@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { controllerForSession } from '../../src/core/session-controller.js';
+import { activeSessionKey } from '../../src/core/types.js';
 import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
 import { contractTerminalStatus, executionObserverSupported, sameExecution } from '../../src/services/session-contract.js';
 import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '../../src/core/terminal-effort-writeback.js';
@@ -18,6 +19,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key in scope) return scope[key as string];
   if (key === 'randomUUID') return randomUUID;
   if (key === 'controllerForSession') return controllerForSession;
+  if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'isCodexAppCliId') return isCodexAppCliId;
   if (key === 'executionObserverSupported') return executionObserverSupported;
@@ -30,7 +32,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'config') return { terminalEffortWriteback: false };
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
-  if (typeof key === 'string' && ['ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
+  if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
     'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);

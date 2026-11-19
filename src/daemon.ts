@@ -35,6 +35,7 @@ import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler, recordMessageListenerTurnTerminal } from './core/message-listener-auto-close.js';
 import { resolveWorkerAdmissionOwner, WorkerAdmissionOwnerAlerts } from './core/worker-admission-owner-alert.js';
+import { WorkerOwnerDiagnostics } from './core/worker-owner-diagnostic.js';
 import { deliverPublishedReport, type ReportDeliveryResponse } from './core/report-publication.js';
 import {
   REPORT_SOURCE_REPLY_ROUTE,
@@ -34196,14 +34197,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onError: err => logger.warn(`[message-listener] Auto-close failed: ${err instanceof Error ? err.message : String(err)}`),
   });
   // Initialise worker pool with daemon callbacks
-  const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts({
+  const ownerAlertDependencies = {
     dataDir: config.session.dataDir,
-    ownerForApp: appId => resolveWorkerAdmissionOwner(appId, { getBot, getOwnerOpenId }),
-    botForApp: appId => ({ name: getBot(appId).botName ?? appId, locale: localeForBot(appId) }),
-    send: (appId, owner, content) => sendUserMessage(appId, owner, content, 'text', undefined, { timeoutMs: 10_000 }),
-    onError: message => logger.warn(`[memory-admission] ${message}`),
-  });
+    ownerForApp: (appId: string) => resolveWorkerAdmissionOwner(appId, { getBot, getOwnerOpenId }),
+    botForApp: (appId: string) => ({ name: getBot(appId).botName ?? appId, locale: localeForBot(appId) }),
+    send: (appId: string, owner: string, content: string) => sendUserMessage(appId, owner, content, 'text', undefined, { timeoutMs: 10_000 }),
+    onError: (message: string) => logger.warn(`[owner-diagnostic] ${message}`),
+  };
+  const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts(ownerAlertDependencies);
+  const workerOwnerDiagnostics = new WorkerOwnerDiagnostics(ownerAlertDependencies);
   initWorkerPool({
+    onOwnerDiagnostic: (ds, diagnostic) =>
+      workerOwnerDiagnostics.report(ds.larkAppId, ds.session.sessionId, diagnostic),
     larkAppId: cfg.larkAppId,
     onMemoryAdmissionBlocked: (ds, decision) =>
       memoryAdmissionOwnerAlerts.report(ds.larkAppId, ds.session.sessionId, decision),
@@ -37229,6 +37234,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     memoryAdmissionOwnerAlerts.dispose();
+    workerOwnerDiagnostics.dispose();
     scheduler.stopScheduler();
 
     // Settle live CoT thinking bubbles as「因重启中断」BEFORE tearing anything

@@ -92,6 +92,7 @@ import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js'
 import { config } from '../config.js';
 import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
+import type { WorkerOwnerDiagnostic } from './worker-owner-diagnostic.js';
 import { RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS, WORKER_EXIT_RUNTIME_RETIRED } from './retired-runtime-exit.js';
 import { hasUnsentInputs, unsentInputJournalFile } from '../services/unsent-input-journal.js';
 import { checkWorkerAdmission, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
@@ -1173,6 +1174,10 @@ type WorkerStartupState = {
    *  gate as a structured error, not reply out-of-band. */
   initTurnId?: string;
   initDispatchAttempt?: number;
+  /** Only the background-restored opening with this exact activation token is
+   * owner-only. A later user-driven tail on the same worker must still deliver
+   * its own deferred Mojo notice when its adapter ACK arrives. */
+  ownerOnlyActivationToken?: string;
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1364,6 +1369,8 @@ export interface WorkerSessionReplyOptions {
 }
 
 export interface WorkerPoolCallbacks {
+  /** Bot-owner diagnostics, separate from any task's conversation output. */
+  onOwnerDiagnostic?: (ds: DaemonSession, diagnostic: WorkerOwnerDiagnostic) => void;
   /** Exact store-owning app, including boot with no live sessions. */
   larkAppId?: string;
   /** Host memory diagnostics go to the bot owner, independently of turn replies. */
@@ -2740,6 +2747,34 @@ function startupFailureNotice(ds: DaemonSession, cliName: string, reason: string
     ? `~/.botmux/logs/daemon-${botIndex}-*.log`
     : tr('worker.start_failed_log_fallback', {}, loc);
   return tr('worker.start_failed', { cliName, reason, sessionId: tag(ds), logPath }, loc);
+}
+
+function reportWorkerOwnerDiagnostic(ds: DaemonSession, diagnostic: WorkerOwnerDiagnostic): void {
+  try { callbacks?.onOwnerDiagnostic?.(ds, diagnostic); }
+  catch (error) { logger.warn(`[${tag(ds)}] Owner diagnostic failed: ${String(error)}`); }
+}
+
+/** Background starts have no new request to reply to. A durable caller keeps
+ * its own output lane; direct replies require the exact incoming turn id. */
+function publishWorkerStartupDiagnostic(
+  ds: DaemonSession, cliName: string, reason: string, turnId: string | undefined,
+  dispatchAttempt?: number,
+  opts: Pick<ForkWorkerOptions, 'memoryNoticeAudience' | 'onAdmissionBlocked'> = {},
+): void {
+  reportWorkerOwnerDiagnostic(ds, { kind: 'startup_failure', cliName, reason });
+  if (opts.memoryNoticeAudience === 'owner-only') return;
+  const content = tr('worker.startup_unavailable', undefined, localeForBot(ds.larkAppId));
+  if (opts.onAdmissionBlocked) {
+    opts.onAdmissionBlocked({ content, ...(turnId === undefined ? {} : { turnId }) });
+    return;
+  }
+  if (!turnId) return;
+  const meetingDriven = !!ds.session.vcMeetingReceiver
+    && (dispatchAttempt !== undefined || resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined);
+  if (meetingDriven || isSilentScheduledTurn(ds, turnId)) return;
+  void requireCallbacks().sessionReply(sessionAnchorId(ds), content, 'text', ds.larkAppId,
+    turnId, { sourceSessionId: ds.session.sessionId })
+    .catch(error => logger.warn(`[${tag(ds)}] Startup status reply failed: ${String(error)}`));
 }
 
 /** Live per-bot `dshRuntime` for a session's card. Only meaningful for cliId
@@ -14254,6 +14289,10 @@ type TransferInputGate = {
 };
 
 const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
+// Delivery-boundary callbacks are daemon-local metadata, not part of the frozen
+// IPC payload. Keying by the buffered object preserves byte-for-byte replay and
+// lets the callback follow the message until its replacement-worker boundary.
+const transferInputDispatchCallbacks = new WeakMap<TransferBufferedInput, () => void>();
 // Only this module can mark the synchronous replacement fork. External callers
 // cannot forge an option that bypasses the transfer gate.
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
@@ -14262,6 +14301,8 @@ const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
+  /** Optional cosmetic delivery after this exact input's worker receipt. */
+  onInputReceived?: () => void;
   key: string;
   ds: DaemonSession;
   worker: ChildProcess;
@@ -14580,6 +14621,7 @@ function sendOrdinaryImDeliveryTracked(
   ds: DaemonSession,
   message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
   onIpcDispatchAttempted?: () => void,
+  onInputReceived?: () => void,
 ): boolean {
   const turnId = message.turnId;
   const worker = ds.worker;
@@ -14601,6 +14643,7 @@ function sendOrdinaryImDeliveryTracked(
       execution: controller.admitInput(turnId, message.dispatchAttempt) } }
     : message;
   const record: OrdinaryImDelivery = {
+    ...(onInputReceived ? { onInputReceived } : {}),
     key,
     ds,
     worker,
@@ -14653,6 +14696,13 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   if (!record.received) {
     record.received = true;
     clearOrdinaryImDeliveryTimer(record);
+    const onInputReceived = record.onInputReceived;
+    record.onInputReceived = undefined;
+    if (canForkRegisteredSession(ds) && ds.worker === record.worker
+      && ds.workerGeneration === record.workerGeneration) {
+      try { onInputReceived?.(); }
+      catch (error) { logger.warn(`[${tag(ds)}] Input receipt notice failed: ${String(error)}`); }
+    }
   }
   logger.info(
     `[${tag(ds)}] Ordinary IM input received by worker `
@@ -14942,6 +14992,7 @@ function withTurnCaller(ds: DaemonSession, message: TransferBufferedInput): Tran
 export function sendWorkerSessionInput(
   ds: DaemonSession,
   message: TransferBufferedInput,
+  onIpcDispatched?: () => void,
 ): boolean {
   // Evaluate the cheap message-shape guards FIRST: getBot() THROWS for an
   // unregistered app (IPC tests / in-flight teardown), and every other input
@@ -14971,10 +15022,17 @@ export function sendWorkerSessionInput(
     ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
     : message;
   const annotated = withTurnCaller(ds, scoped);
-  if (bufferTransferInput(ds, annotated)) return true;
+  if (bufferTransferInput(ds, annotated)) {
+    if (onIpcDispatched) transferInputDispatchCallbacks.set(annotated, onIpcDispatched);
+    return true;
+  }
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
-  return afterWorkerIpcBootstrap(worker, () => worker.send(annotated));
+  return afterWorkerIpcBootstrap(worker, () => {
+    const sent = worker.send(annotated);
+    if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) onIpcDispatched();
+    return sent;
+  });
 }
 
 /** Prompt-cache keep-alive delivery. Deliberately NOT routed through the
@@ -15373,6 +15431,7 @@ function releaseTransferInputGate(
     }
     while (gate.messages.length > 0) {
       const message = gate.messages[0];
+      const onIpcDispatched = transferInputDispatchCallbacks.get(message);
       try {
         if (
           message.type === 'message'
@@ -15382,11 +15441,16 @@ function releaseTransferInputGate(
           // generation exists, ordinary IM delivery returns to the same exact
           // receipt protocol as steady-state input. The watchdog remains valid
           // after the gate itself settles.
-          if (!sendOrdinaryImDeliveryTracked(ds, message)) {
+          if (!sendOrdinaryImDeliveryTracked(ds, message, undefined, onIpcDispatched)) {
             throw new Error('replacement worker rejected tracked IM delivery');
           }
         } else {
-          if (!afterWorkerIpcBootstrap(worker, () => worker.send(message))) {
+          if (!afterWorkerIpcBootstrap(worker, () => {
+            const sent = worker.send(message);
+            if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) {
+              onIpcDispatched();
+            }
+          })) {
             throw new Error('replacement worker IPC bootstrap is unavailable');
           }
         }
@@ -17270,18 +17334,18 @@ export function sendWorkerInput(
       : {}),
     ...(mojoLivePatchForSession(ds) ?? {}),
   };
-  // First moment with a reply context after a restore/resume-time quarantine.
-  deliverPendingMojoQuarantineNotice(ds, turnId, opts.dispatchAttempt);
-  deliverPendingMojoLegacyPinNotice(ds, turnId, opts.dispatchAttempt);
   // #597: the accept-ledger entry is already appended above; if the IPC send
   // fails (returns false or throws) we MUST roll it back or the dispatch ledger
   // keeps a phantom accepted turn. master's ordinary-IM-delivery tracking runs
   // inside the same protected send so a tracked delivery still rolls back.
+  const trackDelivery = !transferGate && shouldTrackOrdinaryImDelivery(ds, message);
+  const deliverNotice = (): void =>
+    deliverMojoNoticesForAcceptedInput(ds, message.content, turnId, opts.dispatchAttempt);
   const performSend = (): boolean => {
-    if (!transferGate && shouldTrackOrdinaryImDelivery(ds, message)) {
-      return sendOrdinaryImDeliveryTracked(ds, message);
+    if (trackDelivery) {
+      return sendOrdinaryImDeliveryTracked(ds, message, undefined, deliverNotice);
     }
-    return sendWorkerSessionInput(ds, message);
+    return sendWorkerSessionInput(ds, message, deliverNotice);
   };
   try {
     if (!performSend()) {
@@ -17374,7 +17438,48 @@ export function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: Moj
  * chat channel.
  */
 /** Sessions with a quarantine notice send in flight, so it cannot double-post. */
-const mojoQuarantineNoticeInFlight = new Set<string>();
+type MojoNoticeRetryTurn = { turnId: string; dispatchAttempt?: number };
+type MojoNoticeAttempts = WeakMap<DaemonSession['session'], Map<string, MojoNoticeRetryTurn | undefined>>;
+
+function mojoNoticeAttemptKey(generation: number | undefined, identity: string): string {
+  return JSON.stringify([generation ?? null, identity]);
+}
+
+function hasMojoNoticeAttempt(
+  attempts: MojoNoticeAttempts, session: DaemonSession['session'], key: string,
+): boolean {
+  return attempts.get(session)?.has(key) ?? false;
+}
+
+function beginMojoNoticeAttempt(
+  attempts: MojoNoticeAttempts, session: DaemonSession['session'], key: string,
+): void {
+  let byIdentity = attempts.get(session);
+  if (!byIdentity) {
+    byIdentity = new Map();
+    attempts.set(session, byIdentity);
+  }
+  byIdentity.set(key, undefined);
+}
+
+function deferMojoNoticeRetry(
+  attempts: MojoNoticeAttempts, session: DaemonSession['session'], key: string, turn: MojoNoticeRetryTurn,
+): void {
+  const byIdentity = attempts.get(session);
+  if (byIdentity?.has(key)) byIdentity.set(key, turn);
+}
+
+function finishMojoNoticeAttempt(
+  attempts: MojoNoticeAttempts, session: DaemonSession['session'], key: string,
+): MojoNoticeRetryTurn | undefined {
+  const byIdentity = attempts.get(session);
+  const retryTurn = byIdentity?.get(key);
+  byIdentity?.delete(key);
+  if (byIdentity?.size === 0) attempts.delete(session);
+  return retryTurn;
+}
+
+const mojoQuarantineNoticeAttempts: MojoNoticeAttempts = new WeakMap();
 
 /**
  * Auxiliary-UI suppression policy for the **mojo quarantine notice** path.
@@ -17440,19 +17545,63 @@ export function auxUiSuppressedFor(
  * authorized output channel, so a later ordinary IM turn delivers it. The
  * quarantine state itself is persisted for dashboard/audit either way.
  */
+function markMojoNoticeDelivered(
+  ds: DaemonSession,
+  session: DaemonSession['session'],
+  flag: 'mojoQuarantineNoticePending' | 'mojoLegacyPinNoticePending',
+  identity: (row: DaemonSession['session']) => string,
+  expectedIdentity: string,
+  expectedGeneration: number | undefined,
+): void {
+  if (!canForkRegisteredSession(ds) || ds.session !== session
+    || session.workerGeneration !== expectedGeneration
+    || identity(session) !== expectedIdentity || session[flag] !== true) return;
+  const { result: applied } = sessionStore.mutateOwnedSessionsAtomically([session.sessionId], rows => {
+    const fresh = rows.get(session.sessionId)!;
+    if (fresh.status !== 'active' || fresh.workerGeneration !== expectedGeneration
+      || identity(fresh) !== expectedIdentity || fresh[flag] !== true) return false;
+    fresh[flag] = false;
+    return true;
+  }, { nonblocking: true });
+  if (applied && canForkRegisteredSession(ds) && ds.session === session
+    && identity(session) === expectedIdentity) session[flag] = false;
+}
+
+function deliverMojoNoticesForAcceptedInput(
+  ds: DaemonSession, content: string, turnId?: string, dispatchAttempt?: number, ownerOnly = false,
+): void {
+  if (ownerOnly || !turnId || !content.trim() || !canForkRegisteredSession(ds)) return;
+  try {
+    deliverPendingMojoQuarantineNotice(ds, turnId, dispatchAttempt);
+    deliverPendingMojoLegacyPinNotice(ds, turnId, dispatchAttempt);
+  } catch (error) {
+    // Cosmetic delivery must never turn an accepted input into a retryable one.
+    logger.warn(`[${tag(ds)}] Pending Mojo notice deferred: ${String(error)}`);
+  }
+}
+
 function deliverPendingMojoQuarantineNotice(
   ds: DaemonSession,
   turnId?: string,
   dispatchAttempt?: number,
 ): void {
+  if (!turnId) return; // Blank restoration must preserve the pending receipt.
   if (ds.session.mojoQuarantineNoticePending !== true) return;
-  // In-flight guard: two turns can be accepted before the first sessionReply
-  // resolves, which would post the notice twice.
-  if (mojoQuarantineNoticeInFlight.has(ds.session.sessionId)) return;
   const lineage = ds.session.mojoQuarantinedLineage;
+  const noticeSession = ds.session;
+  const noticeGeneration = noticeSession.workerGeneration;
   if (!lineage) {
     ds.session.mojoQuarantineNoticePending = undefined;
     sessionStore.updateSession(ds.session);
+    return;
+  }
+  const attemptKey = mojoNoticeAttemptKey(noticeGeneration, lineage);
+  // Only identical attempts coalesce. A successor session object, generation or
+  // lineage owns an independent notice attempt that an older settle cannot drain.
+  if (hasMojoNoticeAttempt(mojoQuarantineNoticeAttempts, noticeSession, attemptKey)) {
+    if (!auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+      deferMojoNoticeRetry(mojoQuarantineNoticeAttempts, noticeSession, attemptKey, { turnId, dispatchAttempt });
+    }
     return;
   }
   let botCfg;
@@ -17465,8 +17614,8 @@ function deliverPendingMojoQuarantineNotice(
   // undefined made the restore migration read it as "old build, never notified"
   // and queue the notice again after every restart.
   const markDelivered = (): void => {
-    ds.session.mojoQuarantineNoticePending = false;
-    sessionStore.updateSession(ds.session);
+    markMojoNoticeDelivered(ds, noticeSession, 'mojoQuarantineNoticePending',
+      row => row.mojoQuarantinedLineage ?? '', lineage!, noticeGeneration);
   };
   if (auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
     // Stay PENDING: this turn simply had no authorized channel (durable replay,
@@ -17479,8 +17628,9 @@ function deliverPendingMojoQuarantineNotice(
     );
     return;
   }
-  mojoQuarantineNoticeInFlight.add(ds.session.sessionId);
+  beginMojoNoticeAttempt(mojoQuarantineNoticeAttempts, noticeSession, attemptKey);
   const message = tr('worker.mojo_lineage_quarantined', { lineage }, botLocale(botCfg));
+  let noticeReplyDelivered = false;
   void callbacks?.sessionReply(
     sessionAnchorId(ds),
     message,
@@ -17489,15 +17639,36 @@ function deliverPendingMojoQuarantineNotice(
     // The turn that actually carried this delivery, not a stale reply target.
     turnId,
     { sourceSessionId: ds.session.sessionId },
-  ).then(markDelivered).catch((err) => {
+  ).then(() => {
+    noticeReplyDelivered = true;
+    // The notice is already delivered. A failed marker update may re-send once
+    // after a restart, but must not be logged as a Lark delivery failure.
+    try {
+      markDelivered();
+    } catch (err) {
+      logger.warn(
+        `[${tag(ds)}] mojo quarantine notice delivered but the delivered marker could not be `
+        + `persisted (may re-send once after a restart): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }).catch((err) => {
     // Flag intentionally left set: the next turn retries.
     logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
   }).finally(() => {
-    mojoQuarantineNoticeInFlight.delete(ds.session.sessionId);
+    const retryTurn = finishMojoNoticeAttempt(mojoQuarantineNoticeAttempts, noticeSession, attemptKey);
+    // Only a failed Lark reply drains a coalesced turn. A successful reply whose
+    // marker write failed remains pending for the next natural input, not an
+    // immediate duplicate send on the same turn.
+    if (!noticeReplyDelivered && retryTurn && canForkRegisteredSession(ds)
+      && ds.session === noticeSession && noticeSession.workerGeneration === noticeGeneration
+      && (noticeSession.mojoQuarantinedLineage ?? '') === lineage
+      && noticeSession.mojoQuarantineNoticePending === true) {
+      deliverPendingMojoQuarantineNotice(ds, retryTurn.turnId, retryTurn.dispatchAttempt);
+    }
   });
 }
 
-const mojoLegacyPinNoticeInFlight = new Set<string>();
+const mojoLegacyPinNoticeAttempts: MojoNoticeAttempts = new WeakMap();
 
 /** In-chat twin of the sessionMojoConfig legacy pin's daemon-log warn: without
  *  it the user keeps retrying a session whose tools and replies silently fail
@@ -17508,8 +17679,20 @@ function deliverPendingMojoLegacyPinNotice(
   turnId?: string,
   dispatchAttempt?: number,
 ): void {
+  if (!turnId) return;
   if (ds.session.mojoLegacyPinNoticePending !== true) return;
-  if (mojoLegacyPinNoticeInFlight.has(ds.session.sessionId)) return;
+  const noticeSession = ds.session;
+  const noticeGeneration = noticeSession.workerGeneration;
+  const noticeIdentity = (row: DaemonSession['session']): string =>
+    JSON.stringify([row.mojoIdentity ?? null, row.mojoIdentityHostDefault ?? null]);
+  const expectedIdentity = noticeIdentity(noticeSession);
+  const attemptKey = mojoNoticeAttemptKey(noticeGeneration, expectedIdentity);
+  if (hasMojoNoticeAttempt(mojoLegacyPinNoticeAttempts, noticeSession, attemptKey)) {
+    if (!auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+      deferMojoNoticeRetry(mojoLegacyPinNoticeAttempts, noticeSession, attemptKey, { turnId, dispatchAttempt });
+    }
+    return;
+  }
   let botCfg;
   try {
     botCfg = getBot(ds.larkAppId).config;
@@ -17523,8 +17706,9 @@ function deliverPendingMojoLegacyPinNotice(
     );
     return;
   }
-  mojoLegacyPinNoticeInFlight.add(ds.session.sessionId);
+  beginMojoNoticeAttempt(mojoLegacyPinNoticeAttempts, noticeSession, attemptKey);
   const message = tr('worker.mojo_legacy_pinned', {}, botLocale(botCfg));
+  let noticeReplyDelivered = false;
   void callbacks?.sessionReply(
     sessionAnchorId(ds),
     message,
@@ -17533,12 +17717,13 @@ function deliverPendingMojoLegacyPinNotice(
     turnId,
     { sourceSessionId: ds.session.sessionId },
   ).then(() => {
-    ds.session.mojoLegacyPinNoticePending = false;
+    noticeReplyDelivered = true;
     // Best-effort, same as the queueing side (review N2): the notice IS
     // delivered at this point — a failed persist only risks one duplicate
     // send after a restart, and must not surface as a delivery failure.
     try {
-      sessionStore.updateSession(ds.session);
+      markMojoNoticeDelivered(ds, noticeSession, 'mojoLegacyPinNoticePending',
+        noticeIdentity, expectedIdentity, noticeGeneration);
     } catch (err) {
       logger.warn(
         `[${tag(ds)}] mojo legacy-pin notice delivered but the delivered marker could not be `
@@ -17549,7 +17734,13 @@ function deliverPendingMojoLegacyPinNotice(
     // Flag intentionally left set: the next turn retries.
     logger.warn(`[${tag(ds)}] failed to deliver mojo legacy-pin notice (will retry): ${err}`);
   }).finally(() => {
-    mojoLegacyPinNoticeInFlight.delete(ds.session.sessionId);
+    const retryTurn = finishMojoNoticeAttempt(mojoLegacyPinNoticeAttempts, noticeSession, attemptKey);
+    if (!noticeReplyDelivered && retryTurn && canForkRegisteredSession(ds)
+      && ds.session === noticeSession && noticeSession.workerGeneration === noticeGeneration
+      && noticeIdentity(noticeSession) === expectedIdentity
+      && noticeSession.mojoLegacyPinNoticePending === true) {
+      deliverPendingMojoLegacyPinNotice(ds, retryTurn.turnId, retryTurn.dispatchAttempt);
+    }
   });
 }
 
@@ -18195,45 +18386,11 @@ function reportProtectedHttpEgressForkFailure(
     : `[${tag(ds)}] Protected HTTP egress target freeze failed: ${rawReason}`);
   if (canForkRegisteredSession(ds)) {
     const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
-    const blockedTurnId = fallbackTurnId(ds, turnId);
-    const message = startupFailureNotice(
-      ds,
-      sessionCliDisplayName(ds, bot.config),
-      reason,
-      botLocale(bot.config),
-    );
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
-      reason: 'worker_fork_error',
-      message: reason,
+      reason: 'worker_fork_error', message: reason,
     });
-    if (opts.onAdmissionBlocked) {
-      opts.onAdmissionBlocked({
-        content: message,
-        ...(blockedTurnId === undefined ? {} : { turnId: blockedTurnId }),
-      });
-    } else {
-      const meetingDriven = !!ds.session.vcMeetingReceiver
-        && (dispatchAttempt !== undefined
-          || resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined);
-      if (meetingDriven || isSilentScheduledTurn(ds, turnId)) {
-        logger.info(
-          `[${tag(ds)}] Managed/silent protected egress ${phase} failure kept out of auxiliary Lark UI: ${rawReason}`,
-        );
-      } else {
-        const cb = requireCallbacks();
-        void cb.sessionReply(
-          sessionAnchorId(ds),
-          message,
-          'text',
-          ds.larkAppId,
-          blockedTurnId,
-          { sourceSessionId: ds.session.sessionId },
-        ).catch(replyError => logger.error(
-          `[${tag(ds)}] Failed to report protected egress ${phase} failure: `
-          + `${replyError instanceof Error ? replyError.message : String(replyError)}`,
-        ));
-      }
-    }
+    publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, bot.config), reason,
+      turnId, dispatchAttempt, opts);
   }
   if (reportAdmission) opts.onAdmission?.('rejected');
 }
@@ -18258,42 +18415,8 @@ function reportProtectedHttpEgressAbortCleanupFailure(
     });
     for (const waiter of waiters) {
       const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(waiter.resumeOrTurnId);
-      const blockedTurnId = fallbackTurnId(ds, turnId);
-      const message = startupFailureNotice(
-        ds,
-        sessionCliDisplayName(ds, bot.config),
-        reason,
-        botLocale(bot.config),
-      );
-      if (waiter.opts.onAdmissionBlocked) {
-        waiter.opts.onAdmissionBlocked({
-          content: message,
-          ...(blockedTurnId === undefined ? {} : { turnId: blockedTurnId }),
-        });
-      } else {
-        const meetingDriven = !!ds.session.vcMeetingReceiver
-          && (dispatchAttempt !== undefined
-            || resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined);
-        if (meetingDriven || isSilentScheduledTurn(ds, turnId)) {
-          logger.info(
-            `[${tag(ds)}] Managed/silent protected egress cleanup persistence failure kept out `
-            + `of auxiliary Lark UI: ${rawReason}`,
-          );
-        } else {
-          const cb = requireCallbacks();
-          void cb.sessionReply(
-            sessionAnchorId(ds),
-            message,
-            'text',
-            ds.larkAppId,
-            blockedTurnId,
-            { sourceSessionId: ds.session.sessionId },
-          ).catch(replyError => logger.error(
-            `[${tag(ds)}] Failed to report protected egress cleanup persistence failure: `
-            + `${replyError instanceof Error ? replyError.message : String(replyError)}`,
-          ));
-        }
-      }
+      publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, bot.config), reason,
+        turnId, dispatchAttempt, waiter.opts);
       if (opts.rejectAdmissions) waiter.opts.onAdmission?.('rejected');
     }
   } else if (opts.rejectAdmissions) {
@@ -19511,6 +19634,8 @@ function forkWorkerPrepared(
     ready: false, failureNotified: false,
     initTurnId: initAttributionTurnId,
     initDispatchAttempt,
+    ownerOnlyActivationToken: opts.memoryNoticeAudience === 'owner-only'
+      ? ds.session.queuedActivationToken : undefined,
     onPreReadyExit: opts.onPreReadyExit,
     onRemoteBackendStartupExit: opts.onRemoteBackendStartupExit,
   };
@@ -19521,6 +19646,8 @@ function forkWorkerPrepared(
   worker.on('error', (err) => {
     const reason = (err as Error)?.message ?? String(err);
     logger.error(`[${t}] Worker fork error: ${reason}`);
+    if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
+      || ds.session.workerGeneration !== workerGeneration || !canForkRegisteredSession(ds)) return;
     if (ds.worker === worker) {
       if (ds.session.queuedActivationPending) {
         // The durable opening journal remains authoritative until the adapter
@@ -19551,35 +19678,8 @@ function forkWorkerPrepared(
       reason: 'worker_fork_error',
       message: reason,
     });
-    // Plan B: a meeting agent is an ordinary chat-scope session. A fork
-    // diagnostic must stay out of the chat only for a genuinely meeting-driven
-    // opening — a durable transcript delivery (initDispatchAttempt set) or a
-    // stamped meeting @mention follow-up — because that path is fenced to the
-    // receipt/lease chain and could otherwise leak on a silent delivery. A plain
-    // user turn on this session gets its fork failure surfaced like any session
-    // (else the user's own turn fails silently). Silent scheduled turns stay
-    // suppressed as before.
-    const forkErrorMeetingDriven = !!ds.session.vcMeetingReceiver
-      && (initDispatchAttempt !== undefined
-        || resolveVcMeetingImTurnOrigin(ds.session, initAttributionTurnId) !== undefined);
-    if (forkErrorMeetingDriven || isSilentScheduledTurn(ds, initAttributionTurnId)) {
-      logger.info(
-        `[${t}] Managed/silent fork failure kept out of auxiliary Lark UI `
-        + `turn=${initAttributionTurnId?.slice(0, 12) ?? '-'} attempt=${initDispatchAttempt}: ${reason}`,
-      );
-      return;
-    }
-    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, botLocale(botCfg));
-    void cb.sessionReply(
-      sessionAnchorId(ds),
-      message,
-      'text',
-      ds.larkAppId,
-      fallbackTurnId(ds, initAttributionTurnId),
-      // A meeting-driven turn (listener_thread delivery) that DOES surface must
-      // still attribute to the meeting session so the send policy resolves it.
-      { sourceSessionId: ds.session.sessionId },
-    ).catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
+    publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, botCfg), reason,
+      initAttributionTurnId, initDispatchAttempt, opts);
   });
 
   // Pipe worker stdout/stderr to daemon logger.
@@ -19965,10 +20065,6 @@ function forkWorkerPrepared(
   // parked until its worker is observed to exit, because the double-fork guard
   // kills asynchronously and spawns the replacement synchronously.
   startNewGenerationEnvLedger(ds, initMsg.env);
-  // Cold-resume path: a workerless session goes straight here without passing
-  // through sendWorkerInput, so without this the "notice on the next message"
-  // promise was never kept for exactly the sessions most likely to need it.
-  deliverPendingMojoQuarantineNotice(ds, initAttributionTurnId, initDispatchAttempt);
 
   // Stamp cliId on the persisted session so the dashboard can show a CLI badge
   // even after the session is closed. Do this before installing worker handlers:
@@ -20009,14 +20105,20 @@ function forkWorkerPrepared(
     if (initCallerOpenId) initMsg = { ...initMsg, turnCallerOpenId: initCallerOpenId };
   }
   if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
-    if (sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted)) commitAcceptedInputTitle(ds, initTitlePlan);
+    if (sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted, () =>
+      deliverMojoNoticesForAcceptedInput(ds, prompt, initAttributionTurnId, initDispatchAttempt,
+        opts.memoryNoticeAudience === 'owner-only'))) {
+      commitAcceptedInputTitle(ds, initTitlePlan);
+    }
   } else {
     afterWorkerIpcBootstrap(worker, () => {
       // Bootstrap may wait while a human stops or supersedes the task. A blank
       // worker can still serve that new input, but must not inherit the claim.
       if (!continuationStillAllowed()) delete initMsg.deploymentContinuation;
       onIpcDispatchAttempted?.();
-      worker.send(initMsg);
+      const sent = worker.send(initMsg);
+      if (sent !== false && ds.worker === worker) deliverMojoNoticesForAcceptedInput(ds, prompt, initAttributionTurnId,
+        initDispatchAttempt, opts.memoryNoticeAudience === 'owner-only');
       commitAcceptedInputTitle(ds, initTitlePlan);
     });
   }
@@ -21846,6 +21948,14 @@ function setupWorkerHandlers(
             timer.unref?.();
             return;
           }
+          // The adapter ACK is the exact acceptance boundary for both an opening
+          // and a promoted activation tail. Its snapshot survives journal cleanup,
+          // so a deferred Mojo notice follows the input that was actually accepted.
+          if (journal.queuedActivationInput) {
+            deliverMojoNoticesForAcceptedInput(ds, journal.queuedActivationInput.content,
+              journal.queuedActivationTurnId, journal.queuedActivationDispatchAttempt,
+              startupState.ownerOnlyActivationToken === msg.activationToken);
+          }
           // Crossing the adapter boundary means this session now owns CLI
           // history even if the worker dies before it can publish a session id.
           ds.hasHistory = true;
@@ -22473,18 +22583,10 @@ function setupWorkerHandlers(
           ds.pendingSuspendReason = CLI_INSTALL_CHANGED_SUSPEND;
           ds.pendingSuspendGeneration = ds.workerGeneration;
         }
-        void cb.sessionReply(
-          sessionAnchorId(ds),
-          tr('worker.cli_install_changed', {
-            cli: getCliDisplayName(cliId),
-            running: msg.runningVersion,
-            installed: msg.installedVersion,
-          }, localeForBot(ds.larkAppId)),
-          'text',
-          ds.larkAppId,
-          undefined,
-          { sourceSessionId: ds.session.sessionId },
-        ).catch(err => logger.warn(`[${t}] install-change notice failed: ${err instanceof Error ? err.message : String(err)}`));
+        reportWorkerOwnerDiagnostic(ds, {
+          kind: 'cli_install_changed', cliName: getCliDisplayName(cliId),
+          runningVersion: msg.runningVersion, installedVersion: msg.installedVersion,
+        });
         runPendingSuspendIfSettled(ds, ownsLifecycleMutation);
         break;
       }
@@ -28900,7 +29002,11 @@ export function forkAdoptWorker(
     } as NodeJS.ProcessEnv,
   });
   serveProtectedMcpSecrets(worker, protectedMcpProvisioning.secrets);
-  const startupState: WorkerStartupState = { ready: false, failureNotified: false };
+  const startupState: WorkerStartupState = {
+    ready: false, failureNotified: false,
+    ownerOnlyActivationToken: opts?.restoredFromMetadata
+      ? ds.session.queuedActivationToken : undefined,
+  };
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   let initMsg!: DaemonToWorker;
   const previousInitConfig = ds.initConfig;
@@ -28912,20 +29018,17 @@ export function forkAdoptWorker(
   worker.on('error', (err) => {
     const reason = (err as Error)?.message ?? String(err);
     logger.error(`[${t}] Adopt worker fork error: ${reason}`);
+    if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
+      || ds.session.workerGeneration !== workerGeneration || !canForkRegisteredSession(ds)) return;
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
-    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, botLocale(botCfg));
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
-      reason: 'worker_fork_error',
-      message: reason,
+      reason: 'worker_fork_error', message: reason,
     });
-    void cb.sessionReply(
-      sessionAnchorId(ds),
-      message,
-      'text',
-      ds.larkAppId,
-      fallbackTurnId(ds, undefined),
-    ).catch(replyErr => logger.error(`[${t}] Failed to deliver adopt worker fork error to Lark: ${replyErr}`));
+    const failureTurnId = opts?.turnId
+      ?? (opts?.restoredFromMetadata ? undefined : fallbackTurnId(ds, undefined));
+    publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, botCfg), reason, failureTurnId,
+      undefined, opts?.restoredFromMetadata ? { memoryNoticeAudience: 'owner-only' } : {});
   });
 
   // Pipe worker stdout/stderr — both go through logger.info (→ daemon.log,
