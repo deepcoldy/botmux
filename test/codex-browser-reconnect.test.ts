@@ -126,6 +126,34 @@ describe.sequential('browser connection recovery', () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it('rebuilds even when every teardown close() keeps rejecting, not just the first one', async () => {
+    // Stricter than the reject-once case: recovery must come from resetting
+    // broker state in the teardown's finally, never from a later close() retry.
+    const recovered = fakeModules();
+    const disconnected = new Error('Browser Node runtime exited');
+    let getCalls = 0;
+    const get = vi.fn(async () => {
+      getCalls += 1;
+      if (getCalls === 1) throw disconnected;
+      return recovered.browser;
+    });
+    const setupBrowserRuntime = recovered.modules.setupBrowserRuntime
+      .mockResolvedValueOnce({ browsers: { get } });
+    const close = vi.fn().mockRejectedValue(new Error('persistent cleanup failure'));
+    broker = new CodexBrowserBroker({
+      sessionId: 'persistent-failed-invalidation',
+      family: 'chrome',
+      modules: { ...recovered.modules, setupBrowserRuntime, close },
+    });
+
+    const request = call({ operation: 'list_tabs' });
+    expect((await broker.handleToolCall(request)).success).toBe(false);
+    expect((await broker.handleToolCall(request)).success).toBe(true);
+    expect(setupBrowserRuntime).toHaveBeenCalledTimes(2);
+    // Let afterEach's broker.close() resolve instead of replaying the mock error.
+    close.mockImplementation(async () => {});
+  });
+
   it('shares one invalidation promise so concurrent callers wait for the same teardown', async () => {
     const closeDefers: Array<{ resolve: () => void }> = [];
     const close = vi.fn(async () => new Promise<void>(resolve => {
