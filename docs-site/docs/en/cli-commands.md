@@ -173,6 +173,22 @@ botmux term-link [id]
 
 Gets a writable Web terminal for a session. The link isn't printed in the terminal; the daemon sends it to the bot owner as a private card (only you can see it in a group; in topics or direct chats it falls back to a direct message). You can omit `id` when there's only one active session. See [Web Terminal](/en/web-terminal).
 
+## Post a message from a host shell
+
+CI jobs, alerting systems, and external agents can use `botmux post` to deliver text they already have. Select a running bot by App ID and provide a destination. The command needs no session ID and starts no AI session.
+
+```bash
+botmux post --bot cli_xxx --chat-id oc_xxx --request-id build_12345 --text "Build complete"
+botmux post --bot cli_xxx --chat-id oc_xxx --into om_xxx --text-file ./result.txt
+printf '%s\n' "Manual action required" | botmux post --bot cli_xxx --user-open-id ou_xxx --text-file -
+```
+
+Run the command in a trusted host shell with access to the local Botmux daemon. The bot must already be in the group. For a topic, supply its group ID and root message ID (`om_…`). For a direct message, use the recipient's `open_id` in the sending bot's app scope. Lark must allow that bot to reach the recipient. Use `--text` or `--text-file` for up to 8192 UTF-8 bytes.
+
+`--bot` accepts a Feishu App ID starting with `cli_`. CI and alerting systems should pass a stable event ID with `--request-id` (8–64 letters, digits, underscores or hyphens). The CLI generates an ID when omitted. A successful JSON receipt on stdout includes `requestId`, `messageId`, `replayed`, the bot and the destination. Group posts share deduplication records with the request-bound group API.
+
+Invalid arguments exit with status 2. Delivery errors exit with status 1 and a JSON error on stderr. A timeout, interrupted connection or unverifiable receipt returns `outcome_unknown`; the message may already be visible. When `retryable` is true, retry within 50 minutes of the first attempt using the same bot, destination, text and request ID. An unresolved attempt past that window returns `retryable: false` and needs manual verification. Reusing the ID with different text returns `request_conflict`. While a definite first rejection is retained, retrying the original text replays that `send_failed`. Use a new request ID for corrected text. Completed requests replay the original message ID for as long as their record is retained in the bounded archive.
+
 ## Dashboard login link
 
 ```bash
@@ -348,3 +364,9 @@ botmux quoted om_example_one om_example_two --no-download
 The default full history and single-message quoted JSON remain compatible. Index mode avoids card/forward expansion and returns previews of up to 240 characters plus resource counts. `--no-download` preserves resource metadata without downloading attachment bytes. Batch quoted accepts up to 20 IDs, deduplicates them, preserves successful input order, and returns `messages`/`errors`; partial failure exits with code 1 while retaining successful results.
 
 Filters apply only within the fetched `--limit` window. `--since` is inclusive and `--until` exclusive; use ISO timestamps with a timezone. The `retrieval` block reports counts, filters, deferred details and detail failures. An index candidate marked `queryMatch=deferred` requires a detail read to verify the keyword. Index mode cannot be combined with `--with-card-json`. Message requests are coalesced only within one invocation, separately by app and representation; the next invocation reads afresh. Both commands support `--help`.
+
+## Worker Memory Protection
+
+`botmux worker-budget status` shows available memory, the reserve, the memory PSI limit, and whether worker startup is allowed. Background recovery failures are logged and batched into a DM to the bot owner. A rejected current request receives only a brief unavailable status in its conversation.
+
+Owner DMs are batched per bot over 2 seconds and count distinct affected sessions. Each bot/owner pair attempts at most one DM every 5 minutes, with a cooldown that survives daemon restarts. Failed sends also enter cooldown; a later rejection can trigger another attempt after it expires. An unresolved owner is logged. If the cooldown cannot be persisted, deduplication falls back to the current process. These notifications are independent of the optional Dashboard host overload monitor.

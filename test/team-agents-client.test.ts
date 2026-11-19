@@ -112,6 +112,28 @@ describe('fetchTeamAgents（端点2）', () => {
     });
   });
 
+  it('外部机器人：带 external 标记，空 machineId/machineName 归一为缺省', async () => {
+    const { o } = opts([{
+      status: 200,
+      json: {
+        teamId: 't1', teamName: 'T',
+        agents: [
+          { appId: 'cli_ext', openId: null, unionId: 'on_ext', name: 'Ext', specialties: [], mentionable: true, online: true,
+            owner: { unionId: 'on_member', name: 'Member' }, machineId: '', machineName: '', external: true },
+          { appId: 'cli_a', name: 'A', machineId: 'm-2', machineName: 'box2', external: 'yes' },
+        ],
+      },
+    }]);
+    const r = await fetchTeamAgents('t1', o);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.value.agents[0]).toMatchObject({ appId: 'cli_ext', external: true, owner: { unionId: 'on_member' } });
+    expect(r.value.agents[0].machineId).toBeUndefined();
+    expect(r.value.agents[0].machineName).toBeUndefined();
+    expect(r.value.agents[1].external).toBeUndefined();
+    expect(r.value.agents[1].machineId).toBe('m-2');
+  });
+
   it('空 agents 是正常态，不报错', async () => {
     const { o } = opts([{ status: 200, json: { teamId: 't1', teamName: 'T', agents: [] } }]);
     const r = await fetchTeamAgents('t1', o);

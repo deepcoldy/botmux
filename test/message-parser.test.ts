@@ -24,6 +24,16 @@ function makeMsg(msgType: string, content: object | string) {
   };
 }
 
+describe('parseEventMessage sender identity', () => {
+  it('preserves the Feishu-stamped bot appId alongside unionId', () => {
+    const { parsed } = parseEventMessage({
+      sender: { sender_type: 'app', sender_id: { open_id: 'ou_ext', app_id: 'cli_ext', union_id: 'on_ext' } },
+      message: { message_id: 'om_ext', chat_id: 'oc_team', chat_type: 'group', message_type: 'text', content: JSON.stringify({ text: 'hello' }), create_time: '1000' },
+    });
+    expect(parsed).toMatchObject({ senderId: 'ou_ext', senderAppId: 'cli_ext', senderUnionId: 'on_ext', senderType: 'app' });
+  });
+});
+
 // ─── API message metadata ─────────────────────────────────────────────────
 
 describe('parseApiMessage metadata', () => {

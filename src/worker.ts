@@ -11,6 +11,7 @@ import {
   RUNTIME_RESERVATION_DEADLINE_MS,
   RUNTIME_RESERVATION_SLOW_LOG_MS,
   RuntimeReservationExpiredError,
+  RuntimeReservationRefusedError,
 } from './services/runtime-reservation.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
@@ -68,7 +69,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
+import { join, basename, dirname, delimiter, relative, extname, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
@@ -189,7 +190,7 @@ import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJo
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideFirstWriteLiveness,
@@ -437,6 +438,7 @@ import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve }
 import {
   readRunningExeIdentity,
   resolveInstallIdentity,
+  sameExecutableObject,
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
@@ -540,12 +542,17 @@ import { cliUnavailableMessageAfterRetry, createAdapterAfterMissingCliWait } fro
 import {
   findLaunchedCliPid,
   findCliProcess,
+  createElapsedDeadline,
   scheduleWrapperRealCliPid,
   snapshotChildPids,
   CODEX_LEAF_SEARCH_DEPTH,
   readComm,
   readCmdline,
+  readCwd,
+  processExecutableArgvSlots,
+  wrapperGenericLauncherComm,
   isNonInteractiveCodexArgv,
+  isClaudeMetadataProbeArgv,
   cliIdForComm,
   isBareShellComm,
   bareShellLaunchKind,
@@ -561,6 +568,7 @@ import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { restoredTurnLabel } from './services/restored-turn-label.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { resolveShadowedAntigravityStatusLine } from './adapters/cli/antigravity.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
@@ -2124,7 +2132,7 @@ function armRpcStartupDialogDismiss(): void {
  * callbacks capture it and must re-check after every await before touching
  * transcript lifecycle or user-visible state. */
 let workerSessionEventScope: WorkerSessionEventScope | undefined;
-const pendingRuntimeReservations = new Map<string, (mayStart: boolean) => void>();
+const pendingRuntimeReservations = new Map<string, (mayStart: boolean, refusal?: import('./services/runtime-reservation.js').RuntimeStartRefusal) => void>();
 const contractWriteBackends = new WeakSet<SessionBackend>();
 function hasCurrentSessionRuntime(): boolean { return !workerSessionEventScope || workerSessionEventScope.isCurrentContext(); }
 function fenceContractBackendWrites(): void {
@@ -3374,6 +3382,8 @@ let lastSpawnCodexLauncherActive = false;
  *  getChildPid may return that mutable field rather than the original pane pid. */
 let lastSpawnCodexLauncherPid: number | undefined;
 let codexOwnershipAttestationPending = false;
+/** Re-roots a sandboxed CLI's lineage proof on its live leaf; bound per spawn. */
+let refreshSandboxedCliLeafAttestation: (() => void) | undefined;
 // Configured Codex-compatible executable name of the latest spawn, used to
 // recognise a renamed native binary when deciding whether getChildPid() is
 // already the real leaf. undefined for the official `codex` binary.
@@ -12787,6 +12797,17 @@ function emitReadyTurns(opts: {
   // rationale. Tracked by object identity across this function's two loops so
   // the terminal can carry positive silence evidence for a durable/async caller.
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
+  // Turns for which loop 1 observed delivered output (emitted final_output,
+  // explicit final `botmux send`, or already-sent fallback suppression). Such
+  // turns must never carry `outputDisposition: 'boundary_unobserved'`.
+  const observedOutputTurns = new Set<(typeof ready)[number]>();
+  // Subset of observedOutputTurns whose delivery proof is an explicit final
+  // `botmux send` marker with NO emitted final_output: the answer reached the
+  // user over IM, but the HTTP channel has no captured content. The terminal
+  // carries `explicit_final_delivered` so wait/async callers still settle.
+  const finalMarkerTurns = new Set<(typeof ready)[number]>();
+  // Turns that actually emitted a final_output IPC in loop 1.
+  const emittedFinalOutputTurns = new Set<(typeof ready)[number]>();
   let emitIndex = 0;
   try {
   for (let i = 0; i < ready.length; i++) {
@@ -12837,11 +12858,16 @@ function emitReadyTurns(opts: {
       isScheduled: turn.isScheduled,
       forwardLocalFinal: zeroPromptTerminalSync(),
     };
+    const explicitReplyMarkers = attributableExplicitReplyMarkersForTurnWindow(
+      turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
+    );
+    if (explicitReplyMarkers.some(isFinalBridgeSendMarker)) {
+      observedOutputTurns.add(turn);
+      finalMarkerTurns.add(turn);
+    }
     notifyExplicitRepliesObserved(
       turn.turnId,
-      attributableExplicitReplyMarkersForTurnWindow(
-        turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
-      ),
+      explicitReplyMarkers,
     );
 
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
@@ -12893,6 +12919,8 @@ function emitReadyTurns(opts: {
       // sentinel (no prose, no send), never "already sent" / local-typed.
       if (!adoptMode && isBridgeNothingToSendFinal(assistantText)) {
         nothingToSendTurns.add(turn);
+      } else {
+        observedOutputTurns.add(turn);
       }
       continue;
     }
@@ -12974,6 +13002,8 @@ function emitReadyTurns(opts: {
       }
       continue;
     }
+    observedOutputTurns.add(turn);
+    emittedFinalOutputTurns.add(turn);
     send({
       type: 'final_output',
       content: deliveredText,
@@ -13085,12 +13115,46 @@ function emitReadyTurns(opts: {
       );
       continue;
     }
+    // Output disposition, positive no-output evidence only:
+    //  - genuine silence (bare nothing-to-send sentinel, no `botmux send`) →
+    //    'nothing_to_send'; a durable/async caller may settle completed-empty.
+    //  - real (non-local) turn whose answer was delivered explicitly over IM via
+    //    a final `botmux send` marker but which emitted NO final_output, popped
+    //    without transcript terminal evidence → 'explicit_final_delivered'.
+    //    The HTTP channel has no captured content, yet the turn IS delivered:
+    //    wait/async callers settle completed-empty instead of hanging, and the
+    //    label rides the terminal so a restarted daemon still converges.
+    //  - real (non-local) turn popped at a screen-idle boundary with NO
+    //    transcript terminal evidence at all (`terminalObserved` false:
+    //    neither an assistant stop_reason/API-error record nor a next-turn-start
+    //    compatibility boundary) and NO observed output → 'boundary_unobserved'.
+    //    The dominant cause is the CLI dying mid-turn (killed/crashed — a frozen
+    //    pane still matches the idle detector), so claiming plain `completed`
+    //    here would let the daemon leave pending HTTP async/wait callers
+    //    hanging `running` forever while the session auto-restarts into an idle
+    //    REPL. The label lets the daemon settle fail-closed instead.
+    //    Gate on terminalObserved (NOT on an undefined terminalOutcome) so a
+    //    marker-less older JSONL variant closed by the next user record keeps
+    //    the label absent; turns that emitted final_output / observed an
+    //    explicit final send, or synthesised local turns, also keep it absent.
+    const outputDisposition = nothingToSendTurns.has(turn)
+      ? 'nothing_to_send'
+      : !turn.isLocal
+        && !turn.terminalObserved
+        && finalMarkerTurns.has(turn)
+        && !emittedFinalOutputTurns.has(turn)
+        ? 'explicit_final_delivered'
+        : !turn.isLocal
+          && !turn.terminalObserved
+          && !observedOutputTurns.has(turn)
+          ? 'boundary_unobserved'
+          : undefined;
     emitTurnTerminal(
       turn.turnId,
       outcome?.status ?? 'completed',
       undefined,
       turn.dispatchAttempt,
-      nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+      outputDisposition,
       undefined,
     );
   }
@@ -21887,6 +21951,7 @@ function markPromptReady(): void {
   // the real execution root before the first turn can call a BotMux tool;
   // waiting for a rollout/history match would repair ownership only AFTER it.
   if (lastInitConfig?.cliId === 'codex') currentCodexObservedPid();
+  refreshSandboxedCliLeafAttestation?.();
   // A recognized startup dialog (cli-startup-blocker) is a selector whose ❯
   // matches readyPattern: never a prompt, and not the "real readyPattern seen
   // during the hold" the ready-gate settle trusts below. The first-prompt
@@ -23547,6 +23612,7 @@ async function flushPending(): Promise<void> {
     // Type-ahead and first-prompt timeout paths can bypass markPromptReady.
     // Refresh here too, before dequeuing or publishing the input's authority.
     if (lastInitConfig?.cliId === 'codex') currentCodexObservedPid();
+    refreshSandboxedCliLeafAttestation?.();
     // One-shot per spawn: type the bot's startup commands (e.g. `/effort
     // ultracode`) into the CLI before the first user prompt drains. Both ready
     // paths funnel through flushPending — the ready-gate settle for Claude-family
@@ -26011,7 +26077,11 @@ async function spawnCli(
     && cfg.cliSessionId === recovery.nativeSessionId && previousBinding?.runtime
     && previousBinding.runtime.runtimeId === recovery.from.runtimeId
     && previousBinding.runtime.epoch === recovery.from.epoch ? recovery : undefined;
-  const binding = workerSessionEventScope.beginRuntime(activeRestartAttemptId);
+  // A control-only resume belongs to close, not restart: startup must never
+  // emit a successful restart receipt for that close operation.
+  const closeControlOperation = firstBinding && cfg.backendType === 'remote-runner'
+    && !cfg.prompt && !cfg.turnId && cfg.remoteBackendState ? cfg.sessionCommand?.operationId : undefined;
+  const binding = workerSessionEventScope.beginRuntime(closeControlOperation ?? activeRestartAttemptId);
   binding.continuation = continuation;
   if (execution) workerSessionEventScope.rememberExecution(execution, binding);
   return workerSessionEventScope.run(binding, async () => {
@@ -26029,6 +26099,10 @@ async function spawnCli(
       // Superseded means another lifecycle operation owns the next start. An
       // unanswered start has no such owner, so it must fail where it is seen.
       if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
+      // The daemon found no operation that takes this start over: fail it where
+      // it is seen, so the session reads as not online and the next start is
+      // retried, instead of idling with no CLI.
+      if (outcome === 'unowned' && !superseded) throw new RuntimeReservationRefusedError();
       if (outcome === 'refused' && continuation && !superseded) {
         abandonTraexAutoModelContinuation(continuation, binding.bindingId, 'rejected');
         return spawnCli(cfg, opts);
@@ -29112,6 +29186,10 @@ async function spawnCliBody(
     });
     if (shadowed.command) childEnv.BOTMUX_STATUSLINE_CHAIN = shadowed.command;
     else delete childEnv.BOTMUX_STATUSLINE_CHAIN;
+  } else if (cliAdapter.id === 'antigravity' && !cliAdapter.runnerFramedInput) {
+    const shadowed = resolveShadowedAntigravityStatusLine();
+    if (shadowed.command) childEnv.BOTMUX_STATUSLINE_CHAIN = shadowed.command;
+    else delete childEnv.BOTMUX_STATUSLINE_CHAIN;
   } else {
     delete childEnv.BOTMUX_STATUSLINE_CHAIN;
   }
@@ -29293,6 +29371,7 @@ async function spawnCliBody(
   let spawnBin = cfg.cliId === 'codex' && codexCleanupLaunchTarget
     ? codexCleanupLaunchTarget.codexBin : cliAdapter.resolvedBin;
   let spawnArgs = args;
+  let configuredWrapperLaunch: { bin: string; args: string[] } | undefined;
   let spawnCwd = cfg.workingDir;
 
   // Dashboard「复现命令」：在**任何** sandbox 包装（下方 macOS Seatbelt / Linux bwrap /
@@ -30646,6 +30725,7 @@ async function spawnCliBody(
       pathDelimiter: delimiter,
     });
     if (launch.bin) {
+      configuredWrapperLaunch = { bin: launch.bin, args: [...launch.args] };
       spawnBin = launch.bin;
       spawnArgs = launch.args;
       if (launch.env) Object.assign(childEnv as Record<string, string>, launch.env);
@@ -31453,26 +31533,48 @@ async function spawnCliBody(
   // BFS-descends through the wrapper by comm). session-id
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
-  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): void => {
+  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): boolean => {
     log(`${label}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${cfg.cliId}); rewiring session discovery + bridge`);
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
     // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
     // module-level bridgeCliPid and re-points to the real CLI's jsonl.
     bridgeCliPid = realPid;
     if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
-    publishLocalProcessAttestation(realPid);
+    return publishLocalProcessAttestation(realPid);
   };
-  // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
-  // reports while this spawn is current (equal to launcherPid unless a relay
-  // sits between the pane and the launcher).
+  const readStablePanePid = (): number | null | undefined => {
+    const current = backend;
+    return current?.getStablePanePid ? current.getStablePanePid() : current?.getChildPid?.();
+  };
+  // Herdr's PID probes are synchronous CLI calls with a 5s timeout. Share one
+  // opt-in budget value between the late-PID and wrapper resolvers; other
+  // backends keep their existing attempt-only behavior.
+  const herdrPidRetryMaxElapsedMs = effectiveBackendType === 'herdr' ? 6_000 : undefined;
+  // wrapperCli launcher → real CLI by comm. `launcherPid` is the unwrapped
+  // launch payload below any pane relay or owned session-scope supervisor.
   const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
     // Codex also needs the real execution root, even without a Claude JSONL bridge.
-    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
+    // Credential-only bwrap uses the single monitored resolver below; running
+    // both would attest the same leaf twice and rotate live-turn authority twice.
+    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || credentialOnlyBwrap
+      || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
+    const generation = cliSpawnGeneration;
+    // A backing/shell PID need not equal the foreground launcher PID. Capture
+    // the backend's own stable identity rather than comparing it with panePid;
+    // wrapper rewrites of cliPid leave it unchanged, while a replaced pane fails
+    // the fence even before the exit callback advances the spawn generation.
+    const stablePanePid = readStablePanePid() ?? panePid;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
-      getChildPid: () => (backend?.getChildPid?.() === panePid ? launcherPid : null),
+      maxElapsedMs: herdrPidRetryMaxElapsedMs,
+      // Herdr/ZMX alias getChildPid() to the mutable cliPid, so retry validity
+      // uses their independent stable pane identity instead. Backends without
+      // the accessor retain the original current-child observation as fallback.
+      getChildPid: () => generation === cliSpawnGeneration && readStablePanePid() === stablePanePid
+        ? launcherPid
+        : null,
       applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -31494,6 +31596,137 @@ async function spawnCliBody(
     + (scopePayloadLauncherActive ? 1 : 0);
   const unwrapLaunchLayers = (pid: number): UnwrappedLaunchLayers =>
     unwrapBotmuxLaunchLayers(pid, { relay: relayMayFrontPane });
+  // Under bwrap the payload is the sandbox supervisor and stays the pid for
+  // session discovery. Tool processes descend from the CLI inside it, which
+  // predates every turn, so the lineage proof needs the CLI leaf attested too.
+  // Codex and TRAE rebind ownership to their leaf through their own resolvers.
+  const attestSandboxedCliLeaf = (payloadPid: number, panePid: number): void => {
+    if (!(sandboxRequested || credentialOnlyBwrap) || cfg.cliId === 'codex' || cfg.cliId === 'traex') return;
+    const targetCliId = cfg.cliId as CliId;
+    const generation = cliSpawnGeneration;
+    const backendAtSpawn = backend;
+    const stablePanePid = readStablePanePid() ?? panePid;
+    // Credential-only bwrap + wrapperCli historically rewired discovery/bridge
+    // to the leaf. Preserve that here; full sandboxes keep the outer payload.
+    const rewireOwnership = credentialOnlyBwrap && !sandboxRequested
+      && !!cfg.wrapperCli?.trim() && !!claudeDataDir;
+    const payloadProcStart = rewireOwnership ? readProcessStartIdentity(payloadPid) : undefined;
+    const launchPayloadStillCurrent = (): boolean => {
+      if (generation !== cliSpawnGeneration || backend !== backendAtSpawn || readStablePanePid() !== stablePanePid) return false;
+      // A non-CLI payload (sh/bwrap) needs the same birth fence as a direct CLI:
+      // pid reuse must terminate discovery rather than authorize its new tree.
+      return !rewireOwnership || (!!payloadProcStart && readProcessStartIdentity(payloadPid) === payloadProcStart);
+    };
+    // Only distinctive executable identity proves a persistent wrapper: for an
+    // interpreter launch, that is the script, never the shared interpreter.
+    const distinctiveExecutableArgv = (comm: string | undefined, argv: string[]): string[] => {
+      const launcherComm = wrapperGenericLauncherComm(comm);
+      const slots = processExecutableArgvSlots(launcherComm ?? comm, argv);
+      return launcherComm ? slots.slice(1) : slots.slice(0, 1);
+    };
+    const directCliIdentity = rewireOwnership
+      ? resolveInstallIdentity(resolve(spawnCwd, reproduceBaseBin)) : undefined;
+    const wrapperIdentities = rewireOwnership && configuredWrapperLaunch
+      ? distinctiveExecutableArgv(
+          basename(configuredWrapperLaunch.bin),
+          [configuredWrapperLaunch.bin, ...configuredWrapperLaunch.args],
+        ).map(path => resolveInstallIdentity(resolve(spawnCwd, path)))
+        // A wrapper that resolves to the CLI itself cannot prove that another
+        // persistent layer exists; keep the direct root on this ambiguity.
+        .filter((identity): identity is ExecutableIdentity => identity !== undefined
+          && !sameExecutableObject(identity, directCliIdentity))
+      : [];
+    const matchesWrapperIdentity = (identity: ExecutableIdentity | undefined): boolean =>
+      wrapperIdentities.some(wrapper => sameExecutableObject(identity, wrapper));
+    const isConfiguredWrapper = (pid: number, procStart: string): boolean => {
+      if (wrapperIdentities.length === 0 || readProcessStartIdentity(pid) !== procStart) return false;
+      const exe = readRunningExeIdentity(pid, procStart);
+      if (exe) {
+        if (matchesWrapperIdentity(exe)) return true;
+        // A readable native image that differs from the configured wrapper is
+        // positive direct-CLI evidence. Process-controlled argv0 cannot overturn
+        // it; only an interpreter proceeds to its constrained script slot.
+        if (!wrapperGenericLauncherComm(basename(exe.path))) return false;
+      }
+      const argv = readCmdline(pid, { exact: true });
+      const cwd = readCwd(pid) ?? spawnCwd;
+      const matches = distinctiveExecutableArgv(exe ? basename(exe.path) : undefined, argv).some(path => {
+        const identity = resolveInstallIdentity(resolve(cwd, path));
+        return matchesWrapperIdentity(identity);
+      });
+      return matches && readProcessStartIdentity(pid) === procStart;
+    };
+    const findLeaf = (lp: number): number | null => findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, {
+      // One process-table snapshot per BFS, not one synchronous ps per node.
+      childrenOf: snapshotChildPids(),
+      commOf: (pid) => {
+        // Filter at the match position, not after BFS returns its first match:
+        // an unreaped zombie or metadata helper must not hide a live sibling.
+        if (isZombieProcess(pid)) return undefined;
+        const comm = readComm(pid);
+        if (comm && targetCliId === 'claude-code'
+          && cliIdForComm(comm, targetCliId) === targetCliId
+          && isClaudeMetadataProbeArgv(readCmdline(pid, { exact: true }))) return undefined;
+        return comm;
+      },
+      isPersistentWrapper: (pid) => {
+        if (!rewireOwnership) return false;
+        const procStart = readProcessStartIdentity(pid);
+        return procStart ? isConfiguredWrapper(pid, procStart) : false;
+      },
+    });
+    const isDirectLeaf = (lp: number): boolean => {
+      if (cliIdForComm(readComm(lp) ?? '', targetCliId) !== targetCliId) return false;
+      if (!rewireOwnership) return true;
+      // Comm alone cannot distinguish an exec'd CLI from a same-named persistent
+      // wrapper. Descend only when this exact payload still runs the configured
+      // wrapper binary/script; versioned-native and interpreter-hosted CLIs keep
+      // their direct root, as does any payload with ambiguous identity evidence.
+      if (!payloadProcStart || readProcessStartIdentity(lp) !== payloadProcStart || wrapperIdentities.length === 0) return true;
+      return !isConfiguredWrapper(lp, payloadProcStart);
+    };
+    let attested: { pid: number; procStart: string; published: boolean } | undefined;
+    // A live, successfully published leaf is never sent twice: every actual
+    // publication rotates the active turn's capability.
+    const isAttested = (pid: number | undefined): boolean => pid !== undefined && attested?.pid === pid
+      && attested.published && !isZombieProcess(pid) && readProcessStartIdentity(pid) === attested.procStart;
+    const attest = (leafPid: number): boolean => {
+      if (!launchPayloadStillCurrent()) return false;
+      if (isAttested(leafPid)) return true;
+      const procStart = readProcessStartIdentity(leafPid);
+      if (!procStart || isZombieProcess(leafPid)) return false;
+      log(`Sandbox: attesting CLI leaf pid ${leafPid} under launch payload ${payloadPid} (cliId=${cfg.cliId})`);
+      const published = rewireOwnership
+        ? applyResolvedCliPid(leafPid, 'Credential-only sandbox CLI leaf', payloadPid)
+        : publishLocalProcessAttestation(leafPid);
+      attested = { pid: leafPid, procStart, published };
+      return published;
+    };
+    // Ready/input edges retain the repair path after the bounded startup poll;
+    // both edges and the poll share the same liveness and deduplication state.
+    refreshSandboxedCliLeafAttestation = () => {
+      if (!launchPayloadStillCurrent()) return;
+      // A proven direct CLI payload was already attested at bind time. Never
+      // replace it with a same-comm subagent discovered on a ready/input edge.
+      if (isDirectLeaf(payloadPid) || isAttested(attested?.pid)) return;
+      const leafPid = findLeaf(payloadPid);
+      if (leafPid) attest(leafPid);
+    };
+    const intervalMs = 200;
+    scheduleWrapperRealCliPid(payloadPid, {
+      intervalMs,
+      maxAttempts: Math.ceil(FIRST_PROMPT_HARD_TIMEOUT_MS / intervalMs),
+      findRealPid: findLeaf,
+      isDirectLeaf,
+      getBackend: () => backend,
+      getChildPid: () => launchPayloadStillCurrent() ? payloadPid : null,
+      applyRealPid: attest,
+      // A matching comm can be a short-lived wrapper probe. Keep the startup
+      // watcher after success so a dead/zombie/reused PID reopens discovery.
+      isAppliedPidValid: isAttested,
+      schedule: (fn, ms) => { const timer = setTimeout(fn, ms); timer?.unref?.(); },
+    });
+  };
   const bindLaunchPayload = (resolved: UnwrappedLaunchLayers, panePid: number): void => {
     if (resolved.pid !== panePid) {
       // Preserve a deeper wrapper/native CLI resolution that already won; a
@@ -31506,6 +31739,7 @@ async function spawnCliBody(
       }
     }
     resolveBehindWrapper(resolved.pid, panePid);
+    attestSandboxedCliLeaf(resolved.pid, panePid);
   };
   const startWrapperRealPidResolve = (panePid: number): void => {
     let resolved = unwrapLaunchLayers(panePid);
@@ -31681,11 +31915,15 @@ async function spawnCliBody(
     let attempts = 0;
     const latePidBackend = backend;
     const latePidGeneration = cliSpawnGeneration;
+    const latePidExpired = createElapsedDeadline(herdrPidRetryMaxElapsedMs);
     const resolveCliPidLate = () => {
-      if (!backend) return;
+      if (!backend || latePidExpired()) return;
       if (cfg.cliId === 'traex'
         && (backend !== latePidBackend || cliSpawnGeneration !== latePidGeneration)) return;
       const pid = backend.getChildPid?.();
+      // A slow Herdr probe can cross the budget before returning a PID. Do not
+      // publish markers, rewire ownership, or arm another timer past the fence.
+      if (latePidExpired()) return;
       if (pid) {
         publishLocalProcessAttestation(pid);
         if (process.env.SESSION_DATA_DIR && !cliPidMarker) {
@@ -31722,7 +31960,7 @@ async function spawnCliBody(
         observeAntigravityCliSessionId(pid, 'async');
         return;
       }
-      if (++attempts < 25) setTimeout(resolveCliPidLate, 120); // ~3s budget
+      if (++attempts < 25 && !latePidExpired()) setTimeout(resolveCliPidLate, 120); // ~3s attempt budget
     };
     setTimeout(resolveCliPidLate, 120);
   }
@@ -32870,6 +33108,7 @@ function killCli(opts: {
   nativeReasoningClock = undefined;
   lastSpawnCodexLauncherPid = undefined;
   codexOwnershipAttestationPending = false;
+  refreshSandboxedCliLeafAttestation = undefined;
   if (backend) previousCliEndedAtMs = Date.now();
   inputDeliveryQuarantine?.cancelReceipt?.();
   inputDeliveryQuarantine = null;
@@ -36634,7 +36873,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
-  outputDisposition?: 'nothing_to_send',
+  outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered',
   retryable?: boolean,
   /** Backend-supplied completion instant (codex-app's runner timestamps its own
    *  finals). Clamped to now by the clock; absent means "use this instant". */
@@ -37553,7 +37792,7 @@ async function sendFatalWorkerErrorAndExit(
   fatalWorkerErrorPending = true;
   // No CLI of this start ever existed to take the queued inputs; the daemon's
   // retry of a transient startup failure starts the worker that types them.
-  if (err instanceof RuntimeReservationExpiredError) saveUnsentInputsForSuccessor('runtime reservation unconfirmed');
+  if (err instanceof RuntimeReservationExpiredError || err instanceof RuntimeReservationRefusedError) saveUnsentInputsForSuccessor('runtime reservation unconfirmed');
   const pendingAttemptId = pendingLaunchConvergence?.attemptId;
   pendingLaunchConvergence = undefined;
   if (pendingAttemptId && pendingAttemptId !== activeRestartAttemptId) {
@@ -38309,7 +38548,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'runtime_contract_reserved': {
       const binding = workerSessionEventScope?.currentBinding();
       if (binding?.bindingId === msg.bindingId) binding.proposedRuntime = msg.runtime;
-      pendingRuntimeReservations.get(msg.bindingId)?.(msg.mayStart);
+      pendingRuntimeReservations.get(msg.bindingId)?.(msg.mayStart, msg.startRefusal);
       break;
     }
     case 'execution_contract_assigned': {

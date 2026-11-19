@@ -82,10 +82,10 @@ async function changeRegion(draft: any, region: string) {
   expect(changed.toast.type).toBe('info');
   await changed.afterAck();
 }
-function submitted(attempt: OncallNativeSubmissionAttempt, id: number, createdAtMs: number) {
+function submitted(attempt: OncallNativeSubmissionAttempt, id: number, launchedAtMs: number) {
   return { id, tenant_id: 12, source_location: attempt.sourceLocation, originator_user: 'actor',
     oncall_question_type_id: attempt.typeId, region: attempt.region, stage: 'launch_oncall',
-    chat_id: '123456789', create_time: new Date(createdAtMs).toISOString() };
+    chat_id: '123456789', oncall_start_time: new Date(launchedAtMs).toISOString() };
 }
 const request = () => new OncallGroupStore(dir).getRequest(source);
 const listCalls = () => fetcher.mock.calls.filter(([url]) => String(url).includes('/oncall_flow/list')).length;
@@ -141,7 +141,7 @@ describe('native submission snapshot history', () => {
     const draft = await openDraft(); const attempt = draft.nativeSubmission!.attempts[0]!;
     rows = [submitted(attempt, 1234, now + 1000)]; vi.setSystemTime(now + 5000); mocks.remove.mockResolvedValue(false);
     await reconcileNativeOncallSubmissions('app');
-    expect(mocks.remove).toHaveBeenCalledWith('app', 'om_form');
+    expect(mocks.remove).toHaveBeenCalledWith('app', 'om_form', { acceptWithdrawn: true });
     expect((await current(draft.id)).nativeSubmission?.completed).not.toBe(true);
     const attemptId = request()!.attemptId; const queries = listCalls();
     mocks.remove.mockResolvedValue(true); vi.setSystemTime(now + 70_000); await reconcileNativeOncallSubmissions('app');

@@ -19,14 +19,16 @@ function ledger(day: string, records: unknown[]) { writeFileSync(join(dir, `usag
 describe('usage ledger analytics', () => {
   it('sums deltas once, keeps all four buckets and preserves separate bot partitions', async () => {
     const rows = [record(), record(), record({ larkAppId: 'bot-b', title: 'Other bot' }),
-      record({ kind: 'ownership' }), record({ recordId: 'r2', costCny: 0, inputTokens: 5 })];
+      record({ kind: 'ownership' }),
+      record({ kind: 'reset', recordId: 'reset-1', inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreateTokens: 0, epoch: 1 }),
+      record({ recordId: 'r2', costCny: 0, inputTokens: 5 })];
     ledger('2026-11-10', rows);
     const before = readFileSync(join(dir, 'usage-2026-11-10.jsonl'), 'utf8');
     const result = await queryUsageLedger(query, { ledgerDir: dir });
     expect(result.summary).toEqual({ inputTokens: 25, outputTokens: 60, cacheReadTokens: 90,
       cacheCreateTokens: 120, totalTokens: 295, records: 3, costCny: 0, pricedRecords: 1 });
     expect(result.coverage.duplicateRecords).toBe(1);
-    // Ownership markers are expected bookkeeping, not "incomplete" records.
+    // Ownership/reset markers are expected bookkeeping, not usage or invalid rows.
     expect(result.coverage.invalidRecords).toBe(0);
     expect(result.sessions).toHaveLength(2);
     expect(result.bots.map(r => [r.id, r.totalTokens])).toEqual([['bot-a', 195], ['bot-b', 100]]);

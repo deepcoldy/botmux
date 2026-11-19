@@ -42,11 +42,13 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 
 ## 5 分钟接入
 
-> 一次飞书扫码即可连续建好应用、配全权限并自动发版（手动创建 / 粘贴凭证也是 setup 中的可选路径）。
+> 一次飞书扫码即可连续建好应用、配全权限并自动发版（手动粘贴凭证也是可选路径）。不需要飞书时用 `botmux setup add --local`，或在 Dashboard「添加机器人」里选「仅本地」。写进 `bots.json` 的 `local_*` id 只是本机身份，不是飞书 App ID。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作目录（自动配权限 + 发版）
+botmux setup add --local --name 研究室 --cli codex --default-working-dir ~ --json
+                             # 只创建本地机器人：不扫码、不绑定飞书 App ID / Secret
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
 

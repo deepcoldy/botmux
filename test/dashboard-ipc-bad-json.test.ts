@@ -16,6 +16,7 @@ const ROUTES: ReadonlyArray<readonly [string, string]> = [
   ['POST', '/api/sessions/:sessionId/durable-send'],
   ['POST', '/api/sessions/:sessionId/native-subagent-runtime'],
   ['POST', '/api/host-overload/sweep'],
+  ['POST', '/api/tmux-upgrade/suspend-idle'],
   ['POST', '/api/sessions/:sessionId/preview'],
   ['POST', '/api/sessions/:sessionId/board'],
   ['POST', '/api/sessions/:sessionId/whiteboard'],

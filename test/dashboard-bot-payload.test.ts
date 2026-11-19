@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { invalidateGlobalConfigCache } from '../src/global-config.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig, withConfiguredCliId } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
   it('shows persisted legacy CoT preferences with explicit canonical values taking precedence', () => {
@@ -737,6 +737,30 @@ describe('dashboard bot payload helpers', () => {
       invalidateGlobalConfigCache();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+  it('propagates apiOnly through live, descriptor and offline recovery payloads', () => {
+    expect(botDefaultsPayload({ larkAppId: 'local_descriptor', apiOnly: true }, {}).apiOnly).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'local_live' }, { apiOnly: true }).apiOnly).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'cli_live' }, {}).apiOnly).toBe(false);
+    const offline = botDefaultsPayload(
+      { larkAppId: 'local_offline' },
+      { displayName: null, larkBotName: null, ...sparseOverridesFromRawBotConfig({ apiOnly: true }) },
+    );
+    expect(offline.apiOnly).toBe(true);
+    expect(mergeBotOncallFields({ larkAppId: 'local_old', apiOnly: true }, {}).apiOnly).toBe(true);
+    expect(mergeBotOncallFields({ larkAppId: 'local_new' }, { apiOnly: true }).apiOnly).toBe(true);
+    expect(mergeBotOncallFields({ larkAppId: 'local_old', apiOnly: true }, { apiOnly: false }).apiOnly).toBe(false);
+  });
+
+  it('keeps apiOnly when merging an older daemon descriptor with config fallbacks', () => {
+    const fallback = new Map<string, { apiOnly?: boolean; cliId?: string }>([
+      ['local_old', { apiOnly: true, cliId: 'riff' }],
+      ['cli_old', { apiOnly: false, cliId: 'codex' }],
+    ]);
+    expect(withConfiguredCliId({ larkAppId: 'local_old' }, fallback)).toMatchObject({ apiOnly: true, cliId: 'riff' });
+    expect(withConfiguredCliId({ larkAppId: 'cli_old' }, fallback)).toMatchObject({ apiOnly: false, cliId: 'codex' });
+    // An explicit descriptor value remains authoritative over a stale config fallback.
+    expect(withConfiguredCliId({ larkAppId: 'local_old', apiOnly: false }, fallback).apiOnly).toBe(false);
   });
 });
 

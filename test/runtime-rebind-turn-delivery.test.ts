@@ -52,7 +52,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function startWorker({ opening = true, cliPid = process.ppid, restart = false, wake = false }: { opening?: boolean; cliPid?: number; restart?: boolean; wake?: boolean } = {}) {
+async function startWorker({ opening = true, cliPid = process.ppid, restart = false, wake = false, zeroPrompt = false }: { opening?: boolean; cliPid?: number; restart?: boolean; wake?: boolean; zeroPrompt?: boolean } = {}) {
   const sessionReply = vi.fn(async () => 'om_reply');
   const screenStatuses: Array<{ prevStatus?: string; status: string; turnId?: string }> = [];
   workerPool.initWorkerPool({
@@ -66,7 +66,9 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
     { rootMessageId: turnId, senderOpenId: `ou_${turnId}`, updatedAt: new Date().toISOString() }]));
   const ds = {
     session: { sessionId: SESSION, chatId: 'oc_group', chatType: 'group', status: 'active', cliId: 'claude-code',
-      createdAt: new Date().toISOString(), workerGeneration: 1, replyTargets },
+      createdAt: new Date().toISOString(), workerGeneration: 1, replyTargets,
+      // Zero-prompt: the CLI's own turns answer the latest message of the chat.
+      ...(zeroPrompt ? { promptInjection: 'none', quoteTargetId: TURNS[0] } : {}) },
     larkAppId: APP, chatId: 'oc_group', chatType: 'group', scope: 'chat',
     worker, workerGeneration: 1, workerPort: 0, workerToken: 'token',
     spawnedAt: Date.now(), cliVersion: '1', lastMessageAt: Date.now(), hasHistory: true,
@@ -233,7 +235,7 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
 
 const answers = (...turnIds: string[]) => turnIds.map(turnId => expect.stringContaining(`answer for ${turnId}`));
 const lostTurnWarnings = (warn: ReturnType<typeof vi.spyOn>) => warn.mock.calls.map(([line]) => String(line))
-  .filter(line => /Dropped managed_turn_origin|not delivered|Worker user_notify/.test(line));
+  .filter(line => /Dropped (managed_turn_origin|terminal_turn_started)|not delivered|Worker user_notify/.test(line));
 
 describe('turns around a semantic runtime rebind', () => {
   it('settles the live screen after a semantic rebind without moving the execution origin', async () => {
@@ -451,6 +453,31 @@ describe('turns around a semantic runtime rebind', () => {
     await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0], 'local-wake-before', 'local-wake-after')));
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(s.replies()).toHaveLength(3);
+    expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+
+  // Zero-prompt: the answer to a turn the CLI starts on its own (a background
+  // task's wake-up) goes out only to where the turn's start said it replies.
+  // The transcript bridge reports that start under the binding the spawn left
+  // behind, which every production start has rebound since.
+  it.each([
+    ['the relay resolved the real CLI and it reported its session id', { cliPid: process.ppid },
+      async (s: Awaited<ReturnType<typeof startWorker>>) => { await s.relayResolvesRealCli(); await s.publishNativeSession('native-cold'); }],
+    ['/clear moved the CLI to another session id', { cliPid: process.pid },
+      async (s: Awaited<ReturnType<typeof startWorker>>) => { await s.publishNativeSession('native-before-clear'); await s.publishNativeSession('native-after-clear'); }],
+  ] as const)('zero-prompt: posts the answer to a turn the CLI starts on its own after %s', async (_shape, opts, rebind) => {
+    const warn = vi.spyOn(logger, 'warn');
+    const s = await startWorker({ opening: false, zeroPrompt: true, ...opts });
+    await rebind(s);
+    expect(s.scope.currentBinding()).not.toBe(s.binding);
+    const turnId = 'local-headless-wake';
+    await s.bridge({ type: 'terminal_turn_started', turnId, startedAtMs: Date.now() });
+    await s.bridge({ type: 'final_output', content: `answer for ${turnId}`, lastUuid: `uuid-${turnId}`, turnId, terminalLocal: true });
+    await s.bridge({ type: 'turn_terminal', sessionId: SESSION, turnId, status: 'completed' });
+
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(turnId)));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(s.replies()).toHaveLength(1);
     expect(lostTurnWarnings(warn)).toEqual([]);
   });
 });

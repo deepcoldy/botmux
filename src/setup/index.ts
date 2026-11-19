@@ -16,6 +16,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { detectPlatform } from './detect-platform.js';
 import { ensureTmux, type TmuxResult } from './ensure-tmux.js';
+import { tmuxRecommendationWarning } from './tmux-recommended.js';
+import { getDefaultLocale } from '../i18n/index.js';
 import { ensureFonts, type FontResult } from './ensure-fonts.js';
 import { ensureHerdr, type HerdrResult } from './ensure-herdr.js';
 import { ensureHerdrIntegrations, type HerdrIntegrationResult } from './ensure-herdr-integrations.js';
@@ -101,6 +103,9 @@ export async function ensureDependencies(): Promise<DependenciesReport> {
   const ptyOptIn = (process.env.BACKEND_TYPE ?? '').toLowerCase() === 'pty';
   if (tmux.installed) {
     if (!tmux.freshInstall) console.log(`✓ tmux ${tmux.version} (existing)`);
+    // Advisory only: a tmux that passed the functional probe keeps working.
+    const advice = tmuxRecommendationWarning(tmux.version, getDefaultLocale());
+    if (advice) console.warn(advice);
   } else if (ptyOptIn) {
     console.warn('');
     console.warn('⚠️  tmux 不可用，但已显式设置 BACKEND_TYPE=pty —— 将使用 PTY 后端兜底。');
