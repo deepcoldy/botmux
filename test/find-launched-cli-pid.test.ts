@@ -4,7 +4,7 @@ import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
-import { CODEX_LEAF_SEARCH_DEPTH, cliIdForComm, findLaunchedCliPid, isClaudeMetadataProbeArgv, isGenericLauncherComm, isNonInteractiveCodexArgv, launcherRetryStillValid, processExecutableArgvSlots, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { CODEX_LEAF_SEARCH_DEPTH, cliIdForComm, findLaunchedCliPid, isClaudeMetadataProbeArgv, wrapperGenericLauncherComm, isNonInteractiveCodexArgv, launcherRetryStillValid, processExecutableArgvSlots, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { sameExecutableObject } from '../src/services/cli-install-identity.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
@@ -94,6 +94,8 @@ function runWorkerWiring(late: boolean, options: {
   runningExes?: Record<number, string | undefined>;
   /** Resolved wrapper command captured before credential sandbox wrapping. */
   wrapperLaunch?: { bin: string; args: string[] };
+  /** Base CLI command captured before wrapper and sandbox rewriting. */
+  directCliBin?: string;
   /** Mutable birth identities and zombie states used by the startup liveness monitor. */
   processStarts?: Record<number, string | undefined>;
   zombies?: Record<number, boolean>;
@@ -205,6 +207,7 @@ function runWorkerWiring(late: boolean, options: {
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
     credentialOnlyBwrap: options.credentialOnlyBwrap ?? false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
     configuredWrapperLaunch: options.wrapperLaunch ?? { bin: '/opt/wrapper/launcher', args: ['claude'] },
+    reproduceBaseBin: options.directCliBin ?? '/opt/claude/claude',
     spawnCwd: '/work',
     // Module-level spawn counter read by the TRAE leaf-resolve guard; the sliced
     // wiring runs in this VM without worker.ts's declaration, so supply its
@@ -224,7 +227,7 @@ function runWorkerWiring(late: boolean, options: {
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
     findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid, cliIdForComm, isClaudeMetadataProbeArgv,
-    basename, resolve, processExecutableArgvSlots, isGenericLauncherComm, sameExecutableObject,
+    basename, resolve, processExecutableArgvSlots, wrapperGenericLauncherComm, sameExecutableObject,
     resolveInstallIdentity: (path: string) => ({ path, dev: 'dev', ino: path, size: '1', mtimeNs: '1', source: 'install-stat' }),
     sessionScopePayloadPid: vi.fn((pid: number) => {
       scopeProbes++;
@@ -692,6 +695,180 @@ describe('worker wrapper PID wiring', () => {
     expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
     expect(result.backend.cliPid).toBe(150);
     expect(result.bridgeCliPid).toBe(150);
+  });
+
+  it.each([false, true])('keeps a native direct root when exec retains the configured wrapper argv0 (late PID=%s)', late => {
+    const children: Record<number, number[]> = {};
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, runningExes: { 150: '/opt/claude/claude.exe' },
+      cmdlines: { 150: ['/opt/wrapper/launcher', 'claude'] }, children,
+      childComms: { 150: 'claude', 154: 'claude' },
+    });
+    children[150] = [154];
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('keeps the direct root when wrapper and CLI resolve to the same executable (late PID=%s)', late => {
+    const children: Record<number, number[]> = {};
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'claude', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, directCliBin: '/opt/claude/claude',
+      wrapperLaunch: { bin: '/opt/claude/claude', args: [] }, runningExes: { 150: '/opt/claude/claude' },
+      cmdlines: { 150: ['/opt/claude/claude'] }, children,
+      childComms: { 150: 'claude', 154: 'claude' },
+    });
+    children[150] = [154];
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('does not use a versioned shared interpreter as wrapper evidence (late PID=%s)', late => {
+    const children: Record<number, number[]> = {};
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'node-v22', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, directCliBin: '/opt/claude/claude.js',
+      wrapperLaunch: { bin: '/opt/node-v22', args: ['/opt/wrapper/launcher.js'] },
+      runningExes: { 150: '/opt/node-v22' }, cmdlines: { 150: ['/opt/node-v22', '/opt/claude/claude.js'] }, children,
+      childComms: { 150: 'claude', 154: 'claude' },
+    });
+    children[150] = [154];
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('passes through a same-comm native wrapper below the bwrap payload (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      runningExes: { 151: '/opt/wrapper/launcher' },
+      cmdlines: { 151: ['/opt/wrapper/launcher', 'claude'], 152: ['/opt/claude/claude'] },
+      children: { 150: [151], 151: [152] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude' },
+    });
+    expect(result.backend.cliPid).toBe(152);
+    expect(result.bridgeCliPid).toBe(152);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(151);
+    const leafPublications = () => result.publishLocalProcessAttestation.mock.calls
+      .filter((call: unknown[]) => call[0] === 152);
+    expect(leafPublications()).toHaveLength(1);
+    result.refreshSandboxedCliLeafAttestation!();
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(leafPublications()).toHaveLength(1);
+  });
+
+  it.each([false, true])('passes through a versioned-interpreter wrapper below bwrap by its script (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'node-v22', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, directCliBin: '/opt/claude/claude.js',
+      wrapperLaunch: { bin: '/opt/node-v22', args: ['/opt/wrapper/launcher.js'] },
+      runningExes: { 151: '/opt/node-v22', 152: '/opt/node-v22' },
+      cmdlines: { 151: ['/opt/node-v22', '/opt/wrapper/launcher.js'], 152: ['/opt/node-v22', '/opt/claude/claude.js'] },
+      children: { 150: [151], 151: [152] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude' },
+    });
+    expect(result.backend.cliPid).toBe(152);
+    expect(result.bridgeCliPid).toBe(152);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(151);
+    expect(result.publishLocalProcessAttestation).toHaveBeenCalledWith(152);
+  });
+
+  it.each([
+    { late: false, wrapperFirst: true }, { late: true, wrapperFirst: true },
+    { late: false, wrapperFirst: false }, { late: true, wrapperFirst: false },
+  ])('resolves a proven wrapper subtree before a helper sibling (wrapper first=$wrapperFirst, late PID=$late)', ({ late, wrapperFirst }) => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      runningExes: { 151: '/opt/wrapper/launcher', 152: '/opt/claude/claude', 155: '/opt/claude/claude' },
+      cmdlines: {
+        151: ['/opt/wrapper/launcher', 'claude'], 152: ['/opt/claude/claude'], 155: ['/opt/claude/claude', 'doctor'],
+      },
+      children: { 150: wrapperFirst ? [151, 155] : [155, 151], 151: [152] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude', 155: 'claude' },
+    });
+    expect(result.backend.cliPid).toBe(152);
+    expect(result.bridgeCliPid).toBe(152);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(155);
+  });
+
+  it.each([
+    { shape: 'birth unreadable at setup', missing: true, late: false },
+    { shape: 'birth unreadable at setup', missing: true, late: true },
+    { shape: 'payload slot reused before poll', missing: false, late: false },
+    { shape: 'payload slot reused before poll', missing: false, late: true },
+  ])('stops discovery for a non-CLI payload when birth is missing or changes ($shape, late PID=$late)', ({ missing, late }) => {
+    const processStarts: Record<number, string | undefined> = {
+      150: missing ? undefined : 'birth-150', 151: 'birth-151', 152: 'birth-152',
+    };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, processStarts,
+      runningExes: { 151: '/opt/wrapper/launcher' },
+      cmdlines: { 151: ['/opt/wrapper/launcher', 'claude'], 152: ['/opt/claude/claude'] },
+      children: { 150: [151], 151: [152] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude' },
+      beforeTimers: missing ? undefined
+        : scope => { scope.setTimeout(() => { processStarts[150] = 'reused-birth'; }, late ? 121 : 0); },
+    });
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(152);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('stops retrying a failed leaf publication after the payload birth changes (late PID=%s)', late => {
+    const processStarts: Record<number, string | undefined> = {
+      150: 'birth-150', 151: 'birth-151', 152: 'birth-152',
+    };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, processStarts,
+      runningExes: { 151: '/opt/wrapper/launcher' },
+      cmdlines: { 151: ['/opt/wrapper/launcher', 'claude'], 152: ['/opt/claude/claude'] },
+      children: { 150: [151], 151: [152] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude' },
+      beforeTimers: scope => {
+        let failed = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid: number) => {
+          if (pid === 152 && !failed) {
+            failed = true;
+            processStarts[150] = 'reused-birth';
+            return false;
+          }
+          return true;
+        });
+      },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 152)).toHaveLength(1);
+    expect(result.findLaunchedCliPid).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])('stops discovery when the stable pane changes before the exit generation advances (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      runningExes: { 151: '/opt/wrapper/launcher' },
+      cmdlines: { 151: ['/opt/wrapper/launcher', 'claude'], 152: ['/opt/claude/claude'] },
+      children: { 150: [151], 151: [152] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude' },
+      beforeTimers: scope => {
+        scope.setTimeout(() => {
+          scope.backend.getStablePanePid = () => 300;
+          scope.backend.getChildPid = () => 300;
+        }, late ? 121 : 199);
+      },
+    });
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(152);
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
   });
 
   it.each([false, true])('resolves a real CLI child when a credential-only wrapper shares its comm (late PID=%s)', late => {

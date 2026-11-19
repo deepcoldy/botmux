@@ -549,7 +549,7 @@ import {
   readCmdline,
   readCwd,
   processExecutableArgvSlots,
-  isGenericLauncherComm,
+  wrapperGenericLauncherComm,
   isNonInteractiveCodexArgv,
   isClaudeMetadataProbeArgv,
   cliIdForComm,
@@ -31541,6 +31541,10 @@ async function spawnCliBody(
     if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
     return publishLocalProcessAttestation(realPid);
   };
+  const readStablePanePid = (): number | null | undefined => {
+    const current = backend;
+    return current?.getStablePanePid ? current.getStablePanePid() : current?.getChildPid?.();
+  };
   // wrapperCli launcher → real CLI by comm. `launcherPid` is the unwrapped
   // launch payload below any pane relay or owned session-scope supervisor.
   const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
@@ -31551,10 +31555,6 @@ async function spawnCliBody(
       || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
     const generation = cliSpawnGeneration;
-    const readStablePanePid = (): number | null | undefined => {
-      const current = backend;
-      return current?.getStablePanePid ? current.getStablePanePid() : current?.getChildPid?.();
-    };
     // A backing/shell PID need not equal the foreground launcher PID. Capture
     // the backend's own stable identity rather than comparing it with panePid;
     // wrapper rewrites of cliPid leave it unchanged, while a replaced pane fails
@@ -31594,29 +31594,62 @@ async function spawnCliBody(
   // session discovery. Tool processes descend from the CLI inside it, which
   // predates every turn, so the lineage proof needs the CLI leaf attested too.
   // Codex and TRAE rebind ownership to their leaf through their own resolvers.
-  const attestSandboxedCliLeaf = (payloadPid: number): void => {
+  const attestSandboxedCliLeaf = (payloadPid: number, panePid: number): void => {
     if (!(sandboxRequested || credentialOnlyBwrap) || cfg.cliId === 'codex' || cfg.cliId === 'traex') return;
     const targetCliId = cfg.cliId as CliId;
     const generation = cliSpawnGeneration;
     const backendAtSpawn = backend;
+    const stablePanePid = readStablePanePid() ?? panePid;
     // Credential-only bwrap + wrapperCli historically rewired discovery/bridge
     // to the leaf. Preserve that here; full sandboxes keep the outer payload.
     const rewireOwnership = credentialOnlyBwrap && !sandboxRequested
       && !!cfg.wrapperCli?.trim() && !!claudeDataDir;
     const payloadProcStart = rewireOwnership ? readProcessStartIdentity(payloadPid) : undefined;
+    const launchPayloadStillCurrent = (): boolean => {
+      if (generation !== cliSpawnGeneration || backend !== backendAtSpawn || readStablePanePid() !== stablePanePid) return false;
+      // A non-CLI payload (sh/bwrap) needs the same birth fence as a direct CLI:
+      // pid reuse must terminate discovery rather than authorize its new tree.
+      return !rewireOwnership || (!!payloadProcStart && readProcessStartIdentity(payloadPid) === payloadProcStart);
+    };
     // Only distinctive executable identity proves a persistent wrapper: for an
     // interpreter launch, that is the script, never the shared interpreter.
     const distinctiveExecutableArgv = (comm: string | undefined, argv: string[]): string[] => {
-      const slots = processExecutableArgvSlots(comm, argv);
-      return isGenericLauncherComm(comm) ? slots.slice(1) : slots.slice(0, 1);
+      const launcherComm = wrapperGenericLauncherComm(comm);
+      const slots = processExecutableArgvSlots(launcherComm ?? comm, argv);
+      return launcherComm ? slots.slice(1) : slots.slice(0, 1);
     };
+    const directCliIdentity = rewireOwnership
+      ? resolveInstallIdentity(resolve(spawnCwd, reproduceBaseBin)) : undefined;
     const wrapperIdentities = rewireOwnership && configuredWrapperLaunch
       ? distinctiveExecutableArgv(
           basename(configuredWrapperLaunch.bin),
           [configuredWrapperLaunch.bin, ...configuredWrapperLaunch.args],
         ).map(path => resolveInstallIdentity(resolve(spawnCwd, path)))
-        .filter((identity): identity is ExecutableIdentity => identity !== undefined)
+        // A wrapper that resolves to the CLI itself cannot prove that another
+        // persistent layer exists; keep the direct root on this ambiguity.
+        .filter((identity): identity is ExecutableIdentity => identity !== undefined
+          && !sameExecutableObject(identity, directCliIdentity))
       : [];
+    const matchesWrapperIdentity = (identity: ExecutableIdentity | undefined): boolean =>
+      wrapperIdentities.some(wrapper => sameExecutableObject(identity, wrapper));
+    const isConfiguredWrapper = (pid: number, procStart: string): boolean => {
+      if (wrapperIdentities.length === 0 || readProcessStartIdentity(pid) !== procStart) return false;
+      const exe = readRunningExeIdentity(pid, procStart);
+      if (exe) {
+        if (matchesWrapperIdentity(exe)) return true;
+        // A readable native image that differs from the configured wrapper is
+        // positive direct-CLI evidence. Process-controlled argv0 cannot overturn
+        // it; only an interpreter proceeds to its constrained script slot.
+        if (!wrapperGenericLauncherComm(basename(exe.path))) return false;
+      }
+      const argv = readCmdline(pid, { exact: true });
+      const cwd = readCwd(pid) ?? spawnCwd;
+      const matches = distinctiveExecutableArgv(exe ? basename(exe.path) : undefined, argv).some(path => {
+        const identity = resolveInstallIdentity(resolve(cwd, path));
+        return matchesWrapperIdentity(identity);
+      });
+      return matches && readProcessStartIdentity(pid) === procStart;
+    };
     const findLeaf = (lp: number): number | null => findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, {
       // One process-table snapshot per BFS, not one synchronous ps per node.
       childrenOf: snapshotChildPids(),
@@ -31630,6 +31663,11 @@ async function spawnCliBody(
           && isClaudeMetadataProbeArgv(readCmdline(pid, { exact: true }))) return undefined;
         return comm;
       },
+      isPersistentWrapper: (pid) => {
+        if (!rewireOwnership) return false;
+        const procStart = readProcessStartIdentity(pid);
+        return procStart ? isConfiguredWrapper(pid, procStart) : false;
+      },
     });
     const isDirectLeaf = (lp: number): boolean => {
       if (cliIdForComm(readComm(lp) ?? '', targetCliId) !== targetCliId) return false;
@@ -31639,14 +31677,7 @@ async function spawnCliBody(
       // wrapper binary/script; versioned-native and interpreter-hosted CLIs keep
       // their direct root, as does any payload with ambiguous identity evidence.
       if (!payloadProcStart || readProcessStartIdentity(lp) !== payloadProcStart || wrapperIdentities.length === 0) return true;
-      const exe = readRunningExeIdentity(lp, payloadProcStart);
-      if (exe && wrapperIdentities.some(wrapper => sameExecutableObject(exe, wrapper))) return false;
-      const argv = readCmdline(lp, { exact: true });
-      const cwd = readCwd(lp) ?? spawnCwd;
-      return !distinctiveExecutableArgv(exe ? basename(exe.path) : undefined, argv).some(path => {
-        const identity = resolveInstallIdentity(resolve(cwd, path));
-        return identity !== undefined && wrapperIdentities.some(wrapper => sameExecutableObject(identity, wrapper));
-      });
+      return !isConfiguredWrapper(lp, payloadProcStart);
     };
     let attested: { pid: number; procStart: string; published: boolean } | undefined;
     // A live, successfully published leaf is never sent twice: every actual
@@ -31654,6 +31685,7 @@ async function spawnCliBody(
     const isAttested = (pid: number | undefined): boolean => pid !== undefined && attested?.pid === pid
       && attested.published && !isZombieProcess(pid) && readProcessStartIdentity(pid) === attested.procStart;
     const attest = (leafPid: number): boolean => {
+      if (!launchPayloadStillCurrent()) return false;
       if (isAttested(leafPid)) return true;
       const procStart = readProcessStartIdentity(leafPid);
       if (!procStart || isZombieProcess(leafPid)) return false;
@@ -31667,10 +31699,10 @@ async function spawnCliBody(
     // Ready/input edges retain the repair path after the bounded startup poll;
     // both edges and the poll share the same liveness and deduplication state.
     refreshSandboxedCliLeafAttestation = () => {
+      if (!launchPayloadStillCurrent()) return;
       // A proven direct CLI payload was already attested at bind time. Never
       // replace it with a same-comm subagent discovered on a ready/input edge.
-      if (isDirectLeaf(payloadPid)) return;
-      if (generation !== cliSpawnGeneration || backend !== backendAtSpawn || isAttested(attested?.pid)) return;
+      if (isDirectLeaf(payloadPid) || isAttested(attested?.pid)) return;
       const leafPid = findLeaf(payloadPid);
       if (leafPid) attest(leafPid);
     };
@@ -31681,7 +31713,7 @@ async function spawnCliBody(
       findRealPid: findLeaf,
       isDirectLeaf,
       getBackend: () => backend,
-      getChildPid: () => (generation === cliSpawnGeneration ? payloadPid : null),
+      getChildPid: () => launchPayloadStillCurrent() ? payloadPid : null,
       applyRealPid: attest,
       // A matching comm can be a short-lived wrapper probe. Keep the startup
       // watcher after success so a dead/zombie/reused PID reopens discovery.
@@ -31701,7 +31733,7 @@ async function spawnCliBody(
       }
     }
     resolveBehindWrapper(resolved.pid, panePid);
-    attestSandboxedCliLeaf(resolved.pid);
+    attestSandboxedCliLeaf(resolved.pid, panePid);
   };
   const startWrapperRealPidResolve = (panePid: number): void => {
     let resolved = unwrapLaunchLayers(panePid);
