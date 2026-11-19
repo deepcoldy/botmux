@@ -351,6 +351,8 @@ export type BotDefaultsRow = {
   larkAppId: string;
   botName?: string;
   cliId?: string;
+  /** Local/core-only bots have no Feishu transport. */
+  apiOnly?: boolean;
   /** 租户品牌，决定飞书后台深链的 host（feishu.cn vs larksuite.com）。
    *  缺省（旧 payload / 未注册）→ larkConsoleUrl 内 normalizeBrand 兜底 feishu。 */
   brand?: string;

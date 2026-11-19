@@ -10478,6 +10478,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
+    apiOnly: getBot(cachedLarkAppId).config.apiOnly === true,
     botName: getBotName(),
     displayName,
     larkBotName,

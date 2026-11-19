@@ -8,6 +8,7 @@ import {
   CardBehaviorSection,
   patchCardPrefsFromBody,
   CodexAppDisplaySection,
+  OwnerGroupFollowControls,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled, onboardingRetryMode } from '../src/dashboard/web/bot-onboarding.js';
@@ -1943,6 +1944,30 @@ describe('bot onboarding Agent availability warning', () => {
     expect(onboardingRetryMode({ registrationMode: 'local' })).toBe('local');
     expect(onboardingRetryMode({ registrationMode: 'web' })).toBe('web');
     expect(onboardingRetryMode({ registrationMode: 'compat' })).toBe('web');
+  });
+});
+
+describe('owner group follow transport gate', () => {
+  it('shows an unavailable explanation for apiOnly while preserving Feishu controls', () => {
+    const render = (apiOnly: boolean) => {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(OwnerGroupFollowControls, {
+          bot: { larkAppId: apiOnly ? 'local_x' : 'cli_x', apiOnly },
+          patchBot: vi.fn(),
+        }));
+      });
+      return renderer;
+    };
+    const local = render(true);
+    expect(local.root.findAll(node => node.props['data-owner-group-follow'] !== undefined)).toHaveLength(0);
+    expect(local.root.findAll(node => node.props['data-owner-group-follow-unavailable'] !== undefined)).toHaveLength(1);
+    act(() => { local.unmount(); });
+
+    const feishu = render(false);
+    expect(feishu.root.findAll(node => node.props['data-owner-group-follow'] !== undefined)).toHaveLength(1);
+    expect(feishu.root.findAll(node => node.props['data-owner-group-follow-unavailable'] !== undefined)).toHaveLength(0);
+    act(() => { feishu.unmount(); });
   });
 });
 

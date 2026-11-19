@@ -376,7 +376,7 @@ import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './c
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig, withConfiguredCliId, type ConfiguredBotAgentFields } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -3284,16 +3284,11 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-type ConfiguredBotAgentFields = Partial<Pick<BotConfig,
-  'cliRuntime' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'model'
-  | 'modelBackendVariant' | 'reasoningEffort' | 'codexProfile' | 'serviceTier' | 'nativeSubagentRuntime'
-  | 'traexAutoModel' | 'turnTimeoutMs' | 'dshRuntime' | 'dshProfile' | 'cliConfigDir'
->> & { cliId?: string };
-
 function configuredBotAgentFields(): Map<string, ConfiguredBotAgentFields> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
+      apiOnly: b.apiOnly,
       cliRuntime: b.cliRuntime,
       // loadBotConfigs mirrors structured runtime.executable into this legacy
       // field in memory. Only forward a genuine path-only config to the private
@@ -3369,6 +3364,7 @@ async function configuredBotDefaultsRecoveryRows(
           larkAppId: bot.larkAppId,
           botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
           cliId: bot.cliId,
+          apiOnly: bot.apiOnly,
           brand: bot.brand,
           cliRuntime: bot.cliRuntime,
           cliPathOverride: bot.cliRuntime ? undefined : bot.cliPathOverride,
@@ -3403,33 +3399,6 @@ async function configuredBotDefaultsRecoveryRows(
   } catch {
     return [];
   }
-}
-
-function withConfiguredCliId<T extends { larkAppId: string } & ConfiguredBotAgentFields>(
-  bot: T,
-  ids: Map<string, string> | Map<string, ConfiguredBotAgentFields>,
-): T & ConfiguredBotAgentFields {
-  const raw = ids.get(bot.larkAppId);
-  const fallback: ConfiguredBotAgentFields | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
-  return {
-    ...bot,
-    cliId: bot.cliId || fallback?.cliId,
-    cliRuntime: bot.cliRuntime || fallback?.cliRuntime,
-    cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
-    wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
-    cliLaunchMode: bot.cliLaunchMode || fallback?.cliLaunchMode,
-    model: bot.model || fallback?.model,
-    traexAutoModel: bot.traexAutoModel ?? fallback?.traexAutoModel,
-    modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
-    reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
-    codexProfile: bot.codexProfile ?? fallback?.codexProfile,
-    serviceTier: bot.serviceTier || fallback?.serviceTier,
-    nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
-    turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
-    dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
-    dshProfile: bot.dshProfile ?? fallback?.dshProfile,
-    cliConfigDir: bot.cliConfigDir ?? fallback?.cliConfigDir,
-  };
 }
 
 function liveBots(): { larkAppId: string; botName: string; cliId?: string; larkTransportEnabled?: boolean }[] {
