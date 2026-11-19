@@ -25,7 +25,7 @@ import { readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
-import { managedTmuxBinDirIfInstalled } from './tmux-managed-path.js';
+import { managedTmuxBinDir, managedTmuxBinDirIfInstalled } from './tmux-managed-path.js';
 import {
   isBotmuxManagedTmuxEnvKey,
   isBotmuxManagedTmuxServerGlobalEnvKey,
@@ -401,13 +401,24 @@ export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv
     if (isBotmuxManagedTmuxEnvKey(key)) continue;
     rest[key] = value;
   }
+  // An earlier tmuxEnv() call may already have prepended botmux's managed
+  // tmux dir (workers inherit the daemon's derived PATH). Strip every stale
+  // occurrence first, then re-prepend it only when the copy verifies NOW and
+  // no fence is active: otherwise a copy that broke after the PATH was first
+  // derived (a library removed, a noexec remount), or a fence entered
+  // afterwards, would keep shadowing the user's tmux through the inherited
+  // PATH entry even though the fresh health check already says not to use it.
+  const managedBin = managedTmuxBinDirIfInstalled(undefined, env);
+  const inheritedPath = (rest.PATH?.split(':') ?? [])
+    .filter(part => part && part !== managedTmuxBinDir())
+    .join(':');
   return {
     ...rest,
     // botmux's own prebuilt tmux (installed only by the one-click upgrade on a
     // host whose tmux no package manager owns) wins over whatever else is on
     // PATH, so every botmux tmux call — daemon, workers, the next server —
     // agrees on one binary. The user's own tmux is never touched.
-    PATH: withTmuxSearchPath(rest.PATH, managedTmuxBinDirIfInstalled(undefined, env)),
+    PATH: withTmuxSearchPath(inheritedPath, managedBin),
   };
 }
 

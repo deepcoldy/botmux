@@ -97,6 +97,36 @@ describe('tmuxEnv and botmux\'s own tmux', () => {
     expect(tmuxEnv({ PATH: '/usr/bin', BOTMUX_FENCED_RUN: '1' }).PATH).not.toContain('.botmux/tools');
   });
 
+  it('a stale managed entry in an inherited PATH is removed once re-verification fails past the TTL', () => {
+    vi.useFakeTimers();
+    try {
+      const binDir = installLayout();
+      const bin = join(binDir, 'tmux');
+      // The daemon derived this PATH while the copy was healthy; a worker
+      // inherits it and later re-derives an environment from the same object.
+      const derived = tmuxEnv({ PATH: '/usr/bin:/bin' });
+      expect(derived.PATH!.split(':')[0]).toBe(binDir);
+      chmodSync(bin, 0o600);
+      vi.advanceTimersByTime(60_001);
+      const rederived = tmuxEnv({ ...derived });
+      const parts = rederived.PATH!.split(':');
+      expect(parts).not.toContain(binDir);
+      expect(parts[0]).toBe('/usr/bin');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('entering a fence strips the managed entry even when the inherited PATH already carries it', () => {
+    const binDir = installLayout();
+    const derived = tmuxEnv({ PATH: '/fence/bin:/usr/bin' });
+    expect(derived.PATH!.split(':')[0]).toBe(binDir);
+    const fenced = tmuxEnv({ PATH: derived.PATH!, BOTMUX_FENCED_RUN: '1' });
+    const parts = fenced.PATH!.split(':');
+    expect(parts).not.toContain(binDir);
+    expect(parts[0]).toBe('/fence/bin');
+  });
+
   it('`current` must be botmux\'s symlink, not a directory someone created', () => {
     const root = managedTmuxRoot(home);
     mkdirSync(join(root, 'current', 'bin'), { recursive: true });
