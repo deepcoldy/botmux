@@ -228,6 +228,20 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ cardBrandLabel: enabled });
   });
 
+  it.each([false, true])('persists modelQueueNotify=%s without replacing unrelated settings', async enabled => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ modelQueueNotify: enabled }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ modelQueueNotify: enabled });
+  });
+
+  it.each(['true', 1, null, {}])('rejects malformed model queue notification without writing: %s', async modelQueueNotify => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ modelQueueNotify }, deps);
+    expect(result).toMatchObject({ ok: false, error: 'invalid_modelQueueNotify' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
   it('writes noVisibleOutputHint toggle (on) through the dashboard segment', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ noVisibleOutputHint: true }, deps);

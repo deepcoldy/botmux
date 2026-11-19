@@ -12,6 +12,7 @@ import {
   type AntigravityTranscriptState,
 } from '../src/services/antigravity-transcript.js';
 import { resolveFileBridgePath } from '../src/services/file-bridge-path.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { resolveSessionTranscriptPath, __resetTranscriptResolverCacheForTest } from '../src/services/transcript-resolver.js';
 import { bridgeSpecFor } from '../src/adapters/cli/registry.js';
 import { jsonl, writeAntigravityTwoLogs } from './helpers/antigravity-two-logs.js';
@@ -73,6 +74,40 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+});
+
+it('keeps a locally typed reply out of the interrupted Lark turn in adopt mode', () => {
+  const queue = new CodexBridgeQueue();
+  const started = '2026-09-29T03:00:00Z';
+  queue.mark('om_first', 'Lark request', Date.parse(started), undefined, undefined, undefined, true);
+  writeFileSync(path, line(userRecord('Lark request', started)) + line(plannerStep({ toolCalls: [toolCall('run_command')] })));
+  const firstDrain = drainAntigravityTranscript(path, 0, {}, { adoptMode: true });
+  queue.ingest(firstDrain.events);
+
+  appendFileSync(path, line(userRecord('Terminal-only request', '2026-09-29T03:00:11Z'))
+    + line(plannerStep({ content: 'Terminal-only reply', createdAt: '2026-09-29T03:00:12Z' })));
+  const secondDrain = drainAntigravityTranscript(path, firstDrain.newOffset, firstDrain.state, {
+    adoptMode: true, flushTrailingFinal: true,
+  });
+  queue.ingest(secondDrain.events);
+  expect(queue.drainEmittable()).toEqual([expect.objectContaining({
+    turnId: 'om_first', finalText: '', terminalStatus: 'ambiguous',
+  })]);
+});
+
+it('ignores a local input that only shares the pending Lark input prefix', () => {
+  const queue = new CodexBridgeQueue();
+  const request = 'List the notes';
+  const started = '2026-09-29T03:00:00Z';
+  queue.mark('om_first', request, Date.parse(started), undefined, undefined, undefined, true);
+  writeFileSync(path, line(userRecord(`${request} in the local folder`, started))
+    + line(plannerStep({ content: 'Reply to the terminal input' }))
+    + line(userRecord(request, '2026-09-29T03:00:02Z'))
+    + line(plannerStep({ content: 'Reply to the Lark input' })));
+  queue.ingest(drainAntigravityTranscript(path, 0, {}, { adoptMode: true, flushTrailingFinal: true }).events);
+  expect(queue.drainEmittable()).toEqual([expect.objectContaining({
+    turnId: 'om_first', finalText: 'Reply to the Lark input',
+  })]);
 });
 
 describe('antigravityTranscriptPath', () => {

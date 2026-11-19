@@ -5,6 +5,7 @@ import {
   writeFileSync,
   rmSync,
   realpathSync,
+  renameSync,
   symlinkSync,
   unlinkSync,
   utimesSync,
@@ -46,6 +47,7 @@ const fake = {
 
 import {
   __resetTranscriptResolverCacheForTest,
+  claudeWritableTreeRoot,
   resolveSessionTranscriptPath,
   cliSupportsNativeUsage,
 } from '../src/services/transcript-resolver.js';
@@ -148,7 +150,20 @@ describe('resolveSessionTranscriptPath — sandboxed-bot BOT_HOME fallback', () 
     const resolved = resolveSessionTranscriptPath({
       cliId: 'claude-code', sessionId: 'sb-1', cwd, larkAppId: APP_ID,
     });
-    expect(resolved).toEqual({ path: expected, kind: 'claude' });
+    // The bots dir holding BOT_HOME: readers re-check everything below it.
+    expect(resolved).toEqual({ path: expected, kind: 'claude', writableTreeRoot: join(base, '.botmux', 'bots') });
+  });
+
+  it('keeps the tree root for a BOT_HOME path even when BOT_HOME/claude has become a link', () => {
+    const path = writeBotHomeTranscript('sb-swap');
+    const claudeDir = join(base, '.botmux', 'bots', APP_ID, 'claude');
+    const elsewhere = join(base, 'elsewhere-claude');
+    mkdirSync(elsewhere);
+    // The state a reader may meet after the resolver picked the path.
+    renameSync(claudeDir, `${claudeDir}.aside`);
+    symlinkSync(elsewhere, claudeDir);
+    expect(claudeWritableTreeRoot(path, undefined, APP_ID)).toBe(join(base, '.botmux', 'bots'));
+    expect(claudeWritableTreeRoot(join(fake.home, '.claude', 'projects', 'k', 'x.jsonl'), undefined, APP_ID)).toBeUndefined();
   });
 
   it('resolves the global dir when only it has the transcript (non-redirected bot)', () => {
@@ -156,7 +171,7 @@ describe('resolveSessionTranscriptPath — sandboxed-bot BOT_HOME fallback', () 
     const resolved = resolveSessionTranscriptPath({
       cliId: 'claude-code', sessionId: 'sb-2', cwd, larkAppId: APP_ID,
     });
-    expect(resolved?.path).toBe(global);
+    expect(resolved).toEqual({ path: global, kind: 'claude' });
   });
 
   // A persistent session that straddles a sandbox flip keeps its session id but

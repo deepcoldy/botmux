@@ -494,6 +494,35 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     expect(TmuxBackend.probeSessionForLaunch('bmx-live-one', socket)).toBe('exists');
   });
 
+  // A write must not wait for the lifecycle watcher (an idle pane is probed
+  // only every ~30s): send-keys into a corpse exits 0 and the text vanishes, so
+  // the read every write makes first has to see the corpse, refuse the write
+  // and report the CLI's real exit.
+  it('refuses a write into the corpse and reports its real exit code', () => {
+    const backend = new TmuxPipeBackend('bmx-corpse', { ownsSession: true, isReattach: true, socketName: socket });
+    const exits: Array<number | null> = [];
+    backend.onExit(code => exits.push(code));
+    expect(backend.sendText('hello')).toBe(false);
+    expect(exits).toEqual([77]);
+    expect(tmux('has-session', '-t', 'bmx-corpse').status).not.toBe(0); // remnant reaped
+    expect(tmux('has-session', '-t', 'bmx-live-one').status).toBe(0);
+  });
+
+  // paste-buffer into a dead pane CRASHES the whole server on tmux <= 3.3a
+  // ("server exited unexpectedly"; 3.4+ answers "target pane has exited").
+  // On a shared server that is every bot session at once, so a paste must
+  // never reach a corpse.
+  it('never pastes into the corpse: the server and its other sessions survive', () => {
+    const livePid = String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-corpse', { ownsSession: true, isReattach: true, socketName: socket });
+    const exits: Array<number | null> = [];
+    backend.onExit(code => exits.push(code));
+    expect(backend.pasteText('hello')).toBe(false);
+    expect(exits).toEqual([77]);
+    expect(tmux('has-session', '-t', 'bmx-live-one').status).toBe(0);
+    expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pid}').stdout).trim()).toBe(livePid);
+  });
+
   it('leaves a genuinely live session reported as alive', () => {
     const backend = new TmuxPipeBackend('bmx-live-one', { ownsSession: true, isReattach: true, socketName: socket });
     expect(backend.isPaneAlive()).toBe(true);

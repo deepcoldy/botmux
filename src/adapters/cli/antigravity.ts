@@ -325,7 +325,7 @@ function antigravityTranscriptHasUserInput(transcriptPath: string): boolean {
   }
 }
 
-/** Antigravity brain transcript. Zero-prompt only (no /adopt bridge). The transcript is
+/** Antigravity brain transcript for zero-prompt and adopted sessions. The transcript is
  *  created lazily after the first submit, so a file born after spawn is the live turn
  *  (`birth-aware`). Its provisional trailing final lives in driver state that the worker
  *  commits on the steady-state ingest tick only. Locates the full log first and the compact
@@ -336,7 +336,7 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
     path,
     offset,
     (ctx.state as AntigravityTranscriptState | undefined) ?? {},
-    { flushTrailingFinal: ctx.flushTrailingFinal },
+    { flushTrailingFinal: ctx.flushTrailingFinal, adoptMode: ctx.adoptMode },
   ),
   stateCommit: 'ingest',
   locate: {

@@ -596,6 +596,14 @@ export interface DaemonSession {
   lastTurnTerminalAt?: number;
   lastTurnTerminalTurnId?: string;
   lastTurnTerminalDispatchAttempt?: number;
+  /** Wall-clock of the first genuine LIVE-work signal observed after the last
+   *  completed terminal, when that work has no managed turn of its own (Web
+   *  Terminal / sandbox direct-submit). Managed turns and retry attempts are
+   *  recognized via currentTurnId / the dispatch high-water instead. This epoch
+   *  keeps the post-terminal settle and self-heal from re-idling a card that a
+   *  direct-submit episode legitimately put back to work. Reset on every
+   *  turn_terminal so a fresh post-terminal window starts clean. In-memory only. */
+  postTerminalLiveWorkAt?: number;
   lastTurnTerminalStatus?: Extract<import('../types.js').WorkerToDaemon, { type: 'turn_terminal' }>['status'];
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
@@ -872,6 +880,17 @@ export interface DaemonSession {
   lastCliInput?: string;
   /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
   lastCliInputTurnId?: string;
+  /** Inputs sent with a failed-turn rewind directive, until the worker says
+   *  whether it cut the failed turn (`failed_turn_rewind`). Keyed by the
+   *  input's turn id; bounded, in-memory (a dead worker never reports). */
+  pendingFailedTurnRewinds?: Map<string, {
+    failedTurnId: string;
+    mode: 'merge' | 'resend';
+    content: string;
+    failedUserPrompt: string;
+    /** The worker process that was asked; another one never answers. */
+    worker: DaemonSession['worker'];
+  }>;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };

@@ -30,6 +30,7 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['POST', '/api/bots/cli_a/oncall-target/choices', '/api/bot-oncall-target/choices', 'json'],
   ['POST', '/api/bots/cli_a/oncall-target/check', '/api/bot-oncall-target/check', 'none'],
   ['PUT', '/api/bots/cli_a/steward', '/api/bot-steward', 'json'],
+  ['PUT', '/api/bots/cli_a/owner-group-follow', '/api/bot-owner-group-follow', 'json'],
   ['PUT', '/api/bots/cli_a/actor-owner-bindings', '/api/bot-actor-owner-bindings', 'raw'],
   ['PUT', '/api/bots/cli_a/feedback', '/api/bot-feedback', 'raw'],
   ['PUT', '/api/bots/cli_a/chats/oc_1/feedback', '/api/chat-feedback/oc_1', 'raw'],

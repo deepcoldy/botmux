@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createSessionRuntimeSweeper } from '../src/core/session-runtime-sweep.js';
+import { registerRewindBackup, rewindBackupDirForSession, rewindBackupSuffix } from '../src/core/rewind-backup-retention.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const roots: string[] = [];
@@ -83,5 +84,52 @@ describe('session runtime sweep (#1748)', () => {
     await first;
     await sweep();
     expect(sweepScratch).toHaveBeenCalledTimes(2);
+  });
+
+  describe('rewind backups in the data dir (#3572)', () => {
+    const DAY = 24 * 60 * 60_000;
+    /** A backup a cut made `ageMs` ago into a session's backup directory. */
+    function seedBackup(data: string, sessionId: string, ageMs: number): string {
+      const dir = rewindBackupDirForSession(data, sessionId);
+      mkdirSync(dir, { recursive: true });
+      const at = Date.now() - ageMs;
+      const path = join(dir, `native.jsonl${rewindBackupSuffix(at, 'removed')}`);
+      writeFileSync(path, 'cut bytes');
+      utimesSync(path, at / 1000, at / 1000);
+      return path;
+    }
+
+    it('removes the expired ones of every session, and next to transcripts where a cut registered them, keeping the young ones', async () => {
+      const data = dataDir();
+      const expired = [seedBackup(data, 'a1', 30 * DAY), seedBackup(data, 'gone', 8 * DAY)];
+      const young = [seedBackup(data, 'a1', 2 * DAY), seedBackup(data, 'gone', 10 * 60_000)];
+      // A transcript's own directory, registered by a cut that wrote there.
+      const projectDir = dataDir();
+      const beside = join(projectDir, `native.jsonl${rewindBackupSuffix(Date.now() - 30 * DAY, 'full')}`);
+      writeFileSync(beside, 'whole transcript');
+      utimesSync(beside, (Date.now() - 30 * DAY) / 1000, (Date.now() - 30 * DAY) / 1000);
+      registerRewindBackup(beside, data);
+      expired.push(beside);
+      const { sweep, log } = harness(data);
+
+      await sweep();
+
+      for (const path of expired) expect(existsSync(path)).toBe(false);
+      for (const path of young) expect(existsSync(path)).toBe(true);
+      expect(log.info).toHaveBeenCalledWith(expect.stringMatching(/3 rewind backup/));
+    });
+
+    it('still prunes them in a round skipped for want of the active sessions', async () => {
+      const data = dataDir();
+      mkdirSync(join(data, 'session-stores', 'appA'), { recursive: true });
+      writeFileSync(join(data, 'session-stores', 'appA', 'sessions.db'), 'this is not a database');
+      const expired = seedBackup(data, 'a1', 30 * DAY);
+      const { sweep, sweepScratch } = harness(data);
+
+      await sweep();
+
+      expect(sweepScratch).not.toHaveBeenCalled();
+      expect(existsSync(expired)).toBe(false);
+    });
   });
 });

@@ -1,3 +1,4 @@
+import { DEFAULT_OWNER_REMINDER_QUIET_HOURS, normalizeOwnerReminderQuietHours } from '../../core/session-owner-reminder-quiet-hours.js';
 import type { OncallPresetOptions } from '../../services/oncall-preset-options.js';
 import { normalizePassthroughCommand, parseCustomPassthroughInput } from '../../core/passthrough-commands.js';
 import type { OncallGroupBusinessTarget } from '../../services/oncall-group-client.js';
@@ -34,6 +35,7 @@ import {
   fetchGlobalPromptCache,
   fetchGlobalProviderRecovery,
   fetchDetectedModels,
+  liveCodexReasoningEfforts,
   fetchDshProfiles,
   createDshProfile,
   fmtSince,
@@ -1609,7 +1611,7 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
         onChange={forwardMode => updateDraft({ ...policy, forwardMode })} />
     </div>
     {(policy.flowMode ?? 'direct') === 'classify' && <div className="bd-oncall-field">
-      <FieldTitle help="仅用于“先选分类再建群”，决定用户在哪里填写问题区域和分类。群内卡片：在原群聊或话题中展示，所有成员可见，仅发起人操作。仅本人可见卡片：仅支持普通群，话题群和私聊不可用。飞书侧栏：打开 Oncall 平台表单，暂不支持自动关联人工群和转交当前对话。">分类填写方式</FieldTitle>
+      <FieldTitle help="仅用于“先选分类再建群”，决定用户在哪里填写问题区域和分类。群内卡片：在原群聊或话题中展示，所有成员可见，仅发起人操作。仅本人可见卡片：仅支持普通群，话题群和私聊不可用。卡片中的分类包含自定义字段时，确认按钮直接打开侧栏，保留区域、分类、等级和问题描述；原发起人提交成功后，自动显示进群入口并按交接设置同步当前会话。单独选择“飞书侧栏”仍为有限支持。">分类填写方式</FieldTitle>
       <DropdownField dataInput="oncallFormDisplay" ariaLabel="分类填写方式" disabled={busy || (policy.flowMode ?? 'direct') !== 'classify'} value={policy.formDisplay ?? 'thread_card'}
         options={[{ value: 'thread_card', label: '群内卡片（推荐）', hint: '在原群聊或话题内填写；所有成员可见，仅发起人操作' }, { value: 'native', label: '飞书侧栏（有限支持）', hint: '在 Oncall 平台表单中填写；暂不自动关联人工群或转交对话' }, { value: 'private_card', label: '仅本人可见卡片', hint: '仅点击者可见；只支持普通群，不支持话题群和私聊' }]}
         onChange={formDisplay => updateDraft({ ...policy, formDisplay })} />
@@ -2011,6 +2013,7 @@ const DEFAULT_OWNER_REMINDER = {
   intervalMinutes: 30,
   text: '该会话已等待处理，请继续跟进。',
   states: OWNER_REMINDER_STATE_OPTIONS.map(option => option.value),
+  quietHours: DEFAULT_OWNER_REMINDER_QUIET_HOURS,
 };
 
 function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
@@ -2020,6 +2023,7 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
   const [interval, setIntervalValue] = useState(String(initial.intervalMinutes));
   const [text, setText] = useState(initial.text);
   const [states, setStates] = useState<OwnerReminderState[]>([...initial.states]);
+  const [quietHours, setQuietHours] = useState(initial.quietHours ?? DEFAULT_OWNER_REMINDER_QUIET_HOURS);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
@@ -2029,6 +2033,7 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
     setIntervalValue(String(next.intervalMinutes));
     setText(next.text);
     setStates([...next.states]);
+    setQuietHours(next.quietHours ?? DEFAULT_OWNER_REMINDER_QUIET_HOURS);
   }, [props.bot.sessionOwnerReminder]);
 
   function toggleState(state: OwnerReminderState, checked: boolean): void {
@@ -2052,7 +2057,11 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
       setStatus({ text: `✗ ${tr('botDefaults.ownerReminderStatesInvalid')}` });
       return;
     }
-    const payload = { enabled, intervalMinutes: minutes, text: cleanText, states };
+    if (!normalizeOwnerReminderQuietHours(quietHours)) {
+      setStatus({ text: `✗ ${tr('botDefaults.ownerReminderQuietHoursInvalid')}` });
+      return;
+    }
+    const payload = { enabled, intervalMinutes: minutes, text: cleanText, states, quietHours };
     await saveBotField({
       request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-owner-reminder`, payload),
       setStatus,
@@ -2077,6 +2086,24 @@ function SessionOwnerReminderSection(props: { bot: BotDefaultsRow; patchBot: Pat
         <label>
           <span>{tr('botDefaults.ownerReminderInterval')}</span>
           <input type="number" min={1} max={10080} step={1} data-input="ownerReminderInterval" value={interval} disabled={busy} onChange={event => setIntervalValue(event.currentTarget.value)} />
+        </label>
+      </div>
+      <ToggleRow
+        checked={quietHours.enabled}
+        disabled={busy}
+        dataAction="toggle-owner-reminder-quiet-hours"
+        title={tr('botDefaults.ownerReminderQuietHours')}
+        help={tr('botDefaults.ownerReminderQuietHoursHelp')}
+        onChange={checked => setQuietHours(current => ({ ...current, enabled: checked }))}
+      />
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.ownerReminderQuietHoursStart')}</span>
+          <input type="time" value={quietHours.start} disabled={busy} onChange={event => setQuietHours({ ...quietHours, start: event.currentTarget.value })} />
+        </label>
+        <label>
+          <span>{tr('botDefaults.ownerReminderQuietHoursEnd')}</span>
+          <input type="time" value={quietHours.end} disabled={busy} onChange={event => setQuietHours({ ...quietHours, end: event.currentTarget.value })} />
         </label>
       </div>
       <div className="bd-subsection">
@@ -2996,6 +3023,10 @@ export function BotAgentSection(props: {
   // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
   const [detectedModels, setDetectedModels] = useState<Awaited<ReturnType<typeof fetchDetectedModels>>>(null);
   const [detectingModels, setDetectingModels] = useState(false);
+  // True once the probe for the current CLI/bot row has answered (or failed).
+  // Unlike detectingModels it starts false, so effects that run in the same
+  // commit as the probe's start still see "not answered yet".
+  const [modelCatalogSettled, setModelCatalogSettled] = useState(false);
   useEffect(() => {
     const current = autoDraftRef.current;
     let settings = current.modelSettings;
@@ -3011,16 +3042,22 @@ export function BotAgentSection(props: {
     if (option?.gateway === 'ttadk') {
       setDetectedModels(null);
       setDetectingModels(false);
+      setModelCatalogSettled(true);
       return;
     }
     // stale 标志防卸载/竞态：cliKey 快速切换时旧响应不得覆盖新 CLI 的候选。
     let stale = false;
     setDetectedModels(null);
     setDetectingModels(true);
+    setModelCatalogSettled(false);
     const cancel = afterNextPaint(() => {
       void fetchDetectedModels(cliKey, bot.larkAppId)
         .then(result => { if (!stale) setDetectedModels(result); })
-        .finally(() => { if (!stale) setDetectingModels(false); });
+        .finally(() => {
+          if (stale) return;
+          setDetectingModels(false);
+          setModelCatalogSettled(true);
+        });
     });
     return () => { stale = true; cancel(); };
     // Runtime/path/env-policy/env edits save into the bot row first. A new row
@@ -3489,13 +3526,28 @@ export function BotAgentSection(props: {
   const reasoningEffortOptions = useMemo(
     () => {
       const capability = isTraex ? detectedModels?.modelCapabilities?.find(entry => entry.slug.toLowerCase() === model.toLowerCase()) : undefined;
+      // Codex: the bot runtime's live catalogue (the same judgment the save
+      // and the launch use). A Codex profile picks its own provider, which the
+      // bare catalogue cannot speak for — the static table applies, as on save.
       const live = isTraex
         ? capability?.contextVariants?.find(entry => entry.id === modelBackendVariant)?.reasoningEfforts ?? capability?.reasoningEfforts
-        : isCodexSelection ? detectedModels?.reasoningEffortsByModel?.[model] : undefined;
-      return live?.filter(isCodexReasoningEffort)
+        : isCodexSelection && !codexProfile ? liveCodexReasoningEfforts(detectedModels?.reasoningEffortsByModel, model) : undefined;
+      const levels = live?.filter(isCodexReasoningEffort)
         ?? reasoningEffortsForCliModel(reasoningCatalogKey(cliKey), model);
+      // The bot's saved Codex pair already passed config load. Unless the live
+      // catalogue answered for this model, nothing here refutes it — keep it
+      // selectable instead of clearing it, or a failed/slow probe would erase
+      // the setting on the next save. The server keeps an unchanged pair too.
+      // A runtime or profile edit picks another catalogue: not the saved launch.
+      const savedEffort = isCodexSelection && !live && cliKey === initialKey && bot.reasoningEffort
+        && !runtimeTouched && !codexProfileTouched
+        && model.trim().toLowerCase() === (bot.model ?? '').trim().toLowerCase()
+        ? bot.reasoningEffort : undefined;
+      return savedEffort && !levels.includes(savedEffort)
+        ? CODEX_REASONING_EFFORTS.filter(effort => effort === savedEffort || levels.includes(effort))
+        : levels;
     },
-    [cliKey, detectedModels, isCodexSelection, isTraex, model, modelBackendVariant],
+    [bot.model, bot.reasoningEffort, cliKey, codexProfile, codexProfileTouched, detectedModels, initialKey, isCodexSelection, isTraex, model, modelBackendVariant, runtimeTouched],
   );
   const nativeReasoningEffortOptions = useMemo(
     () => nativeModelMode === 'custom'
@@ -3508,8 +3560,12 @@ export function BotAgentSection(props: {
     // Await positive per-model metadata before clearing a saved TraeX value.
     // A pending or missing live catalog is not evidence that a level is invalid.
     if (isTraex && !detectedModels?.modelCapabilities?.some(entry => entry.slug.toLowerCase() === model.toLowerCase())) return;
+    // Codex: judge the saved level only once the live catalogue has answered.
+    // The static table is the fallback for "no catalogue", not evidence while
+    // the probe is still in flight (it would clear a catalogue-only max/ultra).
+    if (isCodexSelection && !modelCatalogSettled) return;
     if (reasoningEffort && !reasoningEffortOptions.includes(reasoningEffort)) setReasoningEffort('');
-  }, [reasoningEffort, reasoningEffortOptions, isTraex, detectedModels, model]);
+  }, [reasoningEffort, reasoningEffortOptions, isTraex, isCodexSelection, modelCatalogSettled, detectedModels, model]);
   useEffect(() => {
     if (nativeModelMode !== 'custom') {
       if (nativePolicyErrors.model) setNativePolicyErrors(current => ({ ...current, model: null }));
@@ -4294,6 +4350,7 @@ function WorkingDirSection(props: {
         <button type="button" className="primary" data-action="save-working-dir" disabled={busy} onClick={() => void save()}>{tr('botDefaults.save')}</button>
       </div>
       </AgentManagedLock>
+      <OwnerGroupFollowControls bot={bot} patchBot={props.patchBot} />
       <AutoStartControls bot={bot} putCardPref={props.putCardPref} />
     </section>
   );
@@ -4373,6 +4430,47 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
   const def = bot.defaultOncall ?? { enabled: false, workingDir: '' };
   const mode = def.enabled ? 'oncall' : (bot.defaultWorkingDir ? 'default' : 'off');
   return { mode, workingDir: bot.defaultWorkingDir || def.workingDir || '' };
+}
+
+export function OwnerGroupFollowControls(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot } = props;
+  const savedExcluded = (bot.ownerGroupFollow?.excludeChatIds ?? []).join('\n');
+  const [excluded, setExcluded] = useState(savedExcluded);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  useEffect(() => {
+    setExcluded(savedExcluded);
+  }, [bot.larkAppId, savedExcluded]);
+  const save = (value: BotDefaultsRow['ownerGroupFollow']) => saveBotField({
+    request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/owner-group-follow`, { ownerGroupFollow: value }),
+    setStatus, setBusy, saved: tr('botDefaults.cardPrefSaved'),
+    onSaved: body => props.patchBot(bot.larkAppId, { ownerGroupFollow: body.ownerGroupFollow ?? null }),
+  });
+  return <div className="bd-subsection" data-owner-group-follow>
+    <h4 className="bd-subsection-title">{tr('botDefaults.ownerGroupFollow')}</h4>
+    <ToggleRow
+      checked={bot.ownerGroupFollow?.enabled === true}
+      disabled={busy}
+      dataAction="toggle-owner-group-follow"
+      title={tr('botDefaults.ownerGroupFollowEnabled')}
+      help={tr('botDefaults.ownerGroupFollowHelp')}
+      onChange={enabled => { void save({ ...bot.ownerGroupFollow, enabled }); }}
+    />
+    <p className="bd-section-note">{tr('botDefaults.ownerGroupFollowAuth')}</p>
+    <div className="bd-row"><label>
+      <FieldTitle help={tr('botDefaults.ownerGroupFollowExcludedHelp')}>{tr('botDefaults.ownerGroupFollowExcluded')}</FieldTitle>
+      <textarea data-input="ownerGroupFollowExcluded" rows={2} value={excluded} disabled={busy}
+        placeholder={'oc_xxx\noc_yyy'} onChange={event => setExcluded(event.currentTarget.value)} />
+    </label></div>
+    <div className="actions">
+      <button type="button" data-action="save-owner-group-follow-exclusions" disabled={busy}
+        onClick={() => { void save({ ...bot.ownerGroupFollow, excludeChatIds: excluded.split(/\s+/).filter(Boolean) }); }}>
+        {tr('botDefaults.save')}
+      </button>
+      <StatusSpan status={status} />
+    </div>
+  </div>;
 }
 
 export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {

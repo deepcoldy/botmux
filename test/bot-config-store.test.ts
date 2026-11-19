@@ -14,6 +14,8 @@ import { resolveEffectiveFeedbackPolicy, type FeedbackPolicyLayer } from '../src
 
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+  // No live model catalogue: reasoning levels fall back to the static table.
+  loadCodexServiceTierCatalog: vi.fn(async () => null),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -250,6 +252,28 @@ describe('bot-config store', () => {
     expect(await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'xhigh'))
       .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
     expect(readConfig().reasoningEffort).toBeUndefined();
+  });
+
+  it('defaults owner group follow off and round-trips opt-in settings through persistence and hot config', async () => {
+    const { registry, store } = await loaded();
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+    const spec = store.findConfigField('ownerGroupFollow')!;
+    const parsed = store.coerceConfigValue(spec, '{"enabled":true,"excludeChatIds":["oc_skip"]}');
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error('coercion failed');
+    expect((await store.applyConfigField('app_default', spec, parsed.value)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toEqual({ enabled: true, excludeChatIds: ['oc_skip'] });
+    expect(readConfig().ownerGroupFollow).toEqual({ enabled: true, excludeChatIds: ['oc_skip'] });
+    expect((await store.applyConfigField('app_default', spec, { enabled: 'true' })).ok).toBe(false);
+    expect(readConfig().ownerGroupFollow.enabled).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, { enabled: false })).ok).toBe(true);
+    expect(readConfig().ownerGroupFollow).toBeUndefined();
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+  });
+
+  it('does not enable owner group follow from malformed disk configuration', async () => {
+    const { registry } = await loaded({ ownerGroupFollow: { enabled: 'true' } });
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
   });
 
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
@@ -1658,6 +1682,7 @@ describe('bot-config store', () => {
       intervalMinutes: 30,
       text: '请继续处理。',
       states: ['idle', 'tui_prompt'],
+      quietHours: { enabled: true, start: '23:00', end: '08:30' },
     };
     const saved = await reminderStore.updateSessionOwnerReminderConfig('app_default', value);
     expect(saved).toEqual({ ok: true, config: value });

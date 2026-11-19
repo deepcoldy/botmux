@@ -320,6 +320,11 @@ export interface CliAdapter {
      *  others ignore. Note the accepted set is per-CLI: `ultra` is codex/traex
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Codex App only: whether its runner may use the bare local
+     * `codex debug models` catalogue when a missing-thread resume falls back to
+     * a fresh thread/start. False for wrappers, Codex profiles and remote
+     * backends, whose actual provider the bare catalogue cannot attest. */
+    allowCodexReasoningCatalog?: boolean;
     /** Codex-only thread service tier. Missing inherits the executor's config. */
     codexProfile?: string;
     serviceTier?: CodexServiceTier;

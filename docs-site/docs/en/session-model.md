@@ -78,11 +78,14 @@ The DM mode applies to **all DMs** with that bot, and maps to `p2pMode` in `bots
 |-------|------------------|
 | Starting | The first message arrived and the bot is launching the CLI |
 | Working | The CLI is thinking and running; the status card refreshes live |
+| Waiting for model capacity (queue notification enabled) | TRAE CLI explicitly reports capacity queueing; resumes Working when progress returns, including the first topic turn and collapsed output |
 | Awaiting input | This turn is done; you can send the next message |
 | Dormant | After a long idle period, or when too many sessions are live, the CLI process exits to free memory. The topic stays, and the next message restores the context automatically |
 | Closed | Someone sent `/close` or clicked the close button. A new message starts a new session; resume it to continue the old one |
 
 Each turn gets a new status card, and the previous card freezes in its final state so you can look back. Card colors and buttons are in [Live Streaming Cards](/en/cards); what triggers dormancy and whether a daemon restart loses context are in the [FAQ](/en/faq).
+
+Settings → Feishu Cards → Model queue notification is off by default for all bots on this machine through `dashboard.modelQueueNotify`. Changes take effect on the next card refresh. Turning it off preserves ordinary execution status and elapsed time. Only explicit capacity evidence activates the queue label; pending next-turn input and silence do not establish queueing.
 
 ## The four names of a session
 

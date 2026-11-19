@@ -9,7 +9,10 @@ export function sessionExecutionActivity(ds: DaemonSession, nowMs = Date.now()) 
   const capture = ds.captureIdentity?.workerGeneration === ds.workerGeneration ? ds.captureIdentity : undefined;
   const source = capture ?? ds.managedTurnOrigin;
   const highWater = ds.turnDispatchAttemptHighWater;
-  const validSource = source?.turnId === ds.currentTurnId && source?.turnId
+  // Fresh topics bypass beginNewTurn; their exact root/reply turn still binds
+  // the execution evidence. A successor's currentTurnId remains authoritative.
+  const displayTurnId = ds.currentTurnId ?? ds.currentReplyTarget?.turnId ?? ds.session.rootMessageId;
+  const validSource = source?.turnId === displayTurnId && source?.turnId
     && (highWater?.turnId !== source.turnId || (source.dispatchAttempt !== undefined && source.dispatchAttempt >= highWater.dispatchAttempt));
   const execution = validSource ? ds.replyExecutionStarts?.get(JSON.stringify([source.turnId, source.dispatchAttempt ?? null])) : undefined;
   return projectExecutionActivity({ status, workerGeneration: ds.workerGeneration, nowMs, execution,

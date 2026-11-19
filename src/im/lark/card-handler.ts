@@ -25,6 +25,7 @@ import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
 import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
+import { failedTurnRewindInFlight } from '../../core/failed-turn-rewind.js';
 import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
@@ -4375,6 +4376,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           },
         };
       }
+      // An input is already on its way to re-send this failed turn (its CLI
+      // restart is still running): a retry now would run it twice.
+      if (failedTurnRewindInFlight(ds, failedTurn.turnId)) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_in_flight', undefined, locDs) } };
+      }
       if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
@@ -4405,7 +4411,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
+        // A turn that failed without any output is cut first and its input
+        // re-sent as it was — nothing ran, so there is nothing to continue
+        // from (core/failed-turn-rewind.ts). Otherwise the mode above applies.
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurnResendOf: failedTurn.turnId });
         else {
           accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
