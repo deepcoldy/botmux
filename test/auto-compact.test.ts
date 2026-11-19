@@ -354,12 +354,7 @@ describe('auto-compact unattended worker write gate', () => {
     const scope: Record<string, any> = {
       renderer: rendererShowing(COMPOSER),
       backendScreenEvidenceIsAuthoritativeForMutation: () => true,
-      // The real screen choice, over whatever backend / renderer this case has.
-      unattendedComposerScreen: () => readUnattendedComposerScreen({
-        authoritative: scope.backendScreenEvidenceIsAuthoritativeForMutation(),
-        backend: scope.backend,
-        renderer: scope.renderer,
-      }),
+      readUnattendedComposerScreen,
       promptCacheKeepaliveRefusal,
       backend: {},
       cliAdapter: { readyPattern: /❯/ },
@@ -376,6 +371,8 @@ describe('auto-compact unattended worker write gate', () => {
       lastInitConfig: { cliId: 'claude-code' },
       ...overrides,
     };
+    // The worker's own screen choice, over whatever backend / renderer this case has.
+    scope.unattendedComposerScreen ??= loadWorkerFunction<() => unknown>('unattendedComposerScreen', scope);
     const refuseWithScreen = loadWorkerFunction<(msg: { requireSafeComposer?: true }) => { refusal: string } | undefined>(
       'unattendedRawInputRefusal',
       scope,
