@@ -22315,13 +22315,19 @@ function setupWorkerHandlers(
         // and wait for the NEXT set instead of trusting a stale `true`.
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
-        if (ds.crashDiagnosticParked) {
+        const recoveringParkedDiagnostic = ds.crashDiagnosticParked === true;
+        if (recoveringParkedDiagnostic) {
           // The next-message retry respawns INSIDE the existing worker, so no
           // process-level ready or attempt-correlated restart_result will
           // release the fence lowered by parkCrashDiagnosticWorker. Its first
-          // prompt is the authoritative successful recovery edge.
+          // prompt is the authoritative successful recovery edge and also the
+          // authorized in-place resume of the cold-resume marker.
           ds.workerReady = true;
           ds.crashDiagnosticParked = undefined;
+          if (ds.session.suspendedColdResume) {
+            ds.session.suspendedColdResume = undefined;
+            sessionStore.updateSession(ds.session);
+          }
         }
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
         backendOutage.onPromptReady(ds.session.sessionId);
@@ -22334,17 +22340,9 @@ function setupWorkerHandlers(
           restartStreak.readyAt = Date.now();
           logger.info(`[${t}] CLI ready after ${restartStreak.count} crash(es); the restart streak resets only if it stays up`);
         }
-        // A live prompt means a (re)spawn reached a working CLI — clear the lazy
-        // cold-resume marker set when we parked a crash diagnostic shell. The
-        // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
-        // forkWorker, so without this the stale marker survives in the store and a
-        // LATER genuine zombie (bmx-<sid> actually gone) would be kept active by
-        // restore instead of being closed. If retry never reaches a prompt the
-        // marker persists, preserving the cross-daemon-restart lazy-retry intent.
-        if (ds.session.suspendedColdResume) {
-          ds.session.suspendedColdResume = undefined;
-          sessionStore.updateSession(ds.session);
-        }
+        // Deliberate cold suspension is NOT cleared by an arbitrary late prompt:
+        // only forkWorker admission or the authorized parked in-place retry
+        // above may clear it. Otherwise prompt_ready merely observes the CLI.
         if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
           const rawInput = ds.pendingRawInput;
           ds.pendingRawInput = undefined;

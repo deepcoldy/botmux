@@ -749,7 +749,13 @@ describe('BackendOutageCoordinator', () => {
     await h.clock.advance(3_000);
     expect(h.restarts).toHaveLength(0);
     expect(h.view('s1').state).toBe('dormant');
-    // The user's next message cold-resumes it; its prompt is the outcome.
+    // A late prompt from the old worker is not a user resume.
+    h.coordinator.onPromptReady('s1');
+    await h.clock.advance(0);
+    expect(h.view('s1').state).toBe('dormant');
+    // The user's next message cold-resumes it (clearing the cold marker);
+    // only that authorized prompt is the recovery outcome.
+    h.session('s1').eligibility = 'now';
     h.coordinator.onPromptReady('s1');
     await h.clock.advance(0);
     await h.coordinator.cardsSettled();

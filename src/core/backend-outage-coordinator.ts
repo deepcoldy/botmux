@@ -338,6 +338,13 @@ interface Member<S> {
   timedOutAt?: number;
 }
 
+interface DormantMember<S> {
+  ref: S;
+  report: ServerLossReport;
+  notices: string[];
+  serverRetries: number;
+}
+
 type EpisodePhase =
   /** A timer will (re)assess the server. */
   | 'waiting'
@@ -372,6 +379,9 @@ export class BackendOutageCoordinator<S> {
   /** sessionId → episode key, for members of a live episode. */
   private readonly membership = new Map<string, string>();
   private readonly cards = new Map<string, LiveCard<S>>();
+  /** Closed-episode dormant members: no automatic restart rights, only enough
+   *  information for an authorized later resume to update the original card. */
+  private readonly dormant = new Map<string, DormantMember<S>>();
   private readonly lossHistory = new Map<string, number[]>();
   private readonly timings: BackendOutageTimings;
 
@@ -382,6 +392,7 @@ export class BackendOutageCoordinator<S> {
   /** A session's CLI exit was its server being lost. Always absorbed: the
    *  caller must not run its crash-loop accounting or post exit notices. */
   onServerLost(ref: S, sessionId: string, report: ServerLossReport): void {
+    this.dormant.delete(sessionId);
     const now = this.deps.now();
     const key = episodeKey(report.larkAppId, report.socketName);
     let episode = this.episodes.get(key);
@@ -490,9 +501,40 @@ export class BackendOutageCoordinator<S> {
    *  restarted again by the outage. */
   onPromptReady(sessionId: string): void {
     const member = this.liveMember(sessionId);
-    if (!member || member.state === 'recovered' || member.state === 'stopped') return;
+    if (!member) {
+      this.onDormantPromptReady(sessionId);
+      return;
+    }
+    if (member.state === 'recovered' || member.state === 'stopped') return;
     const episode = this.episodes.get(this.membership.get(sessionId)!)!;
+    if (this.deps.eligible(member.ref) === 'dormant') return; // late, unauthorized prompt
     this.markRecovered(episode, member);
+  }
+
+  /** A prompt after the restart episode closed can update a dormant card only
+   *  after forkWorker / parked in-place retry authorized the resume. */
+  private onDormantPromptReady(sessionId: string): void {
+    const dormant = this.dormant.get(sessionId);
+    if (!dormant) return;
+    const eligibility = this.deps.eligible(dormant.ref);
+    if (eligibility === 'dormant' || eligibility === 'later') return;
+    this.dormant.delete(sessionId);
+    if (eligibility === 'never') return;
+    const now = this.deps.now();
+    let card = this.cards.get(sessionId);
+    if (card && now - card.lastUpdatedAt >= this.timings.cardReuseMs) card = undefined;
+    if (!card) {
+      card = new LiveCard(this.deps, this.timings, sessionId);
+      this.cards.set(sessionId, card);
+    }
+    card.update(dormant.ref, () => ({
+      state: 'recovered',
+      cliName: dormant.report.cliName,
+      serverLabel: serverLabel(dormant.report.socketName),
+      turnInFlight: dormant.report.turnInFlight,
+      serverRetries: dormant.serverRetries,
+      notices: [...dormant.notices],
+    }), now);
   }
 
   /** Test seam: wait until every card update requested so far was attempted. */
@@ -506,6 +548,7 @@ export class BackendOutageCoordinator<S> {
     this.episodes.clear();
     this.membership.clear();
     this.cards.clear();
+    this.dormant.clear();
     this.lossHistory.clear();
   }
 
@@ -934,6 +977,16 @@ export class BackendOutageCoordinator<S> {
       if (this.membership.get(sessionId) === episode.key) this.membership.delete(sessionId);
     }
     const members = [...episode.members.values()];
+    for (const member of members) {
+      if (member.state === 'dormant') {
+        this.dormant.set(member.sessionId, {
+          ref: member.ref,
+          report: member.report,
+          notices: [...member.notices],
+          serverRetries: episode.serverRetries,
+        });
+      }
+    }
     const summary: OutageSummary = {
       larkAppId: episode.larkAppId,
       serverLabel: serverLabel(episode.socketName),

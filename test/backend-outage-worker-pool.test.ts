@@ -482,6 +482,49 @@ describe('daemon: a lost tmux server is one backend outage', () => {
     });
   }
 
+  it('a late prompt does not clear deliberate suspension or claim recovery', async () => {
+    __testOnly_resetBackendOutage(
+      { serverUp: async () => true },
+      { gatherMs: 20, gatherJitterMs: 0, serverBackoffMs: [30, 30], summarySettleMs: 1_000 },
+    );
+    const [{ ds, worker }, ...others] = sessions;
+    for (const other of others.slice(1)) (other.ds.session as any).persistentBackendTarget = { backendType: 'tmux', socketName: 'elsewhere' };
+    worker.emit('message', lostServer);
+    await flush();
+    ds.session.suspendedColdResume = true;
+    await new Promise(r => setTimeout(r, 100));
+    expect(restartsOf(worker)).toEqual([]);
+
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(ds.session.suspendedColdResume).toBe(true);
+    expect(vi.mocked(updateMessage).mock.calls.some(c => String(c[2]).includes('已恢复'))).toBe(false);
+
+    ds.session.suspendedColdResume = undefined;
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(vi.mocked(updateMessage).mock.calls.some(c => String(c[2]).includes('已恢复'))).toBe(true);
+  });
+
+  it('a real resume after the owner summary still updates the dormant card', async () => {
+    __testOnly_resetBackendOutage(
+      { serverUp: async () => true },
+      { gatherMs: 20, gatherJitterMs: 0, serverBackoffMs: [30, 30], summarySettleMs: 60 },
+    );
+    const [{ ds, worker }, ...others] = sessions;
+    for (const other of others.slice(1)) (other.ds.session as any).persistentBackendTarget = { backendType: 'tmux', socketName: 'elsewhere' };
+    worker.emit('message', lostServer);
+    await flush();
+    ds.session.suspendedColdResume = true;
+    await waitFor(() => notifyOwnerMock.mock.calls.length === 1, 'owner summary');
+    const patchesBeforeResume = vi.mocked(updateMessage).mock.calls.length;
+    ds.session.suspendedColdResume = undefined;
+    worker.emit('message', { type: 'prompt_ready' });
+    await waitFor(() => vi.mocked(updateMessage).mock.calls.length > patchesBeforeResume, 'recovered patch after resume');
+    expect(restartsOf(worker)).toEqual([]);
+    expect(vi.mocked(updateMessage).mock.calls.some(c => String(c[2]).includes('已恢复'))).toBe(true);
+  });
+
   it('prompt-ready after a parked outage retry releases the lifecycle fence', async () => {
     const [{ ds, worker }, ...others] = sessions;
     for (const other of others.slice(1)) (other.ds.session as any).persistentBackendTarget = { backendType: 'tmux', socketName: 'elsewhere' };
