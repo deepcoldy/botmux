@@ -922,6 +922,7 @@ import {
 } from './utils/codex-app-turn-liveness.js';
 import { CodexAppTurnDispatchQueue } from './utils/codex-app-turn-dispatch.js';
 import { captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
+import { captureDshProcessIdentity, type DshProcessIdentity } from './services/dsh-process-attestation.js';
 import {
   committedCodexAppSequence,
   validateCodexAppManagedSendOrigin,
@@ -8198,6 +8199,12 @@ let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
 let codexAppControlProven = false;
 let codexAppRunnerProcessIdentity: CodexAppProcessIdentity | undefined;
+let dshProcessAttestation: {
+  generation: number;
+  executable: string;
+  args: string[];
+  identity?: DshProcessIdentity;
+} | undefined;
 let codexAppEngineIdentity: CodexAppEngineIdentity | undefined;
 
 function clearCodexAppEngineIdentity(): void {
@@ -20506,6 +20513,15 @@ function handleAppRunnerOscMarker(body: string): void {
   if (sep < 0) return;
   const kind = body.slice(0, sep);
   const payload = decodeCodexAppPayload(body.slice(sep + 1));
+  if (kind === 'process_ready' && lastInitConfig?.cliId === 'dsh'
+    && (lastInitConfig.dshRuntime ?? 'sdk') === 'sdk') {
+    // No payload field is authority. A replay must not rotate the turn's
+    // pre-existing-process snapshot after tools have already started.
+    if (dshProcessAttestation?.generation === cliSpawnGeneration && !dshProcessAttestation.identity) {
+      publishLocalProcessAttestation(backend?.getChildPid?.() ?? undefined);
+    }
+    return;
+  }
   if (lastInitConfig?.cliId === 'minimax' && minimaxFinalReceiver.accept(kind,
       payload && typeof payload === 'object' ? payload : undefined,
       { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt })) return;
@@ -28879,6 +28895,9 @@ async function spawnCliBody(
     log(`Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ${cliAdapter.id}`);
   }
   if (cliExtraArgs.length) args.push(...cliExtraArgs);
+  dshProcessAttestation = cfg.cliId === 'dsh' && (cfg.dshRuntime ?? 'sdk') === 'sdk'
+    ? { generation: cliSpawnGeneration, executable: cliAdapter.resolvedBin, args: [...args] }
+    : undefined;
 
   // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
   // botmux 必须带这个 flag（话题里没法弹交互式审批），所以为 root 自动注入
@@ -33025,6 +33044,7 @@ function killCli(opts: {
   // depend on that implementation detail.
   cliSpawnGeneration++;
   claudeEffortObserver.reset();
+  dshProcessAttestation = undefined;
   terminalEffortTracker.reset();
   lastNativeReasoningKey = undefined;
   nativeReasoningClock = undefined;
@@ -37602,13 +37622,29 @@ function publishLocalProcessAttestation(
   enginePid = codexRpcEngine?.appServerPid,
 ): boolean {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
+  let dshIdentity: DshProcessIdentity | undefined;
+  if (lastInitConfig?.cliId === 'dsh' && (lastInitConfig.dshRuntime ?? 'sdk') === 'sdk'
+    && dshProcessAttestation?.generation === cliSpawnGeneration) {
+    const proof = dshProcessAttestation;
+    const captured = captureDshProcessIdentity(cliPid, proof.executable, proof.args);
+    // A process change inside this generation cannot grant a new root. A
+    // genuine SDK restart replaces the runner and starts a fresh generation.
+    if (captured && (!proof.identity || (captured.runnerPid === proof.identity.runnerPid
+      && captured.runnerProcStart === proof.identity.runnerProcStart
+      && captured.enginePid === proof.identity.enginePid
+      && captured.engineProcStart === proof.identity.engineProcStart))) {
+      dshIdentity = proof.identity ??= captured;
+    }
+  }
   // Freeze the proven birth token; explicit legacy RPC roots keep priority.
-  enginePid ??= codexAppEngineIdentity?.pid ?? codexAppRunnerProcessIdentity?.enginePid;
+  enginePid ??= codexAppEngineIdentity?.pid ?? codexAppRunnerProcessIdentity?.enginePid ?? dshIdentity?.enginePid;
   const engineProcStart = codexAppEngineIdentity && enginePid === codexAppEngineIdentity.pid
     ? codexAppEngineIdentity.procStart
     : codexAppRunnerProcessIdentity && enginePid === codexAppRunnerProcessIdentity.enginePid
       ? codexAppRunnerProcessIdentity.engineProcStart
-      : enginePid ? readProcessStartIdentity(enginePid) : undefined;
+      : dshIdentity && enginePid === dshIdentity.enginePid
+        ? dshIdentity.engineProcStart
+        : enginePid ? readProcessStartIdentity(enginePid) : undefined;
   // Actual running image of the TRAE leaf, read from the kernel. The initial
   // attestation names the bwrap/forge launcher, which is not traex and must not
   // be recorded; the leaf re-attestation (applyRealPid) fills this in.
