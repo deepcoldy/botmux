@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { delay } from '../src/utils/timing.js';
@@ -155,7 +155,10 @@ describe('antigravity-cot', () => {
       expect(entries).not.toHaveBeenCalled();
       appendFileSync(transcriptPath, jsonl([{ type: 'GENERIC', source: 'MODEL', step_index: 502, content: 'current result' }]));
       await vi.advanceTimersByTimeAsync(40);
-      expect(entries).toHaveBeenCalledWith([{ kind: 'tool_result', id: 'current-tool', result: 'current result' }]);
+      expect(entries).toHaveBeenCalledWith(
+        [{ kind: 'tool_result', id: 'current-tool', result: 'current result' }],
+        undefined,
+      );
     } finally { forward.mockRestore(); }
   });
 
@@ -339,6 +342,43 @@ describe('antigravity-cot', () => {
       startAntigravityCot(CID, entries => { received.push(...entries); }, { brainDir: tmpDir, mode: 'fresh', pollIntervalMs: 50 });
       await waitFor(() => finalTextOf(received) !== undefined);
       expect(finalTextOf(received)).toBe(logs.compactRecords[25].content);
+    });
+
+    it('tags every entry batch with its USER_INPUT boundary and unwraps the submit envelope', async () => {
+      const logsDir = join(tmpDir, CID, '.system_generated', 'logs');
+      const fullPath = join(logsDir, 'transcript_full.jsonl');
+      const boundary = (text: string, createdAt: string) => JSON.stringify({
+        step_index: 0, source: 'USER_EXPLICIT', type: 'USER_INPUT', status: 'DONE', created_at: createdAt,
+        content: `<USER_REQUEST>\n${text}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nx\n</ADDITIONAL_METADATA>`,
+      });
+      const planner = (text: string, createdAt: string) => JSON.stringify({
+        step_index: 1, source: 'MODEL', type: 'PLANNER_RESPONSE', status: 'DONE',
+        created_at: createdAt, content: text,
+      });
+      const batches: Array<{ text: string; input?: string }> = [];
+      const cid = 'cot-boundary-conv';
+      const boundaryLogsDir = join(tmpDir, cid, '.system_generated', 'logs');
+      const boundaryFullPath = join(boundaryLogsDir, 'transcript_full.jsonl');
+      mkdirSync(boundaryLogsDir, { recursive: true });
+      startAntigravityCot(cid, (entries, turnInput) => {
+        batches.push({ text: entries.map(e => e.text ?? '').join('|'), input: turnInput?.text });
+      }, { brainDir: tmpDir, mode: 'fresh', pollIntervalMs: 50 });
+
+      writeFileSync(boundaryFullPath, [
+        boundary('First Lark prompt', '2026-11-18T01:00:00Z'),
+        planner('First answer', '2026-11-18T01:00:01Z'),
+      ].join('\n') + '\n');
+      await waitFor(() => batches.some(b => b.input === 'First Lark prompt'));
+      expect(batches.at(-1)).toEqual({ text: 'First answer', input: 'First Lark prompt' });
+
+      appendFileSync(boundaryFullPath, [
+        boundary('Local terminal prompt', '2026-11-18T01:00:02Z'),
+        planner('Local answer', '2026-11-18T01:00:03Z'),
+      ].join('\n') + '\n');
+      await waitFor(() => batches.some(b => b.input === 'Local terminal prompt'));
+      expect(batches.at(-1)).toEqual({ text: 'Local answer', input: 'Local terminal prompt' });
+      // No batch ever carries the raw envelope.
+      expect(batches.every(b => !b.input?.includes('USER_REQUEST'))).toBe(true);
     });
   });
 

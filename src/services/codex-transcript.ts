@@ -304,8 +304,12 @@ export interface CodexBridgeEvent {
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
+  /** Model recorded on this final answer by its native transcript. */
+  replyModel?: string;
+  replyReasoningEffort?: string;
   /** Exact alternative input spellings proved by the CLI's user record
-   * (e.g. TRAE's native skill expansion). Never derived from assistant text. */
+   * (e.g. TRAE's native skill expansion). An empty list requires the recorded
+   * input itself to match exactly. Never derived from assistant text. */
   inputTextAliases?: string[];
   /** For kind 'cot': the thinking / tool-call entries parsed from this line. */
   cotEntries?: CodexCotEntry[];
@@ -1006,6 +1010,7 @@ export interface CodexDrainState {
   nextOffset: number;
   turnStartOffset: number;
   activeNativeTurnId?: string;
+  activeTurnRuntime?: RolloutRuntimeSnapshot & { turnId: string };
   sourceSessionId?: string;
   sourcePath?: string;
 }
@@ -1803,6 +1808,7 @@ export function drainCodexRollout(
   };
   const turnExecEntries: TerminalExecEntry[] = [];
   let activeNativeTurnId = reusableState?.activeNativeTurnId;
+  let activeTurnRuntime = reusableState?.activeTurnRuntime;
   let nativeContextKnown = start === 0 || reusableState?.activeNativeTurnId !== undefined;
   let sourceSessionId = reusableState?.sourceSessionId;
   // Walk lines with their byte offsets so synthetic uuids are stable across
@@ -1823,6 +1829,11 @@ export function drainCodexRollout(
     if (runtime) {
       if (runtime.model) latestModel = runtime.model;
       if (runtime.reasoningEffort) latestReasoningEffort = runtime.reasoningEffort;
+      const turnId = obj.payload.turn_id;
+      if (typeof turnId === 'string' && turnId) {
+        activeTurnRuntime = { ...runtime, turnId };
+        resolveTurnStartOffset();
+      }
       continue;
     }
     const p = obj?.payload;
@@ -1944,6 +1955,7 @@ export function drainCodexRollout(
       && (p.type === 'task_complete' || p.type === 'turn_aborted')
       && (typeof p.turn_id !== 'string' || p.turn_id.length === 0)) {
       activeNativeTurnId = undefined;
+      activeTurnRuntime = undefined;
       nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
@@ -1966,6 +1978,7 @@ export function drainCodexRollout(
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
       const failed = p.error !== null && p.error !== undefined;
+      const replyRuntime = activeTurnRuntime?.turnId === p.turn_id ? activeTurnRuntime : undefined;
       const failureLimitKind = failed ? codexRolloutLimitKind(p.error) : undefined;
       const terminalTurnStart = turnFullyCovered
         ? (turnStartOffset ?? start)
@@ -1982,6 +1995,8 @@ export function drainCodexRollout(
         timestampMs,
         kind: 'assistant_final',
         text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
+        ...(replyRuntime?.model ? { replyModel: replyRuntime.model } : {}),
+        ...(replyRuntime?.reasoningEffort ? { replyReasoningEffort: replyRuntime.reasoningEffort } : {}),
         ...(failed ? {
           terminalStatus: 'failed' as const,
           terminalErrorCode: codexRolloutFailureCode(p.error),
@@ -1992,6 +2007,7 @@ export function drainCodexRollout(
         ...(sourceSessionId ? { sourceSessionId } : {}),
       });
       activeNativeTurnId = undefined;
+      activeTurnRuntime = undefined;
       nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
@@ -2027,6 +2043,7 @@ export function drainCodexRollout(
         ...(sourceSessionId ? { sourceSessionId } : {}),
       });
       activeNativeTurnId = undefined;
+      activeTurnRuntime = undefined;
       nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
@@ -2052,8 +2069,9 @@ export function drainCodexRollout(
     ...(turnStartOffset !== undefined ? {
       state: { nextOffset: newOffset, turnStartOffset,
         ...(activeNativeTurnId ? { activeNativeTurnId } : {}),
+        ...(activeTurnRuntime ? { activeTurnRuntime } : {}),
         ...(sourceSessionId ? { sourceSessionId } : {}),
-        ...(activeNativeTurnId || sourceSessionId ? { sourcePath: path } : {}),
+        ...(activeNativeTurnId || activeTurnRuntime || sourceSessionId ? { sourcePath: path } : {}),
       },
     } : {}),
   };

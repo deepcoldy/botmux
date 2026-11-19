@@ -20,8 +20,8 @@ import { appendFileSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 
 // An ordinary tool descendant has no app-server/listen identity in its argv.
-// FAKE_GROUP_CHILD_DELAY_MS simulates a tool spawned by a later turn, i.e. after
-// the engine captured the group identity at start().
+// Tests can release a late tool with SIGUSR2 after start() has captured identity,
+// without assuming the handshake finishes within a fixed wall-clock delay.
 if (process.env.FAKE_GROUP_CHILD_PID_FILE) {
   const spawnTool = () => {
     const tool = spawn(process.execPath, ['-e',
@@ -37,9 +37,11 @@ if (process.env.FAKE_GROUP_CHILD_PID_FILE) {
       tool.unref();
     });
   };
-  const delay = Number(process.env.FAKE_GROUP_CHILD_DELAY_MS ?? '0');
-  if (delay > 0) setTimeout(spawnTool, delay).unref?.();
-  else spawnTool();
+  if (process.env.FAKE_GROUP_CHILD_ON_SIGNAL === '1') {
+    process.once('SIGUSR2', spawnTool);
+  } else {
+    spawnTool();
+  }
 }
 
 if (process.env.FAKE_ENV_PROBE_PATH) {

@@ -52,3 +52,53 @@ describe.skipIf(process.platform === 'win32')('complete native catalog proof (PO
     expect(await read(pages)).toBeNull();
   });
 });
+
+describe.skipIf(process.platform === 'win32')('unavailable catalog reads say why (POSIX executable fixture)', () => {
+  // A null read is indistinguishable from "the helper answered too late" or
+  // "the helper never started" unless the reader says which step it reached.
+  function stub(body: string): string {
+    const cli = join(dir, 'native-catalog-reason-stub');
+    writeFileSync(cli, `#!/usr/bin/env node\n${body}\n`);
+    chmodSync(cli, 0o700);
+    return cli;
+  }
+  const answerInitializeOnly = `require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') process.stdout.write(JSON.stringify({id:msg.id,result:{}})+'\\n');
+});`;
+
+  it('names the protocol step a timed-out read was waiting on', async () => {
+    const reasons: string[] = [];
+    const result = await readTraexModelLoadSnapshot({
+      cliBin: stub(answerInitializeOnly), cwd: dir, timeoutMs: 1_500, onUnavailable: reason => reasons.push(reason),
+    });
+    expect(result).toBeNull();
+    expect(reasons).toHaveLength(1);
+    expect(reasons[0]).toMatch(/^timed out after 1500ms \(waiting for model\/list page 1\); \d+ms after launch$/);
+  });
+
+  it('reports a helper that exits before answering, with its exit status', async () => {
+    const reasons: string[] = [];
+    const result = await readTraexModelLoadSnapshot({
+      // Exit only after initialize arrived: the reader then writes nothing more,
+      // so the exit itself (not an EPIPE on a later write) ends the read.
+      cliBin: stub(`process.stdin.once('data', () => process.exit(3));`), cwd: dir, timeoutMs: 8_000,
+      onUnavailable: reason => reasons.push(reason),
+    });
+    expect(result).toBeNull();
+    expect(reasons).toEqual([expect.stringMatching(/^helper exited \(code=3, signal=null\) while helper started, no reply yet; \d+ms after launch$/)]);
+  });
+
+  it('reports nothing for a complete catalog', async () => {
+    const reasons: string[] = [];
+    const result = await readTraexModelLoadSnapshot({
+      cliBin: stub(`require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') process.stdout.write(JSON.stringify({id:msg.id,result:{}})+'\\n');
+  if (msg.method === 'model/list') process.stdout.write(JSON.stringify({id:msg.id,result:{data:[{id:'core'}],nextCursor:null}})+'\\n');
+});`), cwd: dir, timeoutMs: 8_000, onUnavailable: reason => reasons.push(reason),
+    });
+    expect([...result!.catalogModels!]).toEqual(['core']);
+    expect(reasons).toEqual([]);
+  });
+});

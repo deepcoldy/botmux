@@ -182,6 +182,12 @@ botmux dashboard rotate    # 换一个新 token，旧链接失效
 
 Dashboard 的功能见 [Dashboard](/dashboard)。
 
+## 内存启动保护
+
+`botmux worker-budget status` 查看可用内存、预留余量、内存 PSI 门槛和当前是否允许启动 worker。内存不足时，daemon 的后台恢复只记录日志并汇总私信机器人 owner；群内的当前请求被拒绝时，只回复简短的暂不可用状态。
+
+owner 私信在 2 秒窗口内按机器人合并，受影响会话按唯一 session 计数。每个机器人与 owner 组合最多每 5 分钟尝试发送一次，冷却记录跨 daemon 重启保留；发送失败也进入冷却，后续拒绝在冷却结束后可再次触发通知。owner 暂时无法解析时只记日志。无法写入冷却记录时退化为进程内去重。此通知独立于 Dashboard 中可选的主机负载监控。
+
 ## 开机自启
 
 ```bash

@@ -75,7 +75,7 @@ describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
     expect(codexSessionIdFromRolloutPath(segmented)).toBeUndefined();
     expect(traexSessionIdFromRolloutPath(segmented)).toBe(sid);
     expect(bridgeSpecFor('traex')?.adopt?.pidProbedSessionId?.(segmented)).toBe(sid);
-    // antigravity: held final committed on ingest only, birth-aware baseline, no adopt.
+    // Antigravity's worker binds adopted sessions directly using their PID.
     expect(bridgeSpecFor('antigravity')).toMatchObject({ stateCommit: 'ingest', spawn: { baseline: 'birth-aware' } });
     expect(bridgeSpecFor('antigravity')?.adopt).toBeUndefined();
     // cursor: no per-event timestamps → byte-offset baseline on adopt; the

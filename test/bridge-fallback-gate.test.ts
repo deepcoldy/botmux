@@ -418,14 +418,38 @@ describe('cross-conversation delivery boundaries', () => {
 
   it.each([
     ['cross-chat --chat-id', { deliveryKind: 'detoured_send', targetChatId: 'oc_other' }],
-    ['same-chat --into another root', {
-      deliveryKind: 'detoured_send', targetChatId: 'oc_source', targetRootMessageId: 'om_other_root',
-    }],
     ['report to an orchestrator session', {
       deliveryKind: 'dispatch_report', targetSessionId: 'session-orchestrator',
     }],
   ] as const)('keeps the source-topic final after %s', (_label, routing) => {
     expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false)).toBe(false);
+  });
+
+  it('suppresses source-topic prose after a same-chat --into final, even when the transcript is longer', () => {
+    const routing = {
+      deliveryKind: 'detoured_send' as const,
+      targetChatId: 'oc_source',
+      targetRootMessageId: 'om_other_root',
+    };
+    const long = `${finalText}${' extra transcript that was not sent.'.repeat(12)}`;
+    expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false)).toBe(true);
+    expect(shouldSuppressBridgeEmit(gate(long), 200, [marker({
+      ...routing,
+      contentLength: normalise(finalText).length,
+    })], false)).toBe(true);
+  });
+
+  it('still posts source-topic prose when the same-chat detour was only progress', () => {
+    expect(shouldSuppressBridgeEmit(gate(), 200, [marker({
+      deliveryKind: 'detoured_send',
+      targetChatId: 'oc_source',
+      targetRootMessageId: 'om_other_root',
+      responseKind: 'progress',
+    })], false)).toBe(false);
+  });
+
+  it('still posts the fallback when this turn sent no final', () => {
+    expect(shouldSuppressBridgeEmit(gate(), 200, [], false)).toBe(false);
   });
 
   it.each([

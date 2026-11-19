@@ -1984,7 +1984,7 @@ describe('host memory pressure worker admission', () => {
     expect(admissions).toEqual(['rejected']);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringMatching(/memory pressure.*retry/i),
+      expect.any(String),
       'text',
       'app_test',
       'om_retry',
@@ -2019,11 +2019,152 @@ describe('host memory pressure worker admission', () => {
     })).toBe(true);
 
     expect(blocked).toHaveBeenCalledWith({
-      content: expect.stringMatching(/memory pressure.*retry/i),
+      content: expect.any(String),
       turnId: 'om_durable_retry',
     });
     expect(sessionReply).not.toHaveBeenCalled();
     expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('keeps background recovery owner-only even with a retained turn (%s)', async (retainedTurn) => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    const onMemoryAdmissionBlocked = vi.fn();
+    initWorkerPool({ sessionReply, onMemoryAdmissionBlocked, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    checkWorkerAdmissionMock.mockReturnValue({ allowed: false, reasons: ['host memory exhausted'],
+      pressure: { warnings: [] }, policy: {} } as any);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.currentReplyTarget = { turnId: 'om_old', rootMessageId: 'om_old', updatedAt: new Date().toISOString() };
+    const admissions: string[] = [];
+    expect(forkWorker(ds, retainedTurn ? 'retained input' : '',
+      retainedTurn ? { resume: true, turnId: 'om_old' } : true,
+      { memoryNoticeAudience: 'owner-only', onAdmission: value => admissions.push(value) })).toBe(true);
+    await Promise.resolve();
+    expect(onMemoryAdmissionBlocked).toHaveBeenCalledWith(ds, checkWorkerAdmissionMock.mock.results[0]!.value);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['rejected']);
+  });
+
+  it('does not borrow an old reply target for an owner-only blank fork', () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    const onMemoryAdmissionBlocked = vi.fn();
+    initWorkerPool({ sessionReply, onMemoryAdmissionBlocked, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    checkWorkerAdmissionMock.mockReturnValue({ allowed: false, reasons: ['host memory exhausted'],
+      pressure: { warnings: [] }, policy: {} } as any);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.currentReplyTarget = { turnId: 'om_old', rootMessageId: 'om_old', updatedAt: new Date().toISOString() };
+    forkWorker(ds, '', true, { memoryNoticeAudience: 'owner-only' });
+    expect(onMemoryAdmissionBlocked).toHaveBeenCalledTimes(1);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('reports a rejected voice-shaped request through the current reply target', () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    const onMemoryAdmissionBlocked = vi.fn();
+    initWorkerPool({ sessionReply, onMemoryAdmissionBlocked, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    checkWorkerAdmissionMock.mockReturnValue({ allowed: false, reasons: ['host memory exhausted'],
+      pressure: { warnings: [] }, policy: {} } as any);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.currentReplyTarget = { turnId: 'om_old', rootMessageId: 'om_old', updatedAt: new Date().toISOString() };
+    forkWorker(ds, 'voice summary request', true);
+    expect(onMemoryAdmissionBlocked).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root', expect.any(String), 'text', 'app_test', 'om_old',
+      { sourceSessionId: 'sid-start-test' },
+    );
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('reports a rejected blank user wake through the current reply target', () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    checkWorkerAdmissionMock.mockReturnValue({ allowed: false, reasons: ['host memory exhausted'],
+      pressure: { warnings: [] }, policy: {} } as any);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.currentReplyTarget = { turnId: 'om_old', rootMessageId: 'om_old', updatedAt: new Date().toISOString() };
+    forkWorker(ds, '', true);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root', expect.any(String), 'text', 'app_test', 'om_old',
+      { sourceSessionId: 'sid-start-test' },
+    );
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('still replies to the exact current request when owner notification throws', () => {
+    const sessionReply = vi.fn(async () => 'om_pressure');
+    initWorkerPool({ sessionReply, onMemoryAdmissionBlocked: () => { throw new Error('owner unavailable'); },
+      getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    checkWorkerAdmissionMock.mockReturnValue({ allowed: false, reasons: ['available memory 0.1 GiB'],
+      pressure: { warnings: [] }, policy: {} } as any);
+    forkWorker(makeDs(), 'current request', 'om_current');
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]![1]).not.toMatch(/GiB|PSI|reserve|0\.1/);
+    expect(sessionReply.mock.calls[0]![4]).toBe('om_current');
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves owner-only restoration when device isolation defers its fork', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply');
+    const onMemoryAdmissionBlocked = vi.fn();
+    initWorkerPool({ sessionReply, onMemoryAdmissionBlocked, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    checkWorkerAdmissionMock.mockReturnValue({ allowed: false, reasons: ['host memory exhausted'],
+      pressure: { warnings: [] }, policy: {} } as any);
+    const ds = makeDs({ hasHistory: true });
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    acquireDeviceIsolationFreeze({ nonce: 'm'.repeat(32), inventoryGeneration: 'memory-notice',
+      leaseIdFactory: () => 'memory-notice-lease' });
+    try {
+      forkWorker(ds, 'restored input', { resume: true, turnId: 'om_historical' },
+        { memoryNoticeAudience: 'owner-only' });
+      releaseDeviceIsolationFreeze({ nonce: 'm'.repeat(32), leaseId: 'memory-notice-lease' });
+      await vi.advanceTimersByTimeAsync(1);
+      expect(onMemoryAdmissionBlocked).toHaveBeenCalledTimes(1);
+      expect(sessionReply).not.toHaveBeenCalled();
+      expect(forkMock).not.toHaveBeenCalled();
+    } finally {
+      resetDeviceIsolationActivationForTest();
+    }
+  });
+
+  it('preserves owner-only audience when device isolation starts during egress preparation', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply');
+    const onMemoryAdmissionBlocked = vi.fn();
+    initWorkerPool({ sessionReply, onMemoryAdmissionBlocked, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    checkWorkerAdmissionMock.mockReturnValue({ allowed: false, reasons: ['host memory exhausted'],
+      pressure: { warnings: [] }, policy: {} } as any);
+    let resolveDns!: (addresses: string[][]) => void;
+    const dns = new Promise<string[][]>(resolve => { resolveDns = resolve; });
+    const policy = { id: 'memory.write.v1', targets: [{ scheme: 'https', host: 'memory.example.com',
+      port: 443, denyRoutes: [{ methods: ['POST'], path: '/update' }] }] };
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{ pluginId: 'memory-plugin',
+      capabilityId: 'memory.write', policy, policyDigest: 'a'.repeat(64) }] as any);
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(dns);
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    forkWorker(ds, 'restored input', { resume: false, turnId: 'om_historical' },
+      { memoryNoticeAudience: 'owner-only' });
+    acquireDeviceIsolationFreeze({ nonce: 'e'.repeat(32), inventoryGeneration: 'memory-egress',
+      leaseIdFactory: () => 'memory-egress-lease' });
+    try {
+      resolveDns([['192.0.2.10']]);
+      await vi.advanceTimersByTimeAsync(1);
+      releaseDeviceIsolationFreeze({ nonce: 'e'.repeat(32), leaseId: 'memory-egress-lease' });
+      await vi.advanceTimersByTimeAsync(1);
+      expect(onMemoryAdmissionBlocked).toHaveBeenCalledTimes(1);
+      expect(sessionReply).not.toHaveBeenCalled();
+      expect(forkMock).not.toHaveBeenCalled();
+    } finally {
+      resetDeviceIsolationActivationForTest();
+    }
   });
 
   it('reports accepted after a worker receives its init message', () => {
@@ -2110,6 +2251,26 @@ describe('host memory pressure worker admission', () => {
       maxMemoryFullAvg10Source: 'default',
     },
   };
+
+  it('keeps restored input silent while a coalesced marginal retry reports the current request', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const blocked = { ...marginalDecision,
+      pressure: { ...marginalDecision.pressure, availableMemoryBytes: 0.1 * 1024 ** 3 } };
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any)
+      .mockReturnValueOnce(marginalDecision as any).mockReturnValue(blocked as any);
+    const ds = makeDs({ hasHistory: true });
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    forkWorker(ds, 'restored input', { resume: true, turnId: 'om_previous' },
+      { memoryNoticeAudience: 'owner-only' });
+    forkWorker(ds, 'current input', { resume: true, turnId: 'om_current' });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]![4]).toBe('om_current');
+    expect(forkMock).not.toHaveBeenCalled();
+  });
 
   it('reclaims, retries once after the wait, and re-forks with the original prompt', async () => {
     vi.useFakeTimers();
@@ -2321,7 +2482,7 @@ describe('host memory pressure worker admission', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringMatching(/memory pressure.*retry/i),
+      expect.any(String),
       'text',
       'app_test',
       'om_blocked_turn',
@@ -2413,7 +2574,7 @@ describe('host memory pressure worker admission', () => {
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
-      expect.stringMatching(/memory pressure.*retry/i),
+      expect.any(String),
       'text',
       'app_test',
       'om_doc_blocked',
@@ -10308,6 +10469,53 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     await vi.advanceTimersByTimeAsync(0);
     expect(ds.session.ordinaryTurnRecovery?.logicalTurnId).toBe(SCHEDULED_TURN);
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('continues a turn that failed without any output by re-sending its input after cutting it, not by asking to continue', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    // What the daemon recorded from the worker's directFailure terminal.
+    ds.session.lastFailedTurn = {
+      turnId: SCHEDULED_TURN, userPrompt: 'hourly task prompt', cliInput: 'hourly task prompt',
+      failedAt: new Date().toISOString(), errorCode: 'provider_server_error', status: 'failed',
+      retryable: true, directFailure: true, retryCount: 0,
+    };
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true, directFailure: true,
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation).toBeDefined();
+    // Nothing ran, so there is no checkpoint: the worker is told to cut the
+    // failed turn and re-send its input (the recovery prompt is the fallback).
+    expect(continuation.content).toContain('[BOTMUX_RECOVERY]');
+    expect(continuation.failedTurnRewind).toEqual({
+      failedTurnId: SCHEDULED_TURN, failedInput: 'hourly task prompt', mode: 'resend', content: 'hourly task prompt',
+    });
+  });
+
+  it('a continuation re-sends only its own turn: a later failure of the session is not cut and re-sent in its place', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: SCHEDULED_TURN,
+      status: 'failed', errorCode: 'provider_server_error', retryable: true, directFailure: true,
+    });
+    // Another turn failed without output while the continuation waited.
+    ds.session.lastFailedTurn = {
+      turnId: 'om_newer', userPrompt: 'NEWER_TASK', cliInput: 'NEWER_TASK',
+      failedAt: new Date().toISOString(), errorCode: 'provider_server_error', status: 'failed',
+      retryable: true, directFailure: true, retryCount: 0,
+    };
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation).toBeDefined();
+    expect(continuation.failedTurnRewind).toBeUndefined();
   });
 
   it('admits a scheduled fire into semantic recovery and continues it as the same scheduled turn', async () => {
