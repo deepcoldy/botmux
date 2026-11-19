@@ -31,10 +31,14 @@ import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, codexCleanupArchiveEnabled, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
 import { trackStartingCardPublication } from './starting-card-publication.js';
 import {
+  activateStartingCardHealth,
   armStartingCardHealth,
   closeStartingCardHealth,
   noteStartingCardHealthFrame,
+  resetStartingCardHealth,
   startingCardHealthEntryStillCurrent,
+  startingCardHealthySequence,
+  startingCardHealthStalledStatus,
   STARTING_CARD_HEALTH_DELAY_MS,
 } from './starting-card-health.js';
 import { privateReplyEnabled } from './private-reply.js';
@@ -2466,6 +2470,7 @@ export const USAGE_REFRESH_INTERVAL_MS = 12_000;
  *  → nothing to show). Non-streaming usage display requires a rendered
  *  activity label; a background-task label alone does not enable refresh. */
 export function usageRefreshShouldRun(ds: DaemonSession): boolean {
+  if (startingCardHealthStalledStatus(ds)) return false;
   if (ds.lastScreenStatus !== 'working') return false;
   // A real terminal ends periodic execution refresh, even when a stale
   // viewport still says working. Do not repaint the display-only idle repair.
@@ -4732,6 +4737,7 @@ export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefine
  *  sweepers read it. */
 export function cachedStreamingCardStatus(ds: DaemonSession): StreamStatus {
   if (hasNoCliUnderDaemon(ds)) return ds.usageLimit ? 'limited' : 'idle';
+  if (startingCardHealthStalledStatus(ds)) return 'stalled';
   return ds.lastScreenStatus
     ?? turnStartingCardStatus(ds, sessionCliId(ds, getBot(ds.larkAppId).config));
 }
@@ -6756,9 +6762,10 @@ function ownsSettleTarget(
 function settleStaleBusyCardStatus(
   ds: DaemonSession,
   turnId: string | undefined,
-  source: 'prompt-ready-missing' | 'runtime-sweep',
+  source: 'prompt-ready-missing' | 'runtime-sweep' | 'late-starting-publication',
   requireLiveWorker: boolean,
   ownsWorker?: () => boolean,
+  startingCardPublished?: boolean,
 ): boolean {
   try {
     if (!ownsSettleTarget(ds, requireLiveWorker, ownsWorker)) return false;
@@ -6770,7 +6777,7 @@ function settleStaleBusyCardStatus(
     const highWater = ds.turnDispatchAttemptHighWater;
     if (highWater && highWater.turnId === turnId
       && highWater.dispatchAttempt !== ds.lastTurnTerminalDispatchAttempt) return false;
-    const prevStatus = ds.lastScreenStatus;
+    const prevStatus = ds.lastScreenStatus ?? (startingCardPublished ? 'starting' : undefined);
     if (!prevStatus || !POST_TERMINAL_BUSY_STATUSES.has(prevStatus)) return false;
     if (ds.usageLimit) return false;
     if ((ds.backgroundTaskCount ?? 0) > 0) return false;
@@ -6828,7 +6835,9 @@ function settleStaleBusyCardStatus(
     logger.warn(
       `[${tag(ds)}] ${source === 'prompt-ready-missing'
         ? 'turn_terminal status settle'
-        : 'runtime stale-card self-heal'}: card was still ${prevStatus} `
+        : source === 'runtime-sweep'
+          ? 'runtime stale-card self-heal'
+          : 'late starting publication settle'}: card was still ${prevStatus} `
       + `${ageSeconds}s after terminal (turn=${turnLabel}, source=${source})`,
     );
     return true;
@@ -7130,6 +7139,61 @@ export function releaseDeferredUnifiedReplyCard(
   return trackStartingCardPublication(ds, postUnifiedReplyPlaceholder(ds, sessionReply, turnId, 'start'));
 }
 
+/** A publication that completes after its turn's accepted terminal must not
+ * resurrect health monitoring. Completed turns also need a fresh display settle
+ * because the late starting render may have overwritten the earlier correction. */
+function startingCardTurnTerminalCurrent(ds: DaemonSession, turnId: string): boolean {
+  if (ds.lastTurnTerminalTurnId !== turnId || !ds.lastTurnTerminalStatus) return false;
+  const highWater = ds.turnDispatchAttemptHighWater;
+  // The terminal handler has already accepted and recorded this terminal. Only
+  // a same-turn high-water can prove it belongs to an older retry; a missing
+  // high-water must not be compared as attempt=undefined.
+  if (!highWater || highWater.turnId !== turnId) return true;
+  return highWater.dispatchAttempt === ds.lastTurnTerminalDispatchAttempt;
+}
+
+function reconcilePublishedStartingCardTerminal(ds: DaemonSession, turnId: string): boolean {
+  if (!startingCardTurnTerminalCurrent(ds, turnId)) return false;
+  if (ds.lastTurnTerminalStatus === 'completed') {
+    cancelPostTerminalStatusSettle(ds);
+    postTerminalCardSettles.delete(ds);
+    // The late starting render is itself proof of a busy display. Do not require
+    // a worker frame to have populated lastScreenStatus before correcting it.
+    settleStaleBusyCardStatus(ds, turnId, 'late-starting-publication', false, undefined, true);
+  }
+  return true;
+}
+
+/** Shared by every starting-card publication path. The health sequence is
+ * captured before POST; queue activation and retry identity live in the helper. */
+function armPublishedStartingCardHealth(
+  ds: DaemonSession,
+  turnId: string,
+  messageId: string,
+  healthyAtPost: number,
+): void {
+  if (ds.currentTurnId !== turnId || ds.streamCardId !== messageId) return;
+  if (reconcilePublishedStartingCardTerminal(ds, turnId)) return;
+  armStartingCardHealth(ds, turnId, messageId, (entry, delivered) => {
+    if (!entry.warned) {
+      entry.warned = true;
+      logger.warn(`[${tag(ds)}] starting card health: no working frame after ${Math.round(STARTING_CARD_HEALTH_DELAY_MS / 1000)}s; marking card stalled (turn=${turnId.substring(0, 12)})`);
+    }
+    // The health module has already marked the display-only degraded identity.
+    // Stop usage ticks now instead of letting the next tick redraw working.
+    syncUsageRefreshTimer(ds);
+    const accepted = scheduleCardPatch(ds, buildStreamingCardJson(ds, 'stalled'), turnId, {
+      owns: () => startingCardHealthEntryStillCurrent(ds, entry),
+      onSettled: delivered,
+    });
+    if (!accepted) delivered(false);
+    else bumpStreamCardStatusRevision(ds);
+  }, {
+    afterHealthySeq: healthyAtPost,
+    defer: unifiedReplyTurnNotCapturing(ds, turnId),
+  });
+}
+
 async function postTurnStartingStatusCard(
   ds: DaemonSession,
   sessionReply: Parameters<typeof postTurnStartingCard>[1],
@@ -7158,6 +7222,7 @@ async function postTurnStartingStatusCard(
   const nonce = randomBytes(4).toString('hex');
   const status = turnStartingCardStatus(ds, effectiveCliId);
   const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
+  const healthyAtPost = startingCardHealthySequence(ds, turnId);
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     displayAnchorAtPost,
@@ -7247,18 +7312,7 @@ async function postTurnStartingStatusCard(
     syncUsageRefreshTimer(ds);
     reconcilePostedStartingCard(ds, turnId, statusRevisionAtPost);
     if (status === 'starting') {
-      armStartingCardHealth(ds, turnId, messageId, (entry, delivered) => {
-        if (!entry.warned) {
-          entry.warned = true;
-          logger.warn(`[${tag(ds)}] starting card health: no working frame after ${Math.round(STARTING_CARD_HEALTH_DELAY_MS / 1000)}s; marking card stalled (turn=${turnId.substring(0, 12)})`);
-        }
-        const accepted = scheduleCardPatch(ds, buildStreamingCardJson(ds, 'stalled'), turnId, {
-          owns: () => startingCardHealthEntryStillCurrent(ds, entry),
-          onSettled: delivered,
-        });
-        if (!accepted) delivered(false);
-        else bumpStreamCardStatusRevision(ds);
-      });
+      armPublishedStartingCardHealth(ds, turnId, messageId, healthyAtPost);
     }
     logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
     continuePublishedStreamingCardPinChain(ds, messageId, predecessorIds);
@@ -7882,7 +7936,10 @@ export function scheduleCardPatch(
   if (opts?.onSettled) pendingStreamingCardPatchSettlement.set(ds, opts.onSettled);
   const cardFence = captureStreamingCardPatchFence(ds, cardId, turnId);
   pendingStreamingCardPatchFence.set(ds, () => cardFence() && (!opts?.owns || opts.owns()));
-  ds.pendingCardJson = cardJson;
+  const renderJson = startingCardHealthStalledStatus(ds, turnId)
+    ? buildStreamingCardJson(ds, 'stalled')
+    : cardJson;
+  ds.pendingCardJson = renderJson;
   // Capture the card ID now — by the time flushCardPatch runs, ds.streamCardId
   // may have been overwritten by a new turn's card (CARD_POSTING_SENTINEL).
   ds.pendingCardId = cardId;
@@ -12785,7 +12842,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
-    status ?? ds.lastScreenStatus ?? 'starting',
+    status ?? startingCardHealthStalledStatus(ds) ?? ds.lastScreenStatus ?? 'starting',
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
@@ -21042,6 +21099,7 @@ function setupWorkerHandlers(
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
         } else {
+          if (msg.turnId) activateStartingCardHealth(ds, msg.turnId);
           if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
             // The waiting turn has become the terminal producer. Repaint even
             // when the worker remains working→working and no status edge would
@@ -21676,6 +21734,9 @@ function setupWorkerHandlers(
             // and post-daemon-restart paths still see lastScreenStatus
             // undefined and fall back to 'starting' (unchanged behavior).
             const initStatus = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? 'starting');
+            const healthTurnId = msg.turnId ?? ds.currentTurnId;
+            const healthyAtRestore = healthTurnId ? startingCardHealthySequence(ds, healthTurnId) : 0;
+            const statusRevisionAtRestore = ds.streamCardStatusRevision ?? 0;
             const localCliReadyAtBuild = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
             const codexTierAtBuild = ds.codexServiceTier;
             const streamCardJson = buildStreamingCard(
@@ -21719,6 +21780,15 @@ function setupWorkerHandlers(
             rememberPublishedStreamingCardIdentity(ds, restoredCardId);
             // Restored existing card: follows live (never bound to a past turn).
             bindStreamCardDisplayTarget(ds, restoredCardId);
+            if (initStatus === 'starting' && healthTurnId) {
+              // A newer status may have landed while the older starting PATCH
+              // was in flight. Re-assert it even after terminal: an idle frame
+              // is just as important as working when delivery order is reversed.
+              reconcilePostedStartingCard(ds, healthTurnId, statusRevisionAtRestore);
+            }
+            if (initStatus === 'starting' && healthTurnId) {
+              armPublishedStartingCardHealth(ds, healthTurnId, restoredCardId, healthyAtRestore);
+            }
             // Worker IPC handlers may run while the direct restore PATCH is in
             // flight. Re-queue readiness after it completes so an older
             // not-ready payload can never overwrite the cli_session_id PATCH.
@@ -21764,6 +21834,9 @@ function setupWorkerHandlers(
         const postingGeneration = ds.streamCardTurnGeneration ?? 0;
         const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
         const statusRevisionAtPost = ds.streamCardStatusRevision ?? 0;
+        const healthyAtPost = cardReplyTarget.turnId
+          ? startingCardHealthySequence(ds, cardReplyTarget.turnId)
+          : 0;
         const postingSession = ds.session;
         const postingTurnId = ds.currentTurnId;
         const postingChatId = ds.chatId;
@@ -21863,6 +21936,9 @@ function setupWorkerHandlers(
           ds.streamCardReplyTargetKey = cardReplyTarget.replyTargetKey;
           rememberPublishedStreamingCardIdentity(ds, postedCardId, postingGeneration);
           bindStreamCardDisplayTarget(ds, postedCardId, pendingTurnIdAtPost);
+          if (initStatus === 'starting' && cardReplyTarget.turnId) {
+            armPublishedStartingCardHealth(ds, cardReplyTarget.turnId, postedCardId, healthyAtPost);
+          }
           // This card IS the current turn's live card — clear the new-turn flag
           // so subsequent screen_updates PATCH it (starting → working) instead of
           // POSTing a second card. Without this, a re-fork that happens while
@@ -21997,7 +22073,8 @@ function setupWorkerHandlers(
       }
       case 'prompt_ready': {
         if (ds.worker !== worker) break;
-        noteStartingCardHealthFrame(ds, undefined, 'idle');
+        // Readiness over IPC is not a rendered screen frame. Keep the starting
+        // watchdog armed so a capture outage cannot be hidden by prompt_ready.
         // The ONLY set point for the in-memory readiness flag (design
         // 2026-09-11-command-router §5). The generation counter is monotonic —
         // clears below never touch it — so a cascade sequencer can capture it
@@ -22568,9 +22645,8 @@ function setupWorkerHandlers(
             && activeController.store.execution(activeController.ref, openingExecution.executionId)?.phase === 'queued')
         );
         const screenTurnId = screenTurnProven ? msg.turnId : undefined;
-        if (!stalePostTerminalBusy && (!msg.turnId || screenTurnProven)) {
-          noteStartingCardHealthFrame(ds, msg.turnId, projectedScreenStatus);
-        }
+        const startingCardRecovered = !stalePostTerminalBusy && (!msg.turnId || screenTurnProven)
+          && noteStartingCardHealthFrame(ds, msg.turnId, projectedScreenStatus);
         const prevStatus = ds.lastScreenStatus;
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
         const prevLabel = streamCardLabel(ds);
@@ -23060,7 +23136,7 @@ function setupWorkerHandlers(
           // execution stayed busy, so the first live busy frame must render.
           syncUsageRefreshTimer(ds);
           if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount
-            && prevActivity === activity && !forcePostTerminalBusyRepaint) break;
+            && prevActivity === activity && !forcePostTerminalBusyRepaint && !startingCardRecovered) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),
@@ -23737,6 +23813,7 @@ function setupWorkerHandlers(
         // Do NOT auto-restart in adopt mode — there's nothing to restart
         if (isSharedAdoptSession(ds)) {
           logger.info(`[${t}] Shared adopted session ended`);
+          resetStartingCardHealth(ds);
           // Freeze the streaming card
           if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
             const readUrl = '';
@@ -23847,6 +23924,7 @@ function setupWorkerHandlers(
             ? `exited with permanent code ${msg.code ?? '?'} after ${rc.count} attempt(s)`
             : `crashed ${rc.count} times in 1 min`;
           logger.warn(`[${t}] ${sessionCliDisplayName(ds, botCfg)} ${reasonText}, not auto-restarting`);
+          resetStartingCardHealth(ds);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
           // Freeze the last streaming card so it doesn't stay at "working"
           // forever. Backends without a Web Terminal pass an empty read URL;
@@ -24581,7 +24659,6 @@ function setupWorkerHandlers(
         }
         // The「本轮回顾」panel's material (reported by the worker just before
         // this terminal); the panel goes on once the turn's last card settles.
-        closeStartingCardHealth(ds, msg.turnId);
         const recapInput = msg.status === 'completed' && turnRecapIo.enabled(ds)
           ? recapInputFor(ds, msg.turnId) : undefined;
         // The exact turn is over. This is the only boundary that releases the
@@ -24597,6 +24674,7 @@ function setupWorkerHandlers(
         if ((!ds.currentTurnId || ds.currentTurnId === msg.turnId)
           && (!terminalHighWater || terminalHighWater.turnId !== msg.turnId
             || terminalHighWater.dispatchAttempt === msg.dispatchAttempt)) {
+          closeStartingCardHealth(ds, msg.turnId, msg.dispatchAttempt);
           ds.lastTurnTerminalAt = Date.now();
           ds.lastTurnTerminalTurnId = msg.turnId;
           ds.lastTurnTerminalDispatchAttempt = msg.dispatchAttempt;
