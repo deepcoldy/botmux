@@ -21,7 +21,42 @@ export const RUNTIME_RESERVATION_SLOW_LOG_MS = 15_000;
  *  fatal startup reason. */
 export const RUNTIME_RESERVATION_UNCONFIRMED = 'runtime reservation was not confirmed by the daemon';
 
-export type RuntimeReservationOutcome = 'granted' | 'refused' | 'expired';
+/** The daemon's refusal text, matched by the startup-retry classifier. */
+export const RUNTIME_RESERVATION_UNOWNED = 'runtime reservation was refused by the daemon and no lifecycle operation took the start over';
+
+/** `unowned`: the daemon refused the start and nothing else will start this
+ *  session's CLI, so the worker must fail instead of waiting for a takeover. */
+export type RuntimeReservationOutcome = 'granted' | 'refused' | 'unowned' | 'expired';
+export type RuntimeStartRefusal = 'unowned';
+
+export class RuntimeReservationRefusedError extends Error {
+  constructor() {
+    super(`CLI ${RUNTIME_RESERVATION_UNOWNED}`);
+    this.name = 'RuntimeReservationRefusedError';
+  }
+}
+
+/**
+ * Does a refused start have a lifecycle operation that takes the session over?
+ *
+ * A refusal normally hands the start to the operation that owns the session: a
+ * close or suspend in flight retires this worker, a restart or resume starts
+ * its own runtime. Nobody takes over when the contract the worker was bound to
+ * is retired (`closed`/`suspended`) with no operation in flight while the
+ * daemon still holds this worker as the live owner of an active session: a
+ * replacement worker that was bound to its closed predecessor's contract
+ * (2026-11-18, every /repo switch on daemon v3.59.10). Waiting for a takeover
+ * there leaves a session that looks online and idle with no CLI at all.
+ */
+export function runtimeStartRefusal(input: {
+  mayStart: boolean;
+  lifecycle: string;
+  activeOperationId?: string;
+  workerIsLiveOwner: boolean;
+}): RuntimeStartRefusal | undefined {
+  if (input.mayStart || !input.workerIsLiveOwner || input.activeOperationId) return undefined;
+  return input.lifecycle === 'closed' || input.lifecycle === 'suspended' ? 'unowned' : undefined;
+}
 
 export class RuntimeReservationExpiredError extends Error {
   constructor() {
@@ -33,7 +68,7 @@ export class RuntimeReservationExpiredError extends Error {
 /** Register the answer handler for `bindingId` in `pending` (the daemon's
  *  `runtime_contract_reserved` calls it) and resolve with what came of it. */
 export function awaitRuntimeReservation(
-  pending: Map<string, (mayStart: boolean) => void>,
+  pending: Map<string, (mayStart: boolean, refusal?: RuntimeStartRefusal) => void>,
   bindingId: string,
   onSlow: () => void,
 ): Promise<RuntimeReservationOutcome> {
@@ -48,6 +83,6 @@ export function awaitRuntimeReservation(
     const deadline = setTimeout(() => settle('expired'), RUNTIME_RESERVATION_DEADLINE_MS);
     slow.unref?.();
     deadline.unref?.();
-    pending.set(bindingId, mayStart => settle(mayStart ? 'granted' : 'refused'));
+    pending.set(bindingId, (mayStart, refusal) => settle(mayStart ? 'granted' : refusal === 'unowned' ? 'unowned' : 'refused'));
   });
 }

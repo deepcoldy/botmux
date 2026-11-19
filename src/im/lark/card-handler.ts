@@ -25,10 +25,12 @@ import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
 import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
+import { failedTurnRewindInFlight } from '../../core/failed-turn-rewind.js';
 import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
+import { handleTmuxUpgradeCardAction, isTmuxUpgradeAction } from '../../core/tmux-upgrade.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
 import type { GrantCardDelivery } from './card-builder.js';
@@ -1827,6 +1829,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     st.restartedBrowsers = [...new Set([...(st.restartedBrowsers ?? []), bundleId])];
     logger.info(`[overload] browser ${label} restarted by owner ${operatorOpenId} (relaunched=${result.relaunched})`);
     return JSON.parse(buildOverloadAlertCard(st));
+  }
+  // ─── tmux 升级提醒卡（tmux_upgrade_*）────────────────────────────────────
+  // 不绑 session。管理员闸门 + 卡片 nonce + 同时只跑一个任务都在 advisor 里；
+  // 只有主 daemon 注册了 advisor，别的进程收到点击只回「稍后再试」。
+  if (isTmuxUpgradeAction(value?.action) && larkAppId) {
+    return handleTmuxUpgradeCardAction({
+      action: value.action,
+      nonce: value.nonce,
+      messageId: cardMessageId,
+      operatorOpenId,
+      larkAppId,
+    }, localeForBot(larkAppId));
   }
   // ─── 群内授权卡片动作（限制提交 + grant/revoke，talk-only）──────────────────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
@@ -4375,6 +4389,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           },
         };
       }
+      // An input is already on its way to re-send this failed turn (its CLI
+      // restart is still running): a retry now would run it twice.
+      if (failedTurnRewindInFlight(ds, failedTurn.turnId)) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_in_flight', undefined, locDs) } };
+      }
       if ((!ds.worker || ds.worker.killed) && hasProtectedSessionMutationOwnership(ds)) {
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
@@ -4405,7 +4424,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
+        // A turn that failed without any output is cut first and its input
+        // re-sent as it was — nothing ran, so there is nothing to continue
+        // from (core/failed-turn-rewind.ts). Otherwise the mode above applies.
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurnResendOf: failedTurn.turnId });
         else {
           accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }

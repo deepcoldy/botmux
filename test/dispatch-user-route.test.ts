@@ -104,7 +104,20 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // This fixture exercises lifecycle/delegation, not a live process tree.
     // Root refresh and publication are covered by worker-codex-execution-root.
     currentCodexObservedPid: vi.fn(),
+    // markPromptReady calls this module-level let unconditionally (optional
+    // chaining only guards nullish VALUES, not an identifier missing from a
+    // bare `with(scope)` object); the sandbox leaf path has its own suite.
+    refreshSandboxedCliLeafAttestation: undefined,
     stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
+    // markPromptReady's busy-deferral bookkeeping (worker.ts module-level
+    // symbols in the real process): this fixture asserts lifecycle/release
+    // boundaries, so the throttle stays quiet and the bookkeeping is stubbed.
+    busyReadyLogThrottle: { shouldLog: () => false },
+    warnPromptReadySkipped: vi.fn(),
+    busyReadyDeferral: { clear: vi.fn() },
+    cancelTurnTerminalReadyRecovery: vi.fn(),
+    forceReadyAfterTurnTerminal: false,
+    currentBotmuxTurnId: undefined,
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
     spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },

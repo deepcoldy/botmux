@@ -83,6 +83,71 @@ afterEach(() => {
 });
 
 describe('contract gateway and real worker boundaries', () => {
+  it('admits current Claude effort observations while refusing older sequences and retired runtimes', () => {
+    const s = fixture();
+    const reading = (sequence: number) => ({ type: 'claude_effort', claudeSessionId: 'native1',
+      reasoningEffort: 'medium', sessionContract: s.context(sequence) });
+    expect(s.controller.ingest(reading(2), s.worker)).toMatchObject({ kind: 'current' });
+    expect(s.controller.ingest(reading(1), s.worker)).toMatchObject({ kind: 'reject', reason: 'stale_observation_sequence' });
+    s.controller.reserveBinding('binding-replacement', s.worker);
+    s.controller.bindRuntime('binding-replacement', s.worker,
+      { backend: 'tmux', physicalId: 'new-process', nativeSessionId: 'native1', proof: 'process_start' });
+    expect(s.controller.ingest(reading(3), s.worker)).toMatchObject({ kind: 'reject' });
+  });
+
+  // A turn the CLI starts on its own (a background task's wake-up, terminal
+  // input) has no IM input behind it. Its start is how a zero-prompt session
+  // learns where the turn replies; refusing it lost every such answer.
+  it('admits the start of a turn the live CLI began on its own, but not one from a replaced CLI', () => {
+    const s = fixture();
+    const started = (sequence: number, turnId: string) => ({ type: 'terminal_turn_started', turnId,
+      startedAtMs: Date.now(), sessionContract: s.context(sequence) });
+    expect(s.controller.ingest(started(1, 'local-headless-wake'), s.worker)).toMatchObject({ kind: 'current' });
+    expect(s.controller.ingest({ type: 'final_output', sessionId: s.ref.sessionId, turnId: 'local-headless-wake',
+      content: 'verdict', lastUuid: 'uuid-verdict', terminalLocal: true, sessionContract: s.context(2) }, s.worker))
+      .toMatchObject({ kind: 'current' });
+    // The same CLI re-bound in process (its relay resolved, a new native id):
+    // the bridge still reports under the runtime the spawn bound.
+    const rebound = s.controller.reserveBinding('binding-rebound', s.worker);
+    s.controller.bindRuntime('binding-rebound', s.worker,
+      { backend: 'tmux', physicalId: '222:start2', nativeSessionId: 'native2', proof: 'process_start' }, undefined, 'binding-old');
+    const afterRebind = s.controller.ingest(started(3, 'local-headless-after-rebind'), s.worker);
+    expect(afterRebind).toMatchObject({ kind: 'current' });
+    expect(sameRuntime((afterRebind as { context: { scope: { runtime?: unknown } } }).context.scope.runtime as any, rebound)).toBe(true);
+    s.controller.reserveBinding('binding-replacement', s.worker);
+    s.controller.bindRuntime('binding-replacement', s.worker,
+      { backend: 'tmux', physicalId: 'new-process', nativeSessionId: 'native1', proof: 'process_start' });
+    // Still scoped to the CLI that was replaced.
+    expect(s.controller.ingest(started(4, 'local-headless-late'), s.worker)).toMatchObject({ kind: 'reject' });
+  });
+
+  it('admits current close receipts while closing without admitting runtime input or stale workers', () => {
+    const s = fixture();
+    s.controller.beginControl('close');
+    for (const type of ['close_result', 'close_abort_result']) {
+      expect(s.controller.gateway.admit(type, s.context(1), s.worker).kind).toBe('worker');
+      expect(s.controller.gateway.admit(type, s.context(2, {}), s.worker).kind).toBe('worker');
+    }
+    expect(s.controller.gateway.admit('prompt_ready', s.context(3), s.worker).kind).toBe('reject');
+    s.controller.bindWorker(2);
+    expect(s.controller.gateway.admit('close_result', s.context(4), s.worker).kind).toBe('reject');
+  });
+
+  it('binds only the current close operation to a remote control runtime and keeps input fenced', () => {
+    const s = fixture();
+    const { operation } = s.controller.beginControl('close');
+    const producer = s.controller.bindWorker(2).worker;
+    const identity = { backend: 'remote-runner', physicalId: 'control-provider', proof: 'opaque' as const };
+    s.controller.reserveBinding('control', producer);
+    const bound = s.controller.bindRuntime('control', producer, identity, operation.operationId);
+    expect(bound.phase).not.toBe('retiring');
+    expect(s.store.read(s.ref)?.activeRuntime).toEqual(bound.ref);
+    expect(s.controller.allowsInput()).toBe(false);
+    expect(s.ds.workerReady).toBe(false);
+    s.controller.reserveBinding('stale-control', producer);
+    expect(s.controller.bindRuntime('stale-control', producer, { ...identity, physicalId: 'stale' }, 'old-close').phase).toBe('retiring');
+  });
+
   // The worker's input-queue report describes the worker's own queue: a
   // callback started under a runtime that was re-bound in process since then
   // still reports the live queue, and it is reported only when it changes.

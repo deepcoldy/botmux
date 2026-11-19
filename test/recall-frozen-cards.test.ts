@@ -13,6 +13,7 @@ import { pendingStartingCardPublication } from '../src/core/starting-card-public
  * Run:  pnpm vitest run test/recall-frozen-cards.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -22,9 +23,10 @@ import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
-const { loggerWarnMock, loggerDebugMock } = vi.hoisted(() => ({
+const { loggerWarnMock, loggerDebugMock, updateTurnReplyCardMock } = vi.hoisted(() => ({
   loggerWarnMock: vi.fn(),
   loggerDebugMock: vi.fn(),
+  updateTurnReplyCardMock: vi.fn(async () => ({ messageId: 'om_placeholder' })),
 }));
 
 const deleteMessageMock = vi.fn(async (_appId: string, _messageId: string) => {});
@@ -70,6 +72,14 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
 }));
+
+vi.mock('../src/core/turn-reply-card.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/core/turn-reply-card.js')>();
+  return {
+    ...actual,
+    updateTurnReplyCard: (...args: Parameters<typeof actual.updateTurnReplyCard>) => updateTurnReplyCardMock(...args),
+  };
+});
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
@@ -138,6 +148,8 @@ import {
   parkStreamCard,
   postFreshStreamingCard,
   postTurnStartingCard,
+  releaseDeferredUnifiedReplyCard,
+  unifiedReplyTurnNotCapturing,
   setActiveSessionsRegistry,
   restoreUsageLimitRuntimeState,
   scheduleCardPatch,
@@ -147,7 +159,10 @@ import {
   USAGE_REFRESH_INTERVAL_MS,
   canRestoreStreamingCardIdentity,
   restoreStreamingCardIdentityFromProof,
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
+import { replyCardModeFor } from '../src/core/turn-reply-card.js';
 import { MessageWithdrawnError, MessageUpdateExpiredError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
@@ -223,6 +238,7 @@ beforeEach(() => {
   persistStreamCardStateMock.mockClear();
   loggerWarnMock.mockClear();
   loggerDebugMock.mockClear();
+  updateTurnReplyCardMock.mockClear();
   buildStreamingCardMock.mockClear();
   getBotMock.mockReturnValue({
     config: { larkAppId: APP_ID, cliId: 'claude-code' },
@@ -234,6 +250,7 @@ beforeEach(() => {
 afterEach(() => {
   setActiveSessionsRegistry(undefined as any);
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 function flush(): Promise<void> {
@@ -248,9 +265,9 @@ async function drainPinQueue(): Promise<void> {
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
 describe('recallFrozenCards', () => {
-  it('is a no-op when frozenCards is undefined and disk is empty', () => {
+  it('is a no-op when frozenCards is undefined and disk is empty', async () => {
     const ds = makeDs(undefined);
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(loadFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID);
     expect(deleteMessageMock).not.toHaveBeenCalled();
@@ -258,9 +275,9 @@ describe('recallFrozenCards', () => {
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('is a no-op when in-memory frozenCards is empty', () => {
+  it('is a no-op when in-memory frozenCards is empty', async () => {
     const ds = makeDs(new Map());
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     // Lazy-load short-circuited because Map exists (just empty).
     expect(loadFrozenCardsMock).not.toHaveBeenCalled();
@@ -268,14 +285,14 @@ describe('recallFrozenCards', () => {
     expect(saveFrozenCardsMock).not.toHaveBeenCalled();
   });
 
-  it('deletes every frozen card via the Lark client', () => {
+  it('deletes every frozen card via the Lark client', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_a'));
     map.set('n2', makeFrozen('om_b'));
     map.set('n3', makeFrozen('om_c'));
     const ds = makeDs(map);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(3);
     const ids = deleteMessageMock.mock.calls.map(c => c[1]).sort();
@@ -283,25 +300,81 @@ describe('recallFrozenCards', () => {
     deleteMessageMock.mock.calls.forEach(c => expect(c[0]).toBe(APP_ID));
   });
 
-  it('clears the in-memory Map and persists empty state', () => {
+  it('repaints each frozen card to 「等待输入」 before withdrawing it', async () => {
+    const map = new Map<string, FrozenCard>();
+    map.set('n1', makeFrozen('om_a'));
+    map.set('n2', makeFrozen('om_b'));
+    const ds = makeDs(map);
+
+    await recallFrozenCards(ds);
+
+    // Lark keeps a withdrawn message's last frame readable, so deleting a card
+    // frozen mid-work would leave a 「工作中」 tombstone in the thread.
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(updateMessageMock.mock.calls.map(c => c[1])).toEqual(['om_a', 'om_b']);
+    expect(buildStreamingCardMock.mock.calls.map(c => c[5])).toEqual(['idle', 'idle']);
+    // Serial, and each repaint precedes its own withdraw.
+    const repaints = updateMessageMock.mock.invocationCallOrder;
+    const withdrawals = deleteMessageMock.mock.invocationCallOrder;
+    expect(repaints[0]).toBeLessThan(withdrawals[0]);
+    expect(withdrawals[0]).toBeLessThan(repaints[1]);
+    expect(repaints[1]).toBeLessThan(withdrawals[1]);
+  });
+
+  it('still withdraws a frozen card when its repaint fails', async () => {
+    updateMessageMock.mockRejectedValue(new Error('expired'));
+    const map = new Map<string, FrozenCard>();
+    map.set('n1', makeFrozen('om_a'));
+    map.set('n2', makeFrozen('om_b'));
+    const ds = makeDs(map);
+
+    await expect(recallFrozenCards(ds)).resolves.toEqual(['om_a', 'om_b']);
+    expect(deleteMessageMock).toHaveBeenCalledTimes(2);
+    expect(ds.frozenCards?.size).toBe(0);
+  });
+
+  it('does not withdraw a frozen card restored as live while its repaint is pending', async () => {
+    const ds = makeDs(new Map([['old', makeFrozen('om_old')]]));
+    ds.streamCardId = 'om_new';
+    let release!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const recalling = recallFrozenCards(ds);
+    ds.streamCardId = 'om_old';
+    release();
+    await recalling;
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('does not withdraw cards after the session object changes during repaint', async () => {
+    const ds = makeDs(new Map([['old', makeFrozen('om_old')]]));
+    let release!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const recalling = recallFrozenCards(ds);
+    ds.session = { ...ds.session };
+    release();
+    await recalling;
+    expect(deleteMessageMock).not.toHaveBeenCalled();
+  });
+
+  it('clears the in-memory Map and persists empty state', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_a'));
     const ds = makeDs(map);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(ds.frozenCards?.size).toBe(0);
     expect(saveFrozenCardsMock).toHaveBeenCalledTimes(1);
     expect(saveFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID, ds.frozenCards);
   });
 
-  it('lazy-loads from disk when frozenCards is undefined', () => {
+  it('lazy-loads from disk when frozenCards is undefined', async () => {
     const onDisk = new Map<string, FrozenCard>();
     onDisk.set('persisted', makeFrozen('om_persisted'));
     loadFrozenCardsMock.mockReturnValue(onDisk);
 
     const ds = makeDs(undefined);
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(loadFrozenCardsMock).toHaveBeenCalledWith(SESSION_ID);
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
@@ -309,7 +382,7 @@ describe('recallFrozenCards', () => {
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('swallows deleteMessage rejections without throwing', () => {
+  it('swallows deleteMessage rejections without throwing', async () => {
     deleteMessageMock.mockImplementationOnce(async () => {
       throw new Error('boom');
     });
@@ -318,26 +391,26 @@ describe('recallFrozenCards', () => {
     map.set('n2', makeFrozen('om_ok'));
     const ds = makeDs(map);
 
-    expect(() => recallFrozenCards(ds)).not.toThrow();
+    await expect(recallFrozenCards(ds)).resolves.toEqual(['om_failing', 'om_ok']);
     expect(deleteMessageMock).toHaveBeenCalledTimes(2);
     expect(ds.frozenCards?.size).toBe(0);
   });
 
-  it('is idempotent — second call after the first does nothing', () => {
+  it('is idempotent — second call after the first does nothing', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_only'));
     const ds = makeDs(map);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
     expect(deleteMessageMock).toHaveBeenCalledTimes(1); // still 1
   });
 
   // ── P2 regression: never delete the live card ─────────────────────────────
 
-  it('skips entries whose messageId equals the active streamCardId', () => {
+  it('skips entries whose messageId equals the active streamCardId', async () => {
     // Reproduces the daemon-restart window where freeze persisted an entry
     // for the still-live card before crash. Recall must not delete it.
     const map = new Map<string, FrozenCard>();
@@ -346,7 +419,7 @@ describe('recallFrozenCards', () => {
     const ds = makeDs(map);
     ds.streamCardId = 'om_active';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_old');
@@ -355,32 +428,32 @@ describe('recallFrozenCards', () => {
     expect(ds.frozenCards?.has('nonce_old')).toBe(false);
   });
 
-  it('does not persist or call deleteMessage when only the active entry exists', () => {
+  it('does not persist or call deleteMessage when only the active entry exists', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('nonce_active', makeFrozen('om_active'));
     const ds = makeDs(map);
     ds.streamCardId = 'om_active';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).not.toHaveBeenCalled();
     expect(saveFrozenCardsMock).not.toHaveBeenCalled();
     expect(ds.frozenCards?.size).toBe(1);
   });
 
-  it('treats CARD_POSTING_SENTINEL as no active id (deletes everything)', () => {
+  it('treats CARD_POSTING_SENTINEL as no active id (deletes everything)', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('n1', makeFrozen('om_only'));
     const ds = makeDs(map);
     ds.streamCardId = '__posting__';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_only');
   });
 
-  it('withdraws only frozen cards from the live card reply target', () => {
+  it('withdraws only frozen cards from the live card reply target', async () => {
     const map = new Map<string, FrozenCard>();
     map.set('topic_a', makeFrozen('om_card_a', { replyTargetKey: 'thread:om_topic_a' }));
     map.set('topic_b', makeFrozen('om_card_b', { replyTargetKey: 'thread:om_topic_b' }));
@@ -389,7 +462,7 @@ describe('recallFrozenCards', () => {
     ds.streamCardId = 'om_card_b_live';
     ds.streamCardReplyTargetKey = 'thread:om_topic_b';
 
-    recallFrozenCards(ds);
+    await recallFrozenCards(ds);
 
     expect(deleteMessageMock).toHaveBeenCalledTimes(1);
     expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, 'om_card_b');
@@ -734,6 +807,152 @@ describe('postTurnStartingCard', () => {
     expect(ds.streamCardId).toBe('om_turn_card_1');
     expect(ds.streamCardPending).toBe(false);
     expect(ds.streamCardPendingTurnId).toBeUndefined();
+  });
+
+  it('does not post the unified placeholder while another turn still owns the terminal', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    ds.workerGeneration = 3;
+    ds.captureIdentity = { workerGeneration: 3, revision: 1, turnId: 'om_active' };
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_followup';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_should_not_post');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_followup')).resolves.toBe(false);
+
+    expect(unifiedReplyTurnNotCapturing(ds, 'om_followup')).toBe(true);
+    expect(replyCardModeFor(ds, 'om_followup')).toBe('unified');
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+
+    let settlePlaceholder!: (result: { messageId: string }) => void;
+    updateTurnReplyCardMock.mockImplementationOnce(() => new Promise(resolve => { settlePlaceholder = resolve; }));
+    ds.captureIdentity = { workerGeneration: 3, revision: 2, turnId: 'om_followup' };
+    expect(unifiedReplyTurnNotCapturing(ds, 'om_followup')).toBe(false);
+    const release = releaseDeferredUnifiedReplyCard(ds, sessionReply);
+    expect(pendingStartingCardPublication(ds)).toBeDefined();
+    settlePlaceholder({ messageId: 'om_placeholder' });
+    await expect(release).resolves.toBe(true);
+    await flush();
+    expect(pendingStartingCardPublication(ds)).toBeUndefined();
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'start' });
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds the queue-commit start until capture identity releases a working card', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    const worker = new EventEmitter() as any;
+    worker.killed = false;
+    worker.connected = true;
+    worker.pid = 123;
+    worker.send = vi.fn();
+    worker.kill = vi.fn();
+    worker.stdout = new EventEmitter();
+    worker.stderr = new EventEmitter();
+    ds.worker = worker;
+    ds.workerGeneration = 3;
+    ds.session.workerGeneration = 3;
+    ds.captureIdentity = { workerGeneration: 3, revision: 1, turnId: 'om_active' };
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_followup';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_followup')).resolves.toBe(false);
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, 3);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_followup' });
+    await flush();
+
+    expect(ds.captureIdentity?.turnId).toBe('om_active');
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+
+    worker.emit('message', { type: 'capture_identity', revision: 2, turnId: 'om_followup' });
+    await vi.waitFor(() => expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1));
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'start' });
+    worker.removeAllListeners();
+    ds.worker = null;
+  });
+
+  it('posts the unified placeholder immediately when this turn is already capturing', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    ds.workerGeneration = 3;
+    ds.captureIdentity = { workerGeneration: 3, revision: 4, turnId: 'om_followup' };
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_followup';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_followup')).resolves.toBe(true);
+
+    expect(replyCardModeFor(ds, 'om_followup')).toBe('unified');
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
+    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('posts the unified placeholder immediately when no capture identity exists yet', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_first';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+
+    await postTurnStartingCard(ds, sessionReply, 'om_first');
+
+    expect(unifiedReplyTurnNotCapturing(ds, 'om_first')).toBe(false);
+    expect(replyCardModeFor(ds, 'om_first')).toBe('unified');
+    expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_first');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
   });
 
   it('isolates frozen-card cleanup when one chat session moves A to B to A', async () => {

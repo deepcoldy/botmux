@@ -235,6 +235,86 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     expect(late).toEqual({ submitted: true });
   });
 
+  it.each(['launcher', 'missing'] as const)('late recheck follows a %s ownership PID rewired after the write', async initial => {
+    const ownedPid = spawnRolloutHolder(SID_1);
+    const launcher = initial === 'launcher' ? spawn('sleep', ['60'], { stdio: 'ignore' }) : undefined;
+    if (launcher) holders.push(launcher);
+    await new Promise(r => setTimeout(r, 150));
+    const pty = ptyThatNeverCommits(initial === 'launcher' ? launcher!.pid : undefined);
+    const result = await createTraexAdapter('/bin/traex').writeInput(pty, 'late after pid rewire');
+    expect(result?.submitted).toBe(false);
+
+    // The worker's asynchronous launcher/late-PID resolver rewires the SAME
+    // backend after writeInput returned its receipt closure.
+    pty.cliPid = ownedPid;
+    seedHistory(SID_1, 'late after pid rewire');
+    expect(await result!.recheck!()).toEqual({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
+  });
+
+  it('late recovery distinguishes an owned receipt from foreign same-text history', async () => {
+    const ownedPid = spawnRolloutHolder(SID_1);
+    await new Promise(r => setTimeout(r, 150));
+    const pty = ptyThatNeverCommits(ownedPid);
+    const result = await createTraexAdapter('/bin/traex').writeInput(pty, 'late owned receipt');
+    expect(result?.submitted).toBe(false);
+    expect(result?.recheck).toBeTypeOf('function');
+    seedHistory(SID_2, 'late owned receipt');
+    expect(await result!.recheck!()).toEqual({ submitted: true });
+    seedHistory(SID_1, 'late owned receipt');
+    expect(await result!.recheck!()).toEqual({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
+    expect(pty.pasteText).toHaveBeenCalledTimes(1);
+    const enters = pty.sendSpecialKeys.mock.calls.length;
+    await result!.recheck!();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(enters);
+  });
+
+  // A tmux send-keys timeout makes sendSpecialKeys return false even though the
+  // key may still have reached the pane. writeInput must treat only a thrown
+  // error as failure: keep polling history, and still hand back a recheck
+  // closure when nothing lands — otherwise the worker's parked-draft recovery
+  // chain is skipped (no recheck → attribution mark dropped at the warning).
+  it('keeps polling after a false Enter return when the key actually landed', async () => {
+    const adapter = createTraexAdapter('/bin/traex');
+    let pasted = '';
+    const pty: PtyHandle & { pasteText: ReturnType<typeof vi.fn>; sendSpecialKeys: ReturnType<typeof vi.fn> } = {
+      write: vi.fn(),
+      pasteText: vi.fn((text: string) => { pasted = text; }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key === 'Enter') {
+          mkdirSync(join(traeHome, 'cli'), { recursive: true });
+          appendFileSync(historyPath, historyLine(SID_1, pasted));
+        }
+        return false;
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, 'enter reported false but landed');
+
+    expect(result).toEqual({ submitted: true });
+  });
+
+  it('still returns a recheck closure after a false Enter return with no history line', async () => {
+    seedHistory(SID_1, 'prior turn');
+    const adapter = createTraexAdapter('/bin/traex');
+    const pty: PtyHandle & { pasteText: ReturnType<typeof vi.fn>; sendSpecialKeys: ReturnType<typeof vi.fn> } = {
+      write: vi.fn(),
+      pasteText: vi.fn(),
+      sendSpecialKeys: vi.fn(() => false),
+    };
+
+    const result = await adapter.writeInput(pty, 'enter reported false and lost');
+
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as any).recheck).toBe('function');
+  });
+
+  it('honors a rejected fallback write for one-shot composer rescue', () => {
+    const pty: PtyHandle & { write: ReturnType<typeof vi.fn> } = { write: vi.fn(() => false) };
+
+    expect(createTraexAdapter('/bin/traex').pressComposerSubmit?.(pty)).toBe(false);
+    expect(pty.write).toHaveBeenCalledExactlyOnceWith('\r');
+  });
+
   // ── Session-id ownership (only RETURN a pid-owned id) ──
 
   it('returns the session id when THIS pid provably owns the rollout', async () => {
@@ -246,7 +326,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
 
     const result = await adapter.writeInput(pty, 'owned submit');
 
-    expect(result).toEqual({ submitted: true, cliSessionId: SID_1 });
+    expect(result).toEqual({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
   });
 
   it('confirms the submit but WITHHOLDS a foreign sibling id the pid does not own', async () => {
@@ -278,7 +358,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
 
     const result = await adapter.writeInput(pty, 'duplicate text foreign-first');
 
-    expect(result).toEqual({ submitted: true, cliSessionId: SID_1 });
+    expect(result).toEqual({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
   });
 
   it('keeps polling past a foreign-first sighting until the OWNED line lands later (async timing)', async () => {
@@ -298,7 +378,7 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
     const result = await adapter.writeInput(pty, 'duplicate text owned-later');
     for (const t of pty.timers) clearTimeout(t);
 
-    expect(result).toEqual({ submitted: true, cliSessionId: SID_1 });
+    expect(result).toEqual({ submitted: true, cliSessionId: SID_1, ownershipProven: true });
   });
 
   it('withholds the id when fd enumeration is unavailable (pid not running)', async () => {

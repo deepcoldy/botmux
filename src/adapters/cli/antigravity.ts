@@ -1,9 +1,10 @@
 import { detectModelsViaExec } from './model-catalog-json.js';
 import { parseAntigravityModels } from './antigravity-models.js';
-import { existsSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, fstatSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
+import { statuslineHookCommand } from '../hook-command.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { wrapBracketedPaste } from './tui-input.js';
@@ -325,7 +326,7 @@ function antigravityTranscriptHasUserInput(transcriptPath: string): boolean {
   }
 }
 
-/** Antigravity brain transcript. Zero-prompt only (no /adopt bridge). The transcript is
+/** Antigravity brain transcript for zero-prompt and adopted sessions. The transcript is
  *  created lazily after the first submit, so a file born after spawn is the live turn
  *  (`birth-aware`). Its provisional trailing final lives in driver state that the worker
  *  commits on the steady-state ingest tick only. Locates the full log first and the compact
@@ -336,7 +337,7 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
     path,
     offset,
     (ctx.state as AntigravityTranscriptState | undefined) ?? {},
-    { flushTrailingFinal: ctx.flushTrailingFinal },
+    { flushTrailingFinal: ctx.flushTrailingFinal, adoptMode: ctx.adoptMode },
   ),
   stateCommit: 'ingest',
   locate: {
@@ -349,12 +350,56 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
   spawn: { sessionId: 'cli', baseline: 'birth-aware' },
 };
 
-/** Only release versions with the verified paste contract opt into the fast path. */
-function supportsAntigravityBracketedPaste(version: string | undefined): boolean {
+function antigravityVersionAtLeast(
+  version: string | undefined,
+  minMajor: number,
+  minMinor: number,
+  minPatch: number,
+): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version?.trim() ?? '');
   if (!match) return false;
   const [major = 0, minor = 0, patch = 0] = match.slice(1, 4).map(Number);
-  return major > 1 || (major === 1 && (minor > 5 || (minor === 5 && patch >= 4)));
+  return major > minMajor
+    || (major === minMajor && (minor > minMinor || (minor === minMinor && patch >= minPatch)));
+}
+
+/** Only release versions with the verified paste contract opt into the fast path. */
+function supportsAntigravityBracketedPaste(version: string | undefined): boolean {
+  return antigravityVersionAtLeast(version, 1, 5, 4);
+}
+
+/** Verified release baseline supporting ephemeral `--settings` JSON with
+ *  `statusLine.stack_with_default: true` and quota buckets on stdin
+ *  (`stack_with_default` landed in 1.0.6, statusLine quota in 1.0.8 / 1.1.12,
+ *  and `--settings` is documented in 1.5.8+ and verified live on 1.5.12).
+ *  Older or unknown versions skip `--settings` so they never fail on an
+ *  unknown flag or hide the `? for shortcuts` ready footer. */
+export function supportsAntigravityStatusline(version: string | undefined): boolean {
+  return antigravityVersionAtLeast(version, 1, 5, 8);
+}
+
+/** 找回被进程级 `--settings` 遮蔽的用户 Antigravity statusLine 命令。
+ *  读取 `~/.gemini/antigravity-cli/settings.json` 中的 `statusLine`：
+ *  仅当未显式禁用（`enabled !== false`）、未指定非 command 类型、且 `command` 非空时返回。
+ *  纯函数、fail-open：文件缺失或损坏返回 `{}`。 */
+export function resolveShadowedAntigravityStatusLine(
+  opts?: { userSettingsPath?: string },
+): { command?: string } {
+  const settingsPath = opts?.userSettingsPath ?? join(homedir(), '.gemini', 'antigravity-cli', 'settings.json');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(settingsPath, 'utf-8').replace(/^\uFEFF/, ''));
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const sl = (parsed as Record<string, unknown>).statusLine;
+  if (!sl || typeof sl !== 'object' || Array.isArray(sl)) return {};
+  const o = sl as Record<string, unknown>;
+  if (o.enabled === false) return {};
+  if (o.type !== undefined && o.type !== 'command') return {};
+  if (typeof o.command !== 'string' || o.command.trim() === '') return {};
+  return { command: o.command };
 }
 
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
@@ -440,6 +485,20 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       }
       if (reasoningEffort && (reasoningEffort === 'low' || reasoningEffort === 'medium' || reasoningEffort === 'high')) {
         args.push('--effort', reasoningEffort);
+      }
+      // statusLine（agy >= 1.5.8）：通过进程级 --settings 临时注入，不修改用户
+      // ~/.gemini/antigravity-cli/settings.json；stack_with_default=true 保留
+      // 默认底部栏（保证 `? for shortcuts` readyPattern 与 idle 判定不受影响）。
+      // 用户原有的自定义 statusLine.command 由 worker 通过 BOTMUX_STATUSLINE_CHAIN 透传。
+      if (supportsAntigravityStatusline(cliVersion)) {
+        args.push('--settings', JSON.stringify({
+          statusLine: {
+            type: 'command',
+            enabled: true,
+            command: statuslineHookCommand(),
+            stack_with_default: true,
+          },
+        }));
       }
       // agy 1.5.4 supports -i, but its startup prompt bypasses history.jsonl.
       // Keep the same verified stdin submit path for initial and later turns.

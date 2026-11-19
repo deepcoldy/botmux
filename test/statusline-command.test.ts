@@ -59,6 +59,17 @@ function baseEnv(dataDir: string, sessionId: string): NodeJS.ProcessEnv {
 }
 
 describe.skipIf(process.platform === 'win32')('statuslineHookCommand 实际执行', () => {
+  it('native effort changes and disappearance reach disk through the actual hook command', async () => {
+    const dataDir = makeDir(); const env = baseEnv(dataDir, 'sess-effort');
+    for (const level of ['high', 'medium', undefined]) {
+      const raw = { ...PAYLOAD, ...(level ? { effort: { level } } : {}) };
+      expect((await runHookCommand(env, JSON.stringify(raw))).status).toBe(0);
+      const written = JSON.parse(readFileSync(statuslineFilePath(dataDir, 'sess-effort'), 'utf8'));
+      expect(written.reasoningEffort).toBe(level);
+      expect(written.model).toBe(PAYLOAD.model.id);
+    }
+  }, 30_000);
+
   it('落盘的快照与 parseStatuslinePayload 的结果一致（卡片读到的字段不变）', async () => {
     const dataDir = makeDir();
     const r = await runHookCommand(baseEnv(dataDir, 'sess-a'), JSON.stringify(PAYLOAD));
@@ -96,9 +107,50 @@ describe.skipIf(process.platform === 'win32')('statuslineHookCommand 实际执�
     await runHookCommand(env, JSON.stringify(changed));
     expect(JSON.parse(readFileSync(file, 'utf-8')).contextPercent).toBe(42);
   }, 30_000);
+
+  it('Antigravity statusLine payload 经同一 hook 命令落盘 quota 并透传原始 stdin 给 chain', async () => {
+    const dataDir = makeDir();
+    const env = baseEnv(dataDir, 'sess-agy');
+    env.BOTMUX_STATUSLINE_CHAIN = 'cat';
+    const resetIso = new Date(Date.now() + 3600_000).toISOString();
+    const agyPayload = {
+      product: 'antigravity',
+      version: '1.5.12',
+      session_id: 'agy-conv-1',
+      model: { id: 'Gemini 4 Neon (XHigh)', display_name: 'Gemini 4 Neon (XHigh)' },
+      context_window: { context_window_size: 1_048_576, used_percentage: 12 },
+      quota: {
+        'gemini-5h': { remaining_fraction: 0.75, reset_time: resetIso },
+        'gemini-weekly': { remaining_fraction: 0.9, reset_time: resetIso },
+        '3p-5h': { remaining_fraction: 0.1, reset_time: resetIso },
+      },
+    };
+    const raw = JSON.stringify(agyPayload);
+    const r = await runHookCommand(env, raw);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(raw);
+    const written = JSON.parse(readFileSync(statuslineFilePath(dataDir, 'sess-agy'), 'utf-8'));
+    expect(written).toMatchObject({
+      contextPercent: 12,
+      contextWindowTokens: 1_048_576,
+      fiveHourPercent: 25,
+      sevenDayPercent: 10,
+      fiveHourResetsAtMs: Date.parse(resetIso),
+      sevenDayResetsAtMs: Date.parse(resetIso),
+      model: 'Gemini 4 Neon (XHigh)',
+    });
+    expect(written.claudeSessionId).toBeUndefined();
+  }, 30_000);
 });
 
 describe('shouldSkipStatuslineWrite', () => {
+  it('writes a changed or removed effort immediately, even inside the dedupe window', () => {
+    const prev = JSON.stringify({ ts: 1_000_000, model: 'm', reasoningEffort: 'high' });
+    expect(shouldSkipStatuslineWrite(prev, { ts: 1_000_001, model: 'm', reasoningEffort: 'medium' })).toBe(false);
+    expect(shouldSkipStatuslineWrite(prev, { ts: 1_000_001, model: 'm' })).toBe(false);
+    expect(shouldSkipStatuslineWrite(prev, { ts: 1_000_001, model: 'm', reasoningEffort: 'high' })).toBe(true);
+  });
+
   const snap = (over: Partial<StatuslineSnapshot> = {}): StatuslineSnapshot => ({
     ts: 1_000_000, contextPercent: 10, fiveHourPercent: 3, model: 'm', ...over,
   });

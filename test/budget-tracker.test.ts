@@ -91,6 +91,45 @@ describe('parseBudgetConfig', () => {
 });
 
 describe('trackBudgetSpend', () => {
+  it('recovers a missed sink from a valid stale budget and deduplicates a later delivery', () => {
+    const rows = [
+      { recordId: 'old', larkAppId: 'cli_a', costCny: 10 },
+      { recordId: 'missed', larkAppId: 'cli_a', costCny: 20 },
+    ];
+    const path = join(dir, 'usage-2026-09-02.jsonl');
+    writeFileSync(path, JSON.stringify(rows[0]) + '\n');
+    trackBudgetSpend('cli_a', 10, { now: SEP, ledgerDir: dir, recordId: 'old' });
+    writeFileSync(path, rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+    _resetBudgetTrackerForTest();
+    const opts = { now: SEP, ledgerDir: dir, recordId: 'missed' };
+    expect(getBudgetStatus('cli_a', opts)?.spentCny).toBe(30);
+    trackBudgetSpend('cli_a', 20, opts);
+    expect(getBudgetStatus('cli_a', opts)?.spentCny).toBe(30);
+  });
+  it('deduplicates replayed ledger rows when rebuilding the budget', () => {
+    const row = JSON.stringify({ recordId: 'same-event', larkAppId: 'cli_a', costCny: 20 });
+    writeFileSync(join(dir, 'usage-2026-09-02.jsonl'), row + '\n' + row + '\n');
+    expect(getBudgetStatus('cli_a', { now: SEP, ledgerDir: dir })?.spentCny).toBe(20);
+  });
+
+  it('does not count the just-appended record twice when rebuilding a missing budget state', () => {
+    writeFileSync(join(dir, 'usage-2026-09-02.jsonl'), JSON.stringify({
+      recordId: 'event-1', larkAppId: 'cli_a', ts: SEP.toISOString(), costCny: 60,
+    }) + '\n');
+    const opts = { now: SEP, ledgerDir: dir, budget: budget(), recordId: 'event-1', occurredAt: SEP };
+    expect(trackBudgetSpend('cli_a', 60, opts)).toBeNull();
+    expect(getBudgetStatus('cli_a', opts)?.spentCny).toBe(60);
+  });
+
+  it('does not charge a late prior-month record to the current budget', () => {
+    const opts = { now: SEP, ledgerDir: dir, budget: budget({ hardStop: true }) };
+    trackBudgetSpend('cli_a', 10, opts);
+    expect(trackBudgetSpend('cli_a', 200, { ...opts, occurredAt: AUG })).toBeNull();
+    expect(getBudgetStatus('cli_a', opts)?.spentCny).toBe(10);
+    expect(isBudgetHardStopped('cli_a', opts)).toBe(false);
+    expect(readState(dir).month).toBe('2026-09');
+  });
+
   it('accumulates spend across calls and persists the state file', () => {
     trackBudgetSpend('cli_a', 100, { now: AUG, ledgerDir: dir, budget: budget({ monthlyCny: 1000 }) });
     trackBudgetSpend('cli_a', 200, { now: AUG, ledgerDir: dir, budget: budget({ monthlyCny: 1000 }) });
@@ -300,7 +339,7 @@ describe('formatBudgetAlert', () => {
 describe('record sink → trackBudgetSpend → formatBudgetAlert (daemon wiring)', () => {
   /** 复刻 daemon.ts 的 sink 回调：守卫 + 累加 + 生成告警文案。 */
   function daemonSink(
-    record: { larkAppId?: string; costCny?: number },
+    record: { larkAppId?: string; costCny?: number; ts?: string; recordId?: string },
     cfg: BudgetConfig | undefined,
     now: Date,
   ): string | null {
@@ -308,6 +347,7 @@ describe('record sink → trackBudgetSpend → formatBudgetAlert (daemon wiring)
     if (!cfg) return null;
     const alert = trackBudgetSpend(record.larkAppId, record.costCny, {
       now, ledgerDir: dir, budget: cfg,
+      occurredAt: record.ts ? new Date(record.ts) : now, recordId: record.recordId,
     });
     return alert ? formatBudgetAlert(alert) : null;
   }

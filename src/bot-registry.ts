@@ -1,9 +1,11 @@
+import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
 import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
+import { parseInviteConfig, type InviteConfig } from './services/invite-config.js';
 import { readGlobalConfig } from './global-config.js';
 import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
@@ -38,6 +40,7 @@ import {
   type CliLaunchMode,
 } from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
+import { isLocalBotId } from './setup/local-bot.js';
 import { createLarkUploadHttpPool } from './utils/lark-http-pool.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import { HIDE_LOCAL_ADDRESSES_ENV, setHideLocalAddressesResolver } from './im/lark/local-address-switch.js';
@@ -104,7 +107,7 @@ import {
   setAskOptionLayoutLookup,
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
-import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelMayKeepReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from './services/codex-service-tier.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
@@ -1483,8 +1486,15 @@ export interface BotConfig {
    * `local_<slug>`，非 `cli_` 前缀）作为 daemon 标识 + dashboard 路由 key +
    * `/api/trigger` 的 cachedLarkAppId gate；`larkAppSecret` 在此模式下可缺省。
    * 缺省 / false 保持原有飞书 bot 行为字节不变。
+   * `botmux setup add --local` 与 Dashboard 本地模式会把这种 bot 写入 bots.json，
+   * 供 `botmux start` 加载；那不是 `serve --api-only` 的一次性内存身份。
    */
   apiOnly?: boolean;
+  /**
+   * 持久化本地机器人标记。为 true 时 `larkAppId` 只是稳定本地身份（`local_<slug>`），
+   * 不是飞书应用 ID，并且必须同时 `apiOnly: true`。缺省的飞书 bot 不写这个字段。
+   */
+  localIdentity?: boolean;
   /** Internal, opt-in target policy for dispatch launch IPC. Absent/disabled fails closed. */
   dispatchLaunchPolicy?: import('./core/dispatch-launch-contract.js').DispatchLaunchPolicyV1;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
@@ -1493,6 +1503,8 @@ export interface BotConfig {
   oncallGroup?: OncallGroupPolicy;
   /** Opt-in defaults for explicit /g group creation. */
   groupCreation?: GroupCreationDefaults;
+  /** Per-bot member defaults for /invite all, independent of /g. */
+  inviteConfig?: InviteConfig;
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
@@ -2470,6 +2482,8 @@ export interface BotConfig {
    * Defaults 或飞书 /botconfig 配置；仅作用于被动入群，团队建群/federation 不读此开关。
    */
   autoInviteOwnerOnGroupAdd?: boolean;
+  /** Default OFF. Use the configured owner's user authorization to follow newly joined groups. */
+  ownerGroupFollow?: OwnerGroupFollowConfig;
   /**
    * 主动开工 — 场景②. When true, in a 话题群 (topic mode) every new topic's first
    * message auto-starts a session even without an @mention (the default role +
@@ -3807,6 +3821,17 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // requirement — a missing secret there is a misconfig, not a headless bot.
     // The rule for apiOnly is "may be omitted; if present it must still be a
     // string" — a number/object/array/false must NOT slip into a string field.
+    if (entry.localIdentity !== undefined && typeof entry.localIdentity !== 'boolean') {
+      throw new Error(`Bot config [${i}]: localIdentity must be a boolean`);
+    }
+    if (entry.localIdentity === true) {
+      if (entry.apiOnly !== true) {
+        throw new Error(`Bot config [${i}]: localIdentity requires apiOnly: true (this id is not a Feishu app)`);
+      }
+      if (!isLocalBotId(entry.larkAppId)) {
+        throw new Error(`Bot config [${i}]: localIdentity larkAppId must be a local_<slug> identity, not a Feishu app id`);
+      }
+    }
     if (entry.apiOnly === true) {
       if (entry.larkAppSecret !== undefined && typeof entry.larkAppSecret !== 'string') {
         throw new Error(`Bot config [${i}]: larkAppSecret must be a string when provided (apiOnly bots may omit it)`);
@@ -4326,7 +4351,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       botActorOwnerBindings,
       linkRefs: normalizeLinkRefConfig(entry.linkRefs),
       apiOnly: entry.apiOnly === true || undefined,
+      localIdentity: entry.localIdentity === true || undefined,
       groupCreation: entry.groupCreation === undefined ? undefined : parseGroupCreationDefaults(entry.groupCreation),
+      inviteConfig: entry.inviteConfig === undefined ? undefined : parseInviteConfig(entry.inviteConfig),
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
       dispatchLaunchPolicy: (() => {
         if (!entry.dispatchLaunchPolicy || typeof entry.dispatchLaunchPolicy !== 'object') return undefined;
@@ -4414,8 +4441,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       dshProfile: entryCliId === 'dsh' ? normalizeDshProfile(entry.dshProfile) : undefined,
       reasoningEffort: isConfigurableReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
+        // Codex keeps a level the table cannot refute (catalogue-verified at
+        // save time); the worker's launch check has the final say.
         && (entryCliId === 'traex' || sharedEffortModels.every(candidate =>
-          cliModelSupportsReasoningEffort(entryCliId, candidate, entry.reasoningEffort)))
+          cliModelMayKeepReasoningEffort(entryCliId, candidate, entry.reasoningEffort)))
         ? entry.reasoningEffort : undefined,
       codexProfile,
       serviceTier: isCodexServiceTierCliId(entryCliId) && isCodexServiceTier(entry.serviceTier)
@@ -4634,6 +4663,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       autoStartOnGroupJoinAnchor: entry.autoStartOnGroupJoinAnchor === 'latest-message' ? 'latest-message' : undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd === false ? false : undefined,
+      ownerGroupFollow: (() => { try { return normalizeOwnerGroupFollowConfig(entry.ownerGroupFollow); } catch { return undefined; } })(),
       // Preserve the configured prompt verbatim; trim-to-undefined when blank
       // so an empty string doesn't linger in bots.json.
       autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()

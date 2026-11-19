@@ -96,6 +96,7 @@ export interface PluginContributions {
   service?: PluginServiceContribution;
   cardActions?: PluginCardActionsContribution;
   commands?: PluginCommandsContribution;
+  prerequisites?: PluginRuntimeEntrypoint;
 }
 
 /** Installation-time scan result before MCP details are moved to private
@@ -113,6 +114,8 @@ export interface BotmuxPluginManifest {
     plugins?: string[];
   };
   service?: PluginServiceConfig;
+  /** Opt in to install-time preparation and a live check before enabling. */
+  prerequisites?: true;
 }
 
 export interface PluginPackageManifest {

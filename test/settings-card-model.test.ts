@@ -25,8 +25,14 @@ describe('settings-card-model · composeSections', () => {
     const dto = composeSections(makeSettings());
     expect(dto.sections.map(s => s.key)).toEqual(['access', 'cards', 'maintenance']);
     expect(dto.sections[0].toggles.map(t => t.key)).toEqual(['publicReadOnly']);
-    expect(dto.sections[1].toggles.map(t => t.key)).toEqual(['openTerminalInFeishu', 'enableLocalCliOpen']);
+    expect(dto.sections[1].toggles.map(t => t.key)).toEqual(['modelQueueNotify', 'openTerminalInFeishu', 'enableLocalCliOpen']);
     expect(dto.sections[2].toggles.map(t => t.key)).toEqual(['autoUpdate', 'autoRestart']);
+  });
+
+  it.each([undefined, false, true])('projects queue notification with default-off semantics: %s', modelQueueNotify => {
+    const row = composeSections(makeSettings({ modelQueueNotify })).sections[1].toggles.find(t => t.key === 'modelQueueNotify');
+    expect(row?.enabled).toBe(modelQueueNotify === true);
+    expect(row?.state.enabled).toBe(true);
   });
 
   it('marks every toggle disabled when canWrite=false and surfaces readOnlyHintKey', () => {

@@ -561,6 +561,7 @@ export class HerdrBackend implements SessionBackend {
   claudeJsonlPath?: string;
   cliPid?: number;
   private cliExecutable?: string;
+  private lastKnownStablePanePid: number | null = null;
   cliCwd?: string;
 
   /** Default managed agent name for a Botmux-launched CLI (the single source of
@@ -701,6 +702,7 @@ export class HerdrBackend implements SessionBackend {
   }
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    this.lastKnownStablePanePid = null;
     this.cols = opts.cols;
     this.rows = opts.rows;
     this.cliCwd = opts.cwd;
@@ -984,22 +986,52 @@ export class HerdrBackend implements SessionBackend {
 
   getChildPid(): number | null {
     if (this.cliPid) return this.cliPid;
-    if (!this.paneId || !this.cliExecutable || this.exited) return null;
+    const pid = this.readForegroundLaunchPid();
+    if (pid !== null) this.cliPid = pid;
+    return this.cliPid ?? null;
+  }
+
+  getStablePanePid(): number | null {
+    // Re-read the same foreground launch identity that supplied the worker's
+    // original panePid, but never consult the cliPid later refined by wrapper
+    // discovery. Once a baseline exists, a transport failure is unknown rather
+    // than evidence of replacement: freeze the last answered identity just like
+    // ZMX. An answered probe still replaces or clears that identity, and the
+    // backend's authoritative exited state always wins over the frozen value.
+    if (this.exited) return null;
+    const probe = this.probeForegroundLaunchPid();
+    if (!probe.ok) return this.lastKnownStablePanePid;
+    this.lastKnownStablePanePid = probe.pid;
+    return probe.pid;
+  }
+
+  private readForegroundLaunchPid(): number | null {
+    const probe = this.probeForegroundLaunchPid();
+    // getChildPid() runs before the worker captures its stable-pane baseline.
+    // Seed the same last-known identity here so a failure during that baseline
+    // capture (or the first retry tick) can freeze the PID already observed by
+    // the production call order instead of stopping with an empty cache.
+    if (probe.ok) this.lastKnownStablePanePid = probe.pid;
+    return probe.ok ? probe.pid : null;
+  }
+
+  private probeForegroundLaunchPid(): { ok: true; pid: number | null } | { ok: false } {
+    if (!this.paneId || !this.cliExecutable || this.exited) return { ok: true, pid: null };
     // HERDR owns the process, so it is not a child of the worker. Resolve
     // the exact pane's foreground CLI for the worker's procStart-bound marker.
     // Retry on later calls when process detection has not caught up yet.
-    const info = jsonCommand(herdrSessionArgs(this.sessionName, [
+    const result = tryJsonCommand(herdrSessionArgs(this.sessionName, [
       'pane', 'process-info', '--pane', this.paneId,
-    ]))?.result?.process_info;
+    ]));
+    if (!result.ok) return { ok: false };
+    const info = result.value?.result?.process_info;
     const candidates = (info?.foreground_processes ?? []).filter((p: any) => {
       const executable = Array.isArray(p.argv) ? p.argv[0] : p.argv0;
       return typeof executable === 'string'
         && basename(executable) === this.cliExecutable
         && Number.isSafeInteger(p.pid) && p.pid > 1 && p.pid !== info.shell_pid;
     });
-    if (candidates.length !== 1) return null;
-    this.cliPid = candidates[0].pid;
-    return this.cliPid ?? null;
+    return { ok: true, pid: candidates.length === 1 ? candidates[0].pid : null };
   }
 
   getAttachInfo() {

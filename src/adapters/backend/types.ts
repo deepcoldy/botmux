@@ -353,6 +353,15 @@ export interface SessionBackend {
   getAttachInfo?(): { type: 'tmux'; sessionName: string } | null;
   /** PID of the CLI process running inside the backend. */
   getChildPid?(): number | null;
+  /**
+   * Stable identity of the terminal/pane backing this backend, independent of
+   * worker-side `cliPid` refinement to a wrapper's descendant CLI. Unlike
+   * getChildPid(), this must not follow that mutable ownership PID. Backends
+   * participating in wrapper PID resolution must implement it whenever
+   * getChildPid() can alias `cliPid`; others may use the worker's getChildPid()
+   * fallback. Null means the identity is unavailable.
+   */
+  getStablePanePid?(): number | null;
   captureCurrentScreen?(): string;
   /**
    * Escape sequence re-asserting the pane's live input modes (mouse tracking,

@@ -164,6 +164,8 @@ export interface AskAnswerActor {
   botSender?: boolean;
   /** Bot-locked union (evaluateTalk teamBot leg / evaluateBotTalk). */
   senderUnionId?: string;
+  /** Feishu-stamped bot app_id, paired with senderUnionId for external roster entries. */
+  senderAppId?: string;
   /** Raw sender union (evaluateTalk teamMember leg — may be a human union). */
   memberUnionId?: string;
 }

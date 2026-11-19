@@ -345,7 +345,7 @@ The Linux sandbox relies on kernel namespaces, which Docker-style containers and
 Notes:
 
 - **Which bwrap**: the distro binary at `/usr/bin/bwrap` or `/bin/bwrap` is preferred; only when neither exists is a bwrap from `PATH` used, with a one-time warning in the log. Codex installs its own build at `~/.local/bin/bwrap`; when that comes first, sandboxed sessions exit right after launch. Install the distro `bubblewrap` package to fix it.
-- **Symlinked system directories**: when a directory such as `/opt` is itself a symlink, the sandbox recreates the same symlink inside and mounts the real path read-only.
+- **Symlinked system directories**: when `/opt`, `/usr` or `/etc` is itself a symlink, the sandbox recreates the same symlink inside. If the real path is a directory of the same name (`/opt -> /data00/opt`), it is mounted read-only as before; if it points anywhere else (such as the root of a data disk, `/opt -> /data00`), only the link is recreated and the target is not granted — just the working directory, the CLI runtime and whatever `sandboxPaths` grants explicitly are visible under it, so the baseline `/opt` grant never exposes a whole disk. Add the toolchain subdirectories a session needs from `/opt` to `sandboxPaths.readOnly`.
 - **No downgrade by dropping PID isolation**: other bots' processes on the same host hold plaintext credentials in their environment, which a sandbox without PID isolation could read through `/proc`. So a normal deployment refuses to start when procfs cannot be mounted (only the core-only deployment `BOTMUX_CORE_ONLY=1` allows it).
 
 botmux **never** falls back to running the CLI unsandboxed; it refuses to start the session instead. Common messages:

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DurableOutboxRecord, OutboxAttempt } from '../src/services/durable-coordination.js';
 import {
   deliverDurableLarkOutbox,
-  durableLarkOutboxMessage,
+  durableLarkOutboxMessage, durableReplyFileContent,
   LARK_OUTBOX_IDEMPOTENCY_TTL_MS,
   parseDurableLarkOutboxRecord,
 } from '../src/services/durable-lark-outbox.js';
@@ -431,4 +431,15 @@ describe('durable Lark outbox adapter', () => {
     expect(transport.replyMessage).not.toHaveBeenCalled();
     expect(transport.updateMessage).not.toHaveBeenCalled();
   });
+});
+
+it('reuses the first enqueued file key only for identical answer bytes on takeover', async () => {
+  const first = JSON.stringify({ file_key: 'file_first' });
+  const retry = JSON.stringify({ file_key: 'file_reupload' });
+  const prior = row({ msgType: 'file', content: first, hookContext: { replyFileDigest: 'original' } });
+  const store = { readOutbox: vi.fn().mockResolvedValue(prior) };
+  expect(await durableReplyFileContent(store, prior.messageId, 'original', retry)).toBe(first);
+  expect(await durableReplyFileContent(store, prior.messageId, 'changed', retry)).toBe(retry);
+  store.readOutbox.mockResolvedValue(undefined);
+  expect(await durableReplyFileContent(store, prior.messageId, 'original', retry)).toBe(retry);
 });

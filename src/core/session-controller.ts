@@ -395,22 +395,31 @@ export class SessionController {
     // input is still queued. Do not reconstruct execution authority from the
     // notification's display-only turnId (or create an input admission for it).
     if (message.type !== 'cli_session_id' && !context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
-      const preliminary = this.gateway.admit(message.type, context, channel);
-      if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       const existing = this.store.executions(this.ref, message.turnId, message.dispatchAttempt);
       const current = this.currentRuntime();
       // A turn the CLI starts itself is reported under the binding it was
       // spawned with; an in-process continuation moved that CLI to `current`.
-      if (current && !sameRuntime(current, context.scope.runtime) && !existing.some(value => sameRuntime(value.runtime, context.scope.runtime))
-        && this.store.runtimeContinues(this.ref, context.scope.runtime, current, channel)) context.scope.runtime = current;
+      const continuedInto = current && !sameRuntime(current, context.scope.runtime) && !existing.some(value => sameRuntime(value.runtime, context.scope.runtime))
+        && this.store.runtimeContinues(this.ref, context.scope.runtime, current, channel) ? current : undefined;
+      // Its start is a fact of the live CLI, never of an earlier runtime: judged
+      // under the spawn binding it would be refused as stale after any rebind
+      // (the relay resolving the real CLI, a new native session id), and a
+      // zero-prompt session would lose where that turn replies.
+      if (continuedInto && message.type === 'terminal_turn_started') context.scope.runtime = continuedInto;
+      const preliminary = this.gateway.admit(message.type, context, channel);
+      if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
+      if (continuedInto) context.scope.runtime = continuedInto;
       if (existing.length === 1) context.scope.execution = existing[0].ref;
       else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
     }
-    // Physical screen status is a runtime observation, not an execution claim:
-    // keep proven runtime-bound attribution, but drop unproven/unbound turn
-    // scopes instead of rejecting the current runtime's idle/working frame.
+    // Physical screen status is a runtime observation, not an execution claim.
+    // A turn that was already running when its physical CLI continued into a
+    // new runtime keeps its display attribution: the execution remains on the
+    // submitted runtime, while the frame observes the continued live runtime.
+    // Unrelated/replaced-process executions still lose scope and are fenced by
+    // the gateway below; no execution is minted from an unknown turnId.
     if (message.type === 'screen_update' && context.scope.runtime && context.scope.execution
-      && !sameRuntime(this.store.execution(this.ref, context.scope.execution.executionId)?.runtime, context.scope.runtime)) {
+      && !this.sameOrContinuedRuntime(this.store.execution(this.ref, context.scope.execution.executionId)?.runtime, context.scope.runtime, channel)) {
       delete context.scope.execution;
     }
     const continuationFailure = message.continuationFailure as RuntimeExecutionContinuationFailure | undefined;
@@ -444,7 +453,7 @@ export class SessionController {
     // runtime's, and the daemon keeps the turn looking idle until it ends.
     const liveRuntime = runtime && (message.type === 'prompt_ready' || message.type === 'screen_update')
       ? this.continuedInto(runtime, channel) : runtime;
-    if (liveRuntime && ['prompt_ready', 'screen_update', 'active_runtime', 'remote_backend_state', 'remote_usage', 'usage_update', 'cli_session_id'].includes(message.type)
+    if (liveRuntime && ['prompt_ready', 'screen_update', 'active_runtime', 'claude_effort', 'native_reasoning', 'remote_backend_state', 'remote_usage', 'usage_update', 'cli_session_id'].includes(message.type)
       && !this.store.acceptObservation(this.ref, channel, liveRuntime, context.sequence)) return { kind: 'reject', reason: 'stale_observation_sequence' };
     let event: ContractEvent | undefined;
     if (message.type === 'ready') event = { type: 'worker_online', worker: channel };

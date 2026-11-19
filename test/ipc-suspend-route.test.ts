@@ -213,6 +213,91 @@ describe('POST /api/host-overload/sweep suspend_idle', () => {
   });
 });
 
+describe('POST /api/tmux-upgrade/suspend-idle', () => {
+  function tmuxSession(sessionId: string, socketName: string | undefined, over: Record<string, unknown> = {}) {
+    return activeSession({
+      ...over,
+      worker: { killed: false },
+      session: {
+        sessionId,
+        status: 'active',
+        persistentBackendTarget: { backendType: 'tmux', sessionName: `bmx-${sessionId}`, ...(socketName ? { socketName } : {}) },
+      },
+    });
+  }
+  async function post(body: unknown): Promise<Response> {
+    handle ??= await startIpcServer({ port: 0, host: '127.0.0.1' });
+    return fetch(`http://127.0.0.1:${handle.port}/api/tmux-upgrade/suspend-idle`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: typeof body === 'string' ? body : JSON.stringify(body),
+    });
+  }
+
+  it('dry run counts idle sessions on the named server without touching them', async () => {
+    workerPool.setActiveSessionsRegistry(new Map([
+      ['a', tmuxSession('s-a', 'botmux')],
+      ['b', tmuxSession('s-b', undefined)],
+      ['c', tmuxSession('s-c', 'botmux', { lastScreenStatus: 'working' })],
+    ]));
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const res = await post({ socketName: 'botmux', olderThanMs: 1, dryRun: true });
+    expect(await res.json()).toEqual({ ok: true, candidates: 1, affected: 0 });
+    expect(suspendSpy).not.toHaveBeenCalled();
+  });
+
+  it('suspends only idle sessions on the server being replaced', async () => {
+    workerPool.setActiveSessionsRegistry(new Map([
+      ['a', tmuxSession('s-a', 'botmux')],
+      ['b', tmuxSession('s-b', undefined)],
+      ['c', tmuxSession('s-c', 'botmux', { lastScreenStatus: 'working' })],
+    ]));
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const res = await post({ socketName: 'botmux', olderThanMs: 1, dryRun: false });
+    expect(await res.json()).toEqual({ ok: true, candidates: 1, affected: 1 });
+    expect(suspendSpy.mock.calls.map(([ds]) => ds.session.sessionId)).toEqual(['s-a']);
+  });
+
+  it('a session that starts replying while earlier ones are suspended is skipped, not interrupted', async () => {
+    const first = tmuxSession('s-first', 'botmux');
+    const second = tmuxSession('s-second', 'botmux');
+    workerPool.setActiveSessionsRegistry(new Map([['first', first], ['second', second]]));
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockImplementation(ds => {
+      // While the first candidate is being taken down, the other one gets a message.
+      const other = ds === first ? second : first;
+      other.lastScreenStatus = 'working';
+      return true;
+    });
+    const res = await post({ socketName: 'botmux', olderThanMs: 1, dryRun: false });
+    expect(await res.json()).toEqual({ ok: true, candidates: 2, affected: 1 });
+    expect(suspendSpy).toHaveBeenCalledTimes(1);
+    expect(suspendSpy.mock.calls[0]![0].lastScreenStatus).not.toBe('working');
+  });
+
+  it.each([
+    ['two app ids in one daemon', ['cli_a', 'cli_b'], 'cli_a'],
+    ['registry app id mismatches the bound app id', ['cli_b'], 'cli_a'],
+  ])('refuses ambiguous daemon scope before execution (%s)', async (_label, appIds, boundAppId) => {
+    setLarkAppId(boundAppId);
+    workerPool.setActiveSessionsRegistry(new Map(appIds.map((appId, index) => [
+      `s-${index}`, tmuxSession(`s-${index}`, 'botmux', { larkAppId: appId }),
+    ])));
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const res = await post({ socketName: 'botmux', olderThanMs: 1, dryRun: false });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, error: 'ambiguous_daemon_scope' });
+    expect(suspendSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed request before reading any session', async () => {
+    workerPool.setActiveSessionsRegistry(new Map([['a', tmuxSession('s-a', 'botmux')]]));
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    expect((await post({ socketName: '../../x', olderThanMs: 1, dryRun: false })).status).toBe(400);
+    expect((await post('{')).status).toBe(400);
+    expect(suspendSpy).not.toHaveBeenCalled();
+  });
+});
+
 describe('POST /api/maintenance/suspend-idle', () => {
   async function postIdle(
     body: Record<string, unknown>,

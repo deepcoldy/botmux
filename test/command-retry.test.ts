@@ -410,6 +410,8 @@ describe('/retry command', () => {
     expect(sendWorkerInput).toHaveBeenCalledTimes(1);
     const [sentDs, payload, turnId] = sendWorkerInput.mock.calls[0];
     expect(sentDs).toBe(ds);
+    // A cut of a turn that failed without output re-sends the recorded turn.
+    expect((sendWorkerInput.mock.calls[0] as unknown[])[3]).toMatchObject({ failedTurnResendOf: makeFailedTurn().turnId });
     expect(payload).toMatchObject({ content: '<user-prompt>fix the flaky test</user-prompt>' });
     expect(forkWorker).not.toHaveBeenCalled();
     // Cooldown/retry state stamped onto the persisted record.

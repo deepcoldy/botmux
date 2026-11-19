@@ -81,13 +81,16 @@ import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { allowsTaskModelOverride } from './launch-model-capability.js';
 import { emitHookEventLocal, parseHookCommand } from '../services/hook-runner.js';
 import {
+  catalogReasoningEffortsForModel,
+  cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
   isBackendVariantCliId,
+  isCodexReasoningCliId,
   isConfigurableReasoningCliId,
   isCodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
-import { validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
+import { loadCodexServiceTierCatalog, validateCodexServiceTier } from '../services/codex-service-tier-catalog.js';
 import { botOneShotProbeEnv, sessionNetworkPolicyEnvView } from './session-env-resolve.js';
 import { resolvePairedBackendId } from './remote-cli-ids.js';
 import {
@@ -124,7 +127,7 @@ import {
   SchedulePreconditionError,
 } from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
-import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage } from '../services/request-bound-group-send.js';
+import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage, sendRequestBoundMessage, type GroupSendInput } from '../services/request-bound-group-send.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
@@ -218,6 +221,7 @@ import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptRepl
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn-reply-card.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import { FEEDBACK_SEND_LEASE_ROUTE, handleFeedbackSendLeaseRelay } from '../services/feedback-send-lease-relay.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -277,15 +281,17 @@ import {
 import { findOnlineDaemon, listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { ensureBotChatGrantMatrix } from '../cli/exact-chat-grant-client.js';
 import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
+import { HOST_POST_MAX_BODY_BYTES, HOST_POST_PATH, hostPostRequest } from './host-post-request.js';
 import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { updateMessage, sendUserMessage, sendEphemeralCard } from '../im/lark/client.js';
+import { updateMessage, sendUserMessage, sendEphemeralCard, isCurrentBotInChat, lookupMessageChatId } from '../im/lark/client.js';
 import { deliverAuthLink, type AuthLinkDelivery } from './auth-link-delivery.js';
 import { AUTH_PROVIDERS, PROVIDER_LABEL, deliverProviderLink, platformAuthLink, requestProviderAuth, type AuthProvider, type ProviderAuthResult } from './provider-auth-request.js';
+import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
-import { beginBytedcliLogin, completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge } from '../services/bytedcli-auth.js';
+import { completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge, startBytedcliLogin } from '../services/bytedcli-auth.js';
 import { safeRequirementUrl } from './dispatch-task-tree.js';
 import { createDispatchTaskTreeCards, isTaskTreeCardGone, type TaskTreeOrchestrator } from '../services/dispatch-task-tree-card.js';
 import { listDispatchTreeSessionRows } from '../services/dispatch-task-tree-sessions.js';
@@ -372,8 +378,10 @@ import { DEFAULT_LONG_TASK_REMINDER } from '../services/long-task-reminder-polic
 import { updateLongTaskReminderConfig } from '../services/long-task-reminder-config-store.js';
 import {
   selectIdleSuspendCandidates,
+  suspendSelectedIdleCandidatesAfterTurnDrain,
   sweepIdleWorkersByAgeAfterTurnDrain,
 } from './idle-worker-sweeper.js';
+import { parseTmuxSwitchSuspendRequest, selectTmuxSwitchCandidates } from './tmux-switch-candidates.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
@@ -1307,7 +1315,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -2469,6 +2477,30 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   }
 });
 
+/** Feedback send lease for an isolated CLI that cannot take it in-process
+ * (see acquireFeedbackSendLeaseFor); bound to the authenticated session. */
+ipcRoute('POST', `/api/sessions/:sessionId/${FEEDBACK_SEND_LEASE_ROUTE}`, async (req, res, params) => {
+  let body: Record<string, unknown> | undefined;
+  try { body = await readJsonBody<Record<string, unknown>>(req, 4096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  // Release uses the lease-scoped credential returned at acquisition, not the
+  // origin turn's current capability. The handler verifies its persisted hash
+  // together with the exact lease/pid/session, so rotation, session close and
+  // daemon restart cannot strand an already-delivered send.
+  if (body.action === 'release') {
+    const result = handleFeedbackSendLeaseRelay(config.session.dataDir, params.sessionId, body);
+    return jsonRes(res, result.status, result.body);
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  // Managed meeting sends originate in a receiver session too. This route only
+  // guards feedback maintenance; it does not perform a managed session action.
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
+  if (!auth.ok || !ds) return jsonRes(res, 403, { ok: false, error: auth.ok ? 'session_not_active' : auth.error });
+  const result = handleFeedbackSendLeaseRelay(config.session.dataDir, ds.session.sessionId, body);
+  return jsonRes(res, result.status, result.body);
+});
+
 ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   let body: Record<string, unknown>;
@@ -3473,6 +3505,50 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
   }
 
   return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
+});
+
+/**
+ * tmux upgrade: suspend (or, with dryRun, only count) THIS daemon's idle tmux
+ * sessions on the server being replaced, so it can empty out and be recreated
+ * from the upgraded binary. Driven by the primary daemon's tmux-upgrade card /
+ * idle-switch monitor, which fans this out to every online daemon.
+ *
+ * Execution goes through the same bot-turn mutation gate and per-candidate
+ * re-check as the maintenance idle sweep: a session that starts a turn while
+ * earlier candidates are being suspended is skipped, never interrupted. A busy
+ * gate answers 409 so the caller counts this daemon as not done.
+ */
+ipcRoute('POST', '/api/tmux-upgrade/suspend-idle', async (req, res) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res);
+  if (body === BAD_JSON) return;
+  const request = parseTmuxSwitchSuspendRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return jsonRes(res, 503, { ok: false, error: 'session_registry_unavailable' });
+  const socketName = request.socketName ?? undefined;
+  const candidates = selectTmuxSwitchCandidates(registry, { socketName, olderThanMs: request.olderThanMs });
+  if (request.dryRun) return jsonRes(res, 200, { ok: true, candidates: candidates.length, affected: 0 });
+  if (candidates.length === 0) return jsonRes(res, 200, { ok: true, candidates: 0, affected: 0 });
+  const runtimeAppIds = new Set([...registry.values()].map(ds => ds.larkAppId).filter(Boolean));
+  // The turn-mutation gate is per app. Never drain one bot while acting on a
+  // mixed/transferred registry: fail closed exactly like the maintenance sweep.
+  if (runtimeAppIds.size > 1
+    || (cachedLarkAppId && runtimeAppIds.size === 1 && !runtimeAppIds.has(cachedLarkAppId))) {
+    return jsonRes(res, 409, { ok: false, error: 'ambiguous_daemon_scope' });
+  }
+  const larkAppId = cachedLarkAppId || (runtimeAppIds.size === 1 ? [...runtimeAppIds][0] : undefined);
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'daemon_scope_unavailable' });
+  const selected = new Set(candidates.map(c => c.sessionId));
+  const result = await suspendSelectedIdleCandidatesAfterTurnDrain(larkAppId, registry, selected, {
+    olderThanMs: request.olderThanMs,
+    reason: 'tmux_upgrade_switch',
+  });
+  if (result === null) return jsonRes(res, 409, { ok: false, error: 'mutation_gate_busy' });
+  for (const failure of result.failures) {
+    logger.info(`[tmux-upgrade] not suspended ${failure.candidate.sessionId.slice(0, 8)}: ${failure.error}`);
+  }
+  logger.info(`[tmux-upgrade] suspended ${result.suspended.length}/${candidates.length} idle tmux session(s) for the server switch`);
+  return jsonRes(res, 200, { ok: true, candidates: candidates.length, affected: result.suspended.length });
 });
 
 /** 会话级 CLI IPC（slash/cd）的调用方证明：trusted-host（.dashboard-secret HMAC，
@@ -4672,7 +4748,7 @@ async function handleProviderAuthRequest(
       const { state } = await describeBytedcliAuth(person);
       return state === 'unknown' ? 'unknown' : state === 'authorized';
     },
-    beginBytedcliLogin,
+    startBytedcliLogin,
     adoptBytedcliForTurn: person => adoptLocalBytedcliAuthorization({
       sessionDataDir: config.session.dataDir, sessionId, turnId: publishedTurnId,
       botConfig: cfg, senderOpenId: person,
@@ -9207,6 +9283,77 @@ ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, r
   }
 }));
 
+function postBoundGroupMessage(larkAppId: string, input: GroupSendInput, beforeAttempt?: () => Promise<void>) {
+  return sendRequestBoundGroupMessage({
+    larkAppId, storePath: groupSendStorePath(larkAppId), beforeAttempt,
+    send: (chatId, text, uuid, beforeWrite) => sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: true, beforeWrite }),
+    onCommitted: (payload) => emitHookEventLocal('outbound.send', { ...payload }),
+  }, input);
+}
+
+class HostPostDestinationError extends Error {
+  constructor(readonly status: number, message: string, readonly providerCode?: number) { super(message); }
+}
+
+async function checkHostPostDestination(larkAppId: string, chatId: string, rootMessageId?: string) {
+  try {
+    if (!await isCurrentBotInChat(larkAppId, chatId)) throw new HostPostDestinationError(403, 'bot_not_in_chat');
+    if (rootMessageId) {
+      const owner = await lookupMessageChatId(larkAppId, rootMessageId, { timeoutMs: 10_000 });
+      if (!owner) throw new HostPostDestinationError(404, 'topic_not_visible');
+      if (owner !== chatId) throw new HostPostDestinationError(409, 'topic_chat_mismatch');
+    }
+  } catch (error) {
+    if (error instanceof HostPostDestinationError) throw error;
+    throw new HostPostDestinationError(502, 'destination_lookup_failed', extractLarkBusinessCode(error));
+  }
+}
+
+ipcRoute('POST', HOST_POST_PATH, requireBoundBot(async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson(req, res, HOST_POST_MAX_BODY_BYTES);
+  if (body === BAD_JSON) return;
+  const parsed = hostPostRequest.safeParse(body);
+  if (!parsed.success) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  const { larkAppId, text, requestId, ...target } = parsed.data;
+  const { chatId, rootMessageId, userOpenId } = target;
+  // Discovery can race an IPC port being reused. The bound Bot must match.
+  if (larkAppId !== cachedLarkAppId) return jsonRes(res, 409, { ok: false, error: 'bot_mismatch' });
+  if (getBot(larkAppId).config.apiOnly) return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+  const beforeAttempt = chatId ? () => checkHostPostDestination(larkAppId, chatId, rootMessageId) : undefined;
+  try {
+    const result = chatId && !rootMessageId
+      ? await postBoundGroupMessage(larkAppId, { chatId, requestId, content: text }, beforeAttempt)
+      : await sendRequestBoundMessage({
+        larkAppId,
+        beforeAttempt,
+        // Keep legacy group records readable by older daemons after a downgrade.
+        storePath: join(config.session.dataDir, `host-posts-${larkAppId}.json`),
+        send: (uuid, beforeWrite, onAttemptStart) => userOpenId !== undefined
+          ? sendUserMessage(larkAppId, userOpenId, text, 'text', uuid, undefined, { beforeWrite })
+          : replyMessage(larkAppId, rootMessageId!, text, 'text', true, uuid, { chatId }, { suppressHook: true, beforeWrite, onAttemptStart }),
+        onCommitted: (replyId, uuid) => {
+          if (rootMessageId) emitHookEventLocal('outbound.reply', {
+            larkAppId, chatId, messageId: rootMessageId, replyId, uuid, requestId,
+            content: text, msgType: 'text', replyInThread: true,
+          });
+        },
+      }, target, requestId, text);
+    if (!result.ok) {
+      const error = result.error === 'send_failed' && result.retryable ? 'outcome_unknown' : result.error;
+      return jsonRes(res, result.status, { ok: false, error, retryable: result.retryable ?? false, requestId,
+        ...('providerCode' in result ? { providerCode: result.providerCode } : {}), });
+    }
+    return jsonRes(res, 200, { ok: true, larkAppId, ...target, messageId: result.messageId, requestId, replayed: result.replayed });
+  } catch (error) {
+    if (error instanceof HostPostDestinationError) {
+      return jsonRes(res, error.status, { ok: false, error: error.message, retryable: error.status === 502, providerCode: error.providerCode, requestId });
+    }
+    logger.warn(`[host-post] store unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return jsonRes(res, 503, { ok: false, error: 'outcome_unknown', requestId, retryable: true });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
 /**
  * Request-bound send (see services/request-bound-group-send.ts): body exactly
  * `{requestId, content}` (plain text). Returns `{ok, messageId, replayed}`.
@@ -9224,11 +9371,7 @@ ipcRoute('POST', '/api/groups/:chatId/messages', requireBoundBot(async (req, res
   if (!input) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
   const larkAppId = cachedLarkAppId;
   try {
-    const result = await sendRequestBoundGroupMessage({
-      larkAppId, storePath: groupSendStorePath(larkAppId),
-      send: (chatId, text, uuid) => sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: true }),
-      onCommitted: (payload) => emitHookEventLocal('outbound.send', { ...payload }),
-    }, { chatId: p.chatId, ...input });
+    const result = await postBoundGroupMessage(larkAppId, { chatId: p.chatId, ...input });
     const { status, ...rest } = result;
     return jsonRes(res, status, rest);
   } catch (e) {
@@ -10475,6 +10618,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
+    apiOnly: getBot(cachedLarkAppId).config.apiOnly === true,
     botName: getBotName(),
     displayName,
     larkBotName,
@@ -10659,6 +10803,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
     oncallGroup: (() => { try { return getBot(cachedLarkAppId).config.oncallGroup ?? null; } catch { return null; } })(),
     steward: (() => { try { return getBot(cachedLarkAppId).config.steward ?? null; } catch { return null; } })(),
+    ownerGroupFollow: (() => { try { return getBot(cachedLarkAppId).config.ownerGroupFollow ?? null; } catch { return null; } })(),
     noProgressNotify: (() => { try { return getBot(cachedLarkAppId).config.noProgressNotify ?? null; } catch { return null; } })(),
     promptCache: (() => { try { return getBot(cachedLarkAppId).config.promptCache ?? null; } catch { return null; } })(),
     providerRecovery: (() => { try { return getBot(cachedLarkAppId).config.providerRecovery ?? null; } catch { return null; } })(),
@@ -11539,6 +11684,17 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
   const preflightCatalog = preflightNeedsCatalog
     ? await detectModelCapabilitiesViaExec(probeResult.availability.resolvedPath ?? preflight.runtime?.executable ?? preflight.legacyPath ?? 'traex', preflight.env)
     : null;
+  // Codex: the Dashboard offers levels from this runtime's live catalogue
+  // (`codex debug models`), so the save judges the pair against the same
+  // catalogue; a wrapper or profile picks its own provider, and without a
+  // resolved binary there is nothing to ask — both keep the static table.
+  const preflightProfile = profilePresent
+    ? requestedProfile
+    : typeof preflightEntry.codexProfile === 'string' && preflightEntry.codexProfile.trim() ? preflightEntry.codexProfile : undefined;
+  const preflightCodexCatalog = isCodexReasoningCliId(preflight.selection.cliId) && preflightEffort
+    && !preflight.selection.wrapperCli && !preflightProfile && probeResult.availability.resolvedPath
+    ? await loadCodexServiceTierCatalog({ cliBin: probeResult.availability.resolvedPath, env: preflight.env })
+    : null;
   const preflightTier = supportsServiceTier
     ? (serviceTierFieldPresent ? serviceTier ?? undefined : preflightEntry.serviceTier)
     : undefined;
@@ -11736,10 +11892,27 @@ ipcRoute('PUT', '/api/bot-agent', requireBoundBot(async (req, res) => {
       }
       const effortModels = selected.cliId === 'traex' && model.toLowerCase() === TRAEX_AUTO_MODEL_ID
         ? nextTraexAutoModel!.models : [model || undefined];
+      // Re-saving the bot's own launch unchanged (the Agent form always sends
+      // the effort) is judged by the keep-rule config load applied to it, so a
+      // catalogue that is briefly unreachable cannot turn a save into a reject.
+      // Only while nothing that picks the catalogue changed (CLI, wrapper,
+      // runtime, profile) and the catalogue read for this save has no word on
+      // the model: an explicit answer is judged as it stands.
+      const entryRuntimePath = (entry.cliRuntime as { executable?: string } | undefined)?.executable
+        ?? (typeof entry.cliPathOverride === 'string' && entry.cliPathOverride ? entry.cliPathOverride : undefined);
+      const effortCatalog = nextProfile ? null : preflightCodexCatalog;
+      const savedPairUnchanged = selected.cliId === entry.cliId
+        && (selected.wrapperCli ?? undefined) === (typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim() ? entry.wrapperCli : undefined)
+        && (effectivePath || undefined) === entryRuntimePath
+        && (nextProfile || undefined) === (typeof entry.codexProfile === 'string' && entry.codexProfile ? entry.codexProfile : undefined)
+        && (model || undefined) === (typeof entry.model === 'string' && entry.model.trim() ? entry.model.trim() : undefined)
+        && nextReasoningEffort === entry.reasoningEffort
+        && !catalogReasoningEffortsForModel(model, effortCatalog);
       if (nextReasoningEffort && effortModels.some(candidate =>
         !(model.toLowerCase() === TRAEX_AUTO_MODEL_ID && candidate && nextTraexAutoModel?.modelSettings && Object.prototype.hasOwnProperty.call(nextTraexAutoModel.modelSettings, candidate)) &&
         !(fixedTraexEfforts ? fixedTraexEfforts.includes(nextReasoningEffort)
-          : cliModelSupportsReasoningEffort(selected.cliId, candidate, nextReasoningEffort)))) {
+          : savedPairUnchanged ? cliModelMayKeepReasoningEffort(selected.cliId, candidate, nextReasoningEffort)
+          : cliModelSupportsReasoningEffort(selected.cliId, candidate, nextReasoningEffort, effortCatalog)))) {
         return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
       }
       const nextServiceTier = supportsServiceTier
@@ -12237,6 +12410,14 @@ botConfigPutRoute<{ launchShell?: unknown }>('/api/bot-launch-shell', 'launchShe
 });
 
 // 管家（决策看板）：`{ steward: {...} | null }`，校验与「等于默认不写盘」同 /config steward。
+botConfigPutRoute<{ ownerGroupFollow?: unknown }>('/api/bot-owner-group-follow', 'ownerGroupFollow', {
+  normalize: (body, spec) => {
+    const parsed = coerceConfigValue(spec, JSON.stringify(body.ownerGroupFollow ?? null));
+    return parsed.ok ? fieldOk(parsed.value) : fieldInvalid(parsed.reason);
+  },
+  respond: value => ({ ok: true, ownerGroupFollow: value ?? null }),
+});
+
 botConfigPutRoute<{ steward?: unknown }>('/api/bot-steward', 'steward', {
   normalize: (body, spec) => {
     const parsed = coerceConfigValue(spec, JSON.stringify(body.steward ?? null));

@@ -44,7 +44,7 @@ import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
 import { statuslineHookCommand } from '../src/adapters/hook-command.js';
-import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
+import { createAntigravityAdapter, resolveShadowedAntigravityStatusLine, supportsAntigravityStatusline } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
@@ -952,14 +952,21 @@ describe('codex buildArgs', () => {
     expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
-  it('traex RPC mode: same --remote viewer args + update-check disabled', () => {
+  it.each([
+    { toggle: true, restricted: false, flag: true },
+    { toggle: true, restricted: true, flag: false },
+    { toggle: false, restricted: false, flag: false },
+    { toggle: false, restricted: true, flag: false },
+  ])('traex RPC viewer: toggle=$toggle restricted=$restricted', ({ toggle, restricted, flag }) => {
     const traex = createTraexAdapter('/bin/traex');
     const args = traex.buildArgs({
       sessionId: 'sess-rpc', resume: true,
       remoteWsUrl: 'ws://127.0.0.1:9932', remoteThreadId: 'thread-xyz',
-      bypassHookTrust: true,
+      bypassHookTrust: toggle,
+      disableCliBypass: restricted,
     });
     expect(args).toEqual([
+      ...(flag ? ['--dangerously-bypass-hook-trust'] : []),
       '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
       '-c', 'check_for_update_on_startup=false', 'thread-xyz',
     ]);
@@ -1284,6 +1291,19 @@ describe('codex-app buildArgs', () => {
     expect(args).toContain('--thread-id');
     expect(args).toContain('thread-123');
     expect(args).not.toContain('--strict-resume');
+  });
+
+  it('disables the runner fallback catalogue when the bare Codex runtime cannot attest the provider', () => {
+    const direct = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
+    expect(direct).not.toContain('--codex-reasoning-catalog');
+
+    const blind = adapter.buildArgs({
+      sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123',
+      allowCodexReasoningCatalog: false,
+    });
+    const index = blind.indexOf('--codex-reasoning-catalog');
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(blind[index + 1]).toBe('off');
   });
 
   it('requires strict thread resume for a quiet maintenance restore without injecting a prompt', () => {
@@ -1628,6 +1648,29 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     // Headless dsh is a different adapter and keeps its own behaviour.
     expect(createCliAdapterSync(resolveEffectiveCliId('dsh', 'official')).id).toBe('dsh');
     expect(createCliAdapterSync(resolveEffectiveCliId('dsh', undefined)).id).toBe('dsh');
+  });
+
+  // dsh-tui paints the alternate screen and owns its transcript redraw, so a
+  // read-only web terminal has no xterm/tmux scrollback to page. The only way
+  // to reach history is forwarding SGR wheel events back to the CLI — the
+  // narrow, rate-limited `type:'scroll'` path this flag opts into.
+  it('declares readOnlyRemoteScroll so read-only viewers can forward wheel scroll', () => {
+    expect(createDshTuiAdapter().readOnlyRemoteScroll).toBe(true);
+  });
+
+  it('the worker-resolved dsh-tui adapter also forwards wheel scroll', () => {
+    const resolved = createCliAdapterSync(resolveEffectiveCliId('dsh', 'tui'));
+    expect(resolved.id).toBe('dsh-tui');
+    expect(resolved.readOnlyRemoteScroll).toBe(true);
+  });
+
+  // The opt-in is dsh-tui-only: headless dsh speaks JSON-RPC over a plain log
+  // and never parses SGR wheel input, so forwarding a wheel there would be a
+  // no-op while wrongly suppressing the read-only page's own fallback path.
+  it('headless dsh never opts into remote scroll', () => {
+    expect(createDshAdapter('/opt/dsh/bin/dsh').readOnlyRemoteScroll).toBeUndefined();
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', 'official')).readOnlyRemoteScroll)
+      .toBeUndefined();
   });
 
   it('omits --resume on fresh spawn when the question bridge is disabled', () => {
@@ -2064,8 +2107,9 @@ describe('cursor buildArgs', () => {
 
   it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
-    // Positional prompt is inside the tmux launch command. 8192 matches
-    // OpenCode: short turns stay on argv; longer ones defer until readyPattern.
+    // The positional prompt historically counted toward the inline launch
+    // budget; 8192 matches OpenCode and is retained so short turns stay on
+    // argv while longer ones defer until readyPattern.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
     expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
@@ -2237,11 +2281,10 @@ describe('opencode buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+  it('declares the retained maxInitialPromptArgBytes budget', () => {
     // OpenCode bakes the full first-round prompt into `--prompt <content>`.
-    // tmux new-session rejects long command strings well below OS ARG_MAX,
-    // so the adapter must declare a byte budget: short prompts keep --prompt,
-    // over-limit prompts defer to the post-start input queue.
+    // Keep the historical byte budget so short prompts retain --prompt while
+    // over-budget prompts retain the post-start input queue.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
@@ -3055,7 +3098,7 @@ describe('mtr buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+  it('declares the retained maxInitialPromptArgBytes budget', () => {
     // `--prompt` bakes the full first prompt into argv, same budget as OpenCode.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
@@ -3198,6 +3241,74 @@ describe('antigravity buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false });
     expect(args).not.toContain('sess-7');
     expect(args).not.toContain('--session-id');
+  });
+
+  it('injects ephemeral --settings statusLine with stack_with_default for agy >= 1.5.8', () => {
+    for (const cliVersion of ['1.5.8', '1.5.12', '2.0.0', '1.5.8+build.1']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, cliVersion });
+      const idx = args.indexOf('--settings');
+      expect(idx, `cliVersion=${cliVersion}`).toBeGreaterThanOrEqual(0);
+      expect(JSON.parse(args[idx + 1]!)).toEqual({
+        statusLine: {
+          type: 'command',
+          enabled: true,
+          command: statuslineHookCommand(),
+          stack_with_default: true,
+        },
+      });
+    }
+    // disableCliBypass keeps --settings (statusLine only, no bypass flag)
+    const noBypass = adapter.buildArgs({ sessionId: 'sess-7', resume: false, disableCliBypass: true, cliVersion: '1.5.12' });
+    expect(noBypass).not.toContain('--dangerously-skip-permissions');
+    expect(noBypass).toContain('--settings');
+  });
+
+  it.each([undefined, '', 'unknown', '1.0.8', '1.5.4', '1.5.7', '1.5.8-beta.1'])(
+    'omits --settings when cliVersion is missing, older, or pre-release (%j)',
+    cliVersion => {
+      expect(supportsAntigravityStatusline(cliVersion)).toBe(false);
+      const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, cliVersion });
+      expect(args).not.toContain('--settings');
+    },
+  );
+});
+
+describe('resolveShadowedAntigravityStatusLine', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+  const makeSettings = (content: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'bmx-agy-sl-'));
+    dirs.push(dir);
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, content, 'utf-8');
+    return file;
+  };
+
+  it('returns the user statusLine command (including UTF-8 BOM files)', () => {
+    const plain = makeSettings(JSON.stringify({ statusLine: { type: 'command', enabled: true, command: 'bash ~/.gemini/sl.sh' } }));
+    expect(resolveShadowedAntigravityStatusLine({ userSettingsPath: plain })).toEqual({ command: 'bash ~/.gemini/sl.sh' });
+    const withBom = makeSettings('\uFEFF' + JSON.stringify({ statusLine: { command: 'my-sl' } }));
+    expect(resolveShadowedAntigravityStatusLine({ userSettingsPath: withBom })).toEqual({ command: 'my-sl' });
+  });
+
+  it('returns {} when disabled, non-command, blank, corrupt, or missing', () => {
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings(JSON.stringify({ statusLine: { type: 'command', enabled: false, command: 'my-sl' } })),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings(JSON.stringify({ statusLine: { type: 'builtin', command: 'my-sl' } })),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings(JSON.stringify({ statusLine: { type: 'command', command: '   ' } })),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings('{corrupt'),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: join(tmpdir(), 'definitely-missing-agy-settings-99999.json'),
+    })).toEqual({});
   });
 });
 
@@ -4296,7 +4407,10 @@ describe('grok buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false, initialPrompt: 'hello grok' });
     expect(args[args.length - 1]).toBe('hello grok');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
-    // Tighter than 8192: `--rules` is already in the tmux command.
+    // Tighter than 8192: the historical inline launch had to fit `--rules`
+    // and the first prompt together; pane-launch now carries both via a
+    // private file, so 4096 is retained only to keep the argv vs queue split
+    // unchanged.
     expect(adapter.maxInitialPromptArgBytes).toBe(4096);
   });
 

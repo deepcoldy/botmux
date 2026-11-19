@@ -9,13 +9,21 @@ const execution = { startedAtMs: 1000, workerGeneration: 2, lastProgressAtMs: 20
 const turn = { cliId: 'traex', status: 'working', workerGeneration: 2, execution, nowMs: 5000, content: '' };
 
 /** The production composition: shared projection (capacity banner read from the traex screen) → card label. */
-function cardLabel(input: Omit<ExecutionActivityInput, 'capacityQueued'> & { cliId: string; content: string }) {
+function cardLabel(input: Omit<ExecutionActivityInput, 'capacityQueued'> & { cliId: string; content: string }, modelQueueNotify = true) {
   return streamCardExecutionLabel(input.cliId, projectExecutionActivity({
     ...input, capacityQueued: traexCapacityQueueVisible(input.content),
-  }));
+  }), modelQueueNotify);
 }
 
 describe('streaming execution activity', () => {
+  it('requires explicit opt-in to render queue status while preserving execution facts', () => {
+    const observed = projectExecutionActivity({ ...turn, capacityQueued: true });
+    expect(observed).toMatchObject({ phase: 'model_queue' });
+    expect(streamCardExecutionLabel('traex', observed)).toMatchObject({ activity: 'working', elapsedSeconds: 4 });
+    expect(streamCardExecutionLabel('traex', observed, false)).toMatchObject({ activity: 'working' });
+    expect(streamCardExecutionLabel('traex', observed, true)).toMatchObject({ activity: 'model_queue' });
+    expect(observed).toMatchObject({ phase: 'model_queue' });
+  });
   it('advances elapsed and last progress age without inventing a failure', () => {
     expect(cardLabel(turn)).toEqual({ activity: 'working', elapsedSeconds: 4, progressAgeSeconds: 3 });
     expect(cardLabel({ ...turn, nowMs: 65_000 })).toEqual({ activity: 'working', elapsedSeconds: 64, progressAgeSeconds: 63 });

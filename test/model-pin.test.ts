@@ -57,12 +57,14 @@ describe('explicit topic launch choice', () => {
     expect(resolveSessionLaunchEffort(ds, sameModelBot, pin.model, 'low')).toBe('low');
     expect(modelPinView(ds.session, sameModelBot, { adopted: true, model: pin.model, effort: 'low' })?.active).toBe(false);
   });
-  it('applies pin effort only to its matching model and gates unsupported levels', () => {
+  it('applies pin effort only to its matching model and gates levels its verified row refutes', () => {
     const ds = subject();
     expect(resolveSessionLaunchEffort(ds, bot, pin.model, 'low')).toBe('high');
     expect(resolveSessionLaunchEffort(ds, bot, 'other', 'low')).toBe('low');
-    ds.session.modelPin.effort = 'ultra'; ds.session.modelPin.model = 'gpt-5.2';
-    expect(resolveSessionLaunchEffort(ds, bot, 'gpt-5.2', 'low')).toBe('low');
+    // A model without a table row is decided by the worker's launch-time
+    // catalogue check (codex-reasoning-live-catalog.test.ts), not here.
+    ds.session.modelPin.effort = 'ultra'; ds.session.modelPin.model = 'gpt-6-luna';
+    expect(resolveSessionLaunchEffort(ds, bot, 'gpt-6-luna', 'low')).toBe('low');
     expect(modelPinView(ds.session, bot)).toMatchObject({ active: true, effortDowngradeNote: expect.any(String) });
     expect(modelPinView(ds.session, bot)?.inactiveReason).toBeUndefined();
   });

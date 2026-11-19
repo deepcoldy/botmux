@@ -92,6 +92,9 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Durable replay identity. Runner adapters may forward this with turnId so
+   * late output from an older attempt cannot settle its successor. */
+  dispatchAttempt?: number;
   /** Owned, prompt-injected Codex input may carry a fresh correlation marker.
    * An exact post-write history match then proves ownership even when the OS
    * sandbox prevents reading the CLI's open rollout file descriptors. */
@@ -317,6 +320,11 @@ export interface CliAdapter {
      *  others ignore. Note the accepted set is per-CLI: `ultra` is codex/traex
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Codex App only: whether its runner may use the bare local
+     * `codex debug models` catalogue when a missing-thread resume falls back to
+     * a fresh thread/start. False for wrappers, Codex profiles and remote
+     * backends, whose actual provider the bare catalogue cannot attest. */
+    allowCodexReasoningCatalog?: boolean;
     /** Codex-only thread service tier. Missing inherits the executor's config. */
     codexProfile?: string;
     serviceTier?: CodexServiceTier;
@@ -429,8 +437,11 @@ export interface CliAdapter {
   /** Only meaningful with passesInitialPromptViaArgs. If set, prompts whose
    *  UTF-8 byte length is GREATER than this adapter-specific limit are not
    *  baked into launch args; the worker defers them to the normal post-start
-   *  input queue. This guards backend launchers (notably tmux) whose command
-   *  string limit can be much lower than OS ARG_MAX. */
+   *  input queue. The budget dates from the old inline tmux launch, whose
+   *  command string tmux capped far below OS ARG_MAX; panes now read the full
+   *  launch argv from a private pane-launch file, so that cap no longer binds
+   *  and the number is retained only to keep the args-baked vs queued split
+   *  unchanged. */
   readonly maxInitialPromptArgBytes?: number;
 
   /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI
