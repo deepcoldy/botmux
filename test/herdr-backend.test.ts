@@ -34,7 +34,7 @@ vi.mock('node-pty', () => ({
 import { execFileSync, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
 import {
-  HerdrBackend, PANE_AGENT_START_TIMEOUT_MS, PANE_AGENT_START_ATTEMPTS, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes,
+  HerdrBackend, PANE_AGENT_START_TIMEOUT_MS, PANE_AGENT_START_ATTEMPTS, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes, resolveHerdrResumeCliSessionId,
 } from '../src/adapters/backend/herdr-backend.js';
 import { logger } from '../src/utils/logger.js';
 
@@ -1341,15 +1341,50 @@ describe('HerdrBackend.spawn', () => {
     });
 
     it('leaves a busy pane running the session alone', () => {
-      spawnResume([pane('9-1', SID, 'working')]);
+      spawnResume([pane('9-1', SID, 'working'), pane('9-1b', SID, 'blocked')]);
       expect(herdrCall('pane', 'close', '9-1')).toBeUndefined();
+      expect(herdrCall('pane', 'close', '9-1b')).toBeUndefined();
       expect(herdrCall('agent', 'start')).toBeDefined();
+    });
+
+    it('closes a pane whose agent_session is a _<id>.jsonl path', () => {
+      // herdr reports path-shaped bindings (kind "path", e.g. pi and other
+      // CLIs that do not expose a bare id); a near-miss id must not match.
+      const pathValue = `/home/u/.claude/projects/-work/2026-01-01_${SID}.jsonl`;
+      spawnResume([
+        pane('9-3', pathValue),
+        pane('9-4', `/home/u/.claude/projects/-work/2026-01-01_${SID}x.jsonl`),
+      ]);
+      expect(herdrCall('pane', 'close', '9-3')).toBeDefined();
+      expect(herdrCall('pane', 'close', '9-4')).toBeUndefined();
     });
 
     it('does not scan panes when the launch is not a resume', () => {
       spawnResume([pane('9-1', SID)], false);
       expect(herdrCall('pane', 'list')).toBeUndefined();
       expect(herdrCall('pane', 'close')).toBeUndefined();
+    });
+  });
+
+  describe('resolveHerdrResumeCliSessionId', () => {
+    const SID2 = '11111111-2222-3333-4444-555555555555';
+
+    it('passes the id through on an ordinary resume', () => {
+      expect(resolveHerdrResumeCliSessionId(true, undefined, SID2)).toBe(SID2);
+      expect(resolveHerdrResumeCliSessionId(true, false, SID2)).toBe(SID2);
+    });
+
+    it('returns undefined on a non-resume launch', () => {
+      expect(resolveHerdrResumeCliSessionId(false, undefined, SID2)).toBeUndefined();
+      expect(resolveHerdrResumeCliSessionId(false, true, SID2)).toBeUndefined();
+    });
+
+    it('returns undefined for a --fork-session child so the source pane stays alive', () => {
+      expect(resolveHerdrResumeCliSessionId(true, true, SID2)).toBeUndefined();
+    });
+
+    it('returns undefined when no resume id is known', () => {
+      expect(resolveHerdrResumeCliSessionId(true, undefined, undefined)).toBeUndefined();
     });
   });
 

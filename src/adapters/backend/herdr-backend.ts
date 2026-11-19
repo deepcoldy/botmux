@@ -498,6 +498,21 @@ function longestSuffixPrefix(previous: string, next: string): number {
   return 0;
 }
 
+/**
+ * The CLI session id a Herdr cold resume must clear stale panes for.
+ *
+ * Undefined when this is not a resume, and for a `--fork-session` child: a fork
+ * only reads the source transcript and writes forward into a fresh CLI-minted
+ * id, so the pane still running the source session must stay alive.
+ */
+export function resolveHerdrResumeCliSessionId(
+  effectiveResume: boolean,
+  forkSession: boolean | undefined,
+  effectiveCliSessionId: string | undefined,
+): string | undefined {
+  return effectiveResume && forkSession !== true ? effectiveCliSessionId : undefined;
+}
+
 export class HerdrBackend implements SessionBackend {
   private serverProcess: ChildProcess | null = null;
   private pollTimer: NodeJS.Timeout | null = null;

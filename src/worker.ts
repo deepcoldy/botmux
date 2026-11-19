@@ -563,7 +563,7 @@ import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
 import { PtyBackend } from './adapters/backend/pty-backend.js';
 import { prepareSandboxWritableFiles } from './adapters/backend/sandbox-writable-files.js';
-import { HerdrBackend, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
+import { HerdrBackend, resolveHerdrResumeCliSessionId, type HerdrWebTerminalCursor } from './adapters/backend/herdr-backend.js';
 import { TmuxBackend } from './adapters/backend/tmux-backend.js';
 import { applyCodexInstanceEnv, codexInstanceIdentity } from './services/codex-instance-pool.js';
 import { withFileLockSync } from './utils/file-lock.js';
@@ -28373,7 +28373,7 @@ async function spawnCliBody(
           modelBackendVariant: cfg.modelBackendVariant,
           reasoningEffort: cfg.reasoningEffort,
           retryPaneAgentStart: opts.retryPaneAgentStart,
-          resumeCliSessionId: effectiveResume && cfg.forkSession !== true ? effectiveCliSessionId : undefined, // --fork-session writes a new transcript; leave the parent pane alone
+          resumeCliSessionId: resolveHerdrResumeCliSessionId(effectiveResume, cfg.forkSession, effectiveCliSessionId),
         });
       },
     });
