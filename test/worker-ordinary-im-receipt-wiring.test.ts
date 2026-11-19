@@ -10,7 +10,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 type Notify = (
-  turn: { turnId: string; isLocal?: boolean; isScheduled?: boolean },
+  turn: { turnId: string; userUuid?: string; isLocal?: boolean; isScheduled?: boolean },
   evidence: { fullContentMatch: boolean; sourceJsonlPath?: string },
 ) => void;
 
@@ -35,6 +35,14 @@ describe('Claude transcript native input consumption receipt', () => {
     h.notify({ turnId: 'om_turn' }, { fullContentMatch: true, sourceJsonlPath: transcript });
     expect(h.acknowledgeNativeInputConsumed).toHaveBeenCalledExactlyOnceWith(
       'om_turn', 'claude_transcript_user_record', '0f3c1d2e-aaaa-bbbb-cccc-1234567890ab',
+    );
+  });
+
+  it('forwards userUuid as the native turn anchor when present', () => {
+    const h = claudeTranscriptHarness();
+    h.notify({ turnId: 'om_turn', userUuid: 'user-uuid-1' }, { fullContentMatch: true, sourceJsonlPath: transcript });
+    expect(h.acknowledgeNativeInputConsumed).toHaveBeenCalledExactlyOnceWith(
+      'om_turn', 'claude_transcript_user_record', '0f3c1d2e-aaaa-bbbb-cccc-1234567890ab', 'user-uuid-1',
     );
   });
 

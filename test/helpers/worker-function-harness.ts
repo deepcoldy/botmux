@@ -143,6 +143,8 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key in scope) return scope[key as string];
     if (key === 'confirmedTerminalEffortChoice') return () => undefined;
     if (key === 'noteTerminalEffortInput') return () => {};
+    if (key === 'recordStructuredInput') return () => {};
+    if (key === 'updateSessionTurnNativeAnchor') return () => {};
     if (key === 'claudeEffortObserver') {
       if (!dependencies.has(key)) dependencies.set(key, new ClaudeEffortObserver());
       return dependencies.get(key);
@@ -230,6 +232,8 @@ export function loadWorkerMessageHandler(name: string, scope: Record<string, unk
       // when the harness scope does not stub them.
       const scopedDefault = defaultScopedWorkerState(scope, key);
       if (scopedDefault !== undefined) return scopedDefault;
+      if (key === 'recordStructuredInput') return () => {};
+      if (key === 'updateSessionTurnNativeAnchor') return () => {};
       if (key === 'revokePromptReadiness') return loadWorkerFunction('revokePromptReadiness', scope);
       return (globalThis as any)[key];
     },
