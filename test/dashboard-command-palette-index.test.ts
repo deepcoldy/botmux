@@ -70,6 +70,7 @@ function topItem(items: PaletteItem[], query: string): PaletteItem | undefined {
 // 反向扫描读取的区块组件源码：配置项行写在这些组件里。
 const BOT_CONFIG_SOURCE_FILES = [
   'bot-defaults-page.tsx', 'blocked-users-editor.tsx', 'session-env-editor.tsx', 'prompt-cache-editor.tsx',
+  'provider-recovery-editor.tsx',
   'traex-auto-model-editor.tsx', 'quiet-preset-section.tsx',
 ];
 
@@ -263,7 +264,7 @@ const NOT_CONFIG_LABELS: ReadonlyMap<string, string> = new Map([
   ['botDefaults.autoStartExcludedChatsHelp', '排除群文本框上方的说明文案，不是配置项；其入口 autoStartExcludedChats 是可展开 <button>，扫描器不识别 button 标签，登记需新增扫描规则，另行跟进'],
 ]);
 
-const BOT_CONFIG_KEY_NAMESPACES = ['botDefaults.', 'sessionEnv.', 'quietPreset.', 'promptCache.', 'roles.', 'blocked.'];
+const BOT_CONFIG_KEY_NAMESPACES = ['botDefaults.', 'sessionEnv.', 'quietPreset.', 'promptCache.', 'providerRecovery.', 'roles.', 'blocked.'];
 
 describe('⌘K index coverage', () => {
   it('every dashboard route is in the sidebar or NAV_SUBPAGES, or excluded on purpose with a reason', () => {
@@ -325,7 +326,8 @@ describe('⌘K index coverage', () => {
   // 只能读文本反查；守的是「某个分类里新加了格子却没登记进 BOT_DEFAULTS_SECTIONS / 没挂深链落点 id」。
   it('every tile in the Bot config category panels carries a registered section id of that category', () => {
     const source = botDefaultsPageSource();
-    const starts = BOT_DEFAULTS_TABS.map(tab => ({ tab, at: source.indexOf(`id="bd-panel-${tab}"`) }));
+    // 面板已改为 LazyTabPanel 懒挂载（id 传给组件，运行时仍渲染为 bd-panel-<tab>），按组件开头定位。
+    const starts = BOT_DEFAULTS_TABS.map(tab => ({ tab, at: source.indexOf(`<LazyTabPanel id="${tab}"`) }));
     expect(starts.every(entry => entry.at > 0)).toBe(true);
     const tiles: string[] = [];
     starts.forEach(({ tab, at }, index) => {

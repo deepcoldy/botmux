@@ -6,6 +6,7 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { splitCodexEventsByCutoff, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from '../src/services/codex-adopt-recovery.js';
 import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
+import { createHash } from 'node:crypto';
 
 let dir: string;
 let path: string;
@@ -18,6 +19,23 @@ const events = [start, event('cot', 11_000), event('cot', 21_000), final];
 
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'codex-adopt-recovery-')); path = join(dir, 'journal.json'); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+it('checkpoints exact native input proof only after a real user attribution and when opted in', () => {
+  const queue = new CodexBridgeQueue(() => 10_000);
+  queue.mark('om_original', start.text, 10_000);
+  checkpointCodexAdoptTurns(path, rollout, queue, 0, true);
+  expect(readBridgeTurnJournal(path)[0]?.nativeUserProof).toBeUndefined();
+  queue.ingest([start]);
+  checkpointCodexAdoptTurns(path, rollout, queue, 0, true);
+  expect(readBridgeTurnJournal(path)[0]?.nativeUserProof).toEqual({ uuid: start.uuid,
+    hash: createHash('sha256').update(start.text).digest('hex'), timestampMs: start.timestampMs, trajectoryOffset: 0 });
+  queue.ingest([final]);
+  checkpointCodexAdoptTurns(path, rollout, queue, 999, true);
+  checkpointCodexAdoptTurns(path, rollout, queue, 1_999, true);
+  expect(readBridgeTurnJournal(path)[0]?.nativeUserProof?.trajectoryOffset).toBe(0);
+  checkpointCodexAdoptTurns(path, rollout, queue);
+  expect(readBridgeTurnJournal(path)[0]?.nativeUserProof).toBeUndefined();
+});
 
 function checkpoint(
   dispatchAttempt?: number,

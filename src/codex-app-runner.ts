@@ -45,6 +45,11 @@ import {
 } from './services/codex-browser-broker.js';
 import type { CodexBrowserFamily } from './core/codex-browser-config.js';
 import type { CodexServiceTier } from './services/codex-service-tier.js';
+import {
+  isCodexReasoningEffort,
+  resolveCodexLaunchReasoningEffort,
+} from './services/codex-reasoning-effort.js';
+import { loadCodexServiceTierCatalog } from './services/codex-service-tier-catalog.js';
 import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
 
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
@@ -69,6 +74,7 @@ interface Args {
   locale?: string;
   model?: string;
   reasoningEffort?: string;
+  allowReasoningCatalog: boolean;
   serviceTier?: CodexServiceTier;
   browserFamily?: CodexBrowserFamily;
   browserAutoApproveOrigins?: boolean;
@@ -122,6 +128,11 @@ interface ActiveTurn {
   /** Proven canonical native turn id (distinct from the transient nativeTurnId
    * hint until an exact `turn/started` or start-response binds it). */
   canonicalNativeTurnId?: string;
+  /** A request was accepted or may have reached the server. Hold steering
+   * until the native turn settles, including while a timed-out stop is retried. */
+  interruptRequested?: boolean;
+  /** Coalesce a pending request and reuse a confirmed success. */
+  interruptRequest?: Promise<boolean>;
   /** A start-response is outstanding. SEPARATE from steerInFlight: per codex, a
    * start-response may overlap with a steer once an exact `turn/started` proved
    * the canonical id. */
@@ -263,6 +274,7 @@ function parseArgs(argv: string[]): Args {
     cwd: process.cwd(),
     controlGeneration: '',
     controlPrivateKey: undefined as unknown as KeyObject,
+    allowReasoningCatalog: true,
   };
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
@@ -277,6 +289,11 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
+    else if (key === '--codex-reasoning-catalog' && val !== undefined) {
+      if (val !== 'off') throw new Error('--codex-reasoning-catalog accepts only off');
+      out.allowReasoningCatalog = false;
+      i++;
+    }
     else if (key === '--service-tier' && val !== undefined) {
       if (val !== 'default' && val !== 'priority' && val !== 'ultrafast') {
         throw new Error('--service-tier accepts default, priority, or ultrafast');
@@ -509,6 +526,7 @@ let controlFatal = false;
 let controlSocket: Socket | undefined;
 let controlChallenge: string | undefined;
 let controlAccepted = false;
+let controlSupportsTurnInterrupt = false;
 let controlAcceptanceCount = 0;
 let controlReconnectTimer: NodeJS.Timeout | undefined;
 let resolveControlReady!: () => void;
@@ -584,6 +602,7 @@ function connectControlSocket(): void {
   controlSocket = socket;
   controlChallenge = undefined;
   controlAccepted = false;
+  controlSupportsTurnInterrupt = false;
   controlSentThrough = controlAckedSeq;
   socket.setNoDelay(true);
   socket.on('data', chunk => {
@@ -611,6 +630,7 @@ function connectControlSocket(): void {
         // locator's independent epoch plus the already-bound random endpoint.
         // Ed25519 still authenticates every runner marker to the worker.
         controlAccepted = true;
+        controlSupportsTurnInterrupt = action.turnInterrupt === true;
         clearTimeout(handshakeTimer);
         if (args.controlLocatorPath) controlEndpoints.noteAccepted(target.endpoint);
         controlAcceptanceCount++;
@@ -623,6 +643,8 @@ function connectControlSocket(): void {
       } else if (action.type === 'ack' && controlAccepted) {
         if (action.seq > controlAckedSeq) controlAckedSeq = action.seq;
         while (controlQueue[0] && controlQueue[0].seq <= controlAckedSeq) controlQueue.shift();
+      } else if (action.type === 'interrupt' && controlSupportsTurnInterrupt) {
+        void interruptTurn(action.requestId, action.turnEpoch);
       } else {
         socket.destroy(new Error('out-of-order Codex App control response'));
         return;
@@ -820,6 +842,47 @@ function emitRunnerState(
     ...(appServerProcess ? { appServerProcess } : {}),
     ...(busy && !tracksTurn ? { tracksTurn: false } : {}),
   });
+  publishInterruptTarget();
+}
+
+function publishInterruptTarget(): void {
+  if (!controlSupportsTurnInterrupt) return;
+  const turn = activeTurn;
+  const nativeId = turn?.canonicalNativeTurnId;
+  const replyTurnId = turn?.accepted?.at(-1)?.replyTurnId;
+  emitMarker('interrupt_target', turn && turn.serverStarted && !turn.completed && nativeId
+    && nativeId === nativeActiveTurnId && replyTurnId
+    ? { turnEpoch: turn.epoch, replyTurnId } : {});
+}
+
+async function interruptTurn(requestId: string, turnEpoch: number): Promise<void> {
+  const turn = activeTurn;
+  const nativeId = turn?.canonicalNativeTurnId;
+  const tid = threadId;
+  if (!runnerReady || generationFenced || !tid || !turn || turn.epoch !== turnEpoch
+      || !turn.serverStarted || turn.completed || !nativeId || nativeId !== nativeActiveTurnId) {
+    emitMarker('interrupt_result', { requestId, status: 'stale_turn' });
+    return;
+  }
+  // Freeze native coordinates before the RPC. Any queued input stays queued,
+  // and the normal turn/completed path owns the final and next-turn admission.
+  if (!turn.interruptRequest) {
+    const priorInterruptRequested = turn.interruptRequested;
+    turn.interruptRequested = true;
+    turn.interruptRequest = client.request('turn/interrupt', { threadId: tid, turnId: nativeId }, { timeoutMs: 8_000 })
+      .then(() => true, error => {
+        writeLine(`[codex-app] turn interrupt failed: ${asError(error).message}`);
+        turn.interruptRequest = undefined;
+        // A retry's rejection cannot disprove a prior ambiguous request.
+        if (error instanceof AppServerRpcError) {
+          turn.interruptRequested = priorInterruptRequested;
+          if (activeTurn === turn && !turn.interruptRequested) void tryAdmitSteer();
+        }
+        return false;
+      });
+  }
+  const delivered = await turn.interruptRequest;
+  emitMarker('interrupt_result', { requestId, status: delivered ? 'delivered' : 'delivery_failed' });
 }
 
 function cancelRunnerIdleSettle(): void {
@@ -1130,7 +1193,7 @@ function rebuildReconciledFinal(turn: JsonObject, userItemIndex: number): string
 
 function completeActiveTurnFromNative(turn: ActiveTurn, nativeTurn: JsonObject, exactIndex?: number): void {
   if (activeTurn !== turn || turn.completed || !isTerminalNativeTurn(nativeTurn)) return;
-  turn.failureCode = codexAppTurnFailureCode(nativeTurn);
+  turn.failureCode = turn.interruptRequested && nativeTurn.status === 'interrupted' ? 'cancelled' : codexAppTurnFailureCode(nativeTurn);
   if (exactIndex !== undefined) {
     turn.finalText = rebuildReconciledFinal(nativeTurn, exactIndex);
     turn.allAgentText = '';
@@ -1356,6 +1419,7 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
       }
       if (turn.nativeTurnId === startedId) {
         turn.serverStarted = true;
+        publishInterruptTarget();
         emitTurnActivity(turn, 'progress', true);
         // Kick only when the canonical id is proven exact (not a bare id echo)
         // so a follow-up steers into the proven turn during a pending response.
@@ -1396,7 +1460,10 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
         writeLine(`[codex-app] browser turn-ended hook failed: ${asError(error).message}`);
       });
     }
-    if (completedId && nativeActiveTurnId === completedId) nativeActiveTurnId = undefined;
+    if (completedId && nativeActiveTurnId === completedId) {
+      nativeActiveTurnId = undefined;
+      publishInterruptTarget();
+    }
     const turn = activeTurn;
     if (!turn) {
       // An autonomous Goal turn finished with no tracked Botmux turn. If a
@@ -1667,6 +1734,33 @@ function isDefiniteRpcRejection(error: unknown): boolean {
     || isExplicitExpectedTurnInactive(error);
 }
 
+/** A normal fresh launch was judged by the worker before argv was built. This
+ * gate is ONLY for the exceptional path where an unjudged resume attempt finds
+ * the thread missing and must fall back to a fresh thread/start. A successful
+ * thread/resume never reaches here, so it neither probes nor notifies. */
+async function gateMissingThreadFallbackReasoningEffort(): Promise<void> {
+  const effort = args.reasoningEffort;
+  // Preserve the runner's existing pass-through for values outside BotMux's
+  // vocabulary; the worker only supplies valid levels.
+  if (!effort || !isCodexReasoningEffort(effort)) return;
+  const decision = await resolveCodexLaunchReasoningEffort({
+    cliId: 'codex-app',
+    model: args.model,
+    effort,
+    loadCatalog: args.allowReasoningCatalog
+      ? () => loadCodexServiceTierCatalog({ cliBin: args.codexBin, env: process.env })
+      : null,
+  });
+  if (!decision.dropped) return;
+  args.reasoningEffort = undefined;
+  emitMarker('launch_reasoning_dropped', {
+    model: args.model ?? '',
+    effort: decision.dropped.effort,
+    supported: [...decision.dropped.supported],
+    catalog: decision.dropped.catalog,
+  });
+}
+
 async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
   if (client.hasExited && !activeTurn && nativeActiveTurnId === undefined && !generationFenced) {
     // 只恢复尚未投递的新输入；已发送轮次的未知结果仍由 fenceUnknown 保护。
@@ -1728,6 +1822,10 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
       writeLine(`[codex-app] resume failed, starting a fresh thread: ${err?.message ?? err}`);
       threadId = undefined;
       threadReady = false;
+      // The worker deliberately skipped its gate for this resume. Now that the
+      // fallback is known to be a REAL fresh start, judge the level before the
+      // thread/start below consumes it.
+      await gateMissingThreadFallbackReasoningEffort();
     }
   }
 
@@ -1858,6 +1956,7 @@ function canSteer(turn: ActiveTurn, head: QueuedInput): boolean {
     && turn.phase !== 'fenced'
     && turn.phase !== 'closing'
     && !turn.steeringClosed
+    && !turn.interruptRequested
     && !turn.steerInFlight
     && !steerAdmitting
     && turn.canonicalNativeTurnId !== undefined
@@ -1931,7 +2030,7 @@ function settleSteeredCompletion(turn: ActiveTurn, nativeTurn: JsonObject): void
     turn.knownAgentItemIds.clear();
   }
   turn.terminalCompletion = nativeTurn;
-  turn.failureCode = codexAppTurnFailureCode(nativeTurn);
+  turn.failureCode = turn.interruptRequested && nativeTurn.status === 'interrupted' ? 'cancelled' : codexAppTurnFailureCode(nativeTurn);
   if (typeof nativeTurn?.id === 'string' && nativeActiveTurnId === nativeTurn.id) {
     nativeActiveTurnId = undefined;
   }
@@ -1995,7 +2094,7 @@ async function reconcileSteeredGroupFromHistory(
       turn.itemText.clear();
       turn.knownAgentItemIds.clear();
       turn.terminalCompletion = matched;
-      turn.failureCode = codexAppTurnFailureCode(matched);
+      turn.failureCode = turn.interruptRequested && matched.status === 'interrupted' ? 'cancelled' : codexAppTurnFailureCode(matched);
       // R4-B3: the matched turn is now the authoritative native identity for this
       // group — the final marker, native id, and usage drain must all key off
       // matched.id, not the stale pre-history canonical. Compare-and-clear the OLD
@@ -2171,6 +2270,7 @@ async function tryAdmitSteer(): Promise<void> {
   }
   queue.shift();
   turn.accepted!.push(dispatch);
+  publishInterruptTarget();
   turn.steerInFlight = undefined;
   steerAdmitting = false;
   emitLifecycle({
@@ -2208,7 +2308,8 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
   for (const [id, text] of turn.itemText) {
     if (!turn.knownAgentItemIds.has(id) && !turn.asyncItemIds.has(id)) output.display(text);
   }
-  const finalText = (turn.userInputFailure || turn.finalText || turn.allAgentText).trim();
+  const cancelled = turn.failureCode === 'cancelled';
+  const finalText = cancelled ? '' : (turn.userInputFailure || turn.finalText || turn.allAgentText).trim();
   const completedAtMs = Date.now();
   const lastIndex = group.length - 1;
   for (let index = 0; index < group.length; index++) {
@@ -2219,7 +2320,7 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
       ...(replyTurnId ? { turnId: replyTurnId } : {}),
       ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
       content: isReal ? finalText : '',
-      ...(isReal && turn.failureCode ? { errorCode: turn.failureCode } : {}),
+      ...(turn.failureCode && (isReal || cancelled) ? { errorCode: turn.failureCode } : {}),
       // The real answer's clock starts at the LAST accepted dispatch so a
       // botmux-send marker emitted before the follow-up landed cannot race
       // ahead and suppress it. A single-member group keeps the turn's own
@@ -2526,6 +2627,7 @@ async function runTurn(message: QueuedInput): Promise<void> {
   // refuses and it stays serial. Never kick before the replay above.
   // Reconciliation owns settlement once started. Do not admit a follow-up into
   // a turn whose non-canonical terminal identity is still being resolved.
+  publishInterruptTarget();
   if (!turn.completed && !turn.reconciliation) void tryAdmitSteer();
   await turn.done;
 

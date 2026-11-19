@@ -111,9 +111,11 @@ describe('resolveVerifiedUserIdentityByUnionId admission protections', () => {
   });
 
   // Mirror the module-private policy values: fake-clock tests must move past the
-  // real admission budget, and the cap test drives the real boundary — the
+  // real admission budget, the TTL test steps the clock to either side of the
+  // real negative-cache TTL, and the cap test drives the real boundary — the
   // coupling is inherent to what those tests prove, so it is stated in one place.
   const STRICT_BUDGET = 3_000;
+  const NEGATIVE_CACHE_TTL = 60_000;
   const NEGATIVE_CACHE_CAP = 1_000;
 
   const validUser = (overrides: Record<string, unknown> = {}) => ({
@@ -161,25 +163,35 @@ describe('resolveVerifiedUserIdentityByUnionId admission protections', () => {
     // Real timers plus a mocked clock: `vi.runAllTimersAsync` is only a one-tick
     // shim under `bun test`, and this path now awaits a nested promise (the
     // withTimeout race), so a drain-based assertion would fail for a reason that
-    // has nothing to do with the behaviour. Moving Date.now past the TTL keeps
-    // the test about "the entry expires", not about timer plumbing.
-    const now = Date.now();
+    // has nothing to do with the behaviour. Stepping Date.now keeps the test
+    // about "the entry expires", not about timer plumbing.
+    //
+    // The clock is frozen BEFORE the first lookup, so the negative is written at
+    // exactly t0 and every step below is measured from that write. A baseline
+    // read from the live clock ahead of the import and the first lookup lags
+    // the write by however long those awaits take — with only 1ms of headroom
+    // past the TTL, any ≥2ms stall (a cold module load, a contended runner)
+    // left the "expired" read still inside the TTL.
     larkGet
       .mockResolvedValueOnce(validUser({ enterprise_email: '' }))
       .mockResolvedValueOnce(validUser());
     const { resolveVerifiedUserIdentityByUnionId } = await import('../src/im/lark/identity-cache.js');
-    await expect(resolveVerifiedUserIdentityByUnionId('cli_neg_ttl', 'on_owner')).resolves.toBeUndefined();
-    // Still inside the TTL: the negative is served without touching the API.
-    await expect(resolveVerifiedUserIdentityByUnionId('cli_neg_ttl', 'on_owner')).resolves.toBeUndefined();
-    expect(larkGet).toHaveBeenCalledTimes(1);
-
-    const spy = vi.spyOn(Date, 'now').mockReturnValue(now + 60_001);
+    const t0 = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(t0);
     try {
+      await expect(resolveVerifiedUserIdentityByUnionId('cli_neg_ttl', 'on_owner')).resolves.toBeUndefined();
+      // Last millisecond inside the TTL: the negative is served without touching the API.
+      clock.mockReturnValue(t0 + NEGATIVE_CACHE_TTL - 1);
+      await expect(resolveVerifiedUserIdentityByUnionId('cli_neg_ttl', 'on_owner')).resolves.toBeUndefined();
+      expect(larkGet).toHaveBeenCalledTimes(1);
+
+      // Past the TTL: the entry has expired and the owner is resolved again.
+      clock.mockReturnValue(t0 + NEGATIVE_CACHE_TTL + 1);
       await expect(resolveVerifiedUserIdentityByUnionId('cli_neg_ttl', 'on_owner')).resolves.toBeDefined();
+      expect(larkGet).toHaveBeenCalledTimes(2);
     } finally {
-      spy.mockRestore();
+      clock.mockRestore();
     }
-    expect(larkGet).toHaveBeenCalledTimes(2);
   });
 
   it('does not cache a successful resolution — credential material is read fresh every turn', async () => {

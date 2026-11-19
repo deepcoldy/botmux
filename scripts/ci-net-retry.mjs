@@ -45,11 +45,15 @@ export const TRANSIENT = Object.freeze([
   // Node 系（npm / pnpm / electron）套接字层
   /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|ESOCKETTIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|EPIPE|UND_ERR_SOCKET|UND_ERR_CONNECT_TIMEOUT)\b/,
   /\bsocket hang up\b/,
+  // Docker's registry/CDN pull reports the Go socket error without ECONNRESET.
+  /\bconnection reset by peer\b/i,
   // apt 的临时 DNS 失败；不包含一般 Could not resolve。
   /\bTemporary failure resolving\s+['"]/,
 ]);
 
 export const DETERMINISTIC = Object.freeze([
+  // Docker image/tag/permission errors remain fail-fast, even with a reset.
+  /\b(?:manifest unknown|no matching manifest|pull access denied|requested access to the resource is denied)\b/i,
   // lockfile 与 package.json 不符
   /lockfile had changes, but lockfile is frozen/, // bun
   /\bERR_PNPM_OUTDATED_LOCKFILE\b/,

@@ -72,6 +72,14 @@ function harness() {
     injectionFlushing: false,
     commandLineWritesPending: 0,
     initialInputOwnershipPending: false,
+    // The TraeX native startup first-input fence is traex-only and fresh-only;
+    // these Codex upgrade scenarios never arm it (see traex-startup-input).
+    traexNativeStartupInputPending: false,
+    traexFirstInputAdmissionPending: false,
+    traexNativeStartupInputIsPending: () => false,
+    // Captured unconditionally at every flush entry; unused while the fence
+    // above stays disarmed.
+    webTerminalInputGeneration: 0,
     remoteRunnerRecoveredTurnInFlight: false,
     pendingMessages: [], pendingRawInputs: [], pendingInjections: [], pendingAdoptMessages: [],
     sessionRenameInFlight: () => false,
@@ -159,6 +167,10 @@ function harness() {
     expect(state.cliRestartInProgress).toBe(false);
     expect(state.rawInputRestartGate).toBe(false);
   });
+  // Failed-turn rewind wiring flushPending calls into, real: none in flight here.
+  state.failedTurnRewindInFlight = null;
+  state.settleFailedTurnRewindOffQueue = evaluate<() => void>('settleFailedTurnRewindOffQueue', state);
+  state.putBackStoppedRewindCutBeforeWrites = evaluate<() => boolean>('putBackStoppedRewindCutBeforeWrites', state);
   const realFlush = evaluate<() => Promise<void>>('flushPending', state);
   state.flushPending = vi.fn(async () => {
     steps.push('flush requested');

@@ -237,13 +237,20 @@ export function macOSBundledCodexCandidates(userHome = homedir()): string[] {
   ]);
 }
 
+/** Absolute paths and relative launchers containing a path separator are already
+ * direct executable references. `command -v` cannot turn them into an absolute
+ * PATH result; probing them only repeats work and returns the original string. */
+export function isExecutablePathReference(cmd: string): boolean {
+  return isAbsolute(cmd) || cmd.includes('/') || cmd.includes('\\');
+}
+
 /** Resolve a command name to its absolute path via a login/interactive shell.
  *  Tries login shell first (-lc), then interactive shell (-ic) for tools
  *  whose installers add PATH entries to .bashrc/.zshrc only. The command is
  *  passed as positional argv ($1), never interpolated into the shell program:
  *  spaces and shell metacharacters therefore remain one literal filename. */
 export function resolveCommand(cmd: string): string {
-  if (isAbsolute(cmd)) return cmd;
+  if (isExecutablePathReference(cmd)) return cmd;
   const shell = process.env.SHELL || '/bin/zsh';
   const shells = [shell, '/bin/zsh', '/bin/bash'].filter((v, i, a) => a.indexOf(v) === i);
   // `setsid` (util-linux) runs the probe in its own session with NO controlling
@@ -294,7 +301,7 @@ export async function resolveCommandAsync(
   cmd: string,
   opts: { env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
 ): Promise<{ resolved: string; inconclusive: boolean }> {
-  if (isAbsolute(cmd)) return { resolved: cmd, inconclusive: false };
+  if (isExecutablePathReference(cmd)) return { resolved: cmd, inconclusive: false };
   const env = opts.env ?? process.env;
   const shells = [env.SHELL || '/bin/zsh', '/bin/zsh', '/bin/bash']
     .filter((v, i, a) => a.indexOf(v) === i);
@@ -411,6 +418,21 @@ export async function createCliAdapter(id: CliId, pathOverride?: string, opts?: 
 }
 
 export { createClaudeCodeAdapter, createSeedAdapter, createRelayAdapter, createAidenAdapter, createCocoAdapter, createCodexAdapter, createCodexAppAdapter, createCursorAdapter, createGeniusAdapter, createOpenCodeAdapter, createOpenCode2Adapter, createMiMoCodeAdapter, createAntigravityAdapter, createMtrAdapter, createHermesAdapter, createMiraAdapter, createMirAdapter, createTraexAdapter, createPiAdapter, createCopilotAdapter, createOhMyPiAdapter, createEbsdAdapter, createKimiAdapter, createCodemAdapter, createGrokAdapter, createKiroCliAdapter, createRiffAdapter, createReasonixAdapter, createDshAdapter, createDshTuiAdapter, createMojoAdapter, createMinimaxAdapter, createRemoteRunnerAdapter, createZcodeAdapter, createDoubaoAdapter };
+
+/** The CLI id a session actually runs with.
+ *
+ * A bot keeps `cliId='dsh'` and selects the PTY-driven TUI through its
+ * `dshRuntime` toggle, so the worker (and every display/copy surface that asks
+ * "will a resume restore history?") must map that pair to the `dsh-tui`
+ * adapter. Keeping the mapping here — rather than re-deriving it per caller —
+ * is what stops the worker from resuming through one adapter while the closed
+ * card / resume receipt describe another. */
+export function resolveEffectiveCliId(
+  cliId: string,
+  dshRuntime?: 'official' | 'tui',
+): CliId {
+  return (cliId === 'dsh' && dshRuntime === 'tui' ? 'dsh-tui' : cliId) as CliId;
+}
 
 /** Synchronous version for use in worker process. */
 export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: CliAdapterOptions): CliAdapter {

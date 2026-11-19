@@ -85,6 +85,10 @@ import {
 } from '../src/core/worker-pool.js';
 import { activeSessionKey, sessionKey, type DaemonSession, type FrozenCard } from '../src/core/types.js';
 import { t } from '../src/i18n/index.js';
+import { formatClockTime } from '../src/utils/clock-time.js';
+import { attachOrdinaryTurnRecovery, disposeOrdinaryTurnRecovery } from '../src/services/ordinary-turn-recovery.js';
+import { getBot } from '../src/bot-registry.js';
+import { RECOVERY_WAIT_TEMPLATE } from '../src/im/lark/stream-status-palette.js';
 import { resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 const APP_ID = 'app_test';
@@ -325,6 +329,71 @@ describe('toggle status without a fresh worker report', () => {
     const ds = makeRestoredDs({ worker: makeFakeWorker(), workerReady: true, lastScreenStatus: 'idle', backgroundTaskCount: 2 });
     const card = await toggleCurrent(ds, activate(ds));
     expect(statusOf(card)).toBe(t('card.status.background_wait', { count: 2 }, 'zh'));
+  });
+
+  it('a failed turn whose automatic continuation waits for the provider → 预计 HH:MM 自动续跑, not 等待输入', async () => {
+    const recoveryAt = Date.now() + 10 * 60_000;
+    const ds = makeRestoredDs({ worker: makeFakeWorker(), workerReady: true, lastScreenStatus: 'idle' });
+    (ds.session as any).ordinaryTurnRecovery = {
+      logicalTurnId: 'om_task', currentTurnId: 'om_task', continuationsStarted: 0,
+      status: 'backoff', nextAttemptAt: recoveryAt,
+    };
+    // A persisted wait nobody owns (the recovery was detached) is not going to run.
+    expect(statusOf(await toggleCurrent(ds, activate(ds)))).toBe(t('card.status.idle', undefined, 'zh'));
+    // Neither is one whose bot has automatic continuation switched off.
+    const botWith = (providerRecovery?: { enabled: boolean }) => ({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', ...(providerRecovery ? { providerRecovery } : {}) },
+      resolvedAllowedUsers: ['ou_user'], resolvedBlockedUsers: [], botOpenId: 'ou_bot',
+    }) as any;
+    const defaultGetBot = vi.mocked(getBot).getMockImplementation()!;
+    attachOrdinaryTurnRecovery(ds.session as any, {
+      schedule: () => 0, cancel: () => {}, persist: () => {}, enqueue: () => true, warn: () => {},
+    });
+    vi.mocked(getBot).mockImplementation(() => botWith());
+    expect(statusOf(await toggleCurrent(ds, activate(ds)))).toBe(t('card.status.idle', undefined, 'zh'));
+    vi.mocked(getBot).mockImplementation(() => botWith({ enabled: true }));
+    const card = await toggleCurrent(ds, activate(ds));
+    expect(statusOf(card)).toBe(t('card.status.recovery_wait', { at: formatClockTime(recoveryAt, 'zh') }, 'zh'));
+    expect(card.header.template).toBe(RECOVERY_WAIT_TEMPLATE);
+
+    // Due (the CLI is busy or the continuation is being handed over): 「即将」.
+    (ds.session as any).ordinaryTurnRecovery = { ...(ds.session as any).ordinaryTurnRecovery, nextAttemptAt: Date.now() - 1_000 };
+    const due = await toggleCurrent(ds, activate(ds));
+    expect(statusOf(due)).toBe(t('card.status.recovery_wait_due', undefined, 'zh'));
+
+    // Once the continuation is on its way the wait label is gone.
+    (ds.session as any).ordinaryTurnRecovery = { ...(ds.session as any).ordinaryTurnRecovery, status: 'running', nextAttemptAt: undefined };
+    const after = await toggleCurrent(ds, activate(ds));
+    expect(statusOf(after)).not.toContain(formatClockTime(recoveryAt, 'zh'));
+    disposeOrdinaryTurnRecovery(ds.session as any);
+    vi.mocked(getBot).mockImplementation(defaultGetBot);
+  });
+
+  it('never promises an auto-continuation wait once no coordinator owns it, even with the switch on', async () => {
+    const recoveryAt = Date.now() + 10 * 60_000;
+    const ds = makeRestoredDs({ worker: makeFakeWorker(), workerReady: true, lastScreenStatus: 'idle' });
+    (ds.session as any).ordinaryTurnRecovery = {
+      logicalTurnId: 'om_task', currentTurnId: 'om_task', continuationsStarted: 0,
+      status: 'backoff', nextAttemptAt: recoveryAt,
+    };
+    const defaultGetBot = vi.mocked(getBot).getMockImplementation()!;
+    vi.mocked(getBot).mockImplementation(() => ({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', providerRecovery: { enabled: true } },
+      resolvedAllowedUsers: ['ou_user'], resolvedBlockedUsers: [], botOpenId: 'ou_bot',
+    }) as any);
+    // Switch on but no runtime coordinator owns this persisted wait: the card
+    // must not promise a continuation nobody is going to fire.
+    expect(statusOf(await toggleCurrent(ds, activate(ds)))).toBe(IDLE);
+    // Positive control: the same row shows the wait once a coordinator owns it.
+    attachOrdinaryTurnRecovery(ds.session as any, {
+      schedule: () => 0, cancel: () => {}, persist: () => {}, enqueue: () => true, warn: () => {},
+    });
+    expect(statusOf(await toggleCurrent(ds, activate(ds)))).toBe(
+      t('card.status.recovery_wait', { at: formatClockTime(recoveryAt, 'zh') }, 'zh'));
+    disposeOrdinaryTurnRecovery(ds.session as any);
+    // Detaching again hides the promise (the session became ineligible).
+    expect(statusOf(await toggleCurrent(ds, activate(ds)))).toBe(IDLE);
+    vi.mocked(getBot).mockImplementation(defaultGetBot);
   });
 
   it('running worker reporting working → still 工作中 with the stop button', async () => {

@@ -56,3 +56,20 @@ describe('remote runner config surface', () => {
       .toBe('/opt/example/provider');
   });
 });
+
+describe('delegated slash config', () => {
+  it('defaults off and canonicalizes the fixed alias allowlist', () => {
+    expect(normalizeRemoteRunnerConfig({})).not.toHaveProperty('delegatedSlashCommands');
+    expect(normalizeRemoteRunnerConfig({ delegatedSlashCommands: [] }).delegatedSlashCommands).toEqual([]);
+    expect(normalizeRemoteRunnerConfig({ delegatedSlashCommands: [' /ADOPT ', '/disconnect', '/detach'] })
+      .delegatedSlashCommands).toEqual(['/adopt', '/detach']);
+  });
+  it.each(['/stop', '/close', '/restart', '/retry', '/compact', '/fork', 'adopt', '/adopt x', null, 1])(
+    'rejects commands outside the fixed allowlist: %s', command => {
+      expect(() => normalizeRemoteRunnerConfig({ delegatedSlashCommands: [command] })).toThrow();
+    },
+  );
+  it.each([null, '/adopt', true, {}])('rejects a non-array switch: %s', delegatedSlashCommands => {
+    expect(() => normalizeRemoteRunnerConfig({ delegatedSlashCommands })).toThrow();
+  });
+});

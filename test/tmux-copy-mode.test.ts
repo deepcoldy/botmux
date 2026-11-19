@@ -22,10 +22,14 @@ import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
 
+/** The read before every write: liveness fields + `#{pane_in_mode}`, in one
+ *  display-message (a live pane `%1`, not dead, server pid 111). */
+const WRITE_CHECK_FORMAT = '#{pane_id}:#{pane_dead}:#{pane_dead_status}:#{pane_pid}:#{pid}:#{pane_in_mode}';
+
 function mockPaneMode(mode: '0' | '1') {
   mockedExecFileSync.mockImplementation((cmd: any, args: any[]) => {
     if (cmd === 'tmux' && args.includes('display-message')) {
-      return `${mode}\n` as any;
+      return `%1:0::4242:111:${mode}\n` as any;
     }
     return Buffer.from('') as any;
   });
@@ -36,7 +40,7 @@ function tmuxCalls() {
 }
 
 function isCopyModeProbe(args: string[]) {
-  return args.includes('display-message') && args.includes('#{pane_in_mode}');
+  return args.includes('display-message') && args.includes(WRITE_CHECK_FORMAT);
 }
 
 function isCopyModeCancel(args: string[]) {
@@ -56,7 +60,7 @@ describe('TmuxPipeBackend copy-mode guard', () => {
     be.sendSpecialKeys('Enter');
 
     const calls = tmuxCalls();
-    expect(calls[0]).toEqual(['display-message', '-p', '-t', '0:2.0', '#{pane_in_mode}']);
+    expect(calls[0]).toEqual(['display-message', '-p', '-t', '0:2.0', WRITE_CHECK_FORMAT]);
     expect(calls[1]).toEqual(['send-keys', '-t', '0:2.0', '-X', 'cancel']);
     expect(calls[2]).toEqual(['send-keys', '-t', '0:2.0', 'Enter']);
   });
@@ -85,6 +89,7 @@ describe('TmuxPipeBackend copy-mode guard', () => {
 
     const calls = tmuxCalls();
     expect(calls.some(args => args.includes('load-buffer'))).toBe(true);
-    expect(calls.some(args => args.includes('paste-buffer'))).toBe(true);
+    // The paste runs as the dead-pane-guarded if-shell branch.
+    expect(calls.some(args => args.some(arg => arg.startsWith('"paste-buffer"')))).toBe(true);
   });
 });

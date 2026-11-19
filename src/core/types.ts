@@ -1,11 +1,14 @@
+import type { TurnSpeaker } from './turn-speakers.js';
 import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
   CliTurnPayload,
+  AcceptedCommandInput,
   ChatContext,
   CotEntry,
   Session,
   DaemonToWorker,
+  WorkerToDaemon,
   LarkAttachment,
   LarkMention,
   ModelFallbackState,
@@ -205,6 +208,17 @@ export interface DaemonSession {
   /** Epoch ms of the last HUMAN input routed here (see Session.lastHumanMessageAt). */
   lastHumanMessageAt?: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
+  /**
+   * This session already received its ONE "resume fell back to a fresh
+   * session" notice.
+   *
+   * Daemon-side on purpose: `/restart` forks a new worker, so a worker-level
+   * latch would re-post the notice on every restart. The worker reports the
+   * demotion fact each time (and the daemon logs every report); only the
+   * user-visible notice is spent once. In-memory only — a daemon restart is a
+   * new conversation surface as far as this once-per-session courtesy goes.
+   */
+  resumeFreshFallbackNotified?: boolean;
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   /**
@@ -340,6 +354,7 @@ export interface DaemonSession {
    * selection delays the first turn. The legacy enriched prompt remains the
    * compatibility source for every other CLI. */
   pendingCodexAppText?: string;
+  pendingAcceptedInput?: AcceptedCommandInput;
   /** Trusted, Botmux-authored instructions held out of the visible Codex App
    * user message while the first turn waits for repo selection/worktree setup. */
   pendingCodexAppApplicationContext?: string;
@@ -499,6 +514,8 @@ export interface DaemonSession {
     completed?: boolean;
     stage?: 'model_output' | 'tool_started' | 'tool_returned';
     lastProgressAtMs?: number;
+    /** Ephemeral Dashboard publication throttle, scoped to this exact turn. */
+    lastDashboardPublishedAtMs?: number;
   }>;
   /** Bounded terminal facts keyed by worker generation, turn and exact attempt.
    * Values are receipt epoch milliseconds, also fencing older legacy starts
@@ -571,6 +588,23 @@ export interface DaemonSession {
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
    *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
+  /** Wall-clock of the most recent `turn_terminal` observed for this session,
+   *  and the turn it named. The terminal edge is the daemon's authority that a
+   *  turn is over, so these drive the post-terminal display settle (see
+   *  schedulePostTerminalStatusSettle) and the periodic stale-card self-heal.
+   *  In-memory only. */
+  lastTurnTerminalAt?: number;
+  lastTurnTerminalTurnId?: string;
+  lastTurnTerminalDispatchAttempt?: number;
+  /** Wall-clock of the first genuine LIVE-work signal observed after the last
+   *  completed terminal, when that work has no managed turn of its own (Web
+   *  Terminal / sandbox direct-submit). Managed turns and retry attempts are
+   *  recognized via currentTurnId / the dispatch high-water instead. This epoch
+   *  keeps the post-terminal settle and self-heal from re-idling a card that a
+   *  direct-submit episode legitimately put back to work. Reset on every
+   *  turn_terminal so a fresh post-terminal window starts clean. In-memory only. */
+  postTerminalLiveWorkAt?: number;
+  lastTurnTerminalStatus?: Extract<import('../types.js').WorkerToDaemon, { type: 'turn_terminal' }>['status'];
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
    * (stamped on the non-idle → idle edge, cleared on any other status). Drives
@@ -637,6 +671,7 @@ export interface DaemonSession {
   messageListenerCompletedTurnId?: string;
   /** Actual input-committed turn for the managed reply card's Stop control. */
   replyCardRunningTurnId?: string;
+  codexAppInterruptTarget?: Extract<WorkerToDaemon, { type: 'codex_app_interrupt_target' }>['target'];
   /**
    * Authenticated human principal that owns the currently executing interactive
    * turn. Set only after a worker accepts the turn and cleared by its exact
@@ -660,6 +695,11 @@ export interface DaemonSession {
    * daemon-minted schedule turn id and never persisted. The worker can name a
    * turn id but cannot add or change the identity behind it. */
   scheduledTurnCallers?: Map<string, TrustedCaller>;
+  /** Exact-turn controller identity exposed only to tool credential publication
+   * and `botmux actor current` for a bounded schedule child. Unlike
+   * scheduledTurnCallers, this does not authorize workflow or schedule
+   * mutations and is never persisted. */
+  scheduledToolActors?: Map<string, { openId: string; unionId: string }>;
   /** Exact principal-lane turn/generation that still owns the worker until a
    * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
    * the worker's earlier managed-origin revoke must not clear this FIFO fence,
@@ -715,6 +755,8 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Native current selection, separate from the last executed turn_context. */
+  nativeReasoningObservation?: import('../services/native-reasoning-observation.js').NativeReasoningObservation & { workerGeneration: number };
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Undefined means no observation; null means native/default context. */
@@ -838,6 +880,17 @@ export interface DaemonSession {
   lastCliInput?: string;
   /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
   lastCliInputTurnId?: string;
+  /** Inputs sent with a failed-turn rewind directive, until the worker says
+   *  whether it cut the failed turn (`failed_turn_rewind`). Keyed by the
+   *  input's turn id; bounded, in-memory (a dead worker never reports). */
+  pendingFailedTurnRewinds?: Map<string, {
+    failedTurnId: string;
+    mode: 'merge' | 'resend';
+    content: string;
+    failedUserPrompt: string;
+    /** The worker process that was asked; another one never answers. */
+    worker: DaemonSession['worker'];
+  }>;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
@@ -868,7 +921,7 @@ export interface DaemonSession {
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
-  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void; createdAt?: number }>;
   /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
   settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads
@@ -941,6 +994,9 @@ export interface DaemonSession {
     identityTurnId?: string;
     dispatchAttempt?: number;
     trustedCaller?: TrustedCaller | null;
+    /** Humans whose messages are in the running turn, in order of their latest
+     * message (the last one spoke last). Worker-reported, never CLI-supplied. */
+    speakers?: TurnSpeaker[];
     /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
     linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the

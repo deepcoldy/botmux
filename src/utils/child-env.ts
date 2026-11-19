@@ -535,6 +535,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'EBSD_BOTMUX_SUBJECT',
   'EBSD_BOTMUX_REPOSITORY_ROOT',
   'EBSD_NO_UPDATE_CHECK',
+  // Doubao's npm launcher otherwise blocks every interactive start on
+  // `Update now? [Y/N]` while a newer version exists. Set by the doubao
+  // adapter's spawnEnv; without this entry only the pty backend honours it.
+  'DOUBAO_CLI_NO_UPDATE_CHECK',
   // Kimi Code: emit OSC 7501 turn state inside a tmux pane (it skips the
   // support probe there). Set by the kimi adapter's spawnEnv.
   'PI_PROGRAM_STATUS',

@@ -89,6 +89,7 @@ const HELP_TEXT = `botmux observe — 读取 daemon 实时 SessionRow 投影（v
   identity/cli/backend, liveness (alive|not_running|closed|unknown),
   turn (working|idle|starting|analyzing|limited|stalled|interrupted|unknown),
   phase (仅 'unknown'), queued/parkedOrSuspended/closed (boolean|'unknown'),
+  executionActivity: 已验证阶段(tool|model_queue|unknown)、来源、运行时长与最后活动；缺少时长时不填 0。
   pendingRepo, lastActivityAt, workingDirectory, rawStatus, context.
   probe.status: ok|unauthorized|unreachable|not_found|daemon_offline。
 

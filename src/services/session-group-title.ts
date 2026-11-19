@@ -214,7 +214,7 @@ export function supportsOneShotTitle(cliId: string): boolean {
 
 /** Mandatory device-credential isolation on this host — the same marker /
  *  device-credential probe worker.ts runs before every local spawn. */
-function hostRequiresCredentialIsolation(plugins?: string[]): boolean {
+export function hostRequiresCredentialIsolation(plugins?: string[]): boolean {
   const home = homedir();
   const protectedPolicy = matchingProtectedMcpPolicy(plugins);
   const protectedHomePaths = protectedMcpHomePaths(home, protectedPolicy);

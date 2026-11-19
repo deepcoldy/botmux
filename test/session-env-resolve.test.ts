@@ -106,7 +106,7 @@ describe('resolveSessionEnv', () => {
     // lark tool binding is on by default for a local bot
     expect(resolveSessionEnv({ bot: { env }, backendType: 'tmux' }).env).toEqual({ GIT_CONFIG_COUNT: '1', OTHER: 'x' });
     expect(resolveSessionEnv({ bot: { env, larkToolBinding: false }, backendType: 'tmux' }).env).toEqual(env);
-    expect(resolveSessionEnv({ bot: { env, larkToolBinding: false, triggerUserAuth: { enabled: true } }, backendType: 'tmux' }).env)
+    expect(resolveSessionEnv({ bot: { env, larkToolBinding: false, triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }, backendType: 'tmux' }).env)
       .toEqual({ OTHER: 'x' });
   });
 
@@ -114,10 +114,10 @@ describe('resolveSessionEnv', () => {
     const env = { ZDOTDIR: '/mine', BASH_ENV: '/mine/b', OTHER: 'x' };
     // one-shots and v3 workflow workers are never wrapped → legacy env verbatim
     expect(resolveSessionEnv({ bot: { env }, backendType: 'tmux', facts: { unwrapped: true } }).env).toEqual(env);
-    expect(resolveSessionEnv({ bot: { env, triggerUserAuth: { enabled: true } }, backendType: 'tmux', facts: { unwrapped: true } }).env).toEqual(env);
+    expect(resolveSessionEnv({ bot: { env, triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }, backendType: 'tmux', facts: { unwrapped: true } }).env).toEqual(env);
     // HTTP virtual chat / external App Server: binding off, trigger-user auth still wraps
     expect(resolveSessionEnv({ bot: { env }, backendType: 'tmux', facts: { larkBindingOff: true } }).env).toEqual(env);
-    expect(resolveSessionEnv({ bot: { env, triggerUserAuth: { enabled: true } }, backendType: 'tmux', facts: { larkBindingOff: true } }).env).toEqual({ OTHER: 'x' });
+    expect(resolveSessionEnv({ bot: { env, triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }, backendType: 'tmux', facts: { larkBindingOff: true } }).env).toEqual({ OTHER: 'x' });
     expect(botOneShotEnv({}, { env })).toMatchObject(env);
   });
 

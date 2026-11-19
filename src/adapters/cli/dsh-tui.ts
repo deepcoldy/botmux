@@ -37,8 +37,9 @@ function sendBracketedPaste(pty: PtyHandle, content: string): boolean {
  *     positional args as workspace targets (DSH_TUI_WORKSPACE_TARGET), which
  *     would hijack a prompt that happens to look like a path. All prompts go
  *     through writeInput instead.
- *   - `--resume` is intercepted by the launcher (sets DSH_TUI_RESUME_SESSION
- *     from ~/.dsh-tui/resume.txt); we pass it through for session resume.
+ *   - `--resume <id>` is passed through verbatim for a precise session resume;
+ *     a BARE `--resume` is never emitted (the launcher would read the
+ *     machine-wide ~/.dsh-tui/resume.txt, i.e. a possibly foreign session).
  *
  * Selection: this adapter is never chosen directly from the CLI dropdown. The
  * bot keeps cliId='dsh' + dshRuntime='tui'; the worker resolves to this
@@ -84,12 +85,14 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
       // workspace target. Keep the DSH overlay as one token so it reaches
       // `dsh --profile dsh-tui` intact.
       if (bridge) args.push(`--patch=${bridge.patchPath}`);
-      if (resume) {
-        // Bare --resume makes the launcher read ~/.dsh-tui/resume.txt; an
-        // explicit session id is passed through verbatim.
-        if (resumeSessionId) args.push('--resume', resumeSessionId);
-        else args.push('--resume');
-      }
+      // Only an EXPLICIT id is a precise resume. A bare `--resume` is not "this
+      // session": the launcher reads the machine-wide ~/.dsh-tui/resume.txt,
+      // i.e. whichever conversation any process touched last — possibly a
+      // sibling bot's. Without the native id the launch is therefore fresh, and
+      // the resume intent is dropped here as defense-in-depth behind the
+      // worker's Tier-0 demotion (`resumeRequiresCliSessionId`). `--patch=…`
+      // above still rides along.
+      if (resume && resumeSessionId) args.push('--resume', resumeSessionId);
       return args;
     },
 
@@ -187,7 +190,20 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     // detector never fires again after the first turn, so a queued follow-up has
     // no ready edge to wait for.
     injectsTurnIdleHook: true,
+    // Resume intent is only honorable with the native session id: a bare
+    // `--resume` would load ~/.dsh-tui/resume.txt (not botmux-session-scoped),
+    // and we never record the TUI's id (buildResumeCommand stays null). Declare
+    // the capability so the worker demotes resume-without-id to a FRESH launch
+    // and every upper layer (closed card, resume receipt) stops claiming the
+    // history came back.
+    resumeRequiresCliSessionId: true,
     altScreen: false,
+    // dsh-tui runs full-screen on tmux's alternate screen and repaints its
+    // transcript itself, so there is no xterm/tmux scrollback to page. A
+    // read-only web terminal can only reach history by forwarding the wheel
+    // back to the CLI as SGR mouse reports (1003+1006), which the TUI already
+    // handles — opt into that narrow, rate-limited relay.
+    readOnlyRemoteScroll: true,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
     // resume.txt. Both must survive the file sandbox.
     get authPaths(): string[] { return dshAuthPaths(); },

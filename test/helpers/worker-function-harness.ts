@@ -1,5 +1,5 @@
 /**
- * Execute ONE real top-level function of src/worker.ts against an injected
+ * Execute ONE real function or named callback of src/worker.ts against an injected
  * module scope, without importing the worker (its module body installs process
  * IPC/signal handlers and starts runtime services).
  *
@@ -24,6 +24,30 @@ import { contractTerminalStatus, executionObserverSupported } from '../../src/se
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
+import { isNativeReasoningEffort } from '../../src/services/native-reasoning-observation.js';
+import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-footer.js';
+import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-observer.js';
+import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
+import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
+import { TurnRecapRecorder } from '../../src/services/turn-recap.js';
+import { stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
+import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from '../../src/core/rewind-backup-retention.js';
+import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
+import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
+import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
+import { BusyReadyDeferralTracker, BusyReadyLogThrottle } from '../../src/utils/busy-ready-deferral.js';
+
+/** Failed-turn rewind wiring that emitTurnTerminal, flushPending and
+ *  handleTermAction call into (see src/worker.ts startFailedTurnRewind):
+ *  loaded as the real functions, so a fixture with no rewind in flight keeps
+ *  its old behaviour. */
+const FAILED_TURN_REWIND_FUNCTIONS = [
+  'turnFailedWithoutOutput', 'failedTurnRewindWriteEdge', 'stopHeldFailedTurnRewind',
+  'waitForRetiringCliQuiescence', 'putBackFailedTurnCut', 'dropStoppedRewindMessage',
+  'putBackStoppedRewindCutBeforeWrites', 'restartToPutBackCut', 'settleFailedTurnRewindOffQueue',
+  'handOverFailedTurnRewind', 'failedTurnTranscriptScope',
+];
 
 /** TraeX question-page wiring the hold / idle paths call into (see
  *  src/worker.ts "TraeX native question page"): loaded as the real functions,
@@ -31,6 +55,7 @@ import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js
 const TRAEX_QUESTION_FUNCTIONS = [
   'traexQuestionBridgeActive', 'traexQuestionBlockReported', 'traexQuestionHoldBlocks',
   'traexQuestionHoldsHeldInput', 'notifyTraexQuestionInputHeld', 'traexQuestionHoldsIdle',
+  'traexQuestionHoldsQueuedWrite', 'traexQuestionCapture',
 ];
 /** Inert stand-in for the worker's TraexQuestionBridge instance (a const, not
  *  a function); a caller that observes it passes its own in `scope`. */
@@ -51,9 +76,25 @@ function workerSourceFile(): ts.SourceFile {
 
 function transpiledWorkerFunction(name: string): string {
   const source = workerSourceFile();
-  const declaration = source.statements.find(statement => ts.isFunctionDeclaration(statement)
-    && statement.name?.text === name);
-  if (!declaration) throw new Error(`Missing top-level worker function: ${name}`);
+  let declaration = source.statements.find((statement): statement is ts.FunctionDeclaration =>
+    ts.isFunctionDeclaration(statement) && statement.name?.text === name);
+  // Some lifecycle callbacks capture their spawn-local ownership boundary.
+  // Execute the real callback with that boundary injected just like globals,
+  // without importing the worker or modelling its timeout decision.
+  if (!declaration) {
+    const visit = (node: ts.Node): void => {
+      if (declaration) return;
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.name.text === name
+        && node.initializer && ts.isArrowFunction(node.initializer) && ts.isBlock(node.initializer.body)) {
+        const arrow = node.initializer;
+        declaration = ts.factory.createFunctionDeclaration(
+          arrow.modifiers, undefined, name, arrow.typeParameters, arrow.parameters, arrow.type, node.initializer.body,
+        );
+      } else ts.forEachChild(node, visit);
+    };
+    visit(source);
+  }
+  if (!declaration) throw new Error(`Missing worker function or callback: ${name}`);
   // Rewrite before transpilation's module classification: an import.meta in
   // an otherwise standalone function would inject module-only boilerplate.
   const transformed = ts.transform(declaration, [context => node => {
@@ -73,6 +114,23 @@ function transpiledWorkerFunction(name: string): string {
   }).outputText;
 }
 
+/**
+ * Lazy in-scope defaults for worker module-level state that extracted
+ * functions/cases reference via `with (scope)`. A harness that does not stub
+ * these would otherwise resolve them to undefined and throw (e.g. iterating an
+ * undefined Map). Explicitly supplied scope values always win. Returns
+ * `undefined` for keys this does not own so callers keep their own fallbacks.
+ */
+function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | symbol): unknown {
+  if (key === 'inFlightKeepaliveFingerprints') {
+    return (scope.inFlightKeepaliveFingerprints ??= new Map<string, number>());
+  }
+  if (key === 'KEEPALIVE_HOOK_CLAIM_MS') {
+    return (scope.KEEPALIVE_HOOK_CLAIM_MS ??= 30_000);
+  }
+  return undefined;
+}
+
 export function loadWorkerFunction<T extends (...args: any[]) => any>(
   name: string,
   scope: Record<string, unknown>,
@@ -83,13 +141,53 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const dependencies = new Map<string, unknown>();
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
+    if (key === 'confirmedTerminalEffortChoice') return () => undefined;
+    if (key === 'noteTerminalEffortInput') return () => {};
+    if (key === 'claudeEffortObserver') {
+      if (!dependencies.has(key)) dependencies.set(key, new ClaudeEffortObserver());
+      return dependencies.get(key);
+    }
+    if (key === 'terminalEffortTracker') {
+      if (!dependencies.has(key)) dependencies.set(key, new TerminalEffortChoiceTracker());
+      return dependencies.get(key);
+    }
+    if (key === 'config') return { terminalEffortWriteback: false };
     if (key === 'contractTerminalStatus') return contractTerminalStatus;
     if (key === 'executionObserverSupported') return executionObserverSupported;
+    if (key === 'isNativeReasoningEffort') return isNativeReasoningEffort;
+    if (key === 'readNativeReasoningFooter') return readNativeReasoningFooter;
+    if (key === 'readGrokRuntimeObservation') return readGrokRuntimeObservation;
     if (typeof key === 'string' && Object.hasOwn(runtimeReservation, key)) return (runtimeReservation as Record<string, unknown>)[key];
     if (key === 'isRemoteBackendType') return isRemoteBackendType;
+    if (key === 'promptReadinessRevision') return scope.promptReadinessRevision ??= 0;
+    if (key === 'traexCatalogEmptyNoticeTurns') return scope.traexCatalogEmptyNoticeTurns ??= new WeakMap();
+    if (key === 'turnRecapRecorder') return scope.turnRecapRecorder ??= new TurnRecapRecorder();
+    if (key === 'busyReadyDeferral') return scope.busyReadyDeferral ??= new BusyReadyDeferralTracker();
+    if (key === 'busyReadyLogThrottle') return scope.busyReadyLogThrottle ??= new BusyReadyLogThrottle();
+    // Module-level keep-alive provenance state shared with the message-handler
+    // proxy; explicit scope stubs still take precedence.
+    const keepaliveDefault = defaultScopedWorkerState(scope, key);
+    if (keepaliveDefault !== undefined) return keepaliveDefault;
+    if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
+    if (key === 'rewindableErrorCode') return rewindableErrorCode;
+    if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
+    if (key === 'pruneRewindBackupsBeside') return pruneRewindBackupsBeside;
+    if (key === 'rewindBackupDirForSession') return rewindBackupDirForSession;
+    if (key === 'registerRewindBackup') return registerRewindBackup;
+    if (key === 'readTraexCatalogWithRetry') return readTraexCatalogWithRetry;
+    if (key === 'traexAutoModelPolicyKey') return traexAutoModelPolicyKey;
+    if (key === 'reconcileTraexModelCatalog') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
+    if (key === 'currentTraexLoadSnapshot') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
+    if (key === 'traexStartupInputReady') return traexStartupInputReady;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
-    if (typeof key === 'string' && ['codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', ...TRAEX_QUESTION_FUNCTIONS].includes(key)) {
+    if (typeof key === 'string' && ['warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
     }
@@ -125,7 +223,16 @@ export function loadWorkerMessageHandler(name: string, scope: Record<string, unk
   }).outputText;
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => key in target ? target[key as string] : (globalThis as any)[key],
+    get: (target, key) => {
+      if (key in target) return target[key as string];
+      // Same lazy module-state defaults as loadWorkerFunction so extracted IPC
+      // cases (e.g. prompt_submitted reading the keep-alive map) resolve even
+      // when the harness scope does not stub them.
+      const scopedDefault = defaultScopedWorkerState(scope, key);
+      if (scopedDefault !== undefined) return scopedDefault;
+      if (key === 'revokePromptReadiness') return loadWorkerFunction('revokePromptReadiness', scope);
+      return (globalThis as any)[key];
+    },
     set: (target, key, value) => { target[key as string] = value; return true; },
   });
   return new Function('scope', `with (scope) { ${code}; return handle; }`)(proxy);

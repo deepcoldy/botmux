@@ -65,6 +65,83 @@ describe('late SessionStart re-submit in the deferred submit recheck', () => {
     }
   });
 
+  it('does not spend the sole rescue before a pending SessionStart, then presses once after its grace', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { h, pressComposerSubmit } = lateSessionStartHarness('claude-code');
+    try {
+      h.schedule('payload', h.recheck, 'history', undefined, undefined, 1, IDENTITY);
+
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(pressComposerSubmit).not.toHaveBeenCalled();
+      expect(h.scope.emitTurnTerminal).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      h.scope.sessionStartSignalAtMs = 30_000;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(pressComposerSubmit).toHaveBeenCalledTimes(1);
+      expect(pressComposerSubmit).toHaveBeenCalledWith(h.scope.backend);
+      expect(h.scope.emitTurnTerminal).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(pressComposerSubmit).toHaveBeenCalledTimes(1);
+      expect(h.scope.emitTurnTerminal).toHaveBeenCalledWith('delivery', 'failed', 'submit_unconfirmed', 1);
+    } finally {
+      h.submitFailureChains.clear();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still rescues immediately without a SessionStart signal when the ready gate is not armed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { h, pressComposerSubmit } = lateSessionStartHarness('claude-code');
+    h.scope.readyGate.isArmed = false;
+    h.scope.submitActivityEvidenceSince = () => undefined;
+    try {
+      h.schedule('payload', h.recheck, 'history', undefined, undefined, 1, IDENTITY);
+
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(pressComposerSubmit).toHaveBeenCalledTimes(1);
+      expect(h.scope.emitTurnTerminal).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(pressComposerSubmit).toHaveBeenCalledTimes(1);
+    } finally {
+      h.submitFailureChains.clear();
+      vi.useRealTimers();
+    }
+  });
+
+  it('presses once after an earlier SessionStart when the composer holds the input and a background task keeps the program status working', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const { h, pressComposerSubmit } = lateSessionStartHarness('claude-code');
+    h.scope.idleDetector.programStatusHeldWorking = () => true;
+    h.scope.sessionStartSignalAtMs = -30_000;
+    h.scope.captureBackendScreen = () => [
+      '✻ Cogitated for 10m 6s · done 9:26 PM · 1 shell still running',
+      `${'─'.repeat(3)} ↑ 18 more ${'─'.repeat(40)}`,
+      '  second last line of the payload\\',
+      '  last line of the payload',
+      RULE,
+      '  ⏵⏵ bypass permissions on · 1 shell',
+    ].join('\n');
+    try {
+      h.schedule('head of a long payload that scrolled out\nsecond last line of the payload\nlast line of the payload', h.recheck, 'history', undefined, undefined, 1, IDENTITY);
+
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(pressComposerSubmit).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(pressComposerSubmit).toHaveBeenCalledTimes(1);
+      expect(h.scope.emitTurnTerminal).toHaveBeenCalledWith('delivery', 'failed', 'submit_unconfirmed', 1);
+    } finally {
+      h.submitFailureChains.clear();
+      vi.useRealTimers();
+    }
+  });
+
   it('leaves the input box of a CLI other than Claude Code alone', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);

@@ -24,6 +24,7 @@ import {
   type CredentialGrantRequest,
 } from '../platform/credential-grant-client.js';
 import { resolveUnionIdFromOpenId } from '../im/lark/client.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { logger } from '../utils/logger.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
@@ -149,7 +150,7 @@ export function noteSenderUnionId(larkAppId: string, openId: unknown, unionId: u
 const unionIdLookups = new Map<string, Promise<string | null>>();
 export const UNION_ID_SHARE_MS = 5_000;
 
-async function unionIdFor(larkAppId: string, openId: string): Promise<string | null> {
+export async function platformUnionIdFor(larkAppId: string, openId: string): Promise<string | null> {
   const key = `${larkAppId}|${openId}`;
   const hit = unionIdCache.get(key);
   if (hit && deps.now() - hit.at < UNION_ID_TTL_MS) {
@@ -179,16 +180,6 @@ async function lookupUnionId(larkAppId: string, openId: string, key: string, gen
     return unionId;
   }
   return null;
-}
-
-/** The claims of a ByteCloud JWT (read, not verified). */
-function jwtClaims(jwt: string): { region?: unknown; exp?: unknown } {
-  try {
-    const claims = JSON.parse(Buffer.from(jwt.split('.')[1] ?? '', 'base64url').toString('utf8'));
-    return claims && typeof claims === 'object' ? claims : {};
-  } catch {
-    return {};
-  }
 }
 
 /**
@@ -229,7 +220,7 @@ function toIdentity(
     if (!nonEmpty(jwt)) continue;
     regionalIssued = true;
     const claims = jwtClaims(jwt);
-    if (claims.region !== region) {
+    if (claims?.region !== region) {
       logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} does not claim partition ${region}; dropped`);
     } else if (typeof claims.exp === 'number' && claims.exp * 1_000 <= now) {
       logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} has already expired; dropped`);
@@ -261,7 +252,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
 
   const unionId = args.unionId !== undefined
     ? (UNION_ID_RE.test(args.unionId) && !args.unionId.startsWith('ou_') ? args.unionId : null)
-    : await unionIdFor(args.botConfig.larkAppId, args.openId);
+    : await platformUnionIdFor(args.botConfig.larkAppId, args.openId);
   if (!unionId) {
     logger.warn(`[trigger-user-auth] platform grant skipped for ${args.tool}: could not resolve union_id for sender`);
     return { state: 'unavailable', detail: 'sender union_id unresolved' };
@@ -327,6 +318,4 @@ export function platformRefusalReason(resolution: Exclude<PlatformIdentityResolu
   }
 }
 
-export function reasonTag(reason: string): string {
-  return `[reason=${reason}]`;
-}
+export { reasonTag } from './refusal-reasons.js';

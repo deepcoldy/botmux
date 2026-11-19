@@ -1,0 +1,108 @@
+{
+  "zh": {
+    "tag": "column_set",
+    "element_id": "botmux_next_step",
+    "flex_mode": "none",
+    "horizontal_spacing": "8px",
+    "margin": "4px 0px 0px 0px",
+    "columns": [
+      {
+        "tag": "column",
+        "width": "auto",
+        "vertical_align": "center",
+        "elements": [
+          {
+            "tag": "markdown",
+            "text_size": "notation",
+            "content": "<font color='grey'>💡 下一步</font>"
+          }
+        ]
+      },
+      {
+        "tag": "column",
+        "width": "weighted",
+        "weight": 1,
+        "vertical_align": "center",
+        "elements": [
+          {
+            "tag": "button",
+            "type": "default",
+            "size": "small",
+            "text": {
+              "tag": "plain_text",
+              "content": "CI 绿了就合"
+            },
+            "hover_tips": {
+              "tag": "plain_text",
+              "content": "以你的身份发送这条输入"
+            },
+            "behaviors": [
+              {
+                "type": "callback",
+                "value": {
+                  "action": "card_click_turn",
+                  "payload": "[1,\"cli_app\",\"CI 绿了就合\"]",
+                  "sig": "sig_x",
+                  "notice": "next_step"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "en": {
+    "tag": "column_set",
+    "element_id": "botmux_next_step",
+    "flex_mode": "none",
+    "horizontal_spacing": "8px",
+    "margin": "4px 0px 0px 0px",
+    "columns": [
+      {
+        "tag": "column",
+        "width": "auto",
+        "vertical_align": "center",
+        "elements": [
+          {
+            "tag": "markdown",
+            "text_size": "notation",
+            "content": "<font color='grey'>💡 Next step</font>"
+          }
+        ]
+      },
+      {
+        "tag": "column",
+        "width": "weighted",
+        "weight": 1,
+        "vertical_align": "center",
+        "elements": [
+          {
+            "tag": "button",
+            "type": "default",
+            "size": "small",
+            "text": {
+              "tag": "plain_text",
+              "content": "CI 绿了就合"
+            },
+            "hover_tips": {
+              "tag": "plain_text",
+              "content": "Send this as your next message"
+            },
+            "behaviors": [
+              {
+                "type": "callback",
+                "value": {
+                  "action": "card_click_turn",
+                  "payload": "[1,\"cli_app\",\"CI 绿了就合\"]",
+                  "sig": "sig_x",
+                  "notice": "next_step"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

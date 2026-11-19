@@ -3,7 +3,8 @@ import { t } from './ui.js';
 import { controlCsrfHeaders } from './control-csrf.js';
 
 type Target = {
-  backend: 'sqlite' | 'postgresql';
+  backend: 'sqlite' | 'postgresql' | 'supabase';
+  supabase?: { url: string; schema: string; requestTimeoutMs: number; hasKey?: boolean };
   postgres?: { host: string; port: number; database: string; user: string; schema: string;
     connectTimeoutMs: number; tls: { mode: 'verify-full' | 'disable'; hasCa?: boolean }; hasPassword?: boolean;
     bytepg?: { computeId: string; hasToken?: boolean; doas?: { psm: string; environment: string } } };
@@ -19,6 +20,8 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
   const [status, setStatus] = useState<StorageStatus>();
   const [backend, setBackend] = useState<Target['backend']>('sqlite');
   const [postgres, setPostgres] = useState(defaults);
+  const [supabase, setSupabase] = useState({ url: '', schema: 'botmux_feedback', requestTimeoutMs: 5000 });
+  const [supabaseKey, setSupabaseKey] = useState('');
   const [password, setPassword] = useState('');
   const [authentication, setAuthentication] = useState<'password' | 'bytepg'>('password');
   const [computeId, setComputeId] = useState('');
@@ -45,6 +48,10 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
     if (initial) {
       const selected = body.candidate ?? body.active;
       setBackend(selected.backend);
+      if (selected.supabase) {
+        const { hasKey: _key, ...values } = selected.supabase;
+        setSupabase(values);
+      }
       if (selected.postgres) {
         const { hasPassword: _password, bytepg, tls, ...values } = selected.postgres;
         setAuthentication(bytepg ? 'bytepg' : 'password');
@@ -72,7 +79,7 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
       const result = await response.json();
       if (!response.ok) throw new Error(result.error ?? 'feedback_storage_operation_failed');
       setMessage(t('feedback.storage.success'));
-      if (path === 'configure') { setPassword(''); setToken(''); setCa(''); setRequestId(undefined); }
+      if (path === 'configure') { setPassword(''); setToken(''); setCa(''); setSupabaseKey(''); setRequestId(undefined); }
       // A cancelled job is terminal: the panel must mint a fresh requestId for
       // the next migration attempt, or prepareFeedbackMigration would keep
       // returning the old cancelled job (its resume is a permanent no-op).
@@ -92,15 +99,23 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
   const latest = status.migrations.find(job => !['complete', 'cancelled'].includes(job.phase)) ?? status.migrations.at(-1);
   const migrating = latest && !['complete', 'cancelled'].includes(latest.phase);
   return <details className="panel feedback-storage-panel">
-    <summary>{t('feedback.storage.title')} · {status.active.backend === 'sqlite' ? 'SQLite' : 'PostgreSQL'}</summary>
+    <summary>{t('feedback.storage.title')} · {status.active.backend === 'sqlite' ? 'SQLite' : status.active.backend === 'supabase' ? 'Supabase' : 'PostgreSQL'}</summary>
     <p>{t('feedback.storage.help')}</p>
     <div className="feedback-filter-fields" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 12 }}>
       <label>{t('feedback.storage.backend')}
         <select id="feedback-storage-backend" value={backend} disabled={busy || !!migrating}
           onChange={event => setBackend(event.target.value as Target['backend'])}>
-          <option value="sqlite">SQLite</option><option value="postgresql">PostgreSQL</option>
+          <option value="sqlite">SQLite</option><option value="postgresql">PostgreSQL</option><option value="supabase">Supabase</option>
         </select>
       </label>
+      {backend === 'supabase' && <>
+        <label>Supabase URL<input id="feedback-storage-supabase-url" value={supabase.url} disabled={busy || !!migrating}
+          onChange={event => setSupabase(current => ({ ...current, url: event.target.value }))} /></label>
+        <label>{t('feedback.storage.schema')}<input id="feedback-storage-supabase-schema" value={supabase.schema} disabled={busy || !!migrating}
+          onChange={event => setSupabase(current => ({ ...current, schema: event.target.value }))} /></label>
+        <label>Server secret key<input id="feedback-storage-supabase-key" type="password" autoComplete="new-password" value={supabaseKey}
+          disabled={busy || !!migrating} onChange={event => setSupabaseKey(event.target.value)} placeholder={t('feedback.storage.keepToken')} /></label>
+      </>}
       {backend === 'postgresql' && <>
         <label>{t('feedback.storage.authentication')}
           <select id="feedback-storage-authentication" value={authentication} disabled={busy || !!migrating}
@@ -139,13 +154,15 @@ export function FeedbackStoragePanel(): React.JSX.Element | null {
     </div>
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
       <button id="feedback-storage-save" disabled={busy || !!migrating} onClick={() => {
-        const candidate = backend === 'sqlite' ? { backend } : { backend, postgres: {
+        const candidate = backend === 'sqlite' ? { backend } : backend === 'supabase' ? { backend, supabase: { ...supabase, keyRef: '' } } : { backend, postgres: {
           ...postgres, ...(authentication === 'bytepg' ? { user: postgres.user || undefined, bytepg: { computeId,
             ...(tokenSource === 'doas' ? { doas: { psm: doasPsm, environment: doasEnvironment } } : { tokenRef: '' }) } } : {}),
         } };
         void action('configure', { expectedGeneration: status.generation, candidate,
-          ...(authentication === 'password' && password ? { password } : {}),
-          ...(authentication === 'bytepg' && tokenSource === 'reference' && token ? { token } : {}), ...(ca ? { ca } : {}) });
+          ...(backend === 'supabase' && supabaseKey ? { supabaseKey } : {}),
+          ...(backend === 'postgresql' && authentication === 'password' && password ? { password } : {}),
+          ...(backend === 'postgresql' && authentication === 'bytepg' && tokenSource === 'reference' && token ? { token } : {}),
+          ...(backend === 'postgresql' && ca ? { ca } : {}) });
       }}>{t('feedback.storage.save')}</button>
       <button disabled={busy} onClick={() => void action('test')}>{t('feedback.storage.test')}</button>
     </div>

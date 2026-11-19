@@ -92,6 +92,9 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Durable replay identity. Runner adapters may forward this with turnId so
+   * late output from an older attempt cannot settle its successor. */
+  dispatchAttempt?: number;
   /** Owned, prompt-injected Codex input may carry a fresh correlation marker.
    * An exact post-write history match then proves ownership even when the OS
    * sandbox prevents reading the CLI's open rollout file descriptors. */
@@ -317,6 +320,11 @@ export interface CliAdapter {
      *  others ignore. Note the accepted set is per-CLI: `ultra` is codex/traex
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Codex App only: whether its runner may use the bare local
+     * `codex debug models` catalogue when a missing-thread resume falls back to
+     * a fresh thread/start. False for wrappers, Codex profiles and remote
+     * backends, whose actual provider the bare catalogue cannot attest. */
+    allowCodexReasoningCatalog?: boolean;
     /** Codex-only thread service tier. Missing inherits the executor's config. */
     codexProfile?: string;
     serviceTier?: CodexServiceTier;
@@ -987,6 +995,22 @@ export interface CliAdapter {
    *  read as this family's only. Undefined = only the legacy hook-review input
    *  hold, never a card. */
   readonly stuckPageFamily?: import('../../utils/stuck-detector.js').StuckPageFamily;
+
+  /** The CLI's own prediction of the user's next input, read from the
+   *  rendered input box of an idle screen (cells, so dim/inverse attributes
+   *  survive). Undefined = none on screen or not recognised; adapters without
+   *  it never offer a next-step suggestion. */
+  readonly promptSuggestion?: (rows: readonly import('../../utils/terminal-cells.js').ScreenRow[]) => string | undefined;
+
+  /** A one-off, tool-less, small-model call with this CLI's own credentials:
+   *  the optional「本轮回顾」model recap. The prompt is written to stdin;
+   *  stdout is the CLI's JSON result (`services/turn-recap.ts`
+   *  parseRecapModelOutput). Adapters without it never make that call. */
+  readonly recapModel?: {
+    args(systemPrompt: string): string[];
+    /** Added to the session's own CLI env for that call. */
+    readonly env: Readonly<Record<string, string>>;
+  };
 
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
