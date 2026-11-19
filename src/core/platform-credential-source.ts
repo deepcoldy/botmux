@@ -17,14 +17,18 @@ import {
   requestCredentialGrant,
   platformCredentialsUrl,
   describeCredentialGrantFailure,
+  BYTEDCLI_REGIONAL_GRANT_VARIABLES,
+  type BytedcliGrantRegion,
+  type CredentialGrant,
   type CredentialGrantResult,
   type CredentialGrantRequest,
 } from '../platform/credential-grant-client.js';
 import { resolveUnionIdFromOpenId } from '../im/lark/client.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { logger } from '../utils/logger.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
-import type { LarkCliIdentity, BytedCliIdentity } from './cli-identity.js';
+import type { LarkCliIdentity, BytedCliIdentity, BytedcliRegion } from './cli-identity.js';
 
 export type PlatformIdentityResolution =
   | { state: 'granted'; identity: LarkCliIdentity | BytedCliIdentity; expiresAt: number }
@@ -146,7 +150,7 @@ export function noteSenderUnionId(larkAppId: string, openId: unknown, unionId: u
 const unionIdLookups = new Map<string, Promise<string | null>>();
 export const UNION_ID_SHARE_MS = 5_000;
 
-async function unionIdFor(larkAppId: string, openId: string): Promise<string | null> {
+export async function platformUnionIdFor(larkAppId: string, openId: string): Promise<string | null> {
   const key = `${larkAppId}|${openId}`;
   const hit = unionIdCache.get(key);
   if (hit && deps.now() - hit.at < UNION_ID_TTL_MS) {
@@ -185,8 +189,20 @@ async function lookupUnionId(larkAppId: string, openId: string, key: string, gen
  *
  * Note `LARKSUITE_CLI_APP_ID` is the PLATFORM's Feishu app (the issuer of the
  * user token), deliberately not this bot's app id — the two differ by design.
+ *
+ * Regional ByteCloud JWTs come in the same grant as the default one — same
+ * request, same union_id — so they are this turn's sender's as much as it is.
+ * Each must claim the partition it is filed under, as the local mint requires,
+ * and not be expired already: one that fails either would only move the
+ * failure, so it is dropped and that partition's calls are refused like any
+ * other missing region.
  */
-function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>): LarkCliIdentity | BytedCliIdentity | null {
+function toIdentity(
+  tool: TriggerUserAuthTool,
+  grant: Pick<CredentialGrant, 'variables' | 'cloudJwtRegions'>,
+  now: number,
+): LarkCliIdentity | BytedCliIdentity | null {
+  const { variables } = grant;
   const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
   if (tool === 'lark-cli') {
     const appId = variables.LARKSUITE_CLI_APP_ID;
@@ -197,7 +213,28 @@ function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>
   const cloudJwt = variables.BYTEDCLI_USER_CLOUD_JWT;
   if (!nonEmpty(cloudJwt)) return null;
   const codeJwt = variables.BYTEDCLI_USER_CODE_JWT;
-  return { tool, cloudJwt, ...(nonEmpty(codeJwt) ? { codeJwt } : {}) };
+  const regionalCloudJwts: Partial<Record<BytedcliRegion, string>> = {};
+  let regionalIssued = false;
+  for (const [region, key] of Object.entries(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as Array<[BytedcliGrantRegion, string]>) {
+    const jwt = variables[key];
+    if (!nonEmpty(jwt)) continue;
+    regionalIssued = true;
+    const claims = jwtClaims(jwt);
+    if (claims?.region !== region) {
+      logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} does not claim partition ${region}; dropped`);
+    } else if (typeof claims.exp === 'number' && claims.exp * 1_000 <= now) {
+      logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} has already expired; dropped`);
+    } else {
+      regionalCloudJwts[region] = jwt;
+    }
+  }
+  return {
+    tool,
+    cloudJwt,
+    ...(nonEmpty(codeJwt) ? { codeJwt } : {}),
+    ...(Object.keys(regionalCloudJwts).length ? { regionalCloudJwts } : {}),
+    regionalCloudJwtSource: grant.cloudJwtRegions || regionalIssued ? 'platform' : 'platform-legacy',
+  };
 }
 
 /** The platform page a refused person should open (null when unbound). */
@@ -215,7 +252,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
 
   const unionId = args.unionId !== undefined
     ? (UNION_ID_RE.test(args.unionId) && !args.unionId.startsWith('ou_') ? args.unionId : null)
-    : await unionIdFor(args.botConfig.larkAppId, args.openId);
+    : await platformUnionIdFor(args.botConfig.larkAppId, args.openId);
   if (!unionId) {
     logger.warn(`[trigger-user-auth] platform grant skipped for ${args.tool}: could not resolve union_id for sender`);
     return { state: 'unavailable', detail: 'sender union_id unresolved' };
@@ -230,7 +267,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
   }, { binding });
 
   if (result.ok) {
-    const identity = toIdentity(args.tool, result.value.variables);
+    const identity = toIdentity(args.tool, result.value, deps.now());
     if (!identity) {
       logger.warn(`[trigger-user-auth] platform ${args.tool} grant malformed: required variable missing`);
       return { state: 'unavailable', detail: 'malformed grant' };
@@ -281,6 +318,4 @@ export function platformRefusalReason(resolution: Exclude<PlatformIdentityResolu
   }
 }
 
-export function reasonTag(reason: string): string {
-  return `[reason=${reason}]`;
-}
+export { reasonTag } from './refusal-reasons.js';

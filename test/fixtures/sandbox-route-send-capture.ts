@@ -10,6 +10,7 @@ import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
     data = { code: 0, tenant_access_token: 'fake-token', expire: 7200 };
   } else if (/\/im\/v1\/messages(\?|$)/.test(url) && config.method?.toLowerCase() === 'post') {
     console.log('CAPTURE_SEND=' + JSON.stringify({ receiveId: body?.receive_id }));
+    console.log('CAPTURE_CONTENT=' + JSON.stringify(body?.content));
     data = { code: 0, data: { message_id: 'om_fake_sent' } };
   } else if (/\/im\/v1\/messages\/[^/]+\/reply/.test(url)) {
     console.log('CAPTURE_REPLY=' + JSON.stringify({ url: url.replace(/^.*\/messages\//, '') }));

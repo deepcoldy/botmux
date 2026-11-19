@@ -1,3 +1,45 @@
+/* Token usage: reuse the dashboard panels and color tokens in every skin. */
+.page.usage-page { display: flex; flex-direction: column; gap: 18px; }
+.usage-page .sect-header { margin-bottom: 0; }
+.usage-page .sect-header p, .usage-hint { color: var(--muted); font-size: 12px; line-height: 1.6; margin: 8px 0 0; }
+.usage-page .panel { padding: 20px; min-width: 0; }
+.usage-page h2 { font-size: 15px; margin: 0 0 16px; }
+.usage-filter-fields { display: flex; align-items: end; flex-wrap: wrap; gap: 12px; }
+.usage-filter-fields label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); }
+.usage-filter-fields input, .usage-filter-fields select { min-width: 150px; max-width: 260px; min-height: 36px; }
+.usage-presets { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.usage-metrics { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; }
+.usage-insight-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.usage-insights .metric-card small { line-height: 1.5; }
+.usage-page .metric-card { min-width: 0; padding: 18px; }
+.usage-page .metric-card strong { font-size: 25px; overflow-wrap: anywhere; }
+.usage-notice { background: var(--surface); color: var(--muted); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; margin: 0; }
+.usage-legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+.usage-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.usage-legend i { width: 8px; height: 8px; border-radius: 2px; }
+.usage-color-inputTokens { background: #3b82f6; }
+.usage-color-outputTokens { background: #8b5cf6; }
+.usage-color-cacheReadTokens { background: #10b981; }
+.usage-color-cacheCreateTokens { background: #f59e0b; }
+.usage-chart-scroll { overflow-x: auto; }
+.usage-chart { display: flex; gap: 4px; }
+.usage-chart-day { flex: 1; min-width: 20px; padding-top: 8px; }
+.usage-chart-day:hover, .usage-chart-day:focus-visible { background: var(--surface); outline: 1px solid var(--border); border-radius: 4px; }
+.usage-chart-stack { height: 180px; display: flex; flex-direction: column-reverse; justify-content: flex-start; border-bottom: 1px solid var(--border); }
+.usage-chart-stack i { flex-shrink: 0; display: block; width: 100%; max-width: 36px; margin: 0 auto; }
+.usage-chart-day small { display: block; height: 24px; text-align: center; color: var(--muted); font-size: 10px; margin-top: 8px; }
+.usage-breakdowns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.usage-table-scroll { overflow-x: auto; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.usage-table th, .usage-table td { padding: 12px 8px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+.usage-table th:first-child { text-align: left; white-space: normal; min-width: 140px; max-width: 360px; overflow-wrap: anywhere; }
+.usage-table thead th { font-weight: 500; color: var(--muted); }
+.usage-table tbody th { font-weight: 500; }
+.usage-table tr:last-child td, .usage-table tr:last-child th { border-bottom: 0; }
+.usage-empty { color: var(--muted); text-align: center; padding: 28px 12px; font-size: 13px; }
+@media (max-width: 1100px) { .usage-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); } .usage-insight-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-breakdowns { grid-template-columns: 1fr; } }
+@media (max-width: 600px) { .usage-metrics, .usage-insight-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } .usage-page .panel { padding: 14px; } .usage-filter-fields label { flex: 1; min-width: 140px; } .usage-filter-fields input, .usage-filter-fields select { width: 100%; min-width: 0; } }
+
 /* Base tokens — the default look (incl. the "数字员工工作台" redesign from
    PR #123) is layered later in this file. Skins override these per [data-skin]. */
 :root {
@@ -355,20 +397,25 @@ main:has(.sessions-page) {
   overflow: hidden;
 }
 
+/* 宽屏整页纵向 flex：视图舞台伸缩占满剩余高度，其余子元素（含文档评论失败块、已关闭
+   会话分页提示、批量操作栏等可选块）按真实高度排。别改回按位置枚举的
+   grid-template-rows：多渲染一个可选块，给舞台的 1fr 行就落到它头上、塌成 0 高，
+   内容压到看板列头 / 表头下面；也别改成全 auto 行：列表短时剩余高度会平摊给标题、
+   筛选栏，把它们拉高。 */
 main:has(.sessions-page) .sessions-page {
+  display: flex;
+  flex-direction: column;
   height: 100%;
   min-height: 0;
-  /* rows: 标题 / 运行时统计 / 筛选栏 / 批量操作栏 / 视图舞台(占满剩余) */
-  grid-template-rows: auto auto auto auto minmax(0, 1fr);
   overflow: hidden;
 }
 
-main:has(.sessions-page) .sessions-page:not(:has(#bulk-bar:not([hidden]))) {
-  /* 批量操作栏隐藏(display:none 退出 grid)时少一行 */
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+main:has(.sessions-page) .sessions-page > * {
+  flex: none;
 }
 
 main:has(.sessions-page) .sessions-view-stage {
+  flex: 1 1 0;
   min-height: 0;
   overflow: hidden;
 }
@@ -641,7 +688,8 @@ main:has(.groups-page) .groups-matrix-section > #g-loading {
   padding: 14px 15px;
 }
 
-.metric-card span {
+/* Help triggers and marks keep their own centered icon styles. */
+.metric-card span:not(:where(.ui-info-tip, .ui-info-mark)) {
   display: block;
   color: var(--muted);
   font-size: 12px;
@@ -685,7 +733,7 @@ main:has(.groups-page) .groups-matrix-section > #g-loading {
   min-width: 0;
 }
 
-.metric-card .metric-label-with-help > span {
+.metric-card .metric-label-with-help > span:not(.ui-info-tip) {
   display: inline;
 }
 
@@ -2651,13 +2699,15 @@ button.primary {
 }
 
 /* 休眠会话不上看板时的一行提示，放在看板下方。 */
-.sessions-dormant-hint {
+.sessions-dormant-hint,
+.sessions-history-pagination {
   margin: 10px 2px 0;
   color: var(--muted);
   font-size: 12px;
 }
 
-.sessions-dormant-hint button {
+.sessions-dormant-hint button,
+.sessions-history-pagination button {
   margin-left: 6px;
   padding: 0;
   border: 0;
@@ -2667,8 +2717,14 @@ button.primary {
   cursor: pointer;
 }
 
-.sessions-dormant-hint button:hover {
+.sessions-dormant-hint button:hover,
+.sessions-history-pagination button:hover:not(:disabled) {
   text-decoration: underline;
+}
+
+.sessions-history-pagination button:disabled {
+  color: var(--muted);
+  cursor: default;
 }
 
 .kanban-card {
@@ -5923,12 +5979,22 @@ dialog.onboarding-dialog::backdrop {
   line-height: 1.4;
 }
 
-#g-drawer .g-card-section-config {
+#g-drawer .g-card-section-config,
+#g-drawer .g-card-completed-display {
   display: grid;
   gap: 6px;
+  min-width: 0;
   color: var(--muted);
   font-size: var(--fs-12);
   font-weight: var(--fw-s);
+}
+
+#g-drawer .g-card-completed-display select {
+  width: 100%;
+  min-height: var(--button-height);
+  margin: 0;
+  border-color: var(--border-strong);
+  background: var(--surface);
 }
 
 #g-drawer .g-card-section-grid {
@@ -26566,15 +26632,13 @@ button.ui-refresh-button.is-loading .ui-action-icon {
     -webkit-overflow-scrolling: touch;
   }
 
+  /* 窄屏整页随 main 滚动、高度交还内容：退回 .page 的普通 grid（全是 auto 行），
+     宽屏那套「舞台占满剩余」的 flex 在这里不适用。 */
   main:has(.sessions-page) .sessions-page {
+    display: grid;
     height: auto;
     min-height: 100%;
-    grid-template-rows: none;
     overflow: visible;
-  }
-
-  main:has(.sessions-page) .sessions-page:not(:has(#bulk-bar:not([hidden]))) {
-    grid-template-rows: none;
   }
 
   main:has(.sessions-page) .sessions-heading-main,
@@ -35825,3 +35889,16 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .bd-oncall-preset > strong { font-size: 12px; font-weight: 600; }
 .bd-oncall-preset .bd-oncall-grid { margin-top: 12px; gap: 12px; }
 .bd-oncall-preset > .bd-section-note { display: block; margin-top: 12px; }
+
+.bd-command-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-md, 8px); background: var(--surface); }
+.bd-command-tags:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft, transparent); }
+.bd-command-tag { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 8px; border-radius: 6px; background: var(--accent-soft, var(--bg)); border: 1px solid var(--border); }
+.bd-command-tag code { padding: 0; background: transparent; overflow-wrap: anywhere; }
+.bd-command-tag button { margin: 0; padding: 0 2px; min-height: 24px; border: 0; box-shadow: none; background: transparent; color: var(--muted); line-height: 1; }
+.bd-command-tags input { flex: 1 1 140px; min-width: 0; width: auto; margin: 0; padding: 6px; border: 0; box-shadow: none; background: transparent; }
+.bd-command-tags input:focus { border: 0; box-shadow: none; }
+.bd-command-tags.is-disabled { opacity: .65; }
+.bd-command-error { color: var(--danger); }
+
+#sessions-table .session-support-reason { font-size: 11px; opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#sessions-table .sessions-table-text-cell small { display: block; opacity: .75; }

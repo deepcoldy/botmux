@@ -6,7 +6,13 @@ export function groupModelSettings(value: string | GroupModelSettings | undefine
 }
 
 /** New-topic defaults, keyed by CLI so model names never cross providers. */
-export type GroupDefaultModels = Partial<Record<'codex' | 'claude-code', string | GroupModelSettings>>;
+export type GroupModelCliId = 'codex' | 'claude-code' | 'antigravity';
+export type GroupDefaultModels = Partial<Record<GroupModelCliId, string | GroupModelSettings>>;
+
+/** CLIs supported by the persisted group-default contract and launch resolver. */
+export function isGroupModelCliId(cliId: string | undefined): cliId is GroupModelCliId {
+  return cliId === 'codex' || cliId === 'claude-code' || cliId === 'antigravity';
+}
 
 export function parseGroupDefaultModels(raw: unknown): GroupDefaultModels {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -14,7 +20,7 @@ export function parseGroupDefaultModels(raw: unknown): GroupDefaultModels {
   }
   const models: GroupDefaultModels = {};
   for (const [cli, value] of Object.entries(raw)) {
-    if (cli !== 'codex' && cli !== 'claude-code') throw new Error('unsupported_model_cli');
+    if (!isGroupModelCliId(cli)) throw new Error('unsupported_model_cli');
     const settings = typeof value === 'string' ? { model: value } : value;
     if (!settings || typeof settings !== 'object' || Array.isArray(settings)
         || Object.keys(settings).some(key => key !== 'model' && key !== 'reasoningEffort')) throw new Error('invalid_model');

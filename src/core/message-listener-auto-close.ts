@@ -1,15 +1,31 @@
 /** Successful listener completion may reclaim its session after an idle boundary. */
 import type { DaemonSession } from './types.js';
+import type { WorkerToDaemon } from '../types.js';
 import { waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { waitAllWithin } from './producer-quiescence.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+
+/** Prefer the submitted input identity; opening turns need not have a presentation marker. */
+function isCurrentMessageListenerTurn(ds: DaemonSession, turnId: string): boolean {
+  return (ds.lastCliInputTurnId ?? ds.currentTurnId) === turnId;
+}
+
+/** Record exact listener terminal evidence and report whether cleanup should be reconsidered. */
+export function recordMessageListenerTurnTerminal(
+  ds: DaemonSession,
+  terminal: Pick<Extract<WorkerToDaemon, { type: 'turn_terminal' }>, 'turnId' | 'status'>,
+): boolean {
+  if (!ds.session.messageListenerAutoClose || !isCurrentMessageListenerTurn(ds, terminal.turnId)) return false;
+  ds.messageListenerCompletedTurnId = terminal.status === 'completed' ? terminal.turnId : undefined;
+  return true;
+}
 
 /** Check exact completion and queued work under the caller's bot mutation gate. */
 export function canAutoCloseMessageListenerSession(ds: DaemonSession, turnId: string): boolean {
   return ds.session.messageListenerAutoClose === true
     && ds.session.status === 'active'
     && ds.messageListenerCompletedTurnId === turnId
-    && ds.currentTurnId === turnId
+    && isCurrentMessageListenerTurn(ds, turnId)
     && (!ds.currentReplyTarget || ds.currentReplyTarget.turnId === turnId)
     && ds.lastScreenStatus === 'idle'
     && !ds.activeInteractiveTurn

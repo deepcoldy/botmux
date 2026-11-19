@@ -1040,3 +1040,41 @@ describe('RemoteRunnerBackend', () => {
     expect(finals).toEqual([]);
   });
 });
+
+describe('reference provider delegated adopt/detach contract', () => {
+  it('lists, binds, unbinds and resumes providerState without protocol cancel/detach', async () => {
+    const backend = createBackend();
+    const states: RemoteRunnerBackendState[] = [];
+    backend.onBackendState(state => states.push(structuredClone(state)));
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend);
+    await ready;
+    const caller = { requestUserOpenId: 'ou_operator', requestLarkAppId: 'cli_remote', senderType: 'user' as const };
+    async function turn(target: RemoteRunnerBackend, turnId: string, content: string) {
+      const final = once<string>(cb => target.onTurnFinal(text => cb(text)));
+      expect(await target.submitTurn({ turnId, content, trustedCaller: caller })).toEqual({ submitted: true });
+      return await final;
+    }
+    expect(await turn(backend, 'list', '/adopt')).toContain('/adopt reference-thread:alpha');
+    expect(states.at(-1)?.agentThreadId).toBeUndefined();
+    expect(states.at(-1)?.providerState?.adoptCandidates).toEqual(['reference-thread:alpha', 'reference-thread:beta']);
+    await turn(backend, 'bind-alpha', '/ADOPT  reference-thread:alpha');
+    expect(states.at(-1)?.agentThreadId).toBe('reference-thread:alpha');
+    const bound = structuredClone(states.at(-1)!);
+    backend.kill();
+
+    const restored = createBackend(bound);
+    restored.onBackendState(state => states.push(structuredClone(state)));
+    const resumed = once<void>(cb => restored.onReady(cb));
+    spawnBackend(restored);
+    await resumed;
+    expect(states.at(-1)).toEqual(bound);
+    expect(await turn(restored, 'unbind', '/DISCONNECT')).toContain('source agent preserved');
+    expect(states.at(-1)).not.toHaveProperty('agentThreadId');
+    expect(states.at(-1)?.remoteSessionId).toBe(bound.remoteSessionId);
+    expect(states.at(-1)?.generation).toBe(bound.generation);
+    expect(await turn(restored, 'unbind-again', '/detach')).toContain('No agent session is bound');
+    await turn(restored, 'bind-beta', '/adopt reference-thread:beta');
+    expect(states.at(-1)?.agentThreadId).toBe('reference-thread:beta');
+  });
+});

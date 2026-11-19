@@ -16,6 +16,7 @@ import {
   waitForCardStatus,
   waitForModelTextReply,
   showStreamingOutput,
+  reopenTopic,
   openChat,
 } from './helpers.js';
 import { openFeishuSession, releaseFeishuSession } from './feishu-session.js';
@@ -52,7 +53,7 @@ export function registerMidsceneSuites(): void {
       });
 
       // Show output so the test covers the current display toggle labels.
-      await showStreamingOutput(agent, page);
+      await showStreamingOutput(agent, page, { reopen: reopenTopic(agent, page, msg) });
 
       // Scroll down in thread panel to reveal card buttons below expanded content
       await agent.aiAct('滚动当前话题详情面板到底部，显示流式卡片下方的操作按钮');

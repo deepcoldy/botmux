@@ -64,6 +64,20 @@ Codex 的原生 `codex-code-mode-host` 会跨轮复用，属于引擎的工具�
 
 受管工具入口不直接读取该文档接口，而是调用同族窄路由 `POST /api/current-execution-identity`（请求体 `{sessionId, tool}`）：同样的 loopback 血缘证明通过后，daemon 直接返回该执行身份轮次的 env assignment **正文**（schema `botmux.current-execution-identity.v1`，字段 `identityTurnId` 与 `env`），wrapper `eval` 正文后 exec 真实工具；证明失败返回 `current_execution_unverified`，血缘成立但该轮身份材料不存在（未准备/已终态回收/daemon 重启）返回 404 `identity_material_unavailable`，二者都对应 wrapper 退出码 77。会话不在 proven 模型（网络隔离沙盒、adopt/remote/app-server/workflow/非 Linux）时该路由 403，这些路径使用单快照文件 wrapper。CLI 校验响应的完整形状与 bot/session；不输出 capability 或真人身份。`capabilities --json` 的 `current_execution_v1` 只声明本地构建能力，不能证明连接的 daemon 已升级或当前调用可验证。
 
+每个拒绝都带 `reason`，指出失败的是哪一步（`error` 字段保持原值，旧 runner 只看状态码，不受影响）：
+
+| reason | 状态码 | 含义 |
+|---|---|---|
+| `invalid_request` | 400 | 请求体不合法 |
+| `peer_unresolved` | 403 | daemon 无法从 loopback 连接解析出调用进程 |
+| `lineage_unproven` | 403 | 调用进程不属于会话当前执行轮次（未通过证明时只给这一档，不透露会话状态） |
+| `identity_decision_missing` | 403 | 血缘已证明，但 daemon 没收到当前 worker 的身份模型上报 |
+| `identity_decision_conflict` | 403 | worker 上报与会话结构冲突，暂停发布 |
+| `identity_model_single` | 403 | worker 上报 single，与 proven wrapper 不一致 |
+| `identity_material_unavailable` | 404 | 血缘已证明，该轮身份材料不存在 |
+
+wrapper runner 另外区分本地判定的 `daemon_unreachable` / `daemon_timeout` / `response_mismatch` / `invalid_invocation`，旧 daemon 不带 reason 时记为 `unspecified`。拒绝时 stderr 第一行固定为 `botmux: <error> [reason=<reason>]`，随后两行是原因与下一步，退出码仍为 77；不输出凭据、JWT 或环境变量。daemon 侧同一会话、同一 reason 每分钟记一条 `[trigger-user-auth] refused …` WARN。
+
 这是即时观察，不能缓存为授权令牌，也不证明输入已提交、业务已完成或真人已批准。消费者仍需关联自己的原请求和当前修订，在每个受保护操作前重新观察，并独立验证权限、输入依据及结果回执。接口不派发、续租、消费事件或修改会话。机器触发可在没有真人 actor 时凭当前执行证明和有效工具委托申请目标用户授权，委托范围与该用户的实际授权仍须满足工具要求。
 
 持久pane与普通PTY使用同一宿主计算的 `BOTMUX_SESSION_SCOPE`。tmux、tmux-pipe、Zellij与Zmx的共享启动包装器在加载shell配置后清掉继承值，再传入当前会话的thread/chat；未提供scope时保持缺省，bots.json的env不能覆盖。该变量仅用于会话路由，不充当当前执行证明；旧已启动pane需在后续受控重建时才能获得此修复。

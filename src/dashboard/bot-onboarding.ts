@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, rmSync, unlinkSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { readBotsJsonOrEmpty, writeBotsJsonAtomic } from '../setup/bots-store.js';
+import { readBotsJsonOrEmpty, writeBotsJsonAtomic, mutateBotsJsonAtomic } from '../setup/bots-store.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { cloneBotConfig, normalizeBotConfig, findInvalidAllowedUserEntries, hasOwnerEntry } from '../setup/bot-config-editor.js';
@@ -35,6 +35,9 @@ import {
 import type { CliId } from '../adapters/cli/types.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
 import { validateCliLaunchModeConfig } from '../core/cli-launch-mode.js';
+import { buildLocalBotRecord, reallocateLocalBotId } from '../setup/local-bot.js';
+import { checkCliAvailability } from '../setup/cli-availability.js';
+import { invalidWorkingDirs } from '../utils/working-dir.js';
 
 // Static default-imports of qrcode-terminal's vendored QRCode class (its public
 // API only prints to a terminal; we need the low-level class to render a QR into
@@ -106,7 +109,7 @@ export interface BotOnboardingSnapshot {
   permissionStatusMsg?: string;
   appId?: string;
   appName?: string;
-  registrationMode?: 'web' | 'compat';
+  registrationMode?: 'web' | 'compat' | 'local';
   /** Existing onboarding job whose exact App permission setup is being resumed. */
   recoveryOfJobId?: string;
   /** Monotonic permission-recovery attempt within the same immutable target lineage. */
@@ -159,8 +162,8 @@ export interface BotOnboardingInput {
   /** 飞书应用名称；普通创建留空生成 botmux-N，克隆留空生成 源名称-copy-时间戳。 */
   appName?: string;
   cloneSourceAppId?: string;
-  /** 默认 Feishu 单码主路径；compat 是用户明确确认过的 SDK 兼容模式。 */
-  registrationMode?: 'web' | 'compat';
+  /** 默认 Feishu 单码主路径；compat 是 SDK 兼容模式；local 不创建飞书应用。 */
+  registrationMode?: 'web' | 'compat' | 'local';
   /**
    * reuse: 使用表单已展示并确认的身份，缓存失效时不静默弹码；
    * qr: 用户明确选择首次登录/更换账号，强制生成新二维码。
@@ -1649,13 +1652,102 @@ export class BotOnboardingManager {
     this.patch(id, { platformQrScanConfirmedAt: confirmedAt });
   }
 
+  /** Persist a local bot. Does not call Feishu, scan a QR, or create an app. */
+  private async runLocal(id: string, input: BotOnboardingInput): Promise<void> {
+    this.patch(id, { registrationMode: 'local' });
+    if (input.cloneSourceAppId) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'local_clone_unsupported',
+        message: '克隆会新建飞书应用。本地模式只创建不关联飞书的机器人。',
+      });
+      return;
+    }
+    const workingDir = input.workingDir?.trim() || '~';
+    const bad = invalidWorkingDirs({ workingDir });
+    if (bad.length > 0) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_working_dir',
+        message: `目录不存在或不是目录: ${bad.join(', ')}`,
+      });
+      return;
+    }
+    const displayName = input.appName?.trim();
+    const cliId: CliId = input.cliId ?? 'claude-code';
+    const record = buildLocalBotRecord({
+      displayName,
+      cliId,
+      wrapperCli: input.wrapperCli,
+      cliLaunchMode: input.cliLaunchMode,
+      ...(input.dirMode === 'fixed' ? { defaultWorkingDir: workingDir } : { workingDir }),
+      model: input.model,
+      existingIds: readBotsJsonOrEmpty(this.opts.botsJsonPath)
+        .map((bot: { larkAppId?: string }) => bot?.larkAppId)
+        .filter((appId: string | undefined): appId is string => typeof appId === 'string' && appId.length > 0),
+    });
+    try {
+      validateCliLaunchModeConfig({
+        cliId: record.cliId,
+        cliLaunchMode: record.cliLaunchMode,
+        wrapperCli: record.wrapperCli,
+        cliRuntime: record.cliRuntime,
+        cliPathOverride: record.cliPathOverride,
+      }, 'Dashboard local bot');
+    } catch (error) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'invalid_launch_mode_config',
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
+    const availability = checkCliAvailability({
+      cliId: record.cliId,
+      cliPathOverride: record.cliPathOverride,
+      wrapperCli: record.wrapperCli,
+      cliLaunchMode: record.cliLaunchMode,
+    });
+    if (!availability.available) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'cli_not_found',
+        message: `所选 Agent 当前无法启动：${availability.reason ?? '本地启动依赖不可用'}。未写入配置。`,
+      });
+      return;
+    }
+    const persisted = await this.persistNewLocalBot(record);
+    await this.runLiveStart(id, String(persisted.bot.larkAppId));
+    this.patch(id, {
+      status: 'completed',
+      appId: String(persisted.bot.larkAppId),
+      appName: displayName || String(persisted.bot.larkAppId),
+      cliId,
+      workingDir,
+      addedBotIndex: persisted.index,
+      message: 'larkAppId 是稳定的本地身份，不是飞书 App ID。',
+    });
+  }
+
   private async run(id: string, input: BotOnboardingInput = {}): Promise<void> {
+    if (input.registrationMode === 'local') {
+      await this.runLocal(id, input);
+      return;
+    }
     const configuredBots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
     const cloneSource = input.cloneSourceAppId
       ? configuredBots.find((bot: any) => bot?.larkAppId === input.cloneSourceAppId)
       : undefined;
     if (input.cloneSourceAppId && !cloneSource) {
       this.patch(id, { status: 'failed', error: 'clone_source_not_found', message: '源机器人不存在' });
+      return;
+    }
+    if (cloneSource?.localIdentity === true) {
+      this.patch(id, {
+        status: 'failed',
+        error: 'local_clone_unsupported',
+        message: '本地机器人不支持克隆；未创建飞书应用。',
+      });
       return;
     }
     // Freeze the resolved name before any asynchronous work. Later bot list
@@ -1866,6 +1958,44 @@ export class BotOnboardingManager {
         if (info.status === 'domain_switched') this.patch(id, { message: 'domain_switched' });
       },
     });
+  }
+
+  /** Create-only local append: allocate against the locked generation, never upsert. */
+  private async persistNewLocalBot<T extends {
+    larkAppId?: string;
+    displayName?: string;
+    name?: string;
+  }>(record: T): Promise<{ bot: T & { larkAppId: string }; index: number }> {
+    let allocated: (T & { larkAppId: string }) | undefined;
+    try {
+      return await this.runBotsMutation(() => mutateBotsJsonAtomic(this.opts.botsJsonPath, bots => {
+        allocated = normalizeBotConfig(reallocateLocalBotId(
+          record,
+          bots.map((bot: any) => String(bot?.larkAppId ?? '')).filter(Boolean),
+        ));
+        const index = bots.length;
+        return {
+          bots: [...bots, allocated],
+          result: { bot: allocated, index },
+        };
+      }));
+    } catch (error) {
+      // The file rename may already have succeeded when a coordinator's
+      // post-write commit fails. Reconcile that exact record instead of letting
+      // a no-appId failure trigger a second create/append on local retry.
+      if (!allocated) throw error;
+      const expected = allocated as Record<string, any>;
+      const bots = readBotsJsonOrEmpty(this.opts.botsJsonPath);
+      const index = bots.findIndex((bot: any) => (
+        bot?.larkAppId === expected.larkAppId
+        && bot?.localIdentity === true
+        && bot?.cliId === expected.cliId
+        && bot?.displayName === expected.displayName
+        && bot?.name === expected.name
+      ));
+      if (index < 0) throw error;
+      return { bot: bots[index], index };
+    }
   }
 
   /** 把 bot append/更新进 bots.json（按 larkAppId upsert, 幂等），返回它的行号。 */

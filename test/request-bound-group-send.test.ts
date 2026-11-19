@@ -21,14 +21,11 @@ import {
   parseGroupSendBody,
   readRequestBoundGroupMessage,
   sendRequestBoundGroupMessage,
+  sendRequestBoundMessage,
+  __setGroupSendLimitsForTest,
   type GroupSendCommitted,
   type GroupSendRecord,
 } from '../src/services/request-bound-group-send.js';
-
-// Tests 3 and 5 fsync a 2000-record live file thousands of times and can
-// outlast the 30s unit default on a busy runner. bun test ignores this and
-// uses its CLI timeout (180s).
-vi.setConfig({ testTimeout: 120_000 });
 
 const APP = 'cli_group_send';
 const CHAT = 'oc_group_send';
@@ -41,7 +38,10 @@ beforeEach(() => {
   storePath = join(dir, 'group-sends.json');
   clock = 1_700_000_000_000;
 });
-afterEach(() => rmSync(dir, { recursive: true, force: true }));
+afterEach(() => {
+  __setGroupSendLimitsForTest(null);
+  rmSync(dir, { recursive: true, force: true });
+});
 
 const deps = (send: (c: string, t: string, u: string) => Promise<string>, extra: { onCommitted?: (payload: GroupSendCommitted) => void } = {}) =>
   ({ larkAppId: APP, storePath, send, now: () => clock, ...extra });
@@ -76,7 +76,7 @@ describe('sendRequestBoundGroupMessage', () => {
     const send = vi.fn(async () => 'om_1');
     const first = await sendRequestBoundGroupMessage(deps(send), input());
     expect(first).toEqual({ ok: true, status: 200, messageId: 'om_1', requestId: 'req_000001', chatId: CHAT, replayed: false });
-    expect(send).toHaveBeenCalledWith(CHAT, 'mosa-checkin abc123', groupSendUuid(APP, CHAT, 'req_000001'));
+    expect(send).toHaveBeenCalledWith(CHAT, 'mosa-checkin abc123', groupSendUuid(APP, CHAT, 'req_000001'), expect.any(Function));
     expect(groupSendUuid(APP, CHAT, 'req_000001').length).toBeLessThanOrEqual(50);
     const again = await sendRequestBoundGroupMessage(deps(send), input());
     expect(again).toMatchObject({ ok: true, messageId: 'om_1', replayed: true });
@@ -140,10 +140,89 @@ describe('sendRequestBoundGroupMessage', () => {
     expect(longId.length).toBeGreaterThan(CHAT.length);
     const send = vi.fn(async () => 'om_long');
     expect(await sendRequestBoundGroupMessage(deps(send), { ...input(), chatId: longId })).toMatchObject({ ok: true, chatId: longId, messageId: 'om_long' });
-    expect(send).toHaveBeenCalledWith(longId, input().content, groupSendUuid(APP, longId, 'req_000001'));
+    expect(send).toHaveBeenCalledWith(longId, input().content, groupSendUuid(APP, longId, 'req_000001'), expect.any(Function));
     for (const chatId of ['ou_not_a_chat', '../../etc/x', 'oc_', 'chat']) {
       expect(await sendRequestBoundGroupMessage(deps(vi.fn(async () => 'om')), { ...input(), chatId })).toEqual({ ok: false, status: 400, error: 'invalid_request' });
     }
+  });
+
+  it('frees a definitively rejected first attempt but preserves a prior ambiguous attempt', async () => {
+    __setGroupSendLimitsForTest({ record: 2, compactBatch: 1, archive: 2 });
+    const rejection = larkApiError('send message', { code: 230002 });
+    const provider = vi.fn().mockRejectedValue(rejection);
+    const depsWithWriteFence = {
+      larkAppId: APP, storePath, now: () => clock,
+      send: (_chat: string, _text: string, _uuid: string, beforeWrite: () => void) => {
+        beforeWrite();
+        return provider();
+      },
+    };
+    for (let i = 0; i < 4; i++) {
+      expect(await sendRequestBoundGroupMessage(depsWithWriteFence, input(`rejected_${i}`)))
+        .toMatchObject({ error: 'send_failed', retryable: false });
+    }
+    provider.mockRejectedValueOnce(new Error('connection reset'));
+    await sendRequestBoundGroupMessage(depsWithWriteFence, input());
+    expect(await sendRequestBoundGroupMessage(depsWithWriteFence, input())).toMatchObject({ error: 'outcome_unknown', retryable: false });
+    clock += GROUP_SEND_UUID_REUSE_MS + 1;
+    expect(await sendRequestBoundGroupMessage(depsWithWriteFence, input())).toMatchObject({ error: 'outcome_unknown', retryable: false });
+    expect(provider).toHaveBeenCalledTimes(6);
+  });
+
+  it.each([{ chatId: CHAT }, { chatId: CHAT, rootMessageId: 'om_root' }, { userOpenId: 'ou_user' }])(
+    'retains the original rejection and digest across compaction for %o', async target => {
+      __setGroupSendLimitsForTest({ record: 2, compactBatch: 1, archive: 1 });
+      const send = vi.fn().mockRejectedValueOnce(larkApiError('send message', { code: 230025 })).mockResolvedValue('om_sent');
+      const submit = (id: string, text: string) => sendRequestBoundMessage({
+        larkAppId: APP, storePath, now: () => clock, send,
+      }, target, id, text);
+      const rejected = await submit('rejected_id', 'original');
+      expect(rejected).toMatchObject({ error: 'send_failed', retryable: false, providerCode: 230025 });
+      clock += GROUP_SEND_UUID_REUSE_MS + 1;
+      for (const id of ['filler_01', 'filler_02']) {
+        expect((await submit(id, 'filler')).ok).toBe(true);
+        expect(await submit('rejected_id', 'original')).toEqual(rejected);
+        expect(await submit('rejected_id', 'changed')).toMatchObject({ status: 409, error: 'request_conflict' });
+      }
+      expect(send).toHaveBeenCalledTimes(3);
+      clock++;
+      await submit('filler_03', 'filler');
+      expect(await submit('rejected_id', 'changed')).toMatchObject({ ok: true, replayed: false });
+    },
+  );
+
+  it('reports a pending retry as expired when its destination check throws after the window', async () => {
+    const send = vi.fn().mockRejectedValueOnce(new Error('lost receipt'));
+    await sendRequestBoundGroupMessage(deps(send), input());
+    clock += GROUP_SEND_UUID_REUSE_MS - 1;
+    const result = await sendRequestBoundGroupMessage({
+      ...deps(send), beforeAttempt: async () => { clock += 2; throw new Error('lookup failed'); },
+    }, input());
+    expect(result).toMatchObject({ error: 'outcome_unknown', retryable: false });
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it.each(['lost', 'empty', 'accepted'])('settles a late %s provider response using the current time', async outcome => {
+    const send = vi.fn(async () => {
+      clock += GROUP_SEND_UUID_REUSE_MS + 1;
+      if (outcome === 'lost') throw new Error('lost receipt');
+      return outcome === 'empty' ? '' : 'om_accepted';
+    });
+    const result = await sendRequestBoundGroupMessage(deps(send), input());
+    const expected = outcome === 'accepted' ? { ok: true, messageId: 'om_accepted' } : { error: 'outcome_unknown', retryable: false };
+    expect(result).toMatchObject(expected);
+    expect(await sendRequestBoundGroupMessage(deps(send), input())).toMatchObject(expected);
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it('leaves an expired, digest-bound v1 row for a downgraded group daemon', async () => {
+    const send = vi.fn().mockRejectedValueOnce(larkApiError('send message', { code: 230025 }));
+    const request = input('legacy_id', 'body');
+    await sendRequestBoundGroupMessage(deps(send), request);
+    const row = JSON.parse(readFileSync(storePath, 'utf8')).records[`${CHAT}\0${request.requestId}`];
+    expect(row).toMatchObject({ state: 'pending', contentDigest: contentDigest('body') });
+    expect(clock - row.firstAttemptAt).toBeGreaterThan(GROUP_SEND_UUID_REUSE_MS);
+    expect(row.messageId).toBeUndefined();
   });
 
   it('marks definite provider rejections as not retryable', async () => {
@@ -267,6 +346,11 @@ describe('sent archive', () => {
   };
   const readRecords = (path: string) => JSON.parse(readFileSync(path, 'utf8')).records as Record<string, GroupSendRecord>;
 
+  // Crossing the live cap through real sends rewrites the whole live file on
+  // every send, which is quadratic at the production cap. Tests that cross it
+  // that way run at a fiftieth of the production limits, same ratios.
+  const SMALL = { record: 40, compactBatch: 4, archive: 400 };
+
   function fillSent(count: number, idPrefix: string, sentAtStart: number, content = 'x'): Record<string, GroupSendRecord> {
     const records: Record<string, GroupSendRecord> = {};
     for (let i = 0; i < count; i++) {
@@ -338,21 +422,32 @@ describe('sent archive', () => {
     expect(committed).toEqual([]);
   });
 
-  it('still sends the 2002nd new requestId after 2001 unseeded successes', async () => {
+  it('still sends new requestIds past the live cap after only unseeded successes', async () => {
+    __setGroupSendLimitsForTest(SMALL);
+    // A full archive of older sends: what the sends below write must outrank it.
+    writeArchive(fillSent(SMALL.archive, 'a', 1, 'old'));
     let n = 0;
     const send = vi.fn(async () => {
       n += 1;
       return `om_${String(n).padStart(8, '0')}`;
     });
-    for (let i = 0; i < GROUP_SEND_RECORD_LIMIT + 1; i++) {
+    for (let i = 0; i < SMALL.record + 1; i++) {
       const requestId = `req_${String(i).padStart(8, '0')}`;
       expect(await sendRequestBoundGroupMessage(deps(send), input(requestId, 'fresh'))).toMatchObject({ ok: true, replayed: false });
     }
-    const next = `req_${String(GROUP_SEND_RECORD_LIMIT + 1).padStart(8, '0')}`;
+    const next = `req_${String(SMALL.record + 1).padStart(8, '0')}`;
     expect(await sendRequestBoundGroupMessage(deps(send), input(next, 'fresh'))).toMatchObject({ ok: true, replayed: false });
-    expect(send).toHaveBeenCalledTimes(GROUP_SEND_RECORD_LIMIT + 2);
-    // 2002 次 fsync 级 durable 写在 bun:test 默认 5s 超时下跑不完，显式放宽（vitest/bun 均认第三参）。
-  }, 120_000);
+    expect(send).toHaveBeenCalledTimes(SMALL.record + 2);
+    // The cap was crossed: the records these sends wrote themselves were
+    // compacted, and as the newest sends they stayed while the oldest archived
+    // ones were evicted to keep the archive at its cap.
+    const archived = readRecords(archiveFile());
+    expect(Object.keys(archived)).toHaveLength(SMALL.archive);
+    for (let i = 0; i < SMALL.compactBatch; i++) {
+      expect(archived[`${CHAT}\0req_${String(i).padStart(8, '0')}`]).toMatchObject({ state: 'sent' });
+      expect(archived[`${CHAT}\0a${String(i).padStart(7, '0')}`]).toBeUndefined();
+    }
+  });
 
   it('replays an archived requestId with no provider call and reads that binding back', async () => {
     const requestId = 'req_archived';
@@ -387,6 +482,9 @@ describe('sent archive', () => {
   });
 
   it('keeps the active file at the live cap and the archive within ARCHIVE_LIMIT', async () => {
+    __setGroupSendLimitsForTest(SMALL);
+    // Half a compaction batch past the cap: exactly one compaction.
+    const total = SMALL.record + SMALL.compactBatch / 2;
     let n = 0;
     let archiveDuringSend: Buffer | undefined;
     const send = vi.fn(async () => {
@@ -397,36 +495,43 @@ describe('sent archive', () => {
     const sizes: number[] = [];
     let archiveIno: number | undefined;
     let archiveRewrites = 0;
-    for (let i = 0; i < 2100; i++) {
+    for (let i = 0; i < total; i++) {
       const requestId = `req_${String(i).padStart(8, '0')}`;
       expect(await sendRequestBoundGroupMessage(deps(send), input(requestId, 'plateau'))).toMatchObject({ ok: true, replayed: false });
-      if (i + 1 === GROUP_SEND_RECORD_LIMIT + 1) expect(readFileSync(archiveFile()).equals(archiveDuringSend!)).toBe(true);
+      if (i + 1 === SMALL.record + 1) expect(readFileSync(archiveFile()).equals(archiveDuringSend!)).toBe(true);
       // Every atomic rewrite renames a new inode over the archive.
       if (existsSync(archiveFile()) && statSync(archiveFile()).ino !== archiveIno) {
         archiveIno = statSync(archiveFile()).ino;
         archiveRewrites++;
       }
-      if (i + 1 === 2000 || i + 1 === 2100) sizes.push(statSync(storePath).size);
+      if (i + 1 === SMALL.record || i + 1 === total) sizes.push(statSync(storePath).size);
     }
     expect(archiveRewrites).toBe(1);
-    const [at2000, at2100] = sizes;
-    expect(at2100).toBeLessThan(at2000 * 1.04);
+    const [atCap, atTotal] = sizes;
+    expect(atTotal).toBeLessThan(atCap * 1.04);
     const live = Object.keys(readRecords(storePath)).length;
     const archived = Object.keys(readRecords(archiveFile())).length;
-    expect(live).toBeLessThanOrEqual(GROUP_SEND_RECORD_LIMIT);
-    expect(archived).toBe(GROUP_SEND_COMPACT_BATCH);
-    expect(live + archived).toBe(2100);
+    expect(live).toBeLessThanOrEqual(SMALL.record);
+    expect(archived).toBe(SMALL.compactBatch);
+    expect(live + archived).toBe(total);
 
     const beforeReplay = readFileSync(archiveFile());
-    await sendRequestBoundGroupMessage(deps(send), input('req_00002099', 'plateau'));
+    await sendRequestBoundGroupMessage(deps(send), input(`req_${String(total - 1).padStart(8, '0')}`, 'plateau'));
     expect(readFileSync(archiveFile()).equals(beforeReplay)).toBe(true);
+
+    // The same paths at the production limits, from seeded files: one send each.
+    __setGroupSendLimitsForTest(null);
+    rmSync(archiveFile());
+    writeStore(fillSent(GROUP_SEND_RECORD_LIMIT, 'b', clock, 'plateau'));
+    expect(await sendRequestBoundGroupMessage(deps(send), input('req_firstcmp', 'plateau'))).toMatchObject({ ok: true, replayed: false });
+    expect(Object.keys(readRecords(archiveFile()))).toHaveLength(GROUP_SEND_COMPACT_BATCH);
+    expect(Object.keys(readRecords(storePath))).toHaveLength(GROUP_SEND_RECORD_LIMIT - GROUP_SEND_COMPACT_BATCH + 1);
 
     writeArchive(fillSent(GROUP_SEND_ARCHIVE_LIMIT, 'a', 1, 'old'));
     writeStore(fillSent(GROUP_SEND_RECORD_LIMIT, 'b', clock, 'plateau'));
     expect(await sendRequestBoundGroupMessage(deps(send), input('req_pastcap', 'plateau'))).toMatchObject({ ok: true, replayed: false });
     expect(Object.keys(readRecords(archiveFile()))).toHaveLength(GROUP_SEND_ARCHIVE_LIMIT);
-    // 2100 次 durable 写 + 一次 20k 条归档种子，bun:test 默认 5s 超时下跑不完，显式放宽。
-  }, 120_000);
+  });
 
   it('retries a requestId evicted from the archive as a new send', async () => {
     const victim = 'req_victim1';
@@ -624,7 +729,7 @@ describe('request-bound group send routes', () => {
       const first = await post(routeChat, JSON.stringify({ requestId, content }));
       expect(first.status).toBe(200);
       expect(await first.json()).toMatchObject({ ok: true, messageId: 'om_route', replayed: false });
-      expect(sendMessage).toHaveBeenCalledWith(routeApp, routeChat, content, 'text', groupSendUuid(routeApp, routeChat, requestId), undefined, { suppressHook: true });
+      expect(sendMessage).toHaveBeenCalledWith(routeApp, routeChat, content, 'text', groupSendUuid(routeApp, routeChat, requestId), undefined, { suppressHook: true, beforeWrite: expect.any(Function) });
       expect(emit).toHaveBeenCalledTimes(1);
       expect(emit).toHaveBeenCalledWith('outbound.send', {
         larkAppId: routeApp, chatId: routeChat, messageId: 'om_route', msgType: 'text',

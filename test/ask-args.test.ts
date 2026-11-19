@@ -15,7 +15,17 @@ import {
   parseAskMention,
   parseAskOptions,
   parseAskTimeoutSeconds,
+  parseAskRequestId,
 } from '../src/core/ask-args.js';
+
+describe('explicit Ask invocation identity', () => {
+  it('accepts an opt-in stable request id and rejects empty or oversized ids', () => {
+    expect(parseAskRequestId(undefined)).toBeUndefined();
+    expect(parseAskRequestId('mr-42-round-1')).toBe('mr-42-round-1');
+    expect(() => parseAskRequestId('')).toThrow();
+    expect(() => parseAskRequestId('x'.repeat(257))).toThrow();
+  });
+});
 
 describe('parseAskOptions', () => {
   it('parses bare keys with key==label', () => {
@@ -97,6 +107,14 @@ describe('parseAskOptions', () => {
 });
 
 describe('parseAskTimeoutSeconds', () => {
+  it('accepts explicit zero as no deadline without changing finite defaults or bounds', () => {
+    expect(parseAskTimeoutSeconds('0')).toBe(0);
+    expect(parseAskTimeoutSeconds(undefined)).toBe(300_000);
+    expect(parseAskTimeoutSeconds('3600')).toBe(3_600_000);
+    expect(() => parseAskTimeoutSeconds('-1')).toThrowError(AskArgsError);
+    expect(() => parseAskTimeoutSeconds('1')).toThrowError(AskArgsError);
+  });
+
   it('defaults to 300s when unset', () => {
     expect(parseAskTimeoutSeconds(undefined)).toBe(300_000);
     expect(parseAskTimeoutSeconds('')).toBe(300_000);

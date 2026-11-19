@@ -200,3 +200,90 @@ describe('botmux observe real daemon IPC', () => {
     expect(listing.daemons[0].sessions[0]).not.toHaveProperty('context');
   });
 });
+
+describe('botmux observe task block and active filter over real daemon IPC', () => {
+  it('leaves the default listing unchanged and adds task + filtering only on request', async () => {
+    root = mkdtempSync(join(tmpdir(), 'botmux-observe-task-'));
+    const home = join(root, 'home');
+    const dataDir = join(root, 'data');
+    const configDir = join(home, '.botmux');
+    const registryDir = join(dataDir, 'dashboard-daemons');
+    mkdirSync(configDir, { recursive: true, mode: 0o700 });
+    mkdirSync(registryDir, { recursive: true });
+    const secretPath = join(configDir, '.dashboard-secret');
+    writeFileSync(secretPath, SECRET, { mode: 0o600 });
+    chmodSync(secretPath, 0o600);
+
+    const now = Date.now();
+    const HOUR = 60 * 60_000;
+    const base = {
+      larkAppId: 'cli_observe_task', chatId: 'oc_observe', rootMessageId: 'om_observe', scope: 'thread',
+      botName: 'observe-task', cliId: 'claude-code', backendType: 'pty', adopt: false, queued: false,
+    };
+    const rows = [
+      { ...base, sessionId: 'running', status: 'working', workerPid: 11, busySinceAt: now - 5 * 60_000, lastMessageAt: now - 5 * 60_000 },
+      { ...base, sessionId: 'delivered', status: 'dormant', lastMessageAt: now - 3 * HOUR,
+        lastTurn: { turnId: 't1', outcome: 'delivered', at: now - 2 * HOUR, summary: '已合入 master' } },
+      { ...base, sessionId: 'stale', status: 'dormant', lastMessageAt: now - 72 * HOUR },
+      { ...base, sessionId: 'closed', status: 'closed', closedAt: now - 60_000, lastMessageAt: now - 60_000 },
+    ];
+    server = createServer((req, res) => {
+      const port = (server!.address() as { port: number }).port;
+      const pathname = new URL(req.url ?? '/', `http://127.0.0.1:${port}`).pathname;
+      const ok = verifyHmac(
+        SECRET,
+        {
+          ts: String(req.headers['x-botmux-cli-ts'] ?? ''),
+          nonce: String(req.headers['x-botmux-cli-nonce'] ?? ''),
+          sig: String(req.headers['x-botmux-cli-auth'] ?? ''),
+        },
+        req.socket.remoteAddress ?? '',
+        cliAuthBind(req.method ?? 'GET', pathname, port),
+      ).ok;
+      if (!ok) { res.writeHead(401).end('unauthorized'); return; }
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ sessions: rows }));
+    });
+    await new Promise<void>((resolve, reject) => {
+      server!.once('error', reject);
+      server!.listen(0, '127.0.0.1', resolve);
+    });
+    const port = (server.address() as { port: number }).port;
+    writeFileSync(join(registryDir, 'cli_observe_task.json'), JSON.stringify({
+      larkAppId: 'cli_observe_task', ipcPort: port, pid: process.pid, lastHeartbeat: Date.now(),
+    }));
+
+    const run = async (args: string[]) => {
+      const child = spawnTsEvalWithRepoImports(
+        `import { runObserveCommand } from './src/cli/observe-command.js';
+         process.exitCode = await runObserveCommand(${JSON.stringify(args)});`,
+        { cwd: process.cwd(), env: { ...process.env, HOME: home, SESSION_DATA_DIR: dataDir }, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout!.setEncoding('utf8');
+      child.stderr!.setEncoding('utf8');
+      child.stdout!.on('data', chunk => { stdout += chunk; });
+      child.stderr!.on('data', chunk => { stderr += chunk; });
+      const status = await new Promise<number | null>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', resolve);
+      });
+      expect(status, stderr).toBe(0);
+      return JSON.parse(stdout).daemons[0].sessions as Array<Record<string, any>>;
+    };
+
+    const plain = await run(['--lark-app', 'cli_observe_task']);
+    expect(plain.map(s => s.identity.sessionId)).toEqual(['running', 'delivered', 'stale', 'closed']);
+    for (const s of plain) expect(s).not.toHaveProperty('task');
+
+    const active = await run(['--lark-app', 'cli_observe_task', '--active', '--include-task']);
+    expect(active.map(s => [s.identity.sessionId, s.task])).toEqual([
+      ['running', { kind: 'working', busySinceAt: now - 5 * 60_000 }],
+      ['delivered', { kind: 'delivered', at: now - 2 * HOUR, summary: '已合入 master' }],
+    ]);
+
+    const narrow = await run(['--lark-app', 'cli_observe_task', '--since', '1h']);
+    expect(narrow.map(s => s.identity.sessionId)).toEqual(['running']);
+  });
+});

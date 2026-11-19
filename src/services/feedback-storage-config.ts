@@ -4,9 +4,10 @@ import { mkdir, open, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { atomicWriteFile } from '../utils/atomic-write.js';
-import { withFileLock } from '../utils/file-lock.js';
+import { withFileLock, FileLockTimeoutError } from '../utils/file-lock.js';
 import type { FeedbackStorageConfig, FeedbackStorageTarget, PostgresTarget } from './feedback-storage-types.js';
 import { createDoasTokenSource, type PostgresCredential } from './feedback-doas-token.js';
+import { assertFeedbackMigrationSlotAvailable } from './feedback-migration-slot.js';
 
 const secretReference = z.string().regex(/^(env:[A-Za-z_][A-Za-z0-9_]*|file:[0-9a-f-]{36})$/);
 const postgresSchema = z.object({
@@ -34,6 +35,17 @@ const postgresSchema = z.object({
 const targetSchema = z.discriminatedUnion('backend', [
   z.object({ backend: z.literal('sqlite') }).strict(),
   z.object({ backend: z.literal('postgresql'), postgres: postgresSchema }).strict(),
+  z.object({ backend: z.literal('supabase'), supabase: z.object({
+    url: z.string().url().max(2048).refine(value => {
+      try {
+        const url = new URL(value);
+        return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash && url.pathname === '/';
+      } catch { return false; }
+    }),
+    keyRef: secretReference,
+    schema: z.string().regex(/^[a-z_][a-z0-9_]{0,62}$/).refine(value => !['public', 'auth', 'storage', 'pg_catalog', 'information_schema'].includes(value)),
+    requestTimeoutMs: z.number().int().min(100).max(60000),
+  }).strict() }).strict(),
 ]);
 const configSchema = z.object({
   version: z.literal(1),
@@ -104,15 +116,24 @@ export async function saveFeedbackStorageCandidate(
   if (!parsed.success) throw new Error('feedback_storage_target_invalid');
   await readFeedbackStorageConfig(dataDir);
   const path = join(await canonicalDirectory(dataDir), 'feedback-storage.json');
-  return withFileLock(path, async () => {
-    const current = await readConfig(path);
-    if (!current || current.generation !== expectedGeneration) {
-      throw new Error('feedback_storage_generation_conflict');
-    }
-    const next = configSchema.parse({ ...current, generation: current.generation + 1, candidate: parsed.data });
-    await persistConfig(path, next);
-    return next;
-  });
+  const migrations = join(await canonicalDirectory(dataDir), 'feedback-migrations');
+  await mkdir(migrations, { recursive: true, mode: 0o700 });
+  if (await realpath(migrations) !== migrations) throw new Error('feedback_migration_directory_invalid');
+  try {
+    return await withFileLock(join(migrations, 'operation'), () => withFileLock(path, async () => {
+      await assertFeedbackMigrationSlotAvailable(dataDir, undefined, true);
+      const current = await readConfig(path);
+      if (!current || current.generation !== expectedGeneration) {
+        throw new Error('feedback_storage_generation_conflict');
+      }
+      const next = configSchema.parse({ ...current, generation: current.generation + 1, candidate: parsed.data });
+      await persistConfig(path, next);
+      return next;
+    }), { maxWaitMs: 1000 });
+  } catch (error) {
+    if (error instanceof FileLockTimeoutError) throw new Error('feedback_migration_busy_retry');
+    throw error;
+  }
 }
 
 export async function putFeedbackStorageSecret(dataDir: string, value: string): Promise<string> {

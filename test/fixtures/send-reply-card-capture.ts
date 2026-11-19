@@ -79,6 +79,7 @@ if (stubbedLargeUpload) {
 }
 
 const topicLookups = new Map<string, number>();
+let providerMessageSequence = 0;
 
 (defaultHttpInstance as any).defaults.adapter = async (config: any) => {
   const url = new URL(config.url, 'https://open.feishu.cn');
@@ -104,7 +105,8 @@ const topicLookups = new Map<string, number>();
   } else if (url.pathname.includes('/im/v1/messages') && ['POST', 'PATCH'].includes(method)) {
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
-    data = { code: 0, data: { message_id: 'om_separate_message' } };
+    data = { code: 0, data: { message_id: process.env.BOTMUX_TEST_DISTINCT_MESSAGE_IDS === '1'
+      ? `om_sent_${++providerMessageSequence}` : 'om_separate_message' } };
   } else if (url.pathname.includes('/cardkit/v1/cards/') && method === 'PUT') {
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
@@ -279,8 +281,54 @@ if (process.env.BOTMUX_TEST_NATIVE_COT_BARRIER) {
     const path = new URL(url).pathname;
     if (!path.endsWith('/reply-card-ready')) throw new Error(`Unexpected native CoT test route: ${path}`);
     console.log('CAPTURE_NATIVE_READY');
-    const ok = process.env.BOTMUX_TEST_NATIVE_COT_BARRIER === 'ready';
-    return new Response(JSON.stringify({ ok }), { status: ok ? 200 : 409 });
+    // ready = live native thinking; ready-hidden = display failed/switched off;
+    // ready-legacy = an older daemon that answers without visibility.
+    const barrier = process.env.BOTMUX_TEST_NATIVE_COT_BARRIER ?? '';
+    const ok = barrier.startsWith('ready');
+    const body = barrier === 'ready-legacy' || !ok ? { ok } : { ok, nativeThinkingVisible: barrier === 'ready' };
+    return new Response(JSON.stringify(body), { status: ok ? 200 : 409 });
+  });
+}
+if (process.env.BOTMUX_TEST_FEEDBACK_LEASE_DAEMON) {
+  // A read-isolated CLI: its Seatbelt policy denies the shared lease directory
+  // (EPERM), so the send lease must come from the session's daemon. The
+  // daemon side answers with BOTMUX_TEST_FEEDBACK_LEASE_DAEMON=ok|refuse.
+  const originalMkdir = fs.mkdirSync.bind(fs);
+  fs.mkdirSync = ((path: fs.PathLike, options?: unknown) => {
+    if (String(path).endsWith('/feedback-send-leases')) {
+      throw Object.assign(new Error(`EPERM: operation not permitted, mkdir '${String(path)}'`), { code: 'EPERM' });
+    }
+    return originalMkdir(path, options as never);
+  }) as typeof fs.mkdirSync;
+  syncBuiltinESMExports();
+  if ((globalThis as { Bun?: unknown }).Bun) {
+    const bunTestModule = 'bun:test';
+    const { mock } = await import(bunTestModule);
+    const mockedFs = { ...fs, default: fs };
+    mock.module('node:fs', () => mockedFs);
+  }
+  __setLoopbackTransportForTests(async (url, init) => {
+    const target = new URL(url);
+    const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+    if (target.pathname.endsWith('/api/session-origin/attest')) {
+      writeManagedOriginAttestationProof({
+        dataDir: process.env.SESSION_DATA_DIR!,
+        proof: {
+          domain: MANAGED_ORIGIN_PROOF_DOMAIN, version: 1, nonce: body.nonce, channelId: body.channelId,
+          sessionId: body.sessionId, turnId: process.env.BOTMUX_TURN_ID!, requiresCodexAppLedger: false, issuedAtMs: Date.now(),
+        },
+      });
+      return new Response(null, { status: 200 });
+    }
+    if (!target.pathname.endsWith('/feedback-send-lease')) throw new Error(`Unexpected daemon request ${target.pathname}`);
+    console.log('CAPTURE_LEASE=' + JSON.stringify({ path: target.pathname, body }));
+    const refuse = process.env.BOTMUX_TEST_FEEDBACK_LEASE_DAEMON === 'refuse';
+    const result = refuse
+      ? { ok: false, error: 'feedback_storage_maintenance' }
+      : body.action === 'acquire'
+        ? { ok: true, lease: `${body.processId}-0123abcd.json`, releaseToken: 'synthetic-release-token' }
+        : { ok: true };
+    return new Response(JSON.stringify(result), { status: refuse ? 409 : 200, headers: { 'content-type': 'application/json' } });
   });
 }
 // Any non-SDK network request also fails closed; this fixture never contacts Feishu.

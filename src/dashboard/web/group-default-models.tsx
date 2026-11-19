@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from '../../core/group-default-models.js';
+import { isGroupModelCliId, groupModelSettings, type GroupModelCliId, type GroupDefaultModels, type GroupModelSettings } from '../../core/group-default-models.js';
 import { reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
 import { useT } from './react-hooks.js';
 import { DropdownField, ModelPickerField } from './field-controls.js';
@@ -19,13 +19,14 @@ type Props = {
 
 /** The CLI is display-only and always follows the bot's Agent configuration. */
 export function GroupDefaultModelsRow(props: Props) {
-  if (props.cliId !== 'codex' && props.cliId !== 'claude-code') {
+  if (!isGroupModelCliId(props.cliId)) {
     return <p className="group-default-models-cli">CLI：{props.cliId ?? '未加载'}（暂不支持群级模型配置）</p>;
   }
   return <GroupAgentDefaults key={`${props.appId}:${props.cliId}`} {...props} cliId={props.cliId} />;
 }
 
-function GroupAgentDefaults(props: Props & { cliId: 'codex' | 'claude-code' }) {
+/** Edit per-group model and effort defaults while following the Bot’s CLI. */
+function GroupAgentDefaults(props: Props & { cliId: GroupModelCliId }) {
   const tr = useT();
   const [settings, setSettings] = useState<GroupModelSettings>(() => groupModelSettings(props.models?.[props.cliId]));
   const [options, setOptions] = useState<string[]>([]);
@@ -80,7 +81,7 @@ function GroupAgentDefaults(props: Props & { cliId: 'codex' | 'claude-code' }) {
 
   const id = `group-${props.appId}`;
   return <form onSubmit={save} className="group-default-models-row">
-    <small className="group-default-models-cli">CLI：{props.cliId === 'codex' ? 'Codex' : 'Claude'}（跟随 Agent 配置）</small>
+    <small className="group-default-models-cli">CLI：{props.cliId === 'antigravity' ? 'Antigravity' : props.cliId === 'codex' ? 'Codex' : 'Claude'}（跟随 Agent 配置）</small>
     <div className="group-default-models-field"><span>模型</span>
       <ModelPickerField value={settings.model ?? ''} onChange={changeModel} options={options}
         disabled={props.disabled || saving} busy={detecting} dataInput={`${id}-model`}

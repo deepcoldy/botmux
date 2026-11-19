@@ -1,10 +1,84 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
+import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
+import { openDatabaseSync } from '../src/services/sqlite-compat.js';
 
 describe('feedback extension durability', () => {
+  it('skips schema writes on reopen and isolates main feedback store from a corrupt extension DB', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-extension-open-isolation-'));
+    try {
+      const stores = await Promise.all(Array.from({ length: 6 }, () => FeedbackExtensionStore.open(directory)));
+      for (const store of stores) store.close();
+      const dbPath = join(directory, 'feedback-extensions.sqlite');
+      const raw = await openDatabaseSync(dbPath);
+      raw.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      raw.close();
+      const reopened = await FeedbackExtensionStore.open(directory);
+      const walPath = `${dbPath}-wal`;
+      expect(existsSync(walPath) ? statSync(walPath).size : 0).toBe(0);
+      reopened.close();
+
+      rmSync(dbPath, { force: true });
+      rmSync(walPath, { force: true });
+      rmSync(`${dbPath}-shm`, { force: true });
+      writeFileSync(dbPath, 'corrupt-extension-sqlite');
+      const main = await SkillFeedbackStore.open(directory);
+      try {
+        const delivery = main.recordTurnDelivery({
+          botAppId: 'app', sessionId: 'session', turnId: 'turn',
+          platform: 'lark', platformAppId: 'app', platformMessageId: 'om_answer',
+          content: 'answer', cardMode: 'card', status: 'delivered',
+        });
+        expect(delivery.context?.feedbackSubjectBinding).toBeNull();
+      } finally { main.close(); }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('creates no extension database for unbound answers and freezes a later binding through the same main store', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-extension-lazy-'));
+    const main = await SkillFeedbackStore.open(directory);
+    try {
+      const record = (turnId: string, platformMessageId: string) => main.recordTurnDelivery({
+        botAppId: 'app', sessionId: 'session', turnId, platform: 'lark', platformAppId: 'app', platformMessageId,
+        content: 'answer', cardMode: 'card', status: 'delivered', context: { teamId: 'team' },
+      });
+      expect(record('first', 'om_first').context).toEqual({ teamId: 'team', feedbackSubjectBinding: null });
+      // The extension host treats an existing database as "extensions in use".
+      expect(existsSync(join(directory, 'feedback-extensions.sqlite'))).toBe(false);
+      const extensions = await FeedbackExtensionStore.open(directory);
+      try {
+        extensions.bindSubject('app', 'session', 'second', {
+          sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 42 },
+        });
+      } finally { extensions.close(); }
+      expect(record('second', 'om_second').context).toEqual({ teamId: 'team', feedbackSubjectBinding: {
+        sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 42 },
+      } });
+    } finally { main.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('freezes the first action event across cards, actors, replay and pause recovery', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-event-snapshot-'));
+    let store = await FeedbackExtensionStore.open(directory);
+    try {
+      const definition = { id: 'hook', command: ['script'] };
+      const first = { appId: 'app', hookId: 'hook', hookVersion: 1, hookDefinition: definition,
+        event: { context: { category: 42 }, surface: { messageId: 'surface-a' }, actor: { openId: 'first' } } };
+      const second = { ...first, hookVersion: 2,
+        event: { context: { category: 99 }, surface: { messageId: 'surface-b' }, actor: { openId: 'second' } } };
+      store.requestAction({ requestId: 'first', actor: 'first', job: { id: 'job', kind: 'hook', payload: first } });
+      store.requestAction({ requestId: 'second', actor: 'second', job: { id: 'job', kind: 'hook', payload: second } });
+      expect(store.job('job')?.payload.event).toEqual(first.event);
+      store.requestAction({ requestId: 'pause', actor: 'second', paused: true, job: { id: 'job', kind: 'hook', payload: second } });
+      store.close();
+      store = await FeedbackExtensionStore.open(directory);
+      store.requestAction({ requestId: 'resume', actor: 'second', job: { id: 'job', kind: 'hook', payload: second } });
+      expect(store.job('job')).toMatchObject({ status: 'pending', payload: { event: first.event, hookVersion: 2 } });
+      store.requestAction({ requestId: 'first', actor: 'first', job: { id: 'job', kind: 'hook', payload: first } });
+      expect(store.job('job')?.payload.event).toEqual(first.event);
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it('rolls back a paused request together with its callback registration on conflict', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-pause-transaction-'));
     const store = await FeedbackExtensionStore.open(directory);
@@ -75,6 +149,39 @@ describe('feedback extension durability', () => {
       expect(store.subject('app', 'session', 'turn')).toEqual({ sourceMessageId: 'om_question', answerKind: 'substantive' });
       expect(store.subject('other', 'session', 'turn')).toBeUndefined();
       expect(() => store.bindSubject('app', 'session', 'turn', { sourceMessageId: 'om_other', answerKind: 'substantive' })).toThrow();
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('preserves bounded context through reopen and rejects changes to the same binding', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-context-'));
+    let store = await FeedbackExtensionStore.open(directory);
+    try {
+      const context = { kind: 'classification', category: 42, nested: { region: 'region-a' } };
+      store.bindSubject('app', 'session', 'turn', { sourceMessageId: 'om_question', answerKind: 'substantive', context });
+      context.nested.region = 'changed';
+      store.close();
+      store = await FeedbackExtensionStore.open(directory);
+      expect(store.subject('app', 'session', 'turn')?.context).toEqual({
+        category: 42, kind: 'classification', nested: { region: 'region-a' },
+      });
+      expect(() => store.bindSubject('app', 'session', 'turn', {
+        sourceMessageId: 'om_question', answerKind: 'substantive',
+        context: { nested: { region: 'region-a' }, category: 42, kind: 'classification' },
+      })).not.toThrow();
+      expect(() => store.bindSubject('app', 'session', 'turn', {
+        sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 99 },
+      })).toThrow('feedback_subject_binding_conflict');
+      expect(store.subject('other', 'session', 'turn')).toBeUndefined();
+      for (const invalid of [{ text: 'x'.repeat(8192) }, { number: Infinity }, { missing: undefined },
+        { nested: new Date() }, ['not-an-object']]) {
+        expect(() => store.bindSubject('app', 'session', 'invalid', {
+          sourceMessageId: 'om_question', answerKind: 'substantive', context: invalid as any,
+        })).toThrow();
+      }
+      let nested: Record<string, unknown> = {};
+      for (let depth = 0; depth < 8; depth++) nested = { child: nested };
+      expect(() => store.bindSubject('app', 'session', 'deep', {
+        sourceMessageId: 'om_question', answerKind: 'substantive', context: nested,
+      })).toThrow();
     } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
   });
   it('records manual evidence without re-executing unknown operations', async () => {

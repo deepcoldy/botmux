@@ -1,5 +1,5 @@
 import { hasAskForm } from '../../core/ask-form.js';
-import { buildAskFormElements } from './ask-form-elements.js';
+import { buildAskFormElements, formatAskDeadline } from './ask-form-elements.js';
 import type { ReplyCardAsk } from '../../services/turn-reply-card.js';
 import { stripCardMarkdownImages } from './md-card.js';
 import { t, type Locale } from '../../i18n/index.js';
@@ -66,7 +66,7 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   }
   elements.push({ tag: 'markdown', text_size: 'notation', content: [
     t(textReplyRequired ? 'card.ask.text_reply_hint' : 'card.ask.custom_reply_hint', undefined, locale),
-    `${t('card.ask.field.deadline', undefined, locale)}: ${new Date(ask.deadlineAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN')}`,
+    `${t('card.ask.field.deadline', undefined, locale)}: ${formatAskDeadline(ask.deadlineAt, locale)}`,
     t('card.ask.answerable_talk_members', undefined, locale),
   ].join('\n') });
   return elements;

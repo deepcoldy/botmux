@@ -307,7 +307,9 @@ export async function showStreamingOutputPhase(
     return { summary: 'Streaming-card output toggle does not apply to Codex' };
   }
   await withReportTraces(ctx, session.agent, async () => {
-    await showStreamingOutput(session.agent, session.page);
+    await showStreamingOutput(session.agent, session.page, {
+      reopen: reopenTopic(session.agent, session.page, session.msg),
+    });
   });
   return { summary: 'Streaming card output is visible' };
 }

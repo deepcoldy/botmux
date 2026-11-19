@@ -21,7 +21,7 @@ export function workerSubmitHarness() {
     lastInitConfig: { cliId: 'traex' }, cliSpawnGeneration: 7,
     cliRestartInProgress: false, isPromptReady: true, isFlushing: false,
     codexModelMigrationCheckNeeded: () => false,
-    idleDetector: { isStartupPending: () => false },
+    idleDetector: { isStartupPending: () => false, programStatusHeldWorking: () => false },
     shouldHoldCodexRunnerInput: () => false,
     currentInputDeliveryQuarantine: () => null,
     hasPendingInputForFlush: () => pendingMessages.length > 0,
@@ -38,6 +38,7 @@ export function workerSubmitHarness() {
     runtimePtyInputPolicy: () => ({ supportsTypeAhead: true, allowBackToBackWrites: true }),
     pendingInputAllowsTypeAhead: () => true,
     directRpcTurnBlocksTypeAhead: () => false,
+    programStatusBlockedHoldsTypeAhead: () => false,
     activeTurnBlocks: () => false,
     promotePendingHumanInterruption: () => false,
     pendingSessionRename: null, pendingMessages, pendingRawInputs: [], pendingAdoptMessages: [], pendingInjections: [],
@@ -86,13 +87,28 @@ export function workerSubmitHarness() {
     buildSubmitMessagePreview,
     cliName: () => 'TraeX',
     // Any unrelated failure path is observable instead of silently swallowed.
-    SubmissionWriteError: class extends Error {},
+    SubmissionWriteError: class extends Error {
+      constructor(
+        message: string,
+        readonly recoveryFailureReason?: string,
+        readonly submissionStarted = true,
+        readonly runnerGenerationUnsafe = false,
+        readonly traexCatalogAdmissionRequired = false,
+      ) { super(message); }
+    },
     emitTurnTerminal: vi.fn(),
     shouldStopPendingBatch: () => true,
   };
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
+  // Real write-edge transport fold: a no-op unless an item carries a parked
+  // TraeX RPC catalog and no RPC engine will write it.
+  scope.inlineParkedTraexSkillCatalog = loadWorkerFunction('inlineParkedTraexSkillCatalog', scope);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   scope.scheduleSubmitFailureNotify = schedule;
+  // Real predicates for flushPending's native-consumption proof (traex harness →
+  // no Codex history proof); markReplyInputConsumed is a no-op on the empty queue.
+  scope.codexHistoryMatchProvesConsumption = loadWorkerFunction('codexHistoryMatchProvesConsumption', scope);
+  scope.markReplyInputConsumed = loadWorkerFunction('markReplyInputConsumed', scope);
   const flush = loadWorkerFunction<() => Promise<void>>('flushPending', scope);
   return { scope, queue, flush, schedule, recheck, settlements, submitFailureChains, inputDeliveryEvidence };
 }

@@ -19,7 +19,7 @@ export interface SettingsSection {
  */
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: 'settings-access', module: 'settings.moduleGeneral', section: 'settings.sectionAccess', fields: ['settings.publicReadOnly', 'settings.remoteAccess', 'settings.oauthRedirectBase'] },
-  { id: 'settings-cards', module: 'settings.moduleGeneral', section: 'settings.sectionCards', fields: ['settings.cardBrandLabel', 'settings.openTerminalInFeishu', 'settings.stuckCardInitiatorKeys', 'settings.enableLocalCliOpen', 'settings.localCliOpenMode'] },
+  { id: 'settings-cards', module: 'settings.moduleGeneral', section: 'settings.sectionCards', fields: ['settings.modelQueueNotify', 'settings.cardBrandLabel', 'settings.openTerminalInFeishu', 'settings.stuckCardInitiatorKeys', 'settings.enableLocalCliOpen', 'settings.localCliOpenMode'] },
   { id: 'settings-group-creation', module: 'settings.moduleGeneral', section: 'settings.sectionGroupCreation', fields: ['settings.groupNamePrefix'] },
   {
     id: 'settings-experimental',
@@ -30,11 +30,13 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       'settings.herdrTraexPlugin',
       'settings.codexRpcInput',
       'settings.autoUpgradeCodexSessions',
+      'settings.terminalEffortWriteback',
       'settings.bypassCodexHookTrust',
       'settings.hideCodexRateLimitModelNudge',
       'settings.codexNotifier',
       'settings.noVisibleOutputHint',
       'settings.crossPrincipalInterruption',
+      'settings.scheduleChildOneShot',
       'settings.scheduleDelegationCreate',
       'settings.scheduleDelegationSelfManage',
       'settings.scheduleBotGrants',
@@ -48,6 +50,7 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: 'settings-worktree', module: 'settings.moduleGeneral', section: 'settings.sectionWorktree', fields: ['settings.worktreeRoot'] },
   { id: 'settings-schedule', module: 'settings.moduleGeneral', section: 'settings.sectionSchedule', fields: ['settings.scheduleTimeZone', 'settings.sessionCleanupEnable', 'settings.sessionCleanupArchiveCodex'] },
   { id: 'settings-prompt-cache', module: 'settings.moduleGeneral', section: 'settings.sectionPromptCache', fields: ['promptCache.ttl', 'promptCache.keepalive'] },
+  { id: 'settings-provider-recovery', module: 'settings.moduleGeneral', section: 'settings.sectionProviderRecovery', fields: ['providerRecovery.enabled', 'providerRecovery.maxWaitMinutes'] },
   // 表格型区块在「通用设置」的瀑布流之后单独占满一行，所以排在通用设置最后。
   { id: 'settings-session-env', module: 'settings.moduleGeneral', section: 'sessionEnv.sectionTitle', fields: ['sessionEnv.tmuxTitle'] },
   { id: 'settings-vc', module: 'settings.moduleMeeting', section: 'settings.sectionVcMeetingAgent', fields: ['settings.vcMeetingAgent'] },

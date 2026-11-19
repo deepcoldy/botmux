@@ -14,6 +14,28 @@
 
 ## 本次基础变更
 
+### 原生业务上下文
+
+首轮正式回答前可调用`botmux feedback bind --file binding.json`，在既有
+`sourceMessageId`、`answerKind`之外提供可选`context`普通JSON对象。
+宿主核验当前应用、session、turn及原题所在话题后持久绑定，返回`contextBound=true`。
+最大8192 UTF-8字节、8层；拒绝非法JSON值，重复相同内容幂等，不允许变更已有绑定。
+业务数据不授予目标群、动作、工具或人员权限。
+
+答复delivery首次落盘时，在原有delivery context中保存宿主核验的`feedbackSubjectBinding`
+快照；当时没有绑定则显式保存null。SQLite和PostgreSQL运行入口均使用该快照，
+surface与feedback.revised订阅的context只取该快照，不读取后来新增的subject绑定。
+问题归属与答复类型仍按该回合的绑定判定，与旧版一致：同一回合在答复落盘后才绑定时，
+归属与类型照常生效，但context不进入该答复（为null），因此需要context时须在答复前绑定。
+从未绑定过的部署不会因此新建扩展库。
+反馈surface保留该答复的context快照，原生动作事件及feedback.revised订阅携带
+`context`，由宿主读取而不接受按钮回调的自报context。旧卡缺失时为null，保留历史快照，
+不从新问题猜测或补写。`contextRef`保持原null契约，不假定引用解析能力。
+框架不解释分类字段，不调用模型；业务可在首轮分类后写入context，在点击时直接消费。
+需要首轮类别但缺上下文的业务应明确停止，不能假装分类已保存。
+同一问题动作的重复点击、不同反馈卡及暂停恢复保留首次接受的事件、操作者和context；
+脚本定义相同的重新授权只刷新Hook版本，不替换业务事件或增加执行。
+
 - `feedbackPresentation` 提供 bot 默认、群规则和具体问题规则。
 - 具体问题覆盖群规则；数组整体替换；同 selector 或 id 重复时报错。
 - `rounds` 必须是升序、无重复的正整数；未配置默认关闭。

@@ -16,10 +16,19 @@ or persistent lineage evidence. Opaque identities are not reused across boots.
 Busy Traex reattachment can obtain the native ID before the first binding from
 a fresh, unambiguous user rollout held by the actual CLI PID. A configured resume
 ID is not evidence; lookup rechecks process birth and backend/scope ownership.
+A re-attached Claude-family CLI may be mid-turn and write nothing until that turn
+ends, so its first binding takes the native ID from the process's own pid-state
+record (the source a write's session ID comes from) when the record names that
+PID with that process birth and agrees with every session file the process holds
+open; otherwise the binding stays incomplete, as before.
 If an earlier incomplete observation already became selected, a new binding can
 recover only a unique unresolved runtime with the same complete fresh identity.
 The interval must contain no proven identity transition or unfinished execution;
 confirmed bindings and stopped/retired runtimes are never reassigned or revived.
+When the selected incomplete runtime itself still has unfinished work, the
+complete identity of that same live process completes it instead: the older
+runtime stays out of reach, and the re-attached worker is not refused a binding
+(which would leave it, and that work, with no runtime).
 
 The host persists a runtime reservation before granting `mayStart`. A worker
 awaits that receipt before starting its CLI. Once the backend exists, it reports
@@ -102,6 +111,21 @@ ready-to-busy edge. Turn lookups use an index instead of scanning all attempts.
 Readiness has separate worker-online and prompt-ready facets. `workerReady`,
 `cliReady` and `cliReadyGeneration` are compatible read projections. Screen idle,
 IPC receipt and prompt readiness do not settle a business execution.
+
+Ordinary IM delivery tracking admits the exact execution before sending IPC,
+including follow-ups and recovery/board turns. The frozen admission travels with
+every transport retry. Cold-start receipt publication waits until the worker's
+contract identity and execution registry are initialized; the preload only
+publishes legacy receipts and keeps contract-enabled init messages buffered.
+An admitted commit clears the delivery tracker while the execution can remain
+queued. After a worker retires, its late commit may clear only that child's
+matching tracked admission, with session, producer, generation and full attempt
+identity verified. It cannot update the replacement runtime or settle its input.
+If the commit ACK was lost, a successful native terminal accepted by the
+contract gateway also clears that child's exact delivery, including a proven
+historical runtime or retired worker. Settlement still matches the original
+worker object and frozen execution, preserving the replacement input. Failure, cancellation and
+reconciliation boundaries do not supply this fallback admission proof.
 
 Operations progress through `planned`, `applying`, `confirmed`,
 `failed_before_effect`, `rejected` or `uncertain`. They retain their operation ID,

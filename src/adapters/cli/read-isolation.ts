@@ -401,7 +401,10 @@ export function buildSeatbeltProfile(
 // sandbox=true). Both are new mounts: a warm reattach keeps the v17 process with
 // its ORIGINAL mount set and skips skill generation, so such a pane could never
 // read either — it must cold-spawn once.
-export const ISOLATION_PANE_MARKER_VERSION = 18;
+// 19 adds whole-directory read/write masks for project attachment, source-grant
+// and import-outbox authority below dataDir. A credential-only pane launched
+// before those mounts must not warm-reattach and retain access to the new WAL.
+export const ISOLATION_PANE_MARKER_VERSION = 19;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,6 +13,7 @@ import { afterAll, afterEach, describe, expect, it } from 'vitest';
 import { Pool } from 'pg';
 import { openPostgresFeedbackStore } from '../src/services/feedback-postgres-store.js';
 import { openPostgresFeedbackAnalytics } from '../src/services/feedback-postgres-analytics.js';
+import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 import type { PostgresTarget, FeedbackStore } from '../src/services/feedback-storage-types.js';
 
 const connectionString = process.env.BOTMUX_TEST_POSTGRES_URL;
@@ -183,6 +185,30 @@ describe('PostgreSQL feedback integration', () => {
     })).rejects.toThrow();
     expect(await store.listFeedbackRevisions(delivery.deliveryId, 'user')).toEqual([]);
     expect(await store.listFeedbackEvents()).toEqual([]);
+  });
+  it('freezes the host-verified subject binding into a delivery without creating the extension database', async () => {
+    const { target, password, instanceId } = await fixture();
+    const dataDir = await mkdtemp(join(tmpdir(), 'feedback-pg-binding-'));
+    try {
+      const store = await openPostgresFeedbackStore(target, password, instanceId, undefined, false, dataDir);
+      stores.push(store);
+      const record = (turnId: string, platformMessageId: string) => store.recordTurnDelivery({
+        botAppId: 'app', sessionId: 'session', turnId, platform: 'lark', platformAppId: 'app', platformMessageId,
+        content: 'answer', cardMode: 'card', status: 'delivered', context: { teamId: 'team' },
+      });
+      expect((await record('first', 'om_first')).context).toEqual({ teamId: 'team', feedbackSubjectBinding: null });
+      expect(existsSync(join(dataDir, 'feedback-extensions.sqlite'))).toBe(false);
+      const extensions = await FeedbackExtensionStore.open(dataDir);
+      try {
+        extensions.bindSubject('app', 'session', 'second', {
+          sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 42 },
+        });
+      } finally { extensions.close(); }
+      await record('second', 'om_second');
+      expect((await store.findDeliveryByPlatformMessage('lark', 'app', 'om_second'))?.context).toEqual({
+        teamId: 'team', feedbackSubjectBinding: { sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 42 } },
+      });
+    } finally { await rm(dataDir, { recursive: true, force: true }); }
   });
   it('deduplicates concurrent responses and feedback, preserves revisions and statistics', async () => {
     const { target, password, instanceId, store } = await fixture();

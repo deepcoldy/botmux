@@ -387,7 +387,7 @@ describe('sandbox relay watcher host handoff', () => {
     }
   });
 
-  it('never promotes sandbox-supplied origin fields without host authorization (fail closed)', async () => {
+  it.each([false, true])('only host authorization supplies reply addressing (%s)', async (authorized) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-forged-'));
     roots.push(root);
     const outbox = join(root, 'outbox');
@@ -398,6 +398,7 @@ describe('sandbox relay watcher host handoff', () => {
       process.stdout.write(JSON.stringify({
         authorized: process.env.BOTMUX_HOST_RELAY_AUTHORIZED ?? null,
         turnId: process.env.BOTMUX_TURN_ID ?? null,
+        replyMessageId: process.env.BOTMUX_REPLY_MESSAGE_ID ?? null,
         dispatchAttempt: process.env.BOTMUX_DISPATCH_ATTEMPT ?? null,
         sessionId: process.env.BOTMUX_SESSION_ID ?? null,
       }));
@@ -418,9 +419,10 @@ describe('sandbox relay watcher host handoff', () => {
     const stop = startOutboxWatcher(outbox, {
       ...process.env,
       BOTMUX_TURN_ID: 'stale-inherited-turn',
+      BOTMUX_REPLY_MESSAGE_ID: 'om_forged',
       BOTMUX_DISPATCH_ATTEMPT: '7',
       BOTMUX_HOST_RELAY_AUTHORIZED: '',
-    }, 'forced-session', { cliPath: fixture }); // deliberately no authorize hook
+    }, 'forced-session', { cliPath: fixture, ...(authorized ? { authorize: () => ({ ok: true as const, origin: { turnId: 'om_active', replyMessageId: 'om_latest' } }) } : {}) });
 
     try {
       const responsePath = join(outbox, `${id}.res.json`);
@@ -428,13 +430,14 @@ describe('sandbox relay watcher host handoff', () => {
       const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
       expect(response.code, response.stderr).toBe(0);
       const child = JSON.parse(response.stdout) as {
-        authorized: string | null; turnId: string | null; dispatchAttempt: string | null; sessionId: string | null;
+        authorized: string | null; turnId: string | null; replyMessageId: string | null; dispatchAttempt: string | null; sessionId: string | null;
       };
       // The host re-exec itself is trusted, but with no authorize decision the
       // durable origin is dropped and inherited markers scrubbed — the forged
       // originTurnId/dispatchAttempt never reach the host send.
       expect(child.authorized).toBe('1');
-      expect(child.turnId).toBeNull();
+      expect(child.turnId).toBe(authorized ? 'om_active' : null);
+      expect(child.replyMessageId).toBe(authorized ? 'om_latest' : null);
       expect(child.dispatchAttempt).toBeNull();
       expect(child.sessionId).toBe('forced-session');
     } finally {

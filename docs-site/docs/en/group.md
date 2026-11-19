@@ -38,7 +38,7 @@ botmux has two kinds of "session group". This page covers both:
 ### Group name and avatar
 
 - **With a name**: your name is used and never changed afterwards.
-- **Without a name** (just `/g`): the group starts with the placeholder "New session MM/DD HH:mm". After your first substantive message in it, the bot summarizes a title of up to 12 characters and renames the group.
+- **Without a name** (just `/g`): the group starts with the placeholder "New session MM/DD HH:mm". After your first substantive message in it, the bot summarizes a title of up to 20 characters and renames the group.
 - **Avatar**: by default, the botmux logo on a gradient background (one of ten palettes, fixed per group). Add `--avatar name` for a text avatar showing the group name, or `--avatar off` to keep Lark's default.
 
 ![Group-name text avatar example](/img/group-name-avatar.png)
@@ -129,6 +129,26 @@ You can also send `/botconfig set groupCreation <JSON>` in Lark, and `/botconfig
 - `--no-agents`, `--no-tag` and `--avatar off` only drop defaults; they never remove bots you explicitly @-mentioned.
 - Without `groupCreation` and without options, only the current bot and the bots you @-mentioned join.
 
+### Add missing bots to an existing group
+
+Each bot can store its own invitation list in its `bots.json` entry:
+
+```json
+{
+  "inviteConfig": {
+    "agents": ["cli_review_app", "cli_build_app"]
+  }
+}
+```
+
+Use `@bot /botconfig set inviteConfig {"agents":["Review","Build"]}` to save changes immediately, or `@bot /botconfig unset inviteConfig` to clear them. This setting is independent of `/g`'s `groupCreation`; group-creation defaults are neither inherited nor migrated.
+
+A bot admin sends `@bot /invite all` in a group to add missing members from that bot's `inviteConfig.agents`. Names and app IDs resolve as they do for `/g`, and must refer to configured Lark bots in this deployment. Each app ID is invited once; the current bot and existing members are skipped. An unknown or ambiguous entry, or an unavailable membership check, prevents invitations for the entire list. An empty list prompts configuration first. After a partial invitation failure, repeat the command to add the remaining bots.
+
+Bare `@bot /invite` still displays usage help. `@bot /invite @target` and `/invite --app cli_xxx` continue to process only explicit targets without reading defaults. `all` cannot be combined with explicit targets. Invitations do not change the group's name, tag or avatar.
+
+Revoking admin access or changing or clearing the default list during execution stops invitations that have not yet been sent. Completed invitations are kept; check access and the list before running `/invite all` again.
+
 ## Create a group in the Dashboard
 
 Prefer not to type commands? Open the **Group Management** page in `botmux dashboard` and click "New Chat":
@@ -178,12 +198,12 @@ Or in that bot's `bots.json`:
 ```json
 {
   "sessionGroup": {
-    "naming": { "mode": "session-title", "maxLen": 12 }
+    "naming": { "mode": "session-title", "maxLen": 20 }
   }
 }
 ```
 
-`mode` is `ai-summary` / `session-title` / `truncate`; `maxLen` is the maximum title length (default 12).
+`mode` is `ai-summary` / `session-title` / `truncate`; `maxLen` is the maximum title length (default 20).
 
 Notes:
 
@@ -245,3 +265,16 @@ Groups that were not opened from a DM (ordinary and topic groups) also accept `/
 - The bot owns the group and is the only bot in it. Lark cannot confirm in advance whether a disband would succeed otherwise, so the bot replies that it has no permission and closes no session.
 
 The confirmation card lists every session this machine's bots hold in the group (every topic's session in a topic group) and states that the whole group is disbanded for everyone in it. After you confirm, those sessions are closed first, and the group is disbanded only once all of them are closed; the result arrives as a private card. It stops in the same cases as above.
+
+## Follow the owner into new groups
+
+`ownerGroupFollow` is off by default for every bot. When enabled, the bot uses its owner’s own user authorization to check for new group memberships every 60 seconds. The first complete scan records existing groups; later scans invite the bot to newly joined groups.
+
+```text
+@bot /botconfig set ownerGroupFollow {"enabled":true,"excludeChatIds":["oc_example"]}
+@bot /botconfig unset ownerGroupFollow
+```
+
+The switch is in Dashboard → Bot defaults → Common → Working directory. The owner must authorize chat listing, member invitations and continued access, for example `/login --scope im:chat:read im:chat.members:write_only offline_access`. The app must also enable those user scopes. Existing platform authorization follows this bot’s credential policy.
+
+Excluded groups receive no invitation. Once removed, the bot is not automatically re-added. Turning the feature off and back on establishes a fresh baseline. Invitation permissions and external-group restrictions still apply; failures are reported to the owner in a direct message. Periodic scanning cannot capture joins followed by leaves between scans.

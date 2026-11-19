@@ -46,6 +46,45 @@ describe('dashboard stale chunk reload', () => {
     expect(reload).not.toHaveBeenCalled();
   });
 
+  it.each([
+    "The requested module './chunk-KXPFRRWM.js' does not provide an export named 'e'",
+    "The requested module '/assets/chunks/chunk-KXPFRRWM.js' doesn't provide an export named: 'e'",
+    "The requested module 'https://example.test/assets/chunks/page-ABCDEFGH.js' does not provide an export named 'render'",
+  ])('reloads once for a chunk linking error: %s', (message) => {
+    const reload = vi.fn();
+    const env = {
+      href: 'http://127.0.0.1:7891/',
+      hash: '#/monitor-room',
+      sessionStorage: memorySessionStorage(),
+      reload,
+    };
+    const err = new SyntaxError(message);
+
+    expect(maybeReloadBrowserForStaleRouteChunk(err, {
+      ...env,
+      getSessionStorage: () => env.sessionStorage,
+    })).toBe(true);
+    // The same broken shared chunk can affect several routes. Changing the
+    // route must not reset the reload guard.
+    expect(maybeReloadForStaleRouteChunk(err, { ...env, hash: '#/sessions' })).toBe(false);
+    expect(reload).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    new SyntaxError("The requested module './validator.js' does not provide an export named 'e'"),
+    new SyntaxError('Unexpected token'),
+    new Error("render failed: missing export named 'e'"),
+  ])('does not treat an unrelated module or render bug as a stale chunk: %s', (err) => {
+    const reload = vi.fn();
+    expect(maybeReloadForStaleRouteChunk(err, {
+      href: 'http://127.0.0.1:7891/',
+      hash: '#/groups',
+      sessionStorage: memorySessionStorage(),
+      reload,
+    })).toBe(false);
+    expect(reload).not.toHaveBeenCalled();
+  });
+
   it('does not reload when the guard cannot be persisted', () => {
     const reload = vi.fn();
     const sessionStorage: Pick<Storage, 'getItem' | 'setItem'> = {

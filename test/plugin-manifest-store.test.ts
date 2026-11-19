@@ -149,6 +149,28 @@ describe('plugin manifest and registry basics', () => {
     });
   });
 
+  it('accepts the prerequisites opt-in only as the boolean literal true', () => {
+    const base = {
+      name: '@botmux/plugin-prepared',
+      version: '1.0.0',
+      keywords: ['botmux-plugin'],
+    };
+    expect(parsePluginPackageManifest({
+      ...base,
+      botmux: { schemaVersion: 1, id: 'prepared', prerequisites: true },
+    }).botmux.prerequisites).toBe(true);
+    expect(parsePluginPackageManifest({
+      ...base,
+      botmux: { schemaVersion: 1, id: 'prepared' },
+    }).botmux).not.toHaveProperty('prerequisites');
+    for (const prerequisites of ['true', 1, false, {}, [], null]) {
+      expect(() => parsePluginPackageManifest({
+        ...base,
+        botmux: { schemaVersion: 1, id: 'prepared', prerequisites },
+      })).toThrow(/invalid_plugin_prerequisites/);
+    }
+  });
+
   it('requires package versions to use standard semver metadata', () => {
     expect(() => parsePluginPackageManifest({
       name: '@botmux/plugin-bad',
@@ -331,6 +353,17 @@ describe('plugin manifest and registry basics', () => {
       endpoint: '/botmux/commands/v1',
       commands: [{ name: '/work-bind', description: '绑定工作项' }],
     });
+    const closeRoot = makeSource('cmd-close-hook', [{ name: '/p0' }]);
+    const closeFile = join(closeRoot, 'commands', 'index.json');
+    const declaration = JSON.parse(readFileSync(closeFile, 'utf8'));
+    writeFileSync(closeFile, JSON.stringify({ ...declaration, afterClose: true }));
+    expect(scanPluginContributions(closeRoot, manifest('cmd-close-hook'))?.commands?.afterClose).toBe(true);
+    writeFileSync(closeFile, JSON.stringify({ ...declaration, afterClose: true, replacesCloseTag: true }));
+    expect(scanPluginContributions(closeRoot, manifest('cmd-close-hook'))?.commands?.replacesCloseTag).toBe(true);
+    writeFileSync(closeFile, JSON.stringify({ ...declaration, replacesCloseTag: true }));
+    expect(() => scanPluginContributions(closeRoot, manifest('cmd-close-hook'))).toThrow('invalid_plugin_close_tag_override');
+    writeFileSync(closeFile, JSON.stringify({ ...declaration, afterClose: 'true' }));
+    expect(() => scanPluginContributions(closeRoot, manifest('cmd-close-hook'))).toThrow('invalid_plugin_after_close');
     for (const reserved of ['/close', '/disconnect', '/effort', '/t', '/compact', '/grant']) {
       expect(() => scanPluginContributions(makeSource(`cmd-${reserved.slice(1)}`, [{ name: reserved }]), manifest('cmd-x')))
         .toThrow(`plugin_command_reserved:${reserved}`);

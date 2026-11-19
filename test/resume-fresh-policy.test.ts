@@ -18,21 +18,28 @@
  *
  * Run: pnpm vitest run test/resume-fresh-policy.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { resumeStartsFresh } from '../src/services/resume-fresh-policy.js';
+import { resumeSuccessMessage } from '../src/core/resume-result-message.js';
 import { opencodeDbPath } from '../src/services/opencode-paths.js';
 import { buildClosedSessionCard } from '../src/core/closed-session-card.js';
 import { getCliDisplayName } from '../src/im/lark/card-builder.js';
+import { getBot } from '../src/bot-registry.js';
 import { t } from '../src/i18n/index.js';
 import type { Session } from '../src/types.js';
+
+const DEFAULT_BOT = { config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'codex' } };
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'codex' } })),
 }));
+
+const getBotMock = vi.mocked(getBot);
+afterEach(() => { getBotMock.mockReturnValue(DEFAULT_BOT as never); });
 
 describe('resumeStartsFresh', () => {
   it('copilot / cursor without a persisted cliSessionId start fresh', () => {
@@ -126,6 +133,24 @@ describe('resumeStartsFresh', () => {
     expect(resumeStartsFresh({})).toBe(false);
     expect(resumeStartsFresh({ cliId: 'not-a-real-cli' })).toBe(false);
   });
+
+  // Regression: the worker resolves the EFFECTIVE adapter from the bot's LIVE
+  // `dshRuntime` toggle, but a session row only persists `cliId='dsh'`. Asking
+  // the policy with the raw cliId used to build the headless dsh adapter (which
+  // can "resume"), so the closed card / receipt promised restored history that
+  // the PTY-driven dsh-tui can never deliver — it records no native id.
+  it('a dsh bot configured with dshRuntime=tui cannot pretend to resume history', () => {
+    expect(resumeStartsFresh({ cliId: 'dsh', dshRuntime: 'tui' })).toBe(true);
+    expect(resumeStartsFresh({ cliId: 'dsh', dshRuntime: 'tui', cliSessionId: 'native-1' })).toBe(false);
+    // Headless dsh keeps its prior behaviour.
+    expect(resumeStartsFresh({ cliId: 'dsh', dshRuntime: 'official' })).toBe(false);
+    expect(resumeStartsFresh({ cliId: 'dsh' })).toBe(false);
+  });
+
+  it('the persisted dsh-tui cliId resolves to the same answer', () => {
+    expect(resumeStartsFresh({ cliId: 'dsh-tui' })).toBe(true);
+    expect(resumeStartsFresh({ cliId: 'dsh-tui', cliSessionId: 'native-1' })).toBe(false);
+  });
 });
 
 // ─── Closed-session card ────────────────────────────────────────────────────
@@ -149,5 +174,47 @@ describe('closed-session card for a precise-id-only CLI', () => {
     const md = markdown(buildClosedSessionCard(session('chat-1'), 'zh'));
     expect(md).toContain('cursor-agent --resume chat-1');
     expect(md).not.toContain(freshNote);
+  });
+});
+
+// ─── Configured dsh-tui (cliId='dsh' + bot dshRuntime='tui') ────────────────
+describe('display chain for a configured dsh-tui bot', () => {
+  const session = (cliSessionId?: string) => ({
+    sessionId: 'botmux-dsh-tui', rootMessageId: 'om_root', chatId: 'oc_chat', chatType: 'group',
+    title: 'Topic', status: 'closed', createdAt: '2026-08-03T00:00:00.000Z', workingDir: '/repo',
+    cliId: 'dsh', agentFrozen: true, larkAppId: 'app_test',
+    ...(cliSessionId ? { cliSessionId } : {}),
+  }) as unknown as Session;
+  const markdown = (cardJson: string): string =>
+    (JSON.parse(cardJson) as { elements: Array<{ tag: string; content?: string }> })
+      .elements.find(e => e.tag === 'markdown')?.content ?? '';
+  const freshNote = t('card.body.resume_starts_fresh', { cliName: getCliDisplayName('dsh') }, 'zh');
+
+  const asTuiBot = () => getBotMock.mockReturnValue({
+    config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'dsh', dshRuntime: 'tui' },
+  } as never);
+
+  it('closed card warns the resume starts fresh (never claims history is back)', () => {
+    asTuiBot();
+    const md = markdown(buildClosedSessionCard(session(), 'zh'));
+    expect(md).toContain(freshNote);
+    expect(md).not.toContain('会话已恢复');
+  });
+
+  it('closed card stops warning once a native id was persisted', () => {
+    asTuiBot();
+    const md = markdown(buildClosedSessionCard(session('native-1'), 'zh'));
+    expect(md).not.toContain(freshNote);
+  });
+
+  it('resume receipt says "fresh session" for the TUI runtime', () => {
+    const msg = resumeSuccessMessage({ ds: { session: { cliId: 'dsh' } } }, 'dsh', 'zh', 'tui');
+    expect(msg).toContain('新起干净会话');
+    expect(msg).not.toContain('会话已恢复');
+  });
+
+  it('resume receipt keeps the restored wording for headless dsh', () => {
+    const msg = resumeSuccessMessage({ ds: { session: { cliId: 'dsh' } } }, 'dsh', 'zh');
+    expect(msg).toContain('会话已恢复');
   });
 });

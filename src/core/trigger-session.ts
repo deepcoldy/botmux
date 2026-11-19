@@ -18,6 +18,7 @@ import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
 import { markSessionActivity } from './session-activity.js';
+import { excludedTurnActivityAt } from './turn-outcome.js';
 import {
   closeSessionForBackgroundCleanup,
   forkWorker,
@@ -41,7 +42,7 @@ import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { cliModelSupportsReasoningEffort } from '../services/codex-reasoning-effort.js';
+import { cliLaunchAcceptsReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { allowsTaskModelOverride } from './launch-model-capability.js';
 import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updateHeadlessSession } from '../services/headless-session-store.js';
 
@@ -54,6 +55,11 @@ export interface TriggerSessionDeps {
  * public TriggerRequest schema: an untrusted connector must not choose a turn
  * identity that participates in durable delivery reconciliation. */
 export interface TriggerSessionInternalOptions {
+  /** Reject a host-only event before reserving its at-most-once turn lease. */
+  validateBeforeClaim?: () => void;
+  /** Final synchronous host-side policy fence for internal metadata events.
+   * Public trigger JSON cannot supply this callback. */
+  validateBeforeDispatch?: () => void;
   stableTurnId?: string;
   /** Trusted dashboard listener execution; never accepted from the public trigger API. */
   messageListenerRun?: import('./message-listener-silence.js').SilentMessageListenerRun;
@@ -189,6 +195,20 @@ export function isTrustedPayloadRequest(req: TriggerRequest): boolean {
 export function trustedPayloadSessionInScope(requestChatId: string | undefined, sessionChatId: string): boolean {
   if (requestChatId) return sessionChatId === requestChatId;
   return sessionChatId.startsWith('http_async_') || sessionChatId.startsWith('http_wait_');
+}
+
+/** Zero-injection prompt of an external trigger: the caller's instruction,
+ *  then the event data as-is. An event without data (no rawText, payload
+ *  absent or `{}`) sends the instruction alone — rendering the missing payload
+ *  as `{}` put a stray "{}" line under every bare "继续" a connector sent. A
+ *  request with neither still renders its (empty) payload, as before: an empty
+ *  input is not a turn the CLI would start. */
+export function buildZeroInjectionTriggerPrompt(req: Pick<TriggerRequest, 'instruction' | 'envelope'>): string {
+  const { rawText, payload } = req.envelope;
+  const emptyPayload = payload === undefined || payload === null
+    || (typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0);
+  const data = rawText ?? (emptyPayload ? undefined : JSON.stringify(payload));
+  return [req.instruction, data].filter(Boolean).join('\n\n') || JSON.stringify(payload ?? {});
 }
 
 export function buildUntrustedEventPrompt(req: TriggerRequest, triggerId: string): string {
@@ -729,6 +749,7 @@ function waitForSessionFinalOutput(
       resolve({ ok: false, triggerId, errorCode: 'wait_timeout', error: `wait timeout after ${timeoutMs}ms` });
     }, timeoutMs);
     ds.pendingWaitPromises!.set(triggerId, {
+      createdAt: Date.now(),
       resolve: (text: string) => {
         clearTimeout(timer);
         ds.pendingWaitPromises?.delete(triggerId);
@@ -875,6 +896,7 @@ async function triggerSessionTurnAdmitted(
         ? { content, codexAppSteerable: true }
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
+    internal?.validateBeforeDispatch?.();
     // Every accepted external input owns its generated turn, including quiet
     // report follow-ups on an already-running worker. Keep its reply anchor
     // independent of presentation and final-output suppression options.
@@ -1003,7 +1025,7 @@ async function triggerSessionTurnAdmitted(
   const dryRun = !!req.options?.dryRun;
   const promptForSession = (target?: DaemonSession) => zeroPromptInjectionForBot(larkAppId, undefined,
     target ? sessionPromptInjection(target) : undefined)
-    ? [req.instruction, req.envelope.rawText ?? JSON.stringify(req.envelope.payload ?? {})].filter(Boolean).join('\n\n')
+    ? buildZeroInjectionTriggerPrompt(req)
     : buildUntrustedEventPrompt(req, triggerId);
   const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
@@ -1402,7 +1424,12 @@ async function triggerSessionTurnAdmitted(
     const queuedBehindActivation = workerIsLive
       && hasQueuedActivationAdmissionGate(target);
     const recordAcceptedInput = (): void => {
-      markSessionActivity(target);
+      // Registration and accepted-input publication can cross a millisecond
+      // boundary. Reuse the exact per-turn timestamp that the excluded-terminal
+      // hold will read, so this round cannot stay pending behind its own later
+      // wall-clock acceptance time. Never take max(lastMessageAt): a subsequent
+      // human input owns that later timestamp.
+      markSessionActivity(target, excludedTurnActivityAt(target, triggerId) ?? Date.now());
       rememberInput(target, prompt, content);
     };
 
@@ -1423,6 +1450,7 @@ async function triggerSessionTurnAdmitted(
       | { reuse: TriggerResponse }
       | { retry: TriggerResponse }
       | { lease: idempotencyStore.IdempotencyRecord | undefined } => {
+      internal?.validateBeforeClaim?.();
       if (!turnLeaseKey) return { lease: undefined };
       // At-most-once cannot be held through the queued-activation durable tail:
       // that staging path (admitQueuedActivationTail → promotion → queuedActivation
@@ -1817,9 +1845,12 @@ async function triggerSessionTurnAdmitted(
     ? req.options.model.trim()
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
+  // The bot's own saved pair passed config load; judge it by the same keep-rule
+  // (a Codex level on a model the table does not know is the launch check's).
+  const inheritedPair = effectiveModel === bot.config.model && !req.options?.reasoningEffort;
   if (acceptsTaskOverride && effectiveReasoningEffort
       && bot.config.cliId !== 'traex'
-      && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
+      && !cliLaunchAcceptsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort, inheritedPair)) {
     return {
       ok: false,
       errorCode: 'bad_request',

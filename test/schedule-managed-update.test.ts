@@ -48,8 +48,7 @@ function patrolTask() {
     executionPosition: 'new-topic',
     silent: true,
     calendar: 'cn',
-    ownerOpenId: 'ou_owner',
-    ownerUnionId: 'on_owner',
+    owner: { kind: 'human', openId: 'ou_owner', unionId: 'on_owner' },
   }, APP_ID, { enabled: true, source: { kind: 'inline', script: 'printf 1' } });
   updateStoredTask(created.id, {
     lastRunAt: '2026-11-06T10:00:00.000Z', lastStatus: 'ok', lastRunId: 'run-9',
@@ -149,7 +148,7 @@ describe('managed schedule frequency update', () => {
     // resume actually schedules.
     const finishedOneShot = () => {
       const created = scheduler.addTask({
-        name: 'once', schedule: '30m', prompt: 'p', workingDir: tempDir, chatId: 'oc_patrol', larkAppId: APP_ID,
+        name: 'once', schedule: '30m', prompt: 'p', workingDir: tempDir, chatId: 'oc_patrol', larkAppId: APP_ID, owner: { kind: 'ownerless' },
       });
       markRun(created.id, true);
       return created.id;
@@ -176,7 +175,7 @@ describe('managed schedule frequency update', () => {
   it('keeps the until-done retry rule tied to a one-shot', () => {
     const created = scheduler.addTask({
       name: 'follow-up', schedule: '2026-11-07T10:00', prompt: 'clean up', workingDir: tempDir,
-      chatId: 'oc_patrol', larkAppId: APP_ID, untilDone: { retryMinutes: 360 },
+      chatId: 'oc_patrol', larkAppId: APP_ID, untilDone: { retryMinutes: 360 }, owner: { kind: 'ownerless' },
     });
     const before = getTask(created.id, APP_ID)!;
     expect(applyManagedScheduleUpdate(created.id, APP_ID, { schedule: 'every 4h' }))
@@ -198,7 +197,7 @@ describe('managed schedule frequency update', () => {
   it('refuses a one-shot time that has already passed', () => {
     const created = scheduler.addTask({
       name: 'plain', schedule: 'every 1h', prompt: 'p', workingDir: tempDir,
-      chatId: 'oc_patrol', larkAppId: APP_ID,
+      chatId: 'oc_patrol', larkAppId: APP_ID, owner: { kind: 'ownerless' },
     });
     const before = getTask(created.id, APP_ID)!;
     expect(applyManagedScheduleUpdate(created.id, APP_ID, { schedule: '2026-11-01T09:00' }))
@@ -211,7 +210,7 @@ describe('managed schedule frequency update', () => {
   it('keeps the first run no later than an until-done deadline', () => {
     const created = scheduler.addTask({
       name: 'bounded', schedule: '2026-11-07T10:00', prompt: 'wrap up', workingDir: tempDir,
-      chatId: 'oc_patrol', larkAppId: APP_ID, untilDone: { deadline: '2026-11-08T10:00' },
+      chatId: 'oc_patrol', larkAppId: APP_ID, untilDone: { deadline: '2026-11-08T10:00' }, owner: { kind: 'ownerless' },
     });
     const before = getTask(created.id, APP_ID)!;
     expect(applyManagedScheduleUpdate(created.id, APP_ID, { schedule: '2026-11-09T09:00' }))

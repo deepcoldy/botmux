@@ -107,7 +107,12 @@ skipped; the Dashboard run and its report are still required.
 
 Master runs never cancel each other. While one runs, GitHub keeps only the
 newest pending one, so a run can cover several merges. Each master run
-publishes its report under `master-run-<run id>` (the newest five are kept).
+publishes its report under `master-run-<run id>`, and only the newest two are
+kept (a report is 300–600 MB and the Pages site has a size limit); a pull
+request's report is removed once the pull request closes. Older Summary links
+and failure comments therefore return 404. The same site stays in that run's
+`botmux-midscene-site` artifact for 7 days: unzip it and serve the folder
+(for example `python3 -m http.server`) to browse it.
 When a master run fails, `scripts/midscene-notify-failure.mjs` comments on every
 pull request merged since the last master run that reached a result,
 mentioning its author and the repository owner, with the failed cases, the

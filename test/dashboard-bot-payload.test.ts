@@ -1,5 +1,9 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig, withConfiguredCliId } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
   it('shows persisted legacy CoT preferences with explicit canonical values taking precedence', () => {
@@ -55,7 +59,7 @@ describe('dashboard bot payload helpers', () => {
       'sandbox', 'sandboxPaths', 'readIsolationSupported', 'backendType', 'defaultBackendType',
       'usageDisplay', 'usageSupported',
       'disableStreamingCard', 'hiddenStreamingCardButtons', 'pinStreamingCard', 'silentTurnReactions',
-      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'privateCard',
+      'codexAppCleanInput', 'codexBrowser', 'codexBrowserAutoApproveOrigins', 'writableTerminalLinkInCard', 'goalStatusCard', 'privateCard',
       'cotEnabled', 'replyCardShowTools', 'senderTag', 'senderTagHideEmail', 'overloadAlert', 'botToBotSameDir', 'autoInviteOwnerOnGroupAdd', 'quotaFallbackBot',
       'autoStartOnGroupJoin', 'autoStartOnGroupJoinPrompt', 'autoStartOnGroupJoinSeed', 'autoStartOnGroupJoinSeedDefault',
       'groupJoinCommandEnabled', 'groupJoinCommand',
@@ -175,7 +179,6 @@ describe('dashboard bot payload helpers', () => {
     const policy = {
       enabled: true,
       tools: ['lark-cli' as const],
-      fallback: 'none' as const,
       gitHost: 'code.example.com',
     };
     // An enabled policy survives whole — a refresh rebuilds the toggle, the tool
@@ -189,11 +192,11 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: null }))
       .toMatchObject({ triggerUserAuth: null });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: false } }))
-      .toMatchObject({ triggerUserAuth: { enabled: false, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' } });
+      .toMatchObject({ triggerUserAuth: { enabled: false, tools: ['lark-cli', 'bytedcli'] } });
 
     // A malformed policy must not throw here: this builds every bot row, so one
     // bad value would blank the whole Bot Defaults page rather than one toggle.
-    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: true, fallback: 'device' } }))
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: true, capabilities: ['bits'] } }))
       .toMatchObject({ triggerUserAuth: null });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: 'yes' }))
       .toMatchObject({ triggerUserAuth: null });
@@ -352,6 +355,12 @@ describe('dashboard bot payload helpers', () => {
       customPassthroughCommands: '',
       canTalkDaemonCommands: '',
     });
+  });
+
+  it('projects daemon-provided default CLI command names without inventing them for old daemons', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { defaultPassthroughCommands: ['/goal', '/model', 3, 'invalid'] }))
+      .toMatchObject({ defaultPassthroughCommands: ['/goal', '/model'] });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).defaultPassthroughCommands).toBeUndefined();
   });
 
   it('projects launchShell so the dashboard preserves it after refresh', () => {
@@ -699,6 +708,59 @@ describe('dashboard bot payload helpers', () => {
     expect(offlineRow({ grantDelegateBots: 'ou_platform_bot' }).grantDelegateBots).toEqual([]);
     expect(botDefaultsPayload({ larkAppId: 'cli_live' }, { grantDelegateBots: ['ou_x', 42] }).grantDelegateBots)
       .toEqual(['ou_x']);
+  });
+
+  it('archiveCodex shows an explicit per-bot override (also offline) next to the current global value', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'bot-payload-archive-'));
+    const previous = process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    const file = join(dir, 'config.json');
+    process.env.BOTMUX_GLOBAL_CONFIG_FILE = file;
+    try {
+      const offlineRow = (raw: Record<string, unknown>) => botDefaultsPayload(
+        { larkAppId: 'cli_offline' },
+        { displayName: null, larkBotName: null, ...sparseOverridesFromRawBotConfig(raw) },
+      );
+      for (const globalOn of [false, true]) {
+        writeFileSync(file, JSON.stringify({ sessionCleanup: { archiveCodex: globalOn } }));
+        invalidateGlobalConfigCache();
+        // 显式关闭在全局开启时也要原样显示，离线行同样不能退回「跟随全局」。
+        expect(offlineRow({ archiveCodex: false })).toMatchObject({ archiveCodex: false, archiveCodexDefault: globalOn });
+        expect(offlineRow({ archiveCodex: true })).toMatchObject({ archiveCodex: true, archiveCodexDefault: globalOn });
+        expect(botDefaultsPayload({ larkAppId: 'cli_live' }, { archiveCodex: false }).archiveCodex).toBe(false);
+        // 未设置 / 非法手改值：null = 跟随全局。
+        expect(offlineRow({})).toMatchObject({ archiveCodex: null, archiveCodexDefault: globalOn });
+        expect(offlineRow({ archiveCodex: 'off' }).archiveCodex).toBeNull();
+      }
+    } finally {
+      if (previous === undefined) delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+      else process.env.BOTMUX_GLOBAL_CONFIG_FILE = previous;
+      invalidateGlobalConfigCache();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it('propagates apiOnly through live, descriptor and offline recovery payloads', () => {
+    expect(botDefaultsPayload({ larkAppId: 'local_descriptor', apiOnly: true }, {}).apiOnly).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'local_live' }, { apiOnly: true }).apiOnly).toBe(true);
+    expect(botDefaultsPayload({ larkAppId: 'cli_live' }, {}).apiOnly).toBe(false);
+    const offline = botDefaultsPayload(
+      { larkAppId: 'local_offline' },
+      { displayName: null, larkBotName: null, ...sparseOverridesFromRawBotConfig({ apiOnly: true }) },
+    );
+    expect(offline.apiOnly).toBe(true);
+    expect(mergeBotOncallFields({ larkAppId: 'local_old', apiOnly: true }, {}).apiOnly).toBe(true);
+    expect(mergeBotOncallFields({ larkAppId: 'local_new' }, { apiOnly: true }).apiOnly).toBe(true);
+    expect(mergeBotOncallFields({ larkAppId: 'local_old', apiOnly: true }, { apiOnly: false }).apiOnly).toBe(false);
+  });
+
+  it('keeps apiOnly when merging an older daemon descriptor with config fallbacks', () => {
+    const fallback = new Map<string, { apiOnly?: boolean; cliId?: string }>([
+      ['local_old', { apiOnly: true, cliId: 'riff' }],
+      ['cli_old', { apiOnly: false, cliId: 'codex' }],
+    ]);
+    expect(withConfiguredCliId({ larkAppId: 'local_old' }, fallback)).toMatchObject({ apiOnly: true, cliId: 'riff' });
+    expect(withConfiguredCliId({ larkAppId: 'cli_old' }, fallback)).toMatchObject({ apiOnly: false, cliId: 'codex' });
+    // An explicit descriptor value remains authoritative over a stale config fallback.
+    expect(withConfiguredCliId({ larkAppId: 'local_old', apiOnly: false }, fallback).apiOnly).toBe(false);
   });
 });
 

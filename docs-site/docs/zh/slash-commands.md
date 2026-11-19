@@ -110,6 +110,10 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 
 负责人接有对话权限的人的群顶层未 @ 消息；只点名其他成员时让路，@all 不算转交。群名追加机器人名，取消时保留人工改名。原有 ambient、never 和 reply-mode 独立生效；负责人是群级身份与交接，不是新的响应模式，也不保证全群只有一个机器人回复。
 
+**负责人接的消息开不开话题**：默认不开，免 @ 接下的顶层消息照旧平铺回复。回复模式为 `shared` 的普通群里，想让它像 @ 本机器人那样把回复挂到那条消息下面的话题，在 Dashboard 同一处打开「群负责人接的消息也开话题」（或 `/botconfig set chatManagerSharedTopic on`）。会话仍是群里同一个；要先打开「群负责人」；其它回复模式不受影响。话题里继续说话要不要 @，仍按本群的「群聊 @ 策略」：默认「必须 @」时话题内续话也要 @，配成「话题内免 @」、`never` 或 `ambient` 后才可免 @ 续话。
+
+![Dashboard 中「群负责人接的消息也开话题」开关](/img/chat-manager-shared-topic-dashboard.png)
+
 切换时先让旧负责人 clear，成功后再让新负责人 set。每次负责人免 @ 放行都核对群描述标记，读取失败不沿用旧状态；必须同时存在本地管理员启用记录。描述超长拒绝，不截断人写的说明。
 
 飞书没有跨机器条件写入，不承诺并发抢占的强一致性。网络异常或 `chat_update_unconfirmed` 后先查 status。本地记录在数据目录 `chat-managers/` 下，权限 0600，应随数据目录备份。
@@ -200,9 +204,9 @@ Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
 
 `/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Mojo 后端上，`/fast` 仍走透传分支，会被 fail-closed 明确拒绝、给出提示，而不会静默生效。Riff 后端则按上一段处理：`/fast` 不进透传，而是作为普通消息封装成一次远端任务，同样不会切换档位。
 
-部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
+部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex / Seed / Relay / TRAE CLI（`traex`）默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。`/goal` 的子命令和行为以所用 CLI 版本为准。
 
-想放行更多命令，给该 bot 配 [`customPassthroughCommands`](/bots-json)（如 `["/export"]`）即可在上面白名单之外按需扩展。会遮蔽 botmux daemon 命令的项（如 `/status`、`/help`、`/cd`）会被自动丢弃——daemon 命令始终保留自身语义，无法被透传覆盖。
+想放行更多命令，给该 bot 配 [`customPassthroughCommands`](/bots-json)（如 `["/export"]`）即可在上面白名单之外按需扩展。会遮蔽 botmux daemon 命令的项（如 `/status`、`/help`、`/cd`）会被自动丢弃——daemon 命令始终保留自身语义，无法被透传覆盖。也可以在 Dashboard「Bot 配置 → Slash 命令 → 额外透传命令」里改：上方列出当前 CLI 已默认透传的命令，下方逐个增删额外命令（Enter、逗号或 Tab 生成一项，也可一次粘贴多个）。这里只填命令名，参数在会话里随命令一起发；额外命令只在 CLI 正在运行的会话里透传，不会像 `/goal` 那样在新话题里冷启动会话。
 
 **一条消息里级联多条透传命令**（会话内，CLI 已在跑）：每行一条透传命令，最后可以接正文，botmux 会按书写顺序逐条送出，每条之间等 CLI 空闲——
 

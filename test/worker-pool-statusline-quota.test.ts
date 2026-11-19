@@ -1,7 +1,7 @@
 /**
  * getDaemonSessionUsageSnapshot 是回复卡页脚 / 流式卡用量行 / IPC `/usage` 三个读取点的
- * 唯一汇合处：Claude Code statusline 快照（ctx / 5h / 7d）只在这里合并一次。
- * 无快照 / 陈旧 / 非 claude-code ⇒ 原样返回 transcript 快照（同一对象，不带 quota key），
+ * 唯一汇合处：Claude Code / Antigravity statusline 快照（ctx / 5h / 7d）只在这里合并一次。
+ * 无快照 / 陈旧 / 其它 CLI ⇒ 原样返回 transcript 快照（同一对象，不带 quota key），
  * 保证卡片与无 statusline 时逐字节相同。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -55,7 +55,17 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
     expect('quota' in out).toBe(false);
   });
 
-  it('ignores the snapshot for non-claude-code CLIs even when a file exists', () => {
+  it('merges the on-disk statusline snapshot for antigravity (including resumed snapshots without contextPercent)', () => {
+    const base = { context: { usedTokens: 230_000, windowTokens: 1_000_000, percentUsed: 23 }, tokens: { in: 300_000, out: 12_000 } };
+    vi.spyOn(costCalculator, 'getSessionUsageSnapshot').mockReturnValue(base as any);
+    writeStatuslineSnapshot(dataDir, 's-agy', { ts: Date.now(), fiveHourPercent: 20.9, sevenDayPercent: 6.7 });
+    expect(getDaemonSessionUsageSnapshot(ds('s-agy'), 'antigravity')).toEqual({
+      ...base,
+      quota: { fiveHourPercent: 21, sevenDayPercent: 7 },
+    });
+  });
+
+  it('ignores the snapshot for other CLIs even when a file exists', () => {
     const base = { context: null, tokens: { in: 1, out: 2 } };
     vi.spyOn(costCalculator, 'getSessionUsageSnapshot').mockReturnValue(base as any);
     writeStatuslineSnapshot(dataDir, 's3', { ts: Date.now(), fiveHourPercent: 18 });

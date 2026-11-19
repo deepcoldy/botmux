@@ -418,14 +418,38 @@ describe('cross-conversation delivery boundaries', () => {
 
   it.each([
     ['cross-chat --chat-id', { deliveryKind: 'detoured_send', targetChatId: 'oc_other' }],
-    ['same-chat --into another root', {
-      deliveryKind: 'detoured_send', targetChatId: 'oc_source', targetRootMessageId: 'om_other_root',
-    }],
     ['report to an orchestrator session', {
       deliveryKind: 'dispatch_report', targetSessionId: 'session-orchestrator',
     }],
   ] as const)('keeps the source-topic final after %s', (_label, routing) => {
     expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false)).toBe(false);
+  });
+
+  it('suppresses source-topic prose after a same-chat --into final, even when the transcript is longer', () => {
+    const routing = {
+      deliveryKind: 'detoured_send' as const,
+      targetChatId: 'oc_source',
+      targetRootMessageId: 'om_other_root',
+    };
+    const long = `${finalText}${' extra transcript that was not sent.'.repeat(12)}`;
+    expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false)).toBe(true);
+    expect(shouldSuppressBridgeEmit(gate(long), 200, [marker({
+      ...routing,
+      contentLength: normalise(finalText).length,
+    })], false)).toBe(true);
+  });
+
+  it('still posts source-topic prose when the same-chat detour was only progress', () => {
+    expect(shouldSuppressBridgeEmit(gate(), 200, [marker({
+      deliveryKind: 'detoured_send',
+      targetChatId: 'oc_source',
+      targetRootMessageId: 'om_other_root',
+      responseKind: 'progress',
+    })], false)).toBe(false);
+  });
+
+  it('still posts the fallback when this turn sent no final', () => {
+    expect(shouldSuppressBridgeEmit(gate(), 200, [], false)).toBe(false);
   });
 
   it.each([
@@ -2058,5 +2082,60 @@ describe('structuredFallbackKind', () => {
       false,
       false,
     )).toBe('none');
+  });
+});
+
+describe('empty completion requires delivery, not explicitly classified progress', () => {
+  const completed = {
+    ...turn(100), sessionId: 'session', turnId: 'turn', dispatchAttempt: 1,
+    terminalStatus: 'completed' as const, finalText: '',
+  };
+  const delivered: BridgeSendMarker = {
+    ...markerForContent(150, 'result'), sessionId: 'session', turnId: 'turn', dispatchAttempt: 1,
+    messageId: 'message', responseKind: 'final', deliveryKind: 'current_session_send',
+  };
+
+  it.each(['send', 'transcript'] as const)('keeps both classification and emit gates open for progress (%s)', mode => {
+    for (const marker of [
+      { ...delivered, responseKind: 'progress' as const },
+      { ...delivered, responseKind: 'auxiliary' as const },
+      { ...delivered, replyCardResponseKind: 'progress' as const },
+      { ...delivered, replyCardResponseKind: 'auxiliary' as const },
+    ]) {
+      const kind = structuredFallbackKind(completed, 200, [marker], false, true, mode);
+      expect(kind).toBe('empty_completed');
+      expect(shouldSuppressStructuredFallback(kind, completed, 200, [marker], false, mode)).toBe(false);
+    }
+  });
+
+  it('retains the real no-answer/no-send regression', () => {
+    expect(structuredFallbackKind(completed, 200, [], false, true)).toBe('empty_completed');
+  });
+
+  it('does not repost after a final, including an image-only final', () => {
+    for (const marker of [delivered, { ...delivered, contentLength: undefined, contentHash: undefined }]) {
+      expect(structuredFallbackKind(completed, 200, [marker], false, true)).toBe('none');
+    }
+  });
+
+  it('does not borrow another turn or attempt final', () => {
+    for (const marker of [{ ...delivered, turnId: 'other' }, { ...delivered, dispatchAttempt: 2 }]) {
+      expect(structuredFallbackKind(completed, 200, [marker], false, true)).toBe('empty_completed');
+    }
+  });
+
+  it('keeps legacy unclassified sends and explicit silence compatible', () => {
+    const { responseKind: _kind, ...legacy } = delivered;
+    expect(structuredFallbackKind(completed, 200, [legacy], false, true)).toBe('none');
+    const silent = { ...completed, finalText: 'BOTMUX_NOTHING_TO_SEND' };
+    expect(shouldSuppressStructuredFallback('final', silent, 200, [], false)).toBe(true);
+    expect(shouldEmitEmptyCompletedBridgeFallback(completed, 200, [], true)).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback({ ...completed, isLocal: true }, 200, [], false)).toBe(false);
+  });
+
+  it('preserves normal final text dedup independently of completion evidence', () => {
+    const progress = { ...delivered, responseKind: 'progress' as const };
+    const answer = { ...completed, finalText: 'result' };
+    expect(shouldSuppressStructuredFallback('final', answer, 200, [progress], false)).toBe(true);
   });
 });

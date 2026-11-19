@@ -124,6 +124,50 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     try { expect(extensions.subject('cli_app', 'sess-a', 'turn-a')).toEqual({ sourceMessageId: 'om_root_sess-a', answerKind: 'substantive' }); }
     finally { extensions.close(); }
   });
+  it('persists native feedback context only for an authorized current source and bounds its input', async () => {
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{ chat_id: 'oc_sess-a' }] } as any);
+    const context = { kind: 'classification', category: 42, description: 'x'.repeat(5000) };
+    const request = (value: unknown, capability = CAP_A) => fetch(
+      `http://127.0.0.1:${handle!.port}/api/sessions/sess-a/feedback-bind`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ originCapability: capability, expectedTurnId: 'turn-a',
+          sourceMessageId: 'om_root_sess-a', answerKind: 'substantive', context: value }),
+      });
+    expect((await request(context, CAP_B)).status).toBe(403);
+    expect((await request(context)).status).toBe(200);
+    const extensions = await FeedbackExtensionStore.open(dataDir!);
+    try {
+      expect(extensions.subject('cli_app', 'sess-a', 'turn-a')?.context).toEqual(context);
+      expect((await request({ category: 99 })).status).toBe(409);
+      expect((await request({ text: 'x'.repeat(8192) })).status).toBe(400);
+      expect(extensions.subject('cli_app', 'sess-a', 'turn-a')?.context).toEqual(context);
+    } finally { extensions.close(); }
+  });
+  it('refuses a revoked same-turn execution after the asynchronous source lookup', async () => {
+    const session = liveSession('sess-a', CAP_A, 'turn-a');
+    await setup({ 'sess-a': session });
+    let release!: () => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(larkClient, 'getMessageDetail').mockImplementation(async () => {
+      entered();
+      await new Promise<void>(resolve => { release = resolve; });
+      return { items: [{ chat_id: 'oc_sess-a' }] } as any;
+    });
+    const request = fetch(`http://127.0.0.1:${handle!.port}/api/sessions/sess-a/feedback-bind`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ originCapability: CAP_A, expectedTurnId: 'turn-a',
+        sourceMessageId: 'om_root_sess-a', answerKind: 'substantive', context: { category: 42 } }),
+    });
+    await waiting;
+    session.managedTurnOrigin = { ...session.managedTurnOrigin, capability: CAP_B, dispatchAttempt: 3 };
+    release();
+    expect((await request).status).toBe(409);
+    const extensions = await FeedbackExtensionStore.open(dataDir!);
+    try { expect(extensions.subject('cli_app', 'sess-a', 'turn-a')).toBeUndefined(); }
+    finally { extensions.close(); }
+  });
   it('records the row from the live session, ignoring body-supplied correlation fields', async () => {
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
     const res = await post('sess-a', {

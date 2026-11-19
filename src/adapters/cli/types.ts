@@ -92,6 +92,9 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  /** Durable replay identity. Runner adapters may forward this with turnId so
+   * late output from an older attempt cannot settle its successor. */
+  dispatchAttempt?: number;
   /** Owned, prompt-injected Codex input may carry a fresh correlation marker.
    * An exact post-write history match then proves ownership even when the OS
    * sandbox prevents reading the CLI's open rollout file descriptors. */
@@ -99,6 +102,25 @@ export interface WriteInputContext {
   trustedCaller?: TrustedCaller;
   /** codex-app only: this turn is authorized to steer into an active turn. */
   codexAppSteerable?: true;
+  /** Asked right before each submit key: has the CLI's input surface been
+   *  taken over meanwhile — TRAE's question page popping up between the paste
+   *  and its Enter — so the key would answer that page instead of submitting?
+   *  See TraeX's writeInput for how an adapter honours it. */
+  submitGuard?: SubmitGuard;
+}
+
+export interface SubmitGuard {
+  /** A reason (shown to the user) while the surface is taken, else undefined.
+   *  `draft` = the message was pasted and its first Enter is pending (it sits
+   *  in the composer under the page); `retry` = a resend of an Enter that
+   *  may already have submitted. */
+  blocked(phase: 'draft' | 'retry'): Promise<string | undefined>;
+  /** False once the CLI this write started on is gone: stop waiting. */
+  current(): boolean;
+  /** How long a pasted draft may wait for the surface to come back. */
+  maxWaitMs: number;
+  /** Re-check cadence while waiting. */
+  pollMs: number;
 }
 
 /** A session discovered on disk that botmux can resume (import) into a topic —
@@ -272,6 +294,9 @@ export interface CliAdapter {
     /** Lead-only chat manager session (claude-code only; ignored by other CLIs): block
      *  file/web/agent tools, mount the dedicated lead-only guard plugin dir, append the lead-only prompt. */
     leadOnly?: boolean;
+    /** BotConfig.hideLocalAddresses when the worker was forked: adapters that
+     *  build the Botmux system prompt add the full local-address rule. */
+    hideLocalAddresses?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a
@@ -295,6 +320,11 @@ export interface CliAdapter {
      *  others ignore. Note the accepted set is per-CLI: `ultra` is codex/traex
      *  only — Claude Code rejects it with a warning, so its adapter filters. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Codex App only: whether its runner may use the bare local
+     * `codex debug models` catalogue when a missing-thread resume falls back to
+     * a fresh thread/start. False for wrappers, Codex profiles and remote
+     * backends, whose actual provider the bare catalogue cannot attest. */
+    allowCodexReasoningCatalog?: boolean;
     /** Codex-only thread service tier. Missing inherits the executor's config. */
     codexProfile?: string;
     serviceTier?: CodexServiceTier;
@@ -310,6 +340,8 @@ export interface CliAdapter {
      *  Missing or "unknown" means "not probed": adapters must then behave as if the
      *  flag is unsupported (keep the old argv) rather than guess. */
     cliVersion?: string;
+    /** True when attaching to an existing process; its version may differ from the installation. */
+    reattach?: boolean;
     /** Codex App only: restricted local browser extension bridge. */
     codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
@@ -405,8 +437,11 @@ export interface CliAdapter {
   /** Only meaningful with passesInitialPromptViaArgs. If set, prompts whose
    *  UTF-8 byte length is GREATER than this adapter-specific limit are not
    *  baked into launch args; the worker defers them to the normal post-start
-   *  input queue. This guards backend launchers (notably tmux) whose command
-   *  string limit can be much lower than OS ARG_MAX. */
+   *  input queue. The budget dates from the old inline tmux launch, whose
+   *  command string tmux capped far below OS ARG_MAX; panes now read the full
+   *  launch argv from a private pane-launch file, so that cap no longer binds
+   *  and the number is retained only to keep the args-baked vs queued split
+   *  unchanged. */
   readonly maxInitialPromptArgBytes?: number;
 
   /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI
@@ -641,6 +676,14 @@ export interface CliAdapter {
    *  skill 兜底）。注入机制由各 adapter 自行决定（Claude 走 --settings、
    *  OpenCode 走插件、CoCo 走 ensureAskHook）。 */
   readonly asksViaHook?: boolean;
+
+  /** The CLI's own native question page that the worker bridges to a Lark
+   *  question card on the terminal path (no RPC input): `traex` = TRAE CLI's
+   *  `AskUserQuestion` "Questions" panel (utils/traex-question-page.ts). While
+   *  it is on screen queued input is held off it, the quiet screen does not
+   *  end the turn, and the card's answer is entered as verified keys
+   *  (core/traex-question-bridge.ts). Undefined = no such page. */
+  readonly nativeQuestionPage?: 'traex';
 
   /** 命令式 hook 安装钩子：适用于无法靠纯写文件完成、需要 spawn CLI 子命令的场景
    *  （CoCo 需要 `coco plugin install`）。声明式写文件的 CLI 用 `hookInstall`；本方法
@@ -891,6 +934,46 @@ export interface CliAdapter {
    *  with program status off. Later reports are authoritative as usual. */
   readonly programStatusStartupIdleUntrusted?: boolean;
 
+  /** Lowest CLI release whose OSC 7501 reports were verified for this adapter.
+   *  The worker parses reports only for a spawn whose probed version
+   *  (`SpawnContext.cliVersion`) is at least this. An older, unknown or
+   *  unparsable version, an adopted pane (its process version is not the
+   *  probed install) and an RPC viewer keep the screen heuristics, exactly as
+   *  without OSC 7501. Undefined = no version gate. */
+  readonly programStatusMinVersion?: string;
+
+  /** OSC 7501 reports describe this CLI's input cycles, not its composer:
+   *  - before the first botmux write cycle (`IdleDetector.reset({ inputCycle })`)
+   *    every report is ignored and startup readiness stays on the adapter's
+   *    screen gates (only the latest root report is remembered, see
+   *    `IdleDetector.lastProgramStatusReport`);
+   *  - after each write cycle the screen decides idle until the CLI reports
+   *    busy (`working` / `blocked`); terminal reports in between are ignored;
+   *  - from that busy report on the reports are authoritative as usual.
+   *  A cycle re-armed while a busy report is held keeps authority. For CLIs
+   *  that acknowledge a retained `done` with `idle` on the first keystroke,
+   *  report nothing for commands that start no work (`/status`, `/clear`),
+   *  and whose startup reports do not track composer readiness. Do not
+   *  combine with `programStatusSubmitAwaitsBusy`. */
+  readonly programStatusFollowsInputCycle?: boolean;
+
+  /** While OSC 7501 reports `blocked` (an approval dialog owns the input),
+   *  queued input is not typed ahead into the running turn: Enter would pick
+   *  the dialog's default answer. It goes in after the turn's terminal report,
+   *  like any input queued while not type-ahead capable. A `kind=question`
+   *  block is not held here: the next message is its answer (an adapter whose
+   *  question page would only take it as a note declares `nativeQuestionPage`
+   *  instead). */
+  readonly programStatusBlockedHoldsInput?: boolean;
+
+  /** The transcript's own turn terminal (`assistant_final`, fed through
+   *  `IdleDetector.fireIdle`) ends the turn even while OSC 7501 still holds
+   *  `working`; authority is dropped and the screen decides until the next
+   *  report. `blocked` still vetoes it. For CLIs whose `working` also covers
+   *  work beyond the botmux turn (Codex keeps active goals and pending
+   *  follow-ups `working`) and that have an exact transcript terminal. */
+  readonly programStatusYieldsToTranscriptTerminal?: boolean;
+
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,
    *  require fresh composer evidence (`staticBusyClearPattern`, falling back
@@ -906,12 +989,31 @@ export interface CliAdapter {
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
 
-  /** This CLI renders the codex_core hook-review / migration pages recognised
-   *  by `classifyStuckPage` (utils/stuck-detector.ts). Opts the session into
-   *  the "CLI is stuck" card: queued input is held off any of those pages and
-   *  the card offers the page's safe keys (core/stuck-page-catalog.ts).
-   *  Undefined = only the legacy hook-review input hold, never a card. */
-  readonly stuckPageFamily?: 'codex-family';
+  /** Which blocking pages this CLI renders, as recognised by
+   *  `classifyStuckPage(screen, family)` (utils/stuck-detector.ts):
+   *  `codex-family` = the codex_core hook-review / migration / session-lock
+   *  pages; `kimi` = Kimi Code's cache-expiry menu. Opts the session into the
+   *  "CLI is stuck" card: queued input is held off any of those pages and the
+   *  card offers the page's safe keys (core/stuck-page-catalog.ts). Pages are
+   *  read as this family's only. Undefined = only the legacy hook-review input
+   *  hold, never a card. */
+  readonly stuckPageFamily?: import('../../utils/stuck-detector.js').StuckPageFamily;
+
+  /** The CLI's own prediction of the user's next input, read from the
+   *  rendered input box of an idle screen (cells, so dim/inverse attributes
+   *  survive). Undefined = none on screen or not recognised; adapters without
+   *  it never offer a next-step suggestion. */
+  readonly promptSuggestion?: (rows: readonly import('../../utils/terminal-cells.js').ScreenRow[]) => string | undefined;
+
+  /** A one-off, tool-less, small-model call with this CLI's own credentials:
+   *  the optional「本轮回顾」model recap. The prompt is written to stdin;
+   *  stdout is the CLI's JSON result (`services/turn-recap.ts`
+   *  parseRecapModelOutput). Adapters without it never make that call. */
+  readonly recapModel?: {
+    args(systemPrompt: string): string[];
+    /** Added to the session's own CLI env for that call. */
+    readonly env: Readonly<Record<string, string>>;
+  };
 
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
@@ -1174,6 +1276,7 @@ export type StructuredBridgeAttachMode =
 
 /** One incremental drain of a path-addressed transcript. */
 export interface StructuredBridgeDrainResult {
+  latestGoal?: import('../../services/native-goal-state.js').NativeGoalState | null;
   events: CodexBridgeEvent[];
   /** Byte offset of the last fully parsed line; hand it back as the next `offset`. */
   newOffset: number;

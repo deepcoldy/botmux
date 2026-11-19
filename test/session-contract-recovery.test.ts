@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionController } from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { RestoredObserverGrantWait } from '../src/services/restored-observer-grant-wait.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { sameWorker, type WorkerRef } from '../src/services/session-contract.js';
@@ -89,6 +91,101 @@ afterEach(() => {
 });
 
 describe('user input during control operations', () => {
+  it('rolls back a half-written enrichment and retries it after reopening the database', async () => {
+    vi.useFakeTimers();
+    const s = fixture();
+    const restart = s.controller.beginControl('restart').operation; s.controller.controlStarted(restart.operationId);
+    const runtime = s.controller.reserveBinding('replacement', s.worker);
+    const bare = { backend: 'tmux', physicalId: '222:replacement', proof: 'process_start' as const };
+    s.controller.bindRuntime('replacement', s.worker, bare, restart.operationId);
+    s.controller.controlResult(restart.operationId, 'confirmed', runtime);
+    const original = s.store.bindRuntime.bind(s.store);
+    const failedWrite = vi.spyOn(s.store, 'bindRuntime').mockImplementationOnce((...args) => {
+      original(...args); throw new Error('write_after_binding_failed');
+    });
+    setTimeout(() => expect(() => s.controller.bindRuntime('replacement', s.worker,
+      { ...bare, nativeSessionId: 'replacement-native' }, restart.operationId)).toThrow('write_after_binding_failed'), 10);
+    await vi.advanceTimersByTimeAsync(10); failedWrite.mockRestore();
+    expect(s.store.runtime(s.ref)?.identity?.nativeSessionId).toBeUndefined();
+    const restoredSession = { ...s.ds, session: structuredClone(s.ds.session) } as DaemonSession;
+    s.store.close();
+    const reopened = new SessionContractStore(s.data, s.appId); handles.push(reopened);
+    const controller = new SessionController(restoredSession, reopened);
+    const rebound = controller.bindRuntime('replacement', s.worker, { ...bare, nativeSessionId: 'replacement-native' }, restart.operationId);
+    expect(rebound).toMatchObject({ ref: runtime, phase: 'starting', identity: { nativeSessionId: 'replacement-native' } });
+    expect(reopened.read(s.ref)?.activeOperationId).toBeUndefined();
+  });
+
+  it.each(['cancel', 'suspend'] as const)('keeps the live runtime ready when a late restart enrichment overlaps a newer %s', async kind => {
+    vi.useFakeTimers();
+    const s = fixture();
+    const restart = s.controller.beginControl('restart').operation; s.controller.controlStarted(restart.operationId);
+    const runtime = s.controller.reserveBinding('replacement', s.worker);
+    const bare = { backend: 'tmux', physicalId: '222:replacement', proof: 'process_start' as const };
+    s.controller.bindRuntime('replacement', s.worker, bare, restart.operationId);
+    s.controller.controlResult(restart.operationId, 'confirmed', runtime);
+    s.controller.ingest({ type: 'prompt_ready', sessionContract: s.context(3, { runtime }) }, s.worker);
+    const execution = s.controller.admitInput('turn-cancel'); s.store.bindQueuedExecution(s.ref, execution, runtime);
+    const cancel = s.controller.beginControl(kind, undefined, kind === 'cancel' ? execution : undefined).operation; s.controller.controlStarted(cancel.operationId);
+    setTimeout(() => s.controller.bindRuntime('replacement', s.worker, { ...bare, nativeSessionId: 'replacement-native' }, restart.operationId), 10);
+    await vi.advanceTimersByTimeAsync(10);
+    s.controller.controlResult(cancel.operationId, 'rejected', undefined, 'no_effect');
+    expect(s.store.read(s.ref)).toMatchObject({ lifecycle: 'active', activeRuntime: runtime });
+    expect(s.store.runtime(s.ref)?.phase).toBe('ready');
+    expect(s.ds.cliReady).toBe(true);
+  });
+
+  it.each(['early', 'late', 'reopened'] as const)('keeps the replacement live when native identity is enriched %s', timing => {
+    const s = fixture();
+    const { operation } = s.controller.beginControl('restart'); s.controller.controlStarted(operation.operationId);
+    const runtime = s.controller.reserveBinding('replacement', s.worker);
+    const bare = { backend: 'tmux', physicalId: '222:replacement', proof: 'process_start' as const };
+    s.controller.bindRuntime('replacement', s.worker, bare, operation.operationId);
+    if (timing !== 'early') s.controller.controlResult(operation.operationId, 'confirmed', runtime);
+    let controller = s.controller;
+    if (timing === 'reopened') {
+      s.ds = { ...s.ds, session: structuredClone(s.ds.session) };
+      s.store.close();
+      const reopened = new SessionContractStore(s.data, s.appId); handles.push(reopened);
+      controller = new SessionController(s.ds, reopened);
+    }
+    const bound = controller.bindRuntime('replacement', s.worker, { ...bare, nativeSessionId: 'replacement-native' }, operation.operationId);
+    expect(bound.ref).toEqual(runtime);
+    expect(bound.phase).toBe('starting');
+    if (timing === 'early') controller.controlResult(operation.operationId, 'confirmed', runtime);
+    expect(controller.ingest({ type: 'prompt_ready', sessionContract: s.context(3, { runtime }) }, s.worker).kind).toBe('current');
+    expect(s.ds.cliReady).toBe(true);
+    expect(controller.acceptsUserInput()).toBe(true);
+    const execution = controller.admitInput('follow-up');
+    expect(controller.store.bindQueuedExecution(s.ref, execution, runtime)?.runtime).toEqual(runtime);
+  });
+
+  it('does not let a late enrichment bypass a new close or change the physical process', () => {
+    const s = fixture();
+    const { operation } = s.controller.beginControl('restart'); s.controller.controlStarted(operation.operationId);
+    const runtime = s.controller.reserveBinding('replacement', s.worker);
+    const bare = { backend: 'tmux', physicalId: '222:replacement', proof: 'process_start' as const };
+    s.controller.bindRuntime('replacement', s.worker, bare, operation.operationId);
+    s.controller.controlResult(operation.operationId, 'confirmed', runtime);
+    expect(() => s.controller.bindRuntime('replacement', s.worker, { ...bare, physicalId: '333:other' }, operation.operationId)).toThrow('runtime_identity_changed');
+    s.controller.beginControl('close');
+    // Same-executor enrichment completes the identity without retiring the
+    // runtime, but the closing lifecycle still owns the control fence.
+    const before = s.store.runtime(s.ref, runtime.runtimeId)!;
+    const bound = s.controller.bindRuntime('replacement', s.worker, { ...bare, nativeSessionId: 'replacement-native' }, operation.operationId);
+    expect(bound.phase).toBe(before.phase);
+    expect(bound.phase).not.toBe('retiring');
+    expect(s.store.read(s.ref)?.activeRuntime).toEqual(runtime);
+    expect(s.controller.acceptsUserInput()).toBe(false);
+    // Once the close settles, the session stays closed and keeps refusing input;
+    // the reducer-level closed fence for a later binding is pinned separately in
+    // session-contract.test.ts's reducer fence cases.
+    const close = s.store.read(s.ref)?.activeOperationId!;
+    s.controller.controlResult(close, 'confirmed');
+    expect(s.store.read(s.ref)?.lifecycle).toBe('closed');
+    expect(s.controller.acceptsUserInput()).toBe(false);
+  });
+
   const cases: Array<[string, (s: ReturnType<typeof fixture>) => void]> = [
     ['a restart is applying', s => { const { operation } = s.controller.beginControl('restart'); s.controller.controlStarted(operation.operationId); }],
     ['a restart outcome is uncertain', s => {
@@ -331,5 +428,130 @@ describe('contract history stays bounded', () => {
     expect(s.store.apply(s.ref, { type: 'worker_lost', worker: s.worker }, 'event-once').decision).toBe('applied');
     expect(s.store.apply(s.ref, { type: 'worker_lost', worker: s.worker }, 'event-once').decision).toBe('duplicate');
     expect(() => s.store.apply(s.ref, { type: 'worker_online', worker: s.worker }, 'event-once')).toThrow('contract_event_conflict');
+  });
+});
+
+
+describe('restored transcript terminal delivery', () => {
+  function continuedFixture() {
+    const s = fixture();
+    const execution = s.controller.admitInput('restored-turn');
+    s.store.bindQueuedExecution(s.ref, execution, s.runtime);
+    s.store.apply(s.ref, { type: 'execution_phase', execution, runtime: s.runtime, phase: 'accepted' });
+    const binding = s.controller.reserveBinding('leaf-process', s.worker);
+    const leaf = { ...identity, physicalId: '222:leaf' };
+    s.controller.bindRuntime('leaf-process', s.worker, leaf, undefined, 'binding-current');
+    return { ...s, execution, binding, leaf };
+  }
+  it('retains the original attempt across a continued process and grants only historical terminal observation', () => {
+    const s = continuedFixture();
+    s.controller.workerLost(s.worker);
+    expect(s.store.execution(s.ref, s.execution.executionId)?.phase).toBe('reconciling');
+    const replacement = s.controller.bindWorker(2).worker;
+    s.controller.reserveBinding('restored-leaf', replacement);
+    const current = s.controller.bindRuntime('restored-leaf', replacement, s.leaf).ref;
+    expect(s.store.authorizeExecutionObserver(s.ref, replacement, s.execution)).toBe(true);
+    const before = s.store.runtime(s.ref);
+    const context = s.context(1, { runtime: s.runtime, execution: s.execution }, replacement);
+    const admission = s.controller.ingest({ type: 'turn_terminal', turnId: 'restored-turn', status: 'completed', sessionContract: context }, replacement);
+    expect(admission.kind).toBe('historical');
+    expect(s.store.execution(s.ref, s.execution.executionId)).toMatchObject({ phase: 'succeeded', runtime: s.runtime });
+    expect(s.store.runtime(s.ref)).toEqual(before);
+    expect(s.controller.currentRuntime()).toEqual(current);
+    expect(s.controller.gateway.admit('managed_turn_origin', context, replacement).kind).toBe('reject');
+  });
+  it.each(['different-process', 'different-native-session', 'cancelled', 'queued', 'closed'])('refuses an observer for %s', mode => {
+    const s = continuedFixture(); s.controller.workerLost(s.worker);
+    const worker = s.controller.bindWorker(2).worker;
+    s.controller.reserveBinding('restored-leaf', worker);
+    s.controller.bindRuntime('restored-leaf', worker, { ...s.leaf,
+      ...(mode === 'different-process' ? { physicalId: '333:other' } : {}),
+      ...(mode === 'different-native-session' ? { nativeSessionId: 'native-other' } : {}) });
+    if (mode === 'cancelled') s.store.apply(s.ref, { type: 'execution_terminal', execution: s.execution, runtime: s.runtime, status: 'cancelled', evidence: 'caller_interrupt_boundary' });
+    if (mode === 'closed') s.controller.beginControl('close');
+    const attempt = mode === 'queued' ? s.controller.admitInput('never-written') : s.execution;
+    expect(s.store.authorizeExecutionObserver(s.ref, worker, attempt)).toBe(false);
+  });
+  it('keeps restored terminal attribution when a successor already owns the current callback', () => {
+    const s = fixture(); const old = s.controller.admitInput('old'); const successor = s.controller.admitInput('successor');
+    const scope = new WorkerSessionEventScope(s.ref, s.worker); const binding = scope.beginRuntime();
+    const current = { runtimeId: 'current', epoch: 2 }; scope.assign(binding.bindingId, current);
+    scope.noteAdmission({ ref: old, runtime: s.runtime, phase: 'reconciling' });
+    scope.noteAdmission({ ref: successor, runtime: current, phase: 'submitting' });
+    scope.rememberExecution(old, binding); // startup may advertise the old head before the grant
+    scope.rememberExecution(successor, binding);
+    scope.rememberObservedExecution(binding.bindingId, s.runtime, old);
+    const metadata = loadWorkerFunction<(message:any)=>any>('sessionEventMetadata', { workerSessionEventScope: scope });
+    scope.run(binding, () => {
+      const terminal = metadata({ type:'turn_terminal',turnId:'old',status:'completed' });
+      expect(terminal.sessionContract.scope).toMatchObject({ runtime:s.runtime,execution:old });
+      expect(metadata({ type:'turn_terminal',turnId:'successor',status:'completed' }).sessionContract.scope).toMatchObject({ runtime:current,execution:successor });
+    }, successor);
+    const unrelated = scope.beginRuntime(); scope.assign(unrelated.bindingId,{runtimeId:'unrelated',epoch:3});
+    scope.run(unrelated, () => {
+      expect(metadata({ type:'turn_terminal',turnId:'old',status:'completed' }).sessionContract.scope.runtime).not.toEqual(s.runtime);
+      expect(scope.ownsExecutionEvent('old')).toBe(false);
+    });
+  });
+  it('keeps a completed transcript in the real queue until its execution observer is assigned', () => {
+    const s = fixture(); const execution = s.controller.admitInput('restored-turn');
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime();
+    scope.noteAdmission({ ref: execution, runtime: s.runtime, phase: 'reconciling' });
+    const queue = new CodexBridgeQueue(() => 1_000);
+    const turn = { turnId: 'restored-turn', markTimeMs: 100, started: true, finalText: 'RECOVERY_OK', terminalStatus: 'completed' as const };
+    queue.restoreDrained([turn]);
+    const checkpoint = vi.fn(() => { throw Error('delivery reached'); });
+    const emit = loadWorkerFunction<() => void>('emitReadyCodexTurns', {
+      codexBridgeQueue: queue, workerSessionEventScope: scope, recoverTraexQuotaTurn: () => false,
+      universalOutputHandoff: undefined, checkpointCodexAdoptRecovery: checkpoint,
+      // Only a persistent Codex tmux binding can still receive a host grant.
+      lastInitConfig: { cliId: 'codex' }, effectiveBackendType: 'tmux',
+      restoredObserverGrantWait: new RestoredObserverGrantWait(), codexBridgeDrainAndMaybeEmit: vi.fn(),
+    });
+    scope.run(binding, emit);
+    expect(checkpoint).not.toHaveBeenCalled();
+    expect(queue.peek()).toContainEqual(expect.objectContaining({ turnId: 'restored-turn', finalText: 'RECOVERY_OK' }));
+    scope.rememberObservedExecution(binding.bindingId, s.runtime, execution);
+    expect(() => scope.run(binding, emit)).toThrow('delivery reached');
+    expect(checkpoint).toHaveBeenCalledOnce();
+  });
+  it.each([
+    { status: 'succeeded' as const, owned: false },
+    { status: 'failed' as const, owned: false },
+    { status: 'cancelled' as const, owned: false },
+    { status: 'succeeded' as const, owned: true },
+  ])('retires a settled unowned journal predecessor while preserving owned retries ($status/$owned)', ({ status, owned }) => {
+    const s = fixture(); const old = s.controller.admitInput('old');
+    s.store.bindQueuedExecution(s.ref, old, s.runtime);
+    s.store.apply(s.ref, { type: 'execution_terminal', execution: old, runtime: s.runtime, status, evidence: 'native_terminal' });
+    const next = s.controller.reserveBinding('next', s.worker);
+    s.controller.bindRuntime('next', s.worker, { ...identity, physicalId: '222:next' }, undefined, 'binding-current');
+    const successor = s.controller.admitInput('successor');
+    s.store.bindQueuedExecution(s.ref, successor, next);
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, next);
+    for (const { ref, runtime, phase } of s.store.executions(s.ref)) scope.noteAdmission({ ref, runtime, phase });
+    scope.rememberExecution(successor, binding);
+    if (owned) scope.rememberObservedExecution(binding.bindingId, s.runtime, old);
+    const queue = new CodexBridgeQueue(() => 1_000);
+    queue.restoreDrained(['old', 'successor'].map(turnId => ({ turnId, started: true, finalText: `${turnId} final`, terminalStatus: 'completed' as const })));
+    const send = vi.fn(); const terminal = vi.fn();
+    const emit = loadWorkerFunction<() => void>('emitReadyCodexTurns', {
+      codexBridgeQueue: queue, workerSessionEventScope: scope, recoverTraexQuotaTurn: () => false,
+      universalOutputHandoff: undefined, checkpointCodexAdoptRecovery: vi.fn(), checkpointStructuredBridgeRecovery: vi.fn(),
+      armPostTerminalInputFence: vi.fn(), lastInitConfig: { adoptMode: true }, sessionId: s.ref.sessionId,
+      isExistingAppServerSharedBridge: () => false, structuredBridgeIs: () => false, zeroPromptTerminalSync: () => false,
+      bridgeGateInputForTurn: () => ({}), structuredFallbackKind: () => 'final', bridgeTurnOutcome: () => 'answered',
+      traexModelAccessSwitchNotice: undefined, notifyExplicitRepliesObserved: vi.fn(), attributableExplicitReplyMarkersForTurnWindow: () => [],
+      shouldSuppressStructuredFallback: () => false, replyDeliveryMode: () => 'unified', deliveredFinalFailureNoticeSuppressed: () => false,
+      usageLimitTracker: { noteTurnCompleted: vi.fn() }, bridgePostText: (text: string) => text, send,
+      releaseInputDeliveryQuarantineForStructuredTerminal: vi.fn(), retireRpcLifecycleFromStructuredTerminal: vi.fn(),
+      emitTurnTerminal: terminal, retireStructuredTurnAttribution: vi.fn(),
+    });
+    scope.run(binding, emit);
+    expect(send.mock.calls.map(([message]) => message.turnId)).toEqual(owned ? ['old', 'successor'] : ['successor']);
+    expect(terminal.mock.calls.map(([turnId]) => turnId)).toEqual(owned ? ['old', 'successor'] : ['successor']);
+    expect(queue.size()).toBe(0);
   });
 });

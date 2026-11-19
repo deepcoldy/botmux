@@ -404,6 +404,8 @@ function executeProductionSetCaptureIdentity(send: (msg: unknown) => void): Iden
     { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
   ).outputText;
   const factory = new Function('send', `
+    const workerSessionEventScope = undefined;
+    const lastInitConfig = undefined;
     let currentBotmuxTurnId;
     let currentBotmuxDispatchAttempt;
     let captureRevision = 0;
@@ -486,6 +488,7 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
     ).outputText;
     const send = vi.fn();
     const harness = new Function('send', 'isCodexAppCliId', `
+      const workerSessionEventScope = undefined;
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
       let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt, cliSubmissionInFlight = null;

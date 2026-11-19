@@ -90,7 +90,7 @@ afterAll(() => rmSync(isolated.root, { recursive: true, force: true }));
 
 function add(extra: Record<string, unknown> = {}) {
   return scheduler.addTask({ id: `probe${String(++serial).padStart(3, '0')}`, name: 'probe',
-    schedule: 'every 1m', prompt: 'probe', workingDir: '/tmp', chatId: CHAT, larkAppId: APP, ...extra });
+    schedule: 'every 1m', prompt: 'probe', workingDir: '/tmp', chatId: CHAT, larkAppId: APP, owner: { kind: 'ownerless' }, ...extra });
 }
 function session(): Session {
   return { sessionId: `probe-session-${++serial}`, larkAppId: APP, chatId: CHAT,
@@ -196,7 +196,7 @@ describe('schedule repair adversarial overlap probes', () => {
     const scope = { scheduleAuthorityStore: store, parseScheduledTurnId, authorizeDelegatedScheduleRun,
       assertScheduledAuthorityCurrent,
       identityPublicationConflicted: () => false, delegatedScheduleRuntimeDeps: () => ({
-        runEnabled: true, hostRunScopes: ['bytedcli'], triggerUserAuthTools: ['bytedcli', 'lark-cli'],
+        runEnabled: true, hostRunScopes: ['bytedcli'], triggerUserAuth: { enabled: true, tools: ['bytedcli', 'lark-cli'] },
         adminOpenIds: ['ou_user'],
         resolveTargetOpenId: () => new Promise<string>(resolve => setTimeout(() => resolve('ou_user'), 1_000)),
         listChatMemberOpenIds: async () => ['ou_user'],
@@ -293,10 +293,19 @@ describe('schedule repair adversarial overlap probes', () => {
     const s = session();
     const run = await dispatched(s);
     new ScheduleSendAttempt(isolated.dataDir, s, run.turnId).fail(new Error('initial attempt rejected'));
+    // Same shape as slowFinal below: execute() calls dispatch only after it
+    // holds the record's file lock, which takes real time under load. Build the
+    // deferred up front, wait until dispatch is actually running before moving
+    // the fake clock, and let afterEach release the send if the case fails.
     let finishSend!: (messageId: string) => void;
+    let markEntered!: () => void;
+    const delivery = new Promise<string>(resolve => { finishSend = resolve; });
+    const entered = new Promise<void>(resolve => { markEntered = resolve; });
     const receipt = new TurnSendLedger(isolated.dataDir).execute({ larkAppId: APP,
       sessionId: s.sessionId, turnId: run.turnId }, 'final', 'retry in progress',
-    () => new Promise<string>(resolve => { finishSend = resolve; }), { fenced: true });
+    async () => { markEntered(); return delivery; }, { fenced: true });
+    pending.push(() => finishSend('om_after_test_release'));
+    await entered;
     await vi.advanceTimersByTimeAsync(0);
     const ds = daemonSession(s);
     settleLater(ds, { turnId: run.turnId, source: 'terminal' });

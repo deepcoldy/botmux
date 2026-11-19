@@ -23,6 +23,9 @@ import {
   type WorkbenchCapabilityActor,
 } from '../src/dashboard/auth.js';
 import { defaultWorkbenchLayout, type WorkbenchSessionRow } from '../src/dashboard/web/agent-workbench-model.js';
+import { store } from '../src/dashboard/web/store.js';
+import { useDashboardStore } from '../src/dashboard/web/react-hooks.js';
+import { CLOSED_HISTORY_SEARCH_DEBOUNCE_MS } from '../src/dashboard/web/closed-history-search.js';
 import {
   workbenchLayoutStorageKey,
   type WorkbenchStorage,
@@ -831,6 +834,42 @@ describe('Agent Workbench 未读与分组维度', () => {
     // 未读的 session-1 被抽走后，剩下的只有 Builder 那一组——空桶不产出组头。
     expect(groupHeaderLabels(renderer)).toEqual(['待你处理', 'Builder']);
     expect(unreadRowLabels(renderer)).toEqual(['Full title for session 1. 待你处理. 有新回复']);
+    act(() => renderer.unmount());
+  });
+});
+
+describe('Agent Workbench 搜索覆盖更早的已关闭会话', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    store.replaceSnapshot([], []);
+  });
+
+  /** 与真实路由页一致：会话列表来自共享 store。 */
+  function StoreBackedWorkbench(): React.JSX.Element {
+    const snapshot = useDashboardStore();
+    const rows = [...snapshot.sessions.values()] as WorkbenchSessionRow[];
+    return React.createElement(AgentWorkbenchView, kindViewProps(rows[0], { sessions: rows }));
+  }
+
+  it('输入搜索词后去服务端补查更早的已关闭会话，结果出现在列表里', async () => {
+    vi.useFakeTimers();
+    store.replaceSnapshot(sessions(3), [], undefined, { closedCursor: 'older', closedTotal: 900 });
+    const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify(
+      url === '/api/sessions?view=closed&q=ledger'
+        ? { sessions: [{ sessionId: 'session-archived', status: 'closed', title: 'Archived ledger migration', botName: 'Builder', lastMessageAt: 1_700_000_000_000 }], closedCursor: null }
+        : {},
+    )));
+    vi.stubGlobal('fetch', fetchMock);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(StoreBackedWorkbench)); });
+    const search = renderer.root.find(node => node.type === 'input' && node.props.type === 'search');
+    await act(async () => { search.props.onChange({ currentTarget: { value: 'ledger' } }); });
+    const titles = () => renderer.root.findAll(node => node.props.role === 'option').map(node => String(node.props['aria-label']));
+    expect(titles().some(label => label.includes('Archived ledger migration'))).toBe(false);
+    await act(async () => { await vi.advanceTimersByTimeAsync(CLOSED_HISTORY_SEARCH_DEBOUNCE_MS); });
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(['/api/sessions?view=closed&q=ledger']);
+    expect(titles().some(label => label.includes('Archived ledger migration'))).toBe(true);
     act(() => renderer.unmount());
   });
 });

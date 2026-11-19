@@ -27,6 +27,12 @@ export class AskArgsError extends Error {
   }
 }
 
+export function parseAskRequestId(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(raw)) throw new AskArgsError('questions_invalid', '--request-id 需要1至256位字母数字或_-');
+  return raw;
+}
+
 /** Parse `--options` CSV. Each item is either `key` (key==label) or `key=label`.
  *
  *  Rules:
@@ -88,7 +94,8 @@ export function parseAskOptions(raw: string | undefined): AskOption[] {
 
 /** Parse `--timeout <seconds>` → milliseconds. Bounds match §7:
  *   - lower bound: 10s (sub-10s asks are almost always a bug)
- *   - upper bound: 3600s (1h — past that, recovery should kick in v0.1.8)
+ *   - upper bound: 3600s (1h)
+ *   - explicit 0: no deadline for a managed explicit Ask
  *   - default: 300s (caller passes `undefined` to use it) */
 export function parseAskTimeoutSeconds(
   raw: string | undefined,
@@ -108,10 +115,10 @@ export function parseAskTimeoutSeconds(
       `--timeout 必须是整数秒数，收到 "${raw}"`,
     );
   }
-  if (n < defaults.min || n > defaults.max) {
+  if (n !== 0 && (n < defaults.min || n > defaults.max)) {
     throw new AskArgsError(
       'timeout_out_of_range',
-      `--timeout 范围 [${defaults.min}, ${defaults.max}] 秒，收到 ${n}`,
+      `--timeout 范围 [${defaults.min}, ${defaults.max}] 秒，或 0 表示无限等待，收到 ${n}`,
     );
   }
   return n * 1000;

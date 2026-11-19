@@ -76,6 +76,40 @@ function isStrayFormApiPost(req: IncomingMessage): boolean {
 }
 
 describe('botmux ask — CLI boundary', () => {
+  it.each([false, true])('no-deadline CLI uses versioned admission and never downgrades on an old daemon (old: %s)', async oldDaemon => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-no-deadline-'));
+    tempDirs.push(dataDir);
+    const requests: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const server = createServer(async (req, res) => {
+      if (req.method !== 'POST' || !(req.url ?? '').startsWith('/api/asks')) {
+        req.resume(); res.writeHead(404).end(); return;
+      }
+      const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      requests.push({ path: req.url!, body: body! });
+      if (oldDaemon) { res.writeHead(404).end(); return; }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ kind: 'answered', answers: [['yes']], by: 'ou_test', comment: null, timedOut: false }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const registryDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(registryDir, { recursive: true });
+      writeFileSync(join(registryDir, 'cli_test.json'), JSON.stringify({
+        larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now(),
+      }));
+      const result = await runAsk(dataDir, ['ask', 'buttons', '--timeout', '0', '--options', 'yes,no', '请作答']);
+      expect(result.status).toBe(oldDaemon ? 3 : 0);
+      expect(requests).toHaveLength(oldDaemon ? 1 : 2);
+      expect(requests.every(request => request.path === '/api/asks/no-deadline-v1' && request.body.timeoutMs === 0)).toBe(true);
+      if (!oldDaemon) {
+        expect(requests[1]!.body).toMatchObject({ acknowledge: true, requestId: requests[0]!.body.requestId });
+        expect(result.stdout).toBe('yes\n');
+      }
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
   it('normalizes literal paragraph separators in a positional prompt', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-newlines-'));
     tempDirs.push(dataDir);

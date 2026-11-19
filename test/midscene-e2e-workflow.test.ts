@@ -21,6 +21,8 @@ import { evaluateExpression, format, interpolate, isTruthy } from './helpers/git
 interface Step {
   id?: string;
   run?: string;
+  uses?: string;
+  with?: Record<string, string>;
   env?: Record<string, string>;
 }
 
@@ -200,6 +202,17 @@ describe('Midscene model quota wiring (#2670)', () => {
       FEISHU_QUOTA_EXHAUSTED: 'true',
       QUOTA_RESET: '11-15 16:00:00 UTC',
     });
+  });
+
+  it('the fallback for a pruned Pages report names the site artifact this run uploads', () => {
+    const reportSteps = workflow.jobs['midscene-report'].steps!;
+    const upload = reportSteps.find((step) => step.uses?.startsWith('actions/upload-artifact@') && step.with?.path?.endsWith('/midscene-site'));
+    const uploaded = upload?.with?.name;
+    expect(uploaded).toBeTruthy();
+    const summary = reportSteps.find((step) => step.run?.includes('render-midscene-summary.mjs'))!.run!;
+    expect(summary.match(/--site-artifact-name\s+(\S+)/)?.[1]).toBe(uploaded);
+    const notifyStep = workflow.jobs[NOTIFY_JOB].steps!.find((step) => step.run?.includes('midscene-notify-failure.mjs'))!;
+    expect(notifyStep.env?.SITE_ARTIFACT_NAME).toBe(uploaded);
   });
 });
 

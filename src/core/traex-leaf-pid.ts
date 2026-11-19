@@ -10,8 +10,8 @@ import {
 /**
  * Locating the real TRAE process under a launcher.
  *
- * Under the file sandbox / credential-only bwrap / Forge, the pane process is a
- * launcher; only the `traex` leaf holds the rollout fd the submit-ownership gate
+ * Under an ordinary Node wrapper, file sandbox / credential-only bwrap / Forge,
+ * the pane process is a launcher; only the `traex` leaf holds the rollout fd the submit-ownership gate
  * (findTraexRolloutSetByPid) reads. Until the leaf is bound, every submit is
  * confirmed WITHOUT a session id, the transcript bridge never attaches, and the
  * turn is retired when its pre-start lease expires — the reply is lost.
@@ -67,7 +67,10 @@ export function resolveTraexOwnershipPid(
 ): number {
   if (!launcherActive || !candidatePid) return candidatePid;
   if (isTraexProcess(candidatePid, probes.commOf)) return candidatePid;
-  return findTraexLeafPid(candidatePid, probes) ?? candidatePid;
+  const leaf = findTraexLeafPid(candidatePid, probes);
+  // exec is independent of this JS walk. A launcher may have become the
+  // native root while its now-visible subagent was being discovered.
+  return isTraexProcess(candidatePid, probes.commOf) ? candidatePid : leaf ?? candidatePid;
 }
 
 export type TraexLeafResolveDeps = Omit<WrapperRealPidResolveDeps, 'findRealPid' | 'intervalMs' | 'maxAttempts'> & {
@@ -79,7 +82,13 @@ export function scheduleTraexLeafPidResolve(launcherPid: number, deps: TraexLeaf
   const { probes, ...rest } = deps;
   scheduleWrapperRealCliPid(launcherPid, {
     ...rest,
-    findRealPid: lp => findTraexLeafPid(lp, probes),
+    findRealPid: lp => {
+      const leaf = findTraexLeafPid(lp, probes);
+      return isTraexProcess(lp, probes?.commOf) ? lp : leaf;
+    },
+    // A direct install (or launcher which exec'd TRAE) already is the owned
+    // root. A descendant may be a subagent, not a more authoritative CLI.
+    isDirectLeaf: lp => isTraexProcess(lp, probes?.commOf),
     intervalMs: TRAEX_LEAF_RETRY_INTERVAL_MS,
     maxAttempts: TRAEX_LEAF_RETRY_MAX_ATTEMPTS,
   });

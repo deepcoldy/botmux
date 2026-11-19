@@ -97,6 +97,14 @@ describe('resolveCommand shell output parsing', () => {
     expect(resolveCommand('tool with space')).toBe('/opt/fake/bin/tool with space');
   });
 
+  it('returns relative executable paths without invoking a shell', () => {
+    const marker = join(dir, 'relative-path-shell-was-called');
+    useFakeShell(`#!/bin/sh\ntouch '${marker}'\necho "/opt/should-not-be-used"\n`);
+    expect(resolveCommand('./vendorCodex')).toBe('./vendorCodex');
+    expect(resolveCommand('tools/vendor Codex')).toBe('tools/vendor Codex');
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it('does not evaluate semicolons from the command name', () => {
     useSystemShell();
     const marker = join(dir, 'semicolon-was-evaluated');
@@ -165,6 +173,18 @@ describe('asynchronous shell discovery', () => {
     expect(result).toEqual({ resolved: command, inconclusive: false });
     expect(existsSync(join(dir, 'marker'))).toBe(false);
   });
+  it('passes relative executable paths through without asynchronous shell probes', async () => {
+    const { dir } = fixture();
+    const marker = join(dir, 'relative-path-shell-was-called');
+    const shell = join(dir, 'unexpected-shell');
+    writeFileSync(shell, `#!/bin/sh\ntouch '${marker}'\necho "/opt/should-not-be-used"\n`);
+    chmodSync(shell, 0o755);
+    expect(await resolveCommandAsync('./vendorCodex', {
+      env: { HOME: dir, SHELL: shell, PATH: '/usr/bin:/bin' },
+    })).toEqual({ resolved: './vendorCodex', inconclusive: false });
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it('keeps a timed-out shell inconclusive and releases the event loop', async () => {
     const { dir } = fixture();
     const shell = join(dir, 'slow-shell');

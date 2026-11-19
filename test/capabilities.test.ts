@@ -36,6 +36,7 @@ describe('botmux capabilities contract', () => {
         completion_proposal_v1: true,
         ask_form_v1: true,
         riff_host_tools_v1: true,
+        dispatch_only_user_auth_v1: true,
       },
     });
   });

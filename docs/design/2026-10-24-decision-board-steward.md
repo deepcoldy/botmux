@@ -409,3 +409,42 @@ owner 不打开看板也能拍板：事项进入待拍板（或改了问题 / �
 **存储**：`board_batches.source`、`board_decisions.superseded_by` / `ask_key` 三个可空列按列存在性补，`board_cards` 用 `CREATE TABLE IF NOT EXISTS`，不升版本号；回滚到旧构建时看板照常打开（旧构建不认这几列；已作废的决定靠 `handled_at` 仍算已处理）。
 
 **给管家的文本**：只改 `botmux board guide` 的「要 owner 拍板」「执行一批决定」两节各加一条（卡片会自动发、别再自己发带选项的卡片；覆盖标记怎么处理），常驻提示不变。
+
+## 13. 本机外部客户端（2026-11-13 追加）
+
+本机的其他工具（例如本地飞书客户端）要在自己的界面里列出「待我拍板」并提交决定。原来只有两条路：Dashboard
+登录，或管家会话里的 `botmux board`（会话鉴权）；外部进程只能直接读 `decision-board.sqlite`，不该这样做。
+
+**通道**：宿主机 daemon IPC + 新 CLI `botmux owner-board`。daemon 上新增三条路由，挂在外层 host HMAC 闸下
+（`~/.botmux/.dashboard-secret`，与 `botmux observe` 相同，只认 loopback），handler 里再核一次
+`isTrustedHostIpcRequest`：
+
+| 路由 | 用途 |
+|---|---|
+| `GET /api/decision-board/owner/items?state=decide,accept&q=` | 列事项（默认待拍板 + 待验收） |
+| `GET /api/decision-board/owner/items/:seq` | 一项详情 + 最近 50 条历史 |
+| `POST /api/decision-board/owner/items/:seq/decide` | `{askKey, requestId, choice?, text?}` 提交一项决定 |
+
+Dashboard 不转发这组路由（`decision-board-api.ts` 只认固定的几条），H5 免登身份也碰不到；沙箱会话读不到 host
+secret，调不通。字段契约在 `src/core/decision-board/owner-api.ts`。
+
+不复用 Companion API：它的前提是「只绑启动时指定的一个隔离测试 Bot、接口不接受 Bot ID」，看板要按管家
+app_id 区分多张，放进去会推翻它写明的安全边界。
+
+**提交**：与卡片点击同形——一项一批、不经草稿（`store.submitLocal`，与 `submitCard` 共用 `submitSingle`），之后走同一条 `deliverBatch`。
+
+- 只接受待拍板 / 待验收的项。`askKey` 是这一轮拍板的指纹：`decisionAskKey`（问题 + 选项 + 推荐）再加状态和进入
+  状态的时刻（`ownerBoardAskKey`），在写锁里核对。只改状态（待拍板 ⇄ 待验收、重新进入待拍板）也算改过，拒绝
+  （`ask_changed`），不按旧视图写进去；卡片自己的指纹不变。
+- `requestId` 是幂等键（批次 nonce = `local:<requestId>`）：同一个 id、同样的事项和内容重试返回同一批。那一批
+  `pending / failed` 时顺带重投；`delivered`、本进程正在投时不重投；上一轮进程死在投递途中的 `dispatched` 先按
+  现有规则收敛成 `failed` 再用同一个回合 id 投；这条决定已执行或已被后来的决定作废时不再投。同一个 id 换了事项、
+  选项或说明拒绝（`request_id_reused`）。
+- 批次来源记 `'local'`（`board_batches.source` 新取值，不加列）。覆盖与卡片同一口径：卡片和本机客户端都是
+  「点了就交」的来源，只要新旧任一方来自它们，同一项较早、未执行的决定以新的为准（只在待拍板时；待验收的说明
+  逐条交给管家）。网页连续提交的几批仍逐批执行。卡片上写「本机客户端已选 X」，批次消息写「来源：本机客户端」，
+  时间线记「（本机客户端）」，提交人记 `local`。回滚到旧构建时 `'local'` 读成网页来源，旧构建照常打开看板。
+- 决定排队期间管家改了问题或选项（决定记下的 `ask_key` 与现在的不同）：批次消息不附现在的选项原文、不标推荐，
+  写明「提交后改过」（卡片点击的批次同样适用）。
+- CLI 在继承了 `BOTMUX_SESSION_ID` 的进程里拒绝 `decide`：决定只能由 owner 自己的工具提交。这是防会话里的
+  Agent 顺手代拍板的提示性闸门，不是安全边界（非沙箱会话本来就能读 host secret 直接调 IPC）。

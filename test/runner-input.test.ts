@@ -179,6 +179,16 @@ describe('writeRunnerInput — tmux mode', () => {
     });
   });
 
+  it('encodes replyDispatchAttempt without changing the legacy fields', () => {
+    const encoded = encodeRunnerInput('replay prompt', undefined, 'om_reply_1', undefined, undefined, 0);
+    expect(JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'))).toEqual({
+      type: 'message',
+      content: 'replay prompt',
+      replyTurnId: 'om_reply_1',
+      replyDispatchAttempt: 0,
+    });
+  });
+
   it('reports submitted:false and flushes the partial when a chunk is dropped', async () => {
     const big = 'B'.repeat(15_000);
     const { pty, textChunks, enterCount } = fakeTmuxPty({ failTextAt: 2 });

@@ -7,6 +7,7 @@ import type { RecordTurnDeliveryInput, RecordTurnTerminalInput, TurnCompletionEv
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackWebhookDestination } from './feedback-outbox.js';
 import { validateFeedbackEventCursor, type FeedbackEventCursor, type SequencedFeedbackEvent } from './feedback-event-stream.js';
+import { feedbackDeliveryContext } from './feedback-extension-store.js';
 
 type Input<Method extends keyof FeedbackStore> = Parameters<FeedbackStore[Method]>[0];
 type Output<Method extends keyof FeedbackStore> = Awaited<ReturnType<FeedbackStore[Method]>>;
@@ -43,7 +44,7 @@ function cardTemplate(value: Record<string, unknown> | undefined): Record<string
 }
 
 class PostgresFeedbackStore implements FeedbackStore {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly pool: Pool, private readonly dataDir?: string) {}
   async close(): Promise<void> { await this.pool.end(); }
   private async transaction<Result>(operation: (client: PoolClient) => Promise<Result>, ordered = true): Promise<Result> {
     const client = await this.pool.connect();
@@ -115,6 +116,7 @@ class PostgresFeedbackStore implements FeedbackStore {
     return row ? this.delivery(this.pool, row) : undefined;
   }
   async recordTurnDelivery(input: RecordTurnDeliveryInput): Promise<Output<'recordTurnDelivery'>> {
+    input = { ...input, context: feedbackDeliveryContext(this.dataDir, input) };
     return this.transaction(async client => {
       await this.lock(client, JSON.stringify(['turn', input.botAppId, input.sessionId, input.turnId, input.dispatchAttempt ?? 0]));
       await this.lock(client, JSON.stringify(['message', input.platform, input.platformAppId, input.platformMessageId]));
@@ -316,12 +318,12 @@ class PostgresFeedbackStore implements FeedbackStore {
   async tryResetExpiredFeedbackOutboxClaims(now: number, staleAfterMs: number): Promise<Output<'tryResetExpiredFeedbackOutboxClaims'>> { return { done: true, changed: await this.resetExpiredFeedbackOutboxClaims(now, staleAfterMs) }; }
 }
 
-export async function openPostgresFeedbackStore(target: PostgresTarget, password: PostgresCredential, instanceId: string, ca?: string, provision = false): Promise<FeedbackStore> {
+export async function openPostgresFeedbackStore(target: PostgresTarget, password: PostgresCredential, instanceId: string, ca?: string, provision = false, dataDir?: string): Promise<FeedbackStore> {
   const pool = feedbackPostgresPool(target, password, ca);
   try {
     const client = await pool.connect();
     try { await ensurePostgresFeedbackSchema(client, target.schema, instanceId, undefined, provision); } finally { client.release(); }
-    return new PostgresFeedbackStore(pool);
+    return new PostgresFeedbackStore(pool, dataDir);
   } catch (error) {
     await pool.end();
     throw error;

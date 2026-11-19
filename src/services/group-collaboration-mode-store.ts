@@ -24,6 +24,9 @@ export interface GroupCollaborationModeConfig {
   workerAppIds?: string[];
   /** Whether newly joined locally managed Bots should automatically become Workers. */
   autoEnrollWorkers?: boolean;
+  /** Opt-in metadata-only notification of imported sessions. Missing means
+   * ignore; this preference is retained while project mode is disabled. */
+  importedSessionPolicy?: 'ignore' | 'notify';
   progressCard?: ProjectProgressCardConfig;
   /** Internal projection state for the pinned "waiting to start" guide. */
   onboardingCard?: ProjectOnboardingCardState;
@@ -98,12 +101,19 @@ export async function writeGroupCollaborationMode(
     coordinatorAppId?: string;
     workerAppIds?: string[];
     autoEnrollWorkers?: boolean;
+    importedSessionPolicy?: 'ignore' | 'notify';
     progressCard?: ProjectProgressCardConfig;
   },
+  beforeWrite?: () => void,
 ): Promise<GroupCollaborationModeConfig> {
+  if (input.importedSessionPolicy !== undefined
+    && input.importedSessionPolicy !== 'ignore' && input.importedSessionPolicy !== 'notify') {
+    throw new Error('invalid_imported_session_policy');
+  }
   const path = registryPath(dataDir);
   let result!: GroupCollaborationModeConfig;
   await withFileLock(path, async () => {
+    beforeWrite?.();
     const registry = readRegistry(path);
     const current = registry.configs[input.chatId];
     const now = new Date().toISOString();
@@ -112,6 +122,8 @@ export async function writeGroupCollaborationMode(
       schemaVersion: 1,
       chatId: input.chatId,
       mode: input.mode,
+      importedSessionPolicy: input.importedSessionPolicy
+        ?? (current?.importedSessionPolicy === 'notify' ? 'notify' : 'ignore'),
       ...(input.mode === 'project'
         ? {
             coordinatorAppId: input.coordinatorAppId,

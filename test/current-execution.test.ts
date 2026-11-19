@@ -7,6 +7,7 @@ import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js'
 import {
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
   CURRENT_EXECUTION_ORIGINS, CURRENT_EXECUTION_SCHEMA, CURRENT_EXECUTION_TRIGGER_SOURCES,
+  CurrentExecutionIdentityError, IDENTITY_REFUSAL_REASONS,
   isCurrentExecutionDocument, parseCurrentExecutionArgs, resolveCurrentExecution, resolveCurrentExecutionIdentity,
 } from '../src/cli/current-execution.js';
 import { GRANT_ROUTE_CLIENT_TIMEOUT_MS, GRANT_WAIT_CAP_MS, TOTAL_BUDGET_MS } from '../src/platform/credential-grant-budget.js';
@@ -276,5 +277,59 @@ describe('current execution origin', () => {
   it('the client accepts exactly the values the daemon can produce', () => {
     expect([...CURRENT_EXECUTION_ORIGINS]).toEqual([...TURN_ORIGINS]);
     expect([...CURRENT_EXECUTION_TRIGGER_SOURCES]).toEqual([...TRIGGER_SOURCES]);
+  });
+});
+
+
+describe('identity fetch refusal reasons', () => {
+  const fetchWith = (fetchImpl: typeof fetch) => resolveCurrentExecutionIdentity({
+    ipcPort: 12345, sessionId: 'session-a', larkAppId: 'cli_a', tool: 'bytedcli', fetchImpl });
+  const refusal = async (fetchImpl: typeof fetch) => {
+    const error = await fetchWith(fetchImpl).catch(e => e);
+    expect(error).toBeInstanceOf(CurrentExecutionIdentityError);
+    return { code: error.message, reason: error.reason };
+  };
+  const reply = (status: number, body: unknown) => async () => new Response(JSON.stringify(body), { status });
+
+  it.each(['peer_unresolved', 'lineage_unproven', 'identity_decision_missing', 'identity_decision_conflict', 'identity_model_single'])(
+    'carries the daemon reason %s of a refusal', async reason => {
+      expect(await refusal(reply(403, { schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked',
+        error: 'current_execution_unverified', reason }))).toEqual({ code: 'current_execution_unverified', reason });
+    });
+
+  it('falls back to unspecified for an older daemon or an unknown reason', async () => {
+    for (const body of [{ error: 'current_execution_unverified' }, { error: 'current_execution_unverified', reason: 'from_the_future' }, null]) {
+      expect(await refusal(reply(403, body))).toEqual({ code: 'current_execution_unverified', reason: 'unspecified' });
+    }
+  });
+
+  it('keeps missing material distinct from a refusal', async () => {
+    expect(await refusal(reply(404, { error: 'identity_material_unavailable' })))
+      .toEqual({ code: 'identity_material_unavailable', reason: 'identity_material_unavailable' });
+  });
+
+  it('tells an unreachable daemon from a slow one', async () => {
+    const refused = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) });
+    expect(await refusal(async () => { throw refused; })).toEqual({ code: 'current_execution_unverified', reason: 'daemon_unreachable' });
+    expect(await refusal(async () => { throw new DOMException('The operation timed out.', 'TimeoutError'); }))
+      .toEqual({ code: 'current_execution_unverified', reason: 'daemon_timeout' });
+  });
+
+  it('refuses a verified body for another session, app or tool as a mismatch', async () => {
+    const verified = { schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'verified', larkAppId: 'cli_a',
+      sessionId: 'session-a', tool: 'bytedcli', identityTurnId: 'turn-a', env: "BOTMUX_IDENTITY_MODE='user'" };
+    for (const body of [{ ...verified, sessionId: 'session-b' }, { ...verified, larkAppId: 'cli_b' }, { ...verified, tool: 'lark-cli' }]) {
+      expect(await refusal(reply(200, body))).toEqual({ code: 'current_execution_unverified', reason: 'response_mismatch' });
+    }
+    await expect(fetchWith(reply(200, verified))).resolves.toEqual(verified);
+  });
+
+  it('rejects a bad local invocation before any request', async () => {
+    const fetchImpl = vi.fn();
+    const error = await resolveCurrentExecutionIdentity({ ipcPort: 0, sessionId: 'session-a', larkAppId: 'cli_a',
+      tool: 'bytedcli', fetchImpl }).catch(e => e);
+    expect(error).toMatchObject({ message: 'current_execution_route_unavailable', reason: 'invalid_invocation' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect(IDENTITY_REFUSAL_REASONS).toContain(error.reason);
   });
 });

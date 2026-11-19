@@ -1684,6 +1684,26 @@ describe('Codex turn_context runtime (drain)', () => {
     const second = drainCodexRollout(path, first.newOffset);
     expect(second.latestReasoningEffort).toBe('xhigh');
   });
+
+  it('binds runtime to its own native final across polling ticks', () => {
+    const firstTs = '2026-04-29T07:00:00.000Z';
+    const secondTs = '2026-04-29T07:01:00.000Z';
+    writeFileSync(path, ev(turnContext({ model: 'gpt-6.1-sol', effort: 'max', ts: firstTs })));
+    const first = drainCodexRollout(path, 0);
+    appendFileSync(path,
+      ev(assistantFinalResponseItem('first reply', firstTs))
+      + ev(turnContext({ settingsModel: 'gpt-6.2-sol', settingsEffort: 'low', ts: secondTs }))
+      + ev(assistantFinalResponseItem('second reply', secondTs))
+      + ev(assistantFinalResponseItem('reply without context')));
+    const second = drainCodexRollout(path, first.newOffset, first.state);
+    expect(second.events).toMatchObject([
+      { text: 'first reply', replyModel: 'gpt-6.1-sol', replyReasoningEffort: 'max' },
+      { text: 'second reply', replyModel: 'gpt-6.2-sol', replyReasoningEffort: 'low' },
+      { text: 'reply without context' },
+    ]);
+    expect(second.events[2].replyModel).toBeUndefined();
+    expect(second.events[2].replyReasoningEffort).toBeUndefined();
+  });
 });
 
 describe('readLatestCodexRuntime (attach bootstrap)', () => {

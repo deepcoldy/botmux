@@ -2,6 +2,8 @@
 
 `sessionCleanup.archiveCodex` 缺省为 false，可在 Dashboard 设置页的空闲清理区域开启；它独立于定时清理的 enabled，同时适用于手动关闭、手动和定时清理。只改配置开关不会扫描或归档历史会话。
 
+每个 Bot 可在 `bots.json` 设置 `archiveCodex: true|false` 覆盖全局值；省略时继承全局开关。运行中使用 Dashboard「Bot 配置 → 会话 → Codex 原生归档」（跟随全局 / 开启 / 关闭，写入走 `PUT /api/bot-archive-codex`），或 `/config set archiveCodex on`、`/config set archiveCodex off`、`/config unset archiveCodex` 设置，`/config get archiveCodex` 显示 on / off / inherit。修改对后续关闭与清理立即生效，不需要重启；每次关闭在实际开始时冻结策略，途中改配置不改变本次操作。使用不支持 app-server 的 Codex 构建的 Bot 可单独关闭，其他 Bot 继续沿用全局配置；包装器启动（如 TTADK）、scratch 沙盒和非 pty/tmux 后端的会话本来就不做原生归档，Dashboard 对这类 Bot 会提示设置不起作用。开关不影响已有归档 journal 的恢复，也不控制标题同步。
+
 Dashboard 两处空闲清理 fanout 向现有 close RPC 传递 `idleCleanup: true`。Daemon 先完成普通关闭，再处理原生归档。Dashboard / CLI close RPC、`/close` 和飞书关闭卡片同样启用归档；休眠、重启、仓库替换和其它自动关闭路径不会归档。飞书卡片异步完成归档并通过话题消息提示失败，避免阻塞回调 ACK。关闭成功但归档失败，响应仍保留 `ok: true` 和独立的 `archiveError`，批量结果统计 `archiveFailed`；手动关闭/清理显示警告，定时清理记录日志。
 
 Worker 在原生 session id 已确认时上报可信目标（thread id、实际 Codex executable、实际 CODEX_HOME）。支持自有本地 Codex CLI / codex-app 的 pty/tmux，包括 Codex RPC input 模式；codex-app 使用实际 Codex executable 而非 runner 的 Node/Bun executable；外部 adopt、existingAppServerEndpoint、wrapper、remote runner、scratch 和缺少目标的历史记录跳过。不从 live bot 配置推测旧会话目录。
@@ -51,7 +53,7 @@ Worker 退出仅表示进程结束，持久会话仍为 active 时，向 Dashboa
 
 Worker 的 exit code 0 只能证明包装进程退出，不能证明 detached app-server 已释放。显式关闭现在先捕获属于该次启动的 CLI / RPC 原生进程树及进程出生身份，保持 Worker 存活、有界 await RPC stop 和原生进程退出；原生进程退出前不会发送释放证明。丢失、异常、超时或无法读取身份时 fail closed。延迟强杀计时器随原生子进程退出清除，不对已退出的 PID 补发信号。
 
-Daemon 在 pool 实际选择本次关闭对象时生成 session/thread/workerGeneration/nonce 绑定的 ticket，仅接受该 IPC 子进程的匹配证明；干净 Worker exit、旧代或错误 nonce 都不能授权归档。IPC 在 mutation gate 内调用 pool 并获取 ticket，避免 gate 等待期间旧→新或无→新 Worker 的快照过时。卡片仍不 await teardown，归档与重开使用同一生命周期串行队列。
+Daemon 在 pool 实际选择本次关闭对象时生成 session/thread/workerGeneration/nonce 绑定的 ticket，仅接受该 IPC 子进程的匹配证明；干净 Worker exit、旧代或错误 nonce 都不能授权归档。IPC 在 mutation gate 内冻结归档策略，将同一快照传入 pool 并用于后续归档；契约持久化等待及 Worker 释放期间修改配置只影响后续操作。pool 按实际关闭代际返回 ticket，避免 gate 等待期间旧→新或无→新 Worker 的快照过时。卡片仍不 await teardown，归档与重开使用同一生命周期串行队列。
 
 验证过的释放凭据随 pending / archived journal 保存，允许已确认释放后的 RPC 失败重试与幂等关闭；旧 pending 记录或当前无 Worker 且无法证明原生释放的记录不推测凭据，只提示并拒绝归档。历史归档的显式恢复规则保留。所有生产归档入口均由 service 校验凭据，不允许无证明的新归档。
 

@@ -12,6 +12,7 @@ import { jsonRes } from './http.js';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { normalizeOncallConnection, readOncallConnectionDraft } from '../services/oncall-group-client.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
+import { normalizeOncallIdentityApp, readOncallIdentityApp, readOncallIdentityEnv } from '../services/oncall-identity-config.js';
 
 const KEY = 'ONCALL_SERVICE_SECRET';
 
@@ -41,7 +42,8 @@ export async function handleOncallServiceSecret(
   },
 ): Promise<boolean> {
   const isConnection = url.pathname === '/api/oncall-connection';
-  if (url.pathname !== '/api/oncall-service-secret' && !isConnection) return false;
+  const isIdentity = url.pathname === '/api/oncall-identity';
+  if (url.pathname !== '/api/oncall-service-secret' && !isConnection && !isIdentity) return false;
   res.setHeader('cache-control', 'no-store');
   const reply = (status: number, body: unknown) => { jsonRes(res, status, body); return true; };
   if (!deps.identity?.canManageHost) return reply(403, { ok: false, error: '需要管理员权限' });
@@ -50,6 +52,10 @@ export async function handleOncallServiceSecret(
   if (req.method === 'GET') {
     try {
       const active = readOncallDeploymentEnv(envFile);
+      if (isIdentity) {
+        const { appSecret, ...app } = readOncallIdentityApp(active);
+        return reply(200, { ok: true, ...app, appSecretConfigured: Boolean(appSecret) });
+      }
       if (isConnection) {
         const dataDir = deps.dataDir ?? resolveBotmuxDataDir();
         const appId = url.searchParams.get('appId') ?? '';
@@ -66,11 +72,16 @@ export async function handleOncallServiceSecret(
   catch { return reply(400, { ok: false, error: '凭据请求无效或过大' }); }
   const secret = typeof body?.secret === 'string' ? body.secret.trim() : '';
   const hasSecret = Object.hasOwn(body ?? {}, 'secret');
-  if ((!isConnection || hasSecret) && (!secret || secret.length > 8192 || /[^\x21-\x7e]/.test(secret))) {
+  if (!isIdentity && (!isConnection || hasSecret) && (!secret || secret.length > 8192 || /[^\x21-\x7e]/.test(secret))) {
     return reply(400, { ok: false, error: '请输入有效的单行 Service Secret' });
   }
   let values: Record<string, string>;
-  if (isConnection) {
+  if (isIdentity) {
+    try {
+      const app = normalizeOncallIdentityApp(body, readOncallIdentityApp(readOncallDeploymentEnv(envFile)));
+      values = { ONCALL_IDENTITY_APP_ID: app.appId, ONCALL_IDENTITY_APP_SECRET: app.appSecret, ONCALL_IDENTITY_BRAND: app.brand };
+    } catch (error) { return reply(400, { ok: false, error: error instanceof Error ? error.message : '统一查询应用配置无效' }); }
+  } else if (isConnection) {
     try {
       if (!body || Array.isArray(body) || Object.keys(body).some(key => !['endpoint', 'emailDomain', 'secret'].includes(key))) throw new Error();
       const result = normalizeOncallConnection({ endpoint: typeof body.endpoint === 'string' ? body.endpoint.trim() : '',
@@ -85,6 +96,12 @@ export async function handleOncallServiceSecret(
       const raw = file.readLeaf();
       // Creating the global file would stop startup from loading the legacy cwd .env.
       if (raw === null && existsSync(join(process.cwd(), '.env'))) throw new Error('legacy_env');
+      if (isIdentity) {
+        // Resolve an omitted password under the same lock as the write, so a
+        // concurrent credential rotation cannot be reverted by a stale read.
+        const app = normalizeOncallIdentityApp(body, readOncallIdentityApp(readOncallIdentityEnv(parse(raw ?? ''), process.env)));
+        values = { ONCALL_IDENTITY_APP_ID: app.appId, ONCALL_IDENTITY_APP_SECRET: app.appSecret, ONCALL_IDENTITY_BRAND: app.brand };
+      }
       let updated = raw ?? '';
       for (const [key, value] of Object.entries(values)) updated = replaceEnvValue(updated, key, value);
       file.writeLeaf(updated);

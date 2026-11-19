@@ -6,6 +6,27 @@ import { FeedbackStoragePanel } from '../src/dashboard/web/feedback-storage-pane
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 afterEach(() => vi.unstubAllGlobals());
 describe('feedback storage panel', () => {
+  it('saves Supabase URL and write-only server key and clears it after saving', async () => {
+    const writes: any[] = [];
+    vi.stubGlobal('fetch', async (_url: string, options?: RequestInit) => {
+      if (options?.method === 'POST') writes.push(JSON.parse(String(options.body)));
+      return { ok: true, status: 200, json: async () => ({ generation: 1, active: { backend: 'sqlite' }, migrations: [] }) };
+    });
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(FeedbackStoragePanel)); });
+    await act(async () => { renderer.root.findByProps({ id: 'feedback-storage-backend' }).props.onChange({ target: { value: 'supabase' } }); });
+    await act(async () => {
+      renderer.root.findByProps({ id: 'feedback-storage-supabase-url' }).props.onChange({ target: { value: 'https://example.supabase.co' } });
+      renderer.root.findByProps({ id: 'feedback-storage-supabase-key' }).props.onChange({ target: { value: 'sb_secret_ui_key' } });
+    });
+    await act(async () => { renderer.root.findByProps({ id: 'feedback-storage-save' }).props.onClick(); });
+    expect(writes[0]).toMatchObject({
+      supabaseKey: 'sb_secret_ui_key',
+      candidate: { backend: 'supabase', supabase: { url: 'https://example.supabase.co', schema: 'botmux_feedback', requestTimeoutMs: 5000 } },
+    });
+    expect(renderer.root.findByProps({ id: 'feedback-storage-supabase-key' }).props.value).toBe('');
+    await act(async () => renderer.unmount());
+  });
   it('saves structured doas identity instead of sending a token value', async () => {
     const writes: any[] = [];
     vi.stubGlobal('fetch', async (_url: string, options?: RequestInit) => {

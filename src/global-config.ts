@@ -27,6 +27,7 @@ import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
 import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
+import { readProviderRecoveryConfig, type ProviderRecoveryConfig } from './services/provider-recovery-policy.js';
 import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
 import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
 import {
@@ -285,9 +286,20 @@ export interface ScheduleDelegationGlobalConfig {
   runScopes?: Array<'bytedcli'>;
   /** Let a delegated scheduled turn pause or remove its own task. Default off. */
   selfManageEnabled?: boolean;
+  /** Allow an authenticated scheduled turn to create a bounded one-shot child
+   *  in its current topic. Independent from cross-bot createEnabled. */
+  childOneShotEnabled?: boolean;
+  /** Latest allowed child fire time relative to creation. Default 24h, capped at 7d. */
+  childOneShotMaxDelayMinutes?: number;
+  /** Distinct child tasks one scheduled turn may commit. Default 1, capped at 16. */
+  childOneShotMaxTasksPerTurn?: number;
 }
 
 export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
+export const SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_DELAY_MINUTES = 24 * 60;
+export const SCHEDULE_CHILD_ONE_SHOT_MAX_DELAY_MINUTES = 7 * 24 * 60;
+export const SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_TASKS_PER_TURN = 1;
+export const SCHEDULE_CHILD_ONE_SHOT_MAX_TASKS_PER_TURN = 16;
 
 export interface GlobalConfig {
   lang?: Locale;
@@ -332,6 +344,11 @@ export interface GlobalConfig {
    *  `promptCache` in bots.json overrides it field by field
    *  (services/prompt-cache-policy.ts). */
   promptCache?: PromptCacheConfig;
+  /** Automatic continuation after a transient model-provider failure (Claude
+   *  Code). Machine-level, default OFF, managed from the Dashboard; a bot's own
+   *  `providerRecovery` in bots.json overrides it field by field
+   *  (services/provider-recovery-policy.ts). */
+  providerRecovery?: ProviderRecoveryConfig;
   /** Machine-wide meeting listener kill-switch. Missing / enabled !== false
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
@@ -480,6 +497,11 @@ export interface DashboardGlobalConfig {
    *  default OFF; read live so an explicit true starts scheduling upgrades and
    *  removing it stops them, both without restarting the daemon. */
   autoUpgradeCodexSessions?: boolean;
+  /** Opt in to saving confirmed terminal effort choices for managed sessions. Default OFF. */
+  terminalEffortWriteback?: boolean;
+  /** Internal monotonic toggle generation; expires intents across off/on flips. */
+  terminalEffortWritebackEpoch?: number;
+  terminalEffortWritebackEnabledAtMs?: number;
   /** Experimental: at daemon startup, SIGTERM tmux SERVERS orphaned by a
    *  previous daemon generation (a displaced server whose socket was rebound
    *  still hosts the old managed CLIs holding per-session file locks). This is
@@ -550,6 +572,8 @@ export interface DashboardGlobalConfig {
    *  显式 `false` 时只有 Bot 管理员（canOperate）能按卡片上的任何键。与默认值相同的 `true`
    *  不落盘（Dashboard 写入时删键）。点击时 live 读取（见 config.ts `stuckCardInitiatorKeys`）。 */
   stuckCardInitiatorKeys?: boolean;
+  /** Show explicit model-capacity queue status on live cards. Default OFF; read live. */
+  modelQueueNotify?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -686,6 +710,9 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
+  if (typeof d.terminalEffortWriteback === 'boolean') out.terminalEffortWriteback = d.terminalEffortWriteback;
+  if (Number.isSafeInteger(d.terminalEffortWritebackEpoch) && (d.terminalEffortWritebackEpoch as number) >= 0) out.terminalEffortWritebackEpoch = d.terminalEffortWritebackEpoch as number;
+  if (typeof d.terminalEffortWritebackEnabledAtMs === 'number' && Number.isFinite(d.terminalEffortWritebackEnabledAtMs)) out.terminalEffortWritebackEnabledAtMs = d.terminalEffortWritebackEnabledAtMs;
   if (typeof d.reapOrphanTmuxServers === 'boolean') out.reapOrphanTmuxServers = d.reapOrphanTmuxServers;
   if (typeof d.tmuxOrphanSessionSweep === 'boolean') out.tmuxOrphanSessionSweep = d.tmuxOrphanSessionSweep;
   if (typeof d.tmuxOrphanSessionBareWrapperKill === 'boolean') out.tmuxOrphanSessionBareWrapperKill = d.tmuxOrphanSessionBareWrapperKill;
@@ -714,6 +741,7 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
   // Default ON: only an explicit stored false disables (config.ts getter).
   if (typeof d.stuckCardInitiatorKeys === 'boolean') out.stuckCardInitiatorKeys = d.stuckCardInitiatorKeys;
+  if (typeof d.modelQueueNotify === 'boolean') out.modelQueueNotify = d.modelQueueNotify;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -754,6 +782,23 @@ function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | 
     if (runScopes.length > 0) out.runScopes = runScopes;
   }
   if (typeof value.selfManageEnabled === 'boolean') out.selfManageEnabled = value.selfManageEnabled;
+  if (typeof value.childOneShotEnabled === 'boolean') {
+    out.childOneShotEnabled = value.childOneShotEnabled;
+    if (value.childOneShotEnabled) {
+      const maxDelayMinutes = readPositiveInteger(value.childOneShotMaxDelayMinutes)
+        ?? SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_DELAY_MINUTES;
+      out.childOneShotMaxDelayMinutes = Math.min(
+        maxDelayMinutes,
+        SCHEDULE_CHILD_ONE_SHOT_MAX_DELAY_MINUTES,
+      );
+      const maxTasksPerTurn = readPositiveInteger(value.childOneShotMaxTasksPerTurn)
+        ?? SCHEDULE_CHILD_ONE_SHOT_DEFAULT_MAX_TASKS_PER_TURN;
+      out.childOneShotMaxTasksPerTurn = Math.min(
+        maxTasksPerTurn,
+        SCHEDULE_CHILD_ONE_SHOT_MAX_TASKS_PER_TURN,
+      );
+    }
+  }
   if (Array.isArray(value.defaultOnDispatchFromBotAppIds)) {
     const appIds = [...new Set(value.defaultOnDispatchFromBotAppIds.filter(
       (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),
@@ -1071,6 +1116,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (sessionCleanup) out.sessionCleanup = sessionCleanup;
   const promptCache = readPromptCacheConfig(raw.promptCache);
   if (promptCache) out.promptCache = promptCache;
+  const providerRecovery = readProviderRecoveryConfig(raw.providerRecovery);
+  if (providerRecovery) out.providerRecovery = providerRecovery;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   const workflow = readWorkflowFeature(raw.workflow);
@@ -1113,6 +1160,24 @@ export function readGlobalConfig(): GlobalConfig {
 export function invalidateGlobalConfigCache(): void {
   readCache = null;
   vcMeetingAgentLiveCache = null;
+  terminalEffortLiveCache = null;
+}
+
+let terminalEffortLiveCache: { path: string; identity: string; value: { enabled: boolean; epoch: number; enabledAtMs: number } } | null = null;
+/** Preference authority cannot use the general two-second cache: a rapid
+ * off/on must invalidate a pending terminal choice in every process. */
+export function globalTerminalEffortWritebackConfigLive(): { enabled: boolean; epoch: number; enabledAtMs: number } {
+  const path = globalConfigPath();
+  try {
+    const stat = statSync(path);
+    const identity = `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    if (terminalEffortLiveCache?.path === path && terminalEffortLiveCache.identity === identity) return terminalEffortLiveCache.value;
+    const dashboard = readDashboard(readRawConfig().dashboard);
+    const value = { enabled: dashboard?.terminalEffortWriteback === true,
+      epoch: dashboard?.terminalEffortWritebackEpoch ?? 0, enabledAtMs: dashboard?.terminalEffortWritebackEnabledAtMs ?? 0 };
+    terminalEffortLiveCache = { path, identity, value };
+    return value;
+  } catch { return { enabled: false, epoch: 0, enabledAtMs: 0 }; }
 }
 
 /** Live VC meeting listener global config. Missing config means enabled.
@@ -1361,6 +1426,7 @@ export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, Glob
   // (e.g. dashboard PUT /api/settings responds with the resolved config).
   readCache = null;
   vcMeetingAgentLiveCache = null;
+  terminalEffortLiveCache = null;
 }
 
 /** The stored `sessionEnv` exactly as written (for hand-edit diagnostics). */
@@ -1385,7 +1451,13 @@ export function mergeDashboardConfig(patch: DashboardGlobalConfig): DashboardGlo
   const existing = raw.dashboard && typeof raw.dashboard === 'object' && !Array.isArray(raw.dashboard)
     ? raw.dashboard as Record<string, unknown>
     : {};
-  mergeGlobalConfig({ dashboard: { ...existing, ...patch } as DashboardGlobalConfig });
+  const next = { ...existing, ...patch } as DashboardGlobalConfig;
+  if (typeof patch.terminalEffortWriteback === 'boolean' && patch.terminalEffortWriteback !== (existing.terminalEffortWriteback === true)) {
+    const epoch = Number.isSafeInteger(existing.terminalEffortWritebackEpoch) ? existing.terminalEffortWritebackEpoch as number : 0;
+    next.terminalEffortWritebackEpoch = epoch + 1;
+    next.terminalEffortWritebackEnabledAtMs = patch.terminalEffortWriteback ? Date.now() : 0;
+  }
+  mergeGlobalConfig({ dashboard: next });
   return readGlobalConfig().dashboard ?? {};
 }
 
@@ -1453,20 +1525,22 @@ export function ignoredScheduleBotGrantCount(): number {
   return list.length - (readGlobalConfig().scheduleDelegation?.botGrants?.length ?? 0);
 }
 
-/** Dashboard write for the bot-grant entry (`createEnabled`, `selfManageEnabled`,
- *  `botGrants`). A value equal to its default (off / empty) removes the key
+/** Dashboard write for the schedule-delegation entry (`createEnabled`,
+ *  `selfManageEnabled`, `childOneShotEnabled`, `botGrants`). A value equal to
+ *  its default (off / empty) removes the key
  *  instead of being stored, an emptied block is dropped, and every other
  *  scheduleDelegation key on disk is left exactly as it was. */
 export function writeScheduleBotGrantConfig(patch: {
   createEnabled?: boolean;
   selfManageEnabled?: boolean;
+  childOneShotEnabled?: boolean;
   botGrants?: ScheduleBotGrant[];
 }): ScheduleDelegationGlobalConfig | undefined {
   const raw = readRawConfig();
   const next = raw.scheduleDelegation && typeof raw.scheduleDelegation === 'object' && !Array.isArray(raw.scheduleDelegation)
     ? { ...raw.scheduleDelegation as Record<string, unknown> }
     : {};
-  for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+  for (const key of ['createEnabled', 'selfManageEnabled', 'childOneShotEnabled'] as const) {
     if (patch[key] === true) next[key] = true;
     else if (patch[key] === false) delete next[key];
   }

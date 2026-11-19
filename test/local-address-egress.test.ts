@@ -7,7 +7,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor(public opts: Record<string, unknown>) {} },
 }));
 
-import { getBot, registerBot } from '../src/bot-registry.js';
+import { getBot, registerBot, resolveHideLocalAddresses } from '../src/bot-registry.js';
 import {
   patchCardStreamElement, replyMessage, sendEphemeralCard, sendMessage,
   sendUserMessage, updateCardStreamElementContent, updateCardStreamingSettings, updateMessage,
@@ -15,7 +15,7 @@ import {
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
 import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
-import { sanitizeLocalAddressNode, sanitizeLocalAddressText } from '../src/im/lark/local-address-policy.js';
+import { prepareLocalAddressContent, sanitizeLocalAddressNode, sanitizeLocalAddressText } from '../src/im/lark/local-address-policy.js';
 import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
 import { buildTerminalUrl, resetTerminalProxy } from '../src/core/terminal-url.js';
 import { resolvePluginResultAccessUrl } from '../src/core/plugin-result-access-url.js';
@@ -50,9 +50,11 @@ let nextApp = 0;
 const asBuilt = (body: unknown) => JSON.parse(typeof body === 'string' ? body : JSON.stringify(body),
   (key, value) => key === '__bm_cb' ? undefined : value);
 
-function capture() {
+/** The policy cases below are for a bot that turned on BotConfig.hideLocalAddresses;
+ * the default (off) is covered in its own block at the end. */
+function capture({ hideLocalAddresses = true }: { hideLocalAddresses?: boolean } = {}) {
   const app = 'local-egress-' + nextApp++;
-  registerBot({ larkAppId: app, larkAppSecret: 's', cliId: 'claude-code' });
+  registerBot({ larkAppId: app, larkAppSecret: 's', cliId: 'claude-code', ...(hideLocalAddresses ? { hideLocalAddresses } : {}) });
   const writes: any[] = [];
   const write = async (args: any) => {
     writes.push(args);
@@ -280,13 +282,13 @@ describe('host capability links in a default LAN deployment', () => {
     ].map(over => ({ rootMessageId: 'om_root', chatId: 'oc_chat', chatType: 'group', title: 't', cliId: 'claude-code',
       workingDir: '~/work', status: 'idle', lastMessageAt: 1, cliVersion: 'unknown', scope: 'thread', spawnedAt: 0,
       isOncall: false, hasHistory: true, ...over }) as SessionRow);
-    const proxyUrl = buildSessionTerminalUrl(rows[0]!)!;
+    const proxyUrl = buildSessionTerminalUrl(rows[0]!, app)!;
     expect(proxyUrl).toBe(`${webOrigin(8801)}/s/sid-other-bot`);
     expect(() => sanitizeLocalAddressNode({ url: proxyUrl })).toThrow();
-    expect(buildSessionTerminalUrl(rows[1]!)).toBeNull();
+    expect(buildSessionTerminalUrl(rows[1]!, app)).toBeNull();
     for (const row of rows) {
       await sendMessage(app, 'oc_chat', buildSessionsDetailCard(composeDetail(row, 2), {
-        invokerOpenId: 'ou_owner', locale: 'zh', nowMs: 2, scope: 'global', terminalUrl: buildSessionTerminalUrl(row),
+        invokerOpenId: 'ou_owner', locale: 'zh', nowMs: 2, scope: 'global', terminalUrl: buildSessionTerminalUrl(row, app),
       }), 'interactive');
     }
     expect(writes).toHaveLength(2);
@@ -372,5 +374,115 @@ describe('host capability links in a default LAN deployment', () => {
       seams: { resolveLink, getChatMode: async () => 'group' } })).resolves.toBe('ephemeral');
     expect(JSON.parse(writes[4].data.content).text).toContain(resolved.link.url);
     expect(JSON.stringify(writes[5].data.card)).toContain(resolved.link.url);
+  });
+});
+
+// BotConfig.hideLocalAddresses is off by default: model output and cards go out
+// as they did before the policy existed, and the switch is read on every send.
+describe('a bot that has not turned on hideLocalAddresses (default)', () => {
+  const evidence = '排查证据：/opt/app/logs/error.log、/data00/home/alice/run.sh:3、http://localhost:3000/health，'
+    + '见 [MIX Bot 协作技能](/data00/home/alice/.agents/skills/mix-bot-collaboration/SKILL.md)';
+  const cardWith = (button: Record<string, unknown>) => JSON.stringify({ schema: '2.0', body: { elements: [
+    { tag: 'markdown', content: evidence },
+    { tag: 'button', text: { tag: 'plain_text', content: '打开' }, ...button },
+  ] } });
+
+  it('leaves every model output entry as written and refuses nothing', () => {
+    const { app } = capture({ hideLocalAddresses: false });
+    const context = localAddressContextForBot(app, '/data00/home/alice');
+    expect(sanitizeLocalAddressText(evidence, context)).toBe(evidence);
+    for (const body of [
+      cardWith({ url: 'file:///data00/home/alice/report.html' }),
+      cardWith({ behaviors: [{ type: 'open_url', default_url: 'http://127.0.0.1:3000/report' }] }),
+      '{ not json /data00/home/alice/report.md',
+    ]) {
+      expect(prepareLocalAddressContent(body, 'interactive', context)).toBe(body);
+    }
+    const post = { zh_cn: { content: [[{ tag: 'a', text: '报告', href: '/data00/home/alice/report.md' }]] } };
+    expect(sanitizeLocalAddressNode(post, context)).toEqual(post);
+  });
+
+  it.each(['send', 'reply', 'dm', 'ephemeral', 'update', 'patch-element'] as const)(
+    '%s writes prose and card link fields that point at this host', async surface => {
+      const { app, writes } = capture({ hideLocalAddresses: false });
+      const body = cardWith({ behaviors: [{ type: 'open_url', default_url: 'http://127.0.0.1:3000/report' }] });
+      if (surface === 'send') await sendMessage(app, 'oc_chat', body, 'interactive');
+      if (surface === 'reply') await replyMessage(app, 'om_parent', body, 'interactive');
+      if (surface === 'dm') await sendUserMessage(app, 'ou_user', body, 'interactive');
+      if (surface === 'ephemeral') await sendEphemeralCard(app, 'oc_chat', 'ou_user', body);
+      if (surface === 'update') await updateMessage(app, 'om_card', body);
+      if (surface === 'patch-element') {
+        await patchCardStreamElement(app, 'card1', 'open', { tag: 'button', url: 'file:///tmp/report.md' }, 1, 'u1');
+      }
+      expect(writes).toHaveLength(1);
+      const written = JSON.stringify(writes[0].data);
+      if (surface === 'patch-element') expect(written).toContain('file:///tmp/report.md');
+      else {
+        expect(written).toContain('http://127.0.0.1:3000/report');
+        expect(written).toContain('/opt/app/logs/error.log');
+      }
+    });
+
+  it('keeps a direct-port terminal link on a session detail card', async () => {
+    const { app, writes } = capture({ hideLocalAddresses: false });
+    const row = { sessionId: 'sid-direct', larkAppId: app, webPort: 40002, rootMessageId: 'om_root', chatId: 'oc_chat',
+      chatType: 'group', title: 't', cliId: 'claude-code', workingDir: '~/work', status: 'idle', lastMessageAt: 1,
+      cliVersion: 'unknown', scope: 'thread', spawnedAt: 0, isOncall: false, hasHistory: true } as SessionRow;
+    const url = buildSessionTerminalUrl(row, app);
+    expect(url).toBe(localHttpOrigin(config.web.externalHost, 40002));
+    await sendMessage(app, 'oc_chat', buildSessionsDetailCard(composeDetail(row, 2), {
+      invokerOpenId: 'ou_owner', locale: 'zh', nowMs: 2, scope: 'global', terminalUrl: url,
+    }), 'interactive');
+    expect(writes[0].data.content).toContain(':40002');
+  });
+
+  it('applies a switch change from the next send on', async () => {
+    const { app, writes } = capture({ hideLocalAddresses: false });
+    const body = cardWith({ url: 'file:///tmp/report.md' });
+    await sendMessage(app, 'oc_chat', body, 'interactive');
+    getBot(app).config.hideLocalAddresses = true;
+    expect(sanitizeLocalAddressText(evidence, localAddressContextForBot(app))).not.toContain('/opt/app/logs/error.log');
+    await expect(sendMessage(app, 'oc_chat', body, 'interactive'))
+      .rejects.toMatchObject({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' });
+    getBot(app).config.hideLocalAddresses = undefined;
+    await sendMessage(app, 'oc_chat', body, 'interactive');
+    expect(writes).toHaveLength(2);
+  });
+});
+
+// `botmux send` reads the switch without the daemon: the loaded registry, then
+// bots.json, then the snapshot a sandboxed or remote session carries in its env.
+describe('reading the hideLocalAddresses switch', () => {
+  const env = { ...process.env };
+  afterEach(() => { process.env = { ...env }; });
+
+  it('reads bots.json for a bot this process has not registered', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-hide-local-'));
+    try {
+      const file = join(dir, 'bots.json');
+      writeFileSync(file, JSON.stringify([
+        { larkAppId: 'cli_disk_on', larkAppSecret: 's', cliId: 'claude-code', hideLocalAddresses: true },
+        { larkAppId: 'cli_disk_off', larkAppSecret: 's', cliId: 'claude-code' },
+      ]));
+      process.env.BOTS_CONFIG = file;
+      expect(resolveHideLocalAddresses('cli_disk_on')).toBe(true);
+      expect(resolveHideLocalAddresses('cli_disk_off')).toBe(false);
+      // A bot listed in bots.json is not overridden by an inherited env value.
+      process.env.BOTMUX_LARK_APP_ID = 'cli_disk_off';
+      process.env.BOTMUX_HIDE_LOCAL_ADDRESSES = '1';
+      expect(resolveHideLocalAddresses('cli_disk_off')).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to its own session snapshot when bots.json is out of reach', () => {
+    process.env.BOTS_CONFIG = join(tmpdir(), 'botmux-hide-local-missing', 'bots.json');
+    process.env.BOTMUX_LARK_APP_ID = 'cli_sandboxed';
+    process.env.BOTMUX_HIDE_LOCAL_ADDRESSES = '1';
+    expect(resolveHideLocalAddresses('cli_sandboxed')).toBe(true);
+    expect(resolveHideLocalAddresses('cli_other')).toBe(false);
+    process.env.BOTMUX_HIDE_LOCAL_ADDRESSES = '0';
+    expect(resolveHideLocalAddresses('cli_sandboxed')).toBe(false);
   });
 });

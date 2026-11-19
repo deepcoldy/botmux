@@ -125,6 +125,7 @@ export async function detectModelsViaExec(
   bin: string,
   args: readonly string[],
   parse: (stdout: string) => string[],
+  env?: NodeJS.ProcessEnv,
 ): Promise<readonly string[] | null> {
   try {
     // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
@@ -132,6 +133,7 @@ export async function detectModelsViaExec(
     // 的 try/catch 兜住（契约：任何异常 → null）。
     const execFileAsync = promisify(execFile);
     const { stdout } = await execFileAsync(bin, [...args], {
+      ...(env ? { env } : {}),
       timeout: 8000,
       maxBuffer: 16 * 1024 * 1024,
       windowsHide: true,

@@ -34,6 +34,7 @@ import {
 } from './agent-workbench-storage.js';
 import { buildChatAppLink } from './agent-workbench-chat.js';
 import { botDisplayName, t } from './ui.js';
+import { useClosedHistorySearch } from './closed-history-search.js';
 
 /** 行操作按钮用短文字，不用图标——图标要靠猜，两个字直接说清楚做什么。 */
 
@@ -226,6 +227,8 @@ function useTouchRowMetrics(): boolean {
 export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JSX.Element {
   const touchRows = useTouchRowMetrics();
   const [query, setQuery] = useState('');
+  // 首屏只带最近的已关闭会话：搜索时去服务端补查更早的已关闭会话（合进 store 后按本地规则过滤）。
+  useClosedHistorySearch(query);
   const [scrollTop, setScrollTop] = useState(0);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const lastScrolledSelectionRef = useRef<string | null>(props.selectedSessionId ?? null);

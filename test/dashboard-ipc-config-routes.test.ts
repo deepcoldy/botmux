@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { setLarkAppId, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { config } from '../src/config.js';
+import { codexCleanupArchiveEnabled } from '../src/services/codex-cleanup-archive.js';
 
 const APP_ID = 'cli_config_routes_test';
 
@@ -29,12 +30,14 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-cantalk-daemon-commands', LEGACY],
   ['/api/bot-launch-shell', LEGACY],
   ['/api/bot-oncall-group', LEGACY],
+  ['/api/bot-owner-group-follow', LEGACY],
   ['/api/bot-actor-owner-bindings', LEGACY],
   ['/api/bot-no-progress-notify', OK_FALSE],
   ['/api/bot-feedback', LEGACY],
   ['/api/bot-env', LEGACY],
   ['/api/bot-max-live-workers', LEGACY],
   ['/api/bot-idle-suspend-minutes', LEGACY],
+  ['/api/bot-archive-codex', LEGACY],
   ['/api/bot-riff', LEGACY],
   ['/api/bot-herdr', LEGACY],
   ['/api/bot-skills', LEGACY],
@@ -45,6 +48,10 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
 type Case = readonly [string, string, number, unknown, Record<string, unknown>?];
 const CASES: readonly Case[] = [
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true,"excludeChatIds":["oc_skip"]}}', 200, { ok: true, ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }, { ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}', 200, { ok: true, ownerGroupFollow: null }, { ownerGroupFollow: undefined }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":"true"}}', 400, { ok: false, error: 'invalid_json' }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"excludeChatIds":["ou_other"]}}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-p2p-mode', '{"p2pMode":"thread"}', 200, { ok: true, p2pMode: 'thread' }, { p2pMode: 'thread' }],
   ['/api/bot-p2p-mode', '{"p2pMode":5}', 200, { ok: true, p2pMode: 'chat' }, { p2pMode: undefined }],
   ['/api/bot-envelope-injection', '{"envelopeInjection":"auto"}', 200, { ok: true, envelopeInjection: 'auto' }, { envelopeInjection: 'auto' }],
@@ -97,6 +104,13 @@ const CASES: readonly Case[] = [
   ['/api/bot-idle-suspend-minutes', '{"idleSuspendMinutes":null}', 200, { ok: true, idleSuspendMinutes: null }, { idleSuspendMinutes: undefined }],
   ['/api/bot-idle-suspend-minutes', '{"idleSuspendMinutes":"x"}', 400, { ok: false, error: 'invalid_number' }],
   ['/api/bot-idle-suspend-minutes', '{}', 200, { ok: true, idleSuspendMinutes: null }, { idleSuspendMinutes: undefined }],
+  // 三态覆盖：显式 false 也落盘；null 才删键回到继承；缺键 / 非布尔不当清除。
+  ['/api/bot-archive-codex', '{"archiveCodex":false}', 200, { ok: true, archiveCodex: false }, { archiveCodex: false }],
+  ['/api/bot-archive-codex', '{"archiveCodex":true}', 200, { ok: true, archiveCodex: true }, { archiveCodex: true }],
+  ['/api/bot-archive-codex', '{"archiveCodex":null}', 200, { ok: true, archiveCodex: null }, { archiveCodex: undefined }],
+  ['/api/bot-archive-codex', '{"archiveCodex":"off"}', 400, { ok: false, error: 'invalid_archive_codex' }],
+  ['/api/bot-archive-codex', '{}', 400, { ok: false, error: 'invalid_archive_codex' }],
+  ['/api/bot-archive-codex', '[]', 400, { ok: false, error: 'invalid_archive_codex' }],
   ['/api/bot-sandbox-network-policy', '{"policy":null}', 200, { ok: true, sandboxNetworkPolicy: null, warnings: [] }],
   ['/api/bot-sandbox-network-policy', '{"policy":1,"x":2}', 400, { ok: false, error: 'policy_required' }],
   // 校验通过后由 applyConfigField 拒绝：reason 原样作为 400 的 error。
@@ -216,6 +230,36 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     }
   });
 
+  it('/api/bot-owner-group-follow rejects new apiOnly config and permits clearing it', async () => {
+    const localAppId = 'local_config_routes_test';
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: localAppId,
+      apiOnly: true,
+      localIdentity: true,
+      cliId: 'riff',
+      ownerGroupFollow: { enabled: true },
+    }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    setLarkAppId(localAppId);
+    const before = readFileSync(configPath, 'utf8');
+
+    const rejected = await put('/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true}}');
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({ ok: false, error: 'owner_group_follow_api_only' });
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+
+    const defaults = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+    expect(defaults.status).toBe(200);
+    expect((await defaults.json()).apiOnly).toBe(true);
+
+    const cleared = await put('/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}');
+    expect(cleared.status).toBe(200);
+    expect(await cleared.json()).toEqual({ ok: true, ownerGroupFollow: null });
+    expect(persistedBot()).toMatchObject({ larkAppId: localAppId, apiOnly: true, localIdentity: true });
+    expect(persistedBot()).not.toHaveProperty('ownerGroupFollow');
+  });
+
   it.runIf(process.platform === 'linux')('/api/bot-sandbox-network-policy saves with DNS and proxy warnings', async () => {
     // The bot's own env layer counts: its sessions inherit it.
     writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true, backendType: 'pty', env: { HTTPS_PROXY: 'http://proxy.example:8080' } }], null, 2));
@@ -243,6 +287,27 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     const res = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: bare }));
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, warnings: ['proxy_requires_trusted_egress'] });
+  });
+
+  it('/api/bot-archive-codex overrides the global archive switch for the next close and is echoed by the defaults GET', async () => {
+    writeFileSync(join(dir, 'global-config.json'), JSON.stringify({ sessionCleanup: { archiveCodex: true } }));
+    const shown = async () => {
+      const res = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+      expect(res.status).toBe(200);
+      return (await res.json()).archiveCodex;
+    };
+    expect(codexCleanupArchiveEnabled(APP_ID)).toBe(true);
+    expect(await shown()).toBeNull();
+
+    expect((await put('/api/bot-archive-codex', '{"archiveCodex":false}')).status).toBe(200);
+    // 关闭路径每次开始时取的就是这个判定：Dashboard 保存后无需重启即按本 Bot 的值。
+    expect(codexCleanupArchiveEnabled(APP_ID)).toBe(false);
+    expect(await shown()).toBe(false);
+
+    expect((await put('/api/bot-archive-codex', '{"archiveCodex":null}')).status).toBe(200);
+    expect(codexCleanupArchiveEnabled(APP_ID)).toBe(true);
+    expect(await shown()).toBeNull();
+    expect(persistedBot()).not.toHaveProperty('archiveCodex');
   });
 
   it('/api/bot-env merges and removes keys, then clears an empty merge result', async () => {

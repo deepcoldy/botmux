@@ -1,6 +1,9 @@
+import { normalizeOwnerGroupFollowConfig, notifyOwnerGroupFollowChanged } from './owner-group-follow-policy.js';
 import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
+import { parseInviteConfig } from './invite-config.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
+import { normalizeIdleSpinSuspendConfig } from '../core/idle-spin-config.js';
 import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
@@ -16,7 +19,7 @@ import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sa
 import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
 import { normalizeHerdrBackendConfig, resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { normalizeRemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
-import { parseTriggerUserAuthConfig } from './trigger-user-auth.js';
+import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from './trigger-user-auth.js';
 import { sharedBotSandboxAdvice, type SharedBotSandboxAdvice } from '../core/shared-bot-sandbox-advice.js';
 import { resolveLocalSandboxMode, localSandboxApplies } from '../adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityError } from '../adapters/backend/session-backend-selector.js';
@@ -51,17 +54,22 @@ import { normalizeFeedbackPresentation } from './feedback-presentation.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
 import { normalizeNoProgressNotifyPolicy } from './no-progress-notify-policy.js';
 import { normalizePromptCacheConfig } from './prompt-cache-policy.js';
+import { normalizeProviderRecoveryConfig } from './provider-recovery-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
 import {
   notifyPinStreamingCardChanged,
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
 import {
+  cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
+  isCodexReasoningCliId,
   isCodexReasoningEffort,
   isConfigurableReasoningCliId,
   reasoningEffortsForCliModel,
+  type ReasoningCatalog,
 } from './codex-reasoning-effort.js';
+import { loadBotCodexReasoningCatalog } from './codex-bot-reasoning-catalog.js';
 import { isCodexServiceTier, isCodexServiceTierCliId } from './codex-service-tier.js';
 import { validateCodexServiceTier } from './codex-service-tier-catalog.js';
 import { botOneShotEnv } from '../core/session-env-resolve.js';
@@ -127,6 +135,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'displayName', configKey: 'displayName', kind: 'string', effect: 'immediate', clearable: true, maxLen: 64, hint: '自定义展示名（dashboard 名册/会话列表用，≤64 字符）；不改飞书群内应用名；unset 回飞书名称' },
   { key: 'model', configKey: 'model', kind: 'string', effect: 'next-session', clearable: true, hint: 'CLI 模型名（如 opus）；unset 回 CLI 默认' },
   { key: 'codexRpcInput', configKey: 'codexRpcInput', kind: 'boolean', effect: 'next-session', clearable: true, hint: 'Codex/TraeX RPC 输入 on|off；off 显式使用终端输入，unset 跟随全局；Auto 启用时自动使用终端输入' },
+  { key: 'archiveCodex', configKey: 'archiveCodex', kind: 'boolean', effect: 'immediate', clearable: true, hint: '关闭/清理会话时同步归档原生 Codex on|off；unset 继承全局 sessionCleanup.archiveCodex；不影响已有归档的恢复和标题同步' },
   { key: 'reasoningEffort', configKey: 'reasoningEffort', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], hint: '支持的 CLI 上新会话默认思考强度 low|medium|high|xhigh|max|ultra；unset 回 CLI 默认' },
   { key: 'serviceTier', configKey: 'serviceTier', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'priority', 'ultrafast'], hint: 'Codex 新会话速度档位 default|priority|ultrafast；default 显式覆盖原生加速配置；unset 回 Codex 原生配置' },
   { key: 'cli', configKey: 'cliId', kind: 'cli', effect: 'next-session', clearable: false, hint: 'CLI 适配器（序号 1-16 或 id，如 claude-code）' },
@@ -150,6 +159,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'feedbackPresentation', configKey: 'feedbackPresentation', kind: 'json', effect: 'immediate', clearable: true, hint: '反馈卡展示规则 JSON；按群和问题配置轮次、模板与动作；默认关闭' },
   { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=logo(默认)|name|off；unset 恢复默认' },
+  { key: 'inviteConfig', configKey: 'inviteConfig', kind: 'json', effect: 'immediate', clearable: true, hint: '/invite all 默认成员 JSON：agents 名称/app ID 数组；与 /g 的 groupCreation 独立；unset 清空' },
   { key: 'oncallGroup', configKey: 'oncallGroup', kind: 'json', effect: 'immediate', clearable: true, hint: '拉起 Oncall 群按钮：enabled 开关及 chatIds 生效群，默认关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex/Grok/TraeX/Pi/Kimi 普通飞书对话' },
@@ -161,15 +171,21 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'replyCardShowTools', configKey: 'replyCardShowTools', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '动态单卡是否显示工具调用 on|off（默认 on）：仅 replyCardMode=unified 时生效，legacy 模式无效（切换模式保留该值）；off 时卡片隐藏工具节点、命令、结果与工具次数，思考摘要和公开进度仍显示；不影响原生思考气泡，/cot show 也不会显示被隐藏的工具' },
   { key: 'silentTurnReactions', configKey: 'silentTurnReactions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭无卡片模式下的 GoGoGo/DONE reaction 和 Codex App 追加指令确认回执 on|off' },
   { key: 'writableTerminalLinkInCard', configKey: 'writableTerminalLinkInCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '卡片内嵌可写终端链接 on|off' },
+  { key: 'goalStatusCard', configKey: 'goalStatusCard', kind: 'boolean', effect: 'next-session', clearable: false, hint: '目标状态卡 on|off（默认 off）：Codex / TRAE 设定原生目标时，在会话里发一张状态卡并原地更新进行中、完成等状态和 CLI 累计时长；新会话或会话重启后开始读取目标，关闭后已有的卡立即停止更新' },
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
   { key: 'replyCardActions', configKey: 'replyCardActions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡右下角操作菜单（打开终端/切换模型/关闭会话）on|off，默认关闭' },
+  { key: 'replyCardNextStep', configKey: 'replyCardNextStep', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「下一步」按钮 on|off，默认关闭：把 CLI 给出的下一轮推荐输入（目前是 Claude Code 输入框里的置灰提示）放在本轮最后一张回复卡签名上方，点击即以点击人身份发给本会话；不支持的 CLI 不显示' },
+  { key: 'replyCardRecap', configKey: 'replyCardRecap', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「本轮回顾」on|off，默认关闭：在本轮最后一张回复卡签名上方放一个默认折叠的面板，列出改了哪些文件、跑了哪些命令；CLI 自己写出回顾时（Claude Code 空闲几分钟后写进 transcript 的离开总结）原地补上，不额外调用模型' },
+  { key: 'replyCardRecapModel', configKey: 'replyCardRecapModel', kind: 'boolean', effect: 'immediate', clearable: false, hint: '「本轮回顾」小模型补写 on|off，默认关闭，需同时开 replyCardRecap：本轮结束 6 分钟仍没有 CLI 自带回顾时，用会话自己的 Claude Code 凭证调一次 haiku 写回顾（实测每次约 $0.001–0.002）；沙盒/读隔离会话不调用，其它 CLI 不支持' },
   { key: 'summaryMemory', configKey: 'summaryMemory', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/summary 写入当前项目 summary.md 的问题解决记录 on|off' },
   { key: 'summaryMemoryPath', configKey: 'summaryMemoryPath', kind: 'string', effect: 'immediate', clearable: true, hint: '/summary 记忆文件路径，支持相对当前项目根目录或绝对路径；unset 回 summary.md' },
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
   { key: 'autoInviteOwnerOnGroupAdd', configKey: 'autoInviteOwnerOnGroupAdd', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: 'bot 被拉进新群时自动把 owner 拉进群 on|off（默认 on）；off 适用于告警/oncall 批量事件群' },
   { key: 'autoStartOnNewTopic', configKey: 'autoStartOnNewTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '话题群每个新话题自动开工 on|off' },
+  { key: 'ownerGroupFollow', configKey: 'ownerGroupFollow', kind: 'json', effect: 'immediate', clearable: true, hint: '主人进新群时自动邀请本机器人，默认关闭；JSON {"enabled":true,"excludeChatIds":["oc_…"],"pollIntervalSeconds":60}。仅使用主人本人的用户授权，首次扫描只建立基线；被移出后不再补拉；unset 关闭' },
   { key: 'steward', configKey: 'steward', kind: 'json', effect: 'immediate', clearable: true, hint: '管家（决策看板）JSON：{"enabled":true,"chatId":"oc_…","guideMode":"append|replace","guideText":"自定义规则","autoJoinNewGroups":false,"autoJoinSoloGroups":true,"closeHints":true,"decisionCards":false,"taskHints":true}；默认关闭；autoJoinNewGroups=拉新群时带上管家，默认开，只在关掉时写 false；autoJoinSoloGroups=只有你和一个 bot 的新群也带，默认关；closeHints=后台巡检提示可以关 / 可以推进 / 过了复查时间的事项（只提示不改状态），默认关；decisionCards=待拍板时往管家群发拍板卡片，默认开，只在关掉时写 false；taskHints=关联群里一轮交付、举手或中断时提醒管家（只提示不改状态），默认关，只在打开时写 true；unset 关闭（看板数据保留）' },
   { key: 'chatManagerEnabled', configKey: 'chatManagerEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 被设为普通群负责人（默认接待者）on|off（默认 off）：开启后才提供会话内群负责人工具并允许 set，关闭后不免 @ 接话；clear/status 不受影响' },
+  { key: 'chatManagerSharedTopic', configKey: 'chatManagerSharedTopic', kind: 'boolean', effect: 'immediate', clearable: false, hint: '群负责人免 @ 接的顶层消息也开话题 on|off（默认 off）：仅在共享回复模式（/reply-mode shared）的普通群生效，回复挂到那条消息下面、和 @ 本 bot 一样，仍是群级同一个会话；需同时开 chatManagerEnabled' },
   { key: 'groupSecretaryEnabled', configKey: 'groupSecretaryEnabled', kind: 'boolean', effect: 'immediate', clearable: false, hint: '允许本 bot 在群里用 /secretary on 当群秘书 on|off（默认 off）：关闭时 /secretary on|takeover 提示未开放、后台不旁听不巡检；off/status 不受影响' },
   { key: 'worktreeMultiPicker', configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false, hint: 'repo 卡片 worktree 选择器默认多仓库模式 on|off（卡片「切换多仓库选择器」按钮同款）' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
@@ -178,11 +194,13 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'suppressDeliveredFinalFailureNotice', configKey: 'suppressDeliveredFinalFailureNotice', kind: 'boolean', effect: 'next-session', clearable: true, hint: '实验性：已送达 final 后不再补发失败通知 on|off（默认 off）：同一轮同一次尝试已带回执送达显式 final 后，结构化转写（Codex 等）收尾失败只记日志、不再发「模型连接失败」；信任该 final，不比对事后续写文本；执行状态仍为失败；下个 worker 启动生效' },
   { key: 'noProgressNotify', configKey: 'noProgressNotify', kind: 'json', effect: 'immediate', clearable: true, hint: '无进展提醒：Codex CLI 可用 {"cliEnabled":true} 显式开启（下一个 worker 生效，默认 5/15 分钟提醒，无自动重试）；Codex App（#1162）：{"enabled":false} 仅静默 Lark 推送（看板 stalled 状态与 requires_attention 保留，立即生效）；{"timeoutMs":300000} 调整阈值（整数 10000–3600000ms，默认 90000，下一个 worker 进程生效，不影响对账超时）；unset 回默认' },
   { key: 'promptCache', configKey: 'promptCache', kind: 'json', effect: 'immediate', clearable: true, hint: 'Claude Code 提示缓存：{"ttl":"1h","keepalive":{"enabled":true,"idleMinutes":54,"maxPings":2,"activeHours":"10:00-23:00","minContextTokens":50000}}；逐字段覆盖全局 promptCache，未设的字段继承全局；ttl 下个会话生效，保活立即生效；unset 回落全局' },
+  { key: 'providerRecovery', configKey: 'providerRecovery', kind: 'json', effect: 'immediate', clearable: true, hint: 'Claude Code 暂态模型服务故障后自动续跑（默认关）：{"enabled":true,"maxWaitMinutes":30}；开启后按上游给的恢复时间排期、读不到就退避，最长从最后一次成功请求算起 maxWaitMinutes 分钟（1–240，未设时 1 小时提示缓存为 55、否则 15）；关闭时失败直接发失败卡；逐字段覆盖全局 providerRecovery，unset 回落全局' },
   { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'topicUnavailablePolicy', configKey: 'topicUnavailablePolicy', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'stop'], enumDefault: () => 'legacy', hint: '原话题不可用时：legacy=保持原有发送和兜底行为（默认）｜stop=停止发送，查询异常暂停且不改发；unset 回 legacy' },
   { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：send=模型必须自己 botmux send｜transcript=从 CLI 转写自动取最终回复发卡，模型不再被要求 botmux send；缺省按 CLI：doubao 缺省 transcript（其工具命令跑在账号级常驻 service 进程，botmux send 归属不可靠），其余 CLI 缺省 send、与上游一致；仅 doubao 与 claude-code 及 codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok/cursor 支持 transcript，当前沙盒不支持时运行时回落 send；系统提示需 /restart 才换新值，逐轮信封立即生效；unset 回该 CLI 缺省' },
   { key: 'senderTagHideEmail', configKey: 'senderTagHideEmail', kind: 'boolean', effect: 'immediate', clearable: false, hint: '隐藏 <sender> 邮箱 on|off（默认 off）：开启后只省略 email，保留姓名和 ID；不影响鉴权与 --mention-back。下一次新构造的输入生效，不清理历史或用户正文中的邮箱' },
+  { key: 'hideLocalAddresses', configKey: 'hideLocalAddresses', kind: 'boolean', effect: 'immediate', clearable: false, hint: '隐藏开发机地址 on|off（默认 off）：开启后模型回复发到飞书前，开发机文件路径和本机服务地址换成仓库相对引用或「【内部文件】」，提示里加上不放这类地址的规则，卡片按钮指向本机的整条拒发（宿主自己的终端/Dashboard 链接除外）；适合给别人用的 bot，只给自己用、要在回复里看到排障路径的保持 off。回复处理与每轮提示立即生效，系统提示里的完整规则从下个会话生效' },
   { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
   { key: 'grantRequestToOwnerDm', configKey: 'grantRequestToOwnerDm', kind: 'boolean', effect: 'immediate', clearable: false, hint: '授权申请卡转投 owner 私聊 on|off（默认 off）：会话里没有管理员（群里查不到管理员、或私聊被挡）时，申请卡发到主 owner 私聊，申请人只收到中性回执；适合 owner 不进群的用法' },
@@ -193,6 +211,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'cardActionAckTimeoutMs', configKey: 'cardActionAckTimeoutMs', kind: 'number', effect: 'immediate', clearable: true, min: MIN_CARD_ACTION_ACK_TIMEOUT_MS, max: MAX_CARD_ACTION_ACK_TIMEOUT_MS, hint: '本 bot 所有卡片动作的同步 ACK 等待时长（500–2500ms，默认 2500ms）；超时先提示后台处理，插件可继续执行；unset 回默认' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大常驻会话数；超过后最久未用的会话自动休眠（退出后台进程和 CLI、回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'idleSuspendMinutes', configKey: 'idleSuspendMinutes', kind: 'number', effect: 'immediate', clearable: true, hint: '空闲会话自动休眠超时（分钟，正整数）；会话持续空闲超过该时长即自动休眠回收内存，与最大常驻会话数互不影响；unset=关闭（默认，空闲不超时，仅受数量上限约束）' },
+  { key: 'idleSpinSuspend', configKey: 'idleSpinSuspend', kind: 'json', effect: 'immediate', clearable: true, hint: 'CPU 空闲自旋回收 JSON：{"enabled":true,"cliIds":["traex"],"cpuPercent":20,"consecutiveSamples":3,"sampleIntervalSeconds":30,"minIdleMinutes":5,"maxSuspendsPerSample":8,"hostPressure":{"enabled":true,"afterSamples":3,"cooldownMinutes":10,"maxSuspendsPerPass":16,"enterCpuPercent":85,"exitCpuPercent":70}}；cpuPercent 是单核百分比（20=0.2 核）；两层都只作用于 cliIds 内的 CLI（默认只有 traex），CLI 下仍有后台任务等子进程的会话不会被挂起；unset 用保守默认值' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/换行分隔，或“空格+/”分隔，如 /goal /export；名字内空格归一为连字符，/Ultra Goal → /ultra-goal）；unset 回仅内置白名单' },
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
@@ -203,12 +222,12 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：沙箱 bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；完全未开沙箱的 bot 不生效（仍用全局登录），已开沙箱却无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
   { key: 'codexInstancePool', configKey: 'codexInstancePool', kind: 'json', effect: 'next-session', clearable: true, hint: '会话级 Codex 实例：显式 defaultInstanceId 与 instances[{id,codexHome,weight}]，weight默认1；scope=ordinary-feishu，strategy=random。仅新会话分配，已有会话保持绑定。使用 botmux codex-instances check 检查本机目录。' },
-  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli"]}；tools 省略=全部。未授权时 lark-cli / bytedcli 一律拒绝（拒绝消息里会附授权链接，点开后重试即可），不会用 bot 或任何人的身份代跑；fallback 字段仅为兼容旧配置保留，当前不再改变行为。注意 bytedcli 没有 bot 身份，对它 fallback 恒等于失败。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
+  { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后，勾选的能力用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"capabilities":["lark-user","bytecloud","meego"]}：lark-user=飞书用户身份（lark-cli --as user），bytecloud=ByteCloud（bytedcli、codebase、git push、bitscli / bits-cli，同一个开关），meego=Meego（仅 bytedcli meego，独立的 meegle 命令不受管）；bytecloud / meego 未列出时对应命令保持原生，直接用本机登录态；非法取值会被拒绝保存。省略 capabilities 时按 tools 推导（lark-cli→lark-user，bytedcli→bytecloud+meego；tools 也省略=全部）。未授权时命令一律拒绝（拒绝消息里会附授权入口，授权一次后重试即可），不会用 bot 或任何人的身份代跑；旧配置里的 fallback 字段会被忽略。可选 credentialSource：auto（默认）：本机未绑定中心化平台时等同 local；已绑定时先向平台取该人的短期凭据（平台保管与续期），取不到则用本机已有的授权，再没有就拒绝并给平台授权链接，已绑定的机器绝不再自动发起本机扫码。platform：只用平台，未绑定或不可达一律拒绝。local：只用本机扫码，不咨询平台。非法取值会被拒绝保存。可选 delegateOnMention（默认 true）：本 bot 在真人直接发起的一轮里用 botmux send --mention 交接给同机 bot 时，对方以这位发起人的身份调用工具；设为 false 关闭。可选 allowSpeakerSwitch（默认 false）：设为 true 后，多人话题里可在某一条命令前加 BOTMUX_AS=<open_id> 让这一条命令用本轮另一位发言人的账号。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
   { key: 'larkToolBinding', configKey: 'larkToolBinding', kind: 'boolean', defaultOn: true, effect: 'next-session', clearable: true, hint: 'lark-cli 绑定当前机器人应用身份 on|off（默认 on）：会话内 lark-cli 默认使用当前 bot 凭证并允许 --profile 切换宿主 profile；设为 off 则完全不注入当前 bot 凭据；需 /restart 重启或新建会话生效' },
   { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo', 'remote-runner'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）｜remote-runner=外置 provider；选 riff 时需配置 riff 字段，mojo/remoteRunner 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；多用户共享主机上，用 jwtHome 指向该 bot 归属用户的 home（绝对路径）以读到他自己的 ByteCloud 登录态；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
-  { key: 'remoteRunner', configKey: 'remoteRunner', kind: 'json', effect: 'next-session', clearable: true, hint: '通用 Remote Runner 协议配置 JSON（expectedProvider/requiredCapabilities/handshakeTimeoutMs/operationTimeoutMs）；provider 可执行文件用 cliPathOverride 指定；不得写入凭据；unset 清除' },
+  { key: 'remoteRunner', configKey: 'remoteRunner', kind: 'json', effect: 'next-session', clearable: true, hint: '通用 Remote Runner 协议配置 JSON（expectedProvider/requiredCapabilities/handshakeTimeoutMs/operationTimeoutMs/delegatedSlashCommands）；delegatedSlashCommands 仅允许 /adopt、/detach、/disconnect（默认关闭，下次 provider 启动生效）；provider 可执行文件用 cliPathOverride 指定；不得写入凭据；unset 清除' },
   { key: 'herdr', configKey: 'herdr', kind: 'json', effect: 'next-session', clearable: true, hint: 'herdr 后端放置配置 JSON，仅 backendType=herdr 时生效，字段全部可选：sessionName（宿主 Herdr 会话名，默认 botmux，指向别的会话时该会话必须已在运行）/placement（workspace=每话题新工作区，默认｜tab=目标工作区新开 Tab｜split=目标 Tab 分屏）/workspace（目标工作区 id 或标签）/tab（目标 Tab id 或标签）/splitDirection（right，默认｜down）/chatTypes（group/p2p 数组，缺省对所有会话生效）；非法字段会被拒绝，空对象或 unset 清除' },
 ];
 
@@ -236,7 +255,7 @@ export function parseBooleanValue(raw: string): boolean | undefined {
 
 /** 展示某字段当前值的人类可读文本。`cfg` 供 enumDefault 为函数的字段求缺省值。 */
 function formatFieldValue(spec: ConfigFieldSpec, value: unknown, cfg: BotConfig): string {
-  if (spec.configKey === 'codexRpcInput' && typeof value !== 'boolean') return 'inherit';
+  if ((spec.configKey === 'codexRpcInput' || spec.configKey === 'archiveCodex') && typeof value !== 'boolean') return 'inherit';
   if (spec.kind === 'boolean') return (spec.defaultOn ? value !== false : value === true) ? 'on' : 'off';
   if (spec.kind === 'allowedUsers' || spec.kind === 'stringList') {
     const arr = Array.isArray(value) ? value : [];
@@ -345,9 +364,10 @@ export async function applyPerBotEnvChange(
     const prevLayer = botEnvLayer(entry);
     const prev = sanitizePerBotEnv(entry.env);
     const next = nextPerBotEnv({ prev, ...change });
-    // Same pane-argv budget as the session-env editor: the whole bot layer
-    // (`env` set + `envUnset` removals) must fit a tmux pane start command.
-    // Shrinking stays allowed, so an already-oversized layer stays fixable.
+    // Same retained layer budget as the session-env editor; the legacy
+    // /botconfig path shares the same helper. Private pane-launch files removed
+    // the old deterministic tmux start-command failure, but shrinking stays
+    // allowed so an already-oversized layer stays fixable.
     if (!envLayerWithinBudget(prevLayer, botEnvLayer({ env: next ?? undefined, envUnset: entry.envUnset }))) {
       return { write: false, result: 'layer_too_large' };
     }
@@ -465,6 +485,15 @@ async function applyConfigFieldInternal(
     try { value = normalizeFeedbackPresentation(value); }
     catch (error) { return { ok: false, reason: `invalid_feedback_presentation: ${error instanceof Error ? error.message : String(error)}` }; }
   }
+  if (spec.configKey === 'ownerGroupFollow') {
+    try { value = normalizeOwnerGroupFollowConfig(value) ?? null; } catch { return { ok: false, reason: 'invalid_owner_group_follow' }; }
+    // This feature always needs Feishu transport. Reject new persisted config
+    // on apiOnly bots, but keep null/false as an escape hatch for cleaning up
+    // values saved before this guard existed.
+    if (bot.config.apiOnly === true && value !== null) {
+      return { ok: false, reason: 'owner_group_follow_api_only' };
+    }
+  }
   if (spec.configKey === 'envPolicy' && value !== null) {
     try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }
   }
@@ -515,6 +544,29 @@ async function applyConfigFieldInternal(
         reason: `service_tier_${tierCheck.error}`,
       };
     }
+  }
+  // A write that sets the Codex model/effort pair is judged against the live
+  // catalogue of the bot's runtime, the one the Dashboard offers levels from.
+  // Probed outside the bots.json lock, like the service-tier check above.
+  const effortPairWrite = spec.configKey === 'reasoningEffort' || spec.configKey === 'model'
+    || spec.configKey === 'cliId' || spec.kind === 'cli';
+  const pairEffort = spec.configKey === 'reasoningEffort'
+    ? isCodexReasoningEffort(effective) ? effective : undefined
+    : bot.config.reasoningEffort;
+  let reasoningCatalog: ReasoningCatalog | null = null;
+  if (effortPairWrite && pairEffort && isCodexReasoningCliId(nextCliId)) {
+    const nextSelection = spec.kind === 'cli' && typeof effective === 'string'
+      ? resolveCliSelection(effective)
+      : undefined;
+    const sameCli = nextCliId === bot.config.cliId;
+    reasoningCatalog = await loadBotCodexReasoningCatalog({
+      ...bot.config,
+      cliId: nextCliId,
+      wrapperCli: nextSelection ? nextSelection.wrapperCli : bot.config.wrapperCli,
+      // A runtime path configured for another CLI is not a Codex binary.
+      cliRuntime: sameCli ? bot.config.cliRuntime : undefined,
+      cliPathOverride: sameCli ? bot.config.cliPathOverride : undefined,
+    });
   }
 
   const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
@@ -597,8 +649,11 @@ async function applyConfigFieldInternal(
         && (!nextReasoningEffort || !isConfigurableReasoningCliId(nextCliId))) {
       return { write: false, result: 'reasoning_effort_not_supported' };
     }
+    // Re-saving an unrelated field must not reject a pair config load keeps.
     if (nextReasoningEffort && isConfigurableReasoningCliId(nextCliId)
-        && !cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort)) {
+        && !(effortPairWrite
+          ? cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort, reasoningCatalog)
+          : cliModelMayKeepReasoningEffort(nextCliId, nextModel, nextReasoningEffort))) {
       return { write: false, result: 'reasoning_effort_not_supported_by_model' };
     }
     const currentServiceTier = isCodexServiceTier(entry.serviceTier)
@@ -653,15 +708,21 @@ async function applyConfigFieldInternal(
       if (spec.configKey === 'cotEnabled') delete entry.thinkingCard; // [legacy-thinkingCard] 懒迁移，同上
       // 只持久化「非默认」的一侧，bots.json 保持干净：默认 OFF 的字段 true 才写、
       // false 删 key；默认 ON（defaultOn）的字段 false 才写、true 删 key。
-      if (spec.configKey === 'codexRpcInput') {
-        entry.codexRpcInput = effective === true;
+      if (spec.configKey === 'codexRpcInput' || spec.configKey === 'archiveCodex') {
+        entry[spec.configKey] = effective === true;
       } else if (spec.defaultOn) {
         if (effective === false) entry[spec.configKey] = false;
         else delete entry[spec.configKey];
       } else if (effective === true) entry[spec.configKey] = true;
       else delete entry[spec.configKey];
     } else if (spec.kind === 'json') {
-      entry[spec.configKey] = effective as any;
+      if (spec.configKey === 'triggerUserAuth') {
+        // `tools` is derived from `capabilities`, and `legacyFallback` is only
+        // for the background-job key of an unedited config: neither is stored.
+        const { legacyFallback: _legacy, ...stored } = effective as TriggerUserAuthConfig;
+        if (stored.capabilities) delete (stored as Partial<TriggerUserAuthConfig>).tools;
+        entry[spec.configKey] = stored as any;
+      } else entry[spec.configKey] = effective as any;
     } else {
       entry[spec.configKey] = effective;
     }
@@ -671,10 +732,10 @@ async function applyConfigFieldInternal(
     if (spec.configKey === 'cliId' && !isCodexServiceTierCliId(nextCliId)) {
       delete entry.serviceTier;
     }
-    // The pane-argv budget applies to the legacy /botconfig env / envUnset
-    // writes too — an oversized layer makes every new tmux session of this bot
-    // fail deterministically ("command too long"). Shrinking (including clear)
-    // stays allowed so an already-oversized layer can always be cleaned up.
+    // Legacy /botconfig env / envUnset writes share the retained layer budget.
+    // Private pane-launch files removed the old deterministic tmux failure, but
+    // keep shrinking (including clear) allowed so an already-oversized legacy
+    // layer can always be cleaned up.
     if (prevEnvLayer && !envLayerWithinBudget(prevEnvLayer, botEnvLayer(entry))) {
       return { write: false, result: 'layer_too_large' };
     }
@@ -701,7 +762,7 @@ async function applyConfigFieldInternal(
   } else if (effective === null) {
     (bot.config as any)[spec.configKey] = undefined;
   } else if (spec.kind === 'boolean') {
-    (bot.config as any)[spec.configKey] = spec.configKey === 'codexRpcInput'
+    (bot.config as any)[spec.configKey] = spec.configKey === 'codexRpcInput' || spec.configKey === 'archiveCodex'
       ? effective === true : spec.defaultOn
       ? (effective === false ? false : undefined)
       : (effective || undefined);
@@ -731,6 +792,9 @@ async function applyConfigFieldInternal(
     } catch (error) {
       logger.warn(`[config:${larkAppId}] failed to refresh sandbox feedback policy: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+  if (spec.configKey === 'ownerGroupFollow') {
+    try { notifyOwnerGroupFollowChanged(larkAppId); } catch { logger.warn('[owner-group-follow] config reconciliation failed'); }
   }
   if (spec.configKey === 'displayName') {
     try { displayNameRefresher?.(); } catch { /* best effort */ }
@@ -1056,7 +1120,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_provider_recovery: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` | 'invalid_idle_spin_suspend' };
 
 /** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
 export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
@@ -1172,7 +1236,9 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         const parsed = JSON.parse(s);
         if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
         if (spec.configKey === 'groupCreation') return { ok: true, value: parseGroupCreationDefaults(parsed) };
+        if (spec.configKey === 'inviteConfig') return { ok: true, value: parseInviteConfig(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
+        if (spec.configKey === 'ownerGroupFollow') return { ok: true, value: normalizeOwnerGroupFollowConfig(parsed) ?? null };
         if (spec.configKey === 'steward') {
           const steward = normalizeStewardConfig(parsed);
           return steward.ok ? { ok: true, value: steward.value } : { ok: false, reason: `invalid_steward: ${steward.reason}` };
@@ -1189,9 +1255,21 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
             return policy ? { ok: true, value: policy } : { ok: false, reason: 'empty' };
           } catch (error) { return { ok: false, reason: `invalid_prompt_cache: ${error instanceof Error ? error.message : String(error)}` }; }
         }
+        if (spec.configKey === 'providerRecovery') {
+          try {
+            const policy = normalizeProviderRecoveryConfig(parsed);
+            return policy ? { ok: true, value: policy } : { ok: false, reason: 'empty' };
+          } catch (error) { return { ok: false, reason: `invalid_provider_recovery: ${error instanceof Error ? error.message : String(error)}` }; }
+        }
         if (spec.configKey === 'noProgressNotify') {
           try { return { ok: true, value: normalizeNoProgressNotifyPolicy(parsed) }; }
           catch (error) { return { ok: false, reason: `invalid_no_progress_notify: ${error instanceof Error ? error.message : String(error)}` }; }
+        }
+        if (spec.configKey === 'idleSpinSuspend') {
+          const normalized = normalizeIdleSpinSuspendConfig(parsed);
+          return normalized
+            ? { ok: true, value: normalized }
+            : { ok: false, reason: 'invalid_idle_spin_suspend' };
         }
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);

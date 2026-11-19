@@ -44,7 +44,7 @@ function fixture(options: { native?: string; ledgerState?: string; ledgerAttempt
     dispatchAttempt: options.ledgerAttempt ?? historical.dispatchAttempt, state: options.ledgerState ?? 'prepared', content: 'old prompt' }];
   realSessions.updateSession(session);
   const pending: Promise<void>[] = []; const assignments: any[] = [];
-  const workerEnv: any = { workerSessionEventScope: scope };
+  const workerEnv: any = { workerSessionEventScope: scope, codexBridgeDrainAndMaybeEmit: vi.fn() };
   const assign = loadWorkerMessageHandler('runtime_contract_assigned', workerEnv);
   const ipcWorker: any = { send: (message: any) => { assignments.push(message); if (message.type === 'runtime_contract_assigned') pending.push(assign(message)); } }; ds.worker = ipcWorker;
   const hostEnv: any = { sessionController: controller, contractWorker: worker, ds, worker: ipcWorker,

@@ -41,6 +41,11 @@
  */
 import { makeFingerprint, normaliseForFingerprint } from './bridge-turn-queue.js';
 import type { CodexBridgeEvent, CodexCotEntry } from './codex-transcript.js';
+import { createHash } from 'node:crypto';
+
+function exactInputHash(text: string): string {
+  return createHash('sha256').update(text.replace(/\r\n?/g, '\n'), 'utf8').digest('hex');
+}
 
 const UNMATCHED_REPLAY_WINDOW_MS = 5_000;
 const MAX_BUFFERED_UNMATCHED_EVENTS = 20;
@@ -75,6 +80,11 @@ export interface CodexPendingTurn {
   restoredFromJournal?: boolean;
   started: boolean;
   contentFingerprint?: string;
+  /** Digest of the full written input for driver-proved input aliases.
+   * The historical prefix fingerprint alone cannot prove a rewritten skill
+   * input whose arguments differ after its first 30 characters. Persist the
+   * digest for restart recovery without retaining the full private prompt. */
+  inputTextHash?: string;
   /** Wall-clock millis when mark() was called. The emit gate uses this as
    *  the lower bound of the "did `botmux send` happen for this turn?"
    *  window. Optional only for legacy / test-injected turns. */
@@ -88,6 +98,8 @@ export interface CodexPendingTurn {
    *  turn. Kept separate from markTimeMs, whose max(worker mark, transcript)
    *  semantics intentionally serve the outbound-send suppression window. */
   transcriptStartTimeMs?: number;
+  /** Exact native user record corroborated at the actual attribution edge. */
+  nativeUserProof?: { uuid: string; hash: string; timestampMs: number };
   /** Local observation time for a task_started-only provisional claim. Cleared
    *  once the fingerprinted user record corroborates the claim. */
   provisionalTaskStartedAtMs?: number;
@@ -111,8 +123,13 @@ export interface CodexPendingTurn {
    *  began. This closes the race where screen-ready arrives while writeInput
    *  is still polling history, before it can return `submitted: true`. */
   submitVerificationStartedAtMs?: number;
+  /** The worker still owns an ambiguous draft in this CLI generation. Keep
+   * its exact fingerprint for a later manual submit, without claiming success. */
+  inputDeliveryQuarantined?: true;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
+  replyModel?: string;
+  replyReasoningEffort?: string;
   /** Explicit transcript terminal semantics. Undefined keeps the historical
    *  assistant-final => completed behaviour. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
@@ -204,6 +221,16 @@ export class CodexBridgeQueue {
     private readonly now: () => number = Date.now,
     private readonly onLocalTurnStarted?: (turn: CodexPendingTurn) => void,
   ) {}
+
+  private matchesUserInput(turn: CodexPendingTurn, event: CodexBridgeEvent): boolean {
+    if (event.inputTextAliases !== undefined) {
+      if (turn.inputTextHash === undefined) return false;
+      return [event.text, ...event.inputTextAliases]
+        .some(text => exactInputHash(text) === turn.inputTextHash);
+    }
+    return !turn.contentFingerprint
+      || normaliseForFingerprint(event.text).includes(turn.contentFingerprint);
+  }
 
   private isClosedNativeTurn(sourceSessionId: string | undefined, sourceTurnId: string): boolean {
     return this.closedNativeTurns.some(closed => closed.sourceTurnId === sourceTurnId
@@ -359,6 +386,7 @@ export class CodexBridgeQueue {
     dispatchAttempt?: number,
     recoveryCursorAtMark?: { jsonlPath: string; offsetAtMark: number },
     linkRefMode?: 'observe' | 'enabled',
+    requireExactInput = false,
   ): void {
     this.queue.push({
       turnId,
@@ -366,6 +394,7 @@ export class CodexBridgeQueue {
       ...(linkRefMode ? { linkRefMode } : {}),
       started: false,
       contentFingerprint: makeFingerprint(message),
+      ...(requireExactInput || /^[ \t]*(?:[/$]|\[\$)/.test(message) ? { inputTextHash: exactInputHash(message) } : {}),
       markTimeMs,
       recoveryJsonlPathAtMark: recoveryCursorAtMark?.jsonlPath,
       recoveryOffsetAtMark: recoveryCursorAtMark?.offsetAtMark,
@@ -380,6 +409,7 @@ export class CodexBridgeQueue {
   restorePendingTurns(entries: readonly {
     turnId: string;
     fingerprint: string;
+    inputTextHash?: string;
     markTimeMs: number;
     linkRefMode?: 'observe' | 'enabled';
     jsonlPath?: string;
@@ -399,6 +429,7 @@ export class CodexBridgeQueue {
         restoredFromJournal: true,
         ...(entry.linkRefMode ? { linkRefMode: entry.linkRefMode } : {}),
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
+        ...(entry.inputTextHash ? { inputTextHash: entry.inputTextHash } : {}),
         recoveryJsonlPathAtMark: entry.jsonlPath,
         recoveryOffsetAtMark: entry.offsetAtMark,
         ...(entry.mergedExecution ? {
@@ -485,6 +516,7 @@ export class CodexBridgeQueue {
       // The CLI holds this input in its own queue (input_queued); its user
       // record will start it, or cli_settled restarts the lease.
       if (head.cliQueuedAtMs !== undefined) break;
+      if (head.inputDeliveryQuarantined) break;
 
       // An authoritative adapter/history check can legitimately outlive the
       // shorter attribution lease. Do not prune under that in-flight await;
@@ -609,6 +641,12 @@ export class CodexBridgeQueue {
     return true;
   }
 
+  setInputDeliveryQuarantined(turnId: string, quarantined: boolean, dispatchAttempt?: number): void {
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt);
+    if (turn) turn.inputDeliveryQuarantined = quarantined ? true : undefined;
+  }
+
   /** Start bounded adapter/history verification before awaiting writeInput. */
   beginSubmitVerification(
     turnId: string,
@@ -655,6 +693,28 @@ export class CodexBridgeQueue {
     return this.queue.some(candidate => candidate.turnId === turnId
       && candidate.dispatchAttempt === dispatchAttempt
       && candidate.finalText !== undefined);
+  }
+
+  /** Whether a native user record (the CoT reader's USER_INPUT boundary in
+   *  adopt mode) starts a turn owned by a Lark marker rather than a local
+   *  terminal input. Uses the same fingerprint/exact-hash match and the same
+   *  5s replay tolerance as the transcript ingest path, so the thinking-timeline
+   *  side channel cannot attribute local-turn entries to an active Lark card.
+   *  Open marks that have not reached their transcript `user` event yet still
+   *  qualify: the mark is installed before the literal write. */
+  ownsTurnForNativeInput(text: string, timestampMs: number): boolean {
+    return this.queue.some(turn => {
+      if (turn.isLocal || turn.finalText !== undefined) return false;
+      if (turn.markTimeMs !== undefined
+        && timestampMs < turn.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS) return false;
+      // Mirror the adopt-mode antigravity user event shape: an exact-input mark
+      // pairs with an empty alias list so the match is hash-only, never the
+      // looser fingerprint containment.
+      const event: CodexBridgeEvent = turn.inputTextHash !== undefined
+        ? { uuid: '', timestampMs, kind: 'user', text, inputTextAliases: [] }
+        : { uuid: '', timestampMs, kind: 'user', text };
+      return this.matchesUserInput(turn, event);
+    });
   }
 
   /** True while the transcript proves a turn is running, or while a verified
@@ -887,6 +947,11 @@ export class CodexBridgeQueue {
       // buffered — a late replay into the wrong turn is worse than a gap).
       const target = this.targetForNativeEvent(ev);
       if (target && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
+        // Native tool rows can flush after a stop but before the next submit.
+        // A parse-time timestamp must not turn those old bytes into new work.
+        if (ev.progressCursor && ev.progressCursor.jsonlPath === target.recoveryJsonlPathAtMark
+          && target.recoveryOffsetAtMark !== undefined
+          && ev.progressCursor.offset < target.recoveryOffsetAtMark) return;
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
         try { this.cotObserver(ev.cotEntries, target); } catch { /* cosmetic channel — never break attribution */ }
@@ -909,8 +974,7 @@ export class CodexBridgeQueue {
       if (provisional) {
         const collectingTooOld = provisional.markTimeMs !== undefined
           && ev.timestampMs < provisional.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
-        const collectingFingerprintOk = !provisional.contentFingerprint
-          || normaliseForFingerprint(ev.text).includes(provisional.contentFingerprint);
+        const collectingFingerprintOk = this.matchesUserInput(provisional, ev);
         if (!collectingTooOld && collectingFingerprintOk) {
           provisional.transcriptStartTimeMs = ev.timestampMs;
           provisional.sourceMessageId = ev.sourceMessageId;
@@ -956,9 +1020,7 @@ export class CodexBridgeQueue {
       const next = this.queue.find(t => !t.started);
       const tooOld = !!next && next.markTimeMs !== undefined && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
       let fingerprintOk = true;
-      if (next?.contentFingerprint) {
-        fingerprintOk = normaliseForFingerprint(ev.text).includes(next.contentFingerprint);
-      }
+      if (next) fingerprintOk = this.matchesUserInput(next, ev);
       const willStartNext = !!next && !tooOld && fingerprintOk;
       const willSynthLocal = !willStartNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - UNMATCHED_REPLAY_WINDOW_MS;
       if (willStartNext) this.revalidateRestoredMerge(next!, ev);
@@ -1022,6 +1084,7 @@ export class CodexBridgeQueue {
         next!.sourceMessageId = ev.sourceMessageId;
         this.rememberNativeUserMessage(ev);
         next!.transcriptStartTimeMs = ev.timestampMs;
+        next!.nativeUserProof = { uuid: ev.uuid, hash: createHash('sha256').update(ev.text).digest('hex'), timestampMs: ev.timestampMs };
         // Anchor the bridge-fallback suppression window to when the turn
         // ACTUALLY started processing (the transcript user event's
         // timestamp), not when the worker marked it. With type-ahead the
@@ -1100,6 +1163,8 @@ export class CodexBridgeQueue {
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
         target.finalText = ev.text;
+        target.replyModel = ev.replyModel;
+        target.replyReasoningEffort = ev.replyReasoningEffort;
         target.terminalStatus = ev.terminalStatus;
         target.terminalErrorCode = ev.terminalErrorCode;
         target.terminalErrorSummary = ev.terminalErrorSummary;

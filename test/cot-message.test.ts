@@ -69,6 +69,14 @@ beforeEach(() => {
   rmSync(join(dataDir, 'roles'), { recursive: true, force: true });
 });
 
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+
+// The local-address cases in this file are for bots that turned on
+// BotConfig.hideLocalAddresses (default off; the off path is covered in
+// test/local-address-egress.test.ts). The registry is mocked here, so the
+// switch is answered directly.
+setHideLocalAddressesResolver(() => true);
+
 describe('handleCotThinkingUpdate', () => {
   it('sanitizes native reasoning, tool titles and results while preserving execution args and event identities', async () => {
     const ds = makeDs({ workingDir: '/custom/project' });
@@ -92,6 +100,27 @@ describe('handleCotThinkingUpdate', () => {
     expect(result.code).not.toContain('/etc/');
     expect(result.code).toContain('https://example.com/home/page?file=/tmp/x');
     expect(entries[0].text).toContain('/home/alice/');
+  });
+
+  it('pushes reasoning, tool titles and results as written for a bot that has not turned on hideLocalAddresses', async () => {
+    const restore = setHideLocalAddressesResolver(() => false);
+    try {
+      const ds = makeDs({ workingDir: '/custom/project' });
+      const args = JSON.stringify({ path: '/custom/project/src/index.ts' });
+      const entries = [think('协作说明：[协作技能](/home/alice/.agents/skills/a/SKILL.md)\nhttp://localhost:3000/report'),
+        { kind: 'tool_call', id: 'call-off', name: 'read', args },
+        { kind: 'tool_result', id: 'call-off', result: '/etc/private.json' }];
+      handleCotThinkingUpdate(ds, upd(entries));
+      await flush();
+      const events = pushedEvents();
+      const reasoning = events.find(event => event.type === 'REASONING_MESSAGE_CONTENT')!.content;
+      expect(reasoning.delta).toContain('[协作技能](/home/alice/.agents/skills/a/SKILL.md)');
+      expect(reasoning.delta).toContain('http://localhost:3000/report');
+      expect(events.find(event => event.type === 'TOOL_CALL_START')!.content.title).toContain('/custom/project/src/index.ts');
+      expect(events.find(event => event.type === 'TOOL_CALL_RESULT')!.content.content).toContain('/etc/private.json');
+    } finally {
+      restore();
+    }
   });
 
   it.each([false, true])('keeps restored silent listener thinking and late updates local with cotForced=%s', async cotForced => {

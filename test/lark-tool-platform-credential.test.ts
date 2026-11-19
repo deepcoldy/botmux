@@ -113,7 +113,7 @@ describe('resolveBoundLarkUserCredential', () => {
     const { result } = resolve(bot({ enabled: true, tools: ['lark-cli'] }), null);
     const out = await result;
     expect(out).toMatchObject({ ok: false, reason: 'platform', authorizeUrl: PAGE });
-    expect(out.ok === false && out.reason === 'platform' && out.error).toContain(PAGE);
+    expect(out.ok === false && out.reason === 'platform' && out.error).not.toContain(PAGE);
      // The cause travels with the text the agent relays.
     expect(out.ok === false && out.reason === 'platform' && out.error).toMatch(/\[reason=platform_[a-z_]+\]$/);
   });
@@ -179,7 +179,7 @@ describe('platformAuthRequestRedirect', () => {
     expect(url.origin + url.pathname).toBe(PAGE);
     // The platform page reads it back with URLSearchParams: deduplicated, space separated.
     expect(url.searchParams.getAll('scope')).toEqual(['base:record:read base:record:create']);
-    expect(out!.error).toContain(out!.authorizeUrl!);
+    expect(out!.error).not.toContain(out!.authorizeUrl!);
     expect(out!.error).toContain('补充授权');
   });
 
@@ -200,7 +200,7 @@ describe('platformAuthRequestRedirect', () => {
   it('auto: a person without one is sent to the platform page', async () => {
     const out = await redirect(bot({ enabled: true, tools: ['lark-cli'] }), null);
     expect(out).toMatchObject({ authorizeUrl: PAGE });
-    expect(out?.error).toContain(PAGE);
+    expect(out?.error).not.toContain(PAGE);
   });
 
   it('auto on an unbound machine keeps the bot-app flow', async () => {

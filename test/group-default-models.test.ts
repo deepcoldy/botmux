@@ -44,3 +44,15 @@ it('accepts model and effort overrides while preserving legacy model strings', (
   expect(()=>parseGroupDefaultModels({codex:{model:42}})).toThrow();
   expect(resolveSessionLaunchModel({session:{cliId:'codex',groupDefaultModels:{codex:{model:'group',reasoningEffort:'high'}}}}, {cliId:'codex',model:'global'})).toBe('group');
 });
+
+
+it('loads Antigravity group snapshots without applying another CLI’s model or live edits', () => {
+  const models = parseGroupDefaultModels({ antigravity: { model: 'gemini-4-argon-high', reasoningEffort: 'high' } });
+  expect(normalizeGroupDefaultModels({ oc_agy: models }).oc_agy).toEqual(models);
+  const session = { cliId: 'antigravity' as const, groupDefaultModels: structuredClone(models) };
+  models.antigravity = 'changed-after-creation';
+  expect(resolveSessionLaunchModel({ session }, { cliId: 'antigravity', model: 'live-global' })).toBe('gemini-4-argon-high');
+  expect(resolveSessionLaunchModel({ session, spawnModelOverride: 'explicit-trigger' })).toBe('explicit-trigger');
+  expect(resolveSessionLaunchModel({ session: { ...session, scope: 'chat' } }, { cliId: 'antigravity', model: 'global' })).toBe('global');
+  expect(resolveSessionLaunchModel({ session: { ...session, cliId: 'codex' } }, { cliId: 'codex', model: 'codex-global' })).toBe('codex-global');
+});

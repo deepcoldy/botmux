@@ -1,3 +1,4 @@
+import { sessionDisplayTitle, sessionLastActivityAt, sessionSupportReason } from './sessions.js';
 import { ModelPinChip } from './model-pin.js';
 import type React from 'react';
 import {
@@ -101,7 +102,7 @@ import {
   t,
   ui,
 } from './ui.js';
-import { isOffBoardDormant, type SessionKanbanColumn } from './kanban-model.js';
+import { isOffBoardKanbanRow, type SessionKanbanColumn } from './kanban-model.js';
 import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import { sessionTaskStatusText, statusFilterLabel, taskTone } from './session-task-view.js';
 import {
@@ -844,13 +845,13 @@ export function SessionsTableBase(props: {
       case 'tokenOut':
         return <td className="token-cell" data-label={labels.tokenOut}>{formatTokenCount(row.tokenUsage?.out)}</td>;
       case 'title':
-        return <td className="sessions-table-text-cell" data-label={labels.title} title={String(row.title ?? '')}>{stripMentionPrefix(row.title ?? '').slice(0, 48)}</td>;
+        return <td className="sessions-table-text-cell" data-label={labels.title} title={sessionDisplayTitle(row)}><div>{Array.from(stripMentionPrefix(sessionDisplayTitle(row))).slice(0, 48).join('')}</div>{props.hiddenColumns.has('chat') && row.chatDisplayName ? <small>{sessionLocationText(row)}</small> : null}{sessionSupportReason(row) ? <div className="session-support-reason" title={sessionSupportReason(row)}>{sessionSupportReason(row)}</div> : null}</td>;
       case 'workingDir':
         return <td className="sessions-table-path-cell" data-label={labels.workingDir} title={row.workingDir ?? ''}>{String(row.workingDir ?? '').slice(-34)}</td>;
       case 'spawnedAt':
         return <td data-label={labels.spawnedAt}>{relTime(row.spawnedAt)}</td>;
       case 'lastMessageAt':
-        return <td data-label={labels.lastMessageAt}>{relTime(row.lastMessageAt)}</td>;
+        return <td data-label={labels.lastMessageAt}>{relTime(sessionLastActivityAt(row) ?? 0)}</td>;
       case 'adopt':
         return <td data-label={labels.adopt}>{row.adopt ? <span className="badge">adopt</span> : null}</td>;
       default:
@@ -1948,6 +1949,10 @@ function SessionsPage(): React.JSX.Element {
   useT();
   const storeRows = useStoreSelector(snapshot => [...snapshot.sessions.values()] as SessionRow[]);
   const bootstrapped = useStoreSelector(snapshot => snapshot.bootstrapped);
+  const sessionSnapshotVersion = useStoreSelector(snapshot => snapshot.sessionSnapshotVersion);
+  const closedCursor = useStoreSelector(snapshot => snapshot.closedCursor);
+  const closedTotal = useStoreSelector(snapshot => snapshot.closedTotal);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [revision, setRevision] = useState(0);
   const refresh = useCallback(() => setRevision(v => v + 1), []);
   const [filters, setFilters] = useState<FiltersState>(() => initialFilters('', readStoredSessionsShowUnknownChats(windowStorage())));
@@ -1969,6 +1974,19 @@ function SessionsPage(): React.JSX.Element {
   // `#/sessions?session=<id>`（⌘K 全局搜索等跨页入口）直接打开该会话的详情抽屉；
   // 会话还没进 store 时抽屉先不出，快照到了 rowsById 命中后自然弹出。
   const [drawerSessionId, setDrawerSessionId] = useState<string | null>(() => hashQueryParam('session'));
+  useEffect(() => {
+    if (bootstrapped && drawerSessionId) {
+      void store.ensureSession(drawerSessionId).catch(() => toast(t('sessions.historyLoadError')));
+    }
+  }, [bootstrapped, drawerSessionId, sessionSnapshotVersion]);
+
+  /** Load another history page without changing the active-session snapshot. */
+  const loadMoreHistory = async (): Promise<void> => {
+    setHistoryLoading(true);
+    try { await store.loadMoreClosedSessions(); }
+    catch { toast(t('sessions.historyLoadError')); }
+    finally { setHistoryLoading(false); }
+  };
   const [historyState, setHistoryState] = useState<HistoryState | null>(null);
   const [termState, setTermState] = useState<TerminalState | null>(null);
   const [kanbanHost, setKanbanHost] = useState<HTMLElement | null>(null);
@@ -2052,7 +2070,7 @@ function SessionsPage(): React.JSX.Element {
     const onBoard: SessionRow[] = [];
     let off = 0;
     for (const row of rows) {
-      if (isOffBoardDormant(row)) off += 1;
+      if (isOffBoardKanbanRow(row, filters.status)) off += 1;
       else onBoard.push(row);
     }
     return { kanbanRows: onBoard, dormantOffBoard: off };
@@ -2554,7 +2572,7 @@ function SessionsPage(): React.JSX.Element {
     }
   }, [sortKey]);
   const showDormantInTable = useCallback(() => {
-    setFilters(prev => ({ ...prev, status: 'dormant' }));
+    setFilters(prev => ({ ...prev, status: '' }));
     setViewMode('table');
     writeStoredSessionsViewMode(windowStorage(), 'table');
   }, []);
@@ -2729,6 +2747,14 @@ function SessionsPage(): React.JSX.Element {
           onRun: runIdleCleanup,
         }}
       />
+      {bootstrapped && closedCursor !== null ? (
+        <div className="sessions-history-pagination" role="status">
+          <span>{t('sessions.historyPartial', { count: closedTotal })}</span>{' '}
+          <button type="button" disabled={historyLoading} onClick={() => void loadMoreHistory()}>
+            {t(historyLoading ? 'sessions.historyLoading' : 'sessions.historyLoadMore')}
+          </button>
+        </div>
+      ) : null}
       <BulkBar
         selectedCount={selected.size}
         lockDisabled={!selectedRows.some(row => !row.locked)}

@@ -334,7 +334,9 @@ const scanCommands = (
   } catch {
     throw new Error('invalid_plugin_commands_endpoint');
   }
-  return { schemaVersion: 1, endpoint, commands };
+  if (record.afterClose !== undefined && record.afterClose !== true) throw new Error('invalid_plugin_after_close');
+  if (record.replacesCloseTag !== undefined && (record.replacesCloseTag !== true || record.afterClose !== true)) throw new Error('invalid_plugin_close_tag_override');
+  return { schemaVersion: 1, endpoint, commands, ...(record.afterClose === true ? { afterClose: true } : {}), ...(record.replacesCloseTag === true ? { replacesCloseTag: true } : {}) };
 };
 
 export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): ScannedPluginContributions | undefined {
@@ -345,12 +347,17 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
   const service = scanService(runtimeDir, manifest.service?.mode);
   const cardActions = scanCardActions(runtimeDir, service);
   const commands = scanCommands(runtimeDir, service);
+  const prerequisiteEntry = 'prerequisites/index.mjs';
+  if (manifest.prerequisites && !isFile(resolvePluginPath(runtimeDir, prerequisiteEntry, 'prerequisites_entry'))) {
+    throw new Error('plugin_prerequisites_entry_not_found');
+  }
   const contributions: ScannedPluginContributions = {
     ...(skills ? { skills } : {}),
     ...(mcp ? { mcp } : {}),
     ...(dashboard ? { dashboard } : {}),
     ...(cli ? { cli } : {}),
     ...(service ? { service } : {}),
+    ...(manifest.prerequisites ? { prerequisites: { entry: prerequisiteEntry } } : {}),
   };
   if (cardActions) contributions.cardActions = cardActions;
   if (commands) contributions.commands = commands;

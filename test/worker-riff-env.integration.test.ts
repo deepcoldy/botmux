@@ -290,6 +290,10 @@ describe('Riff worker session environment', () => {
             // pane's CLI-side gate from the daemon's authoritative decision.
             BOTMUX_WORKFLOW_ENABLED: 'false',
             BOTMUX_REPLY_STYLE: JSON.stringify({ layout: true, theme: 'vivid' }),
+            // Same stale/forged attempt against the local-address snapshot:
+            // the bot turned hideLocalAddresses on, the raw riff env tries to
+            // turn it off in the remote pane. The host re-freeze must win.
+            BOTMUX_HIDE_LOCAL_ADDRESSES: '0',
             ...(rootMessageId.startsWith('ml:') ? { BOTMUX_ROOT_MESSAGE_ID: 'om_wrong', BOTMUX_CHAT_ID: 'oc_wrong', BOTMUX_SESSION_SCOPE: 'chat' } : {}),
           },
         },
@@ -297,6 +301,7 @@ describe('Riff worker session environment', () => {
         larkAppId: appId,
         larkAppSecret: 'secret',
         ownerOpenId: 'ou_authenticated_owner',
+        hideLocalAddresses: true,
         feedback: {
           enabled: true,
           audience: 'requester',
@@ -328,6 +333,10 @@ describe('Riff worker session environment', () => {
         }),
       ]);
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
+      // The remote `botmux send` cannot read bots.json; it keeps this bot's
+      // local-address policy from the worker's snapshot. The stale
+      // backendConfig.env '0' above must not survive the host re-freeze.
+      expect(request.config?.env?.BOTMUX_HIDE_LOCAL_ADDRESSES).toBe('1');
       expect(request.config?.env?.BOTMUX_ROOT_MESSAGE_ID).toBe(rootMessageId);
       expect(request.config?.env?.BOTMUX_CHAT_ID).toBe('oc_riff_env');
       expect(request.config?.env?.BOTMUX_SESSION_SCOPE).toBe('thread');

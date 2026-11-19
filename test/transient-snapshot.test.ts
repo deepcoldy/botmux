@@ -24,6 +24,7 @@ vi.mock('node:child_process', () => {
   const actual = require('node:child_process') as typeof import('node:child_process');
   return {
     ...actual,
+    execFile: vi.fn(),
     execSync: vi.fn(),
     execFileSync: vi.fn(),
     spawnSync: vi.fn(),

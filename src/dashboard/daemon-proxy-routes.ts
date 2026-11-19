@@ -98,6 +98,7 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   { method: 'POST', path: botPath('oncall-target/check'), upstream: '/api/bot-oncall-target/check', body: NO_BODY },
   // steward：`{ steward: {...} | null }`（管家开关、管家群、提示词追加/替换）。
   putBotConfig('steward', { kind: 'json', maxBytes: 64 * 1024 }),
+  putBotConfig('owner-group-follow', { kind: 'json', maxBytes: 64 * 1024 }),
   // actor-owner-bindings：完整替换 target Bot 的 source Bot 双 ID → Owner 策略。
   putBotConfig('actor-owner-bindings'),
   putBotConfig('feedback'),
@@ -118,6 +119,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('env'),
   putBotConfig('env-policy'),
   putBotConfig('codex-auth-sync'),
+  // archive-codex：`{ archiveCodex: true | false | null }`（null = 继承全局 sessionCleanup.archiveCodex）。
+  putBotConfig('archive-codex'),
   // codex-config：独立 CODEX_HOME 的 config.toml 路径信息；resync 先备份再从宿主覆盖。
   { method: 'GET', path: botPath('codex-config'), upstream: '/api/bot-codex-config', body: NO_BODY },
   { method: 'POST', path: botPath('codex-config/resync'), upstream: '/api/bot-codex-config/resync', body: RAW },
@@ -229,6 +232,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('no-progress-notify'),
   // prompt-cache：`{ promptCache: { ttl?, keepalive? } | null }`（null = 删除本 bot 覆盖、回落全局）。
   putBotConfig('prompt-cache'),
+  // provider-recovery：`{ providerRecovery: { enabled?, maxWaitMinutes? } | null }`（null = 删除本 bot 覆盖、回落全局）。
+  putBotConfig('provider-recovery'),
   // idle-suspend-minutes：`{ idleSuspendMinutes: number | null }`（null = 关闭空闲 TTL）。
   putBotConfig('idle-suspend-minutes'),
   // session-owner-reminder：per-bot 周期性 owner 提醒策略；owning daemon 校验、落盘并热更新。

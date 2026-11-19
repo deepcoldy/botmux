@@ -1290,11 +1290,17 @@ export function prepareDirectSandbox(opts: {
   }
   // Baseline dirs (/opt, …) that are symlinks on this host: bwrap cannot bind a
   // symlink as such into the fresh root, so rebuild the link the usrmerge way
-  // and bind its real target (see relocateSymlinkedBaselineRules).
+  // and bind its real target — except a system dir whose target is not a
+  // same-named copy of it (`/opt -> /data00`, a whole disk), which keeps only
+  // the link (see relocateSymlinkedBaselineRules).
   const relocated = relocateSymlinkedBaselineRules(opts.policy.rules, {
     isSymlink: (path) => { try { return lstatSync(path).isSymbolicLink(); } catch { return false; } },
     realpath: (path) => { try { return realpathSync(path); } catch { return undefined; } },
   });
+  for (const link of relocated.withheld ?? []) {
+    console.error(`[sandbox] ${link.path} is a symlink to ${link.target}, which is not a ${link.path} directory: `
+      + `recreated the link only, ${link.target} is not granted by default — add the subpaths the session needs to sandboxPaths`);
+  }
   const usrmergePaths = new Set(symlinks.map(link => link.path));
   for (const link of relocated.symlinks) if (!usrmergePaths.has(link.path)) symlinks.push(link);
   const policy: FsPolicy = { ...opts.policy, rules: relocated.rules };
@@ -1746,6 +1752,7 @@ const RELAY_FLAGS_NOVAL = new Set([
 const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
+  '--reply-to',
   '--response-kind',
   '--expected-link',
   '--as',
@@ -2039,6 +2046,7 @@ export function buildRelayHostEnv(
   delete env.BOTMUX_ORIGIN_CHANNEL_ID;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
   delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
+  delete env.BOTMUX_REPLY_MESSAGE_ID;
   // Every host re-exec of a sandbox relay carries the route gate: routing
   // flags it forwards must be decided by the daemon, never trusted as given.
   env[SANDBOX_RELAY_ROUTE_GATE_ENV] = '1';
@@ -2095,6 +2103,7 @@ export function startOutboxWatcher(
           ok: true;
           origin: {
             turnId?: string;
+            replyMessageId?: string;
             dispatchAttempt?: number;
             /** The worker matched an unsettled Codex App ledger entry. The
              * host child must still find that exact entry before any provider
@@ -2253,6 +2262,8 @@ export function startOutboxWatcher(
       // the exact receipt/IM origin carried below.
       requestEnv.BOTMUX_HOST_RELAY_AUTHORIZED = '1';
       delete requestEnv.BOTMUX_TURN_ID;
+      delete requestEnv.BOTMUX_REPLY_MESSAGE_ID;
+      if (trustedOrigin?.replyMessageId) requestEnv.BOTMUX_REPLY_MESSAGE_ID = trustedOrigin.replyMessageId;
       delete requestEnv.BOTMUX_DISPATCH_ATTEMPT;
       if (trustedOrigin?.turnId !== undefined) requestEnv.BOTMUX_TURN_ID = trustedOrigin.turnId;
       if (trustedOrigin?.dispatchAttempt !== undefined) {

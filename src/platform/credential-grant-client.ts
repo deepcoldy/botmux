@@ -37,6 +37,13 @@ export interface CredentialGrant {
   variables: Record<string, string>;
   /** Epoch ms after which the variables must not be used. */
   expiresAt: number;
+  /**
+   * bytedcli only: the partitions the platform says it tried to mint (its
+   * answer to {@link CLOUD_JWT_REGIONS_FIELD}). Absent when the platform did not
+   * answer it — one that predates regional tokens — so a region missing from
+   * {@link variables} can be told apart from one the platform could not mint.
+   */
+  cloudJwtRegions?: BytedcliGrantRegion[];
 }
 
 export type CredentialGrantFailure =
@@ -66,6 +73,28 @@ export interface CredentialGrantClientOptions {
   http?: { post: typeof postJson };
 }
 
+/**
+ * A bytedcli grant names the requested ByteCloud partitions in
+ * {@link CLOUD_JWT_REGIONS_FIELD}, and the platform
+ * returns each one it minted under these variable names.
+ *
+ * Asked for, not just accepted: a daemon from before these names rejects the
+ * WHOLE grant when it sees a variable outside its allow-list, so a platform
+ * may only send them to a daemon whose request named the regions.
+ */
+export const BYTEDCLI_REGIONAL_GRANT_VARIABLES = {
+  i18n: 'BYTEDCLI_USER_CLOUD_JWT_I18N',
+  i18nbd: 'BYTEDCLI_USER_CLOUD_JWT_I18NBD',
+  tx: 'BYTEDCLI_USER_CLOUD_JWT_TX',
+  cn: 'BYTEDCLI_USER_CLOUD_JWT_CN',
+} as const;
+export type BytedcliGrantRegion = keyof typeof BYTEDCLI_REGIONAL_GRANT_VARIABLES;
+const BYTEDCLI_GRANT_REGIONS = Object.keys(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as BytedcliGrantRegion[];
+const REGIONAL_GRANT_VARIABLE_SET: ReadonlySet<string> = new Set(Object.values(BYTEDCLI_REGIONAL_GRANT_VARIABLES));
+/** Request field naming the partitions a bytedcli grant should cover, and the
+ *  response field in which the platform says which ones it tried. */
+export const CLOUD_JWT_REGIONS_FIELD = 'cloudJwtRegions';
+
 /** Env keys a grant may carry, per tool. Anything else is rejected: the
  *  platform must not be able to inject arbitrary environment into a session. */
 export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readonly string[]; optional: readonly string[] }> = {
@@ -75,7 +104,7 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
   },
   bytedcli: {
     required: ['BYTEDCLI_USER_CLOUD_JWT'],
-    optional: ['BYTEDCLI_USER_CODE_JWT'],
+    optional: ['BYTEDCLI_USER_CODE_JWT', ...Object.values(BYTEDCLI_REGIONAL_GRANT_VARIABLES)],
   },
 };
 
@@ -127,7 +156,12 @@ function pickVariables(tool: TriggerUserAuthTool, raw: unknown): Record<string, 
   }
   for (const key of spec.optional) {
     if (rec[key] === undefined || rec[key] === null || rec[key] === '') continue;
-    if (!isSafeValue(rec[key])) return `variable ${key} unsafe`;
+    if (!isSafeValue(rec[key])) {
+      // A broken partition ticket costs only that partition (its calls are
+      // refused as missing), not the person's default ticket with it.
+      if (REGIONAL_GRANT_VARIABLE_SET.has(key)) continue;
+      return `variable ${key} unsafe`;
+    }
     out[key] = rec[key] as string;
   }
   const allowed = new Set<string>([...spec.required, ...spec.optional]);
@@ -179,7 +213,7 @@ function classify(status: number, json: unknown, platformUrl: string): Credentia
  *  abort the request then. The socket's own timeout is an IDLE timeout: a peer
  *  that trickles bytes never trips it, and without the abort the retry would
  *  leave the first request still running against the platform. */
-function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+export function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -239,6 +273,12 @@ async function requestCredentialGrantInner(
     sessionId: req.sessionId,
     ...(req.turnId ? { turnId: req.turnId } : {}),
     machineId: binding.machineId,
+    // A platform that predates machine consent ignores the field and keeps
+    // answering `not_teammate` for a sender outside the owner's teams.
+    machineConsent: true,
+    // A platform that predates regional tokens ignores the field (it reads
+    // only the fields it knows) and answers with the default token alone.
+    ...(req.tool === 'bytedcli' ? { [CLOUD_JWT_REGIONS_FIELD]: BYTEDCLI_GRANT_REGIONS } : {}),
   };
   const totalBudget = opts.totalBudgetMs ?? TOTAL_BUDGET_MS;
   const deadline = Date.now() + totalBudget;
@@ -285,7 +325,18 @@ async function requestCredentialGrantInner(
   const expiresAt = Math.min(rawExpiresAt, now + MAX_GRANT_TTL_MS);
   const variables = pickVariables(req.tool, rec.variables);
   if (typeof variables === 'string') return { ok: false, reason: 'invalid_response', error: variables };
-  return { ok: true, value: { tool: req.tool, unionId: req.unionId, variables, expiresAt } };
+  const cloudJwtRegions = req.tool === 'bytedcli' ? pickRegions(rec[CLOUD_JWT_REGIONS_FIELD]) : undefined;
+  return {
+    ok: true,
+    value: { tool: req.tool, unionId: req.unionId, variables, expiresAt, ...(cloudJwtRegions ? { cloudJwtRegions } : {}) },
+  };
+}
+
+/** The platform's list of partitions it tried. It only words the refusal for a
+ *  missing region, so an unreadable list is dropped, never fatal to the grant. */
+function pickRegions(raw: unknown): BytedcliGrantRegion[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return BYTEDCLI_GRANT_REGIONS.filter(region => raw.includes(region));
 }
 
 /** One-line, secret-free description for logs. */
@@ -294,8 +345,8 @@ export function describeCredentialGrantFailure(f: CredentialGrantFailure): strin
     case 'unbound': return 'machine is not bound to a platform';
     case 'network': return `network: ${f.error}`;
     case 'not_authorized': return `not authorized on platform (${f.error})`;
-    case 'consent_missing': return 'authorized on platform but no consent for this team';
-    case 'not_teammate': return 'sender and machine owner share no team';
+    case 'consent_missing': return 'platform has no usable authorization for this person on this machine';
+    case 'not_teammate': return 'platform only issues to the machine owner or a teammate of theirs';
     case 'forbidden': return `forbidden (${f.status} ${f.error})`;
     case 'not_deployed': return `platform has no credential-grant endpoint (${f.status})`;
     case 'rate_limited': return `rate limited (${f.status})`;

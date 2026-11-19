@@ -108,11 +108,13 @@ export type SendFileAttachmentsDeps = {
   uploadFile: (appId: string, path: string) => Promise<string>;
   dispatch: (content: string, msgType: string) => Promise<string>;
   beforeEffect?: () => void | Promise<void>;
+  onResult?: (index: number, outcome: { messageId: string } | { failed: true }) => void | Promise<void>;
 };
 
 export type SendFileAttachmentsResult = {
   sent: string[];                              // message ids of delivered attachments
   failed: { path: string; error: string }[];  // attachments that failed to upload/send
+  trackingErrors?: { index: number; error: string }[];
 };
 
 /**
@@ -130,17 +132,24 @@ export async function sendFileAttachments(
 ): Promise<SendFileAttachmentsResult> {
   const sent: string[] = [];
   const failed: { path: string; error: string }[] = [];
-  for (const fp of files) {
+  const trackingErrors: { index: number; error: string }[] = [];
+  for (const [index, fp] of files.entries()) {
+    let outcome: { messageId: string } | { failed: true };
     try {
       await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, fp);
       await deps.beforeEffect?.();
-      sent.push(await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file'));
+      const messageId = await deps.dispatch(JSON.stringify({ file_key: fileKey }), 'file');
+      sent.push(messageId);
+      outcome = { messageId };
     } catch (err: unknown) {
       failed.push({ path: fp, error: describeSendFailure(err) });
+      outcome = { failed: true };
     }
+    try { await deps.onResult?.(index, outcome); }
+    catch (error) { trackingErrors.push({ index, error: error instanceof Error ? error.message : String(error) }); }
   }
-  return { sent, failed };
+  return { sent, failed, ...(trackingErrors.length ? { trackingErrors } : {}) };
 }
 
 const VIDEO_EXTENSIONS = new Set(['.mp4']);
@@ -167,6 +176,47 @@ export function shouldSendAsPureVideo(input: {
     && input.fileCount === 0
     && input.videoCount > 0
     && input.mentionCount === 0;
+}
+
+type PrimaryShapeInput = Parameters<typeof shouldSendAsPureVideo>[0];
+
+/**
+ * A "pure file" send: exactly one `--files` attachment and nothing else, so the
+ * file message itself is the primary message. Same `<at>` constraint as
+ * {@link shouldSendAsPureVideo}: a requested mention needs the card path.
+ */
+export function shouldSendAsPureFile(input: PrimaryShapeInput): boolean {
+  return !input.hasBodyText
+    && input.imageCount === 0
+    && input.fileCount === 1
+    && input.videoCount === 0
+    && input.mentionCount === 0;
+}
+
+/**
+ * True when the primary message would be the standard reply card with nothing
+ * in its body: no text and no image. Attachments would then trail a card that
+ * shows at most a footer (and none at all for a `--no-mention` progress send,
+ * which Feishu rejects with 230099 so the attachments never go out either).
+ * Only the media-primary shapes (pure file / pure video) may omit the body.
+ *
+ * Callers exclude primaries that are not this card (custom/diff card, voice,
+ * slash) and bodies synthesized from flags (`--as`).
+ */
+export function primaryCardBodyMissing(input: PrimaryShapeInput): boolean {
+  return !input.hasBodyText
+    && input.imageCount === 0
+    && !shouldSendAsPureFile(input)
+    && !shouldSendAsPureVideo(input);
+}
+
+/** Refusal for {@link primaryCardBodyMissing}; `reason` says where the body
+ *  was looked for (stdin shape, empty --content-file, …). */
+export function sendBodyRequiredMessage(reason: string): string {
+  return `botmux send: 这次发送需要正文，但${reason}。`
+    + '多个附件、视频和文件一起发、或带 @（--mention / --mention-back）时，附件前要先发一张正文卡片，不能发空卡片；本次什么都没发。\n'
+    + '请把正文写成位置参数（botmux send --files a --files b --no-mention "说明"），或用 --content-file <文件>；'
+    + "正文由较慢的管道产生时加 '-'，让 botmux 等 stdin 写完。只发一个文件且不 @ 人时可以不写正文。";
 }
 
 export type VideoAttachmentInput = {
@@ -316,11 +366,13 @@ export type SendVideoAttachmentsDeps = {
    * action/provider identity; later bare media sends would duplicate on replay. */
   maxMessages?: number;
   beforeEffect?: () => void | Promise<void>;
+  onResult?: (index: number, outcome: { messageId: string } | { failed: true }) => void | Promise<void>;
 };
 
 export type SendVideoAttachmentsResult = {
   sent: string[];
   failed: { path: string; coverPath: string; error: string }[];
+  trackingErrors?: { index: number; error: string }[];
 };
 
 export async function sendVideoAttachments(
@@ -335,11 +387,13 @@ export async function sendVideoAttachments(
   }
   const sent: string[] = [];
   const failed: { path: string; coverPath: string; error: string }[] = [];
+  const trackingErrors: { index: number; error: string }[] = [];
   // The first video that actually goes out uses `primaryDispatch` (quote chain);
   // every later one uses plain `dispatch`. Tracked on success only, so if the
   // first video's upload fails the next one inherits the primary slot.
   let primaryUsed = false;
-  for (const video of videos) {
+  for (const [index, video] of videos.entries()) {
+    let outcome: { messageId: string } | { failed: true };
     try {
       await deps.beforeEffect?.();
       const fileKey = await deps.uploadFile(appId, video.videoPath);
@@ -355,15 +409,19 @@ export async function sendVideoAttachments(
       const messageId = await send(content, 'media');
       primaryUsed = true;
       sent.push(messageId);
+      outcome = { messageId };
     } catch (err: unknown) {
       failed.push({
         path: video.videoPath,
         coverPath: video.coverPath,
         error: describeSendFailure(err),
       });
+      outcome = { failed: true };
     }
+    try { await deps.onResult?.(index, outcome); }
+    catch (error) { trackingErrors.push({ index, error: error instanceof Error ? error.message : String(error) }); }
   }
-  return { sent, failed };
+  return { sent, failed, ...(trackingErrors.length ? { trackingErrors } : {}) };
 }
 
 export type DispatchPrimaryOptions = {

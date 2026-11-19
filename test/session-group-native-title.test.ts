@@ -102,6 +102,7 @@ describe('Codex session-group native title reuse', () => {
   });
 
   it('truncates a long reused title to the configured maxLen, not the loose stdout ceiling', async () => {
+    state.cfg.sessionGroup = { naming: { mode: 'session-title', maxLen: 12 } };
     const longTitle = '排查支付链路上游超时的根因分析与修复方案';
     const s = state.sessions.get('s1')!;
     s.nativeSessionTitle = `[BotMux·Lark] ${longTitle}`;

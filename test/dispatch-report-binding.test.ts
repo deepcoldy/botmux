@@ -5,7 +5,10 @@ import {
   dispatchReportBindingSecretPath,
   loadOrCreateDispatchReportBindingSecret,
   resolveVerifiedDispatchReportTarget,
+  verifyDispatchReportBinding,
+  type DispatchReportAttachment,
 } from '../src/core/dispatch-report-binding.js';
+import { createHmac } from 'node:crypto';
 import { join } from 'node:path';
 import { chmodSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 
@@ -156,4 +159,120 @@ describe('dispatch report binding', () => {
     })).toThrow('invalid dispatch report target scope');
   });
 
+});
+
+describe('imported dispatch report attachment', () => {
+  const attachment: DispatchReportAttachment = {
+    sourceSessionId: 'session-source',
+    sourceLarkAppId: 'cli_source',
+    ownerKey: 'union:on_source_owner',
+    sourceRouteRevision: 1,
+    revision: 1,
+    state: 'active',
+    reportCapability: 'verified',
+  };
+  const imported = (overrides: Partial<DispatchReportAttachment> = {}) =>
+    createDispatchReportBinding(SECRET, {
+      ...binding().payload,
+      attachment: { ...attachment, ...overrides },
+    });
+  const resolve = (signed: ReturnType<typeof imported>) =>
+    resolveVerifiedDispatchReportTarget({
+      secret: SECRET, dispatchRoot: 'om_seed', registry: { om_seed: { reportBinding: signed } },
+    });
+
+  it('keeps the existing wire signature byte-compatible when attachment is absent', () => {
+    const legacy = binding();
+    const legacyPayload = {
+      domain: 'botmux.dispatch-report-binding.v1',
+      dispatchRoot: 'om_seed',
+      targetLarkAppId: 'cli_orchestrator',
+      targetSessionId: 'session-orchestrator',
+      targetChatId: 'oc_orchestrator',
+      targetScope: 'chat',
+      sourceName: '支付页修复',
+      issuedAt: '2026-08-10T00:00:00.000Z',
+    };
+    expect(legacy.payload).toEqual(legacyPayload);
+    expect(legacy.signature).toBe(createHmac('sha256', SECRET).update(JSON.stringify(legacyPayload)).digest('base64url'));
+    expect(verifyDispatchReportBinding(SECRET, 'om_seed', legacy)).toEqual(legacyPayload);
+  });
+
+  it('signs and resolves an active verified source lifetime', () => {
+    expect(resolve(imported())).toMatchObject({ ok: true, binding: { attachment } });
+  });
+
+  it('ignores unsigned attachment authority alongside the binding', () => {
+    expect(resolveVerifiedDispatchReportTarget({
+      secret: SECRET, dispatchRoot: 'om_seed', registry: {
+        om_seed: {
+          reportBinding: imported({ state: 'pending' }),
+          attachment: { ...attachment, state: 'active' },
+        },
+      },
+    })).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+    expect(resolveVerifiedDispatchReportTarget({
+      secret: SECRET, dispatchRoot: 'om_seed', registry: {
+        om_seed: { reportBinding: binding(), attachment: { ...attachment, state: 'closed' } },
+      },
+    })).toMatchObject({ ok: true, binding: { targetSessionId: 'session-orchestrator' } });
+  });
+
+  it.each(['sourceSessionId', 'sourceLarkAppId', 'ownerKey', 'sourceRouteRevision', 'revision', 'state', 'reportCapability'] as const)(
+    'rejects mutation of signed attachment field %s',
+    field => {
+      const signed = imported();
+      const changes: Record<typeof field, unknown> = {
+        sourceSessionId: 'another-source',
+        sourceLarkAppId: 'cli_another',
+        ownerKey: 'union:on_another_owner',
+        sourceRouteRevision: 2,
+        revision: 2,
+        state: 'closed',
+        reportCapability: 'manual',
+      };
+      signed.payload.attachment = { ...attachment, [field]: changes[field] } as DispatchReportAttachment;
+      expect(resolve(signed)).toEqual({ ok: false, error: 'dispatch_binding_unproven' });
+    },
+  );
+
+  it('cannot strip source constraints from an existing signed binding', () => {
+    const signed = imported();
+    delete signed.payload.attachment;
+    expect(resolve(signed)).toEqual({ ok: false, error: 'dispatch_binding_unproven' });
+  });
+
+  it.each(['pending', 'moved', 'closed', 'unknown'] as const)('refuses source state %s', state => {
+    expect(resolve(imported({ state }))).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+  });
+
+  it.each(['manual', 'unavailable'] as const)('refuses source report capability %s', reportCapability => {
+    expect(resolve(imported({ reportCapability }))).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+  });
+
+  it.each([
+    { value: null },
+    { value: [] },
+    { value: {} },
+    { value: { ...attachment, sourceRouteRevision: 0 } },
+    { value: { ...attachment, sourceRouteRevision: 1.5 } },
+    { value: { ...attachment, sourceRouteRevision: Number.MAX_SAFE_INTEGER + 1 } },
+    { value: { ...attachment, revision: 0 } },
+    { value: { ...attachment, revision: 1.5 } },
+    { value: { ...attachment, revision: Number.MAX_SAFE_INTEGER + 1 } },
+    { value: { ...attachment, sourceSessionId: 'source\nother' } },
+    { value: { ...attachment, sourceSessionId: 'x'.repeat(257) } },
+    { value: { ...attachment, sourceLarkAppId: 'other_app' } },
+    { value: { ...attachment, ownerKey: '' } },
+    { value: { ...attachment, ownerKey: 'owner key' } },
+    { value: { ...attachment, ownerKey: 'owner\0key' } },
+    { value: { ...attachment, ownerKey: 'x'.repeat(257) } },
+    { value: { ...attachment, state: 'working' } },
+    { value: { ...attachment, reportCapability: 'yes' } },
+    { value: { ...attachment, extraAuthority: true } },
+  ])('rejects malformed attachment at the signing boundary', ({ value: malformed }) => {
+    expect(() => createDispatchReportBinding(SECRET, {
+      ...binding().payload, attachment: malformed as DispatchReportAttachment,
+    })).toThrow('invalid dispatch report attachment');
+  });
 });

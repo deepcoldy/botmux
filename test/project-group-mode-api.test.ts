@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getProjectGroupMode, putProjectGroupMode } from '../src/dashboard/project-group-mode-api.js';
@@ -36,6 +36,68 @@ function fixture() {
 }
 
 describe('project group mode dashboard API', () => {
+  it('reports missing import policy as ignore and does not create a setting on reads', async () => {
+    const f = fixture();
+    expect((await getProjectGroupMode('oc_project', f)).body.config).toMatchObject({
+      mode: 'standard', importedSessionPolicy: 'ignore',
+    });
+    expect(readdirSync(f.dataDir)).toEqual([]);
+    const saved = await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+    }, f);
+    expect(saved.body.config).toMatchObject({ importedSessionPolicy: 'ignore' });
+    expect(readGroupCollaborationMode(f.dataDir, 'oc_project')?.importedSessionPolicy).toBe('ignore');
+  });
+
+  it('stores explicit notification on/off and preserves an omitted policy through old API calls', async () => {
+    const f = fixture();
+    const body = { mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'] };
+    expect((await putProjectGroupMode('oc_project', {
+      ...body, importedSessionPolicy: 'notify',
+    }, f)).body.config).toMatchObject({ importedSessionPolicy: 'notify' });
+    expect((await putProjectGroupMode('oc_project', body, f)).body.config)
+      .toMatchObject({ importedSessionPolicy: 'notify' });
+    expect((await putProjectGroupMode('oc_project', { mode: 'standard' }, f)).body.config)
+      .toMatchObject({ mode: 'standard', importedSessionPolicy: 'notify' });
+    expect((await putProjectGroupMode('oc_project', body, f)).body.config)
+      .toMatchObject({ mode: 'project', importedSessionPolicy: 'notify' });
+    expect((await putProjectGroupMode('oc_project', {
+      ...body, importedSessionPolicy: 'ignore',
+    }, f)).body.config).toMatchObject({ importedSessionPolicy: 'ignore' });
+  });
+
+  it.each(['auto-register', 'yes', '', null, false, 1, {}])(
+    'rejects invalid import policy %j before reading groups, writing or updating cards', async value => {
+      const f = fixture();
+      const writeConfig = vi.fn();
+      const refreshProjectCard = vi.fn();
+      const ensureOnboardingCard = vi.fn();
+      const clearOnboardingCard = vi.fn();
+      const result = await putProjectGroupMode('oc_project', {
+        mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+        importedSessionPolicy: value,
+      }, { ...f, writeConfig, refreshProjectCard, ensureOnboardingCard, clearOnboardingCard });
+      expect(result).toMatchObject({ status: 400, body: { error: 'invalid_imported_session_policy' } });
+      expect(f.groups).not.toHaveBeenCalled();
+      expect(writeConfig).not.toHaveBeenCalled();
+      expect(refreshProjectCard).not.toHaveBeenCalled();
+      expect(ensureOnboardingCard).not.toHaveBeenCalled();
+      expect(clearOnboardingCard).not.toHaveBeenCalled();
+      expect(readdirSync(f.dataDir)).toEqual([]);
+    },
+  );
+
+  it('accepts an explicit notification preference while standard mode remains inactive', async () => {
+    const f = fixture();
+    const result = await putProjectGroupMode('oc_project', {
+      mode: 'standard', importedSessionPolicy: 'notify',
+    }, f);
+    expect(result.body.config).toMatchObject({ mode: 'standard', importedSessionPolicy: 'notify' });
+    expect(readGroupCollaborationMode(f.dataDir, 'oc_project')).toMatchObject({
+      mode: 'standard', importedSessionPolicy: 'notify',
+    });
+  });
+
   it('creates the waiting-to-start guide for a configured group without project content', async () => {
     const f = fixture();
     const ensureOnboardingCard = vi.fn(async (chatId: string, coordinatorAppId: string) => {
@@ -93,8 +155,51 @@ describe('project group mode dashboard API', () => {
       progressCard: { schemaVersion: 1, templateId: 'raw-json', sections: [], milestonesExpanded: false },
     }, f)).toMatchObject({ status: 400, body: { error: 'invalid_progress_card_config' } });
     expect(await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+      progressCard: {
+        schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+        completedDisplay: 'hidden',
+      },
+    }, f)).toMatchObject({ status: 400, body: { error: 'invalid_progress_card_config' } });
+    expect(await putProjectGroupMode('oc_project', {
       mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'], autoEnrollWorkers: 'yes',
     }, f)).toMatchObject({ status: 400, body: { error: 'invalid_auto_enroll_workers' } });
+  });
+
+  it('persists progressCard.completedDisplay across collapsed, recent, all, and omitted resets', async () => {
+    const f = fixture();
+    for (const completedDisplay of ['collapsed', 'recent', 'all'] as const) {
+      const result = await putProjectGroupMode('oc_project', {
+        mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+        progressCard: {
+          schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+          completedDisplay,
+        },
+      }, f);
+      expect(result.status).toBe(200);
+      expect(result.body.config).toMatchObject({
+        progressCard: { templateId: 'compact-list', completedDisplay },
+      });
+      expect(readGroupCollaborationMode(f.dataDir, 'oc_project')?.progressCard?.completedDisplay).toBe(completedDisplay);
+    }
+
+    await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+      progressCard: {
+        schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+        completedDisplay: 'collapsed',
+      },
+    }, f);
+    const reset = await putProjectGroupMode('oc_project', {
+      mode: 'project', coordinatorAppId: 'cli_coordinator', workerAppIds: ['cli_worker'],
+      progressCard: {
+        schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+      },
+    }, f);
+    expect(reset.status).toBe(200);
+    expect(readGroupCollaborationMode(f.dataDir, 'oc_project')?.progressCard).toEqual({
+      schemaVersion: 1, templateId: 'compact-list', sections: ['workstreams'], milestonesExpanded: false,
+    });
   });
 
   it('refreshes an existing pinned card immediately after display configuration changes', async () => {

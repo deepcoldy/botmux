@@ -266,11 +266,45 @@ describe('ordinary IM follow-up turn origin', () => {
     expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(true);
     expect(s.ds.worker).toBe(s.worker);
 
-    // Once the worker reports its queue drained, the claim is cashed in.
+    // Once the worker reports its queue drained, the claim is held rather than
+    // cashed in: the follow-up turn is now the live turn but has not reported
+    // its terminal, so the queued suspend waits for that reply to settle instead
+    // of stopping the CLI at the start of the turn (and dropping its answer).
     s.ws.pendingMessages.length = 0;
     await s.scope.run(s.binding, async () => { s.ws.publishCliInputBacklog(); await s.drain(); });
     await new Promise(resolve => setImmediate(resolve));
     expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(false);
+    expect(s.ds.pendingSuspendReason).toBe('cli_install_changed');
+    expect(s.ds.worker).toBe(s.worker);
+
+    // The follow-up turn completes; its terminal re-runs the suspend checkpoint
+    // and the now-settled claim is fulfilled.
+    const followUpCapability = await s.writeTurn(FOLLOW_UP, caller('ou_follow_up_sender'), false);
+    await s.finishTurn(FOLLOW_UP, followUpCapability);
+    await new Promise(resolve => setImmediate(resolve));
+    expect(s.ds.pendingSuspendReason).toBeUndefined();
+  });
+
+  // `botmux suspend` while a follow-up is on its way queues behind that input.
+  // The worker may refuse it before admission: it never reaches the queue, so
+  // no backlog report and no screen edge follows to cash the suspend in.
+  it('carries out a suspend queued behind a follow-up once the worker has refused it', async () => {
+    const s = scenario = startScenario();
+    await s.boot();
+    const openingCapability = await s.writeTurn(OPENING, caller('ou_opening_sender'));
+    await s.finishTurn(OPENING, openingCapability);
+    await s.scope.run(s.binding, () => s.toDaemon({ type: 'screen_update', status: 'idle', content: '' }));
+
+    const delivered = s.deliverFollowUp();
+    expect(workerPool.manualSuspendWaits(s.ds).waitingFor).toEqual(['input']);
+    workerPool.queueManualSuspend(s.ds, workerPool.manualSuspendWaits(s.ds));
+    // Refused before admission on both attempts: the delivery fails.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await s.receive(delivered, () => s.toDaemon({ type: 'turn_input_rejected', turnId: FOLLOW_UP, reason: 'busy', rejectedBeforeAdmission: true }));
+    }
+    await vi.waitFor(() => expect(workerPool.hasPendingOrdinaryImDelivery(s.ds)).toBe(false));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(s.ds.worker).toBeNull();
     expect(s.ds.pendingSuspendReason).toBeUndefined();
   });
 

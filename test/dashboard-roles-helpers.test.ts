@@ -6,6 +6,8 @@ import {
   byteLength,
   entryForBot,
   filterRoleGroups,
+  sortRoleGroups,
+  loadGroups,
   filterRoleProfiles,
   formatListenerPreviewTime,
   hashBotId,
@@ -129,5 +131,39 @@ describe('roles helpers', () => {
     expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toMatchObject({ limit: 20 });
     expect(fetchMock.mock.calls[1][0]).toBe('/api/message-listeners/cli_a/oc_chat_a/run-preview');
     expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body))).toMatchObject({ limit: 3 });
+  });
+});
+
+
+it('ranks configured listeners before Bot count and preserves existing order on ties', () => {
+  const member = (id: string, configured = false, inChat = true) => ({
+    larkAppId: id, botName: id, hasRole: false, oncallChat: null, inChat,
+    hasMessageListener: false, hasMessageListenerConfig: configured,
+  });
+  const groups: GroupInfo[] = [
+    { chatId: 'oc_many', memberBots: [member('a'), member('b'), member('c')] },
+    { chatId: 'oc_tie_first', memberBots: [member('a', true)] },
+    { chatId: 'oc_two_listeners', memberBots: [member('a', true), member('b', true)] },
+    { chatId: 'oc_more_bots', memberBots: [member('a', true), member('b')] },
+    { chatId: 'oc_tie_second', memberBots: [member('a', true), member('gone', true, false)] },
+  ];
+  expect(sortRoleGroups(groups).map(group => group.chatId)).toEqual([
+    'oc_two_listeners', 'oc_more_bots', 'oc_tie_first', 'oc_tie_second', 'oc_many',
+  ]);
+  expect(groups[0].chatId).toBe('oc_many');
+});
+
+it('keeps group model and listener configuration metadata when loading roles', async () => {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ chats: [{
+    chatId: 'oc_agy', memberBots: [{ larkAppId: 'cli_agy', inChat: true,
+      agentCliId: 'antigravity', agentModel: 'global', agentReasoningEffort: 'medium',
+      defaultModels: { antigravity: { model: 'gemini-4-argon-high', reasoningEffort: 'high' } },
+      hasMessageListener: false, hasMessageListenerConfig: true,
+    }],
+  }] }))));
+  expect((await loadGroups()).groups[0].memberBots[0]).toMatchObject({
+    agentCliId: 'antigravity', agentModel: 'global', agentReasoningEffort: 'medium',
+    defaultModels: { antigravity: { model: 'gemini-4-argon-high', reasoningEffort: 'high' } },
+    hasMessageListener: false, hasMessageListenerConfig: true,
   });
 });

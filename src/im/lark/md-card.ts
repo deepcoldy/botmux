@@ -422,8 +422,10 @@ export interface CardUsageSnapshot {
   } | null;
   /** Observed runtime model, or the configured launch model when unavailable. */
   model?: string;
-  /** Observed reasoning effort, or the configured session effort when unavailable. */
+  /** Observed reasoning effort. Non-Claude CLIs may fall back to session configuration. */
   reasoningEffort?: string;
+  /** Native settings can change before the running turn adopts them. */
+  reasoningEffortSource?: 'selected' | 'last-execution';
   /** Session-only configuration; separate from the last executor-reported effort. */
   reasoningControl?: {
     /** Native CLI menu accepted this setting for the next turn. */
@@ -448,6 +450,9 @@ export interface CardUsageSnapshot {
    *  this snapshot for the same reason as `modelFallback`: every live-card call
    *  site already forwards it. Absent ⇒ unsupported here, toggle not rendered. */
   idleAutoCompact?: { enabled: boolean; minutes: number };
+  /** Per-session 缓存过期自动压缩 toggle (core/kimi-cache-expiry.ts), Kimi
+   *  Code only. Absent ⇒ unsupported here, toggle not rendered. */
+  kimiCacheExpiryAutoCompact?: { enabled: boolean };
   /** bots.json `cardFooterExtension` 命令给出的自定义段（已收成短单行纯文本），
    *  渲染时转义并接在用量段末尾。缺省 ⇒ 与未配置时逐字节相同。 */
   extensionSegments?: string[];
@@ -887,6 +892,7 @@ export function cardUsageFooterSegment(
  * within the label budget: CLIs such as Cursor encode effort in that ID. */
 export function cardUsageRuntimeSegment(
   usage: CardUsageSnapshot,
+  locale?: Locale,
 ): string | null {
   // Strip a leading `provider/` routing prefix (e.g. `model_hub/es1_orange_o48`
   // \u2192 `es1_orange_o48`) so the card shows the bare model name, not the relay's
@@ -900,7 +906,11 @@ export function cardUsageRuntimeSegment(
       ? 'Max'
       : '';
   const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
-  const tail = [variant, reasoningEffort].filter(Boolean);
+  const effortLabel = reasoningEffort && usage.reasoningEffortSource === 'selected'
+    ? t('card.usage.effort_selected', { effort: reasoningEffort }, locale)
+    : reasoningEffort && usage.reasoningEffortSource === 'last-execution'
+      ? t('card.usage.effort_last_execution', { effort: reasoningEffort }, locale) : reasoningEffort;
+  const tail = [variant, effortLabel].filter(Boolean);
   return `**${model}**${tail.length > 0 ? `\u00a0${tail.join(' · ')}` : ''}`;
 }
 
@@ -1041,7 +1051,7 @@ export function buildReplyCardFooter(opts: {
   if (opts.usage) {
     const usageSeg = !policy.usage ? null : cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
-    const runtimeSeg = !policy.model ? null : cardUsageRuntimeSegment(opts.usage);
+    const runtimeSeg = !policy.model ? null : cardUsageRuntimeSegment(opts.usage, opts.locale);
     if (runtimeSeg) { parts.push(runtimeSeg); hasUsage = true; }
   }
   const durationMs = opts.presentation?.timing?.executionDurationMs ?? opts.executionDurationMs;

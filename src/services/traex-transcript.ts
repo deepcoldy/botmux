@@ -1,3 +1,4 @@
+import { appliedReasoningSelectionFromRecord, type AppliedReasoningSelection } from './native-reasoning-observation.js';
 /**
  * Reader for TRAE CLI (traex / traecli) per-session rollout JSONL.
  *
@@ -45,6 +46,7 @@ import {
   type Dirent,
 } from 'node:fs';
 import { homedir } from 'node:os';
+import { nativeGoalFromEvent, type NativeGoalState } from './native-goal-state.js';
 import { basename, isAbsolute, join, relative, sep } from 'node:path';
 import { isTraexQuotaError, TRAEX_QUOTA_ERROR_CODE } from './traex-quota.js';
 import { isTraexModelAccessError, TRAEX_MODEL_ACCESS_ERROR_CODE } from './traex-model-access.js';
@@ -52,6 +54,7 @@ import {
   splitCodexEventsByCutoff,
   extractLastCodexTurn,
   type CodexBridgeEvent,
+  type CodexCotEntry,
   type CodexDrainResult,
   codexCotEntriesFromResponseItem,
   codexTaskFailureCode,
@@ -74,6 +77,7 @@ import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
 import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeHome, traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
+import { traexHistoryInputMatches, traexSkillInputAliases } from './traex-skill-input.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
@@ -681,9 +685,45 @@ export function traexRolloutUserInputs(
   return [];
 }
 
-function traexHistoryCotEntries(payload: any, sourceSessionId?: string): CodexBridgeEvent['cotEntries'] {
+const TRAEX_COT_PATHS_MAX = 128;
+const TRAEX_COT_ITEMS_PER_PATH_MAX = 4096;
+const traexCotProgress = new Map<string, { offset: number; seen: Set<string> }>();
+
+function traexCotItemEntries(item: any, turnId: string | undefined, seen: Set<string>): CodexCotEntry[] {
+  if (!item || typeof item !== 'object') return [];
+  const isResult = item.type === 'function_call_output' || item.type === 'custom_tool_call_output';
+  let normalized = item;
+  if (isResult && Array.isArray(item.output)) {
+    const output = item.output.flatMap((block: any) => block && typeof block === 'object'
+      && typeof block.text === 'string'
+      && (block.type === 'input_text' || block.type === 'output_text' || block.type === 'text')
+      ? [block.text]
+      : []).join('');
+    normalized = { ...item, output };
+  }
+  const entries = codexCotEntriesFromResponseItem(normalized);
+  // An empty/opaque tool result still completes the existing card node.
+  if (entries.length === 0 && isResult && typeof item.call_id === 'string' && item.call_id) {
+    entries.push({ kind: 'tool_result', id: item.call_id, result: '' });
+  }
+  return entries.filter(entry => {
+    const id = entry.kind === 'thinking' ? item.id : 'id' in entry ? entry.id : undefined;
+    if (!turnId || typeof id !== 'string' || !id) return true;
+    // A model item can appear in both formats across separate polling windows.
+    // Pair calls and results by call_id, while keeping them separate steps.
+    const key = JSON.stringify([turnId, entry.kind, id]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    if (seen.size > TRAEX_COT_ITEMS_PER_PATH_MAX) seen.delete(seen.values().next().value!);
+    return true;
+  });
+}
+
+function traexHistoryCotEntries(
+  payload: any, sourceSessionId: string | undefined, turnId: string | undefined, seen: Set<string>,
+): CodexCotEntry[] {
   if (payload?.operation !== 'append') return [];
-  const modelItems = Array.isArray(payload.items) ? payload.items : [];
+  const modelItems: any[] = Array.isArray(payload.items) ? payload.items : [];
   const displayReasoning = new Map<string, any>();
   for (const completion of traexDisplayCompletions(payload, sourceSessionId)) {
     const item = completion.item;
@@ -732,34 +772,7 @@ function traexHistoryCotEntries(payload: any, sourceSessionId?: string): CodexBr
     return [...(reasoningInsertions.get(index) ?? []), normalized];
   });
   items.push(...(reasoningInsertions.get(modelItems.length) ?? []));
-  const entries: NonNullable<CodexBridgeEvent['cotEntries']> = [];
-  for (const rawItem of items) {
-    if (!rawItem || typeof rawItem !== 'object') continue;
-    let item = rawItem;
-    if ((rawItem.type === 'function_call_output' || rawItem.type === 'custom_tool_call_output')
-      && Array.isArray(rawItem.output)) {
-      const text = rawItem.output
-        .flatMap((block: any) => block && typeof block === 'object'
-          && typeof block.text === 'string'
-          && (block.type === 'input_text' || block.type === 'output_text' || block.type === 'text')
-          ? [block.text]
-          : [])
-        .join('');
-      item = { ...rawItem, output: text };
-    }
-    const itemEntries = codexCotEntriesFromResponseItem(item);
-    entries.push(...itemEntries);
-    // The shared renderer deliberately accepts an empty tool result and turns
-    // it into its localized completion marker. Preserve that terminal edge
-    // for image-only, unknown-block, and empty-array outputs without exposing
-    // opaque/non-text payloads in the CoT message.
-    if (itemEntries.length === 0
-      && (rawItem.type === 'function_call_output' || rawItem.type === 'custom_tool_call_output')
-      && typeof rawItem.call_id === 'string' && rawItem.call_id) {
-      entries.push({ kind: 'tool_result', id: rawItem.call_id, result: '' });
-    }
-  }
-  return entries;
+  return items.flatMap(item => traexCotItemEntries(item, turnId, seen));
 }
 
 function traexPendingAgentTurns(path: string): TraexPendingAgentTurns {
@@ -970,6 +983,10 @@ export function drainTraexRollout(
   const sourceSessionId = traexSessionIdFromRolloutPath(path);
 
   const events: CodexBridgeEvent[] = [];
+  let latestGoal: NativeGoalState | null | undefined;
+  const collectCot = !probe || opts?.includeHistoryCot === true;
+  const priorCot = probe ? undefined : traexCotProgress.get(path);
+  const seenCot = priorCot?.offset === start ? priorCot.seen : new Set<string>();
   const seenUserTurns = new Set<string>();
   const freshUserItems = (): TraexSeenUserItems => ({ messages: new Map(), turnCounts: new Map() });
   const seenUserItems = probe ? freshUserItems()
@@ -1011,14 +1028,18 @@ export function drainTraexRollout(
   };
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
+  let latestReasoningSelection: AppliedReasoningSelection | undefined;
   for (const { entry: obj, offset: lineStart, displayIndex } of completeTraexRolloutRecords(
     completeText, start, sourceSessionId,
   )) {
+    latestReasoningSelection = appliedReasoningSelectionFromRecord(obj) ?? latestReasoningSelection;
     const runtime = runtimeFromTurnContext(obj);
     latestModel = runtime?.model ?? latestModel;
     latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
     const payload = obj?.payload;
     if (!payload || typeof payload !== 'object') continue;
+    const goal = nativeGoalFromEvent(obj, sourceSessionId);
+    if (goal !== undefined) latestGoal = goal;
     const base = {
       uuid: `${path}:${lineStart}${displayIndex !== undefined ? `:display:${displayIndex}` : ''}`,
       timestampMs: eventTimestampMs(obj.timestamp),
@@ -1052,7 +1073,9 @@ export function drainTraexRollout(
         const text = item.content.flatMap((block: any) => block?.type === 'input_text'
           && typeof block.text === 'string' ? [block.text] : []).join('');
         if (text && claimUserTurn(sourceTurnId)) {
-          events.push({ ...base, kind: 'user', text, sourceTurnId });
+          const inputTextAliases = traexSkillInputAliases(text, item.content);
+          events.push({ ...base, kind: 'user', text, sourceTurnId,
+            ...(inputTextAliases ? { inputTextAliases } : {}) });
           if (!probe) {
             // Forward the no-turn-id pending bucket to this turn, mirroring the
             // legacy user_message / item_completed user edges. Do NOT delete any
@@ -1065,15 +1088,26 @@ export function drainTraexRollout(
         }
       }
     }
-    // The append-only history is TraeX's canonical model/tool timeline. Its
-    // event_msg records mirror reasoning and tool completion, so consuming
-    // those too would duplicate nodes. One mutation can carry parallel calls
-    // or results; preserve their item order in one cosmetic event.
-    if ((!probe || opts?.includeHistoryCot === true) && obj.type === 'history_mutation') {
-      const cotEntries = traexHistoryCotEntries(payload, sourceSessionId);
-      if (cotEntries && cotEntries.length > 0) {
+    // The append-only history can carry several parallel calls or results.
+    // Keep their order and ignore diagnostic item_completed mirrors.
+    if (collectCot && obj.type === 'history_mutation') {
+      const cotEntries = traexHistoryCotEntries(payload, sourceSessionId, sourceTurnId, seenCot);
+      if (cotEntries.length > 0) {
         if (!probe && sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
         events.push({ ...base, kind: 'cot', text: '', cotEntries, ...(sourceTurnId ? { sourceTurnId } : {}) });
+      }
+      continue;
+    }
+    // TraeX 0.215 can persist the model/tool timeline as response items
+    // instead of history mutations. Use their own turn metadata: a resumed
+    // segment can contain old items from another turn.
+    if (collectCot && obj.type === 'response_item') {
+      const turnId = payload.internal_chat_message_metadata_passthrough?.turn_id;
+      if (typeof turnId === 'string' && turnId) {
+        const cotEntries = traexCotItemEntries(payload, turnId, seenCot);
+        if (cotEntries.length > 0) {
+          events.push({ ...base, kind: 'cot', text: '', cotEntries, sourceTurnId: turnId });
+        }
       }
       continue;
     }
@@ -1081,6 +1115,7 @@ export function drainTraexRollout(
       && payload.type === 'user_message'
       && typeof payload.message === 'string') {
       const userText = payload.message;
+      const inputTextAliases = traexSkillInputAliases(userText);
       if (!sourceTurnId) {
         if (takeExpectedTraexUserMirror(pendingUserMirrors, 'legacy', userText, base.timestampMs)) continue;
       }
@@ -1092,6 +1127,7 @@ export function drainTraexRollout(
           ...base,
           kind: 'user',
           text: userText,
+          ...(inputTextAliases ? { inputTextAliases } : {}),
           ...(sourceTurnId ? { sourceTurnId } : {}),
           ...(preserveCollecting ? { preserveCollecting: true } : {}),
         });
@@ -1112,6 +1148,7 @@ export function drainTraexRollout(
       && payload.type === 'item_completed') {
       const userText = itemCompletedUserText(payload.item);
       if (userText) {
+        const inputTextAliases = traexSkillInputAliases(userText, payload.item.content);
         const sourceMessageId = typeof payload.item.id === 'string' && payload.item.id
           ? payload.item.id : undefined;
         const itemClaim = claimTraexUserItem(seenUserItems, sourceTurnId, sourceMessageId);
@@ -1130,6 +1167,7 @@ export function drainTraexRollout(
           if (legacyIndex !== undefined) {
             events[legacyIndex] = {
               ...events[legacyIndex],
+              ...(inputTextAliases ? { inputTextAliases } : {}),
               ...(sourceTurnId ? { sourceTurnId } : {}),
               ...(sourceMessageId ? { sourceMessageId } : {}),
             };
@@ -1144,6 +1182,7 @@ export function drainTraexRollout(
               ...base,
               kind: 'user',
               text: userText,
+              ...(inputTextAliases ? { inputTextAliases } : {}),
               ...(sourceTurnId ? { sourceTurnId } : {}),
               ...(sourceMessageId ? { sourceMessageId } : {}),
               ...(preserveCollecting ? { preserveCollecting: true } : {}),
@@ -1330,13 +1369,24 @@ export function drainTraexRollout(
       });
     }
   }
-  if (!probe) rememberTraexUserMirrors(path, pendingUserMirrors.map(({ eventIndex: _eventIndex, ...candidate }) => candidate));
+  if (!probe) {
+    rememberTraexUserMirrors(path, pendingUserMirrors.map(({ eventIndex: _eventIndex, ...candidate }) => candidate));
+    traexCotProgress.delete(path);
+    if (seenCot.size > 0) {
+      traexCotProgress.set(path, { offset: newOffset, seen: seenCot });
+      if (traexCotProgress.size > TRAEX_COT_PATHS_MAX) {
+        traexCotProgress.delete(traexCotProgress.keys().next().value!);
+      }
+    }
+  }
   return {
     events,
     newOffset,
     pendingTail,
+    ...(latestReasoningSelection ? { latestReasoningSelection } : {}),
     ...(latestModel ? { latestModel } : {}),
     ...(latestReasoningEffort ? { latestReasoningEffort } : {}),
+    ...(latestGoal !== undefined ? { latestGoal } : {}),
   };
 }
 
@@ -1354,10 +1404,6 @@ export function drainTraexRollout(
  * cannot surface a half-written model — matching drainTraexRollout. */
 export function readLatestTraexRuntime(path: string): TraexRuntimeSnapshot {
   return readLatestRolloutRuntime(path, TRAEX_RUNTIME_SCAN_MAX_BYTES);
-}
-
-function normaliseInputText(text: string): string {
-  return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
 // -- history.jsonl submit-confirmation (submit-time truth) ------------------
@@ -1391,7 +1437,8 @@ function readTraexHistorySid(parsed: unknown): string | undefined {
 }
 
 /** Scan the byte delta appended to history.jsonl since `fromByte` for a line
- *  whose decoded `text` exactly matches `expectedText` (newline-normalised).
+ *  whose decoded `text` matches `expectedText` after newline normalization
+ *  or TRAE's native skill-link expansion. Skill arguments still match in full.
  *  Never parses a non-newline-terminated tail, so a half-written line can't
  *  manufacture a false match — a later poll sees the completed entry. */
 export function traexHistoryMatchDelta(
@@ -1411,13 +1458,12 @@ export function traexHistoryMatchDelta(
   const delta = buf.toString('utf8');
   // Drop a trailing partial line (no newline yet) — it may still be mid-write.
   const lines = delta.endsWith('\n') ? delta.split('\n') : delta.split('\n').slice(0, -1);
-  const expected = normaliseInputText(expectedText);
   for (const line of lines) {
     if (line.length === 0) continue;
     let parsed: any;
     try { parsed = JSON.parse(line); } catch { continue; }
     if (typeof parsed?.text !== 'string') continue;
-    if (normaliseInputText(parsed.text) !== expected) continue;
+    if (!traexHistoryInputMatches(parsed.text, expectedText)) continue;
     const cliSessionId = readTraexHistorySid(parsed);
     // Skip a same-text line owned by a DIFFERENT pane (shared-TRAE_HOME
     // collision). Keep scanning — the owned line may be later in this delta

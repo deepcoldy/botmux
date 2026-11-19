@@ -99,20 +99,22 @@ export async function resolveBoundLarkUserCredential(
 function platformRefusal(resolution: PlatformIdentityResolution, delegated: boolean): BoundLarkUserCredential {
   const who = delegated ? 'The original user' : 'This user';
   const url = (resolution.state === 'not_authorized' ? resolution.authorizeUrl : undefined) ?? platformAuthorizeUrl() ?? undefined;
-  const link = url ? ` at ${url}` : '';
   // The cause travels with the text: the agent (and whoever reads its report)
   // must tell "authorize first" from "the platform is down, wait".
   const tag = resolution.state === 'granted' ? '' : ` ${reasonTag(platformRefusalReason(resolution))}`;
   const withUrl = (error: string) => ({ ok: false as const, reason: 'platform' as const, error: `${error}${tag}`, ...(url ? { authorizeUrl: url } : {}) });
   const noBotApp = 'Do not ask them to authorize the bot application or run botmux auth request for it.';
+  const delivered = delegated
+    ? 'They must authorize on the platform themselves; report this, there is no link to relay.'
+    : 'botmux has the platform send them an authorization card; never relay a link.';
   switch (resolution.state) {
     case 'not_authorized':
       return withUrl(resolution.consent
-        ? `${who} authorized lark-cli on the botmux platform but has not allowed this machine's team to use it. Send them the platform page${link} to allow it, then retry with --as user. ${noBotApp}`
-        : `${who} has not authorized lark-cli on the botmux platform. Send them the platform page${link}; one authorization works on every bound machine and renews itself. Retry with --as user after they confirm. ${noBotApp}`);
+        ? `${who} has not authorized lark-cli on the botmux platform, or has not yet allowed this machine to use it. ${delivered} Retry with --as user after they confirm. ${noBotApp}`
+        : `${who} has not authorized lark-cli on the botmux platform. ${delivered} Retry with --as user after they confirm. ${noBotApp}`);
     case 'denied':
       return withUrl(resolution.reason === 'not_teammate'
-        ? `${who} is not in a botmux platform team with this machine's owner, so the platform will not issue their credentials here. The machine owner must invite them into a team on the platform first; then they authorize on the platform page${link}. ${noBotApp}`
+        ? `The botmux platform does not issue ${delegated ? "the original user's" : "this user's"} lark-cli credentials on this machine (an older platform only issues to the machine owner's team members). Do not retry automatically; report it to the operator. ${noBotApp}`
         : `The botmux platform refused ${delegated ? "the original user's" : "this user's"} lark-cli credentials (${resolution.detail}). Do not retry automatically.`);
     case 'unbound':
       return withUrl('This bot takes lark-cli user credentials only from the botmux platform, but this machine is not bound to it. Ask the operator to run botmux bind on the host. Do not ask the user to log in.');
@@ -163,6 +165,9 @@ export async function platformAuthRequestRedirect(input: {
   const url = platformIncrementalAuthorizeUrl(page, input.scopes ?? []);
   const who = input.delegated ? 'The original user' : 'This user';
   const scoped = url !== page;
+  const getPage = input.delegated
+    ? 'the original user must do it on the platform page themselves; report this, there is no link to relay. '
+    : 'botmux has the platform send them an authorization card (the delivery result says whether it went out); never ask for or relay a link. ';
   return {
     error: `${who}'s lark-cli authorization comes from the botmux platform, not from application ${input.bot.larkAppId}. `
       // The platform application cannot hold every scope (some need tenant-wide
@@ -170,11 +175,11 @@ export async function platformAuthRequestRedirect(input: {
       + 'For a READ of data in a chat or document this bot can access (for example messages of a group the bot is in), '
       + 'retry that read with --as bot first; it needs no user authorization. Never switch a write to --as bot. '
       + (scoped
-        ? `If the read also fails as bot, or the action must be done as this user, send them this platform link: ${url} . `
-          + 'It lists the missing scopes and adds just those to their existing platform authorization with one click ("补充授权"); retry with --as user after they confirm. '
+        ? `If the read also fails as bot, or the action must be done as this user, ${getPage}`
+          + 'The page lists the missing scopes and adds just those to their existing platform authorization with one click ("补充授权"); retry with --as user after they confirm. '
           + 'If the page says the platform application has not enabled a scope, only the platform administrator can fix that: tell the user which scope is needed instead of retrying.'
-        : `If the read also fails as bot, or the action must be done as this user, send them the platform page at ${url} `
-          + 'to authorize (or re-authorize). If a scope is still missing afterwards, '
+        : `If the read also fails as bot, or the action must be done as this user, ${getPage}`
+          + 'They authorize (or re-authorize) there. If a scope is still missing afterwards, '
           + 'the platform application itself must enable it first; tell the user which scope is needed instead of retrying.'),
     authorizeUrl: url,
   };

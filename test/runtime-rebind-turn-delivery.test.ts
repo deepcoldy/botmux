@@ -17,6 +17,8 @@ import { WorkerSessionEventScope } from '../src/services/session-event-scope.js'
 import { admitSessionCommand } from '../src/services/session-command-gateway.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { resolveDaemonCurrentActor } from '../src/core/current-actor-attestation.js';
+import { startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { unsettledReplyHoldUntil } from '../src/core/idle-worker-sweeper.js';
 import { logger } from '../src/utils/logger.js';
 import { t } from '../src/i18n/index.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -50,10 +52,12 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function startWorker({ opening = true, cliPid = process.ppid, restart = false }: { opening?: boolean; cliPid?: number; restart?: boolean } = {}) {
+async function startWorker({ opening = true, cliPid = process.ppid, restart = false, wake = false, zeroPrompt = false }: { opening?: boolean; cliPid?: number; restart?: boolean; wake?: boolean; zeroPrompt?: boolean } = {}) {
   const sessionReply = vi.fn(async () => 'om_reply');
+  const screenStatuses: Array<{ prevStatus?: string; status: string; turnId?: string }> = [];
   workerPool.initWorkerPool({
     sessionReply, getSessionWorkingDir: () => dir, getActiveCount: () => 1, closeSession: vi.fn(),
+    onScreenStatus: (_ds: DaemonSession, context: { prevStatus?: string; status: string; turnId?: string }) => { screenStatuses.push(context); },
   } as any);
   const worker = new EventEmitter() as any;
   worker.killed = false; worker.connected = true; worker.pid = process.pid;
@@ -62,7 +66,9 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
     { rootMessageId: turnId, senderOpenId: `ou_${turnId}`, updatedAt: new Date().toISOString() }]));
   const ds = {
     session: { sessionId: SESSION, chatId: 'oc_group', chatType: 'group', status: 'active', cliId: 'claude-code',
-      createdAt: new Date().toISOString(), workerGeneration: 1, replyTargets },
+      createdAt: new Date().toISOString(), workerGeneration: 1, replyTargets,
+      // Zero-prompt: the CLI's own turns answer the latest message of the chat.
+      ...(zeroPrompt ? { promptInjection: 'none', quoteTargetId: TURNS[0] } : {}) },
     larkAppId: APP, chatId: 'oc_group', chatType: 'group', scope: 'chat',
     worker, workerGeneration: 1, workerPort: 0, workerToken: 'token',
     spawnedAt: Date.now(), cliVersion: '1', lastMessageAt: Date.now(), hasHistory: true,
@@ -71,10 +77,17 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
   // forkWorker's contract bootstrap: a cold start carries its opening turn on
   // init; a warm reattach gets every turn through ordinary IM delivery.
   controller = controllerForSession(ds, true)!;
+  if (wake) {
+    // A suspended session: the message that wakes it forks a worker whose CLI
+    // resumes under the session's resume operation.
+    const suspend = controller.beginControl('suspend').operation.operationId;
+    controller.controlStarted(suspend); controller.controlResult(suspend, 'confirmed');
+  }
+  const resumeId = wake ? controller.prepareWorkerStart() : undefined;
   const contract = controller.bindWorker(1);
   // A resume or /restart spawns its CLI under the control operation.
-  const restartId = restart ? controller.beginControl('restart').operation.operationId : undefined;
-  if (restartId) controller.controlStarted(restartId);
+  const restartId = restart ? controller.beginControl('restart').operation.operationId : resumeId;
+  if (restart && restartId) controller.controlStarted(restartId);
   const openingExecution = opening ? controller.admitInput(TURNS[0]) : undefined;
   ds.initConfig = { type: 'init', sessionId: SESSION, cliId: 'claude-code', backendType: 'tmux', ...(opening ? { turnId: TURNS[0] } : {}), sessionContract: contract } as any;
 
@@ -129,6 +142,8 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
           for (const state of message.admissionStates ?? []) scope.noteAdmission(state);
           for (const execution of message.executions ?? []) scope.rememberExecution(execution);
           for (const observed of message.observedExecutions ?? []) scope.rememberObservedExecution(message.bindingId, observed.runtime, observed.execution);
+          // The worker stops reading its transcript once the daemon retires its runtime.
+          if (!message.mayExecute) ws.closeRequested = true;
           break;
         }
       }
@@ -200,7 +215,7 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
     await observer({ type: 'prompt_ready' });
   };
   const replies = () => sessionReply.mock.calls.map(([, content]) => String(content));
-  return { controller, ds, ws, scope, binding, bridge, toWorker, workerLog, replies, spawnCli,
+  return { controller, ds, ws, scope, binding, bridge, toWorker, workerLog, replies, screenStatuses, spawnCli,
     writeOpeningTurn: () => scope.run(binding, async () => { const c = writeTurn(TURNS[0]); await drain(); return c; }, openingExecution),
     deliver, answer,
     // The relay timer rewires the ownership PID and re-attests it at once; the
@@ -210,14 +225,48 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
       await bridge({ type: 'local_process_attestation', backendType: 'tmux', credentialIsolated: false,
         cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) });
     },
-    publishNativeSession: (nativeSessionId: string) => bridge({ type: 'cli_session_id', cliSessionId: nativeSessionId }) };
+    publishNativeSession: (nativeSessionId: string) => bridge({ type: 'cli_session_id', cliSessionId: nativeSessionId }),
+    /** Worker code a callback the spawn started runs (the flush typing the
+     *  opening turn, the transcript bridge). */
+    inSpawnContext: (work: () => void) => scope.run(binding, async () => { work(); await drain(); }, openingExecution),
+    /** A live screen callback: it runs under the binding current at the time. */
+    inCurrentBinding: (work: () => void) => scope.run(scope.currentBinding()!, async () => { work(); await drain(); }) };
 }
 
 const answers = (...turnIds: string[]) => turnIds.map(turnId => expect.stringContaining(`answer for ${turnId}`));
 const lostTurnWarnings = (warn: ReturnType<typeof vi.spyOn>) => warn.mock.calls.map(([line]) => String(line))
-  .filter(line => /Dropped managed_turn_origin|not delivered|Worker user_notify/.test(line));
+  .filter(line => /Dropped (managed_turn_origin|terminal_turn_started)|not delivered|Worker user_notify/.test(line));
 
 describe('turns around a semantic runtime rebind', () => {
+  it('settles the live screen after a semantic rebind without moving the execution origin', async () => {
+    const s = await startWorker();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+    const capability = await s.deliver(TURNS[1]);
+    await s.bridge({ type: 'screen_update', content: 'running', status: 'working', turnId: TURNS[1] });
+    expect(s.ds.lastScreenStatus).toBe('working');
+    await s.answer(TURNS[1], capability);
+    await s.bridge({ type: 'screen_update', content: 'prompt', status: 'idle', turnId: undefined });
+    expect(s.ds.lastScreenStatus).toBe('idle');
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[1])));
+  });
+
+  it('preserves display attribution for a turn that started before the semantic rebind', async () => {
+    const s = await startWorker();
+    const capability = await s.writeOpeningTurn();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+
+    await s.bridge({ type: 'screen_update', content: 'running', status: 'working', turnId: TURNS[0] });
+    expect(s.ds.lastScreenStatus).toBe('working');
+    expect(s.screenStatuses.at(-1)).toMatchObject({ status: 'working', turnId: TURNS[0] });
+
+    await s.answer(TURNS[0], capability);
+    await s.bridge({ type: 'screen_update', content: 'prompt', status: 'idle', turnId: TURNS[0] });
+    expect(s.screenStatuses.at(-1)).toMatchObject({ status: 'idle', turnId: TURNS[0] });
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0])));
+  });
+
   it('delivers both turns of a cold resume whose relay resolves the real CLI mid-turn', async () => {
     const warn = vi.spyOn(logger, 'warn');
     const s = await startWorker();
@@ -337,6 +386,38 @@ describe('turns around a semantic runtime rebind', () => {
     expect(lostTurnWarnings(warn)).toEqual([]);
   });
 
+  // A message wakes a suspended session; the resume is confirmed at the CLI's
+  // first prompt (the ready gate's timeout fallback), and the resumed Claude
+  // shows its native session id only once the waking message is written. The
+  // relay had already resolved the real CLI, so the live runtime only adds that
+  // id to its identity.
+  it('answers the waking message when the woken CLI reports its native session after the resume was confirmed', async () => {
+    const warn = vi.spyOn(logger, 'warn');
+    const s = await startWorker({ wake: true, cliPid: process.pid });
+    expect(s.controller.allowsInput()).toBe(true);
+    const first = await s.writeOpeningTurn();
+    await s.publishNativeSession('native-woken');
+
+    expect(s.scope.currentBinding()).toBe(s.binding);
+    expect(s.toWorker.filter(message => message.type === 'runtime_contract_assigned').at(-1))
+      .toMatchObject({ bindingId: s.binding.bindingId, mayExecute: true });
+    expect(s.controller.currentRuntime()).toEqual(s.binding.runtime);
+    const live = s.controller.store.runtime(s.controller.ref);
+    expect(live).toMatchObject({ identity: { nativeSessionId: 'native-woken' } });
+    expect(live?.phase).not.toBe('retiring');
+    await s.answer(TURNS[0], first);
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0])));
+
+    const second = await s.deliver(TURNS[1]);
+    expect(s.ds.managedTurnOrigin).toMatchObject({ turnId: TURNS[1], callerOpenId: `ou_${TURNS[1]}` });
+    await s.answer(TURNS[1], second);
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0], TURNS[1])));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(s.replies()).toHaveLength(2);
+    expect(s.workerLog).not.toContainEqual(expect.stringContaining('Dropped final_output after close fence'));
+    expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+
   // The pane's exit callback keeps the binding the CLI was spawned under.
   it('takes the idle exit of the relay-resolved CLI as the current runtime\'s exit', async () => {
     const s = await startWorker();
@@ -373,6 +454,175 @@ describe('turns around a semantic runtime rebind', () => {
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(s.replies()).toHaveLength(3);
     expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+
+  // Zero-prompt: the answer to a turn the CLI starts on its own (a background
+  // task's wake-up) goes out only to where the turn's start said it replies.
+  // The transcript bridge reports that start under the binding the spawn left
+  // behind, which every production start has rebound since.
+  it.each([
+    ['the relay resolved the real CLI and it reported its session id', { cliPid: process.ppid },
+      async (s: Awaited<ReturnType<typeof startWorker>>) => { await s.relayResolvesRealCli(); await s.publishNativeSession('native-cold'); }],
+    ['/clear moved the CLI to another session id', { cliPid: process.pid },
+      async (s: Awaited<ReturnType<typeof startWorker>>) => { await s.publishNativeSession('native-before-clear'); await s.publishNativeSession('native-after-clear'); }],
+  ] as const)('zero-prompt: posts the answer to a turn the CLI starts on its own after %s', async (_shape, opts, rebind) => {
+    const warn = vi.spyOn(logger, 'warn');
+    const s = await startWorker({ opening: false, zeroPrompt: true, ...opts });
+    await rebind(s);
+    expect(s.scope.currentBinding()).not.toBe(s.binding);
+    const turnId = 'local-headless-wake';
+    await s.bridge({ type: 'terminal_turn_started', turnId, startedAtMs: Date.now() });
+    await s.bridge({ type: 'final_output', content: `answer for ${turnId}`, lastUuid: `uuid-${turnId}`, turnId, terminalLocal: true });
+    await s.bridge({ type: 'turn_terminal', sessionId: SESSION, turnId, status: 'completed' });
+
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(turnId)));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(s.replies()).toHaveLength(1);
+    expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+});
+
+describe('the CLI input queue around a semantic runtime rebind', () => {
+  let ipc: IpcServerHandle | undefined;
+  beforeEach(() => { workerPool.__testOnly_setSuspendBackingVerifier(() => true); });
+  afterEach(async () => {
+    await ipc?.close(); ipc = undefined;
+    workerPool.__testOnly_setSuspendBackingVerifier();
+  });
+  const postSuspend = async (): Promise<unknown> => {
+    ipc ??= await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${ipc.port}/api/sessions/${SESSION}/suspend`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    return res.json();
+  };
+
+  // Production (2026-11-11): a message woke a dormant Claude session. The
+  // write of that message, its settlement and the transcript bridge kept the
+  // binding the spawn started them under; Claude's native session id, shown
+  // after the write, re-bound the runtime to the real CLI pid. The worker's
+  // "queue drained" report then carried the replaced runtime and was dropped,
+  // while its "writing the waking message" report had been admitted, and the
+  // worker reports a backlog only when it changes. A minute after the reply
+  // was out, the screen idle, `botmux suspend` answered "queued" and the
+  // suspend only ran when the next turn ended, twelve minutes later.
+  it('lets botmux suspend take the idle session at once after the write settled under the replaced binding', async () => {
+    const s = await startWorker();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => (id === SESSION ? s.ds : undefined));
+    // The flush starts typing the waking message: the CLI has not taken it yet.
+    s.ws.cliSubmissionInFlight = { item: { turnId: TURNS[0] }, generation: 1 };
+    const first = await s.writeOpeningTurn();
+    expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(true);
+
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+    expect(s.scope.currentBinding()).not.toBe(s.binding);
+
+    // The write settles in the flush that started it: the queue is drained.
+    await s.inSpawnContext(() => { s.ws.cliSubmissionInFlight = null; s.ws.publishCliInputBacklog(); });
+    await s.answer(TURNS[0], first);
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0])));
+    await vi.waitFor(() => expect(unsettledReplyHoldUntil(s.ds)).toBeUndefined());
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'idle', content: '' }));
+    expect(s.ds.lastScreenStatus).toBe('idle');
+
+    expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(false);
+    expect(await postSuspend()).toEqual({ ok: true, sessionId: SESSION, suspended: true });
+    expect(s.ds.worker).toBeNull();
+    expect(s.ds.pendingSuspendReason).toBeUndefined();
+  });
+
+  // The turn that was running when the runtime moved keeps reporting under the
+  // runtime it was submitted on. Its `working` frames must still reach the
+  // daemon: they are what keeps a suspend from cutting the turn off before
+  // its reply is out.
+  it('queues botmux suspend behind the turn that was running when the runtime moved, and its reply goes out', async () => {
+    const s = await startWorker();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => (id === SESSION ? s.ds : undefined));
+    s.ws.cliSubmissionInFlight = { item: { turnId: TURNS[0] }, generation: 1 };
+    const first = await s.writeOpeningTurn();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+    // The write settles: the CLI took the turn and is working on it.
+    await s.inSpawnContext(() => {
+      s.ws.send({ type: 'screen_update', status: 'working', content: '', turnId: TURNS[0] });
+      s.ws.cliSubmissionInFlight = null; s.ws.publishCliInputBacklog();
+    });
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'working', content: 'spinner', turnId: TURNS[0] }));
+    expect(s.ds.lastScreenStatus).toBe('working');
+
+    const body = await postSuspend() as { suspended: boolean; reason: string; waitingFor: string[] };
+    expect(body).toMatchObject({ suspended: false, reason: 'deferred' });
+    expect(body.waitingFor).toContain('turn');
+    expect(s.ds.worker).not.toBeNull();
+
+    await s.answer(TURNS[0], first);
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'idle', content: '' }));
+    await vi.waitFor(() => expect(s.ds.worker).toBeNull());
+    expect(s.replies()).toEqual(answers(TURNS[0]));
+  });
+
+  it('keeps a message the CLI has not taken protected across the rebind', async () => {
+    const s = await startWorker();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => (id === SESSION ? s.ds : undefined));
+    const first = await s.writeOpeningTurn();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-resumed');
+    await s.answer(TURNS[0], first);
+    await vi.waitFor(() => expect(unsettledReplyHoldUntil(s.ds)).toBeUndefined());
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'idle', content: '' }));
+
+    const worker = s.ds.worker;
+    // A follow-up waits in the worker's queue; the spawn-era flush reports it.
+    await s.inSpawnContext(() => { s.ws.pendingMessages.push({ turnId: TURNS[1], content: 'queued' }); s.ws.publishCliInputBacklog(); });
+    expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(true);
+    expect(await postSuspend()).toEqual({
+      ok: true, sessionId: SESSION, suspended: false, reason: 'deferred', waitingFor: ['input'],
+    });
+    expect(s.ds.worker).toBe(worker);
+    expect(s.ds.pendingSuspendReason).toBe('manual_suspend');
+    // An idle edge before the CLI took it does not cash the suspend in.
+    await s.inCurrentBinding(() => s.ws.send({ type: 'screen_update', status: 'idle', content: '' }));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(s.ds.worker).toBe(worker);
+
+    // The CLI takes it: the queued suspend is cashed in on that report.
+    await s.inSpawnContext(() => { s.ws.pendingMessages.length = 0; s.ws.publishCliInputBacklog(); });
+    await vi.waitFor(() => expect(s.ds.worker).toBeNull());
+    expect(s.ds.pendingSuspendReason).toBeUndefined();
+  });
+});
+
+describe('identity the live runtime of a woken session reports', () => {
+  function wokenSession() {
+    const ds = {
+      session: { sessionId: SESSION, chatId: 'oc_group', chatType: 'group', status: 'active', cliId: 'claude-code',
+        createdAt: new Date().toISOString(), workerGeneration: 1 },
+      larkAppId: APP, chatId: 'oc_group', chatType: 'group', scope: 'chat', workerGeneration: 1,
+    } as unknown as DaemonSession;
+    controller = controllerForSession(ds, true)!;
+    const suspend = controller.beginControl('suspend').operation.operationId;
+    controller.controlStarted(suspend); controller.controlResult(suspend, 'confirmed');
+    const resume = controller.prepareWorkerStart()!;
+    const { worker } = controller.bindWorker(1);
+    controller.reserveBinding('spawned', worker);
+    const identity = { backend: 'tmux', physicalId: '4242:1', proof: 'process_start' } as const;
+    controller.bindRuntime('spawned', worker, identity, resume);
+    const report = () => controller.bindRuntime('spawned', worker, { ...identity, nativeSessionId: 'native-woken' }, resume);
+    return { resume, report };
+  }
+
+  it('is recorded under the resume while the resume is still open', () => {
+    const { resume, report } = wokenSession();
+    expect(report().phase).not.toBe('retiring');
+    expect(controller.operation(resume)?.phase).not.toBe('confirmed');
+    expect(controller.store.runtime(controller.ref)?.identity?.nativeSessionId).toBe('native-woken');
+  });
+
+  it('does not keep a runtime the failed resume left behind', () => {
+    const { resume, report } = wokenSession();
+    controller.controlResult(resume, 'rejected');
+    expect(report().phase).toBe('retiring');
   });
 });
 

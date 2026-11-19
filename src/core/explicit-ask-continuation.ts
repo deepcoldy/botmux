@@ -15,10 +15,60 @@ export interface ExplicitAskReceipt {
   delivered?: boolean;
   /** Daemon-observed origin, never supplied as authority by the caller. */
   origin?: { turnId: string; dispatchAttempt?: number; workerGeneration?: number };
+  retirement?: { operationId: string; reason: string; requestedAt: number };
+  card?: { askId: string; cardMessageId?: string; cardDeliveredAt?: number };
+}
+
+export interface ExplicitAskControl {
+  larkAppId: string;
+  sessionId: string;
+  requestId: string;
+  chatId: string;
+  rootMessageId: string | null;
+  origin: NonNullable<ExplicitAskReceipt['origin']>;
+}
+
+export interface ExplicitAskRetirement extends ExplicitAskControl {
+  operationId: string;
+  reason: string;
 }
 
 /** Consumed receipts only answer late reconnects of the same invocation. */
 const CONSUMED_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+function orderedJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(orderedJson);
+  if (value && typeof value === 'object') return Object.fromEntries(
+    Object.entries(value).filter(([, field]) => field !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, field]) => [key, orderedJson(field)]),
+  );
+  return value;
+}
+
+function sameExplicitInvocation(left: CreateAskInput, right: CreateAskInput): boolean {
+  const { replyCardTarget: leftTarget, backendSurvivesRestart: leftBackend, ...leftIdentity } = left;
+  const { replyCardTarget: rightTarget, backendSurvivesRestart: rightBackend, ...rightIdentity } = right;
+  return JSON.stringify(orderedJson(leftIdentity)) === JSON.stringify(orderedJson(rightIdentity));
+}
+
+export async function waitForExplicitAskResult(
+  body: Record<string, unknown> & { timeoutMs: number },
+  post: (body: Record<string, unknown>) => Promise<AskResult>,
+  deps: { now?: () => number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<AskResult> {
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const reconnectDeadline = body.timeoutMs === 0 ? null : now() + body.timeoutMs + 60_000;
+  while (true) {
+    try { return await post(body); }
+    catch (error) {
+      if (!(error as { retryable?: boolean }).retryable
+        || (reconnectDeadline !== null && now() >= reconnectDeadline)) throw error;
+      await sleep(1000);
+    }
+  }
+}
 
 /** Explicit asks have a daemon-owned claimant, independent of the waiting CLI.
  * Keep terminal receipts until acknowledged or durably dispatched to the SAME
@@ -32,12 +82,33 @@ export function createExplicitAskContinuation(deps: {
   onError: (error: unknown) => void;
   releaseHandoff?: (input: CreateAskInput) => void;
   hasHandoff?: (input: CreateAskInput) => boolean;
+  shouldInvalidate?: (receipt: ExplicitAskReceipt) => boolean;
+  invalidate?: (input: CreateAskInput, reason: string) => void;
+  retire?: (input: CreateAskInput, reason: string) => AskResult | undefined;
+  canRetire?: (receipt: ExplicitAskReceipt) => boolean;
+  snapshot?: (input: CreateAskInput) => {
+    askId: string;
+    cardMessageId?: string;
+    cardDeliveredAt?: number;
+    result?: AskResult;
+  } | undefined;
   now?: () => number;
 }) {
   const now = deps.now ?? Date.now;
   const running = new Map<string, Promise<AskResult>>();
+  /** Receipts whose recovery turn is being dispatched right now. */
+  const dispatching = new Set<string>();
   let sweeping = false;
-  const keyFor = (input: CreateAskInput) => createHash('sha256')
+  const handoffMissing = (): AskResult => ({ kind: 'invalidated', reason: 'durable Ask handoff missing; do not reuse an old confirmation',
+    selected: null, by: null, comment: null, timedOut: false });
+  /** The broker handoff is the only other copy of the delivered card's
+   * identity; freeze it into the receipt before that handoff is released. */
+  const withCard = (receipt: ExplicitAskReceipt): ExplicitAskReceipt => {
+    const snapshot = deps.snapshot?.(receipt.input);
+    return snapshot ? { ...receipt, card: { askId: snapshot.askId, cardMessageId: snapshot.cardMessageId,
+      cardDeliveredAt: snapshot.cardDeliveredAt } } : receipt;
+  };
+  const keyFor = (input: Pick<CreateAskInput, 'larkAppId' | 'sessionId' | 'requestId'>) => createHash('sha256')
     .update(askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!)).digest('hex');
   const pathFor = (key: string) => join(deps.dir, `${key}.json`);
   const read = (key: string): ExplicitAskReceipt | undefined => {
@@ -51,27 +122,85 @@ export function createExplicitAskContinuation(deps: {
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
     atomicWriteFileSync(pathFor(key), JSON.stringify(receipt), { mode: 0o600, durable: true });
   };
-  /** presentation 只影响发卡位置和点名，不写进回执：回执 input 的全等比较就是调用身份。 */
+  function describe(control: Omit<ExplicitAskControl, 'origin'>): ExplicitAskReceipt {
+    const key = keyFor(control);
+    const receipt = read(key);
+    if (!receipt || receipt.input.larkAppId !== deps.appId) throw new Error('explicit Ask not found');
+    if (receipt.input.timeoutMs !== 0 || receipt.input.originKind !== 'host_explicit') {
+      throw new Error('explicit Ask control requires a no-deadline receipt');
+    }
+    if (receipt.input.chatId !== control.chatId || receipt.input.rootMessageId !== control.rootMessageId) {
+      throw new Error('explicit Ask control binding conflict');
+    }
+    const snapshot = deps.snapshot?.(receipt.input);
+    const card = snapshot ? { askId: snapshot.askId, cardMessageId: snapshot.cardMessageId,
+      cardDeliveredAt: snapshot.cardDeliveredAt } : receipt.card;
+    return { ...receipt, ...(card ? { card } : {}),
+      ...(snapshot?.result && !receipt.result ? { result: snapshot.result } : {}) };
+  }
+  function inspect(control: ExplicitAskControl): ExplicitAskReceipt {
+    const receipt = describe(control);
+    if (!receipt.origin || receipt.origin.turnId !== control.origin.turnId
+      || receipt.origin.workerGeneration !== control.origin.workerGeneration
+      || receipt.origin.dispatchAttempt !== control.origin.dispatchAttempt) {
+      throw new Error('explicit Ask control binding conflict');
+    }
+    return receipt;
+  }
+  function retire(control: ExplicitAskRetirement): ExplicitAskReceipt {
+    const current = inspect(control);
+    if (current.retirement && (current.retirement.operationId !== control.operationId
+      || current.retirement.reason !== control.reason)) throw new Error('explicit Ask retirement conflict');
+    if (current.result?.kind === 'answered') return current;
+    if (!deps.retire) throw new Error('explicit Ask retirement unsupported');
+    if (!deps.canRetire?.(current)) throw new Error('explicit Ask retirement authority conflict');
+    const key = keyFor(current.input);
+    const stored = read(key)!;
+    // The sweep already read this settled receipt and is creating its
+    // recovery turn: recording a retirement now would promise "no recovery
+    // turn" after the fact. Let the caller inspect and retry once it lands.
+    if (stored.result && !stored.retirement && dispatching.has(key)) {
+      throw new Error('explicit Ask recovery dispatch in flight');
+    }
+    // A decision another path already invalidated (session rebound, handoff
+    // missing) is void either way: record this operation so the same
+    // retirement can release, without a second broker settlement.
+    if (!stored.retirement) {
+      write(key, { ...stored, retirement: { operationId: control.operationId, reason: control.reason, requestedAt: now() } });
+    }
+    if (!stored.result) {
+      const result = deps.retire(stored.input, control.reason);
+      if (!result) throw new Error('explicit Ask handoff unavailable');
+      const latest = read(key)!;
+      if (!latest.result) write(key, withCard({ ...latest, result, settledAt: now() }));
+      // The receipt now durably owns the terminal result; drop the broker's
+      // host_explicit handoff exactly like a settled wait() does.
+      deps.releaseHandoff?.(stored.input);
+    }
+    return inspect(control);
+  }
+  /** presentation 只影响首次发卡位置和点名；重连保持原始回执与冻结卡片授权。 */
   function wait(input: CreateAskInput & { requestId: string }, origin?: ExplicitAskReceipt['origin'],
     presentation?: Pick<CreateAskInput, 'cardRootMessageId' | 'mentionedOpenId'>): Promise<AskResult> {
     const key = keyFor(input);
     const original = read(key);
-    if (original && JSON.stringify(original.input) !== JSON.stringify(input)) {
+    if (original && !sameExplicitInvocation(original.input, input)) {
       return Promise.reject(new Error('explicit ask invocation identity conflict'));
     }
     if (original?.result) return Promise.resolve(original.result);
     const joined = running.get(key);
     if (joined) return joined;
     if (original && deps.hasHandoff && !deps.hasHandoff(input)) {
-      const result: AskResult = { kind: 'invalidated', reason: 'durable Ask handoff missing; do not reuse an old confirmation', selected: null, by: null, comment: null, timedOut: false };
+      const result = handoffMissing();
       write(key, { ...original, result, settledAt: now() });
       return Promise.resolve(result);
     }
     if (!original) write(key, { version: 1, input, ...(origin ? { origin } : {}) });
-    const promise = deps.register({ ...input, ...presentation }).then(result => {
+    const frozenInput = original?.input ?? input;
+    const promise = deps.register(original ? frozenInput : { ...frozenInput, ...presentation }).then(result => {
       const receipt = read(key)!;
-      write(key, { ...receipt, result, settledAt: now() });
-      deps.releaseHandoff?.(input);
+      write(key, withCard({ ...receipt, result: receipt.result ?? result, settledAt: receipt.settledAt ?? now() }));
+      deps.releaseHandoff?.(frozenInput);
       return result;
     }).finally(() => running.delete(key));
     running.set(key, promise);
@@ -80,7 +209,7 @@ export function createExplicitAskContinuation(deps: {
   function acknowledge(input: CreateAskInput & { requestId: string }, canAcknowledge?: (receipt: ExplicitAskReceipt) => boolean): AskResult | undefined {
     const key = keyFor(input);
     const receipt = read(key);
-    if (!receipt?.result || JSON.stringify(receipt.input) !== JSON.stringify(input)) return undefined;
+    if (!receipt?.result || !sameExplicitInvocation(receipt.input, input)) return undefined;
     // A stdout flush can succeed even after its tool caller ended. A stale
     // origin is not consumption; leave the receipt for same-session recovery.
     if (!canAcknowledge || canAcknowledge(receipt)) write(key, { ...receipt, acknowledged: true });
@@ -100,11 +229,46 @@ export function createExplicitAskContinuation(deps: {
           const receipt = read(key)!;
           if (receipt.version !== 1 || receipt.input.larkAppId !== deps.appId
             || keyFor(receipt.input) !== key) continue;
-          if (receipt.acknowledged || receipt.delivered) {
-            if (now() - receipt.settledAt! >= CONSUMED_RECEIPT_RETENTION_MS) rmSync(pathFor(key), { force: true });
+          // A durable result makes the broker handoff redundant; this also
+          // finishes a release interrupted after the receipt write.
+          if (receipt.result) deps.releaseHandoff?.(receipt.input);
+          if (receipt.acknowledged || receipt.delivered || receipt.retirement && receipt.result?.kind === 'invalidated') {
+            // A retirement recorded on an old settled decision restarts retention.
+            const retainedSince = Math.max(receipt.settledAt ?? 0, receipt.retirement?.requestedAt ?? 0);
+            if (now() - retainedSince >= CONSUMED_RECEIPT_RETENTION_MS) rmSync(pathFor(key), { force: true });
             continue;
           }
           if (!receipt.result) {
+            if (receipt.retirement && deps.retire) {
+              const winner = deps.snapshot?.(receipt.input)?.result;
+              if (winner?.kind === 'answered') {
+                write(key, withCard({ ...receipt, result: winner, settledAt: now() }));
+                deps.releaseHandoff?.(receipt.input);
+                continue;
+              }
+              if (deps.canRetire?.(receipt)) {
+                const result = deps.retire(receipt.input, receipt.retirement.reason);
+                if (result) {
+                  write(key, withCard({ ...receipt, result, settledAt: now() }));
+                  deps.releaseHandoff?.(receipt.input);
+                } else if (deps.hasHandoff && !deps.hasHandoff(receipt.input)) {
+                  // Nothing can answer a card the broker no longer knows: the
+                  // decision is void, same as wait()'s missing-handoff verdict.
+                  write(key, { ...receipt, result: handoffMissing(), settledAt: now() });
+                } else {
+                  deps.onError(new Error(`explicit Ask retirement pending: broker handoff unavailable (${key.slice(0, 12)})`));
+                }
+                continue;
+              }
+              // No longer bound (session closed or rebound): an unfinished
+              // retirement must not keep the card live forever. Fall through
+              // to the ordinary no-deadline invalidation below.
+            }
+            if (receipt.input.timeoutMs === 0 && deps.shouldInvalidate?.(receipt) && deps.invalidate) {
+              deps.invalidate(receipt.input, 'explicit Ask session closed or binding changed');
+              void wait(receipt.input).catch(deps.onError);
+              continue;
+            }
             // Restore only existing, still-bound sessions. Never create a session
             // or revive a closed business task to recover an interaction.
             if (deps.canResume(receipt) && !running.has(key)) {
@@ -118,16 +282,43 @@ export function createExplicitAskContinuation(deps: {
           // binding. Keep the receipt for the original caller to reconnect;
           // never continue a document task in an unbound turn.
           if (receipt.input.deliveryTarget || receipt.input.chatId.startsWith('doc:')) continue;
-          if (await deps.dispatch(receipt, `ask-${key}`)) {
-            // Re-read: a normal claimant may have acknowledged during dispatch.
-            write(key, { ...read(key)!, delivered: true });
-          }
+          dispatching.add(key);
+          try {
+            if (await deps.dispatch(receipt, `ask-${key}`)) {
+              // Re-read: a normal claimant may have acknowledged during dispatch.
+              write(key, { ...read(key)!, delivered: true });
+            }
+          } finally { dispatching.delete(key); }
         } catch (error) { deps.onError(error); }
       }
     } catch (error) { deps.onError(error); }
     finally { sweeping = false; }
   }
-  return { wait, acknowledge, sweep };
+  return { wait, acknowledge, sweep, describe, inspect, retire };
+}
+
+/** Whether the live session still owns an explicit Ask's routing binding. The
+ * Ask is bound with root=null in a chat-scope session, whose record stores its
+ * chat id as rootMessageId; comparing that raw field would treat every
+ * chat-scope Ask as rebound. Recovery and no-deadline invalidation share this. */
+export function explicitAskSessionBound(
+  ask: Pick<CreateAskInput, 'larkAppId' | 'chatId' | 'rootMessageId'>,
+  session: { larkAppId: string; chatId: string; session: { scope?: 'thread' | 'chat'; rootMessageId: string } } | undefined,
+): boolean {
+  return !!session && session.larkAppId === ask.larkAppId && session.chatId === ask.chatId
+    && (session.session.scope === 'chat' ? null : session.session.rootMessageId) === ask.rootMessageId;
+}
+
+/** Retirement authority (live control and the durable sweep alike): the
+ * receipt carries a daemon-observed origin and its exact routing binding is
+ * still the live session's. Worker generation and execution ownership are
+ * deliberately not required — retiring only invalidates the decision, and a
+ * daemon restart or refork always replaces both. */
+export function explicitAskRetirementBound(
+  receipt: ExplicitAskReceipt,
+  session: Parameters<typeof explicitAskSessionBound>[1],
+): boolean {
+  return !!receipt.origin && explicitAskSessionBound(receipt.input, session);
 }
 
 /** The daemon must compare against its live worker authority, not CLI stdout. */

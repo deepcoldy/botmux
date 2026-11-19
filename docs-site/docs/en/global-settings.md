@@ -24,6 +24,7 @@ You can also edit `~/.botmux/config.json` directly. Every item below lists its J
 | Prefix group names created by `/g` | General → Group Creation | `groupNamePrefix` | None |
 | Hide worktrees in the repo picker | General → Repo Picker | `repoPickerMode` | Repos + worktrees |
 | Put new worktrees on a larger disk | General → Worktrees | `worktreeRoot` | Next to the main repo |
+| Let Claude carry on by itself after a transient model-service failure | General → Auto-continue after provider failures | `providerRecovery` | Off |
 | Download new versions through a proxy | System & Maintenance → Auto Maintenance → GitHub download proxy | `httpProxy` | Not set |
 | Skip pasting the callback URL after `/login` | General → Access → OAuth callback base URL | `oauthRedirectBase` | Not set |
 
@@ -65,6 +66,8 @@ Lots of open sessions eat memory. Want sessions nobody has used for a while to c
 | Idle threshold (`olderThanHours`) | How old the last message must be: 24 hours / 72 hours / 7 days | 7 days (168) |
 | Check interval (`intervalMinutes`) | Minutes between checks, minimum 5 | 60 |
 | Archive Codex threads on close / cleanup (`archiveCodex`) | Archive the matching Codex thread when a session closes (manual close or idle cleanup), restore it on reopen | Off |
+
+Override this switch for one Bot under Dashboard “Bot Config → Sessions → Codex native archive” (follow global, on or off; shown for Codex bots only), or with `/config set archiveCodex on` or `/config set archiveCodex off`; `/config unset archiveCodex` restores inheritance. The corresponding Bot entry in `bots.json` also accepts `"archiveCodex": true` or `false`. Command changes apply to subsequent closes and cleanup immediately; an in-progress close keeps its initial value. Previously archived sessions can still be restored.
 
 It uses **the same rules** as the manual "Clean idle" button on the Session Control page, just unattended. Only truly idle sessions are closed: sessions that are running, locked, waiting on a repo pick, or carrying an alert for you are left alone.
 
@@ -139,13 +142,33 @@ An invalid timezone name is skipped and the next level is used. The auto-update 
 - **Repo picker card mode** (General → Repo Picker, `repoPickerMode`): `all` (default, repos plus their worktrees) or `repos` (main repos only). With `repos`, `/repo <worktree path>` still takes you into a worktree.
 - **Worktree directory** (General → Worktrees, `worktreeRoot`): botmux creates new worktrees under this directory, e.g. `/data00/worktrees`. Useful when the system disk is small and a larger data disk is mounted. Worktrees are laid out under it by the main repo's own path: a worktree of `/root/iserver/botmux` becomes `/data00/worktrees/root/iserver/botmux-wt-…`, so repos with the same name in different places don't collide. Use an absolute path (may start with `~/`) to an existing, writable directory. Only affects worktrees created from then on; existing ones stay where they are and keep working, also if you change the directory again later. If the directory later goes missing or stops being writable (e.g. the data disk isn't mounted, or was remounted read-only), new worktrees are created next to the main repo instead and a warning is logged. Clear it and save to go back to creating them next to the main repo; takes effect within about 2 seconds.
 
+## Auto-continue after provider failures {#provider-recovery}
+
+Whether Botmux has a Claude Code turn resume from where it stopped after a transient model-service failure (5xx, a connection dropped mid-response, no upstream account available on the gateway…). The `config.json` field is `providerRecovery`; a bot's own setting under Bot settings → Sessions → Auto-continue after provider failures (`providerRecovery` in bots.json) takes precedence field by field. Claude Code only; Codex capacity recovery uses `codexCapacityRecovery`.
+
+**Off by default.** Then nothing is continued automatically: the failure card appears in the original topic (marked "not continued", with a Retry button), and when the provider's error named a recovery time the card shows "Provider expects recovery at HH:MM".
+
+| Option | Meaning | Default |
+|---|---|---|
+| Auto-continue (`enabled`) | Master switch | Off |
+| Keep trying for (`maxWaitMinutes`) | Counted from the last successful request; past it, automatic continuation stops and the failure card explains why. 1–240 minutes | Follows the prompt cache: 55 with a 1-hour cache, otherwise 15 |
+
+When on:
+
+- If the provider's error names its earliest availability (e.g. "available at 2026-11-13T11:10:16Z") or a `Retry-After`, the turn continues then, plus a few seconds of jitter; otherwise after 2 s, 8 s, 30 s, 1 min, 2 min, 5 min, then every 5 minutes. A continuation that makes progress and fails again restarts the short intervals.
+- If the provider's time lies beyond the limit, it stops right away and the failure card names that time.
+- A wait longer than a minute is announced once in the topic ("upstream unavailable, auto-continuing at HH:MM") and shown on the status card; a new message, or a turn completed in the Web Terminal, cancels it.
+- It never types into a CLI someone is using; it waits until the CLI is free, and if it is still in use at the limit it stops with the failure card.
+- Why the default follows the prompt cache: with a 1-hour cache ("Claude prompt cache" set to 1 hour, and the gateway really serving 1-hour caching), resuming within 55 minutes reads the cache and is cheapest; a 5-minute cache expires within minutes, so the limit only decides when to hand back to a human, and the default is shorter.
+- Switching it off drops a pending continuation: the expected time disappears from the status card right away, and at the scheduled time it settles with an "auto-continue is off" card.
+
 ## Network and access
 
 | Setting | Location | Purpose |
 |---|---|---|
 | GitHub download proxy (`httpProxy`) | System & Maintenance → Auto Maintenance | HTTP proxy for GitHub downloads when the standalone binary updates itself, e.g. `http://127.0.0.1:7890`. If empty, `HTTPS_PROXY` / `HTTP_PROXY` are used, otherwise it connects directly. npm / pnpm / Bun installs use their own proxy settings |
 | OAuth callback base URL (`oauthRedirectBase`) | General → Access | After a Feishu authorization (e.g. `/login`), Feishu redirects here and the Dashboard finishes it, so you don't paste the callback URL by hand. Useful when botmux doesn't run on your own computer. Enter scheme + host + port only, e.g. `http://10.1.2.3:7891`. After changing it, open any bot's "Session-group tag" row and click "Fix Open Platform callback", otherwise Feishu returns error 20029 |
-| Remote terminal access (`remoteAccess`) | General → Access | Off by default. Shown only when this machine is bound to the central platform. When on, session terminals, card terminal buttons, and webhook URLs use platform links; off uses local links |
+| Remote terminal access (`remoteAccess`) | General → Access | Off by default. Shown only when this machine is bound to the [central platform](/en/platform). When on, session terminals, card terminal buttons, and webhook URLs use platform links; off uses local links |
 
 For the web terminal itself, see [Web Terminal](/en/web-terminal).
 

@@ -76,6 +76,7 @@ export interface PersistedAsk {
   customAnswers?: ReadonlyArray<string | null>;
   customRevision?: number;
   createdAt: number;
+  /** Absolute epoch milliseconds; paired with timeoutMs=0 for no deadline. */
   deadlineAt: number;
   /** Original relative timeout. Host-owned asks defer this clock until the
    *  interaction card is confirmed delivered; ordinary CLI asks start it at
@@ -90,6 +91,7 @@ export interface PersistedAsk {
    *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
    *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
+  cardDeliveredAt?: number;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   /** Accumulated per-question selections (checkbox state), so a restart mid-
    *  multi-select keeps the boxes the user already ticked. */
@@ -211,6 +213,11 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         const parsed = raw as unknown as PersistedAsk;
         if (!parsed || parsed.v !== 2 || !parsed.askKey || !parsed.requestId || !Array.isArray(parsed.questions)) {
           if (parsed?.askKey) decisions.remove(parsed.askKey);
+          continue;
+        }
+        if ((parsed.timeoutMs === 0 || parsed.deadlineAt === 0)
+          && !(parsed.originKind === 'host_explicit' && parsed.timeoutMs === 0 && parsed.deadlineAt === 0)) {
+          decisions.remove(parsed.askKey);
           continue;
         }
         // Reap rules:

@@ -150,7 +150,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   {
     key: 'ai.routing.no_local_addresses', block: 'routing_system', stage: 'new', kind: 'editable',
     label: '飞书回复：用户可访问的地址',
-    gateLabel: '完整规则，每个会话一次：系统提示，或无系统提示 CLI 的首轮 Shell 提示',
+    gateLabel: '仅 bot 配置开启「隐藏开发机地址」时注入（默认关）；完整规则每个会话一次：系统提示，或无系统提示 CLI 的首轮 Shell 提示',
   },
   {
     key: 'ai.routing.intro_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
@@ -255,6 +255,10 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   {
     key: 'ai.credentials.on_auth_link', block: 'credentials', stage: 'new', kind: 'editable',
     label: '凭证：stderr 已附授权链接时', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
+  },
+  {
+    key: 'ai.credentials.turn_speakers', block: 'credentials', stage: 'followup', kind: 'placeholder', placeholders: ['speakers'],
+    label: '凭证：本轮多人发言时按人选择身份（BOTMUX_AS）', gateLabel: '仅 trigger-user 鉴权会话且本轮有多位发言人',
   },
   {
     key: 'ai.credentials.on_missing_scope', block: 'credentials', stage: 'new', kind: 'editable',
@@ -378,7 +382,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   {
     key: 'ai.followup.no_local_addresses', block: 'followup', stage: 'followup', kind: 'editable',
     label: '飞书回复：用户可访问的地址（每轮一句）',
-    gateLabel: '随每轮飞书格式提示；完整规则在会话开始阶段',
+    gateLabel: '仅 bot 配置开启「隐藏开发机地址」时随每轮飞书格式提示（默认关）；完整规则在会话开始阶段',
   },
   {
     key: 'ai.followup.reminder_hook', block: 'followup', stage: 'followup', kind: 'editable',
@@ -407,12 +411,20 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   {
     key: 'ai.send.after_success_hint', block: 'send_feedback', stage: 'send', kind: 'editable',
-    label: 'send 成功后的常规回显',
+    label: '最终答复发送成功回显',
+  },
+  {
+    key: 'ai.send.after_success_progress', block: 'send_feedback', stage: 'send', kind: 'editable',
+    label: '进度发送成功回显（未标记 final）',
+  },
+  {
+    key: 'ai.send.after_success_auxiliary', block: 'send_feedback', stage: 'send', kind: 'editable',
+    label: '补充消息发送成功回显',
   },
   {
     key: 'ai.send.after_success_unified', block: 'send_feedback', stage: 'send', kind: 'editable',
     label: '统一回复卡片：进度已更新回显',
-    gateLabel: '仅本轮发送走统一回复卡片、且未标记 --response-kind final 时',
+    gateLabel: '仅本轮发送走统一回复卡片、且发送类型为 progress 时',
   },
 ];
 

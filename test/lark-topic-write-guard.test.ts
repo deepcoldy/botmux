@@ -1,9 +1,13 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { GROUP_SEND_UUID_REUSE_MS, sendRequestBoundMessage } from '../src/services/request-bound-group-send.js';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   config: { topicUnavailablePolicy: 'stop' as 'stop' | 'legacy', apiOnly: false },
   request: vi.fn(), create: vi.fn(), reply: vi.fn(), patch: vi.fn(), forward: vi.fn(),
-  settings: vi.fn(), content: vi.fn(), element: vi.fn(), convert: vi.fn(), hook: vi.fn(),
+  settings: vi.fn(), content: vi.fn(), element: vi.fn(), cardUpdate: vi.fn(), convert: vi.fn(), hook: vi.fn(),
   reaction: vi.fn(), removeReaction: vi.fn(), pin: vi.fn(), unpin: vi.fn(),
 }));
 vi.mock('../src/bot-registry.js', () => ({
@@ -12,14 +16,14 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotClient: () => ({ request: mocks.request,
     im: { v1: { message: { create: mocks.create, reply: mocks.reply, patch: mocks.patch, forward: mocks.forward },
       messageReaction: { create: mocks.reaction, delete: mocks.removeReaction }, pin: { create: mocks.pin, delete: mocks.unpin } } },
-    cardkit: { v1: { card: { settings: mocks.settings, idConvert: mocks.convert },
+    cardkit: { v1: { card: { settings: mocks.settings, idConvert: mocks.convert, update: mocks.cardUpdate },
       cardElement: { content: mocks.content, patch: mocks.element } } },
   }),
 }));
 vi.mock('../src/services/hook-runner.js', () => ({ emitHookEvent: mocks.hook }));
 import { sendMessage, replyMessage, updateMessage, forwardMessage, urgentMessage,
   updateCardStreamingSettings, updateCardStreamElementContent, patchCardStreamElement,
-  resolveCardKitId, MessageWithdrawnError, addReaction, removeReaction, pinMessage, unpinMessage } from '../src/im/lark/client.js';
+  resolveCardKitId, updateCardJson, MessageWithdrawnError, addReaction, removeReaction, pinMessage, unpinMessage } from '../src/im/lark/client.js';
 import { assertSendTopicsAvailable, TopicSendError, type TopicMessageLookup } from '../src/cli/topic-send-guard.js';
 import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
 
@@ -29,6 +33,7 @@ const operations = [
   ['whole card', () => updateMessage('app', 'om_card', '{}'), () => mocks.patch],
   ['forward', () => forwardMessage('app', 'om_card', 'oc_dest'), () => mocks.forward],
   ['CardKit conversion', () => resolveCardKitId('app', 'om_card'), () => mocks.convert],
+  ['CardKit whole update', () => updateCardJson('app', 'card', 'om_card', '{}', 1, 'one'), () => mocks.cardUpdate],
   ['CardKit settings', () => updateCardStreamingSettings('app', 'card', { messageId: 'om_card', streamingMode: true, sequence: 1, uuid: 'one' }), () => mocks.settings],
   ['CardKit content', () => updateCardStreamElementContent('app', 'card', 'body', 'text', 1, 'one', 'om_card'), () => mocks.content],
   ['CardKit element', () => patchCardStreamElement('app', 'card', 'body', { content: 'text' }, 1, 'one', 'om_card'), () => mocks.element],
@@ -45,7 +50,7 @@ beforeEach(() => {
     return { code: 0, data: { items: [{ message_id: id, deleted: id === 'om_root' && rootDeleted,
       ...(id === 'om_card' ? { root_id: 'om_root' } : {}) }] } };
   });
-  for (const mock of [mocks.create, mocks.reply, mocks.patch, mocks.forward, mocks.settings, mocks.content, mocks.element]) {
+  for (const mock of [mocks.create, mocks.reply, mocks.patch, mocks.forward, mocks.settings, mocks.content, mocks.element, mocks.cardUpdate]) {
     mock.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_sent' } });
   }
   mocks.convert.mockReset().mockResolvedValue({ code: 0, data: { card_id: 'card' } });
@@ -110,6 +115,30 @@ describe('stop policy at the actual Lark write boundary', () => {
     expect(beforeWrite).toHaveBeenCalledTimes(2);
     expect(mocks.hook).not.toHaveBeenCalled();
   });
+  it('preserves an unconfirmed reply when the root is withdrawn before the gate retries', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'topic-retry-'));
+    try {
+      let clock = Date.now();
+      mocks.reply.mockImplementationOnce(async () => {
+        rootDeleted = true;
+        throw Object.assign(new Error('lost reply receipt'), { isAxiosError: true });
+      });
+      const submit = () => sendRequestBoundMessage({
+        larkAppId: 'app', storePath: join(dir, 'posts.json'), now: () => clock,
+        send: (uuid, beforeWrite, onAttemptStart) =>
+          replyMessage('app', 'om_root', 'answer', 'text', true, uuid, undefined, { beforeWrite, onAttemptStart }),
+      }, { chatId: 'oc_chat', rootMessageId: 'om_root' }, 'topic_retry', 'answer');
+      expect(await submit()).toMatchObject({ error: 'outcome_unknown', retryable: false });
+      expect(mocks.request).toHaveBeenCalledTimes(2);
+      rootDeleted = false;
+      clock += GROUP_SEND_UUID_REUSE_MS + 1;
+      expect(await submit()).toMatchObject({ error: 'outcome_unknown', retryable: false });
+      expect(mocks.reply).toHaveBeenCalledOnce();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('checks authority after the awaited destination lookup before writing a reply', async () => {
     let authorized = true;
     mocks.request.mockImplementationOnce(async ({ url }) => {
@@ -175,6 +204,16 @@ describe('stop policy at the actual Lark write boundary', () => {
     const error = await replyMessage('app', 'om_card', 'answer').catch(value => value);
     expect(error).toBeInstanceOf(TopicSendError); expect(error).not.toBeInstanceOf(MessageWithdrawnError);
     expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.hook).not.toHaveBeenCalled();
+  });
+  it('reports a withdrawn whole-card update as withdrawn under both topic policies', async () => {
+    mocks.cardUpdate.mockResolvedValue({ code: 230011, msg: 'withdrawn' });
+    await expect(updateCardJson('app', 'card', 'om_card', '{}', 1, 'one')).rejects.toMatchObject({ code: 'TOPIC_SEND_BLOCKED' });
+    mocks.config.topicUnavailablePolicy = 'legacy';
+    mocks.cardUpdate.mockRejectedValue({ isAxiosError: true, response: { status: 400, data: { code: 230011 } } });
+    await expect(updateCardJson('app', 'card', 'om_card', '{}', 2, 'two')).rejects.toBeInstanceOf(MessageWithdrawnError);
+    mocks.cardUpdate.mockResolvedValue({ code: 99991400, msg: 'busy' });
+    const other = await updateCardJson('app', 'card', 'om_card', '{}', 3, 'three').catch(value => value);
+    expect(other).not.toBeInstanceOf(MessageWithdrawnError); expect(other).not.toBeInstanceOf(TopicSendError);
   });
   it('does not pin a surviving card beneath an unavailable root', async () => {
     rootDeleted = true;

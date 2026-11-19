@@ -17,6 +17,7 @@ import {
   waitForStreamingCard,
   waitForCardStatus,
   showStreamingOutput,
+  reopenTopic,
   waitForModelTextReply,
   scrollThreadToBottom,
   openChat,
@@ -52,7 +53,7 @@ export function registerMidsceneSuites(): void {
       );
 
       // --- Step 2: Turn the output on from 更多操作 ---
-      await showStreamingOutput(agent, page);
+      await showStreamingOutput(agent, page, { reopen: reopenTopic(agent, page, msg) });
 
       // Check for ANSI escape codes specifically. CLI output may contain JSON
       // fragments from tool calls, which are expected terminal output.

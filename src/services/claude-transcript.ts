@@ -19,6 +19,8 @@ import type { ModelFallbackState } from '../types.js';
 // cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
 // dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
+// provider-retry-hint 同样零依赖（只用语言内建）。
+import { parseProviderRetryAtMs } from './provider-retry-hint.js';
 
 /** Read the session identity published by one live Claude Code process. */
 export function readClaudeSessionMeta(
@@ -542,7 +544,15 @@ export class ClaudeModelFallbackTracker {
  * retryable only when its bounded text matches a verified transient signature. */
 export type ClaudeTerminalOutcome =
   | { status: 'completed' }
-  | { status: 'failed'; errorCode: string; retryable: boolean }
+  | {
+    status: 'failed';
+    errorCode: string;
+    retryable: boolean;
+    /** Retryable failures only: when the provider's own error text says the
+     *  request may be retried (gateway "available at", Retry-After, "try
+     *  again in 30s"). Absent when it names no usable time. */
+    retryAtMs?: number;
+  }
   | { status: 'ambiguous'; errorCode: string; retryable: false }
   | { status: 'rate_limited'; errorCode: 'provider_rate_limited'; retryable: false };
 
@@ -552,6 +562,16 @@ function normalizedApiErrorCode(ev: TranscriptEvent): string {
 
 function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
   return pattern.test(apiErrorMessageText(ev));
+}
+
+/** Attach the provider's own "retry at" to a retryable failure. Relative hints
+ *  are anchored at the record's timestamp, not at whenever it is read. */
+function withProviderRetryHint(
+  ev: TranscriptEvent,
+  outcome: { status: 'failed'; errorCode: string; retryable: true },
+): Extract<ClaudeTerminalOutcome, { status: 'failed' }> {
+  const retryAtMs = parseProviderRetryAtMs(apiErrorMessageText(ev), eventTimeMs(ev) ?? Date.now());
+  return retryAtMs === undefined ? outcome : { ...outcome, retryAtMs };
 }
 
 /** Model placeholder Claude Code writes on assistant records no model produced. */
@@ -623,12 +643,12 @@ export function classifyClaudeTerminalEvent(
       return { status: 'failed', errorCode: 'provider_cancelled', retryable: false };
     }
     if (code === 'unknown' && hasApiErrorSignature(ev, /unexpected\s+eof/i)) {
-      return { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true };
+      return withProviderRetryHint(ev, { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true });
     }
     if (code === 'server_error'
       || (typeof status === 'number' && status >= 500 && status <= 599)
       || hasApiErrorSignature(ev, /(?:connection\s+(?:reset|lost|closed)|econnreset|http2:\s*client\s+connection\s+lost|closed\s+mid-response|internalserverexception|server\s+unavailable|temporarily\s+unavailable|overload(?:ed)?)/i)) {
-      return { status: 'failed', errorCode: 'provider_server_error', retryable: true };
+      return withProviderRetryHint(ev, { status: 'failed', errorCode: 'provider_server_error', retryable: true });
     }
     return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
   }
@@ -856,6 +876,8 @@ export interface BackgroundTaskLaunch {
   kind: BackgroundTaskKind;
   /** Hard end Claude Code itself enforces (non-persistent Monitor timeout). */
   expiresAtMs?: number;
+  /** A stopped agent started again (SendMessage), under its original id. */
+  resumed?: true;
 }
 
 export function eventTimeMs(ev: TranscriptEvent): number | undefined {
@@ -871,7 +893,12 @@ export function eventTimeMs(ev: TranscriptEvent): number | undefined {
  *    `{ backgroundTaskId }`;
  *  - Monitor → `{ taskId, timeoutMs, persistent }`. A non-persistent Monitor
  *    expires after `timeoutMs` even if no end record is read, so it carries
- *    that deadline.
+ *    that deadline;
+ *  - SendMessage to an agent that had stopped (2.1.322) →
+ *    `{ success:true, message:'Resuming agent …', resumedAgentId, revivedAgentId }`:
+ *    the agent runs again in the background under its original id, and its
+ *    next stop is reported the same way. A message to an agent that is still
+ *    running (`Message queued for delivery …`) changes nothing.
  *  The id is the one the task's `<task-notification>` later reports as `<task-id>`. */
 export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunch[] {
   if (!ev || ev.isSidechain === true) return [];
@@ -889,6 +916,11 @@ export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunc
     const at = eventTimeMs(ev);
     const expiresAtMs = !r.persistent && r.timeoutMs > 0 && at !== undefined ? at + r.timeoutMs : undefined;
     return [{ taskId: r.taskId, kind: 'monitor', ...(expiresAtMs !== undefined ? { expiresAtMs } : {}) }];
+  }
+  const resumedAgentId = typeof r.resumedAgentId === 'string' && r.resumedAgentId ? r.resumedAgentId
+    : typeof r.revivedAgentId === 'string' && r.revivedAgentId ? r.revivedAgentId : undefined;
+  if (r.success !== false && resumedAgentId) {
+    return [{ taskId: resumedAgentId, kind: 'agent', resumed: true }];
   }
   return [];
 }
@@ -972,6 +1004,9 @@ interface TrackedBackgroundTask {
   expiresAtMs?: number;
   /** Value of `promptSeq` when launched — see {@link BackgroundTaskTracker.pendingTurnAgents}. */
   promptSeq: number;
+  /** When this run started (its launch or resume was written). A stop written
+   *  before it belongs to an earlier run of the same agent. */
+  sinceMs?: number;
 }
 
 /** Live set of background work (Agent / Bash / Monitor) the main thread has
@@ -998,9 +1033,11 @@ interface TrackedBackgroundTask {
  *  so a duplicate notification or a re-drained launch cannot double-count. */
 export class BackgroundTaskTracker {
   private readonly live = new Map<string, TrackedBackgroundTask>();
-  /** Ids already seen stopping. A rotation re-drain can re-read a launch after
-   *  its stop (/clear writes the stop into the NEW file); it must not revive it. */
-  private readonly settled = new Set<string>();
+  /** Ids already seen stopping, with the stop's time when known. A rotation
+   *  re-drain can re-read a launch after its stop (/clear writes the stop into
+   *  the NEW file); it must not revive it. Only a resume written after the stop
+   *  does. */
+  private readonly settled = new Map<string, number | undefined>();
   /** tool_use_id → agentId, so a dispatch seen before its ack can be paired. */
   private readonly ackByToolUse = new Map<string, string>();
   /** Dispatch tool_use ids awaiting their launch-ack (async not yet confirmed). */
@@ -1021,7 +1058,7 @@ export class BackgroundTaskTracker {
     }
     const atMs = eventTimeMs(ev);
     for (const launch of backgroundTaskLaunches(ev)) {
-      this.launch(launch.taskId, launch.kind, { atMs, expiresAtMs: launch.expiresAtMs });
+      this.launch(launch.taskId, launch.kind, { atMs, expiresAtMs: launch.expiresAtMs, resumed: launch.resumed });
     }
     // Builds that predate the structured `toolUseResult` are still recognised
     // from the dispatch tool_use + launch-ack text pair.
@@ -1034,24 +1071,45 @@ export class BackgroundTaskTracker {
       this.ackByToolUse.set(ack.toolUseId, ack.agentId);
       if (this.awaitingAck.delete(ack.toolUseId)) this.launch(ack.agentId, 'agent', { atMs });
     }
-    for (const id of backgroundTaskSettledIds(ev)) this.settle(id);
+    for (const id of backgroundTaskSettledIds(ev)) this.settle(id, atMs);
   }
 
   /** Record a running task. `atMs` is when the launch was written; one older
-   *  than the current CLI process (see {@link reset}) is ignored. */
-  launch(taskId: string, kind: BackgroundTaskKind, opts: { atMs?: number; expiresAtMs?: number } = {}): void {
+   *  than the current CLI process (see {@link reset}) is ignored. A `resumed`
+   *  agent runs again after it stopped: it revives a settled id, but only when
+   *  written after that stop (a re-drained resume is older than the next stop). */
+  launch(taskId: string, kind: BackgroundTaskKind, opts: { atMs?: number; expiresAtMs?: number; resumed?: boolean } = {}): void {
     if (opts.atMs !== undefined && opts.atMs < this.liveSinceMs) return;
-    if (this.settled.has(taskId) || this.live.has(taskId)) return;
+    const running = this.live.get(taskId);
+    if (running) {
+      // Resumed again before its previous stop was read: this run is newer.
+      if (opts.resumed && opts.atMs !== undefined && (running.sinceMs === undefined || opts.atMs > running.sinceMs)) {
+        running.sinceMs = opts.atMs;
+      }
+      return;
+    }
+    if (this.settled.has(taskId)) {
+      const stoppedAtMs = this.settled.get(taskId);
+      if (!opts.resumed || opts.atMs === undefined || stoppedAtMs === undefined || opts.atMs <= stoppedAtMs) return;
+      this.settled.delete(taskId);
+    }
     this.live.set(taskId, {
       kind,
       promptSeq: this.promptSeq,
       ...(opts.expiresAtMs !== undefined ? { expiresAtMs: opts.expiresAtMs } : {}),
+      ...(opts.atMs !== undefined ? { sinceMs: opts.atMs } : {}),
     });
   }
 
-  settle(taskId: string): void {
-    this.live.delete(taskId);
-    this.settled.add(taskId);
+  /** Record a task's stop, written at `atMs` when known. A stop written before
+   *  the current run started ends an earlier run: an agent that finished while
+   *  the main turn was still busy has that notice delivered at the next tool
+   *  round, after the SendMessage that resumed it, under the earlier time. */
+  settle(taskId: string, atMs?: number): void {
+    const running = this.live.get(taskId);
+    if (!(running?.sinceMs !== undefined && atMs !== undefined && atMs < running.sinceMs)) this.live.delete(taskId);
+    const previous = this.settled.get(taskId);
+    this.settled.set(taskId, previous !== undefined && (atMs === undefined || previous > atMs) ? previous : atMs);
   }
 
   /** Background tasks still running at `nowMs`. */

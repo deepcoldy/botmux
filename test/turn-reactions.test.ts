@@ -1,3 +1,4 @@
+import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 /**
  * Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming card disabled):
  *   - noteTurnReceived(ds, msgId): react 冲! (GoGoGo) the instant a user message
@@ -58,6 +59,7 @@ import {
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { noteDiagnosticFinal } from '../src/core/turn-outcome.js';
 
 const APP = 'reaction_app';
 
@@ -411,6 +413,60 @@ describe('two-phase turn reactions', () => {
     expect(ds.pendingAckReactions).toEqual([]);
   });
 
+  it.each(['traex', 'codex', 'pi', 'grok'] as const)('%s waits for delivery outcome instead of screen idle', async cliId => {
+    registerWith(true);
+    getBot(APP).config.cliId = cliId;
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_empty');
+    mocks.addReaction.mockClear();
+    await finishTurnReactions(ds);
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toHaveLength(1);
+    await finishTurnReactions(ds, { turnId: 'om_empty', delivered: false, owns: () => true });
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_empty', 'rid_om_empty');
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toEqual([]);
+  });
+
+  it('a delivered terminal settles only its own turn, preserving queued acknowledgements', async () => {
+    registerWith(true);
+    getBot(APP).config.cliId = 'traex';
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_first');
+    await noteTurnReceived(ds, 'om_next');
+    mocks.addReaction.mockClear();
+    await finishTurnReactions(ds, { turnId: 'om_first', delivered: true, owns: () => true });
+    expect(mocks.addReaction.mock.calls).toEqual([[APP, 'om_first', 'DONE']]);
+    expect(ds.pendingAckReactions?.map(a => a.messageId)).toEqual(['om_next']);
+    await finishTurnReactions(ds, { turnId: 'om_first', delivered: true, owns: () => true });
+    expect(mocks.addReaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('binds substitute trigger reactions to the actual execution turn', async () => {
+    registerWith(true);
+    getBot(APP).config.cliId = 'traex';
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_trigger', undefined, undefined, 'om_actual_turn');
+    mocks.addReaction.mockClear();
+    await finishTurnReactions(ds, { turnId: 'om_trigger', delivered: true, owns: () => true });
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    await finishTurnReactions(ds, { turnId: 'om_actual_turn', delivered: true, owns: () => true });
+    expect(mocks.addReaction.mock.calls).toEqual([[APP, 'om_trigger', 'DONE']]);
+  });
+
+  it('does not publish success when worker ownership changes during received-reaction removal', async () => {
+    registerWith(true);
+    getBot(APP).config.cliId = 'traex';
+    const ds = makeDs();
+    await noteTurnReceived(ds, 'om_a');
+    mocks.addReaction.mockClear();
+    let owns = true;
+    mocks.removeReaction.mockImplementationOnce(async () => { owns = false; });
+    await finishTurnReactions(ds, { turnId: 'om_a', delivered: true, owns: () => owns });
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+  });
+
   it('finishTurnReactions with no pending acks is a no-op', async () => {
     const ds = makeDs();
     await finishTurnReactions(ds);
@@ -487,6 +543,58 @@ describe('turn reaction screen_update behavioral gate', () => {
     });
   });
 
+  it('older delivered turn still gets DONE after newer terminal', async () => {
+    getBot(APP).config.cliId = 'traex';
+    const session = sessionStore.createSession('oc_x', 'om_root', 'overlap', 'group', 'chat');
+    const worker = makeFakeWorker();
+    const ds = makeDs({ session, worker, workerPort: 9999, pendingAckReactions: [
+      { messageId: 'om_old', reactionId: 'rid_old' },
+      { messageId: 'om_new', reactionId: 'rid_new' },
+    ] });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const release = beginFinalOutputDelivery(ds, 'om_old');
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_old', status: 'completed' });
+    await flush();
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_new', status: 'completed' });
+    await flush();
+    expect(ds.session.lastTurn?.turnId).toBe('om_new');
+    ds.turnTerminalCarriers = new Map([['om_old', { messageId: 'om_answer', kind: 'non_patchable', responseKind: 'final' }]]);
+    release();
+    await flush();
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_old', 'rid_old');
+    expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_old', 'DONE');
+  });
+
+  it('delivered partial output never becomes DONE', async () => {
+    getBot(APP).config.cliId = 'traex';
+    const session = sessionStore.createSession('oc_x', 'om_root', 'cancel', 'group', 'chat');
+    const worker = makeFakeWorker();
+    const ds = makeDs({ session, worker, workerPort: 9999, pendingAckReactions: [{ messageId: 'om_stop', reactionId: 'rid_stop' }],
+      turnTerminalCarriers: new Map([['om_stop', { messageId: 'om_partial', kind: 'non_patchable', responseKind: 'final' }]]) });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_stop', status: 'cancelled' });
+    await flush();
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_stop', 'rid_stop');
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+  });
+
+  it('old completion after worker swap cannot settle reactions', async () => {
+    getBot(APP).config.cliId = 'traex';
+    const session = sessionStore.createSession('oc_x', 'om_root', 'generation', 'group', 'chat');
+    const worker = makeFakeWorker();
+    const ds = makeDs({ session, worker, workerPort: 9999, pendingAckReactions: [{ messageId: 'om_old', reactionId: 'rid_old' }] });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const release = beginFinalOutputDelivery(ds, 'om_old');
+    worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: 'om_old', status: 'completed' });
+    await flush();
+    ds.worker = makeFakeWorker();
+    release();
+    await flush();
+    expect(mocks.removeReaction).not.toHaveBeenCalled();
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    expect(ds.pendingAckReactions).toHaveLength(1);
+  });
+
   it('undefined→idle alone does not DONE pending GoGoGo (gate)', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs({
@@ -524,6 +632,29 @@ describe('turn reaction screen_update behavioral gate', () => {
     expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_a', 'rid_om_a');
     expect(mocks.addReaction).toHaveBeenCalledWith(APP, 'om_a', 'DONE');
     expect(ds.pendingAckReactions).toEqual([]);
+  });
+
+  it.each(['progress', 'diagnostic', 'answer', 'legacy', 'silent'] as const)('structured terminal classifies %s delivery before finishing reactions', async kind => {
+    getBot(APP).config.cliId = 'traex';
+    const session = sessionStore.createSession('oc_x', 'om_root', 'empty delivery', 'group', 'chat');
+    const worker = makeFakeWorker();
+    const ds = makeDs({ session, worker, workerPort: 9999, lastScreenStatus: 'working',
+      pendingAckReactions: [{ messageId: 'om_empty', reactionId: 'rid_empty' }] });
+    if (kind !== 'silent') ds.turnTerminalCarriers = new Map([['om_empty', {
+      messageId: 'om_reply', kind: 'non_patchable',
+      ...(kind === 'legacy' ? {} : { responseKind: kind === 'progress' ? 'progress' as const : 'final' as const }),
+    }]]);
+    if (kind === 'diagnostic') noteDiagnosticFinal(ds, 'om_empty');
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'screen_update', content: 'ready', status: 'idle', turnId: 'om_empty' });
+    await flush();
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+    worker.emit('message', { type: 'turn_terminal', sessionId: session.sessionId, turnId: 'om_empty', status: 'completed' });
+    await vi.waitFor(() => expect(ds.pendingAckReactions).toEqual([]));
+    const delivered = kind === 'answer' || kind === 'legacy';
+    expect(ds.session.lastTurn?.outcome).toBe(delivered ? 'delivered' : 'no_output');
+    expect(mocks.removeReaction).toHaveBeenCalledWith(APP, 'om_empty', 'rid_empty');
+    expect(mocks.addReaction.mock.calls).toEqual(delivered ? [[APP, 'om_empty', 'DONE']] : []);
   });
 
   it('working→limited does NOT DONE (rate limit is a blocked turn, not completion)', async () => {

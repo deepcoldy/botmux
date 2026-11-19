@@ -15,6 +15,7 @@ import {
 import { useT } from './react-hooks.js';
 import { normalizeMessageListenerReplyMode } from '../../services/message-listener-reply-policy.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
+import { GroupDefaultModelsRow } from './group-default-models.js';
 import { GroupProfileStatus } from './group-profile-status.js';
 import {
   applyRoleProfile,
@@ -25,6 +26,7 @@ import {
   deleteRole,
   entryForBot,
   filterRoleGroups,
+  sortRoleGroups,
   filterRoleProfiles,
   formatListenerPreviewTime,
   hashChatId,
@@ -262,7 +264,7 @@ function RolesPage(props: { tab: RolesTab }) {
   const profileEntryKey = profileEntries.map(entry => entry.larkAppId).sort().join('\u0000');
 
   const filteredGroups = useMemo(
-    () => filterRoleGroups(groups, groupsFilter),
+    () => filterRoleGroups(sortRoleGroups(groups), groupsFilter),
     [groups, groupsFilter],
   );
   const filteredProfiles = useMemo(
@@ -783,6 +785,16 @@ function RolesPage(props: { tab: RolesTab }) {
                   <span className="roles-editor-inject-hint">{tr('roles.privateReplyNoticeHint')}</span>
                 </div>
               </div>
+              {selectedBot && <section className="roles-editor-models" aria-label="群级模型与思考强度">
+                <GroupDefaultModelsRow
+                  key={`${selectedGroupId}:${selectedBotId}`}
+                  chatId={selectedGroupId} appId={selectedBotId} botName={selectedBot.botName}
+                  cliId={selectedBot.agentCliId} botModel={selectedBot.agentModel}
+                  botEffort={selectedBot.agentReasoningEffort} models={selectedBot.defaultModels}
+                  disabled={!selectedBot.inChat} onSaved={refreshGroups}
+                />
+                <small>仅对该群新建话题生效；留空继承 Agent 配置。</small>
+              </section>}
               <textarea
                 id="roles-editor-textarea"
                 placeholder={tr('roles.editorPlaceholder')}

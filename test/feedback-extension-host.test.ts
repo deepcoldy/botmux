@@ -73,6 +73,29 @@ async function fixture() {
 }
 
 describe('feedback extension host callback', () => {
+  it('takes action context from the frozen surface, never the callback or a later question', async () => {
+    const data = await fixture();
+    const binding = data.extensions.surface('app', 'surface')!;
+    const context = { kind: 'classification', category: 42 };
+    data.extensions.bindSurface('app', 'native-surface', { ...binding, context });
+    data.extensions.bindSubject('app', 'session', 'later-turn', {
+      sourceMessageId: 'other-question', answerKind: 'substantive', context: { category: 99 },
+    });
+    const callback = data.callback('feedback_custom_action', { action_id: 'help' });
+    callback.context.open_message_id = 'native-surface';
+    (callback.action.value as any).context = { category: 999 };
+    await handleFeedbackExtensionCard(callback, 'app', data.directory);
+    const jobId = createHash('sha256').update(JSON.stringify(['app', 'chat', 'question', 'help'])).digest('hex');
+    expect((data.extensions.job(jobId)?.payload.event as any).context).toEqual(context);
+    await handleFeedbackExtensionCard(callback, 'app', data.directory);
+    expect((data.extensions.job(jobId)?.payload.event as any).context).toEqual(context);
+  });
+  it('keeps native action context null for a historical card without a binding', async () => {
+    const data = await fixture();
+    await handleFeedbackExtensionCard(data.callback('feedback_custom_action', { action_id: 'help' }), 'app', data.directory);
+    const jobId = createHash('sha256').update(JSON.stringify(['app', 'chat', 'question', 'help'])).digest('hex');
+    expect((data.extensions.job(jobId)?.payload.event as any).context).toBeNull();
+  });
   it('blocks a surface prepared before its counting scope changes at the transport boundary', async () => {
     const data = await fixture();
     const initial = await readFeedbackExtensionConfig(data.directory);

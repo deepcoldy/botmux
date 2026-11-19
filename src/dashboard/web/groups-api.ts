@@ -44,6 +44,8 @@ export interface GroupChat {
   projectCoordinatorAppId?: string;
   projectWorkerAppIds?: string[];
   projectAutoEnrollWorkers?: boolean;
+  /** Group-level import notification switch (`importedSessionPolicy === 'notify'`), default off. */
+  projectImportNotify?: boolean;
   projectProgressCard?: ProjectProgressCardConfig;
   projectRuntime?: ProjectGroupRuntimeSummary;
   memberBots: GroupMemberBot[];
@@ -51,12 +53,14 @@ export interface GroupChat {
 
 export type ProjectProgressCardTemplateId = 'status-dashboard' | 'compact-list';
 export type ProjectProgressCardSectionId = 'goal' | 'blockers' | 'workstreams' | 'milestones';
+export type ProjectProgressCardCompletedDisplay = 'all' | 'collapsed' | 'recent';
 
 export interface ProjectProgressCardConfig {
   schemaVersion: 1;
   templateId: ProjectProgressCardTemplateId;
   sections: ProjectProgressCardSectionId[];
   milestonesExpanded: boolean;
+  completedDisplay?: ProjectProgressCardCompletedDisplay;
 }
 
 export function defaultProjectProgressCardConfig(): ProjectProgressCardConfig {
@@ -89,6 +93,7 @@ export interface GroupCollaborationModeResponse {
     coordinatorAppId?: string;
     workerAppIds?: string[];
     autoEnrollWorkers?: boolean;
+    importedSessionPolicy?: 'ignore' | 'notify';
     progressCard?: ProjectProgressCardConfig;
   };
   project: ProjectGroupRuntimeSummary | null;
@@ -252,12 +257,13 @@ export async function setGroupPinStreamingCard(
 export async function saveGroupCollaborationMode(
   chatId: string,
   input:
-    | { mode: 'standard' }
+    | { mode: 'standard'; importedSessionPolicy?: 'ignore' | 'notify' }
     | {
         mode: 'project';
         coordinatorAppId: string;
         workerAppIds: string[];
         autoEnrollWorkers: boolean;
+        importedSessionPolicy?: 'ignore' | 'notify';
         progressCard: ProjectProgressCardConfig;
       },
 ): Promise<GroupCollaborationModeResponse> {

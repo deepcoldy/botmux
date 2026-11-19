@@ -15,6 +15,7 @@ import { createServer, type Server } from 'node:net';
 import { once } from 'node:events';
 import { buildCredentialOnlySandboxArgs, buildRelayHostArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, coreOnlyPidNamespaceDegradeDecision, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { usePlanOnlyBwrap } from './helpers/plan-only-bwrap.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
 import { protectedMcpHomeDenyPaths, protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
@@ -50,6 +51,8 @@ describe('prepareDirectSandbox platform gate', () => {
 });
 
 describe('prepareDirectSandbox protected egress socket mount', () => {
+  usePlanOnlyBwrap();
+
   async function listen(path: string): Promise<Server> {
     const server = createServer();
     server.listen(path);
@@ -464,6 +467,8 @@ describe('coreOnlyPidNamespaceDegrade gate (credential-safety)', () => {
 // tmux pipe-pane fails). prepareDirectSandbox must realpath the bin so the exec
 // target lands on a bound path.
 describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', () => {
+  usePlanOnlyBwrap();
+
   it('replaces a symlinked cli bin path with its realpath in the bwrap argv', () => {
     if (process.platform !== 'linux') return; // bwrap path only built on linux
     const dir = mkdtempSync(join(tmpdir(), 'sbx-binlink-'));
@@ -472,15 +477,14 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
     writeFileSync(realBin, '#!/bin/sh\ntrue\n', { mode: 0o755 });
     const linkBin = join(dir, 'linked-cli');
     symlinkSync(realBin, linkBin);
-    const r = prepareDirectSandbox({
+    const plan = prepareDirectSandbox({
       sessionId: 'binlink', dataDir: tmp(),
       policy: { rules: [], net: true, writeRegexes: [] },
       chdir: dir, home: dir, cliBin: linkBin, cliArgs: ['--v'],
       tempDir: join(dir, 'session-temp'),
     });
-    // Off-CI without bwrap installed prepareDirectSandbox returns null (dep gate);
-    // only assert the canonicalization when it actually produced a plan.
-    if (!r) return;
+    expect(plan).not.toBeNull();
+    const r = plan!;
     const dashDash = r.args.lastIndexOf('--');
     expect(dashDash).toBeGreaterThan(-1);
     const execTarget = r.args[dashDash + 1];
@@ -500,6 +504,8 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
 // Root daemon + --unshare-user maps only uid 0, so GNU tar's default
 // --same-owner chown of a foreign-owned archive fails inside the sandbox.
 describe('sandbox TAR_OPTIONS', () => {
+  usePlanOnlyBwrap();
+
   it('adds --no-same-owner for a root worker and keeps an operator value', () => {
     expect(sandboxTarOptions(undefined, 0)).toBe('--no-same-owner');
     expect(sandboxTarOptions('  ', 0)).toBe('--no-same-owner');
@@ -516,12 +522,13 @@ describe('sandbox TAR_OPTIONS', () => {
   it('reaches the bwrap child of a root worker', () => {
     if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
     const dir = mkdtempSync(join(tmpdir(), 'sbx-tar-'));
-    const r = prepareDirectSandbox({
+    const plan = prepareDirectSandbox({
       sessionId: 'taropts', dataDir: tmp(),
       policy: { rules: [], net: true, writeRegexes: [] },
       chdir: dir, home: dir, cliBin: '/bin/true', cliArgs: [],
     });
-    if (!r) return; // bwrap unavailable on this host
+    expect(plan).not.toBeNull();
+    const r = plan!;
     const index = r.args.indexOf('TAR_OPTIONS');
     expect(r.args[index - 1]).toBe('--setenv');
     expect(r.args[index + 1]).toContain('--no-same-owner');
@@ -539,6 +546,8 @@ describe('sandbox TAR_OPTIONS', () => {
 });
 
 describe('prepareDirectSandbox mcode data alias', () => {
+  usePlanOnlyBwrap();
+
   function fixture() {
     const root = mkdtempSync(join(tmpdir(), 'sbx-mcode-alias-'));
     const data = join(root, 'native-data');
@@ -558,8 +567,8 @@ describe('prepareDirectSandbox mcode data alias', () => {
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
       plan = prepareDirectSandbox({ ...f.opts, minimaxDataDir: f.alias, useBwrapArgsFile });
-      if (!plan) return;
-      const args = plan.argsFile ? readFileSync(plan.argsFile, 'utf8').split('\0') : plan.args;
+      expect(plan).not.toBeNull();
+      const args = plan!.argsFile ? readFileSync(plan!.argsFile, 'utf8').split('\0') : plan!.args;
       const aliasAt = args.findIndex((arg, i) => arg === '--symlink' && args[i + 2] === f.alias);
       expect(aliasAt).toBeGreaterThan(-1);
       expect(args[aliasAt + 1]).toBe(f.target);
@@ -576,8 +585,8 @@ describe('prepareDirectSandbox mcode data alias', () => {
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
       plan = prepareDirectSandbox({ ...f.opts, ...(canonical ? { minimaxDataDir: f.target } : {}) });
-      if (!plan) return;
-      expect(plan.args).not.toContain(f.alias);
+      expect(plan).not.toBeNull();
+      expect(plan!.args).not.toContain(f.alias);
     } finally { plan?.cleanup(); rmSandboxScratch(f.root); }
   });
   it.each(['missing', 'parent-only', 'denied', 'collision'] as const)('rejects an alias with %s access instead of expanding the grant', scenario => {
@@ -585,8 +594,8 @@ describe('prepareDirectSandbox mcode data alias', () => {
     const f = fixture();
     const baseline = prepareDirectSandbox(f.opts);
     try {
-      if (!baseline) return;
-      baseline.cleanup();
+      expect(baseline).not.toBeNull();
+      baseline!.cleanup();
       const rules = scenario === 'missing' ? [] : scenario === 'parent-only'
         ? [{ path: dirname(f.target), access: 'readWrite' as const, source: 'user' as const }]
         : [...f.opts.policy.rules,
@@ -598,6 +607,8 @@ describe('prepareDirectSandbox mcode data alias', () => {
 });
 
 describe('prepareDirectSandbox tmux argument transport', () => {
+  usePlanOnlyBwrap();
+
   it('stores long bwrap options in a private file while keeping CLI argv on the command line', () => {
     if (process.platform !== 'linux') return;
     const root = mkdtempSync(join(tmpdir(), 'sbx-tmux-args-'));
@@ -622,18 +633,18 @@ describe('prepareDirectSandbox tmux argument transport', () => {
         cliArgs: ['%s', 'space value', '$literal', 'line\nbreak'],
         useBwrapArgsFile: true,
       });
-      if (!plan) return;
+      expect(plan).not.toBeNull();
 
-      expect(plan.argsFile).toBeDefined();
-      expect(statSync(plan.argsFile!).mode & 0o777).toBe(0o600);
-      expect(Buffer.byteLength([plan.bin, ...plan.args].join('\0'))).toBeLessThan(8 * 1024);
-      expect(plan.args.slice(plan.args.indexOf('--') + 1)).toEqual([
+      expect(plan!.argsFile).toBeDefined();
+      expect(statSync(plan!.argsFile!).mode & 0o777).toBe(0o600);
+      expect(Buffer.byteLength([plan!.bin, ...plan!.args].join('\0'))).toBeLessThan(8 * 1024);
+      expect(plan!.args.slice(plan!.args.indexOf('--') + 1)).toEqual([
         realpathSync('/bin/printf'), '%s', 'space value', '$literal', 'line\nbreak',
       ]);
-      const optionBytes = readFileSync(plan.argsFile!);
+      const optionBytes = readFileSync(plan!.argsFile!);
       expect(optionBytes.length).toBeGreaterThan(16 * 1024);
       expect(optionBytes.includes(Buffer.from('space value'))).toBe(false);
-      plan.cleanup();
+      plan!.cleanup();
       expect(existsSync(join(dataDir, 'sandboxes', 'long-tmux'))).toBe(false);
     } finally {
       plan?.cleanup();
