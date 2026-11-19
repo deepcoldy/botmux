@@ -117,7 +117,7 @@ function workerFence() {
       lastProgramStatusReport: () => h.scope.nativeState,
     },
     webTerminalInputGeneration: 0, webTerminalInputGenerationAtSpawn: 0,
-    lastWebTerminalInputAtMs: 0, webTerminalSubmitGeneration: 0,
+    lastWebTerminalInputAtMs: 0, lastWebTerminalSubmitAtMs: 0, webTerminalSubmitGeneration: 0,
     terminalInputSubmits: () => false,
     hookReviewInputHold: false, heldStuckPage: () => undefined,
     // No native question card or session-title operation in this fixture.
@@ -299,5 +299,16 @@ describe('the actual pending-input writer honors native startup evidence', () =>
     h.scope.cliSpawnGeneration++;
     timeout(CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS, true);
     expect(h.scope.markPromptReady).not.toHaveBeenCalled();
+  });
+
+  it('reports only direct-submit attribution to the daemon, never input bytes', () => {
+    const h = workerFence();
+    h.scope.terminalInputSubmits = (data: string) => data.includes('\r');
+    const note = loadWorkerFunction<(data: string) => void>('noteWebTerminalInput', h.scope);
+    note('private text\r');
+    const events = h.scope.send.mock.calls.map(([event]: [{ type: string }]) => event);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: 'terminal_input', submitted: true });
+    expect(JSON.stringify(events[0])).not.toContain('private text');
   });
 });
