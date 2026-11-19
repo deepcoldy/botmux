@@ -66,11 +66,42 @@ function resolveRealTmux(pathValue: string | undefined, skipDir?: string): strin
   return null;
 }
 
+/**
+ * The REAL tmux binary behind the fence shim (null when the host has none).
+ *
+ * Only for comparisons that must observe tmux's own behaviour. The shim
+ * refuses every host socket, so a case where tmux would legitimately answer
+ * for a HOST socket (e.g. the /tmp fallback) can only be observed with the
+ * real binary — and only with a probe that starts no server and addresses a
+ * private, never-used label.
+ */
+export function realTmuxBinary(env: NodeJS.ProcessEnv = process.env): string | null {
+  for (const dir of (env.PATH ?? '').split(delimiter)) {
+    if (!dir) continue;
+    const candidate = join(dir, 'tmux');
+    try {
+      if (!statSync(candidate).isFile()) continue;
+      // Skip the fence shim itself: it refuses host sockets by design, so it
+      // cannot answer questions about tmux's own behaviour.
+      if (readFileSync(candidate, 'utf8').includes('refusing host tmux socket')) continue;
+      return candidate;
+    } catch { /* keep scanning */ }
+  }
+  return null;
+}
+
 function realDir(path: string): string | null {
   try { return realpathSync(path); } catch { return null; }
 }
 
-/** Socket directories that belong to the host, for the CURRENT uid. */
+/** Socket directories that belong to the host, for the CURRENT uid.
+ *
+ *  /tmp is always a possible target (tmux falls back to it for a
+ *  $TMUX_TMPDIR that does not name an existing directory), and every
+ *  directory the raw value names stays host-owned even when tmux itself
+ *  would ignore the whole value: the fence refuses more rather than less.
+ *  What tmux would actually do with the value is decided by the shim below,
+ *  which mirrors tmux exactly. */
 export function hostTmuxSocketDirs(env: NodeJS.ProcessEnv = process.env): string[] {
   const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
   const bases = new Set<string>();
@@ -126,14 +157,15 @@ if [ -z "$socket" ]; then
     socket=\${TMUX%%,*}
   else
     [ -n "$label" ] || label=default
-    base=''
-    old_ifs=$IFS
-    IFS=:
-    for entry in $TMUX_TMPDIR /tmp; do
-      [ -n "$entry" ] || continue
-      if resolved=$(cd "$entry" 2>/dev/null && pwd -P); then base=$resolved; break; fi
-    done
-    IFS=$old_ifs
+    # tmux resolves $TMUX_TMPDIR as ONE path and silently falls back to /tmp
+    # when it does not name an existing directory. A colon separated value is
+    # not a list for tmux — the whole string is one path that does not
+    # resolve — so it must land on /tmp here too.
+    if [ -n "$TMUX_TMPDIR" ] && [ -d "$TMUX_TMPDIR" ]; then
+      base=$TMUX_TMPDIR
+    else
+      base=/tmp
+    fi
     socket="$base/tmux-$(id -u)/$label"
   fi
 fi

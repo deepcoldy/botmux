@@ -8,6 +8,7 @@ import {
   parseLsofListeners,
   parseLsofListenerResult,
   recoverNewestBotmuxSocket,
+  resolveBootDirective,
   tmuxSocketPath,
   newestBotmuxListener,
   type TmuxOwnerProbe,
@@ -190,9 +191,53 @@ describe('parseLsofListeners (macOS)', () => {
 });
 
 describe('tmuxSocketPath', () => {
-  it('honours TMUX_TMPDIR and default name', () => {
-    expect(tmuxSocketPath({ TMUX_TMPDIR: '/t' }, 42, 'botmux')).toBe('/t/tmux-42/botmux');
+  it('honours TMUX_TMPDIR when it names an existing directory, default name otherwise', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'guard-socketroot-'));
+    try {
+      expect(tmuxSocketPath({ TMUX_TMPDIR: dir }, 42, 'botmux')).toBe(`${dir}/tmux-42/botmux`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
     expect(tmuxSocketPath({}, 42)).toBe('/tmp/tmux-42/default');
+  });
+
+  it('falls back to /tmp for a TMUX_TMPDIR tmux itself cannot resolve', () => {
+    // tmux uses $TMUX_TMPDIR as ONE path and silently falls back to /tmp when
+    // it does not name an existing directory. Probing the raw value instead
+    // would inspect a socket no client ever talks to.
+    const missing = join(tmpdir(), 'guard-missing-socketroot-');
+    expect(tmuxSocketPath({ TMUX_TMPDIR: missing }, 42, 'botmux')).toBe('/tmp/tmux-42/botmux');
+    expect(tmuxSocketPath({ TMUX_TMPDIR: `${missing}:/tmp` }, 42, 'botmux')).toBe('/tmp/tmux-42/botmux');
+  });
+});
+
+describe('resolveBootDirective with a TMUX_TMPDIR tmux cannot resolve', () => {
+  const missingRoot = join(tmpdir(), 'guard-diverged-socketroot-');
+  // Where tmux really puts the socket for a $TMUX_TMPDIR that does not resolve.
+  const realPath = `/tmp/tmux-${typeof process.getuid === 'function' ? process.getuid() : -1}/botmux`;
+  const seam = (listenersAt: (path: string) => number[]) => ({
+    env: { TMUX_TMPDIR: missingRoot },
+    owner: { kind: 'connect-error' } as TmuxOwnerProbe,
+    supportsNoFork: true,
+    platform: 'linux' as NodeJS.Platform,
+    listeningServerPids: (path: string) => listenersAt(path),
+    socketFilePresent: () => false,
+    isBotmuxListener: () => false,
+    startTicks: () => null,
+  });
+
+  it('refuses to cold-boot next to a live server on the socket tmux really uses', () => {
+    // The owner is unreachable and a listener is bound at the path tmux
+    // actually uses. A cold start here forks a competing server, so the gate
+    // must wait instead — proving it census-checks the SAME path tmux does.
+    const directive = resolveBootDirective('botmux', seam(path => (path === realPath ? [4242] : [])));
+    expect(directive.mode).toBe('wait');
+  });
+
+  it('cold-boots when nothing listens where tmux will look', () => {
+    // Only the divergent raw path carries a listener; tmux will not use it.
+    const directive = resolveBootDirective('botmux', seam(path => (path === realPath ? [] : [4242])));
+    expect(directive.mode).toBe('spawn');
   });
 });
 

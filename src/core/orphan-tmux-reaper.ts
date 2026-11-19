@@ -96,6 +96,7 @@ import {
   managedTmuxCandidateSockets,
   tmuxSocketArgs,
 } from '../adapters/backend/tmux-socket.js';
+import { resolveTmuxSocketRoot, tmuxSocketPathIn } from '../adapters/backend/tmux-socket-root.js';
 import { logger } from '../utils/logger.js';
 import {
   listeningServersOnPath,
@@ -188,14 +189,16 @@ export function argvCarriesBotmuxSession(cmd: string): boolean {
   return /(?:^|\s)new-session\b.*\s-s\s+(?:bmx(?:-diag)?-[0-9a-f]{8}|bmx-reap-bootstrap-\d+)(?:\s|$)/s.test(cmd);
 }
 
-/** Filesystem pathname of a tmux server socket (undefined name = default). */
+/** Filesystem pathname of a tmux server socket (undefined name = default).
+ *  The root follows tmux's own resolution (a $TMUX_TMPDIR that is not an
+ *  existing directory falls back to /tmp) so the reaper looks at the socket
+ *  the server really listens on. */
 export function defaultSocketPath(
   env: NodeJS.ProcessEnv,
   uid: number,
   socketName?: string,
 ): string {
-  const baseDir = env.TMUX_TMPDIR || '/tmp';
-  return join(baseDir, `tmux-${uid}`, socketName || 'default');
+  return tmuxSocketPathIn(resolveTmuxSocketRoot(env), uid, socketName);
 }
 
 /**

@@ -25,6 +25,7 @@ import { readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
+import { resolveTmuxSocketRoot, tmuxSocketPathIn } from '../adapters/backend/tmux-socket-root.js';
 import {
   isBotmuxManagedTmuxEnvKey,
   isBotmuxManagedTmuxServerGlobalEnvKey,
@@ -578,8 +579,9 @@ export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScru
 function cleanupTmuxProbeSocket(sockName: string, env: NodeJS.ProcessEnv = process.env): void {
   if (typeof process.getuid !== 'function') return;
 
-  const baseDir = env.TMUX_TMPDIR || '/tmp';
-  const socketPath = join(baseDir, `tmux-${process.getuid()}`, sockName);
+  // The probe socket lives where tmux put it: the root tmux itself resolved
+  // (a $TMUX_TMPDIR that is not an existing directory falls back to /tmp).
+  const socketPath = tmuxSocketPathIn(resolveTmuxSocketRoot(env), process.getuid(), sockName);
   try {
     unlinkSync(socketPath);
   } catch {

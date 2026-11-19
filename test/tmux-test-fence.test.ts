@@ -73,9 +73,16 @@ describe.skipIf(!posix)('tmux test fence shim', () => {
     expect(run(['kill-server'], {}).denied).not.toBe('');
   });
 
-  it('honours a colon-separated TMUX_TMPDIR the way tmux does (first entry that resolves)', () => {
+  it('refuses a colon-separated TMUX_TMPDIR — tmux treats it as one path and falls back to /tmp', () => {
+    // tmux does NOT read $TMUX_TMPDIR as a list: the whole value is one path,
+    // and a value that does not name an existing directory makes tmux use /tmp.
+    // So such a call really targets the host socket directory and must be
+    // refused (the fence's own resolution has to match tmux's, or it would
+    // wave through a call that drives the host default server).
     const r = run(['kill-server'], { TMUX_TMPDIR: `${join(work, 'missing')}:${privateRoot}` });
-    expect(r.status).toBe(0);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('refusing host tmux socket');
+    expect(r.denied).toContain(`/tmux-${uid}/default`);
   });
 });
 

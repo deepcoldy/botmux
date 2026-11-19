@@ -77,6 +77,7 @@ import {
   clientTmuxVersionForEnv,
   type TmuxVersion,
 } from '../setup/ensure-tmux.js';
+import { resolveTmuxSocketRoot, tmuxSocketPathIn } from '../adapters/backend/tmux-socket-root.js';
 
 /**
  * Botmux server fingerprint: the server's booting argv carries its first
@@ -157,7 +158,10 @@ export interface TmuxServerGuardSeam {
   owner?: TmuxOwnerProbe;
   probeOwner?: () => TmuxOwnerProbe;
   listeners?: number[];
-  listeningServerPids?: () => number[] | null;
+  /** Listener census for the socket path the gate is about to act on — the
+   *  path is passed in so a caller (and a test) can tell WHICH socket the
+   *  gate is looking at. */
+  listeningServerPids?: (socketPath: string) => number[] | null;
   filePresent?: boolean | null;
   socketFilePresent?: () => boolean | null;
   supportsNoFork?: boolean;
@@ -170,10 +174,13 @@ export interface TmuxServerGuardSeam {
   platform?: NodeJS.Platform;
 }
 
-/** Filesystem pathname of a tmux server socket (undefined name = default). */
+/** Filesystem pathname of a tmux server socket (undefined name = default).
+ *  The root is resolved the way tmux itself resolves it (see
+ *  {@link resolveTmuxSocketRoot}): a $TMUX_TMPDIR that does not name an
+ *  existing directory makes tmux fall back to /tmp, so probing the raw value
+ *  would inspect a socket nobody talks to. */
 export function tmuxSocketPath(env: NodeJS.ProcessEnv, uid: number, socketName?: string): string {
-  const baseDir = env.TMUX_TMPDIR || '/tmp';
-  return join(baseDir, `tmux-${uid}`, socketName || 'default');
+  return tmuxSocketPathIn(resolveTmuxSocketRoot(env), uid, socketName);
 }
 
 /** All path spellings a bound socket may be reported under: the given path and
@@ -466,7 +473,7 @@ export function resolveBootDirective(
   }
 
   const censusListeners = seam.listeners
-    ?? (seam.listeningServerPids ? seam.listeningServerPids() : listeningServersOnPath(socketPath, platform));
+    ?? (seam.listeningServerPids ? seam.listeningServerPids(socketPath) : listeningServersOnPath(socketPath, platform));
   // NOTE: null (unreadable) is preserved and fails closed inside the decision;
   // do NOT coalesce it to [].
   const listeners = censusListeners;
