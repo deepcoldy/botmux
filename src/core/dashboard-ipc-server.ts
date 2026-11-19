@@ -243,6 +243,7 @@ import {
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
+import { parseSessionTurnsPage, readSessionTurns } from '../services/session-turns.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
 import {
   findQuotaFallbackCycle,
@@ -7060,6 +7061,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req
 // 与输出永不进结构。detail=summary 只返聚合+建议（/insight 卡片、抽屉概览用）；
 // detail=spans 才带脱敏 span（详情 tab 用）。owner-only 由 dashboard 外层 authed-only
 // 路由 + /insight 命令层把关，IPC 自身 loopback-trusted。
+ipcRoute('GET', '/api/sessions/:sessionId/turns', (req, res, params) => {
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const page = parseSessionTurnsPage(new URL(req.url ?? '/', 'http://localhost').searchParams);
+  if (!page) return jsonRes(res, 400, { ok: false, error: 'invalid_turns_cursor_or_limit' });
+  res.setHeader('cache-control', 'no-store');
+  return jsonRes(res, 200, session.status === 'closed'
+    ? readSessionTurns(config.session.dataDir, params.sessionId, page.since, 0)
+    : readSessionTurns(config.session.dataDir, params.sessionId, page.since, page.limit));
+});
+
 ipcRoute('GET', '/api/sessions/:sessionId/insight', (req, res, params) => {
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });

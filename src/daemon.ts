@@ -295,6 +295,7 @@ import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { comparableSessionDir } from './core/working-dir-range.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from './types.js';
+import { mergeStagedSessionTurnInputs, projectLarkTurnInbound, stageSessionTurnInbound } from './services/session-turns.js';
 
 export function useOrdinaryOutputDelivery(): void {
   setDurableBridgeFinalOutputHandler(undefined);
@@ -22448,12 +22449,40 @@ async function resolveSoloSessionForTurn(
  * fork. All potentially-slow preparation must happen before this call; the
  * pendingFollowUps snapshot and fork then cannot be interleaved by a later
  * same-anchor handler. */
+function stageStructuredLarkTurn(
+  ds: DaemonSession,
+  message: LarkMessage,
+  attachments: LarkAttachment[],
+  senderName?: string,
+  turnId = message.messageId,
+): void {
+  if (ds.session.status === 'closed') return;
+  try {
+    const root = ds.scope === 'thread' || message.threadId
+      ? message.rootId || message.messageId
+      : undefined;
+    stageSessionTurnInbound(config.session.dataDir, ds.session.sessionId, turnId,
+      projectLarkTurnInbound(message, attachments, root, senderName));
+  } catch {
+    logger.warn('Failed to stage structured session input');
+  }
+}
+
 function buildReservedInitialInput(
   ds: DaemonSession,
   availableBots: AvailableBot[],
 ) {
   const selfBot = getBot(ds.larkAppId);
   const botCfg = selfBot.config;
+  const openingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
+  if (openingTurnId && ds.pendingStructuredOpeningTurnId && ds.pendingFollowUpTurnIds?.length) {
+    try {
+      mergeStagedSessionTurnInputs(config.session.dataDir, ds.session.sessionId, openingTurnId,
+        [ds.pendingStructuredOpeningTurnId, ...ds.pendingFollowUpTurnIds]);
+    } catch {
+      logger.warn('Failed to stage merged session input');
+    }
+  }
   const built = buildNewTopicCliInput(
     ds.pendingPrompt ?? '',
     ds.session.sessionId,
@@ -22522,6 +22551,7 @@ function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingLinkRefMode = undefined;
   ds.pendingFollowUps = undefined;
   ds.pendingFollowUpTurnIds = undefined;
+  ds.pendingStructuredOpeningTurnId = undefined;
   ds.pendingCodexAppFollowUps = undefined;
   ds.pendingCodexAppFollowUpContexts = undefined;
   ds.pendingCodexAppFollowUpGateAccepted = undefined;
@@ -27630,6 +27660,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // repo 卡片 / auto-worktree 之后的 commit）经 buildReservedInitialInput 与
   // worker-pool init 读到同一个值。send 模式零额外 API。
   await resolveSoloSessionForTurn(ds, chatType, newTopicSender);
+  if (promptContent.trim() || attachments.length) {
+    stageStructuredLarkTurn(ds, parsed, attachments, newTopicSender?.name, replyAnchorId);
+    ds.pendingStructuredOpeningTurnId = replyAnchorId;
+  }
   const sharedWorktree = autoWt && pinnedWorkingDir && forceTopicMode === 'worktree'
     ? await forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
     : undefined;
@@ -30298,6 +30332,7 @@ async function handleThreadReplyAdmitted(
         // solo 必须在构造信封之前解析：transcript 下 solo 决定是否去掉
         // <user_message> 壳与 <sender/> 标签。
         const tailSender = await getThreadSender();
+        stageStructuredLarkTurn(ds, parsed, attachments, tailSender?.name);
         await resolveSoloSessionForTurn(ds, ctxChatType, tailSender);
         if (effortSessionIsCurrent && !effortSessionIsCurrent()) throw new Error('Effort task session changed during queued activation preparation');
         const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
@@ -30394,6 +30429,7 @@ async function handleThreadReplyAdmitted(
     const followUpSender: import('./im/lark/identity-cache.js').ResolvedSender | undefined = callerOpenId
       ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
       : undefined;
+    stageStructuredLarkTurn(ds, parsed, attachments, followUpSender?.name);
     if (!zeroInjection) enriched = `${renderInboundMessageLocation({
       messageId: parsed.messageId,
       ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}),
@@ -30425,6 +30461,7 @@ async function handleThreadReplyAdmitted(
         // durable opening instead of an impossible successor to an empty ACK.
         ds.pendingPrompt = promptContent;
         ds.pendingTurnId = parsed.messageId;
+        ds.pendingStructuredOpeningTurnId = parsed.messageId;
         ds.pendingTrustedCaller = threadTrustedCaller;
         ds.pendingCodexAppText = parsed.content;
         ds.pendingAcceptedInput = ctx.acceptedInput;
@@ -30763,6 +30800,8 @@ async function handleThreadReplyAdmitted(
     mirrorDurableSessionShadow(newDs.session);
     // transcript 模式的 solo 判定（同 handleNewTopicAdmitted）：fork 前算好。
     await resolveSoloSessionForTurn(newDs, autoCreateChatType, autoCreateSender);
+    stageStructuredLarkTurn(newDs, parsed, attachments, autoCreateSender?.name);
+    newDs.pendingStructuredOpeningTurnId = parsed.messageId;
     if (newDs.pendingRepo) {
       stageClaimedPendingRepoSetup(activeSessions, newDs, {
         mode: autoWt ? 'auto_worktree' : 'picker',
@@ -30972,6 +31011,7 @@ async function handleThreadReplyAdmitted(
     const wantsOpening = !isBridge && isInitialUserTurnPending(ds);
     const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
     const turnSender = await getThreadSender();
+    stageStructuredLarkTurn(ds, parsed, attachments, turnSender?.name);
     // transcript 模式按轮重算 solo（bridge 会话本就是裸文本，跳过）。
     if (!isBridge) await resolveSoloSessionForTurn(ds, ctxChatType, turnSender);
     if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
@@ -31269,6 +31309,7 @@ async function handleThreadReplyAdmitted(
           : {}),
         build: async () => {
           const stagedSender = await getThreadSender();
+          stageStructuredLarkTurn(ds, parsed, attachments, stagedSender?.name);
           await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);
           const currentCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId;
           const traexRpcContext = traexRpcContextForSession(ds, currentCliId);
@@ -31422,6 +31463,7 @@ async function handleThreadReplyAdmitted(
     const wantsOpening = !ds.adoptedFrom && !queuedDashboardTurn && isInitialUserTurnPending(ds);
     const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
     const reforkSender = await getThreadSender();
+    stageStructuredLarkTurn(ds, parsed, attachments, reforkSender?.name);
     // transcript 模式按轮重算 solo：refork 走 worker-pool init 冻结 solo，且
     // buildReforkCliInput / buildNewTopicCliInput 都据 ds.soloSession 去壳。
     if (!ds.adoptedFrom) await resolveSoloSessionForTurn(ds, ctxChatType, reforkSender);

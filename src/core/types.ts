@@ -413,6 +413,7 @@ export interface DaemonSession {
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
   pendingFollowUpTurnId?: string;
   pendingFollowUpTurnIds?: string[];   // matching inbound ids; last id attributes a folded buffered batch
+  pendingStructuredOpeningTurnId?: string;
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
   /** Arrival-time clean-input decisions matching pendingCodexAppFollowUps.

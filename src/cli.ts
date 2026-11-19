@@ -416,6 +416,7 @@ import {
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import { recordBridgeReplyMarker } from './services/bridge-reply-marker.js';
+import { recordSessionTurnReply } from './services/session-turns.js';
 import {
   commitRestartIntentAttemptTo,
   consumeRestartIntentTo,
@@ -13152,6 +13153,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         try {
           const markerSessionId = originSessionId ?? sid;
           const markerTurnId = originTurnId ?? currentTurnId;
+          recordStructuredSendReceipt(markerSessionId, markerTurnId, messageId, sentAtMs, content);
           const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
             || markerSessionId !== sid;
           recordBridgeReplyMarker({
@@ -13287,6 +13289,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       if (!docDelivery.replayed) {
+        recordStructuredSendReceipt(originSessionId!, originTurnId ?? exactDocTarget.turnId,
+          docDelivery.messageId, sentAtMs, content);
         try {
           recordBridgeReplyMarker({
             dataDir: resolveDataDir(),
@@ -13858,15 +13862,34 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // 此包装自出生即无调用方；但 test/cli-send-hook-context.test.ts 对其源码文本做了断言，
   // 删除需同步改测试。
   void dispatch;
+  function recordStructuredSendReceipt(
+    markerSessionId: string,
+    markerTurnId: string | undefined,
+    messageId: string | undefined,
+    sentAtMs: number,
+    text?: string,
+  ): void {
+    if (!markerTurnId || !messageId) return;
+    try {
+      recordSessionTurnReply(resolveDataDir(), markerSessionId, markerTurnId, {
+        messageId, responseKind: effectiveResponseKind, at: sentAtMs,
+        ...(text ? { text } : {}),
+      });
+    } catch {
+      console.error('botmux: could not record structured reply');
+    }
+  }
   const recordBridgeSendMarker = (
     sentAtMs: number,
     messageId: string,
     sentContent: string,
     terminalCarrier?: TurnTerminalCarrierKind,
+    structuredText?: string,
   ): void => {
+    const markerSessionId = originSessionId ?? sid;
+    const markerTurnId = originTurnId ?? currentTurnId;
+    recordStructuredSendReceipt(markerSessionId, markerTurnId, messageId, sentAtMs, structuredText);
     try {
-      const markerSessionId = originSessionId ?? sid;
-      const markerTurnId = originTurnId ?? currentTurnId;
       const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
         || markerSessionId !== sid;
       recordBridgeReplyMarker({
@@ -14873,6 +14896,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         (!customCard || customFinal) && !pureFileSend && !pureVideoSend
           ? 'standard_reply_card'
           : 'non_patchable',
+        !customCard && !pureFileSend && !pureVideoSend ? text : undefined,
       );
     }
     await removeScheduleSelfAfterFinal();

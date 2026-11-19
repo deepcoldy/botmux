@@ -6748,6 +6748,16 @@ const server = createServer(async (req, res) => {
     // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
     // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
     // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/turns$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${encodeURIComponent(sid)}/turns${url.search}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(await upstream.text());
+      return;
+    }
+
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/insight$/))) {
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);

@@ -264,6 +264,7 @@ import {
   terminalReleasesDurableTurn,
   type PendingCliInput,
 } from './utils/pending-input-queue.js';
+import { recordSessionTurnInput, updateSessionTurnNativeAnchor } from './services/session-turns.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
 import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
 import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
@@ -1930,6 +1931,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       if (first.outcome === 'accepted') {
         // Acknowledged (or rollout-evidenced) first turn on the fresh thread.
         // 'ambiguous' stays on the terminal fallback: dispatched is not accepted.
+        recordStructuredInput(cfg.turnId, firstTurnPrompt, undefined, engine.activeThreadId);
         acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId, cfg.dispatchAttempt);
         publishTraexNativeContextReceipt(initialTraexContext, firstIdentity.turnId, 'accepted');
       } else if (first.outcome === 'ambiguous') {
@@ -3270,6 +3272,7 @@ let argvDurableInitialPromptCompletion: {
   adapter: CliAdapter;
 } | undefined;
 let lastSpawnQueuedInitialPrompt: string | undefined;
+let lastSpawnStructuredArgvPrompt: string | undefined;
 let lastSpawnQueuedInitialPromptLogicalContent: string | undefined;
 
 function watchArgvDurableInitialPromptCompletion(opts: {
@@ -3739,7 +3742,7 @@ function zeroPromptTerminalSync(): boolean {
  *  marked input. Fingerprint-prefix / truncation binds attribute replies but
  *  do not prove envelope consumption, so they stay on the terminal fallback. */
 function notifyNativeTranscriptConsumedLarkTurn(
-  turn: { turnId: string; isLocal?: boolean; isScheduled?: boolean },
+  turn: { turnId: string; userUuid?: string; isLocal?: boolean; isScheduled?: boolean },
   evidence: { fullContentMatch: boolean; sourceJsonlPath?: string },
 ): void {
   if (!evidence.fullContentMatch || turn.isLocal || turn.isScheduled) return;
@@ -3748,7 +3751,7 @@ function notifyNativeTranscriptConsumedLarkTurn(
   const nativeSessionId = base.endsWith('.jsonl') && /^[A-Za-z0-9-]{8,128}\.jsonl$/.test(base)
     ? base.slice(0, -'.jsonl'.length)
     : undefined;
-  acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', nativeSessionId ?? lastInitConfig?.cliSessionId);
+  acknowledgeNativeInputConsumed(turn.turnId, 'claude_transcript_user_record', nativeSessionId ?? lastInitConfig?.cliSessionId, turn.userUuid);
 }
 
 function notifyTerminalTurnStarted(turn: { turnId: string; markTimeMs?: number; replyContextTurnId?: string }): void {
@@ -23837,6 +23840,7 @@ async function flushPending(): Promise<void> {
       const durableWrite = item.dispatchAttempt !== undefined;
       const msg = item.content;
       const logicalMsg = item.logicalContent ?? msg;
+      let submittedText = item.codexAppInput?.text ?? msg;
       let turnSeq = usageLimitTracker.currentTurn();
       let bridgeTurnId: string | undefined;
       let normalWritePrepared = false;
@@ -24231,6 +24235,8 @@ async function flushPending(): Promise<void> {
             break;
           }
           result = { submitted: true };
+          recordStructuredInput(item.turnId, rpcContext?.content ?? msg,
+            item.structuredSourceTurnIds, writeRpcEngine.activeThreadId);
           // The app-server acknowledged turn/start for this exact input on
           // the engine's active thread, fenced to the current generation.
           acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
@@ -24287,6 +24293,7 @@ async function flushPending(): Promise<void> {
               {
                 turnId: item.turnId,
                 dispatchAttempt: item.dispatchAttempt,
+                onInputPrepared: content => { submittedText = content; },
                 ...(lastInitConfig?.cliId === 'codex'
                   && !lastInitConfig.adoptMode && lastInitConfig.promptInjection !== 'none'
                   ? { correlateTranscript: true as const } : {}),
@@ -24622,6 +24629,10 @@ async function flushPending(): Promise<void> {
       // `&& backend`: if the CLI exited during this write (pane gone → onExit
       // nulled backend) the user already got a "CLI exited" notice; don't also
       // nag that the submit wasn't confirmed.
+      if (!writeRpcEngine && result?.submitted !== false) {
+        recordStructuredInput(item.turnId, submittedText,
+          item.structuredSourceTurnIds, result?.cliSessionId);
+      }
       if (result && result.submitted === false) {
         codexAppPromptReplay.cancelSubmission(
           codexAppTurnLiveness,
@@ -28477,6 +28488,7 @@ async function spawnCliBody(
     defer: deferInitialPrompt,
   });
   preparedInitialPrompt = initialPromptDelivery.argvPrompt;
+  lastSpawnStructuredArgvPrompt = preparedInitialPrompt;
   lastSpawnQueuedInitialPrompt = initialPromptDelivery.queuedContent;
   lastSpawnQueuedInitialPromptLogicalContent = initialPromptDelivery.logicalContent;
   // Argv-baked first prompt tracking (PR #633 P2 / second-round review):
@@ -37000,6 +37012,25 @@ function initializeWorkerSessionContract(msg: Extract<DaemonToWorker, { type: 'i
  * exact owned history line, a Codex RPC turn/start acknowledgement, or a
  * Claude transcript user record whose full normalised content matched. Never
  * from IPC arrival, queue ownership or a generic adapter `submitted` flag. */
+function recordStructuredInput(
+  turnId: string | undefined,
+  input: string,
+  sourceTurnIds?: string[],
+  cliSessionId?: string,
+): void {
+  const dataDir = process.env.SESSION_DATA_DIR;
+  const cliId = lastInitConfig?.cliId;
+  if (!dataDir || !sessionId || !turnId || !cliId || closeRequested) return;
+  try {
+    recordSessionTurnInput({
+      dataDir, sessionId, turnId, input, cliId, sourceTurnIds,
+      cliSessionId: cliSessionId ?? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId,
+    });
+  } catch {
+    log('Failed to record structured session input');
+  }
+}
+
 function acknowledgeNativeInputConsumed(
   turnId: string | undefined,
   proofKind: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>['proofKind'],
@@ -37008,6 +37039,13 @@ function acknowledgeNativeInputConsumed(
   dispatchAttempt?: number,
 ): void {
   if (!turnId) return;
+  if (process.env.SESSION_DATA_DIR && sessionId && (nativeSessionId || nativeTurnId)) {
+    try {
+      updateSessionTurnNativeAnchor(process.env.SESSION_DATA_DIR, sessionId, turnId, nativeSessionId, nativeTurnId);
+    } catch {
+      log('Failed to record structured native input anchor');
+    }
+  }
   markReplyInputConsumed(turnId);
   // The CLI has the input in its own history: a crash no longer re-delivers
   // it to a resumed CLI (see InflightInputTracker.onTurnStarted).
@@ -38202,6 +38240,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // A successful spawn with a non-queued prompt means the adapter baked
           // it into argv or the RPC engine already accepted it.
           initialInputCommitted = true;
+          if (!codexRpcEngine) recordStructuredInput(msg.turnId, lastSpawnStructuredArgvPrompt ?? msg.prompt);
           // An argv-baked prompt is input the CLI has not consumed until its
           // turn runs. Track it like a typed input: if the CLI dies first (10-21:
           // tmux panes gone seconds after a cold start), the restart re-delivers
