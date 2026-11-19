@@ -21,15 +21,15 @@
  * derived for this app, is invalid and nothing is sent.
  *
  * The live file is capped at {@link GROUP_SEND_RECORD_LIMIT}. Admitting a new
- * requestId past that cap compacts the oldest `sent` records (by
- * `firstAttemptAt`, at least {@link GROUP_SEND_COMPACT_BATCH} at a time) into
+ * requestId past that cap compacts the oldest settled records (by
+ * attempt time or rejection time, at least {@link GROUP_SEND_COMPACT_BATCH} at a time) into
  * a sibling archive capped at {@link GROUP_SEND_ARCHIVE_LIMIT}. The archive is
  * fsynced before those keys are removed from the live file, and it is not
  * rewritten on replay, on the post-provider `sent` save, or on the new
- * requestIds admitted into the room a compaction made. Pending records are
+ * requestIds admitted into the room a compaction made. Unresolved records are
  * never compacted — they are the proof an attempt may already be visible — and
  * a new requestId is refused with `store_full` once they fill the cap. A
- * requestId evicted from the archive (oldest `sentAt` past the archive cap)
+ * requestId evicted from the archive (oldest completion time past the archive cap)
  * retries as a new send.
  *
  * `outbound.send` is at-most-once per message id, not exactly-once. The route
@@ -70,7 +70,7 @@ export const GROUP_SEND_RECORD_LIMIT = 2000;
 /**
  * Archive cap. 20_000 full records is about 6MB. That file is rewritten only
  * by a compaction (see {@link GROUP_SEND_COMPACT_BATCH}).
- * Past this cap the oldest `sentAt` is dropped, and that requestId retries
+ * Past this cap the oldest terminal outcome is dropped, and that requestId retries
  * as a new send.
  */
 export const GROUP_SEND_ARCHIVE_LIMIT = 20_000;
@@ -131,9 +131,14 @@ function destinationKey(target: SendDestination): string | undefined {
   if (typeof target.rootMessageId === 'string' && TOPIC_ROOT_ID.test(target.rootMessageId)) return `topic:${target.chatId}:${target.rootMessageId}`;
 }
 
+// V1 understands two states. Encode a rejection as irrevocably expired for
+// older readers, which still enforce the digest and never retry its UUID.
+const REJECTED_FIRST_ATTEMPT = Number.MIN_SAFE_INTEGER;
+
 export type GroupSendRecord = SendDestination & {
   requestId: string; contentDigest: string; uuid: string;
   state: 'pending' | 'sent'; firstAttemptAt: number; messageId?: string; sentAt?: number;
+  rejectedAt?: number; providerCode?: number;
 };
 type StoreFile = { schemaVersion: 1; records: Record<string, GroupSendRecord> };
 
@@ -209,6 +214,10 @@ function isGroupSendRecord(value: unknown, storeKey: string, larkAppId: string):
   if (r.messageId !== undefined && (typeof r.messageId !== 'string' || !r.messageId)) return false;
   if (r.state === 'sent' && !r.messageId) return false;
   if (r.sentAt !== undefined && !isFiniteNumber(r.sentAt)) return false;
+  if (r.rejectedAt !== undefined) {
+    return isFiniteNumber(r.rejectedAt) && r.state === 'pending' && r.firstAttemptAt === REJECTED_FIRST_ATTEMPT
+      && r.messageId === undefined && r.sentAt === undefined && (r.providerCode === undefined || Number.isInteger(r.providerCode));
+  }
   return true;
 }
 
@@ -228,22 +237,23 @@ function byKey(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/** Live slot order. Only `sent` records can leave the live file. */
-function oldestSent(file: StoreFile): [string, GroupSendRecord][] {
+/** Unresolved attempts must stay in the live file. */
+function oldestSettled(file: StoreFile): [string, GroupSendRecord][] {
   return Object.entries(file.records)
-    .filter(([, record]) => record.state === 'sent')
-    .sort((a, b) => a[1].firstAttemptAt - b[1].firstAttemptAt || byKey(a[0], b[0]));
+    .filter(([, record]) => record.state === 'sent' || record.rejectedAt !== undefined)
+    .sort((a, b) => (a[1].rejectedAt ?? a[1].firstAttemptAt) - (b[1].rejectedAt ?? b[1].firstAttemptAt)
+      || byKey(a[0], b[0]));
 }
 
-/**
- * Archive retention order is `sentAt`, not `firstAttemptAt`. A missing
- * `sentAt` sorts oldest so an undated row cannot pin the cap forever.
- */
+function settledAt(record: GroupSendRecord): number {
+  return (record.state === 'sent' ? record.sentAt : record.rejectedAt) ?? Number.NEGATIVE_INFINITY;
+}
+
 function evictArchiveOverflow(file: StoreFile): void {
   const entries = Object.entries(file.records);
   let overflow = entries.length - limits.archive;
   if (overflow <= 0) return;
-  entries.sort((a, b) => (a[1].sentAt ?? Number.NEGATIVE_INFINITY) - (b[1].sentAt ?? Number.NEGATIVE_INFINITY) || byKey(a[0], b[0]));
+  entries.sort((a, b) => settledAt(a[1]) - settledAt(b[1]) || byKey(a[0], b[0]));
   for (const [storeKey] of entries) {
     if (overflow <= 0) break;
     delete file.records[storeKey];
@@ -258,8 +268,7 @@ function evictArchiveOverflow(file: StoreFile): void {
  */
 function forwardRecord(active: StoreFile, archive: StoreFile, storeKey: string): GroupSendRecord | undefined {
   const live = active.records[storeKey];
-  if (live) return live;
-  return archive.records[storeKey];
+  return live ?? archive.records[storeKey];
 }
 
 function save(path: string, file: StoreFile): void {
@@ -316,7 +325,7 @@ export async function sendRequestBoundGroupMessage(deps: GroupSendDeps, input: G
 
 export async function sendRequestBoundMessage(
   deps: Pick<GroupSendDeps, 'larkAppId' | 'storePath' | 'now' | 'beforeAttempt'> & {
-    send: (uuid: string, beforeWrite: () => void) => Promise<string>;
+    send: (uuid: string, beforeWrite: () => void, onAttemptStart: () => void) => Promise<string>;
     onCommitted?: (messageId: string, uuid: string) => void;
   },
   target: SendDestination, requestId: string, content: string,
@@ -338,13 +347,17 @@ export async function sendRequestBoundMessage(
     if (record?.state === 'sent' && record.messageId) {
       return { ok: true, status: 200, messageId: record.messageId, requestId, replayed: true };
     }
+    if (record?.rejectedAt !== undefined) {
+      return { ok: false, status: 502, error: 'send_failed', retryable: false, providerCode: record.providerCode };
+    }
     if (record && now() - record.firstAttemptAt > GROUP_SEND_UUID_REUSE_MS) {
       return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
     }
     if (deps.beforeAttempt) {
       try { await deps.beforeAttempt(); }
       catch (error) {
-        if (record) return { ok: false, status: 409, error: 'outcome_unknown', retryable: true };
+        if (record) return { ok: false, status: 409, error: 'outcome_unknown',
+          retryable: now() - record.firstAttemptAt <= GROUP_SEND_UUID_REUSE_MS };
         throw error;
       }
       if (record && now() - record.firstAttemptAt > GROUP_SEND_UUID_REUSE_MS) {
@@ -357,7 +370,7 @@ export async function sendRequestBoundMessage(
         uuid: groupSendUuid(deps.larkAppId, destination, requestId), state: 'pending', firstAttemptAt: now() };
       const overflow = Object.keys(active.records).length + 1 - limits.record;
       if (overflow > 0) {
-        const movable = oldestSent(active);
+        const movable = oldestSettled(active);
         // Decide the whole move before touching either file. Compacting only
         // part of the overflow would still be over the cap and would have
         // written the archive on a store_full response.
@@ -373,27 +386,37 @@ export async function sendRequestBoundMessage(
     }
     const deadline = record.firstAttemptAt + GROUP_SEND_UUID_REUSE_MS;
     let writes = 0;
+    let retryAfterWrite = false;
+    const onAttemptStart = () => {
+      // A reply can fail its topic check before it reaches beforeWrite again.
+      if (writes > 0) retryAfterWrite = true;
+    };
     const beforeWrite = () => {
       // Lark's internal retries and rate-limit waits can outlive this invocation.
       if (now() > deadline) throw new UuidWindowExpired();
       writes++;
     };
     let messageId: string;
-    try { messageId = await deps.send(record.uuid, beforeWrite); }
+    try { messageId = await deps.send(record.uuid, beforeWrite, onAttemptStart); }
     catch (error) {
       if (error instanceof UuidWindowExpired) return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
       const failure = sendFailure(error);
       if (failure.retryable === false) {
         // A rejection of a later attempt cannot disprove an earlier delivery.
-        if (replayed || writes > 1) return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
-        // A first, definitive rejection created no message. It must not occupy
-        // one of the bounded pending slots forever.
-        delete active.records[k];
-        save(deps.storePath, active);
+        if (replayed || retryAfterWrite || writes > 1) return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
+        // Retain the digest and original error. This row can leave the live
+        // file in the same archive-first compaction as a successful send.
+        const latest = load(deps.storePath, deps.larkAppId);
+        latest.records[k] = { ...record, firstAttemptAt: REJECTED_FIRST_ATTEMPT, rejectedAt: now(), providerCode: failure.providerCode };
+        save(deps.storePath, latest);
       }
+      if (failure.retryable && now() > deadline) return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
       return failure;
     }
-    if (typeof messageId !== 'string' || !messageId) return { ok: false, status: 502, error: 'send_failed', retryable: true };
+    if (typeof messageId !== 'string' || !messageId) {
+      if (now() > deadline) return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
+      return { ok: false, status: 502, error: 'send_failed', retryable: true };
+    }
     // Post-provider save rewrites only the live file. The archive was already
     // fsynced above when this send had to compact, and must not be rewritten here.
     const latest = load(deps.storePath, deps.larkAppId);

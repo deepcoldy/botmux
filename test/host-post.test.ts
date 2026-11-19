@@ -106,7 +106,7 @@ it('posts from a bare shell through signed daemon discovery to a group, topic, a
   expect(JSON.parse(topic.stdout)).toEqual({
     ok: true, larkAppId: APP, chatId: CHAT, rootMessageId: ROOT, requestId: expect.any(String), replayed: false, messageId: 'om_topic_sent',
   });
-  expect(transport.reply).toHaveBeenCalledExactlyOnceWith(APP, ROOT, topicText, 'text', true, expect.any(String), { chatId: CHAT }, { suppressHook: true, beforeWrite: expect.any(Function) });
+  expect(transport.reply).toHaveBeenCalledExactlyOnceWith(APP, ROOT, topicText, 'text', true, expect.any(String), { chatId: CHAT }, { suppressHook: true, beforeWrite: expect.any(Function), onAttemptStart: expect.any(Function) });
 
   transport.isInChat.mockClear();
   const direct = await runCli(['--user-open-id', USER, '--text-file', '-'], 'Action needed\n');

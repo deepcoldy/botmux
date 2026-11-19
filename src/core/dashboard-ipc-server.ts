@@ -9258,9 +9258,9 @@ ipcRoute('POST', HOST_POST_PATH, requireBoundBot(async (req, res) => {
         beforeAttempt,
         // Keep legacy group records readable by older daemons after a downgrade.
         storePath: join(config.session.dataDir, `host-posts-${larkAppId}.json`),
-        send: (uuid, beforeWrite) => userOpenId !== undefined
+        send: (uuid, beforeWrite, onAttemptStart) => userOpenId !== undefined
           ? sendUserMessage(larkAppId, userOpenId, text, 'text', uuid, undefined, { beforeWrite })
-          : replyMessage(larkAppId, rootMessageId!, text, 'text', true, uuid, { chatId }, { suppressHook: true, beforeWrite }),
+          : replyMessage(larkAppId, rootMessageId!, text, 'text', true, uuid, { chatId }, { suppressHook: true, beforeWrite, onAttemptStart }),
         onCommitted: (replyId, uuid) => {
           if (rootMessageId) emitHookEventLocal('outbound.reply', {
             larkAppId, chatId, messageId: rootMessageId, replyId, uuid, requestId,

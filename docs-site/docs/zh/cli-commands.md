@@ -187,7 +187,7 @@ printf '%s\n' "需要人工处理" | botmux post --bot cli_xxx --user-open-id ou
 
 `--bot` 只接受 `cli_` 开头的飞书 App ID。CI 或告警系统应通过 `--request-id` 传入稳定的事件 ID（8–64 个字母、数字、下划线或连字符），省略时 CLI 自动生成。成功时 stdout 的 JSON 回执包含 `requestId`、`messageId`、`replayed`、Bot 和目的地。群消息与请求绑定群发送 API 共用去重记录。
 
-参数无效退出 2。投递出错退出 1，stderr 输出 JSON。超时、连接中断或无法确认回执时返回 `outcome_unknown`，消息可能已发出。`retryable: true` 时，在首次尝试后 50 分钟内用相同的 Bot、目的地、正文和请求 ID 重试。窗口过期且结果仍未知时返回 `retryable: false`，请人工核对。相同 ID 改正文会返回 `request_conflict`，明确的飞书拒绝返回 `send_failed`。已成功的请求在有界归档保留期内返回原消息 ID。
+参数无效退出 2。投递出错退出 1，stderr 输出 JSON。超时、连接中断或无法确认回执时返回 `outcome_unknown`，消息可能已发出。`retryable: true` 时，在首次尝试后 50 分钟内用相同的 Bot、目的地、正文和请求 ID 重试。窗口过期且结果仍未知时返回 `retryable: false`，请人工核对。相同 ID 改正文会返回 `request_conflict`，首次明确遭飞书拒绝后，记录保留期间用原 ID 和正文重试会返回原来的 `send_failed`。修改正文需使用新 ID。已成功的请求在有界归档保留期内返回原消息 ID。
 
 ## Dashboard 登录链接
 

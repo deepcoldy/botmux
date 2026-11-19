@@ -21,6 +21,7 @@ import {
   parseGroupSendBody,
   readRequestBoundGroupMessage,
   sendRequestBoundGroupMessage,
+  sendRequestBoundMessage,
   __setGroupSendLimitsForTest,
   type GroupSendCommitted,
   type GroupSendRecord,
@@ -159,6 +160,62 @@ describe('sendRequestBoundGroupMessage', () => {
     clock += GROUP_SEND_UUID_REUSE_MS + 1;
     expect(await sendRequestBoundGroupMessage(deps(send), input())).toMatchObject({ error: 'outcome_unknown', retryable: false });
     expect(send).toHaveBeenCalledTimes(6);
+  });
+
+  it.each([{ chatId: CHAT }, { chatId: CHAT, rootMessageId: 'om_root' }, { userOpenId: 'ou_user' }])(
+    'retains the original rejection and digest across compaction for %o', async target => {
+      __setGroupSendLimitsForTest({ record: 2, compactBatch: 1, archive: 1 });
+      const send = vi.fn().mockRejectedValueOnce(larkApiError('send message', { code: 230025 })).mockResolvedValue('om_sent');
+      const submit = (id: string, text: string) => sendRequestBoundMessage({
+        larkAppId: APP, storePath, now: () => clock, send,
+      }, target, id, text);
+      const rejected = await submit('rejected_id', 'original');
+      expect(rejected).toMatchObject({ error: 'send_failed', retryable: false, providerCode: 230025 });
+      clock += GROUP_SEND_UUID_REUSE_MS + 1;
+      for (const id of ['filler_01', 'filler_02']) {
+        expect((await submit(id, 'filler')).ok).toBe(true);
+        expect(await submit('rejected_id', 'original')).toEqual(rejected);
+        expect(await submit('rejected_id', 'changed')).toMatchObject({ status: 409, error: 'request_conflict' });
+      }
+      expect(send).toHaveBeenCalledTimes(3);
+      clock++;
+      await submit('filler_03', 'filler');
+      expect(await submit('rejected_id', 'changed')).toMatchObject({ ok: true, replayed: false });
+    },
+  );
+
+  it('reports a pending retry as expired when its destination check throws after the window', async () => {
+    const send = vi.fn().mockRejectedValueOnce(new Error('lost receipt'));
+    await sendRequestBoundGroupMessage(deps(send), input());
+    clock += GROUP_SEND_UUID_REUSE_MS - 1;
+    const result = await sendRequestBoundGroupMessage({
+      ...deps(send), beforeAttempt: async () => { clock += 2; throw new Error('lookup failed'); },
+    }, input());
+    expect(result).toMatchObject({ error: 'outcome_unknown', retryable: false });
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it.each(['lost', 'empty', 'accepted'])('settles a late %s provider response using the current time', async outcome => {
+    const send = vi.fn(async () => {
+      clock += GROUP_SEND_UUID_REUSE_MS + 1;
+      if (outcome === 'lost') throw new Error('lost receipt');
+      return outcome === 'empty' ? '' : 'om_accepted';
+    });
+    const result = await sendRequestBoundGroupMessage(deps(send), input());
+    const expected = outcome === 'accepted' ? { ok: true, messageId: 'om_accepted' } : { error: 'outcome_unknown', retryable: false };
+    expect(result).toMatchObject(expected);
+    expect(await sendRequestBoundGroupMessage(deps(send), input())).toMatchObject(expected);
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it('leaves an expired, digest-bound v1 row for a downgraded group daemon', async () => {
+    const send = vi.fn().mockRejectedValueOnce(larkApiError('send message', { code: 230025 }));
+    const request = input('legacy_id', 'body');
+    await sendRequestBoundGroupMessage(deps(send), request);
+    const row = JSON.parse(readFileSync(storePath, 'utf8')).records[`${CHAT}\0${request.requestId}`];
+    expect(row).toMatchObject({ state: 'pending', contentDigest: contentDigest('body') });
+    expect(clock - row.firstAttemptAt).toBeGreaterThan(GROUP_SEND_UUID_REUSE_MS);
+    expect(row.messageId).toBeUndefined();
   });
 
   it('marks definite provider rejections as not retryable', async () => {

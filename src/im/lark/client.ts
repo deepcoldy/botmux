@@ -432,12 +432,13 @@ export async function replyMessage(
   replyInThread: boolean = false,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: OutboundMessageOptions,
+  options?: OutboundMessageOptions & { onAttemptStart?: () => void },
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
   content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
+    options?.onAttemptStart?.();
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
     // The source/authority fence follows the awaited destination lookup.
