@@ -2276,6 +2276,49 @@ function publishExecutionActivityPatch(ds: DaemonSession): void {
 }
 
 const TURN_EXPLICIT_MENTION_MAX = 64;
+/** terminalErrorCode used when the claude transcript bridge ends a turn at a
+ *  screen-idle boundary WITHOUT ever observing an explicit transcript terminal
+ *  or output (`turn_terminal outputDisposition:'boundary_unobserved'` from the
+ *  worker) — the killed-CLI-mid-turn shape. Surfaces to HTTP async/wait callers
+ *  as state=failed / errorCode=trigger_failed / terminalErrorCode=below. */
+const TURN_ENDED_UNOBSERVED = 'turn_ended_unobserved';
+
+/**
+ * Take a session to an observable fail-closed terminal after a durable async
+ * write failure. closeSession persists a `closed` session row, so
+ * trigger-result's closed-branch resolves `failed` after an unclean daemon
+ * restart instead of stranding the poller on `running` against a durable
+ * `pending` record and an `open` row. Never throws into the IPC handler: a
+ * refusal or throw is logged as UNPROVEN and the convergence stamp retains its
+ * worker-exit / terminal-replay backstop. Same contract as
+ * failCloseIdempotentTurnIfConvergenceWriteFailed in daemon.ts.
+ */
+function failCloseSessionAfterAsyncPersistFailure(
+  ds: DaemonSession,
+  turnId: string,
+  context: string,
+): void {
+  const t = tag(ds);
+  logger.error(
+    `[${t}] ${context} for ${turnId.substring(0, 8)}; fail-closing session`,
+  );
+  void Promise.resolve()
+    .then(() => requireCallbacks().closeSession(ds))
+    .then((closed) => {
+      if (closed === false) {
+        logger.error(
+          `[${t}] Fail-close refused for ${turnId.substring(0, 8)} (${context}); `
+          + 'session retained for retry',
+        );
+      }
+    })
+    .catch((closeErr) => {
+      logger.error(
+        `[${t}] Fail-close threw; close state is UNPROVEN for ${turnId.substring(0, 8)} `
+        + `(${context}): ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
+      );
+    });
+}
 /** Posted-receipt memory. Bounded for the same reason as the origin FIFO, and
  *  larger than any plausible replay window within one session's lifetime. */
 const SILENT_RECEIPT_DEDUPE_MAX = 64;
@@ -25075,6 +25118,235 @@ function setupWorkerHandlers(
               `[${t}] Failed to deliver turn failure card: `
               + `${err instanceof Error ? err.message : String(err)}`,
             );
+          }
+        }
+        // HTTP settle-on-UNOBSERVED-boundary (headless residual-running):
+        // the claude transcript bridge pops a started turn at a screen-idle
+        // boundary when the CLI never produced a transcript terminal or output.
+        // The dominant cause is the CLI dying mid-turn (killed/crashed) — the
+        // frozen pane still matches the idle detector, so the pop fires and
+        // `emitReadyTurns` emits `completed` with NO final_output. Neither the
+        // failure gate above (completed ≠ failed/ambiguous) nor the
+        // nothing_to_send arm settles it, leaving HTTP waiters hanging and
+        // durable async triggers `pending` against an `open` session record
+        // (`running` forever while the session auto-restarts into an idle
+        // REPL). The worker now labels that shape
+        // `outputDisposition: 'boundary_unobserved'` so the daemon can keep its
+        // positive-evidence policy and settle both Wait Mode and Async Mode
+        // fail-closed: for the claude bridge, `final_output` is guaranteed to
+        // precede this terminal (same-worker IPC ordering), so a still-pending
+        // caller can never receive an answer afterwards. The RPC-hydration
+        // shape deliberately does NOT carry this label, a bare `completed`
+        // still settles nothing, and Feishu turns have no HTTP waiter/async
+        // sink so they are unaffected.
+        // HTTP settle-on-EXPLICIT-FINAL-DELIVERED: the model's answer went out
+        // over IM via a final `botmux send`, so the turn IS delivered even
+        // though the HTTP transport captured no final_output. Without this
+        // branch the bare completed terminal (the worker correctly withholds
+        // boundary_unobserved because output WAS observed) would leave Wait
+        // callers on wait_timeout and async triggers polling `running` forever.
+        // Settlement mirrors the nothing_to_send completed-empty contract:
+        // resolve/record completed with empty content, durable so a restarted
+        // daemon reads `completed` rather than `running`.
+        if (msg.status === 'completed'
+          && msg.outputDisposition === 'explicit_final_delivered'
+          && !ds.session.vcMeetingReceiver) {
+          const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
+          if (waitPromise) {
+            nonLarkFailureHandled = true;
+            rememberHttpTerminal(ds, msg.turnId);
+            ds.pendingWaitPromises?.delete(msg.turnId);
+            waitPromise.resolve('');
+            logger.info(
+              `[${t}] Settled Wait Mode HTTP turn ${msg.turnId.substring(0, 8)} `
+              + 'completed-empty (explicit final delivered over IM)',
+            );
+          }
+          const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
+          const asyncSink = !!asyncResult
+            || (virtualDeliverySinkForChatId(ds.chatId) === 'http_async'
+              && !msg.turnId.startsWith('local-')
+              && !msg.turnId.startsWith('scheduled-'));
+          if (asyncSink) {
+            nonLarkFailureHandled = true;
+            if (asyncResult?.status === 'completed' || asyncResult?.status === 'failed'
+              || asyncResult?.status === 'interrupted') {
+              // An earlier in-memory settlement (captured final_output, provider
+              // failure, caller interrupt) wins, but in-memory terminality is NOT
+              // durable proof: its strict write may have failed while this
+              // projection was retained. Release the convergence stamp only when
+              // the durable record is itself terminal; otherwise keep the stamp
+              // (worker-exit/boot reconcile backstop) and fail-close so a
+              // restarted resolver cannot return `running` against an open row.
+              let durableTerminal = false;
+              try {
+                const persisted = asyncTriggerStore.lookup(ds.session.sessionId, msg.turnId);
+                durableTerminal = !!persisted && persisted.result.status !== 'pending';
+              } catch (lookupErr) {
+                logger.error(
+                  `[${t}] Durable lookup failed while guarding explicit-final stamp for `
+                  + `${msg.turnId.substring(0, 8)}: `
+                  + `${lookupErr instanceof Error ? lookupErr.message : String(lookupErr)}`,
+                );
+              }
+              if (durableTerminal) {
+                ds.idempotentAsyncTurns?.delete(msg.turnId);
+              } else {
+                failCloseSessionAfterAsyncPersistFailure(
+                  ds, msg.turnId, `explicit-final on in-memory ${asyncResult.status} without durable terminal`,
+                );
+              }
+              logger.info(
+                `[${t}] Ignored explicit-final terminal for already-${asyncResult.status} async HTTP turn `
+                + msg.turnId.substring(0, 8),
+              );
+            } else {
+              const completedAt = Date.now();
+              if (asyncResult?.status === 'pending') {
+                asyncResult.status = 'completed';
+                asyncResult.content = '';
+                asyncResult.completedAt = completedAt;
+              }
+              rememberHttpTerminal(ds, msg.turnId);
+              try {
+                // STRICT write: the best-effort recordCompleted swallows disk
+                // errors (save() only logs), which would leave durable `pending`
+                // while memory says completed — an unclean restart then resolves
+                // `running` forever. The throwing strict API makes a lost write
+                // observable so the catch can fail-close the session.
+                const outcome = asyncTriggerStore.recordCompletedStrict(
+                  ds.session.sessionId, msg.turnId, '', completedAt, ds.larkAppId,
+                );
+                if (outcome === 'terminal') {
+                  // Durable already holds a stronger terminal (explicit
+                  // interrupt / turn_terminal failure). Drop the in-memory
+                  // completed projection so trigger-result reads that proof.
+                  ds.asyncTriggerResults?.delete(msg.turnId);
+                }
+                // Either outcome proves durable terminality: release the stamp.
+                ds.idempotentAsyncTurns?.delete(msg.turnId);
+              } catch (err) {
+                // Durable completed write failed: keep the convergence stamp and
+                // fail-close the session row so a restarted resolver returns
+                // `failed` instead of `running` against an open session.
+                logger.error(
+                  `[${t}] Failed to persist explicit-final completion for `
+                  + `${msg.turnId.substring(0, 8)} (convergence stamp retained): `
+                  + `${err instanceof Error ? err.message : String(err)}`,
+                );
+                failCloseSessionAfterAsyncPersistFailure(
+                  ds, msg.turnId, 'explicit-final completion persist failure',
+                );
+              }
+              logger.info(
+                `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
+                + 'completed-empty (explicit final delivered over IM)',
+              );
+            }
+          }
+        }
+        if (msg.status === 'completed'
+          && msg.outputDisposition === 'boundary_unobserved'
+          && !ds.session.vcMeetingReceiver) {
+          const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
+          if (waitPromise) {
+            nonLarkFailureHandled = true;
+            rememberHttpTerminal(ds, msg.turnId);
+            ds.pendingWaitPromises?.delete(msg.turnId);
+            const failure = new Error(`Worker turn failed: ${TURN_ENDED_UNOBSERVED}`);
+            if (waitPromise.reject) waitPromise.reject(failure);
+            else waitPromise.resolve(`ERROR: ${failure.message}`);
+            logger.info(
+              `[${t}] Settled Wait Mode HTTP turn ${msg.turnId.substring(0, 8)} `
+              + `failed (${TURN_ENDED_UNOBSERVED})`,
+            );
+          }
+          const asyncResult = ds.asyncTriggerResults?.get(msg.turnId);
+          const asyncSink = !!asyncResult
+            || (virtualDeliverySinkForChatId(ds.chatId) === 'http_async'
+              && !msg.turnId.startsWith('local-')
+              && !msg.turnId.startsWith('scheduled-'));
+          if (asyncSink) {
+            nonLarkFailureHandled = true;
+            if (asyncResult?.status === 'completed') {
+              // A partial answer was already published as final_output (killed
+              // mid-answer). Known output is stronger than the unobserved
+              // boundary — keep it, only release the convergence entry.
+              ds.idempotentAsyncTurns?.delete(msg.turnId);
+              logger.info(
+                `[${t}] Ignored unobserved terminal for completed async HTTP turn `
+                + msg.turnId.substring(0, 8),
+              );
+            } else if (asyncResult?.status === 'failed' || asyncResult?.status === 'interrupted') {
+              // Preserve an earlier stronger terminal (e.g. provider failure or
+              // caller interrupt) without overwriting its persisted code or
+              // dropping any convergence stamp that earlier failure retained.
+              logger.info(
+                `[${t}] Ignored unobserved terminal for already-${asyncResult.status} async HTTP turn `
+                + msg.turnId.substring(0, 8),
+              );
+            } else {
+              const failedAt = Date.now();
+              if (asyncResult?.status === 'pending') {
+                asyncResult.status = 'failed';
+                asyncResult.failedAt = failedAt;
+                asyncResult.errorCode = 'trigger_failed';
+                asyncResult.terminalErrorCode = TURN_ENDED_UNOBSERVED;
+              }
+              rememberHttpTerminal(ds, msg.turnId);
+              try {
+                const outcome = asyncTriggerStore.recordTerminalFailureStrict(
+                  ds.session.sessionId,
+                  msg.turnId,
+                  failedAt,
+                  ds.larkAppId,
+                  TURN_ENDED_UNOBSERVED,
+                );
+                if (outcome === 'already_completed') {
+                  // Durable completed proof (e.g. a racing final_output persist)
+                  // is stronger. Drop the stale in-memory projection so
+                  // trigger-result reads that proof instead.
+                  ds.asyncTriggerResults?.delete(msg.turnId);
+                }
+                // Release the worker-exit convergence stamp ONLY after the
+                // durable terminal write landed. On a throw (EIO/ENOSPC) the
+                // in-memory failed projection still terminates this daemon's
+                // polling, but the durable record stays `pending`: deleting the
+                // stamp would leave a restarted daemon with no backstop — the
+                // trigger polls `running` forever. Keeping it lets
+                // convergeIdempotentAsyncTurnOnWorkerExit write the
+                // dispatch_unknown terminal (and fail-close the session if that
+                // write also fails); a replayed turn_terminal retries this
+                // strict write first.
+                ds.idempotentAsyncTurns?.delete(msg.turnId);
+              } catch (err) {
+                // The live failed projection terminates THIS daemon's polling,
+                // but the durable record stays `pending`. Neither the projection
+                // nor the retained convergence stamp survives an unclean daemon
+                // exit: a restarted daemon would read `pending` against an `open`
+                // session row and the poller would resolve `running` forever.
+                // The worker-exit backstop cannot be assumed either — the
+                // original shape is the CLI dying while this worker keeps
+                // running, so no exit callback fires, and an unkeyed virtual-sink
+                // trigger carries no convergence stamp at all. Take the session
+                // to an observable fail-closed terminal NOW (the same contract
+                // as the idempotency exit-convergence double-failure path):
+                // its persisted row becomes `closed` and trigger-result's
+                // closed-branch resolves `failed` after any restart.
+                logger.error(
+                  `[${t}] Failed to persist async unobserved-terminal for `
+                  + `${msg.turnId.substring(0, 8)} (convergence stamp retained): `
+                  + `${err instanceof Error ? err.message : String(err)}`,
+                );
+                failCloseSessionAfterAsyncPersistFailure(
+                  ds, msg.turnId, 'unobserved-terminal persist failure',
+                );
+              }
+              logger.info(
+                `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
+                + `failed (${TURN_ENDED_UNOBSERVED})`,
+              );
+            }
           }
         }
         if (!outcomeExcluded && !nonLarkFailureHandled && !ordinaryHttpTerminal) {

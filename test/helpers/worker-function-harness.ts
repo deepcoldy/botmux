@@ -30,7 +30,7 @@ import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-obse
 import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
 import { TurnRecapRecorder } from '../../src/services/turn-recap.js';
-import { stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from '../../src/core/rewind-backup-retention.js';
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
@@ -169,6 +169,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     const keepaliveDefault = defaultScopedWorkerState(scope, key);
     if (keepaliveDefault !== undefined) return keepaliveDefault;
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
+    if (key === 'isFinalBridgeSendMarker') return isFinalBridgeSendMarker;
     if (key === 'rewindableErrorCode') return rewindableErrorCode;
     if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
     if (key === 'pruneRewindBackupsBeside') return pruneRewindBackupsBeside;
