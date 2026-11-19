@@ -6444,8 +6444,9 @@ async function noteTurnFinalOutsideReplyCard(
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | typeof FEEDBACK_SEND_LEASE_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
   let hostSecret: string | undefined;
@@ -6478,6 +6479,7 @@ async function postSessionCliIpc(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(requestBody),
+    ...(signal ? { signal } : {}),
   } satisfies RequestInit;
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
@@ -11397,7 +11399,11 @@ function resolveDispatchDispatcherAppId(input: {
   return !dispatcherAppId || dispatcherAppId === input.selfAppId ? undefined : dispatcherAppId;
 }
 
-async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflight?: SendPreflight): Promise<void> {
+async function cmdSend(
+  rest: string[],
+  beginFeedbackEffect?: (relay?: FeedbackSendLeaseRelay) => Promise<void>,
+  preflight?: SendPreflight,
+): Promise<void> {
   const resolved = preflight ?? await preflightSendInvocation(rest);
   if (resolved.kind === 'help') {
     console.log(SEND_HELP_BODY);
@@ -12439,12 +12445,24 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       throw error;
     }
   };
+  // A read-isolated CLI can neither read its own birth identity (setuid `ps`)
+  // nor write the data dir, so the feedback send lease falls back to the
+  // origin session's daemon, which takes it on this process's behalf.
+  const feedbackSendLeaseRelay = (): FeedbackSendLeaseRelay | undefined => {
+    const leaseSessionId = originSessionId;
+    const ipcPort = resolveDaemonIpcPort(isolatedAttestationContext?.ipcPortFallback, process.env.BOTMUX_DAEMON_IPC_PORT);
+    if (!leaseSessionId || !ipcPort) return undefined;
+    return async (body, signal) => {
+      const response = await postSessionCliIpc(ipcPort, leaseSessionId, FEEDBACK_SEND_LEASE_ROUTE, body, signal);
+      return { ok: response.ok, status: response.status, body: await response.json().catch(() => undefined) };
+    };
+  };
   const revalidateIsolatedOriginBeforeEffect = async (
     lookup?: TopicMessageLookup,
   ): Promise<ManagedOriginAttestation | undefined> => {
     await checkSendTopics?.(lookup);
     const origin = await revalidateIsolatedOrigin();
-    beginFeedbackEffect?.();
+    await beginFeedbackEffect?.(feedbackSendLeaseRelay());
     return origin;
   };
   const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
@@ -22012,12 +22030,16 @@ switch (command) {
     break;
   }
   case 'send': {
-    let releaseFeedbackEffect: (() => void) | undefined;
+    let feedbackEffectLease: Promise<() => Promise<void>> | undefined;
     try {
-      await cmdSend(process.argv.slice(3), () => {
-        releaseFeedbackEffect ??= acquireFeedbackSendLease(resolveDataDir());
+      await cmdSend(process.argv.slice(3), async (relay) => {
+        feedbackEffectLease ??= acquireFeedbackSendLeaseWithRelay({
+          acquireLocal: () => acquireFeedbackSendLease(resolveDataDir()),
+          relay,
+        });
+        await feedbackEffectLease;
       }, sendPreflight);
-      releaseFeedbackEffect?.();
+      if (feedbackEffectLease) await (await feedbackEffectLease)();
     }
     catch (error) {
       if (!(error instanceof TopicSendError)) throw error;
@@ -22140,3 +22162,4 @@ switch (command) {
     break;
 }
 import { acquireFeedbackSendLease } from './services/feedback-maintenance.js';
+import { acquireFeedbackSendLeaseWithRelay, FEEDBACK_SEND_LEASE_ROUTE, type FeedbackSendLeaseRelay } from './services/feedback-send-lease-relay.js';

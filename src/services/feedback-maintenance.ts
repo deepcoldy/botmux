@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { atomicWriteFileSync, isAtomicWriteTempName } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
-import { readDurableProcessIdentity, readSelfApproxStartIdentity } from '../utils/process-identity.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { readFeedbackStorageConfig } from './feedback-storage-config.js';
 import { FEEDBACK_TABLES } from './feedback-tables.js';
@@ -47,22 +47,65 @@ export function assertFeedbackAdmission(dataDir: string): void {
 export function feedbackMaintenanceActive(dataDir: string): boolean {
   try { assertFeedbackAdmission(dataDir); return false; } catch { return true; }
 }
-export function acquireFeedbackSendLease(dataDir: string): () => void {
-  mkdirSync(dataDir, { recursive: true });
-  // A sandboxed `botmux send` (macOS Seatbelt) cannot exec the setuid `/bin/ps`,
-  // so the exact identity is unreadable from inside; refusing here would make
-  // every send of a sandboxed bot fail. Fall back to a self-reported birth time
-  // that the (unsandboxed) maintenance inspector verifies against the real one.
-  const identity = readDurableProcessIdentity(process.pid) ?? readSelfApproxStartIdentity();
-  if (!identity) throw new Error('feedback_process_identity_unavailable');
-  const directory = join(dataDir, 'feedback-send-leases');
+const sendLeaseDirectory = (dataDir: string) => join(dataDir, 'feedback-send-leases');
+/** Admission and the lease write share the control lock, so a lease either
+ *  lands before maintenance starts (and blocks freezing) or is refused. */
+function writeSendLease(dataDir: string, processId: number, identity: string, sessionId?: string): string {
+  const directory = sendLeaseDirectory(dataDir);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const path = join(directory, `${process.pid}-${crypto.randomUUID()}.json`);
+  const name = `${processId}-${crypto.randomUUID()}.json`;
   withFileLockSync(controlPath(dataDir), () => {
     assertFeedbackAdmission(dataDir);
-    atomicWriteFileSync(path, JSON.stringify({ processId: process.pid, processStartId: identity }), { mode: 0o600, durable: true, followTargetSymlink: false });
+    atomicWriteFileSync(join(directory, name), JSON.stringify({ processId, processStartId: identity, ...(sessionId ? { sessionId } : {}) }), { mode: 0o600, durable: true, followTargetSymlink: false });
   });
+  return name;
+}
+export function acquireFeedbackSendLease(dataDir: string): () => void {
+  mkdirSync(dataDir, { recursive: true });
+  const identity = readDurableProcessIdentity(process.pid);
+  if (!identity) throw new Error('feedback_process_identity_unavailable');
+  const path = join(sendLeaseDirectory(dataDir), writeSendLease(dataDir, process.pid, identity));
   return () => { try { unlinkSync(path); } catch {} };
+}
+
+/**
+ * Daemon-side lease for a session CLI that cannot take one itself: a macOS
+ * read-isolated `botmux send` can neither exec the setuid `ps` (its own birth
+ * identity) nor write the data dir (denied by the session's Seatbelt policy).
+ * The daemon runs outside the sandbox, so it reads the CLI's exact identity and
+ * writes the same lease the CLI would have written — inspection, liveness and
+ * acknowledgement stay unchanged. The CLI is blocked on this request, so the
+ * pid it reports cannot be recycled before the identity is read.
+ *
+ * Trust boundary: the caller passed `sessionCliIpcAuth` for `sessionId`. The
+ * worst it can do is keep a lease on another of its user's live processes,
+ * which delays a maintenance freeze until that process exits — something a
+ * non-isolated CLI can do by writing the lease directory directly. It can only
+ * release leases recorded for its own session and pid.
+ */
+export function acquireFeedbackSendLeaseFor(dataDir: string, input: { processId: number; sessionId: string }): string {
+  if (!Number.isSafeInteger(input.processId) || input.processId < 2 || input.processId === process.pid || !input.sessionId) {
+    throw new Error('feedback_send_lease_invalid');
+  }
+  mkdirSync(dataDir, { recursive: true });
+  const identity = readDurableProcessIdentity(input.processId);
+  if (!identity) throw new Error('feedback_process_identity_unavailable');
+  return writeSendLease(dataDir, input.processId, identity, input.sessionId);
+}
+export function releaseFeedbackSendLeaseFor(dataDir: string, input: { lease: string; processId: number; sessionId: string }): void {
+  if (!Number.isSafeInteger(input.processId) || !new RegExp(`^${input.processId}-[0-9a-f-]+\\.json$`).test(input.lease)) {
+    throw new Error('feedback_send_lease_invalid');
+  }
+  const path = join(sendLeaseDirectory(dataDir), input.lease);
+  let lease: { processId?: unknown; sessionId?: unknown };
+  try { lease = JSON.parse(readFileSync(path, 'utf8')); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw new Error('feedback_send_lease_invalid');
+  }
+  if (lease.processId !== input.processId || lease.sessionId !== input.sessionId) throw new Error('feedback_send_lease_not_owned');
+  try { unlinkSync(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 }
 export function writeFeedbackParticipant(dataDir: string, input: Omit<Participant, 'processId' | 'processStartId' | 'updatedAt'>): void {
   const identity = readDurableProcessIdentity(process.pid);

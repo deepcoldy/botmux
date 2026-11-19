@@ -221,6 +221,7 @@ import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptRepl
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn-reply-card.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import { FEEDBACK_SEND_LEASE_ROUTE, handleFeedbackSendLeaseRelay } from '../services/feedback-send-lease-relay.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -1310,7 +1311,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -2470,6 +2471,22 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
   }
+});
+
+/** Feedback send lease for an isolated CLI that cannot take it in-process
+ * (see acquireFeedbackSendLeaseFor); bound to the authenticated session. */
+ipcRoute('POST', `/api/sessions/:sessionId/${FEEDBACK_SEND_LEASE_ROUTE}`, async (req, res, params) => {
+  let body: Record<string, unknown> | undefined;
+  try { body = await readJsonBody<Record<string, unknown>>(req, 4096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  const ds = findActiveBySessionId(params.sessionId);
+  // Managed meeting sends originate in a receiver session too. This route only
+  // guards feedback maintenance; it does not perform a managed session action.
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
+  if (!auth.ok || !ds) return jsonRes(res, 403, { ok: false, error: auth.ok ? 'session_not_active' : auth.error });
+  const result = handleFeedbackSendLeaseRelay(config.session.dataDir, ds.session.sessionId, body);
+  return jsonRes(res, result.status, result.body);
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, params) => {
