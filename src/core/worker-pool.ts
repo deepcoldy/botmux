@@ -7097,8 +7097,9 @@ function postUnifiedReplyPlaceholder(
   ds: DaemonSession,
   sessionReply: Parameters<typeof postTurnStartingCard>[1],
   turnId: string,
+  eventKind: 'refresh' | 'start' = 'refresh',
 ): Promise<boolean> {
-  return updateTurnReplyCard(ds, turnId, { kind: 'refresh' },
+  return updateTurnReplyCard(ds, turnId, { kind: eventKind },
     (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite }),
     { dispatchAttempt: replyCardDispatchAttempt(ds, turnId) })
     .then(result => !!result).catch(error => {
@@ -7108,14 +7109,15 @@ function postUnifiedReplyPlaceholder(
 }
 
 /** Post a placeholder that was held back until this turn became the capture
- * identity. Returns false when nothing was waiting or this turn is not it. */
+ * identity. Use `start` because the queue-commit's working edge may have been
+ * held back too. Returns false when nothing was waiting or this turn is not it. */
 export function releaseDeferredUnifiedReplyCard(
   ds: DaemonSession,
   sessionReply: Parameters<typeof postTurnStartingCard>[1],
 ): Promise<boolean> {
   const turnId = takeReadyUnifiedReply(ds);
   if (!turnId || replyCardModeFor(ds, turnId) === 'legacy') return Promise.resolve(false);
-  return trackStartingCardPublication(ds, postUnifiedReplyPlaceholder(ds, sessionReply, turnId));
+  return trackStartingCardPublication(ds, postUnifiedReplyPlaceholder(ds, sessionReply, turnId, 'start'));
 }
 
 async function postTurnStartingStatusCard(
@@ -21348,9 +21350,15 @@ function setupWorkerHandlers(
         }
         if (!managedAuxUiSuppressed(msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;
-          void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
-            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
-            { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card start: ${error.message}`));
+          if (replyCardModeFor(ds, msg.turnId) !== 'legacy' && unifiedReplyTurnNotCapturing(ds, msg.turnId)) {
+            // Queue ownership is not terminal ownership. In particular, do not
+            // let the start event bypass the deferred admission placeholder.
+            rememberDeferredUnifiedReply(ds, msg.turnId);
+          } else {
+            void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
+              (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
+              { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card start: ${error.message}`));
+          }
         }
         break;
       }

@@ -13,6 +13,7 @@ import { pendingStartingCardPublication } from '../src/core/starting-card-public
  * Run:  pnpm vitest run test/recall-frozen-cards.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -158,6 +159,8 @@ import {
   USAGE_REFRESH_INTERVAL_MS,
   canRestoreStreamingCardIdentity,
   restoreStreamingCardIdentityFromProof,
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { replyCardModeFor } from '../src/core/turn-reply-card.js';
 import { MessageWithdrawnError, MessageUpdateExpiredError } from '../src/im/lark/client.js';
@@ -846,9 +849,55 @@ describe('postTurnStartingCard', () => {
     expect(pendingStartingCardPublication(ds)).toBeUndefined();
     expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
     expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
-    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'start' });
     await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
     expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds the queue-commit start until capture identity releases a working card', async () => {
+    vi.stubEnv('BOTMUX_SANDBOX', '');
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        disableStreamingCard: true,
+        replyCardMode: 'unified',
+        apiOnly: false,
+      },
+    } as any);
+    const ds = makeDs();
+    const worker = new EventEmitter() as any;
+    worker.killed = false;
+    worker.connected = true;
+    worker.pid = 123;
+    worker.send = vi.fn();
+    worker.kill = vi.fn();
+    worker.stdout = new EventEmitter();
+    worker.stderr = new EventEmitter();
+    ds.worker = worker;
+    ds.workerGeneration = 3;
+    ds.session.workerGeneration = 3;
+    ds.captureIdentity = { workerGeneration: 3, revision: 1, turnId: 'om_active' };
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_followup';
+    activate(ds);
+    const sessionReply = vi.fn(async () => 'om_placeholder');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+
+    await expect(postTurnStartingCard(ds, sessionReply, 'om_followup')).resolves.toBe(false);
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, 3);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_followup' });
+    await flush();
+
+    expect(ds.captureIdentity?.turnId).toBe('om_active');
+    expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
+
+    worker.emit('message', { type: 'capture_identity', revision: 2, turnId: 'om_followup' });
+    await vi.waitFor(() => expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1));
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
+    expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'start' });
+    worker.removeAllListeners();
+    ds.worker = null;
   });
 
   it('posts the unified placeholder immediately when this turn is already capturing', async () => {
