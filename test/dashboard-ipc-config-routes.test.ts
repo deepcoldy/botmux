@@ -8,7 +8,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { setLarkAppId, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { config } from '../src/config.js';
 import { codexCleanupArchiveEnabled } from '../src/services/codex-cleanup-archive.js';
@@ -38,6 +38,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-max-live-workers', LEGACY],
   ['/api/bot-idle-suspend-minutes', LEGACY],
   ['/api/bot-archive-codex', LEGACY],
+  ['/api/bot-bare-rename-passthrough', LEGACY],
   ['/api/bot-riff', LEGACY],
   ['/api/bot-herdr', LEGACY],
   ['/api/bot-skills', LEGACY],
@@ -111,6 +112,11 @@ const CASES: readonly Case[] = [
   ['/api/bot-archive-codex', '{"archiveCodex":"off"}', 400, { ok: false, error: 'invalid_archive_codex' }],
   ['/api/bot-archive-codex', '{}', 400, { ok: false, error: 'invalid_archive_codex' }],
   ['/api/bot-archive-codex', '[]', 400, { ok: false, error: 'invalid_archive_codex' }],
+  // 默认关：true 落盘，false 删键；缺键 / 非布尔一律 400，不当成关闭。
+  ['/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":true}', 200, { ok: true, bareRenamePassthrough: true }, { bareRenamePassthrough: true }],
+  ['/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":false}', 200, { ok: true, bareRenamePassthrough: false }, { bareRenamePassthrough: undefined }],
+  ['/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":"on"}', 400, { ok: false, error: 'invalid_bare_rename_passthrough' }],
+  ['/api/bot-bare-rename-passthrough', '{}', 400, { ok: false, error: 'invalid_bare_rename_passthrough' }],
   ['/api/bot-sandbox-network-policy', '{"policy":null}', 200, { ok: true, sandboxNetworkPolicy: null, warnings: [] }],
   ['/api/bot-sandbox-network-policy', '{"policy":1,"x":2}', 400, { ok: false, error: 'policy_required' }],
   // 校验通过后由 applyConfigField 拒绝：reason 原样作为 400 的 error。
@@ -308,6 +314,25 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     expect(codexCleanupArchiveEnabled(APP_ID)).toBe(true);
     expect(await shown()).toBeNull();
     expect(persistedBot()).not.toHaveProperty('archiveCodex');
+  });
+
+  it('/api/bot-bare-rename-passthrough toggles the live switch and is echoed by the defaults GET', async () => {
+    const shown = async () => {
+      const res = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+      expect(res.status).toBe(200);
+      return (await res.json()).bareRenamePassthrough;
+    };
+    expect(await shown()).toBe(false);
+
+    expect((await put('/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":true}')).status).toBe(200);
+    // /rename 读的就是这份内存配置：保存后下一条 /rename 即按新值，无需重启。
+    expect(getBot(APP_ID).config.bareRenamePassthrough).toBe(true);
+    expect(await shown()).toBe(true);
+
+    expect((await put('/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":false}')).status).toBe(200);
+    expect(getBot(APP_ID).config.bareRenamePassthrough).toBeUndefined();
+    expect(await shown()).toBe(false);
+    expect(persistedBot()).not.toHaveProperty('bareRenamePassthrough');
   });
 
   it('/api/bot-env merges and removes keys, then clears an empty merge result', async () => {

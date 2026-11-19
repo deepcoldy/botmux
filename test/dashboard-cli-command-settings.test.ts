@@ -38,6 +38,52 @@ describe('Dashboard CLI command-name configuration', () => {
   });
 });
 
+describe('bare /rename passthrough switch', () => {
+  async function renderSwitch(bareRenamePassthrough: boolean | undefined, putOk = true) {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => (init?.method === 'PUT'
+      ? (putOk
+        ? { ok: true, status: 200, json: async () => ({ ok: true, ...JSON.parse(String(init.body)) }) }
+        : { ok: false, status: 400, json: async () => ({ ok: false, error: 'invalid_bare_rename_passthrough' }) })
+      : { ok: true, status: 200, json: async () => ({ ok: true, commands: [], summary: { total: 0, synced: 0, missing: 0, outdated: 0, remoteExtra: 0 } }) }));
+    vi.stubGlobal('fetch', fetchMock);
+    const patchBot = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => { renderer = TestRenderer.create(React.createElement(SlashCommandPermissionsSection, {
+      bot: { larkAppId: 'app1', cliId: 'claude-code', bareRenamePassthrough }, patchBot,
+    })); });
+    const toggle = () => renderer.root.findByProps({ 'data-action': 'toggle-bare-rename-passthrough' });
+    const flip = async (checked: boolean) => {
+      await act(async () => { toggle().props.onChange({ currentTarget: { checked } }); });
+    };
+    return { renderer, toggle, flip, fetchMock, patchBot };
+  }
+
+  it('is off when the bot has no setting and saves the new value through its endpoint', async () => {
+    const view = await renderSwitch(undefined);
+    expect(view.toggle().props.checked).toBe(false);
+
+    await view.flip(true);
+
+    expect(view.fetchMock).toHaveBeenCalledWith('/api/bots/app1/bare-rename-passthrough', expect.objectContaining({
+      method: 'PUT', body: JSON.stringify({ bareRenamePassthrough: true }),
+    }));
+    expect(view.patchBot).toHaveBeenCalledWith('app1', { bareRenamePassthrough: true });
+    expect(view.toggle().props.checked).toBe(true);
+    await act(async () => view.renderer.unmount());
+  });
+
+  it('rolls the switch back when the save is rejected', async () => {
+    const view = await renderSwitch(true, false);
+    expect(view.toggle().props.checked).toBe(true);
+
+    await view.flip(false);
+
+    expect(view.toggle().props.checked).toBe(true);
+    expect(view.patchBot).not.toHaveBeenCalled();
+    await act(async () => view.renderer.unmount());
+  });
+});
+
 async function tagEditor(initial = '') {
   const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => ({
     ok: true, status: 200,

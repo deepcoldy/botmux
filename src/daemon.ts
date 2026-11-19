@@ -7063,6 +7063,22 @@ function commandDepsForInvocation(input: {
     ...commandDeps,
     invocationContext: input.context,
     invocationReplyTarget: replyTarget,
+    deliverCliCommand: (ds, command, message) => {
+      // Same refusal as a routed passthrough: a raw command must not overtake
+      // an ordinary message that is still being submitted.
+      if (ds.worker && !ds.worker.killed && hasQueuedActivationAdmissionGate(ds)) {
+        logger.warn(`[${input.anchor.substring(0, 12)}] Refused ${command} before acceptance while queued activation owns raw submission order`);
+        return 'activation_pending';
+      }
+      return deliverPassthroughToExistingSession(ds, command, command, input.anchor, ds.larkAppId, {
+        messageId: input.messageId,
+        replyRootId: input.replyRootId,
+        senderOpenId: message.senderId,
+        senderIsBot: message.senderType === 'app' || message.senderType === 'bot',
+        substitute: false,
+        inThread: !!message.threadId,
+      }) ? 'delivered' : 'rejected';
+    },
     sessionReply: (rootId, content, msgType, larkAppId, turnId, opts) =>
       sessionReply(
         rootId,

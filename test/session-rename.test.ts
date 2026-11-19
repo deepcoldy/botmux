@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { DaemonSession } from '../src/core/types.js';
-import { effectiveSessionCliId, requestAgentSessionRename } from '../src/core/session-rename.js';
+import { effectiveSessionCliId, requestAgentSessionRename, resolveAgentSessionAutoRename } from '../src/core/session-rename.js';
 
 function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
@@ -109,5 +109,57 @@ describe('requestAgentSessionRename', () => {
       cliId: 'codex',
       error: 'channel closed',
     });
+  });
+});
+
+describe('resolveAgentSessionAutoRename', () => {
+  const claude = { cliId: 'claude-code', cliPathOverride: '/bin/claude' } as const;
+
+  it('offers the bare native /rename for a live Claude Code session', () => {
+    const send = vi.fn();
+    const ds = makeDs({ session: { ...makeDs().session, ...claude }, worker: liveWorker(send) });
+
+    expect(resolveAgentSessionAutoRename(ds)).toEqual({ status: 'available', cliId: 'claude-code', command: '/rename' });
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('follows the adopted CLI ahead of a stale persisted session CLI', () => {
+    const ds = makeDs({
+      session: { ...makeDs().session, cliId: 'codex', cliPathOverride: '/bin/claude' },
+      adoptedFrom: { cliId: 'claude-code', cwd: '/repo' },
+      worker: liveWorker(),
+    });
+
+    expect(resolveAgentSessionAutoRename(ds)).toMatchObject({ status: 'available', cliId: 'claude-code' });
+  });
+
+  it.each([
+    ['codex', '/bin/codex'],
+    ['traex', '/bin/traex'],
+    ['seed', '/bin/true'],
+  ] as const)('has nothing to hand over for live %s sessions', (cliId, cliPathOverride) => {
+    const ds = makeDs({ session: { ...makeDs().session, cliId, cliPathOverride }, worker: liveWorker() });
+
+    expect(resolveAgentSessionAutoRename(ds)).toEqual({ status: 'unsupported', cliId });
+  });
+
+  it.each(['riff', 'mojo', 'remote-runner'] as const)('never offers it through the %s backend', backendType => {
+    const ds = makeDs({ session: { ...makeDs().session, ...claude, backendType }, worker: liveWorker() });
+
+    expect(resolveAgentSessionAutoRename(ds)).toEqual({ status: 'unsupported', cliId: 'claude-code' });
+  });
+
+  it.each([
+    ['missing', null],
+    ['killed', { killed: true, connected: true, send: vi.fn() }],
+    ['disconnected', { killed: false, connected: false, send: vi.fn() }],
+  ])('reports not_running for Claude Code with a %s worker', (_label, worker) => {
+    const ds = makeDs({ session: { ...makeDs().session, ...claude }, worker: worker as any });
+
+    expect(resolveAgentSessionAutoRename(ds)).toEqual({ status: 'not_running', cliId: 'claude-code' });
+  });
+
+  it('keeps unsupported CLIs on the usage path even without a worker', () => {
+    expect(resolveAgentSessionAutoRename(makeDs())).toEqual({ status: 'unsupported', cliId: 'codex' });
   });
 });

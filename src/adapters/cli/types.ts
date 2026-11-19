@@ -1252,6 +1252,12 @@ export interface CliAdapter {
    *  command and must never receive a best-guess slash command. */
   buildSessionRenameCommand?(title: string): string;
 
+  /** CLI-native command that makes the CLI name the current interactive
+   *  session itself (Claude Code: a bare `/rename` derives a name from the
+   *  conversation). Botmux types it verbatim when `/rename` arrives without a
+   *  title. Undefined means a bare `/rename` keeps botmux's usage reply. */
+  readonly sessionAutoRenameCommand?: string;
+
   /** Structured-transcript bridge capability (see {@link StructuredBridgeSpec}).
    *  Declared by CLIs whose final answer can be harvested from an append-only
    *  transcript file when the model forgets `botmux send`. Absent = no
