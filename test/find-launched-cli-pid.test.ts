@@ -569,6 +569,27 @@ describe('worker wrapper PID wiring', () => {
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(153);
   });
 
+  it.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ])('never descends from a direct CLI payload on ready/input refresh (credentialOnly=%s, late PID=%s)', (credentialOnly, late) => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: credentialOnly ? 'launcher' : '', claudeDataDir: '/claude',
+      sandboxRequested: !credentialOnly, credentialOnlyBwrap: credentialOnly, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [154] },
+      childComms: { 150: 'claude.exe', 154: 'claude.exe' },
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    // runWorkerWiring already exhausted the startup polling budget. Repeated
+    // ready/input edges must still keep the direct root, even beyond that window.
+    result.refreshSandboxedCliLeafAttestation!();
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+  });
+
   it('re-attests the sandboxed Claude Code leaf on ready/input after a failed publication or a startup helper exits', () => {
     // 153 is a startup helper (`claude --version`) the launch poll attests; it
     // exits and the interactive TUI 154 replaces it before an input edge.

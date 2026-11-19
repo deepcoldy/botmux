@@ -31537,6 +31537,7 @@ async function spawnCliBody(
         return comm;
       },
     });
+    const isDirectLeaf = (lp: number): boolean => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId;
     let attested: { pid: number; procStart: string; published: boolean } | undefined;
     // A live, successfully published leaf is never sent twice: every actual
     // publication rotates the active turn's capability.
@@ -31556,6 +31557,9 @@ async function spawnCliBody(
     // Ready/input edges retain the repair path after the bounded startup poll;
     // both edges and the poll share the same liveness and deduplication state.
     refreshSandboxedCliLeafAttestation = () => {
+      // The initial attestation already names a direct CLI payload. Never
+      // replace it with a same-comm subagent discovered on a ready/input edge.
+      if (isDirectLeaf(payloadPid)) return;
       if (generation !== cliSpawnGeneration || backend !== backendAtSpawn || isAttested(attested?.pid)) return;
       const leafPid = findLeaf(payloadPid);
       if (leafPid) attest(leafPid);
@@ -31565,7 +31569,7 @@ async function spawnCliBody(
       intervalMs,
       maxAttempts: Math.ceil(FIRST_PROMPT_HARD_TIMEOUT_MS / intervalMs),
       findRealPid: findLeaf,
-      isDirectLeaf: (lp) => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId,
+      isDirectLeaf,
       getBackend: () => backend,
       getChildPid: () => (generation === cliSpawnGeneration ? payloadPid : null),
       applyRealPid: attest,
