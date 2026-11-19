@@ -190,7 +190,7 @@ import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJo
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideFirstWriteLiveness,
@@ -563,6 +563,7 @@ import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { restoredTurnLabel } from './services/restored-turn-label.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { resolveShadowedAntigravityStatusLine } from './adapters/cli/antigravity.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
@@ -12791,6 +12792,17 @@ function emitReadyTurns(opts: {
   // rationale. Tracked by object identity across this function's two loops so
   // the terminal can carry positive silence evidence for a durable/async caller.
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
+  // Turns for which loop 1 observed delivered output (emitted final_output,
+  // explicit final `botmux send`, or already-sent fallback suppression). Such
+  // turns must never carry `outputDisposition: 'boundary_unobserved'`.
+  const observedOutputTurns = new Set<(typeof ready)[number]>();
+  // Subset of observedOutputTurns whose delivery proof is an explicit final
+  // `botmux send` marker with NO emitted final_output: the answer reached the
+  // user over IM, but the HTTP channel has no captured content. The terminal
+  // carries `explicit_final_delivered` so wait/async callers still settle.
+  const finalMarkerTurns = new Set<(typeof ready)[number]>();
+  // Turns that actually emitted a final_output IPC in loop 1.
+  const emittedFinalOutputTurns = new Set<(typeof ready)[number]>();
   let emitIndex = 0;
   try {
   for (let i = 0; i < ready.length; i++) {
@@ -12841,11 +12853,16 @@ function emitReadyTurns(opts: {
       isScheduled: turn.isScheduled,
       forwardLocalFinal: zeroPromptTerminalSync(),
     };
+    const explicitReplyMarkers = attributableExplicitReplyMarkersForTurnWindow(
+      turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
+    );
+    if (explicitReplyMarkers.some(isFinalBridgeSendMarker)) {
+      observedOutputTurns.add(turn);
+      finalMarkerTurns.add(turn);
+    }
     notifyExplicitRepliesObserved(
       turn.turnId,
-      attributableExplicitReplyMarkersForTurnWindow(
-        turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
-      ),
+      explicitReplyMarkers,
     );
 
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
@@ -12897,6 +12914,8 @@ function emitReadyTurns(opts: {
       // sentinel (no prose, no send), never "already sent" / local-typed.
       if (!adoptMode && isBridgeNothingToSendFinal(assistantText)) {
         nothingToSendTurns.add(turn);
+      } else {
+        observedOutputTurns.add(turn);
       }
       continue;
     }
@@ -12978,6 +12997,8 @@ function emitReadyTurns(opts: {
       }
       continue;
     }
+    observedOutputTurns.add(turn);
+    emittedFinalOutputTurns.add(turn);
     send({
       type: 'final_output',
       content: deliveredText,
@@ -13089,12 +13110,46 @@ function emitReadyTurns(opts: {
       );
       continue;
     }
+    // Output disposition, positive no-output evidence only:
+    //  - genuine silence (bare nothing-to-send sentinel, no `botmux send`) →
+    //    'nothing_to_send'; a durable/async caller may settle completed-empty.
+    //  - real (non-local) turn whose answer was delivered explicitly over IM via
+    //    a final `botmux send` marker but which emitted NO final_output, popped
+    //    without transcript terminal evidence → 'explicit_final_delivered'.
+    //    The HTTP channel has no captured content, yet the turn IS delivered:
+    //    wait/async callers settle completed-empty instead of hanging, and the
+    //    label rides the terminal so a restarted daemon still converges.
+    //  - real (non-local) turn popped at a screen-idle boundary with NO
+    //    transcript terminal evidence at all (`terminalObserved` false:
+    //    neither an assistant stop_reason/API-error record nor a next-turn-start
+    //    compatibility boundary) and NO observed output → 'boundary_unobserved'.
+    //    The dominant cause is the CLI dying mid-turn (killed/crashed — a frozen
+    //    pane still matches the idle detector), so claiming plain `completed`
+    //    here would let the daemon leave pending HTTP async/wait callers
+    //    hanging `running` forever while the session auto-restarts into an idle
+    //    REPL. The label lets the daemon settle fail-closed instead.
+    //    Gate on terminalObserved (NOT on an undefined terminalOutcome) so a
+    //    marker-less older JSONL variant closed by the next user record keeps
+    //    the label absent; turns that emitted final_output / observed an
+    //    explicit final send, or synthesised local turns, also keep it absent.
+    const outputDisposition = nothingToSendTurns.has(turn)
+      ? 'nothing_to_send'
+      : !turn.isLocal
+        && !turn.terminalObserved
+        && finalMarkerTurns.has(turn)
+        && !emittedFinalOutputTurns.has(turn)
+        ? 'explicit_final_delivered'
+        : !turn.isLocal
+          && !turn.terminalObserved
+          && !observedOutputTurns.has(turn)
+          ? 'boundary_unobserved'
+          : undefined;
     emitTurnTerminal(
       turn.turnId,
       outcome?.status ?? 'completed',
       undefined,
       turn.dispatchAttempt,
-      nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+      outputDisposition,
       undefined,
     );
   }
@@ -26017,7 +26072,11 @@ async function spawnCli(
     && cfg.cliSessionId === recovery.nativeSessionId && previousBinding?.runtime
     && previousBinding.runtime.runtimeId === recovery.from.runtimeId
     && previousBinding.runtime.epoch === recovery.from.epoch ? recovery : undefined;
-  const binding = workerSessionEventScope.beginRuntime(activeRestartAttemptId);
+  // A control-only resume belongs to close, not restart: startup must never
+  // emit a successful restart receipt for that close operation.
+  const closeControlOperation = firstBinding && cfg.backendType === 'remote-runner'
+    && !cfg.prompt && !cfg.turnId && cfg.remoteBackendState ? cfg.sessionCommand?.operationId : undefined;
+  const binding = workerSessionEventScope.beginRuntime(closeControlOperation ?? activeRestartAttemptId);
   binding.continuation = continuation;
   if (execution) workerSessionEventScope.rememberExecution(execution, binding);
   return workerSessionEventScope.run(binding, async () => {
@@ -29122,6 +29181,10 @@ async function spawnCliBody(
     });
     if (shadowed.command) childEnv.BOTMUX_STATUSLINE_CHAIN = shadowed.command;
     else delete childEnv.BOTMUX_STATUSLINE_CHAIN;
+  } else if (cliAdapter.id === 'antigravity' && !cliAdapter.runnerFramedInput) {
+    const shadowed = resolveShadowedAntigravityStatusLine();
+    if (shadowed.command) childEnv.BOTMUX_STATUSLINE_CHAIN = shadowed.command;
+    else delete childEnv.BOTMUX_STATUSLINE_CHAIN;
   } else {
     delete childEnv.BOTMUX_STATUSLINE_CHAIN;
   }
@@ -31474,7 +31537,7 @@ async function spawnCliBody(
   };
   // wrapperCli launcher → real CLI by comm. `launcherPid` is the unwrapped
   // launch payload below any pane relay or owned session-scope supervisor.
-  const resolveBehindWrapper = (launcherPid: number): void => {
+  const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
     // Codex also needs the real execution root, even without a Claude JSONL bridge.
     // Credential-only bwrap uses the single monitored resolver below; running
     // both would attest the same leaf twice and rotate live-turn authority twice.
@@ -31482,13 +31545,24 @@ async function spawnCliBody(
       || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
     const generation = cliSpawnGeneration;
+    const readStablePanePid = (): number | null | undefined => {
+      const current = backend;
+      return current?.getStablePanePid ? current.getStablePanePid() : current?.getChildPid?.();
+    };
+    // A backing/shell PID need not equal the foreground launcher PID. Capture
+    // the backend's own stable identity rather than comparing it with panePid;
+    // wrapper rewrites of cliPid leave it unchanged, while a replaced pane fails
+    // the fence even before the exit callback advances the spawn generation.
+    const stablePanePid = readStablePanePid() ?? panePid;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
-      // Herdr/ZMX alias getChildPid() to the mutable cliPid. A failed publication
-      // may already have rewired that field, so only the captured launcher PID +
-      // spawn generation can fence retries without abandoning them after apply.
-      getChildPid: () => (generation === cliSpawnGeneration ? launcherPid : null),
+      // Herdr/ZMX alias getChildPid() to the mutable cliPid, so retry validity
+      // uses their independent stable pane identity instead. Backends without
+      // the accessor retain the original current-child observation as fallback.
+      getChildPid: () => generation === cliSpawnGeneration && readStablePanePid() === stablePanePid
+        ? launcherPid
+        : null,
       applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -31590,7 +31664,7 @@ async function spawnCliBody(
         bridgeCliPid = resolved.pid;
       }
     }
-    resolveBehindWrapper(resolved.pid);
+    resolveBehindWrapper(resolved.pid, panePid);
     attestSandboxedCliLeaf(resolved.pid);
   };
   const startWrapperRealPidResolve = (panePid: number): void => {
@@ -36721,7 +36795,7 @@ function emitTurnTerminal(
   status: TurnTerminalStatus,
   errorCode?: string,
   dispatchAttempt?: number,
-  outputDisposition?: 'nothing_to_send',
+  outputDisposition?: 'nothing_to_send' | 'boundary_unobserved' | 'explicit_final_delivered',
   retryable?: boolean,
   /** Backend-supplied completion instant (codex-app's runner timestamps its own
    *  finals). Clamped to now by the clock; absent means "use this instant". */
