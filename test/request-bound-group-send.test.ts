@@ -149,17 +149,24 @@ describe('sendRequestBoundGroupMessage', () => {
   it('frees a definitively rejected first attempt but preserves a prior ambiguous attempt', async () => {
     __setGroupSendLimitsForTest({ record: 2, compactBatch: 1, archive: 2 });
     const rejection = larkApiError('send message', { code: 230002 });
-    const send = vi.fn().mockRejectedValue(rejection);
+    const provider = vi.fn().mockRejectedValue(rejection);
+    const depsWithWriteFence = {
+      larkAppId: APP, storePath, now: () => clock,
+      send: (_chat: string, _text: string, _uuid: string, beforeWrite: () => void) => {
+        beforeWrite();
+        return provider();
+      },
+    };
     for (let i = 0; i < 4; i++) {
-      expect(await sendRequestBoundGroupMessage(deps(send), input(`rejected_${i}`)))
+      expect(await sendRequestBoundGroupMessage(depsWithWriteFence, input(`rejected_${i}`)))
         .toMatchObject({ error: 'send_failed', retryable: false });
     }
-    send.mockRejectedValueOnce(new Error('connection reset'));
-    await sendRequestBoundGroupMessage(deps(send), input());
-    expect(await sendRequestBoundGroupMessage(deps(send), input())).toMatchObject({ error: 'outcome_unknown', retryable: false });
+    provider.mockRejectedValueOnce(new Error('connection reset'));
+    await sendRequestBoundGroupMessage(depsWithWriteFence, input());
+    expect(await sendRequestBoundGroupMessage(depsWithWriteFence, input())).toMatchObject({ error: 'outcome_unknown', retryable: false });
     clock += GROUP_SEND_UUID_REUSE_MS + 1;
-    expect(await sendRequestBoundGroupMessage(deps(send), input())).toMatchObject({ error: 'outcome_unknown', retryable: false });
-    expect(send).toHaveBeenCalledTimes(6);
+    expect(await sendRequestBoundGroupMessage(depsWithWriteFence, input())).toMatchObject({ error: 'outcome_unknown', retryable: false });
+    expect(provider).toHaveBeenCalledTimes(6);
   });
 
   it.each([{ chatId: CHAT }, { chatId: CHAT, rootMessageId: 'om_root' }, { userOpenId: 'ou_user' }])(
