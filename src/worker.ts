@@ -563,6 +563,7 @@ import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { restoredTurnLabel } from './services/restored-turn-label.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { resolveShadowedAntigravityStatusLine } from './adapters/cli/antigravity.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
@@ -29178,6 +29179,10 @@ async function spawnCliBody(
       workingDir: cfg.workingDir,
       userSettingsPath: effectiveReadyHookInstall?.configPath ?? cliAdapter.hookInstall?.configPath,
     });
+    if (shadowed.command) childEnv.BOTMUX_STATUSLINE_CHAIN = shadowed.command;
+    else delete childEnv.BOTMUX_STATUSLINE_CHAIN;
+  } else if (cliAdapter.id === 'antigravity' && !cliAdapter.runnerFramedInput) {
+    const shadowed = resolveShadowedAntigravityStatusLine();
     if (shadowed.command) childEnv.BOTMUX_STATUSLINE_CHAIN = shadowed.command;
     else delete childEnv.BOTMUX_STATUSLINE_CHAIN;
   } else {
