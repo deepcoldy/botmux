@@ -96,6 +96,7 @@ vi.mock('../src/services/async-trigger-store.js', async importOriginal => {
 });
 
 import { initWorkerPool, interruptExactWorkerTurn, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { resolveAsyncTriggerState } from '../src/services/async-trigger-state.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
@@ -546,11 +547,20 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     expect(recordCompletedMock).not.toHaveBeenCalled();
   });
 
-  it('keeps the worker-exit convergence stamp when the durable strict write throws', async () => {
+  it('fail-closes the session and keeps the convergence stamp when the durable strict write throws', async () => {
     // EIO/ENOSPC on the durable write: the in-memory projection still fails so
-    // this daemon's polling terminates, but the convergence stamp must survive
-    // — deleting it would leave a restarted daemon with a durable `pending`
-    // record and no backstop, so the trigger polls `running` forever.
+    // this daemon's polling terminates, but the durable record stays `pending`.
+    // Neither the projection nor the retained convergence stamp survives an
+    // unclean daemon exit, so the session row itself must become durably
+    // `closed`: trigger-result's closed-branch then resolves `failed` after a
+    // restart instead of stranding the poller on `running`.
+    const closeSession = vi.fn(async () => true);
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession,
+    } as any);
     recordTerminalFailureStrictMock.mockImplementationOnce(() => { throw new Error('EIO'); });
     const ds = makeDs();
     ds.asyncTriggerResults = new Map([['turn-eio', { status: 'pending' } as any]]);
@@ -572,11 +582,56 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
       errorCode: 'trigger_failed',
       terminalErrorCode: 'turn_ended_unobserved',
     });
-    // The stamp is retained: worker-exit convergence / a terminal replay still
-    // owns the durable terminalization.
+    // The stamp is retained as the in-process worker-exit backstop.
     expect(ds.idempotentAsyncTurns!.has('turn-eio')).toBe(true);
     // The late-output fallthrough guard still armed despite the write failure.
     expect(ds.settledHttpTerminalTurns?.has('turn-eio')).toBe(true);
+    // The durable fail-close that survives an unclean restart.
+    await vi.waitFor(() => expect(closeSession).toHaveBeenCalledWith(ds));
+
+    // Restart observability with the REAL resolver: while the durable trigger
+    // record is still `pending`, an `open` session row resolves `running` (the
+    // stranded shape), while the fail-closed `closed` row resolves `failed`.
+    const persistedPending = {
+      triggerId: 'turn-eio',
+      result: { status: 'pending' as const, createdAt: Date.now() },
+    };
+    const stranded = resolveAsyncTriggerState({
+      sessionId: 'sid-async-settle', liveActive: false, chatId: 'http_async_fixture',
+      persisted: persistedPending, storedStatus: 'open',
+    });
+    expect(stranded.state).toBe('running');
+    const failClosed = resolveAsyncTriggerState({
+      sessionId: 'sid-async-settle', liveActive: false, chatId: 'http_async_fixture',
+      persisted: persistedPending, storedStatus: 'closed',
+    });
+    expect(failClosed.state).toBe('failed');
+    expect(failClosed.errorCode).toBe('no_output');
+  });
+
+  it('does not fail-close the session when the durable strict write succeeds', async () => {
+    const closeSession = vi.fn(async () => true);
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession,
+    } as any);
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['turn-ok', { status: 'pending' } as any]]);
+    ds.idempotentAsyncTurns = new Map([['turn-ok', {
+      ownerLarkAppId: 'app_test', key: 'k', kind: 'turn', workerGeneration: 1,
+    } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('turn-ok', {
+      outputDisposition: 'boundary_unobserved',
+    }));
+
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('turn-ok')?.status).toBe('failed'));
+    await new Promise(r => setTimeout(r, 20));
+    expect(closeSession).not.toHaveBeenCalled();
+    expect(ds.idempotentAsyncTurns!.has('turn-ok')).toBe(false);
   });
 });
 

@@ -25092,15 +25092,41 @@ function setupWorkerHandlers(
                 // strict write first.
                 ds.idempotentAsyncTurns?.delete(msg.turnId);
               } catch (err) {
-                // The live failed projection still terminates current-daemon
-                // polling. Keep the convergence stamp and report the lost
-                // restart guarantee explicitly (the worker-exit backstop or a
-                // terminal replay must still converge the durable record).
+                // The live failed projection terminates THIS daemon's polling,
+                // but the durable record stays `pending`. Neither the projection
+                // nor the retained convergence stamp survives an unclean daemon
+                // exit: a restarted daemon would read `pending` against an `open`
+                // session row and the poller would resolve `running` forever.
+                // The worker-exit backstop cannot be assumed either — the
+                // original shape is the CLI dying while this worker keeps
+                // running, so no exit callback fires, and an unkeyed virtual-sink
+                // trigger carries no convergence stamp at all. Take the session
+                // to an observable fail-closed terminal NOW (the same contract
+                // as the idempotency exit-convergence double-failure path):
+                // its persisted row becomes `closed` and trigger-result's
+                // closed-branch resolves `failed` after any restart.
                 logger.error(
                   `[${t}] Failed to persist async unobserved-terminal for `
-                  + `${msg.turnId.substring(0, 8)} (convergence stamp retained): `
+                  + `${msg.turnId.substring(0, 8)} (convergence stamp retained; fail-closing session): `
                   + `${err instanceof Error ? err.message : String(err)}`,
                 );
+                void Promise.resolve()
+                  .then(() => requireCallbacks().closeSession(ds))
+                  .then((closed) => {
+                    if (closed === false) {
+                      logger.error(
+                        `[${t}] Fail-close after unobserved-terminal write failure was refused `
+                        + `for ${msg.turnId.substring(0, 8)}; session retained for retry`,
+                      );
+                    }
+                  })
+                  .catch((closeErr) => {
+                    logger.error(
+                      `[${t}] Fail-close after unobserved-terminal write failure threw; `
+                      + `close state is UNPROVEN for ${msg.turnId.substring(0, 8)}: `
+                      + `${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
+                    );
+                  });
               }
               logger.info(
                 `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
