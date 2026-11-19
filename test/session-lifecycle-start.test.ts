@@ -7,6 +7,7 @@ import { EventEmitter, once } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
+import { WorkerOwnerDiagnostics } from '../src/core/worker-owner-diagnostic.js';
 import { acceptSessionGroupTitle } from '../src/services/session-group-title.js';
 
 vi.mock('../src/services/session-group-title.js', () => ({
@@ -160,15 +161,27 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
-vi.mock('../src/services/session-store.js', () => ({
+vi.mock('../src/services/session-store.js', () => {
+  const updateSession = vi.fn();
+  const mutateOwnedSessionsAtomically = vi.fn((ids: string[], mutate: (rows: Map<string, any>) => unknown) => {
+    const rows = new Map<string, any>();
+    for (const id of ids) {
+      const row = [...updateSession.mock.calls].reverse().find(call => call[0]?.sessionId === id)?.[0];
+      if (!row) throw new Error('fixture session not persisted');
+      rows.set(id, structuredClone(row));
+    }
+    return { result: mutate(rows), rows };
+  });
+  return {
+  mutateOwnedSessionsAtomically,
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
   getSessionFresh: vi.fn(),
-  updateSession: vi.fn(),
+  updateSession,
   updateSessionPid: vi.fn(),
-}));
+}; });
 
 // These synthetic workers model unscoped legacy IPC. Keep contract storage out
 // of this unit fixture; v2 bootstrap/admission runs through real components in
@@ -732,6 +745,12 @@ describe('protected MCP env stays out of ordinary worker IPC', () => {
 });
 
 describe('protected HTTP egress policy freezing at worker preparation', () => {
+  const ownerDiagnostics = vi.fn();
+  beforeEach(() => initWorkerPool({
+    onOwnerDiagnostic: ownerDiagnostics, sessionReply: vi.fn(async () => 'om_reply'),
+    getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn(),
+    loadScheduledTaskForIdentity,
+  }));
   const policy = {
     id: 'fixture.write.v1',
     targets: [{
@@ -975,9 +994,13 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     await vi.waitFor(() => expect(onAdmissionBlocked).toHaveBeenCalled());
 
     expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
-      content: expect.stringContaining('protected egress disk full'),
+      content: expect.any(String),
       turnId: 'om_persist_fail',
     }));
+    expect(ownerDiagnostics).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      kind: 'startup_failure', reason: expect.stringContaining('protected egress disk full'),
+    }));
+    expect(onAdmissionBlocked.mock.calls[0]?.[0].content).not.toContain('protected egress disk full');
     expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
     expect(forkMock).not.toHaveBeenCalled();
   });
@@ -1083,9 +1106,13 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     await vi.waitFor(() => expect(onAdmission).toHaveBeenCalledWith('rejected'));
 
     expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
-      content: expect.stringContaining('dns unavailable'),
+      content: expect.any(String),
       turnId: 'om_egress_dns',
     }));
+    expect(ownerDiagnostics).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      kind: 'startup_failure', reason: expect.stringContaining('dns unavailable'),
+    }));
+    expect(onAdmissionBlocked.mock.calls[0]?.[0].content).not.toContain('dns unavailable');
     expect(forkMock).not.toHaveBeenCalled();
   });
 
@@ -1128,9 +1155,13 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
     expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
     expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
-      content: expect.stringContaining('dns unavailable'),
+      content: expect.any(String),
       turnId: 'om_dns_follower',
     }));
+    expect(ownerDiagnostics).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      kind: 'startup_failure', reason: expect.stringContaining('dns unavailable'),
+    }));
+    expect(followerBlocked.mock.calls[0]?.[0].content).not.toContain('dns unavailable');
     expect(forkMock).not.toHaveBeenCalled();
   });
 
@@ -1343,11 +1374,19 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     expect(ds.session.queuedActivationTail).toBeUndefined();
     expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
     expect(messageBlocked).toHaveBeenCalledWith(expect.objectContaining({
-      content: expect.stringContaining('dns unavailable'), turnId: 'om_resume_message',
+      content: expect.any(String), turnId: 'om_resume_message',
     }));
+    expect(ownerDiagnostics).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      kind: 'startup_failure', reason: expect.stringContaining('dns unavailable'),
+    }));
+    expect(messageBlocked.mock.calls[0]?.[0].content).not.toContain('dns unavailable');
     expect(observerBlocked).toHaveBeenCalledWith(expect.objectContaining({
-      content: expect.stringContaining('dns unavailable'),
+      content: expect.any(String),
     }));
+    expect(ownerDiagnostics).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      kind: 'startup_failure', reason: expect.stringContaining('dns unavailable'),
+    }));
+    expect(observerBlocked.mock.calls[0]?.[0].content).not.toContain('dns unavailable');
     expect(forkMock).not.toHaveBeenCalled();
   });
 
@@ -1674,9 +1713,13 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
       expect.objectContaining({ id: followerTailId, turnId: 'om_egress_persist_follower' }),
     ]);
     expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
-      content: expect.stringContaining('cleanup persistence failed'),
+      content: expect.any(String),
       turnId: 'om_egress_persist_follower',
     }));
+    expect(ownerDiagnostics).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      kind: 'startup_failure', reason: expect.stringContaining('cleanup persistence failed'),
+    }));
+    expect(followerBlocked.mock.calls[0]?.[0].content).not.toContain('cleanup persistence failed');
     expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
     expect(forkMock).toHaveBeenCalledTimes(1);
 
@@ -1714,11 +1757,13 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     await vi.waitFor(() => expect(onAdmissionBlocked).toHaveBeenCalled());
 
     expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
-      content: expect.stringContaining(
-        'Worker preparation failed after protected egress freeze: late preparation boom',
-      ),
+      content: expect.any(String),
       turnId: 'om_egress_late',
     }));
+    expect(ownerDiagnostics).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      kind: 'startup_failure', reason: expect.stringContaining('Worker preparation failed after protected egress freeze: late preparation boom'),
+    }));
+    expect(onAdmissionBlocked.mock.calls[0]?.[0].content).not.toContain('Worker preparation failed after protected egress freeze: late preparation boom');
     expect(loggerErrorMock).toHaveBeenCalledWith(expect.stringContaining(
       'Worker preparation after protected HTTP egress freeze failed',
     ));
@@ -1775,9 +1820,13 @@ describe('protected HTTP egress policy freezing at worker preparation', () => {
     expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
     expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
     expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
-      content: expect.stringContaining('post-policy preparation write failed'),
+      content: expect.any(String),
       turnId: 'om_follower',
     }));
+    expect(ownerDiagnostics).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      kind: 'startup_failure', reason: expect.stringContaining('post-policy preparation write failed'),
+    }));
+    expect(followerBlocked.mock.calls[0]?.[0].content).not.toContain('post-policy preparation write failed');
 
     expect(forkWorker(ds, 'retry opening', { turnId: 'om_retry' })).toBe(true);
     await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
@@ -9534,6 +9583,235 @@ describe('managed turn authority worker generations', () => {
   });
 });
 
+describe('owner diagnostics and accepted-input session notices', () => {
+  it('batches process errors from three restored conversations into one owner DM', async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), 'worker-owner-fanout-'));
+    const send = vi.fn(async (..._args: unknown[]) => 'om_dm');
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply');
+    const diagnostics = new WorkerOwnerDiagnostics({ dataDir: dir, ownerForApp: () => 'ou_owner',
+      botForApp: () => ({ name: 'Bot', locale: 'en' }), send, onError: vi.fn(), batchMs: 20 });
+    initWorkerPool({ sessionReply, onOwnerDiagnostic: (ds, event) =>
+      diagnostics.report(ds.larkAppId, ds.session.sessionId, event), getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 3, closeSession: vi.fn() });
+    try {
+      const sessions = Array.from({ length: 3 }, (_, i) => {
+        const ds = makeDs({ hasHistory: true, suppressRecoveryCard: true });
+        ds.session.sessionId = `restored_owner_${i}`;
+        ds.session.rootMessageId = `om_old_${i}`;
+        ds.session.chatId = `oc_old_${i}`; ds.chatId = `oc_old_${i}`;
+        return ds;
+      });
+      setActiveSessionsRegistry(new Map(sessions.map(ds => [activeSessionKey(ds), ds])));
+      for (const ds of sessions) {
+        forkWorker(ds, '', true, { memoryNoticeAudience: 'owner-only' });
+        (ds.worker as any).emit('error', new Error('spawn ENOENT'));
+      }
+      await vi.advanceTimersByTimeAsync(20);
+      expect(sessionReply).not.toHaveBeenCalled();
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0]![1]).toBe('ou_owner');
+      expect(String(send.mock.calls[0]![2])).toContain('3');
+      expect(String(send.mock.calls[0]![2])).toContain('ENOENT');
+    } finally { diagnostics.dispose(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps the exact current request informed even when owner reporting throws', async () => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply');
+    initWorkerPool({ sessionReply, onOwnerDiagnostic: () => { throw new Error('owner unavailable'); },
+      getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    forkWorker(ds, 'current input', 'om_current');
+    (ds.worker as any).emit('error', new Error('private executable ENOENT'));
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]![4]).toBe('om_current');
+    expect(String(sessionReply.mock.calls[0]![1])).not.toMatch(/ENOENT|executable|logs/);
+  });
+
+  it('ignores a process error from a replaced worker generation', () => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply');
+    const onOwnerDiagnostic = vi.fn();
+    initWorkerPool({ sessionReply, onOwnerDiagnostic, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    forkWorker(ds, 'current input', 'om_current');
+    const stale = ds.worker as any;
+    ds.worker = makeFakeWorker();
+    stale.emit('error', new Error('stale ENOENT'));
+    expect(onOwnerDiagnostic).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('ignores errors from a superseded registry owner (adopt=%s)', adopt => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply');
+    const onOwnerDiagnostic = vi.fn();
+    initWorkerPool({ sessionReply, onOwnerDiagnostic, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    if (adopt) {
+      ds.adoptedFrom = { tmuxTarget: 'bmx-notice:0.0', originalCliPid: 23456,
+        sessionId: 'native-session', cliId: 'codex', cwd: REPO };
+      forkAdoptWorker(ds, { prompt: 'current input', turnId: 'om_current' });
+    } else forkWorker(ds, 'current input', 'om_current');
+    const worker = ds.worker as any;
+    const successor = makeDs();
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), successor]]));
+    worker.emit('error', new Error('superseded ENOENT'));
+    expect(ds.worker).toBe(worker);
+    expect(onOwnerDiagnostic).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('keeps restored adopt bridge errors out of an old conversation', async () => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply');
+    const onOwnerDiagnostic = vi.fn();
+    initWorkerPool({ sessionReply, onOwnerDiagnostic, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ adoptedFrom: { tmuxTarget: 'bmx-notice:0.0', originalCliPid: 23456,
+      sessionId: 'codex-session', cliId: 'codex', cwd: REPO } });
+    forkAdoptWorker(ds, { restoredFromMetadata: true, turnId: 'om_historical' });
+    (ds.worker as any).emit('error', new Error('adopt ENOENT'));
+    await Promise.resolve();
+    expect(onOwnerDiagnostic).toHaveBeenCalledWith(ds, expect.objectContaining({ kind: 'startup_failure' }));
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  function pendingMojo(ds: DaemonSession): void {
+    ds.session.mojoQuarantineNoticePending = true;
+    ds.session.mojoQuarantinedLineage = 'prior-lineage';
+  }
+
+  it.each([undefined, 1])('waits through cold IPC bootstrap before consuming the notice (attempt=%s)', async dispatchAttempt => {
+    vi.useFakeTimers();
+    standaloneBinaryMock.mockReturnValue(true);
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true }); pendingMojo(ds);
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    forkWorker(ds, 'new input', { resume: true, turnId: 'om_current', dispatchAttempt });
+    const worker = ds.worker as any;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(worker.send.mock.calls.map((call: any[]) => call[0].type)).toEqual(['worker_ipc_probe']);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.mojoQuarantineNoticePending).toBe(true);
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    await vi.advanceTimersByTimeAsync(0);
+    if (dispatchAttempt === undefined) {
+      expect(sessionReply).not.toHaveBeenCalled();
+      worker.emit('message', { type: 'turn_input_received', turnId: 'om_current' });
+      worker.emit('message', { type: 'turn_input_received', turnId: 'om_current' });
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]![4]).toBe('om_current');
+    expect(ds.session.mojoQuarantineNoticePending).toBe(false);
+  });
+
+  it('keeps a tracked notice pending through failed IPC retries', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true }); pendingMojo(ds);
+    const worker = makeFakeWorker();
+    worker.send.mockImplementation(() => { throw new Error('IPC unavailable'); });
+    forkMock.mockReturnValueOnce(worker);
+    forkWorker(ds, 'new input', { resume: true, turnId: 'om_current' });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(sessionReply.mock.calls.filter(call => String(call[1]).includes('prior-lineage'))).toHaveLength(0);
+    expect(ds.session.mojoQuarantineNoticePending).toBe(true);
+  });
+
+  it.each(['registry', 'lineage', 'generation', 'legacy'])('does not clear a successor receipt after late delivery (%s)', async replacement => {
+    vi.useFakeTimers();
+    let finish!: (id: string) => void;
+    const sent = new Promise<string>(resolve => { finish = resolve; });
+    const sessionReply = vi.fn((..._args: unknown[]) => sent);
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true });
+    if (replacement === 'legacy') {
+      ds.session.mojoLegacyPinNoticePending = true;
+      ds.session.mojoIdentityHostDefault = false;
+    } else pendingMojo(ds);
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    forkWorker(ds, '', true, { memoryNoticeAudience: 'owner-only' });
+    ds.workerReady = true;
+    expect(sendWorkerInput(ds, 'new input', 'turn_current')).toBe(true);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    if (replacement === 'registry') setActiveSessionsRegistry(new Map([[activeSessionKey(ds), makeDs()]]));
+    else if (replacement === 'lineage') ds.session = { ...ds.session, mojoQuarantinedLineage: 'successor-lineage' };
+    else if (replacement === 'generation') ds.session.workerGeneration = (ds.session.workerGeneration ?? 0) + 1;
+    else ds.session.mojoIdentityHostDefault = true;
+    vi.mocked(sessionStore.updateSession).mockClear();
+    vi.mocked(sessionStore.mutateOwnedSessionsAtomically).mockClear();
+    finish('om_delivered');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionStore.mutateOwnedSessionsAtomically).not.toHaveBeenCalled();
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    expect(ds.session[replacement === 'legacy' ? 'mojoLegacyPinNoticePending' : 'mojoQuarantineNoticePending']).toBe(true);
+  });
+
+  it.each([false, true])('retains pending Mojo notices during blank/historical restoration (%s)', async historical => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true }); pendingMojo(ds);
+    forkWorker(ds, historical ? 'historical input' : '',
+      historical ? { resume: true, turnId: 'om_historical' } : true,
+      { memoryNoticeAudience: 'owner-only' });
+    await Promise.resolve(); await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.mojoQuarantineNoticePending).toBe(true);
+  });
+
+  it('delivers a pending Mojo notice on the first accepted hot input, once', async () => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true }); pendingMojo(ds);
+    forkWorker(ds, '', true, { memoryNoticeAudience: 'owner-only' });
+    ds.workerReady = true;
+    expect(sendWorkerInput(ds, 'new input', 'turn_new')).toBe(true);
+    await Promise.resolve(); await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]![4]).toBe('turn_new');
+    expect(ds.session.mojoQuarantineNoticePending).toBe(false);
+    expect(sendWorkerInput(ds, 'later input', 'turn_later')).toBe(true);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the Mojo notice pending when a hot input is rejected by IPC', async () => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true }); pendingMojo(ds);
+    forkWorker(ds, '', true, { memoryNoticeAudience: 'owner-only' });
+    ds.workerReady = true;
+    (ds.worker as any).send.mockImplementation(() => { throw new Error('IPC closed'); });
+    expect(sendWorkerInput(ds, 'new input', 'turn_new')).toBe(false);
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.mojoQuarantineNoticePending).toBe(true);
+  });
+
+  it('delivers the pending Mojo notice for a fresh accepted cold input', async () => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true }); pendingMojo(ds);
+    forkWorker(ds, 'new input', { resume: true, turnId: 'turn_new' });
+    await Promise.resolve(); await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]![4]).toBe('turn_new');
+    expect(ds.session.mojoQuarantineNoticePending).toBe(false);
+  });
+});
+
 describe('worker startup failure delivery', () => {
   it.each([
     { source: 'tmux', tmuxTarget: undefined },
@@ -9949,10 +10227,11 @@ describe('worker startup failure delivery', () => {
     expect(sessionReply.mock.calls[0]?.[1]).toContain('CLI relaunch dependency disappeared');
   });
 
-  it('marks an adopt fork failure as requiring attention and replies once', async () => {
+  it('marks a current adopt fork failure as requiring attention and replies once', async () => {
+    const onOwnerDiagnostic = vi.fn();
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({
-      sessionReply,
+      sessionReply, onOwnerDiagnostic,
       getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
@@ -9966,7 +10245,7 @@ describe('worker startup failure delivery', () => {
         cwd: REPO,
       },
     });
-    forkAdoptWorker(ds);
+    forkAdoptWorker(ds, { turnId: 'turn_adopt' });
     const worker = forkMock.mock.results.at(-1)!.value;
 
     worker.emit('error', new Error('adopt fork ENOENT'));
@@ -9974,7 +10253,9 @@ describe('worker startup failure delivery', () => {
     await Promise.resolve();
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
-    expect(sessionReply.mock.calls[0]?.[1]).toContain('adopt fork ENOENT');
+    expect(sessionReply.mock.calls[0]?.[1]).not.toContain('adopt fork ENOENT');
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('turn_adopt');
+    expect(onOwnerDiagnostic).toHaveBeenCalledWith(ds, expect.objectContaining({ reason: 'adopt fork ENOENT' }));
     expect(emitHookEventMock).toHaveBeenCalledWith('session.requires_attention', expect.objectContaining({
       sessionId: 'sid-start-test',
       reason: 'worker_fork_error',

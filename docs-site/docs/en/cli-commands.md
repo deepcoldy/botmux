@@ -354,3 +354,9 @@ Filters apply only within the fetched `--limit` window. `--since` is inclusive a
 `botmux worker-budget status` shows available memory, the reserve, the memory PSI limit, and whether worker startup is allowed. Background recovery failures are logged and batched into a DM to the bot owner. A rejected current request receives only a brief unavailable status in its conversation.
 
 Owner DMs are batched per bot over 2 seconds and count distinct affected sessions. Each bot/owner pair attempts at most one DM every 5 minutes, with a cooldown that survives daemon restarts. Failed sends also enter cooldown; a later rejection can trigger another attempt after it expires. An unresolved owner is logged. If the cooldown cannot be persisted, deduplication falls back to the current process. These notifications are independent of the optional Dashboard host overload monitor.
+
+## Background Recovery Diagnostics
+
+Process-start and DNS/runtime preparation failures during background recovery are batched into a DM to the bot's current owner. A current request receives only a brief unavailable status. Pi installation changes also notify the owner while retaining suspension after the current task settles and cold-starting on the new version for the next input. Startup, installation and memory alerts have independent 2-second batching windows and 5-minute cooldowns.
+
+Mojo lineage-quarantine and legacy-configuration notices remain pending through blank recovery and owner-only historical input replay. They are delivered only after a nonempty input with an explicit turn is accepted. A rejected input or failed notice delivery keeps the pending marker for a later input. Silent tasks, meeting receivers and sessions without an IM transport retain their existing output restrictions.
