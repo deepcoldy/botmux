@@ -4744,11 +4744,18 @@ async function resolveQuotaFallbackForSession(
 }
 
 export function clearUsageLimitState(ds: DaemonSession): void {
+  const previous = ds.usageLimit;
+  ds.usageLimit = undefined;
+  try {
+    persistStreamCardState(ds);
+  } catch (error) {
+    ds.usageLimit = previous;
+    throw error;
+  }
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
   }
-  ds.usageLimit = undefined;
   ds.usageLimitPersistPending = false;
   // Re-arm the proactive rate-limit notification latch: the next limit episode
   // (even one with the same usageLimitStateKey) must notify the owner again.
@@ -4756,7 +4763,6 @@ export function clearUsageLimitState(ds: DaemonSession): void {
   // Only the async ownership token is session-local. Cross-session duplicate
   // handoffs are suppressed by the source-bot five-minute event window.
   ds.quotaFallbackAttemptToken = undefined;
-  persistStreamCardState(ds);
 }
 
 export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefined {
@@ -4871,6 +4877,10 @@ function armUsageLimitRetryTimer(ds: DaemonSession, previous?: CliUsageLimitStat
 
 export function restoreUsageLimitRuntimeState(ds: DaemonSession): void {
   if (!ds.usageLimit) return;
+  // 旧会话只存了当前限额，恢复时先保留它的身份，后续清除状态也能识别残留提示
+  if (ds.usageLimit.source === 'antigravity-error-composer' && ds.usageLimit.relativeResetKey) {
+    ds.session.lastAntigravityQuota = ds.usageLimit;
+  }
   ds.lastScreenStatus = 'limited';
   armUsageLimitRetryTimer(ds);
 }
@@ -4891,10 +4901,17 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
   ) return;
 
   ds.usageLimit = usageLimit;
+  if (usageLimit.source === 'antigravity-error-composer' && usageLimit.relativeResetKey) {
+    ds.session.lastAntigravityQuota = usageLimit;
+  }
   ds.usageLimitPersistPending = true;
   persistStreamCardState(ds);
   ds.usageLimitPersistPending = false;
   armUsageLimitRetryTimer(ds, previous);
+}
+
+function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
+  return limit?.source === 'antigravity-error-composer' && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
 }
 
 /**
@@ -4904,7 +4921,8 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
  * (the worker re-emits only while the limit text stays on screen; screenshot
  * ticks arrive every 10s), so a recorded limit survives ordinary idle frames
  * and the cooldown card stays up until the user retries. But it must
- * self-heal on evidence of active work: a blocked CLI does not produce
+ * self-heal on evidence of active work or after a native agy countdown
+ * expires without a new refusal. A blocked CLI does not produce
  * `working`/`analyzing` frames, so a limit that survives such a frame was a
  * false positive (a flicker-frame screen scan, or a structured emit the CLI
  * recovered from). Without this the card keeps showing 「限额已达」 for the
@@ -4920,13 +4938,18 @@ function resolveUsageAwareScreenStatus(
   content?: string,
 ): ScreenStatus {
   if (freshUsageLimit) return 'limited';
-  if (ds.usageLimit && isActiveWorkRuntimeStatus(workerStatus)) {
-    if (ds.usageLimit.source === 'antigravity-error-composer'
-      && (!content || !isAntigravityWorkingScreen(content))) return 'limited';
-    clearUsageLimitState(ds);
-    return workerStatus;
+  const previous = ds.usageLimit;
+  if (!previous) return workerStatus;
+
+  const working = isActiveWorkRuntimeStatus(workerStatus);
+  if (previous.source === 'antigravity-error-composer') {
+    // 窗口内只有原生工作提示能解除限额。窗口结束后，worker 会过滤同一次拒绝
+    if (!isExpiredNativeAntigravityQuota(previous) && !(working && content && isAntigravityWorkingScreen(content))) return 'limited';
+  } else if (!working) {
+    return 'limited';
   }
-  return ds.usageLimit ? 'limited' : workerStatus;
+  clearUsageLimitState(ds);
+  return workerStatus;
 }
 
 function logWorkerStderr(t: string, line: string): void {
@@ -19472,6 +19495,7 @@ function forkWorkerPrepared(
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
     cliId: agentCfg.cliId,
+    ...(agentCfg.cliId === 'antigravity' ? { lastAntigravityQuota: ds.session.lastAntigravityQuota } : {}),
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     cliConfigDir: agentCfg.cliConfigDir,
@@ -22671,6 +22695,7 @@ function setupWorkerHandlers(
         if (!ownsLifecycleMutation()) break;
         // Project the frame's effective status once: reused for the in-memory
         // status assignment below and the stale-post-terminal gate.
+        const previousLimit = ds.usageLimit;
         const projectedScreenStatus = resolveUsageAwareScreenStatus(
           ds, msg.status, msg.usageLimit, msg.content,
         );
@@ -22896,6 +22921,10 @@ function setupWorkerHandlers(
             { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card status: ${error.message}`));
         }
 
+        // 用户可能在下一帧到来前就重试并收到新拒绝，中间没有 idle 状态
+        const enteredLimit = prevStatus !== 'limited' || (isExpiredNativeAntigravityQuota(previousLimit)
+          && previousLimit?.relativeResetKey !== msg.usageLimit?.relativeResetKey);
+
         // Proactive rate/usage-limit notification. The streaming-card PATCH
         // (card-on) carries no unread/mention signal, and card-off sessions
         // skip card output entirely — so without a fresh message here the owner
@@ -22917,7 +22946,7 @@ function setupWorkerHandlers(
         // ping until a real user turn clears suppressRecoveryCard.
         if (
           ds.lastScreenStatus === 'limited'
-          && prevStatus !== 'limited'
+          && enteredLimit
           && ds.usageLimit
           && !ds.suppressRecoveryCard
           && ds.rateLimitNotifiedKey !== usageLimitStateKey(ds.usageLimit)
@@ -22945,7 +22974,7 @@ function setupWorkerHandlers(
         const quotaFallback = botCfg.quotaFallbackBot;
         if (
           ds.lastScreenStatus === 'limited'
-          && prevStatus !== 'limited'
+          && enteredLimit
           && ds.usageLimit
           && !ds.suppressRecoveryCard
           && quotaFallback?.enabled === true
@@ -28745,6 +28774,7 @@ export function forkAdoptWorker(
     terminalCardEpoch: ds.session.terminalCardEpoch,
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
+    ...(adoptedCliId === 'antigravity' ? { lastAntigravityQuota: ds.session.lastAntigravityQuota } : {}),
     codexProfile: agentCfg.codexProfile,
     codexProfileHome: agentCfg.codexProfileHome,
     cliRuntime: agentCfg.cliRuntime,

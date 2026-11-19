@@ -6,6 +6,8 @@ import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { annotateAntigravityUsageLimit } from '../src/adapters/cli/antigravity.js';
+import { detectCliUsageLimit } from '../src/utils/cli-usage-limit.js';
 
 const children = new Set<ChildProcess>();
 const cliPidFiles = new Set<string>();
@@ -68,7 +70,7 @@ async function waitFor(check: () => boolean, logs: string[], timeout = 10_000): 
   throw new Error(`Worker condition timed out\n${logs.join('')}`);
 }
 
-function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'running', cliId: 'antigravity' | 'traex' = 'antigravity') {
+function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'expired-quota' | 'running', cliId: 'antigravity' | 'traex' = 'antigravity') {
   // Closing a worker also stops its OS session scope. A fixed session ID would
   // let parallel runtime/test invocations terminate each other's fake CLI.
   const sessionId = `agy-delivery-${randomUUID()}`;
@@ -86,7 +88,8 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
   const history = cliId === 'antigravity'
     ? join(cliHome, 'history.jsonl') : join(root, '.trae', 'cli', 'history.jsonl');
   mkdirSync(join(history, '..'), { recursive: true });
-  const passive = ['interrupted', 'native-error', 'quota', 'running'].includes(mode);
+  const isQuota = mode === 'quota' || mode === 'expired-quota';
+  const passive = isQuota || ['interrupted', 'native-error', 'running'].includes(mode);
   if (passive) {
     writeFileSync(join(transcriptDir, 'transcript.jsonl'), JSON.stringify({
       type: 'GENERIC', status: mode === 'running' ? 'RUNNING' : 'DONE', content: 'tool result',
@@ -95,11 +98,13 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
   const ready = cliId === 'antigravity' ? '? for shortcuts' : '›';
   const screen = mode === 'interrupted'
     ? '  ⎿  Interrupted · What should Antigravity CLI do instead?\n────────\n>\n────────\n? for shortcuts\n'
-    : mode === 'native-error' || mode === 'quota'
-      ? `⚠ ${mode === 'quota' ? 'Individual quota reached. Resets in 124h24m15s.' : 'Request failed. Please retry.'}\nError ID: native-error-fixture\n────────\n>\n────────\n`
+    : mode === 'native-error' || isQuota
+      ? `⚠ ${isQuota ? 'Individual quota reached. Resets in 124h24m15s.' : 'Request failed. Please retry.'}\nError ID: native-error-fixture\n────────\n>\n────────\n`
     : mode === 'running'
       ? '● Bash(sleep 30)\n⣻ Running command...\n────────\n>\n────────\nesc to cancel · 1 task(s)\n'
     : ready + '\n';
+  const previousQuota = mode === 'expired-quota' ? detectCliUsageLimit(screen, new Date(0)) : undefined;
+  const lastAntigravityQuota = previousQuota?.limited ? annotateAntigravityUsageLimit(screen, previousQuota) : undefined;
   const fakeCli = join(root, 'fake-cli');
   const initialScreenGate = passive ? join(root, 'worker-ready') : '';
   writeFileSync(fakeCli, `#!${tsRunnerPrefix().command}
@@ -176,6 +181,7 @@ setInterval(() => {}, 1_000);
     type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId, cliPathOverride: fakeCli, backendType: 'pty',
     cliSessionId: nativeId,
+    lastAntigravityQuota,
     prompt: passive ? '' : 'ACTIVATION_UNIQUE_MARKER',
     ...(!passive ? { queuedActivationToken: 'activation-token', turnId: 'om_initial' } : {}),
     larkAppId: 'app_test', larkAppSecret: 'secret',
@@ -203,6 +209,13 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
     await waitFor(() => worker.messages.some(m => m.type === 'screen_update' && m.status === 'limited'
       && m.usageLimit?.kind === 'usage' && m.usageLimit.source === 'antigravity-error-composer'), worker.logs, 20_000);
     expect(worker.input()).toBe('');
+  }, 60_000);
+
+  it('does not re-report a past-reset quota banner on worker reattach', async () => {
+    const worker = startWorker('expired-quota');
+    await waitFor(() => worker.messages.some(m => m.type === 'screen_update' && m.status === 'idle'
+      && m.content.includes('Individual quota reached')), worker.logs, 20_000);
+    expect(worker.messages.some(m => m.type === 'screen_update' && m.usageLimit)).toBe(false);
   }, 60_000);
 
   it('keeps an active command working despite its visible empty composer', async () => {

@@ -7,13 +7,14 @@ import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from '../sr
 
 function classifier(raw: () => string, cliId = 'antigravity') {
   const capture = vi.fn(raw);
+  const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false });
   const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
     backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit,
-    usageLimitTracker: createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false }),
+    usageLimitTracker, reconcileUsageLimitState, lastAntigravityQuota: undefined,
   });
-  return { classify, capture };
+  return { classify, capture, usageLimitTracker };
 }
 const composer = '\r\n────\r\n>\r\n────\r\n';
 const quota = '⚠ Individual quota reached. Resets in 124h24m15s.';
@@ -47,6 +48,34 @@ describe('raw ANSI tmux quota classification', () => {
     const second = classify('', 'working').usageLimit;
     expect(second.relativeResetKey).not.toBe(first.relativeResetKey);
     expect(reconcileUsageLimitState(first, second).retryAtMs).toBe(Date.now() + 60_000);
+  });
+
+  it('ignores a past-reset refusal in the viewport across turns and accepts a new Error ID', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = (errorId: string) => `⚠ Individual quota reached. Resets in 1m.\nError ID: ${errorId}`;
+    let screen = refusal('old') + composer;
+    const { classify, usageLimitTracker } = classifier(() => screen);
+    const first = classify('', 'idle').usageLimit;
+    expect(first?.source).toBe('antigravity-error-composer');
+
+    vi.advanceTimersByTime(59_000);
+    expect(classify('', 'idle').usageLimit?.retryAtMs).toBe(first.retryAtMs);
+
+    vi.advanceTimersByTime(1_000);
+    const turn = usageLimitTracker.beginTurn(screen);
+    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+
+    screen = refusal('old') + '\n429 Too Many Requests';
+    expect(classify('', 'idle').usageLimit?.kind).toBe('rate');
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
+
+    const retryTurn = usageLimitTracker.beginTurn(screen);
+    screen = refusal('old') + '\n' + refusal('new') + composer;
+    const fresh = classify('', 'idle').usageLimit;
+    expect(fresh?.relativeResetKey).toContain('new');
+    expect(fresh?.retryAtMs).toBe(Date.now() + 60_000);
+    expect(usageLimitTracker.detectedThisTurn(retryTurn)).toBe(true);
   });
 
   it('retains actual working footer authority above a colored historical refusal', () => {

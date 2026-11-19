@@ -772,7 +772,7 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, reconcileUsageLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
@@ -9369,6 +9369,8 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
   isOutputActive: isOutputActivelyProgressing,
 });
 
+let lastAntigravityQuota: CliUsageLimitState | undefined;
+
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
   return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
@@ -9400,12 +9402,21 @@ function classifyUsageLimitWithNativeEvidence(
     // IDs. Strip controls without filtering away native composer rows.
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+    return usageLimitTracker.classify(evidence, status, state => {
+      const observed = annotateAntigravityUsageLimit(evidence, state);
+      if (!observed.relativeResetKey) return observed;
+
+      // 同一个 Error ID 和倒计时在视口里重复出现时，沿用首次观察的截止时间
+      const previous = lastAntigravityQuota;
+      if (previous?.relativeResetKey === observed.relativeResetKey) {
+        const now = Date.now();
+        return now >= previous.retryAtMs ? undefined : reconcileUsageLimitState(previous, observed, now);
+      }
+      if (observed.source === 'antigravity-error-composer') lastAntigravityQuota = observed;
+      return observed;
+    });
   }
-  const result = usageLimitTracker.classify(evidence, status);
-  if (cliAdapter?.id === 'antigravity' && result.usageLimit) {
-    return { ...result, usageLimit: annotateAntigravityUsageLimit(evidence, result.usageLimit) };
-  }
-  return result;
+  return usageLimitTracker.classify(evidence, status);
 }
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
@@ -38018,6 +38029,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
       }
       lastInitConfig = msg;
+      lastAntigravityQuota = msg.lastAntigravityQuota;
       kimiCacheExpiryAutoCompact = msg.kimiCacheExpiryAutoCompact === true;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {

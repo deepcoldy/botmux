@@ -35,7 +35,7 @@ import { registerBot } from '../src/bot-registry.js';
 import { initWorkerPool, restoreUsageLimitRuntimeState, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
-import { detectCliUsageLimit } from '../src/utils/cli-usage-limit.js';
+import { detectCliUsageLimit, usageLimitStateKey } from '../src/utils/cli-usage-limit.js';
 import { annotateAntigravityUsageLimit } from '../src/adapters/cli/antigravity.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -176,6 +176,60 @@ describe('usage-limit sticky state self-heal', () => {
     await dispatch(restoredWorker, { type: 'screen_update', content: '⣻ Running command...\n>\nesc to cancel · 1 task(s)', status: 'working' });
     expect(restored.lastScreenStatus).toBe('working');
     expect(restored.usageLimit).toBeUndefined();
+  });
+
+  it.each(['screen_update', 'screenshot_uploaded'] as const)('clears a past-reset native quota on a %s without a fresh limit', async type => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 9, 1));
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_expired_native', 'expired native error', 'group', 'chat');
+    const ds = makeDs({ worker, workerPort: 9999, session });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const text = '⚠ Individual quota reached. Resets in 1m.\nError ID: expired-native\n────\n>\n────\n';
+    const detected = detectCliUsageLimit(text);
+    if (!detected.limited) throw new Error('Expected relative quota');
+    const initial = annotateAntigravityUsageLimit(text, detected);
+    await dispatch(worker, { type: 'screen_update', content: text, status: 'limited', usageLimit: initial });
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    const idleFrame = type === 'screen_update'
+      ? { type, content: text, status: 'idle' } as const
+      : { type, imageKey: 'img_stale_quota', status: 'idle' } as const;
+
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected expired quota clear failure'); });
+    await expect(dispatch(worker, idleFrame)).rejects.toThrow('injected expired quota clear failure');
+    expect(ds.usageLimit?.relativeResetKey).toBe(initial.relativeResetKey);
+    sessionStore.__testOnly_setBeforeRowPersist(undefined);
+
+    await dispatch(worker, idleFrame);
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.usageLimit).toBeUndefined();
+    const stored = sessionStore.getSessionFresh(session.sessionId);
+    expect(stored?.usageLimit).toBeUndefined();
+    expect(stored?.lastAntigravityQuota).toMatchObject({
+      relativeResetKey: initial.relativeResetKey,
+      retryAtMs: initial.retryAtMs,
+    });
+  });
+
+  it('notifies a fresh refusal after the old window without an intervening idle frame', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 9, 1));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const oldBanner = '⚠ Individual quota reached. Resets in 1m.\nError ID: initial\n────\n>\n────\n';
+    const detected = detectCliUsageLimit(oldBanner);
+    if (!detected.limited) throw new Error('Expected relative quota');
+    const initial = annotateAntigravityUsageLimit(oldBanner, detected);
+    await dispatch(worker, { type: 'screen_update', content: oldBanner, status: 'limited', usageLimit: initial });
+    expect(ds.rateLimitNotifiedKey).toBe(usageLimitStateKey(initial));
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    const fresh = rateLimitState();
+    await dispatch(worker, { type: 'screen_update', content: '429 Too Many Requests', status: 'limited', usageLimit: fresh });
+    expect(ds.usageLimit).toBe(fresh);
+    expect(ds.rateLimitNotifiedKey).toBe(usageLimitStateKey(fresh));
   });
 
   it('persists native provenance when a partial quota frame later gains its complete composer', async () => {
