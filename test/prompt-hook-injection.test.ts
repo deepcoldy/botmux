@@ -287,7 +287,11 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     { name: 'BOTMUX_SANDBOX=oncall', config: {}, env: 'oncall', perBot: true },
     { name: 'sandbox: "scratch"', config: { sandbox: 'scratch' as const }, env: undefined, perBot: false },
     { name: 'sandbox: true + BOTMUX_SANDBOX=scratch', config: { sandbox: true }, env: 'scratch', perBot: false },
-  ])('$name：与 worker 同口径，只有 oncall 改查 BOT_HOME 的 settings', ({ config, env, perBot }) => {
+    // 不开沙箱但配了 credentialsSourceDir：worker 同样重定向到 BOT_HOME
+    { name: '非沙箱 + credentialsSourceDir', config: { credentialsSourceDir: '/acc/b' }, env: undefined, perBot: true },
+    { name: '非沙箱 + 空 credentialsSourceDir', config: { credentialsSourceDir: '  ' }, env: undefined, perBot: false },
+    { name: 'scratch + credentialsSourceDir', config: { sandbox: 'scratch' as const, credentialsSourceDir: '/acc/b' }, env: undefined, perBot: false },
+  ])('$name：与 worker 同口径，只有 oncall 或非沙箱+凭证来源改查 BOT_HOME 的 settings', ({ config, env, perBot }) => {
     vi.stubEnv('BOTMUX_SANDBOX', env);
     try {
       getBotMock.mockReturnValue({
