@@ -2967,6 +2967,10 @@ export type WorkerToDaemonBase =
        *  message was posted (silent/suppressed turns also complete). */
       status: 'completed' | 'failed' | 'cancelled' | 'ambiguous';
       errorCode?: string;
+      /** With `errorCode: 'safe_composer_required'` only: why the worker
+       *  refused the unattended maintenance write. Absent from older workers;
+       *  a value this daemon does not know reads as absent. */
+      composerRefusal?: string;
       continuationFailure?: import('./services/session-contract.js').RuntimeExecutionContinuationFailure;
       /** Provider-neutral recovery hint. Only an explicit true authorizes the
        * daemon's bounded ordinary-turn continuation policy. */

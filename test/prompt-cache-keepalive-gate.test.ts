@@ -5,8 +5,21 @@
  *
  * Run: bun run vitest run test/prompt-cache-keepalive-gate.test.ts
  */
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { promptCacheKeepaliveRefusal, type PromptCacheKeepaliveWriteProbe } from '../src/core/prompt-cache-keepalive-gate.js';
+import {
+  composerScreenLogTail,
+  promptCacheKeepaliveRefusal,
+  type PromptCacheKeepaliveWriteProbe,
+} from '../src/core/prompt-cache-keepalive-gate.js';
+import { parseCapturedScreenRows } from '../src/utils/captured-screen-rows.js';
+import type { ScreenRow } from '../src/utils/terminal-cells.js';
+
+/** A plain-text screen as cells: nothing dim, nothing inverse. */
+function cells(text: string): ScreenRow[] {
+  return text.split('\n').map(line => Array.from(line).map(ch => ({ ch, dim: false, inverse: false })));
+}
 
 const READY = /❯/;
 const RULE = '─'.repeat(80);
@@ -100,7 +113,7 @@ const ok: PromptCacheKeepaliveWriteProbe = {
   tuiPromptOpen: false,
   bareShell: false,
   inputPending: false,
-  screen: COMPOSER,
+  screen: cells(COMPOSER),
   readyPattern: READY,
 };
 
@@ -111,23 +124,23 @@ describe('promptCacheKeepaliveRefusal', () => {
 
   it('refuses a permission dialog even though it matches the ready pattern', () => {
     expect(READY.test(PERMISSION_DIALOG)).toBe(true);
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen: PERMISSION_DIALOG })).toBe('action_prompt_open');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(PERMISSION_DIALOG) })).toBe('action_prompt_open');
   });
 
   it('refuses a wrapped permission dialog even with the composer box still painted', () => {
     expect(READY.test(WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER)).toBe(true);
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen: WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER })).toBe('action_prompt_open');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER) })).toBe('action_prompt_open');
   });
 
   it('refuses a wrapped dialog whose last diff row is directly above the question', () => {
     expect(READY.test(WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER)).toBe(true);
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen: WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER })).toBe('action_prompt_open');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER) })).toBe('action_prompt_open');
   });
 
   it('refuses a one-line permission question with the composer still painted below', () => {
     const screen = [PERMISSION_DIALOG, RULE, '❯ ', RULE, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n');
     expect(READY.test(screen)).toBe(true);
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(screen) })).toBe('action_prompt_open');
   });
 
   it('refuses a dialog wrapped beyond the join window (the notification parser stays silent)', () => {
@@ -152,7 +165,7 @@ describe('promptCacheKeepaliveRefusal', () => {
       '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
     ].join('\n');
     expect(READY.test(screen)).toBe(true);
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(screen) })).toBe('action_prompt_open');
   });
 
   it('refuses the 80-col 4-choice variant with a 5-row wrapped question', () => {
@@ -179,16 +192,16 @@ describe('promptCacheKeepaliveRefusal', () => {
     ].join('\n');
     expect(qRows.length).toBe(5);
     expect(READY.test(screen)).toBe(true);
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(screen) })).toBe('action_prompt_open');
   });
 
   it('refuses an AskUserQuestion picker (prompt not inside an input box)', () => {
     expect(READY.test(ASK_USER_QUESTION)).toBe(true);
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen: ASK_USER_QUESTION })).toBe('prompt_not_framed');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(ASK_USER_QUESTION) })).toBe('prompt_not_framed');
   });
 
   it('refuses a composer holding an unsent draft, allows an empty one', () => {
-    const withLine = (line: string) => COMPOSER.replace('❯ ', line);
+    const withLine = (line: string) => cells(COMPOSER.replace('❯ ', line));
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: withLine('❯ 帮我把这个函数重') })).toBe('composer_not_empty');
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: withLine('  ❯ half typed') })).toBe('composer_not_empty');
     // The live empty composer: prompt followed by a non-breaking space.
@@ -198,10 +211,10 @@ describe('promptCacheKeepaliveRefusal', () => {
 
   it('fails closed without an authoritative screen', () => {
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: undefined })).toBe('no_screen_evidence');
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen: '' })).toBe('no_screen_evidence');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: [] })).toBe('no_screen_evidence');
     expect(promptCacheKeepaliveRefusal({ ...ok, readyPattern: undefined })).toBe('no_screen_evidence');
     // A snapshot taken without preserveFormatting has the box rules blanked out.
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen: COMPOSER.replaceAll('─', ' ') })).toBe('prompt_not_framed');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: cells(COMPOSER.replaceAll('─', ' ')) })).toBe('prompt_not_framed');
   });
 
   it.each([
@@ -213,5 +226,100 @@ describe('promptCacheKeepaliveRefusal', () => {
     [{ inputPending: true }, 'input_pending'],
   ] as const)('refuses %j', (override, reason) => {
     expect(promptCacheKeepaliveRefusal({ ...ok, ...override })).toBe(reason);
+  });
+});
+
+/** The composer row `❯ <text>` with every character of <text> dim (ghost). */
+function withComposerRow(screen: string, row: ScreenRow): ScreenRow[] {
+  const rows = cells(screen);
+  const y = rows.findIndex(r => r.map(c => c.ch).join('') === '❯ ');
+  rows[y] = row;
+  return rows;
+}
+function promptRow(text: string, attrs: (index: number) => { dim?: boolean; inverse?: boolean }): ScreenRow {
+  return [
+    { ch: '❯', dim: false, inverse: false },
+    { ch: ' ', dim: false, inverse: false },
+    ...Array.from(text).map((ch, i) => ({ ch, dim: !!attrs(i).dim, inverse: !!attrs(i).inverse })),
+  ];
+}
+
+describe('input box shapes Claude Code 2.1.3xx draws', () => {
+  const titled = (top: string) => cells(COMPOSER.replace(`${RULE}\n❯ `, `${top}\n❯ `));
+
+  it('the top rule may carry the session name, tags or the history position', () => {
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled(`${'─'.repeat(60)} 修复Kimi后台唤醒后回复不转发飞书 ─`) })).toBeUndefined();
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled(`${'─'.repeat(60)} ↯ fast  xhigh ─`) })).toBeUndefined();
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled(`─── History 3/10 ${'─'.repeat(60)}`) })).toBeUndefined();
+  });
+
+  it('still refuses text that only looks like a rule', () => {
+    // No rule after the text, text glued to the rule, or barely any rule.
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled(`${'─'.repeat(60)} 标题`) })).toBe('prompt_not_framed');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled(`${'─'.repeat(60)}标题─`) })).toBe('prompt_not_framed');
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled('── a ─') })).toBe('prompt_not_framed');
+    // Text in the BOTTOM rule is never Claude's input box.
+    const bottomTitled = cells(COMPOSER.replace(`❯ \n${RULE}`, `❯ \n${'─'.repeat(60)} 标题 ─`));
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: bottomTitled })).toBe('prompt_not_framed');
+  });
+
+  it('dim ghost text in the input box is not a draft; typed text is', () => {
+    const suggestion = '好，复核完直接推，CI 绿了发链接';
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: withComposerRow(COMPOSER, promptRow(suggestion, () => ({ dim: true }))) })).toBeUndefined();
+    // Claude's own cursor: one inverse, non-dim cell on the suggestion's first character.
+    expect(promptCacheKeepaliveRefusal({
+      ...ok, screen: withComposerRow(COMPOSER, promptRow(suggestion, i => (i === 0 ? { inverse: true } : { dim: true }))),
+    })).toBeUndefined();
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: withComposerRow(COMPOSER, promptRow(suggestion, () => ({}))) })).toBe('composer_not_empty');
+    // A typed draft that merely ends in a dim autocomplete tail.
+    expect(promptCacheKeepaliveRefusal({
+      ...ok, screen: withComposerRow(COMPOSER, promptRow('/compact', i => (i < 5 ? {} : { dim: true }))),
+    })).toBe('composer_not_empty');
+    // A one-letter draft under the cursor has nothing dim: still a draft.
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: withComposerRow(COMPOSER, promptRow('y', () => ({ inverse: true }))) })).toBe('composer_not_empty');
+  });
+});
+
+describe('real Claude Code input boxes (capture-pane -e -p of live panes)', () => {
+  const FIXTURES = join(process.cwd(), 'test/fixtures');
+  const capture = (name: string) => readFileSync(join(FIXTURES, name), 'utf8');
+  const judge = (text: string) => promptCacheKeepaliveRefusal({ ...ok, screen: parseCapturedScreenRows(text) });
+  /** Same row typed by hand: the cells without SGR 2. */
+  const typed = (text: string) => text.split('\n').map(row => (row.startsWith('\x1b[39m❯') ? row.replace(/\x1b\[2m/g, '') : row)).join('\n');
+
+  it.each([
+    'claude-prompt-suggestion/empty-input-160x50.txt',
+    'claude-prompt-suggestion/empty-input-cursor-160x50.txt',
+    'claude-prompt-suggestion/suggestion-160x50.txt',
+    'claude-prompt-suggestion/suggestion-under-cursor-160x50.txt',
+    'claude-prompt-suggestion/suggestion-titled-rule-160x50.txt',
+    'claude-prompt-suggestion/static-example-160x50.txt',
+    'claude-prompt-suggestion/meta-no-response-160x50.txt',
+    'claude-composer-resize/pane-capture-214x62.txt',
+  ])('an empty input box (at most ghost text) admits the write: %s', name => {
+    expect(judge(capture(name))).toBeUndefined();
+  });
+
+  it.each([
+    'claude-prompt-suggestion/suggestion-160x50.txt',
+    'claude-prompt-suggestion/suggestion-titled-rule-160x50.txt',
+  ])('the same text typed by hand is refused as a draft: %s', name => {
+    expect(judge(typed(capture(name)))).toBe('composer_not_empty');
+  });
+});
+
+describe('composerScreenLogTail', () => {
+  it('keeps the shape the gate read, never the text in the input box', () => {
+    const draft = withComposerRow(COMPOSER, promptRow('my secret draft', () => ({})));
+    const tail = composerScreenLogTail(draft, READY);
+    expect(tail.join('\n')).not.toContain('secret');
+    // Every non-blank row is accounted for, the box rules included.
+    expect(tail).toHaveLength(COMPOSER.split('\n').filter(line => line.trim()).length);
+    const ghost = composerScreenLogTail(withComposerRow(COMPOSER, promptRow('建议', () => ({ dim: true }))), READY);
+    expect(ghost.join('\n')).not.toContain('建议');
+    // The two cases a refusal has to tell apart stay distinguishable.
+    expect(ghost[2]).not.toBe(tail[2]);
+    const empty = composerScreenLogTail(cells(COMPOSER), READY);
+    expect(empty[2]).toBe('❯');
   });
 });

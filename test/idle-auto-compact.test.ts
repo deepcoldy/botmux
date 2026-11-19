@@ -223,16 +223,17 @@ describe('idle auto-compact sweep', () => {
     expect(h.sweepAt([ds], T0 + 115 * MIN)).toBe(1);
   });
 
-  it('a worker refusal (no safe composer) is not retried in the same stretch', () => {
+  it('a draft in the input box is reported at once and not retried in the same stretch', () => {
     const ds = makeDs('33333333', { enabled: true });
     edge(ds, 'idle', T0);
     const h = harness();
     h.sweepAt([ds], T0 + 55 * MIN);
-    expect(noteIdleAutoCompactRefused(ds, h.compact.mock.calls[0][1])).toBe(true);
+    expect(noteIdleAutoCompactRefused(ds, h.compact.mock.calls[0][1], 'composer_not_empty'))
+      .toEqual({ reason: 'draft', attempt: 1, retry: false });
     for (let m = 56; m < 60; m += 1) h.sweepAt([ds], T0 + m * MIN);
     expect(h.compact).toHaveBeenCalledTimes(1);
-    // The topic hears it was skipped, never that it compacted.
-    expect(h.notify.mock.calls.map(c => c[1].kind)).toEqual(['refused']);
+    // The topic hears what stopped it, never that it compacted.
+    expect(h.notify.mock.calls.map(c => c[1])).toEqual([{ kind: 'refused', idleMinutes: 55, reason: 'draft', attempts: 1 }]);
     // Activity that starts no botmux turn (typing in the web terminal) is not
     // proof of a warm cache: the handled stretch stays current.
     edge(ds, 'working', T0 + 61 * MIN);
@@ -243,6 +244,106 @@ describe('idle auto-compact sweep', () => {
     edge(ds, 'working', T0 + 120 * MIN);
     edge(ds, 'idle', T0 + 121 * MIN);
     expect(h.sweepAt([ds], T0 + 176 * MIN)).toBe(1);
+  });
+
+  it('a dialog waiting for an answer is reported at once as well', () => {
+    const ds = makeDs('33333334', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    expect(noteIdleAutoCompactRefused(ds, h.compact.mock.calls[0][1], 'action_prompt_open')?.retry).toBe(false);
+    for (let m = 56; m < 60; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(1);
+    expect(h.notify.mock.calls.map(c => c[1])).toEqual([{ kind: 'refused', idleMinutes: 55, reason: 'choice', attempts: 1 }]);
+  });
+
+  it('an input box that was not recognised is tried again inside the window, then reported with why', () => {
+    const ds = makeDs('33333335', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    const refuseLast = () => {
+      const outcome = noteIdleAutoCompactRefused(ds, h.compact.mock.calls.at(-1)![1], 'prompt_not_framed');
+      h.persist(ds); // worker-pool saves the row after every refusal
+      return outcome;
+    };
+    expect(h.sweepAt([ds], T0 + 55 * MIN)).toBe(1);
+    expect(refuseLast()).toEqual({ reason: 'unconfirmed', attempt: 1, retry: true });
+    expect(h.sweepAt([ds], T0 + 56 * MIN)).toBe(1);
+    expect(refuseLast()).toEqual({ reason: 'unconfirmed', attempt: 2, retry: true });
+    expect(h.sweepAt([ds], T0 + 57 * MIN)).toBe(1);
+    expect(refuseLast()).toEqual({ reason: 'unconfirmed', attempt: 3, retry: false });
+    for (let m = 58; m <= 120; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(3);
+    // One notice, after the last try, with the real reason.
+    expect(h.notify.mock.calls.map(c => c[1])).toEqual([{ kind: 'refused', idleMinutes: 57, reason: 'unconfirmed', attempts: 3 }]);
+  });
+
+  it('a retry that the worker runs is announced as compacted, with no refusal notice', () => {
+    const ds = makeDs('33333336', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    noteIdleAutoCompactRefused(ds, h.compact.mock.calls[0][1], 'prompt_not_ready');
+    expect(h.sweepAt([ds], T0 + 56 * MIN)).toBe(1);
+    // This time the compact runs and returns to idle.
+    edge(ds, 'working', T0 + 56 * MIN + 1_000);
+    edge(ds, 'idle', T0 + 57 * MIN);
+    for (let m = 57; m <= 120; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(2);
+    expect(h.notify.mock.calls.map(c => c[1].kind)).toEqual(['compacted']);
+    expect(ds.session.idleAutoCompact?.retry).toBeUndefined();
+  });
+
+  it('the window closing before the next try still tells the topic why nothing ran', () => {
+    const ds = makeDs('33333337', { enabled: true, minutes: 59 });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    expect(h.sweepAt([ds], T0 + 59 * MIN)).toBe(1);
+    expect(noteIdleAutoCompactRefused(ds, h.compact.mock.calls[0][1], 'no_screen_evidence')?.retry).toBe(true);
+    for (let m = 60; m <= 120; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(1);
+    expect(h.notify.mock.calls.map(c => c[1])).toEqual([{ kind: 'refused', idleMinutes: 60, reason: 'no_screen', attempts: 1 }]);
+  });
+
+  it('an older worker that gives no reason is retried and reported as unknown', () => {
+    const ds = makeDs('33333338', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    for (let m = 55; m <= 57; m += 1) {
+      h.sweepAt([ds], T0 + m * MIN);
+      noteIdleAutoCompactRefused(ds, h.compact.mock.calls.at(-1)![1]);
+    }
+    h.sweepAt([ds], T0 + 58 * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(3);
+    expect(h.notify.mock.calls.map(c => c[1])).toEqual([{ kind: 'refused', idleMinutes: 57, reason: 'unknown', attempts: 3 }]);
+  });
+
+  it('a botmux turn between a refused try and the next ends that stretch: no retry, no stale notice', () => {
+    const ds = makeDs('3333333a', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    noteIdleAutoCompactRefused(ds, h.compact.mock.calls[0][1], 'prompt_not_framed');
+    noteIdleAutoCompactTurnStarted(ds, 'om_user_meanwhile', T0 + 55 * MIN + 20_000);
+    edge(ds, 'working', T0 + 55 * MIN + 20_000);
+    edge(ds, 'idle', T0 + 56 * MIN);
+    expect(ds.session.idleAutoCompact?.retry).toBeUndefined();
+    for (let m = 56; m < 111; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(1);
+    expect(h.notify).not.toHaveBeenCalled();
+    // The new stretch compacts on its own schedule, as a first attempt.
+    expect(h.sweepAt([ds], T0 + 111 * MIN)).toBe(1);
+    expect(ds.session.idleAutoCompact?.inFlight?.attempt).toBe(1);
+  });
+
+  it('a refusal for a turn that is not our in-flight compact changes nothing', () => {
+    const ds = makeDs('33333339', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    expect(noteIdleAutoCompactRefused(ds, 'auto-compact:threshold', 'prompt_not_framed')).toBeUndefined();
+    expect(ds.session.idleAutoCompact?.inFlight?.turnId).toBe(h.compact.mock.calls[0][1]);
+    expect(ds.session.idleAutoCompact?.retry).toBeUndefined();
   });
 
   it('an undelivered send releases the claim so the next tick retries', () => {
@@ -388,6 +489,25 @@ describe('idle auto-compact across a daemon restart', () => {
     edge(restored, 'idle', T0 + 70 * MIN);
     for (let m = 70; m <= 200; m += 1) h.sweepAt([restored], T0 + m * MIN);
     expect(h.compact).toHaveBeenCalledTimes(1);
+  });
+
+  it('a restart between a refused try and the next keeps counting the same stretch', () => {
+    const ds = makeDs('dddd2222', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    for (let m = 55; m <= 56; m += 1) {
+      h.sweepAt([ds], T0 + m * MIN);
+      noteIdleAutoCompactRefused(ds, h.compact.mock.calls.at(-1)![1], 'prompt_not_framed');
+      h.persist(ds);
+    }
+    const restored = restartFrom(ds);
+    edge(restored, 'idle', T0 + 56 * MIN + 30_000);
+    expect(h.sweepAt([restored], T0 + 57 * MIN)).toBe(1);
+    expect(noteIdleAutoCompactRefused(restored, h.compact.mock.calls.at(-1)![1], 'prompt_not_framed'))
+      .toEqual({ reason: 'unconfirmed', attempt: 3, retry: false });
+    for (let m = 58; m <= 120; m += 1) h.sweepAt([restored], T0 + m * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(3);
+    expect(h.notify.mock.calls.map(c => c[1].kind)).toEqual(['refused']);
   });
 
   it('a restart while the compact is running does not compact again when it finishes', () => {

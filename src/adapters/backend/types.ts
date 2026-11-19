@@ -387,6 +387,15 @@ export interface SessionBackend {
     viewport: string;
     cursor: { x: number; y: number };
   } | null;
+  /**
+   * The pane's current viewport as cells (dim / inverse kept), read
+   * synchronously from the backend's own screen. Unattended maintenance writes
+   * judge the composer on this rather than on the worker's long-lived
+   * renderer, which keeps its spawn size while a web terminal resizes the real
+   * pane. Null when the viewport cannot be read now; backends without an
+   * authoritative synchronous viewport omit it.
+   */
+  captureViewportCells?(): import('../../utils/terminal-cells.js').ScreenRow[] | null;
   getPaneSize?(): { cols: number; rows: number } | null;
   /**
    * Remote sandbox access URL — backends that run on a remote sandbox (e.g.

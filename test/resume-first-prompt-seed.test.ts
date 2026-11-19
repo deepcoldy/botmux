@@ -139,6 +139,13 @@ describe('screenShowsFramedPrompt', () => {
     expect(screenShowsFramedPrompt(withBox, CLAUDE_READY)).toBe(true);
   });
 
+  it('改过名的会话：上横线右端嵌着会话名（Claude Code 2.1.3xx）也算输入框', () => {
+    const titledTop = `${'─'.repeat(60)} 修复Kimi后台唤醒后回复不转发飞书 ─`;
+    expect(screenShowsFramedPrompt(IDLE_SCREEN.replace(`${RULE}\n❯ `, `${titledTop}\n❯ `), CLAUDE_READY)).toBe(true);
+    // 下横线从不带字；带字的下横线不是 Claude 的输入框。
+    expect(screenShowsFramedPrompt([RULE, '❯ ', titledTop].join('\n'), CLAUDE_READY)).toBe(false);
+  });
+
   it('框线太短（表格、分隔符之类）不算输入框', () => {
     const screen = ['───', '❯ ', '───'].join('\n');
     expect(screenShowsFramedPrompt(screen, CLAUDE_READY)).toBe(false);

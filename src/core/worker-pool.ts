@@ -75,7 +75,8 @@ import { confirmCodexModelLaunch, readCodexModelLaunchReceipt, readCodexModelSet
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, promptCacheKeepaliveInFlight, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
-import { clearIdleAutoCompactStretch, idleAutoCompactMinutes, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
+import { IDLE_AUTO_COMPACT_MAX_ATTEMPTS, clearIdleAutoCompactStretch, idleAutoCompactMinutes, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
+import { parseUnattendedInputRefusal } from './unattended-input-refusal.js';
 import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command.js';
@@ -24808,7 +24809,9 @@ function setupWorkerHandlers(
         if (outcomeExcluded) holdLastTurnThroughExcludedTerminal(ds, msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         if (settleAutoCompactSafeComposerRefusal(ds, msg)) {
-          if (noteIdleAutoCompactRefused(ds, msg.turnId)) {
+          const composerRefusal = parseUnattendedInputRefusal(msg.composerRefusal);
+          const idleRefusal = noteIdleAutoCompactRefused(ds, msg.turnId, composerRefusal);
+          if (idleRefusal) {
             try { sessionStore.updateSession(ds.session); } catch { /* next status edge re-saves */ }
           }
           // The worker deliberately refused an unattended maintenance write.
@@ -24817,10 +24820,16 @@ function setupWorkerHandlers(
           // a later human turn to repair the projection.
           persistStreamCardState(ds);
           if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
-          logger.warn(
-            `[${t}] Auto compact skipped: live empty composer evidence was unavailable `
-            + `(turn=${msg.turnId.substring(0, 20)})`,
-          );
+          const why = composerRefusal
+            ?? (typeof msg.composerRefusal === 'string'
+              ? `unrecognised reason ${JSON.stringify(msg.composerRefusal.slice(0, 40))}`
+              : 'reason not reported by this worker');
+          logger.warn(idleRefusal
+            ? `[idle-compact] ${t} worker refused /compact (${why}) on attempt `
+              + `${idleRefusal.attempt}/${IDLE_AUTO_COMPACT_MAX_ATTEMPTS}; `
+              + (idleRefusal.retry ? 'will retry at a later sweep inside this idle window' : 'not retrying this idle stretch')
+            : `[${t}] Auto compact skipped: the worker refused the unattended write (${why}) `
+              + `(turn=${msg.turnId.substring(0, 20)})`);
         }
         // Any other non-completed end of our idle auto-compact turn (Ctrl-C,
         // crash, ambiguous) must not be announced as a successful compact. The
