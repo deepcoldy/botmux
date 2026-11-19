@@ -534,7 +534,7 @@ export function resolveHerdrResumeCliSessionId(
 /** Serialize cleanup + launch for one native conversation on one Herdr host.
  * The lock lives outside any worker's session data dir so overlapping workers
  * cannot both observe an empty pane set and start a second writer. */
-function herdrResumeLockTarget(sessionName: string, cliSessionId: string): string {
+export function herdrResumeLockTarget(sessionName: string, cliSessionId: string): string {
   const key = createHash('sha256')
     .update(process.env.HOME ?? '')
     .update('\0').update(sessionName)
@@ -780,6 +780,10 @@ export class HerdrBackend implements SessionBackend {
   }
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    // Unconditional, ahead of every launch path including the resume-lock
+    // failure below: a spawn that never started must not leave the previous
+    // generation's stable-pane identity frozen in getStablePanePid().
+    this.lastKnownStablePanePid = null;
     const resumeCliSessionId = !this.opts.isReattach && !this.opts.externalTarget
       ? opts.resumeCliSessionId
       : undefined;
@@ -797,7 +801,6 @@ export class HerdrBackend implements SessionBackend {
   }
 
   private spawnWithResumeExclusion(bin: string, args: string[], opts: SpawnOpts): void {
-    this.lastKnownStablePanePid = null;
     this.cols = opts.cols;
     this.rows = opts.rows;
     this.cliCwd = opts.cwd;

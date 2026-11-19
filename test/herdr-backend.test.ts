@@ -34,8 +34,9 @@ vi.mock('node-pty', () => ({
 import { execFileSync, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
 import {
-  HerdrBackend, PANE_AGENT_START_TIMEOUT_MS, PANE_AGENT_START_ATTEMPTS, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes, resolveHerdrResumeCliSessionId,
+  HerdrBackend, PANE_AGENT_START_TIMEOUT_MS, PANE_AGENT_START_ATTEMPTS, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes, resolveHerdrResumeCliSessionId, herdrResumeLockTarget,
 } from '../src/adapters/backend/herdr-backend.js';
+import { withFileLockSync } from '../src/utils/file-lock.js';
 import { logger } from '../src/utils/logger.js';
 import { scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 
@@ -1427,6 +1428,26 @@ describe('HerdrBackend.spawn', () => {
       spawnResume([], true, [nestedStart]);
       expect(nestedError).toBeDefined();
       expect(starts).toBe(1);
+    });
+
+    it('clears the cached stable-pane pid even when the resume lock is already held', () => {
+      setHerdrResponses([
+        { match: a => a.includes('process-info'), reply: () => { throw new Error('socket timeout'); } },
+      ]);
+      const be = new HerdrBackend(SESSION);
+      // A previous generation left a frozen identity on this instance.
+      Object.assign(be, { paneId: 'stale-pane', cliExecutable: 'claude' });
+      (be as any).lastKnownStablePanePid = 12345;
+      withFileLockSync(herdrResumeLockTarget(SESSION, SID), () => {
+        // Same key held with maxWaitMs:0 → the lock error fires before any
+        // launch step (and before the in-helper reset used to run).
+        expect(() => be.spawn('claude', ['--resume', SID], {
+          cwd: '/work', cols: 80, rows: 24, env: {}, resumeCliSessionId: SID,
+        })).toThrow(/file-lock timeout/);
+      }, { maxWaitMs: 0 });
+      // A later failed probe must report "unknown", not the prior generation.
+      expect(be.getStablePanePid()).toBeNull();
+      be.kill();
     });
 
     it('closes a pane whose agent_session is a _<id>.jsonl path', () => {
