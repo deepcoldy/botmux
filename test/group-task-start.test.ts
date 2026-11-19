@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { groupTaskForwardIds, groupTaskHasMedia, groupTaskPlaceholder, groupTaskPrompt, groupTaskQuoteId, startGroupTask } from '../src/core/group-task-start.js';
+import { groupTaskForwardIds, groupTaskHasMedia, groupTaskPlaceholder, groupTaskPrompt, groupTaskPromptAttachments, groupTaskQuoteId, groupTaskSenderIsBot, startGroupTask } from '../src/core/group-task-start.js';
 
 describe('groupTaskPlaceholder', () => {
   it('uses the first non-empty line and cuts by grapheme', () => {
@@ -22,6 +22,34 @@ describe('groupTaskForwardIds', () => {
     expect(groupTaskHasMedia({ msgType: 'post', rawPostContent: withImage })).toBe(true);
     expect(groupTaskHasMedia({ msgType: 'post', rawPostContent: textOnly })).toBe(false);
     expect(groupTaskHasMedia({ msgType: 'file' })).toBe(true);
+  });
+});
+
+describe('groupTaskPromptAttachments', () => {
+  it('exposes rich-text file metadata before download', () => {
+    const rawPostContent = JSON.stringify({ title: '', content: [[
+      { tag: 'text', text: '/g --start inspect' },
+      { tag: 'file', file_key: 'file_env', file_name: 'prod.env' },
+    ]] });
+    expect(groupTaskPromptAttachments({ msgType: 'post', rawPostContent }))
+      .toEqual([{ type: 'file', name: 'prod.env' }]);
+    expect(groupTaskPromptAttachments({ msgType: 'text' })).toEqual([]);
+  });
+
+  it('uses already materialized attachment metadata when supplied', () => {
+    expect(groupTaskPromptAttachments({
+      msgType: 'post', attachments: [{ type: 'image', name: 'shot.png' }],
+    })).toEqual([{ type: 'image', name: 'shot.png' }]);
+  });
+});
+
+describe('groupTaskSenderIsBot', () => {
+  it('accepts Lark bot stamps and the learned-peer fallback, never a human lookalike', () => {
+    expect(groupTaskSenderIsBot({ senderType: 'app', senderId: 'ou_bot' }, 'ou_self', false)).toBe(true);
+    expect(groupTaskSenderIsBot({ senderType: 'bot', senderId: 'ou_bot' }, 'ou_self', false)).toBe(true);
+    expect(groupTaskSenderIsBot({ senderType: 'user', senderId: 'ou_peer' }, 'ou_self', true)).toBe(true);
+    expect(groupTaskSenderIsBot({ senderType: 'user', senderId: 'ou_human' }, 'ou_self', false)).toBe(false);
+    expect(groupTaskSenderIsBot({ senderType: 'user', senderId: 'ou_self' }, 'ou_self', true)).toBe(false);
   });
 });
 

@@ -700,6 +700,58 @@ describe("p2pMode='group' 建群前扣费点：命令判定必须早于扣费", 
       });
     });
 
+    it('resolves an indirect prompt only after talk authorization', async () => {
+      const resolvePrompt = vi.fn(async () => ({
+        promptContent: 'quoted task',
+        promptAttachments: [{ type: 'file', name: 'prod.env' }],
+      }));
+
+      await expect(enforceMessageQuotaForCliInput(
+        APP, DM_CHAT, 'ou_stranger', 'om_gate_unauthorized_resolver', 'om_anchor',
+        undefined, undefined, 'group', false, { resolvePrompt },
+      )).resolves.toBe(false);
+
+      expect(resolvePrompt).not.toHaveBeenCalled();
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    });
+
+    it('adjudicates resolved text and attachment metadata before charging', async () => {
+      const seen = join(gateDir, 'seen-resolved.json');
+      installGate(`
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => {
+          const p = JSON.parse(input);
+          writeFileSync(${JSON.stringify(seen)}, JSON.stringify(p));
+          const denied = String(p.content ?? '').includes('机密')
+            || (p.attachments ?? []).some(a => a.name.endsWith('.env'));
+          console.log(JSON.stringify(denied
+            ? { decision: 'deny', reason: 'resolved task rejected' }
+            : { decision: 'allow' }));
+        });
+      `);
+      const resolvePrompt = vi.fn(async () => ({
+        promptContent: '机密任务',
+        promptAttachments: [{ type: 'file', name: 'prod.env' }],
+      }));
+
+      await expect(enforceMessageQuotaForCliInput(
+        APP, DM_CHAT, GRANTEE, 'om_gate_resolved_deny', 'om_anchor',
+        undefined, undefined, 'group', false, { resolvePrompt },
+      )).resolves.toBe(false);
+
+      expect(resolvePrompt).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(readFileSync(seen, 'utf-8'))).toMatchObject({
+        content: '机密任务',
+        attachments: [{ type: 'file', name: 'prod.env' }],
+      });
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    });
+
     it('sees attachment metadata even though the files are not downloaded yet', async () => {
       // The gate runs BEFORE downloadResources (downloading must stay behind
       // authorization, or an unauthorized sender could make the bot fetch

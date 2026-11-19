@@ -112,7 +112,7 @@ botmux 里有两种「会话群」，本页都会讲到：
 
 也可以引用一条消息后只发 `/g --start`，任务就是被引用的那条消息。
 
-想让某个机器人的 `/g` 默认就带任务开工，给它设 `"autoStart": true`（见下一节），之后不用每次写 `--start`；个别时候只想建群，加 `--no-start`。
+想让某个机器人的 `/g` 默认就带任务开工，给它设 `"autoStart": true`（见下一节），之后不用每次写 `--start`；个别时候只想建群，加 `--no-start`。多 bot 时由首个 @ 的 bot 担任 creator，多行命令是否识别也只按 creator 的共享配置判断，其余 bot 的 `autoStart` 不会让判定分叉。
 
 选项（`--start`、`--tag` 等）只认第一行，第二行起原样当任务；第一行的任务里本身带 `--tag` 这类字样时，在任务前加 `--`，如 `/g --start -- npm publish --tag canary`。
 

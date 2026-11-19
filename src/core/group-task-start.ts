@@ -14,6 +14,38 @@ import { extractResources } from '../im/lark/message-parser.js';
 /** Graphemes kept in the placeholder name before the AI title lands. */
 export const GROUP_TASK_PLACEHOLDER_MAX = 20;
 
+export interface GroupTaskPromptAttachment {
+  type: string;
+  name: string;
+}
+
+/** Attachment metadata visible to prompt.submit before anything is downloaded.
+ *  Live slash commands carrying files arrive as rich-text posts; already
+ *  materialized attachments are also accepted for direct handler callers. */
+export function groupTaskPromptAttachments(message: {
+  msgType: string;
+  rawPostContent?: string;
+  attachments?: Array<{ type: string; name: string }>;
+}): GroupTaskPromptAttachment[] {
+  if (message.attachments?.length) {
+    return message.attachments.map(({ type, name }) => ({ type, name }));
+  }
+  if (message.msgType !== 'post' || !message.rawPostContent) return [];
+  return extractResources('post', message.rawPostContent).map(({ type, name }) => ({ type, name }));
+}
+
+/** Same sender classification as the ordinary ingress paths: Lark's stamp is
+ *  authoritative, with the learned peer cross-ref as the fallback for events
+ *  that incorrectly stamp a known bot as `user`. */
+export function groupTaskSenderIsBot(
+  message: { senderType: string; senderId: string },
+  selfBotOpenId: string | undefined,
+  knownPeerBot: boolean,
+): boolean {
+  if (message.senderType === 'app' || message.senderType === 'bot') return true;
+  return !!message.senderId && message.senderId !== selfBotOpenId && knownPeerBot;
+}
+
 export interface GroupTaskSource {
   chatId: string;
   chatType?: 'group' | 'p2p';
@@ -93,8 +125,8 @@ export interface GroupTaskStartResult {
   forwardFailed: string[];
   /** Set when the new session could not be started; the chat is kept. */
   startError?: string;
-  /** The session exists but waits for the user to pick a repository. */
-  pendingRepo?: boolean;
+  /** Opening is waiting for repository selection or automatic worktree setup. */
+  pendingRepo?: 'picker' | 'auto_worktree';
 }
 
 /**

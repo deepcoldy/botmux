@@ -1,3 +1,5 @@
+import { botsInfoObjectEntries, isBotsInfoNameEntry } from './bots-info-shape.js';
+
 export type GroupAvatarMode = 'name' | 'logo' | 'off';
 
 /** Opt-in team defaults for /g; mentions retain creator election and invitations. */
@@ -220,6 +222,65 @@ export function groupCommandStartsTask(commandText: string, defaults: unknown): 
   } catch {
     return false;
   }
+}
+
+export function isGroupCommandText(commandText: string): boolean {
+  return GROUP_COMMAND_PREFIX.test(commandText.trim());
+}
+
+/** Shared name view of bots-info.json, including name-only rows. */
+export function knownGroupBotNames(value: unknown): Set<string> {
+  return new Set(botsInfoObjectEntries(value).filter(isBotsInfoNameEntry)
+    .map(entry => entry.botName.toLowerCase()));
+}
+
+/** First-known-bot election input shared by routing and handleCommand. */
+export function knownGroupBotMentions<T extends { name?: string }>(
+  mentions: readonly T[],
+  knownBotNames: ReadonlySet<string>,
+): T[] {
+  return mentions.filter(m => m.name && knownBotNames.has(m.name.toLowerCase()));
+}
+
+export interface GroupRoutingBotDefaults {
+  botName: string;
+  groupCreation?: unknown;
+}
+
+/**
+ * Multi-line routing must be identical in every mentioned bot's daemon. When
+ * bots are mentioned, use the FIRST known bot's shared defaults — never the
+ * receiving daemon's own defaults. Ambiguous duplicate names fail closed for
+ * implicit task mode (`every`), while an explicit --start remains available.
+ */
+export function groupCommandStartsTaskForRouting(input: {
+  commandText: string;
+  ownDefaults: unknown;
+  mentions?: ReadonlyArray<{ name?: string }>;
+  knownBots: readonly GroupRoutingBotDefaults[];
+}): boolean {
+  if (!isGroupCommandText(input.commandText)) return false;
+  const knownBotsByName = new Map<string, GroupRoutingBotDefaults[]>();
+  for (const bot of input.knownBots) {
+    const name = bot.botName.toLowerCase();
+    const entries = knownBotsByName.get(name) ?? [];
+    entries.push(bot);
+    knownBotsByName.set(name, entries);
+  }
+  const knownNames = new Set(knownBotsByName.keys());
+  const mentions = input.mentions ?? [];
+  // A degraded/empty registry cannot prove that a mention is human. Do not
+  // fork on each daemon's own defaults; explicit --start still parses true.
+  if (mentions.length > 0 && knownNames.size === 0) {
+    return groupCommandStartsTask(input.commandText, undefined);
+  }
+  const botMentions = knownGroupBotMentions(mentions, knownNames);
+  if (botMentions.length === 0) {
+    return groupCommandStartsTask(input.commandText, input.ownDefaults);
+  }
+  const candidates = knownBotsByName.get(botMentions[0]!.name!.toLowerCase()) ?? [];
+  if (candidates.length === 0) return groupCommandStartsTask(input.commandText, undefined);
+  return candidates.every(candidate => groupCommandStartsTask(input.commandText, candidate.groupCreation));
 }
 
 /** What /g should do beyond creating the chat, derived from the parsed args. */

@@ -59,7 +59,8 @@ import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/transport/connection-health.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
-import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { readBotsInfoJson } from './services/bots-info-cache.js';
 import { createBotProfileRefresher } from './services/bot-profile-refresh.js';
 import { lastKnownBotName } from './services/bot-display-name.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
@@ -604,7 +605,8 @@ import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.j
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { commandSpec } from './core/command-schema.js';
-import { groupCommandStartsTask } from './services/group-creation-options.js';
+import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
+import { groupTaskSenderIsBot } from './core/group-task-start.js';
 import { deriveSessionPhase } from './core/session-phase.js';
 import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
@@ -5503,6 +5505,13 @@ export async function enforceMessageQuotaForCliInput(
      *  所以闸看不到文件内容——但至少能看到「这轮带了什么附件」，让
      *  「禁止上传 .env / 只许图片」这类策略可写。见 hooks.md 的边界说明。 */
     promptAttachments?: Array<{ type: string; name: string }>;
+    /** Resolve content that must only be fetched after the built-in talk check
+     * (for example a quoted `/g` task). Runs before prompt.submit and charging;
+     * static promptContent/promptAttachments remain the zero-async default. */
+    resolvePrompt?: () => Promise<{
+      promptContent?: string;
+      promptAttachments?: Array<{ type: string; name: string }>;
+    }>;
   },
 ): Promise<boolean> {
   if (opts?.listenerAuthorized) {
@@ -5511,6 +5520,9 @@ export async function enforceMessageQuotaForCliInput(
     // is attacker-influenceable third-party text, which is exactly what a
     // pre-submit gate exists to inspect. Ask the gate before returning; there
     // is no charge on this path, so the charge-order invariant is not in play.
+    const resolvedPrompt = opts.resolvePrompt
+      ? await opts.resolvePrompt()
+      : { promptContent: opts.promptContent, promptAttachments: opts.promptAttachments };
     const listenerGate = await evaluatePromptGate('prompt.submit', {
       larkAppId,
       chatId,
@@ -5520,8 +5532,8 @@ export async function enforceMessageQuotaForCliInput(
       senderOpenId,
       botSender: !!botSender,
       talkReason: 'messageListener',
-      content: opts.promptContent,
-      attachments: opts.promptAttachments,
+      content: resolvedPrompt.promptContent,
+      attachments: resolvedPrompt.promptAttachments,
     });
     if (!listenerGate.allowed) {
       logger.info(
@@ -5566,6 +5578,10 @@ export async function enforceMessageQuotaForCliInput(
   // they never reach a CLI and therefore must not spend or dedupe a quota unit.
   if (opts?.skipCharge) return true;
 
+  const resolvedPrompt = opts?.resolvePrompt
+    ? await opts.resolvePrompt()
+    : { promptContent: opts?.promptContent, promptAttachments: opts?.promptAttachments };
+
   // ─── prompt.submit 同步前置校验闸 ────────────────────────────────────────
   // 位置是被两条既有不变量夹死的，不能随意挪：
   //   • 必须在 evaluateTalk 之后——内置权限模型仍是第一道；外部 hook 只能
@@ -5584,8 +5600,8 @@ export async function enforceMessageQuotaForCliInput(
     memberUnionId,
     botSender: !!botSender,
     talkReason: ev.reason,
-    content: opts?.promptContent,
-    attachments: opts?.promptAttachments,
+    content: resolvedPrompt.promptContent,
+    attachments: resolvedPrompt.promptAttachments,
   });
   if (!gate.allowed) {
     logger.info(
@@ -7037,18 +7053,25 @@ const commandDeps: CommandHandlerDeps = {
   // `/g <task>` hands its text to a new CLI session: same talk check,
   // prompt.submit gate and quota charge as a normal message, before the
   // group exists (a refusal must leave no external side effect).
-  admitTaskPrompt: ({ larkAppId, message, anchor, content }) => enforceMessageQuotaForCliInput(
-    larkAppId,
-    message.chatId ?? anchor,
-    message.senderId,
-    message.messageId,
-    anchor,
-    message.senderUnionId,
-    undefined,
-    message.chatType,
-    false,
-    { promptContent: content },
-  ),
+  admitTaskPrompt: ({ larkAppId, message, anchor, content, resolvePrompt }) => {
+    const botSender = groupTaskSenderIsBot(
+      message,
+      getBot(larkAppId).botOpenId,
+      isKnownPeerBot(config.session.dataDir, larkAppId, message.senderId),
+    );
+    return enforceMessageQuotaForCliInput(
+      larkAppId,
+      message.chatId ?? anchor,
+      message.senderId,
+      message.messageId,
+      anchor,
+      botSender ? message.senderUnionId : undefined,
+      botSender ? undefined : message.senderUnionId,
+      message.chatType,
+      botSender,
+      { promptContent: content, resolvePrompt },
+    );
+  },
 };
 
 /** Bind every reply produced by one slash-command invocation to the routing
@@ -7136,11 +7159,35 @@ function canTalkForGroupSessions(
     : evaluateTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, memberUnionId, chatType).allowed;
 }
 
-/** Multi-line `/g` routes as a command only when it starts a task for this bot
- * (`--start`, or groupCreation.autoStart: true without `--no-start`). Any other
- * multi-line `/g` stays discussion text for the CLI, as before task mode. */
-function multilineCommandsForRouting(larkAppId: string, text: string): ReadonlySet<string> | undefined {
-  if (!groupCommandStartsTask(text, getBot(larkAppId).config.groupCreation)) return undefined;
+/** Shared, receiver-independent creator defaults for multiline `/g` routing.
+ * Name-only registry rows stay visible to election; config joins by app ID. */
+function sharedGroupRoutingBots(): GroupRoutingBotDefaults[] {
+  let defaultsByAppId = new Map<string, unknown>();
+  try {
+    defaultsByAppId = new Map(loadBotConfigsCached().map(bot => [bot.larkAppId, bot.groupCreation]));
+  } catch { /* Explicit --start still works with unknown defaults. */ }
+  let raw: unknown;
+  try { raw = readBotsInfoJson(config.session.dataDir); } catch { return []; }
+  return botsInfoObjectEntries(raw).filter(isBotsInfoNameEntry).map(entry => ({
+    botName: entry.botName,
+    groupCreation: typeof entry.larkAppId === 'string' ? defaultsByAppId.get(entry.larkAppId) : undefined,
+  }));
+}
+
+/** Multi-line `/g` is a command only under the FIRST mentioned creator's
+ * shared defaults. Without bot mentions, this daemon is the creator. */
+function multilineCommandsForRouting(
+  larkAppId: string,
+  text: string,
+  mentions?: LarkMessage['mentions'],
+): ReadonlySet<string> | undefined {
+  if (!isGroupCommandText(text)) return undefined;
+  if (!groupCommandStartsTaskForRouting({
+    commandText: text,
+    ownDefaults: getBot(larkAppId).config.groupCreation,
+    mentions,
+    knownBots: sharedGroupRoutingBots(),
+  })) return undefined;
   const spec = commandSpec('/group');
   return spec ? new Set([spec.name, ...(spec.aliases ?? [])]) : undefined;
 }
@@ -27871,7 +27918,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
     delegatedCommands: sessionDelegatedSlashCommands(botCfg, undefined, config.daemon.backendType),
     pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
-    multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent),
+    multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
   });
   if (slashDecision.kind === 'plugin') {
     await executePluginSlashCommand({
@@ -31810,7 +31857,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       hasAttachments: resources.length > 0,
       delegatedCommands: sessionDelegatedSlashCommands(getBot(larkAppId).config, existingDs, config.daemon.backendType),
       pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
-      multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent),
+      multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
     });
   // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
   // botmux 自己的命令（/close /status …）照常放行。正文项的重入自带 cascadeBodyReentry 标记。

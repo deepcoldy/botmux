@@ -112,7 +112,7 @@ With `--start`, the text after `/g` is the **task** (multi-line is fine):
 
 You can also quote a message and send just `/g --start`; the quoted message is the task.
 
-To make a bot's `/g` start tasks by default, set `"autoStart": true` for it (next section) and you no longer need `--start`; add `--no-start` when you only want a group.
+To make a bot's `/g` start tasks by default, set `"autoStart": true` for it (next section) and you no longer need `--start`; add `--no-start` when you only want a group. With multiple bots, the first @-mentioned bot is the creator. Multi-line command recognition uses only that creator's shared configuration, so another bot's `autoStart` cannot split the routing decision.
 
 Options (`--start`, `--tag`, …) are read from the first line only; later lines are kept verbatim as the task. If the first line of the task itself contains words like `--tag`, put `--` before the task, e.g. `/g --start -- npm publish --tag canary`.
 

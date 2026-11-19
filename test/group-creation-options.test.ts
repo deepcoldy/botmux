@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatSlashGroupName, groupCommandStartsTask, parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents, resolveGroupDecorations } from '../src/services/group-creation-options.js';
+import { formatSlashGroupName, groupCommandStartsTask, groupCommandStartsTaskForRouting, parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents, resolveGroupDecorations } from '../src/services/group-creation-options.js';
 
 describe('/g customization', () => {
   it('preserves punctuation, spaces and the first non-empty name line', () => {
@@ -160,5 +160,48 @@ describe('/g task mode (opt-in: --start / autoStart: true; --no-start overrides)
   it('validates autoStart in bot defaults', () => {
     expect(parseGroupCreationDefaults({ autoStart: false })).toEqual({ autoStart: false });
     expect(() => parseGroupCreationDefaults({ autoStart: 'yes' })).toThrow(/autoStart/);
+  });
+});
+
+describe('/g multiline routing uses the shared first-mentioned creator, never receiver defaults', () => {
+  const text = '/g 排查价格\n第二行细节';
+  const A = { botName: 'A', groupCreation: { autoStart: false } };
+  const B = { botName: 'B', groupCreation: { autoStart: true } };
+  const route = (ownDefaults: unknown, mentions: Array<Record<string, string>>, knownBots = [A, B], commandText = text) =>
+    groupCommandStartsTaskForRouting({ commandText, ownDefaults, mentions, knownBots });
+
+  it('is identical with opposite receiver defaults in either creator order', () => {
+    for (const own of [{ autoStart: false }, { autoStart: true }]) {
+      expect(route(own, [{ name: 'A', openId: 'ou_A_receiver_1' }, { name: 'B' }])).toBe(false);
+      expect(route(own, [{ name: 'B', openId: 'ou_B_receiver_2' }, { name: 'A' }])).toBe(true);
+    }
+  });
+
+  it('honors explicit switches and preserves no-mention behavior', () => {
+    expect(route({ autoStart: false }, [{ name: 'A' }, { name: 'B' }], [A, B], '/g --start 任务\n细节')).toBe(true);
+    expect(route({ autoStart: true }, [{ name: 'B' }], [A, B], '/g --no-start 群名\n说明')).toBe(false);
+    expect(route({ autoStart: true }, [])).toBe(true);
+    expect(route({ autoStart: false }, [])).toBe(false);
+    // Human mentions do not displace the first known bot; human-only mentions
+    // leave this daemon as creator, matching handleCommand's election input.
+    expect(route({ autoStart: false }, [{ name: 'human' }, { name: 'B' }])).toBe(true);
+    expect(route({ autoStart: true }, [{ name: 'human' }])).toBe(true);
+  });
+
+  it('fails closed for implicit task mode with an empty registry or ambiguous duplicate names', () => {
+    for (const own of [{ autoStart: false }, { autoStart: true }]) {
+      expect(route(own, [{ name: 'A' }], [])).toBe(false);
+      expect(route(own, [{ name: 'A' }], [], '/g --start 任务\n细节')).toBe(true);
+      expect(route(own, [{ name: 'A' }], [A, { botName: 'a', groupCreation: { autoStart: true } }])).toBe(false);
+      expect(route(own, [{ name: 'A' }], [
+        { botName: 'A', groupCreation: { autoStart: true } },
+        { botName: 'a', groupCreation: { autoStart: true } },
+      ])).toBe(true);
+    }
+  });
+
+  it('does not reinterpret non-/g text', () => {
+    expect(route({ autoStart: true }, [], [A, B], '/gx --start 任务\n细节')).toBe(false);
+    expect(route({ autoStart: true }, [], [A, B], '普通文本')).toBe(false);
   });
 });
