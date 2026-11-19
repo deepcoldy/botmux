@@ -221,6 +221,7 @@ import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptRepl
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn-reply-card.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import { FEEDBACK_SEND_LEASE_ROUTE, handleFeedbackSendLeaseRelay } from '../services/feedback-send-lease-relay.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -377,8 +378,10 @@ import { DEFAULT_LONG_TASK_REMINDER } from '../services/long-task-reminder-polic
 import { updateLongTaskReminderConfig } from '../services/long-task-reminder-config-store.js';
 import {
   selectIdleSuspendCandidates,
+  suspendSelectedIdleCandidatesAfterTurnDrain,
   sweepIdleWorkersByAgeAfterTurnDrain,
 } from './idle-worker-sweeper.js';
+import { parseTmuxSwitchSuspendRequest, selectTmuxSwitchCandidates } from './tmux-switch-candidates.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
@@ -1312,7 +1315,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -2474,6 +2477,30 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   }
 });
 
+/** Feedback send lease for an isolated CLI that cannot take it in-process
+ * (see acquireFeedbackSendLeaseFor); bound to the authenticated session. */
+ipcRoute('POST', `/api/sessions/:sessionId/${FEEDBACK_SEND_LEASE_ROUTE}`, async (req, res, params) => {
+  let body: Record<string, unknown> | undefined;
+  try { body = await readJsonBody<Record<string, unknown>>(req, 4096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  // Release uses the lease-scoped credential returned at acquisition, not the
+  // origin turn's current capability. The handler verifies its persisted hash
+  // together with the exact lease/pid/session, so rotation, session close and
+  // daemon restart cannot strand an already-delivered send.
+  if (body.action === 'release') {
+    const result = handleFeedbackSendLeaseRelay(config.session.dataDir, params.sessionId, body);
+    return jsonRes(res, result.status, result.body);
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  // Managed meeting sends originate in a receiver session too. This route only
+  // guards feedback maintenance; it does not perform a managed session action.
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
+  if (!auth.ok || !ds) return jsonRes(res, 403, { ok: false, error: auth.ok ? 'session_not_active' : auth.error });
+  const result = handleFeedbackSendLeaseRelay(config.session.dataDir, ds.session.sessionId, body);
+  return jsonRes(res, result.status, result.body);
+});
+
 ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   let body: Record<string, unknown>;
@@ -3478,6 +3505,50 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
   }
 
   return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
+});
+
+/**
+ * tmux upgrade: suspend (or, with dryRun, only count) THIS daemon's idle tmux
+ * sessions on the server being replaced, so it can empty out and be recreated
+ * from the upgraded binary. Driven by the primary daemon's tmux-upgrade card /
+ * idle-switch monitor, which fans this out to every online daemon.
+ *
+ * Execution goes through the same bot-turn mutation gate and per-candidate
+ * re-check as the maintenance idle sweep: a session that starts a turn while
+ * earlier candidates are being suspended is skipped, never interrupted. A busy
+ * gate answers 409 so the caller counts this daemon as not done.
+ */
+ipcRoute('POST', '/api/tmux-upgrade/suspend-idle', async (req, res) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res);
+  if (body === BAD_JSON) return;
+  const request = parseTmuxSwitchSuspendRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return jsonRes(res, 503, { ok: false, error: 'session_registry_unavailable' });
+  const socketName = request.socketName ?? undefined;
+  const candidates = selectTmuxSwitchCandidates(registry, { socketName, olderThanMs: request.olderThanMs });
+  if (request.dryRun) return jsonRes(res, 200, { ok: true, candidates: candidates.length, affected: 0 });
+  if (candidates.length === 0) return jsonRes(res, 200, { ok: true, candidates: 0, affected: 0 });
+  const runtimeAppIds = new Set([...registry.values()].map(ds => ds.larkAppId).filter(Boolean));
+  // The turn-mutation gate is per app. Never drain one bot while acting on a
+  // mixed/transferred registry: fail closed exactly like the maintenance sweep.
+  if (runtimeAppIds.size > 1
+    || (cachedLarkAppId && runtimeAppIds.size === 1 && !runtimeAppIds.has(cachedLarkAppId))) {
+    return jsonRes(res, 409, { ok: false, error: 'ambiguous_daemon_scope' });
+  }
+  const larkAppId = cachedLarkAppId || (runtimeAppIds.size === 1 ? [...runtimeAppIds][0] : undefined);
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'daemon_scope_unavailable' });
+  const selected = new Set(candidates.map(c => c.sessionId));
+  const result = await suspendSelectedIdleCandidatesAfterTurnDrain(larkAppId, registry, selected, {
+    olderThanMs: request.olderThanMs,
+    reason: 'tmux_upgrade_switch',
+  });
+  if (result === null) return jsonRes(res, 409, { ok: false, error: 'mutation_gate_busy' });
+  for (const failure of result.failures) {
+    logger.info(`[tmux-upgrade] not suspended ${failure.candidate.sessionId.slice(0, 8)}: ${failure.error}`);
+  }
+  logger.info(`[tmux-upgrade] suspended ${result.suspended.length}/${candidates.length} idle tmux session(s) for the server switch`);
+  return jsonRes(res, 200, { ok: true, candidates: candidates.length, affected: result.suspended.length });
 });
 
 /** 会话级 CLI IPC（slash/cd）的调用方证明：trusted-host（.dashboard-secret HMAC，

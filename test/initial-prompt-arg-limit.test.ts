@@ -195,7 +195,7 @@ describe('initial prompt argv byte-limit fallback', () => {
   });
 });
 
-describe('OpenCode v1 initial-prompt argv byte-limit (tmux command-too-long)', () => {
+describe('OpenCode v1 retained initial-prompt argv budget', () => {
   const adapter = createOpenCodeAdapter('/usr/bin/opencode');
 
   it('declares a conservative maxInitialPromptArgBytes budget', () => {
@@ -233,8 +233,8 @@ describe('OpenCode v1 initial-prompt argv byte-limit (tmux command-too-long)', (
   });
 
   it('routes long Chinese/multi-line routing prompts to the post-start queue, not argv', () => {
-    // Simulates a long routing/role/user prompt that would blow tmux's
-    // command-string limit (~12–16 KB on Linux + tmux 3.3a).
+    // Exercises a long routing/role/user prompt past the retained 8 KB budget.
+    // Private pane-launch files mean tmux no longer limits the full CLI argv.
     const prompt = '你是一个资深的代码审查专家。\n'.repeat(500); // ~20 KB UTF-8
     expect(Buffer.byteLength(prompt, 'utf8')).toBeGreaterThan(8192);
 
@@ -246,7 +246,7 @@ describe('OpenCode v1 initial-prompt argv byte-limit (tmux command-too-long)', (
     expect(defer).toBe(true);
 
     // When deferred, the worker passes undefined to buildArgs so --prompt
-    // is never added → the long text does NOT appear in tmux new-session argv.
+    // is never added → the long text does NOT appear in the CLI launch argv.
     const args = adapter.buildArgs({
       sessionId: 'sess-oc-long',
       resume: false,
@@ -414,7 +414,7 @@ describe('OpenCode v1 real-envelope argv budget (buildNewTopicPrompt → defer)'
     expect(defer).toBe(true);
 
     // When deferred, --prompt is never added → the long text does NOT appear
-    // in tmux new-session argv.
+    // in the CLI launch argv.
     const args = adapter.buildArgs({
       sessionId: 'sess-integration-2',
       resume: false,
@@ -433,7 +433,7 @@ describe('OpenCode v1 real-envelope argv budget (buildNewTopicPrompt → defer)'
   });
 });
 
-describe('argv-baked providers share the tmux command-too-long guard', () => {
+describe('argv-baked providers share a retained initial-prompt budget', () => {
   // Pi is intentionally absent: long prompts become a short @file path, so
   // maxInitialPromptArgBytes stays unset (see the Pi cases above).
   const cases: Array<[string, CliAdapter, number]> = [

@@ -248,6 +248,24 @@ function launcherExecutableSlots(argv: string[]): string[] {
   return slots;
 }
 
+export function isGenericLauncherComm(comm: string | undefined): boolean {
+  const normalizedComm = comm?.startsWith('.') ? comm.slice(1) : comm;
+  return normalizedComm ? COMM_ARGV_LAUNCHERS.has(normalizedComm) : false;
+}
+
+/** Canonical launcher name for worker wrapper-identity parsing. Unlike adopt
+ * discovery, a configured wrapper may use a versioned interpreter filename;
+ * normalize that name so only its script can establish wrapper identity. */
+export function wrapperGenericLauncherComm(comm: string | undefined): string | undefined {
+  const normalizedComm = comm?.startsWith('.') ? comm.slice(1) : comm;
+  if (!normalizedComm) return undefined;
+  if (COMM_ARGV_LAUNCHERS.has(normalizedComm)) return normalizedComm;
+  const match = /^(node|nodejs|bun|deno|python|ruby)(?:[-_.]?v?\d+(?:\.\d+)*)(?:\.exe)?$/.exec(normalizedComm);
+  if (!match) return undefined;
+  const launcher = match[1]!;
+  return launcher === 'nodejs' ? 'node' : launcher;
+}
+
 /** Return only argv positions that can establish executable identity for this
  * process. Generic launchers may carry the script/program after a small,
  * explicitly understood flag prefix; ordinary processes are limited to
@@ -258,10 +276,7 @@ export function processExecutableArgvSlots(
   comm: string | undefined,
   argv: string[],
 ): string[] {
-  const normalizedComm = comm?.startsWith('.') ? comm.slice(1) : comm;
-  return normalizedComm && COMM_ARGV_LAUNCHERS.has(normalizedComm)
-    ? launcherExecutableSlots(argv)
-    : argv.slice(0, 1);
+  return isGenericLauncherComm(comm) ? launcherExecutableSlots(argv) : argv.slice(0, 1);
 }
 
 export function cliIdForComm(
@@ -669,6 +684,8 @@ export function findLaunchedCliPid(
     commOf?: (pid: number) => string | undefined;
     cmdlineOf?: (pid: number) => string[];
     isZombie?: (pid: number) => boolean;
+    /** A matching process to traverse rather than return as the CLI leaf. */
+    isPersistentWrapper?: (pid: number, comm: string) => boolean;
   } = {},
   filterExecutable?: string,
 ): number | null {
@@ -680,6 +697,7 @@ export function findLaunchedCliPid(
   const seen = new Set<number>([launcherPid]);
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
     const next: number[] = [];
+    let deferredMatch: number | null = null;
     for (const pid of frontier) {
       if (seen.has(pid)) continue;
       seen.add(pid);
@@ -687,10 +705,23 @@ export function findLaunchedCliPid(
       if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) {
         if (targetCliId === 'codex'
           && (isZombie(pid) || isNonInteractiveCodexArgv(cmdlineOf(pid)))) continue;
-        return pid;
+        if (probes.isPersistentWrapper?.(pid, comm)) {
+          // Exhaust a proven wrapper's subtree before accepting a same-level
+          // helper sibling. Keep the global depth budget; a null result lets the
+          // deferred sibling serve as fallback without scanning this tree twice.
+          const nested = findLaunchedCliPid(pid, targetCliId, maxDepth - depth - 1, probes, filterExecutable);
+          if (nested) return nested;
+          continue;
+        }
+        // Do not let sibling order decide whether a later wrapper at this depth
+        // gets to produce its real CLI first. Without a wrapper, the first match
+        // is returned after this level exactly as before.
+        if (deferredMatch === null) deferredMatch = pid;
+        continue;
       }
       next.push(...childrenOf(pid));
     }
+    if (deferredMatch !== null) return deferredMatch;
     frontier = next;
   }
   return null;
@@ -745,6 +776,22 @@ export interface WrapperRealPidResolveDeps {
   isDirectLeaf?: (launcherPid: number) => boolean;
   intervalMs?: number;
   maxAttempts?: number;
+  /** Optional wall-clock budget measured from scheduling, including time spent
+   * inside synchronous probes and discovery. Undefined preserves attempt-only
+   * retries. An in-flight synchronous callback may finish, but once the budget
+   * is exceeded no further discovery, publication or timer is started. */
+  maxElapsedMs?: number;
+  /** Clock paired with maxElapsedMs; injectable alongside the timer scheduler. */
+  now?: () => number;
+}
+
+/** Create an opt-in elapsed-time fence shared by PID retry loops. The budget
+ * starts at creation and uses `>` so a fast tick exactly at the deadline can
+ * finish. Undefined disables time-based expiry and preserves attempt-only
+ * behavior. An in-flight synchronous callback is never interrupted. */
+export function createElapsedDeadline(maxElapsedMs: number | undefined, now: () => number = Date.now): () => boolean {
+  const startedAt = now();
+  return () => maxElapsedMs !== undefined && now() - startedAt > maxElapsedMs;
 }
 
 /**
@@ -763,19 +810,26 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
   const backendAtSpawn = deps.getBackend();
   const intervalMs = deps.intervalMs ?? 200;
   const maxAttempts = deps.maxAttempts ?? 30;
+  const expired = createElapsedDeadline(deps.maxElapsedMs, deps.now);
   let attempts = 0;
   let appliedPid: number | undefined;
   const retry = () => {
-    if (++attempts < maxAttempts) deps.schedule(tick, intervalMs);
+    attempts++;
+    if (attempts < maxAttempts && !expired()) deps.schedule(tick, intervalMs);
   };
   const tick = () => {
+    if (expired()) return;
     if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
     if (deps.isDirectLeaf?.(launcherPid)) return;
     if (appliedPid !== undefined) {
       if (deps.isAppliedPidValid?.(appliedPid)) { retry(); return; }
       appliedPid = undefined;
     }
+    // A synchronous stable-pane probe can consume most of the budget. Do not
+    // start (or publish) discovery after it returns past the deadline.
+    if (expired()) return;
     const realPid = deps.findRealPid(launcherPid);
+    if (expired()) return;
     if (realPid && realPid !== launcherPid) {
       const applied = deps.applyRealPid(realPid);
       if (applied !== false && deps.isAppliedPidValid) appliedPid = realPid;
