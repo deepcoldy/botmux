@@ -635,6 +635,17 @@ export interface DaemonSession {
   /** A botmux turn started and its idle edge has not been seen yet
    *  (core/idle-auto-compact.ts). In-memory; mirrored to the row while on. */
   idleAutoCompactArm?: import('./idle-auto-compact.js').IdleAutoCompactArm;
+  /** Non-keep-alive busy observed before this idle compact settles. This
+   *  in-memory witness survives session-store's durable-row rollback on a
+   *  failed save; the persisted inFlight flag is the restart-safe counterpart. */
+  idleAutoCompactBusyBeforeSettledTurnId?: string;
+  /** Completed terminal observed for this idle compact. Kept after settlement
+   *  so a durable-row rollback cannot split warm/notice state from the row or
+   *  allow a later duplicate compact. In-memory only; reconciled before sweep. */
+  idleAutoCompactCompletedTurnId?: string;
+  /** A locally answered CLI turn whose own busy repaint must not cancel an
+   *  idle-compact retry. In-memory only; cleared by its terminal or idle edge. */
+  idleAutoCompactLocalTurn?: { turnId: string; since: number };
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still

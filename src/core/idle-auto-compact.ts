@@ -54,10 +54,19 @@ export interface IdleAutoCompactSetting {
    *  Persisted so a daemon restart mid-compact does not mistake the compact's
    *  finish for a new idle stretch. Cleared by that edge or any other turn.
    *  `stretch` / `attempt` / `previousHandled` let a worker refusal that may
-   *  pass release this stretch for another try (see noteIdleAutoCompactRefused). */
+   *  pass release this stretch for another try (see noteIdleAutoCompactRefused).
+   *  `busyBeforeSettled` remembers a non-keep-alive busy edge observed while
+   *  this turn was unsettled: if the worker then refuses, that busy was not our
+   *  compact (which never typed), so the user's activity cancels the retry. */
   inFlight?: {
     turnId: string; since: number; idleMinutes: number; tokens?: number;
     stretch?: number; attempt?: number; previousHandled?: number;
+    busyBeforeSettled?: true;
+    /** Idle was observed after the busy edge, but no terminal has settled the
+     *  compact yet: never announce success before a completed terminal. */
+    idleBeforeSettled?: number;
+    /** Completed terminal arrived before that idle edge; the edge may settle. */
+    completed?: true;
   };
   /** The worker refused this stretch's compact for a reason that may pass
    *  (input box not recognised, CLI momentarily busy): how many attempts so
@@ -152,7 +161,9 @@ function refusalMayPass(reason: IdleAutoCompactRefusalReason): boolean {
 type IdleAutoCompactSessionState = Pick<DaemonSession,
   'session' | 'lastScreenStatus' | 'idleSinceAt'
   | 'idleAutoCompactPendingNotice' | 'idleAutoCompactDispatchedTurnId' | 'promptCacheKeepalive'
-  | 'idleAutoCompactWarmSince' | 'idleAutoCompactArm'>;
+  | 'idleAutoCompactWarmSince' | 'idleAutoCompactArm'
+  | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactLocalTurn'
+  | 'idleAutoCompactCompletedTurnId'>;
 
 export function idleAutoCompactMinutes(setting: IdleAutoCompactSetting | undefined): number {
   const minutes = setting?.minutes;
@@ -246,6 +257,49 @@ function liveInFlight(setting: IdleAutoCompactSetting, now: number): IdleAutoCom
   return f && now - f.since < IDLE_AUTO_COMPACT_IN_FLIGHT_STALE_MS ? f : undefined;
 }
 
+type IdleAutoCompactFlight = NonNullable<IdleAutoCompactSetting['inFlight']>;
+
+function hasBusyBeforeSettled(ds: IdleAutoCompactSessionState, flight: IdleAutoCompactFlight): boolean {
+  // The second leg survives updateSession rolling the nested session object
+  // back to its durable row after a failed save. It is deliberately in-memory:
+  // a later refusal or idle edge reconciles it before any new compact is sent.
+  return flight.busyBeforeSettled === true
+    || ds.idleAutoCompactBusyBeforeSettledTurnId === flight.turnId;
+}
+
+function hasCompleted(ds: IdleAutoCompactSessionState, flight: IdleAutoCompactFlight): boolean {
+  return flight.completed === true || ds.idleAutoCompactCompletedTurnId === flight.turnId;
+}
+
+/** A completed compact and its finishing idle edge have BOTH been observed. */
+function settleCompletedIdleCompact(
+  ds: IdleAutoCompactSessionState,
+  setting: IdleAutoCompactSetting,
+  finished: IdleAutoCompactFlight,
+  idle: number,
+): boolean {
+  delete setting.inFlight;
+  delete setting.retry;
+  if (ds.idleAutoCompactBusyBeforeSettledTurnId === finished.turnId) {
+    ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
+  }
+  ds.idleAutoCompactWarmSince = idle;
+  setting.idleSince = idle;
+  setting.handledIdleSince = idle;
+  // Only a compact THIS process dispatched may be announced as done. A marker
+  // inherited from a restarted daemon folds as handled without a success claim.
+  if (ds.idleAutoCompactDispatchedTurnId === finished.turnId) {
+    ds.idleAutoCompactPendingNotice = {
+      kind: 'compacted',
+      turnId: finished.turnId,
+      idleMinutes: finished.idleMinutes,
+      ...(finished.tokens !== undefined ? { tokens: finished.tokens } : {}),
+    };
+    delete ds.idleAutoCompactDispatchedTurnId;
+  }
+  return true;
+}
+
 /**
  * Screen-status hook, called right after `ds.lastScreenStatus` / `idleSinceAt`
  * were updated (worker-pool stampIdleSinceAt). Returns true when the persisted
@@ -291,8 +345,19 @@ export function noteIdleAutoCompactScreenStatus(
       if (now - arm.at <= IDLE_AUTO_COMPACT_ARM_BUSY_GRACE_MS) arm.busy = true;
       else ds.idleAutoCompactArm = undefined;
     }
-    if (setting?.retry && !setting.inFlight && BUSY_SCREEN_STATUSES.has(ds.lastScreenStatus ?? '')
-      && !keepaliveInFlight(ds, now)) {
+    const busy = BUSY_SCREEN_STATUSES.has(ds.lastScreenStatus ?? '');
+    const nonKeepaliveBusy = busy && !keepaliveInFlight(ds, now) && !localCommandInFlight(ds, now);
+    if (setting?.inFlight && nonKeepaliveBusy) {
+      // If this turn is refused later, its write never happened, so this busy
+      // edge was someone else's activity even though it arrived before the
+      // refusal. Keep both a durable marker and a rollback-proof live witness.
+      ds.idleAutoCompactBusyBeforeSettledTurnId = setting.inFlight.turnId;
+      if (!setting.inFlight.busyBeforeSettled) {
+        setting.inFlight.busyBeforeSettled = true;
+        changed = true;
+      }
+    }
+    if (setting?.retry && !setting.inFlight && nonKeepaliveBusy) {
       // The CLI went busy while a refused compact waited for another try, and
       // neither our compact nor a keep-alive did it: someone is using the
       // session (a turn typed into the terminal, a background task waking
@@ -325,28 +390,18 @@ export function noteIdleAutoCompactScreenStatus(
   }
   if (!enabled) return false;
   syncArm();
+  // A local command's own repaint is over; later busy edges are activity again.
+  ds.idleAutoCompactLocalTurn = undefined;
   const finished = liveInFlight(setting!, now);
-  if (finished) {
-    // Our own /compact just finished: the stretch it opens counts as handled.
-    delete setting!.inFlight;
-    delete setting!.retry;
-    ds.idleAutoCompactWarmSince = idle;
-    setting!.idleSince = idle;
-    setting!.handledIdleSince = idle;
-    // Only a compact THIS process dispatched may be announced as done. A
-    // marker inherited from a restarted daemon is folded as handled (never
-    // compacted twice) but makes no success claim — we never saw it run.
-    if (ds.idleAutoCompactDispatchedTurnId === finished.turnId) {
-      ds.idleAutoCompactPendingNotice = {
-        kind: 'compacted',
-        turnId: finished.turnId,
-        idleMinutes: finished.idleMinutes,
-        ...(finished.tokens !== undefined ? { tokens: finished.tokens } : {}),
-      };
-      delete ds.idleAutoCompactDispatchedTurnId;
-    }
+  if (finished && hasBusyBeforeSettled(ds, finished) && !hasCompleted(ds, finished)) {
+    // A busy → idle edge alone cannot distinguish our compact from the user's
+    // turn. Keep the claim settled against THIS stretch, but wait for the real
+    // terminal before announcing success. A safe-composer refusal will instead
+    // cancel silently; completed settles here or in noteIdleAutoCompactTurnEnded.
+    finished.idleBeforeSettled = idle;
     return true;
   }
+  if (finished) return settleCompletedIdleCompact(ds, setting!, finished, finished.idleBeforeSettled ?? idle);
   // A stale marker (or one a different turn already ended) is just dropped.
   if (setting!.inFlight) { delete setting!.inFlight; changed = true; }
   const warm = ds.idleAutoCompactWarmSince;
@@ -358,23 +413,109 @@ export function noteIdleAutoCompactScreenStatus(
   return changed;
 }
 
+export interface IdleAutoCompactRetryInvalidation {
+  /** The persistent setting changed and must be saved before worker admission. */
+  changed: boolean;
+  /** Restore the old retry after an IPC admission rejection (best effort). */
+  rollback(): void;
+}
+
+/** Invalidate a real turn's old retry and unsettled compact BEFORE admitting it
+ *  to the worker. A failed save therefore rejects the input instead of letting
+ *  an accepted turn revive either one after a restart. Locally answered
+ *  commands preserve only the retry, not another turn's in-flight compact. */
+export function invalidateIdleAutoCompactRetryForTurn(
+  ds: Pick<DaemonSession, 'session'>,
+  turnId: string | undefined,
+  opts: { preserveRetry?: boolean } = {},
+): IdleAutoCompactRetryInvalidation {
+  if (!turnId || turnId.startsWith(IDLE_AUTO_COMPACT_TURN_PREFIX)) {
+    return { changed: false, rollback: () => {} };
+  }
+  const setting = ds.session.idleAutoCompact;
+  const previousInFlight = setting?.inFlight && setting.inFlight.turnId !== turnId
+    ? setting.inFlight
+    : undefined;
+  const retry = opts.preserveRetry ? undefined : setting?.retry;
+  if (!setting || (!previousInFlight && !retry)) return { changed: false, rollback: () => {} };
+  const previousHandled = setting.handledIdleSince;
+  const savedRetry = retry ? { ...retry } : undefined;
+  if (previousInFlight) delete setting.inFlight;
+  if (savedRetry) {
+    setting.handledIdleSince = savedRetry.stretch;
+    delete setting.retry;
+  }
+  return {
+    changed: true,
+    rollback: () => {
+      const current = ds.session.idleAutoCompact;
+      // updateSession may have replaced the nested object. Never overwrite a
+      // newer compact/retry, only our own still-unsettled invalidation.
+      if (!current) return;
+      if (previousInFlight && !current.inFlight) current.inFlight = previousInFlight;
+      if (savedRetry && !current.retry && current.handledIdleSince === savedRetry.stretch) {
+        if (previousHandled === undefined) delete current.handledIdleSince;
+        else current.handledIdleSince = previousHandled;
+        current.retry = savedRetry;
+      }
+    },
+  };
+}
+
 /** A botmux turn started: it sends a request to the model, so the idle edge
  *  that follows opens a fresh, warm stretch. Our own idle /compact does not
  *  arm one (its finishing edge is folded as handled; if it is cancelled first,
  *  the already-handled stretch stays current instead of being compacted
- *  again). Any other turn also ends the in-flight window. The row is saved by
- *  the turn's busy edge. */
+ *  again). Any other turn also ends the in-flight window. A real turn invalidates
+ *  a retry immediately, so the cancellation can be persisted even if the daemon
+ *  restarts before the busy edge; locally answered CLI commands explicitly keep
+ *  it. The arm is saved by the turn's busy edge. Returns true when the caller
+ *  must save the retry invalidation now. */
 export function noteIdleAutoCompactTurnStarted(
-  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactArm' | 'lastScreenStatus'>,
+  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactArm' | 'lastScreenStatus'
+    | 'idleAutoCompactLocalTurn' | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactCompletedTurnId'>,
   turnId: string,
   now = Date.now(),
-): void {
+  opts: { preserveRetry?: boolean } = {},
+): boolean {
   const setting = ds.session.idleAutoCompact;
-  if (setting?.inFlight && setting.inFlight.turnId !== turnId) delete setting.inFlight;
-  if (turnId.startsWith(IDLE_AUTO_COMPACT_TURN_PREFIX)) return;
+  const endedInFlight = setting?.inFlight !== undefined && setting.inFlight.turnId !== turnId;
+  if (endedInFlight) delete setting!.inFlight;
+  if (turnId.startsWith(IDLE_AUTO_COMPACT_TURN_PREFIX)) return endedInFlight;
+  const invalidation = invalidateIdleAutoCompactRetryForTurn(ds, turnId, opts);
+  ds.idleAutoCompactLocalTurn = opts.preserveRetry && setting?.retry
+    ? { turnId, since: now }
+    : undefined;
+  ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
+  ds.idleAutoCompactCompletedTurnId = undefined;
   // Started while the CLI is already busy: no new busy edge will follow, the
   // turn runs on in the same busy period.
   ds.idleAutoCompactArm = { at: now, busy: BUSY_SCREEN_STATUSES.has(ds.lastScreenStatus ?? '') };
+  return endedInFlight || invalidation.changed;
+}
+
+/** A direct Web-terminal submit is positive user-attribution, not a repaint to
+ *  guess about: end any local-command exemption and cancel unsettled maintenance
+ *  state immediately. Returns true when the caller must persist the change. */
+export function noteIdleAutoCompactDirectInput(
+  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactLocalTurn' | 'idleAutoCompactBusyBeforeSettledTurnId'>,
+): boolean {
+  ds.idleAutoCompactLocalTurn = undefined;
+  const setting = ds.session.idleAutoCompact;
+  let changed = false;
+  if (setting?.inFlight) {
+    ds.idleAutoCompactBusyBeforeSettledTurnId = setting.inFlight.turnId;
+    if (!setting.inFlight.busyBeforeSettled) {
+      setting.inFlight.busyBeforeSettled = true;
+      changed = true;
+    }
+  }
+  if (setting?.retry) {
+    setting.handledIdleSince = setting.retry.stretch;
+    delete setting.retry;
+    changed = true;
+  }
+  return changed;
 }
 
 export interface IdleAutoCompactRefusalOutcome {
@@ -393,7 +534,8 @@ export interface IdleAutoCompactRefusalOutcome {
  *  when the refusal is not for our in-flight compact; otherwise the caller
  *  saves the session row. */
 export function noteIdleAutoCompactRefused(
-  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactPendingNotice' | 'idleAutoCompactDispatchedTurnId'>,
+  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactPendingNotice' | 'idleAutoCompactDispatchedTurnId'
+    | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactCompletedTurnId'>,
   turnId: string,
   refusal?: PromptCacheKeepaliveRefusal,
 ): IdleAutoCompactRefusalOutcome | undefined {
@@ -403,8 +545,22 @@ export function noteIdleAutoCompactRefused(
   const reason = idleAutoCompactRefusalReason(refusal);
   const attempt = flight.attempt ?? 1;
   const stretch = flight.stretch ?? setting.handledIdleSince;
+  const busyBeforeSettled = hasBusyBeforeSettled(ds, flight);
+  const locallyDispatched = ds.idleAutoCompactDispatchedTurnId === turnId;
   delete setting.inFlight;
   delete ds.idleAutoCompactDispatchedTurnId;
+  if (ds.idleAutoCompactBusyBeforeSettledTurnId === turnId) {
+    ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
+  }
+  if (ds.idleAutoCompactCompletedTurnId === turnId) ds.idleAutoCompactCompletedTurnId = undefined;
+  if (busyBeforeSettled || !locallyDispatched) {
+    // Busy before refusal proves activity. An inherited claim without THIS
+    // process's dispatch witness is also never retryable: a failed marker save
+    // followed by restart must fail closed rather than resurrect the stretch.
+    if (stretch !== undefined) setting.handledIdleSince = stretch;
+    delete setting.retry;
+    return { reason, attempt, retry: false };
+  }
   if (refusalMayPass(reason) && attempt < IDLE_AUTO_COMPACT_MAX_ATTEMPTS && stretch !== undefined) {
     if (flight.previousHandled === undefined) delete setting.handledIdleSince;
     else setting.handledIdleSince = flight.previousHandled;
@@ -416,20 +572,43 @@ export function noteIdleAutoCompactRefused(
   return { reason, attempt, retry: false };
 }
 
-/** The compact turn reached a terminal receipt. Anything other than
- *  `completed` (cancelled / failed / ambiguous — Ctrl-C, a crash, an
- *  interrupted compact) means the topic must not be told the compact ran:
- *  the stretch stays handled (no immediate retry) and, when this process
+/** The compact turn reached a terminal receipt. When a busy edge was observed,
+ *  success needs BOTH the completed terminal and the finishing idle edge (in
+ *  either order), so a user's busy → idle can never masquerade as our compact.
+ *  Anything other than `completed` (cancelled / failed / ambiguous — Ctrl-C, a
+ *  crash, an interrupted compact) means the topic must not be told the compact
+ *  ran: the stretch stays handled (no immediate retry) and, when this process
  *  witnessed the dispatch, an "interrupted" notice is queued. Also retracts a
- *  `compacted` notice whose finishing edge beat the terminal here but has not
- *  been posted yet (the two events can race on Ctrl-C/crash). Returns true
- *  when the caller should save the session row. */
+ *  `compacted` notice whose settlement beat a contradictory later terminal here
+ *  but has not been posted yet. Returns true when the caller should save the
+ *  session row. */
 export function noteIdleAutoCompactTurnEnded(
   ds: IdleAutoCompactSessionState,
   turnId: string,
   status: string,
 ): boolean {
-  if (status === 'completed') return false;
+  if (ds.idleAutoCompactLocalTurn?.turnId === turnId && ds.lastScreenStatus === 'idle') {
+    // A terminal while the command is busy can precede its own repaint: keep
+    // the exemption until the idle edge. Already-idle means no repaint is due.
+    ds.idleAutoCompactLocalTurn = undefined;
+  }
+  if (status === 'completed') {
+    const setting = ds.session.idleAutoCompact;
+    const flight = setting?.inFlight;
+    if (!setting || flight?.turnId !== turnId || !hasBusyBeforeSettled(ds, flight)) return false;
+    // Keep a rollback-proof witness until a new turn/claim/suspend. If the
+    // session row rolls back, the next sweep can reconcile without duplicating.
+    ds.idleAutoCompactCompletedTurnId = turnId;
+    const idle = flight.idleBeforeSettled
+      ?? (ds.lastScreenStatus === 'idle' ? ds.idleSinceAt : undefined);
+    if (idle === undefined) {
+      // Terminal beat the finishing idle edge: remember it so that edge may
+      // announce success. Without both, an idle edge alone proves nothing.
+      flight.completed = true;
+      return true;
+    }
+    return settleCompletedIdleCompact(ds, setting, flight, idle);
+  }
   const setting = ds.session.idleAutoCompact;
   const witnessed = ds.idleAutoCompactDispatchedTurnId === turnId;
   let idleMinutes: number | undefined;
@@ -440,6 +619,10 @@ export function noteIdleAutoCompactTurnEnded(
     changed = true;
   }
   if (witnessed) delete ds.idleAutoCompactDispatchedTurnId;
+  if (ds.idleAutoCompactBusyBeforeSettledTurnId === turnId) {
+    ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
+  }
+  if (ds.idleAutoCompactCompletedTurnId === turnId) ds.idleAutoCompactCompletedTurnId = undefined;
   const pending = ds.idleAutoCompactPendingNotice;
   if (pending?.kind === 'compacted' && pending.turnId === turnId) {
     // The idle edge announced success first; retract it before the sweep posts.
@@ -451,6 +634,12 @@ export function noteIdleAutoCompactTurnEnded(
     ds.idleAutoCompactPendingNotice = { kind: 'interrupted', idleMinutes };
   }
   return changed;
+}
+
+/** A locally answered CLI command whose own repaint must not cancel a retry. */
+function localCommandInFlight(ds: IdleAutoCompactSessionState, now: number): boolean {
+  const turn = ds.idleAutoCompactLocalTurn;
+  return turn !== undefined && now - turn.since < IDLE_AUTO_COMPACT_ARM_BUSY_GRACE_MS;
 }
 
 /** A prompt-cache keep-alive is being typed into the CLI right now. */
@@ -529,10 +718,14 @@ function postedNotice(p: IdleAutoCompactPendingNotice): IdleAutoCompactNotice {
  *  nothing is timed until the next botmux turn. Returns true when the
  *  persisted setting changed (the caller saves the row). */
 export function clearIdleAutoCompactStretch(
-  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactWarmSince' | 'idleAutoCompactArm'>,
+  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactWarmSince' | 'idleAutoCompactArm'
+    | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactLocalTurn' | 'idleAutoCompactCompletedTurnId'>,
 ): boolean {
   ds.idleAutoCompactWarmSince = undefined;
   ds.idleAutoCompactArm = undefined;
+  ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
+  ds.idleAutoCompactLocalTurn = undefined;
+  ds.idleAutoCompactCompletedTurnId = undefined;
   const setting = ds.session.idleAutoCompact;
   if (!setting || (setting.idleSince === undefined && !setting.inFlight && setting.armed === undefined && !setting.retry)) return false;
   delete setting.idleSince;
@@ -580,6 +773,38 @@ export function runIdleAutoCompactSweep(
     if (!current()?.enabled) continue;
     const id = ds.session.sessionId.slice(0, 8);
     try {
+      // An unsettled claim is a hard stop regardless of handled/stretch. If a
+      // completed/idle save rolled back, reconcile from the rollback-proof
+      // witnesses first and never flush a success notice before that save works.
+      const unsettled = current()!.inFlight;
+      if (unsettled) {
+        const idle = unsettled.idleBeforeSettled
+          ?? (ds.lastScreenStatus === 'idle' ? ds.idleSinceAt : undefined);
+        if (!hasCompleted(ds, unsettled)) {
+          if (unsettled.idleBeforeSettled !== undefined
+            && ds.idleAutoCompactDispatchedTurnId !== unsettled.turnId) {
+            // This claim came from another process. Its idle edge is durable,
+            // but its in-memory completed witness is unrecoverable (for example
+            // a failed completed save followed by restart). Fold it silently as
+            // handled rather than waiting forever or claiming success.
+            const inheritedIdle = unsettled.idleBeforeSettled;
+            delete current()!.inFlight;
+            delete current()!.retry;
+            ds.idleAutoCompactWarmSince = inheritedIdle;
+            current()!.idleSince = inheritedIdle;
+            current()!.handledIdleSince = inheritedIdle;
+            try { deps.persist(ds); } catch { /* the next sweep reconciles again */ }
+          }
+          continue;
+        }
+        if (idle === undefined) continue;
+        settleCompletedIdleCompact(ds, current()!, unsettled, idle);
+        try { deps.persist(ds); }
+        catch (error) {
+          deps.log(`[idle-compact] ${id} could not reconcile the completed claim: ${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
+      }
       const pending = ds.idleAutoCompactPendingNotice;
       if (pending) {
         ds.idleAutoCompactPendingNotice = undefined;
@@ -633,6 +858,8 @@ export function runIdleAutoCompactSweep(
       const turnId = `${IDLE_AUTO_COMPACT_TURN_PREFIX}${now.toString(36)}`;
       const claim = current()!;
       const attempt = (claim.retry?.stretch === decision.stretch ? claim.retry.attempts : 0) + 1;
+      ds.idleAutoCompactCompletedTurnId = undefined;
+      ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
       claim.handledIdleSince = decision.stretch;
       claim.idleSince = decision.stretch;
       claim.inFlight = {

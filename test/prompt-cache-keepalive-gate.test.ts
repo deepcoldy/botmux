@@ -386,6 +386,62 @@ describe('composerScreenLogTail keeps no conversation or input text', () => {
     const picker = readFileSync(join(process.cwd(), 'test/fixtures/claude-selectors/ask-user-question-chat-about-this.txt'), 'utf8');
     expect(composerScreenLogTail(cells(picker), READY).join('\n')).not.toContain('Chat about');
   });
+
+  it('without a rule, selector history and multi-line drafts are shapes too, never status rows', () => {
+    // This real selector has no horizontal rule at all. Treating every row as
+    // "below the last rule" used to copy its history into the worker log.
+    const rewind = readFileSync(join(process.cwd(), 'test/fixtures/claude-selectors/rewind.txt'), 'utf8');
+    const selectorTail = composerScreenLogTail(cells(rewind), READY);
+    const selectorLog = selectorTail.join('\n');
+    for (const privateText of ['hello one', '/compact', 'No code changes', 'Enter to continue']) {
+      expect(selectorLog).not.toContain(privateText);
+    }
+    expect(selectorTail.some(line => line.includes('typed'))).toBe(true);
+
+    const draftTail = composerScreenLogTail(cells([
+      '⏺ private answer text',
+      '❯ first draft line',
+      '  second private draft line',
+      '⏵⏵ bypass permissions on',
+    ].join('\n')), READY);
+    const draftLog = draftTail.join('\n');
+    for (const privateText of ['private answer', 'first draft', 'second private', 'bypass permissions']) {
+      expect(draftLog).not.toContain(privateText);
+    }
+    expect(draftTail.some(line => line.includes('typed'))).toBe(true);
+  });
+
+  it('below-rule selector choices and clipped draft continuations are not status rows', () => {
+    for (const name of [
+      'ask-user-question-first.txt',
+      'ask-user-question-type-something.txt',
+      'ask-user-question-chat-about-this.txt',
+    ]) {
+      const screen = readFileSync(join(process.cwd(), 'test/fixtures/claude-selectors', name), 'utf8');
+      expect(composerScreenLogTail(cells(screen), READY).join('\n')).not.toContain('Chat about this');
+    }
+    // Only the top rule fits in this viewport: every following row is still a
+    // draft, not a CLI status line that may be quoted verbatim.
+    const clipped = cells([
+      '⏺ private answer text',
+      RULE,
+      '❯ first private draft line',
+      '  second private draft line',
+      '  third private draft line',
+    ].join('\n'));
+    const log = composerScreenLogTail(clipped, READY).join('\n');
+    for (const privateText of ['private answer', 'first private', 'second private', 'third private']) {
+      expect(log).not.toContain(privateText);
+    }
+    // A draft can imitate the glyph and position of a status row. Only the
+    // complete known status format may be logged, never its private suffix.
+    const disguised = cells([
+      RULE,
+      '❯ first private draft line',
+      '  ⏵⏵ second private draft line disguised as status',
+    ].join('\n'));
+    expect(composerScreenLogTail(disguised, READY).join('\n')).not.toContain('private draft');
+  });
 });
 
 describe('composerScreenLogTail', () => {

@@ -2774,6 +2774,10 @@ export type WorkerToDaemonBase =
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
   | { type: 'session_ready_ack'; requestId: string }
   | { type: 'goal_update'; goal: import('./services/native-goal-state.js').NativeGoalState | null; turnId?: string; dispatchAttempt?: number; signature?: string }
+  /** A writable Web Terminal submitted input directly to the CLI. Carries no
+   *  input bytes: only the attribution idle-compact needs to distinguish a
+   *  person's turn from a local command's own repaint. */
+  | { type: 'terminal_input'; submitted: true; at: number }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
       /** Set ONLY on the working frame a Web Terminal / sandbox hook
        *  direct-submit publishes via the worker's clearTurnId path: real new

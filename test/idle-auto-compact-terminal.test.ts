@@ -113,7 +113,8 @@ function fixture() {
       type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: TURN_ID, status,
       ...(errorCode ? { errorCode } : {}), ...(composerRefusal ? { composerRefusal } : {}),
     });
-  return { ds, terminal };
+  const directInput = async () => ipc({ type: 'terminal_input', submitted: true, at: Date.now() });
+  return { ds, terminal, directInput };
 }
 
 beforeEach(() => {
@@ -158,6 +159,16 @@ describe('idle auto-compact settles on the real turn_terminal handler', () => {
     expect(ds.session.idleAutoCompact?.handledIdleSince).toBeUndefined();
     expect(ds.session.idleAutoCompact?.retry).toEqual({ stretch: 1000, attempts: 1, reason: 'unconfirmed' });
     expect(ds.idleAutoCompactPendingNotice).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('a direct Web submit is persisted as user activity, not a local repaint', async () => {
+    const { ds, directInput } = fixture();
+    ds.session.idleAutoCompact!.retry = { stretch: 1000, attempts: 1, reason: 'unconfirmed' };
+    await directInput();
+    expect(ds.session.idleAutoCompact?.inFlight?.busyBeforeSettled).toBe(true);
+    expect(ds.session.idleAutoCompact?.retry).toBeUndefined();
+    expect(ds.session.idleAutoCompact?.handledIdleSince).toBe(1000);
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
   });
 

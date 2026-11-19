@@ -168,6 +168,10 @@ function screenShowsSelectorFooter(text: string): boolean {
 
 const LOG_TAIL_ROWS = 8;
 const LOG_ROW_MAX_CHARS = 100;
+/** Only complete, known Claude permission-mode rows are safe to quote verbatim.
+ *  Position below a rule and the ⏵⏵ glyph are NOT evidence: a clipped draft can
+ *  imitate both. Unknown rows and any user-controlled suffix stay shape-only. */
+const LOG_RAW_STATUS_ROW = /^\s*⏵⏵ (?:bypass permissions|auto mode) on(?: \(shift\+tab to cycle\))?(?: · (?:← for agents|\d+ shells?))?\s*$/;
 
 function chars(text: string): number {
   return Array.from(text.trim()).length;
@@ -216,7 +220,7 @@ export function composerScreenLogTail(rows: readonly ScreenRow[], readyPattern: 
       const content = composerContent(rows[y], readyPattern);
       line = content === 'empty' ? raw.trim() : contentShape(raw, content === 'ghost' ? ', dim ghost text' : ', typed');
     }
-    if (line === undefined && y > lastRule) {
+    if (line === undefined && lastRule >= 0 && y > lastRule && LOG_RAW_STATUS_ROW.test(raw)) {
       line = maskFailureText(raw);
       if (line.length > LOG_ROW_MAX_CHARS) line = `${line.slice(0, LOG_ROW_MAX_CHARS - 1)}…`;
     }
