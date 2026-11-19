@@ -30,6 +30,13 @@ import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../s
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, codexCleanupArchiveEnabled, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
 import { trackStartingCardPublication } from './starting-card-publication.js';
+import {
+  armStartingCardHealth,
+  closeStartingCardHealth,
+  noteStartingCardHealthFrame,
+  startingCardHealthEntryStillCurrent,
+  STARTING_CARD_HEALTH_DELAY_MS,
+} from './starting-card-health.js';
 import { privateReplyEnabled } from './private-reply.js';
 import { GoalStatusCardController, goalStatusCardOrigin } from './goal-status-card.js';
 import { updateCardJson } from '../im/lark/client.js';
@@ -7282,6 +7289,20 @@ async function postTurnStartingStatusCard(
     flushPendingCodexServiceTierPatch(ds);
     syncUsageRefreshTimer(ds);
     reconcilePostedStartingCard(ds, turnId, statusRevisionAtPost);
+    if (status === 'starting') {
+      armStartingCardHealth(ds, turnId, messageId, (entry, delivered) => {
+        if (!entry.warned) {
+          entry.warned = true;
+          logger.warn(`[${tag(ds)}] starting card health: no working frame after ${Math.round(STARTING_CARD_HEALTH_DELAY_MS / 1000)}s; marking card stalled (turn=${turnId.substring(0, 12)})`);
+        }
+        const accepted = scheduleCardPatch(ds, buildStreamingCardJson(ds, 'stalled'), turnId, {
+          owns: () => startingCardHealthEntryStillCurrent(ds, entry),
+          onSettled: delivered,
+        });
+        if (!accepted) delivered(false);
+        else bumpStreamCardStatusRevision(ds);
+      });
+    }
     logger.info(`[${tag(ds)}] Posted starting card for turn ${turnId.substring(0, 12)}`);
     continuePublishedStreamingCardPinChain(ds, messageId, predecessorIds);
     if ((ds.streamCardTurnGeneration ?? 0) !== generation && ds.streamCardPendingTurnId) {
@@ -22019,6 +22040,7 @@ function setupWorkerHandlers(
       }
       case 'prompt_ready': {
         if (ds.worker !== worker) break;
+        noteStartingCardHealthFrame(ds, undefined, 'idle');
         // The ONLY set point for the in-memory readiness flag (design
         // 2026-09-11-command-router §5). The generation counter is monotonic —
         // clears below never touch it — so a cascade sequencer can capture it
@@ -22589,6 +22611,9 @@ function setupWorkerHandlers(
             && activeController.store.execution(activeController.ref, openingExecution.executionId)?.phase === 'queued')
         );
         const screenTurnId = screenTurnProven ? msg.turnId : undefined;
+        if (!stalePostTerminalBusy && (!msg.turnId || screenTurnProven)) {
+          noteStartingCardHealthFrame(ds, msg.turnId, projectedScreenStatus);
+        }
         const prevStatus = ds.lastScreenStatus;
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
         const prevLabel = streamCardLabel(ds);
@@ -23182,6 +23207,7 @@ function setupWorkerHandlers(
         if (!stalePostTerminalShot && POST_TERMINAL_BUSY_STATUSES.has(ds.lastScreenStatus)) {
           notePostTerminalLiveWork(ds, { turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt });
         }
+        if (!stalePostTerminalShot) noteStartingCardHealthFrame(ds, msg.turnId ?? frameVerdict.source.turnId, ds.lastScreenStatus);
         // Symmetric to screen_update: an idle/limited screenshot closes the
         // live-work episode so a later keep-alive cannot re-open the card.
         if (!POST_TERMINAL_BUSY_STATUSES.has(ds.lastScreenStatus)) {
@@ -24598,6 +24624,7 @@ function setupWorkerHandlers(
         }
         // The「本轮回顾」panel's material (reported by the worker just before
         // this terminal); the panel goes on once the turn's last card settles.
+        closeStartingCardHealth(ds, msg.turnId);
         const recapInput = msg.status === 'completed' && turnRecapIo.enabled(ds)
           ? recapInputFor(ds, msg.turnId) : undefined;
         // The exact turn is over. This is the only boundary that releases the

@@ -1060,7 +1060,7 @@ function startAdminUnionsPublisher(larkAppId: string): void {
   void publisher.publish();
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, humanCanRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, ensureChatDisbandedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canOperateBotSender, canRunDaemonCommand, humanCanRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, ensureChatDisbandedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { classifyLarkError } from './im/lark/error-classify.js';
@@ -5490,6 +5490,8 @@ export async function enforceMessageQuotaForCliInput(
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
   opts?: {
+    /** 与 bot-locked senderUnionId 同源的飞书 sender app_id；external roster 需要配对。 */
+    senderAppId?: string;
     listenerAuthorized?: boolean;
     skipCharge?: boolean;
     alreadyAuthorizedAndCharged?: boolean;
@@ -5554,7 +5556,7 @@ export async function enforceMessageQuotaForCliInput(
   // 更糟：owner 以为授权生效了，消息凭空消失（#332 同款断点的最后一截）。
   // 不传（人的路径）→ 原样走 evaluateTalk，语义不变。
   const ev = botSender
-    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId, opts?.senderAppId)
     : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
     logger.info(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
@@ -6227,6 +6229,8 @@ interface V3SavedWorkflowImInvocation {
   initiatorOpenId: string | undefined;
   /** union_id may grant teamBot trust only when the event was bot-authored. */
   teamTrustUnionId?: string;
+  /** Feishu-stamped app_id paired with teamTrustUnionId for external roster entries. */
+  teamTrustAppId?: string;
   /** Raw sender union_id may independently grant the configured teamMember leg. */
   memberUnionId?: string;
   /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
@@ -6455,6 +6459,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     larkAppId,
     initiatorOpenId,
     teamTrustUnionId,
+    teamTrustAppId,
     memberUnionId,
     botSender,
   } = invocation;
@@ -6505,7 +6510,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     return true;
   }
 
-  const operatorCanOperate = canOperate(larkAppId, chatId, initiatorOpenId, teamTrustUnionId);
+  const operatorCanOperate = canOperateBotSender(larkAppId, chatId, initiatorOpenId, teamTrustUnionId, teamTrustAppId);
   const policy = await authorizeV3SavedWorkflowInvocation(command, {
     canPublishGlobal: () => operatorCanOperate,
     consumeMessageQuotaOnce: () => enforceMessageQuotaForCliInput(
@@ -6518,6 +6523,7 @@ async function handleV3SavedWorkflowCommandIfAny(
       memberUnionId,
       chatType,
       botSender,
+      { senderAppId: teamTrustAppId },
     ),
   });
   if (!policy.ok) {
@@ -7113,9 +7119,10 @@ function canTalkForGroupSessions(
   memberUnionId: string | undefined,
   chatType: 'p2p' | 'group' | undefined,
   botSender: boolean,
+  botTrustAppId?: string,
 ): boolean {
   return botSender
-    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, botTrustUnionId).allowed
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, botTrustAppId).allowed
     : evaluateTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, memberUnionId, chatType).allowed;
 }
 
@@ -7148,6 +7155,7 @@ async function executePluginSlashCommand(input: {
   senderOpenId: string | undefined;
   senderUnionId: string | undefined;
   teamTrustUnionId: string | undefined;
+  teamTrustAppId: string | undefined;
   botSender: boolean;
   deps: CommandHandlerDeps;
 }): Promise<void> {
@@ -7177,8 +7185,9 @@ async function executePluginSlashCommand(input: {
       input.senderUnionId,
       input.chatType,
       input.botSender,
+      input.teamTrustAppId,
     ),
-    canOperate: () => canOperate(larkAppId, chatId, input.senderOpenId, input.teamTrustUnionId),
+    canOperate: () => canOperateBotSender(larkAppId, chatId, input.senderOpenId, input.teamTrustUnionId, input.teamTrustAppId),
     onAdmitted: () => markIngressAdmitted(input.ctx),
     execute: pluginCommandGateway.execute,
     reply: (content, msgType) => deps.sessionReply(anchor, content, msgType, larkAppId),
@@ -26129,6 +26138,8 @@ async function startInitialPassthroughSession(args: {
   substitute: boolean;
   /** Bot-locked union_id (quota gate's teamBot leg — bot senders only). */
   senderUnionId?: string;
+  /** Feishu-stamped bot app_id paired with senderUnionId for external roster entries. */
+  senderAppId?: string;
   /** Raw sender union_id (quota gate's teamMember leg — may be a human). */
   memberUnionId?: string;
   /** Ownership is the CALLER's call — required fields, no sender fallback.
@@ -26160,12 +26171,13 @@ async function startInitialPassthroughSession(args: {
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, promptResources, commandContent, senderOpenId, substitute, senderUnionId,
+    parsed, promptResources, commandContent, senderOpenId, substitute, senderUnionId, senderAppId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
     routeToCanonicalOwner, lifecycle,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, {
+    senderAppId,
     promptContent: commandContent || parsed.content,
     promptAttachments: promptResources?.map(r => ({ type: r.type, name: r.name })),
   })) {
@@ -27121,6 +27133,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // talk 复查走哪个谓词（evaluateBotTalk vs evaluateTalk）——两者必须同源，见
   // enforceMessageQuotaForCliInput 的 botSender 说明。
   const teamTrustUnionId: string | undefined = isBotSenderType ? senderUnionId : undefined;
+  // external roster 不能只凭手填 union 放行：只把飞书盖章的 app_id 与 bot-locked union
+  // 一起交给授权层做配对。cross-ref 推断的 bot 不补造这份证据；真人路径恒 undefined。
+  const teamTrustAppId: string | undefined = isBotSenderType ? data.sender?.sender_id?.app_id : undefined;
   // A bot-sent new topic (e.g. a message-listener match on a third-party alert
   // bot's card) must NOT make that bot the session owner: daemon-generated
   // footers --mention-back the owner, so a bot owner means we @ the alert bot
@@ -27175,6 +27190,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     larkAppId,
     initiatorOpenId: senderOpenId,
     teamTrustUnionId,
+    teamTrustAppId,
     memberUnionId: senderUnionId,
     botSender: isBotSenderType,
   })) {
@@ -27216,7 +27232,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 斜杠命令执行段已搬到 executeNewTopicSlash（输入全部显式）；true = 已处理。
   if (await executeNewTopicSlash({
     ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent,
-    senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger,
+    senderOpenId, senderUnionId, teamTrustUnionId, teamTrustAppId, isBotSenderType, isForeignBotSender, substituteTrigger,
     forceTopic, forceTopicMode, botCfg, trustedCaller,
   })) return;
 
@@ -27250,6 +27266,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const sessionGroupAlreadyCharged = !!ctx.sessionGroupQuotaConsumed
     || quotaConsumedBeforeSessionGroupBirth;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType, {
+    senderAppId: teamTrustAppId,
     listenerAuthorized: !!messageListener,
     skipCharge: isBareForceTopic || sessionGroupAlreadyCharged,
     alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
@@ -27813,6 +27830,7 @@ interface NewTopicSlashContext {
   senderOpenId: string | undefined;
   senderUnionId: string | undefined;
   teamTrustUnionId: string | undefined;
+  teamTrustAppId: string | undefined;
   isBotSenderType: boolean;
   isForeignBotSender: boolean;
   substituteTrigger: RoutingContext['substituteTrigger'];
@@ -27823,7 +27841,7 @@ interface NewTopicSlashContext {
 }
 
 async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolean> {
-  const { ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, forceTopic, forceTopicMode, botCfg } = slash;
+  const { ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent, senderOpenId, senderUnionId, teamTrustUnionId, teamTrustAppId, isBotSenderType, isForeignBotSender, substituteTrigger, forceTopic, forceTopicMode, botCfg } = slash;
   ctx.acceptedInput = undefined;
   // Intercept daemon commands in new topics (no session needed for some commands)
   // acceptSlashFromBots gate: a bot sender's slash command is only routed as a
@@ -27859,6 +27877,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       senderOpenId,
       senderUnionId,
       teamTrustUnionId,
+      teamTrustAppId,
       botSender: senderIsBotForSlashGate,
       deps: commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId }),
     });
@@ -27891,7 +27910,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     }
     if (slashDecision.kind === 'delegated_turn') {
       ctx.acceptedInput = await admitDelegatedSlashTurn(slashDecision, {
-        authorized: canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType),
+        authorized: canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType, teamTrustAppId),
         primary: coordinationModeIsPrimary(),
         caller: slash.trustedCaller,
         larkAppId,
@@ -27925,6 +27944,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
         senderUnionId,
         chatType,
         senderIsBotForSlashGate,
+        teamTrustAppId,
       )) {
         await sessionsDeps.sessionReply(sessionsAnchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
@@ -27939,7 +27959,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       return true;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'vc-auth') {
-      if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
+      if (!canOperateBotSender(larkAppId, chatId, senderOpenId, teamTrustUnionId, teamTrustAppId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
@@ -27993,6 +28013,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
           senderOpenId,
           substitute: !!substituteTrigger,
           senderUnionId: teamTrustUnionId,
+          senderAppId: teamTrustAppId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
           botSender: isBotSenderType,
           // Reply attribution uses the cross-ref-resolved is-bot (foreign peer
@@ -28026,7 +28047,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // which left a hole once per-chat grants flow through canTalk.
       // canRunDaemonCommand = canOperate ∪（cmd ∈ canTalkDaemonCommands && canTalk）：
       // bot 可通过名单把选定命令（如 /status）降到 canTalk；未配置时与 canOperate 全等。
-      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType)) {
+      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType, teamTrustAppId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
@@ -29581,6 +29602,8 @@ async function handleThreadReplyAdmitted(
   // 类型的话，把真人 union_id 报成 bot 就能让真人在全团队被当队友 bot 放行
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
+  // external roster 还要求和 union 配对的飞书 app_id；cross-ref 认识的 peer 不补造该证据。
+  const threadTeamTrustAppId: string | undefined = isBotSenderType ? data?.sender?.sender_id?.app_id : undefined;
   const threadTrustedCaller = await trustedCallerForInboundTurn(
     larkAppId,
     threadSenderOpenId,
@@ -29723,6 +29746,7 @@ async function handleThreadReplyAdmitted(
     larkAppId,
     initiatorOpenId: threadSenderOpenId,
     teamTrustUnionId: threadTeamTrustUnionId,
+    teamTrustAppId: threadTeamTrustAppId,
     memberUnionId: threadSenderUnionId,
     botSender: isBotSenderType || isForeignBot,
   })) {
@@ -29766,6 +29790,7 @@ async function handleThreadReplyAdmitted(
     ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent,
     routingChatId: ctxChatId, chatType: ctxChatType, chatId: threadChatId,
     senderOpenId: threadSenderOpenId, senderUnionId: threadSenderUnionId, teamTrustUnionId: threadTeamTrustUnionId,
+    teamTrustAppId: threadTeamTrustAppId,
     isBotSenderType, isForeignBotSender: isForeignBot, substituteTrigger, getThreadSender, trustedCaller: threadTrustedCaller,
   })) return;
 
@@ -29824,6 +29849,7 @@ async function handleThreadReplyAdmitted(
             : parsed.senderType === 'user' ? 'user' : undefined,
           botSender: isBotSenderType || isForeignBot,
           senderUnionId: threadTeamTrustUnionId,
+          senderAppId: threadTeamTrustAppId,
           memberUnionId: threadSenderUnionId,
         },
       });
@@ -30005,7 +30031,7 @@ async function handleThreadReplyAdmitted(
     threadSenderUnionId,
     ctxChatType,
     isBotSenderType || isForeignBot,
-    { promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
+    { senderAppId: threadTeamTrustAppId, promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
   )) {
     return;
   }
@@ -31736,6 +31762,7 @@ interface ThreadSlashContext {
   senderOpenId: string | undefined;
   senderUnionId: string | undefined;
   teamTrustUnionId: string | undefined;
+  teamTrustAppId: string | undefined;
   isBotSenderType: boolean;
   isForeignBotSender: boolean;
   substituteTrigger: RoutingContext['substituteTrigger'];
@@ -31743,7 +31770,7 @@ interface ThreadSlashContext {
 }
 
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
-  const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
+  const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, teamTrustAppId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
   ctx.acceptedInput = undefined;
   if (ctx.effortTaskReentry) return false;
   // Intercept daemon commands
@@ -31870,6 +31897,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       senderOpenId,
       senderUnionId,
       teamTrustUnionId,
+      teamTrustAppId,
       botSender: isBotSenderType || isForeignBotSender,
       deps: commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId }),
     });
@@ -31954,7 +31982,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
     }
     if (slashDecision.kind === 'delegated_turn') {
       ctx.acceptedInput = await admitDelegatedSlashTurn(slashDecision, {
-        authorized: canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType),
+        authorized: canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType, teamTrustAppId),
         primary: coordinationModeIsPrimary(),
         caller: slash.trustedCaller,
         larkAppId,
@@ -31972,6 +32000,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         senderUnionId,
         chatType,
         botSender,
+        teamTrustAppId,
       )) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
@@ -31986,7 +32015,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       return true;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'vc-auth') {
-      if (!canOperate(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId)) {
+      if (!canOperateBotSender(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, teamTrustAppId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
@@ -32037,6 +32066,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
           senderOpenId: senderOpenId,
           substitute: !!substituteTrigger,
           senderUnionId: teamTrustUnionId,
+          senderAppId: teamTrustAppId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
           botSender: isBotSenderType || isForeignBotSender,
           // Reply attribution: platform-stamped OR cross-ref-resolved bot →
@@ -32106,7 +32136,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // (see spawn-path gate above). Denies chat-granted users management commands.
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
       // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
-      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType)) {
+      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType, teamTrustAppId)) {
         invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }

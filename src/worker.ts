@@ -547,6 +547,7 @@ import {
   readComm,
   readCmdline,
   isNonInteractiveCodexArgv,
+  isClaudeMetadataProbeArgv,
   cliIdForComm,
   isBareShellComm,
   bareShellLaunchKind,
@@ -31516,28 +31517,32 @@ async function spawnCliBody(
   // BFS-descends through the wrapper by comm). session-id
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
-  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): void => {
+  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): boolean => {
     log(`${label}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${cfg.cliId}); rewiring session discovery + bridge`);
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
     // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
     // module-level bridgeCliPid and re-points to the real CLI's jsonl.
     bridgeCliPid = realPid;
     if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
-    publishLocalProcessAttestation(realPid);
+    return publishLocalProcessAttestation(realPid);
   };
-  // Codex also needs the real execution root, even without a Claude JSONL bridge.
-  const wrapperResolverRuns = (): boolean => !!cfg.wrapperCli?.trim() && !sandboxRequested
-    && (!!claudeDataDir || cfg.cliId === 'codex');
-  // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
-  // reports while this spawn is current (equal to launcherPid unless a relay
-  // sits between the pane and the launcher).
-  const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
-    if (!wrapperResolverRuns()) return;
+  // wrapperCli launcher → real CLI by comm. `launcherPid` is the unwrapped
+  // launch payload below any pane relay or owned session-scope supervisor.
+  const resolveBehindWrapper = (launcherPid: number): void => {
+    // Codex also needs the real execution root, even without a Claude JSONL bridge.
+    // Credential-only bwrap uses the single monitored resolver below; running
+    // both would attest the same leaf twice and rotate live-turn authority twice.
+    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || credentialOnlyBwrap
+      || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
+    const generation = cliSpawnGeneration;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
-      getChildPid: () => (backend?.getChildPid?.() === panePid ? launcherPid : null),
+      // Herdr/ZMX alias getChildPid() to the mutable cliPid. A failed publication
+      // may already have rewired that field, so only the captured launcher PID +
+      // spawn generation can fence retries without abandoning them after apply.
+      getChildPid: () => (generation === cliSpawnGeneration ? launcherPid : null),
       applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -31562,29 +31567,54 @@ async function spawnCliBody(
   // Under bwrap the payload is the sandbox supervisor and stays the pid for
   // session discovery. Tool processes descend from the CLI inside it, which
   // predates every turn, so the lineage proof needs the CLI leaf attested too.
-  // Codex and TRAE rebind ownership to their leaf through their own resolvers,
-  // as does resolveBehindWrapper for a wrapperCli outside the full sandbox.
+  // Codex and TRAE rebind ownership to their leaf through their own resolvers.
   const attestSandboxedCliLeaf = (payloadPid: number): void => {
-    if (!(sandboxRequested || credentialOnlyBwrap) || cfg.cliId === 'codex' || cfg.cliId === 'traex'
-      || wrapperResolverRuns()) return;
+    if (!(sandboxRequested || credentialOnlyBwrap) || cfg.cliId === 'codex' || cfg.cliId === 'traex') return;
     const targetCliId = cfg.cliId as CliId;
     const generation = cliSpawnGeneration;
-    const findLeaf = (lp: number): number | null =>
-      findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, { childrenOf: snapshotChildPids() });
-    let attested: { pid: number; procStart: string | undefined; published: boolean } | undefined;
-    // Republishing rotates the turn capability, so a live, published leaf is never sent twice.
+    const backendAtSpawn = backend;
+    // Credential-only bwrap + wrapperCli historically rewired discovery/bridge
+    // to the leaf. Preserve that here; full sandboxes keep the outer payload.
+    const rewireOwnership = credentialOnlyBwrap && !sandboxRequested
+      && !!cfg.wrapperCli?.trim() && !!claudeDataDir;
+    const findLeaf = (lp: number): number | null => findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, {
+      // One process-table snapshot per BFS, not one synchronous ps per node.
+      childrenOf: snapshotChildPids(),
+      commOf: (pid) => {
+        // Filter at the match position, not after BFS returns its first match:
+        // an unreaped zombie or metadata helper must not hide a live sibling.
+        if (isZombieProcess(pid)) return undefined;
+        const comm = readComm(pid);
+        if (comm && targetCliId === 'claude-code'
+          && cliIdForComm(comm, targetCliId) === targetCliId
+          && isClaudeMetadataProbeArgv(readCmdline(pid, { exact: true }))) return undefined;
+        return comm;
+      },
+    });
+    const isDirectLeaf = (lp: number): boolean => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId;
+    let attested: { pid: number; procStart: string; published: boolean } | undefined;
+    // A live, successfully published leaf is never sent twice: every actual
+    // publication rotates the active turn's capability.
     const isAttested = (pid: number | undefined): boolean => pid !== undefined && attested?.pid === pid
-      && attested.published && attested.procStart !== undefined && readProcessStartIdentity(pid) === attested.procStart;
-    const attest = (leafPid: number): void => {
-      if (isAttested(leafPid)) return;
-      log(`Sandbox: attesting CLI leaf pid ${leafPid} under launch payload ${payloadPid} (cliId=${cfg.cliId})`);
+      && attested.published && !isZombieProcess(pid) && readProcessStartIdentity(pid) === attested.procStart;
+    const attest = (leafPid: number): boolean => {
+      if (isAttested(leafPid)) return true;
       const procStart = readProcessStartIdentity(leafPid);
-      attested = { pid: leafPid, procStart, published: publishLocalProcessAttestation(leafPid) };
+      if (!procStart || isZombieProcess(leafPid)) return false;
+      log(`Sandbox: attesting CLI leaf pid ${leafPid} under launch payload ${payloadPid} (cliId=${cfg.cliId})`);
+      const published = rewireOwnership
+        ? applyResolvedCliPid(leafPid, 'Credential-only sandbox CLI leaf', payloadPid)
+        : publishLocalProcessAttestation(leafPid);
+      attested = { pid: leafPid, procStart, published };
+      return published;
     };
-    // The first match may be a startup helper that exits, or its publication may
-    // fail; ready/input edges repair either before the next turn can run tools.
+    // Ready/input edges retain the repair path after the bounded startup poll;
+    // both edges and the poll share the same liveness and deduplication state.
     refreshSandboxedCliLeafAttestation = () => {
-      if (generation !== cliSpawnGeneration || isAttested(attested?.pid)) return;
+      // The initial attestation already names a direct CLI payload. Never
+      // replace it with a same-comm subagent discovered on a ready/input edge.
+      if (isDirectLeaf(payloadPid)) return;
+      if (generation !== cliSpawnGeneration || backend !== backendAtSpawn || isAttested(attested?.pid)) return;
       const leafPid = findLeaf(payloadPid);
       if (leafPid) attest(leafPid);
     };
@@ -31593,11 +31623,14 @@ async function spawnCliBody(
       intervalMs,
       maxAttempts: Math.ceil(FIRST_PROMPT_HARD_TIMEOUT_MS / intervalMs),
       findRealPid: findLeaf,
-      isDirectLeaf: (lp) => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId,
+      isDirectLeaf,
       getBackend: () => backend,
       getChildPid: () => (generation === cliSpawnGeneration ? payloadPid : null),
       applyRealPid: attest,
-      schedule: (fn, ms) => { setTimeout(fn, ms); },
+      // A matching comm can be a short-lived wrapper probe. Keep the startup
+      // watcher after success so a dead/zombie/reused PID reopens discovery.
+      isAppliedPidValid: isAttested,
+      schedule: (fn, ms) => { const timer = setTimeout(fn, ms); timer?.unref?.(); },
     });
   };
   const bindLaunchPayload = (resolved: UnwrappedLaunchLayers, panePid: number): void => {
@@ -31611,7 +31644,7 @@ async function spawnCliBody(
         bridgeCliPid = resolved.pid;
       }
     }
-    resolveBehindWrapper(resolved.pid, panePid);
+    resolveBehindWrapper(resolved.pid);
     attestSandboxedCliLeaf(resolved.pid);
   };
   const startWrapperRealPidResolve = (panePid: number): void => {

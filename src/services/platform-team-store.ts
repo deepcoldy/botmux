@@ -40,6 +40,11 @@ export interface PlatformTeamBot {
   appId: string;
   unionId?: string;
   name?: string;
+  /** 外部机器人：不跑在 botmux 上的飞书机器人，由团队成员在平台登记担保（平台下发
+   *  `external: true`，旧平台没有该字段）。appId / unionId 都是成员手填的：
+   *  同队信任要求飞书盖章的发送方 appId 与这里精确配对，绝不触发同机信任腿，
+   *  也不能让本机 bot 被当成该团队成员；未验证的 union 不作 non-human 证据。 */
+  external?: boolean;
 }
 
 export interface PlatformTeamSyncTeam {
@@ -60,19 +65,28 @@ export interface PlatformTeamSyncPayload {
 }
 
 interface FileShape extends PlatformTeamSyncPayload {
+  /** 只接受能理解 external 语义的新快照。旧 daemon 会把 external 抹掉后再落盘，
+   *  缺版本的文件不能继续作为授权依据，也不能拿旧 rev 阻止平台重推。 */
+  schemaVersion?: 1;
   updatedAt: number;
 }
+
+const PLATFORM_TEAM_SYNC_SCHEMA_VERSION = 1 as const;
 
 function filePath(dataDir: string): string {
   return join(dataDir, 'platform-team-sync.json');
 }
 
-function readFile(dataDir: string): FileShape | null {
+function readFile(dataDir: string, includeLegacyForRouting = false): FileShape | null {
   const fp = filePath(dataDir);
   if (!existsSync(fp)) return null;
   try {
     const parsed = JSON.parse(readFileSync(fp, 'utf-8'));
-    if (parsed && typeof parsed === 'object' && typeof parsed.rev === 'string' && Array.isArray(parsed.teams)) {
+    if (parsed && typeof parsed === 'object'
+      // includeLegacyForRouting 只允许大厅识别等“宁可吞掉也不误路由”的元数据读取；
+      // 授权、身份与 rev 上报走默认分支，缺版本一律无效。
+      && (includeLegacyForRouting || parsed.schemaVersion === PLATFORM_TEAM_SYNC_SCHEMA_VERSION)
+      && typeof parsed.rev === 'string' && Array.isArray(parsed.teams)) {
       return parsed as FileShape;
     }
   } catch { /* corrupt — fall through to null (rev mismatch → platform re-pushes) */ }
@@ -97,10 +111,12 @@ function sanitizeTeam(raw: unknown): PlatformTeamSyncTeam | null {
       if (!appId) continue;
       const unionId = typeof (b as Record<string, unknown>).unionId === 'string' ? String((b as Record<string, unknown>).unionId).trim() : '';
       const name = typeof (b as Record<string, unknown>).name === 'string' ? String((b as Record<string, unknown>).name) : undefined;
+      const external = (b as Record<string, unknown>).external === true;
       bots.push({
         appId,
         unionId: unionId || undefined,
         name,
+        ...(external ? { external: true } : {}),
       });
     }
   }
@@ -126,14 +142,16 @@ export function applyPlatformTeamSync(
   const teams = (Array.isArray(payload?.teams) ? payload.teams : [])
     .map(sanitizeTeam)
     .filter((t): t is PlatformTeamSyncTeam => !!t);
-  const shape: FileShape = { rev, teams, updatedAt: now };
-  atomicWriteFileSync(filePath(dataDir), JSON.stringify(shape, null, 2) + '\n');
+  const shape: FileShape = { rev, teams, schemaVersion: PLATFORM_TEAM_SYNC_SCHEMA_VERSION, updatedAt: now };
+  // 镜像先写、带 rev 的快照最后提交：镜像失败时 heartbeat 仍上报旧 rev，平台必须重推。
+  // 反向失败（镜像新、快照旧）同样安全——团队群授权以快照为准，下一轮全量替换会收敛。
   replaceTeamGroupsByPrefix(
     dataDir,
     PLATFORM_TEAM_PREFIX,
     teams.flatMap(t => t.groupChatIds.map(chatId => ({ teamId: `${PLATFORM_TEAM_PREFIX}${t.teamId}`, chatId }))),
     now,
   );
+  atomicWriteFileSync(filePath(dataDir), JSON.stringify(shape, null, 2) + '\n');
   return { rev, teams };
 }
 
@@ -155,7 +173,7 @@ export function listPlatformTeams(dataDir: string): PlatformTeamSyncTeam[] {
 export function isPlatformHallChat(dataDir: string, chatId: string | undefined): boolean {
   const id = (chatId ?? '').trim();
   if (!id) return false;
-  const data = readFile(dataDir);
+  const data = readFile(dataDir, true);
   if (!data) return false;
   for (const t of data.teams) if (t.groupChatIds[0] === id) return true;
   return false;
@@ -163,8 +181,10 @@ export function isPlatformHallChat(dataDir: string, chatId: string | undefined):
 
 /** Is `unionId` a bot in ANY platform team this machine belongs to?
  *
- *  Identity evidence only ("this union_id is a botmux bot"), NOT authorization:
- *  the roster is per MACHINE (every team the machine's owner is in), so a hit
+ *  Identity evidence only ("this union_id is a botmux bot"), NOT authorization.
+ *  External entries are excluded: their appId and unionId are both member-supplied,
+ *  so the union is not authoritative non-human evidence (it may name a person or
+ *  a different app). The roster is per MACHINE (every team the machine's owner is in), so a hit
  *  says nothing about whether the RECEIVING bot shares a team with the sender.
  *  Auth gates must use {@link isPlatformTeamBotTrustedBy}. */
 export function isPlatformTeamBot(dataDir: string, unionId: string | undefined): boolean {
@@ -173,7 +193,7 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
   const data = readFile(dataDir);
   if (!data) return false;
   for (const t of data.teams) {
-    for (const b of t.bots) if (b.unionId === id) return true;
+    for (const b of t.bots) if (!b.external && b.unionId === id) return true;
   }
   return false;
 }
@@ -185,7 +205,9 @@ export function isPlatformTeamBot(dataDir: string, unionId: string | undefined):
  * caller has locked to a Feishu-stamped bot sender:
  *
  *  1. SAME TEAM — some team lists both the sender and the receiver in `bots`
- *     (same anchor as {@link isPlatformTeamMember} for people).
+ *     (same anchor as {@link isPlatformTeamMember} for people). For an external
+ *     sender this additionally requires the Lark-stamped `senderAppId` to equal
+ *     the roster appId: a hand-filled union alone may name a human or another app.
  *  2. SAME MACHINE — the sender's roster `appId` is configured on this machine
  *     (`isLocalApp`, i.e. in this deployment's bots.json), whatever its team.
  *     No owner check and `trustSameOwnerBots` does not apply here (unchanged
@@ -202,20 +224,31 @@ export function isPlatformTeamBotTrustedBy(
   receiverAppId: string | undefined,
   unionId: string | undefined,
   isLocalApp: (appId: string) => boolean,
+  /** 飞书事件盖章的 bot sender app_id。external 条目必须用它与 roster appId 配对；
+   *  真人卡片 / Dashboard 等没有该证据的调用方不得传入，因而不会命中 external。 */
+  senderAppId?: string,
 ): boolean {
   const id = (unionId ?? '').trim();
   const receiver = (receiverAppId ?? '').trim();
+  const senderApp = (senderAppId ?? '').trim();
   if (!id) return false;
   const data = readFile(dataDir);
   if (!data) return false;
   let senderAppIds: string[] | undefined;
   for (const t of data.teams) {
-    const sender = t.bots.find((b) => b.unionId === id);
+    const sender = t.bots.find((b) => b.unionId === id && (!b.external || (!!senderApp && b.appId === senderApp)));
     if (!sender) continue;
-    if (receiver && t.bots.some((b) => b.appId === receiver)) return true;
-    (senderAppIds ??= []).push(sender.appId);
+    if (receiver && hasTeamBotmuxBot(t, receiver)) return true;
+    // 外部机器人不跑在任何机器上：同机腿只认 botmux bot 条目。
+    if (!sender.external) (senderAppIds ??= []).push(sender.appId);
   }
   return !!senderAppIds && senderAppIds.some((appId) => isLocalApp(appId));
+}
+
+/** `appId` 作为 botmux bot（非外部条目）在团队 `t` 的 roster 里。判定「接收 bot 是否
+ *  在这个团队」只能看这类条目：外部条目的 appId 是成员手填的。 */
+function hasTeamBotmuxBot(t: PlatformTeamSyncTeam, appId: string): boolean {
+  return t.bots.some((b) => b.appId === appId && !b.external);
 }
 
 /**
@@ -240,7 +273,7 @@ export function isTeamGroupChatFor(
   if (!receiver) return false;
   const data = readFile(dataDir);
   if (!data) return false;
-  return data.teams.some((t) => t.groupChatIds.includes(id) && t.bots.some((b) => b.appId === receiver));
+  return data.teams.some((t) => t.groupChatIds.includes(id) && hasTeamBotmuxBot(t, receiver));
 }
 
 /**
@@ -280,7 +313,7 @@ export function isPlatformTeamMember(
   const data = readFile(dataDir);
   if (!data) return false;
   for (const t of data.teams) {
-    if (t.memberUnionIds.includes(uid) && t.bots.some((b) => b.appId === appId)) return true;
+    if (t.memberUnionIds.includes(uid) && hasTeamBotmuxBot(t, appId)) return true;
   }
   return false;
 }

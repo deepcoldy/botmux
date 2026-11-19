@@ -141,6 +141,7 @@ import {
   scheduleCardPatch,
   noteTurnDispatchAttempt,
   syncUsageRefreshTimer,
+  postTurnStartingCard,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
@@ -982,6 +983,139 @@ describe('stale post-terminal busy frame gate (screen_update)', () => {
     (originalWorker as any).emit('message', { type: 'direct_submit_started' });
     await vi.advanceTimersByTimeAsync(0);
     expect(ds.postTerminalLiveWorkAt).toBeUndefined();
+  });
+});
+
+describe('starting card health watchdog', () => {
+  function setupStartingDs(turnId = TURN) {
+    const ds = makeDs({
+      streamCardPending: true,
+      streamCardPendingTurnId: turnId,
+      streamCardTurnGeneration: 1,
+      currentTurnId: turnId,
+      workerGeneration: 1,
+    });
+    activate(ds);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    return ds;
+  }
+  async function post(ds: DaemonSession, turnId: string) {
+    expect(await postTurnStartingCard(ds, vi.fn(async () => `om_start_${turnId}`), turnId)).toBe(true);
+    updateMessageMock.mockClear();
+  }
+  function patchedStatuses(): unknown[] {
+    return updateMessageMock.mock.calls.map(call => {
+      try { return JSON.parse(String(call[2])).status; } catch { return undefined; }
+    });
+  }
+
+  it('degrades a turn still stuck at starting after 45s without changing execution status', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+    expect(ds.lastScreenStatus).toBe('working');
+  });
+
+  it('does not treat a same-value starting frame as healthy progress', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'still starting', status: 'starting', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    updateMessageMock.mockClear();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('cancels the degradation on a real working frame from the same turn', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'running', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    updateMessageMock.mockClear();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual([]);
+  });
+
+  it('cancels the degradation on prompt_ready instead of marking the CLI stalled', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', { type: 'prompt_ready', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+    updateMessageMock.mockClear();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual([]);
+  });
+
+  it('does not let another turn prove health or let an old timer patch a newer turn', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'other turn output', status: 'working', turnId: 'turn-other',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    updateMessageMock.mockClear();
+
+    ds.currentTurnId = 'turn-live-0002';
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'turn-live-0002';
+    ds.streamCardTurnGeneration = 2;
+    await post(ds, 'turn-live-0002');
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    expect(patchedStatuses()).toEqual(['stalled']);
+    expect(ds.lastScreenStatus).toBe('working');
+  });
+
+  it('does not degrade after the worker generation changes', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    ds.workerGeneration = 3;
+    ds.session.workerGeneration = 3;
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual([]);
+  });
+
+  it('retries a transient health PATCH failure with the same identity', async () => {
+    const ds = setupStartingDs();
+    updateMessageMock.mockImplementationOnce(async () => { throw new Error('transient PATCH failure'); });
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(updateMessageMock).toHaveBeenCalledTimes(2);
+    expect(lastPatchedStatus()).toBe('stalled');
+    expect(ds.lastScreenStatus).toBe('working');
+  });
+
+  it('rejects a stale stalled write when working arrives before beforeWrite', async () => {
+    const delivered: string[] = [];
+    let releaseFirst!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const opts = args[3];
+      const status = JSON.parse(String(args[2])).status;
+      const run = async () => {
+        if (opts?.beforeWrite) await opts.beforeWrite();
+        delivered.push(status);
+      };
+      if (!releaseFirst) return new Promise<void>(resolve => { releaseFirst = resolve; }).then(run);
+      return run();
+    });
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'running', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    releaseFirst();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(delivered).toEqual([]);
   });
 });
 
