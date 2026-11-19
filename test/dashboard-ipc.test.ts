@@ -13272,6 +13272,31 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     // Allowlisted (no auth header) → must NOT be 401 (reaches handler: 400 bad-shape / 200 / 404).
     const trig = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     expect(trig.status).not.toBe(401);
+    const actorBody = JSON.stringify({
+      actor: 'owner', source: { type: 'webhook' },
+      target: { kind: 'turn', botId: 'local_smoke', sessionId: 'fixture-session' },
+      instruction: 'Continue the tests',
+      envelope: { sourceName: 'Example client', format: 'text', trusted: false },
+    });
+    const actorHeaders = { 'content-type': 'application/json' };
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const publicActor = await fetch(`${base}/api/trigger`, { method: 'POST', headers: actorHeaders, body: actorBody });
+      expect(publicActor.status).toBe(403);
+      expect(await publicActor.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+      const unsigned = await fetch(`${base}/api/trigger/owner`, { method: 'POST', headers: actorHeaders, body: actorBody });
+      expect(unsigned.status).toBe(401);
+      const signed = await fetch(`${base}/api/trigger/owner`, {
+        method: 'POST',
+        headers: { ...actorHeaders, ...trustedHostHeaders('POST', '/api/trigger/owner', handle!.port) },
+        body: actorBody,
+      });
+      expect(signed.status).toBe(403);
+      expect(await signed.json()).toMatchObject({ errorCode: 'owner_unresolved' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
     const tr = await fetch(`${base}/api/sessions/nope/trigger-result`);
     expect(tr.status).not.toBe(401);
     const ins = await fetch(`${base}/api/sessions/nope/insight?detail=conversation`);

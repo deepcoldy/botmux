@@ -52,7 +52,7 @@ export async function withLarkTurnIdempotency(
           triggerId: existing.triggerId, turnIdempotencyKey: key, idempotent: true,
         };
       }
-      const receipt: Receipt = { version: 1, requestHash, triggerId: `trg_${randomUUID()}` };
+      const receipt: Receipt = { version: 1, requestHash, triggerId: `trg_${req.actor === 'owner' ? 'owner_' : ''}${randomUUID()}` };
       let fenced = false;
       const persist = () => atomicWriteFileSync(path, JSON.stringify(receipt), { durable: true, followTargetSymlink: false });
       const result = await dispatch(receipt.triggerId, () => {

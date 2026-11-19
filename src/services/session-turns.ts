@@ -10,7 +10,7 @@ export interface SessionTurnInbound {
   messageId: string;
   text: string;
   sender?: { type: string; openId: string; name?: string };
-  via: 'lark' | 'trigger';
+  via: 'lark' | 'trigger' | 'owner_actor';
   quotedMessageId?: string;
   attachments?: { kind: string; name?: string; mimeType?: string }[];
   mentions?: { openId: string; name?: string }[];
@@ -343,7 +343,7 @@ export function readSessionTurns(dataDir: string, sessionId: string, since: numb
   return {
     ok: true,
     schema: 'botmux.session-turns.v1',
-    capabilities: [],
+    capabilities: ['ownerActor'],
     next: String(turns.at(-1)?.seq ?? since),
     turns,
   } as const;

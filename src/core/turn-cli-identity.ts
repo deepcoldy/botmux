@@ -44,7 +44,7 @@ import {
   type BytedCliIdentity,
   type CliIdentity,
 } from './cli-identity.js';
-import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
 import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
 
@@ -199,6 +199,9 @@ export function publishTurnCliIdentity(
 async function publishTurnCliIdentityNow(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
+  if (!allowsPersonalIdentityForTurn(args.turnId, args.botConfig.triggerUserAuth)) {
+    args = { ...args, senderOpenId: undefined, delegatedIdentity: undefined };
+  }
   const { sessionDataDir, sessionId, turnId } = args;
   const privateChat = args.privateChat === true;
   const outcomes: ToolIdentityOutcome[] = [];

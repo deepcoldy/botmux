@@ -124,6 +124,22 @@ function published(tool: 'lark-cli' | 'bytedcli', turnId = 'turn-default'): bool
 
 
 describe('publishTurnCliIdentity — lark-cli per-person HOME (device flow)', () => {
+  it.each([false, true])('publishes the owner actor personal credential only with opt-in=%s', async (allowOwnerActor) => {
+    const owner = 'ou_fixture_owner';
+    const turnId = 'trg_owner_fixture';
+    const ownerHome = '/homes/fixture-owner';
+    larkHomes.set(owner, ownerHome);
+    const outcomes = await publish(botConfig({ enabled: true, tools: ['lark-cli'], allowOwnerActor }), owner, turnId);
+    const body = identityBody('lark-cli', turnId);
+    if (allowOwnerActor) {
+      expect(outcomes.find(outcome => outcome.tool === 'lark-cli')?.state).toBe('user');
+      expect(body).toContain(ownerHome);
+    } else {
+      expect(body).not.toContain(ownerHome);
+      expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+    }
+  });
+
   it('publishes the per-person HOME as a user-home identity (no token injected)', async () => {
     larkHomes.set(ALICE, '/homes/alice');
     const outcomes = await publish(botConfig(), ALICE);

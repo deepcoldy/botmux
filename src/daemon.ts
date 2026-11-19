@@ -686,7 +686,7 @@ import {
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
-import { isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
 import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
 import { capabilityOfTool } from './core/identity-policy.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -9280,19 +9280,20 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     if (!policy.ok) return jsonRes(res, 403, policy);
     const bot = getBot(ds.larkAppId).config;
     const turnId = sourceTurnId;
+    const mayDelegatePersonalIdentity = allowsPersonalIdentityForTurn(turnId, bot.triggerUserAuth);
     const active = ds.activeInteractiveTurn;
     const delegationPolicy = readGlobalConfig().scheduleDelegation;
     const adminOpenIds = getDashboardAdminOpenIds(ds.larkAppId);
-    const directScheduleSource = !!active && active.turnId === turnId
+    const directScheduleSource = mayDelegatePersonalIdentity && !!active && active.turnId === turnId
       && active.caller.senderType === 'user' && !active.caller.source
       && !!active.caller.requestUserOpenId
       && adminOpenIds.includes(active.caller.requestUserOpenId);
-    const dispatchCaller = !turnId ? undefined
+    const dispatchCaller = !turnId || !mayDelegatePersonalIdentity ? undefined
       : ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
         : active?.turnId === turnId ? active.caller
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
     const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
-    const directHumanTurn = directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
+    const directHumanTurn = mayDelegatePersonalIdentity && directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
       session: ds.session, activeTurn: active });
     const inheritedForwardTools = !directHumanTurn && turnId && targetAppIds.length
       ? dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
@@ -9301,7 +9302,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       }) : [];
     // With tools: [] a bot can still forward an already signed grant through
     // dispatchOnly. Read that grant before deciding whether to sign at all.
-    const inheritedLookedUp = inheritedForwardTools.length > 0;
+    const inheritedLookedUp = mayDelegatePersonalIdentity && inheritedForwardTools.length > 0;
     const earlyInherited = inheritedLookedUp ? await dispatchUserForTurn(ds, turnId!) : undefined;
     // A forward passes on only tools the upstream grant already carries. A
     // listed tool it cannot pass on is no immediate delegation: counting it
@@ -9359,7 +9360,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     // schedule:create; `--no-delegate schedule:create` keeps the caller's own
     // immediate tool delegation.
     const serviceGrant = scheduleCreateRequested ? botGrant : undefined;
-    let inherited = needsDelegation && turnId && !serviceGrant
+    let inherited = needsDelegation && turnId && !serviceGrant && mayDelegatePersonalIdentity
       ? inheritedLookedUp ? earlyInherited : await dispatchUserForTurn(ds, turnId)
       : undefined;
     let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
@@ -9501,6 +9502,7 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
   if (targets.length === 0) return skip('no_local_bot');
   const turnId = ds.managedTurnOrigin?.turnId;
   if (!turnId) return skip('no_live_turn');
+  if (!allowsPersonalIdentityForTurn(turnId, bot.triggerUserAuth)) return skip('unattended_turn');
   try {
     const active = ds.activeInteractiveTurn;
     // The person who sent THIS turn directly, or — exactly as `botmux dispatch`
