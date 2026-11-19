@@ -51,6 +51,7 @@ import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendErro
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signature.js';
 import { messageCardContent } from '../im/lark/message-card-content.js';
 import { noteNextStepCard, noteNextStepSuggestion } from './next-step-suggestion.js';
+import { nextStepPlacement } from '../im/lark/next-step-card.js';
 import { nextStepIo } from './next-step-io.js';
 import { noteCliRecap, noteRecapCard, noteRecapReported } from './turn-recap-state.js';
 import { noteRecapResult, recapInputFor, turnRecapIo } from './turn-recap-io.js';
@@ -2346,6 +2347,28 @@ function isFinalTurnTerminalCarrier(
     && carrier.responseKind !== 'auxiliary';
 }
 
+/** A transcript-delivered turn whose terminal saw no final card yet: the
+ * daemon's own final can land later (a V2 handoff waits for the output
+ * ledger's lock before its send joins the turn's drain). Its 下一步 / 本轮回顾
+ * rows go on when that card is recorded. */
+const replyCardRowsAwaitingFinal = new WeakMap<DaemonSession, Map<string, (messageId: string) => void>>();
+const REPLY_CARD_ROWS_AWAITING_MAX = 8;
+
+function awaitFinalForReplyCardRows(ds: DaemonSession, turnId: string, place: (messageId: string) => void): void {
+  let waiting = replyCardRowsAwaitingFinal.get(ds);
+  if (!waiting) { waiting = new Map(); replyCardRowsAwaitingFinal.set(ds, waiting); }
+  waiting.delete(turnId);
+  waiting.set(turnId, place);
+  while (waiting.size > REPLY_CARD_ROWS_AWAITING_MAX) waiting.delete(waiting.keys().next().value!);
+}
+
+function placeReplyCardRowsOnLateFinal(ds: DaemonSession, turnId: string, messageId: string): void {
+  const place = replyCardRowsAwaitingFinal.get(ds)?.get(turnId);
+  if (!place) return;
+  replyCardRowsAwaitingFinal.get(ds)!.delete(turnId);
+  place(messageId);
+}
+
 function recordTurnTerminalCarrier(
   ds: DaemonSession,
   turnId: string,
@@ -2370,29 +2393,58 @@ function recordTurnTerminalCarrier(
   }
 }
 
+/** `patched`: the footer carries the receipt. `no_footer`: an editable reply
+ * card of this chat without a footer (the bot turned it off) — rows still go
+ * on it. `unpatchable`: gone, another chat's, or not a schema 2.0 card. */
 async function patchTurnTerminalCarrier(
   ds: DaemonSession,
   messageId: string,
   kind: TurnTerminalReceiptKind,
-): Promise<boolean> {
+  /** Read at the write itself: a newer turn can start during the reads. */
+  superseded: () => boolean,
+  /** Called right before the write: from here a failure may have landed. */
+  onWrite: () => void = () => {},
+): Promise<'patched' | 'no_footer' | 'unpatchable'> {
   const detail = await getTopicMessageDetail(ds.larkAppId, messageId, { userCardContent: true });
   const cardJson = messageCardContent(detail, ds.chatId);
-  if (!cardJson) return false;
-  const footer = buildTurnTerminalFooterPatch(cardJson, kind, localeForBot(ds.larkAppId));
-  if (!footer) return false;
-  if (footer.alreadyApplied) return true;
+  if (!cardJson) return 'unpatchable';
+  const locale = localeForBot(ds.larkAppId);
+  const existing = buildTurnTerminalFooterPatch(cardJson, kind, locale);
+  if (!existing) return nextStepPlacement(cardJson) ? 'no_footer' : 'unpatchable';
+  if (existing.alreadyApplied) return 'patched';
   const cardId = await resolveCardKitId(ds.larkAppId, messageId);
+  const footer = buildTurnTerminalFooterPatch(cardJson, kind, locale, { superseded: superseded() })!;
   // Ordinary send cards have no CardKit stream writes. Use one stable operation
   // across retries; a card with a conflicting sequence falls back to the strip
   // rather than rewriting its (potentially normalized) answer body.
   const uuid = `trf_${createHash('sha256')
     .update(`${ds.larkAppId}\0${messageId}\0${kind}`)
     .digest('hex').slice(0, 47)}`;
+  onWrite();
   await patchCardStreamElement(
     ds.larkAppId, cardId, REPLY_CARD_FOOTER_ELEMENT_ID,
     { content: footer.content }, 1, uuid, messageId,
   );
-  return true;
+  return 'patched';
+}
+
+/** After a failed footer write: does the card show a receipt anyway? A card
+ * that cannot be read counts as yes — the write may have landed. A card that
+ * was read counts only when its footer carries one. */
+async function terminalFooterMayCarryReceipt(
+  ds: DaemonSession,
+  messageId: string,
+  kind: TurnTerminalReceiptKind,
+): Promise<boolean> {
+  try {
+    const cardJson = messageCardContent(
+      await getTopicMessageDetail(ds.larkAppId, messageId, { userCardContent: true }), ds.chatId);
+    if (!cardJson) return true;
+    // A card that was read says it itself; one without a footer has none.
+    return buildTurnTerminalFooterPatch(cardJson, kind, localeForBot(ds.larkAppId))?.alreadyApplied === true;
+  } catch {
+    return true;
+  }
 }
 
 /** Provider-level idempotency key for the receipt. A transport timeout can be
@@ -22885,8 +22937,12 @@ function setupWorkerHandlers(
       }
 
       case 'prompt_suggestion': {
-        if (!ownsLifecycleMutation()) break;
-        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        const dropped = !ownsLifecycleMutation() ? 'not the current worker'
+          : managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) ? 'managed turn' : undefined;
+        if (dropped) {
+          if (nextStepIo.enabled(ds)) logger.info(`[${t}] Prompt suggestion dropped (${dropped}) turn=${msg.turnId?.substring(0, 16) ?? '-'}`);
+          break;
+        }
         noteNextStepSuggestion(ds, msg.turnId, msg.text, nextStepIo);
         break;
       }
@@ -25186,7 +25242,15 @@ function setupWorkerHandlers(
           disposeIneligibleOrdinaryTurnRecovery(ds, getBot(ds.larkAppId).config,
             msg.status === 'failed' && msg.errorCode === CODEX_CAPACITY_ERROR_CODE ? msg.turnId : undefined);
         }
-        const recoveryOwnsTerminal = (!ordinaryHttpTerminal && ordinaryTurnRecoveryHandlesTerminal(ds.session, msg))
+        // Ordinary recovery tracks every Claude turn, so its registry claims
+        // each of their terminals, completed ones included. Only a failure is
+        // the recovery's to present (it continues the turn or posts its own
+        // notice); a completed turn keeps its reply card's terminal UI — the
+        // footer receipt, then the 下一步 row and 本轮回顾 panel. Counting the
+        // claim here kept every Claude reply card bare. A readonly task
+        // continuation does continue a completed turn, so it still owns it.
+        const recoveryOwnsTerminal = (!ordinaryHttpTerminal && msg.status !== 'completed'
+          && ordinaryTurnRecoveryHandlesTerminal(ds.session, msg))
           || readonlyContinuationOwnsTerminal;
         let recoveryHandled = false;
         // `turn.finished` means this durable callback accepted the worker
@@ -25713,16 +25777,38 @@ function setupWorkerHandlers(
             ? 'silent'
             : 'completed';
         }
-        const terminalReceiptRouteEligible = !!terminalReplyContext
-          && !recoveryHandled
-          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
-          && !ds.session.vcMeetingReceiver
-          && !streamingCardDisabled(ds, msg.turnId)
-          && !botCfg.privateCard
-          && replyCardModeFor(ds, msg.turnId) === 'legacy'
+        // Where this turn's terminal UI goes on a legacy reply card, or why it
+        // goes nowhere. Evaluated in the original short-circuit order:
+        // replyCardModeFor() prepares a unified card record as a side effect.
+        const replyCardRoute: 'receipt' | 'transcript_rows' | 'unified' | 'no_reply_context' | 'recovery'
+          | 'managed' | 'vc_meeting' | 'card_off' | 'private_card' = !terminalReplyContext ? 'no_reply_context'
+          : recoveryHandled ? 'recovery'
+          : managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) ? 'managed'
+          : ds.session.vcMeetingReceiver ? 'vc_meeting'
+          : streamingCardDisabled(ds, msg.turnId) ? 'card_off'
+          : botCfg.privateCard ? 'private_card'
+          : replyCardModeFor(ds, msg.turnId) !== 'legacy' ? 'unified'
           // 按本会话冻结沙箱判：续轮信封与回执口径必须同源于该 worker 的真实
           // 采集能力（sandbox 改动 next-session-only，live 可能已翻转）。
-          && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds), { sessionSandbox: ds.session.sandbox }) === 'send';
+          : effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds), { sessionSandbox: ds.session.sandbox }) === 'send'
+            ? 'receipt'
+            // Transcript delivery keeps its receipt-free contract; only the
+            // rows go on its final card.
+            : 'transcript_rows';
+        const terminalReceiptRouteEligible = replyCardRoute === 'receipt';
+        // The turn's last reply card takes the 下一步 row and 本轮回顾 panel
+        // once it has settled: after its footer receipt, or — transcript
+        // delivery posts none — once the daemon's own final has landed.
+        const noteSettledReplyCard = (messageId: string): void => {
+          noteNextStepCard(ds, msg.turnId, { kind: 'legacy', messageId }, nextStepIo);
+          if (recapInput) {
+            noteRecapCard(ds, msg.turnId, { kind: 'legacy', messageId }, recapInput, turnRecapIo);
+          }
+        };
+        const replyCardRowsWanted = msg.status === 'completed' && (nextStepIo.enabled(ds) || !!recapInput);
+        if (replyCardRowsWanted && replyCardRoute !== 'receipt' && replyCardRoute !== 'transcript_rows' && replyCardRoute !== 'unified') {
+          logger.info(`[${t}] Reply card rows skipped for ${msg.turnId.substring(0, 16)}: ${replyCardRoute}`);
+        }
         const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
           && terminalReceiptRouteEligible;
         // Interim-only turns get no synchronous footer decision. Wait for the
@@ -25743,6 +25829,35 @@ function setupWorkerHandlers(
         //     must be reported even when that status is "no reply needed", so
         //     post a small auto receipt into the thread. No @ in the receipt:
         //     it must never re-trigger the bot (or a peer bot) that went quiet.
+        // The explicit-@ text receipt of a deliberately silent turn. Posted
+        // below when the terminal strip route does not apply, and by that route
+        // when a newer turn left it nothing to render.
+        let silentExplicitMention = false;
+        /** `fromReceiptRoute`: the receipt route claimed this turn and gave up
+         * to this receipt; a failure releases that claim too, so a replayed
+         * terminal routes — and falls back here — again. */
+        const postSilentTextReceipt = (fromReceiptRoute = false): void => {
+          const posted = ds.silentReceiptTurnIds ?? (ds.silentReceiptTurnIds = new Set());
+          if (posted.has(msg.turnId)) return;
+          // Claim BEFORE sending so a replay racing this await cannot double-post;
+          // release on failure so a later replay can still close the loop.
+          posted.add(msg.turnId);
+          trimOldest(posted, SILENT_RECEIPT_DEDUPE_MAX);
+          void scopedReply(
+            tr('worker.silent_turn_receipt', undefined, localeForBot(ds.larkAppId)),
+            'text',
+            msg.turnId,
+            { uuid: silentTurnReceiptUuid(ds.session.sessionId, msg.turnId) },
+          ).catch(err => {
+            // Nothing reached the thread: drop the claim AND restore the
+            // (already consumed) origin record, so a dispatchAttempt replay
+            // retries instead of losing the closure for good.
+            posted.delete(msg.turnId);
+            if (fromReceiptRoute) ds.terminalReceiptTurnIds?.delete(msg.turnId);
+            recordTurnExplicitMention(ds, msg.turnId, true);
+            logger.warn(`[${t}] Failed to post silent-turn receipt for ${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        };
         if (msg.status === 'completed'
           && msg.outputDisposition === 'nothing_to_send'
           && !visibleCarrier
@@ -25754,6 +25869,7 @@ function setupWorkerHandlers(
           // send-failure compensation above exists to prevent.
           const receiptSuppressed = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
           const explicitMention = receiptSuppressed ? false : takeTurnExplicitMention(ds, msg.turnId);
+          silentExplicitMention = explicitMention;
           // Lineage gate on the LABEL only: with type-ahead, a follow-up turn is
           // admitted while the previous one still runs, so this terminal can land
           // after a newer turn already opened. Relabelling the live card then
@@ -25766,28 +25882,7 @@ function setupWorkerHandlers(
           }
           // The RECEIPT is owed regardless of lineage — a dispatched task must
           // report its final status even if a newer turn has since opened.
-          const posted = ds.silentReceiptTurnIds ?? (ds.silentReceiptTurnIds = new Set());
-          if (explicitMention
-            && !shouldPostTerminalReceipt
-            && !posted.has(msg.turnId)) {
-            // Claim BEFORE sending so a replay racing this await cannot double-post;
-            // release on failure so a later replay can still close the loop.
-            posted.add(msg.turnId);
-            trimOldest(posted, SILENT_RECEIPT_DEDUPE_MAX);
-            void scopedReply(
-              tr('worker.silent_turn_receipt', undefined, localeForBot(ds.larkAppId)),
-              'text',
-              msg.turnId,
-              { uuid: silentTurnReceiptUuid(ds.session.sessionId, msg.turnId) },
-            ).catch(err => {
-              // Nothing reached the thread: drop the claim AND restore the
-              // (already consumed) origin record, so a dispatchAttempt replay
-              // retries instead of losing the closure for good.
-              posted.delete(msg.turnId);
-              recordTurnExplicitMention(ds, msg.turnId, true);
-              logger.warn(`[${t}] Failed to post silent-turn receipt for ${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
-            });
-          }
+          if (explicitMention && !shouldPostTerminalReceipt) postSilentTextReceipt();
         }
         // Daemon-owned auto terminal state for ordinary Lark turns in the
         // legacy/send UI. The presentation follows the last visible carrier:
@@ -25806,28 +25901,36 @@ function setupWorkerHandlers(
           // Carrier routing after the answer drain, shared by the immediate
           // receipt and the deferred interim decision. The caller owns the
           // claim, the drain fence and error handling.
-          const routeAfterDrain = async (kind: TurnTerminalReceiptKind): Promise<void> => {
+          // Resolves 'stale' when a newer turn left this one nothing to render.
+          const routeAfterDrain = async (kind: TurnTerminalReceiptKind): Promise<'stale' | undefined> => {
             const carrier = ds.turnTerminalCarriers?.get(msg.turnId);
+            // A footer write that was sent and failed may still have landed
+            // (commit-unknown); a read or card-id failure before it wrote nothing.
+            let footerWriteAttempted = false;
             if (carrier?.kind === 'standard_reply_card') {
               for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
                 const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
                 if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
-                if (!ownsLifecycleMutation()) return;
+                if (!ownsLifecycleMutation()) return undefined;
+                // Lineage is read at the write itself: a newer turn may start
+                // during the backoff or the reads. A write that already landed is
+                // caught by the readback (any receipt counts as applied) and the
+                // stable uuid.
+                const superseded = () => !!ds.currentTurnId && ds.currentTurnId !== msg.turnId;
                 try {
-                  if (await patchTurnTerminalCarrier(
-                    ds,
-                    carrier.messageId,
-                    kind,
-                  )) {
+                  const patched = await patchTurnTerminalCarrier(ds, carrier.messageId, kind, superseded,
+                    () => { footerWriteAttempted = true; });
+                  if (patched === 'patched') {
                     // The footer receipt is this card's first CardKit write;
                     // the next-step row only goes on after it.
-                    if (kind === 'completed') {
-                      noteNextStepCard(ds, msg.turnId, { kind: 'legacy', messageId: carrier.messageId }, nextStepIo);
-                      if (recapInput) {
-                        noteRecapCard(ds, msg.turnId, { kind: 'legacy', messageId: carrier.messageId }, recapInput, turnRecapIo);
-                      }
-                    }
-                    return;
+                    if (kind === 'completed') noteSettledReplyCard(carrier.messageId);
+                    return undefined;
+                  }
+                  // No footer to carry the receipt (turned off for this bot):
+                  // the rows still belong on the card.
+                  if (patched === 'no_footer' && kind === 'completed') noteSettledReplyCard(carrier.messageId);
+                  else if (kind === 'completed' && replyCardRowsWanted) {
+                    logger.info(`[${t}] Reply card rows skipped for ${msg.turnId.substring(0, 16)}: reply card is not editable`);
                   }
                   // A marker can outlive a manually replaced/non-card
                   // message. Fall through to the independent strip rather
@@ -25849,6 +25952,9 @@ function setupWorkerHandlers(
                   );
                 }
               }
+            } else if (kind === 'completed' && replyCardRowsWanted) {
+              logger.info(`[${t}] Reply card rows skipped for ${msg.turnId.substring(0, 16)}: `
+                + `no standard reply card (carrier=${carrier ? carrier.kind : 'none'})`);
             }
 
             // With no explicit/fallback body, the live streaming card is
@@ -25866,7 +25972,7 @@ function setupWorkerHandlers(
                 ds.completedIdleTurnId = msg.turnId;
                 ds.silentIdleTurnId = undefined;
               }
-              if (scheduleActiveRuntimePatch(ds)) return;
+              if (scheduleActiveRuntimePatch(ds)) return undefined;
             }
 
             // An independent strip is meaningful only while this remains
@@ -25878,7 +25984,10 @@ function setupWorkerHandlers(
               logger.debug(
                 `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
               );
-              return;
+              // Nothing rendered — unless a failed footer write landed anyway.
+              if (footerWriteAttempted && carrier
+                && await terminalFooterMayCarryReceipt(ds, carrier.messageId, kind)) return undefined;
+              return 'stale';
             }
 
             for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
@@ -25889,7 +25998,9 @@ function setupWorkerHandlers(
                 logger.debug(
                   `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
                 );
-                return;
+                // A strip was already attempted (it may have landed despite
+                // the error): not 'stale', or the turn could close twice.
+                return undefined;
               }
               try {
                 await scopedReply(
@@ -25901,7 +26012,7 @@ function setupWorkerHandlers(
                   msg.turnId,
                   { uuid: receiptUuid, replyTarget },
                 );
-                return;
+                return undefined;
               } catch (err) {
                 if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) throw err;
                 logger.warn(
@@ -25930,7 +26041,12 @@ function setupWorkerHandlers(
                   // delivery has either succeeded or exhausted retries.
                   await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
                   if (!ownsLifecycleMutation()) return;
-                  await routeAfterDrain(terminalReceiptKind);
+                  const outcome = await routeAfterDrain(terminalReceiptKind);
+                  // A dispatched (explicitly @'d) silent turn still owes the
+                  // thread its closure when a newer turn took the card.
+                  if (outcome === 'stale' && terminalReceiptKind === 'silent' && silentExplicitMention) {
+                    postSilentTextReceipt(true);
+                  }
                 } catch (err) {
                   // No attempt was confirmed. Release the in-memory claim so a
                   // durable replay may compensate; the stable provider UUID
@@ -25978,6 +26094,35 @@ function setupWorkerHandlers(
               }
             })();
           }
+        }
+        if (replyCardRoute === 'transcript_rows' && replyCardRowsWanted) {
+          // The daemon sends a transcript-delivered final itself; the worker
+          // queues final_output before turn_terminal, so that send is in flight
+          // (or done) here. Its card has settled once it has landed.
+          const finishRowsDrain = beginFinalOutputDelivery(ds);
+          void (async () => {
+            try {
+              await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+              if (!ownsLifecycleMutation()) return;
+              const carrier = ds.turnTerminalCarriers?.get(msg.turnId);
+              if (isFinalTurnTerminalCarrier(carrier) && carrier.kind === 'standard_reply_card') {
+                noteSettledReplyCard(carrier.messageId);
+              } else if (!isFinalTurnTerminalCarrier(carrier)) {
+                // No final yet (nothing visible, or only a progress/auxiliary
+                // card): the rows go on when the final card is recorded.
+                awaitFinalForReplyCardRows(ds, msg.turnId, noteSettledReplyCard);
+                logger.info(`[${t}] Reply card rows wait for the final reply card of ${msg.turnId.substring(0, 16)}`);
+              } else {
+                logger.info(`[${t}] Reply card rows skipped for ${msg.turnId.substring(0, 16)}: `
+                  + `final reply is not a reply card (carrier=${carrier.kind})`);
+              }
+            } catch (err) {
+              logger.warn(`[${t}] Reply card rows for ${msg.turnId.substring(0, 16)}: `
+                + `${err instanceof Error ? err.message : String(err)}`);
+            } finally {
+              finishRowsDrain();
+            }
+          })();
         }
         if (msg.turnId.startsWith('mlrp_turn_') && msg.status !== 'completed') {
           markMessageListenerRunPreviewFailed(msg.turnId, {
@@ -28436,6 +28581,7 @@ function deliverFinalOutput(
           kind: sendReplyFile ? 'non_patchable' : 'standard_reply_card',
           responseKind: 'final',
         });
+        if (!sendReplyFile) placeReplyCardRowsOnLateFinal(ds, msg.turnId, messageId);
       }
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
