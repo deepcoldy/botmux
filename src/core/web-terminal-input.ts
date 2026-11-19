@@ -64,10 +64,12 @@ export class WebTerminalInputClassifier {
   private paste = false;
   private readonly carryMs: number;
   private readonly maxCarry: number;
+  private readonly keepPastePrefixes: boolean;
 
-  constructor(options: { carryMs?: number; maxCarry?: number } = {}) {
+  constructor(options: { carryMs?: number; maxCarry?: number; keepPastePrefixes?: boolean } = {}) {
     this.carryMs = options.carryMs ?? 75;
     this.maxCarry = options.maxCarry ?? 256;
+    this.keepPastePrefixes = options.keepPastePrefixes === true;
     if (!Number.isFinite(this.carryMs) || this.carryMs <= 0 || this.carryMs > 1000
       || !Number.isSafeInteger(this.maxCarry) || this.maxCarry < 1 || this.maxCarry > 4096) {
       throw new RangeError('invalid web input carry limits');
@@ -76,15 +78,27 @@ export class WebTerminalInputClassifier {
 
   get pending(): boolean { return this.candidate.length > 0 || this.paste; }
   get inPaste(): boolean { return this.paste; }
-  get deadline(): number | undefined { return this.candidate ? this.startedAt + this.carryMs : undefined; }
+  get pastePrefixPending(): boolean {
+    return /^(?:\x1b\[|\x9b)2/.test(this.candidate)
+      && [...pasteStarts, ...pasteEnds].some(token => token.startsWith(this.candidate));
+  }
+  get deadline(): number | undefined {
+    return this.candidate && !(this.keepPastePrefixes && this.pastePrefixPending)
+      ? this.startedAt + this.carryMs : undefined;
+  }
   get bufferedBytes(): number { return Buffer.byteLength(this.candidate.slice(this.forwarded), 'utf8'); }
 
   push(data: string, options: { forceUser?: unknown } = {}, now = Date.now()): WebTerminalInputClassification {
     const out = this.empty();
-    if (this.candidate && now >= this.startedAt + this.carryMs) this.release(out, 'timeout');
+    if (this.deadline !== undefined && now >= this.deadline) this.release(out, 'timeout');
     const force = options.forceUser === true;
     for (const ch of data) {
       if (this.paste) out.pasteRelated = true;
+      // A new introducer retires the previous incomplete sequence. The ESC
+      // of an OSC string terminator is the exception: it still belongs to
+      // the current color response and must survive split ST packets.
+      if (this.candidate && (ch === '\x1b' || ch === '\x9b' || ch === '\x9d')
+        && candidateKind(this.candidate + ch) === 'invalid') this.release(out, 'user');
       if (!this.candidate && (ch === '\x1b' || ch === '\x9b' || ch === '\x9d')) {
         this.startedAt = now;
         this.userCandidate = force || this.paste;
@@ -117,12 +131,21 @@ export class WebTerminalInputClassifier {
 
   expire(now = Date.now()): WebTerminalInputClassification {
     const out = this.empty();
-    if (this.candidate && now >= this.startedAt + this.carryMs) this.release(out, 'timeout');
+    if (this.deadline !== undefined && now >= this.deadline) this.release(out, 'timeout');
     return this.finish(out);
   }
 
   /** Retirement/authorization loss discards state, never emits it to a successor. */
   reset(): void { this.clearCandidate(); this.paste = false; }
+
+  /** Rebuild accepted-but-unwritten state from the actual physical writer. */
+  copyFrom(other: WebTerminalInputClassifier): void {
+    this.candidate = other.candidate;
+    this.forwarded = other.forwarded;
+    this.userCandidate = other.userCandidate;
+    this.startedAt = other.startedAt;
+    this.paste = other.paste;
+  }
 
   private empty(): WebTerminalInputClassification {
     return { data: '', hasUser: false, maySubmit: false, pasteRelated: false, pending: false, reason: 'protocol' };

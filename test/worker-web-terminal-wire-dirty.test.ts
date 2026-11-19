@@ -64,7 +64,7 @@ function makeInjectionHarness() {
     bareShellLaunchBlocked: false,
     canStartInjectionFlush,
     revokePromptReadiness: vi.fn(() => { h.scope.isPromptReady = false; }),
-    sendRawCommandLineWithRecoveryFence: vi.fn(async () => {}),
+    sendRawCommandLineWithRecoveryFence: vi.fn(async (_target: unknown, _command: string, beforeWrite?: () => void) => { beforeWrite?.(); }),
     awaitPtyQuiescence: vi.fn(async () => {}),
     STARTUP_CMD_QUIET_MS: 1,
     STARTUP_CMD_CAP_MS: 10,
@@ -298,7 +298,7 @@ describe('unconfirmed Web terminal wire state', () => {
     const h = makeInjectionHarness();
     await h.inject();
     expect(h.scope.sendRawCommandLineWithRecoveryFence).toHaveBeenCalledExactlyOnceWith(
-      h.target.backend, '/compact',
+      h.target.backend, '/compact', expect.any(Function),
     );
     expect(h.scope.pendingInjections).toEqual([]);
     expect(h.scope.injectionFlushing).toBe(false);

@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { traeCliStatePath, traeConfigPath, traeHomeFor, traeInstallationIdPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
-  findTraexSessionIdByBotmuxSessionId,
+  resolveTraexResumeSessionId,
   traexHistoryMatchDelta,
   traexHistorySize,
   findTraexRolloutSetByPid,
@@ -489,7 +489,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       if (workingDir) baseArgs.push('-C', workingDir);
       if (!resume) return baseArgs;
 
-      const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
+      const traeSessionId = resolveTraexResumeSessionId(sessionId, resumeSessionId);
       if (!traeSessionId) return baseArgs;
       // Session fork: TraeX exposes the same native subcommand shape as Codex
       // (`traecli fork <id>`). It mints a new thread while leaving the source
@@ -499,7 +499,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
-      const sid = cliSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
+      const sid = resolveTraexResumeSessionId(sessionId, cliSessionId);
       if (!sid) return null;
       return `traex resume ${sid}`;
     },
@@ -531,6 +531,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // before writing any user text. Never select a model with submit retries.
       const pickerFailure = await dismissTraexModelPicker(pty);
       if (pickerFailure) return { submitted: false, failureReason: pickerFailure };
+      context?.submitGuard?.beforeWrite?.();
       // Same bracketed-paste strategy as the Codex adapter: multi-line user
       // messages must not be split into separate turns by embedded \n.
       // A boolean false from sendSpecialKeys (e.g. tmux send-keys timing out

@@ -442,7 +442,7 @@ import {
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
-import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexSessionIdByBotmuxSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
+import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
 import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
@@ -3434,6 +3434,7 @@ let programStatusStream: ProgramStatusFramingStream | null = null;
 /** Armed only for a fresh, version-verified TraeX terminal process. Unlike
  * awaitingFirstPrompt, a screen/timeout ready edge must not retire this fence. */
 let traexNativeStartupInputPending = false;
+let traexFirstPromptDeadlineAt = 0;
 let traexNativeStartupHoldLogged = false;
 /** Thread initialization and the first queued write have separate ownership. */
 let traexFirstInputAdmissionPending = false;
@@ -5065,7 +5066,13 @@ async function sendRawCommandLine(
   // recovery-fence transaction detects a failed submission by a thrown error, so
   // bridge the two: turn an explicit `false` into the same throw the inline
   // implementation used, letting runAmbiguousSubmissionTransaction cancel the WAL.
-  const writeOptions = rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId);
+  const writeGeneration = cliSpawnGeneration;
+  const writeLifetime = cliLifetimeNonce;
+  const writeOptions = {
+    ...rawCommandWriteOptionsFor(cliAdapter ?? undefined, lastInitConfig?.cliId),
+    isCurrent: () => backend === be && cliSpawnGeneration === writeGeneration
+      && cliLifetimeNonce === writeLifetime && !webTerminalInputWireDirty(),
+  };
   // `submit: false` types the line and leaves it in the composer; the caller
   // presses Enter itself. Used by the Codex effort controller, whose Enter must
   // come after a screen re-check (see typeRawCommandLine).
@@ -5264,6 +5271,9 @@ async function sendRawCommandLineWithRecoveryFence(
   commandLineWritesPending += 1;
   await previous;
   try {
+    if (webTerminalInputWireDirty()) throw new SubmissionWriteError(
+      'Web terminal wire is dirty before command write', 'web_terminal_input_wire_dirty', false,
+    );
     const transaction = await runAmbiguousSubmissionTransaction(
       be,
       () => sendRawCommandLine(be, content, { turnId }),
@@ -16489,6 +16499,7 @@ function applyTraexStartupLaunchMode(
     persistentReattach: launch.persistentReattach,
   });
   traexFirstInputAdmissionPending = traexNativeStartupInputPending;
+  traexFirstPromptDeadlineAt = Date.now() + FIRST_PROMPT_HARD_TIMEOUT_MS;
   if (cfg.cliId === 'traex' && launch.resume && launch.nativeSessionId && !cfg.adoptMode && cliAdapter) {
     cliAdapter = {
       ...cliAdapter,
@@ -16517,31 +16528,32 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
     if (sinceInputMs < READY_FLUSH_SETTLE_MS
       || (backendScreenRevision === webTerminalInputBackendScreenRevision
         && sinceInputMs < READY_FLUSH_SETTLE_MS * 3)) {
-      if (!traexStartupWebRecheck && backend) {
+      if (!traexStartupWebRecheck && backend && Date.now() < traexFirstPromptDeadlineAt) {
         const target = backend;
         const generation = cliSpawnGeneration;
         const waitMs = (sinceInputMs < READY_FLUSH_SETTLE_MS ? READY_FLUSH_SETTLE_MS : READY_FLUSH_SETTLE_MS * 3) - sinceInputMs;
         traexStartupWebRecheck = setTimeout(() => {
           traexStartupWebRecheck = undefined;
           if (backend !== target || cliSpawnGeneration !== generation
+            || Date.now() >= traexFirstPromptDeadlineAt
             || (cliRestartInProgress && !replacementSpawnInProgress)) return;
           markPromptReady();
           void flushPending();
-        }, Math.max(0, waitMs) + 1);
+        }, Math.min(Math.max(0, waitMs) + 1, Math.max(0, traexFirstPromptDeadlineAt - Date.now())));
         traexStartupWebRecheck.unref?.();
       }
       return true;
     }
     if (traexStartupRendererWebInputGeneration !== webTerminalInputGeneration
       || traexStartupRendererScreenRevision !== backendScreenRevision) {
-      if (!traexStartupRendererDrain && renderer) {
+      if (!traexStartupRendererDrain && renderer && Date.now() < traexFirstPromptDeadlineAt) {
         const token = {};
         const target = backend;
         const observedRenderer = renderer;
         const generation = cliSpawnGeneration;
         const revision = backendScreenRevision;
         const inputGeneration = webTerminalInputGeneration;
-        const retryDeadline = lastWebTerminalInputAtMs + FIRST_PROMPT_HARD_TIMEOUT_MS;
+        const retryDeadline = traexFirstPromptDeadlineAt;
         let accepted = false;
         traexStartupRendererDrain = token;
         void observedRenderer.writeAndFlush('').then(() => {
@@ -16571,7 +16583,7 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
               || Date.now() >= retryDeadline) return;
             markPromptReady();
             void flushPending();
-          }, 1_000);
+          }, Math.min(1_000, Math.max(0, retryDeadline - Date.now())));
           traexStartupWebRecheck.unref?.();
         });
       }
@@ -16610,13 +16622,13 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
   const detector = idleDetector;
   const adapter = cliAdapter;
   const generation = cliSpawnGeneration;
-  const startedAt = Date.now();
+  const deadline = traexFirstPromptDeadlineAt || (traexFirstPromptDeadlineAt = Date.now() + FIRST_PROMPT_HARD_TIMEOUT_MS);
   const initialRenderer = renderer;
   const stillWaiting = (): boolean => awaitingFirstPrompt
     && backend === observedBackend && idleDetector === detector && cliSpawnGeneration === generation
     && renderer === initialRenderer
     && !(cliRestartInProgress && !replacementSpawnInProgress)
-    && Date.now() - startedAt < FIRST_PROMPT_HARD_TIMEOUT_MS;
+    && Date.now() < deadline;
   const check = async (): Promise<void> => {
     try {
       if (!stillWaiting() || !renderer || inflightInputs.hasUnacked()
@@ -18414,8 +18426,9 @@ const inFlightKeepaliveFingerprints = new Map<string, number>();
 
 /** 排队注入一行 TUI 命令：idle（isPromptReady）时经串行恢复事务敲入。 */
 async function flushPendingInjections(): Promise<void> {
-  if (nativeSessionForkPending()) return;
+  if (nativeSessionForkPending() || webTerminalInputWireDirty()) return;
   if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
+  if (webTerminalInputWireDirty()) return;
   if (idleDetector?.isStartupPending()) return;
   // 不跨 restart 边界写入（与 flushPending 同款守卫）：destroySession 异步期间
   // backend 可能仍指向旧 CLI。
@@ -18439,7 +18452,7 @@ async function flushPendingInjections(): Promise<void> {
   injectionFlushing = true;
   try {
     while (pendingInjections.length > 0 && backend && isPromptReady && !bareShellLaunchBlocked
-      && !sessionRenameInFlight()) {
+      && !sessionRenameInFlight() && !webTerminalInputWireDirty()) {
       // Mirror flushPending's one-shot launch-failure guard: when an injection is
       // the FIRST writer after a (re)spawn, flushPending may never have run
       // (pendingMessages empty ⇒ early return) so the bare-shell check must also
@@ -18457,31 +18470,42 @@ async function flushPendingInjections(): Promise<void> {
       // workingDir; non-barrier injects are best-effort and not replayed
       // cross-process), unlike pendingMessages which killCli preserves.
       if (cliRestartInProgress) return;
+      if (webTerminalInputWireDirty()) return;
       const item = pendingInjections.shift()!;
       const cmd = item.command;
-      // Record the keep-alive by its actual command fingerprint so the later
-      // UserPromptSubmit hook can be matched by content regardless of HTTP
-      // arrival ordering. A non-keepalive injection does NOT touch existing
-      // entries: its write is unrelated to a keep-alive whose hook may still be
-      // in flight, and clearing them would let a late keep-alive hook be
-      // misread as a human direct-submit. Entries leave only on exact match,
-      // expiry purge, or process teardown.
-      if (item.kind === 'keepalive') {
-        const purgeAt = Date.now();
-        for (const [fp, at] of inFlightKeepaliveFingerprints) {
-          if (purgeAt - at >= KEEPALIVE_HOOK_CLAIM_MS) inFlightKeepaliveFingerprints.delete(fp);
-        }
-        inFlightKeepaliveFingerprints.set(fingerprintPromptText(cmd), purgeAt);
-      }
       revokePromptReadiness();
       idleDetector?.reset();
       try {
         // Serially：与 startupCommands / raw_input / native-rename 共用同一条
         // 字面命令行写入互斥链（text → beat → Enter 窗口不被拼接）。
-        await sendRawCommandLineWithRecoveryFence(backend, cmd);
+        await sendRawCommandLineWithRecoveryFence(backend, cmd, () => {
+          if (webTerminalInputWireDirty()) throw new SubmissionWriteError(
+            'Web terminal wire is dirty before injection', 'web_terminal_input_wire_dirty', false,
+          );
+
+          // Record the keep-alive by its actual command fingerprint so the later
+          // UserPromptSubmit hook can be matched by content regardless of HTTP
+          // arrival ordering. A non-keepalive injection does NOT touch existing
+          // entries: its write is unrelated to a keep-alive whose hook may still be
+          // in flight, and clearing them would let a late keep-alive hook be
+          // misread as a human direct-submit. Entries leave only on exact match,
+          // expiry purge, or process teardown.
+          if (item.kind === 'keepalive') {
+            const purgeAt = Date.now();
+            for (const [fp, at] of inFlightKeepaliveFingerprints) {
+              if (purgeAt - at >= KEEPALIVE_HOOK_CLAIM_MS) inFlightKeepaliveFingerprints.delete(fp);
+            }
+            inFlightKeepaliveFingerprints.set(fingerprintPromptText(cmd), purgeAt);
+          }
+        });
         await awaitPtyQuiescence(STARTUP_CMD_QUIET_MS, STARTUP_CMD_CAP_MS);
         log(`Injected command: ${cmd}`);
       } catch (e: any) {
+        if (e instanceof SubmissionWriteError && !e.submissionStarted
+          && webTerminalInputWireDirty()) {
+          pendingInjections.unshift(item);
+          return;
+        }
         log(`Inject command failed (${cmd}): ${e?.message ?? e}`);
       }
     }
@@ -18846,12 +18870,21 @@ let traexQuestionDraftWaiting = false;
 function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>): SubmitGuard {
   const target = backend;
   const generation = cliSpawnGeneration;
+  const lifetime = cliLifetimeNonce;
   let toldWaiting = false;
-  const current = () => backend === target && cliSpawnGeneration === generation && !cliRestartInProgress;
+  const current = () => backend === target && cliSpawnGeneration === generation && !cliRestartInProgress
+    && cliLifetimeNonce === lifetime && !webTerminalInputWireDirty();
   return {
     maxWaitMs: TRAEX_QUESTION_DRAFT_WAIT_MS,
     pollMs: TRAEX_QUESTION_DRAFT_POLL_MS,
     current,
+    beforeWrite: () => {
+      if (!current()) throw new SubmissionWriteError(
+        'Physical input guard retired before adapter paste',
+        webTerminalInputWireDirty() ? 'web_terminal_input_wire_dirty' : 'input_generation_changed_before_write',
+        false,
+      );
+    },
     blocked: async phase => {
       if (!current() || !traexQuestionBridgeActive()) {
         traexQuestionDraftWaiting = false;
@@ -20950,8 +20983,18 @@ async function runAmbiguousSubmissionTransaction<T>(
   submissionAccepted: (result: T) => boolean | Promise<boolean> = () => true,
   beforeWrite?: () => void | Promise<void>,
 ): Promise<{ result: T; recoveryFailureReason?: string }> {
+  const requireCleanWire = (): void => {
+    if (backend === target && webTerminalInputWireDirty()) {
+      throw new SubmissionWriteError(
+        'Web terminal wire is dirty before logical submission', 'web_terminal_input_wire_dirty', false,
+      );
+    }
+  };
   if (!target.captureAmbiguousSubmissionFence) {
-    await beforeWrite?.();
+    requireCleanWire();
+    const preparation = beforeWrite?.();
+    if (preparation) await preparation;
+    requireCleanWire();
     return { result: await write() };
   }
 
@@ -20966,8 +21009,11 @@ async function runAmbiguousSubmissionTransaction<T>(
     if (backend !== target) {
       throw new Error('backend changed before logical submission');
     }
+    requireCleanWire();
     submissionFence = captureAmbiguousSubmissionFence(target);
-    await beforeWrite?.();
+    const preparation = beforeWrite?.();
+    if (preparation) await preparation;
+    requireCleanWire();
     submissionStarted = true;
     const result = await write();
     const accepted = await submissionAccepted(result);
@@ -23349,6 +23395,7 @@ async function flushPending(): Promise<void> {
   // renderer drain; concurrent calls still serialize on isFlushing (no other
   // await before it is set). Nothing below re-reads the screen for the picker.
   if (codexModelMigrationCheckNeeded() && await codexModelMigrationAdmit('write') !== 'proceed') return;
+  if (webTerminalInputWireDirty()) return;
   if (idleDetector?.isStartupPending()) return;
   // Type-ahead arrivals bypass markPromptReady; keep the same first-input
   // evidence fence before any literal write or dequeue.
@@ -23393,7 +23440,7 @@ async function flushPending(): Promise<void> {
     if (await postTerminalInputIsBlocked(target)) return;
     // Two input arrivals can both await the same renderer. Only one may own
     // the drain, and a restart during that await invalidates both arrivals.
-    if (isFlushing || backend !== target || cliRestartInProgress) return;
+    if (isFlushing || backend !== target || cliRestartInProgress || webTerminalInputWireDirty()) return;
   }
   if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
   if (resetTraexAutoModelBeforePendingTurn()) return;
@@ -23591,7 +23638,8 @@ async function flushPending(): Promise<void> {
     // promised to teardown — re-check the restart fence now, before any shift or
     // write. The queue is untouched; the replacement generation's markPromptReady
     // re-invokes flushPending.
-    if (cliRestartInProgress) return;  // finally{} releases the mutex; queue stays
+    if (cliRestartInProgress) return;  // queue stays
+    if (webTerminalInputWireDirty()) return;
     // First write of a fresh spawn: the CLI's input prompt must be on screen
     // before anything is typed (see decideFirstWriteLiveness). The queue stays
     // untouched; a poll re-drives this flush once the prompt has rendered.
@@ -23614,8 +23662,10 @@ async function flushPending(): Promise<void> {
     if (!hasRunStartupCommands) {
       if (!(await runStartupCommands())) return;  // finally{} releases the mutex; queue stays
       hasRunStartupCommands = true;
+      if (webTerminalInputWireDirty()) return;
       await runInitialNativeRename();
     }
+    if (webTerminalInputWireDirty()) return;
     if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) return;
     // Commands deferred behind a previous rename run before the latest pending
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
@@ -23711,7 +23761,8 @@ async function flushPending(): Promise<void> {
       return;
     }
     let holdDrainForPreferredReset = false;
-    while (pendingMessages.length > 0 && backend && cliAdapter && !holdDrainForPreferredReset) {
+    while (pendingMessages.length > 0 && backend && cliAdapter && !holdDrainForPreferredReset
+      && !webTerminalInputWireDirty()) {
       if (guardTraexFirstAdmission && webTerminalInputGeneration !== firstAdmissionWebInputGeneration) {
         holdFirstAdmissionAfterWebInput();
         break;
@@ -23736,7 +23787,7 @@ async function flushPending(): Promise<void> {
         const generation = cliSpawnGeneration;
         if (await postTerminalInputIsBlocked(target)
           || backend !== target || generation !== cliSpawnGeneration
-          || cliRestartInProgress) break;
+          || cliRestartInProgress || webTerminalInputWireDirty()) break;
       }
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       const admissionHead = pendingMessages[0]!;
@@ -23758,6 +23809,7 @@ async function flushPending(): Promise<void> {
           && !cliRestartInProgress) keepPromptReadyAfterHold();
         break;
       }
+      if (webTerminalInputWireDirty()) break;
       const continuation = pendingMessages[0]!.traexAutoModelContinuation;
       if (workerSessionEventScope && pendingMessages[0]!.traexAutoModelRecovery && continuation
         && !workerSessionEventScope.canSubmitContinuation(pendingMessages[0]!.turnId!, continuation.execution)) {
@@ -23787,7 +23839,7 @@ async function flushPending(): Promise<void> {
           const target: SessionBackend = backend;
           const generation = cliSpawnGeneration;
           const refused = await cliAdapter.settleInputBox(adapterInputHandle(target));
-          if (backend !== target || generation !== cliSpawnGeneration || cliRestartInProgress) break;
+          if (backend !== target || generation !== cliSpawnGeneration || cliRestartInProgress || webTerminalInputWireDirty()) break;
           if (refused) {
             keepPromptReadyAfterHold();
             holdOpeningInput(refused);
@@ -23803,7 +23855,7 @@ async function flushPending(): Promise<void> {
         const generation = cliSpawnGeneration;
         const head = pendingMessages[0];
         const held = await traexQuestionHoldsQueuedWrite();
-        if (backend !== target || generation !== cliSpawnGeneration || cliRestartInProgress) break;
+        if (backend !== target || generation !== cliSpawnGeneration || cliRestartInProgress || webTerminalInputWireDirty()) break;
         if (held === true) {
           keepPromptReadyAfterHold();
           break;
@@ -23819,6 +23871,7 @@ async function flushPending(): Promise<void> {
         holdFirstAdmissionAfterWebInput();
         break;
       }
+      if (webTerminalInputWireDirty()) break;
       const catalogAdmissionHead = pendingMessages[0];
       if (catalogAdmissionHead?.turnId
         && admitTraexCatalogModelBeforeInput(catalogAdmissionHead.turnId, catalogAdmissionHead.dispatchAttempt)) break;
@@ -23890,12 +23943,17 @@ async function flushPending(): Promise<void> {
       let turnSeq = usageLimitTracker.currentTurn();
       let bridgeTurnId: string | undefined;
       let normalWritePrepared = false;
+      let webWireWriteRefused = false;
       let submissionPreparationFailed = false;
       // Remote-runner, RPC and Codex App runner input bypass the composer.
       const typedIntoComposer = !writeBackend.submitTurn && !writeRpcEngine
         && !(item.codexAppInput && writeAdapter.writeStructuredInput);
       const prepareNormalWrite = (): void => {
         if (normalWritePrepared) return;
+        if (webTerminalInputWireDirty()) {
+          webWireWriteRefused = true;
+          throw new SubmissionWriteError('Web terminal wire is dirty before the native write', 'web_terminal_input_wire_dirty', false);
+        }
         normalWritePrepared = true;
         syncQueuedTurnsFromMarkerDisk();
 
@@ -24342,7 +24400,7 @@ async function flushPending(): Promise<void> {
                   ? { correlateTranscript: true as const } : {}),
                 ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
                 ...(item.codexAppSteerable ? { codexAppSteerable: true } : {}),
-                ...(traexQuestionBridgeActive() ? { submitGuard: traexQuestionSubmitGuard(item) } : {}),
+                ...(lastInitConfig?.cliId === 'traex' ? { submitGuard: traexQuestionSubmitGuard(item) } : {}),
               },
             ),
             settleVerifiableSubmissionForJournal,
@@ -24369,6 +24427,14 @@ async function flushPending(): Promise<void> {
           scheduleBusyPatternIdleProbe(`${cliName()} post-submit`);
         }
       } catch (err: any) {
+        if ((webWireWriteRefused || (err instanceof SubmissionWriteError && !err.submissionStarted
+          && webTerminalInputWireDirty())) && !tracksCodexAppLiveness && writeContinuationIsCurrent()) {
+          pendingMessages.unshift(item);
+          requeueUnsubmittedQueuedActivation(item);
+          keepPromptReadyAfterHold();
+          log('Retained definitely-unwritten input behind the dirty Web terminal wire');
+          break;
+        }
         if (err instanceof SubmissionWriteError && err.traexCatalogAdmissionRequired) {
           // prepareNormalWrite threw before invoking the adapter. This is a
           // proven pre-write refusal, never an ambiguous submission: restore
@@ -26248,6 +26314,7 @@ async function spawnCliBody(
   // (necessary for adopt mode which wires onPtyData before the normal spawn sequence).
   programStatusStream = shouldEnableProgramStatus(cfg, cliAdapter, { quiet: true }) ? new ProgramStatusFramingStream() : null;
   traexNativeStartupInputPending = false;
+  traexFirstPromptDeadlineAt = 0;
   traexNativeStartupHoldLogged = false;
   traexFirstInputAdmissionPending = false;
   traexStartupRendererWebInputGeneration = -1;
@@ -28215,7 +28282,7 @@ async function spawnCliBody(
   if (effectiveCliId === 'traex' && effectiveResume && !willReattachPersistent && !effectiveCliSessionId) {
     // Preserve the adapter's existing exact Botmux-to-native lookup, but make
     // its result authoritative BEFORE deciding whether this launch is fresh.
-    effectiveCliSessionId = findTraexSessionIdByBotmuxSessionId(effectiveAdapterSessionId);
+    effectiveCliSessionId = resolveTraexResumeSessionId(effectiveAdapterSessionId, effectiveCliSessionId);
   }
   // Claude-family transcripts are scoped by cwd. `/cd` keeps the same Botmux /
   // CLI session id, so mirror the newest native transcript into the new cwd's
@@ -33001,6 +33068,7 @@ function killCli(opts: {
   programStatusStream?.reset();
   programStatusStream = null;
   traexNativeStartupInputPending = false;
+  traexFirstPromptDeadlineAt = 0;
   traexNativeStartupHoldLogged = false;
   traexFirstInputAdmissionPending = false;
   traexStartupRendererWebInputGeneration = -1;
@@ -33469,7 +33537,7 @@ function webTerminalInputWireDirty(): boolean {
   return !!target && backend === target.backend && cliLifetimeNonce === target.lifetime
     && cliSpawnGeneration === target.generation;
 }
-type WebAttachInput = { ws: WebSocket; target: WebTerminalInputTarget; data: string; owner?: symbol };
+type WebAttachInput = { ws: WebSocket; target: WebTerminalInputTarget; data: string; owner?: symbol; wire: WebTerminalInputWireState };
 const webTerminalAttachInputs = new Set<WebAttachInput[]>();
 function webTerminalInputTargetCurrent(ws: WebSocket, target: WebTerminalInputTarget): boolean {
   return !closeRequested && !webTerminalInputWireDirty()
@@ -33502,14 +33570,19 @@ function recheckAfterWebInput(target: WebTerminalInputTarget, ws: WebSocket): vo
     else check();
   } catch { /* Observation cannot swallow authenticated input. */ }
 }
+function discardWebTerminalAttachInputs(queue: WebAttachInput[]): void {
+  for (const input of queue) if (input.owner) input.wire.discard(input.owner);
+  queue.length = 0;
+  webTerminalAttachInputs.delete(queue);
+}
 function queueWebTerminalAttachInput(ws: WebSocket, queue: WebAttachInput[],
   target: WebTerminalInputTarget, data: string, owner?: symbol): false | 'queued' {
   const bytes = queue.reduce((sum, input) => sum + Buffer.byteLength(input.data, 'utf8'), 0);
   if (queue.length >= 128 || bytes + Buffer.byteLength(data, 'utf8') > 256 * 1024) {
-    queue.length = 0; webTerminalAttachInputs.delete(queue);
+    discardWebTerminalAttachInputs(queue);
     ws.close(1009, 'terminal input backlog exceeded'); return false;
   }
-  queue.push({ ws, target, data, owner }); webTerminalAttachInputs.add(queue); return 'queued';
+  queue.push({ ws, target, data, owner, wire: webTerminalInputWireState(target) }); webTerminalAttachInputs.add(queue); return 'queued';
 }
 function markWebTerminalInputWireUncertain(ws: WebSocket, target: WebTerminalInputTarget): void {
   if (backend !== target.backend || cliLifetimeNonce !== target.lifetime
@@ -33526,9 +33599,9 @@ function replayWebTerminalAttachInput(ws: WebSocket, queue: WebAttachInput[], cp
   const inputs = queue.splice(0);
   webTerminalAttachInputs.delete(queue);
   for (const input of inputs) {
-    const wire = webTerminalInputWireState(input.target);
+    const wire = input.wire;
     if (!webTerminalInputTargetCurrent(ws, input.target)) {
-      if (wire.writer.inPaste) markWebTerminalInputWireUncertain(ws, input.target);
+      if (wire.physicalPastePending) markWebTerminalInputWireUncertain(ws, input.target);
       break;
     }
     const write = () => {
@@ -33537,7 +33610,7 @@ function replayWebTerminalAttachInput(ws: WebSocket, queue: WebAttachInput[], cp
         cp.write(input.data);
         wire.written(input.data, input.owner ?? Symbol('attach-writer'));
       } catch {
-        if (wire.writer.pending || /\x1b\[20[01]~|\x9b20[01]~/.test(input.data)) {
+        if (wire.physicalPastePending || /\x1b\[20[01]~|\x9b20[01]~|(?:\x1b\[|\x9b)2(?:0[01]?)?$/.test(input.data)) {
           markWebTerminalInputWireUncertain(ws, input.target);
         }
         throw new Error('web_terminal_attach_write_failed');
@@ -33548,6 +33621,7 @@ function replayWebTerminalAttachInput(ws: WebSocket, queue: WebAttachInput[], cp
       else write();
     } catch { break; }
   }
+  for (const input of inputs) if (input.owner) input.wire.discard(input.owner);
   const latest = inputs.at(-1);
   if (latest) recheckAfterWebInput(latest.target, ws);
 }
@@ -33848,7 +33922,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           if (cp) { cp.write(data); return true; }
           return queueWebTerminalAttachInput(ws, pendingInput, target, data, owner);
         });
-        ws.once('close', () => { pendingInput.length = 0; webTerminalAttachInputs.delete(pendingInput); });
+        ws.once('close', () => { discardWebTerminalAttachInputs(pendingInput); });
 
         const startAttach = (cols: number, rows: number) => {
           if (cp) return;
@@ -33936,7 +34010,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           if (cp) { cp.write(data); return true; }
           return queueWebTerminalAttachInput(ws, pendingInput, target, data, owner);
         });
-        ws.once('close', () => { pendingInput.length = 0; webTerminalAttachInputs.delete(pendingInput); });
+        ws.once('close', () => { discardWebTerminalAttachInputs(pendingInput); });
         // While this attach client is live, silence the ObserveBackend's
         // dump-screen/list-panes pollers: each `zellij action` they run makes the
         // server repaint every attached client, which flickers this client's
@@ -35634,7 +35708,7 @@ if(isTouch&&hasToken){
       // （还没确认）与 false（只读）都不发，桌面也等首帧（第 17 点）。
       if(wsHasWrite!==true){if(wsHasWrite===false)_showReadonlyToast();return;}
       var k=km[btn.getAttribute('data-k')];
-      if(k){ws_.send(JSON.stringify({type:'input',data:k}));_wbNoteInput(k);}
+      if(k){ws_.send(JSON.stringify({type:'input',data:k,forceUser:true}));_wbNoteInput(k);}
     }
     btn.addEventListener('pointerdown',function(e){
       if(e.button!==0)return;e.preventDefault();e.stopPropagation();_wakeToolbar();
@@ -35813,7 +35887,7 @@ if(isTouch&&hasToken){(function(){
     return CL.repeat(suf)+BS.repeat(rem)+ins+CR.repeat(suf);}
   var mirror={sent:'',held:'',composing:false};
   function sendInput(seq){if(!seq||wsHasWrite!==true||!ws_||ws_.readyState!==1)return false;
-    try{ws_.send(JSON.stringify({type:'input',data:seq}));_wbNoteInput(seq);return true;}catch(e){return false;}}
+    try{ws_.send(JSON.stringify({type:'input',data:seq,forceUser:true}));_wbNoteInput(seq);return true;}catch(e){return false;}}
   function syncMirror(v){mirror.held=String(v||'');
     if(mirror.composing||mirror.held===mirror.sent)return true;
     var seq=editSeq(mirror.sent,mirror.held);

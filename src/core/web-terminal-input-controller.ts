@@ -27,47 +27,86 @@ export interface WebTerminalInputControllerDependencies<Target> {
 export type WebTerminalInputOutcome = 'forwarded' | 'pending' | 'refused' | 'failed';
 
 export class WebTerminalInputWireState {
-  readonly writer = new WebTerminalInputClassifier();
-  readonly acceptedWriter = new WebTerminalInputClassifier();
+  readonly writer = new WebTerminalInputClassifier({ keepPastePrefixes: true });
+  readonly acceptedWriter = new WebTerminalInputClassifier({ keepPastePrefixes: true });
   tail: Promise<unknown> = Promise.resolve();
   pendingUsers = 0;
-  owner: symbol | undefined;
+  private physicalOwner: symbol | undefined;
+  private unwritten: Array<{ data: string; owner: symbol; at: number }> = [];
   lastWriter: symbol | undefined;
   dirty = false;
   private completed: Promise<boolean> | undefined;
   private complete: ((ok: boolean) => void) | undefined;
-  get inPaste(): boolean { return this.writer.inPaste || this.acceptedWriter.inPaste; }
-  get pending(): boolean { return this.writer.pending || this.acceptedWriter.pending; }
+  private acceptedCompleted: Promise<boolean> | undefined;
+  private acceptedComplete: ((ok: boolean) => void) | undefined;
+  get physicalPastePending(): boolean { return this.writer.inPaste || this.writer.pastePrefixPending; }
+  get inPaste(): boolean {
+    return this.physicalPastePending || this.acceptedWriter.inPaste || this.acceptedWriter.pastePrefixPending;
+  }
+  get outstanding(): boolean { return this.unwritten.length > 0; }
+  get owner(): symbol | undefined {
+    return this.physicalOwner ?? this.unwritten[0]?.owner;
+  }
+  get pending(): boolean {
+    this.writer.expire();
+    this.acceptedWriter.expire();
+    return this.writer.pending || this.acceptedWriter.pending || this.outstanding;
+  }
 
   waitForPasteEnd(): Promise<boolean> {
     if (this.dirty) return Promise.resolve(false);
-    if (!this.inPaste) return Promise.resolve(true);
+    if (!this.inPaste && !this.outstanding) return Promise.resolve(true);
     this.completed ??= new Promise(resolve => { this.complete = resolve; });
     return this.completed;
   }
+  /** A reply on the same pre-attach queue can follow its accepted END. It
+   * still stays outstanding until the physical writer acknowledges replay. */
+  waitForAcceptedPasteEnd(): Promise<boolean> {
+    if (this.dirty) return Promise.resolve(false);
+    if (!this.acceptedWriter.inPaste && !this.acceptedWriter.pastePrefixPending) return Promise.resolve(true);
+    this.acceptedCompleted ??= new Promise(resolve => { this.acceptedComplete = resolve; });
+    return this.acceptedCompleted;
+  }
   written(data: string, owner: symbol): void {
-    const wasPaste = this.writer.inPaste;
-    this.writer.push(data, { forceUser: true }, 0);
+    const wasPaste = this.physicalPastePending;
+    this.writer.push(data, { forceUser: true });
     this.lastWriter = owner;
-    if (!wasPaste && this.writer.inPaste) this.owner = owner;
-    if (wasPaste && !this.inPaste) {
-      this.owner = undefined;
-      this.complete?.(true); this.complete = undefined; this.completed = undefined;
-    }
+    if (!wasPaste && this.physicalPastePending) this.physicalOwner = owner;
+    if (!this.physicalPastePending) this.physicalOwner = undefined;
+    const queued = this.unwritten[0];
+    if (queued?.owner === owner && queued.data === data) this.unwritten.shift();
+    this.rebuildAccepted();
+    this.releaseWaiters();
   }
   accepted(data: string, owner: symbol): void {
-    const wasPaste = this.acceptedWriter.inPaste;
-    this.acceptedWriter.push(data, { forceUser: true }, 0);
-    this.lastWriter = owner;
-    if (!wasPaste && this.acceptedWriter.inPaste) this.owner = owner;
-    if (wasPaste && !this.inPaste) {
-      this.owner = undefined;
-      this.complete?.(true); this.complete = undefined; this.completed = undefined;
-    }
+    const at = Date.now();
+    this.unwritten.push({ data, owner, at });
+    this.acceptedWriter.push(data, { forceUser: true }, at);
+    this.releaseAcceptedWaiters();
+  }
+  /** The connection dropped bytes that never reached the physical CLI. */
+  discard(owner: symbol): void {
+    this.unwritten = this.unwritten.filter(input => input.owner !== owner);
+    this.rebuildAccepted();
+    this.releaseAcceptedWaiters();
+    this.releaseWaiters();
+  }
+  private rebuildAccepted(): void {
+    this.acceptedWriter.copyFrom(this.writer);
+    for (const input of this.unwritten) this.acceptedWriter.push(input.data, { forceUser: true }, input.at);
+  }
+  private releaseWaiters(): void {
+    if (this.dirty || this.inPaste || this.outstanding) return;
+    this.complete?.(true); this.complete = undefined; this.completed = undefined;
+  }
+  private releaseAcceptedWaiters(): void {
+    if (this.dirty || this.acceptedWriter.inPaste || this.acceptedWriter.pastePrefixPending) return;
+    this.acceptedComplete?.(true); this.acceptedComplete = undefined; this.acceptedCompleted = undefined;
   }
   fail(): void {
     this.dirty = true;
     this.complete?.(false); this.complete = undefined; this.completed = undefined;
+    this.acceptedComplete?.(false); this.acceptedComplete = undefined; this.acceptedCompleted = undefined;
   }
 }
 
@@ -92,6 +131,7 @@ export class WebTerminalInputController<Target> {
   private userBytes = 0;
   private timer: unknown;
   private timerToken: object | undefined;
+  private readonly waits = new Set<(ok: boolean) => void>();
   private readonly maxUserBytes: number;
   private readonly maxUserMessages: number;
 
@@ -112,7 +152,7 @@ export class WebTerminalInputController<Target> {
     }
     if (this.target !== undefined && !this.deps.isCurrent(this.target)) this.reset();
     if (this.wireDirty) return this.dirtyTarget !== undefined && this.deps.isCurrent(this.dirtyTarget);
-    return this.held;
+    return this.held || (!!this.target && this.deps.isCurrent(this.target) && this.wire.inPaste);
   }
 
   accept(data: string, options: { forceUser?: unknown } = {}): Promise<WebTerminalInputOutcome> {
@@ -145,7 +185,7 @@ export class WebTerminalInputController<Target> {
   }
 
   dispose(): void {
-    if (this.wire.inPaste && this.wire.owner === this.identity && this.target !== undefined) this.markUncertain(this.target);
+    if (this.wire.physicalPastePending && this.wire.owner === this.identity && this.target !== undefined) this.markUncertain(this.target);
     this.disposed = true; this.reset();
   }
 
@@ -160,7 +200,9 @@ export class WebTerminalInputController<Target> {
     const epoch = this.epoch;
     const run = (): WebTerminalInputOutcome => {
       if (this.disposed || this.wire.dirty || epoch !== this.epoch || !this.deps.isCurrent(target)) return 'refused';
-      if (this.wire.inPaste) {
+      const followsOwnQueuedEnd = this.wire.outstanding && this.wire.owner === this.identity
+        && !this.wire.acceptedWriter.inPaste && !this.wire.acceptedWriter.pastePrefixPending;
+      if (this.wire.inPaste && !followsOwnQueuedEnd) {
         this.markUncertain(target); this.reset(); return 'refused';
       }
       try {
@@ -176,7 +218,9 @@ export class WebTerminalInputController<Target> {
       } catch { return 'failed'; }
     };
     const wire = this.wire;
-    if (!(wire.inPaste || (wire.pending && wire.pendingUsers > 0))) {
+    const followsOwnQueuedEnd = wire.outstanding && wire.owner === this.identity
+      && !wire.acceptedWriter.inPaste && !wire.acceptedWriter.pastePrefixPending;
+    if (followsOwnQueuedEnd || !(wire.inPaste || wire.outstanding || (wire.pending && wire.pendingUsers > 0))) {
       return Promise.resolve(this.inTarget(target, run));
     }
     const bytes = Buffer.byteLength(input.data, 'utf8');
@@ -187,8 +231,10 @@ export class WebTerminalInputController<Target> {
     this.protocolCount++; this.protocolBytes += bytes; this.syncHold();
     // Only replies which would cross an unfinished writer sequence wait.
     // Ordinary replies still bypass cancellation; this path does not cancel.
-    const wait = wire.inPaste ? wire.waitForPasteEnd() : wire.tail.then(() => true, () => true);
-    const result = wait.then(ok => ok ? this.inTarget(target, run) : 'refused' as const)
+    const wait = wire.outstanding && wire.owner === this.identity
+      ? wire.waitForAcceptedPasteEnd()
+      : wire.inPaste || wire.outstanding ? wire.waitForPasteEnd() : wire.tail.then(() => true, () => true);
+    const result = this.waitForWire(wait).then(ok => ok ? this.inTarget(target, run) : 'refused' as const)
       .finally(() => {
         if (epoch === this.epoch) {
           this.protocolCount--; this.protocolBytes -= bytes; this.syncHold();
@@ -216,17 +262,24 @@ export class WebTerminalInputController<Target> {
     const owns = () => !this.disposed && !wire.dirty && epoch === this.epoch && this.deps.isCurrent(target);
     const run = () => this.inTarget(target, async (): Promise<WebTerminalInputOutcome> => {
       let attemptedWrite = false;
-      const refuse = () => {
+      const refuse = (uncertainWrite = false) => {
         if (epoch !== this.epoch) return;
-        if ((wire.pending && wire.lastWriter === this.identity)
-          || (attemptedWrite && input.pasteRelated)) this.markUncertain(target);
+        if ((wire.physicalPastePending && wire.owner === this.identity)
+          || (uncertainWrite && attemptedWrite && input.pasteRelated)) this.markUncertain(target);
         this.reset();
       };
       try {
         if (!owns()) { refuse(); return 'refused'; }
         // Another connection must not inject a user batch into the paste
         // currently owned by this wire's writer.
-        if (wire.inPaste && wire.owner !== this.identity) { this.reset(); return 'refused'; }
+        if (wire.physicalPastePending && wire.owner !== this.identity) { this.reset(); return 'refused'; }
+        // Accepted pre-attach data owns its ordering barrier until replay or
+        // explicit discard, even if a complete paste has already been parsed.
+        if (wire.outstanding && wire.owner !== this.identity) {
+          // Never hold the user tail while waiting for a different owner:
+          // that owner may still need the tail to accept its paste END.
+          refuse(); return 'refused';
+        }
         if (!await this.deps.beforeUserInput(target)) {
           refuse();
           return 'refused';
@@ -250,7 +303,7 @@ export class WebTerminalInputController<Target> {
         if (written !== 'queued') wire.written(input.data, this.identity);
         return 'forwarded';
       } catch {
-        refuse();
+        refuse(true);
         return 'failed';
       }
       finally {
@@ -260,11 +313,24 @@ export class WebTerminalInputController<Target> {
         }
       }
     });
-    const result = wire.tail.then(run, run);
-    wire.tail = result;
-    return result;
+    const enqueue = () => {
+      const result = wire.tail.then(run, run);
+      wire.tail = result;
+      return result;
+    };
+    if (wire.outstanding && wire.owner !== this.identity) {
+      return this.waitForWire(wire.waitForPasteEnd()).then(ok => ok ? enqueue() : run());
+    }
+    return enqueue();
   }
 
+  private waitForWire(wait: Promise<boolean>): Promise<boolean> {
+    return new Promise(resolve => {
+      const finish = (ok: boolean) => { this.waits.delete(finish); resolve(ok); };
+      this.waits.add(finish);
+      void wait.then(finish, () => finish(false));
+    });
+  }
   private inTarget<T>(target: Target, run: () => T): T { return this.deps.runInTarget ? this.deps.runInTarget(target, run) : run(); }
   private now(): number { return this.deps.now?.() ?? Date.now(); }
   private syncHold(): void {
@@ -306,12 +372,14 @@ export class WebTerminalInputController<Target> {
   }
   private reset(): void {
     const target = this.target, wasHeld = this.held;
-    if (!this.wireDirty && target !== undefined && this.wire.inPaste
+    if (!this.wireDirty && target !== undefined && this.wire.physicalPastePending
       && this.wire.owner === this.identity) this.markUncertain(target);
+    this.wire.discard(this.identity);
     this.clearTimer(); this.epoch++;
     this.classifier.reset(); this.userCount = 0; this.userBytes = 0;
     this.protocolCount = 0; this.protocolBytes = 0;
     this.held = false; this.target = undefined;
+    for (const finish of this.waits) finish(false);
     if (wasHeld && target !== undefined
       && (!this.wireDirty || !this.deps.isCurrent(target))) this.deps.onPendingChange?.(target, false);
   }

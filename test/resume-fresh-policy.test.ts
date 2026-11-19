@@ -60,8 +60,8 @@ describe('resumeStartsFresh', () => {
       expect(findTraexSessionIdByBotmuxSessionId(session.sessionId)).toBe('native-thread-owned');
       expect(resumeStartsFresh(session)).toBe(false);
       expect(resumeStartsFresh({ ...session, sessionId: 'unmapped-route' })).toBe(true);
-      expect(resumeSuccessMessage(session as Session)).toBe(
-        resumeSuccessMessage({ ...session, cliSessionId: 'native-thread-owned' } as Session),
+      expect(resumeSuccessMessage({ ds: { session } }, 'TraeX', 'zh')).toBe(
+        resumeSuccessMessage({ ds: { session: { ...session, cliSessionId: 'native-thread-owned' } } }, 'TraeX', 'zh'),
       );
     } finally {
       if (previous === undefined) delete process.env.TRAE_HOME;

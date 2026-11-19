@@ -1,4 +1,5 @@
 import { createCliAdapterSync, resolveEffectiveCliId } from '../adapters/cli/registry.js';
+import { resolveTraexResumeSessionId } from './traex-transcript.js';
 
 /**
  * The session fields that decide whether a resume lands on the same CLI-native
@@ -33,8 +34,11 @@ export interface ResumeFreshSession {
 export function resumeStartsFresh(session: ResumeFreshSession): boolean {
   if (!session.cliId || session.cliSessionId) return false;
   try {
-    const adapter = createCliAdapterSync(resolveEffectiveCliId(session.cliId, session.dshRuntime));
-    if (adapter.resumeRequiresCliSessionId === true) return true;
+    const cliId = resolveEffectiveCliId(session.cliId, session.dshRuntime);
+    const adapter = createCliAdapterSync(cliId);
+    if (adapter.resumeRequiresCliSessionId === true) {
+      return !(cliId === 'traex' && resolveTraexResumeSessionId(session.sessionId, session.cliSessionId));
+    }
     // The adapter finds its own session (Kimi): the same probe the
     // worker runs before resuming decides, so the copy matches the launch.
     if (adapter.resumeFindsOwnSession === true && session.sessionId) {

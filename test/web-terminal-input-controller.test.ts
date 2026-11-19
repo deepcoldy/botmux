@@ -101,6 +101,82 @@ function fixture(options: { maxUserBytes?: number; maxUserMessages?: number; car
 }
 
 describe('WebTerminalInputController', () => {
+  it('preserves a physically written paste prefix across a slow continuation admission', async () => {
+    let now = 1000;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const shared = { target: { backend: {}, lifetime: 1, generation: 1, binding: {}, transport: {} },
+      wire: new WebTerminalInputWireState() };
+    const f = fixture({}, shared);
+    try {
+      await f.controller.accept('\x1b[20', { forceUser: true });
+      await f.tick(1);
+      const admission = deferred<boolean>();
+      f.before(() => admission.promise);
+      const continuation = f.controller.accept('0~body');
+      await drain();
+      now += 1000;
+      admission.resolve(true);
+      expect(await continuation).toBe('forwarded');
+      expect(f.writes).toEqual(['\x1b[20', '0~body']);
+      expect(shared.wire.writer.inPaste).toBe(true);
+      expect(shared.wire.owner).toBe(f.writeCalls[0]!.owner);
+      f.before(async () => true);
+      await f.controller.accept('\x1b[201~');
+      expect(shared.wire.writer.inPaste).toBe(false);
+      expect(shared.wire.dirty).toBe(false);
+    } finally {
+      f.controller.dispose(); clock.mockRestore();
+    }
+  });
+  it('lets the queued paste owner accept its END while another user waits for replay', async () => {
+    const shared = { target: { backend: {}, lifetime: 1, generation: 1, binding: {}, transport: {} },
+      wire: new WebTerminalInputWireState() };
+    const a = fixture({}, shared), b = fixture({}, shared);
+    const queue: Array<{ data: string; owner: symbol }> = [];
+    const physical: string[] = [];
+    a.write((data, owner) => { queue.push({ data, owner }); return 'queued'; });
+    b.write(data => { physical.push(data); return true; });
+    try {
+      await a.controller.accept('\x1b[200~first');
+      const second = b.controller.accept('second');
+      await drain();
+      let endAccepted = false;
+      const end = a.controller.accept('\x1b[201~').then(result => { endAccepted = true; return result; });
+      await drain();
+      expect(endAccepted).toBe(true);
+      expect(await end).toBe('forwarded');
+      expect(physical).toEqual([]);
+      for (const input of queue) {
+        physical.push(input.data);
+        shared.wire.written(input.data, input.owner);
+      }
+      expect(await second).toBe('forwarded');
+      expect(physical).toEqual(['\x1b[200~first', '\x1b[201~', 'second']);
+    } finally {
+      a.controller.dispose(); b.controller.dispose();
+    }
+  });
+  it.each(['second', REPLY])('retires a disposed peer waiting for queued replay: %j', async next => {
+    const shared = { target: { backend: {}, lifetime: 1, generation: 1, binding: {}, transport: {} },
+      wire: new WebTerminalInputWireState() };
+    const a = fixture({}, shared), b = fixture({}, shared);
+    const queue: Array<{ data: string; owner: symbol }> = [];
+    a.write((data, owner) => { queue.push({ data, owner }); return 'queued'; });
+    try {
+      await a.controller.accept('\x1b[200~first\x1b[201~');
+      const waiting = b.controller.accept(next);
+      await drain();
+      b.controller.dispose();
+      expect(await waiting).toBe('refused');
+      expect(b.writes).toEqual([]);
+      expect(shared.wire.dirty).toBe(false);
+      expect(queue).toHaveLength(1);
+      shared.wire.written(queue[0]!.data, queue[0]!.owner);
+      expect(shared.wire.owner).toBeUndefined();
+    } finally {
+      a.controller.dispose(); b.controller.dispose();
+    }
+  });
   it.each([
     { inputName: 'user input', next: 'second' },
     { inputName: 'neutral reply', next: REPLY },

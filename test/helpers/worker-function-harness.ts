@@ -57,6 +57,7 @@ const TRAEX_QUESTION_FUNCTIONS = [
   'traexQuestionBridgeActive', 'traexQuestionBlockReported', 'traexQuestionHoldBlocks',
   'traexQuestionHoldsHeldInput', 'notifyTraexQuestionInputHeld', 'traexQuestionHoldsIdle',
   'traexQuestionHoldsQueuedWrite', 'traexQuestionCapture',
+  'traexQuestionSubmitGuard',
 ];
 /** Inert stand-in for the worker's TraexQuestionBridge instance (a const, not
  *  a function); a caller that observes it passes its own in `scope`. */

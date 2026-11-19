@@ -307,7 +307,12 @@ process.send?.({ type: 'worker_ipc_ready' });
   async function waitFor(predicate: () => boolean, description: string, timeoutMs = 12_000): Promise<void> {
     const until = Date.now() + timeoutMs;
     while (!predicate()) {
-      if (Date.now() >= until || child?.exitCode != null) throw new Error(`${description}\n${logs.join('')}`);
+      if (Date.now() >= until || child?.exitCode != null) {
+        const received = existsSync(inputFile) ? readFileSync(inputFile, 'utf8').slice(-4096) : '';
+        const events = messages.map(message => ({ type: message.type,
+          ...('reason' in message ? { reason: message.reason } : {}) }));
+        throw new Error(`${description}\n${logs.join('')}\nreceived=${JSON.stringify(received)}\nevents=${JSON.stringify(events)}`);
+      }
       await new Promise(resolveWait => setTimeout(resolveWait, 25));
     }
   }

@@ -103,6 +103,7 @@ function workerFence() {
   Object.assign(h.scope, {
     traexNativeStartupInputPending: true,
     traexFirstInputAdmissionPending: true,
+    traexFirstPromptDeadlineAt: Date.now() + 90_000,
     traexStartupRendererWebInputGeneration: -1,
     backendScreenRevision: 0, webTerminalInputBackendScreenRevision: 0,
     READY_FLUSH_SETTLE_MS: 1_000,

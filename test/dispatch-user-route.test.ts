@@ -104,6 +104,9 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // This fixture exercises lifecycle/delegation, not a live process tree.
     // Root refresh and publication are covered by worker-codex-execution-root.
     currentCodexObservedPid: vi.fn(),
+    // No sandboxed launch payload or live process-tree attestor in this rig.
+    // Match the real worker's unarmed optional callback; retain delegation gates.
+    refreshSandboxedCliLeafAttestation: undefined,
     stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
     // markPromptReady's busy-deferral bookkeeping (worker.ts module-level
     // symbols in the real process): this fixture asserts lifecycle/release
