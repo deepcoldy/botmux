@@ -1134,6 +1134,10 @@ type WorkerStartupState = {
    *  gate as a structured error, not reply out-of-band. */
   initTurnId?: string;
   initDispatchAttempt?: number;
+  /** Only the background-restored opening with this exact activation token is
+   * owner-only. A later user-driven tail on the same worker must still deliver
+   * its own deferred Mojo notice when its adapter ACK arrives. */
+  ownerOnlyActivationToken?: string;
 };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -13981,6 +13985,10 @@ type TransferInputGate = {
 };
 
 const transferInputGates = new WeakMap<DaemonSession, TransferInputGate>();
+// Delivery-boundary callbacks are daemon-local metadata, not part of the frozen
+// IPC payload. Keying by the buffered object preserves byte-for-byte replay and
+// lets the callback follow the message until its replacement-worker boundary.
+const transferInputDispatchCallbacks = new WeakMap<TransferBufferedInput, () => void>();
 // Only this module can mark the synchronous replacement fork. External callers
 // cannot forge an option that bypasses the transfer gate.
 const transferReplacementForkBypass = new WeakSet<DaemonSession>();
@@ -14710,7 +14718,10 @@ export function sendWorkerSessionInput(
     ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
     : message;
   const annotated = withTurnCaller(ds, scoped);
-  if (bufferTransferInput(ds, annotated)) return true;
+  if (bufferTransferInput(ds, annotated)) {
+    if (onIpcDispatched) transferInputDispatchCallbacks.set(annotated, onIpcDispatched);
+    return true;
+  }
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
   return afterWorkerIpcBootstrap(worker, () => {
@@ -15116,6 +15127,7 @@ function releaseTransferInputGate(
     }
     while (gate.messages.length > 0) {
       const message = gate.messages[0];
+      const onIpcDispatched = transferInputDispatchCallbacks.get(message);
       try {
         if (
           message.type === 'message'
@@ -15125,11 +15137,16 @@ function releaseTransferInputGate(
           // generation exists, ordinary IM delivery returns to the same exact
           // receipt protocol as steady-state input. The watchdog remains valid
           // after the gate itself settles.
-          if (!sendOrdinaryImDeliveryTracked(ds, message)) {
+          if (!sendOrdinaryImDeliveryTracked(ds, message, undefined, onIpcDispatched)) {
             throw new Error('replacement worker rejected tracked IM delivery');
           }
         } else {
-          if (!afterWorkerIpcBootstrap(worker, () => worker.send(message))) {
+          if (!afterWorkerIpcBootstrap(worker, () => {
+            const sent = worker.send(message);
+            if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) {
+              onIpcDispatched();
+            }
+          })) {
             throw new Error('replacement worker IPC bootstrap is unavailable');
           }
         }
@@ -17117,7 +17134,9 @@ export function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: Moj
  * chat channel.
  */
 /** Sessions with a quarantine notice send in flight, so it cannot double-post. */
+type MojoNoticeRetryTurn = { turnId: string; dispatchAttempt?: number };
 const mojoQuarantineNoticeInFlight = new Set<string>();
+const mojoQuarantineNoticeRetryTurns = new Map<string, MojoNoticeRetryTurn>();
 
 /**
  * Auxiliary-UI suppression policy for the **mojo quarantine notice** path.
@@ -17226,8 +17245,14 @@ function deliverPendingMojoQuarantineNotice(
   if (!turnId) return; // Blank restoration must preserve the pending receipt.
   if (ds.session.mojoQuarantineNoticePending !== true) return;
   // In-flight guard: two turns can be accepted before the first sessionReply
-  // resolves, which would post the notice twice.
-  if (mojoQuarantineNoticeInFlight.has(ds.session.sessionId)) return;
+  // resolves. Coalesce them and retain the latest authorized attribution so a
+  // failed in-flight reply still gets the promised retry on a later turn.
+  if (mojoQuarantineNoticeInFlight.has(ds.session.sessionId)) {
+    if (!auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+      mojoQuarantineNoticeRetryTurns.set(ds.session.sessionId, { turnId, dispatchAttempt });
+    }
+    return;
+  }
   const lineage = ds.session.mojoQuarantinedLineage;
   const noticeSession = ds.session;
   const noticeSessionId = noticeSession.sessionId;
@@ -17263,6 +17288,7 @@ function deliverPendingMojoQuarantineNotice(
   }
   mojoQuarantineNoticeInFlight.add(noticeSessionId);
   const message = tr('worker.mojo_lineage_quarantined', { lineage }, botLocale(botCfg));
+  let noticeReplyDelivered = false;
   void callbacks?.sessionReply(
     sessionAnchorId(ds),
     message,
@@ -17271,15 +17297,39 @@ function deliverPendingMojoQuarantineNotice(
     // The turn that actually carried this delivery, not a stale reply target.
     turnId,
     { sourceSessionId: ds.session.sessionId },
-  ).then(markDelivered).catch((err) => {
+  ).then(() => {
+    noticeReplyDelivered = true;
+    // The notice is already delivered. A failed marker update may re-send once
+    // after a restart, but must not be logged as a Lark delivery failure.
+    try {
+      markDelivered();
+    } catch (err) {
+      logger.warn(
+        `[${tag(ds)}] mojo quarantine notice delivered but the delivered marker could not be `
+        + `persisted (may re-send once after a restart): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }).catch((err) => {
     // Flag intentionally left set: the next turn retries.
     logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
   }).finally(() => {
     mojoQuarantineNoticeInFlight.delete(noticeSessionId);
+    const retryTurn = mojoQuarantineNoticeRetryTurns.get(noticeSessionId);
+    mojoQuarantineNoticeRetryTurns.delete(noticeSessionId);
+    // Only a failed Lark reply drains a coalesced turn. A successful reply whose
+    // marker write failed remains pending for the next natural input, not an
+    // immediate duplicate send on the same turn.
+    if (!noticeReplyDelivered && retryTurn && canForkRegisteredSession(ds)
+      && ds.session === noticeSession && noticeSession.workerGeneration === noticeGeneration
+      && (noticeSession.mojoQuarantinedLineage ?? '') === lineage
+      && noticeSession.mojoQuarantineNoticePending === true) {
+      deliverPendingMojoQuarantineNotice(ds, retryTurn.turnId, retryTurn.dispatchAttempt);
+    }
   });
 }
 
 const mojoLegacyPinNoticeInFlight = new Set<string>();
+const mojoLegacyPinNoticeRetryTurns = new Map<string, MojoNoticeRetryTurn>();
 
 /** In-chat twin of the sessionMojoConfig legacy pin's daemon-log warn: without
  *  it the user keeps retrying a session whose tools and replies silently fail
@@ -17298,7 +17348,12 @@ function deliverPendingMojoLegacyPinNotice(
   const noticeIdentity = (row: DaemonSession['session']): string =>
     JSON.stringify([row.mojoIdentity ?? null, row.mojoIdentityHostDefault ?? null]);
   const expectedIdentity = noticeIdentity(noticeSession);
-  if (mojoLegacyPinNoticeInFlight.has(ds.session.sessionId)) return;
+  if (mojoLegacyPinNoticeInFlight.has(ds.session.sessionId)) {
+    if (!auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+      mojoLegacyPinNoticeRetryTurns.set(ds.session.sessionId, { turnId, dispatchAttempt });
+    }
+    return;
+  }
   let botCfg;
   try {
     botCfg = getBot(ds.larkAppId).config;
@@ -17314,6 +17369,7 @@ function deliverPendingMojoLegacyPinNotice(
   }
   mojoLegacyPinNoticeInFlight.add(noticeSessionId);
   const message = tr('worker.mojo_legacy_pinned', {}, botLocale(botCfg));
+  let noticeReplyDelivered = false;
   void callbacks?.sessionReply(
     sessionAnchorId(ds),
     message,
@@ -17322,6 +17378,7 @@ function deliverPendingMojoLegacyPinNotice(
     turnId,
     { sourceSessionId: ds.session.sessionId },
   ).then(() => {
+    noticeReplyDelivered = true;
     // Best-effort, same as the queueing side (review N2): the notice IS
     // delivered at this point — a failed persist only risks one duplicate
     // send after a restart, and must not surface as a delivery failure.
@@ -17339,6 +17396,14 @@ function deliverPendingMojoLegacyPinNotice(
     logger.warn(`[${tag(ds)}] failed to deliver mojo legacy-pin notice (will retry): ${err}`);
   }).finally(() => {
     mojoLegacyPinNoticeInFlight.delete(noticeSessionId);
+    const retryTurn = mojoLegacyPinNoticeRetryTurns.get(noticeSessionId);
+    mojoLegacyPinNoticeRetryTurns.delete(noticeSessionId);
+    if (!noticeReplyDelivered && retryTurn && canForkRegisteredSession(ds)
+      && ds.session === noticeSession && noticeSession.workerGeneration === noticeGeneration
+      && noticeIdentity(noticeSession) === expectedIdentity
+      && noticeSession.mojoLegacyPinNoticePending === true) {
+      deliverPendingMojoLegacyPinNotice(ds, retryTurn.turnId, retryTurn.dispatchAttempt);
+    }
   });
 }
 
@@ -19231,6 +19296,8 @@ function forkWorkerPrepared(
     ready: false, failureNotified: false,
     initTurnId: initAttributionTurnId,
     initDispatchAttempt,
+    ownerOnlyActivationToken: opts.memoryNoticeAudience === 'owner-only'
+      ? ds.session.queuedActivationToken : undefined,
     onPreReadyExit: opts.onPreReadyExit,
     onRemoteBackendStartupExit: opts.onRemoteBackendStartupExit,
   };
@@ -19274,7 +19341,7 @@ function forkWorkerPrepared(
       message: reason,
     });
     publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, botCfg), reason,
-      initTurnId, initDispatchAttempt, opts);
+      initAttributionTurnId, initDispatchAttempt, opts);
   });
 
   // Pipe worker stdout/stderr to daemon logger.
@@ -19691,7 +19758,7 @@ function forkWorkerPrepared(
   }
   if (shouldTrackOrdinaryImDelivery(ds, initMsg)) {
     if (sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted, () =>
-      deliverMojoNoticesForAcceptedInput(ds, prompt, initTurnId, initDispatchAttempt,
+      deliverMojoNoticesForAcceptedInput(ds, prompt, initAttributionTurnId, initDispatchAttempt,
         opts.memoryNoticeAudience === 'owner-only'))) {
       commitAcceptedInputTitle(ds, initTitlePlan);
     }
@@ -19702,7 +19769,7 @@ function forkWorkerPrepared(
       if (!continuationStillAllowed()) delete initMsg.deploymentContinuation;
       onIpcDispatchAttempted?.();
       const sent = worker.send(initMsg);
-      if (sent !== false && ds.worker === worker) deliverMojoNoticesForAcceptedInput(ds, prompt, initTurnId,
+      if (sent !== false && ds.worker === worker) deliverMojoNoticesForAcceptedInput(ds, prompt, initAttributionTurnId,
         initDispatchAttempt, opts.memoryNoticeAudience === 'owner-only');
       commitAcceptedInputTitle(ds, initTitlePlan);
     });
@@ -21500,6 +21567,14 @@ function setupWorkerHandlers(
             const timer = setTimeout(() => { void persistActivationAck(attempt + 1); }, delayMs);
             timer.unref?.();
             return;
+          }
+          // The adapter ACK is the exact acceptance boundary for both an opening
+          // and a promoted activation tail. Its snapshot survives journal cleanup,
+          // so a deferred Mojo notice follows the input that was actually accepted.
+          if (journal.queuedActivationInput) {
+            deliverMojoNoticesForAcceptedInput(ds, journal.queuedActivationInput.content,
+              journal.queuedActivationTurnId, journal.queuedActivationDispatchAttempt,
+              startupState.ownerOnlyActivationToken === msg.activationToken);
           }
           // Crossing the adapter boundary means this session now owns CLI
           // history even if the worker dies before it can publish a session id.
@@ -28234,7 +28309,11 @@ export function forkAdoptWorker(
     } as NodeJS.ProcessEnv,
   });
   serveProtectedMcpSecrets(worker, protectedMcpProvisioning.secrets);
-  const startupState: WorkerStartupState = { ready: false, failureNotified: false };
+  const startupState: WorkerStartupState = {
+    ready: false, failureNotified: false,
+    ownerOnlyActivationToken: opts?.restoredFromMetadata
+      ? ds.session.queuedActivationToken : undefined,
+  };
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   let initMsg!: DaemonToWorker;
   const previousInitConfig = ds.initConfig;
@@ -28253,7 +28332,9 @@ export function forkAdoptWorker(
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
       reason: 'worker_fork_error', message: reason,
     });
-    publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, botCfg), reason, opts?.turnId,
+    const failureTurnId = opts?.turnId
+      ?? (opts?.restoredFromMetadata ? undefined : fallbackTurnId(ds, undefined));
+    publishWorkerStartupDiagnostic(ds, sessionCliDisplayName(ds, botCfg), reason, failureTurnId,
       undefined, opts?.restoredFromMetadata ? { memoryNoticeAudience: 'owner-only' } : {});
   });
 

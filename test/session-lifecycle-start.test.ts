@@ -272,6 +272,7 @@ const loadScheduledTaskForIdentity = (_larkAppId: string, taskId: string) =>
 import { armSilentScheduledTurn, isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import {
   __testOnly_resetOrdinaryImDeliveries,
+  __testOnly_setupWorkerHandlers,
   adoptSandboxBlocked,
   auxUiSuppressedFor,
   detachWorkerForTransfer,
@@ -334,6 +335,7 @@ import { readWorkerProcessStart } from '../src/core/session-worker-identity.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { getBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { logger } from '../src/utils/logger.js';
 import { botLocale, t as tr } from '../src/i18n/index.js';
 import { invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-config.js';
 import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
@@ -6515,6 +6517,32 @@ describe('Codex App clean-input feature gate', () => {
     });
   });
 
+  it('delivers a pending Mojo notice at the promoted activation adapter ACK', async () => {
+    const sessionReply = vi.fn(async () => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, initialStartPending: true } as any);
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationInput = { content: 'opening' };
+    ds.session.mojoQuarantineNoticePending = true;
+    ds.session.mojoQuarantinedLineage = 'prior-lineage';
+    expect(sendWorkerInput(ds, 'follow', 'om_activation_tail')).toBe(true);
+    ds.session.queuedActivationPending = false;
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.mojoQuarantineNoticePending).toBe(true);
+
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', {
+      type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+      activationToken: ds.session.queuedActivationToken,
+    });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(ds.session.mojoQuarantineNoticePending).toBe(false));
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('om_activation_tail');
+  });
+
   it('R5-B1-2: a missing/false steer authorization stays forced-serial through the same copy chain', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
     const ds = makeDs({ worker: makeFakeWorker(), initialStartPending: true } as any);
@@ -9683,6 +9711,199 @@ describe('owner diagnostics and accepted-input session notices', () => {
     ds.session.mojoQuarantinedLineage = 'prior-lineage';
   }
 
+  it.each([undefined, 1])('uses pending-repo attribution for a cold Mojo notice (attempt=%s)', async dispatchAttempt => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true });
+    ds.session.queued = true;
+    ds.session.pendingRepoSetup = { mode: 'picker', linkRefMode: 'disabled', prompt: 'stored opening',
+      turnId: 'om_pending_repo' };
+    pendingMojo(ds);
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    forkWorker(ds, 'new input', {
+      resume: true,
+      ...(dispatchAttempt === undefined ? {} : { dispatchAttempt }),
+    });
+    const worker = ds.worker as any;
+    if (dispatchAttempt === undefined) {
+      expect(sessionReply).not.toHaveBeenCalled();
+      worker.emit('message', { type: 'turn_input_received', turnId: 'om_pending_repo' });
+    }
+    await Promise.resolve(); await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('om_pending_repo');
+    expect(ds.session.mojoQuarantineNoticePending).toBe(false);
+  });
+
+  it('keeps a background opening ACK owner-only but delivers a later user tail ACK', async () => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true });
+    ds.session.queued = true;
+    ds.session.pendingRepoSetup = { mode: 'picker', linkRefMode: 'disabled', prompt: 'stored opening',
+      turnId: 'om_historical_opening' };
+    pendingMojo(ds);
+    forkWorker(ds, 'historical input', { resume: true, turnId: 'om_historical_opening' },
+      { memoryNoticeAudience: 'owner-only' });
+    const worker = ds.worker as any;
+    const openingToken = ds.session.queuedActivationToken;
+    expect(openingToken).toEqual(expect.any(String));
+    expect(sendWorkerInput(ds, 'user follow-up', 'om_user_tail')).toBe(true);
+
+    worker.emit('message', {
+      type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+      activationToken: openingToken,
+    });
+    await vi.waitFor(() => expect(ds.session.queuedActivationPending).toBeUndefined());
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.session.mojoQuarantineNoticePending).toBe(true);
+
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+    const tailToken = ds.session.queuedActivationToken;
+    expect(tailToken).not.toBe(openingToken);
+    worker.emit('message', {
+      type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+      activationToken: tailToken,
+    });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(ds.session.mojoQuarantineNoticePending).toBe(false));
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('om_user_tail');
+  });
+
+  it.each(['quarantine', 'legacy'] as const)('retries a failed %s notice on a coalesced accepted tail', async kind => {
+    let rejectFirst!: (error: Error) => void;
+    const firstReply = new Promise<string>((_resolve, reject) => { rejectFirst = reject; });
+    const sessionReply = vi.fn();
+    sessionReply.mockImplementationOnce(() => firstReply);
+    sessionReply.mockImplementation(async () => 'om_notice_retry');
+    initWorkerPool({
+      sessionReply,
+      onQueuedActivationSubmitted: async ds => {
+        if (ds.session.queuedActivationTail?.length) return promoteQueuedActivationTail(ds);
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+        return true;
+      },
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, initialStartPending: true } as any);
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: 'opening-token',
+      queuedActivationInput: { content: 'background opening' },
+      queuedActivationTurnId: 'om_background',
+    });
+    if (kind === 'quarantine') pendingMojo(ds);
+    else {
+      ds.session.mojoLegacyPinNoticePending = true;
+      ds.session.mojoIdentityHostDefault = false;
+    }
+    __testOnly_setupWorkerHandlers(ds, worker, {
+      ready: false, failureNotified: false, ownerOnlyActivationToken: 'opening-token',
+    });
+    expect(sendWorkerInput(ds, 'first user tail', 'om_first_tail')).toBe(true);
+    worker.emit('message', {
+      type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+      activationToken: 'opening-token',
+    });
+    await vi.waitFor(() => expect(ds.session.queuedActivationTurnId).toBe('om_first_tail'));
+    const firstTailToken = ds.session.queuedActivationToken!;
+    expect(sendWorkerInput(ds, 'second user tail', 'om_second_tail')).toBe(true);
+    worker.emit('message', {
+      type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+      activationToken: firstTailToken,
+    });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(ds.session.queuedActivationTurnId).toBe('om_second_tail'));
+    const secondTailToken = ds.session.queuedActivationToken!;
+    worker.emit('message', {
+      type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+      activationToken: secondTailToken,
+    });
+    await vi.waitFor(() => expect(ds.session.queuedActivationPending).toBeUndefined());
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    rejectFirst(new Error('controlled Lark failure'));
+    const flag = kind === 'quarantine' ? 'mojoQuarantineNoticePending' : 'mojoLegacyPinNoticePending';
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(ds.session[flag]).toBe(false));
+    expect(sessionReply.mock.calls[1]?.[4]).toBe('om_second_tail');
+    expect(sendWorkerInput(ds, 'third user input', 'turn_third')).toBe(true);
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not drain a coalesced turn when only the delivered marker update fails', async () => {
+    let resolveFirst!: (id: string) => void;
+    const firstReply = new Promise<string>(resolve => { resolveFirst = resolve; });
+    const sessionReply = vi.fn();
+    sessionReply.mockImplementationOnce(() => firstReply);
+    sessionReply.mockImplementation(async () => 'om_notice_retry');
+    initWorkerPool({
+      sessionReply,
+      onQueuedActivationSubmitted: async ds => {
+        if (ds.session.queuedActivationTail?.length) return promoteQueuedActivationTail(ds);
+        ds.initialStartPending = false;
+        ds.initialStartClaimToken = undefined;
+        return true;
+      },
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, initialStartPending: true } as any);
+    Object.assign(ds.session, {
+      queuedActivationPending: true,
+      queuedActivationToken: 'opening-token',
+      queuedActivationInput: { content: 'background opening' },
+      queuedActivationTurnId: 'om_background',
+    });
+    pendingMojo(ds);
+    __testOnly_setupWorkerHandlers(ds, worker, {
+      ready: false, failureNotified: false, ownerOnlyActivationToken: 'opening-token',
+    });
+    expect(sendWorkerInput(ds, 'first user tail', 'om_first_tail')).toBe(true);
+    worker.emit('message', {
+      type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+      activationToken: 'opening-token',
+    });
+    await vi.waitFor(() => expect(ds.session.queuedActivationTurnId).toBe('om_first_tail'));
+    const firstTailToken = ds.session.queuedActivationToken!;
+    expect(sendWorkerInput(ds, 'second user tail', 'om_second_tail')).toBe(true);
+    worker.emit('message', {
+      type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+      activationToken: firstTailToken,
+    });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(ds.session.queuedActivationTurnId).toBe('om_second_tail'));
+    const secondTailToken = ds.session.queuedActivationToken!;
+    worker.emit('message', {
+      type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+      activationToken: secondTailToken,
+    });
+    await vi.waitFor(() => expect(ds.session.queuedActivationPending).toBeUndefined());
+
+    vi.mocked(sessionStore.mutateOwnedSessionsAtomically).mockImplementationOnce(() => {
+      throw new Error('database is locked');
+    });
+    resolveFirst('om_notice');
+    await vi.waitFor(() => expect(vi.mocked(logger.warn).mock.calls.flat().join('\n')).toContain(
+      'database is locked',
+    ));
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.session.mojoQuarantineNoticePending).toBe(true);
+    expect(sendWorkerInput(ds, 'third user input', 'turn_third')).toBe(true);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(ds.session.mojoQuarantineNoticePending).toBe(false));
+    expect(sessionReply.mock.calls[1]?.[4]).toBe('turn_third');
+  });
+
   it.each([undefined, 1])('waits through cold IPC bootstrap before consuming the notice (attempt=%s)', async dispatchAttempt => {
     vi.useFakeTimers();
     standaloneBinaryMock.mockReturnValue(true);
@@ -9783,6 +10004,27 @@ describe('owner diagnostics and accepted-input session notices', () => {
     expect(sendWorkerInput(ds, 'later input', 'turn_later')).toBe(true);
     await Promise.resolve();
     expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('distinguishes a delivered quarantine notice from a marker persistence failure', async () => {
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ hasHistory: true }); pendingMojo(ds);
+    forkWorker(ds, '', true, { memoryNoticeAudience: 'owner-only' });
+    ds.workerReady = true;
+    vi.mocked(sessionStore.mutateOwnedSessionsAtomically).mockImplementationOnce(() => {
+      throw new Error('database is locked');
+    });
+    expect(sendWorkerInput(ds, 'new input', 'turn_new')).toBe(true);
+    await vi.waitFor(() => expect(vi.mocked(logger.warn).mock.calls.flat().join('\n')).toContain(
+      'database is locked',
+    ));
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.session.mojoQuarantineNoticePending).toBe(true);
+    expect(vi.mocked(logger.warn).mock.calls.flat().join('\n')).not.toContain(
+      'failed to deliver mojo quarantine notice',
+    );
   });
 
   it('keeps the Mojo notice pending when a hot input is rejected by IPC', async () => {
@@ -10261,6 +10503,41 @@ describe('worker startup failure delivery', () => {
       reason: 'worker_fork_error',
       message: 'adopt fork ENOENT',
     }));
+  });
+
+  it('reports an interactive adopt fork failure to the current reply target without an explicit turn', async () => {
+    const onOwnerDiagnostic = vi.fn();
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({ sessionReply, onOwnerDiagnostic, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({
+      currentReplyTarget: { rootMessageId: 'om_root', turnId: 'om_adopt_command', updatedAt: new Date().toISOString() },
+      adoptedFrom: { tmuxTarget: 'bmx-deadbeef:0.0', originalCliPid: 23456,
+        sessionId: 'codex-session', cliId: 'codex', cwd: REPO },
+    });
+    forkAdoptWorker(ds);
+    (ds.worker as any).emit('error', new Error('adopt fork ENOENT'));
+    await Promise.resolve(); await Promise.resolve();
+    expect(onOwnerDiagnostic).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('om_adopt_command');
+  });
+
+  it('reports a raw pending-repo fork failure to the persisted opening turn', async () => {
+    const onOwnerDiagnostic = vi.fn();
+    const sessionReply = vi.fn(async () => 'om_error_reply');
+    initWorkerPool({ sessionReply, onOwnerDiagnostic, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ pendingRawInput: '/compact', pendingRawTurnId: 'om_raw_opening' });
+    ds.session.queued = true;
+    ds.session.pendingRepoSetup = { mode: 'picker', linkRefMode: 'disabled', prompt: '',
+      rawInput: '/compact', turnId: 'om_raw_opening' };
+    forkWorker(ds, '', false);
+    (ds.worker as any).emit('error', new Error('raw opening ENOENT'));
+    await Promise.resolve(); await Promise.resolve();
+    expect(onOwnerDiagnostic).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('om_raw_opening');
   });
 });
 
