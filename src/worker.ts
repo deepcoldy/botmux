@@ -548,6 +548,9 @@ import {
   readCmdline,
   isNonInteractiveCodexArgv,
   isClaudeMetadataProbeArgv,
+  isConfiguredWrapperCliArgv,
+  isNativeElfExecutable,
+  isGenericLauncherExecutable,
   cliIdForComm,
   isBareShellComm,
   bareShellLaunchKind,
@@ -29406,6 +29409,7 @@ async function spawnCliBody(
   // rewrites spawnBin/spawnArgs; the sandbox builders below take it as their
   // command. Only the local pty/tmux backends run a sandbox around a local
   // command; other backends keep ignoring the wrapper under a sandbox.
+  let wrapperLaunchBin: string | undefined;
   const wrapperCliConfigured = !!cfg.wrapperCli && !!cfg.wrapperCli.trim();
   const wrapperInsideSandbox = wrapperCliConfigured && sandboxRequested
     && (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux');
@@ -30719,6 +30723,7 @@ async function spawnCliBody(
       pathDelimiter: delimiter,
     });
     if (launch.bin) {
+      wrapperLaunchBin = launch.bin;
       spawnBin = launch.bin;
       spawnArgs = launch.args;
       if (launch.env) Object.assign(childEnv as Record<string, string>, launch.env);
@@ -31597,6 +31602,38 @@ async function spawnCliBody(
     // to the leaf. Preserve that here; full sandboxes keep the outer payload.
     const rewireOwnership = credentialOnlyBwrap && !sandboxRequested
       && !!cfg.wrapperCli?.trim() && !!claudeDataDir;
+    const realCliBin = cliAdapter?.resolvedBin;
+    const nativeCliImageBin = rewireOwnership && targetCliId === 'claude-code'
+      && !!realCliBin && isNativeElfExecutable(realCliBin) ? realCliBin : undefined;
+    const isConfiguredWrapperProcess = (pid: number): boolean => {
+      if (!rewireOwnership) return false;
+      if (isConfiguredWrapperCliArgv(
+        readCmdline(pid, { exact: true }), cfg.wrapperCli, wrapperLaunchBin, realCliBin,
+      )) return true;
+      // A persistent Node wrapper can overwrite all of /proc/cmdline via
+      // process.title, leaving only "claude.exe". On native CLI installs, the
+      // kernel image still proves whether this is the real native process.
+      // Basename equality deliberately tolerates upgrades and deleted-old-inode
+      // paths; interpreted/unknown installs stay on the conservative argv path.
+      // The launch-time wrapper path is independent evidence even when the
+      // wrapper erased argv. Only a custom, non-interpreter image can match it:
+      // a scripted wrapper and a scripted real CLI can share an interpreter.
+      const runningImage = readRunningExeIdentity(pid);
+      const sameImagePath = (left: string, right: string): boolean => {
+        try { return realpathSync(left) === realpathSync(right); }
+        catch { return left === right; }
+      };
+      if (runningImage) {
+        // Preserve a direct real CLI before considering the wrapper match. The
+        // two configured paths may be the same executable (or share an
+        // interpreter), and a real root must never descend into its subagent.
+        if (realCliBin && sameImagePath(runningImage.path, realCliBin)) return false;
+        if (wrapperLaunchBin && !isGenericLauncherExecutable(wrapperLaunchBin)
+          && sameImagePath(runningImage.path, wrapperLaunchBin)) return true;
+      }
+      if (!nativeCliImageBin) return false;
+      return runningImage !== undefined && basename(runningImage.path) !== basename(nativeCliImageBin);
+    };
     const findLeaf = (lp: number): number | null => findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, {
       // One process-table snapshot per BFS, not one synchronous ps per node.
       childrenOf: snapshotChildPids(),
@@ -31605,13 +31642,18 @@ async function spawnCliBody(
         // an unreaped zombie or metadata helper must not hide a live sibling.
         if (isZombieProcess(pid)) return undefined;
         const comm = readComm(pid);
-        if (comm && targetCliId === 'claude-code'
-          && cliIdForComm(comm, targetCliId) === targetCliId
-          && isClaudeMetadataProbeArgv(readCmdline(pid, { exact: true }))) return undefined;
+        if (comm && cliIdForComm(comm, targetCliId) === targetCliId) {
+          // A persistent wrapper can rebrand its comm to the CLI name. Only
+          // skip it when its argv proves the configured wrapper identity; a
+          // wrapper that has exec'd the real CLI no longer matches that proof.
+          if (isConfiguredWrapperProcess(pid)) return undefined;
+          if (targetCliId === 'claude-code' && isClaudeMetadataProbeArgv(readCmdline(pid, { exact: true }))) return undefined;
+        }
         return comm;
       },
     });
-    const isDirectLeaf = (lp: number): boolean => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId;
+    const isDirectLeaf = (lp: number): boolean => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId
+      && !isConfiguredWrapperProcess(lp);
     let attested: { pid: number; procStart: string; published: boolean } | undefined;
     // A live, successfully published leaf is never sent twice: every actual
     // publication rotates the active turn's capability.

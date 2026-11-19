@@ -1,9 +1,11 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
+import { basename } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { runInNewContext } from 'node:vm';
 import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
 import { describe, it, expect, vi } from 'vitest';
 import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
-import { CODEX_LEAF_SEARCH_DEPTH, cliIdForComm, findLaunchedCliPid, isClaudeMetadataProbeArgv, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
+import { CODEX_LEAF_SEARCH_DEPTH, cliIdForComm, findLaunchedCliPid, isClaudeMetadataProbeArgv, isConfiguredWrapperCliArgv, isGenericLauncherExecutable, isNativeElfExecutable, isNonInteractiveCodexArgv, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 import { isProgramStatusRelayArgv } from '../src/core/program-status-relay-launch.js';
 import { unwrapBotmuxLaunchLayers } from '../src/core/launch-layers.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -79,6 +81,13 @@ function loadRealLeafFns(deps: {
 
 function runWorkerWiring(late: boolean, options: {
   cliId?: string; wrapperCli?: string; claudeDataDir?: string; sandboxRequested?: boolean; credentialOnlyBwrap?: boolean;
+  /** Actual wrapper and underlying CLI executable paths used for same-comm identity checks. */
+  wrapperBin?: string;
+  realCliBin?: string;
+  /** Kernel /proc/<pid>/exe paths for wrappers that erase argv with process.title. */
+  runningExePaths?: Record<number, string>;
+  /** Whether realCliBin has a native ELF header in this synthetic install. */
+  nativeCliImage?: boolean;
   launchedCliPid?: number | null;
   launchedCliAfterMs?: number;
   beforeTimers?: (scope: Record<string, any>) => void;
@@ -213,9 +222,13 @@ function runWorkerWiring(late: boolean, options: {
     snapshotChildPids: snapshotChildPidsMock,
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
     codexProcessIsNativeLeaf: vi.fn(realFns.codexProcessIsNativeLeaf),
-    process: { env: {} }, cliPidMarker: undefined,
+    process: { env: {} }, cliPidMarker: undefined, basename, realpathSync,
     cliAdapterBindsOwnershipPid,
-    findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid, cliIdForComm, isClaudeMetadataProbeArgv,
+    cliAdapter: { resolvedBin: options.realCliBin ?? '/opt/real/claude.exe' },
+    wrapperLaunchBin: options.wrapperBin,
+    findLaunchedCliPid: findLaunchedCliPidMock, scheduleWrapperRealCliPid, cliIdForComm, isClaudeMetadataProbeArgv, isConfiguredWrapperCliArgv,
+    isNativeElfExecutable: () => options.nativeCliImage === true,
+    isGenericLauncherExecutable,
     sessionScopePayloadPid: vi.fn((pid: number) => {
       scopeProbes++;
       return options.scopePayloadPid !== undefined
@@ -240,6 +253,10 @@ function runWorkerWiring(late: boolean, options: {
     readComm: (pid: number) => (pid === 100 ? (options.comm ?? 'node') : (options.childComms?.[pid] ?? 'claude')),
     readProcessStartIdentity: (pid: number) => options.exited?.includes(pid) ? undefined
       : options.processStarts ? options.processStarts[pid] : `birth-${pid}`,
+    readRunningExeIdentity: (pid: number) => {
+      const path = options.runningExePaths?.[pid];
+      return path ? { path } : undefined;
+    },
     isZombieProcess: (pid: number) => options.zombies?.[pid] ?? false,
     isProgramStatusRelayArgv,
     programStatusRelayLaunched: options.relayLaunched ?? false,
@@ -276,6 +293,18 @@ function runWorkerWiring(late: boolean, options: {
 }
 
 describe('worker wrapper PID wiring', () => {
+  // 源码结构护栏(K3)：full-sandbox 的首次 applyWrapperCliLaunch 早于本文件的
+  // wiring 切片；声明若落在首次调用之后会以 TDZ 直接击穿 wrapper 启动。
+  it('initializes wrapperLaunchBin before the first sandboxed wrapper call', () => {
+    const firstCall = workerSource.indexOf('applyWrapperCliLaunch({ insideSandbox: true })');
+    const declaration = workerSource.indexOf('let wrapperLaunchBin');
+    const assignment = workerSource.indexOf('wrapperLaunchBin = launch.bin');
+    expect(firstCall).toBeGreaterThanOrEqual(0);
+    expect(declaration).toBeGreaterThanOrEqual(0);
+    expect(declaration).toBeLessThan(firstCall);
+    expect(assignment).toBeGreaterThan(firstCall);
+  });
+
   it.each([false, true])('binds the native TRAE child of an ordinary Node launcher (late PID=%s)', late => {
     const result = runWorkerWiring(late, {
       cliId: 'traex', wrapperCli: '', scopeLaunched: false,
@@ -616,6 +645,186 @@ describe('worker wrapper PID wiring', () => {
     expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
     expect(result.backend.cliPid).toBe(150);
     expect(result.bridgeCliPid).toBe(150);
+  });
+
+  it.each([
+    ['/opt/wrapper/claude --serve', ['--serve']],
+    ['/opt/wrapper/claude', []],
+  ])('resolves past a same-comm wrapper inside credential-only bwrap (%s)', (wrapperCli, wrapperArgs) => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli, wrapperBin: '/opt/wrapper/claude', realCliBin: '/opt/real/claude.exe',
+      claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153] },
+      childComms: { 150: 'bwrap', 151: 'bwrap', 152: 'claude.exe', 153: 'claude.exe' },
+      cmdlines: {
+        152: ['/opt/wrapper/claude', ...wrapperArgs],
+        153: ['/opt/real/claude.exe'],
+      },
+    });
+    expect(result.backend.cliPid).toBe(153);
+    expect(result.bridgeCliPid).toBe(153);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(153);
+  });
+
+  it('uses the kernel image when a same-comm wrapper has erased its argv', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '/opt/wrapper/claude --serve', wrapperBin: '/opt/wrapper/claude',
+      realCliBin: '/opt/real/claude.exe', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153] },
+      childComms: { 150: 'bwrap', 151: 'bwrap', 152: 'claude.exe', 153: 'claude.exe' },
+      cmdlines: { 152: ['claude.exe'], 153: ['/opt/real/claude.exe'] },
+      runningExePaths: { 152: '/usr/bin/node', 153: '/opt/real/claude.exe' }, nativeCliImage: true,
+    });
+    expect(result.backend.cliPid).toBe(153);
+    expect(result.bridgeCliPid).toBe(153);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(153);
+  });
+
+  it('uses the kernel image for a direct payload whose wrapper erased argv', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '/opt/wrapper/claude --serve', wrapperBin: '/opt/wrapper/claude',
+      realCliBin: '/opt/real/claude.exe', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [154] },
+      childComms: { 150: 'claude.exe', 154: 'claude.exe' },
+      cmdlines: { 150: ['claude.exe'], 154: ['/opt/real/claude.exe'] },
+      runningExePaths: { 150: '/usr/bin/node', 154: '/opt/real/claude.exe' }, nativeCliImage: true,
+    });
+    expect(result.backend.cliPid).toBe(154);
+    expect(result.bridgeCliPid).toBe(154);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(154);
+  });
+
+  it('matches the launch wrapper by kernel path without requiring an .exe install', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '/opt/wrapper/claude --serve', wrapperBin: '/opt/wrapper/claude',
+      realCliBin: '/opt/real/claude', nativeCliImage: false,
+      claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153] },
+      childComms: { 150: 'bwrap', 151: 'bwrap', 152: 'claude.exe', 153: 'claude.exe' },
+      cmdlines: { 152: ['claude.exe'], 153: ['/opt/real/claude'] },
+      runningExePaths: { 152: '/opt/wrapper/claude', 153: '/opt/real/claude' },
+    });
+    expect(result.backend.cliPid).toBe(153);
+    expect(result.bridgeCliPid).toBe(153);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(153);
+  });
+
+  it('keeps a versioned native CLI image distinct from the wrapper path', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '/opt/wrapper/claude --serve', wrapperBin: '/opt/wrapper/claude',
+      realCliBin: '/opt/real/claude.exe', nativeCliImage: true,
+      claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [154] },
+      childComms: { 150: 'claude.exe', 154: 'claude.exe' },
+      cmdlines: { 150: ['/opt/real/claude.exe'], 154: ['/opt/real/claude.exe'] },
+      runningExePaths: { 150: '/opt/versions/2.1.0/claude.exe', 154: '/opt/versions/2.1.0/claude.exe' },
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+  });
+
+  it('uses a native non-.exe CLI image to reject a shebang Node wrapper', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '/opt/wrapper/claude --serve', wrapperBin: '/opt/wrapper/claude',
+      realCliBin: '/opt/real/claude', nativeCliImage: true,
+      claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153] },
+      childComms: { 150: 'bwrap', 151: 'bwrap', 152: 'claude.exe', 153: 'claude.exe' },
+      cmdlines: { 152: ['claude.exe'], 153: ['/opt/real/claude'] },
+      runningExePaths: { 152: '/usr/bin/node', 153: '/opt/real/claude' },
+    });
+    expect(result.backend.cliPid).toBe(153);
+    expect(result.bridgeCliPid).toBe(153);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(153);
+  });
+
+  it('keeps a real direct root when wrapper and CLI share the same executable', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '/opt/real/claude.exe --serve', wrapperBin: '/opt/real/claude.exe',
+      realCliBin: '/opt/real/claude.exe', nativeCliImage: true,
+      claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [154] },
+      childComms: { 150: 'claude.exe', 154: 'claude.exe' },
+      cmdlines: { 150: ['/opt/real/claude.exe', '--serve'], 154: ['/opt/real/claude.exe'] },
+      runningExePaths: { 150: '/opt/real/claude.exe', 154: '/opt/real/claude.exe' },
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+  });
+
+  it('keeps an interpreted direct CLI when the wrapper shares its Node image', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: 'node /opt/wrapper/wrapper.js', wrapperBin: '/usr/bin/node',
+      realCliBin: '/opt/real/claude.js', nativeCliImage: false,
+      claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [154] },
+      childComms: { 150: 'claude', 154: 'claude' },
+      cmdlines: { 150: ['claude'], 154: ['claude'] },
+      runningExePaths: { 150: '/usr/bin/node', 154: '/usr/bin/node' },
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+  });
+
+  it('resolves past a same-comm wrapper that is itself the credential-only payload', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '/opt/wrapper/claude --serve', wrapperBin: '/opt/wrapper/claude',
+      realCliBin: '/opt/real/claude.exe', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [154] },
+      childComms: { 150: 'claude.exe', 154: 'claude.exe' },
+      cmdlines: { 150: ['/opt/wrapper/claude', '--serve'], 154: ['/opt/real/claude.exe'] },
+    });
+    expect(result.backend.cliPid).toBe(154);
+    expect(result.bridgeCliPid).toBe(154);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(154);
+  });
+
+  it('keeps a real direct CLI root with a same-comm subagent when wrapperCli is configured', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '/opt/wrapper/claude --serve', wrapperBin: '/opt/wrapper/claude',
+      realCliBin: '/opt/real/claude.exe', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [154] },
+      childComms: { 150: 'claude.exe', 154: 'claude.exe' },
+      cmdlines: { 150: ['/opt/real/claude.exe', '--serve'], 154: ['/opt/real/claude.exe'] },
+      runningExePaths: { 150: '/opt/real/claude.exe', 154: '/opt/real/claude.exe' }, nativeCliImage: true,
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
+  });
+
+  it('does not treat an interpreted .exe CLI as a wrapper for having a node image', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '/opt/wrapper/claude --serve', wrapperBin: '/opt/wrapper/claude',
+      realCliBin: '/opt/real/claude.exe', nativeCliImage: false,
+      claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [154] },
+      childComms: { 150: 'claude.exe', 154: 'claude.exe' },
+      cmdlines: { 150: ['/opt/real/claude.exe'], 154: ['/opt/real/claude.exe'] },
+      runningExePaths: { 150: '/usr/bin/node', 154: '/usr/bin/node' },
+    });
+    expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(154);
   });
 
   it('re-attests the sandboxed Claude Code leaf on ready/input after a failed publication or a startup helper exits', () => {
@@ -1018,6 +1227,39 @@ describe('findLaunchedCliPid()', () => {
     expect(isClaudeMetadataProbeArgv(['claude.exe'])).toBe(false);
     expect(isClaudeMetadataProbeArgv(['claude.exe', '--', flag])).toBe(false);
     expect(isClaudeMetadataProbeArgv(['claude.exe', '--print', flag])).toBe(false);
+  });
+
+  it('identifies a configured wrapper only with matching argv evidence', () => {
+    expect(isConfiguredWrapperCliArgv(
+      ['/opt/wrapper/claude', '--serve', 'extra'], '/opt/wrapper/claude --serve',
+      '/opt/wrapper/claude', '/opt/real/claude.exe',
+    )).toBe(true);
+    expect(isConfiguredWrapperCliArgv(
+      ['/opt/real/claude.exe', '--serve'], '/opt/wrapper/claude --serve',
+      '/opt/wrapper/claude', '/opt/real/claude.exe',
+    )).toBe(false);
+    expect(isConfiguredWrapperCliArgv(
+      ['/opt/wrapper/claude'], '/opt/wrapper/claude', '/opt/wrapper/claude', '/opt/real/claude.exe',
+    )).toBe(true);
+    expect(isConfiguredWrapperCliArgv(
+      ['claude'], '/opt/wrapper/claude', '/opt/wrapper/claude', '/opt/real/claude.exe',
+    )).toBe(false);
+    expect(isConfiguredWrapperCliArgv(
+      ['/opt/wrapper/claude', '--other'], '/opt/wrapper/claude --serve',
+      '/opt/wrapper/claude', '/opt/real/claude.exe',
+    )).toBe(false);
+    expect(isConfiguredWrapperCliArgv([], '/opt/wrapper/claude')).toBe(false);
+  });
+
+  it('checks the native ELF header instead of trusting an executable extension', () => {
+    if (process.platform === 'linux') expect(isNativeElfExecutable(process.execPath)).toBe(true);
+    expect(isNativeElfExecutable(fileURLToPath(import.meta.url))).toBe(false);
+    expect(isNativeElfExecutable('/definitely/not/a/real/executable')).toBe(false);
+  });
+
+  it('does not use a generic interpreter as unique wrapper identity', () => {
+    expect(isGenericLauncherExecutable('/usr/bin/node')).toBe(true);
+    expect(isGenericLauncherExecutable('/opt/wrapper/claude')).toBe(false);
   });
 
   // tree: 100 launcher → [200 claude child, 201 auth-rpc child], 200 → 300 (bash)

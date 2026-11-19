@@ -5,7 +5,7 @@
  * Codex, Aiden, CoCo, Cursor, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
  */
 import { execFileSync, execSync } from 'node:child_process';
-import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
+import { readdirSync, readFileSync, readlinkSync, realpathSync, openSync, readSync, closeSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
@@ -125,6 +125,12 @@ const COMM_ARGV_LAUNCHERS = new Set([
   'node', 'node.exe', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'ruby', 'npx', 'tsx',
   'MainThread',
 ]);
+
+/** Generic interpreters are never a unique wrapper identity: a real scripted
+ * CLI and its wrapper can share the exact same interpreter image. */
+export function isGenericLauncherExecutable(executable: string): boolean {
+  return COMM_ARGV_LAUNCHERS.has(executableBasename(executable));
+}
 
 /** Interactive-shell comms. When a pane's leaf process is one of these AFTER
  *  botmux is ready to type the first prompt, the CLI never actually launched —
@@ -345,6 +351,62 @@ export function isNonInteractiveCodexArgv(argv: string[]): boolean {
  * are handled by the startup liveness monitor rather than an argv blacklist. */
 export function isClaudeMetadataProbeArgv(argv: string[]): boolean {
   return argv.length === 2 && ['--help', '-h', '--version', '-v'].includes(argv[1]!);
+}
+
+/** Return a path only when argv carries one; bare command names offer no
+ * executable-path evidence. realpathMaybe resolves symlinks when possible. */
+function executablePathEvidence(executable: string): string | undefined {
+  return executable.includes('/') || executable.includes('\\')
+    ? realpathMaybe(executable)
+    : undefined;
+}
+
+/** Linux native-image check used before trusting /proc/<pid>/exe identity.
+ * A script merely named `claude.exe` must stay on the argv-only path. */
+export function isNativeElfExecutable(path: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const magic = Buffer.alloc(4);
+    const bytesRead = readSync(fd, magic, 0, 4, 0);
+    return bytesRead === 4 && magic[0] === 0x7f && magic[1] === 0x45
+      && magic[2] === 0x4c && magic[3] === 0x46;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best effort */ }
+    }
+  }
+}
+
+/** True only when argv identifies the configured wrapper, not the real CLI it
+ * later execs. Prefix matching recognizes persistent wrappers whose comm was
+ * rebranded to the CLI name; path evidence disambiguates single-token wrappers.
+ * Missing evidence is deliberately not a match, preserving the old behavior. */
+export function isConfiguredWrapperCliArgv(
+  argv: string[],
+  wrapperCli: string | undefined,
+  wrapperBin?: string,
+  realCliBin?: string,
+): boolean {
+  if (argv.length === 0 || !wrapperCli?.trim()) return false;
+  const tokens = wrapperCli.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0 || argv.length < tokens.length) return false;
+  const argvZeroPath = executablePathEvidence(argv[0]!);
+  if (realCliBin && argvZeroPath && argvZeroPath === executablePathEvidence(realCliBin)) return false;
+  if (executableBasename(argv[0]!) !== executableBasename(tokens[0]!)) return false;
+  for (let index = 1; index < tokens.length; index++) {
+    if (argv[index] !== tokens[index]) return false;
+  }
+  const expectedWrapperPath = wrapperBin ? executablePathEvidence(wrapperBin) : undefined;
+  if (expectedWrapperPath) {
+    if (argvZeroPath) return argvZeroPath === expectedWrapperPath;
+    // A bare argv[0] cannot prove a same-named single-token wrapper from a
+    // different path. Do not exclude the real interactive CLI by guesswork.
+    if (tokens.length === 1) return false;
+  }
+  return tokens.length > 1 || expectedWrapperPath !== undefined;
 }
 
 /**
