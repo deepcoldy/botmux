@@ -49,6 +49,7 @@ import {
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
+import { resolveTmuxSocketRoot } from './tmux-socket-root.js';
 import { readUnreapedPaneExit, type UnreapedPaneExit } from './unreaped-pane-exit.js';
 import { pipePaneShellCommand } from './tmux-pipe-relay.js';
 import { createTmuxBootGate } from './tmux-anti-fork.js';
@@ -689,6 +690,19 @@ export class TmuxPipeBackend implements SessionBackend {
   /** spawn() sets up the pipe-pane subscription + fifo reader. In managed
    *  mode it first creates a detached bmx-* tmux session that runs the CLI. */
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    // Pin the socket root to an ABSOLUTE path at the worker control-plane
+    // boundary, BEFORE any tmux command runs. A relative $TMUX_TMPDIR
+    // resolves per-cwd: the launch cwd below (sandbox cold start) differs
+    // from the worker cwd every later ambient control command runs in, so
+    // creation and control (options/send/capture/teardown/destroy) would
+    // address DIFFERENT servers. Resolving once against the launch cwd and
+    // rewriting the ambient value makes every control exec in this process
+    // cwd-independent and shared with the creation spawn.
+    const rawTmpdir = process.env.TMUX_TMPDIR;
+    if (rawTmpdir !== undefined) {
+      const pinned = resolveTmuxSocketRoot(process.env, opts.cwd);
+      if (pinned !== rawTmpdir) process.env.TMUX_TMPDIR = pinned;
+    }
     const instanceIdentity = opts.env?.BOTMUX_CODEX_INSTANCE_BINDING;
     if (this.ownsSession && !this.createSession && instanceIdentity) {
       // Fence managed reattachment before options or pipe-pane can touch the
@@ -1939,8 +1953,10 @@ export class TmuxPipeBackend implements SessionBackend {
     const bootSpawnEnv = opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env;
     // Strict CLI inheritance must not move the tmux control client to another
     // server. Discovery, reattach and teardown use the worker's socket root;
-    // retain it only for this client. The pane still receives strictPaneCommand's
-    // separately constructed env -i environment.
+    // retain it only for this client — spawn() already pinned it to the
+    // ABSOLUTE root resolved at the launch cwd, so creation, gate and every
+    // later ambient control command share one server. The pane still receives
+    // strictPaneCommand's separately constructed env -i environment.
     if (opts.strictEnv && process.env.TMUX_TMPDIR !== undefined) {
       bootSpawnEnv.TMUX_TMPDIR = process.env.TMUX_TMPDIR;
     }

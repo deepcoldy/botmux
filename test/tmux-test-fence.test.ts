@@ -85,6 +85,25 @@ describe.skipIf(!posix)('tmux test fence shim', () => {
     expect(r.denied).toContain(`/tmux-${uid}/default`);
   });
 
+  it('refuses an existing host root whose NAME contains a colon', () => {
+    // tmux resolves $TMUX_TMPDIR as ONE path, so a directory literally named
+    // "fleet:root" is a real root the shim can land on. Registration must
+    // cover the COMPLETE value — a colon-split-only list would register /tmp
+    // and the colon-free fragments, waving the real host root through.
+    const hostRoot = join(work, 'fleet:root');
+    mkdirSync(hostRoot);
+    const colonShim = join(work, 'tmux-colon-host');
+    writeFileSync(colonShim, tmuxFenceShimScript(fakeReal, hostTmuxSocketDirs({ TMUX_TMPDIR: hostRoot }), denyLog));
+    chmodSync(colonShim, 0o755);
+    writeFileSync(denyLog, '');
+    const r = spawnSync(colonShim, ['-L', 'x', 'new-session', '-d'], {
+      env: { PATH: process.env.PATH, TMUX_TMPDIR: hostRoot }, encoding: 'utf8', cwd: work,
+    });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain('refusing host tmux socket');
+    expect(readFileSync(denyLog, 'utf8')).toContain(join(hostRoot, `tmux-${uid}`));
+  });
+
   it('refuses a TMUX_TMPDIR symlinked to a host root before tmux-<uid> exists there', () => {
     // tmux realpath()s $TMUX_TMPDIR, so a symlink to a host socket root lands
     // the server in that root. The fence must resolve it the same way even

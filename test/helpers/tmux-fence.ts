@@ -107,7 +107,14 @@ export function hostTmuxSocketDirs(env: NodeJS.ProcessEnv = process.env): string
   const bases = new Set<string>();
   const tmp = realDir('/tmp');
   if (tmp) bases.add(tmp);
-  for (const entry of (env.TMUX_TMPDIR ?? '').split(':')) {
+  const raw = env.TMUX_TMPDIR ?? '';
+  // The COMPLETE raw value first: tmux resolves it as ONE path, so a
+  // directory whose NAME contains a colon is a real host root the shim may
+  // land on. The colon-split entries below only add MORE conservative
+  // refusals — they must never replace the whole-value registration.
+  const whole = raw ? realDir(raw) : null;
+  if (whole) bases.add(whole);
+  for (const entry of raw.split(':')) {
     const resolved = entry ? realDir(entry) : null;
     if (resolved) bases.add(resolved);
   }
