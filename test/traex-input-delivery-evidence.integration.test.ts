@@ -18,7 +18,7 @@ type Submission = { text: string; nativeTurnId: string };
 
 describe('TraeX input delivery evidence ordering', () => {
   it.each(['early-terminal', 'early-send', 'late-terminal', 'history', 'unknown',
-    'skill-adopt-history', 'skill-adopt-terminal'] as const)(
+    'skill-adopt-history', 'skill-adopt-terminal', 'parked-rescue', 'parked-manual'] as const)(
     'delivers successors exactly once with %s evidence',
     async mode => {
       // Keep the UNIX socket path short on macOS (104-byte socket limit).
@@ -52,7 +52,7 @@ const release = ${JSON.stringify(release)};
 const mode = ${JSON.stringify(mode)};
 const sid = ${JSON.stringify(nativeSessionId)};
 const sendMarker = ${JSON.stringify(sendMarker)};
-let count = 0, firstId, completed = false;
+let count = 0, firstId, completed = false, parkedText = '', enters = 0;
 process.stdin.setRawMode?.(true);
 process.stdin.setEncoding('utf8');
 process.stdout.write('\\x1b[?2004h');
@@ -67,14 +67,14 @@ function complete(id) {
   idle();
 }
 idle();
-for (const ms of [500,1000]) setTimeout(() => { if (!count) idle(); }, ms);
-setInterval(() => { if (!count) idle(); }, 5_000);
+for (const ms of [500,1000]) setTimeout(() => { if (!count && !parkedText) idle(); }, ms);
+setInterval(() => { if (!count && !parkedText) idle(); }, 5_000);
 const collect = (${createBracketedPasteCollector.toString()})(text => {
   count++;
   const id = crypto.randomUUID();
   fs.appendFileSync(submissions,JSON.stringify({text,nativeTurnId:id})+'\\n');
   const skill = count === 1 && mode.startsWith('skill-adopt-');
-  if (count > 1 || mode === 'history' || mode === 'skill-adopt-history') {
+  if (count > 1 || mode === 'history' || mode === 'skill-adopt-history' || mode.startsWith('parked-')) {
     const recorded = skill ? text.replace('/receipt', '[$receipt](/tmp/fixture/receipt/SKILL.md)') : text;
     fs.appendFileSync(history,JSON.stringify({session_id:sid,ts:Date.now()/1000,text:recorded})+'\\n');
   }
@@ -97,9 +97,16 @@ const collect = (${createBracketedPasteCollector.toString()})(text => {
     else if (mode === 'unknown') setTimeout(idle,300);
     else if (mode !== 'late-terminal') setTimeout(() => complete(id),mode === 'skill-adopt-terminal' ? 3400 : 300);
   } else setTimeout(() => complete(id),300);
+}, text => {
+  if (!mode.startsWith('parked-') || count) return true;
+  enters++;
+  parkedText = text;
+  process.stdout.write('\\x1b[2J\\x1b[H──────────────────────────────────────────\\n❯ [Pasted Content '+Array.from(text).length+' chars]\\n  GPT-6-Astra xhigh · Context 99% left\\n  ? for shortcuts\\n');
+  return mode === 'parked-rescue' ? enters > 4 : fs.existsSync(release);
 });
 process.stdin.on('data',collect);
 setInterval(() => {
+  if (!count && parkedText && fs.existsSync(release)) collect('\\r');
   if (!completed && firstId && fs.existsSync(release)) {completed=true;complete(firstId);}
 },25);
 `);
@@ -164,6 +171,26 @@ setInterval(() => {
         await wait(() => logs.join('').includes('Worker started, waiting for init'), 'worker booted', 60_000);
         await wait(() => messages.some(m => m.type === 'prompt_ready'), 'initial readiness', 30_000);
         sent(adopt ? '/receipt check version' : 'check version', 'om_first');
+        if (mode.startsWith('parked-')) {
+          await wait(() => logs.join('').includes('deferred 20000ms recheck queued'), 'parked submit budget exhausted');
+          sent('diagnose one', 'om_follow_one');
+          sent('diagnose two', 'om_follow_two');
+          if (mode === 'parked-manual') {
+            await wait(() => messages.some(m => m.type === 'user_notify' && m.kind === 'input_not_submitted'),
+              'single parked draft warning', 90_000);
+            expect(received()).toHaveLength(0);
+            writeFileSync(release, 'manual submit');
+          }
+          await wait(() => received().length === 3, 'parked draft and successors received', 90_000);
+          await wait(() => messages.some(m => m.type === 'turn_terminal'
+            && m.turnId === 'om_follow_two' && m.status === 'completed'), 'successors completed');
+          expect(received()[0]!.text.startsWith('check version')).toBe(true);
+          expect(received().slice(1).map(row => row.text)).toEqual(['diagnose one', 'diagnose two']);
+          expect(messages.filter(m => m.type === 'user_notify' && m.kind === 'input_not_submitted'))
+            .toHaveLength(mode === 'parked-manual' ? 1 : 0);
+          expect(logs.join('')).toContain('Released input-delivery quarantine');
+          return;
+        }
         await wait(() => received().length === 1, 'first input received');
         if (mode === 'early-terminal' || mode === 'history' || mode === 'skill-adopt-history') {
           await wait(() => messages.some(m => m.type === 'turn_terminal'

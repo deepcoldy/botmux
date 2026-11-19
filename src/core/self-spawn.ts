@@ -31,7 +31,7 @@ import { pathToFileURL } from 'node:url';
 export type BotmuxEntry =
   | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard'
   | 'plugin-supervisor' | 'sandbox-network-runner' | 'program-status-relay' | 'background-execution-runner'
-  | 'zellij-socket-probe'
+  | 'zellij-socket-probe' | 'reply-file-sanitizer'
   // CLI-adapter runners. Unlike the entries above these are not fleet processes:
   // an adapter spawns one as the CLI session itself (`resolvedBin` is
   // process.execPath and the runner is argv[0]). They need the same treatment for
@@ -51,6 +51,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'program-status-relay': '__program-status-relay',
   'background-execution-runner': '__background-execution-runner',
   'zellij-socket-probe': '__zellij-socket-probe',
+  'reply-file-sanitizer': '__reply-file-sanitizer',
   'codex-app-runner': '__codex-app-runner',
   'dsh-runner': '__dsh-runner',
   'mira-runner': '__mira-runner',
@@ -73,6 +74,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'program-status-relay': 'program-status-relay.js',
   'background-execution-runner': 'background-execution-runner.js',
   'zellij-socket-probe': 'adapters/backend/zellij-socket-probe.js',
+  'reply-file-sanitizer': 'reply-file-sanitizer.js',
   'codex-app-runner': 'codex-app-runner.js',
   'dsh-runner': 'dsh-runner.js',
   'mira-runner': 'mira-runner.js',

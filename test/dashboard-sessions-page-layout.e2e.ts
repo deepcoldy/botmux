@@ -34,11 +34,13 @@ describe('sessions page full-height layout in Chromium', () => {
   let script: string;
   let css: string;
   // 69 个未关闭 + 2029 个已关闭：首屏只带 50 个已关闭会话和游标，分页提示必然出现。
+  // 前 3 个未关闭会话保持 working：普通 idle 会话默认不上班看板，bulkBar 用例需要
+  // 仍在板上、复选框可用（closed 卡片的复选框禁用）的会话。
   const rows: Row[] = Array.from({ length: 2098 }, (_, index) => ({
     sessionId: `s-${String(index).padStart(4, '0')}`,
     larkAppId: 'cli_fixture', botName: 'Fixture bot', cliId: 'codex',
     chatId: `oc_${index}`, chatDisplayName: `Fixture chat ${index}`,
-    title: `Fixture session ${index}`, status: index < 69 ? 'idle' : 'closed',
+    title: `Fixture session ${index}`, status: index < 3 ? 'working' : index < 69 ? 'idle' : 'closed',
     lastMessageAt: 1700000000000 + index * 1000, spawnedAt: 1700000000000,
   }));
 

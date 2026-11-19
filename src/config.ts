@@ -8,6 +8,7 @@ import {
   isCrossPrincipalInterruptionEnabled,
   isGlobalVcMeetingAgentEnabled,
   readGlobalConfig,
+  globalTerminalEffortWritebackConfigLive,
 } from './global-config.js';
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
@@ -268,6 +269,12 @@ export function resolveWorktreeSlugAiTimeoutMs(env: NodeJS.ProcessEnv = process.
   return resolvePositiveRuntimeTimeout(env.BOTMUX_WORKTREE_SLUG_AI_TIMEOUT_MS, 5_000);
 }
 
+/** Per `git worktree add` budget, including checkout hooks. Other Git
+ * commands and worktree target lock waits retain their own timeouts. */
+export function resolveWorktreeCreateTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePositiveRuntimeTimeout(env.BOTMUX_WORKTREE_CREATE_TIMEOUT_MS, 60_000);
+}
+
 export const config = {
   session: {
     get dataDir() { return process.env.SESSION_DATA_DIR ?? fallbackDataDir(); },
@@ -411,6 +418,10 @@ export const config = {
   // so a Dashboard change gates the next session upgrade without restarting
   // daemons or changing the current turn.
   get autoUpgradeCodexSessions(): boolean { return readGlobalConfig().dashboard?.autoUpgradeCodexSessions === true; },
+  /** Default OFF; only confirmed user terminal choices affect durable session effort. */
+  get terminalEffortWriteback(): boolean { return globalTerminalEffortWritebackConfigLive().enabled; },
+  get terminalEffortWritebackEpoch(): number { return globalTerminalEffortWritebackConfigLive().epoch; },
+  get terminalEffortWritebackEnabledAtMs(): number { return globalTerminalEffortWritebackConfigLive().enabledAtMs; },
   // Live getter (like codexRpcInputDefault): re-reads the experimental global
   // toggle that gates the "no visible output" anti-resend guidance in the botmux
   // routing hints, so a Settings change takes effect on the next session without

@@ -1,15 +1,21 @@
 import { describe, it, expect, afterEach } from 'vitest';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
+  assertOpenedInsideTree,
   assertSameInode,
   findCheckpoint,
   rewindClaudeTranscript,
   scanClaudeTranscriptCheckpoints,
   summarizeUserText,
   waitForTranscriptQuiet,
+  withOpenTranscript,
 } from '../src/core/context-rewind.js';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
+import { rewindBackupSuffix } from '../src/core/rewind-backup-retention.js';
 
 const dirs: string[] = [];
 
@@ -93,11 +99,229 @@ describe('scanClaudeTranscriptCheckpoints', () => {
     expect(scanClaudeTranscriptCheckpoints(path).map(cp => cp.uuid)).toEqual(['u1']);
   });
 
+  it('removedBytes 是回退到该轮会删掉的字节数（含末尾未写完的半行）', () => {
+    const path = fixture([userTurn('a', 'u1'), assistant, userTurn('b', 'u2'), assistant]);
+    appendFileSync(path, JSON.stringify(userTurn('写了一半', 'u3')));
+    const size = statSync(path).size;
+    const cps = scanClaudeTranscriptCheckpoints(path);
+    expect(cps.map(cp => [cp.uuid, cp.removedBytes])).toEqual(cps.map(cp => [cp.uuid, size - cp.offset]));
+    expect(cps.map(cp => cp.uuid)).toEqual(['u2', 'u1']);
+  });
+
   it('最多返回 limit 个，且 index=1 仍是最新', () => {
     const path = fixture([userTurn('a', 'u1'), userTurn('b', 'u2'), userTurn('c', 'u3')]);
     const checkpoints = scanClaudeTranscriptCheckpoints(path, 2);
     expect(checkpoints.map(cp => cp.preview)).toEqual(['c', 'b']);
     expect(checkpoints.map(cp => cp.index)).toEqual([1, 2]);
+  });
+});
+
+describe('scanClaudeTranscriptCheckpoints 只读普通文件', () => {
+  it('路径是软链：拒绝读取，链接目标的内容不会变成检查点预览', () => {
+    const target = fixture([userTurn('LINK_TARGET_TEXT', 'uT'), assistant]);
+    const link = join(dirs.at(-1)!, 'link.jsonl');
+    symlinkSync(target, link);
+    let checkpoints: unknown;
+    expect(() => { checkpoints = scanClaudeTranscriptCheckpoints(link); }).toThrow();
+    expect(JSON.stringify(checkpoints ?? null)).not.toContain('LINK_TARGET_TEXT');
+  });
+
+  // 没有写端的命名管道会让阻塞式 open(2) 永远等下去；放进子进程跑，回归时
+  // 以超时失败，而不是把整个测试进程卡死。
+  it.skipIf(process.platform === 'win32')('路径是命名管道：立即拒绝，不在管道上阻塞', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-rewind-fifo-'));
+    dirs.push(dir);
+    const fifo = join(dir, 'session.jsonl');
+    const mk = spawnSync('mkfifo', [fifo]);
+    expect(mk.status, String(mk.stderr)).toBe(0);
+    const mod = pathToFileURL(resolve('src/core/context-rewind.ts')).href;
+    const snippet = `
+      const { scanClaudeTranscriptCheckpoints } = await import(${JSON.stringify(mod)});
+      let outcome;
+      try {
+        outcome = { returned: scanClaudeTranscriptCheckpoints(${JSON.stringify(fifo)}) };
+      } catch (err) {
+        outcome = { error: String(err && err.message || err) };
+      }
+      console.log(JSON.stringify(outcome));
+    `;
+    const res = spawnSyncTsEvalWithRepoImports(snippet, { encoding: 'utf8', timeout: 60_000, killSignal: 'SIGKILL' });
+    expect(res.signal, `child blocked on the FIFO; stderr=${res.stderr}`).toBeNull();
+    expect(res.status, String(res.stderr)).toBe(0);
+    const out = JSON.parse(String(res.stdout).trim().split('\n').pop()!);
+    expect(out.returned).toBeUndefined();
+    expect(out.error).toMatch(/non-regular/);
+  }, 90_000);
+});
+
+/** `<root>/bots/app/claude/projects/key/session.jsonl` plus the same relative
+ *  layout under an outside directory, for swapping an ancestor for a link. */
+function treeFixture() {
+  const base = mkdtempSync(join(tmpdir(), 'botmux-rewind-tree-'));
+  dirs.push(base);
+  const root = join(base, 'bots');
+  const projects = join(root, 'app', 'claude', 'projects');
+  const path = join(projects, 'key', 'session.jsonl');
+  mkdirSync(join(projects, 'key'), { recursive: true });
+  writeFileSync(path, [userTurn('树里的会话', 'u1'), assistant, userTurn('第二轮', 'u2')].map(l => `${JSON.stringify(l)}\n`).join(''));
+  const outside = join(base, 'outside');
+  mkdirSync(join(outside, 'key'), { recursive: true });
+  const outsideFile = join(outside, 'key', 'session.jsonl');
+  // Same byte layout as the tree's file (same-length texts and uuids), so an
+  // offset computed on one lands on a line boundary in the other.
+  writeFileSync(outsideFile, [userTurn('OUTSIDE_TEXT___', 'u1'), assistant, userTurn('OUT_TWO__', 'u2')].map(l => `${JSON.stringify(l)}\n`).join(''));
+  /** Replace `dir` (inside the tree) with a link to `target`. */
+  const swapForLink = (dir: string, target: string) => {
+    renameSync(dir, `${dir}.aside`);
+    symlinkSync(target, dir);
+  };
+  return { root, projects, path, outside, outsideFile, swapForLink };
+}
+
+const noProc = () => { throw new Error('no /proc'); };
+
+describe('会话记录路径经过 CLI 可写的树', () => {
+  it('树里的普通文件照常扫描', () => {
+    const { root, path } = treeFixture();
+    const cps = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    expect(cps.map(cp => cp.preview)).toEqual(['第二轮', '树里的会话']);
+  });
+
+  it('项目目录被换成指向外部的链接：拒绝扫描，外部内容不进预览', () => {
+    const { root, projects, path, outside, swapForLink } = treeFixture();
+    swapForLink(join(projects, 'key'), join(outside, 'key'));
+    let cps: unknown;
+    expect(() => { cps = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root }); }).toThrow(/not the one under|not a directory/);
+    expect(JSON.stringify(cps ?? null)).not.toContain('OUTSIDE');
+  });
+
+  it('projects 被换成链接：同样拒绝', () => {
+    const { root, projects, path, outside, swapForLink } = treeFixture();
+    swapForLink(projects, outside);
+    expect(() => scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root })).toThrow();
+  });
+
+  for (const [label, openedPath] of [['/proc', undefined], ['逐级 lstat', noProc]] as const) {
+    it(`经链接打开后又换回真目录：仍认出打开的不是树里的文件（${label}）`, () => {
+      const { root, projects, path, outside, swapForLink } = treeFixture();
+      const key = join(projects, 'key');
+      swapForLink(key, join(outside, 'key'));
+      const fd = openSync(path, 'r');
+      try {
+        // Put the real directory back before the check runs.
+        rmSync(key);
+        renameSync(`${key}.aside`, key);
+        expect(() => assertOpenedInsideTree(fd, path, root, openedPath)).toThrow(/not the one under|replaced between validation and open/);
+      } finally {
+        closeSync(fd);
+      }
+    });
+
+    it(`树里一路是真目录时放行（${label}）`, () => {
+      const { root, path } = treeFixture();
+      const fd = openSync(path, 'r');
+      try {
+        expect(() => assertOpenedInsideTree(fd, path, root, openedPath)).not.toThrow();
+      } finally {
+        closeSync(fd);
+      }
+    });
+  }
+
+  it('路径不在给出的树下：拒绝', () => {
+    const { root, outsideFile } = treeFixture();
+    const fd = openSync(outsideFile, 'r');
+    try {
+      expect(() => assertOpenedInsideTree(fd, outsideFile, root)).toThrow(/not under/);
+    } finally {
+      closeSync(fd);
+    }
+  });
+
+  it('截断时项目目录被换成链接：拒绝，外部文件不被截断、不在外部留备份', () => {
+    const { root, projects, path, outside, outsideFile, swapForLink } = treeFixture();
+    const [latest] = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    swapForLink(join(projects, 'key'), join(outside, 'key'));
+    const before = readFileSync(outsideFile, 'utf8');
+    expect(() => rewindClaudeTranscript(path, latest!.offset, Date.now(), { writableTreeRoot: root })).toThrow();
+    expect(readFileSync(outsideFile, 'utf8')).toBe(before);
+    expect(readdirSync(join(outside, 'key'))).toEqual(['session.jsonl']);
+  });
+
+  it('树内的会话记录没给备份目录：拒绝截断，树里不创建任何文件', () => {
+    const { root, path } = treeFixture();
+    const [latest] = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    const size = statSync(path).size;
+    expect(() => rewindClaudeTranscript(path, latest!.offset, Date.now(), { writableTreeRoot: root }))
+      .toThrow(/no backup directory/);
+    expect(statSync(path).size).toBe(size);
+    expect(readdirSync(dirname(path))).toEqual(['session.jsonl']);
+  });
+
+  it('树内的会话记录：备份写进给定目录；备份前祖先目录被换成链接也碰不到树外', () => {
+    const { root, projects, path, outside, swapForLink } = treeFixture();
+    const backupDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-backups-'));
+    dirs.push(backupDir);
+    const [latest] = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    const result = rewindClaudeTranscript(path, latest!.offset, Date.UTC(2026, 10, 18), {
+      writableTreeRoot: root,
+      backupDir,
+      beforeBackup: () => swapForLink(join(projects, 'key'), join(outside, 'key')),
+    });
+    expect(dirname(result.backupPath)).toBe(backupDir);
+    expect(readFileSync(result.backupPath, 'utf8')).toContain('第二轮');
+    expect(readdirSync(join(outside, 'key'))).toEqual(['session.jsonl']);
+    // The cut landed on the descriptor opened before the swap.
+    expect(statSync(join(projects, 'key.aside', 'session.jsonl')).size).toBe(latest!.offset);
+  });
+
+  it('withOpenTranscript：扫描与截断走同一个描述符，截在扫描读的那个文件上', () => {
+    const { root, path } = treeFixture();
+    const backupDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-backups-'));
+    dirs.push(backupDir);
+    const result = withOpenTranscript(path, { writableTreeRoot: root, backupDir }, transcript => {
+      const [latest] = transcript.scan(10);
+      expect(latest!.preview).toBe('第二轮');
+      return { cut: transcript.cut(latest!.offset, Date.UTC(2026, 10, 18)), offset: latest!.offset };
+    });
+    expect(statSync(path).size).toBe(result.offset);
+    expect(dirname(result.cut.backupPath)).toBe(backupDir);
+    expect(readFileSync(result.cut.backupPath, 'utf8')).toContain('第二轮');
+  });
+
+  it('withOpenTranscript：同一个描述符上再扫一次，结果不变', () => {
+    const { root, path } = treeFixture();
+    withOpenTranscript(path, { writableTreeRoot: root }, transcript => {
+      const first = transcript.scan(10);
+      expect(transcript.scan(10)).toEqual(first);
+      expect(first).toHaveLength(2);
+    });
+  });
+
+  it('withOpenTranscript：扫描之后路径被删掉重建（inode 号可能被复用）：拒绝截断，新文件不动', () => {
+    const { root, path } = treeFixture();
+    const replacement = readFileSync(path, 'utf8');
+    const backupDir = mkdtempSync(join(tmpdir(), 'botmux-rewind-backups-'));
+    dirs.push(backupDir);
+    expect(() => withOpenTranscript(path, { writableTreeRoot: root, backupDir }, transcript => {
+      const [latest] = transcript.scan(10);
+      rmSync(path);
+      writeFileSync(path, replacement);
+      return transcript.cut(latest!.offset);
+    })).toThrow(/replaced between validation and open/);
+    expect(readFileSync(path, 'utf8')).toBe(replacement);
+    expect(readdirSync(dirname(path))).toEqual(['session.jsonl']);
+    expect(readdirSync(backupDir)).toEqual([]);
+  });
+
+  it('withOpenTranscript：命名管道或链接一律拒绝打开', () => {
+    const { root, path, outsideFile } = treeFixture();
+    rmSync(path);
+    symlinkSync(outsideFile, path);
+    expect(() => withOpenTranscript(path, { writableTreeRoot: root }, t => t.scan(10))).toThrow();
+    rmSync(path);
+    expect(spawnSync('mkfifo', [path]).status).toBe(0);
+    expect(() => withOpenTranscript(path, { writableTreeRoot: root }, t => t.scan(10))).toThrow(/non-regular/);
   });
 });
 
@@ -189,6 +413,41 @@ describe('rewindClaudeTranscript 文件安全', () => {
     expect(statSync(path).size).toBe(before);
     expect(readFileSync(victim, 'utf8')).toBe(victimBefore);
     expect(existsSync(victim)).toBe(true);
+  });
+
+  it('备份目录在调用方建好之后、写备份之前被清掉（清空目录的周期清扫）：重建目录照常回退', () => {
+    const { root, path } = treeFixture();
+    const backupDir = join(mkdtempSync(join(tmpdir(), 'botmux-rewind-backups-')), 'sess-1');
+    dirs.push(dirname(backupDir));
+    mkdirSync(backupDir);
+    const [latest] = scanClaudeTranscriptCheckpoints(path, 10, { writableTreeRoot: root });
+    const result = rewindClaudeTranscript(path, latest!.offset, Date.UTC(2026, 10, 18), {
+      writableTreeRoot: root,
+      backupDir,
+      beforeBackup: () => rmSync(backupDir, { recursive: true }),
+    });
+    expect(dirname(result.backupPath)).toBe(backupDir);
+    expect(readFileSync(result.backupPath, 'utf8')).toContain('第二轮');
+    expect(statSync(path).size).toBe(latest!.offset);
+  });
+
+  it('备份写完、截断之前备份不在了（被删掉、换成别的文件、或被挪走）：拒绝截断，也不删换进来的文件', () => {
+    for (const takeAway of ['removed', 'replaced', 'moved'] as const) {
+      const path = fixture([userTurn('a', 'u1'), assistant, userTurn('b', 'u2'), assistant]);
+      const before = readFileSync(path, 'utf8');
+      const now = Date.UTC(2026, 10, 18, 12, 0, 0);
+      const backupPath = `${path}${rewindBackupSuffix(now, 'full')}`;
+      const [latest] = scanClaudeTranscriptCheckpoints(path);
+      expect(() => rewindClaudeTranscript(path, latest!.offset, now, {
+        beforeCut: () => {
+          if (takeAway === 'moved') return renameSync(backupPath, `${backupPath}.moved`);
+          rmSync(backupPath);
+          if (takeAway === 'replaced') writeFileSync(backupPath, 'someone else');
+        },
+      })).toThrow(/went away before the cut/);
+      expect(readFileSync(path, 'utf8')).toBe(before);
+      if (takeAway === 'replaced') expect(readFileSync(backupPath, 'utf8')).toBe('someone else');
+    }
   });
 
   it('源路径在描述符校验后被换成软链：备份与截断仍钉在原 inode，不读链接目标', () => {

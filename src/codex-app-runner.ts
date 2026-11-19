@@ -45,6 +45,11 @@ import {
 } from './services/codex-browser-broker.js';
 import type { CodexBrowserFamily } from './core/codex-browser-config.js';
 import type { CodexServiceTier } from './services/codex-service-tier.js';
+import {
+  isCodexReasoningEffort,
+  resolveCodexLaunchReasoningEffort,
+} from './services/codex-reasoning-effort.js';
+import { loadCodexServiceTierCatalog } from './services/codex-service-tier-catalog.js';
 import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
 
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
@@ -69,6 +74,7 @@ interface Args {
   locale?: string;
   model?: string;
   reasoningEffort?: string;
+  allowReasoningCatalog: boolean;
   serviceTier?: CodexServiceTier;
   browserFamily?: CodexBrowserFamily;
   browserAutoApproveOrigins?: boolean;
@@ -268,6 +274,7 @@ function parseArgs(argv: string[]): Args {
     cwd: process.cwd(),
     controlGeneration: '',
     controlPrivateKey: undefined as unknown as KeyObject,
+    allowReasoningCatalog: true,
   };
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i];
@@ -282,6 +289,11 @@ function parseArgs(argv: string[]): Args {
     else if (key === '--locale' && val !== undefined) { out.locale = val; i++; }
     else if (key === '--model' && val !== undefined) { out.model = val; i++; }
     else if (key === '--reasoning-effort' && val !== undefined) { out.reasoningEffort = val; i++; }
+    else if (key === '--codex-reasoning-catalog' && val !== undefined) {
+      if (val !== 'off') throw new Error('--codex-reasoning-catalog accepts only off');
+      out.allowReasoningCatalog = false;
+      i++;
+    }
     else if (key === '--service-tier' && val !== undefined) {
       if (val !== 'default' && val !== 'priority' && val !== 'ultrafast') {
         throw new Error('--service-tier accepts default, priority, or ultrafast');
@@ -1722,6 +1734,33 @@ function isDefiniteRpcRejection(error: unknown): boolean {
     || isExplicitExpectedTurnInactive(error);
 }
 
+/** A normal fresh launch was judged by the worker before argv was built. This
+ * gate is ONLY for the exceptional path where an unjudged resume attempt finds
+ * the thread missing and must fall back to a fresh thread/start. A successful
+ * thread/resume never reaches here, so it neither probes nor notifies. */
+async function gateMissingThreadFallbackReasoningEffort(): Promise<void> {
+  const effort = args.reasoningEffort;
+  // Preserve the runner's existing pass-through for values outside BotMux's
+  // vocabulary; the worker only supplies valid levels.
+  if (!effort || !isCodexReasoningEffort(effort)) return;
+  const decision = await resolveCodexLaunchReasoningEffort({
+    cliId: 'codex-app',
+    model: args.model,
+    effort,
+    loadCatalog: args.allowReasoningCatalog
+      ? () => loadCodexServiceTierCatalog({ cliBin: args.codexBin, env: process.env })
+      : null,
+  });
+  if (!decision.dropped) return;
+  args.reasoningEffort = undefined;
+  emitMarker('launch_reasoning_dropped', {
+    model: args.model ?? '',
+    effort: decision.dropped.effort,
+    supported: [...decision.dropped.supported],
+    catalog: decision.dropped.catalog,
+  });
+}
+
 async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
   if (client.hasExited && !activeTurn && nativeActiveTurnId === undefined && !generationFenced) {
     // 只恢复尚未投递的新输入；已发送轮次的未知结果仍由 fenceUnknown 保护。
@@ -1783,6 +1822,10 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
       writeLine(`[codex-app] resume failed, starting a fresh thread: ${err?.message ?? err}`);
       threadId = undefined;
       threadReady = false;
+      // The worker deliberately skipped its gate for this resume. Now that the
+      // fallback is known to be a REAL fresh start, judge the level before the
+      // thread/start below consumes it.
+      await gateMissingThreadFallbackReasoningEffort();
     }
   }
 

@@ -588,6 +588,23 @@ export interface DaemonSession {
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
    *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
+  /** Wall-clock of the most recent `turn_terminal` observed for this session,
+   *  and the turn it named. The terminal edge is the daemon's authority that a
+   *  turn is over, so these drive the post-terminal display settle (see
+   *  schedulePostTerminalStatusSettle) and the periodic stale-card self-heal.
+   *  In-memory only. */
+  lastTurnTerminalAt?: number;
+  lastTurnTerminalTurnId?: string;
+  lastTurnTerminalDispatchAttempt?: number;
+  /** Wall-clock of the first genuine LIVE-work signal observed after the last
+   *  completed terminal, when that work has no managed turn of its own (Web
+   *  Terminal / sandbox direct-submit). Managed turns and retry attempts are
+   *  recognized via currentTurnId / the dispatch high-water instead. This epoch
+   *  keeps the post-terminal settle and self-heal from re-idling a card that a
+   *  direct-submit episode legitimately put back to work. Reset on every
+   *  turn_terminal so a fresh post-terminal window starts clean. In-memory only. */
+  postTerminalLiveWorkAt?: number;
+  lastTurnTerminalStatus?: Extract<import('../types.js').WorkerToDaemon, { type: 'turn_terminal' }>['status'];
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
    * (stamped on the non-idle → idle edge, cleared on any other status). Drives
@@ -738,6 +755,8 @@ export interface DaemonSession {
   activeModel?: string;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Native current selection, separate from the last executed turn_context. */
+  nativeReasoningObservation?: import('../services/native-reasoning-observation.js').NativeReasoningObservation & { workerGeneration: number };
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Undefined means no observation; null means native/default context. */
@@ -861,6 +880,17 @@ export interface DaemonSession {
   lastCliInput?: string;
   /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
   lastCliInputTurnId?: string;
+  /** Inputs sent with a failed-turn rewind directive, until the worker says
+   *  whether it cut the failed turn (`failed_turn_rewind`). Keyed by the
+   *  input's turn id; bounded, in-memory (a dead worker never reports). */
+  pendingFailedTurnRewinds?: Map<string, {
+    failedTurnId: string;
+    mode: 'merge' | 'resend';
+    content: string;
+    failedUserPrompt: string;
+    /** The worker process that was asked; another one never answers. */
+    worker: DaemonSession['worker'];
+  }>;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
@@ -891,7 +921,7 @@ export interface DaemonSession {
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
-  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void; createdAt?: number }>;
   /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
   settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads

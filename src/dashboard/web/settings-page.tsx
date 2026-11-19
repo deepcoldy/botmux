@@ -54,6 +54,7 @@ interface DashboardSettings {
   };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback: boolean;
   reapOrphanTmuxServers: boolean;
   tmuxOrphanSessionSweep: boolean;
   tmuxOrphanSessionBareWrapperKill: boolean;
@@ -61,6 +62,7 @@ interface DashboardSettings {
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
   stuckCardInitiatorKeys: boolean;
+  modelQueueNotify: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -213,7 +215,7 @@ function traexInstallMessage(install: any, tr: (k: string) => string): StatusMes
   return null;
 }
 
-function parseSettings(s: any): DashboardSettings {
+export function parseSettings(s: any): DashboardSettings {
   return {
     groupNamePrefix: typeof s?.groupNamePrefix === 'string' ? s.groupNamePrefix : '',
     worktreeRoot: typeof s?.worktreeRoot === 'string' ? s.worktreeRoot : '',
@@ -231,6 +233,7 @@ function parseSettings(s: any): DashboardSettings {
     },
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
+    terminalEffortWriteback: s?.terminalEffortWriteback === true,
     reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
     tmuxOrphanSessionSweep: s?.tmuxOrphanSessionSweep !== false,
     tmuxOrphanSessionBareWrapperKill: s?.tmuxOrphanSessionBareWrapperKill === true,
@@ -241,6 +244,7 @@ function parseSettings(s: any): DashboardSettings {
     cardBrandLabel: s?.cardBrandLabel !== false,
     // default ON — only an explicit persisted false disables (server snapshot)
     stuckCardInitiatorKeys: s?.stuckCardInitiatorKeys !== false,
+    modelQueueNotify: s?.modelQueueNotify === true,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -914,7 +918,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'terminalEffortWriteback' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'modelQueueNotify' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -995,6 +999,14 @@ export function SettingsBody(props: {
           />
         </SettingsBlock>
         <SettingsBlock id="settings-cards" title={tr('settings.sectionCards')}>
+          <ToggleRow
+            title={tr('settings.modelQueueNotify')}
+            help={tr('settings.modelQueueNotifyHelp')}
+            checked={settings.modelQueueNotify}
+            disabled={dis || savingKey === 'modelQueueNotify'}
+            dataAction="toggle-model-queue-notify"
+            onChange={value => saveBoolean('modelQueueNotify', value)}
+          />
           <ToggleRow
             title={tr('settings.cardBrandLabel')}
             help={tr('settings.cardBrandLabelHelp')}
@@ -1077,6 +1089,13 @@ export function SettingsBody(props: {
             checked={settings.codexRpcInput}
             disabled={dis || savingKey === 'codexRpcInput'}
             onChange={value => saveBoolean('codexRpcInput', value)}
+          />
+          <ToggleRow
+            title={tr('settings.terminalEffortWriteback')}
+            help={tr('settings.terminalEffortWritebackHelp')}
+            checked={settings.terminalEffortWriteback}
+            disabled={dis || savingKey === 'terminalEffortWriteback'}
+            onChange={value => saveBoolean('terminalEffortWriteback', value)}
           />
           <ToggleRow
             title={tr('settings.autoUpgradeCodexSessions')}

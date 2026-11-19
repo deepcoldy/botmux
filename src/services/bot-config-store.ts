@@ -1,5 +1,6 @@
 import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
+import { parseInviteConfig } from './invite-config.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
 import { normalizeIdleSpinSuspendConfig } from '../core/idle-spin-config.js';
 import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
@@ -59,11 +60,15 @@ import {
   serializePinStreamingCardConfigChange,
 } from './pin-streaming-card-change.js';
 import {
+  cliModelMayKeepReasoningEffort,
   cliModelSupportsReasoningEffort,
+  isCodexReasoningCliId,
   isCodexReasoningEffort,
   isConfigurableReasoningCliId,
   reasoningEffortsForCliModel,
+  type ReasoningCatalog,
 } from './codex-reasoning-effort.js';
+import { loadBotCodexReasoningCatalog } from './codex-bot-reasoning-catalog.js';
 import { isCodexServiceTier, isCodexServiceTierCliId } from './codex-service-tier.js';
 import { validateCodexServiceTier } from './codex-service-tier-catalog.js';
 import { botOneShotEnv } from '../core/session-env-resolve.js';
@@ -153,6 +158,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'feedback', configKey: 'feedback', kind: 'json', effect: 'immediate', clearable: true, hint: '最终回答反馈 JSON；默认关闭，enabled=true 后按本 bot 启用；unset 关闭' },
   { key: 'feedbackPresentation', configKey: 'feedbackPresentation', kind: 'json', effect: 'immediate', clearable: true, hint: '反馈卡展示规则 JSON；按群和问题配置轮次、模板与动作；默认关闭' },
   { key: 'groupCreation', configKey: 'groupCreation', kind: 'json', effect: 'immediate', clearable: true, hint: '/g 默认配置 JSON：agents 名称/app ID 数组、tag 个人消息分组名、avatar=logo(默认)|name|off；unset 恢复默认' },
+  { key: 'inviteConfig', configKey: 'inviteConfig', kind: 'json', effect: 'immediate', clearable: true, hint: '/invite all 默认成员 JSON：agents 名称/app ID 数组；与 /g 的 groupCreation 独立；unset 清空' },
   { key: 'oncallGroup', configKey: 'oncallGroup', kind: 'json', effect: 'immediate', clearable: true, hint: '拉起 Oncall 群按钮：enabled 开关及 chatIds 生效群，默认关闭' },
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex/Grok/TraeX/Pi/Kimi 普通飞书对话' },
@@ -527,6 +533,29 @@ async function applyConfigFieldInternal(
       };
     }
   }
+  // A write that sets the Codex model/effort pair is judged against the live
+  // catalogue of the bot's runtime, the one the Dashboard offers levels from.
+  // Probed outside the bots.json lock, like the service-tier check above.
+  const effortPairWrite = spec.configKey === 'reasoningEffort' || spec.configKey === 'model'
+    || spec.configKey === 'cliId' || spec.kind === 'cli';
+  const pairEffort = spec.configKey === 'reasoningEffort'
+    ? isCodexReasoningEffort(effective) ? effective : undefined
+    : bot.config.reasoningEffort;
+  let reasoningCatalog: ReasoningCatalog | null = null;
+  if (effortPairWrite && pairEffort && isCodexReasoningCliId(nextCliId)) {
+    const nextSelection = spec.kind === 'cli' && typeof effective === 'string'
+      ? resolveCliSelection(effective)
+      : undefined;
+    const sameCli = nextCliId === bot.config.cliId;
+    reasoningCatalog = await loadBotCodexReasoningCatalog({
+      ...bot.config,
+      cliId: nextCliId,
+      wrapperCli: nextSelection ? nextSelection.wrapperCli : bot.config.wrapperCli,
+      // A runtime path configured for another CLI is not a Codex binary.
+      cliRuntime: sameCli ? bot.config.cliRuntime : undefined,
+      cliPathOverride: sameCli ? bot.config.cliPathOverride : undefined,
+    });
+  }
 
   const r = await rmwBotEntry<string | null>(larkAppId, (entry) => {
     // Snapshot for the pane-argv budget check on env / envUnset below (the
@@ -608,8 +637,11 @@ async function applyConfigFieldInternal(
         && (!nextReasoningEffort || !isConfigurableReasoningCliId(nextCliId))) {
       return { write: false, result: 'reasoning_effort_not_supported' };
     }
+    // Re-saving an unrelated field must not reject a pair config load keeps.
     if (nextReasoningEffort && isConfigurableReasoningCliId(nextCliId)
-        && !cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort)) {
+        && !(effortPairWrite
+          ? cliModelSupportsReasoningEffort(nextCliId, nextModel, nextReasoningEffort, reasoningCatalog)
+          : cliModelMayKeepReasoningEffort(nextCliId, nextModel, nextReasoningEffort))) {
       return { write: false, result: 'reasoning_effort_not_supported_by_model' };
     }
     const currentServiceTier = isCodexServiceTier(entry.serviceTier)
@@ -1189,6 +1221,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         const parsed = JSON.parse(s);
         if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
         if (spec.configKey === 'groupCreation') return { ok: true, value: parseGroupCreationDefaults(parsed) };
+        if (spec.configKey === 'inviteConfig') return { ok: true, value: parseInviteConfig(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
         if (spec.configKey === 'steward') {
           const steward = normalizeStewardConfig(parsed);

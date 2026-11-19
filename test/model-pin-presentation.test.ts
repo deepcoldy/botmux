@@ -48,8 +48,10 @@ it('explains the current model effort separately from the waiting pin on every e
 });
 
 it('does not promise an unsupported waiting pin effort will apply', () => {
+  // gpt-6-luna has a verified five-level row; a model without one is decided by
+  // the worker's launch-time catalogue check (codex-reasoning-live-catalog.test.ts).
   const view = resolveSessionModelPinView({ session: { cliId: 'codex', reasoningEffort: 'low',
-    modelPin: { model: 'gpt-5.2', effort: 'ultra', source: 'command', setBy: 'owner', setAt: 'now' } },
+    modelPin: { model: 'gpt-6-luna', effort: 'ultra', source: 'command', setBy: 'owner', setAt: 'now' } },
     activeModel: 'gpt-6-astra', activeReasoningEffort: 'low' }, bot)!;
   expect(view.effortDowngradeNote).toBeTruthy(); expect(view.pendingEffortNote).toBeUndefined();
   expect(view.launchEffort).toBe('low');

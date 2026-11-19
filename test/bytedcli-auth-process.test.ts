@@ -61,6 +61,53 @@ esac
     expect(process.env.BOTMUX_IDENTITY_BIN).toBe(wrappers);
   });
 
+  // Output shapes as bytedcli 0.195 prints them (identifiers replaced): the
+  // result on stdout, progress and action_required events on stderr. Since
+  // 0.186 `--begin` on a HOME that already holds a login prints that login and
+  // no link.
+  it('reads bytedcli 0.186+ output: an existing login, a new challenge and an error', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-auth-process-'));
+    roots.push(root);
+    const tools = join(root, 'tools');
+    mkdirSync(tools);
+    const challenge = '{"status":"success","data":{"message":"Login challenge created","login_mode":"device_code","login_status":"pending","challenge_reused":false,"complete_token":"tok-fixture","complete_command":"bytedcli --json auth login --complete tok-fixture","qr_image_path":"/tmp/auth-login.png","verification_uri_complete":"https://cloud.example.test/open/ai/service_account/create_and_bind?code=fixture&domain-id=online"},"error":null,"context":{"execution_time_ms":90,"timestamp":"2026-11-17T12:39:22.093+08:00"}}';
+    const qrEvent = '{"event":"qr_image_ready","data":{"path":"/tmp/auth-login.png","verification_uri_complete":"https://cloud.example.test/open/ai/service_account/create_and_bind?code=fixture&domain-id=online"}}';
+    const already = '{"status":"success","data":{"site":"cn","status":"ready","initialized":true,"authType":"user","identity":{"username":"alice"},"message":"Already authenticated","login_mode":"device_code","login_status":"success","already_authenticated":true},"error":null,"context":{"execution_time_ms":61,"timestamp":"2026-11-17T12:40:35.376+08:00"}}';
+    const statusYes = '{"status":"success","data":{"authenticated":true,"auth_source":"bytecloud_auth","auth_as":"user","profile":null,"token_expires_at":"2026-11-17T14:40:35.000+08:00","bytecloud_auth":{"site":"cn","status":"ready","initialized":true,"authType":"user"}},"error":null,"context":{"execution_time_ms":22}}';
+    const statusNo = '{"status":"success","data":{"authenticated":false,"auth_source":"bytecloud_auth","auth_as":"user","profile":null,"token_expires_at":null,"bytecloud_auth":{"site":"cn","status":"need_login","initialized":true,"nextCommand":"bytedcli auth login"}},"error":null,"context":{"execution_time_ms":41}}';
+    const failure = '{"status":"error","data":null,"error":{"message":"ByteCloud Auth runtime error.: login challenge not found","code":"BYTECLOUD_AUTH_RUNTIME_ERROR","hint":"Retry with --debug to show ByteCloud Auth runtime logs if this keeps failing."},"context":{"execution_time_ms":24}}';
+    const actionRequired = '{"event":"action_required","data":{"title":"Action required","message":"Retry with --debug to show ByteCloud Auth runtime logs if this keeps failing.","code":"BYTECLOUD_AUTH_RUNTIME_ERROR"}}';
+    writeFileSync(join(tools, 'bytedcli'), `#!/bin/sh
+case "$2" in
+  login)
+    if [ -e "$HOME/broken" ]; then printf '%s\\n' '${failure}'; printf '%s\\n' '${actionRequired}' >&2; exit 1; fi
+    if [ -e "$HOME/logged-in" ]; then printf '%s\\n' '${already}'; exit 0; fi
+    printf '%s\\n' '${qrEvent}' >&2; printf '%s\\n' '${challenge}' ;;
+  status)
+    if [ -e "$HOME/logged-in" ]; then printf '%s\\n' '${statusYes}'; else printf '%s\\n' '${statusNo}'; fi ;;
+esac
+`);
+    chmodSync(join(tools, 'bytedcli'), 0o755);
+    vi.stubEnv('HOME', root);
+    vi.stubEnv('PATH', [tools, '/usr/bin', '/bin'].join(delimiter));
+    vi.resetModules();
+    const provider = await import('../src/services/bytedcli-auth.js');
+    for (const [person, marker] of [['ou_alice', 'logged-in'], ['ou_carol', 'broken']]) {
+      mkdirSync(provider.bytedcliHomeFor(person), { recursive: true });
+      writeFileSync(join(provider.bytedcliHomeFor(person), marker), '');
+    }
+
+    expect(await provider.startBytedcliLogin('ou_alice')).toEqual({ state: 'authorized' });
+    expect(await provider.startBytedcliLogin('ou_bob')).toEqual({ state: 'challenge', challenge: {
+      authUrl: 'https://cloud.example.test/open/ai/service_account/create_and_bind?code=fixture&domain-id=online',
+      completeToken: 'tok-fixture',
+    } });
+    expect(await provider.startBytedcliLogin('ou_carol')).toEqual({ state: 'failed',
+      detail: 'BYTECLOUD_AUTH_RUNTIME_ERROR: ByteCloud Auth runtime error.: login challenge not found' });
+    expect(provider.pendingBytedcliChallenge('ou_alice')).toBeNull();
+    expect(provider.pendingBytedcliChallenge('ou_carol')).toBeNull();
+  });
+
   it('removes stale wrappers even after the session marker was already lost', () => {
     const env = {
       PATH: ['/custom/cli-identity/old.bin', '/custom/cli-identity/other.bin/', '/usr/bin'].join(delimiter),

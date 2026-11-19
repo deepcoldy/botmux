@@ -236,7 +236,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionRuntimeEnv',
     fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel', 'sessionEnv.tmuxTitle'],
   },
-  { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval'] },
+  { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval', 'botDefaults.ownerReminderQuietHours', 'botDefaults.ownerReminderQuietHoursStart', 'botDefaults.ownerReminderQuietHoursEnd'] },
   { id: 'long-task-reminder', tab: 'cards', titleKey: 'botDefaults.longTaskReminderTitle', fieldKeys: ['botDefaults.longTaskReminderEnabled', 'botDefaults.longTaskReminderThreshold', 'botDefaults.longTaskReminderInterval'] },
 ];
 
@@ -564,12 +564,7 @@ export type BotDefaultsRow = {
   dormantSessionCount?: number;
   /** Per-bot native execution reminder preferences; absent means opt-in defaults. */
   longTaskReminder?: import('../../services/long-task-reminder-policy.js').LongTaskReminderConfig | null;
-  sessionOwnerReminder?: {
-    enabled: boolean;
-    intervalMinutes: number;
-    text: string;
-    states: Array<'idle' | 'dormant' | 'pending_repo' | 'tui_prompt' | 'agent_attention' | 'limited'>;
-  } | null;
+  sessionOwnerReminder?: import('../../core/session-owner-reminder.js').SessionOwnerReminderConfig | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
   defaultPassthroughCommands?: string[];
@@ -682,6 +677,24 @@ export function mergeModelCandidates(
  * 按需探测某个 CLI 当前可用的模型列表（live 成功时权威，失败时回退静态）。
  * fail-soft：任何错误（网络/404/400/形状异常）都返回 null，调用方回退静态候选。
  */
+/**
+ * Levels the live catalogue reported for a Codex model (`reasoningEffortsByModel`
+ * from /api/cli-options/models), matched like the server-side judgment: exact
+ * slug first, then case-insensitively. undefined = the catalogue has no word on
+ * this model, and the static table applies.
+ */
+export function liveCodexReasoningEfforts(
+  byModel: Readonly<Record<string, readonly string[]>> | undefined,
+  model: string,
+): readonly string[] | undefined {
+  const name = model.trim();
+  if (!byModel || !name) return undefined;
+  if (Object.prototype.hasOwnProperty.call(byModel, name)) return byModel[name];
+  const lower = name.toLowerCase();
+  const key = Object.keys(byModel).find(slug => slug.trim().toLowerCase() === lower);
+  return key === undefined ? undefined : byModel[key];
+}
+
 export async function fetchDetectedModels(
   key: string,
   appId?: string,

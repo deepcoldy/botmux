@@ -355,6 +355,15 @@ export class WorkerSessionEventScope {
     const binding = [...this.bindings.values()].find(value => value.operationId === operationId);
     return binding ? this.snapshot(binding) : undefined;
   }
+  /** Screen observations describe the live process, not the historical
+   * execution a timer inherited. Only an in-process rebind may advance it;
+   * callbacks from a replaced process retain their stale runtime fence. */
+  screenObservationOrigin(): CapturedSessionOrigin | undefined {
+    const observed = this.storage.getStore()?.binding;
+    if (!observed) return undefined;
+    const binding = this.current?.physicalId === observed.physicalId ? this.current : observed;
+    return { bindingId: binding.bindingId, ...(binding.runtime ? { runtime: structuredClone(binding.runtime) } : {}) };
+  }
   capture(): CapturedSessionOrigin | undefined {
     const context = this.storage.getStore(); return context?.binding ? { ...this.snapshot(context.binding, context.execution), ...(context.operationId ? { operationId: context.operationId } : {}) } : undefined;
   }

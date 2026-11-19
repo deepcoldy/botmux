@@ -95,7 +95,9 @@ describe('Antigravity native runtime model', () => {
     startAntigravityCot('native-a', entries, { brainDir, onRuntime: () => { throw new Error('cosmetic callback failure'); }, pollIntervalMs: 10 });
     appendFileSync(path, JSON.stringify({ type: 'PLANNER_RESPONSE', thinking: 'new thinking' }) + '\n');
     await vi.advanceTimersByTimeAsync(20);
-    expect(entries).toHaveBeenCalledWith([{ kind: 'thinking', text: 'new thinking' }]);
+    // The CoT callback also receives the native turn input; this record has no
+    // preceding USER_INPUT boundary, so the second argument is undefined.
+    expect(entries).toHaveBeenCalledWith([{ kind: 'thinking', text: 'new thinking' }], undefined);
   });
 
   it('wires the real worker model publisher to a footer without configured model, usage or turn authority', async () => {

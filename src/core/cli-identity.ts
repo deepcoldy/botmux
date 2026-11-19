@@ -2030,19 +2030,30 @@ export function installLoginShellPathShim(binDir: string): { zdotdir: string; ba
   // instead of prepending some other session's wrapper dir.
   const reprepend = [
     '# botmux trigger-user identity — generated, do not edit.',
-    '# Re-prepend the wrapper dir AFTER path_helper has rebuilt PATH.',
-    'if [ -n "${BOTMUX_WRAPPER_BIN:-}" ]; then',
-    '  case "$PATH:" in',
-    '    "$BOTMUX_WRAPPER_BIN":*) ;;',
-    '    *) PATH="$BOTMUX_WRAPPER_BIN${PATH:+:$PATH}"; export PATH ;;',
-    '  esac',
+    '# Restore session tools AFTER login startup has rebuilt PATH.',
+    '__botmux_tool_path=',
+    'if [ -n "${BOTMUX_WRAPPER_BIN:-}" ] && [ -d "$BOTMUX_WRAPPER_BIN" ]; then',
+    '  __botmux_tool_path="$BOTMUX_WRAPPER_BIN"',
     'fi',
+    // The Linux file sandbox mounts its relay here. A host wrapper can be
+    // absent or unusable in that namespace, even when its locator survives.
+    ...(process.platform === 'linux' ? [
+      'if [ -d /run/sbxbin ]; then',
+      '  __botmux_tool_path="/run/sbxbin${__botmux_tool_path:+:$__botmux_tool_path}"',
+      'fi',
+    ] : []),
     'if [ -n "$BOTMUX_IDENTITY_BIN" ]; then',
+    '  __botmux_tool_path="$BOTMUX_IDENTITY_BIN${__botmux_tool_path:+:$__botmux_tool_path}"',
+    'fi',
+    // Restore one ordered prefix so repeated startup hooks do not prepend
+    // the identity and command directories in front of each other forever.
+    'if [ -n "$__botmux_tool_path" ]; then',
     '  case "$PATH:" in',
-    '    "$BOTMUX_IDENTITY_BIN":*) ;;',
-    '    *) PATH="$BOTMUX_IDENTITY_BIN${PATH:+:$PATH}"; export PATH ;;',
+    '    "$__botmux_tool_path":*) ;;',
+    '    *) PATH="$__botmux_tool_path${PATH:+:$PATH}"; export PATH ;;',
     '  esac',
     'fi',
+    'unset __botmux_tool_path',
     '',
   ].join('\n');
   // zsh: source the user's own file FIRST, then put ourselves back in front —

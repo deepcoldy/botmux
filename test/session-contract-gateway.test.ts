@@ -83,6 +83,18 @@ afterEach(() => {
 });
 
 describe('contract gateway and real worker boundaries', () => {
+  it('admits current Claude effort observations while refusing older sequences and retired runtimes', () => {
+    const s = fixture();
+    const reading = (sequence: number) => ({ type: 'claude_effort', claudeSessionId: 'native1',
+      reasoningEffort: 'medium', sessionContract: s.context(sequence) });
+    expect(s.controller.ingest(reading(2), s.worker)).toMatchObject({ kind: 'current' });
+    expect(s.controller.ingest(reading(1), s.worker)).toMatchObject({ kind: 'reject', reason: 'stale_observation_sequence' });
+    s.controller.reserveBinding('binding-replacement', s.worker);
+    s.controller.bindRuntime('binding-replacement', s.worker,
+      { backend: 'tmux', physicalId: 'new-process', nativeSessionId: 'native1', proof: 'process_start' });
+    expect(s.controller.ingest(reading(3), s.worker)).toMatchObject({ kind: 'reject' });
+  });
+
   it('admits current close receipts while closing without admitting runtime input or stale workers', () => {
     const s = fixture();
     s.controller.beginControl('close');

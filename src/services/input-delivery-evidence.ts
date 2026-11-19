@@ -1,7 +1,17 @@
 import type { SubmitFailureChainKey } from './submit-failure-chain.js';
 import { submitFailureChainKeyOf } from './submit-failure-chain.js';
 
-type Evidence = { writeStartedAtMs?: number; structuredTerminal: boolean };
+type Evidence = { writeStartedAtMs?: number; externalInputGeneration?: number; interruptGeneration?: number; structuredTerminal: boolean };
+
+/** A persistent reattach does not execute the configured resume target, so that
+ * target is not proof of the pane's live native conversation. Wait for an owned
+ * observation instead of mistaking the first config correction for a rotation. */
+export function inputDeliveryObservedSessionIdAtSpawn(
+  willReattachPersistent: boolean,
+  effectiveCliSessionId?: string,
+): string | undefined {
+  return willReattachPersistent ? undefined : effectiveCliSessionId;
+}
 
 /**
  * Evidence can arrive while an adapter is still awaiting its history receipt.
@@ -18,10 +28,10 @@ export class InputDeliveryEvidenceTracker {
     }
   }
 
-  start(key: SubmitFailureChainKey, atMs: number = Date.now()): void {
+  start(key: SubmitFailureChainKey, atMs: number = Date.now(), externalInputGeneration?: number, interruptGeneration?: number): void {
     if (!key.turnId || !Number.isFinite(atMs)) return;
     // A new literal write is a new evidence window, even for a reused id.
-    this.remember(key, { writeStartedAtMs: atMs, structuredTerminal: false });
+    this.remember(key, { writeStartedAtMs: atMs, externalInputGeneration, interruptGeneration, structuredTerminal: false });
   }
 
   observeStructuredTerminal(key: SubmitFailureChainKey): void {
@@ -38,6 +48,14 @@ export class InputDeliveryEvidenceTracker {
 
   writeStartedAtMs(key: SubmitFailureChainKey): number | undefined {
     return key.turnId ? this.evidence.get(submitFailureChainKeyOf(key))?.writeStartedAtMs : undefined;
+  }
+
+  externalInputGenerationAtWrite(key: SubmitFailureChainKey): number | undefined {
+    return key.turnId ? this.evidence.get(submitFailureChainKeyOf(key))?.externalInputGeneration : undefined;
+  }
+
+  interruptGenerationAtWrite(key: SubmitFailureChainKey): number | undefined {
+    return key.turnId ? this.evidence.get(submitFailureChainKeyOf(key))?.interruptGeneration : undefined;
   }
 
   clear(): void {

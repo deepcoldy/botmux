@@ -20,6 +20,7 @@ export type RawDispatchFailureAction = 'fence-generation' | 'workflow-node-fail'
 
 export interface RawDispatchFailureLike {
   runnerGenerationUnsafe?: boolean;
+  traexCatalogAdmissionRequired?: boolean;
 }
 
 /**
@@ -34,6 +35,7 @@ export interface RewrapableSubmissionFailure {
    *  (e.g. a framed runner refused the line before buffering any byte). */
   submissionStarted?: boolean;
   runnerGenerationUnsafe?: boolean;
+  traexCatalogAdmissionRequired?: boolean;
 }
 
 export interface RewrappedSubmissionFailure {
@@ -41,6 +43,7 @@ export interface RewrappedSubmissionFailure {
   recoveryFailureReason?: string;
   submissionStarted: boolean;
   runnerGenerationUnsafe: boolean;
+  traexCatalogAdmissionRequired?: boolean;
 }
 
 /**
@@ -71,6 +74,7 @@ export function rewrapSubmissionFailure(
     ...(recoveryFailureReason ? { recoveryFailureReason } : {}),
     submissionStarted: submissionStarted && e?.submissionStarted !== false,
     runnerGenerationUnsafe: !!e?.runnerGenerationUnsafe,
+    ...(e?.traexCatalogAdmissionRequired ? { traexCatalogAdmissionRequired: true as const } : {}),
   };
 }
 

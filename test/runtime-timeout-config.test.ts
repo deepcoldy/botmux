@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   resolveStuckDetectorTimeoutMs,
   resolveWorktreeSlugAiTimeoutMs,
+  resolveWorktreeCreateTimeoutMs,
 } from '../src/config.js';
 
 describe('runtime timeout config', () => {
@@ -21,6 +22,12 @@ describe('runtime timeout config', () => {
     })).toBe(2_147_483_647);
   });
 
+  it('accepts worktree creation budgets including surrounding whitespace', () => {
+    expect(resolveWorktreeCreateTimeoutMs({ BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: ' 120000 ' })).toBe(120_000);
+    expect(resolveWorktreeCreateTimeoutMs({ BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: '1' })).toBe(1);
+    expect(resolveWorktreeCreateTimeoutMs({ BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: '2147483647' })).toBe(2_147_483_647);
+  });
+
   it.each(['', ' ', '0', '0.5', '1.9', '-1', 'Infinity', 'not-a-number', '2147483648'])(
     'falls back for invalid timer override %j',
     value => {
@@ -28,6 +35,9 @@ describe('runtime timeout config', () => {
       expect(resolveWorktreeSlugAiTimeoutMs({
         BOTMUX_WORKTREE_SLUG_AI_TIMEOUT_MS: value,
       })).toBe(5_000);
+      expect(resolveWorktreeCreateTimeoutMs({
+        BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: value,
+      })).toBe(resolveWorktreeCreateTimeoutMs({}));
     },
   );
 });

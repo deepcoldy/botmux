@@ -62,6 +62,7 @@ describe('consumed input updates addressing without advancing execution', () => 
     const scope: Record<string, unknown> = {
       queuedTypeAheadTurns: queue,
       writeCliPidMarker: () => snapshots.push(structuredClone(queue)),
+      scheduleConsumedQueuedTurnAdvance: vi.fn(),
       inflightInputs: { onTurnStarted: vi.fn() },
       lastWrittenCliInput: undefined,
       send: vi.fn(),
