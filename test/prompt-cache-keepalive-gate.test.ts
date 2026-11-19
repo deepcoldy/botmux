@@ -252,7 +252,7 @@ describe('input box shapes Claude Code 2.1.3xx draws', () => {
   const titled = (top: string) => cells(COMPOSER.replace(`${RULE}\n❯ `, `${top}\n❯ `));
 
   it('the top rule may carry the session name, tags or the history position', () => {
-    expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled(`${'─'.repeat(60)} 修复Kimi后台唤醒后回复不转发飞书 ─`) })).toBeUndefined();
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled(`${'─'.repeat(60)} 修复后台唤醒后回复不转发 ─`) })).toBeUndefined();
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled(`${'─'.repeat(60)} ↯ fast  xhigh ─`) })).toBeUndefined();
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: titled(`─── History 3/10 ${'─'.repeat(60)}`) })).toBeUndefined();
   });
