@@ -29372,6 +29372,7 @@ async function spawnCliBody(
     ? codexCleanupLaunchTarget.codexBin : cliAdapter.resolvedBin;
   let spawnArgs = args;
   let configuredWrapperLaunch: { bin: string; args: string[] } | undefined;
+  let sandboxDirectCliIdentityAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
   let spawnCwd = cfg.workingDir;
 
   // Dashboard「复现命令」：在**任何** sandbox 包装（下方 macOS Seatbelt / Linux bwrap /
@@ -31253,6 +31254,17 @@ async function spawnCliBody(
         if (cfg.cliId === 'traex') {
           traexInstallAtSpawn = { generation: cliSpawnGeneration, identity: resolveInstallIdentity(spawnCliBin) };
         }
+        if (credentialOnlyBwrap && !sandboxRequested && !!cfg.wrapperCli?.trim() && !!claudeDataDir) {
+          // The running CLI must be compared with the install object that was
+          // present for THIS spawn, not with an upgrade that may replace the
+          // path before post-spawn discovery runs.
+          sandboxDirectCliIdentityAtSpawn = {
+            generation: cliSpawnGeneration,
+            identity: resolveInstallIdentity(resolve(spawnCwd, reproduceBaseBin)),
+          };
+        } else {
+          sandboxDirectCliIdentityAtSpawn = undefined;
+        }
         backend.spawn(spawnBin, spawnArgs, {
           cwd: spawnCwd,
           cols: PTY_COLS,
@@ -31533,14 +31545,30 @@ async function spawnCliBody(
   // BFS-descends through the wrapper by comm). session-id
   // MARKER inference is unaffected (the launcher-pid marker is still a valid
   // ancestor of an in-CLI `botmux send`, and the env fallback covers it too).
-  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number): boolean => {
+  const applyResolvedCliPid = (realPid: number, label: string, launcherPid: number, expectedProcStart?: string): boolean => {
+    if (expectedProcStart && readProcessStartIdentity(realPid) !== expectedProcStart) return false;
+    const observed = backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend;
+    const previousCliPid = observed.cliPid;
+    const previousBridgeCliPid = bridgeCliPid;
     log(`${label}: resolved real CLI pid ${realPid} under launcher ${launcherPid} (cliId=${cfg.cliId}); rewiring session discovery + bridge`);
-    (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
+    observed.cliPid = realPid;
     // Per-tick maybeFollowSessionRotationViaPid (bridge 1s poller) reads the
     // module-level bridgeCliPid and re-points to the real CLI's jsonl.
     bridgeCliPid = realPid;
     if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
-    return publishLocalProcessAttestation(realPid);
+    const published = expectedProcStart
+      ? publishLocalProcessAttestation(realPid, undefined, expectedProcStart)
+      : publishLocalProcessAttestation(realPid);
+    if (expectedProcStart && readProcessStartIdentity(realPid) !== expectedProcStart) {
+      // The publisher refuses to substitute a replacement's birth. Roll back
+      // the numeric PID rewiring as well; the daemon can retain only the old,
+      // now-mismatched token and therefore fails closed for the replacement.
+      observed.cliPid = previousCliPid;
+      bridgeCliPid = previousBridgeCliPid;
+      if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
+      return false;
+    }
+    return published;
   };
   const readStablePanePid = (): number | null | undefined => {
     const current = backend;
@@ -31624,29 +31652,61 @@ async function spawnCliBody(
       const slots = processExecutableArgvSlots(launcherComm ?? comm, argv);
       return launcherComm ? slots.slice(1) : slots.slice(0, 1);
     };
-    const directCliIdentity = rewireOwnership
-      ? resolveInstallIdentity(resolve(spawnCwd, reproduceBaseBin)) : undefined;
-    const wrapperIdentities = rewireOwnership && configuredWrapperLaunch
+    // A persistent reattach did not launch the long-lived CLI, and no original
+    // launch identity was persisted with its pane. The install object current
+    // at reattach is not evidence of the object that process started from.
+    const directCliIdentity = rewireOwnership && !actuallyReattachedPersistent
+      && sandboxDirectCliIdentityAtSpawn?.generation === generation
+      ? sandboxDirectCliIdentityAtSpawn.identity : undefined;
+    const configuredScriptIdentities = rewireOwnership && configuredWrapperLaunch
       ? distinctiveExecutableArgv(
           basename(configuredWrapperLaunch.bin),
           [configuredWrapperLaunch.bin, ...configuredWrapperLaunch.args],
         ).map(path => resolveInstallIdentity(resolve(spawnCwd, path)))
-        // A wrapper that resolves to the CLI itself cannot prove that another
-        // persistent layer exists; keep the direct root on this ambiguity.
-        .filter((identity): identity is ExecutableIdentity => identity !== undefined
-          && !sameExecutableObject(identity, directCliIdentity))
+        .filter((identity): identity is ExecutableIdentity => identity !== undefined)
       : [];
+    const wrapperLauncherComm = configuredWrapperLaunch
+      ? wrapperGenericLauncherComm(basename(configuredWrapperLaunch.bin)) : undefined;
+    const wrapperIdentityKind = configuredWrapperLaunch && wrapperLauncherComm
+      && (configuredScriptIdentities.length > 0
+        || basename(configuredWrapperLaunch.bin) === wrapperLauncherComm)
+      ? 'interpreter' : 'native';
+    const configuredWrapperIdentities = wrapperIdentityKind === 'interpreter'
+      ? configuredScriptIdentities
+      : rewireOwnership && configuredWrapperLaunch
+        ? [resolveInstallIdentity(resolve(spawnCwd, configuredWrapperLaunch.bin))]
+          .filter((identity): identity is ExecutableIdentity => identity !== undefined)
+        : [];
+    const ambiguousWrapperCliIdentity = configuredWrapperIdentities.some(identity =>
+      sameExecutableObject(identity, directCliIdentity));
+    const wrapperIdentities = configuredWrapperIdentities.filter(identity =>
+      // A wrapper that resolves to the CLI itself cannot prove that another
+      // persistent layer exists; keep the direct root on this ambiguity.
+      !sameExecutableObject(identity, directCliIdentity));
     const matchesWrapperIdentity = (identity: ExecutableIdentity | undefined): boolean =>
       wrapperIdentities.some(wrapper => sameExecutableObject(identity, wrapper));
+    const isDirectCliProcess = (pid: number, procStart: string): boolean => {
+      const exe = readRunningExeIdentity(pid, procStart);
+      if (exe && sameExecutableObject(exe, directCliIdentity)) return true;
+      // A readable native image is authoritative: process-controlled argv0
+      // cannot turn a different native executable into the configured CLI.
+      // Only an interpreter proceeds to its constrained script slot.
+      if (exe && !wrapperGenericLauncherComm(basename(exe.path))) return false;
+      const argv = readCmdline(pid, { exact: true });
+      if (argv.length === 0) return false;
+      const cwd = readCwd(pid) ?? spawnCwd;
+      const matches = distinctiveExecutableArgv(exe ? basename(exe.path) : undefined, argv).some(path =>
+        sameExecutableObject(resolveInstallIdentity(resolve(cwd, path)), directCliIdentity));
+      return matches && readProcessStartIdentity(pid) === procStart;
+    };
     const isConfiguredWrapper = (pid: number, procStart: string): boolean => {
       if (wrapperIdentities.length === 0 || readProcessStartIdentity(pid) !== procStart) return false;
       const exe = readRunningExeIdentity(pid, procStart);
       if (exe) {
         if (matchesWrapperIdentity(exe)) return true;
-        // A readable native image that differs from the configured wrapper is
-        // positive direct-CLI evidence. Process-controlled argv0 cannot overturn
-        // it; only an interpreter proceeds to its constrained script slot.
-        if (!wrapperGenericLauncherComm(basename(exe.path))) return false;
+        // Only an image proven to be the configured CLI is direct evidence. A
+        // wrapper-file mismatch alone (e.g. an upgrade) still allows wrapper argv.
+        if (sameExecutableObject(exe, directCliIdentity)) return false;
       }
       const argv = readCmdline(pid, { exact: true });
       const cwd = readCwd(pid) ?? spawnCwd;
@@ -31656,34 +31716,77 @@ async function spawnCliBody(
       });
       return matches && readProcessStartIdentity(pid) === procStart;
     };
-    const findLeaf = (lp: number): number | null => findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, {
-      // One process-table snapshot per BFS, not one synchronous ps per node.
-      childrenOf: snapshotChildPids(),
-      commOf: (pid) => {
-        // Filter at the match position, not after BFS returns its first match:
-        // an unreaped zombie or metadata helper must not hide a live sibling.
-        if (isZombieProcess(pid)) return undefined;
-        const comm = readComm(pid);
-        if (comm && targetCliId === 'claude-code'
-          && cliIdForComm(comm, targetCliId) === targetCliId
-          && isClaudeMetadataProbeArgv(readCmdline(pid, { exact: true }))) return undefined;
-        return comm;
-      },
-      isPersistentWrapper: (pid) => {
-        if (!rewireOwnership) return false;
-        const procStart = readProcessStartIdentity(pid);
-        return procStart ? isConfiguredWrapper(pid, procStart) : false;
-      },
-    });
+    const payloadRole = (): 'wrapper' | 'direct' | 'unknown' => {
+      if (!payloadProcStart || readProcessStartIdentity(payloadPid) !== payloadProcStart) return 'unknown';
+      const comm = readComm(payloadPid);
+      if (!comm || cliIdForComm(comm, targetCliId) !== targetCliId) return 'wrapper';
+      if (actuallyReattachedPersistent) return 'unknown';
+      return isConfiguredWrapper(payloadPid, payloadProcStart) ? 'wrapper'
+        : isDirectCliProcess(payloadPid, payloadProcStart) ? 'direct' : 'unknown';
+    };
+    let leafProcStart: string | undefined;
+    const findLeaf = (lp: number): number | null => {
+      // Anchor each match to the birth observed before any comm/exe/argv role
+      // probe. Reading a token only after BFS returns can adopt a replacement's
+      // birth and make the later apply fence bless the reused PID.
+      const candidateProcStarts = new Map<number, string | undefined>();
+      const candidateProcStart = (pid: number): string | undefined => {
+        if (!candidateProcStarts.has(pid)) candidateProcStarts.set(pid, readProcessStartIdentity(pid));
+        return candidateProcStarts.get(pid);
+      };
+      const found = findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, {
+        // One process-table snapshot per BFS, not one synchronous ps per node.
+        childrenOf: snapshotChildPids(),
+        commOf: (pid) => {
+          candidateProcStart(pid);
+          // Filter at the match position, not after BFS returns its first match:
+          // an unreaped zombie or metadata helper must not hide a live sibling.
+          if (isZombieProcess(pid)) return undefined;
+          const comm = readComm(pid);
+          if (comm && targetCliId === 'claude-code'
+            && cliIdForComm(comm, targetCliId) === targetCliId
+            && isClaudeMetadataProbeArgv(readCmdline(pid, { exact: true }))) return undefined;
+          return comm;
+        },
+        isPersistentWrapper: (pid) => {
+          if (!rewireOwnership) return false;
+          const procStart = candidateProcStart(pid);
+          return procStart ? isConfiguredWrapper(pid, procStart) : false;
+        },
+        isUnknownWrapper: (pid) => {
+          if (!rewireOwnership) return false;
+          // Without the original launch identity, neither a same-comm child nor
+          // a wrapper/CLI-identical binary can authorize a new trusted leaf.
+          if (actuallyReattachedPersistent || ambiguousWrapperCliIdentity) return true;
+          const procStart = candidateProcStart(pid);
+          return procStart ? !isConfiguredWrapper(pid, procStart) && !isDirectCliProcess(pid, procStart) : true;
+        },
+      });
+      leafProcStart = found ? candidateProcStart(found) : undefined;
+      return found;
+    };
     const isDirectLeaf = (lp: number): boolean => {
       if (cliIdForComm(readComm(lp) ?? '', targetCliId) !== targetCliId) return false;
       if (!rewireOwnership) return true;
-      // Comm alone cannot distinguish an exec'd CLI from a same-named persistent
-      // wrapper. Descend only when this exact payload still runs the configured
-      // wrapper binary/script; versioned-native and interpreter-hosted CLIs keep
-      // their direct root, as does any payload with ambiguous identity evidence.
-      if (!payloadProcStart || readProcessStartIdentity(lp) !== payloadProcStart || wrapperIdentities.length === 0) return true;
-      return !isConfiguredWrapper(lp, payloadProcStart);
+      return payloadRole() === 'direct';
+    };
+    const lineageContains = (rootPid: number, targetPid: number): boolean => {
+      const childrenOf = snapshotChildPids();
+      const seen = new Set<number>([rootPid]);
+      let frontier = [rootPid];
+      for (let depth = 0; depth < CODEX_LEAF_SEARCH_DEPTH && frontier.length > 0; depth++) {
+        const next: number[] = [];
+        for (const pid of frontier) {
+          for (const child of childrenOf(pid)) {
+            if (child === targetPid) return true;
+            if (seen.has(child)) continue;
+            seen.add(child);
+            next.push(child);
+          }
+        }
+        frontier = next;
+      }
+      return false;
     };
     let attested: { pid: number; procStart: string; published: boolean } | undefined;
     // A live, successfully published leaf is never sent twice: every actual
@@ -31695,9 +31798,16 @@ async function spawnCliBody(
       if (isAttested(leafPid)) return true;
       const procStart = readProcessStartIdentity(leafPid);
       if (!procStart || isZombieProcess(leafPid)) return false;
+      if (rewireOwnership && (procStart !== leafProcStart
+        || !lineageContains(payloadPid, leafPid)
+        || !isDirectCliProcess(leafPid, procStart))) return false;
+      // Close the observation window between the fresh lineage snapshot and
+      // publication. applyResolvedCliPid / publishLocalProcessAttestation repeat
+      // this expectation so a replacement's birth is never substituted.
+      if (!launchPayloadStillCurrent() || readProcessStartIdentity(leafPid) !== procStart) return false;
       log(`Sandbox: attesting CLI leaf pid ${leafPid} under launch payload ${payloadPid} (cliId=${cfg.cliId})`);
       const published = rewireOwnership
-        ? applyResolvedCliPid(leafPid, 'Credential-only sandbox CLI leaf', payloadPid)
+        ? applyResolvedCliPid(leafPid, 'Credential-only sandbox CLI leaf', payloadPid, procStart)
         : publishLocalProcessAttestation(leafPid);
       attested = { pid: leafPid, procStart, published };
       return published;
@@ -31708,7 +31818,7 @@ async function spawnCliBody(
       if (!launchPayloadStillCurrent()) return;
       // A proven direct CLI payload was already attested at bind time. Never
       // replace it with a same-comm subagent discovered on a ready/input edge.
-      if (isDirectLeaf(payloadPid) || isAttested(attested?.pid)) return;
+      if ((rewireOwnership ? payloadRole() !== 'wrapper' : isDirectLeaf(payloadPid)) || isAttested(attested?.pid)) return;
       const leafPid = findLeaf(payloadPid);
       if (leafPid) attest(leafPid);
     };
@@ -31718,6 +31828,7 @@ async function spawnCliBody(
       maxAttempts: Math.ceil(FIRST_PROMPT_HARD_TIMEOUT_MS / intervalMs),
       findRealPid: findLeaf,
       isDirectLeaf,
+      classifyLauncher: () => rewireOwnership ? payloadRole() : undefined,
       getBackend: () => backend,
       getChildPid: () => launchPayloadStillCurrent() ? payloadPid : null,
       applyRealPid: attest,
@@ -37678,8 +37789,12 @@ function stopHeldFailedTurnRewind(): boolean {
 function publishLocalProcessAttestation(
   cliPid?: number,
   enginePid = codexRpcEngine?.appServerPid,
+  expectedCliProcStart?: string,
 ): boolean {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
+  // A caller that already proved a leaf must never have that proof replaced by
+  // whatever process happens to occupy the numeric PID when publication runs.
+  if (cliPid && expectedCliProcStart !== undefined && cliProcStart !== expectedCliProcStart) return false;
   // Freeze the proven birth token; explicit legacy RPC roots keep priority.
   enginePid ??= codexAppEngineIdentity?.pid ?? codexAppRunnerProcessIdentity?.enginePid;
   const engineProcStart = codexAppEngineIdentity && enginePid === codexAppEngineIdentity.pid

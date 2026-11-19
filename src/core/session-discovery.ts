@@ -686,6 +686,9 @@ export function findLaunchedCliPid(
     isZombie?: (pid: number) => boolean;
     /** A matching process to traverse rather than return as the CLI leaf. */
     isPersistentWrapper?: (pid: number, comm: string) => boolean;
+    /** A matching candidate whose executable identity is unknown: prune its
+     * subtree instead of trusting it or a same-comm descendant. */
+    isUnknownWrapper?: (pid: number, comm: string) => boolean;
   } = {},
   filterExecutable?: string,
 ): number | null {
@@ -705,6 +708,7 @@ export function findLaunchedCliPid(
       if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) {
         if (targetCliId === 'codex'
           && (isZombie(pid) || isNonInteractiveCodexArgv(cmdlineOf(pid)))) continue;
+        if (probes.isUnknownWrapper?.(pid, comm)) continue;
         if (probes.isPersistentWrapper?.(pid, comm)) {
           // Exhaust a proven wrapper's subtree before accepting a same-level
           // helper sibling. Keep the global depth budget; a null result lets the
@@ -774,6 +778,9 @@ export interface WrapperRealPidResolveDeps {
    *  realer: stop polling immediately instead of rescanning the tree on every
    *  tick. */
   isDirectLeaf?: (launcherPid: number) => boolean;
+  /** Classify the launcher once per tick. Unknown skips only this tick, direct
+   *  stops discovery, and wrapper permits descendant resolution. */
+  classifyLauncher?: (launcherPid: number) => 'direct' | 'unknown' | 'wrapper' | undefined;
   intervalMs?: number;
   maxAttempts?: number;
   /** Optional wall-clock budget measured from scheduling, including time spent
@@ -820,7 +827,9 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
   const tick = () => {
     if (expired()) return;
     if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
-    if (deps.isDirectLeaf?.(launcherPid)) return;
+    const role = deps.classifyLauncher?.(launcherPid);
+    if (role === 'unknown') { retry(); return; }
+    if (role === 'direct' || (role === undefined && deps.isDirectLeaf?.(launcherPid))) return;
     if (appliedPid !== undefined) {
       if (deps.isAppliedPidValid?.(appliedPid)) { retry(); return; }
       appliedPid = undefined;
