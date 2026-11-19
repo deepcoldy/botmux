@@ -102,7 +102,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `displayName` | Nickname shown in the Dashboard. Display only; it does not rename the app in Feishu |
 | `cliId` | Which CLI to run. Defaults to `claude-code`. See [Multi-CLI adapters](/en/adapters) for the options. `gemini` has been removed: a bot still set to `"gemini"` refuses to start and tells you to switch to `"antigravity"` |
 | `model` | Model passed to the CLI at launch (e.g. `claude --model opus`); empty means the CLI's own default. Several bots on the same CLI can run different models. It is read every time a session starts or resumes, so after a change, existing sessions without a per-group model pick up the new model on their next resume |
-| `reasoningEffort` | Default reasoning effort for new sessions: `low` / `medium` / `high` / `xhigh` / `max` / `ultra`. Supported CLIs: Claude Code, Codex, Codex App, TraeX, Grok, Kimi, ZCode, `remote-runner`. Checked against the CLI and model; unsupported combinations are ignored. For example, Kimi only applies with model `kimi-code/k3` or `kimi-code/k3-256k`, and only has `low` / `high` / `max`; Claude's Haiku models take no reasoning effort |
+| `reasoningEffort` | Default reasoning effort for new sessions: `low` / `medium` / `high` / `xhigh` / `max` / `ultra`. Supported CLIs: Claude Code, Codex, Codex App, TraeX, Grok, Kimi, ZCode, Doubao, `remote-runner`. Checked against the CLI and model; unsupported combinations are ignored. For example, Kimi only applies with model `kimi-code/k3` or `kimi-code/k3-256k`, and only has `low` / `high` / `max`; Claude's Haiku models take no reasoning effort |
 | `groupDefaultModels` | Per-group default model for new topics; Codex and Claude Code for now. See [Per-group default model](#group-default-models) below |
 | `serviceTier` | Codex only: speed tier for new sessions, `default` / `priority` / `ultrafast`. Empty keeps Codex's own setting |
 | `codexProfile` | Codex only: Codex config profile name; the Dashboard can scan and list them |
@@ -114,6 +114,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `cliConfigDir` | Claude Code only: launch with `CLAUDE_CONFIG_DIR=<dir>`, so settings, login and transcripts all come from that directory. New sessions only |
 | `disableCliBypass` | `true` stops botmux from adding approval-bypass flags such as `--yolo` and `--dangerously-*` |
 | `promptCache` | Claude Code only: prompt-cache lifetime and idle keep-alive, e.g. `{"ttl":"1h","keepalive":{"enabled":true}}`. Fields you leave out follow the global setting; off by default |
+| `providerRecovery` | Claude Code only: continue automatically after a transient model-service failure, e.g. `{"enabled":true,"maxWaitMinutes":30}`. Fields you leave out follow the global setting; off by default. See [Global settings: auto-continue after provider failures](/global-settings#provider-recovery) |
 | `skillInjection` | How botmux's built-in skills reach the CLI: `prompt` (per session), `global` (installed into the CLI's global skills dir), or `off`. If unset, it follows the global setting, which defaults to `prompt`. See [Skills](/en/skill-cli) |
 | `customPassthroughCommands` | Extra slash commands passed through to the CLI, e.g. `["/export"]`. Entries that would clash with botmux's own commands are dropped. `/list-slash-command` shows the full list. See [Slash commands](/en/slash-commands) |
 | `startupCommands` | Commands sent to the CLI after it starts and before the first message, e.g. `["/effort ultracode"]`. Re-sent on every fresh start and resume |
@@ -337,7 +338,8 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
     "enabled": true,
     "intervalMinutes": 30,
     "text": "This session is waiting for you. Please follow up.",
-    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"]
+    "states": ["idle", "dormant", "pending_repo", "tui_prompt", "agent_attention", "limited"],
+    "quietHours": { "enabled": false, "start": "22:00", "end": "09:00" }
   }
 }
 ```
@@ -348,10 +350,12 @@ Disabled by default. Both windows default to 10 minutes and accept integers from
 | `intervalMinutes` | Reminder interval in minutes, default 30, range 1–10080 |
 | `text` | Reminder text, up to 500 characters, no `<at>` tags |
 | `states` | Which states trigger reminders: `idle` (CLI idle), `dormant` (session suspended), `pending_repo` (waiting for a repo choice), `tui_prompt` (waiting for a terminal choice), `agent_attention` (the agent asked for a person), `limited` (quota limited). Pick at least one when enabled |
+| `quietHours` | Optional. Off by default. If enabled, the default window is 22:00 to 09:00 the next day. Use `HH:mm` in the Botmux service's local time zone. The window can cross midnight |
 
 - Only sessions split by topic are reminded (topic groups, topics inside regular groups, and DMs with `p2pMode: "thread"`). A session shared by a whole group or a whole DM is not reminded. The session needs an owner.
 - While the state stays the same, it reminds once every `intervalMinutes`; a state change or a new message in the session restarts the timer.
-- When writing it by hand, include all four fields. A missing or invalid field makes the whole block count as unset (that is, off).
+- Quiet hours include the start time and end at the specified end time. Session activity and state are still tracked during the window. The first scan after it ends sends reminders that are still due.
+- Include `enabled`, `intervalMinutes`, `text`, and `states` when configuring by hand. If you provide `quietHours`, include all three of its fields and use different start and end times. An invalid configuration makes the full reminder setting count as unset.
 
 **`noProgressNotify`**: posts a reminder card when a turn shows no confirmed progress for a long time. It's only a reminder: it never restarts, interrupts or retries the task.
 
@@ -484,9 +488,10 @@ Pick one way to turn it on. It **takes effect for new sessions** (`/restart` an 
 Rules:
 
 - Only `"enabled": true` turns it on. Leaving out `tools` covers every tool; an unknown tool name is an error rather than a silent downgrade.
+- Optional `capabilities` switches each capability separately: `lark-user` (Feishu user identity, `lark-cli --as user`), `bytecloud` (ByteCloud: bytedcli, codebase, git push and bitscli / bits-cli, one switch) and `meego` (`bytedcli meego` only; the standalone `meegle` command is not governed). An unknown value is an error. When absent it is derived from `tools` (`lark-cli` → `lark-user`, `bytedcli` → `bytecloud` + `meego`). With `bytecloud` or `meego` left off the matching commands stay native: they run on this machine's own login with no botmux involvement. With `lark-user` left off there are two cases: a legacy config that only sets `tools` (with no `capabilities`) keeps the upstream behavior, where `lark-cli --as user` uses the current turn sender's own authorization; only when `capabilities` is set explicitly without `lark-user` does `lark-cli --as user` run natively on this machine's own lark-cli config and login, with botmux injecting no credentials and issuing no authorization request (`botmux auth request` returns `lark_user_auth_disabled` for lark-cli).
 - When someone who hasn't authorized makes a call, the command is refused and the refusal carries an authorization link. The AI can also send that person a link itself with `botmux auth request` (see [Agent-initiated authorization](/en/cli-commands#agent-auth-request)), or ask them to send `/login` in the topic. Retry after authorizing.
-- It never falls back to running as the bot or as anyone else. `bytedcli` has no bot identity, so an unauthorized call simply fails.
-- Optional fields: `credentialSource` (`auto` by default / `platform` [central platform](/en/platform) only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
+- It never falls back to running as the bot or as anyone else, and there is no machine-login fallback option; a legacy `fallback` field in old configs is ignored. `bytedcli` has no bot identity, so an unauthorized call simply fails.
+- Optional fields: `credentialSource` (`auto` by default / `platform` [central platform](/en/platform) only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `allowSpeakerSwitch` (default `false`: when `true`, a multi-speaker topic lets you prefix a single command with `BOTMUX_AS=<open_id>` to run it as another speaker of the current turn; when off, the default, `BOTMUX_AS` is always refused), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
 
 #### Upgrade note: old-format authorizations need a fresh `/login` {#legacy-user-token}
 

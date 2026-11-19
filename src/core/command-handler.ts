@@ -1,31 +1,33 @@
+import { sessionDelegatedSlashCommands } from './remote-runner-slash.js';
+import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import { resolveSessionModelPinView } from './session-model.js';
 import { sessionContractPrimary } from './session-contract-primary.js';
 import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
-import { resetSessionCodexModelSelection } from './worker-pool.js';
+import { resetSessionCodexModelSelection, dshRuntimeForSession } from './worker-pool.js';
 import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
-import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies, credentialSourceOf, capabilityOn } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
-import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { startBytedcliLogin, completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
 import { meegoLoginCommand } from './provider-auth-request.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { deliverAuthLink } from './auth-link-delivery.js';
-import { platformTeammateVerdict } from './platform-teammate.js';
+import { askPlatformToAuthorize } from './platform-authorization-request.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/commands/runtime.js';
@@ -65,7 +67,7 @@ import { updateReplyCardNativeThinking, replyCardModeFor, updateTurnReplyCard } 
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { scheduleActiveRuntimePatch, sessionSupportsIdleAutoCompact, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { scheduleActiveRuntimePatch, sessionSupportsIdleAutoCompact, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, isResumeRecoveryPlaceholder, forkClosedSession, requestSessionRestart, isSessionTransferring, updateCodexAppEffort, updateCodexCliEffort, interruptCodexAppTurn, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -148,13 +150,16 @@ import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { modelPinText } from './model-pin.js';
 import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
+import { loadSessionCodexReasoningCatalog } from '../services/codex-bot-reasoning-catalog.js';
+import { failedTurnRewindInFlight } from './failed-turn-rewind.js';
 import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
 import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
-import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
+import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, withOpenTranscript, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
+import { REWIND_BACKUP_RETENTION, pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './rewind-backup-retention.js';
 import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
 import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
@@ -174,8 +179,6 @@ import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../serv
 import { projectTitleWithoutTaskMarker, readProjectGroup } from '../services/project-group-store.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import { isTeamBot } from '../services/team-bots-store.js';
-import { readPlatformTeamSync } from '../services/platform-team-store.js';
-import { platformMachineOwner } from '../platform/binding.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { recordCreatedWorktree } from '../services/botmux-worktree-store.js';
@@ -1114,13 +1117,13 @@ async function handleScheduleCommand(
       // workflow commands as them (scheduled-turn-provenance). On the
       // sandboxed relay path the daemon re-checks the creator is still
       // allowed at every run mutation; the default non-sandbox route does
-      // not re-check membership.
-      ownerOpenId: senderOpenId,
-      // union_id is the tenant-stable half of the same identity; it is what a
-      // scheduled turn presents to per-user backends. Only stamped for human
-      // creators (see the call site) — a task created by a bot deliberately
-      // keeps no user identity.
-      ownerUnionId: senderUnionId,
+      // not re-check membership. union_id is the tenant-stable half of the
+      // same identity; it is what a scheduled turn presents to per-user
+      // backends. Only stamped for human creators (see the call site) — a
+      // task created by a bot deliberately keeps no user identity.
+      owner: senderOpenId
+        ? { kind: 'human', openId: senderOpenId, unionId: senderUnionId }
+        : { kind: 'ownerless' },
       deliver: 'origin',
       silent,
     });
@@ -1251,11 +1254,15 @@ async function applyAllowedUsersSet(
   await reply(msg);
 }
 
-function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale): string {
+function bytedcliLoginSuccessReply(
+  botConfig: BotConfig,
+  locale: Locale,
+  headline: 'cmd.login.bytedcli_ok' | 'cmd.login.bytedcli_already' = 'cmd.login.bytedcli_ok',
+): string {
   const policy = botConfig.triggerUserAuth;
-  const enabled = triggerUserAuthApplies(policy, 'bytedcli');
+  const enabled = capabilityOn(policy, 'bytecloud');
   const lines = [
-    t('cmd.login.bytedcli_ok', undefined, locale),
+    t(headline, undefined, locale),
     t(enabled ? 'cmd.login.bytedcli_enabled' : 'cmd.login.bytedcli_configure', undefined, locale),
   ];
   if (enabled && policy?.gitHost) {
@@ -1337,7 +1344,8 @@ async function triggerUserAuthStatusLines(
   senderOpenId: string | undefined,
 ): Promise<string[]> {
   const policy = botCfg.triggerUserAuth;
-  if (!policy?.enabled || !policy.tools.length) return [];
+  const on = (capability: 'lark-user' | 'bytecloud' | 'meego') => capabilityOn(policy, capability);
+  if (!on('lark-user') && !on('bytecloud') && !on('meego')) return [];
   const brand = normalizeBrand(botCfg.brand);
   // lark-cli acts as the person via either the new per-person device-code HOME
   // or a legacy bot-app OAuth token. Both must count (and /login status reads the
@@ -1349,29 +1357,30 @@ async function triggerUserAuthStatusLines(
   const larkAuthorized = senderOpenId !== undefined
     && (hasLarkCliHome(senderOpenId) || !!legacyLarkUser);
 
-  const bytedStatus = policy.tools.includes('bytedcli') ? await bytedcliLoginStatus(senderOpenId) : undefined;
+  const bytedStatus = on('bytecloud') ? await bytedcliLoginStatus(senderOpenId) : undefined;
   const lines = ['Trigger-user auth: 已开启'];
-  for (const tool of policy.tools) {
-    lines.push(`  ${tool}: ${
-      tool === 'lark-cli'
-        ? larkAuthorized
-          ? `以${legacyLarkUser?.userName ? `「${legacyLarkUser.userName}」` : '你自己'}的身份调用`
-          // lark-cli no longer degrades to the bot's own identity: an
-          // unauthorized call is refused, and the refusal carries a ready
-          // device-code link. Saying "running as the bot" here would describe a
-          // fallback that the turn path does not have.
-          : '你未授权 —— 命令会被拒绝；首次被拒时会自动返回授权链接，点开后重试即可'
-        // ByteCloud is a separate identity provider, so this is a genuinely
-        // different verdict from the Lark line above — the same person can be
-        // authorized for one and refused by the other. There is no bot identity
-        // to degrade to here either; the mint path tries the existing HOME even
-        // while a fresh challenge is pending; ask the provider for the current status.
-        : bytedStatus === 'unavailable'
-          ? '授权服务暂时不可用，已有授权会保留；服务恢复后重试，无需重新授权'
-          : bytedStatus === 'authorized'
+  if (on('lark-user')) {
+    lines.push(`  lark-user: ${
+      larkAuthorized
+        ? `以${legacyLarkUser?.userName ? `「${legacyLarkUser.userName}」` : '你自己'}的身份调用`
+        // lark-cli never degrades to the bot's own identity: an unauthorized
+        // call is refused, and the refusal carries a ready device-code link.
+        : '你未授权 —— 命令会被拒绝；首次被拒时会自动返回授权链接，点开后重试即可'
+    }`);
+  }
+  if (on('bytecloud')) {
+    // ByteCloud is a separate identity provider from Lark, so this verdict can
+    // differ from the Lark line above; there is no bot identity to degrade to.
+    lines.push(`  bytecloud（bytedcli / codebase / git push / bitscli）: ${
+      bytedStatus === 'unavailable'
+        ? '授权服务暂时不可用，已有授权会保留；服务恢复后重试，无需重新授权'
+        : bytedStatus === 'authorized'
           ? '以你自己的身份调用'
           : '你未授权 —— 首次调用被拒时会自动返回登录链接'
     }`);
+  }
+  if (on('meego')) {
+    lines.push('  meego（bytedcli meego）: 以你自己的 Meego 登录调用；还没登录时首次调用会私下发你登录链接，也可以发 /login meego');
   }
   return lines;
 }
@@ -1856,7 +1865,7 @@ function resumeResultMessage(result: Awaited<ReturnType<typeof resumeSession>>, 
   if (result.ok) {
     const cliName = sessionCliDisplayName(result.ds);
     const resultLoc = localeForBot(result.ds.larkAppId);
-    return resumeSuccessMessage(result, cliName, resultLoc);
+    return resumeSuccessMessage(result, cliName, resultLoc, dshRuntimeForSession(result.ds));
   }
   switch (result.error) {
     case 'not_closed': return t('card.action.resume_not_closed', undefined, loc);
@@ -1944,10 +1953,15 @@ export async function handleCommand(
         // Do not interrupt a business turn just to change its next launch.
         try {
           const beforeView = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
+          // A pinned Codex level is judged against the live catalogue of the
+          // runtime this session launches (its frozen CLI/runtime/profile).
+          const reasoningCatalog = args[0] !== '--follow-bot' && args[1]
+            ? await loadSessionCodexReasoningCatalog(ds.session, getBot(ds.larkAppId).config)
+            : null;
           const changed = writeSessionModelPin(ds, args[0] === '--follow-bot' ? undefined : {
             model: args[0]!, ...(args[1] ? { effort: args[1] as import('../services/codex-reasoning-effort.js').CodexReasoningEffort } : {}),
             source: 'command', setBy: message.senderId, setAt: new Date().toISOString(),
-          });
+          }, { reasoningCatalog });
           if (changed === false) { await sessionReply(rootId, '本话题未固定，无需解除。'); break; }
           const view = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
           if (!ds.session.modelPin && beforeView?.shadowedBy) {
@@ -3083,7 +3097,12 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.stop.fork_pending', undefined, loc));
           break;
         }
-        if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
+        if (effectiveCliId === 'codex-app' && !isRemoteBackendSession(ds)) {
+          const status = await interruptCodexAppTurn(ds);
+          await sessionReply(rootId, t(`cmd.stop.app_${status}`, undefined, loc));
+          break;
+        }
+        if (ds.initConfig?.codexRpcInput === true || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
           await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
           break;
         }
@@ -3315,6 +3334,7 @@ export async function handleCommand(
                   whiteboardId: current.session.whiteboardId,
                   substituteTrigger: current.pendingSubstituteTrigger,
                   codexAppText: current.pendingCodexAppText,
+                  acceptedInput: current.pendingAcceptedInput,
                   codexAppApplicationContext: current.pendingCodexAppApplicationContext,
                   codexAppMessageContext: current.pendingCodexAppMessageContext,
                   codexAppFollowUps: current.pendingCodexAppFollowUps,
@@ -3388,6 +3408,7 @@ export async function handleCommand(
             publishAttentionPatch(current);
             current.pendingPrompt = undefined;
             current.pendingCodexAppText = undefined;
+            current.pendingAcceptedInput = undefined;
             current.pendingCodexAppApplicationContext = undefined;
             current.pendingCodexAppMessageContext = undefined;
             current.pendingChatContext = undefined;
@@ -3877,6 +3898,11 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.retry.cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, loc));
           break;
         }
+        // Already being re-sent by an input whose CLI restart is still running.
+        if (failedTurnRewindInFlight(ds, failedTurn.turnId)) {
+          await sessionReply(rootId, t('card.action.retry_turn_in_flight', undefined, loc));
+          break;
+        }
         // Strip clientUserMessageId to avoid dedup conflicts (same as retry_last_task)
         const retryCodexAppInput = failedTurn.codexAppInput
           ? (({ clientUserMessageId: _prior, ...input }) => input)(failedTurn.codexAppInput)
@@ -3890,7 +3916,9 @@ export async function handleCommand(
         let accepted = false;
         try {
           if (ds.worker && !ds.worker.killed) {
-            accepted = sendWorkerInput(ds, retryInput, retryTurnId);
+            // A turn that failed without any output is cut first, so the
+            // retry replaces it instead of stacking on top.
+            accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurnResendOf: failedTurn.turnId });
           } else {
             accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
           }
@@ -3907,6 +3935,8 @@ export async function handleCommand(
         // (same post-acceptance pattern as the daemon's live-worker path).
         markRetryAttempt(ds.session);
         rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
+        // The retry is this session's latest turn now: retire the previous card's rows.
+        noteReplyCardTurnStarted(ds, retryTurnId);
         sessionStore.updateSession(ds.session);
         logger.info(`[${logTag}] /retry re-injected turn ${failedTurn.turnId.slice(0, 8)} (attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`);
         await sessionReply(rootId, t('cmd.retry.success', { errorCode: failedTurn.errorCode ?? 'unknown' }, loc));
@@ -3987,7 +4017,7 @@ export async function handleCommand(
         }
         // The canonical resolver follows the frozen config profile and the sandbox
         // BOT_HOME redirect — the paths the CLI actually wrote.
-        const rewindJsonl = ds.session.cliSessionId
+        const rewindTranscript = ds.session.cliSessionId
           ? resolveSessionTranscriptPath({
               cliId: 'claude-code',
               sessionId: ds.session.sessionId,
@@ -3995,8 +4025,18 @@ export async function handleCommand(
               cwd: getSessionWorkingDir(ds),
               larkAppId: ds.larkAppId,
               fresh: true,
-            })?.path ?? null
+            })
           : null;
+        const rewindJsonl = rewindTranscript?.path ?? null;
+        // Every read and the cut re-check the file they open against the tree
+        // the CLI can write to; the resolver's own check is from before. The
+        // backup of such a transcript goes to a daemon-owned directory.
+        const rewindScope = rewindTranscript?.writableTreeRoot
+          ? {
+              writableTreeRoot: rewindTranscript.writableTreeRoot,
+              backupDir: rewindBackupDirForSession(config.session.dataDir, ds.session.sessionId),
+            }
+          : {};
         if (!rewindJsonl) {
           await sessionReply(rootId, t('cmd.rewind.no_transcript', undefined, loc));
           break;
@@ -4007,7 +4047,7 @@ export async function handleCommand(
         // top-level catch only logs, so without this local catch the user gets
         // NO reply while the CLI may already have been stopped.
         try {
-          const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, REWIND_CHECKPOINT_LIMIT);
+          const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, REWIND_CHECKPOINT_LIMIT, rewindScope);
           const formatCheckpointAt = (iso?: string): string => {
             if (!iso) return '-';
             const d = new Date(iso);
@@ -4055,7 +4095,6 @@ export async function handleCommand(
             break;
           }
           const rewindSessionKey = ds.session.sessionId;
-          const rewindSize = statSync(rewindJsonl).size;
           const pendingPreview = pendingRewindPreviews.get(rewindSessionKey);
           if (rewindMatch[2] && pendingPreview && (
             pendingPreview.index !== rewindIndex
@@ -4072,7 +4111,8 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.rewind.confirm_prompt', {
               index: rewindIndex,
               turns: rewindIndex,
-              bytes: rewindSize - rewindTarget.offset,
+              // From the scan's own descriptor: never a second read by path.
+              bytes: rewindTarget.removedBytes,
               preview: rewindTarget.preview || t('cmd.rewind.no_text', undefined, loc),
             }, loc));
             break;
@@ -4142,49 +4182,59 @@ export async function handleCommand(
               if (!await waitForTranscriptQuiet(rewindJsonl)) {
                 return { ok: false as const, code: 'error' as const, error: 'transcript is still being written' };
               }
-              // Re-resolve the target by identity: the file may have gained a turn
-              // between preview and confirm, which shifts every index.
-              const target = findCheckpoint(scanClaudeTranscriptCheckpoints(rewindJsonl, 50), pendingPreview.target);
-              // index must still match: a turn that landed after the preview would
-              // otherwise be removed silently along with the previewed ones.
-              if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
-                return { ok: false as const, code: 'moved' as const };
-              }
-              // Persist replay-state clearing BEFORE the cut: if this throws
-              // (sqlite busy, disk full), nothing has been truncated and the
-              // live session keeps its previous /retry state.
-              const savedReplay = {
-                lastUserPrompt: current.session.lastUserPrompt,
-                lastCliInput: current.session.lastCliInput,
-                lastCliInputTurnId: current.session.lastCliInputTurnId,
-                lastFailedTurn: current.session.lastFailedTurn,
-              };
-              current.session.lastUserPrompt = undefined;
-              current.session.lastCliInput = undefined;
-              current.session.lastCliInputTurnId = undefined;
-              current.session.lastFailedTurn = undefined;
-              try {
-                sessionStore.updateSession(current.session);
-              } catch (err) {
-                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
-                current.session.lastCliInput = savedReplay.lastCliInput;
-                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
-                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
-                return asError(err, 'could not persist rewind state');
-              }
-              let result: RewindResult;
-              try {
-                result = rewindClaudeTranscript(rewindJsonl, target.offset);
-              } catch (err) {
-                // Cut never happened — restore the replay fields so the failed
-                // attempt leaves the session as it was.
-                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
-                current.session.lastCliInput = savedReplay.lastCliInput;
-                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
-                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
-                try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
-                return asError(err);
-              }
+              // The re-scan and the cut go through ONE open descriptor: the
+              // offset is cut on exactly the file it was read from, never on
+              // whatever the path names by the time of the cut.
+              const cut = withOpenTranscript(rewindJsonl, rewindScope, transcript => {
+                // Re-resolve the target by identity: the file may have gained a turn
+                // between preview and confirm, which shifts every index.
+                const target = findCheckpoint(transcript.scan(50), pendingPreview.target);
+                // index must still match: a turn that landed after the preview would
+                // otherwise be removed silently along with the previewed ones.
+                if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
+                  return { ok: false as const, code: 'moved' as const };
+                }
+                // Persist replay-state clearing BEFORE the cut: if this throws
+                // (sqlite busy, disk full), nothing has been truncated and the
+                // live session keeps its previous /retry state.
+                const savedReplay = {
+                  lastUserPrompt: current.session.lastUserPrompt,
+                  lastCliInput: current.session.lastCliInput,
+                  lastCliInputTurnId: current.session.lastCliInputTurnId,
+                  lastFailedTurn: current.session.lastFailedTurn,
+                };
+                const restoreReplay = () => {
+                  current.session.lastUserPrompt = savedReplay.lastUserPrompt;
+                  current.session.lastCliInput = savedReplay.lastCliInput;
+                  current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
+                  current.session.lastFailedTurn = savedReplay.lastFailedTurn;
+                };
+                current.session.lastUserPrompt = undefined;
+                current.session.lastCliInput = undefined;
+                current.session.lastCliInputTurnId = undefined;
+                current.session.lastFailedTurn = undefined;
+                try {
+                  sessionStore.updateSession(current.session);
+                } catch (err) {
+                  restoreReplay();
+                  return asError(err, 'could not persist rewind state');
+                }
+                try {
+                  if (rewindScope.backupDir) mkdirSync(rewindScope.backupDir, { recursive: true, mode: 0o700 });
+                  return { ok: true as const, result: transcript.cut(target.offset) };
+                } catch (err) {
+                  // Cut never happened — restore the replay fields so the failed
+                  // attempt leaves the session as it was.
+                  restoreReplay();
+                  try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
+                  return asError(err);
+                }
+              });
+              if (!cut.ok) return cut;
+              const result: RewindResult = cut.result;
+              // A backup next to the transcript is registered at once, so the
+              // periodic sweep reaches its directory whatever happens next.
+              registerRewindBackup(result.backupPath, config.session.dataDir, note => logger.warn(`[${logTag}] ${note}`));
               // The CLI will cold-resume from the truncated transcript under the SAME
               // native session id, so group-context coverage still marks the dropped
               // turn's background as delivered and it is not re-injected.
@@ -4222,17 +4272,24 @@ export async function handleCommand(
           logger.info(
             `[${logTag}] /rewind rolled back to checkpoint ${rewindIndex}, removed ${rewindOutcome.removedBytes} bytes, backup ${rewindOutcome.backupPath}`,
           );
+          // How long the backup stays (rewind-backup-retention.ts).
+          const backupRetention = {
+            days: Math.round(REWIND_BACKUP_RETENTION.maxAgeMs / 86_400_000),
+            keep: REWIND_BACKUP_RETENTION.maxPerTranscript,
+          };
           const rewindDoneMessage = rewindOutcome.cleanupError
             ? t('cmd.rewind.done_cleanup_warn', {
               turns: rewindIndex,
               bytes: rewindOutcome.removedBytes,
               backup: rewindOutcome.backupPath,
+              ...backupRetention,
               error: rewindOutcome.cleanupError,
             }, loc)
             : t('cmd.rewind.done', {
               turns: rewindIndex,
               bytes: rewindOutcome.removedBytes,
               backup: rewindOutcome.backupPath,
+              ...backupRetention,
             }, loc);
           // The truncation + backup are already durable here, and this notice
           // is the ONLY message carrying the backup path. A send failure
@@ -4246,11 +4303,18 @@ export async function handleCommand(
           } catch (sendErr) {
             logger.warn(`[${logTag}] /rewind succeeded but the done reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}; backup ${rewindOutcome.backupPath}`);
             try {
-              await sessionReply(rootId, t('cmd.rewind.done_plain', { backup: rewindOutcome.backupPath }, loc));
+              await sessionReply(rootId, t('cmd.rewind.done_plain', { backup: rewindOutcome.backupPath, ...backupRetention }, loc));
             } catch (fallbackErr) {
               logger.warn(`[${logTag}] /rewind plain-text fallback reply also failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}; backup ${rewindOutcome.backupPath}`);
             }
           }
+          // The rewind is settled and reported: prune the directory its backup
+          // went to, this backup left alone (rewind-backup-retention.ts). Not
+          // awaited — nothing waits on it.
+          void pruneRewindBackupsBeside(rewindOutcome.backupPath, {
+            dataDir: config.session.dataDir,
+            log: note => logger.info(`[${logTag}] ${note}`),
+          });
         } catch (err) {
           const errorText = err instanceof Error ? err.message : String(err);
           const errnoCode = (err as NodeJS.ErrnoException | null)?.code;
@@ -4330,14 +4394,16 @@ export async function handleCommand(
       case '/schedule': {
         const scheduleArgs = message.content.replace(/^\/schedule\s*/, '');
         const chatId = ds?.chatId!;
+        const scheduleSenderIsUser = message.senderType === 'user';
         await handleScheduleCommand(
-          scheduleArgs, rootId, chatId, deps, larkAppId, message.senderId,
+          scheduleArgs, rootId, chatId, deps, larkAppId,
           // Non-human senders (bots, and anything else Lark reports as an app)
           // must not hand their own identity to a task: a bot-created task that
           // could query as itself would let any caller of that bot borrow its
-          // access, with the audit trail pointing at the bot. Withholding the
-          // union_id here is what makes such a task fail closed later.
-          message.senderType === 'user' ? message.senderUnionId : undefined,
+          // access, with the audit trail pointing at the bot. Such a task is
+          // ownerless and fails closed later.
+          scheduleSenderIsUser ? message.senderId : undefined,
+          scheduleSenderIsUser ? message.senderUnionId : undefined,
         );
         logger.info(`[${logTag}] Schedule command handled`);
         break;
@@ -4558,12 +4624,11 @@ export async function handleCommand(
         // bare and explicit forms; status/done must not report one either.
         const larkPlatformOnly = credentialSourceOf(botCfg2.triggerUserAuth) === 'platform'
           && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 指向
-        // 平台凭据页（一次授权、所有机器通用）；platform 模式下 /login lark|bytedcli
-        // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
+        // 中心化平台来源：本机已绑定且本 bot 的凭据来源不是 local 时，裸 /login 与显式的
+        // /login lark|bytedcli 都请平台给本人发授权卡片，平台没有该端点时回退到平台凭据页。
         const credSource = credentialSourceOf(botCfg2.triggerUserAuth);
         const larkGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        const bytedcliGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli');
+        const bytedcliGoverned = capabilityOn(botCfg2.triggerUserAuth, 'bytecloud');
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
         const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
@@ -4580,8 +4645,8 @@ export async function handleCommand(
             break;
           }
           const tenant = tenantArg ? tenantArg as MeegoTenant : undefined;
-          if (!bytedcliGoverned) {
-            await sessionReply(rootId, t('cmd.login.bytedcli_configure', undefined, loc));
+          if (!capabilityOn(botCfg2.triggerUserAuth, 'meego')) {
+            await sessionReply(rootId, t('cmd.login.meego_native', undefined, loc));
             break;
           }
           if (!isUsableOpenId(loginOpenId)) {
@@ -4600,37 +4665,33 @@ export async function handleCommand(
           }
           break;
         }
+        // A capability that is off is native: this bot never runs it as the
+        // person, so there is nothing to authorize and no link is minted.
+        const nativeLogin = (subCmd === 'bytedcli' || subCmd.startsWith('bytedcli ') && !/^bytedcli\s+(done|完成)$/.test(subCmd)) && !bytedcliGoverned ? 'ByteCloud'
+          : (subCmd === 'lark' || subCmd.startsWith('lark ')) && !larkGoverned && !larkBound ? t('trigger_user_auth.provider_lark', undefined, loc)
+            : undefined;
+        if (nativeLogin) {
+          await sessionReply(rootId, t('cmd.login.native', { provider: nativeLogin }, loc));
+          break;
+        }
         // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
         if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
           && (subCmd === '' || explicitGoverned)) {
           await sessionReply(rootId, t('cmd.login.platform_unbound', undefined, loc));
           break;
         }
-        if (platformCredsUrl && (subCmd === '' || (credSource === 'platform' && explicitGoverned))) {
-          // The platform only issues to the machine owner or a teammate of theirs.
-          // Someone outside every team would authorize there and still get nothing
-          // here, so tell them that up front and offer what does work.
-          const senderUnionId = message.senderUnionId
-            ?? (loginOpenId ? (await resolveUserUnionId(botCfg2.larkAppId, loginOpenId)).unionId : undefined);
-          const owner = platformMachineOwner();
-          const teammate = platformTeammateVerdict({
-            senderUnionId,
-            ownerUnionId: owner.unionId,
-            teams: readPlatformTeamSync(config.session.dataDir),
+        if (platformCredsUrl && (subCmd === '' || explicitGoverned)) {
+          const asked = await askPlatformToAuthorize({
+            botConfig: botCfg2,
+            ...(isUsableOpenId(loginOpenId) ? { openId: loginOpenId } : {}),
+            ...(message.senderUnionId ? { unionId: message.senderUnionId } : {}),
           });
-          if (teammate === 'not_teammate') {
-            const localCommands = [larkGoverned ? '/login lark' : '', bytedcliGoverned ? '/login bytedcli' : '']
-              .filter(Boolean).join(t('cmd.login.platform_not_teammate_or', undefined, loc));
-            await authLinkReply([
-              t('cmd.login.platform_not_teammate_title', undefined, loc), '',
-              t('cmd.login.platform_not_teammate_body', {
-                owner: owner.name ?? t('cmd.login.platform_not_teammate_owner_fallback', undefined, loc),
-              }, loc), '',
-              credSource === 'auto'
-                ? t('cmd.login.platform_not_teammate_local', { commands: localCommands }, loc)
-                : t('cmd.login.platform_not_teammate_platform_only', undefined, loc),
-              t('cmd.login.platform_not_teammate_join', { url: platformCredsUrl }, loc),
-            ].join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
+          if (asked.kind !== 'legacy') {
+            await sessionReply(rootId, asked.kind === 'sent' ? t('cmd.login.platform_sent', undefined, loc)
+              : asked.kind === 'ready' ? t('cmd.login.platform_ready', undefined, loc)
+                : asked.kind === 'undeliverable' ? t('cmd.login.platform_undeliverable', { url: platformCredsUrl }, loc)
+                  : asked.kind === 'request_cap' ? t('cmd.login.platform_request_cap', { url: platformCredsUrl }, loc)
+                    : t('cmd.login.platform_unavailable', undefined, loc));
             break;
           }
           const which = subCmd === 'bytedcli' ? 'bytedcli' : subCmd === 'lark' ? 'lark-cli'
@@ -4638,17 +4699,13 @@ export async function handleCommand(
           const provider = subCmd === 'bytedcli' ? 'ByteCloud' : subCmd === 'lark'
             ? t('trigger_user_auth.provider_lark', undefined, loc)
             : [larkGoverned ? t('trigger_user_auth.provider_lark', undefined, loc) : '', bytedcliGoverned ? 'ByteCloud' : ''].filter(Boolean).join(' / ');
-          const lines = [
+          await authLinkReply([
             t('cmd.login.platform_title', undefined, loc), '',
             t('cmd.login.platform_step1', { provider }, loc),
             platformCredsUrl, '',
             t('cmd.login.platform_step2', undefined, loc), '',
             t('cmd.login.platform_note', { tool: which }, loc),
-          ];
-          if (credSource === 'auto' && subCmd === '') {
-            lines.push('', t('cmd.login.platform_local_hint', { command: larkGoverned ? 'lark' : 'bytedcli' }, loc));
-          }
-          await authLinkReply(lines.join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
+          ].join('\n'), subCmd === 'bytedcli' ? '/login bytedcli' : '/login');
           break;
         }
 
@@ -4677,11 +4734,11 @@ export async function handleCommand(
             if (!platformCredsUrl) lines.push(t('cmd.login.platform_unbound', undefined, loc));
           } else if (larkBound) {
             lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
-          } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
+          } else if (!platformCredsUrl && loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
-          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
+          if (!platformCredsUrl && loginOpenId && bytedcliGoverned) {
             const status = await bytedcliLoginStatus(loginOpenId);
             lines.push(t(
               status === 'unavailable' ? 'cmd.login.bytedcli_unavailable'
@@ -4690,6 +4747,9 @@ export async function handleCommand(
               undefined,
               loc,
             ));
+          }
+          if (loginOpenId && capabilityOn(botCfg2.triggerUserAuth, 'meego')) {
+            lines.push(t('cmd.login.meego_status', undefined, loc));
           }
           // Legacy bot-app OAuth status when lark-cli is not governed by the
           // per-person device-code flow.
@@ -4851,16 +4911,29 @@ export async function handleCommand(
                   : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
             break;
           }
-          const started = await beginBytedcliLogin(loginOpenId);
-          if (!started) {
-            await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { detail: 'bytedcli auth login --begin' }, loc));
+          // Someone already logged in is told so, whatever the CLI version.
+          // Same order as the wrapper's request: finish a link they already
+          // approved, then ask whether a login is in force, only then start.
+          const pendingChallenge = pendingBytedcliChallenge(loginOpenId);
+          const alreadyAuthorized = (pendingChallenge
+            && (await completeBytedcliLogin(loginOpenId, pendingChallenge)).state === 'authorized')
+            || (await describeBytedcliAuth(loginOpenId)).state === 'authorized';
+          // Newer bytedcli also answers `--begin` with the login it already
+          // holds instead of a link: that is success, not a failure to start.
+          const started = alreadyAuthorized ? { state: 'authorized' as const } : await startBytedcliLogin(loginOpenId);
+          if (started.state === 'authorized') {
+            await sessionReply(rootId, bytedcliLoginSuccessReply(botCfg2, loc, 'cmd.login.bytedcli_already'));
+            break;
+          }
+          if (started.state === 'failed') {
+            await sessionReply(rootId, t('cmd.login.bytedcli_begin_failed', { detail: started.detail }, loc));
             break;
           }
           await authLinkReply([
             t('cmd.login.bytedcli_title', undefined, loc),
             '',
             t('cmd.login.bytedcli_step1', undefined, loc),
-            started.authUrl,
+            started.challenge.authUrl,
             '',
             t('cmd.login.bytedcli_step2', undefined, loc),
             '',
@@ -7054,8 +7127,9 @@ export async function handleCommand(
           : [];
         const mcpServers = listMcpServerNames(workingDir);
 
+        const delegatedCommands = [...sessionDelegatedSlashCommands(botCfg, ds, config.daemon.backendType)];
         const card = buildSlashListCard(
-          { cliName, builtin, adapterDefaults, custom, discovered, workingDir, mcpServers, discoverySupported },
+          { delegatedCommands, cliName, builtin, adapterDefaults, custom, discovered, workingDir, mcpServers, discoverySupported },
           loc,
         );
         await sessionReply(rootId, card, 'interactive');
@@ -7071,6 +7145,7 @@ export async function handleCommand(
           : configuredRuntimeDisplayName(botCfg?.cliRuntime)
             ?? getCliDisplayName(botCfg?.cliId ?? 'claude-code');
         const passthroughCommands = [...resolvePassthroughCommands(helpAppId, ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId)];
+        const delegatedCommands = sessionDelegatedSlashCommands(botCfg, ds, config.daemon.backendType);
         const help = [
           t('help.heading_session', undefined, loc),
           ...(['codex', 'codex-app'].includes(ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? botCfg?.cliId ?? '')
@@ -7124,11 +7199,11 @@ export async function handleCommand(
           t('help.schedule_formats', undefined, loc),
           '',
           t('help.heading_adopt', undefined, loc),
-          t('help.adopt', undefined, loc),
-          t('help.adopt_pane', undefined, loc),
-          t('help.adopt_orca', undefined, loc),
+          ...(delegatedCommands.has('/adopt')
+            ? [t('help.remote_runner_adopt', undefined, loc)]
+            : [t('help.adopt', undefined, loc), t('help.adopt_pane', undefined, loc), t('help.adopt_orca', undefined, loc)]),
           t('help.resume', { cliName }, loc),
-          t('help.detach', undefined, loc),
+          t(delegatedCommands.has('/detach') ? 'help.remote_runner_detach' : 'help.detach', undefined, loc),
           '',
           t('help.heading_collab', undefined, loc),
           t('help.introduce', undefined, loc),

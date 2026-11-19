@@ -10,6 +10,16 @@ describe('schedule IPC error text for sandboxed sessions', () => {
     'schedule_run_as_invalid',
     'schedule_run_as_unresolved',
     'schedule_run_as_not_allowed',
+    'schedule_child_one_shot_disabled',
+    'schedule_child_one_shot_parent_ineligible',
+    'schedule_child_one_shot_descendant_denied',
+    'schedule_child_one_shot_scope_invalid',
+    'schedule_child_one_shot_requires_once',
+    'schedule_child_one_shot_in_past',
+    'schedule_child_one_shot_horizon_exceeded',
+    'schedule_child_one_shot_identity_isolation_required',
+    'schedule_child_one_shot_authority_changed',
+    'schedule_child_one_shot_task_limit',
   ])('maps %s to an actionable Chinese message', code => {
     const text = scheduleIpcErrorMessage(code);
     expect(text).toMatch(/[一-鿿]/);
@@ -27,10 +37,16 @@ describe('schedule IPC error text for sandboxed sessions', () => {
   // 行为用例覆盖。
   it('names exactly the codes the daemon emits', () => {
     const daemon = readFileSync('src/daemon.ts', 'utf8');
+    const childPolicy = readFileSync('src/core/schedule-child-one-shot.ts', 'utf8');
     for (const code of ['schedule_working_dir_forbidden', 'schedule_mutation_scope_forbidden',
       'schedule_direct_task_limit', 'schedule_run_as_invalid', 'schedule_run_as_unresolved',
-      'schedule_run_as_not_allowed']) {
-      expect(daemon).toContain(`'${code}'`);
+      'schedule_run_as_not_allowed', 'schedule_child_one_shot_disabled',
+      'schedule_child_one_shot_parent_ineligible', 'schedule_child_one_shot_descendant_denied',
+      'schedule_child_one_shot_scope_invalid', 'schedule_child_one_shot_requires_once',
+      'schedule_child_one_shot_in_past', 'schedule_child_one_shot_horizon_exceeded',
+      'schedule_child_one_shot_identity_isolation_required', 'schedule_child_one_shot_authority_changed',
+      'schedule_child_one_shot_task_limit']) {
+      expect(`${daemon}\n${childPolicy}`).toContain(`'${code}'`);
     }
   });
 });

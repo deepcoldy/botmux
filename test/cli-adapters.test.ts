@@ -28,7 +28,7 @@ vi.mock('node:child_process', () => ({
   execFile: vi.fn((_bin, _args, _opts, cb) => { cb(null, '{}'); }),
 }));
 
-import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { createCliAdapterSync, resolveEffectiveCliId } from '../src/adapters/cli/registry.js';
 import { t } from '../src/i18n/index.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { shouldWriteNow } from '../src/utils/input-gate.js';
@@ -952,14 +952,21 @@ describe('codex buildArgs', () => {
     expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
-  it('traex RPC mode: same --remote viewer args + update-check disabled', () => {
+  it.each([
+    { toggle: true, restricted: false, flag: true },
+    { toggle: true, restricted: true, flag: false },
+    { toggle: false, restricted: false, flag: false },
+    { toggle: false, restricted: true, flag: false },
+  ])('traex RPC viewer: toggle=$toggle restricted=$restricted', ({ toggle, restricted, flag }) => {
     const traex = createTraexAdapter('/bin/traex');
     const args = traex.buildArgs({
       sessionId: 'sess-rpc', resume: true,
       remoteWsUrl: 'ws://127.0.0.1:9932', remoteThreadId: 'thread-xyz',
-      bypassHookTrust: true,
+      bypassHookTrust: toggle,
+      disableCliBypass: restricted,
     });
     expect(args).toEqual([
+      ...(flag ? ['--dangerously-bypass-hook-trust'] : []),
       '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
       '-c', 'check_for_update_on_startup=false', 'thread-xyz',
     ]);
@@ -1286,6 +1293,19 @@ describe('codex-app buildArgs', () => {
     expect(args).not.toContain('--strict-resume');
   });
 
+  it('disables the runner fallback catalogue when the bare Codex runtime cannot attest the provider', () => {
+    const direct = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
+    expect(direct).not.toContain('--codex-reasoning-catalog');
+
+    const blind = adapter.buildArgs({
+      sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123',
+      allowCodexReasoningCatalog: false,
+    });
+    const index = blind.indexOf('--codex-reasoning-catalog');
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(blind[index + 1]).toBe('off');
+  });
+
   it('requires strict thread resume for a quiet maintenance restore without injecting a prompt', () => {
     const normal = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123' });
     const quiet = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123', quietResume: true });
@@ -1586,15 +1606,71 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(args.some(a => /runner\.js$/.test(a))).toBe(false);
   });
 
-  it('passes --resume for session resume', () => {
+  it('passes --resume <native id> for a precise session resume', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
-    expect(args).toContain('--resume');
-    expect(args).toContain('abc-123');
+    // Behaviour, not an argv snapshot: the id follows --resume, and nothing else
+    // (no bare --patch split, no stray resume flag) is added.
+    const resumeAt = args.indexOf('--resume');
+    expect(resumeAt).toBeGreaterThanOrEqual(0);
+    expect(args[resumeAt + 1]).toBe('abc-123');
+    expect(args.filter(arg => arg === '--resume')).toHaveLength(1);
   });
 
-  it('passes bare --resume (no session id) to read resume.txt', () => {
-    const args = adapter.buildArgs({ sessionId: 's', resume: true });
-    expect(args).toEqual(['--resume']);
+  // Regression: the launcher's bare `--resume` does NOT mean "this session" —
+  // it reads ~/.dsh-tui/resume.txt, the machine-wide pointer to whatever
+  // conversation any process touched last (possibly a sibling bot's). Without a
+  // native id the only safe launch is a fresh one: a bare --resume would
+  // silently resume somebody else's history.
+  it('never emits a bare --resume: a resume without a native id starts fresh', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: undefined });
+    expect(args).not.toContain('--resume');
+    expect(args.filter(arg => arg.startsWith('--resume'))).toEqual([]);
+  });
+
+  // The adapter capability behind the worker's Tier-0 fresh demotion: without
+  // it the launch stays `resume: true` in every upper layer (closed card,
+  // resume receipt) even though the CLI starts blank.
+  it('declares resumeRequiresCliSessionId (an id is required to restore history)', () => {
+    expect(adapter.resumeRequiresCliSessionId).toBe(true);
+  });
+
+  // The worker never constructs the adapter from the raw bot `cliId`: a dsh
+  // bot with dshRuntime='tui' resolves through `resolveEffectiveCliId`. Pin the
+  // behaviour on THAT path, so a regression in the mapping (not just in the
+  // adapter literal) is caught.
+  it('the worker-resolved dsh-tui adapter cannot emit a bare --resume', () => {
+    const resolved = createCliAdapterSync(resolveEffectiveCliId('dsh', 'tui'));
+    expect(resolved.id).toBe('dsh-tui');
+    expect(resolved.resumeRequiresCliSessionId).toBe(true);
+    expect(resolved.buildArgs({ sessionId: 's', resume: true })).not.toContain('--resume');
+    expect(resolved.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'native-9' }))
+      .toContain('native-9');
+    // Headless dsh is a different adapter and keeps its own behaviour.
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', 'official')).id).toBe('dsh');
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', undefined)).id).toBe('dsh');
+  });
+
+  // dsh-tui paints the alternate screen and owns its transcript redraw, so a
+  // read-only web terminal has no xterm/tmux scrollback to page. The only way
+  // to reach history is forwarding SGR wheel events back to the CLI — the
+  // narrow, rate-limited `type:'scroll'` path this flag opts into.
+  it('declares readOnlyRemoteScroll so read-only viewers can forward wheel scroll', () => {
+    expect(createDshTuiAdapter().readOnlyRemoteScroll).toBe(true);
+  });
+
+  it('the worker-resolved dsh-tui adapter also forwards wheel scroll', () => {
+    const resolved = createCliAdapterSync(resolveEffectiveCliId('dsh', 'tui'));
+    expect(resolved.id).toBe('dsh-tui');
+    expect(resolved.readOnlyRemoteScroll).toBe(true);
+  });
+
+  // The opt-in is dsh-tui-only: headless dsh speaks JSON-RPC over a plain log
+  // and never parses SGR wheel input, so forwarding a wheel there would be a
+  // no-op while wrongly suppressing the read-only page's own fallback path.
+  it('headless dsh never opts into remote scroll', () => {
+    expect(createDshAdapter('/opt/dsh/bin/dsh').readOnlyRemoteScroll).toBeUndefined();
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', 'official')).readOnlyRemoteScroll)
+      .toBeUndefined();
   });
 
   it('omits --resume on fresh spawn when the question bridge is disabled', () => {
@@ -1624,6 +1700,11 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
       expect(args).not.toContain('--patch');
       expect(args).toContain('--resume');
       expect(args).toContain('abc-123');
+      // A resume intent WITHOUT the native id demotes to a fresh launch, but
+      // the question-bridge overlay must still ride along.
+      const demoted = bridgeAdapter.buildArgs({ sessionId: 's', resume: true });
+      expect(demoted).not.toContain('--resume');
+      expect(demoted.some(arg => arg.startsWith('--patch='))).toBe(true);
       const readonly = bridgeAdapter.sandboxReadonlyPaths?.();
       expect(readonly?.length).toBe(1);
       expect(patchArg).toContain(readonly![0]);

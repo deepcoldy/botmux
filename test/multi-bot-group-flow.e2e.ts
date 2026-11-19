@@ -31,6 +31,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 // ─── Mock modules ────────────────────────────────────────────────────────────
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: vi.fn(), killWorker: vi.fn(), initWorkerPool: vi.fn(),
 }));
 

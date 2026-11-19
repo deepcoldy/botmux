@@ -24,12 +24,12 @@ import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState }
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
-import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, buildTurnSpeakersBlock, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
@@ -38,7 +38,9 @@ import {
   buildBuiltinSkillCatalogBlock,
   builtinSkillHelpPointer,
   chatManagerEnabledForApp,
+  type BuiltinSkillEntry,
 } from '../skills/injection-mode.js';
+import { compactSkillTriggerSummary } from './skills/prompt.js';
 import { resolveConditionalLine } from '../skills/effective-builtins.js';
 import {
   getSessionPersistentBackendType,
@@ -73,13 +75,17 @@ import { validateZellijAdoptTarget } from './zellij-adopt-discovery.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
-import type { ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
+import { sandboxEnabled } from '../adapters/backend/sandbox.js';
+import { codexRpcEligible } from '../codex-rpc-lifecycle.js';
+import type { AcceptedCommandInput, ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { messageMentionsBot, type MessageResource } from '../im/lark/message-parser.js';
-import type { ResolvedSender } from '../im/lark/identity-cache.js';
+import { getIdentity, type ResolvedSender } from '../im/lark/identity-cache.js';
+import { capabilityOn } from '../services/trigger-user-auth.js';
+import { isSerialGroupInput } from './trusted-session-controller.js';
 import {
   activeSessionKey,
   sessionKey,
@@ -271,6 +277,7 @@ async function resumeRestoredPendingRepoSetup(
         promptInjection: sessionPromptInjection(ds),
         substituteTrigger: ds.pendingSubstituteTrigger,
         codexAppText: ds.pendingCodexAppText,
+        acceptedInput: ds.pendingAcceptedInput,
         codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
         codexAppMessageContext: ds.pendingCodexAppMessageContext,
         // This recovery completes the original fresh pending-repo launch.
@@ -1013,7 +1020,7 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
 function renderRoleContextBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
-  opts?: { followUp?: boolean },
+  opts?: { followUp?: boolean; escapeTagLikeContent?: boolean },
 ): string {
   if (!larkAppId || !chatId) return '';
 
@@ -1026,7 +1033,10 @@ function renderRoleContextBlock(
   if (opts?.followUp && injectMode === 'once') return '';
 
   const ctx = roleSource === 'team' ? 'team' : 'group';
-  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${roleContent}\n</role>`;
+  const renderedRoleContent = opts?.escapeTagLikeContent
+    ? escapeXmlTagLikeTokens(roleContent)
+    : roleContent;
+  return `<role context="${ctx}" chat_id="${xmlEscape(chatId)}">\n${renderedRoleContent}\n</role>`;
 }
 
 export function renderProjectGroupModeBlock(
@@ -1075,7 +1085,7 @@ export function renderStewardContextBlock(larkAppId: string | undefined, chatId:
 function renderApplicationRoleBlock(
   larkAppId: string | undefined,
   chatId: string | undefined,
-  opts?: { followUp?: boolean },
+  opts?: { followUp?: boolean; escapeTagLikeContent?: boolean },
 ): string {
   return [
     renderRoleContextBlock(larkAppId, chatId, opts),
@@ -1298,6 +1308,7 @@ function credentialBoundaryForPrompt(
   chatId: string | undefined,
   resume: boolean,
   locale?: Locale,
+  speakers?: ReadonlyArray<{ openId: string; name?: string }>,
 ): string {
   if (!larkAppId) return '';
   try {
@@ -1307,8 +1318,36 @@ function credentialBoundaryForPrompt(
       managedLarkToolAppIdForPrompt(larkAppId, sessionId, chatId, resume),
       locale,
       sessionIsNoTransport(larkAppId, chatId),
+      speakers,
     );
   } catch { return ''; }
+}
+
+/**
+ * The people of the running turn once `sender`'s message joins it, when that is more than one
+ * and the session can run a call as a chosen speaker (proven identity model, a per-person
+ * capability on). From the daemon's own speaker set plus the sender, who is not in it yet.
+ */
+export function turnSpeakersForPrompt(
+  larkAppId: string | undefined, sessionId: string, sender: ResolvedSender | undefined,
+): Array<{ openId: string; name?: string }> | undefined {
+  if (!larkAppId || config.crossPrincipalInterruption) return undefined;
+  let ds: ReturnType<typeof findActiveBySessionId>;
+  try {
+    const policy = getBot(larkAppId).config.triggerUserAuth;
+    if (policy?.allowSpeakerSwitch !== true
+      || !(capabilityOn(policy, 'lark-user') || capabilityOn(policy, 'bytecloud'))) return undefined;
+    ds = findActiveBySessionId(sessionId);
+    if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return undefined;
+    // A serial group queues each message as its own turn: nobody merges into someone else's turn.
+    if (isSerialGroupInput(ds, { requestLarkAppId: larkAppId, senderType: 'user' })) return undefined;
+  } catch { return undefined; }
+  const openIds = (ds.managedTurnOrigin?.speakers ?? []).map(s => s.openId);
+  if (sender?.type === 'user' && sender.openId) openIds.push(sender.openId);
+  const people = [...new Set(openIds)];
+  return people.length > 1
+    ? people.map(openId => ({ openId, name: (sender?.openId === openId ? sender.name : undefined) ?? getIdentity(larkAppId, openId)?.name }))
+    : undefined;
 }
 
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
@@ -1423,12 +1462,75 @@ type NewTopicOpts = {
   solo?: boolean;
   /** solo 裸文本时用于剥掉开头的自 @（同 buildBridgeInputContent）。 */
   selfMention?: { name?: string | null; openId?: string | null };
+  /** Force the compact first-turn envelope for a TraeX RPC session. */
+  traexRpcContextEnabled?: boolean;
 };
 
 type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
   | 'summaryMemory' | 'whiteboard' | 'groupJoin' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
+
+function buildCompactTraexRoutingHints(
+  locale: Locale | undefined,
+  noTransport: boolean,
+  replyDelivery: ReplyDelivery,
+): string[] {
+  const full = buildBotmuxShellHints(locale, noTransport, replyDelivery);
+  if (noTransport || replyDelivery === 'transcript') return full;
+
+  const verboseKeys = [
+    'ai.shell.intro',
+    'ai.shell.commands_are_shell',
+    'ai.shell.how_to_send',
+    'ai.shell.multiline_heredoc',
+    'ai.shell.heredoc_example',
+    'ai.shell.helpers',
+    'ai.shell.when_to_send',
+    'ai.shell.mention_gate',
+  ];
+  const replaced = new Set(verboseKeys.map(key => escapeXmlTagLikeTokens(t(key, undefined, locale))));
+  const preservedConditionalHints = full.filter(line => !replaced.has(line));
+  const en = (locale ?? getDefaultLocale()) === 'en';
+  const compact = en
+    ? [
+        'Lark session: terminal output is invisible; reply with the shell command `botmux send`.',
+        'For multiline text use quoted heredoc/stdin or UTF-8 `--content-file`; never pass literal \\n or JSON-escaped text. Attach with `--images`, `--files`, or `--videos` plus `--video-covers`.',
+        "Example:\n```bash\nbotmux send <<'EOF'\nline 1\nline 2\nEOF\n```",
+        'Helpers: `botmux history`; `botmux quoted <message_id>` only when the prompt says a message was quoted; `botmux bots list`.',
+        'Every `botmux send` must choose exactly one: `--mention <open_id:name>`, `--mention-back`, or `--no-mention`; collaboration with another bot requires `--mention`.',
+        'Respond to addressed messages at least once via `botmux send`; only unrelated messages use final `BOTMUX_NOTHING_TO_SEND`.',
+      ]
+    : [
+        '飞书会话中终端输出用户不可见；回复用 shell 命令 `botmux send`。',
+        '多行正文用 quoted heredoc/stdin 或 UTF-8 `--content-file`，不得传字面量 `\\n` 或 JSON 转义文本；附件用 `--images`/`--files`/`--videos` 及 `--video-covers`。',
+        "示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
+        '辅助：`botmux history`；仅在 prompt 提示引用时用 `botmux quoted <message_id>`；查群内 bot 用 `botmux bots list`。',
+        '每次 `botmux send` 必须三选一：`--mention <open_id:名字>` / `--mention-back` / `--no-mention`；与其他 bot 协作必须 `--mention`。',
+        '发给你的消息至少用 `botmux send` 回应一次；只有完全无关的消息才在 final 输出 `BOTMUX_NOTHING_TO_SEND`。',
+      ];
+  return [...compact.map(escapeXmlTagLikeTokens), ...preservedConditionalHints];
+}
+
+function buildCompactTraexBuiltinSkillCatalog(
+  entries: BuiltinSkillEntry[],
+  locale: Locale | undefined,
+): string {
+  if (entries.length === 0) return '';
+  const instruction = (locale ?? getDefaultLocale()) === 'en'
+    ? 'Trigger index; run `botmux skill show <name>` before using a matching skill.'
+    : '技能触发索引；匹配后先运行 `botmux skill show <name>` 读取完整说明。';
+  const skills = entries.map((entry) => {
+    const trigger = compactSkillTriggerSummary(entry.description);
+    return `  <skill name="${xmlEscape(entry.name)}"${trigger ? ` trigger="${xmlEscape(trigger)}"` : ''} />`;
+  });
+  return [
+    '<botmux_builtin_skills>',
+    `  <instruction>${escapeXmlTagLikeTokens(instruction)}</instruction>`,
+    ...skills,
+    '</botmux_builtin_skills>',
+  ].join('\n');
+}
 
 /** opening 的 hook 模式（#794 后续）：whiteboard/sender/mentions 搬进 hook envelope，
  *  PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。与 follow-up 同一套
@@ -1468,7 +1570,17 @@ function buildNewTopicBlocks(
   // transcript + solo，首轮同样去壳。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection);
-  const bare = replyDelivery === 'transcript' && opts?.solo === true;
+  let compactTraexRpcContext = false;
+  if (cliId === 'traex') {
+    try {
+      compactTraexRpcContext = opts?.traexRpcContextEnabled
+        ?? getBot(opts?.larkAppId ?? '').config.codexRpcInput
+        ?? config.codexRpcInputDefault;
+    } catch {
+      compactTraexRpcContext = opts?.traexRpcContextEnabled ?? config.codexRpcInputDefault;
+    }
+  }
+  const bare = replyDelivery === 'transcript' && opts?.solo === true && !compactTraexRpcContext;
   // Built by the daemon, whose own env never carries a session marker: the
   // session row decides (a legacy node worker never comes through here).
   const sessionKind: WorkflowSessionKind = opts?.workflowNodeSession ? 'botNode' : 'ordinary';
@@ -1476,7 +1588,9 @@ function buildNewTopicBlocks(
   // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind, hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId) });
+    : compactTraexRpcContext
+      ? buildCompactTraexRoutingHints(locale, noTransport, replyDelivery)
+      : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind, hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId) });
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1514,7 +1628,9 @@ function buildNewTopicBlocks(
         excludeRoutingCovered: true,
         sessionKind,
       });
-      skillBlock = buildBuiltinSkillCatalogBlock(entries, locale);
+      skillBlock = compactTraexRpcContext
+        ? buildCompactTraexBuiltinSkillCatalog(entries, locale)
+        : buildBuiltinSkillCatalogBlock(entries, locale);
     } else if (mode === 'off') {
       skillBlock = builtinSkillHelpPointer(locale, { sessionKind });
     }
@@ -1542,7 +1658,9 @@ function buildNewTopicBlocks(
     ].join('\n');
   }
 
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, {
+    escapeTagLikeContent: compactTraexRpcContext,
+  });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
@@ -1696,6 +1814,7 @@ export function buildNewTopicCliInput(
     chatId?: string;
     whiteboardId?: string;
     substituteTrigger?: SubstituteTrigger;
+    acceptedInput?: AcceptedCommandInput;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -1713,6 +1832,7 @@ export function buildNewTopicCliInput(
     /** 见 NewTopicOpts 同名字段。 */
     solo?: boolean;
     selfMention?: { name?: string | null; openId?: string | null };
+    traexRpcContextEnabled?: boolean;
     /** opening 轮的权威 turnId（= 发给 worker 的 turnId，最终成为
      *  managedTurnOrigin.turnId）。hook 模式下用于 sidecar 绑定；缺失回退 inline。 */
     turnId?: string;
@@ -1765,7 +1885,7 @@ export function buildNewTopicCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return withInitialLinkRefSources({ content: ptyText }, userMessage, { ...opts, attachments });
+      return finalizeCliTurnInput({ content: ptyText }, userMessage, { ...opts, attachments, cliId });
     }
     // 无 envelope（无 whiteboard/sender/mentions）或超限 → 回退 inline。
   }
@@ -1776,10 +1896,10 @@ export function buildNewTopicCliInput(
   // Legacy pending buffers contain enriched strings. Only materialize those as
   // clean input when the caller also preserved their matching raw texts.
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
-    return withInitialLinkRefSources(
+    return finalizeCliTurnInput(
       { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
       userMessage,
-      { ...opts, attachments },
+      { ...opts, attachments, cliId },
     );
   }
   const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
@@ -1799,7 +1919,7 @@ export function buildNewTopicCliInput(
   const availableBotsBlock = renderAvailableBotsBlock(availableBots, mentions, locale);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
-  return withInitialLinkRefSources({
+  return finalizeCliTurnInput({
     content,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
@@ -1820,7 +1940,7 @@ export function buildNewTopicCliInput(
       bufferedFollowUpsBlock: opts?.codexAppFollowUpContexts?.filter(Boolean).join('\n\n'),
       attachments,
     }),
-  }, userMessage, { ...opts, attachments });
+  }, userMessage, { ...opts, attachments, cliId });
 }
 
 /**
@@ -1850,6 +1970,7 @@ type FollowUpOpts = {
   chatId?: string;
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
+  acceptedInput?: AcceptedCommandInput;
   codexAppText?: string;
   codexAppApplicationContext?: string;
   codexAppMessageContext?: string;
@@ -1876,6 +1997,11 @@ type FollowUpOpts = {
   /** 不注入 <botmux_reminder>（「至少回应一次」）：群秘书这类默认静默的回合用，
    *  否则提醒与「无事不发」直接矛盾。 */
   omitReminder?: boolean;
+  /** The session's frozen launch config writes through TraeX RPC: render the
+   *  self-contained compact envelope (role on every turn). Omitting blocks the
+   *  native thread already accepted happens only at the worker's RPC write
+   *  edge, never in a payload that is queued, persisted or re-forked. */
+  traexRpcContext?: true;
 };
 
 function buildFollowUpBlocks(
@@ -1896,8 +2022,11 @@ function buildFollowUpBlocks(
   // 采集关闭，按 live 改口不 send 会静默（见 replyDeliveryFor 注释）。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection, frozenSessionSandbox(sessionId)) === 'transcript';
-  const bare = transcript && opts?.solo === true;
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
+  const bare = transcript && opts?.solo === true && !opts?.traexRpcContext;
+  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, {
+    followUp: !opts?.traexRpcContext,
+    escapeTagLikeContent: !!opts?.traexRpcContext,
+  });
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
@@ -1922,12 +2051,15 @@ function buildFollowUpBlocks(
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
   if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
-  if (noTransport && !skipSessionId) {
+  {
     const session = sessionStore.getSession(sessionId);
     const resume = !!session?.cliId || !!session?.lastCliInput || !!session?.backendType;
-    if (managedLarkToolAppIdForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume)) {
-      const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume, opts?.locale);
+    const speakers = turnSpeakersForPrompt(opts?.larkAppId, sessionId, opts?.sender);
+    if (noTransport && !skipSessionId && managedLarkToolAppIdForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume)) {
+      const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume, opts?.locale, speakers);
       if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
+    } else if (speakers) {
+      blocks.push({ key: 'credentials', text: buildTurnSpeakersBlock(speakers, opts?.locale) });
     }
   }
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
@@ -2164,10 +2296,12 @@ export function promptHookRunsInCli(target: PromptHookTarget): boolean {
   return !!effectivePath && hasInstalledPromptHookCached(effectivePath);
 }
 
-function withInitialLinkRefSources(
+function finalizeCliTurnInput(
   payload: CliTurnPayload,
   userText: string,
   opts: {
+    acceptedInput?: AcceptedCommandInput;
+    cliId?: string;
     linkRefMode?: LinkRefMode;
     linkRefSourceType?: Extract<LinkRefSourceType, 'user_message' | 'card'>;
     sharedGroupContext?: string;
@@ -2175,6 +2309,14 @@ function withInitialLinkRefSources(
     attachments?: LarkAttachment[];
   } | undefined,
 ): CliTurnPayload {
+  // Host-accepted structured input owns its exact content and caller. Keep the
+  // shared LinkRefs finalization below, including when no CLI envelope is needed.
+  if (opts?.acceptedInput) {
+    if (opts.cliId !== 'remote-runner') throw new Error('Accepted provider input cannot cross into a different CLI');
+    payload = { ...payload, content: opts.acceptedInput.content,
+      ...(opts.acceptedInput.trustedCaller ? { trustedCaller: opts.acceptedInput.trustedCaller } : {}) };
+    userText = opts.acceptedInput.content;
+  }
   // Builders only describe explicitly model-visible sources. They do not read
   // mutable rollout configuration: the real fork/send boundary freezes that
   // decision after every await/defer. Keep callers without a daemon app scope
@@ -2185,6 +2327,7 @@ function withInitialLinkRefSources(
     ...payload,
     linkRefs: {
       mode,
+      ...(opts?.acceptedInput ? { presentation: 'registry-only' as const } : {}),
       sources: initialLinkRefSources({
         userText,
         userSourceType: opts?.linkRefSourceType,
@@ -2238,7 +2381,7 @@ export function buildFollowUpCliInput(
       .join('\n\n');
     if (hookEnvelope && hookEnvelope.length <= HOOK_ENVELOPE_MAX_CHARS) {
       writePromptContext(sessionId, hookTurnId, ptyText, hookEnvelope);
-      return withInitialLinkRefSources(
+      return finalizeCliTurnInput(
         { content: ptyText, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
         content,
         opts,
@@ -2248,7 +2391,7 @@ export function buildFollowUpCliInput(
   }
   const legacyContent = buildFollowUpContent(content, sessionId, opts);
   if (opts?.cliId !== 'codex-app' || opts.isAdoptMode) {
-    return withInitialLinkRefSources(
+    return finalizeCliTurnInput(
       { content: legacyContent, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) },
       content,
       opts,
@@ -2271,7 +2414,7 @@ export function buildFollowUpCliInput(
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
   const attachmentBlock = formatAttachmentsHint(opts.attachments, opts.locale, opts.cliId);
   const mentionBlock = renderMentionBlock(opts.mentions);
-  return withInitialLinkRefSources({
+  return finalizeCliTurnInput({
     content: legacyContent,
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
@@ -2392,7 +2535,19 @@ export function buildBridgeInputContent(
 const STREAM_CARD_SENTINEL = '__posting__';
 
 /** Structured refork variant. Adopted external CLIs intentionally remain on
- * their existing raw bridge path and never receive a Codex App sidecar. */
+ * their existing raw bridge path and never receive a Codex App sidecar.
+ *  The compact RPC envelope only applies to a session whose frozen launch config
+ *  actually engages RPC: paste/sandbox/isolation/wrapper/startup-command sessions
+ *  have no turn/start transport and keep the legacy envelope. */
+export function traexRpcContextForSession(
+  ds: DaemonSession,
+  cliId: string | undefined,
+): FollowUpOpts['traexRpcContext'] {
+  if (cliId !== 'traex' || ds.adoptedFrom || !ds.initConfig || !ds.session.cliSessionId) return undefined;
+  if (!codexRpcEligible(ds.initConfig, { sandboxForced: sandboxEnabled() })) return undefined;
+  return true;
+}
+
 export function buildReforkCliInput(
   ds: DaemonSession,
   content: string,
@@ -2405,6 +2560,7 @@ export function buildReforkCliInput(
     locale?: Locale;
     sender?: ResolvedSender;
     substituteTrigger?: SubstituteTrigger;
+    acceptedInput?: AcceptedCommandInput;
     codexAppText?: string;
     codexAppApplicationContext?: string;
     codexAppMessageContext?: string;
@@ -2442,10 +2598,12 @@ export function buildReforkCliInput(
     linkRefSourceType: opts?.linkRefSourceType,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,
+    acceptedInput: opts?.acceptedInput,
     codexAppApplicationContext: opts?.codexAppApplicationContext,
     codexAppMessageContext: opts?.codexAppMessageContext,
     solo: ds.soloSession,
     selfMention: opts?.selfMention,
+    traexRpcContext: traexRpcContextForSession(ds, opts?.cliId),
   });
 }
 
@@ -5757,6 +5915,7 @@ async function forkOrShowRepoCard(
       whiteboardId: ds.session.whiteboardId,
       promptInjection: sessionPromptInjection(ds),
       codexAppText: ds.pendingCodexAppText,
+      acceptedInput: ds.pendingAcceptedInput,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -5843,6 +6002,7 @@ async function forkOrShowRepoCard(
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
     ds.pendingCodexAppText = undefined;
+    ds.pendingAcceptedInput = undefined;
     ds.pendingCodexAppApplicationContext = undefined;
     ds.pendingCodexAppMessageContext = undefined;
     ds.pendingChatContext = undefined;

@@ -1,3 +1,4 @@
+import { MinimaxFinalReceiver } from '../src/services/minimax-final-control.js';
 import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -5,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
+import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { finalizeRawCommandDelivery } from '../src/core/raw-command-writer.js';
 import { classifyRawDispatchFailure, rewrapSubmissionFailure } from '../src/core/raw-dispatch-failure.js';
 import { AmbiguousSubmissionBlockedError } from '../src/adapters/backend/types.js';
@@ -28,6 +30,7 @@ function rawWorker(adapter: ReturnType<typeof createMinimaxAdapter>, backend: { 
     cliAdapter: adapter, SubmissionWriteError, commandLineWriteTail: Promise.resolve(), commandLineWritesPending: 0,
     backend, lastInitConfig: { cliId: 'minimax', adoptMode: false }, isPromptReady: true,
     isFlushing: false, cliRestartInProgress: false, currentBotmuxTurnId: undefined,
+    minimaxFinalReceiver: new MinimaxFinalReceiver(() => {}),
     pendingRawInputs: [], captureRevision: 0, captureIdentityAnnounced: false,
     renderer: undefined, usageLimitTracker: { beginTurn() {} }, currentUsageLimitSnapshot: () => undefined,
     applyMojoLivePatch() {}, tmuxScrolledHalfPages: 0, traexAutoModelController: undefined,
@@ -278,4 +281,24 @@ it('queues a compact IPC while the ordinary input flush owns submission', async 
   expect(worker.scope.pendingRawInputs).toEqual([compact]);
   expect(worker.scope.currentBotmuxTurnId).toBe('business-turn');
   expect(backend.write).not.toHaveBeenCalled();
+});
+
+it('forwards the pending dispatch attempt through the real flush into the MiniMax frame', async () => {
+  const harness = workerSubmitHarness();
+  const backend = { write: vi.fn(() => true) };
+  harness.scope.backend = backend;
+  harness.scope.cliAdapter = createMinimaxAdapter('/not-executed');
+  harness.scope.lastInitConfig = { cliId: 'minimax', adoptMode: false };
+  harness.scope.codexBridgeFallbackActive = () => false;
+  harness.scope.stampMojoTurnMark = () => {};
+  harness.scope.requeueUnsubmittedQueuedActivation = () => {};
+
+  await harness.flush();
+
+  expect(backend.write).toHaveBeenCalledOnce();
+  const written = backend.write.mock.calls[0][0];
+  const prefix = '::botmux-minimax:';
+  expect(written.startsWith(prefix)).toBe(true);
+  const payload = JSON.parse(Buffer.from(written.slice(prefix.length).replace(/\r$/, ''), 'base64').toString('utf8'));
+  expect(payload).toMatchObject({ content: 'payload', replyTurnId: 'delivery', replyDispatchAttempt: 1 });
 });

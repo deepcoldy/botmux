@@ -32,8 +32,17 @@ import {
 } from './session-message-preview.js';
 import { isSuspendableBackendType, resolvePersistentBackendTarget } from './persistent-backend.js';
 import { isNativeTopicId } from './native-topic-id.js';
+import { sessionExecutionActivity } from './session-execution-activity.js';
+import type { ExecutionActivity } from './execution-activity.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  /** Current-turn execution observation (working rows only). */
+  executionActivity?: ExecutionActivity;
+  /** Display-only latest activity: the last routed input or a later real CLI
+   *  progress event. Kept apart from `lastMessageAt`, which stays the last
+   *  routed input — unread markers, sorting and the group secretary's
+   *  human-activity check read that one. */
+  lastActivityAt?: number;
   modelPin?: ReturnType<typeof modelPinView>;
   /** Closed rows only: whether a new message in the topic will resume this session. */
   resumable?: boolean;
@@ -138,6 +147,8 @@ export interface SessionRow extends SessionMessagePreview {
   agentAttention?: { kind: string; reason: string; at: number; source?: 'agent' };
   /** 最近一轮的结果（core/session-task-status.ts）。缺失 = 读不到，前端归空闲。 */
   lastTurn?: SessionLastTurn;
+  /** Main turn ended but this many background tasks are still running (live rows only). */
+  backgroundTaskCount?: number;
   /** 当前忙碌段的起点（进入 starting/working/analyzing 的边沿），只在活跃会话上有。 */
   busySinceAt?: number;
   /** 任务态（会话状态重设计 P2）：从 CLI transcript 读到的当前 TODO 完成度。
@@ -364,6 +375,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
   const brand = getBotBrand(ds.larkAppId);
   const topicLink = sessionThreadLink(ds.session, brand);
   const topicId = sessionThreadId(ds.session);
+  const executionActivity = sessionExecutionActivity(ds);
+  const lastMessageAt = sessionLastActivityAtMs(ds.session) || ds.lastMessageAt;
+  const lastActivityAt = Math.max(lastMessageAt || 0, executionActivity?.lastProgressAtMs ?? 0);
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
@@ -397,7 +411,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
           : (ds.lastScreenStatus ?? (ds.workerReady === true ? 'working' : 'starting'))),
     adopt: !!ds.adoptedFrom,
     spawnedAt: sessionCreatedAtMs(ds.session) || ds.spawnedAt,
-    lastMessageAt: sessionLastActivityAtMs(ds.session) || ds.lastMessageAt,
+    lastMessageAt,
+    ...(lastActivityAt > 0 ? { lastActivityAt } : {}),
+    ...(executionActivity ? { executionActivity } : {}),
     workingDir: ds.workingDir,
     chatId: ds.chatId,
     chatType: ds.chatType,
@@ -443,6 +459,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
         }
       : undefined,
     ...(ds.session.lastTurn ? { lastTurn: ds.session.lastTurn } : {}),
+    ...(ds.backgroundTaskCount !== undefined ? { backgroundTaskCount: ds.backgroundTaskCount } : {}),
     ...(ds.busySinceAt !== undefined ? { busySinceAt: ds.busySinceAt } : {}),
     ...maybeSessionRowUsage(ds.session, ds.workingDir, opts),
     openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),

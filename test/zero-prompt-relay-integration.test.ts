@@ -65,6 +65,7 @@ const mockForkWorker = vi.fn(() => { if (forkShouldThrow) throw new Error('injec
 const mockSendWorkerInput = vi.fn(() => !sendShouldRefuse);
 const mockCloseSession = vi.fn(async () => ({ ok: true, alreadyClosed: false, known: true }));
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => mockForkWorker(...a),
   sendWorkerInput: (...a: any[]) => mockSendWorkerInput(...a),
   getCurrentCliVersion: vi.fn(() => 'test'),
@@ -138,6 +139,8 @@ describe('zero prompt report delivery', () => {
     const triggerMeta = { requestId: key, receivedAt: '2026-09-25T07:00:00.000Z', turnIdempotencyKey: key };
     const shape = validateTriggerRequest(buildOrchestratorReportTrigger(decision, triggerMeta));
     expect(shape.ok).toBe(true);
+    if (!shape.ok) return;
+    expect(shape.request.options?.suppressFinalOutput).toBe(true);
     let lost = true;
     const fetchTarget = vi.fn(async (_path: string, init: RequestInit) => {
       const req = JSON.parse(init.body as string) as TriggerRequest;
@@ -164,6 +167,9 @@ describe('zero prompt report delivery', () => {
     const sessionReply = vi.fn(async () => 'om_lead_reply');
     output.initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     const turnId = mode === 'live' ? mockSendWorkerInput.mock.calls[0][2] as string : turnOpts.turnId;
+    // The handler drops Bridge final_output when this set is armed. The direct
+    // deliverFinalOutput call below is that function alone, under the gate.
+    expect(ds.suppressedTriggerFinalTurns?.has(turnId)).toBe(true);
     const input = (mode === 'live' ? mockSendWorkerInput : mockForkWorker).mock.calls[0][1];
     expect(input.content).not.toContain('botmux_http_response_mode');
     const completed = await new Promise<boolean>(resolve => {

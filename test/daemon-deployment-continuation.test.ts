@@ -96,7 +96,7 @@ function freshNativeTurn(turnId = 'om_first') {
     randomBytes, currentGatewayCallerOpenId, sameTrustedPrincipal,
     currentTurnProcessIdentities: () => undefined, noteTurnDispatchAttempt: () => {},
     ensureAutomaticTaskContinuationLease: () => {},
-    cancelDeploymentContinuation, deploymentContinuationAuthority, sessionStore: store,
+    cancelDeploymentContinuation, deploymentContinuationAuthority, sessionStore: store, sessionController: undefined,
   });
   const scope: any = { sessionId: ds.session.sessionId, lastInitConfig: { cliId: 'codex', larkAppId: 'app_test' },
     activeTurnAuthority: new ActiveTurnAuthority(), sandboxRelayCapability: null, sandboxPolicyCapability: null,

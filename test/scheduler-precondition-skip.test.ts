@@ -77,6 +77,7 @@ function createGuardedTask(schedule = 'every 1m', precondition: 'enabled' | 'dis
     workingDir: tempDir,
     chatId: 'oc_precondition_skip_test',
     larkAppId: APP_ID,
+    owner: { kind: 'ownerless' },
     repeat: { times: 3, completed: 0 },
   }, APP_ID, precondition === 'none' ? undefined : {
     enabled: precondition === 'enabled',

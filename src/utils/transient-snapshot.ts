@@ -24,6 +24,7 @@ import xtermHeadless from '@xterm/headless';
 const { Terminal } = xtermHeadless;
 import { isObserveBackend } from '../adapters/backend/types.js';
 import { readViewportText } from './terminal-renderer.js';
+import { readViewportCells, type ScreenRow } from './terminal-cells.js';
 import { clamp, MIN_RENDER_COLS, MAX_RENDER_COLS, MIN_RENDER_ROWS, MAX_RENDER_ROWS } from './render-dimensions.js';
 
 export interface TransientSnapshot {
@@ -135,8 +136,8 @@ export async function snapshotToText(
   backend: unknown,
   fallbackCols: number,
   fallbackRows: number,
-  opts: { filter: boolean },
-): Promise<{ content: string; ansi: string; cols: number; rows: number } | null> {
+  opts: { filter: boolean; cells?: boolean },
+): Promise<{ content: string; ansi: string; cols: number; rows: number; cells?: ScreenRow[] } | null> {
   const snap = tryCapturePipeSnapshot(backend, fallbackCols, fallbackRows);
   if (!snap) return null;
   const terminal = await buildTransientTerminal(snap);
@@ -144,7 +145,11 @@ export async function snapshotToText(
     // Read from the actual current viewport (see snapshotToPng comment).
     const startY = terminal.buffer.active.baseY;
     const content = readViewportText(terminal, { filter: opts.filter, startY, rows: snap.rows });
-    return { content, ansi: snap.ansi, cols: snap.cols, rows: snap.rows };
+    return {
+      content, ansi: snap.ansi, cols: snap.cols, rows: snap.rows,
+      // Same frame, read from the same transient terminal: no second capture.
+      ...(opts.cells ? { cells: readViewportCells(terminal, { startY, rows: snap.rows }) } : {}),
+    };
   } finally {
     terminal.dispose();
   }

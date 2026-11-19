@@ -1,3 +1,4 @@
+import { sessionDisplayTitle, sessionLastActivityAt, sessionSupportReason } from './sessions.js';
 import { ModelPinChip } from './model-pin.js';
 import type React from 'react';
 import {
@@ -101,7 +102,7 @@ import {
   t,
   ui,
 } from './ui.js';
-import { isOffBoardDormant, type SessionKanbanColumn } from './kanban-model.js';
+import { isOffBoardKanbanRow, type SessionKanbanColumn } from './kanban-model.js';
 import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import { sessionTaskStatusText, statusFilterLabel, taskTone } from './session-task-view.js';
 import {
@@ -844,13 +845,13 @@ export function SessionsTableBase(props: {
       case 'tokenOut':
         return <td className="token-cell" data-label={labels.tokenOut}>{formatTokenCount(row.tokenUsage?.out)}</td>;
       case 'title':
-        return <td className="sessions-table-text-cell" data-label={labels.title} title={String(row.title ?? '')}>{stripMentionPrefix(row.title ?? '').slice(0, 48)}</td>;
+        return <td className="sessions-table-text-cell" data-label={labels.title} title={sessionDisplayTitle(row)}><div>{Array.from(stripMentionPrefix(sessionDisplayTitle(row))).slice(0, 48).join('')}</div>{props.hiddenColumns.has('chat') && row.chatDisplayName ? <small>{sessionLocationText(row)}</small> : null}{sessionSupportReason(row) ? <div className="session-support-reason" title={sessionSupportReason(row)}>{sessionSupportReason(row)}</div> : null}</td>;
       case 'workingDir':
         return <td className="sessions-table-path-cell" data-label={labels.workingDir} title={row.workingDir ?? ''}>{String(row.workingDir ?? '').slice(-34)}</td>;
       case 'spawnedAt':
         return <td data-label={labels.spawnedAt}>{relTime(row.spawnedAt)}</td>;
       case 'lastMessageAt':
-        return <td data-label={labels.lastMessageAt}>{relTime(row.lastMessageAt)}</td>;
+        return <td data-label={labels.lastMessageAt}>{relTime(sessionLastActivityAt(row) ?? 0)}</td>;
       case 'adopt':
         return <td data-label={labels.adopt}>{row.adopt ? <span className="badge">adopt</span> : null}</td>;
       default:
@@ -2069,7 +2070,7 @@ function SessionsPage(): React.JSX.Element {
     const onBoard: SessionRow[] = [];
     let off = 0;
     for (const row of rows) {
-      if (isOffBoardDormant(row)) off += 1;
+      if (isOffBoardKanbanRow(row, filters.status)) off += 1;
       else onBoard.push(row);
     }
     return { kanbanRows: onBoard, dormantOffBoard: off };
@@ -2571,7 +2572,7 @@ function SessionsPage(): React.JSX.Element {
     }
   }, [sortKey]);
   const showDormantInTable = useCallback(() => {
-    setFilters(prev => ({ ...prev, status: 'dormant' }));
+    setFilters(prev => ({ ...prev, status: '' }));
     setViewMode('table');
     writeStoredSessionsViewMode(windowStorage(), 'table');
   }, []);

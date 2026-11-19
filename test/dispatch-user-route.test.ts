@@ -105,6 +105,15 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // Root refresh and publication are covered by worker-codex-execution-root.
     currentCodexObservedPid: vi.fn(),
     stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
+    // markPromptReady's busy-deferral bookkeeping (worker.ts module-level
+    // symbols in the real process): this fixture asserts lifecycle/release
+    // boundaries, so the throttle stays quiet and the bookkeeping is stubbed.
+    busyReadyLogThrottle: { shouldLog: () => false },
+    warnPromptReadySkipped: vi.fn(),
+    busyReadyDeferral: { clear: vi.fn() },
+    cancelTurnTerminalReadyRecovery: vi.fn(),
+    forceReadyAfterTurnTerminal: false,
+    currentBotmuxTurnId: undefined,
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
     spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
@@ -127,6 +136,9 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // ...and no startup dialog can be up (covered by
     // worker-claude-startup-dialog.integration.test.ts).
     probeStartupBlocker: () => null,
+    // These cases run after the first prompt was admitted; the TraeX-only
+    // native startup fence (covered by traex-startup-input) is inert here.
+    traexNativeStartupInputIsPending: () => false,
   };
   const run = new Function('scope', `with (scope) { ${readyCode}; return markPromptReady; }`)(scope);
   try { run(); } catch (err) { if (err !== released) throw err; }

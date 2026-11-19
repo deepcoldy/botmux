@@ -79,6 +79,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.groupWorkingDir', 'botDefaults.autoWorktree', 'botDefaults.autoStartJoin',
       'botDefaults.autoStartJoinSeed', 'botDefaults.autoStartTopic', 'botDefaults.autoInviteOwnerOnGroupAdd',
+      'botDefaults.ownerGroupFollow', 'botDefaults.ownerGroupFollowEnabled', 'botDefaults.ownerGroupFollowExcluded',
       'botDefaults.groupJoinCommand', 'botDefaults.groupJoinCommandField',
       'botDefaults.workingDirField', 'botDefaults.autoStartJoinPrompt',
     ],
@@ -129,6 +130,9 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'promptCache.ttl', 'promptCache.keepalive', 'promptCache.idleMinutes', 'promptCache.maxPings',
       'promptCache.activeHours', 'promptCache.minContextTokens',
     ] },
+  { id: 'provider-recovery', tab: 'sessions', titleKey: 'botDefaults.sectionProviderRecovery', fieldKeys: [
+      'providerRecovery.enabled', 'providerRecovery.maxWaitMinutes',
+    ] },
   { id: 'startup-commands', tab: 'sessions', titleKey: 'botDefaults.sectionStartupCommands' },
   { id: 'summary-trigger', tab: 'sessions', titleKey: 'botDefaults.sectionSummaryTrigger', fieldKeys: [
       'botDefaults.summaryMemory', 'botDefaults.summaryLimit', 'botDefaults.summarySinceHours', 'botDefaults.summaryMemoryPath',
@@ -137,7 +141,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   { id: 'network-policy', tab: 'security', titleKey: 'botDefaults.networkPolicy', tile: 'sandbox' },
   { id: 'codex-auth', tab: 'security', titleKey: 'botDefaults.sectionCodexAuth', fieldKeys: ['botDefaults.codexAuthSyncLabel'] },
   { id: 'sandbox-paths', tab: 'security', titleKey: 'botDefaults.sectionSandboxPaths' },
-  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention'] },
+  { id: 'trigger-user-auth', tab: 'security', titleKey: 'botDefaults.sectionTriggerUserAuth', fieldKeys: ['botDefaults.triggerUserAuthToggle', 'botDefaults.triggerUserAuthDelegateOnMention', 'botDefaults.triggerUserAuthAllowSpeakerSwitch'] },
   { id: 'lark-tool-binding', tab: 'security', titleKey: 'botDefaults.sectionLarkToolBinding', fieldKeys: ['botDefaults.larkToolBindingToggle'] },
   {
     id: 'grant',
@@ -163,7 +167,8 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: [
       'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
-      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions',
+      'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
+      'botDefaults.replyCardRecap', 'botDefaults.replyCardRecapModel',
       'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
       'botDefaults.replyFooterUsage', 'botDefaults.replyFooterRecipients', 'botDefaults.replyFooterVoice',
@@ -232,7 +237,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionRuntimeEnv',
     fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel', 'sessionEnv.tmuxTitle'],
   },
-  { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval'] },
+  { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval', 'botDefaults.ownerReminderQuietHours', 'botDefaults.ownerReminderQuietHoursStart', 'botDefaults.ownerReminderQuietHoursEnd'] },
   { id: 'long-task-reminder', tab: 'cards', titleKey: 'botDefaults.longTaskReminderTitle', fieldKeys: ['botDefaults.longTaskReminderEnabled', 'botDefaults.longTaskReminderThreshold', 'botDefaults.longTaskReminderInterval'] },
 ];
 
@@ -428,14 +433,19 @@ export type BotDefaultsRow = {
    *  through the daemon's merge on PUT, so the page neither shows nor sends them. */
   triggerUserAuth?: {
     enabled: boolean;
-    tools: Array<'lark-cli' | 'bytedcli'>;
-    fallback: 'bot-identity' | 'none';
+    tools?: Array<'lark-cli' | 'bytedcli'>;
+    /** Per-capability switches. The daemon fills it for stored tools-only configs. */
+    capabilities?: Array<'lark-user' | 'bytecloud' | 'meego'>;
+    /** The capabilities were derived from a legacy `tools` list, not chosen explicitly. */
+    legacyCapabilities?: boolean;
     /** Where the sender's credentials come from: central platform first
      *  (`auto`, default), platform only, or this machine only. */
     credentialSource?: 'auto' | 'platform' | 'local';
     /** `--mention` handoffs to bots on this machine carry this turn's sender.
      *  Absent = on (the default); only `false` is stored. */
     delegateOnMention?: boolean;
+    /** One command can run as another speaker of a multi-person turn. Absent = off. */
+    allowSpeakerSwitch?: boolean;
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
@@ -485,6 +495,9 @@ export type BotDefaultsRow = {
   goalStatusCard?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
+  replyCardNextStep?: boolean;
+  replyCardRecap?: boolean;
+  replyCardRecapModel?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   cotEnabled?: boolean;
@@ -542,6 +555,8 @@ export type BotDefaultsRow = {
   noProgressNotify?: import('../../services/no-progress-notify-policy.js').NoProgressNotifyPolicy | null;
   /** Per-bot prompt-cache override; null/absent = inherit the global default. */
   promptCache?: import('../../services/prompt-cache-policy.js').PromptCacheConfig | null;
+  /** Per-bot automatic continuation after provider failures; null/absent = inherit. */
+  providerRecovery?: import('../../services/provider-recovery-policy.js').ProviderRecoveryConfig | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   idleSuspendMinutes?: number | null;
@@ -550,12 +565,7 @@ export type BotDefaultsRow = {
   dormantSessionCount?: number;
   /** Per-bot native execution reminder preferences; absent means opt-in defaults. */
   longTaskReminder?: import('../../services/long-task-reminder-policy.js').LongTaskReminderConfig | null;
-  sessionOwnerReminder?: {
-    enabled: boolean;
-    intervalMinutes: number;
-    text: string;
-    states: Array<'idle' | 'dormant' | 'pending_repo' | 'tui_prompt' | 'agent_attention' | 'limited'>;
-  } | null;
+  sessionOwnerReminder?: import('../../core/session-owner-reminder.js').SessionOwnerReminderConfig | null;
   startupCommands?: string;
   customPassthroughCommands?: string;
   defaultPassthroughCommands?: string[];
@@ -569,6 +579,7 @@ export type BotDefaultsRow = {
   herdr?: import('../../adapters/backend/types.js').HerdrBackendConfig | null;
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;
+  ownerGroupFollow?: import('../../services/owner-group-follow-policy.js').OwnerGroupFollowConfig | null;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;
@@ -668,6 +679,24 @@ export function mergeModelCandidates(
  * 按需探测某个 CLI 当前可用的模型列表（live 成功时权威，失败时回退静态）。
  * fail-soft：任何错误（网络/404/400/形状异常）都返回 null，调用方回退静态候选。
  */
+/**
+ * Levels the live catalogue reported for a Codex model (`reasoningEffortsByModel`
+ * from /api/cli-options/models), matched like the server-side judgment: exact
+ * slug first, then case-insensitively. undefined = the catalogue has no word on
+ * this model, and the static table applies.
+ */
+export function liveCodexReasoningEfforts(
+  byModel: Readonly<Record<string, readonly string[]>> | undefined,
+  model: string,
+): readonly string[] | undefined {
+  const name = model.trim();
+  if (!byModel || !name) return undefined;
+  if (Object.prototype.hasOwnProperty.call(byModel, name)) return byModel[name];
+  const lower = name.toLowerCase();
+  const key = Object.keys(byModel).find(slug => slug.trim().toLowerCase() === lower);
+  return key === undefined ? undefined : byModel[key];
+}
+
 export async function fetchDetectedModels(
   key: string,
   appId?: string,
@@ -878,6 +907,28 @@ export async function fetchGlobalPromptCache(): Promise<import('../../services/p
     return readPromptCacheConfig(body?.settings?.promptCache) ?? null;
   } catch {
     return null;
+  }
+}
+
+/** Machine-wide `providerRecovery` and `promptCache` from GET /api/settings
+ *  (the bot section resolves its blanks and the cache-following default
+ *  against them); nulls when unset or unreadable. */
+export async function fetchGlobalProviderRecovery(): Promise<{
+  providerRecovery: import('../../services/provider-recovery-policy.js').ProviderRecoveryConfig | null;
+  promptCache: import('../../services/prompt-cache-policy.js').PromptCacheConfig | null;
+}> {
+  try {
+    const r = await fetch('/api/settings');
+    if (!r.ok) return { providerRecovery: null, promptCache: null };
+    const body = await r.json().catch(() => ({}));
+    const { readProviderRecoveryConfig } = await import('../../services/provider-recovery-policy.js');
+    const { readPromptCacheConfig } = await import('../../services/prompt-cache-policy.js');
+    return {
+      providerRecovery: readProviderRecoveryConfig(body?.settings?.providerRecovery) ?? null,
+      promptCache: readPromptCacheConfig(body?.settings?.promptCache) ?? null,
+    };
+  } catch {
+    return { providerRecovery: null, promptCache: null };
   }
 }
 

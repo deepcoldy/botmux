@@ -23,6 +23,7 @@ import {
   resolvePurgeResumeTarget,
   MIN_IMAGE_DIMENSION,
 } from '../src/services/transcript-image-purge.js';
+import { pinClaudeProjectsRoot } from '../src/services/claude-projects-root.js';
 
 const SID = '85b23608-1234-4abc-9def-0123456789ab';
 
@@ -341,10 +342,55 @@ describe('purgeUndersizedImages', () => {
     const alias = join(projects, 'aliased-project');
     symlinkSync(outside, alias);
 
-    const report = purgeUndersizedImages(join(alias, `${SID}.jsonl`), { trustedProjectsRoot: projects });
+    const report = purgeUndersizedImages(join(alias, `${SID}.jsonl`), { trustedProjectsRoot: pinClaudeProjectsRoot(root)! });
     expect(report.removed).toBe(0);
     expect(report.failedFiles).toHaveLength(1);
     expect(readFileSync(outsideFile, 'utf8')).toBe(before);
+  });
+
+  it('a link put at `projects` after launch does not carry the trusted root along', () => {
+    const config = makeTemp();
+    const main = join(config, 'projects', 'cwd-key', `${SID}.jsonl`);
+    mkdirSync(join(config, 'projects', 'cwd-key'), { recursive: true });
+    const tiny = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(main, tiny);
+    const trustedProjectsRoot = pinClaudeProjectsRoot(config)!;
+    // Same relative layout elsewhere, then `projects` swapped for a link to it.
+    const outside = makeTemp();
+    const outsideFile = join(outside, 'cwd-key', `${SID}.jsonl`);
+    mkdirSync(join(outside, 'cwd-key'));
+    writeFileSync(outsideFile, tiny);
+    renameSync(join(config, 'projects'), join(config, 'projects.aside'));
+    symlinkSync(outside, join(config, 'projects'));
+
+    for (const dryRun of [true, false]) {
+      const report = purgeUndersizedImages(main, { trustedProjectsRoot, dryRun });
+      expect(report.removed).toBe(0);
+      expect(report.failedFiles).toEqual([{ file: main, reason: 'outside trusted root' }]);
+    }
+    expect(readFileSync(outsideFile, 'utf8')).toBe(tiny);
+    expect(readdirSync(join(outside, 'cwd-key'))).toEqual([`${SID}.jsonl`]);
+  });
+
+  it('purges nothing when no trusted root is known', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    const tiny = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(main, tiny);
+    const report = purgeUndersizedImages(main, { trustedProjectsRoot: null });
+    expect(report.removed).toBe(0);
+    expect(report.failedFiles).toEqual([{ file: main, reason: 'outside trusted root' }]);
+    expect(readFileSync(main, 'utf8')).toBe(tiny);
+  });
+
+  it('purges a transcript under the pinned projects root', () => {
+    const config = makeTemp();
+    const main = join(config, 'projects', 'cwd-key', `${SID}.jsonl`);
+    mkdirSync(join(config, 'projects', 'cwd-key'), { recursive: true });
+    writeFileSync(main, `${imageRecord(png(1, 1).toString('base64'))}\n`);
+    const report = purgeUndersizedImages(main, { trustedProjectsRoot: pinClaudeProjectsRoot(config)! });
+    expect(report.removed).toBe(1);
+    expect(readFileSync(main, 'utf8')).not.toContain('"type":"image"');
   });
 
   it('does not follow a main transcript symlink, and then leaves subagents alone', () => {

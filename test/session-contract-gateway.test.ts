@@ -83,6 +83,18 @@ afterEach(() => {
 });
 
 describe('contract gateway and real worker boundaries', () => {
+  it('admits current Claude effort observations while refusing older sequences and retired runtimes', () => {
+    const s = fixture();
+    const reading = (sequence: number) => ({ type: 'claude_effort', claudeSessionId: 'native1',
+      reasoningEffort: 'medium', sessionContract: s.context(sequence) });
+    expect(s.controller.ingest(reading(2), s.worker)).toMatchObject({ kind: 'current' });
+    expect(s.controller.ingest(reading(1), s.worker)).toMatchObject({ kind: 'reject', reason: 'stale_observation_sequence' });
+    s.controller.reserveBinding('binding-replacement', s.worker);
+    s.controller.bindRuntime('binding-replacement', s.worker,
+      { backend: 'tmux', physicalId: 'new-process', nativeSessionId: 'native1', proof: 'process_start' });
+    expect(s.controller.ingest(reading(3), s.worker)).toMatchObject({ kind: 'reject' });
+  });
+
   // The worker's input-queue report describes the worker's own queue: a
   // callback started under a runtime that was re-bound in process since then
   // still reports the live queue, and it is reported only when it changes.
@@ -904,7 +916,7 @@ describe('contract gateway and real worker boundaries', () => {
     const handlerScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker,
       logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => 'claude-code',
       currentGatewayCallerOpenId: () => 'ou_requester', currentTurnProcessIdentities: () => ['111:start1'],
-      noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn() };
+      noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn(), cb: {} };
     const legacy = vi.fn(loadWorkerPoolClosure<(message: any) => Promise<void>>('handleLegacyWorkerMessage', handlerScope));
     handlerScope.handleLegacyWorkerMessage = legacy;
     const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', handlerScope);

@@ -54,7 +54,9 @@ import {
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
-import { resolveSessionLaunchModel } from '../src/core/session-model.js';
+import { resolveSessionLaunchModel, resolveSessionLaunchModelChoice } from '../src/core/session-model.js';
+import * as sessionModel from '../src/core/session-model.js';
+import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { recordCodexModelLaunch } from '../src/services/codex-model-selection.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
@@ -187,6 +189,29 @@ describe('latestModelForRespawn (daemon-side model carrier)', () => {
     getBotMock.mockImplementation(() => { throw new Error('Bot not registered'); });
     const { ds } = makeDs();
     expect(latestModelForRespawn(ds)).toBeUndefined();
+  });
+});
+
+describe('TraeX empty-pool launch block is visible to every launch carrier', () => {
+  it('keeps an explicit blocked state and rejects all four launch resolution paths', () => {
+    const tombstone = { enabled: true as const, models: [], catalogUnavailable: true as const };
+    const bot = { cliId: 'traex' as const, model: 'auto', traexAutoModel: tombstone };
+    getBotMock.mockReturnValue({ config: bot });
+    const { ds } = makeDs({ cliId: 'traex', model: 'core', agentFrozen: true });
+    expect(resolveSessionLaunchModelChoice(ds, bot)).toMatchObject({
+      blocked: 'catalog_empty', traexAutoModel: tombstone,
+    });
+    expect(() => __testOnly_sessionAgentConfig(ds, bot)).toThrow('catalog_empty');
+    expect(() => latestModelForRespawn(ds)).toThrow('catalog_empty');
+    const scope = {
+      getBot: () => ({ config: bot }), resolveSessionLaunchModelChoice,
+      assertSessionLaunchModelChoiceAllowed: (sessionModel as any).assertSessionLaunchModelChoiceAllowed,
+      isSessionLaunchModelBlockedError: (sessionModel as any).isSessionLaunchModelBlockedError,
+      sessionCliId: () => 'traex', resolveCodexRpcInput: vi.fn(),
+      config: { codexRpcInputDefault: false },
+    };
+    expect(() => loadWorkerPoolFunction('latestTraexAutoModelForRespawn', scope)(ds)).toThrow('catalog_empty');
+    expect(() => loadWorkerPoolFunction('latestCodexRpcInputForRespawn', scope)(ds)).toThrow('catalog_empty');
   });
 });
 

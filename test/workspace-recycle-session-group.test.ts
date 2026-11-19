@@ -18,6 +18,7 @@ vi.mock('../src/im/lark/client.js', async () => ({
   getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' })),
 }));
 vi.mock('../src/core/worker-pool.js', async () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   ...await vi.importActual<any>('../src/core/worker-pool.js'), forkWorker: mocks.fork,
 }));
 

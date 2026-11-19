@@ -1,9 +1,11 @@
+import { normalizeOwnerGroupFollowConfig, type OwnerGroupFollowConfig } from './services/owner-group-follow-policy.js';
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
 import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
 import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
+import { parseInviteConfig, type InviteConfig } from './services/invite-config.js';
 import { readGlobalConfig } from './global-config.js';
 import { getTurnResultRuntime } from './core/turn-result-runtime.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
@@ -88,6 +90,7 @@ import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-po
 import { normalizeOncallGroupPolicy, type OncallGroupPolicy } from './services/oncall-group-policy.js';
 import { normalizeNoProgressNotifyPolicy, type NoProgressNotifyPolicy } from './services/no-progress-notify-policy.js';
 import { normalizePromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
+import { normalizeProviderRecoveryConfig, type ProviderRecoveryConfig } from './services/provider-recovery-policy.js';
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
@@ -103,7 +106,7 @@ import {
   setAskOptionLayoutLookup,
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
-import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelMayKeepReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import { isCodexServiceTier, isCodexServiceTierCliId, type CodexServiceTier } from './services/codex-service-tier.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
@@ -1492,6 +1495,8 @@ export interface BotConfig {
   oncallGroup?: OncallGroupPolicy;
   /** Opt-in defaults for explicit /g group creation. */
   groupCreation?: GroupCreationDefaults;
+  /** Per-bot member defaults for /invite all, independent of /g. */
+  inviteConfig?: InviteConfig;
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
@@ -1670,6 +1675,15 @@ export interface BotConfig {
    * live by the daemon's idle sweep.
    */
   promptCache?: PromptCacheConfig;
+  /**
+   * Claude Code only: automatic continuation after a transient model-provider
+   * failure for this bot. Each field overrides the machine-wide
+   * `providerRecovery` in config.json; unset fields inherit it
+   * (services/provider-recovery-policy.ts). Missing on both layers = off.
+   * Read live: a new turn picks up the current value, and switching it off
+   * settles a pending automatic continuation.
+   */
+  providerRecovery?: ProviderRecoveryConfig;
   /**
    * Codex App only, explicit opt-in: expose a restricted browser dynamic tool
    * backed by the locally installed Codex Chrome/Edge extension plugin.
@@ -2362,6 +2376,25 @@ export interface BotConfig {
    */
   replyCardActions?: boolean;
   /**
+   * Per-bot opt-in for the「下一步」row: the CLI's own next-input suggestion
+   * (Claude Code's greyed-out prompt suggestion) as a button above the last
+   * reply card's footer. Default (undefined) keeps reply cards unchanged.
+   */
+  replyCardNextStep?: boolean;
+  /**
+   * Per-bot opt-in for the collapsed「本轮回顾」panel above the last reply
+   * card's footer: files edited and commands run, plus the CLI's own recap
+   * (Claude Code's transcript away summary) once it writes one. Default
+   * (undefined) keeps reply cards unchanged.
+   */
+  replyCardRecap?: boolean;
+  /**
+   * With replyCardRecap on, also let a small model write the recap for a turn
+   * the CLI left without one (one extra model call per such turn, billed to
+   * the CLI's own credentials; Claude Code only). Default (undefined) off.
+   */
+  replyCardRecapModel?: boolean;
+  /**
    * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
    * into a chat/thread where a sibling bot already has an active session, it
    * reuses that sibling's workingDir and skips its own repo-selection card.
@@ -2441,6 +2474,8 @@ export interface BotConfig {
    * Defaults 或飞书 /botconfig 配置；仅作用于被动入群，团队建群/federation 不读此开关。
    */
   autoInviteOwnerOnGroupAdd?: boolean;
+  /** Default OFF. Use the configured owner's user authorization to follow newly joined groups. */
+  ownerGroupFollow?: OwnerGroupFollowConfig;
   /**
    * 主动开工 — 场景②. When true, in a 话题群 (topic mode) every new topic's first
    * message auto-starts a session even without an @mention (the default role +
@@ -4298,6 +4333,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       linkRefs: normalizeLinkRefConfig(entry.linkRefs),
       apiOnly: entry.apiOnly === true || undefined,
       groupCreation: entry.groupCreation === undefined ? undefined : parseGroupCreationDefaults(entry.groupCreation),
+      inviteConfig: entry.inviteConfig === undefined ? undefined : parseInviteConfig(entry.inviteConfig),
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
       dispatchLaunchPolicy: (() => {
         if (!entry.dispatchLaunchPolicy || typeof entry.dispatchLaunchPolicy !== 'object') return undefined;
@@ -4321,6 +4357,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         } catch (error) {
           logger.warn(
             `[bot-registry:${entry.larkAppId}] ignoring invalid promptCache: `
+            + `${error instanceof Error ? error.message : String(error)}`,
+          );
+          return undefined;
+        }
+      })(),
+      providerRecovery: (() => {
+        if (entry.providerRecovery === undefined) return undefined;
+        try {
+          return normalizeProviderRecoveryConfig(entry.providerRecovery);
+        } catch (error) {
+          logger.warn(
+            `[bot-registry:${entry.larkAppId}] ignoring invalid providerRecovery: `
             + `${error instanceof Error ? error.message : String(error)}`,
           );
           return undefined;
@@ -4373,8 +4421,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       dshProfile: entryCliId === 'dsh' ? normalizeDshProfile(entry.dshProfile) : undefined,
       reasoningEffort: isConfigurableReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
+        // Codex keeps a level the table cannot refute (catalogue-verified at
+        // save time); the worker's launch check has the final say.
         && (entryCliId === 'traex' || sharedEffortModels.every(candidate =>
-          cliModelSupportsReasoningEffort(entryCliId, candidate, entry.reasoningEffort)))
+          cliModelMayKeepReasoningEffort(entryCliId, candidate, entry.reasoningEffort)))
         ? entry.reasoningEffort : undefined,
       codexProfile,
       serviceTier: isCodexServiceTierCliId(entryCliId) && isCodexServiceTier(entry.serviceTier)
@@ -4580,6 +4630,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       goalStatusCard: entry.goalStatusCard === true || undefined,
       privateCard: entry.privateCard === true || undefined,
       replyCardActions: entry.replyCardActions === true || undefined,
+      replyCardNextStep: entry.replyCardNextStep === true || undefined,
+      replyCardRecap: entry.replyCardRecap === true || undefined,
+      replyCardRecapModel: entry.replyCardRecapModel === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。
@@ -4590,6 +4643,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       autoStartOnGroupJoinAnchor: entry.autoStartOnGroupJoinAnchor === 'latest-message' ? 'latest-message' : undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd === false ? false : undefined,
+      ownerGroupFollow: (() => { try { return normalizeOwnerGroupFollowConfig(entry.ownerGroupFollow); } catch { return undefined; } })(),
       // Preserve the configured prompt verbatim; trim-to-undefined when blank
       // so an empty string doesn't linger in bots.json.
       autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' && entry.autoStartOnGroupJoinPrompt.trim()

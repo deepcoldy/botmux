@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -185,6 +185,51 @@ it.each(['gpt-6-astra', model])('the actual command clears a shadowed pin withou
   expect(ds.session.modelPin).toBeUndefined(); expect(worker.send).not.toHaveBeenCalled(); expect(worker.kill).not.toHaveBeenCalled();
   expect(ds.spawnModelOverride).toBe(override);
   store.init(app); expect(store.getOwnedSession(ds.session.sessionId)?.modelPin).toBeUndefined();
+});
+
+it('/modelpin judges a Codex level against the bot runtime\'s live catalogue', async () => {
+  const { handleCommand } = await import('../src/core/command-handler.js');
+  const { sessionKey } = await import('../src/core/types.js');
+  const { clearCodexServiceTierCatalogCache } = await import('../src/services/codex-service-tier-catalog.js');
+  const dispatcher = await import('../src/im/lark/event-dispatcher.js');
+  vi.spyOn(dispatcher, 'canOperate').mockReturnValue(true);
+  // Fake `codex debug models`: gpt-6.3-sol stands for a model the static table
+  // has no row for, so only the catalogue can vouch for ultra.
+  const bin = join(dir, 'bin'); mkdirSync(bin);
+  const catalog = (levels: string[]) => writeFileSync(join(bin, 'catalog.json'), JSON.stringify({ models: [{
+    slug: 'gpt-6.3-sol', visibility: 'list', service_tiers: [], supported_reasoning_levels: levels.map(effort => ({ effort })) }] }));
+  writeFileSync(join(bin, 'codex'), '#!/bin/sh\nif [ "$1" = debug ] && [ "$2" = models ]; then cat "$(dirname "$0")/catalog.json"; exit 0; fi\nexit 1\n');
+  chmodSync(join(bin, 'codex'), 0o755);
+  vi.stubEnv('PATH', `${bin}:${process.env.PATH ?? ''}`);
+  try {
+    const { ds } = fixture(); ds.worker = null;
+    const root = ds.session.rootMessageId;
+    const deps: any = { activeSessions: new Map([[sessionKey(root, app), ds]]), sessionReply: vi.fn(async () => 'reply') };
+    const pin = (content: string) => handleCommand('/modelpin', root, { senderId: 'owner', content, msgType: 'text' } as any, deps, app);
+    catalog(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']); clearCodexServiceTierCatalogCache();
+    await pin('/modelpin gpt-6.3-sol ultra');
+    expect(ds.session.modelPin).toMatchObject({ model: 'gpt-6.3-sol', effort: 'ultra' });
+    catalog(['low', 'medium', 'high', 'xhigh']); clearCodexServiceTierCatalogCache();
+    await pin('/modelpin gpt-6.3-sol max');
+    expect(ds.session.modelPin).toMatchObject({ model: 'gpt-6.3-sol', effort: 'ultra' });
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(root, expect.stringContaining('不支持推理强度 max'), undefined, app, undefined);
+    // Re-pinning the same model without a level keeps the level it was pinned
+    // with, even when no catalogue is at hand now (command and card alike).
+    await pin('/modelpin gpt-6.3-sol');
+    expect(ds.session.modelPin).toMatchObject({ model: 'gpt-6.3-sol', effort: 'ultra' });
+    expect(writeSessionModelPin(ds, { model: 'gpt-6.3-sol', source: 'card', setBy: 'owner', setAt: new Date().toISOString() })).toBe(true);
+    expect(ds.session.modelPin).toMatchObject({ model: 'gpt-6.3-sol', effort: 'ultra' });
+
+    // A session frozen with a Codex profile launches through that profile's
+    // provider: the bare catalogue cannot vouch for it, whatever the bot says now.
+    const { ds: profiled } = fixture(); profiled.worker = null; profiled.session.codexProfile = 'work';
+    deps.activeSessions.set(sessionKey(profiled.session.rootMessageId, app), profiled);
+    catalog(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']); clearCodexServiceTierCatalogCache();
+    await handleCommand('/modelpin', profiled.session.rootMessageId, { senderId: 'owner', content: '/modelpin gpt-6.3-sol ultra', msgType: 'text' } as any, deps, app);
+    expect(profiled.session.modelPin).toMatchObject({ model, effort: 'high' });
+  } finally {
+    vi.unstubAllEnvs(); clearCodexServiceTierCatalogCache();
+  }
 });
 
 it('shows the current TraeX topic selection separately from a waiting model pin', async () => {

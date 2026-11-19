@@ -14,6 +14,8 @@ import { resolveEffectiveFeedbackPolicy, type FeedbackPolicyLayer } from '../src
 
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+  // No live model catalogue: reasoning levels fall back to the static table.
+  loadCodexServiceTierCatalog: vi.fn(async () => null),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -250,6 +252,28 @@ describe('bot-config store', () => {
     expect(await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'xhigh'))
       .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
     expect(readConfig().reasoningEffort).toBeUndefined();
+  });
+
+  it('defaults owner group follow off and round-trips opt-in settings through persistence and hot config', async () => {
+    const { registry, store } = await loaded();
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+    const spec = store.findConfigField('ownerGroupFollow')!;
+    const parsed = store.coerceConfigValue(spec, '{"enabled":true,"excludeChatIds":["oc_skip"]}');
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error('coercion failed');
+    expect((await store.applyConfigField('app_default', spec, parsed.value)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toEqual({ enabled: true, excludeChatIds: ['oc_skip'] });
+    expect(readConfig().ownerGroupFollow).toEqual({ enabled: true, excludeChatIds: ['oc_skip'] });
+    expect((await store.applyConfigField('app_default', spec, { enabled: 'true' })).ok).toBe(false);
+    expect(readConfig().ownerGroupFollow.enabled).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, { enabled: false })).ok).toBe(true);
+    expect(readConfig().ownerGroupFollow).toBeUndefined();
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+  });
+
+  it('does not enable owner group follow from malformed disk configuration', async () => {
+    const { registry } = await loaded({ ownerGroupFollow: { enabled: 'true' } });
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
   });
 
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
@@ -776,6 +800,27 @@ describe('bot-config store', () => {
     expect(readConfig().noProgressNotify).toBeUndefined();
   });
 
+  it('stores a per-bot providerRecovery override, survives a reload, rejects bad values and unsets', async () => {
+    const { store, registry } = await loaded();
+    const spec = store.findConfigField('providerRecovery')!;
+    expect(spec).toMatchObject({ kind: 'json', effect: 'immediate', clearable: true });
+    const value = { enabled: true, maxWaitMinutes: 30 };
+    const parsed = store.coerceConfigValue(spec, JSON.stringify(value));
+    expect(parsed).toEqual({ ok: true, value });
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(await store.applyConfigField('app_default', spec, parsed.value)).toMatchObject({ ok: true });
+    expect(registry.getBot('app_default').config.providerRecovery).toEqual(value);
+    expect(readConfig().providerRecovery).toEqual(value);
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach((c: any) => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config.providerRecovery).toEqual(value);
+    const bad = store.coerceConfigValue(spec, JSON.stringify({ enabled: true, maxWaitMinutes: 0 }));
+    expect(bad.ok).toBe(false);
+    if (!bad.ok) expect(bad.reason).toMatch(/^invalid_provider_recovery: /);
+    expect(await store.applyConfigField('app_default', spec, null)).toMatchObject({ ok: true });
+    expect(readConfig().providerRecovery).toBeUndefined();
+  });
+
   it('keeps CLI progress notices and prompt-cache configuration independent across reload and unset', async () => {
     const { store } = await loaded();
     const noticeSpec = store.findConfigField('noProgressNotify')!;
@@ -815,6 +860,65 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, '{"agents":"bad"}').ok).toBe(false);
     await store.applyConfigField('app_default', spec, null);
     expect(readConfig().groupCreation).toBeUndefined();
+  });
+
+  it('persists, hot-applies, cold-loads and clears per-bot inviteConfig independently of /g defaults', async () => {
+    const groupCreation = { agents: ['cli_group'], tag: 'Work', avatar: 'name' };
+    const { registry, store } = await loaded({ groupCreation });
+    const spec = store.findConfigField('inviteConfig');
+    expect(spec).toBeDefined();
+    const value = { agents: ['Review', 'cli_build'] };
+    const parsed = store.coerceConfigValue(spec!, JSON.stringify({ agents: [' Review ', 'cli_build', 'Review'] }));
+    expect(parsed).toEqual({ ok: true, value });
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(await store.applyConfigField('app_default', spec!, parsed.value)).toMatchObject({ ok: true });
+    expect(readConfig()).toMatchObject({ groupCreation, inviteConfig: value });
+    expect(registry.getBot('app_default').config.inviteConfig).toEqual(value);
+    const cold = await freshModules();
+    cold.registry.loadBotConfigs().forEach(c => cold.registry.registerBot(c));
+    expect(cold.registry.getBot('app_default').config).toMatchObject({ groupCreation, inviteConfig: value });
+    expect(await cold.store.applyConfigField('app_default', cold.store.findConfigField('inviteConfig')!, null)).toMatchObject({ ok: true });
+    expect(readConfig().inviteConfig).toBeUndefined();
+    expect(cold.registry.getBot('app_default').config.inviteConfig).toBeUndefined();
+    expect(cold.registry.loadBotConfigs()[0].inviteConfig).toBeUndefined();
+    expect(readConfig().groupCreation).toEqual(groupCreation);
+  });
+
+  it.each([
+    { value: null }, { value: [] }, { value: 'bad' },
+    { value: { agents: 'Review' } }, { value: { agents: [''] } }, { value: { agents: ['  '] } },
+    { value: { agents: [1] } }, { value: { agents: [null] } },
+    { value: { avatar: 'name' } }, { value: { typo: [] } },
+  ])('rejects malformed inviteConfig on edits and cold loads: %j', async ({ value }) => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('inviteConfig');
+    expect(spec).toBeDefined();
+    expect(store.coerceConfigValue(spec!, JSON.stringify(value)).ok).toBe(false);
+    writeConfig({ inviteConfig: value });
+    expect(() => registry.loadBotConfigs()).toThrow();
+  });
+
+  it('updates only the selected bot\'s invitation defaults', async () => {
+    const { registry, store } = await loaded();
+    const other = {
+      larkAppId: 'app_other', larkAppSecret: 'secret', cliId: 'codex',
+      inviteConfig: { agents: ['cli_other'] },
+    };
+    writeFileSync(configPath, JSON.stringify([readConfig(), other]));
+    const value = { agents: ['cli_review'] };
+    expect(await store.applyConfigField('app_default', store.findConfigField('inviteConfig')!, value)).toMatchObject({ ok: true });
+    const configs = registry.loadBotConfigs();
+    expect(configs.find(c => c.larkAppId === 'app_default')?.inviteConfig).toEqual(value);
+    expect(configs.find(c => c.larkAppId === 'app_other')?.inviteConfig).toEqual(other.inviteConfig);
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))[1]).toEqual(other);
+  });
+
+  it.each([{}, { agents: [] }])('accepts an empty inviteConfig without adding defaults: %j', async value => {
+    const { registry, store } = await loaded({ inviteConfig: value });
+    const spec = store.findConfigField('inviteConfig');
+    expect(spec).toBeDefined();
+    expect(store.coerceConfigValue(spec!, JSON.stringify(value))).toEqual({ ok: true, value });
+    expect(registry.getBot('app_default').config.inviteConfig).toEqual(value);
   });
 
   it('persists Oncall button settings without changing feedback or chat overrides', async () => {
@@ -1578,6 +1682,7 @@ describe('bot-config store', () => {
       intervalMinutes: 30,
       text: '请继续处理。',
       states: ['idle', 'tui_prompt'],
+      quietHours: { enabled: true, start: '23:00', end: '08:30' },
     };
     const saved = await reminderStore.updateSessionOwnerReminderConfig('app_default', value);
     expect(saved).toEqual({ ok: true, config: value });

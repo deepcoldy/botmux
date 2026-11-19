@@ -27,6 +27,7 @@ const BASE_PARAMS = {
   prompt: 'send the report',
   workingDir: '/workspace/project',
   chatId: 'oc_test_chat',
+  owner: { kind: 'ownerless' as const },
 };
 
 async function freshImport() {

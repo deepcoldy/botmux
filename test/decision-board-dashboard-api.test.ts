@@ -67,6 +67,24 @@ async function call(method: string, path: string, d: DecisionBoardApiDeps, body?
 }
 
 describe('handleDecisionBoardApi', () => {
+  it('close-in-chat only forwards confirmation/version with trusted actor, never decision fields', async () => {
+    const d = deps({ canManageHost: false, identity: H5 });
+    const r = await call('POST', '/api/decision-board/cli_s/items/3/close-in-chat', d.deps,
+      { confirmed: true, baseRev: 5, key: 'A', text: 'forged note', submitter: 'forged' });
+    expect(r.out.status).toBe(200);
+    expect(d.calls).toHaveLength(1);
+    expect(d.calls[0].path).toBe('/api/decision-board/items/3/close-in-chat');
+    expect(JSON.parse(String(d.calls[0].init.body))).toEqual({ confirmed: true, baseRev: 5, submitter: 'u:on_owner' });
+    for (const body of [{ baseRev: 5 }, { confirmed: true, baseRev: '5' }, { confirmed: false, baseRev: 5 }]) {
+      expect((await call('POST', '/api/decision-board/cli_s/items/3/close-in-chat', d.deps, body)).out.status).toBe(400);
+    }
+    const denied = deps({ identity: null, canManageHost: false });
+    expect((await call('POST', '/api/decision-board/cli_s/items/3/close-in-chat', denied.deps, { confirmed: true, baseRev: 5 })).out.status).toBe(401);
+    expect(denied.calls).toEqual([]);
+    expect(d.calls).toHaveLength(1);
+    expect(workbenchH5Capability('POST', '/api/decision-board/cli_s/items/3/close-in-chat')).toBe('board.decide');
+  });
+
   it('不是看板路径不接手', async () => {
     expect((await call('GET', '/api/sessions', deps().deps)).handled).toBe(false);
   });

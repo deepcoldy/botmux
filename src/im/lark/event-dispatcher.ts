@@ -1,3 +1,4 @@
+import { OwnerGroupFollowStore } from '../../services/owner-group-follow-store.js';
 import { canInviterTalkToMeeting } from '../../services/vc-meeting-inviter-access.js';
 /**
  * Lark event dispatcher — handles WSClient setup, bot identity probing,
@@ -109,7 +110,7 @@ import {
   type VcMeetingPushEventType,
 } from '../../vc-agent/push-source.js';
 import type { VcMeetingPushContext, VcMeetingPushEventKind } from '../../vc-agent/types.js';
-import type { Session, VcMeetingImTurnOrigin } from '../../types.js';
+import type { AcceptedCommandInput, Session, VcMeetingImTurnOrigin } from '../../types.js';
 import { sessionKey } from '../../core/types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
@@ -3231,6 +3232,8 @@ export interface RoutingContext {
   cascadeBodyReentry?: true;
   /** An already-authorized effort command re-enters ordinary task admission. */
   effortTaskReentry?: true;
+  /** Host-accepted structured input; never populated from message metadata. */
+  acceptedInput?: AcceptedCommandInput;
   /** Set by the session-group birth flow (p2pMode='group') after it has
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */
@@ -7504,7 +7507,11 @@ export function createLarkEventDispatcherRuntime(
     // 同步处理且幂等;bot 被移出后关本 bot 在群里的会话则按 event id 去重、放到 ACK 之后跑。
     'im.chat.member.bot.deleted_v1': (data: any) => {
       const chatId: string | undefined = data?.chat_id;
-      if (chatId) invalidateChatStats(larkAppId, chatId);
+      if (chatId) {
+        invalidateChatStats(larkAppId, chatId);
+        try { new OwnerGroupFollowStore(config.session.dataDir, larkAppId).removed(chatId); }
+        catch { logger.warn('[owner-group-follow] failed to record bot removal'); }
+      }
       scheduleChatGone('im.chat.member.bot.deleted_v1', data, 'bot_removed');
     },
     // 群解散推给群内每个订阅了它的 bot,各自关自己的会话。

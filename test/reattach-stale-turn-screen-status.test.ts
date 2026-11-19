@@ -513,7 +513,7 @@ describe('Daemon IPC convergence: observe, relay, transferSession, and turn attr
     });
   });
 
-  it('replaces inherited AsyncLocalStorage opening execution on later worker screen_update envelopes', () => {
+  it('keeps execution authority off worker screen_update envelopes while admitting the live runtime frame', () => {
     const s = createContractSession('session-metadata-scope');
     const opening = s.controller.admitInput('om_opening_turn');
     const second = s.controller.admitInput('om_second_turn');
@@ -535,12 +535,22 @@ describe('Daemon IPC convergence: observe, relay, transferSession, and turn attr
     expect(unattributed.sessionContract?.scope.execution).toBeUndefined();
     expect(s.controller.ingest(unattributed, s.worker)).toMatchObject({ kind: 'current' });
 
+    // The frame still runs inside the opening turn's AsyncLocalStorage, but a
+    // screen is presentation context: it carries neither the inherited opening
+    // execution nor one resolved from its own turnId.
     const secondFrame = workerScope.run(binding, () => sessionEventMetadata({
       type: 'screen_update',
       status: 'working',
       content: 'running second turn',
       turnId: 'om_second_turn',
     }), opening);
-    expect(secondFrame.sessionContract?.scope.execution).toEqual(second);
+    expect(secondFrame.sessionContract?.scope.runtime).toEqual(s.runtime);
+    expect(secondFrame.sessionContract?.scope.execution).toBeUndefined();
+    // The runtime observation is still admitted, and the display-only turnId
+    // mints no phantom execution.
+    expect(s.controller.ingest(secondFrame, s.worker)).toMatchObject({ kind: 'current' });
+    const admitted = s.store.executions(s.ref, 'om_second_turn');
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]?.ref).toEqual(second);
   });
 });

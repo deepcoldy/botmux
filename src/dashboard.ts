@@ -16,6 +16,7 @@ import { handlePluginSettingsRequest } from './core/plugins/dashboard-settings.j
 import { createHostPluginMarket, PluginMarketError } from './dashboard/plugin-market.js';
 import { pluginRecordHash } from './core/plugins/mutation-guard.js';
 import { withPluginServiceLock } from './core/plugins/service-manager.js';
+import { assertPluginPrerequisitesReady } from './core/plugins/prerequisites.js';
 import { createConfigApi } from './core/plugins/runtime.js';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
@@ -319,7 +320,8 @@ import { listProjectGroups, type ProjectGroupState } from './services/project-gr
 import { resolveProjectProgressCardConfig } from './services/project-progress-card-config.js';
 import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/team-board-store.js';
 import type { CliId } from './adapters/cli/types.js';
-import { ALL_CLI_IDS, createCliAdapterSync, resolveCommandReal } from './adapters/cli/registry.js';
+import { ALL_CLI_IDS, createCliAdapterSync, rawCliExecutable, resolveCommandReal } from './adapters/cli/registry.js';
+import { createDashboardExecutableResolver, resolveDashboardRuntimeUpdateTargets } from './dashboard/cli-executable-resolver.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import {
   buildSkillInstallAuditSummary,
@@ -1254,6 +1256,7 @@ interface ResolvedDashboardSettings {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback?: boolean;
   /** Experimental, default OFF: reap tmux servers orphaned by a previous
    *  daemon generation at daemon startup (automatic process kill). */
   reapOrphanTmuxServers: boolean;
@@ -1269,6 +1272,7 @@ interface ResolvedDashboardSettings {
   cardBrandLabel: boolean;
   /** Turn initiator may press the safe keys on stuck cards. Default ON. */
   stuckCardInitiatorKeys: boolean;
+  modelQueueNotify: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -1310,11 +1314,12 @@ interface ResolvedDashboardSettings {
   noVisibleOutputHint: boolean;
   /** Experimental cross-principal turn isolation (XPI). Default OFF. */
   crossPrincipalInterruption: boolean;
-  /** Cross-bot schedule delegation: the two default-off switches and the
-   *  host bot grants. Private for anonymous read-only viewers. */
+  /** Schedule delegation switches and host bot grants. Private for anonymous
+   *  read-only viewers. */
   scheduleBotGrants: {
     createEnabled: boolean;
     selfManageEnabled: boolean;
+    childOneShotEnabled: boolean;
     grants: ScheduleBotGrant[];
     /** Hand-edited entries the reader dropped; a save would not keep them. */
     ignoredCount: number;
@@ -1348,6 +1353,8 @@ interface ResolvedDashboardSettings {
   workflow: { enabled: boolean; nodeExecutor: 'ephemeral' | 'bot'; handoffIdentity: boolean };
   /** Machine-wide Claude Code prompt-cache default; null = not configured. */
   promptCache: import('./services/prompt-cache-policy.js').PromptCacheConfig | null;
+  /** Machine-wide automatic continuation after provider failures; null = not configured (off). */
+  providerRecovery: import('./services/provider-recovery-policy.js').ProviderRecoveryConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退）。 */
   sessionCleanup: {
@@ -1939,6 +1946,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     },
     codexRpcInput: dashboard.codexRpcInput === true, // default OFF until live-verified
     autoUpgradeCodexSessions: dashboard.autoUpgradeCodexSessions === true, // default OFF until live-verified
+    terminalEffortWriteback: dashboard.terminalEffortWriteback === true,
     reapOrphanTmuxServers: dashboard.reapOrphanTmuxServers === true, // default OFF: automatic process kill, explicit opt-in
     tmuxOrphanSessionSweep: dashboard.tmuxOrphanSessionSweep !== false, // default ON report-only; explicit false disables
     tmuxOrphanSessionBareWrapperKill: dashboard.tmuxOrphanSessionBareWrapperKill === true, // default OFF narrow kill
@@ -1950,6 +1958,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     cardBrandLabel: dashboard.cardBrandLabel !== false,
     // default ON — only an explicit stored false disables (matches config.ts getter)
     stuckCardInitiatorKeys: dashboard.stuckCardInitiatorKeys !== false,
+    modelQueueNotify: dashboard.modelQueueNotify === true,
     codexNotifier: {
       enabled: codexNotifier.enabled,
       targetBotAppId: codexNotifier.targetBotAppId ?? null,
@@ -1977,6 +1986,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
     scheduleBotGrants: {
       createEnabled: global.scheduleDelegation?.createEnabled === true, // default OFF
       selfManageEnabled: global.scheduleDelegation?.selfManageEnabled === true, // default OFF
+      childOneShotEnabled: global.scheduleDelegation?.childOneShotEnabled === true, // default OFF
       grants: global.scheduleDelegation?.botGrants ?? [],
       ignoredCount: ignoredScheduleBotGrantCount(),
       botOptions: scheduleBotGrantBotOptions(),
@@ -2008,6 +2018,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
     promptCache: global.promptCache ?? null,
+    providerRecovery: global.providerRecovery ?? null,
     multiTopic: {
       enabled: global.multiTopic?.enabled !== false, // default ON
       taskTreeCard: global.multiTopic?.taskTreeCard === true, // default OFF
@@ -2979,6 +2990,9 @@ async function listDashboardPluginsPayload(): Promise<Record<string, unknown>> {
 }
 
 async function writeGlobalPluginBinding(pluginId: string, enabled: boolean): Promise<void> {
+  // The live check runs plugin code for up to 20s. Keep it outside the config
+  // lease: the caller's plugin service lock already pins the registry record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   await runDurableConfigMutation({
     scope: 'global',
     path: globalConfigPath(),
@@ -2999,6 +3013,9 @@ async function writeBotPluginBinding(pluginId: string, larkAppId: string, enable
   const path = requireConfigPath();
   const defaults = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
   if (defaults.includes(pluginId)) throw new Error('请先关闭全局启用，再按 Bot 配置');
+  // Never hold bots.json's cross-process lock (5s waiter budget) across the
+  // plugin's live check (up to 20s); the service lock still pins the record.
+  if (enabled) await assertPluginPrerequisitesReady(pluginId);
   return runDurableConfigMutation({
     scope: 'bots',
     path,
@@ -5211,10 +5228,7 @@ const server = createServer(async (req, res) => {
       const latest = latestResult.value;
       let configuredUpdateTargets: ReturnType<typeof selectCodexRuntimeUpdateTargets> = [];
       try {
-        configuredUpdateTargets = selectCodexRuntimeUpdateTargets(
-          loadBotConfigs(),
-          (cliPathOverride) => createCliAdapterSync('codex', cliPathOverride).resolvedBin,
-        );
+        configuredUpdateTargets = await resolveDashboardRuntimeUpdateTargets(loadBotConfigs());
       } catch {
         // Config unreadable or an adapter unavailable: fail closed and hide
         // persisted badges whose continued relevance cannot be established.
@@ -6289,14 +6303,23 @@ const server = createServer(async (req, res) => {
         botConfig = undefined;
       }
       const probeContext = modelCatalogProbeContext(key, botConfig, process.env);
+      const resolveExecutable = createDashboardExecutableResolver(probeContext.probeEnv ?? process.env);
       const body = await buildModelChoicesResponse(key, {
         runtimeContext: probeContext.runtimeContext,
         probeEnv: probeContext.probeEnv,
         runtimeExecutable: probeContext.runtimeExecutable,
-        adapterFactory: requestedCliId => createCliAdapterSync(
-          requestedCliId,
-          requestedCliId === probeContext.cliId ? probeContext.runtimeExecutable : undefined,
-        ),
+        resolveExecutable,
+        supportsModelDiscovery: requestedCliId => {
+          // Capability fields are static for a CLI. An absolute placeholder
+          // keeps even eager constructors (for example pi) from resolving the
+          // real command before this preflight has proved discovery is needed.
+          const adapter = createCliAdapterSync(requestedCliId, '/__botmux_model_capability_probe__');
+          return Boolean(adapter.detectModelCapabilities || adapter.detectModels);
+        },
+        adapterFactory: async (requestedCliId, pathOverride) => {
+          const command = pathOverride ?? rawCliExecutable(requestedCliId);
+          return createCliAdapterSync(requestedCliId, command ? await resolveExecutable(command) : undefined);
+        },
       });
       return jsonRes(res, 200, body);
     }

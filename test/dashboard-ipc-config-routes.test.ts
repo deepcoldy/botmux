@@ -30,6 +30,7 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-cantalk-daemon-commands', LEGACY],
   ['/api/bot-launch-shell', LEGACY],
   ['/api/bot-oncall-group', LEGACY],
+  ['/api/bot-owner-group-follow', LEGACY],
   ['/api/bot-actor-owner-bindings', LEGACY],
   ['/api/bot-no-progress-notify', OK_FALSE],
   ['/api/bot-feedback', LEGACY],
@@ -47,6 +48,10 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
 type Case = readonly [string, string, number, unknown, Record<string, unknown>?];
 const CASES: readonly Case[] = [
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true,"excludeChatIds":["oc_skip"]}}', 200, { ok: true, ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }, { ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}', 200, { ok: true, ownerGroupFollow: null }, { ownerGroupFollow: undefined }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":"true"}}', 400, { ok: false, error: 'invalid_json' }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"excludeChatIds":["ou_other"]}}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-p2p-mode', '{"p2pMode":"thread"}', 200, { ok: true, p2pMode: 'thread' }, { p2pMode: 'thread' }],
   ['/api/bot-p2p-mode', '{"p2pMode":5}', 200, { ok: true, p2pMode: 'chat' }, { p2pMode: undefined }],
   ['/api/bot-envelope-injection', '{"envelopeInjection":"auto"}', 200, { ok: true, envelopeInjection: 'auto' }, { envelopeInjection: 'auto' }],

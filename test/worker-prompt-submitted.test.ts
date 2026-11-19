@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
+import { canStartInjectionFlush } from '../src/core/inject-queue-policy.js';
 
 interface Harness {
   child: ChildProcess;
@@ -168,5 +170,198 @@ describe('worker prompt_submitted handler', () => {
     harness.child.send({ type: 'prompt_submitted', fingerprint: fingerprintPromptText(content), prefix: prefixOf(content) } satisfies DaemonToWorker);
     await delay(300);
     expect(submittedFor()).toEqual([{ type: 'prompt_submitted_input', turnId }]);
+  });
+
+  it('emits direct_submit_started even when prompt_ready never fired (stuck-after-terminal shape)', async () => {
+    const harness = startWorker();
+    await waitFor(
+      harness,
+      () => harness.messages.some(m => m.type === 'ready'),
+      'worker readiness',
+    );
+    // Deliberately do NOT send session_ready: the startup ready-gate stays held,
+    // so prompt_ready is never published and isPromptReady stays false — the
+    // exact shape of a worker stranded after a terminal.
+    const before = harness.messages.filter(m => m.type === 'direct_submit_started').length;
+    harness.child.send({ type: 'prompt_submitted' } satisfies DaemonToWorker);
+    await waitFor(
+      harness,
+      () => harness.messages.filter(m => m.type === 'direct_submit_started').length > before,
+      'direct_submit_started provenance without prompt_ready',
+    );
+    // Provenance is decoupled from the screen edge: no working screen_update is
+    // forced while not ready (the existing no-duplicate contract holds).
+    await delay(300);
+    const workingUpdates = harness.messages.filter(
+      m => m.type === 'screen_update' && m.status === 'working' && m.turnId === undefined,
+    );
+    expect(workingUpdates).toEqual([]);
+  });
+});
+describe('keep-alive vs direct-submit provenance (worker message handler)', () => {
+  const keepaliveFingerprint = fingerprintPromptText('the keepalive command text');
+  const humanFingerprint = fingerprintPromptText('a real human task');
+
+  function scopeWith(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    const sent: WorkerToDaemon[] = [];
+    const inFlightKeepaliveFingerprints = new Map<string, number>();
+    return {
+      isPromptReady: false,
+      revokePromptReadiness: () => {},
+      idleDetector: undefined,
+      log: () => {},
+      writtenInputs: { takeSubmitted: () => undefined },
+      inFlightKeepaliveFingerprints,
+      KEEPALIVE_HOOK_CLAIM_MS: 30_000,
+      send: (m: WorkerToDaemon) => { sent.push(m); },
+      __sent: sent,
+      ...overrides,
+    } as Record<string, unknown>;
+  }
+  const emitsProvenance = (scope: Record<string, unknown>) =>
+    (scope.__sent as WorkerToDaemon[]).some(m => m.type === 'direct_submit_started');
+  // Seed the scope's own Map (the purge helper closes over this instance, so
+  // tests must mutate it rather than replace it).
+  const seedKeepalive = (scope: Record<string, unknown>, at: number = Date.now()) => {
+    (scope.inFlightKeepaliveFingerprints as Map<string, number>).set(keepaliveFingerprint, at);
+    return scope.inFlightKeepaliveFingerprints as Map<string, number>;
+  };
+
+  it('suppresses direct_submit_started when the hook fingerprint matches an in-flight keep-alive', async () => {
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope);
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: keepaliveFingerprint });
+
+    expect(emitsProvenance(scope)).toBe(false);
+    expect(pending.has(keepaliveFingerprint)).toBe(false); // consumed
+  });
+
+  it('R8 reordering: a human hook arriving first still emits, and the late keep-alive hook is then suppressed', async () => {
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope);
+
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: humanFingerprint });
+    expect(emitsProvenance(scope)).toBe(true);
+    expect(pending.has(keepaliveFingerprint)).toBe(true); // survives the human hook
+
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: keepaliveFingerprint });
+    const signals = (scope.__sent as WorkerToDaemon[]).filter(m => m.type === 'direct_submit_started');
+    expect(signals).toHaveLength(1); // still just the human one
+    expect(pending.has(keepaliveFingerprint)).toBe(false);
+  });
+
+  it('R8 reordering: an expired keep-alive entry cannot suppress a later real submit with the same fingerprint', async () => {
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope, Date.now() - 31_000);
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: keepaliveFingerprint });
+
+    expect(emitsProvenance(scope)).toBe(true);
+    expect(pending.size).toBe(0); // purged as abandoned
+  });
+
+  it('emits direct_submit_started when the hook carries no fingerprint (cannot be a matched keep-alive)', async () => {
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope);
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted' });
+
+    expect(emitsProvenance(scope)).toBe(true);
+    expect(pending.size).toBe(1); // untouched
+  });
+
+  it('emits direct_submit_started on a normal prompt_submitted with no keep-alive in flight', async () => {
+    const scope = scopeWith();
+    await loadWorkerMessageHandler('prompt_submitted', scope)({ type: 'prompt_submitted', fingerprint: humanFingerprint });
+    expect(emitsProvenance(scope)).toBe(true);
+  });
+
+  it('R9: a keep-alive entry survives an unrelated injection, so its late hook is still suppressed', async () => {
+    // The keep-alive was written and is awaiting its hook. An unrelated normal
+    // injection (e.g. /compact) writes in between; it must NOT clear the entry.
+    const scope = scopeWith();
+    const pending = seedKeepalive(scope);
+
+    // The keep-alive's independent HTTP hook then arrives late.
+    await loadWorkerMessageHandler('prompt_submitted', scope)({
+      type: 'prompt_submitted', fingerprint: keepaliveFingerprint,
+    });
+
+    expect(emitsProvenance(scope)).toBe(false); // still recognized as keep-alive
+    expect(pending.has(keepaliveFingerprint)).toBe(false); // matched and consumed
+  });
+
+  it('R9 flush: writing a normal injection does not clear an unconfirmed keep-alive entry', async () => {
+    const keepaliveEntries = new Map([[keepaliveFingerprint, Date.now()]]);
+    const pendingInjections = [{ command: '/compact', barrier: false }];
+    const scope: Record<string, unknown> = {
+      nativeSessionForkPending: () => false,
+      codexModelMigrationCheckNeeded: () => false,
+      idleDetector: { isStartupPending: () => false, reset: () => {} },
+      cliRestartInProgress: false,
+      injectionFlushing: false,
+      userFlushing: false,
+      isFlushing: false,
+      commandLineWritesPending: 0,
+      pendingInjections,
+      pendingMessages: [],
+      pendingRawInputs: [],
+      pendingSessionRename: null,
+      backend: {},
+      isPromptReady: true,
+      bareShellLaunchBlocked: false,
+      sessionRenameInFlight: () => false,
+      bareShellChecked: true, // skip the bare-shell launch detector
+      canStartInjectionFlush,
+      revokePromptReadiness: () => {},
+      log: () => {},
+      sendRawCommandLineWithRecoveryFence: async () => {},
+      awaitPtyQuiescence: async () => {},
+      STARTUP_CMD_QUIET_MS: 1,
+      STARTUP_CMD_CAP_MS: 10,
+      inFlightKeepaliveFingerprints: keepaliveEntries,
+      KEEPALIVE_HOOK_CLAIM_MS: 30_000,
+    };
+
+    await loadWorkerFunction<() => Promise<void>>('flushPendingInjections', scope)();
+
+    expect(pendingInjections).toHaveLength(0); // the /compact was written
+    expect(keepaliveEntries.has(keepaliveFingerprint)).toBe(true); // entry retained
+  });
+
+  it('R10 ready keep-alive: the working frame does NOT carry directSubmit', async () => {
+    const publishCalls: Array<{ status: string; opts: Record<string, unknown> }> = [];
+    const scope = scopeWith({
+      isPromptReady: true,
+      idleDetector: { isStartupPending: () => false, reset: () => {} },
+      publishScreenStatus: (status: string, opts: Record<string, unknown>) => publishCalls.push({ status, opts }),
+    });
+    seedKeepalive(scope); // the keep-alive fingerprint is awaiting its hook
+
+    await loadWorkerMessageHandler('prompt_submitted', scope)({
+      type: 'prompt_submitted', fingerprint: keepaliveFingerprint,
+    });
+
+    // One ready→working frame, but it must not be tagged as a direct-submit.
+    expect(publishCalls).toHaveLength(1);
+    expect(publishCalls[0].status).toBe('working');
+    expect(publishCalls[0].opts.directSubmit).toBeUndefined();
+    expect(publishCalls[0].opts.clearTurnId).toBe(true);
+    expect(emitsProvenance(scope)).toBe(false);
+  });
+
+  it('R10 ready human submit: the working frame DOES carry directSubmit', async () => {
+    const publishCalls: Array<{ status: string; opts: Record<string, unknown> }> = [];
+    const scope = scopeWith({
+      isPromptReady: true,
+      idleDetector: { isStartupPending: () => false, reset: () => {} },
+      publishScreenStatus: (status: string, opts: Record<string, unknown>) => publishCalls.push({ status, opts }),
+    });
+
+    await loadWorkerMessageHandler('prompt_submitted', scope)({
+      type: 'prompt_submitted', fingerprint: humanFingerprint,
+    });
+
+    expect(publishCalls).toHaveLength(1);
+    expect(publishCalls[0].opts.directSubmit).toBe(true);
+    expect(emitsProvenance(scope)).toBe(true);
   });
 });

@@ -32,7 +32,8 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
+import { isInClaudeProjectsRoot, type ClaudeProjectsRoot } from './claude-projects-root.js';
 
 /** API-side floor quoted in the 400 ("Minimum allowed dimension: 14 pixels"). */
 export const MIN_IMAGE_DIMENSION = 14;
@@ -422,10 +423,14 @@ function listOutOfScopeTranscripts(sessionDir: string): string[] {
 const SESSION_SUBDIR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Purge the pinned session transcript and its Task/Agent subagent files.
- *  `dryRun` only reports what would be removed and writes nothing. */
+ *  `dryRun` only reports what would be removed and writes nothing.
+ *  `trustedProjectsRoot` is the projects root of the config dir the CLI was
+ *  launched with (see {@link ClaudeProjectsRoot}); `null` means none is known
+ *  and nothing is purged; left out, only the transcript's own directory is
+ *  trusted. */
 export function purgeUndersizedImages(
   mainJsonlPath: string,
-  opts: { minDimension?: number; trustedProjectsRoot?: string; dryRun?: boolean; maxReadBytes?: number } = {},
+  opts: { minDimension?: number; trustedProjectsRoot?: ClaudeProjectsRoot | null; dryRun?: boolean; maxReadBytes?: number } = {},
 ): PurgeReport {
   const report: PurgeReport = {
     files: [],
@@ -438,15 +443,14 @@ export function purgeUndersizedImages(
   };
   let trustedRoot: string;
   try {
-    trustedRoot = realpathSync(opts.trustedProjectsRoot ?? dirname(mainJsonlPath));
-    const lexicalMain = resolve(mainJsonlPath);
-    const lexicalRelative = relative(resolve(opts.trustedProjectsRoot ?? dirname(mainJsonlPath)), lexicalMain);
-    const realMain = realpathSync(mainJsonlPath);
-    if (lexicalRelative.startsWith('..') || lexicalRelative.includes('/../')
-      || (realMain !== trustedRoot && !realMain.startsWith(`${trustedRoot}/`))) {
+    const root = opts.trustedProjectsRoot === undefined
+      ? { lexical: dirname(resolve(mainJsonlPath)), real: realpathSync(dirname(mainJsonlPath)) }
+      : opts.trustedProjectsRoot;
+    if (!root || !isInClaudeProjectsRoot(mainJsonlPath, root)) {
       report.failedFiles.push({ file: mainJsonlPath, reason: 'outside trusted root' });
       return report;
     }
+    trustedRoot = root.real;
   } catch (err) {
     report.failedFiles.push({ file: mainJsonlPath, reason: (err as NodeJS.ErrnoException).code ?? 'unreadable' });
     return report;
