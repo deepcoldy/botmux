@@ -2275,6 +2275,43 @@ const TURN_EXPLICIT_MENTION_MAX = 64;
  *  worker) — the killed-CLI-mid-turn shape. Surfaces to HTTP async/wait callers
  *  as state=failed / errorCode=trigger_failed / terminalErrorCode=below. */
 const TURN_ENDED_UNOBSERVED = 'turn_ended_unobserved';
+
+/**
+ * Take a session to an observable fail-closed terminal after a durable async
+ * write failure. closeSession persists a `closed` session row, so
+ * trigger-result's closed-branch resolves `failed` after an unclean daemon
+ * restart instead of stranding the poller on `running` against a durable
+ * `pending` record and an `open` row. Never throws into the IPC handler: a
+ * refusal or throw is logged as UNPROVEN and the convergence stamp retains its
+ * worker-exit / terminal-replay backstop. Same contract as
+ * failCloseIdempotentTurnIfConvergenceWriteFailed in daemon.ts.
+ */
+function failCloseSessionAfterAsyncPersistFailure(
+  ds: DaemonSession,
+  turnId: string,
+  context: string,
+): void {
+  const t = tag(ds);
+  logger.error(
+    `[${t}] ${context} for ${turnId.substring(0, 8)}; fail-closing session`,
+  );
+  void Promise.resolve()
+    .then(() => requireCallbacks().closeSession(ds))
+    .then((closed) => {
+      if (closed === false) {
+        logger.error(
+          `[${t}] Fail-close refused for ${turnId.substring(0, 8)} (${context}); `
+          + 'session retained for retry',
+        );
+      }
+    })
+    .catch((closeErr) => {
+      logger.error(
+        `[${t}] Fail-close threw; close state is UNPROVEN for ${turnId.substring(0, 8)} `
+        + `(${context}): ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
+      );
+    });
+}
 /** Posted-receipt memory. Bounded for the same reason as the origin FIFO, and
  *  larger than any plausible replay window within one session's lifetime. */
 const SILENT_RECEIPT_DEDUPE_MAX = 64;
@@ -25016,9 +25053,31 @@ function setupWorkerHandlers(
             nonLarkFailureHandled = true;
             if (asyncResult?.status === 'completed' || asyncResult?.status === 'failed'
               || asyncResult?.status === 'interrupted') {
-              // An earlier stronger settlement (captured final_output, provider
-              // failure, caller interrupt) always wins; just release the stamp.
-              ds.idempotentAsyncTurns?.delete(msg.turnId);
+              // An earlier in-memory settlement (captured final_output, provider
+              // failure, caller interrupt) wins, but in-memory terminality is NOT
+              // durable proof: its strict write may have failed while this
+              // projection was retained. Release the convergence stamp only when
+              // the durable record is itself terminal; otherwise keep the stamp
+              // (worker-exit/boot reconcile backstop) and fail-close so a
+              // restarted resolver cannot return `running` against an open row.
+              let durableTerminal = false;
+              try {
+                const persisted = asyncTriggerStore.lookup(ds.session.sessionId, msg.turnId);
+                durableTerminal = !!persisted && persisted.result.status !== 'pending';
+              } catch (lookupErr) {
+                logger.error(
+                  `[${t}] Durable lookup failed while guarding explicit-final stamp for `
+                  + `${msg.turnId.substring(0, 8)}: `
+                  + `${lookupErr instanceof Error ? lookupErr.message : String(lookupErr)}`,
+                );
+              }
+              if (durableTerminal) {
+                ds.idempotentAsyncTurns?.delete(msg.turnId);
+              } else {
+                failCloseSessionAfterAsyncPersistFailure(
+                  ds, msg.turnId, `explicit-final on in-memory ${asyncResult.status} without durable terminal`,
+                );
+              }
               logger.info(
                 `[${t}] Ignored explicit-final terminal for already-${asyncResult.status} async HTTP turn `
                 + msg.turnId.substring(0, 8),
@@ -25032,36 +25091,34 @@ function setupWorkerHandlers(
               }
               rememberHttpTerminal(ds, msg.turnId);
               try {
-                asyncTriggerStore.recordCompleted(
+                // STRICT write: the best-effort recordCompleted swallows disk
+                // errors (save() only logs), which would leave durable `pending`
+                // while memory says completed — an unclean restart then resolves
+                // `running` forever. The throwing strict API makes a lost write
+                // observable so the catch can fail-close the session.
+                const outcome = asyncTriggerStore.recordCompletedStrict(
                   ds.session.sessionId, msg.turnId, '', completedAt, ds.larkAppId,
                 );
+                if (outcome === 'terminal') {
+                  // Durable already holds a stronger terminal (explicit
+                  // interrupt / turn_terminal failure). Drop the in-memory
+                  // completed projection so trigger-result reads that proof.
+                  ds.asyncTriggerResults?.delete(msg.turnId);
+                }
+                // Either outcome proves durable terminality: release the stamp.
                 ds.idempotentAsyncTurns?.delete(msg.turnId);
               } catch (err) {
-                // Durable completed write failed: same fail-close contract as
-                // the unobserved-terminal path — close the session row so a
-                // restarted resolver returns `failed` instead of `running`.
+                // Durable completed write failed: keep the convergence stamp and
+                // fail-close the session row so a restarted resolver returns
+                // `failed` instead of `running` against an open session.
                 logger.error(
                   `[${t}] Failed to persist explicit-final completion for `
-                  + `${msg.turnId.substring(0, 8)} (fail-closing session): `
+                  + `${msg.turnId.substring(0, 8)} (convergence stamp retained): `
                   + `${err instanceof Error ? err.message : String(err)}`,
                 );
-                void Promise.resolve()
-                  .then(() => requireCallbacks().closeSession(ds))
-                  .then((closed) => {
-                    if (closed === false) {
-                      logger.error(
-                        `[${t}] Fail-close after explicit-final write failure was refused `
-                        + `for ${msg.turnId.substring(0, 8)}; session retained for retry`,
-                      );
-                    }
-                  })
-                  .catch((closeErr) => {
-                    logger.error(
-                      `[${t}] Fail-close after explicit-final write failure threw; `
-                      + `close state is UNPROVEN for ${msg.turnId.substring(0, 8)}: `
-                      + `${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
-                    );
-                  });
+                failCloseSessionAfterAsyncPersistFailure(
+                  ds, msg.turnId, 'explicit-final completion persist failure',
+                );
               }
               logger.info(
                 `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
@@ -25160,26 +25217,12 @@ function setupWorkerHandlers(
                 // closed-branch resolves `failed` after any restart.
                 logger.error(
                   `[${t}] Failed to persist async unobserved-terminal for `
-                  + `${msg.turnId.substring(0, 8)} (convergence stamp retained; fail-closing session): `
+                  + `${msg.turnId.substring(0, 8)} (convergence stamp retained): `
                   + `${err instanceof Error ? err.message : String(err)}`,
                 );
-                void Promise.resolve()
-                  .then(() => requireCallbacks().closeSession(ds))
-                  .then((closed) => {
-                    if (closed === false) {
-                      logger.error(
-                        `[${t}] Fail-close after unobserved-terminal write failure was refused `
-                        + `for ${msg.turnId.substring(0, 8)}; session retained for retry`,
-                      );
-                    }
-                  })
-                  .catch((closeErr) => {
-                    logger.error(
-                      `[${t}] Fail-close after unobserved-terminal write failure threw; `
-                      + `close state is UNPROVEN for ${msg.turnId.substring(0, 8)}: `
-                      + `${closeErr instanceof Error ? closeErr.message : String(closeErr)}`,
-                    );
-                  });
+                failCloseSessionAfterAsyncPersistFailure(
+                  ds, msg.turnId, 'unobserved-terminal persist failure',
+                );
               }
               logger.info(
                 `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
