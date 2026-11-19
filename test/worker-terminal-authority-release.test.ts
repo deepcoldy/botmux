@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { promptSuggestionReportTurn } from '../src/utils/prompt-suggestion-publisher.js';
 import { turnFailureDiagnostics } from '../src/services/turn-failure-diagnostics.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
@@ -141,8 +142,21 @@ describe('turn terminal releases the active turn authority', () => {
     expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
     expect(h.queuedTypeAheadTurns).toEqual([]);
     expect(h.retiredTurnIds.has('om_absorbed')).toBe(true);
+    // The screen stays the host's; its prompt suggestion answers the absorbed turn.
+    expect(promptSuggestionReportTurn({ turnId: h.currentBotmuxTurnId }, h.foldedTypeAheadTurn,
+      (turnId: string, attempt?: number) => h.turnTerminalEmitted(turnId, attempt))).toEqual({ turnId: 'om_absorbed', dispatchAttempt: undefined });
     // A silent scheduled fire must be deliverable again.
     expect(h.activeTurnBlocks({ turnId: 'schedule:task:1', queueAfterActiveTurn: true })).toBe(false);
+  });
+
+  it('does not answer a prompt suggestion for a queued turn whose write failed', () => {
+    const h = harness();
+    startTurn(h, 'om_host');
+    h.queuedTypeAheadTurns.push({ turnId: 'om_write_failed' });
+    h.emitTurnTerminal('om_write_failed', 'ambiguous', 'write_input_threw');
+    h.emitTurnTerminal('om_host', 'completed');
+    expect(promptSuggestionReportTurn({ turnId: h.currentBotmuxTurnId }, h.foldedTypeAheadTurn,
+      (turnId: string, attempt?: number) => h.turnTerminalEmitted(turnId, attempt))).toEqual({ turnId: 'om_host' });
   });
 
   it('hands authority to a queued input the CLI consumed before the running turn ended', () => {
