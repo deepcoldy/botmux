@@ -1,5 +1,6 @@
 /** Execute a production closure with explicit host dependencies, matching the
  * worker-function harness while the pool still has no importable host seam. */
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { controllerForSession } from '../../src/core/session-controller.js';
@@ -16,6 +17,7 @@ import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
  * identity checks rather than substituting a no-op completion callback. */
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
   if (key in scope) return scope[key as string];
+  if (key === 'randomUUID') return randomUUID;
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
@@ -31,7 +33,8 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
-    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn'].includes(key)) {
+    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
+    'recordLaunchModel'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

@@ -56,10 +56,12 @@ interface RunOpts {
 
 function runEntry(opts: RunOpts): Promise<{ status: number | null; stdout: Buffer; stderr: string; finishedAtMs: number }> {
   return new Promise((resolve, reject) => {
-    const env: NodeJS.ProcessEnv = { ...process.env, SESSION_DATA_DIR: opts.dataDir, ...opts.extraEnv };
+    const env: NodeJS.ProcessEnv = { ...process.env, SESSION_DATA_DIR: opts.dataDir };
     delete env.BOTMUX_SESSION_ID;
     delete env.BOTMUX_STATUSLINE_CHAIN;
+    delete env.BOTMUX_STATUSLINE_GEN;
     delete env.BOTMUX_WORKFLOW;
+    if (opts.extraEnv) Object.assign(env, opts.extraEnv);
     if (opts.sessionId) env.BOTMUX_SESSION_ID = opts.sessionId;
     if (opts.chain) env.BOTMUX_STATUSLINE_CHAIN = opts.chain;
     const child = spawnTsScript(
