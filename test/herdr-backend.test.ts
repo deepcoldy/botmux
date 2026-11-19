@@ -1314,8 +1314,9 @@ describe('HerdrBackend.spawn', () => {
     const pane = (id: string, value: string, status = 'idle') =>
       ({ pane_id: id, agent: 'claude', agent_status: status, agent_session: { kind: 'id', value } });
 
-    function spawnResume(panes: unknown[], resume = true) {
+    function spawnResume(panes: unknown[], resume = true, overrides: HerdrResponseHandler[] = []) {
       setHerdrResponses([
+        ...overrides,
         { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
         { match: a => a.includes('pane') && a.includes('list'), reply: () => JSON.stringify({ result: { panes } }) },
         {
@@ -1332,19 +1333,99 @@ describe('HerdrBackend.spawn', () => {
     const callIndex = (...needles: string[]) =>
       mockedExecFileSync.mock.calls.findIndex(c => needles.every(n => (c[1] as string[]).includes(n)));
 
-    it('closes the idle restored pane before starting the new CLI', () => {
-      spawnResume([pane('9-1', SID), pane('9-2', 'another-session-id')]);
-      const closeIdx = callIndex('pane', 'close', '9-1');
-      expect(closeIdx).toBeGreaterThanOrEqual(0);
-      expect(closeIdx).toBeLessThan(callIndex('agent', 'start'));
+    it('closes every settled restored pane before starting the new CLI', () => {
+      spawnResume([pane('9-1', SID), pane('9-1b', SID, 'done'), pane('9-2', 'another-session-id')]);
+      const startIdx = callIndex('agent', 'start');
+      for (const paneId of ['9-1', '9-1b']) {
+        const closeIdx = callIndex('pane', 'close', paneId);
+        expect(closeIdx).toBeGreaterThanOrEqual(0);
+        expect(closeIdx).toBeLessThan(startIdx);
+      }
       expect(herdrCall('pane', 'close', '9-2')).toBeUndefined();
     });
 
-    it('leaves a busy pane running the session alone', () => {
-      spawnResume([pane('9-1', SID, 'working'), pane('9-1b', SID, 'blocked')]);
-      expect(herdrCall('pane', 'close', '9-1')).toBeUndefined();
-      expect(herdrCall('pane', 'close', '9-1b')).toBeUndefined();
+    it.each(['working', 'blocked', 'unknown'] as const)('refuses a second writer when the matching pane is %s', status => {
+      expect(() => spawnResume([pane('9-1', SID, status), pane('9-1b', SID)])).toThrow();
+      expect(herdrCall('pane', 'close')).toBeUndefined();
+      expect(herdrCall('agent', 'start')).toBeUndefined();
+    });
+
+    it('rechecks a sibling pane before closing it during multi-pane cleanup', () => {
+      const livePanes = [pane('9-1', SID), pane('9-2', SID)];
+      const dynamicList: HerdrResponseHandler = {
+        match: a => a.includes('pane') && a.includes('list'),
+        reply: () => JSON.stringify({ result: { panes: livePanes } }),
+      };
+      const flipSibling: HerdrResponseHandler = {
+        match: a => a.includes('pane') && a.includes('close') && a.includes('9-1'),
+        reply: () => {
+          livePanes[1] = pane('9-2', SID, 'working');
+          return '';
+        },
+      };
+      expect(() => spawnResume([], true, [dynamicList, flipSibling])).toThrow();
+      expect(herdrCall('pane', 'close', '9-1')).toBeDefined();
+      expect(herdrCall('pane', 'close', '9-2')).toBeUndefined();
+      expect(herdrCall('agent', 'start')).toBeUndefined();
+    });
+
+    it('refuses to start when the pane list fails', () => {
+      const failList: HerdrResponseHandler = {
+        match: a => a.includes('pane') && a.includes('list'),
+        reply: () => { throw new Error('socket timeout'); },
+      };
+      expect(() => spawnResume([], true, [failList])).toThrow(/pane list/);
+      expect(herdrCall('agent', 'start')).toBeUndefined();
+    });
+
+    it('refuses to start when a matching pane cannot be closed', () => {
+      const failClose: HerdrResponseHandler = {
+        match: a => a.includes('pane') && a.includes('close'),
+        reply: () => { throw new Error('socket busy'); },
+      };
+      expect(() => spawnResume([pane('9-1', SID)], true, [failClose])).toThrow();
+      expect(herdrCall('pane', 'close', '9-1')).toBeDefined();
+      expect(herdrCall('agent', 'start')).toBeUndefined();
+    });
+
+    it('accepts the top-level pane-list response supported by the shared parser', () => {
+      const topLevelList: HerdrResponseHandler = {
+        match: a => a.includes('pane') && a.includes('list'),
+        reply: () => JSON.stringify({ panes: [pane('9-1', SID)] }),
+      };
+      spawnResume([], true, [topLevelList]);
+      expect(herdrCall('pane', 'close', '9-1')).toBeDefined();
       expect(herdrCall('agent', 'start')).toBeDefined();
+    });
+
+    it('starts normally when no pane matches the resumed session', () => {
+      spawnResume([pane('9-2', 'another-session-id')]);
+      expect(herdrCall('pane', 'close')).toBeUndefined();
+      expect(herdrCall('agent', 'start')).toBeDefined();
+    });
+
+    it('excludes an overlapping cold resume before it can start another writer', () => {
+      let starts = 0;
+      let nestedError: unknown;
+      const nestedStart: HerdrResponseHandler = {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => {
+          starts++;
+          if (starts === 1) {
+            const nested = new HerdrBackend(SESSION);
+            try {
+              nested.spawn('claude', ['--resume', SID], {
+                cwd: '/work', cols: 80, rows: 24, env: {}, resumeCliSessionId: SID,
+              });
+              nested.kill();
+            } catch (err) { nestedError = err; }
+          }
+          return JSON.stringify({ result: { agent: { name: 'botmux', pane_id: 'fresh-1' } } });
+        },
+      };
+      spawnResume([], true, [nestedStart]);
+      expect(nestedError).toBeDefined();
+      expect(starts).toBe(1);
     });
 
     it('closes a pane whose agent_session is a _<id>.jsonl path', () => {

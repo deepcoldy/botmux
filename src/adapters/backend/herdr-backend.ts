@@ -1,4 +1,5 @@
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join } from 'node:path';
@@ -6,6 +7,7 @@ import * as pty from '../../utils/pty.js';
 import xtermHeadless from '@xterm/headless';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe, HerdrBackendConfig, HerdrBackendPlacement } from './types.js';
 import { logger } from '../../utils/logger.js';
+import { withFileLockSync } from '../../utils/file-lock.js';
 import { sessionChildEnvWithInject, trustedSessionEnvUnsetFlags } from '../../core/session-env.js';
 import { herdrExecutable } from '../../utils/herdr-executable.js';
 import { herdrPaneTerminalDevice, readTerminalDeviceGrid } from '../../utils/herdr-pane-grid.js';
@@ -513,6 +515,18 @@ export function resolveHerdrResumeCliSessionId(
   return effectiveResume && forkSession !== true ? effectiveCliSessionId : undefined;
 }
 
+/** Serialize cleanup + launch for one native conversation on one Herdr host.
+ * The lock lives outside any worker's session data dir so overlapping workers
+ * cannot both observe an empty pane set and start a second writer. */
+function herdrResumeLockTarget(sessionName: string, cliSessionId: string): string {
+  const key = createHash('sha256')
+    .update(process.env.HOME ?? '')
+    .update('\0').update(sessionName)
+    .update('\0').update(cliSessionId)
+    .digest('hex');
+  return join(tmpdir(), `botmux-herdr-resume-${key}`);
+}
+
 export class HerdrBackend implements SessionBackend {
   private serverProcess: ChildProcess | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -684,28 +698,50 @@ export class HerdrBackend implements SessionBackend {
   }
 
   /**
-   * Close idle panes that already run `cliSessionId`. With
+   * Close settled panes that already run `cliSessionId`. With
    * `resume_agents_on_restore`, herdr re-launches every Claude pane as
    * `claude --resume <id>` under a new name Botmux does not track; a cold
-   * resume would then add a second writer to the same transcript. Busy panes
-   * are left alone (a turn is in flight) and only logged.
+   * resume would then add a second writer to the same transcript. Any
+   * unresolved activity or Herdr failure aborts the launch instead: cleanup
+   * is a safety precondition, not a best-effort sweep.
    */
   static closePanesRunningCliSession(sessionName: string, cliSessionId: string): string[] {
-    const raw = jsonCommand(herdrSessionArgs(sessionName, ['pane', 'list']), { timeout: 5000 });
-    const panes: any[] = Array.isArray(raw?.result?.panes) ? raw.result.panes : [];
-    const closed: string[] = [];
-    for (const pane of panes) {
+    const listMatches = () => requiredHerdrList(
+      `herdr pane list before resuming CLI session ${cliSessionId}`,
+      herdrSessionArgs(sessionName, ['pane', 'list']),
+      'panes',
+    ).filter((pane: any) => {
       const value = pane?.agent_session?.value;
-      if (typeof value !== 'string' || typeof pane?.pane_id !== 'string') continue;
-      if (value !== cliSessionId && !value.endsWith(`_${cliSessionId}.jsonl`)) continue;
-      if (pane.agent_status === 'working' || pane.agent_status === 'blocked') {
-        logger.warn(`[herdr-backend] pane ${pane.pane_id} already runs CLI session ${cliSessionId} but is ${pane.agent_status}; not closing it`);
-        continue;
+      return typeof value === 'string' && typeof pane?.pane_id === 'string'
+        && (value === cliSessionId || value.endsWith(`_${cliSessionId}.jsonl`));
+    });
+    const requireSettled = (pane: any) => {
+      if (pane.agent_status !== 'idle' && pane.agent_status !== 'done') {
+        throw new Error(
+          `herdr pane ${pane.pane_id} already runs CLI session ${cliSessionId} but is ${pane.agent_status ?? 'unknown'}; `
+          + 'refusing to start a second writer',
+        );
       }
+    };
+    const matches = listMatches();
+    // Do not partially clean a cohort that is already known to be unresumable.
+    for (const pane of matches) requireSettled(pane);
+    const closed: string[] = [];
+    for (const pane of matches) {
+      // Human input can change a pane while another one is being closed. Herdr
+      // 0.9.5 has no compare-and-close operation, so re-read immediately before
+      // each close; this narrows the race rather than claiming atomicity.
+      const current = listMatches().find((candidate: any) => candidate.pane_id === pane.pane_id);
+      if (!current) continue; // Already gone, or no longer bound to this CLI session.
+      requireSettled(current);
       logger.warn(`[herdr-backend] closing pane ${pane.pane_id}: it already runs CLI session ${cliSessionId} (restored by herdr)`);
-      if (runHerdr(herdrSessionArgs(sessionName, ['pane', 'close', pane.pane_id]), { timeout: 5000 })) {
-        closed.push(pane.pane_id);
+      if (!runHerdr(herdrSessionArgs(sessionName, ['pane', 'close', pane.pane_id]), { timeout: 5000 })) {
+        throw new Error(
+          `herdr pane close ${pane.pane_id} failed while resuming CLI session ${cliSessionId}; `
+          + 'refusing to start a second writer',
+        );
       }
+      closed.push(pane.pane_id);
     }
     return closed;
   }
@@ -727,6 +763,23 @@ export class HerdrBackend implements SessionBackend {
   }
 
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    const resumeCliSessionId = !this.opts.isReattach && !this.opts.externalTarget
+      ? opts.resumeCliSessionId
+      : undefined;
+    if (!resumeCliSessionId) {
+      this.spawnWithResumeExclusion(bin, args, opts);
+      return;
+    }
+    // Cover the whole launch, not just cleanup: a second worker must not see
+    // an empty pane set after our close and before our agent start completes.
+    withFileLockSync(
+      herdrResumeLockTarget(this.sessionName, resumeCliSessionId),
+      () => this.spawnWithResumeExclusion(bin, args, opts),
+      { maxWaitMs: 0 },
+    );
+  }
+
+  private spawnWithResumeExclusion(bin: string, args: string[], opts: SpawnOpts): void {
     this.cols = opts.cols;
     this.rows = opts.rows;
     this.cliCwd = opts.cwd;
