@@ -36,7 +36,7 @@ import type { TmuxVersion } from '../../setup/ensure-tmux.js';
 import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
 import { inheritBotEnv } from '../../core/env-policy.js';
 import { strictPaneCommand } from './strict-env.js';
-import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError, classifyTmuxCaptureError } from './tmux-backend.js';
+import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError, classifyTmuxCaptureError, isTmuxSocketMissingErrorText } from './tmux-backend.js';
 import {
   assertTmuxCommandFits,
   paneLaunchLoader,
@@ -345,6 +345,72 @@ export function paneLossWasServerReplacement(
   answeringPid: number | undefined,
 ): boolean {
   return lastLivePid !== undefined && answeringPid !== undefined && lastLivePid !== answeringPid;
+}
+
+/**
+ * How the tmux server holding a lost pane was itself lost:
+ *  - `replaced`    — a server with a different pid now answers on the socket;
+ *  - `gone`        — nothing listens on the socket any more ("no server
+ *                    running", or the socket file is missing): the server
+ *                    process died (crash, OOM, kill-server) and took every
+ *                    pane with it;
+ *  - `unreachable` — the server never answered for the whole outage window
+ *                    (SERVER_OUTAGE_ESCALATE_MS) before the pane was declared
+ *                    dead.
+ * In all three the CLI did not fail on its own: the backend did.
+ */
+export type TmuxServerLossKind = 'replaced' | 'gone' | 'unreachable';
+
+/** Who answers on a tmux socket right now (see answeringServer). */
+export type TmuxServerAnswer =
+  | { state: 'pid'; pid: number }
+  | { state: 'down' }
+  | { state: 'unknown' };
+
+/**
+ * The server-loss verdict for a pane already judged gone. Needs a live-server
+ * pid anchored while the pane was alive: without it nothing ties the pane to
+ * the server that went away, so the exit stays an ordinary CLI exit (the
+ * conservative answer, which keeps crash-loop protection).
+ *
+ * `down` counts as loss: a server outlives the exit of one CLI on the shared
+ * socket, so an empty socket means the server itself ended. The one ambiguous
+ * shape — the pane was the server's LAST session and its CLI exited cleanly,
+ * so tmux shut down an empty server — is bounded by the daemon's per-session
+ * outage budget (backend-outage-coordinator.ts).
+ */
+export function classifyServerLossAtPaneLoss(
+  lastLivePid: number | undefined,
+  answer: TmuxServerAnswer,
+): Exclude<TmuxServerLossKind, 'unreachable'> | undefined {
+  if (lastLivePid === undefined) return undefined;
+  if (answer.state === 'down') return 'gone';
+  if (answer.state === 'pid' && paneLossWasServerReplacement(lastLivePid, answer.pid)) return 'replaced';
+  return undefined;
+}
+
+/** `list-sessions` failure → whether nothing listens on the socket. Only the
+ *  server-less answers count: "no server running" (connect refused: a socket
+ *  file without a listener) and a missing socket file. A timeout or any other
+ *  connection error may be a live-but-stalled server. */
+function serverAnswerFromFailure(err: any): TmuxServerAnswer {
+  if (isExecTimeoutError(err)) return { state: 'unknown' };
+  if (err && typeof err.status === 'number' && !err.signal) {
+    const stderr = (err.stderr?.toString?.() ?? '').trim();
+    if (/no server running/i.test(stderr) || isTmuxSocketMissingErrorText(stderr)) return { state: 'down' };
+  }
+  return { state: 'unknown' };
+}
+
+/**
+ * Whether a tmux server currently answers on `socketName` (a clean
+ * `list-sessions`). Never starts a server and never blocks the event loop.
+ * Used by the daemon's backend-outage coordinator to decide whether a lost
+ * server is back before it restarts more than one session.
+ */
+export async function probeTmuxServerUp(socketName: string | undefined, timeoutMs = 3_000): Promise<boolean> {
+  const r = await runTmuxAsync([...tmuxSocketArgs(socketName), 'list-sessions', '-F', '#{session_id}'], timeoutMs);
+  return r.ok;
 }
 
 /**
@@ -782,6 +848,33 @@ const RETIRE_KILLED = 'botmux-retired-own-session';
 const RETIRE_KEPT = 'botmux-kept-session';
 const DEAD_PANE_MARKER = 'botmux-pane-dead-before-pipe';
 
+/**
+ * Per-session `pane-died` hook that disables input on a pane the moment its
+ * process dies (`select-pane -d` sets PANE_INPUTOFF).
+ *
+ * `paste-buffer` into a dead pane crashes the WHOLE tmux server on tmux <= 3.3a
+ * (it writes to the pane's freed event buffer; upstream fix 4bdb855, in 3.4).
+ * Botmux's own paste is already guarded in its server queue (pasteBuffer), but
+ * a dead pane kept by remain-on-exit can also be pasted into by ANY attached
+ * client: tmux's default `prefix ]` and middle-click (MouseDown2Pane; botmux
+ * turns `mouse` on) bindings run `paste-buffer` against the current pane.
+ * Measured on a private socket: an attached client pressing `C-b ]` on a dead
+ * pane takes the 3.3a server down whenever any paste buffer exists.
+ * paste-buffer skips a pane with PANE_INPUTOFF on every version (2.8 source:
+ * `if (pb != NULL && ~wp->flags & PANE_INPUTOFF)`), so after this hook a
+ * corpse ignores pastes from every source. Session-scoped, so neither the
+ * user's key bindings nor other sessions' hooks change. Measured on 2.8 / 3.3a
+ * (`on` and `failed`) / 3.6a: `#{pane_input_off}` is 1 on the corpse and the
+ * server survives both a direct paste-buffer and an attached `C-b ]`.
+ */
+const PANE_DIED_INPUT_OFF_HOOK = 'select-pane -d';
+
+/** tmux argv installing {@link PANE_DIED_INPUT_OFF_HOOK} on one session. The
+ *  `-t` value goes in raw (argv form; tmux quotes would break the lookup). */
+export function paneDiedInputOffHookArgs(target: string): string[] {
+  return ['set-hook', '-t', target, 'pane-died', PANE_DIED_INPUT_OFF_HOOK];
+}
+
 function deadPaneSubscriptionError(): Error {
   return Object.assign(new Error('pane is dead'), { status: 1, stderr: 'pane is dead' });
 }
@@ -930,9 +1023,9 @@ export class TmuxPipeBackend implements SessionBackend {
    *  first probe that finds the pane alive fills it only if the attach-time
    *  read failed. Compared with the answering server at teardown time. */
   private lastLiveServerPid: number | undefined;
-  /** Set when the pane was judged gone while a DIFFERENT tmux server answered
-   *  on the same socket — the whole server was lost, the CLI did not exit. */
-  private serverReplacedAtExit = false;
+  /** Set when the pane was judged gone because the whole tmux server was lost
+   *  (see TmuxServerLossKind) — the CLI did not exit on its own. */
+  private serverLossAtExit: TmuxServerLossKind | undefined;
   /** Track the selected option, even if its reply is lost or the version refreshes. */
   private legacyRetention = false;
   /** Set after pipe-pane subscription is active so kill() knows to cancel it. */
@@ -1459,7 +1552,7 @@ export class TmuxPipeBackend implements SessionBackend {
       );
       if (paneProbe.state === 'missing') {
         this.dumpRecentOutputTail();
-        this.noteServerReplacedAtPaneLoss();
+        this.noteServerLossAtPaneLoss();
         this.handlePaneExit();
       }
       return false;
@@ -1569,7 +1662,7 @@ export class TmuxPipeBackend implements SessionBackend {
       process.stderr.write(`[tmux-pipe-backend] refusing write: pane ${this.paneTarget} is dead (remain-on-exit remnant); reporting the CLI exit\n`);
       this.capturePaneDeathSync(verdict.deathLine);
       this.dumpRecentOutputTail();
-      this.noteServerReplacedAtPaneLoss();
+      this.noteServerLossAtPaneLoss();
       this.handlePaneExit();
       return false;
     }
@@ -1948,7 +2041,9 @@ export class TmuxPipeBackend implements SessionBackend {
           process.stderr.write(
             `[tmux-pipe-backend] tmux server continuously unreachable for ${Math.round((Date.now() - this.serverUnreachableSince) / 1000)}s; declaring ${this.ownsSession ? 'managed' : 'adopted'} pane dead (${probe.reason ?? 'connection error'})\n`,
           );
-          this.noteServerReplacedAtPaneLoss();
+          // A server that never answered for the whole window is a backend
+          // failure even when no other server took the socket over.
+          this.noteServerLossAtPaneLoss('unreachable');
           this.handlePaneExit();
           return;
         }
@@ -2016,44 +2111,59 @@ export class TmuxPipeBackend implements SessionBackend {
     process.stderr.write(
       `[tmux-pipe-backend] ${this.ownsSession ? 'managed' : 'adopted'} pane gone after ${ADOPT_LIVENESS_MAX_FAILURES} consecutive authoritative misses; detaching observer\n`,
     );
-    this.noteServerReplacedAtPaneLoss();
+    this.noteServerLossAtPaneLoss();
     this.handlePaneExit();
   }
 
-  /** pid of the tmux server currently answering on this socket, or undefined
-   *  when nobody answers / the answer is unreadable. Read-only. */
-  private static answeringServerPid(timeoutMs: number, socketArgs: readonly string[]): number | undefined {
+  /** Who answers on this socket right now: the server's pid, `down` when
+   *  nothing listens there, `unknown` when the answer is unreadable (timeout,
+   *  connection error of a possibly stalled server). Read-only. */
+  private static answeringServer(timeoutMs: number, socketArgs: readonly string[]): TmuxServerAnswer {
     try {
       const out = execFileSync('tmux', [...socketArgs, 'list-sessions', '-F', '#{pid}'], {
         encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         timeout: timeoutMs,
         env: tmuxEnv(),
       });
-      return parsePositivePid(String(out).split('\n')[0]);
-    } catch {
-      return undefined;
+      const pid = parsePositivePid(String(out).split('\n')[0]);
+      return pid === undefined ? { state: 'unknown' } : { state: 'pid', pid };
+    } catch (err) {
+      return serverAnswerFromFailure(err);
     }
   }
 
   /** True when the last pane exit was caused by losing the whole tmux server
-   *  (a different server now answers on the socket), not by the CLI exiting. */
+   *  (see TmuxServerLossKind), not by the CLI exiting. */
   exitedBecauseServerReplaced(): boolean {
-    return this.exited && this.serverReplacedAtExit;
+    return this.exitedBecauseServerLost() !== undefined;
   }
 
-  /** Before a probe-confirmed teardown, latch whether a DIFFERENT server now
-   *  answers on the socket. Idempotent and skipped when no live-server pid was
-   *  ever anchored: an unreadable verdict stays "CLI exit", the conservative
-   *  answer that keeps the crash-loop FRESH fallback. The adopt pid-death path
-   *  does not call this — there the CLI process itself was observed gone. */
-  private noteServerReplacedAtPaneLoss(): void {
-    if (this.serverReplacedAtExit || this.lastLiveServerPid === undefined) return;
-    const answeringPid = TmuxPipeBackend.answeringServerPid(3000, this.tmuxArgs);
-    if (!paneLossWasServerReplacement(this.lastLiveServerPid, answeringPid)) return;
-    this.serverReplacedAtExit = true;
+  /** After onExit: how the tmux server holding the pane was lost, when the
+   *  exit came from that rather than from the CLI. The socket name lets the
+   *  daemon group every session that lost the same server into ONE outage. */
+  exitedBecauseServerLost(): { kind: TmuxServerLossKind; socketName?: string } | undefined {
+    if (!this.exited || this.serverLossAtExit === undefined) return undefined;
+    return { kind: this.serverLossAtExit, ...(this.socketName !== undefined ? { socketName: this.socketName } : {}) };
+  }
+
+  /** Before a probe-confirmed teardown, latch whether the pane went with its
+   *  whole server (classifyServerLossAtPaneLoss). Idempotent; without an
+   *  anchored live-server pid the verdict stays "CLI exit" — the conservative
+   *  answer that keeps the crash-loop budget and the FRESH fallback —
+   *  unless the caller already knows the server never answered for the whole
+   *  outage window (`fallback`). The adopt pid-death path does not call this —
+   *  there the CLI process itself was observed gone. */
+  private noteServerLossAtPaneLoss(fallback?: 'unreachable'): void {
+    if (this.serverLossAtExit !== undefined) return;
+    const answer = this.lastLiveServerPid === undefined
+      ? { state: 'unknown' } as const
+      : TmuxPipeBackend.answeringServer(3000, this.tmuxArgs);
+    const kind = classifyServerLossAtPaneLoss(this.lastLiveServerPid, answer) ?? fallback;
+    if (kind === undefined) return;
+    this.serverLossAtExit = kind;
     process.stderr.write(
-      `[tmux-pipe-backend] the tmux server on this socket was replaced (was pid ${this.lastLiveServerPid}); the CLI did not exit on its own\n`,
+      `[tmux-pipe-backend] the tmux server holding this pane was lost (${kind}; was pid ${this.lastLiveServerPid ?? 'unknown'}); the CLI did not exit on its own\n`,
     );
   }
 
@@ -2399,6 +2509,9 @@ export class TmuxPipeBackend implements SessionBackend {
       // a NON-zero exit. Before 3.2, `on` also retains clean exits until the
       // lifecycle watcher reads their status and removes the dead pane.
       ';', 'set-option', '-t', this.paneTarget, 'remain-on-exit', remainOnExit,
+      // Same queue, same reason: a corpse must refuse input from the moment it
+      // dies (see PANE_DIED_INPUT_OFF_HOOK).
+      ';', ...paneDiedInputOffHookArgs(this.paneTarget),
       // One server queue: subscribe before tmux can process the CLI's first
       // output. No later client invocation may replace a successful pipe,
       // since doing so could discard those one-shot startup/OSC bytes.
@@ -2618,6 +2731,12 @@ export class TmuxPipeBackend implements SessionBackend {
       // A timed-out client may already have applied the option server-side.
       this.legacyRetention = remainOnExit === 'on';
       execSync(`${this.tmuxCmd} set-option -t ${t} remain-on-exit ${remainOnExit}`, { stdio: 'ignore', env, timeout: 5000 });
+      // Backfill for sessions created before the hook existed (fresh sessions
+      // already set it atomically with new-session). Own try: a failure here
+      // must not skip the options below.
+      try {
+        execFileSync('tmux', [...this.tmuxArgs, ...paneDiedInputOffHookArgs(this.paneTarget)], { stdio: 'ignore', env, timeout: 5000 });
+      } catch { /* best-effort; the paste path keeps its own guard */ }
       // status bar ON: shows tmux's window list so a user who manually
       // `tmux attach -t <session>`es can navigate windows. Zero effect on the
       // Lark card / web terminal — both read PANE bytes (capture-pane /

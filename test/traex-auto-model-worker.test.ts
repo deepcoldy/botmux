@@ -324,7 +324,7 @@ describe('auto-model Worker admission and original-input retirement', () => {
     });
     expect(recovery.content).toBe(`${restartInterruptionNote(work)}\n\n${recovery.logicalContent}`);
     expect(h.scope.send).toHaveBeenLastCalledWith({
-      type: 'user_notify', turnId: 'turn',
+      type: 'user_notify', kind: 'restart_interruption', turnId: 'turn',
       message: restartInterruptionNotice(work, { cliName: 'TRAE', noteDelivered: true }),
     });
     expect(h.scope.pendingRestartInterruption).toBeUndefined();
