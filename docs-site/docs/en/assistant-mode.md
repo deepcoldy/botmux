@@ -49,5 +49,5 @@ Inside the sandbox the real `BOT_HOME`, other owners' directories, the role libr
 ## Not supported
 
 - The role system (`/role`, role switching, role-directory schedules) is off in this mode.
-- `botmux send` routing still needs read-only access to `sessions.db`, so the sandbox can **see** other sessions' metadata (titles, chat ids), not their content.
+- Other sessions are invisible from the sandbox (`sessions.db` is not granted; `botmux list` is empty inside an assistant session).
 - One owner per group; do not put an assistant-mode bot into a group meant for several people.

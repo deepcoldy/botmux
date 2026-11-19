@@ -19584,8 +19584,13 @@ function forkWorkerPrepared(
     });
     const have = ds.session.assistantOwnerOpenId;
     if (!have || !expected || have !== expected) {
-      logger.warn(`[${tag(ds)}] assistant-mode: refusing to fork — session owner ${have ?? '(none)'} vs resolved ${expected ?? '(none)'}`);
+      // 拒绝之外还要退役这个会话：chat-scope 会话会被后续消息一直复用，不退役就永远卡在
+      // 这里（换了主人 / 开模式前的存量会话都是这种）。关掉后下一条消息走新建路径，按
+      // 当前归属重新建会话。本条消息丢弃，由用户重发。
+      logger.warn(`[${tag(ds)}] assistant-mode: refusing to fork — session owner ${have ?? '(none)'} vs resolved ${expected ?? '(none)'}; retiring session`);
       reportAdmission('rejected');
+      void closeSession(ds.session.sessionId, { awaitWorkerExit: false }).catch(err =>
+        logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
       return false;
     }
   }

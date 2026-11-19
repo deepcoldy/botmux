@@ -11,14 +11,14 @@
  * 设计见 docs/design/2026-11-20-assistant-mode.md §5.1。
  */
 import { isBotMentioned, canOperate, extractMessageTextForRouting } from './event-dispatcher.js';
-import { stripLeadingMentions } from './message-parser.js';
+import { mentionOpenId, stripLeadingMentions } from './message-parser.js';
 import { replyMessage } from './client.js';
 import { localeForBot, t } from '../../i18n/index.js';
-import { getBot } from '../../bot-registry.js';
+import { getBot, getBotOpenId } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
 import { getAssistantOwner, setAssistantOwner } from '../../services/assistant-owner-store.js';
-import { isValidAssistantOpenId } from '../../core/assistant-mode.js';
+import { isValidAssistantOpenId, notifyAssistantOwnerChanged, resolveAssistantOwnerOpenId } from '../../core/assistant-mode.js';
 import { logger } from '../../utils/logger.js';
 
 export const ASSISTANT_COMMAND_RE = /^\/assistant(?:\s|$)/i;
@@ -61,11 +61,12 @@ export async function tryHandleAssistantCommand(
   }
 
   const dataDir = config.session.dataDir;
-  // 会话群（/group 出生）的归属由 session-groups-store 固定，不走归属表。
+  // 与 daemon / worker-pool 同一个判定函数：归属表优先，没记录时 /group 会话群归建群人
+  // （fixed：管理员也改不了；建群人退群后表里有 left 记录，就可以被认领）。
+  const stored = getAssistantOwner(dataDir, larkAppId, chatId);
   const sgOwner = getSessionGroup(chatId)?.ownerOpenId;
-  const current = sgOwner
-    ? { openId: sgOwner, fixed: true as const }
-    : (() => { const r = getAssistantOwner(dataDir, larkAppId, chatId); return r && !r.left ? { openId: r.openId, fixed: false as const } : undefined; })();
+  const resolved = resolveAssistantOwnerOpenId({ chatType: 'group', sessionGroupOwnerOpenId: sgOwner, stored });
+  const current = resolved ? { openId: resolved, fixed: !stored && sgOwner === resolved } : undefined;
 
   if (sub === 'status') {
     await reply(current
@@ -86,6 +87,7 @@ export async function tryHandleAssistantCommand(
       return true;
     }
     setAssistantOwner(dataDir, larkAppId, chatId, senderOpenId, 'claimed');
+    notifyAssistantOwnerChanged(larkAppId, chatId, senderOpenId);
     logger.info(`[assistant-mode:${larkAppId}] ${chatId.slice(0, 12)} owner ← ${senderOpenId.slice(0, 12)}… (claimed)`);
     await reply(t('cmd.assistant.claimed', { owner: `<at user_id="${senderOpenId}"></at>` }, loc));
     return true;
@@ -100,16 +102,19 @@ export async function tryHandleAssistantCommand(
       await reply(t('cmd.assistant.session_group_fixed', undefined, loc));
       return true;
     }
-    // 目标只认 @ 出来的真人（open_id 形状过滤掉 bot 的 app_id 形式 @）。
-    const targets = ((message?.mentions ?? []) as Array<{ openId?: string }>)
-      .map(m => m.openId)
-      .filter((v): v is string => isValidAssistantOpenId(v));
-    const target = targets.find(v => v !== senderOpenId) ?? targets[0];
-    if (!target || targets.length !== 1 && !targets.every(v => v === target)) {
+    // 目标只认 @ 出来的真人：飞书原始事件里 mention 身份在 `id.open_id`（mentionOpenId 兼容
+    // 字符串/对象两种形态）；去掉本 bot 自己（命令必须 @bot）和 app_id 形式的 bot @。
+    const selfOpenId = getBotOpenId(larkAppId);
+    const targets = [...new Set(((message?.mentions ?? []) as any[])
+      .map(m => mentionOpenId(m))
+      .filter((v): v is string => isValidAssistantOpenId(v) && v !== selfOpenId))];
+    if (targets.length !== 1) {
       await reply(t('cmd.assistant.owner_usage', undefined, loc));
       return true;
     }
+    const target = targets[0]!;
     setAssistantOwner(dataDir, larkAppId, chatId, target, 'admin');
+    notifyAssistantOwnerChanged(larkAppId, chatId, target);
     logger.info(`[assistant-mode:${larkAppId}] ${chatId.slice(0, 12)} owner ← ${target.slice(0, 12)}… (admin ${senderOpenId?.slice(0, 12)})`);
     await reply(t('cmd.assistant.owner_set', { owner: `<at user_id="${target}"></at>` }, loc));
     return true;

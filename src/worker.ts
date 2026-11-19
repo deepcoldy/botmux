@@ -31061,7 +31061,7 @@ async function spawnCliBody(
       // 个人助理模式：owner 的 USER_HOME 当 botHome 授 rw；真 BOT_HOME 留在 botmux 根 deny 里。
       botHome: canonical(assistantUserHomeDir ?? ownBotHome!),
       ...(assistantUserHomeDir !== undefined
-        ? { attachmentsBucket: assistantAttachmentsBucket(canonical(dataDir), cfg.larkAppId, assistantOwner!) }
+        ? { attachmentsBucket: assistantAttachmentsBucket(canonical(dataDir), cfg.larkAppId, assistantOwner!), assistantMode: true }
         : {}),
       // Resolved above (gated on larkTransportEnabled). roleLibrarySubtree() does
       // the existence + canonicalization + "must be a real dir, not a symlink"

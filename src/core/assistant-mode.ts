@@ -7,7 +7,8 @@
  * 改写这几件不依赖 daemon/worker 状态的事，方便单测；接线在 daemon.ts /
  * worker.ts。设计见 docs/design/2026-11-20-assistant-mode.md。
  */
-import { copyFileSync, lstatSync, mkdirSync, readdirSync } from 'node:fs';
+import { constants as fsConstants, copyFileSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, unlinkSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { join } from 'node:path';
 
 /** open_id 要被拼进沙盒白名单路径，所以形状必须收紧到飞书实际发的样子：
@@ -53,23 +54,38 @@ export function stripRefreshToken(raw: string): string {
 export interface TemplateSyncResult { copied: number; skippedSymlinks: number }
 
 /**
- * 把模板目录覆盖同步进 work/：模板有的文件覆盖写入，模板没有的不删（用户自己的
- * 产物保留）。不跟符号链接（模板里的链接可能指向库外；fail-closed 直接跳过）。
+ * 把模板目录覆盖同步进 work/：模板有的文件覆盖写入，模板没的不删（用户自己的产物
+ * 保留）。两端都不跟符号链接：源端链接跳过（模板里的链接可能指向库外）；**目标端**
+ * 任何一层是链接就先删掉再写——work/ 对 owner 可写，他能把 `work/CLAUDE.md` 或
+ * `work/knowledge` 链到别人的目录，worker 在宿主上跑、不受沙盒约束，跟过去就是替他
+ * 越权写。文件先写进同目录的随机临时名（O_EXCL，不会被预埋的链接劫持）再 rename。
  * 模板目录不存在 → 抛错，由调用方决定是否拒绝 spawn。
  */
 export function syncAssistantTemplate(templateDir: string, workDir: string): TemplateSyncResult {
   const st = lstatSync(templateDir);
   if (!st.isDirectory()) throw new Error(`assistant template is not a directory: ${templateDir}`);
   const result: TemplateSyncResult = { copied: 0, skippedSymlinks: 0 };
+  const ensureRealDir = (dst: string): void => {
+    let e;
+    try { e = lstatSync(dst); } catch { e = undefined; }
+    if (e && e.isSymbolicLink()) { unlinkSync(dst); e = undefined; }
+    if (e && !e.isDirectory()) { rmSync(dst, { force: true }); e = undefined; }
+    if (!e) mkdirSync(dst, { recursive: true });
+  };
   const walk = (src: string, dst: string): void => {
-    mkdirSync(dst, { recursive: true });
+    ensureRealDir(dst);
     for (const name of readdirSync(src)) {
       const s = join(src, name), d = join(dst, name);
       const e = lstatSync(s);
       if (e.isSymbolicLink()) { result.skippedSymlinks++; continue; }
       if (e.isDirectory()) { walk(s, d); continue; }
       if (!e.isFile()) continue;
-      copyFileSync(s, d);
+      let cur;
+      try { cur = lstatSync(d); } catch { cur = undefined; }
+      if (cur && (cur.isSymbolicLink() || cur.isDirectory())) rmSync(d, { recursive: true, force: true });
+      const tmp = join(dst, `.${name}.${randomBytes(6).toString('hex')}.tmp`);
+      copyFileSync(s, tmp, fsConstants.COPYFILE_EXCL);
+      renameSync(tmp, d);
       result.copied++;
     }
   };
@@ -89,8 +105,9 @@ export interface AssistantOwnerRecord {
 
 /**
  * 会话归属判定（纯函数）。返回 owner open_id；`null` = 群未认领 / owner 已退，
- * 调用方不得 spawn。私聊永远归发消息的人；会话群归 session-group 的 ownerOpenId；
- * 普通群查表。任何来源的 id 都要过形状校验——拿不到合法 id 一律 null。
+ * 调用方不得 spawn。私聊永远归发消息的人。群：**归属表优先**——表里有记录就以表为准
+ * （`left` 记录 = 待认领，哪怕是 /group 会话群的建群人退了群也停服）；没记录时会话群
+ * 归 session-group 的 ownerOpenId，普通群 null。任何来源的 id 都要过形状校验。
  */
 export function resolveAssistantOwnerOpenId(input: {
   chatType: 'group' | 'p2p';
@@ -99,10 +116,25 @@ export function resolveAssistantOwnerOpenId(input: {
   stored?: AssistantOwnerRecord;
 }): string | null {
   if (input.chatType === 'p2p') return isValidAssistantOpenId(input.senderOpenId) ? input.senderOpenId : null;
-  if (isValidAssistantOpenId(input.sessionGroupOwnerOpenId)) return input.sessionGroupOwnerOpenId;
   const rec = input.stored;
-  if (!rec || rec.left || !isValidAssistantOpenId(rec.openId)) return null;
-  return rec.openId;
+  if (rec) {
+    if (rec.left || !isValidAssistantOpenId(rec.openId)) return null;
+    return rec.openId;
+  }
+  if (isValidAssistantOpenId(input.sessionGroupOwnerOpenId)) return input.sessionGroupOwnerOpenId;
+  return null;
+}
+
+/**
+ * 归属变更通知（claim / admin 改绑 / owner 退群）。im 层的 /assistant 命令改了归属表之后
+ * 调它，daemon 注册的监听者去退役该群里 owner 不匹配的旧会话——否则 chat-scope 旧会话
+ * 一直 active、还挂着旧 owner，新 owner 的消息复用它、fork 永远被归属闸拒绝。
+ */
+export type AssistantOwnerChangedListener = (larkAppId: string, chatId: string, newOwnerOpenId: string | null) => void;
+let ownerChangedListener: AssistantOwnerChangedListener | null = null;
+export function setAssistantOwnerChangedListener(fn: AssistantOwnerChangedListener | null): void { ownerChangedListener = fn; }
+export function notifyAssistantOwnerChanged(larkAppId: string, chatId: string, newOwnerOpenId: string | null): void {
+  try { ownerChangedListener?.(larkAppId, chatId, newOwnerOpenId); } catch { /* listener 自己兜 */ }
 }
 
 /**

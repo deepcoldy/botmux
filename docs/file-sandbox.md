@@ -493,11 +493,11 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
 用户文档见 docs-site `assistant-mode.md`，设计见 `docs/design/2026-11-20-assistant-mode.md`。这里只记沙盒与凭证层的事实。
 
 - 只在 `sandbox: true`（oncall 白名单）下工作；`off` / `scratch` 一律拒绝 spawn（worker 侧 fail-closed，不退回共享目录）。worker-pool 每次 fork 前还会重新核对归属表：会话没有 owner、或归属已变（管理员换人 / 主人退群）→ 拒绝。
-- fs-policy 的 `botHome` 传的是主人的 `USER_HOME = <BOT_HOME>/users/<open_id>`，所以真 `BOT_HOME`（含 bot 级 `claude/` 与别人的 `users/*`）留在 botmux 根的 deny 里；`roleLibrarySubtree` 为空（不授角色库）；新增 ctx `attachmentsBucket`，把整 bot 的 `attachments/<appId>` readWrite 换成 `attachments/<appId>/u/<open_id>`。`session-stores/<appId>` 仍只读（`botmux send` 路由要读 sessions.db）——沙盒能看到别的会话的元数据，看不到内容。
+- fs-policy 的 `botHome` 传的是主人的 `USER_HOME = <BOT_HOME>/users/<open_id>`，所以真 `BOT_HOME`（含 bot 级 `claude/` 与别人的 `users/*`）留在 botmux 根的 deny 里；`roleLibrarySubtree` 为空（不授角色库）；新增 ctx `attachmentsBucket`，把整 bot 的 `attachments/<appId>` readWrite 换成 `attachments/<appId>/u/<open_id>`。`session-stores/<appId>` **不授**（sessions.db 里存着每个会话最近一条用户输入，不是纯元数据）；CLI 经 `dashboard-daemons` 发现 daemon、走 IPC 解析会话，`botmux list` 在助理沙盒里为空；真 BOT_HOME 的 `send-cred.json` 单独只读放行（`botmux send` 注册本 bot 用）。lark-cli 自己的 `appsecret_<appId>.enc` + 主密钥也不给（拿到就能自己换 tenant token，绕过下面的 IPC 闸）。
 - CLI 数据目录（`CLAUDE_CONFIG_DIR`）= `<USER_HOME>/claude`。凭证副本经 `stripRefreshToken()`：`claudeAiOauth.refreshToken` 替换成 `botmux-assistant-mode-no-refresh`。会话只拿 AT 干活；AT 过期时它自己刷新失败、只伤自己这份副本，永远碰不到共享账号的 RT。**中央刷新分发脚本要把 glob 扩到 `bots/*/users/*/claude/.credentials.json`**（本机是 `~/.cred-keeper/hooks/on-refreshed-default.sh`），否则主人副本在 AT 到期后全部失效。
-- `assistantTemplateDir`（缺省 = bot 默认工作目录）在每次 spawn 前覆盖同步进 `work/`：模板有的覆盖、模板没有的保留、符号链接跳过；模板目录不存在 → 拒绝 spawn。
+- `assistantTemplateDir`（缺省 = bot 默认工作目录）在每次 spawn 前覆盖同步进 `work/`：模板有的覆盖、模板没有的保留；源端符号链接跳过，**目标端**任何一层是链接先删再写（owner 可写 work/，能把文件链到别人目录，worker 在宿主上跑不受沙盒约束），文件经 O_EXCL 临时名 + rename 落盘；模板目录不存在 → 拒绝 spawn。
 - 宿主侧闸：`lark-tool-identity` IPC 的 `mode=bot` 对带 `assistantOwnerOpenId` 的会话回 403（除非 bot 配 `assistantLarkBotIdentity: true`）；角色切换 IPC 回 403；`/cd` `/repo` 回「目录固定」；`botmux history --session-id` / `quoted` 只接受同一主人的会话、`quoted` 只接受本群消息；`botmux list` 只列同一主人。
-- 归属表：`<dataDir>/assistant-owners/<appId>.json`（0600），记录 `chatId → {openId, since, how, left?}`；`how ∈ p2p|session-group|bot-added|claimed|admin`。私聊和 `/group` 会话群不查表。
+- 归属表：`<dataDir>/assistant-owners/<appId>.json`（0600），记录 `chatId → {openId, since, how, left?}`；`how ∈ p2p|session-group|bot-added|claimed|admin`。判定顺序：私聊 = 发消息人；群 = **表优先**（`left` 记录 = 待认领，`/group` 会话群的建群人退群也停服），无记录时 `/group` 会话群归建群人。归属变更（claim / admin 改绑 / 退群）与 `/botconfig assistantMode on` 都会停掉该群（或整 bot）的活 worker；worker-pool 每次 fork 前重核归属，不匹配的会话直接退役，下一条消息按当前归属重建。
 
 ## 后续
 

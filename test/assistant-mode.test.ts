@@ -2,7 +2,7 @@
  * 个人助理模式：纯函数 + 归属表。
  * Run: bun run test -- test/assistant-mode.test.ts ; bun test test/assistant-mode.test.ts
  */
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -84,7 +84,8 @@ describe('resolveAssistantOwnerOpenId', () => {
   it('p2p → sender; session group → its owner; group → stored record; left/invalid → null', () => {
     expect(resolveAssistantOwnerOpenId({ chatType: 'p2p', senderOpenId: OU_A })).toBe(OU_A);
     expect(resolveAssistantOwnerOpenId({ chatType: 'p2p', senderOpenId: 'bad' })).toBeNull();
-    expect(resolveAssistantOwnerOpenId({ chatType: 'group', sessionGroupOwnerOpenId: OU_B, stored: { openId: OU_A, since: '', how: 'bot-added' } })).toBe(OU_B);
+    // 归属表优先于 session-group 固定 owner（表里的记录是认领/改绑/退群的结果）。
+    expect(resolveAssistantOwnerOpenId({ chatType: 'group', sessionGroupOwnerOpenId: OU_B, stored: { openId: OU_A, since: '', how: 'bot-added' } })).toBe(OU_A);
     expect(resolveAssistantOwnerOpenId({ chatType: 'group', stored: { openId: OU_A, since: '', how: 'bot-added' } })).toBe(OU_A);
     expect(resolveAssistantOwnerOpenId({ chatType: 'group', stored: { openId: OU_A, since: '', how: 'bot-added', left: 'x' } })).toBeNull();
     expect(resolveAssistantOwnerOpenId({ chatType: 'group' })).toBeNull();
@@ -122,5 +123,42 @@ describe('assistant-owner-store', () => {
     expect(getAssistantOwner(tmp, 'app', 'oc_1')).toBeUndefined();
     setAssistantOwner(tmp, 'app', 'oc_1', OU_A, 'admin');
     expect(getAssistantOwner(tmp, 'app', 'oc_1')?.openId).toBe(OU_A);
+  });
+});
+
+describe('syncAssistantTemplate — destination symlinks are never followed', () => {
+  it('replaces a planted file symlink instead of writing through it', () => {
+    const tpl = join(tmp, 'tpl'); const work = join(tmp, 'work'); const victim = join(tmp, 'victim.md');
+    mkdirSync(tpl); mkdirSync(work);
+    writeFileSync(join(tpl, 'CLAUDE.md'), 'template');
+    writeFileSync(victim, 'A-private');
+    symlinkSync(victim, join(work, 'CLAUDE.md'));
+    syncAssistantTemplate(tpl, work);
+    expect(readFileSync(victim, 'utf-8')).toBe('A-private');
+    expect(lstatSync(join(work, 'CLAUDE.md')).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(work, 'CLAUDE.md'), 'utf-8')).toBe('template');
+  });
+  it('replaces a planted directory symlink instead of writing into the target dir', () => {
+    const tpl = join(tmp, 'tpl'); const work = join(tmp, 'work'); const victimDir = join(tmp, 'victim');
+    mkdirSync(join(tpl, 'knowledge'), { recursive: true }); mkdirSync(work); mkdirSync(victimDir);
+    writeFileSync(join(tpl, 'knowledge', 'k.md'), 'k');
+    symlinkSync(victimDir, join(work, 'knowledge'));
+    syncAssistantTemplate(tpl, work);
+    expect(existsSync(join(victimDir, 'k.md'))).toBe(false);
+    expect(lstatSync(join(work, 'knowledge')).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(work, 'knowledge', 'k.md'), 'utf-8')).toBe('k');
+  });
+});
+
+describe('resolveAssistantOwnerOpenId — store wins over session-group owner', () => {
+  const A = 'ou_' + 'a'.repeat(32), B = 'ou_' + 'b'.repeat(32);
+  it('a left record makes a /group session group unclaimed even though its creator is fixed', () => {
+    expect(resolveAssistantOwnerOpenId({ chatType: 'group', sessionGroupOwnerOpenId: A, stored: { openId: A, since: 's', how: 'session-group', left: 'l' } })).toBeNull();
+  });
+  it('a claim after the creator left hands the group to the claimant', () => {
+    expect(resolveAssistantOwnerOpenId({ chatType: 'group', sessionGroupOwnerOpenId: A, stored: { openId: B, since: 's', how: 'claimed' } })).toBe(B);
+  });
+  it('without a record the session-group creator still owns it', () => {
+    expect(resolveAssistantOwnerOpenId({ chatType: 'group', sessionGroupOwnerOpenId: A })).toBe(A);
   });
 });

@@ -180,7 +180,7 @@ import {
 } from './bot-registry.js';
 import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from './im/lark/streaming-card-buttons.js';
 import { buildMarkdownCard, contextPercentUsed } from './im/lark/md-card.js';
-import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
+import { setDisplayNameRefresher, findConfigField, applyConfigField, setAssistantModeEnabledHook } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
 import { CardStreamStore } from './services/card-stream-store.js';
@@ -1217,7 +1217,7 @@ import {
 import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat, listChatMemberDisplays, addUsersToChatByOpenId } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
-import { assistantUserHome, assistantWorkDir, isValidAssistantOpenId, resolveAssistantOwnerOpenId } from './core/assistant-mode.js';
+import { assistantUserHome, assistantWorkDir, isValidAssistantOpenId, resolveAssistantOwnerOpenId, setAssistantOwnerChangedListener } from './core/assistant-mode.js';
 import { getAssistantOwner, markAssistantOwnerLeft, setAssistantOwner } from './services/assistant-owner-store.js';
 import { botHomePath } from './adapters/cli/read-isolation.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
@@ -23097,18 +23097,59 @@ async function handleAssistantOwnerLeft(larkAppId: string, chatId: string, userO
   let cfg: BotConfig;
   try { cfg = getBot(larkAppId).config; } catch { return; }
   if (cfg.assistantMode !== true) return;
-  const rec = getAssistantOwner(config.session.dataDir, larkAppId, chatId);
-  if (!rec || rec.left || !userOpenIds.includes(rec.openId)) return;
+  const stored = getAssistantOwner(config.session.dataDir, larkAppId, chatId);
+  const owner = resolveAssistantOwnerOpenId({
+    chatType: 'group',
+    sessionGroupOwnerOpenId: getSessionGroup(chatId)?.ownerOpenId,
+    stored,
+  });
+  if (!owner || !userOpenIds.includes(owner)) return;
+  // /group 会话群的 owner 来自 session-group 表、归属表里没记录：先落一条再标 left，
+  // 之后 resolveAssistantOwnerOpenId 以这条 left 记录为准（表优先于 session-group）。
+  if (!stored) setAssistantOwner(config.session.dataDir, larkAppId, chatId, owner, 'session-group');
   markAssistantOwnerLeft(config.session.dataDir, larkAppId, chatId);
-  let suspended = 0;
-  for (const ds of activeSessions.values()) {
-    if (ds.larkAppId !== larkAppId || ds.chatId !== chatId) continue;
-    if (ds.worker && !ds.worker.killed && suspendWorker(ds, 'assistant_owner_left')) suspended++;
-  }
-  logger.info(`[assistant-mode:${larkAppId}] owner ${rec.openId.slice(0, 12)}… left ${chatId.slice(0, 12)}…; suspended ${suspended} session(s)`);
+  const stopped = stopAssistantSessionsOfChat(larkAppId, chatId, 'assistant_owner_left');
+  logger.info(`[assistant-mode:${larkAppId}] owner ${owner.slice(0, 12)}… left ${chatId.slice(0, 12)}…; stopped ${stopped} session(s)`);
   assistantNoticeAt.delete(`${larkAppId}:${chatId}`);
   await notifyAssistantUnclaimed(larkAppId, chatId, ASSISTANT_OWNER_LEFT_TEXT);
 }
+
+/** 停掉某群（或整个 bot，chatId 为空）的活 worker：先 suspend；suspend 被受保护状态
+ *  （Codex App dispatch、迁移中等）拒绝时直接 kill——不能把「挂起失败」当成已停服，
+ *  活着的 worker 还握着旧 owner 的目录授权。 */
+function stopAssistantSessionsOfChat(larkAppId: string, chatId: string | undefined, reason: string): number {
+  let stopped = 0;
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== larkAppId || (chatId !== undefined && ds.chatId !== chatId)) continue;
+    if (!ds.worker || ds.worker.killed) continue;
+    if (suspendWorker(ds, reason)) { stopped++; continue; }
+    try { killWorker(ds); stopped++; } catch (e) {
+      logger.warn(`[assistant-mode:${larkAppId}] kill ${ds.session.sessionId.slice(0, 8)} failed: ${(e as Error).message}`);
+    }
+  }
+  return stopped;
+}
+
+/** 归属变更（claim / admin 改绑）：退役该群里 owner 不是新主人的会话，新主人下一条消息
+ *  重新建会话。owner 为 null（退群）时只停 worker，会话留给认领后的归属闸处理。 */
+function onAssistantOwnerChanged(larkAppId: string, chatId: string, newOwner: string | null): void {
+  let retired = 0;
+  for (const ds of [...activeSessions.values()]) {
+    if (ds.larkAppId !== larkAppId || ds.chatId !== chatId) continue;
+    if (newOwner !== null && ds.session.assistantOwnerOpenId === newOwner) continue;
+    retired++;
+    void closeSessionHelper(ds.session.sessionId, { awaitWorkerExit: false }).catch(err =>
+      logger.warn(`[assistant-mode:${larkAppId}] retire ${ds.session.sessionId.slice(0, 8)} failed: ${(err as Error).message}`));
+  }
+  if (retired) logger.info(`[assistant-mode:${larkAppId}] owner of ${chatId.slice(0, 12)}… → ${newOwner?.slice(0, 12) ?? '(none)'}; retired ${retired} session(s)`);
+}
+
+// 归属变更 / 即时开模式的副作用都在 daemon 侧退役会话（im 层与 config 层没有 activeSessions）。
+setAssistantOwnerChangedListener(onAssistantOwnerChanged);
+setAssistantModeEnabledHook((larkAppId) => {
+  const stopped = stopAssistantSessionsOfChat(larkAppId, undefined, 'assistant_mode_enabled');
+  logger.info(`[assistant-mode:${larkAppId}] enabled; stopped ${stopped} live worker(s) — sessions without an owner retire on their next message`);
+});
 
 function resolveBotDefaultWorkingDir(larkAppId: string): string | undefined {
   const raw = effectiveDefaultWorkingDir(getBot(larkAppId).config);
@@ -29450,6 +29491,22 @@ async function handleBotAdded(
   const bot = getBot(larkAppId);
   const botCfg = bot.config;
   const forced = typeof opts?.forcePrompt === 'string';
+  // 个人助理模式：把 bot 拉进群的人就是这个群的 owner。放在自动开工的所有前置判断之前——
+  // 归属与「要不要自动开工」无关，autoStartOnGroupJoin 默认关、群里没管理员都不该让群
+  // 变成「未认领」。bot/app 操作者不记（同下面 operatorIsBot 的判据）。
+  if (botCfg.assistantMode === true && operatorOpenId && isValidAssistantOpenId(operatorOpenId)) {
+    const cached = getIdentity(larkAppId, operatorOpenId);
+    const isBotOperator = isKnownPeerBot(config.session.dataDir, larkAppId, operatorOpenId)
+      || cached?.type === 'bot' || cached?.type === 'app';
+    if (!isBotOperator) {
+      try {
+        setAssistantOwner(config.session.dataDir, larkAppId, chatId, operatorOpenId, 'bot-added');
+        logger.info(`[assistant-mode:${larkAppId}] ${chatId.substring(0, 12)} owner ← ${operatorOpenId.substring(0, 12)}… (bot-added)`);
+      } catch (e) {
+        logger.warn(`[assistant-mode:${larkAppId}] record owner failed: ${(e as Error).message}`);
+      }
+    }
+  }
   if (!forced && botCfg.autoStartExcludedChats?.includes(chatId)) return;
   if (!forced && botCfg.autoStartOnGroupJoin !== true) {
     logger.debug(`[auto-start:入群] ${chatId.substring(0, 12)} 开关未开，忽略`);
@@ -29526,15 +29583,6 @@ async function handleBotAdded(
     // that stamp off. lastCallerOpenId is the quote-chain caller for provenance
     // and must not name the app either.
     const humanOperatorOpenId = operatorIsBot ? undefined : operatorOpenId;
-    // 个人助理模式：把 bot 拉进群的人就是这个群的 owner（写归属表，不论随后是否自动开工）。
-    if (botCfg.assistantMode === true && humanOperatorOpenId && isValidAssistantOpenId(humanOperatorOpenId)) {
-      try {
-        setAssistantOwner(config.session.dataDir, larkAppId, chatId, humanOperatorOpenId, 'bot-added');
-        logger.info(`[assistant-mode:${larkAppId}] ${chatId.substring(0, 12)} owner ← ${humanOperatorOpenId.substring(0, 12)}… (bot-added)`);
-      } catch (e) {
-        logger.warn(`[assistant-mode:${larkAppId}] record owner failed: ${(e as Error).message}`);
-      }
-    }
     if (!forced) {
       const groupJoinGate = await evaluatePromptGate('chat.bot_added', {
         larkAppId,
@@ -31314,7 +31362,7 @@ async function handleThreadReplyAdmitted(
   if (prepared) {
     attachments = prepared.attachments;
   } else {
-    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId);
+    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId, ds?.session.assistantOwnerOpenId);
     attachments = downloaded.attachments;
     if (workflowHandoff) attachments = [...attachments, ...workflowNodeDaemon.stageInbound(workflowHandoff, parsed.messageId)];
     if (attachments.length > 0) {

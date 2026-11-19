@@ -345,6 +345,13 @@ export type ApplyFieldResult =
 // descriptor + SessionRow.botName（否则要等重启才换名）。放在 store 层是为了
 // 让 /config displayName（IM 路径）和 dashboard PUT 共享同一刷新点。
 let displayNameRefresher: (() => void) | null = null;
+/** 个人助理模式即时开启后的副作用：daemon 注册，去挂起/退役该 bot 的存量会话——它们
+ *  没有 owner、还拿着共享 cwd 与 BOT_HOME 授权，不处理就等于模式没开。 */
+let assistantModeEnabledHook: ((larkAppId: string) => void) | null = null;
+export function setAssistantModeEnabledHook(fn: ((larkAppId: string) => void) | null): void {
+  assistantModeEnabledHook = fn;
+}
+
 export function setDisplayNameRefresher(fn: (() => void) | null): void {
   displayNameRefresher = fn;
 }
@@ -802,6 +809,9 @@ async function applyConfigFieldInternal(
   }
   if (spec.configKey === 'displayName') {
     try { displayNameRefresher?.(); } catch { /* best effort */ }
+  }
+  if (spec.configKey === 'assistantMode' && bot.config.assistantMode === true) {
+    try { assistantModeEnabledHook?.(larkAppId); } catch { /* best effort */ }
   }
   if (spec.configKey === 'pinStreamingCard' && previousPinStreamingCard !== undefined) {
     const nextPinStreamingCard = bot.config.pinStreamingCard === true;

@@ -11,8 +11,10 @@ import { join } from 'node:path';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 let assistantMode = true;
+const BOT_OPEN_ID = 'ou_' + 'f'.repeat(32);
 vi.mock('../src/bot-registry.js', () => ({
   getBot: () => ({ config: { assistantMode } }),
+  getBotOpenId: () => BOT_OPEN_ID,
 }));
 
 const mockIsBotMentioned = vi.fn(() => true);
@@ -24,7 +26,12 @@ vi.mock('../src/im/lark/event-dispatcher.js', () => ({
     try { return JSON.parse(m.content ?? '{}').text ?? ''; } catch { return ''; }
   },
 }));
-vi.mock('../src/im/lark/message-parser.js', () => ({ stripLeadingMentions: (s: string) => s }));
+// mentionOpenId 按真实实现的形状 mock（bun test 不支持 importOriginal）：/assistant owner
+// 读的是飞书原始事件里 mention 的 `id.open_id`，不是 LarkMention.openId。
+vi.mock('../src/im/lark/message-parser.js', () => ({
+  stripLeadingMentions: (s: string) => s,
+  mentionOpenId: (m: any) => (m && typeof m.id === 'object' && m.id ? (m.id.open_id || undefined) : undefined),
+}));
 
 const mockReplyMessage = vi.fn(async () => 'msg-id');
 vi.mock('../src/im/lark/client.js', () => ({
@@ -59,13 +66,15 @@ const ALICE = 'ou_' + 'a'.repeat(32);
 const BOB = 'ou_' + 'b'.repeat(32);
 const CHAT = 'oc_' + '1'.repeat(32);
 
+/** 飞书原始 mention 形态（dispatcher 传进来的是原始 message，不是 LarkMention）。 */
+const rawMention = (openId?: string) => ({ key: '@_user_1', name: 'x', id: { open_id: openId }, ...(openId ? {} : { id_type: 'app_id' }) });
 function msg(text: string, opts: { chatType?: 'group' | 'p2p'; mentions?: Array<{ openId?: string }> } = {}) {
   return {
     chat_id: opts.chatType === 'p2p' ? 'oc_dm' : CHAT,
     message_id: 'om_1',
     chat_type: opts.chatType ?? 'group',
     content: JSON.stringify({ text }),
-    mentions: opts.mentions ?? [],
+    mentions: [rawMention(BOT_OPEN_ID), ...(opts.mentions ?? []).map(m => rawMention(m.openId))],
   };
 }
 const lastReply = (): string | undefined => (mockReplyMessage.mock.calls.at(-1) as any[] | undefined)?.[2];
