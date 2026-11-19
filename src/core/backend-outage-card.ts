@@ -14,6 +14,7 @@ const HEADER_TEMPLATE: Record<OutageMemberState, CardHeaderTemplate> = {
   recovered: 'green',
   failed: 'red',
   stopped: 'grey',
+  dormant: 'grey',
 };
 
 function stateBody(view: OutageCardView, locale: Locale | undefined): string {
@@ -31,6 +32,8 @@ function stateBody(view: OutageCardView, locale: Locale | undefined): string {
       return t(`card.outage.body_failed_${view.failure ?? 'cli_failed'}`, vars, locale);
     case 'stopped':
       return t('card.outage.body_stopped', vars, locale);
+    case 'dormant':
+      return t('card.outage.body_dormant', vars, locale);
   }
 }
 
@@ -43,6 +46,7 @@ function turnLine(view: OutageCardView, locale: Locale | undefined): string | un
   if (view.state === 'interrupted' || view.state === 'recovering') return t('card.outage.turn_pending', vars, locale);
   if (view.state === 'recovered') return view.notices.length > 0 ? undefined : t('card.outage.turn_unknown', vars, locale);
   if (view.state === 'failed') return t('card.outage.turn_failed', vars, locale);
+  if (view.state === 'dormant') return t('card.outage.turn_dormant', vars, locale);
   return undefined;
 }
 
@@ -79,6 +83,7 @@ export function formatBackendOutageSummary(summary: OutageSummary, botName: stri
   const affected = summary.members.filter(m => m.state !== 'stopped');
   const recovered = affected.filter(m => m.state === 'recovered');
   const failed = affected.filter(m => m.state === 'failed');
+  const dormant = affected.filter(m => m.state === 'dormant').length;
   const stopped = summary.members.length - affected.length;
   const lines = [
     t('owner.outage.summary_title', { bot: botName }, locale),
@@ -86,6 +91,7 @@ export function formatBackendOutageSummary(summary: OutageSummary, botName: stri
     t('owner.outage.summary_result', {
       recovered: recovered.length,
       failed: failed.length,
+      dormant: dormant > 0 ? t('owner.outage.summary_dormant', { count: dormant }, locale) : '',
       stopped: stopped > 0 ? t('owner.outage.summary_stopped', { count: stopped }, locale) : '',
     }, locale),
   ];

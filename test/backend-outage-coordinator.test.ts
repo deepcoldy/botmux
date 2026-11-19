@@ -719,11 +719,87 @@ describe('BackendOutageCoordinator', () => {
     expect(h.restarts).toHaveLength(2);
   });
 
+  // A session put to sleep on purpose (idle reclaim, a tmux switch fan-out, a
+  // crash-diagnostic park) while it waits for recovery must stay cold until
+  // its user writes again: restarting it would undo the suspension.
+  it('a member put to sleep while the server is down is never the canary nor restarted later', async () => {
+    const h = harness({ serverUp: false });
+    h.lose('s1', { turnInFlight: true });
+    h.lose('s2');
+    h.session('s1').eligibility = 'dormant';
+    await h.clock.advance(3_000);
+    // s1 would have been the first canary.
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['s2']);
+    h.state.serverUp = true;
+    h.settleRestart('s2', 'succeeded');
+    await h.clock.advance(0);
+    await h.coordinator.cardsSettled();
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['s2']);
+    expect(h.shown('s1')).toMatchObject({ state: 'dormant', turnInFlight: true });
+    expect(h.giveUps).toEqual([]);
+    await h.clock.advance(60_000);
+    expect(h.summaries).toHaveLength(1);
+    expect(h.summaries[0].members.map(m => [m.sessionId, m.state])).toEqual([['s1', 'dormant'], ['s2', 'recovered']]);
+  });
+
+  it('a sleeping member that its user resumes turns into recovered without an outage restart', async () => {
+    const h = harness({ serverUp: true });
+    h.lose('s1');
+    h.session('s1').eligibility = 'dormant';
+    await h.clock.advance(3_000);
+    expect(h.restarts).toHaveLength(0);
+    expect(h.view('s1').state).toBe('dormant');
+    // The user's next message cold-resumes it; its prompt is the outcome.
+    h.coordinator.onPromptReady('s1');
+    await h.clock.advance(0);
+    await h.coordinator.cardsSettled();
+    expect(h.shown('s1').state).toBe('recovered');
+    expect(h.restarts).toHaveLength(0);
+  });
+
+  it.each(['failed', 'cancelled', 'timed_out'] as const)(
+    'a member put to sleep while its restart runs is not retried after a %s outcome',
+    async status => {
+      const h = harness({ serverUp: true });
+      h.lose('s1');
+      await h.clock.advance(3_000);
+      expect(h.restarts.map(r => r.sessionId)).toEqual(['s1']);
+      h.session('s1').eligibility = 'dormant';
+      h.settleRestart('s1', status);
+      await h.clock.advance(120_000);
+      expect(h.restarts).toHaveLength(1);
+      expect(h.view('s1').state).toBe('dormant');
+      expect(h.giveUps).toEqual([]);
+    },
+  );
+
+  it('a member put to sleep before the budget runs out is left dormant, not failed and given up', async () => {
+    const h = harness({ serverUp: false, timings: { serverBackoffMs: [5_000] } });
+    h.lose('s1');
+    h.lose('s2');
+    await h.clock.advance(3_000);
+    h.settleRestart('s1', 'failed');
+    await h.clock.advance(5_000);
+    expect(h.restarts.map(r => r.sessionId)).toEqual(['s1', 's2']);
+    h.session('s1').eligibility = 'dormant';
+    h.settleRestart('s2', 'failed'); // budget spent
+    await h.clock.advance(0);
+    expect(h.view('s1').state).toBe('dormant');
+    expect(h.view('s2')).toMatchObject({ state: 'failed', failure: 'server_unavailable' });
+    expect(h.giveUps.map(g => g.sessionId)).toEqual(['s2']);
+  });
+
   it('maps the daemon facts about a session to whether it may be restarted', () => {
-    expect(recoveryEligibility({ active: true, current: true, transferring: false })).toBe('now');
+    const awake = { active: true, current: true, transferring: false, dormant: false };
+    expect(recoveryEligibility(awake)).toBe('now');
     // A relay may still fail and leave the session where it was: ask again.
-    expect(recoveryEligibility({ active: true, current: true, transferring: true })).toBe('later');
-    expect(recoveryEligibility({ active: false, current: true, transferring: false })).toBe('never');
-    expect(recoveryEligibility({ active: true, current: false, transferring: true })).toBe('never');
+    expect(recoveryEligibility({ ...awake, transferring: true })).toBe('later');
+    expect(recoveryEligibility({ ...awake, active: false })).toBe('never');
+    expect(recoveryEligibility({ ...awake, current: false, transferring: true })).toBe('never');
+    // Deliberately cold: left for the next message, even mid-relay.
+    expect(recoveryEligibility({ ...awake, dormant: true })).toBe('dormant');
+    expect(recoveryEligibility({ ...awake, dormant: true, transferring: true })).toBe('dormant');
+    // Closed / replaced wins over sleeping.
+    expect(recoveryEligibility({ ...awake, dormant: true, active: false })).toBe('never');
   });
 });

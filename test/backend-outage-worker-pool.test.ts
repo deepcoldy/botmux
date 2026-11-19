@@ -458,6 +458,30 @@ describe('daemon: a lost tmux server is one backend outage', () => {
     expect(ds.cliReady).toBe(true);
   });
 
+  // Idle reclaim and the tmux switch fan-out suspend sessions cold on purpose
+  // (`suspendedColdResume`, worker torn down or still stopping). One that is
+  // waiting for outage recovery must stay cold: a recovery restart would
+  // refork it and forkWorker clears the marker, undoing the suspension.
+  for (const variant of ['worker torn down', 'worker still stopping'] as const) {
+    it(`a session put to sleep while it waits for recovery stays cold (${variant})`, async () => {
+      const [a, b, ...others] = sessions;
+      for (const other of others) (other.ds.session as any).persistentBackendTarget = { backendType: 'tmux', socketName: 'elsewhere' };
+      serverUp = true;
+      a!.worker.emit('message', lostServer);
+      b!.worker.emit('message', lostServer);
+      await flush();
+      expect(restartCounts.has(a!.ds.session.sessionId)).toBe(false);
+      a!.ds.session.suspendedColdResume = true;
+      if (variant === 'worker torn down') a!.ds.worker = null;
+
+      await waitFor(() => restartsOf(b!.worker).length === 1, 'recovery restart of the awake member');
+      await new Promise(r => setTimeout(r, 80));
+      expect(restartsOf(a!.worker)).toEqual([]);
+      expect(a!.ds.session.suspendedColdResume).toBe(true);
+      expect(a!.ds.worker).toBe(variant === 'worker torn down' ? null : a!.worker);
+    });
+  }
+
   it('prompt-ready after a parked outage retry releases the lifecycle fence', async () => {
     const [{ ds, worker }, ...others] = sessions;
     for (const other of others.slice(1)) (other.ds.session as any).persistentBackendTarget = { backendType: 'tmux', socketName: 'elsewhere' };

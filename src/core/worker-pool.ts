@@ -9208,6 +9208,10 @@ function backendOutageDeps(): BackendOutageDeps<DaemonSession> {
       active: ds.session.status === 'active',
       current: !activeSessionsRegistry || activeSessionsRegistry.get(activeSessionKey(ds)) === ds,
       transferring: isSessionTransferring(ds),
+      // Idle reclaim, a tmux switch fan-out or a crash-diagnostic park put it
+      // to sleep on purpose: restarting (or reforking) it would undo that, and
+      // forkWorker clears the marker. Its next real message resumes it.
+      dormant: ds.session.suspendedColdResume === true,
     }),
     externalRecoveryInFlight: ds => {
       if (ds.session.status !== 'active' || ds.session.suspendedColdResume || ds.crashDiagnosticParked) return false;

@@ -40,7 +40,11 @@ export type OutageMemberState =
   | 'recovered'
   | 'failed'
   /** Dropped without a result: the session was closed / replaced meanwhile. */
-  | 'stopped';
+  | 'stopped'
+  /** Deliberately put to sleep meanwhile (idle reclaim, terminal service
+   *  switch, crash-diagnostic park): left cold for the user's next message,
+   *  never restarted by the outage. */
+  | 'dormant';
 
 export type OutageFailureReason =
   /** The server did not come back within the backoff budget. */
@@ -107,8 +111,10 @@ export interface ServerLossReport {
 }
 
 /** Whether a member may be restarted right now: `later` = not now, ask again
- *  (e.g. a relay is in progress); `never` = closed or replaced, drop it. */
-export type RecoveryEligibility = 'now' | 'later' | 'never';
+ *  (e.g. a relay is in progress); `never` = closed or replaced, drop it;
+ *  `dormant` = deliberately suspended cold, leave it for the user's next
+ *  message (restarting it would undo the suspension). */
+export type RecoveryEligibility = 'now' | 'later' | 'never' | 'dormant';
 
 /** Whether a member may be restarted, from the daemon's facts about it. A
  *  relay in progress may still fail and leave the session where it was, so
@@ -120,8 +126,12 @@ export function recoveryEligibility(facts: {
   current: boolean;
   /** A relay / transfer of the session is in progress. */
   transferring: boolean;
+  /** The session was deliberately suspended cold (its next message resumes
+   *  it from history). */
+  dormant: boolean;
 }): RecoveryEligibility {
   if (!facts.active || !facts.current) return 'never';
+  if (facts.dormant) return 'dormant';
   return facts.transferring ? 'later' : 'now';
 }
 
@@ -475,8 +485,9 @@ export class BackendOutageCoordinator<S> {
   }
 
   /** The session's CLI reached its prompt: whoever started it (our restart, a
-   *  user's /restart, a message after a give-up, a late timed-out start), the
-   *  session is back and must not be restarted again by the outage. */
+   *  user's /restart, a message after a give-up or after a dormant member was
+   *  resumed, a late timed-out start), the session is back and must not be
+   *  restarted again by the outage. */
   onPromptReady(sessionId: string): void {
     const member = this.liveMember(sessionId);
     if (!member || member.state === 'recovered' || member.state === 'stopped') return;
@@ -543,7 +554,7 @@ export class BackendOutageCoordinator<S> {
     if (episode.timer !== undefined) return; // an assessment is due anyway
     if (episode.phase === 'failed') {
       for (const member of episode.members.values()) {
-        if (member.state === 'interrupted') this.fail(member, 'server_unavailable');
+        if (member.state === 'interrupted' && !this.dropIfIneligible(member)) this.fail(member, 'server_unavailable');
       }
     } else if (episode.phase === 'canary') {
       // The canary itself may have been lost, failed or recovered elsewhere.
@@ -585,10 +596,7 @@ export class BackendOutageCoordinator<S> {
       for (const member of episode.members.values()) {
         if (member.state !== 'interrupted') continue;
         const eligibility = this.deps.eligible(member.ref);
-        if (eligibility === 'never') {
-          this.stop(member);
-          continue;
-        }
+        if (this.dropIfIneligible(member, eligibility)) continue;
         if (eligibility === 'later') {
           deferred = true;
           continue;
@@ -651,10 +659,7 @@ export class BackendOutageCoordinator<S> {
       if (inFlight(episode) >= this.timings.maxConcurrentRestarts) break;
       if (member.state !== 'interrupted') continue;
       const eligibility = this.deps.eligible(member.ref);
-      if (eligibility === 'never') {
-        this.stop(member);
-        continue;
-      }
+      if (this.dropIfIneligible(member, eligibility)) continue;
       if (eligibility === 'later') {
         deferred = true;
         continue;
@@ -733,32 +738,29 @@ export class BackendOutageCoordinator<S> {
       // returning the member to interrupted (which would bypass timed_out and
       // the per-member attempt budget).
       if (episode.phase === 'failed') {
-        this.fail(member, 'server_unavailable');
+        if (!this.dropIfIneligible(member)) this.fail(member, 'server_unavailable');
       } else if (episode.phase === 'waiting' || episode.phase === 'canary') {
         member.state = 'interrupted';
         member.attempts = Math.max(0, member.attempts - 1);
         this.renderCard(member);
+      } else if (this.dropIfIneligible(member)) {
+        // closed / replaced / put to sleep while its restart was settling
       } else if (status === 'timed_out') {
         this.fail(member, 'timed_out', { giveUp: false });
         member.timedOutAt = this.deps.now();
+      } else if (member.attempts < this.timings.memberMaxAttempts) {
+        member.token += 1;
+        member.state = 'interrupted';
+        this.renderCard(member);
       } else {
-        const eligibility = this.deps.eligible(member.ref);
-        if (eligibility === 'never') {
-          this.stop(member);
-        } else if (member.attempts < this.timings.memberMaxAttempts) {
-          member.token += 1;
-          member.state = 'interrupted';
-          this.renderCard(member);
-        } else {
-          this.fail(member, 'cli_failed');
-        }
+        this.fail(member, 'cli_failed');
       }
       this.progress(episode);
       return;
     }
     if (!up) {
       if (episode.phase === 'failed') {
-        this.fail(member, 'server_unavailable');
+        if (!this.dropIfIneligible(member)) this.fail(member, 'server_unavailable');
       } else {
         // The server is (still / again) down: not this session's fault.
         member.state = 'interrupted';
@@ -772,14 +774,13 @@ export class BackendOutageCoordinator<S> {
         episode.generation += 1;
         this.stopPolling(episode);
       }
-      const eligibility = this.deps.eligible(member.ref);
-      if (status === 'timed_out') {
+      if (this.dropIfIneligible(member)) {
+        // closed / replaced / put to sleep while its restart was running
+      } else if (status === 'timed_out') {
         // Not ready in time, not proven dead either: never kill a CLI that
         // may still be starting. A later prompt_ready flips the card.
         this.fail(member, 'timed_out', { giveUp: false });
         member.timedOutAt = this.deps.now();
-      } else if (eligibility === 'never') {
-        this.stop(member);
       } else if (member.attempts < this.timings.memberMaxAttempts) {
         member.token += 1;
         member.state = 'interrupted';
@@ -878,15 +879,30 @@ export class BackendOutageCoordinator<S> {
     }
   }
 
-  private stop(member: Member<S>): void {
+  /** Drop a member the daemon says must not be restarted (closed, replaced
+   *  or deliberately put to sleep). True when it was dropped. */
+  private dropIfIneligible(member: Member<S>, eligibility = this.deps.eligible(member.ref)): boolean {
+    if (eligibility === 'never') {
+      this.stop(member, 'stopped');
+      return true;
+    }
+    if (eligibility === 'dormant') {
+      this.stop(member, 'dormant');
+      return true;
+    }
+    return false;
+  }
+
+  private stop(member: Member<S>, state: 'stopped' | 'dormant'): void {
     member.token += 1;
     member.restartPending = false;
     member.settling = false;
     member.canary = false;
     member.externalRecoveryUntil = undefined;
-    member.state = 'stopped';
+    member.state = state;
     // A closed topic needs no further card; only correct one already posted.
-    if (this.cards.has(member.sessionId)) this.renderCard(member);
+    // A sleeping one is still the user's: tell it how it comes back.
+    if (state === 'dormant' || this.cards.has(member.sessionId)) this.renderCard(member);
   }
 
   private maybeSettle(episode: Episode<S>): void {
@@ -935,7 +951,8 @@ export class BackendOutageCoordinator<S> {
     this.deps.log(
       `backend outage closed: tmux ${summary.serverLabel}, ${members.length} session(s), `
       + `${members.filter(m => m.state === 'recovered').length} recovered, `
-      + `${members.filter(m => m.state === 'failed').length} failed, ${episode.serverRetries} server retr${episode.serverRetries === 1 ? 'y' : 'ies'}`,
+      + `${members.filter(m => m.state === 'failed').length} failed, `
+      + `${members.filter(m => m.state === 'dormant').length} dormant, ${episode.serverRetries} server retr${episode.serverRetries === 1 ? 'y' : 'ies'}`,
     );
     // Sessions that were closed before anything was shown are not "affected".
     if (summary.members.some(m => m.state !== 'stopped')) {
