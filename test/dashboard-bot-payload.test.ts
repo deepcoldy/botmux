@@ -6,6 +6,22 @@ import { invalidateGlobalConfigCache } from '../src/global-config.js';
 import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from '../src/dashboard/bot-payload.js';
 
 describe('dashboard bot payload helpers', () => {
+  it.each([
+    [false, false],
+    [true, true],
+    [undefined, true],
+    ['false', true],
+    [null, true],
+    [0, true],
+  ])('preserves saved folded layout %s in offline recovery', (saved, expected) => {
+    const raw = { streamingCardFoldedLayout: saved, larkToolBinding: false };
+    const before = { ...raw };
+    const overrides = sparseOverridesFromRawBotConfig(raw);
+    const payload = botDefaultsPayload({ larkAppId: 'app' }, overrides);
+    expect(payload.streamingCardFoldedLayout).toBe(expected);
+    expect(payload.larkToolBinding).toBe(false);
+    expect(raw).toEqual(before);
+  });
   it('exposes folded layout as default-on and preserves explicit classic layout', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, {}).streamingCardFoldedLayout).toBe(true);
     expect(botDefaultsPayload({ larkAppId: 'app' }, { streamingCardFoldedLayout: false }).streamingCardFoldedLayout).toBe(false);

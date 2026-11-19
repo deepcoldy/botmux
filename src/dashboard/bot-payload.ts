@@ -2,7 +2,7 @@ import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from 
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
 import { normalizeUsageDisplay, normalizeCotEnabled } from '../bot-registry.js';
-import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
+import { normalizeHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
@@ -231,7 +231,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     disableStreamingCard: j?.disableStreamingCard === true || j?.replyCardMode === 'final-only',
     replyCardMode: j?.replyCardMode === 'unified' || j?.replyCardMode === 'final-only' ? 'unified' : 'legacy',
     hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(j?.hiddenStreamingCardButtons) ?? [],
-    streamingCardFoldedLayout: j?.streamingCardFoldedLayout !== false,
+    streamingCardFoldedLayout: resolveStreamingCardFoldedLayout(j ?? {}),
     pinStreamingCard: j?.pinStreamingCard === true,
     silentTurnReactions: j?.silentTurnReactions === true,
     codexAppCleanInput: j?.codexAppCleanInput === true,
@@ -364,6 +364,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   quotaFallbackBot: any;
   autoInviteOwnerOnGroupAdd: any;
   larkToolBinding: boolean | undefined;
+  streamingCardFoldedLayout: boolean | undefined;
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
   grantDelegateBots: string[] | undefined;
@@ -373,6 +374,8 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
     autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
     larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
+    streamingCardFoldedLayout: typeof rawEntry?.streamingCardFoldedLayout === 'boolean'
+      ? rawEntry.streamingCardFoldedLayout : undefined,
     askOptionLayout: rawEntry?.askOptionLayout,
     // 默认开：显式 false 不从这里带回，离线行会把已关闭的同机信任显示成开启。
     trustSameOwnerBots: typeof rawEntry?.trustSameOwnerBots === 'boolean' ? rawEntry.trustSameOwnerBots : undefined,

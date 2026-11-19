@@ -143,6 +143,7 @@ import {
 } from './decision-board-model.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
+  resolveStreamingCardFoldedLayout,
   type StreamingCardButtonId,
 } from '../../im/lark/streaming-card-buttons.js';
 
@@ -656,7 +657,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
     hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
-    streamingCardFoldedLayout: body.streamingCardFoldedLayout !== false,
+    streamingCardFoldedLayout: resolveStreamingCardFoldedLayout(body),
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
@@ -6090,7 +6091,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
   const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
-  const [foldedLayout, setFoldedLayout] = useState(bot.streamingCardFoldedLayout !== false);
+  const [foldedLayout, setFoldedLayout] = useState(resolveStreamingCardFoldedLayout(bot));
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
@@ -6111,7 +6112,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setDisableStreaming(bot.disableStreamingCard === true);
     setReplyMode(bot.replyCardMode ?? 'legacy');
     setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
-    setFoldedLayout(bot.streamingCardFoldedLayout !== false);
+    setFoldedLayout(resolveStreamingCardFoldedLayout(bot));
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);

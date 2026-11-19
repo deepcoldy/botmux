@@ -52,6 +52,7 @@ import {
 } from './pin-streaming-card-change.js';
 import {
   normalizeHiddenStreamingCardButtons,
+  resolveStreamingCardFoldedLayout,
   type StreamingCardButtonId,
 } from '../im/lark/streaming-card-buttons.js';
 
@@ -171,7 +172,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       disableStreamingCard: c.disableStreamingCard === true,
       replyCardMode: normalizeReplyCardMode(c.replyCardMode),
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
-      streamingCardFoldedLayout: c.streamingCardFoldedLayout !== false,
+      streamingCardFoldedLayout: resolveStreamingCardFoldedLayout(c),
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,

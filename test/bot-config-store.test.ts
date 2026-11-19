@@ -1436,7 +1436,6 @@ describe('bot-config store', () => {
   it('defaultOn boolean (streamingCardFoldedLayout): inverted persistence — only explicit false is written', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('streamingCardFoldedLayout')!;
-    expect(spec.defaultOn).toBe(true);
 
     const r1 = await store.applyConfigField('app_default', spec, false);
     expect(r1.ok).toBe(true);

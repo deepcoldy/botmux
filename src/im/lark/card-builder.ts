@@ -1471,9 +1471,11 @@ export function buildStreamingCard(
   //    事实源，新增远端 CLI 自动跟随）。weighted columns pin the keys into a
   //    fixed grid: the old `action` rows stacked every key full-width on narrow
   //    cards, which is what made the card a long vertical strip.
+  const mkKey = (label: string, key: string) => ({
+    ...callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }),
+    ...(foldedLayout ? { width: 'fill' as const } : {}),
+  });
   if (keysAvailable && !foldedLayout) {
-    const mkKey = (label: string, key: string) =>
-      callbackButton(label, 'default', { action: 'term_action', ...actionBase, key });
     elements.push({
       tag: 'action',
       actions: [
@@ -1490,10 +1492,6 @@ export function buildStreamingCard(
     });
   }
   if (foldedLayout && keysAvailable && (primaryMode || keysPanelOpen)) {
-    const mkKey = (label: string, key: string) => ({
-      ...callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }),
-      width: 'fill' as const,
-    });
     // Row widths are deliberately unequal: Feishu truncates button text with an
     // ellipsis when a weighted column gets narrower than the label. Labels are
     // therefore single symbols wherever possible (×/⇥/␣/↵/▲/▼) — even a
