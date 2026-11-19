@@ -1373,6 +1373,26 @@ describe('capture failure observability', () => {
     expect(String(errSpy.mock.calls[0][0])).toContain('kind=server-unreachable');
     errSpy.mockRestore();
   });
+
+  it('recognizes the real execFile timeout shape without changing rejection', async () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const timeoutError = Object.assign(new Error('Command failed: tmux capture-pane'), {
+      code: null,
+      killed: true,
+      signal: 'SIGKILL',
+      stderr: '',
+    });
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      cb(timeoutError, '');
+      return {};
+    }) as any);
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    await expect(be.captureViewportAsync()).rejects.toBe(timeoutError);
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(String(errSpy.mock.calls[0][0])).toContain('kind=timeout');
+    errSpy.mockRestore();
+  });
 });
 
 describe('TmuxPipeBackend.getPaneSize', () => {

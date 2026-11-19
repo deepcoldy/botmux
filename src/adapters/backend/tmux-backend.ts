@@ -90,8 +90,13 @@ export type TmuxCaptureErrorKind = 'server-unreachable' | 'no-server' | 'pane-mi
  * error vocabulary so operators can see which part of the frame pipeline is
  * failing and whether it matches the watcher's last probe. */
 export function classifyTmuxCaptureError(err: unknown): { kind: TmuxCaptureErrorKind; detail: string } {
-  if (isExecTimeoutError(err)) return { kind: 'timeout', detail: 'capture deadline exceeded' };
   const anyErr = err as any;
+  // execFile({ timeout, killSignal: 'SIGKILL' }) reports code:null on both Node
+  // and Bun. Capture never kills its child for any other reason, so this is the
+  // asynchronous counterpart of execSync's ETIMEDOUT shape.
+  if (isExecTimeoutError(err) || (anyErr?.killed === true && anyErr?.signal === 'SIGKILL')) {
+    return { kind: 'timeout', detail: 'capture deadline exceeded' };
+  }
   const stderr = String(anyErr?.stderr ?? '').trim();
   if (isTmuxServerLevelErrorText(stderr)) return { kind: 'server-unreachable', detail: stderr || 'tmux connection failed' };
   if (/no server running/i.test(stderr)) return { kind: 'no-server', detail: stderr };
