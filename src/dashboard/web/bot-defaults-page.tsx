@@ -4444,6 +4444,12 @@ export function OwnerGroupFollowControls(props: { bot: BotDefaultsRow; patchBot:
   useEffect(() => {
     setExcluded(savedExcluded);
   }, [bot.larkAppId, savedExcluded]);
+  if (bot.apiOnly === true) {
+    return <div className="bd-subsection" data-owner-group-follow-unavailable>
+      <h4 className="bd-subsection-title">{tr('botDefaults.ownerGroupFollow')}</h4>
+      <p className="bd-section-note">{tr('botDefaults.ownerGroupFollowApiOnly')}</p>
+    </div>;
+  }
   const save = (value: BotDefaultsRow['ownerGroupFollow']) => saveBotField({
     request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/owner-group-follow`, { ownerGroupFollow: value }),
     setStatus, setBusy, saved: tr('botDefaults.cardPrefSaved'),

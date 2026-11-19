@@ -689,6 +689,7 @@ vi.mock('../src/services/oncall-store.js', () => ({
 // own open-mode / allowlist / peer-bot logic (that lives in event-dispatcher).
 vi.mock('../src/im/lark/event-dispatcher.js', () => ({
   canOperate: vi.fn(() => true),
+  canOperateBotSender: vi.fn((...args: any[]) => canOperate(...args)),
   // cross-ref bot 兜底腿默认 false（人类）；个别用例翻成 true 模拟「事件没盖
   // app/bot、但 open_id 已在 peer 互导表里」的 bot。
   isKnownPeerBot: vi.fn(() => false),
@@ -758,7 +759,7 @@ import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-ev
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
 import { detectUnusableOwnerEntries } from '../src/setup/owner-identity.js';
-import { canOperate, isKnownPeerBot, isPlatformTeamBotTrustedForReceiver } from '../src/im/lark/event-dispatcher.js';
+import { canOperate, canOperateBotSender, isKnownPeerBot, isPlatformTeamBotTrustedForReceiver } from '../src/im/lark/event-dispatcher.js';
 import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../src/services/worktree-cleanup-store.js';
 import { getBotUnionId } from '../src/services/bot-union-ids-store.js';
 import { isTeamBot } from '../src/services/team-bots-store.js';
@@ -987,6 +988,17 @@ describe('/models inherit', () => {
     const saved = structuredClone(ds.session);
     await handleCommand('/models', ROOT_ID, makeLarkMessage('/models inherit'), makeDeps(ds), LARK_APP_ID);
     expect(ds.session).toEqual(saved);
+  });
+
+  it('forwards the bot sender appId to the operator check', async () => {
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+    const ds = makeDaemonSession({ session: makeSession({
+      cliId: 'codex', cliSessionId: 'native-1',
+      codexModelSelection: { nativeSessionId: 'native-1', launchModel: 'B', launchStartedAtMs: 1, override: 'B' },
+    }) });
+    const message = makeLarkMessage('/models inherit', { senderType: 'app', senderUnionId: 'on_ext', senderAppId: 'cli_ext' });
+    await handleCommand('/models', ROOT_ID, message, makeDeps(ds), LARK_APP_ID);
+    expect(canOperateBotSender).toHaveBeenCalledWith(ds.larkAppId, ds.chatId, message.senderId, 'on_ext', 'cli_ext');
   });
 
   it('does not mutate another CLI or an external session', async () => {

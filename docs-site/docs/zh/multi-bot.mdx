@@ -117,8 +117,9 @@ botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
 | `name` | 名字 |
 | `specialties` | 专长标签 |
 | `mentionable` / `online` | 能否 @、是否在线 |
-| `owner` | 它的主人 |
-| `machineId` / `machineName` | 它在哪台机器上 |
+| `owner` | 它的主人（外部机器人是登记它的成员） |
+| `machineId` / `machineName` | 它在哪台机器上（外部机器人没有） |
+| `external` | `true` 表示外部机器人（见下文） |
 
 要点：
 
@@ -126,6 +127,15 @@ botmux bots invite --chat <chatId> --team <teamId> --agent <appId> [--agent ...]
 - **专长、在线状态是机器人自报的**：`specialties` / `mentionable` / `online` 只供挑选参考，不是可信凭据。
 - **用 appId，不用 @**：别人的机器人进你的群之前，你根本 @ 不到它，所以这三条命令都按 appId + 平台鉴权走。谁有权限、谁加入了团队，全由平台判断。
 - **`bots invite` 的目标群**：要求**你本人已在群里**，且**平台机器人也在群里**。平台机器人不在时，botmux 会自动用群里已有的本机机器人把它拉进来，再重试补人，一般无感。只有群设了「加机器人需群主审批」，或你本机没有机器人在这个群里时，才会提示你手动添加。
+
+### 外部机器人：不跑在 botmux 上的飞书机器人
+
+别的框架、托管 Agent 平台上的飞书机器人也能加入团队。团队成员在平台团队卡片的「外部机器人」里登记它的 App ID、名称，可选再填它的 `union_id`（`on_` 开头）。登记后：
+
+- 它会被拉进机器人大厅、出现在团队名册里，团队里的 botmux 机器人**不用 `/grant`** 就认它：填了 `union_id`、且飞书事件同时携带与该条目一致的 sender `app_id` 时，在任意共同群里认；没填 `union_id`、事件缺少 `app_id` 或两者不匹配时，只在团队群（大厅、平台拉的群）里认；
+- `bots list --scope team` 能发现它（`external: true`），`create-group --team` / `bots invite` 也能把它连同登记人一起拉进群。
+
+登记人为它担保：登记人退出团队时它一并移除；登记人或团队管理员可以移除它。已经跑在 botmux 上的机器人不能这样登记，请它的 owner 在「管理机器人」里加入团队。外部机器人的同队信任要求 `union_id` 与飞书盖章的发送方 `app_id` 成对匹配，防止借用真人或其他机器人的 union；它的 appId 也不会让本机任何机器人被当成团队成员或同机机器人。
 
 ### 三种拉人方式，别混了
 

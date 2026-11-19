@@ -8,9 +8,10 @@ import {
   CardBehaviorSection,
   patchCardPrefsFromBody,
   CodexAppDisplaySection,
+  OwnerGroupFollowControls,
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
-import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
+import { isOnboardingSubmitDisabled, onboardingRetryMode } from '../src/dashboard/web/bot-onboarding.js';
 import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 
 // Profile scanning has its own component/browser tests. Keep these agent-save
@@ -1937,6 +1938,36 @@ describe('bot onboarding Agent availability warning', () => {
     expect(isOnboardingSubmitDisabled(false, 'qr')).toBe(false);
     expect(isOnboardingSubmitDisabled(true, 'reuse')).toBe(true);
     expect(isOnboardingSubmitDisabled(false, 'checking')).toBe(true);
+  });
+
+  it('keeps a failed local job on the local retry path', () => {
+    expect(onboardingRetryMode({ registrationMode: 'local' })).toBe('local');
+    expect(onboardingRetryMode({ registrationMode: 'web' })).toBe('web');
+    expect(onboardingRetryMode({ registrationMode: 'compat' })).toBe('web');
+  });
+});
+
+describe('owner group follow transport gate', () => {
+  it('shows an unavailable explanation for apiOnly while preserving Feishu controls', () => {
+    const render = (apiOnly: boolean) => {
+      let renderer!: TestRenderer.ReactTestRenderer;
+      act(() => {
+        renderer = TestRenderer.create(React.createElement(OwnerGroupFollowControls, {
+          bot: { larkAppId: apiOnly ? 'local_x' : 'cli_x', apiOnly },
+          patchBot: vi.fn(),
+        }));
+      });
+      return renderer;
+    };
+    const local = render(true);
+    expect(local.root.findAll(node => node.props['data-owner-group-follow'] !== undefined)).toHaveLength(0);
+    expect(local.root.findAll(node => node.props['data-owner-group-follow-unavailable'] !== undefined)).toHaveLength(1);
+    act(() => { local.unmount(); });
+
+    const feishu = render(false);
+    expect(feishu.root.findAll(node => node.props['data-owner-group-follow'] !== undefined)).toHaveLength(1);
+    expect(feishu.root.findAll(node => node.props['data-owner-group-follow-unavailable'] !== undefined)).toHaveLength(0);
+    act(() => { feishu.unmount(); });
   });
 });
 
