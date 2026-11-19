@@ -744,7 +744,9 @@ describe('reconcileUsageForDaemonSession (daemon restart)', () => {
       { at: new Date('2026-01-02T01:00:00Z'), usage: third },
     ]);
     reconcileUsageForDaemonSession(codex, { ledgerDir: dir, now: new Date('2026-01-03T00:00:00Z') });
-    const rows = readdirSync(dir).filter(f => f.startsWith('usage-')).flatMap(f =>
+    // readdirSync order is filesystem-defined; sort the UTC-date ledger files
+    // (usage-YYYY-MM-DD.jsonl, lexical order == chronological) before comparing.
+    const rows = readdirSync(dir).filter(f => f.startsWith('usage-')).sort().flatMap(f =>
       readFileSync(join(dir, f), 'utf8').trim().split('\n').map(line => JSON.parse(line)));
     expect(rows.map(r => [r.ts, r.model, r.inputTokens])).toEqual([
       ['2026-01-01T10:00:00.000Z', 'model-a', 100],
@@ -752,6 +754,37 @@ describe('reconcileUsageForDaemonSession (daemon restart)', () => {
       ['2026-01-02T01:00:00.000Z', 'model-b', 50],
     ]);
     expect(reconcileUsageForDaemonSession(codex, { ledgerDir: dir })).toBeNull();
+  });
+
+  it('orders cross-date recovered rows even when ledger files are read in reverse', () => {
+    const codex = { ...ds, session: { ...ds.session, cliId: 'codex' } };
+    const first = cumulative(100, 10, 0, 0, 'model-a');
+    const second = cumulative(150, 15, 0, 0, 'model-a');
+    const third = cumulative(200, 20, 0, 0, 'model-b');
+    vi.mocked(getSessionTokenUsage).mockReturnValue(first);
+    recordUsageForDaemonSession(codex, { ledgerDir: dir, now: new Date('2026-01-01T10:00:00Z') });
+    vi.mocked(getSessionTokenUsage).mockReturnValue(third);
+    vi.mocked(getSessionUsageRecovery).mockReturnValueOnce([
+      { at: new Date('2026-01-01T23:00:00Z'), usage: second },
+      { at: new Date('2026-01-02T01:00:00Z'), usage: third },
+    ]);
+    reconcileUsageForDaemonSession(codex, { ledgerDir: dir, now: new Date('2026-01-03T00:00:00Z') });
+
+    const parseRows = (f: string) =>
+      readFileSync(join(dir, f), 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    const files = readdirSync(dir).filter((f) => f.startsWith('usage-'));
+    expect(files.length).toBeGreaterThanOrEqual(2);
+    // Force the worst-case readdir order the CI flake hit (newest UTC date
+    // first). Sorting the usage-YYYY-MM-DD.jsonl names must still yield
+    // chronological rows; without the sort this reversed input fails the
+    // exact-order assertion below on every filesystem, not just flaky ones.
+    const reversedFiles = [...files].reverse();
+    const rows = reversedFiles.sort().flatMap(parseRows);
+    expect(rows.map((r) => [r.ts, r.model, r.inputTokens])).toEqual([
+      ['2026-01-01T10:00:00.000Z', 'model-a', 100],
+      ['2026-01-01T23:00:00.000Z', 'model-a', 50],
+      ['2026-01-02T01:00:00.000Z', 'model-b', 50],
+    ]);
   });
 
   it('anchors without recording when the session is new to the ledger', () => {
