@@ -3302,6 +3302,8 @@ let lastSpawnCodexLauncherActive = false;
  *  getChildPid may return that mutable field rather than the original pane pid. */
 let lastSpawnCodexLauncherPid: number | undefined;
 let codexOwnershipAttestationPending = false;
+/** Re-roots a sandboxed CLI's lineage proof on its live leaf; bound per spawn. */
+let refreshSandboxedCliLeafAttestation: (() => void) | undefined;
 // Configured Codex-compatible executable name of the latest spawn, used to
 // recognise a renamed native binary when deciding whether getChildPid() is
 // already the real leaf. undefined for the official `codex` binary.
@@ -21633,6 +21635,7 @@ function markPromptReady(): void {
   // the real execution root before the first turn can call a BotMux tool;
   // waiting for a rollout/history match would repair ownership only AFTER it.
   if (lastInitConfig?.cliId === 'codex') currentCodexObservedPid();
+  refreshSandboxedCliLeafAttestation?.();
   // A recognized startup dialog (cli-startup-blocker) is a selector whose ❯
   // matches readyPattern: never a prompt, and not the "real readyPattern seen
   // during the hold" the ready-gate settle trusts below. The first-prompt
@@ -23286,6 +23289,7 @@ async function flushPending(): Promise<void> {
     // Type-ahead and first-prompt timeout paths can bypass markPromptReady.
     // Refresh here too, before dequeuing or publishing the input's authority.
     if (lastInitConfig?.cliId === 'codex') currentCodexObservedPid();
+    refreshSandboxedCliLeafAttestation?.();
     // One-shot per spawn: type the bot's startup commands (e.g. `/effort
     // ultracode`) into the CLI before the first user prompt drains. Both ready
     // paths funnel through flushPending — the ready-gate settle for Claude-family
@@ -31148,12 +31152,14 @@ async function spawnCliBody(
     if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
     publishLocalProcessAttestation(realPid);
   };
+  // Codex also needs the real execution root, even without a Claude JSONL bridge.
+  const wrapperResolverRuns = (): boolean => !!cfg.wrapperCli?.trim() && !sandboxRequested
+    && (!!claudeDataDir || cfg.cliId === 'codex');
   // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
   // reports while this spawn is current (equal to launcherPid unless a relay
   // sits between the pane and the launcher).
   const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
-    // Codex also needs the real execution root, even without a Claude JSONL bridge.
-    if (!cfg.wrapperCli || !cfg.wrapperCli.trim() || sandboxRequested || (!claudeDataDir && cfg.cliId !== 'codex')) return;
+    if (!wrapperResolverRuns()) return;
     const targetCliId = cfg.cliId as CliId;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
@@ -31183,23 +31189,41 @@ async function spawnCliBody(
   // Under bwrap the payload is the sandbox supervisor and stays the pid for
   // session discovery. Tool processes descend from the CLI inside it, which
   // predates every turn, so the lineage proof needs the CLI leaf attested too.
-  // Codex and TRAE rebind ownership to their leaf through their own resolvers.
+  // Codex and TRAE rebind ownership to their leaf through their own resolvers,
+  // as does resolveBehindWrapper for a wrapperCli outside the full sandbox.
   const attestSandboxedCliLeaf = (payloadPid: number): void => {
-    if (!(sandboxRequested || credentialOnlyBwrap) || cfg.cliId === 'codex' || cfg.cliId === 'traex') return;
+    if (!(sandboxRequested || credentialOnlyBwrap) || cfg.cliId === 'codex' || cfg.cliId === 'traex'
+      || wrapperResolverRuns()) return;
     const targetCliId = cfg.cliId as CliId;
     const generation = cliSpawnGeneration;
+    const findLeaf = (lp: number): number | null =>
+      findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, { childrenOf: snapshotChildPids() });
+    let attested: { pid: number; procStart: string | undefined; published: boolean } | undefined;
+    // Republishing rotates the turn capability, so a live, published leaf is never sent twice.
+    const isAttested = (pid: number | undefined): boolean => pid !== undefined && attested?.pid === pid
+      && attested.published && attested.procStart !== undefined && readProcessStartIdentity(pid) === attested.procStart;
+    const attest = (leafPid: number): void => {
+      if (isAttested(leafPid)) return;
+      log(`Sandbox: attesting CLI leaf pid ${leafPid} under launch payload ${payloadPid} (cliId=${cfg.cliId})`);
+      const procStart = readProcessStartIdentity(leafPid);
+      attested = { pid: leafPid, procStart, published: publishLocalProcessAttestation(leafPid) };
+    };
+    // The first match may be a startup helper that exits, or its publication may
+    // fail; ready/input edges repair either before the next turn can run tools.
+    refreshSandboxedCliLeafAttestation = () => {
+      if (generation !== cliSpawnGeneration || isAttested(attested?.pid)) return;
+      const leafPid = findLeaf(payloadPid);
+      if (leafPid) attest(leafPid);
+    };
     const intervalMs = 200;
     scheduleWrapperRealCliPid(payloadPid, {
       intervalMs,
       maxAttempts: Math.ceil(FIRST_PROMPT_HARD_TIMEOUT_MS / intervalMs),
-      findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH),
+      findRealPid: findLeaf,
       isDirectLeaf: (lp) => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId,
       getBackend: () => backend,
       getChildPid: () => (generation === cliSpawnGeneration ? payloadPid : null),
-      applyRealPid: (leafPid) => {
-        log(`Sandbox: attesting CLI leaf pid ${leafPid} under launch payload ${payloadPid} (cliId=${cfg.cliId})`);
-        publishLocalProcessAttestation(leafPid);
-      },
+      applyRealPid: attest,
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
   };
@@ -32577,6 +32601,7 @@ function killCli(opts: {
   nativeReasoningClock = undefined;
   lastSpawnCodexLauncherPid = undefined;
   codexOwnershipAttestationPending = false;
+  refreshSandboxedCliLeafAttestation = undefined;
   if (backend) previousCliEndedAtMs = Date.now();
   inputDeliveryQuarantine = null;
   postTerminalInputFence = null;

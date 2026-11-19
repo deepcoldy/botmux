@@ -113,6 +113,9 @@ function runWorkerWiring(late: boolean, options: {
   /** Run the real BFS over the synthetic table (`children` / `childComms`)
    *  with the depth the worker passes, instead of the canned result. */
   realCodexSearch?: boolean;
+  credentialOnlyBwrap?: boolean;
+  /** Pids whose process has exited: their birth token no longer reads back. */
+  exited?: number[];
 } = {}) {
   const scheduler = makeScheduler();
   let scopeProbes = 0;
@@ -145,7 +148,7 @@ function runWorkerWiring(late: boolean, options: {
       ...(options.cliRuntime ? { cliRuntime: options.cliRuntime } : {}),
     },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
-    credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
+    credentialOnlyBwrap: options.credentialOnlyBwrap ?? false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
     // Module-level spawn counter read by the TRAE leaf-resolve guard; the sliced
     // wiring runs in this VM without worker.ts's declaration, so supply its
     // initial value. It is only read inside the slice, never assigned.
@@ -155,6 +158,8 @@ function runWorkerWiring(late: boolean, options: {
     lastSpawnCodexExecutable: undefined,
     lastSpawnCodexLauncherPid: undefined,
     codexOwnershipAttestationPending: false,
+    refreshSandboxedCliLeafAttestation: undefined as (() => void) | undefined,
+    readProcessStartIdentity: (pid: number) => (options.exited?.includes(pid) ? undefined : `start-${pid}`),
     FIRST_PROMPT_HARD_TIMEOUT_MS: CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS,
     CODEX_LEAF_SEARCH_DEPTH, snapshotChildPids: () => () => [],
     resolveCodexOwnershipPid: vi.fn(realFns.resolveCodexOwnershipPid),
@@ -533,10 +538,44 @@ describe('worker wrapper PID wiring', () => {
       children: { 150: [151], 151: [152], 152: [153] },
       childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe' },
     });
-    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'claude-code', CODEX_LEAF_SEARCH_DEPTH);
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(150, 'claude-code', CODEX_LEAF_SEARCH_DEPTH, { childrenOf: expect.any(Function) });
     expect(result.backend.cliPid).toBe(150);
     expect(result.bridgeCliPid).toBe(150);
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(153);
+  });
+
+  it('re-attests the sandboxed Claude Code leaf after a failed publication or a startup helper exits', () => {
+    // 153 is a startup helper (`claude --version`) the launch poll attests; it
+    // exits and the interactive TUI 154 replaces it before an input edge.
+    const children: Record<number, number[]> = { 150: [151], 151: [152], 152: [153] };
+    const exited: number[] = [];
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: '', claudeDataDir: '/claude', sandboxRequested: true, realCodexSearch: true,
+      scopePayloadPid: 150, children, exited,
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe', 154: 'claude.exe' },
+      beforeTimers: scope => scope.publishLocalProcessAttestation.mockReturnValueOnce(false),
+    });
+    const leafAttestations = () => result.publishLocalProcessAttestation.mock.calls
+      .map((call: unknown[]) => call[0]).filter((pid: unknown) => pid !== 150);
+    expect(leafAttestations()).toEqual([153]);
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(leafAttestations()).toEqual([153, 153]);
+    exited.push(153);
+    children[152] = [154];
+    result.refreshSandboxedCliLeafAttestation!();
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(leafAttestations()).toEqual([153, 153, 154]);
+  });
+
+  it('leaves a credential-only bwrap wrapperCli leaf to the wrapper resolver alone', () => {
+    const result = runWorkerWiring(false, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      children: { 150: [151], 151: [152], 152: [153] },
+      childComms: { 150: 'sh', 151: 'bwrap', 152: 'bwrap', 153: 'claude.exe' },
+    });
+    expect(result.publishLocalProcessAttestation.mock.calls.filter((call: unknown[]) => call[0] === 153)).toHaveLength(1);
+    expect(result.refreshSandboxedCliLeafAttestation).toBeUndefined();
   });
 
   it.each([false, true])('attests the native Codex child behind the standard npm launcher (late PID=%s)', late => {
