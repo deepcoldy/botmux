@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os';
 const CLI = resolve('dist/cli.js');
 const LARK_FACING = [
   'send',
+  'post',
   'dispatch',
   'card',
   'history',
