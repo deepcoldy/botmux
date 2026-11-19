@@ -10,7 +10,6 @@ import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
-import { clearStatuslineSnapshot } from '../../src/services/statusline-snapshot.js';
 
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
@@ -18,7 +17,6 @@ import { clearStatuslineSnapshot } from '../../src/services/statusline-snapshot.
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
   if (key in scope) return scope[key as string];
   if (key === 'randomUUID') return randomUUID;
-  if (key === 'clearStatuslineSnapshot') return clearStatuslineSnapshot;
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'isCodexAppCliId') return isCodexAppCliId;
@@ -33,7 +31,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (typeof key === 'string' && ['ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
-    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'invalidateSessionStatuslineSnapshot',
+    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
     'recordLaunchModel'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }

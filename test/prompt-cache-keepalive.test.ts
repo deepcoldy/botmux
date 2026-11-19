@@ -12,7 +12,8 @@ const statusline: { contextPercent?: number; contextWindowTokens?: number } = {}
 vi.mock('../src/global-config.js', () => ({
   readGlobalConfig: () => globalConfig,
 }));
-vi.mock('../src/services/statusline-snapshot.js', () => ({
+vi.mock('../src/services/statusline-snapshot.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/statusline-snapshot.js')>()),
   readStatuslineSnapshot: () => ({ ts: Date.now(), ...statusline }),
 }));
 
