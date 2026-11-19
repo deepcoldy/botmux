@@ -171,25 +171,48 @@ export interface TmuxServerGuardSeam {
   /** Send SIGUSR1 (defaults to process.kill). */
   recreateSocket?: (pid: number) => void;
   env?: NodeJS.ProcessEnv;
+  /** cwd the gated new-session will run with: a relative $TMUX_TMPDIR in
+   *  `env` resolves against it (defaults to this process's cwd). */
+  cwd?: string;
   platform?: NodeJS.Platform;
 }
 
 /** Filesystem pathname of a tmux server socket (undefined name = default).
  *  The root is resolved the way tmux itself resolves it (see
- *  {@link resolveTmuxSocketRoot}): a $TMUX_TMPDIR that does not name an
- *  existing directory makes tmux fall back to /tmp, so probing the raw value
- *  would inspect a socket nobody talks to. */
-export function tmuxSocketPath(env: NodeJS.ProcessEnv, uid: number, socketName?: string): string {
-  return tmuxSocketPathIn(resolveTmuxSocketRoot(env), uid, socketName);
+ *  {@link resolveTmuxSocketRoot}): relative $TMUX_TMPDIR values resolve
+ *  against `cwd` — pass the SAME cwd the tmux client will run with, or the
+ *  gate inspects a different root than the spawn. */
+export function tmuxSocketPath(env: NodeJS.ProcessEnv, uid: number, socketName?: string, cwd?: string): string {
+  return tmuxSocketPathIn(resolveTmuxSocketRoot(env, cwd), uid, socketName);
 }
 
 /** All path spellings a bound socket may be reported under: the given path and
  *  the realpath of its directory joined with the basename (a symlinked
- *  TMUX_TMPDIR makes tmux and the census report different strings). */
+ *  TMUX_TMPDIR makes tmux and the census report different strings).
+ *  The realpath variant walks up to the deepest EXISTING ancestor, because
+ *  the cold-boot census routinely runs before tmux-<uid> exists; tmux itself
+ *  realpaths the root, so the census must recognise the canonical spelling
+ *  even when only the link spelling was computed. The /tmp ↔ /private/tmp
+ *  pair covers macOS's canonicalisation on every platform — matching is
+ *  exact-string, so the absent spelling is simply inert elsewhere. */
 export function tmuxSocketPathSpellings(socketPath: string): Set<string> {
   const out = new Set<string>([socketPath]);
-  try { out.add(join(realpathSync(dirname(socketPath)), basename(socketPath))); }
-  catch { /* realpath unavailable — given spelling only */ }
+  const base = basename(socketPath);
+  let dir = dirname(socketPath);
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      out.add(join(realpathSync(dir), ...tail, base));
+      break;
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) break; // '/' itself unresolvable — given spelling only
+      tail.unshift(basename(dir));
+      dir = parent;
+    }
+  }
+  if (socketPath.startsWith('/tmp/')) out.add(`/private${socketPath}`);
+  else if (socketPath.startsWith('/private/tmp/')) out.add(socketPath.slice('/private'.length));
   return out;
 }
 
@@ -202,12 +225,18 @@ export function tmuxSocketPathSpellings(socketPath: string): Set<string> {
  *  the kernel census (fast) is what actually decides. */
 export const GUARD_OWNER_PROBE_TIMEOUT_MS = 800;
 
-export function probeTmuxOwner(socketName?: string, env: NodeJS.ProcessEnv = process.env): TmuxOwnerProbe {
+export function probeTmuxOwner(
+  socketName?: string,
+  env: NodeJS.ProcessEnv = process.env,
+  cwd?: string,
+): TmuxOwnerProbe {
   try {
     const out = execFileSync(
       'tmux',
       [...tmuxSocketArgs(socketName), 'display-message', '-p', '#{pid}'],
-      { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', env: tmuxEnv(env), timeout: GUARD_OWNER_PROBE_TIMEOUT_MS },
+      // The probe must resolve a relative $TMUX_TMPDIR exactly like the
+      // new-session it gates: same env AND same cwd.
+      { stdio: ['ignore', 'pipe', 'pipe'], encoding: 'utf8', env: tmuxEnv(env), timeout: GUARD_OWNER_PROBE_TIMEOUT_MS, cwd },
     );
     const pid = Number(out.trim());
     return Number.isInteger(pid) && pid > 0 ? { kind: 'reachable', pid } : { kind: 'unknown' };
@@ -310,12 +339,11 @@ function normalizeLsofName(raw: string): string {
 }
 
 export function parseLsofListenerResult(stdout: string, socketPath: string): LsofListenerResult {
-  // Exact path spellings lsof may report (macOS /tmp is a symlink to
-  // /private/tmp). Never match by basename suffix: labels like "botmux" and
-  // "botmux2" share a directory and must not cross-match.
-  const spellings = new Set<string>([socketPath]);
-  if (socketPath.startsWith('/tmp/')) spellings.add(`/private${socketPath}`);
-  if (socketPath.startsWith('/private/tmp/')) spellings.add(socketPath.slice('/private'.length));
+  // Exact path spellings lsof may report — the SAME set the Linux /proc
+  // census uses (raw, realpath through the deepest existing ancestor, and
+  // the /tmp ↔ /private/tmp pair). Never match by basename suffix: labels
+  // like "botmux" and "botmux2" share a directory and must not cross-match.
+  const spellings = tmuxSocketPathSpellings(socketPath);
 
   const pids = new Set<number>();
   let pid: number | null = null;
@@ -458,10 +486,10 @@ export function resolveBootDirective(
   if (env.BOTMUX_DISABLE_TMUX_ANTI_FORK === '1') return { mode: 'spawn', noFork: false };
   const platform = seam.platform ?? process.platform;
   const uid = typeof process.getuid === 'function' ? process.getuid() : -1;
-  const socketPath = tmuxSocketPath(env, uid, socketName);
+  const socketPath = tmuxSocketPath(env, uid, socketName, seam.cwd);
 
   const owner = seam.owner
-    ?? (seam.probeOwner ? seam.probeOwner() : probeTmuxOwner(socketName, env));
+    ?? (seam.probeOwner ? seam.probeOwner() : probeTmuxOwner(socketName, env, seam.cwd));
   const supportsNoFork = seam.supportsNoFork ?? supportsNoForkForEnv(env);
   // SIGUSR1 socket recovery is safe only where pid/census/fingerprint proof is
   // strong (Linux /proc). macOS has no /proc and a wider TOCTOU window.

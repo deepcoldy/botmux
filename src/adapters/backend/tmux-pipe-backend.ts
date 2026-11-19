@@ -1803,14 +1803,16 @@ export class TmuxPipeBackend implements SessionBackend {
    * even answers for some other session (both measured on tmux 3.3a). Lines are
    * still filtered by `#{session_name}` so no other session's panes can count.
    */
-  private reapDeadSessionHoldingName(spawnEnv: NodeJS.ProcessEnv | undefined): boolean {
+  private reapDeadSessionHoldingName(spawnEnv: NodeJS.ProcessEnv | undefined, cwd?: string): boolean {
     if (!this.ownsSession || !this.paneTarget.startsWith('bmx-')) return false;
     let panes: string[];
     try {
       panes = String(execFileSync(
         'tmux',
         [...this.tmuxArgs, 'list-panes', '-s', '-t', `=${this.paneTarget}:`, '-F', '#{session_name}|#{pane_dead}:#{pane_dead_status}'],
-        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv(spawnEnv) },
+        // Same env AND cwd the gated new-session uses: a relative
+        // $TMUX_TMPDIR must resolve to the server that answered.
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv(spawnEnv), cwd },
       ) ?? '').split('\n').map(line => line.trim()).filter(Boolean);
     } catch {
       return false;
@@ -1822,7 +1824,7 @@ export class TmuxPipeBackend implements SessionBackend {
     );
     try {
       execFileSync('tmux', [...this.tmuxArgs, 'kill-session', '-t', `=${this.paneTarget}`], {
-        stdio: 'ignore', timeout: 3000, env: tmuxEnv(spawnEnv),
+        stdio: 'ignore', timeout: 3000, env: tmuxEnv(spawnEnv), cwd,
       });
     } catch { /* already gone; a creation that still collides reports the real error */ }
     return true;
@@ -1942,7 +1944,7 @@ export class TmuxPipeBackend implements SessionBackend {
     if (opts.strictEnv && process.env.TMUX_TMPDIR !== undefined) {
       bootSpawnEnv.TMUX_TMPDIR = process.env.TMUX_TMPDIR;
     }
-    const bootGate = createTmuxBootGate(this.socketName, { env: bootSpawnEnv });
+    const bootGate = createTmuxBootGate(this.socketName, { env: bootSpawnEnv, cwd: opts.cwd });
     for (let attempt = 0; ; attempt++) {
       // [] = normal spawn (attach, or a proven cold boot); ['-N'] = attach
       // only, never fork (tmux ≥ 3.2), closing the client-internal macOS
@@ -1985,7 +1987,7 @@ export class TmuxPipeBackend implements SessionBackend {
         // The reap talks to the server this new-session just answered from
         // (same env, hence the same PATH / TMUX_TMPDIR socket resolution).
         if (attempt === 0 && !corpseReaped && /duplicate session/i.test(stderrText)
-            && this.reapDeadSessionHoldingName(bootSpawnEnv)) {
+            && this.reapDeadSessionHoldingName(bootSpawnEnv, opts.cwd)) {
           corpseReaped = true;
           attempt = -1;
           continue;
