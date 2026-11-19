@@ -154,6 +154,82 @@ describe.sequential('browser connection recovery', () => {
     close.mockImplementation(async () => {});
   });
 
+  it.each(['resolve', 'reject'] as const)(
+    'retires the old runtime when an ordinary disconnect clears init mid-close (close %s)',
+    async closeMode => {
+      let closeResolve!: () => void;
+      const closeGate = new Promise<void>(resolve => { closeResolve = resolve; });
+      const close = vi.fn(async () => {
+        await closeGate;
+        if (closeMode === 'reject') throw new Error('Browser Node runtime is unavailable: close failed');
+      });
+
+      let setupCalls = 0;
+      let aGate!: (e: Error) => void;
+      let bGate!: (e: Error) => void;
+      const aOpen = new Promise<never>((_, reject) => { aGate = reject; });
+      const bOpen = new Promise<never>((_, reject) => { bGate = reject; });
+      let openCall = 0;
+
+      const buildBinding = (generation: number) => ({
+        browserId: `browser-${generation}`,
+        nameSession: vi.fn(async () => {}),
+        tabs: { get: vi.fn(), list: vi.fn(async () => []), new: vi.fn(), selected: vi.fn() },
+        user: {
+          claimTab: vi.fn(),
+          openTabs: vi.fn(async () => {
+            // The rebuilt second-generation binding is healthy and always succeeds.
+            if (generation >= 2) return [{ id: 'recovered' }];
+            openCall += 1;
+            const n = openCall;
+            if (n === 1) return [{ id: 't1' }];
+            if (n === 2) return aOpen; // operation A
+            if (n === 3) return bOpen; // operation B
+            throw new Error('Browser is not available: stale agent still bound');
+          }),
+        },
+      });
+      const setupBrowserRuntime = vi.fn(async () => {
+        setupCalls += 1;
+        return { browsers: { get: vi.fn(async () => buildBinding(setupCalls)) } };
+      });
+      broker = new CodexBrowserBroker({
+        sessionId: 'interleaved-invalidation',
+        family: 'chrome',
+        modules: { handleRpc: vi.fn(), setupBrowserRuntime, close },
+      });
+
+      // Establish the cached browser/agent/modules/init first.
+      expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+
+      // A (dead Node runtime) and B (ordinary disconnect) run concurrently on
+      // the same cached browser/generation.
+      const a = broker.handleToolCall(call({ operation: 'list_tabs' }));
+      const b = broker.handleToolCall(call({ operation: 'list_tabs' }));
+      await vi.waitFor(() => expect(openCall).toBe(3));
+
+      // A fails first and parks inside the hanging close.
+      aGate(new Error('Browser Node runtime exited; verify Node.js 22+ and start a fresh browser connection'));
+      await new Promise(resolve => setTimeout(resolve, 20));
+      // B fails with an ordinary disconnect while A's close is still pending;
+      // this path clears this.init without replacing agent/modules.
+      bGate(new Error('Browser is not available: extension transport reset'));
+      await new Promise(resolve => setTimeout(resolve, 20));
+
+      closeResolve();
+      const [ra, rb] = await Promise.all([a, b]);
+      expect(ra.success).toBe(false);
+      expect(rb.success).toBe(false);
+
+      // The dead runtime must be retired despite B having cleared init: the next
+      // operation runs a fresh setupBrowserRuntime instead of reusing the closed agent.
+      const recovered = await broker.handleToolCall(call({ operation: 'list_tabs' }));
+      expect(setupCalls).toBeGreaterThanOrEqual(2);
+      expect(recovered.success).toBe(true);
+      close.mockImplementation(async () => {});
+    },
+  );
+
   it('shares one invalidation promise so concurrent callers wait for the same teardown', async () => {
     const closeDefers: Array<{ resolve: () => void }> = [];
     const close = vi.fn(async () => new Promise<void>(resolve => {

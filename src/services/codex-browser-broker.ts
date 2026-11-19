@@ -765,8 +765,11 @@ export class CodexBrowserBroker {
     const modules = this.pluginModules;
     const done = Promise.resolve().then(() => modules?.close?.()).finally(() => {
       if (this.invalidation?.done === done) this.invalidation = undefined;
-      // A newer binding can take over while the old runtime is closing.
-      if (this.init !== init || this.pluginModules !== modules) return;
+      // Judge takeover by the actual runtime identity, not by init: an
+      // ordinary disconnect on the same generation clears this.init without
+      // replacing agent/modules, and must not skip retiring this dead runtime.
+      // Only a genuinely rebuilt runtime (a new modules object) is protected.
+      if (this.pluginModules !== modules) return;
       this.pluginModules = undefined;
       this.agent = undefined;
       this.turnEndedHandlers.clear();
