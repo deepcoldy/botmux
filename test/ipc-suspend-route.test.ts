@@ -274,6 +274,21 @@ describe('POST /api/tmux-upgrade/suspend-idle', () => {
     expect(suspendSpy.mock.calls[0]![0].lastScreenStatus).not.toBe('working');
   });
 
+  it.each([
+    ['two app ids in one daemon', ['cli_a', 'cli_b'], 'cli_a'],
+    ['registry app id mismatches the bound app id', ['cli_b'], 'cli_a'],
+  ])('refuses ambiguous daemon scope before execution (%s)', async (_label, appIds, boundAppId) => {
+    setLarkAppId(boundAppId);
+    workerPool.setActiveSessionsRegistry(new Map(appIds.map((appId, index) => [
+      `s-${index}`, tmuxSession(`s-${index}`, 'botmux', { larkAppId: appId }),
+    ])));
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const res = await post({ socketName: 'botmux', olderThanMs: 1, dryRun: false });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({ ok: false, error: 'ambiguous_daemon_scope' });
+    expect(suspendSpy).not.toHaveBeenCalled();
+  });
+
   it('rejects a malformed request before reading any session', async () => {
     workerPool.setActiveSessionsRegistry(new Map([['a', tmuxSession('s-a', 'botmux')]]));
     const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);

@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { PlatformInfo } from '../src/setup/detect-platform.js';
 import { TMUX_RECOMMENDED_MIN, parseTmuxRelease } from '../src/setup/tmux-recommended.js';
 import {
@@ -316,6 +316,60 @@ describe('spawnUpgradeCommand', () => {
     });
     expect(r.timedOut).toBe(true);
     expect(Date.now() - started).toBeLessThan(10_000);
+  });
+
+  it.runIf(process.platform === 'linux')('still escalates the process group when the leader exits before its TERM-ignoring descendant', async () => {
+    let pgid: number | undefined;
+    const lines: string[] = [];
+    try {
+      const r = await spawnUpgradeCommand([
+        '/bin/sh', '-c', `trap 'exit 0' TERM; (trap '' TERM; exec sleep 30) & echo $!; wait`,
+      ], {
+        timeoutMs: 100,
+        killGraceMs: 500,
+        env: { PATH: '/usr/bin:/bin' },
+        onLine: line => lines.push(line),
+        onSpawn: pid => { pgid = pid; },
+      });
+      expect(r.timedOut).toBe(true);
+      const descendant = Number(lines.find(line => /^\d+$/.test(line)));
+      expect(descendant).toBeGreaterThan(0);
+      expect(() => process.kill(descendant, 0)).not.toThrow(); // leader settled; descendant survived TERM
+      await vi.waitFor(() => {
+        let groupAlive = true;
+        try { process.kill(-pgid!, 0); } catch { groupAlive = false; }
+        expect(groupAlive).toBe(false);
+      }, { timeout: 3_000, interval: 25 });
+    } finally {
+      if (pgid !== undefined) {
+        try { process.kill(-pgid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
+  });
+
+  it.runIf(process.platform === 'linux')('cancels the delayed KILL once TERM has already emptied the original process group', async () => {
+    let pgid: number | undefined;
+    const killSpy = vi.spyOn(process, 'kill');
+    try {
+      const r = await spawnUpgradeCommand(['/bin/sleep', '30'], {
+        timeoutMs: 50,
+        killGraceMs: 50,
+        env: { PATH: '/usr/bin:/bin' },
+        onLine: () => {},
+        onSpawn: pid => { pgid = pid; },
+      });
+      expect(r.timedOut).toBe(true);
+      await new Promise(resolve => setTimeout(resolve, 200));
+      const escalationSignals = killSpy.mock.calls
+        .filter(([pid, signal]) => pid === -pgid! && (signal === 'SIGTERM' || signal === 'SIGKILL'))
+        .map(([, signal]) => signal);
+      expect(escalationSignals).toEqual(['SIGTERM']);
+    } finally {
+      killSpy.mockRestore();
+      if (pgid !== undefined) {
+        try { process.kill(-pgid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    }
   });
 
   it('a missing executable is an error, not a hang', async () => {

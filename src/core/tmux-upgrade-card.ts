@@ -63,10 +63,10 @@ export interface TmuxUpgradeCardModel {
   client: string | null;
   /** Release of the running botmux tmux server; null = none running / unknown. */
   server: string | null;
+  /** Dedicated socket this card authorizes, or null for the shared default server. */
+  socketName: string | null;
   /** Sessions currently on the botmux tmux server. */
   serverSessions?: number;
-  /** The server is the shared default one (user's own sessions live there too). */
-  sharedServer?: boolean;
   plan?: TmuxUpgradePlanView;
   /** Last output lines of the running / finished installer. */
   log?: string[];
@@ -250,7 +250,7 @@ export function buildTmuxUpgradeCard(model: TmuxUpgradeCardModel, nonce: string,
       if (model.phase === 'switch_failed') lines.push(t('tmux_upgrade.switch_failed', { error: model.error ?? '?' }, locale));
       if (model.interruptedByRestart) lines.push(t('tmux_upgrade.interrupted_by_restart', undefined, locale));
       md(lines.join('\n'));
-      if (model.sharedServer) {
+      if (model.socketName === null) {
         md(t('tmux_upgrade.shared_server', undefined, locale));
         break;
       }

@@ -36877,6 +36877,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       retireEmptyServer: retireEmptyTmuxServer,
       sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
       processStart: readProcessStartIdentity,
+      signalInstaller: (pid, signal) => {
+        try { process.kill(-pid, signal); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      },
       log: (m) => logger.info(`[tmux-upgrade] ${m}`),
     });
     // After an intentional restart, DM the owner a summary. Delayed a few

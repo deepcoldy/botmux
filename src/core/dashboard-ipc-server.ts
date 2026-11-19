@@ -3503,6 +3503,12 @@ ipcRoute('POST', '/api/tmux-upgrade/suspend-idle', async (req, res) => {
   if (request.dryRun) return jsonRes(res, 200, { ok: true, candidates: candidates.length, affected: 0 });
   if (candidates.length === 0) return jsonRes(res, 200, { ok: true, candidates: 0, affected: 0 });
   const runtimeAppIds = new Set([...registry.values()].map(ds => ds.larkAppId).filter(Boolean));
+  // The turn-mutation gate is per app. Never drain one bot while acting on a
+  // mixed/transferred registry: fail closed exactly like the maintenance sweep.
+  if (runtimeAppIds.size > 1
+    || (cachedLarkAppId && runtimeAppIds.size === 1 && !runtimeAppIds.has(cachedLarkAppId))) {
+    return jsonRes(res, 409, { ok: false, error: 'ambiguous_daemon_scope' });
+  }
   const larkAppId = cachedLarkAppId || (runtimeAppIds.size === 1 ? [...runtimeAppIds][0] : undefined);
   if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'daemon_scope_unavailable' });
   const selected = new Set(candidates.map(c => c.sessionId));

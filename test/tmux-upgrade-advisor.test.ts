@@ -6,11 +6,15 @@ import {
   TMUX_CARD_PATCH_GIVE_UP,
   TMUX_IDLE_SWITCH_MS,
   TMUX_NOTIFY_RETRY_MS,
+  TMUX_REMOTE_INSTALLER_TIMEOUT_MS,
+  TMUX_REMOTE_INSTALLER_TERM_GRACE_MS,
   TmuxUpgradeAdvisor,
   deriveTmuxFactPhase,
   fanOutTmuxSwitchSuspend,
   formatTmuxStatusAdvice,
   isNoTmuxServerError,
+  killTmuxServer,
+  retireEmptyTmuxServer,
   readTmuxUpgradeStoreFrom,
   tmuxUpgradeStorePathIn,
   writeTmuxUpgradeStoreTo,
@@ -89,6 +93,7 @@ function harness(over: Partial<TmuxUpgradeAdvisorDeps> = {}, initial?: Partial<T
     }),
     sleep: vi.fn(async (ms: number) => { state.now += ms; }),
     processStart: pid => (pid === process.pid ? 'self-start' : undefined),
+    signalInstaller: vi.fn(),
     log: m => state.log.push(m),
     newNonce: () => `nonce-${++state.nonce}`,
     progressPatchMs: 0,
@@ -322,6 +327,26 @@ describe('one-click upgrade (fake installer)', () => {
     expect(await h.click(TMUX_UPGRADE_ACTION_RUN)).toHaveProperty('card');
   });
 
+  it('does not hide an installer failure just because the new binary is already visible', async () => {
+    const h = harness({
+      executeUpgrade: vi.fn(async () => {
+        h.state.facts = { ...h.state.facts, client: NEW };
+        return { ok: false, ran: ['apt-get install'], failure: 'command_failed' as const, error: 'dpkg post-install failed' };
+      }),
+    });
+    await h.advisor.tick();
+    const res: any = await h.click(TMUX_UPGRADE_ACTION_RUN);
+    await res.afterAck();
+    expect(h.store().card!.model).toMatchObject({ phase: 'upgrade_failed', client: NEW, error: expect.stringContaining('dpkg post-install failed') });
+    expect(h.state.log.some(line => line.includes('tmux upgraded to'))).toBe(false);
+    await h.advisor.tick();
+    expect(h.store().card!.model).toMatchObject({ phase: 'upgrade_failed', error: expect.stringContaining('dpkg post-install failed') });
+    const retry: any = await h.click(TMUX_UPGRADE_ACTION_RUN);
+    await retry.afterAck();
+    expect(h.store().card!.model.phase).toBe('pending_switch');
+    expect(h.deps.executeUpgrade).toHaveBeenCalledTimes(1);
+  });
+
   it('command succeeded but tmux is still old → failed, not success', async () => {
     const h = harness({
       executeUpgrade: vi.fn(async () => ({ ok: true, ran: ['dnf upgrade -y tmux'] })),
@@ -382,6 +407,53 @@ describe('switching the tmux server', () => {
     expect(h.store().card!.model.phase).toBe('pending_switch');
     return h;
   }
+
+  it('refreshes an open switch card when only the server session count changes', async () => {
+    const h = await pendingSwitch({}, { sessions: 1 });
+    h.state.facts = { ...h.state.facts, sessions: 5 };
+    await h.advisor.tick();
+    expect(h.state.patches).toHaveLength(1);
+    expect(h.store().card!.model).toMatchObject({ phase: 'pending_switch', serverSessions: 5 });
+  });
+
+  it('"now" revalidates the confirmation at click time instead of trusting a stale card', async () => {
+    const h = await pendingSwitch({}, { sessions: 1 });
+    h.state.facts = { ...h.state.facts, sessions: 5 };
+    const res: any = await h.click(TMUX_UPGRADE_ACTION_SWITCH_NOW);
+    expect(res.afterAck).toBeUndefined();
+    expect(h.store().job).toBeUndefined();
+    expect(h.store().card!.model).toMatchObject({ phase: 'pending_switch', serverSessions: 5 });
+    expect(h.deps.fanOutSuspend).not.toHaveBeenCalled();
+    expect(h.deps.killServer).not.toHaveBeenCalled();
+    const nowButton = res.card.data.elements
+      .filter((element: any) => element.tag === 'action')
+      .flatMap((element: any) => element.actions)
+      .find((action: any) => action.value.action === TMUX_UPGRADE_ACTION_SWITCH_NOW);
+    expect(nowButton.confirm.text.content).toContain('5');
+  });
+
+  it('an older in-flight tick cannot overwrite a fresher click confirmation', async () => {
+    const h = await pendingSwitch({}, { sessions: 1 });
+    let releaseStale: (() => void) | undefined;
+    h.deps.probeFacts = vi.fn(() => {
+      if (!releaseStale) {
+        return new Promise<TmuxFacts>(resolve => {
+          releaseStale = () => resolve({ ...h.state.facts, sessions: 1 });
+        });
+      }
+      return Promise.resolve({ ...h.state.facts });
+    });
+    h.state.facts = { ...h.state.facts, sessions: 5 };
+    const ticking = h.advisor.tick();
+    await vi.waitFor(() => expect(releaseStale).toBeDefined());
+    const res: any = await h.click(TMUX_UPGRADE_ACTION_SWITCH_NOW);
+    expect(res.afterAck).toBeUndefined();
+    expect(h.store().card!.model.serverSessions).toBe(5);
+    releaseStale!();
+    await ticking;
+    expect(h.store().card!.model.serverSessions).toBe(5);
+    expect(h.store().job).toBeUndefined();
+  });
 
   it('"now": suspends idle sessions first, then stops the old server for the rest', async () => {
     const h = await pendingSwitch({
@@ -497,6 +569,92 @@ describe('switching the tmux server', () => {
     expect(await h.click(TMUX_UPGRADE_ACTION_SWITCH_NOW)).toHaveProperty('toast');
     expect(await h.click(TMUX_UPGRADE_ACTION_SWITCH_IDLE)).toHaveProperty('toast');
     expect(h.deps.killServer).not.toHaveBeenCalled();
+    expect(h.deps.fanOutSuspend).not.toHaveBeenCalled();
+  });
+
+  it('an idle switch and its card are invalidated when the dedicated socket changes', async () => {
+    let socket = 'sock-a';
+    const h = await pendingSwitch({ socketName: () => socket });
+    await h.click(TMUX_UPGRADE_ACTION_SWITCH_IDLE); // armed, but do not run afterAck
+    socket = 'sock-b';
+    expect(await h.click(TMUX_UPGRADE_ACTION_SWITCH_NOW)).toHaveProperty('toast.type', 'warning');
+    await new TmuxUpgradeAdvisor(h.deps).tick();
+    expect(h.store().idleSwitch).toBeUndefined();
+    expect(h.store().job).toBeUndefined();
+    expect(h.store().card).toMatchObject({ recipientOpenId: 'ou_owner', messageId: 'om_2', model: { socketName: 'sock-b' } });
+    expect(h.state.sent.map(s => s.openId)).toEqual(['ou_owner', 'ou_owner']);
+    expect(h.deps.fanOutSuspend).not.toHaveBeenCalled();
+    expect(h.deps.killServer).not.toHaveBeenCalled();
+  });
+
+  it('legacy cards and idle switches without scope fields fail closed', async () => {
+    const h = await pendingSwitch();
+    const s: any = h.store();
+    delete s.card.recipientOpenId;
+    delete s.card.model.socketName;
+    s.card.model.sharedServer = true;
+    s.notifiedKey = 'legacy-unscoped-watermark';
+    s.idleSwitch = { requestedAt: 1, requestedBy: 'ou_owner' };
+    writeTmuxUpgradeStoreTo(h.dataDir, s);
+    await new TmuxUpgradeAdvisor(h.deps).tick();
+    expect(h.store().idleSwitch).toBeUndefined();
+    expect(h.store().card).toMatchObject({ recipientOpenId: 'ou_owner', messageId: 'om_2', model: { socketName: 'botmux' } });
+    expect(h.deps.fanOutSuspend).not.toHaveBeenCalled();
+  });
+
+  it('owner replacement invalidates the old card and sends the new owner an actionable one', async () => {
+    let owner = 'ou_owner';
+    const h = harness({ ownerOpenId: () => owner, isAdmin: (_app, openId) => openId === owner });
+    await h.advisor.tick();
+    const old = h.store().card!;
+    owner = 'ou_new_owner';
+    expect(await h.click(TMUX_UPGRADE_ACTION_RUN, {
+      operator: owner, messageId: old.messageId, nonce: old.nonce,
+    })).toHaveProperty('toast.type', 'warning');
+    await new TmuxUpgradeAdvisor(h.deps).tick();
+    expect(h.state.sent.map(s => s.openId)).toEqual(['ou_owner', 'ou_new_owner']);
+    expect(h.store().card).toMatchObject({ recipientOpenId: 'ou_new_owner', messageId: 'om_2' });
+    expect(h.state.patches).toHaveLength(0);
+  });
+
+  it('a new owner does not inherit the previous owner\'s failed-DM backoff', async () => {
+    let owner = 'ou_owner';
+    const h = harness({
+      ownerOpenId: () => owner,
+      sendCard: vi.fn(async (openId: string, card: string) => {
+        if (openId === 'ou_owner') throw new Error('old owner cannot be DMd');
+        h.state.sent.push({ openId, card: JSON.parse(card) });
+        return 'om_new_owner';
+      }),
+    });
+    await h.advisor.tick();
+    expect(h.store().notifyFailedAt).toBeDefined();
+    owner = 'ou_new_owner';
+    await new TmuxUpgradeAdvisor(h.deps).tick();
+    expect(h.state.sent.map(s => s.openId)).toEqual(['ou_new_owner']);
+    expect(h.store().card).toMatchObject({ recipientOpenId: 'ou_new_owner', messageId: 'om_new_owner' });
+    expect(h.store().notifyFailedAt).toBeUndefined();
+  });
+
+  it('a different primary app does not inherit the previous app\'s failed-DM backoff', async () => {
+    const h = harness({ sendCard: vi.fn(async () => { throw new Error('app A DM failed'); }) });
+    await h.advisor.tick();
+    expect(h.store().notifyFailedAt).toBeDefined();
+    const sendB = vi.fn(async () => 'om_app_b');
+    const appB = new TmuxUpgradeAdvisor({ ...h.deps, larkAppId: 'cli_b', sendCard: sendB });
+    await appB.tick();
+    expect(sendB).toHaveBeenCalledTimes(1);
+    expect(h.store().card).toMatchObject({ larkAppId: 'cli_b', recipientOpenId: 'ou_owner', messageId: 'om_app_b' });
+  });
+
+  it('owner replacement also drops an idle switch armed by the previous owner', async () => {
+    let owner = 'ou_owner';
+    const h = await pendingSwitch({ ownerOpenId: () => owner, isAdmin: (_app, openId) => openId === owner });
+    await h.click(TMUX_UPGRADE_ACTION_SWITCH_IDLE);
+    owner = 'ou_new_owner';
+    await new TmuxUpgradeAdvisor(h.deps).tick();
+    expect(h.store().idleSwitch).toBeUndefined();
+    expect(h.store().card).toMatchObject({ recipientOpenId: 'ou_new_owner', messageId: 'om_2' });
     expect(h.deps.fanOutSuspend).not.toHaveBeenCalled();
   });
 
@@ -618,6 +776,31 @@ describe('adversarial-review regressions', () => {
     expect(h.deps.killServer).not.toHaveBeenCalled();
   });
 
+  it('arming idle during an active tick gets a fresh evaluation in the same tick loop', async () => {
+    const h = await pending({}, { sessions: 1 });
+    let releaseProbe: (() => void) | undefined;
+    h.deps.probeFacts = vi.fn(() => {
+      if (!releaseProbe) {
+        return new Promise<TmuxFacts>(resolve => {
+          releaseProbe = () => resolve({ ...h.state.facts });
+        });
+      }
+      return Promise.resolve({ ...h.state.facts });
+    });
+    h.deps.fanOutSuspend = vi.fn(async request => {
+      if (!request.dryRun) h.state.facts = { ...h.state.facts, serverRunning: false, server: null, sessions: 0 };
+      return { candidates: 1, affected: request.dryRun ? 0 : 1, failed: 0 };
+    });
+    const ticking = h.advisor.tick();
+    await vi.waitFor(() => expect(releaseProbe).toBeDefined());
+    const armed: any = await h.click(TMUX_UPGRADE_ACTION_SWITCH_IDLE);
+    const evaluated = armed.afterAck();
+    releaseProbe!();
+    await Promise.all([ticking, evaluated]);
+    expect((h.deps.fanOutSuspend as any).mock.calls.map((c: any[]) => c[0].dryRun)).toEqual([true, false]);
+    await vi.waitFor(() => expect(h.store().card!.model.phase).toBe('done'));
+  });
+
   it('cancel during a slow dry run is answered at once and the switch does not happen', async () => {
     let releaseDry: (v: any) => void = () => {};
     const h = await pending();
@@ -642,7 +825,7 @@ describe('adversarial-review regressions', () => {
     writeTmuxUpgradeStoreTo(h.dataDir, {
       ...s,
       card: { ...s.card!, larkAppId: 'cli_previous_primary', model: { ...s.card!.model, phase: 'awaiting_idle' } },
-      idleSwitch: { requestedAt: 1, requestedBy: 'ou_previous_owner' },
+      idleSwitch: { requestedAt: 1, requestedBy: 'ou_previous_owner', socketName: 'botmux' },
     });
     await new TmuxUpgradeAdvisor(h.deps).tick();
     expect(h.deps.fanOutSuspend).not.toHaveBeenCalled();
@@ -760,7 +943,7 @@ describe('adversarial-review regressions', () => {
     writeTmuxUpgradeStoreTo(h.dataDir, {
       ...s,
       card: { ...s.card!, model: { ...s.card!.model, phase: 'upgrading' } },
-      job: { kind: 'upgrade', pid: 2_147_000_001, startedAt: 1, installerPid: 777, installerStart: 'apt-start' },
+      job: { kind: 'upgrade', pid: 2_147_000_001, startedAt: h.state.now, installerPid: 777, installerStart: 'apt-start' },
     });
     const restarted = new TmuxUpgradeAdvisor(h.deps);
     await restarted.tick();
@@ -773,6 +956,124 @@ describe('adversarial-review regressions', () => {
     expect(h.store().job).toBeUndefined();
     expect(h.store().card!.model.phase).toBe('pending_switch');
     expect(h.state.sent).toHaveLength(1);
+  });
+
+  it('re-arms a bounded TERM/KILL recovery for an installer that outlives its daemon deadline', async () => {
+    let installerAlive = true;
+    const signalInstaller = vi.fn();
+    const h = harness({
+      processStart: pid => (pid === process.pid ? 'self-start' : pid === 777 && installerAlive ? 'apt-start' : undefined),
+      signalInstaller,
+    });
+    await h.advisor.tick();
+    const s = h.store();
+    writeTmuxUpgradeStoreTo(h.dataDir, {
+      ...s,
+      card: { ...s.card!, model: { ...s.card!.model, phase: 'upgrading' } },
+      job: {
+        kind: 'upgrade', pid: 2_147_000_001,
+        startedAt: h.state.now - TMUX_REMOTE_INSTALLER_TIMEOUT_MS,
+        installerPid: 777, installerStart: 'apt-start',
+      },
+    });
+    const restarted = new TmuxUpgradeAdvisor(h.deps);
+    await restarted.tick();
+    expect(signalInstaller).toHaveBeenCalledWith(777, 'SIGTERM');
+    expect(h.store().job).toMatchObject({ installerPid: 777, timeoutRequestedAt: h.state.now });
+
+    await restarted.tick();
+    expect(signalInstaller).toHaveBeenCalledTimes(1); // still inside the TERM grace
+    h.state.now += TMUX_REMOTE_INSTALLER_TERM_GRACE_MS;
+    await restarted.tick();
+    expect(signalInstaller).toHaveBeenCalledWith(777, 'SIGKILL');
+    expect(h.store().job).toBeDefined(); // never released while the installer is alive
+
+    installerAlive = false;
+    h.state.facts = { ...h.state.facts, client: NEW };
+    await restarted.tick();
+    expect(h.store().job).toBeUndefined();
+    expect(h.store().card!.model.phase).toBe('pending_switch');
+  });
+
+  it('never signals a recycled installer PID just because the old daemon is still alive', async () => {
+    const signalInstaller = vi.fn();
+    const h = harness({
+      processStart: pid => pid === process.pid ? 'self-start'
+        : pid === 4242 ? 'daemon-start'
+          : pid === 777 ? 'recycled-unrelated-process' : undefined,
+      signalInstaller,
+    });
+    await h.advisor.tick();
+    const s = h.store();
+    writeTmuxUpgradeStoreTo(h.dataDir, {
+      ...s,
+      card: { ...s.card!, model: { ...s.card!.model, phase: 'upgrading' } },
+      job: {
+        kind: 'upgrade', pid: 4242, pidStart: 'daemon-start',
+        startedAt: h.state.now - TMUX_REMOTE_INSTALLER_TIMEOUT_MS,
+        installerPid: 777, installerStart: 'original-installer-start',
+      },
+    });
+    await new TmuxUpgradeAdvisor(h.deps).tick();
+    expect(signalInstaller).not.toHaveBeenCalled();
+    expect(h.store().job?.installerPid).toBe(777);
+    expect(h.store().job?.timeoutRequestedAt).toBeUndefined();
+  });
+
+  it('sends KILL once, then surfaces manual recovery without releasing the live job', async () => {
+    const signalInstaller = vi.fn();
+    const h = harness({
+      processStart: pid => pid === process.pid ? 'self-start' : pid === 777 ? 'apt-start' : undefined,
+      signalInstaller,
+    });
+    await h.advisor.tick();
+    const s = h.store();
+    writeTmuxUpgradeStoreTo(h.dataDir, {
+      ...s,
+      card: { ...s.card!, model: { ...s.card!.model, phase: 'upgrading' } },
+      job: {
+        kind: 'upgrade', pid: 2_147_000_001,
+        startedAt: h.state.now - TMUX_REMOTE_INSTALLER_TIMEOUT_MS,
+        installerPid: 777, installerStart: 'apt-start',
+      },
+    });
+    const restarted = new TmuxUpgradeAdvisor(h.deps);
+    await restarted.tick(); // TERM
+    h.state.now += TMUX_REMOTE_INSTALLER_TERM_GRACE_MS;
+    await restarted.tick(); // one KILL
+    h.state.now += TMUX_REMOTE_INSTALLER_TERM_GRACE_MS;
+    await restarted.tick(); // terminal/manual state
+    h.state.now += 2 * TMUX_REMOTE_INSTALLER_TERM_GRACE_MS;
+    await restarted.tick();
+    expect(signalInstaller.mock.calls.map(call => call[1])).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(h.store().job).toMatchObject({ installerPid: 777, recoveryFailedAt: expect.any(Number) });
+    expect(h.store().card!.model).toMatchObject({ phase: 'upgrade_failed', error: expect.stringContaining('777') });
+    const click: any = await h.click(TMUX_UPGRADE_ACTION_RUN);
+    expect(click.toast.content).toContain('777');
+    expect(h.store().job).toBeDefined();
+  });
+
+  it('treats a zombie installer as gone instead of signaling or blocking forever', async () => {
+    const signalInstaller = vi.fn();
+    const h = harness({
+      processStart: pid => pid === process.pid ? 'self-start' : pid === 777 ? 'apt-start' : undefined,
+      processZombie: pid => pid === 777,
+      signalInstaller,
+    });
+    await h.advisor.tick();
+    const s = h.store();
+    writeTmuxUpgradeStoreTo(h.dataDir, {
+      ...s,
+      card: { ...s.card!, model: { ...s.card!.model, phase: 'upgrading' } },
+      job: {
+        kind: 'upgrade', pid: 2_147_000_001,
+        startedAt: h.state.now - TMUX_REMOTE_INSTALLER_TIMEOUT_MS,
+        installerPid: 777, installerStart: 'apt-start',
+      },
+    });
+    await new TmuxUpgradeAdvisor(h.deps).tick();
+    expect(signalInstaller).not.toHaveBeenCalled();
+    expect(h.store().job).toBeUndefined();
   });
 
   it('the installer pid is recorded on the job while it runs', async () => {
@@ -847,6 +1148,20 @@ describe('adversarial-review regressions', () => {
 });
 
 describe('production fan-out and probes', () => {
+  it('zero discovered daemons is a failed fan-out, never an empty success', async () => {
+    const fetchIpc = vi.fn();
+    const result = await fanOutTmuxSwitchSuspend({ socketName: 'botmux', olderThanMs: 1, dryRun: true }, {
+      listDaemons: () => [], fetchIpc,
+    });
+    expect(result).toEqual({ candidates: 0, affected: 0, failed: 1 });
+    expect(fetchIpc).not.toHaveBeenCalled();
+  });
+
+  it('empty socket names are refused before any tmux server mutation', async () => {
+    await expect(killTmuxServer('')).rejects.toThrow();
+    await expect(retireEmptyTmuxServer('')).rejects.toThrow();
+  });
+
   it('a daemon that never answers counts as failed within the deadline; answers are summed', async () => {
     const started = Date.now();
     const result = await fanOutTmuxSwitchSuspend({ socketName: 'botmux', olderThanMs: 1, dryRun: true }, {

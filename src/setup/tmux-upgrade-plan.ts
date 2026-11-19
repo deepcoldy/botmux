@@ -298,6 +298,8 @@ export type UpgradeCommandRunner = (
   argv: string[],
   opts: {
     timeoutMs: number;
+    /** SIGTERM → SIGKILL grace for the detached process group. */
+    killGraceMs?: number;
     env: NodeJS.ProcessEnv;
     onLine: (line: string) => void;
     /** The installer process started (its pid leads its own process group). */
@@ -524,13 +526,43 @@ export const spawnUpgradeCommand: UpgradeCommandRunner = (argv, opts) => new Pro
   let settled = false;
   let timedOut = false;
   let killTimer: NodeJS.Timeout | undefined;
+  let groupWatch: NodeJS.Timeout | undefined;
+  let childPid: number | undefined;
+  const groupAlive = (): boolean => {
+    if (childPid === undefined) return false;
+    try { process.kill(-childPid, 0); return true; } catch { return false; }
+  };
+  const signalGroup = (sig: NodeJS.Signals) => {
+    try { if (childPid !== undefined) process.kill(-childPid, sig); } catch { /* already gone */ }
+  };
+  const stopGroupWatch = () => {
+    if (groupWatch) clearInterval(groupWatch);
+    groupWatch = undefined;
+  };
   const poll = setInterval(() => drain(false), 300);
   poll.unref?.();
   const finish = (r: UpgradeStepResult) => {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
-    if (killTimer) clearTimeout(killTimer);
+    // A leader exiting after TERM does not prove its descendants exited. Keep
+    // escalation only while the original group is actually non-empty, and stop
+    // it as soon as that group disappears so a later PGID reuse is not killed.
+    if (killTimer && groupAlive()) {
+      if (!groupWatch) {
+        groupWatch = setInterval(() => {
+          if (groupAlive()) return;
+          if (killTimer) clearTimeout(killTimer);
+          killTimer = undefined;
+          stopGroupWatch();
+        }, 50);
+        groupWatch.unref?.();
+      }
+    } else {
+      if (killTimer) clearTimeout(killTimer);
+      killTimer = undefined;
+      stopGroupWatch();
+    }
     clearInterval(poll);
     drain(true);
     try { closeSync(fd); } catch { /* already closed */ }
@@ -548,14 +580,16 @@ export const spawnUpgradeCommand: UpgradeCommandRunner = (argv, opts) => new Pro
     finish({ code: null, signal: null, timedOut: false, error: err instanceof Error ? err.message : String(err) });
     return;
   }
+  childPid = child.pid;
   if (child.pid !== undefined) opts.onSpawn?.(child.pid);
-  const signalGroup = (sig: NodeJS.Signals) => {
-    try { if (child.pid !== undefined) process.kill(-child.pid, sig); } catch { /* already gone */ }
-  };
   const timer = setTimeout(() => {
     timedOut = true;
     signalGroup('SIGTERM');
-    killTimer = setTimeout(() => signalGroup('SIGKILL'), 10_000);
+    killTimer = setTimeout(() => {
+      killTimer = undefined;
+      stopGroupWatch();
+      signalGroup('SIGKILL');
+    }, opts.killGraceMs ?? 10_000);
     killTimer.unref?.();
   }, opts.timeoutMs);
   timer.unref?.();

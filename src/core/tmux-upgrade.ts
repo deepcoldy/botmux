@@ -58,6 +58,7 @@ import {
 } from './tmux-upgrade-card.js';
 import type { TmuxSwitchSuspendRequest } from './tmux-switch-candidates.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
+import { isLinuxZombie } from '../utils/process-identity.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 
 export const TMUX_UPGRADE_INITIAL_DELAY_MS = 20_000;
@@ -67,6 +68,10 @@ export const TMUX_IDLE_SWITCH_MS = TMUX_IDLE_SWITCH_MINUTES * 60_000;
 export const TMUX_SERVER_EXIT_WAIT_MS = 20_000;
 /** Minimum spacing between two progress patches of the same card. */
 export const TMUX_PROGRESS_PATCH_MS = 2_000;
+/** Total budget for an installer resumed after a daemon restart (apt update +
+ * install plus process/probe slack). The live spawn has its own per-step timers. */
+export const TMUX_REMOTE_INSTALLER_TIMEOUT_MS = 15 * 60_000;
+export const TMUX_REMOTE_INSTALLER_TERM_GRACE_MS = 10_000;
 
 // ─── Facts ──────────────────────────────────────────────────────────────────
 
@@ -97,17 +102,29 @@ export function deriveTmuxFactPhase(
   return 'done';
 }
 
-/** One DM per distinct situation; a new installed or running version re-arms it. */
-export function tmuxNoticeKey(phase: TmuxFactPhase, facts: TmuxFacts, min: string): string {
-  return phase === 'pending_switch'
+export interface TmuxNoticeScope {
+  /** The app that owns both the card and its app-scoped recipient. */
+  larkAppId: string;
+  /** App-scoped owner of the DM. Never carried to another larkAppId. */
+  recipientOpenId: string | undefined;
+  /** Dedicated target; undefined = the shared default server. */
+  socketName: string | undefined;
+}
+
+/** One DM per distinct situation and authorization scope. */
+export function tmuxNoticeKey(phase: TmuxFactPhase, facts: TmuxFacts, min: string, scope: TmuxNoticeScope): string {
+  const situation = phase === 'pending_switch'
     ? `pending_switch|client=${facts.client}|server=${facts.server}|min=${min}`
     : `${phase}|client=${facts.client}|min=${min}`;
+  return `${situation}|app=${scope.larkAppId}|owner=${scope.recipientOpenId ?? ''}|socket=${scope.socketName ?? 'default'}`;
 }
 
 // ─── Store ──────────────────────────────────────────────────────────────────
 
 export interface TmuxUpgradeCardRef {
   larkAppId: string;
+  /** The app-scoped owner this DM was sent to. */
+  recipientOpenId: string;
   messageId: string;
   nonce: string;
   model: TmuxUpgradeCardModel;
@@ -127,6 +144,12 @@ export interface TmuxUpgradeJobRef {
   /** Process start identity, so a recycled pid is not mistaken for the owner. */
   pidStart?: string;
   startedAt: number;
+  /** First TERM request for a remote installer that outlived its deadline. */
+  timeoutRequestedAt?: number;
+  /** The one and only KILL escalation for this persisted job. */
+  killRequestedAt?: number;
+  /** KILL did not make the installer disappear within the grace window. */
+  recoveryFailedAt?: number;
   /** The package manager process (own process group). It outlives a daemon
    *  restart on purpose, and while it runs the job is still in progress. */
   installerPid?: number;
@@ -137,12 +160,14 @@ export interface TmuxUpgradeStore {
   /** Situation the owner was last told about (see tmuxNoticeKey). */
   notifiedKey?: string;
   card?: TmuxUpgradeCardRef;
-  /** The owner armed "switch when idle". */
-  idleSwitch?: { requestedAt: number; requestedBy: string };
+  /** The owner armed "switch when idle" on this exact dedicated socket. */
+  idleSwitch?: { requestedAt: number; requestedBy: string; socketName: string };
   /** In-flight upgrade / switch. Cleared when it ends. */
   job?: TmuxUpgradeJobRef;
-  /** Last failed attempt to send a NEW DM (backs off retries). */
+  /** Last failed attempt to send a NEW DM (backs off retries for the same scope). */
   notifyFailedAt?: number;
+  /** Situation + owner + socket whose NEW DM failed. */
+  notifyFailedKey?: string;
 }
 
 /** After a failed DM send, wait this long before trying again. */
@@ -178,10 +203,12 @@ export function readTmuxUpgradeStoreFrom(dataDir: string): TmuxUpgradeStore {
   const out: TmuxUpgradeStore = {};
   if (str(raw.notifiedKey)) out.notifiedKey = raw.notifiedKey;
   const c = raw.card;
-  if (c && typeof c === 'object' && str(c.larkAppId) && str(c.messageId) && str(c.nonce)
-    && c.model && typeof c.model === 'object' && PHASES.has(c.model.phase)) {
+  if (c && typeof c === 'object' && str(c.larkAppId) && str(c.recipientOpenId) && str(c.messageId) && str(c.nonce)
+    && c.model && typeof c.model === 'object' && PHASES.has(c.model.phase)
+    && (typeof c.model.socketName === 'string' || c.model.socketName === null)) {
     out.card = {
       larkAppId: c.larkAppId,
+      recipientOpenId: c.recipientOpenId,
       messageId: c.messageId,
       nonce: c.nonce,
       model: c.model as TmuxUpgradeCardModel,
@@ -191,9 +218,15 @@ export function readTmuxUpgradeStoreFrom(dataDir: string): TmuxUpgradeStore {
     };
   }
   if (num(raw.notifyFailedAt) !== undefined) out.notifyFailedAt = raw.notifyFailedAt;
+  if (str(raw.notifyFailedKey)) out.notifyFailedKey = raw.notifyFailedKey;
   const idle = raw.idleSwitch;
-  if (idle && typeof idle === 'object' && num(idle.requestedAt) !== undefined && str(idle.requestedBy)) {
-    out.idleSwitch = { requestedAt: idle.requestedAt, requestedBy: idle.requestedBy };
+  if (idle && typeof idle === 'object' && num(idle.requestedAt) !== undefined && str(idle.requestedBy) && str(idle.socketName)) {
+    out.idleSwitch = { requestedAt: idle.requestedAt, requestedBy: idle.requestedBy, socketName: idle.socketName };
+  }
+  // An armed operation is valid only together with its exact persisted card.
+  // Missing legacy fields therefore fail closed rather than inheriting consent.
+  if (out.idleSwitch && (!out.card || out.card.model.socketName !== out.idleSwitch.socketName)) {
+    delete out.idleSwitch;
   }
   const job = raw.job;
   if (job && typeof job === 'object' && (job.kind === 'upgrade' || job.kind === 'switch')
@@ -203,6 +236,9 @@ export function readTmuxUpgradeStoreFrom(dataDir: string): TmuxUpgradeStore {
       pid: job.pid,
       startedAt: job.startedAt,
       ...(str(job.pidStart) ? { pidStart: job.pidStart } : {}),
+      ...(num(job.timeoutRequestedAt) !== undefined ? { timeoutRequestedAt: job.timeoutRequestedAt } : {}),
+      ...(num(job.killRequestedAt) !== undefined ? { killRequestedAt: job.killRequestedAt } : {}),
+      ...(num(job.recoveryFailedAt) !== undefined ? { recoveryFailedAt: job.recoveryFailedAt } : {}),
       ...(num(job.installerPid) !== undefined ? { installerPid: job.installerPid } : {}),
       ...(str(job.installerStart) ? { installerStart: job.installerStart } : {}),
     };
@@ -263,6 +299,10 @@ export interface TmuxUpgradeAdvisorDeps {
   sleep: (ms: number) => Promise<void>;
   /** Process start identity of `pid` (undefined = gone). */
   processStart: (pid: number) => string | undefined;
+  /** Test seam for zombies; production uses /proc on Linux, false elsewhere. */
+  processZombie?: (pid: number) => boolean;
+  /** Signal the detached installer process group, never the daemon's group. */
+  signalInstaller: (pid: number, signal: 'SIGTERM' | 'SIGKILL') => void;
   log: (message: string) => void;
   newNonce?: () => string;
   recommendation?: TmuxRecommendation;
@@ -319,7 +359,12 @@ function cleanLogLine(line: string): string {
 export class TmuxUpgradeAdvisor {
   private queue: Promise<unknown> = Promise.resolve();
   private jobRunning = false;
-  private ticking = false;
+  /** Coalesce periodic ticks, but guarantee one fresh run after an action that
+   * arrived while an older tick was doing slow I/O. */
+  private tickLoop: Promise<void> | undefined;
+  private tickRequested = false;
+  /** Incremented by an accepted card action while a tick is doing slow I/O. */
+  private actionGeneration = 0;
   private readonly rec: TmuxRecommendation;
 
   constructor(private readonly deps: TmuxUpgradeAdvisorDeps) {
@@ -349,8 +394,8 @@ export class TmuxUpgradeAdvisor {
       why: this.rec.why[locale] ?? this.rec.why.zh,
       client: facts?.client ?? null,
       server: facts?.server ?? null,
+      socketName: this.deps.socketName() ?? null,
       ...(facts && !facts.serverUnknown ? { serverSessions: facts.sessions } : {}),
-      ...(this.deps.socketName() === undefined ? { sharedServer: true } : {}),
     };
   }
 
@@ -359,7 +404,7 @@ export class TmuxUpgradeAdvisor {
   }
 
   private alive(pid: number | undefined, start: string | undefined): boolean {
-    if (pid === undefined) return false;
+    if (pid === undefined || (this.deps.processZombie ?? isLinuxZombie)(pid)) return false;
     const now = this.deps.processStart(pid);
     return now !== undefined && (start === undefined || now === start);
   }
@@ -374,7 +419,70 @@ export class TmuxUpgradeAdvisor {
   }
 
   private ownCard(store: TmuxUpgradeStore): TmuxUpgradeCardRef | undefined {
-    return store.card && store.card.larkAppId === this.deps.larkAppId ? store.card : undefined;
+    const card = store.card;
+    return card
+      && card.larkAppId === this.deps.larkAppId
+      && card.recipientOpenId === this.deps.ownerOpenId()
+      && card.model.socketName === (this.deps.socketName() ?? null)
+      ? card
+      : undefined;
+  }
+
+  private noticeKey(phase: TmuxFactPhase, facts: TmuxFacts): string {
+    return tmuxNoticeKey(phase, facts, this.rec.version, {
+      larkAppId: this.deps.larkAppId,
+      recipientOpenId: this.deps.ownerOpenId(),
+      socketName: this.deps.socketName(),
+    });
+  }
+
+  /** Re-arm a bounded lifetime for an installer whose original daemon (and
+   * therefore whose spawn timer) is gone. Never clear a live job: the process
+   * must actually disappear before the normal stale-job path can release it. */
+  private recoverRemoteInstaller(store: TmuxUpgradeStore): TmuxUpgradeStore {
+    const job = store.job;
+    const installerPid = job?.installerPid;
+    if (!job || job.kind !== 'upgrade' || this.jobRunning || !installerPid || installerPid <= 1
+      || !job.installerStart || installerPid === process.pid) return store;
+    const installerAlive = () => this.alive(installerPid, job.installerStart);
+    // The daemon's liveness proves nothing about the installer. In particular,
+    // a live old daemon PID must never let a recycled installer PGID be killed.
+    if (!installerAlive()) return store;
+    const now = this.deps.now();
+    if (now - job.startedAt < TMUX_REMOTE_INSTALLER_TIMEOUT_MS || job.recoveryFailedAt !== undefined) return store;
+    if (job.killRequestedAt !== undefined) {
+      if (now - job.killRequestedAt < TMUX_REMOTE_INSTALLER_TERM_GRACE_MS) return store;
+      const next = { ...store, job: { ...job, recoveryFailedAt: now } };
+      this.write(next);
+      this.deps.log(`remote installer ${installerPid} survived TERM and KILL; manual recovery required`);
+      return next;
+    }
+    if (job.timeoutRequestedAt !== undefined && now - job.timeoutRequestedAt < TMUX_REMOTE_INSTALLER_TERM_GRACE_MS) {
+      return store;
+    }
+    const signal = job.timeoutRequestedAt === undefined ? 'SIGTERM' : 'SIGKILL';
+    // Re-check immediately before every signal; never signal a recycled PID.
+    if (!installerAlive()) return store;
+    this.deps.signalInstaller(installerPid, signal);
+    const next = signal === 'SIGTERM'
+      ? { ...store, job: { ...job, timeoutRequestedAt: now } }
+      : { ...store, job: { ...job, killRequestedAt: now } };
+    this.write(next);
+    this.deps.log(`remote installer ${installerPid} exceeded its recovery deadline; sent ${signal}`);
+    return next;
+  }
+
+  private async showRecoveryFailure(store: TmuxUpgradeStore): Promise<void> {
+    const job = store.job;
+    if (!job?.recoveryFailedAt || !job.installerPid) return;
+    const locale = this.deps.locale();
+    const error = t('tmux_upgrade.error.recovery_failed', { pid: String(job.installerPid) }, locale);
+    const card = this.ownCard(store);
+    if (card?.model.phase === 'upgrade_failed' && card.model.error === error) return;
+    const model: TmuxUpgradeCardModel = card
+      ? { ...card.model, phase: 'upgrade_failed', error, startedAt: undefined, now: undefined }
+      : { ...this.baseModel(undefined, 'upgrade_failed', locale), error };
+    await this.show(store, model);
   }
 
   /** Fan out with a hard deadline: a daemon that never answers must not wedge
@@ -400,7 +508,7 @@ export class TmuxUpgradeAdvisor {
    * TMUX_CARD_PATCH_GIVE_UP times in a row. A failed patch keeps the model
    * marked `dirty` so the next tick retries it. A failed SEND throws.
    */
-  private async deliver(store: TmuxUpgradeStore, model: TmuxUpgradeCardModel): Promise<TmuxUpgradeCardRef> {
+  private async deliver(store: TmuxUpgradeStore, model: TmuxUpgradeCardModel, notificationKey: string | undefined): Promise<TmuxUpgradeCardRef> {
     const existing = this.ownCard(store);
     if (existing) {
       const attempt = async (m: TmuxUpgradeCardModel) => {
@@ -425,29 +533,36 @@ export class TmuxUpgradeAdvisor {
         this.deps.log('card can no longer be patched; sending a fresh one');
       }
     }
-    if (store.notifyFailedAt !== undefined && this.deps.now() - store.notifyFailedAt < TMUX_NOTIFY_RETRY_MS) {
+    if (store.notifyFailedAt !== undefined && this.deps.now() - store.notifyFailedAt < TMUX_NOTIFY_RETRY_MS
+      && (store.notifyFailedKey ?? store.notifiedKey) === notificationKey) {
       throw new TmuxNotifyBackoffError();
     }
     const owner = this.deps.ownerOpenId();
     if (!owner) throw new Error('no primary owner configured');
     const nonce = this.deps.newNonce?.() ?? randomBytes(9).toString('base64url');
     const messageId = await this.deps.sendCard(owner, this.render(model, nonce));
-    return { larkAppId: this.deps.larkAppId, messageId, nonce, model, updatedAt: this.deps.now() };
+    return { larkAppId: this.deps.larkAppId, recipientOpenId: owner, messageId, nonce, model, updatedAt: this.deps.now() };
   }
 
   /** Deliver `model` and persist it (plus `patch`) in one write. */
   private async show(store: TmuxUpgradeStore, model: TmuxUpgradeCardModel, patch: Partial<TmuxUpgradeStore> = {}): Promise<TmuxUpgradeStore> {
+    const notificationKey = patch.notifiedKey ?? store.notifiedKey;
     let card: TmuxUpgradeCardRef;
     try {
-      card = await this.deliver(store, model);
+      card = await this.deliver(store, model, notificationKey);
     } catch (err) {
       // Only a failed NEW send gets here (patch failures come back dirty).
       // Back off so a host whose owner cannot be DM'd is not retried every tick.
-      if (!(err instanceof TmuxNotifyBackoffError)) this.write({ ...store, notifyFailedAt: this.deps.now() });
+      if (!(err instanceof TmuxNotifyBackoffError)) {
+        this.write({ ...store, notifyFailedAt: this.deps.now(), notifyFailedKey: notificationKey });
+      }
       throw err;
     }
     const next: TmuxUpgradeStore = { ...store, ...patch, card };
-    if (card.messageId !== store.card?.messageId) delete next.notifyFailedAt;
+    if (card.messageId !== store.card?.messageId) {
+      delete next.notifyFailedAt;
+      delete next.notifyFailedKey;
+    }
     this.write(next);
     return next;
   }
@@ -455,27 +570,48 @@ export class TmuxUpgradeAdvisor {
   // ── periodic check ────────────────────────────────────────────────────────
 
   tick(): Promise<void> {
-    if (this.ticking) return Promise.resolve();
-    this.ticking = true;
-    return this.tickInner()
-      .catch(err => { this.deps.log(`tick failed: ${err instanceof Error ? err.message : String(err)}`); })
-      .finally(() => { this.ticking = false; });
+    this.tickRequested = true;
+    if (this.tickLoop) return this.tickLoop;
+    this.tickLoop = (async () => {
+      try {
+        do {
+          this.tickRequested = false;
+          await this.tickInner()
+            .catch(err => { this.deps.log(`tick failed: ${err instanceof Error ? err.message : String(err)}`); });
+        } while (this.tickRequested);
+      } finally {
+        this.tickLoop = undefined;
+      }
+    })();
+    return this.tickLoop;
   }
 
   private async tickInner(): Promise<void> {
     if (!this.deps.tmuxBackendInUse()) return;
+    const actionGeneration = this.actionGeneration;
     // Slow, read-only work first, outside the serialized section.
     const pre = this.read();
-    if (this.jobRunning || (pre.job && this.jobAlive(pre.job))) return;
+    if (this.jobRunning) return;
+    if (pre.job && this.jobAlive(pre.job)) {
+      const recovered = this.recoverRemoteInstaller(pre);
+      if (recovered.job?.recoveryFailedAt) {
+        await this.serial(() => this.showRecoveryFailure(this.read()));
+      }
+      return;
+    }
     const socketName = this.deps.socketName();
     const facts = await this.deps.probeFacts(socketName);
     const phase = deriveTmuxFactPhase(facts, this.rec);
     let dry: TmuxFanOutResult | undefined;
-    if (phase === 'pending_switch' && pre.idleSwitch && socketName !== undefined
+    if (phase === 'pending_switch' && pre.idleSwitch?.socketName === socketName && socketName !== undefined
       && this.ownCard(pre) && facts.sessions > 0) {
       dry = await this.fanOut({ socketName, olderThanMs: TMUX_IDLE_SWITCH_MS, dryRun: true });
     }
-    await this.serial(() => this.tickApply(socketName, facts, phase, dry));
+    // A click may have produced newer facts while this tick was probing. Never
+    // overwrite that newer confirmation with this tick's now-stale snapshot.
+    await this.serial(async () => {
+      if (this.actionGeneration === actionGeneration) await this.tickApply(socketName, facts, phase, dry);
+    });
   }
 
   private async tickApply(
@@ -507,7 +643,7 @@ export class TmuxUpgradeAdvisor {
     }
 
     if (!phase) return;
-    const key = tmuxNoticeKey(phase, facts, this.rec.version);
+    const key = this.noticeKey(phase, facts);
     const card = this.ownCard(store);
     const cardPhase = card?.model.phase;
     const cardActive = !!card && (OPEN_TMUX_UPGRADE_PHASES.has(cardPhase!)
@@ -515,13 +651,20 @@ export class TmuxUpgradeAdvisor {
 
     // An armed "switch when idle" belongs to the card it was armed on and only
     // means something while that card is waiting for a switch.
-    if (store.idleSwitch && (phase !== 'pending_switch' || !cardActive || socketName === undefined)) {
+    if (store.idleSwitch && (store.idleSwitch.socketName !== socketName
+      || phase !== 'pending_switch' || !cardActive || socketName === undefined)) {
       store = { ...store, idleSwitch: undefined };
       this.write(store);
     }
 
     if (phase === 'done') {
       if (card && cardActive) {
+        // A package-manager failure is not acknowledged merely because tmux -V
+        // advanced. Keep it visible until the owner explicitly retries.
+        if (!interruptedByRestart && cardPhase === 'upgrade_failed') {
+          if (store.notifiedKey !== key) this.write({ ...store, notifiedKey: key });
+          return;
+        }
         await this.show(store, {
           ...this.baseModel(facts, 'done', locale),
           ...(interruptedByRestart ? { interruptedByRestart } : {}),
@@ -530,7 +673,7 @@ export class TmuxUpgradeAdvisor {
       return;
     }
 
-    if (phase === 'pending_switch' && store.idleSwitch && socketName !== undefined) {
+    if (phase === 'pending_switch' && store.idleSwitch?.socketName === socketName && socketName !== undefined) {
       await this.tryIdleSwitch(store, facts, socketName, dry);
       return;
     }
@@ -539,12 +682,13 @@ export class TmuxUpgradeAdvisor {
       // Reconcile the open card with what is true now. Re-render only on a
       // real change, so an unchanged host costs zero Lark writes per tick.
       const keepFailure = !interruptedByRestart
-        && ((phase === 'needs_upgrade' && cardPhase === 'upgrade_failed')
+        && (cardPhase === 'upgrade_failed'
           || (phase === 'pending_switch' && cardPhase === 'switch_failed'));
       const wanted: TmuxUpgradePhase = keepFailure ? cardPhase! : phase;
       const changed = wanted !== cardPhase
         || card!.model.client !== facts.client
         || (phase === 'pending_switch' && card!.model.server !== facts.server)
+        || (phase === 'pending_switch' && card!.model.serverSessions !== facts.sessions)
         || interruptedByRestart;
       if (!changed) {
         if (store.notifiedKey !== key) this.write({ ...store, notifiedKey: key });
@@ -563,9 +707,10 @@ export class TmuxUpgradeAdvisor {
     // The open card is the usual de-duplication; the watermark also covers a
     // lost card reference. A card owned by another bot (the primary changed)
     // does not count: the current primary's owner gets its own DM.
-    if (store.notifiedKey === key && (!store.card || store.card.larkAppId === this.deps.larkAppId)) return;
+    if (store.notifiedKey === key && (!store.card || card)) return;
     // Do not even build the card (plan() spawns package tools) while backing off.
-    if (store.notifyFailedAt !== undefined && this.deps.now() - store.notifyFailedAt < TMUX_NOTIFY_RETRY_MS) return;
+    if (store.notifyFailedAt !== undefined && this.deps.now() - store.notifyFailedAt < TMUX_NOTIFY_RETRY_MS
+      && (store.notifyFailedKey ?? store.notifiedKey) === key) return;
     const model: TmuxUpgradeCardModel = {
       ...this.baseModel(facts, phase, locale),
       ...(phase === 'needs_upgrade' ? { plan: planView(await this.deps.plan(locale)) } : {}),
@@ -646,10 +791,12 @@ export class TmuxUpgradeAdvisor {
       await this.serial(async () => {
         const store = this.read();
         const phase = facts ? deriveTmuxFactPhase(facts, this.rec) : null;
+        const invalidateIdle = !!store.idleSwitch && !this.ownCard(store);
         const extra: Partial<TmuxUpgradeStore> = {
           ...patch,
           job: undefined,
-          ...(phase ? { notifiedKey: tmuxNoticeKey(phase, facts!, this.rec.version) } : {}),
+          ...(invalidateIdle ? { idleSwitch: undefined } : {}),
+          ...(phase ? { notifiedKey: this.noticeKey(phase, facts!) } : {}),
         };
         try {
           await this.show(store, model, extra);
@@ -682,16 +829,30 @@ export class TmuxUpgradeAdvisor {
       return toast('error', 'tmux_upgrade.toast.admin_only');
     }
     let store = this.read();
-    const card = store.card;
-    if (!card || card.larkAppId !== input.larkAppId || card.larkAppId !== this.deps.larkAppId
+    const card = this.ownCard(store);
+    if (!card || card.larkAppId !== input.larkAppId
       || card.messageId !== input.messageId || typeof input.nonce !== 'string' || input.nonce !== card.nonce) {
       return toast('warning', 'tmux_upgrade.toast.stale');
     }
+    this.actionGeneration++;
     if (store.job && !this.jobAlive(store.job)) {
       store = { ...store, job: undefined };
       this.write(store);
     }
-    if (store.job || this.jobRunning) return toast('info', 'tmux_upgrade.toast.busy');
+    if (store.job) {
+      store = this.recoverRemoteInstaller(store);
+      const job = store.job;
+      if (job?.recoveryFailedAt && job.installerPid) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('tmux_upgrade.error.recovery_failed', { pid: String(job.installerPid) }, locale),
+          },
+        };
+      }
+      return toast('info', 'tmux_upgrade.toast.busy');
+    }
+    if (this.jobRunning) return toast('info', 'tmux_upgrade.toast.busy');
     const operator = input.operatorOpenId!;
     const phase = card.model.phase;
     const now = this.deps.now();
@@ -728,6 +889,29 @@ export class TmuxUpgradeAdvisor {
         }
         const socketName = this.deps.socketName();
         if (socketName === undefined) return toast('warning', 'tmux_upgrade.toast.unavailable');
+        // The confirmation dialog is static between ticks. Re-read the target
+        // before claiming a destructive job; if the facts changed, return a
+        // fresh pending card and make the owner confirm that card instead.
+        let freshFacts: TmuxFacts;
+        try {
+          freshFacts = await this.deps.probeFacts(socketName);
+        } catch {
+          return toast('warning', 'tmux_upgrade.toast.unavailable');
+        }
+        if (deriveTmuxFactPhase(freshFacts, this.rec) === 'pending_switch'
+          && (freshFacts.sessions !== card.model.serverSessions
+            || freshFacts.client !== card.model.client
+            || freshFacts.server !== card.model.server)) {
+          const refreshed = this.baseModel(freshFacts, 'pending_switch', locale);
+          this.write({
+            ...store,
+            idleSwitch: undefined,
+            notifiedKey: this.noticeKey('pending_switch', freshFacts),
+            card: { ...card, model: refreshed, updatedAt: now, dirty: undefined, dirtyFailures: undefined },
+          });
+          this.deps.log(`switch-now confirmation refreshed: sessions ${card.model.serverSessions ?? '?'} -> ${freshFacts.sessions}`);
+          return respond(refreshed);
+        }
         const model: TmuxUpgradeCardModel = {
           ...card.model, phase: 'switching', startedAt: now, now, log: [],
           error: undefined, interruptedByRestart: undefined,
@@ -742,14 +926,15 @@ export class TmuxUpgradeAdvisor {
       }
       case TMUX_UPGRADE_ACTION_SWITCH_IDLE: {
         if (phase !== 'pending_switch' && phase !== 'switch_failed') return toast('warning', 'tmux_upgrade.toast.stale');
-        if (this.deps.socketName() === undefined) return toast('warning', 'tmux_upgrade.toast.unavailable');
+        const socketName = this.deps.socketName();
+        if (socketName === undefined) return toast('warning', 'tmux_upgrade.toast.unavailable');
         const model: TmuxUpgradeCardModel = {
           ...card.model, phase: 'awaiting_idle', error: undefined, interruptedByRestart: undefined,
           idleReady: undefined, idleCheckedAt: undefined,
         };
         this.write({
           ...store,
-          idleSwitch: { requestedAt: now, requestedBy: operator },
+          idleSwitch: { requestedAt: now, requestedBy: operator, socketName },
           card: { ...card, model, updatedAt: now, dirty: undefined },
         });
         this.deps.log(`idle switch armed by ${operator}`);
@@ -862,7 +1047,7 @@ export class TmuxUpgradeAdvisor {
           }, pid => this.recordInstaller(pid));
           this.deps.onBinaryChanged?.();
           facts = await this.deps.probeFacts(socketName);
-          if (facts.client && !isTmuxBelowRecommended(facts.client, this.rec)) {
+          if (execution.ok && facts.client && !isTmuxBelowRecommended(facts.client, this.rec)) {
             this.deps.log(`tmux upgraded to ${facts.client} (${execution.ran.join(' ; ')})`);
             final = this.afterBinary(facts, locale);
           } else {
@@ -1084,6 +1269,9 @@ export async function probeTmuxFacts(socketName: string | undefined): Promise<Tm
     return { client, serverRunning: !gone, server: null, serverUnknown: !gone, sessions: 0 };
   }
   const sessions = list.stdout.split('\n').filter(line => line.trim()).length;
+  // A much newer client can report rc=0 with empty stdout against an extremely
+  // old server (observed: 3.6a client / 2.8 server, with "server version is too
+  // old" on stderr). Empty output therefore maps to serverUnknown, never done.
   const display = await execTmux([...sock, 'display-message', '-p', '#{version}']);
   const server = display.ok ? tmuxReleaseLabel(display.stdout) : null;
   return { client, serverRunning: true, server, serverUnknown: !server, sessions };

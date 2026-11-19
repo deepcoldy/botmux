@@ -18,6 +18,7 @@ function model(phase: TmuxUpgradePhase, over: Partial<TmuxUpgradeCardModel> = {}
     why: 'WHY-SENTENCE',
     client: '3.3a',
     server: '3.3a',
+    socketName: 'botmux',
     serverSessions: 7,
     ...over,
   };
@@ -93,7 +94,7 @@ describe('tmux upgrade card', () => {
 
   it('a shared default server is never offered a switch', () => {
     for (const phase of ['pending_switch', 'awaiting_idle', 'switch_failed'] as const) {
-      expect(buttons(buildTmuxUpgradeCard(model(phase, { sharedServer: true }), 'n', 'zh'))).toEqual([]);
+      expect(buttons(buildTmuxUpgradeCard(model(phase, { socketName: null }), 'n', 'zh'))).toEqual([]);
     }
   });
 

@@ -49,6 +49,7 @@ function deps(dataDir: string, over: Partial<TmuxUpgradeAdvisorDeps> = {}): Tmux
     retireEmptyServer: vi.fn(async () => {}),
     sleep: async () => {},
     processStart: () => 'start',
+    signalInstaller: vi.fn(),
     log: () => {},
     newNonce: () => 'nonce-x',
     progressPatchMs: 0,
@@ -93,7 +94,7 @@ describe('tmux upgrade buttons through the real card handler', () => {
 describe('tmux upgrade card in chat history', () => {
   it('its buttons never leak into model-visible text, even unstamped', () => {
     const raw = buildTmuxUpgradeCard({
-      phase: 'pending_switch', min: '3.4', why: 'w', client: '3.5a', server: '3.3a', serverSessions: 2,
+      phase: 'pending_switch', min: '3.4', why: 'w', client: '3.5a', server: '3.3a', socketName: 'botmux', serverSessions: 2,
     }, 'n', 'zh');
     const text = extractCardContent(raw);
     expect(text).toContain('3.5a');
