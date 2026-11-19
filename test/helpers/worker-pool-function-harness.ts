@@ -8,6 +8,7 @@ import { contractTerminalStatus, executionObserverSupported, sameExecution } fro
 import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '../../src/core/terminal-effort-writeback.js';
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
+import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
 
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
@@ -15,6 +16,7 @@ import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoni
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
   if (key in scope) return scope[key as string];
   if (key === 'controllerForSession') return controllerForSession;
+  if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'isCodexAppCliId') return isCodexAppCliId;
   if (key === 'executionObserverSupported') return executionObserverSupported;
   if (key === 'contractTerminalStatus') return contractTerminalStatus;

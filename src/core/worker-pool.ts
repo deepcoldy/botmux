@@ -1,6 +1,7 @@
 import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
+import { runtimeStartRefusal } from '../services/runtime-reservation.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
 import { handleResumeFallbackReport } from '../services/resume-fallback-notice.js';
 import {
@@ -25804,11 +25805,15 @@ function setupWorkerHandlers(
           await sessionController.flushPrimary();
           const state = sessionController.store.read(sessionController.ref)!;
           if (ds.worker !== worker || !sameWorker(state.worker, contractWorker)) return;
+          const mayStart = sessionController.bindingMayStart(msg.bindingId)
+            && !['closed', 'closing', 'suspended', 'suspending'].includes(state.lifecycle)
+            && (!state.activeOperationId || state.activeOperationId === msg.operationId);
+          const startRefusal = mayStart ? undefined : runtimeStartRefusal({ mayStart, lifecycle: state.lifecycle,
+            activeOperationId: state.activeOperationId, workerIsLiveOwner: ds.worker === worker && ds.session.status === 'active' });
+          if (startRefusal) logger.warn(`[${t}] Refused runtime reservation ${msg.bindingId}: contract ${state.lifecycle} with no lifecycle operation, but this worker is the live owner of an active session`);
           worker.send({ type: 'runtime_contract_reserved', bindingId: msg.bindingId,
             runtime: sessionController.store.binding(sessionController.ref, msg.bindingId)?.ref,
-            mayStart: sessionController.bindingMayStart(msg.bindingId)
-              && !['closed', 'closing', 'suspended', 'suspending'].includes(state.lifecycle)
-              && (!state.activeOperationId || state.activeOperationId === msg.operationId) });
+            mayStart, ...(startRefusal ? { startRefusal } : {}) });
         }
         else if (msg.type === 'runtime_binding_aborted') {
           // A refused reservation (e.g. a TraeX continuation the contract could

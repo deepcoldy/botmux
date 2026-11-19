@@ -22,7 +22,7 @@
  * Pure module: the classifier and delay schedule are unit-tested; the timer
  * wiring lives in worker-pool's setupWorkerHandlers.
  */
-import { RUNTIME_RESERVATION_UNCONFIRMED } from '../services/runtime-reservation.js';
+import { RUNTIME_RESERVATION_UNCONFIRMED, RUNTIME_RESERVATION_UNOWNED } from '../services/runtime-reservation.js';
 
 /** Maximum daemon-side auto-retries per failing streak. Reset when a worker
  *  generation reaches `ready`. */
@@ -50,7 +50,7 @@ const STARTUP_AUTO_RETRY_BASE_DELAYS_MS = [15_000, 60_000, 180_000];
  * same user-actionable failure.
  */
 export function isTransientStartupFailure(reason: string): boolean {
-  if (reason.includes(RUNTIME_RESERVATION_UNCONFIRMED)) return true;
+  if (reason.includes(RUNTIME_RESERVATION_UNCONFIRMED) || reason.includes(RUNTIME_RESERVATION_UNOWNED)) return true;
   return /\bETIMEDOUT\b|\bECONNREFUSED\b|\bEAGAIN\b|\bEMFILE\b|\bENFILE\b|error connecting to|lost server|server exited unexpectedly/i.test(reason);
 }
 
