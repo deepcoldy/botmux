@@ -13,6 +13,7 @@ import { t, type Locale } from '../i18n/index.js';
 import type { AuthLinkDelivery } from './auth-link-delivery.js';
 import type { MeegoTenant } from '../services/bytedcli-home.js';
 import type { MeegoLoginRequest } from '../services/meego-auth.js';
+import type { BytedcliLoginStart } from '../services/bytedcli-auth.js';
 
 export type AuthProvider = 'meego' | 'bytedcli';
 
@@ -38,7 +39,9 @@ export interface ProviderAuthDeps {
   /** True once the person's ByteCloud login works (finishing one they approved
    *  meanwhile); 'unknown' when the provider cannot be asked. */
   bytedcliAuthorized: (openId: string) => Promise<boolean | 'unknown'>;
-  beginBytedcliLogin: (openId: string) => Promise<{ authUrl: string } | null>;
+  /** A link to send; or `authorized` when bytedcli already holds a confirmed
+   *  login; or `failed` with a redacted reason. */
+  startBytedcliLogin: (openId: string) => Promise<BytedcliLoginStart>;
   /** Hands a finished ByteCloud login to the running turn; true when the turn
    *  can use it now. */
   adoptBytedcliForTurn: (openId: string) => Promise<'adopted' | 'already' | 'none'>;
@@ -76,20 +79,25 @@ export async function requestProviderAuth(
       command: meegoLoginCommand(tenant),
     };
   } else {
-    if (await deps.bytedcliAuthorized(openId) === true) {
+    // Starting a login can itself find one: bytedcli 0.186+ answers `--begin`
+    // with a login it already holds (or just finished) instead of a link.
+    const started = await deps.bytedcliAuthorized(openId) === true
+      ? { state: 'authorized' as const }
+      : await deps.startBytedcliLogin(openId);
+    if (started.state === 'authorized') {
       const adopted = await deps.adoptBytedcliForTurn(openId);
       const key = { adopted: 'provider_auth.ready_bytedcli_now', already: 'provider_auth.ready_bytedcli_already', none: 'provider_auth.ready_bytedcli' }[adopted];
       return { status: 'ready', message: t(key, undefined, locale) };
     }
-    const started = await deps.beginBytedcliLogin(openId);
-    if (!started) {
-      return { status: 'unavailable', message: t('provider_auth.unavailable', { ...vars, detail: 'bytedcli auth login --begin' }, locale) };
+    if (started.state === 'failed') {
+      return { status: 'unavailable', message: t('provider_auth.unavailable', { ...vars, detail: started.detail }, locale) };
     }
+    const { authUrl } = started.challenge;
     link = {
-      authUrl: started.authUrl,
+      authUrl,
       text: [
         t('cmd.login.bytedcli_title', undefined, locale), '',
-        t('cmd.login.bytedcli_step1', undefined, locale), started.authUrl, '',
+        t('cmd.login.bytedcli_step1', undefined, locale), authUrl, '',
         t('auth_link.bytedcli_step2', undefined, locale), '',
         t('cmd.login.bytedcli_note', undefined, locale),
       ].join('\n'),

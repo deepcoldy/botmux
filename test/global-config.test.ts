@@ -77,6 +77,22 @@ describe('global dashboard config', () => {
     expect(globalTerminalEffortWritebackConfigLive()).toMatchObject({ enabled: true, epoch: 5 });
   });
 
+  it('round-trips model queue notification while preserving other dashboard preferences', () => {
+    expect(readGlobalConfig().dashboard?.modelQueueNotify === true).toBe(false);
+    mergeDashboardConfig({ publicReadOnly: true, modelQueueNotify: true });
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().dashboard).toMatchObject({ publicReadOnly: true, modelQueueNotify: true });
+    mergeDashboardConfig({ modelQueueNotify: false });
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().dashboard).toMatchObject({ publicReadOnly: true, modelQueueNotify: false });
+  });
+
+  it('ignores non-boolean model queue notification on disk and keeps the default off', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ dashboard: { modelQueueNotify: 'true' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().dashboard?.modelQueueNotify === true).toBe(false);
+  });
+
   it('keeps unrelated settings and the kill switch when meeting policy is malformed', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', vcMeetingAgent: { enabled: false, listenerPolicy: { rawMessages: 'false' } } }));
     invalidateGlobalConfigCache();

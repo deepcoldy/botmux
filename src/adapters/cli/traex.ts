@@ -562,10 +562,6 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const historyPath = traeHistoryPath();
       const baseByte = traexHistorySize(historyPath);
 
-      const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
-        ? pty.cliPid
-        : undefined;
-
       // Two separable facts, matched with two different scans:
       //  - SUBMIT confirmation: any full-content match in the global submit log,
       //    ownership-INDEPENDENT (a foreign-first line or unknown pid must never
@@ -630,10 +626,19 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // result to return now, or null to keep waiting. `final` relaxes the
       // owned-wait: at budget end / on the worker recheck, confirm on any-text.
       const resolve = (final: boolean) => {
+        // The worker can rewire this same handle from a launcher/missing PID to
+        // the real TraeX leaf after writeInput returns its deferred recheck.
+        // Resolve ownership from the CURRENT pid on every poll, not a stale
+        // write-time snapshot that can never see the leaf's rollout fds.
+        const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
+          ? pty.cliPid
+          : undefined;
         const owned = cliPid ? findTraexRolloutSetByPid(cliPid) : undefined;
         if (owned !== undefined) {
           const m = ownedMatch(owned);
-          if (m.found && m.cliSessionId) return { submitted: true as const, cliSessionId: m.cliSessionId };
+          if (m.found && m.cliSessionId) return {
+            submitted: true as const, cliSessionId: m.cliSessionId, ownershipProven: true as const,
+          };
           // Enumeration works but no owned line yet. Note submit evidence but
           // keep waiting for the owned id — unless the budget is spent.
           if (anyMatch().found) sawAnyText = true;

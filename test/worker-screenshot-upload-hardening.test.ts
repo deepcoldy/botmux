@@ -405,6 +405,7 @@ function executeProductionSetCaptureIdentity(send: (msg: unknown) => void): Iden
   ).outputText;
   const factory = new Function('send', `
     const workerSessionEventScope = undefined;
+    const lastInitConfig = undefined;
     let currentBotmuxTurnId;
     let currentBotmuxDispatchAttempt;
     let captureRevision = 0;

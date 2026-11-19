@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, type ReadStream } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { TmuxPipeBackend, __testOnly_liveFifoReaderCount, setStartupTmuxRetrySleepForTests } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { pipePaneShellCommand } from '../src/adapters/backend/tmux-pipe-relay.js';
 import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
@@ -30,6 +30,7 @@ const children: ChildProcess[] = [];
 const streams: ReadStream[] = [];
 
 afterEach(() => {
+  setStartupTmuxRetrySleepForTests(null);
   backend?.destroySession();
   backend = undefined;
   for (const child of children.splice(0)) child.kill('SIGKILL');
@@ -148,6 +149,95 @@ describe.each(CATS)('pipe-pane copy command with %s', (_label, cat) => {
 });
 
 describe.skipIf(!realTmux)('TmuxPipeBackend streaming through a real tmux server', () => {
+  it('refuses a different instance that replaces the session during a queued subscription retry', () => {
+    const fx = fixture('system');
+    socket = join(fx.root, 'socket');
+    const interrupted = join(fx.root, 'interrupted');
+    // Execute only new-session, then lose the rest of its command queue.
+    // The real session exists and its identity was printed before failure.
+    writeFileSync(join(fx.bin, 'tmux'), `#!/bin/bash
+args=("$@")
+for ((i=0; i<\${#args[@]}; i++)); do
+  if [[ "\${args[i]}" == new-session && ! -e ${quote(interrupted)} ]]; then
+    for ((j=i+1; j<\${#args[@]}; j++)); do
+      if [[ "\${args[j]}" == ';' ]]; then
+        ${quote(realTmux!)} -S ${quote(socket)} "\${args[@]:0:j}" || exit $?
+        : > ${quote(interrupted)}
+        echo 'error connecting to private socket (Connection refused)' >&2
+        exit 1
+      fi
+    done
+  fi
+done
+exec ${quote(realTmux!)} -S ${quote(socket)} "$@"
+`, { mode: 0o700 });
+    process.env.PATH = fx.path;
+    const tmux = (...args: string[]) => execFileSync(realTmux!, ['-S', socket!, ...args], { encoding: 'utf8' });
+    // Keep the private server alive while replacing the original session.
+    tmux('new-session', '-d', '-s', 'keeper', 'sleep 60');
+    backend = new TmuxPipeBackend('retry-stream', { createSession: true, ownsSession: true });
+    const readersBefore = __testOnly_liveFifoReaderCount();
+    const exits: unknown[] = [];
+    backend.onExit((code, signal) => exits.push([code, signal]));
+    let retries = 0;
+    setStartupTmuxRetrySleepForTests(() => {
+      retries++;
+      tmux('kill-session', '-t', 'retry-stream');
+      tmux('new-session', '-d', '-s', 'retry-stream', '-e', 'BOTMUX_CODEX_INSTANCE_BINDING=replacement', 'sleep 60');
+    });
+    expect(() => backend!.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: fx.root, cols: 80, rows: 24, launchShell: '/bin/sh',
+      env: { PATH: fx.path, HOME: fx.root, BOTMUX_CODEX_INSTANCE_BINDING: 'original' },
+    })).toThrow(/identity mismatch/);
+    expect(existsSync(interrupted)).toBe(true);
+    expect(retries).toBe(1);
+    expect(__testOnly_liveFifoReaderCount()).toBe(readersBefore);
+    expect(exits).toEqual([]);
+    expect(backend.retireSessionCreatedBySpawn()).toBe(false);
+    expect(tmux('display-message', '-p', '-t', 'retry-stream', '#{pane_pipe}').trim()).toBe('0');
+    expect(tmux('show-environment', '-t', 'retry-stream', 'BOTMUX_CODEX_INSTANCE_BINDING').trim())
+      .toBe('BOTMUX_CODEX_INSTANCE_BINDING=replacement');
+  });
+
+  it.each(['modern', 'legacy'])('%s: delivers the first screen and one-shot OSC idle even when the creating client returns late', async (version) => {
+    const fx = fixture('system');
+    socket = join(fx.root, 'socket');
+    const emitted = join(fx.root, 'emitted');
+    // Hold the creating client until the CLI has written its startup bytes.
+    // A separate pipe-pane invocation is then deterministically too late.
+    writeFileSync(join(fx.bin, 'tmux'), `#!/bin/sh
+${version === 'legacy' ? `case "$*" in
+  -V) echo 'tmux 3.1c'; exit 0 ;;
+  'display-message -p #{version}') echo 3.1c; exit 0 ;;
+esac` : ''}
+${quote(realTmux!)} -S ${quote(socket)} "$@"
+status=$?
+case "$*" in
+  *new-session*)
+    if [ "$status" = 0 ]; then
+      n=0
+      while [ ! -e ${quote(emitted)} ] && [ "$n" -lt 500 ]; do
+        sleep 0.01
+        n=$((n+1))
+      done
+    fi ;;
+esac
+exit "$status"
+`, { mode: 0o700 });
+    process.env.PATH = fx.path;
+    backend = new TmuxPipeBackend('startup-stream', { createSession: true, ownsSession: true });
+    backend.spawn('/bin/sh', ['-c', `printf 'first-screen\\033]7501;state=idle:app=kimi\\007'; : > ${quote(emitted)}; read line`], {
+      cwd: fx.root, env: { PATH: fx.path, HOME: fx.root }, cols: 80, rows: 24, strictEnv: true,
+    });
+    let received = '';
+    // Match worker ordering: listeners are wired after synchronous spawn().
+    backend.onData(data => { received += data; });
+    expect(existsSync(emitted)).toBe(true);
+    await vi.waitFor(() => expect(received).toBe('first-screen\x1b]7501;state=idle:app=kimi\x07'), {
+      timeout: 3000, interval: 20,
+    });
+  });
+
   const CASES = [
     ['short ready and final markers', ['›\r\n', '\x1b]777;botmux:final:e30=\x07›\r\n']],
     ['Unicode and terminal controls', ['你好\x1b[32m✓\x1b[0m', '\x1b[2K第二轮完成🌍']],
@@ -230,7 +320,7 @@ case "$*" in
   -V) echo 'tmux 3.1c'; exit 0 ;;
   'display-message -p #{version}') echo 3.1c; exit 0 ;;
 esac
-echo "$1" >> ${quote(commands)}
+printf '%s\\n' "$@" >> ${quote(commands)}
 exec ${quote(realTmux!)} -S ${quote(socket)} "$@"
 `, { mode: 0o700 });
     process.env.PATH = fx.path;

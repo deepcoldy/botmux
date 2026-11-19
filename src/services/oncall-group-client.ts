@@ -16,6 +16,21 @@ export interface OncallGroupTarget extends OncallGroupBusinessTarget {
   emailDomain: string;
 }
 
+/** Saved with the claim before sending; contains no service credentials. */
+export interface OncallGroupCreation {
+  target: OncallGroupTarget;
+  username: string;
+  region: string;
+  typeId: number;
+  formId?: string;
+}
+
+export function oncallCreationSource(attemptId: string): string {
+  return `botmux:${attemptId}`;
+}
+
+export const ONCALL_GROUP_CREATE_TIMEOUT_MS = 20_000;
+
 type StoredTarget = OncallGroupBusinessTarget & Partial<Pick<OncallGroupTarget, 'endpoint' | 'emailDomain'>>;
 
 function readTargets(dataDir: string): Record<string, StoredTarget> {
@@ -127,29 +142,33 @@ export function oncallUsername(email: string | undefined, target: OncallGroupTar
 }
 
 export class OncallGroupApiError extends Error {
-  constructor(readonly uncertain: boolean, status?: number) {
+  constructor(readonly uncertain: boolean, readonly status?: number,
+    readonly reason: 'http' | 'timeout' | 'transport' | 'invalid_response' = 'http', cause?: unknown) {
     super(status === 401 ? 'Oncall 服务账号凭据无效或已失效，请联系管理员更新 ONCALL_SERVICE_SECRET'
       : status === 403 ? 'Oncall 服务账号缺少接口或租户权限，请联系管理员授权'
-        : uncertain ? '建群结果待确认，请联系管理员核对，勿重复创建' : '建群失败，请稍后重试或联系管理员');
+        : uncertain ? '建群结果待确认，请联系管理员核对，勿重复创建' : '建群失败，请稍后重试或联系管理员', { cause });
   }
 }
 
 export async function createOncallGroup(target: OncallGroupTarget, secret: string, username: string, message: string,
-  fetcher: typeof fetch = fetch, selection?: { region: string; typeId: number; priority: 'P2' | 'P1' | 'P0' }): Promise<{ flowId: string; openChatId: string }> {
+  fetcher: typeof fetch = fetch, selection?: { region: string; typeId: number; priority: 'P2' | 'P1' | 'P0' },
+  attemptId?: string): Promise<{ flowId: string; openChatId: string }> {
   if (!selection && (!target.typeId || !target.region)) throw new Error('直接建群需要配置固定区域和分类');
   let response: Response;
   try {
     response = await fetcher(target.endpoint, {
-      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(20_000),
+      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(ONCALL_GROUP_CREATE_TIMEOUT_MS),
       headers: { 'content-type': 'application/json', Authorization: `Bearer ${secret}`, 'x-api-user': username },
       body: JSON.stringify({ tenant_id: target.tenantId, type_id: selection?.typeId ?? target.typeId, region: selection?.region ?? target.region,
-        type: 'create_chat', priority: selection?.priority ?? 'P2', source_type: 'open_api', source_location: 'botmux', trigger_message: message }),
+        type: 'create_chat', priority: selection?.priority ?? 'P2', source_type: 'open_api',
+        source_location: attemptId ? oncallCreationSource(attemptId) : 'botmux', trigger_message: message }),
     });
-  } catch { throw new OncallGroupApiError(true); }
+  } catch (error) { throw new OncallGroupApiError(true, undefined,
+    error instanceof Error && error.name === 'TimeoutError' ? 'timeout' : 'transport', error); }
   if (!response.ok) throw new OncallGroupApiError(![400, 401, 403, 404, 422, 429].includes(response.status), response.status);
   let body: any;
-  try { body = await response.json(); } catch { throw new OncallGroupApiError(true); }
+  try { body = await response.json(); } catch (error) { throw new OncallGroupApiError(true, undefined, 'invalid_response', error); }
   if (body?.code !== 0 || !/^oc_[a-zA-Z0-9]+$/.test(body?.data?.open_chat_id ?? '')
-    || !body?.data?.oncall_flow_id) throw new OncallGroupApiError(true);
+    || !body?.data?.oncall_flow_id) throw new OncallGroupApiError(true, undefined, 'invalid_response');
   return { flowId: String(body.data.oncall_flow_id), openChatId: body.data.open_chat_id };
 }

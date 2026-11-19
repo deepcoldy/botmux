@@ -452,7 +452,9 @@ describe('TraeX auto-model real Worker and PTY', () => {
     const f = await fixture(true, 'busy', false, { global: true, override: false });
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_first' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 2, 'lowest-load continuation');
-    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'last']);
+    // A walk to 'backup' means the capacity load read was unavailable or its
+    // reply was discarded; the worker log names which (#3535).
+    expect(rows(f.launches).map(row => row.model), f.logs.join('')).toEqual(['core', 'last']);
     expect(rows(f.launches)[0].args).toContain('model_reasoning_effort="high"');
     expect(rows(f.launches)[0].args).toContain('model_backend_variant="standard"');
     expect(rows(f.launches)[1].args).toContain('model_reasoning_effort="xhigh"');

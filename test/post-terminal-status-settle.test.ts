@@ -278,22 +278,26 @@ describe('turn_terminal status settle (daemon turn_terminal handler)', () => {
     expect(warnings[0]).toContain(TURN.substring(0, 8));
   });
 
-  it('stays out of the way when a real screen_update arrives inside the window', async () => {
+  it('treats a busy frame inside the settle window as stale and still corrects the card', async () => {
     const ds = makeDs();
     activate(ds);
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', terminalMsg(TURN));
+    // A busy frame from the just-completed turn (no newer turn admitted) is
+    // stale viewport evidence: it must not cancel the post-terminal correction.
     (ds.worker as any).emit('message', {
-      type: 'screen_update', content: 'still drawing', status: 'working',
+      type: 'screen_update', content: 'still drawing', status: 'working', turnId: TURN,
     });
 
     await vi.advanceTimersByTimeAsync(2_000);
 
-    expect(idlePatchCount()).toBe(0);
-    // The screen frame is authoritative; the fallback neither patches nor logs.
+    // turn_terminal is the card-display authority: the fallback still fires
+    // exactly once despite the stale busy frame.
+    expect(idlePatchCount()).toBe(1);
+    // The in-memory execution status is untouched (real idle edge still owns
+    // usage settlement); only the card was corrected.
     expect(ds.lastScreenStatus).toBe('working');
-    expect(settleWarnings()).toHaveLength(0);
   });
 
   it('does not settle a turn that is not the session current turn any more', async () => {
@@ -380,15 +384,18 @@ describe('turn_terminal status settle (daemon turn_terminal handler)', () => {
     expect(recordUsageMock).not.toHaveBeenCalled();
   });
 
-  it('repairs a late busy frame but does not keep PATCHing an acknowledged stable render', async () => {
+  it('needs no repeat sweep patch: a stale busy frame cannot invalidate the delivered correction', async () => {
     const ds = makeDs(); activate(ds); __testOnly_setupWorkerHandlers(ds, ds.worker as any);
     (ds.worker as any).emit('message', terminalMsg(TURN));
     await vi.advanceTimersByTimeAsync(2_000);
-    (ds.worker as any).emit('message', { type: 'screen_update', content: 'stale busy footer', status: 'working' });
+    expect(idlePatchCount()).toBe(1); // first correction delivered
+    // The post-terminal busy frame no longer bumps the revision, so the
+    // delivered receipt keeps matching and the self-heal sweep never repaints.
+    (ds.worker as any).emit('message', { type: 'screen_update', content: 'stale busy footer', status: 'working', turnId: TURN });
     await vi.advanceTimersByTimeAsync(180_000);
-    expect(idlePatchCount()).toBe(2);
+    expect(idlePatchCount()).toBe(1);
     await vi.advanceTimersByTimeAsync(180_000);
-    expect(idlePatchCount()).toBe(2);
+    expect(idlePatchCount()).toBe(1);
   });
 
   it('keeps the real delayed idle edge responsible for usage settlement', async () => {
@@ -554,3 +561,427 @@ describe('sweepStaleLiveCardStatuses (runtime self-heal)', () => {
     expect(updateMessageMock).not.toHaveBeenCalled();
   });
 });
+
+describe('stale post-terminal busy frame gate (screen_update)', () => {
+  function setupTerminalDs(overrides?: Partial<DaemonSession>) {
+    const ds = makeDs(overrides);
+    activate(ds);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    return ds;
+  }
+  // A residual frame from the terminalized turn: the worker tags normal
+  // screen_update frames with the current turn id (only direct-submit frames
+  // are untagged), so a stale frame carries the SAME turn id as the terminal.
+  function staleTaggedFrame(ds: DaemonSession, extra: Record<string, unknown> = {}) {
+    return (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'stale busy', status: 'working', turnId: TURN, ...extra,
+    });
+  }
+  // Web Terminal / sandbox direct-submit: worker publishes with clearTurnId
+  // AND the explicit directSubmit provenance marker — real new work.
+  function directSubmitFrame(ds: DaemonSession) {
+    return (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'direct work', status: 'working', directSubmit: true,
+    });
+  }
+  // Prompt-cache keep-alive also clears the turn id but carries NO directSubmit
+  // marker: it belongs to no turn and must never flip a settled card.
+  function keepaliveFrame(ds: DaemonSession) {
+    return (ds.worker as any).emit('message', { type: 'screen_update', content: 'keepalive', status: 'working' });
+  }
+
+  it('does not bump revision or patch the card for a stale tagged busy frame, but keeps non-card state', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000); // settle idle PATCH queued
+    const revAfterSettle = ds.streamCardStatusRevision ?? 0;
+    const callsAfterSettle = updateMessageMock.mock.calls.length;
+
+    staleTaggedFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(revAfterSettle);
+    expect(updateMessageMock.mock.calls.length).toBe(callsAfterSettle);
+    // Non-card execution state is still refreshed.
+    expect(ds.lastScreenContent).toBe('stale busy');
+    expect(ds.lastScreenStatus).toBe('working');
+  });
+
+  it('still bumps revision on a real idle frame after the terminal', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    (ds.worker as any).emit('message', { type: 'screen_update', content: 'composer', status: 'idle', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(ds.lastScreenStatus).toBe('idle');
+  });
+
+  it('resumes card driving (revision bump) once a new turn starts', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    ds.currentTurnId = 'turn-live-0002'; // beginNewTurn: newer turn admitted
+    staleTaggedFrame(ds, { turnId: 'turn-live-0002', content: 'new turn work' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+  });
+
+  it('does not gate busy frames after a failed terminal', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN, 'failed'));
+    await vi.advanceTimersByTimeAsync(0);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    staleTaggedFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+  });
+
+  it('keeps the idle correction deliverable when stale busy frames race an in-flight PATCH (real beforeWrite fence)', async () => {
+    let releaseFirst!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const opts = args[3];
+      const run = async () => { if (opts && typeof opts.beforeWrite === 'function') await opts.beforeWrite(); };
+      if (!releaseFirst) return new Promise<void>(resolve => { releaseFirst = resolve; }).then(run);
+      return run();
+    });
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000); // settle idle PATCH held in flight
+
+    for (let i = 0; i < 3; i++) {
+      staleTaggedFrame(ds, {}, );
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(ds.streamCardStatusRevision ?? 0).toBe(0); // stale frames never bumped it
+
+    releaseFirst();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(lastPatchedStatus()).toBe('idle'); // fence passed, correction delivered
+  });
+
+  it('P1: a direct-submit busy frame is live work, bumps revision and repaints the card', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(lastPatchedStatus()).toBe('idle'); // display-only correction delivered
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    directSubmitFrame(ds); // explicit provenance: real new work, no managed turn
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(ds.lastScreenStatus).toBe('working');
+    // The visible card must come back to working, not stay on the idle correction.
+    expect(lastPatchedStatus()).toBe('working');
+  });
+
+  it('P1 keepalive: an untagged busy frame WITHOUT directSubmit does not reopen the card', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(lastPatchedStatus()).toBe('idle');
+    const rev = ds.streamCardStatusRevision ?? 0;
+    const calls = updateMessageMock.mock.calls.length;
+
+    keepaliveFrame(ds); // same untagged shape as keepalive, no directSubmit marker
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev); // no revision bump
+    expect(updateMessageMock.mock.calls.length).toBe(calls); // no card repaint
+    expect(lastPatchedStatus()).toBe('idle'); // card stays on the correction
+  });
+
+  it('P3: a newer dispatch attempt of the same terminalized turn is live work and repaints the card', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', { ...terminalMsg(TURN), dispatchAttempt: 1 });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(lastPatchedStatus()).toBe('idle');
+    expect(ds.lastTurnTerminalDispatchAttempt).toBe(1);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    // The turn is retried: a fresh attempt is admitted and starts working.
+    noteTurnDispatchAttempt(ds, TURN, 2);
+    staleTaggedFrame(ds, { dispatchAttempt: 2 });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(lastPatchedStatus()).toBe('working');
+  });
+
+  it('forces only one busy repaint: subsequent same-value working ticks do not re-patch', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    directSubmitFrame(ds); // first live busy frame after correction: forced repaint
+    await vi.advanceTimersByTimeAsync(0);
+    const patchesAfterFirstRepaint = updateMessageMock.mock.calls.length;
+    expect(lastPatchedStatus()).toBe('working');
+
+    // More working→working frames with no status edge must not repaint again.
+    directSubmitFrame(ds);
+    directSubmitFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(updateMessageMock.mock.calls.length).toBe(patchesAfterFirstRepaint);
+  });
+
+  it('P2: a stale tagged screenshot_uploaded frame neither bumps revision nor touches the card image', async () => {
+    const ds = setupTerminalDs({ displayMode: 'screenshot' });
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+    const calls = updateMessageMock.mock.calls.length;
+
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-stale', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
+    expect(ds.currentImageKey).not.toBe('img-stale');
+    expect(updateMessageMock.mock.calls.length).toBe(calls);
+    // Non-card execution state still moves.
+    expect(ds.lastScreenStatus).toBe('working');
+  });
+
+  it('P2 keepalive: an untagged screenshot_uploaded frame is gated like a keep-alive', async () => {
+    const ds = setupTerminalDs({ displayMode: 'screenshot' });
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+    const calls = updateMessageMock.mock.calls.length;
+
+    // Untagged (cleared capture identity) without a newer turn = keep-alive.
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-keepalive', status: 'working',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
+    expect(ds.currentImageKey).not.toBe('img-keepalive');
+    expect(updateMessageMock.mock.calls.length).toBe(calls);
+  });
+
+  it('P2 control: a newer-turn screenshot_uploaded live-work frame is not gated', async () => {
+    const ds = setupTerminalDs({ displayMode: 'screenshot' });
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    // A newer managed turn owns this screenshot, so it is genuine live work.
+    ds.currentTurnId = 'turn-live-0002';
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-direct', status: 'working', turnId: 'turn-live-0002',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(ds.currentImageKey).toBe('img-direct');
+  });
+
+  it('P2 sweep: a direct-submit episode prevents the self-heal from re-idling the card', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    // Direct-submit opens a live-work epoch after the terminal.
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'direct', status: 'working', directSubmit: true,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined();
+    // Backdate the terminal past the 120s sweep age while keeping the epoch open.
+    ds.lastTurnTerminalAt = Date.now() - 121_000;
+
+    // The self-heal must not idle-correct a card held by a live-work episode.
+    expect(sweepStaleLiveCardStatuses(APP)).toBe(0);
+    expect(updateMessageMock.mock.calls.filter((c: any[]) => {
+      try { return JSON.parse(String(c[2])).status === 'idle'; } catch { return false; }
+    })).toHaveLength(1); // only the original 2s correction, no sweep re-idle
+  });
+
+  it('P3 handoff: live work arriving while the idle PATCH is in flight repaints once it settles', async () => {
+    let releaseFirst!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const opts = args[3];
+      const run = async () => { if (opts && typeof opts.beforeWrite === 'function') await opts.beforeWrite(); };
+      if (!releaseFirst) return new Promise<void>(resolve => { releaseFirst = resolve; }).then(run);
+      return run();
+    });
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000); // idle correction PATCH held in flight (receipt pending)
+
+    // Direct-submit live work lands BEFORE the idle response returns.
+    directSubmitFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('idle'); // idle not yet settled, still showing idle
+
+    releaseFirst();
+    await vi.advanceTimersByTimeAsync(0); // settle callback honors the repaint request
+
+    expect(lastPatchedStatus()).toBe('working'); // handoff applied after settle
+  });
+
+  it('R4-P1: a local-* completed terminal clears the direct-submit live-work epoch', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    directSubmitFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined();
+
+    // The Web Terminal typed turn completes with a local-* id; currentTurnId
+    // still points at the IM turn, so the managed gate would skip it.
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: SESSION, turnId: 'local-typed-abc', status: 'completed',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined();
+    // With the epoch closed, a later stale busy frame is gated again (self-heal live).
+    keepaliveFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    const rev = ds.streamCardStatusRevision ?? 0;
+    keepaliveFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
+  });
+
+  it('R4-P2: a newer-turn working frame opens liveness before beginNewTurn, so sweep does not idle it', async () => {
+    const ds = setupTerminalDs(); // currentTurnId stays TURN (no beginNewTurn yet)
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    ds.lastTurnTerminalAt = Date.now() - 121_000; // past the sweep age
+
+    // First frame of a newer turn arrives while currentTurnId still equals TURN.
+    staleTaggedFrame(ds, { turnId: 'turn-live-0002', content: 'new turn first frame' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined();
+
+    // The self-heal must recognize the open episode and not idle-correct it.
+    expect(sweepStaleLiveCardStatuses(APP)).toBe(0);
+  });
+
+  it('R4-P3: follow-up screenshots inherit the open direct-submit episode despite an old capture tag', async () => {
+    const ds = setupTerminalDs({ displayMode: 'screenshot' });
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    directSubmitFrame(ds); // opens the live-work episode
+    await vi.advanceTimersByTimeAsync(0);
+    const rev = ds.streamCardStatusRevision ?? 0;
+
+    // A later screenshot still carries the old terminalized turn/attempt tag.
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-episode', status: 'working',
+      turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // It belongs to the open episode, so it is not treated as stale residue.
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev + 1);
+    expect(ds.currentImageKey).toBe('img-episode');
+  });
+
+  it('R5: a real idle frame closes the episode so a later keepalive cannot re-open the card', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    directSubmitFrame(ds); // opens the live-work episode
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined();
+
+    // The direct-submit work ends with a real idle frame (no local terminal).
+    (ds.worker as any).emit('message', { type: 'screen_update', content: 'composer', status: 'idle' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined(); // episode closed
+
+    // A keepalive busy frame must now be treated as stale, not episode continuation.
+    const rev = ds.streamCardStatusRevision ?? 0;
+    const calls = updateMessageMock.mock.calls.length;
+    keepaliveFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
+    expect(updateMessageMock.mock.calls.length).toBe(calls);
+    expect(lastPatchedStatus()).not.toBe('working');
+  });
+
+  it('R5: a local-* failed/cancelled terminal closes the episode even without a completed one', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    directSubmitFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined();
+
+    // Local failure: the worker suppresses the failure terminal to a notice, but
+    // when it does arrive (any non-completed status) the epoch must still close.
+    (ds.worker as any).emit('message', {
+      type: 'turn_terminal', sessionId: SESSION, turnId: 'local-typed-fail', status: 'failed',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined();
+
+    // Self-heal is live again: a residual busy frame is gated.
+    const rev = ds.streamCardStatusRevision ?? 0;
+    keepaliveFrame(ds);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.streamCardStatusRevision ?? 0).toBe(rev);
+  });
+
+  it('R6: direct_submit_started opens the episode with no prompt_ready, then a normal working frame repaints', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(lastPatchedStatus()).toBe('idle'); // correction delivered
+    const revAfterIdle = ds.streamCardStatusRevision ?? 0;
+
+    // Stuck-after-terminal: prompt_ready never fires. The hook still signals a
+    // real direct-submit, but no working screen frame accompanies it yet.
+    (ds.worker as any).emit('message', { type: 'direct_submit_started' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).not.toBeUndefined(); // episode opened without a frame
+
+    // The PTY stream later produces an ordinary working frame (still tagged with
+    // the old terminalized turn, no directSubmit marker). The open episode must
+    // let it through and repaint the card back to working.
+    staleTaggedFrame(ds, { content: 'late working from pty' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.streamCardStatusRevision ?? 0).toBe(revAfterIdle + 1);
+    expect(lastPatchedStatus()).toBe('working');
+  });
+
+  it('R6: direct_submit_started is a no-op outside a completed terminal', async () => {
+    const ds = setupTerminalDs();
+    // No terminal yet: the signal must not open a spurious epoch.
+    (ds.worker as any).emit('message', { type: 'direct_submit_started' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined();
+  });
+
+  it('R6: a stale-generation direct_submit_started is ignored', async () => {
+    const ds = setupTerminalDs();
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2_000);
+    // The handler closure is bound to the original worker/generation; advance
+    // only the session's recorded generation so the bound worker is now stale.
+    const originalWorker = ds.worker;
+    ds.workerGeneration = (ds.workerGeneration ?? 0) + 1;
+    ds.session.workerGeneration = ds.workerGeneration;
+
+    (originalWorker as any).emit('message', { type: 'direct_submit_started' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.postTerminalLiveWorkAt).toBeUndefined();
+  });
+});
+

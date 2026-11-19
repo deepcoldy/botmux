@@ -177,20 +177,21 @@ describe('P1 — dispatchLaunchSpec.effective.reasoningEffort survives to spawn 
 
   it('clears the effort when the effective model does not support it (worker-pool safety net kept)', () => {
     // The pre-existing safety net (worker-pool.ts) must still clear an effort
-    // that the resolved model cannot honor. Use a model with no `ultra` support.
+    // that the resolved model cannot honor. Use a model whose verified table
+    // row has no `ultra` (a model without a row is the launch-time check's).
     const dir = mkdtempSync(join(tmpdir(), 'p1-ipc-'));
     const session = createDispatchLaunchSession({
       dispatchId: `dl_${'c'.repeat(32)}`,
       chatId: CHAT_ID, rootMessageId: ROOT_MESSAGE, title: 'run codex',
       chatType: 'group', workingDir: dir, larkAppId: TARGET_APP,
-      requestedOverride: { model: 'gpt-5.4', reasoningEffort: 'ultra' as any },
-      effectiveOverride: { model: 'gpt-5.4', reasoningEffort: 'ultra' as any },
+      requestedOverride: { model: 'gpt-6-luna', reasoningEffort: 'ultra' as any },
+      effectiveOverride: { model: 'gpt-6-luna', reasoningEffort: 'ultra' as any },
       createdAt: new Date().toISOString(),
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
     expect(session.reasoningEffort).toBe('ultra');
     const ds = makeDs(session);
-    const cfg = sessionAgentConfig(ds, { cliId: 'codex', model: 'gpt-5.4' } as any);
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex', model: 'gpt-6-luna' } as any);
     expect(cfg.reasoningEffort).toBeUndefined();
   });
 });

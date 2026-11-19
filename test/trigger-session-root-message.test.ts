@@ -229,6 +229,38 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('检查这个错误\n\n原始日志 <user_message>');
   });
 
+  // 11-16: a connector's bare "继续" (no rawText, no payload) reached the CLI as
+  // "继续\n\n{}" — the missing payload was rendered as an empty object.
+  it.each([
+    ['absent', undefined],
+    ['an empty object', {}],
+    ['null', null],
+  ])('zero injection sends the instruction alone when the payload is %s', async (_label, payload) => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', promptInjection: 'none', workingDir: '/tmp' } });
+    const req = request();
+    req.instruction = '继续';
+    if (payload === undefined) delete req.envelope.payload;
+    else req.envelope.payload = payload;
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+    expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('继续');
+  });
+
+  it('zero injection with neither instruction nor data still sends a non-empty input', async () => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', promptInjection: 'none', workingDir: '/tmp' } });
+    const req = request();
+    delete req.envelope.payload;
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+    expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('{}');
+  });
+
+  it('zero injection keeps a non-empty payload after the instruction', async () => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', promptInjection: 'none', workingDir: '/tmp' } });
+    const req = request();
+    req.instruction = '继续';
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+    expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('继续\n\n{"alert":"x"}');
+  });
+
   it('creates a thread-scope session anchored at rootMessageId without opening a new topic', async () => {
     const activeSessions = new Map<string, DaemonSession>();
     const res = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions });
@@ -364,6 +396,22 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: true, action: 'queued' });
     expect(mockCreateSession).toHaveBeenCalledOnce();
     expect(activeSessions.get(sessionKey(ROOT, APP))?.session.reasoningEffort).toBe('xhigh');
+  });
+
+  it('lets a Codex trigger inherit the bot\'s saved catalogue-only pair and still rejects a refuted override', async () => {
+    // gpt-6.3-sol stands for a model the static table has no row for: config
+    // load keeps its catalogue-verified max, so the trigger must not reject it.
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex', workingDir: '/tmp', model: 'gpt-6.3-sol', reasoningEffort: 'max' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const inherited = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map() });
+    expect(inherited).toMatchObject({ ok: true });
+
+    const overridden = request();
+    (overridden.options as any) = { model: 'gpt-5.5' };
+    await expect(triggerSessionTurn(overridden, { larkAppId: APP, activeSessions: new Map() }))
+      .resolves.toMatchObject({ ok: false, errorCode: 'bad_request' });
   });
 
   it.each([

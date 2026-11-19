@@ -118,6 +118,7 @@ import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages
 import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
+import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
 import {
   selectCodexRuntimeUpdateTargets,
@@ -193,7 +194,7 @@ import {
 } from './services/durable-lark-primary-runtime.js';
 import {
   deliverDurableLarkOutbox,
-  durableLarkOutboxMessage,
+  durableLarkOutboxMessage, durableReplyFileContent,
   type DurableLarkOutboxTarget,
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
@@ -35743,7 +35744,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   sendStartupWelcomeMessages(durableCoordinationRuntime?.mode ?? 'disabled');
   if (durableCoordinationRuntime?.mode === 'primary') {
     const deliverDurablePrimaryMessage = async (
-      request: DurableSessionSendRequest,
+      request: DurableSessionSendRequest, replyFileDigest?: string,
     ): Promise<DurableSessionSendResult> => {
       const runtime = durablePrimaryRuntimeByApp.get(request.daemonSession.larkAppId);
       if (!runtime) throw new Error('durable primary output runtime is unavailable');
@@ -35765,7 +35766,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         sessionKey: canonicalKey,
         larkAppId: request.daemonSession.larkAppId,
         target: request.target,
-        content: request.content,
+        content: replyFileDigest ? await durableReplyFileContent(durableCoordinationRuntime.store,
+          `out_${request.providerUuid}`, replyFileDigest, request.content) : request.content,
         msgType: request.msgType,
         providerUuid: request.providerUuid,
         hookContext: request.hookContext,
@@ -35811,8 +35813,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       hookContext: {
         sessionId: request.daemonSession.session.sessionId,
         turnId: request.turnId,
+        ...(request.replyFileDigest ? { replyFileDigest: request.replyFileDigest } : {}),
       },
-    }));
+    }, request.replyFileDigest));
     setDurableSessionSendHandler(deliverDurablePrimaryMessage);
     const quarantinedDashboardSessionKeys = new Set<string>();
     setDurableSessionListHandler(async () => {
@@ -35978,6 +35981,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 文档订阅恢复 + 评论轮询：都是主动调飞书文档 API 的路径。apiOnly（core-only）
   // bot 从不连飞书，且其合成身份不会有真实文档订阅——整块跳过，否则非 pristine
   // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
+  const ownerGroupFollower = cfg.apiOnly ? undefined : startOwnerGroupFollow(cfg.larkAppId, config.session.dataDir);
   let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
   let oncallHandoffTimer: ReturnType<typeof setInterval> | undefined;
   let oncallHandoffRunning = false;
@@ -36143,6 +36147,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
     save: records => saveSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId, records),
+    getQuietHours: () => getBot(cfg.larkAppId).config.sessionOwnerReminder?.quietHours,
     canSend: ds => larkTransportEnabled({
       chatId: ds.chatId,
       apiOnly: getBot(ds.larkAppId).config.apiOnly,
@@ -37111,6 +37116,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopCliRuntimeUpdateMonitor();
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
+    ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
     oncallHandoffStopped = true;
     clearInterval(oncallHandoffTimer);
@@ -37401,6 +37407,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
+    ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
     oncallHandoffStopped = true;
     clearInterval(oncallHandoffTimer);
