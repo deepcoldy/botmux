@@ -1007,6 +1007,40 @@ describe('target daemon consumes signed message authority', () => {
       'result=' + (kind === 'hub-only' ? 'target_access_denied' : 'task_turn_isolation_required')));
   });
 
+  it('refuses task credentials after the origin revokes an approved decision', async () => {
+    const h = await targetHarness({ member: false, taskConsent: true });
+    const { answerDispatchTaskConsent, TASK_CONSENT_ACTION } = await import('../src/im/lark/dispatch-task-consent.js');
+    // Approval is revocable: approved -> denied is the supported terminal flip.
+    expect(await answerDispatchTaskConsent(dir, 'target-test-secret', 'cli_source', {
+      action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+      operator: { open_id: ALICE },
+      context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+    })).toBe(true);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'revoked-must-not-publish' });
+    await h.run();
+    const body = identityBody('bytedcli', 'om_kickoff');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).not.toContain('revoked-must-not-publish');
+  });
+
+  it('re-checks the task decision at publication time, not only at recipient lookup', async () => {
+    const h = await targetHarness({ member: false, taskConsent: true });
+    const read = h.scopeValues.readTaskBinding;
+    let reads = 0;
+    h.scopeValues.readTaskBinding = async (...args: Parameters<typeof read>) => {
+      const binding = await read(...args);
+      // First read is the recipient lookup (still approved, so the closure is
+      // installed); every later read is the per-use re-check inside that closure.
+      if (reads++ === 0) return binding;
+      return { ...binding, taskOwner: { ...binding!.taskOwner!, decision: 'denied' as const } };
+    };
+    bytedcliJwts.set(ALICE, { cloudJwt: 'revoked-during-publish' });
+    await h.run();
+    const body = identityBody('bytedcli', 'om_kickoff');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).not.toContain('revoked-during-publish');
+  });
+
   it('reports unavailable member verification without telling the human to log in again', async () => {
     const h = await targetHarness({ memberError: true });
     bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
