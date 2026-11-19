@@ -112,6 +112,7 @@ function makeStartupSampler(screen = '') {
     lastInitConfig: { cliId: 'traex' },
     awaitingFirstPrompt: true,
     FIRST_PROMPT_HARD_TIMEOUT_MS: 90_000,
+    traexFirstPromptDeadlineAt: Date.now() + 90_000,
     lastPtyOutputAtMs: 0,
     backendScreenRevision: 100,
     webTerminalInputBackendScreenRevision: 0,
@@ -218,6 +219,76 @@ describe('Web startup protocol activity and recovery', () => {
     await vi.advanceTimersByTimeAsync(3_000);
     expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(2);
     expect(h.admissions()).toBe(1);
+  });
+
+  it('stops failed renderer drain recovery at the original startup deadline despite Web input at 89 seconds', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    const startedAt = Date.now();
+    const deadline = h.scope.traexFirstPromptDeadlineAt;
+    const drainTimes: number[] = [];
+    const head = h.scope.pendingMessages[0];
+    h.scope.nativeState = 'idle';
+    h.scope.renderer.writeAndFlush = vi.fn(async () => {
+      drainTimes.push(Date.now());
+      throw new Error('fixture renderer remains unavailable');
+    });
+
+    // First fail inside this spawn's fixed window. Later Web activity must
+    // invalidate evidence, not grant another 90 seconds to renderer recovery.
+    await vi.advanceTimersByTimeAsync(80_000);
+    h.noteWebInput('\x1b[A');
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(h.pending()).toBe(true);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(Date.now() - startedAt).toBe(89_000);
+    h.noteWebInput('\x1b[A');
+    expect(h.pending()).toBe(true);
+    expect(h.scope.traexFirstPromptDeadlineAt).toBe(deadline);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const drainsAtDeadline = h.scope.renderer.writeAndFlush.mock.calls.length;
+
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.scope.traexStartupWebRecheck).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(drainsAtDeadline);
+    expect(drainTimes.every(at => at < deadline)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.admissions()).toBe(0);
+    expect(h.scope.pendingMessages[0]).toBe(head);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+  });
+
+  it('recovers a transient renderer drain within the fixed startup deadline', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    const deadline = h.scope.traexFirstPromptDeadlineAt;
+    const drainTimes: number[] = [];
+    h.scope.nativeState = 'idle';
+    h.scope.renderer.writeAndFlush = vi.fn()
+      .mockImplementationOnce(async () => {
+        drainTimes.push(Date.now());
+        throw new Error('fixture transient renderer failure');
+      })
+      .mockImplementation(async () => { drainTimes.push(Date.now()); });
+
+    await vi.advanceTimersByTimeAsync(80_000);
+    h.noteWebInput('\x1b[A');
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(h.pending()).toBe(true);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(h.admissions()).toBe(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(2);
+    expect(drainTimes.every(at => at < deadline)).toBe(true);
+    expect(h.admissions()).toBe(1);
+    expect(h.scope.traexFirstPromptDeadlineAt).toBe(deadline);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.admissions()).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('rechecks a new frame after the screen changes during the renderer drain', async () => {

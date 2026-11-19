@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { WebTerminalInputController, WebTerminalInputWireState } from '../src/core/web-terminal-input-controller.js';
 import { terminalInputSubmits } from '../src/adapters/cli/tui-input.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -13,6 +13,14 @@ function deferred<T>() {
 }
 async function drain() { for (let i = 0; i < 12; i++) await Promise.resolve(); }
 
+function recordWireInput(wire: WebTerminalInputWireState, operation: 'written' | 'accepted',
+  data: string, owner: symbol) {
+  wire[operation](data, owner);
+  // These parser controls use a direct writer; accepted bytes are also
+  // physically acknowledged. Queued-but-unwritten cases are tested separately.
+  if (operation === 'accepted') wire.written(data, owner);
+}
+
 function fixture(options: { maxUserBytes?: number; maxUserMessages?: number; carryMs?: number } = {},
   shared?: { target: Target; wire: WebTerminalInputWireState }) {
   const current: Target = shared?.target ?? { backend: {}, lifetime: 1, generation: 1, binding: {}, transport: {} };
@@ -22,12 +30,14 @@ function fixture(options: { maxUserBytes?: number; maxUserMessages?: number; car
   const context = new AsyncLocalStorage<Target>();
   const timers = new Map<object, { callback: () => void; at: number }>();
   const writes: string[] = [], userInputs: Array<{ data: string; submit: boolean }> = [];
+  const writeCalls: Array<{ target: Target; data: string; owner: symbol }> = [];
+  const uncertainTargets: Target[] = [];
   const holds: boolean[] = [], audit: boolean[] = [];
   let cancellations = 0, efforts = 0, overflows = 0;
   let uncertainties = 0;
   let before: () => Promise<boolean> = async () => true;
   let effort: () => Promise<void> = async () => {};
-  let write: (data: string) => boolean = () => true;
+  let write: (data: string, owner: symbol) => boolean | 'queued' = () => true;
   let onUser: (data: string, submit: boolean) => void = () => {};
   let onHold: (held: boolean) => void = () => {};
   const owns = (target: Target) => writable && open && !fork
@@ -51,9 +61,9 @@ function fixture(options: { maxUserBytes?: number; maxUserMessages?: number; car
       expect(context.getStore()).toBe(target);
       efforts++; await effort();
     },
-    write: (target, data) => {
+    write: (target, data, owner) => {
       expect(context.getStore()).toBe(target);
-      writes.push(data); return write(data);
+      writes.push(data); writeCalls.push({ target, data, owner }); return write(data, owner);
     },
     onUserInput: (target, data, submit) => {
       expect(context.getStore()).toBe(target);
@@ -62,7 +72,7 @@ function fixture(options: { maxUserBytes?: number; maxUserMessages?: number; car
     audit: (_target, input) => { audit.push(input.hasUser); },
     onPendingChange: (_target, held) => { holds.push(held); onHold(held); },
     onOverflow: () => { overflows++; open = false; },
-    onTransportUncertain: () => { uncertainties++; },
+    onTransportUncertain: target => { uncertainties++; uncertainTargets.push(target); },
     now: () => now,
     setTimer: (callback, ms) => { const id = {}; timers.set(id, { callback, at: now + ms }); return id; },
     clearTimer: id => { timers.delete(id as object); },
@@ -76,7 +86,7 @@ function fixture(options: { maxUserBytes?: number; maxUserMessages?: number; car
     await drain();
   };
   return {
-    controller, current, writes, userInputs, holds, audit, timers, tick,
+    controller, current, writes, writeCalls, uncertainTargets, userInputs, holds, audit, timers, tick,
     stats: () => ({ cancellations, efforts, overflows }),
     uncertainties: () => uncertainties,
     setWritable: (value: boolean) => { writable = value; },
@@ -84,13 +94,191 @@ function fixture(options: { maxUserBytes?: number; maxUserMessages?: number; car
     setFork: (value: boolean) => { fork = value; },
     before: (fn: () => Promise<boolean>) => { before = fn; },
     effort: (fn: () => Promise<void>) => { effort = fn; },
-    write: (fn: (data: string) => boolean) => { write = fn; },
+    write: (fn: (data: string, owner: symbol) => boolean | 'queued') => { write = fn; },
     onUser: (fn: (data: string, submit: boolean) => void) => { onUser = fn; },
     onHold: (fn: (held: boolean) => void) => { onHold = fn; },
   };
 }
 
 describe('WebTerminalInputController', () => {
+  it.each([
+    { inputName: 'user input', next: 'second' },
+    { inputName: 'neutral reply', next: REPLY },
+  ])('waits to physically write $inputName until another connection queued complete paste is replayed',
+    async ({ next }) => {
+      const shared = { target: { backend: {}, lifetime: 1, generation: 1, binding: {}, transport: {} },
+        wire: new WebTerminalInputWireState() };
+      const a = fixture({}, shared), b = fixture({}, shared);
+      const queue: Array<{ data: string; owner: symbol }> = [];
+      const physical: Array<{ data: string; owner: symbol }> = [];
+      const paste = '\x1b[200~first\r\n\x1b[201~';
+      a.write((data, owner) => { queue.push({ data, owner }); return 'queued'; });
+      b.write((data, owner) => { physical.push({ data, owner }); return true; });
+      try {
+        expect(await a.controller.accept(paste)).toBe('forwarded');
+        expect(queue.map(item => item.data)).toEqual([paste]);
+        expect(queue[0]!.owner).toBe(a.writeCalls[0]!.owner);
+        expect(shared.wire.writer.inPaste).toBe(false);
+        expect(shared.wire.acceptedWriter.inPaste).toBe(false);
+        expect(physical).toEqual([]);
+
+        let settled = false;
+        const second = b.controller.accept(next).then(result => { settled = true; return result; });
+        await drain();
+        expect(settled).toBe(false);
+        expect(b.writeCalls).toEqual([]);
+        expect(physical).toEqual([]);
+
+        const first = queue.shift()!;
+        physical.push(first);
+        shared.wire.written(first.data, first.owner);
+        expect(await second).toBe('forwarded');
+        expect(physical.map(item => item.data)).toEqual([paste, next]);
+        expect(physical[1]!.owner).toBe(b.writeCalls[0]!.owner);
+        expect(physical[1]!.owner).not.toBe(first.owner);
+        expect(queue).toEqual([]);
+        expect(shared.wire.inPaste).toBe(false);
+        expect(shared.wire.dirty).toBe(false);
+      } finally {
+        a.controller.dispose(); b.controller.dispose();
+      }
+    },
+  );
+
+  it.each([
+    { inputName: 'user input', next: 'second' },
+    { inputName: 'neutral reply', next: REPLY },
+  ])('discards a disposed connection queued paste-start without blocking later $inputName',
+    async ({ next }) => {
+      const shared = { target: { backend: {}, lifetime: 1, generation: 1, binding: {}, transport: {} },
+        wire: new WebTerminalInputWireState() };
+      const a = fixture({}, shared), b = fixture({}, shared);
+      const queue: Array<{ data: string; owner: symbol }> = [];
+      const physical: string[] = [];
+      a.write((data, owner) => { queue.push({ data, owner }); return 'queued'; });
+      b.write(data => { physical.push(data); return true; });
+      try {
+        expect(await a.controller.accept('\x1b[200~first')).toBe('forwarded');
+        expect(queue.map(item => item.data)).toEqual(['\x1b[200~first']);
+        expect(shared.wire.owner).toBe(queue[0]!.owner);
+        expect(queue[0]!.owner).toBe(a.writeCalls[0]!.owner);
+        expect(shared.wire.writer.inPaste).toBe(false);
+        expect(shared.wire.acceptedWriter.inPaste).toBe(true);
+        expect(physical).toEqual([]);
+
+        let settled = false;
+        const second = b.controller.accept(next).then(result => { settled = true; return result; });
+        await drain();
+        expect(settled).toBe(false);
+        expect(b.writeCalls).toEqual([]);
+        a.controller.dispose();
+        expect(shared.wire.dirty).toBe(false);
+        expect(shared.wire.owner).toBeUndefined();
+        expect(shared.wire.acceptedWriter.inPaste).toBe(false);
+        expect(shared.wire.inPaste).toBe(false);
+        expect(a.uncertainTargets).toEqual([]);
+        // The disposed owner's queued bytes are discarded, never replayed.
+        expect(await second).toBe('forwarded');
+        expect(physical).toEqual([next]);
+        expect(shared.wire.dirty).toBe(false);
+      } finally {
+        a.controller.dispose(); b.controller.dispose();
+      }
+    },
+  );
+
+  it.each([
+    { pasteName: 'ESC CSI', paste: '\x1b[200~unwritten\r\n\x1b[201~' },
+    { pasteName: 'C1 CSI', paste: '\x9b200~unwritten\r\n\x9b201~' },
+  ])('keeps the wire clean after write=false rejects an explicitly unwritten complete paste ($pasteName)',
+    async ({ paste }) => {
+      const shared = { target: { backend: {}, lifetime: 1, generation: 1, binding: {}, transport: {} },
+        wire: new WebTerminalInputWireState() };
+      const f = fixture({}, shared);
+      const physical: string[] = [];
+      f.write(() => false);
+      try {
+        expect(await f.controller.accept(paste)).toBe('refused');
+        expect(f.writes).toEqual([paste]);
+        expect(shared.wire.writer.pending).toBe(false);
+        expect(shared.wire.acceptedWriter.pending).toBe(false);
+        expect(shared.wire.dirty).toBe(false);
+        expect(f.uncertainTargets).toEqual([]);
+        expect(f.controller.pending).toBe(false);
+        f.write(data => { physical.push(data); return true; });
+        expect(await f.controller.accept('later')).toBe('forwarded');
+        expect(physical).toEqual(['later']);
+        expect(shared.wire.dirty).toBe(false);
+      } finally {
+        f.controller.dispose();
+      }
+    },
+  );
+
+  it('keeps a physically written nonpaste Escape clean when the next ordinary input is refused', async () => {
+    const shared = { target: { backend: {}, lifetime: 1, generation: 1, binding: {}, transport: {} },
+      wire: new WebTerminalInputWireState() };
+    const f = fixture({}, shared);
+    try {
+      expect(await f.controller.accept('\x1b', { forceUser: true })).toBe('forwarded');
+      expect(f.writes).toEqual(['\x1b']);
+      expect(shared.wire.writer.pending).toBe(true);
+      expect(shared.wire.writer.inPaste).toBe(false);
+      expect(shared.wire.acceptedWriter.inPaste).toBe(false);
+      f.before(async () => false);
+      expect(await f.controller.accept('refused')).toBe('refused');
+      expect(f.writes).toEqual(['\x1b']);
+      expect(shared.wire.dirty).toBe(false);
+      expect(f.uncertainTargets).toEqual([]);
+      expect(f.controller.pending).toBe(false);
+      f.before(async () => true);
+      expect(await f.controller.accept('later')).toBe('forwarded');
+      expect(f.writes).toEqual(['\x1b', 'later']);
+      expect(shared.wire.dirty).toBe(false);
+    } finally {
+      f.controller.dispose();
+    }
+  });
+
+  it.each(['dispose', 'throw'] as const)(
+    'marks an actually written partial paste uncertain on its captured target after %s',
+    async action => {
+      const shared = { target: { backend: {}, lifetime: 1, generation: 1, binding: {}, transport: {} },
+        wire: new WebTerminalInputWireState() };
+      const a = fixture({}, shared), b = fixture({}, shared);
+      try {
+        expect(await a.controller.accept('\x1b[200~written')).toBe('forwarded');
+        const captured = a.writeCalls[0]!.target;
+        expect(shared.wire.writer.inPaste).toBe(true);
+        expect(shared.wire.owner).toBe(a.writeCalls[0]!.owner);
+        if (action === 'dispose') a.controller.dispose();
+        else {
+          a.write(() => { throw new Error('unconfirmed continuation'); });
+          expect(await a.controller.accept('continuation')).toBe('failed');
+        }
+        expect(shared.wire.dirty).toBe(true);
+        expect(a.uncertainties()).toBe(1);
+        expect(a.uncertainTargets).toEqual([captured]);
+        expect(a.uncertainTargets[0]).toBe(captured);
+        expect(await b.controller.accept(REPLY)).toBe('refused');
+        expect(b.writes).toEqual([]);
+        a.controller.dispose();
+        expect(a.uncertainties()).toBe(1);
+
+        shared.target.backend = {};
+        shared.target.generation++;
+        expect(a.controller.pending).toBe(false);
+        expect(await b.controller.accept('successor')).toBe('forwarded');
+        expect(b.writes).toEqual(['successor']);
+        expect(a.uncertainTargets[0]!.backend).toBe(captured.backend);
+        expect(a.uncertainTargets[0]!.backend).not.toBe(shared.target.backend);
+        expect(shared.wire.dirty).toBe(true);
+      } finally {
+        a.controller.dispose(); b.controller.dispose();
+      }
+    },
+  );
+
   it('keeps a reply after the queued attach terminator before replay starts', async () => {
     const wire = new WebTerminalInputWireState();
     const queue: Array<{ data: string; owner: symbol }> = [];
@@ -487,4 +675,101 @@ describe('WebTerminalInputController', () => {
     }
     expect(() => new WebTerminalInputController({ ...deps, setTimer: () => ({}) })).toThrow();
   });
+});
+
+describe('WebTerminalInputWireState', () => {
+  it.each(['written', 'accepted'] as const)(
+    'expires an old Escape before a delayed continuation on the %s wire',
+    async operation => {
+      let now = 1000;
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      const wire = new WebTerminalInputWireState(), owner = Symbol('writer');
+      const parser = operation === 'written' ? wire.writer : wire.acceptedWriter;
+      try {
+        recordWireInput(wire, operation, '\x1b', owner);
+        expect(parser.pending).toBe(true);
+        now += 100;
+        recordWireInput(wire, operation, '[200~', owner);
+        // A tail arriving after expiry cannot turn the old Escape into paste.
+        expect(parser.pending).toBe(false);
+        expect(wire.inPaste).toBe(false);
+        expect(wire.owner).toBeUndefined();
+        expect(await wire.waitForPasteEnd()).toBe(true);
+        now++;
+        recordWireInput(wire, operation, '\x1b[200~fresh', owner);
+        expect(parser.inPaste).toBe(true);
+        now++;
+        recordWireInput(wire, operation, '\x1b[201~', owner);
+        expect(wire.inPaste).toBe(false);
+        expect(wire.dirty).toBe(false);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it.each((['written', 'accepted'] as const).flatMap(operation => [
+    { timing: 'immediate', arrival: 1 },
+    { timing: 'delayed', arrival: 100 },
+  ].flatMap(timing => [
+    { pasteName: 'ESC CSI', start: '\x1b[200~', end: '\x1b[201~' },
+    { pasteName: 'C1 CSI', start: '\x9b200~', end: '\x9b201~' },
+  ].map(paste => ({ operation, ...timing, ...paste })))))(
+    'tracks an Escape followed by a new paste on the $operation wire ($timing, $pasteName)',
+    async ({ operation, arrival, start, end }) => {
+      let now = 0;
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      const wire = new WebTerminalInputWireState(), owner = Symbol('writer');
+      const parser = operation === 'written' ? wire.writer : wire.acceptedWriter;
+      try {
+        recordWireInput(wire, operation, '\x1b', owner);
+        expect(parser.pending).toBe(true);
+        expect(parser.inPaste).toBe(false);
+        now = arrival;
+        recordWireInput(wire, operation, start, owner);
+        expect(parser.inPaste).toBe(true);
+        expect(wire.inPaste).toBe(true);
+        expect(wire.owner).toBe(owner);
+        expect(wire.dirty).toBe(false);
+
+        let completed = false;
+        const completion = wire.waitForPasteEnd().then(ok => { completed = true; return ok; });
+        await drain();
+        expect(completed).toBe(false);
+        now++;
+        recordWireInput(wire, operation, 'body\r\n' + end, owner);
+        expect(await completion).toBe(true);
+        expect(parser.pending).toBe(false);
+        expect(wire.inPaste).toBe(false);
+        expect(wire.owner).toBeUndefined();
+        expect(wire.dirty).toBe(false);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
+  it.each(['written', 'accepted'] as const)(
+    'keeps a color reply split inside ST on the %s wire without creating paste ownership',
+    operation => {
+      let now = 0;
+      const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+      const wire = new WebTerminalInputWireState(), owner = Symbol('writer');
+      const parser = operation === 'written' ? wire.writer : wire.acceptedWriter;
+      try {
+        recordWireInput(wire, operation, REPLY.slice(0, -1), owner);
+        expect(parser.pending).toBe(true);
+        expect(wire.inPaste).toBe(false);
+        expect(wire.owner).toBeUndefined();
+        now = 1;
+        recordWireInput(wire, operation, '\\', owner);
+        expect(parser.pending).toBe(false);
+        expect(wire.inPaste).toBe(false);
+        expect(wire.owner).toBeUndefined();
+        expect(wire.dirty).toBe(false);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
 });

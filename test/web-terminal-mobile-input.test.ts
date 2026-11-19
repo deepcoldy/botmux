@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { WebTerminalInputClassifier } from '../src/core/web-terminal-input.js';
+import { quickCommandSequence } from '../src/core/web-terminal-quick-commands.js';
 
 const workerSource = (): string => readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
@@ -80,6 +82,7 @@ interface MobileHarness {
   controls: FakeElement[];
   shortcut(action: string): FakeElement | undefined;
   sentInputs(): string[];
+  sentFrames(): Array<{ type: string; data: string; forceUser?: boolean }>;
   rootProperty(name: string): string | undefined;
   viewportResizeCount(): number;
   keyboardUp(): boolean;
@@ -257,6 +260,7 @@ function bootMobileInput(options: {
     controls,
     shortcut: action => shortcutButtons.find(button => button.getAttribute('data-sk') === action),
     sentInputs: () => sent.map(payload => JSON.parse(payload).data as string),
+    sentFrames: () => sent.map(payload => JSON.parse(payload)),
     rootProperty: name => rootProperties.get(name),
     viewportResizeCount: () => resizeCount,
     keyboardUp: () => documentStub.activeElement === textarea,
@@ -277,6 +281,32 @@ function bootMobileInput(options: {
 }
 
 describe('手机 Web 终端输入栏', () => {
+  it.each([true, false, null])('toolbar explicit keys retain write authorization %s and user provenance', writable => {
+    const source = workerSource();
+    const start = source.indexOf('    function fire(){', source.indexOf("var btns=document.querySelectorAll('#toolbar-actions button')"));
+    const end = source.indexOf("    btn.addEventListener('pointerdown'", start);
+    // Execute the actual toolbar emitter, not a text-presence assertion.
+    const fireSource = source.slice(start, end).replaceAll('\\\\', '\\');
+    const frames: unknown[] = [];
+    const notify = vi.fn();
+    const fire = new Function('ws_', 'wsHasWrite', 'km', 'btn', '_showReadonlyToast', '_wbNoteInput',
+      `${fireSource}\nreturn fire;`)(
+      { readyState: 1, send: (data: string) => frames.push(JSON.parse(data)) },
+      writable, { key: '\x1b[I' }, { getAttribute: () => 'key' }, notify, vi.fn(),
+    ) as () => void;
+    fire();
+    expect(frames).toEqual(writable === true ? [{ type: 'input', data: '\x1b[I', forceUser: true }] : []);
+    expect(notify).toHaveBeenCalledTimes(writable === false ? 1 : 0);
+  });
+  it.each(['buffer', 'live'] as const)('marks explicit %s shortcut frames as user input even when shaped as focus', mode => {
+    const page = bootMobileInput({ wsHasWrite: true, initialMode: mode });
+    const seq = quickCommandSequence('<Esc>[I');
+    expect(page.mobileSend?.(seq)).toBe(true);
+    expect(page.sentFrames()).toEqual([{ type: 'input', data: seq, forceUser: true }]);
+    const classified = new WebTerminalInputClassifier().push(seq, page.sentFrames()[0]);
+    expect(classified.hasUser).toBe(true);
+    expect(classified.data).toBe(seq);
+  });
   it('把实测底栏高度留给终端，390×844 时内容区不会落到底栏后面', () => {
     const page = bootMobileInput({ wsHasWrite: true, barHeight: 88, barRectHeight: 88.1875 });
     expect(page.rootProperty('--mobile-bar-h')).toBe('89px');

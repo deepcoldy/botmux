@@ -5,6 +5,14 @@ const replies = [10, 11, 12].flatMap(code => ['\x1b]', '\x9d'].flatMap(start =>
   ['\x07', '\x1b\\', '\x9c'].map(end => `${start}${code};rgb:1/aB/1234${end}`)))
   .concat(['\x1b[I', '\x1b[O', '\x9bI', '\x9bO']);
 
+const escapeBoundaries = [
+  { timing: 'immediate', now: 1 },
+  { timing: 'at deadline', now: 10 },
+  { timing: 'after deadline', now: 11 },
+].flatMap(boundary => [false, true].map(forceUser => ({
+  ...boundary, forceUser, escape: forceUser ? 'force-user' : 'buffered',
+})));
+
 describe('WebTerminalInputClassifier', () => {
   it.each(replies)('forwards the entire supported reply without user activity: %j', reply => {
     const c = new WebTerminalInputClassifier();
@@ -62,6 +70,110 @@ describe('WebTerminalInputClassifier', () => {
     expect(c.push(replies[0]!, { forceUser: 'protocol' }, 102).hasUser).toBe(false);
     expect(c.push('draft', { forceUser: false }, 103).hasUser).toBe(true);
   });
+
+  it.each(escapeBoundaries.flatMap(boundary => [
+    { pasteName: 'ESC CSI', start: '\x1b[200~', end: '\x1b[201~' },
+    { pasteName: 'C1 CSI', start: '\x9b200~', end: '\x9b201~' },
+  ].map(paste => ({ ...boundary, ...paste }))))(
+    'tracks a new paste after a separate $escape Escape ($timing, $pasteName)',
+    ({ forceUser, now, start, end }) => {
+      const c = new WebTerminalInputClassifier({ carryMs: 10 });
+      const escape = c.push('\x1b', { forceUser }, 0);
+      expect(escape).toMatchObject({
+        data: forceUser ? '\x1b' : '', hasUser: forceUser, maySubmit: false,
+        pasteRelated: false, pending: true,
+      });
+      const marker = c.push(start, {}, now);
+      expect(marker).toMatchObject({
+        data: (forceUser ? '' : '\x1b') + start, hasUser: true,
+        maySubmit: false, pasteRelated: true, pending: true, deadline: undefined,
+      });
+      expect(c.inPaste).toBe(true);
+      expect(c.bufferedBytes).toBe(0);
+
+      const payload = replies[0]! + '\r\n草稿🌱';
+      const body = c.push(payload, {}, now + 1);
+      expect(body).toMatchObject({
+        data: payload, hasUser: true, maySubmit: false, pasteRelated: true, pending: true,
+      });
+      expect(c.inPaste).toBe(true);
+      const terminator = c.push(end, {}, now + 2);
+      expect(terminator).toMatchObject({
+        data: end, hasUser: true, maySubmit: false, pasteRelated: true, pending: false,
+      });
+      expect(c.inPaste).toBe(false);
+      const submit = c.push('\r', {}, now + 3);
+      expect(submit).toMatchObject({
+        data: '\r', hasUser: true, maySubmit: true, pasteRelated: false, pending: false,
+      });
+      expect(escape.data + marker.data + body.data + terminator.data + submit.data)
+        .toBe('\x1b' + start + payload + end + '\r');
+      expect(c.expire(now + 20).data).toBe('');
+    },
+  );
+
+  it.each(escapeBoundaries.flatMap(boundary => [
+    { replyName: 'ESC focus-in', reply: '\x1b[I' },
+    { replyName: 'ESC focus-out', reply: '\x1b[O' },
+    { replyName: 'C1 focus-in', reply: '\x9bI' },
+    { replyName: 'C1 focus-out', reply: '\x9bO' },
+    { replyName: 'ESC color', reply: '\x1b]11;rgb:1/aB/1234\x1b\\' },
+    { replyName: 'C1 color', reply: '\x9d11;rgb:1/aB/1234\x1b\\' },
+  ].flatMap(reply => [false, true].map(split => ({
+    ...boundary, ...reply, split, splitName: split ? 'split introducer' : 'whole',
+  })))))(
+    'recognizes a new neutral reply after a separate $escape Escape ($timing, $replyName, $splitName)',
+    ({ forceUser, now, reply, split }) => {
+      const c = new WebTerminalInputClassifier({ carryMs: 10 });
+      const escape = c.push('\x1b', { forceUser }, 0);
+      expect(escape).toMatchObject({
+        data: forceUser ? '\x1b' : '', hasUser: forceUser, maySubmit: false,
+        pasteRelated: false, pending: true,
+      });
+      let emitted = escape.data;
+      if (split) {
+        const prefix = c.push(reply[0]!, {}, now);
+        expect(prefix).toMatchObject({
+          data: forceUser ? '' : '\x1b', hasUser: !forceUser, maySubmit: false,
+          pasteRelated: false, pending: true, deadline: now + 10,
+        });
+        expect(c.bufferedBytes).toBe(Buffer.byteLength(reply[0]!, 'utf8'));
+        emitted += prefix.data;
+      }
+      const out = c.push(split ? reply.slice(1) : reply, {}, now + (split ? 1 : 0));
+      expect(out).toMatchObject({
+        data: (!split && !forceUser ? '\x1b' : '') + reply,
+        hasUser: !split && !forceUser, maySubmit: false, pasteRelated: false,
+        pending: false, deadline: undefined,
+      });
+      expect(emitted + out.data).toBe('\x1b' + reply);
+      expect(c.inPaste).toBe(false);
+      expect(c.bufferedBytes).toBe(0);
+      expect(c.expire(now + 20).data).toBe('');
+    },
+  );
+
+  it.each(replies.filter(reply => reply.endsWith('\x1b\\')).flatMap(reply =>
+    [false, true].map(forceUser => ({ reply, forceUser }))))(
+    'keeps a color reply split inside ST in the same candidate: %j',
+    ({ reply, forceUser }) => {
+      const c = new WebTerminalInputClassifier({ carryMs: 10 });
+      const prefix = reply.slice(0, -1);
+      const a = c.push(prefix, { forceUser }, 0);
+      expect(a).toMatchObject({
+        data: forceUser ? prefix : '', hasUser: forceUser, maySubmit: false,
+        pasteRelated: false, pending: true, deadline: 10,
+      });
+      const b = c.push('\\', {}, 1);
+      expect(b).toMatchObject({
+        data: forceUser ? '\\' : reply, hasUser: forceUser, maySubmit: false,
+        pasteRelated: false, pending: false, deadline: undefined,
+      });
+      expect(a.data + b.data).toBe(reply);
+      expect(c.inPaste).toBe(false);
+      expect(c.expire(20).data).toBe('');
+    },
+  );
 
   it('upgrades a buffered prefix if its next fragment has a user hint', () => {
     const c = new WebTerminalInputClassifier();
