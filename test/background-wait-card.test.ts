@@ -22,11 +22,12 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({ Client: class {
 } }));
 import {
   initWorkerPool, setActiveSessionsRegistry, getActiveSessionsRegistry, streamCardLabel,
-  usageRefreshShouldRun, syncUsageRefreshTimer,
+  usageRefreshShouldRun, syncUsageRefreshTimer, USAGE_REFRESH_INTERVAL_MS,
   __testOnly_setupWorkerHandlers as setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
+import { mergeDashboardConfig } from '../src/global-config.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import { __testOnly_activeSessions as activeSessions, __testOnly_sessionReply as sessionReply } from '../src/daemon.js';
@@ -39,6 +40,7 @@ import { composeRowFromActive } from '../src/core/dashboard-rows.js';
 import { markSessionActivity } from '../src/core/session-activity.js';
 import { normalizeExecutionActivity } from '../src/core/execution-activity.js';
 import { sessionLastActivityAt } from '../src/dashboard/web/sessions.js';
+import { isOffBoardIdle } from '../src/dashboard/web/kanban-model.js';
 
 const APP = 'cli_background_wait_card';
 const oldDataDir = config.session.dataDir;
@@ -52,6 +54,8 @@ beforeEach(() => {
   vi.stubEnv('BOTMUX_LARK_QPS', '100000');
   vi.stubEnv('BOTMUX_LARK_GATE_RETRY_BASE_MS', '1');
   home = mkdtempSync(join(tmpdir(), 'background-wait-card-'));
+  vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'config.json'));
+  mergeDashboardConfig({ modelQueueNotify: true });
   const data = join(home, 'data'); mkdirSync(data, { mode: 0o700 });
   config.session.dataDir = data;
   activeSessions.clear(); setActiveSessionsRegistry(activeSessions);
@@ -123,7 +127,105 @@ async function beginActivity(cliId: 'traex' | 'codex', usageDisplay: 'streaming'
   await worker.listeners('message')[0]({ type: 'turn_execution_started', ...input, startedAtMs: Date.now() - 1000 });
 }
 
+async function activityScreen(content: string): Promise<void> {
+  await worker.listeners('message')[0]({
+    type: 'screen_update', content, status: 'working', turnId: 'om_turn', dispatchAttempt: 1,
+  });
+  await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+}
+
 describe('activity-triggered refresh boundaries', () => {
+  it('reads queue notification live while keeping the shared queue observation', async () => {
+    await beginActivity('traex', 'streaming');
+    ds.lastScreenContent = '◆ Queued for capacity (3s • esc to interrupt)';
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'model_queue' });
+    mergeDashboardConfig({ modelQueueNotify: false });
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    expect(composeRowFromActive(ds, { includeTokenUsage: false }).executionActivity).toMatchObject({ phase: 'model_queue' });
+    mergeDashboardConfig({ modelQueueNotify: true });
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'model_queue' });
+  });
+
+  it('repaints a queue label enabled mid-queue through the periodic refresh', async () => {
+    await withActivityClock(async () => {
+      await beginActivity('traex', 'off');
+      mergeDashboardConfig({ modelQueueNotify: false });
+      await activityScreen('◆ Queued for capacity (3s • esc to interrupt)');
+      expect(mocks.patch).not.toHaveBeenCalled();
+
+      mergeDashboardConfig({ modelQueueNotify: true });
+      await activityScreen('⠋ Queued for capacity (4s • esc to interrupt)');
+      // Config-only changes need no immediate PATCH, but must have a refresh
+      // timer even when this working card did not have one before the frame.
+      expect(mocks.patch).not.toHaveBeenCalled();
+      expect(ds.usageRefreshTimer).toBeDefined();
+
+      await vi.advanceTimersByTimeAsync(USAGE_REFRESH_INTERVAL_MS);
+      await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      expect(patchedHeaders()[0]).toContain(t('card.status.model_queue', undefined, 'zh'));
+    });
+  });
+
+  it('restores the working header through the periodic refresh when queue notification is disabled', async () => {
+    await withActivityClock(async () => {
+      await beginActivity('traex', 'off');
+      await activityScreen('◆ Queued for capacity (3s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      expect(patchedHeaders()[0]).toContain(t('card.status.model_queue', undefined, 'zh'));
+      expect(ds.usageRefreshTimer).toBeDefined();
+
+      mergeDashboardConfig({ modelQueueNotify: false });
+      await activityScreen('⠋ Queued for capacity (4s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(USAGE_REFRESH_INTERVAL_MS);
+      await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      expect(mocks.patch).toHaveBeenCalledTimes(2);
+      expect(patchedHeaders()[1]).toContain(t('card.status.working', undefined, 'zh'));
+    });
+  });
+
+  it('binds initial topic activity to the exact root before a follow-up assigns currentTurnId', async () => {
+    await beginActivity('traex', 'streaming');
+    ds.currentTurnId = undefined; ds.currentReplyTarget = undefined; ds.session.rootMessageId = 'om_turn';
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    ds.lastScreenContent = '◆ Queued for capacity (3s • esc to interrupt)';
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'model_queue' });
+    ds.currentTurnId = 'om_successor';
+    expect(streamCardLabel(ds)).toBeUndefined();
+  });
+
+  it('uses the exact initial reply turn and still requires execution evidence', async () => {
+    await beginActivity('traex', 'streaming'); ds.currentTurnId = undefined;
+    expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    ds.currentReplyTarget = { turnId: 'om_successor', rootMessageId: 'om_root' };
+    expect(streamCardLabel(ds)).toBeUndefined();
+    ds.currentReplyTarget = { turnId: 'om_turn', rootMessageId: 'om_root' };
+    ds.replyExecutionStarts = undefined;
+    expect(streamCardLabel(ds)).toBeUndefined();
+  });
+
+  it.each(['streaming', 'footer', 'off'] as const)('PATCHes capacity entry and exit immediately with usage %s', async usageDisplay => {
+    await withActivityClock(async () => {
+      await beginActivity('traex', usageDisplay);
+      const screen = async (content: string) => {
+        await worker.listeners('message')[0]({ type: 'screen_update', content, status: 'working', turnId: 'om_turn', dispatchAttempt: 1 });
+        await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
+      };
+      await screen('◆ Queued for capacity (3s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      expect(streamCardLabel(ds)).toMatchObject({ activity: 'model_queue' });
+      const queuedHeader = patchedHeaders()[0];
+      await screen('⠋ Queued for capacity (4s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(1);
+      await screen('✧ Thinking… (5s • esc to interrupt)');
+      expect(mocks.patch).toHaveBeenCalledTimes(2);
+      expect(patchedHeaders()[1]).not.toEqual(queuedHeader);
+      expect(streamCardLabel(ds)).toMatchObject({ activity: 'working' });
+    });
+  });
+
   it.each([
     ['codex', 'streaming', 0], ['codex', 'footer', 0], ['codex', 'off', 0],
     ['traex', 'streaming', 1], ['traex', 'footer', 1], ['traex', 'off', 1],
@@ -217,6 +319,172 @@ describe('Dashboard execution activity patches', () => {
     await worker.listeners('message')[0]({ type: 'screen_update', content: 'screen', status: 'idle', turnId });
     await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
   }
+
+  it('keeps a follow-up on the kanban when the activity patch invalidates the previous result', async () => {
+    const at = Date.now() - 1_000;
+    ds.lastScreenStatus = 'idle';
+    ds.lastMessageAt = at;
+    ds.session.lastMessageAt = new Date(at).toISOString();
+    ds.session.lastTurn = { turnId: 'om_previous', outcome: 'delivered', at };
+    const view = dashboardRow();
+    try {
+      expect(isOffBoardIdle(view.current())).toBe(false);
+      ds.currentTurnId = 'om_follow_up';
+      markSessionActivity(ds, at + 1_000);
+      expect(view.current().lastMessageAt).toBe(at + 1_000);
+      expect(view.current().status).toBe('idle');
+      expect(isOffBoardIdle(view.current())).toBe(false);
+    } finally { view.stop(); }
+  });
+
+  it('publishes background count changes and clearing without requiring a status edge', async () => {
+    ds.lastScreenStatus = 'idle';
+    const view = dashboardRow();
+    try {
+      await screenUpdate('idle', 2);
+      expect(view.current().backgroundTaskCount).toBe(2);
+      await screenUpdate('idle', 1);
+      expect(view.current().backgroundTaskCount).toBe(1);
+      await screenUpdate('idle');
+      expect(view.current().backgroundTaskCount ?? null).toBeNull();
+    } finally { view.stop(); }
+  });
+
+  it('releases an excluded HTTP round after its terminal without inventing a new result', async () => {
+    const at = Date.now() - 10_000;
+    ds.lastScreenStatus = 'idle';
+    ds.lastMessageAt = at;
+    ds.session.lastMessageAt = new Date(at).toISOString();
+    ds.session.lastTurn = { turnId: 'om_previous', outcome: 'no_output', at };
+    ds.currentTurnId = 'om_turn';
+    ds.asyncTriggerResults = new Map([
+      ['om_turn', { status: 'pending', createdAt: at + 1_000 }],
+    ]) as any;
+    const view = dashboardRow();
+    try {
+      expect(isOffBoardIdle(view.current())).toBe(true);
+      markSessionActivity(ds, at + 1_000);
+      expect(isOffBoardIdle(view.current())).toBe(false);
+      await screenUpdate('working');
+      await screenUpdate('idle');
+      await worker.listeners('message')[0]({
+        type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId: 'om_turn', status: 'completed', outputDisposition: 'nothing_to_send',
+      });
+      expect(ds.asyncTriggerResults.get('om_turn')?.status).toBe('completed');
+      expect(ds.session.lastTurn).toEqual({
+        turnId: 'om_previous', outcome: 'no_output', at, heldThrough: at + 1_000,
+      });
+      expect(view.current().status).toBe('idle');
+      expect(isOffBoardIdle(view.current())).toBe(true);
+    } finally { view.stop(); }
+  });
+
+  it('does not let a late excluded terminal cover activity published before currentTurnId changes', async () => {
+    const t0 = Date.now() - 10_000;
+    const t1 = t0 + 1_000;
+    const t2 = t0 + 2_000;
+    ds.lastScreenStatus = 'idle';
+    ds.lastMessageAt = t0;
+    ds.session.lastMessageAt = new Date(t0).toISOString();
+    ds.session.lastTurn = { turnId: 'om_previous', outcome: 'no_output', at: t0 };
+    ds.currentTurnId = 'om_http';
+    ds.asyncTriggerResults = new Map([
+      ['om_http', { status: 'pending', createdAt: t1 }],
+    ]) as any;
+    const view = dashboardRow();
+    try {
+      markSessionActivity(ds, t1);
+      // Production publishes the human activity before beginNewTurn changes
+      // currentTurnId. The old excluded terminal can arrive inside this window.
+      markSessionActivity(ds, t2, { human: true });
+      expect(ds.currentTurnId).toBe('om_http');
+      await worker.listeners('message')[0]({
+        type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId: 'om_http', status: 'completed', outputDisposition: 'nothing_to_send',
+      });
+      expect(ds.asyncTriggerResults.get('om_http')?.status).toBe('completed');
+      expect(ds.lastMessageAt).toBe(t2);
+      expect(ds.session.lastTurn).toEqual({ turnId: 'om_previous', outcome: 'no_output', at: t0, heldThrough: t1 });
+      expect(isOffBoardIdle(composeRowFromActive(ds))).toBe(false);
+      expect(isOffBoardIdle(view.current())).toBe(false);
+
+      ds.currentTurnId = 'om_human';
+      await worker.listeners('message')[0]({
+        type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId: 'om_human', status: 'completed',
+      });
+      await vi.waitFor(() => expect(ds.session.lastTurn).toMatchObject({ turnId: 'om_human', outcome: 'no_output' }));
+      await vi.waitFor(() => expect(view.current().lastTurn?.turnId).toBe('om_human'));
+      expect(isOffBoardIdle(view.current())).toBe(true);
+    } finally { view.stop(); }
+  });
+
+  it('releases a restored excluded round without currentTurnId using its ledger timestamp', async () => {
+    const t0 = Date.now() - 10_000;
+    const t1 = t0 + 1_000;
+    ds.lastScreenStatus = 'idle';
+    ds.lastMessageAt = t1;
+    ds.session.lastMessageAt = new Date(t1).toISOString();
+    ds.session.lastTurn = { turnId: 'om_previous', outcome: 'no_output', at: t0 };
+    ds.currentTurnId = undefined;
+    ds.asyncTriggerResults = new Map([
+      ['om_http', { status: 'pending', createdAt: t1 }],
+    ]) as any;
+    const view = dashboardRow();
+    try {
+      expect(isOffBoardIdle(view.current())).toBe(false);
+      await worker.listeners('message')[0]({
+        type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId: 'om_http', status: 'completed', outputDisposition: 'nothing_to_send',
+      });
+      expect(ds.asyncTriggerResults.get('om_http')?.status).toBe('completed');
+      expect(ds.session.lastTurn).toEqual({ turnId: 'om_previous', outcome: 'no_output', at: t0, heldThrough: t1 });
+      expect(isOffBoardIdle(view.current())).toBe(true);
+    } finally { view.stop(); }
+  });
+
+  it('retries an excluded wait terminal after a heldThrough write failure without duplicating SSE', async () => {
+    const t0 = Date.now() - 10_000;
+    const t1 = t0 + 1_000;
+    ds.lastScreenStatus = 'idle';
+    ds.lastMessageAt = t1;
+    ds.session.lastMessageAt = new Date(t1).toISOString();
+    ds.session.lastTurn = { turnId: 'om_previous', outcome: 'no_output', at: t0 };
+    ds.currentTurnId = 'om_wait';
+    ds.pendingWaitPromises = new Map([
+      ['om_wait', { resolve: vi.fn(), reject: vi.fn(), createdAt: t1 }],
+    ]);
+    const view = dashboardRow();
+    const lastTurnEvents: unknown[] = [];
+    const off = dashboardEventBus.subscribe((event: any) => {
+      if (event.type === 'session.update' && event.body.sessionId === ds.session.sessionId
+        && event.body.patch.lastTurn) lastTurnEvents.push(event.body.patch.lastTurn);
+    });
+    const write = vi.spyOn(sessionStore, 'updateSession').mockImplementationOnce(() => { throw new Error('injected write failure'); });
+    try {
+      const terminal = {
+        type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId: 'om_wait', status: 'failed', errorCode: 'provider_error',
+      };
+      await worker.listeners('message')[0](terminal);
+      expect(ds.session.lastTurn).toEqual({ turnId: 'om_previous', outcome: 'no_output', at: t0 });
+      expect(lastTurnEvents).toHaveLength(0);
+      expect(ds.pendingWaitPromises?.has('om_wait')).toBe(false);
+
+      await worker.listeners('message')[0](terminal);
+      expect(ds.session.lastTurn).toEqual({ turnId: 'om_previous', outcome: 'no_output', at: t0, heldThrough: t1 });
+      expect(lastTurnEvents).toHaveLength(1);
+      expect(view.current().lastTurn?.heldThrough).toBe(t1);
+
+      await worker.listeners('message')[0](terminal);
+      expect(lastTurnEvents).toHaveLength(1);
+    } finally {
+      write.mockRestore();
+      off();
+      view.stop();
+    }
+  });
 
   it('replaces a settled turn\'s observation instead of carrying it into the next turn', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });

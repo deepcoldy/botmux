@@ -59,6 +59,17 @@ function baseEnv(dataDir: string, sessionId: string): NodeJS.ProcessEnv {
 }
 
 describe.skipIf(process.platform === 'win32')('statuslineHookCommand 实际执行', () => {
+  it('native effort changes and disappearance reach disk through the actual hook command', async () => {
+    const dataDir = makeDir(); const env = baseEnv(dataDir, 'sess-effort');
+    for (const level of ['high', 'medium', undefined]) {
+      const raw = { ...PAYLOAD, ...(level ? { effort: { level } } : {}) };
+      expect((await runHookCommand(env, JSON.stringify(raw))).status).toBe(0);
+      const written = JSON.parse(readFileSync(statuslineFilePath(dataDir, 'sess-effort'), 'utf8'));
+      expect(written.reasoningEffort).toBe(level);
+      expect(written.model).toBe(PAYLOAD.model.id);
+    }
+  }, 30_000);
+
   it('落盘的快照与 parseStatuslinePayload 的结果一致（卡片读到的字段不变）', async () => {
     const dataDir = makeDir();
     const r = await runHookCommand(baseEnv(dataDir, 'sess-a'), JSON.stringify(PAYLOAD));
@@ -99,6 +110,13 @@ describe.skipIf(process.platform === 'win32')('statuslineHookCommand 实际执�
 });
 
 describe('shouldSkipStatuslineWrite', () => {
+  it('writes a changed or removed effort immediately, even inside the dedupe window', () => {
+    const prev = JSON.stringify({ ts: 1_000_000, model: 'm', reasoningEffort: 'high' });
+    expect(shouldSkipStatuslineWrite(prev, { ts: 1_000_001, model: 'm', reasoningEffort: 'medium' })).toBe(false);
+    expect(shouldSkipStatuslineWrite(prev, { ts: 1_000_001, model: 'm' })).toBe(false);
+    expect(shouldSkipStatuslineWrite(prev, { ts: 1_000_001, model: 'm', reasoningEffort: 'high' })).toBe(true);
+  });
+
   const snap = (over: Partial<StatuslineSnapshot> = {}): StatuslineSnapshot => ({
     ts: 1_000_000, contextPercent: 10, fiveHourPercent: 3, model: 'm', ...over,
   });

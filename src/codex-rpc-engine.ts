@@ -24,9 +24,10 @@
 import { spawn, execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createServer } from 'node:net';
 import { get as httpGet } from 'node:http';
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { readLinuxBootIdentity, readProcessStartIdentity } from './utils/process-identity.js';
 import { WebSocket } from 'ws';
 import { MIN_POLL_REQUEST_BUDGET_MS } from './core/codex-poll-budget.js';
 import {
@@ -71,10 +72,92 @@ async function findFreePort(): Promise<number> {
 
 const isAlive = pidIsSignalable;
 
+interface GroupMemberIdentity {
+  pid: number;
+  group: number;
+  startTime: string;
+}
+
+function readGroupMember(pid: number): GroupMemberIdentity | undefined {
+  if (process.platform !== 'linux') {
+    const startTime = readProcessStartIdentity(pid);
+    if (!startTime) return undefined;
+    if (process.platform === 'win32') return { pid, group: pid, startTime };
+    try {
+      const [group, state] = execFileSync('ps', ['-o', 'pgid=,stat=', '-p', String(pid)], {
+        encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'],
+        env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+      }).trim().split(/\s+/);
+      if (state?.startsWith('Z') || !/^\d+$/.test(group ?? '')) return undefined;
+      return { pid, group: Number(group), startTime };
+    } catch { return undefined; }
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).trim().split(/\s+/);
+    if (fields[0] === 'Z' || fields[0] === 'X') return undefined;
+    const group = Number(fields[2]);
+    const startTime = fields[19];
+    if (!Number.isSafeInteger(group) || !/^\d+$/.test(startTime ?? '')) return undefined;
+    return { pid, group, startTime };
+  } catch (error) {
+    if (['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '')) return undefined;
+    throw error;
+  }
+}
+
+function groupMembers(group: number): GroupMemberIdentity[] {
+  let pids: number[];
+  if (process.platform === 'linux') {
+    pids = readdirSync('/proc').filter(entry => /^\d+$/.test(entry)).map(Number);
+  } else if (process.platform === 'win32') {
+    pids = [group];
+  } else {
+    pids = execFileSync('ps', ['-axo', 'pid=,pgid='], {
+      encoding: 'utf8', timeout: 2_000, stdio: ['ignore', 'pipe', 'ignore'],
+      maxBuffer: PROCESS_TABLE_MAX_BUFFER, env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+    }).trim().split('\n').map(line => line.trim().split(/\s+/).map(Number))
+      .filter(([pid, pgid]) => Number.isSafeInteger(pid) && pid > 1 && pgid === group)
+      .map(([pid]) => pid);
+  }
+  return pids.map(readGroupMember)
+    .filter((member): member is GroupMemberIdentity => member?.group === group);
+}
+
+interface GroupIdentity {
+  bootId: string;
+  members: GroupMemberIdentity[];
+}
+
+function bootId(): string | undefined {
+  return process.platform === 'linux' ? readLinuxBootIdentity() : process.platform;
+}
+
+function groupIdentityMatches(group: number, identity?: GroupIdentity): boolean {
+  if (!identity || !identity.bootId || identity.bootId !== bootId() || !Array.isArray(identity.members)) return false;
+  return identity.members.some(member => {
+    if (!Number.isSafeInteger(member?.pid) || member.pid <= 1 || member.group !== group
+      || typeof member.startTime !== 'string') return false;
+    const live = readGroupMember(member.pid);
+    return live?.group === group && live.startTime === member.startTime;
+  });
+}
+
+function isProcessGroupAlive(pid: number): boolean {
+  if (process.platform !== 'win32') return groupMembers(pid).length > 0;
+  if (process.platform === 'win32') return isAlive(pid);
+  return false;
+}
+
 /** Kill the whole process group (node wrapper + its native app-server child).
  *  The app-server is spawned `detached`, so its pid is the group leader. */
 function killGroup(pid: number, signal: NodeJS.Signals): void {
-  try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
+  try {
+    if (process.platform === 'win32') process.kill(pid, signal);
+    else process.kill(-pid, signal);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+  }
 }
 
 export interface CodexRpcEngineOpts {
@@ -98,6 +181,8 @@ export interface CodexRpcEngineOpts {
   appServerFeatures?: string[];
   /** Generic process-scoped app-server config overrides. */
   appServerConfig?: string[];
+  /** Caller must apply CLI version and restricted-bot policy first. */
+  bypassHookTrust?: boolean;
   /** Bridge a native request_user_input server request to the host UI. */
   onRequestUserInput?: (params: unknown, signal: AbortSignal, identity?: CodexRpcTurnIdentity) => Promise<unknown>;
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
@@ -112,6 +197,10 @@ export interface CodexRpcEngineOpts {
    *  resolving the ack. The worker uses that identity to release only the
    *  matching rpcActive bridge entry. */
   onTurnTerminal?: (terminal: CodexRpcTurnTerminal) => void;
+  /** The native thread's history was compacted (`thread/compacted`, or a
+   *  `contextCompaction` item, from auto-compaction or `/compact`). Content an
+   *  earlier turn delivered may no longer be in the model's context. */
+  onContextCompacted?: (threadId: string | undefined) => void;
 }
 
 export interface CodexRpcEngineDependencies {
@@ -124,6 +213,13 @@ export interface CodexRpcEngineDependencies {
     model?: string;
     serviceTier?: CodexServiceTier;
   }): Promise<CodexServiceTierCheck>;
+  /** Test seam: replace group signalling to simulate a verified group that
+   *  survives its bounded SIGKILL cleanup (an ordinary process cannot). */
+  killProcessGroup?(pid: number, signal: NodeJS.Signals): void;
+  /** Test seam: fault injected into the proc-table scan inside group-identity
+   *  capture, to prove a bookkeeping failure cannot change a determined turn
+   *  delivery result. */
+  groupIdentityScanError?: Error;
 }
 
 const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
@@ -150,6 +246,18 @@ export interface CodexRpcTurnTerminal {
   errorCode?: string;
 }
 
+export class CodexRpcDeliveryError extends Error {
+  constructor(
+    message: string,
+    readonly code: 'rpc_turn_start_active' | 'rpc_turn_start_not_sent' | 'rpc_turn_start_ambiguous',
+    readonly deliveryDisposition: 'not_sent' | 'ambiguous',
+    readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'CodexRpcDeliveryError';
+  }
+}
+
 /** Server→client requests are auto-answered so codex never blocks on a human;
  *  botmux already runs codex with approvals bypassed. Mirrors codex-app-runner. */
 function autoApproval(method: string): unknown {
@@ -172,8 +280,11 @@ const MARKER_DIR = join(homedir(), '.botmux', 'data', 'codex-rpc-app-servers');
  *  FIRST turn on a cold app-server pays MCP/model-list startup latency. */
 const REQUEST_TIMEOUT_MS = 60_000;
 
+const APP_SERVER_STOP_GRACE_MS = 2_000;
+const APP_SERVER_STOP_KILL_SETTLE_MS = 250;
 
 export class CodexRpcEngine {
+  private groupIdentity?: GroupIdentity;
   private child?: ChildProcess;
   private ws?: WebSocket;
   private nextId = 1;
@@ -208,6 +319,7 @@ export class CodexRpcEngine {
 
   get wsUrl(): string { return `ws://127.0.0.1:${this.port}`; }
   get activeThreadId(): string | undefined { return this.threadId; }
+  get activeNativeTurnId(): string | undefined { return this.turnOwners.keys().next().value; }
   get appServerPid(): number | undefined { return this.child?.pid; }
 
   private ownerKey(identity: CodexRpcTurnIdentity): string {
@@ -278,6 +390,11 @@ export class CodexRpcEngine {
       if (oldest) this.terminalNativeTurns.delete(oldest);
     }
     this.turnOwners.delete(nativeTurnId);
+    // Refresh the recorded group membership at every turn boundary: tool
+    // children spawned during a turn are only provable as this app-server's
+    // descendants while the leader is alive. After a leader crash they are the
+    // exact members a successor needs to finish bounded cleanup (R4).
+    this.captureGroupIdentity();
     // Keep owner→native through the request continuation. A fast app-server can
     // send turn/completed in the same socket read as the turn/start response;
     // deleting here would make the awaiting sender falsely conclude that the
@@ -303,7 +420,7 @@ export class CodexRpcEngine {
 
   /** Spawn the app-server, connect, and complete the initialize handshake. */
   async start(): Promise<void> {
-    this.reapStaleAppServer();
+    await this.reapStaleAppServer();
     const tierCheck = await (this.dependencies.validateServiceTier ?? validateCodexServiceTier)({
       cliBin: this.opts.cliBin,
       env: this.opts.env,
@@ -315,7 +432,8 @@ export class CodexRpcEngine {
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
     const configArgs = [...(this.opts.appServerConfig ?? [])]
       .flatMap(value => ['-c', value]);
-    this.child = this.dependencies.spawnProcess(this.opts.cliBin, ['app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
+    const globalArgs = this.opts.bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : [];
+    this.child = this.dependencies.spawnProcess(this.opts.cliBin, [...globalArgs, 'app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -340,6 +458,7 @@ export class CodexRpcEngine {
       capabilities: { experimentalApi: true },
     });
     this.notify('initialized');
+    this.captureGroupIdentity();
   }
 
   /** Create a fresh session thread. Its id (== codex rollout session id) is what
@@ -412,9 +531,19 @@ export class CodexRpcEngine {
   async sendTurn(
     content: string,
     identity: CodexRpcTurnIdentity,
-    opts?: { timeoutMs?: number; fatalOnTimeout?: boolean },
+    opts?: {
+      timeoutMs?: number;
+      fatalOnTimeout?: boolean;
+      /** Runs synchronously once the frame is on the socket, before any reply
+       *  can be processed. A `not_sent` rejection guarantees it never ran. */
+      onDispatch?: () => void;
+    },
   ): Promise<{ nativeTurnId: string }> {
-    if (!this.threadId) throw new Error('sendTurn before startThread/resumeThread');
+    if (!this.threadId) {
+      throw new CodexRpcDeliveryError(
+        'sendTurn before startThread/resumeThread', 'rpc_turn_start_not_sent', 'not_sent',
+      );
+    }
     const params: Json = {
       threadId: this.threadId,
       input: [{ type: 'text', text: content, text_elements: [] }],
@@ -423,9 +552,28 @@ export class CodexRpcEngine {
       sandboxPolicy: { type: 'dangerFullAccess' },
     };
     params.clientUserMessageId = identity.turnId;
-    await this.request('turn/start', params, opts, undefined, identity);
+    let dispatched = false;
+    const { onDispatch, ...requestOpts } = opts ?? {};
+    try {
+      await this.request('turn/start', params, requestOpts, () => {
+        dispatched = true;
+        onDispatch?.();
+      }, identity);
+    } catch (err) {
+      throw new CodexRpcDeliveryError(
+        err instanceof Error ? err.message : String(err),
+        dispatched ? 'rpc_turn_start_ambiguous' : 'rpc_turn_start_not_sent',
+        dispatched ? 'ambiguous' : 'not_sent',
+        err,
+      );
+    }
     const nativeTurnId = this.takeNativeTurnId(identity);
-    if (!nativeTurnId) throw new Error('turn/start ack did not bind a native turn id');
+    if (!nativeTurnId) {
+      throw new CodexRpcDeliveryError(
+        'turn/start ack did not bind a native turn id', 'rpc_turn_start_ambiguous', 'ambiguous',
+      );
+    }
+    this.captureGroupIdentity();
     return { nativeTurnId };
   }
 
@@ -531,6 +679,12 @@ export class CodexRpcEngine {
         () => { dispatched = true; },
         identity,
       );
+      // Mirror sendTurn(): a tool child spawned before this ack is only provable
+      // as this group's while the leader is alive. Snapshot now so a leader crash
+      // before the turn/completed event still leaves the successor a verified
+      // member — the completion callback never fires after a crash. capture is
+      // best-effort, so a scan fault cannot downgrade this already-acked result.
+      this.captureGroupIdentity();
       return { outcome: 'accepted', nativeTurnId: this.takeNativeTurnId(identity) };
     } catch (err) {
       if (!dispatched) {
@@ -550,53 +704,127 @@ export class CodexRpcEngine {
         // fallback: doing so could execute an already-landed first turn twice.
         this.log(`[codex-rpc] first-turn rollout probe failed (${(probeErr as Error).message}); keeping delivery ambiguous`);
       }
-      return landed
-        ? { outcome: 'accepted', nativeTurnId: undefined }
-        : { outcome: 'ambiguous' };
+      if (landed) {
+        // The frame was dispatched and persisted despite the lost ack; its tool
+        // children are still this leader's, so refresh membership on acceptance.
+        // capture is best-effort: rollout already proved the turn landed, so a
+        // scan fault cannot escape here into a duplicate paste fallback.
+        this.captureGroupIdentity();
+        return { outcome: 'accepted', nativeTurnId: undefined };
+      }
+      return { outcome: 'ambiguous' };
     }
   }
 
-  stop(): void {
+  stop(options: { scheduleKill?: boolean } = {}): void {
     if (this.closed) return;
     this.closed = true;
     this.emitAllTurnTerminals('stopped', 'rpc_engine_stopped');
     this.deferredUnownedTerminals.clear();
     try { this.ws?.close(); } catch { /* already gone */ }
     const pid = this.child?.pid;
-    if (pid && this.child?.exitCode == null && this.child?.signalCode == null) {
+    let signalError: unknown;
+    if (pid) {
       // Bounded SIGTERM → SIGKILL: don't leave a stubborn child as an untracked
       // orphan. The marker is removed by the child 'exit' handler (confirmed
       // dead), NOT here — if the child ignores SIGTERM and this worker then dies,
       // the surviving marker lets the next incarnation reap it (P1-2).
-      try { killGroup(pid, 'SIGTERM'); } catch { /* already gone */ }
-      const child = this.child!;
-      const t = setTimeout(() => {
-        if (child.exitCode == null && child.signalCode == null && isAlive(pid)) {
-          try { killGroup(pid, 'SIGKILL'); } catch { /* */ }
-        }
-      }, 2000);
-      child.once('exit', () => clearTimeout(t));
-      t.unref?.();
+      try {
+        this.captureGroupIdentity();
+        this.signalProcessGroup(pid, 'SIGTERM', this.wsUrl, this.groupIdentity);
+      } catch (error) { signalError = error; }
+      if (!signalError && options.scheduleKill !== false) {
+        const identity = this.groupIdentity;
+        const t = setTimeout(() => {
+          try { this.signalProcessGroup(pid, 'SIGKILL', this.wsUrl, identity); }
+          catch (error) { this.log(`[codex-rpc] refusing group cleanup: ${String(error)}`); }
+        }, APP_SERVER_STOP_GRACE_MS);
+        t.unref?.();
+      }
     } else {
       this.removeMarkerIfOwned();
     }
     this.failAll(new Error('engine stopped'));
+    // Unverifiable identity is a reason to leave the marker for the next
+    // incarnation, not to abort the caller: a throw here cascaded into
+    // process.exit(1) and made the session permanently unable to start RPC.
+    if (signalError) this.log(`[codex-rpc] refusing group cleanup: ${String(signalError)}`);
   }
 
-  /** Keep this owner alive until the actual native child exit is observed.
-   * stop() remains synchronous for restart callers; explicit close awaits this. */
-  async stopAndWait(timeoutMs = 3_500): Promise<boolean> {
-    const child = this.child;
-    if (!child) { this.stop(); return false; }
-    const exited = child.exitCode != null || child.signalCode != null;
-    if (exited) { this.stop(); return true; }
-    return new Promise<boolean>(resolve => {
-      const done = (ok: boolean) => { clearTimeout(timer); child.off('exit', onExit); resolve(ok); };
-      const onExit = () => done(true);
-      const timer = setTimeout(() => done(false), timeoutMs);
-      child.once('exit', onExit);
-      this.stop();
+  /** Keep the worker alive until all verified members of its detached group exit. */
+  async stopAndWait(timeoutMs = APP_SERVER_STOP_GRACE_MS + APP_SERVER_STOP_KILL_SETTLE_MS): Promise<boolean> {
+    this.stop({ scheduleKill: false });
+    const pid = this.child?.pid;
+    if (!pid) return false;
+    const grace = Math.min(timeoutMs, APP_SERVER_STOP_GRACE_MS);
+    if (!await this.waitForGroupExit(pid, grace)) {
+      try {
+        this.signalProcessGroup(pid, 'SIGKILL', this.wsUrl, this.groupIdentity);
+      } catch (error) {
+        this.log(`[codex-rpc] refusing group cleanup: ${String(error)}`);
+        return false;
+      }
+      if (!await this.waitForGroupExit(pid, Math.max(1, timeoutMs - grace))) {
+        throw new Error(`codex app-server process group ${pid} still alive after bounded cleanup`);
+      }
+    }
+    this.removeMarkerIfOwned();
+    return true;
+  }
+
+  private waitForGroupExit(pid: number, timeoutMs: number): Promise<boolean> {
+    if (!isProcessGroupAlive(pid)) return Promise.resolve(true);
+    return new Promise(resolve => {
+      const finish = (exited: boolean): void => {
+        clearInterval(poll);
+        clearTimeout(timer);
+        resolve(exited);
+      };
+      const poll = setInterval(() => {
+        try { if (!isProcessGroupAlive(pid)) finish(true); }
+        catch { finish(false); } // missing evidence must go through the signal identity gate
+      }, 25);
+      const timer = setTimeout(() => finish(false), timeoutMs);
     });
+  }
+
+  /** Capture the current process-group identity. Best-effort bookkeeping: the
+   *  proc-table scan and marker rewrite can fail, but such a fault must NEVER
+   *  break a live turn/startup/teardown flow — on failure we retain the prior
+   *  identity, and a later reap without fresh evidence simply fails closed. This
+   *  also protects the terminal-handler and sendTurn captures that fire on the
+   *  same clean-ack path as a first turn, not just the first-turn call sites. */
+  private captureGroupIdentity(): void {
+    const pid = this.child?.pid;
+    if (!pid || !this.processIsOurAppServer(pid, this.wsUrl)) return;
+    const currentBoot = bootId();
+    if (!currentBoot) return;
+    try {
+      // Test seam: raised where the real groupMembers() proc-table scan would.
+      if (this.dependencies.groupIdentityScanError) throw this.dependencies.groupIdentityScanError;
+      this.groupIdentity = { bootId: currentBoot, members: groupMembers(pid) };
+    } catch (error) {
+      this.log(`[codex-rpc] group identity scan failed; retaining prior identity: ${String(error)}`);
+      return;
+    }
+    const mp = this.markerPath();
+    if (!mp) return;
+    try {
+      const [markedPid, markedUrl] = readFileSync(mp, 'utf8').split('\n');
+      if (markedPid === String(pid) && markedUrl === this.wsUrl) {
+        writeFileSync(mp, `${pid}\n${this.wsUrl}\n${JSON.stringify(this.groupIdentity)}`, { mode: 0o600 });
+      }
+    } catch { /* cleanup still uses the in-memory identities */ }
+  }
+
+  private signalProcessGroup(pid: number, signal: NodeJS.Signals, url?: string, identity?: GroupIdentity): void {
+    if (!isProcessGroupAlive(pid)) return;
+    // A still-live original member proves PGID continuity even after the leader
+    // exits. PID + start time + boot ID must all match; PGID alone proves nothing.
+    if (!groupIdentityMatches(pid, identity) && !this.processIsOurAppServer(pid, url)) {
+      throw new Error(`exact app-server identity could not be verified for process group ${pid}`);
+    }
+    (this.dependencies.killProcessGroup ?? killGroup)(pid, signal);
   }
 
   // ---- app-server orphan marker (P0 teardown) ------------------------------
@@ -612,32 +840,65 @@ export class CodexRpcEngine {
    *  argv against `app-server` AND, when recorded, the exact `--listen <url>` a
    *  reused pid could not carry (P1-2). */
   private processIsOurAppServer(pid: number, markedUrl?: string): boolean {
-    let argv = '';
-    try { argv = readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' '); }
+    let args: string[];
+    try { args = readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); }
     catch {
-      try { argv = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: PROCESS_TABLE_MAX_BUFFER }); }
+      try {
+        args = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], {
+          encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: PROCESS_TABLE_MAX_BUFFER,
+        }).trim().split(/\s+/);
+      }
       catch { return false; }
     }
-    if (!/\bapp-server\b/.test(argv)) return false;
-    if (markedUrl && !argv.includes(markedUrl)) return false;
+    if (!args.includes('app-server')) return false;
+    const listen = args.indexOf('--listen');
+    if (markedUrl && (listen < 0 || args[listen + 1] !== markedUrl)) return false;
     return true;
   }
 
   /** Kill an app-server left behind by a prior incarnation of this session
    *  (e.g. the worker was SIGKILLed so its exit hooks never ran). Identity-checked
    *  so a reused pid is never mis-killed. */
-  private reapStaleAppServer(): void {
+  private async reapStaleAppServer(): Promise<void> {
     const mp = this.markerPath();
     if (!mp || !existsSync(mp)) return;
+    // Flips true only AFTER the group's identity is proven. Every error past that
+    // point (a signal that fails with EPERM/…, a reap check that throws, or a
+    // group that survives its bounded cleanup) must fail closed: keep the marker
+    // and reject start(), rather than silently spawning a second app-server on top
+    // of an orphan that may still be operating the workspace.
+    let verified = false;
     try {
-      const [pidStr, markedUrl] = readFileSync(mp, 'utf8').trim().split('\n');
-      const pid = parseInt(pidStr, 10);
-      if (Number.isInteger(pid) && pid > 0 && isAlive(pid) && this.processIsOurAppServer(pid, markedUrl)) {
-        killGroup(pid, 'SIGKILL'); // orphan from a crashed worker — no grace needed
-        this.log(`[codex-rpc] reaped stale app-server pid ${pid}`);
+      const [pidStr, markedUrl, rawIdentity] = readFileSync(mp, 'utf8').trim().split('\n');
+      const pid = /^\d+$/.test(pidStr) ? Number(pidStr) : NaN;
+      if (!Number.isSafeInteger(pid) || pid <= 1 || !isProcessGroupAlive(pid)) {
+        rmSync(mp, { force: true });
+        return;
+      }
+      let identity: GroupIdentity | undefined;
+      try { identity = rawIdentity ? JSON.parse(rawIdentity) : undefined; } catch { /* legacy marker */ }
+      // Missing/legacy/corrupted identity is not evidence authorizing a signal.
+      // A surviving group we cannot prove is either an orphan from the prior
+      // incarnation or a recycled pid: deleting the marker is the safe outcome
+      // (baseline behavior) — aborting start() would turn fail-closed into a
+      // session that can never engage RPC again.
+      if (!groupIdentityMatches(pid, identity) && !this.processIsOurAppServer(pid, markedUrl)) {
+        rmSync(mp, { force: true });
+        return;
+      }
+      verified = true;
+      this.signalProcessGroup(pid, 'SIGKILL', markedUrl, identity);
+      if (!await this.waitForGroupExit(pid, APP_SERVER_STOP_KILL_SETTLE_MS)) {
+        throw new Error(`stale codex app-server process group ${pid} still alive after bounded cleanup`);
       }
       rmSync(mp, { force: true });
-    } catch { /* best effort */ }
+    } catch (error) {
+      // A verified group's signal/reap failure is fatal: the marker is retained so
+      // a later incarnation can retry, and start() rejects instead of overwriting
+      // the only record of a live orphan. Only unverified/marker-read failures are
+      // swallowed (they are not evidence authorizing a signal).
+      if (verified) throw error;
+    }
   }
 
   private writeMarker(): void {
@@ -656,6 +917,7 @@ export class CodexRpcEngine {
   private removeMarkerIfOwned(): void {
     const mp = this.markerPath();
     if (!mp) return;
+    if (this.child?.pid && isProcessGroupAlive(this.child.pid)) return;
     try {
       const [pidStr, url] = readFileSync(mp, 'utf8').trim().split('\n');
       if (parseInt(pidStr, 10) === this.child?.pid && url === this.wsUrl) rmSync(mp, { force: true });
@@ -919,6 +1181,12 @@ export class CodexRpcEngine {
       if (['turn/aborted', 'turn/cancelled', 'turn/canceled'].includes(msg.method) && nativeTurnId) {
         this.cancelUserInputRequests(nativeTurnId);
         this.emitTurnTerminal(nativeTurnId, 'aborted', msg.method.replace('turn/', 'rpc_turn_'));
+        return;
+      }
+      if (msg.method === 'thread/compacted'
+        || ((msg.method === 'item/started' || msg.method === 'item/completed')
+          && params.item?.type === 'contextCompaction')) {
+        this.opts.onContextCompacted?.(typeof params.threadId === 'string' ? params.threadId : this.threadId);
         return;
       }
       if (['turn/failed', 'turn/error'].includes(msg.method) && nativeTurnId) {

@@ -139,6 +139,7 @@ describe('Oncall and feedback card composition', () => {
     const question = '系统报错日志'.repeat(500);
     const href = await createNativeOncallLink(target, 'secret', '', question, 'feishu', fetcher);
     const prefill = JSON.parse(new URL(new URL(href).searchParams.get('url')!).searchParams.get('context')!).trigger_message;
+    expect(new URL(new URL(href).searchParams.get('url')!).searchParams.get('query')).toBe(prefill);
     expect(prefill.endsWith('…') && question.startsWith(prefill.slice(0, -1))).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(buildOncallGroupColumn({ href })))).toBeLessThan(CARD_LATE_CHROME_RESERVE_BYTES);
   });

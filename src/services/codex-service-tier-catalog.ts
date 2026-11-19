@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import { realpathSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { parseDebugModelCapabilitiesJson, type DebugModelCapabilities } from '../adapters/cli/model-catalog-json.js';
 import type { CodexServiceTier } from './codex-service-tier.js';
@@ -37,13 +39,28 @@ function executableIdentity(cliBin: string): string {
   }
 }
 
+/**
+ * Identity of the Codex config the catalogue is read under. `codex debug models`
+ * follows CODEX_HOME/config.toml (provider, `model_catalog_json`), so an edit
+ * there must not be answered from a catalogue cached before it.
+ */
+export function codexConfigIdentity(env: NodeJS.ProcessEnv): string {
+  const home = env.CODEX_HOME?.trim() || join(env.HOME?.trim() || homedir(), '.codex');
+  try {
+    const stat = statSync(join(home, 'config.toml'));
+    return `${home}:${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    return `${home}:absent`;
+  }
+}
+
 function cacheKey(cliBin: string, env: NodeJS.ProcessEnv): string {
   const stableEnv = Object.keys(env)
     .filter(key => !CACHE_IRRELEVANT_ENV.has(key))
     .sort()
     .map(key => `${key}=${env[key] ?? ''}`)
     .join('\n');
-  return `${executableIdentity(cliBin)}\0${stableEnv}`;
+  return `${executableIdentity(cliBin)}\0${codexConfigIdentity(env)}\0${stableEnv}`;
 }
 
 export function clearCodexServiceTierCatalogCache(): void {

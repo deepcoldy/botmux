@@ -4,7 +4,28 @@ import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, withFileLockSync } from '../utils/file-lock.js';
 import type { OncallGroupSource } from './oncall-group-store.js';
-import type { OncallChoices } from './oncall-platform.js';
+import type { NativeOncallResultQuery, OncallChoices } from './oncall-platform.js';
+import type { OncallForwardMode } from './oncall-group-policy.js';
+
+export interface OncallNativeSubmissionAttempt extends NativeOncallResultQuery {
+  preparedAtMs: number;
+  policyFingerprint: string;
+  forwardMode: OncallForwardMode;
+}
+export interface OncallNativeSubmission {
+  attempts: OncallNativeSubmissionAttempt[];
+  completed?: boolean;
+}
+
+function normalizeNativeSubmission(draft: any): void {
+  const submission = draft?.nativeSubmission;
+  if (!submission || Array.isArray(submission.attempts) || typeof submission.sourceLocation !== 'string') return;
+  const { completed, ...attempt } = submission;
+  // The first native-form implementation persisted one slot and took the route
+  // from the draft. Migrate that record without discarding its verified identity.
+  draft.nativeSubmission = { attempts: [{ ...attempt, typeId: draft.typeId, region: draft.region }],
+    ...(completed !== undefined ? { completed } : {}) };
+}
 
 export interface OncallFormDraft {
   id: string;
@@ -17,6 +38,15 @@ export interface OncallFormDraft {
   typeId?: number;
   priority: 'P2' | 'P1' | 'P0';
   description: string;
+  /** Prepared before publication, so custom-form confirmation opens the sidebar directly. */
+  nativeFormLink?: string;
+  /** Every published selection is retained until the card is retired. */
+  nativeSubmission?: OncallNativeSubmission;
+  oncallUsername?: string;
+  /** Selected native form; selection stays frozen while the platform owns submission. */
+  nativeEntry?: { href: string; categoryName: string; policyFingerprint: string };
+  /** Read-only native form entry messages are excluded from conversation handoff. */
+  nativeMessageIds?: string[];
   targetFingerprint?: string;
   visibility?: 'private' | 'thread';
   publishStartedAtMs?: number;
@@ -32,7 +62,11 @@ export class OncallFormStore {
     return join(this.directory, createHash('sha256').update(JSON.stringify(ids)).digest('hex') + '.json');
   }
   private read<T>(file: string): T | undefined {
-    try { return JSON.parse(readFileSync(file, 'utf8')); }
+    try {
+      const value = JSON.parse(readFileSync(file, 'utf8'));
+      normalizeNativeSubmission(value);
+      return value as T;
+    }
     catch (e: any) { if (e.code === 'ENOENT') return undefined; throw e; }
   }
   private write(file: string, value: unknown): void {
@@ -62,17 +96,29 @@ export class OncallFormStore {
       if (!name.endsWith('.json')) continue;
       const draft = this.read<OncallFormDraft>(join(this.directory, name));
       if (draft?.appId === source.appId && draft.source?.chatId === source.chatId
-        && (source.sessionId ? draft.source.sessionId === source.sessionId : draft.source.questionId === source.questionId)
-        && draft.messageId) ids.add(draft.messageId);
+        && (source.sessionId ? draft.source.sessionId === source.sessionId : draft.source.questionId === source.questionId)) {
+        if (draft.messageId) ids.add(draft.messageId);
+        for (const id of draft.nativeMessageIds ?? []) ids.add(id);
+      }
     }
     return ids;
   }
-  async use<T>(appId: string, id: string, owner: string, operation: (draft: OncallFormDraft, persist: () => void) => Promise<T>, options: { allowClosed?: boolean } = {}): Promise<T> {
+  pendingNativeSubmissions(appId: string): OncallFormDraft[] {
+    let files: string[];
+    try { files = readdirSync(this.directory); }
+    catch (error: any) { if (error.code === 'ENOENT') return []; throw error; }
+    return files.filter(name => name.endsWith('.json')).flatMap(name => {
+      const draft = this.read<OncallFormDraft>(join(this.directory, name));
+      return draft?.appId === appId && draft.nativeSubmission?.attempts.length && !draft.nativeSubmission.completed
+        && Date.now() - draft.createdAtMs < 24 * 60 * 60_000 ? [draft] : [];
+    });
+  }
+  async use<T>(appId: string, id: string, owner: string, operation: (draft: OncallFormDraft, persist: () => void) => Promise<T>, options: { allowClosed?: boolean; allowExpired?: boolean } = {}): Promise<T> {
     const file = this.file(appId, id);
     return withFileLock(file, async () => {
       const draft = this.read<OncallFormDraft>(file);
       if (!draft || draft.appId !== appId || draft.ownerOpenId !== owner || (draft.closed && !options.allowClosed)
-        || Date.now() - draft.createdAtMs > 24 * 60 * 60_000) throw new Error('此表单已失效或不属于当前用户');
+        || (!options.allowExpired && Date.now() - draft.createdAtMs > 24 * 60 * 60_000)) throw new Error('此表单已失效或不属于当前用户');
       try { return await operation(draft, () => this.write(file, draft)); }
       finally { this.write(file, draft); }
     }, { maxWaitMs: 30_000 });

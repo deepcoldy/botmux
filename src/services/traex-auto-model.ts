@@ -28,6 +28,9 @@ export interface TraexAutoModelPreviousSettings extends TraexAutoModelSettings {
 export interface TraexAutoModelConfig {
   enabled: true;
   models: string[];
+  /** Durable empty-pool tombstone after confirmed catalog removal. Never
+   * launch a native default or enlarge the user's allowlist in this state. */
+  catalogUnavailable?: true;
   /** Omitted preserves the original capacity/queue policy. */
   trigger?: 'capacity' | 'quota';
   /** Keys are concrete model ids. An explicit empty entry follows that model's
@@ -80,7 +83,7 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
   if (!Array.isArray(value.models)) {
     return { error: 'traexAutoModel.models must be an array' };
   }
-  if (value.models.length === 0) {
+  if (value.models.length === 0 && value.catalogUnavailable !== true) {
     return {
       error: 'traexAutoModel.models must contain at least one model',
     };
@@ -215,6 +218,7 @@ export function normalizeTraexAutoModelConfig(raw: unknown): TraexAutoModelConfi
     config: {
       enabled: true,
       models,
+      ...(models.length === 0 && value.catalogUnavailable === true ? { catalogUnavailable: true as const } : {}),
       ...(value.trigger !== undefined ? { trigger: value.trigger as 'capacity' | 'quota' } : {}),
       ...(modelSettings ? { modelSettings } : {}),
       ...(value.reselectPerTurn !== undefined ? { reselectPerTurn: value.reselectPerTurn as boolean } : {}),
@@ -283,6 +287,7 @@ export interface TraexAutoModelRuntimeState {
   sharedSettings?: TraexAutoModelSettings;
   quotaBlocks?: Array<{ model: string; resetAtMs?: number }>;
   stoppedRecoveryTurnId?: string;
+  catalogRemovedModels?: string[];
   modelAccessRecovery?: {
     turnId: string;
     blockedModels: string[];
@@ -324,7 +329,7 @@ export type TraexAutoModelAction =
   | { kind: 'load_check'; turnId: string }
   | {
       kind: 'switch';
-      reason: 'new_turn' | 'quota_exhausted' | 'capacity_timeout' | 'queued_backup' | 'available_model' | 'shortest_queue' | 'lowest_load' | 'preflight_available' | 'preflight_lowest_load' | 'model_access_restricted';
+      reason: 'new_turn' | 'quota_exhausted' | 'capacity_timeout' | 'queued_backup' | 'available_model' | 'shortest_queue' | 'lowest_load' | 'preflight_available' | 'preflight_lowest_load' | 'model_access_restricted' | 'catalog_unavailable';
       turnId: string;
       fromModel: string;
       toModel: string;
@@ -393,17 +398,25 @@ export class TraexAutoModelController {
   private stoppedRecoveryTurnId: string | undefined;
   private accessBlockedModels = new Set<number>();
   private accessQueuedModels = new Set<number>();
+  private catalogModels: ReadonlySet<string> | undefined;
+  private catalogRemovedModels = new Set<string>();
+  private catalogReadFailed = false;
+  private savedPolicyKey: string | undefined;
 
   readonly sharedSettings?: TraexAutoModelSettings;
 
   constructor(readonly config: TraexAutoModelConfig, restored?: TraexAutoModelRuntimeState,
     sharedSettings?: TraexAutoModelSettings) {
+    if (config.models.length === 0) throw new Error('TraeX auto-model pool has no available models; change the pool in the console');
     this.sharedSettings = sharedSettings === undefined ? undefined : { ...sharedSettings };
     if (restored && restored.policyKey === traexAutoModelPolicyKey(config)
       && config.models.includes(restored.model)) {
       if (restored.sharedSettings) this.sharedSettings = { ...restored.sharedSettings };
       this.currentIndex = config.models.indexOf(restored.model);
       this.exhausted = restored.waitingOnFinalModel;
+      for (const model of restored.catalogRemovedModels ?? []) {
+        if (typeof model === 'string') this.catalogRemovedModels.add(model.toLowerCase());
+      }
       const access = restored.modelAccessRecovery;
       if (access && typeof access.turnId === 'string' && access.turnId
         && Array.isArray(access.blockedModels) && Array.isArray(access.queuedModels)) {
@@ -448,7 +461,8 @@ export class TraexAutoModelController {
 
   runtimeState(nativeSessionId: string): TraexAutoModelRuntimeState {
     return { model: this.currentModel(), waitingOnFinalModel: this.exhausted,
-      policyKey: traexAutoModelPolicyKey(this.config), nativeSessionId,
+      policyKey: this.savedPolicyKey ?? traexAutoModelPolicyKey(this.config), nativeSessionId,
+      ...(this.catalogRemovedModels.size ? { catalogRemovedModels: [...this.catalogRemovedModels] } : {}),
       ...(this.config.trigger === 'quota' ? { quotaBlocks: [...this.quotaBlocks].map(([model, block]) => ({ model, ...block })) } : {}),
       ...(this.stoppedRecoveryTurnId ? { stoppedRecoveryTurnId: this.stoppedRecoveryTurnId } : {}),
       ...(this.modelAccessRecoveryTurnId ? { modelAccessRecovery: {
@@ -482,6 +496,34 @@ export class TraexAutoModelController {
     return this.currentIndex;
   }
 
+  observeModelCatalog(models: ReadonlySet<string>): void {
+    if (models.size > 0) this.catalogModels = new Set([...models].map(model => model.toLowerCase()));
+  }
+
+  markCatalogPruned(removedModels: readonly string[], savedConfig: TraexAutoModelConfig): void {
+    for (const model of removedModels) this.catalogRemovedModels.add(model.toLowerCase());
+    this.savedPolicyKey = traexAutoModelPolicyKey(savedConfig);
+  }
+
+  catalogQueryFailed(turnId: string): void {
+    if (turnId !== this.turnId) return;
+    this.catalogReadFailed = true;
+    this.loadCheckPending = false;
+  }
+
+  private catalogEligible(index: number): boolean {
+    const key = this.config.models[index]?.toLowerCase();
+    return !!key && !this.catalogRemovedModels.has(key) && (!this.catalogModels || this.catalogModels.has(key));
+  }
+
+  catalogAdmissionDecision(turnId: string): TraexAutoModelAction {
+    if (this.catalogEligible(this.currentIndex) || this.recoveryStopped(turnId)) return { kind: 'none' };
+    const index = this.config.models.findIndex((_, i) => this.catalogEligible(i));
+    if (index < 0) return { kind: 'exhausted', turnId, model: this.currentModel(), modelCount: 0 };
+    return { kind: 'switch', reason: 'catalog_unavailable', turnId,
+      fromModel: this.currentModel(), toModel: this.config.models[index]!, toIndex: index };
+  }
+
   /** Read-only admission decision for one independent turn. Unknown loads are
    * skipped; if no known model is under the threshold, known loads are ranked
    * with pool order as the stable tie-breaker. The caller commits a switch only
@@ -496,7 +538,8 @@ export class TraexAutoModelController {
     if (this.modelAccessRecoveryTurnId === turnId || this.recoveryStopped(turnId)) {
       return { kind: 'keep', reason: 'disabled', model: currentModel, checkedModel: currentModel };
     }
-    const checkedIndex = options.preferFirstModel ? 0 : this.currentIndex;
+    const checkedIndex = options.preferFirstModel
+      ? this.config.models.findIndex((_, i) => this.catalogEligible(i)) : this.currentIndex;
     const checkedModel = this.config.models[checkedIndex]!;
     if (!traexAutoModelPreflightEnabled(this.config)) {
       return { kind: 'keep', reason: 'disabled', model: currentModel, checkedModel };
@@ -504,6 +547,7 @@ export class TraexAutoModelController {
     const threshold = this.config.overloadThresholdPercent
       ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
     const loadAt = (index: number): number | undefined => {
+      if (!this.catalogEligible(index)) return undefined;
       const value = loads?.get(this.config.models[index]!.toLowerCase());
       return value !== undefined && Number.isFinite(value) && value >= 0 ? value : undefined;
     };
@@ -640,6 +684,9 @@ export class TraexAutoModelController {
   beginTurn(turnId: string, options: { retainCurrentModel?: boolean } = {}): TraexAutoModelAction {
     if (!turnId || this.turnId === turnId) return { kind: 'none' };
     if (this.stoppedRecoveryTurnId !== turnId) this.stoppedRecoveryTurnId = undefined;
+    this.catalogReadFailed = false;
+    const catalogChoice = this.catalogAdmissionDecision(turnId);
+    if (catalogChoice.kind !== 'none') return catalogChoice;
     if (this.modelAccessRecoveryTurnId !== turnId) {
       if (this.modelAccessRecoveryTurnId) this.exhausted = false;
       this.modelAccessRecoveryTurnId = undefined;
@@ -650,12 +697,14 @@ export class TraexAutoModelController {
     if (this.config.trigger === 'quota' && !options.retainCurrentModel) {
       this.turnId = turnId;
       this.awaitingActivity = false;
-      const toIndex = this.config.models.findIndex(model => !this.quotaBlocked(model, Date.now()));
+      const toIndex = this.config.models.findIndex((model, index) =>
+        this.catalogEligible(index) && !this.quotaBlocked(model, Date.now()));
       if (toIndex < 0) return { kind: 'exhausted', turnId, model: fromModel, modelCount: this.config.models.length };
       if (toIndex === this.currentIndex) return { kind: 'none' };
       return { kind: 'switch', reason: 'new_turn', turnId, fromModel, toModel: this.config.models[toIndex]!, toIndex };
     }
-    if (options.retainCurrentModel || !this.config.reselectPerTurn || this.currentIndex === 0) {
+    const preferredIndex = this.config.models.findIndex((_, i) => this.catalogEligible(i));
+    if (options.retainCurrentModel || !this.config.reselectPerTurn || this.currentIndex === preferredIndex) {
       this.turnId = turnId;
       this.queueSinceMs = undefined;
       this.liveCapacityQueued = false;
@@ -672,8 +721,8 @@ export class TraexAutoModelController {
       reason: 'new_turn',
       turnId,
       fromModel,
-      toModel: this.config.models[0]!,
-      toIndex: 0,
+      toModel: this.config.models[preferredIndex]!,
+      toIndex: preferredIndex,
     };
   }
 
@@ -705,7 +754,7 @@ export class TraexAutoModelController {
     this.refreshQuotaEvidence(quotas, nowMs);
     if (!this.quotaBlocks.has(this.currentModel())) this.quotaBlocks.set(this.currentModel(), {});
     for (let index = this.currentIndex + 1; index < this.config.models.length; index++) {
-      if (this.quotaBlocked(this.config.models[index]!, nowMs)) continue;
+      if (!this.catalogEligible(index) || this.quotaBlocked(this.config.models[index]!, nowMs)) continue;
       return { kind: 'switch', reason: 'quota_exhausted', turnId, fromModel: this.currentModel(),
         toModel: this.config.models[index]!, toIndex: index };
     }
@@ -746,7 +795,7 @@ export class TraexAutoModelController {
     const untried: number[] = [];
     for (let offset = 1; offset <= this.config.models.length; offset++) {
       const index = (this.currentIndex + offset) % this.config.models.length;
-      if (!blocked(index) && !this.accessQueuedModels.has(index)) untried.push(index);
+      if (this.catalogEligible(index) && !blocked(index) && !this.accessQueuedModels.has(index)) untried.push(index);
     }
     const threshold = this.config.overloadThresholdPercent ?? TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT;
     const index = untried.find(candidate => loadAt(candidate) === undefined || loadAt(candidate)! <= threshold)
@@ -758,7 +807,7 @@ export class TraexAutoModelController {
         turnId, fromModel: this.currentModel(), toModel: this.config.models[index]!, toIndex: index,
         ...(percent !== undefined ? { loadPercent: percent } : {}) };
     }
-    const queued = [...this.accessQueuedModels].filter(candidate => !blocked(candidate))
+    const queued = [...this.accessQueuedModels].filter(candidate => this.catalogEligible(candidate) && !blocked(candidate))
       .sort((a, b) => a - b);
     if (!queued.length) {
       this.exhausted = true;
@@ -794,10 +843,12 @@ export class TraexAutoModelController {
    * Refused proposals leave the real running model and controller in agreement. */
   commitSwitch(action: Extract<TraexAutoModelAction, { kind: 'switch' }>, nowMs = Date.now()): boolean {
     const admissionSwitch = action.reason === 'new_turn'
+      || action.reason === 'catalog_unavailable'
       || action.reason === 'preflight_available'
       || action.reason === 'preflight_lowest_load';
     if (action.fromModel !== this.currentModel()
       || this.config.models[action.toIndex] !== action.toModel
+      || !this.catalogEligible(action.toIndex)
       || this.accessBlockedModels.has(action.toIndex) || this.recoveryStopped(action.turnId)
       || (!admissionSwitch && action.turnId !== this.turnId)) {
       return false;
@@ -807,7 +858,8 @@ export class TraexAutoModelController {
     this.queueSinceMs = undefined;
     this.liveCapacityQueued = false;
     this.exhausted = action.reason === 'shortest_queue' || action.reason === 'lowest_load';
-    const preflight = action.reason === 'preflight_available' || action.reason === 'preflight_lowest_load';
+    const preflight = action.reason === 'preflight_available' || action.reason === 'preflight_lowest_load'
+      || action.reason === 'catalog_unavailable';
     this.searchingBackups = action.reason !== 'new_turn' && !preflight && !this.exhausted;
     this.awaitingActivity = action.reason !== 'new_turn' && !preflight;
     this.progressSinceMs = undefined;
@@ -850,8 +902,11 @@ export class TraexAutoModelController {
   resolveModelLoads(turnId: string, loads: ReadonlyMap<string, number> | null): TraexAutoModelAction {
     if (turnId !== this.turnId || !this.loadCheckPending || this.recoveryStopped(turnId)) return { kind: 'none' };
     this.loadCheckPending = false;
+    if (this.catalogReadFailed) return { kind: 'none' };
     if (this.queueSinceMs === undefined) return { kind: 'none' };
     this.loadCheckDone = true;
+    const catalogChoice = this.catalogAdmissionDecision(turnId);
+    if (catalogChoice.kind !== 'none') return catalogChoice;
     if (this.modelAccessRecoveryTurnId === turnId) return this.selectModelAccessCandidate(turnId, loads);
     if (!loads) return { kind: 'none' };
     const loadAt = (index: number): number | undefined => {
@@ -859,6 +914,7 @@ export class TraexAutoModelController {
       return value !== undefined && Number.isFinite(value) && value >= 0 ? value : undefined;
     };
     for (let index = this.currentIndex + 1; index < this.config.models.length; index++) {
+      if (!this.catalogEligible(index)) continue;
       const percent = loadAt(index);
       if (percent === undefined || percent <= 100) {
         return { kind: 'switch', reason: percent === undefined
@@ -869,10 +925,11 @@ export class TraexAutoModelController {
     }
     // Do not rank incomplete snapshots. Sequential fallback can still observe
     // real queue positions and finish with a bounded final queue-rank choice.
-    if (this.config.models.some((_, index) => loadAt(index) === undefined)) return { kind: 'none' };
+    if (this.config.models.some((_, index) => this.catalogEligible(index) && loadAt(index) === undefined)) return { kind: 'none' };
     let bestIndex = -1;
     let bestLoad = Infinity;
     this.config.models.forEach((_, index) => {
+      if (!this.catalogEligible(index)) return;
       const percent = loadAt(index)!;
       if (percent < bestLoad) {
         bestIndex = index;
@@ -897,7 +954,7 @@ export class TraexAutoModelController {
     nowMs: number;
     queuePosition?: number;
   }): TraexAutoModelAction {
-    if (input.turnId && this.recoveryStopped(input.turnId)) return { kind: 'none' };
+    if (input.turnId && (this.recoveryStopped(input.turnId) || this.catalogReadFailed)) return { kind: 'none' };
     if (this.config.trigger === 'quota' && !this.modelAccessRecoveryTurnId) {
       if (input.turnId === this.turnId && (input.queued || input.progressing)) this.awaitingActivity = false;
       return { kind: 'none' };
@@ -944,7 +1001,8 @@ export class TraexAutoModelController {
       this.queueSinceMs = undefined;
       return this.selectModelAccessCandidate(input.turnId, null);
     }
-    const nextIndex = this.currentIndex + 1;
+    let nextIndex = this.currentIndex + 1;
+    while (nextIndex < this.config.models.length && !this.catalogEligible(nextIndex)) nextIndex++;
     this.queueSinceMs = undefined;
     if (nextIndex >= this.config.models.length) {
       // Compare recent actual queue ranks, never the elapsed spinner duration.
@@ -952,6 +1010,7 @@ export class TraexAutoModelController {
       let bestIndex = this.currentIndex;
       let bestPosition = Infinity;
       for (const [index, evidence] of this.queuePositions) {
+        if (!this.catalogEligible(index)) continue;
         if (input.nowMs - evidence.atMs > 10 * 60_000) continue;
         if (evidence.position < bestPosition || (evidence.position === bestPosition && index < bestIndex)) {
           bestIndex = index;

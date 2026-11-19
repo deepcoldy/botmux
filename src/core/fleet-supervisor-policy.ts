@@ -43,7 +43,8 @@ export interface FleetProcState {
   name: string;
   /** Owning bot's larkAppId (for status/logs correlation). */
   appId: string;
-  /** Live OS pid, or 0 when not running (stopped/errored/launching). */
+  /** Live OS pid, or 0 when not running. A launching row may retain the old
+   * orphan PID until retirement is verified, before a replacement can spawn. */
   pid: number;
   /** Monotonic spawn counter — bumped on every (re)spawn. Addresses a child by
    *  (name, generation) so a stale exit never mutates a newer generation. */

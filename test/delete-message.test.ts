@@ -36,6 +36,22 @@ describe('deleteMessage boolean contract', () => {
     expect(await deleteMessage('d2', 'om_x')).toBe(false);
   });
 
+  it('checks ownership immediately before the SDK delete, including a queued guard', async () => {
+    const sdkDelete = vi.fn(async () => ({ code: 0 }));
+    setDeleteImpl('d_fenced', sdkDelete);
+    let release!: () => void;
+    let owns = true;
+    const guard = vi.fn(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+      if (!owns) throw new Error('message became live');
+    });
+    const deleting = deleteMessage('d_fenced', 'om_x', { beforeWrite: guard });
+    await vi.waitFor(() => expect(guard).toHaveBeenCalledTimes(1));
+    owns = false; release();
+    expect(await deleting).toBe(false);
+    expect(sdkDelete).not.toHaveBeenCalled();
+  });
+
   it('returns false when the SDK throws', async () => {
     setDeleteImpl('d3', async () => { throw new Error('network'); });
     expect(await deleteMessage('d3', 'om_x')).toBe(false);

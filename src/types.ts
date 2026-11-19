@@ -305,6 +305,15 @@ export interface FailedTurnRecord {
   /** Provisional native quota observation, not a failed terminal. Unclaimed
    * snapshots expire when the CLI leaves limited or completes this turn. */
   limitedSnapshot?: true;
+  /** The worker saw this turn end on API errors alone (turn_terminal
+   *  `directFailure`): the next input may cut it out and re-send its input. */
+  directFailure?: true;
+  /** The terminal's `retryable`, kept for the rewind decision. */
+  retryable?: boolean;
+  /** Frozen at the failure: this turn's answer was meant for the chat (not an
+   *  HTTP wait/async result, a suppressed or silent run, a document comment).
+   *  Only such a failed input may be folded into another chat turn. */
+  answersInChat?: true;
   recovery?: {
     requestId: string;
     mode: 'retry' | 'fresh';
@@ -312,6 +321,23 @@ export interface FailedTurnRecord {
     sessionId: string;
     state: 'attempting' | 'accepted' | 'cancelled' | 'dispatch_unknown';
   };
+}
+
+/** Daemon → worker, on a `message`: the transcript's last turn is a turn that
+ *  failed without any output (see services/failed-turn-rewind.ts). Cut it out
+ *  first — the way /rewind does — and write {@link content} instead of the
+ *  message's own content, so failures do not pile up as turns. When the worker
+ *  cannot cut it (busy, the transcript shows something else, a restart is
+ *  running…) the message goes in unchanged, exactly as without a directive. */
+export interface FailedTurnRewindDirective {
+  failedTurnId: string;
+  /** The failed turn's exact input: the transcript's last turn must be it. */
+  failedInput: string;
+  /** `resend`: the failed input again (retry button / automatic continuation).
+   *  `merge`: the failed input followed by this message's input. */
+  mode: 'resend' | 'merge';
+  /** What the CLI gets once the turn is cut. */
+  content: string;
 }
 
 /** Stable human/bot identity used only for principal-lane routing.  The
@@ -544,6 +570,8 @@ export interface WorkflowNodeSessionMarker {
 }
 
 export interface Session {
+  /** Last settled fixed context for one TraeX native thread. */
+  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
   nativeGoalStatusCard?: import('./core/goal-status-card.js').GoalStatusCardRecord;
   nativeGoalCardOrigin?: import('./core/goal-status-card.js').GoalStatusCardOrigin;
   sessionLifecycle?: import('./services/session-contract.js').SessionLifecycle;
@@ -1141,6 +1169,23 @@ export interface Session {
    *  在 onTurnTerminal 回调中记录（failed/ambiguous），不随新 turn 注入清除——
    *  只被更新的失败 turn 覆盖。 */
   lastFailedTurn?: FailedTurnRecord;
+  /** The latest failure card posted to the chat, and the turn it reports.
+   *  A turn that re-sends that failed input reuses the card when it fails
+   *  the same way (services/failed-turn-rewind.ts). */
+  lastFailureCard?: { turnId: string; messageId: string };
+  /** A failed input that was cut from the transcript and re-sent (alone or
+   *  ahead of a newer input) as `turnId`. While that turn keeps failing
+   *  without output, the chain's one card is updated in place with the count
+   *  instead of a new card per failure. */
+  failedTurnRewindChain?: {
+    turnId: string;
+    /** The failed turn the chain started from: a retry or continuation aimed
+     *  at it may re-send what the chain carries now. */
+    originTurnId: string;
+    /** Consecutive failures of this input before `turnId` (the first is 1). */
+    failures: number;
+    cardMessageId?: string;
+  };
   /** Exact automatic recovery turn and its original, daemon-authenticated principal. */
   failedTurnRecovery?: {
     originalTurnId: string;
@@ -1255,6 +1300,8 @@ export interface Session {
   /** Optional reasoning effort frozen at creation (per-turn API override).
    *  Meaningful for codex/codex-app/traex/grok; injected by adapters at spawn. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Last explicit preference edit, only recorded while terminal writeback is enabled. */
+  terminalEffortPreferenceEdit?: { atMs: number; source: 'explicit' | 'terminal'; requestedAtMs?: number; enableEpoch?: number; nativeSessionId?: string; nativeModel?: string; nativeEffort?: string; nativeSnapshotHash?: string };
   /** Codex service tier frozen at session creation; legacy missing means inherit. */
   serviceTier?: CodexServiceTierPreference;
   /** Per-session opt-in idle auto-compaction (core/idle-auto-compact.ts).
@@ -2148,7 +2195,9 @@ type DaemonToWorkerBase =
   | { type: 'goal_update_ack'; signature: string }
   /** One small-model recap of `prompt`, answered by recap_result. */
   | { type: 'recap_request'; requestId: string; prompt: string }
-  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
+  | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef;
+      /** Set with `mayStart: false` when no lifecycle operation takes the start over. */
+      startRefusal?: import('./services/runtime-reservation.js').RuntimeStartRefusal }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   | { type: 'continuation_failure_ack'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   /** The host refused this binding; the worker returns to its predecessor. */
@@ -2164,6 +2213,7 @@ type DaemonToWorkerBase =
   | { type: 'codex_app_interrupt'; requestId: string; generation: string; turnEpoch: number }
   | { type: 'worker_ipc_probe' }
   | { type: 'protected_mcp_secret_channel_result'; requestId: string; ok: boolean; error?: string }
+  | { type: 'traex_model_pool_prune_result'; requestId: string; result: import('./services/traex-model-pool-prune.js').TraexModelPoolPruneResult }
   | { type: 'plugin_result_delivery_result'; requestId: string; ok: boolean; messageIds?: string[]; error?: string }
   | { type: 'link_ref_register_result'; requestId: string; ok: boolean; companion?: string; stats?: Partial<import('./services/link-ref-types.js').LinkRefExtractionStats>; error?: string }
   | { type: 'link_ref_resolve_result'; requestId: string; ok: boolean; payload?: import('./services/link-ref-resolver.js').ResolvedOutboundLinkRefs; error?: string }
@@ -2175,13 +2225,14 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
    *  IPCs would race: process.on('message') handlers don't serialize, and the
    *  raw_input branch awaits 200ms between sendText and Enter, a window where
    *  a separate `message` IPC could write into the PTY first. */
+  | { type: 'terminal_effort_writeback_ack'; nonce: string; preference: string }
   | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string; requireSafeComposer?: true }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
@@ -2303,7 +2354,10 @@ type DaemonToWorkerBase =
     dispatchAttempt?: number;
   };
 
-export type DaemonToWorker = DaemonToWorkerTransport & { sessionCommand?: import('./services/session-contract.js').SessionCommandContext };
+export type DaemonToWorker = DaemonToWorkerTransport & {
+  sessionCommand?: import('./services/session-contract.js').SessionCommandContext;
+  traexNativeContextReceipt?: import('./core/traex-native-context.js').TraexNativeContextReceipt;
+};
 
 type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
@@ -2411,6 +2465,9 @@ export interface WorkerFinalOutput {
   durationMs?: number;
   /** Literal CLI input time, from the same execution window as durationMs. */
   executionStartedAtMs?: number;
+  /** Model observed for this exact reply. Presentation only. */
+  replyModel?: string;
+  replyReasoningEffort?: string;
   /** Durable receiver attempt attribution. Final output suppression is
    *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
   dispatchAttempt?: number;
@@ -2484,6 +2541,7 @@ export interface WorkerFinalOutput {
 export type WorkerToDaemon = WorkerToDaemonBase & { sessionContract?: import('./services/session-contract.js').SessionEventContext };
 
 export type WorkerToDaemonBase =
+  | { type: 'traex_model_pool_prune'; requestId: string; expectedPolicyKey: string; availableModels: string[]; turnId?: string; dispatchAttempt?: number }
   | import('./services/final-output-handoff.js').FinalOutputOffer
   | { type: 'cancel_deployment_continuation'; requestId: string }
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
@@ -2556,10 +2614,18 @@ export type WorkerToDaemonBase =
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
   | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; dispatchAttempt?: number; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
+  | { type: 'traex_native_context_receipt'; receipt: import('./core/traex-native-context.js').TraexNativeContextReceipt }
   /** The CLI's UserPromptSubmit hook submitted a prompt that is, or starts
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
   | { type: 'prompt_submitted_input'; turnId: string; dispatchAttempt?: number }
+  /** Provenance-only signal for a Web Terminal / sandbox hook direct-submit.
+   *  Sent unconditionally when the submit hook fires, even when the worker has
+   *  no prompt_ready (the exact stuck-after-terminal case this card fix
+   *  targets): it opens the daemon's live-work episode without depending on a
+   *  ready→working screen edge, so a later working frame is never mistaken for
+   *  stale residue. Carries no status and never repaints the card by itself. */
+  | { type: 'direct_submit_started' }
   /** A live native terminal turn in a zero-injection session. Freeze its
    * reply destination before newer IM inputs can replace the sender. */
   | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }
@@ -2631,6 +2697,10 @@ export type WorkerToDaemonBase =
       modelBackendVariant?: 'standard' | 'max' | null;
       traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
     }
+  /** Claude statusline effort.level, independent of the transcript's serving model.
+   * null means the current native session has no usable effort reading. */
+  | ({ type: 'claude_effort' } & import('./services/claude-effort-observer.js').ClaudeEffortObservation)
+  | ({ type: 'native_reasoning' } & import('./services/native-reasoning-observation.js').NativeReasoningObservation)
   /** OBSERVED FACTS about Claude Code's automatic model switching — never a
    * decision. `claudeSessionId` (always present) says WHICH Claude conversation
    * they are about; `fallback` is a `scope:"session"` switch record this worker
@@ -2702,6 +2772,13 @@ export type WorkerToDaemonBase =
   | { type: 'session_ready_ack'; requestId: string }
   | { type: 'goal_update'; goal: import('./services/native-goal-state.js').NativeGoalState | null; turnId?: string; dispatchAttempt?: number; signature?: string }
   | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+      /** Set ONLY on the working frame a Web Terminal / sandbox hook
+       *  direct-submit publishes via the worker's clearTurnId path: real new
+       *  work that belongs to no managed turn. It explicitly reopens the card
+       *  to working after a post-terminal idle correction. A prompt-cache
+       *  keep-alive also clears the turn id but never sets this, so it cannot
+       *  flip a settled card back to working. Omitted everywhere else. */
+      directSubmit?: boolean;
       /** The main turn has ended but this many background tasks it launched are
        *  still running (card: 「主回合已结束 · 后台子任务运行中（N）」). Omitted
        *  otherwise. Never changes the reported status; the card shows it and the
@@ -2928,6 +3005,22 @@ export type WorkerToDaemonBase =
        *  provider answered before this failure — when its prompt cache was last
        *  refreshed. Bounds how long a recovery is worth waiting. */
       providerLastSuccessAtMs?: number;
+      /** `failed` Claude Code terminals only: the transcript's last turn is this
+       *  turn's input answered by API errors alone — no tool call, no text. The
+       *  next input may cut it out instead of stacking on top (see
+       *  services/failed-turn-rewind.ts). */
+      directFailure?: true;
+    }
+  | {
+      /** Outcome of a message's {@link FailedTurnRewindDirective}, sent before
+       *  the message reaches the CLI: `rewound` = the failed turn was cut and
+       *  the directive's content is what the CLI gets; `declined` = nothing
+       *  was cut and the message's own content goes in as usual. */
+      type: 'failed_turn_rewind';
+      turnId: string;
+      failedTurnId: string;
+      outcome: 'rewound' | 'declined';
+      reason: string;
     }
   | { type: 'adopt_preamble'; userText: string; assistantText: string; turnId?: string }
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }

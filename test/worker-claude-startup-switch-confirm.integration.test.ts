@@ -149,7 +149,7 @@ const onData = buf => {
   composer += s;
   render();
 };
-setTimeout(() => { ev({ kind: 'ready' }); render(); process.stdin.on('data', onData); }, 0);
+setTimeout(() => { ev({ kind: 'ready' }); render(); process.stdin.on('data', onData); }, cfg.bootMs);
 // C: a person answers the dialog in the Web terminal.
 setInterval(() => {
   if (!dialog || !cfg.personFile || !fs.existsSync(cfg.personFile)) return;
@@ -163,6 +163,8 @@ setInterval(() => {}, 1000);
 interface Scenario {
   name: string;
   dialogDelayMs: number;
+  /** Silent CLI boot, independent of the command-relative dialog delay. */
+  bootMs?: number;
   hook?: boolean;
   /** Enters on the dialog that are lost before it listens. */
   swallowAccepts?: number;
@@ -215,6 +217,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
   const configFile = join(root, 'fake-claude.json');
   writeFileSync(configFile, JSON.stringify({
     events: eventsFile, pidFile, transcript, dialogDelayMs: scenario.dialogDelayMs,
+    bootMs: scenario.bootMs ?? 0,
     subtitle: scenario.hook ? HOOK_SUBTITLE : CACHE_SUBTITLE,
     body: scenario.hook ? HOOK_BODY : CACHE_BODY,
     personFile: scenario.hook ? personFile : undefined,
@@ -264,6 +267,14 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
     } satisfies DaemonToWorker);
 
     const promptSubmitted = () => events().some(e => e.kind === 'submit' && e.text === FIRST_PROMPT);
+    // The fake's dialog delay starts at command submission, not worker spawn.
+    // Bound cold loading/boot independently, then wait for confirmation from
+    // the same event as the fake. Production timeouts remain unchanged.
+    await waitFor(
+      () => events().some(e => e.kind === 'submit' && e.text === '/effort max'),
+      60_000 + (scenario.bootMs ?? 0),
+      'the startup command submit',
+    );
     if (scenario.hook) {
       if (scenario.awaitDialogPending) {
         // F: the dialog only renders after the hold (dialogDelayMs=24s > 20s
@@ -339,7 +350,9 @@ it.skipIf(!tmuxAvailable)(
       // The fake person does not answer until the correction notice is seen, so
       // the dialog stays on screen across hold polls instead of racing them.
       runScenario({
-        name: 'F late hook dialog', dialogDelayMs: 24_000, hook: true,
+        // Boot + the delayed dialog deliberately exceed the old 60s
+        // spawn-relative budget; a missing event handshake must fail here.
+        name: 'F late hook dialog', bootMs: 45_000, dialogDelayMs: 24_000, hook: true,
         awaitDialogPending: true,
       }),
     ]);
@@ -385,5 +398,5 @@ it.skipIf(!tmuxAvailable)(
     expect(lateHook.events.map(e => e.kind).indexOf('dialog'))
       .toBeLessThan(lateHook.events.map(e => e.kind).indexOf('person'));
   },
-  180_000,
+  300_000,
 );

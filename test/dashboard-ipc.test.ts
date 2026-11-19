@@ -10,6 +10,8 @@ import { validateCodexServiceTier } from '../src/services/codex-service-tier-cat
 
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
+  // No live model catalogue: reasoning levels fall back to the static table.
+  loadCodexServiceTierCatalog: vi.fn(async () => null),
 }));
 import type { ChildProcess } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';

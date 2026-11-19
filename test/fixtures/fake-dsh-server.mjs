@@ -374,27 +374,38 @@ function handleLine(line) {
       if (logPath) appendFileSync(logPath, JSON.stringify({ phase: 'response' }) + '\n');
       return;
     }
-    send({ jsonrpc: '2.0', id: msg.id, result: { messageId } });
-    if (scenario === 'hang') return;
-    // Notifications land after the enqueue receipt, like the real server.
-    setImmediate(() => {
-      if (scenario === 'empty') runEmptyTurn(sessionId, messageId);
-      else if (scenario === 'reasoning') runReasoningTurn(sessionId, messageId);
-      else if (scenario === 'multi-step') runMultiStepTurn(sessionId, messageId);
-      else if (scenario === 'stale') runStaleTurn(sessionId, messageId);
-      else if (scenario === 'turn-error') runTurnErrorTurn(sessionId, messageId);
-      else if (scenario === 'progressive' || scenario === 'endless-progress') {
-        runProgressiveTurn(sessionId, messageId, scenario === 'endless-progress');
-      }
-      else if (scenario === 'unclaimed-progress') runUnclaimedProgress(sessionId);
-      else runHappyTurn(sessionId, messageId);
-    });
+    // A runtime that is slow to accept the prompt (a loaded host): the ACK and
+    // everything after it arrive FAKE_DSH_PROMPT_ACK_DELAY_MS late.
+    const ackDelayMs = Number(process.env.FAKE_DSH_PROMPT_ACK_DELAY_MS ?? 0);
+    if (ackDelayMs > 0) {
+      setTimeout(() => acceptPrompt(msg, sessionId, messageId), ackDelayMs);
+      return;
+    }
+    acceptPrompt(msg, sessionId, messageId);
     return;
   }
   if (msg.method === 'shutdown') {
     send({ jsonrpc: '2.0', id: msg.id, result: {} });
     setTimeout(() => process.exit(0), 50);
   }
+}
+
+function acceptPrompt(msg, sessionId, messageId) {
+  send({ jsonrpc: '2.0', id: msg.id, result: { messageId } });
+  if (scenario === 'hang') return;
+  // Notifications land after the enqueue receipt, like the real server.
+  setImmediate(() => {
+    if (scenario === 'empty') runEmptyTurn(sessionId, messageId);
+    else if (scenario === 'reasoning') runReasoningTurn(sessionId, messageId);
+    else if (scenario === 'multi-step') runMultiStepTurn(sessionId, messageId);
+    else if (scenario === 'stale') runStaleTurn(sessionId, messageId);
+    else if (scenario === 'turn-error') runTurnErrorTurn(sessionId, messageId);
+    else if (scenario === 'progressive' || scenario === 'endless-progress') {
+      runProgressiveTurn(sessionId, messageId, scenario === 'endless-progress');
+    }
+    else if (scenario === 'unclaimed-progress') runUnclaimedProgress(sessionId);
+    else runHappyTurn(sessionId, messageId);
+  });
 }
 
 process.stdin.setEncoding('utf8');

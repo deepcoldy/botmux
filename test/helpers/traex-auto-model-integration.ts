@@ -7,7 +7,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach } from 'vitest';
-import { nodeTsRunnerPrefix, spawnNodeTsScript } from './ts-runner.js';
+import { nodeTsRunnerPrefix } from './ts-runner.js';
+import { workerTestModules, useWorkerTestModulesCleanup } from './worker-test-modules.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../../src/types.js';
 import { resolveCodexRpcInput } from '../../src/services/codex-rpc-input-policy.js';
 import { killWorkerTmuxSession } from './worker-tmux-session.js';
@@ -15,6 +16,7 @@ import { readJsonLines } from './read-json-lines.js';
 import { t } from '../../src/i18n/index.js';
 import { lookupCliDisplayName } from '../../src/adapters/cli/display-names.js';
 import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
+import { pruneSavedTraexModelPool } from '../../src/services/traex-model-pool-prune.js';
 import { restartInterruptionNote, restartInterruptionNotice } from '../../src/services/restart-interruption.js';
 import { SessionController } from '../../src/core/session-controller.js';
 import { SessionContractStore } from '../../src/services/session-contract-store.js';
@@ -54,6 +56,7 @@ export const contractHandles: SessionContractStore[] = [];
 export const contractEvents: Promise<unknown>[] = [];
 /** Each suite registers the shared worker/pane/contract cleanup once. */
 export function useTraexAutoModelIntegrationCleanup(): void {
+  useWorkerTestModulesCleanup();
   afterEach(async () => {
     for (const child of children.splice(0)) {
       // Host replies to messages the worker sent just before the kill may
@@ -87,7 +90,8 @@ export async function fixture(enabled: boolean, loadData: false | 'busy' | 'orde
     exhaustLast?: boolean; initial?: boolean; blocked?: boolean },
   delayedHistoryReceipt?: { submission: number; ms: number },
   preflight?: { enabled: boolean; initialPrompt?: string; dispatchAttempt?: number;
-    probe?: 'success' | 'timeout' | 'failure'; timeoutMs?: number },
+    probe?: 'success' | 'timeout' | 'failure'; timeoutMs?: number; catalogModels?: string[];
+    catalogAfterStart?: string[] },
   restoreInterruptedStructuredTurn = false, restoreExhaustedOnLast = false, withContract = false,
   resumeRolloutDelayMs = 0) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
@@ -104,9 +108,11 @@ export async function fixture(enabled: boolean, loadData: false | 'busy' | 'orde
   const submissions = join(root, 'submissions.jsonl');
   const launches = join(root, 'launches.jsonl');
   const rpcRequests = join(root, 'catalog-requests.jsonl');
+  const poolConfigPath = join(root, 'pool-config.json');
   const release = join(root, 'release');
   const crash = join(root, 'crash');
   const replacementExit = join(root, 'replacement-exit');
+  const removeCliAfterCatalog = join(root, 'remove-cli-after-catalog');
   if (exitFirstReplacement) writeFileSync(replacementExit, '1');
   writeFileSync(rolloutPath, '');
   writeFileSync(historyPath, '');
@@ -129,13 +135,24 @@ if (process.argv[2] === 'app-server') {
       if (request.method === 'initialize') process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n');
       if (request.method === 'model/list' && ${JSON.stringify(preflight?.probe)} === 'timeout') continue;
       if (request.method === 'model/list' && ${JSON.stringify(preflight?.probe)} === 'failure') process.exit(1);
-      if (request.method === 'model/list') process.stdout.write(JSON.stringify({ id: request.id, result: {
-        data: ${JSON.stringify(loadData ? [
+      if (request.method === 'model/list') {
+        // This helper is already running and can still return a valid catalog.
+        // Remove only the future launch target BEFORE writing the response:
+        // the reader may terminate its helper as soon as that response arrives.
+        if (fs.existsSync(${JSON.stringify(removeCliAfterCatalog)})) {
+          fs.unlinkSync(${JSON.stringify(removeCliAfterCatalog)});
+          fs.unlinkSync(__filename);
+        }
+        process.stdout.write(JSON.stringify({ id: request.id, result: {
+        data: fs.existsSync(${JSON.stringify(launches)}) && ${JSON.stringify(preflight?.catalogAfterStart)} !== undefined
+          ? ${JSON.stringify(preflight?.catalogAfterStart?.map(id => ({ id })))}
+          : ${JSON.stringify(preflight?.catalogModels ? preflight.catalogModels.map(id => ({ id })) : loadData ? [
           { id: 'core', businessMetadata: { load: { load_percent: 180 } }, supportedReasoningEfforts: [{ reasoningEffort: 'xhigh' }, { reasoningEffort: 'max' }] },
           { id: 'backup', businessMetadata: { load: { load_percent: loadData === 'ordered' ? 100 : 160 } }, supportedReasoningEfforts: [{ reasoningEffort: 'high' }, { reasoningEffort: 'xhigh' }] },
           { id: 'last', businessMetadata: { load: { load_percent: loadData === 'ordered' ? 50 : 120 } }, supportedReasoningEfforts: [{ reasoningEffort: 'xhigh' }, { reasoningEffort: 'max' }] },
           { id: 'outside', businessMetadata: { load: { load_percent: 0 } } },
-        ] : [])}, nextCursor: null } }) + '\\n');
+        ] : [{ id: 'core' }, { id: 'backup' }, { id: 'last' }])}, nextCursor: null } }) + '\\n');
+      }
     }
   });
 } else {
@@ -233,7 +250,9 @@ process.stdin.on('data', chunk => {
           ...(failed ? { error } : {}) });
         idle();
       }, 1200);
-    } else if (successorAfterReset || (${JSON.stringify(withContract)} && model !== 'core')) {
+    } else if (successorAfterReset || (${JSON.stringify(withContract || restoreWithoutBanner)} && model !== 'core')) {
+      // A recovered composer in the startup-recovery scenario proceeds to
+      // healthy work. A second capacity queue belongs to separate pool tests.
       process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
     } else if (${JSON.stringify(activityMode === 'delayed-first-queue')} && model === 'core') {
       // Native submission is acknowledged before its first activity repaint.
@@ -289,6 +308,7 @@ setInterval(() => {
     })}\n`);
   }
   const binary = process.env.BOTMUX_TEST_WORKER_BINARY;
+  const modules = workerTestModules({ forceSource: !!binary });
   const backendType = withContract || binary || process.env.BOTMUX_TEST_WORKER_BACKEND === 'tmux' ? 'tmux' : 'pty';
   if (backendType === 'tmux') panes.push(`bmx-${sessionId.slice(0, 8)}`);
   const options = {
@@ -297,7 +317,7 @@ setInterval(() => {
       CLI_EXTRA_ARGS: startupExtraArgs ?? '', SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any,
   };
-  let entry = resolve('src/worker.ts');
+  let entry = modules.path('worker.ts');
   if (!binary && (activityMode || delaySecondModelOrderNoticeMs > 0)) {
     // Test-only worker bootstrap, generated into the fixture's cleaned root.
     // - activityMode: heartbeats + capture timing for admission measurements;
@@ -306,8 +326,8 @@ setInterval(() => {
     //   notice rides the worker IPC channel while the relaunched CLI's
     //   submission rides the PTY channel; the notice leads the 3rd submission
     //   by only a few seconds locally, so 4s reliably inverts their arrival.
-    const tmuxImport = JSON.stringify(pathToFileURL(resolve('src/adapters/backend/tmux-pipe-backend.ts')).href);
-    const workerImport = JSON.stringify(pathToFileURL(resolve('src/worker.ts')).href);
+    const tmuxImport = JSON.stringify(pathToFileURL(modules.path('adapters/backend/tmux-pipe-backend.ts')).href);
+    const workerImport = JSON.stringify(pathToFileURL(modules.path('worker.ts')).href);
     const heartbeatProbe = activityMode ? `
 let previous = performance.now();
 setInterval(() => {
@@ -327,7 +347,7 @@ TmuxPipeBackend.prototype.captureViewportAsync = async function () {
 const __modelOrderNoticeFragment = ${JSON.stringify(modelOrderNoticeFragment)};
 let __modelOrderNotices = 0;
 const __realSend = process.send?.bind(process);
-if (__realSend) process.send = function (msg: any, callback?: any): boolean {
+if (__realSend) process.send = function (msg, callback) {
   if (msg && msg.type === 'user_notify' && typeof msg.message === 'string'
     && msg.message.includes(__modelOrderNoticeFragment)) {
     __modelOrderNotices++;
@@ -336,14 +356,15 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
       return true;
     }
   }
-  return __realSend(msg, callback) as boolean;
-} as typeof process.send;
+  return __realSend(msg, callback);
+};
 ` : '';
-    entry = join(root, activityMode ? 'observed-worker.mts' : 'delayed-notice-worker.mts');
+    entry = join(root, `${activityMode ? 'observed-worker' : 'delayed-notice-worker'}.${modules.scriptExtension}`);
     writeFileSync(entry, `${delayedNoticeSend}${heartbeatProbe}await import(${workerImport});
 `);
   }
-  const child = binary ? spawn(binary, ['__worker'], options) : spawnNodeTsScript(entry, [], options);
+  const spawnWorker = () => binary ? spawn(binary, ['__worker'], options) : modules.spawn(entry, [], options);
+  const child = spawnWorker();
   children.push(child);
   const measurements: any[] = [];
   const hostErrors: unknown[] = [];
@@ -370,6 +391,18 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
   child.on('message', (raw: any) => {
     if (raw.type === 'admission_heartbeat' || raw.type === 'admission_capture') measurements.push(raw);
     else messages.push(raw as WorkerToDaemon);
+    if (raw.type === 'traex_model_pool_prune') {
+      contractEvents.push(pruneSavedTraexModelPool({
+        larkAppId: 'app_test', expectedPolicyKey: raw.expectedPolicyKey,
+        availableModels: raw.availableModels, path: poolConfigPath,
+        isCurrent: () => child.exitCode === null && child.signalCode === null,
+        notify: async models => { noticeDeliveries.push({
+          type: 'user_notify', message: 'synthetic cleanup: ' + models.join(', '), turnId: raw.turnId,
+        }); },
+      }).then(result => {
+        if (child.connected) child.send({ type: 'traex_model_pool_prune_result', requestId: raw.requestId, result });
+      }));
+    }
     if (host) contractEvents.push(host(raw).catch(error => { hostErrors.push(error); }));
   });
   child.stdout?.on('data', chunk => logs.push(chunk.toString()));
@@ -429,6 +462,10 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
     ...(bootstrap ? { sessionContract: bootstrap } : {}),
     larkAppId: 'app_test', larkAppSecret: 'secret' } satisfies DaemonToWorker;
   ds.initConfig = init;
+  if (init.traexAutoModel) writeFileSync(poolConfigPath, JSON.stringify([{
+    larkAppId: 'app_test', larkAppSecret: 'fixture', cliId: 'traex', model: 'auto',
+    traexAutoModel: init.traexAutoModel, apiOnly: true,
+  }]));
   child.send(init);
   if (startupExtraArgs) await wait(() => messages.some(message => message.type === 'error' && message.message.includes('cannot be overridden')), 'rejected external model argv');
   else await wait(() => messages.some(message => message.type === 'prompt_ready'), 'startup prompt');
@@ -440,6 +477,6 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
         sessionCommand: { version: 2, execution } }) } : {}) };
     child.send(message);
   };
-  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake,
-    sendInput, controller, hostErrors, terminalDeliveries, noticeDeliveries, options, entry, ds };
+  return { child, spawnWorker, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake, removeCliAfterCatalog,
+    sendInput, controller, hostErrors, terminalDeliveries, noticeDeliveries, options, entry, ds, poolConfigPath };
 }

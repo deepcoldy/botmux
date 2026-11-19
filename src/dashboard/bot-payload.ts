@@ -282,6 +282,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     feedback: j?.feedback && typeof j.feedback === 'object' ? j.feedback : null,
     oncallGroup: j?.oncallGroup && typeof j.oncallGroup === 'object' ? j.oncallGroup : null,
     steward: j?.steward && typeof j.steward === 'object' ? j.steward : null,
+    ownerGroupFollow: j?.ownerGroupFollow && typeof j.ownerGroupFollow === 'object' ? j.ownerGroupFollow : null,
     noProgressNotify: j?.noProgressNotify && typeof j.noProgressNotify === 'object' ? j.noProgressNotify : null,
     promptCache: j?.promptCache && typeof j.promptCache === 'object' ? j.promptCache : null,
     providerRecovery: j?.providerRecovery && typeof j.providerRecovery === 'object' ? j.providerRecovery : null,

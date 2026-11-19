@@ -1,7 +1,10 @@
 /** Test-CLI input surface. Parse paste and Enter in wire order even when a
  * PTY combines several writes into one data callback. Self-contained so fake
  * CLI processes can embed the function without importing repository modules. */
-export function createBracketedPasteCollector(onSubmit: (text: string) => void): (chunk: string) => void {
+export function createBracketedPasteCollector(
+  onSubmit: (text: string) => void,
+  canSubmit: (text: string) => boolean = () => true,
+): (chunk: string) => void {
   let input = '';
   let pasted = '';
   return (chunk: string) => {
@@ -20,7 +23,7 @@ export function createBracketedPasteCollector(onSubmit: (text: string) => void):
       }
       if (enter < 0) return;
       input = input.slice(enter + 1);
-      if (pasted) {
+      if (pasted && canSubmit(pasted)) {
         const text = pasted;
         pasted = '';
         onSubmit(text);
