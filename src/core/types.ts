@@ -753,6 +753,21 @@ export interface DaemonSession {
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */
   activeModel?: string;
+  /** True when `activeModel` was only re-seeded from pre-spawn transcript/DB
+   *  history (not a live post-spawn turn), so statusline validation prefers the
+   *  new launch model over the historical seed. */
+  activeModelFromSeed?: boolean;
+  /** Floor timestamp (ms) for accepting on-disk statusline quota snapshots:
+   *  advanced when launch model or CLI launch generation changes so a
+   *  pre-switch snapshot cannot bleed into the new launch. */
+  statuslineNotBeforeMs?: number;
+  /** Expected per-spawn statusline generation token (`BOTMUX_STATUSLINE_GEN`)
+   *  for the current CLI process; rejects late writes from a dying prior CLI. */
+  statuslineLaunchGen?: string;
+  /** True after a launch-model / CLI restart invalidation until the new
+   *  generation publishes a fresh live `activeModel`, so statusline model
+   *  checks compare against the new launch model instead of a pre-restart `activeModel`. */
+  statuslineActiveModelStale?: boolean;
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
   /** Native current selection, separate from the last executed turn_context. */

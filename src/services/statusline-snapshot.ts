@@ -29,8 +29,12 @@ export interface StatuslineSnapshot {
   fiveHourPercent?: number;
   /** rate_limits.five_hour.resets_at，已换算为毫秒。 */
   fiveHourResetsAtMs?: number;
+  /** fiveHourResetsAtMs 由相对 reset_in_seconds（缺 reset_time）派生时为 true。 */
+  fiveHourResetRelative?: boolean;
   sevenDayPercent?: number;
   sevenDayResetsAtMs?: number;
+  /** sevenDayResetsAtMs 由相对 reset_in_seconds（缺 reset_time）派生时为 true。 */
+  sevenDayResetRelative?: boolean;
   /** model.id，仅存档；卡片的 runtime 段另有来源。 */
   model?: string;
   /** Claude's effort.level: effective runtime effort, after model-specific clamping. */
@@ -38,6 +42,9 @@ export interface StatuslineSnapshot {
   transcriptPath?: string;
   /** Claude 自己的 session_id（≠ botmux sessionId）。 */
   claudeSessionId?: string;
+  /** Worker 每次真正拉起 CLI 进程时分配的启动代际令牌（BOTMUX_STATUSLINE_GEN），
+   *  用于隔离垂死旧进程的迟到写入与防止新代际被旧代际去重吞掉。 */
+  launchGen?: string;
   /** 写入时刻（ms）。 */
   ts: number;
 }
@@ -105,12 +112,89 @@ function nonEmptyString(v: unknown): string | undefined {
 interface ParsedQuotaWindow {
   usedPercent: number;
   resetsAtMs?: number;
+  resetRelative?: boolean;
 }
 
 interface AntigravityQuotaEntry {
   key: string;
   usedPercent: number;
   resetsAtMs?: number;
+  resetRelative?: boolean;
+}
+
+const GEMINI_CODENAME_VARIANTS = ['argon', 'neon', 'hydrogen', 'carbon'] as const;
+const GEMINI_TIER_VARIANTS = ['flash', 'pro'] as const;
+const EFFORT_SUFFIX_TOKENS = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'thinking']);
+
+function hasToken(text: string, token: string): boolean {
+  return new RegExp(`(?:^|[^a-z0-9])${token}(?:$|[^a-z0-9])`).test(text);
+}
+
+function hasKeySegment(key: string, token: string): boolean {
+  return new RegExp(`(?:^|[-_])${token}(?:$|[-_])`).test(key);
+}
+
+function isCanonicalFamilyWindowKey(
+  key: string,
+  familyPattern: string,
+  window: '5h' | 'weekly',
+): boolean {
+  const winPattern = window === '5h' ? '(?:5h|five[-_]?hour)' : '(?:weekly|7d|seven[-_]?day)';
+  return new RegExp(`^(?:${familyPattern})[-_]${winPattern}$`).test(key);
+}
+
+function normalizeAntigravityModelKey(raw: string): string {
+  const tokens = raw.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  while (tokens.length > 1 && EFFORT_SUFFIX_TOKENS.has(tokens[tokens.length - 1]!)) {
+    tokens.pop();
+  }
+  // `agy models` uses `gemini-pro-orchestrator-neon` / `gemini-pro-orchestrator-g1-pro`
+  // while `agy` statusLine reports display names `Orchestrator (Neon)` / `Orchestrator (Argon)`.
+  if (tokens[0] === 'gemini' && tokens[1] === 'pro' && tokens[2] === 'orchestrator') {
+    tokens.splice(0, 2);
+  } else if (tokens[0] === 'gemini' && tokens[1] === 'orchestrator') {
+    tokens.splice(0, 1);
+  }
+  if (tokens.length === 3 && tokens[0] === 'orchestrator' && tokens[1] === 'g1' && tokens[2] === 'pro') {
+    return 'orchestrator argon';
+  }
+  return tokens.join(' ');
+}
+
+function claudeModelFamily(raw: string): 'fable' | 'opus' | 'sonnet' | 'haiku' | undefined {
+  const cleaned = raw.trim().replace(/\[[^\]]*\]$/, '').trim().toLowerCase();
+  if (!cleaned || cleaned === 'default' || cleaned === 'auto' || cleaned === 'opusplan') return undefined;
+  const matches = (['fable', 'opus', 'sonnet', 'haiku'] as const).filter(f => hasToken(cleaned, f));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/**
+ * 校验盘上 statusline 快照里的模型是否与会话当前期望模型兼容：
+ * - 任一侧缺失模型信息时放行（由时间戳/启动代际守卫兜底，保持未配模型会话兼容）；
+ * - Antigravity：规范化 slug 与 display_name（如 `gemini-4-neon-xhigh` ↔ `Gemini 4 Neon (XHigh)`、
+ *   `gemini-pro-orchestrator-g1-pro` ↔ `Orchestrator (Argon)`），跨族（Gemini ↔ 3P）或
+ *   跨模型/跨 variant（Neon ↔ Argon / Flash / Hydrogen）均拒绝合并；
+ * - Claude Code：两侧均识别出明确的单一 Claude 家族（fable/opus/sonnet/haiku）且不一致时拒绝；
+ *   别名（`opus` ↔ `claude-opus-5[1m]`）、meta 别名（`default`/`opusplan`）及自定义代理名均放行。
+ */
+export function isStatuslineModelCompatible(
+  cliId: 'claude-code' | 'antigravity',
+  snapshotModel: string | undefined,
+  expectedModel: string | undefined,
+): boolean {
+  const snap = snapshotModel?.trim();
+  const expected = expectedModel?.trim();
+  if (!snap || !expected) return true;
+  if (snap.toLowerCase() === expected.toLowerCase()) return true;
+  if (cliId === 'antigravity') {
+    const a = normalizeAntigravityModelKey(snap);
+    const b = normalizeAntigravityModelKey(expected);
+    return a.length > 0 && a === b;
+  }
+  const snapFamily = claudeModelFamily(snap);
+  const expectedFamily = claudeModelFamily(expected);
+  if (snapFamily && expectedFamily) return snapFamily === expectedFamily;
+  return true;
 }
 
 function usedPercentFromRemainingFraction(v: unknown): number | undefined {
@@ -135,60 +219,81 @@ function isGenericWindowKey(key: string, window: '5h' | 'weekly'): boolean {
     : /^(?:weekly|7d|seven[-_]?day)$/.test(key);
 }
 
-function pickMostConstrained(entries: AntigravityQuotaEntry[]): AntigravityQuotaEntry | undefined {
+function pickMostConstrained(entries: AntigravityQuotaEntry[], now: number): AntigravityQuotaEntry | undefined {
   if (entries.length === 0) return undefined;
-  return [...entries].sort((a, b) => (b.usedPercent - a.usedPercent) || a.key.localeCompare(b.key))[0];
+  const isActive = (e: AntigravityQuotaEntry) => e.resetsAtMs === undefined || e.resetsAtMs > now;
+  return [...entries].sort((a, b) =>
+    (Number(isActive(b)) - Number(isActive(a)))
+    || (b.usedPercent - a.usedPercent)
+    || a.key.localeCompare(b.key),
+  )[0];
 }
 
 function pickAntigravityBucket(
   entries: AntigravityQuotaEntry[],
   window: '5h' | 'weekly',
   modelHint: string,
+  now: number,
 ): ParsedQuotaWindow | undefined {
   const windowEntries = entries.filter(e =>
     window === '5h' ? isFiveHourBucketKey(e.key) : isWeeklyBucketKey(e.key),
   );
   if (windowEntries.length === 0) return undefined;
 
-  const isThirdParty = /(?:^|[^a-z0-9])(claude|gpt|opus|sonnet|haiku|openai|anthropic)(?:$|[^a-z0-9])/.test(modelHint);
-  const isGemini = !isThirdParty && (/(?:^|[^a-z0-9])(gemini|orchestrator)(?:$|[^a-z0-9])/.test(modelHint) || modelHint.trim() === '');
+  const isClaude = /(?:^|[^a-z0-9])(claude|opus|sonnet|haiku|anthropic)(?:$|[^a-z0-9])/.test(modelHint);
+  const isOpenAi = /(?:^|[^a-z0-9])(gpt|openai)(?:$|[^a-z0-9])/.test(modelHint);
+  const isThirdParty = isClaude || isOpenAi;
+  const isGemini = !isThirdParty && /(?:^|[^a-z0-9])(gemini|orchestrator)(?:$|[^a-z0-9])/.test(modelHint);
 
   const generic = windowEntries.filter(e => isGenericWindowKey(e.key, window));
 
   if (isThirdParty) {
-    const canonical = window === '5h'
-      ? windowEntries.find(e => e.key === '3p-5h')
-      : windowEntries.find(e => e.key === '3p-weekly' || e.key === '3p-7d');
-    if (canonical) return canonical;
-    const family = windowEntries.filter(e => /^(?:3p|claude|gpt|anthropic|openai)(?:[-_]|$)/.test(e.key));
-    if (family.length > 0) return pickMostConstrained(family);
-    if (generic.length > 0) return pickMostConstrained(generic);
+    if (isClaude && !isOpenAi) {
+      const claudeCanonical = windowEntries.filter(e =>
+        isCanonicalFamilyWindowKey(e.key, 'claude|anthropic', window),
+      );
+      if (claudeCanonical.length > 0) return pickMostConstrained(claudeCanonical, now);
+    } else if (isOpenAi && !isClaude) {
+      const openAiCanonical = windowEntries.filter(e =>
+        isCanonicalFamilyWindowKey(e.key, 'gpt|openai', window),
+      );
+      if (openAiCanonical.length > 0) return pickMostConstrained(openAiCanonical, now);
+    }
+    const canonical3p = windowEntries.filter(e => isCanonicalFamilyWindowKey(e.key, '3p', window));
+    if (canonical3p.length > 0) return pickMostConstrained(canonical3p, now);
+    if (generic.length > 0) return pickMostConstrained(generic, now);
     return undefined;
   }
 
   if (isGemini) {
-    // Specific model codenames before generic tier tokens (`flash`/`pro`) so e.g.
-    // `gemini-pro-orchestrator-g1-pro` + `Orchestrator (Argon)` selects `argon`
-    // rather than stopping at `pro`.
-    for (const variant of ['argon', 'neon', 'hydrogen', 'carbon', 'flash', 'pro']) {
-      if (!new RegExp(`(?:^|[^a-z0-9])${variant}(?:$|[^a-z0-9])`).test(modelHint)) continue;
-      const variantMatches = windowEntries.filter(e =>
-        e.key.startsWith('gemini') && new RegExp(`(?:^|[-_])${variant}(?:$|[-_])`).test(e.key),
-      );
-      if (variantMatches.length > 0) return pickMostConstrained(variantMatches);
+    // Specific model codenames take precedence over generic tier tokens (`flash`/`pro`)
+    // so e.g. `gemini-pro-orchestrator-g1-pro` + `Orchestrator (Argon)` selects `argon`
+    // and never crosses into `gemini-pro-*` or another variant's sub-bucket.
+    const matchedCodenames: string[] = GEMINI_CODENAME_VARIANTS.filter(v => hasToken(modelHint, v));
+    // `gemini-pro-orchestrator-g1-pro` is `agy`'s slug for `Orchestrator (Argon)`;
+    // recognize it even when `display_name` is absent.
+    if (matchedCodenames.length === 0 && hasToken(modelHint, 'orchestrator') && /(?:^|[^a-z0-9])g1[-_]?pro(?:$|[^a-z0-9])/.test(modelHint)) {
+      matchedCodenames.push('argon');
     }
-    const canonical = window === '5h'
-      ? windowEntries.find(e => e.key === 'gemini-5h')
-      : windowEntries.find(e => e.key === 'gemini-weekly' || e.key === 'gemini-7d');
-    if (canonical) return canonical;
-    const family = windowEntries.filter(e => /^gemini(?:[-_]|$)/.test(e.key));
-    if (family.length > 0) return pickMostConstrained(family);
-    if (generic.length > 0) return pickMostConstrained(generic);
+    const variantsToCheck = matchedCodenames.length > 0
+      ? matchedCodenames
+      : GEMINI_TIER_VARIANTS.filter(v => hasToken(modelHint, v));
+    for (const variant of variantsToCheck) {
+      const variantMatches = windowEntries.filter(e =>
+        /^gemini(?:[-_]|$)/.test(e.key) && hasKeySegment(e.key, variant),
+      );
+      if (variantMatches.length > 0) return pickMostConstrained(variantMatches, now);
+    }
+    const canonicalGemini = windowEntries.filter(e => isCanonicalFamilyWindowKey(e.key, 'gemini', window));
+    if (canonicalGemini.length > 0) return pickMostConstrained(canonicalGemini, now);
+    if (generic.length > 0) return pickMostConstrained(generic, now);
+    // Fail-closed: never fall back across Gemini variants (e.g. Neon → Argon) or unknown sub-buckets.
     return undefined;
   }
 
-  if (generic.length > 0) return pickMostConstrained(generic);
-  if (windowEntries.length === 1) return windowEntries[0];
+  // Empty or unknown model: fail-closed on family-scoped buckets (`3p-*`, `gemini-*`),
+  // only accept unscoped generic window buckets (`5h`, `weekly`, `7d`).
+  if (generic.length > 0) return pickMostConstrained(generic, now);
   return undefined;
 }
 
@@ -211,13 +316,29 @@ function parseAntigravityQuota(
     const usedPercent = usedPercentFromRemainingFraction(b.remaining_fraction);
     if (usedPercent === undefined) continue;
     let resetMs = resetsAtMs(b.reset_time);
+    let resetRelative = false;
     if (resetMs === undefined) {
       const resetInSec = finiteNumber(b.reset_in_seconds);
-      if (resetInSec !== undefined && resetInSec > 0) {
-        resetMs = Math.round(now + resetInSec * 1000);
+      if (resetInSec !== undefined) {
+        const rawMs = Math.round(now + resetInSec * 1000);
+        if (resetInSec <= 0) {
+          // 缺 reset_time 且 reset_in_seconds <= 0：落一个 <= now 且 > 0 的过期标记，
+          // 防止 100% 耗尽值因缺少 resetsAtMs 而持续可读；极端负溢出兜底为 1。
+          if (now >= 1) {
+            resetMs = Number.isFinite(rawMs) ? Math.max(1, Math.min(now, rawMs)) : 1;
+          }
+        } else if (Number.isFinite(rawMs) && rawMs > 0) {
+          resetMs = rawMs;
+        }
+        if (resetMs !== undefined) resetRelative = true;
       }
     }
-    entries.push({ key: rawKey.trim().toLowerCase(), usedPercent, resetsAtMs: resetMs });
+    entries.push({
+      key: rawKey.trim().toLowerCase(),
+      usedPercent,
+      resetsAtMs: resetMs,
+      ...(resetRelative ? { resetRelative: true } : {}),
+    });
   }
   if (entries.length === 0) return {};
   const modelObj = modelRaw && typeof modelRaw === 'object' && !Array.isArray(modelRaw)
@@ -225,8 +346,8 @@ function parseAntigravityQuota(
     : undefined;
   const modelHint = `${nonEmptyString(modelObj?.id) ?? ''} ${nonEmptyString(modelObj?.display_name) ?? ''}`.toLowerCase();
   return {
-    fiveHour: pickAntigravityBucket(entries, '5h', modelHint),
-    sevenDay: pickAntigravityBucket(entries, 'weekly', modelHint),
+    fiveHour: pickAntigravityBucket(entries, '5h', modelHint, now),
+    sevenDay: pickAntigravityBucket(entries, 'weekly', modelHint, now),
   };
 }
 
@@ -263,10 +384,12 @@ export function parseStatuslinePayload(raw: unknown, now: number = Date.now()): 
     if (agyQuota.fiveHour) {
       set('fiveHourPercent', agyQuota.fiveHour.usedPercent);
       set('fiveHourResetsAtMs', agyQuota.fiveHour.resetsAtMs);
+      if (agyQuota.fiveHour.resetRelative) set('fiveHourResetRelative', true);
     }
     if (agyQuota.sevenDay) {
       set('sevenDayPercent', agyQuota.sevenDay.usedPercent);
       set('sevenDayResetsAtMs', agyQuota.sevenDay.resetsAtMs);
+      if (agyQuota.sevenDay.resetRelative) set('sevenDayResetRelative', true);
     }
   }
   set('model', nonEmptyString(o.model?.id));
@@ -284,7 +407,7 @@ export function writeStatuslineSnapshot(dataDir: string, sessionId: string, snap
   atomicWriteFileSync(statuslineFilePath(dataDir, sessionId), JSON.stringify(snap), { mode: 0o600 });
 }
 
-interface CacheEntry { mtimeMs: number; size: number; snap: StatuslineSnapshot | undefined }
+interface CacheEntry { ino: bigint; mtimeNs: bigint; size: bigint; snap: StatuslineSnapshot | undefined }
 const cache = new Map<string, CacheEntry>();
 
 function readSnapshotFile(path: string): StatuslineSnapshot | undefined {
@@ -302,43 +425,60 @@ function readSnapshotFile(path: string): StatuslineSnapshot | undefined {
   if (wt !== undefined && wt > 0) snap.contextWindowTokens = wt;
   if (p(o.fiveHourPercent) !== undefined) snap.fiveHourPercent = p(o.fiveHourPercent);
   if (ms(o.fiveHourResetsAtMs) !== undefined) snap.fiveHourResetsAtMs = ms(o.fiveHourResetsAtMs);
+  if (o.fiveHourResetRelative === true) snap.fiveHourResetRelative = true;
   if (p(o.sevenDayPercent) !== undefined) snap.sevenDayPercent = p(o.sevenDayPercent);
   if (ms(o.sevenDayResetsAtMs) !== undefined) snap.sevenDayResetsAtMs = ms(o.sevenDayResetsAtMs);
+  if (o.sevenDayResetRelative === true) snap.sevenDayResetRelative = true;
   if (nonEmptyString(o.model)) snap.model = o.model as string;
   if (isClaudeStatuslineEffort(o.reasoningEffort)) snap.reasoningEffort = o.reasoningEffort;
   if (nonEmptyString(o.transcriptPath)) snap.transcriptPath = o.transcriptPath as string;
   if (nonEmptyString(o.claudeSessionId)) snap.claudeSessionId = o.claudeSessionId as string;
+  if (nonEmptyString(o.launchGen)) snap.launchGen = o.launchGen as string;
   return snap;
 }
 
 /**
- * daemon / CLI 侧读：按 (mtimeMs, size) 缓存，文件没变不重新 parse（一次 stat 比一次
- * parse 便宜得多，12s tick 可承受）。文件缺失 / 损坏 → undefined；`ts` 早于
- * `now - maxAgeMs` → undefined；某桶 `resetsAtMs <= now` → 该桶百分比丢弃
- * （窗口已滚动，旧百分比必错，但重置时间本身仍可能有用所以保留）。
+ * daemon / CLI 侧读：按 (ino, mtimeNs, size) 缓存，文件没变不重新 parse（含 inode 防止
+ * 同粗时钟 tick 内原子替换同长文件命中旧缓存）。文件缺失 / 损坏 → undefined；`ts` 早于
+ * `now - maxAgeMs` / 早于 `notBefore`、或 `launchGen` 不匹配 → undefined；某桶
+ * `resetsAtMs <= max(now, snap.ts)` → 该桶百分比丢弃（防止窗口滚动或时钟微调回拨复活
+ * 已过期百分比，但重置时间本身仍保留）。
  */
 export function readStatuslineSnapshot(
   dataDir: string,
   sessionId: string,
-  opts?: { now?: number; maxAgeMs?: number },
+  opts?: { now?: number; maxAgeMs?: number; notBefore?: number; launchGen?: string },
 ): StatuslineSnapshot | undefined {
   const now = opts?.now ?? Date.now();
   const maxAgeMs = opts?.maxAgeMs ?? STATUSLINE_STALE_MS;
+  const notBefore = opts?.notBefore;
+  const launchGen = opts?.launchGen;
   const path = statuslineFilePath(dataDir, sessionId);
-  let st: { mtimeMs: number; size: number };
-  try { st = statSync(path); } catch { cache.delete(path); return undefined; }
+  let st: { ino: bigint; mtimeNs: bigint; size: bigint };
+  try { st = statSync(path, { bigint: true }); } catch { cache.delete(path); return undefined; }
   let entry = cache.get(path);
-  if (!entry || entry.mtimeMs !== st.mtimeMs || entry.size !== st.size) {
-    entry = { mtimeMs: st.mtimeMs, size: st.size, snap: readSnapshotFile(path) };
+  if (!entry || entry.ino !== st.ino || entry.mtimeNs !== st.mtimeNs || entry.size !== st.size) {
+    entry = { ino: st.ino, mtimeNs: st.mtimeNs, size: st.size, snap: readSnapshotFile(path) };
     cache.set(path, entry);
   }
   const snap = entry.snap;
   if (!snap) return undefined;
   if (snap.ts < now - maxAgeMs) return undefined;
+  if (notBefore !== undefined && snap.ts < notBefore) return undefined;
+  if (launchGen !== undefined && snap.launchGen !== launchGen) return undefined;
   const out: StatuslineSnapshot = { ...snap };
-  if (out.fiveHourResetsAtMs !== undefined && out.fiveHourResetsAtMs <= now) delete out.fiveHourPercent;
-  if (out.sevenDayResetsAtMs !== undefined && out.sevenDayResetsAtMs <= now) delete out.sevenDayPercent;
+  const effectiveNow = Math.max(now, snap.ts);
+  if (out.fiveHourResetsAtMs !== undefined && out.fiveHourResetsAtMs <= effectiveNow) delete out.fiveHourPercent;
+  if (out.sevenDayResetsAtMs !== undefined && out.sevenDayResetsAtMs <= effectiveNow) delete out.sevenDayPercent;
   return out;
+}
+
+/** 仅清理快照文件但保留目录（沙盒 bwrap 按目录 bind-mount，删目录会换 inode）。
+ *  用于模型切换 / CLI 重启等启动代际边界，防止旧快照在新帧到达前残留。任何错误吞掉。 */
+export function clearStatuslineSnapshot(dataDir: string, sessionId: string): void {
+  const path = statuslineFilePath(dataDir, sessionId);
+  cache.delete(path);
+  try { rmSync(path, { force: true }); } catch { /* best-effort */ }
 }
 
 /** 会话关闭清理（与 prompt-ctx 目录同时机）。任何错误吞掉。 */

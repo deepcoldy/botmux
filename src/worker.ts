@@ -566,7 +566,7 @@ import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid,
 import { resolveShadowedAntigravityStatusLine } from './adapters/cli/antigravity.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
-import { statuslineDir } from './services/statusline-snapshot.js';
+import { clearStatuslineSnapshot, statuslineDir } from './services/statusline-snapshot.js';
 import { ClaudeEffortObserver } from './services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker, terminalEffortPreferenceKey, readClaudeEffortCommandReceipt, type TerminalEffortBinding, type TerminalEffortChoice } from './services/terminal-effort-choice.js';
 import { isNativeReasoningEffort, type NativeReasoningObservation, type AppliedReasoningSelection } from './services/native-reasoning-observation.js';
@@ -2368,6 +2368,16 @@ let cliSpawnGeneration = 0;
 /** What the TRAE install entry resolved to right before the spawn of
  *  `generation`. Published only while that spawn is still the current one. */
 let traexInstallAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
+/** Pending statusline generation token provided by daemon `init` / `restart`
+ *  for the next non-reattach CLI spawn (consumed once so later self-respawns
+ *  mint a fresh UUID). */
+let pendingStatuslineLaunchGen: string | undefined;
+/** Statusline generation token injected into `BOTMUX_STATUSLINE_GEN` for
+ *  `generation`. Published on `local_process_attestation` while still current. */
+let statuslineLaunchGenAtSpawn: { generation: number; token: string } | undefined;
+/** True when the last published `active_runtime` came from historical pre-spawn
+ *  seeding rather than a live post-spawn turn. */
+let publishedActiveRuntimeSeeded = false;
 
 class CliSpawnSupersededError extends Error {
   constructor() {
@@ -10272,7 +10282,8 @@ const codexServiceTierTracker = new CodexServiceTierTracker(
   snapshot => send({ type: 'codex_service_tier', snapshot }),
 );
 
-function publishActiveRuntime(runtime: TraexRuntimeSnapshot): void {
+function publishActiveRuntime(runtime: TraexRuntimeSnapshot, opts?: { seeded?: boolean }): void {
+  const seeded = opts?.seeded === true;
   if (traexAutoModelRuntimeEligible() && runtime.model
     && !traexAutoModelSwitching && !traexAutoModelController?.currentTurnId()) {
     traexAutoModelController?.observeRunningModel(runtime.model);
@@ -10306,11 +10317,13 @@ function publishActiveRuntime(runtime: TraexRuntimeSnapshot): void {
     && normalized.reasoningEffort === publishedActiveRuntime.reasoningEffort
     && autoVariant === publishedAutoModelVariant
     && autoStateKey === publishedAutoModelStateKey
+    && (seeded || !publishedActiveRuntimeSeeded)
   ) {
     return;
   }
   activeRuntimePublished = true;
   publishedActiveRuntime = normalized;
+  publishedActiveRuntimeSeeded = seeded;
   publishedAutoModelVariant = autoVariant;
   publishedAutoModelStateKey = autoStateKey;
   send({
@@ -10319,6 +10332,7 @@ function publishActiveRuntime(runtime: TraexRuntimeSnapshot): void {
     reasoningEffort: normalized.reasoningEffort ?? null,
     ...(autoVariant !== undefined ? { modelBackendVariant: autoVariant } : {}),
     ...(autoState ? { traexAutoModelRuntime: autoState } : {}),
+    ...(seeded ? { seeded: true } : {}),
   });
 }
 let hermesBridgeOffset = 0;
@@ -12430,7 +12444,7 @@ function seedModelFallbackFromTranscript(): void {
   let seeded: ModelFallbackObservation;
   try { seeded = modelFallbackTracker.seed(bridgeJsonlPath, claudeSessionId); }
   catch (err: any) { log(`Model fallback seed skipped: ${err?.message ?? err}`); return; }
-  reportModelFallbackObservation(seeded);
+  reportModelFallbackObservation(seeded, { seeded: true });
 }
 
 /** Ship one observation. Facts only: the worker never decides that a notice is
@@ -12438,7 +12452,10 @@ function seedModelFallbackFromTranscript(): void {
  *  `claudeSessionId` naming a different Claude conversation, and `fallback:
  *  null` from a newest session-scoped record that is not a live Fable
  *  fallback — and the daemon applies them, not us. */
-function reportModelFallbackObservation(observed: ModelFallbackObservation | null): void {
+function reportModelFallbackObservation(
+  observed: ModelFallbackObservation | null,
+  opts?: { seeded?: boolean },
+): void {
   if (!observed) return;
   const rec = observed.fallback;
   if (rec) {
@@ -12446,7 +12463,7 @@ function reportModelFallbackObservation(observed: ModelFallbackObservation | nul
   } else if (rec === null) {
     log(`Claude model fallback cleared by the newest session switch record (session=${observed.claudeSessionId})`);
   }
-  send({ type: 'model_fallback', ...observed });
+  send({ type: 'model_fallback', ...observed, ...(opts?.seeded ? { seeded: true } : {}) });
 }
 
 function performBridgeIngestAndScheduleQuietEmit(): void {
@@ -14168,9 +14185,9 @@ function ensureAntigravityCotReader(cliSessionId: string): void {
     }
     observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   }, {
-    onRuntime: runtime => {
+    onRuntime: (runtime, info) => {
       if (antigravityCotReaderSessionId !== boundSessionId || lastInitConfig?.cliId !== 'antigravity') return;
-      publishActiveRuntime(runtime);
+      publishActiveRuntime(runtime, info?.seeded ? { seeded: true } : undefined);
     },
   });
   if (ok) {
@@ -16115,6 +16132,7 @@ function stopCodexBridge(): void {
   }
   codexServiceTierTracker.detach();
   activeRuntimePublished = false;
+  publishedActiveRuntimeSeeded = false;
   publishedAutoModelVariant = undefined;
   publishedActiveRuntime = {};
   codexBridgeRolloutPath = undefined;
@@ -29188,6 +29206,20 @@ async function spawnCliBody(
   } else {
     delete childEnv.BOTMUX_STATUSLINE_CHAIN;
   }
+  // 每次真正拉起新 CLI 进程（非 reattach 复用活 pane、非 adopt 外部进程）前清掉旧快照文件，
+  // 并注入本次启动专属的 BOTMUX_STATUSLINE_GEN（保留目录本身以保 bwrap bind-mount 的 inode）；
+  // 防止切换模型或重启后垂死旧进程迟到写入绕过时间栅栏或阻断新代际去重。
+  if (!willReattachPersistent && !cfg.adoptMode) {
+    const launchGen = pendingStatuslineLaunchGen ?? cfg.statuslineLaunchGen ?? randomUUID();
+    pendingStatuslineLaunchGen = undefined;
+    cfg.statuslineLaunchGen = undefined;
+    childEnv.BOTMUX_STATUSLINE_GEN = launchGen;
+    statuslineLaunchGenAtSpawn = { generation: spawnGeneration, token: launchGen };
+    const statuslineDataDir = process.env.SESSION_DATA_DIR ?? config.session?.dataDir;
+    if (statuslineDataDir) clearStatuslineSnapshot(statuslineDataDir, cfg.sessionId);
+  } else {
+    delete childEnv.BOTMUX_STATUSLINE_GEN;
+  }
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
   if (cfg.dispatchAttempt !== undefined) {
@@ -37627,6 +37659,9 @@ function publishLocalProcessAttestation(
   const cliInstallAtSpawn = cliInstallEntry && traexInstallAtSpawn?.generation === cliSpawnGeneration
     ? traexInstallAtSpawn.identity
     : undefined;
+  const statuslineLaunchGen = statuslineLaunchGenAtSpawn?.generation === cliSpawnGeneration
+    ? statuslineLaunchGenAtSpawn.token
+    : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
@@ -37637,6 +37672,7 @@ function publishLocalProcessAttestation(
     ...(cliInstallEntry ? { cliInstallEntry } : {}),
     ...(cliInstallAtSpawn ? { cliInstallAtSpawn } : {}),
     cliSpawnGeneration,
+    ...(statuslineLaunchGen ? { statuslineLaunchGen } : {}),
     ...(enginePid ? { enginePid } : {}),
     ...(engineProcStart ? { engineProcStart } : {}),
   });
@@ -39092,6 +39128,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // 开场注入）。旧桶 transcript 由 resume 预检的 syncClaudeResumeTargetToCwd
       // （COPY 最新 <sid>.jsonl 进新 cwd 桶，已在 master）接住，上下文不丢。
       applyWorkerLaunchModel(lastInitConfig ?? undefined, msg);
+      if (msg.statuslineLaunchGen) pendingStatuslineLaunchGen = msg.statuslineLaunchGen;
       // 合并顺序约束：以下热更字段都放在合并守卫之前——被合并的重复 restart 也应
       // 带走更新，pending 的 respawn 展开 {...lastInitConfig} 时自然拿到新值。
       //  - workingDir：角色切换 cwd-move respawn 先收敛目录（旧桶 transcript 由

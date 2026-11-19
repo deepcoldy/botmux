@@ -164,7 +164,7 @@ interface ReaderState {
    *  has observed. */
   turnInput?: AntigravityCotTurnInput;
   onEntries: AntigravityCotEntriesHandler;
-  onRuntime?: (runtime: { model: string }) => void;
+  onRuntime?: (runtime: { model: string }, info?: { seeded?: boolean }) => void;
   runtimeSignature?: string;
 }
 
@@ -222,7 +222,7 @@ function bindTranscript(state: ReaderState): boolean {
   return existsSync(state.transcriptPath);
 }
 
-function readNewTranscriptLines(state: ReaderState): void {
+function readNewTranscriptLines(state: ReaderState, seeded = false): void {
   // Identity is useful even when thinking is disabled or no log bytes arrived.
   // Reuse this reader's lifetime and exact native session, not a global setting.
   if (state.onRuntime) {
@@ -232,7 +232,7 @@ function readNewTranscriptLines(state: ReaderState): void {
       if (!signature || signature !== state.runtimeSignature) {
         const runtime = readLatestAntigravityRuntime(state.cliSessionId, opts);
         if (runtime.model) {
-          state.onRuntime({ model: runtime.model });
+          state.onRuntime({ model: runtime.model }, { seeded });
           // Failed/unknown reads and failed delivery stay retryable without a
           // file change. Unchanged successful snapshots need no SQLite open.
           state.runtimeSignature = signature;
@@ -288,7 +288,7 @@ export interface StartAntigravityCotOptions {
   mode?: 'baseline-existing' | 'fresh';
   pollIntervalMs?: number;
   /** Observed native model, independent of the thinking-display switch. */
-  onRuntime?: (runtime: { model: string }) => void;
+  onRuntime?: (runtime: { model: string }, info?: { seeded?: boolean }) => void;
 }
 
 /** Pending tools reset at USER_INPUT. Locate that boundary backwards, then
@@ -385,7 +385,7 @@ export function startAntigravityCot(
 
   // Seed runtime immediately on resume too; the EOF cursor still skips history.
   if (opts?.mode === 'fresh' || opts?.onRuntime) {
-    readNewTranscriptLines(state);
+    readNewTranscriptLines(state, opts?.mode !== 'fresh');
   }
 
   return true;

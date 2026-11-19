@@ -1,5 +1,6 @@
 /** Execute a production closure with explicit host dependencies, matching the
  * worker-function harness while the pool still has no importable host seam. */
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { controllerForSession } from '../../src/core/session-controller.js';
@@ -9,12 +10,15 @@ import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
+import { clearStatuslineSnapshot } from '../../src/services/statusline-snapshot.js';
 
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
  * identity checks rather than substituting a no-op completion callback. */
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
   if (key in scope) return scope[key as string];
+  if (key === 'randomUUID') return randomUUID;
+  if (key === 'clearStatuslineSnapshot') return clearStatuslineSnapshot;
   if (key === 'controllerForSession') return controllerForSession;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'isCodexAppCliId') return isCodexAppCliId;
@@ -29,7 +33,8 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
   if (typeof key === 'string' && ['ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
-    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn'].includes(key)) {
+    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'invalidateSessionStatuslineSnapshot',
+    'recordLaunchModel'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

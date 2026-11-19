@@ -72,7 +72,12 @@ import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { confirmCodexModelLaunch, readCodexModelLaunchReceipt, readCodexModelSettingsCursor, refreshCodexModelSelection, recordCodexModelLaunch, resetCodexModelSelection, supportsCodexModelSelection } from '../services/codex-model-selection.js';
-import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
+import {
+  clearStatuslineSnapshot,
+  isStatuslineModelCompatible,
+  readStatuslineSnapshot,
+  toCardQuota,
+} from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, promptCacheKeepaliveInFlight, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { clearIdleAutoCompactStretch, idleAutoCompactMinutes, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
@@ -629,6 +634,30 @@ export function getDaemonSessionUsageSnapshot(
   return snapshot;
 }
 
+function invalidateSessionStatuslineSnapshot(
+  ds: DaemonSession,
+  opts?: { now?: number; nextLaunchGen?: string },
+): void {
+  const now = opts?.now ?? Date.now();
+  ds.statuslineNotBeforeMs = Math.max(ds.statuslineNotBeforeMs ?? 0, now);
+  ds.statuslineLaunchGen = opts?.nextLaunchGen;
+  ds.statuslineActiveModelStale = true;
+  const dataDir = config.session?.dataDir;
+  if (dataDir) clearStatuslineSnapshot(dataDir, ds.session.sessionId);
+}
+
+function resolveExpectedStatuslineModel(ds: DaemonSession): string | undefined {
+  const liveActive = !ds.statuslineActiveModelStale && !ds.activeModelFromSeed
+    ? ds.activeModel?.trim()
+    : undefined;
+  if (liveActive) return liveActive;
+  const override = ds.spawnModelOverride?.trim();
+  if (override) return override;
+  return ds.session.model?.trim()
+    || (ds.statuslineActiveModelStale ? undefined : ds.initConfig?.model?.trim())
+    || undefined;
+}
+
 function readDaemonSessionUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
@@ -680,12 +709,20 @@ function readDaemonSessionUsageSnapshot(
     });
     // Claude Code / Antigravity statusline 快照（`botmux statusline` 落盘的 ctx / 5h / 7d 百分比）：
     // 回复卡页脚、流式卡用量行、IPC /usage 三个读取点都经本函数，只在这里合并一次。
-    // 独立 try/catch：快照读取失败不能拖垮 transcript 用量。无文件 / 陈旧 ⇒ 不带 key，
-    // 卡片与无 statusline 时逐字节相同。
+    // 校验启动代际时间下界（statuslineNotBeforeMs）与当前期望模型兼容性，避免切换模型后
+    // 新 CLI 尚未产出帧时继续展示旧模型周额度。独立 try/catch：快照读取失败不能拖垮
+    // transcript 用量。无文件 / 陈旧 / 模型不匹配 ⇒ 不带 key，卡片与无 statusline 时逐字节相同。
     if (resolvedCliId === 'claude-code' || resolvedCliId === 'antigravity') {
       try {
-        const quota = toCardQuota(readStatuslineSnapshot(config.session.dataDir, ds.session.sessionId));
-        if (quota) return { ...snapshot, quota };
+        const snap = readStatuslineSnapshot(config.session.dataDir, ds.session.sessionId, {
+          notBefore: ds.statuslineNotBeforeMs,
+          launchGen: ds.statuslineLaunchGen,
+        });
+        const expectedModel = resolveExpectedStatuslineModel(ds);
+        if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
+          const quota = toCardQuota(snap);
+          if (quota) return { ...snapshot, quota };
+        }
       } catch { /* best-effort */ }
     }
     return snapshot;
@@ -4068,12 +4105,30 @@ function storedSessionCliDisplayName(ds: DaemonSession): string {
  * A per-trigger override is deliberately NOT recorded: it is one-shot by
  * contract, and persisting it is exactly the mistake the frozen model was.
  */
-function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
+function recordLaunchModel(
+  ds: DaemonSession,
+  model: string | undefined,
+  opts?: { reattach?: boolean; skipStatuslineInvalidate?: boolean },
+): void {
+  if (opts?.reattach) return;
   const recordedNativeLaunch = !ds.adoptedFrom && !ds.initConfig?.adoptMode
     && recordCodexModelLaunch(ds.session, model);
-  if (!recordedNativeLaunch && (ds.spawnModelOverride || ds.session.model === model)) return;
-  if (!ds.spawnModelOverride) ds.session.model = model;   // undefined clears a stale record
+  if (ds.spawnModelOverride) {
+    if (!opts?.skipStatuslineInvalidate && !ds.adoptedFrom && !ds.initConfig?.adoptMode && ds.session.model !== model) {
+      invalidateSessionStatuslineSnapshot(ds);
+    }
+    if (!recordedNativeLaunch) return;
+    sessionStore.updateSession(ds.session);
+    return;
+  }
+  if (!recordedNativeLaunch && ds.session.model === model) return;
+  const previousModel = ds.session.model;
+  ds.session.model = model;   // undefined clears a stale record
   sessionStore.updateSession(ds.session);
+  if (ds.initConfig) ds.initConfig.model = model;
+  if (!opts?.skipStatuslineInvalidate && !ds.adoptedFrom && !ds.initConfig?.adoptMode && previousModel !== model) {
+    invalidateSessionStatuslineSnapshot(ds);
+  }
 }
 
 /** Resolve only this conversation's settings before a launcher can overwrite
@@ -4133,7 +4188,7 @@ function sessionServiceTier(ds: DaemonSession, cliId: CliId): CodexServiceTier |
 function sessionAgentConfig(
   ds: DaemonSession,
   botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; traexAutoModel?: TraexAutoModelConfig; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
-  options: { allowTraexCatalogEmptyReattach?: boolean } = {},
+  options: { allowTraexCatalogEmptyReattach?: boolean; reattachLiveBackend?: boolean } = {},
 ): { codexProfile?: string; codexProfileHome?: string; cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; traexAutoModel?: TraexAutoModelConfig; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; launchShell?: string; startupCommands?: string[] } {
   const launchModelChoice = () => {
     const choice = resolveSessionLaunchModelChoice(ds, botCfg);
@@ -4183,7 +4238,7 @@ function sessionAgentConfig(
     refreshNativeCodexModel(ds, botCfg);
     const modelChoice = launchModelChoice();
     const model = modelChoice.model;
-    recordLaunchModel(ds, model);
+    recordLaunchModel(ds, model, { reattach: options.reattachLiveBackend === true });
     // Newly saved native-catalog receipts have the same cold-launch fence on
     // both storage paths. Keep legacy /cli snapshots unchanged when there is
     // no writeback receipt, and leave modelPin's existing authority intact.
@@ -4301,7 +4356,7 @@ function sessionAgentConfig(
   refreshNativeCodexModel(ds, botCfg);
   const modelChoice = launchModelChoice();
   const model = modelChoice.model;
-  recordLaunchModel(ds, model);
+  recordLaunchModel(ds, model, { reattach: options.reattachLiveBackend === true });
   // Effort is frozen per session, but whether it is *supported* depends on the
   // model this spawn actually uses — which is resolved live above, not frozen.
   // TraeX efforts are syntax-checked at load time; its live catalog owns capability.
@@ -8838,7 +8893,10 @@ function sessionMojoBlockEnv(ds: DaemonSession): Record<string, string> {
  * 三分态：字符串 = 用它；null = 明确不传模型（bot 未配 / 已清空）；
  * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
  */
-export function latestModelForRespawn(ds: DaemonSession): string | null | undefined {
+export function latestModelForRespawn(
+  ds: DaemonSession,
+  opts?: { skipStatuslineInvalidate?: boolean },
+): string | null | undefined {
   let botCfg: Parameters<typeof resolveSessionLaunchModel>[1];
   try {
     botCfg = getBot(ds.larkAppId).config;
@@ -8852,7 +8910,7 @@ export function latestModelForRespawn(ds: DaemonSession): string | null | undefi
   // An in-worker respawn IS a launch, so the rule-3 record must converge here
   // too — otherwise `/restart` starts B while the record still says A, and a
   // later CLI hot-switch pulls A back out of the record.
-  recordLaunchModel(ds, model);
+  recordLaunchModel(ds, model, opts?.skipStatuslineInvalidate ? { skipStatuslineInvalidate: true } : undefined);
   return model ?? null;
 }
 
@@ -9084,18 +9142,37 @@ export function requestSessionRestart(
     if (controller && controller.operation()?.operationId !== attemptId) return;
     try {
       if (ds.worker && !ds.worker.killed) {
-        const model = opts.topicEffort?.model ?? latestModelForRespawn(ds);
+        const previousSessionModel = ds.session.model;
+        const previousInitModel = ds.initConfig?.model;
+        const model = opts.topicEffort?.model ?? latestModelForRespawn(ds, { skipStatuslineInvalidate: true });
+        const nextStatuslineLaunchGen = !opts.topicEffort ? randomUUID() : undefined;
         if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
         ds.workerReady = false;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
-        ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
-          ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model,
-          ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
-          traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
-          ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
-            larkToolBinding: latestLarkToolBindingForRespawn(ds),
-            ...latestLaunchCommandsForRespawn(ds) }) } as DaemonToWorker);
+        try {
+          ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
+            ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model,
+            ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
+            traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
+            ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
+              larkToolBinding: latestLarkToolBindingForRespawn(ds),
+              ...latestLaunchCommandsForRespawn(ds),
+              ...(nextStatuslineLaunchGen ? { statuslineLaunchGen: nextStatuslineLaunchGen } : {}) }) } as DaemonToWorker);
+        } catch (sendError) {
+          // IPC send failed before the worker was told to respawn: roll back
+          // the pre-persisted launch model so the still-running CLI keeps its
+          // real model identity and statusline snapshot intact.
+          if (!opts.topicEffort && ds.session.model !== previousSessionModel) {
+            ds.session.model = previousSessionModel;
+            try { sessionStore.updateSession(ds.session); } catch { /* best-effort rollback */ }
+          }
+          if (!opts.topicEffort && ds.initConfig && ds.initConfig.model !== previousInitModel) {
+            ds.initConfig.model = previousInitModel;
+          }
+          throw sendError;
+        }
+        if (!opts.topicEffort) invalidateSessionStatuslineSnapshot(ds, { nextLaunchGen: nextStatuslineLaunchGen });
         return;
       }
       // No live worker but the persistent pane may still be alive (e.g. after a
@@ -9105,7 +9182,10 @@ export function requestSessionRestart(
       // refuses that start (and offers recovery), so killing the CLI first
       // would only lose it for nothing.
       const restartCwd = callbacks?.getSessionWorkingDir(ds);
-      if (!restartCwd || existsSync(restartCwd)) destroyLivePaneBeforeRestart(ds);
+      if (!restartCwd || existsSync(restartCwd)) {
+        destroyLivePaneBeforeRestart(ds);
+        if (!opts.topicEffort) invalidateSessionStatuslineSnapshot(ds);
+      }
       forkWorker(ds, '', {
         resume: ds.hasHistory,
         restartAttemptId: attemptId,
@@ -19093,6 +19173,7 @@ function forkWorkerPrepared(
 
   agentCfg = sessionAgentConfig(ds, botCfg, {
     allowTraexCatalogEmptyReattach: opts.reattachLiveBackend === true || isSharedAdoptSession(ds),
+    reattachLiveBackend: opts.reattachLiveBackend === true,
   });
   if (!initTurnId && prompt.length > 0 && isCodexAppCliId(agentCfg.cliId)) {
     initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
@@ -19463,9 +19544,14 @@ function forkWorkerPrepared(
     ds.session.terminalCardEpoch = randomUUID();
     sessionStore.updateSession(ds.session);
   }
+  const initStatuslineLaunchGen = !opts.reattachLiveBackend && !isSharedAdoptSession(ds)
+    ? randomUUID()
+    : undefined;
+  if (initStatuslineLaunchGen) ds.statuslineLaunchGen = initStatuslineLaunchGen;
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
+    ...(initStatuslineLaunchGen ? { statuslineLaunchGen: initStatuslineLaunchGen } : {}),
     ...(finalOutputHandoffSupported(ds) ? { finalOutputHandoff: { version: 2 as const, token: randomUUID(), admitNew: finalOutputHandoffAdmitNew(ds) } } : {}),
     chatId: ds.chatId,
     chatType: ds.chatType,
@@ -20126,6 +20212,7 @@ function setupWorkerHandlers(
   // clear it here so the window between respawn and that first observation
   // cannot leave a stale model/effort tail on the card.
   ds.activeModel = undefined;
+  ds.activeModelFromSeed = false;
   ds.activeReasoningEffort = undefined;
   ds.nativeReasoningObservation = undefined;
   ds.activeModelBackendVariant = undefined;
@@ -21569,6 +21656,16 @@ function setupWorkerHandlers(
             ? { workerGeneration: ds.workerGeneration }
             : {}),
         };
+        if (msg.statuslineLaunchGen) {
+          ds.statuslineLaunchGen = msg.statuslineLaunchGen;
+        }
+        if (msg.cliSpawnGeneration !== undefined && previousSpawnGeneration !== undefined
+          && msg.cliSpawnGeneration !== previousSpawnGeneration) {
+          // An in-worker CLI respawn (e.g. crash-park retry or crash auto-restart)
+          // started a fresh CLI process; pre-respawn `activeModel` no longer reflects
+          // the new process until a live post-respawn turn reports one.
+          ds.statuslineActiveModelStale = true;
+        }
         if (msg.cliSpawnGeneration !== undefined && msg.cliSpawnGeneration !== previousSpawnGeneration
           && ds.nativeReasoningObservation) {
           if (ds.nativeReasoningObservation.cliSpawnGeneration !== msg.cliSpawnGeneration) {
@@ -22311,6 +22408,8 @@ function setupWorkerHandlers(
           }
           if (validSettingReceipt && msg.status === 'succeeded' && msg.topicEffort) {
             ds.activeModel = msg.topicEffort.model;
+            ds.activeModelFromSeed = false;
+            ds.statuslineActiveModelStale = false;
             ds.activeReasoningEffort = msg.topicEffort.effort;
             ds.activeModelBackendVariant = msg.topicEffort.variant;
             if (ds.initConfig) {
@@ -22467,9 +22566,27 @@ function setupWorkerHandlers(
           && ds.activeReasoningEffort === reasoningEffort
           && (variant === undefined || ds.activeModelBackendVariant === variant)
         ) {
+          if (model) {
+            if (msg.seeded) {
+              if (ds.statuslineActiveModelStale) ds.activeModelFromSeed = true;
+            } else {
+              ds.activeModelFromSeed = false;
+              ds.statuslineActiveModelStale = false;
+            }
+          }
           break;
         }
         ds.activeModel = model;
+        if (model) {
+          if (msg.seeded) {
+            ds.activeModelFromSeed = true;
+          } else {
+            ds.activeModelFromSeed = false;
+            ds.statuslineActiveModelStale = false;
+          }
+        } else {
+          ds.activeModelFromSeed = false;
+        }
         ds.activeReasoningEffort = reasoningEffort;
         if (ds.codexCliEffortConfirmed?.effort === reasoningEffort) ds.codexCliEffortConfirmed = undefined;
         if (variant !== undefined) ds.activeModelBackendVariant = variant;
@@ -22551,9 +22668,23 @@ function setupWorkerHandlers(
         // this model-only channel must not erase it.
         let runtimeChanged = false;
         const servingModel = normalizeClaudeModelId(msg.servingModel);
-        if (servingModel && ds.activeModel !== servingModel) {
-          ds.activeModel = servingModel;
-          runtimeChanged = true;
+        if (servingModel) {
+          if (msg.seeded) {
+            if (ds.activeModel !== servingModel) {
+              ds.activeModel = servingModel;
+              ds.activeModelFromSeed = true;
+              runtimeChanged = true;
+            } else if (ds.statuslineActiveModelStale) {
+              ds.activeModelFromSeed = true;
+            }
+          } else {
+            ds.activeModelFromSeed = false;
+            ds.statuslineActiveModelStale = false;
+            if (ds.activeModel !== servingModel) {
+              ds.activeModel = servingModel;
+              runtimeChanged = true;
+            }
+          }
         }
         if (merged.changed || runtimeChanged) scheduleActiveRuntimePatch(ds);
         break;
