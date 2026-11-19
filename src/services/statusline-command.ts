@@ -26,6 +26,7 @@ import { readFileSync } from 'node:fs';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import {
   parseStatuslinePayload,
+  STATUSLINE_WRITE_DEDUPE_MS,
   statuslineFilePath,
   writeStatuslineSnapshot,
   type StatuslineSnapshot,
@@ -39,7 +40,7 @@ const STATUSLINE_CHAIN_KILL_GRACE_MS = 1000;
  * 快照完全相同；跳过重写省掉 mkdir + tmp/fsync/rename。必须远小于读端的
  * STATUSLINE_STALE_MS（10 min），否则空闲会话的快照会被误判陈旧。
  */
-export const STATUSLINE_DEDUPE_MS = 30_000;
+export const STATUSLINE_DEDUPE_MS = STATUSLINE_WRITE_DEDUPE_MS;
 
 /**
  * statusline 命令前缀里注入的 Bun/JSC 线程限制（见 hook-command.ts statuslineHookCommand）。

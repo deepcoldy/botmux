@@ -70,6 +70,10 @@ export const STATUSLINE_FILE_BASENAME = 'latest.json';
 /** 快照最长可信时长：Claude 退出 / --settings 被 wrapper 剥掉 / 旧版不认
  *  refreshInterval 时，陈旧值最多存活这么久就自动消失（卡片回到「无数据即省略」）。 */
 export const STATUSLINE_STALE_MS = 10 * 60_000;
+/** Identical statusline frames are written at most this often. Relative reset
+ * deadlines get the same expiry grace so a deduped newer frame cannot make the
+ * persisted percentage expire before the deadline it just reported. */
+export const STATUSLINE_WRITE_DEDUPE_MS = 30_000;
 
 export function statuslineDir(dataDir: string, sessionId: string): string {
   return join(dataDir, STATUSLINE_DIR_NAME, sessionId);
@@ -442,7 +446,8 @@ function readSnapshotFile(path: string): StatuslineSnapshot | undefined {
  * 同粗时钟 tick 内原子替换同长文件命中旧缓存）。文件缺失 / 损坏 → undefined；`ts` 早于
  * `now - maxAgeMs` / 早于 `notBefore`、或 `launchGen` 不匹配 → undefined；某桶
  * `resetsAtMs <= max(now, snap.ts)` → 该桶百分比丢弃（防止窗口滚动或时钟微调回拨复活
- * 已过期百分比，但重置时间本身仍保留）。
+ * 已过期百分比，但重置时间本身仍保留）。仅相对派生且写入时仍活跃的窗口额外保留一个
+ * 去重周期的宽限，避免最新帧被去重跳写后按旧 deadline 提前隐藏；写入时已过期标记不宽限。
  */
 export function readStatuslineSnapshot(
   dataDir: string,
@@ -468,8 +473,12 @@ export function readStatuslineSnapshot(
   if (launchGen !== undefined && snap.launchGen !== launchGen) return undefined;
   const out: StatuslineSnapshot = { ...snap };
   const effectiveNow = Math.max(now, snap.ts);
-  if (out.fiveHourResetsAtMs !== undefined && out.fiveHourResetsAtMs <= effectiveNow) delete out.fiveHourPercent;
-  if (out.sevenDayResetsAtMs !== undefined && out.sevenDayResetsAtMs <= effectiveNow) delete out.sevenDayPercent;
+  const expired = (reset: number, relative: boolean | undefined): boolean => {
+    const grace = relative && reset > snap.ts ? STATUSLINE_WRITE_DEDUPE_MS : 0;
+    return reset <= effectiveNow - grace;
+  };
+  if (out.fiveHourResetsAtMs !== undefined && expired(out.fiveHourResetsAtMs, out.fiveHourResetRelative)) delete out.fiveHourPercent;
+  if (out.sevenDayResetsAtMs !== undefined && expired(out.sevenDayResetsAtMs, out.sevenDayResetRelative)) delete out.sevenDayPercent;
   return out;
 }
 

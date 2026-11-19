@@ -768,6 +768,16 @@ export interface DaemonSession {
    *  generation publishes a fresh live `activeModel`, so statusline model
    *  checks compare against the new launch model instead of a pre-restart `activeModel`. */
   statuslineActiveModelStale?: boolean;
+  /** State captured before a speculative launch generation is assigned. A real
+   * fresh-spawn attestation discards it; a folded restart or warm reattach
+   * restores the last attested generation and time/model fences instead of
+   * clearing them. */
+  statuslineLaunchFenceRollback?: {
+    launchGen?: string;
+    notBeforeMs?: number;
+    activeModelStale?: boolean;
+    activeModelFromSeed?: boolean;
+  };
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
   /** Native current selection, separate from the last executed turn_context. */

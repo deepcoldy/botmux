@@ -157,13 +157,12 @@ export interface AntigravityUsageReadResult {
   result: SessionTokenUsage | null;
 }
 
-/** Read only recent native generation metadata for the session's model.
- * Independent of usage display and transcript growth; WAL commits may precede
- * the next transcript record. Missing evidence never invents a default model. */
-export function readLatestAntigravityRuntime(
+/** Read recent native generation metadata, including the newest row identity so
+ * callers can distinguish a genuinely new generation from a DB/WAL-only write. */
+export function readLatestAntigravityRuntimeObservation(
   cliSessionId: string,
   opts?: { conversationsDir?: string },
-): { model?: string } {
+): { model?: string; latestRowIdx?: number } {
   const dbPath = antigravityRuntimeDbPath(cliSessionId, opts);
   if (!dbPath || !existsSync(dbPath)) return {};
   const db = openDatabaseSyncNow(dbPath, { readOnly: true });
@@ -171,7 +170,13 @@ export function readLatestAntigravityRuntime(
   try {
     // Most recent row normally carries the model. Keep a small backward window
     // for partial metadata without rereading all historical token counts.
-    const rows = db.prepare('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 16').all() as Array<{ data: unknown }>;
+    const rows = db.prepare('SELECT idx, data FROM gen_metadata ORDER BY idx DESC LIMIT 16').all() as Array<{ idx: unknown; data: unknown }>;
+    const rawIdx = rows[0]?.idx;
+    const latestRowIdx = typeof rawIdx === 'number' && Number.isSafeInteger(rawIdx)
+      ? rawIdx
+      : typeof rawIdx === 'bigint' && rawIdx >= 0 && rawIdx <= BigInt(Number.MAX_SAFE_INTEGER)
+        ? Number(rawIdx)
+        : undefined;
     for (const row of rows) {
       if (!(row.data instanceof Uint8Array)) continue;
       const parsed = parseGenMetadataRow(row.data);
@@ -179,11 +184,23 @@ export function readLatestAntigravityRuntime(
       // internal worker. f21 is the native display identity for that call.
       const model = (parsed?.modelDisplayName
         || (parsed?.model.endsWith('-worker-agy') ? undefined : parsed?.model))?.trim();
-      if (model) return { model };
+      if (model) return { model, ...(latestRowIdx !== undefined ? { latestRowIdx } : {}) };
     }
+    return latestRowIdx !== undefined ? { latestRowIdx } : {};
   } catch { /* unavailable/old schema: keep identity unknown */ }
   finally { try { db.close(); } catch { /* best-effort */ } }
   return {};
+}
+
+/** Read only recent native generation metadata for the session's model.
+ * Independent of usage display and transcript growth; WAL commits may precede
+ * the next transcript record. Missing evidence never invents a default model. */
+export function readLatestAntigravityRuntime(
+  cliSessionId: string,
+  opts?: { conversationsDir?: string },
+): { model?: string } {
+  const { model } = readLatestAntigravityRuntimeObservation(cliSessionId, opts);
+  return model ? { model } : {};
 }
 
 function antigravityRuntimeDbPath(cliSessionId: string, opts?: { conversationsDir?: string }): string | undefined {

@@ -73,7 +73,6 @@ import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { confirmCodexModelLaunch, readCodexModelLaunchReceipt, readCodexModelSettingsCursor, refreshCodexModelSelection, recordCodexModelLaunch, resetCodexModelSelection, supportsCodexModelSelection } from '../services/codex-model-selection.js';
 import {
-  clearStatuslineSnapshot,
   isStatuslineModelCompatible,
   readStatuslineSnapshot,
   toCardQuota,
@@ -634,16 +633,16 @@ export function getDaemonSessionUsageSnapshot(
   return snapshot;
 }
 
-function invalidateSessionStatuslineSnapshot(
-  ds: DaemonSession,
-  opts?: { now?: number; nextLaunchGen?: string },
-): void {
-  const now = opts?.now ?? Date.now();
-  ds.statuslineNotBeforeMs = Math.max(ds.statuslineNotBeforeMs ?? 0, now);
-  ds.statuslineLaunchGen = opts?.nextLaunchGen;
-  ds.statuslineActiveModelStale = true;
-  const dataDir = config.session?.dataDir;
-  if (dataDir) clearStatuslineSnapshot(dataDir, ds.session.sessionId);
+function speculateStatuslineLaunchGen(ds: DaemonSession, launchGen: string): void {
+  // Preserve the last ATTESTED state only once. Nested or repeated requests
+  // must not capture the speculative token as if it belonged to a live CLI.
+  ds.statuslineLaunchFenceRollback ??= {
+    launchGen: ds.statuslineLaunchGen,
+    notBeforeMs: ds.statuslineNotBeforeMs,
+    activeModelStale: ds.statuslineActiveModelStale,
+    activeModelFromSeed: ds.activeModelFromSeed,
+  };
+  ds.statuslineLaunchGen = launchGen;
 }
 
 function resolveExpectedStatuslineModel(ds: DaemonSession): string | undefined {
@@ -4108,27 +4107,20 @@ function storedSessionCliDisplayName(ds: DaemonSession): string {
 function recordLaunchModel(
   ds: DaemonSession,
   model: string | undefined,
-  opts?: { reattach?: boolean; skipStatuslineInvalidate?: boolean },
+  opts?: { reattach?: boolean },
 ): void {
   if (opts?.reattach) return;
   const recordedNativeLaunch = !ds.adoptedFrom && !ds.initConfig?.adoptMode
     && recordCodexModelLaunch(ds.session, model);
   if (ds.spawnModelOverride) {
-    if (!opts?.skipStatuslineInvalidate && !ds.adoptedFrom && !ds.initConfig?.adoptMode && ds.session.model !== model) {
-      invalidateSessionStatuslineSnapshot(ds);
-    }
     if (!recordedNativeLaunch) return;
     sessionStore.updateSession(ds.session);
     return;
   }
   if (!recordedNativeLaunch && ds.session.model === model) return;
-  const previousModel = ds.session.model;
   ds.session.model = model;   // undefined clears a stale record
   sessionStore.updateSession(ds.session);
   if (ds.initConfig) ds.initConfig.model = model;
-  if (!opts?.skipStatuslineInvalidate && !ds.adoptedFrom && !ds.initConfig?.adoptMode && previousModel !== model) {
-    invalidateSessionStatuslineSnapshot(ds);
-  }
 }
 
 /** Resolve only this conversation's settings before a launcher can overwrite
@@ -8895,7 +8887,6 @@ function sessionMojoBlockEnv(ds: DaemonSession): Record<string, string> {
  */
 export function latestModelForRespawn(
   ds: DaemonSession,
-  opts?: { skipStatuslineInvalidate?: boolean },
 ): string | null | undefined {
   let botCfg: Parameters<typeof resolveSessionLaunchModel>[1];
   try {
@@ -8910,7 +8901,7 @@ export function latestModelForRespawn(
   // An in-worker respawn IS a launch, so the rule-3 record must converge here
   // too — otherwise `/restart` starts B while the record still says A, and a
   // later CLI hot-switch pulls A back out of the record.
-  recordLaunchModel(ds, model, opts?.skipStatuslineInvalidate ? { skipStatuslineInvalidate: true } : undefined);
+  recordLaunchModel(ds, model);
   return model ?? null;
 }
 
@@ -9144,7 +9135,7 @@ export function requestSessionRestart(
       if (ds.worker && !ds.worker.killed) {
         const previousSessionModel = ds.session.model;
         const previousInitModel = ds.initConfig?.model;
-        const model = opts.topicEffort?.model ?? latestModelForRespawn(ds, { skipStatuslineInvalidate: true });
+        const model = opts.topicEffort?.model ?? latestModelForRespawn(ds);
         const nextStatuslineLaunchGen = !opts.topicEffort ? randomUUID() : undefined;
         if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
         ds.workerReady = false;
@@ -9172,7 +9163,11 @@ export function requestSessionRestart(
           }
           throw sendError;
         }
-        if (!opts.topicEffort) invalidateSessionStatuslineSnapshot(ds, { nextLaunchGen: nextStatuslineLaunchGen });
+        // Fence late writes while the replacement is being negotiated, but do
+        // not clear the snapshot or mark the active model stale yet: a folded
+        // restart may keep the current CLI, and a warm reattach may reuse an
+        // older pane. The worker's attestation commits the actual outcome.
+        if (!opts.topicEffort && nextStatuslineLaunchGen) speculateStatuslineLaunchGen(ds, nextStatuslineLaunchGen);
         return;
       }
       // No live worker but the persistent pane may still be alive (e.g. after a
@@ -9184,7 +9179,6 @@ export function requestSessionRestart(
       const restartCwd = callbacks?.getSessionWorkingDir(ds);
       if (!restartCwd || existsSync(restartCwd)) {
         destroyLivePaneBeforeRestart(ds);
-        if (!opts.topicEffort) invalidateSessionStatuslineSnapshot(ds);
       }
       forkWorker(ds, '', {
         resume: ds.hasHistory,
@@ -19547,7 +19541,7 @@ function forkWorkerPrepared(
   const initStatuslineLaunchGen = !opts.reattachLiveBackend && !isSharedAdoptSession(ds)
     ? randomUUID()
     : undefined;
-  if (initStatuslineLaunchGen) ds.statuslineLaunchGen = initStatuslineLaunchGen;
+  if (initStatuslineLaunchGen) speculateStatuslineLaunchGen(ds, initStatuslineLaunchGen);
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
@@ -21656,18 +21650,38 @@ function setupWorkerHandlers(
             ? { workerGeneration: ds.workerGeneration }
             : {}),
         };
-        if (msg.statuslineLaunchGen) {
-          ds.statuslineLaunchGen = msg.statuslineLaunchGen;
+        const restoreLaunchFence = (): void => {
+          const previous = ds.statuslineLaunchFenceRollback;
+          if (!previous) return;
+          ds.statuslineLaunchGen = previous.launchGen;
+          ds.statuslineNotBeforeMs = previous.notBeforeMs;
+          ds.statuslineActiveModelStale = previous.activeModelStale;
+          ds.activeModelFromSeed = previous.activeModelFromSeed;
+          delete ds.statuslineLaunchFenceRollback;
+        };
+        const isFreshSpawn = msg.cliSpawnGeneration !== undefined
+          && msg.cliSpawnGeneration !== previousSpawnGeneration;
+        if (msg.statuslineReattach) {
+          // A surviving pane cannot receive a newly minted env token. Restore
+          // the last attested generation/time/model fences rather than opening
+          // the reader to every older dying writer. With no speculative launch
+          // there is nothing to roll back, so the current state stays intact.
+          restoreLaunchFence();
+        } else {
+          if (isFreshSpawn) {
+            // A fresh CLI process (including the first spawn of a replacement
+            // worker) commits its generation and invalidates the pre-spawn
+            // activeModel. Repeated attestations for the same spawn do not.
+            ds.statuslineActiveModelStale = true;
+            delete ds.statuslineLaunchFenceRollback;
+          } else {
+            // A same-generation attestation can be the reconciliation of a
+            // folded restart: no new CLI owns the speculative token.
+            restoreLaunchFence();
+          }
+          if (msg.statuslineLaunchGen) ds.statuslineLaunchGen = msg.statuslineLaunchGen;
         }
-        if (msg.cliSpawnGeneration !== undefined && previousSpawnGeneration !== undefined
-          && msg.cliSpawnGeneration !== previousSpawnGeneration) {
-          // An in-worker CLI respawn (e.g. crash-park retry or crash auto-restart)
-          // started a fresh CLI process; pre-respawn `activeModel` no longer reflects
-          // the new process until a live post-respawn turn reports one.
-          ds.statuslineActiveModelStale = true;
-        }
-        if (msg.cliSpawnGeneration !== undefined && msg.cliSpawnGeneration !== previousSpawnGeneration
-          && ds.nativeReasoningObservation) {
+        if (isFreshSpawn && ds.nativeReasoningObservation) {
           if (ds.nativeReasoningObservation.cliSpawnGeneration !== msg.cliSpawnGeneration) {
             ds.nativeReasoningObservation = undefined;
             if (effectiveCliId === 'grok') ds.activeReasoningEffort = undefined;
@@ -22568,7 +22582,7 @@ function setupWorkerHandlers(
         ) {
           if (model) {
             if (msg.seeded) {
-              if (ds.statuslineActiveModelStale) ds.activeModelFromSeed = true;
+              ds.activeModelFromSeed = ds.statuslineActiveModelStale === true;
             } else {
               ds.activeModelFromSeed = false;
               ds.statuslineActiveModelStale = false;
@@ -22576,14 +22590,15 @@ function setupWorkerHandlers(
           }
           break;
         }
+        // A late historical seed must not displace a model already observed
+        // live. With no live predecessor (the usual warm-reattach shape), the
+        // seed describes the surviving pane and is not a launch-stale value.
+        if (msg.seeded && !ds.statuslineActiveModelStale
+          && ds.activeModel && !ds.activeModelFromSeed && ds.activeModel !== model) break;
         ds.activeModel = model;
         if (model) {
-          if (msg.seeded) {
-            ds.activeModelFromSeed = true;
-          } else {
-            ds.activeModelFromSeed = false;
-            ds.statuslineActiveModelStale = false;
-          }
+          ds.activeModelFromSeed = msg.seeded === true && ds.statuslineActiveModelStale === true;
+          if (!msg.seeded) ds.statuslineActiveModelStale = false;
         } else {
           ds.activeModelFromSeed = false;
         }
@@ -22670,12 +22685,13 @@ function setupWorkerHandlers(
         const servingModel = normalizeClaudeModelId(msg.servingModel);
         if (servingModel) {
           if (msg.seeded) {
-            if (ds.activeModel !== servingModel) {
-              ds.activeModel = servingModel;
-              ds.activeModelFromSeed = true;
-              runtimeChanged = true;
-            } else if (ds.statuslineActiveModelStale) {
-              ds.activeModelFromSeed = true;
+            const hasLiveModel = !!ds.activeModel && !ds.activeModelFromSeed && !ds.statuslineActiveModelStale;
+            if (!hasLiveModel) {
+              if (ds.activeModel !== servingModel) {
+                ds.activeModel = servingModel;
+                runtimeChanged = true;
+              }
+              ds.activeModelFromSeed = ds.statuslineActiveModelStale === true;
             }
           } else {
             ds.activeModelFromSeed = false;

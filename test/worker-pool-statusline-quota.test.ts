@@ -22,7 +22,6 @@ import {
 } from '../src/core/worker-pool.js';
 import {
   __testOnly_resetStatuslineCache,
-  statuslineDir,
   statuslineFilePath,
   STATUSLINE_STALE_MS,
   writeStatuslineSnapshot,
@@ -163,11 +162,13 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
     } as any, 'claude-code')).toBe(base);
   });
 
-  it('latestModelForRespawn clears disk snapshot & advances statuslineNotBeforeMs when launch model changes, and preserves it when unchanged', () => {
+  it('records a changed launch model without prematurely clearing statusline, then commits stale state on fresh attestation', () => {
+    const base = { context: { usedTokens: 10 }, tokens: null };
+    vi.spyOn(costCalculator, 'getSessionUsageSnapshot').mockReturnValue(base as any);
     vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
     const now = Date.now();
 
-    // Unchanged launch model (e.g. reattach / same-model restart) preserves existing snapshot file
+    // Unchanged launch model preserves the existing snapshot file.
     writeStatuslineSnapshot(dataDir, 's-same', {
       ts: now, model: 'Gemini 4 Neon (XHigh)', fiveHourPercent: 20, sevenDayPercent: 8,
     });
@@ -183,21 +184,41 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
     expect(existsSync(statuslineFilePath(dataDir, 's-same'))).toBe(true);
     expect(sameDs.statuslineNotBeforeMs).toBeUndefined();
 
-    // Changed launch model (Claude 3P → Gemini Neon) deletes latest.json, preserves dir, and fences old ts
+    // A model edit is recorded immediately, but the old snapshot remains until
+    // the worker proves whether this is a fresh spawn or a warm reattach.
     writeStatuslineSnapshot(dataDir, 's-switch', {
-      ts: now - 1000, model: 'Claude Opus 5.5 (High)', fiveHourPercent: 60, sevenDayPercent: 15,
+      ts: now - 1000, model: 'Claude Opus 5.5 (High)', launchGen: 'gen-old', fiveHourPercent: 60, sevenDayPercent: 15,
     });
-    const switchDs = {
+    const switchDs: any = {
       larkAppId: 'cli_agy',
       activeModel: 'Claude Opus 5.5 (High)',
       session: { sessionId: 's-switch', cliId: 'antigravity', model: 'claude-opus-5-5-high' },
       workingDir: '/repo',
-    } as any;
+    };
     expect(latestModelForRespawn(switchDs)).toBe('gemini-4-neon-xhigh');
-    expect(existsSync(statuslineDir(dataDir, 's-switch'))).toBe(true);
-    expect(existsSync(statuslineFilePath(dataDir, 's-switch'))).toBe(false);
-    expect(switchDs.statuslineNotBeforeMs).toBeGreaterThanOrEqual(now);
+    expect(switchDs.session.model).toBe('gemini-4-neon-xhigh');
+    expect(existsSync(statuslineFilePath(dataDir, 's-switch'))).toBe(true);
+    expect(switchDs.statuslineActiveModelStale).toBeUndefined();
+
+    const worker = {} as any;
+    switchDs.worker = worker;
+    switchDs.workerGeneration = 2;
+    switchDs.session.workerGeneration = 2;
+    switchDs.statuslineLaunchFenceRollback = {
+      launchGen: 'gen-old', notBeforeMs: now - 1_000,
+      activeModelStale: false, activeModelFromSeed: false,
+    };
+    const onAttestation = loadWorkerPoolMessageHandlers(['local_process_attestation'], {
+      ds: switchDs, worker, workerGeneration: 2, effectiveCliId: 'antigravity', scheduleActiveRuntimePatch: () => {},
+    });
+    onAttestation({
+      type: 'local_process_attestation', backendType: 'tmux', credentialIsolated: false,
+      cliSpawnGeneration: 1, statuslineLaunchGen: 'gen-new',
+    });
+    expect(switchDs.statuslineLaunchGen).toBe('gen-new');
     expect(switchDs.statuslineActiveModelStale).toBe(true);
+    expect(switchDs.statuslineLaunchFenceRollback).toBeUndefined();
+    expect(getDaemonSessionUsageSnapshot(switchDs, 'antigravity')).toBe(base);
   });
 
   it('ignores pre-restart seeded active_runtime / model_fallback until a live post-spawn turn updates activeModel', () => {
@@ -245,10 +266,16 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
       ...base, quota: { fiveHourPercent: 60, sevenDayPercent: 15 },
     });
 
+    // A later historical seed must not downgrade the established live model.
+    agyHandler({ type: 'active_runtime', model: 'Gemini 4 Neon (XHigh)', reasoningEffort: null, seeded: true });
+    expect(agyDs.activeModel).toBe('Claude Opus 5.5 (High)');
+    expect(agyDs.activeModelFromSeed).toBe(false);
+
     // Claude Code: worker refork after switch to opus; transcript seed reports pre-switch sonnet with seeded: true
     const claudeDs: any = {
       worker,
       workerGeneration: 3,
+      statuslineActiveModelStale: true,
       session: { sessionId: 's-seed-claude', cliId: 'claude-code', model: 'opus', workerGeneration: 3 },
       workingDir: '/repo',
     };
@@ -295,8 +322,8 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
       ...base, quota: { fiveHourPercent: 21, sevenDayPercent: 7 },
     });
 
-    // One-shot ds.spawnModelOverride invalidates old snapshot without mutating ds.session.model,
-    // and outranks ds.session.model at the merge point
+    // One-shot ds.spawnModelOverride outranks ds.session.model at the merge
+    // point without mutating the recorded model or prematurely deleting the file.
     writeStatuslineSnapshot(dataDir, 's-override', {
       ts: now - 1000, model: 'Gemini 4 Neon (XHigh)', fiveHourPercent: 21, sevenDayPercent: 7,
     });
@@ -309,7 +336,7 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
     const agentCfg = __testOnly_sessionAgentConfig(overrideDs, { cliId: 'antigravity', model: 'gemini-4-neon-xhigh' });
     expect(agentCfg.model).toBe('claude-opus-5-5-high');
     expect(overrideDs.session.model).toBe('gemini-4-neon-xhigh');
-    expect(existsSync(statuslineFilePath(dataDir, 's-override'))).toBe(false);
+    expect(existsSync(statuslineFilePath(dataDir, 's-override'))).toBe(true);
 
     writeStatuslineSnapshot(dataDir, 's-override', {
       ts: now + 50, model: 'Gemini 4 Neon (XHigh)', fiveHourPercent: 21, sevenDayPercent: 7,
@@ -351,6 +378,66 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
     expect(getDaemonSessionUsageSnapshot(dsReattach, 'antigravity')).toEqual({
       ...base, quota: { fiveHourPercent: 60, sevenDayPercent: 15 },
     });
+  });
+
+  it('restores the last attested fence on warm reattach and trusts only the surviving pane seed', () => {
+    const base = { context: { usedTokens: 10 }, tokens: null };
+    vi.spyOn(costCalculator, 'getSessionUsageSnapshot').mockReturnValue(base as any);
+    vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({
+      config: { cliId: 'antigravity', name: 'agy', model: 'gemini-4-neon-xhigh' },
+    } as any);
+    const now = Date.now();
+    writeStatuslineSnapshot(dataDir, 's-warm-reattach', {
+      ts: now, model: 'Claude Opus 5.5 (High)', launchGen: 'gen-old', fiveHourPercent: 60, sevenDayPercent: 15,
+    });
+    const worker = {} as any;
+    const ds: any = {
+      larkAppId: 'cli_agy', worker, workerGeneration: 4,
+      session: { sessionId: 's-warm-reattach', cliId: 'antigravity', model: 'claude-opus-5-5-high', workerGeneration: 4 },
+      workingDir: '/repo',
+    };
+
+    // An ordinary fork resolves the edited model before the worker discovers
+    // that the old pane is alive; it must not delete the old snapshot.
+    __testOnly_sessionAgentConfig(ds, { cliId: 'antigravity', model: 'gemini-4-neon-xhigh' });
+    expect(ds.session.model).toBe('gemini-4-neon-xhigh');
+    expect(existsSync(statuslineFilePath(dataDir, 's-warm-reattach'))).toBe(true);
+    ds.statuslineLaunchFenceRollback = {
+      launchGen: 'gen-old', notBeforeMs: now - 1_000,
+      activeModelStale: false, activeModelFromSeed: false,
+    };
+    ds.statuslineLaunchGen = 'gen-new-speculative';
+    ds.statuslineNotBeforeMs = now + 1_000;
+
+    const onAttestation = loadWorkerPoolMessageHandlers(['local_process_attestation'], {
+      ds, worker, workerGeneration: 4, effectiveCliId: 'antigravity', scheduleActiveRuntimePatch: () => {},
+    });
+    onAttestation({
+      type: 'local_process_attestation', backendType: 'tmux', credentialIsolated: false,
+      cliSpawnGeneration: 1, statuslineReattach: true,
+    });
+    expect(ds.statuslineLaunchGen).toBe('gen-old');
+    expect(ds.statuslineNotBeforeMs).toBe(now - 1_000);
+    expect(ds.statuslineActiveModelStale).toBe(false);
+    expect(ds.statuslineLaunchFenceRollback).toBeUndefined();
+
+    const onRuntime = loadWorkerPoolMessageHandlers(['active_runtime'], {
+      ds, worker, workerGeneration: 4, effectiveCliId: 'antigravity',
+      scheduleActiveRuntimePatch: () => {}, sessionStore: { updateSession: () => {} },
+    });
+    onRuntime({ type: 'active_runtime', model: 'Claude Opus 5.5 (High)', reasoningEffort: null, seeded: true });
+    expect(ds.activeModelFromSeed).toBe(false);
+    expect(getDaemonSessionUsageSnapshot(ds, 'antigravity')).toEqual({
+      ...base, quota: { fiveHourPercent: 60, sevenDayPercent: 15 },
+    });
+
+    // Reattach restores the surviving pane's generation, not a license for an
+    // even older dying process to publish a final frame.
+    writeStatuslineSnapshot(dataDir, 's-warm-reattach', {
+      ts: now + 100, model: 'Claude Opus 5.5 (High)', launchGen: 'gen-dying-prior', fiveHourPercent: 77,
+    });
+    expect(getDaemonSessionUsageSnapshot(ds, 'antigravity')).toBe(base);
   });
 
   it('requestSessionRestart rolls back on failed IPC send, fences dying CLI via statuslineLaunchGen on success, and marks activeModel stale on in-worker respawn', () => {
@@ -405,9 +492,11 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
     expect(okDs.statuslineLaunchGen).toBe(nextGen);
     expect(okDs.session.model).toBe('gemini-4-neon-xhigh');
     expect(okDs.initConfig.model).toBe('gemini-4-neon-xhigh');
-    expect(existsSync(statuslineFilePath(dataDir, 's-ok-ipc'))).toBe(false);
+    // The speculative generation fence is immediate, but snapshot deletion and
+    // activeModel invalidation wait for an actual fresh-spawn attestation.
+    expect(existsSync(statuslineFilePath(dataDir, 's-ok-ipc'))).toBe(true);
 
-    // Late write from dying old CLI AFTER notBefore (same/unconfigured model) is rejected by launchGen
+    // Late write from the dying old CLI is rejected by the speculative launchGen fence
     writeStatuslineSnapshot(dataDir, 's-ok-ipc', {
       ts: Date.now() + 200, model: 'Gemini 4 Neon (XHigh)', launchGen: 'gen-old', fiveHourPercent: 88, sevenDayPercent: 55,
     });

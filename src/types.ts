@@ -2685,6 +2685,9 @@ export type WorkerToDaemonBase =
       /** Per-spawn statusline generation token injected as BOTMUX_STATUSLINE_GEN
        *  for this CLI process generation (omitted on warm reattach / adopt). */
       statuslineLaunchGen?: string;
+      /** The worker actually reattached a surviving pane instead of spawning a
+       *  fresh CLI; the daemon must roll back any speculative launch fence. */
+      statuslineReattach?: boolean;
       /** RPC app-server root. Tool subprocesses are descendants of this
        * sibling rather than of the viewer CLI. */
       enginePid?: number;

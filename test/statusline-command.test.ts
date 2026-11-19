@@ -18,7 +18,13 @@ import {
   chainEnv,
   shouldSkipStatuslineWrite,
 } from '../src/services/statusline-command.js';
-import { parseStatuslinePayload, statuslineFilePath, type StatuslineSnapshot } from '../src/services/statusline-snapshot.js';
+import {
+  parseStatuslinePayload,
+  readStatuslineSnapshot,
+  statuslineFilePath,
+  writeStatuslineSnapshot,
+  type StatuslineSnapshot,
+} from '../src/services/statusline-snapshot.js';
 
 const REPO_ROOT = join(__dirname, '..');
 const tempDirs: string[] = [];
@@ -263,6 +269,23 @@ describe('shouldSkipStatuslineWrite', () => {
       // Disk copy already rolled over by next.ts (10s < 15s) while next is still active -> must write
       const prevShort = JSON.stringify(parseStatuslinePayload(relFrame(10), T0)!);
       expect(shouldSkipStatuslineWrite(prevShort, parseStatuslinePayload(relFrame(10), T0 + 15_000)!)).toBe(false);
+    });
+
+    it('平移帧被去重后不会按旧 deadline 提前隐藏；已过期标记仍立即失效', () => {
+      const frame = relFrame(60);
+      const prev = parseStatuslinePayload(frame, T0)!;
+      const next = parseStatuslinePayload(frame, T0 + 25_000)!;
+      expect(next.fiveHourResetsAtMs).toBe(T0 + 85_000);
+      expect(shouldSkipStatuslineWrite(JSON.stringify(prev), next)).toBe(true);
+
+      const dir = makeDir();
+      writeStatuslineSnapshot(dir, 'relative-grace', prev);
+      expect(readStatuslineSnapshot(dir, 'relative-grace', { now: T0 + 61_000 })?.fiveHourPercent).toBe(50);
+      expect(readStatuslineSnapshot(dir, 'relative-grace', { now: T0 + 91_000 })?.fiveHourPercent).toBeUndefined();
+
+      const expired = parseStatuslinePayload(relFrame(0, 0), T0)!;
+      writeStatuslineSnapshot(dir, 'relative-expired', expired);
+      expect(readStatuslineSnapshot(dir, 'relative-expired', { now: T0 })?.fiveHourPercent).toBeUndefined();
     });
 
     it('从相对 reset 升级到绝对 reset_time，或绝对 resets_at 发生变动，均立即落盘', () => {

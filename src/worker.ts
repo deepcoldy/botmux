@@ -21736,7 +21736,7 @@ function markRemoteRunnerStartupReady(): void {
  *    record it as pending (newest id and settings win), so neither the stale
  *    replacement's ready edge nor the continuation end can settle it.
  */
-function foldRestartIntoWindow(attemptId: string | undefined): void {
+function foldRestartIntoWindow(attemptId: string | undefined): 'adopt' | 'converge' {
   const requested = restartLaunchSettings(lastInitConfig);
   const disposition = classifyMergedRestart({
     windowLaunch: restartWindowLaunch,
@@ -21746,9 +21746,10 @@ function foldRestartIntoWindow(attemptId: string | undefined): void {
   if (disposition === 'converge') {
     pendingLaunchConvergence = { attemptId: attemptId ?? pendingLaunchConvergence?.attemptId, requested };
     log('Restart folded into in-flight window asks for different launch settings — converging with one more respawn before settling it');
-    return;
+    return disposition;
   }
   activeRestartAttemptId ??= attemptId;
+  return disposition;
 }
 
 /** The replacement about to be (or just) built satisfies the pending folded
@@ -31533,7 +31534,11 @@ async function spawnCliBody(
     // filter (which would reject the correct App Server submission).
     (backend as PtyHandle).expectedCodexSessionId = cfg.cliSessionId;
   }
-  publishLocalProcessAttestation(cliPid ?? undefined);
+  publishLocalProcessAttestation(
+    cliPid ?? undefined,
+    undefined,
+    { statuslineReattach: actuallyReattachedPersistent || cfg.adoptMode === true },
+  );
   if (cliPid && process.env.SESSION_DATA_DIR) {
     const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
     try {
@@ -37700,6 +37705,7 @@ function stopHeldFailedTurnRewind(): boolean {
 function publishLocalProcessAttestation(
   cliPid?: number,
   enginePid = codexRpcEngine?.appServerPid,
+  opts: { statuslineReattach?: boolean; publishRelayCapability?: boolean } = {},
 ): boolean {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
   // Freeze the proven birth token; explicit legacy RPC roots keep priority.
@@ -37728,7 +37734,7 @@ function publishLocalProcessAttestation(
     ? traexInstallAtSpawn.identity
     : undefined;
   const statuslineLaunchGen = statuslineLaunchGenAtSpawn?.generation === cliSpawnGeneration
-    ? statuslineLaunchGenAtSpawn.token
+    ? statuslineLaunchGenAtSpawn?.token
     : undefined;
   send({
     type: 'local_process_attestation',
@@ -37741,6 +37747,7 @@ function publishLocalProcessAttestation(
     ...(cliInstallAtSpawn ? { cliInstallAtSpawn } : {}),
     cliSpawnGeneration,
     ...(statuslineLaunchGen ? { statuslineLaunchGen } : {}),
+    ...(opts.statuslineReattach ? { statuslineReattach: true } : {}),
     ...(enginePid ? { enginePid } : {}),
     ...(engineProcStart ? { engineProcStart } : {}),
   });
@@ -37748,7 +37755,7 @@ function publishLocalProcessAttestation(
   // before it snapshots the current turn's pre-existing descendants. This is
   // required for the opening turn, whose origin is first published before the
   // CLI process exists, and whenever a wrapper resolves to a new real CLI pid.
-  return currentBotmuxTurnId ? publishSandboxRelayCapability() : true;
+  return currentBotmuxTurnId && opts.publishRelayCapability !== false ? publishSandboxRelayCapability() : true;
 }
 
 /** Deliver a terminal IPC message before exiting the worker. `process.send()`
@@ -39244,7 +39251,21 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // 结束时已就绪的 replacement，见 settleRestartAttemptOnReady）就是它的成功回执。
         // 否则 daemon 侧这个 attempt 永远等不到 restart_result，workerReady 栅栏放不开，
         // fork/relay 永久 worker_busy（#1863）。已有 attempt 认领时绝不替换，不抢它的回执。
-        foldRestartIntoWindow(msg.attemptId);
+        const foldedDisposition = foldRestartIntoWindow(msg.attemptId);
+        if (foldedDisposition === 'adopt' && msg.statuslineLaunchGen
+          && (lastInitConfig?.cliId === 'claude-code' || lastInitConfig?.cliId === 'antigravity')) {
+          // No second spawn will consume the token carried by this folded
+          // request. Re-attest the generation the current CLI actually owns so
+          // the daemon rolls its speculative expectation back to that process.
+          // Do not rotate the active turn's relay capability on this status-only
+          // reconciliation; the process generation did not change.
+          pendingStatuslineLaunchGen = undefined;
+          publishLocalProcessAttestation(
+            backend?.getChildPid?.() ?? undefined,
+            undefined,
+            { publishRelayCapability: false },
+          );
+        }
         log(`Restart request merged into in-flight restart${msg.updateWorkingDir ? ` (workingDir → ${msg.updateWorkingDir})` : ''}`);
         break;
       }
