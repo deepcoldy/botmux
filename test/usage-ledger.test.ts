@@ -721,9 +721,11 @@ describe('reconcileUsageForDaemonSession (daemon restart)', () => {
   });
 
   // Expand daily ledger files into chronological rows regardless of readdir
-  // order: usage-YYYY-MM-DD.jsonl lexical order is UTC-date order. Every
-  // chronological assertion goes through this helper so the sort contract is
-  // exercised by the reversed-input regression test below.
+  // order: usage-YYYY-MM-DD.jsonl lexical order is UTC-date order. Node lists
+  // a directory sorted by name, but Bun returns the filesystem's own entry
+  // order, so the sort cannot be skipped. Every chronological assertion goes
+  // through this helper so the sort contract is exercised by the
+  // reversed-input regression test below.
   const readLedgerRows = (ledgerDir: string, files: string[]) =>
     [...files].sort().flatMap((f) =>
       readFileSync(join(ledgerDir, f), 'utf8').trim().split('\n').map((line) => JSON.parse(line)));
