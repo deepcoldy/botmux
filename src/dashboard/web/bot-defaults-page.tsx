@@ -4350,6 +4350,7 @@ function WorkingDirSection(props: {
         <button type="button" className="primary" data-action="save-working-dir" disabled={busy} onClick={() => void save()}>{tr('botDefaults.save')}</button>
       </div>
       </AgentManagedLock>
+      <OwnerGroupFollowControls bot={bot} patchBot={props.patchBot} />
       <AutoStartControls bot={bot} putCardPref={props.putCardPref} />
     </section>
   );
@@ -4429,6 +4430,47 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
   const def = bot.defaultOncall ?? { enabled: false, workingDir: '' };
   const mode = def.enabled ? 'oncall' : (bot.defaultWorkingDir ? 'default' : 'off');
   return { mode, workingDir: bot.defaultWorkingDir || def.workingDir || '' };
+}
+
+export function OwnerGroupFollowControls(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot } = props;
+  const savedExcluded = (bot.ownerGroupFollow?.excludeChatIds ?? []).join('\n');
+  const [excluded, setExcluded] = useState(savedExcluded);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  useEffect(() => {
+    setExcluded(savedExcluded);
+  }, [bot.larkAppId, savedExcluded]);
+  const save = (value: BotDefaultsRow['ownerGroupFollow']) => saveBotField({
+    request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/owner-group-follow`, { ownerGroupFollow: value }),
+    setStatus, setBusy, saved: tr('botDefaults.cardPrefSaved'),
+    onSaved: body => props.patchBot(bot.larkAppId, { ownerGroupFollow: body.ownerGroupFollow ?? null }),
+  });
+  return <div className="bd-subsection" data-owner-group-follow>
+    <h4 className="bd-subsection-title">{tr('botDefaults.ownerGroupFollow')}</h4>
+    <ToggleRow
+      checked={bot.ownerGroupFollow?.enabled === true}
+      disabled={busy}
+      dataAction="toggle-owner-group-follow"
+      title={tr('botDefaults.ownerGroupFollowEnabled')}
+      help={tr('botDefaults.ownerGroupFollowHelp')}
+      onChange={enabled => { void save({ ...bot.ownerGroupFollow, enabled }); }}
+    />
+    <p className="bd-section-note">{tr('botDefaults.ownerGroupFollowAuth')}</p>
+    <div className="bd-row"><label>
+      <FieldTitle help={tr('botDefaults.ownerGroupFollowExcludedHelp')}>{tr('botDefaults.ownerGroupFollowExcluded')}</FieldTitle>
+      <textarea data-input="ownerGroupFollowExcluded" rows={2} value={excluded} disabled={busy}
+        placeholder={'oc_xxx\noc_yyy'} onChange={event => setExcluded(event.currentTarget.value)} />
+    </label></div>
+    <div className="actions">
+      <button type="button" data-action="save-owner-group-follow-exclusions" disabled={busy}
+        onClick={() => { void save({ ...bot.ownerGroupFollow, excludeChatIds: excluded.split(/\s+/).filter(Boolean) }); }}>
+        {tr('botDefaults.save')}
+      </button>
+      <StatusSpan status={status} />
+    </div>
+  </div>;
 }
 
 export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {

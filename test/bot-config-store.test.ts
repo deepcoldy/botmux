@@ -254,6 +254,28 @@ describe('bot-config store', () => {
     expect(readConfig().reasoningEffort).toBeUndefined();
   });
 
+  it('defaults owner group follow off and round-trips opt-in settings through persistence and hot config', async () => {
+    const { registry, store } = await loaded();
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+    const spec = store.findConfigField('ownerGroupFollow')!;
+    const parsed = store.coerceConfigValue(spec, '{"enabled":true,"excludeChatIds":["oc_skip"]}');
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) throw new Error('coercion failed');
+    expect((await store.applyConfigField('app_default', spec, parsed.value)).ok).toBe(true);
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toEqual({ enabled: true, excludeChatIds: ['oc_skip'] });
+    expect(readConfig().ownerGroupFollow).toEqual({ enabled: true, excludeChatIds: ['oc_skip'] });
+    expect((await store.applyConfigField('app_default', spec, { enabled: 'true' })).ok).toBe(false);
+    expect(readConfig().ownerGroupFollow.enabled).toBe(true);
+    expect((await store.applyConfigField('app_default', spec, { enabled: false })).ok).toBe(true);
+    expect(readConfig().ownerGroupFollow).toBeUndefined();
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+  });
+
+  it('does not enable owner group follow from malformed disk configuration', async () => {
+    const { registry } = await loaded({ ownerGroupFollow: { enabled: 'true' } });
+    expect(registry.getBot('app_default').config.ownerGroupFollow).toBeUndefined();
+  });
+
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
     const { registry, store } = await loaded({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] } });
     const spec = store.findConfigField('envPolicy')!;
