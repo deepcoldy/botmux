@@ -31532,7 +31532,7 @@ async function spawnCliBody(
   };
   // wrapperCli launcher → real CLI by comm. `launcherPid` is the unwrapped
   // launch payload below any pane relay or owned session-scope supervisor.
-  const resolveBehindWrapper = (launcherPid: number): void => {
+  const resolveBehindWrapper = (launcherPid: number, panePid: number): void => {
     // Codex also needs the real execution root, even without a Claude JSONL bridge.
     // Credential-only bwrap uses the single monitored resolver below; running
     // both would attest the same leaf twice and rotate live-turn authority twice.
@@ -31540,13 +31540,24 @@ async function spawnCliBody(
       || (!claudeDataDir && cfg.cliId !== 'codex')) return;
     const targetCliId = cfg.cliId as CliId;
     const generation = cliSpawnGeneration;
+    const readStablePanePid = (): number | null | undefined => {
+      const current = backend;
+      return current?.getStablePanePid ? current.getStablePanePid() : current?.getChildPid?.();
+    };
+    // A backing/shell PID need not equal the foreground launcher PID. Capture
+    // the backend's own stable identity rather than comparing it with panePid;
+    // wrapper rewrites of cliPid leave it unchanged, while a replaced pane fails
+    // the fence even before the exit callback advances the spawn generation.
+    const stablePanePid = readStablePanePid() ?? panePid;
     scheduleWrapperRealCliPid(launcherPid, {
       findRealPid: (lp) => findLaunchedCliPid(lp, targetCliId),
       getBackend: () => backend,
-      // Herdr/ZMX alias getChildPid() to the mutable cliPid. A failed publication
-      // may already have rewired that field, so only the captured launcher PID +
-      // spawn generation can fence retries without abandoning them after apply.
-      getChildPid: () => (generation === cliSpawnGeneration ? launcherPid : null),
+      // Herdr/ZMX alias getChildPid() to the mutable cliPid, so retry validity
+      // uses their independent stable pane identity instead. Backends without
+      // the accessor retain the original current-child observation as fallback.
+      getChildPid: () => generation === cliSpawnGeneration && readStablePanePid() === stablePanePid
+        ? launcherPid
+        : null,
       applyRealPid: (realPid) => applyResolvedCliPid(realPid, `wrapperCli "${cfg.wrapperCli}"`, launcherPid),
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -31648,7 +31659,7 @@ async function spawnCliBody(
         bridgeCliPid = resolved.pid;
       }
     }
-    resolveBehindWrapper(resolved.pid);
+    resolveBehindWrapper(resolved.pid, panePid);
     attestSandboxedCliLeaf(resolved.pid);
   };
   const startWrapperRealPidResolve = (panePid: number): void => {
