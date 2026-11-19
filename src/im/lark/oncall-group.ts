@@ -431,7 +431,21 @@ async function closeOncallForm(draft: OncallFormDraft, created: boolean, owns: (
     const retired = await client.deleteMessage(draft.appId, messageId, {
       acceptWithdrawn: true,
       onRecallExpired: async () => {
-        if (owns()) await replaceWithStatus('已发起人工 Oncall，请从原回答卡进入。');
+        if (!owns()) return;
+        try {
+          await replaceWithStatus('已发起人工 Oncall，请从原回答卡进入。');
+        } catch (error) {
+          // Once both write windows have expired no retry can ever retire the
+          // immutable form. Settle the durable cleanup instead of retrying
+          // forever; a concurrently withdrawn form is already retired too.
+          const unchangeable = oncallCardUnchangeable(error);
+          if (unchangeable === 'expired') {
+            logger.warn(`[oncall-group] Classification form ${messageId} is immutable after recall/edit expiry; settling cleanup`);
+            return;
+          }
+          if (unchangeable === 'gone') return;
+          throw error;
+        }
       },
     });
     if (!retired) throw new Error('分类表单收起失败，请重试');
