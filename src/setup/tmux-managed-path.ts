@@ -34,8 +34,16 @@ function fenced(env: NodeJS.ProcessEnv): boolean {
   return !!env.BOTMUX_TMUX_FENCE_LOG || env.BOTMUX_FENCED_RUN === '1';
 }
 
-/** Re-try a failed verification after this long (a loaded host can time out). */
-const FAILED_VERIFY_RETRY_MS = 60_000;
+/**
+ * How long either verification result is trusted. Failures are retried after
+ * this instead of hammering a broken binary; successes expire too, because a
+ * managed copy can stop running WITHOUT its stat identity changing — a
+ * dependency library removed by `apt autoremove`, a noexec remount, or
+ * `chmod -x` leave inode/size/mtime untouched. A permanent success cache would
+ * keep such a broken copy in front of the user's working tmux until the
+ * daemon restarted. Re-verification is one ~2ms `tmux -V` per process per TTL.
+ */
+const VERIFY_CACHE_TTL_MS = 60_000;
 const VERIFY_TIMEOUT_MS = 8_000;
 const verified = new Map<string, { key: string; ok: boolean; at: number }>();
 
@@ -48,8 +56,10 @@ export function resetManagedTmuxVerificationForTests(): void {
  * manifest records? Installed copies can break later without botmux touching
  * them (a library removed by `apt autoremove`, a HOME shared with a host that
  * cannot run it, a noexec remount, a truncated file): such a copy must never
- * shadow the user's working tmux. Cached per binary identity, so each process
- * pays one `tmux -V` per installed binary.
+ * shadow the user's working tmux. Cached per binary identity with a bounded
+ * TTL, so each process pays one `tmux -V` per installed binary per TTL — and
+ * a copy that breaks after a successful verification is dropped at the next
+ * TTL boundary rather than shadowing the fallback until a daemon restart.
  */
 function verifiedRunnable(root: string, bin: string): boolean {
   let key: string;
@@ -61,7 +71,7 @@ function verifiedRunnable(root: string, bin: string): boolean {
   }
   const cached = verified.get(root);
   const now = Date.now();
-  if (cached && cached.key === key && (cached.ok || now - cached.at < FAILED_VERIFY_RETRY_MS)) return cached.ok;
+  if (cached && cached.key === key && now - cached.at < VERIFY_CACHE_TTL_MS) return cached.ok;
   let ok = false;
   let detail = '';
   try {

@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { tmuxEnv } from '../src/setup/ensure-tmux.js';
 import {
   managedTmuxBinDir,
@@ -69,6 +69,26 @@ describe('tmuxEnv and botmux\'s own tmux', () => {
   it('an answer that is not the release botmux installed is not trusted', () => {
     installLayout('#!/bin/sh\necho "tmux 3.3a"\n', '3.5a');
     expect(tmuxEnv({ PATH: '/usr/bin' }).PATH).not.toContain('.botmux/tools');
+  });
+
+  it('a copy that breaks after a successful verification drops out of PATH at the TTL boundary', () => {
+    vi.useFakeTimers();
+    try {
+      const binDir = installLayout();
+      const bin = join(binDir, 'tmux');
+      // Healthy: the first real verification succeeds and prepends the managed dir.
+      expect(tmuxEnv({ PATH: '/usr/bin' }).PATH!.split(':')[0]).toBe(binDir);
+      // Break runnability WITHOUT changing inode/size/mtime — the same shape as
+      // a dependency library removed by apt autoremove or a noexec remount.
+      chmodSync(bin, 0o600);
+      // Inside the TTL window the cached answer still stands.
+      expect(tmuxEnv({ PATH: '/usr/bin' }).PATH).toContain('.botmux/tools');
+      vi.advanceTimersByTime(60_001);
+      // Past the TTL, re-verification runs, fails, and the user's tmux wins again.
+      expect(tmuxEnv({ PATH: '/usr/bin' }).PATH).not.toContain('.botmux/tools');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('inside a tmux test fence the managed copy is ignored (the fence shim must stay first)', () => {
