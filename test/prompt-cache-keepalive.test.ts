@@ -20,6 +20,7 @@ vi.mock('../src/services/statusline-snapshot.js', async (importOriginal) => ({
 import {
   notePromptCacheKeepaliveResult,
   notePromptCacheKeepaliveScreenStatus,
+  notePromptCacheKeepaliveTurnStarted,
   promptCacheKeepaliveIneligibility,
   resetPromptCacheKeepalive,
   resolvedPromptCacheTtl,
@@ -171,6 +172,31 @@ describe('ack and idle-clock bookkeeping', () => {
   it('a new turn resets the stretch', () => {
     const ds = session({ promptCacheKeepalive: { pings: 2, idleSinceAt: idleStart } });
     resetPromptCacheKeepalive(ds);
+    expect(ds.promptCacheKeepalive).toBeUndefined();
+  });
+
+  it('an unattended /compact the worker refuses leaves the keep-alive schedule alone', () => {
+    globalConfig.promptCache = { keepalive: { enabled: true } };
+    const pinged = { pings: 1, lastPingAt: NOON.getTime() - MIN, idleSinceAt: idleStart };
+    // An ordinary turn ends the stretch: the next sweep pings at once.
+    const human = session({ promptCacheKeepalive: { ...pinged } });
+    notePromptCacheKeepaliveTurnStarted(human, {}, NOON.getTime());
+    expect(sweep([human]).sent).toBe(1);
+    // The refused maintenance write changed nothing on screen: no extra ping.
+    const refused = session({ promptCacheKeepalive: { ...pinged } });
+    notePromptCacheKeepaliveTurnStarted(refused, { unattended: true }, NOON.getTime());
+    expect(refused.promptCacheKeepalive).toEqual(pinged);
+    expect(sweep([refused]).sent).toBe(0);
+    // When it does run, its own busy edge ends the stretch as any turn would.
+    refused.lastScreenStatus = 'working';
+    refused.idleSinceAt = undefined;
+    notePromptCacheKeepaliveScreenStatus(refused, 'idle', NOON.getTime() + 1_000);
+    expect(refused.promptCacheKeepalive).toBeUndefined();
+  });
+
+  it('with a keep-alive in flight an unattended turn still resets, so its busy edge is not taken for the ping', () => {
+    const ds = session({ promptCacheKeepalive: { pings: 0, idleSinceAt: idleStart, inFlightSince: NOON.getTime() } });
+    notePromptCacheKeepaliveTurnStarted(ds, { unattended: true }, NOON.getTime() + 1_000);
     expect(ds.promptCacheKeepalive).toBeUndefined();
   });
 });
