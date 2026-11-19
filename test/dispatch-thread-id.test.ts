@@ -37,6 +37,7 @@ function harness(mode: Mode, options: {
   threadId?: unknown;
   failure?: 'permission' | 'network' | 'timeout' | 'send';
   acceptance?: 'accepted' | 'timed_out';
+  consentPending?: boolean;
   taskTreeCardEnabled?: boolean;
   resolveBotApps?: (receiver: string, chatId: string, appIds: string[]) => Promise<unknown>;
 } = {}) {
@@ -76,6 +77,7 @@ function harness(mode: Mode, options: {
   });
   const postCurrentSessionDaemonRoute = vi.fn(async (input: { path: string; body: any }) => {
     if (input.path === '/api/dispatch-user/deliver') {
+      if (options.consentPending) return { ok: false, json: async () => ({ ok: false, error: 'task_consent_pending' }) };
       const messageId = await replyMessage('cli_source', input.body.rootId, input.body.content, 'post', true);
       return { ok: true, json: async () => ({ ok: true, messageId }) };
     }
@@ -259,6 +261,14 @@ for (const mode of ['dispatch', 'standby', 'into'] as const) {
     });
   });
 }
+
+it.each(['dispatch', 'into'] as const)('%s reports a resumable consent wait without failing the task', async mode => {
+  const h = harness(mode, { consentPending: true, acceptance: 'accepted' });
+  await h.run();
+  expect(JSON.parse(h.stderr.at(-1)!)).toMatchObject({ errorCode: 'TASK_CONSENT_PENDING', taskSent: false, threadRootId: h.root });
+  expect(h.persistDispatchLifecycle).not.toHaveBeenCalled();
+  expect(h.replyMessage).not.toHaveBeenCalled();
+});
 
 it.each(['dispatch', 'into'] as const)('%s keeps acceptance timeout independent from thread metadata', async mode => {
   const h = harness(mode, { acceptance: 'timed_out' });

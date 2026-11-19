@@ -154,7 +154,7 @@ import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js'
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
-import { projectAuthorityPaths } from './services/project-authority-paths.js';
+import { hostAuthorityPaths } from './services/project-authority-paths.js';
 import { CodexAppEngineRootWaitCancelled, parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { assertWorkingDirStaysInRoleLibrary, roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
@@ -29665,7 +29665,7 @@ async function spawnCliBody(
     const hostOnlyDenyPaths: string[] = [
       join(canonical(dataDir), 'schedule-preconditions'),
       join(canonical(dataDir), 'link-refs'),
-      ...projectAuthorityPaths(canonical(dataDir)),
+      ...hostAuthorityPaths(canonical(dataDir)),
     ];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
@@ -30261,7 +30261,7 @@ async function spawnCliBody(
       sessionId: cfg.sessionId,
     });
     const scratchDeny = [...new Set<string>([
-      ...projectAuthorityPaths(scratchCanonical(scratchDataDir)),
+      ...hostAuthorityPaths(scratchCanonical(scratchDataDir)),
       ...credentialRules.denyPaths.map(path =>
         scratchProtectedPathSet.has(path) ? path : scratchCanonical(path)),
       ...existingProtectedPathVariants(scratchProtectedPaths),
@@ -30741,8 +30741,8 @@ async function spawnCliBody(
     }, seatbeltProtectedPaths);
     // Imported-task authority is nested under dataDir, not among the legacy
     // root-level dashboard files enumerated by credential-only profiles.
-    rules.denyPaths.push(...projectAuthorityPaths(canonical(isolationRuntimeDataDir)));
-    rules.denyWritePaths.push(...projectAuthorityPaths(canonical(isolationRuntimeDataDir)));
+    rules.denyPaths.push(...hostAuthorityPaths(canonical(isolationRuntimeDataDir)));
+    rules.denyWritePaths.push(...hostAuthorityPaths(canonical(isolationRuntimeDataDir)));
     const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
     const originDirectory = managedOriginCapabilityDirectory(
@@ -30863,7 +30863,7 @@ async function spawnCliBody(
       }
     };
     const credentialOnlyProtectedPaths = protectedPathsForHome(hostHomeDir);
-    for (const path of projectAuthorityPaths(isolationRuntimeDataDir)) {
+    for (const path of hostAuthorityPaths(isolationRuntimeDataDir)) {
       try { mkdirSync(path, { recursive: true, mode: 0o700 }); } catch {
         throw new Error('project authority mask directory unavailable');
       }

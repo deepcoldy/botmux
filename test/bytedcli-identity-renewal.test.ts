@@ -64,6 +64,19 @@ afterEach(() => {
 });
 
 describe('bytedcli identity renewal', () => {
+  it.each(['before', 'during'])('withholds renewed material when a task authorization is revoked %s minting', async when => {
+    const identity = publish(60, 60);
+    let approved = when === 'during';
+    const check = vi.fn(async () => approved);
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity, taskAuthorized: check });
+    renew.mockImplementation(async () => { approved = false; return { cloudJwt: 'must-not-publish' }; });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).toHaveBeenCalledTimes(when === 'during' ? 1 : 0);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).not.toContain('must-not-publish');
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+  });
+
   it('leaves registered background cache to its per-invocation authority checks', async () => {
     const ordinary = publish(600, 600);
     forgetBytedcliIdentityRenewals();

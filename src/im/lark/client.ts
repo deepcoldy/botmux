@@ -2590,6 +2590,21 @@ export async function listMessagesByThreadId(larkAppId: string, threadId: string
   return listByThread(getBotClient(larkAppId), threadId, pageSize);
 }
 
+/** Read the very first native reply to a daemon-created task seed. A later
+ * matching reply or a chat scan cannot prove who originated a legacy task. */
+export async function firstDispatchReply(appId: string, chatId: string, rootId: string): Promise<string | undefined> {
+  const item = (await getMessageDetail(appId, rootId, { userCardContent: false, timeoutMs: 5000 }))?.items?.[0];
+  if (item?.message_id !== rootId || item?.chat_id !== chatId || item?.sender?.id !== appId
+      || !['app', 'bot'].includes(item.sender.sender_type) || !/^omt_[a-zA-Z0-9_-]+$/.test(item.thread_id ?? '')) return;
+  const page = await larkGet(getBotClient(appId), '/open-apis/im/v1/messages', {
+    container_id_type: 'thread', container_id: item.thread_id, sort_type: 'ByCreateTimeAsc', page_size: 2,
+  }, { timeoutMs: 5000 });
+  if (page.code !== 0) throw larkApiError('get first dispatch reply', page);
+  const first = page.data?.items?.find((message: { message_id?: string }) => message.message_id !== rootId);
+  if (first?.root_id === rootId && first.chat_id === chatId && first.thread_id === item.thread_id
+      && !first.deleted && first.sender?.id === appId && ['app', 'bot'].includes(first.sender.sender_type)) return first.message_id;
+}
+
 export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
   return (await listThreadMessagesWithContext(larkAppId, chatId, rootMessageId, pageSize)).messages;
 }

@@ -32,6 +32,7 @@ interface RenewalEntry {
   sessionDataDir: string;
   sessionId: string;
   credentialOpenId: string;
+  taskAuthorized?: () => Promise<boolean>;
   identity: BytedCliIdentity & { turnId: string };
 }
 
@@ -104,11 +105,13 @@ export async function renewExpiringBytedcliIdentities(
     if (expiresAt === undefined || expiresAt - now() > renewBeforeMs) continue;
     inFlight.add(key);
     try {
+      if (entry.taskAuthorized && !await entry.taskAuthorized()) { entries.delete(key); continue; }
       const jwts = await renewBytedcliJwts(entry.credentialOpenId);
       if (!jwts) {
         logger.warn(`[bytedcli-renewal] could not renew ${entry.sessionId.slice(0, 8)}/${entry.identity.turnId.slice(0, 12)}; keeping current tokens`);
         continue;
       }
+      if (entry.taskAuthorized && !await entry.taskAuthorized()) { entries.delete(key); continue; }
       // The turn may have ended or been republished while the CLI ran.
       if (entries.get(key) !== entry) continue;
       if (!stillPublished(entry)) { entries.delete(key); continue; }

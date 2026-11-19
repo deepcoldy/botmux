@@ -66,8 +66,8 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
 const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
 const { isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
-const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper } = await import('../src/core/cli-identity.js');
-const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper, sessionIdentityPath } = await import('../src/core/cli-identity.js');
+const { capabilityOn, parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
 const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
 const { prepareScheduledRecoveryRun } = await import('../src/core/scheduled-send.js');
@@ -548,7 +548,7 @@ describe('queued identities stay separate from the executing task', () => {
 });
 
 describe('target daemon consumes signed message authority', () => {
-  async function targetHarness(options: { mapping?: 'resolved' | 'transient' | 'definitive'; member?: boolean; memberError?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
+  async function targetHarness(options: { taskConsent?: boolean; botAccess?: boolean; mapping?: 'resolved' | 'transient' | 'definitive'; member?: boolean; memberError?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
     const ts = (await import('typescript')).default;
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
@@ -570,8 +570,23 @@ describe('target daemon consumes signed message authority', () => {
     await deliverDispatchWithUser({ dataDir: dir, secret, payload: {
       sourceAppId: 'cli_source', sourceSessionId: 'source', sourceTurnId: 'om_human',
       rootId: 'om_root', chatId: 'oc_chat', targetAppIds: [APP],
+      ...(options.taskConsent ? { taskConsent: { sourceChatId: 'oc_source', cardId: 'om_consent' } } : {}),
       authority: { appId: 'cli_source', openId: ALICE, unionId: 'on_alice', tools: ['bytedcli'] },
     }, send: async () => 'om_kickoff' });
+    const { readTaskBinding } = await import('../src/im/lark/dispatch-task-consent.js');
+    if (options.taskConsent) {
+      const { createDispatchReportBinding } = await import('../src/core/dispatch-report-binding.js');
+      const reportBinding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source',
+        targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread', sourceName: 'test',
+        issuedAt: new Date().toISOString(), taskOwner: { openId: ALICE, receivingAppId: APP,
+          receivingChatId: 'oc_chat', consentMessageId: 'om_consent' } });
+      writeFileSync(join(dir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding } }));
+      const { answerDispatchTaskConsent, TASK_CONSENT_ACTION } = await import('../src/im/lark/dispatch-task-consent.js');
+      await answerDispatchTaskConsent(dir, secret, 'cli_source', { action: { value: {
+        action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } }, operator: { open_id: ALICE },
+        context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } });
+
+    }
     const scope = options.scope ?? 'thread';
     const ds: any = { larkAppId: APP, chatId: 'oc_chat', chatType: 'group', scope,
       session: { sessionId: SESSION, rootMessageId: scope === 'thread' ? 'om_root' : 'om_shared',
@@ -582,9 +597,12 @@ describe('target daemon consumes signed message authority', () => {
       ? { status: options.mapping } : { status: 'resolved', openId: 'ou_alice_target' });
     const scopeValues = {
       config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
-      getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
+      readTaskBinding, capabilityOn, getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       loadOrCreateDispatchReportBindingSecret: () => secret,
-      resolveTargetAppOpenId, evaluateTalk: () => ({ allowed: options.talk !== false }),
+      resolveTargetAppOpenId, evaluateTalk: (_app: string, chat?: string, _user?: string, botUnion?: string, humanUnion?: string) => ({
+        allowed: options.talk !== false && (!!chat || options.botAccess !== false)
+          && (!options.taskConsent || (!botUnion && humanUnion === 'on_alice')),
+      }),
       listChatMemberOpenIds: async () => options.member === false ? [] : ['ou_alice_target'],
       findCurrentChatUserMembers: async () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');
@@ -948,6 +966,47 @@ describe('target daemon consumes signed message authority', () => {
     await h.run('om_peer');
     expect(identityBody('bytedcli', 'om_peer')).not.toContain('must-not-use-peer');
   });
+  it('uses a source-authorized task only for its exact proven target turn', async () => {
+    const h = await targetHarness({ member: false, taskConsent: true });
+    bytedcliJwts.set(ALICE, { cloudJwt: 'test-task-user' });
+    await h.run();
+    expect(identityBody('bytedcli', 'om_kickoff')).toContain('test-task-user');
+    await h.run('om_unrelated');
+    expect(identityBody('bytedcli', 'om_unrelated')).not.toContain('test-task-user');
+  });
+
+  it('withholds a ByteCloud task identity for a Meego-only target', async () => {
+    const h = await targetHarness({ taskConsent: true });
+    h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, capabilities: ['meego'] }) });
+    bytedcliJwts.set(ALICE, { cloudJwt: 'private-task-user' });
+    await h.run();
+    expect(identityBody('bytedcli', 'om_kickoff')).toContain("BOTMUX_IDENTITY_MODE='denied'");
+  });
+
+  it('does not publish task credentials to disk when the worker changes model during lookup', async () => {
+    const h = await targetHarness({ taskConsent: true, member: false });
+    const read = h.scopeValues.readTaskBinding;
+    h.scopeValues.readTaskBinding = async (...args: Parameters<typeof read>) => {
+      h.ds.reportedModel = 'single';
+      return read(...args);
+    };
+    bytedcliJwts.set(ALICE, { cloudJwt: 'private-task-user' });
+    await h.run();
+    const body = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).not.toContain('private-task-user');
+  });
+
+  it.each(['hub-only', 'shared-chat', 'file-identity'] as const)('refuses an unisolated or group-only recipient: %s', async kind => {
+    const h = await targetHarness({ member: false, taskConsent: true, botAccess: kind !== 'hub-only',
+      scope: kind === 'shared-chat' ? 'chat' : 'thread' });
+    if (kind === 'file-identity') h.ds.reportedModel = 'single';
+    bytedcliJwts.set(ALICE, { cloudJwt: 'test-task-user' });
+    await h.run();
+    expect(h.scopeValues.logger.info).toHaveBeenCalledWith(expect.stringContaining(
+      'result=' + (kind === 'hub-only' ? 'target_access_denied' : 'task_turn_isolation_required')));
+  });
+
   it('reports unavailable member verification without telling the human to log in again', async () => {
     const h = await targetHarness({ memberError: true });
     bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });

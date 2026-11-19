@@ -1,3 +1,6 @@
+import { capabilityOn } from '../src/services/trigger-user-auth.js';
+import { answerDispatchTaskConsent, confirmDispatchTask, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
+import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /** Executes the production IPC handler with platform/network seams replaced. */
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
@@ -54,7 +57,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
   const send = vi.fn(async () => 'om_kickoff');
   const resolveUnionIdFromOpenId = vi.fn(async () => 'on_alice');
   const scope: any = {
-    readJsonBody: async () => body, DISPATCH_USER_DELIVERY_MAX_BYTES, JsonBodyTooLargeError,
+    capabilityOn, readJsonBody: async () => body, DISPATCH_USER_DELIVERY_MAX_BYTES, JsonBodyTooLargeError,
     findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
     authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => isHost, selfDaemonLarkAppId: 'cli_source',
     validateCodexAppManagedSendOrigin, isCodexAppCliId,
@@ -156,6 +159,51 @@ describe('dispatch user IPC end-to-end identity binding', () => {
       enabled: true, tools: ['lark-cli'], dispatchOnly,
     } } });
   };
+  it('records source consent and reuses it for the same signed workstream across requests', async () => {
+    const h = harness({ content: JSON.stringify({ zh_cn: { title: '', content: [[{ tag: 'text', text: 'Review the change' }]] } }) });
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    let dispatches = 0;
+    const send = vi.fn(async (_app, _turn, _content, type) => type === 'interactive' ? 'om_consent' : 'om_delivery' + ++dispatches);
+    Object.assign(h.scope, { readTaskBinding, confirmDispatchTask,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      findCurrentChatUserMembers: async (app: string, chat: string) => {
+        expect(app).toBe('cli_source');
+        return new Set(chat === 'oc_source' ? ['ou_alice'] : []);
+      },
+      replyMessage: send, evaluateTalk: () => ({ allowed: true }),
+    });
+    const result = h.run();
+    await vi.waitFor(async () => expect((await readTaskBinding(dataDir, secret, 'om_root'))?.taskOwner?.consentMessageId).toBe('om_consent'));
+    const click = { action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } },
+      operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } };
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_other', click)).toBe(false);
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', { ...click, operator: { open_id: 'ou_other' } })).toBe(false);
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', { ...click, context: { ...click.context, open_message_id: 'om_copy' } })).toBe(false);
+    expect(send.mock.calls.filter(call => call[3] === 'post')).toHaveLength(0);
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    const oldRouting = readFileSync(join(dataDir, 'orchestrate-dispatch.json'));
+    expect((await result).status).toBe(200);
+    const exact = await resolveDispatchUser({ dataDir, secret, appId: 'cli_target', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_delivery1', waitMs: 0 });
+    expect(exact).toMatchObject({ domain: 'botmux.dispatch-user.task.v1', authority: { tools: ['bytedcli'] } });
+    expect(await resolveDispatchUser({ dataDir, secret, appId: 'cli_other', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_delivery1', waitMs: 0 })).toBeUndefined();
+    h.ds.managedTurnOrigin.turnId = h.ds.activeInteractiveTurn.turnId = h.body.originTurnId = 'om_followup';
+    expect((await h.run()).status).toBe(200);
+    expect(send.mock.calls.filter(call => call[3] === 'interactive')).toHaveLength(1);
+    click.action.value.choice = 'deny';
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    click.action.value.choice = 'approve';
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(false);
+    expect((await h.run()).value.error).toBe('task_consent_denied');
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), oldRouting);
+    expect((await h.run()).value.error).toBe('task_consent_denied');
+    expect(dispatches).toBe(2);
+  });
+
   it('signs the direct sender for one allowed dispatch without changing the source CLI policy', async () => {
     const h = harness();
     h.ds.chatId = 'oc_target';
