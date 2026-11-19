@@ -1,5 +1,5 @@
 import { capabilityOn } from '../src/services/trigger-user-auth.js';
-import { answerDispatchTaskConsent, confirmDispatchTask, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
+import { answerDispatchTaskConsent, assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /** Executes the production IPC handler with platform/network seams replaced. */
@@ -9,6 +9,17 @@ import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+let taskReadHook: (() => void) | undefined;
+vi.mock('node:fs/promises', async () => {
+  const { promises: original } = await import('node:fs');
+  const readFile = original.readFile.bind(original);
+  return { ...original, readFile: ((...args: Parameters<typeof original.readFile>) => {
+    const hook = taskReadHook;
+    taskReadHook = undefined;
+    hook?.();
+    return readFile(...args);
+  }) as typeof original.readFile };
+});
 import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
 import { fallbackTurnId, frozenReplyContextForTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
@@ -74,7 +85,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
-    resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
+    resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser, deliverApprovedDispatchTask, assertDispatchTaskApproved,
     config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
     logger: { info: vi.fn() },
   };
@@ -202,6 +213,44 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), oldRouting);
     expect((await h.run()).value.error).toBe('task_consent_denied');
     expect(dispatches).toBe(2);
+  });
+
+  it.each(['revocation', 'turn replacement'] as const)('refuses %s between approval and provider write', async race => {
+    const h = harness();
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    const click = { action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } },
+      operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } };
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    Object.assign(h.scope, { readTaskBinding, confirmDispatchTask,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async (_app: string, chat: string) => {
+        if (chat !== 'oc_source') return new Set();
+        if (race === 'revocation') {
+          expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source',
+            { ...click, action: { value: { ...click.action.value, choice: 'deny' } } })).toBe(true);
+        }
+        return new Set(['ou_alice']);
+      },
+      replyMessage: async (...args: any[]) => {
+        taskReadHook = () => { h.ds.managedTurnOrigin.turnId = 'om_next'; };
+        try {
+          await args[7]?.beforeWrite();
+          return h.send(...args);
+        } finally { taskReadHook = undefined; }
+      },
+    });
+    const result = await h.run();
+    expect(result.value.error).toBe(race === 'revocation' ? 'task_consent_denied' : 'dispatch_delivery_failed');
+    if (race === 'turn replacement') expect(result.value.detail).toBe('dispatch origin changed before provider effect');
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
   });
 
   it('signs the direct sender for one allowed dispatch without changing the source CLI policy', async () => {

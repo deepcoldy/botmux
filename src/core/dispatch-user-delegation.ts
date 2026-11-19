@@ -330,6 +330,13 @@ export async function deliverDispatchWithUser(input: {
   send: () => Promise<string>;
 }): Promise<string> {
   const pending = await registerPendingDispatchUser(input);
+  return deliverPendingDispatchUser(input, pending);
+}
+
+/** Complete an already registered delivery using the same send/cleanup path. */
+export async function deliverPendingDispatchUser(input: {
+  dataDir: string; secret: string; send: () => Promise<string>;
+}, pending: SignedDispatchUser): Promise<string> {
   const deliveryId = pending.payload.deliveryId;
   let messageId: string;
   try {

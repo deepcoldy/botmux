@@ -6,6 +6,8 @@ import { mkdir, readFile } from 'node:fs/promises';
 import type { CardActionData } from './card-handler.js';
 import { createDispatchReportBinding, verifyDispatchReportBinding, type DispatchReportBindingPayload } from '../../core/dispatch-report-binding.js';
 import { updateDispatchRegistry } from '../../core/dispatch-registry.js';
+import { withFileLock } from '../../utils/file-lock.js';
+import { deliverPendingDispatchUser, registerPendingDispatchUser } from '../../core/dispatch-user-delegation.js';
 
 export const TASK_CONSENT_ACTION = 'dispatch_task_bytedcli';
 const registryPath = (dataDir: string) => join(dataDir, 'orchestrate-dispatch.json');
@@ -41,6 +43,42 @@ export async function readTaskBinding(dataDir: string, secret: string, root: str
     && (record.decision === 'approved' || record.decision === 'denied')
     && record.signature === decisionSignature(secret, root, record.cardId, record.decision) ? record.decision : undefined;
   return { ...binding, taskOwner: { ...binding.taskOwner, decision } };
+}
+
+/** Revalidate the exact source task at the signing and provider-write edges. */
+export async function assertDispatchTaskApproved(
+  input: Parameters<typeof registerPendingDispatchUser>[0],
+): Promise<void> {
+  const p = input.payload;
+  const current = p.rootId ? await readTaskBinding(input.dataDir, input.secret, p.rootId) : null;
+  const owner = current?.taskOwner;
+  if (!p.taskConsent || !current || current.attachment
+    || current.targetSessionId !== p.sourceSessionId || current.targetLarkAppId !== p.sourceAppId
+    || current.targetChatId !== p.taskConsent.sourceChatId || current.targetScope !== 'thread'
+    || owner?.openId !== p.authority.openId || p.authority.appId !== p.sourceAppId
+    || owner.receivingChatId !== p.chatId || p.targetAppIds.length !== 1
+    || owner.receivingAppId !== p.targetAppIds[0]
+    || owner.consentMessageId !== p.taskConsent.cardId) throw new Error('dispatch_task_changed');
+  if (owner.decision !== 'approved') {
+    throw new Error(owner.decision === 'denied' ? 'task_consent_denied' : 'task_consent_pending');
+  }
+}
+
+export async function deliverApprovedDispatchTask(
+  input: Parameters<typeof registerPendingDispatchUser>[0] & { send: () => Promise<string> },
+): Promise<string> {
+  const root = input.payload.rootId;
+  if (!root) throw new Error('dispatch_task_changed');
+  // Decision and registration have one order. Do not hold this lock while
+  // waiting on provider I/O: a human must still be able to revoke promptly.
+  const pending = await withFileLock(decisionPath(input.dataDir, root), async () => {
+    await assertDispatchTaskApproved(input);
+    return registerPendingDispatchUser(input);
+  });
+  return deliverPendingDispatchUser({
+    ...input,
+    send: async () => { await assertDispatchTaskApproved(input); return input.send(); },
+  }, pending);
 }
 
 /** Adopt a pre-upgrade workstream only after verifying the identity on its

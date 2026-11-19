@@ -657,7 +657,7 @@ import type { IdentityStorageModel } from './core/lark-tool-binding.js';
 import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
-import { confirmDispatchTask, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
+import { assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
 import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
@@ -9507,18 +9507,24 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       }
     }
     await sourceWriteOptions.beforeWrite();
-    const send = () => replyMessage(ds.larkAppId, rootId, body.content, 'post', true, undefined, undefined, sourceWriteOptions);
-    const messageId = authority && turnId && targetAppIds.length
-      ? await deliverDispatchWithUser({
-          dataDir: config.session.dataDir,
-          secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
-          payload: {
-            sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
-            rootId, chatId, targetAppIds, authority,
-            ...(taskConsent ? { taskConsent } : {}),
-            ...(inheritedWorkflow && !scheduleCreateCapabilities(authority).length ? { workflow: inheritedWorkflow } : {}),
-          }, send,
-        })
+    const delivery = authority && turnId && targetAppIds.length ? {
+      dataDir: config.session.dataDir,
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+      payload: {
+        sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
+        rootId, chatId, targetAppIds, authority,
+        ...(taskConsent ? { taskConsent } : {}),
+        ...(inheritedWorkflow && !scheduleCreateCapabilities(authority).length ? { workflow: inheritedWorkflow } : {}),
+      },
+    } : undefined;
+    const send = () => replyMessage(ds.larkAppId, rootId, body.content, 'post', true, undefined, undefined,
+      taskConsent && delivery ? { ...sourceWriteOptions, beforeWrite: async () => {
+        await sourceWriteOptions.beforeWrite();
+        await assertDispatchTaskApproved(delivery);
+        await sourceWriteOptions.beforeWrite();
+      } } : sourceWriteOptions);
+    const messageId = delivery
+      ? await (taskConsent ? deliverApprovedDispatchTask : deliverDispatchWithUser)({ ...delivery, send })
       : await send();
     if (scheduleCreateDefaulted || serviceGrant) {
       // With a service grant the signer is the sponsor, not whoever drove the
