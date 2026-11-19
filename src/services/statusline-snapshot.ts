@@ -1,12 +1,11 @@
 /**
- * statusline-snapshot.ts — Claude Code statusline 数据的落盘与读取。
+ * statusline-snapshot.ts — Claude Code / Antigravity statusline 数据的落盘与读取。
  *
- * Claude Code 会把一份 JSON（`context_window`、`rate_limits`、`model`、
- * `transcript_path` …）喂给 settings 里配置的 `statusLine.command`（stdin），
- * 触发时机：每条 assistant 消息后、/compact 后、到达 `resets_at` 时、以及可选的
- * `refreshInterval` 定时。botmux 用进程级 `--settings` 把该命令指向
- * `botmux statusline`，由它把快照写到 `<DATA_DIR>/statusline/<sessionId>/latest.json`；
- * daemon 在组装卡片用量段时按 mtime 缓存读回，渲染成 `ctx 23% · 5h 18% · 7d 5%`。
+ * Claude Code / Antigravity (`agy`) 会把一份 JSON（`context_window`、`rate_limits` /
+ * `quota`、`model`、`transcript_path` …）喂给 settings 里配置的 `statusLine.command`
+ * （stdin）。botmux 用进程级 `--settings` 把该命令指向 `botmux statusline`，由它把
+ * 快照写到 `<DATA_DIR>/statusline/<sessionId>/latest.json`；daemon 在组装卡片用量段时
+ * 按 mtime 缓存读回，渲染成 `ctx 23% · 5h 18% · 7d 5%`。
  *
  * 为什么是每会话一个目录而不是单文件：沙盒（bwrap / Seatbelt）对单文件只授
  * readWrite，父目录不可写，原子写的 tmp+rename 必败；目录粒度既保原子写又隔离会话。
@@ -85,24 +84,160 @@ function percent(v: unknown): number | undefined {
   return n;
 }
 
-/** resets_at：文档为 Unix 秒；启发式兼容毫秒（< 1e12 视为秒）。 */
+/** resets_at / reset_time：支持 Unix 秒（< 1e12）、毫秒、或 ISO 8601 时间字符串。 */
 function resetsAtMs(v: unknown): number | undefined {
   const n = finiteNumber(v);
-  if (n === undefined || n <= 0) return undefined;
-  return n < 1e12 ? Math.round(n * 1000) : Math.round(n);
+  if (n !== undefined) {
+    if (n <= 0) return undefined;
+    return n < 1e12 ? Math.round(n * 1000) : Math.round(n);
+  }
+  if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) {
+    const parsed = Date.parse(v);
+    if (Number.isFinite(parsed) && parsed > 0) return Math.round(parsed);
+  }
+  return undefined;
 }
 
 function nonEmptyString(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
 
+interface ParsedQuotaWindow {
+  usedPercent: number;
+  resetsAtMs?: number;
+}
+
+interface AntigravityQuotaEntry {
+  key: string;
+  usedPercent: number;
+  resetsAtMs?: number;
+}
+
+function usedPercentFromRemainingFraction(v: unknown): number | undefined {
+  const n = finiteNumber(v);
+  if (n === undefined) return undefined;
+  const remaining = n < 0 ? 0 : n > 1 ? 1 : n;
+  // 四位小数规整，避免 (1 - 0.9) * 100 = 9.999999999999998 这类 IEEE-754 尾差。
+  return percent(Math.round((1 - remaining) * 1e6) / 1e4);
+}
+
+function isFiveHourBucketKey(key: string): boolean {
+  return /(?:^|[-_])(5h|five[-_]?hour)(?:$|[-_])/.test(key);
+}
+
+function isWeeklyBucketKey(key: string): boolean {
+  return /(?:^|[-_])(weekly|7d|seven[-_]?day)(?:$|[-_])/.test(key);
+}
+
+function isGenericWindowKey(key: string, window: '5h' | 'weekly'): boolean {
+  return window === '5h'
+    ? /^(?:5h|five[-_]?hour)$/.test(key)
+    : /^(?:weekly|7d|seven[-_]?day)$/.test(key);
+}
+
+function pickMostConstrained(entries: AntigravityQuotaEntry[]): AntigravityQuotaEntry | undefined {
+  if (entries.length === 0) return undefined;
+  return [...entries].sort((a, b) => (b.usedPercent - a.usedPercent) || a.key.localeCompare(b.key))[0];
+}
+
+function pickAntigravityBucket(
+  entries: AntigravityQuotaEntry[],
+  window: '5h' | 'weekly',
+  modelHint: string,
+): ParsedQuotaWindow | undefined {
+  const windowEntries = entries.filter(e =>
+    window === '5h' ? isFiveHourBucketKey(e.key) : isWeeklyBucketKey(e.key),
+  );
+  if (windowEntries.length === 0) return undefined;
+
+  const isThirdParty = /(?:^|[^a-z0-9])(claude|gpt|opus|sonnet|haiku|openai|anthropic)(?:$|[^a-z0-9])/.test(modelHint);
+  const isGemini = !isThirdParty && (/(?:^|[^a-z0-9])(gemini|orchestrator)(?:$|[^a-z0-9])/.test(modelHint) || modelHint.trim() === '');
+
+  const generic = windowEntries.filter(e => isGenericWindowKey(e.key, window));
+
+  if (isThirdParty) {
+    const canonical = window === '5h'
+      ? windowEntries.find(e => e.key === '3p-5h')
+      : windowEntries.find(e => e.key === '3p-weekly' || e.key === '3p-7d');
+    if (canonical) return canonical;
+    const family = windowEntries.filter(e => /^(?:3p|claude|gpt|anthropic|openai)(?:[-_]|$)/.test(e.key));
+    if (family.length > 0) return pickMostConstrained(family);
+    if (generic.length > 0) return pickMostConstrained(generic);
+    return undefined;
+  }
+
+  if (isGemini) {
+    // Specific model codenames before generic tier tokens (`flash`/`pro`) so e.g.
+    // `gemini-pro-orchestrator-g1-pro` + `Orchestrator (Argon)` selects `argon`
+    // rather than stopping at `pro`.
+    for (const variant of ['argon', 'neon', 'hydrogen', 'carbon', 'flash', 'pro']) {
+      if (!new RegExp(`(?:^|[^a-z0-9])${variant}(?:$|[^a-z0-9])`).test(modelHint)) continue;
+      const variantMatches = windowEntries.filter(e =>
+        e.key.startsWith('gemini') && new RegExp(`(?:^|[-_])${variant}(?:$|[-_])`).test(e.key),
+      );
+      if (variantMatches.length > 0) return pickMostConstrained(variantMatches);
+    }
+    const canonical = window === '5h'
+      ? windowEntries.find(e => e.key === 'gemini-5h')
+      : windowEntries.find(e => e.key === 'gemini-weekly' || e.key === 'gemini-7d');
+    if (canonical) return canonical;
+    const family = windowEntries.filter(e => /^gemini(?:[-_]|$)/.test(e.key));
+    if (family.length > 0) return pickMostConstrained(family);
+    if (generic.length > 0) return pickMostConstrained(generic);
+    return undefined;
+  }
+
+  if (generic.length > 0) return pickMostConstrained(generic);
+  if (windowEntries.length === 1) return windowEntries[0];
+  return undefined;
+}
+
 /**
- * 把 Claude 喂进 stdin 的原始 JSON 规范成快照：逐字段容错（缺失 / 非数值的字段
+ * 解析 Antigravity (`agy`) statusLine 的 `quota` 桶字典：
+ *   { "gemini-5h": { remaining_fraction: 0.79, reset_time: "...Z", reset_in_seconds: 9121 }, ... }
+ * 按当前活跃模型路由到对应族（Gemini / 3P）及子桶，并换算为与 Claude Code 一致的已用百分比。
+ */
+function parseAntigravityQuota(
+  quotaRaw: unknown,
+  modelRaw: unknown,
+  now: number,
+): { fiveHour?: ParsedQuotaWindow; sevenDay?: ParsedQuotaWindow } {
+  if (!quotaRaw || typeof quotaRaw !== 'object' || Array.isArray(quotaRaw)) return {};
+  const entries: AntigravityQuotaEntry[] = [];
+  for (const [rawKey, value] of Object.entries(quotaRaw as Record<string, unknown>)) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const b = value as Record<string, unknown>;
+    if (b.disabled === true) continue;
+    const usedPercent = usedPercentFromRemainingFraction(b.remaining_fraction);
+    if (usedPercent === undefined) continue;
+    let resetMs = resetsAtMs(b.reset_time);
+    if (resetMs === undefined) {
+      const resetInSec = finiteNumber(b.reset_in_seconds);
+      if (resetInSec !== undefined && resetInSec > 0) {
+        resetMs = Math.round(now + resetInSec * 1000);
+      }
+    }
+    entries.push({ key: rawKey.trim().toLowerCase(), usedPercent, resetsAtMs: resetMs });
+  }
+  if (entries.length === 0) return {};
+  const modelObj = modelRaw && typeof modelRaw === 'object' && !Array.isArray(modelRaw)
+    ? modelRaw as Record<string, unknown>
+    : undefined;
+  const modelHint = `${nonEmptyString(modelObj?.id) ?? ''} ${nonEmptyString(modelObj?.display_name) ?? ''}`.toLowerCase();
+  return {
+    fiveHour: pickAntigravityBucket(entries, '5h', modelHint),
+    sevenDay: pickAntigravityBucket(entries, 'weekly', modelHint),
+  };
+}
+
+/**
+ * 把 Claude / Antigravity 喂进 stdin 的原始 JSON 规范成快照：逐字段容错（缺失 / 非数值的字段
  * 丢弃，不影响其它字段）；整体不是对象 → null。写端与读端共用，口径一致。
  */
 export function parseStatuslinePayload(raw: unknown, now: number = Date.now()): StatuslineSnapshot | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
   const o = raw as Record<string, any>;
+  const isAntigravity = o.product === 'antigravity';
   const cw = o.context_window && typeof o.context_window === 'object' ? o.context_window : undefined;
   const rl = o.rate_limits && typeof o.rate_limits === 'object' ? o.rate_limits : undefined;
   const five = rl?.five_hour && typeof rl.five_hour === 'object' ? rl.five_hour : undefined;
@@ -111,17 +246,35 @@ export function parseStatuslinePayload(raw: unknown, now: number = Date.now()): 
   const set = <K extends keyof StatuslineSnapshot>(k: K, v: StatuslineSnapshot[K] | undefined) => {
     if (v !== undefined) (snap as any)[k] = v;
   };
-  set('contextPercent', percent(cw?.used_percentage));
   const windowTokens = finiteNumber(cw?.context_window_size);
-  set('contextWindowTokens', windowTokens !== undefined && windowTokens > 0 ? Math.round(windowTokens) : undefined);
+  const validWindowTokens = windowTokens !== undefined && windowTokens > 0 ? Math.round(windowTokens) : undefined;
+  // Antigravity 在启动/恢复早期模型窗口未就绪时会报 context_window_size=0, used_percentage=0；
+  // 此时跳过占位 0%，让卡片继续沿用 conversation db 的准确上下文百分比。
+  if (!isAntigravity || validWindowTokens !== undefined) {
+    set('contextPercent', percent(cw?.used_percentage));
+  }
+  set('contextWindowTokens', validWindowTokens);
   set('fiveHourPercent', percent(five?.used_percentage));
   set('fiveHourResetsAtMs', resetsAtMs(five?.resets_at));
   set('sevenDayPercent', percent(seven?.used_percentage));
   set('sevenDayResetsAtMs', resetsAtMs(seven?.resets_at));
+  if (!five && !seven && (isAntigravity || (o.quota && typeof o.quota === 'object' && !Array.isArray(o.quota)))) {
+    const agyQuota = parseAntigravityQuota(o.quota, o.model, now);
+    if (agyQuota.fiveHour) {
+      set('fiveHourPercent', agyQuota.fiveHour.usedPercent);
+      set('fiveHourResetsAtMs', agyQuota.fiveHour.resetsAtMs);
+    }
+    if (agyQuota.sevenDay) {
+      set('sevenDayPercent', agyQuota.sevenDay.usedPercent);
+      set('sevenDayResetsAtMs', agyQuota.sevenDay.resetsAtMs);
+    }
+  }
   set('model', nonEmptyString(o.model?.id));
   set('reasoningEffort', isClaudeStatuslineEffort(o.effort?.level) ? o.effort.level : undefined);
   set('transcriptPath', nonEmptyString(o.transcript_path));
-  set('claudeSessionId', nonEmptyString(o.session_id));
+  if (!isAntigravity) {
+    set('claudeSessionId', nonEmptyString(o.session_id));
+  }
   return snap;
 }
 

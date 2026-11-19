@@ -671,11 +671,11 @@ function readDaemonSessionUsageSnapshot(
       // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
       pricing: resolvePricingForBot(ds.larkAppId ?? ds.session.larkAppId),
     });
-    // Claude Code statusline 快照（`botmux statusline` 落盘的 ctx / 5h / 7d 百分比）：
+    // Claude Code / Antigravity statusline 快照（`botmux statusline` 落盘的 ctx / 5h / 7d 百分比）：
     // 回复卡页脚、流式卡用量行、IPC /usage 三个读取点都经本函数，只在这里合并一次。
     // 独立 try/catch：快照读取失败不能拖垮 transcript 用量。无文件 / 陈旧 ⇒ 不带 key，
     // 卡片与无 statusline 时逐字节相同。
-    if (resolvedCliId === 'claude-code') {
+    if (resolvedCliId === 'claude-code' || resolvedCliId === 'antigravity') {
       try {
         const quota = toCardQuota(readStatuslineSnapshot(config.session.dataDir, ds.session.sessionId));
         if (quota) return { ...snapshot, quota };
