@@ -166,6 +166,10 @@ function scheduleStartingCardHealthFire(ds: DaemonSession, entry: StartingCardHe
 export function activateStartingCardHealth(ds: DaemonSession, turnId: string): void {
   const entry = pending.get(ds);
   if (!entry || entry.turnId !== turnId || !entry.deferred || entry.delivered) return;
+  // A queued publication may precede the first numeric attempt known for its
+  // turn. Adopt that first identity only; an already-known attempt must still
+  // fail the identity check when a retry takes over before activation.
+  if (entry.dispatchAttempt === undefined) entry.dispatchAttempt = dispatchAttemptFor(ds, turnId);
   if (!startingCardHealthEntryStillCurrent(ds, entry)) {
     closeStartingCardHealth(ds, turnId, entry.dispatchAttempt);
     return;

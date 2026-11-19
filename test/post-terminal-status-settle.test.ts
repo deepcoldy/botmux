@@ -1125,6 +1125,40 @@ describe('starting card health watchdog', () => {
     expect(delivered).toEqual(['working']);
   });
 
+  it('activates a queued watchdog when capture first supplies a numeric attempt', async () => {
+    const queuedTurn = 'turn-live-0002';
+    const ds = setupStartingDs(queuedTurn);
+    ds.captureIdentity = {
+      workerGeneration: ds.workerGeneration!, revision: 1, turnId: TURN, dispatchAttempt: 4,
+    };
+    noteTurnDispatchAttempt(ds, TURN, 4);
+    await post(ds, queuedTurn);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: queuedTurn, dispatchAttempt: 0,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.turnDispatchAttemptHighWater).toEqual({ turnId: queuedTurn, dispatchAttempt: 0 });
+    updateMessageMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('does not adopt a different attempt when a queued retry activates', async () => {
+    const queuedTurn = 'turn-live-0002';
+    const ds = setupStartingDs(queuedTurn);
+    ds.captureIdentity = { workerGeneration: ds.workerGeneration!, revision: 1, turnId: TURN };
+    noteTurnDispatchAttempt(ds, queuedTurn, 0);
+    await post(ds, queuedTurn);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: queuedTurn, dispatchAttempt: 1,
+    });
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).not.toContain('stalled');
+  });
+
   it('defers a queued turn watchdog until its capture identity activates', async () => {
     const queuedTurn = 'turn-live-0002';
     const ds = setupStartingDs(queuedTurn);
@@ -1223,6 +1257,31 @@ describe('starting card health watchdog', () => {
     expect(patchedStatuses()).toEqual(['working']);
   });
 
+  it('closes health for an attempt-less compatibility terminal with a numeric high-water', async () => {
+    const ds = setupStartingDs();
+    noteTurnDispatchAttempt(ds, TURN, 1);
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).not.toContain('stalled');
+  });
+
+  it('does not re-arm health for an attempt-less terminal that arrived during the starting POST', async () => {
+    const ds = setupStartingDs();
+    noteTurnDispatchAttempt(ds, TURN, 1);
+    let resolvePost!: (messageId: string) => void;
+    const posting = postTurnStartingCard(ds, vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })), TURN);
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    resolvePost('om_start_slow_legacy_terminal');
+    await posting;
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    expect(patchedStatuses()).not.toContain('stalled');
+    expect(lastPatchedStatus()).toBe('idle');
+  });
+
   it('does not let an older-attempt terminal close the active retry watchdog', async () => {
     const ds = setupStartingDs();
     noteTurnDispatchAttempt(ds, TURN, 2);
@@ -1259,7 +1318,52 @@ describe('starting card health watchdog', () => {
     expect(patchedStatuses()).toEqual(['stalled']);
   });
 
-  it.each(['completed', 'failed', 'cancelled'] as const)('does not arm after restored ready completes after a %s terminal', async terminalStatus => {
+  it('arms restored health when the first numeric attempt arrives during the starting PATCH', async () => {
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { releaseRestore = resolve; }));
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0,
+    });
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+    updateMessageMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('does not arm restored health when a known attempt advances during the starting PATCH', async () => {
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { releaseRestore = resolve; }));
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    noteTurnDispatchAttempt(ds, TURN, 0);
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 1,
+    });
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).not.toContain('stalled');
+  });
+
+  it.each([
+    ['completed', 'idle'],
+    ['failed', 'idle'],
+    ['cancelled', 'interrupted'],
+    ['ambiguous', 'idle'],
+  ] as const)('settles restored ready publication after a %s terminal without re-arming', async (terminalStatus, expectedStatus) => {
     let releaseRestore!: () => void;
     updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { releaseRestore = resolve; }));
     const ds = setupStartingDs();
@@ -1277,7 +1381,10 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(45_000);
 
     expect(patchedStatuses()).not.toContain('stalled');
-    if (terminalStatus === 'completed') expect(lastPatchedStatus()).toBe('idle');
+    expect(lastPatchedStatus()).toBe(expectedStatus);
+    if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
+      expect(ds.failedIdleTurnId).toBe(TURN);
+    }
   });
 
   it.each([
@@ -1302,6 +1409,21 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(45_000);
 
     expect(lastPatchedStatus()).toBe(expected);
+  });
+
+  it('reasserts idle when a late completed starting publication follows cached idle', async () => {
+    const ds = setupStartingDs();
+    ds.lastScreenStatus = 'idle';
+    let resolvePost!: (messageId: string) => void;
+    const posting = postTurnStartingCard(ds, vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })), TURN);
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    resolvePost('om_start_slow_cached_idle');
+    await posting;
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(patchedStatuses()).toContain('idle');
   });
 
   it('reasserts idle after a restored starting PATCH completes behind terminal and an idle frame', async () => {
@@ -1394,6 +1516,46 @@ describe('starting card health watchdog', () => {
     (ds.worker as any).emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: false });
     await vi.advanceTimersByTimeAsync(0);
     expect(lastPatchedStatus()).toBe('idle');
+  });
+
+  it('repaints a delivered stalled card when a healthy screenshot arrives after switching to hidden', async () => {
+    const ds = setupStartingDs();
+    ds.displayMode = 'screenshot';
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(lastPatchedStatus()).toBe('stalled');
+    ds.displayMode = 'hidden';
+    updateMessageMock.mockClear();
+
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-recovered', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(patchedStatuses()).toEqual(['working']);
+  });
+
+  it('restores the authorized usage refresh when a screenshot proves health', async () => {
+    const ds = setupStartingDs();
+    ds.displayMode = 'screenshot';
+    ds.workerReady = true;
+    ds.session.cliId = 'claude-code';
+    const { resolveUsageDisplay } = await import('../src/bot-registry.js');
+    vi.mocked(resolveUsageDisplay).mockReturnValue('streaming');
+    try {
+      await post(ds, TURN);
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(ds.usageRefreshTimer).toBeUndefined();
+      updateMessageMock.mockClear();
+
+      (ds.worker as any).emit('message', {
+        type: 'screenshot_uploaded', imageKey: 'img-usage-recovered', status: 'working', turnId: TURN,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lastPatchedStatus()).toBe('working');
+      expect(ds.usageRefreshTimer).toBeDefined();
+    } finally {
+      vi.mocked(resolveUsageDisplay).mockReturnValue('off');
+    }
   });
 
   it('cancels degradation on a working screenshot from the same turn', async () => {
