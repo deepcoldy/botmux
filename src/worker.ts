@@ -2200,7 +2200,7 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // turnId on a screen is presentation context, not execution authority.
   // The sampler can outlive both the turn and an in-process identity rebind.
   if (msg.type === 'screen_update') {
-    const context = workerSessionEventScope.envelope(origin ?? workerSessionEventScope.screenObservationOrigin());
+    const context = workerSessionEventScope.envelope(origin ?? workerSessionEventScope.screenObservationOrigin(msg.turnId, msg.dispatchAttempt));
     delete context.scope.execution;
     return { ...msg, sessionContract: context };
   }
