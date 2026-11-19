@@ -97,6 +97,8 @@ vi.mock('../src/services/team-groups-store.js', async () => {
 });
 
 import { registerBot, getBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
+import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { parseSlashCommandInvocation } from '../src/core/command-handler.js';
 import {
@@ -167,6 +169,34 @@ describe('message quota enforcement', () => {
         undefined, undefined, 'group', true,
       ),
     ).resolves.toBe(true);
+  });
+
+  it('external roster bot 在 quota 复查仍需 union + appId 配对', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-quota-external-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dir;
+    applyPlatformTeamSync(dir, { rev: 'r-ext', teams: [{
+      teamId: 't1', teamName: 'T1', groupChatIds: [],
+      bots: [{ appId: 'quota_app', unionId: 'on_quota' }, { appId: 'cli_ext', unionId: 'on_ext', external: true }],
+      memberUnionIds: [],
+    }] });
+    try {
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_public', 'ou_ext', 'om_ext_pair', 'om_anchor', 'on_ext', undefined, 'group', true,
+        { skipCharge: true, senderAppId: 'cli_ext' },
+      )).resolves.toBe(true);
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_public', 'ou_ext', 'om_ext_mismatch', 'om_anchor', 'on_ext', undefined, 'group', true,
+        { skipCharge: true, senderAppId: 'cli_other' },
+      )).resolves.toBe(false);
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_public', 'ou_ext', 'om_ext_missing', 'om_anchor', 'on_ext', undefined, 'group', true,
+        { skipCharge: true },
+      )).resolves.toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('同一条消息不标 bot（人的路径）仍按 evaluateTalk 拦下——团队拉群不放行真人', async () => {

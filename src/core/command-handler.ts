@@ -123,7 +123,7 @@ import { clearChatReplyMode, resolveRegularGroupMode, setChatReplyMode } from '.
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
-import { canOperate, isKnownPeerBot, isPlatformTeamBotTrustedForReceiver } from '../im/lark/event-dispatcher.js';
+import { canOperate, canOperateBotSender, isKnownPeerBot, isPlatformTeamBotTrustedForReceiver } from '../im/lark/event-dispatcher.js';
 import { IDLE_AUTO_COMPACT_MIN_CONTEXT_TOKENS, applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled, parseIdleAutoCompactCommand } from './idle-auto-compact.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
@@ -1958,6 +1958,14 @@ export function resetPendingRewindPreviewsForTest(): void {
   pendingRewindPreviews.clear();
 }
 
+function canOperateForCommandMessage(larkAppId: string, chatId: string | undefined, message: LarkMessage): boolean {
+  // external roster 只能走 bot 专用 operate；真人/卡片 union 即使与外部条目相同，
+  // 也只能走通用 canOperate，不能借手填 union 变成 operator。
+  return message.senderType === 'app' || message.senderType === 'bot'
+    ? canOperateBotSender(larkAppId, chatId, message.senderId, message.senderUnionId, message.senderAppId)
+    : canOperate(larkAppId, chatId, message.senderId, message.senderUnionId);
+}
+
 export async function handleCommand(
   cmd: string,
   rootId: string,
@@ -1984,7 +1992,7 @@ export async function handleCommand(
     switch (cmd) {
       case '/modelpin': {
         if (!ds) { await replyNoSession(replyHere, loc); break; }
-        if (!message.senderId || !canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+        if (!message.senderId || !canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc)); break;
         }
         const args = message.content.trim().split(/\s+/).slice(1);
@@ -2031,7 +2039,7 @@ export async function handleCommand(
             await replyNoSession(replyHere, loc);
             break;
           }
-          if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+          if (!canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
             await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
             break;
           }
@@ -2091,7 +2099,7 @@ export async function handleCommand(
           await replyNoSession(replyHere, loc);
           break;
         }
-        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+        if (!canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
           break;
         }
@@ -2145,7 +2153,7 @@ export async function handleCommand(
         }
         const result: import('../types.js').CodexAppEffortResult = confirmation
           ? { status: 'future_only', reason: cliId === 'codex' ? 'cli_next_turn' : undefined }
-          : await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort, undefined, () => current() && canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId), { source: 'command', setBy: message.senderId });
+          : await (cliId === 'codex' ? updateCodexCliEffort : updateCodexAppEffort)(ds, effort, undefined, () => current() && canOperateForCommandMessage(ds.larkAppId, ds.chatId, message), { source: 'command', setBy: message.senderId });
         const saved = result.status === 'applied' || result.status === 'future_only';
         if (replay && saved && current()) {
           try {
@@ -2210,7 +2218,7 @@ export async function handleCommand(
           break;
         }
         const selectedCliId = requested.cliId;
-        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+        if (!canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cli' }, loc));
           break;
         }
@@ -2247,7 +2255,7 @@ export async function handleCommand(
           await sessionReply(rootId, '用法：`/cleanup-wt <id>`');
           break;
         }
-        if (!canOperate(appId, message.chatId ?? ds?.chatId, message.senderId, message.senderUnionId)) {
+        if (!canOperateForCommandMessage(appId, message.chatId ?? ds?.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cleanup-wt' }, loc));
           break;
         }
@@ -2549,7 +2557,7 @@ export async function handleCommand(
         const appId = larkAppId ?? ds?.larkAppId;
         const chatId = message.chatId ?? ds?.chatId;
         if (!appId || !chatId || message.senderType !== 'user' || !message.senderId
-          || !canOperate(appId, chatId, message.senderId, message.senderUnionId)) {
+          || !canOperateForCommandMessage(appId, chatId, message)) {
           await sessionReply(rootId, t(chatId && !isSessionGroup(chatId) ? 'cmd.dismiss.operator_only' : 'cmd.dismiss.owner_only', undefined, loc));
           break;
         }
@@ -2833,7 +2841,7 @@ export async function handleCommand(
                 command: '/close', args: '',
                 chat: { chatId: closed.current.chatId, chatType: closed.current.session.chatType ?? message.chatType ?? null, anchor: rootId },
                 sender: { openId: message.senderId ?? null, unionId: message.senderUnionId ?? null },
-                privileges: { canTalk: true, canOperate: canOperate(closed.current.larkAppId, closed.current.chatId, message.senderId, message.senderUnionId) },
+                privileges: { canTalk: true, canOperate: canOperateForCommandMessage(closed.current.larkAppId, closed.current.chatId, message) },
                 locale: loc,
               });
               for (const outcome of outcomes) {
@@ -3992,7 +4000,7 @@ export async function handleCommand(
           await replyNoSession(replyHere, loc);
           break;
         }
-        if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
+        if (!canOperateForCommandMessage(ds.larkAppId, ds.chatId, message)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd }, loc));
           break;
         }

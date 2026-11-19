@@ -46,11 +46,13 @@ A daemon watches Lark messages and spawns an isolated session process for each n
 
 ## 5-Minute Setup
 
-> A single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (manual app creation / credential entry is also supported).
+> A single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (manual credential entry is also supported). For a bot with no Feishu app, use `botmux setup add --local` or Dashboard → Add bot → Local only. The saved `local_*` id is a stable local identity, not a Feishu app id.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
 botmux setup                 # one scan to create app → pick CLI → pick working dir (auto-configured)
+botmux setup add --local --name lab --cli codex --default-working-dir ~ --json
+                             # local bot only: no QR, no Feishu App ID or secret
 botmux start                 # start the daemon (botmux autostart enable for auto-start on boot)
 ```
 

@@ -83,6 +83,27 @@ export function isTmuxServerLevelErrorText(stderrText: string): boolean {
   return /error connecting to|lost server|server exited unexpectedly/i.test(stderrText);
 }
 
+export type TmuxCaptureErrorKind = 'server-unreachable' | 'no-server' | 'pane-missing' | 'timeout' | 'unknown';
+
+/** Classify capture failures without turning them into a liveness verdict. The
+ * lifecycle watcher makes the actual death decision; capture only gets the same
+ * error vocabulary so operators can see which part of the frame pipeline is
+ * failing and whether it matches the watcher's last probe. */
+export function classifyTmuxCaptureError(err: unknown): { kind: TmuxCaptureErrorKind; detail: string } {
+  if (isExecTimeoutError(err)) return { kind: 'timeout', detail: 'capture deadline exceeded' };
+  const anyErr = err as any;
+  const stderr = String(anyErr?.stderr ?? '').trim();
+  if (isTmuxServerLevelErrorText(stderr)) return { kind: 'server-unreachable', detail: stderr || 'tmux connection failed' };
+  if (/no server running/i.test(stderr)) return { kind: 'no-server', detail: stderr };
+  if (/can't find pane|no such pane|session not found|no such session/i.test(stderr)) {
+    return { kind: 'pane-missing', detail: stderr };
+  }
+  return {
+    kind: 'unknown',
+    detail: stderr || String(anyErr?.code ?? anyErr?.message ?? 'unknown capture failure'),
+  };
+}
+
 /**
  * True when the connection failure is specifically "the socket file does not
  * exist" (ENOENT on connect). This is still a server-level error (see

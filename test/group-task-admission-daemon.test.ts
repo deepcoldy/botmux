@@ -112,6 +112,7 @@ vi.mock('../src/services/group-creator.js', async () => {
 import { registerBot, getBot } from '../src/bot-registry.js';
 import { __testOnly_activeSessions as activeSessions, __testOnly_handleNewTopic as handleNewTopic } from '../src/daemon.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
+import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
 
 const APP = 'group_task_admission_app';
 const GROUP = 'oc_group_task_source';
@@ -123,12 +124,18 @@ function event(content: string, opts: {
   type?: string;
   senderType?: string;
   senderOpenId?: string;
+  senderUnionId?: string;
+  senderAppId?: string;
   parentId?: string;
   mentions?: any[];
 } = {}): any {
   return {
     sender: {
-      sender_id: { open_id: opts.senderOpenId ?? OWNER, union_id: 'on_group_task_sender' },
+      sender_id: {
+        open_id: opts.senderOpenId ?? OWNER,
+        union_id: opts.senderUnionId ?? 'on_group_task_sender',
+        ...(opts.senderAppId ? { app_id: opts.senderAppId } : {}),
+      },
       sender_type: opts.senderType ?? 'user',
     },
     message: {
@@ -277,5 +284,41 @@ describe('/g task admission through the real new-topic entry', () => {
     await vi.waitFor(() => expect(mocks.evaluatePromptGate).toHaveBeenCalled());
     expect(mocks.createGroup).not.toHaveBeenCalled();
     expect(mocks.spawn).not.toHaveBeenCalled();
+  });
+
+  it('passes the Lark-stamped appId through external-roster authorization', async () => {
+    const workDir = join(mocks.dataDir, 'workdir');
+    registerBot({
+      larkAppId: APP,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      defaultWorkingDir: workDir,
+      allowedUsers: [OWNER],
+    } as any);
+    getBot(APP).resolvedAllowedUsers = [OWNER];
+    applyPlatformTeamSync(mocks.dataDir, {
+      rev: 'r-group-task-external',
+      teams: [{
+        teamId: 't1',
+        teamName: 'T1',
+        groupChatIds: [],
+        bots: [
+          { appId: APP, unionId: 'on_receiver' },
+          { appId: 'cli_external_sender', unionId: 'on_external_sender', external: true },
+        ],
+        memberUnionIds: [],
+      }],
+    });
+
+    const payload = await gatePayloadFor(event('/g --start external task', {
+      senderType: 'app',
+      senderOpenId: BOT,
+      senderUnionId: 'on_external_sender',
+      senderAppId: 'cli_external_sender',
+    }));
+
+    expect(payload).toMatchObject({ botSender: true, senderUnionId: 'on_external_sender' });
+    expect(mocks.createGroup).toHaveBeenCalledTimes(1);
+    expect(mocks.spawn.mock.calls[0][2]).toMatchObject({ ownerOpenId: null, creatorOpenId: BOT });
   });
 });
