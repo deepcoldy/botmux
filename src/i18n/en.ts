@@ -1,5 +1,8 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'worker.startup_unavailable': '⚠️ The execution environment cannot start right now. Please retry later.',
+  'worker.startup_owner_alert': '⚠️ {botName} worker process startup failed\nAffected sessions: {count}\nLatest reported CLI: {cliName}\nLatest error: {reason}\nCheck the bot installation and runtime environment.',
+  'worker.install_owner_alert': '⚠️ {botName} detected a CLI installation change\nAffected sessions: {count}\nLatest reported CLI: {cliName}\nRunning version: {running}; installed version: {installed}\nAffected sessions suspend after their current task settles and start on the new version with the next input.',
   'worker.purge_images_unsupported': '🧹 "Purge tiny images and continue" is only supported for local Claude Code sessions. Use /clear or start a new topic instead.',
   'worker.purge_images_busy': '🧹 The CLI is restarting, so tiny images cannot be purged right now; the transcript was not changed. Tap again once it is back.',
   'worker.purge_images_sandbox_unsupported': '🧹 "Purge tiny images and continue" is not supported yet for sessions in the macOS isolation sandbox; the transcript was not changed. Use /clear or start a new topic instead.',
@@ -1711,7 +1714,7 @@ export const messages: Record<string, string> = {
   'worker.crash_diagnostic_terminal': 'The web terminal, where available, preserves the last startup output. Fix the issue, then send a new message to retry.',
   'worker.crash_recent_output': 'Recent terminal output:',
   'worker.sandbox_namespace_unsupported': 'This environment does not support the {kind} namespace the sandbox needs (common in containers and nested sandboxes), so the bwrap sandbox cannot start. See {docUrl}',
-  'worker.mojo_lineage_quarantined': '⚠️ This session was created before botmux recorded which mojo control plane (endpoint / workspace) it ran on, so its earlier remote session cannot be verified.\nIt has been parked rather than discarded — the previous context will NOT continue, and your next message starts a fresh mojo session on the current configuration. The parked id is kept on the session for manual cleanup: {lineage}',
+  'worker.mojo_lineage_quarantined': '⚠️ This session was created before botmux recorded which mojo control plane (endpoint / workspace) it ran on, so its earlier remote session cannot be verified.\nIt has been parked rather than discarded — the previous context will NOT continue, and this input uses a fresh mojo session on the current configuration. The parked id is kept on the session for manual cleanup: {lineage}',
   'worker.mojo_legacy_pinned': '⚠️ This mojo session predates the host-execution upgrade, so it is pinned to the legacy sandbox-fallback mode — tools and replies will mostly NOT work here. This is deliberate (an upgrade must never silently move a live session onto the host).\nPlease close this session (❌ button or /close) and send a new message to start a fresh session on the new behaviour.',
   'worker.start_failed': '⚠️ The {cliName} session failed to start: {reason}\nSession {sessionId}; full details in {logPath}.\nCheck the Agent/backend settings in Dashboard and the installation environment on the daemon host, then resend your message to retry.',
   'worker.input_delivery_failed': '⚠️ Botmux could not confirm whether this message entered the Worker execution queue. It stopped delivery to avoid duplicate execution. Check the session status first; do not resend immediately.\nturn: {turnId}',

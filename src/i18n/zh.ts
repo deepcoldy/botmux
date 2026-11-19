@@ -3,6 +3,9 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'worker.startup_unavailable': '⚠️ 暂时无法启动执行环境，请稍后重试。',
+  'worker.startup_owner_alert': '⚠️ {botName} 执行进程启动失败\n受影响会话：{count}\n最近报告的 CLI：{cliName}\n最近错误：{reason}\n请检查机器人的安装和运行环境。',
+  'worker.install_owner_alert': '⚠️ {botName} 检测到 CLI 安装版本变化\n受影响会话：{count}\n最近报告的 CLI：{cliName}\n运行版本：{running}；安装版本：{installed}\n相关会话将在当前任务结束后休眠，下一次输入使用新版本启动。',
   'worker.purge_images_unsupported': '🧹「清理小图并续跑」仅支持本地 Claude Code 会话，当前会话不适用。请改用 /clear 或开新话题恢复。',
   'worker.purge_images_busy': '🧹 CLI 正在重启，暂时无法清理小图，会话记录未改动。请等它恢复后再点一次。',
   'worker.purge_images_sandbox_unsupported': '🧹 当前会话运行在 macOS 隔离沙箱中，暂不支持「清理小图并续跑」，会话记录未改动。请改用 /clear 或开新话题恢复。',
@@ -1711,7 +1714,7 @@ export const messages: Record<string, string> = {
   'worker.crash_diagnostic_terminal': 'Web 终端（若可用）保留了最后一次启动输出，可打开查看；修复问题后发新消息会重新启动。',
   'worker.crash_recent_output': '最近终端输出：',
   'worker.sandbox_namespace_unsupported': '当前环境不支持沙盒需要的 {kind} namespace（常见于容器或嵌套沙盒），bwrap 沙盒无法启动。说明见 {docUrl}',
-  'worker.mojo_lineage_quarantined': '⚠️ 这个会话创建于 botmux 记录 mojo 控制面（endpoint / workspace）之前，因此无法确认它此前的远端会话跑在哪里。\n该远端会话已被暂存而非丢弃：原有上下文不会延续，你的下一条消息将在当前配置上新建 mojo 会话。暂存的 id 保留在会话上以便人工清理：{lineage}',
+  'worker.mojo_lineage_quarantined': '⚠️ 这个会话创建于 botmux 记录 mojo 控制面（endpoint / workspace）之前，因此无法确认它此前的远端会话跑在哪里。\n该远端会话已被暂存而非丢弃：原有上下文不会延续，本次输入使用当前配置上的新 mojo 会话。暂存的 id 保留在会话上以便人工清理：{lineage}',
   'worker.mojo_legacy_pinned': '⚠️ 本 mojo 会话创建于「本机执行」升级之前，已被固定在旧的沙箱回退模式——这里的工具和回复基本不可用。这是刻意为之（升级绝不能把活跃会话悄悄切到本机执行）。\n请关闭本会话（❌ 按钮或 /close），再发一条新消息即可用新行为开启全新会话。',
   'worker.start_failed': '⚠️ {cliName} 会话启动失败：{reason}\n会话 {sessionId}，详细日志见本机 {logPath}\n请检查 Dashboard 的 Agent / 后端配置和 daemon 所在机器的安装环境，修复后重发消息即可重试。',
   'worker.input_delivery_failed': '⚠️ Botmux 无法确认这条消息是否已进入 Worker 的执行队列。已停止继续投递以避免重复执行。请先查看会话状态，不要直接重发。\nturn: {turnId}',
