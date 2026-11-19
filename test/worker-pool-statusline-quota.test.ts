@@ -296,6 +296,41 @@ describe('getDaemonSessionUsageSnapshot × Claude statusline quota', () => {
     });
   });
 
+  it('a late seeded model_fallback after a live model is established never displaces the live model', () => {
+    const base = { context: { usedTokens: 10 }, tokens: null };
+    vi.spyOn(costCalculator, 'getSessionUsageSnapshot').mockReturnValue(base as any);
+    const now = Date.now();
+    const worker = {} as any;
+    // A real live turn already established opus as the running model.
+    const liveDs: any = {
+      worker,
+      workerGeneration: 5,
+      activeModel: 'claude-opus-5',
+      activeModelFromSeed: false,
+      statuslineActiveModelStale: false,
+      session: { sessionId: 's-live-seed-fb', cliId: 'claude-code', model: 'opus', workerGeneration: 5 },
+      workingDir: '/repo',
+    };
+    const handler = loadWorkerPoolMessageHandlers(['model_fallback'], {
+      ds: liveDs, worker, workerGeneration: 5, effectiveCliId: 'claude-code',
+      mergeModelFallbackObservation: () => ({ changed: false, next: undefined }),
+      normalizeClaudeModelId,
+      persistStreamCardState: () => {},
+      scheduleActiveRuntimePatch: () => {},
+    });
+    // Transcript rotation re-seeds the new file's historical sonnet (seeded: true).
+    handler({ type: 'model_fallback', claudeSessionId: 'native-2', servingModel: 'claude-sonnet-5', seeded: true });
+    expect(liveDs.activeModel).toBe('claude-opus-5');
+    expect(liveDs.activeModelFromSeed).toBe(false);
+    // The live opus snapshot stays readable; the historical sonnet identity must not win.
+    writeStatuslineSnapshot(dataDir, 's-live-seed-fb', {
+      ts: now, model: 'claude-opus-5[1m]', fiveHourPercent: 12, sevenDayPercent: 4,
+    });
+    expect(getDaemonSessionUsageSnapshot(liveDs, 'claude-code')).toEqual({
+      ...base, quota: { fiveHourPercent: 12, sevenDayPercent: 4 },
+    });
+  });
+
   it('clears stale ds.initConfig.model when bot model is cleared and honors ds.spawnModelOverride precedence', () => {
     const base = { context: { usedTokens: 10 }, tokens: null };
     vi.spyOn(costCalculator, 'getSessionUsageSnapshot').mockReturnValue(base as any);
