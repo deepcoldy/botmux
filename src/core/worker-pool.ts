@@ -17135,8 +17135,47 @@ export function mojoLivePatchForSession(ds: DaemonSession): { mojoLivePatch: Moj
  */
 /** Sessions with a quarantine notice send in flight, so it cannot double-post. */
 type MojoNoticeRetryTurn = { turnId: string; dispatchAttempt?: number };
-const mojoQuarantineNoticeInFlight = new Set<string>();
-const mojoQuarantineNoticeRetryTurns = new Map<string, MojoNoticeRetryTurn>();
+type MojoNoticeAttempts = WeakMap<DaemonSession['session'], Map<string, MojoNoticeRetryTurn | undefined>>;
+
+function mojoNoticeAttemptKey(generation: number | undefined, identity: string): string {
+  return JSON.stringify([generation ?? null, identity]);
+}
+
+function hasMojoNoticeAttempt(
+  attempts: MojoNoticeAttempts, session: DaemonSession['session'], key: string,
+): boolean {
+  return attempts.get(session)?.has(key) ?? false;
+}
+
+function beginMojoNoticeAttempt(
+  attempts: MojoNoticeAttempts, session: DaemonSession['session'], key: string,
+): void {
+  let byIdentity = attempts.get(session);
+  if (!byIdentity) {
+    byIdentity = new Map();
+    attempts.set(session, byIdentity);
+  }
+  byIdentity.set(key, undefined);
+}
+
+function deferMojoNoticeRetry(
+  attempts: MojoNoticeAttempts, session: DaemonSession['session'], key: string, turn: MojoNoticeRetryTurn,
+): void {
+  const byIdentity = attempts.get(session);
+  if (byIdentity?.has(key)) byIdentity.set(key, turn);
+}
+
+function finishMojoNoticeAttempt(
+  attempts: MojoNoticeAttempts, session: DaemonSession['session'], key: string,
+): MojoNoticeRetryTurn | undefined {
+  const byIdentity = attempts.get(session);
+  const retryTurn = byIdentity?.get(key);
+  byIdentity?.delete(key);
+  if (byIdentity?.size === 0) attempts.delete(session);
+  return retryTurn;
+}
+
+const mojoQuarantineNoticeAttempts: MojoNoticeAttempts = new WeakMap();
 
 /**
  * Auxiliary-UI suppression policy for the **mojo quarantine notice** path.
@@ -17244,22 +17283,21 @@ function deliverPendingMojoQuarantineNotice(
 ): void {
   if (!turnId) return; // Blank restoration must preserve the pending receipt.
   if (ds.session.mojoQuarantineNoticePending !== true) return;
-  // In-flight guard: two turns can be accepted before the first sessionReply
-  // resolves. Coalesce them and retain the latest authorized attribution so a
-  // failed in-flight reply still gets the promised retry on a later turn.
-  if (mojoQuarantineNoticeInFlight.has(ds.session.sessionId)) {
-    if (!auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
-      mojoQuarantineNoticeRetryTurns.set(ds.session.sessionId, { turnId, dispatchAttempt });
-    }
-    return;
-  }
   const lineage = ds.session.mojoQuarantinedLineage;
   const noticeSession = ds.session;
-  const noticeSessionId = noticeSession.sessionId;
   const noticeGeneration = noticeSession.workerGeneration;
   if (!lineage) {
     ds.session.mojoQuarantineNoticePending = undefined;
     sessionStore.updateSession(ds.session);
+    return;
+  }
+  const attemptKey = mojoNoticeAttemptKey(noticeGeneration, lineage);
+  // Only identical attempts coalesce. A successor session object, generation or
+  // lineage owns an independent notice attempt that an older settle cannot drain.
+  if (hasMojoNoticeAttempt(mojoQuarantineNoticeAttempts, noticeSession, attemptKey)) {
+    if (!auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
+      deferMojoNoticeRetry(mojoQuarantineNoticeAttempts, noticeSession, attemptKey, { turnId, dispatchAttempt });
+    }
     return;
   }
   let botCfg;
@@ -17286,7 +17324,7 @@ function deliverPendingMojoQuarantineNotice(
     );
     return;
   }
-  mojoQuarantineNoticeInFlight.add(noticeSessionId);
+  beginMojoNoticeAttempt(mojoQuarantineNoticeAttempts, noticeSession, attemptKey);
   const message = tr('worker.mojo_lineage_quarantined', { lineage }, botLocale(botCfg));
   let noticeReplyDelivered = false;
   void callbacks?.sessionReply(
@@ -17313,9 +17351,7 @@ function deliverPendingMojoQuarantineNotice(
     // Flag intentionally left set: the next turn retries.
     logger.warn(`[${tag(ds)}] failed to deliver mojo quarantine notice (will retry): ${err}`);
   }).finally(() => {
-    mojoQuarantineNoticeInFlight.delete(noticeSessionId);
-    const retryTurn = mojoQuarantineNoticeRetryTurns.get(noticeSessionId);
-    mojoQuarantineNoticeRetryTurns.delete(noticeSessionId);
+    const retryTurn = finishMojoNoticeAttempt(mojoQuarantineNoticeAttempts, noticeSession, attemptKey);
     // Only a failed Lark reply drains a coalesced turn. A successful reply whose
     // marker write failed remains pending for the next natural input, not an
     // immediate duplicate send on the same turn.
@@ -17328,8 +17364,7 @@ function deliverPendingMojoQuarantineNotice(
   });
 }
 
-const mojoLegacyPinNoticeInFlight = new Set<string>();
-const mojoLegacyPinNoticeRetryTurns = new Map<string, MojoNoticeRetryTurn>();
+const mojoLegacyPinNoticeAttempts: MojoNoticeAttempts = new WeakMap();
 
 /** In-chat twin of the sessionMojoConfig legacy pin's daemon-log warn: without
  *  it the user keeps retrying a session whose tools and replies silently fail
@@ -17343,14 +17378,14 @@ function deliverPendingMojoLegacyPinNotice(
   if (!turnId) return;
   if (ds.session.mojoLegacyPinNoticePending !== true) return;
   const noticeSession = ds.session;
-  const noticeSessionId = noticeSession.sessionId;
   const noticeGeneration = noticeSession.workerGeneration;
   const noticeIdentity = (row: DaemonSession['session']): string =>
     JSON.stringify([row.mojoIdentity ?? null, row.mojoIdentityHostDefault ?? null]);
   const expectedIdentity = noticeIdentity(noticeSession);
-  if (mojoLegacyPinNoticeInFlight.has(ds.session.sessionId)) {
+  const attemptKey = mojoNoticeAttemptKey(noticeGeneration, expectedIdentity);
+  if (hasMojoNoticeAttempt(mojoLegacyPinNoticeAttempts, noticeSession, attemptKey)) {
     if (!auxUiSuppressedFor(ds, turnId, dispatchAttempt)) {
-      mojoLegacyPinNoticeRetryTurns.set(ds.session.sessionId, { turnId, dispatchAttempt });
+      deferMojoNoticeRetry(mojoLegacyPinNoticeAttempts, noticeSession, attemptKey, { turnId, dispatchAttempt });
     }
     return;
   }
@@ -17367,7 +17402,7 @@ function deliverPendingMojoLegacyPinNotice(
     );
     return;
   }
-  mojoLegacyPinNoticeInFlight.add(noticeSessionId);
+  beginMojoNoticeAttempt(mojoLegacyPinNoticeAttempts, noticeSession, attemptKey);
   const message = tr('worker.mojo_legacy_pinned', {}, botLocale(botCfg));
   let noticeReplyDelivered = false;
   void callbacks?.sessionReply(
@@ -17395,9 +17430,7 @@ function deliverPendingMojoLegacyPinNotice(
     // Flag intentionally left set: the next turn retries.
     logger.warn(`[${tag(ds)}] failed to deliver mojo legacy-pin notice (will retry): ${err}`);
   }).finally(() => {
-    mojoLegacyPinNoticeInFlight.delete(noticeSessionId);
-    const retryTurn = mojoLegacyPinNoticeRetryTurns.get(noticeSessionId);
-    mojoLegacyPinNoticeRetryTurns.delete(noticeSessionId);
+    const retryTurn = finishMojoNoticeAttempt(mojoLegacyPinNoticeAttempts, noticeSession, attemptKey);
     if (!noticeReplyDelivered && retryTurn && canForkRegisteredSession(ds)
       && ds.session === noticeSession && noticeSession.workerGeneration === noticeGeneration
       && noticeIdentity(noticeSession) === expectedIdentity

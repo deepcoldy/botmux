@@ -9904,6 +9904,53 @@ describe('owner diagnostics and accepted-input session notices', () => {
     expect(sessionReply.mock.calls[1]?.[4]).toBe('turn_third');
   });
 
+  it.each([
+    { kind: 'quarantine', outcome: 'resolve', successor: 'generation' },
+    { kind: 'quarantine', outcome: 'reject', successor: 'generation' },
+    { kind: 'legacy', outcome: 'resolve', successor: 'generation' },
+    { kind: 'legacy', outcome: 'reject', successor: 'generation' },
+    { kind: 'quarantine', outcome: 'resolve', successor: 'session' },
+    { kind: 'quarantine', outcome: 'reject', successor: 'session' },
+    { kind: 'legacy', outcome: 'resolve', successor: 'session' },
+    { kind: 'legacy', outcome: 'reject', successor: 'session' },
+  ] as const)('isolates $kind notice attempts by $successor after old reply $outcome', async ({ kind, outcome, successor }) => {
+    let settleOld!: (result: 'resolve' | 'reject') => void;
+    const oldReply = new Promise<string>((resolve, reject) => {
+      settleOld = result => result === 'resolve' ? resolve('om_old_notice') : reject(new Error('old reply failed'));
+    });
+    const sessionReply = vi.fn();
+    sessionReply.mockImplementationOnce(() => oldReply);
+    sessionReply.mockImplementation(async () => 'om_new_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1, closeSession: vi.fn() });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.workerGeneration = 1;
+    ds.session.workerGeneration = 1;
+    if (kind === 'quarantine') pendingMojo(ds);
+    else {
+      ds.session.mojoLegacyPinNoticePending = true;
+      ds.session.mojoIdentityHostDefault = false;
+    }
+    setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+    expect(sendWorkerInput(ds, 'old input', 'turn_old')).toBe(true);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+
+    if (successor === 'generation') {
+      ds.session.workerGeneration = 2;
+      ds.workerGeneration = 2;
+    } else {
+      ds.session = { ...ds.session };
+    }
+    sessionStore.updateSession(ds.session);
+    expect(sendWorkerInput(ds, 'new input', 'turn_new')).toBe(true);
+    settleOld(outcome);
+    const flag = kind === 'quarantine' ? 'mojoQuarantineNoticePending' : 'mojoLegacyPinNoticePending';
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(ds.session[flag]).toBe(false));
+    expect(sessionReply.mock.calls[1]?.[4]).toBe('turn_new');
+  });
+
   it.each([undefined, 1])('waits through cold IPC bootstrap before consuming the notice (attempt=%s)', async dispatchAttempt => {
     vi.useFakeTimers();
     standaloneBinaryMock.mockReturnValue(true);
