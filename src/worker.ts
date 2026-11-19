@@ -26017,7 +26017,11 @@ async function spawnCli(
     && cfg.cliSessionId === recovery.nativeSessionId && previousBinding?.runtime
     && previousBinding.runtime.runtimeId === recovery.from.runtimeId
     && previousBinding.runtime.epoch === recovery.from.epoch ? recovery : undefined;
-  const binding = workerSessionEventScope.beginRuntime(activeRestartAttemptId);
+  // A control-only resume belongs to close, not restart: startup must never
+  // emit a successful restart receipt for that close operation.
+  const closeControlOperation = firstBinding && cfg.backendType === 'remote-runner'
+    && !cfg.prompt && !cfg.turnId && cfg.remoteBackendState ? cfg.sessionCommand?.operationId : undefined;
+  const binding = workerSessionEventScope.beginRuntime(closeControlOperation ?? activeRestartAttemptId);
   binding.continuation = continuation;
   if (execution) workerSessionEventScope.rememberExecution(execution, binding);
   return workerSessionEventScope.run(binding, async () => {
