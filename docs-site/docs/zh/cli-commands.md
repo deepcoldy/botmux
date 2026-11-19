@@ -178,14 +178,16 @@ botmux term-link [id]
 CI、告警系统和外部 Agent 可以用 `botmux post` 把已有内容作为飞书文本发送。指定运行中的 Bot App ID 和收件位置即可，无需会话 ID 或启动 AI 会话。
 
 ```bash
-botmux post --bot cli_xxx --chat-id oc_xxx --text "构建完成"
+botmux post --bot cli_xxx --chat-id oc_xxx --request-id build_12345 --text "构建完成"
 botmux post --bot cli_xxx --chat-id oc_xxx --into om_xxx --text-file ./result.txt
 printf '%s\n' "需要人工处理" | botmux post --bot cli_xxx --user-open-id ou_xxx --text-file -
 ```
 
 命令在有权访问本机 Botmux daemon 的宿主 shell 中运行。群消息要求 Bot 已入群。话题使用所属群 ID 和根消息 ID（`om_…`）。私聊使用发送 Bot 应用视角下的用户 `open_id`，接收人须在应用可见范围内。正文可用 `--text` 或 `--text-file`，上限为 8192 个 UTF-8 字节。
 
-成功时 stdout 输出一行 JSON，包含 `ok`、`larkAppId`、收件位置和飞书返回的 `messageId`。失败时 stderr 输出 JSON 错误，退出码为 2（参数无效）或 1（投递失败）。
+`--bot` 只接受 `cli_` 开头的飞书 App ID。CI 或告警系统应通过 `--request-id` 传入稳定的事件 ID（8–64 个字母、数字、下划线或连字符），省略时 CLI 自动生成。成功时 stdout 的 JSON 回执包含 `requestId`、`messageId`、`replayed`、Bot 和目的地。群消息与请求绑定群发送 API 共用去重记录。
+
+参数无效退出 2。投递出错退出 1，stderr 输出 JSON。超时、连接中断或无法确认回执时返回 `outcome_unknown`，消息可能已发出。`retryable: true` 时，在首次尝试后 50 分钟内用相同的 Bot、目的地、正文和请求 ID 重试。窗口过期且结果仍未知时返回 `retryable: false`，请人工核对。相同 ID 改正文会返回 `request_conflict`，明确的飞书拒绝返回 `send_failed`。已成功的请求在有界归档保留期内返回原消息 ID。
 
 ## Dashboard 登录链接
 

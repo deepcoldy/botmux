@@ -75,7 +75,7 @@ describe('sendRequestBoundGroupMessage', () => {
     const send = vi.fn(async () => 'om_1');
     const first = await sendRequestBoundGroupMessage(deps(send), input());
     expect(first).toEqual({ ok: true, status: 200, messageId: 'om_1', requestId: 'req_000001', chatId: CHAT, replayed: false });
-    expect(send).toHaveBeenCalledWith(CHAT, 'mosa-checkin abc123', groupSendUuid(APP, CHAT, 'req_000001'));
+    expect(send).toHaveBeenCalledWith(CHAT, 'mosa-checkin abc123', groupSendUuid(APP, CHAT, 'req_000001'), expect.any(Function));
     expect(groupSendUuid(APP, CHAT, 'req_000001').length).toBeLessThanOrEqual(50);
     const again = await sendRequestBoundGroupMessage(deps(send), input());
     expect(again).toMatchObject({ ok: true, messageId: 'om_1', replayed: true });
@@ -139,10 +139,26 @@ describe('sendRequestBoundGroupMessage', () => {
     expect(longId.length).toBeGreaterThan(CHAT.length);
     const send = vi.fn(async () => 'om_long');
     expect(await sendRequestBoundGroupMessage(deps(send), { ...input(), chatId: longId })).toMatchObject({ ok: true, chatId: longId, messageId: 'om_long' });
-    expect(send).toHaveBeenCalledWith(longId, input().content, groupSendUuid(APP, longId, 'req_000001'));
+    expect(send).toHaveBeenCalledWith(longId, input().content, groupSendUuid(APP, longId, 'req_000001'), expect.any(Function));
     for (const chatId of ['ou_not_a_chat', '../../etc/x', 'oc_', 'chat']) {
       expect(await sendRequestBoundGroupMessage(deps(vi.fn(async () => 'om')), { ...input(), chatId })).toEqual({ ok: false, status: 400, error: 'invalid_request' });
     }
+  });
+
+  it('frees a definitively rejected first attempt but preserves a prior ambiguous attempt', async () => {
+    __setGroupSendLimitsForTest({ record: 2, compactBatch: 1, archive: 2 });
+    const rejection = larkApiError('send message', { code: 230002 });
+    const send = vi.fn().mockRejectedValue(rejection);
+    for (let i = 0; i < 4; i++) {
+      expect(await sendRequestBoundGroupMessage(deps(send), input(`rejected_${i}`)))
+        .toMatchObject({ error: 'send_failed', retryable: false });
+    }
+    send.mockRejectedValueOnce(new Error('connection reset'));
+    await sendRequestBoundGroupMessage(deps(send), input());
+    expect(await sendRequestBoundGroupMessage(deps(send), input())).toMatchObject({ error: 'outcome_unknown', retryable: false });
+    clock += GROUP_SEND_UUID_REUSE_MS + 1;
+    expect(await sendRequestBoundGroupMessage(deps(send), input())).toMatchObject({ error: 'outcome_unknown', retryable: false });
+    expect(send).toHaveBeenCalledTimes(6);
   });
 
   it('marks definite provider rejections as not retryable', async () => {
@@ -649,7 +665,7 @@ describe('request-bound group send routes', () => {
       const first = await post(routeChat, JSON.stringify({ requestId, content }));
       expect(first.status).toBe(200);
       expect(await first.json()).toMatchObject({ ok: true, messageId: 'om_route', replayed: false });
-      expect(sendMessage).toHaveBeenCalledWith(routeApp, routeChat, content, 'text', groupSendUuid(routeApp, routeChat, requestId), undefined, { suppressHook: true });
+      expect(sendMessage).toHaveBeenCalledWith(routeApp, routeChat, content, 'text', groupSendUuid(routeApp, routeChat, requestId), undefined, { suppressHook: true, beforeWrite: expect.any(Function) });
       expect(emit).toHaveBeenCalledTimes(1);
       expect(emit).toHaveBeenCalledWith('outbound.send', {
         larkAppId: routeApp, chatId: routeChat, messageId: 'om_route', msgType: 'text',

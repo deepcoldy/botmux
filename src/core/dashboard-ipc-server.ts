@@ -127,7 +127,7 @@ import {
   SchedulePreconditionError,
 } from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
-import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage } from '../services/request-bound-group-send.js';
+import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage, sendRequestBoundMessage, type GroupSendInput } from '../services/request-bound-group-send.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
@@ -9212,32 +9212,74 @@ ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, r
   }
 }));
 
+function postBoundGroupMessage(larkAppId: string, input: GroupSendInput, beforeAttempt?: () => Promise<void>) {
+  return sendRequestBoundGroupMessage({
+    larkAppId, storePath: groupSendStorePath(larkAppId), beforeAttempt,
+    send: (chatId, text, uuid, beforeWrite) => sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: true, beforeWrite }),
+    onCommitted: (payload) => emitHookEventLocal('outbound.send', { ...payload }),
+  }, input);
+}
+
+class HostPostDestinationError extends Error {
+  constructor(readonly status: number, message: string, readonly providerCode?: number) { super(message); }
+}
+
+async function checkHostPostDestination(larkAppId: string, chatId: string, rootMessageId?: string) {
+  try {
+    if (!await isCurrentBotInChat(larkAppId, chatId)) throw new HostPostDestinationError(403, 'bot_not_in_chat');
+    if (rootMessageId) {
+      const owner = await lookupMessageChatId(larkAppId, rootMessageId, { timeoutMs: 10_000 });
+      if (!owner) throw new HostPostDestinationError(404, 'topic_not_visible');
+      if (owner !== chatId) throw new HostPostDestinationError(409, 'topic_chat_mismatch');
+    }
+  } catch (error) {
+    if (error instanceof HostPostDestinationError) throw error;
+    throw new HostPostDestinationError(502, 'destination_lookup_failed', extractLarkBusinessCode(error));
+  }
+}
+
 ipcRoute('POST', HOST_POST_PATH, requireBoundBot(async (req, res) => {
   if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   const body = await readJsonBodyOrBadJson(req, res, HOST_POST_MAX_BODY_BYTES);
   if (body === BAD_JSON) return;
   const parsed = hostPostRequest.safeParse(body);
   if (!parsed.success) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
-  const { larkAppId, text, ...target } = parsed.data;
+  const { larkAppId, text, requestId, ...target } = parsed.data;
   const { chatId, rootMessageId, userOpenId } = target;
   // Discovery can race an IPC port being reused. The bound Bot must match.
   if (larkAppId !== cachedLarkAppId) return jsonRes(res, 409, { ok: false, error: 'bot_mismatch' });
   if (getBot(larkAppId).config.apiOnly) return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+  const beforeAttempt = chatId ? () => checkHostPostDestination(larkAppId, chatId, rootMessageId) : undefined;
   try {
-    if (chatId && !await isCurrentBotInChat(larkAppId, chatId)) {
-      return jsonRes(res, 403, { ok: false, error: 'bot_not_in_chat' });
+    const result = chatId && !rootMessageId
+      ? await postBoundGroupMessage(larkAppId, { chatId, requestId, content: text }, beforeAttempt)
+      : await sendRequestBoundMessage({
+        larkAppId,
+        beforeAttempt,
+        // Keep legacy group records readable by older daemons after a downgrade.
+        storePath: join(config.session.dataDir, `host-posts-${larkAppId}.json`),
+        send: (uuid, beforeWrite) => userOpenId !== undefined
+          ? sendUserMessage(larkAppId, userOpenId, text, 'text', uuid, undefined, { beforeWrite })
+          : replyMessage(larkAppId, rootMessageId!, text, 'text', true, uuid, { chatId }, { suppressHook: true, beforeWrite }),
+        onCommitted: (replyId, uuid) => {
+          if (rootMessageId) emitHookEventLocal('outbound.reply', {
+            larkAppId, chatId, messageId: rootMessageId, replyId, uuid, requestId,
+            content: text, msgType: 'text', replyInThread: true,
+          });
+        },
+      }, target, requestId, text);
+    if (!result.ok) {
+      const error = result.error === 'send_failed' && result.retryable ? 'outcome_unknown' : result.error;
+      return jsonRes(res, result.status, { ok: false, error, retryable: result.retryable ?? false, requestId,
+        ...('providerCode' in result ? { providerCode: result.providerCode } : {}), });
     }
-    if (rootMessageId) {
-      const actualChatId = await lookupMessageChatId(larkAppId, rootMessageId, { timeoutMs: 10_000 });
-      if (!actualChatId) return jsonRes(res, 404, { ok: false, error: 'topic_not_visible' });
-      if (actualChatId !== chatId) return jsonRes(res, 409, { ok: false, error: 'topic_chat_mismatch' });
-    }
-    const messageId = userOpenId !== undefined ? await sendUserMessage(larkAppId, userOpenId, text)
-      : rootMessageId ? await replyMessage(larkAppId, rootMessageId, text, 'text', true, undefined, { chatId })
-      : await sendMessage(larkAppId, chatId, text);
-    return jsonRes(res, 200, { ok: true, larkAppId, ...target, messageId });
+    return jsonRes(res, 200, { ok: true, larkAppId, ...target, messageId: result.messageId, requestId, replayed: result.replayed });
   } catch (error) {
-    return jsonRes(res, 502, { ok: false, error: 'lark_request_failed', providerCode: extractLarkBusinessCode(error) });
+    if (error instanceof HostPostDestinationError) {
+      return jsonRes(res, error.status, { ok: false, error: error.message, retryable: error.status === 502, providerCode: error.providerCode, requestId });
+    }
+    logger.warn(`[host-post] store unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return jsonRes(res, 503, { ok: false, error: 'outcome_unknown', requestId, retryable: true });
   }
 }, NOT_BOUND_BODY.okFalse));
 
@@ -9258,11 +9300,7 @@ ipcRoute('POST', '/api/groups/:chatId/messages', requireBoundBot(async (req, res
   if (!input) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
   const larkAppId = cachedLarkAppId;
   try {
-    const result = await sendRequestBoundGroupMessage({
-      larkAppId, storePath: groupSendStorePath(larkAppId),
-      send: (chatId, text, uuid) => sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: true }),
-      onCommitted: (payload) => emitHookEventLocal('outbound.send', { ...payload }),
-    }, { chatId: p.chatId, ...input });
+    const result = await postBoundGroupMessage(larkAppId, { chatId: p.chatId, ...input });
     const { status, ...rest } = result;
     return jsonRes(res, status, rest);
   } catch (e) {

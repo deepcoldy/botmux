@@ -22,7 +22,7 @@ The JSON body itself is capped at 64KiB before it is parsed.
 | `409 outcome_unknown` | A previous attempt may have sent but cannot be reconciled any more. Never re-sent; use a new `requestId` only if a duplicate is acceptable. |
 | `413 body_too_large` | Body exceeded 64KiB. Nothing sent. |
 | `502 send_failed` (`retryable:true`) | Ambiguous provider error (timeout, 5xx, rate limit). Retry the **same** `requestId` within 50 minutes; the Lark `uuid` is reused, so Lark returns the original message instead of a second one. |
-| `502 send_failed` (`retryable:false`) | Definite rejection (not in the chat `230002`, content too long `230025`, missing scope `99991672`, and the same class as `230001` / `230011` / `230022`). Nothing was created. Retrying until the window ends only yields `outcome_unknown`. |
+| `502 send_failed` (`retryable:false`) | Definite rejection (not in the chat `230002`, content too long `230025`, missing scope `99991672`, and the same class as `230001` / `230011` / `230022`). A definitive first-attempt rejection releases the pending slot. If an earlier attempt might already have been accepted, a later rejection yields `outcome_unknown` instead. |
 | `503 store_full` (`retryable:false`) | The live file is full of unresolved attempts, so nothing can be compacted. Neither file is written. Pending records are not deleted. |
 | `503 store_unavailable` (`retryable:true`) | Dedupe store unreadable or unwritable. Retry the **same** `requestId`. Do not mint a new one: if the failure was the save *after* the provider accepted, a new id posts a second visible message. The response does not include the filesystem error. |
 

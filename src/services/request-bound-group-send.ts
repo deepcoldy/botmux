@@ -43,6 +43,7 @@ import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   extractLarkBusinessCode,
+  LARK_CODE_CROSS_APP_OPEN_ID,
   LARK_CODE_APP_SCOPE_MISSING,
   LARK_CODE_MESSAGE_CONTENT_TOO_LONG,
   LARK_CODE_MESSAGE_WITHDRAWN,
@@ -112,8 +113,26 @@ export function groupSendArchivePath(storePath: string): string {
     : `${storePath}-archive.json`;
 }
 
-export type GroupSendRecord = {
-  chatId: string; requestId: string; contentDigest: string; uuid: string;
+export const TOPIC_ROOT_ID = /^om_[A-Za-z0-9_-]{1,128}$/;
+export const USER_OPEN_ID = /^ou_[A-Za-z0-9_-]{1,128}$/;
+export type SendDestination =
+  | { chatId: string; rootMessageId?: string; userOpenId?: never }
+  | { userOpenId: string; chatId?: never; rootMessageId?: never };
+
+// Bare group ids retain the original record key and provider uuid.
+function destinationKey(target: SendDestination): string | undefined {
+  if (target.userOpenId !== undefined) {
+    if (typeof target.userOpenId !== 'string' || !USER_OPEN_ID.test(target.userOpenId)
+      || target.chatId !== undefined || target.rootMessageId !== undefined) return;
+    return `dm:${target.userOpenId}`;
+  }
+  if (typeof target.chatId !== 'string' || !GROUP_CHAT_ID.test(target.chatId)) return;
+  if (target.rootMessageId === undefined) return target.chatId;
+  if (typeof target.rootMessageId === 'string' && TOPIC_ROOT_ID.test(target.rootMessageId)) return `topic:${target.chatId}:${target.rootMessageId}`;
+}
+
+export type GroupSendRecord = SendDestination & {
+  requestId: string; contentDigest: string; uuid: string;
   state: 'pending' | 'sent'; firstAttemptAt: number; messageId?: string; sentAt?: number;
 };
 type StoreFile = { schemaVersion: 1; records: Record<string, GroupSendRecord> };
@@ -132,8 +151,9 @@ export type GroupSendCommitted = {
 export type GroupSendDeps = {
   larkAppId: string;
   storePath: string;
-  send: (chatId: string, text: string, uuid: string) => Promise<string>;
+  send: (chatId: string, text: string, uuid: string, beforeWrite: () => void) => Promise<string>;
   now?: () => number;
+  beforeAttempt?: () => Promise<void>;
   /**
    * At most once per message, after `state:'sent'` is durable. The route binds
    * this to `emitHookEventLocal('outbound.send', …)` and always calls
@@ -142,13 +162,18 @@ export type GroupSendDeps = {
   onCommitted?: (payload: GroupSendCommitted) => void;
 };
 export type GroupSendInput = { chatId: string; requestId: string; content: string };
+type BoundSendResult =
+  | { ok: true; status: 200; messageId: string; requestId: string; replayed: boolean }
+  | { ok: false; status: 400 | 409 | 502 | 503; error: 'invalid_request' | 'request_conflict' | 'outcome_unknown' | 'send_failed' | 'store_full'; retryable?: boolean; providerCode?: number };
+
 export type GroupSendResult =
-  | { ok: true; status: 200; messageId: string; requestId: string; chatId: string; replayed: boolean }
-  | { ok: false; status: 400 | 409 | 502 | 503; error: 'invalid_request' | 'request_conflict' | 'outcome_unknown' | 'send_failed' | 'store_full'; retryable?: boolean };
+  | (Extract<BoundSendResult, { ok: true }> & { chatId: string })
+  | Omit<Extract<BoundSendResult, { ok: false }>, 'providerCode'>;
 
 /** Provider rejections that did not create a message. Retrying them until the
  * uuid window expires only ends in `outcome_unknown`. */
 const DEFINITE_SEND_FAILURE_CODES = new Set<number>([
+  LARK_CODE_CROSS_APP_OPEN_ID,
   230001,
   230002,
   LARK_CODE_MESSAGE_WITHDRAWN,
@@ -173,11 +198,12 @@ function isFiniteNumber(value: unknown): value is number {
 function isGroupSendRecord(value: unknown, storeKey: string, larkAppId: string): value is GroupSendRecord {
   if (!value || typeof value !== 'object') return false;
   const r = value as GroupSendRecord;
-  if (typeof r.chatId !== 'string' || !GROUP_CHAT_ID.test(r.chatId)) return false;
+  const destination = destinationKey(r);
+  if (!destination) return false;
   if (typeof r.requestId !== 'string' || !GROUP_SEND_REQUEST_ID.test(r.requestId)) return false;
-  if (storeKey !== key(r.chatId, r.requestId)) return false;
+  if (storeKey !== key(destination, r.requestId)) return false;
   if (typeof r.contentDigest !== 'string' || !/^sha256:[0-9a-f]{64}$/.test(r.contentDigest)) return false;
-  if (typeof r.uuid !== 'string' || r.uuid !== groupSendUuid(larkAppId, r.chatId, r.requestId)) return false;
+  if (typeof r.uuid !== 'string' || r.uuid !== groupSendUuid(larkAppId, destination, r.requestId)) return false;
   if (r.state !== 'pending' && r.state !== 'sent') return false;
   if (!isFiniteNumber(r.firstAttemptAt)) return false;
   if (r.messageId !== undefined && (typeof r.messageId !== 'string' || !r.messageId)) return false;
@@ -261,18 +287,42 @@ export function parseGroupSendBody(body: unknown): { requestId: string; content:
   return { requestId, content };
 }
 
-function sendFailure(err: unknown): GroupSendResult {
+class UuidWindowExpired extends Error {}
+
+function sendFailure(err: unknown): Extract<BoundSendResult, { ok: false }> {
   const named = err as { name?: string; code?: unknown } | null;
   // sendMessage rewrites 230011 into these before the numeric code is visible.
   const namedDefinite = named?.name === 'MessageWithdrawnError'
     || (named?.name === 'TopicSendError' && named.code === 'TOPIC_SEND_BLOCKED');
   const code = extractLarkBusinessCode(err);
   const retryable = !namedDefinite && (code === undefined || !DEFINITE_SEND_FAILURE_CODES.has(code));
-  return { ok: false, status: 502, error: 'send_failed', retryable };
+  return { ok: false, status: 502, error: 'send_failed', retryable, ...(code === undefined ? {} : { providerCode: code }) };
 }
 
 export async function sendRequestBoundGroupMessage(deps: GroupSendDeps, input: GroupSendInput): Promise<GroupSendResult> {
-  if (!GROUP_CHAT_ID.test(input.chatId) || !GROUP_SEND_REQUEST_ID.test(input.requestId)) {
+  const { chatId, requestId, content } = input;
+  const result = await sendRequestBoundMessage({
+    ...deps,
+    send: (uuid, beforeWrite) => deps.send(chatId, content, uuid, beforeWrite),
+    onCommitted: (messageId, uuid) => deps.onCommitted?.({
+      larkAppId: deps.larkAppId, chatId, requestId, content, messageId, uuid, msgType: 'text',
+    }),
+  }, { chatId }, requestId, content);
+  if (result.ok) return { ...result, chatId };
+  // Keep the original group API error contract.
+  const { providerCode: _code, ...failure } = result;
+  return failure;
+}
+
+export async function sendRequestBoundMessage(
+  deps: Pick<GroupSendDeps, 'larkAppId' | 'storePath' | 'now' | 'beforeAttempt'> & {
+    send: (uuid: string, beforeWrite: () => void) => Promise<string>;
+    onCommitted?: (messageId: string, uuid: string) => void;
+  },
+  target: SendDestination, requestId: string, content: string,
+): Promise<BoundSendResult> {
+  const destination = destinationKey(target);
+  if (!destination || !GROUP_SEND_REQUEST_ID.test(requestId)) {
     return { ok: false, status: 400, error: 'invalid_request' };
   }
   const now = deps.now ?? Date.now;
@@ -282,19 +332,29 @@ export async function sendRequestBoundGroupMessage(deps: GroupSendDeps, input: G
     // Missing archive is an empty store. A corrupt archive throws here (fail
     // closed) before any provider call or write.
     const archive = load(archivePath, deps.larkAppId);
-    const k = key(input.chatId, input.requestId), contentDigest = digest(input.content);
+    const k = key(destination, requestId), contentDigest = digest(content);
     let record = forwardRecord(active, archive, k);
     if (record && record.contentDigest !== contentDigest) return { ok: false, status: 409, error: 'request_conflict' };
     if (record?.state === 'sent' && record.messageId) {
-      return { ok: true, status: 200, messageId: record.messageId, requestId: input.requestId, chatId: input.chatId, replayed: true };
+      return { ok: true, status: 200, messageId: record.messageId, requestId, replayed: true };
     }
     if (record && now() - record.firstAttemptAt > GROUP_SEND_UUID_REUSE_MS) {
       return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
     }
+    if (deps.beforeAttempt) {
+      try { await deps.beforeAttempt(); }
+      catch (error) {
+        if (record) return { ok: false, status: 409, error: 'outcome_unknown', retryable: true };
+        throw error;
+      }
+      if (record && now() - record.firstAttemptAt > GROUP_SEND_UUID_REUSE_MS) {
+        return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
+      }
+    }
     const replayed = !!record;
     if (!record) {
-      record = { chatId: input.chatId, requestId: input.requestId, contentDigest,
-        uuid: groupSendUuid(deps.larkAppId, input.chatId, input.requestId), state: 'pending', firstAttemptAt: now() };
+      record = { ...target, requestId, contentDigest,
+        uuid: groupSendUuid(deps.larkAppId, destination, requestId), state: 'pending', firstAttemptAt: now() };
       const overflow = Object.keys(active.records).length + 1 - limits.record;
       if (overflow > 0) {
         const movable = oldestSent(active);
@@ -311,22 +371,37 @@ export async function sendRequestBoundGroupMessage(deps: GroupSendDeps, input: G
       active.records[k] = record;
       save(deps.storePath, active);
     }
+    const deadline = record.firstAttemptAt + GROUP_SEND_UUID_REUSE_MS;
+    let writes = 0;
+    const beforeWrite = () => {
+      // Lark's internal retries and rate-limit waits can outlive this invocation.
+      if (now() > deadline) throw new UuidWindowExpired();
+      writes++;
+    };
     let messageId: string;
-    try { messageId = await deps.send(input.chatId, input.content, record.uuid); }
-    catch (err) { return sendFailure(err); }
+    try { messageId = await deps.send(record.uuid, beforeWrite); }
+    catch (error) {
+      if (error instanceof UuidWindowExpired) return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
+      const failure = sendFailure(error);
+      if (failure.retryable === false) {
+        // A rejection of a later attempt cannot disprove an earlier delivery.
+        if (replayed || writes > 1) return { ok: false, status: 409, error: 'outcome_unknown', retryable: false };
+        // A first, definitive rejection created no message. It must not occupy
+        // one of the bounded pending slots forever.
+        delete active.records[k];
+        save(deps.storePath, active);
+      }
+      return failure;
+    }
     if (typeof messageId !== 'string' || !messageId) return { ok: false, status: 502, error: 'send_failed', retryable: true };
     // Post-provider save rewrites only the live file. The archive was already
     // fsynced above when this send had to compact, and must not be rewritten here.
     const latest = load(deps.storePath, deps.larkAppId);
     latest.records[k] = { ...record, state: 'sent', messageId, sentAt: now() };
     save(deps.storePath, latest);
-    const payload: GroupSendCommitted = {
-      larkAppId: deps.larkAppId, chatId: input.chatId, messageId, msgType: 'text',
-      uuid: record.uuid, content: input.content, requestId: input.requestId,
-    };
-    try { deps.onCommitted?.(payload); }
+    try { deps.onCommitted?.(messageId, record.uuid); }
     catch { /* message is durable; a hook error must not look like a failed send */ }
-    return { ok: true, status: 200, messageId, requestId: input.requestId, chatId: input.chatId, replayed };
+    return { ok: true, status: 200, messageId, requestId, replayed };
   });
 }
 

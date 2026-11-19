@@ -178,14 +178,16 @@ Gets a writable Web terminal for a session. The link isn't printed in the termin
 CI jobs, alerting systems, and external agents can use `botmux post` to deliver text they already have. Select a running bot by App ID and provide a destination. The command needs no session ID and starts no AI session.
 
 ```bash
-botmux post --bot cli_xxx --chat-id oc_xxx --text "Build complete"
+botmux post --bot cli_xxx --chat-id oc_xxx --request-id build_12345 --text "Build complete"
 botmux post --bot cli_xxx --chat-id oc_xxx --into om_xxx --text-file ./result.txt
 printf '%s\n' "Manual action required" | botmux post --bot cli_xxx --user-open-id ou_xxx --text-file -
 ```
 
 Run the command in a trusted host shell with access to the local Botmux daemon. The bot must already be in the group. For a topic, supply its group ID and root message ID (`om_…`). For a direct message, use the recipient's `open_id` in the sending bot's app scope. Lark must allow that bot to reach the recipient. Use `--text` or `--text-file` for up to 8192 UTF-8 bytes.
 
-On success, stdout contains one JSON line with `ok`, `larkAppId`, the destination, and Lark's `messageId`. On failure, stderr contains a JSON error and the exit status is 2 for invalid arguments or 1 for a delivery error.
+`--bot` accepts a Feishu App ID starting with `cli_`. CI and alerting systems should pass a stable event ID with `--request-id` (8–64 letters, digits, underscores or hyphens). The CLI generates an ID when omitted. A successful JSON receipt on stdout includes `requestId`, `messageId`, `replayed`, the bot and the destination. Group posts share deduplication records with the request-bound group API.
+
+Invalid arguments exit with status 2. Delivery errors exit with status 1 and a JSON error on stderr. A timeout, interrupted connection or unverifiable receipt returns `outcome_unknown`; the message may already be visible. When `retryable` is true, retry within 50 minutes of the first attempt using the same bot, destination, text and request ID. An unresolved attempt past that window returns `retryable: false` and needs manual verification. Reusing the ID with different text returns `request_conflict`. A definite provider rejection returns `send_failed`. Completed requests replay the original message ID for as long as their record is retained in the bounded archive.
 
 ## Dashboard login link
 
