@@ -7115,7 +7115,7 @@ export function releaseDeferredUnifiedReplyCard(
 ): Promise<boolean> {
   const turnId = takeReadyUnifiedReply(ds);
   if (!turnId || replyCardModeFor(ds, turnId) === 'legacy') return Promise.resolve(false);
-  return postUnifiedReplyPlaceholder(ds, sessionReply, turnId);
+  return trackStartingCardPublication(ds, postUnifiedReplyPlaceholder(ds, sessionReply, turnId));
 }
 
 async function postTurnStartingStatusCard(

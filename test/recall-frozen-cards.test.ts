@@ -834,9 +834,16 @@ describe('postTurnStartingCard', () => {
     await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(false);
     expect(updateTurnReplyCardMock).not.toHaveBeenCalled();
 
+    let settlePlaceholder!: (result: { messageId: string }) => void;
+    updateTurnReplyCardMock.mockImplementationOnce(() => new Promise(resolve => { settlePlaceholder = resolve; }));
     ds.captureIdentity = { workerGeneration: 3, revision: 2, turnId: 'om_followup' };
     expect(unifiedReplyTurnNotCapturing(ds, 'om_followup')).toBe(false);
-    await expect(releaseDeferredUnifiedReplyCard(ds, sessionReply)).resolves.toBe(true);
+    const release = releaseDeferredUnifiedReplyCard(ds, sessionReply);
+    expect(pendingStartingCardPublication(ds)).toBeDefined();
+    settlePlaceholder({ messageId: 'om_placeholder' });
+    await expect(release).resolves.toBe(true);
+    await flush();
+    expect(pendingStartingCardPublication(ds)).toBeUndefined();
     expect(updateTurnReplyCardMock).toHaveBeenCalledTimes(1);
     expect(updateTurnReplyCardMock.mock.calls[0]?.[1]).toBe('om_followup');
     expect(updateTurnReplyCardMock.mock.calls[0]?.[2]).toEqual({ kind: 'refresh' });
