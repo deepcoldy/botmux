@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, it } from 'vitest';
+import { t } from '../src/i18n/index.js';
 
 import { composeSections } from '../src/dashboard/settings-card-model.js';
 import {
@@ -17,6 +18,7 @@ import {
   handleSettingsCardAction,
   SETTINGS_ACTION_NOOP,
   SETTINGS_ACTION_TOGGLE,
+  buildPatchFromAction,
 } from '../src/im/lark/settings-card.js';
 
 const INVOKER = 'ou_owner';
@@ -83,6 +85,7 @@ function getSegmentedRow(cardJson: string, field: string): {
 /** zh dictionary labels — used as exact-text substring anchors. */
 function labelFragmentFor(field: string): string {
   switch (field) {
+    case 'modelQueueNotify': return t('settings.modelQueueNotify', undefined, 'zh');
     case 'publicReadOnly': return '公开只读模式';
     case 'openTerminalInFeishu': return '飞书内打开 Web 终端';
     case 'enableLocalCliOpen': return '启用本机 CLI 直开';
@@ -144,6 +147,17 @@ describe('PR3 UI revision (codex C4) — segmented control schema', () => {
     expect(on.value?.action).toBe(SETTINGS_ACTION_TOGGLE);
     expect(on.value?.field).toBe('enableLocalCliOpen');
     expect(on.value?.next_value).toBe('true');
+  });
+
+  it('renders queue notification off by default and builds its global settings patch', () => {
+    const { on, off } = getSegmentedRow(renderCard(buildSettings()), 'modelQueueNotify');
+    expect(off.type).toBe('primary');
+    expect(off.disabled).toBe(true);
+    expect(on.value?.action).toBe(SETTINGS_ACTION_TOGGLE);
+    expect(buildPatchFromAction(on.value.action, on.value, {})).toEqual({ ok: true, value: { modelQueueNotify: true } });
+    const enabled = getSegmentedRow(renderCard(buildSettings({ modelQueueNotify: true })), 'modelQueueNotify');
+    expect(buildPatchFromAction(enabled.off.value.action, enabled.off.value, {}))
+      .toEqual({ ok: true, value: { modelQueueNotify: false } });
   });
 
   it('R3: localDev autoUpdate disabled → BOTH buttons disabled + NO toggle action; JSON still contains 04:00 + local-dev reason', () => {

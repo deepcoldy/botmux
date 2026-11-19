@@ -348,3 +348,9 @@ botmux quoted om_example_one om_example_two --no-download
 The default full history and single-message quoted JSON remain compatible. Index mode avoids card/forward expansion and returns previews of up to 240 characters plus resource counts. `--no-download` preserves resource metadata without downloading attachment bytes. Batch quoted accepts up to 20 IDs, deduplicates them, preserves successful input order, and returns `messages`/`errors`; partial failure exits with code 1 while retaining successful results.
 
 Filters apply only within the fetched `--limit` window. `--since` is inclusive and `--until` exclusive; use ISO timestamps with a timezone. The `retrieval` block reports counts, filters, deferred details and detail failures. An index candidate marked `queryMatch=deferred` requires a detail read to verify the keyword. Index mode cannot be combined with `--with-card-json`. Message requests are coalesced only within one invocation, separately by app and representation; the next invocation reads afresh. Both commands support `--help`.
+
+## Worker Memory Protection
+
+`botmux worker-budget status` shows available memory, the reserve, the memory PSI limit, and whether worker startup is allowed. Background recovery failures are logged and batched into a DM to the bot owner. A rejected current request receives only a brief unavailable status in its conversation.
+
+Owner DMs are batched per bot over 2 seconds and count distinct affected sessions. Each bot/owner pair attempts at most one DM every 5 minutes, with a cooldown that survives daemon restarts. Failed sends also enter cooldown; a later rejection can trigger another attempt after it expires. An unresolved owner is logged. If the cooldown cannot be persisted, deduplication falls back to the current process. These notifications are independent of the optional Dashboard host overload monitor.

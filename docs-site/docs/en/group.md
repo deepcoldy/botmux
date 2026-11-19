@@ -265,3 +265,16 @@ Groups that were not opened from a DM (ordinary and topic groups) also accept `/
 - The bot owns the group and is the only bot in it. Lark cannot confirm in advance whether a disband would succeed otherwise, so the bot replies that it has no permission and closes no session.
 
 The confirmation card lists every session this machine's bots hold in the group (every topic's session in a topic group) and states that the whole group is disbanded for everyone in it. After you confirm, those sessions are closed first, and the group is disbanded only once all of them are closed; the result arrives as a private card. It stops in the same cases as above.
+
+## Follow the owner into new groups
+
+`ownerGroupFollow` is off by default for every bot. When enabled, the bot uses its owner’s own user authorization to check for new group memberships every 60 seconds. The first complete scan records existing groups; later scans invite the bot to newly joined groups.
+
+```text
+@bot /botconfig set ownerGroupFollow {"enabled":true,"excludeChatIds":["oc_example"]}
+@bot /botconfig unset ownerGroupFollow
+```
+
+The switch is in Dashboard → Bot defaults → Common → Working directory. The owner must authorize chat listing, member invitations and continued access, for example `/login --scope im:chat:read im:chat.members:write_only offline_access`. The app must also enable those user scopes. Existing platform authorization follows this bot’s credential policy.
+
+Excluded groups receive no invitation. Once removed, the bot is not automatically re-added. Turning the feature off and back on establishes a fresh baseline. Invitation permissions and external-group restrictions still apply; failures are reported to the owner in a direct message. Periodic scanning cannot capture joins followed by leaves between scans.

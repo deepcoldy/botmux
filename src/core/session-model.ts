@@ -1,6 +1,6 @@
 import { modelPinView, cliMatchesBot, type ModelPin } from './model-pin.js';
 import { isPinSuspendedForAdopt } from './shared-adopt.js';
-import { cliModelSupportsReasoningEffort, reasoningEffortsForCliModel, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
+import { cliModelMayKeepReasoningEffort, reasoningEffortsForCliModel, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { isGroupModelCliId, groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from './group-default-models.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
@@ -199,8 +199,10 @@ export function resolveSessionLaunchEffort(
   const pin = ds.session.modelPin;
   if (pin && ds.session.dispatchLaunchSpec) return ds.session.dispatchLaunchSpec.effective.reasoningEffort;
   if (!pin || !cliMatchesBot(ds.session, botCfg) || isPinSuspendedForAdopt(ds) || pin.model.toLowerCase() !== model?.toLowerCase() || !pin.effort) return prior;
-  return cliModelSupportsReasoningEffort(cliId, model, pin.effort) ? pin.effort
-    : prior && cliModelSupportsReasoningEffort(cliId, model, prior) ? prior : undefined;
+  // Same keep-rule as config load: a pinned Codex level the table cannot refute
+  // was catalogue-verified by /modelpin; the worker's launch check decides.
+  return cliModelMayKeepReasoningEffort(cliId, model, pin.effort) ? pin.effort
+    : prior && cliModelMayKeepReasoningEffort(cliId, model, prior) ? prior : undefined;
 }
 
 /** All presentation surfaces describe the same resolved launch, never just the row. */

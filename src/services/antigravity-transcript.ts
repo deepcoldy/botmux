@@ -303,6 +303,7 @@ export function unwrapAntigravityUserInput(content: string): string {
  *  user turn confirms it (it gets emitted). */
 export interface AntigravityTranscriptState {
   provisionalFinal?: CodexBridgeEvent;
+  sourceTurnId?: string;
   /** A background task (manage_task / schedule / RUNNING background GENERIC)
    *  is outstanding: the transcript itself proves the turn is not done, so the
    *  quiet-tick flush is refused until the completion SYSTEM_MESSAGE or the
@@ -338,9 +339,11 @@ export interface AntigravityDrainOptions {
   /** Worker-only: release the held trailing candidate after the viewport
    *  quiet-tick probe confirmed the TUI is idle and on the ready marker. */
   flushTrailingFinal?: boolean;
+  /** Bind replies to native inputs when a person can also type in the pane. */
+  adoptMode?: boolean;
 }
 
-function recordTimestampMs(rec: any): number {
+export function recordTimestampMs(rec: any): number {
   const ms = Date.parse(rec?.created_at);
   return Number.isFinite(ms) ? ms : Date.now();
 }
@@ -350,6 +353,7 @@ function cloneState(state: AntigravityTranscriptState | undefined): AntigravityT
   return {
     ...(candidate ? { provisionalFinal: { ...candidate } } : {}),
     ...(state?.hasPendingTask ? { hasPendingTask: true } : {}),
+    ...(state?.sourceTurnId ? { sourceTurnId: state.sourceTurnId } : {}),
   };
 }
 
@@ -380,10 +384,10 @@ function foldRecord(
   timestampMs: number,
   events: CodexBridgeEvent[],
   state: AntigravityTranscriptState,
+  adoptMode: boolean,
 ): AntigravityTranscriptState {
   const type = obj?.type;
-  const keepPending = (s: AntigravityTranscriptState): AntigravityTranscriptState =>
-    s.hasPendingTask ? { hasPendingTask: true } : {};
+  const turn = state.sourceTurnId ? { sourceTurnId: state.sourceTurnId } : {};
 
   if (type === 'USER_INPUT') {
     // Only agy's own explicit submits start bridge turns. Any other source is
@@ -392,11 +396,20 @@ function foldRecord(
     // A new explicit user turn proves the previous loop really ended AND no
     // background task from it is outstanding: release its held final BEFORE
     // the user event so turns stay interleaved, and reset the turn state.
-    if (state.provisionalFinal) events.push(state.provisionalFinal);
+    const uuid = `${path}:${lineStart}`;
+    if (state.provisionalFinal && !(adoptMode && state.hasPendingTask)) {
+      events.push(state.provisionalFinal);
+    } else if (state.sourceTurnId) {
+      events.push({ uuid: `${uuid}:abort`, timestampMs, kind: 'turn_aborted', text: '', ...turn });
+    }
     const raw = typeof obj.content === 'string' ? obj.content : '';
     const text = unwrapAntigravityUserInput(raw);
     if (text) {
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
+      const next = adoptMode ? { sourceTurnId: uuid } : {};
+      events.push({ uuid, timestampMs, kind: 'user', text, ...next,
+        ...(adoptMode ? { inputTextAliases: [] } : {}),
+      });
+      return next;
     }
     return {};
   }
@@ -416,10 +429,10 @@ function foldRecord(
       //    session 098f4ab3's 491-char release summary) still emit its real
       //    final instead of latching forever.
       if (obj.tool_calls.every(isTaskPollToolCall)) return state;
-      return {};
+      return turn;
     }
     const text = typeof obj.content === 'string' ? obj.content : '';
-    if (!text.trim()) {
+    if (!text.trim() || (adoptMode && !state.sourceTurnId)) {
       // Empty content-only step: the "model output must contain either output
       // text or tool calls" ERROR precursor. Never a final; do not disturb a
       // held candidate or the pending flag.
@@ -429,8 +442,13 @@ function foldRecord(
     // replaces an earlier held one). The pending-task flag rides along — the
     // quiet flush checks it and refuses while a task is outstanding.
     const finalText = hasTruncatedContent(obj) ? `${text}\n\n${ANTIGRAVITY_TRUNCATED_REPLY_NOTICE}` : text;
+    const model = adoptMode && typeof obj.model === 'string' ? obj.model.trim() : '';
     return {
-      provisionalFinal: { uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: finalText },
+      ...turn,
+      provisionalFinal: {
+        uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: finalText, ...turn,
+        ...(model && !model.endsWith('-worker-agy') ? { replyModel: model } : {}),
+      },
       ...(state.hasPendingTask ? { hasPendingTask: true } : {}),
     };
   }
@@ -445,7 +463,7 @@ function foldRecord(
   if (type === 'GENERIC') {
     // Foreground tool output after a content-only step cancels the candidate;
     // a possibly-outstanding background task stays recorded.
-    return keepPending(state);
+    return state.hasPendingTask ? { ...turn, hasPendingTask: true } : turn;
   }
 
   // SYSTEM_MESSAGE is the background-task result / stop-hook wake-up: the
@@ -453,7 +471,7 @@ function foldRecord(
   // narration — the planner either continues with tools (re-cancelling) or
   // emits the real final afterwards. ERROR records cancel the candidate too.
   if (type === 'SYSTEM_MESSAGE' || type === 'ERROR_MESSAGE' || type === 'ERROR') {
-    return {};
+    return turn;
   }
 
   // CHECKPOINT / TASK_NOTIFICATION / unknown types neither confirm nor cancel;
@@ -505,7 +523,7 @@ export function drainAntigravityTranscript(
   for (const { line, lineStart } of iterateJsonlLines(completeText, fromOffset)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state);
+    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state, options.adoptMode === true);
   }
 
   // The final object may sit at EOF without a trailing \n until the next turn.
@@ -513,7 +531,7 @@ export function drainAntigravityTranscript(
   if (pendingTail.length > 0) {
     try {
       const obj = JSON.parse(pendingTail);
-      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state);
+      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state, options.adoptMode === true);
       newOffset = size;
       pendingTail = '';
     } catch {
@@ -527,6 +545,7 @@ export function drainAntigravityTranscript(
   if (options.flushTrailingFinal && state.provisionalFinal && !state.hasPendingTask) {
     events.push(state.provisionalFinal);
     state.provisionalFinal = undefined;
+    delete state.sourceTurnId;
   }
   return { events, newOffset, pendingTail, state };
 }

@@ -364,6 +364,59 @@ describe('claudeComposerHoldsInput', () => {
     expect(claudeComposerHoldsInput(screen, 'line one\nline two')).toBe(true);
   });
 
+  describe('a long draft scrolled inside the composer', () => {
+    const lines = Array.from({ length: 25 }, (_, i) => `line ${i + 1} of the forwarded message`);
+    const longInput = lines.join('\n');
+    const scrolledScreen = [
+      '✻ Cogitated for 10m 6s · done 9:26 PM · 1 shell still running',
+      '─── ↑ 18 more ───────────────────────────────────────────',
+      ...lines.slice(-6).map(line => `  ${line}\\`),
+      RULE,
+      '  ⏵⏵ bypass permissions on · 1 shell',
+    ].join('\n');
+
+    it('matches the input by its tail when the head scrolled out', () => {
+      expect(claudeComposerHoldsInput(scrolledScreen, longInput)).toBe(true);
+    });
+
+    it('is diagnosed as a parked draft', () => {
+      const screen = scrolledScreen.replace('line 25 of the forwarded message', '</user_message>');
+      expect(diagnoseSubmitFailure({ screenText: screen, cliId: 'claude-code', nowMs: NOW }).reason).toBe('draft_parked');
+    });
+
+    it('matches by the user_message body when the envelope is shared', () => {
+      const wrap = (body: string) => `<botmux_formatting>fmt</botmux_formatting>\n<user_message>\n${body}\n</user_message>\n<sender id="ou_1" />\n<mentions>\n  @bot\n</mentions>`;
+      const bodyA = Array.from({ length: 20 }, (_, i) => `alpha row ${i} of the first draft`).join('\n');
+      const bodyB = Array.from({ length: 20 }, (_, i) => `bravo row ${i} of the second draft`).join('\n');
+      const screenOf = (wrapped: string) => {
+        const rows = wrapped.split('\n').slice(-12);
+        return [RULE.slice(0, 3) + ' ↑ 18 more ' + RULE, ...rows.map(r => `  ${r}\\`), RULE, '  ⏵⏵ bypass permissions on · 1 shell'].join('\n');
+      };
+      expect(claudeComposerHoldsInput(screenOf(wrap(bodyA)), wrap(bodyA))).toBe(true);
+      expect(claudeComposerHoldsInput(screenOf(wrap(bodyA)), wrap(bodyB))).toBe(false);
+    });
+
+    it('does not match a different scrolled draft', () => {
+      expect(claudeComposerHoldsInput(scrolledScreen, 'something else entirely, long enough to compare against')).toBe(false);
+    });
+  });
+
+  it('does not let a shared tail override a different visible head in an unscrolled composer', () => {
+    const sharedTail = ' common instruction suffix: keep the implementation unchanged and report test results.';
+    const wrap = (body: string) => `<botmux_formatting>fmt</botmux_formatting>\n<user_message>\n${body}\n</user_message>\n<sender id="ou_1" />`;
+    const input = wrap(`Handle the alpha file first.${sharedTail}`);
+    const otherDraft = wrap(`Handle a completely different bravo file.${sharedTail}`);
+    const screen = [
+      RULE,
+      ...otherDraft.split('\n').map((row, index) => `${index === 0 ? '❯ ' : '  '}${row}\\`),
+      RULE,
+      '  ? for shortcuts',
+    ].join('\n');
+
+    expect(claudeComposerHoldsInput(screen, otherDraft)).toBe(true);
+    expect(claudeComposerHoldsInput(screen, input)).toBe(false);
+  });
+
   it('does not match once the input left the composer for the transcript', () => {
     const screen = [`> ${input}`, '', '● Working on it', RULE, '❯ ', RULE].join('\n');
     expect(claudeComposerHoldsInput(screen, input)).toBe(false);

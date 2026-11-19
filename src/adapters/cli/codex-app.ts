@@ -55,7 +55,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommandReal(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, botOpenId, locale, model, reasoningEffort, serviceTier, codexBrowser }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, botOpenId, locale, model, reasoningEffort, allowCodexReasoningCatalog, serviceTier, codexBrowser }) {
       const args = [
         runnerArgv0('codex-app-runner', resolveRunnerPath('codex-app-runner.js', { testOverrideEnv: 'BOTMUX_TEST_CODEX_APP_RUNNER_PATH' })),
         '--session-id', sessionId,
@@ -73,6 +73,10 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       // app-server thread/start (model + config.model_reasoning_effort).
       pushOpt(args, '--model', model && model.trim() ? model.trim() : undefined);
       pushOpt(args, '--reasoning-effort', reasoningEffort);
+      // Only a missing-thread resume fallback probes in the runner. Fresh
+      // starts were already judged by the worker; successful resumes use the
+      // thread's persisted effort and must not probe at all.
+      if (allowCodexReasoningCatalog === false) args.push('--codex-reasoning-catalog', 'off');
       pushOpt(args, '--service-tier', serviceTier);
       pushOpt(args, '--browser-family', codexBrowser?.family);
       pushOpt(args, '--browser-plugin-root', codexBrowser?.pluginRoot);

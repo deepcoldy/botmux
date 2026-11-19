@@ -369,6 +369,7 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
         turnId: 'turn-before-crash',
         dispatchAttempt: undefined,
       },
+      expect.objectContaining({ memoryNoticeAudience: 'owner-only' }),
     );
   });
 
@@ -406,7 +407,9 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(restored.session.queued).toBe(false);
     expect(restored.hasHistory).toBe(false);
     expect(restored.session.codexAppDispatchLedger).toHaveLength(1);
-    expect(forkWorkerMock).toHaveBeenCalledWith(restored, '', true);
+    expect(forkWorkerMock).toHaveBeenCalledWith(
+      restored, '', true, expect.objectContaining({ memoryNoticeAudience: 'owner-only' }),
+    );
   });
 
   it('starts a restored pre-clean-input backlog task safely from the Dashboard button', async () => {

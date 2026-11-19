@@ -3,6 +3,16 @@ import { submitFailureChainKeyOf } from './submit-failure-chain.js';
 
 type Evidence = { writeStartedAtMs?: number; externalInputGeneration?: number; interruptGeneration?: number; structuredTerminal: boolean };
 
+/** A persistent reattach does not execute the configured resume target, so that
+ * target is not proof of the pane's live native conversation. Wait for an owned
+ * observation instead of mistaking the first config correction for a rotation. */
+export function inputDeliveryObservedSessionIdAtSpawn(
+  willReattachPersistent: boolean,
+  effectiveCliSessionId?: string,
+): string | undefined {
+  return willReattachPersistent ? undefined : effectiveCliSessionId;
+}
+
 /**
  * Evidence can arrive while an adapter is still awaiting its history receipt.
  * Retain it independently of live bridge marks and execution timings, which

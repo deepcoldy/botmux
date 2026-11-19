@@ -12,7 +12,7 @@ import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgent
  * Extracted from daemon.ts for modularity.
  */
 import { sessionPromptInjection, supportsZeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
@@ -150,13 +150,16 @@ import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { modelPinText } from './model-pin.js';
 import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
+import { loadSessionCodexReasoningCatalog } from '../services/codex-bot-reasoning-catalog.js';
+import { failedTurnRewindInFlight } from './failed-turn-rewind.js';
 import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
 import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
-import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, rewindClaudeTranscript, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
+import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, withOpenTranscript, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
+import { REWIND_BACKUP_RETENTION, pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './rewind-backup-retention.js';
 import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
 import { clearBridgeTurnJournal } from '../services/bridge-turn-journal.js';
 import { resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
@@ -1950,10 +1953,15 @@ export async function handleCommand(
         // Do not interrupt a business turn just to change its next launch.
         try {
           const beforeView = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
+          // A pinned Codex level is judged against the live catalogue of the
+          // runtime this session launches (its frozen CLI/runtime/profile).
+          const reasoningCatalog = args[0] !== '--follow-bot' && args[1]
+            ? await loadSessionCodexReasoningCatalog(ds.session, getBot(ds.larkAppId).config)
+            : null;
           const changed = writeSessionModelPin(ds, args[0] === '--follow-bot' ? undefined : {
             model: args[0]!, ...(args[1] ? { effort: args[1] as import('../services/codex-reasoning-effort.js').CodexReasoningEffort } : {}),
             source: 'command', setBy: message.senderId, setAt: new Date().toISOString(),
-          });
+          }, { reasoningCatalog });
           if (changed === false) { await sessionReply(rootId, '本话题未固定，无需解除。'); break; }
           const view = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
           if (!ds.session.modelPin && beforeView?.shadowedBy) {
@@ -3890,6 +3898,11 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.retry.cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, loc));
           break;
         }
+        // Already being re-sent by an input whose CLI restart is still running.
+        if (failedTurnRewindInFlight(ds, failedTurn.turnId)) {
+          await sessionReply(rootId, t('card.action.retry_turn_in_flight', undefined, loc));
+          break;
+        }
         // Strip clientUserMessageId to avoid dedup conflicts (same as retry_last_task)
         const retryCodexAppInput = failedTurn.codexAppInput
           ? (({ clientUserMessageId: _prior, ...input }) => input)(failedTurn.codexAppInput)
@@ -3903,7 +3916,9 @@ export async function handleCommand(
         let accepted = false;
         try {
           if (ds.worker && !ds.worker.killed) {
-            accepted = sendWorkerInput(ds, retryInput, retryTurnId);
+            // A turn that failed without any output is cut first, so the
+            // retry replaces it instead of stacking on top.
+            accepted = sendWorkerInput(ds, retryInput, retryTurnId, { failedTurnResendOf: failedTurn.turnId });
           } else {
             accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
           }
@@ -4002,7 +4017,7 @@ export async function handleCommand(
         }
         // The canonical resolver follows the frozen config profile and the sandbox
         // BOT_HOME redirect — the paths the CLI actually wrote.
-        const rewindJsonl = ds.session.cliSessionId
+        const rewindTranscript = ds.session.cliSessionId
           ? resolveSessionTranscriptPath({
               cliId: 'claude-code',
               sessionId: ds.session.sessionId,
@@ -4010,8 +4025,18 @@ export async function handleCommand(
               cwd: getSessionWorkingDir(ds),
               larkAppId: ds.larkAppId,
               fresh: true,
-            })?.path ?? null
+            })
           : null;
+        const rewindJsonl = rewindTranscript?.path ?? null;
+        // Every read and the cut re-check the file they open against the tree
+        // the CLI can write to; the resolver's own check is from before. The
+        // backup of such a transcript goes to a daemon-owned directory.
+        const rewindScope = rewindTranscript?.writableTreeRoot
+          ? {
+              writableTreeRoot: rewindTranscript.writableTreeRoot,
+              backupDir: rewindBackupDirForSession(config.session.dataDir, ds.session.sessionId),
+            }
+          : {};
         if (!rewindJsonl) {
           await sessionReply(rootId, t('cmd.rewind.no_transcript', undefined, loc));
           break;
@@ -4022,7 +4047,7 @@ export async function handleCommand(
         // top-level catch only logs, so without this local catch the user gets
         // NO reply while the CLI may already have been stopped.
         try {
-          const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, REWIND_CHECKPOINT_LIMIT);
+          const checkpoints = scanClaudeTranscriptCheckpoints(rewindJsonl, REWIND_CHECKPOINT_LIMIT, rewindScope);
           const formatCheckpointAt = (iso?: string): string => {
             if (!iso) return '-';
             const d = new Date(iso);
@@ -4070,7 +4095,6 @@ export async function handleCommand(
             break;
           }
           const rewindSessionKey = ds.session.sessionId;
-          const rewindSize = statSync(rewindJsonl).size;
           const pendingPreview = pendingRewindPreviews.get(rewindSessionKey);
           if (rewindMatch[2] && pendingPreview && (
             pendingPreview.index !== rewindIndex
@@ -4087,7 +4111,8 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.rewind.confirm_prompt', {
               index: rewindIndex,
               turns: rewindIndex,
-              bytes: rewindSize - rewindTarget.offset,
+              // From the scan's own descriptor: never a second read by path.
+              bytes: rewindTarget.removedBytes,
               preview: rewindTarget.preview || t('cmd.rewind.no_text', undefined, loc),
             }, loc));
             break;
@@ -4157,49 +4182,59 @@ export async function handleCommand(
               if (!await waitForTranscriptQuiet(rewindJsonl)) {
                 return { ok: false as const, code: 'error' as const, error: 'transcript is still being written' };
               }
-              // Re-resolve the target by identity: the file may have gained a turn
-              // between preview and confirm, which shifts every index.
-              const target = findCheckpoint(scanClaudeTranscriptCheckpoints(rewindJsonl, 50), pendingPreview.target);
-              // index must still match: a turn that landed after the preview would
-              // otherwise be removed silently along with the previewed ones.
-              if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
-                return { ok: false as const, code: 'moved' as const };
-              }
-              // Persist replay-state clearing BEFORE the cut: if this throws
-              // (sqlite busy, disk full), nothing has been truncated and the
-              // live session keeps its previous /retry state.
-              const savedReplay = {
-                lastUserPrompt: current.session.lastUserPrompt,
-                lastCliInput: current.session.lastCliInput,
-                lastCliInputTurnId: current.session.lastCliInputTurnId,
-                lastFailedTurn: current.session.lastFailedTurn,
-              };
-              current.session.lastUserPrompt = undefined;
-              current.session.lastCliInput = undefined;
-              current.session.lastCliInputTurnId = undefined;
-              current.session.lastFailedTurn = undefined;
-              try {
-                sessionStore.updateSession(current.session);
-              } catch (err) {
-                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
-                current.session.lastCliInput = savedReplay.lastCliInput;
-                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
-                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
-                return asError(err, 'could not persist rewind state');
-              }
-              let result: RewindResult;
-              try {
-                result = rewindClaudeTranscript(rewindJsonl, target.offset);
-              } catch (err) {
-                // Cut never happened — restore the replay fields so the failed
-                // attempt leaves the session as it was.
-                current.session.lastUserPrompt = savedReplay.lastUserPrompt;
-                current.session.lastCliInput = savedReplay.lastCliInput;
-                current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
-                current.session.lastFailedTurn = savedReplay.lastFailedTurn;
-                try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
-                return asError(err);
-              }
+              // The re-scan and the cut go through ONE open descriptor: the
+              // offset is cut on exactly the file it was read from, never on
+              // whatever the path names by the time of the cut.
+              const cut = withOpenTranscript(rewindJsonl, rewindScope, transcript => {
+                // Re-resolve the target by identity: the file may have gained a turn
+                // between preview and confirm, which shifts every index.
+                const target = findCheckpoint(transcript.scan(50), pendingPreview.target);
+                // index must still match: a turn that landed after the preview would
+                // otherwise be removed silently along with the previewed ones.
+                if (!target || target.index !== pendingPreview.index || target.beforeCompaction || !target.resumable) {
+                  return { ok: false as const, code: 'moved' as const };
+                }
+                // Persist replay-state clearing BEFORE the cut: if this throws
+                // (sqlite busy, disk full), nothing has been truncated and the
+                // live session keeps its previous /retry state.
+                const savedReplay = {
+                  lastUserPrompt: current.session.lastUserPrompt,
+                  lastCliInput: current.session.lastCliInput,
+                  lastCliInputTurnId: current.session.lastCliInputTurnId,
+                  lastFailedTurn: current.session.lastFailedTurn,
+                };
+                const restoreReplay = () => {
+                  current.session.lastUserPrompt = savedReplay.lastUserPrompt;
+                  current.session.lastCliInput = savedReplay.lastCliInput;
+                  current.session.lastCliInputTurnId = savedReplay.lastCliInputTurnId;
+                  current.session.lastFailedTurn = savedReplay.lastFailedTurn;
+                };
+                current.session.lastUserPrompt = undefined;
+                current.session.lastCliInput = undefined;
+                current.session.lastCliInputTurnId = undefined;
+                current.session.lastFailedTurn = undefined;
+                try {
+                  sessionStore.updateSession(current.session);
+                } catch (err) {
+                  restoreReplay();
+                  return asError(err, 'could not persist rewind state');
+                }
+                try {
+                  if (rewindScope.backupDir) mkdirSync(rewindScope.backupDir, { recursive: true, mode: 0o700 });
+                  return { ok: true as const, result: transcript.cut(target.offset) };
+                } catch (err) {
+                  // Cut never happened — restore the replay fields so the failed
+                  // attempt leaves the session as it was.
+                  restoreReplay();
+                  try { sessionStore.updateSession(current.session); } catch { /* best effort */ }
+                  return asError(err);
+                }
+              });
+              if (!cut.ok) return cut;
+              const result: RewindResult = cut.result;
+              // A backup next to the transcript is registered at once, so the
+              // periodic sweep reaches its directory whatever happens next.
+              registerRewindBackup(result.backupPath, config.session.dataDir, note => logger.warn(`[${logTag}] ${note}`));
               // The CLI will cold-resume from the truncated transcript under the SAME
               // native session id, so group-context coverage still marks the dropped
               // turn's background as delivered and it is not re-injected.
@@ -4237,17 +4272,24 @@ export async function handleCommand(
           logger.info(
             `[${logTag}] /rewind rolled back to checkpoint ${rewindIndex}, removed ${rewindOutcome.removedBytes} bytes, backup ${rewindOutcome.backupPath}`,
           );
+          // How long the backup stays (rewind-backup-retention.ts).
+          const backupRetention = {
+            days: Math.round(REWIND_BACKUP_RETENTION.maxAgeMs / 86_400_000),
+            keep: REWIND_BACKUP_RETENTION.maxPerTranscript,
+          };
           const rewindDoneMessage = rewindOutcome.cleanupError
             ? t('cmd.rewind.done_cleanup_warn', {
               turns: rewindIndex,
               bytes: rewindOutcome.removedBytes,
               backup: rewindOutcome.backupPath,
+              ...backupRetention,
               error: rewindOutcome.cleanupError,
             }, loc)
             : t('cmd.rewind.done', {
               turns: rewindIndex,
               bytes: rewindOutcome.removedBytes,
               backup: rewindOutcome.backupPath,
+              ...backupRetention,
             }, loc);
           // The truncation + backup are already durable here, and this notice
           // is the ONLY message carrying the backup path. A send failure
@@ -4261,11 +4303,18 @@ export async function handleCommand(
           } catch (sendErr) {
             logger.warn(`[${logTag}] /rewind succeeded but the done reply failed: ${sendErr instanceof Error ? sendErr.message : String(sendErr)}; backup ${rewindOutcome.backupPath}`);
             try {
-              await sessionReply(rootId, t('cmd.rewind.done_plain', { backup: rewindOutcome.backupPath }, loc));
+              await sessionReply(rootId, t('cmd.rewind.done_plain', { backup: rewindOutcome.backupPath, ...backupRetention }, loc));
             } catch (fallbackErr) {
               logger.warn(`[${logTag}] /rewind plain-text fallback reply also failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}; backup ${rewindOutcome.backupPath}`);
             }
           }
+          // The rewind is settled and reported: prune the directory its backup
+          // went to, this backup left alone (rewind-backup-retention.ts). Not
+          // awaited — nothing waits on it.
+          void pruneRewindBackupsBeside(rewindOutcome.backupPath, {
+            dataDir: config.session.dataDir,
+            log: note => logger.info(`[${logTag}] ${note}`),
+          });
         } catch (err) {
           const errorText = err instanceof Error ? err.message : String(err);
           const errnoCode = (err as NodeJS.ErrnoException | null)?.code;

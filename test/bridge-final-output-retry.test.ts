@@ -5291,6 +5291,32 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     }
   });
 
+  it.each([
+    { cliId: 'antigravity', replyModel: 'gemini-4-carbon-high', replyReasoningEffort: undefined },
+    { cliId: 'codex', replyModel: 'gpt-6.2-sol', replyReasoningEffort: 'max' },
+    { cliId: 'codex', replyModel: 'gpt-6.1-sol', replyReasoningEffort: undefined },
+  ] as const)('renders the adopted $cliId reply model $replyModel on initial delivery and retry', async ({ cliId, replyModel, replyReasoningEffort }) => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('transient')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    vi.mocked(resolveUsageDisplay).mockReturnValue('off');
+    const ds = makeDs();
+    ds.session.cliId = cliId;
+    ds.activeModel = 'previous-model';
+    if (cliId === 'codex') ds.activeReasoningEffort = 'low';
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js');
+    __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), replyModel, replyReasoningEffort }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.activeModel).toBe('previous-model');
+    ds.activeModel = 'next-model';
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    const card = sessionReply.mock.calls[0][1];
+    expect(card).toContain(`**${replyModel}**`);
+    expect(card).not.toContain('low');
+    if (replyReasoningEffort) expect(card).toContain(replyReasoningEffort);
+    expect(sessionReply.mock.calls[1][1]).toBe(card);
+  });
+
   it('does not read or render footer usage when this bot is not in footer mode', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({

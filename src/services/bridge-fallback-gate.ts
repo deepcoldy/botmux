@@ -46,7 +46,11 @@
  *     delivery, so it suppresses the fallback UNCONDITIONALLY (regardless of
  *     length) under EVERY replyDelivery, including when the marker carries no
  *     body length at all (image-only / voice sends) — see the note on
- *     markerSetDuplicatesFinal. That comparison only ever runs for
+ *     markerSetDuplicatesFinal. A same-chat `detoured_send` into another topic
+ *     (`--into` / another root) is still this turn's final: the transcript
+ *     must not also become a card on the current anchor. A different chat, a
+ *     `dispatch_report`, and a progress-only detour do not retire that prose.
+ *     That comparison only ever runs for
  *     progress/kind-less sends. When the transcript final is available, only
  *     emit fallback if that final is materially longer than any single
  *     explicit send in the same window.
@@ -606,9 +610,11 @@ function supersededFinalMarkerExplainsCompletionNarration(
 
 /** Whether this delivery can replace the non-empty answer expected here.
  *
- * A cross-chat / cross-thread delivery still explains an EMPTY terminal, but
- * it must not consume this conversation's non-empty final or failure notice.
- * Legacy markers predate routing metadata and retain their historical credit. */
+ * A cross-chat delivery or a dispatch report still explains an EMPTY terminal,
+ * but it must not consume this conversation's non-empty final or failure
+ * notice. A same-chat detour into another topic is handled separately: an
+ * explicit final there already answered this turn. Legacy markers predate
+ * routing metadata and retain their historical credit. */
 function markerCoversOwnThread(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
   if (marker.deliveryKind === undefined) return true;
   if (turn.chatId && marker.targetChatId && marker.targetChatId !== turn.chatId) {
@@ -632,6 +638,20 @@ function markerCoversOwnThread(turn: BridgeGateInput, marker: BridgeSendMarker):
   return !marker.targetChatId
     && !!marker.targetSessionId
     && marker.targetSessionId === turn.sessionId;
+}
+
+/** This turn's own `--response-kind final` landed in the same chat, on a
+ * different topic. That delivery retires the transcript fallback on the
+ * current anchor. Progress detours, cross-chat sends, dispatch reports, and a
+ * predecessor turn's final do not. */
+function sameChatOtherRootExplicitFinal(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+  if (!markerMatchesExactTurn(turn, marker) || !isFinalBridgeSendMarker(marker)) return false;
+  if (marker.terminalIndependent === true) return false;
+  if (marker.replyCardResponseKind !== undefined && marker.replyCardResponseKind !== 'final') return false;
+  return marker.deliveryKind === 'detoured_send'
+    && !!turn.chatId && marker.targetChatId === turn.chatId
+    && !!turn.rootMessageId && !!marker.targetRootMessageId
+    && marker.targetRootMessageId !== turn.rootMessageId;
 }
 
 /**
@@ -688,7 +708,7 @@ export function shouldSuppressBridgeEmit(
   // suppress a later attempt of the same logical turn.
   if (turn.turnId && markers.some(marker => (markerMatchesExactTurn(turn, marker)
       || markerMatchesSupersededFinal(turn, marker))
-      && markerCoversOwnThread(turn, marker)
+      && (markerCoversOwnThread(turn, marker) || sameChatOtherRootExplicitFinal(turn, marker))
       && marker.terminalIndependent !== true
       && isFinalBridgeSendMarker(marker)
       && (marker.replyCardResponseKind === undefined
@@ -709,7 +729,8 @@ export function shouldSuppressBridgeEmit(
   const hasVisibleFinal = turn.finalText !== undefined
     && normaliseForFingerprint(turn.finalText).length > 0;
   const inWindow = hasVisibleFinal
-    ? attributable.filter(marker => markerCoversOwnThread(turn, marker))
+    ? attributable.filter(marker => markerCoversOwnThread(turn, marker)
+      || sameChatOtherRootExplicitFinal(turn, marker))
     : attributable;
   if (turn.markTimeMs === undefined) {
     if (inWindow.length === 0) return false;

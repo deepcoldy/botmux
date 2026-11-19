@@ -128,6 +128,8 @@ export interface CodexPendingTurn {
   inputDeliveryQuarantined?: true;
   /** Set once an assistant_final event closes this turn. */
   finalText?: string;
+  replyModel?: string;
+  replyReasoningEffort?: string;
   /** Explicit transcript terminal semantics. Undefined keeps the historical
    *  assistant-final => completed behaviour. */
   terminalStatus?: 'completed' | 'failed' | 'ambiguous';
@@ -384,6 +386,7 @@ export class CodexBridgeQueue {
     dispatchAttempt?: number,
     recoveryCursorAtMark?: { jsonlPath: string; offsetAtMark: number },
     linkRefMode?: 'observe' | 'enabled',
+    requireExactInput = false,
   ): void {
     this.queue.push({
       turnId,
@@ -391,7 +394,7 @@ export class CodexBridgeQueue {
       ...(linkRefMode ? { linkRefMode } : {}),
       started: false,
       contentFingerprint: makeFingerprint(message),
-      ...(/^[ \t]*(?:[/$]|\[\$)/.test(message) ? { inputTextHash: exactInputHash(message) } : {}),
+      ...(requireExactInput || /^[ \t]*(?:[/$]|\[\$)/.test(message) ? { inputTextHash: exactInputHash(message) } : {}),
       markTimeMs,
       recoveryJsonlPathAtMark: recoveryCursorAtMark?.jsonlPath,
       recoveryOffsetAtMark: recoveryCursorAtMark?.offsetAtMark,
@@ -690,6 +693,28 @@ export class CodexBridgeQueue {
     return this.queue.some(candidate => candidate.turnId === turnId
       && candidate.dispatchAttempt === dispatchAttempt
       && candidate.finalText !== undefined);
+  }
+
+  /** Whether a native user record (the CoT reader's USER_INPUT boundary in
+   *  adopt mode) starts a turn owned by a Lark marker rather than a local
+   *  terminal input. Uses the same fingerprint/exact-hash match and the same
+   *  5s replay tolerance as the transcript ingest path, so the thinking-timeline
+   *  side channel cannot attribute local-turn entries to an active Lark card.
+   *  Open marks that have not reached their transcript `user` event yet still
+   *  qualify: the mark is installed before the literal write. */
+  ownsTurnForNativeInput(text: string, timestampMs: number): boolean {
+    return this.queue.some(turn => {
+      if (turn.isLocal || turn.finalText !== undefined) return false;
+      if (turn.markTimeMs !== undefined
+        && timestampMs < turn.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS) return false;
+      // Mirror the adopt-mode antigravity user event shape: an exact-input mark
+      // pairs with an empty alias list so the match is hash-only, never the
+      // looser fingerprint containment.
+      const event: CodexBridgeEvent = turn.inputTextHash !== undefined
+        ? { uuid: '', timestampMs, kind: 'user', text, inputTextAliases: [] }
+        : { uuid: '', timestampMs, kind: 'user', text };
+      return this.matchesUserInput(turn, event);
+    });
   }
 
   /** True while the transcript proves a turn is running, or while a verified
@@ -1138,6 +1163,8 @@ export class CodexBridgeQueue {
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
         target.finalText = ev.text;
+        target.replyModel = ev.replyModel;
+        target.replyReasoningEffort = ev.replyReasoningEffort;
         target.terminalStatus = ev.terminalStatus;
         target.terminalErrorCode = ev.terminalErrorCode;
         target.terminalErrorSummary = ev.terminalErrorSummary;

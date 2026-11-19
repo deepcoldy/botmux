@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { canonicalJson } from '../utils/canonical-input-hash.js';
 import {
   CODEX_REASONING_EFFORTS,
-  cliModelSupportsReasoningEffort,
+  cliLaunchAcceptsReasoningEffort,
   type CodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
 
@@ -639,8 +639,12 @@ export function resolveDispatchLaunchOverride(input: {
     };
   }
   const effectiveEffort = input.requested.reasoningEffort ?? input.targetReasoningEffort;
+  // Same rule as the dispatching CLI (dispatch-launch-spec): the target's own
+  // saved pair passed its config load and is judged by that keep-rule.
+  const inheritsSavedPair = input.requested.reasoningEffort === undefined
+    && effectiveModel === input.targetModel?.trim();
   if (effectiveEffort !== undefined
-      && !cliModelSupportsReasoningEffort(input.cliId, effectiveModel, effectiveEffort)) {
+      && !cliLaunchAcceptsReasoningEffort(input.cliId, effectiveModel, effectiveEffort, inheritsSavedPair)) {
     return {
       ok: false,
       errorCode: 'INVALID_MODEL_EFFORT_COMBINATION',
