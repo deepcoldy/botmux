@@ -67,7 +67,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
+import { join, basename, dirname, delimiter, relative, extname, isAbsolute } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
@@ -619,6 +619,7 @@ import {
   selectSessionBackend,
 } from './adapters/backend/session-backend-selector.js';
 import { managedTmuxCandidateSockets, normaliseTmuxSocketName, preferredManagedTmuxSocket, tmuxServerLabel, tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
+import { probeTmuxSessionWithLegacyRoot } from './adapters/backend/tmux-socket-root.js';
 import { buildReproduceCommand, selectReproduceLaunch } from './adapters/backend/reproduce-command.js';
 import {
   deriveRiffReposFromDirs,
@@ -25412,7 +25413,17 @@ async function spawnCliBody(
       const placement = resolveManagedTmuxPlacement({
         recordedSocketName: recordedTmuxSocket(cfg.persistentBackendTarget),
         preferred: preferredTmuxSocket,
-        probe: socketName => TmuxBackend.probeSessionWithRetry(tmuxSessionName, { socketName }),
+        probe: socketName => {
+          const result = probeTmuxSessionWithLegacyRoot({
+            strict: cfg.envPolicy?.mode === 'strict',
+            socketName,
+            probe: label => TmuxBackend.probeSessionWithRetry(tmuxSessionName, { socketName: label }),
+          });
+          // Pre-PR strict workers always used /tmp. Adopt that root only when
+          // the legacy session provably exists; unknown never permits a fork.
+          if (result.legacySocketRoot) process.env.TMUX_TMPDIR = result.legacySocketRoot;
+          return result.probe;
+        },
       });
       resolvedTmuxSocketName = placement.socketName;
       if (placement.probe !== 'missing' && placement.socketName !== preferredTmuxSocket) {
@@ -26140,6 +26151,10 @@ async function spawnCliBody(
           ? persistentReattachBias(resolvedTmuxSessionProbe)
           : undefined,
     tmuxSocketName: persistentReattachBias(resolvedTmuxSessionProbe) ? resolvedTmuxSocketName : preferredTmuxSocket,
+    // Only strict workers pin an absolute root. Persist it with the existing
+    // target so daemon workerless probe/kill uses explicit -S on the SAME server.
+    tmuxSocketRoot: cfg.envPolicy?.mode === 'strict' && process.env.TMUX_TMPDIR && isAbsolute(process.env.TMUX_TMPDIR)
+      ? process.env.TMUX_TMPDIR : undefined,
     zmxRecoveryStateDir: isolationRuntimeDataDir,
   });
   // Settle a reattach that rests on an indeterminate existence probe with one

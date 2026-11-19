@@ -313,8 +313,8 @@ export class TmuxBackend {
    * those as its own clean exits 127/126, which this classifier would wrongly
    * read as 'missing'.
    */
-  static probeSession(name: string, socketName?: string): SessionProbe {
-    return TmuxBackend.classifyHasSession(name, false, socketName);
+  static probeSession(name: string, socketName?: string, socketRoot?: string): SessionProbe {
+    return TmuxBackend.classifyHasSession(name, false, socketName, false, socketRoot);
   }
 
   /**
@@ -364,9 +364,10 @@ export class TmuxBackend {
     socketMissingIsMissing: boolean,
     socketName?: string,
     coldEvidenceOnDefaultServer = false,
+    socketRoot?: string,
   ): SessionProbe {
     try {
-      execFileSync('tmux', [...tmuxSocketArgs(socketName), 'has-session', '-t', name], {
+      execFileSync('tmux', [...tmuxSocketArgs(socketName, socketRoot), 'has-session', '-t', name], {
         stdio: ['ignore', 'ignore', 'pipe'],
         env: tmuxEnv(),
         timeout: 3000,
@@ -489,12 +490,12 @@ export class TmuxBackend {
   }
 
   /** Kill a named tmux session (no-op if it doesn't exist). */
-  static killSession(name: string, socketName?: string): void {
+  static killSession(name: string, socketName?: string, socketRoot?: string): void {
     try {
       // Runtime recovery calls this from many workers. Bound the command so a
       // wedged shared server cannot pin every worker forever; restart jitter
       // keeps the bounded attempts from landing simultaneously.
-      execFileSync('tmux', [...tmuxSocketArgs(socketName), 'kill-session', '-t', name], {
+      execFileSync('tmux', [...tmuxSocketArgs(socketName, socketRoot), 'kill-session', '-t', name], {
         stdio: 'ignore',
         timeout: 3000,
         env: tmuxEnv(),

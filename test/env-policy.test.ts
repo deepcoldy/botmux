@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { buildBotWorkerEnv, buildSessionChildEnv, botInjectedEnv, inheritBotEnv, normalizeEnvPolicy } from '../src/core/env-policy.js';
 import { applySessionOwnerEnv } from '../src/utils/child-env.js';
 import { envPolicyId, envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from '../src/services/env-policy-stamp.js';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
@@ -100,6 +100,34 @@ describe('per-bot environment policy', () => {
     expect(child.TMUX_TMPDIR).toBe(mode === 'strict' ? undefined : socketRoot);
     if (socketRoot === undefined) expect(Object.hasOwn(worker, 'TMUX_TMPDIR')).toBe(false);
     expect(base).toEqual(before);
+  });
+  it('pins a relative tmux socket root only at the strict daemon/worker boundary', () => {
+    const controlCwd = mkdtempSync(join(tmpdir(), 'worker-root-'));
+    const relativeRoot = join(controlCwd, 'rel');
+    mkdirSync(relativeRoot);
+    const absoluteRoot = realpathSync(relativeRoot);
+    const base = { ...host, TMUX_TMPDIR: 'rel' };
+    const before = { ...base };
+    const redaction: ProtectedMcpWorkerPolicy = {
+      capabilities: [], protectedHomePaths: [], redactEnv: ['TMUX_TMPDIR'],
+    };
+    try {
+      const worker = buildBotWorkerEnv(base, strict, undefined, controlCwd);
+      expect(worker.TMUX_TMPDIR).toBe(absoluteRoot);
+      expect(buildSessionChildEnv(worker, strict).TMUX_TMPDIR).toBeUndefined();
+      // A missing relative path resolves to the same /tmp fallback as tmux.
+      expect(buildBotWorkerEnv({ TMUX_TMPDIR: 'missing' }, strict, undefined, controlCwd).TMUX_TMPDIR).toBe('/tmp');
+      // Path normalization must not resurrect a protected value.
+      expect(buildBotWorkerEnv(base, strict, redaction, controlCwd).TMUX_TMPDIR).toBeUndefined();
+      // Historical inheritance is unchanged for the worker and the CLI.
+      const inherited = buildBotWorkerEnv(base, { mode: 'inherit' }, undefined, controlCwd);
+      expect(inherited.TMUX_TMPDIR).toBe('rel');
+      expect(buildSessionChildEnv(inherited, { mode: 'inherit' }).TMUX_TMPDIR).toBe('rel');
+      expect(buildBotWorkerEnv({ TMUX_TMPDIR: 'missing' }, { mode: 'inherit' }, undefined, controlCwd).TMUX_TMPDIR).toBe('missing');
+      expect(base).toEqual(before);
+    } finally {
+      rmSync(controlCwd, { recursive: true, force: true });
+    }
   });
   it('preserves per-session homes and workflows after trusted injection', () => {
     const env = buildSessionChildEnv({ ...host, CODEX_HOME: '/test/bot/codex', BOTMUX_WORKFLOW: '1', BOTMUX_GOAL_PATH: '/test/goal', SESSION_DATA_DIR: '/test/data' }, strict);

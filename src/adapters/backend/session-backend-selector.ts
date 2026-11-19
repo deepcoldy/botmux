@@ -462,6 +462,8 @@ export function selectSessionBackend(opts: {
   hasExistingSession?: boolean;
   /** tmux server for the managed session (undefined = default server). */
   tmuxSocketName?: string;
+  /** Absolute root selected by a strict worker; persisted for daemon -S control. */
+  tmuxSocketRoot?: string;
   /** Host-persistent journal for fail-closed ZMX composer recovery. */
   zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
@@ -729,8 +731,8 @@ export function selectSessionBackend(opts: {
   const socketName = opts.tmuxSocketName;
   // Default-server targets keep the historical shape (no socketName key).
   const persistentBackendTarget: PersistentBackendTarget = socketName === undefined
-    ? { backendType: 'tmux', sessionName }
-    : { backendType: 'tmux', sessionName, socketName };
+    ? { backendType: 'tmux', sessionName, ...(opts.tmuxSocketRoot !== undefined ? { socketRoot: opts.tmuxSocketRoot } : {}) }
+    : { backendType: 'tmux', sessionName, socketName, ...(opts.tmuxSocketRoot !== undefined ? { socketRoot: opts.tmuxSocketRoot } : {}) };
   // Prefer the worker's frozen decision (tri-state probe resolved once at the
   // gate, biased toward reattach on 'unknown', refreshed to 'missing' after any
   // teardown) so the gate, the pre-spawn fresh/reattach setup and the backend

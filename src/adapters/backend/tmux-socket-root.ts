@@ -37,6 +37,7 @@
 
 import { realpathSync } from 'node:fs';
 import { join, resolve as resolvePath } from 'node:path';
+import type { SessionProbe } from './types.js';
 
 /** Socket root tmux uses when $TMUX_TMPDIR does not resolve. */
 export const TMUX_DEFAULT_SOCKET_ROOT = '/tmp';
@@ -62,4 +63,40 @@ export function resolveTmuxSocketRoot(env: NodeJS.ProcessEnv = process.env, cwd:
 /** Filesystem pathname of a tmux server socket under `root`. */
 export function tmuxSocketPathIn(root: string, uid: number, socketName?: string): string {
   return join(root, `tmux-${uid}`, socketName || 'default');
+}
+
+export interface TmuxLegacyRootProbe {
+  probe: SessionProbe;
+  /** Set only when a live legacy session was found and should be reattached. */
+  legacySocketRoot?: string;
+}
+
+/**
+ * Probe the pre-PR strict-session default root before allowing a cold spawn.
+ * Current-root `missing` is the ONLY state that may trigger the legacy probe;
+ * an `unknown` legacy answer stays unknown (reattach bias), never permission to
+ * create a second session. The caller applies legacySocketRoot on `exists`.
+ * `legacyRoot` defaults to /tmp; tests use a private root to stay off the host.
+ */
+export function probeTmuxSessionWithLegacyRoot(opts: {
+  strict: boolean;
+  socketName?: string;
+  legacyRoot?: string;
+  probe: (socketName: string | undefined) => SessionProbe;
+}): TmuxLegacyRootProbe {
+  const current = opts.probe(opts.socketName);
+  const currentRoot = process.env.TMUX_TMPDIR;
+  const legacyRoot = opts.legacyRoot ?? TMUX_DEFAULT_SOCKET_ROOT;
+  if (!opts.strict || current !== 'missing' || !currentRoot || currentRoot === legacyRoot) {
+    return { probe: current };
+  }
+  process.env.TMUX_TMPDIR = legacyRoot;
+  try {
+    const legacy = opts.probe(opts.socketName);
+    if (legacy === 'exists') return { probe: legacy, legacySocketRoot: legacyRoot };
+    if (legacy === 'unknown') return { probe: legacy };
+    return { probe: current };
+  } finally {
+    process.env.TMUX_TMPDIR = currentRoot;
+  }
 }

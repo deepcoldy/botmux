@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   resolveTmuxSocketRoot,
+  probeTmuxSessionWithLegacyRoot,
   tmuxSocketPathIn,
   TMUX_DEFAULT_SOCKET_ROOT,
 } from '../src/adapters/backend/tmux-socket-root.js';
@@ -91,6 +92,59 @@ describe('resolveTmuxSocketRoot', () => {
     const dir = tempDir('tmux-root-path-');
     expect(tmuxSocketPathIn(dir, 42, 'botmux')).toBe(`${dir}/tmux-42/botmux`);
     expect(tmuxSocketPathIn(dir, 42)).toBe(`${dir}/tmux-42/default`);
+  });
+});
+
+describe('legacy strict-session root probing', () => {
+  it('offers a legacy root only when the old session exists and restores the probe env', () => {
+    const previous = process.env.TMUX_TMPDIR;
+    const currentRoot = join(tmpdir(), 'current-root');
+    process.env.TMUX_TMPDIR = currentRoot;
+    const legacyRoot = join(tmpdir(), 'legacy-root');
+    try {
+      const seenRoots: Array<string | undefined> = [];
+      const result = probeTmuxSessionWithLegacyRoot({
+        strict: true,
+        legacyRoot,
+        probe: () => {
+          seenRoots.push(process.env.TMUX_TMPDIR);
+          return seenRoots.length === 1 ? 'missing' : 'exists';
+        },
+      });
+      expect(result).toEqual({ probe: 'exists', legacySocketRoot: legacyRoot });
+      expect(seenRoots).toEqual([currentRoot, legacyRoot]);
+      expect(process.env.TMUX_TMPDIR).toBe(currentRoot);
+    } finally {
+      if (previous === undefined) delete process.env.TMUX_TMPDIR;
+      else process.env.TMUX_TMPDIR = previous;
+    }
+  });
+
+  it('keeps unknown indeterminate and never probes legacy for inherit', () => {
+    const previous = process.env.TMUX_TMPDIR;
+    const currentRoot = join(tmpdir(), 'current-root');
+    process.env.TMUX_TMPDIR = currentRoot;
+    const legacyRoot = join(tmpdir(), 'legacy-root');
+    try {
+      let calls = 0;
+      const unknown = probeTmuxSessionWithLegacyRoot({
+        strict: true, legacyRoot,
+        probe: () => ++calls === 1 ? 'missing' : 'unknown',
+      });
+      expect(unknown).toEqual({ probe: 'unknown' });
+      expect(calls).toBe(2);
+      expect(process.env.TMUX_TMPDIR).toBe(currentRoot);
+      calls = 0;
+      const inherited = probeTmuxSessionWithLegacyRoot({
+        strict: false, legacyRoot,
+        probe: () => { calls++; return 'missing'; },
+      });
+      expect(inherited).toEqual({ probe: 'missing' });
+      expect(calls).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.TMUX_TMPDIR;
+      else process.env.TMUX_TMPDIR = previous;
+    }
   });
 });
 
