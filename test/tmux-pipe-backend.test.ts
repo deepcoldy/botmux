@@ -1310,6 +1310,60 @@ describe('TmuxPipeBackend.captureViewportAsync', () => {
   });
 });
 
+describe('capture failure observability', () => {
+  function captureError(stderr: string): Error {
+    return Object.assign(new Error(stderr), { status: 1, signal: null, stderr: Buffer.from(stderr) });
+  }
+
+  it.each([
+    ['error connecting to /tmp/tmux-0/private-test (Connection refused)', 'server-unreachable'],
+    ['no server running on /tmp/tmux-0/private-test', 'no-server'],
+    ["can't find pane: 0:2.0", 'pane-missing'],
+  ])('classifies %s without changing the empty capture result', (stderr, kind) => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    mockedExecSync.mockImplementation(() => { throw captureError(stderr); });
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    expect(be.captureViewport()).toBe('');
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const line = String(errSpy.mock.calls[0][0]);
+    expect(line).toContain(`kind=${kind}`);
+    expect(line).toContain('socket=private-test');
+    expect(line).toContain('target=0:2.0');
+    errSpy.mockRestore();
+  });
+
+  it('rate-limits identical errors but logs again after the interval', () => {
+    vi.useFakeTimers();
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    mockedExecSync.mockImplementation(() => { throw captureError('no server running on /tmp/tmux-0/private-test'); });
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    be.captureViewport();
+    be.captureViewport();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(31_000);
+    be.captureViewport();
+    expect(errSpy).toHaveBeenCalledTimes(2);
+    errSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('classifies async capture errors while preserving rejection', async () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      cb(captureError('error connecting to /tmp/tmux-0/private-test (Connection refused)'), '');
+      return {};
+    }) as any);
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    await expect(be.captureViewportAsync()).rejects.toThrow('error connecting');
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(String(errSpy.mock.calls[0][0])).toContain('kind=server-unreachable');
+    errSpy.mockRestore();
+  });
+});
+
 describe('TmuxPipeBackend.getPaneSize', () => {
   it('parses `#{pane_width} #{pane_height}` into {cols, rows}', () => {
     const be = new TmuxPipeBackend('0:2.0');
