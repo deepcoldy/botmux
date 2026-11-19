@@ -69,7 +69,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
+import { join, basename, dirname, delimiter, relative, extname, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
@@ -438,6 +438,7 @@ import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve }
 import {
   readRunningExeIdentity,
   resolveInstallIdentity,
+  sameExecutableObject,
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
@@ -546,6 +547,9 @@ import {
   CODEX_LEAF_SEARCH_DEPTH,
   readComm,
   readCmdline,
+  readCwd,
+  processExecutableArgvSlots,
+  isGenericLauncherComm,
   isNonInteractiveCodexArgv,
   isClaudeMetadataProbeArgv,
   cliIdForComm,
@@ -29303,6 +29307,7 @@ async function spawnCliBody(
   let spawnBin = cfg.cliId === 'codex' && codexCleanupLaunchTarget
     ? codexCleanupLaunchTarget.codexBin : cliAdapter.resolvedBin;
   let spawnArgs = args;
+  let configuredWrapperLaunch: { bin: string; args: string[] } | undefined;
   let spawnCwd = cfg.workingDir;
 
   // Dashboard「复现命令」：在**任何** sandbox 包装（下方 macOS Seatbelt / Linux bwrap /
@@ -30656,6 +30661,7 @@ async function spawnCliBody(
       pathDelimiter: delimiter,
     });
     if (launch.bin) {
+      configuredWrapperLaunch = { bin: launch.bin, args: [...launch.args] };
       spawnBin = launch.bin;
       spawnArgs = launch.args;
       if (launch.env) Object.assign(childEnv as Record<string, string>, launch.env);
@@ -31523,6 +31529,20 @@ async function spawnCliBody(
     // to the leaf. Preserve that here; full sandboxes keep the outer payload.
     const rewireOwnership = credentialOnlyBwrap && !sandboxRequested
       && !!cfg.wrapperCli?.trim() && !!claudeDataDir;
+    const payloadProcStart = rewireOwnership ? readProcessStartIdentity(payloadPid) : undefined;
+    // Only distinctive executable identity proves a persistent wrapper: for an
+    // interpreter launch, that is the script, never the shared interpreter.
+    const distinctiveExecutableArgv = (comm: string | undefined, argv: string[]): string[] => {
+      const slots = processExecutableArgvSlots(comm, argv);
+      return isGenericLauncherComm(comm) ? slots.slice(1) : slots.slice(0, 1);
+    };
+    const wrapperIdentities = rewireOwnership && configuredWrapperLaunch
+      ? distinctiveExecutableArgv(
+          basename(configuredWrapperLaunch.bin),
+          [configuredWrapperLaunch.bin, ...configuredWrapperLaunch.args],
+        ).map(path => resolveInstallIdentity(resolve(spawnCwd, path)))
+        .filter((identity): identity is ExecutableIdentity => identity !== undefined)
+      : [];
     const findLeaf = (lp: number): number | null => findLaunchedCliPid(lp, targetCliId, CODEX_LEAF_SEARCH_DEPTH, {
       // One process-table snapshot per BFS, not one synchronous ps per node.
       childrenOf: snapshotChildPids(),
@@ -31537,7 +31557,23 @@ async function spawnCliBody(
         return comm;
       },
     });
-    const isDirectLeaf = (lp: number): boolean => cliIdForComm(readComm(lp) ?? '', targetCliId) === targetCliId;
+    const isDirectLeaf = (lp: number): boolean => {
+      if (cliIdForComm(readComm(lp) ?? '', targetCliId) !== targetCliId) return false;
+      if (!rewireOwnership) return true;
+      // Comm alone cannot distinguish an exec'd CLI from a same-named persistent
+      // wrapper. Descend only when this exact payload still runs the configured
+      // wrapper binary/script; versioned-native and interpreter-hosted CLIs keep
+      // their direct root, as does any payload with ambiguous identity evidence.
+      if (!payloadProcStart || readProcessStartIdentity(lp) !== payloadProcStart || wrapperIdentities.length === 0) return true;
+      const exe = readRunningExeIdentity(lp, payloadProcStart);
+      if (exe && wrapperIdentities.some(wrapper => sameExecutableObject(exe, wrapper))) return false;
+      const argv = readCmdline(lp, { exact: true });
+      const cwd = readCwd(lp) ?? spawnCwd;
+      return !distinctiveExecutableArgv(exe ? basename(exe.path) : undefined, argv).some(path => {
+        const identity = resolveInstallIdentity(resolve(cwd, path));
+        return identity !== undefined && wrapperIdentities.some(wrapper => sameExecutableObject(identity, wrapper));
+      });
+    };
     let attested: { pid: number; procStart: string; published: boolean } | undefined;
     // A live, successfully published leaf is never sent twice: every actual
     // publication rotates the active turn's capability.
@@ -31557,7 +31593,7 @@ async function spawnCliBody(
     // Ready/input edges retain the repair path after the bounded startup poll;
     // both edges and the poll share the same liveness and deduplication state.
     refreshSandboxedCliLeafAttestation = () => {
-      // The initial attestation already names a direct CLI payload. Never
+      // A proven direct CLI payload was already attested at bind time. Never
       // replace it with a same-comm subagent discovered on a ready/input edge.
       if (isDirectLeaf(payloadPid)) return;
       if (generation !== cliSpawnGeneration || backend !== backendAtSpawn || isAttested(attested?.pid)) return;

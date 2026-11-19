@@ -248,6 +248,11 @@ function launcherExecutableSlots(argv: string[]): string[] {
   return slots;
 }
 
+export function isGenericLauncherComm(comm: string | undefined): boolean {
+  const normalizedComm = comm?.startsWith('.') ? comm.slice(1) : comm;
+  return normalizedComm ? COMM_ARGV_LAUNCHERS.has(normalizedComm) : false;
+}
+
 /** Return only argv positions that can establish executable identity for this
  * process. Generic launchers may carry the script/program after a small,
  * explicitly understood flag prefix; ordinary processes are limited to
@@ -258,10 +263,7 @@ export function processExecutableArgvSlots(
   comm: string | undefined,
   argv: string[],
 ): string[] {
-  const normalizedComm = comm?.startsWith('.') ? comm.slice(1) : comm;
-  return normalizedComm && COMM_ARGV_LAUNCHERS.has(normalizedComm)
-    ? launcherExecutableSlots(argv)
-    : argv.slice(0, 1);
+  return isGenericLauncherComm(comm) ? launcherExecutableSlots(argv) : argv.slice(0, 1);
 }
 
 export function cliIdForComm(
