@@ -193,6 +193,69 @@ describe.skipIf(!runnable)('TRAE ownership when procfs refuses the fd table', ()
     expect(result.afterReadable).toEqual({ probe: 'ok', denial: null, via: 'fd' });
   });
 
+  it('clears both diagnosis layers once the refused process exits and is reaped', async () => {
+    // A bare-pid diagnosis that outlives its process would be read back as the
+    // next process holding that pid's verdict: the terminal unavailable probe
+    // must clear the denial record and the TRAE source alike. The holder is
+    // the reader's own child, so only the reader can reap it and make
+    // /proc/<pid> actually disappear.
+    const reader = `
+      const { spawn } = await import('node:child_process');
+      const { existsSync } = await import('node:fs');
+      const files = await import('./src/utils/process-open-files.js');
+      const t = await import('./src/services/traex-transcript.js');
+      const script = [
+        'import ctypes, sys',
+        'ctypes.CDLL(None).prctl(4, 0, 0, 0, 0)',
+        "print('ready', flush=True)",
+        'sys.stdin.read()',
+      ].join('\\n');
+      const child = spawn('python3', ['-I', '-c', script], { stdio: ['pipe', 'pipe', 'ignore'] });
+      await new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.stdout.once('data', () => resolve(undefined));
+      });
+      const pid = child.pid;
+      const before = files.probeProcessOpenFiles(pid);
+      const hadDenial = files.processOpenFilesDenial(pid) !== undefined;
+      t.findTraexRolloutSetByPid(pid);
+      const hadSource = t.traexProcessFileSource(pid) !== undefined;
+      child.kill('SIGKILL');
+      await new Promise(resolve => child.on('exit', resolve));
+      for (let i = 0; i < 50 && existsSync('/proc/' + pid); i++) {
+        await new Promise(r => setTimeout(r, 20));
+      }
+      const after = files.probeProcessOpenFiles(pid);
+      // The worker's periodic PID probe keeps calling the TRAE finder, which
+      // is what retires the previous process's source record.
+      const setAfter = t.findTraexRolloutSetByPid(pid);
+      console.log(JSON.stringify({
+        beforeStatus: before.status,
+        hadDenial,
+        hadSource,
+        procGone: !existsSync('/proc/' + pid),
+        afterStatus: after.status,
+        setAfter: setAfter === undefined ? 'undefined' : ['size', setAfter.size],
+        denialAfter: files.processOpenFilesDenial(pid) ?? null,
+        sourceAfter: t.traexProcessFileSource(pid) ?? null,
+      }));
+    `;
+    const { command, prefixArgs } = tsRunnerPrefix();
+    const argv = [...dropPtrace, command, ...prefixArgs, ...tsEvalArgs(reader).args];
+    const run = spawnSync(argv[0]!, argv.slice(1), { encoding: 'utf8', timeout: 60_000 });
+    const line = String(run.stdout ?? '').trim().split('\n').filter(l => l.startsWith('{')).pop();
+    if (!line) throw new Error(`reader produced no result: ${String(run.stderr ?? '')}`);
+    const r = JSON.parse(line) as Record<string, unknown>;
+    expect(r.beforeStatus).toBe('denied');
+    expect(r.hadDenial).toBe(true);
+    expect(r.hadSource).toBe(true);
+    expect(r.procGone).toBe(true);
+    expect(r.afterStatus).toBe('unavailable');
+    expect(r.setAfter).toBe('undefined');
+    expect(r.denialAfter).toBeNull();
+    expect(r.sourceAfter).toBeNull();
+  }, 90_000);
+
   it('matches a held lock to a lock file by device, or by TRAE\'s owner record where devices disagree', () => {
     const held = readFileSync('/proc/locks', 'utf8').split('\n')
       .filter(line => procLocksExclusiveHoldsOf(line, targetPid).length > 0);

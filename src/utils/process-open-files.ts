@@ -125,6 +125,7 @@ export function probeProcessOpenFiles(
   opts: ProcessOpenFilesOptions = {},
 ): ProcessOpenFilesProbe {
   if (!Number.isInteger(pid) || pid <= 0) return { status: 'unavailable' };
+  let probe: ProcessOpenFilesProbe;
   if (IS_LINUX) {
     const procfs = probeProcfs(pid, opts);
     if (procfs) {
@@ -133,18 +134,26 @@ export function probeProcessOpenFiles(
     }
     // procfs has no entry for this pid — fall through to lsof.
   }
-  let out: string;
   try {
-    out = execFileSync('lsof', ['-n', '-P', '-p', String(pid), '-Fn'], LSOF_EXEC_OPTIONS);
+    const out = execFileSync('lsof', ['-n', '-P', '-p', String(pid), '-Fn'], LSOF_EXEC_OPTIONS);
+    if (typeof out !== 'string') {
+      probe = { status: 'unavailable' };
+    } else {
+      const targets: string[] = [];
+      for (const line of out.split('\n')) {
+        if (line.startsWith('n/')) targets.push(line.slice(1));
+      }
+      probe = { status: 'ok', targets };
+    }
   } catch {
-    return { status: 'unavailable' };
+    probe = { status: 'unavailable' };
   }
-  if (typeof out !== 'string') return { status: 'unavailable' };
-  const targets: string[] = [];
-  for (const line of out.split('\n')) {
-    if (line.startsWith('n/')) targets.push(line.slice(1));
-  }
-  return { status: 'ok', targets };
+  // Record every terminal state, lsof included: a pid that has exited and been
+  // reaped reaches here as unavailable, and its earlier denial must be cleared
+  // — otherwise a pid reused before its next probe reads the old process's
+  // EACCES.
+  recordProbe(pid, probe);
+  return probe;
 }
 
 /**

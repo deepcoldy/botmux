@@ -1787,6 +1787,14 @@ function recordTraexFileSource(pid: number, source: TraexProcessFileSource): voi
   }
 }
 
+/** Drop the last enumeration of a pid whose procfs entry is gone (exited and
+ *  reaped) or otherwise unreadable. The map is keyed by bare pid with no
+ *  incarnation check, so a stale entry could otherwise be read back as the
+ *  diagnosis of whichever process the kernel later reuses that pid for. */
+function invalidateTraexProcessFileSource(pid: number): void {
+  traexFileSources.delete(pid);
+}
+
 /** The result of the latest enumeration of `pid` by the finders below, for
  *  logs and notices. Undefined before the first one. */
 export function traexProcessFileSource(pid: number): TraexProcessFileSource | undefined {
@@ -1807,7 +1815,13 @@ function traexProcessFileTargets(pid: number): string[] | undefined {
     recordTraexFileSource(pid, { via: 'fd' });
     return probe.targets;
   }
-  if (probe.status !== 'denied') return undefined;
+  if (probe.status !== 'denied') {
+    // Unavailable (the pid has exited and been reaped, or enumeration cannot
+    // run): fail closed and forget the previous process's diagnosis so a pid
+    // reuse cannot inherit it.
+    invalidateTraexProcessFileSource(pid);
+    return undefined;
+  }
   const denial: ProcessOpenFilesDenial = { code: probe.code, stage: probe.stage };
   const scan = scanTraexWriterLocks(pid);
   if (!scan) {
