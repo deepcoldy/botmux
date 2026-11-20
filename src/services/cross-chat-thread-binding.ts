@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
 import type { BridgeSendMarker } from './bridge-fallback-gate.js';
+import { crossChatFollowThreadPath } from './cross-chat-follow-thread-store.js';
 
 export type CrossChatFollowThreadMode = 'at' | 'off';
 
@@ -32,30 +32,30 @@ export interface CrossChatCandidateSession {
 
 const MESSAGE_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
 
-interface CachedTurnSends {
+interface CachedFollowBindings {
   mtimeMs: number;
   size: number;
   markers: BridgeSendMarker[];
 }
 
-const turnSendsCache = new Map<string, CachedTurnSends>();
+const followBindingCache = new Map<string, CachedFollowBindings>();
 const MAX_CACHE_ENTRIES = 512;
 
-function readSessionTurnSendMarkers(dataDir: string, sessionId: string): readonly BridgeSendMarker[] {
-  const filePath = join(dataDir, 'turn-sends', `${sessionId}.jsonl`);
+function readSessionFollowBindings(dataDir: string, sessionId: string): readonly BridgeSendMarker[] {
+  const filePath = crossChatFollowThreadPath(dataDir, sessionId);
   let stat: ReturnType<typeof statSync>;
   try {
     if (!existsSync(filePath)) {
-      turnSendsCache.delete(filePath);
+      followBindingCache.delete(filePath);
       return [];
     }
     stat = statSync(filePath);
   } catch {
-    turnSendsCache.delete(filePath);
+    followBindingCache.delete(filePath);
     return [];
   }
 
-  const cached = turnSendsCache.get(filePath);
+  const cached = followBindingCache.get(filePath);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
     return cached.markers;
   }
@@ -81,11 +81,11 @@ function readSessionTurnSendMarkers(dataDir: string, sessionId: string): readonl
     }
   }
 
-  if (turnSendsCache.size >= MAX_CACHE_ENTRIES && !turnSendsCache.has(filePath)) {
-    const oldestKey = turnSendsCache.keys().next().value;
-    if (oldestKey) turnSendsCache.delete(oldestKey);
+  if (followBindingCache.size >= MAX_CACHE_ENTRIES && !followBindingCache.has(filePath)) {
+    const oldestKey = followBindingCache.keys().next().value;
+    if (oldestKey) followBindingCache.delete(oldestKey);
   }
-  turnSendsCache.set(filePath, {
+  followBindingCache.set(filePath, {
     mtimeMs: stat.mtimeMs,
     size: stat.size,
     markers,
@@ -102,8 +102,8 @@ function readSessionTurnSendMarkers(dataDir: string, sessionId: string): readonl
  *  1. An active thread-scope session in `chatId` itself anchored at one of
  *     `candidateRootIds` always wins (returns `null`).
  *  2. Among active non-listener sessions in other chats (`s.chatId !== chatId`),
- *     scan their durable `turn-sends/<sessionId>.jsonl` markers for a cross-chat
- *     `detoured_send` targeting `chatId` whose `messageId` or
+ *     scan their host-only `cross-chat-follow-thread/<sessionId>.jsonl` bindings
+ *     for a cross-chat `detoured_send` targeting `chatId` whose `messageId` or
  *     `targetRootMessageId` matches a candidate root id.
  *  3. If the latest matching marker for that `(session, canonicalRootId)` did
  *     not opt out (`crossChatFollowThread !== 'off'`), select the match with the
@@ -167,14 +167,15 @@ export function resolveCrossChatFollowedThread(input: {
       continue;
     }
 
-    const markers = readSessionTurnSendMarkers(dataDir, s.sessionId);
+    const markers = readSessionFollowBindings(dataDir, s.sessionId);
     if (markers.length === 0) continue;
 
     // Group by canonical thread root in the target chat so a later --no-follow-thread
     // on the same root can override an earlier marker for that session.
     const latestByCanonicalRoot = new Map<string, BridgeSendMarker>();
     for (const marker of markers) {
-      if (marker.deliveryKind !== 'detoured_send' || marker.targetChatId !== chatId) continue;
+      if (marker.sessionId !== s.sessionId
+        || marker.deliveryKind !== 'detoured_send' || marker.targetChatId !== chatId) continue;
       const matched = (marker.messageId && rootSet.has(marker.messageId))
         || (marker.targetRootMessageId && rootSet.has(marker.targetRootMessageId));
       if (!matched) continue;
@@ -217,6 +218,6 @@ export function resolveCrossChatFollowedThread(input: {
   };
 }
 
-export function __clearCrossChatTurnSendsCacheForTest(): void {
-  turnSendsCache.clear();
+export function __clearCrossChatFollowBindingCacheForTest(): void {
+  followBindingCache.clear();
 }

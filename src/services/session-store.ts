@@ -16,6 +16,7 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
+import { crossChatFollowThreadPath } from './cross-chat-follow-thread-store.js';
 import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
 import { removeCodexModelLaunchReceipt } from './codex-model-selection.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
@@ -2503,6 +2504,7 @@ function findInOtherFiles(sessionId: string): Session | undefined {
 
 export function cleanupSessionBridgeSendMarkersNow(sessionId: string): void {
   try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+  try { unlinkSync(crossChatFollowThreadPath(config.session.dataDir, sessionId)); } catch { /* absent/best effort */ }
 }
 
 export function cleanupSessionBridgeSendMarkers(sessionId: string): void {

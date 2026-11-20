@@ -4,6 +4,7 @@ import {
   buildBridgeSendMarkerContent,
   type BridgeSendMarker,
 } from './bridge-fallback-gate.js';
+import { recordCrossChatFollowThreadBinding } from './cross-chat-follow-thread-store.js';
 
 export interface RecordBridgeReplyMarkerInput {
   dataDir: string;
@@ -56,5 +57,6 @@ export function recordBridgeReplyMarker(input: RecordBridgeReplyMarkerInput): Br
   const markerDir = join(input.dataDir, 'turn-sends');
   if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
   appendFileSync(join(markerDir, `${input.sessionId}.jsonl`), `${JSON.stringify(marker)}\n`);
+  recordCrossChatFollowThreadBinding(input.dataDir, input.sessionId, marker);
   return marker;
 }

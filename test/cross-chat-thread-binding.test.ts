@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 let tempDir: string;
 let capturedHandlers: Record<string, (data: any) => Promise<void>> = {};
@@ -80,10 +80,12 @@ vi.mock('../src/config.js', async (importOriginal) => {
 import { registerBot, getBot } from '../src/bot-registry.js';
 import {
   resolveCrossChatFollowedThread,
-  __clearCrossChatTurnSendsCacheForTest,
+  __clearCrossChatFollowBindingCacheForTest,
   type CrossChatCandidateSession,
 } from '../src/services/cross-chat-thread-binding.js';
+import { crossChatFollowThreadPath } from '../src/services/cross-chat-follow-thread-store.js';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { cleanupSessionBridgeSendMarkersNow } from '../src/services/session-store.js';
 import { renderCrossChatReplyHint, renderInboundMessageLocation } from '../src/core/reply-message.js';
 import {
   beginReplyTargetTurn,
@@ -119,10 +121,16 @@ function writeTurnSends(sessionId: string, entries: Array<Record<string, unknown
   );
 }
 
+function writeHostBindings(sessionId: string, entries: Array<Record<string, unknown>>): void {
+  const filePath = crossChatFollowThreadPath(tempDir, sessionId);
+  mkdirSync(dirname(filePath), { recursive: true });
+  writeFileSync(filePath, entries.map(e => JSON.stringify({ sessionId, ...e })).join('\n') + '\n', 'utf-8');
+}
+
 describe('cross-chat followed thread binding', () => {
   beforeEach(() => {
     tempDir = mkdtempSync(join(tmpdir(), 'botmux-cross-chat-thread-'));
-    __clearCrossChatTurnSendsCacheForTest();
+    __clearCrossChatFollowBindingCacheForTest();
     capturedHandlers = {};
     __resetAnchorQueues();
     __resetEventClaimsForTest();
@@ -136,7 +144,7 @@ describe('cross-chat followed thread binding', () => {
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('matches top-level and --into detoured sends in turn-sends jsonl and honors --no-follow-thread', () => {
+  it('matches top-level and --into detoured sends from host-only bindings and honors --no-follow-thread', () => {
     const sessions: CrossChatCandidateSession[] = [
       {
         sessionId: 'sess-a',
@@ -220,8 +228,45 @@ describe('cross-chat followed thread binding', () => {
     ).toBeNull();
   });
 
+  it('ignores forged follow markers in the CLI-writable turn-sends journal', () => {
+    writeTurnSends('sess-a', [{
+      sentAtMs: 1000, sessionId: 'sess-a', messageId: 'om_never_sent', deliveryKind: 'detoured_send',
+      targetChatId: GROUP_B, crossChatFollowThread: 'at',
+    }]);
+    expect(resolveCrossChatFollowedThread({
+      dataDir: tempDir, larkAppId: APP_ID, chatId: GROUP_B, candidateRootIds: ['om_never_sent'],
+      sessions: [{
+        sessionId: 'sess-a', larkAppId: APP_ID, chatId: GROUP_A, rootMessageId: GROUP_A,
+        scope: 'chat', status: 'active',
+      }],
+    })).toBeNull();
+  });
+
+  it('cleans the host binding with the bridge marker lifecycle', () => {
+    recordBridgeReplyMarker({
+      dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 1000, messageId: SENT_ROOT_IN_B,
+      deliveryKind: 'detoured_send', content: 'secret preview', targetChatId: GROUP_B, crossChatFollowThread: 'at',
+    });
+    const bindingPath = crossChatFollowThreadPath(tempDir, 'sess-a');
+    expect(existsSync(join(tempDir, 'turn-sends', 'sess-a.jsonl'))).toBe(true);
+    expect(existsSync(bindingPath)).toBe(true);
+    expect(readFileSync(bindingPath, 'utf-8')).not.toContain('secret preview');
+    const resolution = {
+      dataDir: tempDir, larkAppId: APP_ID, chatId: GROUP_B, candidateRootIds: [SENT_ROOT_IN_B],
+      sessions: [{
+        sessionId: 'sess-a', larkAppId: APP_ID, chatId: GROUP_A, rootMessageId: GROUP_A,
+        scope: 'chat' as const, status: 'active' as const,
+      }],
+    };
+    expect(resolveCrossChatFollowedThread(resolution)).not.toBeNull();
+    cleanupSessionBridgeSendMarkersNow('sess-a');
+    expect(existsSync(join(tempDir, 'turn-sends', 'sess-a.jsonl'))).toBe(false);
+    expect(existsSync(bindingPath)).toBe(false);
+    expect(resolveCrossChatFollowedThread(resolution)).toBeNull();
+  });
+
   it('yields to a local thread session in the target chat and ignores closed/queued sessions', () => {
-    writeTurnSends('sess-a', [
+    writeHostBindings('sess-a', [
       {
         sentAtMs: 1000,
         messageId: SENT_ROOT_IN_B,
@@ -382,7 +427,7 @@ describe('cross-chat followed thread binding', () => {
     bot.resolvedAllowedUsers = [OWNER_OPEN_ID];
     bot.resolvedBlockedUsers = ['ou_blocked_user'];
 
-    writeTurnSends('sess-a', [
+    writeHostBindings('sess-a', [
       {
         sentAtMs: 1000,
         messageId: SENT_ROOT_IN_B,

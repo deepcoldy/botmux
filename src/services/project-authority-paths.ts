@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { crossChatFollowThreadDir } from './cross-chat-follow-thread-store.js';
 
 export const dispatchTaskDecisionDirectory = (dataDir: string) => join(dataDir, '.dashboard-secret.dispatch-task-decisions');
 
@@ -12,5 +13,6 @@ export function hostAuthorityPaths(dataDir: string): string[] {
     join(dataDir, '.dashboard-secret.project-source-grants'),
     join(dataDir, '.dashboard-secret.project-imports'),
     dispatchTaskDecisionDirectory(dataDir),
+    crossChatFollowThreadDir(dataDir),
   ];
 }
