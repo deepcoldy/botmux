@@ -200,7 +200,7 @@ function restoreUpdatedTaskRow(
   before: ScheduledTask,
   updates: ScheduleUpdateParams,
   appId: string,
-  identityBefore?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'>,
+  identityBefore?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim' | 'ownerAccess'>,
 ): void {
   const patch: Parameters<typeof scheduleStore.updateTask>[1] = {
     preconditionRef: before.preconditionRef,
@@ -248,6 +248,7 @@ function restoreUpdatedTaskRow(
       ownerOpenId: identityBefore.ownerOpenId,
       ownerUnionId: identityBefore.ownerUnionId,
       runAsClaim: identityBefore.runAsClaim,
+      ownerAccess: identityBefore.ownerAccess,
     } : {}),
   }, appId);
 }

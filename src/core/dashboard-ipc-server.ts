@@ -10848,6 +10848,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     grantRequestToOwnerDm: grantPrefs.grantRequestToOwnerDm,
     trustSameOwnerBots: grantPrefs.trustSameOwnerBots,
     grantDelegateBots: grantPrefs.grantDelegateBots,
+    scheduleCreateByTalkers: grantPrefs.scheduleCreateByTalkers,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -11205,6 +11206,7 @@ ipcRoute('PUT', '/api/bot-summary-range', requireBoundBot(async (req, res) => {
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 //   • trustSameOwnerBots: boolean          — 信任同一 owner 的同机 Bot（管理命令 + 点名授权）
 //   • grantDelegateBots: string[]|null     — 委托授权外部 bot 名单（ou_/cli_）；[]/null = 清空
+//   • scheduleCreateByTalkers: boolean     — 允许只能对话的真人为自己创建定时任务（默认关）
 ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
   const raw = await readJsonBodyOrBadJson<unknown>(req, res);
   if (raw === BAD_JSON) return;
@@ -11221,6 +11223,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantDefaultDurationMs?: unknown;
     trustSameOwnerBots?: unknown;
     grantDelegateBots?: unknown;
+    scheduleCreateByTalkers?: unknown;
   };
 
   const patch: {
@@ -11232,12 +11235,14 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantDefaultDurationMs?: number | null;
     trustSameOwnerBots?: boolean;
     grantDelegateBots?: string[];
+    scheduleCreateByTalkers?: boolean;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
   if (typeof body.grantRequestToOwnerDm === 'boolean') patch.grantRequestToOwnerDm = body.grantRequestToOwnerDm;
   if (typeof body.trustSameOwnerBots === 'boolean') patch.trustSameOwnerBots = body.trustSameOwnerBots;
+  if (typeof body.scheduleCreateByTalkers === 'boolean') patch.scheduleCreateByTalkers = body.scheduleCreateByTalkers;
   // null = 清空名单；字符串数组 = 设定名单（store 内 trim/去空白/去重，空名单不写盘）。
   if (body.grantDelegateBots === null) patch.grantDelegateBots = [];
   else if (Array.isArray(body.grantDelegateBots) && body.grantDelegateBots.every((x): x is string => typeof x === 'string')) {

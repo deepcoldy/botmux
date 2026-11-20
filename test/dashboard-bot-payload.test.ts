@@ -67,7 +67,7 @@ describe('dashboard bot payload helpers', () => {
       'summaryRange', 'summaryMemory', 'summaryMemoryPath',
       'regularGroupReplyMode', 'regularGroupMentionMode', 'docSubscribeDefaultMode',
       'substituteMode', 'feedback', 'replyStyle', 'askOptionLayout',
-      'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen', 'grantRequestToOwnerDm',
+      'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen', 'scheduleCreateByTalkers', 'grantRequestToOwnerDm',
       'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
       'envelopeInjection', 'replyDelivery', 'replyDeliveryDefault', 'replyDeliverySupported', 'codexAuthSync', 'triggerUserAuth',
       'skillInjection', 'skillInjectionDefault', 'skillInjectionSupport',
