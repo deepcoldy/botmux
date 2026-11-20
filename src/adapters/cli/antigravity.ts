@@ -187,7 +187,7 @@ export function annotateAntigravityUsageLimit(screen: string, state: CliUsageLim
   return state;
 }
 
-const ANTIGRAVITY_QUOTA_HISTORY_LIMIT = 32;
+export const ANTIGRAVITY_QUOTA_HISTORY_LIMIT = 32;
 
 /** 保留最近首次见到的原生拒绝，重复帧既不改截止时间，也不改变淘汰顺序 */
 export function rememberAntigravityQuota(

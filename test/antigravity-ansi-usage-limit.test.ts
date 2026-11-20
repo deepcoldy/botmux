@@ -3,7 +3,7 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { reconcileUsageLimitState, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
-import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
 
 function classifier(raw: () => string, cliId = 'antigravity') {
   const capture = vi.fn(raw);
@@ -107,14 +107,12 @@ describe('raw ANSI tmux quota classification', () => {
       relativeResetKey: 'usage:60000:first', source: 'antigravity-error-composer',
     };
     let history = rememberAntigravityQuota(undefined, first);
-    for (let index = 0; index < 32; index++) {
-      const key = `usage:60000:${index}`;
+    const newerKeys = Array.from({ length: ANTIGRAVITY_QUOTA_HISTORY_LIMIT }, (_, index) => `usage:60000:${index}`);
+    for (const key of newerKeys) {
       expect(rememberAntigravityQuota(history, { ...first, retryAtMs: 120_000 })).toBe(history);
       history = rememberAntigravityQuota(history, { ...first, relativeResetKey: key });
     }
-    expect(history).toHaveLength(32);
-    expect(history?.[0]?.relativeResetKey).toBe('usage:60000:0');
-    expect(history?.at(-1)?.relativeResetKey).toBe('usage:60000:31');
+    expect(history?.map(entry => entry.relativeResetKey)).toEqual(newerKeys);
   });
 
   it('retains actual working footer authority above a colored historical refusal', () => {
