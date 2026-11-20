@@ -13314,6 +13314,29 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     expect((await fetch(`${base}/api/asks/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"askId":"x","selections":[]}' })).status).toBe(401);
   });
 
+  it('rejects an unsigned owner IPC request before owner resolution without outer auth', async () => {
+    setLarkAppId('cli_owner_without_outer_auth');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/owner`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          actor: 'owner', source: { type: 'webhook' },
+          target: { kind: 'turn', botId: 'cli_owner_without_outer_auth', sessionId: 'fixture-session' },
+          instruction: 'Continue the tests',
+          envelope: { sourceName: 'Example client', format: 'text', trusted: false },
+        }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
   it('readiness barrier: control routes AND /healthz return 503 until ready, without a healthz pre-check', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     setLarkAppId('local_smoke');

@@ -65,7 +65,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
 const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
-const { isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
+const { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
 const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
@@ -606,7 +606,11 @@ describe('target daemon consumes signed message authority', () => {
         return options.member === false ? [] : ['ou_alice_target'];
       },
       publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en',
-      clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
+      clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, allowsPersonalIdentityForTurn, isOwnerActorTurnId,
+      // This harness never configures an ownerOpenId; non-owner turns do not
+      // evaluate the owner-only fence, and an owner fixture would be unresolved.
+      getStrictOwnerOpenId: () => undefined,
+      logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
       // A session whose worker has not reported yet publishes under the
       // fail-closed single default; tests set ds.reportedModel to stage that.
       identityStorageModelForDaemonSession: (session: any) => session.reportedModel ?? 'proven',

@@ -146,6 +146,7 @@ import {
   createDetachedLarkClient,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
+  getStrictOwnerOpenId,
   getBotBrand,
   getDashboardAdminOpenIds,
   findOncallChat,
@@ -686,7 +687,7 @@ import {
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
-import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
 import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
 import { capabilityOfTool } from './core/identity-policy.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -4507,6 +4508,28 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
   if (turnId.startsWith('schedule:')) {
     return prepareScheduledTurnCliIdentity(ds, turnId);
   }
+  if (isOwnerActorTurnId(turnId)) {
+    const prepareKey = JSON.stringify([ds.workerGeneration ?? null, ds.managedTurnOrigin?.dispatchAttempt ?? null]);
+    let preparations = ownerActorIdentityRestores.get(ds);
+    const previous = preparations?.get(turnId);
+    if (previous) {
+      if (previous.key === prepareKey) return previous.work;
+      // Every owner preparation, not only daemon-restart recovery, waits for
+      // an older generation's fence and cleanup before publishing its own.
+      return previous.work.then(() => prepareTurnCliIdentity(ds, turnId), () => prepareTurnCliIdentity(ds, turnId));
+    }
+    const work = refreshTurnCliIdentity(ds, turnId);
+    if (!preparations) ownerActorIdentityRestores.set(ds, preparations = new Map());
+    const entry = { key: prepareKey, work };
+    preparations.set(turnId, entry);
+    const cleanup = () => {
+      if (preparations.get(turnId) !== entry) return;
+      preparations.delete(turnId);
+      if (!preparations.size) ownerActorIdentityRestores.delete(ds);
+    };
+    work.then(cleanup, cleanup);
+    return work;
+  }
   return refreshTurnCliIdentity(ds, turnId);
 }
 
@@ -4697,16 +4720,21 @@ async function handleIdentityDecisionFlip(
   }
 }
 
+/** Owner preparations are serialized per session/turn and generation. */
+const ownerActorIdentityRestores = new WeakMap<DaemonSession, Map<string, { key: string; work: Promise<void> }>>();
+
 /** Proven identity material lives only in daemon memory, so a turn that was
  *  executing when the daemon restarted has none once its re-attached worker
  *  republishes the turn's origin. Before this daemon has published anything
  *  for the session, prepare that turn again through the entry its original
  *  publication used: the schedule authority for a scheduled run, the
- *  session's reply target for a human message. */
+ *  session's reply target for a human message or a resolved owner actor turn. */
 async function restoreTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   if (ds.lastPublishedIdentityModel !== undefined || !triggerUserAuthEnabledFor(ds)
     || identityStorageModelForDaemonSession(ds) !== 'proven'
-    || !(parseScheduledTurnId(turnId) || isHumanInboundTurnId(turnId))
+    // Owner turns are synthetic but carry a daemon-resolved human sender. Other
+    // external triggers stay excluded; publication rechecks allowOwnerActor.
+    || !(parseScheduledTurnId(turnId) || isHumanInboundTurnId(turnId) || isOwnerActorTurnId(turnId))
     || !identityDecisionTurnIsLive(ds, turnId)) return;
   const replay = prepareTurnCliIdentity(ds, turnId);
   if (replay) await trackTurnIdentityPublication(config.session.dataDir, ds.session.sessionId, replay);
@@ -4966,6 +4994,25 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
     || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
     ? undefined : reply?.senderOpenId;
+  const ownerActor = isOwnerActorTurnId(turnId);
+  const ownerPersonalAllowedAtStart = ownerActor && allowsPersonalIdentityForTurn(turnId, botConfig.triggerUserAuth);
+  const ownerOrigin = ownerActor && ds.managedTurnOrigin?.turnId === turnId
+    ? { generation: ds.workerGeneration, dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt }
+    : undefined;
+  const validateBeforeWrite = !ownerActor ? undefined : (): boolean => {
+    let currentBotConfig;
+    try { currentBotConfig = getBot(ds.larkAppId).config; } catch { return false; }
+    if (!allowsPersonalIdentityForTurn(turnId, currentBotConfig.triggerUserAuth)
+      || !turnSenderOpenId || getStrictOwnerOpenId(ds.larkAppId) !== turnSenderOpenId) return false;
+    const turnIsLive = ds.worker
+      ? identityDecisionTurnIsLive(ds, turnId)
+      : ds.session.status === 'active' && !ds.terminalIdentityTurnIds?.has(turnId);
+    if (!turnIsLive) return false;
+    if (ownerOrigin && (ds.workerGeneration !== ownerOrigin.generation
+      || ds.managedTurnOrigin?.turnId !== turnId
+      || ds.managedTurnOrigin.dispatchAttempt !== ownerOrigin.dispatchAttempt)) return false;
+    return true;
+  };
   const outcomes = await publishTurnCliIdentity({
     botConfig,
     sessionDataDir: config.session.dataDir,
@@ -4976,7 +5023,14 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     turnId,
     storageModel: identityModelForPublication(ds),
     privateChat: ds.chatType === 'p2p',
+    ...(validateBeforeWrite ? { validateBeforeWrite } : {}),
   });
+  if (validateBeforeWrite && !validateBeforeWrite()) {
+    // The write fence already removed any partial publication. Clear its
+    // baseline too so a later live origin may retry instead of reusing absence.
+    if (ownerPersonalAllowedAtStart) ds.lastPublishedIdentityModel = undefined;
+    return;
+  }
   // An external or workflow turn is unattended too: credentials in force end its lapse.
   if (turnSenderOpenId && !delegatedIdentity && isUnattendedIdentityTurnId(turnId)) {
     clearRestoredLapses({ appId: ds.larkAppId, openId: turnSenderOpenId, outcomes,
