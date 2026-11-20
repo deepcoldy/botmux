@@ -4905,6 +4905,7 @@ export function clearUsageLimitState(ds: DaemonSession): void {
     throw error;
   }
   cancelComposerRecoveryRetry(ds);
+  cancelUsageLimitPersistRetry(ds);
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
@@ -5044,10 +5045,15 @@ export function restoreUsageLimitRuntimeState(ds: DaemonSession): void {
   armUsageLimitRetryTimer(ds);
 }
 
-function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitState): void {
+function updateUsageLimitState(
+  ds: DaemonSession,
+  usageLimit: CliUsageLimitState | undefined,
+  owns: () => boolean,
+): void {
   if (!usageLimit) return;
   // Even a repeated refusal invalidates earlier recovery evidence.
   cancelComposerRecoveryRetry(ds);
+  cancelUsageLimitPersistRetry(ds);
 
   const previous = ds.usageLimit;
   usageLimit = reconcileUsageLimitState(previous, usageLimit);
@@ -5064,13 +5070,67 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
   ds.usageLimit = usageLimit;
   rememberSessionAntigravityQuota(ds, usageLimit);
   ds.usageLimitPersistPending = true;
-  persistStreamCardState(ds);
+  try {
+    persistStreamCardState(ds);
+  } catch (error) {
+    // The current frame is valid evidence even when its write fails. Keep the
+    // runtime projection and give THIS refusal its own durable retry owner;
+    // otherwise cancelling the old proof leaves no writer for the new key.
+    retryUsageLimitPersistence(ds, previous, owns);
+    logger.warn(`[${tag(ds)}] Usage-limit persistence deferred: ${String(error)}`);
+    return;
+  }
   ds.usageLimitPersistPending = false;
   armUsageLimitRetryTimer(ds, previous);
 }
 
 function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
   return limit?.source === 'antigravity-error-composer' && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
+}
+
+const usageLimitPersistRetries = new WeakMap<DaemonSession, {
+  timer: ReturnType<typeof setTimeout>;
+  owns: () => boolean;
+}>();
+
+function cancelUsageLimitPersistRetry(ds: DaemonSession): void {
+  const pending = usageLimitPersistRetries.get(ds);
+  if (pending) clearTimeout(pending.timer);
+  usageLimitPersistRetries.delete(ds);
+}
+
+/** Persist a newly accepted refusal without depending on another identical
+ * frame. Success re-arms the deadline owner; stale workers and later episodes
+ * lose the write, while a newer clear cancels it at the same choke point. */
+function retryUsageLimitPersistence(
+  ds: DaemonSession,
+  previous: CliUsageLimitState | undefined,
+  owns: () => boolean,
+): void {
+  if (usageLimitPersistRetries.get(ds)?.owns()) return;
+  cancelUsageLimitPersistRetry(ds);
+  const key = ds.usageLimit && usageLimitStateKey(ds.usageLimit);
+  let delayMs = 500;
+  const schedule = (): void => {
+    const timer = setTimeout(() => {
+      if (usageLimitPersistRetries.get(ds)?.timer !== timer) return;
+      usageLimitPersistRetries.delete(ds);
+      if (!owns() || !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+      try {
+        persistStreamCardState(ds);
+        armUsageLimitRetryTimer(ds, previous);
+        ds.usageLimitPersistPending = false;
+      } catch (error) {
+        ds.usageLimitPersistPending = true;
+        delayMs = Math.min(delayMs * 2, 30_000);
+        logger.warn(`[${tag(ds)}] Usage-limit persistence retry: ${String(error)}`);
+        schedule();
+      }
+    }, delayMs);
+    timer.unref();
+    usageLimitPersistRetries.set(ds, { timer, owns });
+  };
+  schedule();
 }
 
 const composerRecoveryRetries = new WeakMap<DaemonSession, {
@@ -5093,6 +5153,7 @@ function retryComposerRecovery(
   owns: () => boolean,
 ): void {
   const { status } = frame;
+  cancelUsageLimitPersistRetry(ds);
   const pending = composerRecoveryRetries.get(ds);
   if (pending?.owns()) return;
   cancelComposerRecoveryRetry(ds);
@@ -5102,7 +5163,11 @@ function retryComposerRecovery(
     const timer = setTimeout(() => {
       if (composerRecoveryRetries.get(ds)?.timer !== timer) return;
       composerRecoveryRetries.delete(ds);
-      if (!owns() || !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+      // Losing live ownership invalidates the proof, except for an already
+      // committed close: its second-stage clear still owes the SAME key's
+      // durable cleanup, and dropping it would resurrect the limit on resume.
+      const committedCloseCleanup = ds.session.status === 'closed';
+      if ((!owns() && !committedCloseCleanup) || !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
       try {
         clearUsageLimitState(ds);
       } catch (error) {
@@ -8700,7 +8765,15 @@ export function killWorker(
   }
   restartCoordinator.cancelSession(ds.session.sessionId);
   resetStartingCardHealth(ds);
-  clearUsageLimitState(ds);
+  try {
+    clearUsageLimitState(ds);
+  } catch (error) {
+    // closeSession has already committed the closed row at this point. Retain
+    // the second-stage clear even without an earlier recovery proof, but only
+    // while the session remains closed; a resume must not inherit a stale clear.
+    if (ds.session.status === 'closed') retryComposerRecovery(ds, { status: 'idle' }, () => false);
+    throw error;
+  }
   ds.workerReady = false;
   // The CLI process dies with this worker — no prompt is ready any more.
   ds.cliReady = false;
@@ -23601,7 +23674,7 @@ function setupWorkerHandlers(
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
         const prevLabel = streamCardLabel(ds);
         const prevActivity = typeof prevLabel === 'object' && 'activity' in prevLabel ? prevLabel.activity : undefined;
-        updateUsageLimitState(ds, msg.usageLimit);
+        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = projectedScreenStatus;
         workersWithScreenStatus.add(worker);
@@ -24059,7 +24132,7 @@ function setupWorkerHandlers(
         }
         const prevStatus = ds.lastScreenStatus;
         const previousLimit = ds.usageLimit;
-        updateUsageLimitState(ds, msg.usageLimit);
+        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg, ownsLifecycleMutation);
         workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);

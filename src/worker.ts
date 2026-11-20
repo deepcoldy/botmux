@@ -17930,8 +17930,11 @@ async function captureAndUpload(): Promise<void> {
       if (pipeResult) {
         // Same ANSI on a resized canvas is a different picture.
         usageLimitContent = pipeResult.content;
-        usageAware = classifyScreenUsageLimit(pipeResult.content, projectedRuntimeScreenStatus());
         pixelHash = `${pipeResult.cols}x${pipeResult.rows}:${pipeResult.ansi}`;
+        // Other CLIs never emit this recovery signal: preserve their original
+        // zero-classification fast path for unchanged pixels.
+        if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
+        usageAware = classifyScreenUsageLimit(pipeResult.content, projectedRuntimeScreenStatus());
         const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
@@ -17946,8 +17949,9 @@ async function captureAndUpload(): Promise<void> {
         const startY = term.buffer.active.baseY;
         const snap = renderer.rawSnapshot();
         usageLimitContent = snap;
-        usageAware = classifyScreenUsageLimit(snap, projectedRuntimeScreenStatus());
         pixelHash = createHash('md5').update(snap).digest('hex');
+        if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
+        usageAware = classifyScreenUsageLimit(snap, projectedRuntimeScreenStatus());
         const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;

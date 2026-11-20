@@ -198,6 +198,24 @@ describe('raw ANSI tmux quota classification', () => {
     expect(capture).not.toHaveBeenCalled();
   });
 
+  it('rejects a non-empty draft that ends with the exact placeholder suffix', () => {
+    const screen = quota + `\nError ID: ${id}` + composer
+      + '> explain this shortcut (shift+tab to cycle)\n────\n? for shortcuts';
+    expect(isAntigravityReadyComposerScreen(screen)).toBe(false);
+  });
+
+  it.each([
+    '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)',
+    '> Accept-edits mode: file edits auto-approved (shift+tab to cycle)',
+    '> Plan mode: research & plan only (shift+tab to cycle)',
+    '> Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)',
+  ])('accepts an exact empty placeholder split across terminal rows: %s', placeholder => {
+    const splitAt = 23;
+    const folded = `${placeholder.slice(0, splitAt)}\n${placeholder.slice(splitAt)}`;
+    const screen = quota + `\nError ID: ${id}` + composer + `${folded}\n────\n? for shortcuts`;
+    expect(isAntigravityReadyComposerScreen(screen)).toBe(true);
+  });
+
   it.each([
     '> drafted next request\n────\n? for shortcuts',
     '>\n────\n? for shortcuts\nnew output after the footer',
