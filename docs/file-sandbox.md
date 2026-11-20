@@ -168,8 +168,8 @@ Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`s
 
 ## Claude 的 per-bot 账号（`credentialsSourceDir`）
 
-默认所有沙盒 bot 共用本机登录的同一个 Claude 账号（每次冷启动把全局凭证写进
-`<BOTMUX_HOME>/bots/<larkAppId>/claude`）。要让不同 bot 用不同账号，给 bot 配一个
+默认所有 bot 共用本机登录的同一个 Claude 账号：沙盒 bot 每次冷启动把全局凭证写进
+`<BOTMUX_HOME>/bots/<larkAppId>/claude`，非沙盒 bot 直接用全局 `~/.claude`。要让不同 bot 用不同账号，给 bot 配一个
 凭证来源目录，目录下按 CLI 分子目录：
 
 ```json
@@ -197,7 +197,20 @@ Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`s
   `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN`、
   Bedrock/Vertex/Foundry 开关或 `apiKeyHelper`；与 `codexAuthSync: "isolated"` 同配。
 - 持久后端（tmux 等）的存活 pane 若是用别的来源启动的，会被杀掉并冷启动，不会复用。
-- 完全没开沙盒的 bot 不生效（仅打 WARN），仍用全局登录；未配置该字段的 bot 行为不变。
+- 没开沙盒的 `claude-code` bot 也生效：配了该字段就和 Codex `codexAuthSync: "isolated"`
+  一样，把 CLI 数据目录重定向到 `<BOTMUX_HOME>/bots/<larkAppId>/claude`（只换数据目录，
+  不加任何文件读写限制），再按上面的规则复制凭证；无法重定向（设了 `wrapperCli`、缺
+  `SESSION_DATA_DIR`）时拒绝启动，与沙盒 bot 一致。CLI 不在支持清单时仍只打 WARN、继续用
+  全局登录。未配置该字段的 bot 行为不变。
+- 一直用全局 `~/.claude` 的非沙盒 bot 切过来时要注意，per-bot 目录与沙盒 bot 的规则相同，
+  **不是**全局目录的副本：
+  - 已有会话的转写/记忆不会迁移，续接旧会话会退化为新会话（需要的话先把
+    `~/.claude/projects/<cwd 对应目录>` 拷到新目录再切）；
+  - `settings.json` 只继承 `env`，顶层 `permissions`、`hooks`、`enabledPlugins`、`model`、
+    `statusLine` 等都不继承；
+  - `~/.claude` 下的 `CLAUDE.md`、`skills`、`agents`、`commands`、`plugins` 不会带过去；
+  - `.claude.json` 按「全局减去 `projects`」seed 一次；
+  - 和沙盒 bot 一样关闭 turn recap；`/g` 一次性标题也不会用全局登录去跑，保留占位名。
 - **token 刷新不归 botmux 管**：外部脚本负责刷新来源目录里的凭证（必须赶在 CLI 自己
   刷新之前），并 suspend 使用该账号的 bot 让其冷启动取新凭证。
 - 修改某个 bot 的 `credentialsSourceDir`（或换掉它背后的账号）前，先 suspend 该 bot 的

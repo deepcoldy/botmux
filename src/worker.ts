@@ -897,6 +897,7 @@ import {
   claudeAuthOverridesInSettingsLayers,
   claudeStateAuthOverrides,
   planCredentialSource,
+  credentialSourceForcesBotHome,
   readCredentialSource,
   readCredentialSourceStamp,
   reconcileClaudeAccountState,
@@ -2697,6 +2698,9 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
 let consecutiveInWorkerRestarts = 0;
 /** The last CLI exit was the tmux server being lost, not the CLI (see restart-fresh-budget.ts). */
 let lastCliExitServerReplaced = false;
+/** In-flight inputs the current spawn re-queued from the previous CLI's exit;
+ *  reported once at its first prompt (`inflight_requeued`). */
+let requeuedInflightAtSpawn = 0;
 let tmuxRestartTimer: NodeJS.Timeout | null = null;
 /** Guard: the scratch "submounts over the overlay limit" notice is sent once
  *  per worker, not on every CLI respawn. */
@@ -9820,6 +9824,7 @@ function deliverRestartInterruptionNote(): void {
   log(`Restart interruption note ${delivered ? 'queued for the resumed CLI' : 'not deliverable — notice only'}`);
   send({
     type: 'user_notify',
+    kind: 'restart_interruption',
     message: restartInterruptionNotice(work, { cliName: cliName(), noteDelivered: delivered }),
     ...(noticeTurnId ? { turnId: noticeTurnId } : {}),
   });
@@ -22226,6 +22231,16 @@ function markPromptReady(): void {
     if (resumedStarted > 0) log(`Resumed conversation already holds ${resumedStarted} started input(s); not re-delivering them`);
     // Before the flush below, so the note lands as this CLI's first input.
     deliverRestartInterruptionNote();
+    if (requeuedInflightAtSpawn > 0) {
+      // Informational: the daemon shows it only on a backend-outage card (the
+      // outcome of the turn the outage cut); ordinary restarts stay silent.
+      send({
+        type: 'inflight_requeued',
+        count: requeuedInflightAtSpawn,
+        message: t('worker.inflight_requeued', { count: requeuedInflightAtSpawn, cliName: cliName() }),
+      });
+      requeuedInflightAtSpawn = 0;
+    }
   }
   sandboxWrapperAwaitingFirstPrompt = undefined;
   // Kimi: publish the finished turn's last activity before its idle edge.
@@ -26402,6 +26417,7 @@ async function spawnCliBody(
   // don't own — never replay into it.
   if (!cfg.adoptMode) {
     const carry = inflightInputs.takeCarryOver();
+    requeuedInflightAtSpawn = carry.length;
     if (carry.length > 0) {
       pendingMessages.unshift(...carry);
       log(`Re-queued ${carry.length} in-flight message(s) lost to CLI exit`);
@@ -27486,7 +27502,8 @@ async function spawnCliBody(
         : probePersistentSession(effectiveBackendType as PersistentBackendType, name))
   );
   // BOT_HOME CLI-data redirect: sandboxed bots whose adapter supports it, plus
-  // Codex bots explicitly requesting isolated auth, keep their CLI data
+  // Codex bots explicitly requesting isolated auth and Claude bots with a
+  // credentialsSourceDir, keep their CLI data
   // (transcripts/memory/auth) in their own BOT_HOME via
   // CLAUDE_CONFIG_DIR/CODEX_HOME — under deny-by-default the global ~/.claude|
   // ~/.codex are simply not exposed. Best-effort: a non-supporting adapter
@@ -27501,9 +27518,16 @@ async function spawnCliBody(
   if (scratchRequested && isolatedCodexHomeRequested) {
     throw new Error('codexAuthSync "isolated" cannot be combined with sandbox "scratch" (scratch uses the native CLI home)');
   }
+  // An unsandboxed bot with its own credential source needs its own Claude
+  // data root too, or there is nothing to copy the source into.
+  const credentialSourceHomeRequested = legacyHomePolicy && credentialSourceForcesBotHome({
+    sourceDir: cfg.credentialsSourceDir,
+    cliId: cfg.cliId,
+    sandboxRequested,
+  });
   const willRedirectCliData = !scratchRequested && legacyHomePolicy && shouldRedirectCliData({
     sandboxRequested,
-    forcePerBotHome: isolatedCodexHomeRequested,
+    forcePerBotHome: isolatedCodexHomeRequested || credentialSourceHomeRequested,
     supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
     wrapperCli: cfg.wrapperCli,
     sessionDataDir: process.env.SESSION_DATA_DIR,
@@ -32659,6 +32683,9 @@ async function spawnCliBody(
       intentionalRestart,
       backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
     });
+    // Same evidence, for the daemon: an exit caused by losing the shared tmux
+    // server joins ONE backend outage instead of counting as a CLI crash.
+    const serverLoss = intentionalRestart ? undefined : observedBackend.exitedBecauseServerLost?.();
     if (codexAutoUpgrade) {
       backend = null;
       revokePromptReadiness();
@@ -32857,6 +32884,7 @@ async function spawnCliBody(
     } else {
       const sandboxNamespace = code !== 0 ? sandboxNamespaceDiagnosis(logTail) : undefined;
       send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt,
+        ...(serverLoss ? { backendLost: { backend: 'tmux' as const, ...serverLoss } } : {}),
         ...(lastInitConfig?.cliId === 'traex' ? { traexStartupFailure: freshCliNeverReady() } : {}),
         ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
     }
@@ -39265,7 +39293,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // onExit so transient (auto-restarted) exits never pay for it. Mark the
       // stopped state even if the tmux park fails, so the next message still
       // retries the CLI (no hang) rather than writing into a dead pane.
-      parkCrashDiagnosticTerminal(lastCliExitCode, lastCliExitSignal);
+      if (msg.terminal !== false) parkCrashDiagnosticTerminal(lastCliExitCode, lastCliExitSignal);
       crashDiagnosticStopped = true;
       break;
     }

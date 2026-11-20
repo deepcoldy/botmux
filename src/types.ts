@@ -2289,7 +2289,9 @@ type DaemonToWorkerBase =
   // Crash loop: daemon gave up auto-restarting and asks the worker to park a
   // diagnostic shell (bmx-diag-<sid>) preserving the last output. Deferred from
   // onExit so transient auto-restarted exits don't park-then-tear-down.
-  | { type: 'park_diagnostic' }
+  // `terminal: false` (backend-outage give-up): only stop and wait for the next
+  // message; do not create the bmx-diag shell on a tmux server that just failed.
+  | { type: 'park_diagnostic'; terminal?: boolean }
   | {
       type: 'tui_keys';
       keys: string[];
@@ -2750,6 +2752,11 @@ export type WorkerToDaemonBase =
     codexAppActiveWriter?: boolean;
     /** Linux bwrap sandbox could not create this namespace on this host. */
     sandboxNamespace?: 'pid' | 'user';
+    /** The CLI did not exit on its own: the shared tmux server holding its
+     *  pane was lost (crash / kill / replaced / unreachable). The daemon
+     *  handles every such exit of one server as ONE backend outage
+     *  (backend-outage-coordinator.ts), outside the per-session crash loop. */
+    backendLost?: { backend: 'tmux'; kind: 'replaced' | 'gone' | 'unreachable'; socketName?: string };
     turnId?: string;
     dispatchAttempt?: number;
   }
@@ -2878,6 +2885,10 @@ export type WorkerToDaemonBase =
    *  worker process; undefined turnId/attempt is a meaningful tuple. Not an
    *  input receipt: input_received/input_committed keep their own semantics. */
   | { type: 'capture_identity'; revision: number; turnId?: string; dispatchAttempt?: number }
+  /** Not a user notice: inputs the previous CLI had not finished were
+   *  re-queued to this one. The daemon shows it only on a backend-outage
+   *  status card (the outcome of the turn the outage cut). */
+  | { type: 'inflight_requeued'; count: number; message: string }
   | { type: 'user_notify'; message: string; turnId?: string; dispatchAttempt?: number; /** Identifies the Codex App no-progress nudge so the daemon can apply the
       * per-bot `noProgressNotify.enabled` mute against the LIVE registry (an
       * already-stalled turn is silenced immediately, no worker round-trip). */
@@ -2896,7 +2907,11 @@ export type WorkerToDaemonBase =
          *  the FACT on every demotion; the daemon decides whether to speak
          *  (per-session latch + history gate) and composes the copy. A worker
          *  is reforked on every `/restart`, so it cannot own that latch. */
-        | 'resume_fallback';
+        | 'resume_fallback'
+        /** A resumed CLI reported what the previous process left unfinished
+         *  (restart-interruption.ts). During a backend outage the daemon folds
+         *  it into the topic's single outage status card. */
+        | 'restart_interruption';
       /** Bounded plain-text bottom of the screen for an input_not_submitted
        *  notice (core/stuck-page-catalog stuckScreenTail). The daemon renders
        *  the notice as a card with this text; absent = plain text as before. */

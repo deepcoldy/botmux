@@ -435,6 +435,10 @@ describe('oneShotTitleAllowed (/g auto title runs on the host)', () => {
     expect(oneShotTitleAllowed({ cliId: 'codex', codexAuthSync: 'isolated' })).toBe(false);
     expect(oneShotTitleAllowed({ cliId: 'codex', codexInstancePool: { instances: [] } })).toBe(false);
     expect(oneShotTitleAllowed({ cliId: 'codex', codexAuthSync: 'shared' })).toBe(true);
+    // A per-bot account source: the one-shot would run on the shared login instead.
+    expect(oneShotTitleAllowed({ cliId: 'claude-code', sandbox: 'off', credentialsSourceDir: '/acc/b' })).toBe(false);
+    expect(oneShotTitleAllowed({ cliId: 'claude-code', credentialsSourceDir: 'rel/b' })).toBe(false);
+    expect(oneShotTitleAllowed({ cliId: 'claude-code', credentialsSourceDir: '  ' })).toBe(true);
   });
 
   it('refuses on a host with mandatory device-credential isolation', () => {

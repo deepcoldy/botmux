@@ -1069,6 +1069,9 @@ import {
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { failedTurnRewindInFlight, mergeFailedTurnInput, planFailedTurnRewind, turnAnswersInChat } from './failed-turn-rewind.js';
 import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
+import { BackendOutageCoordinator, recoveryEligibility, type BackendOutageDeps, type BackendOutageTimings } from './backend-outage-coordinator.js';
+import { buildBackendOutageCard, formatBackendOutageSummary } from './backend-outage-card.js';
+import { probeTmuxServerUp } from '../adapters/backend/tmux-pipe-backend.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
@@ -1375,6 +1378,8 @@ export interface WorkerPoolCallbacks {
   onOwnerDiagnostic?: (ds: DaemonSession, diagnostic: WorkerOwnerDiagnostic) => void;
   /** Exact store-owning app, including boot with no live sessions. */
   larkAppId?: string;
+  /** One plain-text message to the bot owner's DM (backend-outage summary). */
+  notifyOwner?: (larkAppId: string, content: string) => Promise<unknown>;
   /** Host memory diagnostics go to the bot owner, independently of turn replies. */
   onMemoryAdmissionBlocked?: (ds: DaemonSession, decision: WorkerAdmissionDecision) => void;
   onTurnResult?: (result: Readonly<TurnResult>) => void | Promise<void>;
@@ -5879,6 +5884,13 @@ export function evaluateScreenshotFrame(
   return { ok: true, source };
 }
 
+/** Count actual high-water replacements, not fence evaluations: write admission
+ * can coalesce multiple attempt IPCs before a restored PATCH's first beforeWrite. */
+const turnDispatchAttemptHighWaterTransitions = new WeakMap<DaemonSession, number>();
+function turnDispatchAttemptHighWaterTransition(ds: DaemonSession): number {
+  return turnDispatchAttemptHighWaterTransitions.get(ds) ?? 0;
+}
+
 /** Raise the per-turn dispatch-attempt high-water mark (never lowers it for
  * the same turn; a different turn replaces it). Authority-free bookkeeping. */
 export function noteTurnDispatchAttempt(
@@ -5890,6 +5902,7 @@ export function noteTurnDispatchAttempt(
   const current = ds.turnDispatchAttemptHighWater;
   if (current?.turnId === turnId && current.dispatchAttempt >= dispatchAttempt) return;
   ds.turnDispatchAttemptHighWater = { turnId, dispatchAttempt };
+  turnDispatchAttemptHighWaterTransitions.set(ds, turnDispatchAttemptHighWaterTransition(ds) + 1);
 }
 
 /** A frame that passed the current worker's source + target + suppression
@@ -7377,28 +7390,57 @@ function reconcilePublishedStartingCardTerminal(ds: DaemonSession, turnId: strin
   const terminalStatus = ds.lastTurnTerminalStatus;
   if (!terminalStatus || !startingCardTurnTerminalCurrent(ds, turnId)) return false;
   const terminalAttempt = ds.lastTurnTerminalDispatchAttempt;
-  cancelPostTerminalStatusSettle(ds);
+  // A receipt for an earlier render must not suppress correction of this newly
+  // published starting render. Keep a snapshot for rollback, but detach it while
+  // attempting the replacement; an accepted completed correction installs its
+  // own receipt synchronously and that NEW receipt must survive for live-work
+  // repaint handoff. Non-completed scheduleCardPatch clears the old receipt itself.
+  const previousSettle = postTerminalCardSettles.get(ds);
   postTerminalCardSettles.delete(ds);
+  // A fresh starting publication is already complete. Clear its pending marker
+  // before attempting the correction, and only cancel the original settle once
+  // the replacement was accepted. On rejection, restore both so the normal
+  // post-terminal path can still deliver the idle state later.
+  const pending = ds.streamCardPending;
+  const pendingTurnId = ds.streamCardPendingTurnId;
+  const previousFailedIdleTurnId = ds.failedIdleTurnId;
+  const previousCompletedIdleTurnId = ds.completedIdleTurnId;
+  ds.streamCardPending = false;
+  ds.streamCardPendingTurnId = undefined;
+  let accepted = false;
   if (terminalStatus === 'completed') {
     // The late starting render is itself proof of a busy display. Do not require
     // a worker frame to have populated lastScreenStatus before correcting it.
-    settleStaleBusyCardStatus(ds, turnId, 'late-starting-publication', false, undefined, true);
-    return true;
+    accepted = settleStaleBusyCardStatus(ds, turnId, 'late-starting-publication', false, undefined, true);
+  } else {
+    if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
+      ds.failedIdleTurnId = turnId;
+      ds.completedIdleTurnId = undefined;
+    }
+    accepted = scheduleCardPatch(ds, buildStreamingCardJson(ds, terminalStatus === 'cancelled' ? 'interrupted' : 'idle'), turnId, {
+      owns: () => startingCardTurnTerminalCurrent(ds, turnId)
+        && ds.lastTurnTerminalStatus === terminalStatus
+        && ds.lastTurnTerminalDispatchAttempt === terminalAttempt,
+    });
   }
-  // A late starting publication must not erase an already-accepted non-completed
-  // terminal either. Preserve the existing display vocabulary instead of using
-  // the completed-only idle settle: cancellation is interrupted; failure and
-  // ambiguity use idle with the established failed label. Execution state and
-  // the ordinary post-terminal sweep semantics are deliberately untouched.
-  if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
-    ds.failedIdleTurnId = turnId;
-    ds.completedIdleTurnId = undefined;
+  if (accepted) {
+    cancelPostTerminalStatusSettle(ds);
+  } else {
+    // Drop a rejected replacement receipt, then restore the exact pre-attempt
+    // display state. In particular, do not erase an already-established failure label.
+    postTerminalCardSettles.delete(ds);
+    if (previousSettle) postTerminalCardSettles.set(ds, previousSettle);
+    ds.streamCardPending = pending;
+    ds.streamCardPendingTurnId = pendingTurnId;
+    if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
+      ds.failedIdleTurnId = previousFailedIdleTurnId;
+      ds.completedIdleTurnId = previousCompletedIdleTurnId;
+    }
   }
-  scheduleCardPatch(ds, buildStreamingCardJson(ds, terminalStatus === 'cancelled' ? 'interrupted' : 'idle'), turnId, {
-    owns: () => startingCardTurnTerminalCurrent(ds, turnId)
-      && ds.lastTurnTerminalStatus === terminalStatus
-      && ds.lastTurnTerminalDispatchAttempt === terminalAttempt,
-  });
+  // accepted only controls cancellation of the ORIGINAL settle. It must not
+  // decide whether this terminalized publication gets a NEW watchdog: current
+  // terminal evidence is sufficient to suppress re-arming even when live work
+  // rejects the idle correction itself.
   return true;
 }
 
@@ -8115,19 +8157,21 @@ const pendingStreamingCardPatchFence = new WeakMap<DaemonSession, () => boolean>
 const pendingStreamingCardPatchSettlement = new WeakMap<DaemonSession, (delivered: boolean) => void>();
 
 /** A starting publication can straddle the first numeric attempt announced for
- * its own turn. That transition completes the publication identity; it is not a
- * retry. Any transition away from an already-known attempt (or to another turn)
- * keeps the strict object-identity fence and invalidates the older write. */
+ * its own turn. Exactly one high-water replacement after capture completes the
+ * publication identity; a second replacement is a retry and invalidates the write. */
 function streamCardAttemptHighWaterStillCurrent(
   ds: DaemonSession,
   atCapture: DaemonSession['turnDispatchAttemptHighWater'],
   turnId: string | undefined,
   allowFirstAttemptForTurn: boolean,
+  atCaptureTransition: number,
 ): boolean {
   const current = ds.turnDispatchAttemptHighWater;
   if (current === atCapture) return true;
   if (!allowFirstAttemptForTurn || !turnId || current?.turnId !== turnId) return false;
-  return atCapture?.turnId !== turnId;
+  // A known attempt at capture is never a first attempt for this turn.
+  if (atCapture?.turnId === turnId) return false;
+  return turnDispatchAttemptHighWaterTransition(ds) === atCaptureTransition + 1;
 }
 
 /** An enqueued render belongs to the captured card and route. Closing a
@@ -8148,6 +8192,7 @@ function captureStreamingCardPatchFence(
   const generation = ds.workerGeneration ?? session.workerGeneration;
   const currentTurnId = ds.currentTurnId;
   const attemptHighWater = ds.turnDispatchAttemptHighWater;
+  const attemptHighWaterTransition = turnDispatchAttemptHighWaterTransition(ds);
   const runtimeKey = activeSessionKey(ds);
   return () => ds.session === session && ds.session.sessionId === sessionId && ds.session.status === status
     && ds.larkAppId === appId && ds.chatId === chatId && sessionAnchorId(ds) === anchor
@@ -8161,7 +8206,7 @@ function captureStreamingCardPatchFence(
         && (ds.workerGeneration ?? ds.session.workerGeneration) === generation
         && ds.currentTurnId === currentTurnId
         && streamCardAttemptHighWaterStillCurrent(
-          ds, attemptHighWater, turnId, opts?.allowFirstAttemptForTurn === true));
+          ds, attemptHighWater, turnId, opts?.allowFirstAttemptForTurn === true, attemptHighWaterTransition));
 }
 
 /**
@@ -8590,6 +8635,7 @@ export function killWorker(
     return;
   }
   restartCoordinator.cancelSession(ds.session.sessionId);
+  resetStartingCardHealth(ds);
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // The CLI process dies with this worker — no prompt is ready any more.
@@ -8677,6 +8723,7 @@ export function killWorker(
  */
 export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void {
   restartCoordinator.cancelSession(ds.session.sessionId);
+  resetStartingCardHealth(ds);
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // SIGTERM below makes the worker killCli() — the CLI prompt is gone.
@@ -8708,6 +8755,7 @@ function clearTransferWorkerState(
   reason: string,
 ): void {
   restartCoordinator.cancelSession(ds.session.sessionId);
+  resetStartingCardHealth(ds);
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // The transfer detaches this worker/CLI pair; the replacement must re-prove
@@ -9443,6 +9491,173 @@ export function requestSessionRestart(
 export function __testOnly_resetRestartCoordinator(): void {
   topicEffortRestartReadiness.clear();
   restartCoordinator.reset();
+}
+
+/**
+ * Keep a crash-stopped worker around as a diagnostic: it parks a tmux shell
+ * showing the last startup output and respawns the CLI itself on the next
+ * message. Shared by the crash-loop give-up and the backend-outage give-up.
+ */
+function parkCrashDiagnosticWorker(ds: DaemonSession, opts: { terminal?: boolean } = {}): void {
+  // Ask the worker to park a lightweight tmux diagnostic shell under
+  // bmx-diag-<sid> NOW (deferred from its exit so transient restarts
+  // don't pay for it). Keep its web server alive so the existing
+  // terminal URL can show the startup failure; the next user message
+  // tells that same worker to destroy the diagnostic shell and retry.
+  ds.workerReady = false;
+  // The worker now holds a parked diagnostic shell and will respawn the
+  // CLI itself on the next message (no restart IPC in that path), so the
+  // next message must carry the current launch model. Cleared once a
+  // worker generation reports ready again.
+  ds.crashDiagnosticParked = true;
+  ds.worker!.send({ type: 'park_diagnostic', ...(opts.terminal === false ? { terminal: false } : {}) } as DaemonToWorker);
+  restartCounts.delete(ds.session.sessionId);
+  const crashPrevScreenStatus = ds.lastScreenStatus;
+  ds.lastScreenStatus = 'idle';
+  stampIdleSinceAt(ds, crashPrevScreenStatus);
+  // Diagnostic park keeps the worker alive (no killWorker here), so the
+  // periodic usage refresh must be stopped explicitly on this
+  // working→idle boundary — the else branch's killWorker already does.
+  clearUsageRefreshTimer(ds);
+  // Survive a daemon restart: mark this as a deliberate lazy
+  // cold-resume. Restore keeps ANY managed session with a 'missing'
+  // backing active regardless (re-spawns the CLI on the next
+  // message) since the host-reboot fix, so this marker records the
+  // parked state (dormant label + skip redundant probes) rather than
+  // gating the keep. ds.hasHistory is already true (set at the top of
+  // claude_exit); forkWorker clears suspendedColdResume on re-spawn.
+  ds.session.suspendedColdResume = true;
+  sessionStore.updateSession(ds.session);
+}
+
+function backendOutageDeps(): BackendOutageDeps<DaemonSession> {
+  return {
+    now: () => Date.now(),
+    setTimeout: (fn, ms) => {
+      const handle = setTimeout(fn, ms);
+      handle.unref?.();
+      return handle;
+    },
+    clearTimeout: handle => clearTimeout(handle as NodeJS.Timeout),
+    // Through the restart coordinator like every crash auto-restart, so the
+    // attempt-correlated restart_result lifts the workerReady fence.
+    restart: (ds, onSettled) => requestSessionRestart(ds, {
+      source: 'cli_crash',
+      notify: status => {
+        if (status !== 'in_progress') onSettled(status);
+      },
+    }) !== undefined,
+    serverUp: socketName => probeTmuxServerUp(socketName),
+    eligible: ds => recoveryEligibility({
+      active: ds.session.status === 'active',
+      current: !activeSessionsRegistry || activeSessionsRegistry.get(activeSessionKey(ds)) === ds,
+      transferring: isSessionTransferring(ds),
+      // Idle reclaim, a tmux switch fan-out or a crash-diagnostic park put it
+      // to sleep on purpose: restarting (or reforking) it would undo that, and
+      // forkWorker clears the marker. Its next real message resumes it.
+      dormant: ds.session.suspendedColdResume === true,
+    }),
+    externalRecoveryInFlight: ds => {
+      if (ds.session.status !== 'active' || ds.session.suspendedColdResume || ds.crashDiagnosticParked) return false;
+      // A cancelled outage restart may be superseded by a refork, transfer or
+      // another correlated restart. The readiness flags cover the short gap
+      // after the old worker's retirement releases and before the replacement
+      // reports process-ready, as well as the later process-ready → CLI-prompt
+      // window; the grace in the coordinator bounds the wait if no replacement
+      // actually exists.
+      return isSessionTransferring(ds)
+        || lifecycleRetiringWorkers.has(ds)
+        || restartCoordinator.activeAttemptId(ds.session.sessionId) !== undefined
+        || ds.workerReady === false
+        || ds.cliReady === false;
+    },
+    giveUp: (ds, { keepTerminal }) => {
+      ds.managedTurnOrigin = undefined;
+      if (ds.worker && !ds.worker.killed) {
+        // Keep the worker: inputs that arrived during the outage stay queued
+        // in it, and the next message restarts the CLI (crash-loop contract).
+        parkCrashDiagnosticWorker(ds, { terminal: keepTerminal });
+      } else {
+        const prev = ds.lastScreenStatus;
+        ds.lastScreenStatus = 'idle';
+        stampIdleSinceAt(ds, prev);
+        killWorker(ds);
+      }
+      // The interrupted turn's streaming card must not stay "working".
+      scheduleActiveRuntimePatch(ds);
+    },
+    render: (ds, view) => buildBackendOutageCard(view, botLocale(getBot(ds.larkAppId).config)),
+    post: async (ds, cardJson, uuid) => callbacks?.sessionReply(
+      sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId,
+      fallbackTurnId(ds, undefined), { sourceSessionId: ds.session.sessionId, uuid },
+    ),
+    patch: async (ds, messageId, cardJson) => {
+      await updateMessage(ds.larkAppId, messageId, cardJson);
+    },
+    patchIsFinal: err => err instanceof MessageWithdrawnError || err instanceof MessageUpdateExpiredError,
+    summarize: async summary => {
+      let botName = summary.larkAppId;
+      let locale;
+      try {
+        const bot = getBot(summary.larkAppId);
+        botName = bot.botName ?? summary.larkAppId;
+        locale = botLocale(bot.config);
+      } catch { /* bot deregistered meanwhile: keep the app id */ }
+      await callbacks?.notifyOwner?.(summary.larkAppId, formatBackendOutageSummary(summary, botName, locale));
+    },
+    log: line => logger.warn(`[backend-outage] ${line}`),
+  };
+}
+
+/** Socket a managed session's pane lives on, as the worker recorded it. */
+function managedTmuxSocketOf(ds: DaemonSession): string | undefined | null {
+  const target = ds.session.persistentBackendTarget;
+  return target?.backendType === 'tmux' ? target.socketName : null;
+}
+
+/** Pre-loss evidence that another managed backend could have kept this tmux
+ *  server non-empty. A persisted registry row alone is not evidence: suspended
+ *  cold-resume and worker-less sessions have no pane. Parked workers are also
+ *  excluded conservatively (terminal:false has no diagnostic shell); ambiguity
+ *  then stays on the ordinary CLI-exit path. */
+function hasLiveManagedBackendForGone(ds: DaemonSession): boolean {
+  const worker = ds.worker;
+  if (!worker || worker.killed || worker.connected === false || worker.exitCode != null || worker.signalCode != null) return false;
+  return !ds.session.suspendedColdResume && !ds.crashDiagnosticParked;
+}
+
+/**
+ * Whether a `gone` server (nobody listens on the socket) is a real loss of a
+ * shared server. tmux shuts an EMPTY server down cleanly, so a lone session
+ * whose own CLI exited 0 leaves the very same `gone` behind. A server that
+ * still held another session of ours cannot have ended that way: if another
+ * active session with a live managed backend lives on the socket, the server
+ * was lost with sessions in it. Otherwise the exit is treated as the CLI's own
+ * (ordinary crash handling, which also restarts it). An old outage's existence
+ * alone is NOT current evidence: its members may since have gone cold too.
+ */
+function goneServerCorroborated(ds: DaemonSession, socketName: string | undefined): boolean {
+  if (!activeSessionsRegistry) return false;
+  for (const other of activeSessionsRegistry.values()) {
+    if (other === ds || other.session.status !== 'active') continue;
+    const socket = managedTmuxSocketOf(other);
+    if (socket !== null && (socket ?? '') === (socketName ?? '') && hasLiveManagedBackendForGone(other)) return true;
+  }
+  return false;
+}
+
+/** Every CLI exit caused by losing a shared tmux server goes here instead of
+ *  the per-session crash loop (see backend-outage-coordinator.ts). */
+let backendOutage = new BackendOutageCoordinator<DaemonSession>(backendOutageDeps());
+
+/** Test seam: a fresh coordinator, optionally with fake I/O and timings. */
+export function __testOnly_resetBackendOutage(
+  overrides: Partial<BackendOutageDeps<DaemonSession>> = {},
+  timings: Partial<BackendOutageTimings> = {},
+): BackendOutageCoordinator<DaemonSession> {
+  backendOutage.reset();
+  backendOutage = new BackendOutageCoordinator<DaemonSession>({ ...backendOutageDeps(), ...overrides }, timings);
+  return backendOutage;
 }
 
 /**
@@ -12413,6 +12628,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   armWorkerKillBackstop(w, tag(ds));
 
   ds.worker = null;
+  resetStartingCardHealth(ds);
   ds.workerReady = false;
   // The CLI is destroyed by the suspend; the cold resume brings a new one.
   ds.cliReady = false;
@@ -20914,6 +21130,11 @@ function setupWorkerHandlers(
     dispatchAttempt?: number,
   ): Promise<void> => {
     if (startupState.failureNotified) return;
+    // Backend-outage recovery owns this session's restarts and its one card.
+    if (backendOutage.onStartupFailure(ds.session.sessionId, reason)) {
+      logger.warn(`[${t}] Startup failure folded into the backend outage recovery: ${reason}`);
+      return;
+    }
     // Restart recovery (daemon restart batch-restore): stay silent in the chat.
     // Without this guard every restored session whose worker fails to start
     // posts a "会话启动失败" card into its own topic — a broadcast storm during
@@ -22403,19 +22624,20 @@ function setupWorkerHandlers(
                 throw new Error('Restored card no longer owns delivery');
               }
             } });
-            if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
+            const ownsRestoredDelivery = ownsLifecycleMutation() && ownsRestoredCard();
+            if (initStatus === 'starting' && healthTurnId && ownsRestoredDelivery) {
+              // The admitted write has completed. Reconcile newer execution evidence
+              // before backing out on a post-write attempt fence: otherwise the stale
+              // starting render remains the last visible write even though working won.
+              reconcilePostedStartingCard(ds, healthTurnId, statusRevisionAtRestore);
+            }
+            if (!ownsRestoredDelivery || !ownsRestoredWrite()) break;
             ds.parkedStreamCardNonce = undefined;
             // Verified: the persisted exact current card id/nonce accepted
             // this PATCH, so it is the publication proof for this route.
             rememberPublishedStreamingCardIdentity(ds, restoredCardId);
             // Restored existing card: follows live (never bound to a past turn).
             bindStreamCardDisplayTarget(ds, restoredCardId);
-            if (initStatus === 'starting' && healthTurnId) {
-              // A newer status may have landed while the older starting PATCH
-              // was in flight. Re-assert it even after terminal: an idle frame
-              // is just as important as working when delivery order is reversed.
-              reconcilePostedStartingCard(ds, healthTurnId, statusRevisionAtRestore);
-            }
             if (initStatus === 'starting' && healthTurnId) {
               armPublishedStartingCardHealth(ds, healthTurnId, restoredCardId, healthyAtRestore);
             }
@@ -22711,7 +22933,22 @@ function setupWorkerHandlers(
         // and wait for the NEXT set instead of trusting a stale `true`.
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
+        const recoveringParkedDiagnostic = ds.crashDiagnosticParked === true;
+        if (recoveringParkedDiagnostic) {
+          // The next-message retry respawns INSIDE the existing worker, so no
+          // process-level ready or attempt-correlated restart_result will
+          // release the fence lowered by parkCrashDiagnosticWorker. Its first
+          // prompt is the authoritative successful recovery edge and also the
+          // authorized in-place resume of the cold-resume marker.
+          ds.workerReady = true;
+          ds.crashDiagnosticParked = undefined;
+          if (ds.session.suspendedColdResume) {
+            ds.session.suspendedColdResume = undefined;
+            sessionStore.updateSession(ds.session);
+          }
+        }
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
+        backendOutage.onPromptReady(ds.session.sessionId);
         // 到了 prompt 不等于恢复健康：CLI 可能每收到一条（被重投的）输入就退出，
         // 在这里清零会让熔断永远不触发。只记下本轮崩溃后首次 ready 的时间，ready
         // 后稳定存活满一个窗口再崩溃才算新一轮——一次历史性永久退出（127/77）因此
@@ -22721,17 +22958,9 @@ function setupWorkerHandlers(
           restartStreak.readyAt = Date.now();
           logger.info(`[${t}] CLI ready after ${restartStreak.count} crash(es); the restart streak resets only if it stays up`);
         }
-        // A live prompt means a (re)spawn reached a working CLI — clear the lazy
-        // cold-resume marker set when we parked a crash diagnostic shell. The
-        // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
-        // forkWorker, so without this the stale marker survives in the store and a
-        // LATER genuine zombie (bmx-<sid> actually gone) would be kept active by
-        // restore instead of being closed. If retry never reaches a prompt the
-        // marker persists, preserving the cross-daemon-restart lazy-retry intent.
-        if (ds.session.suspendedColdResume) {
-          ds.session.suspendedColdResume = undefined;
-          sessionStore.updateSession(ds.session);
-        }
+        // Deliberate cold suspension is NOT cleared by an arbitrary late prompt:
+        // only forkWorker admission or the authorized parked in-place retry
+        // above may clear it. Otherwise prompt_ready merely observes the CLI.
         if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
           const rawInput = ds.pendingRawInput;
           ds.pendingRawInput = undefined;
@@ -24234,6 +24463,8 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
+        // Read before any later step can move the screen state.
+        const turnRunningAtExit = ds.lastScreenStatus === 'working';
         // The original opted-in turn has no dispatchAttempt, so worker.ts's
         // durable-delivery terminal path cannot report its CLI exit. Bind the
         // exit here to the exact live turn + worker generation. Synthetic
@@ -24454,6 +24685,29 @@ function setupWorkerHandlers(
           // Explicit /close and daemon shutdown already own the user-visible
           // lifecycle. Only an unexpected backend exit needs recovery guidance.
           if (!retirementPhase && !suppressExitUi) {
+            // Process-only retirement also clears the starting-card watchdog.
+            // Install a real terminal display so the card cannot remain "starting"
+            // forever when no working frame ever arrived.
+            if (isRealStreamingCardId(ds.streamCardId)) {
+              const exitSession = ds.session;
+              const exitCardId = ds.streamCardId;
+              const exitGeneration = ds.workerGeneration ?? ds.session.workerGeneration;
+              postTerminalCardSettles.delete(ds);
+              scheduleCardPatch(ds, buildStreamingCardJson(ds, 'idle'), msg.turnId, {
+                onSettled: delivered => {
+                  if (delivered) return;
+                  // A replacement ready PATCH bypasses the legacy card queue. If this
+                  // old idle already passed beforeWrite but loses ownership afterwards,
+                  // reassert the replacement's current state after the stale write lands.
+                  queueMicrotask(() => {
+                    const currentGeneration = ds.workerGeneration ?? ds.session.workerGeneration;
+                    if (ds.session !== exitSession || ds.streamCardId !== exitCardId) return;
+                    if (currentGeneration === exitGeneration || !ds.workerReady || !ds.worker) return;
+                    scheduleCardPatch(ds, buildStreamingCardJson(ds), ds.currentTurnId);
+                  });
+                },
+              });
+            }
             try {
               await scopedReply(tr('cmd.restart.remote_unsupported', undefined, loc), 'text', undefined);
             } catch (replyErr) {
@@ -24463,6 +24717,48 @@ function setupWorkerHandlers(
               }
             }
           }
+          break;
+        }
+
+        // The CLI did not fail: the shared tmux server holding its pane was
+        // lost, and every session on that server is reporting the same thing.
+        // One backend outage, handled once (backend-outage-coordinator.ts):
+        // no crash-loop count, no per-session crash notice, a single server
+        // recovery, one status card per topic and one owner summary.
+        const serverLost = msg.backendLost
+          && (msg.backendLost.kind !== 'gone' || goneServerCorroborated(ds, msg.backendLost.socketName));
+        if (msg.backendLost && !serverLost) {
+          logger.info(
+            `[${t}] tmux server ${msg.backendLost.socketName ?? 'default'} is gone but held no other session of ours; `
+            + 'treating it as the CLI\'s own exit',
+          );
+        }
+        if (msg.backendLost && serverLost) {
+          logger.warn(
+            `[${t}] ${sessionCliDisplayName(ds, botCfg)} lost its tmux server `
+            + `(${msg.backendLost.kind}); handing it to the backend outage recovery`,
+          );
+          backendOutage.onServerLost(ds, ds.session.sessionId, {
+            larkAppId: ds.larkAppId,
+            ...(msg.backendLost.socketName !== undefined ? { socketName: msg.backendLost.socketName } : {}),
+            kind: msg.backendLost.kind,
+            cliName: sessionCliDisplayName(ds, botCfg),
+            title: ds.session.title || ds.currentTurnTitle || '',
+            turnInFlight: turnRunningAtExit,
+            canPark: !!msg.canParkDiagnostic,
+            silent: suppressExitUi,
+          });
+          break;
+        }
+        // A session still being recovered from such an outage: its recovery
+        // restart reports the outcome to the outage coordinator, which decides
+        // on another attempt or gives up — never the crash loop.
+        if (backendOutage.onCliExit(ds.session.sessionId, {
+          code: msg.code,
+          ...(msg.logTail ? { logTail: msg.logTail } : {}),
+          canPark: !!msg.canParkDiagnostic,
+        })) {
+          logger.warn(`[${t}] CLI exited during backend outage recovery (code: ${msg.code}); the outage recovery owns its restart`);
           break;
         }
 
@@ -24513,35 +24809,7 @@ function setupWorkerHandlers(
             scheduleCardPatch(ds, frozenCard);
           }
           if (keepDiagnosticWorker) {
-            // Ask the worker to park a lightweight tmux diagnostic shell under
-            // bmx-diag-<sid> NOW (deferred from its exit so transient restarts
-            // don't pay for it). Keep its web server alive so the existing
-            // terminal URL can show the startup failure; the next user message
-            // tells that same worker to destroy the diagnostic shell and retry.
-            ds.workerReady = false;
-            // The worker now holds a parked diagnostic shell and will respawn the
-            // CLI itself on the next message (no restart IPC in that path), so the
-            // next message must carry the current launch model. Cleared once a
-            // worker generation reports ready again.
-            ds.crashDiagnosticParked = true;
-            ds.worker!.send({ type: 'park_diagnostic' } as DaemonToWorker);
-            restartCounts.delete(key);
-            const crashPrevScreenStatus = ds.lastScreenStatus;
-            ds.lastScreenStatus = 'idle';
-            stampIdleSinceAt(ds, crashPrevScreenStatus);
-            // Diagnostic park keeps the worker alive (no killWorker here), so the
-            // periodic usage refresh must be stopped explicitly on this
-            // working→idle boundary — the else branch's killWorker already does.
-            clearUsageRefreshTimer(ds);
-            // Survive a daemon restart: mark this as a deliberate lazy
-            // cold-resume. Restore keeps ANY managed session with a 'missing'
-            // backing active regardless (re-spawns the CLI on the next
-            // message) since the host-reboot fix, so this marker records the
-            // parked state (dormant label + skip redundant probes) rather than
-            // gating the keep. ds.hasHistory is already true (set at the top of
-            // claude_exit); forkWorker clears suspendedColdResume on re-spawn.
-            ds.session.suspendedColdResume = true;
-            sessionStore.updateSession(ds.session);
+            parkCrashDiagnosticWorker(ds);
           } else {
             // Non-tmux or failed diagnostic parking: keep the historical
             // cleanup path so we do not leave an unusable worker around.
@@ -24629,6 +24897,9 @@ function setupWorkerHandlers(
 
       case 'error': {
         logger.error(`[${t}] Worker error: ${msg.message}`);
+        // A start failure while recovering from a backend outage belongs to
+        // that recovery: it decides on a retry and shows it on the topic card.
+        if (backendOutage.onStartupFailure(ds.session.sessionId, msg.message)) break;
         // `error` is a fatal launch-generation signal. It normally arrives
         // during init, but can also follow a previously-ready worker whose CLI
         // recovery/restart fails; that later failure must remain user-visible —
@@ -25076,6 +25347,17 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'inflight_requeued': {
+        // Re-queued in-flight inputs only matter as the outcome of a turn a
+        // backend outage cut: shown on its card, never as a message or an
+        // attention event of its own (ordinary restarts stay as they were).
+        logger.info(`[${t}] ${msg.message}`);
+        if (ds.worker === worker && !managedAuxUiSuppressed(undefined, undefined)) {
+          backendOutage.absorbNotice(ds.session.sessionId, msg.message);
+        }
+        break;
+      }
+
       case 'user_notify': {
         if (msg.kind === 'resume_fallback') {
           // The worker reports the demotion FACT on every occurrence; the
@@ -25108,6 +25390,8 @@ function setupWorkerHandlers(
               message: msg.message,
             }),
             send: async notice => {
+              // During a backend outage the topic's one status card says it.
+              if (backendOutage.absorbNotice(ds.session.sessionId, notice)) return;
               await sendTurnNotice(ds, {
                 kind: 'user_notify',
                 turnId: fallbackTurnId(ds, msg.turnId),
@@ -25124,6 +25408,11 @@ function setupWorkerHandlers(
           reason: 'user_notify',
           message: msg.message,
         });
+        // What a resumed CLI lost to a backend outage goes on the topic's one
+        // outage status card instead of a separate message.
+        if (msg.kind === 'restart_interruption'
+            && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
+            && backendOutage.absorbNotice(ds.session.sessionId, msg.message)) break;
         // The card already asks about this dialog. Fork agents and sessions
         // without the hook get no card and keep this notice.
         if (msg.kind === 'claude_permission_prompt') {
