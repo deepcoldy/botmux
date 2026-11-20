@@ -8,7 +8,7 @@
  *      bun test test/sandbox-relay-session-tool.test.ts
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -327,13 +327,31 @@ describe('readVerifiedFile (host packaging of quoted attachments)', () => {
     writeFileSync(good, 'GOOD');
     const info = lstatSync(good);
     expect(readVerifiedFile(good, info).toString()).toBe('GOOD');
+    // Pre-build the replacement while the validated file still holds its
+    // inode: two coexisting regular files must have distinct inodes. This has
+    // to happen before good is removed — on Linux ext4/tmpfs a just-freed
+    // inode is reallocated to the next create in an otherwise-empty directory,
+    // so an rm + recreate can legitimately keep the same (dev, ino).
+    const other = join(dir, 'b.png');
+    writeFileSync(other, 'SECRET');
+    expect(lstatSync(other).ino).not.toBe(info.ino);
+    // A hard link keeps the validated inode alive at another path.
+    const hardCopy = join(dir, 'hard.png');
+    linkSync(good, hardCopy);
     // swapped for a symlink to the withheld credential
     const secret = join(dir, 'send-cred.json');
     writeFileSync(secret, 'SECRET');
     rmSync(good); symlinkSync(secret, good);
     expect(() => readVerifiedFile(good, info)).toThrow();
-    // swapped for a different regular file (hard copy, new inode)
-    rmSync(good); writeFileSync(good, 'SECRET');
+    // swapped for the pre-built regular file; rename carries its own inode.
+    rmSync(good);
+    renameSync(other, good);
+    expect(() => readVerifiedFile(good, info)).toThrow();
+    // A symlink must be refused even when its target satisfies the inode
+    // identity (the hard link shares the validated inode): O_NOFOLLOW is the
+    // only guard that rejects the link itself rather than its target's inode.
+    rmSync(good);
+    symlinkSync(hardCopy, good);
     expect(() => readVerifiedFile(good, info)).toThrow();
   });
 });
