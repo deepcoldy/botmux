@@ -65,11 +65,18 @@ export type AssistantAdmission =
  *  - 其余（开模式前跑过的存量会话、主人已变、群未认领）→ reject。 */
 export function decideAssistantAdmission(
   larkAppId: string,
-  s: { chatId: string; chatType: 'group' | 'p2p'; ownerOpenId?: string; assistantOwnerOpenId?: string; everRan: boolean },
+  s: {
+    chatId: string; chatType: 'group' | 'p2p'; ownerOpenId?: string; assistantOwnerOpenId?: string; everRan: boolean;
+    /** 会话的沙盒形态已冻结、但没冻结「不放 Bot 密钥」（开模式前就冻结了）——这种会话不能起。 */
+    sandboxFrozenWithoutWithhold: boolean;
+  },
 ): AssistantAdmission {
   const spawn = resolveAssistantSpawn(larkAppId, s.chatId, s.chatType, s.ownerOpenId);
   if (spawn.kind === 'off') return { kind: 'allow' };
   const expected = spawn.kind === 'owner' ? spawn.openId : undefined;
+  if (s.sandboxFrozenWithoutWithhold) {
+    return { kind: 'reject', ...(s.assistantOwnerOpenId ? { have: s.assistantOwnerOpenId } : {}), ...(expected ? { expected } : {}) };
+  }
   if (s.assistantOwnerOpenId) {
     return s.assistantOwnerOpenId === expected
       ? { kind: 'allow' }

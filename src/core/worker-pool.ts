@@ -19582,6 +19582,7 @@ function forkWorkerPrepared(
       ownerOpenId: ds.session.ownerOpenId,
       assistantOwnerOpenId: ds.session.assistantOwnerOpenId,
       everRan: ds.hasHistory || !!ds.session.cliSessionId,
+      sandboxFrozenWithoutWithhold: ds.session.sandbox !== undefined && ds.session.sandboxWithholdBotSecret !== true,
     });
     if (decision.kind === 'adopt') {
       ds.session.assistantOwnerOpenId = decision.openId;
@@ -19595,6 +19596,17 @@ function forkWorkerPrepared(
       // 当前归属重新建会话。本条消息丢弃，由用户重发。
       logger.warn(`[${tag(ds)}] assistant-mode: refusing to fork — session owner ${decision.have ?? '(none)'} vs resolved ${decision.expected ?? '(none)'}; retiring session`);
       reportAdmission('rejected');
+      // 告诉用户这条没处理、要重发（否则消息静默丢失）。
+      const retiredTurnId = fallbackTurnId(ds, initTurnId);
+      const retiredNotice = tr('worker.assistant.session_retired', {}, botLocale(botCfg));
+      if (opts.onAdmissionBlocked) {
+        opts.onAdmissionBlocked({ content: retiredNotice, ...(retiredTurnId ? { turnId: retiredTurnId } : {}) });
+      } else if (prompt.length > 0 || initTurnId) {
+        void cb.sessionReply(sessionAnchorId(ds), retiredNotice, 'text', ds.larkAppId, retiredTurnId,
+          { sourceSessionId: ds.session.sessionId }).catch(error => logger.error(
+            `[${tag(ds)}] assistant-mode: failed to report retired session: ${String(error)}`,
+          ));
+      }
       void closeSessionForBackgroundCleanup(ds.session.sessionId, 'assistant-mode owner mismatch').catch(err =>
         logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
       return false;

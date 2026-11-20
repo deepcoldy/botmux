@@ -648,6 +648,7 @@ export const messages: Record<string, string> = {
   'cmd.secretary.not_enabled': '⚠️ The group secretary is not enabled for this bot. The owner needs to turn on "Group secretary" under Session mode in the Dashboard bot settings (or /botconfig set groupSecretaryEnabled on).',
   'cmd.secretary.status_paused': 'I am registered as this group\'s secretary, but the group secretary switch is off for this bot, so I am not watching or patrolling right now. Turning it back on in the Dashboard resumes; if it is no longer needed, @me /secretary off.',
   'cmd.assistant.disabled': '⚠️ This bot does not have personal-assistant mode (assistantMode) enabled.',
+  'worker.assistant.session_retired': '⚠️ This conversation was started before personal-assistant mode was enabled (or before the owner changed) and has been closed. Your last message was not processed — please send it again and I will continue in a new conversation.',
   'cmd.assistant.p2p': 'In a DM I am already your assistant — nothing to claim. /assistant is for groups.',
   'cmd.assistant.status': 'Assistant owner of this group: {owner}',
   'cmd.assistant.unclaimed': 'This group is unclaimed. Reply /assistant claim to make me your assistant; a bot admin can also assign it with /assistant owner @someone.',

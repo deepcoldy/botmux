@@ -98,13 +98,18 @@ describe('v3 workflow', () => {
 });
 
 describe('decideAssistantAdmission (worker launch gate)', () => {
-  const g = (o: Partial<{ chatType: 'group' | 'p2p'; ownerOpenId: string; assistantOwnerOpenId: string; everRan: boolean }>) =>
-    decideAssistantAdmission('cli_app', { chatId: 'oc_g', chatType: 'group', everRan: false, ...o });
+  const g = (o: Partial<{ chatType: 'group' | 'p2p'; ownerOpenId: string; assistantOwnerOpenId: string; everRan: boolean; sandboxFrozenWithoutWithhold: boolean }>) =>
+    decideAssistantAdmission('cli_app', { chatId: 'oc_g', chatType: 'group', everRan: false, sandboxFrozenWithoutWithhold: false, ...o });
   it('a never-run session created by a path that did not stamp an owner is adopted by the chat owner, cwd in their work dir', () => {
     state.stored = A;
     expect(g({ ownerOpenId: B })).toEqual({ kind: 'adopt', openId: A, workDir: join(root, 'bots', 'cli_app', 'users', A, 'work') });
-    expect(decideAssistantAdmission('cli_app', { chatId: 'oc_dm', chatType: 'p2p', ownerOpenId: B, everRan: false }))
+    expect(decideAssistantAdmission('cli_app', { chatId: 'oc_dm', chatType: 'p2p', ownerOpenId: B, everRan: false, sandboxFrozenWithoutWithhold: false }))
       .toMatchObject({ kind: 'adopt', openId: B });
+  });
+  it('a sandbox shape frozen before the mode (secret not withheld) is never launched, adopted or owned', () => {
+    state.stored = A;
+    expect(g({ sandboxFrozenWithoutWithhold: true })).toMatchObject({ kind: 'reject', expected: A });
+    expect(g({ assistantOwnerOpenId: A, sandboxFrozenWithoutWithhold: true })).toMatchObject({ kind: 'reject', have: A });
   });
   it('a session that already ran before the mode was enabled is not adopted', () => {
     state.stored = A;

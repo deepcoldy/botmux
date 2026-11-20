@@ -646,6 +646,7 @@ export const messages: Record<string, string> = {
   'cmd.secretary.not_enabled': '⚠️ 本 bot 还没有开放群秘书。需要 owner 先在 Dashboard 机器人配置的「会话模式」里打开「群秘书」（或 /botconfig set groupSecretaryEnabled on）。',
   'cmd.secretary.status_paused': '本群秘书登记的是我，但本 bot 的群秘书开关已关闭，现在不旁听也不巡检。在 Dashboard 重新打开即恢复；不再需要可 @我 /secretary off。',
   'cmd.assistant.disabled': '⚠️ 这个机器人没有开启个人助理模式（assistantMode）。',
+  'worker.assistant.session_retired': '⚠️ 这个会话是开启个人助理模式前、或换主人前建的，已结束。刚才这条没有处理，请重新发一次，我会在新会话里接着做。',
   'cmd.assistant.p2p': '私聊里我就是你的助理，不需要认领。/assistant 只在群里用。',
   'cmd.assistant.status': '本群助理主人：{owner}',
   'cmd.assistant.unclaimed': '本群还没有认领。回复 /assistant claim 让我成为你的助理；bot 管理员也可以用 /assistant owner @某人 指定。',
