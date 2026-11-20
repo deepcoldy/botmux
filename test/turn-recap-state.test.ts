@@ -1,7 +1,7 @@
 /**
  * Keeping the「本轮回顾」panel on the latest turn's last card in step with
- * what is known: the turn's facts when its card settles, the CLI's own recap
- * when it arrives, and the optional model recap after a quiet stretch.
+ * the CLI's own recap of that turn: nothing when the card settles, the panel
+ * once the CLI recaps the turn, updated in place by a later recap.
  *
  * The card side is an in-memory CardKit card with the semantics observed on
  * live cards: an insert of an id the card already has is refused with
@@ -15,20 +15,17 @@ import {
   noteRecapCard,
   noteRecapTurnStarted,
   recapIdle,
-  RECAP_MODEL_IDLE_MS,
   type RecapIo,
 } from '../src/core/turn-recap-state.js';
 import { serializeCardWrite } from '../src/core/card-element-writes.js';
 import { buildNextStepElement, NEXT_STEP_ELEMENT_ID } from '../src/im/lark/next-step-card.js';
 import { buildCardBodyElements, buildReplyCardFooterElements, createReplyCard } from '../src/im/lark/md-card.js';
 import { TURN_RECAP_ELEMENT_ID } from '../src/im/lark/turn-recap-card.js';
-import { claudeAwaySummaryText, type RecapFacts } from '../src/services/turn-recap.js';
+import { claudeAwaySummaryText } from '../src/services/turn-recap.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const away = readFileSync(resolve('test/fixtures/turn-recap/claude-away-summary.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
 const SUMMARY = claudeAwaySummaryText(away[1])!;
-const FACTS: RecapFacts = { files: ['src/utils/terminal-cells.ts'], commands: 1, lastCommand: 'git log --oneline -1 HEAD' };
-const INPUT = { facts: FACTS, modelPrompt: 'Language: Simplified Chinese\n\nTurn record:\nTool Bash: git log' };
 
 function session(): DaemonSession {
   return { session: { sessionId: 'sess-recap-0001' }, larkAppId: 'cli_app', chatId: 'oc_chat', currentTurnId: undefined } as unknown as DaemonSession;
@@ -41,8 +38,6 @@ function harness(over: Partial<RecapIo> = {}) {
   const writes: Write[] = [];
   const attempts = { insert: 0 };
   const warnings: string[] = [];
-  const modelPrompts: string[] = [];
-  const modelAnswers: Array<(text: string | undefined) => void> = [];
   const send = (messageId: string) => {
     cards.set(messageId, createReplyCard([
       ...buildCardBodyElements('最终答复'),
@@ -53,8 +48,6 @@ function harness(over: Partial<RecapIo> = {}) {
   const panelOf = (messageId: string) => cards.get(messageId)?.body.elements.find((element: any) => element.element_id === TURN_RECAP_ELEMENT_ID);
   const io: RecapIo = {
     enabled: () => true,
-    modelEnabled: () => false,
-    showFacts: () => true,
     locale: () => 'zh',
     readCard: async (_ds, messageId) => JSON.stringify(cards.get(messageId)),
     cardId: async (_ds, messageId) => `card_${messageId}`,
@@ -77,23 +70,13 @@ function harness(over: Partial<RecapIo> = {}) {
       card.body.elements[index] = element;
       writes.push({ op: 'replace', messageId, sequence, markdown: (element as any).elements[0].content });
     },
-    modelRecap: async (_ds, prompt) => {
-      modelPrompts.push(prompt);
-      return new Promise(resolve => { modelAnswers.push(resolve); });
-    },
-    setTimer(run, ms) {
-      const timer = setTimeout(run, ms);
-      return () => clearTimeout(timer);
-    },
     now: () => Date.now(),
     warn: message => { warnings.push(message); },
     ...over,
   };
   return {
-    io, cards, writes, attempts, warnings, send, panelOf, modelPrompts,
+    io, cards, writes, attempts, warnings, send, panelOf,
     ids: (messageId: string): string[] => cards.get(messageId).body.elements.map((element: any) => element.element_id ?? element.tag),
-    /** Answers the latest model call, or the `index`-th one. */
-    answer: (text: string | undefined, index = modelAnswers.length - 1) => modelAnswers[index]!(text),
   };
 }
 
@@ -114,32 +97,58 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-11-16T03:00:00Z'));
+});
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 describe('legacy reply card', () => {
-  it('puts the facts above the footer when the card settles, then adds the CLI recap in place', async () => {
+  it('writes nothing when the card settles, then puts the CLI recap above the footer and updates it in place', async () => {
     const ds = session();
     const run = harness();
     const messageId = run.send('om_card1');
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, run.io);
     await settle(ds);
-    expect(run.writes).toEqual([expect.objectContaining({ op: 'insert', target: 'botmux_reply_footer', markdown: expect.stringContaining('**做了什么**') })]);
-    expect(run.writes[0]!.markdown).not.toContain(SUMMARY);
+    // No recap yet: no panel, and the card is not even read.
+    expect(run.writes).toEqual([]);
+    expect(run.panelOf(messageId)).toBeUndefined();
 
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await settle(ds);
-    expect(run.writes).toHaveLength(2);
-    expect(run.writes[1]!.op).toBe('replace');
-    expect(run.writes[1]!.markdown.startsWith(SUMMARY)).toBe(true);
-    expect(run.writes[1]!.markdown).toContain('来自 CLI 自带的离开总结');
-    expect(run.writes[1]!.markdown).toContain('**做了什么**');
-    expect(run.writes[1]!.sequence).toBeGreaterThan(run.writes[0]!.sequence);
+    expect(run.writes).toEqual([expect.objectContaining({ op: 'insert', target: 'botmux_reply_footer' })]);
+    expect(run.writes[0]!.markdown.split('\n\n')).toEqual([SUMMARY, "<font color='grey'>来自 CLI 自带的离开总结</font>"]);
 
     // The same recap again (a re-read transcript), or the same card settling
     // again (a replayed terminal), changes nothing.
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, run.io);
     await settle(ds);
-    expect(run.writes).toHaveLength(2);
+    expect(run.writes).toHaveLength(1);
+
+    // A later summary of the same turn replaces the panel's text.
+    noteCliRecap(ds, 'om_turn1', `${SUMMARY}（更新）`, run.io);
+    await settle(ds);
+    expect(run.writes.map(write => write.op)).toEqual(['insert', 'replace']);
+    expect(run.writes[1]!.sequence).toBeGreaterThan(run.writes[0]!.sequence);
+    expect(run.panelOf(messageId).elements[0].content).toContain('（更新）');
+  });
+
+  it('gives a turn the CLI never recaps no panel', async () => {
+    const ds = session();
+    const run = harness();
+    noteRecapTurnStarted(ds, 'om_turn1');
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, run.io);
+    await settle(ds);
+    noteRecapTurnStarted(ds, 'om_turn2');
+    noteRecapCard(ds, 'om_turn2', { kind: 'legacy', messageId: run.send('om_card2') }, run.io);
+    await settle(ds);
+    expect(run.writes).toEqual([]);
+    expect(run.panelOf('om_card1')).toBeUndefined();
+    expect(run.panelOf('om_card2')).toBeUndefined();
   });
 
   it('writes a CLI recap that arrived before the card settled with the first insert', async () => {
@@ -149,7 +158,7 @@ describe('legacy reply card', () => {
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await settle(ds);
     expect(run.writes).toEqual([]);
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, run.io);
     await settle(ds);
     expect(run.writes).toEqual([expect.objectContaining({ op: 'insert', markdown: expect.stringContaining(SUMMARY) })]);
   });
@@ -158,15 +167,31 @@ describe('legacy reply card', () => {
     const ds = session();
     const run = harness();
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, run.io);
     await settle(ds);
     noteRecapTurnStarted(ds, 'om_turn2');
     // Late facts for the old turn: its recap and a duplicate card settle.
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: 'om_card1' }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: 'om_card1' }, run.io);
     await settle(ds);
-    expect(run.writes).toHaveLength(1);
-    expect(run.panelOf('om_card1').elements[0].content).not.toContain(SUMMARY);
+    expect(run.writes).toEqual([]);
+    expect(run.panelOf('om_card1')).toBeUndefined();
+  });
+
+  it('puts a new turn\'s recap on no card until that turn\'s own card settles', async () => {
+    const ds = session();
+    const run = harness();
+    noteRecapTurnStarted(ds, 'om_turn1');
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, run.io);
+    await settle(ds);
+    noteRecapTurnStarted(ds, 'om_turn2');
+    noteCliRecap(ds, 'om_turn2', SUMMARY, run.io);
+    await settle(ds);
+    expect(run.writes).toEqual([]);
+    noteRecapCard(ds, 'om_turn2', { kind: 'legacy', messageId: run.send('om_card2') }, run.io);
+    await settle(ds);
+    expect(run.panelOf('om_card1')).toBeUndefined();
+    expect(run.panelOf('om_card2').elements[0].content).toContain(SUMMARY);
   });
 
   it('updates in place when an earlier write landed but its answer was lost', async () => {
@@ -179,14 +204,16 @@ describe('legacy reply card', () => {
       if (first) { first = false; throw new Error('socket hang up'); }
     };
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: lost.send('om_card1') }, INPUT, lost.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: lost.send('om_card1') }, lost.io);
     await settle(ds);
     noteCliRecap(ds, 'om_turn1', SUMMARY, lost.io);
+    await settle(ds);
+    noteCliRecap(ds, 'om_turn1', `${SUMMARY}（更新）`, lost.io);
     await settle(ds);
     expect(lost.writes.map(write => write.op)).toEqual(['insert', 'replace']);
     // The card was read again rather than inserted into a second time.
     expect(lost.attempts.insert).toBe(1);
-    expect(lost.panelOf('om_card1').elements[0].content).toContain(SUMMARY);
+    expect(lost.panelOf('om_card1').elements[0].content).toContain('（更新）');
   });
 
   it('inserts again when an earlier insert did not land', async () => {
@@ -199,13 +226,15 @@ describe('legacy reply card', () => {
       return insert(...args);
     };
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, run.io);
     await settle(ds);
-    expect(run.panelOf('om_card1')).toBeUndefined();
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await settle(ds);
+    expect(run.panelOf('om_card1')).toBeUndefined();
+    noteCliRecap(ds, 'om_turn1', `${SUMMARY}（更新）`, run.io);
+    await settle(ds);
     expect(run.writes.map(write => write.op)).toEqual(['insert']);
-    expect(run.panelOf('om_card1').elements[0].content).toContain(SUMMARY);
+    expect(run.panelOf('om_card1').elements[0].content).toContain('（更新）');
   });
 
   it('falls back to an update when CardKit already has the panel the read-back does not show yet', async () => {
@@ -214,7 +243,8 @@ describe('legacy reply card', () => {
     const messageId = run.send('om_card1');
     const stale = JSON.stringify(run.cards.get(messageId));
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, run.io);
+    noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await settle(ds);
     run.io.readCard = async () => stale;
     let fail = true;
@@ -223,28 +253,12 @@ describe('legacy reply card', () => {
       if (fail) { fail = false; throw new Error('socket hang up'); }
       return replace(...args);
     };
-    noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
+    noteCliRecap(ds, 'om_turn1', `${SUMMARY}（更新）`, run.io);
     await settle(ds);
-    noteCliRecap(ds, 'om_turn1', `${SUMMARY} `.trim() + '（更新）', run.io);
+    noteCliRecap(ds, 'om_turn1', `${SUMMARY}（再更新）`, run.io);
     await settle(ds);
-    expect(run.panelOf('om_card1').elements[0].content).toContain('（更新）');
+    expect(run.panelOf('om_card1').elements[0].content).toContain('（再更新）');
     expect(run.cards.get(messageId).body.elements.filter((element: any) => element.element_id === TURN_RECAP_ELEMENT_ID)).toHaveLength(1);
-  });
-
-  it('keeps a turn\'s facts when a repeated terminal for it knows nothing', async () => {
-    const ds = session();
-    const run = harness();
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-    await settle(ds);
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: 'om_card1' }, { facts: { files: [], commands: 0 } }, run.io);
-    // Nor when a later report for the same turn knows less, but something.
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: 'om_card1' }, { facts: { files: [], commands: 1, lastCommand: 'ls' } }, run.io);
-    noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
-    await settle(ds);
-    expect(run.panelOf('om_card1').elements[0].content).toContain(SUMMARY);
-    expect(run.panelOf('om_card1').elements[0].content).toContain('`src/utils/terminal-cells.ts`');
-    expect(run.panelOf('om_card1').elements[0].content).not.toContain('`ls`');
   });
 
   /** A read-back answered late: the card as it was when asked, not as it is when the answer comes. */
@@ -265,7 +279,8 @@ describe('legacy reply card', () => {
     const messageId = run.send('om_race_insert');
     const answerReadBack = lateReadBack(run);
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, run.io);
+    noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await ticks();
     // The「下一步」row is written meanwhile, above the footer.
     const row = serializeCardWrite(messageId, () => Date.now(), async () => {
@@ -290,7 +305,8 @@ describe('legacy reply card', () => {
     card.body.elements.splice(footer, 0, nextStepRow());
     const answerReadBack = lateReadBack(run);
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId }, run.io);
+    noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await ticks();
     // The next turn takes the row off meanwhile.
     const removal = serializeCardWrite(messageId, () => Date.now(), async () => {
@@ -313,30 +329,18 @@ describe('legacy reply card', () => {
       return insert(...args);
     };
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, run.io);
+    noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await settle(ds);
     expect(run.panelOf('om_card1')).toBeDefined();
     expect(run.warnings).toEqual([]);
-  });
-
-  it('shows no files or commands in a chat that hides a turn\'s activity', async () => {
-    const ds = session();
-    const run = harness({ showFacts: () => false });
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-    await settle(ds);
-    expect(run.writes).toEqual([]);
-    noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
-    await settle(ds);
-    expect(run.panelOf('om_card1').elements[0].content).toContain(SUMMARY);
-    expect(run.panelOf('om_card1').elements[0].content).not.toContain('做了什么');
   });
 
   it('writes nothing with the switch off', async () => {
     const ds = session();
     const run = harness({ enabled: () => false });
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, run.io);
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await settle(ds);
     expect(run.writes).toEqual([]);
@@ -344,167 +348,21 @@ describe('legacy reply card', () => {
 });
 
 describe('unified reply card', () => {
-  it('publishes the panel through the card record and does not repeat an unchanged one', async () => {
+  it('publishes the panel through the card record once the CLI recaps the turn, and does not repeat an unchanged one', async () => {
     const ds = session();
     const run = harness();
     const published: string[] = [];
     const card = { kind: 'unified' as const, publish: async (markdown: string) => { published.push(markdown); } };
     noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', card, INPUT, run.io);
+    noteRecapCard(ds, 'om_turn1', card, run.io);
     await settle(ds);
+    expect(published).toEqual([]);
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
     await settle(ds);
-    expect(published).toHaveLength(2);
-    expect(published[1]).toContain(SUMMARY);
+    expect(published).toHaveLength(1);
+    expect(published[0]).toContain(SUMMARY);
     expect(run.writes).toEqual([]);
-  });
-});
-
-describe('model recap', () => {
-  const modelOn = () => harness({ modelEnabled: () => true });
-
-  it('runs once the card stayed quiet for the idle stretch without a CLI recap', async () => {
-    const ds = session();
-    const run = modelOn();
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-    await settle(ds);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS - 1_000);
-    expect(run.modelPrompts).toEqual([]);
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(run.modelPrompts).toEqual([INPUT.modelPrompt]);
-    run.answer('已合入，CI 全绿；下一步发版。');
-    await settle(ds);
-    expect(run.panelOf('om_card1').elements[0].content).toMatch(/^已合入，CI 全绿；下一步发版。\n\n<font color='grey'>由小模型生成的回顾<\/font>/);
-  });
-
-  it('is not made when the CLI recapped the turn, a new turn started, or a switch is off', async () => {
-    for (const interrupt of ['cli', 'turn', 'model-off', 'recap-off'] as const) {
-      const ds = session();
-      let modelSwitch = true;
-      let recapSwitch = true;
-      const run = harness({ modelEnabled: () => modelSwitch, enabled: () => recapSwitch });
-      noteRecapTurnStarted(ds, 'om_turn1');
-      noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-      await vi.advanceTimersByTimeAsync(60_000);
-      if (interrupt === 'cli') noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
-      if (interrupt === 'turn') noteRecapTurnStarted(ds, 'om_turn2');
-      if (interrupt === 'model-off') modelSwitch = false;
-      if (interrupt === 'recap-off') recapSwitch = false;
-      await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS * 2);
-      expect(run.modelPrompts, interrupt).toEqual([]);
-    }
-  });
-
-  it('gives a new turn its own wait even when the previous turn\'s was still running', async () => {
-    const ds = session();
-    const run = modelOn();
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-    await vi.advanceTimersByTimeAsync(60_000);
-    noteRecapTurnStarted(ds, 'om_turn2');
-    const second = { ...INPUT, modelPrompt: 'Language: Simplified Chinese\n\nTurn record:\nAssistant: 第二轮' };
-    noteRecapCard(ds, 'om_turn2', { kind: 'legacy', messageId: run.send('om_card2') }, second, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS);
-    expect(run.modelPrompts).toEqual([second.modelPrompt]);
-    run.answer('第二轮的回顾');
-    await settle(ds);
-    expect(run.panelOf('om_card2').elements[0].content).toContain('第二轮的回顾');
-    expect(run.panelOf('om_card1').elements[0].content).not.toContain('回顾<');
-  });
-
-  it('keeps the newer turn\'s recap when an older turn\'s answer comes in after it', async () => {
-    const ds = session();
-    const run = modelOn();
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS);
-    noteRecapTurnStarted(ds, 'om_turn2');
-    noteRecapCard(ds, 'om_turn2', { kind: 'legacy', messageId: run.send('om_card2') }, INPUT, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS);
-    expect(run.modelPrompts).toHaveLength(2);
-    run.answer('第二轮的回顾', 1);
-    await settle(ds);
-    run.answer('第一轮迟到的回顾', 0);
-    await settle(ds);
-    // The same card settling again (a replayed terminal) re-renders from what is known.
-    noteRecapCard(ds, 'om_turn2', { kind: 'legacy', messageId: 'om_card2' }, INPUT, run.io);
-    await settle(ds);
-    expect(run.panelOf('om_card2').elements[0].content).toContain('第二轮的回顾');
-    expect(run.panelOf('om_card2').elements[0].content).not.toContain('第一轮');
-  });
-
-  it('is not made for a turn that left nothing to recap', async () => {
-    const ds = session();
-    const run = modelOn();
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, { facts: { files: [], commands: 0 } }, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS * 2);
-    expect(run.modelPrompts).toEqual([]);
-  });
-
-  it('is made once per turn even when its card settles again during the call', async () => {
-    const ds = session();
-    const run = modelOn();
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS);
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: 'om_card1' }, INPUT, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS * 2);
-    expect(run.modelPrompts).toHaveLength(1);
-  });
-
-  it('is asked once per turn, even when the answer was lost and the card settles again', async () => {
-    const ds = session();
-    const run = modelOn();
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS);
-    run.answer(undefined);
-    await settle(ds);
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: 'om_card1' }, INPUT, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS * 2);
-    expect(run.modelPrompts).toHaveLength(1);
-  });
-
-  it('is not made in a chat that hides a turn\'s activity: the model would read it', async () => {
-    const ds = session();
-    const run = harness({ modelEnabled: () => true, showFacts: () => false });
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS * 2);
-    expect(run.modelPrompts).toEqual([]);
-  });
-
-  it('drops an answer that arrives after the model switch was turned off', async () => {
-    const ds = session();
-    let modelSwitch = true;
-    const run = harness({ modelEnabled: () => modelSwitch });
-    noteRecapTurnStarted(ds, 'om_turn1');
-    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-    await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS);
-    expect(run.modelPrompts).toHaveLength(1);
-    modelSwitch = false;
-    run.answer('关掉之后才到的回顾');
-    await settle(ds);
-    expect(run.panelOf('om_card1').elements[0].content).not.toContain('关掉之后才到的回顾');
-  });
-
-  it('drops an answer that arrives after the next turn started or after the CLI recap', async () => {
-    for (const late of ['turn', 'cli'] as const) {
-      const ds = session();
-      const run = modelOn();
-      noteRecapTurnStarted(ds, 'om_turn1');
-      noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, INPUT, run.io);
-      await vi.advanceTimersByTimeAsync(RECAP_MODEL_IDLE_MS);
-      expect(run.modelPrompts).toHaveLength(1);
-      if (late === 'turn') noteRecapTurnStarted(ds, 'om_turn2');
-      else noteCliRecap(ds, 'om_turn1', SUMMARY, run.io);
-      run.answer('迟到的回顾');
-      await settle(ds);
-      expect(run.panelOf('om_card1').elements[0].content, late).not.toContain('迟到的回顾');
-    }
   });
 });
 

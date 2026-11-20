@@ -431,26 +431,27 @@ describe('/retry command', () => {
       worker: aliveWorker() as any,
       session: makeSession({ lastFailedTurn: makeFailedTurn() }),
     });
-    const cancelled: string[] = [];
+    const readBack: string[] = [];
     const published: string[] = [];
     const io: RecapIo = {
-      enabled: () => true, modelEnabled: () => true, showFacts: () => true, locale: () => 'zh',
-      readCard: async () => undefined, cardId: async () => 'card', insert: async () => {}, replace: async () => {},
-      modelRecap: async () => undefined,
-      setTimer: () => () => { cancelled.push('model wait'); },
+      enabled: () => true, locale: () => 'zh',
+      readCard: async (_ds, messageId) => { readBack.push(messageId); return undefined; },
+      cardId: async () => 'card', insert: async () => {}, replace: async () => {},
       now: () => Date.now(), warn: () => {},
     };
-    const input = { facts: { files: ['src/a.ts'], commands: 0 }, modelPrompt: 'PROMPT' };
     noteRecapTurnStarted(ds, 'om_turn_done');
-    noteRecapCard(ds, 'om_turn_done', { kind: 'legacy', messageId: 'om_card_done' }, input, io);
+    noteRecapCard(ds, 'om_turn_done', { kind: 'legacy', messageId: 'om_card_done' }, io);
     await recapIdle(ds);
     await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), makeDeps(ds), LARK_APP_ID);
     const retryTurnId = sendWorkerInput.mock.calls[0][2] as string;
-    expect(cancelled).toEqual(['model wait']);
-    noteRecapCard(ds, retryTurnId, { kind: 'unified', publish: async markdown => { published.push(markdown); } }, input, io);
+    noteRecapCard(ds, retryTurnId, { kind: 'unified', publish: async markdown => { published.push(markdown); } }, io);
+    // A late recap of the turn the retry replaced goes nowhere.
+    noteCliRecap(ds, 'om_turn_done', '上一轮的回顾', io);
     noteCliRecap(ds, retryTurnId, '重试这一轮的回顾', io);
     await recapIdle(ds);
+    expect(readBack).toEqual([]);
     expect(published.at(-1)).toContain('重试这一轮的回顾');
+    expect(published.join('\n')).not.toContain('上一轮的回顾');
   });
 
   it('routes a new retry turn to the failed topic even after another topic becomes current', async () => {

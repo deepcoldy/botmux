@@ -1140,7 +1140,6 @@ export const messages: Record<string, string> = {
   'config.label.replyCardNextStep': 'Reply card next-step button',
   'config.label.bareRenamePassthrough': 'Bare /rename names via CLI',
   'config.label.replyCardRecap': 'Reply card turn recap',
-  'config.label.replyCardRecapModel': 'Turn recap by a small model',
   'config.label.autoStartOnGroupJoin': 'Auto-start on join',
   'config.label.autoStartOnNewTopic': 'Auto-start on new topic',
   'config.label.chatManagerEnabled': 'Group manager (default responder)',
@@ -2442,6 +2441,8 @@ export const messages: Record<string, string> = {
   'settings.localCliOpenModeHelp': 'Defaults to attaching the current session: managed tmux / Herdr / ZMX use exact attach, and adopted sessions attach only when a reliable existing target is known. A native ZMX attach does not mean botmux provides a Web TUI. Direct resume is for local debugging when you accept the Feishu continuity risk.',
   'settings.localCliOpenModeAttach': 'Attach current session (recommended)',
   'settings.localCliOpenModeResume': 'Start CLI resume',
+  'settings.notifyOnNewVersion': 'New version DM reminders',
+  'settings.notifyOnNewVersionHelp': 'Off by default. Checks botmux hourly and DMs the primary bot owner once per new version. Does not require auto-update.',
   'settings.autoUpdate': 'Daily auto-update',
   'settings.autoUpdateHelp': 'Auto-pull the latest version at the scheduled time.',
   'settings.autoRestart': 'Auto-restart after update',
@@ -2660,6 +2661,11 @@ export const messages: Record<string, string> = {
   'restart.dashboard_local': 'Local direct (if the platform is down): {url}',
   'restart.changelog_label': 'What’s new:',
   'restart.changelog_link_fallback': 'Details: {url}',
+  'updateNotice.title': 'botmux version reminder',
+  'updateNotice.available': 'A new botmux version is available: **{version}**',
+  'updateNotice.current': 'Current version: {version}',
+  'updateNotice.release': 'Release notes: {url}',
+  'updateNotice.manual': 'Review and choose an update in Dashboard → Version & Update.',
   'restart.card_title': 'botmux maintenance notice',
 
   // Host-side CLI runtime update monitor
