@@ -1,6 +1,7 @@
 import { capabilityOn } from '../src/services/trigger-user-auth.js';
 import { answerDispatchTaskConsent, assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
+import { messageSenderUnionIdFromDetail } from '../src/im/lark/client.js';
 import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /** Executes the production IPC handler with platform/network seams replaced. */
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
@@ -95,6 +96,73 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
   return { ds, scope, send, body, run: (req: unknown = {}) => run(req, {}) };
 }
 const read = () => resolveDispatchUser({ dataDir, secret, appId: 'cli_target', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_kickoff', waitMs: 0 });
+
+// Execute the production entry that creates the reply registry, then let the
+// real dispatch IPC handler consume it after the live caller has gone away.
+function daemonEntry(name: string, scope: Record<string, unknown>): any {
+  const declaration = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+  if (!declaration) throw new Error('Missing production entry: ' + name);
+  const entryCode = ts.transpileModule(declaration.getText(source), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  }).outputText;
+  return new Function('scope', `with (scope) { ${entryCode}; return ${name}; }`)(scope);
+}
+
+function restoreEntryCallerForDispatch(h: ReturnType<typeof harness>, turnId: string): void {
+  h.ds.managedTurnOrigin.turnId = turnId;
+  h.body.originTurnId = turnId;
+  h.ds.activeInteractiveTurn = undefined;
+  h.scope.pickTurnReplyTarget = pickTurnReplyTarget;
+  h.scope.resolveMessageSenderUnionId.mockResolvedValue('on_from_message');
+  h.scope.resolveUnionIdFromOpenId.mockResolvedValue(null);
+}
+
+async function expectEntrySenderSigned(h: ReturnType<typeof harness>, messageId: string): Promise<void> {
+  expect((await h.run()).status).toBe(200);
+  expect(h.scope.resolveMessageSenderUnionId).toHaveBeenCalledExactlyOnceWith('cli_source', messageId);
+  expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+  expect((await read())?.authority).toMatchObject({ openId: 'ou_alice', unionId: 'on_from_message' });
+}
+
+async function submitQueuedFollowUp(h: ReturnType<typeof harness>, messageId: string): Promise<void> {
+  h.ds.worker = { killed: false };
+  h.ds.session.workerGeneration = 1;
+  h.ds.session.cliSessionId = 'native';
+  const submit = daemonEntry('submitQueuedMessage', {
+    activeSessions: new Map([['session-key', h.ds]]), activeSessionKey: () => 'session-key',
+    senderIsBotTriState: () => false, isKnownPeerBot: () => false,
+    config: h.scope.config, resolveSender: async () => ({ name: 'Alice' }),
+    getBot: () => ({ config: { botName: 'source', botOpenId: 'ou_bot' } }),
+    buildFollowUpCliInput: () => 'queued-input', sessionPromptInjection: () => undefined,
+    beginReplyTargetTurn, noteTurnReceived: async () => {},
+    trustedCallerForInboundTurn: async () => ({
+      senderType: 'user', requestLarkAppId: 'cli_source', requestUserOpenId: 'ou_alice',
+    }),
+    sendWorkerInput: () => true, beginNewTurn: () => {}, rememberLastCliInput: () => {},
+    markSessionActivity: () => {}, sessionStore: { updateSession: () => {} },
+  });
+  expect(await submit(h.ds, {
+    messageId, senderId: 'ou_alice', senderType: 'user', mentions: [], threadId: 'omt_thread',
+  }, 'queued follow-up', { mode: 'thread', rootMessageId: 'om_root' })).toBe(true);
+}
+
+function deliverPassthrough(h: ReturnType<typeof harness>, messageId: string, turnId?: string): void {
+  h.ds.worker = { killed: false };
+  const deliver = daemonEntry('deliverPassthroughToExistingSession', {
+    isSessionTransferring: () => false, sessionStore: { updateSession: () => {} },
+    getBot: () => ({ config: {} }),
+    buildTurnParticipants: () => ({ participants: [{ openId: 'ou_alice', isBot: false }], incomplete: false }),
+    beginReplyTargetTurn, isLocalCliCommand: () => false,
+    invalidateIdleAutoCompactRetryForTurn: () => ({ changed: false }),
+    sendWorkerSessionInput: () => true, trustedSessionController: () => undefined,
+    mojoLivePatchForSession: () => undefined, beginNewTurn: () => {}, markPassthroughActivity: () => {},
+    logger: { info: vi.fn(), warn: vi.fn() },
+  });
+  expect(deliver(h.ds, '/compact', '/compact', 'om_root', 'cli_source', {
+    messageId, replyRootId: 'om_root', senderOpenId: 'ou_alice', senderIsBot: false,
+    substitute: false, inThread: true, ...(turnId ? { turnId } : {}),
+  })).toBe(true);
+}
 
 // Run the actual worker screen-ready gate against a real transcript queue.
 // Stop at its release boundary: the remainder only schedules UI/input work.
@@ -994,6 +1062,43 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect(h.scope.resolveMessageSenderUnionId).toHaveBeenCalledExactlyOnceWith('cli_source', 'om_human');
     expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
     expect((await read())?.authority).toMatchObject({ openId: 'ou_alice', unionId: 'on_from_message' });
+  });
+  it('signs a restored /queue sender through its original message when Contact is unavailable', async () => {
+    const h = harness();
+    await submitQueuedFollowUp(h, 'om_queued');
+    restoreEntryCallerForDispatch(h, 'om_queued');
+    await expectEntrySenderSigned(h, 'om_queued');
+  });
+  it('signs a restored first-passthrough sender through its original message when Contact is unavailable', async () => {
+    const h = harness();
+    deliverPassthrough(h, 'om_passthrough');
+    restoreEntryCallerForDispatch(h, 'om_passthrough');
+    await expectEntrySenderSigned(h, 'om_passthrough');
+  });
+  it('keeps a cascade turn pinned to the real message without authenticating the derived turn id', async () => {
+    const h = harness();
+    deliverPassthrough(h, 'om_passthrough', 'om_passthrough#c1');
+    expect(h.ds.session.turnReplyContexts['om_passthrough#c1'].sourceMessageId).toBe('om_passthrough');
+    const fromMessage = vi.fn(async () => 'on_derived_turn_must_not_be_used');
+    const fromContact = vi.fn(async () => null);
+    await expect(resolveDispatchSenderUnionId(
+      h.ds.session, 'om_passthrough#c1', 'cli_source', 'ou_alice', fromMessage, fromContact,
+    )).resolves.toBeNull();
+    expect(fromMessage).not.toHaveBeenCalled();
+    expect(fromContact).toHaveBeenCalledExactlyOnceWith('cli_source', 'ou_alice');
+  });
+  it('does not borrow a non-human compact-card sender for the click operator', async () => {
+    const h = harness();
+    deliverPassthrough(h, 'om_bot_card');
+    const fromMessage = vi.fn(async () => messageSenderUnionIdFromDetail({
+      items: [{ sender: { sender_type: 'app', id_type: 'union_id', id: 'on_card_sender' } }],
+    }));
+    const fromContact = vi.fn(async () => 'on_click_operator');
+    await expect(resolveDispatchSenderUnionId(
+      h.ds.session, 'om_bot_card', 'cli_source', 'ou_alice', fromMessage, fromContact,
+    )).resolves.toBe('on_click_operator');
+    expect(fromMessage).toHaveBeenCalledExactlyOnceWith('cli_source', 'om_bot_card');
+    expect(fromContact).toHaveBeenCalledExactlyOnceWith('cli_source', 'ou_alice');
   });
   it('does not deliver after the source turn changes during the message lookup', async () => {
     const h = harness();

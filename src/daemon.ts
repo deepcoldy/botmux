@@ -7190,6 +7190,7 @@ async function submitQueuedMessage(
     senderOpenId: message.senderId,
     participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
     inThread: !!message.threadId,
+    sourceMessageId: message.messageId,
   });
   await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
   // Identity refresh and reaction delivery both await external work.
@@ -26451,6 +26452,8 @@ function deliverPassthroughToExistingSession(
       participants: passthroughWindow.participants,
       participantsIncomplete: passthroughWindow.incomplete,
       inThread: turn.inThread,
+      // A cascade's derived turnId is not a Lark message id; keep the exact inbound id.
+      sourceMessageId: turn.messageId,
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
