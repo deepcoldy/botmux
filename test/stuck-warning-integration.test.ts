@@ -1097,15 +1097,15 @@ describe('Claude permission dialog notice (integration)', () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({ worker: fakeWorker });
     __testOnly_setupWorkerHandlers(ds, fakeWorker);
-    const notice = () => fakeWorker.emit('message', {
-      type: 'user_notify', kind: 'claude_permission_prompt', message: 'Claude 正等待你确认', turnId: 'turn_1',
+    const notice = (permissionPromptStable = false) => fakeWorker.emit('message', {
+      type: 'user_notify', kind: 'claude_permission_prompt', message: 'Claude 正等待你确认', turnId: 'turn_1', permissionPromptStable,
     });
     const hookAsk = (options = ALLOW_DENY, sessionId = ds.session.sessionId, kind: 'permission' | 'question' = 'permission') => void registerAsk({
       larkAppId: ds.larkAppId, chatId: ds.chatId, rootMessageId: 'om_root', sessionId, originKind: 'hook', timeoutMs: 600_000,
       questions: [{ prompt: 'Claude 请求执行一个需要人工确认的操作', multiSelect: false, options,
         ...(kind === 'permission' ? { allowCustom: false } : {}) }],
     });
-    return { notice, hookAsk };
+    return { notice, hookAsk, ds, fakeWorker };
   }
   const texts = () => sessionReplyMock.mock.calls.filter(c => c[2] === 'text').map(c => c[1]);
 
@@ -1121,6 +1121,62 @@ describe('Claude permission dialog notice (integration)', () => {
     notice();
     await vi.advanceTimersByTimeAsync(1_000);
     hookAsk();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(texts()).toEqual([]);
+  });
+
+  it('does not delay a worker-revalidated prompt a second time', async () => {
+    const { notice } = setup();
+    notice(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(texts()).toEqual(['Claude 正等待你确认']);
+  });
+
+  it('still suppresses a worker-revalidated prompt when a native card is pending', async () => {
+    const { notice, hookAsk } = setup();
+    hookAsk(); notice(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(texts()).toEqual([]);
+  });
+
+  it('keeps a legacy turn-less fork notice when an unrelated main turn starts during grace', async () => {
+    const { ds, fakeWorker } = setup();
+    fakeWorker.emit('message', { type: 'user_notify', kind: 'claude_permission_prompt', message: 'fork permission' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    ds.currentTurnId = 'new-main-turn';
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(texts()).toEqual(['fork permission']);
+  });
+
+  it('drops an explicit permission notice when its attempt is superseded during grace', async () => {
+    const { ds, fakeWorker } = setup();
+    ds.currentTurnId = 'turn_1';
+    ds.turnDispatchAttemptHighWater = { turnId: 'turn_1', dispatchAttempt: 1 };
+    fakeWorker.emit('message', { type: 'user_notify', kind: 'claude_permission_prompt',
+      message: 'old attempt permission', turnId: 'turn_1', dispatchAttempt: 1 });
+    await vi.advanceTimersByTimeAsync(1_000);
+    ds.turnDispatchAttemptHighWater = { turnId: 'turn_1', dispatchAttempt: 2 };
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(texts()).toEqual([]);
+  });
+
+  it.each(['worker', 'closed'] as const)('still drops a turn-less legacy notice after %s changes', async change => {
+    const { ds, fakeWorker } = setup();
+    fakeWorker.emit('message', { type: 'user_notify', kind: 'claude_permission_prompt', message: 'fork permission' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    if (change === 'worker') ds.worker = makeFakeWorker();
+    else ds.session.status = 'closed';
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(texts()).toEqual([]);
+  });
+
+  it.each(['worker', 'turn', 'closed'] as const)('drops legacy delayed notices after %s changes', async change => {
+    const { notice, ds } = setup();
+    notice();
+    await vi.advanceTimersByTimeAsync(1_000);
+    if (change === 'worker') ds.worker = makeFakeWorker();
+    if (change === 'turn') ds.currentTurnId = 'next-turn';
+    if (change === 'closed') ds.session.status = 'closed';
     await vi.advanceTimersByTimeAsync(10_000);
     expect(texts()).toEqual([]);
   });

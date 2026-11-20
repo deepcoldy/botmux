@@ -40,7 +40,7 @@ import {
 import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
-import {claudeActionPrompt} from './services/claude-action-prompt.js';
+import {ClaudePermissionNoticeTracker} from './services/claude-action-prompt.js';
 import { PromptSuggestionPublisher, promptSuggestionReportTurn, type FoldedTypeAheadTurn } from './utils/prompt-suggestion-publisher.js';
 import { CliRecapObserver } from './services/turn-recap.js';
 import { WrittenInputLedger } from './services/prompt-submission-match.js';
@@ -25712,6 +25712,41 @@ function sendToPty(
 
 // ─── Screen Update Timer ─────────────────────────────────────────────────────
 
+async function captureClaudePermissionNoticeScreen(): Promise<{ screen: string; runtimeKey: string; observationKey: string; turnKey: string; episodeKey?: string } | undefined> {
+  const target = backend;
+  const targetRenderer = renderer;
+  const generation = cliSpawnGeneration;
+  const lifetime = cliLifetimeNonce;
+  const turn = currentBotmuxTurnId;
+  const attempt = currentBotmuxDispatchAttempt;
+  const input = webTerminalInputGeneration;
+  const revision = backendScreenRevision;
+  const physicalId = workerSessionEventScope?.currentBinding()?.physicalId;
+  if (!target || lastInitConfig?.cliId !== 'claude-code' || cliRestartInProgress) return;
+  let screen: string | null | undefined;
+  // PTY revisions count every output chunk. Snapshot-only backends have no
+  // equivalent episode evidence, so they leave this undefined and fail open.
+  let episodeKey: string | undefined;
+  try {
+    if (target.captureViewport || target.captureCurrentScreen) {
+      screen = (await snapshotToText(target, renderCols, renderRows, { filter: false }))?.content;
+    } else if (targetRenderer) {
+      await targetRenderer.writeAndFlush('');
+      screen = targetRenderer.rawSnapshot();
+      episodeKey = String(revision);
+    }
+  } catch { return; }
+  if (screen == null || backend !== target || renderer !== targetRenderer
+    || generation !== cliSpawnGeneration || lifetime !== cliLifetimeNonce
+    || turn !== currentBotmuxTurnId || attempt !== currentBotmuxDispatchAttempt
+    || input !== webTerminalInputGeneration || cliRestartInProgress
+    || revision !== backendScreenRevision
+    || (workerSessionEventScope && !hasCurrentSessionRuntime())) return;
+  const runtimeKey = JSON.stringify([generation, lifetime, physicalId]);
+  return { screen, runtimeKey, observationKey: JSON.stringify([runtimeKey, turn, attempt, input]),
+    turnKey: JSON.stringify([turn, attempt]), episodeKey };
+}
+
 function startScreenUpdates(): void {
   // renderCols / renderRows were set by the init handler from cfg, so
   // adopt-mode panes (e.g. 270x57) get an xterm-headless of matching
@@ -25725,9 +25760,13 @@ function startScreenUpdates(): void {
   let lastSentBackgroundWait = 0;
   let lastTextSnapshotHash = '';
   let lastContent = '';
-  // Last Claude permission dialog already notified (dedup by projection text;
-  // cleared when the dialog leaves the screen so the next one notifies again).
-  let lastClaudeActionPrompt = '';
+  const permissionNotice = new ClaudePermissionNoticeTracker();
+  let permissionCapture: { backend: typeof backend; key: string; expiresAt: number } | undefined;
+  const permissionCaptureTimeoutMs = 10_000;
+  let screenSampleSequence = 0;
+  let latestCommittedScreenSample = 0;
+  let generalCaptureAttempt: { activityKey: string; startedAt: number; retried: boolean } | undefined;
+  const generalCaptureRetryTimeoutMs = 10_000;
   // The CLI's own next-input suggestion (adapters with promptSuggestion only).
   const promptSuggestions = new PromptSuggestionPublisher();
   // PTY-activity watermark of the last tick that actually captured. The screen
@@ -25739,9 +25778,18 @@ function startScreenUpdates(): void {
   // watermark — there we must capture every tick (see shouldCaptureScreen).
   let lastSnapshotPtyActivity = -1;
   let lastSnapshotGridRevision = observedPaneGridRevision;
-  screenUpdateTimer = setInterval(() => {
+  const sample = () => {
+    const sampleSequence = ++screenSampleSequence;
     const capacityBackend = backend;
     const capacityGeneration = cliSpawnGeneration;
+    const capacityLifetime = cliLifetimeNonce;
+    const sampleTurn = currentBotmuxTurnId;
+    const sampleAttempt = currentBotmuxDispatchAttempt;
+    const screenTurn = { turnId: sampleTurn, dispatchAttempt: sampleAttempt };
+    const ownsSample = () => backend === capacityBackend && cliSpawnGeneration === capacityGeneration
+      && cliLifetimeNonce === capacityLifetime
+      && currentBotmuxTurnId === sampleTurn && currentBotmuxDispatchAttempt === sampleAttempt
+      && (!workerSessionEventScope || hasCurrentSessionRuntime());
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
       if (renderer) observeTraexAutoModelCapacity(renderer.rawSnapshot());
@@ -25798,11 +25846,13 @@ function startScreenUpdates(): void {
     }
 
     void (async () => {
+      let captureAttempt: typeof generalCaptureAttempt;
       const { snapshot, status } = await snapshotWithLatestRuntimeStatus(async () => {
         let content = lastContent;
         let changed = false;
         let refreshed = false;
         let nativeScreen: string | undefined;
+        let commitCapture: (() => void) | undefined;
         const observedAtMs = Date.now();
 
         // Capture only when the pane has emitted output since our last snapshot.
@@ -25814,49 +25864,94 @@ function startScreenUpdates(): void {
         // watermark can't be trusted there, so capture every tick.
         const ptyActivity = lastPtyActivityAtMs;
         const gridRevision = observedPaneGridRevision;
-        if (gridRevision !== lastSnapshotGridRevision || shouldCaptureScreen({
+        const activityKey = JSON.stringify([ptyActivity, gridRevision]);
+        const pendingCapture = generalCaptureAttempt?.activityKey === activityKey ? generalCaptureAttempt : undefined;
+        const retryReady = !!pendingCapture && !pendingCapture.retried
+          && Date.now() - pendingCapture.startedAt >= generalCaptureRetryTimeoutMs;
+        const needsCapture = gridRevision !== lastSnapshotGridRevision || shouldCaptureScreen({
           ptyActivity,
           lastCapturedPtyActivity: lastSnapshotPtyActivity,
           screenSelfDriven: isScreenSelfDriven(backend),
-        })) {
+        });
+        // Keep one read per activity, plus one timeout retry. A genuinely new
+        // activity bypasses the stalled slot; a second stalled read does not
+        // accumulate another pending renderer on every tick.
+        if (needsCapture && (!pendingCapture || retryReady)) {
+          captureAttempt = { activityKey, startedAt: Date.now(), retried: !!pendingCapture };
+          generalCaptureAttempt = captureAttempt;
           refreshed = true;
-          lastSnapshotPtyActivity = ptyActivity;
-          lastSnapshotGridRevision = gridRevision;
+          const capturedPtyActivity = ptyActivity;
+          const capturedGridRevision = gridRevision;
+          let textSnapshotHash = lastTextSnapshotHash;
+          let analyzerSnapshot = lastAnalyzerSnapshot;
+          let replaceAnalyzerSnapshot = false;
+          let observeSuggestion: (() => void) | undefined;
           // Preferred path: pipe-pane backends pull a fresh viewport snapshot
           // from tmux every tick. This eliminates the accumulated-buffer drift
           // that produced duplicated/staircase text in 'text' display mode.
           const suggestionReader = cliAdapter?.promptSuggestion;
-          const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true, ...(suggestionReader ? { cells: true } : {}) });
+          const pipeText = await snapshotToText(capacityBackend, renderCols, renderRows, { filter: true, ...(suggestionReader ? { cells: true } : {}) });
+          if (!ownsSample()) return null;
           if (pipeText) {
             content = pipeText.content;
-            if (suggestionReader && pipeText.cells) promptSuggestions.observe(suggestionReader(pipeText.cells), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+            if (suggestionReader && pipeText.cells) {
+              const cells = pipeText.cells;
+              observeSuggestion = () => promptSuggestions.observe(suggestionReader(cells), screenTurn);
+            }
             // Geometry is part of the frame: the same ANSI re-wrapped on a
             // resized pane renders different text.
             const hash = `${pipeText.cols}x${pipeText.rows}:${pipeText.ansi}`;
             changed = hash !== lastTextSnapshotHash;
-            lastTextSnapshotHash = hash;
+            textSnapshotHash = hash;
             // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
             // tmux call would otherwise need to fire twice per tick.
             if (changed) {
-              const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
-              if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
+              const rawSnap = await snapshotToText(capacityBackend, renderCols, renderRows, { filter: false });
+              if (!ownsSample()) return null;
+              if (rawSnap) {
+                analyzerSnapshot = rawSnap.content;
+                replaceAnalyzerSnapshot = true;
+              }
             }
-            nativeScreen = lastAnalyzerSnapshot;
+            nativeScreen = analyzerSnapshot;
           } else if (renderer) {
-            const snap = renderer.snapshot();
+            const currentRenderer = renderer;
+            const snap = currentRenderer.snapshot();
             content = snap.content;
             changed = snap.changed;
-            nativeScreen = renderer.rawSnapshot();
-            if (suggestionReader) promptSuggestions.observe(suggestionReader(renderer.viewportCells()), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+            nativeScreen = currentRenderer.rawSnapshot();
+            if (suggestionReader) {
+              const cells = currentRenderer.viewportCells();
+              observeSuggestion = () => promptSuggestions.observe(suggestionReader(cells), screenTurn);
+            }
           } else {
             return null;
           }
-          lastContent = content;
+          // Async captures finish out of order. Keep every write sample-local
+          // until the outer sequence fence selects this sample for commit.
+          commitCapture = () => {
+            lastSnapshotPtyActivity = capturedPtyActivity;
+            lastSnapshotGridRevision = capturedGridRevision;
+            lastTextSnapshotHash = textSnapshotHash;
+            if (replaceAnalyzerSnapshot) lastAnalyzerSnapshot = analyzerSnapshot;
+            lastContent = content;
+            observeSuggestion?.();
+          };
         }
 
-        return { content, changed, refreshed, nativeScreen, observedAtMs };
-      }, projectedRuntimeScreenStatus);
-      if (!snapshot) return;
+        return { content, changed, refreshed, nativeScreen, observedAtMs, commitCapture };
+      }, projectedRuntimeScreenStatus).finally(() => {
+        if (captureAttempt && generalCaptureAttempt === captureAttempt) generalCaptureAttempt = undefined;
+      });
+      if (!snapshot || !ownsSample()) return;
+      // Status-only ticks reuse the committed cache and must not invalidate an
+      // older capture that is still in flight. Only a fresh capture advances
+      // the ordering high-water and can supersede another capture's commit.
+      if (snapshot.refreshed) {
+        if (sampleSequence < latestCommittedScreenSample) return;
+        latestCommittedScreenSample = sampleSequence;
+      }
+      snapshot.commitCapture?.();
       // TRAE's question page sits still once drawn: the tick's screen catches
       // one the per-chunk hold check missed (its card is raised from a fresh
       // capture, see core/traex-question-bridge.ts).
@@ -25895,15 +25990,35 @@ function startScreenUpdates(): void {
       // is narrow: only the bounded title/question/options leave the
       // terminal, never tool args.
       if (lastInitConfig?.cliId === 'claude-code') {
-        const prompt = claudeActionPrompt(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
-        if (prompt && prompt !== lastClaudeActionPrompt) {
-          lastClaudeActionPrompt = prompt;
-          send({type: 'user_notify', kind: 'claude_permission_prompt', message: prompt, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
-        } else if (!prompt) {
-          lastClaudeActionPrompt = '';
+        if (permissionCapture && Date.now() >= permissionCapture.expiresAt) {
+          permissionCapture = undefined;
+          permissionNotice.observe(undefined, '', Date.now());
+        }
+        if (permissionNotice.needsCapture([snapshot.nativeScreen, renderer?.rawSnapshot(), snapshot.content])) {
+          const key = JSON.stringify([capacityGeneration, capacityLifetime, sampleTurn, sampleAttempt,
+            webTerminalInputGeneration, workerSessionEventScope?.currentBinding()?.bindingId]);
+          if (!permissionCapture || permissionCapture.backend !== capacityBackend || permissionCapture.key !== key) {
+            const capture = { backend: capacityBackend, key, expiresAt: Date.now() + permissionCaptureTimeoutMs };
+            permissionCapture = capture;
+            // A slow permission read must not hold ordinary screen updates or be
+            // superseded by every tick. A stuck read loses its slot and late
+            // results cannot settle a newer read's observation.
+            void captureClaudePermissionNoticeScreen().then(current => {
+              if (permissionCapture !== capture || !ownsSample()) return;
+              const observedAt = Date.now();
+              if (observedAt >= capture.expiresAt) {
+                permissionNotice.observe(undefined, '', observedAt);
+                return;
+              }
+              const prompt = permissionNotice.observe(current?.screen, current?.runtimeKey ?? '', observedAt, current?.observationKey, current?.episodeKey, current?.turnKey);
+              if (prompt) send({type: 'user_notify', kind: 'claude_permission_prompt', message: prompt,
+                permissionPromptStable: true, turnId: sampleTurn, dispatchAttempt: sampleAttempt});
+            }).finally(() => {
+              if (permissionCapture === capture) permissionCapture = undefined;
+            });
+          }
         }
       }
-      const screenTurn = { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt };
       const suggestion = promptSuggestions.take(usageAware.status, screenTurn,
         promptSuggestionReportTurn(screenTurn, foldedTypeAheadTurn, turnTerminalEmitted));
       if (suggestion) {
@@ -25932,11 +26047,20 @@ function startScreenUpdates(): void {
           content: snapshot.content,
           ...usageAware,
           ...backgroundWaitPayload(),
-          turnId: currentBotmuxTurnId,
-          dispatchAttempt: currentBotmuxDispatchAttempt,
+          turnId: screenTurn.turnId,
+          dispatchAttempt: screenTurn.dispatchAttempt,
         });
       }
     })();
+  };
+  screenUpdateTimer = setInterval(() => {
+    // This worker-wide timer starts before spawn; pin each sample, not the timer,
+    // to the runtime it observes so delayed frames retain their original fence.
+    const scope = workerSessionEventScope;
+    const binding = scope?.currentBinding();
+    if (scope && !binding) return;
+    if (scope && binding) scope.run(binding, sample);
+    else sample();
   }, SCREEN_UPDATE_INTERVAL_MS);
 }
 
