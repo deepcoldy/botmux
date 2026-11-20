@@ -239,6 +239,7 @@ function runWorkerWiring(late: boolean, options: {
     credentialOnlyBwrap: options.credentialOnlyBwrap ?? false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
     configuredWrapperLaunch: options.wrapperLaunch ?? { bin: '/opt/wrapper/launcher', args: ['claude'] },
     sandboxDirectCliIdentityAtSpawn: undefined as unknown,
+    sandboxWrapperExecutableIdentityAtSpawn: undefined as unknown,
     reproduceBaseBin: options.directCliBin ?? '/opt/claude/claude',
     spawnCwd: '/work',
     // Module-level spawn counter read by the TRAE leaf-resolve guard; the sliced
@@ -333,15 +334,18 @@ function runWorkerWiring(late: boolean, options: {
     cfg: context.cfg,
     claudeDataDir: context.claudeDataDir,
     sandboxDirectCliIdentityAtSpawn: undefined as unknown,
+    sandboxWrapperExecutableIdentityAtSpawn: undefined as unknown,
     cliSpawnGeneration: 0,
     resolveInstallIdentity: (path: string) => options.missingPaths?.includes(path) ? undefined
       : { path, dev: 'dev', ino: options.spawnInstallInos?.[path] ?? options.installInos?.[path] ?? path, size: '1', mtimeNs: '1', source: 'install-stat' },
     resolve,
     spawnCwd: context.spawnCwd,
     reproduceBaseBin: context.reproduceBaseBin,
+    configuredWrapperLaunch: context.configuredWrapperLaunch,
   };
   runInNewContext(directIdentityCapture, captureScope);
   context.sandboxDirectCliIdentityAtSpawn = captureScope.sandboxDirectCliIdentityAtSpawn;
+  context.sandboxWrapperExecutableIdentityAtSpawn = captureScope.sandboxWrapperExecutableIdentityAtSpawn;
   runInNewContext(workerWiring, context);
   options.beforeTimers?.(context);
   scheduler.runAll();
@@ -952,6 +956,21 @@ describe('worker wrapper PID wiring', () => {
     expect(publicationPids(result)).not.toContain(152);
   });
 
+  it.each([false, true])('does not trust configured wrapper argv0 when a nested candidate runs a different native image (late PID=%s)', late => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      runningExes: { 151: '/opt/other/native', 152: '/opt/claude/claude' },
+      cmdlines: { 151: ['/opt/wrapper/launcher', 'claude'], 152: ['/opt/claude/claude'] },
+      children: { 150: [151], 151: [152] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude' },
+    });
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(publicationPids(result)).not.toContain(151);
+    expect(publicationPids(result)).not.toContain(152);
+  });
+
   it.each([
     { late: false, wrapperFirst: true }, { late: true, wrapperFirst: true },
     { late: false, wrapperFirst: false }, { late: true, wrapperFirst: false },
@@ -969,6 +988,53 @@ describe('worker wrapper PID wiring', () => {
     expect(result.backend.cliPid).toBe(152);
     expect(result.bridgeCliPid).toBe(152);
     expect(publicationPids(result)).not.toContain(155);
+  });
+
+  it.each([
+    { late: false, wrapperFirst: true }, { late: true, wrapperFirst: true },
+    { late: false, wrapperFirst: false }, { late: true, wrapperFirst: false },
+  ])('withholds a helper sibling while wrapper evidence is unknown (wrapper first=$wrapperFirst, late PID=$late)', ({ late, wrapperFirst }) => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      runningExes: { 152: '/opt/claude/claude', 155: '/opt/claude/claude' },
+      cmdlines: {
+        151: [], 152: ['/opt/claude/claude'], 155: ['/opt/claude/claude', 'doctor'],
+      },
+      children: { 150: wrapperFirst ? [151, 155] : [155, 151], 151: [152] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude', 155: 'claude' },
+    });
+    // The unknown wrapper may hide the interactive CLI. A same-level direct
+    // helper must not win merely because wrapper evidence is unavailable.
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(publicationPids(result)).not.toContain(152);
+    expect(publicationPids(result)).not.toContain(155);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS);
+  });
+
+  it.each([
+    { late: false, unknownFirst: true }, { late: true, unknownFirst: true },
+    { late: false, unknownFirst: false }, { late: true, unknownFirst: false },
+  ])('withholds a proven wrapper result while any sibling is unknown (unknown first=$unknownFirst, late PID=$late)', ({ late, unknownFirst }) => {
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150,
+      runningExes: { 152: '/opt/claude/claude', 156: '/opt/wrapper/launcher', 157: '/opt/claude/claude' },
+      cmdlines: {
+        151: [], 152: ['/opt/claude/claude'],
+        156: ['/opt/wrapper/launcher', 'claude'], 157: ['/opt/claude/claude'],
+      },
+      children: { 150: unknownFirst ? [151, 156] : [156, 151], 151: [152], 156: [157] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude', 156: 'claude', 157: 'claude' },
+    });
+    // Unknown anywhere in the search invalidates every direct/nested result,
+    // including a proven wrapper returned before or after that sibling.
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    expect(publicationPids(result)).not.toContain(152);
+    expect(publicationPids(result)).not.toContain(157);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS);
   });
 
   it.each([
@@ -1081,6 +1147,7 @@ describe('worker wrapper PID wiring', () => {
     const result = runWorkerWiring(late, {
       cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
       scopePayloadPid: 150, wrapperLaunch,
+      spawnInstallInos: { [wrapperLaunch.bin]: 'wrapper-inode-a' },
       installInos: { [wrapperLaunch.bin]: 'wrapper-inode-b' }, runningInos: { 151: 'wrapper-inode-a' },
       runningExes: { 151: wrapperLaunch.bin, 152: '/opt/claude/claude' },
       cmdlines: { 151: [wrapperLaunch.bin, ...wrapperLaunch.args], 152: ['/opt/claude/claude'] },
@@ -1193,6 +1260,26 @@ describe('worker wrapper PID wiring', () => {
     expect(lastPublishedPid(result)).toBe(152);
   });
 
+  it.each([false, true])('distinguishes a direct script CLI from a versioned interpreter whose wrapper script is unreadable (late PID=%s)', late => {
+    const node = '/opt/node-v22';
+    const wrapperScript = '/opt/wrapper/launcher.js';
+    const directScript = '/opt/claude/claude.js';
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'node-v22', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, directCliBin: directScript,
+      wrapperLaunch: { bin: node, args: [wrapperScript] }, missingPaths: [wrapperScript],
+      runningExes: { 151: node, 152: node },
+      cmdlines: { 151: [node, wrapperScript], 152: [node, directScript] },
+      children: { 150: [151], 151: [152] },
+      childComms: { 150: 'bwrap', 151: 'claude', 152: 'claude' },
+    });
+    // The shared interpreter image must not hide the independently proven
+    // direct script behind a persistent-wrapper recursion.
+    expect(result.backend.cliPid).toBe(152);
+    expect(result.bridgeCliPid).toBe(152);
+    expect(lastPublishedPid(result)).toBe(152);
+  });
+
   it.each([
     { late: false, severLineage: false }, { late: true, severLineage: false },
     { late: false, severLineage: true }, { late: true, severLineage: true },
@@ -1262,6 +1349,121 @@ describe('worker wrapper PID wiring', () => {
     });
     expect(publicationPids(result)).not.toContain(151);
     expect(result.backend.cliPid).toBe(150);
+  });
+
+  it.each([false, true])('withholds a descendant after the payload execs direct during discovery (late PID=%s)', late => {
+    const directCliBin = '/opt/claude/claude.exe';
+    const runningExes: Record<number, string | undefined> = { 150: '/opt/wrapper/launcher', 151: directCliBin };
+    const cmdlines: Record<number, string[]> = { 150: ['/opt/wrapper/launcher', 'claude'], 151: [directCliBin] };
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, directCliBin, runningExes, cmdlines,
+      children: { 150: [151] }, childComms: { 150: 'claude', 151: 'claude' },
+      beforeTimers: scope => {
+        const originalSnapshot = scope.snapshotChildPids;
+        let snapshots = 0;
+        scope.snapshotChildPids = () => {
+          const snapshot = originalSnapshot();
+          snapshots++;
+          if (snapshots === 1) {
+            // exec preserves the payload birth. The final apply fence must
+            // reclassify the root instead of accepting its former descendant.
+            runningExes[150] = directCliBin;
+            cmdlines[150] = [directCliBin];
+          }
+          return snapshot;
+        };
+      },
+    });
+    expect(publicationPids(result)).not.toContain(151);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+  });
+
+  it.each([
+    { late: false, failRestore: false }, { late: true, failRestore: false },
+    { late: false, failRestore: true }, { late: true, failRestore: true },
+  ])('restores the payload after it execs direct inside leaf publication (fail first restore=$failRestore, late PID=$late)', ({ late, failRestore }) => {
+    const directCliBin = '/opt/claude/claude.exe';
+    const runningExes: Record<number, string | undefined> = { 150: '/opt/wrapper/launcher', 151: directCliBin };
+    const cmdlines: Record<number, string[]> = { 150: ['/opt/wrapper/launcher', 'claude'], 151: [directCliBin] };
+    let immediateOwnership: { cliPid: number; bridgeCliPid: unknown } | undefined;
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, directCliBin, runningExes, cmdlines,
+      children: { 150: [151] }, childComms: { 150: 'claude', 151: 'claude' },
+      beforeTimers: scope => {
+        const originalPublish = scope.publishLocalProcessAttestation.getMockImplementation()!;
+        let restoreFailed = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid?: number, enginePid?: number, expectedProcStart?: string) => {
+          if (pid === 151 && expectedProcStart) {
+            runningExes[150] = directCliBin;
+            cmdlines[150] = [directCliBin];
+          }
+          if (failRestore && pid === 150 && !restoreFailed && publicationPids(scope).includes(151)) {
+            restoreFailed = true;
+            return false;
+          }
+          const published = originalPublish(pid, enginePid, expectedProcStart);
+          if (pid === 151 && expectedProcStart) {
+            scope.setTimeout(() => {
+              immediateOwnership = { cliPid: scope.backend.cliPid, bridgeCliPid: scope.bridgeCliPid };
+            }, 0);
+          }
+          return published;
+        });
+      },
+    });
+    expect(immediateOwnership).toEqual({ cliPid: 150, bridgeCliPid: 150 });
+    const publications = publicationPids(result);
+    const firstLeaf = publications.indexOf(151);
+    expect(firstLeaf).toBeGreaterThanOrEqual(0);
+    expect(publications.slice(firstLeaf + 1).filter(pid => pid === 150)).toHaveLength(failRestore ? 2 : 1);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+  });
+
+  it.each([
+    { late: false, failRestore: false }, { late: true, failRestore: false },
+    { late: false, failRestore: true }, { late: true, failRestore: true },
+  ])('restores the direct payload after a later exec and old leaf exit (fail first restore=$failRestore, late PID=$late)', ({ late, failRestore }) => {
+    const directCliBin = '/opt/claude/claude.exe';
+    const runningExes: Record<number, string | undefined> = { 150: '/opt/wrapper/launcher', 151: directCliBin };
+    const cmdlines: Record<number, string[]> = { 150: ['/opt/wrapper/launcher', 'claude'], 151: [directCliBin] };
+    const exited: number[] = [];
+    let publicationsBeforeExec: unknown[] = [];
+    const result = runWorkerWiring(late, {
+      cliId: 'claude-code', wrapperCli: 'launcher', claudeDataDir: '/claude', credentialOnlyBwrap: true, realCodexSearch: true,
+      scopePayloadPid: 150, directCliBin, runningExes, cmdlines, exited,
+      children: { 150: [151] }, childComms: { 150: 'claude', 151: 'claude' },
+      beforeTimers: scope => {
+        const originalPublish = scope.publishLocalProcessAttestation.getMockImplementation()!;
+        let restoreFailed = false;
+        scope.publishLocalProcessAttestation.mockImplementation((pid?: number, enginePid?: number, expectedProcStart?: string) => {
+          if (failRestore && pid === 150 && !restoreFailed && publicationsBeforeExec.length > 0) {
+            restoreFailed = true;
+            return false;
+          }
+          return originalPublish(pid, enginePid, expectedProcStart);
+        });
+        scope.setTimeout(() => {
+          publicationsBeforeExec = [...publicationPids(scope)];
+          runningExes[150] = directCliBin;
+          cmdlines[150] = [directCliBin];
+          exited.push(151);
+        }, 400);
+      },
+    });
+    expect(publicationsBeforeExec).toContain(151);
+    const publications = publicationPids(result);
+    const firstLeaf = publications.indexOf(151);
+    expect(publications.slice(firstLeaf + 1).filter(pid => pid === 150)).toHaveLength(failRestore ? 2 : 1);
+    expect(lastPublishedPid(result)).toBe(150);
+    expect(result.backend.cliPid).toBe(150);
+    expect(result.bridgeCliPid).toBe(150);
+    const settled = publicationPids(result);
+    result.refreshSandboxedCliLeafAttestation!();
+    expect(publicationPids(result)).toEqual(settled);
   });
 
   it.each([false, true])('does not substitute a replacement birth inside leaf publication (late PID=%s)', late => {

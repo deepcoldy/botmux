@@ -692,6 +692,19 @@ export function findLaunchedCliPid(
   } = {},
   filterExecutable?: string,
 ): number | null {
+  return findLaunchedCliPidWithUnknownState(
+    launcherPid, targetCliId, maxDepth, probes, filterExecutable, { sawUnknownMatch: false },
+  );
+}
+
+function findLaunchedCliPidWithUnknownState(
+  launcherPid: number,
+  targetCliId: CliId,
+  maxDepth: number,
+  probes: NonNullable<Parameters<typeof findLaunchedCliPid>[3]>,
+  filterExecutable: string | undefined,
+  unknownState: { sawUnknownMatch: boolean },
+): number | null {
   const childrenOf = probes.childrenOf ?? getChildPids;
   const commOf = probes.commOf ?? readComm;
   const cmdlineOf = probes.cmdlineOf ?? (pid => readCmdline(pid, { exact: true }));
@@ -701,6 +714,7 @@ export function findLaunchedCliPid(
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
     const next: number[] = [];
     let deferredMatch: number | null = null;
+    let nestedMatch: number | null = null;
     for (const pid of frontier) {
       if (seen.has(pid)) continue;
       seen.add(pid);
@@ -708,13 +722,23 @@ export function findLaunchedCliPid(
       if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) {
         if (targetCliId === 'codex'
           && (isZombie(pid) || isNonInteractiveCodexArgv(cmdlineOf(pid)))) continue;
-        if (probes.isUnknownWrapper?.(pid, comm)) continue;
+        if (probes.isUnknownWrapper?.(pid, comm)) {
+          // An unidentified wrapper may hide the real CLI in its pruned subtree.
+          // Do not let a same-level helper become the fallback merely because
+          // wrapper evidence is temporarily unreadable; retry the whole search.
+          unknownState.sawUnknownMatch = true;
+          continue;
+        }
         if (probes.isPersistentWrapper?.(pid, comm)) {
           // Exhaust a proven wrapper's subtree before accepting a same-level
           // helper sibling. Keep the global depth budget; a null result lets the
           // deferred sibling serve as fallback without scanning this tree twice.
-          const nested = findLaunchedCliPid(pid, targetCliId, maxDepth - depth - 1, probes, filterExecutable);
-          if (nested) return nested;
+          const nested = findLaunchedCliPidWithUnknownState(
+            pid, targetCliId, maxDepth - depth - 1, probes, filterExecutable, unknownState,
+          );
+          // A nested result is only usable after the whole level was scanned:
+          // a later unknown sibling invalidates it just like an earlier one.
+          if (nestedMatch === null && nested) nestedMatch = nested;
           continue;
         }
         // Do not let sibling order decide whether a later wrapper at this depth
@@ -725,7 +749,10 @@ export function findLaunchedCliPid(
       }
       next.push(...childrenOf(pid));
     }
-    if (deferredMatch !== null) return deferredMatch;
+    if (!unknownState.sawUnknownMatch) {
+      if (nestedMatch !== null) return nestedMatch;
+      if (deferredMatch !== null) return deferredMatch;
+    }
     frontier = next;
   }
   return null;

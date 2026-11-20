@@ -29373,6 +29373,7 @@ async function spawnCliBody(
   let spawnArgs = args;
   let configuredWrapperLaunch: { bin: string; args: string[] } | undefined;
   let sandboxDirectCliIdentityAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
+  let sandboxWrapperExecutableIdentityAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
   let spawnCwd = cfg.workingDir;
 
   // Dashboard「复现命令」：在**任何** sandbox 包装（下方 macOS Seatbelt / Linux bwrap /
@@ -31262,8 +31263,17 @@ async function spawnCliBody(
             generation: cliSpawnGeneration,
             identity: resolveInstallIdentity(resolve(spawnCwd, reproduceBaseBin)),
           };
+          // Native wrapper recovery must likewise use the object handed to THIS
+          // spawn. A later stat can describe an upgrade, never the old inode
+          // still running underneath this launch.
+          sandboxWrapperExecutableIdentityAtSpawn = {
+            generation: cliSpawnGeneration,
+            identity: configuredWrapperLaunch
+              ? resolveInstallIdentity(resolve(spawnCwd, configuredWrapperLaunch.bin)) : undefined,
+          };
         } else {
           sandboxDirectCliIdentityAtSpawn = undefined;
+          sandboxWrapperExecutableIdentityAtSpawn = undefined;
         }
         backend.spawn(spawnBin, spawnArgs, {
           cwd: spawnCwd,
@@ -31671,12 +31681,20 @@ async function spawnCliBody(
       && (configuredScriptIdentities.length > 0
         || basename(configuredWrapperLaunch.bin) === wrapperLauncherComm)
       ? 'interpreter' : 'native';
+    // A versioned generic name with no readable script is ambiguous: it can be
+    // a native executable with that name, or a real Node/Python interpreter.
+    // Keep the native-install fallback, but require the exact configured argv
+    // below so the shared interpreter image alone never authorizes descent.
+    const versionedNativeWrapperFallback = wrapperIdentityKind === 'native'
+      && configuredWrapperLaunch !== undefined && wrapperLauncherComm !== undefined
+      && basename(configuredWrapperLaunch.bin) !== wrapperLauncherComm;
+    const nativeWrapperIdentity = rewireOwnership && !actuallyReattachedPersistent
+      && sandboxWrapperExecutableIdentityAtSpawn?.generation === generation
+      ? sandboxWrapperExecutableIdentityAtSpawn.identity : undefined;
     const configuredWrapperIdentities = wrapperIdentityKind === 'interpreter'
       ? configuredScriptIdentities
-      : rewireOwnership && configuredWrapperLaunch
-        ? [resolveInstallIdentity(resolve(spawnCwd, configuredWrapperLaunch.bin))]
-          .filter((identity): identity is ExecutableIdentity => identity !== undefined)
-        : [];
+      : [nativeWrapperIdentity]
+        .filter((identity): identity is ExecutableIdentity => identity !== undefined);
     const ambiguousWrapperCliIdentity = configuredWrapperIdentities.some(identity =>
       sameExecutableObject(identity, directCliIdentity));
     const wrapperIdentities = configuredWrapperIdentities.filter(identity =>
@@ -31702,11 +31720,27 @@ async function spawnCliBody(
     const isConfiguredWrapper = (pid: number, procStart: string): boolean => {
       if (wrapperIdentities.length === 0 || readProcessStartIdentity(pid) !== procStart) return false;
       const exe = readRunningExeIdentity(pid, procStart);
+      if (wrapperIdentityKind === 'native') {
+        // A readable native image is authoritative. Upgrades are recovered by
+        // the pre-spawn identity above, never by process-controlled argv0.
+        if (!exe) return false;
+        if (matchesWrapperIdentity(exe) && !versionedNativeWrapperFallback) return true;
+        if (!versionedNativeWrapperFallback) return false;
+        // The versioned-name fallback may be a real interpreter. Require its
+        // complete configured invocation, not merely the shared Node/Python
+        // image; a direct script CLI has a different constrained script slot.
+        if (!wrapperGenericLauncherComm(basename(exe.path))) return false;
+        const argv = readCmdline(pid, { exact: true });
+        const expected = [configuredWrapperLaunch!.bin, ...configuredWrapperLaunch!.args];
+        const matches = argv.length === expected.length && argv.every((arg, index) => arg === expected[index]);
+        return matches && readProcessStartIdentity(pid) === procStart;
+      }
       if (exe) {
         if (matchesWrapperIdentity(exe)) return true;
-        // Only an image proven to be the configured CLI is direct evidence. A
-        // wrapper-file mismatch alone (e.g. an upgrade) still allows wrapper argv.
+        // Only an image proven to be the configured CLI is direct evidence.
         if (sameExecutableObject(exe, directCliIdentity)) return false;
+        // A different readable native image is unknown, not wrapper evidence.
+        if (!wrapperGenericLauncherComm(basename(exe.path))) return false;
       }
       const argv = readCmdline(pid, { exact: true });
       const cwd = readCwd(pid) ?? spawnCwd;
@@ -31789,6 +31823,29 @@ async function spawnCliBody(
       return false;
     };
     let attested: { pid: number; procStart: string; published: boolean } | undefined;
+    let payloadOwnershipRestorePending = false;
+    const restorePayloadOwnership = (): boolean => {
+      if (!launchPayloadStillCurrent() || !payloadProcStart) return false;
+      const restored = applyResolvedCliPid(
+        payloadPid, 'Credential-only sandbox CLI payload', payloadPid, payloadProcStart,
+      );
+      if (restored) {
+        attested = undefined;
+        payloadOwnershipRestorePending = false;
+      }
+      return restored;
+    };
+    const restoreDirectPayloadOwnership = (): boolean => {
+      if (!payloadOwnershipRestorePending) {
+        const observed = backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend;
+        if (!attested || observed.cliPid !== attested.pid || observed.cliPid === payloadPid) return true;
+        // Publication writes the numeric PID before its result is known. Keep
+        // the retry obligation even when a failed attempt already wrote the
+        // payload PID.
+        payloadOwnershipRestorePending = true;
+      }
+      return restorePayloadOwnership();
+    };
     // A live, successfully published leaf is never sent twice: every actual
     // publication rotates the active turn's capability.
     const isAttested = (pid: number | undefined): boolean => pid !== undefined && attested?.pid === pid
@@ -31798,7 +31855,8 @@ async function spawnCliBody(
       if (isAttested(leafPid)) return true;
       const procStart = readProcessStartIdentity(leafPid);
       if (!procStart || isZombieProcess(leafPid)) return false;
-      if (rewireOwnership && (procStart !== leafProcStart
+      if (rewireOwnership && (payloadRole() !== 'wrapper'
+        || procStart !== leafProcStart
         || !lineageContains(payloadPid, leafPid)
         || !isDirectCliProcess(leafPid, procStart))) return false;
       // Close the observation window between the fresh lineage snapshot and
@@ -31806,9 +31864,24 @@ async function spawnCliBody(
       // this expectation so a replacement's birth is never substituted.
       if (!launchPayloadStillCurrent() || readProcessStartIdentity(leafPid) !== procStart) return false;
       log(`Sandbox: attesting CLI leaf pid ${leafPid} under launch payload ${payloadPid} (cliId=${cfg.cliId})`);
+      const observed = backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend;
+      const previousCliPid = observed.cliPid;
+      const previousBridgeCliPid = bridgeCliPid;
       const published = rewireOwnership
         ? applyResolvedCliPid(leafPid, 'Credential-only sandbox CLI leaf', payloadPid, procStart)
         : publishLocalProcessAttestation(leafPid);
+      if (rewireOwnership && payloadRole() !== 'wrapper') {
+        // exec keeps the payload birth, so the leaf-birth fence cannot catch a
+        // role flip that happened inside publication. Undo the leaf rewiring,
+        // then re-publish the original payload to correct the daemon as well.
+        observed.cliPid = previousCliPid;
+        bridgeCliPid = previousBridgeCliPid;
+        if (typeof refreshActiveRuntimeContract === 'function') refreshActiveRuntimeContract();
+        attested = undefined;
+        payloadOwnershipRestorePending = true;
+        restorePayloadOwnership();
+        return false;
+      }
       attested = { pid: leafPid, procStart, published };
       return published;
     };
@@ -31816,9 +31889,18 @@ async function spawnCliBody(
     // both edges and the poll share the same liveness and deduplication state.
     refreshSandboxedCliLeafAttestation = () => {
       if (!launchPayloadStillCurrent()) return;
+      if (rewireOwnership) {
+        const role = payloadRole();
+        if (role === 'direct') {
+          // A direct root after a prior wrapper leaf must take its ownership
+          // back; otherwise a dead/stale leaf remains the trusted root forever.
+          restoreDirectPayloadOwnership();
+          return;
+        }
+        if (role !== 'wrapper' || isAttested(attested?.pid)) return;
+      } else if (isDirectLeaf(payloadPid) || isAttested(attested?.pid)) return;
       // A proven direct CLI payload was already attested at bind time. Never
       // replace it with a same-comm subagent discovered on a ready/input edge.
-      if ((rewireOwnership ? payloadRole() !== 'wrapper' : isDirectLeaf(payloadPid)) || isAttested(attested?.pid)) return;
       const leafPid = findLeaf(payloadPid);
       if (leafPid) attest(leafPid);
     };
@@ -31828,7 +31910,14 @@ async function spawnCliBody(
       maxAttempts: Math.ceil(FIRST_PROMPT_HARD_TIMEOUT_MS / intervalMs),
       findRealPid: findLeaf,
       isDirectLeaf,
-      classifyLauncher: () => rewireOwnership ? payloadRole() : undefined,
+      classifyLauncher: () => {
+        if (!rewireOwnership) return undefined;
+        const role = payloadRole();
+        // Do not stop on direct until any previous leaf ownership has actually
+        // been replaced by a successfully published payload attestation.
+        if (role === 'direct' && !restoreDirectPayloadOwnership()) return 'unknown';
+        return role;
+      },
       getBackend: () => backend,
       getChildPid: () => launchPayloadStillCurrent() ? payloadPid : null,
       applyRealPid: attest,
