@@ -205,11 +205,20 @@ function invalidateClosedExplicitAsk(ask: InternalPending | undefined): void {
   }
 }
 
+function expireAskAtDeadline(ask: InternalPending | undefined): void {
+  if (ask && !ask.settled && ask.timeoutMs !== 0
+    && (!ask.timeoutStartsAfterDelivery || ask.timeoutStartedAt !== undefined)
+    && Date.now() >= ask.deadlineAt) {
+    settle(ask.askId, { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
+  }
+}
+
 function gateAskDecision(
   ask: InternalPending | undefined,
   input: { nonce?: string; by: string; actor?: AskAnswerActor },
 ): Exclude<AskClickOutcome, 'accepted' | 'toggled' | 'needs_empty_confirm'> | 'ready' {
   invalidateClosedExplicitAsk(ask);
+  expireAskAtDeadline(ask);
   const gate = gateHumanDecisionAttempt({
     exists: !!ask,
     nonceMatches: !!ask && (input.nonce === undefined || ask.nonce === input.nonce),
@@ -1491,6 +1500,7 @@ export function submitAskFromDesktop(args: {
   gcSettled();
   const ask = pending.get(args.askId);
   invalidateClosedExplicitAsk(ask);
+  expireAskAtDeadline(ask);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
 

@@ -3241,7 +3241,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     expect(result.output).not.toContain('forged marker output');
   });
 
-  it('steers two plain-Lark follow-ups into an open turn/start before its final, expanding into N ordered finals (superseded + real)', async () => {
+  it.each(['om_follow_1', 'trg_owner_fixture'])('steers follow-up %s and a Lark reply into one native turn with ordered finals', async firstFollowUp => {
     // Blocking 1 (ordered steer): unlike the Goal-continuation path, here inputs
     // #2 and #3 arrive while input #1's own turn/start is still OPEN (no final
     // yet) and are admitted as pre-final turn/steer into the SAME native turn.
@@ -3279,7 +3279,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       send('root', 'om_root');
       await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
       // Two follow-ups arrive BEFORE any final — each steers into the open turn.
-      send('follow one', 'om_follow_1');
+      send('follow one', firstFollowUp);
       send('follow two', 'om_follow_2');
 
       // The 2nd steer completes the native turn; one completion → three finals.
@@ -3297,7 +3297,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       // N-final expansion: first two superseded (empty, no usage), last is real.
       expect(control.finals).toEqual([
         expect.objectContaining({ turnId: 'om_root', content: '', disposition: 'steer_superseded' }),
-        expect.objectContaining({ turnId: 'om_follow_1', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: firstFollowUp, content: '', disposition: 'steer_superseded' }),
         expect.objectContaining({ turnId: 'om_follow_2', content: 'fake answer 1' }),
       ]);
       // The real final carries no superseded disposition.
@@ -3311,8 +3311,8 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       const lifecycles = control.markers.filter(m => m.kind === 'lifecycle').map(m => m.payload);
       const attempts = lifecycles.filter(l => l.kind === 'steer_attempt');
       const accepted = lifecycles.filter(l => l.kind === 'steer_accepted');
-      expect(attempts.map(a => a.replyTurnId)).toEqual(['om_follow_1', 'om_follow_2']);
-      expect(accepted.map(a => a.replyTurnId)).toEqual(['om_follow_1', 'om_follow_2']);
+      expect(attempts.map(a => a.replyTurnId)).toEqual([firstFollowUp, 'om_follow_2']);
+      expect(accepted.map(a => a.replyTurnId)).toEqual([firstFollowUp, 'om_follow_2']);
       // No forged final OSC leaked to stdout (finals stay out of band).
       expect(harness.stdout.match(/\x1b\]777;botmux:final:/g)).toBeNull();
     } finally {

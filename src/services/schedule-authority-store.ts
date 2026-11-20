@@ -352,13 +352,19 @@ export class ScheduleAuthorityStore {
     };
   }
 
-  createDirect(task: ScheduledTask, turn?: { turnId: string; maxTasksPerTurn: number }): ScheduledTask {
+  createDirect(task: ScheduledTask, turn?: { turnId: string; maxTasksPerTurn: number; maxLiveTasksPerOwner?: number }): ScheduledTask {
     const appId = task.larkAppId;
     if (typeof appId !== 'string' || !appId) {
       throw new Error('schedule_authority_app_required');
     }
     if (turn && (typeof turn.turnId !== 'string' || !turn.turnId
       || !Number.isSafeInteger(turn.maxTasksPerTurn) || turn.maxTasksPerTurn < 1)) {
+      throw new Error('schedule_authority_invalid_task_limit');
+    }
+    const maxLiveTasksPerOwner = turn?.maxLiveTasksPerOwner;
+    if (maxLiveTasksPerOwner !== undefined
+      && (!Number.isSafeInteger(maxLiveTasksPerOwner) || maxLiveTasksPerOwner < 1
+        || task.ownerAccess !== 'talk' || !task.ownerOpenId)) {
       throw new Error('schedule_authority_invalid_task_limit');
     }
     const now = new Date().toISOString();
@@ -375,6 +381,20 @@ export class ScheduleAuthorityStore {
         if (taskHash(existing.task) !== taskHash(task)) throw new Error('schedule_task_id_conflict');
         this.db.exec('COMMIT;');
         return existing.task;
+      }
+      if (maxLiveTasksPerOwner !== undefined) {
+        // Identical replay returned above before this count. BEGIN IMMEDIATE
+        // serializes competing creators, so two turns cannot both pass the
+        // per-owner limit against the same pre-insert snapshot.
+        const committedForOwner = this.db.prepare(`
+          SELECT COUNT(*) AS count FROM schedule_authority_tasks
+          WHERE app_id = ? AND kind = 'direct' AND control_open_id = ?
+            AND state IN ('active', 'paused')
+            AND json_extract(task_json, '$.ownerAccess') = 'talk'
+        `).get(appId, task.ownerOpenId!) as { count?: number | bigint } | undefined;
+        if (Number(committedForOwner?.count ?? 0) >= maxLiveTasksPerOwner) {
+          throw new Error('schedule_talker_task_limit');
+        }
       }
       if (turn) {
         // Same shape as commitDelegated's per-grant count. Revoked rows still

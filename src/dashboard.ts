@@ -119,7 +119,7 @@ import {
   WORKFLOW_DAEMON_IPC_ROUTE_PREFIX,
   type WorkflowDaemonIpcTarget,
 } from './workflows/v3/daemon-ipc-auth.js';
-import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
+import { handleDashboardTriggerApi, rejectActorOnDeniedTrigger } from './dashboard/trigger-api.js';
 import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from './dashboard/daemon-proxy-routes.js';
 import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
@@ -4487,7 +4487,7 @@ const server = createServer(async (req, res) => {
     // Only the local legacy Dashboard cookie is management authority. Platform
     // identities — owner included — retain terminal/preview capability through
     // signed proxy grants, but cannot cross into host administration APIs.
-    const { legacyAuthed, canManageHost, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
+    const { legacyAuthed, allowOwnerActor, canManageHost, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
@@ -4541,6 +4541,8 @@ const server = createServer(async (req, res) => {
     if (workflowInitiatorPreGateDenial(res, url.pathname, requestIdentity, canManageHost)) return;
 
     if (decision.kind === 'deny401') {
+      if (req.method === 'POST' && url.pathname === '/api/trigger'
+        && await rejectActorOnDeniedTrigger(req, res)) return;
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
         'content-type': 'text/html; charset=utf-8',
@@ -6164,7 +6166,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/trigger') {
-      return handleDashboardTriggerApi(req, res, { proxyToDaemon });
+      return handleDashboardTriggerApi(req, res, { proxyToDaemon }, allowOwnerActor);
     }
 
     // CLI 下拉选项 (id=选择键 + 展示名), 单一事实源在 cli-selection.CLI_SELECT_OPTIONS,
@@ -6730,6 +6732,16 @@ const server = createServer(async (req, res) => {
     // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
     // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
     // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/turns$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${encodeURIComponent(sid)}/turns${url.search}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(await upstream.text());
+      return;
+    }
+
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/insight$/))) {
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);

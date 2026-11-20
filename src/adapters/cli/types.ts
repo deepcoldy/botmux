@@ -92,6 +92,7 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  onInputPrepared?: (content: string) => void;
   /** Durable replay identity. Runner adapters may forward this with turnId so
    * late output from an older attempt cannot settle its successor. */
   dispatchAttempt?: number;
@@ -110,6 +111,8 @@ export interface WriteInputContext {
 }
 
 export interface SubmitGuard {
+  /** May reject before any paste bytes, after an adapter's awaited setup. */
+  beforeWrite?(): void;
   /** A reason (shown to the user) while the surface is taken, else undefined.
    *  `draft` = the message was pasted and its first Enter is pending (it sits
    *  in the composer under the page); `retry` = a resend of an Enter that

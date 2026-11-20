@@ -193,6 +193,17 @@ describe('resolveCurrentTurnProvenance', () => {
       });
     });
 
+    it('refuses a talk-only task owner from workflow mutation provenance', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeScheduledTask({ ownerAccess: 'talk' });
+      expect(() => resolveCurrentTurnProvenance({
+        dataDir,
+        envSessionId: 'sess-1',
+        startPid: process.pid,
+      })).toThrow(CurrentTurnProvenanceError);
+    });
+
     it('uses the chat-scope reply target root for a scheduled turn', () => {
       writeMarker('sess-1', SCHED_TURN_ID);
       writeSession({

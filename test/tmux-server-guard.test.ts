@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { describe, it, expect, afterAll } from 'vitest';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -8,7 +8,9 @@ import {
   parseLsofListeners,
   parseLsofListenerResult,
   recoverNewestBotmuxSocket,
+  resolveBootDirective,
   tmuxSocketPath,
+  tmuxSocketPathSpellings,
   newestBotmuxListener,
   type TmuxOwnerProbe,
 } from '../src/core/tmux-server-guard.js';
@@ -190,9 +192,138 @@ describe('parseLsofListeners (macOS)', () => {
 });
 
 describe('tmuxSocketPath', () => {
-  it('honours TMUX_TMPDIR and default name', () => {
-    expect(tmuxSocketPath({ TMUX_TMPDIR: '/t' }, 42, 'botmux')).toBe('/t/tmux-42/botmux');
+  it('honours TMUX_TMPDIR when it names an existing directory, default name otherwise', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'guard-socketroot-'));
+    try {
+      expect(tmuxSocketPath({ TMUX_TMPDIR: dir }, 42, 'botmux')).toBe(`${realpathSync(dir)}/tmux-42/botmux`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
     expect(tmuxSocketPath({}, 42)).toBe('/tmp/tmux-42/default');
+  });
+
+  it('falls back to /tmp for a TMUX_TMPDIR tmux itself cannot resolve', () => {
+    // tmux uses $TMUX_TMPDIR as ONE path and silently falls back to /tmp when
+    // it does not name an existing directory. Probing the raw value instead
+    // would inspect a socket no client ever talks to.
+    const missing = join(tmpdir(), 'guard-missing-socketroot-');
+    expect(tmuxSocketPath({ TMUX_TMPDIR: missing }, 42, 'botmux')).toBe('/tmp/tmux-42/botmux');
+    expect(tmuxSocketPath({ TMUX_TMPDIR: `${missing}:/tmp` }, 42, 'botmux')).toBe('/tmp/tmux-42/botmux');
+  });
+});
+
+describe('resolveBootDirective with a TMUX_TMPDIR tmux cannot resolve', () => {
+  const missingRoot = join(tmpdir(), 'guard-diverged-socketroot-');
+  // Where tmux really puts the socket for a $TMUX_TMPDIR that does not resolve.
+  const realPath = `/tmp/tmux-${typeof process.getuid === 'function' ? process.getuid() : -1}/botmux`;
+  const seam = (listenersAt: (path: string) => number[]) => ({
+    env: { TMUX_TMPDIR: missingRoot },
+    owner: { kind: 'connect-error' } as TmuxOwnerProbe,
+    supportsNoFork: true,
+    platform: 'linux' as NodeJS.Platform,
+    listeningServerPids: (path: string) => listenersAt(path),
+    socketFilePresent: () => false,
+    isBotmuxListener: () => false,
+    startTicks: () => null,
+  });
+
+  it('refuses to cold-boot next to a live server on the socket tmux really uses', () => {
+    // The owner is unreachable and a listener is bound at the path tmux
+    // actually uses. A cold start here forks a competing server, so the gate
+    // must wait instead — proving it census-checks the SAME path tmux does.
+    const directive = resolveBootDirective('botmux', seam(path => (path === realPath ? [4242] : [])));
+    expect(directive.mode).toBe('wait');
+  });
+
+  it('cold-boots when nothing listens where tmux will look', () => {
+    // Only the divergent raw path carries a listener; tmux will not use it.
+    const directive = resolveBootDirective('botmux', seam(path => (path === realPath ? [] : [4242])));
+    expect(directive.mode).toBe('spawn');
+  });
+});
+
+describe('resolveBootDirective with a RELATIVE TMUX_TMPDIR and a differing cwd', () => {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : -1;
+  const work = mkdtempSync(join(tmpdir(), 'guard-relcwd-'));
+  const other = mkdtempSync(join(tmpdir(), 'guard-relcwd-other-'));
+  mkdirSync(join(work, 'rel'));
+  // The gate must resolve `rel` the way the spawn does: against the LAUNCH
+  // cwd (which has `rel`), not some other cwd (which has not).
+  const cwdWithRel = realpathSync(work);
+  const cwdWithoutRel = realpathSync(other);
+  const relRoot = realpathSync(join(work, 'rel'));
+  const realPath = join(relRoot, `tmux-${uid}`, 'botmux');
+  const seam = (cwd: string, listenersAt: (path: string) => number[]) => ({
+    env: { TMUX_TMPDIR: 'rel' },
+    cwd,
+    owner: { kind: 'connect-error' } as TmuxOwnerProbe,
+    supportsNoFork: true,
+    platform: 'linux' as NodeJS.Platform,
+    listeningServerPids: (path: string) => listenersAt(path),
+    socketFilePresent: () => false,
+    isBotmuxListener: () => false,
+    startTicks: () => null,
+  });
+
+  it('censuses the root the LAUNCH cwd resolves, so a live listener blocks the cold boot', () => {
+    expect(resolveBootDirective('botmux', seam(cwdWithRel, path => (path === realPath ? [4242] : []))).mode)
+      .toBe('wait');
+  });
+
+  it('still cold-boots when the launch cwd cannot resolve the value (tmux would use /tmp)', () => {
+    // cwdWithoutRel has no `rel` child, so tmux itself would fall back to
+    // /tmp — the gate must agree and not invent a root from another cwd.
+    expect(resolveBootDirective('botmux', seam(cwdWithoutRel, path => (path === realPath ? [4242] : []))).mode)
+      .toBe('spawn');
+  });
+
+  afterAll(() => {
+    rmSync(work, { recursive: true, force: true });
+    rmSync(other, { recursive: true, force: true });
+  });
+});
+
+describe('tmuxSocketPathSpellings', () => {
+  it('adds the realpath spelling through the deepest EXISTING ancestor', () => {
+    // Cold-boot census state: tmux-<uid> does not exist yet, the ROOT is a
+    // symlink. The canonical spelling must still be recognisable.
+    const work = mkdtempSync(join(tmpdir(), 'guard-spell-'));
+    try {
+      const targetPath = join(work, 'target');
+      mkdirSync(targetPath);
+      const target = realpathSync(targetPath);
+      const link = join(work, 'link');
+      symlinkSync(target, link);
+      const spellings = tmuxSocketPathSpellings(join(link, 'tmux-9', 'botmux'));
+      expect(spellings.has(join(link, 'tmux-9', 'botmux'))).toBe(true);
+      expect(spellings.has(join(target, 'tmux-9', 'botmux'))).toBe(true);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the /tmp ↔ /private/tmp pair on every platform', () => {
+    expect(tmuxSocketPathSpellings('/tmp/tmux-501/botmux').has('/private/tmp/tmux-501/botmux')).toBe(true);
+    expect(tmuxSocketPathSpellings('/private/tmp/tmux-501/botmux').has('/tmp/tmux-501/botmux')).toBe(true);
+  });
+});
+
+describe('parseLsofListenerResult uses the shared path spellings', () => {
+  it('recognises a listener reported at the symlink TARGET while the gate computed the LINK spelling', () => {
+    const work = mkdtempSync(join(tmpdir(), 'guard-lsof-'));
+    try {
+      const targetPath = join(work, 'target');
+      mkdirSync(targetPath);
+      const target = realpathSync(targetPath);
+      const link = join(work, 'link');
+      symlinkSync(target, link);
+      // tmux-<uid> intentionally NOT created: the census runs before boot.
+      const out = `p77\nn${join(target, 'tmux-501', 'botmux')}\n`;
+      expect(parseLsofListenerResult(out, join(link, 'tmux-501', 'botmux')))
+        .toEqual({ pids: [77], recognized: true });
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+    }
   });
 });
 
