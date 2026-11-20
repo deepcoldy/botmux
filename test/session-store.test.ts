@@ -3365,6 +3365,31 @@ describe('reactivateClosedSession()', () => {
     expect(resolve()).toBeNull();
   });
 
+  it('assigns a new epoch when resuming a pre-epoch closed row', () => {
+    const session = createSession('oc_origin', 'om_root', 'Legacy Closed Cross Chat');
+    closeSession(session.sessionId);
+    session.followThreadEpoch = undefined;
+    updateSession(session);
+    recordBridgeReplyMarker({
+      dataDir: tempDir, sessionId: session.sessionId, sentAtMs: 1000, messageId: 'om_sent_to_b',
+      deliveryKind: 'detoured_send', content: 'legacy binding', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at',
+    });
+
+    const resumed = reactivateClosedSession(session.sessionId);
+    expect(resumed.ok).toBe(true);
+    expect(session.followThreadEpoch).toBeDefined();
+    expect(resolveCrossChatFollowedThread({
+      dataDir: tempDir, larkAppId: session.larkAppId ?? 'test-app', chatId: 'oc_followed',
+      candidateRootIds: ['om_sent_to_b'],
+      sessions: [{
+        sessionId: session.sessionId, larkAppId: session.larkAppId ?? 'test-app', chatId: session.chatId,
+        rootMessageId: session.rootMessageId, scope: 'chat', status: session.status,
+        followThreadEpoch: session.followThreadEpoch,
+      }],
+    })).toBeNull();
+  });
+
   it.each(['awaiting_classification', 'terminal_notice_pending'] as const)(
     'does not revive %s XPI work left on a legacy closed row', (phase) => {
       const session = createSession('chat-xpi-resume', 'root-xpi-resume', 'Legacy Closed XPI');

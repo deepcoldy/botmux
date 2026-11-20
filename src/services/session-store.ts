@@ -2957,6 +2957,7 @@ export function reactivateClosedSession(
   // starts a new lifecycle, so the previous close-time token snapshot must not
   // survive into the active row or the next close.
   const next: Session = { ...session };
+  if (next.followThreadEpoch === undefined) next.followThreadEpoch = randomUUID();
   next.status = 'active';
   next.closedAt = undefined;
   next.userClosedAt = undefined;
