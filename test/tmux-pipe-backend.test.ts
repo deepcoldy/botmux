@@ -1705,8 +1705,9 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
 
   const logged = (text: string) => errSpy.mock.calls.some((call: unknown[]) => String(call[0]).includes(text));
 
-  /** Drain the real Promise chain after the fake-clock deadline, with a real
-   * wall-clock bound instead of assuming one clock advance drained everything. */
+  /** Step the fake clock while draining the real Promise chain. A chain that
+   * schedules its next fake timer during the drain can never be released by
+   * realSetImmediate alone; the real wall clock only bounds the whole wait. */
   async function untilSettled(check: () => boolean, message: string): Promise<void> {
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
@@ -1715,7 +1716,12 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     });
     try {
       await Promise.race([
-        (async () => { while (!check()) await new Promise<void>(r => realSetImmediate(r)); })(),
+        (async () => {
+          while (!check()) {
+            await vi.advanceTimersByTimeAsync(100);
+            await new Promise<void>(r => realSetImmediate(r));
+          }
+        })(),
         timeout,
       ]);
     } finally { if (timer) realClearTimeout(timer); }
