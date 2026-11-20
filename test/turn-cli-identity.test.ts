@@ -65,7 +65,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
 const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
-const { isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
+const { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
 const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper, sessionIdentityPath } = await import('../src/core/cli-identity.js');
 const { renewExpiringBytedcliIdentities, trackedBytedcliRenewalCount, forgetBytedcliIdentityRenewals } = await import('../src/core/bytedcli-identity-renewal.js');
 const { renewBytedcliJwts } = await import('../src/services/bytedcli-auth.js');
@@ -128,6 +128,22 @@ function published(tool: 'lark-cli' | 'bytedcli', turnId = 'turn-default'): bool
 
 
 describe('publishTurnCliIdentity — lark-cli per-person HOME (device flow)', () => {
+  it.each([false, true])('publishes the owner actor personal credential only with opt-in=%s', async (allowOwnerActor) => {
+    const owner = 'ou_fixture_owner';
+    const turnId = 'trg_owner_fixture';
+    const ownerHome = '/homes/fixture-owner';
+    larkHomes.set(owner, ownerHome);
+    const outcomes = await publish(botConfig({ enabled: true, tools: ['lark-cli'], allowOwnerActor }), owner, turnId);
+    const body = identityBody('lark-cli', turnId);
+    if (allowOwnerActor) {
+      expect(outcomes.find(outcome => outcome.tool === 'lark-cli')?.state).toBe('user');
+      expect(body).toContain(ownerHome);
+    } else {
+      expect(body).not.toContain(ownerHome);
+      expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+    }
+  });
+
   it('publishes the per-person HOME as a user-home identity (no token injected)', async () => {
     larkHomes.set(ALICE, '/homes/alice');
     const outcomes = await publish(botConfig(), ALICE);
@@ -616,7 +632,11 @@ describe('target daemon consumes signed message authority', () => {
         return new Set(options.member === false ? [] : ['ou_alice_target']);
       },
       publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en',
-      clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
+      clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, allowsPersonalIdentityForTurn, isOwnerActorTurnId,
+      // This harness never configures an ownerOpenId; non-owner turns do not
+      // evaluate the owner-only fence, and an owner fixture would be unresolved.
+      getStrictOwnerOpenId: () => undefined,
+      logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
       // A session whose worker has not reported yet publishes under the
       // fail-closed single default; tests set ds.reportedModel to stage that.
       identityStorageModelForDaemonSession: (session: any) => session.reportedModel ?? 'proven',

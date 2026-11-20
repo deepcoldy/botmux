@@ -53,8 +53,8 @@ import { messageCardContent } from '../im/lark/message-card-content.js';
 import { noteNextStepCard, noteNextStepSuggestion } from './next-step-suggestion.js';
 import { nextStepPlacement } from '../im/lark/next-step-card.js';
 import { nextStepIo } from './next-step-io.js';
-import { noteCliRecap, noteRecapCard, noteRecapReported } from './turn-recap-state.js';
-import { noteRecapResult, recapInputFor, turnRecapIo } from './turn-recap-io.js';
+import { noteCliRecap, noteRecapCard } from './turn-recap-state.js';
+import { turnRecapIo } from './turn-recap-io.js';
 import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage, uploadFile } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { modelPinView, retainPinEffort, samePinModel, validateModelPin, type ModelPin } from './model-pin.js';
@@ -23506,22 +23506,10 @@ function setupWorkerHandlers(
         break;
       }
 
-      case 'recap_input': {
-        if (!ownsLifecycleMutation() || !turnRecapIo.enabled(ds)) break;
-        const { type: _type, turnId, dispatchAttempt: _attempt, ...input } = msg;
-        noteRecapReported(ds, turnId, input);
-        break;
-      }
-
       case 'cli_recap': {
         if (!ownsLifecycleMutation()) break;
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         noteCliRecap(ds, msg.turnId, msg.text, turnRecapIo);
-        break;
-      }
-
-      case 'recap_result': {
-        noteRecapResult(ds, msg);
         break;
       }
 
@@ -25533,10 +25521,9 @@ function setupWorkerHandlers(
           );
           break;
         }
-        // The「本轮回顾」panel's material (reported by the worker just before
-        // this terminal); the panel goes on once the turn's last card settles.
-        const recapInput = msg.status === 'completed' && turnRecapIo.enabled(ds)
-          ? recapInputFor(ds, msg.turnId) : undefined;
+        // The「本轮回顾」panel goes on the turn's last card once it settles —
+        // and only if the CLI recaps the turn (core/turn-recap-state.ts).
+        const recapWanted = msg.status === 'completed' && turnRecapIo.enabled(ds);
         // The exact turn is over. This is the only boundary that releases the
         // accepted-input guard for it, and only for the exact attempt it names:
         // a late terminal from an older attempt must not release a newer one.
@@ -25700,11 +25687,11 @@ function setupWorkerHandlers(
                 await updateTurnReplyCard(ds, msg.turnId, { kind: 'next_step', ...(next ? { nextStep: next } : {}) },
                   replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsCard });
               } }, nextStepIo);
-              if (recapInput) {
+              if (recapWanted) {
                 noteRecapCard(ds, msg.turnId, { kind: 'unified', publish: async markdown => {
                   await updateTurnReplyCard(ds, msg.turnId, { kind: 'recap', markdown },
                     replyCardSend, { dispatchAttempt: msg.dispatchAttempt, owns: ownsCard });
-                } }, recapInput, turnRecapIo);
+                } }, turnRecapIo);
               }
             })
             .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
@@ -26302,11 +26289,11 @@ function setupWorkerHandlers(
         // delivery posts none — once the daemon's own final has landed.
         const noteSettledReplyCard = (messageId: string): void => {
           noteNextStepCard(ds, msg.turnId, { kind: 'legacy', messageId }, nextStepIo);
-          if (recapInput) {
-            noteRecapCard(ds, msg.turnId, { kind: 'legacy', messageId }, recapInput, turnRecapIo);
+          if (recapWanted) {
+            noteRecapCard(ds, msg.turnId, { kind: 'legacy', messageId }, turnRecapIo);
           }
         };
-        const replyCardRowsWanted = msg.status === 'completed' && (nextStepIo.enabled(ds) || !!recapInput);
+        const replyCardRowsWanted = msg.status === 'completed' && (nextStepIo.enabled(ds) || recapWanted);
         if (replyCardRowsWanted && replyCardRoute !== 'receipt' && replyCardRoute !== 'transcript_rows' && replyCardRoute !== 'unified') {
           logger.info(`[${t}] Reply card rows skipped for ${msg.turnId.substring(0, 16)}: ${replyCardRoute}`);
         }

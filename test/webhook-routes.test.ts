@@ -70,6 +70,24 @@ async function postWebhook(
   return { status: res.status, body: await res.json() };
 }
 
+it('rejects a top-level owner actor on authenticated HMAC and bearer webhooks', async () => {
+  const proxyToDaemon = vi.fn();
+  await startWebhookServer({ proxyToDaemon });
+  const signed = await seedNewGroupConnector();
+  const token = await seedTokenConnector();
+  const body = { actor: 'owner', event: 'fixture' };
+  expect(await postWebhook(signed.id, 'fixture-actor-nonce', body))
+    .toMatchObject({ status: 403, body: { errorCode: 'actor_not_allowed' } });
+  const response = await fetch(`${baseUrl}/webhook/${token.id}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer tok_plain_value' },
+    body: JSON.stringify(body),
+  });
+  expect(response.status).toBe(403);
+  expect(await response.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+  expect(proxyToDaemon).not.toHaveBeenCalled();
+});
+
 async function seedWorkflowConnector(input: {
   mode: 'fixed' | 'dynamic' | 'new-group';
   dedup?: boolean;

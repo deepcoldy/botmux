@@ -3,6 +3,7 @@ import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto
 import { connectorPayloadTrustBlocker, getConnector, listConnectors, type ConnectorDefinition } from '../services/connector-store.js';
 import { getWebhookSecret } from '../services/webhook-key.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
+import { hasTriggerActor } from '../services/trigger-types.js';
 import {
   appendTriggerLog,
   pruneTriggerLogsByConnectorRetention,
@@ -656,6 +657,11 @@ async function handleWebhookRouteImpl(
       return true;
     }
     requestId = nonce;
+  }
+
+  if (hasTriggerActor(parsed.payload)) {
+    fail(403, 'actor_not_allowed', 'actor requires the local Dashboard administrator token');
+    return true;
   }
 
   const responseOptions = parseTriggerResponseOptions(req, url);

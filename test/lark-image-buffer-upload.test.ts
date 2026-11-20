@@ -1,7 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-  file: vi.fn(async (_request: { data: { file_type: string; file_name: string; file: Buffer } }) => ({ file_key: 'file_reply' })),
+  // uploadFile hands the SDK a file stream (a Buffer part has no filename and
+  // Feishu rejects it past ~26MiB) and removes any temp file once the call
+  // returns, so drain the stream while the request is in flight.
+  sent: [] as Buffer[],
+  file: vi.fn(async (request: { data: { file_type: string; file_name: string; file: AsyncIterable<Buffer> } }) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request.data.file) chunks.push(chunk);
+    mocks.sent.push(Buffer.concat(chunks));
+    return { file_key: 'file_reply' };
+  }),
   create: vi.fn(async () => ({ image_key: 'img_v3_uploaded' })),
 }));
 
@@ -31,5 +40,6 @@ it('uploads the full in-memory Markdown answer with its filename and stream type
   expect(mocks.file).toHaveBeenCalledTimes(1);
   const { file, ...metadata } = mocks.file.mock.calls[0]![0].data;
   expect(metadata).toEqual({ file_type: 'stream', file_name: 'reply.md' });
-  expect(file.equals(Buffer.from(answer))).toBe(true);
+  expect(file).toHaveProperty('path', expect.stringMatching(/reply\.md$/));
+  expect(mocks.sent[0]!.equals(Buffer.from(answer))).toBe(true);
 });

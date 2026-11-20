@@ -59,7 +59,7 @@ describe('structured session turns', () => {
     updateSessionTurnNativeAnchor(dataDir, sessionId, 'message-first', 'native-session', 'native-entry');
     expect(readSessionTurns(dataDir, sessionId, 0, 50)).toMatchObject({
       schema: 'botmux.session-turns.v1',
-      capabilities: [],
+      capabilities: ['ownerActor'],
       turns: [{
         anchor: {
           cliId, cliSessionId: 'native-session', cliEntryId: 'native-entry',

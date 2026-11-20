@@ -2408,17 +2408,11 @@ export interface BotConfig {
   replyCardNextStep?: boolean;
   /**
    * Per-bot opt-in for the collapsed「本轮回顾」panel above the last reply
-   * card's footer: files edited and commands run, plus the CLI's own recap
-   * (Claude Code's transcript away summary) once it writes one. Default
-   * (undefined) keeps reply cards unchanged.
+   * card's footer, holding the CLI's own recap of the turn (Claude Code's
+   * transcript away summary). A turn the CLI does not recap gets no panel.
+   * Default (undefined) keeps reply cards unchanged.
    */
   replyCardRecap?: boolean;
-  /**
-   * With replyCardRecap on, also let a small model write the recap for a turn
-   * the CLI left without one (one extra model call per such turn, billed to
-   * the CLI's own credentials; Claude Code only). Default (undefined) off.
-   */
-  replyCardRecapModel?: boolean;
   /**
    * bot@bot 同目录拉起 (cross-bot working-dir inheritance). When a bot is @-ed
    * into a chat/thread where a sibling bot already has an active session, it
@@ -3055,11 +3049,14 @@ export function getConfiguredOwnerOpenId(larkAppId: string): string | undefined 
 export function getOwnerOpenId(larkAppId: string): string | undefined {
   const bot = bots.get(larkAppId);
   if (!bot) return undefined;
+  return getStrictOwnerOpenId(larkAppId) ?? bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
   const configuredOwner = getConfiguredOwnerOpenId(larkAppId);
-  if (configuredOwner && bot.resolvedAllowedUsers.includes(configuredOwner)) {
+  if (configuredOwner && bots.get(larkAppId)?.resolvedAllowedUsers.includes(configuredOwner)) {
     return configuredOwner;
   }
-  return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
@@ -4677,7 +4674,6 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       replyCardActions: entry.replyCardActions === true || undefined,
       replyCardNextStep: entry.replyCardNextStep === true || undefined,
       replyCardRecap: entry.replyCardRecap === true || undefined,
-      replyCardRecapModel: entry.replyCardRecapModel === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       botToBotSameDir: entry.botToBotSameDir === false ? false : undefined,
       // 平台团队展示默认 ON：只有显式 false 有意义/落盘（undefined = 展示）。
