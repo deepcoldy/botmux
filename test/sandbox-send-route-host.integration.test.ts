@@ -40,6 +40,13 @@ async function fakeDaemon(verdict: Record<string, unknown>, chatTool?: (body: an
     req.on('end', async () => {
       let body: any = {};
       try { body = JSON.parse(raw || '{}'); } catch { /* keep {} */ }
+      // Only the known GET / discovery probe is not a route call. Every other
+      // request stays visible to the exact route assertions below.
+      if (req.method === 'GET' && req.url === '/') {
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'not_found' }));
+        return;
+      }
       requests.push({ path: req.url ?? '', body });
       if (req.url === SESSION_CHAT_TOOLS_ROUTE && chatTool) {
         const result = await chatTool(body);
@@ -212,9 +219,12 @@ describe('host re-exec of a sandboxed routed send', () => {
   }, 30_000);
 
   it('fails closed when the daemon cannot be asked', async () => {
-    const daemon = await fakeDaemon({ ok: true });
-    const { root, env } = prepare(daemon.port);
-    await new Promise(resolve => servers.pop()!.close(resolve));
+    // Hold the port and reset every request instead of closing it: another
+    // shard process can never bind this endpoint and answer the route check.
+    const unavailable = createServer(req => { req.socket.destroy(); });
+    servers.push(unavailable);
+    await new Promise<void>(resolve => unavailable.listen(0, '127.0.0.1', resolve));
+    const { root, env } = prepare((unavailable.address() as AddressInfo).port);
     const r = await runSend(['--chat-id', 'oc_team', '--top-level', '--no-mention', 'x'], env, root);
     expect(r.code, r.stderr).toBe(2);
     expect(r.stderr).toContain('ROUTE_NOT_AUTHORIZED');
