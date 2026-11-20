@@ -473,7 +473,7 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
-import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
@@ -775,7 +775,7 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, reconcileUsageLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
@@ -9414,15 +9414,24 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
   isOutputActive: isOutputActivelyProgressing,
 });
 
+let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
+let unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
+
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
   return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
 }
 
+type UsageAwareScreen = {
+  status: RuntimeScreenStatus | 'limited';
+  usageLimit?: CliUsageLimitState;
+  expiredAntigravityQuota?: CliUsageLimitState;
+};
+
 function classifyScreenUsageLimit(
   content: string,
   status: RuntimeScreenStatus,
-): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+): UsageAwareScreen {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   return classifyUsageLimitWithNativeEvidence(content, status);
 }
@@ -9432,7 +9441,7 @@ function classifyScreenUsageLimit(
 function classifyUsageLimitWithNativeEvidence(
   content: string,
   status: RuntimeScreenStatus,
-): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+): UsageAwareScreen {
   if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   let evidence = content;
   if (cliAdapter?.id === 'antigravity' && backend) {
@@ -9445,12 +9454,40 @@ function classifyUsageLimitWithNativeEvidence(
     // IDs. Strip controls without filtering away native composer rows.
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+    let expiredAntigravityQuota: CliUsageLimitState | undefined;
+    const result = usageLimitTracker.classify(evidence, status, state => {
+      const observed = annotateAntigravityUsageLimit(evidence, state);
+      const key = observed.relativeResetKey;
+      if (!key) return observed;
+
+      const previous = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === key)
+        ?? unconfirmedAntigravityQuotas.get(key);
+      const now = Date.now();
+      const limit = reconcileUsageLimitState(previous, observed, now);
+      // Composer 可能到期后才补齐。保留确认后的记录，但从本轮限额判定中排除。
+      if (observed.source === 'antigravity-error-composer' && previous && now >= limit.retryAtMs) {
+        expiredAntigravityQuota = limit;
+        return undefined;
+      }
+      return limit;
+    });
+    // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生 composer 后再把它计入历史。
+    const limit = expiredAntigravityQuota ?? result.usageLimit;
+    const key = limit?.relativeResetKey;
+    if (limit && key) {
+      if (limit.source === 'antigravity-error-composer') {
+        antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, limit);
+        unconfirmedAntigravityQuotas.delete(key);
+      } else if (limit.kind === 'usage' && !key.endsWith(':')) {
+        unconfirmedAntigravityQuotas.set(key, limit);
+        if (unconfirmedAntigravityQuotas.size > ANTIGRAVITY_QUOTA_HISTORY_LIMIT) {
+          unconfirmedAntigravityQuotas.delete(unconfirmedAntigravityQuotas.keys().next().value!);
+        }
+      }
+    }
+    return expiredAntigravityQuota ? { ...result, expiredAntigravityQuota } : result;
   }
-  const result = usageLimitTracker.classify(evidence, status);
-  if (cliAdapter?.id === 'antigravity' && result.usageLimit) {
-    return { ...result, usageLimit: annotateAntigravityUsageLimit(evidence, result.usageLimit) };
-  }
-  return result;
+  return usageLimitTracker.classify(evidence, status);
 }
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
@@ -25270,6 +25307,7 @@ function startScreenUpdates(): void {
   // content (the live failure that prompted this fix).
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
+  let lastSentExpiredQuotaKey: string | undefined;
   let lastSentBackgroundWait = 0;
   let lastTextSnapshotHash = '';
   let lastContent = '';
@@ -25467,8 +25505,11 @@ function startScreenUpdates(): void {
       // has been typed for it, so the projection's 'working' would be false —
       // leave the card at its starting state until the first write happens.
       if (startupInputHeld()) return;
-      if (snapshot.changed || usageAware.status !== lastSentStatus || backgroundWaitTasks !== lastSentBackgroundWait) {
+      const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
+      if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
+        || backgroundWaitTasks !== lastSentBackgroundWait) {
         lastSentStatus = usageAware.status;
+        lastSentExpiredQuotaKey = expiredQuotaKey;
         lastSentBackgroundWait = backgroundWaitTasks;
         send({
           type: 'screen_update',
@@ -38673,6 +38714,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
       }
       lastInitConfig = msg;
+      antigravityQuotaHistory = msg.antigravityQuotaHistory;
+      unconfirmedAntigravityQuotas = new Map();
+      const restoredQuota = msg.antigravityActiveQuota;
+      const restoredKey = restoredQuota?.relativeResetKey;
+      if (restoredQuota?.kind === 'usage' && !restoredQuota.source && restoredKey && !restoredKey.endsWith(':')) {
+        unconfirmedAntigravityQuotas.set(restoredKey, restoredQuota);
+      }
       kimiCacheExpiryAutoCompact = msg.kimiCacheExpiryAutoCompact === true;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {

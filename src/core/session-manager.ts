@@ -12,6 +12,7 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
  * session restoration, and scheduled task execution.
  */
 import { existsSync, statSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { normalizeImageAttachment, imageSequenceHint } from './attachment-image-format.js';
 import { randomUUID } from 'node:crypto';
 import { recordScheduledSessionRun } from './scheduled-send.js';
@@ -2667,6 +2668,7 @@ export function buildReforkCliInput(
 export function persistStreamCardState(ds: DaemonSession): void {
   const cardId = ds.streamCardId === STREAM_CARD_SENTINEL ? undefined : ds.streamCardId;
   const s = ds.session;
+  const quotaHistory = ds.antigravityQuotaHistory ?? s.antigravityQuotaHistory;
   // Skip write if nothing actually changed — avoids disk churn on every screen_update.
   if (
     s.streamCardId === cardId &&
@@ -2677,6 +2679,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
+    isDeepStrictEqual(s.antigravityQuotaHistory, quotaHistory) &&
     s.modelFallback?.uuid === ds.modelFallback?.uuid &&
     s.modelFallback?.claudeSessionId === ds.modelFallback?.claudeSessionId &&
     s.lastUserPrompt === ds.lastUserPrompt &&
@@ -2694,6 +2697,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
   s.usageLimit = ds.usageLimit;
+  s.antigravityQuotaHistory = quotaHistory;
   s.modelFallback = ds.modelFallback;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;

@@ -1,19 +1,21 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
-import { reconcileUsageLimitState } from '../src/utils/cli-usage-limit.js';
+import { reconcileUsageLimitState, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
-import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from '../src/adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
 
 function classifier(raw: () => string, cliId = 'antigravity') {
   const capture = vi.fn(raw);
+  const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false });
   const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
     backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit,
-    usageLimitTracker: createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false }),
+    usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
+    unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
   });
-  return { classify, capture };
+  return { classify, capture, usageLimitTracker };
 }
 const composer = '\r\n────\r\n>\r\n────\r\n';
 const quota = '⚠ Individual quota reached. Resets in 124h24m15s.';
@@ -47,6 +49,101 @@ describe('raw ANSI tmux quota classification', () => {
     const second = classify('', 'working').usageLimit;
     expect(second.relativeResetKey).not.toBe(first.relativeResetKey);
     expect(reconcileUsageLimitState(first, second).retryAtMs).toBe(Date.now() + 60_000);
+  });
+
+  it('ignores a past-reset refusal in the viewport across turns and accepts a new Error ID', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const refusal = (errorId: string) => `⚠ Individual quota reached. Resets in 1m.\nError ID: ${errorId}`;
+    let screen = refusal('old') + composer;
+    const { classify, usageLimitTracker } = classifier(() => screen);
+    const first = classify('', 'idle').usageLimit;
+    expect(first?.source).toBe('antigravity-error-composer');
+
+    vi.advanceTimersByTime(59_000);
+    expect(classify('', 'idle').usageLimit?.retryAtMs).toBe(first.retryAtMs);
+
+    vi.advanceTimersByTime(1_000);
+    const turn = usageLimitTracker.beginTurn(screen);
+    expect(classify('', 'idle')).toMatchObject({ status: 'idle', expiredAntigravityQuota: { source: 'antigravity-error-composer' } });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+
+    screen = refusal('old') + '\n429 Too Many Requests';
+    expect(classify('', 'idle').usageLimit?.kind).toBe('rate');
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(true);
+
+    const retryTurn = usageLimitTracker.beginTurn(screen);
+    screen = refusal('old') + '\n' + refusal('new') + composer;
+    const fresh = classify('', 'idle').usageLimit;
+    expect(fresh?.relativeResetKey).toContain('new');
+    expect(fresh?.retryAtMs).toBe(Date.now() + 60_000);
+    expect(usageLimitTracker.detectedThisTurn(retryTurn)).toBe(true);
+  });
+
+  it('uses the first published deadline when a partial refusal gains its native composer', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const partialScreen = '⚠ Individual quota reached. Resets in 1m.\nError ID: partial-first';
+    let screen = partialScreen;
+    const { classify } = classifier(() => screen);
+    const partial = classify('', 'idle').usageLimit;
+    expect(partial?.source).toBeUndefined();
+
+    vi.advanceTimersByTime(10_000);
+    screen += composer;
+    const confirmed = classify('', 'idle').usageLimit;
+    expect(confirmed?.source).toBe('antigravity-error-composer');
+    expect(confirmed?.retryAtMs).toBe(partial.retryAtMs);
+
+    vi.advanceTimersByTime(50_000);
+    expect(classify('', 'idle')).toMatchObject({ status: 'idle', expiredAntigravityQuota: { source: 'antigravity-error-composer' } });
+
+    screen = partialScreen;
+    expect(classify('', 'idle').status).toBe('limited');
+  });
+
+  it('keeps reporting a partial refusal until its native composer is confirmed', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const screen = '⚠ Individual quota reached. Resets in 1m.\nError ID: unconfirmed';
+    const { classify } = classifier(() => screen);
+    const partial = classify('', 'idle').usageLimit;
+    vi.advanceTimersByTime(60_000);
+    expect(classify('', 'idle')).toMatchObject({ status: 'limited', usageLimit: { retryAtMs: partial.retryAtMs } });
+  });
+
+  it('suppresses an expired refusal revealed by a redraw after a newer refusal', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const oldScreen = '⚠ Individual quota reached. Resets in 1m.\nError ID: old' + composer;
+    const newScreen = oldScreen.replace('Error ID: old', 'Error ID: new');
+    let screen = oldScreen;
+    const { classify, usageLimitTracker } = classifier(() => screen);
+    expect(classify('', 'idle').usageLimit?.relativeResetKey).toContain('old');
+
+    vi.advanceTimersByTime(60_000);
+    screen = newScreen;
+    const fresh = classify('', 'idle').usageLimit;
+    expect(fresh?.relativeResetKey).toContain('new');
+
+    screen = oldScreen;
+    const turn = usageLimitTracker.beginTurn(screen);
+    expect(classify('', 'idle')).toMatchObject({ status: 'idle', expiredAntigravityQuota: { source: 'antigravity-error-composer' } });
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+
+    screen = newScreen;
+    vi.advanceTimersByTime(1_000);
+    expect(classify('', 'idle').usageLimit?.retryAtMs).toBe(fresh.retryAtMs);
+  });
+
+  it('evicts the oldest refusal without promoting a repeated key', () => {
+    const first: CliUsageLimitState = {
+      limited: true, kind: 'usage', retryAtMs: 60_000, retryLabel: '1m', retryReady: false,
+      relativeResetKey: 'usage:60000:first', source: 'antigravity-error-composer',
+    };
+    let history = rememberAntigravityQuota(undefined, first);
+    const newerKeys = Array.from({ length: ANTIGRAVITY_QUOTA_HISTORY_LIMIT }, (_, index) => `usage:60000:${index}`);
+    for (const key of newerKeys) {
+      expect(rememberAntigravityQuota(history, { ...first, retryAtMs: 120_000 })).toBe(history);
+      history = rememberAntigravityQuota(history, { ...first, relativeResetKey: key });
+    }
+    expect(history?.map(entry => entry.relativeResetKey)).toEqual(newerKeys);
   });
 
   it('retains actual working footer authority above a colored historical refusal', () => {
