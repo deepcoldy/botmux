@@ -17,7 +17,7 @@ import { withFileLockSync } from '../src/utils/file-lock.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
 import { RELAY_SESSION_TOOLS_MARKER, prepareDirectSandbox, startOutboxWatcher, validateRelaySessionToolRequest } from '../src/adapters/backend/sandbox.js';
-import { accessForPath, buildFsPolicy, compileToSeatbelt, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
+import { accessForPath, buildFsPolicy, compileToBwrap, compileToSeatbelt, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
 import { buildRelaySessionToolRequest, materializeRelayedAttachments } from '../src/cli/relay-session-tool.js';
 import { readVerifiedFile } from '../src/services/remote-runner-session-tool.js';
 import { sandboxWithholdsBotSecret } from '../src/adapters/cli/sandbox-mode.js';
@@ -73,6 +73,155 @@ describe('fs-policy: withholdSendCredential', () => {
     for (const f of ['master.key', 'appsecret_cli_self.enc']) {
       expect(accessForPath(buildFsPolicy(ctx(linux)).rules, `${linuxStore}/${f}`).access).toBe('readOnly');
       expect(accessForPath(buildFsPolicy(ctx({ ...linux, withholdSendCredential: true })).rules, `${linuxStore}/${f}`).access).toBe('deny');
+    }
+  });
+
+  it.each([
+    ['workingDir', (store: string) => ({ workingDir: store })],
+    ['user readWrite store', (store: string) => ({ userPaths: { readWrite: [store] } })],
+    ['user readWrite exact key', (store: string) => ({ userPaths: { readWrite: [`${store}/master.key.file`, `${store}/master.key`] } })],
+    ['user readOnly store', (store: string) => ({ userPaths: { readOnly: [store] } })],
+  ])('keeps the lark-cli keystore closed against %s on both platforms', (_label, grant) => {
+    for (const platform of ['darwin', 'linux'] as const) {
+      const home = platform === 'darwin' ? '/Users/u' : '/home/u';
+      const store = platform === 'darwin' ? `${home}/Library/Application Support/lark-cli` : `${home}/.local/share/lark-cli`;
+      const master = platform === 'darwin' ? 'master.key.file' : 'master.key';
+      const policy = buildFsPolicy(ctx({
+        platform, homeDir: home, botmuxHome: `${home}/.botmux`, sessionDataDir: `${home}/.botmux/data`,
+        workingDir: `${home}/proj`, botHome: `${home}/.botmux/bots/cli_self`,
+        ...grant(store), withholdSendCredential: true,
+      }));
+      for (const file of [master, 'appsecret_cli_self.enc']) {
+        const effective = accessForPath(policy.rules, `${store}/${file}`);
+        expect(effective.access, `${platform}/${_label}/${file}`).toBe('deny');
+        expect(effective.rule?.source).toBe('mandatory');
+      }
+      expect(accessForPath(policy.rules, store).access).toBe('deny');
+      expect(accessForPath(policy.rules, store).rule?.source).toBe('mandatory');
+    }
+  });
+
+  it('also closes an exact-key grant against a custom Linux keystore', () => {
+    const store = '/home/u/custom-lark-store';
+    const policy = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      botHome: '/home/u/.botmux/bots/cli_self', larkCliLinuxStore: store,
+      withholdSendCredential: true,
+      userPaths: { readWrite: [`${store}/master.key`] },
+    }));
+    expect(accessForPath(policy.rules, `${store}/master.key`).access).toBe('deny');
+    expect(accessForPath(policy.rules, `${store}/appsecret_cli_self.enc`).access).toBe('deny');
+  });
+
+  it.each(['darwin', 'linux'] as const)('seals the keystore in no-transport sessions on %s', (platform) => {
+    const home = platform === 'darwin' ? '/Users/u' : '/home/u';
+    const store = platform === 'darwin' ? `${home}/Library/Application Support/lark-cli` : `${home}/.local/share/lark-cli`;
+    const master = platform === 'darwin' ? 'master.key.file' : 'master.key';
+    const policy = buildFsPolicy(ctx({
+      platform, homeDir: home, botmuxHome: `${home}/.botmux`, sessionDataDir: `${home}/.botmux/data`,
+      workingDir: `${home}/proj`, botHome: `${home}/.botmux/bots/cli_self`,
+      larkTransportEnabled: false, withholdSendCredential: true,
+      mandatoryReadOnlyPaths: [`${store}/${master}`, `${store}/appsecret_cli_self.enc`],
+    }));
+    for (const file of [master, 'appsecret_cli_self.enc']) {
+      expect(accessForPath(policy.rules, `${store}/${file}`).access).toBe('deny');
+    }
+    expect(policy.finalDenyPaths).toContain(store);
+    if (platform === 'darwin') {
+      const ancestor = buildFsPolicy(ctx({
+        platform, homeDir: home, botmuxHome: `${home}/.botmux`, sessionDataDir: `${home}/.botmux/data`,
+        workingDir: `${home}/proj`, botHome: `${home}/.botmux/bots/cli_self`,
+        larkTransportEnabled: false, withholdSendCredential: true,
+        mandatoryReadOnlyPaths: [home],
+      }));
+      const profile = compileToSeatbelt(ancestor);
+      expect(profile.lastIndexOf(`(deny file-read* (subpath "${store}"))`))
+        .toBeGreaterThan(profile.lastIndexOf(`(allow file-read* (subpath "${home}"))`));
+    } else {
+      const compiled = compileToBwrap(policy, {
+        chdir: `${home}/proj`, emptyDir: '/empty', emptiesDir: '/empties', filePaths: new Set(),
+      });
+      expect(compiled.args).not.toContain(`${store}/${master}`);
+      expect(compiled.args).not.toContain(`${store}/appsecret_cli_self.enc`);
+    }
+  });
+
+  it('seals a custom Linux keystore in a no-transport session', () => {
+    const store = '/home/u/custom-lark-store';
+    const policy = buildFsPolicy(ctx({
+      platform: 'linux', homeDir: '/home/u', botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj',
+      botHome: '/home/u/.botmux/bots/cli_self', larkCliLinuxStore: store,
+      larkTransportEnabled: false, withholdSendCredential: true,
+      mandatoryReadOnlyPaths: [`${store}/master.key`],
+    }));
+    expect(accessForPath(policy.rules, `${store}/master.key`).access).toBe('deny');
+    expect(policy.finalDenyPaths).toContain(store);
+    const compiled = compileToBwrap(policy, {
+      chdir: '/home/u/proj', emptyDir: '/empty', emptiesDir: '/empties', filePaths: new Set(),
+    });
+    expect(compiled.args).not.toContain(`${store}/master.key`);
+  });
+
+  it('does not let a final Seatbelt read-only exception re-open a withheld key', () => {
+    const store = '/Users/u/Library/Application Support/lark-cli';
+    const key = `${store}/master.key.file`;
+    const policy = buildFsPolicy(ctx({
+      withholdSendCredential: true,
+      userPaths: { readWrite: [store] },
+      serviceCredentialReadOnlyPaths: [key],
+    }));
+    expect(policy.finalReadOnlyPaths).not.toContain(key);
+    const profile = compileToSeatbelt(policy);
+    const allow = `(allow file-read* (subpath "${key}"))`;
+    const deny = `(deny file-read* (subpath "${key}"))`;
+    expect(profile.lastIndexOf(deny)).toBeGreaterThan(profile.lastIndexOf(allow));
+  });
+
+  it.each(['/Users/u/Library/Application Support', '/Users/u', '/'])(
+    'does not let an ancestor final read-only path re-open withheld keys: %s',
+    (ancestor) => {
+      const policy = buildFsPolicy(ctx({
+        withholdSendCredential: true,
+        mandatoryReadOnlyPaths: [ancestor],
+      }));
+      // Ancestors may remain readable for the rest of the sandbox, but the
+      // final withheld-store deny must be emitted after every such grant.
+      expect(policy.finalReadOnlyPaths).toContain(ancestor);
+      const profile = compileToSeatbelt(policy);
+      const store = '/Users/u/Library/Application Support/lark-cli';
+      expect(profile.lastIndexOf(`(deny file-read* (subpath "${store}"))`))
+        .toBeGreaterThan(profile.lastIndexOf(`(allow file-read* (subpath "${ancestor}"))`));
+      for (const file of ['master.key.file', 'appsecret_cli_self.enc']) {
+        const key = `/Users/u/Library/Application Support/lark-cli/${file}`;
+        expect(profile.lastIndexOf(`(deny file-read* (subpath "${key}"))`))
+          .toBeGreaterThan(profile.lastIndexOf(`(allow file-read* (subpath "${key}"))`));
+      }
+    },
+  );
+
+  it('drops every deeper grant inside a withheld keystore, including sibling and future files', () => {
+    for (const platform of ['darwin', 'linux'] as const) {
+      const home = platform === 'darwin' ? '/Users/u' : '/home/u';
+      const store = platform === 'darwin' ? `${home}/Library/Application Support/lark-cli` : `${home}/.local/share/lark-cli`;
+      const siblings = ['appsecret_cli_other.enc', 'cli_self_ou_secret.enc', 'future-secret.enc'];
+      const policy = buildFsPolicy(ctx({
+        platform, homeDir: home, botmuxHome: `${home}/.botmux`, sessionDataDir: `${home}/.botmux/data`,
+        workingDir: `${home}/proj`, botHome: `${home}/.botmux/bots/cli_self`, withholdSendCredential: true,
+        userPaths: { readOnly: siblings.map(file => `${store}/${file}`) },
+        mandatoryReadOnlyPaths: [`${store}/cli_self_ou_secret.enc`],
+      }));
+      for (const file of siblings) {
+        expect(accessForPath(policy.rules, `${store}/${file}`).access, `${platform}/${file}`).toBe('deny');
+      }
+      expect(policy.rules.every(rule => rule.access === 'deny' || !rule.path.startsWith(`${store}/`))).toBe(true);
+      if (platform === 'linux') {
+        const compiled = compileToBwrap(policy, {
+          chdir: `${home}/proj`, emptyDir: '/empty', emptiesDir: '/empties', filePaths: new Set(),
+        });
+        for (const file of siblings) expect(compiled.args).not.toContain(`${store}/${file}`);
+      }
     }
   });
 
