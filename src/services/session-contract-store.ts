@@ -34,7 +34,7 @@ function sessionKey(ref: ContractSessionRef): string {
 }
 function eventExecution(event: ContractEvent): ExecutionRef | undefined {
   if (event.type === 'execution_admitted') return event.execution.ref;
-  if (event.type === 'execution_phase' || event.type === 'execution_continued' || event.type === 'execution_terminal' || event.type === 'execution_output') return event.execution;
+  if (event.type === 'execution_phase' || event.type === 'execution_continued' || event.type === 'execution_reattached' || event.type === 'execution_terminal' || event.type === 'execution_output') return event.execution;
   if (event.type === 'control_requested') return event.operation.targetExecution;
   return undefined;
 }
@@ -338,9 +338,11 @@ export class SessionContractStore {
       older('execution', retention.executions, ['succeeded', 'failed', 'cancelled']);
       older('continuation_failure_delivery', retention.executions, ['delivered']);
       older('operation', retention.operations, ['confirmed', 'failed_before_effect', 'rejected']);
-      this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind='execution_observer'
-        AND NOT EXISTS (SELECT 1 FROM entities x WHERE x.session_key=entities.session_key AND x.kind='execution'
-          AND x.id=json_extract(entities.value,'$.execution.executionId'))`).run(key);
+      for (const kind of ['execution_observer', 'execution_reattachment']) {
+        this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind=?
+          AND NOT EXISTS (SELECT 1 FROM entities x WHERE x.session_key=entities.session_key AND x.kind='execution'
+            AND x.id=json_extract(entities.value,'$.execution.executionId'))`).run(key, kind);
+      }
       // A turn whose attempt is still unsettled may yet deliver its result.
       for (const kind of ['result_binding', 'result_delivery', 'result_revision']) {
         this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind=? AND rowid NOT IN (SELECT rowid FROM entities WHERE session_key=? AND kind=? ORDER BY rowid DESC LIMIT ?)
@@ -718,6 +720,114 @@ export class SessionContractStore {
       const operation: ControlOperation = { operationId: options.operationId ?? randomUUID(), kind, phase: 'planned', targetRuntime: options.runtime ?? session.activeRuntime, targetExecution: options.execution, proposedRuntime: options.proposedRuntime, expectedRevision: session.revision, previousLifecycle: supersedes && kind === 'restart' ? active!.previousLifecycle ?? 'active' : session.lifecycle };
       const result = this.applyInside(ref, { type: 'control_requested', operation }, `operation:${operation.operationId}`, session.revision);
       if (result.decision !== 'applied') throw new Error(`control_request_${result.decision}`); return { operation, joined: false };
+    });
+  }
+  /** `execution` was moved by re-attachment from `from`, possibly over several
+   *  restarts, and now runs on `to`. */
+  executionReattachedFrom(ref: ContractSessionRef, execution: ExecutionRef, from: RuntimeRef, to: RuntimeRef): boolean {
+    let current = from;
+    for (let hops = 0; hops < 16; hops++) {
+      const link = this.entity<{ execution: ExecutionRef; from: RuntimeRef; to: RuntimeRef }>(ref, 'execution_reattachment',
+        JSON.stringify([execution.executionId, current.runtimeId]));
+      if (!link || !sameExecution(link.execution, execution) || !sameRuntime(link.from, current)) return false;
+      if (sameRuntime(link.to, to)) return true;
+      current = link.to;
+    }
+    return false;
+  }
+  /**
+   * A successor worker re-attached the CLI process an older worker generation
+   * left running with attempts in flight (a daemon restart keeps the pane and
+   * its CLI). When the live runtime's identity is that same process — same
+   * backend, pid and kernel start time — in the same native conversation, those
+   * attempts are still running in it; they move onto the live runtime, keeping
+   * their phase, and nothing is re-submitted.
+   *
+   * A successor normally proves this on its first binding and simply reuses the
+   * old runtime, or completes its bare first observation through a new binding.
+   * A CLI whose native conversation id only arrives after that binding, enriching
+   * it in place (Antigravity reads it from the process's open files once
+   * re-attached), got a new runtime first and kept it: its running attempt stayed
+   * on the lost one, and every later report of it, its final reply included, was
+   * refused as `execution_scope_unproven`.
+   *
+   * Fail closed, on the same evidence a reuse needs: only an older worker's
+   * runtime whose loss was recorded (`unresolved`); a live runtime with no
+   * attempt of its own yet; the same process and conversation in every binding
+   * the two runtimes ever had; and between them nothing but bare re-observations
+   * of that process (or this worker's own launcher continued into it) that ran
+   * no work. A lifecycle operation keeps every attempt where it is.
+   */
+  reattachPredecessorExecutions(ref: ContractSessionRef, live: RuntimeRef, worker: WorkerRef): ExecutionRef[] {
+    return this.transaction(() => {
+      const state = this.read(ref);
+      const current = this.runtime(ref, live.runtimeId);
+      const identity = current?.identity;
+      if (!state || state.lifecycle !== 'active' || state.activeOperationId || !sameWorker(state.worker, worker)
+        || !current || !sameRuntime(current.ref, live) || !sameRuntime(state.activeRuntime, live)
+        || !sameWorker(current.worker, worker) || !['starting', 'ready'].includes(current.phase)
+        || identity?.proof !== 'process_start' || !identity.nativeSessionId) return [];
+      const executions = this.executions(ref);
+      const holdsOpenWork = (runtime: RuntimeRef): boolean => executions.some(execution =>
+        !terminalPhase(execution.phase) && sameRuntime(execution.runtime, runtime));
+      // Input already running here means the CLI moved on since; whether an
+      // older attempt is still running in it is no longer the runtime's to say.
+      if (holdsOpenWork(live)) return [];
+      const open = executions.filter(execution => execution.runtime && !execution.terminal && !terminalPhase(execution.phase));
+      if (!open.length) return [];
+      const history = (this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime'").all(sessionKey(ref)) as Array<{ value: string }>)
+        .map(row => JSON.parse(row.value) as RuntimeContract);
+      const records = (this.db.prepare("SELECT value FROM events WHERE session_key=? AND type IN ('runtime_bound','runtime_reserved')").all(sessionKey(ref)) as Array<{ value: string }>)
+        .map(row => JSON.parse(row.value) as Extract<ContractEvent, { type: 'runtime_bound' | 'runtime_reserved' }>);
+      const bound = records.flatMap(event => event.type === 'runtime_bound' ? [event.runtime] : []);
+      const sameConversation = (other?: RuntimeIdentity): boolean => !!other && samePhysicalRuntimeIdentity(other, identity)
+        && (other.nativeSessionId === undefined || other.nativeSessionId === identity.nativeSessionId)
+        && (other.nativeGeneration === undefined || other.nativeGeneration === identity.nativeGeneration);
+      if (!bound.filter(runtime => sameRuntime(runtime.ref, live)).every(runtime => !runtime.identity || sameConversation(runtime.identity))) return [];
+      const continuedBareLauncher = (runtime: RuntimeContract): boolean => sameWorker(runtime.worker, worker)
+        && this.runtimeContinues(ref, runtime.ref, live, worker)
+        && runtime.identity?.proof === 'process_start'
+        && runtime.identity.nativeSessionId === undefined && runtime.identity.nativeGeneration === undefined;
+      const moved: ExecutionRef[] = [];
+      for (const execution of open) {
+        const source = this.runtime(ref, execution.runtime!.runtimeId);
+        if (!source || !sameRuntime(source.ref, execution.runtime)) continue;
+        // This worker already observes it there under a host grant (Codex);
+        // moving it would void the grant its in-flight reports carry.
+        if (this.authorizedExecutionObserver(ref, source.ref, worker, execution.ref)) continue;
+        // In-process continuations keep an attempt on the runtime it was
+        // submitted under; its process is the last runtime of that lineage.
+        const lineage = [source.ref, ...this.continuedRuntimes(ref, source.ref, source.worker)];
+        const survivor = this.runtime(ref, lineage.at(-1)!.runtimeId);
+        if (!survivor || sameWorker(survivor.worker, worker) || survivor.worker.generation >= worker.generation
+          || survivor.phase !== 'unresolved' || survivor.ref.epoch >= live.epoch
+          || !reusableRuntimeIdentity(survivor.identity, identity)) continue;
+        // The survivor was only ever bound to this process and conversation.
+        if (!bound.filter(runtime => sameRuntime(runtime.ref, survivor.ref))
+          .every(runtime => !runtime.identity || runtime.identity.proof === 'opaque' || sameConversation(runtime.identity))) continue;
+        // Every epoch between them is accounted for, and in every binding it
+        // ever had only re-observes this process without contradicting the
+        // conversation, or is this worker's own bare launcher whose CLI became
+        // the live runtime; none ran work.
+        const between = (runtime: RuntimeContract): boolean => runtime.ref.epoch > survivor.ref.epoch && runtime.ref.epoch < live.epoch;
+        const interval = history.filter(between);
+        const complete = interval.length === live.epoch - survivor.ref.epoch - 1
+          && new Set(interval.map(runtime => runtime.ref.epoch)).size === interval.length
+          && interval.every(runtime => records.some(event => event.type === 'runtime_reserved' && sameRuntime(event.runtime.ref, runtime.ref)));
+        const uncertainOnly = [...interval, ...bound.filter(between)]
+          .every(runtime => !runtime.identity || sameConversation(runtime.identity) || continuedBareLauncher(runtime))
+          && interval.every(runtime => !holdsOpenWork(runtime.ref));
+        if (!complete || !uncertainOnly) continue;
+        const result = this.applyInside(ref, { type: 'execution_reattached', execution: execution.ref, from: execution.runtime!, runtime: live },
+          `reattach:${execution.ref.executionId}:${live.runtimeId}:${live.epoch}`);
+        if (result.decision !== 'applied') continue;
+        // Output frozen under the runtime it moved from (a durable handoff)
+        // still names that runtime; keep the link that proves where it went.
+        this.saveEntity(ref, 'execution_reattachment', JSON.stringify([execution.ref.executionId, execution.runtime!.runtimeId]),
+          'active', { execution: execution.ref, from: execution.runtime, to: live });
+        moved.push(execution.ref);
+      }
+      return moved;
     });
   }
   markUnresolvedExecutions(ref: ContractSessionRef, runtime: RuntimeRef): void {

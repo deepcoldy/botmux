@@ -161,6 +161,10 @@ export class SessionController {
         this.store.continueRuntime(this.ref, continued, bound.ref, worker);
         this.store.inheritExecutionContinuation(this.ref, continuesBindingId!, bindingId, worker);
       }
+      // A re-attached CLI may prove its native conversation only after its
+      // first binding; attempts a predecessor worker left running in this very
+      // process then report under the live runtime again.
+      this.store.reattachPredecessorExecutions(this.ref, bound.ref, worker);
       return bound;
     });
     // Physical binding is a fact even if granting execution continuation fails.
@@ -245,7 +249,18 @@ export class SessionController {
   }
   controlStarted(operationId: string): boolean { const result = this.store.apply(this.ref, { type: 'control_started', operationId }); this.refresh(); return result.decision === 'applied'; }
   controlResult(operationId: string, phase: 'confirmed' | 'failed_before_effect' | 'rejected' | 'uncertain', runtime?: RuntimeRef, error?: string): void {
-    this.store.apply(this.ref, { type: 'control_result', operationId, phase, ...(runtime ? { runtime } : {}), ...(error ? { error } : {}) }); this.refresh();
+    this.store.atomic(() => {
+      this.store.apply(this.ref, { type: 'control_result', operationId, phase, ...(runtime ? { runtime } : {}), ...(error ? { error } : {}) });
+      this.reattachToLiveRuntime();
+    }); this.refresh();
+  }
+  /** An operation that settled may have held back a re-attachment the live
+   *  runtime already proved (a /stop sent before the conversation id arrived). */
+  private reattachToLiveRuntime(): void {
+    const state = this.store.read(this.ref);
+    if (state?.activeRuntime && state.worker && !state.activeOperationId) {
+      this.store.reattachPredecessorExecutions(this.ref, state.activeRuntime, state.worker);
+    }
   }
   allowsInput(): boolean {
     const state = this.store.read(this.ref)!;
@@ -305,7 +320,8 @@ export class SessionController {
       if (!execution) return undefined;
       if (execution.runtime && !sameRuntime(execution.runtime, runtime)) {
         if (!this.store.runtimeContinues(this.ref, execution.runtime, runtime, value.producer)
-          && !this.store.runtimeContinues(this.ref, runtime, execution.runtime, value.producer)) return undefined;
+          && !this.store.runtimeContinues(this.ref, runtime, execution.runtime, value.producer)
+          && !this.store.executionReattachedFrom(this.ref, execution.ref, runtime, execution.runtime)) return undefined;
         value.scope.runtime = execution.runtime;
       }
     }
@@ -385,6 +401,14 @@ export class SessionController {
         && this.sameOrContinuedRuntime(stored.runtime, context.scope.runtime, channel)) {
         context.scope.runtime = stored.runtime;
       }
+      // An attempt no runtime has bound yet — an opening turn whose input rode
+      // the spawn argv before any runtime existed (Pi, Grok, …) — is reported
+      // under the binding its observer captured, often the launcher's. Once this
+      // worker continued that CLI in process into the active runtime (the relay
+      // resolving the real CLI behind its launcher), the attempt runs there.
+      // Judged under the launcher's binding its final was refused, and the
+      // opening reply never reached the chat.
+      if (stored && !stored.runtime) context.scope.runtime = this.continuedInto(context.scope.runtime, channel);
     }
     if (sidecar) {
       const proven = this.outputOrigin(sidecar);
@@ -479,6 +503,7 @@ export class SessionController {
     if (event) {
       const result = this.store.apply(this.ref, event, context.eventId);
       if (result.decision === 'conflict' || result.decision === 'stale') return { kind: 'reject', reason: result.reason ?? `contract_${result.decision}` };
+      if (event.type === 'control_result') this.reattachToLiveRuntime();
       if (continuationFailure) this.store.rejectExecutionContinuation(this.ref, continuationFailure.bindingId);
       if (this.ds.initConfig?.cliId === 'traex' && event.type === 'execution_phase' && event.execution.dispatchAttempt === undefined
         && (event.phase === 'submitting' || event.phase === 'accepted')) {

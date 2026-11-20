@@ -5,7 +5,7 @@
 // transcript bridge is the callback the spawn left behind, as in production.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
@@ -285,6 +285,28 @@ describe('turns around a semantic runtime rebind', () => {
 
     await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0], TURNS[1])));
     expect(s.ds.managedTurnOrigin?.turnId).toBeUndefined();
+    expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+
+  it('delivers the opening reply whose prompt rode the spawn argv once the relay resolves the real CLI', async () => {
+    // Pi and Grok take the opening prompt in their argv: nothing is written to
+    // the CLI, and the worker's start report precedes any runtime, so no
+    // runtime ever binds that turn. Its transcript bridge was armed under the
+    // launcher's binding, which the relay then continued into the real CLI's
+    // (2026-11-14..19: 10 of 15 opening replies of one Pi bot were refused).
+    const warn = vi.spyOn(logger, 'warn');
+    const s = await startWorker();
+    const opening = () => s.controller.store.executions(s.controller.ref, TURNS[0])[0];
+    expect(opening()?.runtime).toBeUndefined();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-argv');
+    expect(s.scope.currentBinding()).not.toBe(s.binding);
+    expect(opening()?.runtime).toBeUndefined();
+
+    await s.bridge({ type: 'final_output', content: `answer for ${TURNS[0]}`, lastUuid: `uuid-${TURNS[0]}`, turnId: TURNS[0] });
+    await s.bridge({ type: 'turn_terminal', sessionId: SESSION, turnId: TURNS[0], status: 'completed' });
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0])));
+    expect(opening()).toMatchObject({ phase: 'succeeded', runtime: s.controller.currentRuntime() });
     expect(lostTurnWarnings(warn)).toEqual([]);
   });
 
@@ -674,6 +696,11 @@ describe('replies that genuinely cannot be posted', () => {
       expect.stringMatching(new RegExp(`Final output from current worker not delivered turn=${TURNS[0]}`))));
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(s.replies()).toEqual([]);
+    // Quiet, but not thrown away: the reply is kept on the host.
+    const archive = join(dir, 'undelivered-replies');
+    const kept = readdirSync(archive, { recursive: true }).map(String).filter(name => name.endsWith('.md'));
+    expect(kept).toHaveLength(1);
+    expect(readFileSync(join(archive, kept[0]!), 'utf8')).toContain(`answer for ${TURNS[0]}`);
   });
 
   // A replaced CLI's observer drops its copy; the live CLI's observer posts it.

@@ -2319,6 +2319,22 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       }
     } else if (!nativeSessionId && lastInitConfig?.cliId === 'grok' && typeof findGrokSessionByPid === 'function') {
       nativeSessionId = findGrokSessionByPid(childPid)?.sessionId;
+    } else if (!nativeSessionId && lastInitConfig?.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput
+      && (observedBackend as { isReattach?: boolean } | null)?.isReattach === true
+      && typeof nativeSessionForkPending === 'function' && !nativeSessionForkPending()) {
+      // A daemon restart re-attaches agy mid-turn. Its conversation is the one
+      // the process holds open (the observation that later persists its id);
+      // read it here so the first binding already proves it. Bound bare, the
+      // re-attached CLI got a new runtime, and a reply that finished while no
+      // worker was attached was refused before that id caught up. A fresh
+      // launch has no predecessor to match, and while agy starts up it briefly
+      // holds sibling conversations open: leave its id to the later observation.
+      const cid = cliAdapter?.resolveActiveSessionId
+        ? cliAdapter.resolveActiveSessionId({ cliPid: childPid, cliCwd: lastInitConfig.workingDir })
+        : findAntigravityConversationIdByPid(childPid) ?? undefined;
+      if (cid && !(lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid)) {
+        nativeSessionId = cid;
+      }
     } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
       // Likewise a re-attached Claude may be mid-turn and write nothing until
       // that turn ends. Without its conversation the contract cannot tell this
@@ -14031,7 +14047,12 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
           const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff);
           codexBridgeQueue.absorb(history);
           codexBridgeQueue.ingest(live);
-          if (restored > 0 && structuredBridgeIs('antigravity') && lastInitConfig?.adoptMode) {
+          // agy's last reply is held as a provisional final in driver state
+          // until a quiet tick confirms it. A turn that finished while no worker
+          // was attached (a daemon restart) ends in exactly that state, and the
+          // offset already moved past it: dropping the state dropped the reply,
+          // for a re-attached botmux-launched agy as for an adopted pane.
+          if (restored > 0 && structuredBridgeIs('antigravity')) {
             structuredBridgeDriverState = result.state;
           }
           if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
