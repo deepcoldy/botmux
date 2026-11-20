@@ -34489,6 +34489,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onOwnerDiagnostic: (ds, diagnostic) =>
       workerOwnerDiagnostics.report(ds.larkAppId, ds.session.sessionId, diagnostic),
     larkAppId: cfg.larkAppId,
+    // Backend-outage summary: one DM per outage, to the bot's current owner
+    // (same resolution as the host-memory alert; apiOnly bots have no DM).
+    notifyOwner: async (appId, content) => {
+      const owner = resolveWorkerAdmissionOwner(appId, { getBot, getOwnerOpenId });
+      if (!owner) {
+        logger.warn(`[backend-outage] no owner to send the outage summary to for ${appId}`);
+        return;
+      }
+      await sendUserMessage(appId, owner, content, 'text', undefined, { timeoutMs: 10_000 });
+    },
     onMemoryAdmissionBlocked: (ds, decision) =>
       memoryAdmissionOwnerAlerts.report(ds.larkAppId, ds.session.sessionId, decision),
     sessionReply,

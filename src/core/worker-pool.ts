@@ -1069,6 +1069,9 @@ import {
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { failedTurnRewindInFlight, mergeFailedTurnInput, planFailedTurnRewind, turnAnswersInChat } from './failed-turn-rewind.js';
 import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
+import { BackendOutageCoordinator, recoveryEligibility, type BackendOutageDeps, type BackendOutageTimings } from './backend-outage-coordinator.js';
+import { buildBackendOutageCard, formatBackendOutageSummary } from './backend-outage-card.js';
+import { probeTmuxServerUp } from '../adapters/backend/tmux-pipe-backend.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
@@ -1375,6 +1378,8 @@ export interface WorkerPoolCallbacks {
   onOwnerDiagnostic?: (ds: DaemonSession, diagnostic: WorkerOwnerDiagnostic) => void;
   /** Exact store-owning app, including boot with no live sessions. */
   larkAppId?: string;
+  /** One plain-text message to the bot owner's DM (backend-outage summary). */
+  notifyOwner?: (larkAppId: string, content: string) => Promise<unknown>;
   /** Host memory diagnostics go to the bot owner, independently of turn replies. */
   onMemoryAdmissionBlocked?: (ds: DaemonSession, decision: WorkerAdmissionDecision) => void;
   onTurnResult?: (result: Readonly<TurnResult>) => void | Promise<void>;
@@ -9405,6 +9410,173 @@ export function requestSessionRestart(
 export function __testOnly_resetRestartCoordinator(): void {
   topicEffortRestartReadiness.clear();
   restartCoordinator.reset();
+}
+
+/**
+ * Keep a crash-stopped worker around as a diagnostic: it parks a tmux shell
+ * showing the last startup output and respawns the CLI itself on the next
+ * message. Shared by the crash-loop give-up and the backend-outage give-up.
+ */
+function parkCrashDiagnosticWorker(ds: DaemonSession, opts: { terminal?: boolean } = {}): void {
+  // Ask the worker to park a lightweight tmux diagnostic shell under
+  // bmx-diag-<sid> NOW (deferred from its exit so transient restarts
+  // don't pay for it). Keep its web server alive so the existing
+  // terminal URL can show the startup failure; the next user message
+  // tells that same worker to destroy the diagnostic shell and retry.
+  ds.workerReady = false;
+  // The worker now holds a parked diagnostic shell and will respawn the
+  // CLI itself on the next message (no restart IPC in that path), so the
+  // next message must carry the current launch model. Cleared once a
+  // worker generation reports ready again.
+  ds.crashDiagnosticParked = true;
+  ds.worker!.send({ type: 'park_diagnostic', ...(opts.terminal === false ? { terminal: false } : {}) } as DaemonToWorker);
+  restartCounts.delete(ds.session.sessionId);
+  const crashPrevScreenStatus = ds.lastScreenStatus;
+  ds.lastScreenStatus = 'idle';
+  stampIdleSinceAt(ds, crashPrevScreenStatus);
+  // Diagnostic park keeps the worker alive (no killWorker here), so the
+  // periodic usage refresh must be stopped explicitly on this
+  // working→idle boundary — the else branch's killWorker already does.
+  clearUsageRefreshTimer(ds);
+  // Survive a daemon restart: mark this as a deliberate lazy
+  // cold-resume. Restore keeps ANY managed session with a 'missing'
+  // backing active regardless (re-spawns the CLI on the next
+  // message) since the host-reboot fix, so this marker records the
+  // parked state (dormant label + skip redundant probes) rather than
+  // gating the keep. ds.hasHistory is already true (set at the top of
+  // claude_exit); forkWorker clears suspendedColdResume on re-spawn.
+  ds.session.suspendedColdResume = true;
+  sessionStore.updateSession(ds.session);
+}
+
+function backendOutageDeps(): BackendOutageDeps<DaemonSession> {
+  return {
+    now: () => Date.now(),
+    setTimeout: (fn, ms) => {
+      const handle = setTimeout(fn, ms);
+      handle.unref?.();
+      return handle;
+    },
+    clearTimeout: handle => clearTimeout(handle as NodeJS.Timeout),
+    // Through the restart coordinator like every crash auto-restart, so the
+    // attempt-correlated restart_result lifts the workerReady fence.
+    restart: (ds, onSettled) => requestSessionRestart(ds, {
+      source: 'cli_crash',
+      notify: status => {
+        if (status !== 'in_progress') onSettled(status);
+      },
+    }) !== undefined,
+    serverUp: socketName => probeTmuxServerUp(socketName),
+    eligible: ds => recoveryEligibility({
+      active: ds.session.status === 'active',
+      current: !activeSessionsRegistry || activeSessionsRegistry.get(activeSessionKey(ds)) === ds,
+      transferring: isSessionTransferring(ds),
+      // Idle reclaim, a tmux switch fan-out or a crash-diagnostic park put it
+      // to sleep on purpose: restarting (or reforking) it would undo that, and
+      // forkWorker clears the marker. Its next real message resumes it.
+      dormant: ds.session.suspendedColdResume === true,
+    }),
+    externalRecoveryInFlight: ds => {
+      if (ds.session.status !== 'active' || ds.session.suspendedColdResume || ds.crashDiagnosticParked) return false;
+      // A cancelled outage restart may be superseded by a refork, transfer or
+      // another correlated restart. The readiness flags cover the short gap
+      // after the old worker's retirement releases and before the replacement
+      // reports process-ready, as well as the later process-ready → CLI-prompt
+      // window; the grace in the coordinator bounds the wait if no replacement
+      // actually exists.
+      return isSessionTransferring(ds)
+        || lifecycleRetiringWorkers.has(ds)
+        || restartCoordinator.activeAttemptId(ds.session.sessionId) !== undefined
+        || ds.workerReady === false
+        || ds.cliReady === false;
+    },
+    giveUp: (ds, { keepTerminal }) => {
+      ds.managedTurnOrigin = undefined;
+      if (ds.worker && !ds.worker.killed) {
+        // Keep the worker: inputs that arrived during the outage stay queued
+        // in it, and the next message restarts the CLI (crash-loop contract).
+        parkCrashDiagnosticWorker(ds, { terminal: keepTerminal });
+      } else {
+        const prev = ds.lastScreenStatus;
+        ds.lastScreenStatus = 'idle';
+        stampIdleSinceAt(ds, prev);
+        killWorker(ds);
+      }
+      // The interrupted turn's streaming card must not stay "working".
+      scheduleActiveRuntimePatch(ds);
+    },
+    render: (ds, view) => buildBackendOutageCard(view, botLocale(getBot(ds.larkAppId).config)),
+    post: async (ds, cardJson, uuid) => callbacks?.sessionReply(
+      sessionAnchorId(ds), cardJson, 'interactive', ds.larkAppId,
+      fallbackTurnId(ds, undefined), { sourceSessionId: ds.session.sessionId, uuid },
+    ),
+    patch: async (ds, messageId, cardJson) => {
+      await updateMessage(ds.larkAppId, messageId, cardJson);
+    },
+    patchIsFinal: err => err instanceof MessageWithdrawnError || err instanceof MessageUpdateExpiredError,
+    summarize: async summary => {
+      let botName = summary.larkAppId;
+      let locale;
+      try {
+        const bot = getBot(summary.larkAppId);
+        botName = bot.botName ?? summary.larkAppId;
+        locale = botLocale(bot.config);
+      } catch { /* bot deregistered meanwhile: keep the app id */ }
+      await callbacks?.notifyOwner?.(summary.larkAppId, formatBackendOutageSummary(summary, botName, locale));
+    },
+    log: line => logger.warn(`[backend-outage] ${line}`),
+  };
+}
+
+/** Socket a managed session's pane lives on, as the worker recorded it. */
+function managedTmuxSocketOf(ds: DaemonSession): string | undefined | null {
+  const target = ds.session.persistentBackendTarget;
+  return target?.backendType === 'tmux' ? target.socketName : null;
+}
+
+/** Pre-loss evidence that another managed backend could have kept this tmux
+ *  server non-empty. A persisted registry row alone is not evidence: suspended
+ *  cold-resume and worker-less sessions have no pane. Parked workers are also
+ *  excluded conservatively (terminal:false has no diagnostic shell); ambiguity
+ *  then stays on the ordinary CLI-exit path. */
+function hasLiveManagedBackendForGone(ds: DaemonSession): boolean {
+  const worker = ds.worker;
+  if (!worker || worker.killed || worker.connected === false || worker.exitCode != null || worker.signalCode != null) return false;
+  return !ds.session.suspendedColdResume && !ds.crashDiagnosticParked;
+}
+
+/**
+ * Whether a `gone` server (nobody listens on the socket) is a real loss of a
+ * shared server. tmux shuts an EMPTY server down cleanly, so a lone session
+ * whose own CLI exited 0 leaves the very same `gone` behind. A server that
+ * still held another session of ours cannot have ended that way: if another
+ * active session with a live managed backend lives on the socket, the server
+ * was lost with sessions in it. Otherwise the exit is treated as the CLI's own
+ * (ordinary crash handling, which also restarts it). An old outage's existence
+ * alone is NOT current evidence: its members may since have gone cold too.
+ */
+function goneServerCorroborated(ds: DaemonSession, socketName: string | undefined): boolean {
+  if (!activeSessionsRegistry) return false;
+  for (const other of activeSessionsRegistry.values()) {
+    if (other === ds || other.session.status !== 'active') continue;
+    const socket = managedTmuxSocketOf(other);
+    if (socket !== null && (socket ?? '') === (socketName ?? '') && hasLiveManagedBackendForGone(other)) return true;
+  }
+  return false;
+}
+
+/** Every CLI exit caused by losing a shared tmux server goes here instead of
+ *  the per-session crash loop (see backend-outage-coordinator.ts). */
+let backendOutage = new BackendOutageCoordinator<DaemonSession>(backendOutageDeps());
+
+/** Test seam: a fresh coordinator, optionally with fake I/O and timings. */
+export function __testOnly_resetBackendOutage(
+  overrides: Partial<BackendOutageDeps<DaemonSession>> = {},
+  timings: Partial<BackendOutageTimings> = {},
+): BackendOutageCoordinator<DaemonSession> {
+  backendOutage.reset();
+  backendOutage = new BackendOutageCoordinator<DaemonSession>({ ...backendOutageDeps(), ...overrides }, timings);
+  return backendOutage;
 }
 
 /**
@@ -20757,6 +20929,11 @@ function setupWorkerHandlers(
     dispatchAttempt?: number,
   ): Promise<void> => {
     if (startupState.failureNotified) return;
+    // Backend-outage recovery owns this session's restarts and its one card.
+    if (backendOutage.onStartupFailure(ds.session.sessionId, reason)) {
+      logger.warn(`[${t}] Startup failure folded into the backend outage recovery: ${reason}`);
+      return;
+    }
     // Restart recovery (daemon restart batch-restore): stay silent in the chat.
     // Without this guard every restored session whose worker fails to start
     // posts a "会话启动失败" card into its own topic — a broadcast storm during
@@ -22554,7 +22731,22 @@ function setupWorkerHandlers(
         // and wait for the NEXT set instead of trusting a stale `true`.
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
+        const recoveringParkedDiagnostic = ds.crashDiagnosticParked === true;
+        if (recoveringParkedDiagnostic) {
+          // The next-message retry respawns INSIDE the existing worker, so no
+          // process-level ready or attempt-correlated restart_result will
+          // release the fence lowered by parkCrashDiagnosticWorker. Its first
+          // prompt is the authoritative successful recovery edge and also the
+          // authorized in-place resume of the cold-resume marker.
+          ds.workerReady = true;
+          ds.crashDiagnosticParked = undefined;
+          if (ds.session.suspendedColdResume) {
+            ds.session.suspendedColdResume = undefined;
+            sessionStore.updateSession(ds.session);
+          }
+        }
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
+        backendOutage.onPromptReady(ds.session.sessionId);
         // 到了 prompt 不等于恢复健康：CLI 可能每收到一条（被重投的）输入就退出，
         // 在这里清零会让熔断永远不触发。只记下本轮崩溃后首次 ready 的时间，ready
         // 后稳定存活满一个窗口再崩溃才算新一轮——一次历史性永久退出（127/77）因此
@@ -22564,17 +22756,9 @@ function setupWorkerHandlers(
           restartStreak.readyAt = Date.now();
           logger.info(`[${t}] CLI ready after ${restartStreak.count} crash(es); the restart streak resets only if it stays up`);
         }
-        // A live prompt means a (re)spawn reached a working CLI — clear the lazy
-        // cold-resume marker set when we parked a crash diagnostic shell. The
-        // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
-        // forkWorker, so without this the stale marker survives in the store and a
-        // LATER genuine zombie (bmx-<sid> actually gone) would be kept active by
-        // restore instead of being closed. If retry never reaches a prompt the
-        // marker persists, preserving the cross-daemon-restart lazy-retry intent.
-        if (ds.session.suspendedColdResume) {
-          ds.session.suspendedColdResume = undefined;
-          sessionStore.updateSession(ds.session);
-        }
+        // Deliberate cold suspension is NOT cleared by an arbitrary late prompt:
+        // only forkWorker admission or the authorized parked in-place retry
+        // above may clear it. Otherwise prompt_ready merely observes the CLI.
         if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
           const rawInput = ds.pendingRawInput;
           ds.pendingRawInput = undefined;
@@ -24195,6 +24379,8 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored claude_exit from stale worker generation`);
           break;
         }
+        // Read before any later step can move the screen state.
+        const turnRunningAtExit = ds.lastScreenStatus === 'working';
         // The original opted-in turn has no dispatchAttempt, so worker.ts's
         // durable-delivery terminal path cannot report its CLI exit. Bind the
         // exit here to the exact live turn + worker generation. Synthetic
@@ -24427,6 +24613,48 @@ function setupWorkerHandlers(
           break;
         }
 
+        // The CLI did not fail: the shared tmux server holding its pane was
+        // lost, and every session on that server is reporting the same thing.
+        // One backend outage, handled once (backend-outage-coordinator.ts):
+        // no crash-loop count, no per-session crash notice, a single server
+        // recovery, one status card per topic and one owner summary.
+        const serverLost = msg.backendLost
+          && (msg.backendLost.kind !== 'gone' || goneServerCorroborated(ds, msg.backendLost.socketName));
+        if (msg.backendLost && !serverLost) {
+          logger.info(
+            `[${t}] tmux server ${msg.backendLost.socketName ?? 'default'} is gone but held no other session of ours; `
+            + 'treating it as the CLI\'s own exit',
+          );
+        }
+        if (msg.backendLost && serverLost) {
+          logger.warn(
+            `[${t}] ${sessionCliDisplayName(ds, botCfg)} lost its tmux server `
+            + `(${msg.backendLost.kind}); handing it to the backend outage recovery`,
+          );
+          backendOutage.onServerLost(ds, ds.session.sessionId, {
+            larkAppId: ds.larkAppId,
+            ...(msg.backendLost.socketName !== undefined ? { socketName: msg.backendLost.socketName } : {}),
+            kind: msg.backendLost.kind,
+            cliName: sessionCliDisplayName(ds, botCfg),
+            title: ds.session.title || ds.currentTurnTitle || '',
+            turnInFlight: turnRunningAtExit,
+            canPark: !!msg.canParkDiagnostic,
+            silent: suppressExitUi,
+          });
+          break;
+        }
+        // A session still being recovered from such an outage: its recovery
+        // restart reports the outcome to the outage coordinator, which decides
+        // on another attempt or gives up — never the crash loop.
+        if (backendOutage.onCliExit(ds.session.sessionId, {
+          code: msg.code,
+          ...(msg.logTail ? { logTail: msg.logTail } : {}),
+          canPark: !!msg.canParkDiagnostic,
+        })) {
+          logger.warn(`[${t}] CLI exited during backend outage recovery (code: ${msg.code}); the outage recovery owns its restart`);
+          break;
+        }
+
         // Rate-limit auto-restart to prevent crash loops. 判定纳入退出码语义：
         // 永久失败（身份 77/命令缺失 127）只给一次重启且不被 60s 时间窗豁免，
         // 避免慢启动 CLI 的确定性失败无限静默重启（见 restart-policy）。
@@ -24474,35 +24702,7 @@ function setupWorkerHandlers(
             scheduleCardPatch(ds, frozenCard);
           }
           if (keepDiagnosticWorker) {
-            // Ask the worker to park a lightweight tmux diagnostic shell under
-            // bmx-diag-<sid> NOW (deferred from its exit so transient restarts
-            // don't pay for it). Keep its web server alive so the existing
-            // terminal URL can show the startup failure; the next user message
-            // tells that same worker to destroy the diagnostic shell and retry.
-            ds.workerReady = false;
-            // The worker now holds a parked diagnostic shell and will respawn the
-            // CLI itself on the next message (no restart IPC in that path), so the
-            // next message must carry the current launch model. Cleared once a
-            // worker generation reports ready again.
-            ds.crashDiagnosticParked = true;
-            ds.worker!.send({ type: 'park_diagnostic' } as DaemonToWorker);
-            restartCounts.delete(key);
-            const crashPrevScreenStatus = ds.lastScreenStatus;
-            ds.lastScreenStatus = 'idle';
-            stampIdleSinceAt(ds, crashPrevScreenStatus);
-            // Diagnostic park keeps the worker alive (no killWorker here), so the
-            // periodic usage refresh must be stopped explicitly on this
-            // working→idle boundary — the else branch's killWorker already does.
-            clearUsageRefreshTimer(ds);
-            // Survive a daemon restart: mark this as a deliberate lazy
-            // cold-resume. Restore keeps ANY managed session with a 'missing'
-            // backing active regardless (re-spawns the CLI on the next
-            // message) since the host-reboot fix, so this marker records the
-            // parked state (dormant label + skip redundant probes) rather than
-            // gating the keep. ds.hasHistory is already true (set at the top of
-            // claude_exit); forkWorker clears suspendedColdResume on re-spawn.
-            ds.session.suspendedColdResume = true;
-            sessionStore.updateSession(ds.session);
+            parkCrashDiagnosticWorker(ds);
           } else {
             // Non-tmux or failed diagnostic parking: keep the historical
             // cleanup path so we do not leave an unusable worker around.
@@ -24590,6 +24790,9 @@ function setupWorkerHandlers(
 
       case 'error': {
         logger.error(`[${t}] Worker error: ${msg.message}`);
+        // A start failure while recovering from a backend outage belongs to
+        // that recovery: it decides on a retry and shows it on the topic card.
+        if (backendOutage.onStartupFailure(ds.session.sessionId, msg.message)) break;
         // `error` is a fatal launch-generation signal. It normally arrives
         // during init, but can also follow a previously-ready worker whose CLI
         // recovery/restart fails; that later failure must remain user-visible —
@@ -25037,6 +25240,17 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'inflight_requeued': {
+        // Re-queued in-flight inputs only matter as the outcome of a turn a
+        // backend outage cut: shown on its card, never as a message or an
+        // attention event of its own (ordinary restarts stay as they were).
+        logger.info(`[${t}] ${msg.message}`);
+        if (ds.worker === worker && !managedAuxUiSuppressed(undefined, undefined)) {
+          backendOutage.absorbNotice(ds.session.sessionId, msg.message);
+        }
+        break;
+      }
+
       case 'user_notify': {
         if (msg.kind === 'resume_fallback') {
           // The worker reports the demotion FACT on every occurrence; the
@@ -25069,6 +25283,8 @@ function setupWorkerHandlers(
               message: msg.message,
             }),
             send: async notice => {
+              // During a backend outage the topic's one status card says it.
+              if (backendOutage.absorbNotice(ds.session.sessionId, notice)) return;
               await sendTurnNotice(ds, {
                 kind: 'user_notify',
                 turnId: fallbackTurnId(ds, msg.turnId),
@@ -25085,6 +25301,11 @@ function setupWorkerHandlers(
           reason: 'user_notify',
           message: msg.message,
         });
+        // What a resumed CLI lost to a backend outage goes on the topic's one
+        // outage status card instead of a separate message.
+        if (msg.kind === 'restart_interruption'
+            && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
+            && backendOutage.absorbNotice(ds.session.sessionId, msg.message)) break;
         // The card already asks about this dialog. Fork agents and sessions
         // without the hook get no card and keep this notice.
         if (msg.kind === 'claude_permission_prompt') {
