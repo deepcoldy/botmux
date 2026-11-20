@@ -1,8 +1,7 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
-import { closeSync, constants as fsConstants, openSync, readFileSync, createWriteStream, mkdirSync, existsSync, lstatSync, renameSync, unlinkSync, realpathSync } from 'node:fs';
+import { closeSync, constants as fsConstants, openSync, readFileSync, mkdirSync, existsSync, lstatSync, renameSync, unlinkSync, realpathSync } from 'node:fs';
 import { dirname, extname, basename, join, sep } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
@@ -2151,8 +2150,11 @@ async function writeViaRename(savePath: string, write: (fd: number) => Promise<v
   const fd = openSync(tmp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
   let renamed = false;
   try {
+    // `write` owns no descriptor lifecycle: it must never close `fd`, so this
+    // function is its single closer. A WriteStream/pipeline would close the fd
+    // on error even with autoClose:false, leaving the finally to close a number
+    // another open() may have recycled in between.
     await write(fd);
-    closeSync(fd);
     // Rename only into that same directory. If an attacker swaps it after this
     // check, `tmp` no longer resolves to the descriptor's original directory,
     // so there is no external staging file for the rename to publish.
@@ -2180,11 +2182,19 @@ async function writeResourceToDisk(res: any, savePath: string, guard?: DownloadD
     const stream = res && typeof res.getReadableStream === 'function'
       ? res.getReadableStream()
       : res;
-    if (stream && (typeof stream.pipe === 'function' || typeof stream[Symbol.asyncIterator] === 'function')) {
-      await pipeline(stream as NodeJS.ReadableStream, createWriteStream('', { fd, autoClose: false }));
-      return;
+    if (!stream || (typeof stream.pipe !== 'function' && typeof stream[Symbol.asyncIterator] !== 'function')) {
+      throw new Error('Resource download did not return a readable stream');
     }
-    throw new Error('Resource download did not return a readable stream');
+    // Drain the stream onto the pinned descriptor with raw callback writes.
+    // Do not hand `fd` to a WriteStream: pipeline() destroys it on error and
+    // closes the descriptor despite autoClose:false, which would double-close
+    // (and potentially close a recycled fd belonging to another operation).
+    let position = 0;
+    for await (const chunk of stream as AsyncIterable<unknown>) {
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array | string);
+      await fdWriteAll(fd, buffer, position);
+      position += buffer.length;
+    }
   }, guard);
 }
 
