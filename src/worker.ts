@@ -69,7 +69,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname, delimiter, relative, extname, resolve } from 'node:path';
+import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
@@ -474,7 +474,7 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
-import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
@@ -653,6 +653,7 @@ import {
   selectSessionBackend,
 } from './adapters/backend/session-backend-selector.js';
 import { managedTmuxCandidateSockets, normaliseTmuxSocketName, preferredManagedTmuxSocket, tmuxServerLabel, tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
+import { probeTmuxSessionWithLegacyRoot } from './adapters/backend/tmux-socket-root.js';
 import { buildReproduceCommand, selectReproduceLaunch } from './adapters/backend/reproduce-command.js';
 import {
   deriveRiffReposFromDirs,
@@ -776,7 +777,7 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, reconcileUsageLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
@@ -9412,15 +9413,24 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
   isOutputActive: isOutputActivelyProgressing,
 });
 
+let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
+let unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
+
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
   return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
 }
 
+type UsageAwareScreen = {
+  status: RuntimeScreenStatus | 'limited';
+  usageLimit?: CliUsageLimitState;
+  expiredAntigravityQuota?: CliUsageLimitState;
+};
+
 function classifyScreenUsageLimit(
   content: string,
   status: RuntimeScreenStatus,
-): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+): UsageAwareScreen {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   return classifyUsageLimitWithNativeEvidence(content, status);
 }
@@ -9430,7 +9440,7 @@ function classifyScreenUsageLimit(
 function classifyUsageLimitWithNativeEvidence(
   content: string,
   status: RuntimeScreenStatus,
-): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+): UsageAwareScreen {
   if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   let evidence = content;
   if (cliAdapter?.id === 'antigravity' && backend) {
@@ -9443,12 +9453,40 @@ function classifyUsageLimitWithNativeEvidence(
     // IDs. Strip controls without filtering away native composer rows.
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+    let expiredAntigravityQuota: CliUsageLimitState | undefined;
+    const result = usageLimitTracker.classify(evidence, status, state => {
+      const observed = annotateAntigravityUsageLimit(evidence, state);
+      const key = observed.relativeResetKey;
+      if (!key) return observed;
+
+      const previous = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === key)
+        ?? unconfirmedAntigravityQuotas.get(key);
+      const now = Date.now();
+      const limit = reconcileUsageLimitState(previous, observed, now);
+      // Composer 可能到期后才补齐。保留确认后的记录，但从本轮限额判定中排除。
+      if (observed.source === 'antigravity-error-composer' && previous && now >= limit.retryAtMs) {
+        expiredAntigravityQuota = limit;
+        return undefined;
+      }
+      return limit;
+    });
+    // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生 composer 后再把它计入历史。
+    const limit = expiredAntigravityQuota ?? result.usageLimit;
+    const key = limit?.relativeResetKey;
+    if (limit && key) {
+      if (limit.source === 'antigravity-error-composer') {
+        antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, limit);
+        unconfirmedAntigravityQuotas.delete(key);
+      } else if (limit.kind === 'usage' && !key.endsWith(':')) {
+        unconfirmedAntigravityQuotas.set(key, limit);
+        if (unconfirmedAntigravityQuotas.size > ANTIGRAVITY_QUOTA_HISTORY_LIMIT) {
+          unconfirmedAntigravityQuotas.delete(unconfirmedAntigravityQuotas.keys().next().value!);
+        }
+      }
+    }
+    return expiredAntigravityQuota ? { ...result, expiredAntigravityQuota } : result;
   }
-  const result = usageLimitTracker.classify(evidence, status);
-  if (cliAdapter?.id === 'antigravity' && result.usageLimit) {
-    return { ...result, usageLimit: annotateAntigravityUsageLimit(evidence, result.usageLimit) };
-  }
-  return result;
+  return usageLimitTracker.classify(evidence, status);
 }
 
 // ─── Adopt-bridge state (Claude Code only) ─────────────────────────────────
@@ -22733,7 +22771,7 @@ function scheduleSubmitFailureNotify(
   turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'nativeSessionTitle' | 'queuedActivationToken'>,
   durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
   structuredTarget = false,
-  onConfirmed?: (cliSessionId?: string) => void,
+  onConfirmed?: (cliSessionId?: string, unprovenCliSessionId?: string) => void,
 ): void {
   const preview = buildSubmitMessagePreview(msg);
   const emitDurableTerminal = (errorCode: string): void => {
@@ -22876,7 +22914,7 @@ function scheduleSubmitFailureNotify(
           acknowledgeNativeInputConsumed(turnIdentity?.turnId, 'codex_history_match',
             cliSessionId ?? lastInitConfig?.cliSessionId, undefined, turnIdentity?.dispatchAttempt);
         }
-        onConfirmed?.(cliSessionId);
+        onConfirmed?.(cliSessionId, settlement.unprovenCliSessionId);
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
         redriveRejectedStructuredReady();
         return;
@@ -23272,6 +23310,7 @@ function acknowledgeQueuedActivation(item: PendingCliInput): void {
 function observeQueuedActivationReceipt(
   item: PendingCliInput,
   recheck: () => SubmitRecheckResult | Promise<SubmitRecheckResult>,
+  submittedText: string,
 ): void {
   if (!item.queuedActivationToken || !backend) return;
   const generation = cliSpawnGeneration;
@@ -23281,10 +23320,14 @@ function observeQueuedActivationReceipt(
     isCurrent: () => cliSpawnGeneration === generation
       && backend === receiptBackend && !cliRestartInProgress,
     onConfirmed: result => {
-      if (typeof result === 'object' && result.cliSessionId) {
-        persistCliSessionId(result.cliSessionId);
-        if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(result.cliSessionId);
-        void syncFreshCodexNativeSessionTitle(result.cliSessionId, codexRpcEngine);
+      const cliSessionId = typeof result === 'object' && result ? result.cliSessionId : undefined;
+      const unprovenCliSessionId = typeof result === 'object' && result ? result.unprovenCliSessionId : undefined;
+      recordStructuredInput(item.turnId, submittedText, item.structuredSourceTurnIds,
+        cliSessionId, !unprovenCliSessionId);
+      if (cliSessionId) {
+        persistCliSessionId(cliSessionId);
+        if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cliSessionId);
+        void syncFreshCodexNativeSessionTitle(cliSessionId, codexRpcEngine);
       }
       queuePostSubmitNativeSessionTitle(item.nativeSessionTitle);
       acknowledgeQueuedActivation(item);
@@ -24945,7 +24988,13 @@ async function flushPending(): Promise<void> {
             item,
             'failed',
             codexBridgeActive,
-            () => {
+            (confirmedCliSessionId, unprovenCliSessionId) => {
+              // The immediate write returned submitted:false, so the normal
+              // post-write anchor was skipped. Preserve the exact prepared
+              // bytes (including any adapter correlation marker) when the
+              // deferred receipt later proves this same input was accepted.
+              recordStructuredInput(item.turnId, submittedText,
+                item.structuredSourceTurnIds, confirmedCliSessionId, !unprovenCliSessionId);
               releaseInputDeliveryQuarantine(
                 deliveryQuarantine,
                 'authoritative deferred submit evidence',
@@ -24954,7 +25003,7 @@ async function flushPending(): Promise<void> {
             },
           );
           if (!result.failureReason && result.recheck) {
-            observeQueuedActivationReceipt(item, result.recheck);
+            observeQueuedActivationReceipt(item, result.recheck, submittedText);
           } else if (result.failureReason && item.queuedActivationToken && !codexAppSafeNonSubmission) {
             // The thread was just told this input was not written; follow-ups
             // the daemon holds behind the activation would otherwise wait forever.
@@ -25230,6 +25279,7 @@ function startScreenUpdates(): void {
   // content (the live failure that prompted this fix).
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
+  let lastSentExpiredQuotaKey: string | undefined;
   let lastSentBackgroundWait = 0;
   let lastTextSnapshotHash = '';
   let lastContent = '';
@@ -25427,8 +25477,11 @@ function startScreenUpdates(): void {
       // has been typed for it, so the projection's 'working' would be false —
       // leave the card at its starting state until the first write happens.
       if (startupInputHeld()) return;
-      if (snapshot.changed || usageAware.status !== lastSentStatus || backgroundWaitTasks !== lastSentBackgroundWait) {
+      const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
+      if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
+        || backgroundWaitTasks !== lastSentBackgroundWait) {
         lastSentStatus = usageAware.status;
+        lastSentExpiredQuotaKey = expiredQuotaKey;
         lastSentBackgroundWait = backgroundWaitTasks;
         send({
           type: 'screen_update',
@@ -26825,7 +26878,17 @@ async function spawnCliBody(
       const placement = resolveManagedTmuxPlacement({
         recordedSocketName: recordedTmuxSocket(cfg.persistentBackendTarget),
         preferred: preferredTmuxSocket,
-        probe: socketName => TmuxBackend.probeSessionWithRetry(tmuxSessionName, { socketName }),
+        probe: socketName => {
+          const result = probeTmuxSessionWithLegacyRoot({
+            strict: cfg.envPolicy?.mode === 'strict',
+            socketName,
+            probe: label => TmuxBackend.probeSessionWithRetry(tmuxSessionName, { socketName: label }),
+          });
+          // Pre-PR strict workers always used /tmp. Adopt that root only when
+          // the legacy session provably exists; unknown never permits a fork.
+          if (result.legacySocketRoot) process.env.TMUX_TMPDIR = result.legacySocketRoot;
+          return result.probe;
+        },
       });
       resolvedTmuxSocketName = placement.socketName;
       if (placement.probe !== 'missing' && placement.socketName !== preferredTmuxSocket) {
@@ -27553,6 +27616,10 @@ async function spawnCliBody(
           ? persistentReattachBias(resolvedTmuxSessionProbe)
           : undefined,
     tmuxSocketName: persistentReattachBias(resolvedTmuxSessionProbe) ? resolvedTmuxSocketName : preferredTmuxSocket,
+    // Only strict workers pin an absolute root. Persist it with the existing
+    // target so daemon workerless probe/kill uses explicit -S on the SAME server.
+    tmuxSocketRoot: cfg.envPolicy?.mode === 'strict' && process.env.TMUX_TMPDIR && isAbsolute(process.env.TMUX_TMPDIR)
+      ? process.env.TMUX_TMPDIR : undefined,
     zmxRecoveryStateDir: isolationRuntimeDataDir,
   });
   // Settle a reattach that rests on an indeterminate existence probe with one
@@ -37703,6 +37770,7 @@ function recordStructuredInput(
   input: string,
   sourceTurnIds?: string[],
   cliSessionId?: string,
+  allowCliSessionIdFallback = true,
 ): void {
   const dataDir = process.env.SESSION_DATA_DIR;
   const cliId = lastInitConfig?.cliId;
@@ -37710,7 +37778,11 @@ function recordStructuredInput(
   try {
     recordSessionTurnInput({
       dataDir, sessionId, turnId, input, cliId, sourceTurnIds,
-      cliSessionId: cliSessionId ?? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId,
+      // An unproven deferred candidate must not inherit the previous native
+      // thread: owned proof can fill the id later without first mis-anchoring.
+      cliSessionId: cliSessionId ?? (allowCliSessionIdFallback
+        ? lastInitConfig?.cliSessionId ?? lastSpawnEffectiveCliSessionId
+        : undefined),
     });
   } catch {
     log('Failed to record structured session input');
@@ -38633,6 +38705,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
       }
       lastInitConfig = msg;
+      antigravityQuotaHistory = msg.antigravityQuotaHistory;
+      unconfirmedAntigravityQuotas = new Map();
+      const restoredQuota = msg.antigravityActiveQuota;
+      const restoredKey = restoredQuota?.relativeResetKey;
+      if (restoredQuota?.kind === 'usage' && !restoredQuota.source && restoredKey && !restoredKey.endsWith(':')) {
+        unconfirmedAntigravityQuotas.set(restoredKey, restoredQuota);
+      }
       kimiCacheExpiryAutoCompact = msg.kimiCacheExpiryAutoCompact === true;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {

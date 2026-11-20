@@ -23109,6 +23109,17 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
     const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
       ?? ds.currentReplyTarget?.turnId
       ?? `queued-activation-followup-${randomUUID()}`;
+    // The coalesced CLI turn keeps only the last turnId for attribution, so
+    // fold every buffered message's staged inbound into that turn's payload
+    // before durable admission. Without this the read model would expose only
+    // the final buffered message (same merge as buildReservedInitialInput).
+    if (bufferedTurnIds.length > 0) {
+      try {
+        mergeStagedSessionTurnInputs(config.session.dataDir, ds.session.sessionId, turnId, bufferedTurnIds);
+      } catch {
+        logger.warn('Failed to stage merged activation input');
+      }
+    }
     const traexRpcContext = traexRpcContextForSession(ds, cliId);
     const followUp = buildFollowUpCliInput(
       buffered.join('\n\n'),
