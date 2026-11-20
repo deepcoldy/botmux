@@ -741,6 +741,7 @@ describe('principal lane durable store', () => {
     source.backendType = 'pty';
     source.sandbox = true;
     source.sandboxNetwork = true;
+    source.sandboxWithholdBotSecret = true;
     source.sandboxNetworkPolicy = {
       version: 1, public: { mode: 'allow' },
       private: { mode: 'allowlist', rules: [{ cidr: '10.77.0.1', protocol: 'tcp', ports: [443] }] },
@@ -776,6 +777,7 @@ describe('principal lane durable store', () => {
     expect(shadow.session).toMatchObject({
       sandbox: true,
       sandboxNetwork: true,
+      sandboxWithholdBotSecret: true,
       sandboxNetworkPolicy: frozen,
       protectedHttpEgressPolicy: frozenProtectedEgress,
     });
@@ -2561,6 +2563,17 @@ describe('createSession()', () => {
         },
       },
     });
+  });
+
+  it('round-trips the frozen legacy reply delivery across store reloads', () => {
+    const session = createSession('chat-legacy-delivery', 'root-legacy-delivery', 'Legacy pane');
+    session.replyDeliveryLegacy = { cliId: 'claude-code', mode: 'transcript' };
+    updateSession(session);
+
+    init('other-app');
+    init('test-app');
+    expect(getSessionFresh(session.sessionId)?.replyDeliveryLegacy)
+      .toEqual({ cliId: 'claude-code', mode: 'transcript' });
   });
 
   it('should default chatType to undefined when not provided', () => {

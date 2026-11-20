@@ -315,6 +315,20 @@ describe('run context and display', () => {
     expect(buildUntilDoneRunPrompt(task(), 'run-4', fmt)).toBeUndefined();
   });
 
+  it('silent 收尾轮必须显式 final send，非 silent 保持最终答复指引', () => {
+    const base = markUntilDoneFinalRun(task({ untilDone: open({ attempts: 2, deadline: iso(NOW) }) }), 'run-final');
+    const silent = buildUntilDoneRunPrompt({ ...base, silent: true }, 'run-final', fmt)!;
+    expect(silent).toContain('botmux send --response-kind final');
+    expect(silent).toContain('最终回复不会发到群里');
+    expect(silent.match(/botmux send --response-kind final/g)).toHaveLength(2);
+    expect(silent).toContain('交付结果');
+    expect(silent).not.toContain('做不完就在最终答复里');
+
+    const loud = buildUntilDoneRunPrompt({ ...base, silent: false }, 'run-final', fmt)!;
+    expect(loud).toContain('做不完就在最终答复里');
+    expect(loud).not.toContain('botmux send --response-kind final');
+  });
+
   it('shows state and ledger only for tasks that have them', () => {
     expect(describeScheduleState(task(), fmt)).toEqual([]);
     const lines = describeScheduleState(task({

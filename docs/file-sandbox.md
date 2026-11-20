@@ -258,7 +258,60 @@ worker spawnCli
 2. daemon 侧 `startOutboxWatcher` 拾取请求，在**沙盒外**用真实凭证重跑 `send` 投递，结果写回
 3. 附件被拷进 `outbox`（共享路径）后路径改写，host 侧才读得到
 
-→ **所有飞书密钥全程不进沙盒**。
+→ send 这条路不需要沙盒里有飞书密钥。但白名单隔离默认仍授 BOT_HOME 读写，其中的
+`send-cred.json` 是明文 App Secret，`history` / `quoted` 等命令就靠它直连飞书。
+
+**`sandboxWithholdBotSecret`（会话创建时冻结进 `session.sandboxWithholdBotSecret`）**：
+
+- fs-policy 对 `<BOT_HOME>/send-cred.json` 加 mandatory deny（`ctx.withholdSendCredential`），
+  BOT_HOME 其余部分照旧读写。worker 仍会写这个文件，给宿主侧重执行用。
+- macOS 白名单隔离也建 `<数据目录>/sandboxes/<会话>/outbox`、授读写、起 outbox watcher、发布
+  relay capability。Seatbelt 没有 `--setenv`、tmux pane 只透传白名单里的 `BOTMUX_*`，所以
+  `BOTMUX_SEND_RELAY` 放在命令里传：`sandbox-exec -f <sb> /usr/bin/env BOTMUX_SEND_RELAY=<outbox> <cli>`。
+  热重连时 outbox 不在就拒绝启动。孤儿目录清扫依赖 `/proc`，macOS 上不会扫到这类目录，
+  会话正常关闭时由 worker 删除。
+- `cmdSend`：macOS 的 Seatbelt pane 看得到宿主的进程标记，所以「有活标记」不能当成「不在沙盒」；
+  有 `BOTMUX_SEND_RELAY` 且内核探针被拒时，和 Linux 一样只认 outbox 里的 capability。
+- `history` / `quoted`：沙盒内读不到 send-cred 且有中转目录时，写一条
+  `{command:'session-tool', tool:<RemoteRunnerSessionToolRequest>, originCapability}`。watcher 用
+  remote-runner 同一份校验（`normalizeRemoteRunnerSessionToolRequest`，只放行 history / quoted），
+  经 `authorize` 拿到本轮 turn，再走 `runRemoteRunnerSessionTool` 在宿主执行：session-id 由宿主
+  指定，`quoted` 带 `--remote-runner-session-tool`（消息不在本会话的群里就拒绝）。宿主执行 `quoted`
+  时把 `BOTMUX_ATTACHMENTS_ROOT` 指到 `sandboxes/<会话>/relay-attachments`（沙盒不可达），下载不进
+  沙盒可写的共享附件桶；打包时按已校验的 inode 读（O_NOFOLLOW）。附件以 base64 随 `res.json` 返回
+  （上限 32MB），沙盒侧用 O_EXCL 写进 outbox 下的子目录并替换占位路径。
+- 只有服务 session tool 的 watcher 才在 outbox 写 `.botmux-session-tools` 标记；沙盒侧见到标记才走
+  中转，仅凭据隔离的会话与未开开关的 bot 保持原路径。
+- 其余凭证通道一并关闭：本 bot 的 lark-cli 密钥库（appsecret 密文 + master key）不再放行；
+  `/api/sessions/<sid>/lark-tool-identity` 对 `mode: 'bot'` 返回 403（`--as user` 不受影响）。
+- outbox 与附件桶对沙盒可写，宿主往里写都不跟随软链：`res.json` 用 `followTargetSymlink: false`，
+  附件下载写临时文件后 rename，并在 rename 前复核目录 inode 未被换成软链。
+- 开关随会话冻结，fork / 干净恢复、多人分道（principal lane）、v3 工作流 bot 快照都带着它；
+  `BOTMUX_SANDBOX=1` 强制开 oncall 的会话也带。
+- macOS 宿主 worker 进程 env 里有 `LARK_APP_SECRET`，同用户进程可用 `sysctl(KERN_PROCARGS2)` 读回
+  （实测 `(allow default)` 下可读）。开关打开时 Seatbelt 多发两条：`(deny process-info* (target others))`
+  与 `(deny sysctl-read (sysctl-name-prefix "kern.procargs"))`——实测必须两条同时才拦得住，单独任一条仍可读；
+  不能 deny 对自身的 process-info（会让运行时直接崩）。Linux 靠 PID namespace。
+- send-cred 两个写入点（worker 启动、feedback 配置改动）统一走 `writeSendCredFile`：**原地写、不换
+  inode、内容没变不写**。Linux 对该路径的 mask 挂在目录项上，temp+rename 会换成新 inode 让运行中的
+  pane 读到未遮罩的新文件；同级临时文件也会在 BOT_HOME 里短暂可读。跨进程写入与 feedback 的读改写用
+  同一把文件锁串行化，写满全部字节并在失败时尽力恢复旧内容；CLI 读取只对撕裂 JSON 做有界重试，明确
+  EPERM/EACCES 不重试。锁目标放在 `<数据目录>/send-cred-locks/` 的宿主私有目录，不使用 BOT_HOME
+  同级锁文件，避免 Linux deny mask 把不存在的锁路径预建成目录后让后续更新 EISDIR。
+- 附件文件名只取 basename，`..`/空名退回 file_key；Range 下载在 rename 前复核目录 inode；
+  下载还要求目录 realpath 落在附件根下（`withinRoot`），防 `attachments/<appId>` 这一层被换成软链。
+- macOS 可写目录能被整个 rename 走（子文件从未被打开，文件级 deny 不触发），再从可写位置读回；
+  或换成软链让宿主写穿。开关打开时对 BOT_HOME 与 outbox 发 `(deny file-write-unlink (literal …))`
+  （实测拦住 mv/rmdir、目录内 mkdir/touch/rename 不受影响）；watcher 另记住启动时 outbox 的 inode，
+  被换掉就不写 `res.json`。Linux 上这两处是 bind mount，本就不能 rename。
+- 判「这个 bot 的会话要不要扣密钥」统一走 `sandboxWithholdsBotSecret(botCfg)`（按 `resolveSandboxMode`
+  含 env 强制后的实际沙盒档判），冻结、会议接收、工作流快照都用它。
+- 附件下载的目录校验在 mkdir **之前**做（否则 mkdir -p 会顺着被换的祖先建到外面），校验通过的目录
+  identity（dev/ino + 根内）一路带到最终 rename 前再核一次——等待网络那段是攻击窗口；macOS 另把
+  开关打开时 `attachments/<appId>` 对沙盒改成**只读**（两个平台）：这时桶的唯一写者是宿主（入站消息；
+  中转的 `quoted` 落在宿主私有的 relay-attachments），沙盒不再能在宿主「校验→open/rename」两个系统调用
+  之间换目录——这是路径式检查关不掉的跨进程竞态，只读直接消灭这一类。Range 下载的暂存文件在校验后
+  同步打开、暂存名与目标文件名无关（避免 NAME_MAX）。开关关着时桶仍可写（原有设计），上述守卫只是缩小窗口。
 
 **沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
 

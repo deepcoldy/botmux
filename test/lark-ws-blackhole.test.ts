@@ -10,15 +10,15 @@ it.skipIf(!resolveBunExecutable())('Bun survives a timed-out upgrade, escapes st
   expect(String(result.stdout)).toContain('"reconnected":true');
 }, 15_000);
 
-it.skipIf(!resolveBunExecutable())('exits nonzero after rebuilding over a persistently silent CONNECT proxy', () => {
+it.skipIf(!resolveBunExecutable())('survives exhausted recovery over a silent CONNECT proxy and cancels retired sockets', () => {
   const result = spawnSyncBunTsEvalWithRepoImports("await import('./test/fixtures/lark-ws-watchdog-exit.ts')", {
     encoding: 'utf8', timeout: 12_000,
   });
   expect(result.error).toBeUndefined();
-  expect(result.status, String(result.stderr)).toBe(1);
-  expect(result.stdout).toContain('proxy-connect=2');
-  expect(result.stderr).toContain('rebuilding WSClient 1/1');
-  expect(result.stderr).toContain('exiting for supervisor recovery');
+  expect(result.status, String(result.stderr)).toBe(0);
+  const outcome = JSON.parse(String(result.stdout).trim().split('\n').at(-1)!);
+  expect(outcome).toMatchObject({ alive: true, maxSockets: 1, remainingSockets: 0 });
+  expect(outcome.connects).toBeGreaterThanOrEqual(3);
 }, 15_000);
 
 it.skipIf(!resolveBunExecutable())('the parked Bun daemon exits on an uncaught native WS error', () => {

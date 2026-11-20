@@ -308,6 +308,14 @@ export interface GlobalConfig {
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
    *  Other creation paths intentionally ignore it. Missing means disabled. */
   groupNamePrefix?: string;
+  /** Machine-wide switch for the @-mention notice a freshly created group posts
+   *  to its new owner (「群已创建，后续进展将在本群同步。」, plus the bare @ a
+   *  deferred team-group owner transfer posts). Missing / `true` keeps the
+   *  notice; only an explicit `false` suppresses it on every creation path.
+   *  Owner transfer, invites and managers are unaffected. Only `false` is ever
+   *  written (turning it back on deletes the key). Read per creation, so a flip
+   *  applies without restarting any daemon — see config.ts `groupOwnerNotice`. */
+  groupOwnerNotice?: boolean;
   /** Machine-wide repo picker display mode. Missing / 'all' preserves legacy
    *  behavior (repos + linked worktrees). 'repos' lists only main worktrees in
    *  selection cards; explicit /repo /abs/path/to/worktree still works. */
@@ -436,6 +444,8 @@ export interface MaintenanceConfig {
   /** Whether an intentional restart sends the owner a restart report DM.
    *  Missing preserves the legacy behavior (enabled). */
   notifyOnRestart?: boolean;
+  /** Opt-in owner DMs when a newer botmux release is discovered; no installation. */
+  notifyOnNewVersion?: boolean;
 }
 
 export interface MaintenanceTask {
@@ -660,6 +670,10 @@ export function parseMaintenancePatch(
     if (typeof b.notifyOnRestart !== 'boolean') return { ok: false, error: 'invalid_notify_on_restart' };
     patch.notifyOnRestart = b.notifyOnRestart;
   }
+  if ('notifyOnNewVersion' in b) {
+    if (typeof b.notifyOnNewVersion !== 'boolean') return { ok: false, error: 'invalid_notify_on_new_version' };
+    patch.notifyOnNewVersion = b.notifyOnNewVersion;
+  }
   if (Object.keys(patch).length === 0) return { ok: false, error: 'empty' };
   return { ok: true, patch };
 }
@@ -673,6 +687,7 @@ function readMaintenance(raw: unknown): MaintenanceConfig | undefined {
   const ar = readMaintenanceToggle(m.autoRestart);
   if (ar) out.autoRestart = ar;
   if (typeof m.notifyOnRestart === 'boolean') out.notifyOnRestart = m.notifyOnRestart;
+  if (typeof m.notifyOnNewVersion === 'boolean') out.notifyOnNewVersion = m.notifyOnNewVersion;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -1094,6 +1109,7 @@ export function readGlobalConfig(): GlobalConfig {
   if (linkRefs) out.linkRefs = linkRefs;
   const groupNamePrefix = normalizeGroupNamePrefix(raw.groupNamePrefix);
   if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
+  if (typeof raw.groupOwnerNotice === 'boolean') out.groupOwnerNotice = raw.groupOwnerNotice;
   const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
   if (repoPickerMode) out.repoPickerMode = repoPickerMode;
   const worktreeRoot = normalizeWorktreeRoot(raw.worktreeRoot);
@@ -1258,6 +1274,19 @@ export function isGlobalVcMeetingAgentEnabled(): boolean {
 
 export function globalVcMeetingAgentListenerBotAppId(): string | undefined {
   return globalVcMeetingAgentConfigLive().listenerBotAppId;
+}
+
+/** The stored `groupOwnerNotice` exactly as written, so a hand edit that the
+ *  typed read ignores (e.g. the string "false") can be pointed out. */
+export function readRawGroupOwnerNotice(): unknown {
+  return readRawConfig().groupOwnerNotice;
+}
+
+/** Persist the `groupOwnerNotice` switch (read live via config.ts
+ *  `config.groupOwnerNotice`). Only the non-default `false` is stored; turning
+ *  it back on deletes the key, so the file never pins the default. */
+export function setGroupOwnerNoticeEnabled(enabled: boolean): void {
+  mergeGlobalConfig({ groupOwnerNotice: enabled ? null : false });
 }
 
 /** 远程访问 enabled? Reads the (short-TTL cached) global config — cheap enough to

@@ -39,9 +39,8 @@ import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../
 import { dropConfiguredCliRuntime } from '../adapters/cli/runtime.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { sendCredFilePath } from '../adapters/cli/read-isolation.js';
+import { existsSync, statSync } from 'node:fs';
+import { sendCredFilePath, sendCredUpdateLockTarget, updateSendCredFile } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
@@ -164,6 +163,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'disableStreamingCard', configKey: 'disableStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '关闭实时流式卡片 on|off' },
   { key: 'replyCardMode', configKey: 'replyCardMode', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'unified'], hint: '回答展示方式（下一轮生效）：legacy=默认模式｜unified=动态单卡模式；动态单卡限 Claude Code/Codex/Grok/TraeX/Pi/Kimi 普通飞书对话' },
   { key: 'hiddenStreamingCardButtons', configKey: 'hiddenStreamingCardButtons', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseHiddenStreamingCardButtonsInput, hint: '隐藏实时卡片按钮，逗号/空格分隔：output terminal writeLink compact stop close substitute；unset 恢复全部' },
+  { key: 'streamingCardFoldedLayout', configKey: 'streamingCardFoldedLayout', kind: 'boolean', effect: 'immediate', clearable: true, defaultOn: true, hint: '实时卡片折叠布局 on|off（默认 on）：on 保留「更多操作」折叠面板；off 恢复经典按钮排列及终端按键' },
   { key: 'pinStreamingCard', configKey: 'pinStreamingCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '置顶当前公开实时卡片 on|off（失败不影响会话）' },
   { key: 'cotEnabled', configKey: 'cotEnabled', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考过程消息 on|off（默认 on）：turn 进行中把模型思考过程以飞书原生 CoT 消息（message_cot）流式展示（客户端需 PC ≥7.70 / 移动端 ≥7.74；支持 claude-code / codex / traex / pi 等适配器）。动态单卡中控制卡内执行过程，默认模式中控制原生 CoT；单个群可用 /cot off 关闭' },
   { key: 'thinkingCardToolResult', configKey: 'thinkingCardToolResult', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '思考气泡是否贴工具输出 on|off（默认 on）：off 时气泡只保留思考段落与工具节点标题（工具名 · 命令/路径），不再附带命令输出/文件内容代码块，与 Claude Code 自身界面一致' },
@@ -175,8 +175,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
   { key: 'replyCardActions', configKey: 'replyCardActions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡右下角操作菜单（打开终端/切换模型/关闭会话）on|off，默认关闭' },
   { key: 'replyCardNextStep', configKey: 'replyCardNextStep', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「下一步」按钮 on|off，默认关闭：把 CLI 给出的下一轮推荐输入（目前是 Claude Code 输入框里的置灰提示）放在本轮最后一张回复卡签名上方，点击即以点击人身份发给本会话；不支持的 CLI 不显示' },
-  { key: 'replyCardRecap', configKey: 'replyCardRecap', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「本轮回顾」on|off，默认关闭：在本轮最后一张回复卡签名上方放一个默认折叠的面板，列出改了哪些文件、跑了哪些命令；CLI 自己写出回顾时（Claude Code 空闲几分钟后写进 transcript 的离开总结）原地补上，不额外调用模型' },
-  { key: 'replyCardRecapModel', configKey: 'replyCardRecapModel', kind: 'boolean', effect: 'immediate', clearable: false, hint: '「本轮回顾」小模型补写 on|off，默认关闭，需同时开 replyCardRecap：本轮结束 6 分钟仍没有 CLI 自带回顾时，用会话自己的 Claude Code 凭证调一次 haiku 写回顾（实测每次约 $0.001–0.002）；沙盒/读隔离会话不调用，其它 CLI 不支持' },
+  { key: 'replyCardRecap', configKey: 'replyCardRecap', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「本轮回顾」on|off，默认关闭：CLI 自己写出本轮回顾时（Claude Code 会话空闲约 3 分钟且终端不在前台时写进 transcript 的离开总结），放到本轮最后一张回复卡签名上方的折叠面板里；没有回顾的回合不出面板，不额外调用模型' },
   { key: 'summaryMemory', configKey: 'summaryMemory', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/summary 写入当前项目 summary.md 的问题解决记录 on|off' },
   { key: 'summaryMemoryPath', configKey: 'summaryMemoryPath', kind: 'string', effect: 'immediate', clearable: true, hint: '/summary 记忆文件路径，支持相对当前项目根目录或绝对路径；unset 回 summary.md' },
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },
@@ -198,7 +197,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'topicUnavailablePolicy', configKey: 'topicUnavailablePolicy', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'stop'], enumDefault: () => 'legacy', hint: '原话题不可用时：legacy=保持原有发送和兜底行为（默认）｜stop=停止发送，查询异常暂停且不改发；unset 回 legacy' },
-  { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：send=模型必须自己 botmux send｜transcript=从 CLI 转写自动取最终回复发卡，模型不再被要求 botmux send；缺省按 CLI：doubao 缺省 transcript（其工具命令跑在账号级常驻 service 进程，botmux send 归属不可靠），其余 CLI 缺省 send、与上游一致；仅 doubao 与 claude-code 及 codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok/cursor 支持 transcript，当前沙盒不支持时运行时回落 send；系统提示需 /restart 才换新值，逐轮信封立即生效；unset 回该 CLI 缺省' },
+  { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：transcript=从 CLI 转写自动取本轮最后的回答发卡，botmux send 只留给 @ 别的 bot 协作、附件/卡片、发到别的群或话题｜send=模型必须自己 botmux send（旧行为）；缺省按 CLI：能采集转写的 claude-code 及 codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok/cursor/doubao 缺省 transcript，其余 CLI 缺省 send，当前沙盒采集不到时运行时回落 send（scratch 下只有 claude-code/codex/traex 可用，oncall 下 hermes 也因 state.db 无宿主挂载而回落）；想用回旧行为显式 set send；系统提示与转发方式在 /restart 或 CLI 重新拉起后换新值，逐轮信封立即生效；unset 回该 CLI 缺省' },
   { key: 'senderTagHideEmail', configKey: 'senderTagHideEmail', kind: 'boolean', effect: 'immediate', clearable: false, hint: '隐藏 <sender> 邮箱 on|off（默认 off）：开启后只省略 email，保留姓名和 ID；不影响鉴权与 --mention-back。下一次新构造的输入生效，不清理历史或用户正文中的邮箱' },
   { key: 'hideLocalAddresses', configKey: 'hideLocalAddresses', kind: 'boolean', effect: 'immediate', clearable: false, hint: '隐藏开发机地址 on|off（默认 off）：开启后模型回复发到飞书前，开发机文件路径和本机服务地址换成仓库相对引用或「【内部文件】」，提示里加上不放这类地址的规则，卡片按钮指向本机的整条拒发（宿主自己的终端/Dashboard 链接除外）；适合给别人用的 bot，只给自己用、要在回复里看到排障路径的保持 off。回复处理与每轮提示立即生效，系统提示里的完整规则从下个会话生效' },
   { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
@@ -785,10 +784,11 @@ async function applyConfigFieldInternal(
     try {
       const path = sendCredFilePath(config.session.dataDir, larkAppId);
       if (existsSync(path)) {
-        const cred = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-        if (effective === null || (effective as any)?.enabled !== true) delete cred.feedback;
-        else cred.feedback = effective;
-        atomicWriteFileSync(path, JSON.stringify(cred), { mode: 0o600 });
+        updateSendCredFile(path, cred => {
+          if (effective === null || (effective as any)?.enabled !== true) delete cred.feedback;
+          else cred.feedback = effective;
+          return cred;
+        }, sendCredUpdateLockTarget(config.session.dataDir, path));
       }
     } catch (error) {
       logger.warn(`[config:${larkAppId}] failed to refresh sandbox feedback policy: ${error instanceof Error ? error.message : String(error)}`);

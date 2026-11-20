@@ -55,6 +55,7 @@ const TOGGLE_FIELDS: ReadonlySet<string> = new Set([
   'modelQueueNotify',
   'autoUpdate',
   'autoRestart',
+  'notifyOnNewVersion',
 ]);
 
 /** Builder opts intentionally exclude sender union identity. */
@@ -375,6 +376,9 @@ export function buildPatchFromAction(
       const next = raw === 'true';
       if (field === 'publicReadOnly' || field === 'openTerminalInFeishu' || field === 'enableLocalCliOpen' || field === 'modelQueueNotify') {
         return { ok: true, value: { [field]: next } };
+      }
+      if (field === 'notifyOnNewVersion') {
+        return { ok: true, value: { maintenance: { notifyOnNewVersion: next } } };
       }
       return { ok: true, value: { maintenance: { [field]: { enabled: next } } } };
     }

@@ -31,7 +31,7 @@ import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { credentialSourceForcesBotHome } from '../services/cli-credential-source.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
-import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, buildTurnSpeakersBlock, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, buildTurnSpeakersBlock, feishuReplyPresentationGuidance, transcriptPromptTeachesSend } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
@@ -112,7 +112,7 @@ import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../se
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { unpinnedSessionWorkingDir } from './working-dir-range.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
-import { getAttachmentsDir } from './attachment-path.js';
+import { attachmentsRoot, getAttachmentsDir, safeAttachmentFileName } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn, pickTurnReplyTarget } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
@@ -712,14 +712,14 @@ export async function downloadResources(larkAppId: string, messageId: string, re
   let needLogin = false;
 
   for (const res of resources) {
-    const savePath = join(dir, res.name);
+    const savePath = join(dir, safeAttachmentFileName(res.name, res.key));
     try {
       const resMessageId = res.messageId ?? messageId;
       // Whose token backs the user-token fallback: the person who sent the
       // attachment. They can see what they just posted, and the download is
       // attributed to them rather than to whoever happens to be logged in.
       await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId,
-        res.fallbackMessageIds ? { fallbackMessageIds: res.fallbackMessageIds } : undefined);
+        { withinRoot: attachmentsRoot(), ...(res.fallbackMessageIds ? { fallbackMessageIds: res.fallbackMessageIds } : {}) });
       const attachment: LarkAttachment = { type: res.type, path: savePath, name: res.name, resourceKey: res.key };
       // Sniffing is best-effort: a successfully downloaded attachment must remain available.
       try {
@@ -1647,14 +1647,16 @@ function buildNewTopicBlocks(
     // the routing block above and the system-prompt identity path in
     // buildBotmuxSystemPromptText. botIdentity is passed even for a NORMAL bot
     // running an HTTP task (R1), so this block reaches HTTP turns and must gate too.
-    // transcript（含 solo）同样只留 name/open_id：short_routing 整句是「协作必须
-    // botmux send --mention」，transcript 模式的提示不再提 send；solo 会话更没有
-    // 别的 bot 可路由。
+    // transcript + solo 同样只留 name/open_id：solo 会话没有别的 bot 可路由。
+    // transcript 非 solo 保留 short_routing：最终回复卡不会 @ 触发本轮的 bot，
+    // 跟别的 bot 协作 / 回报仍只能靠 `botmux send --mention`（与系统提示路径的
+    // mention_must 同口径）。doubao 例外（transcriptPromptTeachesSend）：提示里
+    // 不教 send，这句也不加。
     identityBlock = [
       '<identity>',
       `  <name>${xmlEscape(botIdentity.name ?? unknown)}</name>`,
       `  <open_id>${xmlEscape(botIdentity.openId ?? unknown)}</open_id>`,
-      ...(noTransport || replyDelivery === 'transcript'
+      ...(noTransport || (replyDelivery === 'transcript' && (opts?.solo === true || !transcriptPromptTeachesSend(cliId)))
         ? []
         : [`  <routing_rules>${escapeXmlTagLikeTokens(t('ai.identity.short_routing', undefined, locale))}</routing_rules>`]),
       '</identity>',
@@ -4679,6 +4681,13 @@ export async function resumeSession(
  * instructs the model to post progress updates via `botmux send`; a silent
  * monitoring task needs the opposite default — say nothing unless the alert
  * condition in the task prompt is met. Exported for tests.
+ *
+ * The daemon drops a silent turn's final_output under EVERY replyDelivery
+ * (managedFinalOutputSuppressed → isSilentScheduledTurn), so `botmux send` is
+ * the only notification channel here. The last line states that explicitly:
+ * under `transcript` the session prompt says final replies are forwarded
+ * automatically, and a model that wrote the alert into its final reply would
+ * have it silently discarded.
  */
 export function buildSilentScheduleHint(taskName: string, locale?: Locale): string {
   if (locale === 'en') {
@@ -4688,6 +4697,7 @@ export function buildSilentScheduleHint(taskName: string, locale?: Locale): stri
       '- Do NOT send progress or confirmation messages ("started", "checked, all good", "done").',
       '- Only when the result meets the notify condition described in the task (an anomaly found, an alert threshold hit, or the task explicitly asks for a deliverable) should you `botmux send` the conclusion.',
       '- Otherwise finish the turn completely silently — do not call `botmux send` at all.',
+      '- This run\'s final reply is never posted to the chat, even when the session normally forwards final replies automatically; `botmux send` is the only way to notify.',
       '</botmux_silent_schedule>',
     ].join('\n');
   }
@@ -4697,6 +4707,7 @@ export function buildSilentScheduleHint(taskName: string, locale?: Locale): stri
     '- 不要发送过程性/确认性消息（“开始执行”“检查完毕，一切正常”“已完成”都不要发）。',
     '- 仅当结果满足任务描述中需要通知用户的条件（发现异常、达到报警阈值、任务本身要求交付产物）时，才用 `botmux send` 发送结论。',
     '- 不满足条件就完全静默地结束本轮，不要调用 `botmux send`。',
+    '- 本轮的最终回复不会发到群里（即使本会话平时会自动转发最终回复）；要通知只能用 `botmux send`。',
     '</botmux_silent_schedule>',
   ].join('\n');
 }

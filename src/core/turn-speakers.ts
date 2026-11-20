@@ -2,7 +2,7 @@ import type { TrustedCaller } from '../types.js';
 import { capabilityOn, type IdentityRouteTool, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { capabilityOfTool } from './identity-policy.js';
 import { getLarkToolDelegation } from './lark-tool-delegation.js';
-import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 
 /** One human whose message is part of the running turn, with the message turn that carries their identity material. */
 export interface TurnSpeaker { openId: string; turnId: string }
@@ -21,7 +21,7 @@ export function governedSpeakers(args: {
   const turnId = origin?.identityTurnId ?? origin?.turnId;
   if (!turnId || policy?.allowSpeakerSwitch !== true || !capabilityOn(policy, capabilityOfTool(args.tool))) return undefined;
   if (isUnattendedIdentityTurnId(turnId) || getLarkToolDelegation(args.sessionDataDir, args.sessionId, turnId)) return undefined;
-  return origin?.speakers;
+  return origin?.speakers?.filter(speaker => allowsPersonalIdentityForTurn(speaker.turnId, policy));
 }
 
 /**

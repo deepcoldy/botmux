@@ -16,6 +16,8 @@
  * worker globals it reads; renaming either fails loudly (missing function /
  * undefined read), never silently green.
  */
+import { paneReplyDeliveryFromProcessTree } from '../../src/services/pane-reply-delivery.js';
+import { REPLY_DELIVERY_ENV } from '../../src/services/send-completion-hint.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -26,13 +28,13 @@ import { contractTerminalStatus, executionObserverSupported } from '../../src/se
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
+import { antigravityBlockingPageTail } from '../../src/utils/antigravity-blocking-page.js';
 import { isNativeReasoningEffort } from '../../src/services/native-reasoning-observation.js';
 import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-footer.js';
 import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-observer.js';
 import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
-import { TurnRecapRecorder } from '../../src/services/turn-recap.js';
-import { isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { finalBridgeSendMarkerCoversOwnThread, isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from '../../src/core/rewind-backup-retention.js';
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
@@ -188,7 +190,6 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'isRemoteBackendType') return isRemoteBackendType;
     if (key === 'promptReadinessRevision') return scope.promptReadinessRevision ??= 0;
     if (key === 'traexCatalogEmptyNoticeTurns') return scope.traexCatalogEmptyNoticeTurns ??= new WeakMap();
-    if (key === 'turnRecapRecorder') return scope.turnRecapRecorder ??= new TurnRecapRecorder();
     if (key === 'busyReadyDeferral') return scope.busyReadyDeferral ??= new BusyReadyDeferralTracker();
     if (key === 'busyReadyLogThrottle') return scope.busyReadyLogThrottle ??= new BusyReadyLogThrottle();
     // Module-level keep-alive provenance state shared with the message-handler
@@ -197,6 +198,9 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (keepaliveDefault !== undefined) return keepaliveDefault;
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
     if (key === 'isFinalBridgeSendMarker') return isFinalBridgeSendMarker;
+    if (key === 'finalBridgeSendMarkerCoversOwnThread') return finalBridgeSendMarkerCoversOwnThread;
+    if (key === 'paneReplyDeliveryFromProcessTree') return paneReplyDeliveryFromProcessTree;
+    if (key === 'REPLY_DELIVERY_ENV') return REPLY_DELIVERY_ENV;
     if (key === 'rewindableErrorCode') return rewindableErrorCode;
     if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
     if (key === 'pruneRewindBackupsBeside') return pruneRewindBackupsBeside;
@@ -213,6 +217,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
       return dependencies.get(key);
     }
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
+    if (key === 'antigravityBlockingPageTail') return antigravityBlockingPageTail;
     if (key === 'traexStartupInputReady') return traexStartupInputReady;
     if (key === 'reconcileActiveAntigravityToken') return reconcileActiveAntigravityToken;
     if (key === 'inspectAntigravityAccounts') return inspectAntigravityAccounts;

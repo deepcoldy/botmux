@@ -21,7 +21,7 @@ import { readCliAuthEpoch } from '../services/cli-auth-epoch.js';
 import type { BotConfig } from '../bot-registry.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
 import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
-import { registerActiveIdentityTurn } from './active-identity-turns.js';
+import { registerActiveIdentityTurn, releaseActiveIdentityTurn } from './active-identity-turns.js';
 import {
   TRIGGER_USER_AUTH_TOOLS,
   type TriggerUserAuthConfig,
@@ -44,7 +44,7 @@ import {
   type BytedCliIdentity,
   type CliIdentity,
 } from './cli-identity.js';
-import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
 import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
 
@@ -135,6 +135,16 @@ export interface PublishTurnIdentityArgs {
    *  may a refusal carry an authorization link for the agent to relay: in a
    *  group, whoever opens the link authorizes as themselves. */
   privateChat?: boolean;
+  /** Synchronous final fence for authority that can change while credentials
+   *  resolve (owner replacement/revocation, opt-out, terminal or generation
+   *  replacement). Checked before credential resolution and again immediately
+   *  before each personal-identity write. A publication that becomes invalid
+   *  is removed rather than left readable by a later policy flip. */
+  validateBeforeWrite?: () => boolean;
+}
+
+function publicationValid(validate: (() => boolean) | undefined): boolean {
+  try { return validate?.() !== false; } catch { return false; }
 }
 
 /**
@@ -201,6 +211,10 @@ export function publishTurnCliIdentity(
 async function publishTurnCliIdentityNow(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
+  const personalIdentityAllowedAtStart = allowsPersonalIdentityForTurn(args.turnId, args.botConfig.triggerUserAuth);
+  if (!personalIdentityAllowedAtStart || !publicationValid(args.validateBeforeWrite)) {
+    args = { ...args, senderOpenId: undefined, delegatedIdentity: undefined };
+  }
   const { sessionDataDir, sessionId, turnId } = args;
   const privateChat = args.privateChat === true;
   const outcomes: ToolIdentityOutcome[] = [];
@@ -219,6 +233,13 @@ async function publishTurnCliIdentityNow(
   // closed on its own, and this settles only after every tool has settled, so
   // a turn is never released with one identity still being written.
   const settled = await Promise.allSettled(TRIGGER_USER_AUTH_TOOLS.map(tool => publishToolIdentity(tool, args, privateChat)));
+  // Only an initially eligible personal publication is revoked here. A turn
+  // that started with owner credentials disabled keeps its ordinary denial.
+  if (personalIdentityAllowedAtStart && args.validateBeforeWrite && !publicationValid(args.validateBeforeWrite)) {
+    for (const tool of TRIGGER_USER_AUTH_TOOLS) clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, args.storageModel);
+    if (turnId) releaseActiveIdentityTurn(sessionDataDir, sessionId, turnId);
+    return TRIGGER_USER_AUTH_TOOLS.map(tool => ({ tool, state: 'off' as const }));
+  }
   for (const result of settled) {
     if (result.status === 'rejected') throw result.reason;
     outcomes.push(result.value);
@@ -252,7 +273,7 @@ async function publishToolIdentity(
       // session creator's or the owner's credentials to fill the gap.
       return await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
     }
-    return await publishOne(tool, botConfig, sessionDataDir, sessionId, principal.openId, locale, turnId, storageModel, privateChat, policy);
+    return await publishOne(tool, botConfig, sessionDataDir, sessionId, principal.openId, locale, turnId, storageModel, privateChat, policy, args.validateBeforeWrite);
   } catch (e) {
     // Fail closed through the SAME policy as an ordinary missing token, so a
     // credential-store outage and "this person never authorized" cannot end
@@ -354,6 +375,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     ...(args.turnId ? { turnId: args.turnId } : {}),
     ...(user.targetOpenId ? { openId: user.targetOpenId } : {}),
   }, policy);
+  if (!publicationValid(args.validateBeforeWrite)) return { tool, state: 'off' };
   writeSessionIdentity(args.sessionDataDir, args.sessionId, stamped, args.storageModel);
   if (localMint && args.turnId && args.storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
     trackBytedcliIdentityRenewal({
@@ -384,6 +406,7 @@ async function publishMeegoOnly(
     }, storageModel);
     return { tool: 'bytedcli', state: 'needs-authorization' };
   }
+  if (!publicationValid(args.validateBeforeWrite)) return { tool: 'bytedcli', state: 'off' };
   writeSessionIdentity(sessionDataDir, sessionId, withMeegoStore({
     tool: 'bytedcli', cloudJwt: '', meegoOnly: true, ...(turnId ? { turnId } : {}), openId,
   }, policy), storageModel);
@@ -401,11 +424,13 @@ async function publishOne(
   storageModel: IdentityStorageModel,
   privateChat: boolean,
   policy: IdentityPolicy,
+  validateBeforeWrite?: () => boolean,
 ): Promise<ToolIdentityOutcome> {
   const withheld = async () =>
     withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
 
   const publish = (identity: CliIdentity, localMint = false): ToolIdentityOutcome => {
+    if (!publicationValid(validateBeforeWrite)) return { tool, state: 'off' };
     const stamped = withMeegoStore({ ...identity, ...(turnId ? { turnId } : {}), openId: senderOpenId }, policy);
     writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
     if (localMint && turnId && storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {

@@ -10,6 +10,11 @@ export const STREAMING_CARD_BUTTON_IDS = [
 
 export type StreamingCardButtonId = typeof STREAMING_CARD_BUTTON_IDS[number];
 
+/** Default on, including older configs and malformed hand-edited values. */
+export function resolveStreamingCardFoldedLayout(config: { streamingCardFoldedLayout?: unknown }): boolean {
+  return config.streamingCardFoldedLayout !== false;
+}
+
 const BUTTON_ID_BY_LOWER = new Map<string, StreamingCardButtonId>(
   STREAMING_CARD_BUTTON_IDS.map(id => [id.toLowerCase(), id]),
 );

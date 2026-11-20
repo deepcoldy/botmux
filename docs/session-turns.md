@@ -2,8 +2,7 @@
 
 `GET /api/sessions/:sessionId/turns?since=&limit=50` uses the local Dashboard
 administrator token. A successful response contains `ok`, `schema`
-(`botmux.session-turns.v1`), `capabilities`, `next`, and `turns`. The capabilities
-array is empty in this version.
+(`botmux.session-turns.v1`), `capabilities`, `next`, and `turns`.
 
 - Omit `since` for the first page, then pass the returned `next` verbatim.
   The page size defaults to 50 and accepts 1–100.
@@ -21,3 +20,37 @@ array is empty in this version.
   send command. Custom cards and attachment bodies have no text guarantee.
 - Records survive process restarts. Closing a session deletes its records.
   Turns from before this feature was installed are not reconstructed.
+
+## Continue a session as its owner
+
+Check the target session's `capabilities` for `ownerActor` before sending an
+owner request. On older versions, proceed with the ordinary external event
+path. A missing `actor` in the response is not a reason to resend.
+
+Send `POST /api/trigger` with the local Dashboard administrator token and
+the following JSON body.
+
+```json
+{
+  "source": { "type": "webhook", "connectorId": "example-client" },
+  "target": { "kind": "turn", "botId": "<bot id>", "sessionId": "<session id>" },
+  "actor": "owner",
+  "instruction": "Continue the tests",
+  "envelope": { "format": "text", "sourceName": "Example client", "trusted": false }
+}
+```
+
+The server resolves the explicitly configured `ownerOpenId` against the bot's
+current allowlist. It returns `owner_unresolved` if that owner is unavailable.
+The instruction enters the existing session as a follow-up. Successful
+responses echo `"actor": "owner"`, and the session records the input as
+`via: "owner_actor"`. Topic presentation follows the existing policy.
+
+Other actor values and requests carrying `envelope.payload` or
+`envelope.rawText` return HTTP 400. Webhook authentication, public-read tokens,
+and H5 or platform identities cannot submit an actor and receive
+`actor_not_allowed`.
+
+Owner attribution alone does not publish personal CLI credentials. For a bot
+that uses trigger-user authentication, set `triggerUserAuth.allowOwnerActor`
+to `true` to opt into that bot's configured per-user credential policy.

@@ -35,6 +35,13 @@ export interface HookAskAdapter {
   passthrough(payload: unknown): string;
 
   /**
+   * 可选：问题已路由到 botmux 会话、却没拿到真人答案（超时 / 卡片失效 / 投递失败）时
+   * 写回 CLI 的 directive。未实现 = passthrough（回退原生终端提问）。原生提问页会停在
+   * 没人看的终端上、又没有按键回灌通道的 CLI（agy）实现它，让问题带着原因结束。
+   */
+  formatUnanswered?(outcome: UnansweredAsk, parsed: ParsedAsk): string;
+
+  /**
    * 可选：CLI 即将弹出终端权限确认框（Claude `PermissionRequest`，含 bypass 模式下
    * 仍会触发的「Dangerous rm」这类内置安全检查）时，把它转成一问两选（允许/拒绝）。
    * 非权限确认事件返回 null。未实现 = 该 CLI 不桥接权限确认。
@@ -50,6 +57,13 @@ export interface HookAskAdapter {
    */
   createPermissionOutcomeWatcher?(payload: unknown): PermissionOutcomeWatcher | null;
 }
+
+/** 已路由的提问没拿到真人答案的原因（见 HookAskAdapter.formatUnanswered）。 */
+export type UnansweredAsk =
+  | { kind: 'timedOut'; timeoutMs: number }
+  | { kind: 'invalidated'; reason: string; failureCode?: string }
+  /** daemon 不可达 / 确定性拒收：卡片根本没发出去。 */
+  | { kind: 'undelivered' };
 
 export interface PermissionOutcomeWatcher {
   /** 读取新增记录；CLI 已了结这次确认时返回结局，否则 null。 */

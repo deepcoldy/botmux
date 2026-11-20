@@ -58,6 +58,17 @@ export function isUnattendedIdentityTurnId(turnId: string | undefined): boolean 
   return !!turnId && (isUnattendedSyntheticTurnId(turnId) || turnId.startsWith('background:'));
 }
 
+export function isOwnerActorTurnId(turnId: string | undefined): boolean {
+  return turnId?.startsWith('trg_owner_') === true;
+}
+
+export function allowsPersonalIdentityForTurn(
+  turnId: string | undefined,
+  policy: { enabled?: boolean; allowOwnerActor?: boolean } | null | undefined,
+): boolean {
+  return !isOwnerActorTurnId(turnId) || (policy?.enabled === true && policy.allowOwnerActor === true);
+}
+
 /** Run-bound verification of a workflow event turn (injected by the caller
  *  that owns the run's binding). */
 export type WorkflowEventTurnVerifier = (input: WorkflowEventTurnRef & {

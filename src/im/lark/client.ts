@@ -1,7 +1,8 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
-import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
-import { dirname, extname, basename, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { closeSync, constants as fsConstants, openSync, readFileSync, writeFileSync, createWriteStream, createReadStream, mkdirSync, mkdtempSync, rmSync, statSync, existsSync, lstatSync, renameSync, unlinkSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, extname, basename, join, sep } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
@@ -45,6 +46,7 @@ import {
 } from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
 import { downloadResourceWithRange, getResourceErrorCode, isResourceSizeLimitError, LARK_RESOURCE_SIZE_LIMIT_CODE, type ResourceStream } from './resource-range-download.js';
+import { fdWriteAll } from './async-fd.js';
 
 // larkGet lives in a dependency-free module so setup/owner-identity.ts (shared
 // by every onboarding / allowedUsers write path) can use the same no-body GET
@@ -1938,7 +1940,7 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean; fallbackMessageIds?: readonly string[] }): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean; fallbackMessageIds?: readonly string[]; withinRoot?: string }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
@@ -1948,9 +1950,26 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   // Feishu downloads video bodies through the file endpoint.
   const apiType = type === 'video' ? 'file' : type;
   const dir = dirname(savePath);
+  // The attachment bucket is writable from inside the file sandbox, so the
+  // directory, an ancestor (attachments/<appId>) or the file name may be a
+  // planted symlink. Check containment BEFORE mkdir (mkdir -p would otherwise
+  // create the message directory wherever a planted ancestor points), refuse a
+  // symlinked directory, remember which directory was validated, and land the
+  // bytes via rename only into that same directory (identity + containment are
+  // re-checked right before the rename — the network wait is the attacker's window).
+  // The root itself (<dataDir>/attachments) is host-owned and may not exist yet.
+  if (options?.withinRoot && !existsSync(options.withinRoot)) mkdirSync(options.withinRoot, { recursive: true });
+  const root = options?.withinRoot ? realpathSync(options.withinRoot) : undefined;
+  if (root) assertExistingAncestorWithinRoot(dir, root);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
+  const dirInfo = lstatSync(dir);
+  if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {
+    throw new Error(`Refusing to download into a non-directory: ${dir}`);
+  }
+  if (root) assertWithinRoot(realpathSync(dir), root, dir);
+  const guard: DownloadDirGuard = { dev: dirInfo.dev, ino: dirInfo.ino, ...(root ? { root } : {}) };
 
   // Resolve resource ownership with the same app identity before borrowing a
   // user's token. A forward's outer ID, owning leaf and enclosing forward can
@@ -1960,7 +1979,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   for (const [index, candidateId] of messageIds.entries()) {
     resourceMessageId = candidateId;
     try {
-      await downloadWithAppToken(larkAppId, resourceMessageId, fileKey, apiType, savePath);
+      await downloadWithAppToken(larkAppId, resourceMessageId, fileKey, apiType, savePath, guard);
       logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
       return;
     } catch (appErr: any) {
@@ -1984,7 +2003,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
           headers: { Range: `bytes=${start}-${end}` },
           responseType: 'stream',
           timeout: 30_000,
-        }), savePath);
+        }), savePath, guard);
         logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via App Token Range)`);
         return;
       }
@@ -2022,11 +2041,43 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     );
   }
 
-  await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand);
+  await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand, guard);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
-async function downloadWithAppToken(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+/** The directory a download was validated against: same inode at rename time,
+ *  and (when confined) still resolving under the attachment root. */
+export interface DownloadDirGuard { dev: number; ino: number; root?: string }
+
+function assertWithinRoot(real: string, root: string, shown: string): void {
+  if (real !== root && !real.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)) {
+    throw new Error(`Refusing to download outside ${root}: ${shown}`);
+  }
+}
+
+/** Containment of the deepest EXISTING ancestor of `dir`, so mkdir -p cannot be
+ *  steered through a planted symlink higher up (attachments/<appId>). */
+function assertExistingAncestorWithinRoot(dir: string, root: string): void {
+  let probe = dir;
+  while (!existsSync(probe)) {
+    const parent = dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+  assertWithinRoot(realpathSync(probe), root, dir);
+}
+
+/** Re-check the validated directory right before publishing a file into it. */
+export function assertDownloadDirUnchanged(dir: string, guard: DownloadDirGuard | undefined): void {
+  if (!guard) return;
+  const st = lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== guard.dev || st.ino !== guard.ino) {
+    throw new Error(`Download directory changed while writing: ${dir}`);
+  }
+  if (guard.root) assertWithinRoot(realpathSync(dir), guard.root, dir);
+}
+
+async function downloadWithAppToken(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, guard?: DownloadDirGuard): Promise<void> {
   const c = getBotClient(larkAppId);
   // Route through client.request() (empty-GET-body guard) instead of the
   // generated messageResource.get, which sends `{}` as a GET body and trips
@@ -2038,10 +2089,10 @@ async function downloadWithAppToken(larkAppId: string, messageId: string, fileKe
     params: { type },
     responseType: 'stream',
   });
-  await writeResourceToDisk(res, savePath);
+  await writeResourceToDisk(res, savePath, guard);
 }
 
-async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, brand: Brand = 'feishu'): Promise<void> {
+async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, brand: Brand = 'feishu', guard?: DownloadDirGuard): Promise<void> {
   const url = `${larkHosts(brand).openApi}/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${userToken}` },
@@ -2065,7 +2116,7 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
         stream.statusCode = partial.status;
         stream.headers = { 'content-range': partial.headers.get('content-range') ?? undefined };
         return stream;
-      }, savePath);
+      }, savePath, guard);
       return;
     }
     // 401 = the token itself was rejected (expired / wrong scope) → genuinely
@@ -2078,22 +2129,107 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
     throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
-  writeFileSync(savePath, buf);
+  await writeViaRename(savePath, async (fd) => { await fdWriteAll(fd, buf); }, guard);
 }
 
-async function writeResourceToDisk(res: any, savePath: string): Promise<void> {
-  if (res instanceof Buffer) {
-    writeFileSync(savePath, res);
-  } else if (res && typeof res === 'object' && 'writeFile' in res) {
-    await res.writeFile(savePath);
-  } else {
-    // Raw Readable (client.request with responseType:'stream'). Pipe straight
-    // to disk instead of buffering — this resource API serves files up to
-    // 100MB, so Buffer.concat + writeFileSync would spike memory and block the
-    // event loop under concurrent downloads. pipeline handles backpressure and
-    // closes/cleans up both streams on error.
-    await pipeline(res as NodeJS.ReadableStream, createWriteStream(savePath));
+/** Write to a fresh sibling descriptor, then rename it over `savePath`: a
+ *  symlink already sitting at `savePath` is replaced, never written through.
+ *  The descriptor is opened synchronously immediately after the directory
+ *  check. If the directory is replaced afterwards, the staging pathname cannot
+ *  name an external file created by an attacker, and the final rename fails
+ *  closed instead of publishing bytes outside the validated directory. */
+async function writeViaRename(savePath: string, write: (fd: number) => Promise<void>, guard?: DownloadDirGuard): Promise<void> {
+  const dir = dirname(savePath);
+  const before = lstatSync(dir);
+  if (before.isSymbolicLink() || !before.isDirectory()) throw new Error(`Refusing to download into a non-directory: ${dir}`);
+  // Same directory the caller validated before the network wait (a later lstat
+  // alone would accept a swapped-in external directory as a fresh baseline).
+  const expected: DownloadDirGuard = guard ?? { dev: before.dev, ino: before.ino };
+  assertDownloadDirUnchanged(dir, expected);
+  // Staging name independent of the destination name: a valid 250-char file
+  // name plus a suffix would exceed NAME_MAX. Open NOW, before any await.
+  const tmp = join(dir, `.botmux-dl-${process.pid}-${randomBytes(4).toString('hex')}.part`);
+  const fd = openSync(tmp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+  let renamed = false;
+  try {
+    // `write` owns no descriptor lifecycle: it must never close `fd`, so this
+    // function is its single closer. A WriteStream/pipeline would close the fd
+    // on error even with autoClose:false, leaving the finally to close a number
+    // another open() may have recycled in between.
+    await write(fd);
+    // Rename only into that same directory. If an attacker swaps it after this
+    // check, `tmp` no longer resolves to the descriptor's original directory,
+    // so there is no external staging file for the rename to publish.
+    assertDownloadDirUnchanged(dir, expected);
+    renameSync(tmp, savePath);
+    renamed = true;
+  } finally {
+    try { closeSync(fd); } catch { /* already closed */ }
+    if (!renamed) {
+      // Never unlink through a replacement directory.
+      try { assertDownloadDirUnchanged(dir, expected); unlinkSync(tmp); } catch { /* */ }
+    }
   }
+}
+
+async function writeResourceToDisk(res: any, savePath: string, guard?: DownloadDirGuard): Promise<void> {
+  await writeViaRename(savePath, async (fd) => {
+    if (res instanceof Buffer) {
+      await fdWriteAll(fd, res);
+      return;
+    }
+    // SDK download responses expose getReadableStream alongside their legacy
+    // writeFile(path) helper. Never use the path helper here: it would reopen
+    // the staging pathname after the directory check and reintroduce the race.
+    const stream = res && typeof res.getReadableStream === 'function'
+      ? res.getReadableStream()
+      : res;
+    if (!stream || (typeof stream.pipe !== 'function' && typeof stream[Symbol.asyncIterator] !== 'function')) {
+      throw new Error('Resource download did not return a readable stream');
+    }
+    // Normalize a legacy pipe-only readable (v1 stream, no async iterator) into
+    // a modern Readable before iteration. pipeline() consumed both shapes; keep
+    // that compatibility. wrap() only adapts the stream — it never touches `fd`,
+    // whose sole owner stays writeViaRename.
+    const iterable: AsyncIterable<unknown> = typeof stream[Symbol.asyncIterator] === 'function'
+      ? stream
+      : new Readable().wrap(stream);
+    // Drain the stream onto the pinned descriptor with raw callback writes.
+    // Do not hand `fd` to a WriteStream: pipeline() destroys it on error and
+    // closes the descriptor despite autoClose:false, which would double-close
+    // (and potentially close a recycled fd belonging to another operation).
+    let position = 0;
+    try {
+      for await (const chunk of iterable) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array | string);
+        await fdWriteAll(fd, buffer, position);
+        position += buffer.length;
+      }
+    } catch (error) {
+      // Abrupt for-await tears down the wrap ADAPTER, but Readable.wrap() never
+      // propagates that back to a pipe-only SOURCE (verified on Node/Bun): the
+      // underlying network stream keeps emitting and holds its listeners. Cancel
+      // it explicitly, mirroring pipeline()'s destroy-on-error. No error arg: the
+      // download already rejects with the original reason, and a sourced 'error'
+      // event without a listener could itself crash the process. Idempotent for
+      // modern streams, whose iterator return already destroyed them.
+      //
+      // Teardown must run inside its own guard: a throwing destroy() (e.g. an
+      // already-closed socket) would otherwise replace the real download error,
+      // changing caller-side classification, the user-token fallback and the
+      // user-visible diagnostic. The original error is always what propagates.
+      try {
+        if (typeof stream.destroy === 'function') stream.destroy();
+      } catch {
+        // Fixed text only: a thrown value can be any JS value, including a
+        // null-prototype object whose String()/coercion itself throws. Touching
+        // it here would re-introduce the exact masking this guard prevents. The
+        // real download error below is the only one callers classify on.
+        logger.debug('resource download: source destroy after failure was ignored');
+      }
+      throw error;
+    }
+  }, guard);
 }
 
 const EXT_TO_FILE_TYPE: Record<string, string> = {
@@ -2120,26 +2256,81 @@ export async function uploadImage(larkAppId: string, imagePath: string | Buffer)
 
 export async function uploadFile(larkAppId: string, source: string | { name: string; bytes: Buffer }, opts?: { duration?: number }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
-  return executeWithLarkGate(larkAppId, 'uploadFile', async () => {
-    const c = getBotUploadClient(larkAppId);
-    const buf = typeof source === 'string' ? readFileSync(source) : source.bytes;
-    const fileName = basename(typeof source === 'string' ? source : source.name);
-    const ext = extname(fileName).toLowerCase();
-    const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
-    // `duration` (ms) only applies to opus voice uploads — it sets the length
-    // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
-    const duration = fileType === 'opus' && opts?.duration
-      ? Math.max(1000, Math.round(opts.duration))
-      : undefined;
-    // SDK returns { file_key } directly (not wrapped in { code, data })
-    const res = await c.im.v1.file.create({
-      data: { file_type: fileType as any, file_name: fileName, file: buf, ...(duration ? { duration } : {}) },
+  const fileName = basename(typeof source === 'string' ? source : source.name);
+  const ext = extname(fileName).toLowerCase();
+  const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
+  // `duration` (ms) only applies to opus voice uploads — it sets the length
+  // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
+  const duration = fileType === 'opus' && opts?.duration
+    ? Math.max(1000, Math.round(opts.duration))
+    : undefined;
+  // The `file` part must be a file stream, not a Buffer. The SDK hands `data`
+  // to axios, which appends a Buffer to form-data WITHOUT a filename; Feishu
+  // then treats the part as a plain form field and rejects it with
+  // 400 code=9499 once it passes ~25–26MiB (the documented file limit is
+  // 30MiB). An fs.ReadStream carries `path`, so form-data emits `filename=`.
+  // form-data also trusts stat(path).size for Content-Length, which is not
+  // reliable for FIFOs or virtual files (both can report zero while yielding
+  // bytes). Stage those sources and in-memory bytes ONCE before the gate: a
+  // one-shot FIFO must never be reopened for a retry. Ordinary non-empty files
+  // still stream directly, with a fresh stream for every attempt.
+  let tmpDir: string | undefined;
+  try {
+    let filePath: string;
+    if (typeof source === 'string') {
+      const sourceStat = statSync(source);
+      filePath = source;
+      if (!sourceStat.isFile() || sourceStat.size === 0) {
+        tmpDir = mkdtempSync(join(tmpdir(), 'botmux-upload-'));
+        filePath = join(tmpDir, fileName);
+        await pipeline(createReadStream(source), createWriteStream(filePath));
+      }
+    } else {
+      tmpDir = mkdtempSync(join(tmpdir(), 'botmux-upload-'));
+      filePath = join(tmpDir, fileName);
+      writeFileSync(filePath, source.bytes);
+    }
+    return await executeWithLarkGate(larkAppId, 'uploadFile', async () => {
+      const c = getBotUploadClient(larkAppId);
+      const size = statSync(filePath).size;
+      const file = createReadStream(filePath);
+      try {
+        // SDK returns { file_key } directly (not wrapped in { code, data })
+        const res: { file_key?: string } | null | undefined = await c.im.v1.file.create({
+          data: { file_type: fileType as any, file_name: fileName, file, ...(duration ? { duration } : {}) },
+        });
+        const fileKey = res?.file_key;
+        if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
+        logger.info(`Uploaded file ${fileName} (${size} bytes) → ${fileKey}`);
+        return fileKey;
+      } catch (err) {
+        logger.warn(`Upload file ${fileName} failed (size=${size} bytes, file_type=${fileType}): ${formatLarkError(err) ?? (err instanceof Error ? err.message : String(err))}`);
+        throw err;
+      } finally {
+        if (!file.closed) {
+          // events.once(file, 'close') would reject on a teardown-time error,
+          // replacing the SDK result/error and skipping the outer temp cleanup.
+          // Only close settles this wait; the error listener prevents an
+          // uncaught exception while destroy() completes the close lifecycle.
+          await new Promise<void>((resolve) => {
+            file.once('close', resolve);
+            file.on('error', () => {});
+            file.destroy();
+          });
+        }
+      }
     });
-    const fileKey = res?.file_key;
-    if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-    logger.info(`Uploaded file ${fileName} → ${fileKey}`);
-    return fileKey;
-  });
+  } finally {
+    if (tmpDir) {
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (err) {
+        // Cleanup is best-effort: never turn an uploaded file_key into a failure
+        // or hide the original upload error behind a local rm failure.
+        logger.warn(`Failed to remove upload temp dir ${tmpDir}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
 }
 
 /**

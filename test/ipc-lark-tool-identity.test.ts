@@ -281,6 +281,17 @@ describe('session application identity route', () => {
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
   });
+  it('withholds the bot token from a session frozen with sandboxWithholdBotSecret, keeping user mode', async () => {
+    session.session.sandboxWithholdBotSecret = true;
+    try {
+      const bot = await request('bot');
+      expect(bot.status).toBe(403);
+      expect(await bot.json()).toEqual({ ok: false, error: 'lark_tool_bot_identity_withheld' });
+      expect(bots.getBotClient).not.toHaveBeenCalled();
+      const user = await request('user');
+      expect(await user.json()).toMatchObject({ ok: true, mode: 'user', credentialType: 'user_access_token' });
+    } finally { delete session.session.sandboxWithholdBotSecret; }
+  });
   it('binds bot and current user without requiring triggerUserAuth configuration', async () => {
     const bot = await request('bot'); const raw = await bot.text();
     expect(bot.status).toBe(200);

@@ -143,6 +143,7 @@ import {
 } from './decision-board-model.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
+  resolveStreamingCardFoldedLayout,
   type StreamingCardButtonId,
 } from '../../im/lark/streaming-card-buttons.js';
 
@@ -656,6 +657,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
     hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
+    streamingCardFoldedLayout: resolveStreamingCardFoldedLayout(body),
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
@@ -667,7 +669,6 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     replyCardActions: body.replyCardActions,
     replyCardNextStep: body.replyCardNextStep,
     replyCardRecap: body.replyCardRecap,
-    replyCardRecapModel: body.replyCardRecapModel,
     cotEnabled: body.cotEnabled,
     replyCardShowTools: body.replyCardShowTools,
     replyCardNativeCot: body.replyCardNativeCot,
@@ -5872,77 +5873,94 @@ export function HerdrConfigSection(props: { bot: BotDefaultsRow; patchBot: Patch
   );
 }
 
-function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
-  const [loaded, setLoaded] = useState(typeof bot.teamRole === 'string');
+  const [snapshot, setSnapshot] = useState<{ role: string; injectMode: RoleInjectMode } | null>(null);
   const [role, setRole] = useState(typeof bot.teamRole === 'string' ? bot.teamRole : '');
   const [injectMode, setInjectMode] = useState<RoleInjectMode>('every');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [conflict, setConflict] = useState(false);
+  const [reloadVersion, setReloadVersion] = useState(0);
 
+  // Switching bots resets the visible draft. A same-bot conflict reload must
+  // keep that draft until a fresh GET succeeds, including when the GET fails.
+  useEffect(() => {
+    setRole(typeof bot.teamRole === 'string' ? bot.teamRole : '');
+    setInjectMode('every');
+    setConflict(false);
+  }, [bot.larkAppId]);
+
+  // A cached teamRole is useful while loading, but it is not a CAS snapshot:
+  // role and injectMode must come from the SAME GET before every edit session.
   useEffect(() => {
     let active = true;
     const roleUrl = `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`;
-    if (typeof bot.teamRole === 'string') {
-      // Already resolved (incl. right after our own save, which patchBot's teamRole
-      // re-fires this effect) — sync the field but DON'T clear status, or the freshly
-      // set "✓ 已保存/已删除" toast gets wiped a frame later.
-      setLoaded(true);
-      setRole(bot.teamRole);
-      return () => { active = false; };
-    }
     setStatus(null);
-    setLoaded(false);
-    setRole('');
+    setSnapshot(null);
+    setLoading(true);
     void (async () => {
       try {
         const r = await fetch(roleUrl);
         const body = await r.json().catch(() => ({}));
         if (!active) return;
         if (r.ok && body.ok) {
-          const next = body.role ?? '';
-          setRole(next);
-          setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
-          setLoaded(true);
-          patchBot(bot.larkAppId, { teamRole: next });
+          const nextRole = typeof body.role === 'string' ? body.role : '';
+          const nextMode: RoleInjectMode = body.injectMode === 'once' ? 'once' : 'every';
+          setSnapshot({ role: nextRole, injectMode: nextMode });
+          setRole(nextRole);
+          setInjectMode(nextMode);
+          setConflict(false);
+          patchBot(bot.larkAppId, { teamRole: nextRole });
         } else {
           setStatus({ text: `✗ ${tr('botDefaults.roleLoadErr')}: ${body.error ?? r.status}` });
         }
       } catch (e: any) {
         if (active) setStatus({ text: `✗ ${tr('botDefaults.roleLoadErr')}: ${caughtErrorText(e)}` });
+      } finally {
+        if (active) setLoading(false);
       }
     })();
     return () => { active = false; };
-  }, [bot.larkAppId, bot.teamRole, patchBot, tr]);
-
-  // injectMode isn't cached on the bot row, so when the team role is already
-  // resolved (cache hit above skips the GET) fetch just the mode once per bot.
-  useEffect(() => {
-    let active = true;
-    if (typeof bot.teamRole !== 'string') return () => { active = false; };
-    void (async () => {
-      try {
-        const r = await fetch(`/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`);
-        const body = await r.json().catch(() => ({}));
-        if (active && r.ok && body.ok) setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
-      } catch { /* keep default 'every' */ }
-    })();
-    return () => { active = false; };
-  }, [bot.larkAppId]);
+  }, [bot.larkAppId, reloadVersion, patchBot, tr]);
 
   async function putRole(nextRole: string, deleted: boolean, mode: RoleInjectMode = injectMode): Promise<void> {
-    if (!loaded) return;
+    if (!snapshot || conflict) return;
+    const expected = snapshot;
     await saveBotField({
-      request: () => sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole, injectMode: mode }),
+      request: async () => {
+        const result = await sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, {
+          role: nextRole,
+          injectMode: mode,
+          expectedRole: expected.role,
+          expectedInjectMode: expected.injectMode,
+        });
+        if (result.status === 409 && result.body?.error === 'role_changed') setConflict(true);
+        return result;
+      },
       setStatus,
       setBusy,
       saved: deleted ? tr('botDefaults.roleDeleted') : tr('botDefaults.roleSaved'),
+      errorText: result => result.body?.error === 'role_changed'
+        ? tr('botDefaults.roleConflict')
+        : responseErrorText(result),
       onSaved: body => {
-        const stored = nextRole.trim();
-        setRole(stored);
-        if (body.injectMode === 'once' || body.injectMode === 'every') setInjectMode(body.injectMode);
-        patchBot(bot.larkAppId, { teamRole: stored });
+        // The persisted value can differ from local input after trim/32KiB
+        // truncation. Reload if talking to an older server without role in PUT.
+        if (typeof body.role !== 'string') {
+          setReloadVersion(value => value + 1);
+          return;
+        }
+        const storedMode: RoleInjectMode = body.injectMode === 'once' || body.injectMode === 'every'
+          ? body.injectMode
+          : mode;
+        setSnapshot({ role: body.role, injectMode: storedMode });
+        setRole(body.role);
+        setInjectMode(storedMode);
+        setConflict(false);
+        patchBot(bot.larkAppId, { teamRole: body.role });
       },
     });
   }
@@ -5959,7 +5977,8 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         data-input="teamRole"
         rows={6}
         placeholder={tr('botDefaults.rolePlaceholder')}
-        disabled={!loaded || busy}
+        disabled={!snapshot || busy}
+        readOnly={conflict}
         value={role}
         onChange={event => setRole(event.currentTarget.value)}
       />
@@ -5969,7 +5988,7 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
           id={`bd-role-inject-${bot.larkAppId}`}
           className="bd-role-inject-menu"
           ariaLabel={tr('roles.injectModeLabel')}
-          disabled={!loaded || busy}
+          disabled={!snapshot || busy || conflict}
           label={dropdownLabel(injectOptions, injectMode)}
           value={injectMode}
           options={injectOptions}
@@ -5977,7 +5996,8 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         />
       </div>
       <div className="actions">
-        <button type="button" className="primary" data-action="save-role" disabled={!loaded || busy} onClick={() => void putRole(role, role.trim() === '')}>{tr('botDefaults.roleSave')}</button>
+        <button type="button" className="primary" data-action="save-role" disabled={!snapshot || busy || conflict} onClick={() => void putRole(role, role.trim() === '')}>{tr('botDefaults.roleSave')}</button>
+        {conflict && <button type="button" data-action="reload-role" disabled={loading || busy} onClick={() => setReloadVersion(value => value + 1)}>{tr('botDefaults.roleReload')}</button>}
         <StatusSpan status={status} attr={{ 'data-role-status': '' }} />
       </div>
       <ProfileRoles appId={bot.larkAppId} />
@@ -6095,6 +6115,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
   const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
+  const [foldedLayout, setFoldedLayout] = useState(resolveStreamingCardFoldedLayout(bot));
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
@@ -6103,7 +6124,6 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
   const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
   const [recap, setRecap] = useState(bot.replyCardRecap === true);
-  const [recapModel, setRecapModel] = useState(bot.replyCardRecapModel === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [nativeCot, setNativeCot] = useState(bot.replyCardNativeCot === true);
@@ -6115,6 +6135,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setDisableStreaming(bot.disableStreamingCard === true);
     setReplyMode(bot.replyCardMode ?? 'legacy');
     setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
+    setFoldedLayout(resolveStreamingCardFoldedLayout(bot));
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
@@ -6123,11 +6144,10 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setReplyActions(bot.replyCardActions === true);
     setNextStep(bot.replyCardNextStep === true);
     setRecap(bot.replyCardRecap === true);
-    setRecapModel(bot.replyCardRecapModel === true);
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.replyCardRecapModel, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6300,6 +6320,18 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
         <section className="bd-card-setting-group" data-card-buttons-group>
           <h4 className="bd-card-setting-heading">{tr(replyMode === 'legacy' ? 'botDefaults.streamingButtons' : 'botDefaults.replyCardControls')}</h4>
           {replyMode !== 'legacy' && <p className="bd-card-setting-copy">{tr('botDefaults.replyCardControlsHelp')}</p>}
+          <ToggleRow
+            checked={foldedLayout}
+            disabled={busy !== null}
+            dataAction="toggle-streaming-card-folded-layout"
+            title={tr('botDefaults.streamingCardFoldedLayout')}
+            help={tr('botDefaults.streamingCardFoldedLayoutHelp')}
+            onChange={checked => {
+              const previous = foldedLayout;
+              setFoldedLayout(checked);
+              void savePatch({ streamingCardFoldedLayout: checked }, 'folded-layout', () => setFoldedLayout(previous));
+            }}
+          />
           <div className="bd-card-button-grid" data-card-button-grid>
             {buttonOptions.map(option => {
               const visible = !hiddenButtons.includes(option.id);
@@ -6431,19 +6463,6 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                 const previous = recap;
                 setRecap(checked);
                 void savePatch({ replyCardRecap: checked }, 'reply-recap', () => setRecap(previous));
-              }}
-            />
-            <ToggleRow
-              checked={recapModel}
-              disabled={busy !== null || !recap}
-              dataAction="toggle-reply-card-recap-model"
-              title={tr('botDefaults.replyCardRecapModel')}
-              description={tr('botDefaults.replyCardRecapModelDescription')}
-              help={tr('botDefaults.replyCardRecapModelHelp')}
-              onChange={checked => {
-                const previous = recapModel;
-                setRecapModel(checked);
-                void savePatch({ replyCardRecapModel: checked }, 'reply-recap-model', () => setRecapModel(previous));
               }}
             />
           </div>
@@ -6764,6 +6783,7 @@ const ZERO_PROMPT_UNSUPPORTED_COPY: Record<ZeroPromptUnsupportedReason, string> 
   cli_unsupported: 'botDefaults.promptInjectionUnsupportedCli',
   backend_unsupported: 'botDefaults.promptInjectionUnsupportedBackend',
   scratch_unsupported_for_cli: 'botDefaults.promptInjectionUnsupportedScratch',
+  oncall_unsupported_for_cli: 'botDefaults.promptInjectionUnsupportedOncall',
   zmx_unsupported_for_antigravity: 'botDefaults.promptInjectionUnsupportedZmx',
 };
 

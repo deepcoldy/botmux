@@ -642,18 +642,17 @@ describe('retry_recovery_turn — routing', () => {
 
 
 describe('a retry takes over the last reply card', () => {
-  /** A finished turn whose card has a「本轮回顾」panel and a pending model wait. */
-  function recapIoFor(cancelled: string[], published: string[]) {
+  /** A finished turn whose card waits for the CLI's recap; `readBack` lists
+   * the legacy cards a panel write was attempted on. */
+  function recapIoFor(readBack: string[], published: string[]) {
     const io: RecapIo = {
-      enabled: () => true, modelEnabled: () => true, showFacts: () => true, locale: () => 'zh',
-      readCard: async () => undefined, cardId: async () => 'card', insert: async () => {}, replace: async () => {},
-      modelRecap: async () => undefined,
-      setTimer: () => () => { cancelled.push('model wait'); },
+      enabled: () => true, locale: () => 'zh',
+      readCard: async (_ds, messageId) => { readBack.push(messageId); return undefined; },
+      cardId: async () => 'card', insert: async () => {}, replace: async () => {},
       now: () => Date.now(), warn: () => {},
     };
     return { io, unified: { kind: 'unified' as const, publish: async (markdown: string) => { published.push(markdown); } } };
   }
-  const input = { facts: { files: ['src/a.ts'], commands: 0 }, modelPrompt: 'PROMPT' };
 
   it.each([
     ['retry_turn', 'resend'],
@@ -665,21 +664,22 @@ describe('a retry takes over the last reply card', () => {
       lastCliInput: 'wrapped: do the thing', lastUserPrompt: 'do the thing', lastCliInputTurnId: TURN,
       usageLimit: { limited: true, kind: 'usage', retryAtMs: 0, retryReady: true, retryLabel: '' } as any,
     });
-    const cancelled: string[] = [];
+    const readBack: string[] = [];
     const published: string[] = [];
-    const { io, unified } = recapIoFor(cancelled, published);
+    const { io, unified } = recapIoFor(readBack, published);
     noteRecapTurnStarted(ds, 'om_turn_done');
-    noteRecapCard(ds, 'om_turn_done', { kind: 'legacy', messageId: 'om_card_done' }, input, io);
+    noteRecapCard(ds, 'om_turn_done', { kind: 'legacy', messageId: 'om_card_done' }, io);
     await recapIdle(ds);
     await handleCardAction(actionData(TURN, mode, action), depsWith(ds), LARK_APP_ID);
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
     const retryTurnId = sendWorkerInputMock.mock.calls[0][2] as string;
     expect(retryTurnId).toMatch(/^retry-/);
-    expect(cancelled).toEqual(['model wait']);
-    noteRecapCard(ds, retryTurnId, unified, input, io);
+    noteRecapCard(ds, retryTurnId, unified, io);
     noteCliRecap(ds, 'om_turn_done', '上一轮的回顾', io);
     noteCliRecap(ds, retryTurnId, '重试这一轮的回顾', io);
     await recapIdle(ds);
+    // The previous turn's card is no longer the panel's: its late recap goes nowhere.
+    expect(readBack).toEqual([]);
     expect(published.at(-1)).toContain('重试这一轮的回顾');
     expect(published.join('\n')).not.toContain('上一轮的回顾');
   });
@@ -767,27 +767,25 @@ describe('/quote cold admission', () => {
   it('hands the「本轮回顾」over from the previous turn to the quote turn', async () => {
     const ds = makeDs({ worker: { killed: false } as any });
     ds.lastScreenStatus = 'idle';
-    const cancelled: string[] = [];
+    const readBack: string[] = [];
     const published: string[] = [];
     const io: RecapIo = {
-      enabled: () => true, modelEnabled: () => true, showFacts: () => true, locale: () => 'zh',
-      readCard: async () => undefined, cardId: async () => 'card', insert: async () => {}, replace: async () => {},
-      modelRecap: async () => undefined,
-      setTimer: () => () => { cancelled.push('model wait'); },
+      enabled: () => true, locale: () => 'zh',
+      readCard: async (_ds, messageId) => { readBack.push(messageId); return undefined; },
+      cardId: async () => 'card', insert: async () => {}, replace: async () => {},
       now: () => Date.now(), warn: () => {},
     };
-    const input = { facts: { files: ['src/a.ts'], commands: 0 }, modelPrompt: 'PROMPT' };
     noteRecapTurnStarted(ds, 'om_turn_before');
-    noteRecapCard(ds, 'om_turn_before', { kind: 'legacy', messageId: 'om_card_before' }, input, io);
+    noteRecapCard(ds, 'om_turn_before', { kind: 'legacy', messageId: 'om_card_before' }, io);
     await recapIdle(ds);
     await handleCardAction(event(), depsWith(ds), LARK_APP_ID);
     expect(ds.currentTurnId).toBe('om_quote_click');
-    // The previous turn's model wait ends with it.
-    expect(cancelled).toEqual(['model wait']);
-    noteRecapCard(ds, 'om_quote_click', { kind: 'unified', publish: async markdown => { published.push(markdown); } }, input, io);
+    noteRecapCard(ds, 'om_quote_click', { kind: 'unified', publish: async markdown => { published.push(markdown); } }, io);
     noteCliRecap(ds, 'om_turn_before', '上一轮的回顾', io);
     noteCliRecap(ds, 'om_quote_click', '引用这一轮的回顾', io);
     await recapIdle(ds);
+    // The previous turn's card is no longer the panel's.
+    expect(readBack).toEqual([]);
     expect(published.at(-1)).toContain('引用这一轮的回顾');
     expect(published.join('\n')).not.toContain('上一轮的回顾');
   });
