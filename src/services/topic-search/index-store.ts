@@ -69,7 +69,7 @@ export function indexTransaction<T>(db: DatabaseSyncLike, run: () => T): T {
 }
 
 /** Read-only handles own a pinned read transaction, released by close(). */
-export function openTopicIndex(dataDir: string, options: { readOnly?: boolean } = {}): DatabaseSyncLike {
+export function openTopicIndex(dataDir: string, options: { readOnly?: boolean; busyTimeoutMs?: number } = {}): DatabaseSyncLike {
   const path = topicIndexPath(dataDir);
   const directory = join(dataDir, 'topic-search');
   if (existsSync(directory) && !lstatSync(directory).isDirectory()) throw new TopicIndexError('unsafe_topic_index_directory');
@@ -95,7 +95,7 @@ export function openTopicIndex(dataDir: string, options: { readOnly?: boolean } 
   }
   if (!existsSync(path) || !lstatSync(path).isFile()) throw new TopicIndexError('topic_index_unavailable');
   if (options.readOnly) {
-    const reader = beginPinnedRead(openDatabaseSyncOrThrow(path, { readOnly: true }));
+    const reader = beginPinnedRead(openDatabaseSyncOrThrow(path, { readOnly: true }), options.busyTimeoutMs);
     try {
       validateIdentity(reader);
       if (version(reader) !== SCHEMA_VERSION) throw new TopicIndexError('topic_index_schema_mismatch');

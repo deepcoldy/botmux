@@ -12,8 +12,8 @@ export type ReadonlySource = { status: 'ready'; db: DatabaseSyncLike; version: n
  *  Bun, close() with unfinalized statements leaves the connection alive until GC,
  *  and a connection still inside BEGIN keeps its snapshot, so the source's own
  *  writer cannot checkpoint (its WAL keeps growing) until then. */
-export function beginPinnedRead(db: DatabaseSyncLike): DatabaseSyncLike {
-  try { db.exec(`PRAGMA busy_timeout=${READ_BUSY_TIMEOUT_MS}`); db.exec('BEGIN'); }
+export function beginPinnedRead(db: DatabaseSyncLike, busyTimeoutMs = READ_BUSY_TIMEOUT_MS): DatabaseSyncLike {
+  try { db.exec(`PRAGMA busy_timeout=${busyTimeoutMs}`); db.exec('BEGIN'); }
   catch (error) { db.close(); throw error; }
   return {
     exec: sql => db.exec(sql),

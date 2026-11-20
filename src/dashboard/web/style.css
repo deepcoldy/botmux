@@ -34688,7 +34688,8 @@ dialog.command-palette-dialog::backdrop {
   min-width: 0;
 }
 .cmdk-item-title,
-.cmdk-item-sub {
+.cmdk-item-sub,
+.cmdk-item-excerpt {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -34699,7 +34700,8 @@ dialog.command-palette-dialog::backdrop {
   font-weight: 550;
   line-height: 1.35;
 }
-.cmdk-item-sub {
+.cmdk-item-sub,
+.cmdk-item-excerpt {
   color: var(--muted);
   font-size: 12px;
   line-height: 1.35;

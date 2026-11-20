@@ -1,4 +1,7 @@
 import { selectSessionPage } from './dashboard/session-pagination.js';
+import { createSessionContentSearch } from './dashboard/session-content-search.js';
+import { searchTopics, TopicIndexError } from './services/topic-search/query.js';
+import { readTopicSessions } from './services/topic-search/sources.js';
 import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -935,6 +938,16 @@ const previewGuardPage = createPreviewGuardPage({
   // 没权限」。这只是不渲染一个必然失败的入口，服务端门禁一分未松。
   canInteract: req => projectWorkbenchOperationCapabilities(dashboardRequestIdentity(req)).canInteract,
 });
+const sessionContentSearch = createSessionContentSearch({
+  search: (request, options) => {
+    if (process.env.BOTMUX_TOPIC_SEARCH === '0') throw new TopicIndexError('topic_search_disabled');
+    return searchTopics(config.session.dataDir, request, undefined, options);
+  },
+  readSessions: () => readTopicSessions(config.session.dataDir).sessions,
+  now: Date.now,
+  warn: reason => logger.warn(`[dashboard] content search unavailable: ${reason}`),
+});
+
 // Primary replicas need one shared route registry for Pod-local worker
 // terminals. Initialize it before the `/s/*` front proxy so a request landing
 // on a non-owner backend can resolve the current owner Dashboard NodePort.
@@ -4958,7 +4971,8 @@ const server = createServer(async (req, res) => {
       const groupPresentation = groupsMatrixSnapshot.peekPresentation();
       let page: ReturnType<typeof selectSessionPage<ReturnType<typeof aggregator.getSessions>[number]>>;
       try {
-        page = selectSessionPage(aggregator.getSessions(), url.searchParams, {
+        const rows = aggregator.getSessions();
+        page = selectSessionPage(rows, url.searchParams, {
           // ⌘K / Workbench search also matches the names the browser displays
           // beside a row: the current bot name and the group name.
           searchText: row => [
@@ -4966,6 +4980,9 @@ const server = createServer(async (req, res) => {
             typeof row.chatId === 'string' ? groupPresentation.get(row.chatId)?.name : undefined,
           ],
         });
+        if (url.searchParams.get('view') === 'content') {
+          page = sessionContentSearch(url.searchParams.get('q') ?? '', sessionBoardAudience, rows);
+        }
       }
       catch (error) {
         return jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : 'invalid_session_page' });

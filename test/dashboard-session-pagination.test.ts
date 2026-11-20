@@ -157,3 +157,23 @@ describe('closed-session keyword search (view=closed&q=)', () => {
     expect(() => selectSessionPage(rows, new URLSearchParams({ view: 'board', q: 'x' }))).toThrow('invalid_session_query');
   });
 });
+
+
+describe('Dashboard content view parameters', () => {
+  it('validates the content view without returning metadata rows or history cursors', () => {
+    const rows = archive(2);
+    expect(selectSessionPage(rows, new URLSearchParams({ view: 'content', q: 'needle' }))).toEqual({ sessions: [] });
+    expect(selectSessionPage(rows, new URLSearchParams({ view: 'content', q: '' }))).toEqual({ sessions: [] });
+    expect(selectSessionPage(rows, new URLSearchParams({ view: 'content', q: 'x'.repeat(200) }))).toEqual({ sessions: [] });
+  });
+
+  it('rejects missing, oversized or controlled queries and every supplied cursor', () => {
+    for (const params of [new URLSearchParams({ view: 'content' }),
+      ...['x'.repeat(201), 'bad\nquery', 'bad\u0000query', 'bad\u007fquery'].map(q => new URLSearchParams({ view: 'content', q }))]) {
+      expect(() => selectSessionPage([], params)).toThrow('invalid_session_query');
+    }
+    for (const cursor of ['', 'anything', Buffer.from('[1,"session"]').toString('base64url')]) {
+      expect(() => selectSessionPage([], new URLSearchParams({ view: 'content', q: 'needle', cursor }))).toThrow('invalid_session_cursor');
+    }
+  });
+});
