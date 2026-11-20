@@ -101,6 +101,7 @@ export interface TriggerUserAuthConfig {
    * prompts do not mention it.
    */
   allowSpeakerSwitch?: boolean;
+  allowOwnerActor?: boolean;
   /** Extra tools signed for a direct human's dispatch, or allowed to pass
    * through from an already verified delegation, into the exact listed chat
    * and target apps. They never govern this bot's own CLI calls. */
@@ -271,6 +272,9 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     && typeof rec.allowSpeakerSwitch !== 'boolean') {
     throw new TriggerUserAuthConfigError('triggerUserAuth.allowSpeakerSwitch must be a boolean');
   }
+  if (rec.allowOwnerActor !== undefined && typeof rec.allowOwnerActor !== 'boolean') {
+    throw new TriggerUserAuthConfigError('triggerUserAuth.allowOwnerActor must be a boolean');
+  }
 
   const gitHost = optionalHost(rec.gitHost, 'triggerUserAuth.gitHost');
   const gitTokenExchangeUrl = optionalHttpsUrl(
@@ -318,6 +322,7 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     // Equal to the default → not stored.
     ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
     ...(rec.allowSpeakerSwitch === true ? { allowSpeakerSwitch: true } : {}),
+    ...(rec.allowOwnerActor === true ? { allowOwnerActor: true } : {}),
     ...(dispatchOnly ? { dispatchOnly } : {}),
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),

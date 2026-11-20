@@ -247,6 +247,7 @@ import {
   reserveQueuedActivationTailAdmission,
 } from '../src/core/worker-pool.js';
 import { __testOnly_resetSessionTurnQueues, runSessionTurn } from '../src/core/session-turn-queue.js';
+import { readSessionTurns, recordSessionTurnInput, stageSessionTurnInbound } from '../src/services/session-turns.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
@@ -1332,6 +1333,52 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(activeSessions.size).toBe(1);
     expect(activeSessions.get(sessionKey('om_root_2', APP))).toBe(ds);
     expect(repliedText()).toContain('会话标题已更新');
+  });
+
+  it.each([
+    { entry: 'new-topic', sender: 'peer', expectedIsBot: true },
+    { entry: 'thread', sender: 'peer', expectedIsBot: true },
+    { entry: 'thread', sender: 'human', expectedIsBot: false },
+  ] as const)('bare /rename preserves the route-resolved sender identity ($entry, $sender)', async ({ entry, sender, expectedIsBot }) => {
+    const peerOpenId = 'ou_bare_rename_peer';
+    const senderOpenId = sender === 'peer' ? peerOpenId : OWNER;
+    mkdirSync(mocks.dataDir, { recursive: true });
+    writeFileSync(crossRefPath(), JSON.stringify({ PeerBot: peerOpenId }));
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER, peerOpenId],
+      bareRenamePassthrough: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER, peerOpenId];
+    const anchor = `om_bare_rename_${entry}_${sender}`;
+    const messageId = `${anchor}_message`;
+    const ds = seedThreadSession(anchor, 'bare rename sender identity');
+    ds.session.cliId = 'claude-code';
+    const send = vi.fn();
+    ds.worker = { killed: false, connected: true, send } as any;
+    const data = makeEventData(messageId, '/rename', entry === 'thread' ? anchor : undefined);
+    // Lark did not stamp sender_type. Only the route's cross-ref can distinguish
+    // the registered peer bot from the genuine human control.
+    data.sender = { sender_id: { open_id: senderOpenId } };
+
+    if (entry === 'new-topic') await handleNewTopic(data, makeCtx(anchor, messageId));
+    else await handleThreadReply(data, makeCtx(anchor, messageId));
+
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'raw_input', content: '/rename', turnId: messageId,
+    }));
+    expect(ds.session.quoteTargetSenderOpenId).toBe(senderOpenId);
+    expect(ds.session.quoteTargetSenderIsBot).toBe(expectedIsBot);
+    expect(ds.session.replyTargets?.[messageId]?.participants).toEqual([
+      expect.objectContaining({ openId: senderOpenId, isBot: expectedIsBot }),
+    ]);
+    expect(ds.session.turnReplyContexts?.[messageId]).toMatchObject({
+      replyTargetSenderOpenId: senderOpenId,
+      replyTargetSenderIsBot: expectedIsBot,
+    });
+    expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
   it('non-allowedUsers sender: `/rename` is denied by canOperate on BOTH routes, nothing created/renamed', async () => {
@@ -3101,7 +3148,16 @@ describe('/rename production routing — must not pre-create a session (review P
     ds.pendingCodexAppFollowUpContexts = bufs.map(() => '');
     // Every buffered message was clean-input-accepted (all true) — must NOT leak
     // into a steer authorization at any layer.
-    ds.pendingCodexAppFollowUpGateAccepted = [...gates];
+    ds.pendingCodexAppFollowUpGateAccepted = [...gates]
+
+    // Read model: stage the inbound rows the real daemon writes on admission,
+    // BEFORE the coalesced release merges them into the last attributed turn.
+    for (const [i, tid] of turnIds.entries()) {
+      stageSessionTurnInbound(config.session.dataDir, ds.session.sessionId, tid, {
+        via: 'trigger', messageId: tid, text: bufs[i]!,
+        placement: { kind: 'thread', rootMessageId: anchor },
+      });
+    }
 
     await expect(releaseQueuedActivationReservation(ds)).resolves.toBe(true);
 
@@ -3126,6 +3182,21 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(msg.content).toContain('BUFFERED_ONE');
     if (bufs.length > 1) expect(msg.content).toContain('BUFFERED_TWO');
     expect(msg.codexAppSteerable).toBeUndefined();
+
+    // Replay the worker's default resolution (no explicit source ids) against
+    // the last attributed turnId: the release must have merged every buffered
+    // message's staged inbound into that turn.
+    const targetTurnId = turnIds.at(-1)!;
+    recordSessionTurnInput({
+      dataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      turnId: targetTurnId,
+      input: bufs.join('\n\n'),
+      cliId: 'codex',
+    });
+    const turnsPage = readSessionTurns(config.session.dataDir, ds.session.sessionId, 0, 50);
+    expect(turnsPage.turns.find(turn => turn.turnId === targetTurnId)?.inbound.map(m => m.text))
+      .toEqual(bufs);
   });
 
   it('routes Codex /fast verbatim to a live session but never cold-starts one', async () => {

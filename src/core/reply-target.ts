@@ -466,7 +466,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string; crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string } },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string; synthetic?: true; crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string } },
 ): void {
   if (isLarkChatId(replyRootId)) replyRootId = undefined;
   // #597: the frozen per-turn dispatch context — the authoritative reply target
@@ -492,17 +492,18 @@ export function beginReplyTargetTurn(
               ? { requesterIsBot: ds.session.quoteTargetSenderIsBot } : {}) } : {}),
     ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
       ? { sourceMessageId: opts.sourceMessageId } : {}),
-    ...(ds.session.quoteTargetId && !opts?.crossChatOrigin ? { quoteTargetId: ds.session.quoteTargetId } : {}),
-    ...((opts?.crossChatOrigin ? (opts.senderOpenId ?? ds.session.quoteTargetSenderOpenId) : ds.session.quoteTargetSenderOpenId)
-      ? { replyTargetSenderOpenId: (opts?.crossChatOrigin ? (opts.senderOpenId ?? ds.session.quoteTargetSenderOpenId) : ds.session.quoteTargetSenderOpenId)! }
-      : {}),
+    ...(!opts?.synthetic && ds.session.quoteTargetId && !opts?.crossChatOrigin ? { quoteTargetId: ds.session.quoteTargetId } : {}),
+    ...(opts?.crossChatOrigin
+      ? ((opts.senderOpenId ?? ds.session.quoteTargetSenderOpenId)
+        ? { replyTargetSenderOpenId: (opts.senderOpenId ?? ds.session.quoteTargetSenderOpenId)! } : {})
+      : (!opts?.synthetic && ds.session.quoteTargetSenderOpenId
+        ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId } : {})),
     ...(opts?.crossChatOrigin
       ? (opts.participants?.find(p => p.openId === opts.senderOpenId)?.isBot !== undefined
         ? { replyTargetSenderIsBot: opts.participants.find(p => p.openId === opts.senderOpenId)!.isBot }
         : {})
-      : (ds.session.quoteTargetSenderIsBot !== undefined
-        ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
-        : {})),
+      : (!opts?.synthetic && ds.session.quoteTargetSenderIsBot !== undefined
+        ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot } : {})),
     ...(opts?.crossChatOrigin ? { crossChatOrigin: opts.crossChatOrigin } : {}),
     // Chat-scope only: distinguishes "answered flat AT TOP LEVEL" from
     // "answered flat but the inbound was already inside a topic" (a native
@@ -552,7 +553,7 @@ export function beginReplyTargetTurn(
   );
   ds.session.replyTargets = targets;
 
-  if (ds.scope !== 'chat') return;
+  if (ds.scope !== 'chat' || opts?.synthetic) return;
   if (replyRootId) {
     const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
     aliases[replyRootId] = {

@@ -148,7 +148,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'security',
     titleKey: 'botDefaults.sectionGrant',
     fieldKeys: [
-      'botDefaults.p2pOpen', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
+      'botDefaults.p2pOpen', 'botDefaults.scheduleCreateByTalkers', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
       'botDefaults.grantRequestToOwnerDm', 'botDefaults.trustSameOwnerBots', 'botDefaults.grantDelegateBots',
       'botDefaults.grantDurationDefault', 'botDefaults.quotaDefault',
     ],
@@ -158,7 +158,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'slash-commands',
     tab: 'security',
     titleKey: 'botDefaults.sectionSlashCommands',
-    fieldKeys: ['botDefaults.nativeSlashTitle', 'botDefaults.canTalkDaemon', 'botDefaults.customPassthrough'],
+    fieldKeys: ['botDefaults.nativeSlashTitle', 'botDefaults.canTalkDaemon', 'botDefaults.customPassthrough', 'botDefaults.bareRenamePassthrough'],
   },
   {
     id: 'card-behavior',
@@ -572,6 +572,8 @@ export type BotDefaultsRow = {
   customPassthroughCommands?: string;
   defaultPassthroughCommands?: string[];
   canTalkDaemonCommands?: string;
+  /** Bare `/rename` goes to the CLI to name the session itself (default off). */
+  bareRenamePassthrough?: boolean;
   launchShell?: string;
   env?: string;
   envKeys?: string[];
@@ -597,6 +599,7 @@ export type BotDefaultsRow = {
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
   p2pOpen?: boolean;
+  scheduleCreateByTalkers?: boolean;
   grantRequestToOwnerDm?: boolean;
   trustSameOwnerBots?: boolean;
   grantDelegateBots?: string[];

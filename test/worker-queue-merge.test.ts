@@ -35,7 +35,10 @@ describe('mergeQueuedCliInput', () => {
 
     expect(mergeQueuedCliInput(pending, { content: 'second', turnId: 't2', trustedCaller })).toBe(true);
 
-    expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2', trustedCaller }]);
+    expect(pending).toEqual([{
+      content: 'first\n\nsecond', turnId: 't2', trustedCaller,
+      structuredSourceTurnIds: ['t1', 't2'],
+    }]);
   });
 
   it('never merges queue items across trusted caller boundaries', () => {

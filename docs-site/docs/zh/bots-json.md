@@ -117,6 +117,7 @@
 | `providerRecovery` | 仅 Claude Code：模型服务暂时出错时自动续跑，例如 `{"enabled":true,"maxWaitMinutes":30}`。没写的字段沿用全局设置，默认关闭。说明见[全局设置：暂态故障自动续跑](/global-settings#provider-recovery) |
 | `skillInjection` | botmux 自带 skill 怎么交给 CLI：`prompt`（按会话注入）、`global`（装进 CLI 全局 skill 目录）、`off`。不填时跟随全局设置，全局默认是 `prompt`。见 [Skill](/skill-cli) |
 | `customPassthroughCommands` | 额外允许透传给 CLI 的斜杠命令，例如 `["/export"]`。会和 botmux 自己命令重名的项会被丢掉。用 `/list-slash-command` 看完整放行清单。见[斜杠命令](/slash-commands) |
+| `bareRenamePassthrough` | 默认关闭。设 `true` 后，不带标题的 `/rename` 会原样交给 CLI，由 CLI 根据对话给会话起名（目前只有 Claude Code 支持，接管的会话也算）。见[斜杠命令](/slash-commands#rename-cli) |
 | `startupCommands` | 会话启动后、第一条消息之前自动发给 CLI 的命令，例如 `["/effort ultracode"]`。每次新启动或恢复都会重发 |
 | `quotaFallbackBot` | CLI 额度用完后自动交接给另一个 bot。默认关闭。见下方[额度用完自动交接](#quota-fallback) |
 | `codexCapacityRecovery` | 仅 Codex / Codex App：遇到明确的模型容量错误时自动续跑。默认关闭；每个任务最多追加两条续跑输入。普通限流和额度用完不算 |

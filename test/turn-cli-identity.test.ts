@@ -65,7 +65,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
 const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
-const { isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
+const { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
 const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper, sessionIdentityPath } = await import('../src/core/cli-identity.js');
 const { renewExpiringBytedcliIdentities, trackedBytedcliRenewalCount, forgetBytedcliIdentityRenewals } = await import('../src/core/bytedcli-identity-renewal.js');
 const { renewBytedcliJwts } = await import('../src/services/bytedcli-auth.js');
@@ -129,6 +129,22 @@ function published(tool: 'lark-cli' | 'bytedcli', turnId = 'turn-default'): bool
 
 
 describe('publishTurnCliIdentity — lark-cli per-person HOME (device flow)', () => {
+  it.each([false, true])('publishes the owner actor personal credential only with opt-in=%s', async (allowOwnerActor) => {
+    const owner = 'ou_fixture_owner';
+    const turnId = 'trg_owner_fixture';
+    const ownerHome = '/homes/fixture-owner';
+    larkHomes.set(owner, ownerHome);
+    const outcomes = await publish(botConfig({ enabled: true, tools: ['lark-cli'], allowOwnerActor }), owner, turnId);
+    const body = identityBody('lark-cli', turnId);
+    if (allowOwnerActor) {
+      expect(outcomes.find(outcome => outcome.tool === 'lark-cli')?.state).toBe('user');
+      expect(body).toContain(ownerHome);
+    } else {
+      expect(body).not.toContain(ownerHome);
+      expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+    }
+  });
+
   it('publishes the per-person HOME as a user-home identity (no token injected)', async () => {
     larkHomes.set(ALICE, '/homes/alice');
     const outcomes = await publish(botConfig(), ALICE);
@@ -558,12 +574,14 @@ describe('target daemon consumes signed message authority', () => {
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } = await import('../src/core/reply-target.js');
     const { resolveScheduledRunIdentity } = await import('../src/core/schedule-identity-claim.js');
+    const { isTalkerScheduledTask, authorizeTalkerScheduleRun, talkerSchedulePolicy, talkerScheduleChatType } = await import('../src/core/schedule-talker.js');
     const { buildUntilDoneRunPrompt, isAutoCompletedSchedule } = await import('../src/services/schedule-until-done.js');
     const { scheduleTimeZone } = await import('../src/utils/timezone.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
     const { clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers } = await import('../src/core/cli-identity.js');
     const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'checkDelegationRecipient', 'delegatedScheduleRuntimeDeps',
+      'talkerScheduleRuntimeDeps',
       'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
       'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
       'handleIdentityDecisionFlip', 'noteTurnReceived'].map(name => {
@@ -615,7 +633,11 @@ describe('target daemon consumes signed message authority', () => {
         return new Set(options.member === false ? [] : ['ou_alice_target']);
       },
       publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en',
-      clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
+      clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, allowsPersonalIdentityForTurn, isOwnerActorTurnId,
+      // This harness never configures an ownerOpenId; non-owner turns do not
+      // evaluate the owner-only fence, and an owner fixture would be unresolved.
+      getStrictOwnerOpenId: () => undefined,
+      logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
       // A session whose worker has not reported yet publishes under the
       // fail-closed single default; tests set ds.reportedModel to stage that.
       identityStorageModelForDaemonSession: (session: any) => session.reportedModel ?? 'proven',
@@ -635,6 +657,12 @@ describe('target daemon consumes signed message authority', () => {
       prepareScheduledRecoveryRun,
       assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn,
       resolveScheduledRunIdentity,
+      // prepareScheduledTurnCliIdentity / the extracted scheduler callback gained
+      // the talker-task branch (core/schedule-talker); bind the real symbols.
+      // The production runtime-deps helper is extracted above and assigned back
+      // below, so neither entry point can fall back to a test-side mirror.
+      isTalkerScheduledTask, authorizeTalkerScheduleRun, talkerScheduleChatType, talkerSchedulePolicy,
+      talkerScheduleRuntimeDeps: undefined as any,
       noteScheduledIdentityGap: vi.fn(),
       noteScheduledIdentityRestored: vi.fn(),
       isAutoCompletedSchedule, buildUntilDoneRunPrompt, scheduleTimeZone,
@@ -648,7 +676,10 @@ describe('target daemon consumes signed message authority', () => {
       registerOncallTurn: () => {},
     };
     const handlers = new Function('scope', 'with (scope) { ' + code
-      + '; return { refreshTurnCliIdentity, prepareTurnCliIdentity, handleIdentityDecisionFlip, noteTurnReceived }; }')(scopeValues);
+      + '; return { refreshTurnCliIdentity, prepareTurnCliIdentity, handleIdentityDecisionFlip, noteTurnReceived, talkerScheduleRuntimeDeps }; }')(scopeValues);
+    // Both the already-extracted prepare function and the separately extracted
+    // scheduler callback resolve this same live scope property.
+    scopeValues.talkerScheduleRuntimeDeps = handlers.talkerScheduleRuntimeDeps;
     return {
       ds,
       scopeValues,
@@ -1315,6 +1346,169 @@ describe('target daemon consumes signed message authority', () => {
     h.scopeValues.identityDecisionConflict = () => undefined;
     await h.run('om_kickoff');
     expect(publish).toHaveBeenCalledOnce();
+  });
+
+  // A talker-created task (ownerAccess: 'talk') is re-admitted through
+  // core/schedule-talker, never through the administrator path: its creator has
+  // no canOperate, and a failed re-admission must refuse without a claim card.
+  function talkerSchedule(h: Awaited<ReturnType<typeof targetHarness>>) {
+    const { task, authority } = directSchedule(h, {
+      ownerOpenId: 'ou_alice_target', ownerUnionId: 'on_alice', ownerAccess: 'talk',
+    });
+    Object.assign(authority, {
+      controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+      runScopes: [], selfManage: false,
+    });
+    return { task, authority };
+  }
+  const enableTalkerPolicy = (h: Awaited<ReturnType<typeof targetHarness>>) => {
+    h.scopeValues.getBot = () => ({
+      config: { ...botConfig({ enabled: true, tools: ['bytedcli'] }), scheduleCreateByTalkers: true },
+    });
+  };
+
+  it('publishes a talker task as its creator while the policy holds, with no claim card', async () => {
+    const h = await targetHarness();
+    enableTalkerPolicy(h);
+    talkerSchedule(h);
+    bytedcliJwts.set('ou_alice_target', { cloudJwt: 'talker-cloud' });
+    await h.run(firstScheduledTurn);
+    expect(identityBody('bytedcli', firstScheduledTurn)).toContain('talker-cloud');
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+    expect(h.scopeValues.noteScheduledIdentityRestored).toHaveBeenCalledWith(h.ds,
+      expect.objectContaining({ id: 'a1b2c3d4' }), firstScheduledTurn,
+      { ok: true, openId: 'ou_alice_target', unionId: 'on_alice', source: 'creator' });
+    // The administrator path must not be consulted for a talker task.
+    expect(h.scopeValues.canOperate).not.toHaveBeenCalled();
+  });
+
+  it('publishes a talker task for a creator whose talk source is platform team membership', async () => {
+    const h = await targetHarness();
+    enableTalkerPolicy(h);
+    talkerSchedule(h);
+    h.scopeValues.evaluateTalk = vi.fn((...args: any[]) => ({
+      allowed: args[3] === undefined && args[4] === 'on_alice', reason: 'teamMember',
+    }));
+    bytedcliJwts.set('ou_alice_target', { cloudJwt: 'team-member-cloud' });
+    await h.run(firstScheduledTurn);
+    expect(identityBody('bytedcli', firstScheduledTurn)).toContain('team-member-cloud');
+  });
+
+  it('refuses a talker task when the switch changes during credential publication', async () => {
+    const h = await targetHarness();
+    enableTalkerPolicy(h);
+    talkerSchedule(h);
+    bytedcliJwts.set('ou_alice_target', { cloudJwt: 'published-before-revoke' });
+    const publish = h.scopeValues.publishTurnCliIdentity;
+    h.scopeValues.publishTurnCliIdentity = vi.fn(async (args: any) => {
+      const outcomes = await publish(args);
+      h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) });
+      return outcomes;
+    });
+    await expect(h.run(firstScheduledTurn)).rejects.toThrow(/disabled/);
+  });
+
+  it.each([
+    ['the bot switch is off', (h: Awaited<ReturnType<typeof targetHarness>>) => {
+      h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) });
+    }, /disabled/],
+    ['the creator can no longer talk', (h: Awaited<ReturnType<typeof targetHarness>>) => {
+      h.scopeValues.evaluateTalk = () => ({ allowed: false });
+    }, /can no longer talk/],
+    ['the creator left the group', (h: Awaited<ReturnType<typeof targetHarness>>) => {
+      h.scopeValues.listChatMemberOpenIds = async () => [];
+    }, /no longer a target chat member/],
+  ] as const)('refuses a talker scheduled turn when %s, without offering a claimant', async (_label, arrange, expected) => {
+    const h = await targetHarness();
+    enableTalkerPolicy(h);
+    talkerSchedule(h);
+    const publish = vi.fn();
+    h.scopeValues.publishTurnCliIdentity = publish;
+    arrange(h);
+    bytedcliJwts.set('ou_alice_target', { cloudJwt: 'must-not-leak' });
+    await expect(h.run(firstScheduledTurn)).rejects.toThrow(expected);
+    expect(h.scopeValues.noteScheduledIdentityGap).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  it('the scheduler queue-entry re-admission blocks a talker task whose switch was turned off', async () => {
+    const h = await targetHarness();
+    enableTalkerPolicy(h);
+    const { task } = talkerSchedule(h);
+    task.lastRunId = 'test-run';
+    let execute: (task: any, context: any) => Promise<void>;
+    let dispatches = 0;
+    h.installSchedulerCallback({
+      cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
+        await run(); return 'executed';
+      },
+      executeScheduledTaskForTargets: async (task: any, _chats: any, run: (task: any) => Promise<void>) => {
+        await run(task); return [];
+      },
+      withBotTurnAdmission: (_app: any, run: () => Promise<void>) => run(),
+      activeSessions: new Map(), refreshCliVersion: vi.fn(),
+      ScheduleTargetExecutionError: class extends Error {},
+      resolveScheduleRunLogErrorDetails: (_precondition: any, error: Error) => ({ error: error.message }),
+      executeScheduledTask: async () => { dispatches += 1; },
+      appendScheduleRunLog: vi.fn(),
+    });
+    // Switch turned off after creation: the run is refused before any dispatch.
+    h.scopeValues.getBot = () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) });
+    await expect(execute!(task, { runId: 'test-run', trigger: 'scheduler', startedAt: new Date().toISOString() }))
+      .rejects.toThrow(/disabled/);
+    expect(dispatches).toBe(0);
+    // Re-enabling restores the task without rewriting anything.
+    enableTalkerPolicy(h);
+    await execute!(task, { runId: 'test-run-2', trigger: 'scheduler', startedAt: new Date().toISOString() });
+    expect(dispatches).toBe(1);
+  });
+
+  it('re-admits talker tasks after queue waits even when trigger-user auth is off', async () => {
+    const h = await targetHarness();
+    const { task } = talkerSchedule(h);
+    const withoutTriggerAuth = (scheduleCreateByTalkers: boolean) => ({
+      ...botConfig({ enabled: true, tools: ['bytedcli'] }),
+      triggerUserAuth: undefined,
+      scheduleCreateByTalkers,
+    });
+    h.scopeValues.getBot = () => ({ config: withoutTriggerAuth(true) });
+    task.lastRunId = 'test-run';
+    let execute: (task: any, context: any) => Promise<void>;
+    let dispatches = 0;
+    let revokeOnWait = true;
+    h.installSchedulerCallback({
+      cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
+        if (revokeOnWait) {
+          revokeOnWait = false;
+          h.scopeValues.getBot = () => ({ config: withoutTriggerAuth(false) });
+        }
+        await run(); return 'executed';
+      },
+      executeScheduledTaskForTargets: async (task: any, _chats: any, run: (task: any) => Promise<void>) => {
+        await run(task); return [];
+      },
+      withBotTurnAdmission: (_app: any, run: () => Promise<void>) => run(),
+      activeSessions: new Map(), refreshCliVersion: vi.fn(),
+      ScheduleTargetExecutionError: class extends Error {},
+      resolveScheduleRunLogErrorDetails: (_precondition: any, error: Error) => ({ error: error.message }),
+      executeScheduledTask: async (_task: any, _active: any, _refresh: any, _prompt: any, runtime: any) => {
+        await runtime?.prepareTurnIdentity(h.ds, firstScheduledTurn);
+        dispatches += 1;
+      },
+      appendScheduleRunLog: vi.fn(),
+    });
+    await expect(execute!(task, { runId: 'test-run', trigger: 'scheduler', startedAt: new Date().toISOString() }))
+      .rejects.toThrow(/disabled/);
+    expect(dispatches).toBe(0);
+
+    // Re-enabling the feature admits a later fire through the same no-trigger
+    // path; this fence is not an unconditional rejection of talker tasks.
+    h.scopeValues.getBot = () => ({ config: withoutTriggerAuth(true) });
+    task.lastRunId = 'test-run-2';
+    await execute!(task, { runId: 'test-run-2', trigger: 'scheduler', startedAt: new Date().toISOString() });
+    expect(dispatches).toBe(1);
   });
 });
 

@@ -5798,15 +5798,120 @@ describe('handleCommand', () => {
   // ─── /rename ─────────────────────────────────────────────────────────────
 
   describe('/rename', () => {
-    it('shows usage when no title is provided', async () => {
-      const ds = makeDaemonSession();
-      const deps = makeDeps(ds);
+    /** Turns on the bot's `bareRenamePassthrough` switch until the test ends. */
+    function enableBareRenamePassthrough(): void {
+      const previous = vi.mocked(getBot).getMockImplementation()!;
+      vi.mocked(getBot).mockImplementation(((id?: string) => {
+        const bot = previous(id as any) as any;
+        return { ...bot, config: { ...bot.config, bareRenamePassthrough: true } };
+      }) as any);
+      onTestFinished(() => { vi.mocked(getBot).mockImplementation(previous); });
+    }
+
+    it('keeps the usage reply for a bare /rename on live Claude Code while the switch is off', async () => {
+      const send = vi.fn();
+      const ds = makeDaemonSession({
+        session: makeSession({ cliId: 'claude-code', cliPathOverride: '/bin/claude' }),
+        worker: { killed: false, connected: true, send } as any,
+      });
+      const deps = { ...makeDeps(ds), deliverCliCommand: vi.fn(() => 'delivered' as const) };
 
       await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename'), deps, LARK_APP_ID);
 
       const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-      expect(replyContent).toContain('/rename');
-      expect(replyContent).toContain('新的会话标题');
+      expect(replyContent).toBe('用法：/rename <新的会话标题>');
+      expect(deps.deliverCliCommand).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['codex', '/bin/codex'],
+      ['traex', '/bin/traex'],
+    ] as const)('shows usage for a bare /rename on a live %s session', async (cliId, cliPathOverride) => {
+      enableBareRenamePassthrough();
+      const send = vi.fn();
+      const ds = makeDaemonSession({
+        session: makeSession({ cliId, cliPathOverride }),
+        worker: { killed: false, connected: true, send } as any,
+      });
+      const deps = { ...makeDeps(ds), deliverCliCommand: vi.fn(() => 'delivered' as const) };
+
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toBe('用法：/rename <新的会话标题>');
+      expect(deps.deliverCliCommand).not.toHaveBeenCalled();
+      expect(send).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    });
+
+    it('hands a bare /rename to a live Claude Code session and keeps the Botmux title', async () => {
+      enableBareRenamePassthrough();
+      const send = vi.fn();
+      const ds = makeDaemonSession({
+        session: makeSession({ cliId: 'claude-code', cliPathOverride: '/bin/claude' }),
+        worker: { killed: false, connected: true, send } as any,
+      });
+      const deps = { ...makeDeps(ds), deliverCliCommand: vi.fn(() => 'delivered' as const) };
+      const message = makeLarkMessage('/rename  ');
+
+      await handleCommand('/rename', ROOT_ID, message, deps, LARK_APP_ID);
+
+      expect(deps.deliverCliCommand).toHaveBeenCalledOnce();
+      expect(deps.deliverCliCommand).toHaveBeenCalledWith(ds, '/rename', message);
+      expect(send).not.toHaveBeenCalled();
+      expect(ds.session.title).toBe('Test Session');
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('自动起名');
+    });
+
+    it('uses the adopted CLI to decide that a bare /rename goes to Claude Code', async () => {
+      enableBareRenamePassthrough();
+      const ds = makeDaemonSession({
+        session: makeSession({ cliId: 'codex', cliPathOverride: '/bin/claude' }),
+        adoptedFrom: { cliId: 'claude-code', cwd: '/repo' } as any,
+        worker: { killed: false, connected: true, send: vi.fn() } as any,
+      });
+      const deps = { ...makeDeps(ds), deliverCliCommand: vi.fn(() => 'delivered' as const) };
+
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename'), deps, LARK_APP_ID);
+
+      expect(deps.deliverCliCommand).toHaveBeenCalledWith(ds, '/rename', expect.anything());
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('交给 Claude');
+      expect(replyContent).not.toContain('交给 codex');
+    });
+
+    it.each([
+      ['activation_pending', '暂不能发送'],
+      ['rejected', '发送 /rename 失败'],
+    ] as const)('reports a %s bare /rename delivery', async (outcome, expected) => {
+      enableBareRenamePassthrough();
+      const ds = makeDaemonSession({
+        session: makeSession({ cliId: 'claude-code', cliPathOverride: '/bin/claude' }),
+        worker: { killed: false, connected: true, send: vi.fn() } as any,
+      });
+      const deps = { ...makeDeps(ds), deliverCliCommand: vi.fn(() => outcome) };
+
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain(expected);
+      expect(replyContent).not.toContain('自动起名。');
+    });
+
+    it('says Claude Code is not running for a bare /rename without a live worker', async () => {
+      enableBareRenamePassthrough();
+      const ds = makeDaemonSession({ session: makeSession({ cliId: 'claude-code', cliPathOverride: '/bin/claude' }) });
+      const deps = { ...makeDeps(ds), deliverCliCommand: vi.fn(() => 'delivered' as const) };
+
+      await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename'), deps, LARK_APP_ID);
+
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('当前未运行');
+      expect(deps.deliverCliCommand).not.toHaveBeenCalled();
       expect(sessionStore.updateSession).not.toHaveBeenCalled();
     });
 

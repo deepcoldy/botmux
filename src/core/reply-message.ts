@@ -22,7 +22,7 @@ export function selectReplyMessageId(
 }
 
 export interface InboundMessageLocation {
-  messageId: string;
+  messageId?: string;
   rootMessageId?: string;
   /** When the message arrived from a cross-chat followed thread in another group. */
   crossChatOrigin?: {
@@ -55,9 +55,9 @@ export function renderInboundMessageLocation(location: InboundMessageLocation | 
   const cross = location.crossChatOrigin;
   if (cross) {
     const rootId = location.rootMessageId ?? cross.followedRootMessageId;
-    return `<message_location message_id="${escape(location.messageId)}" placement="thread" chat_id="${escape(cross.followedChatId)}" root_message_id="${escape(rootId)}" default_reply_chat_id="${escape(cross.sourceChatId)}" />\n${renderCrossChatReplyHint(cross)}`;
+    return `<message_location${location.messageId ? ` message_id="${escape(location.messageId)}"` : ''} placement="thread" chat_id="${escape(cross.followedChatId)}" root_message_id="${escape(rootId)}" default_reply_chat_id="${escape(cross.sourceChatId)}" />\n${renderCrossChatReplyHint(cross)}`;
   }
-  return `<message_location message_id="${escape(location.messageId)}" placement="${location.rootMessageId ? 'thread' : 'chat'}"${location.rootMessageId ? ` root_message_id="${escape(location.rootMessageId)}"` : ''} />`;
+  return `<message_location${location.messageId ? ` message_id="${escape(location.messageId)}"` : ''} placement="${location.rootMessageId ? 'thread' : 'chat'}"${location.rootMessageId ? ` root_message_id="${escape(location.rootMessageId)}"` : ''} />`;
 }
 
 export function parseReplyMessageTarget(value: unknown): SessionReplyTarget | undefined {

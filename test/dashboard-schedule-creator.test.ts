@@ -524,6 +524,17 @@ describe('taskAcceptsRecordedCreator', () => {
     expect(store.getRecord(APP, 'a1b2c3d4')).toMatchObject({ controlOpenId: 'ou_next', controlUnionId: 'on_next' });
     expect(store.getRecord(APP, 'd1d2d3d4')).toMatchObject({ controlOpenId: 'ou_delegate', controlUnionId: 'on_delegate' });
   });
+  it('clears talk-only runtime authorization when an edit records a new creator', () => {
+    scheduler.addTask({ id: 'a1b2c3d4', name: 'n', schedule: 'every 1h', prompt: 'p', workingDir: '/repo',
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'human', openId: 'ou_first', unionId: 'on_first' }, ownerAccess: 'talk' });
+    expect(scheduler.updateTask('a1b2c3d4', { creator: { openId: 'ou_admin', unionId: 'on_admin' } })).toMatchObject({ ok: true });
+    const record = store.getRecord(APP, 'a1b2c3d4')!;
+    expect(record).toMatchObject({
+      controlOpenId: 'ou_admin',
+      task: { ownerOpenId: 'ou_admin' },
+    });
+    expect(record.task.ownerAccess).toBeUndefined();
+  });
 });
 
 describe('a failed edit does not keep the new creator', () => {
@@ -554,7 +565,7 @@ describe('a failed edit does not keep the new creator', () => {
   it('restores who the task runs as, its claim and control columns when the precondition step fails', () => {
     const created = createTaskWithOptionalPrecondition({
       name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
-      owner: { kind: 'human', openId: 'ou_first', unionId: 'on_first' },
+      owner: { kind: 'human', openId: 'ou_first', unionId: 'on_first' }, ownerAccess: 'talk',
     }, APP, 'printf 1');
     const claim = { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: APP, claimedAt: '2026-10-27T02:00:00.000Z' };
     expect(scheduler.claimTaskRunAs(created.id, APP, claim, null)).toMatchObject({ ok: true });
@@ -570,7 +581,7 @@ describe('a failed edit does not keep the new creator', () => {
       { action: 'replace', source: { kind: 'inline', script: 'printf 0' } },
     )).toThrow('staged protected record is missing');
     const record = store.getRecord(APP, created.id)!;
-    expect(record.task).toMatchObject({ prompt: 'p', ownerOpenId: 'ou_first', ownerUnionId: 'on_first', runAsClaim: claim });
+    expect(record.task).toMatchObject({ prompt: 'p', ownerOpenId: 'ou_first', ownerUnionId: 'on_first', runAsClaim: claim, ownerAccess: 'talk' });
     expect(record).toMatchObject({ controlOpenId: 'ou_first', controlUnionId: 'on_first' });
   });
 

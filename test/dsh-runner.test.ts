@@ -6,12 +6,13 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readlinkSync, existsSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { captureDshProcessIdentity } from '../src/services/dsh-process-attestation.js';
 
 const RUNNER_PATH = resolve('src/dsh-runner.ts');
 const FAKE_SERVER = resolve('test/fixtures/fake-dsh-server.mjs');
@@ -156,6 +157,16 @@ describe('dsh-runner', () => {
     h = spawnRunner('happy');
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
+    expect(parseMarkers(h.stdout).find(m => m.kind === 'process_ready')?.payload).toEqual({});
+    if (process.platform === 'linux') {
+      const pid = h.child.pid!;
+      const runnerArgs = readFileSync(`/proc/${pid}/cmdline`, 'utf8').slice(0, -1).split('\0').slice(1);
+      const proof = captureDshProcessIdentity(pid, readlinkSync(`/proc/${pid}/exe`), runnerArgs);
+      expect(proof).toMatchObject({ runnerPid: pid });
+      expect(proof?.enginePid).not.toBe(pid);
+      expect(readFileSync(`/proc/${proof!.enginePid}/cmdline`, 'utf8')).toContain(FAKE_SERVER);
+    }
+
     h.child.stdin.write(makeFrame('你好'));
     await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
 
@@ -177,6 +188,27 @@ describe('dsh-runner', () => {
     expect(existsSync(join(h.home, '.dsh', 'profiles', 'botmux'))).toBe(true);
     // The legacy ~/.botmux/dsh path must not be created anymore.
     expect(existsSync(join(h.home, '.botmux', 'dsh'))).toBe(false);
+  });
+
+  it.skipIf(process.platform !== 'linux')('keeps the SDK usable without engine attestation when proof setup is unavailable', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-no-proof-'));
+    const blocker = join(home, 'not-a-directory');
+    writeFileSync(blocker, 'x');
+    // tsx also writes a cache under TMPDIR; disable only the loader cache so
+    // the real runner can reach the deliberately unavailable proof setup.
+    h = spawnRunner('happy', [], { TMPDIR: blocker, TSX_DISABLE_CACHE: '1' }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready without proof' }).catch(error => {
+      throw new Error(`${error}\nstdout:\n${h!.stdout}\nstderr:\n${h!.stderr}`);
+    });
+
+    const pid = h.child.pid!;
+    const runnerArgs = readFileSync(`/proc/${pid}/cmdline`, 'utf8').slice(0, -1).split('\0').slice(1);
+    expect(captureDshProcessIdentity(pid, readlinkSync(`/proc/${pid}/exe`), runnerArgs)).toBeUndefined();
+
+    h.child.stdin.write(makeFrame('无证明也要完成这一轮'));
+    await waitFor(() => parseMarkers(h!.stdout).some(m => m.kind === 'final'), { label: 'final without proof' });
+    expect(parseMarkers(h.stdout).find(m => m.kind === 'final')?.payload.content).toContain('你好，我是 dsh。');
+    expect(h.child.exitCode).toBeNull();
   });
 
   it('emits ordered CoT entries for reasoning without duplicating the final reply', async () => {

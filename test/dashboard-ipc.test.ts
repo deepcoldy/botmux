@@ -3644,6 +3644,66 @@ describe('PUT /api/bot-card-prefs — senderTagHideEmail (<sender> 注入开关)
   });
 });
 
+describe('PUT /api/bot-grant-prefs — scheduleCreateByTalkers (对话用户自建定时任务)', () => {
+  it('surfaces it in the Bot Defaults payload, persists explicit on/off and drops non-booleans', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-talker-schedules-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-talker-schedules-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_owner'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).scheduleCreateByTalkers).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ scheduleCreateByTalkers: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, scheduleCreateByTalkers: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].scheduleCreateByTalkers).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).scheduleCreateByTalkers).toBe(true);
+      // The schedule routes read the live registry, so the write must land there too.
+      expect(getBot(appId).config.scheduleCreateByTalkers).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ scheduleCreateByTalkers: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, scheduleCreateByTalkers: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].scheduleCreateByTalkers).toBeUndefined();
+      expect(getBot(appId).config.scheduleCreateByTalkers).toBeUndefined();
+
+      const bogus = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ scheduleCreateByTalkers: 'yes' }),
+      });
+      expect(bogus.status).toBe(400);
+      expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
   it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-p2p-open-'));
@@ -13272,6 +13332,31 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     // Allowlisted (no auth header) → must NOT be 401 (reaches handler: 400 bad-shape / 200 / 404).
     const trig = await fetch(`${base}/api/trigger`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
     expect(trig.status).not.toBe(401);
+    const actorBody = JSON.stringify({
+      actor: 'owner', source: { type: 'webhook' },
+      target: { kind: 'turn', botId: 'local_smoke', sessionId: 'fixture-session' },
+      instruction: 'Continue the tests',
+      envelope: { sourceName: 'Example client', format: 'text', trusted: false },
+    });
+    const actorHeaders = { 'content-type': 'application/json' };
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const publicActor = await fetch(`${base}/api/trigger`, { method: 'POST', headers: actorHeaders, body: actorBody });
+      expect(publicActor.status).toBe(403);
+      expect(await publicActor.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+      const unsigned = await fetch(`${base}/api/trigger/owner`, { method: 'POST', headers: actorHeaders, body: actorBody });
+      expect(unsigned.status).toBe(401);
+      const signed = await fetch(`${base}/api/trigger/owner`, {
+        method: 'POST',
+        headers: { ...actorHeaders, ...trustedHostHeaders('POST', '/api/trigger/owner', handle!.port) },
+        body: actorBody,
+      });
+      expect(signed.status).toBe(403);
+      expect(await signed.json()).toMatchObject({ errorCode: 'owner_unresolved' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
     const tr = await fetch(`${base}/api/sessions/nope/trigger-result`);
     expect(tr.status).not.toBe(401);
     const ins = await fetch(`${base}/api/sessions/nope/insight?detail=conversation`);
@@ -13287,6 +13372,29 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     expect((await fetch(`${base}/api/asks/pending`)).status).toBe(401);
     // /api/asks/answer is deliberately excluded from the allowlist → 401.
     expect((await fetch(`${base}/api/asks/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"askId":"x","selections":[]}' })).status).toBe(401);
+  });
+
+  it('rejects an unsigned owner IPC request before owner resolution without outer auth', async () => {
+    setLarkAppId('cli_owner_without_outer_auth');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/owner`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          actor: 'owner', source: { type: 'webhook' },
+          target: { kind: 'turn', botId: 'cli_owner_without_outer_auth', sessionId: 'fixture-session' },
+          instruction: 'Continue the tests',
+          envelope: { sourceName: 'Example client', format: 'text', trusted: false },
+        }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
   });
 
   it('readiness barrier: control routes AND /healthz return 503 until ready, without a healthz pre-check', async () => {

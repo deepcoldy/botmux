@@ -63,14 +63,17 @@ function harness(screen = '', options: { cliId?: 'claude-code' | 'kimi'; priorWo
     busyProbeRegion: (text: string) => text,
     dropFailedBridgeMark: vi.fn(), redriveRejectedStructuredReady: vi.fn(),
     deferNativeCodexInputCommit: () => false, queuePostSubmitNativeSessionTitle: vi.fn(),
+    codexBridgeNoteUnprovenCliSessionId: vi.fn(),
     buildSubmitMessagePreview, cliName: () => 'Claude', currentBotmuxTurnId: 'delivery',
     emitTurnTerminal: vi.fn(), log: vi.fn(), send, t: (key: string) => key,
   };
   scope.submitUnconfirmedNotice = loadWorkerFunction('submitUnconfirmedNotice', scope);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
-  schedule('status please', recheck, 'transcript', 'delivery', undefined, 1, { turnId: 'delivery' });
+  const onConfirmed = vi.fn();
+  schedule('status please', recheck, 'transcript', 'delivery', undefined, 1, { turnId: 'delivery' },
+    'failed', false, onConfirmed);
   return {
-    detector, recheck, chain, scope, backend,
+    detector, recheck, chain, scope, backend, onConfirmed,
     warnings: () => send.mock.calls.map(([message]) => message).filter(message => message.type === 'user_notify'),
   };
 }
@@ -78,6 +81,13 @@ function harness(screen = '', options: { cliId?: 'claude-code' | 'kimi'; priorWo
 describe('worker submit confirmation with native program status', () => {
   const rule = '─'.repeat(60);
   const composerScreen = (body: string) => ['Claude Code', rule, `❯ ${body}`, rule, '  ? for shortcuts'].join('\n');
+
+  it('forwards an unproven candidate separately from the confirmed native session id', async () => {
+    const h = harness();
+    h.recheck.mockReturnValue({ submitted: true, unprovenCliSessionId: 'candidate-new-thread' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.onConfirmed).toHaveBeenCalledExactlyOnceWith(undefined, 'candidate-new-thread');
+  });
 
   it.each([
     { kind: 'unpainted prompt', screen: '' },

@@ -20,6 +20,7 @@ import { crossChatFollowThreadPath } from './cross-chat-follow-thread-store.js';
 import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
 import { removeCodexModelLaunchReceipt } from './codex-model-selection.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
+import { cleanupSessionTurns, resumeSessionTurns } from './session-turns.js';
 import {
   applySessionRowCommand,
   type HostSessionCommand,
@@ -2912,6 +2913,11 @@ export function closeSession(
     // user-visible, so workerless/forced closes must apply the same cleanup;
     // otherwise closed sessions retain private reply text indefinitely.
     if (opts.cleanupBridgeMarkers !== false) cleanupSessionBridgeSendMarkers(sessionId);
+    try {
+      cleanupSessionTurns(config.session.dataDir, sessionId);
+    } catch {
+      logger.warn('Failed to clean structured session turns');
+    }
     // #794: per-turn hook sidecar 与 turn-sends 同生命周期，关会话一并清掉，
     // 否则 prompt-ctx/<sid>/ 成为孤儿目录（24h TTL 兜底但 daemon 长命会累积）。
     removePromptContextDir(sessionId);
@@ -2984,6 +2990,11 @@ export function reactivateClosedSession(
   next.mojoCloseJournal = undefined;
   next.tokenUsage = undefined;
 
+  try {
+    resumeSessionTurns(config.session.dataDir, sessionId);
+  } catch {
+    logger.warn('Failed to reset structured session turns on reactivation');
+  }
   commitContractLifecycle(session, 'resume', () => persistRow(next));
   const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
   Object.assign(session, next, committed ? JSON.parse(committed.row) : {});

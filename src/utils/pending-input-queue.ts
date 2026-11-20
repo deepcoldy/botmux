@@ -5,6 +5,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
+import { isOwnerActorTurnId } from '../core/workflow-event-turn.js';
 import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export interface PendingCliInput {
@@ -19,6 +20,7 @@ export interface PendingCliInput {
    * receives `content`. */
   logicalContent?: string;
   turnId?: string;
+  structuredSourceTurnIds?: string[];
   replyTurnId?: string;
   dispatchAttempt?: number;
   /** This item belongs to the durable-primary Lark Inbox commit protocol. */
@@ -151,8 +153,12 @@ export function mergeQueuedCliInput(
   // trustworthy sender boundary. New Lark turns carry trustedCaller; unknown
   // legacy callers fail closed and stay as separate turns.
   if (!sameTrustedPrincipal(tail.trustedCaller, next.trustedCaller)) return false;
+  const sourceIds = (item: PendingCliInput) => item.structuredSourceTurnIds ?? (item.turnId ? [item.turnId] : []);
+  tail.structuredSourceTurnIds = [...sourceIds(tail), ...sourceIds(next)];
   tail.content = `${tail.content}\n\n${next.content}`;
-  tail.turnId = next.turnId ?? tail.turnId;
+  if (!isOwnerActorTurnId(tail.turnId) || isOwnerActorTurnId(next.turnId)) {
+    tail.turnId = next.turnId ?? tail.turnId;
+  }
   return true;
 }
 

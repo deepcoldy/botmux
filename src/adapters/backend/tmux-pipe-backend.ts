@@ -49,6 +49,7 @@ import {
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { LivenessGate, ADOPT_LIVENESS_MAX_FAILURES } from './liveness-gate.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
+import { resolveTmuxSocketRoot } from './tmux-socket-root.js';
 import { readUnreapedPaneExit, type UnreapedPaneExit } from './unreaped-pane-exit.js';
 import { pipePaneShellCommand } from './tmux-pipe-relay.js';
 import { createTmuxBootGate } from './tmux-anti-fork.js';
@@ -1086,6 +1087,19 @@ export class TmuxPipeBackend implements SessionBackend {
 
   /** Prepare the reader before a managed CLI can emit its startup bytes. */
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
+    // Pin the socket root to an ABSOLUTE path at the worker control-plane
+    // boundary, BEFORE any tmux command runs. A relative $TMUX_TMPDIR
+    // resolves per-cwd: the launch cwd below (sandbox cold start) differs
+    // from the worker cwd every later ambient control command runs in, so
+    // creation and control (options/send/capture/teardown/destroy) would
+    // address DIFFERENT servers. Resolving once against the launch cwd and
+    // rewriting the ambient value makes every control exec in this process
+    // cwd-independent and shared with the creation spawn.
+    const rawTmpdir = process.env.TMUX_TMPDIR;
+    if (rawTmpdir !== undefined) {
+      const pinned = resolveTmuxSocketRoot(process.env, opts.cwd);
+      if (pinned !== rawTmpdir) process.env.TMUX_TMPDIR = pinned;
+    }
     if (!this.createSession && this.ownsSession && this._isReattach) {
       // A pre-upgrade corpse must refuse input BEFORE identity, global-env or
       // version probes can wait on the server. All of those windows are long
@@ -2424,14 +2438,16 @@ export class TmuxPipeBackend implements SessionBackend {
    * even answers for some other session (both measured on tmux 3.3a). Lines are
    * still filtered by `#{session_name}` so no other session's panes can count.
    */
-  private reapDeadSessionHoldingName(spawnEnv: NodeJS.ProcessEnv | undefined): boolean {
+  private reapDeadSessionHoldingName(spawnEnv: NodeJS.ProcessEnv | undefined, cwd?: string): boolean {
     if (!this.ownsSession || !this.paneTarget.startsWith('bmx-')) return false;
     let panes: string[];
     try {
       panes = String(execFileSync(
         'tmux',
         [...this.tmuxArgs, 'list-panes', '-s', '-t', `=${this.paneTarget}:`, '-F', '#{session_name}|#{pane_dead}:#{pane_dead_status}'],
-        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv(spawnEnv) },
+        // Same env AND cwd the gated new-session uses: a relative
+        // $TMUX_TMPDIR must resolve to the server that answered.
+        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: PANE_DEATH_PROBE_TIMEOUT_MS, env: tmuxEnv(spawnEnv), cwd },
       ) ?? '').split('\n').map(line => line.trim()).filter(Boolean);
     } catch {
       return false;
@@ -2443,7 +2459,7 @@ export class TmuxPipeBackend implements SessionBackend {
     );
     try {
       execFileSync('tmux', [...this.tmuxArgs, 'kill-session', '-t', `=${this.paneTarget}`], {
-        stdio: 'ignore', timeout: 3000, env: tmuxEnv(spawnEnv),
+        stdio: 'ignore', timeout: 3000, env: tmuxEnv(spawnEnv), cwd,
       });
     } catch { /* already gone; a creation that still collides reports the real error */ }
     return true;
@@ -2568,7 +2584,16 @@ export class TmuxPipeBackend implements SessionBackend {
     // new-session exec below uses, so the owner probe, -N capability and socket
     // path resolve against the launch's PATH/TMUX_TMPDIR (not daemon ambient).
     const bootSpawnEnv = opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env;
-    const bootGate = createTmuxBootGate(this.socketName, { env: bootSpawnEnv });
+    // Strict CLI inheritance must not move the tmux control client to another
+    // server. Discovery, reattach and teardown use the worker's socket root;
+    // retain it only for this client — spawn() already pinned it to the
+    // ABSOLUTE root resolved at the launch cwd, so creation, gate and every
+    // later ambient control command share one server. The pane still receives
+    // strictPaneCommand's separately constructed env -i environment.
+    if (opts.strictEnv && process.env.TMUX_TMPDIR !== undefined) {
+      bootSpawnEnv.TMUX_TMPDIR = process.env.TMUX_TMPDIR;
+    }
+    const bootGate = createTmuxBootGate(this.socketName, { env: bootSpawnEnv, cwd: opts.cwd });
     for (let attempt = 0; ; attempt++) {
       // [] = normal spawn (attach, or a proven cold boot); ['-N'] = attach
       // only, never fork (tmux ≥ 3.2), closing the client-internal macOS
@@ -2624,7 +2649,7 @@ export class TmuxPipeBackend implements SessionBackend {
         // The reap talks to the server this new-session just answered from
         // (same env, hence the same PATH / TMUX_TMPDIR socket resolution).
         if (attempt === 0 && !corpseReaped && /duplicate session/i.test(stderrText)
-            && this.reapDeadSessionHoldingName(bootSpawnEnv)) {
+            && this.reapDeadSessionHoldingName(bootSpawnEnv, opts.cwd)) {
           corpseReaped = true;
           attempt = -1;
           continue;

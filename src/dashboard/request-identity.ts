@@ -235,6 +235,7 @@ export function resolveDashboardIdentity(input: DashboardIdentityInput): Dashboa
 export interface DashboardRequestGate {
   /** 本机 owner 身份（debug shell / write-link / spawn-command 的唯一凭据）。 */
   legacyAuthed: boolean;
+  allowOwnerActor: boolean;
   /**
    * 管理面能力（settings / schedules / groups 的读写与不脱敏）。
    *
@@ -276,7 +277,10 @@ export function resolveDashboardRequestGate(input: {
   const canManageHost = legacyAuthed || managementCredential || platformManages;
   const workbenchOnlyIdentity = !legacyAuthed && !managementCredential && !platformManages
     && (platformIdentity || input.identity?.kind === 'feishu-h5');
-  const decision = workbenchOnlyIdentity
+  const turnsRead = input.method === 'GET' && /^\/api\/sessions\/[^/]+\/turns$/.test(input.pathname);
+  const decision = turnsRead && !managementCredential
+    ? { kind: 'deny401' as const }
+    : workbenchOnlyIdentity
     ? decideWorkbenchH5Auth({ method: input.method, pathname: input.pathname })
     : decideDashboardAuth({
       method: input.method,
@@ -296,7 +300,8 @@ export function resolveDashboardRequestGate(input: {
       activeToken: input.activeToken ?? '',
       publicReadOnly: input.publicReadOnly,
     });
-  return { legacyAuthed, canManageHost, workbenchOnlyIdentity, presentedToken, decision };
+  const allowOwnerActor = managementCredential && (!input.identity || legacyAuthed);
+  return { legacyAuthed, allowOwnerActor, canManageHost, workbenchOnlyIdentity, presentedToken, decision };
 }
 
 /** 便于把 `IncomingMessage` 直接喂给上面的纯函数（测试与真实服务共用一条路径）。 */

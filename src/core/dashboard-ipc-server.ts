@@ -244,6 +244,7 @@ import {
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
+import { parseSessionTurnsPage, readSessionTurns } from '../services/session-turns.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
 import {
   findQuotaFallbackCycle,
@@ -612,7 +613,7 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope, isValidLarkScopeSyntax } from '../utils/lark-scope-catalog.js';
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
-import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import {
   resolveRegisteredBackgroundContext,
   backgroundContextStillValid,
@@ -1742,6 +1743,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // Without `BOTMUX_AS` the call runs as the turn principal; the speakers of the turn only validate a named one.
     let policy: TriggerUserAuthConfig | undefined;
     try { policy = getBot(ds.larkAppId).config.triggerUserAuth; } catch { /* bot missing: nothing is governed */ }
+    if (!allowsPersonalIdentityForTurn(identityTurnId, policy)) return jsonRes(res, 403, blocked('unattended_turn'));
     const governed = governedSpeakers({
       policy, tool, sessionDataDir: config.session.dataDir, sessionId,
       origin: { identityTurnId, speakers: ds.managedTurnOrigin?.speakers },
@@ -4490,6 +4492,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     });
   }
   const identityTurnId = liveOrigin?.identityTurnId;
+  if (!allowsPersonalIdentityForTurn(identityTurnId ?? turnId, bot.triggerUserAuth)) {
+    return jsonRes(res, 403, { ok: false, error: 'unattended_turn' });
+  }
   if (process.platform === 'linux' && !execution && !detachedForUser) {
     return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
   }
@@ -4660,6 +4665,9 @@ async function handleProviderAuthRequest(
     return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
   }
   const turnId = origin.identityTurnId ?? origin.turnId;
+  if (!allowsPersonalIdentityForTurn(turnId, cfg.triggerUserAuth)) {
+    return jsonRes(res, 403, { ok: false, error: 'unattended_turn' });
+  }
   if (!capabilityOn(cfg.triggerUserAuth, provider === 'meego' ? 'meego' : provider === 'lark-cli' ? 'lark-user' : 'bytecloud')) {
     return jsonRes(res, 409, {
       ok: false, status: 'refused', error: 'native_capability',
@@ -4907,6 +4915,7 @@ for (const action of ['auth-request', 'auth-status']) {
       const liveOrigin = ds.managedTurnOrigin;
       if (!liveOrigin?.turnId) return undefined;
       const liveIdentityTurnId = liveOrigin.identityTurnId ?? liveOrigin.turnId;
+      if (!allowsPersonalIdentityForTurn(liveIdentityTurnId, getBot(ds.larkAppId).config.triggerUserAuth)) return undefined;
       const grant = currentLarkToolDelegation(config.session.dataDir, params.sessionId, liveIdentityTurnId);
       if (!grant) {
         // `BOTMUX_AS` names the speaker asked; else the turn principal.
@@ -7133,6 +7142,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req
 // 与输出永不进结构。detail=summary 只返聚合+建议（/insight 卡片、抽屉概览用）；
 // detail=spans 才带脱敏 span（详情 tab 用）。owner-only 由 dashboard 外层 authed-only
 // 路由 + /insight 命令层把关，IPC 自身 loopback-trusted。
+ipcRoute('GET', '/api/sessions/:sessionId/turns', (req, res, params) => {
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const page = parseSessionTurnsPage(new URL(req.url ?? '/', 'http://localhost').searchParams);
+  if (!page) return jsonRes(res, 400, { ok: false, error: 'invalid_turns_cursor_or_limit' });
+  res.setHeader('cache-control', 'no-store');
+  return jsonRes(res, 200, session.status === 'closed'
+    ? readSessionTurns(config.session.dataDir, params.sessionId, page.since, 0)
+    : readSessionTurns(config.session.dataDir, params.sessionId, page.since, page.limit));
+});
+
 ipcRoute('GET', '/api/sessions/:sessionId/insight', (req, res, params) => {
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
@@ -8808,7 +8828,10 @@ ipcRoute('DELETE', '/api/schedules/:id', requireBoundBot((_req, res, p) => {
   }
 }, NOT_BOUND_BODY.okFalse));
 
-ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
+async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, ownerActorEndpoint: boolean): Promise<void> {
+  if (ownerActorEndpoint && !isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
+  }
   const activeSessions = getActiveSessionsRegistry();
   if (!activeSessions) return jsonRes(res, 503, { ok: false, errorCode: 'trigger_failed', error: 'active session registry unavailable' });
   let body: unknown;
@@ -8819,6 +8842,9 @@ ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
   }
   const valid = validateTriggerRequest(body);
   if (!valid.ok) return jsonRes(res, valid.status, valid.body);
+  if (ownerActorEndpoint !== (valid.request.actor === 'owner')) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
+  }
   if (valid.request.target.botId && valid.request.target.botId !== cachedLarkAppId) {
     return jsonRes(res, 400, {
       ok: false,
@@ -8856,7 +8882,9 @@ ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
         ? 200
       : result.errorCode === 'idempotency_conflict'
         ? 409
-      : result.errorCode === 'bot_not_in_chat'
+      : ownerActorEndpoint && result.errorCode === 'session_not_runnable'
+        ? 409
+      : result.errorCode === 'bot_not_in_chat' || result.errorCode === 'owner_unresolved'
         ? 403
         : result.errorCode === 'session_not_found'
           ? 404
@@ -8869,7 +8897,11 @@ ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
   } catch (e: any) {
     return jsonRes(res, 500, { ok: false, errorCode: 'trigger_failed', error: e?.message ?? String(e) });
   }
-}, { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' }));
+}
+
+const unboundTriggerResponse = { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' };
+ipcRoute('POST', '/api/trigger', requireBoundBot((req, res) => handleTriggerIpc(req, res, false), unboundTriggerResponse));
+ipcRoute('POST', '/api/trigger/owner', requireBoundBot((req, res) => handleTriggerIpc(req, res, true), unboundTriggerResponse));
 
 // ─── Exact chat grants (talk-only) ─────────────────────────────────────────
 
@@ -10816,6 +10848,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     grantRequestToOwnerDm: grantPrefs.grantRequestToOwnerDm,
     trustSameOwnerBots: grantPrefs.trustSameOwnerBots,
     grantDelegateBots: grantPrefs.grantDelegateBots,
+    scheduleCreateByTalkers: grantPrefs.scheduleCreateByTalkers,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -10843,6 +10876,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     defaultPassthroughCommands: [...resolvePassthroughCommands(cachedLarkAppId, undefined, false)],
     customPassthroughCommands,
     canTalkDaemonCommands,
+    bareRenamePassthrough: getBot(cachedLarkAppId).config.bareRenamePassthrough === true,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
     envRevision,
@@ -11172,6 +11206,7 @@ ipcRoute('PUT', '/api/bot-summary-range', requireBoundBot(async (req, res) => {
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 //   • trustSameOwnerBots: boolean          — 信任同一 owner 的同机 Bot（管理命令 + 点名授权）
 //   • grantDelegateBots: string[]|null     — 委托授权外部 bot 名单（ou_/cli_）；[]/null = 清空
+//   • scheduleCreateByTalkers: boolean     — 允许只能对话的真人为自己创建定时任务（默认关）
 ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
   const raw = await readJsonBodyOrBadJson<unknown>(req, res);
   if (raw === BAD_JSON) return;
@@ -11188,6 +11223,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantDefaultDurationMs?: unknown;
     trustSameOwnerBots?: unknown;
     grantDelegateBots?: unknown;
+    scheduleCreateByTalkers?: unknown;
   };
 
   const patch: {
@@ -11199,12 +11235,14 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantDefaultDurationMs?: number | null;
     trustSameOwnerBots?: boolean;
     grantDelegateBots?: string[];
+    scheduleCreateByTalkers?: boolean;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
   if (typeof body.grantRequestToOwnerDm === 'boolean') patch.grantRequestToOwnerDm = body.grantRequestToOwnerDm;
   if (typeof body.trustSameOwnerBots === 'boolean') patch.trustSameOwnerBots = body.trustSameOwnerBots;
+  if (typeof body.scheduleCreateByTalkers === 'boolean') patch.scheduleCreateByTalkers = body.scheduleCreateByTalkers;
   // null = 清空名单；字符串数组 = 设定名单（store 内 trim/去空白/去重，空名单不写盘）。
   if (body.grantDelegateBots === null) patch.grantDelegateBots = [];
   else if (Array.isArray(body.grantDelegateBots) && body.grantDelegateBots.every((x): x is string => typeof x === 'string')) {
@@ -12404,6 +12442,18 @@ botConfigPutRoute<{ canTalkDaemonCommands?: unknown }>('/api/bot-cantalk-daemon-
 // Per-bot launch-shell override launchShell。Body `{ launchShell: string }`：
 // 空字符串＝清除（回 $SHELL）。走 applyConfigField（与 /config launchShell 同一写盘
 // + 内存热更新路径），next-session 生效（下个会话起用新 shell 启动 CLI）。
+// Per-bot 裸 /rename 交给 CLI 自己起名。Body `{ bareRenamePassthrough: boolean }`；
+// 缺键或非布尔一律 400。走 applyConfigField（与 /botconfig 同一写盘 + 内存热更新路径），
+// 下一条 /rename 即生效；false 删 key，bots.json 保持干净。
+botConfigPutRoute('/api/bot-bare-rename-passthrough', 'bareRenamePassthrough', {
+  normalize: raw => {
+    const value = typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).bareRenamePassthrough : undefined;
+    return typeof value === 'boolean' ? fieldOk(value) : fieldInvalid('invalid_bare_rename_passthrough');
+  },
+  respond: value => ({ ok: true, bareRenamePassthrough: value === true }),
+});
+
 botConfigPutRoute<{ launchShell?: unknown }>('/api/bot-launch-shell', 'launchShell', {
   normalize: (body, spec) => optionalTextField(spec, body.launchShell),
   respond: value => ({ ok: true, launchShell: (value as string | null) ?? '' }),

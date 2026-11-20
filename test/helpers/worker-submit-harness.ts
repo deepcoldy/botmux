@@ -5,6 +5,7 @@ import { createSubmitFailureChainController } from '../../src/services/submit-fa
 import { combineSubmitCurrentFences, settleDeferredSubmitConfirmation } from '../../src/services/submit-confirmation.js';
 import { buildSubmitMessagePreview } from '../../src/services/submit-notification.js';
 import { CodexAppFlushPromptReplay } from '../../src/utils/codex-app-turn-liveness.js';
+import { CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS } from '../../src/utils/codex-app-control.js';
 import { loadWorkerFunction } from './worker-function-harness.js';
 
 /** Run the actual pending-input caller and deferred confirmation callback;
@@ -19,6 +20,7 @@ export function workerSubmitHarness() {
   const scope: Record<string, any> = {
     backend: {}, cliAdapter: { reliableTurnTerminal: true, writeInput: vi.fn(async () => ({ submitted: false, recheck })) },
     lastInitConfig: { cliId: 'traex' }, cliSpawnGeneration: 7,
+    FIRST_PROMPT_HARD_TIMEOUT_MS: CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS,
     cliRestartInProgress: false, isPromptReady: true, isFlushing: false,
     codexModelMigrationCheckNeeded: () => false,
     idleDetector: { isStartupPending: () => false, programStatusHeldWorking: () => false },

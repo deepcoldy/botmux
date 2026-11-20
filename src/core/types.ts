@@ -413,6 +413,7 @@ export interface DaemonSession {
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
   pendingFollowUpTurnId?: string;
   pendingFollowUpTurnIds?: string[];   // matching inbound ids; last id attributes a folded buffered batch
+  pendingStructuredOpeningTurnId?: string;
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
   /** Arrival-time clean-input decisions matching pendingCodexAppFollowUps.
@@ -895,6 +896,7 @@ export interface DaemonSession {
     taskId?: string | null;
   };
   usageLimit?: CliUsageLimitState;
+  antigravityQuotaHistory?: readonly CliUsageLimitState[];
   /** A failed persistence must be retried even if the next frame is identical. */
   usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;

@@ -524,6 +524,7 @@ export function runPeriodicOrphanSessionSweep(seam: PeriodicSweepSeam): Periodic
       result.censusComplete = false;
       continue;
     }
+    if (listeners.length === 0) continue;
     const reachable = seam.reachablePid(socketName);
     // A single listening server (even if the owner probe is briefly null) is a
     // slow/current server, NEVER an orphan. We need a positive reachable owner

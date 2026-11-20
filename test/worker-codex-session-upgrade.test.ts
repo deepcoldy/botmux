@@ -80,6 +80,9 @@ function harness() {
     // Captured unconditionally at every flush entry; unused while the fence
     // above stays disarmed.
     webTerminalInputGeneration: 0,
+    // No writable web terminal exists in these Codex upgrade scenarios, so the
+    // paste-uncertainty gate must never hold a flush.
+    webTerminalInputWireDirty: () => false,
     remoteRunnerRecoveredTurnInFlight: false,
     pendingMessages: [], pendingRawInputs: [], pendingInjections: [], pendingAdoptMessages: [],
     sessionRenameInFlight: () => false,
