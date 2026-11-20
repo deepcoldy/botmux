@@ -20,7 +20,7 @@ export interface SettingsSection {
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: 'settings-access', module: 'settings.moduleGeneral', section: 'settings.sectionAccess', fields: ['settings.publicReadOnly', 'settings.remoteAccess', 'settings.oauthRedirectBase'] },
   { id: 'settings-cards', module: 'settings.moduleGeneral', section: 'settings.sectionCards', fields: ['settings.modelQueueNotify', 'settings.cardBrandLabel', 'settings.openTerminalInFeishu', 'settings.stuckCardInitiatorKeys', 'settings.enableLocalCliOpen', 'settings.localCliOpenMode'] },
-  { id: 'settings-group-creation', module: 'settings.moduleGeneral', section: 'settings.sectionGroupCreation', fields: ['settings.groupNamePrefix'] },
+  { id: 'settings-group-creation', module: 'settings.moduleGeneral', section: 'settings.sectionGroupCreation', fields: ['settings.groupNamePrefix', 'settings.groupOwnerNotice'] },
   {
     id: 'settings-experimental',
     module: 'settings.moduleGeneral',

@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   createGroupCompletionStatus,
+  parseOwnerNoticeCommand,
   resolveBotRefs,
   resolveChatMode,
   resolveKickoff,
@@ -158,6 +159,41 @@ describe('resolveChatMode', () => {
       const r = resolveChatMode(bad);
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toContain('--chat-mode');
+    }
+  });
+});
+
+describe('parseOwnerNoticeCommand', () => {
+  it('leaves ordinary create-group calls alone, wherever the word appears later', () => {
+    for (const rest of [
+      [],
+      ['--bot', 'Review', '--name', 'PR 42'],
+      ['--bot', 'owner-notice'],
+      ['--name', 'owner-notice', '--bot', 'Review'],
+      ['--team', 't1', '--agent', 'cli_x'],
+    ]) {
+      expect(parseOwnerNoticeCommand(rest)).toEqual({ kind: 'none' });
+    }
+  });
+
+  it('reads status with no value, and on/off (enable/disable) case-insensitively', () => {
+    expect(parseOwnerNoticeCommand(['owner-notice'])).toEqual({ kind: 'status' });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'status'])).toEqual({ kind: 'status' });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'off'])).toEqual({ kind: 'set', enabled: false });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'OFF'])).toEqual({ kind: 'set', enabled: false });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'disable'])).toEqual({ kind: 'set', enabled: false });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'on'])).toEqual({ kind: 'set', enabled: true });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'enable'])).toEqual({ kind: 'set', enabled: true });
+  });
+
+  it('refuses anything else instead of guessing which way to flip', () => {
+    for (const rest of [
+      ['owner-notice', 'false'],
+      ['owner-notice', '0'],
+      ['owner-notice', 'off', 'now'],
+      ['owner-notice', '--bot', 'Review'],
+    ]) {
+      expect(parseOwnerNoticeCommand(rest).kind).toBe('invalid');
     }
   });
 });

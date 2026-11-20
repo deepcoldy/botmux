@@ -8455,6 +8455,8 @@ ${SEND_HELP_BODY}
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"] [--chat-mode group|topic]
                                        用指定 bot 起新群（--chat-mode topic 建话题群）；详见 \`botmux create-group --help\`
+  create-group owner-notice [status|on|off]
+                                       建群后 @ 群主提醒的本机开关（默认开，所有建群入口通用）
 
 精确群对话授权（talk-only）:
   grant chat --bot <receiver> --chat-id <oc_...> --subject-bot <larkAppId>
@@ -17851,6 +17853,14 @@ botmux create-group — 用一组机器人新建飞书群
   --json-status    可选；在 chatId 后追加一行结构化完成状态。默认 stdout 无论完整成功或
                    部分失败都保持历史兼容，只输出单行 chatId；显式 kickoff 未发出时以非零退出表示。
 
+建群后 @ 群主提醒（本机全局开关，默认开）:
+  botmux create-group owner-notice [status|on|off]
+
+  新群建好后，创建群的 bot 默认会 @ 群主发「群已创建，后续进展将在本群同步。」。
+  off 之后本机所有建群入口（本命令、/group、Dashboard 建群、会议监听群等）都不再发这条，
+  群主转让、拉人、设管理员照常。写的是 ~/.botmux/config.json 的 "groupOwnerNotice": false
+  （on 会删掉这个键，回到默认）；下一次建群即生效，不用重启 daemon。不带参数 = status。
+
 团队模式（跨机建聚焦新群，走中心化平台）:
   botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
 
@@ -17865,7 +17875,7 @@ botmux create-group — 用一组机器人新建飞书群
 行为:
   - 第一个解析到的 bot 作为 creator（决定建群身份 + 初始群主 + open_id app scope）。
   - 邀请用户 / 转让群主 / @通知 对象都从 creator 的 resolvedAllowedUsers 取首个 open_id（email 自动转换；
-    转不出来或为空则跳过对应步骤，stderr warning）。
+    转不出来或为空则跳过对应步骤，stderr warning）。@通知 受上面的 owner-notice 开关控制。
   - 不依赖 botmux 会话，任何环境都能跑。
   - --working-dir 会先校验路径存在且是目录；绑定失败不会重复建群，会在 stderr 给出逐 bot 结果。
   - --kickoff-bot/--kickoff-prompt：creator 建群后 @ 指定 bot 并发 prompt；该 bot 收到 @ 会自动起会话。
@@ -17879,6 +17889,34 @@ botmux create-group — 用一组机器人新建飞书群
   - 只有缺 --bot / 解析失败 / chat.create 未成功时 stdout 才为空。只要 stdout 已有 chatId，
     即使超时或 exit 非零也必须先检查并复用该群，不得重建。
 `);
+    return;
+  }
+
+  // `create-group owner-notice …` is a settings write, not a group creation:
+  // route it before every creation gate (transport, bots.json, --bot).
+  const { parseOwnerNoticeCommand, OWNER_NOTICE_USAGE } = await import('./cli/create-group-resolver.js');
+  const ownerNoticeCommand = parseOwnerNoticeCommand(rest);
+  if (ownerNoticeCommand.kind !== 'none') {
+    if (ownerNoticeCommand.kind === 'invalid') {
+      console.error(ownerNoticeCommand.error);
+      console.error(OWNER_NOTICE_USAGE);
+      process.exitCode = 2;
+      return;
+    }
+    if (ownerNoticeCommand.kind === 'set') {
+      const { setGroupOwnerNoticeEnabled } = await import('./global-config.js');
+      try {
+        setGroupOwnerNoticeEnabled(ownerNoticeCommand.enabled);
+      } catch (err: any) {
+        console.error(`写入 ${globalConfigPath()} 失败: ${err?.message ?? err}（可改用 Dashboard「设置 → 群聊创建」）`);
+        process.exitCode = 1;
+        return;
+      }
+    }
+    const enabled = config.groupOwnerNotice;
+    console.log(`建群后 @ 群主提醒: ${enabled ? 'on' : 'off'}${ownerNoticeCommand.kind === 'set' ? '（已保存）' : ''}`);
+    console.log(`配置文件: ${globalConfigPath()}（${enabled ? 'groupOwnerNotice 未设为 false，默认开' : '"groupOwnerNotice": false'}）`);
+    console.log('下一次建群即生效，无需重启 daemon。');
     return;
   }
 

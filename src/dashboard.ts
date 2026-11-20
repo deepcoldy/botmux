@@ -1242,6 +1242,8 @@ const attaching = new Set<string>();   // dedup concurrent attaches per appId
 interface ResolvedDashboardSettings {
   /** Machine-wide prefix applied only by the `/group` and `/g` slash commands. */
   groupNamePrefix: string;
+  /** Machine-wide "group is ready" @-owner notice on every creation path. Default ON. */
+  groupOwnerNotice: boolean;
   /** Machine-wide directory for new botmux-created worktrees; '' = next to the repo. */
   worktreeRoot: string;
   publicReadOnly: boolean;
@@ -1931,6 +1933,8 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   const larkCli = checkLarkCliVersion();
   return {
     groupNamePrefix: global.groupNamePrefix ?? '',
+    // default ON — only an explicit stored false disables (matches config.ts getter)
+    groupOwnerNotice: global.groupOwnerNotice !== false,
     worktreeRoot: global.worktreeRoot ?? '',
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,

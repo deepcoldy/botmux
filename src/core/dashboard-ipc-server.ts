@@ -13667,7 +13667,9 @@ ipcRoute('POST', '/api/groups/transfer-owner', requireBoundBot(async (req, res) 
   });
   let notifyMessageId: string | null = null;
   let notifyError: string | null = null;
-  if (transferred.ownerTransferredTo) {
+  // This bare @ is the deferred team-group form of the "group is ready" owner
+  // notice, so the same machine-wide switch silences it; the transfer stays.
+  if (transferred.ownerTransferredTo && config.groupOwnerNotice !== false) {
     try {
       // Feishu accepts union_id in an @ tag; keeping it stable avoids a second
       // app-scope lookup after the owner was added by another deployment.

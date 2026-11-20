@@ -91,6 +91,36 @@ export function shouldWriteCreateGroupCompletionStatus(
   return explicitJsonStatus;
 }
 
+export type OwnerNoticeCommand =
+  /** Not an owner-notice invocation: an ordinary `create-group` call. */
+  | { kind: 'none' }
+  | { kind: 'status' }
+  | { kind: 'set'; enabled: boolean }
+  | { kind: 'invalid'; error: string };
+
+export const OWNER_NOTICE_USAGE = '用法: botmux create-group owner-notice [status|on|off]';
+
+/**
+ * `botmux create-group owner-notice [status|on|off]` — the machine-wide switch
+ * (`groupOwnerNotice` in ~/.botmux/config.json) for the @-owner notice a newly
+ * created group posts. Only a leading `owner-notice` positional selects it, so
+ * an ordinary `create-group --bot …` call is never mistaken for a settings
+ * write; a stray value refuses instead of guessing which way to flip it.
+ */
+export function parseOwnerNoticeCommand(rest: string[]): OwnerNoticeCommand {
+  if (rest[0] !== 'owner-notice') return { kind: 'none' };
+  const args = rest.slice(1);
+  if (args.length === 0) return { kind: 'status' };
+  if (args.length > 1) {
+    return { kind: 'invalid', error: `owner-notice 只接受一个参数，收到: ${args.join(' ')}` };
+  }
+  const value = args[0].trim().toLowerCase();
+  if (value === 'status') return { kind: 'status' };
+  if (value === 'on' || value === 'enable') return { kind: 'set', enabled: true };
+  if (value === 'off' || value === 'disable') return { kind: 'set', enabled: false };
+  return { kind: 'invalid', error: `owner-notice 只支持 status / on / off，收到: "${args[0]}"` };
+}
+
 export type ResolvedChatMode =
   | { ok: true; chatMode?: ChatMode }
   | { ok: false; error: string };
