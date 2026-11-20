@@ -224,4 +224,85 @@ describe('fresh permission notice observations', () => {
     expect(tracker.observe(edit, 'runtime', 4_000)).toBeUndefined();
     expect(tracker.observe(edit, 'runtime', 8_000)).toContain('make this edit');
   });
+
+  it('keeps no-output dedup across turns, re-arms a new CLI lifetime, and ignores navigation', () => {
+    const tracker = new ClaudePermissionNoticeTracker();
+    const emittedAt: number[] = [];
+    const observe = (runtime: string, observation: string, turn: string, episode: string, now: number) => {
+      if (tracker.observe(dialog, runtime, now, observation, episode, turn)) emittedAt.push(now);
+    };
+
+    observe('physical-a', 'background', 'background', '0', 0);
+    observe('physical-a', 'background', 'background', '0', 2_000);
+    observe('physical-a', 'background', 'background', '0', 4_000);
+    observe('physical-a', 'main', 'main', '0', 6_000);
+    observe('physical-a', 'main', 'main', '0', 8_000);
+    observe('physical-a', 'main', 'main', '0', 10_000);
+    expect(emittedAt).toEqual([4_000]);
+
+    observe('physical-b', 'main', 'main', '0', 12_000);
+    observe('physical-b', 'main', 'main', '0', 14_000);
+    observe('physical-b', 'main', 'main', '0', 16_000);
+    expect(emittedAt).toEqual([4_000, 16_000]);
+
+    observe('physical-b', 'main-input', 'main', '1', 18_000);
+    observe('physical-b', 'main-input', 'main', '1', 20_000);
+    observe('physical-b', 'main-input', 'main', '1', 22_000);
+    expect(emittedAt).toEqual([4_000, 16_000]);
+  });
+
+  it('throttles a same-turn replacement candidate without hiding it after navigation', () => {
+    const tracker = new ClaudePermissionNoticeTracker();
+    const emittedAt: number[] = [];
+    const observe = (observation: string, episode: string, now: number) => {
+      if (tracker.observe(dialog, 'physical', now, observation, episode, 'turn')) emittedAt.push(now);
+    };
+
+    observe('turn-input-0', '0', 0);
+    observe('turn-input-0', '0', 2_000);
+    observe('turn-input-0', '0', 4_000);
+    observe('turn-input-0', '1', 6_000);
+    observe('turn-input-0', '1', 8_000);
+    observe('turn-input-0', '1', 10_000);
+    expect(emittedAt).toEqual([4_000]);
+
+    observe('turn-input-1', '2', 12_000);
+    observe('turn-input-1', '2', 14_000);
+    observe('turn-input-1', '2', 16_000);
+    observe('turn-input-1', '3', 18_000);
+    observe('turn-input-1', '3', 20_000);
+    observe('turn-input-1', '3', 22_000);
+    expect(emittedAt).toEqual([4_000]);
+
+    observe('turn-input-1', '3', 34_000);
+    observe('turn-input-1', '3', 36_000);
+    observe('turn-input-1', '3', 38_000);
+    expect(emittedAt).toEqual([4_000, 38_000]);
+  });
+
+  it('does not repeatedly re-arm an unchanged dialog on output-only redraws', () => {
+    const tracker = new ClaudePermissionNoticeTracker();
+    const emittedAt: number[] = [];
+    for (let now = 0; now <= 22_000; now += 2_000) {
+      if (tracker.observe(dialog, 'physical', now, 'turn-input', String(now), 'turn')) emittedAt.push(now);
+    }
+    expect(emittedAt).toEqual([4_000]);
+  });
+
+  it.each([{ replacementEpisode: '1' }, { replacementEpisode: undefined }])(
+    're-arms an identical replacement with changed or missing episode evidence (%s)', ({ replacementEpisode }) => {
+      const tracker = new ClaudePermissionNoticeTracker();
+      const emittedAt: number[] = [];
+      const observe = (observation: string, turn: string, episode: string | undefined, now: number) => {
+        if (tracker.observe(dialog, 'physical', now, observation, episode, turn)) emittedAt.push(now);
+      };
+
+      observe('background', 'background', '0', 0);
+      observe('background', 'background', '0', 2_000);
+      observe('background', 'background', '0', 4_000);
+      observe('main', 'main', replacementEpisode, 6_000);
+      observe('main', 'main', replacementEpisode, 8_000);
+      observe('main', 'main', replacementEpisode, 10_000);
+      expect(emittedAt).toEqual([4_000, 10_000]);
+    });
 });

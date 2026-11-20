@@ -8,7 +8,7 @@ const dialog = 'Bash command\nDo you want to proceed?\n1. Yes\n2. No\nEsc to can
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); };
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
-function start() {
+function start(cliId = 'claude-code') {
   vi.useFakeTimers(); vi.setSystemTime(0);
   let screen = dialog, output = 0;
   const messages: any[] = [];
@@ -17,7 +17,7 @@ function start() {
     turnTerminalEmitted: () => false,
     TerminalRenderer: class { rawSnapshot() { return screen; } async writeAndFlush() {} },
     backend: {}, cliSpawnGeneration: 1, cliLifetimeNonce: 1,
-    lastInitConfig: { cliId: 'claude-code' }, effectiveBackendType: 'pty', cliAdapter: {},
+    lastInitConfig: { cliId }, effectiveBackendType: 'pty', cliAdapter: {},
     awaitingFirstPrompt: false, currentBotmuxTurnId: 'turn-1', currentBotmuxDispatchAttempt: 1,
     webTerminalInputGeneration: 0, backendScreenRevision: 0,
     ptyOutputGeneration: { snapshot: () => output, isCurrent: (value: number) => value === output },
@@ -31,6 +31,7 @@ function start() {
   };
   loadWorkerFunction<() => void>('startScreenUpdates', scope)();
   return { scope, messages, notices: () => messages.filter(message => message.kind === 'claude_permission_prompt'),
+    screenUpdates: () => messages.filter(message => message.type === 'screen_update'),
     setScreen(value: string) { screen = value; output++; scope.backendScreenRevision++; } };
 }
 
@@ -107,5 +108,166 @@ describe('independent Claude permission notice review', () => {
     scope.webTerminalInputGeneration++;
     finish();
     expect(await pending).toBeUndefined();
+  });
+
+  it('re-arms an identical dialog only when a turn change has new output evidence', async () => {
+    const run = start();
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(run.notices()).toHaveLength(1);
+
+    run.scope.currentBotmuxTurnId = 'turn-2';
+    run.scope.currentBotmuxDispatchAttempt = 2;
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(run.notices()).toHaveLength(1);
+
+    run.setScreen(dialog);
+    run.scope.currentBotmuxDispatchAttempt = 3;
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(run.notices()).toHaveLength(2);
+    expect(run.notices()[1]).toEqual(expect.objectContaining({ turnId: 'turn-2', dispatchAttempt: 3 }));
+  });
+
+  it('eventually re-arms a same-turn replacement without repeating on navigation', async () => {
+    const run = start();
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(run.notices()).toHaveLength(1);
+
+    run.setScreen(dialog);
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(run.notices()).toHaveLength(1);
+
+    run.scope.webTerminalInputGeneration++;
+    run.setScreen(dialog.replace('1. Yes', '❯ 1. Yes'));
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(run.notices()).toHaveLength(1);
+
+    run.setScreen(dialog);
+    await vi.advanceTimersByTimeAsync(34_000);
+    expect(run.notices()).toHaveLength(2);
+  });
+
+  it('does not repeatedly notify an unchanged dialog on output-only redraws', async () => {
+    const run = start();
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(run.notices()).toHaveLength(1);
+    for (let i = 0; i < 5; i++) {
+      run.setScreen(dialog);
+      await vi.advanceTimersByTimeAsync(2_000);
+    }
+    expect(run.notices()).toHaveLength(1);
+  });
+
+  it('keeps a non-Claude CLI moving through slow overlapping general snapshots', async () => {
+    const run = start('grok');
+    const pending: Array<(value: any) => void> = [];
+    run.scope.snapshotWithLatestRuntimeStatus = vi.fn(() => new Promise(resolve => pending.push(resolve)));
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(pending).toHaveLength(2);
+
+    pending[0]({ snapshot: { content: 'grok frame one', changed: true }, status: 'idle' }); await flush();
+    pending[1]({ snapshot: { content: 'grok frame two', changed: true }, status: 'idle' }); await flush();
+    expect(run.screenUpdates().map(message => message.content)).toEqual(['grok frame one', 'grok frame two']);
+  });
+
+  it('does not let a discarded older snapshot poison the cached frame used by a later status change', async () => {
+    const run = start('grok');
+    let projectedStatus = 'idle';
+    let resolveOld!: (value: any) => void;
+    let filteredCalls = 0;
+    run.scope.lastPtyActivityAtMs = 1;
+    run.scope.projectedRuntimeScreenStatus = () => projectedStatus;
+    run.scope.isScreenSelfDriven = () => false;
+    run.scope.shouldCaptureScreen = ({ ptyActivity, lastCapturedPtyActivity }: any) => ptyActivity !== lastCapturedPtyActivity;
+    run.scope.snapshotWithLatestRuntimeStatus = loadWorkerFunction('snapshotWithLatestRuntimeStatus', run.scope);
+    run.scope.snapshotToText = vi.fn(async (_backend: any, _cols: any, _rows: any, options: any) => {
+      if (!options.filter) return { content: 'CURRENT-RAW' };
+      filteredCalls++;
+      if (filteredCalls === 1) return new Promise(resolve => { resolveOld = resolve; });
+      return { content: 'NEW', ansi: 'NEW', cols: 80, rows: 24 };
+    });
+
+    run.setScreen('OLD');
+    await vi.advanceTimersByTimeAsync(2_000);
+    run.scope.lastPtyActivityAtMs = 2;
+    run.setScreen('NEW');
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(run.screenUpdates().map(message => [message.content, message.status])).toEqual([['NEW', 'idle']]);
+
+    resolveOld({ content: 'OLD', ansi: 'OLD', cols: 80, rows: 24 }); await flush();
+    projectedStatus = 'working';
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(run.screenUpdates().map(message => [message.content, message.status])).toEqual([
+      ['NEW', 'idle'], ['NEW', 'working'],
+    ]);
+  });
+
+  it('does not invalidate an in-flight capture when a status-only tick completes first', async () => {
+    const run = start('grok');
+    let projectedStatus = 'idle';
+    let resolveCapture!: (value: any) => void;
+    run.scope.lastPtyActivityAtMs = 1;
+    run.scope.projectedRuntimeScreenStatus = () => projectedStatus;
+    run.scope.isScreenSelfDriven = () => false;
+    run.scope.shouldCaptureScreen = ({ ptyActivity, lastCapturedPtyActivity }: any) => ptyActivity !== lastCapturedPtyActivity;
+    run.scope.snapshotWithLatestRuntimeStatus = loadWorkerFunction('snapshotWithLatestRuntimeStatus', run.scope);
+    run.scope.snapshotToText = vi.fn(async (_backend: any, _cols: any, _rows: any, options: any) => {
+      if (!options.filter) return { content: 'CURRENT-RAW' };
+      return new Promise(resolve => { resolveCapture = resolve; });
+    });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    projectedStatus = 'working';
+    await vi.advanceTimersByTimeAsync(2_000);
+    resolveCapture({ content: 'SLOW-FRESH', ansi: 'SLOW-FRESH', cols: 80, rows: 24 });
+    await flush();
+    expect(run.screenUpdates().map(message => [message.content, message.status])).toContainEqual(['SLOW-FRESH', 'working']);
+  });
+
+  it('bounds a stalled general capture to one timeout retry and recovers on new activity', async () => {
+    const run = start('grok');
+    const pending: Array<(value: any) => void> = [];
+    run.scope.lastPtyActivityAtMs = 1;
+    run.scope.isScreenSelfDriven = () => false;
+    run.scope.shouldCaptureScreen = ({ ptyActivity, lastCapturedPtyActivity }: any) => ptyActivity !== lastCapturedPtyActivity;
+    run.scope.snapshotWithLatestRuntimeStatus = loadWorkerFunction('snapshotWithLatestRuntimeStatus', run.scope);
+    run.scope.snapshotToText = vi.fn(async (_backend: any, _cols: any, _rows: any, options: any) => {
+      if (!options.filter) return { content: 'CURRENT-RAW' };
+      return new Promise(resolve => pending.push(resolve));
+    });
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(pending).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(pending).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(pending).toHaveLength(2);
+
+    run.scope.lastPtyActivityAtMs = 2;
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(pending).toHaveLength(3);
+    pending[2]({ content: 'RECOVERED', ansi: 'RECOVERED', cols: 80, rows: 24 });
+    await flush();
+    expect(run.screenUpdates().map(message => message.content)).toContain('RECOVERED');
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(pending).toHaveLength(3);
+  });
+
+  it('fences a non-Claude CLI general snapshot at a turn transition', async () => {
+    const run = start('grok');
+    const pending: Array<(value: any) => void> = [];
+    run.scope.snapshotWithLatestRuntimeStatus = vi.fn(() => new Promise(resolve => pending.push(resolve)));
+    await vi.advanceTimersByTimeAsync(2_000);
+    run.scope.currentBotmuxTurnId = 'turn-2';
+    run.scope.currentBotmuxDispatchAttempt = 2;
+    pending[0]({ snapshot: { content: 'old turn frame', changed: true }, status: 'idle' }); await flush();
+    expect(run.screenUpdates()).toHaveLength(0);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    pending[1]({ snapshot: { content: 'new turn frame', changed: true }, status: 'idle' }); await flush();
+    expect(run.screenUpdates()).toEqual([expect.objectContaining({
+      content: 'new turn frame', turnId: 'turn-2', dispatchAttempt: 2,
+    })]);
   });
 });

@@ -36,31 +36,88 @@ function projectDialogLines(screen: string): string[] {
 
 /** Wait on fresh viewport observations, not on an already queued notification.
  * This also gives PermissionRequest time to resolve or register its own card. */
+/** Same-turn output alone cannot prove a dialog was replaced. Rate-limit that
+ * ambiguous path while keeping turn changes and observed close/reopen immediate. */
+const AMBIGUOUS_PERMISSION_REPEAT_MS = 30_000;
+
 export class ClaudePermissionNoticeTracker {
   private key = '';
   private observationKey = '';
   private since = 0;
   private notifiedKey = '';
+  private notifiedTurnKey = '';
+  private notifiedEpisodeKey: string | undefined;
+  private lastTurnKey = '';
+  private lastEpisodeKey: string | undefined;
+  private notifiedAtMs = 0;
+  private replacementKey = '';
+  private replacementNotBefore = 0;
 
   needsCapture(screens: Array<string | undefined>): boolean {
     return !!this.key || !!this.notifiedKey || screens.some(screen => screen !== undefined && !!claudeActionPrompt(screen));
   }
 
   // runtimeKey identifies the physical CLI; turn/attempt/input belong only in observationKey.
-  observe(screen: string | undefined, runtimeKey: string, now: number, observationKey = runtimeKey): string | undefined {
+  observe(screen: string | undefined, runtimeKey: string, now: number, observationKey = runtimeKey, episodeKey?: string, turnKey = observationKey): string | undefined {
     // An unreadable frame breaks the wait, but does not prove a dialog closed.
     if (screen === undefined) { this.key = ''; return; }
     const prompt = claudeActionPrompt(screen);
     const key = prompt ? JSON.stringify([runtimeKey, prompt]) : '';
-    if (!key) this.notifiedKey = '';
-    if (key !== this.key || observationKey !== this.observationKey) {
+    const navigation = !!key && this.notifiedKey === key && this.lastTurnKey === turnKey
+      && observationKey !== this.observationKey;
+    const outputReplacement = !!key && this.notifiedKey === key && this.lastTurnKey === turnKey
+      && observationKey === this.observationKey
+      && episodeKey !== undefined && episodeKey !== this.lastEpisodeKey;
+    if (this.replacementKey && (this.replacementKey !== key || this.notifiedTurnKey !== turnKey)) {
+      this.replacementKey = '';
+      this.replacementNotBefore = 0;
+    }
+    const throttled = outputReplacement && now - this.notifiedAtMs < AMBIGUOUS_PERMISSION_REPEAT_MS;
+    if (throttled) {
+      this.replacementKey = key;
+      this.replacementNotBefore = this.notifiedAtMs + AMBIGUOUS_PERMISSION_REPEAT_MS;
+    }
+    const replacementDue = !!key && this.notifiedKey === key
+      && ((outputReplacement && !throttled)
+        || (this.replacementKey === key && now >= this.replacementNotBefore));
+    const throttledReplacement = !!key && this.notifiedKey === key
+      && (throttled || (this.replacementKey === key && now < this.replacementNotBefore));
+    if (replacementDue) {
+      this.replacementKey = '';
+      this.replacementNotBefore = 0;
+    }
+    this.lastTurnKey = turnKey;
+    this.lastEpisodeKey = episodeKey;
+    if (!key || replacementDue) {
+      this.notifiedKey = '';
+      this.notifiedTurnKey = '';
+      this.notifiedEpisodeKey = undefined;
+    } else if (navigation) {
+      // Navigation explains the latest output without creating a new dialog.
+      // Keep it as the baseline so a later no-input replacement is still seen.
+      this.notifiedEpisodeKey = episodeKey;
+    }
+    if (key !== this.key || observationKey !== this.observationKey || replacementDue) {
       this.key = key;
       this.observationKey = observationKey;
       this.since = now;
       return;
     }
-    if (!key || this.notifiedKey === key || now - this.since < 3_000) return;
+    // An unchanged episode proves continuity across turns. Within one turn,
+    // input-generation changes identify navigation redraws, while new output
+    // without input can be an identical replacement and must re-arm. Backends
+    // without episode evidence can only fail open at a turn/attempt boundary.
+    const sameNotifiedDialog = this.notifiedKey === key
+      && ((episodeKey !== undefined && episodeKey === this.notifiedEpisodeKey)
+        || (this.notifiedTurnKey === turnKey && episodeKey === undefined)
+        || navigation || throttledReplacement);
+    if (!key || sameNotifiedDialog || now - this.since < 3_000) return;
     this.notifiedKey = key;
+    this.notifiedTurnKey = turnKey;
+    this.notifiedEpisodeKey = episodeKey;
+    this.notifiedAtMs = now;
+    this.replacementKey = '';
+    this.replacementNotBefore = 0;
     return prompt;
   }
 }
