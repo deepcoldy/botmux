@@ -2197,10 +2197,22 @@ async function writeResourceToDisk(res: any, savePath: string, guard?: DownloadD
     // closes the descriptor despite autoClose:false, which would double-close
     // (and potentially close a recycled fd belonging to another operation).
     let position = 0;
-    for await (const chunk of iterable) {
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array | string);
-      await fdWriteAll(fd, buffer, position);
-      position += buffer.length;
+    try {
+      for await (const chunk of iterable) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array | string);
+        await fdWriteAll(fd, buffer, position);
+        position += buffer.length;
+      }
+    } catch (error) {
+      // Abrupt for-await tears down the wrap ADAPTER, but Readable.wrap() never
+      // propagates that back to a pipe-only SOURCE (verified on Node/Bun): the
+      // underlying network stream keeps emitting and holds its listeners. Cancel
+      // it explicitly, mirroring pipeline()'s destroy-on-error. No error arg: the
+      // download already rejects with the original reason, and a sourced 'error'
+      // event without a listener could itself crash the process. Idempotent for
+      // modern streams, whose iterator return already destroyed them.
+      if (typeof stream.destroy === 'function') stream.destroy();
+      throw error;
     }
   }, guard);
 }
