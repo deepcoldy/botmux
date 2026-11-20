@@ -94,6 +94,8 @@ import {
   markMojoClosePrepared,
   finishMojoCloseAbort,
   closeSession,
+  cleanupSessionBridgeSendMarkers,
+  registerSessionBridgeSendMarkerCleanupFence,
   reactivateClosedSession,
   updateSession,
   updateSessionPid,
@@ -130,6 +132,7 @@ import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lan
 import { topicResumeBlockReason } from '../src/core/topic-session-continuity.js';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
 import { resolveCrossChatFollowedThread } from '../src/services/cross-chat-thread-binding.js';
+import { crossChatFollowThreadPath } from '../src/services/cross-chat-follow-thread-store.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 import { paneLaunchDir, writePaneLaunchFile } from '../src/adapters/backend/pane-launch.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
@@ -3363,6 +3366,26 @@ describe('reactivateClosedSession()', () => {
     expect(session.followThreadEpoch).toBeDefined();
     expect(session.followThreadEpoch).not.toBe(oldEpoch);
     expect(resolve()).toBeNull();
+  });
+
+  it('does not let an old cleanup fence delete a resumed lifecycle binding', async () => {
+    const session = createSession('oc_origin', 'om_root', 'Deferred Binding Cleanup');
+    let release!: () => void;
+    const fence = new Promise<void>(resolve => { release = resolve; });
+    registerSessionBridgeSendMarkerCleanupFence(session.sessionId, fence);
+    closeSession(session.sessionId);
+    cleanupSessionBridgeSendMarkers(session.sessionId);
+    expect(reactivateClosedSession(session.sessionId).ok).toBe(true);
+    recordBridgeReplyMarker({
+      dataDir: tempDir, sessionId: session.sessionId, sentAtMs: 1000, messageId: 'om_new_lifecycle',
+      deliveryKind: 'detoured_send', content: 'new lifecycle', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at', followThreadEpoch: session.followThreadEpoch,
+    });
+
+    release();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    // The old fence used to unlink the new lifecycle file immediately.
+    expect(existsSync(crossChatFollowThreadPath(tempDir, session.sessionId))).toBe(true);
   });
 
   it('assigns a new epoch when resuming a pre-epoch closed row', () => {

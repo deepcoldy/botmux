@@ -4386,6 +4386,31 @@ function findCrossChatFollowedThread(
   });
 }
 
+function crossChatFollowUpIsCurrent(ctx: RoutingContext): boolean {
+  const expected = ctx.crossChatThreadFollowUp;
+  if (!expected) return true;
+  const current = findCrossChatFollowedThread(
+    [expected.followedRootMessageId], expected.followedChatId, ctx.larkAppId,
+  );
+  const source = current
+    ? activeSessions.get(sessionKey(current.runtimeRoutingAnchor ?? current.anchor, ctx.larkAppId))
+    : undefined;
+  const valid = !!current
+    && current.sourceSessionId === expected.sourceSessionId
+    && current.followThreadEpoch === expected.followThreadEpoch
+    && current.sourceChatId === expected.sourceChatId
+    && current.scope === expected.scope
+    && current.anchor === expected.anchor
+    && current.runtimeRoutingAnchor === expected.runtimeRoutingAnchor
+    && source?.session.sessionId === expected.sourceSessionId
+    && source.session.status === 'active'
+    && source.session.followThreadEpoch === expected.followThreadEpoch;
+  if (!valid) {
+    logger.info(`[cross-chat-thread:${ctx.larkAppId}] dropping stale follow-up msg=${ctx.messageId.substring(0, 12)} source=${expected.sourceSessionId.substring(0, 12)}`);
+  }
+  return valid;
+}
+
 function setDirectChatDisplayNameFromSender(
   session: Session,
   chatType: 'group' | 'p2p' | undefined,
@@ -30169,6 +30194,7 @@ async function handleThreadReplyAdmitted(
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
   effortSessionIsCurrent?: () => boolean,
 ): Promise<void> {
+  if (!crossChatFollowUpIsCurrent(ctx)) return;
   if (feedbackMaintenanceActive(config.session.dataDir)) throw new Error('feedback_storage_maintenance');
   noteInboundSenderUnionId(ctx.larkAppId, data); // see handleNewTopicAdmitted
   if (!replay && handleDocumentAskTextReply(data, ctx)) return;
@@ -30856,7 +30882,9 @@ async function handleThreadReplyAdmitted(
   }
 
   // Quota/talk gate runs before any side effect below (continuity resume/close,
-  // initial-start claim).
+  // initial-start claim). Revalidate the source after any earlier async work so
+  // a stale lifecycle cannot be charged or admitted after the anchor was queued.
+  if (!crossChatFollowUpIsCurrent(ctx)) return;
   const quotaSenderOpenId = threadSenderOpenId;
   if (!prepared?.quotaChecked && !await enforceMessageQuotaForCliInput(
     larkAppId,
@@ -30883,6 +30911,7 @@ async function handleThreadReplyAdmitted(
   )) {
     return;
   }
+  if (!crossChatFollowUpIsCurrent(ctx)) return;
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // Topic session continuity (core/topic-session-continuity.ts). A topic whose
   // session was closed used to get a brand-new CLI session on the next message,

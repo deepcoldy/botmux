@@ -12,6 +12,7 @@ export interface CrossChatFollowedThreadOrigin {
 
 export interface CrossChatFollowedThreadMatch extends CrossChatFollowedThreadOrigin {
   sourceSessionId: string;
+  followThreadEpoch?: string;
   scope: 'chat' | 'thread';
   anchor: string;
   runtimeRoutingAnchor?: string;
@@ -211,6 +212,7 @@ export function resolveCrossChatFollowedThread(input: {
 
   return {
     sourceSessionId: best.session.sessionId,
+    followThreadEpoch: best.session.followThreadEpoch,
     sourceChatId: best.session.chatId,
     scope: isChat ? 'chat' : 'thread',
     anchor: isChat ? best.session.chatId : best.session.rootMessageId,

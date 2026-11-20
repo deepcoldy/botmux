@@ -2511,10 +2511,19 @@ export function cleanupSessionBridgeSendMarkersNow(sessionId: string): void {
 export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
   const fence = bridgeMarkerCleanupFences.get(sessionId);
   if (fence) {
-    void fence.then(
-      () => cleanupSessionBridgeSendMarkersNow(sessionId),
-      () => cleanupSessionBridgeSendMarkersNow(sessionId),
-    );
+    const expectedEpoch = getOwnedSession(sessionId)?.followThreadEpoch;
+    const cleanupIfLifecycleUnchanged = () => {
+      try {
+        const current = getOwnedSession(sessionId);
+        // A close fence belongs to the lifecycle that created it. If resume or
+        // another close has moved the session forward, its cleanup must not
+        // delete the new lifecycle's host binding.
+        if (current?.status === 'closed' && current.followThreadEpoch === expectedEpoch) {
+          cleanupSessionBridgeSendMarkersNow(sessionId);
+        }
+      } catch { /* an unreadable lifecycle is not proof it is safe to delete */ }
+    };
+    void fence.then(cleanupIfLifecycleUnchanged, cleanupIfLifecycleUnchanged);
     return;
   }
   cleanupSessionBridgeSendMarkersNow(sessionId);
