@@ -932,6 +932,7 @@ import {
 } from './utils/codex-app-turn-liveness.js';
 import { CodexAppTurnDispatchQueue } from './utils/codex-app-turn-dispatch.js';
 import { captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
+import { captureDshProcessIdentity, type DshProcessIdentity } from './services/dsh-process-attestation.js';
 import {
   committedCodexAppSequence,
   validateCodexAppManagedSendOrigin,
@@ -8246,6 +8247,15 @@ let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
 let codexAppControlProven = false;
 let codexAppRunnerProcessIdentity: CodexAppProcessIdentity | undefined;
+let dshProcessAttestation: {
+  generation: number;
+  executable: string;
+  args: string[];
+  identity?: DshProcessIdentity;
+  originPublished?: boolean;
+  retryTimer?: NodeJS.Timeout;
+  retryAttempts?: number;
+} | undefined;
 let codexAppEngineIdentity: CodexAppEngineIdentity | undefined;
 
 function clearCodexAppEngineIdentity(): void {
@@ -20678,11 +20688,57 @@ async function handleTrustedCodexAppMarker(
   return false;
 }
 
+function scheduleDshProcessAttestationRetry(proof: NonNullable<typeof dshProcessAttestation>): void {
+  if ((proof.identity && proof.originPublished) || proof.retryTimer || dshProcessAttestation !== proof
+    || proof.generation !== cliSpawnGeneration) return;
+  const delays = [50, 200, 1000, 2000, 5000, 10_000];
+  const attempt = proof.retryAttempts ?? 0;
+  const delay = delays[attempt];
+  if (delay === undefined) return;
+  proof.retryTimer = setTimeout(() => {
+    proof.retryTimer = undefined;
+    if ((proof.identity && proof.originPublished) || dshProcessAttestation !== proof
+      || proof.generation !== cliSpawnGeneration) return;
+    proof.retryAttempts = attempt + 1;
+    // Never rotate an already-published turn origin or retake its process
+    // snapshot. Only a FAILED origin publication may be repaired here.
+    const republishTurnOrigin = !proof.originPublished;
+    const published = publishLocalProcessAttestation(
+      backend?.getChildPid?.() ?? undefined,
+      undefined,
+      { republishTurnOrigin },
+    );
+    if (republishTurnOrigin && published) proof.originPublished = true;
+    scheduleDshProcessAttestationRetry(proof);
+  }, delay);
+  proof.retryTimer.unref?.();
+}
+
 function handleAppRunnerOscMarker(body: string): void {
   const sep = body.indexOf(':');
   if (sep < 0) return;
   const kind = body.slice(0, sep);
   const payload = decodeCodexAppPayload(body.slice(sep + 1));
+  if (kind === 'process_ready' && lastInitConfig?.cliId === 'dsh'
+    && lastInitConfig.dshRuntime !== 'tui') {
+    // No payload field is authority. A replay must not rotate the turn's
+    // pre-existing-process snapshot after tools have already started.
+    if (dshProcessAttestation?.generation === cliSpawnGeneration
+      && (!dshProcessAttestation.identity || !dshProcessAttestation.originPublished)) {
+      const proof = dshProcessAttestation;
+      const republishTurnOrigin = !proof.originPublished;
+      const published = publishLocalProcessAttestation(
+        backend?.getChildPid?.() ?? undefined,
+        undefined,
+        { republishTurnOrigin },
+      );
+      // Latch only a successful origin publication. A replay may repair a
+      // failed origin, but can never rotate an already-valid capability.
+      if (republishTurnOrigin && published) proof.originPublished = true;
+      scheduleDshProcessAttestationRetry(proof);
+    }
+    return;
+  }
   if (lastInitConfig?.cliId === 'minimax' && minimaxFinalReceiver.accept(kind,
       payload && typeof payload === 'object' ? payload : undefined,
       { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt })) return;
@@ -29156,6 +29212,10 @@ async function spawnCliBody(
     log(`Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ${cliAdapter.id}`);
   }
   if (cliExtraArgs.length) args.push(...cliExtraArgs);
+  if (dshProcessAttestation?.retryTimer) clearTimeout(dshProcessAttestation.retryTimer);
+  dshProcessAttestation = cfg.cliId === 'dsh' && cfg.dshRuntime !== 'tui'
+    ? { generation: cliSpawnGeneration, executable: cliAdapter.resolvedBin, args: [...args] }
+    : undefined;
 
   // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
   // botmux 必须带这个 flag（话题里没法弹交互式审批），所以为 root 自动注入
@@ -33599,6 +33659,8 @@ function killCli(opts: {
   // depend on that implementation detail.
   cliSpawnGeneration++;
   claudeEffortObserver.reset();
+  if (dshProcessAttestation?.retryTimer) clearTimeout(dshProcessAttestation.retryTimer);
+  dshProcessAttestation = undefined;
   terminalEffortTracker.reset();
   lastNativeReasoningKey = undefined;
   nativeReasoningClock = undefined;
@@ -38325,20 +38387,40 @@ function publishLocalProcessAttestation(
   opts: {
     statuslineReattach?: boolean;
     publishRelayCapability?: boolean;
+    republishTurnOrigin?: boolean;
     expectedCliProcStart?: string;
   } = {},
 ): boolean {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
   // A caller that already proved a leaf must never have that proof replaced by
   // whatever process happens to occupy the numeric PID when publication runs.
+  // This guard must stay ahead of DSH capture, identity freeze and retry
+  // cancellation so a replacement never mutates any attestation state.
   if (cliPid && opts.expectedCliProcStart !== undefined && cliProcStart !== opts.expectedCliProcStart) return false;
+  let dshIdentity: DshProcessIdentity | undefined;
+  if (lastInitConfig?.cliId === 'dsh' && lastInitConfig.dshRuntime !== 'tui'
+    && dshProcessAttestation?.generation === cliSpawnGeneration) {
+    const proof = dshProcessAttestation;
+    // A frozen identity is reused for this CLI generation. A later transient
+    // procfs failure must not revoke it, and a replacement cannot mint a new
+    // root. The daemon revalidates engineProcStart on every use; a legitimate
+    // engine exit takes down the runner, and generation replacement clears it.
+    const captured = proof.identity ?? captureDshProcessIdentity(cliPid, proof.executable, proof.args);
+    if (captured) dshIdentity = proof.identity ??= captured;
+    if (dshIdentity && proof.retryTimer) {
+      clearTimeout(proof.retryTimer);
+      proof.retryTimer = undefined;
+    }
+  }
   // Freeze the proven birth token; explicit legacy RPC roots keep priority.
-  enginePid ??= codexAppEngineIdentity?.pid ?? codexAppRunnerProcessIdentity?.enginePid;
+  enginePid ??= codexAppEngineIdentity?.pid ?? codexAppRunnerProcessIdentity?.enginePid ?? dshIdentity?.enginePid;
   const engineProcStart = codexAppEngineIdentity && enginePid === codexAppEngineIdentity.pid
     ? codexAppEngineIdentity.procStart
     : codexAppRunnerProcessIdentity && enginePid === codexAppRunnerProcessIdentity.enginePid
       ? codexAppRunnerProcessIdentity.engineProcStart
-      : enginePid ? readProcessStartIdentity(enginePid) : undefined;
+      : dshIdentity && enginePid === dshIdentity.enginePid
+        ? dshIdentity.engineProcStart
+        : enginePid ? readProcessStartIdentity(enginePid) : undefined;
   // Actual running image of the TRAE leaf, read from the kernel. The initial
   // attestation names the bwrap/forge launcher, which is not traex and must not
   // be recorded; the leaf re-attestation (applyRealPid) fills this in.
@@ -38379,7 +38461,8 @@ function publishLocalProcessAttestation(
   // before it snapshots the current turn's pre-existing descendants. This is
   // required for the opening turn, whose origin is first published before the
   // CLI process exists, and whenever a wrapper resolves to a new real CLI pid.
-  return currentBotmuxTurnId && opts.publishRelayCapability !== false ? publishSandboxRelayCapability() : true;
+  if (opts.republishTurnOrigin === false || opts.publishRelayCapability === false) return true;
+  return currentBotmuxTurnId ? publishSandboxRelayCapability() : true;
 }
 
 /** Deliver a terminal IPC message before exiting the worker. `process.send()`
