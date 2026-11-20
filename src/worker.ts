@@ -16696,7 +16696,9 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
         traexStartupWebRecheck = setTimeout(() => {
           traexStartupWebRecheck = undefined;
           if (backend !== target || cliSpawnGeneration !== generation
-            || Date.now() >= recheckDeadline
+            // Re-read the confirmation at fire time: an owned receipt may have
+            // landed after this callback captured the finite 90s deadline.
+            || Date.now() >= (traexFirstSubmitConfirmed ? Number.POSITIVE_INFINITY : traexFirstPromptDeadlineAt)
             || (cliRestartInProgress && !replacementSpawnInProgress)) return;
           markPromptReady();
           void flushPending();
@@ -16719,7 +16721,7 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
         const generation = cliSpawnGeneration;
         const revision = backendScreenRevision;
         const inputGeneration = webTerminalInputGeneration;
-        const retryDeadline = recheckDeadline;
+        const retryDeadline = () => traexFirstSubmitConfirmed ? Number.POSITIVE_INFINITY : traexFirstPromptDeadlineAt;
         let accepted = false;
         traexStartupRendererDrain = token;
         void observedRenderer.writeAndFlush('').then(() => {
@@ -16741,15 +16743,15 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
           if (accepted || (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending)
             || backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
             || (cliRestartInProgress && !replacementSpawnInProgress)
-            || Date.now() >= retryDeadline || traexStartupWebRecheck) return;
+            || Date.now() >= retryDeadline() || traexStartupWebRecheck) return;
           traexStartupWebRecheck = setTimeout(() => {
             traexStartupWebRecheck = undefined;
             if (backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
               || (cliRestartInProgress && !replacementSpawnInProgress)
-              || Date.now() >= retryDeadline) return;
+              || Date.now() >= retryDeadline()) return;
             markPromptReady();
             void flushPending();
-          }, Math.min(1_000, Math.max(0, retryDeadline - Date.now())));
+          }, Math.min(1_000, Math.max(0, retryDeadline() - Date.now())));
           traexStartupWebRecheck.unref?.();
         });
       }
@@ -23087,7 +23089,12 @@ function scheduleSubmitFailureNotify(
       noteTraexRescue(`read-back: no receipt after the submit key; composer ${stillParked ? 'still holds' : 'no longer shows'} the original draft`);
     }
     if (retainTraexReceipt && !traexDraftVisible) {
-      const footerRow = submitDiagnosisScreen.trimEnd().split(/\r?\n/).at(-1)?.trim().slice(0, 120) ?? '';
+      // Login / API-key screens can carry a device code or a signed URL in the
+      // last row. Keep the diagnostic reason, but apply the same outbound
+      // credential boundary as submitUnconfirmedNotice to this persistent log.
+      const credentialPage = screenShowsCredentialPage(submitDiagnosisScreen);
+      const footerRow = credentialPage ? ''
+        : submitDiagnosisScreen.trimEnd().split(/\r?\n/).at(-1)?.trim().slice(0, 120) ?? '';
       noteTraexRescue(`skipped: ${
         quarantineAtSchedule!.draftRescueAttempted ? 'the one-shot submit was already used'
           : quarantineAtSchedule!.submitWarningSent ? 'the one-shot warning was already sent'
@@ -23097,7 +23104,9 @@ function scheduleSubmitFailureNotify(
                 : interruptGenerationAtWrite === undefined || interruptGenerationAtWrite !== cliInterruptGeneration
                   ? 'interrupt since the write'
                   : !backendScreenEvidenceIsAuthoritativeForMutation() ? 'screen is not authoritative'
-                    : `the live composer does not show the original draft (last row: ${JSON.stringify(footerRow)})`
+                    : credentialPage
+                      ? 'the live composer does not show the original draft (last row withheld: credential page)'
+                      : `the live composer does not show the original draft (last row: ${JSON.stringify(footerRow)})`
       }`);
     }
     if (traexDraftVisible && !traexDraftReady

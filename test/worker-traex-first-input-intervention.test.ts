@@ -323,6 +323,50 @@ describe('Web startup protocol activity and recovery', () => {
     expect(h.scope.traexStartupWebRecheck).toBeUndefined();
   });
 
+  it('re-drives a stale late drain after an owned receipt extends its already-captured deadline', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    h.scope.traexFirstSubmitConfirmed = false;
+    h.scope.traexFirstPromptDeadlineAt = 90_000;
+    let finish!: () => void;
+    h.scope.renderer.writeAndFlush = vi.fn()
+      .mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }))
+      .mockResolvedValue(undefined);
+    h.scope.flushPending = vi.fn(async () => { h.pending(); });
+
+    vi.setSystemTime(88_000);
+    h.noteWebInput('\x1b[A');
+    h.scope.backendScreenRevision += 1;
+    vi.setSystemTime(89_000);
+    expect(h.pending()).toBe(true);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(89_500);
+    const quarantine = {
+      backend: h.scope.backend,
+      generation: h.scope.cliSpawnGeneration,
+      draftContent: 'first', turnId: 'first', dispatchAttempt: 1,
+    };
+    h.scope.inputDeliveryQuarantine = quarantine;
+    const release = loadWorkerFunction<(q: unknown, reason: string, opts: { redriveTerminal: boolean }) => boolean>(
+      'releaseInputDeliveryQuarantine', h.scope);
+    expect(release(quarantine, 'owned late submit receipt', { redriveTerminal: true })).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The old frame changes during the drain and is correctly rejected. The
+    // receipt must nevertheless let the finally arm a fresh post-90s retry.
+    vi.setSystemTime(91_000);
+    h.scope.backendScreenRevision += 1;
+    finish();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(h.scope.traexStartupWebRecheck).toBeDefined();
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(2);
+    expect(h.admissions()).toBe(1);
+    expect(h.scope.traexStartupWebRecheck).toBeUndefined();
+  });
+
   it('recovers a transient renderer drain within the fixed startup deadline', async () => {
     const h = makeStartupSampler(RESOLVED);
     const deadline = h.scope.traexFirstPromptDeadlineAt;

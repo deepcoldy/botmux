@@ -17,6 +17,15 @@ const SHORTCUT = [
 ].join('\n');
 const RESOLVED = SHORTCUT.replace('  ? for shortcuts',
   '  GPT-6-Astra · /tmp/native-control · Context —\n  ☢ Full Access · ? for shortcuts · ← for agents');
+// Real 0.214.1 [tui] status_line=[] + approval_policy=never: no model or
+// permission cells remain, but the native post-initialization content does.
+const INITIALIZED_SINGLE_HINT = [
+  '  █ ◆ ◆ █  TRAE CLI (v0.214.1)',
+  '  /tmp/native-control', '',
+  '  Good afternoon, user', '',
+  '  Tip: Use /fork to branch the current chat into a new thread.', '',
+  ...SHORTCUT.split('\n').slice(3),
+].join('\n');
 const readyPattern = createTraexAdapter('/bin/true').readyPattern;
 const ready = (screen: string, options: Partial<Parameters<typeof traexStartupInputReady>[0]> = {}) =>
   traexStartupInputReady({ screen, readyPattern, webInputUnchanged: true, blockingOwner: false, ...options });
@@ -37,6 +46,19 @@ describe('native thread readiness is distinct from a provisional input box', () 
       expect(ready(RESOLVED, { nativeState })).toBe(true);
     }
     expect(ready(RESOLVED, { nativeState: 'idle', webInputUnchanged: false })).toBe(true);
+  });
+
+  it('accepts an initialized single-hint layout without trusting the provisional idle frame', () => {
+    expect(ready(SHORTCUT, { nativeState: 'idle' })).toBe(false);
+    expect(ready(INITIALIZED_SINGLE_HINT)).toBe(true);
+    for (const nativeState of ['idle', 'done', 'working'] as const) {
+      expect(ready(INITIALIZED_SINGLE_HINT, { nativeState })).toBe(true);
+    }
+    // A long cold resume can scroll the welcome/tip away; restored native
+    // transcript rows are the same post-initialization evidence.
+    const restored = INITIALIZED_SINGLE_HINT.replace('  Good afternoon, user', '  ▍ earlier native request')
+      .replace('  Tip: Use /fork to branch the current chat into a new thread.', '  Worked for 2s');
+    expect(ready(restored, { nativeState: 'idle' })).toBe(true);
   });
 
   it('still lets native idle vouch for the repository notice that hides both footer rows', () => {

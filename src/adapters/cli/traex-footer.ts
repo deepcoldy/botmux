@@ -167,6 +167,18 @@ export function traexRestoredComposerReady(
   // its host-provided launch context replaces the banner requirement only
   // for this known nonblocking notification, never arbitrary dialog text.
   const startupRows = rows.slice(0, composer);
+  // With [tui] status_line=[] and approval_policy=never the initialized
+  // footer is intentionally identical to the provisional bare-hint row.
+  // Native idle cannot distinguish them (a stalled catalog also reports it),
+  // but the native content ABOVE the composer can: 0.214.1 PTY recordings with
+  // a hung catalog proxy show the welcome/tip only after initialization, and
+  // cold-resume recordings likewise paint restored transcript rows only after
+  // the resume has completed. This is independent of the hidden status cells.
+  const initializedStartupContent = startupRows.some(row =>
+    /^[ \t]*Good (?:morning|afternoon|evening),[ \t]*\S/.test(row)
+    || /^[ \t]*Tip:[ \t]+\S/.test(row)
+    || /^[ \t]*▍[ \t]+\S/.test(row)
+    || /^[ \t]*Worked for \d/.test(row));
   const repositoryNotice = footer.length === 1
     && /^[ \t]*无法访问 Git 仓库 `[^`\r\n]+`，请确认该仓库权限或地址。[ \t]*$/.test(footer[0]!)
     && (opts.resumedSession === true || (
@@ -208,14 +220,16 @@ export function traexRestoredComposerReady(
   // A fresh 0.214.1 TUI paints this provisional surface BEFORE its app-server
   // thread/start response. It accepts paste then, but drops Enter; the draft
   // survives once initialization finishes. The general restoration predicate
-  // keeps its legacy hint/notice support. Only the native first-input fence
-  // requires either a resolved model footer or a separately observed idle.
+  // keeps its legacy hint/notice support. The native first-input fence
+  // requires either a resolved model footer or the independently initialized
+  // startup/transcript content above (which also covers a hidden status line).
   // A native idle cannot vouch for the shortcut-only surface itself: 0.214.1
   // and 0.216.0 (fresh and resumed) report idle on it while the model catalog
   // fetch stalls, and still drop Enter. It still vouches for the repository
   // notice, which hides both footer rows of an otherwise unknown state.
   if (opts.requireThreadReady
-    && (shortcutOnlyFooter || (repositoryNotice && !opts.nativeIdleReported))) return false;
+    && ((shortcutOnlyFooter && !initializedStartupContent)
+      || (repositoryNotice && !opts.nativeIdleReported))) return false;
   // A working directory wider than the pane truncates the model/context row
   // with a U+2026 ellipsis before the Context cell can render. Such a row
   // still contains the native ` · ` cell separator and ends on the

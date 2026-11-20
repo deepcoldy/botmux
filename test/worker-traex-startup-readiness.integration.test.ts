@@ -27,12 +27,12 @@ function redraw(rows: string[]): string {
 
 // per-bot-home: TRAE_HOME comes only from the bot's env (the worker's own env
 // has none), so the submit receipt is only visible if the worker follows it.
-type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer' | 'provisional-thread-start' | 'provisional-thread-resume' | 'web-protocol-replies' | 'web-protocol-missing-resume';
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer' | 'initialized-single-hint-fresh' | 'initialized-single-hint-resume' | 'provisional-thread-start' | 'provisional-thread-resume' | 'web-protocol-replies' | 'web-protocol-missing-resume';
 
 useWorkerTestModulesCleanup();
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer', 'provisional-thread-start', 'provisional-thread-resume', 'web-protocol-replies', 'web-protocol-missing-resume'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer', 'initialized-single-hint-fresh', 'initialized-single-hint-resume', 'provisional-thread-start', 'provisional-thread-resume', 'web-protocol-replies', 'web-protocol-missing-resume'] as const) {
     if (mode.startsWith('native-viewport') && backendType !== 'tmux') continue;
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
@@ -67,11 +67,12 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
   const fakeCli = join(root, 'traex');
   const nativeViewport = mode.startsWith('native-viewport');
   const heldIdle = mode === 'resumed-repository-notice-held-idle';
+  const initializedSingleHint = mode === 'initialized-single-hint-fresh' || mode === 'initialized-single-hint-resume';
   // provisional-thread-resume replays the recorded 0.216.0 cold resume: the
   // resumed TUI paints the shortcut-only composer, reports idle on it, and
   // only a later redraw with the model/context row can submit.
-  const coldResume = mode === 'provisional-thread-resume';
-  const provisionalThread = mode === 'provisional-thread-start' || coldResume;
+  const coldResume = mode === 'provisional-thread-resume' || mode === 'initialized-single-hint-resume';
+  const provisionalThread = mode === 'provisional-thread-start' || mode === 'provisional-thread-resume';
   const idleReported = join(root, 'idle-reported');
   const recordedFrame = (name: string) => readFileSync(
     resolve(`test/fixtures/traex-cold-resume/0.216.0-resume-${name}.txt`), 'utf8').trimEnd().split('\n');
@@ -87,7 +88,13 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
   }
   const initial = mode === 'session-lock'
     ? readFileSync(resolve('test/fixtures/stuck-pages/traex-0.213.1-session-lock.txt'), 'utf8').trimEnd().split('\n')
-    : coldResume
+    : initializedSingleHint
+    ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo', '',
+        '  Good afternoon, user', '',
+        coldResume ? '  ▍ earlier native request' : '  Tip: Use /fork to branch the current chat into a new thread.', '',
+        ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+        '  ? for shortcuts']
+    : mode === 'provisional-thread-resume'
     ? recordedFrame('provisional')
     : nativeViewport
     ? COMPOSER.map(row => mode === 'native-viewport-loading' ? row.replace('GPT-6-Astra xhigh', 'loading') : row)
@@ -189,7 +196,7 @@ process.stdin.on('data', chunk => {
 });
 setInterval(() => {
   paint();
-  if (${JSON.stringify(provisionalThread || webProtocol)} && !reportedReady && fs.existsSync(${JSON.stringify(threadReady)})) {
+  if (${JSON.stringify(provisionalThread || webProtocol || initializedSingleHint)} && !reportedReady && fs.existsSync(${JSON.stringify(threadReady)})) {
     reportedReady = true;
     process.stdout.write('\\x1b]7501;state=idle:app=traex\\x07');
     fs.writeFileSync(${JSON.stringify(idleReported)}, 'idle');
@@ -348,7 +355,7 @@ process.send?.({ type: 'worker_ipc_ready' });
     child.send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_test',
       workingDir: dataDir, cliId: 'traex', cliPathOverride: fakeCli, backendType,
-      ...(provisionalThread || webProtocol ? { cliVersion: coldResume ? '0.216.0' : '0.214.1' } : {}),
+      ...(provisionalThread || webProtocol || initializedSingleHint ? { cliVersion: coldResume ? '0.216.0' : '0.214.1' } : {}),
       ...(coldResume ? { resume: true, cliSessionId: nativeId } : {}),
       ...(mode === 'web-protocol-missing-resume' ? { resume: true } : {}),
       ...(mode === 'resume' || mode === 'session-lock' || mode.startsWith('resumed-repository-notice') || nativeViewport ? { resume: true, cliSessionId: nativeId } : {}),
@@ -358,6 +365,7 @@ process.send?.({ type: 'worker_ipc_ready' });
       larkAppId: 'app_test', larkAppSecret: 'test',
     } satisfies DaemonToWorker);
     await waitFor(() => existsSync(seenFile), 'first frame', mode === 'session-lock' ? 60_000 : 12_000);
+    if (initializedSingleHint) writeFileSync(threadReady, 'initialized');
     if (webProtocol) {
       await waitFor(() => messages.some(message => message.type === 'ready'), 'writable Web terminal');
       const ready = messages.find(message => message.type === 'ready') as Extract<WorkerToDaemon, { type: 'ready' }>;

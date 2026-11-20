@@ -8,7 +8,8 @@ import { createSubmitFailureChainController } from '../src/services/submit-failu
 import { combineSubmitCurrentFences, settleDeferredSubmitConfirmation } from '../src/services/submit-confirmation.js';
 import { buildSubmitMessagePreview } from '../src/services/submit-notification.js';
 import { claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure,
-  shouldWaitThroughBusyTurn } from '../src/services/submit-failure-diagnosis.js';
+  diagnoseSubmitFailure, shouldWaitThroughBusyTurn } from '../src/services/submit-failure-diagnosis.js';
+import { screenMayShowCredential } from '../src/core/cli-startup-blocker.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { classifyStuckPage } from '../src/utils/stuck-detector.js';
 
@@ -65,6 +66,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     SUBMIT_DIAG_BUSY_SILENCE_MAX_EXTRA: 12, SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA: 3,
     unscopedSubmitFailureChainSequence: 0, effectiveBackendType: 'tmux', lastPtyActivityAtMs: 0,
     captureBackendScreen: () => screen, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+    screenMayShowCredential, diagnoseSubmitFailure,
     traexComposerHoldsInput, diagnoseBackendSubmitFailure, shouldWaitThroughBusyTurn,
     claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning,
     busyProbeRegion: (text: string) => text,
@@ -81,6 +83,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     isPromptReady: false, flushPending: vi.fn(),
   };
   scope.currentInputDeliveryQuarantine = loadWorkerFunction('currentInputDeliveryQuarantine', scope);
+  scope.screenShowsCredentialPage = loadWorkerFunction('screenShowsCredentialPage', scope);
   scope.releaseInputDeliveryQuarantine = loadWorkerFunction('releaseInputDeliveryQuarantine', scope);
   scope.traexQuestionCapture = loadWorkerFunction('traexQuestionCapture', scope);
   scope.submitUnconfirmedNotice = loadWorkerFunction('submitUnconfirmedNotice', scope);
@@ -261,6 +264,19 @@ describe('TRAE parked draft recovery', () => {
     ]));
   });
 
+  it('withholds a credential-page last row from persistent rescue logs', async () => {
+    const secret = 'DEVICE-CODE-SECRET-7319';
+    const h = fixture({
+      screen: `Sign in to TraeCode CLI\nOpen this link in your browser: https://auth.example.invalid/login?code=${secret}`,
+    });
+    h.start();
+    await vi.advanceTimersByTimeAsync(140_000);
+    expect(h.warnings()).toHaveLength(1);
+    const logs = h.scope.log.mock.calls.map(([line]: [string]) => line).join('\n');
+    expect(logs).not.toContain(secret);
+    expect(logs).toContain('last row withheld: credential page');
+  });
+
   it('warns without pressing when the provisional composer outlives the startup hard cap', async () => {
     const h = fixture({ screen: '─────────────────────────\n❯ [Pasted Content 6 chars]\n  ? for shortcuts' });
     h.start();
@@ -302,6 +318,13 @@ describe('TRAE live draft recognition', () => {
     expect(traexComposerHoldsInput(recorded('resolved-pasted', draft), draft)).toBe(true);
     expect(traexComposerHoldsInput(recorded('resolved-pasted-redrawn', draft), draft)).toBe(true);
     expect(traexComposerHoldsInput(recorded('resolved-pasted', draft), 'y'.repeat(2348))).toBe(false);
+  });
+  it('recognizes an initialized hidden-status draft while keeping its provisional twin gated', () => {
+    const draft = 'x'.repeat(2349);
+    const initialized = recorded('provisional-pasted', draft).replace('  permissions: YOLO mode',
+      '  Good afternoon, user\n\n  Tip: Use /fork to branch the current chat into a new thread.');
+    expect(traexComposerHoldsInput(initialized, draft)).toBe(true);
+    expect(traexComposerHoldsInput(recorded('provisional-pasted', draft), draft)).toBe(false);
   });
   it('never accepts the paste hint below an empty composer', () => {
     const empty = recorded('resolved-pasted').replace(/❯ \[Pasted Content \d+ chars\]/, '❯ Ask TRAE CLI to do anything');

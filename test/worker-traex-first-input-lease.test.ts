@@ -172,6 +172,43 @@ describe('TraeX first-write lease after Web terminal input', () => {
     expect(h.scope.traexFirstInputAdmissionPending).toBe(false);
   });
 
+  it('re-drives an already-armed Web recheck when an owned receipt lands inside the old deadline window', async () => {
+    const h = leaseHarness();
+    // Startup is resolved, but the first write has not earned its receipt yet.
+    expect(h.pending()).toBe(false);
+    expect(h.scope.traexFirstInputAdmissionPending).toBe(true);
+    const startedAt = Date.now();
+    h.scope.traexFirstPromptDeadlineAt = startedAt + 90_000;
+
+    vi.setSystemTime(startedAt + 89_000);
+    h.noteWebInput(FOCUS_OUT);
+    await h.flush();
+    expect(h.scope.traexStartupWebRecheck).toBeDefined();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+
+    vi.setSystemTime(startedAt + 89_500);
+    const quarantine = {
+      backend: h.scope.backend,
+      generation: h.scope.cliSpawnGeneration,
+      draftContent: 'first', turnId: 'first', dispatchAttempt: 1,
+    };
+    h.scope.inputDeliveryQuarantine = quarantine;
+    const release = loadWorkerFunction<(q: unknown, reason: string, opts: { redriveTerminal: boolean }) => boolean>(
+      'releaseInputDeliveryQuarantine', h.scope);
+    expect(release(quarantine, 'owned late submit receipt', { redriveTerminal: true })).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.scope.traexFirstSubmitConfirmed).toBe(true);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+
+    // The old callback used to exit at 90s even though the receipt had already
+    // made its deadline infinite. No later screen event should be necessary.
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(h.scope.pendingMessages).toHaveLength(0);
+    expect(h.scope.traexFirstInputAdmissionPending).toBe(false);
+    expect(h.scope.traexStartupWebRecheck).toBeUndefined();
+  });
+
   it('never re-drives a held input from a recheck timer whose spawn generation was replaced', async () => {
     const h = leaseHarness();
     h.noteWebInput(FOCUS_OUT);
