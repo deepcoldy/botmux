@@ -99,6 +99,27 @@ describe('freezeSessionSandboxDecision', () => {
     }
   });
 
+  it('BOTMUX_SANDBOX=1 forcing oncall on a sandbox-off bot still freezes sandboxWithholdBotSecret', () => {
+    const prev = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTMUX_SANDBOX = '1';
+      const forced = makeSession();
+      freezeSessionSandboxDecision(forced, botCfg({ sandboxWithholdBotSecret: true }));
+      expect(forced.session.sandbox).toBe(false);
+      expect(forced.session.sandboxWithholdBotSecret).toBe(true);
+      process.env.BOTMUX_SANDBOX = 'scratch';
+      const scratch = makeSession();
+      freezeSessionSandboxDecision(scratch, botCfg({ sandboxWithholdBotSecret: true }));
+      expect(scratch.session.sandboxWithholdBotSecret).toBeUndefined();
+      delete process.env.BOTMUX_SANDBOX;
+      const plain = makeSession();
+      freezeSessionSandboxDecision(plain, botCfg({ sandboxWithholdBotSecret: true }));
+      expect(plain.session.sandboxWithholdBotSecret).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SANDBOX; else process.env.BOTMUX_SANDBOX = prev;
+    }
+  });
+
   it('folds legacy readIsolation into the frozen tri-state as oncall', () => {
     const ds = makeSession();
     freezeSessionSandboxDecision(ds, botCfg({ sandbox: false, readIsolation: true }));

@@ -28660,10 +28660,13 @@ async function spawnCliBody(
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR, cfg.larkAppId);
       mkdirSync(dirname(credPath), { recursive: true });
-      writeFileSync(
+      // sandboxWithholdBotSecret denies the exact file only; a sibling temp file
+      // in the readable BOT_HOME would expose the secret during (or after a
+      // crash before) the rename, so stage it one level up, out of the grant.
+      atomicWriteFileSync(
         credPath,
         JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
-        { mode: 0o600 },
+        { mode: 0o600, ...(cfg.sandboxWithholdBotSecret === true ? { tmpDir: dirname(dirname(credPath)) } : {}) },
       );
     } catch (e) {
       log(`[sandbox] WARN could not write send-cred file: ${(e as Error).message}`);

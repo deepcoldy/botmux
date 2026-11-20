@@ -42,6 +42,13 @@ export interface FsPolicy {
   rules: FsRule[];
   /** Keep network egress (bwrap-only knob; Seatbelt does not confine net here). */
   net: boolean;
+  /** Seatbelt only: refuse process-info on OTHER processes and the
+   *  kern.procargs* sysctls. The host worker's environment carries the Lark app
+   *  secret; measured on macOS: a same-uid sandboxed process reads it back via
+   *  sysctl(KERN_PROCARGS2) unless BOTH denies are present (either alone still
+   *  leaks; denying self pid-info crashes runtimes). Linux hides host processes
+   *  with the PID namespace instead. */
+  hideHostProcessInfo?: boolean;
   /** Extra Seatbelt write-allow regexes (e.g. ~/.claude.json.tmp.* atomic-save
    *  siblings when the CLI data dir is NOT redirected into BOT_HOME). */
   writeRegexes: string[];
@@ -1231,6 +1238,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   return {
     rules,
     net: ctx.net !== false,
+    ...(ctx.withholdSendCredential ? { hideHostProcessInfo: true } : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
     finalReadOnlyPaths,
@@ -1317,6 +1325,9 @@ export function compileToSeatbelt(policy: FsPolicy): string {
     // if a deployment ever needs the kernel surface closed too.
     '(allow iokit-open)',
     ...(policy.net ? ['(allow network*)', '(allow system-socket)'] : []),
+    ...(policy.hideHostProcessInfo
+      ? ['(deny process-info* (target others))', '(deny sysctl-read (sysctl-name-prefix "kern.procargs"))']
+      : []),
   ];
   for (const r of policy.rules) {
     const p = escSb(r.path);

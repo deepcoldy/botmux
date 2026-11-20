@@ -58,6 +58,12 @@ export interface AtomicWriteOptions {
    * directory is canonicalized, but the leaf is replaced rather than followed.
    */
   followTargetSymlink?: boolean;
+  /**
+   * Directory for the temporary file (default: next to the target). Must be on
+   * the same filesystem. Used when the target directory is readable by a
+   * sandbox but the bytes must never be observable before the rename lands.
+   */
+  tmpDir?: string;
 }
 
 function fsyncDirectorySync(filePath: string): void {
@@ -76,8 +82,9 @@ async function fsyncDirectory(filePath: string): Promise<void> {
 }
 
 /** 生成与目标同目录的唯一 tmp 路径。 */
-function tmpPathFor(filePath: string): string {
-  return `${filePath}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+function tmpPathFor(filePath: string, tmpDir?: string): string {
+  const base = tmpDir ? join(tmpDir, basename(filePath)) : filePath;
+  return `${base}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
 }
 
 /** Whether a directory entry is an atomic-write intermediate left by
@@ -129,7 +136,7 @@ export function atomicWriteFileSync(
   filePath = options.followTargetSymlink === false
     ? resolveParentPathSync(filePath)
     : resolveRealPathSync(filePath);
-  const tmp = tmpPathFor(filePath);
+  const tmp = tmpPathFor(filePath, options.tmpDir);
   let fd: number | undefined;
   try {
     fd = openSync(
@@ -166,7 +173,7 @@ export async function atomicWriteFile(
   filePath = options.followTargetSymlink === false
     ? await resolveParentPath(filePath)
     : await resolveRealPath(filePath);
-  const tmp = tmpPathFor(filePath);
+  const tmp = tmpPathFor(filePath, options.tmpDir);
   let handle: import('node:fs/promises').FileHandle | undefined;
   try {
     handle = await fsp.open(

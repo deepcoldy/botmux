@@ -1,4 +1,4 @@
-import { mkdtemp, open, rename, rm } from 'node:fs/promises';
+import { lstat, mkdtemp, open, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Readable } from 'node:stream';
 
@@ -72,6 +72,11 @@ export async function downloadResourceWithRange(
   savePath: string,
 ): Promise<void> {
   let total = 0;
+  // The destination directory may be writable by a sandbox; it is checked here,
+  // before any network wait, and must be the same inode when the file lands.
+  const dir = dirname(savePath);
+  const dirBefore = await lstat(dir);
+  if (dirBefore.isSymbolicLink() || !dirBefore.isDirectory()) throw new RangeDownloadError(`Refusing to download into a non-directory: ${dir}`);
   // A one-byte probe avoids the ordinary endpoint's whole-file size limit.
   // Intentionally fail fast here: data retries start only after range metadata is validated.
   let probe: ResourceStream | undefined;
@@ -125,6 +130,10 @@ export async function downloadResourceWithRange(
       }
       if ((await file.stat()).size !== total) throw new RangeDownloadError('Resource final size mismatch');
     } finally { await file.close(); }
+    const dirAfter = await lstat(dir);
+    if (dirAfter.isSymbolicLink() || !dirAfter.isDirectory() || dirAfter.dev !== dirBefore.dev || dirAfter.ino !== dirBefore.ino) {
+      throw new RangeDownloadError(`Download directory changed while writing: ${dir}`);
+    }
     await rename(temporaryPath, savePath);
   } finally {
     await rm(temporaryDir, { recursive: true, force: true });

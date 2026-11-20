@@ -40,6 +40,7 @@ import { dropConfiguredCliRuntime } from '../adapters/cli/runtime.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { sendCredFilePath } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
@@ -788,7 +789,11 @@ async function applyConfigFieldInternal(
         const cred = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
         if (effective === null || (effective as any)?.enabled !== true) delete cred.feedback;
         else cred.feedback = effective;
-        atomicWriteFileSync(path, JSON.stringify(cred), { mode: 0o600 });
+        atomicWriteFileSync(path, JSON.stringify(cred), {
+          mode: 0o600,
+          // see worker.ts send-cred write: keep the temp file out of the sandbox-readable BOT_HOME
+          ...(bot.config.sandboxWithholdBotSecret === true ? { tmpDir: dirname(dirname(path)) } : {}),
+        });
       }
     } catch (error) {
       logger.warn(`[config:${larkAppId}] failed to refresh sandbox feedback policy: ${error instanceof Error ? error.message : String(error)}`);

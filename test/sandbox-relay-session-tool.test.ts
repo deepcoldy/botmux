@@ -13,7 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { RELAY_SESSION_TOOLS_MARKER, startOutboxWatcher, validateRelaySessionToolRequest } from '../src/adapters/backend/sandbox.js';
-import { accessForPath, buildFsPolicy, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
+import { accessForPath, buildFsPolicy, compileToSeatbelt, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
 import { buildRelaySessionToolRequest, materializeRelayedAttachments } from '../src/cli/relay-session-tool.js';
 import { readVerifiedFile } from '../src/services/remote-runner-session-tool.js';
 
@@ -67,6 +67,15 @@ describe('fs-policy: withholdSendCredential', () => {
       expect(accessForPath(buildFsPolicy(ctx(linux)).rules, `${linuxStore}/${f}`).access).toBe('readOnly');
       expect(accessForPath(buildFsPolicy(ctx({ ...linux, withholdSendCredential: true })).rules, `${linuxStore}/${f}`).access).toBe('deny');
     }
+  });
+
+  it('hides other processes from the Seatbelt pane only when the secret is withheld', () => {
+    const on = compileToSeatbelt(buildFsPolicy(ctx({ withholdSendCredential: true })));
+    expect(on).toContain('(deny process-info* (target others))');
+    expect(on).toContain('(deny sysctl-read (sysctl-name-prefix "kern.procargs"))');
+    const off = compileToSeatbelt(buildFsPolicy(ctx()));
+    expect(off).not.toContain('process-info*');
+    expect(off).not.toContain('kern.procargs');
   });
 
   it('grants the macOS relay outbox read-write', () => {

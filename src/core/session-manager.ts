@@ -110,7 +110,7 @@ import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../se
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { unpinnedSessionWorkingDir } from './working-dir-range.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
-import { getAttachmentsDir } from './attachment-path.js';
+import { getAttachmentsDir, safeAttachmentFileName } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn, pickTurnReplyTarget } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
@@ -710,7 +710,7 @@ export async function downloadResources(larkAppId: string, messageId: string, re
   let needLogin = false;
 
   for (const res of resources) {
-    const savePath = join(dir, res.name);
+    const savePath = join(dir, safeAttachmentFileName(res.name, res.key));
     try {
       const resMessageId = res.messageId ?? messageId;
       // Whose token backs the user-token fallback: the person who sent the

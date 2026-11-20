@@ -321,6 +321,7 @@ When on:
 - `botmux send`, `botmux dispatch`, `botmux history` and `botmux quoted` are written to the session relay directory and executed by the daemon outside the sandbox. This also gives macOS the same relay Linux has;
 - For `history` the daemon always reads the current session; for `quoted` the message must be in this session's chat or it is refused. Images and files from a quoted message are downloaded by the daemon and handed back inside the session relay directory;
 - Relayed `history` supports only `--limit` (at most 100), `--scope` and `--with-card-json`; `quoted` reads one message per call and supports `--raw`. Other options are refused;
+- Other host processes' arguments and environment are hidden from the sandbox (on macOS, process-info on other processes and `kern.procargs` sysctls are denied);
 - The session's `lark-cli` bot identity (the default and `--as bot`) is unavailable; `--as user` keeps working. Other commands that need to call Lark directly from the sandbox (for example `botmux bots list`) fail.
 
 Applies to the allowlist sandbox (`oncall`) only; scratch is unaffected. Like the other sandbox options it is fixed when a session is created, so a change applies to new sessions.

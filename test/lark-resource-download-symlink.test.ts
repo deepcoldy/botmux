@@ -21,6 +21,7 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 import { downloadMessageResource } from '../src/im/lark/client.js';
+import { downloadResourceWithRange, type ResourceStream } from '../src/im/lark/resource-range-download.js';
 
 let root = '';
 beforeEach(() => { vi.resetAllMocks(); root = mkdtempSync(join(tmpdir(), 'botmux-dl-symlink-')); });
@@ -60,6 +61,25 @@ describe('downloadMessageResource symlink safety', () => {
       },
     });
     await expect(downloadMessageResource('cli_test', 'om_z', 'file_k', 'file', join(dir, 'cli.js'))).rejects.toThrow();
+    expect(readFileSync(join(hostDir, 'cli.js'), 'utf8')).toBe('HOST');
+    expect(readdirSync(hostDir)).toEqual(['cli.js']);
+  });
+
+  it('range download: does not rename into a directory swapped during the probe', async () => {
+    const hostDir = join(root, 'host-dist');
+    mkdirSync(hostDir);
+    writeFileSync(join(hostDir, 'cli.js'), 'HOST');
+    const dir = join(root, 'om_r');
+    mkdirSync(dir);
+    const data = Buffer.from('EVIL');
+    let swapped = false;
+    const request = async (start: number, end: number): Promise<ResourceStream> => {
+      if (!swapped) { swapped = true; renameSync(dir, `${dir}.moved`); symlinkSync(hostDir, dir); }
+      return Object.assign(Readable.from([data.subarray(start, end + 1)]), {
+        statusCode: 206, headers: { 'content-range': `bytes ${start}-${end}/${data.length}` },
+      });
+    };
+    await expect(downloadResourceWithRange(request, join(dir, 'cli.js'))).rejects.toThrow();
     expect(readFileSync(join(hostDir, 'cli.js'), 'utf8')).toBe('HOST');
     expect(readdirSync(hostDir)).toEqual(['cli.js']);
   });

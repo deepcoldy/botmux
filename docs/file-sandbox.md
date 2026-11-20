@@ -286,7 +286,15 @@ worker spawnCli
   `/api/sessions/<sid>/lark-tool-identity` 对 `mode: 'bot'` 返回 403（`--as user` 不受影响）。
 - outbox 与附件桶对沙盒可写，宿主往里写都不跟随软链：`res.json` 用 `followTargetSymlink: false`，
   附件下载写临时文件后 rename，并在 rename 前复核目录 inode 未被换成软链。
-- 开关随会话冻结，fork / 干净恢复、多人分道（principal lane）、v3 工作流 bot 快照都带着它。
+- 开关随会话冻结，fork / 干净恢复、多人分道（principal lane）、v3 工作流 bot 快照都带着它；
+  `BOTMUX_SANDBOX=1` 强制开 oncall 的会话也带。
+- macOS 宿主 worker 进程 env 里有 `LARK_APP_SECRET`，同用户进程可用 `sysctl(KERN_PROCARGS2)` 读回
+  （实测 `(allow default)` 下可读）。开关打开时 Seatbelt 多发两条：`(deny process-info* (target others))`
+  与 `(deny sysctl-read (sysctl-name-prefix "kern.procargs"))`——实测必须两条同时才拦得住，单独任一条仍可读；
+  不能 deny 对自身的 process-info（会让运行时直接崩）。Linux 靠 PID namespace。
+- send-cred 两个写入点（worker 启动、feedback 配置改动）在开关打开时把原子写的临时文件放到
+  `bots/`（沙盒不可读）而不是 BOT_HOME 同级，避免 rename 前（或崩溃残留）被读到。
+- 附件文件名只取 basename，`..`/空名退回 file_key；Range 下载在 rename 前复核目录 inode。
 
 **沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
 
