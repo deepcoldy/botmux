@@ -110,6 +110,8 @@ export interface WriteInputContext {
 }
 
 export interface SubmitGuard {
+  /** May reject before any paste bytes, after an adapter's awaited setup. */
+  beforeWrite?(): void;
   /** A reason (shown to the user) while the surface is taken, else undefined.
    *  `draft` = the message was pasted and its first Enter is pending (it sits
    *  in the composer under the page); `retry` = a resend of an Enter that
