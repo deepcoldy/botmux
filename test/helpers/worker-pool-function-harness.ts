@@ -12,6 +12,16 @@ import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-mo
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
+import {
+  clearInFlightAntigravityRotation,
+  formatAntigravityCooldown,
+  tryAntigravityQuotaAutoRotate,
+} from '../../src/core/antigravity-rotation.js';
+import {
+  inspectAntigravityAccounts,
+  maskAntigravityEmail,
+  rotateAntigravityAccountOnQuotaLimit,
+} from '../../src/services/antigravity-accounts.js';
 
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
@@ -23,6 +33,12 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
+  if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
+  if (key === 'formatAntigravityCooldown') return formatAntigravityCooldown;
+  if (key === 'tryAntigravityQuotaAutoRotate') return tryAntigravityQuotaAutoRotate;
+  if (key === 'inspectAntigravityAccounts') return inspectAntigravityAccounts;
+  if (key === 'maskAntigravityEmail') return maskAntigravityEmail;
+  if (key === 'rotateAntigravityAccountOnQuotaLimit') return rotateAntigravityAccountOnQuotaLimit;
   if (key === 'isCodexAppCliId') return isCodexAppCliId;
   if (key === 'executionObserverSupported') return executionObserverSupported;
   if (key === 'contractTerminalStatus') return contractTerminalStatus;
