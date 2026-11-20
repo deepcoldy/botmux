@@ -124,6 +124,7 @@ import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-res
 import { countHostOverload } from './im/lark/card-handler.js';
 import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
+import { createBotmuxUpdateNotifier, buildBotmuxUpdateNoticeCard } from './core/botmux-update-notify.js';
 import {
   selectCodexRuntimeUpdateTargets,
   startCliRuntimeUpdateMonitor,
@@ -692,7 +693,7 @@ import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-cre
 import { validateRoleLibraryPath } from './core/role-library.js';
 import { assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
 import { dispatchConsentCardAvailable } from './im/lark/client.js';
-import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
+import { authorityForDispatch, resolveDispatchSenderUnionId, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
@@ -7337,6 +7338,7 @@ async function submitQueuedMessage(
     senderOpenId: message.senderId,
     participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
     inThread: !!message.threadId,
+    sourceMessageId: message.messageId,
   });
   await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
   // Identity refresh and reaction delivery both await external work.
@@ -9856,7 +9858,9 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           allowSelfManage: delegationPolicy?.selfManageEnabled === true,
         },
       } : {}),
-      resolveUnionId: resolveUnionIdFromOpenId,
+      resolveUnionId: (appId, openId) => resolveDispatchSenderUnionId(
+        ds.session, turnId, appId, openId, resolveMessageSenderUnionId, resolveUnionIdFromOpenId,
+      ),
     }) : undefined;
     if (serviceGrant) {
       const sponsor = await resolveTargetAppOpenId(ds.larkAppId, serviceGrant.controllerUnionId);
@@ -10115,7 +10119,9 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
       inherited: inherited?.authority,
       tools: [...new Set([...bot.triggerUserAuth!.tools, ...dispatchOnlyTools])],
-      resolveUnionId: resolveUnionIdFromOpenId,
+      resolveUnionId: (appId, openId) => resolveDispatchSenderUnionId(
+        ds.session, turnId, appId, openId, resolveMessageSenderUnionId, resolveUnionIdFromOpenId,
+      ),
     });
     if (!authority) {
       if (inherited) return skip('no_shared_tool');
@@ -26746,6 +26752,8 @@ function deliverPassthroughToExistingSession(
       participants: passthroughWindow.participants,
       participantsIncomplete: passthroughWindow.incomplete,
       inThread: turn.inThread,
+      // A cascade's derived turnId is not a Lark message id; keep the exact inbound id.
+      sourceMessageId: turn.messageId,
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
@@ -37530,8 +37538,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // it must NOT own host-wide fleet maintenance — auto-update could rewrite the
   // global botmux install and a detached `botmux restart` would tear down the
   // real fleet. Core-only manages only its own single process.
+  const botmuxUpdateNotifier = createBotmuxUpdateNotifier({
+    dataDir: config.session.dataDir,
+    larkAppId: cfg.larkAppId,
+    enabled: () => readGlobalConfig().maintenance?.notifyOnNewVersion === true,
+    ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+    send: async (notice, beforeWrite) => {
+      const card = buildBotmuxUpdateNoticeCard(notice, {
+        dashboardUrl: dashboardUrlForReport().url,
+        locale: localeForBot(cfg.larkAppId),
+      });
+      await sendUserMessage(cfg.larkAppId, notice.ownerOpenId, card, 'interactive', notice.uuid,
+        { timeoutMs: 15_000 }, { beforeWrite });
+    },
+    log: message => logger.info(`[botmux-update] ${message}`),
+  });
   if (idx === 0 && !coreOnly) {
     startMaintenance();
+    botmuxUpdateNotifier.start();
     startCliRuntimeUpdateMonitor({
       dataDir: config.session.dataDir,
       primaryLarkAppId: cfg.larkAppId,
@@ -37897,6 +37921,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     await (await import('./services/constrained-invocation/daemon.js')).closeConstrainedInvocations();
     await waitAllWithin([stopInputCaptureRuntimes()], shutdownDeadlineMs);
     stopMaintenance();
+    botmuxUpdateNotifier.stop();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
     for (const timer of vcMeetingReceiverRecoveryTimers.values()) clearTimeout(timer);

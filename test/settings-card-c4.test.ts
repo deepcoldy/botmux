@@ -686,3 +686,11 @@ describe('handleDashboardCommand dispatches settings to real handler', () => {
   // canonical module slug. Unknown-module fallback semantics are covered by
   // the help-text path in dashboard-command-c1.test.ts.
 });
+
+
+describe('version reminder card actions', () => {
+  it.each(['true', 'false'])('writes the boolean maintenance switch: %s', next => {
+    expect(buildPatchFromAction(SETTINGS_ACTION_TOGGLE, { field: 'notifyOnNewVersion', next_value: next }, {}))
+      .toEqual({ ok: true, value: { maintenance: { notifyOnNewVersion: next === 'true' } } });
+  });
+});
