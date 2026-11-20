@@ -1068,7 +1068,7 @@ type RolloutHeaderCheck =
   | { verified: true; sid: string | null; internal: boolean }
   | { verified: false };
 
-function rolloutHeaderCheck(path: string, noFollow = false): RolloutHeaderCheck {
+export function rolloutHeaderCheck(path: string, noFollow = false): RolloutHeaderCheck {
   let fd: number | undefined;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | (noFollow ? constants.O_NOFOLLOW : 0));

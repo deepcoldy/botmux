@@ -26,6 +26,7 @@ import { readFileSync } from 'node:fs';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import {
   parseStatuslinePayload,
+  STATUSLINE_WRITE_DEDUPE_MS,
   statuslineFilePath,
   writeStatuslineSnapshot,
   type StatuslineSnapshot,
@@ -39,7 +40,7 @@ const STATUSLINE_CHAIN_KILL_GRACE_MS = 1000;
  * 快照完全相同；跳过重写省掉 mkdir + tmp/fsync/rename。必须远小于读端的
  * STATUSLINE_STALE_MS（10 min），否则空闲会话的快照会被误判陈旧。
  */
-export const STATUSLINE_DEDUPE_MS = 30_000;
+export const STATUSLINE_DEDUPE_MS = STATUSLINE_WRITE_DEDUPE_MS;
 
 /**
  * statusline 命令前缀里注入的 Bun/JSC 线程限制（见 hook-command.ts statuslineHookCommand）。
@@ -70,14 +71,45 @@ async function readStdinWithTimeout(ms: number): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-function contentKey(snap: Partial<StatuslineSnapshot>): string {
+const RELATIVE_RESET_JITTER_MS = 1000;
+
+function contentKey(
+  snap: Partial<StatuslineSnapshot>,
+  ignoreFiveHourReset = false,
+  ignoreSevenDayReset = false,
+): string {
   const { ts: _ts, ...rest } = snap;
+  if (ignoreFiveHourReset) delete rest.fiveHourResetsAtMs;
+  if (ignoreSevenDayReset) delete rest.sevenDayResetsAtMs;
   return JSON.stringify(Object.keys(rest).sort().map(k => [k, (rest as Record<string, unknown>)[k]]));
 }
 
 /**
- * 盘上已有快照与新快照内容（除 ts 外全部字段）一致，且盘上那份写于 dedupeMs 之内 ⇒
- * 不必重写。读不到 / 损坏 / 时钟回拨（prev.ts 在未来）⇒ 照写。
+ * 仅由相对 `reset_in_seconds` 派生的 `resetsAtMs` 会在相同原始帧反复解析（平移 +age）
+ * 或整数秒倒计时（±1s 抖动）间变化。满足以下条件时视为同一重置窗口，不绕过 30s 去重：
+ *  1. 双方均有有限毫秒值；
+ *  2. 在 `nextTs` 时刻的过期态一致（防止盘上已过期而新帧仍活跃，或盘上未过期而新帧已到期）；
+ *  3. 若双方均未过期，`nextReset` 落在 `[prevReset - 1s, prevReset + age + 1s]` 内。
+ */
+function relativeResetEquivalent(
+  prevReset: unknown,
+  nextReset: number | undefined,
+  nextTs: number,
+  age: number,
+): boolean {
+  if (typeof prevReset !== 'number' || !Number.isFinite(prevReset) || prevReset <= 0) return false;
+  if (typeof nextReset !== 'number' || !Number.isFinite(nextReset) || nextReset <= 0) return false;
+  const prevExpiredAtNext = prevReset <= nextTs;
+  const nextExpiredAtNext = nextReset <= nextTs;
+  if (prevExpiredAtNext !== nextExpiredAtNext) return false;
+  if (prevExpiredAtNext && nextExpiredAtNext) return true;
+  return nextReset >= prevReset - RELATIVE_RESET_JITTER_MS
+    && nextReset <= prevReset + age + RELATIVE_RESET_JITTER_MS;
+}
+
+/**
+ * 盘上已有快照与新快照内容（除 ts 与相对 reset_in_seconds 的合理时间平移外）一致，
+ * 且盘上那份写于 dedupeMs 之内 ⇒ 不必重写。读不到 / 损坏 / 时钟回拨（prev.ts 在未来）⇒ 照写。
  */
 export function shouldSkipStatuslineWrite(
   prevRaw: string | undefined,
@@ -88,16 +120,28 @@ export function shouldSkipStatuslineWrite(
   let prev: unknown;
   try { prev = JSON.parse(prevRaw); } catch { return false; }
   if (!prev || typeof prev !== 'object' || Array.isArray(prev)) return false;
-  const prevTs = (prev as { ts?: unknown }).ts;
+  const prevSnap = prev as Partial<StatuslineSnapshot>;
+  const prevTs = prevSnap.ts;
   if (typeof prevTs !== 'number' || !Number.isFinite(prevTs)) return false;
   const age = next.ts - prevTs;
   if (age < 0 || age >= dedupeMs) return false;
-  return contentKey(prev as StatuslineSnapshot) === contentKey(next);
+  const ignoreFiveHourReset = prevSnap.fiveHourResetRelative === true && next.fiveHourResetRelative === true;
+  const ignoreSevenDayReset = prevSnap.sevenDayResetRelative === true && next.sevenDayResetRelative === true;
+  if (ignoreFiveHourReset && !relativeResetEquivalent(prevSnap.fiveHourResetsAtMs, next.fiveHourResetsAtMs, next.ts, age)) {
+    return false;
+  }
+  if (ignoreSevenDayReset && !relativeResetEquivalent(prevSnap.sevenDayResetsAtMs, next.sevenDayResetsAtMs, next.ts, age)) {
+    return false;
+  }
+  return contentKey(prevSnap, ignoreFiveHourReset, ignoreSevenDayReset)
+    === contentKey(next, ignoreFiveHourReset, ignoreSevenDayReset);
 }
 
 function persistSnapshot(raw: Buffer, sessionId: string): void {
   const snap = parseStatuslinePayload(JSON.parse(raw.toString('utf-8')));
   if (!snap) return;
+  const launchGen = process.env.BOTMUX_STATUSLINE_GEN?.trim();
+  if (launchGen) snap.launchGen = launchGen;
   const dataDir = resolveBotmuxDataDir();
   let prevRaw: string | undefined;
   try { prevRaw = readFileSync(statuslineFilePath(dataDir, sessionId), 'utf-8'); } catch { /* 首次 / 不可读 */ }

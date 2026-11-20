@@ -173,6 +173,22 @@ botmux term-link [id]
 
 Gets a writable Web terminal for a session. The link isn't printed in the terminal; the daemon sends it to the bot owner as a private card (only you can see it in a group; in topics or direct chats it falls back to a direct message). You can omit `id` when there's only one active session. See [Web Terminal](/en/web-terminal).
 
+## Post a message from a host shell
+
+CI jobs, alerting systems, and external agents can use `botmux post` to deliver text they already have. Select a running bot by App ID and provide a destination. The command needs no session ID and starts no AI session.
+
+```bash
+botmux post --bot cli_xxx --chat-id oc_xxx --request-id build_12345 --text "Build complete"
+botmux post --bot cli_xxx --chat-id oc_xxx --into om_xxx --text-file ./result.txt
+printf '%s\n' "Manual action required" | botmux post --bot cli_xxx --user-open-id ou_xxx --text-file -
+```
+
+Run the command in a trusted host shell with access to the local Botmux daemon. The bot must already be in the group. For a topic, supply its group ID and root message ID (`om_…`). For a direct message, use the recipient's `open_id` in the sending bot's app scope. Lark must allow that bot to reach the recipient. Use `--text` or `--text-file` for up to 8192 UTF-8 bytes.
+
+`--bot` accepts a Feishu App ID starting with `cli_`. CI and alerting systems should pass a stable event ID with `--request-id` (8–64 letters, digits, underscores or hyphens). The CLI generates an ID when omitted. A successful JSON receipt on stdout includes `requestId`, `messageId`, `replayed`, the bot and the destination. Group posts share deduplication records with the request-bound group API.
+
+Invalid arguments exit with status 2. Delivery errors exit with status 1 and a JSON error on stderr. A timeout, interrupted connection or unverifiable receipt returns `outcome_unknown`; the message may already be visible. When `retryable` is true, retry within 50 minutes of the first attempt using the same bot, destination, text and request ID. An unresolved attempt past that window returns `retryable: false` and needs manual verification. Reusing the ID with different text returns `request_conflict`. While a definite first rejection is retained, retrying the original text replays that `send_failed`. Use a new request ID for corrected text. Completed requests replay the original message ID for as long as their record is retained in the bounded archive.
+
 ## Dashboard login link
 
 ```bash
@@ -354,3 +370,9 @@ Filters apply only within the fetched `--limit` window. `--since` is inclusive a
 `botmux worker-budget status` shows available memory, the reserve, the memory PSI limit, and whether worker startup is allowed. Background recovery failures are logged and batched into a DM to the bot owner. A rejected current request receives only a brief unavailable status in its conversation.
 
 Owner DMs are batched per bot over 2 seconds and count distinct affected sessions. Each bot/owner pair attempts at most one DM every 5 minutes, with a cooldown that survives daemon restarts. Failed sends also enter cooldown; a later rejection can trigger another attempt after it expires. An unresolved owner is logged. If the cooldown cannot be persisted, deduplication falls back to the current process. These notifications are independent of the optional Dashboard host overload monitor.
+
+## Background Recovery Diagnostics
+
+Process-start and DNS/runtime preparation failures during background recovery are batched into a DM to the bot's current owner. A current request receives only a brief unavailable status. Pi installation changes also notify the owner while retaining suspension after the current task settles and cold-starting on the new version for the next input. Startup, installation and memory alerts have independent 2-second batching windows and 5-minute cooldowns.
+
+Mojo lineage-quarantine and legacy-configuration notices remain pending through blank recovery and owner-only historical input replay. They are delivered only after a nonempty input with an explicit turn is accepted. A rejected input or failed notice delivery keeps the pending marker for a later input. Silent tasks, meeting receivers and sessions without an IM transport retain their existing output restrictions.

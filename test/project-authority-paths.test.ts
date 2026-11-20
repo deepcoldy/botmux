@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { join } from 'node:path';
-import { projectAuthorityPaths } from '../src/services/project-authority-paths.js';
+import { hostAuthorityPaths } from '../src/services/project-authority-paths.js';
 import {
   buildCredentialIsolationRules, buildSeatbeltProfile,
 } from '../src/adapters/cli/read-isolation.js';
@@ -10,11 +10,11 @@ import {
 import { buildCredentialOnlySandboxArgs } from '../src/adapters/backend/sandbox.js';
 
 const HOME = '/home/project-fixture', DATA = `${HOME}/.botmux/data`;
-const paths = projectAuthorityPaths(DATA);
+const paths = hostAuthorityPaths(DATA);
 const leaves = paths.map(path => `${path}/host-authority.json`);
 
 function policyContext(platform: 'linux' | 'darwin', dataDir = DATA): FsPolicyContext {
-  const denyPaths = projectAuthorityPaths(dataDir);
+  const denyPaths = hostAuthorityPaths(dataDir);
   return {
     platform, homeDir: HOME, botmuxHome: `${HOME}/.botmux`, sessionDataDir: dataDir,
     sessionId: 'project-session', currentAppId: 'cli_project_self',
@@ -29,10 +29,11 @@ function policyContext(platform: 'linux' | 'darwin', dataDir = DATA): FsPolicyCo
 describe('project authority directory isolation', () => {
   it.each(['/home/project-fixture/.botmux/data/', '/srv/custom-project-state', '/data'])(
     'derives all authority under the exact configured data directory %s', dataDir => {
-      expect(projectAuthorityPaths(dataDir)).toEqual([
+      expect(hostAuthorityPaths(dataDir)).toEqual([
         join(dataDir, '.dashboard-secret.project-attachments'),
         join(dataDir, '.dashboard-secret.project-source-grants'),
         join(dataDir, '.dashboard-secret.project-imports'),
+        join(dataDir, '.dashboard-secret.dispatch-task-decisions'),
       ]);
     },
   );
@@ -70,7 +71,7 @@ describe('project authority directory isolation', () => {
   });
 
   it('keeps custom data authority outside Home explicitly denied in credential-only policy', () => {
-    const custom = projectAuthorityPaths('/srv/custom-project-state');
+    const custom = hostAuthorityPaths('/srv/custom-project-state');
     const rules = buildCredentialIsolationRules({
       homeDir: HOME, botmuxHome: `${HOME}/.botmux`,
     }, custom);
@@ -101,7 +102,7 @@ describe('project authority directory isolation', () => {
       const context = policyContext(platform, dataDir);
       context.userPaths!.readWrite!.push(dataDir);
       const policy = buildFsPolicy(context);
-      for (const path of projectAuthorityPaths(dataDir)) {
+      for (const path of hostAuthorityPaths(dataDir)) {
         expect(accessForPath(policy.rules, `${path}/grant.json`).access).toBe('deny');
       }
     },
@@ -114,7 +115,7 @@ describe('project authority directory isolation', () => {
     const compiled = compileToBwrap(buildFsPolicy(context), {
       emptyDir: '/sandbox-empty', emptiesDir: '/sandbox-empty-files', chdir: HOME,
     });
-    for (const path of projectAuthorityPaths(dataDir)) {
+    for (const path of hostAuthorityPaths(dataDir)) {
       expect(compiled.maskMounts).toContainEqual({ path, kind: 'dir' });
       const index = compiled.args.indexOf(path);
       expect(compiled.args.slice(index - 2, index)).toEqual(['--ro-bind', '/sandbox-empty']);

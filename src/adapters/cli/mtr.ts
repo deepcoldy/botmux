@@ -57,8 +57,8 @@ export function createMtrAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
-    // `--prompt` bakes the full first prompt into argv. Same tmux ceiling as
-    // OpenCode/Cursor; over-limit prompts defer to the post-start queue.
+    // `--prompt` bakes the full first prompt into argv. Keep the historical
+    // OpenCode/Cursor budget so over-limit prompts use the post-start queue.
     maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
     writeInput: writeTextThenEnter,

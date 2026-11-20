@@ -18,7 +18,8 @@ const fakeClient = {
   request: vi.fn(async () => ({ code: 0 })),
   im: {
     v1: {
-      message: { create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_x' } })), patch: vi.fn(async () => ({ code: 0 })), forward: vi.fn(async () => ({ code: 0, data: { message_id: 'om_fwd' } })) },
+      message: { create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_x' } })), patch: vi.fn(async () => ({ code: 0 })), forward: vi.fn(async () => ({ code: 0, data: { message_id: 'om_fwd' } })),
+        delete: vi.fn(async () => ({ code: 0 })) },
       pin: { create: vi.fn(async () => ({ code: 0 })), delete: vi.fn(async () => ({ code: 0 })) },
       messageReaction: { create: vi.fn(async () => ({ code: 0, data: { reaction_id: 'r' } })), delete: vi.fn(async () => ({ code: 0 })) },
     },
@@ -63,6 +64,7 @@ import {
   deleteEphemeralCard, uploadImage, uploadFile,
   LarkTransportDisabledError,
 } from '../src/im/lark/client.js';
+import { LARK_CODE_EPHEMERAL_DELETED, LARK_CODE_MESSAGE_DELETED, LARK_CODE_MESSAGE_RECALL_EXPIRED } from '../src/im/lark/lark-errors.js';
 
 const APIONLY = 'local_riff';
 const NORMAL = 'app_normal';
@@ -103,6 +105,34 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
     await expect(deleteEphemeralCard(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(uploadImage(APIONLY, '/tmp/none.png')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(uploadFile(APIONLY, '/tmp/none.bin')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+  });
+
+  it.each([
+    [deleteMessage, fakeClient.im.v1.message.delete, LARK_CODE_MESSAGE_DELETED],
+    [deleteEphemeralCard, fakeClient.request, LARK_CODE_EPHEMERAL_DELETED],
+  ] as const)('settles a confirmed recall after the previous response was lost (%#)', async (remove, request, code) => {
+    getBotMock.mockReturnValue(bot(false));
+    const withdrawn = { code };
+    const options = { acceptWithdrawn: true };
+    request.mockResolvedValueOnce(withdrawn);
+    await expect(remove(NORMAL, 'om')).resolves.toBe(false);
+    request.mockResolvedValueOnce(withdrawn);
+    await expect(remove(NORMAL, 'om', options)).resolves.toBe(true);
+    request.mockRejectedValueOnce({ response: { data: withdrawn } });
+    await expect(remove(NORMAL, 'om', options)).resolves.toBe(true);
+    request.mockRejectedValueOnce(new Error('connection lost'));
+    await expect(remove(NORMAL, 'om', options)).resolves.toBe(false);
+  });
+
+  it('allows a caller to replace a card only when the platform says the recall window expired', async () => {
+    getBotMock.mockReturnValue(bot(false));
+    const onRecallExpired = vi.fn(async () => {});
+    fakeClient.im.v1.message.delete.mockRejectedValueOnce(new Error('connection lost'));
+    await expect(deleteMessage(NORMAL, 'om', { onRecallExpired })).resolves.toBe(false);
+    expect(onRecallExpired).not.toHaveBeenCalled();
+    fakeClient.im.v1.message.delete.mockResolvedValueOnce({ code: LARK_CODE_MESSAGE_RECALL_EXPIRED });
+    await expect(deleteMessage(NORMAL, 'om', { onRecallExpired })).resolves.toBe(true);
+    expect(onRecallExpired).toHaveBeenCalledOnce();
   });
 
   it('a normal bot is unaffected — sendMessage/updateMessage proceed to the client', async () => {

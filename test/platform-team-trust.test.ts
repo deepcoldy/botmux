@@ -16,8 +16,12 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 import { config } from '../src/config.js';
 import { registerBot } from '../src/bot-registry.js';
-import { canOperate, evaluateBotTalk, evaluateTalk, isTrustedTeamBotSender, learnTeamBotFromGroupMessage } from '../src/im/lark/event-dispatcher.js';
+import { canOperate, canOperateBotSender, canRunDaemonCommand, evaluateBotTalk, evaluateTalk, isTrustedTeamBotSender, learnTeamBotFromGroupMessage } from '../src/im/lark/event-dispatcher.js';
 import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
+import { cardClickOperatorIsBotOrApp } from '../src/services/card-click-turn-bind.js';
+import { resolveDashboardScheduleCreator } from '../src/core/dashboard-schedule-creator.js';
+import { resolveDashboardWorkflowInitiator } from '../src/core/workflow-initiator.js';
+import { resolvePluginCardPrivileges } from '../src/core/plugins/card-actions/privileges.js';
 import { isTeamBot, recordTeamBot } from '../src/services/team-bots-store.js';
 import { recordTeamGroup } from '../src/services/team-groups-store.js';
 
@@ -209,5 +213,96 @@ describe('platform roster trust is scoped to the RECEIVING bot (same team or sam
     writeLocalBots(['pf1', 'cli_local']);
     expect(evaluateTalk('pf1', 'oc_public', 'ou_local', 'on_local').allowed).toBe(true);
     expect(evaluateTalk('pf1', 'oc_public', 'ou_remote', 'on_remote').allowed).toBe(false);
+  });
+});
+
+// 外部机器人：appId / unionId 都是成员手填的。同队 union 信任必须同时拿到飞书盖章、
+// 且与名册 appId 精确相等的发送方 appId；缺字段或错配都 fail-closed。团队群 chat 腿不变。
+describe('external bots in the platform roster', () => {
+  function seedExternalTeam(): void {
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-ext1',
+      teams: [{ teamId: 't1', teamName: 'T1', groupChatIds: ['oc_t1_hall'], bots: [{ appId: 'pf1', unionId: 'on_pf1' }, { appId: 'cli_ext', unionId: 'on_ext', name: 'Ext', external: true }], memberUnionIds: [] }],
+    });
+  }
+
+  it('trusts an external bot only when the Lark-stamped sender appId pairs with its union_id', () => {
+    seedExternalTeam();
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_ext', 'on_ext', 'cli_ext')).toMatchObject({ allowed: true, reason: 'teamBot' });
+    expect(canOperateBotSender('pf1', 'oc_public', 'ou_ext', 'on_ext', 'cli_ext')).toBe(true);
+    expect(canRunDaemonCommand('pf1', 'oc_public', 'ou_ext', 'on_ext', '/restart', undefined, 'group', true, true, 'cli_ext')).toBe(true);
+
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_ext', 'on_ext').allowed).toBe(false);
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_ext', 'on_ext', 'cli_other').allowed).toBe(false);
+    expect(canOperate('pf1', 'oc_public', 'ou_ext', 'on_ext')).toBe(false);
+    expect(canOperateBotSender('pf1', 'oc_public', 'ou_ext', 'on_ext', 'cli_other')).toBe(false);
+    expect(canRunDaemonCommand('pf1', 'oc_public', 'ou_ext', 'on_ext', '/restart', undefined, 'group', true, true, 'cli_other')).toBe(false);
+  });
+
+  it('keeps the team-group first-contact leg when appId is absent', () => {
+    seedExternalTeam();
+    expect(evaluateBotTalk('pf1', 'oc_t1_hall', 'ou_ext', 'on_ext')).toMatchObject({ allowed: true, reason: 'teamBot' });
+    expect(isTrustedTeamBotSender(dataDir, 'pf1', 'oc_t1_hall', 'on_ext')).toBe(true);
+  });
+
+  it('does not let a human union in an external entry pass generic operate or Dashboard schedule creation', async () => {
+    seedExternalTeam();
+    expect(canOperate('pf1', 'oc_public', 'ou_human', 'on_ext')).toBe(false);
+    const creator = await resolveDashboardScheduleCreator({
+      appId: 'pf1', chatId: 'oc_public', unionId: 'on_ext',
+      resolveOpenId: async () => 'ou_human',
+      canOperate,
+    });
+    expect(creator).toEqual({ ok: false, reason: 'cannot_operate' });
+
+    const workflow = await resolveDashboardWorkflowInitiator(
+      { source: 'dashboard-platform', unionId: 'on_ext' },
+      {
+        appId: 'pf1', featureEnabled: true, trustedHost: true,
+        ownerOpenId: () => 'ou_owner',
+        resolveOpenId: async () => ({ status: 'resolved', openId: 'ou_human' }),
+        canOperate: (appId, openId, unionId) => canOperate(appId, 'oc_public', openId, unionId),
+      },
+    );
+    expect(workflow).toMatchObject({ ok: false, error: 'cannot_operate' });
+
+    await expect(resolvePluginCardPrivileges('pf1', {
+      operator: { open_id: 'ou_human', union_id: 'on_ext' },
+      context: { open_chat_id: 'oc_public' },
+      action: { value: {} },
+    })).resolves.toEqual({ canOperate: false, canTalk: false });
+  });
+
+  it('does not treat an unverified external union as non-human evidence for card clicks', () => {
+    seedExternalTeam();
+    expect(cardClickOperatorIsBotOrApp(dataDir, 'pf1', 'ou_human', 'on_ext')).toBe(false);
+  });
+
+  it('an external entry carrying a LOCAL bot\'s appId does not open the same-machine leg', () => {
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-ext2',
+      teams: [{ teamId: 't2', teamName: 'T2', groupChatIds: [], bots: [{ appId: 'cli_local', unionId: 'on_chosen', external: true }], memberUnionIds: [] }],
+    });
+    writeLocalBots(['pf1', 'cli_local']);
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_chosen', 'on_chosen', 'cli_local').allowed).toBe(false);
+    expect(canOperateBotSender('pf1', 'oc_public', 'ou_chosen', 'on_chosen', 'cli_local')).toBe(false);
+  });
+
+  it('an external entry carrying the RECEIVER\'s appId does not make the receiver a team member', () => {
+    applyPlatformTeamSync(dataDir, {
+      rev: 'r-ext3',
+      teams: [{
+        teamId: 't3', teamName: 'T3', groupChatIds: ['oc_t3_hall'],
+        bots: [{ appId: 'pf1', unionId: 'on_pf1_claimed', external: true }, { appId: 'cli_remote', unionId: 'on_remote' }],
+        memberUnionIds: ['on_t3_member'],
+      }],
+    });
+    // 同队腿：pf1 并不真在 T3
+    expect(evaluateBotTalk('pf1', 'oc_public', 'ou_remote', 'on_remote').allowed).toBe(false);
+    expect(canOperate('pf1', 'oc_public', 'ou_remote', 'on_remote')).toBe(false);
+    // 团队群首次接触腿
+    expect(evaluateBotTalk('pf1', 'oc_t3_hall', 'ou_fresh', 'on_fresh').allowed).toBe(false);
+    // 真人成员腿
+    expect(evaluateTalk('pf1', 'oc_public', 'ou_m', undefined, 'on_t3_member').allowed).toBe(false);
   });
 });

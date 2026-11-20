@@ -36,7 +36,7 @@ import type { TmuxVersion } from '../../setup/ensure-tmux.js';
 import { stripAnsiForLog, tailChars } from '../../utils/crash-log.js';
 import { inheritBotEnv } from '../../core/env-policy.js';
 import { strictPaneCommand } from './strict-env.js';
-import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError } from './tmux-backend.js';
+import { buildBotmuxEnvAssignments, resolveUserShell, shellWrapperScript, shellCommandArgv, shellKindForPath, TmuxBackend, isTmuxServerLevelErrorText, isExecTimeoutError, classifyTmuxCaptureError } from './tmux-backend.js';
 import {
   assertTmuxCommandFits,
   paneLaunchLoader,
@@ -52,6 +52,8 @@ import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
 import { readUnreapedPaneExit, type UnreapedPaneExit } from './unreaped-pane-exit.js';
 import { pipePaneShellCommand } from './tmux-pipe-relay.js';
 import { createTmuxBootGate } from './tmux-anti-fork.js';
+import { parseCapturedScreenRows } from '../../utils/captured-screen-rows.js';
+import type { ScreenRow } from '../../utils/terminal-cells.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
@@ -901,6 +903,8 @@ export class TmuxPipeBackend implements SessionBackend {
   /** State of the last lifecycle probe (drives the cadence after a setback). */
   private lastProbeState: SessionProbe = 'exists';
   private lastUnknownProbeLogAt = 0;
+  private lastCaptureErrorKey = '';
+  private lastCaptureErrorLogAt = 0;
   /** Debounce authoritative pane-missing replies. Probe timeouts / EMFILE /
    *  spawn failures are classified as unknown and never enter this destructive
    *  counter. (Adopted CLI pid-death stays decisive.) */
@@ -1661,6 +1665,10 @@ export class TmuxPipeBackend implements SessionBackend {
   }
 
   getChildPid(): number | null {
+    return this.getStablePanePid();
+  }
+
+  getStablePanePid(): number | null {
     try {
       const out = execSync(
         `${this.tmuxCmd} display-message -p -t ${shellescape(this.paneTarget)} '#{pane_pid}'`,
@@ -2721,8 +2729,10 @@ export class TmuxPipeBackend implements SessionBackend {
         encoding: 'utf8', timeout: 1_000, killSignal: 'SIGKILL',
         maxBuffer: 1024 * 1024, env: tmuxEnv(),
       }, (error, stdout) => {
-        if (error) reject(error);
-        else resolve(this.exited ? '' : stdout);
+        if (error) {
+          this.noteCaptureError(error);
+          reject(error);
+        } else resolve(this.exited ? '' : stdout);
       });
     });
   }
@@ -2751,6 +2761,42 @@ export class TmuxPipeBackend implements SessionBackend {
     }
   }
 
+  /** The pane's viewport as cells, read now (see SessionBackend). One
+   * synchronous `capture-pane -e -p`: tmux's own grid at the pane's real size,
+   * so a web terminal that resized the pane cannot skew it. Never the pipe
+   * renderer: tmux can repaint before the worker has consumed the matching
+   * FIFO bytes. */
+  captureViewportCells(): ScreenRow[] | null {
+    if (this.exited) return null;
+    try {
+      const raw = execFileSync(
+        'tmux', [...this.tmuxArgs, 'capture-pane', '-e', '-p', '-t', this.paneTarget],
+        {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 2000,
+          maxBuffer: 16 * 1024 * 1024,
+          env: tmuxEnv(),
+        },
+      );
+      const rows = parseCapturedScreenRows(raw);
+      return rows.length > 0 ? rows : null;
+    } catch (err) {
+      this.noteCaptureError(err);
+      return null;
+    }
+  }
+
+  private noteCaptureError(err: unknown): void {
+    const { kind, detail } = classifyTmuxCaptureError(err);
+    const key = `${kind}:${detail}`;
+    const now = Date.now();
+    if (key === this.lastCaptureErrorKey && now - this.lastCaptureErrorLogAt < 30_000) return;
+    this.lastCaptureErrorKey = key;
+    this.lastCaptureErrorLogAt = now;
+    process.stderr.write(`[tmux-pipe-backend] capture failed (kind=${kind}, socket=${this.socketName ?? 'default'}, target=${this.paneTarget}): ${detail}\n`);
+  }
+
   private captureWithBounds(bounds: string, opts?: { restoreCursor?: boolean }): string {
     if (this.exited) return '';
     try {
@@ -2775,7 +2821,8 @@ export class TmuxPipeBackend implements SessionBackend {
         return `\x1b[?1049h\x1b[H\x1b[2J${body}`;
       }
       return body;
-    } catch {
+    } catch (err) {
+      this.noteCaptureError(err);
       return '';
     }
   }
