@@ -37,7 +37,7 @@ import { downloadMessageResource } from '../src/im/lark/client.js';
 
 /** Pipe-only v1 readable: pipe/on/emit, no async iterator. destroy() honours the
  *  real-stream contract — it stops production and drops its listeners. */
-function pipeOnlySource() {
+function pipeOnlySource(opts: { destroyThrows?: boolean } = {}) {
   const s = new EventEmitter() as EventEmitter & {
     readable: boolean;
     pipe: (dest: any) => unknown;
@@ -54,6 +54,7 @@ function pipeOnlySource() {
   s.destroy = () => {
     destroyCalls++;
     clearInterval(timer);
+    if (opts.destroyThrows) throw new Error('socket already closed');
     s.removeAllListeners();
     s.emit('close');
     return s;
@@ -94,5 +95,25 @@ describe('a failed legacy download cancels its source stream', () => {
     expect(source.destroyed()).toBe(true);
     expect(source.dataListeners()).toBe(0);
     expect(fs.readdirSync(dir).filter(name => name.endsWith('.part'))).toEqual([]);
+  });
+
+  it('keeps the original download error when source destroy also fails', async () => {
+    const dir = join(root, 'attachments', 'cli_test', 'om_teardown');
+    fs.mkdirSync(dir, { recursive: true });
+    const savePath = join(dir, 'b.bin');
+    const source = pipeOnlySource({ destroyThrows: true });
+    mocks.request.mockResolvedValueOnce({ getReadableStream: () => source.stream });
+    failNextWrite.armed = true;
+
+    // allowUserTokenFallback:false makes the app-token error propagate instead
+    // of being re-wrapped by the user-token fallback, so the exact reason the
+    // caller classifies on is observable.
+    await expect(downloadMessageResource(
+      'cli_test', 'om_teardown', 'file_k', 'file', savePath, undefined,
+      { withinRoot: join(root, 'attachments'), allowUserTokenFallback: false },
+    )).rejects.toMatchObject({ code: 'ENOSPC' });
+
+    // Cancellation was still attempted even though it threw.
+    expect(source.destroyed()).toBe(true);
   });
 });

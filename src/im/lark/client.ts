@@ -2211,7 +2211,17 @@ async function writeResourceToDisk(res: any, savePath: string, guard?: DownloadD
       // download already rejects with the original reason, and a sourced 'error'
       // event without a listener could itself crash the process. Idempotent for
       // modern streams, whose iterator return already destroyed them.
-      if (typeof stream.destroy === 'function') stream.destroy();
+      //
+      // Teardown must run inside its own guard: a throwing destroy() (e.g. an
+      // already-closed socket) would otherwise replace the real download error,
+      // changing caller-side classification, the user-token fallback and the
+      // user-visible diagnostic. The original error is always what propagates.
+      try {
+        if (typeof stream.destroy === 'function') stream.destroy();
+      } catch (teardownError) {
+        logger.debug(`resource download: source destroy after failure was ignored: ${
+          teardownError instanceof Error ? teardownError.message : String(teardownError)}`);
+      }
       throw error;
     }
   }, guard);
