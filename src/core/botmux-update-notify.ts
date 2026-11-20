@@ -22,10 +22,21 @@ export interface BotmuxUpdateNotice {
   uuid: string;
 }
 
+export interface BotmuxUpdatePending {
+  version: string;
+  uuid: string;
+  createdAt: number;
+  /** Durable start of the uncertainty window. Fresh records use the first
+   *  transport-guard passage; pre-existing records retain their original
+   *  createdAt so an upgrade cannot extend the provider's UUID window.
+   *  Its presence means a POST may have landed. */
+  egressStartedAt?: number;
+}
+
 export interface BotmuxUpdateRecipientState {
   nextCheckAt?: number;
   lastNotifiedVersion?: string;
-  pending?: { version: string; uuid: string; createdAt: number };
+  pending?: BotmuxUpdatePending;
 }
 
 export interface BotmuxUpdateNotifyState {
@@ -50,7 +61,9 @@ export function readBotmuxUpdateNotifyState(path: string): BotmuxUpdateNotifySta
       || (value.lastNotifiedVersion !== undefined && !parseVersion(value.lastNotifiedVersion))
       || (value.pending !== undefined && (!value.pending || !parseVersion(value.pending.version)
         || typeof value.pending.uuid !== 'string' || !/^[0-9a-f-]{36}$/.test(value.pending.uuid)
-        || !Number.isFinite(value.pending.createdAt) || value.pending.createdAt < 0))) {
+        || !Number.isFinite(value.pending.createdAt) || value.pending.createdAt < 0
+        || (value.pending.egressStartedAt !== undefined
+          && (!Number.isFinite(value.pending.egressStartedAt) || value.pending.egressStartedAt < 0))))) {
       throw new Error('invalid update notification state');
     }
   }
@@ -94,11 +107,24 @@ export interface BotmuxUpdateNotifyDeps {
   ownerOpenId: () => string | undefined;
   currentVersion?: () => string;
   fetchLatest?: () => Promise<string | null>;
-  /** beforeWrite is rechecked by the transport after every rate-limit/retry wait. */
+  /** beforeWrite is rechecked by the transport after every rate-limit/retry wait;
+   *  its first successful call also records possible provider egress durably. */
   send: (notice: BotmuxUpdateNotice, beforeWrite: () => void) => Promise<void>;
   now?: () => number;
   writeState?: typeof writeBotmuxUpdateNotifyState;
   log?: (message: string) => void;
+}
+
+class UpdateNotificationNotApplicableError extends Error {
+  constructor() { super('update notification no longer applicable'); }
+}
+
+function isDeliveryUncertaintyExpired(pending: BotmuxUpdatePending | undefined, now: number): boolean {
+  // A missing marker on a pre-existing record may come from an older writer
+  // that already POSTed. Stay conservative; only this tick's freshly prepared
+  // record is eligible for the pre-egress rollback below.
+  const uncertaintyStartedAt = pending?.egressStartedAt ?? pending?.createdAt;
+  return uncertaintyStartedAt !== undefined && now - uncertaintyStartedAt >= BOTMUX_UPDATE_DEDUPE_MS;
 }
 
 /** One controller per primary daemon. Disk lock also serializes overlapping processes. */
@@ -136,7 +162,11 @@ export function createBotmuxUpdateNotifier(deps: BotmuxUpdateNotifyDeps) {
         const latest = await (deps.fetchLatest ?? probeBotmuxLatestVersion)();
         if (stopped || !deps.enabled() || deps.ownerOpenId() !== owner) return;
         if (!latest || !parseVersion(latest)) {
-          state.nextCheckAt = now() + BOTMUX_UPDATE_RETRY_MS;
+          const uncertaintyExpired = isDeliveryUncertaintyExpired(state.pending, now());
+          state.nextCheckAt = now() + (uncertaintyExpired ? BOTMUX_UPDATE_CHECK_MS : BOTMUX_UPDATE_RETRY_MS);
+          if (uncertaintyExpired) {
+            deps.log?.(`delivery of v${state.pending!.version} remains uncertain while the version source is unavailable; automatic retry suspended`);
+          }
           write(path, ledger); // Preserve pending UUID across transient lookup failures.
           return;
         }
@@ -146,7 +176,7 @@ export function createBotmuxUpdateNotifier(deps: BotmuxUpdateNotifyDeps) {
         // the window has elapsed the suspension is logged like the same-version
         // path instead of staying silent on every later tick.
         if (state.pending && isNewerVersion(state.pending.version, latest)) {
-          if (now() - state.pending.createdAt < BOTMUX_UPDATE_DEDUPE_MS) {
+          if (!isDeliveryUncertaintyExpired(state.pending, now())) {
             state.nextCheckAt = now() + BOTMUX_UPDATE_RETRY_MS;
           } else {
             deps.log?.(`delivery of v${state.pending.version} remains uncertain while the version source reports v${latest}; automatic retry suspended`);
@@ -159,25 +189,57 @@ export function createBotmuxUpdateNotifier(deps: BotmuxUpdateNotifyDeps) {
           write(path, ledger);
           return;
         }
-        if (state.pending?.version === latest && now() - state.pending.createdAt >= BOTMUX_UPDATE_DEDUPE_MS) {
+        if (state.pending?.version === latest && isDeliveryUncertaintyExpired(state.pending, now())) {
           write(path, ledger);
           deps.log?.(`delivery of v${latest} remains uncertain; automatic retry suspended`);
           return;
         }
-        const beforeWrite = () => {
+        const assertApplicable = () => {
           if (stopped || !deps.enabled() || deps.ownerOpenId() !== owner
             || !parseVersion(currentVersion()) || !isNewerVersion(latest, currentVersion())
-            || (state.pending?.version === latest && now() - state.pending.createdAt >= BOTMUX_UPDATE_DEDUPE_MS)) {
-            throw new Error('update notification no longer applicable');
+            || (state.pending?.version === latest && isDeliveryUncertaintyExpired(state.pending, now()))) {
+            throw new UpdateNotificationNotApplicableError();
           }
         };
-        beforeWrite();
+        assertApplicable();
         // Prepare durably before sending; retries reuse the Lark UUID even if the
         // response or the final ledger write is lost. Lark dedupes UUIDs for 1h.
-        if (state.pending?.version !== latest) state.pending = { version: latest, uuid: randomUUID(), createdAt: now() };
+        const preparedInThisTick = state.pending?.version !== latest;
+        if (preparedInThisTick) state.pending = { version: latest, uuid: randomUUID(), createdAt: now() };
         state.nextCheckAt = now() + BOTMUX_UPDATE_RETRY_MS;
         write(path, ledger);
-        await deps.send({ ownerOpenId: owner, current: currentVersion(), latest, uuid: state.pending.uuid }, beforeWrite);
+        const prepared = state.pending;
+        if (!prepared) throw new Error('update notification pending state missing');
+        const uuid = prepared.uuid;
+        const beforeWrite = () => {
+          assertApplicable();
+          const pending = state.pending;
+          if (!pending || pending.version !== latest || pending.uuid !== uuid) {
+            throw new Error('update notification pending state changed');
+          }
+          if (pending.egressStartedAt === undefined) {
+            // A crash after this durable write is conservatively treated as a
+            // possible delivery, even if the process died before the actual POST.
+            // Backfilling an older record must never extend its original UUID
+            // retention window, so retain createdAt instead of restarting at now.
+            pending.egressStartedAt = preparedInThisTick ? now() : pending.createdAt;
+            write(path, ledger);
+          }
+        };
+        try {
+          await deps.send({ ownerOpenId: owner, current: currentVersion(), latest, uuid }, beforeWrite);
+        } catch (error) {
+          // A guard rejected the very first provider attempt for a record that
+          // this tick created. Only that record is known not to carry a legacy
+          // or mixed-version delivery, so its unused UUID can be rolled back.
+          if (preparedInThisTick && error instanceof UpdateNotificationNotApplicableError
+            && state.pending?.version === latest && state.pending.uuid === uuid
+            && state.pending.egressStartedAt === undefined) {
+            delete state.pending;
+            write(path, ledger);
+          }
+          throw error;
+        }
         state.lastNotifiedVersion = latest;
         delete state.pending;
         state.nextCheckAt = now() + BOTMUX_UPDATE_CHECK_MS;

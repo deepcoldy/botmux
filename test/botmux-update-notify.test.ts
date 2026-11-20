@@ -77,7 +77,7 @@ describe('botmux owner version reminders', () => {
   });
   it('retries failed delivery with its durable UUID without marking it delivered', async () => {
     const send = vi.mocked(deps.send);
-    send.mockRejectedValueOnce(new Error('network'));
+    send.mockImplementationOnce(async (_notice, beforeWrite) => { beforeWrite(); throw new Error('network'); });
     const c = controller(); await c.tick();
     const pending = recipient();
     expect(pending.lastNotifiedVersion).toBeUndefined(); expect(pending.pending?.version).toBe(latest);
@@ -89,7 +89,7 @@ describe('botmux owner version reminders', () => {
   it('reuses the UUID after successful send followed by a failed final state write', async () => {
     let writes = 0;
     deps.writeState = (p, state) => {
-      if (++writes === 2) throw new Error('disk full');
+      if (Object.values(state.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('disk full');
       writeBotmuxUpdateNotifyState(p, state);
     };
     await controller().tick(); await controller().tick();
@@ -97,10 +97,39 @@ describe('botmux owner version reminders', () => {
     expect(calls).toHaveLength(2); expect(calls[1][0].uuid).toBe(calls[0][0].uuid);
     expect(recipient().lastNotifiedVersion).toBe(latest);
   });
+  it('keeps a pre-existing markerless pending conservative across cancellation and restart', async () => {
+    mkdirSync(deps.dataDir);
+    const uuid = '00000000-0000-0000-0000-000000000001';
+    writeBotmuxUpdateNotifyState(path(), { entries: {
+      [JSON.stringify([deps.larkAppId, owner])]: { pending: { version: '1.1.0', uuid, createdAt: clock } },
+    } });
+    deps.send = vi.fn(async (_notice, beforeWrite) => { enabled = false; beforeWrite(); });
+    const c = controller(); await c.tick();
+    expect(recipient().pending?.uuid).toBe(uuid);
+    expect(recipient().pending?.egressStartedAt).toBeUndefined();
+
+    await c.tick(); enabled = true;
+    clock += BOTMUX_UPDATE_DEDUPE_MS;
+    deps.send = vi.fn(async (_notice, beforeWrite) => { beforeWrite(); });
+    await controller().tick();
+    expect(deps.send).not.toHaveBeenCalled();
+    expect(recipient().pending?.uuid).toBe(uuid);
+  });
+  it('reuses the pending UUID after a crash between egress marking and the provider request', async () => {
+    deps.send = vi.fn(async (_notice, beforeWrite) => { beforeWrite(); throw new Error('crash before POST'); });
+    await controller().tick();
+    const pending = recipient().pending;
+    expect(pending?.egressStartedAt).toBeDefined();
+    deps.send = vi.fn(async (_notice, beforeWrite) => { beforeWrite(); });
+    clock += BOTMUX_UPDATE_RETRY_MS;
+    await controller().tick();
+    expect(vi.mocked(deps.send).mock.calls[0][0].uuid).toBe(pending?.uuid);
+    expect(recipient().lastNotifiedVersion).toBe(latest);
+  });
   it('preserves prepared delivery across a temporary lookup outage', async () => {
     let writes = 0;
     deps.writeState = (p, state) => {
-      if (++writes === 2) throw new Error('disk full');
+      if (Object.values(state.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('disk full');
       writeBotmuxUpdateNotifyState(p, state);
     };
     const c = controller(); await c.tick();
@@ -113,7 +142,7 @@ describe('botmux owner version reminders', () => {
   it.each(['1.0.0', '1.1.0'])('preserves a pending newer UUID across a source regression: %s', older => {
     latest = '1.2.0'; let writes = 0;
     deps.writeState = (p, state) => {
-      if (++writes === 2) throw new Error('disk full');
+      if (Object.values(state.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('disk full');
       writeBotmuxUpdateNotifyState(p, state);
     };
     return (async () => {
@@ -150,7 +179,7 @@ describe('botmux owner version reminders', () => {
   it('logs suspension when a version-source regression outlasts the dedupe cutoff', async () => {
     let writes = 0;
     deps.writeState = (p, state) => {
-      if (++writes === 2) throw new Error('disk full');
+      if (Object.values(state.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('disk full');
       writeBotmuxUpdateNotifyState(p, state);
     };
     const c = controller(); await c.tick();
@@ -160,6 +189,20 @@ describe('botmux owner version reminders', () => {
     expect(deps.send).toHaveBeenCalledTimes(1);
     expect(vi.mocked(deps.log)).toHaveBeenCalledWith(expect.stringMatching(/suspended/i));
     expect(recipient().pending?.version).toBe('1.1.0');
+  });
+  it('logs suspension when an unavailable version source outlasts the dedupe cutoff', async () => {
+    let writes = 0;
+    deps.writeState = (p, state) => {
+      if (Object.values(state.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('disk full');
+      writeBotmuxUpdateNotifyState(p, state);
+    };
+    const c = controller(); await c.tick();
+    expect(deps.send).toHaveBeenCalledTimes(1);
+    clock += BOTMUX_UPDATE_DEDUPE_MS; latest = null;
+    await c.tick();
+    expect(deps.send).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(deps.log)).toHaveBeenCalledWith(expect.stringMatching(/suspended/i));
+    expect(recipient().pending?.egressStartedAt).toBeDefined();
   });
   it('backs off thrown version lookup failures', async () => {
     deps.fetchLatest = vi.fn(async () => { throw new Error('network'); });
@@ -175,6 +218,15 @@ describe('botmux owner version reminders', () => {
     mkdirSync(deps.dataDir); writeFileSync(path(), '{broken');
     await controller().tick(); expect(deps.send).not.toHaveBeenCalled();
     expect(deps.fetchLatest).not.toHaveBeenCalled();
+  });
+  it.each([null, -1, '0'])('rejects an invalid first-egress timestamp in the ledger: %s', value => {
+    mkdirSync(deps.dataDir);
+    writeFileSync(path(), JSON.stringify({ entries: {
+      [JSON.stringify([deps.larkAppId, owner])]: {
+        pending: { version: '1.1.0', uuid: '00000000-0000-0000-0000-000000000000', createdAt: 1, egressStartedAt: value },
+      },
+    } }));
+    expect(() => readBotmuxUpdateNotifyState(path())).toThrow('invalid update notification state');
   });
   it('throttles unavailable version lookups and recovers', async () => {
     latest = null; const c = controller(); await c.tick(); await c.tick();

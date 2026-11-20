@@ -162,13 +162,116 @@ describe('botmux version reminder delivery', () => {
     enabled = false;
     await vi.advanceTimersByTimeAsync(1000); await run;
     expect(sdk.request).not.toHaveBeenCalled();
-    expect(state().pending?.version).toBe('1.1.0');
+    expect(state().pending).toBeUndefined();
     expect(state().lastNotifiedVersion).toBeUndefined();
     await c.tick(); enabled = true;
     const resumed = c.tick();
     await ioUntil(() => vi.getTimerCount() > 0);
     await vi.advanceTimersByTimeAsync(1000); await resumed;
     expect(deliveries).toHaveLength(1);
+  });
+
+  it('a cancellation before the first SDK request remains notifiable after the old cutoff', async () => {
+    vi.stubEnv('BOTMUX_LARK_QPS', '1');
+    await executeWithLarkGate('cli_review', 'exhaust-burst', async () => {});
+    const c = controller(); const run = c.tick();
+    await ioUntil(() => existsSync(statePath()));
+    await ioUntil(() => vi.getTimerCount() > 0);
+    enabled = false;
+    await vi.advanceTimersByTimeAsync(1000); await run;
+    expect(sdk.request).not.toHaveBeenCalled();
+    expect(state().pending).toBeUndefined();
+
+    await c.tick(); enabled = true;
+    await vi.advanceTimersByTimeAsync(notice.BOTMUX_UPDATE_DEDUPE_MS);
+    await c.tick();
+    expect(sdk.request).toHaveBeenCalledTimes(1);
+    expect(deliveries).toHaveLength(1);
+    expect(state().lastNotifiedVersion).toBe('1.1.0');
+    expect(state().pending).toBeUndefined();
+  });
+
+  it('a cancellation after provider egress keeps its UUID and still suspends after the cutoff', async () => {
+    let completionFailures = 0;
+    deps.writeState = (p, s) => {
+      if (Object.values(s.entries).some(entry => entry.lastNotifiedVersion) && completionFailures++ === 0) {
+        throw new Error('completion disk full');
+      }
+      notice.writeBotmuxUpdateNotifyState(p, s);
+    };
+    const reached = deferred();
+    sdk.request.mockImplementationOnce(async () => {
+      reached.resolve();
+      throw Object.assign(new Error('rate limited'), { isAxiosError: true, response: { status: 429 } });
+    });
+    const c = controller(); const first = c.tick(); await reached.promise;
+    await ioUntil(() => vi.getTimerCount() > 0);
+    enabled = false;
+    await vi.advanceTimersByTimeAsync(500); await first;
+    const firstUuid = state().pending?.uuid;
+    expect(firstUuid).toBeDefined();
+    expect(state().pending?.egressStartedAt).toBeDefined();
+    expect(sdk.request).toHaveBeenCalledTimes(1);
+    expect(deliveries).toHaveLength(0);
+
+    await c.tick(); enabled = true;
+    await vi.advanceTimersByTimeAsync(notice.BOTMUX_UPDATE_RETRY_MS);
+    await c.tick();
+    expect(sdk.request).toHaveBeenCalledTimes(2);
+    expect(sdk.request.mock.calls[1][0].data.uuid).toBe(firstUuid);
+    expect(deliveries).toHaveLength(1);
+    expect(state().pending?.uuid).toBe(firstUuid);
+
+    await vi.advanceTimersByTimeAsync(notice.BOTMUX_UPDATE_DEDUPE_MS);
+    await c.tick();
+    expect(sdk.request).toHaveBeenCalledTimes(2);
+    expect(deliveries).toHaveLength(1);
+    expect(state().pending?.uuid).toBe(firstUuid);
+    expect(vi.mocked(deps.log).mock.calls.some(([message]) => /automatic retry suspended/.test(message))).toBe(true);
+  });
+
+  it('a legacy pending beyond the UUID window does not POST again after upgrade', async () => {
+    const uuid = '00000000-0000-0000-0000-000000000001';
+    const sentAt = Date.now() - 61 * 60_000;
+    mkdirSync(deps.dataDir);
+    notice.writeBotmuxUpdateNotifyState(statePath(), { entries: {
+      [JSON.stringify([deps.larkAppId, owner])]: { pending: { version: '1.1.0', uuid, createdAt: sentAt } },
+    } });
+    uuidSeen.set(uuid, sentAt);
+    deliveries.push({ owner: owner!, uuid, time: sentAt });
+
+    await controller().tick();
+    expect(sdk.request).not.toHaveBeenCalled();
+    expect(deliveries).toHaveLength(1);
+    expect(state().pending?.uuid).toBe(uuid);
+    expect(vi.mocked(deps.log).mock.calls.some(([message]) => /automatic retry suspended/.test(message))).toBe(true);
+  });
+
+  it('an upgrade retry cannot extend a legacy UUID beyond its original uncertainty window', async () => {
+    const uuid = '00000000-0000-0000-0000-000000000001';
+    const sentAt = Date.now() - 50 * 60_000;
+    mkdirSync(deps.dataDir);
+    notice.writeBotmuxUpdateNotifyState(statePath(), { entries: {
+      [JSON.stringify([deps.larkAppId, owner])]: { pending: { version: '1.1.0', uuid, createdAt: sentAt } },
+    } });
+    uuidSeen.set(uuid, sentAt);
+    deliveries.push({ owner: owner!, uuid, time: sentAt });
+    deps.writeState = (p, s) => {
+      if (Object.values(s.entries).some(entry => entry.lastNotifiedVersion)) throw new Error('completion unavailable');
+      notice.writeBotmuxUpdateNotifyState(p, s);
+    };
+
+    const c = controller(); await c.tick();
+    expect(sdk.request).toHaveBeenCalledTimes(1);
+    expect(state().pending?.egressStartedAt).toBe(sentAt);
+    for (let i = 0; i < 2; i++) {
+      await vi.advanceTimersByTimeAsync(notice.BOTMUX_UPDATE_RETRY_MS);
+      await c.tick();
+    }
+    expect(sdk.request).toHaveBeenCalledTimes(1);
+    expect(deliveries).toHaveLength(1);
+    expect(state().pending?.uuid).toBe(uuid);
+    expect(vi.mocked(deps.log).mock.calls.some(([message]) => /automatic retry suspended/.test(message))).toBe(true);
   });
 
   it.each(['disable', 'owner', 'upgrade', 'stop'])('the real 429 retry rechecks applicability: %s', async action => {
@@ -241,7 +344,7 @@ describe('botmux version reminder delivery', () => {
   it('final write failure is retried with the same UUID across restart inside the dedupe window', async () => {
     let writes = 0;
     deps.writeState = (p, s) => {
-      if (++writes === 2) throw new Error('completion disk full');
+      if (Object.values(s.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('completion disk full');
       notice.writeBotmuxUpdateNotifyState(p, s);
     };
     await controller().tick();
@@ -257,7 +360,7 @@ describe('botmux version reminder delivery', () => {
   it('unavailable lookup after successful egress and failed final write preserves one logical delivery', async () => {
     let writes = 0;
     deps.writeState = (p, s) => {
-      if (++writes === 2) throw new Error('completion disk full');
+      if (Object.values(s.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('completion disk full');
       notice.writeBotmuxUpdateNotifyState(p, s);
     };
     const c = controller(); await c.tick();
@@ -285,7 +388,7 @@ describe('botmux version reminder delivery', () => {
   it('the uncertainty cutoff is rechecked after the real token wait crosses its boundary', async () => {
     let writes = 0;
     deps.writeState = (p, s) => {
-      if (++writes === 2) throw new Error('completion disk full');
+      if (Object.values(s.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('completion disk full');
       notice.writeBotmuxUpdateNotifyState(p, s);
     };
     const c = controller(); await c.tick();
@@ -303,7 +406,7 @@ describe('botmux version reminder delivery', () => {
   it('a suspended uncertain older delivery still permits one later higher release', async () => {
     let writes = 0;
     deps.writeState = (p, s) => {
-      if (++writes === 2) throw new Error('completion disk full');
+      if (Object.values(s.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('completion disk full');
       notice.writeBotmuxUpdateNotifyState(p, s);
     };
     const c = controller(); await c.tick();
@@ -319,7 +422,7 @@ describe('botmux version reminder delivery', () => {
     let writes = 0;
     deps.writeState = (p, s) => {
       notice.writeBotmuxUpdateNotifyState(p, s);
-      if (++writes === 2) throw new Error('directory fsync acknowledgement lost');
+      if (Object.values(s.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('directory fsync acknowledgement lost');
     };
     await controller().tick(); await controller().tick();
     expect(deliveries).toHaveLength(1);
@@ -338,7 +441,7 @@ describe('botmux version reminder delivery', () => {
   it('upgrading and reverting while final delivery settlement is unresolved preserves dedupe identity', async () => {
     let writes = 0;
     deps.writeState = (p, s) => {
-      if (++writes === 2) throw new Error('completion disk full');
+      if (Object.values(s.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('completion disk full');
       notice.writeBotmuxUpdateNotifyState(p, s);
     };
     const c = controller(); await c.tick();
@@ -351,7 +454,7 @@ describe('botmux version reminder delivery', () => {
   it.each(['1.0.0', '1.0.5'])('a regressed lookup after successful send and failed final write preserves the original UUID: %s', async regressed => {
     let writes = 0;
     deps.writeState = (p, s) => {
-      if (++writes === 2) throw new Error('completion disk full');
+      if (Object.values(s.entries).some(entry => entry.lastNotifiedVersion) && writes++ === 0) throw new Error('completion disk full');
       notice.writeBotmuxUpdateNotifyState(p, s);
     };
     const c = controller(); await c.tick();
