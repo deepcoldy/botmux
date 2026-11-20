@@ -63,11 +63,26 @@ import {
  *      "line1" + M-Enter + "line2" + Enter produces ONE history line with
  *      `display:"line1\nline2"`.
  *
- *  Skills layout note: Antigravity loads SKILL.md only inside plugin
- *  bundles (`plugins/<plugin>/{plugin.json, skills/<name>/SKILL.md}`),
- *  not from a flat `skills/` dir. botmux's installer writes the flat
- *  layout, so `skillsDir` is intentionally undefined; routing guidance
- *  is injected via `systemHints` instead.
+ *  Skills: agy 1.5.x discovers global skills from `~/.gemini/config/skills/
+ *  <name>/SKILL.md` (listed under "Available skills" in its system prompt,
+ *  verified on 1.5.12; 1.0.0 only loaded plugin bundles). That is `skillsDir`,
+ *  so the built-in catalog — botmux-ask included — reaches agy sessions the
+ *  same way as codex/opencode (prompt mode by default, files in global mode).
+ *
+ *  Questions to the user (agy 1.5.12):
+ *    - `ask_question` (main agent and subagents) is taken over by a
+ *      PreToolUse hook in `~/.gemini/config/hooks.json` (hook-installer
+ *      `antigravity-hooks`, core/ask-hook/antigravity.ts): a Lark question
+ *      card, the answer back as the hook's deny reason; the picker never
+ *      opens. botmux-ask stays installed as the fallback for when the hook
+ *      cannot take it (it fails open to agy's own picker).
+ *    - agy's own pickers that can still come up — the question picker
+ *      (hook unavailable) and the tool permission dialog — are the
+ *      `antigravity` stuck-page family: queued input and raw passthrough
+ *      commands are held off them (utils/antigravity-blocking-page.ts).
+ *    - A plan artifact with RequestFeedback does not block the composer: agy
+ *      only shows "N artifact · /artifact to review" in its footer, and the
+ *      next message reaches the model.
  */
 
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
@@ -663,14 +678,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     // conversation without cancelling the in-flight tool. Without
     // --dangerously-skip-permissions (disableCliBypass: true), agy can block on
     // a permission dialog where Enter approves and digit keys jump options, so
-    // runtimePtyInputPolicy suppresses type-ahead for restricted bots.
-    // Known issue (unified screen-hold follow-up): busy `raw_input` passthrough
-    // commands (/effort, /compact, /model, /btw, /clear) bypass
-    // runtimePtyInputPolicy, and interactive selection menus that still appear
-    // with bypass enabled (`ask_question`, Plan artifact review) also capture
-    // digit keys + Enter; both belong in one unified screen-based hold
-    // alongside hookReviewInputHold.
+    // runtimePtyInputPolicy suppresses type-ahead for restricted bots. Selection
+    // pickers that do come up (the question picker when the ask hook could not
+    // take it, the permission dialog) take digit keys + Enter: the
+    // `antigravity` stuck-page family holds queued input and busy raw
+    // passthrough commands (/effort, /compact, /model, …) off them.
     supportsTypeAhead: true,
+    stuckPageFamily: 'antigravity',
     isSessionBusy({ cliSessionId, getCurrentScreen }) {
       if (cliSessionId) knownCliSessionId = cliSessionId;
       if (lastConfirmedSubmitAtMs > 0) {
@@ -729,6 +743,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       return true;
     },
     systemHints: BOTMUX_SHELL_HINTS,
+    skillsDir: '~/.gemini/config/skills',
+    hookInstall: { configPath: '~/.gemini/config/hooks.json', format: 'antigravity-hooks' },
+    // The hook takes ask_question over, but falls back to agy's own picker
+    // when it cannot (agy without hooks, an unparseable hooks.json, botmux
+    // moved): keep the botmux-ask skill as the fallback, like TRAE does next
+    // to its native question bridge.
+    asksViaHook: false,
     altScreen: true,
   };
 }

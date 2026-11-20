@@ -10,12 +10,13 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { logger } from '../utils/logger.js';
 import { hookCommandParts, zcodeSessionHookCommandParts } from './hook-command.js';
+import { shellQuote } from '../core/cli-launch-mode.js';
 
 // ─── 类型 ────────────────────────────────────────────────────────────────────
 
 export interface HookInstallConfig {
   readonly configPath: string;
-  readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks';
+  readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks' | 'antigravity-hooks';
   /** Claude read-isolation: merge the shared settings `env` map into a
    *  per-bot settings file before installing hooks. Shared values win so
    *  rotated auth/provider/proxy settings refresh on every cold spawn; global
@@ -1056,6 +1057,86 @@ function installZcodeHooks(configPath: string, parts: { cmd: string; args: strin
   }
 }
 
+// ─── Antigravity hooks.json 格式 ──────────────────────────────────────────────
+//
+// agy reads global lifecycle hooks from `~/.gemini/config/hooks.json`; each
+// top-level key is a named hook (merged with the others — the user's, a
+// plugin's, another tool's):
+//   { "botmux": { "PreToolUse": [ { "matcher": "ask_question",
+//       "hooks": [ { "type": "command", "command": "…", "timeout": 90000 } ] } ] } }
+// `--settings` rejects a `hooks` key ("unknown setting"), so there is no
+// per-process scope: like Claude's settings.json hook, the global hook also
+// runs in standalone agy, where `botmux hook antigravity` finds no session and
+// prints nothing (agy then draws its own picker).
+//
+// agy differs from Claude in one way that shapes the command: a PreToolUse
+// handler that exits non-zero, prints invalid JSON or is killed at its timeout
+// FAILS the tool call (measured on 1.5.12). An uninstalled/moved botmux would
+// otherwise break ask_question in every agy session, so the command checks
+// its own files first; see antigravityHookCommand for why it then `exec`s.
+
+/** Our named hook in agy's hooks.json. */
+export const ANTIGRAVITY_HOOK_NAME = 'botmux';
+/** agy kills the handler at this many seconds and fails the tool call. Above
+ *  the hook client's own default ask wait (24h, cli.ts runHook), so the client
+ *  answers "nobody answered" before agy kills it. */
+const ANTIGRAVITY_HOOK_TIMEOUT_S = 90_000;
+
+/** POSIX `sh -c` command for `botmux hook antigravity`.
+ *
+ *  `exec`: agy gives up on a handler (Esc, a stopped turn, its timeout) by
+ *  SIGKILLing the process it started — only that one. Were the shell to stay
+ *  in between, the hook client would survive as an orphan still holding its
+ *  ask: the card would stay answerable and the next text in the thread would
+ *  be read as the answer to a question nobody waits for (seen on 1.5.12).
+ *
+ *  The checks first: with the runtime or the script gone (a moved checkout,
+ *  an uninstall) the command drains stdin and prints nothing — no decision,
+ *  agy opens its own picker — instead of failing every ask_question. */
+export function antigravityHookCommand(parts: { cmd: string; args: string[] }): string {
+  const checks = [`[ -x ${shellQuote(parts.cmd)} ]`,
+    ...parts.args.filter(arg => arg.startsWith('/')).map(arg => `[ -f ${shellQuote(arg)} ]`)];
+  const run = [parts.cmd, ...parts.args].map(arg => /^[A-Za-z0-9_-]+$/.test(arg) ? arg : shellQuote(arg)).join(' ');
+  return `if ${checks.join(' && ')}; then exec ${run}; fi; cat >/dev/null 2>&1 || :`;
+}
+
+function installAntigravityHooks(configPath: string, parts: { cmd: string; args: string[] }): void {
+  if (process.platform === 'win32') {
+    // agy runs hook commands through cmd.exe there; the guard above is POSIX
+    // sh, and a broken command would fail every ask_question.
+    logger.info(`[hook] Windows 上不安装 Antigravity ask hook（命令是 POSIX sh）→ ${configPath}`);
+    return;
+  }
+  // Never rebuild a file agy (or the user) owns from scratch: an unparseable
+  // one would lose every other named hook.
+  let existing: Record<string, unknown> = {};
+  if (existsSync(configPath)) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(readFileSync(configPath, 'utf-8').replace(/^\uFEFF/, '')); } catch { parsed = undefined; }
+    if (!isRecord(parsed)) {
+      logger.warn(`[hook] ${configPath} 不是合法 JSON 对象，拒绝写入以免覆盖用户配置；Antigravity 提问不会转飞书卡片`);
+      return;
+    }
+    existing = parsed;
+  }
+  const previous = isRecord(existing[ANTIGRAVITY_HOOK_NAME]) ? existing[ANTIGRAVITY_HOOK_NAME] as Record<string, unknown> : {};
+  const spec: Record<string, unknown> = {
+    // An explicit `"enabled": false` on our hook is the user's choice.
+    ...(previous.enabled === false ? { enabled: false } : {}),
+    PreToolUse: [{
+      matcher: 'ask_question',
+      hooks: [{ type: 'command', command: antigravityHookCommand(parts), timeout: ANTIGRAVITY_HOOK_TIMEOUT_S }],
+    }],
+  };
+  const content = JSON.stringify({ ...existing, [ANTIGRAVITY_HOOK_NAME]: spec }, null, 2) + '\n';
+  const changed = writeIfChanged(configPath, content);
+  if (changed) {
+    logger.info(`[hook] 已写入 Antigravity ask_question hook → ${configPath}`);
+  } else {
+    logger.info(`[hook] Antigravity ask_question hook 已是最新，跳过写入 → ${configPath}`);
+  }
+}
+
 // ─── 主入口 ───────────────────────────────────────────────────────────────────
 
 /**
@@ -1102,6 +1183,10 @@ export function installHook(
         // ZCode has no ask-hook surface: the bridge records session identity and
         // submit receipts, which is what makes submit confirmation work at all.
         installZcodeHooks(configPath, zcodeSessionHookCommandParts());
+        break;
+      case 'antigravity-hooks':
+        // agy runs `sh -c` command strings: argv parts rendered with a guard.
+        installAntigravityHooks(configPath, hookCommandParts(cliId));
         break;
       default: {
         // TypeScript exhaustiveness（编译时保障，运行时防御）

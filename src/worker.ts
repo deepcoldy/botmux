@@ -448,6 +448,7 @@ import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResu
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
 import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
+import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath, restoreFilteredHermesUserEvents } from './services/hermes-transcript.js';
@@ -4892,8 +4893,11 @@ function notifyHookReviewInputHold(freshScreen?: string): void {
   const holdNotice = cliAdapter?.stuckPageFamily === 'kimi'
     ? `⚠️ ${cliName()} 正在显示「缓存过期」选择菜单。为避免消息被菜单吞掉或误选选项，`
       + 'BotMux 已暂存后续消息；请先在 Web 终端完成选择，恢复普通输入框后会自动投递。'
-    : `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
-      + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。';
+    : cliAdapter?.stuckPageFamily === 'antigravity'
+      ? `⚠️ ${cliName()} 正在终端显示选择菜单（提问或权限确认）。为避免消息被菜单当成按键、误选选项，`
+        + 'BotMux 已暂存后续消息；请先在 Web 终端完成选择，恢复普通输入框后会自动投递。'
+      : `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
+        + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。';
   send({
     type: 'user_notify',
     turnId: currentBotmuxTurnId,
@@ -4982,6 +4986,10 @@ function shareableStuckScreenTail(screen: string): string {
   // Kimi draws its menu under the live conversation: only the menu rows leave
   // the terminal, never the transcript above them.
   if (family === 'kimi') return kimiCacheExpiryMenuTail(screen);
+  // agy draws its pickers under the live conversation: same, picker rows only
+  // (a permission dialog's command already masked), then the same credential
+  // and home-path redaction as any other page.
+  if (family === 'antigravity') return stuckScreenTail(redactStuckPageTail(antigravityBlockingPageTail(screen)));
   // Redact the whole page before bounding it: the line / char cut can drop a
   // row's label and leave its value (or a wrapped continuation) unmasked.
   const unbounded = stuckScreenTail(screen, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);

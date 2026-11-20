@@ -26,6 +26,7 @@ import { contractTerminalStatus, executionObserverSupported } from '../../src/se
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
+import { antigravityBlockingPageTail } from '../../src/utils/antigravity-blocking-page.js';
 import { isNativeReasoningEffort } from '../../src/services/native-reasoning-observation.js';
 import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-footer.js';
 import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-observer.js';
@@ -206,6 +207,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
       return dependencies.get(key);
     }
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
+    if (key === 'antigravityBlockingPageTail') return antigravityBlockingPageTail;
     if (key === 'traexStartupInputReady') return traexStartupInputReady;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
     if (typeof key === 'string' && ['warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
