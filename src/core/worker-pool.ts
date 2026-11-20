@@ -60,7 +60,7 @@ import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTrig
 import { modelPinView, retainPinEffort, samePinModel, validateModelPin, type ModelPin } from './model-pin.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
-import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, sessionCardSandboxMode, botConfigSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, sessionCardSandboxMode, botConfigSandboxMode, sandboxWithholdsBotSecret } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -92,6 +92,7 @@ import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
+import { archiveUndeliveredReply, shellQuoteDisplayDir } from '../services/undelivered-reply-archive.js';
 import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import type { WorkerOwnerDiagnostic } from './worker-owner-diagnostic.js';
@@ -4905,6 +4906,8 @@ export function clearUsageLimitState(ds: DaemonSession): void {
     ds.usageLimit = previous;
     throw error;
   }
+  cancelComposerRecoveryRetry(ds);
+  cancelUsageLimitPersistRetry(ds);
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
@@ -5044,8 +5047,15 @@ export function restoreUsageLimitRuntimeState(ds: DaemonSession): void {
   armUsageLimitRetryTimer(ds);
 }
 
-function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitState): void {
+function updateUsageLimitState(
+  ds: DaemonSession,
+  usageLimit: CliUsageLimitState | undefined,
+  owns: () => boolean,
+): void {
   if (!usageLimit) return;
+  // Even a repeated refusal invalidates earlier recovery evidence.
+  cancelComposerRecoveryRetry(ds);
+  cancelUsageLimitPersistRetry(ds);
 
   const previous = ds.usageLimit;
   usageLimit = reconcileUsageLimitState(previous, usageLimit);
@@ -5062,13 +5072,123 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
   ds.usageLimit = usageLimit;
   rememberSessionAntigravityQuota(ds, usageLimit);
   ds.usageLimitPersistPending = true;
-  persistStreamCardState(ds);
+  try {
+    persistStreamCardState(ds);
+  } catch (error) {
+    // The current frame is valid evidence even when its write fails. Keep the
+    // runtime projection and give THIS refusal its own durable retry owner;
+    // otherwise cancelling the old proof leaves no writer for the new key.
+    retryUsageLimitPersistence(ds, previous, owns);
+    logger.warn(`[${tag(ds)}] Usage-limit persistence deferred: ${String(error)}`);
+    return;
+  }
   ds.usageLimitPersistPending = false;
   armUsageLimitRetryTimer(ds, previous);
 }
 
 function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
   return limit?.source === 'antigravity-error-composer' && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
+}
+
+const usageLimitPersistRetries = new WeakMap<DaemonSession, {
+  timer: ReturnType<typeof setTimeout>;
+  owns: () => boolean;
+}>();
+
+function cancelUsageLimitPersistRetry(ds: DaemonSession): void {
+  const pending = usageLimitPersistRetries.get(ds);
+  if (pending) clearTimeout(pending.timer);
+  usageLimitPersistRetries.delete(ds);
+}
+
+/** Persist a newly accepted refusal without depending on another identical
+ * frame. Success re-arms the deadline owner; stale workers and later episodes
+ * lose the write, while a newer clear cancels it at the same choke point. */
+function retryUsageLimitPersistence(
+  ds: DaemonSession,
+  previous: CliUsageLimitState | undefined,
+  owns: () => boolean,
+): void {
+  if (usageLimitPersistRetries.get(ds)?.owns()) return;
+  cancelUsageLimitPersistRetry(ds);
+  const key = ds.usageLimit && usageLimitStateKey(ds.usageLimit);
+  let delayMs = 500;
+  const schedule = (): void => {
+    const timer = setTimeout(() => {
+      if (usageLimitPersistRetries.get(ds)?.timer !== timer) return;
+      usageLimitPersistRetries.delete(ds);
+      if (!owns() || !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+      try {
+        persistStreamCardState(ds);
+        armUsageLimitRetryTimer(ds, previous);
+        ds.usageLimitPersistPending = false;
+      } catch (error) {
+        ds.usageLimitPersistPending = true;
+        delayMs = Math.min(delayMs * 2, 30_000);
+        logger.warn(`[${tag(ds)}] Usage-limit persistence retry: ${String(error)}`);
+        schedule();
+      }
+    }, delayMs);
+    timer.unref();
+    usageLimitPersistRetries.set(ds, { timer, owns });
+  };
+  schedule();
+}
+
+const composerRecoveryRetries = new WeakMap<DaemonSession, {
+  timer: ReturnType<typeof setTimeout>;
+  owns: () => boolean;
+}>();
+
+function cancelComposerRecoveryRetry(ds: DaemonSession): void {
+  const pending = composerRecoveryRetries.get(ds);
+  if (pending) clearTimeout(pending.timer);
+  composerRecoveryRetries.delete(ds);
+}
+
+/** Retain an accepted proof locally until SQLite commits it. Worker screen
+ * dedup deliberately sends an edge once, so persistence cannot depend on a
+ * second identical frame. Ownership and fresh refusals invalidate this proof. */
+function retryComposerRecovery(
+  ds: DaemonSession,
+  frame: { status: ScreenStatus; turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
+  owns: () => boolean,
+): void {
+  const { status } = frame;
+  cancelUsageLimitPersistRetry(ds);
+  const pending = composerRecoveryRetries.get(ds);
+  if (pending?.owns()) return;
+  cancelComposerRecoveryRetry(ds);
+  const key = ds.usageLimit && usageLimitStateKey(ds.usageLimit);
+  let delayMs = 500;
+  const schedule = (): void => {
+    const timer = setTimeout(() => {
+      if (composerRecoveryRetries.get(ds)?.timer !== timer) return;
+      composerRecoveryRetries.delete(ds);
+      // Losing live ownership invalidates the proof, except for an already
+      // committed close: its second-stage clear still owes the SAME key's
+      // durable cleanup, and dropping it would resurrect the limit on resume.
+      const committedCloseCleanup = ds.session.status === 'closed';
+      if ((!owns() && !committedCloseCleanup) || !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+      try {
+        clearUsageLimitState(ds);
+      } catch (error) {
+        logger.warn(`[${tag(ds)}] composer recovery persistence retry: ${String(error)}`);
+        delayMs = Math.min(delayMs * 2, 30_000);
+        schedule();
+        return;
+      }
+      if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = status;
+      stampIdleSinceAt(ds, 'limited');
+      if (!isStalePostTerminalBusyFrame(ds, status, frame)
+        && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+        scheduleCardPatch(ds, buildStreamingCardJson(ds), frame.turnId, { owns });
+      }
+    }, delayMs);
+    timer.unref();
+    composerRecoveryRetries.set(ds, { timer, owns });
+  };
+  schedule();
 }
 
 /**
@@ -5090,7 +5210,8 @@ function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
  */
 function resolveUsageAwareScreenStatus(
   ds: DaemonSession,
-  frame: { status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; content?: string },
+  frame: { status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; content?: string; usageLimitRecovery?: 'antigravity-ready-composer'; turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
+  owns: () => boolean,
 ): ScreenStatus {
   const { status, usageLimit, expiredAntigravityQuota, content } = frame;
   const previous = ds.usageLimit;
@@ -5104,8 +5225,17 @@ function resolveUsageAwareScreenStatus(
     // 原生拒绝在窗口内只接受原生工作提示，避免无关 PTY 输出清掉限额。
     const workRecovered = working && (previous.source !== 'antigravity-error-composer'
       || (content && isAntigravityWorkingScreen(content)));
-    if (expiredSameEpisode || isExpiredNativeAntigravityQuota(previous) || workRecovered) {
-      clearUsageLimitState(ds);
+    const composerRecovered = frame.usageLimitRecovery === 'antigravity-ready-composer'
+      && sessionCliId(ds, getBot(ds.larkAppId).config) === 'antigravity';
+    if (expiredSameEpisode || isExpiredNativeAntigravityQuota(previous) || workRecovered || composerRecovered) {
+      try {
+        clearUsageLimitState(ds);
+      } catch (error) {
+        if (!composerRecovered) throw error;
+        logger.warn(`[${tag(ds)}] composer recovery persistence failed: ${String(error)}`);
+        retryComposerRecovery(ds, frame, owns);
+        return 'limited';
+      }
       return status;
     }
   }
@@ -8637,7 +8767,15 @@ export function killWorker(
   }
   restartCoordinator.cancelSession(ds.session.sessionId);
   resetStartingCardHealth(ds);
-  clearUsageLimitState(ds);
+  try {
+    clearUsageLimitState(ds);
+  } catch (error) {
+    // closeSession has already committed the closed row at this point. Retain
+    // the second-stage clear even without an earlier recovery proof, but only
+    // while the session remains closed; a resume must not inherit a stale clear.
+    if (ds.session.status === 'closed') retryComposerRecovery(ds, { status: 'idle' }, () => false);
+    throw error;
+  }
   ds.workerReady = false;
   // The CLI process dies with this worker — no prompt is ready any more.
   ds.cliReady = false;
@@ -18605,7 +18743,7 @@ export function resolveQuarantinedForkPlan(
  */
 export function freezeSessionSandboxDecision(
   ds: DaemonSession,
-  botCfg: Pick<BotConfig, 'sandbox' | 'readIsolation' | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork' | 'sandboxNetworkPolicy' | 'scratchStorage' | 'scratchTmpfsSizeMb' | 'scratchDenyPaths'>,
+  botCfg: Pick<BotConfig, 'sandbox' | 'readIsolation' | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork' | 'sandboxNetworkPolicy' | 'sandboxWithholdBotSecret' | 'scratchStorage' | 'scratchTmpfsSizeMb' | 'scratchDenyPaths'>,
   opts: { resume?: boolean } = {},
 ): void {
   if (ds.session.sandbox !== undefined) return;
@@ -18617,6 +18755,11 @@ export function freezeSessionSandboxDecision(
     ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
     ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
     ds.session.sandboxNetworkPolicy = botCfg.sandboxNetworkPolicy ? structuredClone(botCfg.sandboxNetworkPolicy) : undefined;
+    // Frozen with the rest of the sandbox shape: it decides whether the pane is
+    // built around the outbox relay, which a live pane cannot change.
+    // Decided against the sandbox the worker will actually build (BOTMUX_SANDBOX
+    // forcing included), not only the configured one.
+    if (sandboxWithholdsBotSecret(botCfg)) ds.session.sandboxWithholdBotSecret = true;
     if (ds.session.sandbox === 'scratch') {
       ds.session.sandboxScratch = {
         storage: normalizeScratchStorage(botCfg.scratchStorage),
@@ -20203,6 +20346,7 @@ function forkWorkerPrepared(
     sandboxReadonlyPaths: ds.session.sandboxReadonlyPaths ?? [],
     sandboxNetwork: ds.session.sandboxNetwork !== false,
     sandboxNetworkPolicy: ds.session.sandboxNetworkPolicy ? structuredClone(ds.session.sandboxNetworkPolicy) : undefined,
+    ...(ds.session.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true } : {}),
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).
@@ -20823,18 +20967,42 @@ function setupWorkerHandlers(
   // The live worker produced an answer the contract will not post. Without the
   // notice the card stays "working" and the user never learns the reply is gone.
   const undeliveredFinalNotices = new Set<string>();
+  const archivedUndeliveredFinals = new Map<string, import('../services/undelivered-reply-archive.js').ArchivedUndeliveredReply | null>();
   const reportUndeliveredFinal = (final: Extract<WorkerToDaemon, { type: 'final_output' }>, reason: string): void => {
     if (ds.worker !== worker) return;
     logger.warn(`[${t}] Final output from current worker not delivered turn=${final.turnId} reason=${reason}`);
-    // Restart, suspend and close retire in-flight replies on purpose.
-    if (!final.content.trim() || (sessionController && !sessionController.allowsInput())) return;
+    if (!final.content.trim()) return;
     if (managedFinalOutputSuppressed(final.turnId, final.dispatchAttempt) || managedAuxUiSuppressed(final.turnId, final.dispatchAttempt)) return;
     const key = `${final.turnId}:${final.dispatchAttempt ?? ''}`;
+    // Refusing to post the reply must not destroy it: keep it on the bot's
+    // machine, once per turn, and say where so it can still be recovered.
+    let archived = archivedUndeliveredFinals.get(key);
+    if (archived === undefined) {
+      try {
+        archived = archiveUndeliveredReply(config.session.dataDir, {
+          appId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: final.turnId,
+          ...(final.dispatchAttempt !== undefined ? { dispatchAttempt: final.dispatchAttempt } : {}),
+          reason, cliId: ds.initConfig?.cliId ?? ds.session.cliId, content: final.content,
+        });
+        logger.warn(`[${t}] Undelivered reply kept at ${archived.path}`);
+      } catch (error) {
+        archived = null;
+        logger.error(`[${t}] Undelivered reply not archived: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      archivedUndeliveredFinals.set(key, archived);
+    }
+    // Restart, suspend and close retire in-flight replies on purpose: kept,
+    // but the group is not told about them.
+    if (sessionController && !sessionController.allowsInput()) return;
     if (undeliveredFinalNotices.has(key)) return;
     undeliveredFinalNotices.add(key);
+    const locale = localeForBot(ds.larkAppId);
+    const recovery = archived
+      ? tr('worker.final_output_undelivered_archived', { dir: shellQuoteDisplayDir(archived.displayDir), stamp: archived.stamp }, locale)
+      : tr('worker.final_output_undelivered_unarchived', undefined, locale);
     void sendTurnNotice(ds, {
       kind: 'user_notify', turnId: fallbackTurnId(ds, final.turnId), msgType: 'text',
-      content: tr('worker.final_output_undelivered', undefined, localeForBot(ds.larkAppId)),
+      content: tr('worker.final_output_undelivered', { recovery }, locale),
     }).catch(error => logger.error(`[${t}] Undelivered reply notice failed: ${error instanceof Error ? error.message : String(error)}`));
   };
   // A new worker generation is starting. As a backstop, invalidate any
@@ -23529,7 +23697,7 @@ function setupWorkerHandlers(
         // Project the frame's effective status once: reused for the in-memory
         // status assignment below and the stale-post-terminal gate.
         const previousLimit = ds.usageLimit;
-        const projectedScreenStatus = resolveUsageAwareScreenStatus(ds, msg);
+        const projectedScreenStatus = resolveUsageAwareScreenStatus(ds, msg, ownsLifecycleMutation);
         // A busy frame from a turn that already reported a completed terminal
         // (with no newer turn admitted) is stale viewport evidence. It must not
         // cancel the post-terminal correction or drive the card/revision; the
@@ -23551,7 +23719,7 @@ function setupWorkerHandlers(
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
         const prevLabel = streamCardLabel(ds);
         const prevActivity = typeof prevLabel === 'object' && 'activity' in prevLabel ? prevLabel.activity : undefined;
-        updateUsageLimitState(ds, msg.usageLimit);
+        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
         ds.lastScreenContent = msg.content;
         ds.lastScreenStatus = projectedScreenStatus;
         workersWithScreenStatus.add(worker);
@@ -24009,8 +24177,8 @@ function setupWorkerHandlers(
         }
         const prevStatus = ds.lastScreenStatus;
         const previousLimit = ds.usageLimit;
-        updateUsageLimitState(ds, msg.usageLimit);
-        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg);
+        updateUsageLimitState(ds, msg.usageLimit, ownsLifecycleMutation);
+        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg, ownsLifecycleMutation);
         workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);
         // Same per-frame stale gate as screen_update: a residual busy screenshot

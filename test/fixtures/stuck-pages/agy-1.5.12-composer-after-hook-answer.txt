@@ -1,0 +1,40 @@
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.12
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     ~/work
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> please ask me
+
+● AskQuestion(Which database should we use?)
+⎿  Error: tool call denied by pre-tool hook: User answered in Lark: PostgreSQL
+
+  TOOL_RESULT_ECHO: {"id":"4a3b498d-3005-4a48-abc4-
+  d32ba857d3fa","name":"ask_question","response":{"error":"Encountered error in tool execution: tool call denied by
+  pre-tool hook: User answered in Lark: PostgreSQL"}}
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                     Gemini 3.1 Pro · low
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

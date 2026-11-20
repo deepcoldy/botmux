@@ -1,0 +1,40 @@
+
+      [38;5;179m▄[38;5;208m[48;5;208m▀[38;5;203m[48;5;209m▀[49m▄[39m        [1m[94mAntigravity CLI 1.5.12
+[0m[39m[49m     [38;5;149m[48;5;113m▀[38;5;143m[48;5;107m▀[38;5;173m[48;5;173m▀[38;5;209m[48;5;209m▀[38;5;203m[48;5;167m▀▀[39m[49m       [90mGemini API key
+[39m    [38;5;107m[48;5;113m▀[38;5;71m[48;5;72m▀[38;5;72m[48;5;68m▀[38;5;67m[49m▀[38;5;103m▀[38;5;98m[48;5;68m▀[38;5;97m[48;5;62m▀[38;5;132m[48;5;97m▀[39m[49m      [90mGemini 3.1 Pro (Low)
+[39m   [38;5;78m▄[48;5;74m▀[38;5;73m▀[39m[49m    [38;5;68m[48;5;69m▀▀[49m▄[39m     [90m~/work
+[39m  [38;5;75m▄[38;5;79m[48;5;75m▀[38;5;75m[49m▀[39m      [38;5;69m▀[48;5;69m▀[49m▄
+
+[90m────────────────────────────────────────────────────────────[39m
+[1m[34m> run it
+
+[0m[33m[49m●[39m [1m[33mRan[0m[39m[49m [37m(touch /tmp/agy-probe-perm-marker-xyz && echo done)[39m [37m(ctrl+o to expand)[39m
+
+[1m[33mCommand[0m[39m[49m
+[90m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[1m[37mRequesting permission for:
+[0m[37m[49m   touch /tmp/agy-probe-perm-marker-xyz && echo done
+
+[1m[39mRun this command?
+[0m[94m[49m> 1. Yes, run command
+[39m  2. Yes, and always allow in this conversation for commands that start with 'touch'
+  3. Yes, and always allow for commands that start with 'touch' (Persist to settings.json)
+  4. No, cancel
+
+  [1m[94m↑/↓[0m[90m[49m Navigate · [1m[94mtab[0m[90m[49m Amend · [1m[94mctrl+g[0m[90m[49m edit/expand command
+esc to cancel[39m                                                                                       [2mGemini 3.1 Pro · low
+[0m[39m[49mSTATUSLINE_PROBE_ROW
+
+
+
+
+
+
+
+
+
+
+
+
+

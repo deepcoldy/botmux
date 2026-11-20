@@ -532,7 +532,7 @@ describe('group context history attachments', () => {
       resourceRefs: [{ type, key: 'file_v3_clip', name: 'demo.mp4' }], sourceAppId: 'cli_b' });
     const prepared = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '看看上面的附件' });
     expect(prepared?.attachments).toEqual([expect.objectContaining({ type, name: 'demo.mp4', resourceKey: 'file_v3_clip' })]);
-    expect(network.download).toHaveBeenCalledWith('cli_b', 'om_clip', 'file_v3_clip', type, expect.any(String), undefined, { allowUserTokenFallback: false });
+    expect(network.download).toHaveBeenCalledWith('cli_b', 'om_clip', 'file_v3_clip', type, expect.any(String), undefined, { allowUserTokenFallback: false, withinRoot: expect.any(String) });
   });
 
   const shot = (now: number) => upsertGroupContextMessage('cli_b', { messageId: 'om_shot', chatId: 'oc_room', conversationScope: 'main', senderId: 'ou_user',

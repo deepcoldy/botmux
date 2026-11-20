@@ -42,6 +42,21 @@ export interface FsPolicy {
   rules: FsRule[];
   /** Keep network egress (bwrap-only knob; Seatbelt does not confine net here). */
   net: boolean;
+  /** Seatbelt only: refuse process-info on OTHER processes and the
+   *  kern.procargs* sysctls. The host worker's environment carries the Lark app
+   *  secret; measured on macOS: a same-uid sandboxed process reads it back via
+   *  sysctl(KERN_PROCARGS2) unless BOTH denies are present (either alone still
+   *  leaks; denying self pid-info crashes runtimes). Linux hides host processes
+   *  with the PID namespace instead. */
+  hideHostProcessInfo?: boolean;
+  /** Seatbelt only: directories the pane may write INTO but must not rename or
+   *  remove. A writable directory can otherwise be rename(2)d wholesale (its
+   *  children are never opened, so a per-file deny does not fire) and read
+   *  back from a writable location, or replaced by a symlink the host then
+   *  writes through. Measured: `(deny file-write-unlink (literal <dir>))` blocks
+   *  mv/rmdir of the directory while mkdir/touch/rename inside it keep working.
+   *  Linux needs none of this: these directories are bind mounts there. */
+  pinnedDirs?: string[];
   /** Extra Seatbelt write-allow regexes (e.g. ~/.claude.json.tmp.* atomic-save
    *  siblings when the CLI data dir is NOT redirected into BOT_HOME). */
   writeRegexes: string[];
@@ -117,8 +132,15 @@ export interface FsPolicyContext {
    *  the caller itself grants that part of the checkout (a workingDir or user
    *  path at/inside the install root — a bot working ON the checkout). */
   botmuxInstallRootMaskPaths?: readonly string[];
-  /** Daemon-mediated relay outbox (Linux) — readWrite. */
+  /** Daemon-mediated relay outbox — readWrite. Linux always; macOS when the
+   *  bot withholds its app secret (see `withholdSendCredential`). */
   outbox?: string;
+  /** Bot config `sandboxWithholdBotSecret`: deny this bot's own
+   *  `<BOT_HOME>/send-cred.json` (plaintext app secret) even though BOT_HOME is
+   *  otherwise readWrite. The sandboxed CLI then reaches Lark only through the
+   *  host relay. Without it the secret is readable in-sandbox, and anyone who
+   *  can steer the agent can mint this bot's tenant token directly. */
+  withholdSendCredential?: boolean;
   /** Extra writable roots (resolved TMPDIR, admin extras). */
   extraWritePaths?: readonly string[];
   /** Per-bot user config (bots.json sandboxPaths) — highest precedence. */
@@ -905,6 +927,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const roleLibGrant = larkTransport && ctx.roleLibrarySubtree ? roleLibAccess(ctx.roleLibrarySubtree) : null;
   if (roleLibGrant) push([ctx.roleLibrarySubtree!], roleLibGrant, 'internal');
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
+  if (ctx.withholdSendCredential) push([`${ctx.botHome}/send-cred.json`], 'deny', 'mandatory');
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
   push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
   // Session-owned read-only roots: directories the daemon generated for THIS
@@ -938,7 +961,13 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // downloaded attachment under attachments/<self>/<messageId>/… (not just reads
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the
   // existence-filter and gets bound rw. Siblings' buckets stay uncovered.
-  push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], 'readWrite', 'internal');
+  // With sandboxWithholdBotSecret the only writer of this bucket is the host
+  // (incoming messages; relayed `quoted` lands in the host-private
+  // relay-attachments instead), so the pane gets it read-only. A writable
+  // bucket lets the pane swap a message directory for a symlink between the
+  // host's validation and its open/rename — a cross-process race no path-based
+  // check can close — and a read-only bucket removes that class outright.
+  push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], ctx.withholdSendCredential ? 'readOnly' : 'readWrite', 'internal');
   // Own per-turn hook context（UserPromptSubmit sidecar，#794）——read-only。
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
@@ -1056,7 +1085,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // path than the deny so longest-prefix-wins. Siblings' `appsecret_*.enc` and
   // user tokens stay denied → the master key alone can't decrypt what it can't
   // read (verified: sibling ciphertext still DENIED).
-  if (ctx.platform === 'darwin' && larkTransport) {
+  // withholdSendCredential: the own appsecret + master key ARE the app secret
+  // (decryptable), so the carve-out stays closed and the store stays denied.
+  if (ctx.platform === 'darwin' && larkTransport && !ctx.withholdSendCredential) {
     const larkStore = `${ctx.homeDir}/Library/Application Support/lark-cli`;
     push([`${larkStore}/master.key.file`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
   }
@@ -1094,7 +1125,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       // outrank this deny by source rank (internal 2 > baseline 0), re-opening the whole
       // keystore rw. mandatory (4) keeps the ceiling; the deeper own-key carve-outs still win by depth.
       push([larkStore], 'deny', 'mandatory');
-      push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+      if (!ctx.withholdSendCredential) {
+        push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+      }
     }
   }
 
@@ -1219,6 +1252,10 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   return {
     rules,
     net: ctx.net !== false,
+    ...(ctx.withholdSendCredential ? { hideHostProcessInfo: true } : {}),
+    ...(ctx.withholdSendCredential
+      ? { pinnedDirs: [ctx.botHome, ...(ctx.outbox ? [ctx.outbox] : [])].map(p => normalizeFsPath(p)).filter((p): p is string => !!p) }
+      : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
     finalReadOnlyPaths,
@@ -1305,6 +1342,9 @@ export function compileToSeatbelt(policy: FsPolicy): string {
     // if a deployment ever needs the kernel surface closed too.
     '(allow iokit-open)',
     ...(policy.net ? ['(allow network*)', '(allow system-socket)'] : []),
+    ...(policy.hideHostProcessInfo
+      ? ['(deny process-info* (target others))', '(deny sysctl-read (sysctl-name-prefix "kern.procargs"))']
+      : []),
   ];
   for (const r of policy.rules) {
     const p = escSb(r.path);
@@ -1335,6 +1375,7 @@ export function compileToSeatbelt(policy: FsPolicy): string {
     lines.push(`(allow file-read* (subpath "${escSb(path)}"))`);
     lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
   }
+  for (const p of policy.pinnedDirs ?? []) lines.push(`(deny file-write-unlink (literal "${escSb(p)}"))`);
   return lines.join('\n') + '\n';
 }
 

@@ -82,6 +82,44 @@ describe('freezeSessionSandboxDecision', () => {
     expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
+  it('records sandboxWithholdBotSecret for the file sandbox only, and keeps it frozen', () => {
+    const ds = makeSession();
+    const cfg = botCfg({ sandbox: true, sandboxWithholdBotSecret: true });
+    freezeSessionSandboxDecision(ds, cfg);
+    expect(ds.session.sandboxWithholdBotSecret).toBe(true);
+    cfg.sandboxWithholdBotSecret = false;
+    freezeSessionSandboxDecision(ds, cfg);
+    expect(ds.session.sandboxWithholdBotSecret).toBe(true);
+    // Scratch / off sessions never carry it: only the file-sandbox arm builds
+    // the outbox-only pane.
+    for (const sandbox of ['scratch', false] as const) {
+      const other = makeSession();
+      freezeSessionSandboxDecision(other, botCfg({ sandbox, sandboxWithholdBotSecret: true } as Partial<BotConfig>));
+      expect(other.session.sandboxWithholdBotSecret).toBeUndefined();
+    }
+  });
+
+  it('BOTMUX_SANDBOX=1 forcing oncall on a sandbox-off bot still freezes sandboxWithholdBotSecret', () => {
+    const prev = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTMUX_SANDBOX = '1';
+      const forced = makeSession();
+      freezeSessionSandboxDecision(forced, botCfg({ sandboxWithholdBotSecret: true }));
+      expect(forced.session.sandbox).toBe(false);
+      expect(forced.session.sandboxWithholdBotSecret).toBe(true);
+      process.env.BOTMUX_SANDBOX = 'scratch';
+      const scratch = makeSession();
+      freezeSessionSandboxDecision(scratch, botCfg({ sandboxWithholdBotSecret: true }));
+      expect(scratch.session.sandboxWithholdBotSecret).toBeUndefined();
+      delete process.env.BOTMUX_SANDBOX;
+      const plain = makeSession();
+      freezeSessionSandboxDecision(plain, botCfg({ sandboxWithholdBotSecret: true }));
+      expect(plain.session.sandboxWithholdBotSecret).toBeUndefined();
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_SANDBOX; else process.env.BOTMUX_SANDBOX = prev;
+    }
+  });
+
   it('folds legacy readIsolation into the frozen tri-state as oncall', () => {
     const ds = makeSession();
     freezeSessionSandboxDecision(ds, botCfg({ sandbox: false, readIsolation: true }));

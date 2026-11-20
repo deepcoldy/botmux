@@ -245,6 +245,7 @@ export interface BotSnapshot {
   sandboxReadonlyPaths?: string[];
   sandboxNetwork?: boolean;
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy;
+  sandboxWithholdBotSecret?: boolean;
   /** The resolved working directory for this run. */
   workingDir: string;
 }
