@@ -16633,10 +16633,12 @@ function applyTraexStartupLaunchMode(
   cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'adoptMode'>,
   launch: { resume: boolean; nativeSessionId?: string; persistentReattach: boolean },
 ): void {
+  // A cold resume is fenced like a fresh launch: its first frame is the same
+  // provisional composer (see shouldFenceTraexStartupInput). A reattached
+  // live pane is already past it.
   traexNativeStartupInputPending = shouldFenceTraexStartupInput({
     cliId: cfg.cliId,
     programStatusEnabled: programStatusStream !== null,
-    resume: launch.resume,
     adoptMode: cfg.adoptMode,
     remoteViewer: !!remoteWsUrl,
     persistentReattach: launch.persistentReattach,
@@ -16688,7 +16690,9 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
         traexStartupWebRecheck = setTimeout(() => {
           traexStartupWebRecheck = undefined;
           if (backend !== target || cliSpawnGeneration !== generation
-            || Date.now() >= recheckDeadline
+            // Re-read the confirmation at fire time: an owned receipt may have
+            // landed after this callback captured the finite 90s deadline.
+            || Date.now() >= (traexFirstSubmitConfirmed ? Number.POSITIVE_INFINITY : traexFirstPromptDeadlineAt)
             || (cliRestartInProgress && !replacementSpawnInProgress)) return;
           markPromptReady();
           void flushPending();
@@ -16699,20 +16703,25 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
     }
     if (traexStartupRendererWebInputGeneration !== webTerminalInputGeneration
       || traexStartupRendererScreenRevision !== backendScreenRevision) {
-      if (!traexStartupRendererDrain && renderer && Date.now() < recheckDeadline) {
+      // Only this fence's own retry timers are bounded by the 90s window. A
+      // drain driven by an idle edge, a new message or markPromptReady must
+      // still run after it: a footer can resolve later than 90s (cold resume
+      // on a slow network), and Web input after the timeout notice would
+      // otherwise wedge every later message until /restart.
+      if (!traexStartupRendererDrain && renderer) {
         const token = {};
         const target = backend;
         const observedRenderer = renderer;
         const generation = cliSpawnGeneration;
         const revision = backendScreenRevision;
         const inputGeneration = webTerminalInputGeneration;
-        const retryDeadline = recheckDeadline;
+        const retryDeadline = () => traexFirstSubmitConfirmed ? Number.POSITIVE_INFINITY : traexFirstPromptDeadlineAt;
         let accepted = false;
         traexStartupRendererDrain = token;
         void observedRenderer.writeAndFlush('').then(() => {
           if (traexStartupRendererDrain !== token || backend !== target || renderer !== observedRenderer
             || cliSpawnGeneration !== generation || backendScreenRevision !== revision
-            || webTerminalInputGeneration !== inputGeneration || Date.now() >= retryDeadline
+            || webTerminalInputGeneration !== inputGeneration
             || (cliRestartInProgress && !replacementSpawnInProgress)) return;
           traexStartupRendererWebInputGeneration = inputGeneration;
           traexStartupRendererScreenRevision = revision;
@@ -16728,15 +16737,15 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
           if (accepted || (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending)
             || backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
             || (cliRestartInProgress && !replacementSpawnInProgress)
-            || Date.now() >= retryDeadline || traexStartupWebRecheck) return;
+            || Date.now() >= retryDeadline() || traexStartupWebRecheck) return;
           traexStartupWebRecheck = setTimeout(() => {
             traexStartupWebRecheck = undefined;
             if (backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
               || (cliRestartInProgress && !replacementSpawnInProgress)
-              || Date.now() >= retryDeadline) return;
+              || Date.now() >= retryDeadline()) return;
             markPromptReady();
             void flushPending();
-          }, Math.min(1_000, Math.max(0, retryDeadline - Date.now())));
+          }, Math.min(1_000, Math.max(0, retryDeadline() - Date.now())));
           traexStartupWebRecheck.unref?.();
         });
       }
@@ -21109,6 +21118,10 @@ function releaseInputDeliveryQuarantine(
   if (!quarantine || inputDeliveryQuarantine !== quarantine) return false;
   quarantine.cancelReceipt?.();
   inputDeliveryQuarantine = null;
+  // Every release is receipt- or terminal-proven: the quarantined write was
+  // submitted, so a pending TraeX first-input lease may retire at its next
+  // passing admission instead of outliving its 90s recheck window.
+  traexFirstSubmitConfirmed = true;
   if (quarantine.turnId) {
     codexBridgeQueue.setInputDeliveryQuarantined(quarantine.turnId, false, quarantine.dispatchAttempt);
   }
@@ -22880,6 +22893,28 @@ function scheduleSubmitFailureNotify(
     && !!quarantineAtSchedule && turnIdentity?.dispatchAttempt === undefined
     && quarantineAtSchedule?.turnId === turnIdentity?.turnId;
   const draftContent = quarantineAtSchedule?.draftContent ?? msg;
+  if (lastInitConfig?.cliId === 'traex' && !retainTraexReceipt) {
+    // Explain why this submit has no parked-draft rescue: the chain below then
+    // warns once and stops, and only the original receipt can release it.
+    const why = !structuredTarget ? 'structured bridge inactive'
+      : !recheck ? 'adapter supplied no receipt recheck'
+        : !bridgeTurnId ? 'no bridge mark'
+          : turnIdentity?.dispatchAttempt !== undefined ? `durable dispatch attempt ${turnIdentity.dispatchAttempt}`
+            : !quarantineAtSchedule ? 'no input-delivery quarantine'
+              : 'quarantine belongs to another turn';
+    log(`TRAE draft rescue not armed for turn=${turnIdentity?.turnId ?? '-'}: ${why}`);
+  }
+  // One line per distinct reason: after the warning this chain keeps polling
+  // every 20s, and the same skip must not flood the worker log.
+  let traexRescueLastNote: string | undefined;
+  const noteTraexRescue = (note: string): void => {
+    if (note === traexRescueLastNote) return;
+    traexRescueLastNote = note;
+    log(`TRAE draft rescue ${note} turn=${turnIdentity?.turnId ?? '-'}`);
+  };
+  // Set when the one-shot submit key was handed to the backend; the next
+  // recheck reports what the receipt and the composer show after it.
+  let traexRescueReadBackPending = false;
   const deferredAttemptIsCurrent = (): boolean => (
     cliSpawnGeneration === cliGenerationAtSchedule
     && backendAtSchedule !== null
@@ -22941,6 +22976,10 @@ function scheduleSubmitFailureNotify(
           log(`Deferred recheck saw an unattributed same-text receipt — keeping TRAE draft quarantine. preview="${preview}"`);
           armDeferredRecheck();
           return;
+        }
+        if (traexRescueReadBackPending) {
+          traexRescueReadBackPending = false;
+          noteTraexRescue('read-back: owned receipt found after the submit key');
         }
         traexFirstSubmitConfirmed = true;
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
@@ -23038,6 +23077,32 @@ function scheduleSubmitFailureNotify(
       && traexComposerHoldsInput(submitDiagnosisScreen, draftContent, { requireThreadReady: false });
     const traexDraftReady = traexDraftVisible
       && traexComposerHoldsInput(submitDiagnosisScreen, draftContent);
+    if (traexRescueReadBackPending) {
+      traexRescueReadBackPending = false;
+      const stillParked = traexComposerHoldsInput(submitDiagnosisScreen, draftContent, { requireThreadReady: false });
+      noteTraexRescue(`read-back: no receipt after the submit key; composer ${stillParked ? 'still holds' : 'no longer shows'} the original draft`);
+    }
+    if (retainTraexReceipt && !traexDraftVisible) {
+      // Login / API-key screens can carry a device code or a signed URL in the
+      // last row. Keep the diagnostic reason, but apply the same outbound
+      // credential boundary as submitUnconfirmedNotice to this persistent log.
+      const credentialPage = screenShowsCredentialPage(submitDiagnosisScreen);
+      const footerRow = credentialPage ? ''
+        : submitDiagnosisScreen.trimEnd().split(/\r?\n/).at(-1)?.trim().slice(0, 120) ?? '';
+      noteTraexRescue(`skipped: ${
+        quarantineAtSchedule!.draftRescueAttempted ? 'the one-shot submit was already used'
+          : quarantineAtSchedule!.submitWarningSent ? 'the one-shot warning was already sent'
+            : lastInitConfig?.adoptMode ? 'adopted pane'
+              : externalInputGenerationAtWrite === undefined || externalInputGenerationAtWrite !== webTerminalInputGeneration
+                ? 'Web terminal input since the write'
+                : interruptGenerationAtWrite === undefined || interruptGenerationAtWrite !== cliInterruptGeneration
+                  ? 'interrupt since the write'
+                  : !backendScreenEvidenceIsAuthoritativeForMutation() ? 'screen is not authoritative'
+                    : credentialPage
+                      ? 'the live composer does not show the original draft (last row withheld: credential page)'
+                      : `the live composer does not show the original draft (last row: ${JSON.stringify(footerRow)})`
+      }`);
+    }
     if (traexDraftVisible && !traexDraftReady
       && Date.now() - activityBaselineMs < FIRST_PROMPT_HARD_TIMEOUT_MS) {
       // The provisional startup composer can display the pasted draft while its
@@ -23046,6 +23111,9 @@ function scheduleSubmitFailureNotify(
       log('Deferred recheck: TRAE draft is visible but the native thread is not ready — waiting before rescue');
       armDeferredRecheck();
       return;
+    }
+    if (traexDraftVisible && !traexDraftReady) {
+      noteTraexRescue(`skipped: native thread still not ready ${Math.round((Date.now() - activityBaselineMs) / 1000)}s after the write`);
     }
     if (traexDraftReady) {
       const freshScreen = await traexQuestionCapture();
@@ -23065,6 +23133,7 @@ function scheduleSubmitFailureNotify(
         if (receipt.stale) return;
         if (receipt.action.kind === 'suppress-confirmed'
           || (receipt.action.kind === 'suppress-active' && receipt.action.evidence !== 'pty-output')) {
+          noteTraexRescue(`deferred: ${receipt.action.kind === 'suppress-confirmed' ? 'a receipt' : receipt.action.evidence} appeared before the submit key`);
           armDeferredRecheck();
           return;
         }
@@ -23075,10 +23144,19 @@ function scheduleSubmitFailureNotify(
           quarantineAtSchedule!.draftRescueAttempted = true;
           if (cliAdapter?.pressComposerSubmit?.(adapterInputHandle(backendAtSchedule!))) {
             log('Deferred recheck: unchanged TRAE composer holds the original draft — pressing submit once');
+            noteTraexRescue('submit key accepted by the backend');
+            traexRescueReadBackPending = true;
             armDeferredRecheck();
             return;
           }
+          noteTraexRescue('failed: the backend did not accept the submit key');
+        } else {
+          noteTraexRescue(`skipped: ${receipt.recheckError !== undefined ? 'the receipt recheck threw'
+            : receipt.action.kind === 'suppress-usage-limit' ? 'usage limit reported for this turn'
+              : 'manual input or interrupt during the receipt check'}`);
         }
+      } else {
+        noteTraexRescue('skipped: the fresh capture no longer shows the original draft or input changed');
       }
     }
     // The one-shot notice does not prove the message can never be submitted.
@@ -26865,7 +26943,6 @@ async function spawnCliBody(
   traexNativeStartupInputPending = shouldFenceTraexStartupInput({
     cliId: cfg.cliId,
     programStatusEnabled: programStatusStream !== null,
-    resume: cfg.resume,
     adoptMode: cfg.adoptMode,
     remoteViewer: !!remoteWsUrl,
   });
