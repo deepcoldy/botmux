@@ -14,10 +14,9 @@ export function currentGatewayCallerOpenId(
     if (origin.trustedCaller === null) return undefined;
     if (origin.trustedCaller !== undefined) return origin.callerOpenId;
   }
-  if (ds.session.turnReplyContexts?.[turnId]?.crossChatOrigin) {
-    return undefined;
-  }
-  const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
+  const reply = pickTurnReplyTarget(ds.session, turnId);
+  if (reply?.crossChatOrigin) return undefined;
+  const replyTargetCaller = reply?.senderOpenId;
   if (replyTargetCaller) return replyTargetCaller;
   // Document turns have their own reply-target registry, populated before
   // worker delivery. Never borrow the subscription/session owner or a later turn.

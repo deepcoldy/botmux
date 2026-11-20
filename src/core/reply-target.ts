@@ -291,12 +291,12 @@ export function registryTurnMayAuthenticateHuman(
     ordinaryTurnRecovery?: { logicalTurnId: string; currentTurnId: string };
     failedTurnRecovery?: { turnId: string };
     readonlyTaskContinuation?: { logicalTurnId: string; currentTurnId: string };
-    turnReplyContexts?: Record<string, { crossChatOrigin?: unknown }>;
+    replyTargets?: Record<string, { crossChatOrigin?: unknown; senderOpenId?: string }>;
   },
   turnId: string,
 ): boolean {
   if (!isHumanInboundTurnId(turnId)) return false;
-  if (s.turnReplyContexts?.[turnId]?.crossChatOrigin) return false;
+  if (s.replyTargets?.[turnId]?.crossChatOrigin) return false;
   const ordinary = s.ordinaryTurnRecovery;
   if (ordinary && ordinary.currentTurnId === turnId && turnId !== ordinary.logicalTurnId) return false;
   if (s.failedTurnRecovery?.turnId === turnId) return false;
@@ -724,6 +724,7 @@ export function rehomeReplyTargetState(ds: DaemonSession): void {
         ...(context.replyTargetSenderIsBot !== undefined
           ? { replyTargetSenderIsBot: context.replyTargetSenderIsBot }
           : {}),
+        ...(context.crossChatOrigin ? { crossChatOrigin: context.crossChatOrigin } : {}),
         // `inThread` is deliberately NOT carried over: it describes the shape of
         // the inbound message in the SOURCE chat, which says nothing about the
         // new destination. Readers treat its absence as "unknown" and fall back
@@ -741,6 +742,7 @@ export function rehomeReplyTargetState(ds: DaemonSession): void {
         ...(entry.senderOpenId ? { senderOpenId: entry.senderOpenId } : {}),
         ...(entry.participants?.length ? { participants: entry.participants } : {}),
         ...(entry.participantsIncomplete ? { participantsIncomplete: true } : {}),
+        ...(entry.crossChatOrigin ? { crossChatOrigin: entry.crossChatOrigin } : {}),
       };
     }
     ds.session.replyTargets = targets;

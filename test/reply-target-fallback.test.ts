@@ -26,11 +26,14 @@ import {
   isSubstituteTurn,
   pickTurnReplyTarget,
   reconcileCronTaskReplyAnchors,
+  registryEntryProvesHumanSender,
+  registryTurnMayAuthenticateHuman,
   rehomeReplyTargetState,
   resolveInboundReplyTarget,
   resolveSessionReplyTarget,
 } from '../src/core/reply-target.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { currentGatewayCallerOpenId } from '../src/core/gateway-turn-caller.js';
 import { inheritTriggerReplyAnchor } from '../src/core/trigger-final-suppression.js';
 
 const NOW = new Date().toISOString();
@@ -196,6 +199,33 @@ describe('rehomeReplyTargetState', () => {
       mode: 'thread',
       rootMessageId: 'om_target_topic',
     });
+  });
+
+  it('preserves cross-chat origin while replacing source routing authority', () => {
+    const ds = makeDs();
+    const crossChatOrigin = {
+      sourceChatId: 'oc_source', followedChatId: 'oc_followed', followedRootMessageId: 'om_followed_root',
+    };
+    ds.session.turnReplyContexts = {
+      om_cross: {
+        target: { mode: 'plain', chatId: 'oc_source' },
+        replyTargetSenderOpenId: 'ou_stranger_b', replyTargetSenderIsBot: false, crossChatOrigin,
+      },
+    };
+    ds.session.replyTargets = {
+      om_cross: {
+        updatedAt: NOW, senderOpenId: 'ou_stranger_b',
+        participants: [{ openId: 'ou_stranger_b', isBot: false }], crossChatOrigin,
+      },
+    };
+
+    rehomeReplyTargetState(ds as DaemonSession);
+
+    expect(ds.session.turnReplyContexts.om_cross.crossChatOrigin).toEqual(crossChatOrigin);
+    expect(pickTurnReplyTarget(ds.session, 'om_cross')?.crossChatOrigin).toEqual(crossChatOrigin);
+    expect(registryTurnMayAuthenticateHuman(ds.session, 'om_cross')).toBe(false);
+    expect(registryEntryProvesHumanSender(pickTurnReplyTarget(ds.session, 'om_cross'))).toBe(false);
+    expect(currentGatewayCallerOpenId(ds as DaemonSession, 'om_cross')).toBeUndefined();
   });
 });
 
