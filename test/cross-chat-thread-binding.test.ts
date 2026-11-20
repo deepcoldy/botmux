@@ -86,7 +86,7 @@ import {
 import { crossChatFollowThreadPath } from '../src/services/cross-chat-follow-thread-store.js';
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
 import { cleanupSessionBridgeSendMarkersNow } from '../src/services/session-store.js';
-import { renderCrossChatReplyHint, renderInboundMessageLocation } from '../src/core/reply-message.js';
+import { renderCrossChatReplyHint, renderInboundMessageLocation, crossChatOriginForSend, crossChatSenderForSend } from '../src/core/reply-message.js';
 import {
   beginReplyTargetTurn,
   pickTurnReplyTarget,
@@ -371,6 +371,28 @@ describe('cross-chat followed thread binding', () => {
     expect(registryTurnMayAuthenticateHuman(ds.session, 'om_reply_in_b')).toBe(false);
     expect(registryEntryProvesHumanSender(picked)).toBe(false);
     expect(currentGatewayCallerOpenId(ds, 'om_reply_in_b')).toBeUndefined();
+  });
+
+  it('uses durable cross-chat origin and origin-chat sender even after reply indexes are pruned', () => {
+    const crossChatOrigin = {
+      sourceChatId: GROUP_A, followedChatId: GROUP_B, followedRootMessageId: SENT_ROOT_IN_B,
+    };
+    expect(crossChatOriginForSend({ frozenTurnDispatch: { crossChatOrigin } })).toBe(crossChatOrigin);
+    expect(crossChatSenderForSend({
+      crossChatOrigin, sendingToOriginSessionChat: true,
+      frozenTurnSender: 'ou_stranger_b', perTurnSender: 'ou_stranger_b', originOwner: 'ou_owner_a',
+    })).toBe('ou_owner_a');
+    expect(crossChatSenderForSend({
+      crossChatOrigin, sendingToOriginSessionChat: true,
+      frozenTurnSender: 'ou_stranger_b', perTurnSender: 'ou_stranger_b', originQuoteSender: 'ou_quote_a',
+    })).toBe('ou_quote_a');
+    expect(crossChatSenderForSend({
+      crossChatOrigin, sendingToOriginSessionChat: false,
+      frozenTurnSender: 'ou_stranger_b', perTurnSender: 'ou_stranger_b', originOwner: 'ou_owner_a',
+    })).toBe('ou_stranger_b');
+    expect(crossChatSenderForSend({
+      sendingToOriginSessionChat: true, frozenTurnSender: 'ou_local',
+    })).toBe('ou_local');
   });
 
   it('keeps registry and gateway authentication closed when a pinned reply target outlives the context map', () => {

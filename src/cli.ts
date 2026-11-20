@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
 import { sendCompletionHintKey } from './services/send-completion-hint.js';
-import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
+import { selectReplyMessageId, parseReplyMessageTarget, crossChatOriginForSend, crossChatSenderForSend } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
@@ -419,7 +419,7 @@ import {
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import { recordBridgeReplyMarker } from './services/bridge-reply-marker.js';
-import { effectiveCrossChatFollowThreadMode, recordCrossChatFollowThreadBinding } from './services/cross-chat-follow-thread-store.js';
+import { effectiveCrossChatFollowThreadMode, replayOrThrowThenPersistOff, ensureCrossChatFollowThreadAtBinding } from './services/cross-chat-follow-thread-store.js';
 import { recordSessionTurnReply } from './services/session-turns.js';
 import {
   commitRestartIntentAttemptTo,
@@ -4466,6 +4466,7 @@ interface SessionData {
   ownerUnionId?: string;
   creatorOpenId?: string;
   lastCallerOpenId?: string;
+  lastCallerIsBot?: boolean;
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
@@ -12297,13 +12298,6 @@ async function cmdSend(
   }
   const turnReplyTarget = pickTurnReplyTarget(s, replyMessageId);
   const replyContextForQuote = s.turnReplyContexts?.[replyMessageId ?? ''];
-  const isCrossChatOriginTurn = !!(replyContextForQuote?.crossChatOrigin ?? s.replyTargets?.[replyMessageId ?? '']?.crossChatOrigin);
-  const turnBoundQuoteTarget = isCrossChatOriginTurn
-    ? ((!overrideChatId || overrideChatId === s.chatId) ? s.quoteTargetId : undefined)
-    : (turnReplyTarget?.rootMessageId
-      ?? replyContextForQuote?.quoteTargetId
-      ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
-      ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined));
   if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
     console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
     process.exit(2);
@@ -12402,6 +12396,17 @@ async function cmdSend(
   const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
     ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
   const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
+  const isCrossChatOriginTurn = !!crossChatOriginForSend({
+    replyContext: replyContextForQuote,
+    replyTarget: s.replyTargets?.[replyMessageId ?? ''],
+    frozenTurnDispatch,
+  });
+  const turnBoundQuoteTarget = isCrossChatOriginTurn
+    ? ((!overrideChatId || overrideChatId === s.chatId) ? s.quoteTargetId : undefined)
+    : (turnReplyTarget?.rootMessageId
+      ?? replyContextForQuote?.quoteTargetId
+      ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
+      ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined));
   if (exactOriginDispatch?.deliverySink === 'http_wait'
     || exactOriginDispatch?.deliverySink === 'http_async'
     || exactOriginDispatch?.deliverySink === 'suppressed') {
@@ -12862,25 +12867,33 @@ async function cmdSend(
     process.exit(2);
   }
   const currentTurnCrossChatOrigin = currentTurnId
-    ? (s.turnReplyContexts?.[currentTurnId]?.crossChatOrigin
-      ?? s.replyTargets?.[currentTurnId]?.crossChatOrigin)
+    ? crossChatOriginForSend({
+        replyContext: s.turnReplyContexts?.[currentTurnId],
+        replyTarget: s.replyTargets?.[currentTurnId],
+        frozenTurnDispatch,
+      })
     : undefined;
   const sendingToOriginSessionChat = (!overrideChatId || overrideChatId === s.chatId) && !sendInto;
+  // #750: legacySender is consulted only for a true no-turn send. A turn-scoped
+  // map miss never borrows the mutable latest quote slot for mention-back.
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-    ?? frozenTurnDispatch?.replyTargetSenderOpenId
-    ?? (currentTurnCrossChatOrigin && sendingToOriginSessionChat
-      ? (s.quoteTargetSenderOpenId ?? s.lastCallerOpenId ?? s.ownerOpenId ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId)
-      : undefined)
-    ?? pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
-    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
-    // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
-    // borrowed as a legacy fallback when there is NO currentTurnId (true
-    // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
-    // resolve to NO sender — never the global slot, which may have advanced to a
-    // DIFFERENT turn B and would mis-@ B as A's --mention-back (the cross-turn
-    // bug #750 fixed). pickTurnReplyTarget already enforces
-    // quoteTargetId===currentTurnId for its own hit.
-    ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
+    ?? crossChatSenderForSend({
+      crossChatOrigin: currentTurnCrossChatOrigin,
+      sendingToOriginSessionChat,
+      frozenTurnSender: frozenTurnDispatch?.replyTargetSenderOpenId,
+      perTurnSender: pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
+        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId,
+      legacySender: currentTurnId ? undefined : s.quoteTargetSenderOpenId,
+      originQuoteSender: s.quoteTargetSenderOpenId,
+      originLastCaller: s.lastCallerOpenId,
+      originOwner: s.ownerOpenId,
+    });
+  const replyTargetSenderIsBot = currentTurnCrossChatOrigin && sendingToOriginSessionChat
+    ? (replyTargetSenderOpenId ? (s.quoteTargetSenderIsBot ?? s.lastCallerIsBot ?? false) : undefined)
+    : frozenTurnDispatch?.replyTargetSenderIsBot
+      ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
+      ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
+      ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
   const proposalRequesterIsExactHuman = !!currentTurnId
     && !!replyTargetSenderOpenId
     && collectTurnWindowParticipants(s, currentTurnId).participants
@@ -13074,17 +13087,6 @@ async function cmdSend(
     sourceChatId: (originSession ?? s).chatId,
     noFollowThread,
   });
-  if (effectiveFollowThreadMode === 'off' && sendInto) {
-    const persisted = recordCrossChatFollowThreadBinding(resolveDataDir(), originSessionId ?? sid, {
-      sentAtMs: Date.now(), deliveryKind: 'detoured_send', targetChatId: followThreadTargetChatId,
-      targetRootMessageId: sendInto, crossChatFollowThread: 'off',
-      followThreadEpoch: (originSession ?? s).followThreadEpoch,
-    });
-    if (!persisted) {
-      console.error('botmux send: 无法持久化 --no-follow-thread，已中止发送（未向飞书投递）');
-      process.exit(2);
-    }
-  }
   const turnRequestIdentity = canonicalJson({
     version: 1,
     content: expectedLinkRenderedContent,
@@ -13180,13 +13182,26 @@ async function cmdSend(
   let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
   try {
     existingTurnPrimary = turnSendKey
-      ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, turnRequestIdentity)
+      ? await replayOrThrowThenPersistOff(turnSendLedger, turnSendKey, effectiveResponseKind, turnRequestIdentity,
+        effectiveFollowThreadMode === 'off' && sendInto ? {
+          dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, targetChatId: followThreadTargetChatId,
+          targetRootMessageId: sendInto, followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        } : undefined)
       : undefined;
   } catch (error) {
     console.error(`botmux send refused: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    if (effectiveFollowThreadMode === 'at') {
+      const bound = ensureCrossChatFollowThreadAtBinding({
+        dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs: Date.now(),
+        messageId: existingTurnPrimary.messageId, targetChatId: followThreadTargetChatId,
+        ...(sendInto ? { targetRootMessageId: sendInto } : {}),
+        followThreadEpoch: (originSession ?? s).followThreadEpoch,
+      });
+      if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
+    }
     // A retry after a lost reply-card mark completes it; a final already on
     // the card is left alone by the store.
     if (effectiveResponseKind === 'final' && currentTurnId) {
@@ -13422,6 +13437,16 @@ async function cmdSend(
         sourceChatId: (originSession ?? s).chatId,
         noFollowThread,
       });
+      if (voiceDelivery.replayed && voiceCrossChatFollowThread === 'at') {
+        const voiceFollowRoot = deferredTopicRootMessageIdForOutput ?? sendInto;
+        const bound = ensureCrossChatFollowThreadAtBinding({
+          dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs, messageId,
+          targetChatId: voicePrimaryOutputChatId,
+          ...(voiceFollowRoot ? { targetRootMessageId: voiceFollowRoot } : {}),
+          followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        });
+        if (!bound) console.error('botmux send: 已复用语音投递，但跨群话题绑定补建失败');
+      }
       if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
         || !!(originTurnId ?? currentTurnId)
         || !!deferredTopicRootMessageIdForOutput
@@ -14640,13 +14665,15 @@ async function cmdSend(
     // （Codex review P2）。--top-level 同样无特定收件人。
     const frozenFooterAddressingSource = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
       ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
-      : frozenTurnDispatch?.replyTargetSenderOpenId
-        ? {
-            ...s,
-            lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId,
-            lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot,
-          }
-        : s;
+      : currentTurnCrossChatOrigin && sendingToOriginSessionChat
+        ? { ...s, lastCallerOpenId: replyTargetSenderOpenId ?? s.ownerOpenId, lastCallerIsBot: replyTargetSenderIsBot }
+        : frozenTurnDispatch?.replyTargetSenderOpenId
+          ? {
+              ...s,
+              lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId,
+              lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot,
+            }
+          : s;
     const footerAddressing = (sendTopLevel || noMention)
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
       : buildFooterAddressing(frozenFooterAddressingSource, {
@@ -14924,13 +14951,6 @@ async function cmdSend(
       if (feedbackBaseCard && replyCardJson !== withOncall) feedbackBaseCard = JSON.parse(replyCardJson);
       const replyStore = new TurnReplyCardStore(resolveDataDir());
       const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
-      const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
-        ?? (currentTurnCrossChatOrigin && sendingToOriginSessionChat && replyTargetSenderOpenId && replyTargetSenderOpenId === (s.quoteTargetSenderOpenId ?? s.lastCallerOpenId ?? s.ownerOpenId)
-          ? (s.quoteTargetSenderIsBot ?? false)
-          : undefined)
-        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
-        ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
-        ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
       // Mentioning this turn's human requester is still an ordinary reply.
       // Peer bots, other recipients and unknown identities need a new message
       // so their notification/automation cannot be swallowed by a PATCH.
@@ -15039,6 +15059,15 @@ async function cmdSend(
     // after waiting. Stop here so the losing process cannot repeat indexing,
     // attachments, urgency, bridge markers, or attention side effects.
     if (turnPrimaryReplayed) {
+      if (crossChatFollowThread === 'at') {
+        const bound = ensureCrossChatFollowThreadAtBinding({
+          dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs, messageId,
+          targetChatId,
+          ...(sendTarget.mode !== 'plain' ? { targetRootMessageId: sendTarget.rootMessageId } : {}),
+          followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        });
+        if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
+      }
       // Reusing a receipt is not a new send. Preserve the original marker's
       // time, including when another input arrived while we waited on the lock.
       // The first sender may have lost the reply-card mark; it is idempotent.

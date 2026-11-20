@@ -1,6 +1,6 @@
 import './helpers/require-fenced-data-dir.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,7 +21,9 @@ vi.mock('node:fs', async (importOriginal) => {
 import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
 import {
   effectiveCrossChatFollowThreadMode,
+  ensureCrossChatFollowThreadAtBinding,
   recordCrossChatFollowThreadBinding,
+  replayOrThrowThenPersistOff,
 } from '../src/services/cross-chat-follow-thread-store.js';
 import {
   __clearCrossChatFollowBindingCacheForTest,
@@ -100,9 +102,37 @@ describe('cross-chat follow store failure and replay semantics', () => {
       controls: { followThread: mode(noFollowThread) },
     });
     await ledger.execute(key, 'final', identity(false), async () => 'om_root_b');
-    await expect(ledger.replayOrThrow(key, 'final', identity(false)))
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 1000, deliveryKind: 'detoured_send', messageId: 'om_root_b',
+      targetChatId: 'oc_followed', crossChatFollowThread: 'at',
+    });
+    await expect(replayOrThrowThenPersistOff(ledger, key, 'final', identity(false)))
       .resolves.toEqual({ messageId: 'om_root_b', replayed: true });
-    await expect(ledger.replayOrThrow(key, 'final', identity(true)))
-      .rejects.toThrow('目标、提及或附件与已投递请求不同');
+    await expect(replayOrThrowThenPersistOff(ledger, key, 'final', identity(true), {
+      dataDir: tempDir, sessionId: 'sess-a', targetChatId: 'oc_followed', targetRootMessageId: 'om_root_b',
+    })).rejects.toThrow('目标、提及或附件与已投递请求不同');
+    expect(resolve()).not.toBeNull();
+  });
+
+  it('backfills a missing at binding without duplicating or reviving an off root', () => {
+    expect(ensureCrossChatFollowThreadAtBinding({
+      dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 1000, messageId: 'om_root_b', targetChatId: 'oc_followed',
+    })).toBe(true);
+    expect(resolve()).not.toBeNull();
+    expect(ensureCrossChatFollowThreadAtBinding({
+      dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 1000, messageId: 'om_root_b', targetChatId: 'oc_followed',
+    })).toBe(true);
+    expect(readFileSync(join(tempDir, '.dashboard-secret.cross-chat-follow-thread', 'sess-a.jsonl'), 'utf-8')
+      .trim().split('\n')).toHaveLength(1);
+
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 2000, deliveryKind: 'detoured_send', targetRootMessageId: 'om_root_b',
+      targetChatId: 'oc_followed', crossChatFollowThread: 'off',
+    });
+    expect(resolve()).toBeNull();
+    expect(ensureCrossChatFollowThreadAtBinding({
+      dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 1000, messageId: 'om_root_b', targetChatId: 'oc_followed',
+    })).toBe(true);
+    expect(resolve()).toBeNull();
   });
 });

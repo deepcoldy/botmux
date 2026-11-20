@@ -32,6 +32,34 @@ export interface InboundMessageLocation {
   };
 }
 
+export function crossChatOriginForSend(input: {
+  replyContext?: { crossChatOrigin?: InboundMessageLocation['crossChatOrigin'] };
+  replyTarget?: { crossChatOrigin?: InboundMessageLocation['crossChatOrigin'] };
+  frozenTurnDispatch?: { crossChatOrigin?: InboundMessageLocation['crossChatOrigin'] };
+}): InboundMessageLocation['crossChatOrigin'] | undefined {
+  return input.replyContext?.crossChatOrigin
+    ?? input.replyTarget?.crossChatOrigin
+    ?? input.frozenTurnDispatch?.crossChatOrigin;
+}
+
+/** A followed-chat sender is never the origin session's implicit addressee.
+ * Only an explicit send back into the followed chat may retain that sender. */
+export function crossChatSenderForSend(input: {
+  crossChatOrigin?: InboundMessageLocation['crossChatOrigin'];
+  sendingToOriginSessionChat: boolean;
+  frozenTurnSender?: string;
+  perTurnSender?: string;
+  legacySender?: string;
+  originQuoteSender?: string;
+  originLastCaller?: string;
+  originOwner?: string;
+}): string | undefined {
+  if (!input.crossChatOrigin || !input.sendingToOriginSessionChat) {
+    return input.frozenTurnSender ?? input.perTurnSender ?? input.legacySender;
+  }
+  return input.originQuoteSender ?? input.originLastCaller ?? input.originOwner;
+}
+
 export function renderCrossChatReplyHint(cross: NonNullable<InboundMessageLocation['crossChatOrigin']>): string {
   const escape = (value: string) => value.replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;',
