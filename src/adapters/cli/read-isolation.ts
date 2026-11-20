@@ -240,6 +240,7 @@ export const DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME = '.device-credential-i
 function hostDeviceAuthorityPaths(root: string): string[] {
   return [
     `${root}/${DEVICE_AUTHORITY_DIRECTORY}`,
+    `${root}/antigravity-accounts`,
     ...HOST_DEVICE_CREDENTIAL_FILES.map(file => `${root}/${file}`),
   ];
 }

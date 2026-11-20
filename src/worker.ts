@@ -478,6 +478,13 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
+import {
+  inspectAntigravityAccounts,
+  reconcileActiveAntigravityToken,
+  resolveAntigravitySpawnStoreOptions,
+  type AntigravityAccountStoreOptions,
+  type ReconcileAntigravityTokenResult,
+} from './services/antigravity-accounts.js';
 import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
@@ -26486,6 +26493,61 @@ function resolveCliExtraArgs(): string[] {
   return cliExtraArgs;
 }
 
+/** Keep the credential-only mount target present even before the first account
+ * is imported. Otherwise a later host-side save/login becomes visible through
+ * the pane's bind-mounted root. */
+function prepareAntigravityAccountsCredentialMask(
+  root: string,
+  hideDirectories: Set<string>,
+  hideFiles: Set<string>,
+): void {
+  const directory = join(root, 'antigravity-accounts');
+  try {
+    const stat = lstatSync(directory);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      hideDirectories.add(realpathSync(directory));
+    } else {
+      hideFiles.add(directory);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    mkdirSync(directory, { mode: 0o700 });
+    hideDirectories.add(realpathSync(directory));
+  }
+}
+
+/** Reconcile the exact credential HOME visible to the child. A managed vault
+ * error is a pre-spawn failure, never permission to boot a disabled/unknown
+ * account with whatever live file happens to remain. */
+function reconcileAntigravitySpawnAccount(
+  opts: AntigravityAccountStoreOptions,
+): { reconciled: ReconcileAntigravityTokenResult; accountId: string } | undefined {
+  const reconciled = reconcileActiveAntigravityToken(opts);
+  if (!reconciled.managed) return undefined;
+  if (reconciled.error || !reconciled.activeId) {
+    throw new Error(`Antigravity 账号预检失败：${reconciled.error ?? 'active_account_missing'}`);
+  }
+  return { reconciled, accountId: reconciled.activeId };
+}
+
+/** A post-spawn observation is only an account hint when the live file still
+ * matches the account we reconciled. A racing agy rewrite becomes UNKNOWN, not
+ * a false attestation for automatic recovery. */
+function confirmAntigravitySpawnAccount(
+  opts: AntigravityAccountStoreOptions,
+  expectedAccountId: string,
+): string | null {
+  try {
+    const inspection = inspectAntigravityAccounts(opts);
+    const active = inspection.accounts.find(account => account.id === expectedAccountId);
+    return inspection.activeId === expectedAccountId && active?.hasValidToken && inspection.liveTokenMatchesActive
+      ? expectedAccountId
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /** One-shot guard for the tmux version / crash-exit-code degradation self-check. */
 let hasLoggedTmuxVersionSelfCheck = false;
 
@@ -31417,6 +31479,7 @@ async function spawnCliBody(
         mkdirSync(authorityDirectory, { mode: 0o700 });
       }
       hideDirectories.add(realpathSync(authorityDirectory));
+      prepareAntigravityAccountsCredentialMask(root, hideDirectories, hideFiles);
       for (const name of readdirSync(root)) {
         if (name === DEVICE_AUTHORITY_DIRECTORY) continue;
         if (!isCredentialIsolationReservedBasename(name)
@@ -31765,6 +31828,26 @@ async function spawnCliBody(
     }
     const spawnBackend = backend;
     const spawnCliBin = cliAdapter.resolvedBin;
+    let spawnedAntigravityAccountReport: { accountId: string } | undefined;
+    let antigravitySpawnStoreOptions: AntigravityAccountStoreOptions | undefined;
+    if (cfg.cliId === 'antigravity' && !willReattachPersistent && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
+      const effectiveChildEnv = { ...spawnEnvPlan.childEnv, ...spawnEnvPlan.injectEnv };
+      antigravitySpawnStoreOptions = resolveAntigravitySpawnStoreOptions({
+        effectiveHome: effectiveChildEnv.HOME,
+        botmuxConfigDir: configuredBotmuxHome,
+        env: effectiveChildEnv,
+      });
+      const prepared = reconcileAntigravitySpawnAccount(antigravitySpawnStoreOptions);
+      if (prepared) {
+        const { reconciled } = prepared;
+        spawnedAntigravityAccountReport = { accountId: prepared.accountId };
+        if (reconciled.advancedFrom) {
+          log(`Antigravity account pre-spawn advance: ${reconciled.advancedFrom} -> ${reconciled.activeId}`);
+        } else if (reconciled.restored) {
+          log(`Antigravity live token restored to active account ${reconciled.activeId}`);
+        }
+      }
+    }
     spawnWithCodexModelLaunch({
       dataDir: config.session.dataDir, sessionId: cfg.sessionId, launch: nativeModelLaunch,
       reattached: () => 'isReattach' in spawnBackend && spawnBackend.isReattach === true,
@@ -31827,6 +31910,17 @@ async function spawnCliBody(
         });
       },
     });
+    if (spawnedAntigravityAccountReport && antigravitySpawnStoreOptions
+      && !('isReattach' in spawnBackend && spawnBackend.isReattach === true)) {
+      send({
+        type: 'antigravity_account',
+        accountId: confirmAntigravitySpawnAccount(
+          antigravitySpawnStoreOptions,
+          spawnedAntigravityAccountReport.accountId,
+        ),
+        ...(activeRestartAttemptId ? { attemptId: activeRestartAttemptId } : {}),
+      });
+    }
     if (!willReattachPersistent) {
       writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
       // Which configured environment this CLI really got (Dashboard marks a
@@ -40218,11 +40312,21 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
       });
       await restartCliProcess(
-        msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
-        // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
-        // FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
+        msg.updateWorkingDir
+          ? `cwd-move respawn → ${msg.updateWorkingDir}`
+          : msg.reason === 'account_rotation'
+            ? 'antigravity account rotation'
+            : 'daemon request',
+        // cwd-move / topicEffort / account_rotation 是主动运维/轮换迁移、不是崩溃恢复，
+        // 不计入 tier-2 强制 FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
         // auto-restart 那条裸 restart 的计数兜底。
-        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort, ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}) },
+        {
+          preservePending: true,
+          immediate: msg.reason === 'account_rotation',
+          skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort || msg.reason === 'account_rotation',
+          ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}),
+          ...(msg.reason === 'account_rotation' ? { restartCause: 'antigravity-account-rotation' as const } : {}),
+        },
       );
       break;
     }
