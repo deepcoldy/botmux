@@ -172,8 +172,8 @@ export function resolveCrossChatFollowedThread(input: {
     const markers = readSessionFollowBindings(dataDir, s.sessionId);
     if (markers.length === 0) continue;
 
-    // Group by canonical thread root in the target chat so a later --no-follow-thread
-    // on the same root can override an earlier marker for that session.
+    // Append order is the durable override order for this session/root: an off
+    // tombstone must win even if the wall clock moves backward between writes.
     const latestByCanonicalRoot = new Map<string, BridgeSendMarker>();
     for (const marker of markers) {
       if (marker.sessionId !== s.sessionId
@@ -187,12 +187,7 @@ export function resolveCrossChatFollowedThread(input: {
         : (marker.messageId && MESSAGE_ID_RE.test(marker.messageId))
           ? marker.messageId
           : validRoots[0];
-      const prev = latestByCanonicalRoot.get(canonicalRoot);
-      const sentAtMs = Number.isFinite(marker.sentAtMs) ? marker.sentAtMs : 0;
-      const prevMs = prev && Number.isFinite(prev.sentAtMs) ? prev.sentAtMs : -1;
-      if (!prev || sentAtMs >= prevMs) {
-        latestByCanonicalRoot.set(canonicalRoot, marker);
-      }
+      latestByCanonicalRoot.set(canonicalRoot, marker);
     }
 
     for (const [canonicalRootId, marker] of latestByCanonicalRoot) {

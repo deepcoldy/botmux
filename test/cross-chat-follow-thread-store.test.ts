@@ -76,6 +76,18 @@ describe('cross-chat follow store failure and replay semantics', () => {
     expect(resolve()).toBeNull();
   });
 
+  it('uses durable append order rather than wall-clock time for off/at overrides', () => {
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 2000, deliveryKind: 'detoured_send', messageId: 'om_root_b',
+      targetChatId: 'oc_followed', crossChatFollowThread: 'at',
+    });
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 1000, deliveryKind: 'detoured_send', targetRootMessageId: 'om_root_b',
+      targetChatId: 'oc_followed', crossChatFollowThread: 'off',
+    });
+    expect(resolve()).toBeNull();
+  });
+
   it('makes a follow-mode change a durable replay conflict instead of a silent replay', async () => {
     const ledger = new TurnSendLedger(tempDir);
     const key = { larkAppId: 'cli_cross', sessionId: 'sess-a', turnId: 'om_turn' };
