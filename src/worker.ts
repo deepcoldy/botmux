@@ -40,7 +40,7 @@ import {
 import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
-import {claudeActionPrompt} from './services/claude-action-prompt.js';
+import {ClaudePermissionNoticeTracker} from './services/claude-action-prompt.js';
 import { PromptSuggestionPublisher, promptSuggestionReportTurn, type FoldedTypeAheadTurn } from './utils/prompt-suggestion-publisher.js';
 import { CliRecapObserver, RECAP_MODEL_SYSTEM_PROMPT, TurnRecapRecorder } from './services/turn-recap.js';
 import { recapModelLaunchFor, runRecapModel, type RecapModelLaunch } from './services/turn-recap-runner.js';
@@ -25271,6 +25271,36 @@ function sendToPty(
 
 // ─── Screen Update Timer ─────────────────────────────────────────────────────
 
+async function captureClaudePermissionNoticeScreen(): Promise<{ screen: string; runtimeKey: string; observationKey: string } | undefined> {
+  const target = backend;
+  const targetRenderer = renderer;
+  const generation = cliSpawnGeneration;
+  const lifetime = cliLifetimeNonce;
+  const turn = currentBotmuxTurnId;
+  const attempt = currentBotmuxDispatchAttempt;
+  const input = webTerminalInputGeneration;
+  const revision = backendScreenRevision;
+  const startedAt = Date.now();
+  if (!target || lastInitConfig?.cliId !== 'claude-code' || cliRestartInProgress) return;
+  let screen: string | null | undefined;
+  try {
+    if (target.captureViewport || target.captureCurrentScreen) {
+      screen = (await snapshotToText(target, renderCols, renderRows, { filter: false }))?.content;
+    } else if (targetRenderer) {
+      await targetRenderer.writeAndFlush('');
+      screen = targetRenderer.rawSnapshot();
+    }
+  } catch { return; }
+  if (screen == null || backend !== target || renderer !== targetRenderer
+    || generation !== cliSpawnGeneration || lifetime !== cliLifetimeNonce
+    || turn !== currentBotmuxTurnId || attempt !== currentBotmuxDispatchAttempt
+    || input !== webTerminalInputGeneration || cliRestartInProgress
+    || revision !== backendScreenRevision || Date.now() - startedAt > SCREEN_UPDATE_INTERVAL_MS
+    || (workerSessionEventScope && !hasCurrentSessionRuntime())) return;
+  const runtimeKey = JSON.stringify([generation, lifetime, turn, attempt]);
+  return { screen, runtimeKey, observationKey: JSON.stringify([runtimeKey, input]) };
+}
+
 function startScreenUpdates(): void {
   // renderCols / renderRows were set by the init handler from cfg, so
   // adopt-mode panes (e.g. 270x57) get an xterm-headless of matching
@@ -25283,9 +25313,8 @@ function startScreenUpdates(): void {
   let lastSentBackgroundWait = 0;
   let lastTextSnapshotHash = '';
   let lastContent = '';
-  // Last Claude permission dialog already notified (dedup by projection text;
-  // cleared when the dialog leaves the screen so the next one notifies again).
-  let lastClaudeActionPrompt = '';
+  const permissionNotice = new ClaudePermissionNoticeTracker();
+  let permissionCaptureSequence = 0;
   // The CLI's own next-input suggestion (adapters with promptSuggestion only).
   const promptSuggestions = new PromptSuggestionPublisher();
   // PTY-activity watermark of the last tick that actually captured. The screen
@@ -25297,9 +25326,11 @@ function startScreenUpdates(): void {
   // watermark — there we must capture every tick (see shouldCaptureScreen).
   let lastSnapshotPtyActivity = -1;
   let lastSnapshotGridRevision = observedPaneGridRevision;
-  screenUpdateTimer = setInterval(() => {
+  const sample = () => {
     const capacityBackend = backend;
     const capacityGeneration = cliSpawnGeneration;
+    const ownsSample = () => backend === capacityBackend && cliSpawnGeneration === capacityGeneration
+      && (!workerSessionEventScope || hasCurrentSessionRuntime());
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
       if (renderer) observeTraexAutoModelCapacity(renderer.rawSnapshot());
@@ -25384,7 +25415,8 @@ function startScreenUpdates(): void {
           // from tmux every tick. This eliminates the accumulated-buffer drift
           // that produced duplicated/staircase text in 'text' display mode.
           const suggestionReader = cliAdapter?.promptSuggestion;
-          const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true, ...(suggestionReader ? { cells: true } : {}) });
+          const pipeText = await snapshotToText(capacityBackend, renderCols, renderRows, { filter: true, ...(suggestionReader ? { cells: true } : {}) });
+          if (!ownsSample()) return null;
           if (pipeText) {
             content = pipeText.content;
             if (suggestionReader && pipeText.cells) promptSuggestions.observe(suggestionReader(pipeText.cells), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
@@ -25396,7 +25428,8 @@ function startScreenUpdates(): void {
             // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
             // tmux call would otherwise need to fire twice per tick.
             if (changed) {
-              const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
+              const rawSnap = await snapshotToText(capacityBackend, renderCols, renderRows, { filter: false });
+              if (!ownsSample()) return null;
               if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
             }
             nativeScreen = lastAnalyzerSnapshot;
@@ -25414,7 +25447,7 @@ function startScreenUpdates(): void {
 
         return { content, changed, refreshed, nativeScreen, observedAtMs };
       }, projectedRuntimeScreenStatus);
-      if (!snapshot) return;
+      if (!snapshot || !ownsSample()) return;
       // TRAE's question page sits still once drawn: the tick's screen catches
       // one the per-chunk hold check missed (its card is raised from a fresh
       // capture, see core/traex-question-bridge.ts).
@@ -25452,14 +25485,14 @@ function startScreenUpdates(): void {
       // daemon's scopedReply falls back to the session anchor. The projection
       // is narrow: only the bounded title/question/options leave the
       // terminal, never tool args.
-      if (lastInitConfig?.cliId === 'claude-code') {
-        const prompt = claudeActionPrompt(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
-        if (prompt && prompt !== lastClaudeActionPrompt) {
-          lastClaudeActionPrompt = prompt;
-          send({type: 'user_notify', kind: 'claude_permission_prompt', message: prompt, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
-        } else if (!prompt) {
-          lastClaudeActionPrompt = '';
-        }
+      if (lastInitConfig?.cliId === 'claude-code'
+        && permissionNotice.needsCapture([snapshot.nativeScreen, renderer?.rawSnapshot(), snapshot.content])) {
+        const captureSequence = ++permissionCaptureSequence;
+        const current = await captureClaudePermissionNoticeScreen();
+        if (!ownsSample() || captureSequence !== permissionCaptureSequence) return;
+        const prompt = permissionNotice.observe(current?.screen, current?.runtimeKey ?? '', Date.now(), current?.observationKey);
+        if (prompt) send({type: 'user_notify', kind: 'claude_permission_prompt', message: prompt,
+          permissionPromptStable: true, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
       }
       const screenTurn = { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt };
       const suggestion = promptSuggestions.take(usageAware.status, screenTurn,
@@ -25493,6 +25526,15 @@ function startScreenUpdates(): void {
         });
       }
     })();
+  };
+  screenUpdateTimer = setInterval(() => {
+    // This worker-wide timer starts before spawn; pin each sample, not the timer,
+    // to the runtime it observes so delayed frames retain their original fence.
+    const scope = workerSessionEventScope;
+    const binding = scope?.currentBinding();
+    if (scope && !binding) return;
+    if (scope && binding) scope.run(binding, sample);
+    else sample();
   }, SCREEN_UPDATE_INTERVAL_MS);
 }
 

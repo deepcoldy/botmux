@@ -25403,11 +25403,13 @@ function setupWorkerHandlers(
           });
           break;
         }
-        logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
-        emitSessionLifecycleHook(ds, 'session.requires_attention', {
-          reason: 'user_notify',
-          message: msg.message,
-        });
+        if (msg.kind !== 'claude_permission_prompt') {
+          logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+          emitSessionLifecycleHook(ds, 'session.requires_attention', {
+            reason: 'user_notify',
+            message: msg.message,
+          });
+        }
         // What a resumed CLI lost to a backend outage goes on the topic's one
         // outage status card instead of a separate message.
         if (msg.kind === 'restart_interruption'
@@ -25416,11 +25418,21 @@ function setupWorkerHandlers(
         // The card already asks about this dialog. Fork agents and sessions
         // without the hook get no card and keep this notice.
         if (msg.kind === 'claude_permission_prompt') {
-          if (!permissionCardPending(ds)) await new Promise(resolve => setTimeout(resolve, PERMISSION_CARD_GRACE_MS));
+          const turn = ds.currentTurnId;
+          // New workers wait on fresh captures. Retain the grace for old workers.
+          if (!msg.permissionPromptStable && !permissionCardPending(ds)) {
+            await new Promise(resolve => setTimeout(resolve, PERMISSION_CARD_GRACE_MS));
+          }
+          if (!ownsLifecycleMutation() || ds.currentTurnId !== turn) break;
           if (permissionCardPending(ds)) {
             logger.info(`[${t}] Claude permission dialog notice skipped: PermissionRequest card pending`);
             break;
           }
+          logger.warn(`[${t}] Worker user_notify: ${msg.message}`);
+          emitSessionLifecycleHook(ds, 'session.requires_attention', {
+            reason: 'user_notify',
+            message: msg.message,
+          });
         }
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
         if (msg.kind === 'structured_turn_not_collected' && msg.turnId && ownsLifecycleMutation()) {

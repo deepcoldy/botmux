@@ -2920,6 +2920,8 @@ export type WorkerToDaemonBase =
          *  (restart-interruption.ts). During a backend outage the daemon folds
          *  it into the topic's single outage status card. */
         | 'restart_interruption';
+      /** Permission prompt persisted across fresh worker captures; no daemon-side grace needed. */
+      permissionPromptStable?: boolean;
       /** Bounded plain-text bottom of the screen for an input_not_submitted
        *  notice (core/stuck-page-catalog stuckScreenTail). The daemon renders
        *  the notice as a card with this text; absent = plain text as before. */

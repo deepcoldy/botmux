@@ -34,6 +34,36 @@ function projectDialogLines(screen: string): string[] {
     .map(line => line.replace(/[│┃╭╮╰╯┌┐└┘─━╌]/g, ' ').trim());
 }
 
+/** Wait on fresh viewport observations, not on an already queued notification.
+ * This also gives PermissionRequest time to resolve or register its own card. */
+export class ClaudePermissionNoticeTracker {
+  private key = '';
+  private observationKey = '';
+  private since = 0;
+  private notifiedKey = '';
+
+  needsCapture(screens: Array<string | undefined>): boolean {
+    return !!this.key || !!this.notifiedKey || screens.some(screen => screen !== undefined && !!claudeActionPrompt(screen));
+  }
+
+  observe(screen: string | undefined, runtimeKey: string, now: number, observationKey = runtimeKey): string | undefined {
+    // An unreadable frame breaks the wait, but does not prove a dialog closed.
+    if (screen === undefined) { this.key = ''; return; }
+    const prompt = claudeActionPrompt(screen);
+    const key = prompt ? JSON.stringify([runtimeKey, prompt]) : '';
+    if (!key) this.notifiedKey = '';
+    if (key !== this.key || observationKey !== this.observationKey) {
+      this.key = key;
+      this.observationKey = observationKey;
+      this.since = now;
+      return;
+    }
+    if (!key || this.notifiedKey === key || now - this.since < 3_000) return;
+    this.notifiedKey = key;
+    return prompt;
+  }
+}
+
 /** A narrow terminal wraps a long question ("Do you want to make this edit to
  * <long path>?") over several rows, so no single row matches QUESTION_RE and the
  * dialog never reaches Lark. Re-join up to 3 continuation rows, only when the

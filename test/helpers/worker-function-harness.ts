@@ -40,6 +40,7 @@ import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js'
 import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
 import { WebTerminalInputController, WebTerminalInputWireState } from '../../src/core/web-terminal-input-controller.js';
 import { BusyReadyDeferralTracker, BusyReadyLogThrottle } from '../../src/utils/busy-ready-deferral.js';
+import { ClaudePermissionNoticeTracker } from '../../src/services/claude-action-prompt.js';
 
 /** Failed-turn rewind wiring that emitTurnTerminal, flushPending and
  *  handleTermAction call into (see src/worker.ts startFailedTurnRewind):
@@ -148,6 +149,11 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const dependencies = new Map<string, unknown>();
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
+    if (key === 'ClaudePermissionNoticeTracker') return ClaudePermissionNoticeTracker;
+    if (key === 'captureClaudePermissionNoticeScreen') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
     if (key === 'WebTerminalInputController') return WebTerminalInputController;
     if (key === 'WebTerminalInputWireState') return WebTerminalInputWireState;
     if (key === 'webTerminalInputControllers' || key === 'webTerminalAttachInputs') {
