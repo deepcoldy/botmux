@@ -36,6 +36,10 @@ describe('downloadMessageResource symlink safety', () => {
   it.each([
     ['buffer', () => Buffer.from('NEW')],
     ['stream', () => Readable.from([Buffer.from('NEW')])],
+    ['SDK readable stream', () => ({
+      getReadableStream: () => Readable.from([Buffer.from('NEW')]),
+      writeFile: () => { throw new Error('legacy path helper must not be called'); },
+    })],
   ])('replaces a symlinked file name (%s body)', async (_kind, body) => {
     const victim = join(root, 'victim.js');
     writeFileSync(victim, 'HOST');
@@ -49,25 +53,14 @@ describe('downloadMessageResource symlink safety', () => {
     expect(readFileSync(join(dir, 'a.js'), 'utf8')).toBe('NEW');
   });
 
-  it('does not rename into a directory swapped for a symlink after the pre-check (SDK writeFile body)', async () => {
-    const hostDir = join(root, 'host-dist');
-    mkdirSync(hostDir);
-    writeFileSync(join(hostDir, 'cli.js'), 'HOST');
+  it('rejects a writeFile-only SDK response instead of reopening the staging path', async () => {
     const dir = join(root, 'om_z');
     mkdirSync(dir);
-    // The Lark SDK hands back an object whose writeFile() opens the path itself.
-    // Swapping the directory right before that open is the exact window the
-    // network wait leaves open to another process.
-    mocks.request.mockResolvedValueOnce({
-      writeFile: async (tmp: string) => {
-        renameSync(dir, `${dir}.moved`);
-        symlinkSync(hostDir, dir);
-        writeFileSync(tmp, 'EVIL', { flag: 'wx' });
-      },
-    });
-    await expect(downloadMessageResource('cli_test', 'om_z', 'file_k', 'file', join(dir, 'cli.js'))).rejects.toThrow();
-    expect(readFileSync(join(hostDir, 'cli.js'), 'utf8')).toBe('HOST');
-    expect(readdirSync(hostDir)).toEqual(['cli.js']);
+    const writeFile = vi.fn(async () => { throw new Error('must not reopen by path'); });
+    mocks.request.mockResolvedValueOnce({ writeFile });
+    await expect(downloadMessageResource('cli_test', 'om_z', 'file_k', 'file', join(dir, 'cli.js'), undefined, { allowUserTokenFallback: false })).rejects.toThrow('readable stream');
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(readdirSync(dir)).toEqual([]);
   });
 
   it('range download: does not rename into a directory swapped during the probe', async () => {

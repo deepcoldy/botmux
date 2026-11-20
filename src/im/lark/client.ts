@@ -1,5 +1,5 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
-import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync, lstatSync, renameSync, unlinkSync, realpathSync } from 'node:fs';
+import { closeSync, constants as fsConstants, openSync, readFileSync, createWriteStream, mkdirSync, existsSync, lstatSync, renameSync, unlinkSync, realpathSync } from 'node:fs';
 import { dirname, extname, basename, join, sep } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
@@ -45,6 +45,7 @@ import {
 } from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
 import { downloadResourceWithRange, getResourceErrorCode, isResourceSizeLimitError, LARK_RESOURCE_SIZE_LIMIT_CODE, type ResourceStream } from './resource-range-download.js';
+import { fdWriteAll } from './async-fd.js';
 
 // larkGet lives in a dependency-free module so setup/owner-identity.ts (shared
 // by every onboarding / allowedUsers write path) can use the same no-body GET
@@ -2127,12 +2128,16 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
     throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
-  await writeViaRename(savePath, async (tmp) => { writeFileSync(tmp, buf, { flag: 'wx' }); }, guard);
+  await writeViaRename(savePath, async (fd) => { await fdWriteAll(fd, buf); }, guard);
 }
 
-/** Write to a fresh sibling file, then rename it over `savePath`: a symlink
- *  already sitting at `savePath` is replaced, never written through. */
-async function writeViaRename(savePath: string, write: (tmp: string) => Promise<void>, guard?: DownloadDirGuard): Promise<void> {
+/** Write to a fresh sibling descriptor, then rename it over `savePath`: a
+ *  symlink already sitting at `savePath` is replaced, never written through.
+ *  The descriptor is opened synchronously immediately after the directory
+ *  check. If the directory is replaced afterwards, the staging pathname cannot
+ *  name an external file created by an attacker, and the final rename fails
+ *  closed instead of publishing bytes outside the validated directory. */
+async function writeViaRename(savePath: string, write: (fd: number) => Promise<void>, guard?: DownloadDirGuard): Promise<void> {
   const dir = dirname(savePath);
   const before = lstatSync(dir);
   if (before.isSymbolicLink() || !before.isDirectory()) throw new Error(`Refusing to download into a non-directory: ${dir}`);
@@ -2141,35 +2146,45 @@ async function writeViaRename(savePath: string, write: (tmp: string) => Promise<
   const expected: DownloadDirGuard = guard ?? { dev: before.dev, ino: before.ino };
   assertDownloadDirUnchanged(dir, expected);
   // Staging name independent of the destination name: a valid 250-char file
-  // name plus a suffix would exceed NAME_MAX.
+  // name plus a suffix would exceed NAME_MAX. Open NOW, before any await.
   const tmp = join(dir, `.botmux-dl-${process.pid}-${randomBytes(4).toString('hex')}.part`);
+  const fd = openSync(tmp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+  let renamed = false;
   try {
-    await write(tmp);
-    // Rename only into that same directory.
+    await write(fd);
+    closeSync(fd);
+    // Rename only into that same directory. If an attacker swaps it after this
+    // check, `tmp` no longer resolves to the descriptor's original directory,
+    // so there is no external staging file for the rename to publish.
     assertDownloadDirUnchanged(dir, expected);
     renameSync(tmp, savePath);
-  } catch (err) {
-    try { unlinkSync(tmp); } catch { /* not created */ }
-    throw err;
+    renamed = true;
+  } finally {
+    try { closeSync(fd); } catch { /* already closed */ }
+    if (!renamed) {
+      // Never unlink through a replacement directory.
+      try { assertDownloadDirUnchanged(dir, expected); unlinkSync(tmp); } catch { /* */ }
+    }
   }
 }
 
 async function writeResourceToDisk(res: any, savePath: string, guard?: DownloadDirGuard): Promise<void> {
-  await writeViaRename(savePath, async (tmp) => {
+  await writeViaRename(savePath, async (fd) => {
     if (res instanceof Buffer) {
-      writeFileSync(tmp, res, { flag: 'wx' });
-    } else if (res && typeof res === 'object' && 'writeFile' in res) {
-      // SDK helper: it opens the path itself, so make sure nothing is there.
-      if (existsSync(tmp)) throw new Error(`download temp already exists: ${tmp}`);
-      await res.writeFile(tmp);
-    } else {
-      // Raw Readable (client.request with responseType:'stream'). Pipe straight
-      // to disk instead of buffering — this resource API serves files up to
-      // 100MB, so Buffer.concat + writeFileSync would spike memory and block the
-      // event loop under concurrent downloads. pipeline handles backpressure and
-      // closes/cleans up both streams on error.
-      await pipeline(res as NodeJS.ReadableStream, createWriteStream(tmp, { flags: 'wx' }));
+      await fdWriteAll(fd, res);
+      return;
     }
+    // SDK download responses expose getReadableStream alongside their legacy
+    // writeFile(path) helper. Never use the path helper here: it would reopen
+    // the staging pathname after the directory check and reintroduce the race.
+    const stream = res && typeof res.getReadableStream === 'function'
+      ? res.getReadableStream()
+      : res;
+    if (stream && (typeof stream.pipe === 'function' || typeof stream[Symbol.asyncIterator] === 'function')) {
+      await pipeline(stream as NodeJS.ReadableStream, createWriteStream('', { fd, autoClose: false }));
+      return;
+    }
+    throw new Error('Resource download did not return a readable stream');
   }, guard);
 }
 

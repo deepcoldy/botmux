@@ -39,8 +39,8 @@ import { CLI_SELECT_OPTIONS, resolveCliSelection, selectionKeyForBot } from '../
 import { dropConfiguredCliRuntime } from '../adapters/cli/runtime.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
-import { existsSync, readFileSync, statSync } from 'node:fs';
-import { sendCredFilePath, writeSendCredFile } from '../adapters/cli/read-isolation.js';
+import { existsSync, statSync } from 'node:fs';
+import { sendCredFilePath, sendCredUpdateLockTarget, updateSendCredFile } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
@@ -784,10 +784,11 @@ async function applyConfigFieldInternal(
     try {
       const path = sendCredFilePath(config.session.dataDir, larkAppId);
       if (existsSync(path)) {
-        const cred = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-        if (effective === null || (effective as any)?.enabled !== true) delete cred.feedback;
-        else cred.feedback = effective;
-        writeSendCredFile(path, JSON.stringify(cred)); // in place: see writeSendCredFile
+        updateSendCredFile(path, cred => {
+          if (effective === null || (effective as any)?.enabled !== true) delete cred.feedback;
+          else cred.feedback = effective;
+          return cred;
+        }, sendCredUpdateLockTarget(config.session.dataDir, path));
       }
     } catch (error) {
       logger.warn(`[config:${larkAppId}] failed to refresh sandbox feedback policy: ${error instanceof Error ? error.message : String(error)}`);

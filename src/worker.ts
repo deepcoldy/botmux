@@ -99,6 +99,7 @@ import {
   provenancePendingContent,
   provenancePendingNonce,
   sendCredFilePath,
+  sendCredUpdateLockTarget,
   writeSendCredFile,
   botHomePath,
   shouldRedirectCliData,
@@ -28666,6 +28667,7 @@ async function spawnCliBody(
       writeSendCredFile(
         credPath,
         JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
+        sendCredUpdateLockTarget(process.env.SESSION_DATA_DIR, credPath),
       );
     } catch (e) {
       log(`[sandbox] WARN could not write send-cred file: ${(e as Error).message}`);

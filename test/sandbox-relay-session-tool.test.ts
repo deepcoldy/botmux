@@ -11,13 +11,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { once } from 'node:events';
+import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
+import { withFileLockSync } from '../src/utils/file-lock.js';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
-import { RELAY_SESSION_TOOLS_MARKER, startOutboxWatcher, validateRelaySessionToolRequest } from '../src/adapters/backend/sandbox.js';
+import { RELAY_SESSION_TOOLS_MARKER, prepareDirectSandbox, startOutboxWatcher, validateRelaySessionToolRequest } from '../src/adapters/backend/sandbox.js';
 import { accessForPath, buildFsPolicy, compileToSeatbelt, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
 import { buildRelaySessionToolRequest, materializeRelayedAttachments } from '../src/cli/relay-session-tool.js';
 import { readVerifiedFile } from '../src/services/remote-runner-session-tool.js';
 import { sandboxWithholdsBotSecret } from '../src/adapters/cli/sandbox-mode.js';
-import { writeSendCredFile } from '../src/adapters/cli/read-isolation.js';
+import { readSendCredJsonWithRetry, sendCredUpdateLockTarget, updateSendCredFile, writeSendCredFile } from '../src/adapters/cli/read-isolation.js';
 import { statSync } from 'node:fs';
 
 const roots: string[] = [];
@@ -162,6 +166,123 @@ describe('writeSendCredFile', () => {
     symlinkSync(victim, join(home, 'send-cred.json'));
     expect(() => writeSendCredFile(join(home, 'send-cred.json'), '{}')).toThrow();
     expect(readFileSync(victim, 'utf8')).toBe('keep');
+  });
+  it('serializes writers across processes, not only within one event loop', async () => {
+    const home = tmp('botmux-send-cred-lock-');
+    const path = join(home, 'send-cred.json');
+    const ready = join(home, 'child-ready');
+    const oldJson = '{"v":"old"}';
+    const newJson = '{"v":"new"}';
+    writeFileSync(path, oldJson);
+    let child: ReturnType<typeof spawnTsEvalWithRepoImports> | undefined;
+    let duringLock = '';
+    try {
+      withFileLockSync(path, () => {
+        child = spawnTsEvalWithRepoImports(`
+          import { writeSendCredFile } from './src/adapters/cli/read-isolation.js';
+          import { writeFileSync } from 'node:fs';
+          writeFileSync(${JSON.stringify(ready)}, '1');
+          writeSendCredFile(${JSON.stringify(path)}, ${JSON.stringify(newJson)});
+        `);
+        const deadline = Date.now() + 10_000;
+        while (!existsSync(ready)) {
+          if (Date.now() > deadline) throw new Error('writer did not become ready');
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+        duringLock = readFileSync(path, 'utf8');
+      });
+      expect(duringLock).toBe(oldJson);
+      const [code] = await once(child!, 'close');
+      expect(code).toBe(0);
+      expect(readFileSync(path, 'utf8')).toBe(newJson);
+    } finally {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill();
+    }
+  });
+  it('retries a torn JSON read until the writer completes the object', async () => {
+    const home = tmp('botmux-send-cred-read-');
+    const path = join(home, 'send-cred.json');
+    const ready = join(home, 'truncate-ready');
+    const expected = { larkAppSecret: 'new-secret', feedback: { enabled: true } };
+    writeFileSync(path, '{"larkAppSecret":"old"}');
+    const child = spawnTsEvalWithRepoImports(`
+      import { openSync, ftruncateSync, writeFileSync, writeSync, fsyncSync, closeSync } from 'node:fs';
+      const fd = openSync(${JSON.stringify(path)}, 'r+');
+      ftruncateSync(fd, 0);
+      writeFileSync(${JSON.stringify(ready)}, '1');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30);
+      writeSync(fd, ${JSON.stringify(JSON.stringify(expected))}, 0, 'utf8');
+      fsyncSync(fd);
+      closeSync(fd);
+    `);
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(ready)) {
+        if (Date.now() > deadline) throw new Error('writer did not truncate');
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+      }
+      expect(readSendCredJsonWithRetry(path)).toEqual(expected);
+      const [code] = await once(child, 'close');
+      expect(code).toBe(0);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill();
+    }
+  });
+  it('updates feedback inside the same credential without dropping other fields', () => {
+    const home = tmp('botmux-send-cred-update-');
+    const path = join(home, 'send-cred.json');
+    writeSendCredFile(path, JSON.stringify({ larkAppSecret: 'secret', apiOnly: false, feedback: { enabled: false } }));
+    updateSendCredFile(path, cred => { delete cred.feedback; return cred; });
+    expect(readSendCredJsonWithRetry(path)).toEqual({ larkAppSecret: 'secret', apiOnly: false });
+    expect(readdirSync(home)).toEqual(['send-cred.json']);
+  });
+  it('uses one lock for lexical aliases of the same credential and distinct locks for different files', () => {
+    const root = tmp('botmux-send-cred-lock-alias-');
+    const real = join(root, 'real');
+    mkdirSync(join(real, 'bots', 'cli_self'), { recursive: true });
+    const alias = join(root, 'alias');
+    symlinkSync(real, alias);
+    const dataDir = join(root, 'data');
+    const first = join(real, 'bots', 'cli_self', 'send-cred.json');
+    const same = join(alias, 'bots', 'cli_self', 'send-cred.json');
+    const other = join(real, 'bots', 'cli_other', 'send-cred.json');
+    expect(sendCredUpdateLockTarget(dataDir, first)).toBe(sendCredUpdateLockTarget(dataDir, same));
+    expect(sendCredUpdateLockTarget(dataDir, first)).not.toBe(sendCredUpdateLockTarget(dataDir, other));
+  });
+  it.skipIf(process.platform !== 'linux')('keeps the host-private lock usable after direct-sandbox mask preparation', () => {
+    const root = tmp('botmux-send-cred-prepare-');
+    const dataDir = join(root, 'data');
+    const botHome = join(root, 'bots', 'cli_self');
+    const path = join(botHome, 'send-cred.json');
+    const lockTarget = sendCredUpdateLockTarget(dataDir, path);
+    mkdirSync(botHome, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    writeSendCredFile(path, '{"larkAppSecret":"old","feedback":{"enabled":false}}', lockTarget);
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'cred-lock', dataDir,
+        policy: { rules: [
+          { path: botHome, access: 'readWrite', source: 'internal' },
+          { path, access: 'deny', source: 'mandatory' },
+          // Deliberately mask a would-be sibling lock: the production lock must
+          // stay outside this mount plan or updates would fail with EISDIR.
+          { path: `${path}.lock`, access: 'deny', source: 'mandatory' },
+        ], net: true, writeRegexes: [] },
+        chdir: root, home: root, cliBin: '/usr/bin/true', cliArgs: [],
+      });
+      if (!plan) return; // host cannot create the exact bwrap primitives
+      updateSendCredFile(path, cred => ({ ...cred, feedback: { enabled: true } }), lockTarget);
+      expect(readSendCredJsonWithRetry(path)).toEqual({ larkAppSecret: 'old', feedback: { enabled: true } });
+      // Worker restart rewrites the full credential through the same lock target.
+      writeSendCredFile(path, '{"larkAppSecret":"new","feedback":{"enabled":false}}', lockTarget);
+      expect(readSendCredJsonWithRetry(path)).toEqual({ larkAppSecret: 'new', feedback: { enabled: false } });
+      expect(lstatSync(`${path}.lock`).isDirectory()).toBe(true);
+    } finally {
+      plan?.cleanup();
+      rmSandboxScratch(root);
+    }
   });
 });
 
@@ -372,6 +493,18 @@ describe('materializeRelayedAttachments', () => {
     expect(readFileSync(join(dir, '0-a.png'), 'utf8')).toBe('PNG');
     expect(readFileSync(join(dir, '1-x.txt'), 'utf8')).toBe('TXT');
   });
+  it('rewrites only attachment paths, not message text equal to a placeholder', () => {
+    const placeholder = 'botmux-session-tool://attachment/0';
+    const stdout = JSON.stringify({ text: placeholder, nested: { literal: placeholder },
+      attachments: [{ path: placeholder, name: 'a.txt', type: 'file' }] });
+    const out = materializeRelayedAttachments(stdout, [
+      { placeholder, name: 'a.txt', type: 'file', dataBase64: Buffer.from('A').toString('base64') },
+    ], join(tmp('botmux-relay-att-text-'), 'quoted-1'));
+    const parsed = JSON.parse(out) as { text: string; nested: { literal: string }; attachments: Array<{ path: string }> };
+    expect(parsed.text).toBe(placeholder);
+    expect(parsed.nested.literal).toBe(placeholder);
+    expect(parsed.attachments[0]!.path).not.toBe(placeholder);
+  });
   it('never writes through a pre-planted entry', () => {
     const root = tmp('botmux-relay-att-');
     const dir = join(root, 'quoted-1');
@@ -379,7 +512,7 @@ describe('materializeRelayedAttachments', () => {
     const victim = join(root, 'victim');
     writeFileSync(victim, 'keep');
     symlinkSync(victim, join(dir, '0-a.png'));
-    expect(() => materializeRelayedAttachments('{}', [
+    expect(() => materializeRelayedAttachments(JSON.stringify({ attachments: [{ path: 'p' }] }), [
       { placeholder: 'p', name: 'a.png', type: 'image', dataBase64: Buffer.from('X').toString('base64') },
     ], dir)).toThrow();
     expect(readFileSync(victim, 'utf8')).toBe('keep');

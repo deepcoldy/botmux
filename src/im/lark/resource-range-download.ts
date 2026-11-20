@@ -1,4 +1,5 @@
-import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, renameSync, unlinkSync, writeSync } from 'node:fs';
+import { closeSync, constants as fsConstants, lstatSync, openSync, renameSync, unlinkSync } from 'node:fs';
+import { fdStat, fdTruncate, fdWriteAll } from './async-fd.js';
 import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
 import { assertDownloadDirUnchanged, type DownloadDirGuard } from './client.js';
@@ -120,12 +121,7 @@ export async function downloadResourceWithRange(
               throw new RangeDownloadError('Resource range body exceeds the requested size');
             }
             try {
-              let written = 0;
-              while (written < buffer.length) {
-                const n = writeSync(fd, buffer, written, buffer.length - written, offset + received + written);
-                if (!n) throw new Error('Zero-byte write');
-                written += n;
-              }
+              await fdWriteAll(fd, buffer, offset + received);
             } catch { throw new RangeDownloadError('Unable to write resource to disk'); }
             received += buffer.length;
           }
@@ -135,14 +131,14 @@ export async function downloadResourceWithRange(
           response?.destroy();
           // Defensive rollback: each retry overwrites the full range, but discard any
           // partial tail first so the temporary file contains only completed ranges.
-          ftruncateSync(fd, offset);
+          await fdTruncate(fd, offset);
           if (attempt >= 2 || !transient(error)) throw error;
           await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
         } finally { response?.destroy(); }
       }
       offset = end + 1;
     }
-    if (fstatSync(fd).size !== total) throw new RangeDownloadError('Resource final size mismatch');
+    if ((await fdStat(fd)).size !== total) throw new RangeDownloadError('Resource final size mismatch');
     closeSync(fd);
     guardIntact();
     renameSync(temporaryPath, savePath);

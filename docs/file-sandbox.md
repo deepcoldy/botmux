@@ -294,7 +294,10 @@ worker spawnCli
   不能 deny 对自身的 process-info（会让运行时直接崩）。Linux 靠 PID namespace。
 - send-cred 两个写入点（worker 启动、feedback 配置改动）统一走 `writeSendCredFile`：**原地写、不换
   inode、内容没变不写**。Linux 对该路径的 mask 挂在目录项上，temp+rename 会换成新 inode 让运行中的
-  pane 读到未遮罩的新文件；同级临时文件也会在 BOT_HOME 里短暂可读。
+  pane 读到未遮罩的新文件；同级临时文件也会在 BOT_HOME 里短暂可读。跨进程写入与 feedback 的读改写用
+  同一把文件锁串行化，写满全部字节并在失败时尽力恢复旧内容；CLI 读取只对撕裂 JSON 做有界重试，明确
+  EPERM/EACCES 不重试。锁目标放在 `<数据目录>/send-cred-locks/` 的宿主私有目录，不使用 BOT_HOME
+  同级锁文件，避免 Linux deny mask 把不存在的锁路径预建成目录后让后续更新 EISDIR。
 - 附件文件名只取 basename，`..`/空名退回 file_key；Range 下载在 rename 前复核目录 inode；
   下载还要求目录 realpath 落在附件根下（`withinRoot`），防 `attachments/<appId>` 这一层被换成软链。
 - macOS 可写目录能被整个 rename 走（子文件从未被打开，文件级 deny 不触发），再从可写位置读回；

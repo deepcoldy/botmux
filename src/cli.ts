@@ -43,7 +43,7 @@ import type { ManagedScheduleUpdateReceipt } from './core/schedule-managed-updat
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, rmSync, realpathSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
-import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
+import { underReadIsolation, sendCredFilePath, readSendCredJsonWithRetry } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { writeAndFlush } from './cli/stdout-flush.js';
@@ -9985,7 +9985,7 @@ async function relaySessionToolIfSecretWithheld(tool: 'history' | 'quoted', rest
   const appId = process.env.BOTMUX_LARK_APP_ID?.trim();
   const sd = process.env.SESSION_DATA_DIR?.trim();
   if (appId && sd) {
-    try { readFileSync(sendCredFilePath(sd, appId)); return; } catch { /* withheld → relay */ }
+    try { if (readSendCredJsonWithRetry(sendCredFilePath(sd, appId))) return; } catch { /* withheld → relay */ }
   }
   const { buildRelaySessionToolRequest, materializeRelayedAttachments } = await import('./cli/relay-session-tool.js');
   const sid = process.env.BOTMUX_SESSION_ID?.trim();
@@ -10918,7 +10918,7 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
     if (process.env.BOTMUX_API_ONLY === '1') return true;
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR as string, larkAppId);
-      return JSON.parse(readFileSync(credPath, 'utf-8'))?.apiOnly === true;
+      return readSendCredJsonWithRetry(credPath)?.apiOnly === true;
     } catch {
       // No readable cred file: we cannot tell. Say "not apiOnly" rather than
       // crash — the transport boundary still fail-closes downstream
@@ -11105,15 +11105,15 @@ async function registerSelfFromCredFile(): Promise<void> {
   const appId = process.env.BOTMUX_LARK_APP_ID;
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
-  const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean; feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput };
-  try {
-    // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
-    // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
-    cred = JSON.parse(readFileSync(sendCredFilePath(sd, appId), 'utf-8'));
-  } catch {
-    return; // no cred file → not isolated (or first layer supplies creds elsewhere)
-  }
+  const { sendCredFilePath, readSendCredJsonWithRetry } = await import('./adapters/cli/read-isolation.js');
+  // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
+  // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
+  // A short parse retry covers an in-place update without treating EPERM as transient.
+  const cred = readSendCredJsonWithRetry(sendCredFilePath(sd, appId)) as {
+    larkAppSecret?: string; brand?: string; apiOnly?: boolean;
+    feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput;
+  } | undefined;
+  if (!cred) return; // no cred file → not isolated (or first layer supplies creds elsewhere)
   // apiOnly bots legitimately have an empty secret — don't bail on that, but DO
   // carry the apiOnly flag through so the reconstructed config keeps the
   // transport boundary (getBotClient throws for apiOnly). A non-apiOnly bot with

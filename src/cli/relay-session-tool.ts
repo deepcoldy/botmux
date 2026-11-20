@@ -115,14 +115,36 @@ export function materializeRelayedAttachments(
   dir: string,
 ): string {
   if (!attachments?.length) return stdout;
+  let root: unknown;
+  try { root = JSON.parse(stdout); } catch { return stdout; }
+  if (!root || typeof root !== 'object' || Array.isArray(root)) return stdout;
+  const byPlaceholder = new Map(attachments.map((att, index) => [att.placeholder, { att, index }]));
+  const holders: Array<Record<string, unknown>> = [];
+  const envelope = root as Record<string, unknown>;
+  if (Array.isArray(envelope.attachments)) holders.push(envelope);
+  if (Array.isArray(envelope.messages)) {
+    for (const message of envelope.messages) {
+      if (message && typeof message === 'object' && !Array.isArray(message)
+          && Array.isArray((message as Record<string, unknown>).attachments)) {
+        holders.push(message as Record<string, unknown>);
+      }
+    }
+  }
+  let rewritten = false;
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  let out = stdout;
-  attachments.forEach((att, i) => {
-    const safe = basename(String(att.name ?? '')).replace(/^\.+/, '').slice(0, 200) || 'attachment';
-    const path = join(dir, `${i}-${safe}`);
-    const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
-    try { writeSync(fd, Buffer.from(att.dataBase64, 'base64')); } finally { closeSync(fd); }
-    out = out.split(JSON.stringify(att.placeholder)).join(JSON.stringify(path));
-  });
-  return out;
+  for (const holder of holders) {
+    for (const raw of holder.attachments as unknown[]) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const item = raw as Record<string, unknown>;
+      const match = typeof item.path === 'string' ? byPlaceholder.get(item.path) : undefined;
+      if (!match) continue;
+      const safe = basename(String(match.att.name ?? '')).replace(/^\.+/, '').slice(0, 200) || 'attachment';
+      const path = join(dir, `${match.index}-${safe}`);
+      const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+      try { writeSync(fd, Buffer.from(match.att.dataBase64, 'base64')); } finally { closeSync(fd); }
+      item.path = path;
+      rewritten = true;
+    }
+  }
+  return rewritten ? `${JSON.stringify(root, null, 2)}\n` : stdout;
 }
