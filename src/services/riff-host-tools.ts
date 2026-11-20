@@ -42,7 +42,7 @@ export interface RiffHostContext {
 // destinations are authorized by the daemon, just like sandbox outbox sends.
 const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; files?: string }> = {
   send: {
-    values: '--chat-id --response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode',
+    values: '--chat-id --into --response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode',
     bools: '--top-level --mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice --text --card --follow-thread-at --no-follow-thread',
     files: '--content-file --card-file --images --image --files --file --videos --video-covers --completion-proposal-file',
   },
@@ -103,6 +103,8 @@ export function riffHostFileArguments(argv: string[]): number[] {
       if (++i >= argv.length || argv[i]!.startsWith('--')) throw new Error('riff_host_missing_flag_value');
       if (files.has(flag!)) paths.push(i);
     }
+    const value = inline.length ? inline.join('=') : argv[i]!;
+    if (flag === '--into' && !/^om_[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error('riff_host_invalid_into');
   }
   return paths;
 }
