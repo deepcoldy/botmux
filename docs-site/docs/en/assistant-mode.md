@@ -49,5 +49,5 @@ Inside the sandbox the real `BOT_HOME`, other owners' directories, the role libr
 ## Not supported
 
 - The role system (`/role`, role switching, role-directory schedules) is off in this mode.
-- Other sessions are invisible from the sandbox; `botmux history` / `quoted` / `list` are unavailable inside an assistant session (neither the session store nor the bot credential enters the sandbox; inlining quoted messages is a follow-up).
+- Neither the session store nor the bot credential enters the sandbox (assistant mode turns on [`sandboxWithholdBotSecret`](/en/sandbox#withhold-bot-secret) automatically). `botmux send` / `history` / `quoted` are carried out by the daemon outside the sandbox: `history` reads only the current session and `quoted` only messages of the session's own chat; `botmux list` is unavailable in an assistant session.
 - One owner per group; do not put an assistant-mode bot into a group meant for several people.

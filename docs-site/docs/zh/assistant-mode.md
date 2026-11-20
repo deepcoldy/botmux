@@ -49,5 +49,5 @@
 ## 不支持的东西
 
 - 角色系统（`/role`、角色切换、按角色目录的定时任务）在此模式下关闭。
-- 沙盒里看不到其他会话，`botmux history` / `quoted` / `list` 在助理会话里不可用（会话库与 bot 凭证都不进沙盒；引用消息内联注入待做）。
+- 会话库与 bot 凭证都不进沙盒（助理模式自动打开 [`sandboxWithholdBotSecret`](/sandbox#withhold-bot-secret)）。`botmux send` / `history` / `quoted` 由 daemon 在沙盒外代为执行：`history` 只读本会话，`quoted` 只读本会话所在群的消息；`botmux list` 在助理会话里不可用。
 - 一个群只能有一个主人；多人共用的群请不要开此模式的 bot。

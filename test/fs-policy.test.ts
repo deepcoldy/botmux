@@ -2171,6 +2171,19 @@ describe('buildFsPolicy — assistant mode (per-owner USER_HOME)', () => {
     for (const f of keyFiles) expect(accessForPath(normal.rules, f).access, f).toBe('readOnly');
   });
 
+  it("with the secret withheld (assistant mode implies it) the owner's attachment bucket is read-only and USER_HOME is pinned", () => {
+    const outbox = `${sd}/sandboxes/s/outbox`;
+    const p = buildFsPolicy(ctx({
+      botHome: `${botHome}/users/${A}`, workingDir: `${botHome}/users/${A}/work`,
+      attachmentsBucket: `${sd}/attachments/cli_self/u/${A}`, assistantMode: true,
+      withholdSendCredential: true, outbox,
+    }));
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${A}/om_x/a.png`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${B}/om_x/a.png`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${outbox}/x.req.json`).access).toBe('readWrite');
+    expect(p.pinnedDirs).toEqual(expect.arrayContaining([`${botHome}/users/${A}`, outbox]));
+  });
+
   it("grants only the owner's USER_HOME; the real BOT_HOME and other owners stay denied", () => {
     const p = buildFsPolicy(ownerCtx(A));
     expect(accessForPath(p.rules, `${botHome}/users/${A}/work/notes.md`).access).toBe('readWrite');

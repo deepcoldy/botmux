@@ -4536,7 +4536,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
-      ...(entry.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true } : {}),
+      // assistantMode implies it (see sandboxWithholdsBotSecret)
+      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true ? { sandboxWithholdBotSecret: true } : {}),
       ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
