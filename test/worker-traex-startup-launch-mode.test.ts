@@ -52,12 +52,14 @@ describe('resolved TraeX startup launch mode', () => {
     expect(scope.traexFirstInputAdmissionPending).toBe(true);
   });
 
-  it('keeps genuine exact resume outside the fresh-input fence', () => {
+  it('fences a genuine exact resume like a fresh launch and keeps its restored-screen recognizer', () => {
+    // A cold resume paints the same provisional composer before its thread
+    // can submit (recorded on 0.216.0), so its first input is fenced too.
     const { scope, adapter } = launchMode({
       requestedResume: true, actualResume: true, id: '00000000-0000-4000-8000-000000000009',
     });
-    expect(scope.traexNativeStartupInputPending).toBe(false);
-    expect(scope.traexFirstInputAdmissionPending).toBe(false);
+    expect(scope.traexNativeStartupInputPending).toBe(true);
+    expect(scope.traexFirstInputAdmissionPending).toBe(true);
     expect(scope.cliAdapter.startupReadyFromHistory).not.toBe(adapter.startupReadyFromHistory);
   });
 

@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { shouldFenceTraexStartupInput, traexStartupInputReady } from '../src/core/traex-startup-input.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { traexRestoredComposerReady } from '../src/adapters/cli/traex-footer.js';
@@ -27,10 +28,32 @@ describe('native thread readiness is distinct from a provisional input box', () 
     expect(ready(SHORTCUT.replace('? for shortcuts', '⚠ 1 warning · f2 to view'))).toBe(false);
   });
 
-  it('accepts native idle behind a composer, including a still-provisional model footer', () => {
-    expect(ready(SHORTCUT, { nativeState: 'idle' })).toBe(true);
-    expect(ready(SHORTCUT, { nativeState: 'done' })).toBe(true);
-    expect(ready(SHORTCUT, { nativeState: 'idle', webInputUnchanged: false })).toBe(false);
+  it('does not let native idle override the provisional shortcut-only composer', () => {
+    // Recorded 0.214.1 / 0.216.0: with a stale model catalog and a slow
+    // network the TUI reports idle on this frame for ~30s and drops Enter.
+    for (const nativeState of ['idle', 'done'] as const) {
+      expect(ready(SHORTCUT, { nativeState })).toBe(false);
+      expect(ready(SHORTCUT.replace('? for shortcuts', '⚠ 1 warning · f2 to view'), { nativeState })).toBe(false);
+      expect(ready(RESOLVED, { nativeState })).toBe(true);
+    }
+    expect(ready(RESOLVED, { nativeState: 'idle', webInputUnchanged: false })).toBe(true);
+  });
+
+  it('still lets native idle vouch for the repository notice that hides both footer rows', () => {
+    const notice = SHORTCUT.replace('? for shortcuts', '无法访问 Git 仓库 `git@example.invalid`，请确认该仓库权限或地址。');
+    expect(ready(notice)).toBe(false);
+    expect(ready(notice, { nativeState: 'idle' })).toBe(true);
+  });
+
+  it('judges the recorded 0.216.0 cold-resume frames by their footer, not by the idle report', () => {
+    const frame = (name: string) => readFileSync(`test/fixtures/traex-cold-resume/0.216.0-resume-${name}.txt`, 'utf8');
+    // The restored-screen recognizer still sees a composer on the provisional
+    // frame; only the first-input fence demands the resolved footer.
+    expect(traexRestoredComposerReady(frame('provisional'), { resumedSession: true })).toBe(true);
+    expect(ready(frame('provisional'), { nativeState: 'idle' })).toBe(false);
+    expect(ready(frame('provisional'))).toBe(false);
+    expect(ready(frame('resolved'), { nativeState: 'idle' })).toBe(true);
+    expect(ready(frame('resolved'))).toBe(true);
   });
 
   it('recovers a resolved footer when the startup report was missed', () => {
@@ -82,15 +105,14 @@ describe('native thread readiness is distinct from a provisional input box', () 
   });
 });
 
-describe('only a fresh verified native terminal gets the fence', () => {
-  it('arms the verified fresh TraeX path', () => {
+describe('only a verified native terminal this worker launches gets the fence', () => {
+  it('arms the verified fresh and cold-resumed TraeX paths', () => {
     expect(shouldFenceTraexStartupInput({ cliId: 'traex', programStatusEnabled: true })).toBe(true);
   });
-  it('keeps legacy CLI versions, other CLIs, resumes, adopts, viewers and persistent panes unchanged', () => {
+  it('keeps legacy CLI versions, other CLIs, adopts, viewers and persistent panes unchanged', () => {
     for (const scope of [
       { cliId: 'traex', programStatusEnabled: false },
       { cliId: 'codex', programStatusEnabled: true },
-      { cliId: 'traex', programStatusEnabled: true, resume: true },
       { cliId: 'traex', programStatusEnabled: true, adoptMode: true },
       { cliId: 'traex', programStatusEnabled: true, remoteViewer: true },
       { cliId: 'traex', programStatusEnabled: true, persistentReattach: true },
@@ -140,11 +162,15 @@ describe('the actual pending-input writer honors native startup evidence', () =>
     expect(h.scope.traexNativeStartupInputPending).toBe(true);
   });
 
-  it('retires the fence on a real idle and delivers the queued input once', async () => {
+  it('holds through an idle on the provisional composer and delivers once the footer resolves', async () => {
     const h = workerFence();
     h.scope.cliAdapter.writeInput = vi.fn(async () => ({ submitted: true }));
     await h.flush();
     h.scope.nativeState = 'idle';
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.traexNativeStartupInputPending).toBe(true);
+    h.scope.screen = RESOLVED;
     await h.flush();
     await h.flush();
     expect(h.scope.log.mock.calls.filter(([line]: [string]) => line.startsWith('writeInput threw:'))).toEqual([]);
@@ -311,5 +337,82 @@ describe('the actual pending-input writer honors native startup evidence', () =>
     expect(events).toHaveLength(1);
     expect(events[0]).toMatchObject({ type: 'terminal_input', submitted: true });
     expect(JSON.stringify(events[0])).not.toContain('private text');
+  });
+});
+
+describe('a footer that resolves after the 90s window still admits after Web input', () => {
+  afterEach(() => { vi.useRealTimers(); });
+
+  function lateFence(nativeState: 'idle' | undefined) {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    const h = workerFence();
+    h.scope.nativeState = nativeState;
+    h.scope.cliAdapter.writeInput = vi.fn(async () => ({ submitted: true }));
+    // The fence's own timers re-enter through these, like the live worker.
+    h.scope.markPromptReady = vi.fn();
+    h.scope.flushPending = vi.fn(() => h.flush());
+    return h;
+  }
+  /** A real keystroke from the Web terminal: the TUI echoes it and the human
+   *  deletes it again, so the screen changes but stays an empty composer. */
+  function webKeystroke(h: ReturnType<typeof workerFence>): void {
+    h.scope.lastWebTerminalInputAtMs = Date.now();
+    h.scope.webTerminalInputGeneration++;
+    h.scope.webTerminalInputBackendScreenRevision = h.scope.backendScreenRevision;
+    h.scope.backendScreenRevision += 2;
+  }
+  /** On a live worker an idle edge, the viewport poller or a new message
+   *  re-drives admission every couple of seconds. */
+  async function driveUntil(h: ReturnType<typeof workerFence>, startedAt: number, untilMs: number): Promise<void> {
+    while (Date.now() - startedAt < untilMs) {
+      await h.flush();
+      await vi.advanceTimersByTimeAsync(2_000);
+    }
+  }
+
+  it.each([['an idle report', 'idle'], ['no idle report', undefined]] as const)(
+    'Web keystroke after the timeout notice, footer at 100s, with %s', async (_label, nativeState) => {
+      const h = lateFence(nativeState);
+      const startedAt = Date.now();
+      await driveUntil(h, startedAt, 95_000);
+      expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+      webKeystroke(h);
+      await driveUntil(h, startedAt, 100_000);
+      expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+      h.scope.screen = RESOLVED;
+      h.scope.backendScreenRevision++;
+      await driveUntil(h, startedAt, 130_000);
+      expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+      expect(h.scope.pendingMessages).toHaveLength(0);
+    });
+
+  it('a receipt-proven quarantine release keeps re-driving the lease after a keystroke that draws nothing', async () => {
+    const h = lateFence('idle');
+    // The first input was written (thread readiness verified) but its submit
+    // stayed unconfirmed and was quarantined. Past the 90s window a key that
+    // draws nothing reaches the pane, then the owned late receipt releases
+    // the quarantine with the follow-up already queued. Nothing else redraws.
+    Object.assign(h.scope, {
+      traexNativeStartupInputPending: false, traexFirstInputAdmissionPending: true,
+      traexFirstSubmitConfirmed: false, screen: RESOLVED,
+    });
+    const followUp = h.scope.pendingMessages.splice(0);
+    const quarantine = { backend: h.scope.backend, generation: h.scope.cliSpawnGeneration,
+      draftContent: 'first', turnId: 'first', dispatchAttempt: 1 };
+    h.scope.inputDeliveryQuarantine = quarantine;
+    const release = loadWorkerFunction<(q: unknown, reason: string) => boolean>('releaseInputDeliveryQuarantine', h.scope);
+    await vi.advanceTimersByTimeAsync(95_000);
+    h.scope.lastWebTerminalInputAtMs = Date.now();
+    h.scope.webTerminalInputGeneration++;
+    h.scope.webTerminalInputBackendScreenRevision = h.scope.backendScreenRevision;
+    expect(release(quarantine, 'owned late submit receipt')).toBe(true);
+    h.scope.pendingMessages.push(...followUp);
+    await h.flush(); // the release's own redrive
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    // Only the fence's own recheck timers may move it from here.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(h.scope.traexFirstInputAdmissionPending).toBe(false);
   });
 });

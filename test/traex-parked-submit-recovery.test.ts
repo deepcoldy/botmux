@@ -1,6 +1,7 @@
+import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
-import { traexComposerHoldsInput } from '../src/adapters/cli/traex-footer.js';
+import { traexComposerHoldsInput, traexRestoredComposerReady } from '../src/adapters/cli/traex-footer.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
 import { createSubmitFailureChainController } from '../src/services/submit-failure-chain.js';
@@ -13,6 +14,12 @@ import { classifyStuckPage } from '../src/utils/stuck-detector.js';
 
 const content = '查询大盘状态';
 const composer = (body: string) => `Earlier conversation\n─────────────────────────\n❯ ${body}\n  GPT-6-Astra xhigh · Context 99% left\n  ? for shortcuts`;
+/** Real TRAE 0.216.0 cold-resume frames: a large paste collapses into a chip
+ *  and the hint row becomes `paste again expand` (provisional and resolved
+ *  composer), or the whole footer is redrawn once the model row resolves. */
+const recorded = (name: 'provisional-pasted' | 'resolved-pasted' | 'resolved-pasted-redrawn', draft = content) =>
+  readFileSync(`test/fixtures/traex-cold-resume/0.216.0-resume-${name}.txt`, 'utf8')
+    .replace('[Pasted Content 2349 chars]', `[Pasted Content ${Array.from(draft).length} chars]`);
 const chains = new Set<ReturnType<typeof createSubmitFailureChainController>>();
 
 afterEach(() => {
@@ -200,6 +207,60 @@ describe('TRAE parked draft recovery', () => {
     expect(h.scope.inputDeliveryQuarantine).toBeNull();
   });
 
+  it('submits a draft parked under the recorded resolved footer that kept the paste hint', async () => {
+    const h = fixture({ screen: recorded('resolved-pasted') });
+    h.start();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.backend.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    expect(h.backend.write).not.toHaveBeenCalled();
+    expect(h.warnings()).toEqual([]);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.scope.flushPending).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits on the recorded provisional paste footer, then submits once after the redraw', async () => {
+    const h = fixture({ screen: recorded('provisional-pasted') });
+    h.start();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
+    expect(h.warnings()).toEqual([]);
+
+    h.setScreen(recorded('resolved-pasted-redrawn'));
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(h.backend.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
+    expect(h.warnings()).toEqual([]);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+  });
+
+  it('logs why the rescue did not run, whether the key was accepted and what the read-back saw', async () => {
+    const lines = (h: ReturnType<typeof fixture>) => h.scope.log.mock.calls.map(([line]: [string]) => line)
+      .filter((line: string) => line.startsWith('TRAE draft rescue'));
+    const unknown = fixture({ screen: composer(content).replace('? for shortcuts', 'ⓘ unknown new footer') });
+    unknown.start();
+    await vi.advanceTimersByTimeAsync(140_000);
+    expect(unknown.warnings()).toHaveLength(1);
+    // One line per distinct reason, even though the retained chain keeps polling.
+    expect(lines(unknown)).toEqual([
+      expect.stringMatching(/skipped: the live composer does not show the original draft .*ⓘ unknown new footer/),
+      expect.stringMatching(/skipped: the one-shot warning was already sent/),
+    ]);
+
+    const refused = fixture({ acceptsRescue: false });
+    refused.backend.sendSpecialKeys.mockReturnValue(false);
+    refused.start();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(lines(refused)).toContainEqual(expect.stringMatching(/failed: the backend did not accept the submit key/));
+
+    const dropped = fixture({ acceptsRescue: false });
+    dropped.start();
+    await vi.advanceTimersByTimeAsync(80_000);
+    expect(dropped.backend.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(lines(dropped)).toEqual(expect.arrayContaining([
+      expect.stringMatching(/submit key accepted by the backend/),
+      expect.stringMatching(/read-back: no receipt after the submit key; composer still holds the original draft/),
+    ]));
+  });
+
   it('warns without pressing when the provisional composer outlives the startup hard cap', async () => {
     const h = fixture({ screen: '─────────────────────────\n❯ [Pasted Content 6 chars]\n  ? for shortcuts' });
     h.start();
@@ -233,5 +294,18 @@ describe('TRAE live draft recognition', () => {
     '  Question 1/1\n❯ 1. Yes\n  enter submit answer',
   ])('rejects another input owner, a history example, or an unknown footer', screen => {
     expect(traexComposerHoldsInput(screen, content)).toBe(false);
+  });
+  it('reads the recorded 0.216.0 paste-hint footers as a draft surface', () => {
+    const draft = 'x'.repeat(2349);
+    expect(traexComposerHoldsInput(recorded('provisional-pasted', draft), draft, { requireThreadReady: false })).toBe(true);
+    expect(traexComposerHoldsInput(recorded('provisional-pasted', draft), draft)).toBe(false);
+    expect(traexComposerHoldsInput(recorded('resolved-pasted', draft), draft)).toBe(true);
+    expect(traexComposerHoldsInput(recorded('resolved-pasted-redrawn', draft), draft)).toBe(true);
+    expect(traexComposerHoldsInput(recorded('resolved-pasted', draft), 'y'.repeat(2348))).toBe(false);
+  });
+  it('never accepts the paste hint below an empty composer', () => {
+    const empty = recorded('resolved-pasted').replace(/❯ \[Pasted Content \d+ chars\]/, '❯ Ask TRAE CLI to do anything');
+    expect(traexRestoredComposerReady(empty)).toBe(false);
+    expect(traexRestoredComposerReady(empty, { requireThreadReady: true })).toBe(false);
   });
 });
