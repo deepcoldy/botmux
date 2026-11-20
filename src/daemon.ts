@@ -5744,6 +5744,34 @@ export async function enforceMessageQuotaForCliInput(
       );
       return false;
     }
+    if (!ev.quotaKey) return true;
+    if (!senderOpenId) return false;
+    // The followed-chat allowlist exemption does not exempt a grant's finite
+    // quota. Keep the ordinary charge order: gate first, then dedup + consume;
+    // a rejected or uncertain message is never committed as charged.
+    const charge = beginCharge(larkAppId, messageId);
+    if (charge === 'done') return true;
+    if (charge === 'pending') return false;
+    let quota;
+    try {
+      const def = ev.reason === 'oncall' && !ev.explicitGrantOverride
+        ? getBot(larkAppId).config.messageQuota?.defaultLimit
+        : undefined;
+      quota = await consumeQuota(larkAppId, ev.quotaKey, def, ev.expiredGrantCleanup);
+    } catch (err) {
+      logger.warn(`[quota:${larkAppId}] cross-chat consume failed; dropping message ${messageId.substring(0, 12)}: ${err}`);
+      abortCharge(larkAppId, messageId);
+      return false;
+    }
+    if (quota.tracked) {
+      if (!quota.allow) {
+        abortCharge(larkAppId, messageId);
+        await revokeQuotaGrant(larkAppId, checkChatId, senderOpenId, ev);
+        await notifyQuotaExhausted(larkAppId, anchor, senderOpenId, quota.limit);
+        return false;
+      }
+    }
+    commitCharge(larkAppId, messageId);
     return true;
   }
   if (opts?.listenerAuthorized) {

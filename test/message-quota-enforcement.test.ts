@@ -298,6 +298,51 @@ describe('message quota enforcement', () => {
     expect(mocks.consumeQuota).not.toHaveBeenCalled();
   });
 
+  describe('cross-chat followed-thread quota', () => {
+    const run = (senderOpenId = 'ou_chat', messageId = 'om_cross') => enforceMessageQuotaForCliInput(
+      'quota_app', 'oc_origin', senderOpenId, messageId, 'om_anchor',
+      undefined, undefined, 'group', false,
+      { crossChatFollowedThreadAuthorized: true, crossChatFollowedChatId: 'oc_1', promptContent: 'hello' },
+    );
+
+    it('charges a finite grant in the followed chat and commits the exact message', async () => {
+      await expect(run()).resolves.toBe(true);
+      expect(mocks.beginCharge).toHaveBeenCalledWith('quota_app', 'om_cross');
+      expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'chat:oc_1:ou_chat', undefined, undefined);
+      expect(mocks.commitCharge).toHaveBeenCalledWith('quota_app', 'om_cross');
+    });
+
+    it('rejects an exhausted followed-chat grant and aborts rather than commits', async () => {
+      mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
+      await expect(run()).resolves.toBe(false);
+      expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_cross');
+      expect(mocks.commitCharge).not.toHaveBeenCalled();
+      expect(mocks.removeChatGrant).toHaveBeenCalledWith('quota_app', 'oc_1', 'ou_chat');
+    });
+
+    it.each([
+      ['done', true], ['pending', false],
+    ])('preserves %s dedup semantics without consuming twice', async (state, expected) => {
+      mocks.beginCharge.mockReturnValue(state);
+      await expect(run()).resolves.toBe(expected);
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+      expect(mocks.commitCharge).not.toHaveBeenCalled();
+    });
+
+    it('fails closed and aborts when followed-chat quota storage fails', async () => {
+      mocks.consumeQuota.mockRejectedValue(new Error('lock timeout'));
+      await expect(run()).resolves.toBe(false);
+      expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_cross');
+      expect(mocks.commitCharge).not.toHaveBeenCalled();
+    });
+
+    it('keeps the allowlist exemption unmetered when the sender has no quotaKey', async () => {
+      await expect(run('ou_stranger')).resolves.toBe(true);
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    });
+  });
+
   it('allows the exhausting chat-grant message but defers revoke/notify to the next message', async () => {
     // exhausted=true 表示「本条刚好用完额度」——依旧放行给 AI 处理，但不在此时 revoke/notify
     // （避免给用户「本条已被拒绝」的错觉）；revoke + 通知推迟到下一条被 allow=false 拦截时再做。
