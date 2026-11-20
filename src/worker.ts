@@ -29715,6 +29715,12 @@ async function spawnCliBody(
     const outbox = process.platform === 'linux' || darwinRelayOutbox
       ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
       : undefined;
+    // macOS has no prepareDirectSandbox: create the outbox here, before the
+    // policy drops grants for paths that do not exist. A warm reattach must
+    // reuse the pane's existing directory (checked below), never make one.
+    if (darwinRelayOutbox && outbox && !willReattachPersistent) {
+      mkdirSync(outbox, { recursive: true, mode: 0o700 });
+    }
     // Pre-create the outbox BEFORE buildFsPolicy so it survives the allow-rule
     // existence-filter below (a not-yet-existing readWrite path is dropped, and
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
