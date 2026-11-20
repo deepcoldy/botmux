@@ -7367,12 +7367,23 @@ async function readCardUsageSnapshotForSend(
       // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
       pricing: larkAppId ? resolvePricingForCli(larkAppId) : undefined,
     });
-    // Claude statusline 配额段（与 daemon 侧 getDaemonSessionUsageSnapshot 同口径）：
+    // Claude / Antigravity statusline 配额段（与 daemon 侧 getDaemonSessionUsageSnapshot 同口径）：
     // 本地直接读 <DATA_DIR>/statusline/<sid>/latest.json；沙盒内该目录对本会话可读写。
-    // 非空才带 key；读取失败不影响 transcript 用量。
+    // 严格按 CLI 门控（仅 claude-code / antigravity；unknown 失败闭合），并校验启动代际与模型兼容。
     try {
-      const quota = toCardQuota(readStatuslineSnapshot(resolveDataDir(), session.sessionId));
-      if (quota) return { ...configuredRuntime, ...snapshot, quota };
+      let botCliId: CliId | undefined;
+      try { botCliId = larkAppId ? getBot(larkAppId).config.cliId : undefined; } catch { /* sandbox / unknown bot */ }
+      const resolvedCliId = (session.cliId ?? session.adoptedFrom?.cliId ?? botCliId ?? 'unknown') as CliId | 'unknown';
+      if (resolvedCliId === 'claude-code' || resolvedCliId === 'antigravity') {
+        const launchGen = process.env.BOTMUX_STATUSLINE_GEN?.trim() || undefined;
+        const snap = readStatuslineSnapshot(resolveDataDir(), session.sessionId, { launchGen });
+        const observedModel = snapshot.tokens?.model?.trim();
+        const expectedModel = observedModel || configuredRuntime.model || session.model;
+        if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
+          const quota = toCardQuota(snap);
+          if (quota) return { ...configuredRuntime, ...snapshot, quota };
+        }
+      }
     } catch { /* best-effort */ }
     return { ...configuredRuntime, ...snapshot };
   } catch {
@@ -10348,7 +10359,7 @@ import { applyCompanionStartupOptions } from './cli/companion-startup-options.js
 import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import { normalizeCardUsageSnapshot } from './cli/card-usage-normalize.js';
-import { readStatuslineSnapshot, toCardQuota } from './services/statusline-snapshot.js';
+import { isStatuslineModelCompatible, readStatuslineSnapshot, toCardQuota } from './services/statusline-snapshot.js';
 import {
   resolveQuoteTarget,
   shouldSuppressImplicitReplyTarget,
@@ -16626,6 +16637,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     });
     const result: any = await response.json();
     if (!response.ok || result?.ok !== true || typeof result.messageId !== 'string') {
+      if (result?.error === 'task_consent_pending') {
+        throw Object.assign(new Error(`原话题的任务授权待确认。确认后用 --into ${rootId} 继续这条派单。`),
+          { code: 'TASK_CONSENT_PENDING', rootId });
+      }
+      if (result?.error === 'task_consent_denied') {
+        throw Object.assign(new Error('发起人已拒绝或撤销本任务授权。'),
+          { code: 'TASK_CONSENT_DENIED', rootId });
+      }
       throw new Error(`dispatch delivery failed: ${result?.error ?? response.status}`);
     }
     return result.messageId;
@@ -16895,6 +16914,13 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }));
     if (!accepted) process.exitCode = 1;
   } catch (err: any) {
+    if (err?.code === 'TASK_CONSENT_PENDING' || err?.code === 'TASK_CONSENT_DENIED') {
+      console.error(JSON.stringify({ success: false, taskSent: false, errorCode: err.code,
+        sourceSessionId: sid, targetAppIds: parsedBotApps.map(item => item.appId),
+        chatId: targetChatId, threadRootId: err.rootId, detail: err.message }));
+      process.exitCode = 1;
+      return;
+    }
     let receiptState: DispatchReceiptState = {
       transportState: 'failed',
       acceptanceState: 'failed',

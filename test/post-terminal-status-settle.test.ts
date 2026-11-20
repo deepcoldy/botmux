@@ -142,6 +142,7 @@ import {
   noteTurnDispatchAttempt,
   syncUsageRefreshTimer,
   postTurnStartingCard,
+  unifiedReplyTurnNotCapturing,
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
@@ -1041,25 +1042,30 @@ describe('starting card health watchdog', () => {
     expect(patchedStatuses()).toEqual([]);
   });
 
-  it('cancels the degradation on prompt_ready instead of marking the CLI stalled', async () => {
+  it('does not let prompt_ready hide a stuck capture pipeline', async () => {
     const ds = setupStartingDs();
     await post(ds, TURN);
     (ds.worker as any).emit('message', { type: 'prompt_ready', turnId: TURN });
     await vi.advanceTimersByTimeAsync(0);
     updateMessageMock.mockClear();
     await vi.advanceTimersByTimeAsync(45_000);
-    expect(patchedStatuses()).toEqual([]);
+    expect(patchedStatuses()).toEqual(['stalled']);
   });
 
-  it('does not let another turn prove health or let an old timer patch a newer turn', async () => {
+  it('does not let another turn prove health for the armed turn', async () => {
     const ds = setupStartingDs();
     await post(ds, TURN);
     (ds.worker as any).emit('message', {
       type: 'screen_update', content: 'other turn output', status: 'working', turnId: 'turn-other',
     });
-    await vi.advanceTimersByTimeAsync(0);
-    updateMessageMock.mockClear();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+    expect(updateMessageMock.mock.calls[0][1]).toBe(`om_start_${TURN}`);
+  });
 
+  it('does not let an old timer patch a newer turn card', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
     ds.currentTurnId = 'turn-live-0002';
     ds.streamCardPending = true;
     ds.streamCardPendingTurnId = 'turn-live-0002';
@@ -1068,6 +1074,7 @@ describe('starting card health watchdog', () => {
     await vi.advanceTimersByTimeAsync(45_000);
 
     expect(patchedStatuses()).toEqual(['stalled']);
+    expect(updateMessageMock.mock.calls[0][1]).toBe('om_start_turn-live-0002');
     expect(ds.lastScreenStatus).toBe('working');
   });
 
@@ -1091,7 +1098,7 @@ describe('starting card health watchdog', () => {
     expect(ds.lastScreenStatus).toBe('working');
   });
 
-  it('rejects a stale stalled write when working arrives before beforeWrite', async () => {
+  it('rejects a stale stalled write and repaints working when health arrives in flight', async () => {
     const delivered: string[] = [];
     let releaseFirst!: () => void;
     updateMessageMock.mockImplementation((...args: any[]) => {
@@ -1115,7 +1122,762 @@ describe('starting card health watchdog', () => {
     releaseFirst();
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(delivered).toEqual([]);
+    expect(delivered).toEqual(['working']);
+  });
+
+  it('activates a queued watchdog when capture first supplies a numeric attempt', async () => {
+    const queuedTurn = 'turn-live-0002';
+    const ds = setupStartingDs(queuedTurn);
+    ds.captureIdentity = {
+      workerGeneration: ds.workerGeneration!, revision: 1, turnId: TURN, dispatchAttempt: 4,
+    };
+    noteTurnDispatchAttempt(ds, TURN, 4);
+    await post(ds, queuedTurn);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: queuedTurn, dispatchAttempt: 0,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.turnDispatchAttemptHighWater).toEqual({ turnId: queuedTurn, dispatchAttempt: 0 });
+    updateMessageMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('does not adopt a different attempt when a queued retry activates', async () => {
+    const queuedTurn = 'turn-live-0002';
+    const ds = setupStartingDs(queuedTurn);
+    ds.captureIdentity = { workerGeneration: ds.workerGeneration!, revision: 1, turnId: TURN };
+    noteTurnDispatchAttempt(ds, queuedTurn, 0);
+    await post(ds, queuedTurn);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: queuedTurn, dispatchAttempt: 1,
+    });
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).not.toContain('stalled');
+  });
+
+  it('defers a queued turn watchdog until its capture identity activates', async () => {
+    const queuedTurn = 'turn-live-0002';
+    const ds = setupStartingDs(queuedTurn);
+    ds.captureIdentity = { workerGeneration: ds.workerGeneration!, revision: 1, turnId: TURN };
+    expect(unifiedReplyTurnNotCapturing(ds, queuedTurn)).toBe(true);
+    await post(ds, queuedTurn);
+    expect(unifiedReplyTurnNotCapturing(ds, queuedTurn)).toBe(true);
+
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'predecessor still running', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual([]);
+
+    (ds.worker as any).emit('message', { type: 'capture_identity', revision: 2, turnId: queuedTurn });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('working');
+    updateMessageMock.mockClear();
+    await vi.advanceTimersByTimeAsync(44_999);
+    expect(patchedStatuses()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('does not let unattributed evidence disarm a queued turn watchdog', async () => {
+    const queuedTurn = 'turn-live-0002';
+    const ds = setupStartingDs(queuedTurn);
+    ds.captureIdentity = { workerGeneration: ds.workerGeneration!, revision: 1, turnId: TURN };
+    expect(unifiedReplyTurnNotCapturing(ds, queuedTurn)).toBe(true);
+    await post(ds, queuedTurn);
+    (ds.worker as any).emit('message', { type: 'screen_update', content: 'legacy predecessor', status: 'working' });
+    (ds.worker as any).emit('message', { type: 'prompt_ready' });
+    (ds.worker as any).emit('message', { type: 'capture_identity', revision: 2, turnId: queuedTurn });
+    await vi.advanceTimersByTimeAsync(0);
+    updateMessageMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('does not degrade after a working frame arrived during the starting POST', async () => {
+    const ds = setupStartingDs();
+    let resolvePost!: (messageId: string) => void;
+    const posting = postTurnStartingCard(ds, vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })), TURN);
+    await vi.advanceTimersByTimeAsync(0);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'running before POST lands', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    resolvePost('om_start_slow');
+    await posting;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('working');
+    updateMessageMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual([]);
+  });
+
+  it('keeps stalled through usage and routine renders until healthy evidence arrives', async () => {
+    const ds = setupStartingDs();
+    ds.workerReady = true;
+    ds.session.cliId = 'claude-code';
+    const { resolveUsageDisplay } = await import('../src/bot-registry.js');
+    vi.mocked(resolveUsageDisplay).mockReturnValue('streaming');
+    try {
+      await post(ds, TURN);
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(lastPatchedStatus()).toBe('stalled');
+      expect(ds.usageRefreshTimer).toBeUndefined();
+      updateMessageMock.mockClear();
+
+      // Keep streaming enabled through this tick: the old implementation would
+      // now redraw working, while the degraded gate must suppress the refresh.
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(patchedStatuses()).toEqual([]);
+      scheduleCardPatch(ds, JSON.stringify({ status: 'working' }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lastPatchedStatus()).toBe('stalled');
+    } finally {
+      vi.mocked(resolveUsageDisplay).mockReturnValue('off');
+    }
+  });
+
+  it('repaints a delivered stalled card on the first same-value working frame', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+    updateMessageMock.mockClear();
+
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'recovered', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(patchedStatuses()).toEqual(['working']);
+  });
+
+  it('closes health for an attempt-less compatibility terminal with a numeric high-water', async () => {
+    const ds = setupStartingDs();
+    noteTurnDispatchAttempt(ds, TURN, 1);
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).not.toContain('stalled');
+  });
+
+  it('does not re-arm health for an attempt-less terminal that arrived during the starting POST', async () => {
+    const ds = setupStartingDs();
+    noteTurnDispatchAttempt(ds, TURN, 1);
+    let resolvePost!: (messageId: string) => void;
+    const posting = postTurnStartingCard(ds, vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })), TURN);
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    resolvePost('om_start_slow_legacy_terminal');
+    await posting;
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    expect(patchedStatuses()).not.toContain('stalled');
+    expect(lastPatchedStatus()).toBe('idle');
+  });
+
+  it('does not let an older-attempt terminal close the active retry watchdog', async () => {
+    const ds = setupStartingDs();
+    noteTurnDispatchAttempt(ds, TURN, 2);
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', { ...terminalMsg(TURN), dispatchAttempt: 1 });
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('arms health monitoring for a starting card published by worker ready', async () => {
+    const ds = setupStartingDs();
+    ds.streamCardId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.streamCardId).toBe('om_new_card');
+    updateMessageMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('arms health monitoring when worker ready restores a starting card', async () => {
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('starting');
+    updateMessageMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('arms restored health when the first numeric attempt arrives during the starting PATCH', async () => {
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { releaseRestore = resolve; }));
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0,
+    });
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+    updateMessageMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['stalled']);
+  });
+
+  it('does not arm restored health when a known attempt advances during the starting PATCH', async () => {
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { releaseRestore = resolve; }));
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    noteTurnDispatchAttempt(ds, TURN, 0);
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 1,
+    });
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).not.toContain('stalled');
+  });
+
+  it.each([
+    ['completed', 'idle'],
+    ['failed', 'idle'],
+    ['cancelled', 'interrupted'],
+    ['ambiguous', 'idle'],
+  ] as const)('settles restored ready publication after a %s terminal without re-arming', async (terminalStatus, expectedStatus) => {
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { releaseRestore = resolve; }));
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN, terminalStatus));
+    await vi.advanceTimersByTimeAsync(0);
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    expect(patchedStatuses()).not.toContain('stalled');
+    expect(lastPatchedStatus()).toBe(expectedStatus);
+    if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
+      expect(ds.failedIdleTurnId).toBe(TURN);
+    }
+  });
+
+  it.each([
+    { label: 'missing high-water', highWater: undefined, expected: 'idle' },
+    { label: 'matching high-water', highWater: 1, expected: 'idle' },
+    { label: 'newer high-water', highWater: 2, expected: 'stalled' },
+  ])('accepts restored terminal attempt identity: $label', async ({ highWater, expected }) => {
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementationOnce(() => new Promise<void>(resolve => { releaseRestore = resolve; }));
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    if (highWater !== undefined) noteTurnDispatchAttempt(ds, TURN, highWater);
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', { ...terminalMsg(TURN), dispatchAttempt: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    expect(lastPatchedStatus()).toBe(expected);
+  });
+
+  it('reasserts idle when a late completed starting publication follows cached idle', async () => {
+    const ds = setupStartingDs();
+    ds.lastScreenStatus = 'idle';
+    let resolvePost!: (messageId: string) => void;
+    const posting = postTurnStartingCard(ds, vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })), TURN);
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    resolvePost('om_start_slow_cached_idle');
+    await posting;
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(patchedStatuses()).toContain('idle');
+  });
+
+  it('reasserts idle after a restored starting PATCH completes behind terminal and an idle frame', async () => {
+    const delivered: string[] = [];
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const status = JSON.parse(String(args[2])).status;
+      if (!releaseRestore) {
+        return new Promise<void>(resolve => {
+          releaseRestore = () => { delivered.push(status); resolve(); };
+        });
+      }
+      return Promise.resolve().then(() => { delivered.push(status); });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'idle after terminal', status: 'idle', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(45_000);
+
+    expect(delivered.at(-1)).toBe('idle');
+  });
+
+  it('reconciles a working frame that landed before the restored starting PATCH completed', async () => {
+    const delivered: string[] = [];
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const status = JSON.parse(String(args[2])).status;
+      if (!releaseRestore) {
+        return new Promise<void>(resolve => {
+          releaseRestore = () => { delivered.push(status); resolve(); };
+        });
+      }
+      return Promise.resolve().then(() => { delivered.push(status); });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'working during restore', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(delivered.at(-1)).toBe('working');
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(delivered.at(-1)).toBe('working');
+  });
+
+  it('lets an adopted CLI exit replace stalled with the explicit idle freeze', async () => {
+    const ds = setupStartingDs();
+    ds.adoptedFrom = {} as any;
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(lastPatchedStatus()).toBe('stalled');
+    updateMessageMock.mockClear();
+
+    (ds.worker as any).emit('message', { type: 'claude_exit', code: 0, signal: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('idle');
+  });
+
+  it('lets a permanent CLI exit replace stalled with the explicit idle freeze', async () => {
+    const ds = setupStartingDs();
+    ds.session.cliId = 'claude-code';
+    ds.workerReady = true;
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(lastPatchedStatus()).toBe('stalled');
+    updateMessageMock.mockClear();
+
+    (ds.worker as any).emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: false });
+    await vi.advanceTimersByTimeAsync(0);
+    ds.workerReady = true;
+    (ds.worker as any).emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: false });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('idle');
+  });
+
+  it('repaints a delivered stalled card when a healthy screenshot arrives after switching to hidden', async () => {
+    const ds = setupStartingDs();
+    ds.displayMode = 'screenshot';
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(lastPatchedStatus()).toBe('stalled');
+    ds.displayMode = 'hidden';
+    updateMessageMock.mockClear();
+
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-recovered', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(patchedStatuses()).toEqual(['working']);
+  });
+
+  it('restores the authorized usage refresh when a screenshot proves health', async () => {
+    const ds = setupStartingDs();
+    ds.displayMode = 'screenshot';
+    ds.workerReady = true;
+    ds.session.cliId = 'claude-code';
+    const { resolveUsageDisplay } = await import('../src/bot-registry.js');
+    vi.mocked(resolveUsageDisplay).mockReturnValue('streaming');
+    try {
+      await post(ds, TURN);
+      await vi.advanceTimersByTimeAsync(45_000);
+      expect(ds.usageRefreshTimer).toBeUndefined();
+      updateMessageMock.mockClear();
+
+      (ds.worker as any).emit('message', {
+        type: 'screenshot_uploaded', imageKey: 'img-usage-recovered', status: 'working', turnId: TURN,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lastPatchedStatus()).toBe('working');
+      expect(ds.usageRefreshTimer).toBeDefined();
+    } finally {
+      vi.mocked(resolveUsageDisplay).mockReturnValue('off');
+    }
+  });
+
+  it('cancels degradation on a working screenshot from the same turn', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img-healthy', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    updateMessageMock.mockClear();
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual([]);
+  });
+
+  it('does not replace a cold-suspended idle card with a delivered stalled state', async () => {
+    const ds = setupStartingDs();
+    await post(ds, TURN);
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(lastPatchedStatus()).toBe('stalled');
+
+    ds.lastScreenStatus = 'idle';
+    ds.session.suspendedColdResume = true;
+    ds.worker = null;
+    scheduleCardPatch(ds, JSON.stringify({ type: 'streaming', status: 'idle' }), TURN);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('idle');
+  });
+
+  it('settles a completed terminal that arrives while a fresh-ready POST is pending', async () => {
+    let resolvePost!: (messageId: string) => void;
+    initWorkerPool({
+      sessionReply: vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+    const ds = setupStartingDs();
+    ds.streamCardId = undefined;
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(0);
+    resolvePost('om_start_pending_completed');
+    await vi.advanceTimersByTimeAsync(47_000);
+    expect(patchedStatuses()).toContain('idle');
+  });
+
+  it('does not re-arm a terminalized starting publication when new live work rejects the idle correction', async () => {
+    let resolvePost!: (messageId: string) => void;
+    initWorkerPool({
+      sessionReply: vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+    const ds = setupStartingDs();
+    ds.streamCardId = undefined;
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(0);
+    // Direct user work after the terminal is still live work, so the correction
+    // is rejected. It must not cause the old publication to re-arm its watchdog.
+    (ds.worker as any).emit('message', { type: 'direct_submit_started' });
+    await vi.advanceTimersByTimeAsync(0);
+    resolvePost('om_start_pending_completed_with_live_work');
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).not.toContain('stalled');
+  });
+
+  it('rejects the restored starting write after a second same-turn attempt transition', async () => {
+    let releaseRestore!: () => void;
+    let beforeWrite!: () => Promise<void>;
+    updateMessageMock.mockImplementationOnce((...args: any[]) => {
+      beforeWrite = args[3].beforeWrite;
+      return new Promise<void>(resolve => { releaseRestore = resolve; });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    noteTurnDispatchAttempt(ds, 'turn-previous', 7);
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0,
+    });
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: TURN, dispatchAttempt: 1,
+    });
+    await expect(async () => { await beforeWrite(); }).rejects.toThrow();
+  });
+
+  it('rejects restored starting when attempts advance twice before write admission', async () => {
+    let beforeWrite!: () => Promise<void>;
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementationOnce((...args: any[]) => {
+      beforeWrite = args[3].beforeWrite;
+      return new Promise<void>(resolve => { releaseRestore = resolve; });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    noteTurnDispatchAttempt(ds, 'turn-previous', 7);
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0,
+    });
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: TURN, dispatchAttempt: 1,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(async () => { await beforeWrite(); }).rejects.toThrow('Restored card no longer owns delivery');
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it('corrects a late restored starting write after the original idle settle delivered', async () => {
+    const delivered: string[] = [];
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const status = JSON.parse(String(args[2])).status;
+      const opts = args[3];
+      if (!releaseRestore) {
+        return new Promise<void>(resolve => {
+          releaseRestore = () => { delivered.push(status); resolve(); };
+        });
+      }
+      return Promise.resolve().then(async () => {
+        if (opts?.beforeWrite) await opts.beforeWrite();
+        delivered.push(status);
+      });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    // Residual output supplies busy execution evidence without bumping the card revision.
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'residual busy', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(delivered).toEqual(['idle']);
+
+    // The older starting write lands after that correction and must be idled again.
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(delivered).toEqual(['idle', 'starting', 'idle']);
+  });
+
+  it('keeps the late-publication correction receipt for a direct-submit repaint', async () => {
+    let resolvePost!: (messageId: string) => void;
+    initWorkerPool({
+      sessionReply: vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+    const ds = setupStartingDs();
+    ds.streamCardId = undefined;
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(0);
+    resolvePost('om_start_pending_completed_receipt');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('idle');
+
+    // A residual busy frame updates execution state without touching the idle card.
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'residual busy', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.lastScreenStatus).toBe('working');
+    expect(lastPatchedStatus()).toBe('idle');
+
+    // The ordinary same-value frame needs the delivered receipt to repaint live work.
+    (ds.worker as any).emit('message', { type: 'direct_submit_started' });
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'direct busy', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('working');
+  });
+
+  it('installs idle instead of leaving starting forever after a remote backend exit', async () => {
+    const ds = setupStartingDs();
+    ds.session.backendType = 'riff';
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', {
+      type: 'claude_exit', code: 1, signal: null, canParkDiagnostic: false,
+    });
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['idle']);
+  });
+
+  it('preserves the established failure label when a late correction is rejected', async () => {
+    let resolvePost!: (messageId: string) => void;
+    initWorkerPool({
+      sessionReply: vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+    const ds = setupStartingDs();
+    ds.streamCardId = undefined;
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Failed final-output handling establishes this label before turn_terminal.
+    ds.failedIdleTurnId = TURN;
+    (ds.worker as any).emit('message', terminalMsg(TURN, 'failed'));
+    // A silent-listener transition while the POST is in flight rejects the PATCH.
+    ds.session.messageListenerRun = { sourceMessageId: 'om_listener', replyMode: 'none' };
+    await vi.advanceTimersByTimeAsync(0);
+    resolvePost('om_start_pending_failed_label');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.failedIdleTurnId).toBe(TURN);
+  });
+
+  it('reconciles working after an admitted restored starting write loses its post-write fence', async () => {
+    const delivered: string[] = [];
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const status = JSON.parse(String(args[2])).status;
+      const opts = args[3];
+      if (!releaseRestore) {
+        return Promise.resolve().then(async () => {
+          if (opts?.beforeWrite) await opts.beforeWrite();
+          return new Promise<void>(resolve => {
+            releaseRestore = () => { delivered.push(status); resolve(); };
+          });
+        });
+      }
+      return Promise.resolve().then(async () => {
+        if (opts?.beforeWrite) await opts.beforeWrite();
+        delivered.push(status);
+      });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The starting write was admitted before any numeric attempt. Two attempts
+    // and a newer working frame then arrive before its network completion.
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0,
+    });
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: TURN, dispatchAttempt: 1,
+    });
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'retry working', status: 'working', turnId: TURN, dispatchAttempt: 1,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(delivered).toEqual(['working']);
+
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(delivered).toEqual(['working', 'starting', 'working']);
+  });
+
+  it('reasserts replacement-worker working after an old remote-exit idle settles', async () => {
+    const delivered: string[] = [];
+    let releaseExitIdle!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const status = JSON.parse(String(args[2])).status;
+      const opts = args[3];
+      if (!releaseExitIdle) {
+        return Promise.resolve().then(async () => {
+          if (opts?.beforeWrite) await opts.beforeWrite();
+          return new Promise<void>(resolve => {
+            releaseExitIdle = () => { delivered.push(status); resolve(); };
+          });
+        });
+      }
+      return Promise.resolve().then(async () => {
+        if (opts?.beforeWrite) await opts.beforeWrite();
+        delivered.push(status);
+      });
+    });
+    const ds = setupStartingDs();
+    ds.session.backendType = 'riff';
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', {
+      type: 'claude_exit', code: 1, signal: null, canParkDiagnostic: false,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const replacement = makeFakeWorker();
+    ds.worker = replacement;
+    ds.workerGeneration = (ds.workerGeneration ?? 0) + 1;
+    ds.session.workerGeneration = ds.workerGeneration;
+    __testOnly_setupWorkerHandlers(ds, replacement);
+    replacement.emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(delivered).toEqual(['working']);
+
+    releaseExitIdle();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(delivered).toEqual(['working', 'idle', 'working']);
   });
 });
 

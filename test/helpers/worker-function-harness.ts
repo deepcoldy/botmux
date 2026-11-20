@@ -16,10 +16,12 @@
  * worker globals it reads; renaming either fails loudly (missing function /
  * undefined read), never silently green.
  */
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import { clearStatuslineSnapshot } from '../../src/services/statusline-snapshot.js';
 import { contractTerminalStatus, executionObserverSupported } from '../../src/services/session-contract.js';
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
@@ -128,6 +130,9 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'KEEPALIVE_HOOK_CLAIM_MS') {
     return (scope.KEEPALIVE_HOOK_CLAIM_MS ??= 30_000);
   }
+  if (key === 'publishedActiveRuntimeSeeded') {
+    return (scope.publishedActiveRuntimeSeeded ??= false);
+  }
   return undefined;
 }
 
@@ -141,6 +146,8 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const dependencies = new Map<string, unknown>();
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
+    if (key === 'randomUUID') return randomUUID;
+    if (key === 'clearStatuslineSnapshot') return clearStatuslineSnapshot;
     if (key === 'confirmedTerminalEffortChoice') return () => undefined;
     if (key === 'noteTerminalEffortInput') return () => {};
     if (key === 'claudeEffortObserver') {

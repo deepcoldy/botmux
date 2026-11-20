@@ -324,7 +324,7 @@ describe('auto-model Worker admission and original-input retirement', () => {
     });
     expect(recovery.content).toBe(`${restartInterruptionNote(work)}\n\n${recovery.logicalContent}`);
     expect(h.scope.send).toHaveBeenLastCalledWith({
-      type: 'user_notify', turnId: 'turn',
+      type: 'user_notify', kind: 'restart_interruption', turnId: 'turn',
       message: restartInterruptionNotice(work, { cliName: 'TRAE', noteDelivered: true }),
     });
     expect(h.scope.pendingRestartInterruption).toBeUndefined();
@@ -476,6 +476,87 @@ const privateTmuxColdStartAvailable = (() => {
     return false;
   }
 })();
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function withPrivateTmuxColdStartHarness<TMode extends string>(
+  sockets: string[],
+  buildShim: (fixture: {
+    mode: TMode;
+    tmuxBin: string;
+    countFile: string;
+    socket: string;
+  }) => string,
+  run: (fixture: {
+    tmuxBin: string;
+    countFile: string;
+    writeShim: (mode: TMode, socket: string) => void;
+  }) => void,
+): void {
+  const root = mkdtempSync(join(tmpdir(), 'auto-admission-cold-'));
+  const countFile = join(root, 'new-session-count');
+  const shim = join(root, 'tmux');
+  const originalPath = process.env.PATH;
+  let tmuxBin = '';
+  let bodyError: unknown;
+  try {
+    tmuxBin = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim();
+    const writeShim = (mode: TMode, socket: string) => {
+      writeFileSync(countFile, '0');
+      writeFileSync(shim, `#!/bin/sh\n${buildShim({ mode, tmuxBin, countFile, socket })}`);
+      chmodSync(shim, 0o755);
+    };
+    process.env.PATH = `${root}${delimiter}${originalPath ?? ''}`;
+    run({ tmuxBin, countFile, writeShim });
+  } catch (err) {
+    bodyError = err;
+  } finally {
+    const cleanupFailures: Error[] = [];
+    const keep = (resource: string, err: unknown) => {
+      const detail = tmuxThrownText(err).reason || (err instanceof Error ? err.message : String(err));
+      cleanupFailures.push(new Error(`failed to release ${resource}: ${detail}`, {
+        cause: err instanceof Error ? err : undefined,
+      }));
+    };
+    try {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    } catch (err) {
+      keep('PATH', err);
+    }
+    // One socket's failure must not skip the others or the temp dir.
+    // Only an authoritative "already gone" answer drops the error; every
+    // other failure keeps that socket's name and is reported below.
+    for (const socket of sockets) {
+      const resource = `tmux socket ${socket}`;
+      try {
+        if (!tmuxBin) throw new Error('real tmux binary was not resolved');
+        execFileSync(tmuxBin, ['-L', socket, 'kill-server'], {
+          encoding: 'utf8',
+          timeout: 2_000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err) {
+        if (!coldStartKillReleased(err)) keep(resource, err);
+      }
+    }
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch (err) {
+      keep(root, err);
+    }
+    const failures = [...(bodyError === undefined ? [] : [bodyError]), ...cleanupFailures];
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        failures.map(failure => failure instanceof Error ? failure.message : String(failure)).join('\n'),
+      );
+    }
+  }
+}
 
 describe('Auto live follow-up input policy', () => {
   it.each([
@@ -665,26 +746,17 @@ describe('Auto live follow-up input policy', () => {
     }
   });
 
-  it.skipIf(!privateTmuxColdStartAvailable)('retries a private tmux new-session cold start past a 2s wall and a refused first connect', () => {
-    const root = mkdtempSync(join(tmpdir(), 'auto-admission-cold-'));
-    const countFile = join(root, 'new-session-count');
-    const shim = join(root, 'tmux');
-    const originalPath = process.env.PATH;
+  it.skipIf(!privateTmuxColdStartAvailable)('allows a private tmux cold start past the old 2s wall and retries a refused first connect', () => {
     const sockets: string[] = [];
-    let tmuxBin = '';
-    let bodyError: unknown;
-    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-    const writeShim = (mode: 'slow' | 'refuse', socket: string) => {
-      writeFileSync(countFile, '0');
+    withPrivateTmuxColdStartHarness<'slow' | 'refuse'>(sockets, ({ mode, tmuxBin, countFile, socket }) => {
       // Phase 1 sleeps past the old 2s wall, then creates the session.
       // Phase 2's first client never creates one; only the retry may.
       const first = mode === 'slow'
         ? 'sleep 2.5\n'
         : 'echo "error connecting to $socket (Connection refused)" >&2\nexit 1\n';
-      writeFileSync(shim, `#!/bin/sh
-real=${quote(tmuxBin)}
-count_file=${quote(countFile)}
-socket=${quote(socket)}
+      return `real=${shellQuote(tmuxBin)}
+count_file=${shellQuote(countFile)}
+socket=${shellQuote(socket)}
 is_new=0
 for arg in "$@"; do
   if [ "$arg" = "new-session" ]; then
@@ -701,12 +773,8 @@ printf '%s' "$n" > "$count_file"
 if [ "$n" = 1 ]; then
 ${first}fi
 exec "$real" "$@"
-`);
-      chmodSync(shim, 0o755);
-    };
-    try {
-      tmuxBin = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim();
-      process.env.PATH = `${root}${delimiter}${originalPath ?? ''}`;
+`;
+    }, ({ tmuxBin, countFile, writeShim }) => {
       const phase = (mode: 'slow' | 'refuse') => {
         const socket = `cold-${process.pid}-${Date.now()}-${mode}`;
         sockets.push(socket);
@@ -720,79 +788,25 @@ exec "$real" "$@"
       // that itself overruns the client wall may add a probe-confirmed attempt,
       // so only the lower bound is load-independent.
       expect(Number(readFileSync(countFile, 'utf8'))).toBeGreaterThanOrEqual(2);
-    } catch (err) {
-      bodyError = err;
-    } finally {
-      const cleanupFailures: Error[] = [];
-      const keep = (resource: string, err: unknown) => {
-        const detail = tmuxThrownText(err).reason || (err instanceof Error ? err.message : String(err));
-        cleanupFailures.push(new Error(`failed to release ${resource}: ${detail}`, {
-          cause: err instanceof Error ? err : undefined,
-        }));
-      };
-      try {
-        if (originalPath === undefined) delete process.env.PATH;
-        else process.env.PATH = originalPath;
-      } catch (err) {
-        keep('PATH', err);
-      }
-      // One socket's failure must not skip the others or the temp dir.
-      // Only an authoritative "already gone" answer drops the error; every
-      // other failure keeps that socket's name and is reported below.
-      for (const socket of sockets) {
-        const resource = `tmux socket ${socket}`;
-        try {
-          if (!tmuxBin) throw new Error('real tmux binary was not resolved');
-          execFileSync(tmuxBin, ['-L', socket, 'kill-server'], {
-            encoding: 'utf8',
-            timeout: 2_000,
-            stdio: ['ignore', 'pipe', 'pipe'],
-          });
-        } catch (err) {
-          if (!coldStartKillReleased(err)) keep(resource, err);
-        }
-      }
-      try {
-        rmSync(root, { recursive: true, force: true });
-      } catch (err) {
-        keep(root, err);
-      }
-      const failures = [...(bodyError === undefined ? [] : [bodyError]), ...cleanupFailures];
-      if (failures.length === 1) throw failures[0];
-      if (failures.length > 1) {
-        throw new AggregateError(
-          failures,
-          failures.map(failure => failure instanceof Error ? failure.message : String(failure)).join('\n'),
-        );
-      }
-    }
+    });
   });
 
   it.skipIf(!privateTmuxColdStartAvailable)('recognizes a session a timed-out client already built, and retries a duplicate while the probe is unconfirmed', () => {
-    const root = mkdtempSync(join(tmpdir(), 'auto-admission-cold-'));
-    const countFile = join(root, 'new-session-count');
-    const shim = join(root, 'tmux');
-    const originalPath = process.env.PATH;
     const sockets: string[] = [];
-    let tmuxBin = '';
-    let bodyError: unknown;
-    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
     // One second past the helper's own client wall, so this always overruns
     // whatever COLD_TMUX_NEW_SESSION_TIMEOUT_MS is rather than pinning the
     // shim to a hard-coded 6s that silently stops triggering a timeout.
     const overrunSleepSec = COLD_TMUX_NEW_SESSION_TIMEOUT_MS / 1000 + 1;
-    const writeShim = (mode: 'timeout-present' | 'duplicate-unconfirmed', socket: string) => {
-      writeFileSync(countFile, '0');
+    withPrivateTmuxColdStartHarness<'timeout-present' | 'duplicate-unconfirmed'>(sockets, ({ mode, tmuxBin, countFile }) => {
       // timeout-present: the real client forks the server and builds the
       // session in the background while the shim sleeps past the client wall,
       // so spawnSync sees ETIMEDOUT although the session comes alive.
       // duplicate-unconfirmed: the first create answers "duplicate session"
       // with no server on the socket yet, so the has-session probe can only be
       // unconfirmed; only the retry is allowed to create.
-      writeFileSync(shim, `#!/bin/sh
-real=${quote(tmuxBin)}
-count_file=${quote(countFile)}
-mode=${quote(mode)}
+      return `real=${shellQuote(tmuxBin)}
+count_file=${shellQuote(countFile)}
+mode=${shellQuote(mode)}
 is_new=0
 for arg in "$@"; do
   if [ "$arg" = "new-session" ]; then
@@ -816,12 +830,8 @@ if [ "$n" = 1 ]; then
   exit 1
 fi
 exec "$real" "$@"
-`);
-      chmodSync(shim, 0o755);
-    };
-    try {
-      tmuxBin = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim();
-      process.env.PATH = `${root}${delimiter}${originalPath ?? ''}`;
+`;
+    }, ({ tmuxBin, countFile, writeShim }) => {
       // Phase 1: the killed client already built the session. The has-session
       // probe must confirm it and return without a second new-session. Warm the
       // server first on a generous wall outside the helper, so the background
@@ -847,49 +857,7 @@ exec "$real" "$@"
       startColdTmuxSession(duplicateSocket, ['new-session', '-d', '-s', 'test']);
       expect(Number(readFileSync(countFile, 'utf8'))).toBeGreaterThanOrEqual(2);
       execFileSync(tmuxBin, ['-L', duplicateSocket, 'has-session', '-t', 'test'], { encoding: 'utf8', timeout: 2_000 });
-    } catch (err) {
-      bodyError = err;
-    } finally {
-      const cleanupFailures: Error[] = [];
-      const keep = (resource: string, err: unknown) => {
-        const detail = tmuxThrownText(err).reason || (err instanceof Error ? err.message : String(err));
-        cleanupFailures.push(new Error(`failed to release ${resource}: ${detail}`, {
-          cause: err instanceof Error ? err : undefined,
-        }));
-      };
-      try {
-        if (originalPath === undefined) delete process.env.PATH;
-        else process.env.PATH = originalPath;
-      } catch (err) {
-        keep('PATH', err);
-      }
-      for (const socket of sockets) {
-        const resource = `tmux socket ${socket}`;
-        try {
-          if (!tmuxBin) throw new Error('real tmux binary was not resolved');
-          execFileSync(tmuxBin, ['-L', socket, 'kill-server'], {
-            encoding: 'utf8',
-            timeout: 2_000,
-            stdio: ['ignore', 'pipe', 'pipe'],
-          });
-        } catch (err) {
-          if (!coldStartKillReleased(err)) keep(resource, err);
-        }
-      }
-      try {
-        rmSync(root, { recursive: true, force: true });
-      } catch (err) {
-        keep(root, err);
-      }
-      const failures = [...(bodyError === undefined ? [] : [bodyError]), ...cleanupFailures];
-      if (failures.length === 1) throw failures[0];
-      if (failures.length > 1) {
-        throw new AggregateError(
-          failures,
-          failures.map(failure => failure instanceof Error ? failure.message : String(failure)).join('\n'),
-        );
-      }
-    }
+    });
   });
 
   it('holds follow-ups through the resumed continuation until its first model activity', async () => {
