@@ -130,6 +130,44 @@ describe('a turn left running in a CLI the next worker re-attaches', () => {
     expect(s.execution().runtime).toEqual(s.r2);
   });
 
+  it('leaves the turn alone after a newer turn has already finished on the live CLI', () => {
+    const s = turnRunningAcrossRestart();
+    const r3 = s.bind(s.w2, 'b3', cliBare);
+    s.send(s.w2, { type: 'ready' }, {});
+    const newer = s.controller.admitInput('om_newer_turn');
+    s.send(s.w2, { type: 'turn_execution_started', turnId: 'om_newer_turn' }, { runtime: r3, execution: newer });
+    expect(s.send(s.w2, { type: 'turn_terminal', turnId: 'om_newer_turn', status: 'completed' }, { runtime: r3, execution: newer }))
+      .toMatchObject({ kind: 'current' });
+    expect(s.execution('om_newer_turn').phase).toBe('succeeded');
+    // The conversation id can arrive after the newer reply has settled. That
+    // must not make the older reply current again behind it.
+    s.controller.bindRuntime('b3', s.w2, cliNative);
+    expect(s.execution().runtime).toEqual(s.r2);
+    expect(s.final(s.w2, { runtime: r3, execution: s.turn })).toEqual({ kind: 'reject', reason: 'execution_scope_unproven' });
+  });
+
+  it('leaves the turn alone when an intermediate runtime already finished a newer turn', () => {
+    const s = turnRunningAcrossRestart();
+    const r3 = s.bind(s.w2, 'b3', cliBare);
+    s.send(s.w2, { type: 'ready' }, {});
+    const newer = s.controller.admitInput('om_newer_turn');
+    s.send(s.w2, { type: 'turn_execution_started', turnId: 'om_newer_turn' }, { runtime: r3, execution: newer });
+    expect(s.send(s.w2, { type: 'turn_terminal', turnId: 'om_newer_turn', status: 'completed' }, { runtime: r3, execution: newer }))
+      .toMatchObject({ kind: 'current' });
+    expect(s.execution('om_newer_turn').phase).toBe('succeeded');
+    // Complete the intermediate runtime's identity before losing its worker;
+    // the next worker's bare first binding then has to open a later epoch.
+    s.controller.bindRuntime('b3', s.w2, cliNative);
+    expect(s.execution().runtime).toEqual(s.r2);
+    s.controller.workerLost(s.w2);
+    const w3 = s.controller.bindWorker(3).worker;
+    const r4 = s.bind(w3, 'b4', cliBare);
+    expect(r4).not.toEqual(r3);
+    s.controller.bindRuntime('b4', w3, cliNative);
+    expect(s.execution().runtime).toEqual(s.r2);
+    expect(s.final(w3, { runtime: r4, execution: s.turn })).toEqual({ kind: 'reject', reason: 'execution_scope_unproven' });
+  });
+
   it('leaves the turn alone when the old worker\'s loss was never recorded', () => {
     // The old runtime was retired by the new binding rather than marked lost:
     // nothing shows its worker is gone.

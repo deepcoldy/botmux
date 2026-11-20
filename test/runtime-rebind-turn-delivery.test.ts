@@ -5,6 +5,7 @@
 // transcript bridge is the callback the spawn left behind, as in production.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -675,12 +676,22 @@ describe('replies that genuinely cannot be posted', () => {
   it('warns and tells the group when the daemon refuses the live worker\'s final', async () => {
     const warn = vi.spyOn(logger, 'warn');
     const { s, first } = await respawnMidTurn();
+    config.session.dataDir = join(dir, 'data with space');
     await s.answer(TURNS[0], first);
 
     await vi.waitFor(() => expect(s.replies()).toEqual([expect.stringContaining('⚠️')]));
     expect(s.replies()[0]).not.toContain(`answer for ${TURNS[0]}`);
     expect(warn.mock.calls.map(([line]) => String(line))).toContainEqual(
       expect.stringMatching(new RegExp(`Final output from current worker not delivered turn=${TURNS[0]}`)));
+    // Run the command the notice actually carries, not just a quoting helper:
+    // a custom data dir with spaces must still be copy/paste recoverable.
+    const command = /`(find [^`]+)`/.exec(s.replies()[0]!)?.[1];
+    expect(command).toBeDefined();
+    const found = spawnSync('/bin/sh', ['-c', command!], { encoding: 'utf8' });
+    expect(found.status, found.stderr).toBe(0);
+    const kept = readdirSync(join(config.session.dataDir, 'undelivered-replies'), { recursive: true }).map(String).filter(name => name.endsWith('.md'));
+    expect(kept).toHaveLength(1);
+    expect(found.stdout).toContain(kept[0]!);
     await s.answer(TURNS[0], first);
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(s.replies()).toHaveLength(1);

@@ -42,6 +42,15 @@ function displayPath(path: string): string {
   return rel && !rel.startsWith('..') && !rel.startsWith(sep) ? `~/${rel}` : path;
 }
 
+/** Quote the display path for the recovery command in the group notice. Keep
+ *  the `~/` prefix outside the quotes so the shell still expands it. */
+export function shellQuoteDisplayDir(path: string): string {
+  const homeRelative = path.startsWith('~/');
+  const value = homeRelative ? path.slice(2) : path;
+  const quoted = `'${value.replace(/'/g, `'\\''`)}'`;
+  return homeRelative ? `~/${quoted}` : quoted;
+}
+
 /**
  * Keep a reply the session contract would not post. It could not be tied to
  * the runtime the session runs now, so it must not reach the chat — but it is

@@ -768,11 +768,11 @@ export class SessionContractStore {
         || !sameWorker(current.worker, worker) || !['starting', 'ready'].includes(current.phase)
         || identity?.proof !== 'process_start' || !identity.nativeSessionId) return [];
       const executions = this.executions(ref);
-      const holdsOpenWork = (runtime: RuntimeRef): boolean => executions.some(execution =>
-        !terminalPhase(execution.phase) && sameRuntime(execution.runtime, runtime));
-      // Input already running here means the CLI moved on since; whether an
-      // older attempt is still running in it is no longer the runtime's to say.
-      if (holdsOpenWork(live)) return [];
+      const hasBoundWork = (runtime: RuntimeRef): boolean => executions.some(execution =>
+        !!execution.runtime && sameRuntime(execution.runtime, runtime));
+      // Any input already run here means the CLI moved on since, even after
+      // that newer attempt settled; a late older reply must not follow it.
+      if (hasBoundWork(live)) return [];
       const open = executions.filter(execution => execution.runtime && !execution.terminal && !terminalPhase(execution.phase));
       if (!open.length) return [];
       const history = (this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime'").all(sessionKey(ref)) as Array<{ value: string }>)
@@ -816,7 +816,7 @@ export class SessionContractStore {
           && interval.every(runtime => records.some(event => event.type === 'runtime_reserved' && sameRuntime(event.runtime.ref, runtime.ref)));
         const uncertainOnly = [...interval, ...bound.filter(between)]
           .every(runtime => !runtime.identity || sameConversation(runtime.identity) || continuedBareLauncher(runtime))
-          && interval.every(runtime => !holdsOpenWork(runtime.ref));
+          && interval.every(runtime => !hasBoundWork(runtime.ref));
         if (!complete || !uncertainOnly) continue;
         const result = this.applyInside(ref, { type: 'execution_reattached', execution: execution.ref, from: execution.runtime!, runtime: live },
           `reattach:${execution.ref.executionId}:${live.runtimeId}:${live.epoch}`);

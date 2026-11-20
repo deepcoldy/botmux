@@ -2,20 +2,31 @@
  * A reply the session contract refuses to post is kept on the bot's machine
  * instead of being thrown away, and the group notice points at it.
  */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import {
-  archiveUndeliveredReply, UNDELIVERED_REPLIES_KEPT_PER_SESSION, UNDELIVERED_REPLY_DIR,
+  archiveUndeliveredReply, shellQuoteDisplayDir, UNDELIVERED_REPLIES_KEPT_PER_SESSION, UNDELIVERED_REPLY_DIR,
 } from '../src/services/undelivered-reply-archive.js';
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-function dataDir(): string {
-  const root = mkdtempSync(join(tmpdir(), 'undelivered-reply-')); roots.push(root); return root;
+afterEach(() => {
+  vi.unstubAllEnvs();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+function dataDir(prefix = 'undelivered-reply-'): string {
+  const root = mkdtempSync(join(tmpdir(), prefix)); roots.push(root); return root;
 }
 const reply = { appId: 'cli_app', sessionId: 'session-1', turnId: 'om_turn', reason: 'execution_scope_unproven', cliId: 'antigravity', content: '完整的回复正文\n第二行' };
+
+function expectNoticeFinds(kept: ReturnType<typeof archiveUndeliveredReply>): void {
+  const command = `find ${shellQuoteDisplayDir(kept.displayDir)} -name "${kept.stamp}*"`;
+  const found = spawnSync('/bin/sh', ['-c', command], { encoding: 'utf8', env: process.env });
+  expect(found.status, `${command}\n${found.stderr}`).toBe(0);
+  expect(found.stdout.split('\n')).toContain(kept.path);
+}
 
 describe('archiveUndeliveredReply', () => {
   it('keeps the whole reply, owner-only, with what it answered and why it was held back', () => {
@@ -53,5 +64,19 @@ describe('archiveUndeliveredReply', () => {
     // Another session's archive is not this one's to trim.
     const other = archiveUndeliveredReply(data, { ...reply, sessionId: 'session-2', at: new Date(base) });
     expect(readdirSync(dirname(other.path))).toHaveLength(1);
+  });
+
+  it('makes the notice command find an archive under an absolute path with spaces and quotes', () => {
+    const data = dataDir("undelivered reply 'space ");
+    const kept = archiveUndeliveredReply(data, reply);
+    expectNoticeFinds(kept);
+  });
+
+  it('makes the notice command find an archive under the home-relative display path', () => {
+    const home = dataDir();
+    vi.stubEnv('HOME', home);
+    const kept = archiveUndeliveredReply(join(home, "botmux data 'space"), reply);
+    expect(kept.displayDir.startsWith('~/')).toBe(true);
+    expectNoticeFinds(kept);
   });
 });

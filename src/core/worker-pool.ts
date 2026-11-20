@@ -92,7 +92,7 @@ import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
-import { archiveUndeliveredReply } from '../services/undelivered-reply-archive.js';
+import { archiveUndeliveredReply, shellQuoteDisplayDir } from '../services/undelivered-reply-archive.js';
 import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import type { WorkerOwnerDiagnostic } from './worker-owner-diagnostic.js';
@@ -20829,7 +20829,7 @@ function setupWorkerHandlers(
     undeliveredFinalNotices.add(key);
     const locale = localeForBot(ds.larkAppId);
     const recovery = archived
-      ? tr('worker.final_output_undelivered_archived', { dir: archived.displayDir, stamp: archived.stamp }, locale)
+      ? tr('worker.final_output_undelivered_archived', { dir: shellQuoteDisplayDir(archived.displayDir), stamp: archived.stamp }, locale)
       : tr('worker.final_output_undelivered_unarchived', undefined, locale);
     void sendTurnNotice(ds, {
       kind: 'user_notify', turnId: fallbackTurnId(ds, final.turnId), msgType: 'text',
