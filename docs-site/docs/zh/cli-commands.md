@@ -290,7 +290,7 @@ botmux autostart status   # 查看状态
 | 命令 | 说明 |
 |------|------|
 | `botmux observe [--session <id>] [--lark-app <appId>] [--include-task] [--active\|--since <时长>]` | 通过 daemon 实时查询会话和 worker 状态（JSON）。查不到就显示 unknown，不读缓存。`--include-task` 给每个会话加上任务状态（需要你 / 进行中 / 本轮已交付 / 没做完 / 空闲 / 已关闭，与 Dashboard 看板同一套判断）；`--active` 只列没关闭、并且在跑或 24 小时内有消息的会话，`--since 6h` 把窗口改成 6 小时 |
-| `botmux execution current --json` | 核对当前进程属于哪个机器人、会话、轮次和 worker |
+| `botmux execution current --json [--cli]` | 核对当前进程所属执行；`--cli` 另返回实际 CLI 模式、系统账号和原生操作权限 |
 | `botmux actor current --json` | 返回经 daemon 验证的本轮发起人企业邮箱，以及当前群 ID 和轮次 ID（不含 open_id）。不在会话进程里运行时会拒绝 |
 
 ### 进阶能力（各有专页）

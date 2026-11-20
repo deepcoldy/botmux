@@ -8282,8 +8282,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
   workspace-recycle discover|prepare|finish|status|hook
                          按精确工作区发现、回收会话并读取资源验证结果
-  execution current --json
-              只读核验当前进程所属的 bot/session/turn、执行尝试和 Worker 代次
+  execution current --json [--cli]
+              --cli 另返回实际启动模式、系统执行账号与原生操作权限；只读核验当前进程所属的 bot/session/turn、执行尝试和 Worker 代次
   execution background [--ttl-seconds <秒>] -- <命令> [参数...]
               在已验证定时轮次登记并启动后台任务，返回任务 ID、PID 与日志位置
   execution background-revoke <任务ID> --json
@@ -21590,13 +21590,14 @@ switch (command) {
     }
     const { CURRENT_EXECUTION_SCHEMA, parseCurrentExecutionArgs, resolveCurrentExecution } = await import('./cli/current-execution.js');
     if (!parseCurrentExecutionArgs(process.argv.slice(3))) {
-      console.error('用法: botmux execution current --json');
+      console.error('用法: botmux execution current --json [--cli]');
       process.exitCode = 2;
       break;
     }
     try {
       const { resolveBotmuxAncestorContext } = await import('./cli/current-actor.js');
-      const document = await resolveCurrentExecution(resolveBotmuxAncestorContext());
+      const document = await resolveCurrentExecution({ ...resolveBotmuxAncestorContext(),
+        includeCli: process.argv.slice(3).includes('--cli') });
       process.stdout.write(`${JSON.stringify(document)}\n`);
     } catch {
       process.stdout.write(`${JSON.stringify({ schema: CURRENT_EXECUTION_SCHEMA,

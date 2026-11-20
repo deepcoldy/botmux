@@ -1,3 +1,5 @@
+import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from './core/cli-execution-mode.js';
+import { resolveNativeScheduledControlActor } from './core/scheduled-control-actor.js';
 import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
 import { renderInboundMessageLocation } from './core/reply-message.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
@@ -4618,10 +4620,15 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
     // Tool-identity publication is optional, talker re-admission is not. The
     // scheduler calls this after precondition/admission waits, so a talk-only
     // task must still be checked before it can dispatch with the bot's tools.
-    if (turnId.startsWith('schedule:')) return prepareScheduledTurnCliIdentity(ds, turnId, true);
+    if (turnId.startsWith('schedule:')) return prepareScheduledTurnCliIdentity(ds, turnId, true)
+      .then(() => prepareNativeScheduledControlIdentity(ds, turnId));
     return;
   }
   if (turnId.startsWith('schedule:')) {
+    if (configuredCliExecutionMode(getBot(ds.larkAppId).config) === 'native') {
+      return prepareScheduledTurnCliIdentity(ds, turnId, true)
+        .then(() => prepareNativeScheduledControlIdentity(ds, turnId));
+    }
     return prepareScheduledTurnCliIdentity(ds, turnId);
   }
   if (isOwnerActorTurnId(turnId)) {
@@ -4758,6 +4765,11 @@ function delegatedScheduleRuntimeDeps(appId: string) {
     runEnabled: schedulePolicy?.runEnabled !== false,
     hostRunScopes: schedulePolicy?.runScopes ?? [],
     triggerUserAuth: triggerPolicy,
+    larkToolBinding: botConfig.larkToolBinding,
+    currentCliConfig: () => getBot(appId).config,
+    currentRunEnabled: () => readGlobalConfig().scheduleDelegation?.runEnabled !== false,
+    currentAdminOpenIds: () => getDashboardAdminOpenIds(appId),
+    currentRunScopes: () => readGlobalConfig().scheduleDelegation?.runScopes ?? [],
     validateBotGrant: (record: import('./services/schedule-authority-store.js').ScheduleAuthorityRecord) =>
       assertScheduleBotGrantActive(record, readGlobalConfig().scheduleDelegation),
     adminOpenIds: getDashboardAdminOpenIds(appId),
@@ -4893,6 +4905,12 @@ const ownerActorIdentityRestores = new WeakMap<DaemonSession, Map<string, { key:
  *  publication used: the schedule authority for a scheduled run, the
  *  session's reply target for a human message or a resolved owner actor turn. */
 async function restoreTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  // daemon 重启后原生定时轮也需重建控制人证明，但不发布个人凭据。
+  if (parseScheduledTurnId(turnId) && configuredCliExecutionMode(getBot(ds.larkAppId).config) === 'native') {
+    await prepareScheduledTurnCliIdentity(ds, turnId, true);
+    await prepareNativeScheduledControlIdentity(ds, turnId);
+    return;
+  }
   if (ds.lastPublishedIdentityModel !== undefined || !triggerUserAuthEnabledFor(ds)
     || identityStorageModelForDaemonSession(ds) !== 'proven'
     // Owner turns are synthetic but carry a daemon-resolved human sender. Other
@@ -5046,6 +5064,28 @@ const scheduleIdentityClaims = createScheduleIdentityClaims({
   now: () => new Date(),
   log: { info: message => logger.info(message), warn: message => logger.warn(message) },
 });
+
+async function prepareNativeScheduledControlIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  ds.scheduledControlActors?.delete(turnId);
+  if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
+  if (configuredCliExecutionMode(getBot(ds.larkAppId).config) !== 'native') return;
+  const taskId = parseScheduledTurnId(turnId);
+  const authority = taskId ? scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId) : undefined;
+  if (!authority) throw new Error('schedule authority record missing');
+  const actor = await resolveNativeScheduledControlActor({
+    turnId, appId: ds.larkAppId, chatId: ds.chatId, authority,
+    cliConfig: () => getBot(ds.larkAppId).config,
+    deps: delegatedScheduleRuntimeDeps(ds.larkAppId),
+    resolveDirectActor: () => resolveScheduledRunIdentity(authority.task, ds.larkAppId,
+      (openId, unionId) => canOperate(ds.larkAppId, ds.chatId, openId, unionId)),
+    assertCurrent: () => assertScheduledAuthorityCurrent(authority,
+      scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId!), { turnId, allowCompleted: true }),
+  });
+  if (actor) {
+    noteSenderUnionId(ds.larkAppId, actor.openId, actor.unionId);
+    (ds.scheduledControlActors ??= new Map()).set(turnId, actor);
+  }
+}
 
 async function prepareDelegatedScheduledTurnIdentity(
   ds: DaemonSession,
@@ -10466,9 +10506,8 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       if (resolved.status !== 'resolved' || resolved.openId !== parent.controlOpenId) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
       }
-      const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
-      if (!targetTriggerPolicy?.enabled
-        || !capabilityOn(targetTriggerPolicy, 'lark-user') || !capabilityOn(targetTriggerPolicy, 'bytecloud')) {
+      const targetCliConfig = getBot(ds.larkAppId).config;
+      if (!delegatedCliExecutionAllowed(targetCliConfig)) {
         return jsonRes(res, 403, {
           ok: false,
           error: 'schedule_child_one_shot_identity_isolation_required',
@@ -10524,12 +10563,14 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         };
         if (!botGrantHolds()) return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
       }
-      const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
-      if (!capabilityOn(targetTriggerPolicy, 'lark-user') || !capabilityOn(targetTriggerPolicy, 'bytecloud')) {
+      const targetCliConfig = getBot(ds.larkAppId).config;
+      const targetTriggerPolicy = targetCliConfig.triggerUserAuth;
+      if (!delegatedCliExecutionAllowed(targetCliConfig)) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_target_identity_isolation_required' });
       }
       if (capability.allowedRunScopes.some(scope => !targetPolicy?.runScopes?.includes(scope)
-        || !capabilityOn(targetTriggerPolicy, capabilityOfTool(scope)))) {
+        || configuredCliExecutionMode(targetCliConfig) !== 'native'
+          && !capabilityOn(targetTriggerPolicy, capabilityOfTool(scope)))) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_run_scope_unsupported' });
       }
       if (capability.allowSelfManage === true && targetPolicy?.selfManageEnabled !== true) {
@@ -10603,6 +10644,12 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         return jsonRes(res, 403, { ok: false, error: childDecision.error });
       }
       scheduledChildMaxTasksPerTurn = childDecision.value.maxTasksPerTurn;
+    }
+    if (!direct && !providerActor && !delegatedCliExecutionAllowed(getBot(ds.larkAppId).config)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_target_identity_isolation_required' });
+    }
+    if (persistentRunScopes.some(scope => !readGlobalConfig().scheduleDelegation?.runScopes?.includes(scope))) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_run_scope_unsupported' });
     }
     const baseParams = {
       name: task.name.trim(),

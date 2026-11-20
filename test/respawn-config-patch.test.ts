@@ -22,6 +22,19 @@ function forkSnapshot(): Cfg {
 }
 
 describe('applyRespawnConfigPatch', () => {
+  it('updates both CLI identity switches on an in-worker respawn', () => {
+    const cfg = forkSnapshot();
+    cfg.triggerUserAuth = { enabled: true, tools: ['lark-cli', 'bytedcli'] };
+    applyRespawnConfigPatch(cfg, { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] } });
+    expect(cfg.larkToolBinding).toBe(false);
+    expect(cfg.triggerUserAuth?.enabled).toBe(false);
+    applyRespawnConfigPatch(cfg, { triggerUserAuth: null });
+    expect(cfg.triggerUserAuth).toBeUndefined();
+    applyRespawnConfigPatch(cfg, { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } });
+    applyRespawnConfigPatch(cfg, {});
+    expect(cfg.triggerUserAuth?.tools).toEqual(['bytedcli']);
+  });
+
   it('replaces the fork-time startup commands with the carried ones', () => {
     const cfg = forkSnapshot();
     const result = applyRespawnConfigPatch(cfg, { startupCommands: ['/effort xhigh'] });

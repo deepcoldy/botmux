@@ -22,6 +22,7 @@
  * resolves frozen `/cli` selections to their own snapshot before sending.
  */
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
+import type { TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 
 export interface RespawnConfigPatch {
   /** Role-switch cwd move (restart IPC `updateWorkingDir`). Empty → ignored. */
@@ -34,6 +35,7 @@ export interface RespawnConfigPatch {
   traexAutoModel?: TraexAutoModelConfig | null;
   /** null = explicitly disabled (bots.json `larkToolBinding: false`). */
   larkToolBinding?: boolean | null;
+  triggerUserAuth?: TriggerUserAuthConfig | null;
   startupCommands?: string[] | null;
   launchShell?: string | null;
 }
@@ -48,6 +50,7 @@ export interface RespawnPatchTarget {
   codexRpcInput?: boolean;
   traexAutoModel?: TraexAutoModelConfig;
   larkToolBinding?: boolean;
+  triggerUserAuth?: TriggerUserAuthConfig;
   startupCommands?: string[];
   launchShell?: string;
 }
@@ -78,6 +81,7 @@ export function applyRespawnConfigPatch(cfg: RespawnPatchTarget, patch: RespawnC
   if (patch.larkToolBinding !== undefined) {
     cfg.larkToolBinding = patch.larkToolBinding === null ? false : patch.larkToolBinding;
   }
+  if (patch.triggerUserAuth !== undefined) cfg.triggerUserAuth = patch.triggerUserAuth ?? undefined;
   let startupCommandsChanged = false;
   if (patch.startupCommands !== undefined) {
     const next = patch.startupCommands === null || patch.startupCommands.length === 0

@@ -366,6 +366,8 @@ export interface CurrentTurnPeerAttestationInput {
   /** Current-actor only: let the daemon's live ownerless-child tool actor
    * satisfy the human caller requirement without promoting workflow authority. */
   allowScheduledToolActor?: boolean;
+  /** 仅 Actor 查询可读取原生控制人；工具凭据证明必须保持独立。 */
+  allowScheduledControlActor?: boolean;
 }
 
 /**
@@ -402,9 +404,13 @@ export function attestCurrentExecutionLoopbackPeer(
   const expectedScheduledToolActor = input.allowScheduledToolActor && input.expectedScheduledTurnId
     ? ds?.scheduledToolActors?.get(input.expectedScheduledTurnId)
     : undefined;
-  const attestedCallerOpenId = callerOpenId ?? scheduledToolActor?.openId;
+  const scheduledControlActor = input.allowScheduledControlActor && turnId
+    ? ds?.scheduledControlActors?.get(turnId) : undefined;
+  const expectedScheduledControlActor = input.allowScheduledControlActor && input.expectedScheduledTurnId
+    ? ds?.scheduledControlActors?.get(input.expectedScheduledTurnId) : undefined;
+  const attestedCallerOpenId = callerOpenId ?? scheduledToolActor?.openId ?? scheduledControlActor?.openId;
   const expectedScheduledCallerOpenId = scheduledCaller?.requestUserOpenId
-    ?? expectedScheduledToolActor?.openId;
+    ?? expectedScheduledToolActor?.openId ?? expectedScheduledControlActor?.openId;
   const refuse = (reason: string): null => { input.onRefusal?.(reason); return null; };
   if (!ds) return refuse('no session');
   if (ds.session.status !== 'active') return refuse('session not active');
@@ -517,6 +523,7 @@ export async function resolveDaemonCurrentActor(input: {
     sessionId: input.sessionId, peer: input.peer,
     findSession: input.findSession, procRoot,
     allowScheduledToolActor: true,
+    allowScheduledControlActor: true,
     ...(input.expectedScheduledTurnId
       ? { expectedScheduledTurnId: input.expectedScheduledTurnId }
       : {}),
