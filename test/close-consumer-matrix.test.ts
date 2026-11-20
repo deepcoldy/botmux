@@ -224,6 +224,12 @@ const CONSUMERS: Record<string, Rule> = {
       + 'so the next message creates one for the current owner; nobody waits on it and the wrapper '
       + 'logs refusal and residual.',
   },
+  'core/worker-pool.ts::sendWorkerInput::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Assistant-mode input gate: input to a live session not owned by the current owner is refused '
+      + '(the user is told to resend) and the session retired; every later input is refused the same way '
+      + 'even if that close is refused, and the wrapper logs refusal and residual.',
+  },
   'daemon.ts::onAssistantOwnerChanged::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Assistant-mode owner change (claim / admin reassign): retires the previous owner\'s sessions; '

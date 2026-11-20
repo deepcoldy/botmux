@@ -17695,6 +17695,27 @@ export function sendWorkerInput(
   let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
+  // 个人助理模式：活着的 worker 也要按当前归属核对（开模式时没能退役的存量会话、主人已变）。
+  // 不核对的话，新消息会直接喂给一个不属于当前主人、也没冻结「不放 Bot 密钥」的 worker。
+  if (bot.config.assistantMode === true) {
+    const decision = decideAssistantAdmission(ds.larkAppId, {
+      chatId: ds.chatId,
+      chatType: ds.session.chatType === 'p2p' ? 'p2p' : 'group',
+      ownerOpenId: ds.session.ownerOpenId,
+      assistantOwnerOpenId: ds.session.assistantOwnerOpenId,
+      everRan: true,
+      sandboxFrozenWithoutWithhold: ds.session.sandboxWithholdBotSecret !== true,
+    });
+    if (decision.kind !== 'allow') {
+      logger.warn(`[${tag(ds)}] assistant-mode: refusing input ${turnId ?? '?'} to a session not owned by the current owner; retiring it`);
+      if (opts.notifyRejection !== false) void callbacks?.sessionReply(
+        sessionAnchorId(ds), tr('worker.assistant.session_retired', {}, localeForBot(ds.larkAppId)), 'text', ds.larkAppId, turnId,
+      ).catch(err => logger.warn(`[${tag(ds)}] assistant-mode: failed to report retired session: ${String(err)}`));
+      void closeSessionForBackgroundCleanup(ds.session.sessionId, 'assistant-mode input to unowned session').catch(err =>
+        logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
+      return false;
+    }
+  }
   const effectiveCliId = sessionCliId(ds, bot.config);
   const effectiveTurnId = turnId ?? (isCodexAppCliId(effectiveCliId)
     ? `codex-app-dispatch-${randomUUID()}`

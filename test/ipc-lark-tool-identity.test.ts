@@ -292,6 +292,17 @@ describe('session application identity route', () => {
       expect(await user.json()).toMatchObject({ ok: true, mode: 'user', credentialType: 'user_access_token' });
     } finally { delete session.session.sandboxWithholdBotSecret; }
   });
+  it('withholds the bot token from a session that predates assistant mode once the live bot enables it', async () => {
+    vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', assistantMode: true } } as any);
+    try {
+      const bot = await request('bot');
+      expect(bot.status).toBe(403);
+      expect(await bot.json()).toEqual({ ok: false, error: 'lark_tool_bot_identity_withheld' });
+      expect(bots.getBotClient).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
+    }
+  });
   it('binds bot and current user without requiring triggerUserAuth configuration', async () => {
     const bot = await request('bot'); const raw = await bot.text();
     expect(bot.status).toBe(200);
