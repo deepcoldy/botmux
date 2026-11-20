@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setImmediate as realSetImmediate } from 'node:timers';
+import { setImmediate as realSetImmediate, setTimeout as realSetTimeout, clearTimeout as realClearTimeout } from 'node:timers';
 import type * as NoticeModule from '../src/core/botmux-update-notify.js';
 import { readGlobalConfig, mergeMaintenanceConfig } from '../src/global-config.js';
 import { withFileLock } from '../src/utils/file-lock.js';
@@ -43,12 +43,40 @@ function deferred<T = void>() {
   const promise = new Promise<T>(r => { resolve = r; });
   return { promise, resolve };
 }
+async function withRealTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = realSetTimeout(() => reject(new Error(message)), 10_000);
+    timer.unref?.();
+  });
+  try { return await Promise.race([promise, timeout]); }
+  finally { if (timer) realClearTimeout(timer); }
+}
+
 async function ioUntil(check: () => boolean) {
-  for (let i = 0; i < 4000; i++) {
-    if (check()) return;
-    await new Promise<void>(r => realSetImmediate(r));
-  }
-  throw new Error('I/O condition did not settle');
+  await withRealTimeout((async () => {
+    while (!check()) await new Promise<void>(r => realSetImmediate(r));
+  })(), 'I/O condition did not settle');
+}
+
+/** Await the actual timer registration, not a scheduler-speed poll count. */
+async function fakeTimerScheduled(): Promise<void> {
+  if (vi.getTimerCount() > 0) return;
+  const signal = deferred();
+  const originalTimeout = globalThis.setTimeout;
+  const originalInterval = globalThis.setInterval;
+  const timeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+  const intervalSpy = vi.spyOn(globalThis, 'setInterval');
+  timeoutSpy.mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+    signal.resolve();
+    return originalTimeout(callback, ms, ...args);
+  }) as typeof setTimeout);
+  intervalSpy.mockImplementation(((callback: (...args: any[]) => void, ms?: number, ...args: any[]) => {
+    signal.resolve();
+    return originalInterval(callback, ms, ...args);
+  }) as typeof setInterval);
+  try { await withRealTimeout(signal.promise, 'fake timer was not scheduled'); }
+  finally { timeoutSpy.mockRestore(); intervalSpy.mockRestore(); }
 }
 
 describe('botmux version reminder delivery', () => {
@@ -158,7 +186,7 @@ describe('botmux version reminder delivery', () => {
     await executeWithLarkGate('cli_review', 'exhaust-burst', async () => {});
     const c = controller(); const run = c.tick();
     await ioUntil(() => existsSync(statePath()));
-    await ioUntil(() => vi.getTimerCount() > 0);
+    await fakeTimerScheduled();
     enabled = false;
     await vi.advanceTimersByTimeAsync(1000); await run;
     expect(sdk.request).not.toHaveBeenCalled();
@@ -166,7 +194,7 @@ describe('botmux version reminder delivery', () => {
     expect(state().lastNotifiedVersion).toBeUndefined();
     await c.tick(); enabled = true;
     const resumed = c.tick();
-    await ioUntil(() => vi.getTimerCount() > 0);
+    await fakeTimerScheduled();
     await vi.advanceTimersByTimeAsync(1000); await resumed;
     expect(deliveries).toHaveLength(1);
   });
@@ -176,7 +204,7 @@ describe('botmux version reminder delivery', () => {
     await executeWithLarkGate('cli_review', 'exhaust-burst', async () => {});
     const c = controller(); const run = c.tick();
     await ioUntil(() => existsSync(statePath()));
-    await ioUntil(() => vi.getTimerCount() > 0);
+    await fakeTimerScheduled();
     enabled = false;
     await vi.advanceTimersByTimeAsync(1000); await run;
     expect(sdk.request).not.toHaveBeenCalled();
@@ -205,7 +233,7 @@ describe('botmux version reminder delivery', () => {
       throw Object.assign(new Error('rate limited'), { isAxiosError: true, response: { status: 429 } });
     });
     const c = controller(); const first = c.tick(); await reached.promise;
-    await ioUntil(() => vi.getTimerCount() > 0);
+    await fakeTimerScheduled();
     enabled = false;
     await vi.advanceTimersByTimeAsync(500); await first;
     const firstUuid = state().pending?.uuid;
@@ -282,7 +310,7 @@ describe('botmux version reminder delivery', () => {
     });
     const c = controller(); const run = c.tick();
     await reached.promise;
-    await ioUntil(() => vi.getTimerCount() > 0);
+    await fakeTimerScheduled();
     if (action === 'disable') enabled = false;
     if (action === 'owner') owner = 'ou_new_review';
     if (action === 'upgrade') current = '1.1.0';
@@ -396,7 +424,7 @@ describe('botmux version reminder delivery', () => {
     __testOnly_resetLarkGate(); vi.stubEnv('BOTMUX_LARK_QPS', '1');
     await executeWithLarkGate('cli_review', 'exhaust-burst', async () => {});
     const run = c.tick();
-    await ioUntil(() => vi.getTimerCount() > 0);
+    await fakeTimerScheduled();
     await vi.advanceTimersByTimeAsync(1000); await run;
     expect(sdk.request).toHaveBeenCalledTimes(1);
     expect(deliveries).toHaveLength(1);
@@ -476,8 +504,6 @@ describe('botmux version reminder delivery', () => {
     const c = controller(); c.start();
     await vi.advanceTimersByTimeAsync(20_000); await entered.promise;
     await vi.advanceTimersByTimeAsync(10 * 60_000);
-    // Drain real filesystem turns after the controlled timers advance.
-    for (let i = 0; i < 100; i++) await new Promise<void>(r => realSetImmediate(r));
     expect(deps.fetchLatest).toHaveBeenCalledTimes(1);
     expect(deliveries).toHaveLength(0);
     expect(deps.log).not.toHaveBeenCalled();
@@ -492,12 +518,8 @@ describe('botmux version reminder delivery', () => {
     deps.fetchLatest = vi.fn(async () => { entered.resolve(); return release.promise; });
     const a = controller(), b = controller();
     const holder = a.tick(); await entered.promise;
-    let contenderDone = false;
-    const contender = b.tick().then(() => { contenderDone = true; });
-    for (let i = 0; i < 70 && !contenderDone; i++) {
-      await new Promise<void>(r => realSetImmediate(r));
-      await vi.advanceTimersByTimeAsync(100);
-    }
+    const contender = b.tick();
+    await vi.advanceTimersByTimeAsync(7_000);
     await contender;
     expect(deps.fetchLatest).toHaveBeenCalledTimes(1);
     expect(sdk.request).not.toHaveBeenCalled();
@@ -514,18 +536,14 @@ describe('botmux version reminder delivery', () => {
     const entered = deferred(), release = deferred();
     const holder = withFileLock(statePath(), async () => { entered.resolve(); await release.promise; });
     await entered.promise;
-    let done = false;
-    const run = controller().tick().then(() => { done = true; });
+    const run = controller().tick();
     try {
-      await ioUntil(() => vi.getTimerCount() > 0 || vi.mocked(deps.fetchLatest).mock.calls.length > 0);
+      await fakeTimerScheduled();
       expect(deps.fetchLatest).not.toHaveBeenCalled();
       expect(sdk.request).not.toHaveBeenCalled();
     } finally {
       release.resolve(); await holder;
-      for (let i = 0; i < 60 && !done; i++) {
-        await new Promise<void>(r => realSetImmediate(r));
-        await vi.advanceTimersByTimeAsync(100);
-      }
+      await vi.advanceTimersByTimeAsync(7_000);
       await run;
     }
     expect(deliveries).toHaveLength(1);
@@ -536,14 +554,10 @@ describe('botmux version reminder delivery', () => {
     const entered = deferred(), release = deferred();
     const holder = withFileLock(statePath(), async () => { entered.resolve(); await release.promise; });
     await entered.promise;
-    let done = false;
-    const run = controller().tick().then(() => { done = true; });
+    const run = controller().tick();
     await new Promise<void>(r => realSetImmediate(r));
     enabled = false; release.resolve(); await holder;
-    for (let i = 0; i < 60 && !done; i++) {
-      await new Promise<void>(r => realSetImmediate(r));
-      await vi.advanceTimersByTimeAsync(100);
-    }
+    await vi.advanceTimersByTimeAsync(7_000);
     await run;
     console.log('REVIEW_DISABLE_WAITING_LOCK', JSON.stringify({ checks: vi.mocked(deps.fetchLatest).mock.calls.length, deliveries }));
     expect(deps.fetchLatest).not.toHaveBeenCalled();
