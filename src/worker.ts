@@ -17899,8 +17899,8 @@ async function captureAndUpload(): Promise<void> {
     || capturedAttempt !== currentBotmuxDispatchAttempt;
   // Dedup is bound to the full identity: the same pixels under a new capture
   // identity or display cycle are a NEW first frame, never a duplicate.
-  const dedupKey = (pixelHash: string): string =>
-    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}`;
+  const dedupKey = (pixelHash: string, recovery?: UsageAwareScreen['usageLimitRecovery']): string =>
+    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${recovery ? `:recovery=${recovery}` : ''}`;
   let recaptureAfterStaleFrame = false;
   let ownedKey: string | null = null;
   let previousShotHash = lastShotHash;
@@ -17918,6 +17918,8 @@ async function captureAndUpload(): Promise<void> {
   try {
     let png: Buffer;
     let usageLimitContent = '';
+    let pixelHash = '';
+    let usageAware: UsageAwareScreen;
     try {
       // Preferred path: pipe-pane backends ask tmux for a fresh viewport
       // snapshot and render it through a transient xterm-headless. This
@@ -17927,13 +17929,15 @@ async function captureAndUpload(): Promise<void> {
       if (frameIsStale()) { cancelStale('snapshot'); return; }
       if (pipeResult) {
         // Same ANSI on a resized canvas is a different picture.
-        const key = dedupKey(`${pipeResult.cols}x${pipeResult.rows}:${pipeResult.ansi}`);
+        usageLimitContent = pipeResult.content;
+        usageAware = classifyScreenUsageLimit(pipeResult.content, projectedRuntimeScreenStatus());
+        pixelHash = `${pipeResult.cols}x${pipeResult.rows}:${pipeResult.ansi}`;
+        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
         lastShotHash = key;
         png = pipeResult.png;
-        usageLimitContent = pipeResult.content;
       } else {
         // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
         // still drive the long-lived renderer.
@@ -17941,12 +17945,14 @@ async function captureAndUpload(): Promise<void> {
         const term = renderer.xterm;
         const startY = term.buffer.active.baseY;
         const snap = renderer.rawSnapshot();
-        const key = dedupKey(createHash('md5').update(snap).digest('hex'));
+        usageLimitContent = snap;
+        usageAware = classifyScreenUsageLimit(snap, projectedRuntimeScreenStatus());
+        pixelHash = createHash('md5').update(snap).digest('hex');
+        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
         lastShotHash = key;
-        usageLimitContent = snap;
         const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
         const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
         // `captureToPng` is the module-scope lazy wrapper above: the canvas native
@@ -17974,7 +17980,15 @@ async function captureAndUpload(): Promise<void> {
 
     if (frameIsStale()) { cancelStale('upload'); return; }
 
-    const status = projectedRuntimeScreenStatus();
+    // Recheck after the async upload: a newer native refusal must win over
+    // the pre-upload recovery evidence used by pixel dedup.
+    const currentUsageAware = classifyScreenUsageLimit(usageLimitContent, projectedRuntimeScreenStatus());
+    // Commit the evidence actually sent, not the pre-upload classification.
+    // A capture failure during upload must leave a later ready edge deliverable.
+    if (lastShotHash === ownedKey) {
+      ownedKey = dedupKey(pixelHash, currentUsageAware.usageLimitRecovery);
+      lastShotHash = ownedKey;
+    }
     // Success is otherwise completely silent (skips and failures log above), which
     // made "loop alive and uploading" indistinguishable from "loop never started"
     // in the daemon log. One throttled line keeps the happy path observable.
@@ -17986,7 +18000,7 @@ async function captureAndUpload(): Promise<void> {
     send({
       type: 'screenshot_uploaded',
       imageKey,
-      ...classifyScreenUsageLimit(usageLimitContent, status),
+      ...currentUsageAware,
       turnId: capturedTurnId,
       dispatchAttempt: capturedAttempt,
       captureRevision: capturedRevision,
@@ -25346,6 +25360,7 @@ function startScreenUpdates(): void {
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
   let lastSentExpiredQuotaKey: string | undefined;
+  let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
   let lastTextSnapshotHash = '';
   let lastContent = '';
@@ -25545,9 +25560,11 @@ function startScreenUpdates(): void {
       if (startupInputHeld()) return;
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
+        || usageAware.usageLimitRecovery !== lastSentRecovery
         || backgroundWaitTasks !== lastSentBackgroundWait) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
+        lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
         send({
           type: 'screen_update',

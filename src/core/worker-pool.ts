@@ -4904,6 +4904,7 @@ export function clearUsageLimitState(ds: DaemonSession): void {
     ds.usageLimit = previous;
     throw error;
   }
+  cancelComposerRecoveryRetry(ds);
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
@@ -5045,6 +5046,8 @@ export function restoreUsageLimitRuntimeState(ds: DaemonSession): void {
 
 function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitState): void {
   if (!usageLimit) return;
+  // Even a repeated refusal invalidates earlier recovery evidence.
+  cancelComposerRecoveryRetry(ds);
 
   const previous = ds.usageLimit;
   usageLimit = reconcileUsageLimitState(previous, usageLimit);
@@ -5070,6 +5073,57 @@ function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
   return limit?.source === 'antigravity-error-composer' && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
 }
 
+const composerRecoveryRetries = new WeakMap<DaemonSession, {
+  timer: ReturnType<typeof setTimeout>;
+  owns: () => boolean;
+}>();
+
+function cancelComposerRecoveryRetry(ds: DaemonSession): void {
+  const pending = composerRecoveryRetries.get(ds);
+  if (pending) clearTimeout(pending.timer);
+  composerRecoveryRetries.delete(ds);
+}
+
+/** Retain an accepted proof locally until SQLite commits it. Worker screen
+ * dedup deliberately sends an edge once, so persistence cannot depend on a
+ * second identical frame. Ownership and fresh refusals invalidate this proof. */
+function retryComposerRecovery(
+  ds: DaemonSession,
+  frame: { status: ScreenStatus; turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
+  owns: () => boolean,
+): void {
+  const { status } = frame;
+  const pending = composerRecoveryRetries.get(ds);
+  if (pending?.owns()) return;
+  cancelComposerRecoveryRetry(ds);
+  const key = ds.usageLimit && usageLimitStateKey(ds.usageLimit);
+  let delayMs = 500;
+  const schedule = (): void => {
+    const timer = setTimeout(() => {
+      if (composerRecoveryRetries.get(ds)?.timer !== timer) return;
+      composerRecoveryRetries.delete(ds);
+      if (!owns() || !ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+      try {
+        clearUsageLimitState(ds);
+      } catch (error) {
+        logger.warn(`[${tag(ds)}] composer recovery persistence retry: ${String(error)}`);
+        delayMs = Math.min(delayMs * 2, 30_000);
+        schedule();
+        return;
+      }
+      if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = status;
+      stampIdleSinceAt(ds, 'limited');
+      if (!isStalePostTerminalBusyFrame(ds, status, frame)
+        && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+        scheduleCardPatch(ds, buildStreamingCardJson(ds), frame.turnId, { owns });
+      }
+    }, delayMs);
+    timer.unref();
+    composerRecoveryRetries.set(ds, { timer, owns });
+  };
+  schedule();
+}
+
 /**
  * Resolve the daemon-side screen status in the presence of a usage limit.
  *
@@ -5089,7 +5143,8 @@ function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
  */
 function resolveUsageAwareScreenStatus(
   ds: DaemonSession,
-  frame: { status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; content?: string; usageLimitRecovery?: 'antigravity-ready-composer' },
+  frame: { status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; content?: string; usageLimitRecovery?: 'antigravity-ready-composer'; turnId?: string; dispatchAttempt?: number; directSubmit?: boolean },
+  owns: () => boolean,
 ): ScreenStatus {
   const { status, usageLimit, expiredAntigravityQuota, content } = frame;
   const previous = ds.usageLimit;
@@ -5106,7 +5161,14 @@ function resolveUsageAwareScreenStatus(
     const composerRecovered = frame.usageLimitRecovery === 'antigravity-ready-composer'
       && sessionCliId(ds, getBot(ds.larkAppId).config) === 'antigravity';
     if (expiredSameEpisode || isExpiredNativeAntigravityQuota(previous) || workRecovered || composerRecovered) {
-      clearUsageLimitState(ds);
+      try {
+        clearUsageLimitState(ds);
+      } catch (error) {
+        if (!composerRecovered) throw error;
+        logger.warn(`[${tag(ds)}] composer recovery persistence failed: ${String(error)}`);
+        retryComposerRecovery(ds, frame, owns);
+        return 'limited';
+      }
       return status;
     }
   }
@@ -23517,7 +23579,7 @@ function setupWorkerHandlers(
         // Project the frame's effective status once: reused for the in-memory
         // status assignment below and the stale-post-terminal gate.
         const previousLimit = ds.usageLimit;
-        const projectedScreenStatus = resolveUsageAwareScreenStatus(ds, msg);
+        const projectedScreenStatus = resolveUsageAwareScreenStatus(ds, msg, ownsLifecycleMutation);
         // A busy frame from a turn that already reported a completed terminal
         // (with no newer turn admitted) is stale viewport evidence. It must not
         // cancel the post-terminal correction or drive the card/revision; the
@@ -23998,7 +24060,7 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         const previousLimit = ds.usageLimit;
         updateUsageLimitState(ds, msg.usageLimit);
-        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg);
+        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg, ownsLifecycleMutation);
         workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);
         // Same per-frame stale gate as screen_update: a residual busy screenshot

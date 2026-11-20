@@ -43,6 +43,7 @@ import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { WorkerToDaemon } from '../src/types.js';
+import { antigravityScreenProducer } from './helpers/antigravity-screen-recovery.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const APP = 'limit_app';
@@ -516,25 +517,149 @@ describe('usage-limit sticky state self-heal', () => {
     expect(ds.lastScreenStatus).toBe('limited');
   });
 
-  it('rolls back a failed recovery write and retries on the next proven recovery frame', async () => {
+  it.each(['screen', 'screenshot'] as const)('delivers ready evidence after capture failure with unchanged %s content', async mode => {
+    vi.useFakeTimers();
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_sampler', 'quota sampler recovery', 'group', 'chat');
+    session.cliId = 'antigravity';
+    const ds = makeDs({ session, worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const pending: Promise<void>[] = [];
+    const frames: WorkerToDaemon[] = [];
+    const producer = antigravityScreenProducer(frame => { frames.push(frame); pending.push(dispatch(worker, frame)); });
+    const step = async () => {
+      if (mode === 'screen') await vi.advanceTimersByTimeAsync(100);
+      else await producer.screenshot();
+      await Promise.all(pending.splice(0));
+    };
+    if (mode === 'screen') producer.start();
+    else await dispatch(worker, { type: 'capture_identity', revision: 0 });
+    producer.screen('⚠ Individual quota reached. Resets in 1h.\nError ID: sampler\n────\n>\n────');
+    await step();
+    expect(ds.usageLimit).toBeDefined();
+    producer.screen('', true);
+    await step();
+    expect(ds.usageLimit).toBeDefined();
+    producer.screen('output\n────\n> Auto mode: edits & safe commands\nauto-approved (shift+tab to cycle)\n────\n? for shortcuts');
+    await step();
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeUndefined();
+    const delivered = frames.length;
+    await step(); await step();
+    expect(frames).toHaveLength(delivered);
+    expect(frames.filter(frame => 'usageLimitRecovery' in frame)).toHaveLength(1);
+  });
+
+  it.each(['success', 'fresh refusal', 'worker replaced', 'session suspended'] as const)('retries one real sampler proof after SQLite rollback: %s', async outcome => {
     vi.useFakeTimers();
     const worker = makeFakeWorker();
     const session = sessionStore.createSession('oc_x', 'om_recovery_write', 'quota recovery retry', 'group', 'chat');
     session.cliId = 'antigravity';
     const ds = makeDs({ session, worker, workerPort: 9999 });
     __testOnly_setupWorkerHandlers(ds, worker);
-    await dispatch(worker, { type: 'screen_update', content: 'native error', status: 'limited', usageLimit: { ...rateLimitState(), kind: 'usage', source: 'antigravity-error-composer' } });
+    const pending: Promise<void>[] = [];
+    const frames: WorkerToDaemon[] = [];
+    const producer = antigravityScreenProducer(frame => { frames.push(frame); pending.push(dispatch(worker, frame)); });
+    producer.screen('⚠ Individual quota reached. Resets in 1h.\nError ID: recovery\n────\n>\n────');
+    producer.start();
+    await vi.advanceTimersByTimeAsync(100); await Promise.all(pending.splice(0));
+    const original = ds.usageLimit;
     sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected recovery write failure'); });
-    await expect(dispatch(worker, { type: 'screen_update', content: '', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' })).rejects.toThrow('injected recovery write failure');
-    expect(ds.usageLimit).toBeDefined();
+    producer.screen('output\n────\n>\n────\n? for shortcuts');
+    await vi.advanceTimersByTimeAsync(100); await Promise.all(pending.splice(0));
+    expect(ds.usageLimit).toBe(original);
     expect(ds.usageLimitRetryTimer).toBeDefined();
     expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeDefined();
+    // No more producer ticks: recovery must not require a second IPC frame.
+    clearInterval(producer.scope.screenUpdateTimer);
+    await vi.advanceTimersByTimeAsync(500); // first local retry also rolls back
+    expect(ds.usageLimit).toBe(original);
     sessionStore.__testOnly_setBeforeRowPersist(undefined);
-    await dispatch(worker, { type: 'screen_update', content: '', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
-    expect(ds.usageLimitPersistPending).toBe(false);
-    expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeUndefined();
-    await vi.advanceTimersByTimeAsync(120_000);
+    if (outcome === 'fresh refusal') {
+      await dispatch(worker, { type: 'screen_update', content: 'new refusal', status: 'limited', usageLimit: original });
+    } else if (outcome === 'worker replaced') ds.worker = makeFakeWorker();
+    else if (outcome === 'session suspended') ds.session.status = 'suspended';
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(frames.filter(frame => 'usageLimitRecovery' in frame)).toHaveLength(1);
+    if (outcome === 'success') {
+      expect(ds.lastScreenStatus).toBe('idle');
+      expect(ds.usageLimit).toBeUndefined();
+      expect(ds.usageLimitRetryTimer).toBeUndefined();
+      expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeUndefined();
+    } else {
+      expect(ds.usageLimit).toBeDefined();
+      expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeDefined();
+    }
+  });
+
+  it('retains one accepted proof across the quota retry-ready transition and prolonged SQLite outage', async () => {
+    vi.useFakeTimers();
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_adversarial_expiry', 'retry overlap', 'group', 'chat');
+    session.cliId = 'antigravity';
+    const ds = makeDs({ session, worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const pending: Promise<void>[] = [];
+    const frames: WorkerToDaemon[] = [];
+    const producer = antigravityScreenProducer(frame => { frames.push(frame); pending.push(dispatch(worker, frame)); });
+    producer.screen('⚠ Individual quota reached. Resets in 1s.\nError ID: overlap\n────\n>\n────');
+    producer.start();
+    await vi.advanceTimersByTimeAsync(100); await Promise.all(pending.splice(0));
+    expect(ds.usageLimit).toBeDefined();
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('outage spanning deadline'); });
+    producer.screen('output\n────\n>\n────\n? for shortcuts');
+    await vi.advanceTimersByTimeAsync(100); await Promise.all(pending.splice(0));
+    clearInterval(producer.scope.screenUpdateTimer);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ds.usageLimit?.retryReady).toBe(true);
+    sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(frames.filter(frame => 'usageLimitRecovery' in frame)).toHaveLength(1);
     expect(ds.usageLimit).toBeUndefined();
+    expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeUndefined();
+  });
+
+  it('sends readiness after upload-time capture failure even when screenshot pixels remain unchanged', async () => {
+    vi.useFakeTimers();
+    const frames: WorkerToDaemon[] = [];
+    const producer = antigravityScreenProducer(frame => frames.push(frame));
+    producer.screen('output\n────\n>\n────\n? for shortcuts');
+    let finish!: (key: string) => void;
+    producer.scope.uploadImageBuffer = vi.fn(() => new Promise<string>(resolve => { finish = resolve; }));
+    const upload = producer.screenshot();
+    await Promise.resolve(); await Promise.resolve();
+    producer.screen('', true);
+    finish('first-image'); await upload;
+    expect(frames[0]).not.toHaveProperty('usageLimitRecovery');
+    producer.screen('output\n────\n>\n────\n? for shortcuts');
+    producer.scope.uploadImageBuffer = vi.fn(async () => 'same-image');
+    await producer.screenshot();
+    expect(frames).toHaveLength(2);
+    expect(frames[1]).toHaveProperty('usageLimitRecovery', 'antigravity-ready-composer');
+    await producer.screenshot();
+    expect(frames).toHaveLength(2);
+  });
+
+  it('new worker can retain its proof before the retired worker retry timer fires', async () => {
+    vi.useFakeTimers();
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_generation', 'retry generation handover', 'group', 'chat');
+    session.cliId = 'antigravity';
+    const ds = makeDs({ session, worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    await dispatch(worker, { type: 'screen_update', content: 'native error', status: 'limited', usageLimit: { ...rateLimitState(), kind: 'usage', source: 'antigravity-error-composer' } });
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('outage across worker replacement'); });
+    await dispatch(worker, { type: 'screen_update', content: 'ready', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+    const successor = makeFakeWorker();
+    ds.worker = successor;
+    sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    __testOnly_setupWorkerHandlers(ds, successor);
+    sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('new clear still fails'); });
+    await dispatch(successor, { type: 'screen_update', content: 'ready', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer' });
+    sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ds.usageLimit).toBeUndefined();
+    expect(sessionStore.getSessionFresh(session.sessionId)?.usageLimit).toBeUndefined();
   });
 
   it('limited → working(带新鲜 usageLimit) 保持 limited：新鲜判定优先', async () => {
