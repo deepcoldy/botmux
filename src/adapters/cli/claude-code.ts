@@ -1770,6 +1770,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     buildSessionRenameCommand: variant.id === 'claude-code'
       ? (title) => `/rename ${title}`
       : undefined,
+    // Bare `/rename` makes Claude Code pick a name from the conversation and
+    // answer "Session renamed to: …" (verified on 2.1.323).
+    sessionAutoRenameCommand: variant.id === 'claude-code' ? '/rename' : undefined,
     systemHints: [],
     altScreen: false,
     // Claude Code (及 seed 同源 fork) 的 TUI 自管重绘整段 transcript，xterm/tmux

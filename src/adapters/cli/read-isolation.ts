@@ -82,7 +82,8 @@ export function botHomePath(botmuxHome: string, appId: string): string {
 }
 
 /** Whether a worker can redirect CLI data into BOT_HOME for this session.
- * A forced per-bot home (currently Codex `codexAuthSync=isolated`) is separate
+ * A forced per-bot home (Codex `codexAuthSync=isolated`, or a Claude bot's
+ * `credentialsSourceDir`) is separate
  * from the OS sandbox: it changes CLI state ownership without implying file
  * read/write confinement. */
 export function shouldRedirectCliData(input: {

@@ -2195,6 +2195,13 @@ export interface BotConfig {
    */
   canTalkDaemonCommands?: string[];
   /**
+   * 不带标题的 `/rename` 交给 CLI 自己起名（默认关）。开启后，会话 CLI 声明了
+   * `sessionAutoRenameCommand`（目前只有 Claude Code 的裸 `/rename`）时，daemon 不再回
+   * 用法提示，而是把该命令作为透传 turn 原样送进 CLI；Botmux 会话标题不变。
+   * 关闭（undefined）→ 裸 `/rename` 只回用法提示（原行为）。带标题的 `/rename` 不受影响。
+   */
+  bareRenamePassthrough?: boolean;
+  /**
    * Optional per-bot startup commands: slash-command lines the worker types into
    * a freshly spawned CLI right after it's ready, BEFORE the user's first prompt
    * (e.g. `/effort ultracode`, `/model opus`). Sent in order, one submit each,
@@ -4592,6 +4599,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
       canTalkDaemonCommands,
+      // 默认关，只落显式 true。
+      bareRenamePassthrough: entry.bareRenamePassthrough === true || undefined,
       tuiSlashAllow,
       startupCommands,
       env,

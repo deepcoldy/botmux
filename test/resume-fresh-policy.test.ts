@@ -24,6 +24,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { resumeStartsFresh } from '../src/services/resume-fresh-policy.js';
+import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
+import { findTraexSessionIdByBotmuxSessionId } from '../src/services/traex-transcript.js';
 import { resumeSuccessMessage } from '../src/core/resume-result-message.js';
 import { opencodeDbPath } from '../src/services/opencode-paths.js';
 import { buildClosedSessionCard } from '../src/core/closed-session-card.js';
@@ -42,6 +44,31 @@ const getBotMock = vi.mocked(getBot);
 afterEach(() => { getBotMock.mockReturnValue(DEFAULT_BOT as never); });
 
 describe('resumeStartsFresh', () => {
+  it('restores the exact TraeX mapping without requiring a persisted native id', () => {
+    const root = mkdtempSync(join(tmpdir(), 'resume-traex-'));
+    const previous = process.env.TRAE_HOME;
+    const session = { cliId: 'traex', sessionId: 'botmux-owned-route' };
+    try {
+      process.env.TRAE_HOME = root;
+      mkdirSync(join(root, 'cli'), { recursive: true });
+      const db = openDatabaseSyncNow(join(root, 'cli', 'state_5.sqlite'))!;
+      db.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, first_user_message TEXT, created_at INTEGER)');
+      db.prepare('INSERT INTO threads VALUES (?, ?, ?)').run(
+        'native-thread-owned', '<session_id>botmux-owned-route</session_id>', 1,
+      );
+      db.close();
+      expect(findTraexSessionIdByBotmuxSessionId(session.sessionId)).toBe('native-thread-owned');
+      expect(resumeStartsFresh(session)).toBe(false);
+      expect(resumeStartsFresh({ ...session, sessionId: 'unmapped-route' })).toBe(true);
+      expect(resumeSuccessMessage({ ds: { session } }, 'TraeX', 'zh')).toBe(
+        resumeSuccessMessage({ ds: { session: { ...session, cliSessionId: 'native-thread-owned' } } }, 'TraeX', 'zh'),
+      );
+    } finally {
+      if (previous === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previous;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   it('copilot / cursor without a persisted cliSessionId start fresh', () => {
     expect(resumeStartsFresh({ cliId: 'copilot' })).toBe(true);
     expect(resumeStartsFresh({ cliId: 'cursor' })).toBe(true);

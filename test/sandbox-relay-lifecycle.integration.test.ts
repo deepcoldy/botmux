@@ -232,6 +232,12 @@ if (mode === 'fail') {
 process.exit(run(queued ? args.slice(boundary + 1) : args));
 `, { mode: 0o700 });
   writeFileSync(join(bin, 'tmux'), `#!/bin/sh
+# A strict worker pins its server with a leading explicit
+# \`-S <root>/tmux-<uid>/<label>\` (tmuxSocketArgs with a socket root). tmux
+# honours the LAST -S, which would beat this lab's own -S below and send the
+# call to a server that does not exist here; drop it so every call still lands
+# on the lab's private server, exactly like a -L or default-server call.
+if [ "$1" = -S ]; then shift 2; fi
 if [ -e '${failNewSessionFlag}' ]; then
   creating=0; ours=0
   for arg in "$@"; do

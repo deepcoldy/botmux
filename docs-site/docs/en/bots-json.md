@@ -117,6 +117,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `providerRecovery` | Claude Code only: continue automatically after a transient model-service failure, e.g. `{"enabled":true,"maxWaitMinutes":30}`. Fields you leave out follow the global setting; off by default. See [Global settings: auto-continue after provider failures](/global-settings#provider-recovery) |
 | `skillInjection` | How botmux's built-in skills reach the CLI: `prompt` (per session), `global` (installed into the CLI's global skills dir), or `off`. If unset, it follows the global setting, which defaults to `prompt`. See [Skills](/en/skill-cli) |
 | `customPassthroughCommands` | Extra slash commands passed through to the CLI, e.g. `["/export"]`. Entries that would clash with botmux's own commands are dropped. `/list-slash-command` shows the full list. See [Slash commands](/en/slash-commands) |
+| `bareRenamePassthrough` | Off by default. When `true`, a `/rename` without a title goes to the CLI as is, and the CLI names the session from the conversation (Claude Code only for now, adopted sessions included). See [Slash commands](/en/slash-commands#rename-cli) |
 | `startupCommands` | Commands sent to the CLI after it starts and before the first message, e.g. `["/effort ultracode"]`. Re-sent on every fresh start and resume |
 | `quotaFallbackBot` | Hand the session to another bot when CLI quota runs out. Off by default. See [Quota handoff](#quota-fallback) below |
 | `codexCapacityRecovery` | Codex / Codex App only: automatically continue after an explicit model-capacity error. Off by default; at most two recovery inputs per task. Ordinary rate limits and exhausted quota don't count |
@@ -407,7 +408,7 @@ Details in [File sandbox](/en/sandbox).
 | `scratchDenyPaths` | `scratch` only: extra paths to hide. botmux's own credentials are always hidden |
 | `sandboxNetwork` | Default `true` keeps network access; `false` cuts ordinary outbound network |
 | `sandboxNetworkPolicy` | Advanced network policy that filters target IPs separately for public and private ranges |
-| `credentialsSourceDir` | A sandboxed bot copies its CLI login from this directory on every start, instead of the machine's shared login. Useful for several accounts on one machine |
+| `credentialsSourceDir` | A `claude-code` bot copies its login from this directory on every cold start instead of using the machine's shared login, with allowlist isolation (`oncall`) or the sandbox off; `scratch` refuses to start. An unsandboxed bot switches to its own CLI data directory. Useful for several accounts on one machine |
 | `codexAuthSync` | Codex login policy: `shared` (default) uses the global login; `isolated` always uses this bot's own `CODEX_HOME` and never reads or copies global credentials |
 | `triggerUserAuth` | Off by default. When on, tools such as `lark-cli` in the session run with the authorization of the person who sent the message; people who haven't authorized get an authorization link |
 | `larkToolBinding` | On by default: `lark-cli` in the session uses the current bot's app identity, and `--as user` / `--profile` can switch. `false` injects no bot credentials at all |

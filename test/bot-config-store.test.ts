@@ -995,6 +995,25 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.model).toBeUndefined();
   });
 
+  it('bareRenamePassthrough is off by default, persists only true and applies without restart', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('bareRenamePassthrough')!;
+    expect(spec.effect).toBe('immediate');
+    expect(registry.getBot('app_default').config.bareRenamePassthrough).toBeUndefined();
+
+    expect((await store.applyConfigField('app_default', spec, true)).ok).toBe(true);
+    expect(readConfig().bareRenamePassthrough).toBe(true);
+    expect(registry.getBot('app_default').config.bareRenamePassthrough).toBe(true);
+    const [reloaded] = registry.parseBotConfigsFromText(readFileSync(configPath, 'utf8'));
+    expect(reloaded.bareRenamePassthrough).toBe(true);
+
+    expect((await store.applyConfigField('app_default', spec, false)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('bareRenamePassthrough');
+    expect(registry.getBot('app_default').config.bareRenamePassthrough).toBeUndefined();
+    const [invalid] = registry.parseBotConfigsFromText(JSON.stringify([{ ...readConfig(), bareRenamePassthrough: 'true' }]));
+    expect(invalid.bareRenamePassthrough).toBeUndefined();
+  });
+
   it('archiveCodex preserves both overrides across reload and unset restores inheritance', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('archiveCodex')!;

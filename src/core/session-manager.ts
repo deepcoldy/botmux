@@ -12,6 +12,7 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
  * session restoration, and scheduled task execution.
  */
 import { existsSync, statSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { normalizeImageAttachment, imageSequenceHint } from './attachment-image-format.js';
 import { randomUUID } from 'node:crypto';
 import { recordScheduledSessionRun } from './scheduled-send.js';
@@ -28,6 +29,7 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWork
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
+import { credentialSourceForcesBotHome } from '../services/cli-credential-source.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, buildTurnSpeakersBlock, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
@@ -1869,6 +1871,8 @@ export function buildNewTopicCliInput(
     sessionBackendType: opts?.sessionBackendType,
     promptInjection: opts?.promptInjection,
     larkAppId: opts?.larkAppId,
+    sessionId,
+    opening: true,
   }) === 'hook' && hookTurnId) {
     const blocks = buildNewTopicBlocks(
       userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
@@ -2202,7 +2206,43 @@ type EnvelopeInjectionCfg = {
   cliPathOverride?: string;
   sessionBackendType?: BackendType;
   larkAppId?: string;
+  sessionId?: string;
+  /** A genuinely new opening has no prior worker generation to mirror. */
+  opening?: boolean;
 };
+
+/** Launch facts for the CLI generation that will actually read the settings.
+ * A live worker's init is authoritative: live bot config may have moved on,
+ * while its CLI/pane still uses the old home. Existing sessions without a live
+ * generation fail closed to inline; only a new opening may use live config. */
+function promptHookLaunchConfig(
+  cfg: EnvelopeInjectionCfg,
+  botConfig: BotConfig,
+): BotConfig | undefined {
+  if (!cfg.sessionId) return botConfig;
+  const registry = getActiveSessionsRegistry();
+  const ds = registry
+    ? [...registry.values()].find(candidate => candidate.session.sessionId === cfg.sessionId)
+    : undefined;
+  if (ds) {
+    const init = ds.initConfig;
+    if (!ds.worker || ds.worker.killed || ds.worker.connected === false || !init) return undefined;
+    return {
+      ...botConfig,
+      sandbox: init.sandbox,
+      readIsolation: init.readIsolation,
+      wrapperCli: init.wrapperCli,
+      credentialsSourceDir: init.credentialsSourceDir,
+      backendType: init.backendType,
+    };
+  }
+  if (!cfg.opening) {
+    try {
+      if (sessionStore.getSession(cfg.sessionId)) return undefined;
+    } catch { return undefined; }
+  }
+  return botConfig;
+}
 
 function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inline' {
   if (!cfg?.cliId || zeroPromptInjectionForBot(cfg.larkAppId, cfg.cliId, cfg.promptInjection)) return 'inline';
@@ -2225,7 +2265,9 @@ function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inl
     botConfig = getBot(cfg.larkAppId).config;
   } catch { return 'inline'; }
   if (botConfig.envelopeInjection !== 'auto') return 'inline';
-  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, cfg.larkAppId, cfg.sessionBackendType);
+  const launchConfig = promptHookLaunchConfig(cfg, botConfig);
+  if (!launchConfig) return 'inline';
+  const effectivePath = effectivePromptHookConfigPath(adapter, launchConfig, cfg.larkAppId, cfg.sessionBackendType);
   if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
   return 'hook';
 }
@@ -2237,7 +2279,8 @@ function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inl
  * preflight 必须查这份而不是全局——per-bot 安装是 best-effort（provisionIsolatedBotHome
  * 吞异常），查全局会把安装失败误判为已装，导致该 session 每轮系统性丢 reminder。
  *
- * 与 worker willRedirectCliData 的微差保持一致：
+ * 与 worker willRedirectCliData 的微差保持一致（含不开沙箱但配了 credentialsSourceDir 的
+ * Claude bot，同样重定向到 BOT_HOME）：
  *  - backendType !== 'riff'：riff 后端的 CLI 跑在远端，本地 settings 不适用，
  *    hook 模式对它无意义（远端没有 botmux hook，sidecar 写了没人读）。
  *  - process.env.SESSION_DATA_DIR（不用 config.session.dataDir 的 packagedDataDir
@@ -2253,15 +2296,22 @@ function effectivePromptHookConfigPath(
   const base = adapter.hookInstall?.configPath;
   if (!base) return undefined;
   // scratch keeps the CLI's native home, like the worker (only oncall redirects).
-  let oncallRequested: boolean;
+  let sandboxMode: ReturnType<typeof resolveSandboxMode>;
   try {
-    oncallRequested = resolveSandboxMode({
+    sandboxMode = resolveSandboxMode({
       configSandbox: botConfig.sandbox,
       readIsolation: botConfig.readIsolation === true,
       envValue: process.env.BOTMUX_SANDBOX,
-    }) === 'oncall';
+    });
   } catch { return undefined; }
-  const willRedirect = oncallRequested
+  const credentialSourceHome = credentialSourceForcesBotHome({
+    sourceDir: botConfig.credentialsSourceDir,
+    // The adapter is built from the session's frozen CLI, which may differ from
+    // the bot's current default after /cli selection or a later config edit.
+    cliId: adapter.id,
+    sandboxRequested: sandboxMode !== 'off',
+  });
+  const willRedirect = (sandboxMode === 'oncall' || credentialSourceHome)
     && adapter.supportsReadIsolation === true
     && !botConfig.wrapperCli
     && (sessionBackendType ?? botConfig.backendType) !== 'riff'
@@ -2278,6 +2328,7 @@ export interface PromptHookTarget {
   cliConfigDir?: string;
   sessionBackendType?: BackendType;
   larkAppId: string;
+  sessionId?: string;
 }
 
 /** Whether botmux's UserPromptSubmit hook runs on every submit of a session's
@@ -2292,7 +2343,9 @@ export function promptHookRunsInCli(target: PromptHookTarget): boolean {
     botConfig = getBot(target.larkAppId).config;
   } catch { return false; }
   if (!adapter.hookInstall?.userPromptSubmitCommand) return false;
-  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, target.larkAppId, target.sessionBackendType);
+  const launchConfig = promptHookLaunchConfig(target, botConfig);
+  if (!launchConfig) return false;
+  const effectivePath = effectivePromptHookConfigPath(adapter, launchConfig, target.larkAppId, target.sessionBackendType);
   return !!effectivePath && hasInstalledPromptHookCached(effectivePath);
 }
 
@@ -2366,7 +2419,7 @@ export function buildFollowUpCliInput(
   // 输入框不再出现 <user_message>/<sender>/<mentions> 标签。代价：hook 注入内容不落
   // transcript，insight 发送者归因对 hook 模式会话降级为「未知用户」（用户已确认接受）。
   const hookTurnId = opts?.turnId;
-  if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
+  if (resolveEnvelopeInjectionMode({ ...opts, sessionId }) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
     // messageLocation 是宿主元数据，与 sender 同类：hook 模式下进 envelope，
     // 输入框与 transcript 仍只有用户正文。
@@ -2615,6 +2668,7 @@ export function buildReforkCliInput(
 export function persistStreamCardState(ds: DaemonSession): void {
   const cardId = ds.streamCardId === STREAM_CARD_SENTINEL ? undefined : ds.streamCardId;
   const s = ds.session;
+  const quotaHistory = ds.antigravityQuotaHistory ?? s.antigravityQuotaHistory;
   // Skip write if nothing actually changed — avoids disk churn on every screen_update.
   if (
     s.streamCardId === cardId &&
@@ -2625,6 +2679,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
+    isDeepStrictEqual(s.antigravityQuotaHistory, quotaHistory) &&
     s.modelFallback?.uuid === ds.modelFallback?.uuid &&
     s.modelFallback?.claudeSessionId === ds.modelFallback?.claudeSessionId &&
     s.lastUserPrompt === ds.lastUserPrompt &&
@@ -2642,6 +2697,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
   s.usageLimit = ds.usageLimit;
+  s.antigravityQuotaHistory = quotaHistory;
   s.modelFallback = ds.modelFallback;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
