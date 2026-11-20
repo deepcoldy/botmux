@@ -83,6 +83,13 @@ export interface EphemeralPoolDeps {
   manifestSettleMs?: number;
 }
 
+/** Throws when the live bot runs personal-assistant mode (see runNodeImpl). */
+export function assertNotAssistantModeBot(larkAppId: string): void {
+  let assistant = false;
+  try { assistant = getBot(larkAppId).config.assistantMode === true; } catch { /* unknown bot: launch fails later anyway */ }
+  if (assistant) throw new Error(`v3 workflow does not support personal-assistant mode; bot ${larkAppId} has assistantMode=true`);
+}
+
 /** Session env overlay for a workflow worker, from the live bot config. */
 function v3WorkerSessionEnv(
   larkAppId: string,
@@ -131,6 +138,11 @@ async function runNodeImpl(
       `v3 pool: attempt lease "${req.attemptLease.attemptId}" does not match request "${req.attemptId}"`,
     );
   }
+  // Personal-assistant mode is checked against the LIVE bot, not the frozen
+  // snapshot: a run paused before the mode was enabled resumes from its stored
+  // snapshot, and a workflow worker has no per-owner session (it would get the
+  // bot-wide BOT_HOME). Refuse before any side effect.
+  assertNotAssistantModeBot(req.botSnapshot.larkAppId);
   const cancelSignal = req.attemptLease?.signal ?? req.cancelSignal;
   const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH] ?? join(req.attemptDir, 'manifest.json');
   const ptyLogPath = join(req.attemptDir, 'pty.log');

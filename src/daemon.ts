@@ -25910,6 +25910,8 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.sandboxNetwork = source.sandboxNetwork;
   child.sandboxNetworkPolicy = source.sandboxNetworkPolicy ? structuredClone(source.sandboxNetworkPolicy) : undefined;
   child.sandboxWithholdBotSecret = source.sandboxWithholdBotSecret;
+  // 个人助理模式：独立任务仍在同一 chat，归同一个主人（cwd 取自源会话，已是主人的 work/）。
+  if (source.assistantOwnerOpenId) child.assistantOwnerOpenId = source.assistantOwnerOpenId;
   child.reasoningEffort = source.reasoningEffort;
   child.modelBackendVariant = source.modelBackendVariant;
   child.model = source.model;

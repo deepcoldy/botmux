@@ -24,6 +24,7 @@ vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return
 import { assistantSessionStillOwned, resolveAssistantSpawn } from '../src/core/assistant-spawn.js';
 import { inheritSessionLaunchConfiguration } from '../src/core/session-launch-inheritance.js';
 import { botToSnapshot } from '../src/workflows/v3/bot-resolve.js';
+import { assertNotAssistantModeBot } from '../src/workflows/v3/ephemeral-pool.js';
 import type { Session } from '../src/types.js';
 
 const A = 'ou_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -80,5 +81,10 @@ describe('v3 workflow', () => {
   it('refuses an assistant-mode bot instead of running it with the bot-wide home', () => {
     expect(() => botToSnapshot({ larkAppId: 'cli_app', larkAppSecret: 'x', cliId: 'claude-code', sandbox: true, assistantMode: true } as any, '/w'))
       .toThrow(/assistant/);
+  });
+  it('a resumed run (stored snapshot) is refused at launch once the live bot is in assistant mode', () => {
+    expect(() => assertNotAssistantModeBot('cli_app')).toThrow(/assistant/);
+    state.assistantMode = false;
+    expect(() => assertNotAssistantModeBot('cli_app')).not.toThrow();
   });
 });
