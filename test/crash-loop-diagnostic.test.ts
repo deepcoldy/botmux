@@ -42,6 +42,8 @@ vi.mock('../src/bot-registry.js', () => ({
     botName: 'TestBot',
   })),
   getAllBots: vi.fn(() => []),
+  // Unconfigured replyDelivery: the per-CLI default applies (both test legs).
+  resolveReplyDelivery: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -230,13 +232,15 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     // First 3 auto-restart in place; the 4th asks the worker to park a
     // diagnostic shell (deferred park) and keeps it alive (no close).
-    // auto-restart 捎带最新 per-bot env + 最新模型 + larkToolBinding（本 fixture 的 mock getBot
-    // env/model 未配 → 均为 null；larkToolBinding 默认开启 → 为 true；三分态 contract: true 启用 / null 明确清空 / undefined 保持），
+    // auto-restart 捎带最新 per-bot env + 最新模型 + larkToolBinding + replyDelivery（本 fixture 的 mock getBot
+    // env/model 未配 → 均为 null；larkToolBinding 默认开启 → 为 true；三分态 contract: true 启用 / null 明确清空 / undefined 保持；
+    // replyDelivery 未配 → 按 claude-code 缺省 transcript），
     // 并标记 reason: 'cli_crash' 区分 operator 主动 restart；经 restart coordinator 发出，
     // 必带 attemptId（#1863：只有关联回执能放开 workerReady 栅栏）。
     expect(worker.send).toHaveBeenCalledWith({
       type: 'restart', attemptId: expect.any(String), reason: 'cli_crash',
       env: null, envUnset: null, envFingerprint: expect.any(String), model: null, larkToolBinding: true,
+      replyDelivery: 'transcript',
       codexRpcInput: false, traexAutoModel: null, startupCommands: null, launchShell: null,
       statuslineLaunchGen: expect.any(String),
     });
