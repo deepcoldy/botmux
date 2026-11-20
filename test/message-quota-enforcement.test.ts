@@ -302,7 +302,8 @@ describe('message quota enforcement', () => {
     const run = (senderOpenId = 'ou_chat', messageId = 'om_cross') => enforceMessageQuotaForCliInput(
       'quota_app', 'oc_origin', senderOpenId, messageId, 'om_anchor',
       undefined, undefined, 'group', false,
-      { crossChatFollowedThreadAuthorized: true, crossChatFollowedChatId: 'oc_1', promptContent: 'hello' },
+      { crossChatFollowedThreadAuthorized: true, crossChatFollowedChatId: 'oc_1',
+        crossChatFollowedRootMessageId: 'om_followed_root', promptContent: 'hello' },
     );
 
     it('charges a finite grant in the followed chat and commits the exact message', async () => {
@@ -317,7 +318,17 @@ describe('message quota enforcement', () => {
       await expect(run()).resolves.toBe(false);
       expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_cross');
       expect(mocks.commitCharge).not.toHaveBeenCalled();
-      expect(mocks.removeChatGrant).toHaveBeenCalledWith('quota_app', 'oc_1', 'ou_chat');
+      // Revoking the grant would make replay and later cross-chat messages
+      // degrade into the unmetered stranger exemption.
+      expect(mocks.removeChatGrant).not.toHaveBeenCalled();
+      expect(mocks.replyMessage.mock.calls[0]?.[1]).toBe('om_followed_root');
+    });
+
+    it('keeps an exhausted global grant as the durable cross-chat denial', async () => {
+      mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
+      await expect(run('ou_global', 'om_cross_global')).resolves.toBe(false);
+      expect(mocks.removeGlobalGrant).not.toHaveBeenCalled();
+      expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_cross_global');
     });
 
     it.each([

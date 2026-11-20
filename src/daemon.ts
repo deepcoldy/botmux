@@ -5695,6 +5695,7 @@ export async function enforceMessageQuotaForCliInput(
     listenerAuthorized?: boolean;
     crossChatFollowedThreadAuthorized?: boolean;
     crossChatFollowedChatId?: string;
+    crossChatFollowedRootMessageId?: string;
     skipCharge?: boolean;
     alreadyAuthorizedAndCharged?: boolean;
     /** 本轮要喂给 CLI 的用户文本，交给 prompt.submit 同步校验闸做内容级判断。
@@ -5766,8 +5767,16 @@ export async function enforceMessageQuotaForCliInput(
     if (quota.tracked) {
       if (!quota.allow) {
         abortCharge(larkAppId, messageId);
-        await revokeQuotaGrant(larkAppId, checkChatId, senderOpenId, ev);
-        await notifyQuotaExhausted(larkAppId, anchor, senderOpenId, quota.limit);
+        // Keep the exhausted grant and quotaState as the durable denial. If
+        // they were revoked, the next cross-chat evaluation would degrade to
+        // an unmetered stranger exemption and both replay and later messages
+        // would bypass the hard cap.
+        await notifyQuotaExhausted(
+          larkAppId,
+          opts.crossChatFollowedRootMessageId ?? anchor,
+          senderOpenId,
+          quota.limit,
+        );
         return false;
       }
     }
@@ -30562,6 +30571,7 @@ async function handleThreadReplyAdmitted(
         ? {
             crossChatFollowedThreadAuthorized: true,
             crossChatFollowedChatId: ctx.crossChatThreadFollowUp.followedChatId,
+            crossChatFollowedRootMessageId: ctx.crossChatThreadFollowUp.followedRootMessageId,
           }
         : {}),
     },
