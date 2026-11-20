@@ -20514,7 +20514,7 @@ function handleAppRunnerOscMarker(body: string): void {
   const kind = body.slice(0, sep);
   const payload = decodeCodexAppPayload(body.slice(sep + 1));
   if (kind === 'process_ready' && lastInitConfig?.cliId === 'dsh'
-    && (lastInitConfig.dshRuntime ?? 'sdk') === 'sdk') {
+    && lastInitConfig.dshRuntime !== 'tui') {
     // No payload field is authority. A replay must not rotate the turn's
     // pre-existing-process snapshot after tools have already started.
     if (dshProcessAttestation?.generation === cliSpawnGeneration && !dshProcessAttestation.identity) {
@@ -28895,7 +28895,7 @@ async function spawnCliBody(
     log(`Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ${cliAdapter.id}`);
   }
   if (cliExtraArgs.length) args.push(...cliExtraArgs);
-  dshProcessAttestation = cfg.cliId === 'dsh' && (cfg.dshRuntime ?? 'sdk') === 'sdk'
+  dshProcessAttestation = cfg.cliId === 'dsh' && cfg.dshRuntime !== 'tui'
     ? { generation: cliSpawnGeneration, executable: cliAdapter.resolvedBin, args: [...args] }
     : undefined;
 
@@ -37623,7 +37623,7 @@ function publishLocalProcessAttestation(
 ): boolean {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
   let dshIdentity: DshProcessIdentity | undefined;
-  if (lastInitConfig?.cliId === 'dsh' && (lastInitConfig.dshRuntime ?? 'sdk') === 'sdk'
+  if (lastInitConfig?.cliId === 'dsh' && lastInitConfig.dshRuntime !== 'tui'
     && dshProcessAttestation?.generation === cliSpawnGeneration) {
     const proof = dshProcessAttestation;
     const captured = captureDshProcessIdentity(cliPid, proof.executable, proof.args);

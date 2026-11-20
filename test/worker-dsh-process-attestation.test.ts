@@ -72,4 +72,12 @@ describe('worker DSH engine attestation', () => {
     expect(scope.captureDshProcessIdentity).not.toHaveBeenCalled();
     expect(scope.send.mock.calls[0][0].enginePid).toBeUndefined();
   });
+
+  it('attests the SDK engine when the persisted runtime is explicitly official', () => {
+    const { scope, ready } = fixture('dsh', 'official');
+    ready();
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(1);
+    expect(scope.send.mock.calls[0][0].enginePid).toBe(60);
+    expect(scope.send.mock.calls[0][0].engineProcStart).toBe('600');
+  });
 });
