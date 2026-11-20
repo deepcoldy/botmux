@@ -193,11 +193,14 @@ export function shouldDeferArgsBakedDurablePrompt(opts: {
     && (opts.dispatchAttempt !== undefined || !!opts.queuedActivationToken);
 }
 
-/** Some backends (tmux in particular) reject long launch command strings before
- *  the spawned CLI ever sees argv. For adapters that normally bake the first
- *  prompt into args, route over-limit prompts through the regular input queue
- *  instead. The comparison is strictly `>` so a prompt exactly at the adapter's
- *  declared budget keeps legacy args-baked behavior. */
+/** For adapters that normally bake the first prompt into args, route prompts
+ *  past the adapter's declared byte budget through the regular input queue.
+ *  The budget dates from the old inline tmux launch, whose command string tmux
+ *  rejected past ~16 KiB; panes now read the full launch argv from a private
+ *  pane-launch file (backend/pane-launch.ts), so the budget is retained only to
+ *  keep the args-baked vs queued split unchanged. The comparison is strictly
+ *  `>` so a prompt exactly at the adapter's declared budget keeps legacy
+ *  args-baked behavior. */
 export function shouldDeferInitialPromptForArgLimit(opts: {
   passesInitialPromptViaArgs: boolean;
   prompt?: string;

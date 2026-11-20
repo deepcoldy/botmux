@@ -27,6 +27,32 @@ describe('buildTurnTerminalReceiptCard', () => {
 });
 
 describe('buildTurnTerminalFooterPatch', () => {
+  const footerCard = (content: string) => JSON.stringify({ schema: '2.0', body: { elements: [
+    { tag: 'markdown', content: 'answer' },
+    { tag: 'markdown', element_id: 'botmux_reply_footer', content },
+  ] } });
+
+  it('does not claim the session awaits input when a newer turn already runs', () => {
+    expect(buildTurnTerminalFooterPatch(footerCard('brand'), 'completed', 'zh', { superseded: true })).toEqual({
+      content: "brand · <font color='grey'>✓ 本轮已结束</font>", alreadyApplied: false,
+    });
+    expect(buildTurnTerminalFooterPatch(footerCard('brand'), 'silent', 'en', { superseded: true })?.content)
+      .toBe("brand · <font color='grey'>✓ Turn ended (AI determined no reply was needed)</font>");
+  });
+
+  it.each([
+    ['completed', { superseded: true }],
+    ['silent', {}],
+    ['silent', { superseded: true }],
+  ] as const)('treats a footer that already carries any receipt as applied (%s %o)', (kind, opts) => {
+    const written = buildTurnTerminalFooterPatch(footerCard('brand'), 'completed', 'zh')!.content;
+    // The receipt's fixed CardKit sequence can be written once per card.
+    expect(buildTurnTerminalFooterPatch(footerCard(written), kind, 'zh', opts)).toEqual({ content: written, alreadyApplied: true });
+    const superseded = buildTurnTerminalFooterPatch(footerCard('brand'), 'completed', 'en', { superseded: true })!.content;
+    expect(buildTurnTerminalFooterPatch(footerCard(superseded), kind, 'en', opts)).toEqual({ content: superseded, alreadyApplied: true });
+  });
+
+
   it('returns only footer content even when the provider readback has normalized the body', () => {
     const body = '- item**Next heading**\n- another item';
     const card = { schema: '2.0', body: { elements: [

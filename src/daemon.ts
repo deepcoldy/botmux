@@ -35,6 +35,7 @@ import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler, recordMessageListenerTurnTerminal } from './core/message-listener-auto-close.js';
 import { resolveWorkerAdmissionOwner, WorkerAdmissionOwnerAlerts } from './core/worker-admission-owner-alert.js';
+import { WorkerOwnerDiagnostics } from './core/worker-owner-diagnostic.js';
 import { deliverPublishedReport, type ReportDeliveryResponse } from './core/report-publication.js';
 import {
   REPORT_SOURCE_REPLY_ROUTE,
@@ -59,7 +60,8 @@ import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/transport/connection-health.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
-import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { readBotsInfoJson } from './services/bots-info-cache.js';
 import { createBotProfileRefresher } from './services/bot-profile-refresh.js';
 import { lastKnownBotName } from './services/bot-display-name.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
@@ -174,8 +176,7 @@ import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
-import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
-import { resolveImportedTopicHandoff } from './services/imported-topic-handoff.js';
+import { peerAnswersTopicWithoutMention, resolveGroupMentionMode, resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -297,6 +298,7 @@ import {
   readDebianCodename,
   spawnUpgradeCommand,
 } from './setup/tmux-upgrade-plan.js';
+import { installManagedTmuxForHost } from './setup/tmux-prebuilt.js';
 import {
   fanOutTmuxSwitchSuspend,
   killTmuxServer,
@@ -554,8 +556,8 @@ import {
   collectSessionTurnGarbage,
   sweepTraexInstallChanges,
 } from './core/worker-pool.js';
-import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
-import { isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
+import { notePromptCacheKeepaliveTurnStarted, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
+import { invalidateIdleAutoCompactRetryForTurn, isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice, type IdleAutoCompactRefusalReason } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { runPeriodicOrphanSessionSweep, loadRichProcsLinux, enumerateThreadLockHolders, enumerateOrphanPanes, readProcEnviron } from './core/orphan-session-reaper.js';
 import { listeningServersOnPath, probeTmuxOwner, tmuxSocketPath, procIsBotmuxListener } from './core/tmux-server-guard.js';
@@ -618,9 +620,18 @@ import {
   evaluateProjectDispatchPolicy,
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
+import {
+  findLiveMentionlessSubtopicOwner,
+  resolveManagedSubtopicMentionlessHandoff,
+  type ConfiguredBotIdentity,
+  type ResolveSubtopicHandoffDeps,
+} from './services/subtopic-mentionless-handoff.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
+import { commandSpec } from './core/command-schema.js';
+import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
+import { groupTaskSenderIsBot } from './core/group-task-start.js';
 import { deriveSessionPhase } from './core/session-phase.js';
 import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
@@ -4228,9 +4239,85 @@ function scheduleDeferredScheduleSettlement(
   });
 }
 
+function doesBotAnswerTopicWithoutMention(targetAppId: string, chatId: string, observerAppId?: string): boolean | 'unknown' {
+  if (observerAppId && targetAppId === observerAppId) {
+    try {
+      getBot(targetAppId);
+      return resolveGroupMentionMode(targetAppId, chatId) !== 'always';
+    } catch {
+      /* fall through to peer config lookup */
+    }
+  }
+  let cfg: BotConfig | undefined;
+  try {
+    cfg = getBot(targetAppId).config;
+  } catch {
+    try {
+      cfg = loadBotConfigsCached().find(b => b.larkAppId === targetAppId);
+    } catch {
+      cfg = undefined;
+    }
+  }
+  return peerAnswersTopicWithoutMention(cfg, chatId);
+}
+
+function subtopicHandoffDeps(): ResolveSubtopicHandoffDeps {
+  return {
+    dataDir: config.session.dataDir,
+    getLiveThreadSessionsAtRoot: (rootId, chatId) => {
+      const out: Session[] = [];
+      for (const ds of activeSessions.values()) {
+        if (ds.session.status === 'active'
+            && ds.chatId === chatId
+            && (ds.scope ?? ds.session.scope) === 'thread'
+            && ds.session.rootMessageId === rootId
+            && !!ds.larkAppId) {
+          out.push(ds.session.larkAppId ? ds.session : { ...ds.session, larkAppId: ds.larkAppId });
+        }
+      }
+      return out;
+    },
+    findActiveSessionsByRoot: rootId => sessionStore.findActiveSessionsByRoot(rootId),
+    findActiveChatScopeSessionsByChat: chatId => sessionStore.findActiveChatScopeSessionsByChat(chatId),
+    readSessionsByRoots: roots => sessionStore.readSessionsByRoots(roots, { dataDir: config.session.dataDir }),
+    doesBotAnswerTopicWithoutMention: (targetAppId, chatId, observerAppId) =>
+      doesBotAnswerTopicWithoutMention(targetAppId, chatId, observerAppId),
+    getConfiguredBots: () => {
+      const out: ConfiguredBotIdentity[] = [];
+      const seen = new Set<string>();
+      for (const b of getAllBots()) {
+        seen.add(b.config.larkAppId);
+        out.push({
+          larkAppId: b.config.larkAppId,
+          cliId: b.config.cliId,
+          botName: b.botName,
+          botOpenId: b.botOpenId,
+        });
+      }
+      try {
+        for (const c of loadBotConfigsCached()) {
+          if (seen.has(c.larkAppId)) continue;
+          seen.add(c.larkAppId);
+          out.push({ larkAppId: c.larkAppId, cliId: c.cliId });
+        }
+      } catch {
+        /* ignore unconfigured bots.json in tests */
+      }
+      return out;
+    },
+  };
+}
+
 function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string; anchor?: string } | null {
   // A real thread-scope session at this root wins over any historical alias.
   if (activeSessions.get(sessionKey(rootId, larkAppId))?.scope === 'thread') return null;
+  // When another bot's live thread-scope session in a managed subtopic (imported,
+  // dispatch, or project workstream) has免@ enabled (`topic` / `ambient` / `never`),
+  // it owns un-@ replies inside its topic even if a coordinator previously answered
+  // an explicit `@coordinator` message inside the same topic.
+  if (findLiveMentionlessSubtopicOwner(subtopicHandoffDeps(), rootId, chatId, larkAppId)) {
+    return null;
+  }
   for (const ds of activeSessions.values()) {
     if (ds.larkAppId !== larkAppId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
     const deferredRoot = reconcileDeferredTopicBinding(ds);
@@ -5572,6 +5659,13 @@ export async function enforceMessageQuotaForCliInput(
      *  所以闸看不到文件内容——但至少能看到「这轮带了什么附件」，让
      *  「禁止上传 .env / 只许图片」这类策略可写。见 hooks.md 的边界说明。 */
     promptAttachments?: Array<{ type: string; name: string }>;
+    /** Resolve content that must only be fetched after the built-in talk check
+     * (for example a quoted `/g` task). Runs before prompt.submit and charging;
+     * static promptContent/promptAttachments remain the zero-async default. */
+    resolvePrompt?: () => Promise<{
+      promptContent?: string;
+      promptAttachments?: Array<{ type: string; name: string }>;
+    }>;
   },
 ): Promise<boolean> {
   if (opts?.listenerAuthorized) {
@@ -5580,6 +5674,9 @@ export async function enforceMessageQuotaForCliInput(
     // is attacker-influenceable third-party text, which is exactly what a
     // pre-submit gate exists to inspect. Ask the gate before returning; there
     // is no charge on this path, so the charge-order invariant is not in play.
+    const resolvedPrompt = opts.resolvePrompt
+      ? await opts.resolvePrompt()
+      : { promptContent: opts.promptContent, promptAttachments: opts.promptAttachments };
     const listenerGate = await evaluatePromptGate('prompt.submit', {
       larkAppId,
       chatId,
@@ -5589,8 +5686,8 @@ export async function enforceMessageQuotaForCliInput(
       senderOpenId,
       botSender: !!botSender,
       talkReason: 'messageListener',
-      content: opts.promptContent,
-      attachments: opts.promptAttachments,
+      content: resolvedPrompt.promptContent,
+      attachments: resolvedPrompt.promptAttachments,
     });
     if (!listenerGate.allowed) {
       logger.info(
@@ -5635,6 +5732,10 @@ export async function enforceMessageQuotaForCliInput(
   // they never reach a CLI and therefore must not spend or dedupe a quota unit.
   if (opts?.skipCharge) return true;
 
+  const resolvedPrompt = opts?.resolvePrompt
+    ? await opts.resolvePrompt()
+    : { promptContent: opts?.promptContent, promptAttachments: opts?.promptAttachments };
+
   // ─── prompt.submit 同步前置校验闸 ────────────────────────────────────────
   // 位置是被两条既有不变量夹死的，不能随意挪：
   //   • 必须在 evaluateTalk 之后——内置权限模型仍是第一道；外部 hook 只能
@@ -5653,8 +5754,8 @@ export async function enforceMessageQuotaForCliInput(
     memberUnionId,
     botSender: !!botSender,
     talkReason: ev.reason,
-    content: opts?.promptContent,
-    attachments: opts?.promptAttachments,
+    content: resolvedPrompt.promptContent,
+    attachments: resolvedPrompt.promptAttachments,
   });
   if (!gate.allowed) {
     logger.info(
@@ -6792,13 +6893,25 @@ function idleAutoCompactContextTokens(ds: DaemonSession): number | undefined {
   return typeof used === 'number' && Number.isFinite(used) && used > 0 ? used : undefined;
 }
 
+/** Each refusal says what actually stopped the write (see IdleAutoCompactRefusalReason). */
+const IDLE_COMPACT_REFUSED_NOTICE_KEYS = {
+  draft: 'idle_compact.notice.refused_draft',
+  choice: 'idle_compact.notice.refused_choice',
+  unconfirmed: 'idle_compact.notice.refused_unconfirmed',
+  no_screen: 'idle_compact.notice.refused_no_screen',
+  busy: 'idle_compact.notice.refused_busy',
+  unknown: 'idle_compact.notice.refused_unknown',
+} as const satisfies Record<IdleAutoCompactRefusalReason, string>;
+
 function idleAutoCompactNoticeText(ds: DaemonSession, notice: IdleAutoCompactNotice): string {
   const loc = localeForBot(ds.larkAppId);
   const k = (tokens: number) => String(Math.round(tokens / 1000));
   if (notice.kind === 'skipped_small') {
     return tr('idle_compact.notice.skipped_small', { minutes: notice.idleMinutes, tokens: k(notice.tokens), min: k(notice.minTokens) }, loc);
   }
-  if (notice.kind === 'refused') return tr('idle_compact.notice.refused', { minutes: notice.idleMinutes }, loc);
+  if (notice.kind === 'refused') {
+    return tr(IDLE_COMPACT_REFUSED_NOTICE_KEYS[notice.reason], { minutes: notice.idleMinutes, attempts: notice.attempts }, loc);
+  }
   if (notice.kind === 'interrupted') return tr('idle_compact.notice.interrupted', { minutes: notice.idleMinutes }, loc);
   return notice.tokens !== undefined
     ? tr('idle_compact.notice.compacted', { minutes: notice.idleMinutes, tokens: k(notice.tokens) }, loc)
@@ -6846,14 +6959,19 @@ function runIdleAutoCompact(): void {
  * this, passthrough commands silently PATCH the previous card and the user
  * sees no visible response.
  */
-function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
+function beginNewTurn(ds: DaemonSession, title: string, turnId: string, opts: { unattended?: boolean; preserveIdleCompactRetry?: boolean } = {}): void {
   noteTurnStarted(ds, turnId);
   // The previous turn's「下一步」row stops being the last card's.
   noteReplyCardTurnStarted(ds, turnId);
-  // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
-  resetPromptCacheKeepalive(ds);
+  // A real turn ends the idle stretch a prompt-cache keep-alive was extending
+  // (an unattended /compact only once it actually runs — see the helper).
+  notePromptCacheKeepaliveTurnStarted(ds, opts);
   // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
-  noteIdleAutoCompactTurnStarted(ds, turnId);
+  // Persist a real turn's retry invalidation before its busy edge: the whole
+  // turn may finish while the daemon is down, and an old retry must not revive.
+  if (noteIdleAutoCompactTurnStarted(ds, turnId, Date.now(), { preserveRetry: opts.preserveIdleCompactRetry })) {
+    sessionStore.updateSession(ds.session);
+  }
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
   // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
   // deliverFinalOutput / botmux send 成功路径清理。
@@ -7107,6 +7225,33 @@ const commandDeps: CommandHandlerDeps = {
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
   submitQueuedMessage,
+  // `/g <task>` hands its text to a new CLI session: same talk check,
+  // prompt.submit gate and quota charge as a normal message, before the
+  // group exists (a refusal must leave no external side effect).
+  admitTaskPrompt: ({ larkAppId, message, anchor, content, resolvePrompt }) => {
+    const larkStampedBotSender = message.senderType === 'app' || message.senderType === 'bot';
+    const botSender = groupTaskSenderIsBot(
+      message,
+      getBot(larkAppId).botOpenId,
+      isKnownPeerBot(config.session.dataDir, larkAppId, message.senderId),
+    );
+    return enforceMessageQuotaForCliInput(
+      larkAppId,
+      message.chatId ?? anchor,
+      message.senderId,
+      message.messageId,
+      anchor,
+      botSender ? message.senderUnionId : undefined,
+      botSender ? undefined : message.senderUnionId,
+      message.chatType,
+      botSender,
+      {
+        senderAppId: larkStampedBotSender ? message.senderAppId : undefined,
+        promptContent: content,
+        resolvePrompt,
+      },
+    );
+  },
 };
 
 /** Bind every reply produced by one slash-command invocation to the routing
@@ -7193,6 +7338,39 @@ function canTalkForGroupSessions(
   return botSender
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, botTrustAppId).allowed
     : evaluateTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, memberUnionId, chatType).allowed;
+}
+
+/** Shared, receiver-independent creator defaults for multiline `/g` routing.
+ * Name-only registry rows stay visible to election; config joins by app ID. */
+function sharedGroupRoutingBots(): GroupRoutingBotDefaults[] {
+  let defaultsByAppId = new Map<string, unknown>();
+  try {
+    defaultsByAppId = new Map(loadBotConfigsCached().map(bot => [bot.larkAppId, bot.groupCreation]));
+  } catch { /* Explicit --start still works with unknown defaults. */ }
+  let raw: unknown;
+  try { raw = readBotsInfoJson(config.session.dataDir); } catch { return []; }
+  return botsInfoObjectEntries(raw).filter(isBotsInfoNameEntry).map(entry => ({
+    botName: entry.botName,
+    groupCreation: typeof entry.larkAppId === 'string' ? defaultsByAppId.get(entry.larkAppId) : undefined,
+  }));
+}
+
+/** Multi-line `/g` is a command only under the FIRST mentioned creator's
+ * shared defaults. Without bot mentions, this daemon is the creator. */
+function multilineCommandsForRouting(
+  larkAppId: string,
+  text: string,
+  mentions?: LarkMessage['mentions'],
+): ReadonlySet<string> | undefined {
+  if (!isGroupCommandText(text)) return undefined;
+  if (!groupCommandStartsTaskForRouting({
+    commandText: text,
+    ownDefaults: getBot(larkAppId).config.groupCreation,
+    mentions,
+    knownBots: sharedGroupRoutingBots(),
+  })) return undefined;
+  const spec = commandSpec('/group');
+  return spec ? new Set([spec.name, ...(spec.aliases ?? [])]) : undefined;
 }
 
 /** Plugin command table for routing. Only `/…` text can route to a plugin, so
@@ -26221,11 +26399,16 @@ function deliverPassthroughToExistingSession(
       ...sessionBindingKeys.map(key => ({ target: ds.session, key, descriptor: Object.getOwnPropertyDescriptor(ds.session, key) })),
       ...['replyThreadAliases', 'currentReplyTarget'].map(key => ({ target: ds, key, descriptor: Object.getOwnPropertyDescriptor(ds, key) })),
     ];
+    // Unlike the reply descriptors above, this nested object is mutated by the
+    // pre-admission invalidation itself: a descriptor alone cannot roll it back.
+    const savedIdleAutoCompact = structuredClone(ds.session.idleAutoCompact);
     const restoreBinding = () => {
       for (const { target, key, descriptor } of savedBinding) {
         if (descriptor) Object.defineProperty(target, key, descriptor);
         else Reflect.deleteProperty(target, key);
       }
+      if (savedIdleAutoCompact === undefined) delete ds.session.idleAutoCompact;
+      else ds.session.idleAutoCompact = structuredClone(savedIdleAutoCompact);
       sessionStore.updateSession(ds.session);
     };
     // Passthrough commands bypass the normal message-forwarding block, so bind
@@ -26260,19 +26443,26 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
+    const localCliCommand = isLocalCliCommand(cmd);
+    const retryInvalidation = invalidateIdleAutoCompactRetryForTurn(ds, turnId, { preserveRetry: localCliCommand });
     let accepted: boolean;
-    try { accepted = sendWorkerSessionInput(ds, {
-      type: 'raw_input',
-      content: commandContent,
-      ...(trustedSessionController(ds)
-        ? { trustedController: trustedSessionController(ds) }
-        : {}),
-      // Same reason as the worker-pool raw_input send: a passthrough is a real
-      // mojo turn, so it needs the live credential snapshot too.
-      ...(mojoLivePatchForSession(ds) ?? {}),
-      turnId,
-      ...(turn.requireSafeComposer ? { requireSafeComposer: true as const } : {}),
-    }); } catch (err) { restoreBinding(); throw err; }
+    try {
+      // Commit the cancellation before IPC admission: if this save fails the
+      // worker never accepts a turn that could revive the old retry on restart.
+      if (retryInvalidation.changed) sessionStore.updateSession(ds.session);
+      accepted = sendWorkerSessionInput(ds, {
+        type: 'raw_input',
+        content: commandContent,
+        ...(trustedSessionController(ds)
+          ? { trustedController: trustedSessionController(ds) }
+          : {}),
+        // Same reason as the worker-pool raw_input send: a passthrough is a real
+        // mojo turn, so it needs the live credential snapshot too.
+        ...(mojoLivePatchForSession(ds) ?? {}),
+        turnId,
+        ...(turn.requireSafeComposer ? { requireSafeComposer: true as const } : {}),
+      });
+    } catch (err) { restoreBinding(); throw err; }
     if (!accepted) {
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
       restoreBinding();
@@ -26285,10 +26475,13 @@ function deliverPassthroughToExistingSession(
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
     // A locally answered CLI command (/model, /cost, …) sends no request, so it
-    // must not arm a warm idle-auto-compact stretch (core/idle-auto-compact.ts).
+    // must not arm a warm idle-auto-compact stretch or cancel a pending retry.
     const idleCompactArm = ds.idleAutoCompactArm;
-    beginNewTurn(ds, commandContent, turnId);
-    if (isLocalCliCommand(cmd)) ds.idleAutoCompactArm = idleCompactArm;
+    beginNewTurn(ds, commandContent, turnId, {
+      unattended: turn.requireSafeComposer === true,
+      preserveIdleCompactRetry: localCliCommand,
+    });
+    if (localCliCommand) ds.idleAutoCompactArm = idleCompactArm;
     markPassthroughActivity(ds, turnId);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;
@@ -28047,6 +28240,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
     delegatedCommands: sessionDelegatedSlashCommands(botCfg, undefined, config.daemon.backendType),
     pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
+    multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
   });
   if (slashDecision.kind === 'plugin') {
     await executePluginSlashCommand({
@@ -31994,6 +32188,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       hasAttachments: resources.length > 0,
       delegatedCommands: sessionDelegatedSlashCommands(getBot(larkAppId).config, existingDs, config.daemon.backendType),
       pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
+      multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
     });
   // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
   // botmux 自己的命令（/close /status …）照常放行。正文项的重入自带 cascadeBodyReentry 标记。
@@ -34281,14 +34476,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onError: err => logger.warn(`[message-listener] Auto-close failed: ${err instanceof Error ? err.message : String(err)}`),
   });
   // Initialise worker pool with daemon callbacks
-  const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts({
+  const ownerAlertDependencies = {
     dataDir: config.session.dataDir,
-    ownerForApp: appId => resolveWorkerAdmissionOwner(appId, { getBot, getOwnerOpenId }),
-    botForApp: appId => ({ name: getBot(appId).botName ?? appId, locale: localeForBot(appId) }),
-    send: (appId, owner, content) => sendUserMessage(appId, owner, content, 'text', undefined, { timeoutMs: 10_000 }),
-    onError: message => logger.warn(`[memory-admission] ${message}`),
-  });
+    ownerForApp: (appId: string) => resolveWorkerAdmissionOwner(appId, { getBot, getOwnerOpenId }),
+    botForApp: (appId: string) => ({ name: getBot(appId).botName ?? appId, locale: localeForBot(appId) }),
+    send: (appId: string, owner: string, content: string) => sendUserMessage(appId, owner, content, 'text', undefined, { timeoutMs: 10_000 }),
+    onError: (message: string) => logger.warn(`[owner-diagnostic] ${message}`),
+  };
+  const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts(ownerAlertDependencies);
+  const workerOwnerDiagnostics = new WorkerOwnerDiagnostics(ownerAlertDependencies);
   initWorkerPool({
+    onOwnerDiagnostic: (ds, diagnostic) =>
+      workerOwnerDiagnostics.report(ds.larkAppId, ds.session.sessionId, diagnostic),
     larkAppId: cfg.larkAppId,
     onMemoryAdmissionBlocked: (ds, decision) =>
       memoryAdmissionOwnerAlerts.report(ds.larkAppId, ds.session.sessionId, decision),
@@ -35502,20 +35701,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
-      resolveImportedTopicMentionlessHandoff: (rootId, chatId, appId) => resolveImportedTopicHandoff({
-        rootId,
-        chatId,
-        larkAppId: appId,
-        // One cross-bot lookup (this bot's own sessions are excluded inside).
-        sessionsAtRoot: sessionStore.findActiveSessionsByRoot(rootId),
-        chatScopeSessions: () => sessionStore.findActiveChatScopeSessionsByChat(chatId),
-        // One bot per daemon: a peer is not registered here, read bots.json.
-        peerConfig: peerAppId => {
-          try { return getBot(peerAppId).config; } catch { /* not this daemon's bot */ }
-          return loadBotConfigsCached().find(b => b.larkAppId === peerAppId);
-        },
-        groupMode: () => readGroupCollaborationMode(config.session.dataDir, chatId),
-      }),
+      resolveSubtopicMentionlessHandoff: (rootId, chatId, appId) =>
+        resolveManagedSubtopicMentionlessHandoff(subtopicHandoffDeps(), rootId, chatId, appId),
       resolveDurableSession: (ctx) => activeSessions.get(sessionKey(
         ctx.runtimeRoutingAnchor ?? ctx.anchor,
         ctx.larkAppId,
@@ -37030,6 +37217,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           onLine,
           onSpawn,
           aptCandidates: () => defaultTmuxUpgradeProbe(platform).packageCandidates('apt'),
+          // Hosts no package manager can serve: botmux's own verified copy.
+          installPrebuilt: (line) => installManagedTmuxForHost(line),
         });
       },
       onBinaryChanged: () => { refreshTmuxVersion(); },
@@ -37326,6 +37515,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
 
     memoryAdmissionOwnerAlerts.dispose();
+    workerOwnerDiagnostics.dispose();
     scheduler.stopScheduler();
 
     // Settle live CoT thinking bubbles as「因重启中断」BEFORE tearing anything

@@ -2107,8 +2107,9 @@ describe('cursor buildArgs', () => {
 
   it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
-    // Positional prompt is inside the tmux launch command. 8192 matches
-    // OpenCode: short turns stay on argv; longer ones defer until readyPattern.
+    // The positional prompt historically counted toward the inline launch
+    // budget; 8192 matches OpenCode and is retained so short turns stay on
+    // argv while longer ones defer until readyPattern.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
     expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
@@ -2280,11 +2281,10 @@ describe('opencode buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+  it('declares the retained maxInitialPromptArgBytes budget', () => {
     // OpenCode bakes the full first-round prompt into `--prompt <content>`.
-    // tmux new-session rejects long command strings well below OS ARG_MAX,
-    // so the adapter must declare a byte budget: short prompts keep --prompt,
-    // over-limit prompts defer to the post-start input queue.
+    // Keep the historical byte budget so short prompts retain --prompt while
+    // over-budget prompts retain the post-start input queue.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
@@ -3098,7 +3098,7 @@ describe('mtr buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+  it('declares the retained maxInitialPromptArgBytes budget', () => {
     // `--prompt` bakes the full first prompt into argv, same budget as OpenCode.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
@@ -4407,7 +4407,10 @@ describe('grok buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false, initialPrompt: 'hello grok' });
     expect(args[args.length - 1]).toBe('hello grok');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
-    // Tighter than 8192: `--rules` is already in the tmux command.
+    // Tighter than 8192: the historical inline launch had to fit `--rules`
+    // and the first prompt together; pane-launch now carries both via a
+    // private file, so 4096 is retained only to keep the argv vs queue split
+    // unchanged.
     expect(adapter.maxInitialPromptArgBytes).toBe(4096);
   });
 
