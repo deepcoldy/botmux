@@ -183,12 +183,19 @@ describe('V3ProgressCardManager', () => {
     const runDir = seedRun('progress-coalesce');
     let release!: (messageId: string) => void;
     const blockedSend = new Promise<string>((resolve) => { release = resolve; });
-    const reply = vi.fn(async () => blockedSend);
+    let enterReply!: () => void;
+    const inReply = new Promise<'reply'>((resolve) => { enterReply = () => resolve('reply'); });
+    const reply = vi.fn(async () => { enterReply(); return blockedSend; });
     const tx = transport({ reply });
     const cards = manager(tx);
 
     const first = cards.refresh('progress-coalesce', { allowCreate: true });
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // The first pass takes its snapshot behind the card's file lock and disk
+    // I/O before it reaches the transport; wait for it to hang there, not for
+    // a wall-clock guess an overloaded runner outlasts (#3643). A pass that
+    // ends without reaching the transport fails here at once.
+    const settled = first.then(() => 'settled' as const, () => 'settled' as const);
+    expect(await Promise.race([inReply, settled])).toBe('reply');
     const queued = Array.from({ length: 100 }, () =>
       cards.refresh('progress-coalesce', { allowCreate: true }));
     appendEvent(join(runDir, 'journal.ndjson'), {
