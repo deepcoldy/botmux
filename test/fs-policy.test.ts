@@ -2211,15 +2211,35 @@ describe('buildFsPolicy — assistant mode (per-owner USER_HOME)', () => {
   it('keeps the no-transport assistant sessions.db denied while retaining other carve-outs', () => {
     const p = buildFsPolicy(ownerCtx(A));
     expect(accessForPath(p.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
-    const noTransport = buildFsPolicy({ ...ownerCtx(A), larkTransportEnabled: false });
+    const noTransport = buildFsPolicy({ ...ownerCtx(A),
+      botHome: '/var/assistant/users/a', workingDir: '/var/assistant/users/a/work',
+      larkTransportEnabled: false, mandatoryReadOnlyPaths: ['/Users/u'] });
     expect(accessForPath(noTransport.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
     expect(accessForPath(noTransport.rules, `${sd}/bots-info.json`).access).toBe('readOnly');
     expect(accessForPath(noTransport.rules, `${sd}/bin/botmux`).access).toBe('readOnly');
+    const profile = compileToSeatbelt(noTransport);
+    const finalAllow = profile.lastIndexOf('(allow file-read* (subpath "/Users/u"))');
+    const finalDatabaseDeny = profile.lastIndexOf(`(deny file-read* (subpath "${sd}/session-stores/cli_self"))`);
+    expect(finalAllow).toBeGreaterThanOrEqual(0);
+    expect(finalDatabaseDeny).toBeGreaterThan(finalAllow);
+  });
+
+  it('filters final ancestor grants that cover the real BOT_HOME', () => {
+    const p = buildFsPolicy({ ...ownerCtx(A), mandatoryReadOnlyPaths: ['/Users/u'] });
+    expect(p.finalReadOnlyPaths).not.toContain('/Users/u');
+    const profile = compileToSeatbelt(p);
+    const homeAllows = profile.match(/\(allow file-read\* \(subpath "\/Users\/u"\)\)/g) ?? [];
+    // Only the baseline HOME grant remains; the final pass must not re-emit it
+    // after the botmux/owner denies.
+    expect(homeAllows).toHaveLength(1);
+    expect(accessForPath(p.rules, `${botHome}/users/${B}/claude/projects/x/memory/MEMORY.md`).access).toBe('deny');
   });
 
   it('emits the assistant keystore deny after a final ancestor read-only grant', () => {
     const store = '/Users/u/Library/Application Support/lark-cli';
-    const p = buildFsPolicy({ ...ownerCtx(A), mandatoryReadOnlyPaths: ['/Users/u'] });
+    const p = buildFsPolicy({ ...ownerCtx(A),
+      botHome: '/var/assistant/users/a', workingDir: '/var/assistant/users/a/work',
+      mandatoryReadOnlyPaths: ['/Users/u'] });
     const profile = compileToSeatbelt(p);
     const finalAllow = profile.lastIndexOf('(allow file-read* (subpath "/Users/u"))');
     const finalKeyDeny = profile.lastIndexOf(`(deny file-read* (subpath "${store}"))`);

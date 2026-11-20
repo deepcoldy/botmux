@@ -1214,13 +1214,24 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // Seatbelt re-emits these paths after every ordinary rule so they can carve
   // a narrow read-only exception out of a broader deny. Never carry a path
   // inside a host-only root into that final pass, or it would undo the
-  // daemon-owned boundary that `push()` enforced above.
+  // daemon-owned boundary that `push()` enforced above. Assistant mode has one
+  // additional boundary: the final pass must not grant the REAL BOT_HOME or any
+  // of its ancestors — otherwise HOME re-opens every other owner and the shared
+  // bot-level data. The owner's own USER_HOME subtree remains eligible.
+  const assistantOwnerHome = ctx.assistantMode ? normalizeFsPath(ctx.botHome) : null;
+  const assistantUsersRoot = assistantOwnerHome?.slice(0, assistantOwnerHome.lastIndexOf('/')) ?? null;
+  const assistantBotHome = assistantUsersRoot?.endsWith('/users')
+    ? normalizeFsPath(assistantUsersRoot.slice(0, -'/users'.length) || '/')
+    : null;
+  const outsideAssistantOwnerWithinBotHome = (p: string): boolean => !!assistantBotHome && !!assistantOwnerHome
+    && ((coversPath(assistantBotHome, p) && !coversPath(assistantOwnerHome, p))
+      || coversPath(p, assistantBotHome));
   const finalReadOnlyPaths = [
     ...serviceCredentialReadOnlyPaths,
     ...(ctx.mandatoryReadOnlyPaths ?? []),
   ].filter((path) => {
     const normalized = normalizeFsPath(path);
-    if (!normalized || insideHostOnlyRoot(normalized)) return false;
+    if (!normalized || insideHostOnlyRoot(normalized) || outsideAssistantOwnerWithinBotHome(normalized)) return false;
     // This final pass runs after ordinary rules. A service-credential exception
     // under a withheld lark-cli store would otherwise re-open the exact key the
     // mandatory ceiling just denied.
@@ -1313,7 +1324,15 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
-    ...(sealLarkKeyStore ? { finalDenyPaths: [...withheldLarkStores] } : {}),
+    // The final Seatbelt pass must also cover the assistant session store: an
+    // ancestor finalReadOnly grant would otherwise re-open DB/WAL/SHM even when
+    // the ordinary rules and the no-transport carve-out both exclude it.
+    ...(sealLarkKeyStore ? {
+      finalDenyPaths: [
+        ...withheldLarkStores,
+        ...(ctx.assistantMode ? [`${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`] : []),
+      ],
+    } : {}),
     finalReadOnlyPaths,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()
