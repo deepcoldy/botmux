@@ -895,6 +895,7 @@ export interface DaemonSession {
     taskId?: string | null;
   };
   usageLimit?: CliUsageLimitState;
+  antigravityQuotaHistory?: readonly CliUsageLimitState[];
   /** A failed persistence must be retried even if the next frame is identical. */
   usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;

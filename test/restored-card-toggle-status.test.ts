@@ -84,6 +84,7 @@ import {
   __testOnly_setupWorkerHandlers,
 } from '../src/core/worker-pool.js';
 import { activeSessionKey, sessionKey, type DaemonSession, type FrozenCard } from '../src/core/types.js';
+import type { WorkerToDaemon } from '../src/types.js';
 import { t } from '../src/i18n/index.js';
 import { formatClockTime } from '../src/utils/clock-time.js';
 import { attachOrdinaryTurnRecovery, disposeOrdinaryTurnRecovery } from '../src/services/ordinary-turn-recovery.js';
@@ -323,6 +324,58 @@ describe('toggle status without a fresh worker report', () => {
     expect(statusOf(card)).toBe(LIMITED);
     expect(markdownOf(card).some(md => md.includes('23:59'))).toBe(true);
     expect(hasStopButton(card)).toBe(false);
+  });
+
+  it.each(['screenshot first', 'text first'])('patches the hidden card once when a native quota clears (%s)', async order => {
+    vi.useFakeTimers();
+    try {
+      const worker = makeFakeWorker();
+      const turn = { turnId: 'om_quota_turn', dispatchAttempt: 1 };
+      const ds = makeRestoredDs({
+        worker, workerReady: true, workerPort: 9999, displayMode: 'screenshot', currentTurnId: turn.turnId,
+      });
+      ds.session.cliId = 'antigravity';
+      const deps = activate(ds);
+      __testOnly_setupWorkerHandlers(ds, worker);
+      const dispatch = async (message: WorkerToDaemon) => {
+        for (const listener of worker.listeners('message')) await listener(message);
+        await vi.advanceTimersByTimeAsync(0);
+      };
+      await dispatch({ type: 'capture_identity', revision: 1, ...turn });
+      await dispatch({
+        type: 'screen_update', status: 'limited', content: 'Native quota refusal', ...turn,
+        usageLimit: {
+          limited: true, kind: 'usage', source: 'antigravity-error-composer', relativeResetKey: 'usage:60000:quota',
+          retryAtMs: Date.now() + 60_000, retryLabel: '1m', retryReady: false,
+        },
+      });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(ds.usageLimit?.retryReady).toBe(true);
+      expect(statusOf(patches().at(-1)!.card)).toBe(label('card.status.retry_ready'));
+
+      await handleCardAction(toggle(), deps, APP_ID);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ds.displayMode).toBe('hidden');
+      const before = patches().length;
+      expect(statusOf(patches().at(-1)!.card)).toBe(label('card.status.retry_ready'));
+
+      const screenshot = { type: 'screenshot_uploaded', status: 'idle', imageKey: 'img_in_flight', captureRevision: 1, ...turn } as const;
+      const text = { type: 'screen_update', status: 'idle', content: 'Ready', ...turn } as const;
+      const [first, second] = order === 'screenshot first' ? [screenshot, text] : [text, screenshot];
+      await dispatch(first);
+      expect(patches()).toHaveLength(before + 1);
+      await dispatch(second);
+      await dispatch(text);
+      expect(ds.currentImageKey).toBe(screenshot.imageKey);
+      expect(ds.usageLimit).toBeUndefined();
+      expect(patches()).toHaveLength(before + 1);
+      const updated = patches().at(-1)!;
+      expect(updated.messageId).toBe(CARD_ID);
+      expect(statusOf(updated.card)).toBe(IDLE);
+      expect(buttonsOf(updated.card).some(button => button.value?.action === 'retry_last_task')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('running worker with subtasks left → still shows them', async () => {
