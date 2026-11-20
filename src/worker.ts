@@ -365,6 +365,7 @@ import {
   type BotConfig,
 } from './bot-registry.js';
 import { HIDE_LOCAL_ADDRESSES_ENV, hideLocalAddressesEnvValue } from './im/lark/local-address-switch.js';
+import { REPLY_DELIVERY_ENV } from './services/send-completion-hint.js';
 import {
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
@@ -12013,11 +12014,15 @@ function judgeClaudeBridgeTurn(): void {
   if (verdict.reported) return;
   const unreadLarkTurn = bridgeQueue.peek().find(turn => !turn.started && !turn.isLocal);
   const adoptMode = lastInitConfig?.adoptMode === true;
+  const sendsDuringTurn = adoptMode ? [] : readSendMarkers()
+    .filter(marker => marker.sentAtMs >= verdict.turnStartedAtMs && marker.terminalIndependent !== true);
   const needsNotice = blindTurnNeedsNotice({
     transcriptCarriesEveryReply: adoptMode || zeroPromptTerminalSync(),
     unreadLarkTurn: !!unreadLarkTurn,
-    sentDuringTurn: !adoptMode && readSendMarkers()
-      .some(marker => marker.sentAtMs >= verdict.turnStartedAtMs && marker.terminalIndependent !== true),
+    sentDuringTurn: sendsDuringTurn.length > 0,
+    ...(replyDeliveryMode() === 'transcript'
+      ? { transcriptReplies: { sentFinalDuringTurn: sendsDuringTurn.some(isFinalBridgeSendMarker) } }
+      : {}),
   });
   if (!needsNotice) return;
   bridgeBlindTurnWatch.noteReported();
@@ -29414,6 +29419,13 @@ async function spawnCliBody(
   // A sandboxed `botmux send` cannot read bots.json; it keeps this bot's
   // local-address policy from the snapshot taken when the worker was forked.
   childEnv[HIDE_LOCAL_ADDRESSES_ENV] = hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true);
+  // The reply delivery this pane's prompt was built with (after the resolved-
+  // sandbox degrade above). `botmux send` words its post-send hint from it: in
+  // a transcript session a progress send is answered with "the final reply is
+  // forwarded automatically" instead of "deliver with --response-kind final".
+  // A warm reattach keeps the env of the original spawn, matching the system
+  // prompt that pane still runs with.
+  childEnv[REPLY_DELIVERY_ENV] = cfg.replyDelivery === 'transcript' ? 'transcript' : 'send';
   // The stable native/global skill loader and `botmux send` must see one exact
   // normalized snapshot for the lifetime of this pane. Always inject `{}` for
   // defaults so an inherited stale value can never bleed across bot sessions.

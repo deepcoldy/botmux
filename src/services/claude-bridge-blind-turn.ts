@@ -119,13 +119,23 @@ export interface BlindTurnNoticeInput {
   unreadLarkTurn: boolean;
   /** The model ran `botmux send` after the turn started. */
   sentDuringTurn: boolean;
+  /** replyDelivery=transcript: a Lark turn's answer is its forwarded final
+   *  reply, and `botmux send` is only for what that reply cannot carry (a
+   *  cross-bot @, an attachment). Only a declared final send then proves the
+   *  answer went out. Omitted = send delivery. */
+  transcriptReplies?: { sentFinalDuringTurn: boolean };
 }
 
 /** Whether an unread turn lost something the group would otherwise have got.
  *  With `botmux send` delivery the transcript is only the fallback for a Lark
  *  turn the model did not answer itself, and a terminal-local turn is never
- *  forwarded at all — telling the group about those would be noise. */
+ *  forwarded at all — telling the group about those would be noise. With
+ *  transcript delivery an ordinary send during the turn does not stand in for
+ *  the lost final; a `--response-kind final` send does. */
 export function blindTurnNeedsNotice(input: BlindTurnNoticeInput): boolean {
   if (input.transcriptCarriesEveryReply) return true;
-  return input.unreadLarkTurn && !input.sentDuringTurn;
+  if (!input.unreadLarkTurn) return false;
+  return input.transcriptReplies
+    ? !input.transcriptReplies.sentFinalDuringTurn
+    : !input.sentDuringTurn;
 }

@@ -225,7 +225,10 @@ describe('independent turn terminal receipt', () => {
   beforeEach(() => {
     for (const key of Object.keys(botConfig)) delete botConfig[key];
     Object.assign(botConfig, {
-      larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'traex',
+      // The receipt strip is the send-delivery UI contract; traex / claude-code /
+      // codex otherwise default to transcript, which keeps its own receipt-free
+      // contract (covered by the 'transcript delivery' cases below).
+      larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'traex', replyDelivery: 'send',
     });
     sessionReplyMock.mockReset();
     sessionReplyMock.mockResolvedValue('om_terminal_receipt' as any);
@@ -1258,6 +1261,8 @@ describe('independent turn terminal receipt', () => {
     ['card-off', { disableStreamingCard: true }],
     ['private-card', { privateCard: true }],
     ['transcript delivery', { replyDelivery: 'transcript' }],
+    // Unconfigured traex follows its CLI default (transcript) — same contract.
+    ['default delivery on a transcript-capable CLI', { replyDelivery: undefined }],
   ])('keeps %s sessions on their existing UI contract', async (_label, override) => {
     Object.assign(botConfig, override);
     const ds = makeDs();

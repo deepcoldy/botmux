@@ -575,7 +575,7 @@ Edit it visually in Dashboard "Bot Config → Message Cards → Final answer fee
 
 | Field | Description |
 |------|------|
-| `replyDelivery` | How the final answer reaches Feishu. `send` (default for every CLI except Doubao): the model runs `botmux send` itself; `transcript`: botmux takes the turn's last answer from the CLI's session record and sends it. See below |
+| `replyDelivery` | How the final answer reaches Feishu. `transcript` (default for CLIs whose session record botmux can read): botmux takes the turn's last answer from the CLI's session record and sends it; `send` (default for every other CLI, and can be set explicitly): the model runs `botmux send` itself. See below |
 | `senderTag` | On by default: every message forwarded to the CLI carries a `<sender ... />` tag saying who spoke. Only `false` turns it off |
 | `senderTagHideEmail` | Off by default. When on, the `<sender>` tag leaves out the email; name and ID stay |
 | `hideLocalAddresses` | Off by default: model replies reach Feishu as written. When on, host paths and local service addresses are kept out of replies. See [Hide development host addresses](#hide-local-addresses) below |
@@ -586,25 +586,36 @@ Edit it visually in Dashboard "Bot Config → Message Cards → Final answer fee
 
 ### Transcript replies (`replyDelivery: "transcript"`)
 
-Doubao defaults to `transcript` (its tool commands run in an account-wide resident process, so a model-run `botmux send` can land in the wrong topic; see [CLI Adapters](/en/adapters)). Every other CLI defaults to `send`, where the model has to run `botmux send` to post its answer to Feishu. With `transcript`, botmux takes the turn's last answer from the CLI's session record and sends it; the model just answers.
+CLIs whose session record botmux can read default to `transcript`: botmux takes the turn's last answer from the CLI's session record and posts it to Feishu, so the model just answers instead of running `botmux send`. Models no longer `botmux send` every progress note, interim conclusion and final answer, which keeps chats much quieter.
 
-Three things change:
+Compared with `send`, four things change:
 
-1. The system prompt no longer teaches `botmux send`. When the model really needs it (attachments, mentioning another bot), it can find out how through the built-in `botmux-send` skill.
+1. The system prompt says "write the final answer in your reply" and keeps `botmux send` for what the final reply cannot carry: mentioning another bot to collaborate or handing results back to the bot that assigned the task, attachments or cards, posting to another chat or topic, and turns whose instructions explicitly ask for it (such as silent scheduled tasks). It also tells the model not to use it for progress broadcasts.
 2. No more `<botmux_reminder>` each turn.
 3. In DMs, or 1:1 groups with only the admin and this bot, messages are no longer wrapped in `<user_message>` and `<sender/>`; the model sees the raw text.
+4. The output the model reads after `botmux send` reminds it that the final answer belongs in its reply and progress needs no send.
 
-Supported CLIs: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao. Antigravity only captures answers in zero-injection mode, so setting it explicitly is rejected; if you later switch to an unsupported CLI, runtime falls back to `send` and no answer is lost. Cursor and Doubao don't support transcript under `sandbox: "scratch"` (setting it is rejected and the default falls back to `send` at runtime); the oncall sandbox is unaffected.
+Supported CLIs: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao. Other CLIs (Antigravity, OpenCode, Relay, codex-app, …) still default to `send`; Antigravity only captures answers in zero-injection mode, so setting it explicitly is rejected. If you set `transcript` and later switch to an unsupported CLI, runtime falls back to `send` and no answer is lost. Cursor and Doubao don't support transcript under `sandbox: "scratch"` (setting it explicitly is rejected and the default falls back to `send` at runtime); the oncall sandbox is unaffected.
 
-```text
-/botconfig set replyDelivery transcript   # turn on
-/botconfig set replyDelivery send         # explicitly use botmux send (not recommended for Doubao)
-/botconfig unset replyDelivery            # back to default
+To get the old behavior back (the model runs `botmux send` itself), set `send` explicitly:
+
+```json
+{ "replyDelivery": "send" }
 ```
 
-- Per-turn reminders and wrappers change from the next turn. The system prompt is set when a session starts, so running sessions need `/restart`.
-- Trade-off: 1:1 sessions lose the `<user_message>` / `<sender>` structure, so `/adopt` no longer recognizes them as botmux's own sessions.
-- The Dashboard "Transcript reply mode" switch writes this field; it's greyed out when the current CLI doesn't support it.
+```text
+/botconfig set replyDelivery send         # back to botmux send (not recommended for Doubao)
+/botconfig set replyDelivery transcript   # pin transcript explicitly
+/botconfig unset replyDelivery            # back to this CLI's default
+```
+
+A bot with an explicit `send` stays on `send`; the default never overrides it.
+
+- The per-turn reminder and wrapper change from the next turn; the system prompt is fixed when a session starts, so a running session needs `/restart` to pick it up. The same applies to bots without `replyDelivery` after upgrading to this version: running sessions get their final replies forwarded by botmux from the next turn while still on the old system prompt (which teaches `botmux send`); an answer the model sends with `--response-kind final` is not forwarded twice. `/restart` switches them to the new prompt.
+- Bot-to-bot collaboration is unchanged: reaching another bot, or handing results back to the bot that assigned the task, still takes `botmux send --mention` (or `--mention-back`); the final reply card does not @ the other bot.
+- Silent scheduled tasks are unchanged: their final reply never reaches the chat, and the model still runs `botmux send` when the notify condition is met.
+- Cost: 1:1 sessions lose the `<user_message>` / `<sender>` structure, so `/adopt` no longer recognizes them as botmux's own sessions by content (exclusion by session ID still applies).
+- The Dashboard "Transcript reply mode" switch writes this field, in both directions; it's greyed out when the current CLI doesn't support it.
 
 ### Turning off the sender tag (`senderTag: false`)
 

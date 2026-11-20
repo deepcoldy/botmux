@@ -6,18 +6,19 @@
  *
  * - `send`：模型必须自己 `botmux send`，系统提示与每轮 reminder 都这么要求。
  * - `transcript`：daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡
- *   （bridge fallback 升为主通道）；系统提示不再提及 `botmux send`、不注入每轮
+ *   （bridge fallback 升为主通道）；系统提示只把 `botmux send` 留给最终回复带不了
+ *   的事（@ 别的 bot 协作/回报、附件或卡片、发到别的群或话题），不注入每轮
  *   reminder；solo 会话去掉 `<user_message>` 壳与 `<sender/>`。
  *
- * 缺省按 CLI 区分（`defaultReplyDeliveryFor`）：doubao 缺省 `transcript`（账号级常驻
- * service 进程使 `botmux send` 归属不可靠，见该函数注释），其余 CLI 缺省 `send`、与上游
- * 一致；bots.json 显式写 `transcript` / `send` 都覆盖缺省。所有判定 fail-closed：
- * 拿不准就回到 `send` / 非 solo。
+ * 缺省按 CLI 能力区分（`defaultReplyDeliveryFor`）：有转写采集通道的 CLI 缺省
+ * `transcript`，其余缺省 `send`；bots.json 显式写 `transcript` / `send` 都覆盖缺省。
+ * 所有判定 fail-closed：拿不准就回到 `send` / 非 solo。
  */
 import { getBot, getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { logger } from '../utils/logger.js';
 import { zeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
+import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 import { supportsTranscriptReplyDeliveryForBot, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
 
 export type ReplyDelivery = 'send' | 'transcript';
@@ -30,34 +31,33 @@ export { supportsTranscriptReplyDeliveryForBot } from './zero-prompt-support.js'
 export type { TranscriptDeliveryCapabilityOpts } from './zero-prompt-support.js';
 
 /**
- * 未显式配置时的缺省投递方式：除 doubao 外**一律 `send`**，与上游行为逐字节一致——
- * 模型仍被教「botmux send」，最终回复由它自己发。doubao 是唯一例外（缺省
- * `transcript`），原因见函数体注释。
+ * 未显式配置时的缺省投递方式：CLI 有转写采集通道（`supportsTranscriptReplyDelivery`：
+ * claude-code 与 structured bridge ALWAYS 集合）就缺省 `transcript`，否则 `send`。
  *
- * `transcript` 在其余 CLI 上仍是 opt-in：它改的不只是投递路径，还会改写系统提示、
- * 去掉逐轮 `<botmux_reminder>`、并让 solo 会话的信封去壳，且 `/adopt` 不再把这类
- * 会话识别为本 bot 自产。这些都是对既有会话可感知的变化，不该由升级顺带发生，所以
- * 交给使用者在 bots.json 或 dashboard 上显式打开。
+ * 为什么缺省 transcript：send 模式要求模型每轮自己 `botmux send`，部分模型（典型是
+ * GPT 系）会把进度、阶段结论、最终答复都 send 一遍，群里被频繁打扰；transcript 下
+ * 最终答复由 daemon 从转写取、只发一张卡，`botmux send` 退回到协作与附件这类最终
+ * 回复带不了的场景。
  *
- * 保留 `cliId` 形参而不直接写死常量：缺省策略的唯一出口就在这里，为某个 CLI 单独换
- * 缺省只改这一个函数即可，不必回头翻所有调用点。
+ * 只按 CLI 判，不看沙盒：cursor / doubao 在 scratch 沙盒下采集不到，这一层仍返回
+ * `transcript`，由 `effectiveReplyDelivery` 在运行时按沙盒回落 `send`（缺省值回落
+ * 不告警，只有显式配置的 transcript 回落才告警）。Dashboard 的「当前 CLI 缺省」
+ * 展示也取这里，与沙盒无关。
+ *
+ * 显式写 `send` 的 bot 保持 send：`effectiveReplyDelivery` 先取显式配置，缺省只在
+ * 未配置时补位。Doubao 历来缺省 transcript（账号级常驻 service 进程使 `botmux
+ * send` 归属不可靠，#2828），现在只是与其它可采集 CLI 同一条规则。
  */
 export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
-  // Doubao 例外，缺省 transcript：它的工具命令由账号级常驻 `doubao --type=service`
-  // 进程执行，所有 TUI 共用一个；该进程的环境变量与进程树来自**第一个**拉起它的
-  // 终端，而不是当前收到消息的会话。模型自己跑 `botmux send` 时，provenance 会按
-  // 那棵进程树解析出别的会话（甚至别的 bot），回复被投到错误的群/身份下。
-  // transcript 模式下 daemon 从本会话 assignment.md / trajectory.jsonl 收最终回复，
-  // 系统提示也不再教 `botmux send`，绕开这条串号路径。显式写 `send` 仍可退回。
-  if (cliId === 'doubao') return 'transcript';
-  return 'send';
+  return supportsTranscriptReplyDelivery(cliId) ? 'transcript' : 'send';
 }
 
 const warnedUnsupported = new Set<string>();
 
 /** 运行时生效值：显式配置（send / transcript）优先，未配置按 CLI 缺省；结果为
- *  transcript 但当前 CLI 不支持时回落 send（每个 bot+cli 组合只 warn 一次，避免
- *  每轮刷日志）。无 larkAppId / registry 异常 → send（fail-closed）。
+ *  transcript 但当前 CLI / 沙盒组合不支持时回落 send（显式配置的才 warn，每个
+ *  bot+cli 组合只 warn 一次，避免每轮刷日志）。无 larkAppId / registry 异常 → send
+ *  （fail-closed）。
  *
  * opts.sessionSandbox：为**已存活会话的续轮**传该会话 spawn 时冻结的沙箱
  * （session.sandbox）。信封判定必须按「这个会话的 worker 实际有没有采集」来，
@@ -109,6 +109,9 @@ export function effectiveReplyDelivery(
   const wanted: ReplyDelivery = configured ?? defaultReplyDeliveryFor(cliId);
   if (wanted !== 'transcript') return 'send';
   if (supportsTranscriptReplyDeliveryForBot(cliId, { sandbox })) return 'transcript';
+  // 缺省值回落是预期内的（如 scratch 沙盒下的 cursor / doubao），不告警；只有使用者
+  // 显式写了 transcript 却用不上时才提示一次。
+  if (configured !== 'transcript') return 'send';
   const key = `${larkAppId}:${cliId ?? ''}`;
   if (!warnedUnsupported.has(key)) {
     warnedUnsupported.add(key);

@@ -6,6 +6,7 @@ import {
   BridgeBlindTurnWatch,
   blindTurnNeedsNotice,
 } from '../src/services/claude-bridge-blind-turn.js';
+import { isFinalBridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 
 const OLD = '/claude/projects/-w/6b50f4a4-3392-43df-837b-02261f498b43.jsonl';
 const NEW = '/claude/projects/-w/76cd870a-7bd4-46e7-b191-34290ff42dc2.jsonl';
@@ -32,7 +33,9 @@ function compactionWorker(relocate: () => boolean = () => false) {
     bridgeDrainAndMaybeEmit,
     relocateUnreadClaudeTranscript,
     zeroPromptTerminalSync: () => true,
+    replyDeliveryMode: () => 'send',
     readSendMarkers: () => [],
+    isFinalBridgeSendMarker,
     lastWebTerminalInputAtMs: 0,
     webTerminalInputGeneration: 0,
     lastWebTerminalSubmitAtMs: 0,
@@ -312,5 +315,48 @@ describe('blindTurnNeedsNotice', () => {
     expect(blindTurnNeedsNotice({ transcriptCarriesEveryReply: false, unreadLarkTurn: true, sentDuringTurn: true })).toBe(false);
     // A terminal-local turn is never forwarded in this mode, read or not.
     expect(blindTurnNeedsNotice({ transcriptCarriesEveryReply: false, unreadLarkTurn: false, sentDuringTurn: false })).toBe(false);
+  });
+
+  it('with transcript delivery, an ordinary send (cross-bot @, attachment) does not stand in for the lost final', () => {
+    const base = { transcriptCarriesEveryReply: false, unreadLarkTurn: true, sentDuringTurn: true };
+    expect(blindTurnNeedsNotice({ ...base, transcriptReplies: { sentFinalDuringTurn: false } })).toBe(true);
+    // A declared final send already delivered the answer.
+    expect(blindTurnNeedsNotice({ ...base, transcriptReplies: { sentFinalDuringTurn: true } })).toBe(false);
+    // Terminal-local turns stay unforwarded in transcript mode too.
+    expect(blindTurnNeedsNotice({ ...base, unreadLarkTurn: false, transcriptReplies: { sentFinalDuringTurn: false } })).toBe(false);
+  });
+});
+
+describe('worker：transcript 回复模式下的漏读通知', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+  });
+  afterEach(() => vi.useRealTimers());
+
+  /** Ordinary (non zero-prompt) session whose unread Lark turn is pending while
+   *  the model ran one `botmux send` of the given kind during the turn. */
+  function unreadTurnWithSend(replyDelivery: 'send' | 'transcript', responseKind: 'progress' | 'final') {
+    const w = compactionWorker();
+    w.scope.zeroPromptTerminalSync = () => false;
+    w.scope.replyDeliveryMode = () => replyDelivery;
+    w.pending.push({ started: false, isLocal: false, turnId: 'om_unread' });
+    w.busy();
+    w.scope.readSendMarkers = () => [{ sentAtMs: Date.now(), messageId: 'om_sent', responseKind }];
+    vi.advanceTimersByTime(LONG);
+    w.judge();
+    return w.notices();
+  }
+
+  it('一条协作 / 附件类的普通 send 不能代替丢掉的最终回复：照常告警', () => {
+    expect(unreadTurnWithSend('transcript', 'progress')).toBe(1);
+  });
+
+  it('本轮已用 --response-kind final 交付：不告警', () => {
+    expect(unreadTurnWithSend('transcript', 'final')).toBe(0);
+  });
+
+  it('send 模式保持原口径：任意一次 send 都算模型自己答过', () => {
+    expect(unreadTurnWithSend('send', 'progress')).toBe(0);
   });
 });
