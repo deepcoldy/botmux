@@ -10239,7 +10239,9 @@ function codexBridgeStartTimer(): void {
             // (either the pending SID authoritatively, or the pid's open
             // conversation switched): release the retired conversation's held
             // final, then bind the new one fresh so its live turn is ingested
-            // from byte 0 (never as history).
+            // from byte 0 (never as history). Pending task/subagent waits still
+            // block that flush: /new abandons unfinished work; its waiting
+            // narration must not be promoted to a completed answer.
             codexBridgePendingSessionId = undefined;
             codexAdoptPendingPid = undefined;
             try {
@@ -11261,8 +11263,9 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         // existing bytes are THIS session's live turn, never history →
         // fresh-empty regardless of the spawn resume flag.
         try {
-          // Flush the retired conversation's held candidate: the new
-          // conversation starting proves the old loop ended.
+          // Flush a completed retired conversation's held candidate. Pending
+          // task/subagent waits still block the flush: /new abandons unfinished
+          // work rather than promoting its waiting narration to a final.
           codexBridgeIngest({ flushAntigravityTrailingFinal: true });
           emitReadyCodexTurns();
         } catch (err: any) {

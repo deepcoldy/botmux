@@ -175,6 +175,36 @@ describe('Antigravity subagent final delivery', () => {
     expect(drain([reply('agent-2'), planner('Done')]).map(e => e.text)).toEqual(['Done']);
   });
 
+  it.each([
+    { Action: '"kill"', ConversationIds: '["agent-1"]' },
+    { Action: 'kill', ConversationIds: '["agent-1"]' },
+    { Action: '"kill"', ConversationIds: ['agent-1'] },
+  ])('decodes compact-log kill argument values: %j', args => {
+    launch('agent-1', 'agent-2');
+    expect(drain([tools({ name: 'manage_subagents', args }), planner('Still waiting')])).toEqual([]);
+    expect(state.pendingSubagentIds).toEqual(['agent-2']);
+    expect(drain([reply('agent-2'), planner('Done')]).map(e => e.text)).toEqual(['Done']);
+  });
+
+  it('decodes compact-log kill_all and cancels stale narration', () => {
+    launch('agent-1', 'agent-2');
+    expect(drain([tools({ name: 'manage_subagents', args: { Action: '"kill_all"' } })])).toEqual([]);
+    expect(hasAntigravityPendingTasks(state)).toBe(false);
+    expect(state.provisionalFinal).toBeUndefined();
+    expect(drain([planner('Canceled reviewers')]).map(e => e.text)).toEqual(['Canceled reviewers']);
+  });
+
+  it.each([
+    { Action: '"kill"', ConversationIds: '[broken' },
+    { Action: '"kill"', ConversationIds: 'null' },
+    { Action: '"kill"', ConversationIds: '"agent-1"' },
+    { Action: '"list"', ConversationIds: '["agent-1"]' },
+  ])('keeps waits for malformed or non-cancel argument values: %j', args => {
+    launch('agent-1');
+    expect(drain([tools({ name: 'manage_subagents', args }), planner('Still waiting')])).toEqual([]);
+    expect(state.pendingSubagentIds).toEqual(['agent-1']);
+  });
+
   it('kill_all cancels stale waiting narration before allowing a fresh final', () => {
     launch('agent-1', 'agent-2');
     expect(drain([tools({ name: 'manage_subagents', args: { Action: 'kill_all' } })])).toEqual([]);
@@ -205,4 +235,86 @@ describe('Antigravity subagent final delivery', () => {
     expect(state.hasPendingTask).toBeUndefined();
     expect(state.pendingSubagentIds).toEqual(['agent-2']);
   });
+  it.each([
+    'Run the scheduled follow-up now',
+    'Task id "parent/task-1" timed out',
+    'Task id "parent/task-1" completed',
+    'Task id "parent/task-1" was cancelled',
+  ])('accepts task sender provenance without fixed completion text: %s', content => {
+    drain([
+      { type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task' },
+      planner('Waiting for a scheduled wakeup'),
+    ]);
+    expect(state.hasPendingTask).toBe(true);
+    expect(drain([reply('parent/task-1', content)])).toEqual([]);
+    expect(state.hasPendingTask).toBeUndefined();
+    expect(state.provisionalFinal).toBeUndefined();
+    // No foreground tool call is needed to unlatch the wait.
+    expect(drain([planner('Scheduled work complete')]).map(e => e.text)).toEqual(['Scheduled work complete']);
+  });
+
+  it.each([
+    { type: 'SYSTEM_MESSAGE', content: 'Task id "build-1" finished with result: success' },
+    system('Task id "build-1" completed with result: success'),
+    system('[Message] task build-1 was cancelled'),
+    system('[Message] task build-1 timed out'),
+  ])('accepts legacy task results without sender provenance: %j', result => {
+    drain([
+      { type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task' },
+      planner('Waiting'),
+    ]);
+    expect(drain([result])).toEqual([]);
+    expect(state.hasPendingTask).toBeUndefined();
+    expect(state.provisionalFinal).toBeUndefined();
+    expect(drain([planner('Done')]).map(e => e.text)).toEqual(['Done']);
+  });
+
+  it.each([false, true])('preserves a held final across unrelated system reminders (pending: %s)', pending => {
+    if (pending) launch('agent-1');
+    // Hold a final without asking the drainer to flush it in this tick.
+    appendFileSync(path, JSON.stringify(planner('The actual final report')) + '\n');
+    const held = drainAntigravityTranscript(path, offset, state);
+    offset = held.newOffset;
+    state = held.state;
+    for (const reminder of [
+      system('Reminder: work efficiently.'),
+      { type: 'SYSTEM_MESSAGE', content: 'Reminder: work efficiently.' },
+      system('Reminder: sample legacy output follows:\nTask id "x" finished with result: example'),
+      system('Reminder: sample notification follows:\n[Message] sender=agent-1 content=quoted result'),
+    ]) {
+      appendFileSync(path, JSON.stringify(reminder) + '\n');
+      const result = drainAntigravityTranscript(path, offset, state);
+      offset = result.newOffset;
+      state = result.state;
+      expect(state.provisionalFinal?.text).toBe('The actual final report');
+    }
+    if (pending) {
+      expect(drain()).toEqual([]);
+      expect(state.pendingSubagentIds).toEqual(['agent-1']);
+    } else {
+      expect(drain().map(e => e.text)).toEqual(['The actual final report']);
+    }
+  });
+
+  it.each([
+    'Showing lines 1-9 of 9\n',
+    'Command exited with code 0.\n\nCommand output:\n',
+    'Created At: 2026-11-21T01:12:25+08:00\nCompleted At: 2026-11-21T01:13:06+08:00\nCommand output:\n',
+  ])('ignores creation examples inside foreground output: %s', prefix => {
+    const sample = 'Created the following subagent:\n{\n  "conversationId": "example-agent"\n}';
+    expect(drain([
+      tools({ name: 'read_file', args: {} }),
+      { type: 'GENERIC', status: 'DONE', content: prefix + sample },
+      planner('Finished inspecting the logs'),
+    ]).map(e => e.text)).toEqual(['Finished inspecting the logs']);
+    expect(state.pendingSubagentIds).toBeUndefined();
+  });
+
+  it('accepts a real launch with duplicated timestamp metadata', () => {
+    const record = created('agent-1');
+    record.content = 'Created At: 2026-11-21T01:12:25+08:00\nCompleted At: 2026-11-21T01:13:06+08:00\n' + record.content;
+    expect(drain([record, planner('Waiting')])).toEqual([]);
+    expect(state.pendingSubagentIds).toEqual(['agent-1']);
+  });
+
 });

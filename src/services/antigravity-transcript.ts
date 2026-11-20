@@ -291,8 +291,10 @@ export interface AntigravityTranscriptState {
   /** Legacy command wait, separate from subagent waits: foreground work can
    *  clear this even when an agy build omitted the command callback. */
   hasPendingTask?: boolean;
-  /** Launched subagents whose replies have not arrived, deduplicated by id.
-   *  An array keeps carried worker state serializable. */
+  /** Launched subagents whose first notifications have not arrived,
+   *  deduplicated by id. A notification can request guidance rather than
+   *  finish the work; send_message does not re-arm this wait because it does
+   *  not promise a reply. An array keeps carried worker state serializable. */
   pendingSubagentIds?: string[];
 }
 
@@ -357,14 +359,29 @@ function subagentState(ids: readonly string[] | undefined): AntigravityTranscrip
 
 /** Match the tool's result header, not arbitrary conversationIds in output. */
 function createdSubagentIds(content: string): string[] {
-  return [...content.matchAll(/(?:^|\n)Created the following subagent:\s*\{\s*"conversationId"\s*:\s*"([A-Za-z0-9._-]+)"/g)]
-    .map(match => match[1]);
+  // A launch has only timestamp metadata before this header. read_file and
+  // run_command output can quote the same text later in their result bodies.
+  const match = content.match(/^(?:(?:Created|Completed) At: [^\r\n]+\r?\n)*Created the following subagent:\s*\{\s*"conversationId"\s*:\s*"([A-Za-z0-9._-]+)"/);
+  return match ? [match[1]] : [];
 }
 
 /** Only the notification header supplies provenance; a report body may quote
  *  other agents' sender= strings. */
 function systemMessageHeader(content: string): string {
-  return content.match(/(?:^|\n)\[Message\] ([^\n]*)/)?.[1] ?? '';
+  return systemMessagePayload(content).match(/^\[Message\] ([^\n]*)/)?.[1] ?? '';
+}
+
+/** Strip only agy's system envelope, so legacy unheaded task results can be
+ *  matched at the start of the payload rather than anywhere in a reminder. */
+function systemMessagePayload(content: string): string {
+  return content.match(/(?:^|\n)<SYSTEM_MESSAGE>\r?\n([\s\S]*?)(?:\r?\n<\/SYSTEM_MESSAGE>|$)/)?.[1] ?? content;
+}
+
+/** Compact transcripts JSON-encode each args field separately; full logs and
+ *  function-call encodings can already carry native values. Decode one layer. */
+function decodeArgumentValue(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return value; }
 }
 
 /** An explicit kill abandons the requested waits. list/send_message/ordinary
@@ -376,10 +393,12 @@ function abandonSubagentWaits(state: AntigravityTranscriptState, toolCalls: any[
     if (typeof args === 'string') {
       try { args = JSON.parse(args); } catch { continue; }
     }
-    if (args?.Action !== 'kill_all' && !(args?.Action === 'kill' && Array.isArray(args.ConversationIds))) continue;
-    const ids = args.Action === 'kill_all'
+    const action = decodeArgumentValue(args?.Action);
+    const conversationIds = decodeArgumentValue(args?.ConversationIds);
+    if (action !== 'kill_all' && !(action === 'kill' && Array.isArray(conversationIds))) continue;
+    const ids = action === 'kill_all'
       ? undefined
-      : state.pendingSubagentIds?.filter(id => !args.ConversationIds.includes(id));
+      : state.pendingSubagentIds?.filter(id => !(conversationIds as unknown[]).includes(id));
     // Cancel the old "waiting" narration as well: otherwise kill_all could
     // immediately flush that stale candidate before the kill's result lands.
     const { provisionalFinal: _final, pendingSubagentIds: _ids, ...rest } = state;
@@ -486,16 +505,26 @@ function foldRecord(
   }
 
   if (type === 'SYSTEM_MESSAGE') {
-    const header = systemMessageHeader(typeof obj.content === 'string' ? obj.content : '');
+    const content = typeof obj.content === 'string' ? obj.content : '';
+    const header = systemMessageHeader(content);
     const sender = header.match(/(?:^|\s)sender=([A-Za-z0-9._/-]+)(?:\s|$)/)?.[1];
+    // Sender provenance is sufficient for command/timer wakeups: schedule
+    // delivers arbitrary user-defined prompts, not a fixed completion phrase.
+    const taskSender = sender !== undefined && /\/task-[A-Za-z0-9._-]+$/.test(sender);
+    const payload = header
+      ? (header.match(/(?:^|\s)content=(.*)/)?.[1] ?? header)
+      : systemMessagePayload(content);
+    // Older builds omit sender and sometimes [Message] itself. Match only a
+    // task result at the payload's start, never a quoted result in a reminder
+    // or a subagent's report body.
+    const legacyTaskResult = !sender
+      && /^[Tt]ask(?: id)?\s+[^\n]*? (?:finished|completed|was cancel(?:l)?ed|failed|timed out)\b/.test(payload);
+    // Pure system notices do not wake the planner with a result and may land
+    // after its real final. Preserve both pending work and the held candidate.
+    if (!header && !legacyTaskResult) return state;
     const ids = state.pendingSubagentIds?.filter(id => id !== sender);
-    // A task completion/cancellation, not a reminder or a subagent report,
-    // proves the command wait ended. Older logs omit timestamp/sender fields.
-    const commandSender = !sender || /\/task-[A-Za-z0-9._-]+$/.test(sender);
-    const commandCompleted = commandSender
-      && /(?:^|\scontent=)[Tt]ask(?: id)?\s+[^\n]*? (?:finished|was canceled|failed)\b/.test(header);
     return {
-      ...(!commandCompleted && state.hasPendingTask ? { hasPendingTask: true } : {}),
+      ...(!taskSender && !legacyTaskResult && state.hasPendingTask ? { hasPendingTask: true } : {}),
       ...subagentState(ids),
     };
   }
