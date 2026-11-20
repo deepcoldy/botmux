@@ -209,8 +209,8 @@ describe('daemon quota fallback handoff', () => {
     const expiry = 6 * 60_000;
     const first = { ...limit('usage'), retryAtMs: Date.now() + expiry, relativeResetKey: `usage:${expiry}:first`,
       source: 'antigravity-error-composer' as const };
-    const emitFrame = async (type: 'screen_update' | 'screenshot_uploaded', usageLimit: CliUsageLimitState) => {
-      const content = type === 'screen_update' ? { content: 'native quota' } : { imageKey: 'img_quota' };
+    const emitFrame = async (type: 'screen_update' | 'screenshot_uploaded', usageLimit: CliUsageLimitState, captureRevision?: number) => {
+      const content = type === 'screen_update' ? { content: 'native quota' } : { imageKey: 'img_quota', captureRevision };
       for (const listener of worker.listeners('message')) {
         await listener({ type, status: 'limited', usageLimit, turnId: TURN, ...content });
       }
@@ -221,6 +221,9 @@ describe('daemon quota fallback handoff', () => {
 
     await vi.advanceTimersByTimeAsync(expiry);
     const second = { ...first, retryLabel: '1h', retryAtMs: Date.now() + 3_600_000, relativeResetKey: 'usage:3600000:second' };
+    await emitFrame('screenshot_uploaded', second, 1);
+    expect(ds.usageLimit?.relativeResetKey).toBe(first.relativeResetKey);
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
     await emitFrame('screenshot_uploaded', second);
     await emitFrame('screen_update', second);
     const ownerReplies = sessionReply.mock.calls.filter(call => String(call[1]).includes('<at id=ou_owner>'));
@@ -399,17 +402,18 @@ describe('daemon quota fallback handoff', () => {
     expect(fallbackReplies(sessionReply)).toHaveLength(1);
   });
 
-  it('does not backfill a stale handoff during daemon restore silence', async () => {
+  it.each(['screen_update', 'screenshot_uploaded'] as const)('keeps %s quiet during daemon restore', async type => {
     const sessionReply = vi.fn(async () => 'om_reply');
     setup(sessionReply);
     const worker = fakeWorker();
     const ds = makeDs({ worker, workerPort: 9999, suppressRecoveryCard: true });
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    worker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit(), turnId: TURN });
+    const evidence = type === 'screen_update' ? { content: '429' } : { imageKey: 'img_quota' };
+    worker.emit('message', { type, ...evidence, status: 'limited', usageLimit: limit(), turnId: TURN });
     await flush();
 
-    expect(fallbackReplies(sessionReply)).toHaveLength(0);
+    expect(sessionReply).not.toHaveBeenCalled();
     expect(mocks.resolveCurrent).not.toHaveBeenCalled();
   });
 });

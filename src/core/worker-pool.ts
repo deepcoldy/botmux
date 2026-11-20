@@ -20428,7 +20428,7 @@ function setupWorkerHandlers(
   const loc = botLocale(botCfg);
   /** 文本帧和截图帧共享限额切换边沿，各自在通过来源和静默检查后调用 */
   const notifyUsageLimitEdge = (
-    previousStatus: ScreenStatus | undefined,
+    previousStatus: DaemonSession['lastScreenStatus'],
     previousLimit: CliUsageLimitState | undefined,
     turnId?: string,
   ): void => {

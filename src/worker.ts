@@ -9370,7 +9370,7 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
 });
 
 let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
-const unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
+let unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
 
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
@@ -9410,7 +9410,8 @@ function classifyUsageLimitWithNativeEvidence(
 
       const confirmed = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === key);
       const now = Date.now();
-      if (confirmed && now >= confirmed.retryAtMs) return undefined;
+      // 只有当前画面确认了原生拒绝，才把已到期的同一条横幅视为残留。
+      if (observed.source === 'antigravity-error-composer' && confirmed && now >= confirmed.retryAtMs) return undefined;
       const previous = confirmed ?? unconfirmedAntigravityQuotas.get(key);
       return reconcileUsageLimitState(previous, observed, now);
     });
@@ -38044,7 +38045,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       }
       lastInitConfig = msg;
       antigravityQuotaHistory = msg.antigravityQuotaHistory;
-      unconfirmedAntigravityQuotas.clear();
+      unconfirmedAntigravityQuotas = new Map();
       const restoredQuota = msg.antigravityActiveQuota;
       const restoredKey = restoredQuota?.relativeResetKey;
       if (restoredQuota?.kind === 'usage' && !restoredQuota.source && restoredKey && !restoredKey.endsWith(':')) {

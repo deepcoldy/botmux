@@ -81,7 +81,8 @@ describe('raw ANSI tmux quota classification', () => {
 
   it('uses the first published deadline when a partial refusal gains its native composer', () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
-    let screen = '⚠ Individual quota reached. Resets in 1m.\nError ID: partial-first';
+    const partialScreen = '⚠ Individual quota reached. Resets in 1m.\nError ID: partial-first';
+    let screen = partialScreen;
     const { classify } = classifier(() => screen);
     const partial = classify('', 'idle').usageLimit;
     expect(partial?.source).toBeUndefined();
@@ -94,6 +95,18 @@ describe('raw ANSI tmux quota classification', () => {
 
     vi.advanceTimersByTime(50_000);
     expect(classify('', 'idle')).toEqual({ status: 'idle' });
+
+    screen = partialScreen;
+    expect(classify('', 'idle').status).toBe('limited');
+  });
+
+  it('keeps reporting a partial refusal until its native composer is confirmed', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    const screen = '⚠ Individual quota reached. Resets in 1m.\nError ID: unconfirmed';
+    const { classify } = classifier(() => screen);
+    const partial = classify('', 'idle').usageLimit;
+    vi.advanceTimersByTime(60_000);
+    expect(classify('', 'idle')).toMatchObject({ status: 'limited', usageLimit: { retryAtMs: partial.retryAtMs } });
   });
 
   it('suppresses an expired refusal revealed by a redraw after a newer refusal', () => {

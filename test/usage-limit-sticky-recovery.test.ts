@@ -271,7 +271,10 @@ describe('usage-limit sticky state self-heal', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     const second = await emitQuota(newBanner);
     await vi.advanceTimersByTimeAsync(1_000);
+    const write = vi.fn();
+    sessionStore.__testOnly_setBeforeRowPersist(write);
     await emitQuota(newBanner);
+    expect(write).not.toHaveBeenCalled();
     await dispatch(worker, { type: 'screen_update', content: oldBanner, status: 'idle' });
     expect(ds.usageLimit?.relativeResetKey).toBe(second.relativeResetKey);
 
