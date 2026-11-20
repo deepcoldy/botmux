@@ -141,10 +141,22 @@ export function materializeRelayedAttachments(
       const safe = basename(String(match.att.name ?? '')).replace(/^\.+/, '').slice(0, 200) || 'attachment';
       const path = join(dir, `${match.index}-${safe}`);
       const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
-      try { writeSync(fd, Buffer.from(match.att.dataBase64, 'base64')); } finally { closeSync(fd); }
+      try { writeAllSync(fd, Buffer.from(match.att.dataBase64, 'base64')); } finally { closeSync(fd); }
       item.path = path;
       rewritten = true;
     }
   }
   return rewritten ? `${JSON.stringify(root, null, 2)}\n` : stdout;
+}
+
+/** Write the whole buffer, retrying partial writes. A short/zero-byte write to
+ *  the O_EXCL staging file must surface as an error instead of silently leaving
+ *  a truncated attachment that the consumer would treat as complete. */
+function writeAllSync(fd: number, body: Buffer): void {
+  let offset = 0;
+  while (offset < body.length) {
+    const written = writeSync(fd, body, offset, body.length - offset, offset);
+    if (written <= 0) throw new Error('Zero-byte write while materializing relayed attachment');
+    offset += written;
+  }
 }
