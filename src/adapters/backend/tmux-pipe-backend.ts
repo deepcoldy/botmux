@@ -52,6 +52,8 @@ import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
 import { readUnreapedPaneExit, type UnreapedPaneExit } from './unreaped-pane-exit.js';
 import { pipePaneShellCommand } from './tmux-pipe-relay.js';
 import { createTmuxBootGate } from './tmux-anti-fork.js';
+import { parseCapturedScreenRows } from '../../utils/captured-screen-rows.js';
+import type { ScreenRow } from '../../utils/terminal-cells.js';
 
 function shellescape(s: string): string {
   // Single-quote-escape, replacing internal ' with '\''
@@ -2755,6 +2757,32 @@ export class TmuxPipeBackend implements SessionBackend {
       );
       return { viewport, cursor };
     } catch {
+      return null;
+    }
+  }
+
+  /** The pane's viewport as cells, read now (see SessionBackend). One
+   * synchronous `capture-pane -e -p`: tmux's own grid at the pane's real size,
+   * so a web terminal that resized the pane cannot skew it. Never the pipe
+   * renderer: tmux can repaint before the worker has consumed the matching
+   * FIFO bytes. */
+  captureViewportCells(): ScreenRow[] | null {
+    if (this.exited) return null;
+    try {
+      const raw = execFileSync(
+        'tmux', [...this.tmuxArgs, 'capture-pane', '-e', '-p', '-t', this.paneTarget],
+        {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 2000,
+          maxBuffer: 16 * 1024 * 1024,
+          env: tmuxEnv(),
+        },
+      );
+      const rows = parseCapturedScreenRows(raw);
+      return rows.length > 0 ? rows : null;
+    } catch (err) {
+      this.noteCaptureError(err);
       return null;
     }
   }

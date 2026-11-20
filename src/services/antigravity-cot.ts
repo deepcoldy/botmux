@@ -21,7 +21,7 @@ import { closeSync, constants, existsSync, fstatSync, openSync, statSync, watch,
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { scanJsonlBackwardFd, scanJsonlFromFd, scanJsonlFromOffset } from './jsonl-cursor.js';
-import { antigravityRuntimeSignature, readLatestAntigravityRuntime } from './antigravity-usage.js';
+import { antigravityRuntimeSignature, readLatestAntigravityRuntimeObservation } from './antigravity-usage.js';
 import {
   antigravityFullSiblingPath,
   mapAntigravityCompactOffsetToFull,
@@ -164,8 +164,13 @@ interface ReaderState {
    *  has observed. */
   turnInput?: AntigravityCotTurnInput;
   onEntries: AntigravityCotEntriesHandler;
-  onRuntime?: (runtime: { model: string }) => void;
+  onRuntime?: (runtime: { model: string }, info?: { seeded?: boolean }) => void;
   runtimeSignature?: string;
+  /** Latest gen_metadata row observed by this reader. A DB/WAL write without a
+   * newer row is not evidence that the historical model became live. */
+  runtimeLatestRowIdx?: number;
+  /** Baseline readers wait for a newer metadata row before clearing seeded. */
+  runtimeAwaitingLiveEvidence: boolean;
 }
 
 const readers = new Map<string, ReaderState>();
@@ -230,9 +235,18 @@ function readNewTranscriptLines(state: ReaderState): void {
       const opts = { conversationsDir: join(dirname(state.brainDir), 'conversations') };
       const signature = antigravityRuntimeSignature(state.cliSessionId, opts);
       if (!signature || signature !== state.runtimeSignature) {
-        const runtime = readLatestAntigravityRuntime(state.cliSessionId, opts);
+        const runtime = readLatestAntigravityRuntimeObservation(state.cliSessionId, opts);
         if (runtime.model) {
-          state.onRuntime({ model: runtime.model });
+          const hasNewEvidence = runtime.latestRowIdx !== undefined
+            && state.runtimeLatestRowIdx !== undefined
+            && runtime.latestRowIdx > state.runtimeLatestRowIdx;
+          const seeded = state.runtimeAwaitingLiveEvidence && !hasNewEvidence;
+          // Keep the pre-seed callback shape for live observations; only the
+          // historical baseline carries the optional marker.
+          if (seeded) state.onRuntime({ model: runtime.model }, { seeded: true });
+          else state.onRuntime({ model: runtime.model });
+          if (!seeded) state.runtimeAwaitingLiveEvidence = false;
+          if (runtime.latestRowIdx !== undefined) state.runtimeLatestRowIdx = runtime.latestRowIdx;
           // Failed/unknown reads and failed delivery stay retryable without a
           // file change. Unchanged successful snapshots need no SQLite open.
           state.runtimeSignature = signature;
@@ -288,7 +302,7 @@ export interface StartAntigravityCotOptions {
   mode?: 'baseline-existing' | 'fresh';
   pollIntervalMs?: number;
   /** Observed native model, independent of the thinking-display switch. */
-  onRuntime?: (runtime: { model: string }) => void;
+  onRuntime?: (runtime: { model: string }, info?: { seeded?: boolean }) => void;
 }
 
 /** Pending tools reset at USER_INPUT. Locate that boundary backwards, then
@@ -378,6 +392,7 @@ export function startAntigravityCot(
     pendingTools,
     onEntries,
     onRuntime: opts?.onRuntime,
+    runtimeAwaitingLiveEvidence: opts?.mode !== 'fresh',
   };
 
   readers.set(cliSessionId, state);

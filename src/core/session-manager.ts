@@ -6041,9 +6041,12 @@ export interface SpawnDashboardSessionArgs {
   title?: string;
   /** 是否在群里发一条可见的任务横幅（只由 creator/lead 那一次 spawn 发，避免 N 个 bot 重复刷屏）。 */
   postBanner?: boolean;
-  /** 会话归属人 open_id（本 bot 作用域）；缺省回退本 bot 首个 allowedUser。 */
-  ownerOpenId?: string;
+  /** 会话归属人 open_id（本 bot 作用域）；缺省回退本 bot 首个 allowedUser。
+   *  显式 null = foreign-bot 发起的无 owner 会话，不回退配置用户。 */
+  ownerOpenId?: string | null;
   ownerUnionId?: string;
+  /** 原始发起者；foreign-bot 无 owner 时仍保留给 report / 审计。 */
+  creatorOpenId?: string;
 }
 
 /** 在新建的飞书群里为某个 bot 拉起一条 chat-scope 会话（dashboard「创建会话」用）。
@@ -6133,9 +6136,11 @@ export async function spawnDashboardSession(
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = 'chat';
-    session.ownerOpenId = args.ownerOpenId ?? getOwnerOpenId(larkAppId);
-    session.creatorOpenId = session.ownerOpenId;
-    if (args.ownerUnionId) session.ownerUnionId = args.ownerUnionId;
+    session.ownerOpenId = args.ownerOpenId === null
+      ? undefined
+      : (args.ownerOpenId ?? getOwnerOpenId(larkAppId));
+    session.creatorOpenId = args.creatorOpenId ?? session.ownerOpenId;
+    if (session.ownerOpenId && args.ownerUnionId) session.ownerUnionId = args.ownerUnionId;
     session.lastMessageAt = new Date(now).toISOString();
     if (args.attachments?.length) session.dashboardAttachments = args.attachments;
     if (column === 'backlog') {
@@ -6370,10 +6375,9 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     sessionStore.updateSession(ds.session);
     return { ok: true };
   }
-  // Repo selection / auto-worktree already owns this activation attempt. Keep
-  // the durable queued payload as its crash-recovery journal and make repeated
-  // dashboard starts idempotent instead of posting a second picker/build.
-  if (ds.pendingRepo) return { ok: true };
+  // Repo selection / auto-worktree or another ingress already owns this
+  // activation attempt. Keep the durable queued payload as its crash journal.
+  if (ds.pendingRepo || ds.initialStartPending) return { ok: true };
   const activate = async (): Promise<{ ok: boolean; error?: string }> => {
     if (!ds.session.queued) {
       return (ds.worker && !ds.worker.killed) ? { ok: true } : { ok: false, error: 'not_queued' };
@@ -6440,6 +6444,9 @@ export async function activateQueuedSession(ds: DaemonSession): Promise<{ ok: bo
     if (registry.get(key) !== ds || ds.session.status !== 'active') {
       return { ok: false, error: 'session_not_active' };
     }
+    // The first check ran before lock acquisition. A normal inbound activation
+    // may have installed its opening reservation while this caller waited.
+    if (ds.pendingRepo || ds.initialStartPending) return { ok: true };
     return activate();
   });
 }

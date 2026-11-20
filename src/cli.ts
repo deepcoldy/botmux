@@ -3931,12 +3931,33 @@ async function cmdStatus(): Promise<void> {
   }
   const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
   if (restartHint) console.log(restartHint);
+  await printTmuxStatusAdvice();
   if (sandbox.inSandbox) console.log(SANDBOX_STATUS_NOTE);
   warnIfLegacyBotmuxAlive();
   // The pm2 read-only projection print is gone: the fleet-state table above IS
   // the authoritative status now (supervisor-owned), so there is no second
   // registry to reconcile against. Legacy pm2 still gets surfaced by
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
+}
+
+/** tmux below the recommended version, or upgraded but the botmux server
+ *  still on the old one. Advisory only; read-only probes (never boots a server). */
+async function printTmuxStatusAdvice(): Promise<void> {
+  try {
+    // Not loadBotsJson(): that exits the process on a malformed file, and an
+    // advisory line must never turn `status` into a failure.
+    let bots: any[] = [];
+    try { bots = existsSync(BOTS_JSON_FILE) ? parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE) : []; }
+    catch { return; }
+    if (!bots.some(b => (b?.backendType ?? config.daemon.backendType) === 'tmux')) return;
+    const [{ probeTmuxFacts, formatTmuxStatusAdvice }, { preferredManagedTmuxSocket }, { getDefaultLocale }] = await Promise.all([
+      import('./core/tmux-upgrade.js'),
+      import('./adapters/backend/tmux-socket.js'),
+      import('./i18n/index.js'),
+    ]);
+    const advice = formatTmuxStatusAdvice(await probeTmuxFacts(preferredManagedTmuxSocket()), getDefaultLocale());
+    if (advice) console.log(advice);
+  } catch { /* advisory */ }
 }
 
 function printUpgradeHelp(): void {
@@ -7346,12 +7367,23 @@ async function readCardUsageSnapshotForSend(
       // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
       pricing: larkAppId ? resolvePricingForCli(larkAppId) : undefined,
     });
-    // Claude statusline 配额段（与 daemon 侧 getDaemonSessionUsageSnapshot 同口径）：
+    // Claude / Antigravity statusline 配额段（与 daemon 侧 getDaemonSessionUsageSnapshot 同口径）：
     // 本地直接读 <DATA_DIR>/statusline/<sid>/latest.json；沙盒内该目录对本会话可读写。
-    // 非空才带 key；读取失败不影响 transcript 用量。
+    // 严格按 CLI 门控（仅 claude-code / antigravity；unknown 失败闭合），并校验启动代际与模型兼容。
     try {
-      const quota = toCardQuota(readStatuslineSnapshot(resolveDataDir(), session.sessionId));
-      if (quota) return { ...configuredRuntime, ...snapshot, quota };
+      let botCliId: CliId | undefined;
+      try { botCliId = larkAppId ? getBot(larkAppId).config.cliId : undefined; } catch { /* sandbox / unknown bot */ }
+      const resolvedCliId = (session.cliId ?? session.adoptedFrom?.cliId ?? botCliId ?? 'unknown') as CliId | 'unknown';
+      if (resolvedCliId === 'claude-code' || resolvedCliId === 'antigravity') {
+        const launchGen = process.env.BOTMUX_STATUSLINE_GEN?.trim() || undefined;
+        const snap = readStatuslineSnapshot(resolveDataDir(), session.sessionId, { launchGen });
+        const observedModel = snapshot.tokens?.model?.trim();
+        const expectedModel = observedModel || configuredRuntime.model || session.model;
+        if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
+          const quota = toCardQuota(snap);
+          if (quota) return { ...configuredRuntime, ...snapshot, quota };
+        }
+      }
     } catch { /* best-effort */ }
     return { ...configuredRuntime, ...snapshot };
   } catch {
@@ -10327,7 +10359,7 @@ import { applyCompanionStartupOptions } from './cli/companion-startup-options.js
 import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import { normalizeCardUsageSnapshot } from './cli/card-usage-normalize.js';
-import { readStatuslineSnapshot, toCardQuota } from './services/statusline-snapshot.js';
+import { isStatuslineModelCompatible, readStatuslineSnapshot, toCardQuota } from './services/statusline-snapshot.js';
 import {
   resolveQuoteTarget,
   shouldSuppressImplicitReplyTarget,

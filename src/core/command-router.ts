@@ -40,7 +40,13 @@ export interface SlashCommandInvocation {
  *  are intentionally left for the CLI instead of being intercepted by the
  *  daemon; otherwise discussion text such as `/adopt <pane>` can accidentally
  *  trigger real daemon actions. */
-export function parseSlashCommandInvocation(content: string, cliId?: string): SlashCommandInvocation | null {
+export function parseSlashCommandInvocation(
+  content: string,
+  cliId?: string,
+  /** Commands that accept a multi-line body for this message only (see
+   *  `SlashRouteInput.multilineCommands`); on top of MULTILINE_COMMANDS. */
+  multilineCommands?: ReadonlySet<string>,
+): SlashCommandInvocation | null {
   // trim BOTH ends: a trailing newline/space rides into the returned `content`
   // and, for a passthrough command relayed verbatim to the CLI (raw_input), gets
   // typed as a literal trailing newline — which breaks the CLI's slash-command
@@ -68,7 +74,7 @@ export function parseSlashCommandInvocation(content: string, cliId?: string): Sl
   if (restNonBlank.length > 0) {
     // A list of slash commands is almost certainly discussion / planning text.
     if (!literalBody && restNonBlank.some(l => l.startsWith('/'))) return null;
-    if (!MULTILINE_COMMANDS.has(cmd) && !cliPayload) return null;
+    if (!MULTILINE_COMMANDS.has(cmd) && !multilineCommands?.has(cmd) && !cliPayload) return null;
   }
 
   return { cmd, content: trimmed };
@@ -116,6 +122,10 @@ export interface SlashRouteInput {
   /** 当前 bot 有效插件声明的飞书指令：指令名 → pluginId（两个插件同名时为 null，执行段 fail closed）。
    *  缺省 = 无插件指令，判定与改造前逐字一致。 */
   pluginCommands?: ReadonlyMap<string, string | null>;
+  /** 本条消息额外接受多行正文的命令（按 bot 配置 + 本条正文由入口算好）。今天只有
+   *  `/g` 带任务开工时（首行 `--start`，或 `groupCreation.autoStart: true` 且无
+   *  `--no-start`）才放进来；缺省 = 判定与改造前逐字一致。 */
+  multilineCommands?: ReadonlySet<string>;
 }
 
 /** runtime 级联的一项：透传命令行，或最后的正文。 */
@@ -190,7 +200,7 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   }
 
   // ② parse：不以 `/` 开头是"没有命令"；占位符/多行是"讨论文本"。
-  const invocation = parseSlashCommandInvocation(input.text, input.cliId);
+  const invocation = parseSlashCommandInvocation(input.text, input.cliId, input.multilineCommands);
   if (!invocation) {
     if (!input.text.trim().startsWith('/')) return { kind: 'forward', reason: 'no_slash' };
     // 多行被今天的解析器判成"讨论文本"的，只在「thread + 活 worker + 无附件」下再试一次

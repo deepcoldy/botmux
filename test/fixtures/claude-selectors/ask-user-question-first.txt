@@ -1,0 +1,12 @@
+
+Which colour do you prefer for the probe?
+
+❯ 1. Red
+     the red one
+  2. Blue
+     the blue one
+  3. Type something.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
