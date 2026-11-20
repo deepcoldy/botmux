@@ -122,6 +122,7 @@ import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-res
 import { countHostOverload } from './im/lark/card-handler.js';
 import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
+import { createBotmuxUpdateNotifier, buildBotmuxUpdateNoticeCard } from './core/botmux-update-notify.js';
 import {
   selectCodexRuntimeUpdateTargets,
   startCliRuntimeUpdateMonitor,
@@ -37182,8 +37183,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // it must NOT own host-wide fleet maintenance — auto-update could rewrite the
   // global botmux install and a detached `botmux restart` would tear down the
   // real fleet. Core-only manages only its own single process.
+  const botmuxUpdateNotifier = createBotmuxUpdateNotifier({
+    dataDir: config.session.dataDir,
+    larkAppId: cfg.larkAppId,
+    enabled: () => readGlobalConfig().maintenance?.notifyOnNewVersion === true,
+    ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+    send: async (notice, beforeWrite) => {
+      const card = buildBotmuxUpdateNoticeCard(notice, {
+        dashboardUrl: dashboardUrlForReport().url,
+        locale: localeForBot(cfg.larkAppId),
+      });
+      await sendUserMessage(cfg.larkAppId, notice.ownerOpenId, card, 'interactive', notice.uuid,
+        { timeoutMs: 15_000 }, { beforeWrite });
+    },
+    log: message => logger.info(`[botmux-update] ${message}`),
+  });
   if (idx === 0 && !coreOnly) {
     startMaintenance();
+    botmuxUpdateNotifier.start();
     startCliRuntimeUpdateMonitor({
       dataDir: config.session.dataDir,
       primaryLarkAppId: cfg.larkAppId,
@@ -37549,6 +37566,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     await (await import('./services/constrained-invocation/daemon.js')).closeConstrainedInvocations();
     await waitAllWithin([stopInputCaptureRuntimes()], shutdownDeadlineMs);
     stopMaintenance();
+    botmuxUpdateNotifier.stop();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
     for (const timer of vcMeetingReceiverRecoveryTimers.values()) clearTimeout(timer);
