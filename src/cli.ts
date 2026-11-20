@@ -419,7 +419,7 @@ import {
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import { recordBridgeReplyMarker } from './services/bridge-reply-marker.js';
-import { effectiveCrossChatFollowThreadMode, replayOrThrowThenPersistOff, ensureCrossChatFollowThreadAtBinding } from './services/cross-chat-follow-thread-store.js';
+import { effectiveCrossChatFollowThreadMode, ensureCrossChatFollowThreadAtBinding, persistCrossChatFollowThreadOffBeforeProvider } from './services/cross-chat-follow-thread-store.js';
 import { recordSessionTurnReply } from './services/session-turns.js';
 import {
   commitRestartIntentAttemptTo,
@@ -13168,25 +13168,34 @@ async function cmdSend(
       effectiveResponseKind = 'final';
     }
   }
+  const persistOffBeforeProvider = (): void => {
+    if (effectiveFollowThreadMode !== 'off' || !sendInto) return;
+    persistCrossChatFollowThreadOffBeforeProvider({
+      dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, targetChatId: followThreadTargetChatId,
+      targetRootMessageId: sendInto, followThreadEpoch: (originSession ?? s).followThreadEpoch,
+    });
+  };
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
   ): Promise<{ messageId: string; replayed: boolean }> => {
     return turnSendKey
       ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
+          beforeDispatch: persistOffBeforeProvider,
           ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
             !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
         })
-      : { messageId: await dispatch(), replayed: false };
+      : (async () => {
+          // No-turn sends have no ledger to validate, but the same pre-provider
+          // off contract still applies: a failed tombstone aborts before Lark.
+          persistOffBeforeProvider();
+          return { messageId: await dispatch(), replayed: false };
+        })();
   };
   let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
   try {
     existingTurnPrimary = turnSendKey
-      ? await replayOrThrowThenPersistOff(turnSendLedger, turnSendKey, effectiveResponseKind, turnRequestIdentity,
-        effectiveFollowThreadMode === 'off' && sendInto ? {
-          dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, targetChatId: followThreadTargetChatId,
-          targetRootMessageId: sendInto, followThreadEpoch: (originSession ?? s).followThreadEpoch,
-        } : undefined)
+      ? await turnSendLedger.replayOrThrow(turnSendKey, effectiveResponseKind, turnRequestIdentity)
       : undefined;
   } catch (error) {
     console.error(`botmux send refused: ${error instanceof Error ? error.message : String(error)}`);

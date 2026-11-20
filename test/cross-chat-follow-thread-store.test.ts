@@ -1,8 +1,10 @@
 import './helpers/require-fenced-data-dir.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { spawnNodeTsScript } from './helpers/ts-runner.js';
 
 const fsControl = vi.hoisted(() => ({ failHostAppend: false }));
 vi.mock('node:fs', async (importOriginal) => {
@@ -22,8 +24,8 @@ import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js'
 import {
   effectiveCrossChatFollowThreadMode,
   ensureCrossChatFollowThreadAtBinding,
+  persistCrossChatFollowThreadOffBeforeProvider,
   recordCrossChatFollowThreadBinding,
-  replayOrThrowThenPersistOff,
 } from '../src/services/cross-chat-follow-thread-store.js';
 import {
   __clearCrossChatFollowBindingCacheForTest,
@@ -106,12 +108,26 @@ describe('cross-chat follow store failure and replay semantics', () => {
       sentAtMs: 1000, deliveryKind: 'detoured_send', messageId: 'om_root_b',
       targetChatId: 'oc_followed', crossChatFollowThread: 'at',
     });
-    await expect(replayOrThrowThenPersistOff(ledger, key, 'final', identity(false)))
+    await expect(ledger.replayOrThrow(key, 'final', identity(false)))
       .resolves.toEqual({ messageId: 'om_root_b', replayed: true });
-    await expect(replayOrThrowThenPersistOff(ledger, key, 'final', identity(true), {
-      dataDir: tempDir, sessionId: 'sess-a', targetChatId: 'oc_followed', targetRootMessageId: 'om_root_b',
+    await expect(ledger.execute(key, 'final', identity(true), async () => 'om_other', {
+      beforeDispatch: () => persistCrossChatFollowThreadOffBeforeProvider({
+        dataDir: tempDir, sessionId: 'sess-a', targetChatId: 'oc_followed', targetRootMessageId: 'om_root_b',
+      }),
     })).rejects.toThrow('目标、提及或附件与已投递请求不同');
     expect(resolve()).not.toBeNull();
+  });
+
+  it('aborts a no-turn off send before provider when the tombstone cannot persist', async () => {
+    fsControl.failHostAppend = true;
+    const dispatch = vi.fn(async () => 'om_root_b');
+    await expect((async () => {
+      persistCrossChatFollowThreadOffBeforeProvider({
+        dataDir: tempDir, sessionId: 'sess-a', targetChatId: 'oc_followed', targetRootMessageId: 'om_root_b',
+      });
+      return dispatch();
+    })()).rejects.toThrow('无法持久化 --no-follow-thread');
+    expect(dispatch).not.toHaveBeenCalled();
   });
 
   it('backfills a missing at binding without duplicating or reviving an off root', () => {
@@ -134,5 +150,36 @@ describe('cross-chat follow store failure and replay semantics', () => {
       dataDir: tempDir, sessionId: 'sess-a', sentAtMs: 1000, messageId: 'om_root_b', targetChatId: 'oc_followed',
     })).toBe(true);
     expect(resolve()).toBeNull();
+  });
+
+  it('serializes replay at with a concurrent off writer across real processes', async () => {
+    const replayReady = join(tempDir, 'replay-ready');
+    const offReady = join(tempDir, 'off-ready');
+    const release = join(tempDir, 'release');
+    const script = fileURLToPath(new URL('./fixtures/cross-chat-replay-lock.ts', import.meta.url));
+    const cwd = fileURLToPath(new URL('..', import.meta.url));
+    recordCrossChatFollowThreadBinding(tempDir, 'sess-a', {
+      sentAtMs: 500, deliveryKind: 'detoured_send', messageId: 'om_other_root',
+      targetChatId: 'oc_followed', crossChatFollowThread: 'at',
+    });
+    const replay = spawnNodeTsScript(script, ['replay', tempDir, replayReady, release], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let off: ReturnType<typeof spawnNodeTsScript> | undefined;
+    const wait = (child: ReturnType<typeof spawnNodeTsScript>) => new Promise<void>((resolve, reject) => {
+      let stderr = '';
+      child.stderr!.on('data', chunk => { stderr += chunk; });
+      child.once('error', reject);
+      child.once('close', code => code === 0 ? resolve() : reject(new Error(`child exited ${code}: ${stderr}`)));
+    });
+    try {
+      await vi.waitFor(() => expect(existsSync(replayReady)).toBe(true), { timeout: 10_000 });
+      off = spawnNodeTsScript(script, ['off', tempDir, offReady, release], { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      await vi.waitFor(() => expect(existsSync(offReady)).toBe(true), { timeout: 10_000 });
+      writeFileSync(release, 'go');
+      await Promise.all([wait(replay), wait(off)]);
+      expect(resolve()).toBeNull();
+    } finally {
+      replay.kill('SIGKILL');
+      off?.kill('SIGKILL');
+    }
   });
 });

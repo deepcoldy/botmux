@@ -31065,6 +31065,7 @@ async function handleThreadReplyAdmitted(
     }
   }
 
+  if (!crossChatFollowUpIsCurrent(ctx)) return;
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
@@ -31241,6 +31242,7 @@ async function handleThreadReplyAdmitted(
     // synthetic opening turn from an empty pendingPrompt (a non-empty new-topic
     // envelope), which would be accepted as a fresh dispatch and overtake the
     // promoted old head — the exact defect this recovery must avoid.
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     if (ds.quarantinedActivationTailPromotion && (!ds.worker || ds.worker.killed)) {
       if (forkWorker(ds, '', true)) {
         logger.info(`[${tag(ds)}] Quarantined activation-tail promotion recovered on inbound; cold-forked promoted head`);
@@ -31966,6 +31968,7 @@ async function handleThreadReplyAdmitted(
     // covers routing/materialisation and therefore cannot protect the mutable
     // worker turn marker after this handler returns.  Persist the final payload
     // behind the active turn instead of exposing B2 to B1's worker process.
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     if (ds.session.principalLane && threadTrustedCaller
         && (ds.principalLaneRunningTurn
           || ds.activeInteractiveTurn
@@ -32219,6 +32222,7 @@ async function handleThreadReplyAdmitted(
     // Codex App may retain an ACK journal/FIFO head after its worker dies. A
     // new inbound turn wakes a pure recovery fork first; it stays in the exact
     // runtime tail until that recovered head produces its submission ACK.
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     if (ds.session.queuedActivationPending) {
       await stageCurrentBehindQueuedActivation();
       try {
@@ -32265,6 +32269,7 @@ async function handleThreadReplyAdmitted(
     const retainedQueuedActivation = ds.session.queued === true
       ? ds.session.queuedActivationInput
       : undefined;
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     if (retainedQueuedActivation) {
       await stageCurrentBehindQueuedActivation();
       try {
@@ -32452,6 +32457,7 @@ async function handleThreadReplyAdmitted(
         return;
       }
     }
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     try {
       // Adopt sessions must re-fork via forkAdoptWorker, NOT forkWorker: the
       // latter would spawn a fresh botmux-managed bmx-* CLI in the adopt cwd,

@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BridgeSendMarker } from './bridge-fallback-gate.js';
-import type { TurnSendKind, TurnSendLedger, TurnSendLedgerKey } from './turn-send-ledger.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 const DIRECTORY = '.dashboard-secret.cross-chat-follow-thread';
 
@@ -37,62 +37,52 @@ export function ensureCrossChatFollowThreadAtBinding(input: {
   followThreadEpoch?: string;
 }): boolean {
   const canonicalRoot = input.targetRootMessageId ?? input.messageId;
+  const filePath = crossChatFollowThreadPath(input.dataDir, input.sessionId);
   try {
-    const filePath = crossChatFollowThreadPath(input.dataDir, input.sessionId);
-    if (existsSync(filePath)) {
-      for (const line of readFileSync(filePath, 'utf-8').split('\n')) {
-        if (!line.trim()) continue;
-        let record: BridgeSendMarker;
-        try { record = JSON.parse(line) as BridgeSendMarker; } catch { continue; }
-        if (record.sessionId === input.sessionId
-          && record.deliveryKind === 'detoured_send'
-          && record.targetChatId === input.targetChatId
-          && record.followThreadEpoch === input.followThreadEpoch
-          && (record.messageId === canonicalRoot || record.targetRootMessageId === canonicalRoot)) {
-          return true;
+    mkdirSync(crossChatFollowThreadDir(input.dataDir), { recursive: true });
+    return withFileLockSync(filePath, () => {
+      if (existsSync(filePath)) {
+        for (const line of readFileSync(filePath, 'utf-8').split('\n')) {
+          if (!line.trim()) continue;
+          let record: BridgeSendMarker;
+          try { record = JSON.parse(line) as BridgeSendMarker; } catch { continue; }
+          if (record.sessionId === input.sessionId
+            && record.deliveryKind === 'detoured_send'
+            && record.targetChatId === input.targetChatId
+            && record.followThreadEpoch === input.followThreadEpoch
+            && (record.messageId === canonicalRoot || record.targetRootMessageId === canonicalRoot)) {
+            return true;
+          }
         }
       }
-    }
-    return recordCrossChatFollowThreadBinding(input.dataDir, input.sessionId, {
-      sentAtMs: input.sentAtMs,
-      deliveryKind: 'detoured_send',
-      messageId: input.messageId,
-      targetChatId: input.targetChatId,
-      ...(input.targetRootMessageId ? { targetRootMessageId: input.targetRootMessageId } : {}),
-      crossChatFollowThread: 'at',
-      followThreadEpoch: input.followThreadEpoch,
+      return appendCrossChatFollowThreadBindingUnlocked(input.dataDir, input.sessionId, {
+        sentAtMs: input.sentAtMs,
+        deliveryKind: 'detoured_send',
+        messageId: input.messageId,
+        targetChatId: input.targetChatId,
+        ...(input.targetRootMessageId ? { targetRootMessageId: input.targetRootMessageId } : {}),
+        crossChatFollowThread: 'at',
+        followThreadEpoch: input.followThreadEpoch,
+      });
     });
   } catch {
     return false;
   }
 }
 
-/** Replay validation is the first side-effect boundary for a changed request.
- * Only after it succeeds may an off tombstone be persisted; a conflict must
- * leave the previous at binding untouched. */
-export async function replayOrThrowThenPersistOff(
-  ledger: TurnSendLedger,
-  key: TurnSendLedgerKey,
-  kind: TurnSendKind,
-  renderedContent: string,
-  off?: {
-    dataDir: string;
-    sessionId: string;
-    targetChatId: string;
-    targetRootMessageId: string;
-    followThreadEpoch?: string;
-  },
-): Promise<{ messageId: string; replayed: boolean } | undefined> {
-  const replay = await ledger.replayOrThrow(key, kind, renderedContent);
-  if (off) {
-    const persisted = recordCrossChatFollowThreadBinding(off.dataDir, off.sessionId, {
-      sentAtMs: Date.now(), deliveryKind: 'detoured_send', targetChatId: off.targetChatId,
-      targetRootMessageId: off.targetRootMessageId, crossChatFollowThread: 'off',
-      followThreadEpoch: off.followThreadEpoch,
-    });
-    if (!persisted) throw new Error('无法持久化 --no-follow-thread，已中止发送（未向飞书投递）');
-  }
-  return replay;
+export function persistCrossChatFollowThreadOffBeforeProvider(input: {
+  dataDir: string;
+  sessionId: string;
+  targetChatId: string;
+  targetRootMessageId: string;
+  followThreadEpoch?: string;
+}): void {
+  const persisted = recordCrossChatFollowThreadBinding(input.dataDir, input.sessionId, {
+    sentAtMs: Date.now(), deliveryKind: 'detoured_send', targetChatId: input.targetChatId,
+    targetRootMessageId: input.targetRootMessageId, crossChatFollowThread: 'off',
+    followThreadEpoch: input.followThreadEpoch,
+  });
+  if (!persisted) throw new Error('无法持久化 --no-follow-thread，已中止发送（未向飞书投递）');
 }
 
 /** Persist only the routing fields, never the bridge journal's content preview.
@@ -100,6 +90,25 @@ export async function replayOrThrowThenPersistOff(
  * Post-delivery callers ignore that result so a provider success is not repeated;
  * pre-provider off tombstones must instead abort before any external effect.
  * Never fall back to the CLI-writable turn-sends journal. */
+function appendCrossChatFollowThreadBindingUnlocked(
+  dataDir: string,
+  sessionId: string,
+  marker: BridgeSendMarker,
+): boolean {
+  const record: BridgeSendMarker = {
+    sentAtMs: marker.sentAtMs,
+    sessionId,
+    deliveryKind: 'detoured_send',
+    ...(marker.messageId ? { messageId: marker.messageId } : {}),
+    targetChatId: marker.targetChatId!,
+    ...(marker.targetRootMessageId ? { targetRootMessageId: marker.targetRootMessageId } : {}),
+    crossChatFollowThread: marker.crossChatFollowThread!,
+    ...(marker.followThreadEpoch ? { followThreadEpoch: marker.followThreadEpoch } : {}),
+  };
+  appendFileSync(crossChatFollowThreadPath(dataDir, sessionId), `${JSON.stringify(record)}\n`);
+  return true;
+}
+
 export function recordCrossChatFollowThreadBinding(
   dataDir: string,
   sessionId: string,
@@ -107,20 +116,10 @@ export function recordCrossChatFollowThreadBinding(
 ): boolean {
   if (marker.deliveryKind !== 'detoured_send' || !marker.crossChatFollowThread || !marker.targetChatId) return true;
   if (!marker.messageId && !marker.targetRootMessageId) return true;
-  const record: BridgeSendMarker = {
-    sentAtMs: marker.sentAtMs,
-    sessionId,
-    deliveryKind: 'detoured_send',
-    ...(marker.messageId ? { messageId: marker.messageId } : {}),
-    targetChatId: marker.targetChatId,
-    ...(marker.targetRootMessageId ? { targetRootMessageId: marker.targetRootMessageId } : {}),
-    crossChatFollowThread: marker.crossChatFollowThread,
-    ...(marker.followThreadEpoch ? { followThreadEpoch: marker.followThreadEpoch } : {}),
-  };
+  const filePath = crossChatFollowThreadPath(dataDir, sessionId);
   try {
     mkdirSync(crossChatFollowThreadDir(dataDir), { recursive: true });
-    appendFileSync(crossChatFollowThreadPath(dataDir, sessionId), `${JSON.stringify(record)}\n`);
-    return true;
+    return withFileLockSync(filePath, () => appendCrossChatFollowThreadBindingUnlocked(dataDir, sessionId, marker));
   } catch {
     // The provider effect is already complete. A missing binding only disables
     // follow-up routing; it must never turn into a user-facing send failure.
