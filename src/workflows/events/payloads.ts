@@ -127,6 +127,7 @@ export const BotSnapshotSchema = z.object({
   sandboxHidePaths: z.array(z.string()).optional(),
   sandboxReadonlyPaths: z.array(z.string()).optional(),
   sandboxNetwork: z.boolean().optional(),
+  sandboxWithholdBotSecret: z.literal(true).optional(),
   sandboxNetworkPolicy: z.unknown().transform((value, ctx) => {
     if (value === undefined) return undefined;
     try { return parseSandboxNetworkPolicy(value); } catch (error) {

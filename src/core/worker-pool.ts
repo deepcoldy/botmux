@@ -60,7 +60,7 @@ import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTrig
 import { modelPinView, retainPinEffort, samePinModel, validateModelPin, type ModelPin } from './model-pin.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
-import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, sessionCardSandboxMode, botConfigSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, sessionCardSandboxMode, botConfigSandboxMode, sandboxWithholdsBotSecret } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -18588,7 +18588,7 @@ export function resolveQuarantinedForkPlan(
  */
 export function freezeSessionSandboxDecision(
   ds: DaemonSession,
-  botCfg: Pick<BotConfig, 'sandbox' | 'readIsolation' | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork' | 'sandboxNetworkPolicy' | 'scratchStorage' | 'scratchTmpfsSizeMb' | 'scratchDenyPaths'>,
+  botCfg: Pick<BotConfig, 'sandbox' | 'readIsolation' | 'sandboxPaths' | 'sandboxHidePaths' | 'sandboxReadonlyPaths' | 'sandboxNetwork' | 'sandboxNetworkPolicy' | 'sandboxWithholdBotSecret' | 'scratchStorage' | 'scratchTmpfsSizeMb' | 'scratchDenyPaths'>,
   opts: { resume?: boolean } = {},
 ): void {
   if (ds.session.sandbox !== undefined) return;
@@ -18600,6 +18600,11 @@ export function freezeSessionSandboxDecision(
     ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
     ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
     ds.session.sandboxNetworkPolicy = botCfg.sandboxNetworkPolicy ? structuredClone(botCfg.sandboxNetworkPolicy) : undefined;
+    // Frozen with the rest of the sandbox shape: it decides whether the pane is
+    // built around the outbox relay, which a live pane cannot change.
+    // Decided against the sandbox the worker will actually build (BOTMUX_SANDBOX
+    // forcing included), not only the configured one.
+    if (sandboxWithholdsBotSecret(botCfg)) ds.session.sandboxWithholdBotSecret = true;
     if (ds.session.sandbox === 'scratch') {
       ds.session.sandboxScratch = {
         storage: normalizeScratchStorage(botCfg.scratchStorage),
@@ -20186,6 +20191,7 @@ function forkWorkerPrepared(
     sandboxReadonlyPaths: ds.session.sandboxReadonlyPaths ?? [],
     sandboxNetwork: ds.session.sandboxNetwork !== false,
     sandboxNetworkPolicy: ds.session.sandboxNetworkPolicy ? structuredClone(ds.session.sandboxNetworkPolicy) : undefined,
+    ...(ds.session.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true } : {}),
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).

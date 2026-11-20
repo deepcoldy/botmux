@@ -66,7 +66,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, rmSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -98,6 +98,8 @@ import {
   provenancePendingContent,
   provenancePendingNonce,
   sendCredFilePath,
+  sendCredUpdateLockTarget,
+  writeSendCredFile,
   botHomePath,
   shouldRedirectCliData,
   buildCliExecutableReadCarveOuts,
@@ -28924,10 +28926,12 @@ async function spawnCliBody(
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR, cfg.larkAppId);
       mkdirSync(dirname(credPath), { recursive: true });
-      writeFileSync(
+      // In place on purpose (see writeSendCredFile): a rename would defeat the
+      // running Linux mask and leave a readable temp sibling in BOT_HOME.
+      writeSendCredFile(
         credPath,
         JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
-        { mode: 0o600 },
+        sendCredUpdateLockTarget(process.env.SESSION_DATA_DIR, credPath),
       );
     } catch (e) {
       log(`[sandbox] WARN could not write send-cred file: ${(e as Error).message}`);
@@ -29959,11 +29963,21 @@ async function spawnCliBody(
       resolvedBin: canonical(cliAdapter.resolvedBin),
     }).map(canonical);
 
-    // Linux relay outbox (created by prepareDirectSandbox; in the policy so the
-    // compiled plan binds it read-write).
-    const outbox = process.platform === 'linux'
+    // Relay outbox (in the policy so the compiled plan grants it read-write).
+    // Linux: always (created by prepareDirectSandbox, bound into bwrap).
+    // macOS: only when the bot withholds its app secret from the sandbox — the
+    // Seatbelt pane then has no credential to call Lark with, so send / history /
+    // quoted go through this outbox like they do on Linux.
+    const darwinRelayOutbox = process.platform === 'darwin' && cfg.sandboxWithholdBotSecret === true;
+    const outbox = process.platform === 'linux' || darwinRelayOutbox
       ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
       : undefined;
+    // macOS has no prepareDirectSandbox: create the outbox here, before the
+    // policy drops grants for paths that do not exist. A warm reattach must
+    // reuse the pane's existing directory (checked below), never make one.
+    if (darwinRelayOutbox && outbox && !willReattachPersistent) {
+      mkdirSync(outbox, { recursive: true, mode: 0o700 });
+    }
     // Pre-create the outbox BEFORE buildFsPolicy so it survives the allow-rule
     // existence-filter below (a not-yet-existing readWrite path is dropped, and
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
@@ -30392,6 +30406,7 @@ async function spawnCliBody(
       botmuxInstallRoot,
       botmuxInstallRootMaskPaths: installRootMasks.paths,
       outbox,
+      withholdSendCredential: cfg.sandboxWithholdBotSecret === true,
       extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir]),
       userPaths,
       serviceCredentialReadOnlyPaths,
@@ -30468,9 +30483,36 @@ async function spawnCliBody(
       const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
       writeFileSync(profilePath, compileToSeatbelt(policy), { mode: 0o600 });
       seatbeltProfilePath = profilePath;
-      spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+      if (outbox) {
+        // Seatbelt has no --setenv and the tmux pane only receives allowlisted
+        // BOTMUX_* keys, so the relay location rides on the command itself.
+        spawnArgs = ['-f', profilePath, '/usr/bin/env', `BOTMUX_SEND_RELAY=${outbox}`, spawnBin, ...spawnArgs];
+      } else {
+        spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+      }
       spawnBin = 'sandbox-exec';
       log(`[file-sandbox] wrapping ${cliAdapter.id} in Seatbelt (fs-policy, ${policy.rules.length} rules): sandbox-exec -f ${profilePath}`);
+      if (outbox) {
+        // A warm reattach must re-serve the outbox the live pane already uses;
+        // if it vanished, no one would answer that pane's relay → fail closed.
+        let outboxOk = false;
+        try { const st = lstatSync(outbox); outboxOk = st.isDirectory() && !st.isSymbolicLink(); } catch { /* */ }
+        if (!outboxOk) {
+          throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: relay outbox ${outbox} is missing`);
+        }
+        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+        const sessionTree = dirname(outbox);
+        sandboxCleanup = () => { rmSync(sessionTree, { recursive: true, force: true }); };
+        sandboxRelayOutbox = outbox;
+        sandboxStopWatcher = startOutboxWatcher(
+          outbox,
+          childEnv,
+          cfg.sessionId,
+          { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
+        );
+        publishSandboxRelayCapability();
+        log(`[file-sandbox] bot secret withheld from the sandbox; send/history/quoted relay via outbox=${outbox}`);
+      }
     } else if (willReattachPersistent) {
       // Warm reattach (daemon restart / transfer) to a live bwrap'd pane:
       // backend.spawn() ignores bin/args and just re-attaches. Only re-wire the
@@ -30493,7 +30535,7 @@ async function spawnCliBody(
         att.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend, allowRouting: true },
+        { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
       );
       publishSandboxRelayCapability();
       log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
@@ -30591,7 +30633,7 @@ async function spawnCliBody(
         sbx.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend, allowRouting: true },
+        { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
       );
       publishSandboxRelayCapability();
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);

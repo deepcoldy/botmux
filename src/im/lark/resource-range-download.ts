@@ -1,5 +1,8 @@
-import { mkdtemp, open, rename, rm } from 'node:fs/promises';
+import { closeSync, constants as fsConstants, lstatSync, openSync, renameSync, unlinkSync } from 'node:fs';
+import { fdStat, fdTruncate, fdWriteAll } from './async-fd.js';
+import { randomBytes } from 'node:crypto';
 import { dirname, join } from 'node:path';
+import { assertDownloadDirUnchanged, type DownloadDirGuard } from './client.js';
 import type { Readable } from 'node:stream';
 
 export const LARK_RESOURCE_SIZE_LIMIT_CODE = 234037;
@@ -70,63 +73,82 @@ function transient(error: any): boolean {
 export async function downloadResourceWithRange(
   request: ResourceRangeRequest,
   savePath: string,
+  guard?: DownloadDirGuard,
 ): Promise<void> {
   let total = 0;
-  // A one-byte probe avoids the ordinary endpoint's whole-file size limit.
-  // Intentionally fail fast here: data retries start only after range metadata is validated.
-  let probe: ResourceStream | undefined;
+  // The destination directory may be writable by a sandbox; the caller validated
+  // it before any network wait and it must be the same directory when the file
+  // lands (identity, and containment when confined).
+  const dir = dirname(savePath);
+  const dirBefore = lstatSync(dir);
+  if (dirBefore.isSymbolicLink() || !dirBefore.isDirectory()) throw new RangeDownloadError(`Refusing to download into a non-directory: ${dir}`);
+  const expected: DownloadDirGuard = guard ?? { dev: dirBefore.dev, ino: dirBefore.ino };
+  const guardIntact = (): void => {
+    try { assertDownloadDirUnchanged(dir, expected); } catch (e) { throw new RangeDownloadError((e as Error).message); }
+  };
+  guardIntact();
+  // Open the staging file NOW, synchronously, in the directory just validated:
+  // nothing may await between the check and the open, or the directory could be
+  // swapped for a symlink meanwhile and the staging file created elsewhere.
+  // The open descriptor then keeps writing into that directory whatever the
+  // path resolves to later; the rename at the end is re-guarded.
+  // Staging name independent of the destination name (NAME_MAX).
+  const temporaryPath = join(dir, `.botmux-dl-${process.pid}-${randomBytes(4).toString('hex')}.part`);
+  const fd = openSync(temporaryPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+  let renamed = false;
   try {
-    probe = await request(0, 0);
-    total = validateRange(probe, 0, 0);
-  } finally { probe?.destroy(); }
-  if (total > MAX_BYTES) throw new RangeDownloadError('Resource exceeds the 2 GiB download limit');
-
-  const temporaryDir = await mkdtemp(join(dirname(savePath), '.botmux-download-'));
-  const temporaryPath = join(temporaryDir, 'resource.part');
-  try {
-    const file = await open(temporaryPath, 'wx', 0o600);
+    // A one-byte probe avoids the ordinary endpoint's whole-file size limit.
+    // Intentionally fail fast here: data retries start only after range metadata is validated.
+    let probe: ResourceStream | undefined;
     try {
-      for (let offset = 0; offset < total;) {
-        const end = Math.min(total - 1, offset + CHUNK_BYTES - 1);
-        const expected = end - offset + 1;
-        for (let attempt = 0;; attempt++) {
-          let response: ResourceStream | undefined;
-          try {
-            response = await request(offset, end);
-            validateRange(response, offset, end, total);
-            let received = 0;
-            for await (const chunk of response) {
-              const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-              if (received + buffer.length > expected) {
-                throw new RangeDownloadError('Resource range body exceeds the requested size');
-              }
-              try {
-                let written = 0;
-                while (written < buffer.length) {
-                  const result = await file.write(buffer, written, buffer.length - written, offset + received + written);
-                  if (!result.bytesWritten) throw new Error('Zero-byte write');
-                  written += result.bytesWritten;
-                }
-              } catch { throw new RangeDownloadError('Unable to write resource to disk'); }
-              received += buffer.length;
+      probe = await request(0, 0);
+      total = validateRange(probe, 0, 0);
+    } finally { probe?.destroy(); }
+    if (total > MAX_BYTES) throw new RangeDownloadError('Resource exceeds the 2 GiB download limit');
+
+    for (let offset = 0; offset < total;) {
+      const end = Math.min(total - 1, offset + CHUNK_BYTES - 1);
+      const want = end - offset + 1;
+      for (let attempt = 0;; attempt++) {
+        let response: ResourceStream | undefined;
+        try {
+          response = await request(offset, end);
+          validateRange(response, offset, end, total);
+          let received = 0;
+          for await (const chunk of response) {
+            const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            if (received + buffer.length > want) {
+              throw new RangeDownloadError('Resource range body exceeds the requested size');
             }
-            if (received !== expected) throw new RangeDownloadError('Resource range body length mismatch');
-            break;
-          } catch (error) {
-            response?.destroy();
-            // Defensive rollback: each retry overwrites the full range, but discard any
-            // partial tail first so the temporary file contains only completed ranges.
-            await file.truncate(offset);
-            if (attempt >= 2 || !transient(error)) throw error;
-            await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
-          } finally { response?.destroy(); }
-        }
-        offset = end + 1;
+            try {
+              await fdWriteAll(fd, buffer, offset + received);
+            } catch { throw new RangeDownloadError('Unable to write resource to disk'); }
+            received += buffer.length;
+          }
+          if (received !== want) throw new RangeDownloadError('Resource range body length mismatch');
+          break;
+        } catch (error) {
+          response?.destroy();
+          // Defensive rollback: each retry overwrites the full range, but discard any
+          // partial tail first so the temporary file contains only completed ranges.
+          await fdTruncate(fd, offset);
+          if (attempt >= 2 || !transient(error)) throw error;
+          await new Promise(resolve => setTimeout(resolve, 250 * 2 ** attempt));
+        } finally { response?.destroy(); }
       }
-      if ((await file.stat()).size !== total) throw new RangeDownloadError('Resource final size mismatch');
-    } finally { await file.close(); }
-    await rename(temporaryPath, savePath);
+      offset = end + 1;
+    }
+    if ((await fdStat(fd)).size !== total) throw new RangeDownloadError('Resource final size mismatch');
+    closeSync(fd);
+    guardIntact();
+    renameSync(temporaryPath, savePath);
+    renamed = true;
   } finally {
-    await rm(temporaryDir, { recursive: true, force: true });
+    try { closeSync(fd); } catch { /* already closed */ }
+    // Only touch the staging path while it still resolves into the validated
+    // directory; otherwise leave it (it sits in the sandbox's own directory).
+    if (!renamed) {
+      try { assertDownloadDirUnchanged(dir, expected); unlinkSync(temporaryPath); } catch { /* */ }
+    }
   }
 }
