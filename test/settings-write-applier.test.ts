@@ -1538,3 +1538,13 @@ describe('Codex idle cleanup setting', () => {
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 });
+
+
+describe('new version notification settings writes', () => {
+  it('allows reminders on source installs with automatic updates disabled', async () => {
+    const deps = makeDeps({ isLocalDevInstall: () => true, isAutoUpdateSupportedInstall: () => false });
+    const result = await applySettingsWrite({ maintenance: { notifyOnNewVersion: true } }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.mergeMaintenanceConfig).toHaveBeenCalledWith({ notifyOnNewVersion: true });
+  });
+});

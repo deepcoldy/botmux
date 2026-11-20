@@ -8,8 +8,10 @@
  * migration picker and session writer-lock page — each matched against text
  * captured from a real build.
  * Kimi Code's "cache expired" menu is a separate family (see
- * utils/kimi-cache-expiry-menu.ts): pages are classified per adapter family,
- * so a Codex-family CLI never matches the Kimi menu and vice versa.
+ * utils/kimi-cache-expiry-menu.ts), and so are Antigravity's question picker
+ * and permission dialog (utils/antigravity-blocking-page.ts): pages are
+ * classified per adapter family, so a Codex-family CLI never matches the Kimi
+ * menu and vice versa.
  * Generic [Y/n]/permission/Press-to-continue prompts are NOT handled here —
  * they require semantic parsing that cannot be safely inferred from a regex.
  * Which keys a card may send for each page lives in core/stuck-page-catalog.ts.
@@ -58,6 +60,7 @@
  *    them must carry that level's semantic rows.
  */
 import { matchKimiCacheExpiryMenu } from './kimi-cache-expiry-menu.js';
+import { matchAntigravityBlockingPage, type AntigravityBlockingPageType } from './antigravity-blocking-page.js';
 
 const VIEWPORT_LINES = 40;
 
@@ -133,9 +136,10 @@ export type HookReviewPageType = 'hook review startup' | 'hook review level 1' |
  *  Kimi puts it), or anywhere else / nowhere (`moved`) — Enter then picks a
  *  different row, so that page offers no key at all. */
 export type KimiCacheExpiryPageType = 'kimi cache expiry' | 'kimi cache expiry moved';
-export type StuckPageType = HookReviewPageType | 'cli migration menu' | 'session lock' | KimiCacheExpiryPageType;
+export type StuckPageType = HookReviewPageType | 'cli migration menu' | 'session lock' | KimiCacheExpiryPageType
+  | AntigravityBlockingPageType;
 /** CliAdapter.stuckPageFamily: which CLI's blocking pages a screen is read as. */
-export type StuckPageFamily = 'codex-family' | 'kimi';
+export type StuckPageFamily = 'codex-family' | 'kimi' | 'antigravity';
 
 export function isKimiCacheExpiryPage(pageType: string | undefined): pageType is KimiCacheExpiryPageType {
   return pageType === 'kimi cache expiry' || pageType === 'kimi cache expiry moved';
@@ -238,6 +242,8 @@ export function classifyStuckPage(snapshot: string, family: StuckPageFamily = 'c
     if (!menu) return undefined;
     return menu.highlighted === 'compact' ? 'kimi cache expiry' : 'kimi cache expiry moved';
   }
+  // agy's question picker / permission dialog (utils/antigravity-blocking-page.ts).
+  if (family === 'antigravity') return matchAntigravityBlockingPage(snapshot);
   const hookPage = matchHookReviewScreen(snapshot);
   if (hookPage) return hookPage;
   if (isStartupHookReviewScreen(snapshot)) return 'hook review startup';

@@ -26,12 +26,12 @@ import { contractTerminalStatus, executionObserverSupported } from '../../src/se
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
+import { antigravityBlockingPageTail } from '../../src/utils/antigravity-blocking-page.js';
 import { isNativeReasoningEffort } from '../../src/services/native-reasoning-observation.js';
 import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-footer.js';
 import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-observer.js';
 import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
-import { TurnRecapRecorder } from '../../src/services/turn-recap.js';
 import { isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from '../../src/core/rewind-backup-retention.js';
@@ -183,7 +183,6 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'isRemoteBackendType') return isRemoteBackendType;
     if (key === 'promptReadinessRevision') return scope.promptReadinessRevision ??= 0;
     if (key === 'traexCatalogEmptyNoticeTurns') return scope.traexCatalogEmptyNoticeTurns ??= new WeakMap();
-    if (key === 'turnRecapRecorder') return scope.turnRecapRecorder ??= new TurnRecapRecorder();
     if (key === 'busyReadyDeferral') return scope.busyReadyDeferral ??= new BusyReadyDeferralTracker();
     if (key === 'busyReadyLogThrottle') return scope.busyReadyLogThrottle ??= new BusyReadyLogThrottle();
     // Module-level keep-alive provenance state shared with the message-handler
@@ -208,6 +207,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
       return dependencies.get(key);
     }
     if (key === 'traexQuestionFlowVisible') return traexQuestionFlowVisible;
+    if (key === 'antigravityBlockingPageTail') return antigravityBlockingPageTail;
     if (key === 'traexStartupInputReady') return traexStartupInputReady;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
     if (typeof key === 'string' && ['warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {

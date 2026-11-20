@@ -654,7 +654,7 @@ export interface CliAdapter {
     /** 待写入的配置文件路径（~ 由 installer 展开）。 */
     readonly configPath: string;
     /** 写入格式：决定 installer 如何合并进既有配置。 */
-    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks';
+    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks' | 'antigravity-hooks';
     /** 可选：SessionStart「真就绪」hook 命令。
      *  - claude-settings：写进全局 settings.json（兼进程级 --settings）
      *  - grok-hooks：写进 `~/.grok/hooks/*.json` 的 SessionStart
@@ -1007,16 +1007,6 @@ export interface CliAdapter {
    *  survive). Undefined = none on screen or not recognised; adapters without
    *  it never offer a next-step suggestion. */
   readonly promptSuggestion?: (rows: readonly import('../../utils/terminal-cells.js').ScreenRow[]) => string | undefined;
-
-  /** A one-off, tool-less, small-model call with this CLI's own credentials:
-   *  the optional「本轮回顾」model recap. The prompt is written to stdin;
-   *  stdout is the CLI's JSON result (`services/turn-recap.ts`
-   *  parseRecapModelOutput). Adapters without it never make that call. */
-  readonly recapModel?: {
-    args(systemPrompt: string): string[];
-    /** Added to the session's own CLI env for that call. */
-    readonly env: Readonly<Record<string, string>>;
-  };
 
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
