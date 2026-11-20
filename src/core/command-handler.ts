@@ -156,7 +156,7 @@ import { failedTurnRewindInFlight } from './failed-turn-rewind.js';
 import { messageMentionsBot, parseApiMessage, extractResources } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
 import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
-import { requestAgentSessionRename } from './session-rename.js';
+import { requestAgentSessionRename, resolveAgentSessionAutoRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission, withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, withOpenTranscript, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
@@ -699,6 +699,12 @@ export interface CommandHandlerDeps {
   }) => Promise<boolean>;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
+  /** Type a literal CLI command into the session's live CLI as a passthrough
+   *  turn on behalf of this invocation's message — the same delivery and the
+   *  same queued-activation refusal a routed passthrough (`/clear`, `/model`)
+   *  gets. `activation_pending`: an earlier message is still being submitted. */
+  deliverCliCommand?: (ds: DaemonSession, command: string, message: LarkMessage) =>
+    'delivered' | 'activation_pending' | 'rejected';
 }
 
 // ─── Schedule command ────────────────────────────────────────────────────────
@@ -3270,7 +3276,34 @@ export async function handleCommand(
         }
         const rawTitle = message.content.replace(/^\/rename\s*/i, '').trim();
         if (!rawTitle) {
-          await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
+          // Opt-in per bot (`bareRenamePassthrough`, default off): a CLI that
+          // can name the session itself (Claude Code's bare `/rename`) gets the
+          // command verbatim; botmux's title stays as is. Off = usage reply.
+          if (getBot(ds.larkAppId).config.bareRenamePassthrough !== true) {
+            await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
+            break;
+          }
+          const auto = resolveAgentSessionAutoRename(ds);
+          const cliName = auto.cliId ? getCliDisplayName(auto.cliId) : sessionCliDisplayName(ds);
+          if (auto.status === 'available' && deps.deliverCliCommand) {
+            const delivery = deps.deliverCliCommand(ds, auto.command, message);
+            if (delivery === 'delivered') {
+              await sessionReply(rootId, t('cmd.rename.auto_requested', { cliName }, loc));
+              logger.info(`[${logTag}] Bare /rename passed to ${cliName} for native auto-naming`);
+            } else if (delivery === 'activation_pending') {
+              await sessionReply(rootId, t('daemon.cmd_activation_pending', { cmd: '/rename' }, loc));
+            } else {
+              await sessionReply(rootId, t('cmd.rename.auto_failed', { cliName }, loc));
+              logger.warn(`[${logTag}] Bare /rename was not accepted by the ${cliName} worker`);
+            }
+          } else if (auto.status === 'not_running') {
+            await sessionReply(rootId, t('cmd.rename.auto_not_running', { cliName }, loc));
+          } else {
+            if (auto.status === 'failed') {
+              logger.warn(`[${logTag}] Native auto-rename lookup failed for ${cliName}: ${auto.error}`);
+            }
+            await sessionReply(rootId, t('cmd.rename.usage', undefined, loc));
+          }
           break;
         }
         const updated = updateSessionTitle(ds.session, rawTitle, 'user');

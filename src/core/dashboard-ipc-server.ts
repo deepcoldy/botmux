@@ -10844,6 +10844,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     defaultPassthroughCommands: [...resolvePassthroughCommands(cachedLarkAppId, undefined, false)],
     customPassthroughCommands,
     canTalkDaemonCommands,
+    bareRenamePassthrough: getBot(cachedLarkAppId).config.bareRenamePassthrough === true,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
     envRevision,
@@ -12411,6 +12412,18 @@ botConfigPutRoute<{ canTalkDaemonCommands?: unknown }>('/api/bot-cantalk-daemon-
 // Per-bot launch-shell override launchShell。Body `{ launchShell: string }`：
 // 空字符串＝清除（回 $SHELL）。走 applyConfigField（与 /config launchShell 同一写盘
 // + 内存热更新路径），next-session 生效（下个会话起用新 shell 启动 CLI）。
+// Per-bot 裸 /rename 交给 CLI 自己起名。Body `{ bareRenamePassthrough: boolean }`；
+// 缺键或非布尔一律 400。走 applyConfigField（与 /botconfig 同一写盘 + 内存热更新路径），
+// 下一条 /rename 即生效；false 删 key，bots.json 保持干净。
+botConfigPutRoute('/api/bot-bare-rename-passthrough', 'bareRenamePassthrough', {
+  normalize: raw => {
+    const value = typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).bareRenamePassthrough : undefined;
+    return typeof value === 'boolean' ? fieldOk(value) : fieldInvalid('invalid_bare_rename_passthrough');
+  },
+  respond: value => ({ ok: true, bareRenamePassthrough: value === true }),
+});
+
 botConfigPutRoute<{ launchShell?: unknown }>('/api/bot-launch-shell', 'launchShell', {
   normalize: (body, spec) => optionalTextField(spec, body.launchShell),
   respond: value => ({ ok: true, launchShell: (value as string | null) ?? '' }),
