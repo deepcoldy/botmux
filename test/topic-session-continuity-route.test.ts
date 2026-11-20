@@ -310,6 +310,22 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(mocks.createdSessions[0].continuity).toMatchObject({ mode: 'fresh-requested', previousSessionId: 'sess-live' });
   });
 
+  it('cross-chat follow-up treats @session fresh as literal and never closes the origin session', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const { data, ctx } = event('@session fresh\n换一件事', 'bot');
+    ctx.crossChatThreadFollowUp = {
+      sourceSessionId: 'sess-live', sourceChatId: CHAT, followedChatId: 'oc_external_followed',
+      followedRootMessageId: 'om_external_followed_root', scope: 'thread', anchor: ROOT,
+    };
+    await handleThreadReply(data, ctx);
+    expect(mocks.closeSession).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.get(sessionKey(ROOT, APP))?.session.sessionId).toBe('sess-live');
+    expect(String(mocks.forkWorker.mock.calls[0]?.[1].content)).toContain('@session fresh');
+  });
+
   it('a refused close keeps the live session handling the message', async () => {
     resumeRegisters();
     await mocks.resumeSession('sess-live');

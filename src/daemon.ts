@@ -29901,7 +29901,9 @@ async function handleThreadReplyAdmitted(
     senderOpenIdForPrefix !== selfBotOpenId &&
     (isBotSenderType ||
       isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenIdForPrefix));
-  const botSteerDirective = isForeignBot
+  // Cross-chat follow-ups are literal conversational text even when a bot sent
+  // them: their transport directives must not steer or replace the origin session.
+  const botSteerDirective = isForeignBot && !ctx.crossChatThreadFollowUp
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
@@ -29911,7 +29913,7 @@ async function handleThreadReplyAdmitted(
   // Unlike @steer (text only) it changes persistent state (closes a session), so
   // besides the @steer sender rule (a bot sender) it needs this bot to accept bot
   // slash commands; the quota/talk gate then runs before anything is consumed.
-  const botSessionDirective = isForeignBot && botAcceptsSlashFromBots(larkAppId)
+  const botSessionDirective = isForeignBot && !ctx.crossChatThreadFollowUp && botAcceptsSlashFromBots(larkAppId)
     ? parseBotSessionDirective(parsed.content)
     : { content: parsed.content };
   if (botSessionDirective.mode) parsed.content = botSessionDirective.content;
