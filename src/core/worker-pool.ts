@@ -4772,10 +4772,11 @@ export function clearUsageLimitState(ds: DaemonSession): void {
   ds.quotaFallbackAttemptToken = undefined;
 }
 
-/** 限额身份或可重试状态变化时，已有卡片需要重绘 */
+/** 限额出现、解除、换代或可重试状态变化时重绘已有卡片 */
 function usageLimitCardChanged(previous: CliUsageLimitState | undefined, current: CliUsageLimitState | undefined): boolean {
-  return !!current && (!previous || previous.retryReady !== current.retryReady
-    || usageLimitStateKey(previous) !== usageLimitStateKey(current));
+  if (!previous || !current) return previous !== current;
+  return previous.retryReady !== current.retryReady
+    || usageLimitStateKey(previous) !== usageLimitStateKey(current);
 }
 
 export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefined {
