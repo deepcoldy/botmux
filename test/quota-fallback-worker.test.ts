@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   resolveCurrent: vi.fn(),
@@ -123,6 +123,7 @@ function fallbackReplies(sessionReply: ReturnType<typeof vi.fn>) {
 }
 
 describe('daemon quota fallback handoff', () => {
+  afterEach(() => vi.useRealTimers());
   beforeEach(() => {
     vi.clearAllMocks();
     __testOnly_resetQuotaFallbackEvents();
@@ -196,6 +197,37 @@ describe('daemon quota fallback handoff', () => {
     // The handoff uses daemon transport only; it never injects text back into
     // the exhausted worker/model input channel.
     expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('notifies the owner and fallback once when a screenshot carries the first frame of a new refusal', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    setup(sessionReply);
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const expiry = 6 * 60_000;
+    const first = { ...limit('usage'), retryAtMs: Date.now() + expiry, relativeResetKey: `usage:${expiry}:first`,
+      source: 'antigravity-error-composer' as const };
+    const emitFrame = async (type: 'screen_update' | 'screenshot_uploaded', usageLimit: CliUsageLimitState) => {
+      const content = type === 'screen_update' ? { content: 'native quota' } : { imageKey: 'img_quota' };
+      for (const listener of worker.listeners('message')) {
+        await listener({ type, status: 'limited', usageLimit, turnId: TURN, ...content });
+      }
+      await vi.advanceTimersByTimeAsync(0);
+    };
+    await emitFrame('screen_update', first);
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(expiry);
+    const second = { ...first, retryLabel: '1h', retryAtMs: Date.now() + 3_600_000, relativeResetKey: 'usage:3600000:second' };
+    await emitFrame('screenshot_uploaded', second);
+    await emitFrame('screen_update', second);
+    const ownerReplies = sessionReply.mock.calls.filter(call => String(call[1]).includes('<at id=ou_owner>'));
+    expect(ownerReplies).toHaveLength(2);
+    expect(String(ownerReplies.at(-1)?.[1])).toContain('1h');
+    expect(fallbackReplies(sessionReply)).toHaveLength(2);
+    expect(mocks.resolveCurrent).toHaveBeenCalledTimes(2);
   });
 
   it('deduplicates repeated frames and a same-bot event in another session for five minutes', async () => {

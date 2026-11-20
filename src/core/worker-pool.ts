@@ -20410,6 +20410,96 @@ function setupWorkerHandlers(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
+  /** 文本帧和截图帧共享限额切换边沿，各自在通过来源和静默检查后调用 */
+  const notifyUsageLimitEdge = (
+    previousStatus: ScreenStatus | undefined,
+    previousLimit: CliUsageLimitState | undefined,
+    turnId?: string,
+  ): void => {
+    const limit = ds.usageLimit;
+    if (ds.lastScreenStatus !== 'limited' || !limit || ds.suppressRecoveryCard) return;
+    const replacedExpiredQuota = isExpiredNativeAntigravityQuota(previousLimit)
+      && previousLimit?.relativeResetKey !== limit.relativeResetKey;
+    if (previousStatus === 'limited' && !replacedExpiredQuota) return;
+
+    const limitKey = usageLimitStateKey(limit);
+    if (ds.rateLimitNotifiedKey !== limitKey) {
+      ds.rateLimitNotifiedKey = limitKey;
+      const notifyBody = tr(
+        limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
+        { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
+        loc,
+      );
+      const ownerOpenId = ds.session.ownerOpenId;
+      const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
+      scopedReply(notifyText, 'text', turnId).catch((err: any) => {
+        logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
+      });
+    }
+
+    // 先认领五分钟去重窗口，再异步解析接手 Bot 的身份
+    const quotaFallback = botCfg.quotaFallbackBot;
+    if (!quotaFallback?.enabled || !quotaFallback.kinds.includes(limit.kind)) return;
+    const fallbackTurn = fallbackTurnId(ds, turnId);
+    if (!claimQuotaFallbackEvent(ds.larkAppId, limit.kind)) {
+      logger.info(
+        `[${t}] Quota fallback deduplicated within five minutes `
+        + `(kind=${limit.kind}, target=${quotaFallback.targetAppId})`,
+      );
+    } else {
+      const attemptToken = randomUUID();
+      ds.quotaFallbackAttemptToken = attemptToken;
+      const ownsFallbackAttempt = (): boolean =>
+        ownsLifecycleMutation()
+        && ds.quotaFallbackAttemptToken === attemptToken
+        && ds.lastScreenStatus === 'limited'
+        && !!ds.usageLimit
+        && usageLimitStateKey(ds.usageLimit) === limitKey;
+      void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
+        .then(async resolved => {
+          // Identity resolution is asynchronous. Never let a lookup from
+          // a cleared/replaced worker episode post into a later turn —
+          // even when that later episode happens to have the same limit
+          // key (the token distinguishes the two claims).
+          if (!ownsFallbackAttempt()) {
+            logger.info(
+              `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
+            );
+            return;
+          }
+          if (!resolved.ok) {
+            logger.warn(
+              `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
+              + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
+            );
+            return;
+          }
+          const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
+          try {
+            if (!ownsFallbackAttempt()) return;
+            await scopedReply(handoff, 'text', fallbackTurn);
+            logger.info(
+              `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
+              + `(${resolved.source}) for episode=${limitKey}`,
+            );
+          } catch (err: any) {
+            // Keep the daemon-wide five-minute claim. A later frame/session
+            // must not retry and spam the same peer; owner notice and manual
+            // retry controls remain available.
+            logger.warn(
+              `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
+              + `${err?.message ?? err}`,
+            );
+          }
+        })
+        .catch((err: any) => {
+          logger.warn(
+            `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
+            + `${err?.message ?? err}`,
+          );
+        });
+    }
+  };
   const traexCatalogContextKey = traexCatalogConfigKey(botCfg);
   ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
   ensureReadonlyTaskContinuationAttached(ds, botCfg);
@@ -22917,126 +23007,7 @@ function setupWorkerHandlers(
             { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card status: ${error.message}`));
         }
 
-        // 用户可能在下一帧到来前就重试并收到新拒绝，中间没有 idle 状态
-        const enteredLimit = prevStatus !== 'limited' || (isExpiredNativeAntigravityQuota(previousLimit)
-          && previousLimit?.relativeResetKey !== msg.usageLimit?.relativeResetKey);
-
-        // Proactive rate/usage-limit notification. The streaming-card PATCH
-        // (card-on) carries no unread/mention signal, and card-off sessions
-        // skip card output entirely — so without a fresh message here the owner
-        // never learns the CLI is blocked (the turn just stalls). Fire on the
-        // working/other→limited edge, AFTER the managed/silent fence above but
-        // BEFORE the card-off early-break below (card-off sessions must still
-        // get this ping), once per limit episode: the latch is keyed on
-        // usageLimitStateKey and reset by clearUsageLimitState (self-heal /
-        // turn end), so the same episode's repeated limited ticks stay quiet
-        // while the next episode notifies again.
-        //
-        // Recovery-window exclusion: usageLimit is in-memory. When the CLI got
-        // limited WHILE the daemon was down (common for tmux/adopt restores),
-        // restore has no usageLimit to seed lastScreenStatus='limited' from,
-        // so the first post-restart limited tick is a false (empty→limited)
-        // edge. The in-memory latch also died with the old process, so without
-        // this guard the restart-silence contract would be broken by one @owner
-        // ping. The owner already got the private recovery DM summary; hold the
-        // ping until a real user turn clears suppressRecoveryCard.
-        if (
-          ds.lastScreenStatus === 'limited'
-          && enteredLimit
-          && ds.usageLimit
-          && !ds.suppressRecoveryCard
-          && ds.rateLimitNotifiedKey !== usageLimitStateKey(ds.usageLimit)
-        ) {
-          ds.rateLimitNotifiedKey = usageLimitStateKey(ds.usageLimit);
-          const limit = ds.usageLimit;
-          const notifyBody = tr(
-            limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
-            { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
-            loc,
-          );
-          const ownerOpenId = ds.session.ownerOpenId;
-          const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
-          scopedReply(notifyText, 'text', screenTurnId).catch((err: any) => {
-            logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
-          });
-        }
-
-        // Optional daemon-side backup-Bot handoff. This deliberately sits next
-        // to (but does not share) the owner-notification latch: the daemon sends
-        // one fixed message with one real <at>, without asking the exhausted CLI
-        // to generate or replay anything. Claim the source-bot/kind five-minute
-        // window BEFORE asynchronous identity resolution/send, so repeated
-        // screen ticks and concurrent limited sessions cannot produce a storm.
-        const quotaFallback = botCfg.quotaFallbackBot;
-        if (
-          ds.lastScreenStatus === 'limited'
-          && enteredLimit
-          && ds.usageLimit
-          && !ds.suppressRecoveryCard
-          && quotaFallback?.enabled === true
-          && quotaFallback.kinds.includes(ds.usageLimit.kind)
-        ) {
-          const limitKey = usageLimitStateKey(ds.usageLimit);
-          const fallbackTurn = fallbackTurnId(ds, screenTurnId);
-          if (!claimQuotaFallbackEvent(ds.larkAppId, ds.usageLimit.kind)) {
-            logger.info(
-              `[${t}] Quota fallback deduplicated within five minutes `
-              + `(kind=${ds.usageLimit.kind}, target=${quotaFallback.targetAppId})`,
-            );
-          } else {
-            const attemptToken = randomUUID();
-            ds.quotaFallbackAttemptToken = attemptToken;
-            const ownsFallbackAttempt = (): boolean =>
-              ownsLifecycleMutation()
-              && ds.quotaFallbackAttemptToken === attemptToken
-              && ds.lastScreenStatus === 'limited'
-              && !!ds.usageLimit
-              && usageLimitStateKey(ds.usageLimit) === limitKey;
-            void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
-              .then(async resolved => {
-                // Identity resolution is asynchronous. Never let a lookup from
-                // a cleared/replaced worker episode post into a later turn —
-                // even when that later episode happens to have the same limit
-                // key (the token distinguishes the two claims).
-                if (!ownsFallbackAttempt()) {
-                  logger.info(
-                    `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
-                  );
-                  return;
-                }
-                if (!resolved.ok) {
-                  logger.warn(
-                    `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
-                    + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
-                  );
-                  return;
-                }
-                const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
-                try {
-                  if (!ownsFallbackAttempt()) return;
-                  await scopedReply(handoff, 'text', fallbackTurn);
-                  logger.info(
-                    `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
-                    + `(${resolved.source}) for episode=${limitKey}`,
-                  );
-                } catch (err: any) {
-                  // Keep the daemon-wide five-minute claim. A later frame/session
-                  // must not retry and spam the same peer; owner notice and manual
-                  // retry controls remain available.
-                  logger.warn(
-                    `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
-                    + `${err?.message ?? err}`,
-                  );
-                }
-              })
-              .catch((err: any) => {
-                logger.warn(
-                  `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
-                  + `${err?.message ?? err}`,
-                );
-              });
-          }
-        }
+        notifyUsageLimitEdge(prevStatus, previousLimit, screenTurnId);
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card. Turn-exact: a
@@ -23305,6 +23276,7 @@ function setupWorkerHandlers(
           break;
         }
         const prevStatus = ds.lastScreenStatus;
+        const previousLimit = ds.usageLimit;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
         workersWithScreenStatus.add(worker);
@@ -23355,6 +23327,7 @@ function setupWorkerHandlers(
           persistStreamCardState(ds);
           break;
         }
+        if (ownsLifecycleMutation()) notifyUsageLimitEdge(prevStatus, previousLimit, frameVerdict.source.turnId);
         // Store the image key only AFTER the managed gate: now that the ready
         // handler re-syncs display mode on every path, a worker can be
         // uploading during a suppressed managed/silent turn — letting that
