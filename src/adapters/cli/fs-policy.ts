@@ -1215,23 +1215,41 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // a narrow read-only exception out of a broader deny. Never carry a path
   // inside a host-only root into that final pass, or it would undo the
   // daemon-owned boundary that `push()` enforced above. Assistant mode has one
-  // additional boundary: the final pass must not grant the REAL BOT_HOME or any
-  // of its ancestors — otherwise HOME re-opens every other owner and the shared
-  // bot-level data. The owner's own USER_HOME subtree remains eligible.
+  // additional boundary: the final pass must not grant bot homes, session stores,
+  // other owners' attachments, bot config secrets, or any of their ancestors.
+  // Only the owner's USER_HOME and their own attachment bucket remain eligible.
   const assistantOwnerHome = ctx.assistantMode ? normalizeFsPath(ctx.botHome) : null;
   const assistantUsersRoot = assistantOwnerHome?.slice(0, assistantOwnerHome.lastIndexOf('/')) ?? null;
   const assistantBotHome = assistantUsersRoot?.endsWith('/users')
     ? normalizeFsPath(assistantUsersRoot.slice(0, -'/users'.length) || '/')
     : null;
-  const outsideAssistantOwnerWithinBotHome = (p: string): boolean => !!assistantBotHome && !!assistantOwnerHome
-    && ((coversPath(assistantBotHome, p) && !coversPath(assistantOwnerHome, p))
-      || coversPath(p, assistantBotHome));
+  const assistantAllowedRoots = [
+    assistantOwnerHome,
+    ctx.assistantMode && ctx.attachmentsBucket ? normalizeFsPath(ctx.attachmentsBucket) : null,
+  ].filter((p): p is string => !!p);
+  const assistantProtectedRoots = [
+    assistantBotHome,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.botmuxHome}/bots`) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.sessionDataDir}/session-stores`) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.sessionDataDir}/attachments`) : null,
+  ].filter((p): p is string => !!p);
+  const assistantProtectedFiles = [
+    ctx.assistantMode && ctx.loadedBotsConfigPath ? normalizeFsPath(ctx.loadedBotsConfigPath) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.botmuxHome}/bots.json`) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.botmuxHome}/.dashboard-secret`) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.botmuxHome}/.dashboard-token`) : null,
+  ].filter((p): p is string => !!p);
+  const outsideAssistantAllowedRoots = (p: string): boolean => {
+    if (assistantAllowedRoots.some(root => coversPath(root, p))) return false;
+    return assistantProtectedRoots.some(root => coversPath(root, p) || coversPath(p, root))
+      || assistantProtectedFiles.some(file => coversPath(file, p) || coversPath(p, file));
+  };
   const finalReadOnlyPaths = [
     ...serviceCredentialReadOnlyPaths,
     ...(ctx.mandatoryReadOnlyPaths ?? []),
   ].filter((path) => {
     const normalized = normalizeFsPath(path);
-    if (!normalized || insideHostOnlyRoot(normalized) || outsideAssistantOwnerWithinBotHome(normalized)) return false;
+    if (!normalized || insideHostOnlyRoot(normalized) || outsideAssistantAllowedRoots(normalized)) return false;
     // This final pass runs after ordinary rules. A service-credential exception
     // under a withheld lark-cli store would otherwise re-open the exact key the
     // mandatory ceiling just denied.
@@ -1324,13 +1342,20 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
-    // The final Seatbelt pass must also cover the assistant session store: an
-    // ancestor finalReadOnly grant would otherwise re-open DB/WAL/SHM even when
-    // the ordinary rules and the no-transport carve-out both exclude it.
+    // The final Seatbelt pass must also cover assistant session stores (all
+    // bots, including WAL/SHM) and config/dashboard secrets: an ancestor
+    // finalReadOnly grant would otherwise re-open them even when the ordinary
+    // rules and the no-transport carve-out both exclude them.
     ...(sealLarkKeyStore ? {
       finalDenyPaths: [
         ...withheldLarkStores,
-        ...(ctx.assistantMode ? [`${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`] : []),
+        ...(ctx.assistantMode ? [
+          `${ctx.sessionDataDir}/session-stores`,
+          ...(ctx.loadedBotsConfigPath ? [ctx.loadedBotsConfigPath] : []),
+          `${ctx.botmuxHome}/bots.json`,
+          `${ctx.botmuxHome}/.dashboard-secret`,
+          `${ctx.botmuxHome}/.dashboard-token`,
+        ] : []),
       ],
     } : {}),
     finalReadOnlyPaths,

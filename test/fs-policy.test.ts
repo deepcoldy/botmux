@@ -2211,15 +2211,18 @@ describe('buildFsPolicy — assistant mode (per-owner USER_HOME)', () => {
   it('keeps the no-transport assistant sessions.db denied while retaining other carve-outs', () => {
     const p = buildFsPolicy(ownerCtx(A));
     expect(accessForPath(p.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
+    const externalSd = '/var/botmux/data';
     const noTransport = buildFsPolicy({ ...ownerCtx(A),
+      botmuxHome: '/var/botmux', sessionDataDir: externalSd,
       botHome: '/var/assistant/users/a', workingDir: '/var/assistant/users/a/work',
+      attachmentsBucket: `${externalSd}/attachments/cli_self/u/${A}`,
       larkTransportEnabled: false, mandatoryReadOnlyPaths: ['/Users/u'] });
-    expect(accessForPath(noTransport.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
-    expect(accessForPath(noTransport.rules, `${sd}/bots-info.json`).access).toBe('readOnly');
-    expect(accessForPath(noTransport.rules, `${sd}/bin/botmux`).access).toBe('readOnly');
+    expect(accessForPath(noTransport.rules, `${externalSd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
+    expect(accessForPath(noTransport.rules, `${externalSd}/bots-info.json`).access).toBe('readOnly');
+    expect(accessForPath(noTransport.rules, `${externalSd}/bin/botmux`).access).toBe('readOnly');
     const profile = compileToSeatbelt(noTransport);
     const finalAllow = profile.lastIndexOf('(allow file-read* (subpath "/Users/u"))');
-    const finalDatabaseDeny = profile.lastIndexOf(`(deny file-read* (subpath "${sd}/session-stores/cli_self"))`);
+    const finalDatabaseDeny = profile.lastIndexOf(`(deny file-read* (subpath "${externalSd}/session-stores"))`);
     expect(finalAllow).toBeGreaterThanOrEqual(0);
     expect(finalDatabaseDeny).toBeGreaterThan(finalAllow);
   });
@@ -2232,13 +2235,49 @@ describe('buildFsPolicy — assistant mode (per-owner USER_HOME)', () => {
     // Only the baseline HOME grant remains; the final pass must not re-emit it
     // after the botmux/owner denies.
     expect(homeAllows).toHaveLength(1);
+    expect(p.finalDenyPaths).toEqual(expect.arrayContaining([
+      `${sd}/session-stores`,
+      `${botmuxHome}/bots.json`,
+      `${botmuxHome}/.dashboard-secret`,
+      `${botmuxHome}/.dashboard-token`,
+    ]));
+    for (const sensitive of [
+      `${sd}/session-stores`,
+      `${botmuxHome}/bots.json`,
+      `${botmuxHome}/.dashboard-secret`,
+      `${botmuxHome}/.dashboard-token`,
+    ]) {
+      expect(profile.lastIndexOf(`(deny file-read* (subpath "${sensitive}"))`)).toBeGreaterThanOrEqual(0);
+    }
     expect(accessForPath(p.rules, `${botHome}/users/${B}/claude/projects/x/memory/MEMORY.md`).access).toBe('deny');
+  });
+
+  it('does not reopen other apps or owners when an external BOT_HOME has a final ancestor grant', () => {
+    const p = buildFsPolicy({ ...ownerCtx(A),
+      botHome: '/var/assistant/users/a', workingDir: '/var/assistant/users/a/work',
+      larkTransportEnabled: false, mandatoryReadOnlyPaths: ['/Users/u'] });
+    expect(p.finalReadOnlyPaths).not.toContain('/Users/u');
+    const profile = compileToSeatbelt(p);
+    const homeAllows = profile.match(/\(allow file-read\* \(subpath "\/Users\/u"\)\)/g) ?? [];
+    expect(homeAllows).toHaveLength(1);
+    for (const denied of [
+      `${sd}/session-stores`,
+      `${botmuxHome}/bots.json`,
+      `${botmuxHome}/.dashboard-secret`,
+      `${botmuxHome}/.dashboard-token`,
+    ]) {
+      expect(profile).toContain(`(deny file-read* (subpath "${denied}"))`);
+    }
+    expect(accessForPath(p.rules, `${sd}/session-stores/cli_other/sessions.db`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${B}/om_2/b.png`).access).toBe('deny');
   });
 
   it('emits the assistant keystore deny after a final ancestor read-only grant', () => {
     const store = '/Users/u/Library/Application Support/lark-cli';
     const p = buildFsPolicy({ ...ownerCtx(A),
+      botmuxHome: '/var/botmux', sessionDataDir: '/var/botmux/data',
       botHome: '/var/assistant/users/a', workingDir: '/var/assistant/users/a/work',
+      attachmentsBucket: `/var/botmux/data/attachments/cli_self/u/${A}`,
       mandatoryReadOnlyPaths: ['/Users/u'] });
     const profile = compileToSeatbelt(p);
     const finalAllow = profile.lastIndexOf('(allow file-read* (subpath "/Users/u"))');
