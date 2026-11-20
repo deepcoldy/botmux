@@ -92,6 +92,7 @@ import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
+import { archiveUndeliveredReply, shellQuoteDisplayDir } from '../services/undelivered-reply-archive.js';
 import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import type { WorkerOwnerDiagnostic } from './worker-owner-diagnostic.js';
@@ -20803,18 +20804,42 @@ function setupWorkerHandlers(
   // The live worker produced an answer the contract will not post. Without the
   // notice the card stays "working" and the user never learns the reply is gone.
   const undeliveredFinalNotices = new Set<string>();
+  const archivedUndeliveredFinals = new Map<string, import('../services/undelivered-reply-archive.js').ArchivedUndeliveredReply | null>();
   const reportUndeliveredFinal = (final: Extract<WorkerToDaemon, { type: 'final_output' }>, reason: string): void => {
     if (ds.worker !== worker) return;
     logger.warn(`[${t}] Final output from current worker not delivered turn=${final.turnId} reason=${reason}`);
-    // Restart, suspend and close retire in-flight replies on purpose.
-    if (!final.content.trim() || (sessionController && !sessionController.allowsInput())) return;
+    if (!final.content.trim()) return;
     if (managedFinalOutputSuppressed(final.turnId, final.dispatchAttempt) || managedAuxUiSuppressed(final.turnId, final.dispatchAttempt)) return;
     const key = `${final.turnId}:${final.dispatchAttempt ?? ''}`;
+    // Refusing to post the reply must not destroy it: keep it on the bot's
+    // machine, once per turn, and say where so it can still be recovered.
+    let archived = archivedUndeliveredFinals.get(key);
+    if (archived === undefined) {
+      try {
+        archived = archiveUndeliveredReply(config.session.dataDir, {
+          appId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: final.turnId,
+          ...(final.dispatchAttempt !== undefined ? { dispatchAttempt: final.dispatchAttempt } : {}),
+          reason, cliId: ds.initConfig?.cliId ?? ds.session.cliId, content: final.content,
+        });
+        logger.warn(`[${t}] Undelivered reply kept at ${archived.path}`);
+      } catch (error) {
+        archived = null;
+        logger.error(`[${t}] Undelivered reply not archived: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      archivedUndeliveredFinals.set(key, archived);
+    }
+    // Restart, suspend and close retire in-flight replies on purpose: kept,
+    // but the group is not told about them.
+    if (sessionController && !sessionController.allowsInput()) return;
     if (undeliveredFinalNotices.has(key)) return;
     undeliveredFinalNotices.add(key);
+    const locale = localeForBot(ds.larkAppId);
+    const recovery = archived
+      ? tr('worker.final_output_undelivered_archived', { dir: shellQuoteDisplayDir(archived.displayDir), stamp: archived.stamp }, locale)
+      : tr('worker.final_output_undelivered_unarchived', undefined, locale);
     void sendTurnNotice(ds, {
       kind: 'user_notify', turnId: fallbackTurnId(ds, final.turnId), msgType: 'text',
-      content: tr('worker.final_output_undelivered', undefined, localeForBot(ds.larkAppId)),
+      content: tr('worker.final_output_undelivered', { recovery }, locale),
     }).catch(error => logger.error(`[${t}] Undelivered reply notice failed: ${error instanceof Error ? error.message : String(error)}`));
   };
   // A new worker generation is starting. As a backstop, invalidate any
