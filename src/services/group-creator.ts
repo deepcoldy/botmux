@@ -20,7 +20,7 @@
  * path may instead provide `transferOwnerUnionId`; this service resolves that
  * tenant-stable ID into the creator app's open_id before transfer.
  */
-import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat, addChatManagers } from './groups-store.js';
+import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByOpenId, addUsersToChatByUnionId, addBotToChat, addChatManagers } from './groups-store.js';
 import type { ChatMode } from './groups-store.js';
 import type { GroupAvatarMode } from './group-creation-options.js';
 import { listChatBotMembers, resolveAllowedUsersWithMap, resolveUnionIdFromOpenIdStrict, sendMessage } from '../im/lark/client.js';
@@ -90,12 +90,12 @@ export interface CreateGroupOpts {
    * never skips the remaining steps — the chat already exists, and an aborted
    * initialization would leave the owner without the group. */
   ensureBotCollaboration?: (chatId: string, joinedBotAppIds: string[]) => Promise<void>;
-  /** Synchronous progress hook fired immediately after chat.create returns a
-   *  chatId, before bot invites, share-link lookup, owner transfer, oncall
-   *  binding, or role bootstrap. CLI callers use this as the durable
-   *  side-effect boundary: once notified, retrying create would duplicate the
-   *  group even if a later best-effort step hangs or fails. */
-  onChatCreated?: (chatId: string) => void;
+  /** Task launches reserve their opening here before deferred user invites.
+   * Existing synchronous callers keep their behavior; the hook is awaited. */
+  onChatCreated?: (chatId: string) => void | Promise<void>;
+  /** Opt-in for `/g --start`: create without users, await the durable opening
+   * reservation in onChatCreated, then invite userOpenIds. */
+  deferUserInvites?: true;
 }
 
 export interface CreateGroupResult {
@@ -178,10 +178,16 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   const r = await createChat(opts.creatorLarkAppId, {
     name: opts.name,
     botIds: [],
-    userIds: opts.userOpenIds ?? [],
+    userIds: opts.deferUserInvites ? [] : (opts.userOpenIds ?? []),
     chatMode: opts.chatMode,
   });
-  opts.onChatCreated?.(r.chatId);
+  await opts.onChatCreated?.(r.chatId);
+  if (opts.deferUserInvites && opts.userOpenIds?.length) {
+    const added = await addUsersToChatByOpenId(opts.creatorLarkAppId, r.chatId, opts.userOpenIds);
+    for (const id of added.invalidUserIds) {
+      if (!r.invalidUserIds.includes(id)) r.invalidUserIds.push(id);
+    }
+  }
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {
     const batch = otherBots.slice(i, i + BOT_BATCH);
     let added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);

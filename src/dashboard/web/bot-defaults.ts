@@ -158,7 +158,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'slash-commands',
     tab: 'security',
     titleKey: 'botDefaults.sectionSlashCommands',
-    fieldKeys: ['botDefaults.nativeSlashTitle', 'botDefaults.canTalkDaemon', 'botDefaults.customPassthrough'],
+    fieldKeys: ['botDefaults.nativeSlashTitle', 'botDefaults.canTalkDaemon', 'botDefaults.customPassthrough', 'botDefaults.bareRenamePassthrough'],
   },
   {
     id: 'card-behavior',
@@ -351,6 +351,8 @@ export type BotDefaultsRow = {
   larkAppId: string;
   botName?: string;
   cliId?: string;
+  /** Local/core-only bots have no Feishu transport. */
+  apiOnly?: boolean;
   /** 租户品牌，决定飞书后台深链的 host（feishu.cn vs larksuite.com）。
    *  缺省（旧 payload / 未注册）→ larkConsoleUrl 内 normalizeBrand 兜底 feishu。 */
   brand?: string;
@@ -570,6 +572,8 @@ export type BotDefaultsRow = {
   customPassthroughCommands?: string;
   defaultPassthroughCommands?: string[];
   canTalkDaemonCommands?: string;
+  /** Bare `/rename` goes to the CLI to name the session itself (default off). */
+  bareRenamePassthrough?: boolean;
   launchShell?: string;
   env?: string;
   envKeys?: string[];

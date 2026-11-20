@@ -636,6 +636,17 @@ export interface DaemonSession {
   /** A botmux turn started and its idle edge has not been seen yet
    *  (core/idle-auto-compact.ts). In-memory; mirrored to the row while on. */
   idleAutoCompactArm?: import('./idle-auto-compact.js').IdleAutoCompactArm;
+  /** Non-keep-alive busy observed before this idle compact settles. This
+   *  in-memory witness survives session-store's durable-row rollback on a
+   *  failed save; the persisted inFlight flag is the restart-safe counterpart. */
+  idleAutoCompactBusyBeforeSettledTurnId?: string;
+  /** Completed terminal observed for this idle compact. Kept after settlement
+   *  so a durable-row rollback cannot split warm/notice state from the row or
+   *  allow a later duplicate compact. In-memory only; reconciled before sweep. */
+  idleAutoCompactCompletedTurnId?: string;
+  /** A locally answered CLI turn whose own busy repaint must not cancel an
+   *  idle-compact retry. In-memory only; cleared by its terminal or idle edge. */
+  idleAutoCompactLocalTurn?: { turnId: string; since: number };
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
@@ -754,6 +765,31 @@ export interface DaemonSession {
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */
   activeModel?: string;
+  /** True when `activeModel` was only re-seeded from pre-spawn transcript/DB
+   *  history (not a live post-spawn turn), so statusline validation prefers the
+   *  new launch model over the historical seed. */
+  activeModelFromSeed?: boolean;
+  /** Floor timestamp (ms) for accepting on-disk statusline quota snapshots:
+   *  advanced when launch model or CLI launch generation changes so a
+   *  pre-switch snapshot cannot bleed into the new launch. */
+  statuslineNotBeforeMs?: number;
+  /** Expected per-spawn statusline generation token (`BOTMUX_STATUSLINE_GEN`)
+   *  for the current CLI process; rejects late writes from a dying prior CLI. */
+  statuslineLaunchGen?: string;
+  /** True after a launch-model / CLI restart invalidation until the new
+   *  generation publishes a fresh live `activeModel`, so statusline model
+   *  checks compare against the new launch model instead of a pre-restart `activeModel`. */
+  statuslineActiveModelStale?: boolean;
+  /** State captured before a speculative launch generation is assigned. A real
+   * fresh-spawn attestation discards it; a folded restart or warm reattach
+   * restores the last attested generation and time/model fences instead of
+   * clearing them. */
+  statuslineLaunchFenceRollback?: {
+    launchGen?: string;
+    notBeforeMs?: number;
+    activeModelStale?: boolean;
+    activeModelFromSeed?: boolean;
+  };
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
   /** Native current selection, separate from the last executed turn_context. */

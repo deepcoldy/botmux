@@ -16,10 +16,12 @@
  * worker globals it reads; renaming either fails loudly (missing function /
  * undefined read), never silently green.
  */
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
+import { clearStatuslineSnapshot } from '../../src/services/statusline-snapshot.js';
 import { contractTerminalStatus, executionObserverSupported } from '../../src/services/session-contract.js';
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
@@ -30,12 +32,13 @@ import { readGrokRuntimeObservation } from '../../src/services/grok-runtime-obse
 import { ClaudeEffortObserver } from '../../src/services/claude-effort-observer.js';
 import { TerminalEffortChoiceTracker } from '../../src/services/terminal-effort-choice.js';
 import { TurnRecapRecorder } from '../../src/services/turn-recap.js';
-import { stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
+import { isFinalBridgeSendMarker, stripTrailingBridgeSentinelLine } from '../../src/services/bridge-fallback-gate.js';
 import { rewindableErrorCode, transcriptTurnFailedWithoutOutput } from '../../src/core/failed-turn-rewind.js';
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from '../../src/core/rewind-backup-retention.js';
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
 import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
 import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
+import { WebTerminalInputController, WebTerminalInputWireState } from '../../src/core/web-terminal-input-controller.js';
 import { BusyReadyDeferralTracker, BusyReadyLogThrottle } from '../../src/utils/busy-ready-deferral.js';
 
 /** Failed-turn rewind wiring that emitTurnTerminal, flushPending and
@@ -56,6 +59,7 @@ const TRAEX_QUESTION_FUNCTIONS = [
   'traexQuestionBridgeActive', 'traexQuestionBlockReported', 'traexQuestionHoldBlocks',
   'traexQuestionHoldsHeldInput', 'notifyTraexQuestionInputHeld', 'traexQuestionHoldsIdle',
   'traexQuestionHoldsQueuedWrite', 'traexQuestionCapture',
+  'traexQuestionSubmitGuard',
 ];
 /** Inert stand-in for the worker's TraexQuestionBridge instance (a const, not
  *  a function); a caller that observes it passes its own in `scope`. */
@@ -128,6 +132,9 @@ function defaultScopedWorkerState(scope: Record<string, unknown>, key: string | 
   if (key === 'KEEPALIVE_HOOK_CLAIM_MS') {
     return (scope.KEEPALIVE_HOOK_CLAIM_MS ??= 30_000);
   }
+  if (key === 'publishedActiveRuntimeSeeded') {
+    return (scope.publishedActiveRuntimeSeeded ??= false);
+  }
   return undefined;
 }
 
@@ -141,6 +148,19 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const dependencies = new Map<string, unknown>();
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
+    if (key === 'WebTerminalInputController') return WebTerminalInputController;
+    if (key === 'WebTerminalInputWireState') return WebTerminalInputWireState;
+    if (key === 'webTerminalInputControllers' || key === 'webTerminalAttachInputs') {
+      if (!dependencies.has(key)) dependencies.set(key, new Set());
+      return dependencies.get(key);
+    }
+    if (key === 'pendingWebTerminalInput' || key === 'webTerminalInputWireDirty'
+      || key === 'webTerminalInputWireState' || key === 'markWebTerminalInputWireUncertain') {
+      if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
+      return dependencies.get(key);
+    }
+    if (key === 'randomUUID') return randomUUID;
+    if (key === 'clearStatuslineSnapshot') return clearStatuslineSnapshot;
     if (key === 'confirmedTerminalEffortChoice') return () => undefined;
     if (key === 'noteTerminalEffortInput') return () => {};
     if (key === 'recordStructuredInput') return () => {};
@@ -171,6 +191,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     const keepaliveDefault = defaultScopedWorkerState(scope, key);
     if (keepaliveDefault !== undefined) return keepaliveDefault;
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
+    if (key === 'isFinalBridgeSendMarker') return isFinalBridgeSendMarker;
     if (key === 'rewindableErrorCode') return rewindableErrorCode;
     if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
     if (key === 'pruneRewindBackupsBeside') return pruneRewindBackupsBeside;

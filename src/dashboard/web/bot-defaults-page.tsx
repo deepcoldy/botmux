@@ -4442,6 +4442,12 @@ export function OwnerGroupFollowControls(props: { bot: BotDefaultsRow; patchBot:
   useEffect(() => {
     setExcluded(savedExcluded);
   }, [bot.larkAppId, savedExcluded]);
+  if (bot.apiOnly === true) {
+    return <div className="bd-subsection" data-owner-group-follow-unavailable>
+      <h4 className="bd-subsection-title">{tr('botDefaults.ownerGroupFollow')}</h4>
+      <p className="bd-section-note">{tr('botDefaults.ownerGroupFollowApiOnly')}</p>
+    </div>;
+  }
   const save = (value: BotDefaultsRow['ownerGroupFollow']) => saveBotField({
     request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/owner-group-follow`, { ownerGroupFollow: value }),
     setStatus, setBusy, saved: tr('botDefaults.cardPrefSaved'),
@@ -9603,6 +9609,7 @@ export function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; pat
   const commandHelpId = useId();
   const commandTags = parseCustomPassthroughInput(passthrough);
   const [canTalk, setCanTalk] = useState(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
+  const [bareRename, setBareRename] = useState(props.bot.bareRenamePassthrough === true);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -9616,6 +9623,7 @@ export function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; pat
   useEffect(() => {
     setCanTalk(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
   }, [props.bot.canTalkDaemonCommands]);
+  useEffect(() => setBareRename(props.bot.bareRenamePassthrough === true), [props.bot.bareRenamePassthrough]);
 
   function commitCommandDraft(text = commandDraft): string | null {
     if (!text.trim()) return passthrough;
@@ -9644,6 +9652,23 @@ export function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; pat
         const next = typeof body.customPassthroughCommands === 'string' ? body.customPassthroughCommands : '';
         setPassthrough(next);
         props.patchBot(props.bot.larkAppId, { customPassthroughCommands: next });
+      },
+    });
+  }
+
+  async function saveBareRename(checked: boolean): Promise<void> {
+    const previous = bareRename;
+    setBareRename(checked);
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/bare-rename-passthrough`, { bareRenamePassthrough: checked }),
+      setStatus,
+      setBusy: on => setBusy(on ? 'bare-rename' : null),
+      saved: tr('botDefaults.cardPrefSaved'),
+      rollback: () => setBareRename(previous),
+      onSaved: body => {
+        const next = body.bareRenamePassthrough === true;
+        setBareRename(next);
+        props.patchBot(props.bot.larkAppId, { bareRenamePassthrough: next });
       },
     });
   }
@@ -9731,6 +9756,17 @@ export function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; pat
         <div className="actions">
           <button type="button" className="primary" data-action="save-cantalk-daemon" disabled={busy === 'cantalk'} onClick={() => void saveCanTalk()}>{tr('botDefaults.canTalkDaemonSave')}</button>
         </div>
+      </div>
+      <div className="bd-subsection">
+        <ToggleRow
+          checked={bareRename}
+          disabled={busy === 'bare-rename'}
+          dataAction="toggle-bare-rename-passthrough"
+          title={tr('botDefaults.bareRenamePassthrough')}
+          description={tr('botDefaults.bareRenamePassthroughDescription')}
+          help={tr('botDefaults.bareRenamePassthroughHelp')}
+          onChange={checked => void saveBareRename(checked)}
+        />
       </div>
       <StatusSpan status={status} attr={{ 'data-slash-commands-status': '' }} />
     </section>

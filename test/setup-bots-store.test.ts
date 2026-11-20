@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { writeBotsJsonAtomic, readBotsJsonOrEmpty } from '../src/setup/bots-store.js';
+import { writeBotsJsonAtomic, readBotsJsonOrEmpty, mutateBotsJsonAtomic } from '../src/setup/bots-store.js';
 
 let tmpDir: string;
 let botsPath: string;
@@ -105,6 +105,18 @@ describe('writeBotsJsonAtomic', () => {
     expect(() => writeBotsJsonAtomic(botsPath, [legacyInvalid, { ...editable, lang: 'zh' }]))
       .not.toThrow();
     expect(readBotsJsonOrEmpty(botsPath)[1].lang).toBe('zh');
+  });
+  it('mutates the latest on-disk generation and returns the committed result', () => {
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_a', larkAppSecret: 'a' }]);
+    const result = mutateBotsJsonAtomic(botsPath, previous => {
+      expect(previous.map(bot => bot.larkAppId)).toEqual(['cli_a']);
+      return {
+        bots: [...previous, { larkAppId: 'cli_b', larkAppSecret: 'b' }],
+        result: { index: previous.length },
+      };
+    });
+    expect(result).toEqual({ index: 1 });
+    expect(readBotsJsonOrEmpty(botsPath).map(bot => bot.larkAppId)).toEqual(['cli_a', 'cli_b']);
   });
 });
 

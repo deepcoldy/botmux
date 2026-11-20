@@ -220,6 +220,9 @@ export interface BotSnapshot {
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /** Frozen per-bot Claude credential source. This is a directory path, not a
+   *  secret, so replay can preserve account selection without persisting tokens. */
+  credentialsSourceDir?: string;
   /** Frozen configured launch prefix.  Workflow workers must use
    *  the same gateway/runtime selection as ordinary bot sessions. */
   wrapperCli?: string;

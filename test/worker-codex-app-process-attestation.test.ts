@@ -128,6 +128,29 @@ describe('worker Codex App process attestation', () => {
     loadWorkerFunction<(pid: number) => void>('publishLocalProcessAttestation', scope)(40);
     expect(scope.send).toHaveBeenLastCalledWith(expect.objectContaining({ enginePid: 71, engineProcStart: '400' }));
   });
+
+  it('refuses to attest a leaf whose live birth differs from the proven token', () => {
+    const scope: Record<string, any> = {
+      codexRpcEngine: undefined, codexAppEngineIdentity: undefined,
+      codexAppRunnerProcessIdentity: undefined,
+      readProcessStartIdentity: (pid: number) => pid === 40 ? 'live-birth' : undefined,
+      send: vi.fn(), effectiveBackendType: 'tmux', currentCliCredentialIsolated: false,
+      currentBotmuxTurnId: undefined,
+    };
+    const publish = loadWorkerFunction<(
+      pid: number, enginePid?: number, opts?: { expectedCliProcStart?: string },
+    ) => boolean>('publishLocalProcessAttestation', scope);
+    // A caller holding a proven leaf must never have that proof replaced by
+    // whatever process occupies the numeric PID at publication time.
+    expect(publish(40, undefined, { expectedCliProcStart: 'proven-birth' })).toBe(false);
+    expect(scope.send).not.toHaveBeenCalled();
+    // The matching token publishes; omitting the option keeps legacy behavior.
+    expect(publish(40, undefined, { expectedCliProcStart: 'live-birth' })).toBe(true);
+    expect(scope.send).toHaveBeenCalledTimes(1);
+    expect(scope.send).toHaveBeenCalledWith(expect.objectContaining({ cliPid: 40, cliProcStart: 'live-birth' }));
+    expect(publish(40)).toBe(true);
+    expect(scope.send).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('authenticated Codex App turn recovery', () => {

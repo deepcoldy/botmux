@@ -111,6 +111,8 @@ export interface WriteInputContext {
 }
 
 export interface SubmitGuard {
+  /** May reject before any paste bytes, after an adapter's awaited setup. */
+  beforeWrite?(): void;
   /** A reason (shown to the user) while the surface is taken, else undefined.
    *  `draft` = the message was pasted and its first Enter is pending (it sits
    *  in the composer under the page); `retry` = a resend of an Enter that
@@ -438,8 +440,11 @@ export interface CliAdapter {
   /** Only meaningful with passesInitialPromptViaArgs. If set, prompts whose
    *  UTF-8 byte length is GREATER than this adapter-specific limit are not
    *  baked into launch args; the worker defers them to the normal post-start
-   *  input queue. This guards backend launchers (notably tmux) whose command
-   *  string limit can be much lower than OS ARG_MAX. */
+   *  input queue. The budget dates from the old inline tmux launch, whose
+   *  command string tmux capped far below OS ARG_MAX; panes now read the full
+   *  launch argv from a private pane-launch file, so that cap no longer binds
+   *  and the number is retained only to keep the args-baked vs queued split
+   *  unchanged. */
   readonly maxInitialPromptArgBytes?: number;
 
   /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI
@@ -1252,6 +1257,12 @@ export interface CliAdapter {
    *  by the daemon. Undefined means this adapter has no proven native rename
    *  command and must never receive a best-guess slash command. */
   buildSessionRenameCommand?(title: string): string;
+
+  /** CLI-native command that makes the CLI name the current interactive
+   *  session itself (Claude Code: a bare `/rename` derives a name from the
+   *  conversation). Botmux types it verbatim when `/rename` arrives without a
+   *  title. Undefined means a bare `/rename` keeps botmux's usage reply. */
+  readonly sessionAutoRenameCommand?: string;
 
   /** Structured-transcript bridge capability (see {@link StructuredBridgeSpec}).
    *  Declared by CLIs whose final answer can be harvested from an append-only

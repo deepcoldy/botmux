@@ -1,7 +1,7 @@
 import { defaultSummaryRangePrefs, summaryRangeFromLegacyContentTriggers } from '../services/summary-range-store.js';
 import { selectionKeyForBot } from '../setup/cli-selection.js';
 import { normalizeReplyFooter } from '../services/reply-footer.js';
-import { normalizeUsageDisplay, normalizeCotEnabled } from '../bot-registry.js';
+import { normalizeUsageDisplay, normalizeCotEnabled, type BotConfig } from '../bot-registry.js';
 import { normalizeHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
@@ -30,6 +30,8 @@ export interface DashboardBotDescriptor {
   botName?: string | null;
   botAvatarUrl?: string;
   cliId?: string;
+  /** True for local/core-only bots with no Feishu transport. */
+  apiOnly?: boolean;
   /** 租户品牌（bots.json 的 BotConfig.brand）。决定飞书后台深链 host。
    *  缺省 → 前端 normalizeBrand 兜底 feishu，向后兼容旧 payload。 */
   brand?: string;
@@ -117,6 +119,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
   const base = {
     larkAppId: bot.larkAppId,
     botName: bot.botName,
+    apiOnly: bot.apiOnly === true || j?.apiOnly === true,
     ...(bot.cliId ? { cliId: bot.cliId } : {}),
     ...(bot.brand ? { brand: bot.brand } : {}),
     ...(bot.cliRuntime ? { cliRuntime: bot.cliRuntime } : {}),
@@ -335,6 +338,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       ? j.defaultPassthroughCommands.filter((command: unknown): command is string => typeof command === 'string' && command.startsWith('/'))
       : undefined,
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',
+    bareRenamePassthrough: j?.bareRenamePassthrough === true,
     launchShell: typeof j?.launchShell === 'string' ? j.launchShell : '',
     env: typeof j?.env === 'string' ? j.env : '',
     // env 值只写不读，变量名是刷新后唯一能证明「已保存」的信号——漏掉它，
@@ -362,6 +366,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
 export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   quotaFallbackBot: any;
   autoInviteOwnerOnGroupAdd: any;
+  apiOnly: boolean;
   larkToolBinding: boolean | undefined;
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
@@ -371,6 +376,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
     autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
+    apiOnly: rawEntry?.apiOnly === true,
     larkToolBinding: typeof rawEntry?.larkToolBinding === 'boolean' ? rawEntry.larkToolBinding : undefined,
     askOptionLayout: rawEntry?.askOptionLayout,
     // 默认开：显式 false 不从这里带回，离线行会把已关闭的同机信任显示成开启。
@@ -381,6 +387,41 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
       : undefined,
     // 显式开/关原样带回（否则 daemon 离线时会显示成「跟随全局」）；缺省或非法值不带，按跟随全局显示。
     archiveCodex: typeof rawEntry?.archiveCodex === 'boolean' ? rawEntry.archiveCodex : undefined,
+  };
+}
+
+export type ConfiguredBotAgentFields = Partial<Pick<BotConfig,
+  'cliRuntime' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'model'
+  | 'modelBackendVariant' | 'reasoningEffort' | 'codexProfile' | 'serviceTier' | 'nativeSubagentRuntime'
+  | 'traexAutoModel' | 'turnTimeoutMs' | 'dshRuntime' | 'dshProfile' | 'cliConfigDir' | 'apiOnly'
+>> & { cliId?: string };
+
+/** Merge registry descriptors with config fallbacks without losing transport identity. */
+export function withConfiguredCliId<T extends { larkAppId: string } & ConfiguredBotAgentFields>(
+  bot: T,
+  ids: Map<string, string> | Map<string, ConfiguredBotAgentFields>,
+): T & ConfiguredBotAgentFields {
+  const raw = ids.get(bot.larkAppId);
+  const fallback: ConfiguredBotAgentFields | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
+  return {
+    ...bot,
+    cliId: bot.cliId || fallback?.cliId,
+    apiOnly: bot.apiOnly ?? fallback?.apiOnly,
+    cliRuntime: bot.cliRuntime || fallback?.cliRuntime,
+    cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
+    wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
+    cliLaunchMode: bot.cliLaunchMode || fallback?.cliLaunchMode,
+    model: bot.model || fallback?.model,
+    traexAutoModel: bot.traexAutoModel ?? fallback?.traexAutoModel,
+    modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
+    reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
+    codexProfile: bot.codexProfile ?? fallback?.codexProfile,
+    serviceTier: bot.serviceTier || fallback?.serviceTier,
+    nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
+    turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
+    dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
+    dshProfile: bot.dshProfile ?? fallback?.dshProfile,
+    cliConfigDir: bot.cliConfigDir ?? fallback?.cliConfigDir,
   };
 }
 
@@ -396,6 +437,7 @@ export function mergeBotOncallFields(d: DashboardBotDescriptor, j: Record<string
   return {
     ...d,
     botName: d.botName ?? j.botName,
+    apiOnly: own('apiOnly') ? j.apiOnly === true : d.apiOnly === true,
     cliId: (j.cliId || d.cliId) as DashboardBotDescriptor['cliId'],
     cliRuntime: own('cliRuntime') ? j.cliRuntime ?? undefined : d.cliRuntime,
     cliPathOverride: own('cliPathOverride') ? j.cliPathOverride ?? undefined : d.cliPathOverride,

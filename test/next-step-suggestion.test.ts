@@ -8,7 +8,7 @@ import {
   type NextStepIo,
 } from '../src/core/next-step-suggestion.js';
 import { NEXT_STEP_ELEMENT_ID } from '../src/im/lark/next-step-card.js';
-import { PromptSuggestionPublisher } from '../src/utils/prompt-suggestion-publisher.js';
+import { PromptSuggestionPublisher, promptSuggestionReportTurn } from '../src/utils/prompt-suggestion-publisher.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 function session(id = 'sess-next-step', currentTurnId?: string): DaemonSession {
@@ -379,6 +379,34 @@ describe('PromptSuggestionPublisher', () => {
     // The same text seen again under the next turn is that turn's suggestion.
     publisher.observe('可以合了', { turnId: 't2' });
     expect(publisher.take('idle', { turnId: 't2' })).toEqual({ text: '可以合了', turnId: 't2' });
+  });
+
+  it('reports a suggestion for the turn that answers it, keyed by the screen\'s own turn', () => {
+    const publisher = new PromptSuggestionPublisher();
+    publisher.observe('push 一下', t1);
+    const folded = { turnId: 't2', dispatchAttempt: 1 };
+    expect(publisher.take('idle', t1, folded)).toEqual({ text: 'push 一下', turnId: 't2', dispatchAttempt: 1 });
+    expect(publisher.take('idle', t1, folded)).toBeUndefined();
+  });
+
+  it('reports the same text again once it answers a newly folded turn', () => {
+    const publisher = new PromptSuggestionPublisher();
+    publisher.observe('push 一下', t1);
+    expect(publisher.take('idle', t1)?.turnId).toBe('t1');
+    // t2's terminal (folded into t1) goes out after the first report.
+    expect(publisher.take('idle', t1, { turnId: 't2' })).toEqual({ text: 'push 一下', turnId: 't2' });
+  });
+
+  it('answers the newest type-ahead turn the CLI folded into the screen\'s turn', () => {
+    const ended = new Set(['t1', 't2']);
+    const isEnded = (turnId: string) => ended.has(turnId);
+    const folded = { turnId: 't2', dispatchAttempt: 1, into: 't1' };
+    expect(promptSuggestionReportTurn(t1, folded, isEnded)).toEqual({ turnId: 't2', dispatchAttempt: 1 });
+    // While the screen's own turn runs, the folded one is not answered yet.
+    expect(promptSuggestionReportTurn({ turnId: 't0' }, { ...folded, into: 't0' }, isEnded)).toEqual({ turnId: 't0' });
+    // A turn folded into an earlier screen turn says nothing about this one.
+    expect(promptSuggestionReportTurn({ turnId: 't3' }, folded, () => true)).toEqual({ turnId: 't3' });
+    expect(promptSuggestionReportTurn(t1, undefined, isEnded)).toBe(t1);
   });
 
   it('never publishes a frame captured under the previous turn as the new turn\'s', () => {

@@ -13,16 +13,30 @@ import { assertChangedBotConfigInvariants } from '../services/bot-config-invaria
 import { assertDurableConfigMutationAllowed } from '../services/durable-config-mutation.js';
 import { assertNextBotsGenerationContent } from '../services/config-store.js';
 
-export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
+export interface BotsJsonMutation<T> {
+  bots: any[];
+  result: T;
+}
+
+/**
+ * Cross-process read-modify-write under ONE non-reentrant file lock.
+ *
+ * The callback runs against the latest on-disk generation. It must return a new
+ * array rather than relying on an earlier caller snapshot; otherwise two
+ * processes can each append to a different stale array and the later rename
+ * silently discards the other one's update. Keep the callback synchronous:
+ * yielding while holding this lock would also block the process's own writer.
+ */
+export function mutateBotsJsonAtomic<T>(
+  botsJsonPath: string,
+  mutation: (previous: any[]) => BotsJsonMutation<T>,
+): T {
   assertDurableConfigMutationAllowed('bots');
-  // PM2 start surfaces hold this same generation lock from snapshot through
-  // post-start verification/rollback, so the ecosystem and its expected names
-  // can never be built from different bots.json generations.
-  withFileLockSync(botsJsonPath, () => {
+  return withFileLockSync(botsJsonPath, () => {
     const previous = existsSync(botsJsonPath) ? JSON.parse(readFileSync(botsJsonPath, 'utf8')) as any[] : [];
+    const { bots, result } = mutation(previous);
     assertCodexInstanceConfigWrite(previous, bots);
     assertChangedBotConfigInvariants(previous, bots);
-    // Clone/onboarding callers pass the exact generation they intend to save.
     assertQuotaFallbackGraphAcyclic(bots);
     // Same loader-level gate as the daemon's writeRawConfigAtomic: never persist
     // a changed entry parseBotConfigsFromText would reject on the next startup.
@@ -33,7 +47,12 @@ export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
       writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });
       renameSync(tmp, botsJsonPath);
     }, undefined, botsJsonPath);
+    return result;
   });
+}
+
+export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
+  mutateBotsJsonAtomic(botsJsonPath, () => ({ bots, result: undefined }));
 }
 
 export function readBotsJsonOrEmpty(botsJsonPath: string): any[] {

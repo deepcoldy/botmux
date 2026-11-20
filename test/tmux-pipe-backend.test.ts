@@ -1135,6 +1135,17 @@ describe('TmuxPipeBackend.getChildPid', () => {
     expect(cmd).toContain('#{pane_pid}');
     expect(cmd).not.toContain('list-panes');
   });
+  it('re-reads the stable pane pid independently of cliPid rewrites', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockClear();
+    mockedExecSync.mockReturnValue('45678\n' as any);
+    expect(be.getStablePanePid()).toBe(45678);
+    be.cliPid = 999;
+    expect(be.getChildPid()).toBe(45678);
+    mockedExecSync.mockReturnValue('56789\n' as any);
+    expect(be.getStablePanePid()).toBe(56789);
+  });
 });
 
 describe('TmuxPipeBackend.captureCurrentScreen', () => {
@@ -1360,6 +1371,26 @@ describe('capture failure observability', () => {
     await expect(be.captureViewportAsync()).rejects.toThrow('error connecting');
     expect(errSpy).toHaveBeenCalledTimes(1);
     expect(String(errSpy.mock.calls[0][0])).toContain('kind=server-unreachable');
+    errSpy.mockRestore();
+  });
+
+  it('recognizes the real execFile timeout shape without changing rejection', async () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const timeoutError = Object.assign(new Error('Command failed: tmux capture-pane'), {
+      code: null,
+      killed: true,
+      signal: 'SIGKILL',
+      stderr: '',
+    });
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      cb(timeoutError, '');
+      return {};
+    }) as any);
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    await expect(be.captureViewportAsync()).rejects.toBe(timeoutError);
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(String(errSpy.mock.calls[0][0])).toContain('kind=timeout');
     errSpy.mockRestore();
   });
 });

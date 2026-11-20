@@ -271,7 +271,10 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 - 默认最多等待 active remote turn 12 秒。运行长任务的部署可以设置 provider-neutral 的 `BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS`（12,000 到 86,400,000 毫秒）；BotMux 会把同一 drain deadline 传给 Remote Runner backend，并同步派生 daemon、fleet supervisor 和 CLI 的外层等待预算，避免普通 provider operation timeout 或任一外层 supervisor 提前截断 active turn。provider 发出 `final` 只表示模型执行完成，daemon 还会在提交 detach 前等待对应的用户可见最终回复完成投递；这段固定 20 秒的 delivery drain 预算同样包含在全部外层预算中，避免 worker 退出后首个发送尝试才发现原 generation 已失效。该配置只控制正常退出的 active-turn 等待时间，不改变 turn 自身超时，也不会把取消作为超时后的兜底行为。进程编排层的 termination grace 必须大于派生出的 fleet hard-stop 预算。
 - 如果 shutdown 在持久化阶段失败，BotMux 使用 `reattach` 回滚已经确认的 `detach`；回滚没有得到
   `status: ready` 时继续保持写入门禁，不把未知状态伪装成已恢复。
-- 当前 worker 不存在时，BotMux 不会猜测 provider 的控制面 API，也不会直接把仍为 active 的记录改成 closed；应先恢复同一 provider worker，再执行显式关闭。
+- 关闭先登记 canonical close 操作并封闭输入；控制通道按当前会话、worker 代次、真实握手和操作归属判断就绪，不使用输入准入的 `workerReady`。当前 worker 的匹配关闭回执在 `closing` 期间仍可被接纳。
+- 当前 worker 不存在时，显式关闭可用已有持久化 provider 状态唤醒空 prompt 的控制 worker，仅发送 `resume` 和 `cancel`，不会为关闭创建新远端会话。没有有效持久状态或输入/迁移尚未收敛时拒绝唤醒。
+- `retryable` 只描述重试策略。可证明 cancel 尚未派发的首次失败收敛为 `failed_before_effect`；provider 明确拒绝且写入准入已恢复时收敛为 `rejected`；派发后 ACK 丢失继续保留 `uncertain`。诊断区分 worker 缺失、控制未就绪和取消结果未知。
+- 升级不会清除历史 `closing/uncertain`。旧版就绪自锁留下的记录可重试 `/close` 或 `botmux delete <session-id>`，只有当前 worker 返回有效取消确认才提交 closed；重试的准备失败不抹去先前未知结果。真实 cancel 未知且进程内关闭保护仍在时继续要求对账；provider 退出并被正式回收后，可通过持久状态恢复控制 worker 再关闭。
 
 ## Reference runner
 
