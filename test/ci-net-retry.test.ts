@@ -24,7 +24,12 @@ const TRANSIENT: Record<string, string> = {
   'Docker 镜像 CDN 重置连接（#3500 CI 原始日志）': DOCKER_CDN_RESET,
   'apt 临时 DNS 失败（#3348 CI 原始日志）': APT_DNS,
   'apt 镜像 429 限流（#3573 network-boundary 日志）': APT_429,
+  'apt 408 请求超时': 'Err:2 http://azure.archive.ubuntu.com/ubuntu noble InRelease\n  408  Request Timeout [IP: 1.2.3.4 80]',
+  'apt 500 内部服务器错误': 'Err:1 http://azure.archive.ubuntu.com/ubuntu noble InRelease\n  500  Internal Server Error [IP: 1.2.3.4 80]',
   'apt 502 网关错误': 'Err:1 http://azure.archive.ubuntu.com/ubuntu noble InRelease\n  502  Bad Gateway [IP: 1.2.3.4 80]',
+  'apt 503 服务不可用（短短语）': 'Err:1 http://azure.archive.ubuntu.com/ubuntu noble InRelease\n  503  Service Unavailable [IP: 1.2.3.4 80]',
+  'apt 503 服务不可用（长短语）': 'Err:1 http://azure.archive.ubuntu.com/ubuntu noble InRelease\n  503  Service Temporarily Unavailable [IP: 1.2.3.4 80]',
+  'apt 504 网关超时': 'Err:1 http://azure.archive.ubuntu.com/ubuntu noble InRelease\n  504  Gateway Time-out [IP: 1.2.3.4 80]',
   'electron postinstall 504（#3193 现场一）':
     'bun install v1.4.3 (c6da4a4d3)\nHTTPError: Response code 504 (Gateway Time-out)\n    at Request._onResponseBase (/home/runner/work/botmux/botmux/node_modules/got/dist/source/core/index.js:913:31)\nerror: postinstall script from "electron" exited with 1',
   'setup-bun 下载 504（#3193 现场二）': 'Unexpected HTTP response: 504\nWaiting 18 seconds before trying again\n##[error]Error: Unexpected HTTP response: 504',
