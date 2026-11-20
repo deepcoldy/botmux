@@ -29,6 +29,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionController } from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import type { ExecutionRef, RuntimeIdentity, RuntimeRef, WorkerRef } from '../src/services/session-contract.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -168,6 +169,46 @@ describe('a turn left running in a CLI the next worker re-attaches', () => {
     expect(s.final(w3, { runtime: r4, execution: s.turn })).toEqual({ kind: 'reject', reason: 'execution_scope_unproven' });
   });
 
+  it('completes the intermediate runtime instead of reviving an older one after newer work finished', () => {
+    const s = turnRunningAcrossRestart();
+    const r3 = s.bind(s.w2, 'b3', cliBare);
+    s.send(s.w2, { type: 'ready' }, {});
+    const newer = s.controller.admitInput('om_newer_turn');
+    s.send(s.w2, { type: 'turn_execution_started', turnId: 'om_newer_turn' }, { runtime: r3, execution: newer });
+    expect(s.send(s.w2, { type: 'turn_terminal', turnId: 'om_newer_turn', status: 'completed' }, { runtime: r3, execution: newer }))
+      .toMatchObject({ kind: 'current' });
+    // The intermediate worker disappears before it can enrich its bare binding.
+    // The next complete identity belongs to that newer work's runtime, not the
+    // older execution it replaced.
+    s.controller.workerLost(s.w2);
+    const w3 = s.controller.bindWorker(3).worker;
+    const rebound = s.controller.bindRuntime('b4', w3, cliNative);
+    expect(rebound.ref).toEqual(r3);
+    expect(rebound.identity).toEqual(cliNative);
+    expect(s.execution().runtime).toEqual(s.r2);
+    expect(s.final(w3, { runtime: rebound.ref, execution: s.turn })).toEqual({ kind: 'reject', reason: 'execution_scope_unproven' });
+  });
+
+  it('does not reuse an older runtime across an interval that already finished newer work', () => {
+    const s = turnRunningAcrossRestart();
+    const r3 = s.bind(s.w2, 'b3', cliBare);
+    s.send(s.w2, { type: 'ready' }, {});
+    const newer = s.controller.admitInput('om_newer_turn');
+    s.send(s.w2, { type: 'turn_execution_started', turnId: 'om_newer_turn' }, { runtime: r3, execution: newer });
+    expect(s.send(s.w2, { type: 'turn_terminal', turnId: 'om_newer_turn', status: 'completed' }, { runtime: r3, execution: newer }))
+      .toMatchObject({ kind: 'current' });
+    s.controller.bindRuntime('b3', s.w2, cliNative);
+    // A later bare observation retires the native intermediate runtime without
+    // running work of its own. Only the older runtime remains a reuse candidate.
+    const w3 = s.controller.bindWorker(3).worker;
+    const r4 = s.bind(w3, 'b4', cliBare);
+    expect(s.store.runtime(s.ref, r3.runtimeId)?.phase).toBe('retiring');
+    const w4 = s.controller.bindWorker(4).worker;
+    expect(() => s.controller.bindRuntime('b5', w4, cliNative)).toThrow('runtime_recovery_has_active_execution');
+    expect(s.execution().runtime).toEqual(s.r2);
+    expect(s.final(w4, { runtime: r4, execution: s.turn })).toMatchObject({ kind: 'reject' });
+  });
+
   it('leaves the turn alone when the old worker\'s loss was never recorded', () => {
     // The old runtime was retired by the new binding rather than marked lost:
     // nothing shows its worker is gone.
@@ -230,6 +271,22 @@ describe('a turn left running in a CLI the next worker re-attaches', () => {
     s.send(s.w2, { type: 'turn_execution_started', turnId: 'om_unrelated' }, { runtime: r3, execution: other });
     expect(s.store.execution(s.ref, other.executionId)?.runtime).toEqual(r3);
     expect(s.controller.outputOrigin({ ...frozen, scope: { runtime: s.r2, execution: other } })).toBeUndefined();
+  });
+
+  it('rolls back a half-written reattachment and retries it', () => {
+    const s = turnRunningAcrossRestart();
+    const r3 = s.bind(s.w2, 'b3', cliBare);
+    const db = openDatabaseSyncOrThrow(s.store.filename);
+    try {
+      db.exec("CREATE TRIGGER fail_reattachment_link BEFORE INSERT ON entities WHEN NEW.kind='execution_reattachment' BEGIN SELECT RAISE(ABORT,'reattachment_link_failed'); END");
+      expect(() => s.controller.bindRuntime('b3', s.w2, cliNative)).toThrow('reattachment_link_failed');
+      expect(s.execution().runtime).toEqual(s.r2);
+      expect(s.store.runtime(s.ref, r3.runtimeId)?.identity).toEqual(cliBare);
+      db.exec('DROP TRIGGER fail_reattachment_link');
+      s.controller.bindRuntime('b3', s.w2, cliNative);
+      expect(s.execution().runtime).toEqual(r3);
+      expect(s.final(s.w2, { runtime: r3, execution: s.turn })).toMatchObject({ kind: 'current' });
+    } finally { db.close(); }
   });
 
   it('leaves a turn this worker already observes under a host grant where the grant names it', () => {

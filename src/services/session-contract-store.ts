@@ -45,6 +45,11 @@ function eventRuntime(event: ContractEvent): RuntimeRef | undefined {
   return undefined;
 }
 function terminalPhase(phase: string): boolean { return ['succeeded', 'failed', 'cancelled'].includes(phase); }
+/** Any execution ever bound here, including a settled newer turn. An opening
+ *  argv turn is deliberately absent until a runtime first binds it. */
+function hasBoundWork(executions: readonly ExecutionContract[], runtime: RuntimeRef): boolean {
+  return executions.some(execution => !!execution.runtime && sameRuntime(execution.runtime, runtime));
+}
 // Recovery replays these records to prove a runtime interval; never pruned.
 const structuralEvents = ['runtime_bound', 'runtime_reserved'];
 const retention = { events: 1024, executions: 256, results: 256, operations: 128, interval: 128 };
@@ -548,17 +553,18 @@ export class SessionContractStore {
         // Proven transitions or outstanding work in that interval prevent reuse.
         const history = (this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime'").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as RuntimeContract);
         const executions = this.executions(ref);
-        const previousHasOpenWork = executions.some(execution => !terminalPhase(execution.phase) && sameRuntime(execution.runtime, previous.ref));
-        if (previousHasOpenWork && sameBarePhysical) {
-          // Work still open on the selected bare observation keeps the older
-          // runtime out of reach. The complete identity is that same live
-          // process, so it completes the selected runtime: refusing the binding
-          // would leave a re-attached worker, and that work, with no runtime.
+        const previousHasBoundWork = hasBoundWork(executions, previous.ref);
+        if (previousHasBoundWork && sameBarePhysical) {
+          // Work already bound to the selected bare observation keeps the older
+          // runtime out of reach, even after that newer work settled. The
+          // complete identity is that same live process, so it completes the
+          // selected runtime: refusing the binding would leave a re-attached
+          // worker, and that work, with no runtime.
           if (['retiring', 'stopped'].includes(previous.phase)) throw new Error('runtime_recovery_has_active_execution');
           reuse = previous;
         }
         const records = (this.db.prepare("SELECT value FROM events WHERE session_key=? AND type IN ('runtime_bound','runtime_reserved')").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as Extract<ContractEvent, { type: 'runtime_bound' | 'runtime_reserved' }>);
-        const candidates = reuse || previousHasOpenWork ? [] : history.filter(runtime => runtime.phase === 'unresolved'
+        const candidates = reuse || previousHasBoundWork ? [] : history.filter(runtime => runtime.phase === 'unresolved'
           && runtime.ref.epoch < previous.ref.epoch && reusableRuntimeIdentity(runtime.identity, identity));
         if (candidates.length === 1) {
           const candidate = candidates[0];
@@ -575,13 +581,12 @@ export class SessionContractStore {
           const uncertainOnly = [...interval, ...proven].every(runtime => !runtime.identity || ((samePhysicalRuntimeIdentity(runtime.identity, identity)
             && runtime.identity.nativeSessionId === undefined && runtime.identity.nativeGeneration === undefined)
             || isContinuedBareLauncher(runtime)));
-          const openIntervalRuntimes = interval.filter(runtime => executions.some(execution =>
-            !terminalPhase(execution.phase) && sameRuntime(runtime.ref, execution.runtime)));
-          if (openIntervalRuntimes.some(runtime => !isContinuedBareLauncher(runtime))) {
+          const intervalRuntimesWithWork = interval.filter(runtime => hasBoundWork(executions, runtime.ref));
+          if (intervalRuntimesWithWork.some(runtime => !isContinuedBareLauncher(runtime))) {
             throw new Error('runtime_recovery_has_active_execution');
           }
           const candidateProofs = records.filter(event => event.type === 'runtime_bound' && sameRuntime(event.runtime.ref, candidate.ref));
-          const complete = openIntervalRuntimes.length === 0
+          const complete = intervalRuntimesWithWork.length === 0
             && interval.length === proposed.epoch - candidate.ref.epoch - 1
             && new Set(interval.map(runtime => runtime.ref.epoch)).size === interval.length
             && interval.every(runtime => Number.isSafeInteger(runtime.ref.epoch)
@@ -768,11 +773,9 @@ export class SessionContractStore {
         || !sameWorker(current.worker, worker) || !['starting', 'ready'].includes(current.phase)
         || identity?.proof !== 'process_start' || !identity.nativeSessionId) return [];
       const executions = this.executions(ref);
-      const hasBoundWork = (runtime: RuntimeRef): boolean => executions.some(execution =>
-        !!execution.runtime && sameRuntime(execution.runtime, runtime));
       // Any input already run here means the CLI moved on since, even after
       // that newer attempt settled; a late older reply must not follow it.
-      if (hasBoundWork(live)) return [];
+      if (hasBoundWork(executions, live)) return [];
       const open = executions.filter(execution => execution.runtime && !execution.terminal && !terminalPhase(execution.phase));
       if (!open.length) return [];
       const history = (this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime'").all(sessionKey(ref)) as Array<{ value: string }>)
@@ -816,7 +819,7 @@ export class SessionContractStore {
           && interval.every(runtime => records.some(event => event.type === 'runtime_reserved' && sameRuntime(event.runtime.ref, runtime.ref)));
         const uncertainOnly = [...interval, ...bound.filter(between)]
           .every(runtime => !runtime.identity || sameConversation(runtime.identity) || continuedBareLauncher(runtime))
-          && interval.every(runtime => !hasBoundWork(runtime.ref));
+          && interval.every(runtime => !hasBoundWork(executions, runtime.ref));
         if (!complete || !uncertainOnly) continue;
         const result = this.applyInside(ref, { type: 'execution_reattached', execution: execution.ref, from: execution.runtime!, runtime: live },
           `reattach:${execution.ref.executionId}:${live.runtimeId}:${live.epoch}`);
