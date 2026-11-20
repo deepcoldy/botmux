@@ -479,6 +479,32 @@ describe('cross-conversation delivery boundaries', () => {
       { ...emptyGate, terminalStatus: 'completed' }, 200, [delivered], false,
     )).toBe(false);
   });
+
+  // Transcript delivery (the default for transcript-capable CLIs): the forwarded
+  // final IS the answer, and botmux send only carries what it cannot — a
+  // cross-bot @ in another chat, a report to an orchestrator, a progress detour.
+  // Only a declared final that already answered this conversation retires it.
+  describe('under transcript delivery', () => {
+    const otherRoot = { deliveryKind: 'detoured_send', targetChatId: 'oc_source', targetRootMessageId: 'om_other_root' } as const;
+    it('a same-chat --into final already answered this conversation', () => {
+      expect(shouldSuppressBridgeEmit(gate(), 200, [marker(otherRoot)], false, 'transcript')).toBe(true);
+    });
+
+    it.each([
+      ['a cross-chat send (e.g. @-ing a bot elsewhere)', { deliveryKind: 'detoured_send', targetChatId: 'oc_other' }],
+      ['a report to an orchestrator session', { deliveryKind: 'dispatch_report', targetSessionId: 'session-orchestrator' }],
+      ['a progress-only same-chat detour', { ...otherRoot, responseKind: 'progress' }],
+    ] as const)('still forwards the source-topic final after %s', (_label, routing) => {
+      expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false, 'transcript')).toBe(false);
+    });
+
+    it('a shorter progress send in this topic does not swallow the forwarded final', () => {
+      expect(shouldSuppressBridgeEmit(gate(), 200, [marker({
+        deliveryKind: 'current_session_send', targetChatId: 'oc_source', responseKind: 'progress',
+        contentLength: normalise('已收到，开始处理').length, previewText: '已收到，开始处理',
+      })], false, 'transcript')).toBe(false);
+    });
+  });
 });
 
 describe('mixed turn-identity rolling-upgrade fallback', () => {

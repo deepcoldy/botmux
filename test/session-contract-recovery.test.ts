@@ -55,7 +55,7 @@ function restartHarness(s: ReturnType<typeof fixture>) {
     isSessionTransferring: () => false, sessionContractPrimary: () => false, isSessionRestartInFlight: () => false,
     topicEffortRestartReadiness: new Map(), restartIpcReason: () => ({}), restartSessionEnvFields: () => ({}),
     latestModelForRespawn: () => undefined, latestTraexAutoModelForRespawn: () => undefined,
-    latestCodexRpcInputForRespawn: () => undefined, latestLarkToolBindingForRespawn: () => undefined,
+    latestCodexRpcInputForRespawn: () => undefined, latestLarkToolBindingForRespawn: () => undefined, latestReplyDeliveryForRespawn: () => undefined,
     latestPinEffortForRespawn: () => ({}), latestLaunchCommandsForRespawn: () => ({}),
     destroyLivePaneBeforeRestart: vi.fn(), forkWorker: vi.fn(), logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test' };
   scope.restartCoordinator = loadWorkerPoolClosure('restartCoordinator', scope);
