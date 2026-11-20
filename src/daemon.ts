@@ -7267,6 +7267,8 @@ function commandDepsForInvocation(input: {
   anchor: string;
   messageId: string;
   replyRootId?: string;
+  /** Sender identity already resolved by the route, including cross-ref peer bots. */
+  senderIsBot: boolean;
 }): CommandHandlerDeps {
   const replyTarget = resolveInboundReplyTarget({
     scope: input.scope,
@@ -7278,6 +7280,22 @@ function commandDepsForInvocation(input: {
     ...commandDeps,
     invocationContext: input.context,
     invocationReplyTarget: replyTarget,
+    deliverCliCommand: (ds, command, message) => {
+      // Same refusal as a routed passthrough: a raw command must not overtake
+      // an ordinary message that is still being submitted.
+      if (ds.worker && !ds.worker.killed && hasQueuedActivationAdmissionGate(ds)) {
+        logger.warn(`[${input.anchor.substring(0, 12)}] Refused ${command} before acceptance while queued activation owns raw submission order`);
+        return 'activation_pending';
+      }
+      return deliverPassthroughToExistingSession(ds, command, command, input.anchor, ds.larkAppId, {
+        messageId: input.messageId,
+        replyRootId: input.replyRootId,
+        senderOpenId: message.senderId,
+        senderIsBot: input.senderIsBot,
+        substitute: false,
+        inThread: !!message.threadId,
+      }) ? 'delivered' : 'rejected';
+    },
     sessionReply: (rootId, content, msgType, larkAppId, turnId, opts) =>
       sessionReply(
         rootId,
@@ -28302,7 +28320,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       teamTrustUnionId,
       teamTrustAppId,
       botSender: senderIsBotForSlashGate,
-      deps: commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId }),
+      deps: commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId, senderIsBot: isForeignBotSender }),
     });
     return true;
   }
@@ -28311,7 +28329,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
   if (slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, slashDecision.cmd);
     if (restrictedText) {
-      await commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId })
+      await commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId, senderIsBot: isForeignBotSender })
         .sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
     }
@@ -28325,6 +28343,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       anchor,
       messageId: parsed.messageId,
       replyRootId,
+      senderIsBot: isForeignBotSender,
     });
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
     if (restrictedText) {
@@ -28357,6 +28376,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
             chatId,
             anchor: chatId,
             messageId: parsed.messageId,
+            senderIsBot: isForeignBotSender,
           })
         : invocationDeps;
       if (!canTalkForGroupSessions(
@@ -32273,6 +32293,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       anchor,
       messageId: parsed.messageId,
       replyRootId,
+      senderIsBot: isForeignBotSender,
     });
     const cascadeChatId = cascadeDs.chatId ?? chatId;
     // 与单条透传同一组闸，逐条命令过一遍：grant 限制、排队激活提交闸、/fast 后端门。
@@ -32331,7 +32352,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       teamTrustUnionId,
       teamTrustAppId,
       botSender: isBotSenderType || isForeignBotSender,
-      deps: commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId }),
+      deps: commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId, senderIsBot: isForeignBotSender }),
     });
     return true;
   }
@@ -32339,7 +32360,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   if (slashDecision && slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, existingDs?.chatId ?? chatId, senderOpenId, slashDecision.cmd);
     if (restrictedText) {
-      await commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId })
+      await commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId, senderIsBot: isForeignBotSender })
         .sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
     }
@@ -32353,6 +32374,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       anchor,
       messageId: parsed.messageId,
       replyRootId,
+      senderIsBot: isForeignBotSender,
     });
     invocationDeps.submitEffortTask = async (ds, message, text) => {
       const committed = !!ctx.durablePrimaryDispatch && hasDurablePrimaryInputCommit(ds, message.messageId);
@@ -34542,6 +34564,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onOwnerDiagnostic: (ds, diagnostic) =>
       workerOwnerDiagnostics.report(ds.larkAppId, ds.session.sessionId, diagnostic),
     larkAppId: cfg.larkAppId,
+    // Backend-outage summary: one DM per outage, to the bot's current owner
+    // (same resolution as the host-memory alert; apiOnly bots have no DM).
+    notifyOwner: async (appId, content) => {
+      const owner = resolveWorkerAdmissionOwner(appId, { getBot, getOwnerOpenId });
+      if (!owner) {
+        logger.warn(`[backend-outage] no owner to send the outage summary to for ${appId}`);
+        return;
+      }
+      await sendUserMessage(appId, owner, content, 'text', undefined, { timeoutMs: 10_000 });
+    },
     onMemoryAdmissionBlocked: (ds, decision) =>
       memoryAdmissionOwnerAlerts.report(ds.larkAppId, ds.session.sessionId, decision),
     sessionReply,

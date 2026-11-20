@@ -498,6 +498,9 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       // hold a no-op (undefined controller short-circuits the optional chain).
       const traexAutoModelController = undefined;
       const traexAutoModelRuntimeEligible = () => false;
+      // This scenario has no writable Web terminal: the dirty-wire write gate
+      // must stay open for the queue-only capture identity harness.
+      const webTerminalInputWireDirty = () => false;
       const retiredTurnIds = new Set();
       const started = [];
       const syncQueuedTurnsFromMarkerDisk = () => false;

@@ -117,6 +117,7 @@
 | `providerRecovery` | 仅 Claude Code：模型服务暂时出错时自动续跑，例如 `{"enabled":true,"maxWaitMinutes":30}`。没写的字段沿用全局设置，默认关闭。说明见[全局设置：暂态故障自动续跑](/global-settings#provider-recovery) |
 | `skillInjection` | botmux 自带 skill 怎么交给 CLI：`prompt`（按会话注入）、`global`（装进 CLI 全局 skill 目录）、`off`。不填时跟随全局设置，全局默认是 `prompt`。见 [Skill](/skill-cli) |
 | `customPassthroughCommands` | 额外允许透传给 CLI 的斜杠命令，例如 `["/export"]`。会和 botmux 自己命令重名的项会被丢掉。用 `/list-slash-command` 看完整放行清单。见[斜杠命令](/slash-commands) |
+| `bareRenamePassthrough` | 默认关闭。设 `true` 后，不带标题的 `/rename` 会原样交给 CLI，由 CLI 根据对话给会话起名（目前只有 Claude Code 支持，接管的会话也算）。见[斜杠命令](/slash-commands#rename-cli) |
 | `startupCommands` | 会话启动后、第一条消息之前自动发给 CLI 的命令，例如 `["/effort ultracode"]`。每次新启动或恢复都会重发 |
 | `quotaFallbackBot` | CLI 额度用完后自动交接给另一个 bot。默认关闭。见下方[额度用完自动交接](#quota-fallback) |
 | `codexCapacityRecovery` | 仅 Codex / Codex App：遇到明确的模型容量错误时自动续跑。默认关闭；每个任务最多追加两条续跑输入。普通限流和额度用完不算 |
@@ -418,7 +419,7 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 | `scratchDenyPaths` | 仅 `scratch`：额外遮住的路径。botmux 自己的凭证总是遮住的 |
 | `sandboxNetwork` | 默认 `true` 保留网络；`false` 断开普通网络出口 |
 | `sandboxNetworkPolicy` | 按公网 / 内网分别过滤目标 IP 的高级网络策略 |
-| `credentialsSourceDir` | 沙盒 bot 每次启动时从这个目录复制 CLI 登录凭证，而不是用本机共享的登录。适合一台机器多个账号 |
+| `credentialsSourceDir` | `claude-code` bot 每次冷启动时从这个目录复制登录凭证，而不是用本机共享的登录，白名单隔离（oncall）或关闭沙盒时可用，scratch 会拒绝启动。未开沙盒时会改用 bot 专属数据目录；适合一台机器多个账号 |
 | `codexAuthSync` | Codex 登录策略：`shared`（默认）沿用全局登录；`isolated` 始终用这个 bot 自己的 `CODEX_HOME`，不读也不复制全局凭证 |
 | `triggerUserAuth` | 默认关闭。开启后，会话里的 `lark-cli` 等工具以「发这条消息的人」自己的授权调用；没授权的人会收到授权链接 |
 | `larkToolBinding` | 默认开启：会话里的 `lark-cli` 默认用当前 bot 的应用身份调用，可用 `--as user`、`--profile` 切换。设 `false` 完全不注入 bot 凭据 |
