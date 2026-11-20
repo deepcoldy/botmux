@@ -39,6 +39,7 @@ interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: Mainte
 
 interface DashboardSettings {
   groupNamePrefix: string;
+  groupOwnerNotice: boolean;
   worktreeRoot: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
@@ -218,6 +219,8 @@ function traexInstallMessage(install: any, tr: (k: string) => string): StatusMes
 export function parseSettings(s: any): DashboardSettings {
   return {
     groupNamePrefix: typeof s?.groupNamePrefix === 'string' ? s.groupNamePrefix : '',
+    // default ON — only an explicit persisted false disables (server snapshot)
+    groupOwnerNotice: s?.groupOwnerNotice !== false,
     worktreeRoot: typeof s?.worktreeRoot === 'string' ? s.worktreeRoot : '',
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
@@ -918,7 +921,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'terminalEffortWriteback' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'modelQueueNotify' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'groupOwnerNotice' | 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'terminalEffortWriteback' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'modelQueueNotify' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -1059,6 +1062,14 @@ export function SettingsBody(props: {
               { groupNamePrefix: value },
               s => ({ ...s, groupNamePrefix: value }),
             )}
+          />
+          <ToggleRow
+            title={tr('settings.groupOwnerNotice')}
+            help={tr('settings.groupOwnerNoticeHelp')}
+            checked={settings.groupOwnerNotice}
+            disabled={dis || savingKey === 'groupOwnerNotice'}
+            dataAction="toggle-group-owner-notice"
+            onChange={value => saveBoolean('groupOwnerNotice', value)}
           />
         </SettingsBlock>
         <SettingsBlock id="settings-experimental" title={tr('settings.sectionExperimental')}>

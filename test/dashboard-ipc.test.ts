@@ -26,6 +26,7 @@ import { rmwBotEntry } from '../src/services/config-store.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
+import { invalidateGlobalConfigCache, setGroupOwnerNoticeEnabled } from '../src/global-config.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { resolveScheduleModelOverride } from '../src/core/schedule-model-override.js';
@@ -12274,6 +12275,83 @@ describe('POST /api/groups/create', () => {
     bindSpy.mockRestore();
     addSpy.mockRestore();
     createSpy.mockRestore();
+  });
+});
+
+/** Point the machine config at a throwaway file with the owner notice off. */
+function withGroupOwnerNoticeOff(): () => void {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-owner-notice-'));
+  vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(dir, 'config.json'));
+  invalidateGlobalConfigCache();
+  setGroupOwnerNoticeEnabled(false);
+  return () => {
+    vi.unstubAllEnvs();
+    invalidateGlobalConfigCache();
+    rmSync(dir, { recursive: true, force: true });
+  };
+}
+
+describe('groupOwnerNotice off on the Dashboard group routes', () => {
+  it('create: invites, transfers and binds as usual but posts no owner notice', async () => {
+    const restore = withGroupOwnerNoticeOff();
+    setLarkAppId('test-app');
+    const createSpy = vi.spyOn(groupsStore, 'createChat').mockResolvedValue({ chatId: 'oc_quiet', invalidBotIds: [], invalidUserIds: [] });
+    const addSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([{ id: 'cli_X', ok: true }]);
+    const linkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockResolvedValue({ ok: true, shareLink: 'https://example.test/chat' });
+    const transferSpy = vi.spyOn(groupsStore, 'transferChatOwner').mockResolvedValue({ ok: true });
+    const sendSpy = vi.spyOn(larkClient, 'sendMessage').mockResolvedValue('om_should_not_send');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/create`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          larkAppIds: ['test-app', 'cli_X'],
+          userOpenIds: ['ou_operator'],
+          transferOwnerTo: 'ou_operator',
+          notifyOwnerOpenId: 'ou_operator',
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true, chatId: 'oc_quiet', ownerTransferredTo: 'ou_operator', notifyMessageId: null, notifyError: null,
+      });
+      expect(createSpy).toHaveBeenCalledWith('test-app', expect.objectContaining({ userIds: ['ou_operator'] }));
+      expect(transferSpy).toHaveBeenCalledWith('test-app', 'oc_quiet', 'ou_operator');
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      sendSpy.mockRestore();
+      transferSpy.mockRestore();
+      linkSpy.mockRestore();
+      addSpy.mockRestore();
+      createSpy.mockRestore();
+      restore();
+    }
+  });
+
+  it('transfer-owner: completes the deferred team-group hand-over without the bare @', async () => {
+    const restore = withGroupOwnerNoticeOff();
+    setLarkAppId('test-app');
+    const transferSpy = vi.spyOn(groupsStore, 'transferChatOwner').mockResolvedValue({ ok: true });
+    const sendSpy = vi.spyOn(larkClient, 'sendMessage').mockResolvedValue('om_should_not_send');
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/groups/transfer-owner`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId: 'oc_team', ownerUnionId: 'on_operator' }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        ok: true, ownerTransferredTo: 'on_operator', transferError: null, notifyMessageId: null, notifyError: null,
+      });
+      expect(transferSpy).toHaveBeenCalledWith('test-app', 'oc_team', 'on_operator', 'union_id');
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      sendSpy.mockRestore();
+      transferSpy.mockRestore();
+      restore();
+    }
   });
 });
 

@@ -72,10 +72,11 @@ vi.mock('../src/services/feed-group-tagger.js', () => ({ addCreatedChatToFeedGro
 const mockLogoAvatar = vi.fn();
 vi.mock('../src/services/session-group-avatar.js', () => ({ applyLogoGroupAvatar: (...args: any[]) => mockLogoAvatar(...args) }));
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createGroupWithBots, transferGroupOwner } from '../src/services/group-creator.js';
+import { invalidateGlobalConfigCache, setGroupOwnerNoticeEnabled } from '../src/global-config.js';
 import { isStewardSilentJoin } from '../src/services/steward-auto-join.js';
 import { adminListFingerprint, writeBotAdminUnions } from '../src/services/bot-admin-unions-store.js';
 import { config } from '../src/config.js';
@@ -1198,5 +1199,151 @@ describe('transferGroupOwner', () => {
     });
     expect(mockGetChatOwner).toHaveBeenCalledWith(CREATOR, 'oc_deferred', 'union_id');
     expect(result).toEqual({ ownerTransferredTo: 'on_operator', transferError: null });
+  });
+});
+
+describe('createGroupWithBots — machine-wide groupOwnerNotice switch', () => {
+  // A real ~/.botmux/config.json stand-in: the switch is read through the real
+  // global-config + config.ts getter, the way a daemon or a one-shot
+  // `botmux create-group` process reads it.
+  let dir: string;
+  let configFile: string;
+  // The owner notice is the one message that @-mentions the new owner (kickoff
+  // and role bootstrap @ bots); identify it by that, not by its wording.
+  const ownerNotices = () => mockSendMessage.mock.calls.filter(call => String(call[2]).startsWith(`<at user_id="${USER_OPEN_ID}"></at>`));
+
+  beforeEach(() => {
+    for (const mock of [
+      mockCreateChat, mockTransferChatOwner, mockGetChatOwner, mockGetChatShareLink, mockSendMessage,
+      mockListChatBotMembers, mockResolveAllowedUsersWithMap, mockAddUsersByOpenId, mockAddUsersByUnionId,
+      mockAddBotToChat, mockAddChatManagers, mockBindOncall,
+    ]) mock.mockReset();
+    mockGetChatShareLink.mockResolvedValue({ ok: true, shareLink: SHARE_LINK });
+    mockAddUsersByOpenId.mockResolvedValue({ invalidUserIds: [] });
+    mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: [] });
+    mockAddChatManagers.mockImplementation(async (_app: string, _chat: string, ids: string[]) => ({ ok: true, addedManagers: ids }));
+    mockAddBotToChat.mockImplementation(async (_app: string, _chat: string, ids: string[]) => ids.map(id => ({ id, ok: true })));
+    mockResolveAllowedUsersWithMap.mockResolvedValue({ resolved: [USER_OPEN_ID], map: new Map([['on_operator', USER_OPEN_ID]]) });
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+    mockSendMessage.mockImplementation(async () => `om_${mockSendMessage.mock.calls.length}`);
+    dir = mkdtempSync(join(tmpdir(), 'botmux-owner-notice-'));
+    configFile = join(dir, 'config.json');
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', configFile);
+    invalidateGlobalConfigCache();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    invalidateGlobalConfigCache();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // The shape `botmux create-group`, `/group` and Dashboard creation all send:
+  // invite the owner, hand the chat over, and @ them.
+  const createForOwner = (chatId: string, extra: Partial<Parameters<typeof createGroupWithBots>[0]> = {}) => {
+    mockCreateChat.mockResolvedValue({ chatId, invalidBotIds: [], invalidUserIds: [] });
+    return createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      userOpenIds: [USER_OPEN_ID],
+      transferOwnerTo: USER_OPEN_ID,
+      notifyOwnerOpenId: USER_OPEN_ID,
+      ...extra,
+    });
+  };
+
+  it('keeps the owner notice by default: no config file, or an explicit true', async () => {
+    const unset = await createForOwner('oc_default');
+    writeFileSync(configFile, JSON.stringify({ groupOwnerNotice: true }));
+    invalidateGlobalConfigCache();
+    const explicitOn = await createForOwner('oc_explicit_on');
+
+    expect(ownerNotices().map(call => call[1])).toEqual(['oc_default', 'oc_explicit_on']);
+    expect(unset.notifyMessageId).not.toBeNull();
+    expect(explicitOn.notifyMessageId).not.toBeNull();
+  });
+
+  it('off: no owner notice, while invites, owner transfer and managers still happen', async () => {
+    setGroupOwnerNoticeEnabled(false);
+    expect(JSON.parse(readFileSync(configFile, 'utf-8'))).toEqual({ groupOwnerNotice: false });
+
+    const result = await createForOwner('oc_quiet', { managerUserIds: ['ou_manager'] });
+
+    expect(mockCreateChat).toHaveBeenCalledWith(CREATOR, expect.objectContaining({ userIds: [USER_OPEN_ID] }));
+    expect(mockAddBotToChat).toHaveBeenCalledWith(CREATOR, 'oc_quiet', [OTHER_BOT]);
+    expect(mockTransferChatOwner).toHaveBeenCalledWith(CREATOR, 'oc_quiet', USER_OPEN_ID);
+    expect(mockAddChatManagers).toHaveBeenCalledWith(CREATOR, 'oc_quiet', ['ou_manager']);
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      ownerTransferredTo: USER_OPEN_ID,
+      transferError: null,
+      managersAdded: ['ou_manager'],
+      notifyMessageId: null,
+      notifyError: null,
+    });
+  });
+
+  it('off: the team-group union_id hand-over posts no implicit notice and reports no notify error', async () => {
+    setGroupOwnerNoticeEnabled(false);
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_team', invalidBotIds: [], invalidUserIds: [] });
+    const handedOver = await createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR, OTHER_BOT],
+      ownerUnionIds: ['on_operator'], transferOwnerUnionId: 'on_operator',
+    });
+    expect(mockTransferChatOwner).toHaveBeenCalledWith(CREATOR, 'oc_team', USER_OPEN_ID);
+    expect(handedOver).toMatchObject({ ownerTransferredTo: USER_OPEN_ID, notifyMessageId: null, notifyError: null });
+
+    // A rejected operator invite still fails the transfer, but with the notice
+    // switched off there is no notice to have failed.
+    mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: ['on_operator'] });
+    const rejected = await createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR],
+      ownerUnionIds: ['on_operator'], transferOwnerUnionId: 'on_operator',
+    });
+    expect(rejected).toMatchObject({ transferError: 'invitee_rejected', notifyError: null });
+    expect(mockSendMessage).not.toHaveBeenCalled();
+  });
+
+  it('off: only the owner notice is dropped — an explicit kickoff still posts', async () => {
+    setGroupOwnerNoticeEnabled(false);
+    mockListChatBotMembers.mockResolvedValue([{ larkAppId: OTHER_BOT, openId: 'ou_other_bot', mentionable: true }]);
+    const result = await createForOwner('oc_kickoff', { kickoffBotLarkAppId: OTHER_BOT, kickoffPrompt: 'review PR' });
+
+    expect(ownerNotices()).toEqual([]);
+    expect(mockSendMessage).toHaveBeenCalledWith(CREATOR, 'oc_kickoff', '<at user_id="ou_other_bot"></at> review PR', 'text');
+    expect(result.kickoffMessageId).not.toBeNull();
+    expect(result.kickoffError).toBeNull();
+  });
+
+  it('a per-call ownerNotice:false stays silent even with the switch explicitly on', async () => {
+    writeFileSync(configFile, JSON.stringify({ groupOwnerNotice: true }));
+    invalidateGlobalConfigCache();
+    const result = await createForOwner('oc_workflow', { ownerNotice: false });
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ ownerTransferredTo: USER_OPEN_ID, notifyMessageId: null, notifyError: null });
+  });
+
+  it('a flip reaches the next creation in the same process, no restart: CLI write, then another process editing the file', async () => {
+    setGroupOwnerNoticeEnabled(false);
+    await createForOwner('oc_off');
+    setGroupOwnerNoticeEnabled(true);
+    // Turning it back on removes the key instead of pinning the default.
+    expect(JSON.parse(readFileSync(configFile, 'utf-8'))).toEqual({});
+    await createForOwner('oc_back_on');
+    expect(ownerNotices().map(call => call[1])).toEqual(['oc_back_on']);
+
+    // Another process (Dashboard, a hand edit) writes the file: a long-lived
+    // daemon picks it up once its short read cache has expired.
+    const start = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    try {
+      await createForOwner('oc_cached');
+      writeFileSync(configFile, JSON.stringify({ groupOwnerNotice: false }));
+      clock.mockReturnValue(start + 60_000);
+      await createForOwner('oc_other_process_off');
+    } finally {
+      clock.mockRestore();
+    }
+    expect(ownerNotices().map(call => call[1])).toEqual(['oc_back_on', 'oc_cached']);
   });
 });

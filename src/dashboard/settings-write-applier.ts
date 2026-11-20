@@ -55,6 +55,8 @@ import { isValidTimeZone } from '../utils/timezone.js';
  */
 export interface ResolvedDashboardSettingsView {
   groupNamePrefix: string;
+  /** Whether new groups @-mention their owner with the "group is ready" notice. Default ON. */
+  groupOwnerNotice: boolean;
   worktreeRoot: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
@@ -171,6 +173,18 @@ export interface ResolvedDashboardSettingsView {
   effectiveScheduleTimeZone?: string;
 }
 
+/** Group-creation fields of the Dashboard settings snapshot. `groupOwnerNotice`
+ *  must agree with what group creation reads (config.ts `groupOwnerNotice`):
+ *  only an explicit stored `false` shows the switch off. */
+export function resolveGroupCreationSettings(
+  global: Pick<GlobalConfig, 'groupNamePrefix' | 'groupOwnerNotice'>,
+): Pick<ResolvedDashboardSettingsView, 'groupNamePrefix' | 'groupOwnerNotice'> {
+  return {
+    groupNamePrefix: global.groupNamePrefix ?? '',
+    groupOwnerNotice: global.groupOwnerNotice !== false,
+  };
+}
+
 export type ParseMaintenanceResult =
   | { ok: true; patch: MaintenanceConfig }
   | { ok: false; error: string };
@@ -269,6 +283,7 @@ export type ApplySettingsWriteResult =
  */
 export type ApplySettingsWriteError =
   | 'invalid_groupNamePrefix'
+  | 'invalid_groupOwnerNotice'
   | 'invalid_worktreeRoot'
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
@@ -473,6 +488,16 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_groupNamePrefix' };
     }
     groupNamePrefixPatch = groupNamePrefix ?? null;
+  }
+
+  // Default ON: only `false` is stored; writing `true` deletes the key so the
+  // file never pins the default (same shape as stuckCardInitiatorKeys).
+  let groupOwnerNoticePatch: false | null | undefined;
+  if ('groupOwnerNotice' in obj) {
+    if (typeof obj.groupOwnerNotice !== 'boolean') {
+      return { ok: false, error: 'invalid_groupOwnerNotice' };
+    }
+    groupOwnerNoticePatch = obj.groupOwnerNotice ? null : false;
   }
 
   // The directory must already exist: a typo would otherwise have the next
@@ -1064,6 +1089,11 @@ export async function applySettingsWrite(
   // 返回失败却已经改变了 `/group` 的建群命名。
   if (groupNamePrefixPatch !== undefined) {
     deps.mergeGlobalConfig({ groupNamePrefix: groupNamePrefixPatch });
+    touched = true;
+  }
+
+  if (groupOwnerNoticePatch !== undefined) {
+    deps.mergeGlobalConfig({ groupOwnerNotice: groupOwnerNoticePatch });
     touched = true;
   }
 
