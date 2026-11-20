@@ -4743,8 +4743,15 @@ async function resolveQuotaFallbackForSession(
   });
 }
 
+/** 在运行态保留已观察的拒绝，SQLite 写入回滚时仍可重试 */
+function rememberSessionAntigravityQuota(ds: DaemonSession, limit: CliUsageLimitState): void {
+  const history = ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory;
+  ds.antigravityQuotaHistory = rememberAntigravityQuota(history, limit);
+}
+
 export function clearUsageLimitState(ds: DaemonSession): void {
   const previous = ds.usageLimit;
+  if (previous) rememberSessionAntigravityQuota(ds, previous);
   ds.usageLimit = undefined;
   try {
     persistStreamCardState(ds);
@@ -4878,7 +4885,7 @@ function armUsageLimitRetryTimer(ds: DaemonSession, previous?: CliUsageLimitStat
 export function restoreUsageLimitRuntimeState(ds: DaemonSession): void {
   if (!ds.usageLimit) return;
   // 旧会话只存了当前限额，恢复时先保留它的身份，后续清除状态也能识别残留提示
-  ds.session.antigravityQuotaHistory = rememberAntigravityQuota(ds.session.antigravityQuotaHistory, ds.usageLimit);
+  rememberSessionAntigravityQuota(ds, ds.usageLimit);
   ds.lastScreenStatus = 'limited';
   armUsageLimitRetryTimer(ds);
 }
@@ -4899,7 +4906,7 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
   ) return;
 
   ds.usageLimit = usageLimit;
-  ds.session.antigravityQuotaHistory = rememberAntigravityQuota(ds.session.antigravityQuotaHistory, usageLimit);
+  rememberSessionAntigravityQuota(ds, usageLimit);
   ds.usageLimitPersistPending = true;
   persistStreamCardState(ds);
   ds.usageLimitPersistPending = false;
@@ -19492,7 +19499,7 @@ function forkWorkerPrepared(
     workingDir: cwd,
     cliId: agentCfg.cliId,
     ...(agentCfg.cliId === 'antigravity' ? {
-      antigravityQuotaHistory: ds.session.antigravityQuotaHistory,
+      antigravityQuotaHistory: ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory,
       antigravityActiveQuota: ds.usageLimit,
     } : {}),
     cliRuntime: agentCfg.cliRuntime,
@@ -28747,7 +28754,7 @@ export function forkAdoptWorker(
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
     ...(adoptedCliId === 'antigravity' ? {
-      antigravityQuotaHistory: ds.session.antigravityQuotaHistory,
+      antigravityQuotaHistory: ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory,
       antigravityActiveQuota: ds.usageLimit,
     } : {}),
     codexProfile: agentCfg.codexProfile,

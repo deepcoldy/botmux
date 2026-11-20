@@ -212,6 +212,44 @@ describe('usage-limit sticky state self-heal', () => {
     }]);
   });
 
+  it.each(['first-write', 'legacy-clear'] as const)('persists cleared native quota history after a %s failure', async path => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 9, 1));
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_native_history_retry', 'native history retry', 'group', 'chat');
+    const ds = makeDs({ worker, workerPort: 9999, session });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const content = '⚠ Individual quota reached. Resets in 1m.\nError ID: old\n────\n>\n────\n';
+    const detected = detectCliUsageLimit(content);
+    if (!detected.limited) throw new Error('Expected relative quota');
+    const limit = annotateAntigravityUsageLimit(content, detected);
+    const idle = { type: 'screen_update', content, status: 'idle' } as const;
+    const failWrite = () => { throw new Error('injected SQLite write failure'); };
+
+    if (path === 'first-write') {
+      sessionStore.__testOnly_setBeforeRowPersist(failWrite);
+      await expect(dispatch(worker, { ...idle, status: 'limited', usageLimit: limit })).rejects.toThrow('injected SQLite write failure');
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+      await vi.advanceTimersByTimeAsync(60_000);
+    } else {
+      await vi.advanceTimersByTimeAsync(60_000);
+      session.usageLimit = { ...limit, retryReady: true };
+      sessionStore.updateSession(session);
+      ds.usageLimit = session.usageLimit;
+      restoreUsageLimitRuntimeState(ds);
+      expect(sessionStore.getSessionFresh(session.sessionId)?.antigravityQuotaHistory).toMatchObject([
+        { relativeResetKey: limit.relativeResetKey, retryAtMs: limit.retryAtMs },
+      ]);
+      sessionStore.__testOnly_setBeforeRowPersist(failWrite);
+      await expect(dispatch(worker, idle)).rejects.toThrow('injected SQLite write failure');
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    }
+    await dispatch(worker, idle);
+    const stored = sessionStore.getSessionFresh(session.sessionId);
+    expect(stored?.usageLimit).toBeUndefined();
+    expect(stored?.antigravityQuotaHistory).toMatchObject([{ relativeResetKey: limit.relativeResetKey, retryAtMs: limit.retryAtMs }]);
+  });
+
   it('restores both native quota episodes with their first deadlines from SQLite', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 9, 1));
