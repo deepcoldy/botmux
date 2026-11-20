@@ -13,6 +13,11 @@
  * creation path and the reattach backfill must leave `#{pane_input_off}` = 1
  * on the corpse, and a paste into it must leave the server (and its other
  * sessions) alive.
+ *
+ * tmux marks a pane dead (`#{pane_dead}` = 1) as soon as its terminal closes,
+ * but runs `pane-died` only once it has reaped the pane's process. A read in
+ * between legitimately answers `1:0` (CI caught that, #3667), so the hooked
+ * cases wait for the state the hook converges to, within the same bound.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -25,6 +30,12 @@ import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
 
+/** A pane process that lets go of its terminal and only then exits, which
+ *  widens the window between `#{pane_dead}` = 1 and `pane-died` from the
+ *  natural microseconds (#3667) to every run. HUP is ignored so tmux closing
+ *  the pty does not end it early. */
+const DIES_AFTER_CLOSING_TERMINAL = `trap '' HUP; exec </dev/null >/dev/null 2>&1; sleep 0.3; exit 3`;
+
 describe.skipIf(!realTmux)('a managed tmux pane refuses input once its CLI died', () => {
   let dir: string;
   const socket = 'bmxinputoff';
@@ -33,17 +44,42 @@ describe.skipIf(!realTmux)('a managed tmux pane refuses input once its CLI died'
   const tmux = (...args: string[]) =>
     spawnSync(realTmux!, ['-L', socket, ...args], { encoding: 'utf8', timeout: 5_000, env: { ...process.env } });
 
+  const paneState = (name: string) =>
+    String(tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_input_off}').stdout ?? '').trim();
+
   /** Poll until the pane is dead (before the backend reaps it), then return
-   *  its `#{pane_dead}:#{pane_input_off}` answer. */
+   *  its `#{pane_dead}:#{pane_input_off}` answer. Only for panes WITHOUT a
+   *  hook: with one, the first dead answer may predate the hook. */
   const waitForCorpse = async (name: string): Promise<string> => {
     const deadline = Date.now() + 20_000;
     let last = '';
     while (Date.now() < deadline) {
-      last = String(tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_input_off}').stdout ?? '').trim();
+      last = paneState(name);
       if (last.startsWith('1:')) return last;
       await new Promise(r => setTimeout(r, 25));
     }
     throw new Error(`pane ${name} never died (last answer: ${JSON.stringify(last)})`);
+  };
+
+  /** Wait, within the same bound, until a hooked corpse reaches the state the
+   *  `pane-died` hook converges to. Returns every distinct answer seen, so a
+   *  failure shows whether the pane died at all and where it stopped. */
+  const waitForInputOff = async (name: string): Promise<string> => {
+    const deadline = Date.now() + 20_000;
+    const seen: string[] = [];
+    while (Date.now() < deadline) {
+      const answer = paneState(name);
+      if (seen.at(-1) !== answer) seen.push(answer);
+      if (answer === '1:1') break;
+      if (!/^[01]:[01]$/.test(answer)) break; // the pane is gone: nothing left to converge
+      // tmux < 3.6 built with libutempter can drop the pane's SIGCHLD
+      // (tmux#4559) and then reaps it — and runs the hook — only when another
+      // child exits. A synchronous run-shell is that child; it does not touch
+      // the pane's input state itself.
+      if (answer === '1:0') tmux('run-shell', 'true');
+      await new Promise(r => setTimeout(r, 25));
+    }
+    return seen.join(' → ');
   };
 
   /** A paste into the corpse must not take the server down. */
@@ -90,13 +126,17 @@ describe.skipIf(!realTmux)('a managed tmux pane refuses input once its CLI died'
         cwd: workdir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: workdir,
       });
     } catch { /* an instantly dead CLI is reported as a startup failure */ }
-    expect(await waitForCorpse('bmx-inputoff-fresh')).toBe('1:1');
+    expect(await waitForInputOff('bmx-inputoff-fresh')).toMatch(/1:1$/);
     pasteIntoCorpseLeavesServerUp('bmx-inputoff-fresh');
   }, 40_000);
 
   it('backfills the hook on a session an older build created, when reattaching', async () => {
-    // Created the way an older build did: remain-on-exit, but no hook.
-    expect(tmux('new-session', '-d', '-s', 'bmx-inputoff-old', 'sleep 2; exit 3',
+    // Created the way an older build did: remain-on-exit, but no hook. Its
+    // CLI dies only once the reattach has finished: a fixed lifetime raced
+    // spawn() itself under load (and a corpse found by spawn is reaped).
+    const release = join(dir, 'release-old');
+    expect(tmux('new-session', '-d', '-s', 'bmx-inputoff-old',
+      `until [ -e '${release}' ]; do sleep 0.05; done; ${DIES_AFTER_CLOSING_TERMINAL}`,
       ';', 'set-option', '-t', 'bmx-inputoff-old', 'remain-on-exit', 'on').status).toBe(0);
     const backend = new TmuxPipeBackend('bmx-inputoff-old', { ownsSession: true, isReattach: true, socketName: socket });
     backends.push(backend);
@@ -104,7 +144,9 @@ describe.skipIf(!realTmux)('a managed tmux pane refuses input once its CLI died'
     backend.spawn('/bin/sh', ['-c', 'exit 0'], {
       cwd: workdir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: workdir,
     });
-    expect(await waitForCorpse('bmx-inputoff-old')).toBe('1:1');
+    expect(paneState('bmx-inputoff-old')).toBe('0:0');
+    writeFileSync(release, '');
+    expect(await waitForInputOff('bmx-inputoff-old')).toMatch(/1:1$/);
     pasteIntoCorpseLeavesServerUp('bmx-inputoff-old');
   }, 40_000);
 
