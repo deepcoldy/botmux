@@ -5149,8 +5149,15 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
       + `result=${delegatedIdentity.denialReason ?? 'delegated'}`,
     );
   }
+  // A cross-chat reply has a human sender in the followed chat, but that person
+  // did not speak into this session and must not become its CLI principal. Keep
+  // this narrower than registryTurnMayAuthenticateHuman: asynchronous answers
+  // and unattended external turns use synthetic ids while still refreshing the
+  // identity of the person already bound to their per-turn reply target. Read
+  // the origin from that same captured record as the sender; the separately
+  // bounded context map can be pruned or rebound while delegation is awaited.
   const turnSenderOpenId = delegationBlocked
-    || !registryTurnMayAuthenticateHuman(ds.session, turnId)
+    || reply?.crossChatOrigin
     || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
     || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
     ? undefined : reply?.senderOpenId;
