@@ -11,8 +11,9 @@ import { randomBytes } from 'node:crypto';
  *  - `cli_crash`       — daemon auto-restart after an unexpected CLI exit.
  *  - `dashboard`       — dashboard restart button (operator).
  *  - `cwd_move`        — role-switch working-directory move (respawn in new cwd).
+ *  - `account_rotation` — automatic Antigravity account rotation after quota limit.
  */
-export type RestartSource = 'slash' | 'card' | 'cli_crash' | 'dashboard' | 'cwd_move';
+export type RestartSource = 'slash' | 'card' | 'cli_crash' | 'dashboard' | 'cwd_move' | 'account_rotation';
 export type RestartTerminalStatus = 'succeeded' | 'failed' | 'timed_out';
 /**
  * `cancelled`: the attempt was dropped without a result because the session's
@@ -121,7 +122,10 @@ export class RestartCoordinator {
   }
 
   activeAttemptId(sessionId: string): string | undefined {
-    return this.attempts.get(sessionId)?.id;
+    const active = this.attempts.get(sessionId);
+    if (active) return active.id;
+    const restored = this.options.persistence?.restore(sessionId);
+    return restored && !restored.planned ? restored.id : undefined;
   }
 
   reset(): void {

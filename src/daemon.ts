@@ -170,7 +170,7 @@ import {
   type VcMeetingConsumerAgentConfig,
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
-import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
+import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from './im/lark/streaming-card-buttons.js';
 import { buildMarkdownCard, contextPercentUsed } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
@@ -7118,6 +7118,8 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string, opts: { 
       false,
       substituteCardControlFor(ds),
       ds.keysPanelOpen === true,
+      undefined,
+      resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
     );
     scheduleCardPatch(ds, frozenCard);
 

@@ -1211,6 +1211,8 @@ export function buildStreamingCard(
    *  through every PATCH so streaming refreshes don't snap the grid shut. */
   keysPanelOpen = false,
   codexAppStopTarget?: string,
+  /** Default true preserves the current card; false restores the pre-folding layout. */
+  foldedLayout = true,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1287,7 +1289,7 @@ export function buildStreamingCard(
   // 生效；不设时窄屏把每个按钮拉成整行竖排。flow 让按钮按文字宽度横排、放不下才折行：
   // 手机上主区行数减少（中文工作中常见 4 行 → 2 行），桌面宽卡排法不变。不用 bisected：
   // 等分半宽列放不下「打开 Web 终端」「Open Web Terminal」等标签，会被截断。
-  if (primaryActions.length > 0) elements.push({ tag: 'action', layout: 'flow', actions: primaryActions });
+  if (foldedLayout && primaryActions.length > 0) elements.push({ tag: 'action', layout: 'flow', actions: primaryActions });
 
   // ── Secondary row + collapsible panels ──────────────────────────────────
   // The terminal-key grid is a daemon-controlled toggle (state must survive
@@ -1298,7 +1300,7 @@ export function buildStreamingCard(
   // back on the next streaming PATCH is harmless.
   const keysAvailable = displayMode === 'screenshot' && !isRemoteCliId(cliId);
   const primaryMode = coordinationModeIsPrimary();
-  if (keysAvailable && !primaryMode) {
+  if (foldedLayout && keysAvailable && !primaryMode) {
     elements.push({
       tag: 'action',
       actions: [
@@ -1380,7 +1382,22 @@ export function buildStreamingCard(
       { action: 'toggle_substitute', desired: substituteControl.enabled ? 'off' : 'on', ...actionBase },
     ));
   }
-  if (morePanelButtons.length > 0) {
+  if (!foldedLayout) {
+    // Restore the pre-#3101 order without rebuilding callbacks: capability,
+    // visibility, nonce and durable desired-state guards remain identical.
+    const order = [
+      'toggle_display', 'export_text', 'refresh_screenshot', 'terminal',
+      'open_local_cli', 'retry_last_task', 'get_write_link', 'compact_session',
+      'toggle_idle_compact', 'toggle_kimi_expiry_compact', 'toggle_substitute',
+      'stop_turn', 'takeover', 'disconnect', 'close',
+    ];
+    const rank = (button: any): number => {
+      const index = order.indexOf(button.value?.action ?? 'terminal');
+      return index === -1 ? order.length : index;
+    };
+    const actions = [...primaryActions, ...morePanelButtons].sort((a, b) => rank(a) - rank(b));
+    if (actions.length > 0) elements.push({ tag: 'action', actions });
+  } else if (morePanelButtons.length > 0) {
     // Two weighted columns keep labels on one line even on a phone-sized card;
     // an odd last button simply occupies the first column of the final row.
     const panelRows: any[] = [];
@@ -1465,11 +1482,27 @@ export function buildStreamingCard(
   //    事实源，新增远端 CLI 自动跟随）。weighted columns pin the keys into a
   //    fixed grid: the old `action` rows stacked every key full-width on narrow
   //    cards, which is what made the card a long vertical strip.
-  if (keysAvailable && (primaryMode || keysPanelOpen)) {
-    const mkKey = (label: string, key: string) => ({
-      ...callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }),
-      width: 'fill' as const,
+  const mkKey = (label: string, key: string) => ({
+    ...callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }),
+    ...(foldedLayout ? { width: 'fill' as const } : {}),
+  });
+  if (keysAvailable && !foldedLayout) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        mkKey('Esc', 'esc'), mkKey('^C', 'ctrlc'), mkKey('Tab', 'tab'),
+        mkKey('␣ Space', 'space'), mkKey('↵ Enter', 'enter'),
+      ],
+    }, {
+      tag: 'action',
+      actions: [
+        mkKey('←', 'left'), mkKey('↑', 'up'), mkKey('↓', 'down'), mkKey('→', 'right'),
+        mkKey(t('card.btn.half_page_up', undefined, locale), 'half_page_up'),
+        mkKey(t('card.btn.half_page_down', undefined, locale), 'half_page_down'),
+      ],
     });
+  }
+  if (foldedLayout && keysAvailable && (primaryMode || keysPanelOpen)) {
     // Row widths are deliberately unequal: Feishu truncates button text with an
     // ellipsis when a weighted column gets narrower than the label. Labels are
     // therefore single symbols wherever possible (×/⇥/␣/↵/▲/▼) — even a

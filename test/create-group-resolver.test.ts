@@ -9,9 +9,22 @@
  *  - duplicate refs → dedup, keep first occurrence
  *  - unresolvable refs → reported in `invalid`
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  globalConfigPath,
+  invalidateGlobalConfigCache,
+  readRawGroupOwnerNotice,
+  setGroupOwnerNoticeEnabled,
+} from '../src/global-config.js';
+import { config } from '../src/config.js';
 import {
   createGroupCompletionStatus,
+  parseOwnerNoticeCommand,
+  runOwnerNoticeCommand,
+  type OwnerNoticeCommandDeps,
   resolveBotRefs,
   resolveChatMode,
   resolveKickoff,
@@ -159,6 +172,115 @@ describe('resolveChatMode', () => {
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toContain('--chat-mode');
     }
+  });
+});
+
+describe('parseOwnerNoticeCommand', () => {
+  it('leaves ordinary create-group calls alone, wherever the word appears later', () => {
+    for (const rest of [
+      [],
+      ['--bot', 'Review', '--name', 'PR 42'],
+      ['--bot', 'owner-notice'],
+      ['--name', 'owner-notice', '--bot', 'Review'],
+      ['--team', 't1', '--agent', 'cli_x'],
+    ]) {
+      expect(parseOwnerNoticeCommand(rest)).toEqual({ kind: 'none' });
+    }
+  });
+
+  it('reads status with no value, and on/off (enable/disable) case-insensitively', () => {
+    expect(parseOwnerNoticeCommand(['owner-notice'])).toEqual({ kind: 'status' });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'status'])).toEqual({ kind: 'status' });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'off'])).toEqual({ kind: 'set', enabled: false });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'OFF'])).toEqual({ kind: 'set', enabled: false });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'disable'])).toEqual({ kind: 'set', enabled: false });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'on'])).toEqual({ kind: 'set', enabled: true });
+    expect(parseOwnerNoticeCommand(['owner-notice', 'enable'])).toEqual({ kind: 'set', enabled: true });
+  });
+
+  it('refuses anything else instead of guessing which way to flip', () => {
+    for (const rest of [
+      ['owner-notice', 'false'],
+      ['owner-notice', '0'],
+      ['owner-notice', 'off', 'now'],
+      ['owner-notice', '--bot', 'Review'],
+    ]) {
+      expect(parseOwnerNoticeCommand(rest).kind).toBe('invalid');
+    }
+  });
+});
+
+describe('runOwnerNoticeCommand (real config file)', () => {
+  let dir: string;
+  let configFile: string;
+  // The same wiring `botmux create-group owner-notice` uses.
+  const realDeps: OwnerNoticeCommandDeps = {
+    setEnabled: setGroupOwnerNoticeEnabled,
+    isEnabled: () => config.groupOwnerNotice,
+    rawValue: readRawGroupOwnerNotice,
+    configPath: globalConfigPath,
+  };
+  const run = (...args: string[]) => {
+    const cmd = parseOwnerNoticeCommand(['owner-notice', ...args]);
+    if (cmd.kind === 'none') throw new Error('expected an owner-notice command');
+    return runOwnerNoticeCommand(cmd, realDeps);
+  };
+  const stored = () => existsSync(configFile) ? JSON.parse(readFileSync(configFile, 'utf-8')) : undefined;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-owner-notice-cli-'));
+    configFile = join(dir, 'config.json');
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', configFile);
+    invalidateGlobalConfigCache();
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    invalidateGlobalConfigCache();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('off writes false, status only reads, on removes the key', () => {
+    expect(run()).toMatchObject({ exitCode: 0, enabled: true, stderr: [] });
+    expect(stored()).toBeUndefined();
+
+    expect(run('off')).toMatchObject({ exitCode: 0, enabled: false });
+    expect(stored()).toEqual({ groupOwnerNotice: false });
+    expect(run('status')).toMatchObject({ exitCode: 0, enabled: false });
+    expect(stored()).toEqual({ groupOwnerNotice: false });
+
+    expect(run('on')).toMatchObject({ exitCode: 0, enabled: true });
+    expect(stored()).toEqual({});
+  });
+
+  it('refuses a bad value without touching the file', () => {
+    const refused = run('false');
+    expect(refused.exitCode).toBe(2);
+    expect(refused.enabled).toBeUndefined();
+    expect(stored()).toBeUndefined();
+  });
+
+  it('flags a hand-edited non-boolean that group creation ignores', () => {
+    writeFileSync(configFile, JSON.stringify({ groupOwnerNotice: 'false' }));
+    invalidateGlobalConfigCache();
+    const status = run();
+    expect(status.enabled).toBe(true);
+    expect(status.stderr).toHaveLength(1);
+
+    // Rewriting it through the command clears the warning.
+    expect(run('off')).toMatchObject({ enabled: false, stderr: [] });
+  });
+
+  it('reports a failed write as exit 1 instead of claiming the new state', () => {
+    const cmd = parseOwnerNoticeCommand(['owner-notice', 'off']);
+    if (cmd.kind === 'none') throw new Error('expected an owner-notice command');
+    const outcome = runOwnerNoticeCommand(cmd, {
+      ...realDeps,
+      setEnabled: () => { throw new Error('durable_config_coordinator_required'); },
+    });
+    expect(outcome.exitCode).toBe(1);
+    expect(outcome.enabled).toBeUndefined();
+    expect(outcome.stdout).toEqual([]);
+    expect(stored()).toBeUndefined();
   });
 });
 

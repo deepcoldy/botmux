@@ -340,4 +340,17 @@ describe('会话群出生：自动赋予发起人群管理员权限', () => {
     expect(opts.managerUserIds).toEqual([OWNER]);
     expect(opts.transferOwnerTo).toBeUndefined();
   });
+
+  it('不请求建群后 @ 群主提醒：私聊转群在任何开关设置下都不发这条', async () => {
+    // group-creator 只在传了 notifyOwnerOpenId 或 transferOwnerUnionId 时才发
+    // 「群已创建…」提醒。会话群里 @ 发起人的引子消息是本轮回复的锚点，不归这个开关管。
+    registerAppBot({ defaultWorkingDir: join(mocks.dataDir, 'default-dir'), sessionGroup: { tag: { mode: 'off' }, avatar: 'off' } });
+
+    await handleNewTopic(dmEvent('帮我看下代码', 'om_no_owner_notice'), dmCtx('om_no_owner_notice'));
+
+    expect(mocks.createGroupWithBots).toHaveBeenCalledTimes(1);
+    const opts = mocks.createGroupWithBots.mock.calls[0][0];
+    expect(opts.notifyOwnerOpenId).toBeUndefined();
+    expect(opts.transferOwnerUnionId).toBeUndefined();
+  });
 });

@@ -191,7 +191,7 @@ import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJo
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, finalBridgeSendMarkerCoversOwnThread, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideFirstWriteLiveness,
@@ -218,7 +218,7 @@ import {
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
-import { applyRespawnConfigPatch } from './core/respawn-config-patch.js';
+import { applyRespawnConfigPatch, respawnConfigPatchFromMessage } from './core/respawn-config-patch.js';
 import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import {
@@ -366,6 +366,8 @@ import {
   type BotConfig,
 } from './bot-registry.js';
 import { HIDE_LOCAL_ADDRESSES_ENV, hideLocalAddressesEnvValue } from './im/lark/local-address-switch.js';
+import { REPLY_DELIVERY_ENV } from './services/send-completion-hint.js';
+import { paneReplyDeliveryFromProcessTree } from './services/pane-reply-delivery.js';
 import {
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
@@ -483,6 +485,13 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
+import {
+  inspectAntigravityAccounts,
+  reconcileActiveAntigravityToken,
+  resolveAntigravitySpawnStoreOptions,
+  type AntigravityAccountStoreOptions,
+  type ReconcileAntigravityTokenResult,
+} from './services/antigravity-accounts.js';
 import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
@@ -3767,8 +3776,14 @@ let traexAutoModelReasoningEfforts = new Map<string, readonly import('./services
 /** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
  *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
  *  fail-closed 等于历史行为。 */
+/** Reply delivery the CURRENT CLI process was launched with, when this worker
+ *  re-attached a surviving persistent pane instead of spawning one: its prompt
+ *  predates this worker's init (services/pane-reply-delivery.ts). Cleared by
+ *  every fresh spawn, whose prompt is built from lastInitConfig. */
+let reattachedPaneReplyDelivery: 'send' | 'transcript' | undefined;
+
 function replyDeliveryMode(): 'send' | 'transcript' {
-  return lastInitConfig?.replyDelivery === 'transcript' ? 'transcript' : 'send';
+  return (reattachedPaneReplyDelivery ?? lastInitConfig?.replyDelivery) === 'transcript' ? 'transcript' : 'send';
 }
 
 /** spawnCli resolved-mode 复核把 transcript 降级为 send 时，每个 bot+cli 组合只
@@ -12064,11 +12079,21 @@ function judgeClaudeBridgeTurn(): void {
   if (verdict.reported || unreadClaudeTurnLook) return;
   const unreadLarkTurn = bridgeQueue.peek().find(turn => !turn.started && !turn.isLocal);
   const adoptMode = lastInitConfig?.adoptMode === true;
+  const sendsDuringTurn = adoptMode ? [] : readSendMarkers()
+    .filter(marker => marker.sentAtMs >= verdict.turnStartedAtMs && marker.terminalIndependent !== true);
+  const finalDeliveryTarget = {
+    sessionId: lastInitConfig?.sessionId,
+    chatId: lastInitConfig?.chatId,
+    rootMessageId: lastInitConfig?.rootMessageId,
+  };
   const needsNotice = blindTurnNeedsNotice({
     transcriptCarriesEveryReply: adoptMode || zeroPromptTerminalSync(),
     unreadLarkTurn: !!unreadLarkTurn,
-    sentDuringTurn: !adoptMode && readSendMarkers()
-      .some(marker => marker.sentAtMs >= verdict.turnStartedAtMs && marker.terminalIndependent !== true),
+    sentDuringTurn: sendsDuringTurn.length > 0,
+    ...(replyDeliveryMode() === 'transcript'
+      ? { transcriptReplies: { sentFinalDuringTurn: sendsDuringTurn.some(marker =>
+        finalBridgeSendMarkerCoversOwnThread(finalDeliveryTarget, marker)) } }
+      : {}),
   });
   if (!needsNotice) return;
   const run: UnreadClaudeTurnRun = {
@@ -26643,6 +26668,61 @@ function resolveCliExtraArgs(): string[] {
   return cliExtraArgs;
 }
 
+/** Keep the credential-only mount target present even before the first account
+ * is imported. Otherwise a later host-side save/login becomes visible through
+ * the pane's bind-mounted root. */
+function prepareAntigravityAccountsCredentialMask(
+  root: string,
+  hideDirectories: Set<string>,
+  hideFiles: Set<string>,
+): void {
+  const directory = join(root, 'antigravity-accounts');
+  try {
+    const stat = lstatSync(directory);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      hideDirectories.add(realpathSync(directory));
+    } else {
+      hideFiles.add(directory);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    mkdirSync(directory, { mode: 0o700 });
+    hideDirectories.add(realpathSync(directory));
+  }
+}
+
+/** Reconcile the exact credential HOME visible to the child. A managed vault
+ * error is a pre-spawn failure, never permission to boot a disabled/unknown
+ * account with whatever live file happens to remain. */
+function reconcileAntigravitySpawnAccount(
+  opts: AntigravityAccountStoreOptions,
+): { reconciled: ReconcileAntigravityTokenResult; accountId: string } | undefined {
+  const reconciled = reconcileActiveAntigravityToken(opts);
+  if (!reconciled.managed) return undefined;
+  if (reconciled.error || !reconciled.activeId) {
+    throw new Error(`Antigravity 账号预检失败：${reconciled.error ?? 'active_account_missing'}`);
+  }
+  return { reconciled, accountId: reconciled.activeId };
+}
+
+/** A post-spawn observation is only an account hint when the live file still
+ * matches the account we reconciled. A racing agy rewrite becomes UNKNOWN, not
+ * a false attestation for automatic recovery. */
+function confirmAntigravitySpawnAccount(
+  opts: AntigravityAccountStoreOptions,
+  expectedAccountId: string,
+): string | null {
+  try {
+    const inspection = inspectAntigravityAccounts(opts);
+    const active = inspection.accounts.find(account => account.id === expectedAccountId);
+    return inspection.activeId === expectedAccountId && active?.hasValidToken && inspection.liveTokenMatchesActive
+      ? expectedAccountId
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /** One-shot guard for the tmux version / crash-exit-code degradation self-check. */
 let hasLoggedTmuxVersionSelfCheck = false;
 
@@ -29774,6 +29854,13 @@ async function spawnCliBody(
   // A sandboxed `botmux send` cannot read bots.json; it keeps this bot's
   // local-address policy from the snapshot taken when the worker was forked.
   childEnv[HIDE_LOCAL_ADDRESSES_ENV] = hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true);
+  // The reply delivery this pane's prompt was built with (after the resolved-
+  // sandbox degrade above). `botmux send` words its post-send hint from it: in
+  // a transcript session a progress send is answered with "the final reply is
+  // forwarded automatically" instead of "deliver with --response-kind final".
+  // A warm reattach keeps the env of the original spawn, matching the system
+  // prompt that pane still runs with.
+  childEnv[REPLY_DELIVERY_ENV] = cfg.replyDelivery === 'transcript' ? 'transcript' : 'send';
   // The stable native/global skill loader and `botmux send` must see one exact
   // normalized snapshot for the lifetime of this pane. Always inject `{}` for
   // defaults so an inherited stale value can never bleed across bot sessions.
@@ -31567,6 +31654,7 @@ async function spawnCliBody(
         mkdirSync(authorityDirectory, { mode: 0o700 });
       }
       hideDirectories.add(realpathSync(authorityDirectory));
+      prepareAntigravityAccountsCredentialMask(root, hideDirectories, hideFiles);
       for (const name of readdirSync(root)) {
         if (name === DEVICE_AUTHORITY_DIRECTORY) continue;
         if (!isCredentialIsolationReservedBasename(name)
@@ -31915,6 +32003,26 @@ async function spawnCliBody(
     }
     const spawnBackend = backend;
     const spawnCliBin = cliAdapter.resolvedBin;
+    let spawnedAntigravityAccountReport: { accountId: string } | undefined;
+    let antigravitySpawnStoreOptions: AntigravityAccountStoreOptions | undefined;
+    if (cfg.cliId === 'antigravity' && !willReattachPersistent && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
+      const effectiveChildEnv = { ...spawnEnvPlan.childEnv, ...spawnEnvPlan.injectEnv };
+      antigravitySpawnStoreOptions = resolveAntigravitySpawnStoreOptions({
+        effectiveHome: effectiveChildEnv.HOME,
+        botmuxConfigDir: configuredBotmuxHome,
+        env: effectiveChildEnv,
+      });
+      const prepared = reconcileAntigravitySpawnAccount(antigravitySpawnStoreOptions);
+      if (prepared) {
+        const { reconciled } = prepared;
+        spawnedAntigravityAccountReport = { accountId: prepared.accountId };
+        if (reconciled.advancedFrom) {
+          log(`Antigravity account pre-spawn advance: ${reconciled.advancedFrom} -> ${reconciled.activeId}`);
+        } else if (reconciled.restored) {
+          log(`Antigravity live token restored to active account ${reconciled.activeId}`);
+        }
+      }
+    }
     spawnWithCodexModelLaunch({
       dataDir: config.session.dataDir, sessionId: cfg.sessionId, launch: nativeModelLaunch,
       reattached: () => 'isReattach' in spawnBackend && spawnBackend.isReattach === true,
@@ -31977,6 +32085,17 @@ async function spawnCliBody(
         });
       },
     });
+    if (spawnedAntigravityAccountReport && antigravitySpawnStoreOptions
+      && !('isReattach' in spawnBackend && spawnBackend.isReattach === true)) {
+      send({
+        type: 'antigravity_account',
+        accountId: confirmAntigravitySpawnAccount(
+          antigravitySpawnStoreOptions,
+          spawnedAntigravityAccountReport.accountId,
+        ),
+        ...(activeRestartAttemptId ? { attemptId: activeRestartAttemptId } : {}),
+      });
+    }
     if (!willReattachPersistent) {
       writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
       // Which configured environment this CLI really got (Dashboard marks a
@@ -32187,6 +32306,17 @@ async function spawnCliBody(
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
+  // A re-attached pane keeps the prompt it was launched with; follow it rather
+  // than this init's delivery (a daemon upgrade or config edit since then).
+  if (actuallyReattachedPersistent && !cfg.adoptMode) {
+    const pane = paneReplyDeliveryFromProcessTree(cliPid, cfg.replyDeliveryLegacy ?? (cfg.replyDelivery === 'transcript' ? 'transcript' : 'send'));
+    reattachedPaneReplyDelivery = pane;
+    if (pane && pane !== (cfg.replyDelivery === 'transcript' ? 'transcript' : 'send')) {
+      log(`[reply-delivery] re-attached pane was launched with replyDelivery=${pane} (init says ${cfg.replyDelivery ?? 'send'}); following the pane until the CLI is respawned`);
+    }
+  } else {
+    reattachedPaneReplyDelivery = undefined;
+  }
   if (cfg.existingAppServerEndpoint !== undefined) {
     // The local `codex --remote` client does not own the selected rollout fd;
     // writeInput must accept only the explicitly bound remote thread in the
@@ -39739,18 +39869,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // restart IPC 可携带新值。三分态同 restart：undefined = 不携带（旧 daemon）
       // 保持快照；null = 明确不传模型。对已经在跑的 CLI 无影响（只在下次 spawn 用）。
       applyWorkerLaunchModel(lastInitConfig ?? undefined, msg);
-      // startupCommands / launchShell 同理，但只在**真的 parked**（下面那条恢复重启
-      // 即将执行）时才收：daemon 的 crashDiagnosticParked 在 worker 内恢复后不会清
-      // （只有 refork 的 ready 才清），之后每条消息都还捎带；而 runStartupCommands
-      // 在当前 spawn 的启动序列里实时读 lastInitConfig.startupCommands——若在启动
-      // 命令待确认时被换掉，正在跑的 CLI 会拿新列表配旧游标，两份都敲不全。
+      // startupCommands / launchShell / replyDelivery 同理，但只在**真的 parked**
+      // （下面那条恢复重启即将执行）时才收：daemon 的 crashDiagnosticParked 在
+      // worker 内恢复后不会清（只有 refork 的 ready 才清），之后每条消息都还捎带。
+      // 正在跑的 CLI 若在此换启动命令，会拿新列表配旧游标；若在此换投递方式，
+      // 则会出现旧提示配新门控。
       const parkedRespawnPending = !backend && crashDiagnosticStopped && !lastInitConfig?.adoptMode;
       if (lastInitConfig) {
-        applyRespawnConfigPatch(lastInitConfig, {
-          model: msg.model,
-          larkToolBinding: msg.larkToolBinding,
-          ...(parkedRespawnPending ? { startupCommands: msg.startupCommands, launchShell: msg.launchShell } : {}),
-        });
+        applyRespawnConfigPatch(lastInitConfig, respawnConfigPatchFromMessage(msg, parkedRespawnPending));
       }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written
@@ -40284,6 +40410,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           larkToolBinding: msg.larkToolBinding,
           startupCommands: msg.startupCommands,
           launchShell: msg.launchShell,
+          replyDelivery: msg.replyDelivery,
         });
         if (patched.traexReconfigure) configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
         if (patched.startupCommandsChanged) {
@@ -40360,11 +40487,21 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
       });
       await restartCliProcess(
-        msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
-        // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
-        // FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
+        msg.updateWorkingDir
+          ? `cwd-move respawn → ${msg.updateWorkingDir}`
+          : msg.reason === 'account_rotation'
+            ? 'antigravity account rotation'
+            : 'daemon request',
+        // cwd-move / topicEffort / account_rotation 是主动运维/轮换迁移、不是崩溃恢复，
+        // 不计入 tier-2 强制 FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
         // auto-restart 那条裸 restart 的计数兜底。
-        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort, ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}) },
+        {
+          preservePending: true,
+          immediate: msg.reason === 'account_rotation',
+          skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort || msg.reason === 'account_rotation',
+          ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}),
+          ...(msg.reason === 'account_rotation' ? { restartCause: 'antigravity-account-rotation' as const } : {}),
+        },
       );
       break;
     }

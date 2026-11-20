@@ -445,6 +445,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_REPLY_FOOTER',
   // Per-bot local-address policy snapshot for a sandboxed `botmux send`.
   'BOTMUX_HIDE_LOCAL_ADDRESSES',
+  // Spawn-time replyDelivery ('send' | 'transcript') this pane's prompt was
+  // built with. `botmux send` only uses it to word its post-send hint; a
+  // missing value falls back to the send-mode wording.
+  'BOTMUX_REPLY_DELIVERY',
   // Normalized sparse reply-style snapshot. Shared/native skill loaders and
   // `botmux send` consume this same session value; it must never enter a
   // co-tenant tmux server's ambient environment.
@@ -613,6 +617,8 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_REPLY_FOOTER',
   // Per-bot local-address policy, from the worker's init snapshot per session.
   'BOTMUX_HIDE_LOCAL_ADDRESSES',
+  // Per-session replyDelivery, from the worker's init snapshot per spawn.
+  'BOTMUX_REPLY_DELIVERY',
   // Spawn-time normalized reply style; unset/scrub at every session boundary to
   // avoid cross-bot guide/card drift through a shared persistent backend.
   'BOTMUX_REPLY_STYLE',

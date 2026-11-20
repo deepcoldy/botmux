@@ -65,7 +65,9 @@ export interface CreateGroupOpts {
   /** `false`: no @-the-new-owner notice at all, not even the one a
    *  `transferOwnerUnionId` transfer posts by default. A Dashboard workflow
    *  launch (design 2026-11-03 workflow-dashboard-orchestration §4.5) builds a
-   *  topic group whose first top-level message must be its root card. */
+   *  topic group whose first top-level message must be its root card.
+   *  The machine-wide `groupOwnerNotice: false` (global-config) has the same
+   *  effect for every call; a per-call `false` wins even when it is on. */
   ownerNotice?: false;
   /** Users to grant group manager permissions to. Added while the creator bot is owner. */
   managerUserIds?: string[];
@@ -343,11 +345,15 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     }
   }
 
-  const notifyOwnerOpenId = opts.ownerNotice === false
+  // The machine-wide switch is read here, per creation, so a Dashboard / CLI
+  // flip reaches the next group without a restart. Off behaves exactly like a
+  // per-call `ownerNotice: false`: no notice, and no notify error either.
+  const ownerNoticeWanted = opts.ownerNotice !== false && config.groupOwnerNotice !== false;
+  const notifyOwnerOpenId = !ownerNoticeWanted
     ? null
     : opts.notifyOwnerOpenId?.trim() || (transferOwnerUnionId ? transferOwnerTo : null);
   let notifyMessageId: string | null = null;
-  let notifyError: string | null = !notifyOwnerOpenId && transferOwnerUnionId && opts.ownerNotice !== false ? transferError : null;
+  let notifyError: string | null = !notifyOwnerOpenId && transferOwnerUnionId && ownerNoticeWanted ? transferError : null;
   if (notifyOwnerOpenId) {
     if (r.invalidUserIds.includes(notifyOwnerOpenId)) {
       notifyError = 'invitee_rejected';

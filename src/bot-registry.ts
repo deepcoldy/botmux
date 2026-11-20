@@ -1708,12 +1708,12 @@ export interface BotConfig {
    * 最终回复投递方式。`send`：模型必须自己执行 `botmux send` 把回复发到飞书，
    * 系统提示与每轮 reminder 都这么要求。`transcript`：daemon 从 CLI 转写自动取
    * 本轮最后的 assistant 文本发最终回复卡（即原来的 bridge fallback 升为主通道），
-   * 系统提示不再提及 `botmux send`、不再注入每轮 reminder；solo 会话（私聊 / 仅
-   * owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。只对有转写采集
-   * 的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动回落 send。
-   * 缺省见 `defaultReplyDeliveryFor`（doubao 缺省 transcript，其余 CLI 缺省 send）；
-   * 显式 `'send'` / `'transcript'` 都持久化。系统提示部分需 /restart 生效，逐轮
-   * 信封立即生效。
+   * 系统提示只把 `botmux send` 留给协作 / 附件 / 跨群话题、不再注入每轮 reminder；
+   * solo 会话（私聊 / 仅 owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。
+   * 只对有转写采集的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动
+   * 回落 send。缺省见 `defaultReplyDeliveryFor`（有转写采集的 CLI 缺省 transcript，
+   * 其余缺省 send）；显式 `'send'` / `'transcript'` 都持久化、不被缺省覆盖。系统提示
+   * 部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
   turnResults?: { enabled: boolean };
@@ -2309,6 +2309,8 @@ export interface BotConfig {
   replyCardMode?: import('./services/turn-reply-card.js').ReplyCardMode;
   /** Main controls omitted from live streaming cards. Missing means show all. */
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
+  /** Fold low-frequency live-card controls. Default on; false restores the classic layout. */
+  streamingCardFoldedLayout?: boolean;
   /**
    * Pin the current public streaming card. Default false; best-effort only.
    */
@@ -3070,8 +3072,8 @@ export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
- *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（doubao 缺省
- *  transcript，其余缺省 send）。只读内存
+ *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 按 CLI 补缺省（有转写采集的
+ *  CLI 缺省 transcript，其余缺省 send）。只读内存
  *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
 export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
   const v = bots.get(larkAppId)?.config.replyDelivery;
@@ -4647,6 +4649,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       replyCardShowTools: entry.replyCardShowTools === false ? false : undefined,
       replyCardNativeCot: entry.replyCardNativeCot === true ? true : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
+      streamingCardFoldedLayout: entry.streamingCardFoldedLayout === false ? false : undefined,
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       cotEnabled: normalizeCotEnabled(entry) ? undefined : false,

@@ -12,6 +12,7 @@ type Settings = ComponentProps<typeof SettingsBody>['settings'];
 
 const settings: Settings = {
   groupNamePrefix: '',
+  groupOwnerNotice: true,
   worktreeRoot: '',
   publicReadOnly: false,
   openTerminalInFeishu: false,
