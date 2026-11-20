@@ -92,6 +92,7 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  onInputPrepared?: (content: string) => void;
   /** Durable replay identity. Runner adapters may forward this with turnId so
    * late output from an older attempt cannot settle its successor. */
   dispatchAttempt?: number;

@@ -4,6 +4,7 @@
  * default server (pre-isolation rows and the BOTMUX_TMUX_SOCKET=default opt-out).
  */
 import { spawnSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SessionProbe } from '../src/adapters/backend/types.js';
 import {
@@ -52,6 +53,12 @@ describe('socket name resolution', () => {
     expect(tmuxSocketArgs('botmux')).toEqual(['-L', 'botmux']);
     expect(tmuxCommand(undefined)).toBe('tmux');
     expect(tmuxCommand('botmux')).toBe('tmux -L botmux');
+  });
+
+  it('builds an explicit -S path when a strict root is present', () => {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+    expect(tmuxSocketArgs('botmux', '/tmp')).toEqual(['-S', `${realpathSync('/tmp')}/tmux-${uid}/botmux`]);
+    expect(tmuxSocketArgs(undefined, '/tmp')).toEqual(['-S', `${realpathSync('/tmp')}/tmux-${uid}/default`]);
   });
 
   it('lists the recorded server (or the default one) before the preferred one, deduplicated', () => {
@@ -134,6 +141,16 @@ describe('selectSessionBackend (tmux)', () => {
     }
   });
 
+  it('freezes a strict absolute root into the persisted target', () => {
+    const selected = selectSessionBackend({
+      sessionId, backendType: 'tmux', hasExistingSession: false,
+      tmuxSocketName: 'botmux', tmuxSocketRoot: '/test/strict-root',
+    });
+    expect(selected.persistentBackendTarget).toEqual({
+      backendType: 'tmux', sessionName: 'bmx-abcdef12', socketName: 'botmux', socketRoot: '/test/strict-root',
+    });
+  });
+
   it('keeps the historical target shape for the default server', () => {
     const selected = selectSessionBackend({ sessionId, backendType: 'tmux', hasExistingSession: true });
     expect((selected.backend as { socketName?: string }).socketName).toBeUndefined();
@@ -162,6 +179,18 @@ describe('persistent tmux targets', () => {
     killPersistentBackendTarget(legacy);
     expect(probe).toHaveBeenLastCalledWith('bmx-abcdef12');
     expect(kill).toHaveBeenLastCalledWith('bmx-abcdef12');
+  });
+
+  it('uses a persisted absolute root for workerless probe and kill', () => {
+    const rooted = { ...dedicated, socketRoot: '/test/strict-root' };
+    const probe = vi.spyOn(TmuxBackend, 'probeSession').mockReturnValue('exists');
+    const kill = vi.spyOn(TmuxBackend, 'killSession').mockImplementation(() => {});
+    expect(probePersistentBackendTarget(rooted)).toBe('exists');
+    killPersistentBackendTarget(rooted);
+    expect(probe).toHaveBeenLastCalledWith('bmx-abcdef12', 'botmux', '/test/strict-root');
+    expect(kill).toHaveBeenLastCalledWith('bmx-abcdef12', 'botmux', '/test/strict-root');
+    expect(persistentBackendTargetKey(rooted)).not.toBe(persistentBackendTargetKey(dedicated));
+    expect(persistentBackendTargetKey(dedicated)).toBe(persistentBackendTargetKey({ ...dedicated }));
   });
 
   it('answers a batch per server, not per name', () => {

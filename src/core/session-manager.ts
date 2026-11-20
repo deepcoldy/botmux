@@ -80,6 +80,7 @@ import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-ru
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { codexRpcEligible } from '../codex-rpc-lifecycle.js';
 import type { AcceptedCommandInput, ChatContext, CliTurnPayload, CodexAppAdditionalContextEntry, CodexAppTurnInput, LarkAttachment, LarkMention, ScheduledTask, Session, SubstituteTrigger } from '../types.js';
+import { reconcileClosedSessionTurns } from '../services/session-turns.js';
 import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
@@ -2822,6 +2823,12 @@ export async function restoreActiveSessions(
   options: { prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined } = {},
 ): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice> | undefined> {
   const sessions = sessionStore.listSessions();
+  try {
+    reconcileClosedSessionTurns(config.session.dataDir,
+      new Set(sessions.filter(session => session.status === 'closed').map(session => session.sessionId)));
+  } catch {
+    logger.warn('Failed to reconcile closed structured session turns');
+  }
   const restorePriority = (session: Session): number => {
     if (session.headless) return 2;
     if (session.adoptedFrom || session.cliId || session.cliLaunchSnapshot || session.lastCliInput || session.backendType) return 2;

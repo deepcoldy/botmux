@@ -1,4 +1,6 @@
+import { isAbsolute } from 'node:path';
 import { sanitizePerBotEnv, isReservedPerBotEnvKey } from './per-bot-env.js';
+import { resolveTmuxSocketRoot } from '../adapters/backend/tmux-socket-root.js';
 import { BOTMUX_INJECTED_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS, redactChildEnv } from '../utils/child-env.js';
 import { applySessionEnvUnset } from './session-env.js';
 import {
@@ -88,6 +90,7 @@ export function buildBotWorkerEnv(
   base: NodeJS.ProcessEnv,
   policy?: EnvPolicy,
   protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
+  controlCwd: string = process.cwd(),
 ): NodeJS.ProcessEnv {
   const env = inheritBotEnv(base, policy);
   if (policy?.mode === 'strict') {
@@ -104,17 +107,26 @@ export function buildBotWorkerEnv(
   if (policy?.mode === 'strict') {
     // Host-owned worker HTTP/watchdog settings are control-plane only. The
     // CLI boundary does not retain them without an explicit user grant.
-    // BOTMUX_TMUX_SOCKET: which tmux server the worker creates managed panes on
-    // (tmux-socket.ts) — dropping it would undo an operator's opt-out per bot.
+    // BOTMUX_TMUX_SOCKET/TMUX_TMPDIR: the label and root of the worker's tmux
+    // server. Dropping either retargets strict workers to a different server.
     for (const key of ['WEB_HOST', 'WEB_EXTERNAL_HOST', 'WEB_EXTERNAL_PORT',
-      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS', 'BOTMUX_TMUX_SOCKET']) {
+      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS', 'BOTMUX_TMUX_SOCKET', 'TMUX_TMPDIR']) {
       if (base[key] !== undefined) env[key] = base[key];
     }
   }
-  // Apply dynamic capability redaction last: a protected source may share a
-  // name with a normally retained worker control key (for example under a
-  // strict policy), and the protected boundary must win that collision.
+  // Apply dynamic capability redaction before final path normalization: a
+  // protected source may share a name with a normally retained worker control
+  // key (for example under a strict policy), and the protected boundary must
+  // win that collision.
   for (const key of protectedMcpRedactedEnvKeys(protectedMcpPolicy)) delete env[key];
+  // Pin only the strict worker control plane to the daemon's OWN resolution of
+  // a relative root. The daemon's workerless probes use that same cwd, while
+  // the worker receives an absolute value and can no longer retarget creation,
+  // reattachment or cleanup by changing cwd. Inherit and absolute values keep
+  // their historical spelling; protected redaction above still wins.
+  if (policy?.mode === 'strict' && env.TMUX_TMPDIR !== undefined && !isAbsolute(env.TMUX_TMPDIR)) {
+    env.TMUX_TMPDIR = resolveTmuxSocketRoot(env, controlCwd);
+  }
   return env;
 }
 

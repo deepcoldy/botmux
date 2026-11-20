@@ -276,7 +276,10 @@ export function resolveDashboardRequestGate(input: {
   const canManageHost = legacyAuthed || managementCredential || platformManages;
   const workbenchOnlyIdentity = !legacyAuthed && !managementCredential && !platformManages
     && (platformIdentity || input.identity?.kind === 'feishu-h5');
-  const decision = workbenchOnlyIdentity
+  const turnsRead = input.method === 'GET' && /^\/api\/sessions\/[^/]+\/turns$/.test(input.pathname);
+  const decision = turnsRead && !managementCredential
+    ? { kind: 'deny401' as const }
+    : workbenchOnlyIdentity
     ? decideWorkbenchH5Auth({ method: input.method, pathname: input.pathname })
     : decideDashboardAuth({
       method: input.method,
