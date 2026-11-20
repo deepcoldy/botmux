@@ -5656,13 +5656,28 @@ async function revokeQuotaGrant(
   }
 }
 
+const quotaExhaustedNoticeStates = new BoundedMap<string, string>(1024);
+function clearQuotaExhaustedNotice(larkAppId: string, quotaKey: string): void {
+  quotaExhaustedNoticeStates.delete(`${larkAppId}:${quotaKey}`);
+}
+export function __resetQuotaExhaustedNoticesForTest(): void {
+  quotaExhaustedNoticeStates.clear();
+}
+
 async function notifyQuotaExhausted(
   larkAppId: string,
   anchor: string,
   senderOpenId: string,
   limit: number | undefined,
+  quotaKey?: string,
+  exhaustedUsed?: number,
 ): Promise<void> {
   if (typeof limit !== 'number') return;
+  const noticeKey = quotaKey ? `${larkAppId}:${quotaKey}` : undefined;
+  const noticeState = `${limit}:${exhaustedUsed ?? ''}`;
+  // Denials are never deduped: only the user-facing card is. A successful
+  // consume clears this state so a later refill→exhaust cycle notifies again.
+  if (noticeKey && quotaExhaustedNoticeStates.get(noticeKey) === noticeState) return;
   let autoReapply = false;
   try {
     const cfg = getBot(larkAppId).config;
@@ -5675,6 +5690,7 @@ async function notifyQuotaExhausted(
       'interactive',
       larkAppId,
     );
+    if (noticeKey) quotaExhaustedNoticeStates.set(noticeKey, noticeState);
   } catch (err) {
     logger.warn(`[quota:${larkAppId}] quota exhausted notify failed: ${err}`);
   }
@@ -5765,6 +5781,7 @@ export async function enforceMessageQuotaForCliInput(
       abortCharge(larkAppId, messageId);
       return false;
     }
+    if (quota.allow) clearQuotaExhaustedNotice(larkAppId, ev.quotaKey);
     if (quota.tracked) {
       if (!quota.allow) {
         abortCharge(larkAppId, messageId);
@@ -5777,6 +5794,8 @@ export async function enforceMessageQuotaForCliInput(
           opts.crossChatFollowedRootMessageId ?? anchor,
           senderOpenId,
           quota.limit,
+          ev.quotaKey,
+          quota.used,
         );
         return false;
       }
@@ -5923,6 +5942,7 @@ export async function enforceMessageQuotaForCliInput(
     return false;
   }
 
+  if (quota.allow) clearQuotaExhaustedNotice(larkAppId, ev.quotaKey);
   // 无额度记录（无限授权）：放行；标 done 去重后续重投。
   if (!quota.tracked) {
     commitCharge(larkAppId, messageId);
@@ -5934,7 +5954,7 @@ export async function enforceMessageQuotaForCliInput(
   if (!quota.allow) {
     abortCharge(larkAppId, messageId);
     await revokeQuotaGrant(larkAppId, chatId, senderOpenId, ev);
-    await notifyQuotaExhausted(larkAppId, anchor, senderOpenId, quota.limit);
+    await notifyQuotaExhausted(larkAppId, anchor, senderOpenId, quota.limit, ev.quotaKey, quota.used);
     return false;
   }
   // 扣费成功才定论为 done。

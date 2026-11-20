@@ -103,6 +103,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import { parseSlashCommandInvocation } from '../src/core/command-handler.js';
 import {
   enforceMessageQuotaForCliInput,
+  __resetQuotaExhaustedNoticesForTest,
   grantRestrictedCommandText,
   grantRestrictedSlashCommandText,
   __testOnly_activeSessions as activeSessions,
@@ -125,6 +126,7 @@ function registerQuotaBot() {
 describe('message quota enforcement', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetQuotaExhaustedNoticesForTest();
     mocks.beginCharge.mockReturnValue('fresh');
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true });
     mocks.removeChatGrant.mockResolvedValue({ ok: true, removed: true });
@@ -329,6 +331,26 @@ describe('message quota enforcement', () => {
       await expect(run('ou_global', 'om_cross_global')).resolves.toBe(false);
       expect(mocks.removeGlobalGrant).not.toHaveBeenCalled();
       expect(mocks.abortCharge).toHaveBeenCalledWith('quota_app', 'om_cross_global');
+    });
+
+    it('deduplicates only the exhaustion notice while every over-limit message stays denied', async () => {
+      mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
+      await expect(run()).resolves.toBe(false);
+      await expect(run()).resolves.toBe(false);
+      await expect(run('ou_chat', 'om_next_after_exhaustion')).resolves.toBe(false);
+      expect(mocks.consumeQuota).toHaveBeenCalledTimes(3);
+      expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    });
+
+    it('notifies again after a successful refill is exhausted a second time', async () => {
+      mocks.consumeQuota
+        .mockResolvedValueOnce({ tracked: true, allow: false, used: 5, limit: 5 })
+        .mockResolvedValueOnce({ tracked: true, allow: true, used: 1, limit: 5 })
+        .mockResolvedValueOnce({ tracked: true, allow: false, used: 5, limit: 5 });
+      await expect(run()).resolves.toBe(false);
+      await expect(run('ou_chat', 'om_refilled')).resolves.toBe(true);
+      await expect(run('ou_chat', 'om_exhausted_again')).resolves.toBe(false);
+      expect(mocks.replyMessage).toHaveBeenCalledTimes(2);
     });
 
     it.each([
