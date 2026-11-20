@@ -62,6 +62,9 @@ export interface FsPolicy {
   writeRegexes: string[];
   /** Final host-security denies that cannot be represented as path prefixes. */
   denyRegexes?: string[];
+  /** Seatbelt only: withheld credential stores re-denied after every
+   *  finalReadOnlyPaths/ancestor grant, so no allow can re-open the secret. */
+  finalDenyPaths?: string[];
   /** Narrow read-only exceptions emitted after denyRegexes (macOS gateway socket). */
   finalReadOnlyPaths?: string[];
   /** No-transport turns: caller-supplied allow paths (extraWrite / readonlyRoots /
@@ -1076,6 +1079,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // so the old shared data/schedules.json grant (and the cross-bot task-prompt
   // exposure it had to accept) is gone. The RMW sibling lock lives in the same
   // rw dir, so sandboxed `botmux schedule` mutations work on both platforms.)
+  const withheldLarkStores = new Set<string>();
   // macOS lark-cli key store carve-out. The baseline DENIES the whole
   // `~/Library/Application Support/lark-cli` dir (it holds EVERY bot's appsecret
   // ciphertext + the master key — the pre-refactor cross-bot leak). But this bot
@@ -1087,9 +1091,21 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // read (verified: sibling ciphertext still DENIED).
   // withholdSendCredential: the own appsecret + master key ARE the app secret
   // (decryptable), so the carve-out stays closed and the store stays denied.
-  if (ctx.platform === 'darwin' && larkTransport && !ctx.withholdSendCredential) {
+  if (ctx.platform === 'darwin' && (larkTransport || ctx.withholdSendCredential)) {
     const larkStore = `${ctx.homeDir}/Library/Application Support/lark-cli`;
-    push([`${larkStore}/master.key.file`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+    if (ctx.withholdSendCredential) {
+      withheldLarkStores.add(larkStore);
+      // Both levels are mandatory: the baseline store deny alone loses to a
+      // same-path internal workingDir/user grant, while a deeper exact-key
+      // grant would re-open the parent store deny.
+      push([
+        larkStore,
+        `${larkStore}/master.key.file`,
+        `${larkStore}/appsecret_${ctx.currentAppId}.enc`,
+      ], 'deny', 'mandatory');
+    } else {
+      push([`${larkStore}/master.key.file`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+    }
   }
   // LINUX lark-cli key store — SAME cross-bot leak, SAME carve-out (was missing).
   // lark-cli on Linux writes keys to `<LARKSUITE_CLI_DATA_DIR>/lark-cli` (when that env
@@ -1112,7 +1128,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // no custom LARKSUITE_CLI_DATA_DIR → resolved == default → one store). `deny` tagged
   // `mandatory` (not `baseline` like darwin's): see the rank-collision note in the loop.
   // No-transport denies both stores wholesale via authorityRoots and gets NO carve-out.
-  if (ctx.platform === 'linux' && larkTransport) {
+  if (ctx.platform === 'linux' && (larkTransport || ctx.withholdSendCredential)) {
     const stores = new Set<string>();
     const resolved = larkCliLinuxStorePath(ctx.homeDir, ctx.larkCliLinuxStore);
     if (resolved) stores.add(resolved);
@@ -1124,9 +1140,18 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       // the internal BOT_HOME readWrite grant lands on the SAME path and would otherwise
       // outrank this deny by source rank (internal 2 > baseline 0), re-opening the whole
       // keystore rw. mandatory (4) keeps the ceiling; the deeper own-key carve-outs still win by depth.
-      push([larkStore], 'deny', 'mandatory');
       if (!ctx.withholdSendCredential) {
+        push([larkStore], 'deny', 'mandatory');
         push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+      } else {
+        withheldLarkStores.add(larkStore);
+        // The mandatory parent is not enough: a user grant that names one of
+        // these exact files is deeper and would otherwise re-open the secret.
+        push([
+          larkStore,
+          `${larkStore}/master.key`,
+          `${larkStore}/appsecret_${ctx.currentAppId}.enc`,
+        ], 'deny', 'mandatory');
       }
     }
   }
@@ -1175,7 +1200,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     ...(ctx.mandatoryReadOnlyPaths ?? []),
   ].filter((path) => {
     const normalized = normalizeFsPath(path);
-    return !normalized || !insideHostOnlyRoot(normalized);
+    if (!normalized || insideHostOnlyRoot(normalized)) return false;
+    // This final pass runs after ordinary rules. A service-credential exception
+    // under a withheld lark-cli store would otherwise re-open the exact key the
+    // mandatory ceiling just denied.
+    return ![...withheldLarkStores].some(root => coversPath(root, normalized));
   });
 
   // No-Lark-transport HOST-AUTHORITY denies + minimal carve-out (codex escalation
@@ -1216,7 +1245,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     // reaching sibling daemons, and the secret is the escalation vector.
   }
 
-  const rules = mergeFsRules(candidates);
+  // Deepest-prefix grants inside a withheld keystore must not survive at all:
+  // otherwise a sibling/token/future-file grant would beat the mandatory parent.
+  const rules = mergeFsRules(candidates).filter(rule =>
+    rule.access === 'deny'
+    || ![...withheldLarkStores].some(root => coversPath(root, rule.path)));
 
   // Post-merge self-check for the loaded bots-config (codex P1). Being inside a
   // frozen authority root is necessary but NOT sufficient: this is a white-in-black
@@ -1258,6 +1291,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
+    ...(ctx.withholdSendCredential ? { finalDenyPaths: [...withheldLarkStores] } : {}),
     finalReadOnlyPaths,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()
@@ -1373,6 +1407,12 @@ export function compileToSeatbelt(policy: FsPolicy): string {
   }
   for (const path of policy.finalReadOnlyPaths ?? []) {
     lines.push(`(allow file-read* (subpath "${escSb(path)}"))`);
+    lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
+  }
+  // Last-match backstop: an ancestor grant (HOME or /) would otherwise
+  // re-open every secret in a withheld store, even exact mandatory denies.
+  for (const path of policy.finalDenyPaths ?? []) {
+    lines.push(`(deny file-read* (subpath "${escSb(path)}"))`);
     lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
   }
   for (const p of policy.pinnedDirs ?? []) lines.push(`(deny file-write-unlink (literal "${escSb(p)}"))`);
