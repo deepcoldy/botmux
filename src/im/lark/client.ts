@@ -2185,12 +2185,19 @@ async function writeResourceToDisk(res: any, savePath: string, guard?: DownloadD
     if (!stream || (typeof stream.pipe !== 'function' && typeof stream[Symbol.asyncIterator] !== 'function')) {
       throw new Error('Resource download did not return a readable stream');
     }
+    // Normalize a legacy pipe-only readable (v1 stream, no async iterator) into
+    // a modern Readable before iteration. pipeline() consumed both shapes; keep
+    // that compatibility. wrap() only adapts the stream — it never touches `fd`,
+    // whose sole owner stays writeViaRename.
+    const iterable: AsyncIterable<unknown> = typeof stream[Symbol.asyncIterator] === 'function'
+      ? stream
+      : new Readable().wrap(stream);
     // Drain the stream onto the pinned descriptor with raw callback writes.
     // Do not hand `fd` to a WriteStream: pipeline() destroys it on error and
     // closes the descriptor despite autoClose:false, which would double-close
     // (and potentially close a recycled fd belonging to another operation).
     let position = 0;
-    for await (const chunk of stream as AsyncIterable<unknown>) {
+    for await (const chunk of iterable) {
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array | string);
       await fdWriteAll(fd, buffer, position);
       position += buffer.length;
