@@ -285,13 +285,67 @@ describe('effectiveReplyDelivery', () => {
     for (const cliId of ['claude-code', 'codex', 'traex']) {
       expect(supportsTranscriptReplyDeliveryForBot(cliId, { sandbox: 'scratch' })).toBe(true);
     }
-    // 其余转写 CLI 按真实 HOME 找文件，读不到 overlay 里的写入：scratch 下回落 send，
-    // 不能让提示改口「不用 send」而转写一无所获。oncall 沙箱按目录 bind 宿主路径，不受影响。
-    for (const cliId of ['grok', 'pi', 'oh-my-pi', 'ebsd', 'coco', 'hermes', 'mtr', 'cursor', 'doubao']) {
+    // 其余转写 CLI 按真实 HOME 找文件，读不到 overlay 里的写入：scratch 下回落 send。
+    // 除 hermes 外，这些适配器也声明了 oncall 的宿主状态目录 bind。
+    for (const cliId of ['grok', 'pi', 'oh-my-pi', 'ebsd', 'coco', 'mtr', 'cursor', 'doubao']) {
       expect(supportsTranscriptReplyDeliveryForBot(cliId, { sandbox: 'scratch' })).toBe(false);
       expect(supportsTranscriptReplyDeliveryForBot(cliId, { sandbox: 'oncall' })).toBe(true);
       expect(supportsTranscriptReplyDeliveryForBot(cliId)).toBe(true);
     }
+    // hermes 没有 authPaths：无沙盒仍可 transcript，oncall/scratch 都必须 fail-closed 回落 send。
+    expect(supportsTranscriptReplyDeliveryForBot('hermes', { sandbox: 'oncall' })).toBe(false);
+    expect(supportsTranscriptReplyDeliveryForBot('hermes', { sandbox: true })).toBe(false);
+    expect(supportsTranscriptReplyDeliveryForBot('hermes', { sandbox: 'scratch' })).toBe(false);
+    expect(supportsTranscriptReplyDeliveryForBot('hermes')).toBe(true);
+  });
+
+  it('缺省/显式 transcript + hermes + oncall → 运行时回落 send，避免宿主采不到 state.db', () => {
+    mockBotConfig({ sandbox: 'oncall' });
+    expect(effectiveReplyDelivery('app_a', 'hermes')).toBe('send');
+    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+    expect(effectiveReplyDelivery('app_a', 'hermes')).toBe('send');
+    mockBotConfig({ sandbox: undefined });
+    expect(effectiveReplyDelivery('app_a', 'hermes')).toBe('transcript');
+  });
+
+  it('零注入 + hermes + oncall：不能绕过运行时能力回落，且零注入能力本身 fail-closed', async () => {
+    mockBotConfig({ sandbox: 'oncall', promptInjection: 'none' });
+    expect(effectiveReplyDelivery('app_zero', 'hermes')).toBe('send');
+    const { supportsZeroPromptInjection, zeroPromptInjectionUnsupportedReason } = await import('../src/core/zero-prompt-support.js');
+    expect(supportsZeroPromptInjection('hermes', { sandbox: 'oncall' })).toBe(false);
+    expect(zeroPromptInjectionUnsupportedReason('hermes', { sandbox: 'oncall' })).toBe('oncall_unsupported_for_cli');
+    expect(supportsZeroPromptInjection('hermes')).toBe(true);
+    // 存活会话显式冻结 promptInjection=none 时，live config 不再负责拒绝；
+    // 必须靠 effectiveReplyDelivery 的 zeroPrompt 分支按 sessionSandbox 回落。
+    mockBotConfig({});
+    expect(effectiveReplyDelivery('app_zero_frozen', 'hermes', 'none', { sessionSandbox: 'oncall' })).toBe('send');
+    // Antigravity 只在零注入下采集，不走普通 replyDelivery 白名单；oncall/无沙盒都不能误降为 send。
+    mockBotConfig({ sandbox: 'oncall', promptInjection: 'none' });
+    expect(effectiveReplyDelivery('app_zero_agy', 'antigravity')).toBe('transcript');
+    expect(zeroPromptInjectionUnsupportedReason('antigravity', { sandbox: 'oncall' })).toBeNull();
+    expect(effectiveReplyDelivery('app_zero_agy_frozen', 'antigravity', 'none', { sessionSandbox: 'oncall' })).toBe('transcript');
+    mockBotConfig({ promptInjection: 'none' });
+    expect(effectiveReplyDelivery('app_zero_agy', 'antigravity')).toBe('transcript');
+  });
+
+  it('冻结 off + 机器级 BOTMUX_SANDBOX=oncall：按真实 oncall 形态回落 hermes send', () => {
+    process.env.BOTMUX_SANDBOX = 'oncall';
+    mockBotConfig({});
+    expect(effectiveReplyDelivery('app_env', 'hermes', undefined, { sessionSandbox: false })).toBe('send');
+    expect(effectiveReplyDelivery('app_env', 'hermes', undefined, { sessionSandbox: 'off' })).toBe('send');
+  });
+
+  it('oncall 白名单与真实适配器的宿主状态挂载保持一致（新 CLI 缺省 fail-closed）', async () => {
+    const { createCliAdapterSync } = await import('../src/adapters/cli/registry.js');
+    const { STRUCTURED_BRIDGE_ALWAYS_CLI_IDS } = await import('../src/services/structured-bridge-clis.js');
+    const { ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS } = await import('../src/core/zero-prompt-support.js');
+    const allTranscriptClis = ['claude-code', ...STRUCTURED_BRIDGE_ALWAYS_CLI_IDS] as const;
+    for (const cliId of allTranscriptClis) {
+      const adapter = createCliAdapterSync(cliId);
+      const hasHostStateMount = cliId === 'claude-code' || (adapter.authPaths?.length ?? 0) > 0;
+      expect(ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS.has(cliId), `${cliId} 的宿主状态挂载与白名单不一致`).toBe(hasHostStateMount);
+    }
+    expect(allTranscriptClis).toContain('hermes');
   });
 
   it('缺省值 + grok/pi + scratch → 回落 send；显式 transcript 同样回落（运行时兜底，不静默）', () => {

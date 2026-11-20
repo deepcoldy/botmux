@@ -607,7 +607,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 3. 私聊，或只有管理员和这个 bot 的 1 对 1 群里，消息不再包 `<user_message>` 壳和 `<sender/>` 标签，模型看到的就是原文。
 4. 模型执行 `botmux send` 后看到的回显会提醒它：最终答复写在回复里就行，进度不必发。
 
-支持的 CLI：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao。其余 CLI（如 Antigravity、OpenCode、Relay、codex-app）默认仍是 `send`；Antigravity 只在零注入模式下采集回答，显式设置会被拒绝。如果写好 `transcript` 后又把 CLI 换成不支持的，运行时自动回到 `send`，不会丢答复。`sandbox: "scratch"` 下只有 Claude Code、Codex、TraeX 的会话记录在宿主侧读得到，其余 CLI 在 scratch 下运行时回到 `send`（Cursor、Doubao 显式设置 `transcript` 会被拒）；oncall 沙盒不受影响。
+支持的 CLI：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao。其余 CLI（如 Antigravity、OpenCode、Relay、codex-app）默认仍是 `send`；Antigravity 只在零注入模式下采集回答，显式设置会被拒绝。如果写好 `transcript` 后又把 CLI 换成不支持的，运行时自动回到 `send`，不会丢答复。`sandbox: "scratch"` 下只有 Claude Code、Codex、TraeX 的会话记录在宿主侧读得到，其余 CLI 在 scratch 下运行时回到 `send`（Cursor、Doubao 显式设置 `transcript` 会被拒）；`oncall` 沙盒下 Hermes 例外：它的适配器没有把 `~/.hermes/state.db` 挂载到宿主，运行时同样回落 `send`；其它 CLI 的 oncall 沙盒不受影响。
 
 想用回旧行为（模型自己 `botmux send`），显式写 `send`：
 
@@ -675,7 +675,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 
 - **只传任务原文和附件**：不加 botmux 的系统提示、每轮提醒、身份信息、角色、白板、记忆和技能目录。CLI 自己的系统提示和项目里的 `AGENTS.md` 照常由 CLI 处理。
 - **自动回传答复**：从 CLI 的会话记录里取最终答复发回飞书，默认 @ 本轮发任务的人；答复里点名群里其它 bot（如 `@Reviewer`）会自动换成真正的飞书 @。
-- **支持的 CLI**：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao、Antigravity。后端限本机的 tmux / pty / zellij / herdr / zmx（Antigravity 不支持 zmx）；Cursor、Antigravity 不支持 `scratch` 沙盒。暂不支持远端后端和 v3 工作流。
+- **支持的 CLI**：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao、Antigravity。后端限本机的 tmux / pty / zellij / herdr / zmx（Antigravity 不支持 zmx）；Cursor、Antigravity 不支持 `scratch` 沙盒；Hermes 不支持 `oncall` 沙盒（`~/.hermes/state.db` 未挂载到宿主）。暂不支持远端后端和 v3 工作流。
 
 技术细节见 [`docs/zero-prompt-injection.md`](https://github.com/deepcoldy/botmux/blob/master/docs/zero-prompt-injection.md)。
 

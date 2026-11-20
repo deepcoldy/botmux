@@ -68,6 +68,7 @@ export type ZeroPromptUnsupportedReason =
   | 'cli_unsupported'
   | 'backend_unsupported'
   | 'scratch_unsupported_for_cli'
+  | 'oncall_unsupported_for_cli'
   | 'zmx_unsupported_for_antigravity';
 
 export interface ZeroPromptSupportOpts {
@@ -92,6 +93,9 @@ export function zeroPromptInjectionUnsupportedReason(
   }
   if ((cliId === 'cursor' || cliId === 'antigravity' || cliId === 'doubao') && isScratchSandbox(opts)) {
     return 'scratch_unsupported_for_cli';
+  }
+  if ((opts?.sandbox === true || opts?.sandbox === 'oncall') && !ZERO_PROMPT_ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS.has(cliId!)) {
+    return 'oncall_unsupported_for_cli';
   }
   if (cliId === 'antigravity' && opts?.backendType === 'zmx') {
     return 'zmx_unsupported_for_antigravity';
@@ -123,17 +127,38 @@ export interface TranscriptDeliveryCapabilityOpts {
  *  the merged overlay the host-side bridge cannot read. Enabling the
  *  transcript envelope there would steer the model away from `botmux send`
  *  while harvest produced nothing — a fully silent turn — so they fall back to
- *  `send` (see SCRATCH_HOST_VIEW_TRANSCRIPT_CLI_IDS). The deny-by-default
- *  oncall bwrap is fine for all of them: their adapters declare the data
- *  directories as authPaths, directory-bind mounted from the real host fs. */
+ *  `send` (see SCRATCH_HOST_VIEW_TRANSCRIPT_CLI_IDS). The oncall bwrap has the
+ * same failure mode whenever the adapter has no host-state mount: hermes has no
+ * `authPaths`, so its `~/.hermes/state.db` would exist only in the sandbox's
+ * tmpfs. Oncall therefore also uses an allowlist (see
+ * ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS); don't add Hermes until a per-bot isolated
+ * host-state mount exists. */
 export function supportsTranscriptReplyDeliveryForBot(
   cliId: string | undefined,
   opts?: TranscriptDeliveryCapabilityOpts,
 ): boolean {
   if (!supportsTranscriptReplyDelivery(cliId)) return false;
   if (isScratchSandbox(opts) && !SCRATCH_HOST_VIEW_TRANSCRIPT_CLI_IDS.has(cliId!)) return false;
+  if ((opts?.sandbox === true || opts?.sandbox === 'oncall') && !ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS.has(cliId!)) return false;
   return true;
 }
+
+/** CLIs whose oncall sandbox exposes the CLI's state directory to the host-side
+ * transcript bridge. Every listed non-claude adapter declares `authPaths`;
+ * claude-code instead uses its dedicated data-dir remap. Hermes deliberately has
+ * no entry: its adapter declares no mount, so `~/.hermes/state.db` would be
+ * written only into the sandbox's private tmpfs. An allowlist makes a newly added
+ * transcript CLI without host-state mounts fall back to `send` by default. */
+export const ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS: ReadonlySet<string> = new Set([
+  'claude-code', 'codex', 'traex', 'coco', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'cursor', 'doubao',
+]);
+
+/** Zero-injection has one extra transcript-capable CLI: antigravity only
+ * harvests in zero-prompt mode and has its own host-state mount, so it must not
+ * be rejected by the ordinary replyDelivery allowlist above. */
+const ZERO_PROMPT_ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS: ReadonlySet<string> = new Set([
+  ...ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS, 'antigravity',
+]);
 
 /** CLIs whose transcript the host-side bridge can still read under the full-root
  *  COW scratch sandbox: the worker points CODEX_HOME / TRAE_HOME at the merged

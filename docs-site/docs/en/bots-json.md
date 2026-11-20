@@ -596,7 +596,7 @@ Compared with `send`, four things change:
 3. In DMs, or 1:1 groups with only the admin and this bot, messages are no longer wrapped in `<user_message>` and `<sender/>`; the model sees the raw text.
 4. The output the model reads after `botmux send` reminds it that the final answer belongs in its reply and progress needs no send.
 
-Supported CLIs: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao. Other CLIs (Antigravity, OpenCode, Relay, codex-app, …) still default to `send`; Antigravity only captures answers in zero-injection mode, so setting it explicitly is rejected. If you set `transcript` and later switch to an unsupported CLI, runtime falls back to `send` and no answer is lost. Under `sandbox: "scratch"` only Claude Code, Codex and TraeX session records are readable from the host; every other CLI falls back to `send` there at runtime (an explicit `transcript` is rejected for Cursor and Doubao); the oncall sandbox is unaffected.
+Supported CLIs: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao. Other CLIs (Antigravity, OpenCode, Relay, codex-app, …) still default to `send`; Antigravity only captures answers in zero-injection mode, so setting it explicitly is rejected. If you set `transcript` and later switch to an unsupported CLI, runtime falls back to `send` and no answer is lost. Under `sandbox: "scratch"` only Claude Code, Codex and TraeX session records are readable from the host; every other CLI falls back to `send` there at runtime (an explicit `transcript` is rejected for Cursor and Doubao); The oncall sandbox has one exception: Hermes' adapter does not mount `~/.hermes/state.db` into the host, so it also falls back to `send` at runtime; other CLIs are unaffected by oncall.
 
 To get the old behavior back (the model runs `botmux send` itself), set `send` explicitly:
 
@@ -664,7 +664,7 @@ What happens:
 
 - **Only the task and attachments are passed**: no botmux system prompt, per-turn reminders, identity info, role, whiteboard, memory or skill catalog. The CLI's own system prompt and the project's `AGENTS.md` are still handled by the CLI.
 - **Answers are forwarded automatically**: the final answer is taken from the CLI's session record and sent back to Feishu, mentioning the person who sent the task by default. Names of other bots in the group (like `@Reviewer`) become real Feishu mentions.
-- **Supported CLIs**: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao, Antigravity. Local backends only: tmux / pty / zellij / herdr / zmx (Antigravity doesn't support zmx). Cursor and Antigravity don't support the `scratch` sandbox. Remote backends and v3 workflows are not supported yet.
+- **Supported CLIs**: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao, Antigravity. Local backends only: tmux / pty / zellij / herdr / zmx (Antigravity doesn't support zmx). Cursor and Antigravity don't support the `scratch` sandbox. Hermes doesn't support the `oncall` sandbox (`~/.hermes/state.db` is not mounted into the host). Remote backends and v3 workflows are not supported yet.
 
 Technical details: [`docs/zero-prompt-injection.md`](https://github.com/deepcoldy/botmux/blob/master/docs/zero-prompt-injection.md).
 

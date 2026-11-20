@@ -3050,6 +3050,14 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
     });
   });
 
+  it('hermes + oncall: state.db 无宿主挂载，GET 生效值回落 send、开关 unsupported', async () => {
+    await withBot('hermes', async (base, configPath) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: false });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+    }, { sandbox: 'oncall' });
+  });
+
   it('antigravity（无转写采集）: GET 缺省 send、开关 unsupported', async () => {
     await withBot('antigravity', async (base, configPath) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();

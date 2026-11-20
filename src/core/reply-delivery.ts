@@ -19,7 +19,7 @@ import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { logger } from '../utils/logger.js';
 import { zeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
 import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
-import { supportsTranscriptReplyDeliveryForBot, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
+import { supportsTranscriptReplyDeliveryForBot, supportsZeroPromptInjection, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
 
 export type ReplyDelivery = 'send' | 'transcript';
 
@@ -83,7 +83,7 @@ export function effectiveReplyDelivery(
   opts?: { sessionSandbox?: ZeroPromptSandboxValue; legacyDefault?: boolean },
 ): ReplyDelivery {
   if (!larkAppId) return 'send';
-  if (zeroPromptInjectionForBot(larkAppId, cliId, promptInjection)) return 'transcript';
+  const zeroPrompt = zeroPromptInjectionForBot(larkAppId, cliId, promptInjection);
   let configured: ReplyDelivery | undefined;
   let sandbox: ZeroPromptSandboxValue | undefined;
   try {
@@ -95,12 +95,18 @@ export function effectiveReplyDelivery(
       // resolveLocalSandboxMode 实际跑在 scratch（采集关闭）。只信冻结值会在
       // 续轮把 transcript 错放回去（改口不 send + 采集关 = 静默）。任一源为
       // scratch 即按 scratch 降级；env=0 不追溯翻案已冻成 scratch 的会话
-      // （spawn 时它确实在 scratch 里）。oncall 不收窄（authPaths bind 宿主
-      // 目录，桥可读）。env 非法值由 envSandboxMode throw，落到外层 catch
-      // fail-closed → send。
+      // （spawn 时它确实在 scratch 里）。oncall 按宿主挂载白名单判定；env 非法值
+      // 由 envSandboxMode throw，落到外层 catch fail-closed → send。
       const frozen = opts.sessionSandbox;
       const envResolved = resolveSandboxMode({ configSandbox: undefined, envValue: process.env.BOTMUX_SANDBOX });
-      sandbox = frozen === 'scratch' || envResolved === 'scratch' ? 'scratch' : frozen;
+      // 任一来源为 scratch 即按 scratch 降级；任一来源为 oncall 即按 oncall
+      // 做宿主挂载能力判定。冻结 off 只证明 config 未显式开沙盒，不能抵消
+      // 机器级 BOTMUX_SANDBOX=oncall 强制启用后的真实运行形态。
+      sandbox = frozen === 'scratch' || envResolved === 'scratch'
+        ? 'scratch'
+        : frozen === 'oncall' || envResolved === 'oncall'
+          ? 'oncall'
+          : frozen;
     } else {
       const cfg = getBot(larkAppId).config;
       // 机器级 BOTMUX_SANDBOX 开关不会 materialise 进 cfg（与零注入同一约定，见
@@ -117,6 +123,9 @@ export function effectiveReplyDelivery(
       });
     }
   } catch { return 'send'; }
+  // 零注入强制 transcript，但仍受同一宿主采集能力约束；否则 Hermes oncall
+  // 会绕过下面的运行时回落，再次形成「提示不 send、宿主也采不到」的静默轮。
+  if (zeroPrompt) return supportsZeroPromptInjection(cliId, { sandbox }) ? 'transcript' : 'send';
   const wanted: ReplyDelivery = configured
     ?? (opts?.legacyDefault ? legacyDefaultReplyDeliveryFor(cliId) : defaultReplyDeliveryFor(cliId));
   if (wanted !== 'transcript') return 'send';
