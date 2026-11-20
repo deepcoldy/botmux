@@ -23,10 +23,14 @@ function fixture() {
 describe('native scheduled control actor', () => {
   it('returns the host-revalidated controller without acquiring task ownership', async () => {
     const { input, authority } = fixture(); const before = JSON.stringify(authority);
+    const resolve = vi.spyOn(input.deps, 'resolveTargetOpenId');
+    const members = vi.spyOn(input.deps, 'listChatMemberOpenIds');
     expect(await resolveNativeScheduledControlActor(input)).toEqual({ openId: 'ou_controller', unionId: 'on_controller' });
     expect(JSON.stringify(authority)).toBe(before);
     expect(authority.task.ownerOpenId).toBeUndefined();
-    expect(input.assertCurrent).toHaveBeenCalledTimes(4);
+    const authorityChecks = input.assertCurrent.mock.invocationCallOrder;
+    expect(authorityChecks[0]!).toBeLessThan(resolve.mock.invocationCallOrder[0]!);
+    expect(authorityChecks.at(-1)!).toBeGreaterThan(members.mock.invocationCallOrder[0]!);
   });
 
   it.each(['turn', 'app', 'chat', 'managed'] as const)('does not publish an actor for mismatched %s', async kind => {

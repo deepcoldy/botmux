@@ -86,4 +86,4 @@ wrapper runner 另外区分本地判定的 `daemon_unreachable` / `daemon_timeou
 
 `botmux execution current --json --cli` 显式请求 `cliExecution` 字段。`mode` 为 `native`、`managed` 或 `unknown`；`executor` 是 worker 实际启动进程的系统账号，不代表平台登录账号；`nativeAuthorized` 表示当前发起/定时控制人仍在宿主操作权限范围内。原生模式要求关闭所有个人能力并关闭 Lark 应用绑定，受管失败不会转为原生模式。`managed` 也包括部分能力开启的组合，并不表示每个 CLI 都按提问人运行。
 
-模式来自当前 worker 的私有启动报告，核对进程、代次和当前配置。旧 worker 没有报告、配置切换尚未重启或报告冲突时返回 `unknown`，调用者不得据环境变量补齐权限。原来的命令不接收新增字段，保持旧客户端严格键检查兼容。该字段是模式与操作权限证明，不签发平台凭据；平台身份仍由原生 CLI 的实际登录决定。
+模式来自当前 worker 的私有启动报告，核对进程、代次和当前配置。旧 worker 没有报告、配置切换尚未重启或报告冲突时返回 `unknown`，调用者不得据环境变量补齐权限。系统账号无法从 OS 核证时同样省略报告并返回 `unknown`，不中止 CLI 启动。原来的命令不接收新增字段，保持旧客户端严格键检查兼容。该字段是模式与操作权限证明，不签发平台凭据；平台身份仍由原生 CLI 的实际登录决定。

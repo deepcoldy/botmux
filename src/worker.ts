@@ -72,7 +72,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
-import { workerCliExecution } from './core/cli-execution-mode.js';
+import { workerCliExecutionReport } from './core/cli-execution-mode.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
 import { tokenStoreProtection, capabilityOn, larkUserNative } from './services/trigger-user-auth.js';
 import { installAidenCodexShim, writeAidenCodexShellConfigs } from './services/aiden-codex-shim.js';
@@ -1804,7 +1804,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
         type: 'session_identity_decision',
         sessionId: cfg.sessionId,
         model: engineIdentityModel,
-        cliExecution: workerCliExecution(cfg, boundLark, userInfo()),
+        cliExecution: workerCliExecutionReport(cfg, boundLark),
         sandboxEngaged: false,
         loopbackShared: true,
         ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
@@ -29344,7 +29344,7 @@ async function spawnCliBody(
       type: 'session_identity_decision',
       sessionId: cfg.sessionId,
       model: childIdentityModel,
-      cliExecution: workerCliExecution(cfg, boundLark, userInfo()),
+      cliExecution: workerCliExecutionReport(cfg, boundLark),
       sandboxEngaged: spawnNetworkShape.sandboxEngaged,
       loopbackShared: spawnNetworkShape.loopbackShared,
       ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),

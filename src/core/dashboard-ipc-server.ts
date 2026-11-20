@@ -174,7 +174,7 @@ import {
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
-import { sessionCliExecutionInfo } from './cli-execution-mode.js';
+import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
 import { getDashboardAdminOpenIds } from '../bot-registry.js';
 import {
   attestCurrentExecutionLoopbackPeer,
@@ -1905,6 +1905,10 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
+    scheduledControlActorMode: ds => {
+      try { return configuredCliExecutionMode(getBot(ds.larkAppId).config); }
+      catch { return 'managed'; }
+    },
     ...(expectedScheduledTurnId ? { expectedScheduledTurnId } : {}),
   });
   return result.ok

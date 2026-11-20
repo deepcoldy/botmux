@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { configuredCliExecutionMode, delegatedCliExecutionAllowed, isCliExecutionInfo,
   isWorkerCliExecution, resolveCliExecutionInfo, sessionCliExecutionInfo, workerCliExecution,
-  type CliExecutionConfig } from '../src/core/cli-execution-mode.js';
+  workerCliExecutionReport, type CliExecutionConfig } from '../src/core/cli-execution-mode.js';
 
 const native: CliExecutionConfig = { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] } };
 const managed: CliExecutionConfig = { triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'] } };
@@ -26,6 +26,27 @@ describe('CLI execution mode', () => {
     expect(workerCliExecution({}, false, user)).toEqual({ mode: 'native', executor: { kind: 'os-user', ...user } });
     expect(workerCliExecution(native, true, { username: 'windows-user', uid: -1 }))
       .toEqual({ mode: 'managed', executor: { kind: 'os-user', username: 'windows-user' } });
+  });
+
+  it('withholds executor metadata instead of failing spawn or trusting an environment fallback', () => {
+    const expected = workerCliExecution(native, false, user);
+    expect(workerCliExecutionReport(native, false, { userInfo: () => user, bun: false })).toEqual(expected);
+    expect(workerCliExecutionReport(native, false, {
+      userInfo: () => { throw new Error('passwd entry missing'); }, bun: false,
+    })).toBeUndefined();
+    expect(workerCliExecutionReport(native, false, {
+      userInfo: () => user, bun: true, getuid: () => user.uid + 1,
+    })).toBeUndefined();
+    expect(workerCliExecutionReport(native, false, {
+      userInfo: () => user, bun: true, getuid: () => user.uid, readUsername: () => 'root',
+    })).toBeUndefined();
+    expect(workerCliExecutionReport(native, false, {
+      userInfo: () => user, bun: true, getuid: () => user.uid,
+      readUsername: () => { throw new Error('account unresolved'); },
+    })).toBeUndefined();
+    expect(workerCliExecutionReport(native, false, {
+      userInfo: () => user, bun: true, getuid: () => user.uid, readUsername: () => user.username,
+    })).toEqual(expected);
   });
 
   it('withholds native authorization for missing, stale or mismatched worker facts', () => {

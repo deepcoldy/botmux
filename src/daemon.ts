@@ -685,10 +685,11 @@ import { readSecretaryMarker, writeSecretaryMarker } from './services/group-secr
 import { fetchRemoteSecretarySessions, fetchRemoteSecretaryTranscript, listSecretaryPeers, type SecretaryPeer } from './services/group-secretary-federation.js';
 import { listSecretaryWatches } from './services/group-secretary-watch-store.js';
 import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
-import { clearSingleIdentityArtifacts, forgetProvenIdentityContent, recallProvenIdentityContent } from './core/cli-identity.js';
+import { clearSessionIdentity, clearSingleIdentityArtifacts, forgetProvenIdentityContent, recallProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
-import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
+import { getLarkToolDelegation, rememberLarkToolDelegation } from './core/lark-tool-delegation.js';
+import { releaseActiveIdentityTurn } from './core/active-identity-turns.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
 import { assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
@@ -723,7 +724,7 @@ import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.j
 import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
 import { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
-import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
+import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn, TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { capabilityOfTool } from './core/identity-policy.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
@@ -4617,21 +4618,74 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
       persist: () => sessionStore.updateSession(ds.session),
     });
   }
-  if (!triggerUserAuthEnabledFor(ds)) {
-    // Tool-identity publication is optional, talker re-admission is not. The
-    // scheduler calls this after precondition/admission waits, so a talk-only
-    // task must still be checked before it can dispatch with the bot's tools.
-    if (turnId.startsWith('schedule:')) return prepareScheduledTurnCliIdentity(ds, turnId, true)
-      .then(() => prepareNativeScheduledControlIdentity(ds, turnId));
-    return;
-  }
   if (turnId.startsWith('schedule:')) {
-    if (configuredCliExecutionMode(getBot(ds.larkAppId).config) === 'native') {
-      return prepareScheduledTurnCliIdentity(ds, turnId, true)
-        .then(() => prepareNativeScheduledControlIdentity(ds, turnId));
+    const modeAtStart = configuredCliExecutionMode(getBot(ds.larkAppId).config);
+    const authAtStart = triggerUserAuthEnabledFor(ds);
+    const clearControlActor = () => {
+      ds.scheduledControlActors?.delete(turnId);
+      if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
+    };
+    const clearFailedAdmission = () => {
+      clearControlActor();
+      ds.scheduledToolActors?.delete(turnId);
+      if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
+      rememberLarkToolDelegation(config.session.dataDir, ds.session.sessionId, turnId, undefined);
+      releaseActiveIdentityTurn(config.session.dataDir, ds.session.sessionId, turnId);
+      for (const model of ['proven', 'single'] as const) {
+        for (const tool of TRIGGER_USER_AUTH_TOOLS) {
+          clearSessionIdentity(config.session.dataDir, ds.session.sessionId, tool, turnId, model);
+        }
+      }
+      // 材料已撤销；下一次 live replay 必须重新准备，不能沿用这次发布基线。
+      ds.lastPublishedIdentityModel = undefined;
+    };
+    const finishScheduledAdmission = async (preparation: Promise<void>): Promise<void> => {
+      try {
+        await preparation;
+        const assertStable = () => {
+          if (configuredCliExecutionMode(getBot(ds.larkAppId).config) !== modeAtStart
+            || triggerUserAuthEnabledFor(ds) !== authAtStart) {
+            throw new Error('CLI execution policy changed during scheduled turn admission');
+          }
+        };
+        assertStable();
+        const taskId = parseScheduledTurnId(turnId);
+        const authority = taskId ? scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId) : undefined;
+        if (!authority) throw new Error('schedule authority record missing');
+        if (modeAtStart === 'native') {
+          // ABA（native→managed→native）也不能只凭最终模式放行：本轮必须真的
+          // 走完 native 控制人准备，而不是提交一次空 native 分支的结果。
+          if (authority.kind === 'delegated' && !ds.scheduledControlActors?.has(turnId)) {
+            throw new Error('native scheduled control actor missing');
+          }
+          return;
+        }
+        clearControlActor();
+        // managed 身份发布可能发生外部等待。发布后、返回 admission 成功前，
+        // 再按当前配置核验 delegated 控制器、授予范围和 host 策略。
+        if (authority.kind === 'delegated') {
+          await authorizeDelegatedScheduleRun(authority.task, authority, {
+            ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
+            allowCompletedOnce: true,
+            assertAuthorityCurrent: () => assertScheduledAuthorityCurrent(authority,
+              scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId!), { turnId, allowCompleted: true }),
+          });
+        }
+        assertStable();
+      } catch (error) {
+        clearFailedAdmission();
+        throw error;
+      }
+    };
+    if (modeAtStart === 'native' || !authAtStart) {
+      return finishScheduledAdmission(prepareScheduledTurnCliIdentity(ds, turnId, true)
+        .then(() => prepareNativeScheduledControlIdentity(ds, turnId)));
     }
-    return prepareScheduledTurnCliIdentity(ds, turnId);
+    // managed delegated turn 不再保留 native 控制人证明；即时查询另有模式门控。
+    clearControlActor();
+    return finishScheduledAdmission(prepareScheduledTurnCliIdentity(ds, turnId));
   }
+  if (!triggerUserAuthEnabledFor(ds)) return;
   if (isOwnerActorTurnId(turnId)) {
     const prepareKey = JSON.stringify([ds.workerGeneration ?? null, ds.managedTurnOrigin?.dispatchAttempt ?? null]);
     let preparations = ownerActorIdentityRestores.get(ds);
@@ -4912,6 +4966,10 @@ async function restoreTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
     await prepareNativeScheduledControlIdentity(ds, turnId);
     return;
   }
+  if (parseScheduledTurnId(turnId)) {
+    ds.scheduledControlActors?.delete(turnId);
+    if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
+  }
   if (ds.lastPublishedIdentityModel !== undefined || !triggerUserAuthEnabledFor(ds)
     || identityStorageModelForDaemonSession(ds) !== 'proven'
     // Owner turns are synthetic but carry a daemon-resolved human sender. Other
@@ -5069,10 +5127,24 @@ const scheduleIdentityClaims = createScheduleIdentityClaims({
 async function prepareNativeScheduledControlIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   ds.scheduledControlActors?.delete(turnId);
   if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
-  if (configuredCliExecutionMode(getBot(ds.larkAppId).config) !== 'native') return;
+  ds.scheduledToolActors?.delete(turnId);
+  if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
   const taskId = parseScheduledTurnId(turnId);
   const authority = taskId ? scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId) : undefined;
   if (!authority) throw new Error('schedule authority record missing');
+  if (configuredCliExecutionMode(getBot(ds.larkAppId).config) !== 'native') {
+    // triggerUserAuth 全关时 prepareScheduledTurnCliIdentity 只复核 talker；
+    // fire 后若从 native 切到 managed，仍须在入 worker 前按当前配置重跑 delegated 门禁。
+    if (authority?.kind === 'delegated') {
+      await authorizeDelegatedScheduleRun(authority.task, authority, {
+        ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
+        allowCompletedOnce: true,
+        assertAuthorityCurrent: () => assertScheduledAuthorityCurrent(authority,
+          scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId!), { turnId, allowCompleted: true }),
+      });
+    }
+    return;
+  }
   const actor = await resolveNativeScheduledControlActor({
     turnId, appId: ds.larkAppId, chatId: ds.chatId, authority,
     cliConfig: () => getBot(ds.larkAppId).config,
@@ -5111,6 +5183,16 @@ async function prepareDelegatedScheduledTurnIdentity(
     { ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
       allowCompletedOnce: true, assertAuthorityCurrent: assertCurrent },
   );
+  const scheduledPublicationSnapshot = () => JSON.stringify([
+    configuredCliExecutionMode(getBot(ds.larkAppId).config), triggerUserAuthEnabledFor(ds),
+  ]);
+  const assertScheduledPublicationStable = (snapshot: string): void => {
+    // 比较的是“本次发布实际采用的配置”，不是 admission 的起止字符串：
+    // managed→native→managed 的 ABA 不能把 native 发布结果提交给 managed。
+    if (scheduledPublicationSnapshot() !== snapshot) {
+      throw new Error('CLI execution policy changed during scheduled identity publication');
+    }
+  };
   if (authorized.usesControllerToolActor) {
     const identity: Extract<ScheduledRunIdentity, { ok: true }> = {
       ok: true,
@@ -5120,6 +5202,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     };
     noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
     noteScheduledIdentityRestored(ds, authorized.task, turnId, identity);
+    const publicationSnapshot = scheduledPublicationSnapshot();
     await publishTurnCliIdentity({
       botConfig: getBot(ds.larkAppId).config,
       sessionDataDir: config.session.dataDir,
@@ -5130,12 +5213,14 @@ async function prepareDelegatedScheduledTurnIdentity(
       storageModel: identityModelForPublication(ds),
       privateChat: ds.chatType === 'p2p',
     });
+    assertScheduledPublicationStable(publicationSnapshot);
     assertCurrent();
     (ds.scheduledToolActors ??= new Map()).set(turnId, {
       openId: identity.openId,
       unionId: identity.unionId,
     });
   } else {
+    const publicationSnapshot = scheduledPublicationSnapshot();
     await publishTurnCliIdentity({
       botConfig: getBot(ds.larkAppId).config,
       sessionDataDir: config.session.dataDir,
@@ -5147,6 +5232,7 @@ async function prepareDelegatedScheduledTurnIdentity(
       storageModel: identityModelForPublication(ds),
       privateChat: ds.chatType === 'p2p',
     });
+    assertScheduledPublicationStable(publicationSnapshot);
     assertCurrent();
   }
   return true;

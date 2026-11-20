@@ -1,3 +1,6 @@
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { userInfo } from 'node:os';
 import { capabilitiesOf, capabilityOn, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 
 export type CliExecutionMode = 'native' | 'managed';
@@ -29,6 +32,44 @@ export function workerCliExecution(config: CliExecutionConfig, boundLark: boolea
   return { mode: configuredCliExecutionMode({ ...config, larkToolBinding: boundLark }),
     executor: { kind: 'os-user', username: user.username,
       ...(Number.isSafeInteger(user.uid) && user.uid >= 0 ? { uid: user.uid } : {}) } };
+}
+
+function readPosixUsername(): string {
+  const id = ['/usr/bin/id', '/bin/id'].find(existsSync);
+  if (!id) throw new Error('system id utility unavailable');
+  return execFileSync(id, ['-un'], {
+    encoding: 'utf8', timeout: 2_000, env: { PATH: '/usr/bin:/bin', LANG: 'C' },
+    stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim();
+}
+
+export interface WorkerCliExecutionReportDeps {
+  userInfo?: () => { username: string; uid: number };
+  bun?: boolean;
+  getuid?: () => number;
+  readUsername?: () => string;
+}
+
+/** Executor metadata is optional and must never prevent the actual CLI spawn.
+ * Node throws when a numeric UID has no passwd entry; Bun instead falls back to
+ * USER/LOGNAME, which is not OS attestation. On POSIX Bun, cross-check that
+ * answer against the account resolved from the real UID. Any failure withholds
+ * the report, making `execution current --cli` return unknown. */
+export function workerCliExecutionReport(config: CliExecutionConfig, boundLark: boolean,
+  deps: WorkerCliExecutionReportDeps = {}): WorkerCliExecution | undefined {
+  try {
+    const user = (deps.userInfo ?? userInfo)();
+    const bun = deps.bun ?? Boolean(process.versions.bun);
+    const getuid = deps.getuid ?? (typeof process.getuid === 'function' ? process.getuid.bind(process) : undefined);
+    if (bun && getuid) {
+      if (user.uid !== getuid()) return undefined;
+      const username = (deps.readUsername ?? readPosixUsername)();
+      if (!username || username !== user.username) return undefined;
+    }
+    return workerCliExecution(config, boundLark, user);
+  } catch {
+    return undefined;
+  }
 }
 
 export interface CliExecutionInfo {
