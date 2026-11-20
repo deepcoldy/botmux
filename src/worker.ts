@@ -421,7 +421,14 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
-import { BridgeBlindTurnWatch, blindTurnNeedsNotice, type BridgeReadPosition } from './services/claude-bridge-blind-turn.js';
+import {
+  BridgeBlindTurnWatch,
+  blindTurnNeedsNotice,
+  replyRecordsStampedWithin,
+  UNREAD_TURN_RELOCATE_RETRIES,
+  UNREAD_TURN_RELOCATE_RETRY_MS,
+  type BridgeReadPosition,
+} from './services/claude-bridge-blind-turn.js';
 import { terminalInputSubmits, wrapBracketedPaste } from './adapters/cli/tui-input.js';
 import { WebTerminalInputController, WebTerminalInputWireState } from './core/web-terminal-input-controller.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
@@ -581,7 +588,7 @@ import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } fro
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { restoredTurnLabel } from './services/restored-turn-label.js';
-import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, resolveJsonlFromPidState, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { resolveShadowedAntigravityStatusLine } from './adapters/cli/antigravity.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
@@ -9659,6 +9666,9 @@ let bridgeStalePidStateSessionId: string | undefined;
 let bridgePathConfirmedAtMs = 0;
 /** Turns Claude ran that the bridge read nothing of (see claude-bridge-blind-turn). */
 const bridgeBlindTurnWatch = new BridgeBlindTurnWatch();
+/** The next look for an unread run's transcript, while the notice about it
+ *  waits on that look (recheckUnreadClaudeTurn). */
+let unreadClaudeTurnLook: { run: UnreadClaudeTurnRun; timer: ReturnType<typeof setTimeout> } | undefined;
 /** Old jsonl paths we keep polling AFTER a rotation switched
  *  bridgeJsonlPath away — needed when a started turn was stamped with the
  *  old path but its assistant text hasn't been written yet. We continue to
@@ -11554,7 +11564,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // re-proves `seen` if the new file carries a marker.
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
-  if (live.length > 0) bridgeQueue.ingest(live, matched);
+  ingestClaudeSwitchLiveAndSettleUnreadTurn(live, matched);
   // The switch moved us onto another Claude session: rebind the fallback
   // tracker to it (seed always publishes, so the daemon drops whatever the
   // previous session left behind) before folding this file's own events in.
@@ -11839,7 +11849,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // not carry over; absorb re-proves `seen` from the new file.
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
-  if (live.length > 0) bridgeQueue.ingest(live, newPath);
+  ingestClaudeSwitchLiveAndSettleUnreadTurn(live, newPath);
   // Same as the fingerprint switch: rebind the fallback tracker to the Claude
   // session we just rotated onto, then fold this file's own events in.
   seedModelFallbackFromTranscript();
@@ -12068,7 +12078,9 @@ function handleClaudeCompactionSignal(startedAtMs: number): void {
 /** Prompt-ready edge: did the bridge read the turn Claude just ran? For an
  *  unread one, first locate the transcript Claude really writes and replay the
  *  unread run from it; failing that, tell the group once rather than let the
- *  replies vanish without a trace. */
+ *  replies vanish without a trace — unless Claude's record of where it writes
+ *  was caught mid-rewrite, which a later look can still read
+ *  (recheckUnreadClaudeTurn). */
 function judgeClaudeBridgeTurn(): void {
   if (!bridgeJsonlPath) return;
   // Judge what is on disk now, not what the last poll happened to drain.
@@ -12084,18 +12096,20 @@ function judgeClaudeBridgeTurn(): void {
     // the queue nor the web counters, so a turn may have run inside this span.
     // Recover it if Claude demonstrably writes another transcript; never report.
     log(`Bridge read nothing during a ${Math.round((Date.now() - verdict.turnStartedAtMs) / 1000)}s ${cliName()} compaction span; not reporting it as an unread turn`);
-    if (relocateUnreadClaudeTranscript(verdict.turnStartedAtMs)) {
+    if (relocateUnreadClaudeTranscript(verdict.turnStartedAtMs) === 'moved') {
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit after transcript recovery failed: ${err.message}`); }
     }
     return;
   }
   if (verdict.kind !== 'blind') return;
   log(`Bridge read nothing from ${bridgeJsonlPath} during a ${Math.round((Date.now() - verdict.turnStartedAtMs) / 1000)}s ${cliName()} turn; locating the transcript it writes`);
-  if (relocateUnreadClaudeTranscript(verdict.blindSinceMs)) {
+  const located = relocateUnreadClaudeTranscript(verdict.blindSinceMs);
+  if (located === 'moved') {
     try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit after transcript recovery failed: ${err.message}`); }
     return;
   }
-  if (verdict.reported) return;
+  // Already told, or still looking for this run's transcript.
+  if (verdict.reported || unreadClaudeTurnLook) return;
   const unreadLarkTurn = bridgeQueue.peek().find(turn => !turn.started && !turn.isLocal);
   const adoptMode = lastInitConfig?.adoptMode === true;
   const sendsDuringTurn = adoptMode ? [] : readSendMarkers()
@@ -12115,21 +12129,180 @@ function judgeClaudeBridgeTurn(): void {
       : {}),
   });
   if (!needsNotice) return;
+  const run: UnreadClaudeTurnRun = {
+    path: bridgeJsonlPath,
+    blindSinceMs: verdict.blindSinceMs,
+    ...(unreadLarkTurn ? { turnId: unreadLarkTurn.turnId } : {}),
+    judgedAtMs: Date.now(),
+    promptReadyEdge: promptReadyEdges,
+    writtenInput: lastWrittenCliInput,
+    webSubmitGeneration: webTerminalSubmitGeneration,
+  };
+  if (located !== 'mid-rewrite') {
+    notifyUnreadClaudeTurn(run);
+    return;
+  }
+  // Claude rewrites the record in place on this very busy→idle edge, and a
+  // loaded host can stall that rewrite past the re-reads: look again before
+  // telling anyone (see UNREAD_TURN_RELOCATE_RETRY_MS). A worker killed while
+  // looking takes the notice with it; that window is these few seconds.
+  log(`Bridge caught ${cliName()}'s session record mid-rewrite; looking again before telling the group`);
+  scheduleUnreadClaudeTurnLook(run, 1);
+}
+
+/** An unread run whose transcript the bridge is still looking for: the
+ *  transcript it was blind on, when the run began and was judged, the Lark turn
+ *  a notice about it answers, and where Claude stood when it was judged. */
+interface UnreadClaudeTurnRun {
+  path: string;
+  blindSinceMs: number;
+  judgedAtMs: number;
+  turnId?: string;
+  promptReadyEdge: number;
+  writtenInput: typeof lastWrittenCliInput;
+  webSubmitGeneration: number;
+}
+
+function scheduleUnreadClaudeTurnLook(run: UnreadClaudeTurnRun, attempt: number): void {
+  const timer = setTimeout(() => recheckUnreadClaudeTurn(run, attempt), UNREAD_TURN_RELOCATE_RETRY_MS);
+  timer.unref?.();
+  unreadClaudeTurnLook = { run, timer };
+}
+
+/** Nothing has moved Claude since the unread run was judged: it sits at that
+ *  same prompt — no turn started, no input written from Lark, a passthrough or
+ *  the Web terminal. Only then is the transcript it writes now the one holding
+ *  the run, with nothing after it, so that a replay found now delivers the run
+ *  whole. Otherwise the group is told, as it would have been at the prompt. */
+function unreadClaudeTurnUndisturbed(run: UnreadClaudeTurnRun): boolean {
+  return isPromptReady
+    && promptReadyEdges === run.promptReadyEdge
+    && !bridgeBlindTurnWatch.turnInProgress()
+    && lastWrittenCliInput === run.writtenInput
+    && webTerminalSubmitGeneration === run.webSubmitGeneration;
+}
+
+/** A reply the switch's ingest actually attributed to a turn. Raw transcript
+ *  presence is not delivery evidence: an already-seen reply from the previous
+ *  turn can fall inside the replay skew window, but the queue consumes it
+ *  nowhere and the current run stays stranded. */
+interface UnreadTurnReplyAttribution {
+  record: { type?: unknown; subtype?: unknown; timestamp?: unknown };
+  turnId: string;
+  isLocal: boolean;
+}
+
+/** Ingest a switch's live records before deciding whether they settle a
+ *  deferred unread-turn notice. Keeping settlement after ingest also means an
+ *  ingest failure leaves the look alive, so its ordinary fail-closed path can
+ *  still report the run. */
+function ingestClaudeSwitchLiveAndSettleUnreadTurn(live: TranscriptEvent[], path: string): void {
+  const attributed: UnreadTurnReplyAttribution[] = [];
+  if (live.length > 0) {
+    bridgeQueue.ingest(live, path, (record, turn) => {
+      if (record.type === 'assistant') attributed.push({ record, turnId: turn.turnId, isLocal: turn.isLocal === true });
+    }, (record, turn) => {
+      attributed.push({ record, turnId: turn.turnId, isLocal: turn.isLocal === true });
+    });
+  }
+  settleUnreadClaudeTurnLookOnSwitch(attributed);
+}
+
+/** A transcript switch — a bridge follower's, or a look's own — while the
+ *  bridge looks for an unread run's transcript. It consumed the run if Claude
+ *  is still where the run left it and ingest attributed a reply written during
+ *  the run to that run's own Lark turn. Adopt / zero-injection local turns have
+ *  no Lark id to match; for those, actual attribution to a local turn is the
+ *  equivalent evidence. Anything less — including an old reply merely present
+ *  in the live time window — leaves the look to tell the group. */
+function settleUnreadClaudeTurnLookOnSwitch(attributed: readonly UnreadTurnReplyAttribution[]): void {
+  const look = unreadClaudeTurnLook;
+  if (!look || !unreadClaudeTurnUndisturbed(look.run)) return;
+  // The same skew the relocation replays from: a turn's records can precede
+  // the busy evidence its run starts from. Attribution, not the timestamp
+  // alone, distinguishes such a reply from the previous turn's replay.
+  const consumed = attributed.some(({ record, turnId, isLocal }) =>
+    (look.run.turnId ? turnId === look.run.turnId : isLocal)
+    && replyRecordsStampedWithin([record], look.run.blindSinceMs - PENDING_MARK_SKEW_MS, look.run.judgedAtMs));
+  if (!consumed) return;
+  clearTimeout(look.timer);
+  unreadClaudeTurnLook = undefined;
+  log(`Bridge transcript switch attributed the unread ${cliName()} run's reply; no notice needed`);
+}
+
+/** Look for an unread run's transcript once more. Its notice is dropped only on
+ *  evidence the run was delivered (settleUnreadClaudeTurnLookOnSwitch);
+ *  anything less tells the group. */
+function recheckUnreadClaudeTurn(run: UnreadClaudeTurnRun, attempt: number): void {
+  const look = unreadClaudeTurnLook;
+  // Over already: a later turn was read, or the bridge was torn down.
+  if (!bridgeBlindTurnWatch.isUnreportedRun(run.blindSinceMs)) {
+    unreadClaudeTurnLook = undefined;
+    return;
+  }
+  // Moved since it was judged, or switched by a follower without replaying
+  // the run: whether the run reaches the group is no longer known.
+  if (!unreadClaudeTurnUndisturbed(run) || bridgeJsonlPath !== run.path) {
+    unreadClaudeTurnLook = undefined;
+    notifyUnreadClaudeTurn(run);
+    return;
+  }
+  let located: ReturnType<typeof relocateUnreadClaudeTranscript>;
+  try {
+    located = relocateUnreadClaudeTranscript(run.blindSinceMs);
+  } catch (err: any) {
+    // This look's timer has already fired. If its own switch fails mid-ingest,
+    // leaving the look merely alive would strand it with no timer left.
+    unreadClaudeTurnLook = undefined;
+    log(`Bridge transcript recovery during the unread-turn recheck failed: ${err.message}`);
+    notifyUnreadClaudeTurn(run);
+    return;
+  }
+  if (look && unreadClaudeTurnLook !== look) {
+    // The switch replayed the run, at the prompt it was judged on: drain as
+    // that edge would have.
+    try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit after transcript recovery failed: ${err.message}`); }
+    return;
+  }
+  if (located === 'mid-rewrite' && attempt < UNREAD_TURN_RELOCATE_RETRIES) {
+    scheduleUnreadClaudeTurnLook(run, attempt + 1);
+    return;
+  }
+  // Still unreadable, nothing else to read, or moved onto a transcript that
+  // does not hold the run.
+  unreadClaudeTurnLook = undefined;
+  notifyUnreadClaudeTurn(run);
+}
+
+/** The bridge is being torn down (CLI exit or restart) while still looking for
+ *  an unread run's transcript: tell the group now rather than lose the notice
+ *  with the bridge. */
+function settleUnreadClaudeTurnLookOnTeardown(): void {
+  if (!unreadClaudeTurnLook) return;
+  const { run, timer } = unreadClaudeTurnLook;
+  clearTimeout(timer);
+  unreadClaudeTurnLook = undefined;
+  if (bridgeBlindTurnWatch.isUnreportedRun(run.blindSinceMs)) notifyUnreadClaudeTurn(run);
+}
+
+function notifyUnreadClaudeTurn(run: UnreadClaudeTurnRun): void {
   bridgeBlindTurnWatch.noteReported();
   log(`Bridge could not locate the transcript ${cliName()} writes; telling the group its replies are not being read`);
   send({
     type: 'user_notify',
     message: t('worker.claude_bridge_turn_unread', { cliName: cliName() }),
-    ...(unreadLarkTurn ? { turnId: unreadLarkTurn.turnId } : {}),
+    ...(run.turnId ? { turnId: run.turnId } : {}),
   });
 }
 
 /** Find the transcript Claude writes from Claude's own state — never from
  *  directory recency, which a sibling pane in the same project dir would win —
  *  and move the bridge onto it, replaying what it holds since `blindSinceMs`.
- *  Returns true when the bridge moved. */
-function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
-  if (!bridgeCliCwd || !lastInitConfig) return false;
+ *  'moved' when the bridge moved; 'mid-rewrite' when it did not because
+ *  Claude's pid-state record was caught mid-rewrite, so a later look may still
+ *  read it; 'none' otherwise. */
+function relocateUnreadClaudeTranscript(blindSinceMs: number): 'moved' | 'mid-rewrite' | 'none' {
+  if (!bridgeCliCwd || !lastInitConfig) return 'none';
   // A bound pid that is not Claude means the launch-layer resolution stopped
   // short on a layer it does not know. The shallowest Claude process under our
   // own pane is the CLI, whatever sits in between — recognised by comm or, for
@@ -12151,14 +12324,15 @@ function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
       bridgeCliPid = cliPid;
     }
   }
-  if (bridgeCliPid === undefined) return false;
+  if (bridgeCliPid === undefined) return 'none';
   const confirmedAtMs = Math.min(bridgePathConfirmedAtMs, blindSinceMs - PENDING_MARK_SKEW_MS);
-  const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd, bridgeDataDir);
-  if (resolved && resolved.path !== bridgeJsonlPath && resolved.cliSessionId !== bridgeStalePidStateSessionId) {
+  const resolved = resolveJsonlFromPidState(bridgeCliPid, bridgeCliCwd, bridgeDataDir);
+  if (resolved && resolved !== 'mid-rewrite'
+    && resolved.path !== bridgeJsonlPath && resolved.cliSessionId !== bridgeStalePidStateSessionId) {
     bridgeObservedCliSessionId = resolved.cliSessionId;
     bridgeRememberSessionIdForPath(resolved.path, 'cli');
     switchBridgeToPidStatePath(resolved.path, 'unread turn → pid state', confirmedAtMs);
-    return true;
+    return 'moved';
   }
   // A pid-state record that keeps the spawn-time id (older Claude) cannot see
   // an in-pane /clear; the session files Claude holds open can — accepted only
@@ -12168,11 +12342,11 @@ function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
     .map(sid => claudeJsonlPathForSession(sid, cwd, bridgeDataDir))
     .filter(path => path !== bridgeJsonlPath && (statSafe(path)?.mtimeMs ?? 0) >= confirmedAtMs);
   const newest = newestPath(written);
-  if (!newest) return false;
+  if (!newest) return resolved === 'mid-rewrite' ? 'mid-rewrite' : 'none';
   bridgeRememberSessionIdForPath(newest, 'cli');
   switchBridgeToPidStatePath(newest, 'unread turn → open session files', confirmedAtMs);
   bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(newest));
-  return true;
+  return 'moved';
 }
 
 /** True while the head Lark/API turn is still being written to the Claude
@@ -12775,6 +12949,7 @@ function stopBridgeWatcher(): void {
   bridgeSecondaryPaths.clear();
   orcaClaudeWebHistorySignature = undefined;
   bridgeFingerprintScanLastMs.clear();
+  settleUnreadClaudeTurnLookOnTeardown();
   bridgeBlindTurnWatch.reset();
   claudeCompactionInputSnapshot = undefined;
   // Attribution belongs to the CLI generation whose transcript we watched.

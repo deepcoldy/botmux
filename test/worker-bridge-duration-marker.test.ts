@@ -231,6 +231,7 @@ function exitPath(queue: BridgeTurnQueue) {
     bridgeSecondaryPaths: new Map(),
     bridgeRestoreGate: { markGenerationRetired: () => {} },
     bridgeBlindTurnWatch: new BridgeBlindTurnWatch(),
+    settleUnreadClaudeTurnLookOnTeardown: () => {},
     resetThinkingChannel: () => {},
     disarmProvisionalExitWatch: () => {},
     beginNewBridgeTranscriptGeneration: () => {},
