@@ -250,8 +250,10 @@ function isExclusiveAgentlessHerdrTarget(
 }
 
 export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {
-  if (target.backendType === 'tmux' && target.socketName !== undefined) {
-    return TmuxBackend.probeSession(target.sessionName, target.socketName);
+  if (target.backendType === 'tmux' && (target.socketName !== undefined || target.socketRoot !== undefined)) {
+    return target.socketRoot !== undefined
+      ? TmuxBackend.probeSession(target.sessionName, target.socketName, target.socketRoot)
+      : TmuxBackend.probeSession(target.sessionName, target.socketName);
   }
   if (target.backendType === 'zmx' && target.socketDir !== undefined) {
     return ZmxBackend.probeSession(target.sessionName, zmxEnv(process.env, target.socketDir));
@@ -296,8 +298,9 @@ export function killPersistentBackendTarget(
     HerdrBackend.killSession(target.sessionName);
     return;
   }
-  if (target.backendType === 'tmux' && target.socketName !== undefined) {
-    TmuxBackend.killSession(target.sessionName, target.socketName);
+  if (target.backendType === 'tmux' && (target.socketName !== undefined || target.socketRoot !== undefined)) {
+    if (target.socketRoot !== undefined) TmuxBackend.killSession(target.sessionName, target.socketName, target.socketRoot);
+    else TmuxBackend.killSession(target.sessionName, target.socketName);
     return;
   }
   killPersistentSession(target.backendType, target.sessionName, sessionId);
@@ -367,9 +370,10 @@ export function persistentBackendTargetKey(target: PersistentBackendTarget): str
     target.backendType === 'herdr' ? target.agentName ?? '' : '',
     target.backendType === 'herdr' && target.agentName === undefined ? target.sessionId ?? '' : '',
     target.backendType === 'zmx' ? target.socketDir ?? '' : '',
-    // Appended only when set so default-server keys stay byte-identical to the
-    // keys older code computed (caches/batches compare them across call sites).
     ...(target.backendType === 'tmux' && target.socketName !== undefined ? [target.socketName] : []),
+    // socketRoot is optional and appended only when present, preserving every
+    // key produced for legacy targets and for targets with only socketName.
+    ...(target.backendType === 'tmux' && target.socketRoot !== undefined ? [target.socketRoot] : []),
   ]);
 }
 
