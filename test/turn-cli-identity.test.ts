@@ -555,7 +555,7 @@ describe('target daemon consumes signed message authority', () => {
   async function targetHarness(options: { taskConsent?: boolean; botAccess?: boolean; mapping?: 'resolved' | 'transient' | 'definitive'; member?: boolean; memberError?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
     const ts = (await import('typescript')).default;
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
-    const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
+    const { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } = await import('../src/core/reply-target.js');
     const { resolveScheduledRunIdentity } = await import('../src/core/schedule-identity-claim.js');
     const { buildUntilDoneRunPrompt, isAutoCompletedSchedule } = await import('../src/services/schedule-until-done.js');
     const { scheduleTimeZone } = await import('../src/utils/timezone.js');
@@ -600,7 +600,7 @@ describe('target daemon consumes signed message authority', () => {
     const resolveTargetAppOpenId = vi.fn(async () => options.mapping && options.mapping !== 'resolved'
       ? { status: options.mapping } : { status: 'resolved', openId: 'ou_alice_target' });
     const scopeValues = {
-      config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
+      config: { session: { dataDir: dir } }, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveDispatchUser, dispatchCallerFromReply,
       readTaskBinding, capabilityOn, getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       dispatchConsentCardAvailable: async () => true,
       loadOrCreateDispatchReportBindingSecret: () => secret,
