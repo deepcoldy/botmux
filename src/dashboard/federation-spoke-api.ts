@@ -373,11 +373,24 @@ export async function handleFederationSpokeApi(
     }
     if (method === 'PUT') {
       let body: any;
-      try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+      // Conditional role writes carry old and new values; JSON can escape each
+      // byte as six characters. Keep the persisted role's own limit unchanged.
+      const bodyLimit = field === 'role' ? 2 * MAX_ROLE_BYTES * 6 + 1024 : undefined;
+      try { body = await readBody(req, bodyLimit); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
       if (field === 'capability') {
         const cap = String(body?.capability ?? '').trim();
         if (cap) setBotCapability(dataDir, larkAppId, cap); else clearBotCapability(dataDir, larkAppId);
       } else {
+        // Compare after reading the request, with no await before the write.
+        // Legacy callers omit both expectations and retain their existing API.
+        if (body?.expectedRole !== undefined || body?.expectedInjectMode !== undefined) {
+          const fp = teamRolePath(dataDir, larkAppId);
+          const current = existsSync(fp) ? readFileSync(fp, 'utf-8') : '';
+          if (body.expectedRole !== current || body.expectedInjectMode !== readTeamRoleInjectMode(larkAppId)) {
+            jsonRes(res, 409, { ok: false, error: 'role_changed' });
+            return true;
+          }
+        }
         const role = String(body?.role ?? '').trim();
         if (role) writeTeamRole(dataDir, larkAppId, role);
         else { try { unlinkSync(teamRolePath(dataDir, larkAppId)); } catch { /* already gone */ } }
