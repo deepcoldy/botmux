@@ -15,6 +15,7 @@ import {
 import { SessionEventGateway, type SessionEventAdmission } from './session-event-gateway.js';
 import { isOutputJournalAppId } from '../services/universal-output-handoff.js';
 import { commitPrimarySessionContract, sessionContractPrimary } from './session-contract-primary.js';
+import { isCodexFamilyCliId } from '../adapters/cli/types.js';
 
 export type SessionContractBootstrap = import('../services/session-contract.js').SessionContractBootstrap;
 export interface WorkerContractContext extends SessionEventContext { bindingId?: string }
@@ -164,7 +165,7 @@ export class SessionController {
       // A re-attached CLI may prove its native conversation only after its
       // first binding; attempts a predecessor worker left running in this very
       // process then report under the live runtime again.
-      this.store.reattachPredecessorExecutions(this.ref, bound.ref, worker);
+      if (this.reattachesPredecessorExecutions()) this.store.reattachPredecessorExecutions(this.ref, bound.ref, worker);
       return bound;
     });
     // Physical binding is a fact even if granting execution continuation fails.
@@ -254,11 +255,17 @@ export class SessionController {
       this.reattachToLiveRuntime();
     }); this.refresh();
   }
+  /** Codex and Codex App settle a predecessor's attempt in the re-attached
+   * CLI through the host's observer grant instead: the live runtime stays
+   * selected and that attempt finishes under the runtime it ran on. */
+  private reattachesPredecessorExecutions(): boolean {
+    return !isCodexFamilyCliId(this.ds.initConfig?.cliId ?? this.ds.session.cliId);
+  }
   /** An operation that settled may have held back a re-attachment the live
    *  runtime already proved (a /stop sent before the conversation id arrived). */
   private reattachToLiveRuntime(): void {
     const state = this.store.read(this.ref);
-    if (state?.activeRuntime && state.worker && !state.activeOperationId) {
+    if (this.reattachesPredecessorExecutions() && state?.activeRuntime && state.worker && !state.activeOperationId) {
       this.store.reattachPredecessorExecutions(this.ref, state.activeRuntime, state.worker);
     }
   }
