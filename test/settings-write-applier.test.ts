@@ -27,6 +27,7 @@ import {
 import { config } from '../src/config.js';
 import {
   applySettingsWrite,
+  resolveGroupCreationSettings,
   hasResolvedCodexNotifierRecipient,
   resolveCodexNotifierRecipientView,
   type ResolvedDashboardSettingsView,
@@ -1556,14 +1557,20 @@ describe('applySettingsWrite — groupOwnerNotice', () => {
       const deps = makeDeps({ mergeGlobalConfig: realMergeGlobalConfig, readGlobalConfig: realReadGlobalConfig });
       expect(config.groupOwnerNotice).toBe(true);
 
+      // The page reloads its snapshot from the same file it just wrote.
+      const snapshot = () => resolveGroupCreationSettings(realReadGlobalConfig());
+      expect(snapshot()).toEqual({ groupNamePrefix: 'AI·', groupOwnerNotice: true });
+
       expect((await applySettingsWrite({ groupOwnerNotice: false }, deps)).ok).toBe(true);
       expect(JSON.parse(readFileSync(configFile, 'utf-8'))).toEqual({ groupNamePrefix: 'AI·', groupOwnerNotice: false });
       expect(config.groupOwnerNotice).toBe(false);
+      expect(snapshot().groupOwnerNotice).toBe(false);
 
       // Back on removes the key rather than pinning the default.
       expect((await applySettingsWrite({ groupOwnerNotice: true }, deps)).ok).toBe(true);
       expect(JSON.parse(readFileSync(configFile, 'utf-8'))).toEqual({ groupNamePrefix: 'AI·' });
       expect(config.groupOwnerNotice).toBe(true);
+      expect(snapshot().groupOwnerNotice).toBe(true);
     } finally {
       vi.unstubAllEnvs();
       invalidateGlobalConfigCache();

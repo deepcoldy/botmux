@@ -295,6 +295,7 @@ import {
   defaultSettingsWriteApplierDeps,
   hasResolvedCodexNotifierRecipient,
   resolveCodexNotifierRecipientView,
+  resolveGroupCreationSettings,
 } from './dashboard/settings-write-applier.js';
 import {
   addBotsToGroup,
@@ -1932,9 +1933,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   const codexNotifierState = readCodexNotifierWorkerState(config.session.dataDir);
   const larkCli = checkLarkCliVersion();
   return {
-    groupNamePrefix: global.groupNamePrefix ?? '',
-    // default ON — only an explicit stored false disables (matches config.ts getter)
-    groupOwnerNotice: global.groupOwnerNotice !== false,
+    ...resolveGroupCreationSettings(global),
     worktreeRoot: global.worktreeRoot ?? '',
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,

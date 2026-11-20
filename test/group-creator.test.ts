@@ -1208,8 +1208,9 @@ describe('createGroupWithBots — machine-wide groupOwnerNotice switch', () => {
   // `botmux create-group` process reads it.
   let dir: string;
   let configFile: string;
-  const OWNER_NOTICE = /^<at user_id="[^"]+"><\/at> (群已创建|The group is ready)/;
-  const ownerNotices = () => mockSendMessage.mock.calls.filter(call => OWNER_NOTICE.test(String(call[2])));
+  // The owner notice is the one message that @-mentions the new owner (kickoff
+  // and role bootstrap @ bots); identify it by that, not by its wording.
+  const ownerNotices = () => mockSendMessage.mock.calls.filter(call => String(call[2]).startsWith(`<at user_id="${USER_OPEN_ID}"></at>`));
 
   beforeEach(() => {
     for (const mock of [

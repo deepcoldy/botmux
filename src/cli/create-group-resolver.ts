@@ -121,6 +121,58 @@ export function parseOwnerNoticeCommand(rest: string[]): OwnerNoticeCommand {
   return { kind: 'invalid', error: `owner-notice 只支持 status / on / off，收到: "${args[0]}"` };
 }
 
+export interface OwnerNoticeCommandDeps {
+  /** Persist the switch (global-config `setGroupOwnerNoticeEnabled`). */
+  setEnabled(enabled: boolean): void;
+  /** Effective value, as group creation reads it (config.ts getter). */
+  isEnabled(): boolean;
+  /** The stored value exactly as written, for hand-edit diagnostics. */
+  rawValue(): unknown;
+  configPath(): string;
+}
+
+export interface OwnerNoticeCommandOutcome {
+  exitCode: 0 | 1 | 2;
+  /** Effective switch after the command; absent when it was refused. */
+  enabled?: boolean;
+  stdout: string[];
+  stderr: string[];
+}
+
+/** Execute a parsed `create-group owner-notice …` (I/O only through deps). */
+export function runOwnerNoticeCommand(
+  cmd: Exclude<OwnerNoticeCommand, { kind: 'none' }>,
+  deps: OwnerNoticeCommandDeps,
+): OwnerNoticeCommandOutcome {
+  if (cmd.kind === 'invalid') return { exitCode: 2, stdout: [], stderr: [cmd.error, OWNER_NOTICE_USAGE] };
+  if (cmd.kind === 'set') {
+    try {
+      deps.setEnabled(cmd.enabled);
+    } catch (err: any) {
+      return {
+        exitCode: 1,
+        stdout: [],
+        stderr: [`写入 ${deps.configPath()} 失败: ${err?.message ?? err}（可改用 Dashboard「设置 → 群聊创建」）`],
+      };
+    }
+  }
+  const enabled = deps.isEnabled();
+  const raw = deps.rawValue();
+  const stderr = raw !== undefined && typeof raw !== 'boolean'
+    ? [`⚠️  ${deps.configPath()} 里的 groupOwnerNotice 是 ${JSON.stringify(raw)}，不是 JSON 布尔值，已忽略（按默认开）；用 botmux create-group owner-notice off 改写。`]
+    : [];
+  return {
+    exitCode: 0,
+    enabled,
+    stdout: [
+      `建群后 @ 群主提醒: ${enabled ? 'on' : 'off'}${cmd.kind === 'set' ? '（已保存）' : ''}`,
+      `配置文件: ${deps.configPath()}（${enabled ? 'groupOwnerNotice 未设为 false，默认开' : '"groupOwnerNotice": false'}）`,
+      '下一次建群即生效，无需重启 daemon。',
+    ],
+    stderr,
+  };
+}
+
 export type ResolvedChatMode =
   | { ok: true; chatMode?: ChatMode }
   | { ok: false; error: string };

@@ -36,9 +36,9 @@
 - 命令行：`botmux create-group owner-notice off`；`on` 恢复，不带参数（或 `status`）查看当前状态。
 - 配置文件：在 `~/.botmux/config.json` 顶层写 `"groupOwnerNotice": false`（必须是 JSON 布尔值）；删掉这一项即恢复默认开。
 
-开关是本机全局的，对本机所有会发这条提醒的建群入口生效：`/g`（`/group`）、`botmux create-group`、Dashboard 建群与「创建会话」、Webhook 生命周期群、Dashboard 团队页拉群、会议监听群；团队页拉群延后转让群主时补发的那条单独 @ 也一并不发。关闭只去掉这条提醒，群主转让、邀请成员、设管理员、kickoff 消息照常。改完不用重启：下一次建群就按新设置执行（单次 `botmux create-group` 每次都读最新配置，daemon 最多约 2 秒读到新值）。
+开关是本机全局的，对本机所有会发这条提醒的建群入口生效：`/g`（`/group`）、`botmux create-group`、Dashboard 建群与「创建会话」、Webhook 生命周期群、Dashboard 团队页拉群、会议监听群；团队页拉群延后转让群主时补发的那条单独 @ 也一并不发。团队页拉群在本机没有可用的建群机器人时会交给团队里另一台部署代建，这时按代建那台机器的开关算。关闭只去掉这条提醒，群主转让、邀请成员、设管理员、kickoff 消息照常。改完不用重启：下一次建群就按新设置执行（单次 `botmux create-group` 每次都读最新配置，daemon 最多约 2 秒读到新值）。
 
-私聊转群（群聊模式的会话群）、`/relay --create`、`/fork --create` 和领取 issue 建群本来就不发这条提醒；Dashboard 发起 Workflow 时建的话题群在任何设置下都不发。`botmux create-group --team` 由中心平台代建，平台自己发的「群已建好」@ 不归这个本机开关管。
+私聊转群（群聊模式的会话群）、`/relay --create`、`/fork --create` 和领取 issue 建群本来就不发这条提醒（会话群里 @ 发起人的引子消息是本轮回复的锚点，不受这个开关影响）；Dashboard 发起 Workflow 时建的话题群在任何设置下都不发。`botmux create-group --team` 由中心平台代建，平台自己发的「群已建好」@ 不归这个本机开关管。
 
 ## 自动群名
 

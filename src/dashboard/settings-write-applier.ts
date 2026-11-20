@@ -173,6 +173,18 @@ export interface ResolvedDashboardSettingsView {
   effectiveScheduleTimeZone?: string;
 }
 
+/** Group-creation fields of the Dashboard settings snapshot. `groupOwnerNotice`
+ *  must agree with what group creation reads (config.ts `groupOwnerNotice`):
+ *  only an explicit stored `false` shows the switch off. */
+export function resolveGroupCreationSettings(
+  global: Pick<GlobalConfig, 'groupNamePrefix' | 'groupOwnerNotice'>,
+): Pick<ResolvedDashboardSettingsView, 'groupNamePrefix' | 'groupOwnerNotice'> {
+  return {
+    groupNamePrefix: global.groupNamePrefix ?? '',
+    groupOwnerNotice: global.groupOwnerNotice !== false,
+  };
+}
+
 export type ParseMaintenanceResult =
   | { ok: true; patch: MaintenanceConfig }
   | { ok: false; error: string };

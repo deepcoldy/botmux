@@ -1269,6 +1269,12 @@ export function globalVcMeetingAgentListenerBotAppId(): string | undefined {
   return globalVcMeetingAgentConfigLive().listenerBotAppId;
 }
 
+/** The stored `groupOwnerNotice` exactly as written, so a hand edit that the
+ *  typed read ignores (e.g. the string "false") can be pointed out. */
+export function readRawGroupOwnerNotice(): unknown {
+  return readRawConfig().groupOwnerNotice;
+}
+
 /** Persist the `groupOwnerNotice` switch (read live via config.ts
  *  `config.groupOwnerNotice`). Only the non-default `false` is stored; turning
  *  it back on deletes the key, so the file never pins the default. */

@@ -17894,29 +17894,19 @@ botmux create-group — 用一组机器人新建飞书群
 
   // `create-group owner-notice …` is a settings write, not a group creation:
   // route it before every creation gate (transport, bots.json, --bot).
-  const { parseOwnerNoticeCommand, OWNER_NOTICE_USAGE } = await import('./cli/create-group-resolver.js');
+  const { parseOwnerNoticeCommand, runOwnerNoticeCommand } = await import('./cli/create-group-resolver.js');
   const ownerNoticeCommand = parseOwnerNoticeCommand(rest);
   if (ownerNoticeCommand.kind !== 'none') {
-    if (ownerNoticeCommand.kind === 'invalid') {
-      console.error(ownerNoticeCommand.error);
-      console.error(OWNER_NOTICE_USAGE);
-      process.exitCode = 2;
-      return;
-    }
-    if (ownerNoticeCommand.kind === 'set') {
-      const { setGroupOwnerNoticeEnabled } = await import('./global-config.js');
-      try {
-        setGroupOwnerNoticeEnabled(ownerNoticeCommand.enabled);
-      } catch (err: any) {
-        console.error(`写入 ${globalConfigPath()} 失败: ${err?.message ?? err}（可改用 Dashboard「设置 → 群聊创建」）`);
-        process.exitCode = 1;
-        return;
-      }
-    }
-    const enabled = config.groupOwnerNotice;
-    console.log(`建群后 @ 群主提醒: ${enabled ? 'on' : 'off'}${ownerNoticeCommand.kind === 'set' ? '（已保存）' : ''}`);
-    console.log(`配置文件: ${globalConfigPath()}（${enabled ? 'groupOwnerNotice 未设为 false，默认开' : '"groupOwnerNotice": false'}）`);
-    console.log('下一次建群即生效，无需重启 daemon。');
+    const { setGroupOwnerNoticeEnabled, readRawGroupOwnerNotice } = await import('./global-config.js');
+    const outcome = runOwnerNoticeCommand(ownerNoticeCommand, {
+      setEnabled: setGroupOwnerNoticeEnabled,
+      isEnabled: () => config.groupOwnerNotice,
+      rawValue: readRawGroupOwnerNotice,
+      configPath: globalConfigPath,
+    });
+    for (const line of outcome.stdout) console.log(line);
+    for (const line of outcome.stderr) console.error(line);
+    if (outcome.exitCode !== 0) process.exitCode = outcome.exitCode;
     return;
   }
 
