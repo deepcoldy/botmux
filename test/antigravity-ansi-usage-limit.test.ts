@@ -13,6 +13,7 @@ function classifier(raw: () => string, cliId = 'antigravity') {
     backendScreenEvidenceIsAuthoritativeForMutation: () => true,
     stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit,
     usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
+    unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
   });
   return { classify, capture, usageLimitTracker };
 }
@@ -76,6 +77,23 @@ describe('raw ANSI tmux quota classification', () => {
     expect(fresh?.relativeResetKey).toContain('new');
     expect(fresh?.retryAtMs).toBe(Date.now() + 60_000);
     expect(usageLimitTracker.detectedThisTurn(retryTurn)).toBe(true);
+  });
+
+  it('uses the first published deadline when a partial refusal gains its native composer', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-10-01T00:00:00Z'));
+    let screen = '⚠ Individual quota reached. Resets in 1m.\nError ID: partial-first';
+    const { classify } = classifier(() => screen);
+    const partial = classify('', 'idle').usageLimit;
+    expect(partial?.source).toBeUndefined();
+
+    vi.advanceTimersByTime(10_000);
+    screen += composer;
+    const confirmed = classify('', 'idle').usageLimit;
+    expect(confirmed?.source).toBe('antigravity-error-composer');
+    expect(confirmed?.retryAtMs).toBe(partial.retryAtMs);
+
+    vi.advanceTimersByTime(50_000);
+    expect(classify('', 'idle')).toEqual({ status: 'idle' });
   });
 
   it('suppresses an expired refusal revealed by a redraw after a newer refusal', () => {

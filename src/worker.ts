@@ -471,7 +471,7 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
-import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
@@ -9370,6 +9370,7 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
 });
 
 let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
+const unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
 
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
@@ -9402,19 +9403,32 @@ function classifyUsageLimitWithNativeEvidence(
     // IDs. Strip controls without filtering away native composer rows.
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
-    return usageLimitTracker.classify(evidence, status, state => {
+    const result = usageLimitTracker.classify(evidence, status, state => {
       const observed = annotateAntigravityUsageLimit(evidence, state);
-      if (!observed.relativeResetKey) return observed;
+      const key = observed.relativeResetKey;
+      if (!key) return observed;
 
-      // 同一个 Error ID 和倒计时在视口里重复出现时，沿用首次观察的截止时间
-      const previous = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === observed.relativeResetKey);
-      if (previous) {
-        const now = Date.now();
-        return now >= previous.retryAtMs ? undefined : reconcileUsageLimitState(previous, observed, now);
-      }
-      antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, observed);
-      return observed;
+      const confirmed = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === key);
+      const now = Date.now();
+      if (confirmed && now >= confirmed.retryAtMs) return undefined;
+      const previous = confirmed ?? unconfirmedAntigravityQuotas.get(key);
+      return reconcileUsageLimitState(previous, observed, now);
     });
+    // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生 composer 后再把它计入历史。
+    const limit = result.usageLimit;
+    const key = limit?.relativeResetKey;
+    if (limit && key) {
+      if (limit.source === 'antigravity-error-composer') {
+        antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, limit);
+        unconfirmedAntigravityQuotas.delete(key);
+      } else if (limit.kind === 'usage' && !key.endsWith(':')) {
+        unconfirmedAntigravityQuotas.set(key, limit);
+        if (unconfirmedAntigravityQuotas.size > ANTIGRAVITY_QUOTA_HISTORY_LIMIT) {
+          unconfirmedAntigravityQuotas.delete(unconfirmedAntigravityQuotas.keys().next().value!);
+        }
+      }
+    }
+    return result;
   }
   return usageLimitTracker.classify(evidence, status);
 }
@@ -38030,6 +38044,12 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       }
       lastInitConfig = msg;
       antigravityQuotaHistory = msg.antigravityQuotaHistory;
+      unconfirmedAntigravityQuotas.clear();
+      const restoredQuota = msg.antigravityActiveQuota;
+      const restoredKey = restoredQuota?.relativeResetKey;
+      if (restoredQuota?.kind === 'usage' && !restoredQuota.source && restoredKey && !restoredKey.endsWith(':')) {
+        unconfirmedAntigravityQuotas.set(restoredKey, restoredQuota);
+      }
       kimiCacheExpiryAutoCompact = msg.kimiCacheExpiryAutoCompact === true;
       configureTraexAutoModel(msg);
       if (isCodexAppCliId(msg.cliId) && msg.noProgressNotify?.timeoutMs !== undefined) {

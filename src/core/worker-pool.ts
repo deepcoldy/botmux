@@ -19491,7 +19491,10 @@ function forkWorkerPrepared(
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
     cliId: agentCfg.cliId,
-    ...(agentCfg.cliId === 'antigravity' ? { antigravityQuotaHistory: ds.session.antigravityQuotaHistory } : {}),
+    ...(agentCfg.cliId === 'antigravity' ? {
+      antigravityQuotaHistory: ds.session.antigravityQuotaHistory,
+      antigravityActiveQuota: ds.usageLimit,
+    } : {}),
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     cliConfigDir: agentCfg.cliConfigDir,
@@ -28743,7 +28746,10 @@ export function forkAdoptWorker(
     terminalCardEpoch: ds.session.terminalCardEpoch,
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
-    ...(adoptedCliId === 'antigravity' ? { antigravityQuotaHistory: ds.session.antigravityQuotaHistory } : {}),
+    ...(adoptedCliId === 'antigravity' ? {
+      antigravityQuotaHistory: ds.session.antigravityQuotaHistory,
+      antigravityActiveQuota: ds.usageLimit,
+    } : {}),
     codexProfile: agentCfg.codexProfile,
     codexProfileHome: agentCfg.codexProfileHome,
     cliRuntime: agentCfg.cliRuntime,
