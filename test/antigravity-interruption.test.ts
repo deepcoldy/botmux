@@ -35,6 +35,7 @@ describe('Antigravity explicit interruption viewport', () => {
 
   it.each([
     interrupted.replace('\n>\n', '\n> next request\n'),
+    interrupted.replace('\n>\n', '\n> explain this shortcut (shift+tab to cycle)\n'),
     interrupted.replace('accept-edits', 'esc to cancel'),
     interrupted + '\n● Bash(next command)',
     interrupted.replace('────────────────────────\n>', 'A newer response\n>'),

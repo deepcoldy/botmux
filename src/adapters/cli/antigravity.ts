@@ -162,13 +162,19 @@ async function waitForHistoryAppend(
   return historyDeltaContains(path, fromByte, marker);
 }
 
-/** agy ≥1.2 renders the active permission mode INSIDE an otherwise empty
- *  composer as a placeholder after the prompt marker, e.g.
- *  `> Accept-edits mode: file edits auto-approved (shift+tab to cycle)`.
- *  All four modes (Auto / Accept-edits / Plan / Best-of-N) share the
- *  `(shift+tab to cycle)` suffix; older builds rendered a bare `>`. A real
- *  draft (including botmux's own <user_message> envelopes) matches neither. */
-const EMPTY_COMPOSER_ROW = /(?:>|> .+\(shift\+tab to cycle\))/;
+/** Only the four native permission placeholders prove an empty composer.
+ * Allow terminal line wrapping (including a split inside a word), but never
+ * accept an arbitrary draft just because it ends with the shortcut hint. */
+const COMPOSER_PLACEHOLDERS = [
+  'Auto mode: edits & safe commands auto-approved (shift+tab to cycle)',
+  'Accept-edits mode: file edits auto-approved (shift+tab to cycle)',
+  'Plan mode: research & plan only (shift+tab to cycle)',
+  'Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)',
+];
+const wrappedPlaceholder = (text: string): string => text.split(' ').map(word =>
+  [...word].map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('(?:[ \t]*\\r?\\n[ \t]*)?'),
+).join('[ \t\\r\\n]+');
+const EMPTY_COMPOSER_ROW = new RegExp(`(?:>|> (?:${COMPOSER_PLACEHOLDERS.map(wrappedPlaceholder).join('|')}))`);
 
 function isEmptyComposerRow(row: string): boolean {
   return new RegExp(`^${EMPTY_COMPOSER_ROW.source}$`).test(row);
@@ -219,10 +225,10 @@ export function rememberAntigravityQuota(
 /** Walk the tail of a viewport (ready footer → separators → composer) and
  *  decide whether agy is parked at an EMPTY composer with its ready footer —
  *  i.e. the live TUI is demonstrably waiting for input. Returns the index of
- *  the row immediately above the composer block, or -1 when the tail does not
+ *  the row immediately above the composer block, or undefined when the tail does not
  *  match. One walk shared by the interruption and generic idle-composer
  *  classifiers. */
-function readyComposerRowAbove(plain: string): number {
+function readyComposerRowAbove(plain: string): number | undefined {
   const rows = plain.split('\n').map(row => row.trim());
   let end = rows.length;
   const skipBlankRows = (): void => {
@@ -234,11 +240,22 @@ function readyComposerRowAbove(plain: string): number {
     while (end > 0 && /^[─━]*$/.test(rows[end - 1])) end--;
   };
   skipBlankRows();
-  if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return -1;
+  if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return undefined;
   skipSeparators();
-  if (end === 0 || !isEmptyComposerRow(rows[--end])) return -1;
+  const composerEnd = end;
+  // A wrapped placeholder ends above the separator; walk back only within
+  // that composer block, without consuming earlier output or a draft prompt.
+  while (end > 0 && !rows[end - 1]!.startsWith('>') && !/^[─━]*$/.test(rows[end - 1]!)) end--;
+  if (end === 0 || !isEmptyComposerRow(rows.slice(--end, composerEnd).join('\n'))) return undefined;
   skipSeparators();
   return end - 1;
+}
+
+/** 正常输入框及快捷键页脚证明旧额度错误已退出；原生错误输入框没有此页脚。
+ * 只检查当前视口尾部，不能用历史里的输入框证明当前状态。 */
+export function isAntigravityReadyComposerScreen(screen: string): boolean {
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  return !isAntigravityWorkingScreen(plain) && readyComposerRowAbove(plain) !== undefined;
 }
 
 /** Cancellation can leave the transcript at a tool result forever. Accept only
@@ -251,7 +268,7 @@ export function isAntigravityInterruptedScreen(screen: string): boolean {
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
   if (/esc to cancel/i.test(plain)) return false;
   const rowAbove = readyComposerRowAbove(plain);
-  if (rowAbove < 0) return false;
+  if (rowAbove === undefined || rowAbove < 0) return false;
   return /^⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?$/.test(plain.split('\n').map(row => row.trim())[rowAbove]);
 }
 
@@ -266,7 +283,7 @@ export function isAntigravityInterruptedScreen(screen: string): boolean {
 export function isAntigravityIdleComposerScreen(screen: string): boolean {
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
   if (/esc to cancel/i.test(plain)) return false;
-  return readyComposerRowAbove(plain) >= 0 || ERROR_COMPOSER_PATTERN.test(plain);
+  return readyComposerRowAbove(plain) !== undefined || ERROR_COMPOSER_PATTERN.test(plain);
 }
 
 export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
