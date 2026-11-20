@@ -90,6 +90,27 @@ export function bwrapExecutable(deps?: BwrapResolveDeps): string | undefined {
   return resolved?.path;
 }
 
+/**
+ * The bubblewrap botmux runs, when it is installed setuid root (Debian 10's
+ * /usr/bin/bwrap 0.3.1 is). Such a bwrap creates every sandbox's user
+ * namespace as root, so a non-root botmux holds no CAP_SYS_PTRACE over the
+ * sandboxed CLI and procfs refuses that process's /proc/<pid>/fd even under
+ * the same uid (measured). Diagnosis only: nothing here changes which bwrap
+ * runs or how.
+ */
+export function setuidRootBwrap(
+  deps: BwrapResolveDeps & { statFile?: (path: string) => { mode: number; uid: number } } = {},
+): string | undefined {
+  const path = resolveBwrap(deps)?.path;
+  if (!path) return undefined;
+  try {
+    const st = (deps.statFile ?? statSync)(path);
+    return (st.mode & 0o4000) !== 0 && st.uid === 0 ? path : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Test-only: forget which fallback paths were already warned about. */
 export function __testOnly_resetBwrapWarnings(): void {
   warnedPaths.clear();

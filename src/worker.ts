@@ -448,7 +448,7 @@ import {
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
-import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
+import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
 import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
@@ -695,7 +695,8 @@ import {
   bwrapNamespaceFailure,
   coreOnlyPidNamespaceDegrade,
 } from './adapters/backend/sandbox.js';
-import { diagnoseSandboxNamespaceFailure, type BwrapNamespaceFailure } from './core/system-bwrap.js';
+import { diagnoseSandboxNamespaceFailure, setuidRootBwrap, type BwrapNamespaceFailure } from './core/system-bwrap.js';
+import { processOpenFilesDenial } from './utils/process-open-files.js';
 import {
   prepareScratchSandboxDetailed,
   attachScratchSession,
@@ -4490,9 +4491,39 @@ function uncollectedStructuredTurnNotice(): string {
   if (blocked) {
     return t('worker.structured_turn_not_started_blocked', { cliName: cliName(), blocker: startupBlockerLabel(blocked) });
   }
+  const fdDenied = uncollectedTranscriptFdDenial();
+  if (fdDenied) {
+    const bwrap = setuidRootBwrap();
+    return t('worker.structured_turn_not_collected_fd_denied', {
+      cliName: cliName(),
+      pid: String(fdDenied.pid),
+      code: fdDenied.code,
+      hint: bwrap ? t('worker.fd_denied_setuid_bwrap_hint', { path: bwrap }) : '',
+    });
+  }
   const firstTurnOfFreshStart = promptReadyEdges === promptReadyEdgesAtFreshCliStart && !lastInitConfig?.adoptMode;
   return t('worker.structured_turn_not_collected', { cliName: cliName() })
     + (firstTurnOfFreshStart ? startupUpgradeHint() : '');
+}
+
+/** The observed CLI process whose fd table procfs refused, while no
+ *  transcript is bound. That is why the turn could not be collected, and the
+ *  notice says so ("permission denied") rather than implying the CLI never
+ *  wrote one. A bound transcript means the file was located after all (TRAE's
+ *  writer-lock fallback): whatever lost the turn then, it was not this. */
+function uncollectedTranscriptFdDenial(): { pid: number; code: string } | undefined {
+  if (codexBridgeRolloutPath) return undefined;
+  const pids = [
+    structuredBridgeIs('traex') ? currentTraexObservedPid() : undefined,
+    structuredBridgeIs('codex') ? currentCodexObservedPid() : undefined,
+    (backend as { cliPid?: number } | null)?.cliPid,
+    backend?.getChildPid?.(),
+  ];
+  for (const pid of pids) {
+    const denial = pid ? processOpenFilesDenial(pid) : undefined;
+    if (pid && denial) return { pid, code: denial.code };
+  }
+  return undefined;
 }
 
 /** Folders whose explicit "do not trust" this worker already reported. */
@@ -10509,6 +10540,8 @@ let grokBridgePidProbeLastMs = 0;
 const GROK_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
 let traexBridgePidProbeLastMs = 0;
 const TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
+/** `<pid>|<source>` of the TRAE fd-access outcome last written to the log. */
+let traexFileSourceLogKey: string | undefined;
 
 /** Adopt-only: 一次性发送的 "/adopt 前最后一轮" preamble 是否已经触发过。
  *  codexBridgeAttach 在 split-live 分支会查 history 取最后一对 user/assistant
@@ -14738,8 +14771,37 @@ function traexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
   const owned = traexHistorySidIsOwned(cliSessionId, ownedRollouts);
   if (!owned) {
     log(`TRAE session id ${cliSessionId} not owned by pid ${pid ?? '?'} (open rollouts: ${ownedRollouts ? [...ownedRollouts].join(',') || 'none' : 'unknown'})`);
+    if (pid) noteTraexProcessFileSource(pid);
   }
   return owned;
+}
+
+/** Say once (per pid and outcome) that procfs refused a TRAE process's fd
+ *  table, and what located its thread instead. Without this line a sandbox
+ *  whose namespace this uid cannot read looked exactly like a TRAE that never
+ *  wrote a transcript: the fd reads were skipped one by one, silently. */
+function noteTraexProcessFileSource(pid: number): void {
+  const source = traexProcessFileSource(pid);
+  if (!source || source.via === 'fd') return;
+  const key = `${pid}|${source.via === 'writer-lock'
+    ? `lock:${source.sessionIds.join(',')}:${source.sessionIds.length === 0 && source.exclusiveHolds > 0}`
+    : 'none'}`;
+  if (traexFileSourceLogKey === key) return;
+  traexFileSourceLogKey = key;
+  const bwrap = setuidRootBwrap();
+  let located: string;
+  if (source.via === 'none') {
+    located = '; the kernel lock table (/proc/locks) is unreadable too, so this TRAE process\'s transcript cannot be located';
+  } else if (source.sessionIds.length > 0) {
+    located = `; located its TRAE thread through the kernel lock table (/proc/locks) instead: ${source.sessionIds.join(', ')}`;
+  } else if (source.exclusiveHolds > 0) {
+    located = `; it holds ${source.exclusiveHolds} exclusive lock(s) in /proc/locks, but none is a TRAE thread writer lock under TRAE_HOME=${process.env.TRAE_HOME || '~/.trae'}, so its transcript cannot be located`;
+  } else {
+    located = '; it holds no TRAE thread writer lock yet (/proc/locks), so there is no transcript to locate so far';
+  }
+  log(`TRAE pid ${pid}: permission denied reading /proc/${pid}/fd (${source.denial.stage} ${source.denial.code})`
+    + (bwrap ? `; ${bwrap} is setuid root, so the sandbox's user namespace belongs to root and this uid cannot read its processes' open files` : '')
+    + located);
 }
 
 /** Called from flushPending after writeInput first returns a cliSessionId.
@@ -15079,6 +15141,7 @@ function maybeFollowTraexSessionRotationViaPid(): void {
   if (!pid) return;
   const currentSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
   const observed = findTraexRolloutByPid(pid, currentSid);
+  noteTraexProcessFileSource(pid);
   if (!observed) return;
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
   persistCliSessionId(observed.cliSessionId);
@@ -16304,6 +16367,7 @@ function stopCodexBridge(): void {
   lastResolvedSandboxMode = undefined;
   grokBridgePidProbeLastMs = 0;
   traexBridgePidProbeLastMs = 0;
+  traexFileSourceLogKey = undefined;
 }
 
 /** When a rotation moves bridgeJsonlPath away from `oldPath`, queue turns

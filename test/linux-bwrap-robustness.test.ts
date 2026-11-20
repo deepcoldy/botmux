@@ -32,6 +32,7 @@ import {
   diagnoseSandboxNamespaceFailure,
   resolveBwrap,
   sandboxNamespaceNotice,
+  setuidRootBwrap,
   systemBwrapPath,
 } from '../src/core/system-bwrap.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
@@ -87,6 +88,17 @@ describe('bwrap executable resolution', () => {
     });
     expect(plain?.warning).toContain(onPath);
     expect(plain?.warning).not.toMatch(/Codex/);
+  });
+
+  it('names the bwrap it runs only when that one is setuid root', () => {
+    const root = tmp('bwrap-resolve-');
+    const system = fakeExecutable(join(root, 'system-bwrap'));
+    const candidates = [system];
+    expect(setuidRootBwrap({ candidates, statFile: () => ({ mode: 0o104755, uid: 0 }) })).toBe(system);
+    expect(setuidRootBwrap({ candidates, statFile: () => ({ mode: 0o100755, uid: 0 }) })).toBeUndefined();
+    // setuid to some other owner does not make bwrap create root's namespaces.
+    expect(setuidRootBwrap({ candidates, statFile: () => ({ mode: 0o104755, uid: 1000 }) })).toBeUndefined();
+    expect(setuidRootBwrap({ candidates: [join(root, 'absent')], env: { PATH: root } })).toBeUndefined();
   });
 
   it('returns undefined when no bwrap exists anywhere', () => {
