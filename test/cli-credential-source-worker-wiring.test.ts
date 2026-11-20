@@ -64,4 +64,19 @@ describe('credentialsSourceDir daemon → worker cold-spawn wiring', () => {
     // The stamp is written only for a cold spawn.
     expect(worker.slice(stamp - 120, stamp)).toContain('if (!willReattachPersistent) {');
   });
+  // 源码结构护栏(K2)：不开沙箱的 claude-code bot 配了 credentialsSourceDir 时，worker 必须把它的
+  // CLI 数据目录重定向到 BOT_HOME，否则没地方复制凭证、静默跑在全局登录上。判定在 worker.ts
+  // spawn 闭包里，无行为 seam；判定函数 credentialSourceForcesBotHome 与 daemon 侧镜像
+  // （prompt hook 配置路径）各有行为测试。
+  it('redirects an unsandboxed bot with a credential source before planning the copy', () => {
+    const force = worker.indexOf('credentialSourceForcesBotHome({');
+    const redirect = worker.indexOf('shouldRedirectCliData({', force);
+    const plan = worker.indexOf('planCredentialSource({', redirect);
+    expect(force).toBeGreaterThan(-1);
+    expect(redirect).toBeGreaterThan(force);
+    expect(plan).toBeGreaterThan(redirect);
+    expect(worker.slice(force, plan)).toMatch(
+      /forcePerBotHome:\s*isolatedCodexHomeRequested\s*\|\|\s*credentialSourceHomeRequested/,
+    );
+  });
 });

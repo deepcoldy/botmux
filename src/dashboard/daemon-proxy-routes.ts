@@ -89,6 +89,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('custom-passthrough'),
   // cantalk-daemon-commands：`{ canTalkDaemonCommands: string }`（逗号/空格分隔，'' = 清除）。
   putBotConfig('cantalk-daemon-commands'),
+  // bare-rename-passthrough：`{ bareRenamePassthrough: boolean }`（裸 /rename 交给 CLI 自己起名）。
+  putBotConfig('bare-rename-passthrough'),
   // launch-shell：`{ launchShell: string }`（shell 名或绝对路径；'' = 清除，回 $SHELL）。
   putBotConfig('launch-shell'),
   { ...putBotConfig('oncall-group'), decodeAppId: 'after-body' },

@@ -302,6 +302,7 @@ async function runNodeImpl(
     cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
+    credentialsSourceDir: req.botSnapshot.credentialsSourceDir,
     wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
     reasoningEffort: req.botSnapshot.reasoningEffort,

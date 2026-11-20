@@ -338,6 +338,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
       ? j.defaultPassthroughCommands.filter((command: unknown): command is string => typeof command === 'string' && command.startsWith('/'))
       : undefined,
     canTalkDaemonCommands: typeof j?.canTalkDaemonCommands === 'string' ? j.canTalkDaemonCommands : '',
+    bareRenamePassthrough: j?.bareRenamePassthrough === true,
     launchShell: typeof j?.launchShell === 'string' ? j.launchShell : '',
     env: typeof j?.env === 'string' ? j.env : '',
     // env 值只写不读，变量名是刷新后唯一能证明「已保存」的信号——漏掉它，
