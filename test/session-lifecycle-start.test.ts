@@ -10068,6 +10068,76 @@ describe('owner diagnostics and accepted-input session notices', () => {
     }
   });
 
+  it.each([
+    { type: 'raw_input', content: '/model opus', turnId: 'om_raw' },
+    { type: 'inject_command', command: '/status' },
+    { type: 'message', content: 'secret', turnId: 'om_message' },
+  ] as const)('rejects $type immediately when the assistant owner is stale', async message => {
+    const data = mkdtempSync(join(tmpdir(), 'botmux-assistant-sync-ipc-owner-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = data;
+    const ownerA = `ou_${'a'.repeat(32)}`;
+    const ownerB = `ou_${'b'.repeat(32)}`;
+    try {
+      const { setAssistantOwner } = await import('../src/services/assistant-owner-store.js');
+      const { sendWorkerSessionInput } = await import('../src/core/worker-pool.js');
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ assistantMode: true, sandbox: 'oncall' }));
+      setAssistantOwner(data, 'app_test', 'oc_chat', ownerB, 'admin');
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker, hasHistory: true });
+      ds.session.assistantOwnerOpenId = ownerA;
+      ds.session.sandbox = 'oncall';
+      ds.session.sandboxWithholdBotSecret = true;
+      expect(sendWorkerSessionInput(ds, message)).toBe(false);
+      expect(worker.send).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+
+  it('withholds non-ordinary IPC after an assistant owner change during bootstrap', async () => {
+    vi.useFakeTimers();
+    standaloneBinaryMock.mockReturnValue(true);
+    const data = mkdtempSync(join(tmpdir(), 'botmux-assistant-raw-ipc-owner-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = data;
+    const ownerA = `ou_${'a'.repeat(32)}`;
+    const ownerB = `ou_${'b'.repeat(32)}`;
+    try {
+      const { setAssistantOwner } = await import('../src/services/assistant-owner-store.js');
+      const { sendWorkerSessionInput } = await import('../src/core/worker-pool.js');
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ assistantMode: true, sandbox: 'oncall' }));
+      setAssistantOwner(data, 'app_test', 'oc_chat', ownerA, 'claimed');
+      const ds = makeDs({ hasHistory: true });
+      ds.session.cliSessionId = 'cli-existing';
+      ds.session.assistantOwnerOpenId = ownerA;
+      ds.session.sandbox = 'oncall';
+      ds.session.sandboxWithholdBotSecret = true;
+      sessionStore.updateSession(ds.session);
+      expect(forkWorker(ds, '', true)).toBe(true);
+      const worker = ds.worker as any;
+      expect(sendWorkerSessionInput(ds, { type: 'raw_input', content: '/model opus', turnId: 'om_raw' })).toBe(true);
+      setAssistantOwner(data, 'app_test', 'oc_chat', ownerB, 'admin');
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(worker.send.mock.calls.some((call: any[]) => call[0]?.type === 'raw_input'
+        && call[0]?.content === '/model opus')).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+
+  it('does not consult the bot registry for control-only worker IPC', async () => {
+    const { sendWorkerSessionInput } = await import('../src/core/worker-pool.js');
+    vi.mocked(getBot).mockImplementation(() => { throw new Error('bot is unregistered during teardown'); });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    expect(sendWorkerSessionInput(ds, { type: 'refresh_screen' })).toBe(true);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'refresh_screen' });
+  });
+
   it.each([undefined, 1])('waits through cold IPC bootstrap before consuming the notice (attempt=%s)', async dispatchAttempt => {
     vi.useFakeTimers();
     standaloneBinaryMock.mockReturnValue(true);

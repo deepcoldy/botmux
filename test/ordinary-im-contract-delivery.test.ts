@@ -48,8 +48,10 @@ function fixture() {
     ensurePrincipalLaneInboundTurnBinding: vi.fn(), workerIpcBootstrapStates: new WeakMap(),
     ORDINARY_IM_TRANSPORT_TIMEOUT_MS: 100, ORDINARY_IM_MAX_ATTEMPTS: 3,
     logger: { info: vi.fn(), debug: vi.fn(), warn: vi.fn(), error: vi.fn() }, tag: () => 'receipt',
+    getBot: () => ({ config: {} }),
     failOrdinaryImDelivery: failures, recordWorkerCommittedTurn: vi.fn(),
   };
+  env.assistantLiveInputAdmission = loadWorkerPoolFunction('assistantLiveInputAdmission', env);
   for (const name of ['ordinaryImDeliveryKey', 'clearOrdinaryImDelivery', 'clearOrdinaryImDeliveryTimer',
     'retryOrFailOrdinaryImDelivery', 'sendOrdinaryImDeliveryAttempt', 'sendOrdinaryImDeliveryTracked',
     'acknowledgeOrdinaryImDeliveryReceipt', 'completeOrdinaryImDelivery', 'completeWorkerOrdinaryImDelivery',

@@ -2208,6 +2208,25 @@ describe('buildFsPolicy — assistant mode (per-owner USER_HOME)', () => {
     expect(accessForPath(p.rules, `${sd}/attachments/cli_self/u/${A}/om_1/a.png`).access).toBe('readWrite');
   });
 
+  it('keeps the no-transport assistant sessions.db denied while retaining other carve-outs', () => {
+    const p = buildFsPolicy(ownerCtx(A));
+    expect(accessForPath(p.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
+    const noTransport = buildFsPolicy({ ...ownerCtx(A), larkTransportEnabled: false });
+    expect(accessForPath(noTransport.rules, `${sd}/session-stores/cli_self/sessions.db`).access).toBe('deny');
+    expect(accessForPath(noTransport.rules, `${sd}/bots-info.json`).access).toBe('readOnly');
+    expect(accessForPath(noTransport.rules, `${sd}/bin/botmux`).access).toBe('readOnly');
+  });
+
+  it('emits the assistant keystore deny after a final ancestor read-only grant', () => {
+    const store = '/Users/u/Library/Application Support/lark-cli';
+    const p = buildFsPolicy({ ...ownerCtx(A), mandatoryReadOnlyPaths: ['/Users/u'] });
+    const profile = compileToSeatbelt(p);
+    const finalAllow = profile.lastIndexOf('(allow file-read* (subpath "/Users/u"))');
+    const finalKeyDeny = profile.lastIndexOf(`(deny file-read* (subpath "${store}"))`);
+    expect(finalAllow).toBeGreaterThanOrEqual(0);
+    expect(finalKeyDeny).toBeGreaterThan(finalAllow);
+  });
+
   it("two owners' policies never grant each other's writable paths", () => {
     const pa = buildFsPolicy(ownerCtx(A));
     const pb = buildFsPolicy(ownerCtx(B));

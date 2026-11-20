@@ -1246,7 +1246,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     //    own-app-scoped — NOT the shared secret/port table).
     push([
       `${ctx.sessionDataDir}/bots-info.json`,               // display names for <available_bots> (public-ish)
-      `${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`,
+      // 助理模式仍不得经 no-transport carve-out 读回 bot 级 sessions.db；其余
+      // routing/bin 等合法最小授权保持不变。
+      ...(!ctx.assistantMode ? [`${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`] : []),
       `${ctx.sessionDataDir}/bot-openids-${ctx.currentAppId}.json`,
       // Core-only writes its `botmux` wrapper into <dataDir>/bin (dedicated, NOT
       // the shared ~/.botmux/bin) and prepends it to the worker PATH — read-only
@@ -1311,7 +1313,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
-    ...(ctx.withholdSendCredential ? { finalDenyPaths: [...withheldLarkStores] } : {}),
+    ...(sealLarkKeyStore ? { finalDenyPaths: [...withheldLarkStores] } : {}),
     finalReadOnlyPaths,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()

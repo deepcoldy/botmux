@@ -15497,6 +15497,18 @@ function withTurnCaller(ds: DaemonSession, message: TransferBufferedInput): Tran
   return { ...message, turnCallerOpenId: openId } as TransferBufferedInput;
 }
 
+/** Content input must be re-authorized at the actual IPC boundary. Control-only
+ * messages deliberately avoid getBot: teardown and unregistered-app IPC rely on
+ * their cheap no-registry path. */
+function assistantTransferInputDeliveryAllowed(
+  ds: DaemonSession,
+  message: TransferBufferedInput,
+  context: string,
+): boolean {
+  if (message.type !== 'message' && message.type !== 'raw_input' && message.type !== 'inject_command') return true;
+  return assistantLiveInputAdmission(ds, 'turnId' in message ? message.turnId : undefined, { context });
+}
+
 /** Route user/automation input through the transfer fence. Messages accepted
  * during detach are replayed byte-for-byte to the replacement generation. */
 export function sendWorkerSessionInput(
@@ -15532,6 +15544,7 @@ export function sendWorkerSessionInput(
     ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
     : message;
   const annotated = withTurnCaller(ds, scoped);
+  if (!assistantTransferInputDeliveryAllowed(ds, annotated, 'worker session input')) return false;
   if (bufferTransferInput(ds, annotated)) {
     if (onIpcDispatched) transferInputDispatchCallbacks.set(annotated, onIpcDispatched);
     return true;
@@ -15539,6 +15552,7 @@ export function sendWorkerSessionInput(
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
   return afterWorkerIpcBootstrap(worker, () => {
+    if (!assistantTransferInputDeliveryAllowed(ds, annotated, 'worker session input after bootstrap')) return;
     const sent = worker.send(annotated);
     if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) onIpcDispatched();
     return sent;
@@ -15956,6 +15970,7 @@ function releaseTransferInputGate(
           }
         } else {
           if (!afterWorkerIpcBootstrap(worker, () => {
+            if (!assistantTransferInputDeliveryAllowed(ds, message, 'transfer replay after bootstrap')) return;
             const sent = worker.send(message);
             if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) {
               onIpcDispatched();
