@@ -2,6 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const identity = { runnerPid: 50, runnerProcStart: '500', enginePid: 60, engineProcStart: '600' };
+type PublishOpts = {
+  statuslineReattach?: boolean;
+  publishRelayCapability?: boolean;
+  republishTurnOrigin?: boolean;
+  expectedCliProcStart?: string;
+};
 afterEach(() => { vi.useRealTimers(); });
 function fixture(cliId = 'dsh', dshRuntime?: string) {
   const scope: any = {
@@ -16,7 +22,7 @@ function fixture(cliId = 'dsh', dshRuntime?: string) {
     decodeCodexAppPayload: (s: string) => JSON.parse(Buffer.from(s, 'base64').toString()),
     handleTrustedCodexAppMarker: vi.fn(),
   };
-  const publish = loadWorkerFunction<(pid: number, enginePid?: number) => boolean>('publishLocalProcessAttestation', scope);
+  const publish = loadWorkerFunction<(pid: number, enginePid?: number, opts?: PublishOpts) => boolean>('publishLocalProcessAttestation', scope);
   scope.publishLocalProcessAttestation = vi.fn(publish);
   scope.scheduleDshProcessAttestationRetry = loadWorkerFunction('scheduleDshProcessAttestationRetry', scope);
   const marker = loadWorkerFunction<(body: string) => void>('handleAppRunnerOscMarker', scope);
@@ -46,6 +52,7 @@ describe('worker DSH engine attestation', () => {
     expect(scope.dshProcessAttestation.identity).toBeUndefined();
     ready();
     expect(scope.send.mock.calls[1][0].enginePid).toBe(60);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
   });
 
   it('retries a transient capture failure without another marker or a new turn snapshot', async () => {
@@ -63,6 +70,35 @@ describe('worker DSH engine attestation', () => {
     expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
     expect(scope.send.mock.calls.every(([message]) => message.type === 'local_process_attestation')).toBe(true);
     expect(scope.dshProcessAttestation.retryTimer).toBeUndefined();
+  });
+
+  it('repairs a failed origin publication after the engine identity has frozen', async () => {
+    vi.useFakeTimers();
+    const { scope, ready } = fixture();
+    scope.publishSandboxRelayCapability.mockReturnValueOnce(false);
+    ready();
+    expect(scope.dshProcessAttestation.identity).toEqual(identity);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(2);
+    expect(scope.send.mock.calls.at(-1)[0]).toMatchObject({ enginePid: 60, engineProcStart: '600' });
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(2);
+  });
+
+  it('allows a later marker to repair a failed origin publication', () => {
+    const { scope, ready } = fixture();
+    scope.captureDshProcessIdentity.mockReturnValueOnce(undefined);
+    scope.publishSandboxRelayCapability.mockReturnValueOnce(false);
+    ready({ enginePid: 999 });
+    expect(scope.send.mock.calls[0][0].enginePid).toBeUndefined();
+    ready();
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(2);
+    expect(scope.send.mock.calls[1][0]).toMatchObject({ enginePid: 60, engineProcStart: '600' });
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(2);
+    ready();
+    expect(scope.send).toHaveBeenCalledTimes(2);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(2);
   });
 
   it('does not rescan or rotate a frozen identity after time advances', async () => {
@@ -123,7 +159,29 @@ describe('worker DSH engine attestation', () => {
     publish(40);
     scope.captureDshProcessIdentity.mockReturnValue({ ...identity, [key]: typeof identity[key as keyof typeof identity] === 'number' ? 99 : '990' });
     publish(40);
-    expect(scope.send.mock.calls[1][0].enginePid).toBeUndefined();
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(1);
+    expect(scope.send.mock.calls[1][0]).toMatchObject({ enginePid: 60, engineProcStart: '600' });
+    expect(scope.dshProcessAttestation.identity).toEqual(identity);
+  });
+
+  it('keeps a frozen engine root when a later publication cannot recapture it', () => {
+    const { scope, publish, ready } = fixture();
+    ready();
+    scope.captureDshProcessIdentity.mockReturnValue(undefined);
+    publish(40);
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(1);
+    expect(scope.send.mock.calls[1][0]).toMatchObject({ enginePid: 60, engineProcStart: '600' });
+    expect(scope.dshProcessAttestation.identity).toEqual(identity);
+    ready();
+    expect(scope.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('checks expectedCliProcStart before reusing a frozen identity', () => {
+    const { scope, publish } = fixture();
+    publish(40);
+    expect(publish(40, undefined, { expectedCliProcStart: 'different' })).toBe(false);
+    expect(scope.send).toHaveBeenCalledTimes(1);
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(1);
     expect(scope.dshProcessAttestation.identity).toEqual(identity);
   });
 

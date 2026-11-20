@@ -8243,6 +8243,7 @@ let dshProcessAttestation: {
   executable: string;
   args: string[];
   identity?: DshProcessIdentity;
+  originPublished?: boolean;
   retryTimer?: NodeJS.Timeout;
   retryAttempts?: number;
 } | undefined;
@@ -20642,7 +20643,7 @@ async function handleTrustedCodexAppMarker(
 }
 
 function scheduleDshProcessAttestationRetry(proof: NonNullable<typeof dshProcessAttestation>): void {
-  if (proof.identity || proof.retryTimer || dshProcessAttestation !== proof
+  if ((proof.identity && proof.originPublished) || proof.retryTimer || dshProcessAttestation !== proof
     || proof.generation !== cliSpawnGeneration) return;
   const delays = [50, 200, 1000, 2000, 5000, 10_000];
   const attempt = proof.retryAttempts ?? 0;
@@ -20650,17 +20651,18 @@ function scheduleDshProcessAttestationRetry(proof: NonNullable<typeof dshProcess
   if (delay === undefined) return;
   proof.retryTimer = setTimeout(() => {
     proof.retryTimer = undefined;
-    if (proof.identity || dshProcessAttestation !== proof
+    if ((proof.identity && proof.originPublished) || dshProcessAttestation !== proof
       || proof.generation !== cliSpawnGeneration) return;
     proof.retryAttempts = attempt + 1;
-    // The runner root already covers the engine in the current-turn snapshot.
-    // Add only the missing trusted root; never rotate the relay token or retake
-    // preexistingProcessIdentities after tools may have started.
-    publishLocalProcessAttestation(
+    // Never rotate an already-published turn origin or retake its process
+    // snapshot. Only a FAILED origin publication may be repaired here.
+    const republishTurnOrigin = !proof.originPublished;
+    const published = publishLocalProcessAttestation(
       backend?.getChildPid?.() ?? undefined,
       undefined,
-      { republishTurnOrigin: false },
+      { republishTurnOrigin },
     );
+    if (republishTurnOrigin && published) proof.originPublished = true;
     scheduleDshProcessAttestationRetry(proof);
   }, delay);
   proof.retryTimer.unref?.();
@@ -20675,9 +20677,18 @@ function handleAppRunnerOscMarker(body: string): void {
     && lastInitConfig.dshRuntime !== 'tui') {
     // No payload field is authority. A replay must not rotate the turn's
     // pre-existing-process snapshot after tools have already started.
-    if (dshProcessAttestation?.generation === cliSpawnGeneration && !dshProcessAttestation.identity) {
+    if (dshProcessAttestation?.generation === cliSpawnGeneration
+      && (!dshProcessAttestation.identity || !dshProcessAttestation.originPublished)) {
       const proof = dshProcessAttestation;
-      publishLocalProcessAttestation(backend?.getChildPid?.() ?? undefined);
+      const republishTurnOrigin = !proof.originPublished;
+      const published = publishLocalProcessAttestation(
+        backend?.getChildPid?.() ?? undefined,
+        undefined,
+        { republishTurnOrigin },
+      );
+      // Latch only a successful origin publication. A replay may repair a
+      // failed origin, but can never rotate an already-valid capability.
+      if (republishTurnOrigin && published) proof.originPublished = true;
       scheduleDshProcessAttestationRetry(proof);
     }
     return;
@@ -38275,15 +38286,12 @@ function publishLocalProcessAttestation(
   if (lastInitConfig?.cliId === 'dsh' && lastInitConfig.dshRuntime !== 'tui'
     && dshProcessAttestation?.generation === cliSpawnGeneration) {
     const proof = dshProcessAttestation;
-    const captured = captureDshProcessIdentity(cliPid, proof.executable, proof.args);
-    // A process change inside this generation cannot grant a new root. A
-    // genuine SDK restart replaces the runner and starts a fresh generation.
-    if (captured && (!proof.identity || (captured.runnerPid === proof.identity.runnerPid
-      && captured.runnerProcStart === proof.identity.runnerProcStart
-      && captured.enginePid === proof.identity.enginePid
-      && captured.engineProcStart === proof.identity.engineProcStart))) {
-      dshIdentity = proof.identity ??= captured;
-    }
+    // A frozen identity is reused for this CLI generation. A later transient
+    // procfs failure must not revoke it, and a replacement cannot mint a new
+    // root. The daemon revalidates engineProcStart on every use; a legitimate
+    // engine exit takes down the runner, and generation replacement clears it.
+    const captured = proof.identity ?? captureDshProcessIdentity(cliPid, proof.executable, proof.args);
+    if (captured) dshIdentity = proof.identity ??= captured;
     if (dshIdentity && proof.retryTimer) {
       clearTimeout(proof.retryTimer);
       proof.retryTimer = undefined;
