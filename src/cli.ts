@@ -8278,6 +8278,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
+  agy-accounts list|save|login|use|next|enable|disable|remove|clear-cooldown|auto-rotate|sync
+              托管 Antigravity (agy) 多账号凭据并配置限额自动轮换（AI CLI 会话内拒绝写操作）
   actor current --json
               返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
   workspace-recycle discover|prepare|finish|status|hook
@@ -21814,6 +21816,19 @@ switch (command) {
   case 'codex-instances': {
     const { runCodexInstancesCommand } = await import('./cli/codex-instances.js');
     await runCodexInstancesCommand(process.argv.slice(3));
+    break;
+  }
+  case 'agy-accounts':
+  case 'antigravity-accounts': {
+    const { runAntigravityAccountsCommand } = await import('./cli/antigravity-accounts.js');
+    try {
+      await runAntigravityAccountsCommand(process.argv.slice(3), {
+        isBlockedInSession: isolatedCliProcess() || isSessionScopedCliProcess(),
+      });
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
     break;
   }
   case 'upgrade':
