@@ -50,6 +50,8 @@ export interface NextStepIo {
   remove(ds: DaemonSession, cardId: string, messageId: string, sequence: number, uuid: string): Promise<void>;
   now(): number;
   warn(message: string): void;
+  /** One line per decision that changes (or keeps off) a card. */
+  info?(message: string): void;
 }
 
 interface Shown {
@@ -110,6 +112,14 @@ function latestTurn(ds: DaemonSession, state: State): string | undefined {
   return state.turnId ?? ds.currentTurnId;
 }
 
+function tag(ds: DaemonSession): string {
+  return `[next-step] ${ds.session.sessionId.slice(0, 8)}`;
+}
+
+function short(id: string): string {
+  return id.slice(0, 16);
+}
+
 export function noteNextStepTurnStarted(ds: DaemonSession, turnId: string, io: NextStepIo): void {
   const state = stateFor(ds);
   if (state.turnId === turnId) return;
@@ -122,7 +132,10 @@ export function noteNextStepTurnStarted(ds: DaemonSession, turnId: string, io: N
 export function noteNextStepCard(ds: DaemonSession, turnId: string, card: NextStepCard, io: NextStepIo): void {
   const state = stateFor(ds);
   const latest = latestTurn(ds, state);
-  if (latest !== undefined && latest !== turnId) return;
+  if (latest !== undefined && latest !== turnId) {
+    io.info?.(`${tag(ds)}: card of ${short(turnId)} ignored: the session's latest turn is ${short(latest)}`);
+    return;
+  }
   state.turnId = turnId;
   state.card = card;
   reconcile(ds, io);
@@ -133,7 +146,10 @@ export function noteNextStepSuggestion(ds: DaemonSession, turnId: string | undef
   if (!turnId || !trimmed) return;
   const state = stateFor(ds);
   const latest = latestTurn(ds, state);
-  if (latest !== undefined && latest !== turnId) return;
+  if (latest !== undefined && latest !== turnId) {
+    io.info?.(`${tag(ds)}: suggestion of ${short(turnId)} ignored: the session's latest turn is ${short(latest)}`);
+    return;
+  }
   if (state.suggestion?.turnId === turnId && state.suggestion.text === trimmed) return;
   state.turnId = turnId;
   state.suggestion = { turnId, text: trimmed };
@@ -159,12 +175,14 @@ function describe(error: unknown): string {
 async function removeRow(ds: DaemonSession, shown: Shown, io: NextStepIo): Promise<void> {
   if (shown.card.kind === 'unified') {
     await shown.card.publish(undefined);
+    io.info?.(`${tag(ds)}: row of ${short(shown.turnId)} removed`);
     return;
   }
   const { messageId } = shown.card;
   const cardId = shown.cardId ?? await io.cardId(ds, messageId);
   await serializeCardWrite(messageId, io.now, sequence =>
     io.remove(ds, cardId, messageId, sequence, writeUuid(messageId, 'remove', sequence)));
+  io.info?.(`${tag(ds)}: row of ${short(shown.turnId)} removed from ${messageId}`);
 }
 
 /** Removal targets only the card it was placed on, so a failure never blocks
@@ -204,7 +222,10 @@ async function apply(ds: DaemonSession, state: State, io: NextStepIo): Promise<v
   if (!desired || !card || turnId === undefined) return;
   if (state.shown?.confirmed && state.shown.text === desired) return;
   const token = io.issue(ds, desired);
-  if (!token) return;
+  if (!token) {
+    io.warn(`${tag(ds)}: no button token for ${short(turnId)}; row not shown`);
+    return;
+  }
   const next: NextStepButton = { text: desired, ...token };
   if (card.kind === 'unified') {
     // Recorded before the write: the record may be persisted (and replayed by
@@ -212,6 +233,7 @@ async function apply(ds: DaemonSession, state: State, io: NextStepIo): Promise<v
     state.shown = { turnId, card, text: desired, confirmed: false };
     await card.publish(next);
     state.shown.confirmed = true;
+    io.info?.(`${tag(ds)}: row shown for ${short(turnId)}`);
     return;
   }
   const { messageId } = card;
@@ -225,7 +247,10 @@ async function apply(ds: DaemonSession, state: State, io: NextStepIo): Promise<v
     const json = await io.readCard(ds, messageId);
     placement = json ? nextStepPlacement(json) : undefined;
     // Not a card this can edit (gone, not schema 2.0): show nothing.
-    if (!placement) return;
+    if (!placement) {
+      io.info?.(`${tag(ds)}: ${messageId} cannot take the row (gone, or not an editable reply card)`);
+      return;
+    }
   }
   // Recorded before the write, for the same reason as above.
   state.shown = { turnId, card, text: desired, cardId, confirmed: false };
@@ -234,4 +259,5 @@ async function apply(ds: DaemonSession, state: State, io: NextStepIo): Promise<v
     ? io.replace(ds, cardId, messageId, element, sequence, writeUuid(messageId, 'replace', sequence))
     : io.insert(ds, cardId, messageId, write.placement, element, sequence, writeUuid(messageId, 'insert', sequence)));
   state.shown.confirmed = true;
+  io.info?.(`${tag(ds)}: row ${write.kind === 'present' ? 'updated' : 'placed'} on ${messageId} for ${short(turnId)}`);
 }

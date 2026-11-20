@@ -1,3 +1,6 @@
+import { capabilityOn } from '../src/services/trigger-user-auth.js';
+import { answerDispatchTaskConsent, assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
+import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /** Executes the production IPC handler with platform/network seams replaced. */
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
@@ -6,6 +9,17 @@ import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+let taskReadHook: (() => void) | undefined;
+vi.mock('node:fs/promises', async () => {
+  const { promises: original } = await import('node:fs');
+  const readFile = original.readFile.bind(original);
+  return { ...original, readFile: ((...args: Parameters<typeof original.readFile>) => {
+    const hook = taskReadHook;
+    taskReadHook = undefined;
+    hook?.();
+    return readFile(...args);
+  }) as typeof original.readFile };
+});
 import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
 import { fallbackTurnId, frozenReplyContextForTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
@@ -54,7 +68,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
   const send = vi.fn(async () => 'om_kickoff');
   const resolveUnionIdFromOpenId = vi.fn(async () => 'on_alice');
   const scope: any = {
-    readJsonBody: async () => body, DISPATCH_USER_DELIVERY_MAX_BYTES, JsonBodyTooLargeError,
+    capabilityOn, readJsonBody: async () => body, DISPATCH_USER_DELIVERY_MAX_BYTES, JsonBodyTooLargeError,
     findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
     authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => isHost, selfDaemonLarkAppId: 'cli_source',
     validateCodexAppManagedSendOrigin, isCodexAppCliId,
@@ -71,7 +85,8 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
-    resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
+    resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, assertDispatchTaskApproved,
+    dispatchConsentCardAvailable: async () => true,
     config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
     logger: { info: vi.fn() },
   };
@@ -156,6 +171,262 @@ describe('dispatch user IPC end-to-end identity binding', () => {
       enabled: true, tools: ['lark-cli'], dispatchOnly,
     } } });
   };
+  it('records source consent and reuses it for the same signed workstream across requests', async () => {
+    const h = harness({ content: JSON.stringify({ zh_cn: { title: '', content: [[{ tag: 'text', text: 'Review the change' }]] } }) });
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    let dispatches = 0;
+    const send = vi.fn(async (_app, _turn, _content, type) => type === 'interactive' ? 'om_consent' : 'om_delivery' + ++dispatches);
+    Object.assign(h.scope, { readTaskBinding, confirmDispatchTask,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      findCurrentChatUserMembers: async (app: string, chat: string) => {
+        expect(app).toBe('cli_source');
+        return new Set(chat === 'oc_source' ? ['ou_alice'] : []);
+      },
+      replyMessage: send, evaluateTalk: () => ({ allowed: true }),
+    });
+    const result = h.run();
+    await vi.waitFor(async () => expect((await readTaskBinding(dataDir, secret, 'om_root'))?.taskOwner?.consentMessageId).toBe('om_consent'));
+    const click = { action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } },
+      operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } };
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_other', click)).toBe(false);
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', { ...click, operator: { open_id: 'ou_other' } })).toBe(false);
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', { ...click, context: { ...click.context, open_message_id: 'om_copy' } })).toBe(false);
+    expect(send.mock.calls.filter(call => call[3] === 'post')).toHaveLength(0);
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    const oldRouting = readFileSync(join(dataDir, 'orchestrate-dispatch.json'));
+    expect((await result).status).toBe(200);
+    const exact = await resolveDispatchUser({ dataDir, secret, appId: 'cli_target', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_delivery1', waitMs: 0 });
+    expect(exact).toMatchObject({ domain: 'botmux.dispatch-user.task.v1', authority: { tools: ['bytedcli'] } });
+    expect(await resolveDispatchUser({ dataDir, secret, appId: 'cli_other', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_delivery1', waitMs: 0 })).toBeUndefined();
+    h.ds.managedTurnOrigin.turnId = h.ds.activeInteractiveTurn.turnId = h.body.originTurnId = 'om_followup';
+    expect((await h.run()).status).toBe(200);
+    expect(send.mock.calls.filter(call => call[3] === 'interactive')).toHaveLength(1);
+    click.action.value.choice = 'deny';
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    click.action.value.choice = 'approve';
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(false);
+    expect((await h.run()).value.error).toBe('task_consent_denied');
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), oldRouting);
+    expect((await h.run()).value.error).toBe('task_consent_denied');
+    expect(dispatches).toBe(2);
+  });
+
+  it.each(['revocation', 'turn replacement'] as const)('refuses %s between approval and provider write', async race => {
+    const h = harness();
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    const click = { action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } },
+      operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } };
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    Object.assign(h.scope, { readTaskBinding, confirmDispatchTask,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async (_app: string, chat: string) => {
+        if (chat !== 'oc_source') return new Set();
+        if (race === 'revocation') {
+          expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source',
+            { ...click, action: { value: { ...click.action.value, choice: 'deny' } } })).toBe(true);
+        }
+        return new Set(['ou_alice']);
+      },
+      replyMessage: async (...args: any[]) => {
+        taskReadHook = () => { h.ds.managedTurnOrigin.turnId = 'om_next'; };
+        try {
+          await args[7]?.beforeWrite();
+          return h.send(...args);
+        } finally { taskReadHook = undefined; }
+      },
+    });
+    const result = await h.run();
+    expect(result.value.error).toBe(race === 'revocation' ? 'task_consent_denied' : 'dispatch_delivery_failed');
+    if (race === 'turn replacement') expect(result.value.detail).toBe('dispatch origin changed before provider effect');
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
+  it('keeps a task denial sticky after the owner joins the target chat', async () => {
+    const h = harness();
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', {
+      action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+      operator: { open_id: 'ou_alice' },
+      context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+    })).toBe(true);
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      // The human has since become a member of the execution chat. Membership
+      // must not reopen a consent they explicitly refused for this task.
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+    });
+    const result = await h.run();
+    expect(result.status).toBe(409);
+    expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
+  it.each(['explicit', 'automatic'] as const)('keeps a task denial sticky with %s schedule delegation', async scheduleMode => {
+    const h = harness(scheduleMode === 'explicit' ? { delegateScheduleCreate: true } : {});
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', {
+      action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+      operator: { open_id: 'ou_alice' },
+      context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+    })).toBe(true);
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+      // Both paths would otherwise issue immediate bytedcli AND a schedule
+      // capability whose run scope can use the same personal credential.
+      readGlobalConfig: () => ({ scheduleDelegation: {
+        createEnabled: true, runScopes: ['bytedcli'],
+        ...(scheduleMode === 'automatic' ? { defaultOnDispatchFromBotAppIds: ['cli_source'] } : {}),
+      } }),
+    });
+    const result = await h.run();
+    expect(result.status).toBe(409);
+    expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
+  it.each(['multi-target', 'legacy-recipient', 'ownerless-route-replay'] as const)(
+    'keeps a task denial sticky with automatic schedule and %s', async scenario => {
+      const h = harness(scenario === 'multi-target' ? { targetAppIds: ['cli_target', 'cli_other'] }
+        : scenario === 'legacy-recipient' ? { hasLegacyBots: true } : {});
+      h.ds.chatType = 'group';
+      const route = { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+        targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread' as const,
+        sourceName: 'test', issuedAt: new Date().toISOString() };
+      const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+        consentMessageId: 'om_consent' };
+      writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: {
+        reportBinding: createDispatchReportBinding(secret, { ...route, taskOwner: owner }),
+      } }));
+      expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', {
+        action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+        operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+      })).toBe(true);
+      if (scenario === 'ownerless-route-replay') {
+        // A genuine signed pre-owner route can be replayed, but it must not hide
+        // the host-only denied tombstone left by the newer owner route.
+        writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: {
+          reportBinding: createDispatchReportBinding(secret, route),
+        } }));
+      }
+      Object.assign(h.scope, { readTaskBinding,
+        loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+        evaluateTalk: () => ({ allowed: true }),
+        findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+        readGlobalConfig: () => ({ scheduleDelegation: {
+          createEnabled: true, runScopes: ['bytedcli'], defaultOnDispatchFromBotAppIds: ['cli_source'],
+        } }),
+      });
+      const result = await h.run();
+      expect(result.status).toBe(409);
+      expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+      expect(h.send).not.toHaveBeenCalled();
+      expect(await read()).toBeUndefined();
+    });
+
+  it.each(['provider-write', 'bind'] as const)('rechecks a sticky task decision before schedule %s', async edge => {
+    const h = harness();
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    const click = { action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } },
+      operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } };
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    let sent = false;
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+      readGlobalConfig: () => ({ scheduleDelegation: {
+        createEnabled: true, runScopes: ['bytedcli'], defaultOnDispatchFromBotAppIds: ['cli_source'],
+      } }),
+      replyMessage: async (...args: any[]) => {
+        if (edge === 'provider-write') {
+          click.action.value.choice = 'deny';
+          expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+        }
+        await args[7]?.beforeWrite?.();
+        if (edge === 'bind') {
+          click.action.value.choice = 'deny';
+          expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+        }
+        sent = true;
+        return 'om_kickoff';
+      },
+    });
+    const result = await h.run();
+    expect(result.status).toBe(409);
+    expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+    expect(sent).toBe(edge === 'bind');
+    expect(await read()).toBeUndefined();
+  });
+
+  it.each(['ordinary', 'explicit', 'automatic'] as const)('binds a first member delivery without a decision directory: %s', async mode => {
+    const h = harness(mode === 'explicit' ? { delegateScheduleCreate: true } : {});
+    h.ds.chatType = 'group';
+    // Initial taskOwner is present, but no consent card or host decision has
+    // ever existed: the decision directory itself starts absent.
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+      readGlobalConfig: () => ({ scheduleDelegation: {
+        createEnabled: true, runScopes: ['bytedcli'],
+        ...(mode === 'automatic' ? { defaultOnDispatchFromBotAppIds: ['cli_source'] } : {}),
+      } }),
+    });
+    const result = await h.run();
+    expect(result.status).toBe(200);
+    const delegated = await read();
+    expect(delegated).toMatchObject({
+      domain: mode === 'ordinary' ? 'botmux.dispatch-user.v1' : 'botmux.dispatch-user.v2',
+      authority: { tools: ['bytedcli'] },
+    });
+    if (mode !== 'ordinary') {
+      expect(scheduleCreateCapabilities(delegated!.authority)).toEqual([
+        expect.objectContaining({ allowedRunScopes: ['bytedcli'] }),
+      ]);
+    }
+  });
+
   it('signs the direct sender for one allowed dispatch without changing the source CLI policy', async () => {
     const h = harness();
     h.ds.chatId = 'oc_target';

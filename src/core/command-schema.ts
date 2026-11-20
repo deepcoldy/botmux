@@ -150,6 +150,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: '/context-sharing', sessionPolicy: 'sessionless', help: ['help.context_sharing'],
     notes: '群级后台上下文开关；严格 owner/allowedUsers 闸，不创建或唤醒会话',
   },
+  // 多行只在这条 /g 会带任务开工时才接受（入口经 SlashRouteInput.multilineCommands 按条放行）。
   { name: '/group', aliases: ['/g'], sessionPolicy: 'sessionless', help: ['help.group'] },
   { name: '/relay', sessionPolicy: 'default', help: ['help.relay', 'help.relay_create'] },
   { name: '/quote', sessionPolicy: 'existingOnly', help: ['help.quote'] },

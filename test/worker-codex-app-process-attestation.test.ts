@@ -138,14 +138,14 @@ describe('worker Codex App process attestation', () => {
       currentBotmuxTurnId: undefined,
     };
     const publish = loadWorkerFunction<(
-      pid: number, enginePid?: number, expectedCliProcStart?: string,
+      pid: number, enginePid?: number, opts?: { expectedCliProcStart?: string },
     ) => boolean>('publishLocalProcessAttestation', scope);
     // A caller holding a proven leaf must never have that proof replaced by
     // whatever process occupies the numeric PID at publication time.
-    expect(publish(40, undefined, 'proven-birth')).toBe(false);
+    expect(publish(40, undefined, { expectedCliProcStart: 'proven-birth' })).toBe(false);
     expect(scope.send).not.toHaveBeenCalled();
     // The matching token publishes; omitting the option keeps legacy behavior.
-    expect(publish(40, undefined, 'live-birth')).toBe(true);
+    expect(publish(40, undefined, { expectedCliProcStart: 'live-birth' })).toBe(true);
     expect(scope.send).toHaveBeenCalledTimes(1);
     expect(scope.send).toHaveBeenCalledWith(expect.objectContaining({ cliPid: 40, cliProcStart: 'live-birth' }));
     expect(publish(40)).toBe(true);

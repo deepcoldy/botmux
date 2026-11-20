@@ -447,6 +447,23 @@ describe('controlled failed-turn recovery', () => {
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn).toBe(first);
   });
+  it('does not record a carried-over limit for a turn that already completed', () => {
+    // Observed on a recovery turn: the earlier 429 left ds.usageLimit set, the
+    // recovery turn answered and settled `completed`, and the next idle frame
+    // was projected `limited` for the same turn id — recording it marked an
+    // answered turn as rate_limited and invited a second replay.
+    delete ds.session.lastFailedTurn;
+    ds.activeInteractiveTurn = { turnId: request.turnId, caller };
+    ds.lastUserPrompt = 'task'; ds.lastCliInput = 'wrapped';
+    ds.usageLimit = { limited: true, kind: 'rate' };
+    ds.terminalIdentityTurnIds = new Set([request.turnId]);
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn).toBeUndefined();
+    // A turn still in flight (no terminal observed) records as before.
+    ds.terminalIdentityTurnIds = new Set(['om_other']);
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn).toMatchObject({ turnId: request.turnId, limitedSnapshot: true });
+  });
   it('rejects bot/unknown attribution and does not infer a human from an owner', () => {
     ds.session.replyTargets = {}; delete ds.session.lastFailedTurn.trustedCaller;
     expect(failedTurnCaller(ds, request.turnId)).toBeUndefined();

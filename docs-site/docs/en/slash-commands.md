@@ -333,6 +333,8 @@ Written and hot-applied — no restart needed.
 
 Like session groups, the new group gets a gradient logo avatar by default, and without a name it is renamed from its first message.
 
+With `--start` the text is a task: `/g --start Investigate the wrong price` names the group from the task, forwards the quote and attachments into it, and has the bot start working there; quote a message and send just `/g --start` to use the quoted message as the task. With `groupCreation.autoStart: true` a bot starts tasks by default; use `/g --no-start <name>` for a plain group once.
+
 Add `--role-profile <profile>` to bootstrap the new group with reusable per-bot roles:
 
 ```bash

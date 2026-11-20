@@ -302,7 +302,8 @@ function runWorkerWiring(late: boolean, options: {
     programStatusRelayLaunched: options.relayLaunched ?? false,
     effectiveBackendType: options.backendType ?? 'tmux',
     actuallyReattachedPersistent: options.reattached ?? false,
-    publishLocalProcessAttestation: vi.fn((pid?: number, _enginePid?: number, expectedProcStart?: string) => {
+    publishLocalProcessAttestation: vi.fn((pid?: number, _enginePid?: number, opts?: { expectedCliProcStart?: string }) => {
+      const expectedProcStart = opts?.expectedCliProcStart;
       if (pid && expectedProcStart !== undefined && currentProcessStart(pid) !== expectedProcStart) return false;
       return true;
     }), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(), observeZcodeCliSessionId: vi.fn(),
@@ -1395,7 +1396,8 @@ describe('worker wrapper PID wiring', () => {
       beforeTimers: scope => {
         const originalPublish = scope.publishLocalProcessAttestation.getMockImplementation()!;
         let restoreFailed = false;
-        scope.publishLocalProcessAttestation.mockImplementation((pid?: number, enginePid?: number, expectedProcStart?: string) => {
+        scope.publishLocalProcessAttestation.mockImplementation((pid?: number, enginePid?: number, opts?: { expectedCliProcStart?: string }) => {
+          const expectedProcStart = opts?.expectedCliProcStart;
           if (pid === 151 && expectedProcStart) {
             runningExes[150] = directCliBin;
             cmdlines[150] = [directCliBin];
@@ -1404,7 +1406,7 @@ describe('worker wrapper PID wiring', () => {
             restoreFailed = true;
             return false;
           }
-          const published = originalPublish(pid, enginePid, expectedProcStart);
+          const published = originalPublish(pid, enginePid, opts);
           if (pid === 151 && expectedProcStart) {
             scope.setTimeout(() => {
               immediateOwnership = { cliPid: scope.backend.cliPid, bridgeCliPid: scope.bridgeCliPid };
@@ -1439,12 +1441,12 @@ describe('worker wrapper PID wiring', () => {
       beforeTimers: scope => {
         const originalPublish = scope.publishLocalProcessAttestation.getMockImplementation()!;
         let restoreFailed = false;
-        scope.publishLocalProcessAttestation.mockImplementation((pid?: number, enginePid?: number, expectedProcStart?: string) => {
+        scope.publishLocalProcessAttestation.mockImplementation((pid?: number, enginePid?: number, opts?: { expectedCliProcStart?: string }) => {
           if (failRestore && pid === 150 && !restoreFailed && publicationsBeforeExec.length > 0) {
             restoreFailed = true;
             return false;
           }
-          return originalPublish(pid, enginePid, expectedProcStart);
+          return originalPublish(pid, enginePid, opts);
         });
         scope.setTimeout(() => {
           publicationsBeforeExec = [...publicationPids(scope)];
@@ -1476,9 +1478,10 @@ describe('worker wrapper PID wiring', () => {
       beforeTimers: scope => {
         const originalPublish = scope.publishLocalProcessAttestation.getMockImplementation()!;
         let replacements = 0;
-        scope.publishLocalProcessAttestation.mockImplementation((pid?: number, enginePid?: number, expectedProcStart?: string) => {
+        scope.publishLocalProcessAttestation.mockImplementation((pid?: number, enginePid?: number, opts?: { expectedCliProcStart?: string }) => {
+          const expectedProcStart = opts?.expectedCliProcStart;
           if (pid === 151 && expectedProcStart) processStarts[151] = `reused-birth-151-${++replacements}`;
-          return originalPublish(pid, enginePid, expectedProcStart);
+          return originalPublish(pid, enginePid, opts);
         });
       },
     });
