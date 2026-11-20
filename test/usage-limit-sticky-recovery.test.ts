@@ -32,11 +32,16 @@ vi.mock('node-pty', () => ({
 }));
 
 import { registerBot } from '../src/bot-registry.js';
-import { initWorkerPool, restoreUsageLimitRuntimeState, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { clearUsageLimitState, initWorkerPool, restoreUsageLimitRuntimeState, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
-import { detectCliUsageLimit, usageLimitStateKey } from '../src/utils/cli-usage-limit.js';
-import { annotateAntigravityUsageLimit } from '../src/adapters/cli/antigravity.js';
+import { detectCliUsageLimit, reconcileUsageLimitState, usageLimitStateKey } from '../src/utils/cli-usage-limit.js';
+import {
+  ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota,
+} from '../src/adapters/cli/antigravity.js';
+import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
+import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -248,6 +253,61 @@ describe('usage-limit sticky state self-heal', () => {
     const stored = sessionStore.getSessionFresh(session.sessionId);
     expect(stored?.usageLimit).toBeUndefined();
     expect(stored?.antigravityQuotaHistory).toMatchObject([{ relativeResetKey: limit.relativeResetKey, retryAtMs: limit.retryAtMs }]);
+  });
+
+  it.each(['active partial', 'cleared partial'])('persists the first deadline when composer confirmation arrives after expiry (%s)', async path => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 9, 1));
+    const worker = makeFakeWorker();
+    const session = sessionStore.createSession('oc_x', 'om_late_composer', 'late composer', 'group', 'chat');
+    const ds = makeDs({ worker, workerPort: 9999, session });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false });
+    type UsageFrame = Pick<Extract<WorkerToDaemon, { type: 'screen_update' }>, 'status' | 'usageLimit' | 'expiredAntigravityQuota'>;
+    const classify = loadWorkerFunction<(content: string, status: 'idle') => UsageFrame>(
+      'classifyUsageLimitWithNativeEvidence', {
+        cliAdapter: { id: 'antigravity' }, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+        stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit, usageLimitTracker,
+        reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
+        unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
+      },
+    );
+    const partial = '⚠ Individual quota reached. Resets in 1m.\nError ID: late-composer';
+    const first = classify(partial, 'idle');
+    expect(first.usageLimit?.source).toBeUndefined();
+    const report = (content: string, evidence: ReturnType<typeof classify>) => dispatch(worker, { type: 'screen_update', content, ...evidence });
+    await report(partial, first);
+    await vi.advanceTimersByTimeAsync(60_000);
+    await report(partial, classify(partial, 'idle'));
+    if (path === 'cleared partial') {
+      clearUsageLimitState(ds);
+      ds.lastScreenStatus = 'idle';
+    }
+    const composer = partial + '\n────\n>\n────\n';
+    const turn = usageLimitTracker.beginTurn(partial);
+    const expired = classify(composer, 'idle');
+    expect(expired.status).toBe('idle');
+    expect(expired.usageLimit).toBeUndefined();
+    expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
+    if (path === 'cleared partial') {
+      sessionStore.__testOnly_setBeforeRowPersist(() => { throw new Error('injected history write failure'); });
+      await expect(report(composer, expired)).rejects.toThrow('injected history write failure');
+      sessionStore.__testOnly_setBeforeRowPersist(undefined);
+    }
+    await report(composer, classify(composer, 'idle'));
+
+    const stored = sessionStore.getSessionFresh(session.sessionId);
+    expect(stored?.usageLimit).toBeUndefined();
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(stored?.antigravityQuotaHistory).toMatchObject([{
+      source: 'antigravity-error-composer', relativeResetKey: first.usageLimit?.relativeResetKey,
+      retryAtMs: first.usageLimit?.retryAtMs,
+    }]);
+    expect(ds.rateLimitNotifiedKey).toBeUndefined();
+    const writes = vi.fn();
+    sessionStore.__testOnly_setBeforeRowPersist(writes);
+    await report(composer, classify(composer, 'idle'));
+    expect(writes).not.toHaveBeenCalled();
   });
 
   it('restores both native quota episodes with their first deadlines from SQLite', async () => {

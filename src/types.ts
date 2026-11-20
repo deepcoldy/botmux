@@ -2777,7 +2777,7 @@ export type WorkerToDaemonBase =
    *  daemon 收到后才结束 `botmux session-ready` HTTP 请求。 */
   | { type: 'session_ready_ack'; requestId: string }
   | { type: 'goal_update'; goal: import('./services/native-goal-state.js').NativeGoalState | null; turnId?: string; dispatchAttempt?: number; signature?: string }
-  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+  | { type: 'screen_update'; content: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
       /** Set ONLY on the working frame a Web Terminal / sandbox hook
        *  direct-submit publishes via the worker's clearTurnId path: real new
        *  work that belongs to no managed turn. It explicitly reopens the card
@@ -2854,7 +2854,7 @@ export type WorkerToDaemonBase =
       /** False when the post-key capture could not be taken. */
       afterObserved?: boolean }
 
-  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
+  | { type: 'screenshot_uploaded'; imageKey: string; status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; turnId?: string; dispatchAttempt?: number;
       /** capture_identity revision this frame was captured under (bound before
        *  the first await). Absent only from pre-capture-identity workers. */
       captureRevision?: number }

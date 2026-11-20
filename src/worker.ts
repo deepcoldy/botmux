@@ -9377,10 +9377,16 @@ function currentUsageLimitSnapshot(): string {
   return lastAnalyzerSnapshot || renderer?.rawSnapshot() || '';
 }
 
+type UsageAwareScreen = {
+  status: RuntimeScreenStatus | 'limited';
+  usageLimit?: CliUsageLimitState;
+  expiredAntigravityQuota?: CliUsageLimitState;
+};
+
 function classifyScreenUsageLimit(
   content: string,
   status: RuntimeScreenStatus,
-): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+): UsageAwareScreen {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   return classifyUsageLimitWithNativeEvidence(content, status);
 }
@@ -9390,7 +9396,7 @@ function classifyScreenUsageLimit(
 function classifyUsageLimitWithNativeEvidence(
   content: string,
   status: RuntimeScreenStatus,
-): { status: RuntimeScreenStatus | 'limited'; usageLimit?: CliUsageLimitState } {
+): UsageAwareScreen {
   if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   let evidence = content;
   if (cliAdapter?.id === 'antigravity' && backend) {
@@ -9403,20 +9409,25 @@ function classifyUsageLimitWithNativeEvidence(
     // IDs. Strip controls without filtering away native composer rows.
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+    let expiredAntigravityQuota: CliUsageLimitState | undefined;
     const result = usageLimitTracker.classify(evidence, status, state => {
       const observed = annotateAntigravityUsageLimit(evidence, state);
       const key = observed.relativeResetKey;
       if (!key) return observed;
 
-      const confirmed = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === key);
+      const previous = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === key)
+        ?? unconfirmedAntigravityQuotas.get(key);
       const now = Date.now();
-      // 只有当前画面确认了原生拒绝，才把已到期的同一条横幅视为残留。
-      if (observed.source === 'antigravity-error-composer' && confirmed && now >= confirmed.retryAtMs) return undefined;
-      const previous = confirmed ?? unconfirmedAntigravityQuotas.get(key);
-      return reconcileUsageLimitState(previous, observed, now);
+      const limit = reconcileUsageLimitState(previous, observed, now);
+      // Composer 可能到期后才补齐。保留确认后的记录，但从本轮限额判定中排除。
+      if (observed.source === 'antigravity-error-composer' && previous && now >= limit.retryAtMs) {
+        expiredAntigravityQuota = limit;
+        return undefined;
+      }
+      return limit;
     });
     // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生 composer 后再把它计入历史。
-    const limit = result.usageLimit;
+    const limit = expiredAntigravityQuota ?? result.usageLimit;
     const key = limit?.relativeResetKey;
     if (limit && key) {
       if (limit.source === 'antigravity-error-composer') {
@@ -9429,7 +9440,7 @@ function classifyUsageLimitWithNativeEvidence(
         }
       }
     }
-    return result;
+    return expiredAntigravityQuota ? { ...result, expiredAntigravityQuota } : result;
   }
   return usageLimitTracker.classify(evidence, status);
 }
@@ -25069,6 +25080,7 @@ function startScreenUpdates(): void {
   // content (the live failure that prompted this fix).
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
+  let lastSentExpiredQuotaKey: string | undefined;
   let lastSentBackgroundWait = 0;
   let lastTextSnapshotHash = '';
   let lastContent = '';
@@ -25263,8 +25275,11 @@ function startScreenUpdates(): void {
       // has been typed for it, so the projection's 'working' would be false —
       // leave the card at its starting state until the first write happens.
       if (startupInputHeld()) return;
-      if (snapshot.changed || usageAware.status !== lastSentStatus || backgroundWaitTasks !== lastSentBackgroundWait) {
+      const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
+      if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
+        || backgroundWaitTasks !== lastSentBackgroundWait) {
         lastSentStatus = usageAware.status;
+        lastSentExpiredQuotaKey = expiredQuotaKey;
         lastSentBackgroundWait = backgroundWaitTasks;
         send({
           type: 'screen_update',

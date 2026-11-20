@@ -64,7 +64,7 @@ describe('raw ANSI tmux quota classification', () => {
 
     vi.advanceTimersByTime(1_000);
     const turn = usageLimitTracker.beginTurn(screen);
-    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(classify('', 'idle')).toMatchObject({ status: 'idle', expiredAntigravityQuota: { source: 'antigravity-error-composer' } });
     expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
 
     screen = refusal('old') + '\n429 Too Many Requests';
@@ -94,7 +94,7 @@ describe('raw ANSI tmux quota classification', () => {
     expect(confirmed?.retryAtMs).toBe(partial.retryAtMs);
 
     vi.advanceTimersByTime(50_000);
-    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(classify('', 'idle')).toMatchObject({ status: 'idle', expiredAntigravityQuota: { source: 'antigravity-error-composer' } });
 
     screen = partialScreen;
     expect(classify('', 'idle').status).toBe('limited');
@@ -124,7 +124,7 @@ describe('raw ANSI tmux quota classification', () => {
 
     screen = oldScreen;
     const turn = usageLimitTracker.beginTurn(screen);
-    expect(classify('', 'idle')).toEqual({ status: 'idle' });
+    expect(classify('', 'idle')).toMatchObject({ status: 'idle', expiredAntigravityQuota: { source: 'antigravity-error-composer' } });
     expect(usageLimitTracker.detectedThisTurn(turn)).toBe(false);
 
     screen = newScreen;

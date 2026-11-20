@@ -48,6 +48,8 @@ import {
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { __testOnly_resetQuotaFallbackEvents } from '../src/services/quota-fallback.js';
 
@@ -231,6 +233,46 @@ describe('daemon quota fallback handoff', () => {
     expect(String(ownerReplies.at(-1)?.[1])).toContain('1h');
     expect(fallbackReplies(sessionReply)).toHaveLength(2);
     expect(mocks.resolveCurrent).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['previous', 'current', 'previous with a silent successor'])('checks the active reply topic for a valid screenshot (%s)', async source => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    setup(sessionReply);
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    const oldTopic = { rootMessageId: 'om_old_topic', turnId: TURN, updatedAt: new Date().toISOString() };
+    const currentTopic = { rootMessageId: 'om_current_topic', turnId: 'om_current_turn', updatedAt: oldTopic.updatedAt };
+    ds.session.replyTargets = { [TURN]: oldTopic, [currentTopic.turnId]: currentTopic };
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const turnId = source === 'current' ? currentTopic.turnId : TURN;
+    if (source !== 'current') {
+      worker.emit('message', { type: 'capture_identity', revision: 1, turnId });
+      await flush();
+    }
+    ds.currentTurnId = currentTopic.turnId;
+    ds.currentReplyTarget = currentTopic;
+    if (source === 'previous with a silent successor') armSilentScheduledTurn(ds, currentTopic.turnId);
+    if (source === 'current') {
+      worker.emit('message', { type: 'capture_identity', revision: 1, turnId });
+      await flush();
+    }
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_limit', captureRevision: 1,
+      status: 'limited', usageLimit: limit(), turnId,
+    });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_limit');
+    if (source === 'previous with a silent successor') {
+      expect(sessionReply).not.toHaveBeenCalled();
+      return;
+    }
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+    const notices = sessionReply.mock.calls.filter(call => call[2] === 'text');
+    expect(notices).toHaveLength(2);
+    expect(notices.map(call => resolveSessionReplyTarget(ds, call[4] as string))).toEqual([
+      { mode: 'thread', rootMessageId: currentTopic.rootMessageId },
+      { mode: 'thread', rootMessageId: currentTopic.rootMessageId },
+    ]);
   });
 
   it('deduplicates repeated frames and a same-bot event in another session for five minutes', async () => {

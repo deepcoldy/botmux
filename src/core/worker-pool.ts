@@ -4943,23 +4943,28 @@ function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
  */
 function resolveUsageAwareScreenStatus(
   ds: DaemonSession,
-  workerStatus: ScreenStatus,
-  freshUsageLimit: CliUsageLimitState | undefined,
-  content?: string,
+  frame: { status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; content?: string },
 ): ScreenStatus {
-  if (freshUsageLimit) return 'limited';
+  const { status, usageLimit, expiredAntigravityQuota, content } = frame;
   const previous = ds.usageLimit;
-  if (!previous) return workerStatus;
+  const expired = expiredAntigravityQuota && isExpiredNativeAntigravityQuota(expiredAntigravityQuota)
+    ? expiredAntigravityQuota : undefined;
+  if (expired) rememberSessionAntigravityQuota(ds, expired);
 
-  const working = isActiveWorkRuntimeStatus(workerStatus);
-  if (previous.source === 'antigravity-error-composer') {
-    // 窗口内只有原生工作提示能解除限额。窗口结束后，worker 会过滤同一次拒绝
-    if (!isExpiredNativeAntigravityQuota(previous) && !(working && content && isAntigravityWorkingScreen(content))) return 'limited';
-  } else if (!working) {
-    return 'limited';
+  if (previous && !usageLimit) {
+    const expiredSameEpisode = expired && expired.relativeResetKey === previous.relativeResetKey && expired.kind === previous.kind;
+    const working = isActiveWorkRuntimeStatus(status);
+    // 原生拒绝在窗口内只接受原生工作提示，避免无关 PTY 输出清掉限额。
+    const workRecovered = working && (previous.source !== 'antigravity-error-composer'
+      || (content && isAntigravityWorkingScreen(content)));
+    if (expiredSameEpisode || isExpiredNativeAntigravityQuota(previous) || workRecovered) {
+      clearUsageLimitState(ds);
+      return status;
+    }
   }
-  clearUsageLimitState(ds);
-  return workerStatus;
+  // 即使活动限额已被清掉，仍须保留这次确认的截止时间，供 worker 恢复时使用。
+  if (expired) persistStreamCardState(ds);
+  return usageLimit || previous ? 'limited' : status;
 }
 
 function logWorkerStderr(t: string, line: string): void {
@@ -20427,11 +20432,25 @@ function setupWorkerHandlers(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
+  /** 判定屏幕帧能否用其轮次选择回复话题 */
+  const provenScreenTurnId = (turnId?: string, dispatchAttempt?: number): string | undefined => {
+    if (!turnId) return undefined;
+    if (!sessionController) return turnId;
+    const admittedExecution = sessionController.admittedExecution();
+    if (admittedExecution?.turnId === turnId
+      && (dispatchAttempt === undefined || admittedExecution.dispatchAttempt === dispatchAttempt)) return turnId;
+    const openingExecution = ds.initConfig?.turnId === turnId ? ds.initConfig.sessionCommand?.execution : undefined;
+    if (openingExecution?.turnId === turnId
+      && (dispatchAttempt === undefined || openingExecution.dispatchAttempt === dispatchAttempt)
+      && sessionController.store.execution(sessionController.ref, openingExecution.executionId)?.phase === 'queued') return turnId;
+    return undefined;
+  };
   /** 文本帧和截图帧共享限额切换边沿，各自在通过来源和静默检查后调用 */
   const notifyUsageLimitEdge = (
     previousStatus: DaemonSession['lastScreenStatus'],
     previousLimit: CliUsageLimitState | undefined,
-    turnId?: string,
+    frameTurnId?: string,
+    dispatchAttempt?: number,
   ): void => {
     const limit = ds.usageLimit;
     if (ds.lastScreenStatus !== 'limited' || !limit || ds.suppressRecoveryCard) return;
@@ -20439,6 +20458,17 @@ function setupWorkerHandlers(
       && previousLimit?.relativeResetKey !== limit.relativeResetKey;
     if (previousStatus === 'limited' && !replacedExpiredQuota) return;
 
+    // 已通过截图来源校验的旧帧仍可能指向旧话题。两个入口都先核对当前执行。
+    const provenTurn = provenScreenTurnId(frameTurnId, dispatchAttempt);
+    const admittedExecution = sessionController?.admittedExecution();
+    const currentTurn = admittedExecution?.turnId ?? ds.currentTurnId ?? fallbackTurnId(ds, undefined);
+    const turnId = sessionController ? provenTurn ?? currentTurn : currentTurn ?? provenTurn;
+    if (turnId && turnId !== frameTurnId) {
+      const latestAttempt = ds.turnDispatchAttemptHighWater;
+      const attempt = admittedExecution?.turnId === turnId ? admittedExecution.dispatchAttempt
+        : latestAttempt?.turnId === turnId ? latestAttempt.dispatchAttempt : undefined;
+      if (managedAuxUiSuppressed(turnId, attempt)) return;
+    }
     const limitKey = usageLimitStateKey(limit);
     if (ds.rateLimitNotifiedKey !== limitKey) {
       ds.rateLimitNotifiedKey = limitKey;
@@ -22799,9 +22829,7 @@ function setupWorkerHandlers(
         // Project the frame's effective status once: reused for the in-memory
         // status assignment below and the stale-post-terminal gate.
         const previousLimit = ds.usageLimit;
-        const projectedScreenStatus = resolveUsageAwareScreenStatus(
-          ds, msg.status, msg.usageLimit, msg.content,
-        );
+        const projectedScreenStatus = resolveUsageAwareScreenStatus(ds, msg);
         // A busy frame from a turn that already reported a completed terminal
         // (with no newer turn admitted) is stale viewport evidence. It must not
         // cancel the post-terminal correction or drive the card/revision; the
@@ -22816,21 +22844,8 @@ function setupWorkerHandlers(
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
         if (!startupState.ready && !workerHasInitialized(ds)) break;
-        const activeController = typeof sessionController !== 'undefined' ? sessionController : undefined;
-        const admittedExecution = activeController?.admittedExecution();
-        const openingExecution = msg.turnId && ds.initConfig?.turnId === msg.turnId ? ds.initConfig.sessionCommand?.execution : undefined;
-        const screenTurnProven = Boolean(msg.turnId) && (
-          !activeController
-          || (admittedExecution !== undefined
-            && admittedExecution.turnId === msg.turnId
-            && (msg.dispatchAttempt === undefined || admittedExecution.dispatchAttempt === msg.dispatchAttempt))
-          || (openingExecution !== undefined
-            && openingExecution.turnId === msg.turnId
-            && (msg.dispatchAttempt === undefined || openingExecution.dispatchAttempt === msg.dispatchAttempt)
-            && activeController.store.execution(activeController.ref, openingExecution.executionId)?.phase === 'queued')
-        );
-        const screenTurnId = screenTurnProven ? msg.turnId : undefined;
-        if (!stalePostTerminalBusy && (!msg.turnId || screenTurnProven)) {
+        const screenTurnId = provenScreenTurnId(msg.turnId, msg.dispatchAttempt);
+        if (!stalePostTerminalBusy && (!msg.turnId || screenTurnId)) {
           noteStartingCardHealthFrame(ds, msg.turnId, projectedScreenStatus);
         }
         const prevStatus = ds.lastScreenStatus;
@@ -23024,7 +23039,7 @@ function setupWorkerHandlers(
             { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card status: ${error.message}`));
         }
 
-        notifyUsageLimitEdge(prevStatus, previousLimit, screenTurnId);
+        notifyUsageLimitEdge(prevStatus, previousLimit, msg.turnId, msg.dispatchAttempt);
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card. Turn-exact: a
@@ -23296,7 +23311,7 @@ function setupWorkerHandlers(
         const prevStatus = ds.lastScreenStatus;
         const previousLimit = ds.usageLimit;
         updateUsageLimitState(ds, msg.usageLimit);
-        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg);
         workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);
         // Same per-frame stale gate as screen_update: a residual busy screenshot
@@ -23345,7 +23360,10 @@ function setupWorkerHandlers(
           persistStreamCardState(ds);
           break;
         }
-        if (ownsLifecycleMutation()) notifyUsageLimitEdge(prevStatus, previousLimit, frameVerdict.source.turnId);
+        if (ownsLifecycleMutation()) {
+          const source = frameVerdict.source;
+          notifyUsageLimitEdge(prevStatus, previousLimit, source.turnId, source.dispatchAttempt);
+        }
         // Store the image key only AFTER the managed gate: now that the ready
         // handler re-syncs display mode on every path, a worker can be
         // uploading during a suppressed managed/silent turn — letting that
