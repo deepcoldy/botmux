@@ -230,6 +230,36 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     }
   });
 
+  it('/api/bot-owner-group-follow rejects new apiOnly config and permits clearing it', async () => {
+    const localAppId = 'local_config_routes_test';
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: localAppId,
+      apiOnly: true,
+      localIdentity: true,
+      cliId: 'riff',
+      ownerGroupFollow: { enabled: true },
+    }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    setLarkAppId(localAppId);
+    const before = readFileSync(configPath, 'utf8');
+
+    const rejected = await put('/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true}}');
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({ ok: false, error: 'owner_group_follow_api_only' });
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+
+    const defaults = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+    expect(defaults.status).toBe(200);
+    expect((await defaults.json()).apiOnly).toBe(true);
+
+    const cleared = await put('/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}');
+    expect(cleared.status).toBe(200);
+    expect(await cleared.json()).toEqual({ ok: true, ownerGroupFollow: null });
+    expect(persistedBot()).toMatchObject({ larkAppId: localAppId, apiOnly: true, localIdentity: true });
+    expect(persistedBot()).not.toHaveProperty('ownerGroupFollow');
+  });
+
   it.runIf(process.platform === 'linux')('/api/bot-sandbox-network-policy saves with DNS and proxy warnings', async () => {
     // The bot's own env layer counts: its sessions inherit it.
     writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true, backendType: 'pty', env: { HTTPS_PROXY: 'http://proxy.example:8080' } }], null, 2));

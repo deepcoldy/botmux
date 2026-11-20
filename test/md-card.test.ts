@@ -1832,6 +1832,16 @@ describe('cardUsageFooterSegment — Claude Code statusline quota (ctx / 5h / 7d
       'zh',
     )).toBe('ctx 24% · 5h 100%');
   });
+
+  it('falls back to transcript/DB context.percentUsed when Antigravity statusline omits contextPercent (5h + 7d still render)', () => {
+    const usage = {
+      context: { usedTokens: 230_000, windowTokens: 1_000_000, percentUsed: 23 },
+      tokens: { in: 300_000, out: 12_000 },
+      quota: { fiveHourPercent: 21, sevenDayPercent: 7 },
+    };
+    expect(cardUsageFooterSegment(usage, 'zh', 'footer')).toBe('ctx 23% · 5h 21% · 7d 7%');
+    expect(cardUsageFooterSegment(usage, 'zh', 'streaming')).toBe('ctx 23% · 5h 21% · 7d 7% · 累计 ↑300K ↓12K');
+  });
 });
 
 describe('unified diff reply cards', () => {

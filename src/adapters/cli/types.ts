@@ -438,8 +438,11 @@ export interface CliAdapter {
   /** Only meaningful with passesInitialPromptViaArgs. If set, prompts whose
    *  UTF-8 byte length is GREATER than this adapter-specific limit are not
    *  baked into launch args; the worker defers them to the normal post-start
-   *  input queue. This guards backend launchers (notably tmux) whose command
-   *  string limit can be much lower than OS ARG_MAX. */
+   *  input queue. The budget dates from the old inline tmux launch, whose
+   *  command string tmux capped far below OS ARG_MAX; panes now read the full
+   *  launch argv from a private pane-launch file, so that cap no longer binds
+   *  and the number is retained only to keep the args-baked vs queued split
+   *  unchanged. */
   readonly maxInitialPromptArgBytes?: number;
 
   /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI

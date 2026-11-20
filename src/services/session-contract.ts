@@ -209,7 +209,10 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
         state.runtime = { ...current, identity: nextIdentity };
         return finish('applied');
       }
-      if (session.lifecycle === 'closing') { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
+      const closeControl = state.operation?.kind === 'close'
+        && !!event.operationId && event.operationId === session.activeOperationId
+        && event.runtime.identity?.backend === 'remote-runner';
+      if (session.lifecycle === 'closing' && !closeControl) { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
       if (event.operationId && session.activeOperationId !== event.operationId) { state.runtime = { ...event.runtime, phase: 'retiring' }; return finish('historical'); }
       if (!event.operationId && session.activeOperationId) return finish('conflict', 'runtime_transition_in_progress');
       session.runtimeEpoch = Math.max(session.runtimeEpoch, event.runtime.ref.epoch);
