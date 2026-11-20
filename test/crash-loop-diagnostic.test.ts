@@ -238,6 +238,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
       type: 'restart', attemptId: expect.any(String), reason: 'cli_crash',
       env: null, envUnset: null, envFingerprint: expect.any(String), model: null, larkToolBinding: true,
       codexRpcInput: false, traexAutoModel: null, startupCommands: null, launchShell: null,
+      statuslineLaunchGen: expect.any(String),
     });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });

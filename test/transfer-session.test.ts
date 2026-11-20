@@ -15,17 +15,30 @@
 import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 
-vi.mock('../src/services/session-store.js', () => ({
-  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
-  cleanupSessionBridgeSendMarkers: vi.fn(),
-  cleanupSessionBridgeSendMarkersNow: vi.fn(),
-  updateSession: vi.fn(),
-  updateSessionPid: vi.fn(),
-  getSession: vi.fn(),
-  getOwnedSession: vi.fn(),
-  listSessions: vi.fn(() => []),
-  closeSession: vi.fn(),
-}));
+vi.mock('../src/services/session-store.js', () => {
+  const updateSession = vi.fn();
+  const mutateOwnedSessionsAtomically = vi.fn((ids: string[], mutate: (rows: Map<string, any>) => unknown) => {
+    const rows = new Map<string, any>();
+    for (const id of ids) {
+      const row = [...updateSession.mock.calls].reverse().find(call => call[0]?.sessionId === id)?.[0];
+      if (!row) throw new Error('fixture session not persisted');
+      rows.set(id, structuredClone(row));
+    }
+    return { result: mutate(rows), rows };
+  });
+  return {
+    mutateOwnedSessionsAtomically,
+    updateSession,
+    registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+    cleanupSessionBridgeSendMarkers: vi.fn(),
+    cleanupSessionBridgeSendMarkersNow: vi.fn(),
+    updateSessionPid: vi.fn(),
+    getSession: vi.fn(),
+    getOwnedSession: vi.fn(),
+    listSessions: vi.fn(() => []),
+    closeSession: vi.fn(),
+  };
+});
 
 const getBotMock = vi.hoisted(() => vi.fn(() => ({
     config: { cliId: 'claude-code', larkAppId: 'cli_app_test', pinStreamingCard: false },
@@ -591,6 +604,9 @@ describe('transferSession', () => {
   });
 
   it('waits for detach ACK+exit and buffers new input for the replacement worker', async () => {
+    const sessionReply = vi.fn(async () => 'om_notice');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/project',
+      getActiveCount: () => 1, closeSession: vi.fn() });
     const lifecycle: string[] = [];
     let detachMessage: { type: string; requestId?: string } | undefined;
     const send = vi.fn((
@@ -621,6 +637,9 @@ describe('transferSession', () => {
         },
       },
     });
+    ds.session.mojoQuarantineNoticePending = true;
+    ds.session.mojoQuarantinedLineage = 'prior-lineage';
+    ds.suppressedFinalOutputTurns = new Map([['turn-late', 7]]);
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
 
     const replacementSend = vi.fn((message: { type: string }) => {
@@ -639,6 +658,7 @@ describe('transferSession', () => {
       ds.worker = replacementWorker;
       ds.workerGeneration = 2;
       ds.session.workerGeneration = 2;
+      sessionStore.updateSession(ds.session);
       return forkWorkerSpy(...args);
     });
     const moving = transferSession(
@@ -728,6 +748,15 @@ describe('transferSession', () => {
       expect.any(Function),
     );
     expect(replacementSend).toHaveBeenNthCalledWith(3, rawDuringTransfer);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    __testOnly_setupWorkerHandlers(ds, replacementWorker, { ready: false, failureNotified: false }, 2);
+    replacementWorker.emit('message', { type: 'turn_input_received', turnId: 'om_transfer_late' });
+    replacementWorker.emit('message', { type: 'turn_input_received', turnId: 'om_transfer_late' });
+    await Promise.resolve(); await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[4]).toBe('om_transfer_late');
+    expect(ds.session.mojoQuarantineNoticePending).toBe(false);
   });
 
   it('fails safe on detach timeout using hard retirement without ordinary close cleanup', async () => {

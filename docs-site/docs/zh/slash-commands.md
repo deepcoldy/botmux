@@ -333,6 +333,8 @@ Dashboard 的「Bot 配置 → 权限与安全 → Slash 命令」还有一个�
 
 新群默认像群聊模式的会话群一样用渐变 logo 头像；不写群名时会在第一条消息后按内容自动改群名。
 
+加 `--start` 则正文就是任务：`/g --start 排查价格展示错误` 会按任务起群名、把引用和附件转发进新群，并让机器人在新群直接开工；引用一条消息只发 `/g --start` 则以被引用的消息为任务。机器人配置 `groupCreation.autoStart: true` 后默认就带任务开工，单次只想建群用 `/g --no-start <群名>`。
+
 加上 `--role-profile <profile>` 可以在新群里自动 bootstrap 一套按 bot 区分的角色：
 
 ```bash

@@ -9,7 +9,18 @@ import {
   type AutoCompactEligibilitySnapshot,
 } from '../src/core/auto-compact.js';
 import { promptCacheKeepaliveRefusal } from '../src/core/prompt-cache-keepalive-gate.js';
+import { readUnattendedComposerScreen } from '../src/core/unattended-composer-screen.js';
+import type { ScreenRow } from '../src/utils/terminal-cells.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+
+/** A plain-text screen as cells: nothing dim, nothing inverse. */
+function cellsOf(text: string): ScreenRow[] {
+  return text.split('\n').map(line => Array.from(line).map(ch => ({ ch, dim: false, inverse: false })));
+}
+/** A long-lived renderer stub showing this screen. */
+function rendererShowing(text: string) {
+  return { viewportCells: vi.fn(() => cellsOf(text)), xterm: { cols: 160, rows: 50 } };
+}
 
 describe('AutoCompactCoordinator', () => {
   beforeEach(() => vi.useFakeTimers());
@@ -341,8 +352,10 @@ describe('auto-compact unattended worker write gate', () => {
 
   function harness(overrides: Record<string, unknown> = {}) {
     const scope: Record<string, any> = {
-      renderer: { rawSnapshot: vi.fn(() => COMPOSER) },
+      renderer: rendererShowing(COMPOSER),
       backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+      readUnattendedComposerScreen,
+      webResizedBackendGrid: undefined,
       promptCacheKeepaliveRefusal,
       backend: {},
       cliAdapter: { readyPattern: /❯/ },
@@ -359,10 +372,13 @@ describe('auto-compact unattended worker write gate', () => {
       lastInitConfig: { cliId: 'claude-code' },
       ...overrides,
     };
-    const refuse = loadWorkerFunction<(msg: { requireSafeComposer?: true }) => string | undefined>(
+    // The worker's own screen choice, over whatever backend / renderer this case has.
+    scope.unattendedComposerScreen ??= loadWorkerFunction<() => unknown>('unattendedComposerScreen', scope);
+    const refuseWithScreen = loadWorkerFunction<(msg: { requireSafeComposer?: true }) => { refusal: string } | undefined>(
       'unattendedRawInputRefusal',
       scope,
     );
+    const refuse = (msg: { requireSafeComposer?: true }) => refuseWithScreen(msg)?.refusal;
     return { refuse, scope };
   }
 
@@ -375,12 +391,39 @@ describe('auto-compact unattended worker write gate', () => {
   it('admits unattended input only with a live empty framed composer', () => {
     const { refuse, scope } = harness();
     expect(refuse({ requireSafeComposer: true })).toBeUndefined();
-    expect(scope.renderer.rawSnapshot).toHaveBeenCalledWith({ preserveFormatting: true });
+    expect(scope.renderer.viewportCells).toHaveBeenCalled();
   });
 
   it('refuses a permission selector even though it contains the ready pattern', () => {
-    const { refuse } = harness({ renderer: { rawSnapshot: () => PERMISSION_DIALOG } });
+    const { refuse } = harness({ renderer: rendererShowing(PERMISSION_DIALOG) });
     expect(refuse({ requireSafeComposer: true })).toBe('action_prompt_open');
+  });
+
+  it("judges the pane's own capture over a renderer that disagrees with it", () => {
+    const { refuse, scope } = harness({
+      renderer: rendererShowing(PERMISSION_DIALOG),
+      backend: { captureViewportCells: () => cellsOf(COMPOSER), getPaneSize: () => ({ cols: 214, rows: 62 }) },
+    });
+    expect(refuse({ requireSafeComposer: true })).toBeUndefined();
+    expect(scope.renderer.viewportCells).not.toHaveBeenCalled();
+    // And the other way round: the pane shows the dialog, the stale renderer an empty box.
+    expect(harness({
+      renderer: rendererShowing(COMPOSER),
+      backend: { captureViewportCells: () => cellsOf(PERMISSION_DIALOG) },
+    }).refuse({ requireSafeComposer: true })).toBe('action_prompt_open');
+  });
+
+  it('after a web terminal resized a renderer-only backend, its renderer is no evidence', () => {
+    const backend = {};
+    const { refuse } = harness({ backend, webResizedBackendGrid: { backend, cols: 214, rows: 62 } });
+    expect(refuse({ requireSafeComposer: true })).toBe('no_screen_evidence');
+    // A resize recorded for an earlier backend (CLI restarted since) does not count.
+    expect(harness({ webResizedBackendGrid: { backend: {}, cols: 214, rows: 62 } }).refuse({ requireSafeComposer: true })).toBeUndefined();
+  });
+
+  it('a failed pane capture fails closed instead of trusting the renderer', () => {
+    const { refuse } = harness({ backend: { captureViewportCells: () => null } });
+    expect(refuse({ requireSafeComposer: true })).toBe('no_screen_evidence');
   });
 
   it('admits the real Codex fixture without letting its footer steal the composer anchor', () => {
@@ -462,7 +505,7 @@ describe('auto-compact unattended worker write gate', () => {
     const workerPool = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
     expect(daemon).toContain('requireSafeComposer: true');
     expect(worker).toContain('const unattendedRefusal = unattendedRawInputRefusal(msg)');
-    expect(worker).toContain("emitTurnTerminal(msg.turnId, 'failed', 'safe_composer_required')");
+    expect(worker).toMatch(/emitTurnTerminal\(msg\.turnId, 'failed', 'safe_composer_required',[^;]*unattendedRefusal\.refusal\)/);
     expect(worker).toContain('codexInputState = backend.captureInputState?.()');
     expect(workerPool).toContain('settleAutoCompactSafeComposerRefusal(ds, msg)');
     expect(daemon).toContain('autoCompactCoordinator.cancel(session.sessionId)');

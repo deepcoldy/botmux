@@ -13,26 +13,29 @@ import { tmpdir } from 'node:os';
 
 let tempDir: string;
 vi.mock('../src/config.js', () => ({
-  config: { session: { get dataDir() { return tempDir; } } },
+  config: { session: { get dataDir() { return tempDir; } }, daemon: { backendType: 'tmux', cliId: 'claude-code' } },
 }));
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { createSession, getSession, init, updateSession } from '../src/services/session-store.js';
+import { createSession, getSession, init, updateSession, __testOnly_setBeforeRowPersist } from '../src/services/session-store.js';
 import {
   applyIdleAutoCompactSetting,
+  noteIdleAutoCompactRefused,
   noteIdleAutoCompactScreenStatus,
+  noteIdleAutoCompactTurnEnded,
   runIdleAutoCompactSweep,
 } from '../src/core/idle-auto-compact.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { stampIdleSinceAt } from '../src/core/worker-pool.js';
 
 const MIN = 60_000;
 const T0 = Date.UTC(2026, 10, 2, 1, 0, 0);
 const APP = 'cli_idle_compact_store';
 
 beforeEach(() => { tempDir = mkdtempSync(join(tmpdir(), 'idle-compact-store-')); init(APP); });
-afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+afterEach(() => { __testOnly_setBeforeRowPersist(undefined); rmSync(tempDir, { recursive: true, force: true }); });
 
 describe('idle auto-compact persistence', () => {
   it('the opt-in and the running idle stretch survive a store reload', () => {
@@ -82,6 +85,152 @@ describe('idle auto-compact persistence', () => {
     expect(getSession(session.sessionId)!.idleAutoCompact?.handledIdleSince).toBeUndefined();
     accept = true;
     expect(sweep(T0 + 56 * MIN)).toBe(1);
+  });
+
+  it('the pre-refusal busy marker and its cancellation survive a real SQLite reload', () => {
+    const session = createSession('oc_chat', 'om_root4', 'busy marker', 'group', 'thread');
+    session.lastMessageAt = new Date(T0 - MIN).toISOString();
+    applyIdleAutoCompactSetting(session, { enabled: true });
+    const ds = { session, lastScreenStatus: 'idle', idleSinceAt: T0, idleAutoCompactWarmSince: T0 } as unknown as DaemonSession;
+    updateSession(session);
+    const compact = vi.fn(() => true);
+    runIdleAutoCompactSweep([ds], {
+      now: () => T0 + 55 * MIN, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      persist: d => updateSession(d.session), compact, notify: () => {}, log: () => {},
+    });
+    const turnId = compact.mock.calls[0][1] as string;
+    ds.lastScreenStatus = 'working';
+    ds.idleSinceAt = undefined;
+    expect(noteIdleAutoCompactScreenStatus(ds, 'idle', T0 + 55 * MIN + 10_000)).toBe(true);
+    updateSession(session);
+
+    init(APP);
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.idleAutoCompact?.inFlight?.busyBeforeSettled).toBe(true);
+    const restored = { session: reloaded } as unknown as DaemonSession;
+    expect(noteIdleAutoCompactRefused(restored, turnId, 'prompt_not_ready')?.retry).toBe(false);
+    expect(restored.session.idleAutoCompact?.retry).toBeUndefined();
+    expect(restored.session.idleAutoCompact?.handledIdleSince).toBe(T0);
+    expect(restored.idleAutoCompactPendingNotice).toBeUndefined();
+    updateSession(reloaded);
+    init(APP);
+    expect(getSession(session.sessionId)!.idleAutoCompact?.handledIdleSince).toBe(T0);
+  });
+
+  it('a failed busy-marker save keeps a live witness and cancels on refusal', () => {
+    const session = createSession('oc_chat', 'om_root5', 'busy save failure', 'group', 'thread');
+    session.lastMessageAt = new Date(T0 - MIN).toISOString();
+    applyIdleAutoCompactSetting(session, { enabled: true });
+    const ds = { session, lastScreenStatus: 'idle', idleSinceAt: T0, idleAutoCompactWarmSince: T0 } as unknown as DaemonSession;
+    updateSession(session);
+    const compact = vi.fn(() => true);
+    const sweep = (at: number) => runIdleAutoCompactSweep([ds], {
+      now: () => at, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      persist: d => updateSession(d.session), compact, notify: () => {}, log: () => {},
+    });
+    sweep(T0 + 55 * MIN);
+    const turnId = compact.mock.calls[0][1] as string;
+    let failOnce = true;
+    __testOnly_setBeforeRowPersist(() => {
+      if (failOnce) { failOnce = false; throw new Error('injected SQLITE_BUSY'); }
+    });
+    ds.lastScreenStatus = 'working';
+    stampIdleSinceAt(ds, 'idle', T0 + 55 * MIN + 10_000);
+    __testOnly_setBeforeRowPersist(undefined);
+    // The durable-row rollback removed the nested flag; the independent live
+    // witness must still prevent a late refusal from reviving this stretch.
+    expect(ds.session.idleAutoCompact?.inFlight?.busyBeforeSettled).toBeUndefined();
+    expect(ds.idleAutoCompactBusyBeforeSettledTurnId).toBe(turnId);
+    expect(noteIdleAutoCompactRefused(ds, turnId, 'prompt_not_ready')?.retry).toBe(false);
+    updateSession(session);
+    expect(ds.session.idleAutoCompact?.retry).toBeUndefined();
+    ds.lastScreenStatus = 'idle';
+    stampIdleSinceAt(ds, 'working', T0 + 55 * MIN + 40_000);
+    expect(sweep(T0 + 56 * MIN)).toBe(0);
+    expect(compact).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['completed-first', 'idle-first'] as const)('a completed-settlement rollback reconciles without duplicates (%s)', (order) => {
+    const session = createSession('oc_chat', `om_rollback_${order}`, 'completed rollback', 'group', 'thread');
+    session.lastMessageAt = new Date(T0 - MIN).toISOString();
+    applyIdleAutoCompactSetting(session, { enabled: true });
+    const ds = { session, lastScreenStatus: 'idle', idleSinceAt: T0, idleAutoCompactWarmSince: T0 } as unknown as DaemonSession;
+    updateSession(session);
+    const compact = vi.fn(() => true);
+    const notices: unknown[] = [];
+    const sweep = (at: number) => runIdleAutoCompactSweep([ds], {
+      now: () => at, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      persist: d => updateSession(d.session), compact, notify: (_d, notice) => { notices.push(notice); }, log: () => {},
+    });
+    sweep(T0 + 55 * MIN);
+    const turnId = compact.mock.calls[0][1] as string;
+    ds.lastScreenStatus = 'working';
+    stampIdleSinceAt(ds, 'idle', T0 + 55 * MIN + 10_000);
+    if (order === 'idle-first') {
+      ds.lastScreenStatus = 'idle';
+      stampIdleSinceAt(ds, 'working', T0 + 55 * MIN + 40_000);
+    }
+    let failNext = true;
+    __testOnly_setBeforeRowPersist(() => {
+      if (failNext) { failNext = false; throw new Error('injected completed-settlement rollback'); }
+    });
+    expect(noteIdleAutoCompactTurnEnded(ds, turnId, 'completed')).toBe(true);
+    expect(() => updateSession(session)).toThrow('injected completed-settlement rollback');
+    __testOnly_setBeforeRowPersist(undefined);
+    expect(ds.idleAutoCompactCompletedTurnId).toBe(turnId);
+    if (order === 'completed-first') {
+      expect(ds.session.idleAutoCompact?.inFlight?.completed).toBeUndefined();
+      ds.lastScreenStatus = 'idle';
+      stampIdleSinceAt(ds, 'working', T0 + 55 * MIN + 40_000);
+    } else {
+      expect(ds.session.idleAutoCompact?.inFlight).toBeDefined();
+      expect(ds.idleAutoCompactPendingNotice?.kind).toBe('compacted');
+    }
+    for (let m = 56; m <= 120; m += 1) sweep(T0 + m * MIN);
+    expect(compact).toHaveBeenCalledTimes(1);
+    expect(notices).toEqual([{ kind: 'compacted', idleMinutes: 55 }]);
+  });
+
+  it('an inherited idle claim without a completed witness folds silently, never waits forever', () => {
+    const session = createSession('oc_chat', 'om_completed_restart', 'completed restart', 'group', 'thread');
+    session.lastMessageAt = new Date(T0 - MIN).toISOString();
+    applyIdleAutoCompactSetting(session, { enabled: true });
+    const ds = { session, lastScreenStatus: 'idle', idleSinceAt: T0, idleAutoCompactWarmSince: T0 } as unknown as DaemonSession;
+    updateSession(session);
+    const compact = vi.fn(() => true);
+    const notices: unknown[] = [];
+    const sweep = (target: DaemonSession, at: number) => runIdleAutoCompactSweep([target], {
+      now: () => at, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      persist: d => updateSession(d.session), compact, notify: (_d, notice) => { notices.push(notice); }, log: () => {},
+    });
+    sweep(ds, T0 + 55 * MIN);
+    const turnId = compact.mock.calls[0][1] as string;
+    ds.lastScreenStatus = 'working';
+    stampIdleSinceAt(ds, 'idle', T0 + 55 * MIN + 10_000);
+    ds.lastScreenStatus = 'idle';
+    stampIdleSinceAt(ds, 'working', T0 + 55 * MIN + 40_000);
+    let failNext = true;
+    __testOnly_setBeforeRowPersist(() => {
+      if (failNext) { failNext = false; throw new Error('injected completed restart rollback'); }
+    });
+    expect(noteIdleAutoCompactTurnEnded(ds, turnId, 'completed')).toBe(true);
+    expect(() => updateSession(session)).toThrow('injected completed restart rollback');
+    __testOnly_setBeforeRowPersist(undefined);
+
+    // Restart before any sweep reconcile: the durable idle remains, while the
+    // live completed witness is gone. The inherited claim folds as handled.
+    init(APP);
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.idleAutoCompact?.inFlight?.idleBeforeSettled).toBe(T0 + 55 * MIN + 40_000);
+    expect(reloaded.idleAutoCompact?.inFlight?.completed).toBeUndefined();
+    const restored = {
+      session: reloaded, lastScreenStatus: 'idle', idleSinceAt: T0 + 55 * MIN + 40_000,
+    } as unknown as DaemonSession;
+    for (let m = 56; m <= 120; m += 1) sweep(restored, T0 + m * MIN);
+    expect(compact).toHaveBeenCalledTimes(1);
+    expect(notices).toEqual([]);
+    expect(restored.session.idleAutoCompact?.inFlight).toBeUndefined();
+    expect(restored.session.idleAutoCompact?.handledIdleSince).toBe(T0 + 55 * MIN + 40_000);
   });
 
   it('a session that never opted in has no setting after reload', () => {

@@ -152,6 +152,24 @@ export function resetPromptCacheKeepalive(ds: DaemonSession, now = Date.now()): 
 }
 
 /**
+ * A botmux turn is starting: it ends the idle stretch the keep-alive was
+ * extending. Except an unattended maintenance write (auto / idle /compact):
+ * the worker may still refuse it before typing anything, and resetting here
+ * would make the keep-alive fire again at once over a stretch nothing
+ * touched. If it does run, its busy edge ends the stretch in
+ * notePromptCacheKeepaliveScreenStatus. With a keep-alive in flight it resets
+ * as before: that busy edge would otherwise be taken for the keep-alive's.
+ */
+export function notePromptCacheKeepaliveTurnStarted(
+  ds: DaemonSession,
+  opts: { unattended?: boolean } = {},
+  now = Date.now(),
+): void {
+  if (opts.unattended && !promptCacheKeepaliveInFlight(ds, now)) return;
+  resetPromptCacheKeepalive(ds, now);
+}
+
+/**
  * Screen-status hook, called right after `ds.lastScreenStatus` changes and the
  * idle stamp has been applied. A keep-alive in flight keeps the stretch alive
  * across its own busy period and gets the original idle start restored on its

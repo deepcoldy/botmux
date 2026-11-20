@@ -8,7 +8,7 @@ import { WorkerSessionEventScope } from '../src/services/session-event-scope.js'
 import { sameWorker, contractTerminalStatus } from '../src/services/session-contract.js';
 import { loadWorkerPoolFunction, loadWorkerPoolClosure } from './helpers/worker-pool-function-harness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 
 const fixtureConfig = vi.hoisted(() => ({ dataDir: '' }));
 vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return fixtureConfig.dataDir; } } } }));
@@ -76,6 +76,39 @@ function fixture() {
 }
 
 describe('ordinary IM delivery through the strict session contract', () => {
+  it('runs the accepted input callback once after the scoped receipt, before commit', async () => {
+    const s = fixture();
+    s.env.activeSessionsRegistry = new Map([[activeSessionKey(s.ds), s.ds]]);
+    const received = vi.fn();
+    s.env.sendOrdinaryImDeliveryTracked(s.ds, { type: 'message', content: 'question', turnId: 'om_notice' }, undefined, received);
+    expect(received).not.toHaveBeenCalled();
+    await s.handle(s.receipt('turn_input_received'));
+    await s.handle(s.receipt('turn_input_received'));
+    expect(received).toHaveBeenCalledTimes(1);
+    expect([...s.pending.values()][0].received).toBe(true);
+    await s.handle(s.receipt('turn_input_committed'));
+    expect(s.pending.size).toBe(0);
+    expect(received).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['closed', 'registry', 'worker', 'generation'])('keeps a late receipt from notifying a superseded input owner (%s)', kind => {
+    const s = fixture();
+    const registry = new Map([[activeSessionKey(s.ds), s.ds]]);
+    s.env.activeSessionsRegistry = registry;
+    const received = vi.fn();
+    s.env.sendOrdinaryImDeliveryTracked(s.ds, { type: 'message', content: 'question', turnId: 'om_late_notice' }, undefined, received);
+    if (kind === 'closed') s.ds.session.status = 'closed';
+    if (kind === 'registry') registry.set(activeSessionKey(s.ds), { ...s.ds });
+    if (kind === 'worker') s.ds.worker = { ...s.worker };
+    if (kind === 'generation') s.ds.workerGeneration = 2;
+    s.env.acknowledgeOrdinaryImDeliveryReceipt(s.ds, 'om_late_notice', 1);
+    expect([...s.pending.values()][0].received).toBe(true);
+    expect([...s.pending.values()][0].onInputReceived).toBeUndefined();
+    expect(received).not.toHaveBeenCalled();
+    s.env.completeOrdinaryImDelivery(s.ds, 'om_late_notice', 1);
+    expect(s.pending.size).toBe(0);
+  });
+
   it.each(['om_followup', 'bmx-recovery-retry', 'board:cli_receipt_test:1'])('settles the queued receipt before retirement: %s', async turnId => {
     const s = fixture();
     expect(s.env.sendOrdinaryImDeliveryTracked(s.ds, { type: 'message', content: 'question', turnId })).toBe(true);

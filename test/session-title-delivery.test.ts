@@ -101,6 +101,10 @@ function beginBootstrapActivation(ds: any, token: string, turnId: string): void 
 function activationAck(ds: any, worker: any) {
   const scope: Record<string, any> = {
     ds, worker, t: 'title-delivery', logger, sessionStore: store,
+    startupState: { ready: false, failureNotified: false },
+    // Title delivery fixtures never arm Mojo notices; the cosmetic dependency
+    // stays observable while the real activation journal and SQLite store run.
+    deliverMojoNoticesForAcceptedInput: vi.fn(),
     cb: {
       onQueuedActivationSubmitted: () => {
         if (!ds.session.queuedActivationTail?.length && !ds.session.queuedActivationPending) {
