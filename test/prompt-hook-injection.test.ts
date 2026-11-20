@@ -383,6 +383,43 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
   });
 
+  it.each([
+    ['worker 已 killed', { killed: true, connected: true }],
+    ['worker 断开连接', { killed: false, connected: false }],
+  ] as const)('registry 有会话但 %s：不沿用旧 init 判 hook，回退 inline', (_label, workerState) => {
+    activeRegistryMock.mockReturnValue(new Map([['test-session-key', {
+      session: { sessionId: SESSION_ID, status: 'active' },
+      larkAppId: LARK_APP_ID,
+      // 旧 init 指向 per-bot 目录，但读它的 worker 已不可信。
+      initConfig: { sessionId: SESSION_ID, backendType: 'pty', cliId: 'claude-code', credentialsSourceDir: '/acc/b', sandbox: 'off' },
+      worker: workerState,
+    }]]));
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code',
+        envelopeInjection: 'auto' as const, credentialsSourceDir: '/acc/b',
+      },
+    });
+    preflightMock.mockClear();
+    const result = buildFollowUpCliInput('untrusted worker probe', SESSION_ID, followUpOpts());
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(preflightMock).not.toHaveBeenCalled();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('registry 有会话但缺 initConfig：回退 inline 而非读空 init 抛错', () => {
+    activeRegistryMock.mockReturnValue(new Map([['test-session-key', {
+      session: { sessionId: SESSION_ID, status: 'active' },
+      larkAppId: LARK_APP_ID,
+      worker: { killed: false, connected: true },
+    }]]));
+    preflightMock.mockClear();
+    const result = buildFollowUpCliInput('missing init probe', SESSION_ID, followUpOpts());
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(preflightMock).not.toHaveBeenCalled();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
   it('BOTMUX_SANDBOX 非法值：不做 preflight，回退 inline', () => {
     vi.stubEnv('BOTMUX_SANDBOX', 'yes');
     try {
