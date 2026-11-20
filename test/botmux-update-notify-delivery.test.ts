@@ -7,20 +7,30 @@ import type * as NoticeModule from '../src/core/botmux-update-notify.js';
 import { readGlobalConfig, mergeMaintenanceConfig } from '../src/global-config.js';
 import { withFileLock } from '../src/utils/file-lock.js';
 
-const sdk = vi.hoisted(() => ({ request: vi.fn(), create: vi.fn() }));
-vi.mock('../src/bot-registry.js', () => ({
-  getBotClient: () => ({ request: sdk.request, im: { v1: { message: { create: sdk.create } } } }),
-  getBotUploadClient: () => ({ request: sdk.request }),
-  getBot: () => ({ config: { larkAppId: 'cli_review', allowedUsers: ['ou_review'], apiOnly: false } }),
-  getAllBots: () => [],
-  loadBotConfigs: () => [],
-  formatLarkError: (error: unknown) => String(error),
-  LARK_REQUEST_TIMEOUT_MS: 15_000,
-  LarkTransportDisabledError: class extends Error {},
-}));
+vi.mock('../src/bot-registry.js', () => {
+  const sdk = { request: vi.fn(), create: vi.fn() };
+  return {
+    getBotClient: () => ({ request: sdk.request, im: { v1: { message: { create: sdk.create } } } }),
+    getBotUploadClient: () => ({ request: sdk.request }),
+    getBot: () => ({ config: { larkAppId: 'cli_review', allowedUsers: ['ou_review'], apiOnly: false } }),
+    getAllBots: () => [],
+    loadBotConfigs: () => [],
+    formatLarkError: (error: unknown) => String(error),
+    LARK_REQUEST_TIMEOUT_MS: 15_000,
+    LarkTransportDisabledError: class extends Error {},
+  };
+});
 vi.mock('../src/utils/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() } }));
 import { sendUserMessage } from '../src/im/lark/client.js';
 import { __testOnly_resetLarkGate, executeWithLarkGate } from '../src/im/lark/api-gate.js';
+// Read an existing export after installing the mock: Bun updates existing
+// module bindings but may not expose exports added after the module loaded.
+// These are the same SDK functions used by the real sendUserMessage transport.
+const sdkClient = (await import('../src/bot-registry.js')).getBotClient('cli_review') as unknown as {
+  request: ReturnType<typeof vi.fn>;
+  im: { v1: { message: { create: ReturnType<typeof vi.fn> } } };
+};
+const sdk = { request: sdkClient.request, create: sdkClient.im.v1.message.create };
 
 // A mutation copy can be selected without changing production files or these probes.
 const modulePath = process.env.REVIEW_VERSION_NOTICE_MODULE;
