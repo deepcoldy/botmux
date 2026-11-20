@@ -31,6 +31,9 @@ const connection = startLarkConnection('cli_0000000000000000', randomUUID(), new
 await delay(3800);
 connection.close({ force: true });
 await delay(200);
+// Bun can leave server.close() pending after every CONNECT tunnel socket has
+// already emitted 'close'; closeAllConnections flushes that stale tracking.
+proxy.closeAllConnections();
 await new Promise<void>(resolve => proxy.close(() => resolve()));
 clearTimeout(deadline);
 console.log(JSON.stringify({ alive: true, connects, maxSockets, remainingSockets: sockets }));
