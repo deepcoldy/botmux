@@ -5,6 +5,7 @@
  * getOwnerOpenId, and it never copies the session owner or creator into the
  * caller or the reply-target sender.
  */
+import { resolveAssistantSpawn } from '../core/assistant-spawn.js';
 import { existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -142,6 +143,9 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     chatType: 'group' | 'p2p',
   ): Promise<{ ok: true; session: CardClickBoundSession } | { ok: false; reason: string }> {
     if (!claims.chatId || !claims.workingDir) return { ok: false, reason: 'working_dir_required' };
+    // 个人助理模式：会话归该 chat 的主人、cwd 在主人 work/（不用卡片里签的目录）；未认领不建。
+    const assistantSpawn = resolveAssistantSpawn(larkAppId, claims.chatId, chatType, senderOpenId);
+    if (assistantSpawn.kind === 'unclaimed') return { ok: false, reason: 'assistant_unclaimed' };
     const key = sessionKey(claims.chatId, larkAppId);
     const registered = await withActiveSessionKeyLock(deps.activeSessions, key, async () => {
       const current = deps.activeSessions.get(key);
@@ -155,7 +159,8 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
       session.scope = 'chat';
       session.ownerOpenId = senderOpenId;
       session.creatorOpenId = senderOpenId;
-      session.workingDir = claims.workingDir;
+      session.workingDir = assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : claims.workingDir;
+      if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
       session.lastMessageAt = new Date(now).toISOString();
       sessionStore.updateSession(session);
       ensureQueue(claims.chatId!);

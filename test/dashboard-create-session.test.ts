@@ -15,6 +15,8 @@ import type { DaemonSession } from '../src/core/types.js';
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
 let sessionSeq = 0;
+const assistant = vi.hoisted(() => ({ spawn: { kind: 'off' } as any }));
+vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => assistant.spawn }));
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
@@ -218,6 +220,30 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     );
     // banner posted once (postBanner)
     expect(sendMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('assistant mode: the task belongs to the chat owner in the owner work dir; an unclaimed chat is refused', async () => {
+    try {
+      assistant.spawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+      const active = new Map<string, DaemonSession>();
+      const r = await spawnDashboardSession(active, undefined, {
+        larkAppId: APP, chatId: CHAT, content: 'task', column: 'backlog', role: 'solo',
+      });
+      expect(r.ok).toBe(true);
+      const ds = active.get(sessionKey(CHAT, APP))!;
+      expect(ds.session.assistantOwnerOpenId).toBe('ou_owner_a');
+      expect(ds.session.workingDir).toBe('/home/u/ou_owner_a/work');
+
+      assistant.spawn = { kind: 'unclaimed' };
+      const empty = new Map<string, DaemonSession>();
+      const refused = await spawnDashboardSession(empty, undefined, {
+        larkAppId: APP, chatId: CHAT, content: 'task', column: 'backlog', role: 'solo',
+      });
+      expect(refused).toEqual({ ok: false, error: 'assistant_unclaimed' });
+      expect(empty.size).toBe(0);
+    } finally {
+      assistant.spawn = { kind: 'off' };
+    }
   });
 
   it('keeps an explicitly ownerless bot opening ownerless while preserving its creator', async () => {

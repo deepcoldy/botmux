@@ -6148,6 +6148,9 @@ export async function spawnDashboardSession(
   let bot: ReturnType<typeof getBot>;
   try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found' }; }
   const locale = localeForBot(larkAppId);
+  // 个人助理模式：看板任务也归该群的主人、cwd 在主人 work/；群未认领就不建。
+  const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', args.ownerOpenId ?? undefined);
+  if (assistantSpawn.kind === 'unclaimed') return { ok: false, error: 'assistant_unclaimed' };
 
   // chat-scope：锚点就是 chatId。先挡掉「同群同 bot 已有真会话」的撞键（会被
   // Map.set 覆盖而泄漏 worker）。queued 占位 / 纯 scratch 不算冲突。
@@ -6237,8 +6240,11 @@ export async function spawnDashboardSession(
       session.kanbanColumn = 'backlog';
     }
 
-    const workingDir = resolveDashboardSpawnWorkingDir(larkAppId, chatId);
+    const workingDir = assistantSpawn.kind === 'owner'
+      ? assistantSpawn.workDir
+      : resolveDashboardSpawnWorkingDir(larkAppId, chatId);
     if (workingDir) session.workingDir = workingDir;
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 

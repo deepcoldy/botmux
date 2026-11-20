@@ -25,7 +25,7 @@ vi.mock('../src/services/assistant-owner-store.js', () => ({
 vi.mock('../src/services/session-groups-store.js', () => ({ getSessionGroup: () => undefined }));
 vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return state.dataDir; } } } }));
 
-import { assistantSessionStillOwned, resolveAssistantSpawn } from '../src/core/assistant-spawn.js';
+import { assistantSessionStillOwned, decideAssistantAdmission, resolveAssistantSpawn } from '../src/core/assistant-spawn.js';
 import { inheritSessionLaunchConfiguration } from '../src/core/session-launch-inheritance.js';
 import { botToSnapshot } from '../src/workflows/v3/bot-resolve.js';
 import { assertNotAssistantModeBot } from '../src/workflows/v3/ephemeral-pool.js';
@@ -94,5 +94,32 @@ describe('v3 workflow', () => {
     expect(() => assertNotAssistantModeBot('cli_app')).toThrow(/assistant/);
     state.assistantMode = false;
     expect(() => assertNotAssistantModeBot('cli_app')).not.toThrow();
+  });
+});
+
+describe('decideAssistantAdmission (worker launch gate)', () => {
+  const g = (o: Partial<{ chatType: 'group' | 'p2p'; ownerOpenId: string; assistantOwnerOpenId: string; everRan: boolean }>) =>
+    decideAssistantAdmission('cli_app', { chatId: 'oc_g', chatType: 'group', everRan: false, ...o });
+  it('a never-run session created by a path that did not stamp an owner is adopted by the chat owner, cwd in their work dir', () => {
+    state.stored = A;
+    expect(g({ ownerOpenId: B })).toEqual({ kind: 'adopt', openId: A, workDir: join(root, 'bots', 'cli_app', 'users', A, 'work') });
+    expect(decideAssistantAdmission('cli_app', { chatId: 'oc_dm', chatType: 'p2p', ownerOpenId: B, everRan: false }))
+      .toMatchObject({ kind: 'adopt', openId: B });
+  });
+  it('a session that already ran before the mode was enabled is not adopted', () => {
+    state.stored = A;
+    expect(g({ everRan: true })).toMatchObject({ kind: 'reject', expected: A });
+  });
+  it('owner match → allow; owner changed or unclaimed → reject', () => {
+    state.stored = A;
+    expect(g({ assistantOwnerOpenId: A, everRan: true })).toEqual({ kind: 'allow' });
+    expect(g({ assistantOwnerOpenId: B })).toMatchObject({ kind: 'reject', have: B, expected: A });
+    state.stored = undefined;
+    expect(g({})).toEqual({ kind: 'reject' });
+    expect(g({ assistantOwnerOpenId: A })).toEqual({ kind: 'reject', have: A });
+  });
+  it('mode off → allow', () => {
+    state.assistantMode = false;
+    expect(g({ everRan: true })).toEqual({ kind: 'allow' });
   });
 });

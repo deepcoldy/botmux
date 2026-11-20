@@ -38,6 +38,8 @@ vi.mock('../src/services/oncall-store.js', () => ({
 const mockCreateSession = vi.fn();
 const mockUpdateSession = vi.fn();
 const mockCloseSession = vi.fn();
+const assistant = vi.hoisted(() => ({ spawn: { kind: 'off' } as any }));
+vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => assistant.spawn }));
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
@@ -416,6 +418,28 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.session.rootMessageId).toBe(ROOT);
     expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
     expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
+  });
+
+  it('assistant mode: the trigger session belongs to the chat owner in the owner work dir; an unclaimed chat is refused', async () => {
+    try {
+      assistant.spawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+      const activeSessions = new Map<string, DaemonSession>();
+      const res = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions });
+      expect(res).toMatchObject({ ok: true });
+      const ds = activeSessions.get(sessionKey(ROOT, APP));
+      expect(ds?.session.assistantOwnerOpenId).toBe('ou_owner_a');
+      expect(ds?.session.workingDir).toBe('/home/u/ou_owner_a/work');
+
+      mockForkWorker.mockClear();
+      assistant.spawn = { kind: 'unclaimed' };
+      const empty = new Map<string, DaemonSession>();
+      const refused = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: empty });
+      expect(refused).toMatchObject({ ok: false });
+      expect(empty.size).toBe(0);
+      expect(mockForkWorker).not.toHaveBeenCalled();
+    } finally {
+      assistant.spawn = { kind: 'off' };
+    }
   });
 
   it('registers the minted turn as a trigger turn of its connector kind (execution current origin)', async () => {

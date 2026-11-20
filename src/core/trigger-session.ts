@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { resolveAssistantSpawn } from './assistant-spawn.js';
 import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import { messageListenerTaskAnchor } from './message-listener-silence.js';
@@ -1897,10 +1898,19 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const wd = resolveWorkingDir(larkAppId, chatId);
-  if (!wd.ok) {
-    return { ok: false, errorCode: 'trigger_failed', error: wd.error };
+  const resolvedWd = resolveWorkingDir(larkAppId, chatId);
+  if (!resolvedWd.ok) {
+    return { ok: false, errorCode: 'trigger_failed', error: resolvedWd.error };
   }
+  // 个人助理模式：触发器建的会话归该群的主人、cwd 在主人 work/（不建 worktree）；
+  // 群未认领（含私聊——触发器不知道是谁在说话）就拒绝。
+  const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', undefined);
+  if (assistantSpawn.kind === 'unclaimed') {
+    return { ok: false, errorCode: 'trigger_failed', error: 'assistant mode: this chat has no assistant owner' };
+  }
+  const wd = assistantSpawn.kind === 'owner'
+    ? { ok: true as const, workingDir: assistantSpawn.workDir, fromBotDefault: false }
+    : resolvedWd;
 
   const bot = getBot(larkAppId);
   const acceptsTaskOverride = allowsTaskModelOverride(bot.config.cliId);
@@ -1982,6 +1992,7 @@ async function triggerSessionTurnAdmitted(
     }
     session.lastMessageAt = nowIso;
     session.workingDir = wd.workingDir;
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     session.cliId = bot.config.cliId;
     // Per-turn model / reasoning-effort overrides follow the same explicit CLI
     // policy as schedules, independently of bot-level effort configuration.

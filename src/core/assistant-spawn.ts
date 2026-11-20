@@ -52,3 +52,29 @@ export function assistantSessionStillOwned(
   if (spawn.kind === 'off') return true;
   return spawn.kind === 'owner' && session.assistantOwnerOpenId === spawn.openId;
 }
+
+export type AssistantAdmission =
+  | { kind: 'allow' }
+  | { kind: 'adopt'; openId: string; workDir: string }
+  | { kind: 'reject'; have?: string; expected?: string };
+
+/** worker 起之前的归属判定（助理模式开着时调用）：
+ *  - 会话主人正是当前解析出的主人 → allow；
+ *  - 还没跑过 CLI 的新会话、没记主人 → adopt：认领给当前主人，cwd 改到主人 work/（各条建会话路径
+ *    不必各自记得填主人）；
+ *  - 其余（开模式前跑过的存量会话、主人已变、群未认领）→ reject。 */
+export function decideAssistantAdmission(
+  larkAppId: string,
+  s: { chatId: string; chatType: 'group' | 'p2p'; ownerOpenId?: string; assistantOwnerOpenId?: string; everRan: boolean },
+): AssistantAdmission {
+  const spawn = resolveAssistantSpawn(larkAppId, s.chatId, s.chatType, s.ownerOpenId);
+  if (spawn.kind === 'off') return { kind: 'allow' };
+  const expected = spawn.kind === 'owner' ? spawn.openId : undefined;
+  if (s.assistantOwnerOpenId) {
+    return s.assistantOwnerOpenId === expected
+      ? { kind: 'allow' }
+      : { kind: 'reject', have: s.assistantOwnerOpenId, ...(expected ? { expected } : {}) };
+  }
+  if (spawn.kind === 'owner' && !s.everRan) return { kind: 'adopt', openId: spawn.openId, workDir: spawn.workDir };
+  return { kind: 'reject', ...(expected ? { expected } : {}) };
+}

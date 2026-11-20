@@ -1,5 +1,6 @@
 import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecution } from './cli-execution-mode.js';
 import { isLeadOnlySession } from './lead-only.js';
+import { decideAssistantAdmission } from './assistant-spawn.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { runtimeStartRefusal } from '../services/runtime-reservation.js';
@@ -1076,10 +1077,8 @@ import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { BackendOutageCoordinator, recoveryEligibility, type BackendOutageDeps, type BackendOutageTimings } from './backend-outage-coordinator.js';
 import { buildBackendOutageCard, formatBackendOutageSummary } from './backend-outage-card.js';
 import { probeTmuxServerUp } from '../adapters/backend/tmux-pipe-backend.js';
-import { isSessionGroup, touchSessionGroup, getSessionGroup } from '../services/session-groups-store.js';
+import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
-import { getAssistantOwner } from '../services/assistant-owner-store.js';
-import { resolveAssistantOwnerOpenId } from './assistant-mode.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
@@ -19574,22 +19573,27 @@ function forkWorkerPrepared(
     reportAdmission('rejected');
     return true;
   }
-  // 个人助理模式：每次起 worker 都重新核对归属。会话没有 owner（daemon 之外的建会话路径、
-  // 开模式前的存量会话）、或归属表已变（管理员换了主人 / 主人退群）→ 拒绝 spawn。这是最后
+  // 个人助理模式：每次起 worker 都重新核对归属（判定见 core/assistant-spawn.ts）。这是最后
   // 一道闸：这里放过去，worker 就会拿共享 BOT_HOME 和默认 cwd 起来。
   if (botCfg.assistantMode === true) {
-    const expected = resolveAssistantOwnerOpenId({
+    const decision = decideAssistantAdmission(ds.larkAppId, {
+      chatId: ds.chatId,
       chatType: ds.session.chatType === 'p2p' ? 'p2p' : 'group',
-      senderOpenId: ds.session.ownerOpenId,
-      sessionGroupOwnerOpenId: ds.session.chatType === 'p2p' ? undefined : getSessionGroup(ds.chatId)?.ownerOpenId,
-      stored: ds.session.chatType === 'p2p' ? undefined : getAssistantOwner(config.session.dataDir, ds.larkAppId, ds.chatId),
+      ownerOpenId: ds.session.ownerOpenId,
+      assistantOwnerOpenId: ds.session.assistantOwnerOpenId,
+      everRan: ds.hasHistory || !!ds.session.cliSessionId,
     });
-    const have = ds.session.assistantOwnerOpenId;
-    if (!have || !expected || have !== expected) {
+    if (decision.kind === 'adopt') {
+      ds.session.assistantOwnerOpenId = decision.openId;
+      ds.session.workingDir = decision.workDir;
+      ds.workingDir = decision.workDir;
+      sessionStore.updateSession(ds.session);
+      logger.info(`[${tag(ds)}] assistant-mode: new session adopted by its chat owner`);
+    } else if (decision.kind === 'reject') {
       // 拒绝之外还要退役这个会话：chat-scope 会话会被后续消息一直复用，不退役就永远卡在
       // 这里（换了主人 / 开模式前的存量会话都是这种）。关掉后下一条消息走新建路径，按
       // 当前归属重新建会话。本条消息丢弃，由用户重发。
-      logger.warn(`[${tag(ds)}] assistant-mode: refusing to fork — session owner ${have ?? '(none)'} vs resolved ${expected ?? '(none)'}; retiring session`);
+      logger.warn(`[${tag(ds)}] assistant-mode: refusing to fork — session owner ${decision.have ?? '(none)'} vs resolved ${decision.expected ?? '(none)'}; retiring session`);
       reportAdmission('rejected');
       void closeSessionForBackgroundCleanup(ds.session.sessionId, 'assistant-mode owner mismatch').catch(err =>
         logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
