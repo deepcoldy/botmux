@@ -19,6 +19,7 @@ export interface MaintenanceTaskCfgInput {
 export interface MaintenanceCfgInput {
   autoUpdate?: MaintenanceTaskCfgInput;
   autoRestart?: MaintenanceTaskCfgInput;
+  notifyOnNewVersion?: boolean;
 }
 
 /** Raw dashboard settings as persisted in ~/.botmux/config.json's `dashboard` + `maintenance` segments. */
@@ -47,7 +48,8 @@ export type SettingsToggleKey =
   | 'enableLocalCliOpen'
   | 'modelQueueNotify'
   | 'autoUpdate'
-  | 'autoRestart';
+  | 'autoRestart'
+  | 'notifyOnNewVersion';
 
 /** A single toggle row inside a settings section. */
 export interface SettingsToggleDTO {
@@ -183,6 +185,13 @@ export function composeSections(
         hintKey: 'settings.autoRestartHelp',
         enabled: settings.maintenance?.autoRestart?.enabled === true,
         state: { enabled: autoRestartEnabledUi, reasonKey: autoRestartReasonKey },
+      },
+      {
+        key: 'notifyOnNewVersion',
+        labelKey: 'settings.notifyOnNewVersion',
+        hintKey: 'settings.notifyOnNewVersionHelp',
+        enabled: settings.maintenance?.notifyOnNewVersion === true,
+        state: { enabled: canWrite },
       },
     ],
     hintKey: settings.localDevInstall

@@ -1137,7 +1137,6 @@ export const messages: Record<string, string> = {
   'config.label.replyCardNextStep': '回复卡下一步按钮',
   'config.label.bareRenamePassthrough': '裸 /rename 交给 CLI 起名',
   'config.label.replyCardRecap': '回复卡本轮回顾',
-  'config.label.replyCardRecapModel': '本轮回顾小模型补写',
   'config.label.autoStartOnGroupJoin': '进群即开工',
   'config.label.autoStartOnNewTopic': '新话题即开工',
   'config.label.chatManagerEnabled': '群负责人（默认接待者）',
@@ -2445,6 +2444,8 @@ export const messages: Record<string, string> = {
   'settings.localCliOpenModeHelp': '默认附加当前会话：managed tmux / Herdr / ZMX 走精确 attach，adopt 会话只在已有可靠目标时附加；ZMX 的原生 attach 不代表 botmux 提供 Web TUI。direct resume 适合明确接受飞书连续性风险的本机调试。',
   'settings.localCliOpenModeAttach': '附加当前会话（推荐）',
   'settings.localCliOpenModeResume': '另起 CLI resume',
+  'settings.notifyOnNewVersion': '新版私聊提醒',
+  'settings.notifyOnNewVersionHelp': '默认关闭。每小时检查 botmux 新版，由主机器人私聊通知 owner；同一版本只提醒一次，无需开启自动更新。',
   'settings.autoUpdate': '每日自动更新',
   'settings.autoUpdateHelp': '在每天指定时间自动拉取最新版本。',
   'settings.autoRestart': '更新后自动重启',
@@ -2666,6 +2667,11 @@ export const messages: Record<string, string> = {
   'restart.dashboard_local': '本地直连（平台异常时可用）：{url}',
   'restart.changelog_label': '更新内容：',
   'restart.changelog_link_fallback': '详情：{url}',
+  'updateNotice.title': 'botmux 新版提醒',
+  'updateNotice.available': '发现 botmux 新版本 **{version}**',
+  'updateNotice.current': '当前版本：{version}',
+  'updateNotice.release': '发布说明：{url}',
+  'updateNotice.manual': '可在 Dashboard 的“版本与更新”中查看并选择更新。',
   'restart.card_title': 'botmux 维护通知',
 
   // Host-side CLI runtime update monitor
