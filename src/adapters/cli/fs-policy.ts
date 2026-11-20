@@ -49,6 +49,14 @@ export interface FsPolicy {
    *  leaks; denying self pid-info crashes runtimes). Linux hides host processes
    *  with the PID namespace instead. */
   hideHostProcessInfo?: boolean;
+  /** Seatbelt only: directories the pane may write INTO but must not rename or
+   *  remove. A writable directory can otherwise be rename(2)d wholesale (its
+   *  children are never opened, so a per-file deny does not fire) and read
+   *  back from a writable location, or replaced by a symlink the host then
+   *  writes through. Measured: `(deny file-write-unlink (literal <dir>))` blocks
+   *  mv/rmdir of the directory while mkdir/touch/rename inside it keep working.
+   *  Linux needs none of this: these directories are bind mounts there. */
+  pinnedDirs?: string[];
   /** Extra Seatbelt write-allow regexes (e.g. ~/.claude.json.tmp.* atomic-save
    *  siblings when the CLI data dir is NOT redirected into BOT_HOME). */
   writeRegexes: string[];
@@ -1239,6 +1247,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     rules,
     net: ctx.net !== false,
     ...(ctx.withholdSendCredential ? { hideHostProcessInfo: true } : {}),
+    ...(ctx.withholdSendCredential
+      ? { pinnedDirs: [ctx.botHome, ...(ctx.outbox ? [ctx.outbox] : [])].map(p => normalizeFsPath(p)).filter((p): p is string => !!p) }
+      : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
     finalReadOnlyPaths,
@@ -1358,6 +1369,7 @@ export function compileToSeatbelt(policy: FsPolicy): string {
     lines.push(`(allow file-read* (subpath "${escSb(path)}"))`);
     lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
   }
+  for (const p of policy.pinnedDirs ?? []) lines.push(`(deny file-write-unlink (literal "${escSb(p)}"))`);
   return lines.join('\n') + '\n';
 }
 

@@ -1,4 +1,5 @@
 import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
+import { sandboxWithholdsBotSecret } from './adapters/cli/sandbox-mode.js';
 import { renderInboundMessageLocation } from './core/reply-message.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
@@ -3503,7 +3504,7 @@ async function ensureVcMeetingReceiverSession(
     session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
     session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
     session.sandboxNetworkPolicy = bot.config.sandboxNetworkPolicy ? structuredClone(bot.config.sandboxNetworkPolicy) : undefined;
-    session.sandboxWithholdBotSecret = receiverSandboxed === true && bot.config.sandboxWithholdBotSecret === true ? true : undefined;
+    session.sandboxWithholdBotSecret = sandboxWithholdsBotSecret(bot.config) ? true : undefined;
     session.backendType = isolation.backendType;
     sessionStore.updateSession(session);
 

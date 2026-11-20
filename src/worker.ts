@@ -28662,12 +28662,16 @@ async function spawnCliBody(
       mkdirSync(dirname(credPath), { recursive: true });
       // sandboxWithholdBotSecret denies the exact file only; a sibling temp file
       // in the readable BOT_HOME would expose the secret during (or after a
-      // crash before) the rename, so stage it one level up, out of the grant.
-      atomicWriteFileSync(
-        credPath,
-        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
-        { mode: 0o600, ...(cfg.sandboxWithholdBotSecret === true ? { tmpDir: dirname(dirname(credPath)) } : {}) },
-      );
+      // crash before) the rename. BOT_HOME is shared by every session of the
+      // bot, so stage one level up for ALL of them; only a bot without the flag
+      // may fall back to the sibling when bots/ is on another filesystem.
+      const credJson = JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback });
+      try {
+        atomicWriteFileSync(credPath, credJson, { mode: 0o600, tmpDir: dirname(dirname(credPath)) });
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'EXDEV' || cfg.sandboxWithholdBotSecret === true) throw e;
+        atomicWriteFileSync(credPath, credJson, { mode: 0o600 });
+      }
     } catch (e) {
       log(`[sandbox] WARN could not write send-cred file: ${(e as Error).message}`);
     }

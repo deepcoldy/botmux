@@ -2178,6 +2178,16 @@ export function startOutboxWatcher(
   const inFlight = new Set<string>();
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
   const staging = join(dirname(outbox), 'relay-staging');
+  // The pane can write inside the outbox; on macOS it could also try to replace
+  // the directory itself while a request is in flight. Remember what we were
+  // started on and refuse to write a response anywhere else.
+  let outboxIdentity: { dev: number; ino: number } | null = null;
+  try { const st = lstatSync(outbox); if (st.isDirectory() && !st.isSymbolicLink()) outboxIdentity = { dev: st.dev, ino: st.ino }; } catch { /* */ }
+  const outboxIntact = (): boolean => {
+    if (!outboxIdentity) return false;
+    try { const st = lstatSync(outbox); return st.isDirectory() && !st.isSymbolicLink() && st.dev === outboxIdentity.dev && st.ino === outboxIdentity.ino; }
+    catch { return false; }
+  };
 
   const finish = (id: string, reqPath: string, name: string, staged: string[], code: number, stdout: string, stderr: string, extra?: Record<string, unknown>) => {
     // 先消费请求、再发布响应：任何人看到 res.json 时，req.json 都已不在。
@@ -2185,10 +2195,15 @@ export function startOutboxWatcher(
     // 的 watcher（restore / transfer 之后）会把它再执行一遍。
     try { rmSync(reqPath, { force: true }); } catch { /* */ }
     // 原子写：沙盒侧 CLI 在 existsSync 轮询这个 res.json，rename 保证它读到完整 JSON。
-    // outbox 对沙盒可写：res.json 可能被预先放成指向宿主文件的软链，必须替换而不是写穿。
-    try {
-      atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr, ...extra }), { followTargetSymlink: false });
-    } catch { /* */ }
+    // outbox 对沙盒可写：res.json 可能被预先放成指向宿主文件的软链，必须替换而不是写穿；
+    // outbox 目录本身被换掉（rename + 软链）时干脆不写。
+    if (outboxIntact()) {
+      try {
+        atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr, ...extra }), { followTargetSymlink: false });
+      } catch { /* */ }
+    }
+    // else: the outbox was replaced while serving this request — the response
+    // is dropped and the sandbox-side CLI reports its relay timeout.
     for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
     inFlight.delete(name);
   };

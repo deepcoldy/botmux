@@ -145,5 +145,9 @@ describe('downloadResources: Lark file names stay inside the message directory',
     expect(paths[1]).toMatch(/\/attachments\/app\/om_1\/file_k2$/);
     expect(paths[2]).toMatch(/\/attachments\/app\/om_1\/report\.pdf$/);
     for (const p of paths) expect(p).not.toContain('..');
+    // and the downloader is told which root the directory must resolve under
+    for (const call of (downloadMessageResource as any).mock.calls) {
+      expect(call[6]).toMatchObject({ withinRoot: expect.stringMatching(/\/attachments$/) });
+    }
   });
 });

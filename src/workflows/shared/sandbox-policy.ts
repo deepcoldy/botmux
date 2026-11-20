@@ -54,7 +54,6 @@ export function workflowSandboxInitFields(
     sandboxReadonlyPaths: [...(policy?.sandboxReadonlyPaths ?? [])],
     sandboxNetwork: policy?.sandboxNetwork !== false,
     ...(policy?.sandboxNetworkPolicy ? { sandboxNetworkPolicy: structuredClone(policy.sandboxNetworkPolicy) } : {}),
-    ...((policy?.sandbox === true || policy?.sandbox === 'oncall') && policy.sandboxWithholdBotSecret === true
-      ? { sandboxWithholdBotSecret: true } : {}),
+    ...(policy?.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true } : {}),
   };
 }

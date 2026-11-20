@@ -84,6 +84,19 @@ describe('downloadMessageResource symlink safety', () => {
     expect(readdirSync(hostDir)).toEqual(['cli.js']);
   });
 
+  it('withinRoot: refuses a message directory reached through a swapped ancestor', async () => {
+    const hostDir = join(root, 'host-dist');
+    mkdirSync(join(hostDir, 'om_a'), { recursive: true });
+    const attachments = join(root, 'attachments');
+    mkdirSync(attachments);
+    symlinkSync(hostDir, join(attachments, 'app'));
+    mocks.request.mockResolvedValueOnce(Buffer.from('EVIL'));
+    await expect(downloadMessageResource('cli_test', 'om_a', 'file_k', 'file', join(attachments, 'app', 'om_a', 'cli.js'), undefined, { withinRoot: attachments }))
+      .rejects.toThrow(/outside/);
+    expect(readdirSync(join(hostDir, 'om_a'))).toEqual([]);
+    expect(mocks.request).not.toHaveBeenCalled();
+  });
+
   it('refuses a symlinked message directory', async () => {
     const hostDir = join(root, 'host-dist');
     mkdirSync(hostDir);

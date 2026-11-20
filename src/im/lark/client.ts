@@ -1,6 +1,6 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
-import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync, lstatSync, renameSync, unlinkSync } from 'node:fs';
-import { dirname, extname, basename, join } from 'node:path';
+import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync, lstatSync, renameSync, unlinkSync, realpathSync } from 'node:fs';
+import { dirname, extname, basename, join, sep } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
@@ -1938,7 +1938,7 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean; fallbackMessageIds?: readonly string[] }): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean; fallbackMessageIds?: readonly string[]; withinRoot?: string }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
@@ -1958,6 +1958,15 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   const dirInfo = lstatSync(dir);
   if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {
     throw new Error(`Refusing to download into a non-directory: ${dir}`);
+  }
+  // An ancestor (attachments/<appId>) is writable too and could have been
+  // swapped for a symlink: the resolved directory must still sit under the root.
+  if (options?.withinRoot) {
+    const real = realpathSync(dir);
+    const root = realpathSync(options.withinRoot);
+    if (real !== root && !real.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)) {
+      throw new Error(`Refusing to download outside ${root}: ${dir}`);
+    }
   }
 
   // Resolve resource ownership with the same app identity before borrowing a

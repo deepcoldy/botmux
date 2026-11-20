@@ -8,7 +8,7 @@
  *      bun test test/sandbox-relay-session-tool.test.ts
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,6 +16,7 @@ import { RELAY_SESSION_TOOLS_MARKER, startOutboxWatcher, validateRelaySessionToo
 import { accessForPath, buildFsPolicy, compileToSeatbelt, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
 import { buildRelaySessionToolRequest, materializeRelayedAttachments } from '../src/cli/relay-session-tool.js';
 import { readVerifiedFile } from '../src/services/remote-runner-session-tool.js';
+import { sandboxWithholdsBotSecret } from '../src/adapters/cli/sandbox-mode.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
@@ -78,6 +79,17 @@ describe('fs-policy: withholdSendCredential', () => {
     expect(off).not.toContain('kern.procargs');
   });
 
+  it('pins BOT_HOME and the outbox against rename/rmdir, after the write grants', () => {
+    const outbox = '/Users/u/.botmux/data/sandboxes/s/outbox';
+    const on = compileToSeatbelt(buildFsPolicy(ctx({ outbox, withholdSendCredential: true })));
+    for (const dir of ['/Users/u/.botmux/bots/cli_self', outbox]) {
+      const pin = `(deny file-write-unlink (literal "${dir}"))`;
+      expect(on).toContain(pin);
+      expect(on.indexOf(pin)).toBeGreaterThan(on.indexOf(`(subpath "${dir}")`));
+    }
+    expect(compileToSeatbelt(buildFsPolicy(ctx({ outbox })))).not.toContain('file-write-unlink (literal');
+  });
+
   it('grants the macOS relay outbox read-write', () => {
     const outbox = '/Users/u/.botmux/data/sandboxes/s/outbox';
     const p = buildFsPolicy(ctx({ outbox, withholdSendCredential: true }));
@@ -94,6 +106,22 @@ describe('fs-policy: withholdSendCredential', () => {
       expect(a, platform).not.toBe('readWrite');
       expect(a, platform).not.toBe('readOnly');
     }
+  });
+});
+
+describe('sandboxWithholdsBotSecret (one decision for every freeze / snapshot path)', () => {
+  it.each([
+    [{ sandbox: 'oncall', sandboxWithholdBotSecret: true }, undefined, true],
+    [{ sandbox: true, sandboxWithholdBotSecret: true }, undefined, true],
+    [{ sandboxWithholdBotSecret: true }, '1', true],
+    [{ sandbox: false, sandboxWithholdBotSecret: true }, 'oncall', true],
+    [{ sandbox: 'scratch', sandboxWithholdBotSecret: true }, undefined, false],
+    [{ sandbox: 'oncall', sandboxWithholdBotSecret: true }, 'scratch', false],
+    [{ sandboxWithholdBotSecret: true }, undefined, false],
+    [{ sandbox: 'oncall' }, '1', false],
+    [{ sandbox: 'oncall', sandboxWithholdBotSecret: true }, 'bogus', false],
+  ] as const)('%j with BOTMUX_SANDBOX=%s → %s', (cfg, env, expected) => {
+    expect(sandboxWithholdsBotSecret(cfg as any, env)).toBe(expected);
   });
 });
 
@@ -162,6 +190,28 @@ describe('outbox watcher: session-tool requests', () => {
       expect(existsSync(join(a.outbox, RELAY_SESSION_TOOLS_MARKER))).toBe(true);
       expect(existsSync(join(b.outbox, RELAY_SESSION_TOOLS_MARKER))).toBe(false);
     } finally { stopA(); stopB(); }
+  });
+
+  it('drops the response instead of writing through an outbox replaced mid-flight', async () => {
+    const root = tmp('botmux-relay-outbox-swap-');
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const victim = join(root, 'victim');
+    mkdirSync(victim);
+    const signal = join(root, 'started');
+    const fixture = join(root, 'slow.mjs');
+    writeFileSync(fixture, `import { writeFileSync } from 'node:fs'; writeFileSync(process.env.PIN_SIGNAL, '1'); setTimeout(() => process.stdout.write('{}'), 700);`);
+    writeFileSync(join(outbox, 'swap.content'), 'hello');
+    writeFileSync(join(outbox, 'swap.req.json'), JSON.stringify({ contentFile: 'swap.content', flags: ['--no-mention'] }));
+    const stop = startOutboxWatcher(outbox, { ...process.env, PIN_SIGNAL: signal }, 'sid', { cliPath: fixture });
+    try {
+      await vi.waitFor(() => expect(existsSync(signal)).toBe(true), { timeout: 5_000 });
+      renameSync(outbox, `${outbox}.moved`);
+      symlinkSync(victim, outbox);
+      await new Promise(r => setTimeout(r, 1_800));
+      expect(readdirSync(victim)).toEqual([]);
+      expect(readdirSync(`${outbox}.moved`).filter(n => n.endsWith('.res.json'))).toEqual([]);
+    } finally { stop(); }
   });
 
   it('replaces a planted res.json symlink instead of writing through it', async () => {

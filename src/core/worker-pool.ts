@@ -60,7 +60,7 @@ import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTrig
 import { modelPinView, retainPinEffort, samePinModel, validateModelPin, type ModelPin } from './model-pin.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
-import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, sessionCardSandboxMode, botConfigSandboxMode, envSandboxMode } from '../adapters/cli/sandbox-mode.js';
+import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, sessionCardSandboxMode, botConfigSandboxMode, sandboxWithholdsBotSecret } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -18564,14 +18564,9 @@ export function freezeSessionSandboxDecision(
     ds.session.sandboxNetworkPolicy = botCfg.sandboxNetworkPolicy ? structuredClone(botCfg.sandboxNetworkPolicy) : undefined;
     // Frozen with the rest of the sandbox shape: it decides whether the pane is
     // built around the outbox relay, which a live pane cannot change.
-    // BOTMUX_SANDBOX=1 makes the worker enable oncall isolation even when the
-    // bot config leaves the sandbox off; that pane is built around the relay too.
-    const envForcedOncall = ds.session.sandbox === false && (() => {
-      try { return envSandboxMode(process.env.BOTMUX_SANDBOX) === 'oncall'; } catch { return false; }
-    })();
-    if ((ds.session.sandbox === true || envForcedOncall) && botCfg.sandboxWithholdBotSecret === true) {
-      ds.session.sandboxWithholdBotSecret = true;
-    }
+    // Decided against the sandbox the worker will actually build (BOTMUX_SANDBOX
+    // forcing included), not only the configured one.
+    if (sandboxWithholdsBotSecret(botCfg)) ds.session.sandboxWithholdBotSecret = true;
     if (ds.session.sandbox === 'scratch') {
       ds.session.sandboxScratch = {
         storage: normalizeScratchStorage(botCfg.scratchStorage),

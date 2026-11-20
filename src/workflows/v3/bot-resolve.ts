@@ -1,4 +1,5 @@
 import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
+import { sandboxWithholdsBotSecret } from '../../adapters/cli/sandbox-mode.js';
 /**
  * Shared v3 bot resolution — selector → BotConfig → BotSnapshot.
  *
@@ -100,8 +101,7 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),
     ...(bot.sandboxReadonlyPaths?.length ? { sandboxReadonlyPaths: [...bot.sandboxReadonlyPaths] } : {}),
     ...(bot.sandboxNetwork === false ? { sandboxNetwork: false } : {}),
-    ...((bot.sandbox === true || bot.sandbox === 'oncall') && bot.sandboxWithholdBotSecret === true
-      ? { sandboxWithholdBotSecret: true as const } : {}),
+    ...(sandboxWithholdsBotSecret(bot) ? { sandboxWithholdBotSecret: true as const } : {}),
     ...(bot.sandboxNetworkPolicy ? { sandboxNetworkPolicy: structuredClone(bot.sandboxNetworkPolicy) } : {}),
     workingDir: botWorkingDir(bot, workingDirOverride),
   };
