@@ -1334,6 +1334,52 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(repliedText()).toContain('会话标题已更新');
   });
 
+  it.each([
+    { entry: 'new-topic', sender: 'peer', expectedIsBot: true },
+    { entry: 'thread', sender: 'peer', expectedIsBot: true },
+    { entry: 'thread', sender: 'human', expectedIsBot: false },
+  ] as const)('bare /rename preserves the route-resolved sender identity ($entry, $sender)', async ({ entry, sender, expectedIsBot }) => {
+    const peerOpenId = 'ou_bare_rename_peer';
+    const senderOpenId = sender === 'peer' ? peerOpenId : OWNER;
+    mkdirSync(mocks.dataDir, { recursive: true });
+    writeFileSync(crossRefPath(), JSON.stringify({ PeerBot: peerOpenId }));
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER, peerOpenId],
+      bareRenamePassthrough: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER, peerOpenId];
+    const anchor = `om_bare_rename_${entry}_${sender}`;
+    const messageId = `${anchor}_message`;
+    const ds = seedThreadSession(anchor, 'bare rename sender identity');
+    ds.session.cliId = 'claude-code';
+    const send = vi.fn();
+    ds.worker = { killed: false, connected: true, send } as any;
+    const data = makeEventData(messageId, '/rename', entry === 'thread' ? anchor : undefined);
+    // Lark did not stamp sender_type. Only the route's cross-ref can distinguish
+    // the registered peer bot from the genuine human control.
+    data.sender = { sender_id: { open_id: senderOpenId } };
+
+    if (entry === 'new-topic') await handleNewTopic(data, makeCtx(anchor, messageId));
+    else await handleThreadReply(data, makeCtx(anchor, messageId));
+
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'raw_input', content: '/rename', turnId: messageId,
+    }));
+    expect(ds.session.quoteTargetSenderOpenId).toBe(senderOpenId);
+    expect(ds.session.quoteTargetSenderIsBot).toBe(expectedIsBot);
+    expect(ds.session.replyTargets?.[messageId]?.participants).toEqual([
+      expect.objectContaining({ openId: senderOpenId, isBot: expectedIsBot }),
+    ]);
+    expect(ds.session.turnReplyContexts?.[messageId]).toMatchObject({
+      replyTargetSenderOpenId: senderOpenId,
+      replyTargetSenderIsBot: expectedIsBot,
+    });
+    expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
   it('non-allowedUsers sender: `/rename` is denied by canOperate on BOTH routes, nothing created/renamed', async () => {
     // The /rename handler itself has no permission gate — it relies entirely on
     // the routes' canOperate gate running BEFORE the existing-session-only
