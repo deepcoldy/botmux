@@ -407,7 +407,7 @@ Details in [File sandbox](/en/sandbox).
 | `scratchDenyPaths` | `scratch` only: extra paths to hide. botmux's own credentials are always hidden |
 | `sandboxNetwork` | Default `true` keeps network access; `false` cuts ordinary outbound network |
 | `sandboxNetworkPolicy` | Advanced network policy that filters target IPs separately for public and private ranges |
-| `credentialsSourceDir` | A sandboxed bot copies its CLI login from this directory on every start, instead of the machine's shared login. Useful for several accounts on one machine |
+| `credentialsSourceDir` | A `claude-code` bot copies its login from this directory on every cold start instead of using the machine's shared login, with allowlist isolation (`oncall`) or the sandbox off; `scratch` refuses to start. An unsandboxed bot switches to its own CLI data directory. Useful for several accounts on one machine |
 | `codexAuthSync` | Codex login policy: `shared` (default) uses the global login; `isolated` always uses this bot's own `CODEX_HOME` and never reads or copies global credentials |
 | `triggerUserAuth` | Off by default. When on, tools such as `lark-cli` in the session run with the authorization of the person who sent the message; people who haven't authorized get an authorization link |
 | `larkToolBinding` | On by default: `lark-cli` in the session uses the current bot's app identity, and `--as user` / `--profile` can switch. `false` injects no bot credentials at all |

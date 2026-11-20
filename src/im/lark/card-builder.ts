@@ -89,12 +89,12 @@ function findCardElementById(value: unknown, elementId: string): any | undefined
 }
 
 function withoutKnownTurnTerminalReceipt(content: string): string {
-  const known = [
-    t('worker.turn_terminal_receipt.completed', undefined, 'zh'),
-    t('worker.turn_terminal_receipt.silent', undefined, 'zh'),
-    t('worker.turn_terminal_receipt.completed', undefined, 'en'),
-    t('worker.turn_terminal_receipt.silent', undefined, 'en'),
-  ];
+  const known = (['zh', 'en'] as const).flatMap(locale => [
+    'worker.turn_terminal_receipt.completed',
+    'worker.turn_terminal_receipt.silent',
+    'worker.turn_terminal_receipt.completed_superseded',
+    'worker.turn_terminal_receipt.silent_superseded',
+  ].map(key => t(key, undefined, locale)));
   let result = content;
   for (const label of known) {
     const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -113,12 +113,20 @@ function appendTurnTerminalReceiptToFooter(content: string, label: string): stri
   return `${base} · <font color='grey'>${label}</font>`;
 }
 
+function carriesTurnTerminalReceipt(content: string): boolean {
+  const body = /^<font color=['"]grey['"]>([\s\S]*)<\/font>$/.exec(content)?.[1] ?? content;
+  return withoutKnownTurnTerminalReceipt(body) !== body.trimEnd();
+}
+
 /** Build a footer-only CardKit update. Message reads may normalize Markdown;
  * never submit their body as the source of a full-card update. */
 export function buildTurnTerminalFooterPatch(
   cardJson: string,
   kind: TurnTerminalReceiptKind,
   locale?: Locale,
+  /** A newer turn is already running: the card's turn ended, but the session
+   * is not awaiting input. */
+  opts: { superseded?: boolean } = {},
 ): { content: string; alreadyApplied: boolean } | undefined {
   let card: any;
   try { card = JSON.parse(cardJson); } catch { return undefined; }
@@ -127,8 +135,11 @@ export function buildTurnTerminalFooterPatch(
   if (footer?.tag !== 'markdown' || typeof footer.content !== 'string' || !footer.content.trim()) {
     return undefined;
   }
+  // The receipt is the card's one fixed-sequence CardKit write: once any
+  // variant is on the footer, a replay must not try to write another.
+  if (carriesTurnTerminalReceipt(footer.content)) return { content: footer.content, alreadyApplied: true };
   const content = appendTurnTerminalReceiptToFooter(
-    footer.content, t(`worker.turn_terminal_receipt.${kind}`, undefined, locale),
+    footer.content, t(`worker.turn_terminal_receipt.${kind}${opts.superseded ? '_superseded' : ''}`, undefined, locale),
   );
   // The append is idempotent, so an unchanged footer already carries this
   // receipt (a replayed terminal). Re-sending its fixed CardKit sequence would

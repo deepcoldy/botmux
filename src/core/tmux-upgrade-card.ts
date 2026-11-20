@@ -50,6 +50,10 @@ export interface TmuxUpgradePlanView {
   hint?: string;
   /** Release the package source offers (best ≥ min for auto, best overall for no_candidate). */
   candidate?: string;
+  /** Auto plan installing botmux's own prebuilt copy. */
+  prebuilt?: { release: string; dir: string; keepPath?: string };
+  /** Manual plan: why botmux's own prebuilt copy is not possible either. */
+  prebuiltUnavailable?: { reason: string; detail?: string; missingLibraries?: string[] };
 }
 
 /** Everything the card renders. Persisted so a restarted daemon can re-render. */
@@ -96,6 +100,16 @@ const HEADER_TEMPLATE: Record<TmuxUpgradePhase, string> = {
   switching: 'blue',
   switch_failed: 'red',
   done: 'green',
+};
+
+const PREBUILT_UNAVAILABLE_KEY: Record<string, string> = {
+  platform: 'tmux_upgrade.prebuilt.unavailable.platform',
+  arch: 'tmux_upgrade.prebuilt.unavailable.arch',
+  glibc: 'tmux_upgrade.prebuilt.unavailable.glibc',
+  extractor: 'tmux_upgrade.prebuilt.unavailable.extractor',
+  libraries: 'tmux_upgrade.prebuilt.unavailable.libraries',
+  outdated: 'tmux_upgrade.prebuilt.unavailable.outdated',
+  managed_modified: 'tmux_upgrade.prebuilt.unavailable.managed_modified',
 };
 
 const TITLE_KEY: Record<TmuxUpgradePhase, string> = {
@@ -170,11 +184,22 @@ function manualLines(plan: TmuxUpgradePlanView | undefined, model: TmuxUpgradeCa
     case 'tmux_missing':
       lines.push(t('tmux_upgrade.manual.missing', undefined, locale));
       break;
+    case 'managed_modified':
+      lines.push(t('tmux_upgrade.manual.managed_modified', { path: path || '~/.botmux/tools/tmux' }, locale));
+      break;
     default:
       lines.push(t('tmux_upgrade.manual.unsupported', undefined, locale));
   }
   if (plan.manualCommand) lines.push(t('tmux_upgrade.manual.command', { command: code(plan.manualCommand) }, locale));
   if (plan.hint) lines.push(plan.hint);
+  const unavailable = plan.prebuiltUnavailable;
+  if (unavailable) {
+    const key = PREBUILT_UNAVAILABLE_KEY[unavailable.reason] ?? 'tmux_upgrade.prebuilt.unavailable.platform';
+    lines.push(t(key, {
+      detail: unavailable.detail ?? '?',
+      libs: (unavailable.missingLibraries ?? []).join(', ') || '?',
+    }, locale));
+  }
   lines.push(t('tmux_upgrade.manual.auto_detect', undefined, locale));
   return lines;
 }
@@ -192,7 +217,18 @@ export function buildTmuxUpgradeCard(model: TmuxUpgradeCardModel, nonce: string,
     case 'needs_upgrade': {
       md([versions, t('tmux_upgrade.why', { why: model.why }, locale)].join('\n'));
       if (model.interruptedByRestart) md(t('tmux_upgrade.interrupted_by_restart', undefined, locale));
-      if (model.plan?.auto) {
+      if (model.plan?.auto && model.plan.prebuilt) {
+        const pb = model.plan.prebuilt;
+        md([
+          t('tmux_upgrade.plan.prebuilt', { release: pb.release, dir: code(pb.dir) }, locale),
+          ...(pb.keepPath ? [t('tmux_upgrade.plan.prebuilt_keep', { path: code(pb.keepPath) }, locale)] : []),
+          t('tmux_upgrade.plan.safe', undefined, locale),
+        ].join('\n'));
+        elements.push({
+          tag: 'action',
+          actions: [button(t('tmux_upgrade.btn.run', undefined, locale), TMUX_UPGRADE_ACTION_RUN, nonce, 'primary')],
+        });
+      } else if (model.plan?.auto) {
         md([
           t('tmux_upgrade.plan.command', { command: code(model.plan.display ?? '') }, locale),
           ...(model.plan.tmuxPath ? [t('tmux_upgrade.plan.path', { path: code(model.plan.tmuxPath) }, locale)] : []),
@@ -211,7 +247,9 @@ export function buildTmuxUpgradeCard(model: TmuxUpgradeCardModel, nonce: string,
     case 'upgrading': {
       md([
         t('tmux_upgrade.upgrading', { min: model.min }, locale),
-        ...(model.plan?.display ? [t('tmux_upgrade.plan.running', { command: code(model.plan.display) }, locale)] : []),
+        ...(model.plan?.prebuilt
+          ? [t('tmux_upgrade.plan.prebuilt_running', { release: model.plan.prebuilt.release }, locale)]
+          : model.plan?.display ? [t('tmux_upgrade.plan.running', { command: code(model.plan.display) }, locale)] : []),
         ...(elapsed(model, locale) ? [elapsed(model, locale)!] : []),
       ].join('\n'));
       const log = logBlock(model.log);

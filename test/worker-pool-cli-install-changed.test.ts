@@ -1,7 +1,7 @@
 /**
  * worker-pool: a worker reports that its CLI install changed under the running
  * process (Pi after a global upgrade). The daemon queues the same suspend as
- * `botmux suspend` on a busy session, says so once in the chat, and the next
+ * `botmux suspend` on a busy session, reports it to the bot owner, and the next
  * message cold-starts on the new install.
  *
  * Run: bun x vitest run --project unit test/worker-pool-cli-install-changed.test.ts
@@ -148,6 +148,7 @@ async function flush(): Promise<void> { await new Promise(resolve => setTimeout(
 
 describe('cli_install_changed', () => {
   let sessionReply: ReturnType<typeof vi.fn>;
+  let ownerDiagnostic: ReturnType<typeof vi.fn>;
   beforeEach(() => {
     vi.clearAllMocks();
     // TmuxBackend is mocked as an empty class below; suspend now verifies the
@@ -156,12 +157,13 @@ describe('cli_install_changed', () => {
     // in the other suspendWorker suites (the real verifier has its own tests).
     __testOnly_setSuspendBackingVerifier(() => true);
     sessionReply = vi.fn(async () => 'om_notice');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    ownerDiagnostic = vi.fn();
+    initWorkerPool({ sessionReply, onOwnerDiagnostic: ownerDiagnostic, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
   });
 
   afterEach(() => __testOnly_setSuspendBackingVerifier());
 
-  it('suspends an idle session right away and says why, once', async () => {
+  it('suspends an idle session and reports the install change to its owner', async () => {
     const worker = makeFakeWorker();
     const ds = makeDs(worker, 'idle');
     __testOnly_setupWorkerHandlers(ds, worker);
@@ -173,12 +175,10 @@ describe('cli_install_changed', () => {
     expect(ds.worker).toBe(null);
     expect(ds.session.suspendedColdResume).toBe(true);
     expect(ds.pendingSuspendReason).toBeUndefined();
-    expect(sessionReply).toHaveBeenCalledTimes(1);
-    const [anchor, text, msgType] = sessionReply.mock.calls[0]!;
-    expect(anchor).toBe('om_root');
-    expect(msgType).toBe('text');
-    expect(text).toContain('1.3.0');
-    expect(text).toContain('1.1.0');
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ownerDiagnostic).toHaveBeenCalledWith(ds, expect.objectContaining({
+      kind: 'cli_install_changed', runningVersion: '1.1.0', installedVersion: '1.3.0',
+    }));
   });
 
   it('waits for the running turn: the suspend is queued for this generation, not done', async () => {
@@ -221,5 +221,6 @@ describe('cli_install_changed', () => {
     expect(replacement.send).not.toHaveBeenCalledWith({ type: 'suspend' });
     expect(ds.pendingSuspendReason).toBeUndefined();
     expect(sessionReply).not.toHaveBeenCalled();
+    expect(ownerDiagnostic).not.toHaveBeenCalled();
   });
 });

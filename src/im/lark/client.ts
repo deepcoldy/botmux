@@ -2605,6 +2605,57 @@ export async function listMessagesByThreadId(larkAppId: string, threadId: string
   return listByThread(getBotClient(larkAppId), threadId, pageSize);
 }
 
+/** Read the very first native reply to a daemon-created task seed. A later
+ * matching reply or a chat scan cannot prove who originated a legacy task. */
+export async function firstDispatchReply(appId: string, chatId: string, rootId: string, targetAppId: string): Promise<string | undefined> {
+  const item = (await getMessageDetail(appId, rootId, { userCardContent: false, timeoutMs: 5000 }))?.items?.[0];
+  if (item?.message_id !== rootId || item?.chat_id !== chatId || item?.sender?.id !== appId
+      || !['app', 'bot'].includes(item.sender.sender_type) || !/^omt_[a-zA-Z0-9_-]+$/.test(item.thread_id ?? '')) return;
+  const page = await larkGet(getBotClient(appId), '/open-apis/im/v1/messages', {
+    container_id_type: 'thread', container_id: item.thread_id, sort_type: 'ByCreateTimeAsc', page_size: 3,
+  }, { timeoutMs: 5000 });
+  if (page.code !== 0) throw larkApiError('get first dispatch reply', page);
+  const replies = page.data?.items?.filter((message: { message_id?: string }) => message.message_id !== rootId) ?? [];
+  const nativeReply = (message: any) => message?.root_id === rootId && message.chat_id === chatId
+    && message.thread_id === item.thread_id && !message.deleted
+    && message.sender?.id === appId && ['app', 'bot'].includes(message.sender.sender_type);
+  const first = replies[0];
+  if (!nativeReply(first)) return;
+  if (first.msg_type !== 'text') return first.message_id;
+  // A legacy --repo task has exactly one unsigned initialization reply before
+  // its signed kickoff. Verify that narrow shape and target; never search later
+  // replies for a grant that could belong to a different sender's follow-up.
+  const mentions = first.mentions;
+  if (!Array.isArray(mentions) || mentions.length !== 1 || mentions[0].id_type !== 'open_id'
+    || typeof mentions[0].id !== 'string' || typeof mentions[0].key !== 'string') return first.message_id;
+  let text: unknown;
+  try { text = JSON.parse(first.body?.content ?? '').text; } catch { return; }
+  const key = mentions[0].key;
+  if (typeof text !== 'string' || !text.startsWith(key)
+    || !/^[ \t]+\/repo[ \t]+\S[^\r\n]*$/.test(text.slice(key.length))) return first.message_id;
+  const targets = await resolveCurrentChatBotOpenIdsByLarkAppIds(appId, chatId, [targetAppId]);
+  if (!targets.ok || targets.mappings.length !== 1 || targets.mappings[0]?.subjectOpenId !== mentions[0].id) return;
+  const kickoff = replies[1];
+  if (nativeReply(kickoff) && kickoff.msg_type === 'post') return kickoff.message_id;
+}
+
+/** The original app reads its exact card; unavailable reads never prove deletion. */
+export async function dispatchConsentCardAvailable(appId: string, chatId: string, messageId: string): Promise<boolean> {
+  let item: any;
+  try {
+    item = (await getMessageDetail(appId, messageId, { userCardContent: false, timeoutMs: 5000 }))?.items?.[0];
+  } catch (error) {
+    const code = getLarkErrorCode(error);
+    // Both codes are terminal provider states: the message can never become
+    // readable again, so the consent flow must rotate rather than throw forever.
+    if (code === LARK_CODE_MESSAGE_WITHDRAWN || code === LARK_CODE_MESSAGE_DELETED) return false;
+    throw error;
+  }
+  return item?.message_id === messageId && item.chat_id === chatId && !item.deleted
+    && item.msg_type === 'interactive' && item.sender?.id === appId
+    && ['app', 'bot'].includes(item.sender.sender_type);
+}
+
 export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
   return (await listThreadMessagesWithContext(larkAppId, chatId, rootMessageId, pageSize)).messages;
 }
