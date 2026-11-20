@@ -10,10 +10,14 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-const state = vi.hoisted(() => ({ assistantMode: true, stored: undefined as string | undefined, dataDir: '' }));
+const state = vi.hoisted(() => ({ assistantMode: true, unregistered: false, stored: undefined as string | undefined, dataDir: '' }));
 vi.mock('../src/bot-registry.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/bot-registry.js')>(),
-  getBot: () => ({ config: { larkAppId: 'cli_app', assistantMode: state.assistantMode } }),
+  getBot: (id: string) => {
+    if (state.unregistered) throw new Error(`bot ${id} not registered`);
+    return { config: { larkAppId: 'cli_app', assistantMode: state.assistantMode } };
+  },
+  loadBotConfigsCached: () => [{ larkAppId: 'cli_app', assistantMode: state.assistantMode }],
 }));
 vi.mock('../src/services/assistant-owner-store.js', () => ({
   getAssistantOwner: () => state.stored ? { openId: state.stored, since: '2026-11-20T00:00:00Z', how: 'claim' } : undefined,
@@ -35,6 +39,7 @@ beforeEach(() => {
   state.dataDir = join(root, 'data');
   state.assistantMode = true;
   state.stored = undefined;
+  state.unregistered = false;
 });
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
@@ -83,6 +88,9 @@ describe('v3 workflow', () => {
       .toThrow(/assistant/);
   });
   it('a resumed run (stored snapshot) is refused at launch once the live bot is in assistant mode', () => {
+    expect(() => assertNotAssistantModeBot('cli_app')).toThrow(/assistant/);
+    // a standalone run / another daemon's bot is not registered here: read the configured bots
+    state.unregistered = true;
     expect(() => assertNotAssistantModeBot('cli_app')).toThrow(/assistant/);
     state.assistantMode = false;
     expect(() => assertNotAssistantModeBot('cli_app')).not.toThrow();

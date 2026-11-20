@@ -15,7 +15,7 @@ import { SessionContractStore } from '../../services/session-contract-store.js';
 import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
-import { getBot } from '../../bot-registry.js';
+import { getBot, loadBotConfigsCached } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -85,8 +85,14 @@ export interface EphemeralPoolDeps {
 
 /** Throws when the live bot runs personal-assistant mode (see runNodeImpl). */
 export function assertNotAssistantModeBot(larkAppId: string): void {
-  let assistant = false;
-  try { assistant = getBot(larkAppId).config.assistantMode === true; } catch { /* unknown bot: launch fails later anyway */ }
+  // A daemon registers only its own bot, and standalone runs register none:
+  // fall back to the configured bots. A bot absent from both has no secret to
+  // launch with either, so that case is left to the credential resolver.
+  let cfg: { assistantMode?: boolean } | undefined;
+  try { cfg = getBot(larkAppId).config; } catch {
+    try { cfg = loadBotConfigsCached().find(b => b.larkAppId === larkAppId); } catch { cfg = undefined; }
+  }
+  const assistant = cfg?.assistantMode === true;
   if (assistant) throw new Error(`v3 workflow does not support personal-assistant mode; bot ${larkAppId} has assistantMode=true`);
 }
 

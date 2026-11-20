@@ -30197,6 +30197,9 @@ async function handlePrincipalLaneLiveMessage(
   if (!sourceDs || sourceDs.scope !== 'chat' || sourceDs.chatId !== ctx.chatId
       || (sourceDs.session.principalLane
         && sourceDs.session.principalLane.laneId !== 'source')) return false;
+  // 个人助理模式：群里的会话都归群主人、cwd 固定在主人 work/，不按发言人分道
+  // （分道会话没有主人、用 worktree cwd，会被准入闸拒掉，消息就丢了）。
+  if (sourceDs.session.assistantOwnerOpenId) return false;
   const parsed = parseEventMessage(data).parsed;
   const senderOpenId = parsed.senderId;
   const isForeignBotSender = parsed.senderType === 'app'
