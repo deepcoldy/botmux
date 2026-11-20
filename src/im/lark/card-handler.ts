@@ -1,3 +1,5 @@
+import { answerDispatchTaskConsent, TASK_CONSENT_ACTION } from './dispatch-task-consent.js';
+import { readDispatchReportBindingSecret } from '../../core/dispatch-report-binding.js';
 import { modelPinText } from '../../core/model-pin.js';
 import { resolveSessionModelPinView } from '../../core/session-model.js';
 import { sessionContractPrimary } from '../../core/session-contract-primary.js';
@@ -2230,6 +2232,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       result[key].data = reconcileOncallReplyCard(larkAppId, data.context.open_message_id, result[key].data);
     }
     return result;
+  }
+
+  if (value?.action === TASK_CONSENT_ACTION && larkAppId) {
+    const secret = readDispatchReportBindingSecret(config.session.dataDir);
+    const ok = secret && await answerDispatchTaskConsent(config.session.dataDir, secret, larkAppId, data);
+    return { toast: { type: ok ? 'success' : 'error', content: ok
+      ? value.choice === 'approve' ? '已授权本任务' : '已停止本任务的后续授权'
+      : '仅发起人可在原话题的有效授权卡上操作。' } };
   }
 
   if (

@@ -76,10 +76,10 @@ export interface DelegatedCliIdentity {
   dispatchRoot: string;
   /** `delegation_inactive`: a workflow handoff's delegation whose run attempt
    *  ended, or whose handoff was withdrawn (design 2026-11-03 §10.3). */
-  denialReason?: 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive'
+  denialReason?: 'target_chat_membership_required' | 'target_identity_unresolved' | 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive'
     /** A workflow delegation passed on from a node session into a session
      *  that keeps identities on disk: it could not be re-checked per use. */
-    | 'passed_on_unsupported';
+    | 'passed_on_unsupported' | 'task_turn_isolation_required';
   /** A workflow handoff's delegation (design 2026-11-03 §10). */
   workflowHandoff?: true;
   /** Workflow handoff only: re-run its run / attempt / revocation checks
@@ -87,6 +87,8 @@ export interface DelegatedCliIdentity {
    *  so a stop that never reached this daemon still ends it. Daemon memory
    *  only; never serialized. */
   recheck?: () => string | undefined;
+  /** Recheck a cross-chat task's signed user decision before publishing or renewing. */
+  taskAuthorized?: () => Promise<boolean>;
 }
 
 /** Replace one tool's published identity for `turnId` with the refusal for
@@ -277,15 +279,16 @@ async function publishToolIdentity(
 }
 
 function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): ToolIdentityOutcome {
-  const reason = user.denialReason === 'target_validation_unavailable'
-    ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
-    : user.denialReason === 'target_access_denied'
-      ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
-      : user.denialReason === 'delegation_inactive'
-        ? 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn), so the requester\'s identity no longer applies; do not request another login.'
-        : user.denialReason === 'passed_on_unsupported'
-          ? 'This workflow identity was passed on by another bot; it can only be used in a session that re-checks it on every call, and this session does not. Tools that need the person\'s authorization refuse here; do not request another login.'
-          : 'The source must ask the original human to authorize.';
+  const reasons = {
+    target_validation_unavailable: 'Target user or group membership verification is unavailable. Restore verification before retrying.',
+    target_access_denied: 'The target bot does not allow this requester to talk in the destination context.',
+    target_identity_unresolved: 'The target bot could not resolve the requester in its own application.',
+    target_chat_membership_required: 'The requester is outside the internal dispatch chat. Its membership rule blocked this task before credential issuance. Report to the original topic; another login will not change membership.',
+    task_turn_isolation_required: 'This task requires a thread session with proven per-turn identity isolation.',
+    delegation_inactive: 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn).',
+    passed_on_unsupported: 'This workflow identity was passed on by another bot; it can only be used in a session that re-checks it on every call.',
+  } satisfies Record<NonNullable<DelegatedCliIdentity['denialReason']>, string>;
+  const reason = user.denialReason ? reasons[user.denialReason] : 'The source must ask the original human to authorize.';
   try {
     writeSessionIdentity(args.sessionDataDir, args.sessionId, {
       tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),
@@ -335,7 +338,17 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
       if (token) identity = { tool, appId: args.botConfig.larkAppId, userAccessToken: token };
     }
   }
-  if (!identity) return denyDelegated(tool, args, user);
+  let taskHolds = true;
+  if (user.taskAuthorized) {
+    try {
+      taskHolds = await user.taskAuthorized();
+    } catch {
+      // Transient validation unavailability fails closed at publication; the
+      // renewal sweep treats the same throw as retryable rather than dropping.
+      taskHolds = false;
+    }
+  }
+  if (!identity || !taskHolds) return denyDelegated(tool, args, user);
   const stamped = withMeegoStore({
     ...identity,
     ...(args.turnId ? { turnId: args.turnId } : {}),
@@ -346,6 +359,7 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
     trackBytedcliIdentityRenewal({
       sessionDataDir: args.sessionDataDir, sessionId: args.sessionId,
       credentialOpenId: user.credentialOpenId, identity: { ...stamped, turnId: args.turnId },
+      taskAuthorized: user.taskAuthorized,
     });
   }
   return { tool, state: 'user' };
