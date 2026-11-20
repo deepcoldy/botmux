@@ -165,7 +165,7 @@ describe('new version notification configuration', () => {
     expect(parseMaintenancePatch({ notifyOnNewVersion: value }))
       .toEqual({ ok: true, patch: { notifyOnNewVersion: value } });
   });
-  it.each(['true', 1, null, {}, []])('rejects non-boolean opt-in: %s', value => {
+  it.each([['true'], [1], [null], [{}], [[]]])('rejects non-boolean opt-in: %s', value => {
     expect(parseMaintenancePatch({ notifyOnNewVersion: value }))
       .toEqual({ ok: false, error: 'invalid_notify_on_new_version' });
     writeFileSync(globalConfigPath(), JSON.stringify({ maintenance: { notifyOnNewVersion: value } }));
