@@ -108,9 +108,13 @@ function fixture() {
   const listeners = worker.listeners('message');
   expect(listeners).toHaveLength(1);
   const ipc = async (msg: WorkerToDaemon) => { await listeners[0](msg); };
-  const terminal = async (status: 'completed' | 'failed' | 'cancelled' | 'ambiguous', errorCode?: string) =>
-    ipc({ type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: TURN_ID, status, ...(errorCode ? { errorCode } : {}) });
-  return { ds, terminal };
+  const terminal = async (status: 'completed' | 'failed' | 'cancelled' | 'ambiguous', errorCode?: string, composerRefusal?: string) =>
+    ipc({
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: TURN_ID, status,
+      ...(errorCode ? { errorCode } : {}), ...(composerRefusal ? { composerRefusal } : {}),
+    });
+  const directInput = async () => ipc({ type: 'terminal_input', submitted: true, at: Date.now() });
+  return { ds, terminal, directInput };
 }
 
 beforeEach(() => {
@@ -138,11 +142,41 @@ describe('idle auto-compact settles on the real turn_terminal handler', () => {
     expect(ds.idleAutoCompactPendingNotice?.kind).toBe('interrupted');
   });
 
-  it('keeps the safe-composer refusal wording when the worker required proof', async () => {
+  it('a refused draft settles at once with the reason the worker gave', async () => {
     const { ds, terminal } = fixture();
-    await terminal('failed', 'safe_composer_required');
+    await terminal('failed', 'safe_composer_required', 'composer_not_empty');
     expect(ds.session.idleAutoCompact?.inFlight).toBeUndefined();
-    expect(ds.idleAutoCompactPendingNotice?.kind).toBe('refused');
+    expect(ds.session.idleAutoCompact?.handledIdleSince).toBe(1000);
+    expect(ds.idleAutoCompactPendingNotice).toEqual({ kind: 'refused', idleMinutes: 55, reason: 'draft', attempts: 1 });
+    expect(ds.idleAutoCompactDispatchedTurnId).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('an unrecognised input box releases the stretch for another try, saved, with no notice yet', async () => {
+    const { ds, terminal } = fixture();
+    await terminal('failed', 'safe_composer_required', 'prompt_not_framed');
+    expect(ds.session.idleAutoCompact?.inFlight).toBeUndefined();
+    expect(ds.session.idleAutoCompact?.handledIdleSince).toBeUndefined();
+    expect(ds.session.idleAutoCompact?.retry).toEqual({ stretch: 1000, attempts: 1, reason: 'unconfirmed' });
+    expect(ds.idleAutoCompactPendingNotice).toBeUndefined();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('a direct Web submit is persisted as user activity, not a local repaint', async () => {
+    const { ds, directInput } = fixture();
+    ds.session.idleAutoCompact!.retry = { stretch: 1000, attempts: 1, reason: 'unconfirmed' };
+    await directInput();
+    expect(ds.session.idleAutoCompact?.inFlight?.busyBeforeSettled).toBe(true);
+    expect(ds.session.idleAutoCompact?.retry).toBeUndefined();
+    expect(ds.session.idleAutoCompact?.handledIdleSince).toBe(1000);
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('a reason this daemon does not know reads as unknown, never as a draft', async () => {
+    const { ds, terminal } = fixture();
+    await terminal('failed', 'safe_composer_required', 'some_future_reason');
+    expect(ds.session.idleAutoCompact?.retry?.reason).toBe('unknown');
+    expect(ds.idleAutoCompactPendingNotice).toBeUndefined();
   });
 
   it('does not touch the marker when the compact completed', async () => {

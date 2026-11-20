@@ -26,7 +26,8 @@ vi.mock('../src/global-config.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../src/global-config.js')>(),
   readGlobalConfig: () => globalConfig,
 }));
-vi.mock('../src/services/statusline-snapshot.js', () => ({
+vi.mock('../src/services/statusline-snapshot.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/statusline-snapshot.js')>()),
   readStatuslineSnapshot: () => ({ ts: Date.now(), contextPercent: 40, contextWindowTokens: 1_000_000 }),
 }));
 

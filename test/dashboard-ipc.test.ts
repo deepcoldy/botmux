@@ -5683,7 +5683,7 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-restart', cliId: 'codex' });
     // Correlated through the restart coordinator (#1863): the attemptId-matched
     // restart_result is what lifts the workerReady fence after the respawn.
-    expect(send).toHaveBeenCalledWith({ type: 'restart', attemptId: expect.any(String), reason: 'operator' });
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'restart', attemptId: expect.any(String), reason: 'operator' }));
     findSpy.mockRestore();
   });
 

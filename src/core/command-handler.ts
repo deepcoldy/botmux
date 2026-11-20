@@ -6,7 +6,8 @@ import { forkManualTurn } from './manual-turn-dispatch.js';
 import { showDefaultModelPicker, showSessionModelPicker } from '../im/lark/session-model-picker.js';
 import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
 import { resetSessionCodexModelSelection, dshRuntimeForSession } from './worker-pool.js';
-import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, type GroupCreationArgs } from '../services/group-creation-options.js';
+import { formatSlashGroupName, parseGroupCreationArgs, resolveGroupCreationAgents, resolveGroupDecorations, knownGroupBotMentions, knownGroupBotNames, type GroupCreationArgs } from '../services/group-creation-options.js';
+import { groupTaskForwardIds, groupTaskPlaceholder, groupTaskPrompt, groupTaskPromptAttachments, groupTaskQuoteId, groupTaskSenderIsBot, startGroupTask, type GroupTaskPromptAttachment, type GroupTaskStartResult } from './group-task-start.js';
 /**
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
@@ -53,7 +54,7 @@ import { ALL_CLI_IDS, cliAliasesSelecting, createCliAdapterSync, resolveCliName 
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError, forwardMessage, getChatName } from '../im/lark/client.js';
 import type { OutboundMessageOptions } from '../im/lark/client.js';
 import { assertSendTopicsAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { prepareForkTopic } from '../im/lark/fork-topic.js';
@@ -62,7 +63,7 @@ import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
 import { isStoreFileUnavailableError } from '../utils/json-file.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
-import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
+import { normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
 import { updateReplyCardNativeThinking, replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
@@ -152,12 +153,12 @@ import { modelPinText } from './model-pin.js';
 import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
 import { loadSessionCodexReasoningCatalog } from '../services/codex-bot-reasoning-catalog.js';
 import { failedTurnRewindInFlight } from './failed-turn-rewind.js';
-import { messageMentionsBot } from '../im/lark/message-parser.js';
+import { messageMentionsBot, parseApiMessage, extractResources } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
 import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
+import { withBotTurnMutation, runDetachedBotTurnAdmission, withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { REWIND_CHECKPOINT_LIMIT, findCheckpoint, scanClaudeTranscriptCheckpoints, waitForTranscriptQuiet, withOpenTranscript, type RewindCheckpoint, type RewindResult } from './context-rewind.js';
 import { REWIND_BACKUP_RETENTION, pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './rewind-backup-retention.js';
 import { trackProcessExited, waitAllWithin } from './producer-quiescence.js';
@@ -572,12 +573,42 @@ function globalKnownBotNames(): Set<string> {
   try {
     const p = join(config.session.dataDir, 'bots-info.json');
     if (!existsSync(p)) return new Set();
-    const entries = botsInfoObjectEntries(JSON.parse(readFileSync(p, 'utf-8')))
-      .filter(isBotsInfoNameEntry);
-    return new Set(entries.map(e => e.botName.toLowerCase()));
+    return knownGroupBotNames(JSON.parse(readFileSync(p, 'utf-8')));
   } catch {
     return new Set();
   }
+}
+
+/** Read the quoted task only after the caller's talk check. The complete text
+ * and attachment metadata are needed by prompt.submit; failure must abort
+ * before group creation/quota rather than admitting an empty task. */
+async function quotedMessageTask(larkAppId: string, messageId: string): Promise<{
+  text: string;
+  attachments: GroupTaskPromptAttachment[];
+}> {
+  const detail = await getMessageDetail(larkAppId, messageId, { userCardContent: false, timeoutMs: 10000 });
+  const item = detail?.items?.[0];
+  if (!item || item.deleted) throw new Error('quoted_message_unavailable');
+  const rawContent = typeof item.body?.content === 'string' ? item.body.content : '';
+  const attachments = rawContent && item.msg_type
+    ? extractResources(item.msg_type, rawContent).map(({ type, name }) => ({ type, name }))
+    : [];
+  return { text: parseApiMessage(item).content.trim(), attachments };
+}
+
+/** Talk-only grants between the local bots that joined a `/g` task group,
+ *  skipping pairs already trusted as same-owner siblings. */
+async function ensureLocalGroupBotCollaboration(chatId: string, joinedBotAppIds: string[]): Promise<void> {
+  if (joinedBotAppIds.length < 2) return;
+  const dataDir = config.session.dataDir;
+  const { ensureBotChatGrantMatrix } = await import('../cli/exact-chat-grant-client.js');
+  const { loadDaemonIpcSecret } = await import('./daemon-ipc-auth.js');
+  const { trustsSameOwnerSiblingApp } = await import('../im/lark/event-dispatcher.js');
+  await ensureBotChatGrantMatrix(chatId, joinedBotAppIds, {
+    findDaemon: appId => findOnlineDaemon(appId, dataDir),
+    secret: () => loadDaemonIpcSecret(),
+    needsGrant: (receiver, subject) => !trustsSameOwnerSiblingApp(dataDir, receiver, subject),
+  });
 }
 
 /** Human-friendly name for a bot larkAppId — Lark app display name, else cliId, else the raw id. */
@@ -653,6 +684,19 @@ export interface CommandHandlerDeps {
   /** Immutable Lark placement captured by the daemon for this slash-command
    * invocation. Unlike session state, it remains valid after close/replace. */
   invocationReplyTarget?: FrozenSessionReplyTarget;
+  /** `/g <task>`: authorize, resolve the complete task behind that authorization,
+   *  run prompt.submit with its text + attachment metadata, then charge quota
+   *  before the group is created. False = refused (the gate already replied). */
+  admitTaskPrompt?: (input: {
+    larkAppId: string;
+    message: LarkMessage;
+    anchor: string;
+    content: string;
+    resolvePrompt?: () => Promise<{
+      promptContent: string;
+      promptAttachments: GroupTaskPromptAttachment[];
+    }>;
+  }) => Promise<boolean>;
   /** 会前预热文档评论会话：立即启动 CLI、读取文档并进入待命。 */
   prewarmDocCommentSession?: (ds: DaemonSession, sub: DocSubscription) => Promise<void>;
 }
@@ -5904,7 +5948,7 @@ export async function handleCommand(
         }
 
         // The @-mentioned bots, in mention order. The first one is the creator.
-        const botMentions = mentions.filter(m => m.name && knownBotNames.has(m.name.toLowerCase()));
+        const botMentions = knownGroupBotMentions(mentions, knownBotNames);
 
         // ── Leader election ──────────────────────────────────────────────────
         const mentionedBotAppIds: string[] = [];
@@ -5995,7 +6039,50 @@ export async function handleCommand(
           await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
           break;
         }
-        const firstLine = groupArgs.name;
+        // Task mode is opt-in (`--start`, or groupCreation.autoStart: true
+        // without `--no-start`): the chat is named from the text and this bot
+        // starts a fresh session there; a quoted message may carry the whole
+        // task. Otherwise `/g <text>` keeps its released meaning — a plain
+        // group named <text> — and a bare `/g` is titled from its first message.
+        const taskMode = groupArgs.autoStart === true;
+        const taskText = taskMode ? groupArgs.body : '';
+        const quoteId = taskMode ? groupTaskQuoteId(message) : undefined;
+        const autoStart = !!taskText || !!quoteId;
+        const commandAttachments = taskMode ? groupTaskPromptAttachments(message) : [];
+        let quotedTask: { text: string; attachments: GroupTaskPromptAttachment[] } | undefined;
+        let quotedTaskPromise: Promise<{ text: string; attachments: GroupTaskPromptAttachment[] }> | undefined;
+        const loadQuotedTask = () => quotedTaskPromise ??= quotedMessageTask(creatorAppId, quoteId!);
+        const resolvePrompt = async () => {
+          // enforceMessageQuotaForCliInput invokes this only AFTER evaluateTalk:
+          // an unauthorized sender cannot make the bot fetch the quote.
+          if (quoteId) quotedTask = await loadQuotedTask();
+          return {
+            promptContent: [taskText, quotedTask?.text ?? ''].filter(Boolean).join('\n'),
+            promptAttachments: [...commandAttachments, ...(quotedTask?.attachments ?? [])],
+          };
+        };
+        // The task reaches a CLI like any message: authorize, resolve the full
+        // prompt behind that boundary, run prompt.submit and charge quota before
+        // any external side effect. A false refusal is already reported (or
+        // deliberately silent) by the gate.
+        if (autoStart) {
+          try {
+            if (deps.admitTaskPrompt && !await deps.admitTaskPrompt({
+              larkAppId: creatorAppId, message, anchor: rootId, content: taskText, resolvePrompt,
+            })) break;
+            // Direct handler callers without an admission hook still need the
+            // title seed; production resolves and caches it inside the gate.
+            if (quoteId && !quotedTask) quotedTask = await loadQuotedTask();
+          } catch (err: any) {
+            logger.warn(`[${logTag}] /group task admission failed before chat creation: ${err?.message ?? err}`);
+            await sessionReply(rootId, quoteId
+              ? t('cmd.group.quote_read_failed', undefined, loc)
+              : t('cmd.group.failed', { error: err?.message ?? String(err) }, loc));
+            break;
+          }
+        }
+        const titleSeed = autoStart ? taskText || quotedTask?.text || '' : '';
+        const firstLine = autoStart ? groupTaskPlaceholder(titleSeed) : groupArgs.name;
         let baseGroupName: string;
         if (firstLine) {
           baseGroupName = firstLine;
@@ -6012,15 +6099,66 @@ export async function handleCommand(
         // placeholder simply stays (same silent degrade).
         const decorations = resolveGroupDecorations(groupArgs);
         const { oneShotTitleAllowed } = await import('../services/session-group-title.js');
-        const autoTitle = decorations.autoTitle && oneShotTitleAllowed(getBot(creatorAppId).config);
+        const autoTitle = (autoStart ? !!titleSeed : decorations.autoTitle)
+          && oneShotTitleAllowed(getBot(creatorAppId).config);
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).
         const larkAppIdsForGroup = [...new Set([creatorAppId, ...mentionedBotAppIds, ...configuredAgentIds])];
 
+        let createdChatId: string | undefined;
+        let reservedSessionId: string | undefined;
+        let sourceReplyStarted = false;
+        let taskPrompt = '';
+        let taskSessionManager: typeof import('./session-manager.js') | undefined;
+        const taskSenderIsBot = autoStart && groupTaskSenderIsBot(
+          message,
+          getBot(creatorAppId).botOpenId,
+          isKnownPeerBot(config.session.dataDir, creatorAppId, senderOpenId),
+        );
+        let reservedTaskAttempt: Promise<GroupTaskStartResult> | undefined;
+        const runReservedTask = (chatId: string): Promise<GroupTaskStartResult> => {
+          reservedTaskAttempt ??= (async () => {
+            if (!taskSessionManager || !reservedSessionId) {
+              return { forwardFailed: [], startError: 'session_not_reserved' };
+            }
+            const expectedSessionId = reservedSessionId;
+            return startGroupTask(chatId, groupTaskForwardIds(message), taskPrompt, {
+              forward: (id, targetChatId) => forwardMessage(creatorAppId, id, targetChatId),
+              startSession: async (targetChatId, _content) => {
+                const ds = activeSessions.get(sessionKey(targetChatId, creatorAppId));
+                // Never replace a newer generation or spawn a second session.
+                if (!ds || ds.session.sessionId !== expectedSessionId) {
+                  return { ok: false, error: 'session_exists' };
+                }
+                const activated = await withBotTurnAdmission(creatorAppId,
+                  () => taskSessionManager!.activateQueuedSession(ds));
+                return activated.ok ? { ok: true } : { ok: false, error: activated.error ?? 'start_failed' };
+              },
+            });
+          })();
+          return reservedTaskAttempt;
+        };
+        const taskStartHints = (taskStart: GroupTaskStartResult): string[] => [
+          ...(taskStart.startError ? [t('cmd.group.start_failed', { reason: taskStart.startError }, loc)] : []),
+          ...(taskStart.pendingRepo === 'picker' ? [t('cmd.group.start_pending_repo', undefined, loc)] : []),
+          ...(taskStart.pendingRepo === 'auto_worktree' ? [t('cmd.group.start_pending_worktree', undefined, loc)] : []),
+          ...(taskStart.forwardFailed.length ? [t('cmd.group.forward_failed', undefined, loc)] : []),
+        ];
+
         try {
           const { createGroupWithBots } = await import('../services/group-creator.js');
-          const { registerGroupAutoTitle } = await import('../services/group-auto-title.js');
+          const { registerGroupAutoTitle, scheduleGroupAutoTitle } = await import('../services/group-auto-title.js');
+          if (autoStart) {
+            taskSessionManager = await import('./session-manager.js');
+            const chatName = message.chatType === 'p2p' || !sourceChatId
+              ? undefined
+              : (await getChatName(creatorAppId, sourceChatId)) ?? undefined;
+            taskPrompt = groupTaskPrompt({
+              chatId: sourceChatId ?? '', chatType: message.chatType, chatName, messageId: message.messageId,
+              threadId: message.threadId, rootId: message.rootId, parentId: quoteId, task: taskText,
+            }, loc);
+          }
           // Settles when createGroupWithBots returns or throws, i.e. after its
           // initial avatar; a fast AI title waits on it before re-rendering.
           let settleDecorations!: () => void;
@@ -6033,17 +6171,39 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
             roleProfileId,
+            // A task group is worked on by its bots together; let them @ each
+            // other without approval, as `botmux create-group` does.
+            ...(autoStart ? {
+              ensureBotCollaboration: ensureLocalGroupBotCollaboration,
+              deferUserInvites: true as const,
+            } : {}),
             ...((groupArgs.tag || decorations.avatar) ? {
               customization: { tag: groupArgs.tag, avatar: decorations.avatar, userOpenId: senderOpenId },
             } : {}),
-            // Register as soon as the chat exists: the invited sender can type
-            // in it while invites / owner transfer are still running.
-            ...(autoTitle ? {
-              onChatCreated: (chatId: string) => registerGroupAutoTitle(creatorAppId, chatId, {
-                placeholderName: groupName,
-                namePrefix: namePrefix || undefined,
-                nameAvatar: decorations.avatar === 'name' || undefined,
-              }, decorationsSettled),
+            // Reserve the original task at the durable chat boundary, BEFORE
+            // deferred user invites. A fast first message then joins this queued
+            // opening instead of winning session_exists and losing the task.
+            ...((autoTitle || autoStart) ? {
+              onChatCreated: async (chatId: string) => {
+                createdChatId = chatId;
+                if (autoTitle) registerGroupAutoTitle(creatorAppId, chatId, {
+                  placeholderName: groupName,
+                  namePrefix: namePrefix || undefined,
+                  nameAvatar: decorations.avatar === 'name' || undefined,
+                }, decorationsSettled);
+                if (autoStart) {
+                  const reserved = await withBotTurnAdmission(creatorAppId,
+                    () => taskSessionManager!.spawnDashboardSession(activeSessions, undefined, {
+                      larkAppId: creatorAppId, chatId, content: taskPrompt, column: 'backlog', role: 'solo', title: groupName,
+                      postBanner: false,
+                      ownerOpenId: taskSenderIsBot ? null : senderOpenId,
+                      ownerUnionId: taskSenderIsBot ? undefined : message.senderUnionId,
+                      creatorOpenId: senderOpenId,
+                    }));
+                  if (!reserved.ok) throw new Error(reserved.error);
+                  reservedSessionId = reserved.sessionId;
+                }
+              },
             } : {}),
           }).finally(settleDecorations);
           // Prefer the shareable join link (others can click to *join*); fall
@@ -6052,8 +6212,20 @@ export async function handleCommand(
           const link = result.shareLink ?? applink;
           // Partial failures are non-fatal — the chat exists; surface them as
           // hints so the user knows whether to expect to be auto-invited.
+          let taskStart: GroupTaskStartResult | undefined;
+          if (autoStart) {
+            if (autoTitle) scheduleGroupAutoTitle({ larkAppId: creatorAppId, chatId: result.chatId, userText: titleSeed });
+            taskStart = await runReservedTask(result.chatId);
+            const pendingSetup = activeSessions.get(sessionKey(result.chatId, creatorAppId))?.session.pendingRepoSetup;
+            if (!taskStart.startError && activeSessions.get(sessionKey(result.chatId, creatorAppId))?.pendingRepo) {
+              taskStart.pendingRepo = pendingSetup?.mode ?? 'picker';
+            }
+            logger.info(`[${logTag}] /group task chat=${result.chatId} forwardFailed=${taskStart.forwardFailed.length} startError=${taskStart.startError ?? '-'}`);
+          }
           const hints: string[] = [];
-          if (autoTitle) hints.push(t('cmd.group.auto_title_pending', undefined, loc));
+          if (autoTitle) hints.push(t(autoStart ? 'cmd.group.auto_title_task' : 'cmd.group.auto_title_pending', undefined, loc));
+          if (taskStart) hints.push(...taskStartHints(taskStart));
+          if (result.collaborationError) hints.push(t('cmd.group.collaboration_failed', { reason: result.collaborationError }, loc));
           if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
           if (result.customization?.tagError) hints.push(t('cmd.group.tag_failed', { reason: result.customization.tagError }, loc));
           if (result.invalidUserIds.includes(senderOpenId)) {
@@ -6087,15 +6259,40 @@ export async function handleCommand(
             }
           }
           const hintsText = hints.length > 0 ? '\n' + hints.join('\n') : '';
-          await sessionReply(rootId, t('cmd.group.created', { name: groupName, link, hints: hintsText }, loc));
+          sourceReplyStarted = true;
+          await sessionReply(rootId, t(autoStart ? 'cmd.group.started' : 'cmd.group.created', { name: groupName, link, hints: hintsText }, loc));
           logger.info(`[${logTag}] /group created chat=${result.chatId} name="${groupName}" bots=[${larkAppIdsForGroup.join(',')}] invitee=${senderOpenId} autoTitle=${autoTitle} avatar=${decorations.avatar ?? '-'}`);
-          // Intentionally NO auto-bootstrap (repo-select card / chat-scope
-          // session) here: the group name rarely carries enough context to seed
-          // a useful prompt. The user starts a real conversation with the bot in
-          // the new group, which spawns the session on first message.
+          // Outside task mode there is intentionally NO auto-bootstrap
+          // (repo-select card / chat-scope session): a group name rarely
+          // carries enough context to seed a useful prompt. The user starts a
+          // real conversation in the new group, which spawns the session.
         } catch (err: any) {
           logger.error(`[${logTag}] /group failed: ${err?.message ?? err}`);
-          await sessionReply(rootId, t('cmd.group.failed', { error: err?.message ?? String(err) }, loc));
+          // A source-reply failure is not a setup failure. Do not re-run
+          // forwarding/activation or send a second, contradictory receipt.
+          if (sourceReplyStarted) throw err;
+          if (autoStart && createdChatId) {
+            const chatId = createdChatId;
+            const link = chatAppLink(chatId, normalizeBrand(getBot(creatorAppId).config.brand));
+            if (reservedSessionId) {
+              // The chat and durable opening already exist. Do not strand the
+              // original task merely because a later setup step failed.
+              const taskStart = await runReservedTask(chatId);
+              const hints = [
+                t('cmd.group.setup_failed', { reason: err?.message ?? String(err) }, loc),
+                ...taskStartHints(taskStart),
+              ];
+              await sessionReply(rootId, t('cmd.group.started', {
+                name: groupName, link, hints: `\n${hints.join('\n')}`,
+              }, loc));
+            } else {
+              await sessionReply(rootId, t('cmd.group.reservation_failed', {
+                name: groupName, reason: err?.message ?? String(err), link,
+              }, loc));
+            }
+          } else {
+            await sessionReply(rootId, t('cmd.group.failed', { error: err?.message ?? String(err) }, loc));
+          }
         }
         break;
       }

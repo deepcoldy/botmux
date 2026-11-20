@@ -23,21 +23,52 @@ export class PromptSuggestionPublisher {
     this.onScreen = { text, turnKey: turnKey(turn) };
   }
 
-  take(status: string, turn: { turnId?: string; dispatchAttempt?: number }): PromptSuggestionNotice | undefined {
+  /** `reportAs`: the turn the suggestion answers when it is not the one
+   * owning the screen (see promptSuggestionReportTurn). */
+  take(
+    status: string,
+    turn: { turnId?: string; dispatchAttempt?: number },
+    reportAs: { turnId?: string; dispatchAttempt?: number } = turn,
+  ): PromptSuggestionNotice | undefined {
     const text = this.onScreen.text;
-    if (status !== 'idle' || !text || !turn.turnId) return undefined;
+    if (status !== 'idle' || !text || !turn.turnId || !reportAs.turnId) return undefined;
     // A frame captured before the screen changed hands (a new turn's input is
     // written but not echoed yet) still shows the previous turn's suggestion.
     if (this.onScreen.turnKey !== turnKey(turn)) return undefined;
-    const key = JSON.stringify([turnKey(turn), text]);
+    const key = JSON.stringify([turnKey(reportAs), text]);
     if (key === this.lastSent) return undefined;
     this.lastSent = key;
     return {
       text,
-      turnId: turn.turnId,
-      ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      turnId: reportAs.turnId,
+      ...(reportAs.dispatchAttempt !== undefined ? { dispatchAttempt: reportAs.dispatchAttempt } : {}),
     };
   }
+}
+
+/** A type-ahead turn the CLI folded into the turn owning the screen (`into`). */
+export interface FoldedTypeAheadTurn {
+  turnId: string;
+  dispatchAttempt?: number;
+  into?: string;
+}
+
+/**
+ * The turn a suggestion on screen answers. Input typed while a turn runs can
+ * be folded into it by the CLI: both end together, the folded turn's record is
+ * retired at its terminal, and the screen keeps belonging to the earlier turn
+ * — while the session's latest turn, and its last reply card, is the folded
+ * one. Once the screen's own turn has ended, the suggestion answers the newest
+ * turn folded into it.
+ */
+export function promptSuggestionReportTurn(
+  current: { turnId?: string; dispatchAttempt?: number },
+  folded: FoldedTypeAheadTurn | undefined,
+  ended: (turnId: string, dispatchAttempt?: number) => boolean,
+): { turnId?: string; dispatchAttempt?: number } {
+  if (!current.turnId || !ended(current.turnId, current.dispatchAttempt)) return current;
+  if (!folded || folded.into !== current.turnId) return current;
+  return { turnId: folded.turnId, dispatchAttempt: folded.dispatchAttempt };
 }
 
 function turnKey(turn: { turnId?: string; dispatchAttempt?: number }): string {

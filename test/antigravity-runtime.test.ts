@@ -66,9 +66,25 @@ describe('Antigravity native runtime model', () => {
   it('reports an initial model and DB-only changes even before a transcript exists', async () => {
     const db = database('native-a', 'model-first'); const onRuntime = vi.fn(); const onEntries = vi.fn();
     startAntigravityCot('native-a', onEntries, { brainDir, onRuntime, pollIntervalMs: 10 });
-    expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-first' }); expect(onEntries).not.toHaveBeenCalled();
+    expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-first' }, { seeded: true }); expect(onEntries).not.toHaveBeenCalled();
     insert(db, 2, 'model-next'); await vi.advanceTimersByTimeAsync(20);
     expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-next' }); expect(onEntries).not.toHaveBeenCalled();
+  });
+
+  it('keeps the historical model seeded when a DB-only write adds no metadata row', async () => {
+    const db = database('native-a', 'model-first');
+    db.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;');
+    const onRuntime = vi.fn();
+    startAntigravityCot('native-a', () => {}, { brainDir, onRuntime, pollIntervalMs: 10 });
+    expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-first' }, { seeded: true });
+
+    db.exec('PRAGMA user_version=1');
+    await vi.advanceTimersByTimeAsync(20);
+    expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-first' }, { seeded: true });
+
+    insert(db, 2, 'model-next');
+    await vi.advanceTimersByTimeAsync(20);
+    expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-next' });
   });
 
   it('does not reopen SQLite for an unchanged model, but sees WAL-only commits', async () => {
@@ -86,7 +102,7 @@ describe('Antigravity native runtime model', () => {
     const db = database('native-a', 'model-first'); const opened = vi.spyOn(sqliteCompat, 'openDatabaseSyncNow'); const onRuntime = vi.fn();
     startAntigravityCot('native-a', () => {}, { brainDir, onRuntime, pollIntervalMs: 10 });
     insert(db, 2, 'model-next'); opened.mockReturnValueOnce(null);
-    await vi.advanceTimersByTimeAsync(10); expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-first' });
+    await vi.advanceTimersByTimeAsync(10); expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-first' }, { seeded: true });
     await vi.advanceTimersByTimeAsync(10); expect(onRuntime).toHaveBeenLastCalledWith({ model: 'model-next' });
   });
 
