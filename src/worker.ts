@@ -42,8 +42,7 @@ import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { PromptSuggestionPublisher, promptSuggestionReportTurn, type FoldedTypeAheadTurn } from './utils/prompt-suggestion-publisher.js';
-import { CliRecapObserver, RECAP_MODEL_SYSTEM_PROMPT, TurnRecapRecorder } from './services/turn-recap.js';
-import { recapModelLaunchFor, runRecapModel, type RecapModelLaunch } from './services/turn-recap-runner.js';
+import { CliRecapObserver } from './services/turn-recap.js';
 import { WrittenInputLedger } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
@@ -9916,13 +9915,6 @@ const emittedRateLimitUuids = new Set<string>();
 /** Claude Code's away summaries (「本轮回顾」), forwarded once each for the
  *  turn they recap. */
 const cliRecapObserver = new CliRecapObserver();
-/** What each turn did, for its「本轮回顾」: every activity entry counts here,
- *  unlike the capped CoT buffer below. Sent just before a completed terminal. */
-const turnRecapRecorder = new TurnRecapRecorder();
-/** How to run the optional model recap for the current CLI: its own binary
- *  and env, recorded at spawn. Undefined when the adapter has none or the CLI
- *  is not a plain local one (sandbox, read isolation, wrapper, adopt). */
-let recapModelLaunch: RecapModelLaunch | undefined;
 /** Codex collaboration sub-agents spawned during live ingest. Their quota
  *  failures land in their own rollouts and reach the parent only as tool
  *  results, so they are tailed separately and fed into the same structured
@@ -10203,7 +10195,6 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
     const withoutSentinel = cotEntryWithoutSentinel(entry);
     return withoutSentinel ? [withoutSentinel] : [];
   });
-  turnRecapRecorder.observe(turn, kept);
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
@@ -12438,13 +12429,6 @@ function bridgeIngest(): void {
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
   emitReadyTurns({ explicitTerminalOnly: true });
-}
-
-/** One optional「本轮回顾」model recap for the daemon. */
-async function answerRecapRequest(requestId: string, prompt: string): Promise<void> {
-  const launch = recapModelLaunch;
-  const outcome = launch ? await runRecapModel(launch, prompt) : { error: 'unavailable for this CLI' };
-  send({ type: 'recap_result', requestId, ...outcome });
 }
 
 /** Scan newly-drained Claude transcript events for a structured rate-limit
@@ -29730,21 +29714,6 @@ async function spawnCliBody(
   const reproduceBaseBin = spawnBin;
   const reproduceBaseArgs = [...spawnArgs];
 
-  // The optional「本轮回顾」model recap: the same binary and env, outside any terminal.
-  recapModelLaunch = recapModelLaunchFor({
-    recapModel: cliAdapter.recapModel,
-    systemPrompt: RECAP_MODEL_SYSTEM_PROMPT,
-    bin: spawnBin,
-    env: { ...childEnv, ...perBotInjectEnv },
-    cwd: cfg.workingDir,
-    backend: effectiveBackendType,
-    sandboxed: sandboxRequested,
-    readIsolated: !!isolationBotHome,
-    wrapped: !!cfg.wrapperCli,
-    adopted: !!cfg.adoptMode,
-    credentialIsolated: credentialIsolationGate.required,
-  });
-
   // CJADK_INTERACTIVE is a cjadk-only knob we set on the cjadk wrapper branch
   // (applyWrapperCliLaunch). Strip any value inherited from the daemon's own
   // env first so a daemon launched under `cjadk feishu` (which exports it)
@@ -37623,10 +37592,6 @@ function emitTurnTerminal(
     ...(directFailure ? { directFailure: true as const } : {}),
     ...(composerRefusal && errorCode === 'safe_composer_required' ? { composerRefusal } : {}),
   };
-  // The「本轮回顾」material first: the daemon reads it when the terminal lands.
-  const recapInput = status === 'completed'
-    ? turnRecapRecorder.input({ turnId, dispatchAttempt }, lastInitConfig?.workingDir) : undefined;
-  if (recapInput) send({ type: 'recap_input', turnId, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}), ...recapInput });
   const scope = workerSessionEventScope;
   if (continuationFailure && scope) {
     scope.reportContinuationFailure(continuationFailure, () => {
@@ -40311,11 +40276,6 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'goal_update_ack': {
       if (msg.signature === nativeGoalPendingSignature) nativeGoalSignature = msg.signature;
-      break;
-    }
-
-    case 'recap_request': {
-      void answerRecapRequest(msg.requestId, msg.prompt);
       break;
     }
 

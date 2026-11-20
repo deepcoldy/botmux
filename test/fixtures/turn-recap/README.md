@@ -5,16 +5,11 @@
   the `(disable recaps in /config)` hint Claude Code appends to its first few
   summaries, one without). `cwd` was replaced and one repository name in the
   second summary was generalized; everything else is as written.
-- `claude-p-recap.json`, `claude-p-recap-heading.json`: stdout of the
-  optional model recap (`CLAUDE_RECAP_MODEL` in `src/adapters/cli/claude-code.ts`,
-  Claude Code 2.1.325) run on two real turn records. The second answer opens
-  with a markdown heading although the instructions ask for plain text. A bot
-  name in the first answer was generalized.
-- `claude-p-model-error.json`: stdout of the same print mode for a model the
-  account cannot use (`is_error: true`, exit status 1).
+- `claude-away-summary-2.1.326.jsonl`: one such record from a live Claude Code
+  2.1.326 session, whose hint reads `(turn off recaps in /config)` (the
+  wording since 2.1.326). `cwd` was replaced; everything else is as written.
 - `claude-tool-calls.jsonl`: six assistant `tool_use` records (Bash, Read,
   Write, Edit) from a live Claude Code session working in this repository.
   The checkout path was replaced with `/work/app`, edit and write bodies with
-  `…`, and fields the recap does not read were dropped.
-- `codex-exec-command.jsonl`: two `exec_command` function calls from a live
-  Codex rollout; the home directory in them was replaced with `/home/user`.
+  `…`, and fields the recap does not read were dropped. Used as records that
+  are not a recap.
