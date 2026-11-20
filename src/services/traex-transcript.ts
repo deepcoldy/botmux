@@ -1873,3 +1873,8 @@ export function findTraexSessionIdByBotmuxSessionId(botmuxSessionId: string): st
     return undefined;
   }) ?? undefined;
 }
+
+/** One exact-id resolution path for launch arguments and resume receipts. */
+export function resolveTraexResumeSessionId(botmuxSessionId?: string, persistedNativeId?: string): string | undefined {
+  return persistedNativeId || (botmuxSessionId ? findTraexSessionIdByBotmuxSessionId(botmuxSessionId) : undefined);
+}
