@@ -31,6 +31,7 @@ import { drainTraexRollout } from '../src/services/traex-transcript.js';
 import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
+import { allowsPersonalIdentityForTurn } from '../src/core/workflow-event-turn.js';
 import { validateCodexAppManagedSendOrigin } from '../src/utils/codex-app-dispatch-ledger.js';
 import {
   isDispatchOriginNotSendableError,
@@ -77,6 +78,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     lookupMessageChatId: vi.fn(async () => 'oc_target'), readGroupCollaborationMode: () => undefined,
     evaluateProjectDispatchPolicy: vi.fn(() => ({ ok: true })),
     getBot: () => ({ config: { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } } }),
+    allowsPersonalIdentityForTurn,
     dispatchUserForTurn: vi.fn(async () => undefined),
     targetUserForDelegation: vi.fn(async () => 'ou_alice_target'),
     fallbackTurnId, frozenReplyContextForTurn,
@@ -165,6 +167,16 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
 }
 
 describe('dispatch user IPC end-to-end identity binding', () => {
+  it('does not sign a personal delegation for an owner actor with no opt-in', async () => {
+    const h = harness({ originTurnId: 'trg_owner_fixture' });
+    h.ds.managedTurnOrigin.turnId = 'trg_owner_fixture';
+    h.ds.activeInteractiveTurn.turnId = 'trg_owner_fixture';
+    expect((await h.run()).status).toBe(200);
+    expect(h.send).toHaveBeenCalledOnce();
+    expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
   const dispatchOnly = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_target'] };
   const restrictSource = (h: ReturnType<typeof harness>) => {
     h.scope.getBot = () => ({ config: { triggerUserAuth: {

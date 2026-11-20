@@ -15,6 +15,7 @@ import {
 } from '../src/core/dispatch-user-delegation.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { delegatesOnMention, dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
+import { allowsPersonalIdentityForTurn } from '../src/core/workflow-event-turn.js';
 import { pickTurnReplyTarget } from '../src/core/reply-target.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
@@ -83,7 +84,7 @@ function harness(options: {
       options.delegatedUserAllowed === false ? undefined : user.openId),
     getBot: () => ({ config: { larkAppId: appId,
       triggerUserAuth: 'triggerUserAuth' in options ? options.triggerUserAuth : { enabled: true, tools: ['bytedcli'] } } }),
-    delegatesOnMention, dispatchOnlyToolsForTurn,
+    delegatesOnMention, dispatchOnlyToolsForTurn, allowsPersonalIdentityForTurn,
     loadBotConfigsCached: () => (options.localBots ?? ['cli_source', 'cli_target', 'cli_third']).map(larkAppId => ({ larkAppId })),
     authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
     resolveUnionIdFromOpenId: vi.fn(async () => 'on_alice'),
