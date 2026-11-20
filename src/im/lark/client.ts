@@ -1,7 +1,6 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
 import { readFileSync, writeFileSync, createWriteStream, createReadStream, mkdirSync, mkdtempSync, rmSync, statSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { once } from 'node:events';
 import { dirname, extname, basename, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
@@ -2122,65 +2121,81 @@ export async function uploadImage(larkAppId: string, imagePath: string | Buffer)
 
 export async function uploadFile(larkAppId: string, source: string | { name: string; bytes: Buffer }, opts?: { duration?: number }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
-  return executeWithLarkGate(larkAppId, 'uploadFile', async () => {
-    const c = getBotUploadClient(larkAppId);
-    const fileName = basename(typeof source === 'string' ? source : source.name);
-    const ext = extname(fileName).toLowerCase();
-    const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
-    // `duration` (ms) only applies to opus voice uploads — it sets the length
-    // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
-    const duration = fileType === 'opus' && opts?.duration
-      ? Math.max(1000, Math.round(opts.duration))
-      : undefined;
-    // The `file` part must be a file stream, not a Buffer. The SDK hands `data`
-    // to axios, which appends a Buffer to form-data WITHOUT a filename; Feishu
-    // then treats the part as a plain form field and rejects it with
-    // 400 code=9499 once it passes ~25–26MiB (the documented file limit is
-    // 30MiB). An fs.ReadStream carries `path`, so form-data emits
-    // `filename=` and a known Content-Length. In-memory sources are spilled to
-    // a temp file for the same reason. Built per attempt: the gate may retry
-    // and a consumed stream cannot be resent.
-    let tmpDir: string | undefined;
-    let file: ReturnType<typeof createReadStream> | undefined;
-    try {
-      let filePath: string;
-      if (typeof source === 'string') {
-        filePath = source;
-      } else {
+  const fileName = basename(typeof source === 'string' ? source : source.name);
+  const ext = extname(fileName).toLowerCase();
+  const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
+  // `duration` (ms) only applies to opus voice uploads — it sets the length
+  // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
+  const duration = fileType === 'opus' && opts?.duration
+    ? Math.max(1000, Math.round(opts.duration))
+    : undefined;
+  // The `file` part must be a file stream, not a Buffer. The SDK hands `data`
+  // to axios, which appends a Buffer to form-data WITHOUT a filename; Feishu
+  // then treats the part as a plain form field and rejects it with
+  // 400 code=9499 once it passes ~25–26MiB (the documented file limit is
+  // 30MiB). An fs.ReadStream carries `path`, so form-data emits `filename=`.
+  // form-data also trusts stat(path).size for Content-Length, which is not
+  // reliable for FIFOs or virtual files (both can report zero while yielding
+  // bytes). Stage those sources and in-memory bytes ONCE before the gate: a
+  // one-shot FIFO must never be reopened for a retry. Ordinary non-empty files
+  // still stream directly, with a fresh stream for every attempt.
+  let tmpDir: string | undefined;
+  try {
+    let filePath: string;
+    if (typeof source === 'string') {
+      const sourceStat = statSync(source);
+      filePath = source;
+      if (!sourceStat.isFile() || sourceStat.size === 0) {
         tmpDir = mkdtempSync(join(tmpdir(), 'botmux-upload-'));
         filePath = join(tmpDir, fileName);
-        writeFileSync(filePath, source.bytes);
+        await pipeline(createReadStream(source), createWriteStream(filePath));
       }
+    } else {
+      tmpDir = mkdtempSync(join(tmpdir(), 'botmux-upload-'));
+      filePath = join(tmpDir, fileName);
+      writeFileSync(filePath, source.bytes);
+    }
+    return await executeWithLarkGate(larkAppId, 'uploadFile', async () => {
+      const c = getBotUploadClient(larkAppId);
       const size = statSync(filePath).size;
-      file = createReadStream(filePath);
-      let res: { file_key?: string } | null | undefined;
+      const file = createReadStream(filePath);
       try {
         // SDK returns { file_key } directly (not wrapped in { code, data })
-        res = await c.im.v1.file.create({
+        const res: { file_key?: string } | null | undefined = await c.im.v1.file.create({
           data: { file_type: fileType as any, file_name: fileName, file, ...(duration ? { duration } : {}) },
         });
+        const fileKey = res?.file_key;
+        if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
+        logger.info(`Uploaded file ${fileName} (${size} bytes) → ${fileKey}`);
+        return fileKey;
       } catch (err) {
-        logger.warn(`Upload file ${fileName} failed (size=${size} bytes, file_type=${fileType}): ${formatLarkError(err)}`);
+        logger.warn(`Upload file ${fileName} failed (size=${size} bytes, file_type=${fileType}): ${formatLarkError(err) ?? (err instanceof Error ? err.message : String(err))}`);
         throw err;
+      } finally {
+        if (!file.closed) {
+          // events.once(file, 'close') would reject on a teardown-time error,
+          // replacing the SDK result/error and skipping the outer temp cleanup.
+          // Only close settles this wait; the error listener prevents an
+          // uncaught exception while destroy() completes the close lifecycle.
+          await new Promise<void>((resolve) => {
+            file.once('close', resolve);
+            file.on('error', () => {});
+            file.destroy();
+          });
+        }
       }
-      const fileKey = res?.file_key;
-      if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-      logger.info(`Uploaded file ${fileName} (${size} bytes) → ${fileKey}`);
-      return fileKey;
-    } finally {
-      // A request that fails before reading the stream would otherwise leave
-      // the fd open. Destroy it and wait for the close before removing a temp
-      // file; the no-op listener keeps a teardown-time error (e.g. the open
-      // still in flight) from surfacing as an uncaught exception.
-      if (file && !file.closed) {
-        file.on('error', () => {});
-        const closed = once(file, 'close');
-        file.destroy();
-        await closed;
+    });
+  } finally {
+    if (tmpDir) {
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (err) {
+        // Cleanup is best-effort: never turn an uploaded file_key into a failure
+        // or hide the original upload error behind a local rm failure.
+        logger.warn(`Failed to remove upload temp dir ${tmpDir}: ${err instanceof Error ? err.message : String(err)}`);
       }
-      if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
     }
-  });
+  }
 }
 
 /**
