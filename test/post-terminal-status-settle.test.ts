@@ -1656,5 +1656,228 @@ describe('starting card health watchdog', () => {
     });
     await expect(async () => { await beforeWrite(); }).rejects.toThrow();
   });
+
+  it('rejects restored starting when attempts advance twice before write admission', async () => {
+    let beforeWrite!: () => Promise<void>;
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementationOnce((...args: any[]) => {
+      beforeWrite = args[3].beforeWrite;
+      return new Promise<void>(resolve => { releaseRestore = resolve; });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    noteTurnDispatchAttempt(ds, 'turn-previous', 7);
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0,
+    });
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: TURN, dispatchAttempt: 1,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(async () => { await beforeWrite(); }).rejects.toThrow('Restored card no longer owns delivery');
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+  });
+
+  it('corrects a late restored starting write after the original idle settle delivered', async () => {
+    const delivered: string[] = [];
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const status = JSON.parse(String(args[2])).status;
+      const opts = args[3];
+      if (!releaseRestore) {
+        return new Promise<void>(resolve => {
+          releaseRestore = () => { delivered.push(status); resolve(); };
+        });
+      }
+      return Promise.resolve().then(async () => {
+        if (opts?.beforeWrite) await opts.beforeWrite();
+        delivered.push(status);
+      });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    // Residual output supplies busy execution evidence without bumping the card revision.
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'residual busy', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(delivered).toEqual(['idle']);
+
+    // The older starting write lands after that correction and must be idled again.
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(delivered).toEqual(['idle', 'starting', 'idle']);
+  });
+
+  it('keeps the late-publication correction receipt for a direct-submit repaint', async () => {
+    let resolvePost!: (messageId: string) => void;
+    initWorkerPool({
+      sessionReply: vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+    const ds = setupStartingDs();
+    ds.streamCardId = undefined;
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+    (ds.worker as any).emit('message', terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(0);
+    resolvePost('om_start_pending_completed_receipt');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('idle');
+
+    // A residual busy frame updates execution state without touching the idle card.
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'residual busy', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.lastScreenStatus).toBe('working');
+    expect(lastPatchedStatus()).toBe('idle');
+
+    // The ordinary same-value frame needs the delivered receipt to repaint live work.
+    (ds.worker as any).emit('message', { type: 'direct_submit_started' });
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'direct busy', status: 'working', turnId: TURN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lastPatchedStatus()).toBe('working');
+  });
+
+  it('installs idle instead of leaving starting forever after a remote backend exit', async () => {
+    const ds = setupStartingDs();
+    ds.session.backendType = 'riff';
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', {
+      type: 'claude_exit', code: 1, signal: null, canParkDiagnostic: false,
+    });
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(patchedStatuses()).toEqual(['idle']);
+  });
+
+  it('preserves the established failure label when a late correction is rejected', async () => {
+    let resolvePost!: (messageId: string) => void;
+    initWorkerPool({
+      sessionReply: vi.fn(() => new Promise<string>(resolve => { resolvePost = resolve; })),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+    const ds = setupStartingDs();
+    ds.streamCardId = undefined;
+    ds.lastScreenStatus = 'idle';
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Failed final-output handling establishes this label before turn_terminal.
+    ds.failedIdleTurnId = TURN;
+    (ds.worker as any).emit('message', terminalMsg(TURN, 'failed'));
+    // A silent-listener transition while the POST is in flight rejects the PATCH.
+    ds.session.messageListenerRun = { sourceMessageId: 'om_listener', replyMode: 'none' };
+    await vi.advanceTimersByTimeAsync(0);
+    resolvePost('om_start_pending_failed_label');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ds.failedIdleTurnId).toBe(TURN);
+  });
+
+  it('reconciles working after an admitted restored starting write loses its post-write fence', async () => {
+    const delivered: string[] = [];
+    let releaseRestore!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const status = JSON.parse(String(args[2])).status;
+      const opts = args[3];
+      if (!releaseRestore) {
+        return Promise.resolve().then(async () => {
+          if (opts?.beforeWrite) await opts.beforeWrite();
+          return new Promise<void>(resolve => {
+            releaseRestore = () => { delivered.push(status); resolve(); };
+          });
+        });
+      }
+      return Promise.resolve().then(async () => {
+        if (opts?.beforeWrite) await opts.beforeWrite();
+        delivered.push(status);
+      });
+    });
+    const ds = setupStartingDs();
+    ds.streamCardPending = false;
+    ds.streamCardPendingTurnId = undefined;
+    ds.lastScreenStatus = undefined;
+    (ds.worker as any).emit('message', { type: 'ready', port: 0, token: 'tok' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The starting write was admitted before any numeric attempt. Two attempts
+    // and a newer working frame then arrive before its network completion.
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 1, turnId: TURN, dispatchAttempt: 0,
+    });
+    (ds.worker as any).emit('message', {
+      type: 'capture_identity', revision: 2, turnId: TURN, dispatchAttempt: 1,
+    });
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'retry working', status: 'working', turnId: TURN, dispatchAttempt: 1,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(delivered).toEqual(['working']);
+
+    releaseRestore();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(delivered).toEqual(['working', 'starting', 'working']);
+  });
+
+  it('reasserts replacement-worker working after an old remote-exit idle settles', async () => {
+    const delivered: string[] = [];
+    let releaseExitIdle!: () => void;
+    updateMessageMock.mockImplementation((...args: any[]) => {
+      const status = JSON.parse(String(args[2])).status;
+      const opts = args[3];
+      if (!releaseExitIdle) {
+        return Promise.resolve().then(async () => {
+          if (opts?.beforeWrite) await opts.beforeWrite();
+          return new Promise<void>(resolve => {
+            releaseExitIdle = () => { delivered.push(status); resolve(); };
+          });
+        });
+      }
+      return Promise.resolve().then(async () => {
+        if (opts?.beforeWrite) await opts.beforeWrite();
+        delivered.push(status);
+      });
+    });
+    const ds = setupStartingDs();
+    ds.session.backendType = 'riff';
+    await post(ds, TURN);
+    (ds.worker as any).emit('message', {
+      type: 'claude_exit', code: 1, signal: null, canParkDiagnostic: false,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    const replacement = makeFakeWorker();
+    ds.worker = replacement;
+    ds.workerGeneration = (ds.workerGeneration ?? 0) + 1;
+    ds.session.workerGeneration = ds.workerGeneration;
+    __testOnly_setupWorkerHandlers(ds, replacement);
+    replacement.emit('message', { type: 'ready', port: 0, token: 'tok', turnId: TURN });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(delivered).toEqual(['working']);
+
+    releaseExitIdle();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(delivered).toEqual(['working', 'idle', 'working']);
+  });
 });
 

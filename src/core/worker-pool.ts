@@ -5794,6 +5794,13 @@ export function evaluateScreenshotFrame(
   return { ok: true, source };
 }
 
+/** Count actual high-water replacements, not fence evaluations: write admission
+ * can coalesce multiple attempt IPCs before a restored PATCH's first beforeWrite. */
+const turnDispatchAttemptHighWaterTransitions = new WeakMap<DaemonSession, number>();
+function turnDispatchAttemptHighWaterTransition(ds: DaemonSession): number {
+  return turnDispatchAttemptHighWaterTransitions.get(ds) ?? 0;
+}
+
 /** Raise the per-turn dispatch-attempt high-water mark (never lowers it for
  * the same turn; a different turn replaces it). Authority-free bookkeeping. */
 export function noteTurnDispatchAttempt(
@@ -5805,6 +5812,7 @@ export function noteTurnDispatchAttempt(
   const current = ds.turnDispatchAttemptHighWater;
   if (current?.turnId === turnId && current.dispatchAttempt >= dispatchAttempt) return;
   ds.turnDispatchAttemptHighWater = { turnId, dispatchAttempt };
+  turnDispatchAttemptHighWaterTransitions.set(ds, turnDispatchAttemptHighWaterTransition(ds) + 1);
 }
 
 /** A frame that passed the current worker's source + target + suppression
@@ -7292,12 +7300,21 @@ function reconcilePublishedStartingCardTerminal(ds: DaemonSession, turnId: strin
   const terminalStatus = ds.lastTurnTerminalStatus;
   if (!terminalStatus || !startingCardTurnTerminalCurrent(ds, turnId)) return false;
   const terminalAttempt = ds.lastTurnTerminalDispatchAttempt;
+  // A receipt for an earlier render must not suppress correction of this newly
+  // published starting render. Keep a snapshot for rollback, but detach it while
+  // attempting the replacement; an accepted completed correction installs its
+  // own receipt synchronously and that NEW receipt must survive for live-work
+  // repaint handoff. Non-completed scheduleCardPatch clears the old receipt itself.
+  const previousSettle = postTerminalCardSettles.get(ds);
+  postTerminalCardSettles.delete(ds);
   // A fresh starting publication is already complete. Clear its pending marker
   // before attempting the correction, and only cancel the original settle once
   // the replacement was accepted. On rejection, restore both so the normal
   // post-terminal path can still deliver the idle state later.
   const pending = ds.streamCardPending;
   const pendingTurnId = ds.streamCardPendingTurnId;
+  const previousFailedIdleTurnId = ds.failedIdleTurnId;
+  const previousCompletedIdleTurnId = ds.completedIdleTurnId;
   ds.streamCardPending = false;
   ds.streamCardPendingTurnId = undefined;
   let accepted = false;
@@ -7318,12 +7335,16 @@ function reconcilePublishedStartingCardTerminal(ds: DaemonSession, turnId: strin
   }
   if (accepted) {
     cancelPostTerminalStatusSettle(ds);
-    postTerminalCardSettles.delete(ds);
   } else {
+    // Drop a rejected replacement receipt, then restore the exact pre-attempt
+    // display state. In particular, do not erase an already-established failure label.
+    postTerminalCardSettles.delete(ds);
+    if (previousSettle) postTerminalCardSettles.set(ds, previousSettle);
     ds.streamCardPending = pending;
     ds.streamCardPendingTurnId = pendingTurnId;
     if (terminalStatus === 'failed' || terminalStatus === 'ambiguous') {
-      ds.failedIdleTurnId = undefined;
+      ds.failedIdleTurnId = previousFailedIdleTurnId;
+      ds.completedIdleTurnId = previousCompletedIdleTurnId;
     }
   }
   // accepted only controls cancellation of the ORIGINAL settle. It must not
@@ -8046,26 +8067,21 @@ const pendingStreamingCardPatchFence = new WeakMap<DaemonSession, () => boolean>
 const pendingStreamingCardPatchSettlement = new WeakMap<DaemonSession, (delivered: boolean) => void>();
 
 /** A starting publication can straddle the first numeric attempt announced for
- * its own turn. That transition completes the publication identity; it is not a
- * retry. Any transition away from an already-known attempt (or to another turn)
- * keeps the strict object-identity fence and invalidates the older write. */
+ * its own turn. Exactly one high-water replacement after capture completes the
+ * publication identity; a second replacement is a retry and invalidates the write. */
 function streamCardAttemptHighWaterStillCurrent(
   ds: DaemonSession,
   atCapture: DaemonSession['turnDispatchAttemptHighWater'],
   turnId: string | undefined,
   allowFirstAttemptForTurn: boolean,
-  firstAttemptForTurn: { current?: DaemonSession['turnDispatchAttemptHighWater'] },
+  atCaptureTransition: number,
 ): boolean {
   const current = ds.turnDispatchAttemptHighWater;
   if (current === atCapture) return true;
   if (!allowFirstAttemptForTurn || !turnId || current?.turnId !== turnId) return false;
   // A known attempt at capture is never a first attempt for this turn.
   if (atCapture?.turnId === turnId) return false;
-  if (firstAttemptForTurn.current) return firstAttemptForTurn.current === current;
-  // The first numeric attempt for this turn completes the publication identity;
-  // latch it so a SECOND same-turn transition can never inherit that allowance.
-  firstAttemptForTurn.current = current;
-  return true;
+  return turnDispatchAttemptHighWaterTransition(ds) === atCaptureTransition + 1;
 }
 
 /** An enqueued render belongs to the captured card and route. Closing a
@@ -8086,7 +8102,7 @@ function captureStreamingCardPatchFence(
   const generation = ds.workerGeneration ?? session.workerGeneration;
   const currentTurnId = ds.currentTurnId;
   const attemptHighWater = ds.turnDispatchAttemptHighWater;
-  const firstAttemptForTurn: { current?: DaemonSession['turnDispatchAttemptHighWater'] } = {};
+  const attemptHighWaterTransition = turnDispatchAttemptHighWaterTransition(ds);
   const runtimeKey = activeSessionKey(ds);
   return () => ds.session === session && ds.session.sessionId === sessionId && ds.session.status === status
     && ds.larkAppId === appId && ds.chatId === chatId && sessionAnchorId(ds) === anchor
@@ -8100,7 +8116,7 @@ function captureStreamingCardPatchFence(
         && (ds.workerGeneration ?? ds.session.workerGeneration) === generation
         && ds.currentTurnId === currentTurnId
         && streamCardAttemptHighWaterStillCurrent(
-          ds, attemptHighWater, turnId, opts?.allowFirstAttemptForTurn === true, firstAttemptForTurn));
+          ds, attemptHighWater, turnId, opts?.allowFirstAttemptForTurn === true, attemptHighWaterTransition));
 }
 
 /**
@@ -22163,19 +22179,20 @@ function setupWorkerHandlers(
                 throw new Error('Restored card no longer owns delivery');
               }
             } });
-            if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
+            const ownsRestoredDelivery = ownsLifecycleMutation() && ownsRestoredCard();
+            if (initStatus === 'starting' && healthTurnId && ownsRestoredDelivery) {
+              // The admitted write has completed. Reconcile newer execution evidence
+              // before backing out on a post-write attempt fence: otherwise the stale
+              // starting render remains the last visible write even though working won.
+              reconcilePostedStartingCard(ds, healthTurnId, statusRevisionAtRestore);
+            }
+            if (!ownsRestoredDelivery || !ownsRestoredWrite()) break;
             ds.parkedStreamCardNonce = undefined;
             // Verified: the persisted exact current card id/nonce accepted
             // this PATCH, so it is the publication proof for this route.
             rememberPublishedStreamingCardIdentity(ds, restoredCardId);
             // Restored existing card: follows live (never bound to a past turn).
             bindStreamCardDisplayTarget(ds, restoredCardId);
-            if (initStatus === 'starting' && healthTurnId) {
-              // A newer status may have landed while the older starting PATCH
-              // was in flight. Re-assert it even after terminal: an idle frame
-              // is just as important as working when delivery order is reversed.
-              reconcilePostedStartingCard(ds, healthTurnId, statusRevisionAtRestore);
-            }
             if (initStatus === 'starting' && healthTurnId) {
               armPublishedStartingCardHealth(ds, healthTurnId, restoredCardId, healthyAtRestore);
             }
@@ -24296,6 +24313,29 @@ function setupWorkerHandlers(
           // Explicit /close and daemon shutdown already own the user-visible
           // lifecycle. Only an unexpected backend exit needs recovery guidance.
           if (!retirementPhase && !suppressExitUi) {
+            // Process-only retirement also clears the starting-card watchdog.
+            // Install a real terminal display so the card cannot remain "starting"
+            // forever when no working frame ever arrived.
+            if (isRealStreamingCardId(ds.streamCardId)) {
+              const exitSession = ds.session;
+              const exitCardId = ds.streamCardId;
+              const exitGeneration = ds.workerGeneration ?? ds.session.workerGeneration;
+              postTerminalCardSettles.delete(ds);
+              scheduleCardPatch(ds, buildStreamingCardJson(ds, 'idle'), msg.turnId, {
+                onSettled: delivered => {
+                  if (delivered) return;
+                  // A replacement ready PATCH bypasses the legacy card queue. If this
+                  // old idle already passed beforeWrite but loses ownership afterwards,
+                  // reassert the replacement's current state after the stale write lands.
+                  queueMicrotask(() => {
+                    const currentGeneration = ds.workerGeneration ?? ds.session.workerGeneration;
+                    if (ds.session !== exitSession || ds.streamCardId !== exitCardId) return;
+                    if (currentGeneration === exitGeneration || !ds.workerReady || !ds.worker) return;
+                    scheduleCardPatch(ds, buildStreamingCardJson(ds), ds.currentTurnId);
+                  });
+                },
+              });
+            }
             try {
               await scopedReply(tr('cmd.restart.remote_unsupported', undefined, loc), 'text', undefined);
             } catch (replyErr) {
