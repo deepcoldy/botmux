@@ -1137,7 +1137,6 @@ export const messages: Record<string, string> = {
   'config.label.replyCardNextStep': '回复卡下一步按钮',
   'config.label.bareRenamePassthrough': '裸 /rename 交给 CLI 起名',
   'config.label.replyCardRecap': '回复卡本轮回顾',
-  'config.label.replyCardRecapModel': '本轮回顾小模型补写',
   'config.label.autoStartOnGroupJoin': '进群即开工',
   'config.label.autoStartOnNewTopic': '新话题即开工',
   'config.label.chatManagerEnabled': '群负责人（默认接待者）',

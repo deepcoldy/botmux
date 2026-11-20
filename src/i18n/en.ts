@@ -1140,7 +1140,6 @@ export const messages: Record<string, string> = {
   'config.label.replyCardNextStep': 'Reply card next-step button',
   'config.label.bareRenamePassthrough': 'Bare /rename names via CLI',
   'config.label.replyCardRecap': 'Reply card turn recap',
-  'config.label.replyCardRecapModel': 'Turn recap by a small model',
   'config.label.autoStartOnGroupJoin': 'Auto-start on join',
   'config.label.autoStartOnNewTopic': 'Auto-start on new topic',
   'config.label.chatManagerEnabled': 'Group manager (default responder)',
