@@ -106,7 +106,8 @@ export function countLiveTalkerTasks(
 }
 
 export interface TalkerScheduleRunDependencies {
-  policy: TalkerSchedulePolicy;
+  /** Read live on every admission check, including again after network waits. */
+  policy: () => TalkerSchedulePolicy;
   /** evaluateTalk for this bot: may `openId` (union `unionId`) talk in `chatId`? */
   canTalk: (chatId: string, openId: string, unionId: string, chatType: 'group' | 'p2p') => boolean;
   resolveTargetOpenId: (unionId: string) => Promise<string | undefined>;
@@ -140,7 +141,7 @@ export async function authorizeTalkerScheduleRun(
   if (authority.kind !== 'direct' || !isTalkerScheduledTask(authority.task)) {
     throw new Error('schedule authority is not a talker-created direct task');
   }
-  if (!deps.policy.enabled) {
+  if (!deps.policy().enabled) {
     throw new Error('talker schedule creation is disabled for this bot; refusing run');
   }
   const openId = authority.controlOpenId;
@@ -167,6 +168,15 @@ export async function authorizeTalkerScheduleRun(
   if (target.chatType === 'group'
     && !(await deps.listChatMemberOpenIds(target.chatId)).includes(openId)) {
     throw new Error('talker schedule creator is no longer a target chat member');
+  }
+  // The policy is a live getter, not a snapshot captured before contact /
+  // membership APIs. Re-admit after those waits so a switch or grant revoked
+  // while they were pending cannot authorize this run with stale state.
+  if (!deps.policy().enabled) {
+    throw new Error('talker schedule creation is disabled for this bot; refusing run');
+  }
+  if (!deps.canTalk(target.chatId, openId, unionId, target.chatType)) {
+    throw new Error('talker schedule creator can no longer talk in the target chat');
   }
   return { openId, unionId };
 }

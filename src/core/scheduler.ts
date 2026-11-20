@@ -1334,7 +1334,7 @@ export function addTask(params: {
   /** Server-authoritative live turn that created this direct task (never from a
    *  request body). Recorded in the authority row's target_turn_id column only —
    *  not in the task JSON — and counted against maxTasksPerTurn. */
-  directTurn?: { turnId: string; maxTasksPerTurn: number };
+  directTurn?: { turnId: string; maxTasksPerTurn: number; maxLiveTasksPerOwner?: number };
   /** The live turn whose agent creates this task; the creation observer reads what that turn published. */
   creatingTurn?: ScheduleCreatingTurn;
 }): ScheduledTask {
@@ -1447,7 +1447,7 @@ export function addTask(params: {
  * path. */
 export function authoritativeCreateFor(
   appId: string | undefined,
-  directTurn?: { turnId: string; maxTasksPerTurn: number },
+  directTurn?: { turnId: string; maxTasksPerTurn: number; maxLiveTasksPerOwner?: number },
 ): ((task: ScheduledTask) => ScheduledTask) | undefined {
   assertScheduleAuthorityAvailable();
   return appId && authorityStore?.isInitialized(appId)
@@ -1990,7 +1990,7 @@ export function updateTask(
   /** With `creator`: who the task ran as just before this edit, read inside
    *  the same authority write, so a caller that must undo the edit can put
    *  exactly that back. */
-  previousRunAs?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'>;
+  previousRunAs?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim' | 'ownerAccess'>;
 } {
   const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
@@ -2212,12 +2212,13 @@ export function updateTask(
   // Identity fields stay out of `patch`: it doubles as the dashboard event,
   // which anonymous public-read viewers also receive.
   const creatorPatch: Partial<ScheduledTask> = updates.creator
-    ? { ownerOpenId: updates.creator.openId, ownerUnionId: updates.creator.unionId, runAsClaim: undefined }
+    ? { ownerOpenId: updates.creator.openId, ownerUnionId: updates.creator.unionId, runAsClaim: undefined, ownerAccess: undefined }
     : {};
-  let previousRunAs: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'> | undefined;
+  let previousRunAs: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim' | 'ownerAccess'> | undefined;
   if (!mutateRuntimeTask(id, current => {
     if (updates.creator) {
-      previousRunAs = { ownerOpenId: current.ownerOpenId, ownerUnionId: current.ownerUnionId, runAsClaim: current.runAsClaim };
+      previousRunAs = { ownerOpenId: current.ownerOpenId, ownerUnionId: current.ownerUnionId,
+        runAsClaim: current.runAsClaim, ownerAccess: current.ownerAccess };
     }
     return { ...current, ...patch, ...creatorPatch };
   })) {

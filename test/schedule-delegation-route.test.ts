@@ -122,7 +122,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
     capabilityOn,
     capabilityOfTool,
-    scheduleAuthorityStore: { listRecords: vi.fn((): unknown[] => []) },
+    scheduleAuthorityStore: { getRecord: vi.fn(() => undefined), listRecords: vi.fn((): unknown[] => []) },
     createHash,
     scheduler: { parseSchedule, commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
   };
@@ -1325,7 +1325,7 @@ function talkerHarness() {
   return h;
 }
 
-const TALKER_TURN = { directTurn: { turnId: 'om_kickoff', maxTasksPerTurn: 1 },
+const TALKER_TURN = { directTurn: { turnId: 'om_kickoff', maxTasksPerTurn: 1, maxLiveTasksPerOwner: 5 },
   creatingTurn: { sessionId: 'target-session', turnId: 'om_kickoff' } };
 
 const talkerRecord = (controlOpenId: string, state = 'active', shape: { ownerAccess?: string; kind?: string } = { ownerAccess: 'talk' }) =>
@@ -1341,7 +1341,16 @@ describe('talker schedule creation (scheduleCreateByTalkers)', () => {
     expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ ownerAccess: 'talk' }), TALKER_TURN);
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
     // Talk access is re-evaluated for this exact chat and sender, not assumed from the turn.
-    expect(h.scope.evaluateTalk).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_user_target', 'on_user', undefined, 'group');
+    expect(h.scope.evaluateTalk).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_user_target', undefined, 'on_user', 'group');
+  });
+
+  it('admits a human whose only talk source is platform team membership', async () => {
+    const h = talkerHarness();
+    h.scope.evaluateTalk = vi.fn((_app: string, _chat: string, _open: string, senderUnion: string | undefined, memberUnion: string | undefined) => ({
+      allowed: senderUnion === undefined && memberUnion === 'on_user',
+      reason: memberUnion === 'on_user' ? 'teamMember' : 'none',
+    }));
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerAccess: 'talk' } } });
   });
 
   it('keeps an administrator on the ordinary path (no talker marker, default per-turn limit)', async () => {
@@ -1429,7 +1438,7 @@ describe('talker schedule creation (scheduleCreateByTalkers)', () => {
     h.scope.listChatMemberOpenIds = vi.fn(async () => []);
     expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerAccess: 'talk' } } });
     expect(h.scope.listChatMemberOpenIds).not.toHaveBeenCalled();
-    expect(h.scope.evaluateTalk).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_user_target', 'on_user', undefined, 'p2p');
+    expect(h.scope.evaluateTalk).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_user_target', undefined, 'on_user', 'p2p');
   });
 
   it('counts only this person\'s live talker tasks against the per-person quota (default 5)', async () => {
@@ -1454,6 +1463,20 @@ describe('talker schedule creation (scheduleCreateByTalkers)', () => {
     expect(full.scope.scheduler.addTask).not.toHaveBeenCalled();
   });
 
+  it('lets an identical replay reach the store after the first task filled the quota', async () => {
+    const h = talkerHarness();
+    h.scope.getBot = () => ({ config: { scheduleCreateByTalkers: true, scheduleTalkerMaxTasks: 1 } });
+    const existing = talkerRecord('ou_user_target');
+    h.scope.scheduler.addTask = vi.fn((value: unknown) => {
+      h.scope.scheduleAuthorityStore.getRecord = () => existing;
+      h.scope.scheduleAuthorityStore.listRecords = () => [existing];
+      return value;
+    });
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { id: 'a1b2c3d4' } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledTimes(2);
+  });
+
   it('honours a bot-level quota override', async () => {
     const h = talkerHarness();
     h.scope.getBot = () => ({ config: { scheduleCreateByTalkers: true, scheduleTalkerMaxTasks: 1 } });
@@ -1471,10 +1494,28 @@ describe('talker schedule creation (scheduleCreateByTalkers)', () => {
     expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
   });
 
+  it('commits nothing when talk access is revoked during the membership lookup', async () => {
+    const h = talkerHarness();
+    let allowed = true;
+    h.scope.evaluateTalk = vi.fn(() => ({ allowed, reason: allowed ? 'chatGrant' : 'none' }));
+    h.scope.listChatMemberOpenIds = async () => {
+      allowed = false;
+      return ['ou_user_target'];
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_operator_denied' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
   it('maps the per-turn direct limit to 403 for a talker too', async () => {
     const h = talkerHarness();
     h.scope.scheduler.addTask = vi.fn(() => { throw new Error('schedule_direct_task_limit'); });
     expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_direct_task_limit' } });
+  });
+
+  it('maps the transactional per-owner limit to 403 when the fast path was stale', async () => {
+    const h = talkerHarness();
+    h.scope.scheduler.addTask = vi.fn(() => { throw new Error('schedule_talker_task_limit'); });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_task_limit' } });
   });
 
   it('does not admit a scheduled-turn or bot caller as a talker', async () => {

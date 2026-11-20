@@ -33,7 +33,7 @@ function record(task: ScheduledTask, overrides: Partial<ScheduleAuthorityRecord>
 
 function deps(overrides: Partial<Parameters<typeof authorizeTalkerScheduleRun>[2]> = {}) {
   return {
-    policy: { enabled: true, maxTasksPerUser: 5 },
+    policy: () => ({ enabled: true, maxTasksPerUser: 5 }),
     canTalk: vi.fn(() => true),
     resolveTargetOpenId: vi.fn(async () => 'ou_talker'),
     listChatMemberOpenIds: vi.fn(async () => ['ou_talker', 'ou_admin']),
@@ -153,7 +153,7 @@ describe('authorizeTalkerScheduleRun', () => {
 
   it('refuses when the bot switch is off', async () => {
     const task = talkerTask();
-    await expect(authorizeTalkerScheduleRun(task, record(task), deps({ policy: { enabled: false, maxTasksPerUser: 5 } })))
+    await expect(authorizeTalkerScheduleRun(task, record(task), deps({ policy: () => ({ enabled: false, maxTasksPerUser: 5 }) })))
       .rejects.toThrow(/disabled/);
   });
 
@@ -209,5 +209,29 @@ describe('authorizeTalkerScheduleRun', () => {
       .rejects.toThrow(/can no longer talk/);
     await expect(authorizeTalkerScheduleRun(task, record(task), deps({ listChatMemberOpenIds: vi.fn(async () => ['ou_admin']) })))
       .rejects.toThrow(/no longer a target chat member/);
+  });
+
+  it('re-reads the switch after asynchronous admission checks', async () => {
+    const task = talkerTask();
+    let enabled = true;
+    const d = deps({
+      policy: () => ({ enabled, maxTasksPerUser: 5 }),
+      listChatMemberOpenIds: vi.fn(async () => {
+        enabled = false;
+        return ['ou_talker'];
+      }),
+    });
+    await expect(authorizeTalkerScheduleRun(task, record(task), d)).rejects.toThrow(/disabled/);
+  });
+
+  it('re-checks talk access after the membership wait', async () => {
+    const task = talkerTask();
+    let checks = 0;
+    const d = deps({
+      canTalk: vi.fn(() => ++checks === 1),
+      listChatMemberOpenIds: vi.fn(async () => ['ou_talker']),
+    });
+    await expect(authorizeTalkerScheduleRun(task, record(task), d)).rejects.toThrow(/can no longer talk/);
+    expect(checks).toBe(2);
   });
 });

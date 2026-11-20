@@ -148,16 +148,24 @@ Bot 级开关 `scheduleCreateByTalkers`（Dashboard「授权与额度」同步�
   `topicTitle`、`deliver=local`、多群、until-done、notify。工作目录边界沿用
   `capabilityScheduleWorkingDir`。
 - **配额**：每轮最多 1 个（复用 `directTurn.maxTasksPerTurn`，删除不退额度）；每人每 Bot
-  最多 `scheduleTalkerMaxTasks`（1–100，缺省 5）个存活（active/paused）任务。
-- **到点复核（fail-closed）**：每次执行进入队列前、以及发布 scheduled turn 身份时，都重新
-  检查：开关仍开、authority 控制人与 task owner 一致且无 claim、`union_id` 仍解析回同一
-  `open_id`、本人仍可在目标群 `canTalk`、群聊时仍是群成员。任一不满足即拒跑，**不**发认领卡
-  （认领卡会把任务交给管理员接手，与「不借到别人权限」相悖）。关闭开关 = 所有此类任务停止触发，
-  再打开即恢复。
+  最多 `scheduleTalkerMaxTasks`（1–100，缺省 5）个存活（active/paused）任务。每人配额由
+  `createDirect` 在同一个 `BEGIN IMMEDIATE` 事务内最终判定；相同 id + canonical input 的
+  replay 先于配额计数返回，因此响应丢失后的重试不会被自己刚创建的任务挡住。
+- **到点复核（fail-closed）**：每次执行进入队列前、以及等待 precondition/admission 后实际派发前，
+  都重新检查：开关仍开、authority 控制人与 task owner 一致且无 claim、`union_id` 仍解析回同一
+  `open_id`、本人仍可在目标群 `canTalk`、群聊时仍是群成员。第二道复核不依赖
+  `triggerUserAuth` 是否开启；异步身份/成员查询结束后还会重读开关并复查 talk，凭据发布完成后
+  再复核一次。任一不满足即拒跑，**不**发认领卡（认领卡会把任务交给管理员接手，与「不借到别人权限」
+  相悖）。关闭开关 = 所有此类任务停止触发，再打开即恢复。创建路由在成员查询结束后、提交前也复查
+  开关和 talk，等待期间撤权不会落盘任务或消耗配额。
 - **管理**：`SCHEDULE_MANAGED_MUTATE_ROUTE` 对非管理员只放行 authority 控制人 == 本人、
   任务所在群 == 当前会话、开关仍开 的任务（update/remove/pause/resume/run 都可）；管理员行为不变。
-  talker 任务自己的 scheduled turn 不能 `pause/remove self`（`authorizeScheduleSelfManage` 仍要求
-  管理员），也不能创建 one-shot 子任务、不能驾驭 v3 workflow（owner gate 仍是管理员）。
+  Dashboard 编辑记录新 creator 时同时清除 `ownerAccess: 'talk'`，新 owner 回到普通管理员授权语义；
+  若复合编辑失败，旧 owner 与该标记一起回滚。talker 任务自己的 scheduled turn 不能
+  `pause/remove self`（`authorizeScheduleSelfManage` 仍要求管理员），也不能创建 one-shot 子任务、
+  不能驾驭 v3 workflow（共享 scheduled-turn owner gate 对 talk-only owner 直接拒绝；chat-bound
+  signed-envelope 请求还必须携带每轮 session capability，daemon 用它绑定 live turn 并从宿主
+  `schedule-authority.sqlite` 复核 owner，删除 schedules.json 或进程 marker 字段都不能取得权限）。
 - **执行身份**：与本人直接发消息一致——开了 `triggerUserAuth` 时 scheduled turn 以本人身份发布
   工具凭据；没开时用 Bot 自己的工具。开关的帮助文案明示这一点。
 - **判定「真人直接发起」**：沿用 `scheduleCallerForTurn` 的 `senderType === 'user'
