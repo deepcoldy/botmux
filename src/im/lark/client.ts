@@ -2140,7 +2140,9 @@ async function writeViaRename(savePath: string, write: (tmp: string) => Promise<
   // alone would accept a swapped-in external directory as a fresh baseline).
   const expected: DownloadDirGuard = guard ?? { dev: before.dev, ino: before.ino };
   assertDownloadDirUnchanged(dir, expected);
-  const tmp = `${savePath}.${process.pid}.${randomBytes(4).toString('hex')}.part`;
+  // Staging name independent of the destination name: a valid 250-char file
+  // name plus a suffix would exceed NAME_MAX.
+  const tmp = join(dir, `.botmux-dl-${process.pid}-${randomBytes(4).toString('hex')}.part`);
   try {
     await write(tmp);
     // Rename only into that same directory.

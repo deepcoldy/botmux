@@ -177,6 +177,22 @@ describe('downloadMessageResource symlink safety', () => {
     expect(mocks.request).not.toHaveBeenCalled();
   });
 
+  it('downloads a file whose name is near NAME_MAX (staging name must not push it over)', async () => {
+    const dir = join(root, 'om_long');
+    mkdirSync(dir);
+    const name = 'a'.repeat(250) + '.bin';
+    mocks.request.mockResolvedValueOnce(Buffer.from('LONG'));
+    await downloadMessageResource('cli_test', 'om_long', 'file_k', 'file', join(dir, name));
+    expect(readFileSync(join(dir, name), 'utf8')).toBe('LONG');
+    const data = Buffer.from('RANGE');
+    const request = async (start: number, end: number): Promise<ResourceStream> => Object.assign(
+      Readable.from([data.subarray(start, end + 1)]),
+      { statusCode: 206, headers: { 'content-range': `bytes ${start}-${end}/${data.length}` } });
+    await downloadResourceWithRange(request, join(dir, 'r' + name));
+    expect(readFileSync(join(dir, 'r' + name))).toEqual(data);
+    expect(readdirSync(dir).sort()).toEqual([name, 'r' + name].sort());
+  });
+
   it('refuses a symlinked message directory', async () => {
     const hostDir = join(root, 'host-dist');
     mkdirSync(hostDir);

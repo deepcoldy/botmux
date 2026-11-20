@@ -1,6 +1,6 @@
 import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, renameSync, unlinkSync, writeSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { assertDownloadDirUnchanged, type DownloadDirGuard } from './client.js';
 import type { Readable } from 'node:stream';
 
@@ -91,7 +91,8 @@ export async function downloadResourceWithRange(
   // swapped for a symlink meanwhile and the staging file created elsewhere.
   // The open descriptor then keeps writing into that directory whatever the
   // path resolves to later; the rename at the end is re-guarded.
-  const temporaryPath = `${savePath}.${process.pid}.${randomBytes(4).toString('hex')}.part`;
+  // Staging name independent of the destination name (NAME_MAX).
+  const temporaryPath = join(dir, `.botmux-dl-${process.pid}-${randomBytes(4).toString('hex')}.part`);
   const fd = openSync(temporaryPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
   let renamed = false;
   try {

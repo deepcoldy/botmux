@@ -961,7 +961,13 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // downloaded attachment under attachments/<self>/<messageId>/… (not just reads
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the
   // existence-filter and gets bound rw. Siblings' buckets stay uncovered.
-  push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], 'readWrite', 'internal');
+  // With sandboxWithholdBotSecret the only writer of this bucket is the host
+  // (incoming messages; relayed `quoted` lands in the host-private
+  // relay-attachments instead), so the pane gets it read-only. A writable
+  // bucket lets the pane swap a message directory for a symlink between the
+  // host's validation and its open/rename — a cross-process race no path-based
+  // check can close — and a read-only bucket removes that class outright.
+  push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], ctx.withholdSendCredential ? 'readOnly' : 'readWrite', 'internal');
   // Own per-turn hook context（UserPromptSubmit sidecar，#794）——read-only。
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
@@ -1248,7 +1254,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     net: ctx.net !== false,
     ...(ctx.withholdSendCredential ? { hideHostProcessInfo: true } : {}),
     ...(ctx.withholdSendCredential
-      ? { pinnedDirs: [ctx.botHome, `${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`, ...(ctx.outbox ? [ctx.outbox] : [])].map(p => normalizeFsPath(p)).filter((p): p is string => !!p) }
+      ? { pinnedDirs: [ctx.botHome, ...(ctx.outbox ? [ctx.outbox] : [])].map(p => normalizeFsPath(p)).filter((p): p is string => !!p) }
       : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],

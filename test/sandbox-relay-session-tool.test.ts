@@ -84,12 +84,23 @@ describe('fs-policy: withholdSendCredential', () => {
   it('pins BOT_HOME and the outbox against rename/rmdir, after the write grants', () => {
     const outbox = '/Users/u/.botmux/data/sandboxes/s/outbox';
     const on = compileToSeatbelt(buildFsPolicy(ctx({ outbox, withholdSendCredential: true })));
-    for (const dir of ['/Users/u/.botmux/bots/cli_self', '/Users/u/.botmux/data/attachments/cli_self', outbox]) {
+    for (const dir of ['/Users/u/.botmux/bots/cli_self', outbox]) {
       const pin = `(deny file-write-unlink (literal "${dir}"))`;
       expect(on).toContain(pin);
       expect(on.indexOf(pin)).toBeGreaterThan(on.indexOf(`(subpath "${dir}")`));
     }
     expect(compileToSeatbelt(buildFsPolicy(ctx({ outbox })))).not.toContain('file-write-unlink (literal');
+  });
+
+  it('makes the own attachment bucket read-only when the secret is withheld (both platforms), read-write otherwise', () => {
+    for (const platform of ['darwin', 'linux'] as const) {
+      const home = platform === 'darwin' ? '/Users/u' : '/home/u';
+      const base = { platform, homeDir: home, botmuxHome: `${home}/.botmux`, sessionDataDir: `${home}/.botmux/data`,
+        workingDir: `${home}/proj`, botHome: `${home}/.botmux/bots/cli_self`, outbox: `${home}/.botmux/data/sandboxes/s/outbox` };
+      const file = `${home}/.botmux/data/attachments/cli_self/om_x/a.png`;
+      expect(accessForPath(buildFsPolicy(ctx({ ...base, withholdSendCredential: true })).rules, file).access).toBe('readOnly');
+      expect(accessForPath(buildFsPolicy(ctx(base)).rules, file).access).toBe('readWrite');
+    }
   });
 
   it('grants the macOS relay outbox read-write', () => {

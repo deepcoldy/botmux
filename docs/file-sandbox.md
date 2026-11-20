@@ -298,15 +298,17 @@ worker spawnCli
 - 附件文件名只取 basename，`..`/空名退回 file_key；Range 下载在 rename 前复核目录 inode；
   下载还要求目录 realpath 落在附件根下（`withinRoot`），防 `attachments/<appId>` 这一层被换成软链。
 - macOS 可写目录能被整个 rename 走（子文件从未被打开，文件级 deny 不触发），再从可写位置读回；
-  或换成软链让宿主写穿。开关打开时对 BOT_HOME、`attachments/<appId>` 与 outbox 发 `(deny file-write-unlink (literal …))`
+  或换成软链让宿主写穿。开关打开时对 BOT_HOME 与 outbox 发 `(deny file-write-unlink (literal …))`
   （实测拦住 mv/rmdir、目录内 mkdir/touch/rename 不受影响）；watcher 另记住启动时 outbox 的 inode，
   被换掉就不写 `res.json`。Linux 上这两处是 bind mount，本就不能 rename。
 - 判「这个 bot 的会话要不要扣密钥」统一走 `sandboxWithholdsBotSecret(botCfg)`（按 `resolveSandboxMode`
   含 env 强制后的实际沙盒档判），冻结、会议接收、工作流快照都用它。
 - 附件下载的目录校验在 mkdir **之前**做（否则 mkdir -p 会顺着被换的祖先建到外面），校验通过的目录
   identity（dev/ino + 根内）一路带到最终 rename 前再核一次——等待网络那段是攻击窗口；macOS 另把
-  `attachments/<appId>` 也 pin 住。Range 下载的暂存文件在校验后**同步**打开（中间不 await），之后无论
-  路径解析到哪，fd 都在校验过的目录里；消息目录本身仍可被沙盒挪动，所以不能在网络等待后再建暂存。
+  开关打开时 `attachments/<appId>` 对沙盒改成**只读**（两个平台）：这时桶的唯一写者是宿主（入站消息；
+  中转的 `quoted` 落在宿主私有的 relay-attachments），沙盒不再能在宿主「校验→open/rename」两个系统调用
+  之间换目录——这是路径式检查关不掉的跨进程竞态，只读直接消灭这一类。Range 下载的暂存文件在校验后
+  同步打开、暂存名与目标文件名无关（避免 NAME_MAX）。开关关着时桶仍可写（原有设计），上述守卫只是缩小窗口。
 
 **沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
 
