@@ -291,6 +291,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     restrictGrantCommands: j?.restrictGrantCommands === true,
     autoGrantRequestCards: j?.autoGrantRequestCards !== false,
     p2pOpen: j?.p2pOpen === true,
+    scheduleCreateByTalkers: j?.scheduleCreateByTalkers === true,
     grantRequestToOwnerDm: j?.grantRequestToOwnerDm === true,
     trustSameOwnerBots: j?.trustSameOwnerBots !== false,
     grantDelegateBots: Array.isArray(j?.grantDelegateBots)
