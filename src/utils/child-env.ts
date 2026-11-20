@@ -494,6 +494,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // command that `botmux statusline` chains to after persisting the snapshot.
   // Not a credential — it is what the user already put in their settings.json.
   'BOTMUX_STATUSLINE_CHAIN',
+  // Per-CLI-spawn opaque generation token stamped on statusline snapshots so
+  // late writes from a dying CLI process cannot pollute or dedupe-block the
+  // replacement generation.
+  'BOTMUX_STATUSLINE_GEN',
   // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
   // the pane; the runner consumes+unlinks the file before app-server starts.
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
@@ -624,6 +628,9 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Shadowed user statusLine command, resolved per session from the spawn cwd
   // + user settings (worker.ts); an inherited copy points at another project.
   'BOTMUX_STATUSLINE_CHAIN',
+  // Per-CLI-spawn statusline generation token; an inherited copy belongs to
+  // another CLI process generation and must be scrubbed at session boundaries.
+  'BOTMUX_STATUSLINE_GEN',
   // Per-app value pinned by the ecosystemConfig env block; an inherited copy
   // is untrusted (the daemon resolves its bot via BOTMUX_BOT_INDEX).
   'BOTMUX_LARK_APP_ID',

@@ -34,13 +34,25 @@ import {
   parseTmuxRelease,
   type TmuxRecommendation,
 } from './tmux-recommended.js';
+import {
+  defaultPrebuiltSupportIo,
+  inspectManagedTmux,
+  probePrebuiltSupport,
+  type ManagedTmuxState,
+  type PrebuiltInstallFailure,
+  type PrebuiltInstallResult,
+  type PrebuiltSupport,
+} from './tmux-prebuilt.js';
+import { managedTmuxRoot } from './tmux-managed-path.js';
 
 export type SystemPackageManager = Exclude<PackageManager, 'brew' | 'conda' | 'unknown'>;
 
 export type TmuxInstallOwner =
   | { kind: 'brew'; brewBin: string }
   | { kind: 'conda'; condaBin: string; prefix: string }
-  | { kind: 'system'; pm: SystemPackageManager };
+  | { kind: 'system'; pm: SystemPackageManager }
+  /** botmux's own prebuilt copy under `root` (fresh install or replacement). */
+  | { kind: 'botmux'; root: string };
 
 /** Why there is no button, and what the owner can do instead. */
 export type TmuxManualReason =
@@ -48,7 +60,9 @@ export type TmuxManualReason =
   | 'unmanaged_binary'
   | 'needs_sudo'
   | 'no_candidate'
-  | 'unsupported_platform';
+  | 'unsupported_platform'
+  /** botmux's own tmux directory exists but is not provably what botmux put there. */
+  | 'managed_modified';
 
 export type TmuxUpgradePlan =
   | {
@@ -59,6 +73,8 @@ export type TmuxUpgradePlan =
       display: string;
       /** Best release the package source offers right now, when known. */
       candidate?: string;
+      /** owner=botmux: what gets installed where, and which binary stays as is. */
+      prebuilt?: { release: string; root: string; keepPath?: string };
     }
   | {
       auto: false;
@@ -70,6 +86,8 @@ export type TmuxUpgradePlan =
       manualCommand?: string;
       /** Platform-specific way out (backports, Homebrew, …); plain text. */
       hint?: string;
+      /** Why botmux's own prebuilt tmux is not an option here either. */
+      prebuiltUnavailable?: { reason: string; detail?: string; missingLibraries?: string[] };
     };
 
 /** apt / dnf report versions like `3.5a-2~bpo12+1`; keep the exact string for
@@ -100,6 +118,14 @@ export interface TmuxUpgradeProbe {
   systemPackageInstalled(pm: SystemPackageManager): MaybePromise<boolean>;
   /** Versions the package source currently offers (no network). null = unknown. */
   packageCandidates(pm: SystemPackageManager): MaybePromise<PackageCandidate[] | null>;
+  /** botmux's own tmux directory; absent → the prebuilt route is not considered. */
+  managedRoot?: string;
+  /** Canonical path (production: realpathSync); undefined when it does not exist. */
+  realpath?(path: string): string | undefined;
+  /** Ownership of what is in `managedRoot` right now. */
+  managedState?(): ManagedTmuxState;
+  /** Can botmux install its own prebuilt tmux on this host? */
+  prebuiltSupport?(): Promise<PrebuiltSupport>;
 }
 
 const ALWAYS_FRESH_SYSTEM_MANAGERS: ReadonlySet<SystemPackageManager> = new Set(['pacman', 'apk', 'zypper']);
@@ -205,6 +231,66 @@ function noCandidateHint(platform: PlatformInfo, codename: string | undefined, l
 export async function planTmuxUpgrade(
   probe: TmuxUpgradeProbe,
   opts: { locale?: 'zh' | 'en'; recommendation?: TmuxRecommendation; debianCodename?: string } = {},
+): Promise<TmuxUpgradePlan> {
+  const root = probe.managedRoot;
+  const tmux = probe.resolveTmux();
+  // Compare canonical paths: a symlinked HOME/.botmux must not make botmux's
+  // own copy look like the user's (and get offered as "left untouched").
+  const realRoot = root ? (probe.realpath?.(root) ?? root) : undefined;
+  // botmux's own copy is what runs: replace it (only if provably ours).
+  if (root && realRoot && tmux && (tmux.realPath.startsWith(realRoot + '/') || tmux.realPath.startsWith(root + '/'))) {
+    const state = probe.managedState?.() ?? { state: 'foreign', reason: 'unknown' } as ManagedTmuxState;
+    if (state.state === 'foreign') return { auto: false, reason: 'managed_modified', tmuxPath: root };
+    const support = await probe.prebuiltSupport?.();
+    if (support?.ok) {
+      return {
+        auto: true,
+        owner: { kind: 'botmux', root },
+        tmuxPath: tmux.path,
+        display: support.candidates[0]!.fileName,
+        prebuilt: { release: support.candidates[0]!.release, root },
+      };
+    }
+    return {
+      auto: false,
+      reason: 'unsupported_platform',
+      tmuxPath: tmux.path,
+      ...(support && !support.ok ? { prebuiltUnavailable: unavailable(support) } : {}),
+    };
+  }
+  const viaPackages = await planPackageManagerUpgrade(probe, opts);
+  if (viaPackages.auto || !root || !probe.prebuiltSupport) return viaPackages;
+  // No package manager can deliver it: botmux's own prebuilt copy, if this
+  // host can run one. The binary the user put there stays exactly as it is.
+  if (viaPackages.reason !== 'unmanaged_binary' && viaPackages.reason !== 'needs_sudo'
+    && viaPackages.reason !== 'no_candidate') return viaPackages;
+  const state = probe.managedState?.() ?? { state: 'absent' } as ManagedTmuxState;
+  if (state.state === 'foreign') {
+    return { ...viaPackages, prebuiltUnavailable: { reason: 'managed_modified', detail: root } };
+  }
+  const support = await probe.prebuiltSupport();
+  if (!support.ok) return { ...viaPackages, prebuiltUnavailable: unavailable(support) };
+  return {
+    auto: true,
+    owner: { kind: 'botmux', root },
+    tmuxPath: viaPackages.tmuxPath ?? tmux?.path ?? 'tmux',
+    display: support.candidates[0]!.fileName,
+    prebuilt: { release: support.candidates[0]!.release, root, ...(viaPackages.tmuxPath ? { keepPath: viaPackages.tmuxPath } : {}) },
+  };
+}
+
+function unavailable(support: Extract<PrebuiltSupport, { ok: false }>): NonNullable<Extract<TmuxUpgradePlan, { auto: false }>['prebuiltUnavailable']> {
+  return {
+    reason: support.reason,
+    ...(support.detail ? { detail: support.detail } : {}),
+    ...(support.missingLibraries?.length ? { missingLibraries: support.missingLibraries } : {}),
+  };
+}
+
+/** The package-manager route only (brew / conda / distro manager). */
+async function planPackageManagerUpgrade(
+  probe: TmuxUpgradeProbe,
+  opts: { locale?: 'zh' | 'en'; recommendation?: TmuxRecommendation; debianCodename?: string },
 ): Promise<TmuxUpgradePlan> {
   const locale = opts.locale ?? 'zh';
   const recommendation = opts.recommendation ?? TMUX_RECOMMENDED_MIN;
@@ -316,7 +402,9 @@ export interface TmuxUpgradeExecution {
   /** Failure reason in plain words (no stack traces). */
   error?: string;
   /** Machine-readable failure kind. */
-  failure?: 'command_failed' | 'timed_out' | 'no_candidate' | 'refused';
+  failure?: 'command_failed' | 'timed_out' | 'no_candidate' | 'refused' | PrebuiltInstallFailure;
+  /** Prebuilt route: libraries this host lacks for every candidate. */
+  missingLibraries?: string[];
 }
 
 const STEP_TIMEOUT_MS = 10 * 60_000;
@@ -337,6 +425,8 @@ export async function executeTmuxUpgrade(
     onLine: (line: string) => void;
     onSpawn?: (pid: number) => void;
     aptCandidates?: () => MaybePromise<PackageCandidate[] | null>;
+    /** Prebuilt route (owner=botmux): install botmux's own copy. */
+    installPrebuilt?: (onLine: (line: string) => void) => Promise<PrebuiltInstallResult>;
     recommendation?: TmuxRecommendation;
     env?: NodeJS.ProcessEnv;
   },
@@ -363,6 +453,21 @@ export async function executeTmuxUpgrade(
   });
 
   const { owner } = plan;
+  if (owner.kind === 'botmux') {
+    if (!deps.installPrebuilt) return { ok: false, ran, failure: 'unsupported', error: 'prebuilt install unavailable' };
+    const r = await deps.installPrebuilt(deps.onLine);
+    if (r.ok) {
+      ran.push(r.source);
+      return { ok: true, ran, selected: r.release };
+    }
+    return {
+      ok: false,
+      ran,
+      failure: r.failure,
+      error: r.error,
+      ...(r.missingLibraries?.length ? { missingLibraries: r.missingLibraries } : {}),
+    };
+  }
   if (owner.kind === 'brew' || owner.kind === 'conda') {
     const argv = owner.kind === 'brew'
       ? [owner.brewBin, 'upgrade', 'tmux']
@@ -434,8 +539,13 @@ function quietExec(bin: string, args: string[], timeoutMs = 10_000): Promise<str
 
 export function defaultTmuxUpgradeProbe(platform: PlatformInfo): TmuxUpgradeProbe {
   const pathValue = tmuxEnv().PATH;
+  const managedRoot = managedTmuxRoot();
   return {
     platform,
+    managedRoot,
+    realpath: path => { try { return realpathSync(path); } catch { return undefined; } },
+    managedState: () => inspectManagedTmux(managedRoot),
+    prebuiltSupport: () => probePrebuiltSupport(defaultPrebuiltSupportIo()),
     resolveTmux() {
       const path = whichOnPath('tmux', pathValue);
       if (!path) return null;

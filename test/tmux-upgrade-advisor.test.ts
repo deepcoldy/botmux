@@ -1187,3 +1187,68 @@ describe('production fan-out and probes', () => {
     expect(isNoTmuxServerError('')).toBe(false);
   });
 });
+
+describe('one-click upgrade through botmux\'s own prebuilt tmux', () => {
+  const PREBUILT_PLAN: TmuxUpgradePlan = {
+    auto: true,
+    owner: { kind: 'botmux', root: '/home/u/.botmux/tools/tmux' },
+    tmuxPath: '/home/u/.local/bin/tmux',
+    display: 'tmux_3.5a-2~bpo12+1_amd64.deb',
+    prebuilt: { release: NEW, root: '/home/u/.botmux/tools/tmux', keepPath: '/home/u/.local/bin/tmux' },
+  };
+
+  it('the reminder offers it; the click installs, re-reads tmux -V, then asks when to switch', async () => {
+    const h = harness({
+      plan: async () => PREBUILT_PLAN,
+      executeUpgrade: vi.fn(async (plan, onLine) => {
+        expect(plan.owner.kind).toBe('botmux');
+        onLine('download https://deb.debian.org/debian/pool/main/t/tmux/tmux_3.5a-2~bpo12+1_amd64.deb');
+        onLine('  sha256 ok (8aedf15af88f47dd…)');
+        h.state.facts = { ...h.state.facts, client: NEW }; // tmuxEnv now resolves botmux's copy
+        return { ok: true, ran: ['https://deb.debian.org/…'], selected: NEW };
+      }),
+    });
+    await h.advisor.tick();
+    const reminder = JSON.stringify(h.state.sent[0]!.card);
+    expect(reminder).toContain('/home/u/.botmux/tools/tmux/current/bin/tmux');
+    expect(reminder).toContain('/home/u/.local/bin/tmux');
+    expect(h.buttonsOf(h.state.sent[0]!.card)).toEqual([TMUX_UPGRADE_ACTION_RUN]);
+    const res: any = await h.click(TMUX_UPGRADE_ACTION_RUN);
+    await res.afterAck();
+    expect(JSON.stringify(h.state.patches.map(p => p.card))).toContain('sha256 ok');
+    expect(h.store().card!.model.phase).toBe('pending_switch');
+    // Switching is still the owner's choice: nothing was suspended or killed.
+    expect(h.deps.fanOutSuspend).not.toHaveBeenCalled();
+    expect(h.deps.killServer).not.toHaveBeenCalled();
+  });
+
+  it('a host lacking the libraries gets a plain explanation, and can retry later', async () => {
+    const h = harness({
+      plan: async () => PREBUILT_PLAN,
+      executeUpgrade: vi.fn(async () => ({
+        ok: false, ran: [], failure: 'libs_missing' as const, error: 'missing', missingLibraries: ['libjemalloc.so.2', 'libutempter.so.0'],
+      })),
+    });
+    await h.advisor.tick();
+    const res: any = await h.click(TMUX_UPGRADE_ACTION_RUN);
+    await res.afterAck();
+    expect(h.store().card!.model).toMatchObject({ phase: 'upgrade_failed' });
+    expect(h.store().card!.model.error).toContain('libjemalloc.so.2');
+    expect(h.buttonsOf(h.lastCard())).toEqual([TMUX_UPGRADE_ACTION_RUN]);
+  });
+
+  it('checksum / download / verification / foreign failures are each worded for the owner', async () => {
+    for (const failure of ['checksum_mismatch', 'download_failed', 'verify_failed', 'foreign'] as const) {
+      const h = harness({
+        plan: async () => PREBUILT_PLAN,
+        executeUpgrade: vi.fn(async () => ({ ok: false, ran: [], failure, error: `DETAIL-${failure}` })),
+      });
+      await h.advisor.tick();
+      const res: any = await h.click(TMUX_UPGRADE_ACTION_RUN);
+      await res.afterAck();
+      const error = h.store().card!.model.error!;
+      expect(error).toContain(`DETAIL-${failure}`);
+      expect(error).not.toMatch(/tmux_upgrade\./);
+    }
+  });
+});

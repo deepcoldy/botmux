@@ -125,3 +125,54 @@ describe('tmux upgrade card', () => {
     for (const action of TMUX_UPGRADE_ACTIONS) expect(isBotmuxCardAction(action)).toBe(true);
   });
 });
+
+describe('tmux upgrade card — botmux\'s own prebuilt tmux', () => {
+  const prebuilt = {
+    auto: true,
+    display: 'tmux_3.5a-2~bpo12+1_amd64.deb',
+    tmuxPath: '/home/u/.local/bin/tmux',
+    prebuilt: { release: '3.5a', dir: '/home/u/.botmux/tools/tmux/current/bin/tmux', keepPath: '/home/u/.local/bin/tmux' },
+  };
+
+  it('says what is installed where, that the user\'s copy stays, and offers the same button', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const json = buildTmuxUpgradeCard(model('needs_upgrade', { plan: prebuilt }), 'n', locale);
+      expect(text(json)).toContain('3.5a');
+      expect(text(json)).toContain('/home/u/.botmux/tools/tmux/current/bin/tmux');
+      expect(text(json)).toContain('/home/u/.local/bin/tmux');
+      expect(text(json)).not.toMatch(/tmux_upgrade\./);
+      expect(buttons(json).map(b => b.value.action)).toEqual([TMUX_UPGRADE_ACTION_RUN]);
+    }
+    const upgrading = buildTmuxUpgradeCard(model('upgrading', { plan: prebuilt, log: ['sha256 ok'] }), 'n', 'zh');
+    expect(text(upgrading)).toContain('3.5a');
+    expect(text(upgrading)).toContain('sha256 ok');
+    expect(buttons(upgrading)).toEqual([]);
+  });
+
+  it('explains why the prebuilt route is unavailable, for every reason', () => {
+    for (const reason of ['platform', 'arch', 'glibc', 'extractor', 'libraries', 'outdated', 'managed_modified']) {
+      for (const locale of ['zh', 'en'] as const) {
+        const json = buildTmuxUpgradeCard(model('needs_upgrade', {
+          plan: {
+            auto: false, reason: 'unmanaged_binary', tmuxPath: '/home/u/.local/bin/tmux',
+            prebuiltUnavailable: { reason, detail: 'DETAIL', missingLibraries: ['libjemalloc.so.2'] },
+          },
+        }), 'n', locale);
+        expect(buttons(json)).toEqual([]);
+        expect(text(json)).not.toMatch(/tmux_upgrade\./);
+      }
+    }
+    const libs = buildTmuxUpgradeCard(model('needs_upgrade', {
+      plan: { auto: false, reason: 'needs_sudo', prebuiltUnavailable: { reason: 'libraries', missingLibraries: ['libjemalloc.so.2'] } },
+    }), 'n', 'zh');
+    expect(text(libs)).toContain('libjemalloc.so.2');
+  });
+
+  it('a modified botmux tmux directory is reported, never offered for overwrite', () => {
+    const json = buildTmuxUpgradeCard(model('needs_upgrade', {
+      plan: { auto: false, reason: 'managed_modified', tmuxPath: '/home/u/.botmux/tools/tmux' },
+    }), 'n', 'zh');
+    expect(buttons(json)).toEqual([]);
+    expect(text(json)).toContain('/home/u/.botmux/tools/tmux');
+  });
+});
