@@ -168,6 +168,7 @@ describe('grant-prefs store', () => {
       grantDefaultDurationMs: null,
       trustSameOwnerBots: true,
       grantDelegateBots: [],
+      scheduleCreateByTalkers: false,
     });
   });
 

@@ -2080,6 +2080,16 @@ export interface BotConfig {
    */
   p2pOpen?: boolean;
   /**
+   * 允许只有对话权限（canTalk，非管理员）的真人在对话里为**自己**创建定时任务。
+   * 默认关（undefined = 关），只落显式 true。开启后任务归发起人本人：只能投到当前会话、
+   * 不带任何委托/持久 run scope、每轮最多 1 个、每人最多 `scheduleTalkerMaxTasks` 个
+   * 存活任务；到点前复核「开关仍开 + 本人仍能在该群对话 + 仍是群成员」，任一不满足即
+   * 拒跑；只能由本人或管理员管理。见 core/schedule-talker.ts。
+   */
+  scheduleCreateByTalkers?: boolean;
+  /** 每位对话用户在本 bot 最多保留的存活（启用或暂停）talker 任务数；1–100，缺省 5。 */
+  scheduleTalkerMaxTasks?: number;
+  /**
    * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
    * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
    *
@@ -4566,6 +4576,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       globalGrants,
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
       p2pOpen: entry.p2pOpen === true || undefined,
+      scheduleCreateByTalkers: entry.scheduleCreateByTalkers === true || undefined,
+      scheduleTalkerMaxTasks: typeof entry.scheduleTalkerMaxTasks === 'number'
+        && Number.isInteger(entry.scheduleTalkerMaxTasks)
+        && entry.scheduleTalkerMaxTasks >= 1 && entry.scheduleTalkerMaxTasks <= 100
+        ? entry.scheduleTalkerMaxTasks
+        : undefined,
       messageQuota,
       grantDefaultDurationMs,
       quotaState,

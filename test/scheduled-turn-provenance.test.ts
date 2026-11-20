@@ -95,6 +95,11 @@ describe('authorizeScheduledTurn', () => {
       isScheduledTurnLive: () => true })).toEqual({ error: 'owner_revoked' });
   });
 
+  it('refuses a talk-only owner even when the host owner gate is a pass-through', () => {
+    writeTask({ ownerAccess: 'talk' });
+    expect(call()).toEqual({ error: 'owner_revoked' });
+  });
+
   function writeTask(over: Record<string, unknown> = {}, id: string = TASK_ID): void {
     const dir = dirname(schedulesPath());
     mkdirSync(dir, { recursive: true });

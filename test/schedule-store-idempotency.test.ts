@@ -225,6 +225,18 @@ describe('createTask — id provided, task exists with identical canonical input
     expect(task?.ownerUnionId).toBe('on_creator');
   });
 
+  it('rehydrates the talker marker from disk and treats it as canonical', async () => {
+    const { createTask, IdempotencyConflictError } = await freshImport();
+    createTask({ ...BASE_PARAMS, id: 'wf_talker_reload', ownerAccess: 'talk',
+      owner: { kind: 'human', openId: 'ou_talker', unionId: 'on_talker' } });
+    const reload = await freshImport();
+    expect(reload.getTask('wf_talker_reload')?.ownerAccess).toBe('talk');
+    // An administrator-shaped request for the same id is a different schedule.
+    expect(() => reload.createTask({ ...BASE_PARAMS, id: 'wf_talker_reload',
+      owner: { kind: 'human', openId: 'ou_talker', unionId: 'on_talker' } })).toThrow(reload.IdempotencyConflictError);
+    void IdempotencyConflictError;
+  });
+
   it('treats chatType as canonical because it changes future session semantics', async () => {
     const { createTask, IdempotencyConflictError } = await freshImport();
     const id = 'wf_chattype';
