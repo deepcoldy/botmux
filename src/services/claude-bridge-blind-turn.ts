@@ -133,11 +133,11 @@ export class BridgeBlindTurnWatch {
 }
 
 /** Whether any of these transcript records is a reply Claude wrote within
- *  [fromMs, toMs]: an assistant record, or the turn_duration closing a turn. A
- *  switch that replays, as live, a reply written while an unread run was going
- *  on has delivered that run; one that replays only later records (a `/resume`
- *  typed afterwards, a newer Lark message) or bookkeeping around the run (a
- *  `/clear` command record, a compact boundary) has not. */
+ *  [fromMs, toMs]: an assistant record, or the turn_duration closing a turn.
+ *  This is only the time-window half of the delivery check. The caller must
+ *  also prove the record was attributed to the unread run: the skew below a
+ *  run's busy evidence can contain the previous turn's reply, which timestamp
+ *  inspection alone cannot distinguish from this run's early first record. */
 export function replyRecordsStampedWithin(
   records: readonly { type?: unknown; subtype?: unknown; timestamp?: unknown }[],
   fromMs: number,

@@ -137,7 +137,7 @@ describe('worker trust set: what the CLI proved vs what was only guessed or swit
       bridgeMarkStalePidStateForAcceptedSid: () => {},
       fsWatch: () => ({ close: () => {} }),
       performBridgeIngestAndScheduleQuietEmit: () => {},
-      settleUnreadClaudeTurnLookOnSwitch: () => {},
+      ingestClaudeSwitchLiveAndSettleUnreadTurn: () => {},
     });
     loadWorkerFunction<(m: string, r: string, c: number) => void>('bridgeApplyFingerprintSwitch', scope)(`/p/${SIBLING}.jsonl`, 'test', 0);
     expect([...(scope.bridgeKnownSessionIds as Set<string>)]).toEqual([SIBLING]);

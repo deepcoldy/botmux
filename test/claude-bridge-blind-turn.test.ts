@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { terminalInputSubmits } from '../src/adapters/cli/tui-input.js';
-import { splitTranscriptEventsByCutoff } from '../src/services/claude-transcript.js';
+import { splitTranscriptEventsByCutoff, type TranscriptEvent } from '../src/services/claude-transcript.js';
+import { BridgeTurnQueue } from '../src/services/bridge-turn-queue.js';
 import {
   BLIND_TURN_MIN_BUSY_MS,
   BridgeBlindTurnWatch,
@@ -21,9 +22,16 @@ const paste = (text: string): string => `\x1b[200~${text}\x1b[201~`;
 const LOOK_AGAIN_WINDOW_MS = UNREAD_TURN_RELOCATE_RETRY_MS * UNREAD_TURN_RELOCATE_RETRIES;
 
 type Located = 'moved' | 'mid-rewrite' | 'none';
-type Records = Array<{ type?: string; subtype?: string; timestamp?: string }>;
-/** A reply record Claude wrote at `atMs`. */
-const stamped = (atMs: number): Records => [{ type: 'assistant', timestamp: new Date(atMs).toISOString() }];
+type Records = TranscriptEvent[];
+/** A reply record Claude wrote at `atMs`, with the identity the real queue
+ *  needs to dedupe and attribute it. */
+const stamped = (atMs: number): Records => [{
+  type: 'assistant', uuid: `reply-${atMs}`, timestamp: new Date(atMs).toISOString(),
+  message: { role: 'assistant', content: [{ type: 'text', text: `reply at ${atMs}` }] },
+}];
+const duration = (atMs: number): TranscriptEvent => ({
+  type: 'system', subtype: 'turn_duration', uuid: `duration-${atMs}`, timestamp: new Date(atMs).toISOString(),
+});
 
 /** The real worker functions over one shared scope: the PreCompact signal, a
  *  web-terminal forward, the prompt-ready judge, its later looks for the
@@ -40,10 +48,18 @@ function compactionWorker(relocate: () => Located = () => 'none', movedLive?: ()
   let busySinceMs = 0;
   let offset = 100;
   const scope: Record<string, unknown> = {};
-  /** A transcript switch onto NEW that replays `live`. */
+  /** A transcript switch onto NEW whose ingest attributes `live` to the
+   *  pending Lark turn when there is one, or to a local turn otherwise. */
   const switchTo = (live: Records): void => {
     scope.bridgeJsonlPath = NEW;
-    (scope.settleUnreadClaudeTurnLookOnSwitch as (live: Records) => void)(live);
+    const turn = pending.find(candidate => candidate.started)
+      ?? pending.find(candidate => !candidate.started && !candidate.isLocal);
+    const turnId = turn?.turnId ?? 'local-reply';
+    const isLocal = turn?.isLocal ?? true;
+    const attributed = live.filter(record => record.type === 'assistant'
+      || (record.type === 'system' && record.subtype === 'turn_duration'))
+      .map(record => ({ record, turnId, isLocal }));
+    (scope.settleUnreadClaudeTurnLookOnSwitch as (attributed: unknown) => void)(attributed);
   };
   const relocateUnreadClaudeTranscript = vi.fn((_blindSinceMs: number) => {
     const located = relocate();
@@ -291,6 +307,20 @@ describe('worker：判定时 Claude 的 pid 记录正被原地改写，先再找
     expect(w.notices()).toBe(1);
   });
 
+  it('再找自己的切换半途失败：当场告警，不把 look 留在已经没有 timer 的状态', () => {
+    const w = compactionWorker(() => 'mid-rewrite');
+    unreadTurn(w);
+    const fail = vi.fn(() => { throw new Error('ingest failed after the switch'); });
+    w.scope.relocateUnreadClaudeTranscript = fail;
+    vi.advanceTimersByTime(UNREAD_TURN_RELOCATE_RETRY_MS);
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(w.scope.unreadClaudeTurnLook).toBeUndefined();
+    expect(w.notices()).toBe(1);
+    vi.advanceTimersByTime(LOOK_AGAIN_WINDOW_MS);
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(w.notices()).toBe(1);
+  });
+
   it.each([
     ['开始了新的一轮', (w: ReturnType<typeof compactionWorker>) => w.busy()],
     ['离开了提示符', (w: ReturnType<typeof compactionWorker>) => { w.scope.isPromptReady = false; }],
@@ -325,6 +355,15 @@ describe('worker：判定时 Claude 的 pid 记录正被原地改写，先再找
     w.switchTo(stamped(startedAtMs - 1_000));
     vi.advanceTimersByTime(LOOK_AGAIN_WINDOW_MS);
     expect(w.notices()).toBe(0);
+  });
+
+  it('真实 judge 没记 turnId 时，已 started 的 managed 旧轮回复不能冒充本地当前轮', () => {
+    const w = compactionWorker(() => 'mid-rewrite');
+    w.pending.push({ started: true, isLocal: false, turnId: 'om_previous_managed' });
+    const { startedAtMs } = unreadTurn(w);
+    w.switchTo(stamped(startedAtMs - 1_000));
+    vi.advanceTimersByTime(LOOK_AGAIN_WINDOW_MS);
+    expect(w.notices()).toBe(1);
   });
 
   it.each([
@@ -392,15 +431,21 @@ describe.each(['performRotationSwitch', 'bridgeApplyFingerprintSwitch'])('worker
   });
   afterEach(() => vi.useRealTimers());
 
-  /** The real switch onto NEW while a look for a run judged at 90s (begun at
+  /** The real switch and queue while a look for a run judged at 90s (begun at
    *  80s) is pending; NEW holds `records`, all replayed as live. */
-  function switchWhileLooking(records: Records) {
+  function switchWhileLooking(records: Records, opts: {
+    turnId?: string;
+    prepareQueue?: (queue: BridgeTurnQueue) => void;
+  } = {}) {
     const look = vi.fn();
     const watch = new BridgeBlindTurnWatch();
     watch.noteTurnStarted({ path: OLD, offset: 100 }, 80_000);
     watch.noteTurnEnded({ path: OLD, offset: 100 }, 90_000);
+    const queue = new BridgeTurnQueue();
+    opts.prepareQueue?.(queue);
     const run = {
       path: OLD, blindSinceMs: 80_000, judgedAtMs: 90_000,
+      ...(opts.turnId ? { turnId: opts.turnId } : {}),
       promptReadyEdge: 1, writtenInput: undefined, webSubmitGeneration: 0,
     };
     const scope: Record<string, unknown> = {
@@ -410,7 +455,7 @@ describe.each(['performRotationSwitch', 'bridgeApplyFingerprintSwitch'])('worker
       drainTranscript: () => ({ newOffset: 1, events: records }),
       splitTranscriptEventsByCutoff,
       beginNewBridgeTranscriptGeneration: () => {},
-      bridgeQueue: { absorb: () => {}, ingest: () => {} },
+      bridgeQueue: queue,
       seedModelFallbackFromTranscript: () => {}, observeModelFallbackEvents: () => {},
       observeClaudeBackgroundTasks: () => {}, bridgeMarkStalePidStateForAcceptedSid: () => {},
       bridgeRememberSessionIdForPath: () => {},
@@ -422,18 +467,144 @@ describe.each(['performRotationSwitch', 'bridgeApplyFingerprintSwitch'])('worker
       PENDING_MARK_SKEW_MS: 5_000, replyRecordsStampedWithin,
       unreadClaudeTurnLook: { run, timer: setTimeout(look, UNREAD_TURN_RELOCATE_RETRY_MS) },
     };
-    for (const name of ['unreadClaudeTurnUndisturbed', 'settleUnreadClaudeTurnLookOnSwitch']) {
+    for (const name of [
+      'unreadClaudeTurnUndisturbed', 'settleUnreadClaudeTurnLookOnSwitch',
+      'ingestClaudeSwitchLiveAndSettleUnreadTurn',
+    ]) {
       scope[name] = loadWorkerFunction(name, scope);
     }
-    loadWorkerFunction<(path: string, reason: string, cutoffMs: number) => void>(switchFn, scope)(NEW, 'test', 0);
+    let switchError: unknown;
+    try {
+      if (switchFn === 'performRotationSwitch') {
+        loadWorkerFunction<(path: string, cutoffMs: number, reason: string) => void>(switchFn, scope)(NEW, 0, 'test');
+      } else {
+        loadWorkerFunction<(path: string, reason: string, cutoffMs: number) => void>(switchFn, scope)(NEW, 'test', 0);
+      }
+    } catch (error) {
+      switchError = error;
+    }
     vi.advanceTimersByTime(UNREAD_TURN_RELOCATE_RETRY_MS);
-    return { look, settled: scope.unreadClaudeTurnLook === undefined };
+    return { look, queue, switchError, settled: scope.unreadClaudeTurnLook === undefined };
   }
 
-  it('补读到漏读期间写的记录：结清，不再找', () => {
-    const { look, settled } = switchWhileLooking(stamped(85_000));
+  it.each([79_000, 85_000])('无 turnId 的本地轮补读到真实归因的回复（含 busy 前 1s）：结清，不再找', (atMs) => {
+    const { look, settled } = switchWhileLooking(stamped(atMs));
     expect(settled).toBe(true);
     expect(look).not.toHaveBeenCalled();
+  });
+
+  it('无 turnId 的本地轮只有当前轮 duration：真实归属后结清', () => {
+    const { look, settled } = switchWhileLooking([
+      { type: 'user', uuid: 'local-duration-user', timestamp: new Date(80_000).toISOString(),
+        message: { role: 'user', content: 'local duration prompt' } },
+      duration(81_000),
+    ]);
+    expect(settled).toBe(true);
+    expect(look).not.toHaveBeenCalled();
+  });
+
+  it('managed 当前轮的 prompt 与回复都真实归属该 turn：结清', () => {
+    const { look, settled } = switchWhileLooking([
+      { type: 'user', uuid: 'current-user', timestamp: new Date(80_000).toISOString(),
+        message: { role: 'user', content: 'current prompt' } },
+      ...stamped(81_000),
+    ], { turnId: 'om_unread', prepareQueue: queue => { queue.mark('om_unread'); } });
+    expect(settled).toBe(true);
+    expect(look).not.toHaveBeenCalled();
+  });
+
+  it('managed 当前轮只有 duration：marker 真实关闭该 turn 后结清', () => {
+    const { look, queue, settled } = switchWhileLooking([
+      { type: 'user', uuid: 'current-duration-user', timestamp: new Date(80_000).toISOString(),
+        message: { role: 'user', content: 'current duration prompt' } },
+      duration(81_000),
+    ], { turnId: 'om_unread', prepareQueue: queue => { queue.mark('om_unread'); } });
+    expect(settled).toBe(true);
+    expect(look).not.toHaveBeenCalled();
+    expect(queue.drainEmittable({ terminalBoundary: true })).toEqual([
+      expect.objectContaining({ turnId: 'om_unread', closedByDurationMarker: true }),
+    ]);
+  });
+
+  it('5 秒容差内已经出队的上一轮回复不算当前轮送达：留给再找告警', () => {
+    const previous = stamped(77_000)[0]!;
+    const { look, queue, settled } = switchWhileLooking([previous], {
+      turnId: 'om_unread',
+      prepareQueue: queue => {
+        queue.mark('om_previous');
+        queue.ingest([
+          { type: 'user', uuid: 'previous-user', timestamp: new Date(76_000).toISOString(),
+            message: { role: 'user', content: 'previous prompt' } },
+          previous,
+        ], OLD);
+        expect(queue.drainEmittable({ terminalBoundary: true })).toHaveLength(1);
+        queue.mark('om_unread');
+      },
+    });
+    expect(settled).toBe(false);
+    expect(look).toHaveBeenCalledTimes(1);
+    expect(queue.peek().map(turn => turn.turnId)).toEqual(['om_unread']);
+  });
+
+  it('5 秒容差内已经出队的上一轮 duration 不算当前轮送达：留给再找告警', () => {
+    const previous = duration(77_000);
+    const { look, queue, settled } = switchWhileLooking([previous], {
+      turnId: 'om_unread',
+      prepareQueue: queue => {
+        queue.mark('om_previous');
+        queue.ingest([
+          { type: 'user', uuid: 'previous-duration-user', timestamp: new Date(76_000).toISOString(),
+            message: { role: 'user', content: 'previous duration prompt' } },
+          previous,
+        ], OLD);
+        expect(queue.drainEmittable({ terminalBoundary: true })).toHaveLength(1);
+        queue.mark('om_unread');
+      },
+    });
+    expect(settled).toBe(false);
+    expect(look).toHaveBeenCalledTimes(1);
+    expect(queue.peek().map(turn => turn.turnId)).toEqual(['om_unread']);
+  });
+
+  it('补读真实归因到别的 turn，不算 managed 当前轮送达：留给再找告警', () => {
+    const { look, queue, settled } = switchWhileLooking([
+      { type: 'user', uuid: 'other-user', timestamp: new Date(80_000).toISOString(),
+        message: { role: 'user', content: 'another local prompt' } },
+      ...stamped(81_000),
+    ], {
+      turnId: 'om_unread',
+      prepareQueue: queue => { queue.mark('om_unread', 'managed prompt', undefined, 'managed prompt'); },
+    });
+    expect(settled).toBe(false);
+    expect(look).toHaveBeenCalledTimes(1);
+    expect(queue.peek().find(turn => turn.turnId === 'om_unread')?.started).toBe(false);
+  });
+
+  it('无 turnId 的 look 不接受真实归属已 started managed 旧轮的回复', () => {
+    const { look, queue, settled } = switchWhileLooking(stamped(79_000), {
+      prepareQueue: queue => {
+        queue.mark('om_previous_managed');
+        queue.ingest([
+          { type: 'user', uuid: 'previous-managed-user', timestamp: new Date(76_000).toISOString(),
+            message: { role: 'user', content: 'previous managed prompt' } },
+        ], OLD);
+      },
+    });
+    expect(queue.peek().find(turn => turn.turnId === 'om_previous_managed')?.assistantUuids)
+      .toEqual(['reply-79000']);
+    expect(settled).toBe(false);
+    expect(look).toHaveBeenCalledTimes(1);
+  });
+
+  it('切换已经改路、ingest 才失败：不结清，保留下一次再找去告警', () => {
+    const { look, switchError, settled } = switchWhileLooking(stamped(85_000), {
+      prepareQueue: queue => {
+        queue.ingest = () => { throw new Error('injected ingest failure'); };
+      },
+    });
+    expect((switchError as Error).message).toBe('injected ingest failure');
+    expect(settled).toBe(false);
+    expect(look).toHaveBeenCalledTimes(1);
   });
 
   it('只补读到判定之后的记录：留给再找去告警', () => {

@@ -11476,12 +11476,11 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   const drained = drainTranscript(matched, 0);
   bridgeOffset = drained.newOffset;
   const { history, live } = splitTranscriptEventsByCutoff(drained.events, cutoffMs);
-  settleUnreadClaudeTurnLookOnSwitch(live);
   // Switched files: re-arm marker verdicts for the new transcript; absorb
   // re-proves `seen` if the new file carries a marker.
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
-  if (live.length > 0) bridgeQueue.ingest(live, matched);
+  ingestClaudeSwitchLiveAndSettleUnreadTurn(live, matched);
   // The switch moved us onto another Claude session: rebind the fallback
   // tracker to it (seed always publishes, so the daemon drops whatever the
   // previous session left behind) before folding this file's own events in.
@@ -11762,12 +11761,11 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   const result = drainTranscript(newPath, 0);
   bridgeOffset = result.newOffset;
   const { history, live } = splitTranscriptEventsByCutoff(result.events, cutoffMs);
-  settleUnreadClaudeTurnLookOnSwitch(live);
   // New file = new writer generation: verdicts from the old transcript must
   // not carry over; absorb re-proves `seen` from the new file.
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
-  if (live.length > 0) bridgeQueue.ingest(live, newPath);
+  ingestClaudeSwitchLiveAndSettleUnreadTurn(live, newPath);
   // Same as the fingerprint switch: rebind the fallback tracker to the Claude
   // session we just rotated onto, then fold this file's own events in.
   seedModelFallbackFromTranscript();
@@ -12090,21 +12088,52 @@ function unreadClaudeTurnUndisturbed(run: UnreadClaudeTurnRun): boolean {
     && webTerminalSubmitGeneration === run.webSubmitGeneration;
 }
 
+/** A reply the switch's ingest actually attributed to a turn. Raw transcript
+ *  presence is not delivery evidence: an already-seen reply from the previous
+ *  turn can fall inside the replay skew window, but the queue consumes it
+ *  nowhere and the current run stays stranded. */
+interface UnreadTurnReplyAttribution {
+  record: { type?: unknown; subtype?: unknown; timestamp?: unknown };
+  turnId: string;
+  isLocal: boolean;
+}
+
+/** Ingest a switch's live records before deciding whether they settle a
+ *  deferred unread-turn notice. Keeping settlement after ingest also means an
+ *  ingest failure leaves the look alive, so its ordinary fail-closed path can
+ *  still report the run. */
+function ingestClaudeSwitchLiveAndSettleUnreadTurn(live: TranscriptEvent[], path: string): void {
+  const attributed: UnreadTurnReplyAttribution[] = [];
+  if (live.length > 0) {
+    bridgeQueue.ingest(live, path, (record, turn) => {
+      if (record.type === 'assistant') attributed.push({ record, turnId: turn.turnId, isLocal: turn.isLocal === true });
+    }, (record, turn) => {
+      attributed.push({ record, turnId: turn.turnId, isLocal: turn.isLocal === true });
+    });
+  }
+  settleUnreadClaudeTurnLookOnSwitch(attributed);
+}
+
 /** A transcript switch — a bridge follower's, or a look's own — while the
- *  bridge looks for an unread run's transcript. It delivered the run if Claude
- *  is still where the run left it and the switch replayed, as live, replies
- *  Claude wrote during the run: the look is settled then and there, so that no
- *  later disturbance, switch or teardown reports the run. Any other switch
- *  leaves the look to tell the group (recheckUnreadClaudeTurn). */
-function settleUnreadClaudeTurnLookOnSwitch(live: readonly { type?: unknown; subtype?: unknown; timestamp?: unknown }[]): void {
+ *  bridge looks for an unread run's transcript. It consumed the run if Claude
+ *  is still where the run left it and ingest attributed a reply written during
+ *  the run to that run's own Lark turn. Adopt / zero-injection local turns have
+ *  no Lark id to match; for those, actual attribution to a local turn is the
+ *  equivalent evidence. Anything less — including an old reply merely present
+ *  in the live time window — leaves the look to tell the group. */
+function settleUnreadClaudeTurnLookOnSwitch(attributed: readonly UnreadTurnReplyAttribution[]): void {
   const look = unreadClaudeTurnLook;
   if (!look || !unreadClaudeTurnUndisturbed(look.run)) return;
   // The same skew the relocation replays from: a turn's records can precede
-  // the busy evidence its run starts from.
-  if (!replyRecordsStampedWithin(live, look.run.blindSinceMs - PENDING_MARK_SKEW_MS, look.run.judgedAtMs)) return;
+  // the busy evidence its run starts from. Attribution, not the timestamp
+  // alone, distinguishes such a reply from the previous turn's replay.
+  const consumed = attributed.some(({ record, turnId, isLocal }) =>
+    (look.run.turnId ? turnId === look.run.turnId : isLocal)
+    && replyRecordsStampedWithin([record], look.run.blindSinceMs - PENDING_MARK_SKEW_MS, look.run.judgedAtMs));
+  if (!consumed) return;
   clearTimeout(look.timer);
   unreadClaudeTurnLook = undefined;
-  log(`Bridge transcript switch replayed the unread ${cliName()} run; no notice needed`);
+  log(`Bridge transcript switch attributed the unread ${cliName()} run's reply; no notice needed`);
 }
 
 /** Look for an unread run's transcript once more. Its notice is dropped only on
@@ -12124,7 +12153,17 @@ function recheckUnreadClaudeTurn(run: UnreadClaudeTurnRun, attempt: number): voi
     notifyUnreadClaudeTurn(run);
     return;
   }
-  const located = relocateUnreadClaudeTranscript(run.blindSinceMs);
+  let located: ReturnType<typeof relocateUnreadClaudeTranscript>;
+  try {
+    located = relocateUnreadClaudeTranscript(run.blindSinceMs);
+  } catch (err: any) {
+    // This look's timer has already fired. If its own switch fails mid-ingest,
+    // leaving the look merely alive would strand it with no timer left.
+    unreadClaudeTurnLook = undefined;
+    log(`Bridge transcript recovery during the unread-turn recheck failed: ${err.message}`);
+    notifyUnreadClaudeTurn(run);
+    return;
+  }
   if (look && unreadClaudeTurnLook !== look) {
     // The switch replayed the run, at the prompt it was judged on: drain as
     // that edge would have.
