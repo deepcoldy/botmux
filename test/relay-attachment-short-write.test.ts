@@ -37,7 +37,9 @@ afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe('materializeRelayedAttachments completes partial writes', () => {
   const placeholder = 'botmux-session-tool://attachment/0';
-  const payload = Buffer.from('A'.repeat(100));
+  // Non-repeating payload (period 251 > length), so an offset/slice mistake
+  // cannot hide behind identical adjacent bytes — a full equals() catches it.
+  const payload = Buffer.from(Array.from({ length: 100 }, (_, i) => (i * 7 + 3) % 251));
   const stdout = JSON.stringify({ attachments: [{ path: placeholder, name: 'a.bin', type: 'file' }] });
   const att = [{ placeholder, name: 'a.bin', type: 'file' as const, dataBase64: payload.toString('base64') }];
 
@@ -46,7 +48,9 @@ describe('materializeRelayedAttachments completes partial writes', () => {
     const dir = join(root, 'quoted-1');
     const out = materializeRelayedAttachments(stdout, att, dir);
     const parsed = JSON.parse(out) as { attachments: Array<{ path: string }> };
-    expect(readFileSync(parsed.attachments[0]!.path).length).toBe(payload.length);
+    const landed = readFileSync(parsed.attachments[0]!.path);
+    expect(landed.length).toBe(payload.length);
+    expect(landed.equals(payload)).toBe(true); // exact bytes, not just length
   });
 
   it('still writes the full file on the normal single-write path', () => {
