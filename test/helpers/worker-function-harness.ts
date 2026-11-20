@@ -16,6 +16,8 @@
  * worker globals it reads; renaming either fails loudly (missing function /
  * undefined read), never silently green.
  */
+import { paneReplyDeliveryFromProcessTree } from '../../src/services/pane-reply-delivery.js';
+import { REPLY_DELIVERY_ENV } from '../../src/services/send-completion-hint.js';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -192,6 +194,8 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (keepaliveDefault !== undefined) return keepaliveDefault;
     if (key === 'stripTrailingBridgeSentinelLine') return stripTrailingBridgeSentinelLine;
     if (key === 'isFinalBridgeSendMarker') return isFinalBridgeSendMarker;
+    if (key === 'paneReplyDeliveryFromProcessTree') return paneReplyDeliveryFromProcessTree;
+    if (key === 'REPLY_DELIVERY_ENV') return REPLY_DELIVERY_ENV;
     if (key === 'rewindableErrorCode') return rewindableErrorCode;
     if (key === 'transcriptTurnFailedWithoutOutput') return transcriptTurnFailedWithoutOutput;
     if (key === 'pruneRewindBackupsBeside') return pruneRewindBackupsBeside;
