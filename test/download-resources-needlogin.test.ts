@@ -131,3 +131,23 @@ describe('video attachments and CLI media hints', () => {
       .not.toContain('<video_hint>');
   });
 });
+
+describe('downloadResources: Lark file names stay inside the message directory', () => {
+  it('reduces a traversal name to its basename and falls back to the key for `..`', async () => {
+    (downloadMessageResource as any).mockResolvedValue(undefined);
+    await downloadResources('app', 'om_1', [
+      { type: 'file', key: 'file_k1', name: '../../../../bin/botmux' },
+      { type: 'file', key: 'file_k2', name: '..' },
+      { type: 'file', key: 'file_k3', name: 'report.pdf' },
+    ] as any);
+    const paths = (downloadMessageResource as any).mock.calls.map((c: any[]) => c[4] as string);
+    expect(paths[0]).toMatch(/\/attachments\/app\/om_1\/botmux$/);
+    expect(paths[1]).toMatch(/\/attachments\/app\/om_1\/file_k2$/);
+    expect(paths[2]).toMatch(/\/attachments\/app\/om_1\/report\.pdf$/);
+    for (const p of paths) expect(p).not.toContain('..');
+    // and the downloader is told which root the directory must resolve under
+    for (const call of (downloadMessageResource as any).mock.calls) {
+      expect(call[6]).toMatchObject({ withinRoot: expect.stringMatching(/\/attachments$/) });
+    }
+  });
+});

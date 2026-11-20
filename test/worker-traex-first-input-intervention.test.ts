@@ -262,7 +262,11 @@ describe('Web startup protocol activity and recovery', () => {
     expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])('rechecks the deadline when a drain resolves late (firstSubmitConfirmed=%s)', async confirmed => {
+  // A drain that settles after the 90s notice still carries current evidence
+  // (same screen revision, same Web epoch) and the admission re-reads the
+  // screen right then. Refusing it would strand the queued first input for
+  // good once anyone touched the terminal the notice points them to.
+  it.each([false, true])('admits on current evidence when a drain resolves after the deadline (firstSubmitConfirmed=%s)', async confirmed => {
     const h = makeStartupSampler(RESOLVED);
     const head = h.scope.pendingMessages[0];
     h.scope.nativeState = 'idle';
@@ -285,15 +289,82 @@ describe('Web startup protocol activity and recovery', () => {
     for (let i = 0; i < 12; i++) await Promise.resolve();
     await h.flush();
 
-    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(confirmed ? 1 : 0);
-    if (confirmed) {
-      expect(h.scope.pendingMessages).toHaveLength(0);
-      expect(h.scope.traexFirstInputAdmissionPending).toBe(false);
-    } else {
-      expect(h.scope.pendingMessages[0]).toBe(head);
-      expect(h.scope.traexFirstInputAdmissionPending).toBe(true);
-      expect(h.scope.traexStartupWebRecheck).toBeUndefined();
-    }
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(h.scope.pendingMessages).toHaveLength(0);
+    expect(h.scope.pendingMessages).not.toContain(head);
+    // This harness's write stays unconfirmed: its first-input lease remains.
+    expect(h.scope.traexFirstInputAdmissionPending).toBe(!confirmed);
+    expect(h.scope.traexStartupWebRecheck).toBeUndefined();
+  });
+
+  it('does not admit or keep retrying past the deadline when the screen moved during a late drain', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    const head = h.scope.pendingMessages[0];
+    h.scope.nativeState = 'idle';
+    h.scope.traexFirstSubmitConfirmed = false;
+    h.scope.traexFirstPromptDeadlineAt = 90_000;
+    let finish!: () => void;
+    h.scope.renderer.writeAndFlush = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+    h.scope.markPromptReady = vi.fn();
+    h.scope.flushPending = vi.fn(() => h.flush());
+
+    vi.setSystemTime(88_000);
+    h.noteWebInput('\x1b[A');
+    h.scope.backendScreenRevision += 1;
+    vi.setSystemTime(89_000);
+    expect(h.pending()).toBe(true);
+    vi.setSystemTime(91_000);
+    h.scope.backendScreenRevision += 1;
+    finish();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages[0]).toBe(head);
+    expect(h.scope.traexStartupWebRecheck).toBeUndefined();
+  });
+
+  it('re-drives a stale late drain after an owned receipt extends its already-captured deadline', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    h.scope.traexFirstSubmitConfirmed = false;
+    h.scope.traexFirstPromptDeadlineAt = 90_000;
+    let finish!: () => void;
+    h.scope.renderer.writeAndFlush = vi.fn()
+      .mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }))
+      .mockResolvedValue(undefined);
+    h.scope.flushPending = vi.fn(async () => { h.pending(); });
+
+    vi.setSystemTime(88_000);
+    h.noteWebInput('\x1b[A');
+    h.scope.backendScreenRevision += 1;
+    vi.setSystemTime(89_000);
+    expect(h.pending()).toBe(true);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(89_500);
+    const quarantine = {
+      backend: h.scope.backend,
+      generation: h.scope.cliSpawnGeneration,
+      draftContent: 'first', turnId: 'first', dispatchAttempt: 1,
+    };
+    h.scope.inputDeliveryQuarantine = quarantine;
+    const release = loadWorkerFunction<(q: unknown, reason: string, opts: { redriveTerminal: boolean }) => boolean>(
+      'releaseInputDeliveryQuarantine', h.scope);
+    expect(release(quarantine, 'owned late submit receipt', { redriveTerminal: true })).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+
+    // The old frame changes during the drain and is correctly rejected. The
+    // receipt must nevertheless let the finally arm a fresh post-90s retry.
+    vi.setSystemTime(91_000);
+    h.scope.backendScreenRevision += 1;
+    finish();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(h.scope.traexStartupWebRecheck).toBeDefined();
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(2);
+    expect(h.admissions()).toBe(1);
+    expect(h.scope.traexStartupWebRecheck).toBeUndefined();
   });
 
   it('recovers a transient renderer drain within the fixed startup deadline', async () => {

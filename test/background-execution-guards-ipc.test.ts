@@ -100,6 +100,14 @@ describe.skipIf(process.platform !== 'linux')('background execution HTTP guards'
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ok: true, mode, credential: `test-${mode}-token` });
   });
+  it('keeps detached bot credentials when a live oncall-only flag does not apply to the job', async () => {
+    bot.sandboxWithholdBotSecret = true;
+    registerSelf();
+    vi.spyOn(registry, 'getBotClient').mockReturnValue({ tokenManager: { getTenantAccessToken: async () => 'test-bot-token' } } as any);
+    const response = await lark('bot');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, mode: 'bot', credential: 'test-bot-token' });
+  });
   it.each((['user', 'bot'] as const).flatMap(mode =>
     (['revoke', 'pause', 'expiry'] as const).map(change => [mode, change] as const)))(
     'rechecks detached %s authority after %s during provider await', async (mode, change) => {

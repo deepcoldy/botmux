@@ -18,6 +18,13 @@
  *    compacting screen and the composer after Enter / Esc. Captured from the
  *    real binary against a local fake API (the menu needs the managed
  *    provider's cache rules, served by the same fake).
+ *  - Antigravity CLI 1.5.12 (its own `antigravity` family): the ask_question
+ *    picker (single / multi-select, an open write-in field, 60x24, with a
+ *    stacked statusLine row, the next question after Esc) and the
+ *    run_command permission dialog; plus the screens around them — the ask
+ *    hook still waiting (spinner, a message queued under it), the answer and
+ *    the skip in the transcript, the interrupt after Esc. Real binary against
+ *    a local fake Gemini API, 120x40 unless named.
  *
  * Every positive screen here was missed by the base classifier (footers,
  * "<Event> hooks" titles and the singular state line of these builds), so a
@@ -29,6 +36,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { classifyStuckPage, shouldHoldInputForStuckPage } from '../src/utils/stuck-detector.js';
 import { kimiCacheExpiryMenuTail, matchKimiCacheExpiryMenu } from '../src/utils/kimi-cache-expiry-menu.js';
+import { antigravityBlockingPageTail } from '../src/utils/antigravity-blocking-page.js';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { diagnoseBackendSubmitFailure } from '../src/services/submit-failure-diagnosis.js';
 import { detectCliStartupBlocker, screenMayShowCredential } from '../src/core/cli-startup-blocker.js';
@@ -116,10 +124,43 @@ const KIMI_NOT_PAGES = [
 ];
 const isKimiFixture = (name: string) => name.startsWith('kimi-');
 
+/** Antigravity's pickers, read as the `antigravity` family. */
+const AGY_PAGES: Record<string, ReturnType<typeof classifyStuckPage>> = {
+  'agy-1.5.12-question-single-select.txt': 'antigravity question',
+  'agy-1.5.12-question-multi-select.txt': 'antigravity question',
+  'agy-1.5.12-question-write-in-open.txt': 'antigravity question',
+  'agy-1.5.12-question-60x24.txt': 'antigravity question',
+  // 44 columns: agy cuts the hint bar (`… · enter Select · esc`, `… · ent`).
+  'agy-1.5.12-question-44x30.txt': 'antigravity question',
+  'agy-1.5.12-question-multi-select-44x30.txt': 'antigravity question',
+  'agy-1.5.12-permission-run-command-44x30.txt': 'antigravity permission',
+  // 30 options in a 24-row pane: the title and `Question 1/1:` header are off screen.
+  'agy-1.5.12-question-header-scrolled-off-120x24.txt': 'antigravity question',
+  'agy-1.5.12-question-statusline.txt': 'antigravity question',
+  'agy-1.5.12-question-after-esc-skip.txt': 'antigravity question',
+  'agy-1.5.12-permission-run-command.txt': 'antigravity permission',
+};
+/** agy screens without a picker: input may go in (the composer, or agy's own
+ *  queue while the ask hook waits). The picker's text above the composer
+ *  (answered / skipped) is history, not a page. */
+const AGY_NOT_PAGES = [
+  'agy-1.5.12-hook-waiting.txt',
+  'agy-1.5.12-hook-waiting-queued-message.txt',
+  'agy-1.5.12-composer-after-hook-answer.txt',
+  'agy-1.5.12-composer-after-answer.txt',
+  'agy-1.5.12-composer-after-skip-all.txt',
+  'agy-1.5.12-interrupted-after-esc.txt',
+];
+const isAgyFixture = (name: string) => name.startsWith('agy-');
+const fixtureFamily = (name: string) => (isKimiFixture(name) ? 'kimi' : isAgyFixture(name) ? 'antigravity' : 'codex-family');
+
 describe('classifyStuckPage over real captures', () => {
   it('covers every plain-text fixture in the directory exactly once', () => {
     const plain = readdirSync(DIR).filter(name => name.endsWith('.txt') && !name.endsWith('.ansi.txt')).sort();
-    expect([...Object.keys(PAGES), ...NOT_PAGES, ...Object.keys(KIMI_PAGES), ...KIMI_NOT_PAGES].sort()).toEqual(plain);
+    expect([
+      ...Object.keys(PAGES), ...NOT_PAGES, ...Object.keys(KIMI_PAGES), ...KIMI_NOT_PAGES,
+      ...Object.keys(AGY_PAGES), ...AGY_NOT_PAGES,
+    ].sort()).toEqual(plain);
   });
 
   it.each(Object.entries(PAGES))('%s → %s, and holds queued input', (name, page) => {
@@ -138,10 +179,11 @@ describe('classifyStuckPage over real captures', () => {
     readdirSync(DIR).filter(name => name.endsWith('.ansi.txt')).sort(),
   )('%s (capture-pane -e) classifies like its plain capture', name => {
     const plain = name.replace(/\.ansi\.txt$/, '.txt');
-    const family = isKimiFixture(name) ? 'kimi' : 'codex-family';
+    const family = fixtureFamily(name);
     expect(classifyStuckPage(fixture(name), family)).toBe(classifyStuckPage(fixture(plain), family));
     // The pair must be a real page or a real non-page, never an unlisted one.
-    expect(plain in PAGES || NOT_PAGES.includes(plain) || plain in KIMI_PAGES || KIMI_NOT_PAGES.includes(plain)).toBe(true);
+    expect(plain in PAGES || NOT_PAGES.includes(plain) || plain in KIMI_PAGES || KIMI_NOT_PAGES.includes(plain)
+      || plain in AGY_PAGES || AGY_NOT_PAGES.includes(plain)).toBe(true);
   });
 });
 
@@ -240,6 +282,131 @@ describe('Kimi Code cache-expiry menu (kimi family) over real captures', () => {
     expect(tail).not.toContain('Summarize the project layout');
     expect(tail).not.toContain('Never Ask');
     expect(kimiCacheExpiryMenuTail(fixture('kimi-2.5.3-composer-after-esc-80x24.txt'))).toBe('');
+  });
+});
+
+describe('Antigravity pickers (antigravity family) over real captures', () => {
+  it.each(Object.entries(AGY_PAGES))('%s → %s, and holds queued input', (name, page) => {
+    const screen = fixture(name);
+    expect(classifyStuckPage(screen, 'antigravity')).toBe(page);
+    expect(shouldHoldInputForStuckPage(screen, 'antigravity')).toBe(true);
+  });
+
+  it.each(AGY_NOT_PAGES)('%s is not a picker', name => {
+    expect(classifyStuckPage(fixture(name), 'antigravity')).toBeUndefined();
+    expect(shouldHoldInputForStuckPage(fixture(name), 'antigravity')).toBe(false);
+  });
+
+  // The worker also reads screens through xterm (renderer.rawSnapshot): box
+  // rules blanked, runs of spaces collapsed.
+  it.each(Object.keys(AGY_PAGES).concat(AGY_NOT_PAGES))('%s classifies the same through the worker\'s xterm text', async name => {
+    const [cols, rows] = name.includes('60x24') ? [60, 24] : name.includes('44x30') ? [44, 30] : name.includes('120x24') ? [120, 24] : [120, 40];
+    const renderer = new TerminalRenderer(cols, rows);
+    try {
+      await renderer.writeAndFlush(fixture(name).replace(/\s+$/, '').split('\n').join('\r\n'));
+      const xtermText = renderer.rawSnapshot();
+      expect(xtermText).not.toContain('────');
+      expect(classifyStuckPage(xtermText, 'antigravity')).toBe(AGY_PAGES[name]);
+    } finally {
+      renderer.dispose();
+    }
+  });
+
+  it('pages are read per family: no other family sees an agy picker, agy sees no other family\'s page', () => {
+    for (const name of [...Object.keys(AGY_PAGES), ...AGY_NOT_PAGES]) {
+      expect(classifyStuckPage(fixture(name), 'codex-family'), name).toBeUndefined();
+      expect(classifyStuckPage(fixture(name), 'kimi'), name).toBeUndefined();
+    }
+    for (const name of [...Object.keys(PAGES), ...NOT_PAGES, ...Object.keys(KIMI_PAGES), ...KIMI_NOT_PAGES]) {
+      expect(classifyStuckPage(fixture(name), 'antigravity'), name).toBeUndefined();
+    }
+  });
+
+  const single = () => fixture('agy-1.5.12-question-single-select.txt');
+  it.each([
+    // The picker quoted in the transcript, the live composer and ready footer below it.
+    (screen: string) => screen.replace(/esc to cancel.*$/m, '─'.repeat(40) + '\n>\n' + '─'.repeat(40) + '\n? for shortcuts      Gemini 3.1 Pro · low'),
+    // A composer row under the busy status row is not the picker's screen.
+    (screen: string) => `${screen.trimEnd()}\n> typed\n`,
+    // The hint bar reworded or not directly above the busy status row.
+    (screen: string) => screen.replace('↑/↓ Navigate · → Next', 'Use the arrows · → Next'),
+    (screen: string) => screen.replace(/^(\s*↑\/↓ Navigate.*)$/m, '$1\n  a quoted note'),
+    // No busy status row under the bar (the bar is the bottom row).
+    (screen: string) => screen.replace(/^esc to cancel.*$/m, ''),
+    // Fewer than two numbered options left.
+    (screen: string) => screen.replace(/^\s*(?:>\s*)?[1-3]\. .*$/gm, ''),
+    // Neither the header + title nor the picker's own bottom rows.
+    (screen: string) => screen.replace('Question 1/2: Which', 'Which').replace('4. Write-in...', '4. Other')
+      .replace('enter Select · esc Skip', 'enter Select').replace('→ Next · ', ''),
+    // A header without its title is not enough either, without those bottom rows.
+    (screen: string) => screen.replace(/^Question$/m, '').replace('4. Write-in...', '4. Other')
+      .replace('enter Select · esc Skip', 'enter Select').replace('→ Next · ', ''),
+    // Not during a turn: the ready footer instead of the busy status row.
+    (screen: string) => screen.replace(/esc to cancel/, '? for shortcuts'),
+  ])('does not recognise quoted, incomplete or reworded question pickers %#', change => {
+    const screen = change(single());
+    expect(screen).not.toBe(single());
+    expect(classifyStuckPage(screen, 'antigravity')).toBeUndefined();
+  });
+
+  it.each([
+    (screen: string) => screen.replace('↑/↓ Navigate · tab Amend', 'Navigate · tab Amend'),
+    (screen: string) => screen.replace(/^\s*(?:>\s*)?\d+\. (?:Yes|No).*$/gm, ''),
+    // The write-in bar belongs to the question picker only.
+    (screen: string) => screen.replace(/^\s*↑\/↓ Navigate.*$/m, '  enter Submit All · esc Back'),
+  ])('does not recognise an incomplete permission dialog %#', change => {
+    const screen = change(fixture('agy-1.5.12-permission-run-command.txt'));
+    expect(classifyStuckPage(screen, 'antigravity')).toBeUndefined();
+  });
+
+  it.each([
+    // Without its header, a list is the question picker only by its own bottom
+    // rows: the write-in row above the bar, or a question-only hint.
+    (screen: string) => screen.replace('31. Write-in...', '31. Option number 31').replace('enter Select · esc Skip', 'enter Select'),
+    (screen: string) => screen.replace(/^\s*\d+\. Option number \d+$/gm, '').replace('31. Write-in...', ''),
+  ])('a list without its header and without the picker\'s own bottom rows is not the question picker %#', change => {
+    const screen = change(fixture('agy-1.5.12-question-header-scrolled-off-120x24.txt'));
+    expect(screen).not.toBe(fixture('agy-1.5.12-question-header-scrolled-off-120x24.txt'));
+    expect(classifyStuckPage(screen, 'antigravity')).toBeUndefined();
+  });
+
+  it('with its header or title off screen the picker is known by its bottom rows', () => {
+    for (const screen of [
+      single().replace('Question 1/2: Which', 'Which'),
+      single().replace(/^Question$/m, ''),
+    ]) expect(classifyStuckPage(screen, 'antigravity')).toBe('antigravity question');
+  });
+
+  it.each(['agy-1.5.12-permission-run-command.txt', 'agy-1.5.12-permission-run-command-44x30.txt'])(
+    '%s: the command the dialog asks about never leaves the terminal, even wrapped over rows',
+    name => {
+      const tail = antigravityBlockingPageTail(fixture(name));
+      expect(tail).toContain('Requesting permission for:');
+      expect(tail).toContain('‹hidden›');
+      expect(tail).not.toContain('/tmp/agy-probe-perm-marker-xyz');
+      expect(tail).not.toContain('echo');
+      expect(tail).toMatch(/Run this command\?/);
+    },
+  );
+
+  it('the narrow-pane captures really carry a cut hint bar, and the statusLine capture a row under the status row', () => {
+    expect(fixture('agy-1.5.12-question-44x30.txt')).toMatch(/enter Select · esc\s*$/m);
+    expect(fixture('agy-1.5.12-question-multi-select-44x30.txt')).toMatch(/space Toggle · ent\s*$/m);
+    expect(fixture('agy-1.5.12-question-statusline.txt')).toMatch(/esc to cancel.*\nSTATUSLINE_PROBE_ROW/);
+  });
+
+  it('a card tail carries only the picker rows, never the conversation above it', () => {
+    const tail = antigravityBlockingPageTail(single());
+    expect(tail).toContain('Question 1/2: Which database should we use?');
+    expect(tail).toContain('> 1. (Recommended) PostgreSQL');
+    expect(tail).not.toContain('please ask me');
+    expect(tail).not.toContain('Antigravity CLI');
+    expect(tail).not.toContain('esc to cancel');
+    const perm = antigravityBlockingPageTail(fixture('agy-1.5.12-permission-run-command.txt'));
+    expect(perm).toContain('Requesting permission for:');
+    expect(perm).toContain('4. No, cancel');
+    expect(perm).not.toContain('run it');
+    expect(antigravityBlockingPageTail(fixture('agy-1.5.12-composer-after-answer.txt'))).toBe('');
   });
 });
 
