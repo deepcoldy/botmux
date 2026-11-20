@@ -505,6 +505,7 @@ import {
   forkWorker,
   forkAdoptWorker,
   sendWorkerInput,
+  assistantLiveInputAdmission,
   promoteQueuedActivationTail,
   admitQueuedActivationTail,
   reserveQueuedActivationTailAdmission,
@@ -23629,7 +23630,7 @@ async function admitFollowerBehindOpening(
   await runSessionTurn(ds.session.sessionId, async () => {
     const cliInput = await follower.build();
     if (follower.isCurrent && !follower.isCurrent()) throw new Error('Effort task session changed before queued activation admission');
-    admitQueuedActivationTail(ds, {
+    const admitted = admitQueuedActivationTail(ds, {
       userPrompt: follower.userPrompt,
       cliInput,
       turnId: follower.turnId,
@@ -23637,6 +23638,7 @@ async function admitFollowerBehindOpening(
         ? { dispatchAttempt: follower.dispatchAttempt }
         : {}),
     }, reservation);
+    if (!admitted) return;
     if (!ds.initialStartPending && !releaseQueuedActivationReservationNow(ds)) {
       scheduleQueuedActivationTailReleaseRetry(ds);
     }
@@ -23727,11 +23729,12 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
     reservation.codexAppInputAccepted = bufferedGateDecisions.length > 0
       && bufferedGateDecisions.every(Boolean);
     try {
-      admitQueuedActivationTail(ds, {
+      const admitted = admitQueuedActivationTail(ds, {
         userPrompt: rawCodexText || buffered.join('\n\n'),
         cliInput: followUp,
         turnId,
       }, reservation);
+      if (!admitted) return false;
     } catch (err) {
       logger.error(
         `[${ds.session.sessionId.slice(0, 8)}] Failed to persist buffered activation successor: `
@@ -31348,6 +31351,16 @@ async function handleThreadReplyAdmitted(
     ?? initialCodexAppMessageContext;
   const codexAppApplicationContext = initialCodexAppApplicationContext;
 
+  // 附件落盘也是一次跨 owner 写入，必须早于 download / prepared attachments 交接。
+  // 已经跑过或已带 owner 的会话若不再属于当前主人，先走统一的提示重发 + 退役；
+  // 尚未跑过、等待 fork adopt 的全新会话仍由 fork 闸认领，不在这里误拒。
+  const existingAssistantSession = ds && (ds.hasHistory || !!ds.session.cliSessionId || !!ds.session.assistantOwnerOpenId);
+  if (ds && existingAssistantSession
+    && !assistantLiveInputAdmission(ds, parsed.messageId, { context: 'attachment ingress' })) {
+    markIngressAdmitted(ctx);
+    return;
+  }
+
   // Download attachments
   const effectiveAppId = ds?.larkAppId ?? larkAppId;
   // Same value the turn record below is built from; read here because the
@@ -31685,11 +31698,15 @@ async function handleThreadReplyAdmitted(
         if (codexAppSteerable) exactFollowUp.codexAppSteerable = true;
         // No await separates this arrival from its admission, so the FIFO
         // order is stamped by the admit itself.
-        admitQueuedActivationTail(ds, {
+        const admitted = admitQueuedActivationTail(ds, {
           userPrompt: promptContent,
           cliInput: exactFollowUp,
           turnId: parsed.messageId,
         });
+        if (!admitted) {
+          markIngressAdmitted(ctx);
+          return;
+        }
       }
       // 本轮已持久化接纳（durable opening 或 durable tail）；下面的状态回复再
       // 失败也不得诱导重发（PR #846 review）。

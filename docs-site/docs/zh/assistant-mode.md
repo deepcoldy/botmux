@@ -10,14 +10,13 @@
 {
   "assistantMode": true,
   "sandbox": true,
-  "assistantTemplateDir": "~/assistant-template",
-  "assistantLarkBotIdentity": false
+  "assistantTemplateDir": "~/assistant-template"
 }
 ```
 
 - `assistantMode`：开关。**必须同时开 `sandbox: true`（oncall 白名单沙盒）**，否则会话一律拒绝启动——没有沙盒就没有隔离，退回共享目录正是这个模式要堵的洞。也可用 `/botconfig assistantMode on` 即时切换。
 - `assistantTemplateDir`：模板目录（可选，缺省用 bot 的默认工作目录）。每次会话启动前把模板里的文件**覆盖**同步进主人的工作目录（模板没有的文件不删，主人自己的产物保留；不跟符号链接）。管理员维护共享知识 / CLAUDE.md 就放这里。
-- `assistantLarkBotIdentity`：是否允许会话里的 `lark-cli` 用 **bot 身份**调飞书接口。缺省 `false`——bot 身份能读它所在的任何群和私聊，等于绕过隔离；只留 `--as user`（主人自己的授权）。
+- 助理模式会话里的 `lark-cli` 不能使用 **bot 身份**调飞书接口——bot 身份能读它所在的任何群和私聊，等于绕过隔离；只留 `--as user`（主人自己的授权）。
 
 开启前请把 bot 级 `~/.botmux/bots/<appId>/claude/projects/` 里旧的共享记忆归档（它们对助理会话不可见，但仍是明文留在宿主上）。
 

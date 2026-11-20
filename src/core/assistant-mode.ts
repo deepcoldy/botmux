@@ -166,15 +166,14 @@ export function notifyAssistantOwnerChanged(larkAppId: string, chatId: string, n
  * （effectiveDefaultWorkingDir）。
  */
 export function assistantInitFields(
-  cfg: { assistantMode?: boolean; assistantTemplateDir?: string; assistantLarkBotIdentity?: boolean },
+  cfg: { assistantMode?: boolean; assistantTemplateDir?: string },
   ownerOpenId: string | undefined,
   fallbackTemplateDir: string | undefined,
-): { assistantOwnerOpenId?: string; assistantTemplateDir?: string; assistantLarkBotIdentity?: boolean } {
+): { assistantOwnerOpenId?: string; assistantTemplateDir?: string } {
   if (cfg.assistantMode !== true || !isValidAssistantOpenId(ownerOpenId)) return {};
   const tpl = cfg.assistantTemplateDir ?? fallbackTemplateDir;
   return {
     assistantOwnerOpenId: ownerOpenId,
     ...(tpl ? { assistantTemplateDir: tpl } : {}),
-    ...(cfg.assistantLarkBotIdentity === true ? { assistantLarkBotIdentity: true } : {}),
   };
 }

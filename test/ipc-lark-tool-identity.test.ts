@@ -303,6 +303,22 @@ describe('session application identity route', () => {
       vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
     }
   });
+  it('rechecks live assistant withholding after a slow tenant-token lookup', async () => {
+    const liveConfig: any = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' };
+    vi.mocked(bots.getBot).mockImplementation(() => ({ config: liveConfig }) as any);
+    let releaseToken!: (value: string) => void;
+    botToken.mockImplementation(() => new Promise<string>(resolve => { releaseToken = resolve; }));
+    const pending = request('bot');
+    await vi.waitFor(() => expect(botToken).toHaveBeenCalledOnce());
+    liveConfig.assistantMode = true;
+    // Even a legacy session whose worker has already stopped must not receive a
+    // late credential while its active row is still retiring.
+    session.worker = null;
+    releaseToken('late-bot-token');
+    const response = await pending;
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, error: 'lark_tool_bot_identity_withheld' });
+  });
   it('binds bot and current user without requiring triggerUserAuth configuration', async () => {
     const bot = await request('bot'); const raw = await bot.text();
     expect(bot.status).toBe(200);

@@ -9,7 +9,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 
 const admission = vi.hoisted(() => ({ decision: { kind: 'allow' } as any }));
-vi.mock('../src/core/assistant-spawn.js', () => ({ decideAssistantAdmission: () => admission.decision }));
+vi.mock('../src/core/assistant-spawn.js', () => ({
+  decideAssistantAdmission: () => admission.decision,
+  decideAssistantLiveInputAdmission: () => admission.decision,
+}));
 
 // ─── Mocks (mirror crash-loop-diagnostic.test.ts harness) ────────────────
 vi.mock('../src/im/lark/client.js', () => {

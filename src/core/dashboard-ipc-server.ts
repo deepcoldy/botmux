@@ -4438,20 +4438,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     // credential in any form, including the tenant token lark-cli would get here.
     // Personal-assistant mode is enforced against the LIVE bot as well: a session
     // that predates the mode froze no withhold flag and has no owner.
-    const botSecretWithheld = (ds
+    const botSecretWithheld = (cfg: typeof bot): boolean => (ds
       ? ds.session.sandboxWithholdBotSecret === true
       : detachedScheduled?.session.sandboxWithholdBotSecret === true)
-      || bot.assistantMode === true;
-    if (botSecretWithheld) {
+      || cfg.assistantMode === true;
+    if (botSecretWithheld(bot)) {
       return jsonRes(res, 403, { ok: false, error: 'lark_tool_bot_identity_withheld' });
-    }
-    // 个人助理模式：bot 身份能读它所在的任何会话（别人的私聊、所在群、共享给 bot 的文档），
-    // 等于绕过按 owner 的隔离。缺省拒绝，只留 --as user；管理员显式 assistantLarkBotIdentity
-    // 才放开。detachedScheduled（定时任务后台）同样按会话的 owner 判。
-    const assistantOwned = ds?.session.assistantOwnerOpenId
-      ?? (detachedScheduled ? sessionStore.getOwnedSession(params.sessionId)?.assistantOwnerOpenId : undefined);
-    if (assistantOwned && bot.assistantLarkBotIdentity !== true) {
-      return jsonRes(res, 403, { ok: false, error: 'lark_tool_bot_identity_disabled_by_assistant_mode' });
     }
     let token: unknown;
     try {
@@ -4463,6 +4455,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     }
     if (typeof token !== 'string' || !token) {
       return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
+    }
+    // Token lookup may await across an assistantMode transition. The config and
+    // session flags captured above are stale now: repeat the complete withholding
+    // decision against the live bot before any credential enters the response.
+    try { bot = getBot(targetLarkAppId!).config; }
+    catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
+    if (botSecretWithheld(bot)) {
+      return jsonRes(res, 403, { ok: false, error: 'lark_tool_bot_identity_withheld' });
     }
     const validHeadlessSessionAfterToken = !!ds?.session.headless
       && ds.session.headless.source === 'cli'

@@ -10,14 +10,13 @@ Add to the bot in `bots.json`:
 {
   "assistantMode": true,
   "sandbox": true,
-  "assistantTemplateDir": "~/assistant-template",
-  "assistantLarkBotIdentity": false
+  "assistantTemplateDir": "~/assistant-template"
 }
 ```
 
 - `assistantMode`: the switch. **Requires `sandbox: true` (the oncall allow-list sandbox)** — without it every session refuses to start, because falling back to the shared directory is exactly the hole this mode closes. `/botconfig assistantMode on` toggles it live.
 - `assistantTemplateDir`: optional template directory (defaults to the bot's default working directory). Before each session starts, template files are **overwrite-synced** into the owner's work directory (files absent from the template are kept; symlinks are not followed). Put admin-maintained shared knowledge / CLAUDE.md here.
-- `assistantLarkBotIdentity`: whether `lark-cli` inside a session may call Lark with the **bot identity**. Default `false` — the bot identity can read every chat the bot is in, which bypasses the isolation; only `--as user` (the owner's own grant) remains.
+- `lark-cli` inside an assistant session cannot call Lark with the **bot identity**: that identity can read every chat the bot is in, bypassing owner isolation. Only `--as user` (the owner's own grant) remains.
 
 Before enabling, archive the old shared memories under `~/.botmux/bots/<appId>/claude/projects/` (invisible to assistant sessions, but still plaintext on the host).
 

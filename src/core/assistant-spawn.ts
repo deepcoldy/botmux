@@ -85,3 +85,23 @@ export function decideAssistantAdmission(
   if (spawn.kind === 'owner' && !s.everRan) return { kind: 'adopt', openId: spawn.openId, workDir: spawn.workDir };
   return { kind: 'reject', ...(expected ? { expected } : {}) };
 }
+
+/** 已经存在（尤其已经有 live worker）的会话能不能再收输入。这里绝不 adopt：
+ * 没记 owner 的现存 worker 可能是开模式前的共享会话，不能因为它还没留下 history
+ * 就把新主人的输入交给它。所有 queued / promotion / IPC 实际投递点共用这一判定。 */
+export function decideAssistantLiveInputAdmission(
+  larkAppId: string,
+  s: {
+    chatId: string; chatType: 'group' | 'p2p'; ownerOpenId?: string; assistantOwnerOpenId?: string;
+    sandboxWithholdBotSecret?: boolean;
+  },
+): AssistantAdmission {
+  return decideAssistantAdmission(larkAppId, {
+    chatId: s.chatId,
+    chatType: s.chatType,
+    ownerOpenId: s.ownerOpenId,
+    assistantOwnerOpenId: s.assistantOwnerOpenId,
+    everRan: true,
+    sandboxFrozenWithoutWithhold: s.sandboxWithholdBotSecret !== true,
+  });
+}

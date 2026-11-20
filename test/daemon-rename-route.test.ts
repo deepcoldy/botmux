@@ -832,6 +832,43 @@ describe('/rename production routing — must not pre-create a session (review P
     rmSync(crossRefPath(), { force: true });
   });
 
+  it('does not download a new assistant owner attachment into the retiring owner bucket', async () => {
+    const ownerA = `ou_${'a'.repeat(32)}`;
+    const ownerB = `ou_${'b'.repeat(32)}`;
+    const { setAssistantOwner } = await import('../src/services/assistant-owner-store.js');
+    const { notifyAssistantOwnerChanged } = await import('../src/core/assistant-mode.js');
+    const bot = registerBot({
+      larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [ownerA, ownerB],
+      assistantMode: true, sandbox: 'oncall', workingDirs: ['/tmp'], disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [ownerA, ownerB];
+    const send = vi.fn();
+    const ds = seedLiveChatSession(send);
+    ds.hasHistory = true;
+    ds.session.cliSessionId = 'cli-owner-a';
+    ds.session.chatType = 'group';
+    ds.session.assistantOwnerOpenId = ownerA;
+    ds.session.sandbox = 'oncall';
+    ds.session.sandboxWithholdBotSecret = true;
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    setAssistantOwner(mocks.dataDir, APP, CHAT, ownerA, 'claimed');
+    // Model a remote close that has started but cannot settle: the stale active
+    // row must remain unable to persist new-owner data in the meantime.
+    mocks.closeWorkerPoolSession.mockImplementation(() => new Promise(() => {}));
+    setAssistantOwner(mocks.dataDir, APP, CHAT, ownerB, 'admin');
+    notifyAssistantOwnerChanged(APP, CHAT, ownerB);
+    const data = makeEventData('om_owner_b_secret', 'secret attachment');
+    data.sender.sender_id.open_id = ownerB;
+    data.message.message_type = 'file';
+    data.message.content = JSON.stringify({ file_key: 'file_owner_b_secret', file_name: 'secret.txt' });
+    await handleThreadReply(data, { ...makeCtx(CHAT, 'om_owner_b_secret'), scope: 'chat', anchor: CHAT });
+    const bucketOwners = mocks.downloadResources.mock.calls
+      .filter(call => call[1] === 'om_owner_b_secret')
+      .map(call => call[4]);
+    expect(bucketOwners).toEqual([]);
+    expect(send.mock.calls.some(call => call[0]?.type === 'message')).toBe(false);
+  });
+
   describe('async Ask production HTTP route and inbound answer wiring', () => {
     async function setup(scope: 'chat' | 'thread' = 'thread') {
       const root = scope === 'thread' ? 'om_async_review_root' : CHAT;

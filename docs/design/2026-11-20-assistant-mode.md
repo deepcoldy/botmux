@@ -56,8 +56,7 @@
   "p2pOpen": true,
   "sandbox": true,                      // 必需（oncall 白名单模式）
   "assistantMode": true,                // 新增；缺省 undefined = 现状
-  "assistantTemplateDir": "~/botmux-roles/<appId>/shared/default",  // 可选；缺省 = defaultWorkingDir
-  "assistantLarkBotIdentity": false     // 可选；lark-cli --as bot 是否可用，缺省 false
+  "assistantTemplateDir": "~/botmux-roles/<appId>/shared/default"  // 可选；缺省 = defaultWorkingDir
 }
 ```
 
@@ -136,10 +135,10 @@
 
 沙盒里的 `lark-cli` 是 botmux 包装层（`lark-tool-binding.ts:211`），身份由 daemon 的 `lark-tool-identity` 路由按 `mode: bot|user` 发放 token——这就是闸口：
 
-- `assistantLarkBotIdentity: false`（缺省）：助理模式会话请求 `mode=bot` → 403 `lark_tool_bot_identity_disabled_by_privacy`；`mode=user`（用户本人授权）照常。
+- 助理模式会话请求 `mode=bot` → 403 `lark_tool_bot_identity_withheld`；`mode=user`（用户本人授权）照常。
 - 效果：bot 在 A 的私聊里不能用 bot 身份读 B 的私聊、拉 bot 所在群消息、读"共享给 bot"的文档；用 A 本人身份读 A 自己的文档/日历/邮件照常。
 - 代价：`lark-tool-binding.ts:233` 那段"bot 无权就 --as user、用户无权就 --as bot 重试"的提示要加一句"保密私聊里 bot 身份不可用"。
-- 管理员要保留 bot 身份就显式开 `true`，并接受 #9 不堵。
+- 助理模式隐含 `sandboxWithholdBotSecret`，不提供按 bot 配置放开 app 身份凭证的逃生阀。
 
 ## 6. 边界与已知限制
 

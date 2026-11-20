@@ -9972,6 +9972,102 @@ describe('owner diagnostics and accepted-input session notices', () => {
     expect(sessionReply.mock.calls[1]?.[4]).toBe('turn_new');
   });
 
+  it('refuses a double-fork tail write after the assistant owner changes', async () => {
+    const data = mkdtempSync(join(tmpdir(), 'botmux-assistant-tail-owner-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = data;
+    const ownerA = `ou_${'a'.repeat(32)}`;
+    const ownerB = `ou_${'b'.repeat(32)}`;
+    try {
+      const { setAssistantOwner } = await import('../src/services/assistant-owner-store.js');
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ assistantMode: true, sandbox: 'oncall' }));
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker, hasHistory: true, initialStartPending: true });
+      ds.session.assistantOwnerOpenId = ownerA;
+      ds.session.sandbox = 'oncall';
+      ds.session.sandboxWithholdBotSecret = true;
+      ds.session.queuedActivationPending = true;
+      ds.session.queuedActivationToken = 'opening-token';
+      ds.session.queuedActivationInput = { content: 'owner A opening' };
+      ds.session.queuedActivationTailNextOrder = 7;
+      sessionStore.updateSession(ds.session);
+      setAssistantOwner(data, 'app_test', 'oc_chat', ownerB, 'admin');
+      const onAdmission = vi.fn();
+      expect(forkWorker(ds, 'owner B secret', 'om_owner_b', { onAdmission })).toBe(true);
+      expect(onAdmission).toHaveBeenCalledWith('rejected');
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+      expect(ds.session.queuedActivationTailNextOrder).toBe(7);
+      expect(worker.send.mock.calls.some(call => call[0]?.content === 'owner B secret')).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+
+  it('does not promote a queued journal after the assistant owner changes', async () => {
+    const data = mkdtempSync(join(tmpdir(), 'botmux-assistant-promote-owner-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = data;
+    const ownerA = `ou_${'a'.repeat(32)}`;
+    const ownerB = `ou_${'b'.repeat(32)}`;
+    try {
+      const { setAssistantOwner } = await import('../src/services/assistant-owner-store.js');
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ assistantMode: true, sandbox: 'oncall' }));
+      setAssistantOwner(data, 'app_test', 'oc_chat', ownerA, 'claimed');
+      const worker = makeFakeWorker();
+      const ds = makeDs({ worker, hasHistory: true });
+      ds.session.assistantOwnerOpenId = ownerA;
+      ds.session.sandbox = 'oncall';
+      ds.session.sandboxWithholdBotSecret = true;
+      sessionStore.updateSession(ds.session);
+      expect(admitQueuedActivationTail(ds, {
+        userPrompt: 'queued while owned', cliInput: { content: 'queued while owned' }, turnId: 'om_before_rebind',
+      })).toBeDefined();
+      const journalBefore = structuredClone(ds.session);
+      setAssistantOwner(data, 'app_test', 'oc_chat', ownerB, 'admin');
+      expect(promoteQueuedActivationTail(ds)).toBe(false);
+      expect(ds.session).toEqual(journalBefore);
+      expect(worker.send.mock.calls.some(call => call[0]?.content === 'queued while owned')).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+
+  it.each([undefined, 1])('withholds a cold init after an assistant owner change (attempt=%s)', async dispatchAttempt => {
+    vi.useFakeTimers();
+    standaloneBinaryMock.mockReturnValue(true);
+    const data = mkdtempSync(join(tmpdir(), 'botmux-assistant-init-owner-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = data;
+    const ownerA = `ou_${'a'.repeat(32)}`;
+    const ownerB = `ou_${'b'.repeat(32)}`;
+    try {
+      const { setAssistantOwner } = await import('../src/services/assistant-owner-store.js');
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ assistantMode: true, sandbox: 'oncall' }));
+      setAssistantOwner(data, 'app_test', 'oc_chat', ownerA, 'claimed');
+      const ds = makeDs({ hasHistory: true });
+      ds.session.cliSessionId = 'cli-existing';
+      ds.session.assistantOwnerOpenId = ownerA;
+      ds.session.sandbox = 'oncall';
+      ds.session.sandboxWithholdBotSecret = true;
+      sessionStore.updateSession(ds.session);
+      expect(forkWorker(ds, 'owner A opening secret', {
+        resume: true, turnId: 'om_owner_a', ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      })).toBe(true);
+      const worker = ds.worker as any;
+      expect(worker.send.mock.calls.map((call: any[]) => call[0].type)).toEqual(['worker_ipc_probe']);
+      setAssistantOwner(data, 'app_test', 'oc_chat', ownerB, 'admin');
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(worker.send.mock.calls.some((call: any[]) => call[0]?.type === 'init'
+        && call[0]?.prompt === 'owner A opening secret')).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(data, { recursive: true, force: true });
+    }
+  });
+
   it.each([undefined, 1])('waits through cold IPC bootstrap before consuming the notice (attempt=%s)', async dispatchAttempt => {
     vi.useFakeTimers();
     standaloneBinaryMock.mockReturnValue(true);

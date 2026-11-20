@@ -1,6 +1,6 @@
 import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecution } from './cli-execution-mode.js';
 import { isLeadOnlySession } from './lead-only.js';
-import { decideAssistantAdmission } from './assistant-spawn.js';
+import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { runtimeStartRefusal } from '../services/runtime-reservation.js';
@@ -15047,6 +15047,14 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
     });
   }
 
+  // IPC bootstrap / 重试可能跨越 owner 改绑。实际发送前再查一次；入口处的
+  // allow 不能授权这个较晚的投递点。拒绝由共用闸提示重发并退役，清掉投递
+  // 记录以免传输超时再补一张含义不准确的失败卡。
+  if (!assistantLiveInputAdmission(record.ds, record.turnId, { context: 'worker IPC delivery' })) {
+    clearOrdinaryImDelivery(record);
+    return false;
+  }
+
   if (record.timer) clearTimeout(record.timer);
   record.timer = undefined;
   record.received = false;
@@ -17622,6 +17630,37 @@ export function applyFailedTurnRewindResult(
   }
 }
 
+/** 现有会话接收任何输入前的统一助理归属闸。队列写入、journal promotion、
+ * 普通 IPC 与 bootstrap 后的 init 都必须在各自实际边界重新调用，不能只靠入口检查。 */
+export function assistantLiveInputAdmission(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  opts: {
+    notifyRejection?: false;
+    context?: string;
+    bot?: ReturnType<typeof getBot>;
+  } = {},
+): boolean {
+  const bot = opts.bot ?? getBot(ds.larkAppId);
+  if (bot.config.assistantMode !== true) return true;
+  const decision = decideAssistantLiveInputAdmission(ds.larkAppId, {
+    chatId: ds.chatId,
+    chatType: ds.session.chatType === 'p2p' ? 'p2p' : 'group',
+    ownerOpenId: ds.session.ownerOpenId,
+    assistantOwnerOpenId: ds.session.assistantOwnerOpenId,
+    sandboxWithholdBotSecret: ds.session.sandboxWithholdBotSecret,
+  });
+  if (decision.kind === 'allow') return true;
+  const context = opts.context ?? 'input';
+  logger.warn(`[${tag(ds)}] assistant-mode: refusing ${context} ${turnId ?? '?'} to a session not owned by the current owner; retiring it`);
+  if (opts.notifyRejection !== false) void callbacks?.sessionReply(
+    sessionAnchorId(ds), tr('worker.assistant.session_retired', {}, localeForBot(ds.larkAppId)), 'text', ds.larkAppId, turnId,
+  ).catch(err => logger.warn(`[${tag(ds)}] assistant-mode: failed to report retired session: ${String(err)}`));
+  void closeSessionForBackgroundCleanup(ds.session.sessionId, `assistant-mode ${context} to unowned session`).catch(err =>
+    logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
+  return false;
+}
+
 export function sendWorkerInput(
   ds: DaemonSession,
   payload: string | CliTurnPayload,
@@ -17696,26 +17735,7 @@ export function sendWorkerInput(
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
   // 个人助理模式：活着的 worker 也要按当前归属核对（开模式时没能退役的存量会话、主人已变）。
-  // 不核对的话，新消息会直接喂给一个不属于当前主人、也没冻结「不放 Bot 密钥」的 worker。
-  if (bot.config.assistantMode === true) {
-    const decision = decideAssistantAdmission(ds.larkAppId, {
-      chatId: ds.chatId,
-      chatType: ds.session.chatType === 'p2p' ? 'p2p' : 'group',
-      ownerOpenId: ds.session.ownerOpenId,
-      assistantOwnerOpenId: ds.session.assistantOwnerOpenId,
-      everRan: true,
-      sandboxFrozenWithoutWithhold: ds.session.sandboxWithholdBotSecret !== true,
-    });
-    if (decision.kind !== 'allow') {
-      logger.warn(`[${tag(ds)}] assistant-mode: refusing input ${turnId ?? '?'} to a session not owned by the current owner; retiring it`);
-      if (opts.notifyRejection !== false) void callbacks?.sessionReply(
-        sessionAnchorId(ds), tr('worker.assistant.session_retired', {}, localeForBot(ds.larkAppId)), 'text', ds.larkAppId, turnId,
-      ).catch(err => logger.warn(`[${tag(ds)}] assistant-mode: failed to report retired session: ${String(err)}`));
-      void closeSessionForBackgroundCleanup(ds.session.sessionId, 'assistant-mode input to unowned session').catch(err =>
-        logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
-      return false;
-    }
-  }
+  if (!assistantLiveInputAdmission(ds, turnId, { notifyRejection: opts.notifyRejection, bot })) return false;
   const effectiveCliId = sessionCliId(ds, bot.config);
   const effectiveTurnId = turnId ?? (isCodexAppCliId(effectiveCliId)
     ? `codex-app-dispatch-${randomUUID()}`
@@ -17732,7 +17752,7 @@ export function sendWorkerInput(
       ?? routingTurnId
       ?? `queued-activation-followup-${randomUUID()}`;
     try {
-      admitQueuedActivationTail(ds, {
+      const admitted = admitQueuedActivationTail(ds, {
         userPrompt: normalized.content,
         cliInput: {
           content: normalized.content,
@@ -17752,6 +17772,7 @@ export function sendWorkerInput(
           ? { dispatchAttempt: opts.dispatchAttempt }
           : {}),
       });
+      if (!admitted) return false;
       logger.info(
         `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
       );
@@ -18312,6 +18333,9 @@ export function promoteQueuedActivationTail(
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
   const head = ordered[0];
   if (!head) return false;
+  // owner 可能在 tail 落盘后、ACK promotion 前改变。必须在移动 journal 之前拒绝，
+  // 否则旧会话会把新主人的输入推进成自己的下一个持久化回合。
+  if (!assistantLiveInputAdmission(ds, head.turnId, { context: 'queued activation promotion' })) return false;
 
   const priorJournal = snapshotQueuedActivationJournal(ds.session);
   const priorTail = ds.session.queuedActivationTail?.map(entry => ({
@@ -18514,15 +18538,18 @@ export function reserveQueuedActivationTailAdmission(
 
 /** Admit one exact successor behind a queued activation. The response boundary
  * is the session-store write: callers must not report acceptance or use live
- * worker IPC unless this returns. `reservation` lets routes reserve FIFO order
+ * worker IPC unless this returns an entry. `reservation` lets routes reserve FIFO order
  * before asynchronous prompt construction without duplicating persistence
- * logic. */
+ * logic. A live assistant-owner mismatch returns undefined before any journal
+ * or FIFO-counter mutation, after the common retire/resend handling. */
 export function admitQueuedActivationTail(
   ds: DaemonSession,
   entry: Omit<QueuedActivationTailEntry, 'id' | 'order'>,
-  reservation: QueuedActivationTailReservation = reserveQueuedActivationTailAdmission(ds),
+  reservation?: QueuedActivationTailReservation,
   opts: { codexAppInputGateFrozen?: boolean } = {},
-): QueuedActivationTailEntry {
+): QueuedActivationTailEntry | undefined {
+  if (!assistantLiveInputAdmission(ds, entry.turnId, { context: 'queued activation input' })) return undefined;
+  const fifoReservation = reservation ?? reserveQueuedActivationTailAdmission(ds);
   const admittedLinkRefs = entry.cliInput.linkRefs
     ? freezeDeferredLinkRefPayload({
         ds,
@@ -18532,12 +18559,12 @@ export function admitQueuedActivationTail(
   const frozenInput = admittedLinkRefs.payload;
   const acceptedCodexAppInput = opts.codexAppInputGateFrozen === true
     ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
-    : reservation.codexAppInputAccepted === true
+    : fifoReservation.codexAppInputAccepted === true
       ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
       : undefined;
   const admitted: QueuedActivationTailEntry = {
-    id: reservation.id,
-    order: reservation.order,
+    id: fifoReservation.id,
+    order: fifoReservation.order,
     ...entry,
     cliInput: {
       content: frozenInput.content,
@@ -19017,6 +19044,10 @@ function queueBehindPendingProtectedHttpEgressFork(
           && resumeOrTurnId !== null
           && resumeOrTurnId.codexAppInputGateFrozen === true,
       });
+      if (!admitted) {
+        opts.onAdmission?.('rejected');
+        return true;
+      }
       queuedActivationTailId = admitted.id;
     } catch (error) {
       logger.error(
@@ -19522,7 +19553,7 @@ function forkWorkerPrepared(
       const turnId = initTurnId
         ?? ds.currentReplyTarget?.turnId
         ?? `queued-activation-followup-${randomUUID()}`;
-      admitQueuedActivationTail(ds, {
+      const admitted = admitQueuedActivationTail(ds, {
         userPrompt: prompt,
         cliInput: {
           content: prompt,
@@ -19541,6 +19572,10 @@ function forkWorkerPrepared(
           ? { dispatchAttempt: initDispatchAttempt }
           : {}),
       });
+      if (!admitted) {
+        reportAdmission('rejected');
+        return true;
+      }
       logger.info(
         `[${tag(ds)}] Staged double-fork prompt behind queued activation ACK `
         + `(turn=${turnId})`,
@@ -20730,8 +20765,11 @@ function forkWorkerPrepared(
     }
   } else {
     afterWorkerIpcBootstrap(worker, () => {
-      // Bootstrap may wait while a human stops or supersedes the task. A blank
-      // worker can still serve that new input, but must not inherit the claim.
+      // Bootstrap may wait while a human stops, supersedes the task, or rebinds
+      // the assistant owner. The fork-time admission does not cover this later
+      // IPC boundary; never release the old opening prompt into a stale worker.
+      if (!assistantLiveInputAdmission(ds, initAttributionTurnId, { context: 'worker init delivery' })) return;
+      // A blank worker can still serve a new input, but must not inherit the claim.
       if (!continuationStillAllowed()) delete initMsg.deploymentContinuation;
       onIpcDispatchAttempted?.();
       const sent = worker.send(initMsg);
