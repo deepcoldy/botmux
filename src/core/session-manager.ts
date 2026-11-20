@@ -1870,6 +1870,8 @@ export function buildNewTopicCliInput(
     sessionBackendType: opts?.sessionBackendType,
     promptInjection: opts?.promptInjection,
     larkAppId: opts?.larkAppId,
+    sessionId,
+    opening: true,
   }) === 'hook' && hookTurnId) {
     const blocks = buildNewTopicBlocks(
       userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
@@ -2203,7 +2205,43 @@ type EnvelopeInjectionCfg = {
   cliPathOverride?: string;
   sessionBackendType?: BackendType;
   larkAppId?: string;
+  sessionId?: string;
+  /** A genuinely new opening has no prior worker generation to mirror. */
+  opening?: boolean;
 };
+
+/** Launch facts for the CLI generation that will actually read the settings.
+ * A live worker's init is authoritative: live bot config may have moved on,
+ * while its CLI/pane still uses the old home. Existing sessions without a live
+ * generation fail closed to inline; only a new opening may use live config. */
+function promptHookLaunchConfig(
+  cfg: EnvelopeInjectionCfg,
+  botConfig: BotConfig,
+): BotConfig | undefined {
+  if (!cfg.sessionId) return botConfig;
+  const registry = getActiveSessionsRegistry();
+  const ds = registry
+    ? [...registry.values()].find(candidate => candidate.session.sessionId === cfg.sessionId)
+    : undefined;
+  if (ds) {
+    const init = ds.initConfig;
+    if (!ds.worker || ds.worker.killed || ds.worker.connected === false || !init) return undefined;
+    return {
+      ...botConfig,
+      sandbox: init.sandbox,
+      readIsolation: init.readIsolation,
+      wrapperCli: init.wrapperCli,
+      credentialsSourceDir: init.credentialsSourceDir,
+      backendType: init.backendType,
+    };
+  }
+  if (!cfg.opening) {
+    try {
+      if (sessionStore.getSession(cfg.sessionId)) return undefined;
+    } catch { return undefined; }
+  }
+  return botConfig;
+}
 
 function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inline' {
   if (!cfg?.cliId || zeroPromptInjectionForBot(cfg.larkAppId, cfg.cliId, cfg.promptInjection)) return 'inline';
@@ -2226,7 +2264,9 @@ function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inl
     botConfig = getBot(cfg.larkAppId).config;
   } catch { return 'inline'; }
   if (botConfig.envelopeInjection !== 'auto') return 'inline';
-  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, cfg.larkAppId, cfg.sessionBackendType);
+  const launchConfig = promptHookLaunchConfig(cfg, botConfig);
+  if (!launchConfig) return 'inline';
+  const effectivePath = effectivePromptHookConfigPath(adapter, launchConfig, cfg.larkAppId, cfg.sessionBackendType);
   if (!effectivePath || !hasInstalledPromptHookCached(effectivePath)) return 'inline';
   return 'hook';
 }
@@ -2265,7 +2305,9 @@ function effectivePromptHookConfigPath(
   } catch { return undefined; }
   const credentialSourceHome = credentialSourceForcesBotHome({
     sourceDir: botConfig.credentialsSourceDir,
-    cliId: botConfig.cliId,
+    // The adapter is built from the session's frozen CLI, which may differ from
+    // the bot's current default after /cli selection or a later config edit.
+    cliId: adapter.id,
     sandboxRequested: sandboxMode !== 'off',
   });
   const willRedirect = (sandboxMode === 'oncall' || credentialSourceHome)
@@ -2285,6 +2327,7 @@ export interface PromptHookTarget {
   cliConfigDir?: string;
   sessionBackendType?: BackendType;
   larkAppId: string;
+  sessionId?: string;
 }
 
 /** Whether botmux's UserPromptSubmit hook runs on every submit of a session's
@@ -2299,7 +2342,9 @@ export function promptHookRunsInCli(target: PromptHookTarget): boolean {
     botConfig = getBot(target.larkAppId).config;
   } catch { return false; }
   if (!adapter.hookInstall?.userPromptSubmitCommand) return false;
-  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, target.larkAppId, target.sessionBackendType);
+  const launchConfig = promptHookLaunchConfig(target, botConfig);
+  if (!launchConfig) return false;
+  const effectivePath = effectivePromptHookConfigPath(adapter, launchConfig, target.larkAppId, target.sessionBackendType);
   return !!effectivePath && hasInstalledPromptHookCached(effectivePath);
 }
 
@@ -2373,7 +2418,7 @@ export function buildFollowUpCliInput(
   // 输入框不再出现 <user_message>/<sender>/<mentions> 标签。代价：hook 注入内容不落
   // transcript，insight 发送者归因对 hook 模式会话降级为「未知用户」（用户已确认接受）。
   const hookTurnId = opts?.turnId;
-  if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
+  if (resolveEnvelopeInjectionMode({ ...opts, sessionId }) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
     // messageLocation 是宿主元数据，与 sender 同类：hook 模式下进 envelope，
     // 输入框与 transcript 仍只有用户正文。

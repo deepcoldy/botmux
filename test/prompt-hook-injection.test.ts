@@ -73,8 +73,9 @@ vi.mock('../src/bot-registry.js', () => ({
   getOwnerOpenId: vi.fn(() => undefined),
 }));
 
+const getSessionMock = vi.fn(() => undefined as any);
 vi.mock('../src/services/session-store.js', () => ({
-  getSession: vi.fn(() => undefined),
+  getSession: (...args: unknown[]) => getSessionMock(...args),
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
@@ -95,12 +96,13 @@ vi.mock('../src/services/whiteboard-store.js', () => ({
   whiteboardEnabled: vi.fn(() => true),
 }));
 
+const activeRegistryMock = vi.fn((): Map<string, any> | undefined => undefined);
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: vi.fn(),
   killStalePids: vi.fn(),
   sweepDeadPidMarkers: vi.fn(),
-  getActiveSessionsRegistry: vi.fn(() => undefined),
+  getActiveSessionsRegistry: (...args: unknown[]) => activeRegistryMock(...args),
   getCurrentCliVersion: vi.fn(() => '1.0.0'),
 }));
 
@@ -139,6 +141,15 @@ function followUpOpts(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function mockLiveWorker(initConfig: Record<string, unknown>): void {
+  activeRegistryMock.mockReturnValue(new Map([['test-session-key', {
+    session: { sessionId: SESSION_ID, status: 'active' },
+    larkAppId: LARK_APP_ID,
+    initConfig: { sessionId: SESSION_ID, backendType: 'pty', ...initConfig },
+    worker: { killed: false, connected: true },
+  }]]));
+}
+
 describe('buildFollowUpCliInput — hook 注入模式', () => {
   let prevDataDir: string | undefined;
   beforeEach(() => {
@@ -147,6 +158,8 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
     });
+    activeRegistryMock.mockReturnValue(undefined);
+    getSessionMock.mockReturnValue(undefined);
     preflightMock.mockReturnValue(true);
   });
   afterEach(() => {
@@ -307,6 +320,69 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it('/cli 冻结的 wrapper/source 与 live 默认配置不同：按 worker init 查 per-bot settings', () => {
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'codex', wrapperCli: 'gateway codex',
+        envelopeInjection: 'auto' as const, credentialsSourceDir: '/acc/b',
+      },
+    });
+    mockLiveWorker({ cliId: 'claude-code', wrapperCli: undefined, credentialsSourceDir: '/acc/b', sandbox: 'off' });
+    const perBotSettings = '/tmp/bots/app_test/claude/settings.json';
+    // 全局有 hook、per-bot 没有：判错路径会把 reminder 放进无人 claim 的 sidecar。
+    preflightMock.mockClear();
+    preflightMock.mockImplementation((path: unknown) => path !== perBotSettings);
+    const result = buildFollowUpCliInput('wrapper probe', SESSION_ID, followUpOpts());
+    expect(preflightMock).toHaveBeenCalledTimes(1);
+    expect(preflightMock.mock.calls[0][0]).toBe(perBotSettings);
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('运行中删除来源：旧 worker 仍按 init 查 per-bot settings，不跟 live 配置走', () => {
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+    });
+    mockLiveWorker({ cliId: 'claude-code', credentialsSourceDir: '/acc/a', sandbox: 'off' });
+    const perBotSettings = '/tmp/bots/app_test/claude/settings.json';
+    preflightMock.mockClear();
+    preflightMock.mockImplementation((path: unknown) => path !== perBotSettings);
+    const result = buildFollowUpCliInput('source removal probe', SESSION_ID, followUpOpts());
+    expect(preflightMock).toHaveBeenCalledTimes(1);
+    expect(preflightMock.mock.calls[0][0]).toBe(perBotSettings);
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('运行中新增来源：旧 worker 仍按 init 查全局 settings，不提前切到 per-bot', () => {
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code',
+        envelopeInjection: 'auto' as const, credentialsSourceDir: '/acc/b',
+      },
+    });
+    mockLiveWorker({ cliId: 'claude-code', credentialsSourceDir: undefined, sandbox: 'off' });
+    const perBotSettings = '/tmp/bots/app_test/claude/settings.json';
+    const globalSettings = `${DEFAULT_CLAUDE_DATA_DIR}/settings.json`;
+    // per-bot 有 hook、实际旧 worker 读取的全局没有：只有查全局才能安全回退 inline。
+    preflightMock.mockClear();
+    preflightMock.mockImplementation((path: unknown) => path === perBotSettings);
+    const result = buildFollowUpCliInput('source addition probe', SESSION_ID, followUpOpts());
+    expect(preflightMock).toHaveBeenCalledTimes(1);
+    expect(preflightMock.mock.calls[0][0]).toBe(globalSettings);
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('已有会话但没有可信存活 worker：不用 live 配置进 hook，回退 inline', () => {
+    getSessionMock.mockReturnValue({ sessionId: SESSION_ID, status: 'active' });
+    preflightMock.mockClear();
+    const result = buildFollowUpCliInput('worker missing probe', SESSION_ID, followUpOpts());
+    expect(result.content).toContain('<botmux_reminder>');
+    expect(preflightMock).not.toHaveBeenCalled();
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
   it('BOTMUX_SANDBOX 非法值：不做 preflight，回退 inline', () => {
     vi.stubEnv('BOTMUX_SANDBOX', 'yes');
     try {
@@ -401,6 +477,8 @@ describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
     });
+    activeRegistryMock.mockReturnValue(undefined);
+    getSessionMock.mockReturnValue(undefined);
     preflightMock.mockReturnValue(true);
   });
   afterEach(() => {

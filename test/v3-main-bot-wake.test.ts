@@ -1042,9 +1042,9 @@ describe('checkpoint: the dependants wait for the main bot', () => {
       expect(workflowMainWakeAcceptanceReported(
         ds({ cliId: 'claude-code', cliConfigDir: '/profiles/work', backendType: 'tmux' }), 'cursor', hook(true),
       )).toBe(true);
-      expect(asked.at(-1)).toEqual({ cliId: 'claude-code', cliConfigDir: '/profiles/work', sessionBackendType: 'tmux', larkAppId: 'cli_main' });
+      expect(asked.at(-1)).toEqual({ cliId: 'claude-code', cliConfigDir: '/profiles/work', sessionBackendType: 'tmux', larkAppId: 'cli_main', sessionId: 'sess-main' });
       expect(workflowMainWakeAcceptanceReported(ds({ backendType: 'pty' }), 'codex', hook(false))).toBe(false);
-      expect(asked.at(-1)).toEqual({ cliId: 'codex', sessionBackendType: 'pty', larkAppId: 'cli_main' });
+      expect(asked.at(-1)).toEqual({ cliId: 'codex', sessionBackendType: 'pty', larkAppId: 'cli_main', sessionId: 'sess-main' });
       const asks = asked.length;
       expect(workflowMainWakeAcceptanceReported(
         ds({ cliId: 'claude-code', backendType: 'tmux', adoptedFrom: { cliId: 'claude-code' } }), 'claude-code', hook(true),

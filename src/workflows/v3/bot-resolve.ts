@@ -13,6 +13,7 @@ import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js'
  */
 
 import { normalizeEnvPolicy } from '../../core/env-policy.js';
+import { normalizeCredentialsSourceDir } from '../../services/cli-credential-source.js';
 import { effectiveDefaultWorkingDir, type BotConfig } from '../../bot-registry.js';
 import {
   newSessionCodexInstanceState,
@@ -77,12 +78,14 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     );
   }
   const instance = newSessionCodexInstanceState(bot, 'workflow');
+  const credentialsSourceDir = normalizeCredentialsSourceDir(bot.credentialsSourceDir);
   return {
     ...(instance.cliInstanceBinding ? { cliInstanceBinding: instance.cliInstanceBinding, cliRuntime: instance.cliRuntime } : {}),
     larkAppId: bot.larkAppId,
     ...(bot.envPolicy ? { envPolicy: normalizeEnvPolicy(bot.envPolicy) } : {}),
     cliId: bot.cliId,
     ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
+    ...(credentialsSourceDir ? { credentialsSourceDir } : {}),
     ...(bot.wrapperCli ? { wrapperCli: bot.wrapperCli } : {}),
     ...(bot.model ? { model: bot.model } : {}),
     ...(bot.sandbox === true || bot.sandbox === 'oncall'
@@ -163,6 +166,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'cliRuntime',
     'cliId',
     'cliPathOverride',
+    'credentialsSourceDir',
     'wrapperCli',
     'model',
     'reasoningEffort',
@@ -202,6 +206,10 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
         throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].${field} must be a string`);
       }
     }
+    // Snapshot files are operator-editable artifacts: never trust their raw
+    // spelling. Normalize again so replay gets the same absolute, ~-expanded
+    // source path as the ordinary worker-pool path (and relative paths refuse).
+    const credentialsSourceDir = normalizeCredentialsSourceDir(obj.credentialsSourceDir);
     if (obj.reasoningEffort !== undefined && !isCodexReasoningEffort(obj.reasoningEffort)) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].reasoningEffort is invalid`);
     }
@@ -258,6 +266,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.envPolicy ? { envPolicy: normalizeEnvPolicy(obj.envPolicy) } : {}),
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
+      ...(credentialsSourceDir ? { credentialsSourceDir } : {}),
       ...(obj.wrapperCli !== undefined ? { wrapperCli: obj.wrapperCli as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
       ...(obj.reasoningEffort !== undefined
