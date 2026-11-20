@@ -3240,7 +3240,7 @@ export async function handleCommand(
             break;
           }
           const auto = resolveAgentSessionAutoRename(ds);
-          const cliName = sessionCliDisplayName(ds);
+          const cliName = auto.cliId ? getCliDisplayName(auto.cliId) : sessionCliDisplayName(ds);
           if (auto.status === 'available' && deps.deliverCliCommand) {
             const delivery = deps.deliverCliCommand(ds, auto.command, message);
             if (delivery === 'delivered') {

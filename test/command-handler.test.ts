@@ -5859,6 +5859,9 @@ describe('handleCommand', () => {
       await handleCommand('/rename', ROOT_ID, makeLarkMessage('/rename'), deps, LARK_APP_ID);
 
       expect(deps.deliverCliCommand).toHaveBeenCalledWith(ds, '/rename', expect.anything());
+      const replyContent = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(replyContent).toContain('交给 Claude');
+      expect(replyContent).not.toContain('交给 codex');
     });
 
     it.each([
