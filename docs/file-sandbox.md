@@ -305,7 +305,8 @@ worker spawnCli
   含 env 强制后的实际沙盒档判），冻结、会议接收、工作流快照都用它。
 - 附件下载的目录校验在 mkdir **之前**做（否则 mkdir -p 会顺着被换的祖先建到外面），校验通过的目录
   identity（dev/ino + 根内）一路带到最终 rename 前再核一次——等待网络那段是攻击窗口；macOS 另把
-  `attachments/<appId>` 也 pin 住。
+  `attachments/<appId>` 也 pin 住。Range 下载的暂存文件在校验后**同步**打开（中间不 await），之后无论
+  路径解析到哪，fd 都在校验过的目录里；消息目录本身仍可被沙盒挪动，所以不能在网络等待后再建暂存。
 
 **沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
 

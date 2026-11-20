@@ -6,7 +6,7 @@
  * Run: npx vitest run --project unit test/lark-resource-download-symlink.test.ts
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
@@ -87,6 +87,27 @@ describe('downloadMessageResource symlink safety', () => {
     await expect(downloadResourceWithRange(request, join(dir, 'cli.js'))).rejects.toThrow();
     expect(readFileSync(join(hostDir, 'cli.js'), 'utf8')).toBe('HOST');
     expect(readdirSync(hostDir)).toEqual(['cli.js']);
+  });
+
+  it('range download: a directory swapped during the probe and restored before the data cannot host the staging file', async () => {
+    const hostDir = join(root, 'host-dist');
+    mkdirSync(hostDir);
+    const dir = join(root, 'om_s');
+    mkdirSync(dir);
+    const data = Buffer.from('DATA');
+    let calls = 0;
+    const request = async (start: number, end: number): Promise<ResourceStream> => {
+      calls++;
+      if (calls === 1) { renameSync(dir, `${dir}.moved`); symlinkSync(hostDir, dir); }   // during the probe
+      if (calls === 2) { unlinkSync(dir); renameSync(`${dir}.moved`, dir); }              // restored before the data
+      return Object.assign(Readable.from([data.subarray(start, end + 1)]), {
+        statusCode: 206, headers: { 'content-range': `bytes ${start}-${end}/${data.length}` },
+      });
+    };
+    await downloadResourceWithRange(request, join(dir, 'a.bin'));
+    expect(readFileSync(join(dir, 'a.bin'))).toEqual(data);
+    expect(readdirSync(hostDir)).toEqual([]);
+    expect(readdirSync(dir)).toEqual(['a.bin']);
   });
 
   it('withinRoot: refuses a message directory reached through a swapped ancestor', async () => {
