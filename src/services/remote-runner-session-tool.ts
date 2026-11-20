@@ -44,6 +44,9 @@ export interface RemoteRunnerSessionToolHostContext {
   env?: NodeJS.ProcessEnv;
   cliPath?: string;
   timeoutMs?: number;
+  /** Total quoted-attachment budget. Defaults to the remote-runner wire limit;
+   *  the local sandbox relay (outbox) passes a larger one. */
+  maxAttachmentBytes?: number;
 }
 
 function boundedDiagnostic(value: string, fallback: string): string {
@@ -320,7 +323,7 @@ export async function runRemoteRunnerSessionTool(
       }
       try {
         const packaged = request.tool === 'quoted'
-          ? quotedAttachments(stdout, env)
+          ? quotedAttachments(stdout, env, context.maxAttachmentBytes)
           : { stdout };
         finish({
           outcome: 'completed',

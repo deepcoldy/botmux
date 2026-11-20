@@ -258,7 +258,26 @@ worker spawnCli
 2. daemon 侧 `startOutboxWatcher` 拾取请求，在**沙盒外**用真实凭证重跑 `send` 投递，结果写回
 3. 附件被拷进 `outbox`（共享路径）后路径改写，host 侧才读得到
 
-→ **所有飞书密钥全程不进沙盒**。
+→ send 这条路不需要沙盒里有飞书密钥。但白名单隔离默认仍授 BOT_HOME 读写，其中的
+`send-cred.json` 是明文 App Secret，`history` / `quoted` 等命令就靠它直连飞书。
+
+**`sandboxWithholdBotSecret`（会话创建时冻结进 `session.sandboxWithholdBotSecret`）**：
+
+- fs-policy 对 `<BOT_HOME>/send-cred.json` 加 mandatory deny（`ctx.withholdSendCredential`），
+  BOT_HOME 其余部分照旧读写。worker 仍会写这个文件，给宿主侧重执行用。
+- macOS 白名单隔离也建 `<数据目录>/sandboxes/<会话>/outbox`、授读写、起 outbox watcher、发布
+  relay capability。Seatbelt 没有 `--setenv`、tmux pane 只透传白名单里的 `BOTMUX_*`，所以
+  `BOTMUX_SEND_RELAY` 放在命令里传：`sandbox-exec -f <sb> /usr/bin/env BOTMUX_SEND_RELAY=<outbox> <cli>`。
+  热重连时 outbox 不在就拒绝启动。孤儿目录清扫依赖 `/proc`，macOS 上不会扫到这类目录，
+  会话正常关闭时由 worker 删除。
+- `cmdSend`：macOS 的 Seatbelt pane 看得到宿主的进程标记，所以「有活标记」不能当成「不在沙盒」；
+  有 `BOTMUX_SEND_RELAY` 且内核探针被拒时，和 Linux 一样只认 outbox 里的 capability。
+- `history` / `quoted`：沙盒内读不到 send-cred 且有中转目录时，写一条
+  `{command:'session-tool', tool:<RemoteRunnerSessionToolRequest>, originCapability}`。watcher 用
+  remote-runner 同一份校验（`normalizeRemoteRunnerSessionToolRequest`，只放行 history / quoted），
+  经 `authorize` 拿到本轮 turn，再走 `runRemoteRunnerSessionTool` 在宿主执行：session-id 由宿主
+  指定，`quoted` 带 `--remote-runner-session-tool`（消息不在本会话的群里就拒绝）。附件以 base64
+  随 `res.json` 返回（上限 32MB），沙盒侧用 O_EXCL 写进 outbox 下的子目录并替换占位路径。
 
 **沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
 

@@ -9970,6 +9970,60 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
   }
 }
 
+/**
+ * `sandboxWithholdBotSecret`: the sandbox cannot read this bot's send-cred, so
+ * history / quoted go to the host through the session outbox (see
+ * cli/relay-session-tool.ts). Returns only when the direct path should run:
+ * no relay, a host re-exec, or a sandbox that can still read its credential.
+ */
+async function relaySessionToolIfSecretWithheld(tool: 'history' | 'quoted', rest: string[]): Promise<void> {
+  const relayDir = process.env.BOTMUX_SEND_RELAY?.trim();
+  if (!relayDir || process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1') return;
+  const appId = process.env.BOTMUX_LARK_APP_ID?.trim();
+  const sd = process.env.SESSION_DATA_DIR?.trim();
+  if (appId && sd) {
+    try { readFileSync(sendCredFilePath(sd, appId)); return; } catch { /* withheld → relay */ }
+  }
+  const { buildRelaySessionToolRequest, materializeRelayedAttachments } = await import('./cli/relay-session-tool.js');
+  const sid = process.env.BOTMUX_SESSION_ID?.trim();
+  const built = buildRelaySessionToolRequest(tool, rest, sid);
+  if (!built.ok) { console.error(built.error); process.exit(2); }
+  const originCapability = sid
+    ? readManagedOriginCapability(resolveDataDir(), sid, relayDir, process.env.BOTMUX_ORIGIN_CHANNEL_ID)?.capability
+    : undefined;
+  if (!originCapability) {
+    console.error(`botmux ${tool} refused: managed host relay capability is stale or missing`);
+    process.exit(2);
+  }
+  const id = randomBytes(8).toString('hex');
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({
+    command: 'session-tool',
+    tool: built.request,
+    originCapability,
+  }));
+  const resPath = join(relayDir, `${id}.res.json`);
+  const deadlineMs = Date.now() + 120_000;
+  while (Date.now() < deadlineMs) {
+    if (existsSync(resPath)) {
+      let res: { code?: number; stdout?: string; stderr?: string; attachments?: any[] };
+      try { res = JSON.parse(readFileSync(resPath, 'utf-8')); }
+      catch { await new Promise(r => setTimeout(r, 150)); continue; /* partial write */ }
+      try { unlinkSync(resPath); } catch { /* */ }
+      let stdout = res.stdout ?? '';
+      try {
+        stdout = materializeRelayedAttachments(stdout, res.attachments, join(relayDir, `${tool}-${id}`));
+      } catch (e) {
+        console.error(`relay: 无法写出附件：${(e as Error).message}`);
+        process.exit(1);
+      }
+      await mirrorRelayResponseAndExit({ code: res.code, stdout, stderr: res.stderr }, 0);
+    }
+    await new Promise(r => setTimeout(r, 150));
+  }
+  console.error(`relay: 等待宿主执行 ${tool} 超时（120s）`);
+  process.exit(1);
+}
+
 async function cmdHistory(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) { console.log(HISTORY_READ_USAGE); return; }
   // Reject unrecognized flags BEFORE anything else. Every flag below is pulled
@@ -9992,6 +10046,7 @@ async function cmdHistory(rest: string[]): Promise<void> {
   catch (err: any) { console.error(err.message); process.exit(2); }
   // No-transport turn has no Feishu chat history to read — central hard gate.
   assertTurnTransportOrExit('history');
+  await relaySessionToolIfSecretWithheld('history', rest);
   // Read isolation: register this bot from its cred file so the Lark client is
   // available without reading the denied bots.json (same as cmdSend).
   await registerSelfFromCredFile();
@@ -10145,6 +10200,7 @@ async function cmdQuoted(rest: string[]): Promise<void> {
     console.error("botmux quoted refused: --remote-runner-session-tool requires the owning worker\'s live turn authority");
     process.exit(2);
   }
+  await relaySessionToolIfSecretWithheld('quoted', rest);
   await registerSelfFromCredFile();
   const { sid, larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
   assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
@@ -11525,6 +11581,13 @@ async function cmdSend(
     || managedOriginLegacyIsolationProbeAccess(osUserHomeDir)
     === 'sandbox_denied'
     || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
+  // A relay pane the kernel isolates must authorize through the outbox
+  // capability. On Linux the PID namespace already hides host markers; on
+  // macOS (Seatbelt + outbox, `sandboxWithholdBotSecret`) the markers stay
+  // visible, so without this the pane would fall through to the direct path
+  // it has no credential for.
+  const relayIsolationDetected = linuxKernelIsolationDetected
+    || (!!relayDir && kernelReadIsolationDetected);
   const isolatedSendRequired = !relayDir
     && (kernelReadIsolationDetected
       || process.env.BOTMUX_READ_ISOLATED === '1'
@@ -11565,7 +11628,7 @@ async function cmdSend(
     process.env.SESSION_DATA_DIR = sendDataDir;
     liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
   }
-  const isolatedCapabilityCtx = !isolatedSendRequired && !linuxKernelIsolationDetected && liveMarkerCtx?.sessionId
+  const isolatedCapabilityCtx = !isolatedSendRequired && !relayIsolationDetected && liveMarkerCtx?.sessionId
     ? null
     : readWorkflowSessionRelayContext({
         env: process.env,
@@ -11573,7 +11636,7 @@ async function cmdSend(
         // Keep one marker snapshot for the whole decision. In particular, do
         // not let resolveSessionContext's protected-capability fallback get
         // mislabeled as a live process marker.
-        findMarker: () => isolatedSendRequired || linuxKernelIsolationDetected ? null : liveMarkerCtx,
+        findMarker: () => isolatedSendRequired || relayIsolationDetected ? null : liveMarkerCtx,
       });
   if (isolatedSendRequired
     && (isolatedCapabilityCtx?.sessionId !== isolatedBoundSessionId
@@ -11614,7 +11677,7 @@ async function cmdSend(
     await relaySend(rest, relayDir, replyLayout, sendPlan);
     return;
   }
-  if (relayDir && (linuxKernelIsolationDetected || !liveMarkerCtx?.sessionId)) {
+  if (relayDir && (relayIsolationDetected || !liveMarkerCtx?.sessionId)) {
     // The child may delete or replace its writable outbox capability, while
     // the immutable default snapshot remains visible. That snapshot is only a
     // routing hint and can survive worker death; never fall through to direct

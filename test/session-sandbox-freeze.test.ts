@@ -82,6 +82,23 @@ describe('freezeSessionSandboxDecision', () => {
     expect(mocks.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
+  it('records sandboxWithholdBotSecret for the file sandbox only, and keeps it frozen', () => {
+    const ds = makeSession();
+    const cfg = botCfg({ sandbox: true, sandboxWithholdBotSecret: true });
+    freezeSessionSandboxDecision(ds, cfg);
+    expect(ds.session.sandboxWithholdBotSecret).toBe(true);
+    cfg.sandboxWithholdBotSecret = false;
+    freezeSessionSandboxDecision(ds, cfg);
+    expect(ds.session.sandboxWithholdBotSecret).toBe(true);
+    // Scratch / off sessions never carry it: only the file-sandbox arm builds
+    // the outbox-only pane.
+    for (const sandbox of ['scratch', false] as const) {
+      const other = makeSession();
+      freezeSessionSandboxDecision(other, botCfg({ sandbox, sandboxWithholdBotSecret: true } as Partial<BotConfig>));
+      expect(other.session.sandboxWithholdBotSecret).toBeUndefined();
+    }
+  });
+
   it('folds legacy readIsolation into the frozen tri-state as oncall', () => {
     const ds = makeSession();
     freezeSessionSandboxDecision(ds, botCfg({ sandbox: false, readIsolation: true }));

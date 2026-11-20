@@ -49,6 +49,7 @@ import { isValidPluginId } from '../../core/plugins/ids.js';
 import { cliSurvivesWorkerExit } from '../../core/cli-pid-marker-handoff.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV } from '../../core/sandbox-send-route.js';
 import { safeRequirementUrl } from '../../core/dispatch-task-tree.js';
+import { normalizeRemoteRunnerSessionToolRequest, type RemoteRunnerSessionToolRequest } from './remote-runner-protocol.js';
 
 /** Verify (and best-effort auto-install) bubblewrap so the user needn't
  *  pre-install. Installs via the system package manager when the daemon can
@@ -1717,6 +1718,8 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
 //   { contentFile: <basename>, preparedContentFile?: <basename>, cardFile?: <basename>, ... }
 export interface RelayRequest {
   command?: unknown;
+  /** `command: 'session-tool'` only: the structured tool request. */
+  tool?: unknown;
   contentFile?: unknown;
   preparedContentFile?: unknown;
   cardFile?: unknown;
@@ -1759,6 +1762,44 @@ const RELAY_FLAGS_VAL = new Set([
   '--layout',
   '--plugin-card-action',
 ]);
+
+/** Read-only session tools a sandbox may ask the host to run for it. The
+ *  request reuses the remote-runner session-tool contract (one structured
+ *  object, never argv); the host forces this session's id and, for `quoted`,
+ *  refuses a message outside this session's chat. */
+const RELAY_SESSION_TOOLS = new Set(['history', 'quoted']);
+
+export interface ValidatedRelaySessionTool {
+  request: Extract<RemoteRunnerSessionToolRequest, { tool: 'history' | 'quoted' }>;
+  originCapability?: string;
+}
+
+/** PURE validation of a `command: 'session-tool'` outbox request. */
+export function validateRelaySessionToolRequest(
+  req: RelayRequest,
+): { ok: true; value: ValidatedRelaySessionTool } | { ok: false; error: string } {
+  if (req.command !== 'session-tool') return { ok: false, error: 'command must be session-tool' };
+  const request = normalizeRemoteRunnerSessionToolRequest(req.tool);
+  if (!request || !RELAY_SESSION_TOOLS.has(request.tool)) {
+    return { ok: false, error: 'tool must be a well-formed history or quoted request' };
+  }
+  const originCapability = req.originCapability === undefined
+    ? undefined
+    : typeof req.originCapability === 'string' && /^[a-f0-9]{32,128}$/i.test(req.originCapability)
+      ? req.originCapability
+      : null;
+  if (originCapability === null) return { ok: false, error: 'originCapability must be a bounded hex token' };
+  return {
+    ok: true,
+    value: {
+      request: request as ValidatedRelaySessionTool['request'],
+      ...(originCapability !== undefined ? { originCapability } : {}),
+    },
+  };
+}
+
+/** Quoted attachments travel back base64-encoded inside `<id>.res.json`. */
+export const RELAY_SESSION_TOOL_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 
 export interface ValidatedRelay {
   command: 'send' | 'dispatch';
@@ -2121,6 +2162,9 @@ export function startOutboxWatcher(
      *  file / scratch sandbox watchers set this; the credential-only relay
      *  keeps rejecting them. */
     allowRouting?: boolean;
+    /** Serve `session-tool` requests (history / quoted) for this session's
+     *  chat. Absent → such requests are rejected. Requires `authorize`. */
+    sessionToolChatId?: string;
   } = {},
 ): () => void {
   const cliInvocation = botmuxCliInvocation(opts.cliPath);
@@ -2129,15 +2173,51 @@ export function startOutboxWatcher(
   // Host-private staging — a sibling of the outbox, NOT bound into the sandbox.
   const staging = join(dirname(outbox), 'relay-staging');
 
-  const finish = (id: string, reqPath: string, name: string, staged: string[], code: number, stdout: string, stderr: string) => {
+  const finish = (id: string, reqPath: string, name: string, staged: string[], code: number, stdout: string, stderr: string, extra?: Record<string, unknown>) => {
     // 先消费请求、再发布响应：任何人看到 res.json 时，req.json 都已不在。
     // 反过来的话，两步之间这条已执行完的请求看上去仍在排队，接手同一 outbox
     // 的 watcher（restore / transfer 之后）会把它再执行一遍。
     try { rmSync(reqPath, { force: true }); } catch { /* */ }
     // 原子写：沙盒侧 CLI 在 existsSync 轮询这个 res.json，rename 保证它读到完整 JSON。
-    try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr })); } catch { /* */ }
+    try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr, ...extra })); } catch { /* */ }
     for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
     inFlight.delete(name);
+  };
+
+  const serveSessionTool = async (id: string, reqPath: string, name: string, req: RelayRequest): Promise<void> => {
+    const v = validateRelaySessionToolRequest(req);
+    if (!v.ok) { finish(id, reqPath, name, [], 1, '', `relay rejected: ${v.error}`); return; }
+    const chatId = opts.sessionToolChatId;
+    if (!chatId || !authorize) {
+      finish(id, reqPath, name, [], 2, '', 'relay rejected: session tools are not served for this sandbox');
+      return;
+    }
+    const authorization = authorize({ capability: v.value.originCapability });
+    if (!authorization.ok) { finish(id, reqPath, name, [], 2, '', `relay rejected: ${authorization.error}`); return; }
+    const turnId = authorization.origin.turnId;
+    if (!turnId) { finish(id, reqPath, name, [], 2, '', 'relay rejected: session tools need a live turn'); return; }
+    try {
+      const { runRemoteRunnerSessionTool } = await import('../../services/remote-runner-session-tool.js');
+      const result = await runRemoteRunnerSessionTool(v.value.request, {
+        sessionId,
+        turnId,
+        chatId,
+        ...(authorization.origin.dispatchAttempt !== undefined
+          ? { dispatchAttempt: authorization.origin.dispatchAttempt }
+          : {}),
+        env: baseEnv,
+        ...(opts.cliPath ? { cliPath: opts.cliPath } : {}),
+        maxAttachmentBytes: RELAY_SESSION_TOOL_ATTACHMENT_BYTES,
+      });
+      if (result.outcome === 'completed') {
+        finish(id, reqPath, name, [], result.exitCode, result.stdout, result.stderr,
+          result.attachments?.length ? { attachments: result.attachments } : undefined);
+      } else {
+        finish(id, reqPath, name, [], 1, '', `relay ${result.outcome}: ${result.code}: ${result.message}`);
+      }
+    } catch (e) {
+      finish(id, reqPath, name, [], 1, '', `relay failed: ${(e as Error).message}`);
+    }
   };
 
   const tick = () => {
@@ -2153,6 +2233,10 @@ export function startOutboxWatcher(
       try { req = JSON.parse(readFileSync(reqPath, 'utf8')); }
       catch { finish(id, reqPath, name, staged, 1, '', 'relay: bad json'); continue; }
 
+      if (req && typeof req === 'object' && req.command === 'session-tool') {
+        void serveSessionTool(id, reqPath, name, req);
+        continue;
+      }
       const v = validateRelayRequest(req, { allowRouting: opts.allowRouting === true });
       if (!v.ok) { finish(id, reqPath, name, staged, 1, '', `relay rejected: ${v.error}`); continue; }
       const authorization = authorize?.({ capability: v.value.originCapability });

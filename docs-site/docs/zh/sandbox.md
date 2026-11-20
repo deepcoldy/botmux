@@ -296,15 +296,34 @@ CLI 在一个没有外部网络的命名空间里运行。适合纯本地、离�
 
 ## 沙盒里能做什么、不能做什么
 
-### `botmux send` 照常可用，凭证不进沙盒
+### `botmux send` 照常可用
 
-沙盒里的 CLI 调 `botmux send` 发文字、卡片、图片或附件时，不会拿到飞书凭证。请求先写进会话私有的中转目录，由沙盒外的 daemon 代为发送，**飞书 App Secret 全程不进沙盒**。
+Linux 上，沙盒里的 CLI 调 `botmux send` 发文字、卡片、图片或附件时，请求先写进会话私有的中转目录，由沙盒外的 daemon 代为发送。macOS 的白名单隔离默认由沙盒里的 CLI 自己调飞书，发送前先向 daemon 核实本轮的来源。
+
+注意：白名单隔离默认**能读到**这个 Bot 自己的飞书 App Secret（`<BOT_HOME>/send-cred.json`），`botmux history`、`botmux quoted` 等命令就是靠它直连飞书的。能指使 agent 的人因此可以让它直接用这个密钥换应用身份的 token，绕开 daemon 的所有检查。不希望这样时，打开下面的 `sandboxWithholdBotSecret`。
 
 发到本话题以外的地方（`--top-level` 发群顶层、`--chat-id` 跨群、`--into` 发到某条消息的话题）也可以，但目标由 daemon 重新核实：
 
 - 本会话所在的群总是允许；
 - 其它群必须是这个 Bot 在里面的普通群（不是单聊、不是外部群），并且本轮发消息的人（没有真人时是会话 owner）也在那个群里、有和 Bot 对话的权限；
 - 查不到这些信息时一律拒绝。
+
+### 不把 Bot 密钥放进沙盒（`sandboxWithholdBotSecret`） {#withhold-bot-secret}
+
+```json
+"sandbox": "oncall",
+"sandboxWithholdBotSecret": true
+```
+
+开启后：
+
+- 沙盒里读不到 `send-cred.json`，agent 拿不到这个 Bot 的 App Secret，也就换不到应用身份的 token；
+- `botmux send`、`botmux dispatch`、`botmux history`、`botmux quoted` 都写进会话中转目录，由 daemon 在沙盒外执行。macOS 也因此用上和 Linux 一样的中转；
+- daemon 执行 `history` 时固定读本会话；执行 `quoted` 时，被引用的消息必须在本会话所在的群里，否则拒绝。引用消息里的图片和文件由 daemon 下载后传回，放在会话中转目录里；
+- 经中转的 `history` 只支持 `--limit`（最多 100）、`--scope`、`--with-card-json`；`quoted` 一次只读一条，支持 `--raw`。其它选项会直接报错；
+- 其它需要在沙盒里直连飞书的命令（例如 `botmux bots list`）会失败。
+
+只对白名单隔离（`oncall`）生效，scratch 沙盒不受影响。和其它沙盒选项一样，在会话创建时定下来，改了之后对新会话生效。
 
 ### 宿主管理命令要回宿主执行
 

@@ -117,8 +117,15 @@ export interface FsPolicyContext {
    *  the caller itself grants that part of the checkout (a workingDir or user
    *  path at/inside the install root — a bot working ON the checkout). */
   botmuxInstallRootMaskPaths?: readonly string[];
-  /** Daemon-mediated relay outbox (Linux) — readWrite. */
+  /** Daemon-mediated relay outbox — readWrite. Linux always; macOS when the
+   *  bot withholds its app secret (see `withholdSendCredential`). */
   outbox?: string;
+  /** Bot config `sandboxWithholdBotSecret`: deny this bot's own
+   *  `<BOT_HOME>/send-cred.json` (plaintext app secret) even though BOT_HOME is
+   *  otherwise readWrite. The sandboxed CLI then reaches Lark only through the
+   *  host relay. Without it the secret is readable in-sandbox, and anyone who
+   *  can steer the agent can mint this bot's tenant token directly. */
+  withholdSendCredential?: boolean;
   /** Extra writable roots (resolved TMPDIR, admin extras). */
   extraWritePaths?: readonly string[];
   /** Per-bot user config (bots.json sandboxPaths) — highest precedence. */
@@ -905,6 +912,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const roleLibGrant = larkTransport && ctx.roleLibrarySubtree ? roleLibAccess(ctx.roleLibrarySubtree) : null;
   if (roleLibGrant) push([ctx.roleLibrarySubtree!], roleLibGrant, 'internal');
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
+  if (ctx.withholdSendCredential) push([`${ctx.botHome}/send-cred.json`], 'deny', 'mandatory');
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
   push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
   // Session-owned read-only roots: directories the daemon generated for THIS

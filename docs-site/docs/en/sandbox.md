@@ -296,15 +296,34 @@ Other limits:
 
 ## What works inside the sandbox, and what does not
 
-### `botmux send` still works, credentials stay outside
+### `botmux send` still works
 
-When the CLI inside the sandbox calls `botmux send` to post text, cards, images or files, it never gets Lark credentials. The request is written to a session-private relay directory and the daemon outside the sandbox sends it. **The Lark App Secret never enters the sandbox.**
+On Linux, when the CLI inside the sandbox calls `botmux send` to post text, cards, images or files, the request is written to a session-private relay directory and the daemon outside the sandbox sends it. On macOS the allowlist sandbox by default calls Lark itself, after the daemon confirms this turn's origin.
+
+Note: by default the allowlist sandbox **can read** this bot's own Lark App Secret (`<BOT_HOME>/send-cred.json`); `botmux history`, `botmux quoted` and similar commands use it to call Lark directly. Anyone who can steer the agent can therefore have it trade the secret for an app-identity token and skip every daemon-side check. Turn on `sandboxWithholdBotSecret` below if that is not acceptable.
 
 Sending somewhere other than the current topic (`--top-level` for the group's top level, `--chat-id` for another group, `--into` for another message's thread) also works, but the daemon re-checks the destination:
 
 - The session's own chat is always allowed;
 - Any other chat must be a regular group (not a DM, not an external chat) that the bot is in, and the person who sent this turn's message (or the session owner when there is none) must be a member there and allowed to talk to the bot;
 - If any of this cannot be confirmed, the send is refused.
+
+### Keep the bot secret out of the sandbox (`sandboxWithholdBotSecret`) {#withhold-bot-secret}
+
+```json
+"sandbox": "oncall",
+"sandboxWithholdBotSecret": true
+```
+
+When on:
+
+- The sandbox cannot read `send-cred.json`, so the agent never sees this bot's App Secret and cannot mint an app-identity token;
+- `botmux send`, `botmux dispatch`, `botmux history` and `botmux quoted` are written to the session relay directory and executed by the daemon outside the sandbox. This also gives macOS the same relay Linux has;
+- For `history` the daemon always reads the current session; for `quoted` the message must be in this session's chat or it is refused. Images and files from a quoted message are downloaded by the daemon and handed back inside the session relay directory;
+- Relayed `history` supports only `--limit` (at most 100), `--scope` and `--with-card-json`; `quoted` reads one message per call and supports `--raw`. Other options are refused;
+- Other commands that need to call Lark directly from the sandbox (for example `botmux bots list`) fail.
+
+Applies to the allowlist sandbox (`oncall`) only; scratch is unaffected. Like the other sandbox options it is fixed when a session is created, so a change applies to new sessions.
 
 ### Fleet commands belong on the host
 

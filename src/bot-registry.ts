@@ -1871,6 +1871,16 @@ export interface BotConfig {
   sandboxNetwork?: boolean;
   sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /**
+   * Keep this bot's Lark app secret out of the file sandbox. The worker still
+   * writes `<BOT_HOME>/send-cred.json` for host-side use, but the sandbox policy
+   * denies it, and the sandboxed `botmux send` / `history` / `quoted` go through
+   * the host relay (outbox) instead of calling Lark directly. On macOS this also
+   * gives the oncall Seatbelt sandbox the outbox relay Linux already has.
+   * Default off: today the secret is readable inside the sandbox, which lets an
+   * agent mint the tenant token itself.
+   */
+  sandboxWithholdBotSecret?: boolean;
+  /**
    * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
    * deny-by-default, so cross-bot read isolation is inherent — this flag is
    * auto-migrated to `sandbox: true` at daemon startup and kept on disk only
@@ -3943,6 +3953,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (entry.sandboxNetwork != null && typeof entry.sandboxNetwork !== 'boolean') {
       throw new Error(`Bot config [${i}]: sandboxNetwork must be true or false, got ${JSON.stringify(entry.sandboxNetwork)}`);
     }
+    if (entry.sandboxWithholdBotSecret != null && typeof entry.sandboxWithholdBotSecret !== 'boolean') {
+      throw new Error(`Bot config [${i}]: sandboxWithholdBotSecret must be true or false, got ${JSON.stringify(entry.sandboxWithholdBotSecret)}`);
+    }
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
@@ -4498,6 +4511,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
+      ...(entry.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true } : {}),
       ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
