@@ -119,7 +119,7 @@ import {
   WORKFLOW_DAEMON_IPC_ROUTE_PREFIX,
   type WorkflowDaemonIpcTarget,
 } from './workflows/v3/daemon-ipc-auth.js';
-import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
+import { handleDashboardTriggerApi, rejectActorOnDeniedTrigger } from './dashboard/trigger-api.js';
 import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from './dashboard/daemon-proxy-routes.js';
 import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
@@ -4487,7 +4487,7 @@ const server = createServer(async (req, res) => {
     // Only the local legacy Dashboard cookie is management authority. Platform
     // identities — owner included — retain terminal/preview capability through
     // signed proxy grants, but cannot cross into host administration APIs.
-    const { legacyAuthed, canManageHost, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
+    const { legacyAuthed, allowOwnerActor, canManageHost, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
@@ -4541,6 +4541,8 @@ const server = createServer(async (req, res) => {
     if (workflowInitiatorPreGateDenial(res, url.pathname, requestIdentity, canManageHost)) return;
 
     if (decision.kind === 'deny401') {
+      if (req.method === 'POST' && url.pathname === '/api/trigger'
+        && await rejectActorOnDeniedTrigger(req, res)) return;
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
         'content-type': 'text/html; charset=utf-8',
@@ -6164,7 +6166,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/trigger') {
-      return handleDashboardTriggerApi(req, res, { proxyToDaemon });
+      return handleDashboardTriggerApi(req, res, { proxyToDaemon }, allowOwnerActor);
     }
 
     // CLI 下拉选项 (id=选择键 + 展示名), 单一事实源在 cli-selection.CLI_SELECT_OPTIONS,

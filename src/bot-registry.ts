@@ -3057,11 +3057,14 @@ export function getConfiguredOwnerOpenId(larkAppId: string): string | undefined 
 export function getOwnerOpenId(larkAppId: string): string | undefined {
   const bot = bots.get(larkAppId);
   if (!bot) return undefined;
+  return getStrictOwnerOpenId(larkAppId) ?? bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+export function getStrictOwnerOpenId(larkAppId: string): string | undefined {
   const configuredOwner = getConfiguredOwnerOpenId(larkAppId);
-  if (configuredOwner && bot.resolvedAllowedUsers.includes(configuredOwner)) {
+  if (configuredOwner && bots.get(larkAppId)?.resolvedAllowedUsers.includes(configuredOwner)) {
     return configuredOwner;
   }
-  return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
 }
 
 /** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，

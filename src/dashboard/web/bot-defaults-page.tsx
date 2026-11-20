@@ -5874,77 +5874,94 @@ export function HerdrConfigSection(props: { bot: BotDefaultsRow; patchBot: Patch
   );
 }
 
-function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
-  const [loaded, setLoaded] = useState(typeof bot.teamRole === 'string');
+  const [snapshot, setSnapshot] = useState<{ role: string; injectMode: RoleInjectMode } | null>(null);
   const [role, setRole] = useState(typeof bot.teamRole === 'string' ? bot.teamRole : '');
   const [injectMode, setInjectMode] = useState<RoleInjectMode>('every');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [conflict, setConflict] = useState(false);
+  const [reloadVersion, setReloadVersion] = useState(0);
 
+  // Switching bots resets the visible draft. A same-bot conflict reload must
+  // keep that draft until a fresh GET succeeds, including when the GET fails.
+  useEffect(() => {
+    setRole(typeof bot.teamRole === 'string' ? bot.teamRole : '');
+    setInjectMode('every');
+    setConflict(false);
+  }, [bot.larkAppId]);
+
+  // A cached teamRole is useful while loading, but it is not a CAS snapshot:
+  // role and injectMode must come from the SAME GET before every edit session.
   useEffect(() => {
     let active = true;
     const roleUrl = `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`;
-    if (typeof bot.teamRole === 'string') {
-      // Already resolved (incl. right after our own save, which patchBot's teamRole
-      // re-fires this effect) — sync the field but DON'T clear status, or the freshly
-      // set "✓ 已保存/已删除" toast gets wiped a frame later.
-      setLoaded(true);
-      setRole(bot.teamRole);
-      return () => { active = false; };
-    }
     setStatus(null);
-    setLoaded(false);
-    setRole('');
+    setSnapshot(null);
+    setLoading(true);
     void (async () => {
       try {
         const r = await fetch(roleUrl);
         const body = await r.json().catch(() => ({}));
         if (!active) return;
         if (r.ok && body.ok) {
-          const next = body.role ?? '';
-          setRole(next);
-          setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
-          setLoaded(true);
-          patchBot(bot.larkAppId, { teamRole: next });
+          const nextRole = typeof body.role === 'string' ? body.role : '';
+          const nextMode: RoleInjectMode = body.injectMode === 'once' ? 'once' : 'every';
+          setSnapshot({ role: nextRole, injectMode: nextMode });
+          setRole(nextRole);
+          setInjectMode(nextMode);
+          setConflict(false);
+          patchBot(bot.larkAppId, { teamRole: nextRole });
         } else {
           setStatus({ text: `✗ ${tr('botDefaults.roleLoadErr')}: ${body.error ?? r.status}` });
         }
       } catch (e: any) {
         if (active) setStatus({ text: `✗ ${tr('botDefaults.roleLoadErr')}: ${caughtErrorText(e)}` });
+      } finally {
+        if (active) setLoading(false);
       }
     })();
     return () => { active = false; };
-  }, [bot.larkAppId, bot.teamRole, patchBot, tr]);
-
-  // injectMode isn't cached on the bot row, so when the team role is already
-  // resolved (cache hit above skips the GET) fetch just the mode once per bot.
-  useEffect(() => {
-    let active = true;
-    if (typeof bot.teamRole !== 'string') return () => { active = false; };
-    void (async () => {
-      try {
-        const r = await fetch(`/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`);
-        const body = await r.json().catch(() => ({}));
-        if (active && r.ok && body.ok) setInjectMode(body.injectMode === 'once' ? 'once' : 'every');
-      } catch { /* keep default 'every' */ }
-    })();
-    return () => { active = false; };
-  }, [bot.larkAppId]);
+  }, [bot.larkAppId, reloadVersion, patchBot, tr]);
 
   async function putRole(nextRole: string, deleted: boolean, mode: RoleInjectMode = injectMode): Promise<void> {
-    if (!loaded) return;
+    if (!snapshot || conflict) return;
+    const expected = snapshot;
     await saveBotField({
-      request: () => sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, { role: nextRole, injectMode: mode }),
+      request: async () => {
+        const result = await sendJson('PUT', `/api/team/local-bots/${encodeURIComponent(bot.larkAppId)}/role`, {
+          role: nextRole,
+          injectMode: mode,
+          expectedRole: expected.role,
+          expectedInjectMode: expected.injectMode,
+        });
+        if (result.status === 409 && result.body?.error === 'role_changed') setConflict(true);
+        return result;
+      },
       setStatus,
       setBusy,
       saved: deleted ? tr('botDefaults.roleDeleted') : tr('botDefaults.roleSaved'),
+      errorText: result => result.body?.error === 'role_changed'
+        ? tr('botDefaults.roleConflict')
+        : responseErrorText(result),
       onSaved: body => {
-        const stored = nextRole.trim();
-        setRole(stored);
-        if (body.injectMode === 'once' || body.injectMode === 'every') setInjectMode(body.injectMode);
-        patchBot(bot.larkAppId, { teamRole: stored });
+        // The persisted value can differ from local input after trim/32KiB
+        // truncation. Reload if talking to an older server without role in PUT.
+        if (typeof body.role !== 'string') {
+          setReloadVersion(value => value + 1);
+          return;
+        }
+        const storedMode: RoleInjectMode = body.injectMode === 'once' || body.injectMode === 'every'
+          ? body.injectMode
+          : mode;
+        setSnapshot({ role: body.role, injectMode: storedMode });
+        setRole(body.role);
+        setInjectMode(storedMode);
+        setConflict(false);
+        patchBot(bot.larkAppId, { teamRole: body.role });
       },
     });
   }
@@ -5961,7 +5978,8 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         data-input="teamRole"
         rows={6}
         placeholder={tr('botDefaults.rolePlaceholder')}
-        disabled={!loaded || busy}
+        disabled={!snapshot || busy}
+        readOnly={conflict}
         value={role}
         onChange={event => setRole(event.currentTarget.value)}
       />
@@ -5971,7 +5989,7 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
           id={`bd-role-inject-${bot.larkAppId}`}
           className="bd-role-inject-menu"
           ariaLabel={tr('roles.injectModeLabel')}
-          disabled={!loaded || busy}
+          disabled={!snapshot || busy || conflict}
           label={dropdownLabel(injectOptions, injectMode)}
           value={injectMode}
           options={injectOptions}
@@ -5979,7 +5997,8 @@ function RoleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
         />
       </div>
       <div className="actions">
-        <button type="button" className="primary" data-action="save-role" disabled={!loaded || busy} onClick={() => void putRole(role, role.trim() === '')}>{tr('botDefaults.roleSave')}</button>
+        <button type="button" className="primary" data-action="save-role" disabled={!snapshot || busy || conflict} onClick={() => void putRole(role, role.trim() === '')}>{tr('botDefaults.roleSave')}</button>
+        {conflict && <button type="button" data-action="reload-role" disabled={loading || busy} onClick={() => setReloadVersion(value => value + 1)}>{tr('botDefaults.roleReload')}</button>}
         <StatusSpan status={status} attr={{ 'data-role-status': '' }} />
       </div>
       <ProfileRoles appId={bot.larkAppId} />
