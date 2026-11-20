@@ -570,6 +570,8 @@ describe('queued identities stay separate from the executing task', () => {
 describe('target daemon consumes signed message authority', () => {
   async function targetHarness(options: { taskConsent?: boolean; botAccess?: boolean; mapping?: 'resolved' | 'transient' | 'definitive'; member?: boolean; memberError?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
     const ts = (await import('typescript')).default;
+    const { configuredCliExecutionMode } = await import('../src/core/cli-execution-mode.js');
+    const { resolveNativeScheduledControlActor } = await import('../src/core/scheduled-control-actor.js');
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
     const { resolveScheduledRunIdentity } = await import('../src/core/schedule-identity-claim.js');
@@ -578,7 +580,7 @@ describe('target daemon consumes signed message authority', () => {
     const { scheduleTimeZone } = await import('../src/utils/timezone.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
     const { clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers } = await import('../src/core/cli-identity.js');
-    const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
+    const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity', 'prepareNativeScheduledControlIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'checkDelegationRecipient', 'delegatedScheduleRuntimeDeps',
       'talkerScheduleRuntimeDeps',
       'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
@@ -619,7 +621,8 @@ describe('target daemon consumes signed message authority', () => {
       ? { status: options.mapping } : { status: 'resolved', openId: 'ou_alice_target' });
     const scopeValues = {
       config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
-      readTaskBinding, capabilityOn, getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
+      readTaskBinding, capabilityOn, configuredCliExecutionMode, resolveNativeScheduledControlActor,
+      getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       dispatchConsentCardAvailable: async () => true,
       loadOrCreateDispatchReportBindingSecret: () => secret,
       resolveTargetAppOpenId, evaluateTalk: (_app: string, chat?: string, _user?: string, botUnion?: string, humanUnion?: string) => ({
