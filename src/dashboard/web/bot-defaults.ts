@@ -148,7 +148,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'security',
     titleKey: 'botDefaults.sectionGrant',
     fieldKeys: [
-      'botDefaults.p2pOpen', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
+      'botDefaults.p2pOpen', 'botDefaults.scheduleCreateByTalkers', 'botDefaults.restrictGrant', 'botDefaults.autoGrantCard',
       'botDefaults.grantRequestToOwnerDm', 'botDefaults.trustSameOwnerBots', 'botDefaults.grantDelegateBots',
       'botDefaults.grantDurationDefault', 'botDefaults.quotaDefault',
     ],
@@ -601,6 +601,7 @@ export type BotDefaultsRow = {
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
   p2pOpen?: boolean;
+  scheduleCreateByTalkers?: boolean;
   grantRequestToOwnerDm?: boolean;
   trustSameOwnerBots?: boolean;
   grantDelegateBots?: string[];

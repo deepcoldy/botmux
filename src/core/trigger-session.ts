@@ -17,6 +17,7 @@ import { resolveRegularGroupMode, type ChatReplyMode } from '../services/chat-re
 import { localeForBot, t } from '../i18n/index.js';
 import { validateWorkingDir } from './working-dir.js';
 import { buildFollowUpCliInput, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, rememberLastCliInput } from './session-manager.js';
+import { stageSessionTurnInbound } from '../services/session-turns.js';
 import { markSessionActivity } from './session-activity.js';
 import { excludedTurnActivityAt } from './turn-outcome.js';
 import {
@@ -861,6 +862,22 @@ function buildExistingSessionContent(
   });
 }
 
+function stageTriggerReadModel(ds: DaemonSession, req: TriggerRequest, turnId: string): void {
+  if (ds.session.status === 'closed') return;
+  try {
+    stageSessionTurnInbound(config.session.dataDir, ds.session.sessionId, turnId, {
+      via: 'trigger',
+      messageId: turnId,
+      text: req.instruction ?? '',
+      placement: ds.scope === 'thread'
+        ? { kind: 'thread', rootMessageId: ds.session.rootMessageId }
+        : { kind: 'chat' },
+    });
+  } catch {
+    logger.warn('Failed to stage structured trigger input');
+  }
+}
+
 async function triggerSessionTurnAdmitted(
   req: TriggerRequest,
   deps: TriggerSessionDeps,
@@ -1418,6 +1435,7 @@ async function triggerSessionTurnAdmitted(
         error: `target session ${target.session.sessionId} is not runnable (${state}); preserving its opening prompt`,
       };
     }
+    stageTriggerReadModel(target, req, triggerId);
     const content = buildExistingSessionContent(
       target, prompt, larkAppId, chatId, codexAppText, codexAppApplicationContext, codexAppMessageContext, triggerId,
     );
@@ -2078,6 +2096,7 @@ async function triggerSessionTurnAdmitted(
     });
     throw err;
   }
+  stageTriggerReadModel(newDs, req, triggerId);
   const promptInput = buildNewTopicCliInput(
     prompt,
     session.sessionId,

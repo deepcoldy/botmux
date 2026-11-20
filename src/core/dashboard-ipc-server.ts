@@ -244,6 +244,7 @@ import {
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
+import { parseSessionTurnsPage, readSessionTurns } from '../services/session-turns.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
 import {
   findQuotaFallbackCycle,
@@ -7133,6 +7134,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req
 // 与输出永不进结构。detail=summary 只返聚合+建议（/insight 卡片、抽屉概览用）；
 // detail=spans 才带脱敏 span（详情 tab 用）。owner-only 由 dashboard 外层 authed-only
 // 路由 + /insight 命令层把关，IPC 自身 loopback-trusted。
+ipcRoute('GET', '/api/sessions/:sessionId/turns', (req, res, params) => {
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const page = parseSessionTurnsPage(new URL(req.url ?? '/', 'http://localhost').searchParams);
+  if (!page) return jsonRes(res, 400, { ok: false, error: 'invalid_turns_cursor_or_limit' });
+  res.setHeader('cache-control', 'no-store');
+  return jsonRes(res, 200, session.status === 'closed'
+    ? readSessionTurns(config.session.dataDir, params.sessionId, page.since, 0)
+    : readSessionTurns(config.session.dataDir, params.sessionId, page.since, page.limit));
+});
+
 ipcRoute('GET', '/api/sessions/:sessionId/insight', (req, res, params) => {
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
@@ -10817,6 +10829,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     grantRequestToOwnerDm: grantPrefs.grantRequestToOwnerDm,
     trustSameOwnerBots: grantPrefs.trustSameOwnerBots,
     grantDelegateBots: grantPrefs.grantDelegateBots,
+    scheduleCreateByTalkers: grantPrefs.scheduleCreateByTalkers,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -11180,6 +11193,7 @@ ipcRoute('PUT', '/api/bot-summary-range', requireBoundBot(async (req, res) => {
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 //   • trustSameOwnerBots: boolean          — 信任同一 owner 的同机 Bot（管理命令 + 点名授权）
 //   • grantDelegateBots: string[]|null     — 委托授权外部 bot 名单（ou_/cli_）；[]/null = 清空
+//   • scheduleCreateByTalkers: boolean     — 允许只能对话的真人为自己创建定时任务（默认关）
 ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
   const raw = await readJsonBodyOrBadJson<unknown>(req, res);
   if (raw === BAD_JSON) return;
@@ -11196,6 +11210,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantDefaultDurationMs?: unknown;
     trustSameOwnerBots?: unknown;
     grantDelegateBots?: unknown;
+    scheduleCreateByTalkers?: unknown;
   };
 
   const patch: {
@@ -11207,12 +11222,14 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantDefaultDurationMs?: number | null;
     trustSameOwnerBots?: boolean;
     grantDelegateBots?: string[];
+    scheduleCreateByTalkers?: boolean;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
   if (typeof body.grantRequestToOwnerDm === 'boolean') patch.grantRequestToOwnerDm = body.grantRequestToOwnerDm;
   if (typeof body.trustSameOwnerBots === 'boolean') patch.trustSameOwnerBots = body.trustSameOwnerBots;
+  if (typeof body.scheduleCreateByTalkers === 'boolean') patch.scheduleCreateByTalkers = body.scheduleCreateByTalkers;
   // null = 清空名单；字符串数组 = 设定名单（store 内 trim/去空白/去重，空名单不写盘）。
   if (body.grantDelegateBots === null) patch.grantDelegateBots = [];
   else if (Array.isArray(body.grantDelegateBots) && body.grantDelegateBots.every((x): x is string => typeof x === 'string')) {

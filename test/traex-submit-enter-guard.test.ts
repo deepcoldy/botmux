@@ -80,6 +80,18 @@ describe.sequential('TraeX submit Enter guard', () => {
     };
   };
 
+  it('preserves a pre-paste refusal after awaited adapter setup without writing text or Enter', async () => {
+    const pty = ptyWithLaggingReceipt(1);
+    const refusal = new Error('physical writer retired during setup');
+    const g = guard([undefined]);
+    const beforeWrite = vi.fn(() => { throw refusal; });
+    await expect(createTraexAdapter('/bin/traex').writeInput(pty, 'hello', {
+      submitGuard: { ...g.guard, beforeWrite },
+    })).rejects.toBe(refusal);
+    expect(beforeWrite).toHaveBeenCalledOnce();
+    expect(pty.pasteText).not.toHaveBeenCalled();
+    expect(pty.enters()).toBe(0);
+  });
   it('a page up before the first Enter: waits for it to go, then submits the pasted draft once', async () => {
     const pty = ptyWithLaggingReceipt(1);
     const g = guard(['question page is up', 'question page is up', undefined]);

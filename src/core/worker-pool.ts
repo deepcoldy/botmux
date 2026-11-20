@@ -1083,7 +1083,7 @@ import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.j
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { sameTrustedPrincipal } from './active-turn-authority.js';
 import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
-import { isAntigravityWorkingScreen } from '../adapters/cli/antigravity.js';
+import { isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
 import {
   evaluateVcMeetingManagedSend,
   resolveVcMeetingImTurnOrigin,
@@ -4893,12 +4893,26 @@ async function resolveQuotaFallbackForSession(
   });
 }
 
+/** 在运行态保留已观察的拒绝，SQLite 写入回滚时仍可重试 */
+function rememberSessionAntigravityQuota(ds: DaemonSession, limit: CliUsageLimitState): void {
+  const history = ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory;
+  ds.antigravityQuotaHistory = rememberAntigravityQuota(history, limit);
+}
+
 export function clearUsageLimitState(ds: DaemonSession): void {
+  const previous = ds.usageLimit;
+  if (previous) rememberSessionAntigravityQuota(ds, previous);
+  ds.usageLimit = undefined;
+  try {
+    persistStreamCardState(ds);
+  } catch (error) {
+    ds.usageLimit = previous;
+    throw error;
+  }
   if (ds.usageLimitRetryTimer) {
     clearTimeout(ds.usageLimitRetryTimer);
     ds.usageLimitRetryTimer = undefined;
   }
-  ds.usageLimit = undefined;
   ds.usageLimitPersistPending = false;
   // Re-arm the proactive rate-limit notification latch: the next limit episode
   // (even one with the same usageLimitStateKey) must notify the owner again.
@@ -4906,7 +4920,13 @@ export function clearUsageLimitState(ds: DaemonSession): void {
   // Only the async ownership token is session-local. Cross-session duplicate
   // handoffs are suppressed by the source-bot five-minute event window.
   ds.quotaFallbackAttemptToken = undefined;
-  persistStreamCardState(ds);
+}
+
+/** 限额出现、解除、换代或可重试状态变化时重绘已有卡片 */
+function usageLimitCardChanged(previous: CliUsageLimitState | undefined, current: CliUsageLimitState | undefined): boolean {
+  if (!previous || !current) return previous !== current;
+  return previous.retryReady !== current.retryReady
+    || usageLimitStateKey(previous) !== usageLimitStateKey(current);
 }
 
 export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefined {
@@ -5023,6 +5043,8 @@ function armUsageLimitRetryTimer(ds: DaemonSession, previous?: CliUsageLimitStat
 
 export function restoreUsageLimitRuntimeState(ds: DaemonSession): void {
   if (!ds.usageLimit) return;
+  // 旧会话只存了当前限额，恢复时先保留它的身份，后续清除状态也能识别残留提示
+  rememberSessionAntigravityQuota(ds, ds.usageLimit);
   ds.lastScreenStatus = 'limited';
   armUsageLimitRetryTimer(ds);
 }
@@ -5043,10 +5065,15 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
   ) return;
 
   ds.usageLimit = usageLimit;
+  rememberSessionAntigravityQuota(ds, usageLimit);
   ds.usageLimitPersistPending = true;
   persistStreamCardState(ds);
   ds.usageLimitPersistPending = false;
   armUsageLimitRetryTimer(ds, previous);
+}
+
+function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
+  return limit?.source === 'antigravity-error-composer' && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
 }
 
 /**
@@ -5056,7 +5083,8 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
  * (the worker re-emits only while the limit text stays on screen; screenshot
  * ticks arrive every 10s), so a recorded limit survives ordinary idle frames
  * and the cooldown card stays up until the user retries. But it must
- * self-heal on evidence of active work: a blocked CLI does not produce
+ * self-heal on evidence of active work or after a native agy countdown
+ * expires without a new refusal. A blocked CLI does not produce
  * `working`/`analyzing` frames, so a limit that survives such a frame was a
  * false positive (a flicker-frame screen scan, or a structured emit the CLI
  * recovered from). Without this the card keeps showing 「限额已达」 for the
@@ -5067,18 +5095,28 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
  */
 function resolveUsageAwareScreenStatus(
   ds: DaemonSession,
-  workerStatus: ScreenStatus,
-  freshUsageLimit: CliUsageLimitState | undefined,
-  content?: string,
+  frame: { status: ScreenStatus; usageLimit?: CliUsageLimitState; expiredAntigravityQuota?: CliUsageLimitState; content?: string },
 ): ScreenStatus {
-  if (freshUsageLimit) return 'limited';
-  if (ds.usageLimit && isActiveWorkRuntimeStatus(workerStatus)) {
-    if (ds.usageLimit.source === 'antigravity-error-composer'
-      && (!content || !isAntigravityWorkingScreen(content))) return 'limited';
-    clearUsageLimitState(ds);
-    return workerStatus;
+  const { status, usageLimit, expiredAntigravityQuota, content } = frame;
+  const previous = ds.usageLimit;
+  const expired = expiredAntigravityQuota && isExpiredNativeAntigravityQuota(expiredAntigravityQuota)
+    ? expiredAntigravityQuota : undefined;
+  if (expired) rememberSessionAntigravityQuota(ds, expired);
+
+  if (previous && !usageLimit) {
+    const expiredSameEpisode = expired && expired.relativeResetKey === previous.relativeResetKey && expired.kind === previous.kind;
+    const working = isActiveWorkRuntimeStatus(status);
+    // 原生拒绝在窗口内只接受原生工作提示，避免无关 PTY 输出清掉限额。
+    const workRecovered = working && (previous.source !== 'antigravity-error-composer'
+      || (content && isAntigravityWorkingScreen(content)));
+    if (expiredSameEpisode || isExpiredNativeAntigravityQuota(previous) || workRecovered) {
+      clearUsageLimitState(ds);
+      return status;
+    }
   }
-  return ds.usageLimit ? 'limited' : workerStatus;
+  // 即使活动限额已被清掉，仍须保留这次确认的截止时间，供 worker 恢复时使用。
+  if (expired) persistStreamCardState(ds);
+  return usageLimit || previous ? 'limited' : status;
 }
 
 function logWorkerStderr(t: string, line: string): void {
@@ -20052,6 +20090,10 @@ function forkWorkerPrepared(
     rootMessageId: sessionAnchorId(ds),
     workingDir: cwd,
     cliId: agentCfg.cliId,
+    ...(agentCfg.cliId === 'antigravity' ? {
+      antigravityQuotaHistory: ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory,
+      antigravityActiveQuota: ds.usageLimit,
+    } : {}),
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     cliConfigDir: agentCfg.cliConfigDir,
@@ -20973,6 +21015,121 @@ function setupWorkerHandlers(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
+  /** 判定屏幕帧能否用其轮次选择回复话题 */
+  const provenScreenTurnId = (turnId?: string, dispatchAttempt?: number): string | undefined => {
+    if (!turnId) return undefined;
+    if (!sessionController) return turnId;
+    const admittedExecution = sessionController.admittedExecution();
+    if (admittedExecution?.turnId === turnId
+      && (dispatchAttempt === undefined || admittedExecution.dispatchAttempt === dispatchAttempt)) return turnId;
+    const openingExecution = ds.initConfig?.turnId === turnId ? ds.initConfig.sessionCommand?.execution : undefined;
+    if (openingExecution?.turnId === turnId
+      && (dispatchAttempt === undefined || openingExecution.dispatchAttempt === dispatchAttempt)
+      && sessionController.store.execution(sessionController.ref, openingExecution.executionId)?.phase === 'queued') return turnId;
+    return undefined;
+  };
+  /** 文本帧和截图帧共享限额切换边沿，各自在通过来源和静默检查后调用 */
+  const notifyUsageLimitEdge = (
+    previousStatus: DaemonSession['lastScreenStatus'],
+    previousLimit: CliUsageLimitState | undefined,
+    frameTurnId?: string,
+    dispatchAttempt?: number,
+  ): void => {
+    const limit = ds.usageLimit;
+    if (ds.lastScreenStatus !== 'limited' || !limit || ds.suppressRecoveryCard) return;
+    const replacedExpiredQuota = isExpiredNativeAntigravityQuota(previousLimit)
+      && previousLimit?.relativeResetKey !== limit.relativeResetKey;
+    if (previousStatus === 'limited' && !replacedExpiredQuota) return;
+
+    // 已通过截图来源校验的旧帧仍可能指向旧话题。两个入口都先核对当前执行。
+    const provenTurn = provenScreenTurnId(frameTurnId, dispatchAttempt);
+    const admittedExecution = sessionController?.admittedExecution();
+    const currentTurn = admittedExecution?.turnId ?? ds.currentTurnId ?? fallbackTurnId(ds, undefined);
+    const turnId = sessionController ? provenTurn ?? currentTurn : currentTurn ?? provenTurn;
+    if (turnId && turnId !== frameTurnId) {
+      const latestAttempt = ds.turnDispatchAttemptHighWater;
+      const attempt = admittedExecution?.turnId === turnId ? admittedExecution.dispatchAttempt
+        : latestAttempt?.turnId === turnId ? latestAttempt.dispatchAttempt : undefined;
+      if (managedAuxUiSuppressed(turnId, attempt)) return;
+    }
+    const limitKey = usageLimitStateKey(limit);
+    if (ds.rateLimitNotifiedKey !== limitKey) {
+      ds.rateLimitNotifiedKey = limitKey;
+      const notifyBody = tr(
+        limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
+        { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
+        loc,
+      );
+      const ownerOpenId = ds.session.ownerOpenId;
+      const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
+      scopedReply(notifyText, 'text', turnId).catch((err: any) => {
+        logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
+      });
+    }
+
+    // 先认领五分钟去重窗口，再异步解析接手 Bot 的身份
+    const quotaFallback = botCfg.quotaFallbackBot;
+    if (!quotaFallback?.enabled || !quotaFallback.kinds.includes(limit.kind)) return;
+    const fallbackTurn = fallbackTurnId(ds, turnId);
+    if (!claimQuotaFallbackEvent(ds.larkAppId, limit.kind)) {
+      logger.info(
+        `[${t}] Quota fallback deduplicated within five minutes `
+        + `(kind=${limit.kind}, target=${quotaFallback.targetAppId})`,
+      );
+    } else {
+      const attemptToken = randomUUID();
+      ds.quotaFallbackAttemptToken = attemptToken;
+      const ownsFallbackAttempt = (): boolean =>
+        ownsLifecycleMutation()
+        && ds.quotaFallbackAttemptToken === attemptToken
+        && ds.lastScreenStatus === 'limited'
+        && !!ds.usageLimit
+        && usageLimitStateKey(ds.usageLimit) === limitKey;
+      void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
+        .then(async resolved => {
+          // Identity resolution is asynchronous. Never let a lookup from
+          // a cleared/replaced worker episode post into a later turn —
+          // even when that later episode happens to have the same limit
+          // key (the token distinguishes the two claims).
+          if (!ownsFallbackAttempt()) {
+            logger.info(
+              `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
+            );
+            return;
+          }
+          if (!resolved.ok) {
+            logger.warn(
+              `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
+              + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
+            );
+            return;
+          }
+          const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
+          try {
+            if (!ownsFallbackAttempt()) return;
+            await scopedReply(handoff, 'text', fallbackTurn);
+            logger.info(
+              `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
+              + `(${resolved.source}) for episode=${limitKey}`,
+            );
+          } catch (err: any) {
+            // Keep the daemon-wide five-minute claim. A later frame/session
+            // must not retry and spam the same peer; owner notice and manual
+            // retry controls remain available.
+            logger.warn(
+              `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
+              + `${err?.message ?? err}`,
+            );
+          }
+        })
+        .catch((err: any) => {
+          logger.warn(
+            `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
+            + `${err?.message ?? err}`,
+          );
+        });
+    }
+  };
   const traexCatalogContextKey = traexCatalogConfigKey(botCfg);
   ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
   ensureReadonlyTaskContinuationAttached(ds, botCfg);
@@ -23369,9 +23526,8 @@ function setupWorkerHandlers(
         if (!ownsLifecycleMutation()) break;
         // Project the frame's effective status once: reused for the in-memory
         // status assignment below and the stale-post-terminal gate.
-        const projectedScreenStatus = resolveUsageAwareScreenStatus(
-          ds, msg.status, msg.usageLimit, msg.content,
-        );
+        const previousLimit = ds.usageLimit;
+        const projectedScreenStatus = resolveUsageAwareScreenStatus(ds, msg);
         // A busy frame from a turn that already reported a completed terminal
         // (with no newer turn admitted) is stale viewport evidence. It must not
         // cancel the post-terminal correction or drive the card/revision; the
@@ -23386,21 +23542,8 @@ function setupWorkerHandlers(
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
         if (!startupState.ready && !workerHasInitialized(ds)) break;
-        const activeController = typeof sessionController !== 'undefined' ? sessionController : undefined;
-        const admittedExecution = activeController?.admittedExecution();
-        const openingExecution = msg.turnId && ds.initConfig?.turnId === msg.turnId ? ds.initConfig.sessionCommand?.execution : undefined;
-        const screenTurnProven = Boolean(msg.turnId) && (
-          !activeController
-          || (admittedExecution !== undefined
-            && admittedExecution.turnId === msg.turnId
-            && (msg.dispatchAttempt === undefined || admittedExecution.dispatchAttempt === msg.dispatchAttempt))
-          || (openingExecution !== undefined
-            && openingExecution.turnId === msg.turnId
-            && (msg.dispatchAttempt === undefined || openingExecution.dispatchAttempt === msg.dispatchAttempt)
-            && activeController.store.execution(activeController.ref, openingExecution.executionId)?.phase === 'queued')
-        );
-        const screenTurnId = screenTurnProven ? msg.turnId : undefined;
-        const startingCardRecovered = !stalePostTerminalBusy && (!msg.turnId || screenTurnProven)
+        const screenTurnId = provenScreenTurnId(msg.turnId, msg.dispatchAttempt);
+        const startingCardRecovered = !stalePostTerminalBusy && (!msg.turnId || screenTurnId)
           && noteStartingCardHealthFrame(ds, msg.turnId, projectedScreenStatus);
         const prevStatus = ds.lastScreenStatus;
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
@@ -23593,122 +23736,7 @@ function setupWorkerHandlers(
             { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card status: ${error.message}`));
         }
 
-        // Proactive rate/usage-limit notification. The streaming-card PATCH
-        // (card-on) carries no unread/mention signal, and card-off sessions
-        // skip card output entirely — so without a fresh message here the owner
-        // never learns the CLI is blocked (the turn just stalls). Fire on the
-        // working/other→limited edge, AFTER the managed/silent fence above but
-        // BEFORE the card-off early-break below (card-off sessions must still
-        // get this ping), once per limit episode: the latch is keyed on
-        // usageLimitStateKey and reset by clearUsageLimitState (self-heal /
-        // turn end), so the same episode's repeated limited ticks stay quiet
-        // while the next episode notifies again.
-        //
-        // Recovery-window exclusion: usageLimit is in-memory. When the CLI got
-        // limited WHILE the daemon was down (common for tmux/adopt restores),
-        // restore has no usageLimit to seed lastScreenStatus='limited' from,
-        // so the first post-restart limited tick is a false (empty→limited)
-        // edge. The in-memory latch also died with the old process, so without
-        // this guard the restart-silence contract would be broken by one @owner
-        // ping. The owner already got the private recovery DM summary; hold the
-        // ping until a real user turn clears suppressRecoveryCard.
-        if (
-          ds.lastScreenStatus === 'limited'
-          && prevStatus !== 'limited'
-          && ds.usageLimit
-          && !ds.suppressRecoveryCard
-          && ds.rateLimitNotifiedKey !== usageLimitStateKey(ds.usageLimit)
-        ) {
-          ds.rateLimitNotifiedKey = usageLimitStateKey(ds.usageLimit);
-          const limit = ds.usageLimit;
-          const notifyBody = tr(
-            limit.kind === 'usage' ? 'worker.rate_limit_notify.usage' : 'worker.rate_limit_notify.rate',
-            { cliName: sessionCliDisplayName(ds, botCfg), retryLabel: limit.retryLabel },
-            loc,
-          );
-          const ownerOpenId = ds.session.ownerOpenId;
-          const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
-          scopedReply(notifyText, 'text', screenTurnId).catch((err: any) => {
-            logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
-          });
-        }
-
-        // Optional daemon-side backup-Bot handoff. This deliberately sits next
-        // to (but does not share) the owner-notification latch: the daemon sends
-        // one fixed message with one real <at>, without asking the exhausted CLI
-        // to generate or replay anything. Claim the source-bot/kind five-minute
-        // window BEFORE asynchronous identity resolution/send, so repeated
-        // screen ticks and concurrent limited sessions cannot produce a storm.
-        const quotaFallback = botCfg.quotaFallbackBot;
-        if (
-          ds.lastScreenStatus === 'limited'
-          && prevStatus !== 'limited'
-          && ds.usageLimit
-          && !ds.suppressRecoveryCard
-          && quotaFallback?.enabled === true
-          && quotaFallback.kinds.includes(ds.usageLimit.kind)
-        ) {
-          const limitKey = usageLimitStateKey(ds.usageLimit);
-          const fallbackTurn = fallbackTurnId(ds, screenTurnId);
-          if (!claimQuotaFallbackEvent(ds.larkAppId, ds.usageLimit.kind)) {
-            logger.info(
-              `[${t}] Quota fallback deduplicated within five minutes `
-              + `(kind=${ds.usageLimit.kind}, target=${quotaFallback.targetAppId})`,
-            );
-          } else {
-            const attemptToken = randomUUID();
-            ds.quotaFallbackAttemptToken = attemptToken;
-            const ownsFallbackAttempt = (): boolean =>
-              ownsLifecycleMutation()
-              && ds.quotaFallbackAttemptToken === attemptToken
-              && ds.lastScreenStatus === 'limited'
-              && !!ds.usageLimit
-              && usageLimitStateKey(ds.usageLimit) === limitKey;
-            void resolveQuotaFallbackForSession(ds, quotaFallback.targetAppId)
-              .then(async resolved => {
-                // Identity resolution is asynchronous. Never let a lookup from
-                // a cleared/replaced worker episode post into a later turn —
-                // even when that later episode happens to have the same limit
-                // key (the token distinguishes the two claims).
-                if (!ownsFallbackAttempt()) {
-                  logger.info(
-                    `[${t}] Dropped stale quota fallback resolution for ${quotaFallback.targetAppId}`,
-                  );
-                  return;
-                }
-                if (!resolved.ok) {
-                  logger.warn(
-                    `[${t}] Quota fallback target rejected: target=${quotaFallback.targetAppId} `
-                    + `reason=${resolved.reason}${resolved.detail ? ` detail=${resolved.detail}` : ''}`,
-                  );
-                  return;
-                }
-                const handoff = `<at id=${resolved.openId}></at> ${quotaFallback.message}`;
-                try {
-                  if (!ownsFallbackAttempt()) return;
-                  await scopedReply(handoff, 'text', fallbackTurn);
-                  logger.info(
-                    `[${t}] Quota fallback handed off to ${quotaFallback.targetAppId} `
-                    + `(${resolved.source}) for episode=${limitKey}`,
-                  );
-                } catch (err: any) {
-                  // Keep the daemon-wide five-minute claim. A later frame/session
-                  // must not retry and spam the same peer; owner notice and manual
-                  // retry controls remain available.
-                  logger.warn(
-                    `[${t}] Failed to deliver quota fallback to ${quotaFallback.targetAppId}: `
-                    + `${err?.message ?? err}`,
-                  );
-                }
-              })
-              .catch((err: any) => {
-                logger.warn(
-                  `[${t}] Quota fallback resolution failed for ${quotaFallback.targetAppId}: `
-                  + `${err?.message ?? err}`,
-                );
-              });
-          }
-        }
+        notifyUsageLimitEdge(prevStatus, previousLimit, msg.turnId, msg.dispatchAttempt);
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card. Turn-exact: a
@@ -23874,13 +23902,14 @@ function setupWorkerHandlers(
               }
             });
         } else {
-          // Same turn — PATCH only on a header change: the status, or the
-          // background-task count it shows. Image PATCHes go through the
+          // Same turn — PATCH on status, limit, or background-task changes.
+          // Image PATCHes go through the
           // screenshot_uploaded path; text is no longer a card body mode.
           // The post-terminal repaint is the one same-value exception: the
           // display-only idle correction left a delivered receipt while
           // execution stayed busy, so the first live busy frame must render.
           const statusChanged = prevStatus !== ds.lastScreenStatus;
+          const limitChanged = usageLimitCardChanged(previousLimit, cardUsageLimit(ds));
           const label = streamCardLabel(ds);
           const activity = typeof label === 'object' && 'activity' in label ? label.activity : undefined;
           // Capacity entry/exit keeps status=working but changes the card header.
@@ -23891,7 +23920,7 @@ function setupWorkerHandlers(
           // display-only idle correction left a delivered receipt while
           // execution stayed busy, so the first live busy frame must render.
           syncUsageRefreshTimer(ds);
-          if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount
+          if (!statusChanged && !limitChanged && prevBackgroundTaskCount === ds.backgroundTaskCount
             && prevActivity === activity && !forcePostTerminalBusyRepaint && !startingCardRecovered) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
@@ -23979,8 +24008,9 @@ function setupWorkerHandlers(
           break;
         }
         const prevStatus = ds.lastScreenStatus;
+        const previousLimit = ds.usageLimit;
         updateUsageLimitState(ds, msg.usageLimit);
-        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg);
         workersWithScreenStatus.add(worker);
         stampIdleSinceAt(ds, prevStatus);
         // Same per-frame stale gate as screen_update: a residual busy screenshot
@@ -24028,6 +24058,10 @@ function setupWorkerHandlers(
           persistStreamCardState(ds);
           break;
         }
+        if (ownsLifecycleMutation()) {
+          const source = frameVerdict.source;
+          notifyUsageLimitEdge(prevStatus, previousLimit, source.turnId, source.dispatchAttempt);
+        }
         // Store the image key only AFTER the managed gate: now that the ready
         // handler re-syncs display mode on every path, a worker can be
         // uploading during a suppressed managed/silent turn — letting that
@@ -24050,15 +24084,20 @@ function setupWorkerHandlers(
         // source releases the retained suppressed-source evidence.
         releaseRetainedCaptureSourceByAcceptedFrame(ds, frameVerdict.source);
         persistStreamCardState(ds);
+        const mode = ds.displayMode ?? 'hidden';
         if (startingCardRecovered) syncUsageRefreshTimer(ds);
-        if ((ds.displayMode ?? 'hidden') !== 'screenshot') {
+        if (mode !== 'screenshot') {
+          // A pending trigger card waits for turn_input_committed; an in-flight
+          // screenshot must not repaint (or re-limit) the previous card for it.
+          const limitRepaint = !hasPendingTriggerStreamingCard(ds, msg.turnId)
+            && usageLimitCardChanged(previousLimit, cardUsageLimit(ds));
           // Hidden mode has no image render to carry the recovery. A healthy
           // screenshot that cleared a delivered stalled state must nevertheless
           // repaint the status, including when the mode changed mid-upload.
-          if (startingCardRecovered && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
+          if (startingCardRecovered && !limitRepaint && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL && workerHasInitialized(ds)) {
             scheduleCardPatch(ds, buildStreamingCardJson(ds, ds.lastScreenStatus), msg.turnId ?? frameVerdict.source.turnId);
           }
-          break;
+          if (!limitRepaint) break;
         }
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) break;
         const readUrl = liveReadableTerminalUrlFor(ds);
@@ -24071,7 +24110,7 @@ function setupWorkerHandlers(
           ds.lastScreenContent ?? '',
           ds.lastScreenStatus,
           effectiveCliId,
-          'screenshot',
+          mode,
           ds.streamCardNonce,
           streamingCardPresentationImageKey(ds),
           isAdopt,
@@ -29622,6 +29661,10 @@ export function forkAdoptWorker(
     terminalCardEpoch: ds.session.terminalCardEpoch,
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
+    ...(adoptedCliId === 'antigravity' ? {
+      antigravityQuotaHistory: ds.antigravityQuotaHistory ?? ds.session.antigravityQuotaHistory,
+      antigravityActiveQuota: ds.usageLimit,
+    } : {}),
     codexProfile: agentCfg.codexProfile,
     codexProfileHome: agentCfg.codexProfileHome,
     cliRuntime: agentCfg.cliRuntime,

@@ -28,7 +28,7 @@
  * DSH_SESSION_ROOT but cross-process resume is not wired up yet).
  */
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -42,6 +42,7 @@ import { parseArgs, MAX_TURN_TIMEOUT_MS, type Args } from './dsh-runner-args.js'
 import { appendPendingNotification } from './dsh-runner-pending.js';
 import { resolveDshModel } from './dsh-runner-config.js';
 import { cotEntriesFromAssistantMessage, cotEntryFromToolCall, cotEntryFromToolResult } from './services/dsh-cot.js';
+import { createDshProcessAttestationFd } from './services/dsh-process-attestation.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const EMPTY_TURN_REPLY = 'DeepSeek Harness 已结束本轮处理，但没有生成最终回复；无法确认任务是否成功，请查看会话执行记录。';
@@ -381,6 +382,7 @@ function addUsage(a: DshUsage, b: DshUsage): DshUsage {
 /** Minimal JSON-RPC client over the dsh runtime's stdio transport. */
 class DshJsonRpcClient {
   private child?: ChildProcessWithoutNullStreams;
+  private attestationFd?: number;
   private readonly rpc = new JsonRpcStdioCore({
     mapRpcError: (_method, error) => new Error(`dsh error: ${error.message ?? JSON.stringify(error)}`),
     onMessage: msg => {
@@ -400,21 +402,40 @@ class DshJsonRpcClient {
   ) {}
 
   start(): void {
-    this.child = spawn(this.dshBin, this.launchArgs, {
-      env: this.env,
-      cwd: this.cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    this.attestationFd = createDshProcessAttestationFd();
+    if (process.platform === 'linux' && this.attestationFd === undefined) {
+      output.error('[dsh] engine attestation unavailable; continuing without an engine root\n');
+    }
+    try {
+      this.child = spawn(this.dshBin, this.launchArgs, {
+        env: this.env,
+        cwd: this.cwd,
+        stdio: ['pipe', 'pipe', 'pipe', this.attestationFd ?? 'ignore'],
+      }) as ChildProcessWithoutNullStreams;
+    } catch (error) {
+      this.closeAttestationFd();
+      throw error;
+    }
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', chunk => this.rpc.push(String(chunk)));
     this.child.stderr.setEncoding('utf8');
     this.child.stderr.on('data', chunk => output.error(`[dsh] ${String(chunk)}`));
-    this.child.on('error', err => this.rpc.failAll(err));
+    this.child.on('error', err => {
+      this.closeAttestationFd();
+      this.rpc.failAll(err);
+    });
     this.child.on('exit', (code, signal) => {
       this.exited = true;
+      this.closeAttestationFd();
       this.rpc.failAll(new Error(`dsh process exited (code=${code}, signal=${signal})`));
       this.onExit?.(code, signal);
     });
+  }
+
+  private closeAttestationFd(): void {
+    if (this.attestationFd === undefined) return;
+    closeSync(this.attestationFd);
+    this.attestationFd = undefined;
   }
 
   request<T>(method: string, params: unknown, timeoutMs: number): Promise<T> {
@@ -869,6 +890,9 @@ async function main(): Promise<void> {
   }
   const { serverInfo } = parseInitializeResult(initializeResult);
   writeLine(`dsh connected (${serverInfo.name} ${serverInfo.version}).`);
+  // A hint only: the worker discovers the exact runner/RPC child in procfs.
+  // Emit before the visible prompt can release the first queued model input.
+  emitMarker('process_ready', {});
 
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   process.stdin.resume();

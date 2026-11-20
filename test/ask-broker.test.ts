@@ -93,6 +93,20 @@ afterEach(() => {
 });
 
 describe('registerAsk happy path', () => {
+  it.each([0, 1])('rejects a click %i ms after the deadline before its timer runs', async offset => {
+    const dispatcher = mockDispatcher();
+    setCardDispatcher(dispatcher);
+    const waiting = registerAsk(makeInput());
+    await Promise.resolve();
+    const card = dispatcher.sendCalls[0]!;
+    vi.setSystemTime(card.deadlineAt + offset);
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'yes', by: 'ou_owner' }))
+      .toBe('already_settled');
+    await expect(waiting).resolves.toMatchObject({ kind: 'timedOut', by: null, timedOut: true });
+    await vi.runAllTimersAsync();
+    expect(dispatcher.settleCalls).toHaveLength(1);
+  });
+
   it('rejects an answer immediately after a no-deadline session closes, before the recovery sweep', async () => {
     const dispatcher = mockDispatcher();
     setCardDispatcher(dispatcher);

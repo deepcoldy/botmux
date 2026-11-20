@@ -10,7 +10,7 @@
  * rollout only after the test releases a barrier, which it does once the
  * worker has already settled the submit without a proven session.
  */
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -21,6 +21,7 @@ import { killProcessTree } from './helpers/process-tree.js';
 import { standaloneSleep } from './helpers/standalone-sleep.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { readSessionTurns, stageSessionTurnInbound } from '../src/services/session-turns.js';
 
 const OWN_SID = '01a17500-0000-7000-8000-00000000a363';
 const FOREIGN_SID = '01a17500-0000-7000-8000-00000000f363';
@@ -41,7 +42,7 @@ afterEach(async () => {
 
 async function startWorker(
   historySid: string,
-  opts: { openAfterGivingUp?: boolean; historyDelayMs?: number; startupProbe?: boolean; startupDelayMs?: number } = {},
+  opts: { openAfterGivingUp?: boolean; historyDelayMs?: number; startupProbe?: boolean; startupDelayMs?: number; structuredTurn?: boolean } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'bmx-codex-lazy-rollout-'));
   const dataDir = join(root, 'data');
@@ -165,6 +166,13 @@ setTimeout(() => {
   }
 
   const sessionId = randomUUID();
+  if (opts.structuredTurn) {
+    // Model the daemon's admission-time staging before the worker starts. The
+    // deferred receipt must materialize this staged inbound as a visible turn.
+    stageSessionTurnInbound(dataDir, sessionId, 'om_lazy', {
+      via: 'lark', messageId: 'om_lazy', text: PROMPT, placement: { kind: 'chat' },
+    });
+  }
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
   const child: ChildProcess = spawnNodeTsScript(resolve('src/worker.ts'), [], {
@@ -271,6 +279,7 @@ setTimeout(() => {
   const consumed = () => messages.filter(
     (m): m is Extract<WorkerToDaemon, { type: 'native_input_consumed' }> => m.type === 'native_input_consumed');
   return { child, messages, logs, waitFor, finals, consumed, cliPid: Number(readFileSync(cliPidFile, 'utf8')),
+    structuredTurns: () => readSessionTurns(dataDir, sessionId, 0, 50),
     firstSubmitAttestation: JSON.parse(readFileSync(firstSubmitAttestationFile, 'utf8')) };
 }
 
@@ -319,7 +328,7 @@ describe('Codex history match that lands before the lazily-created rollout', () 
   it('collects the turn when only the deferred recheck sees the history line', async () => {
     // The confirmation renews the turn's lease, so a candidate dropped here
     // would fail the turn just like the in-band drop did.
-    const run = await startWorker(OWN_SID, { historyDelayMs: 6_000 });
+    const run = await startWorker(OWN_SID, { historyDelayMs: 6_000, structuredTurn: true });
     await run.waitFor('the turn reply', () => run.finals().some(m => m.turnId === 'om_lazy'));
     expect(run.finals().filter(m => m.turnId === 'om_lazy')).toEqual([
       expect.objectContaining({ content: 'OWN ROLLOUT REPLY' }),
@@ -329,6 +338,17 @@ describe('Codex history match that lands before the lazily-created rollout', () 
     })]);
     // The deferred path must persist the session id exactly as the in-band one.
     expect(run.messages).toContainEqual(expect.objectContaining({ type: 'cli_session_id', cliSessionId: OWN_SID }));
+    // It must also cross the structured read-model boundary: a native receipt
+    // alone only writes pending_native and cannot make the turn visible.
+    expect(run.structuredTurns().turns).toEqual([expect.objectContaining({
+      turnId: 'om_lazy',
+      inbound: [expect.objectContaining({ messageId: 'om_lazy', text: PROMPT })],
+      anchor: expect.objectContaining({
+        cliId: 'codex',
+        cliSessionId: OWN_SID,
+        inputSha256: createHash('sha256').update(PROMPT).digest('hex'),
+      }),
+    })]);
   }, 80_000);
 
   it('never binds a deferred foreign-sid candidate even though that rollout is on disk', async () => {

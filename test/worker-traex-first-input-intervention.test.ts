@@ -11,6 +11,7 @@ import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS } from '../src/utils/codex-app-control.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { WebTerminalInputController } from '../src/core/web-terminal-input-controller.js';
 
 const SHORTCUT = [
   '  █ ◆ ◆ █  TRAE CLI (v0.214.1)',
@@ -96,13 +97,331 @@ function makeFence(screen = RESOLVED) {
     h.scope,
   );
 
-  const noteWebInput = loadWorkerFunction<(data: string) => void>(
+  const noteWebInput = loadWorkerFunction<(data: string, submits?: boolean) => void>(
     'noteWebTerminalInput',
     h.scope,
   );
 
   return { ...h, pending, noteWebInput };
 }
+
+function makeStartupSampler(screen = '') {
+  const h = makeFence(screen);
+  let admissions = 0;
+  Object.assign(h.scope, {
+    lastInitConfig: { cliId: 'traex' },
+    awaitingFirstPrompt: true,
+    FIRST_PROMPT_HARD_TIMEOUT_MS: 90_000,
+    traexFirstPromptDeadlineAt: Date.now() + 90_000,
+    lastPtyOutputAtMs: 0,
+    backendScreenRevision: 100,
+    webTerminalInputBackendScreenRevision: 0,
+    ptyOutputGeneration: { snapshot: () => 0, isCurrent: () => true },
+    traexStartupRendererWebInputGeneration: -1,
+    traexStartupRendererScreenRevision: -1,
+    traexStartupRendererDrain: undefined,
+    traexStartupWebRecheck: undefined,
+    TmuxPipeBackend: class {},
+    cliName: () => 'TRAE',
+    traexNativeStartupInputIsPending: h.pending,
+  });
+  h.scope.inflightInputs.hasUnacked = () => false;
+  h.scope.renderer.writeAndFlush = vi.fn(async () => {});
+  h.scope.cliAdapter.startupReadyFromHistory = (value: string) => value === RESOLVED;
+  h.scope.idleDetector.observeStartupHistory = vi.fn(() => true);
+  const admit = () => {
+    if (!h.pending() && h.scope.awaitingFirstPrompt) {
+      admissions++;
+      h.scope.awaitingFirstPrompt = false;
+    }
+  };
+  h.scope.idleDetector.seedReadyEvidence = admit;
+  h.scope.markPromptReady = admit;
+  h.scope.flushPending = vi.fn(async () => {});
+  const sample = loadWorkerFunction<(backend: unknown) => void>(
+    'scheduleTraexFirstPromptReadiness', h.scope,
+  );
+  const input = new WebTerminalInputController({
+    capture: () => h.scope.backend,
+    isCurrent: target => target === h.scope.backend,
+    beforeUserInput: async () => true,
+    write: () => true,
+    onUserInput: (_target, data, submits) => h.noteWebInput(data, submits),
+  });
+  h.scope.pendingWebTerminalInput = () => input.pending;
+  return { ...h, sample, input, admissions: () => admissions };
+}
+
+describe('Web startup protocol activity and recovery', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+  });
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it('does not count a complete terminal background-color reply as human activity', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    await h.input.accept('\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\');
+    expect(h.scope.webTerminalInputGeneration).toBe(0);
+    expect(h.scope.lastWebTerminalInputAtMs).toBe(0);
+    expect(h.scope.webTerminalSubmitGeneration).toBe(0);
+  });
+
+  it('holds first-input admission while a web socket still buffers an undecided prefix', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    expect(h.pending()).toBe(false);
+    await h.input.accept('\x1b');
+    expect(h.input.pending).toBe(true);
+    expect(h.pending()).toBe(true);
+  });
+
+  it('continues sampling a late initialized composer after one no-op human key', async () => {
+    const h = makeStartupSampler();
+    h.sample(h.scope.backend);
+    h.noteWebInput('\x1b[A');
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(h.admissions()).toBe(0);
+    h.scope.screen = RESOLVED;
+    h.scope.nativeState = 'idle';
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(h.admissions()).toBe(1);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(h.admissions()).toBe(1);
+  });
+
+  it('admits once when initialized while automatic color replies keep arriving', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    h.sample(h.scope.backend);
+    for (let i = 0; i < 12; i++) {
+      await h.input.accept('\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\');
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    expect(h.admissions()).toBe(1);
+    expect(h.scope.webTerminalInputGeneration).toBe(0);
+  });
+
+  it('rechecks after a transient renderer drain rejection without releasing stale evidence', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    h.noteWebInput('\x1b[A');
+    await vi.advanceTimersByTimeAsync(4_000);
+    h.scope.renderer.writeAndFlush = vi.fn()
+      .mockRejectedValueOnce(new Error('transient fixture drain'))
+      .mockResolvedValue(undefined);
+    expect(h.pending()).toBe(true);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(h.admissions()).toBe(0);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(2);
+    expect(h.admissions()).toBe(1);
+  });
+
+  it('stops failed renderer drain recovery at the original startup deadline despite Web input at 89 seconds', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    const startedAt = Date.now();
+    const deadline = h.scope.traexFirstPromptDeadlineAt;
+    const drainTimes: number[] = [];
+    const head = h.scope.pendingMessages[0];
+    h.scope.nativeState = 'idle';
+    h.scope.renderer.writeAndFlush = vi.fn(async () => {
+      drainTimes.push(Date.now());
+      throw new Error('fixture renderer remains unavailable');
+    });
+
+    // First fail inside this spawn's fixed window. Later Web activity must
+    // invalidate evidence, not grant another 90 seconds to renderer recovery.
+    await vi.advanceTimersByTimeAsync(80_000);
+    h.noteWebInput('\x1b[A');
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(h.pending()).toBe(true);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(Date.now() - startedAt).toBe(89_000);
+    h.noteWebInput('\x1b[A');
+    expect(h.pending()).toBe(true);
+    expect(h.scope.traexFirstPromptDeadlineAt).toBe(deadline);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const drainsAtDeadline = h.scope.renderer.writeAndFlush.mock.calls.length;
+
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.scope.traexStartupWebRecheck).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(drainsAtDeadline);
+    expect(drainTimes.every(at => at < deadline)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.admissions()).toBe(0);
+    expect(h.scope.pendingMessages[0]).toBe(head);
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('rechecks the deadline when a drain resolves late (firstSubmitConfirmed=%s)', async confirmed => {
+    const h = makeStartupSampler(RESOLVED);
+    const head = h.scope.pendingMessages[0];
+    h.scope.nativeState = 'idle';
+    h.scope.traexFirstSubmitConfirmed = confirmed;
+    h.scope.traexFirstPromptDeadlineAt = 90_000;
+    let finish!: () => void;
+    h.scope.renderer.writeAndFlush = vi.fn(() => new Promise<void>(resolve => { finish = resolve; }));
+    h.scope.markPromptReady = vi.fn();
+    h.scope.flushPending = vi.fn(() => h.flush());
+
+    vi.setSystemTime(88_000);
+    h.noteWebInput('\x1b[A');
+    h.scope.backendScreenRevision += 1;
+    vi.setSystemTime(89_000);
+    expect(h.pending()).toBe(true);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(1);
+
+    vi.setSystemTime(91_000);
+    finish();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    await h.flush();
+
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(confirmed ? 1 : 0);
+    if (confirmed) {
+      expect(h.scope.pendingMessages).toHaveLength(0);
+      expect(h.scope.traexFirstInputAdmissionPending).toBe(false);
+    } else {
+      expect(h.scope.pendingMessages[0]).toBe(head);
+      expect(h.scope.traexFirstInputAdmissionPending).toBe(true);
+      expect(h.scope.traexStartupWebRecheck).toBeUndefined();
+    }
+  });
+
+  it('recovers a transient renderer drain within the fixed startup deadline', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    const deadline = h.scope.traexFirstPromptDeadlineAt;
+    const drainTimes: number[] = [];
+    h.scope.nativeState = 'idle';
+    h.scope.renderer.writeAndFlush = vi.fn()
+      .mockImplementationOnce(async () => {
+        drainTimes.push(Date.now());
+        throw new Error('fixture transient renderer failure');
+      })
+      .mockImplementation(async () => { drainTimes.push(Date.now()); });
+
+    await vi.advanceTimersByTimeAsync(80_000);
+    h.noteWebInput('\x1b[A');
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(h.pending()).toBe(true);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(h.admissions()).toBe(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(2);
+    expect(drainTimes.every(at => at < deadline)).toBe(true);
+    expect(h.admissions()).toBe(1);
+    expect(h.scope.traexFirstPromptDeadlineAt).toBe(deadline);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.admissions()).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('rechecks a new frame after the screen changes during the renderer drain', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    h.noteWebInput('\x1b[A');
+    await vi.advanceTimersByTimeAsync(4_000);
+    let finish!: () => void;
+    h.scope.renderer.writeAndFlush = vi.fn()
+      .mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }))
+      .mockResolvedValue(undefined);
+    expect(h.pending()).toBe(true);
+    h.scope.backendScreenRevision++;
+    finish();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(h.admissions()).toBe(0);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(h.scope.renderer.writeAndFlush).toHaveBeenCalledTimes(2);
+    expect(h.admissions()).toBe(1);
+  });
+
+  it('does not let a stale sampler admit a replacement backend', async () => {
+    const h = makeStartupSampler();
+    h.sample(h.scope.backend);
+    h.scope.backend = {};
+    h.scope.cliSpawnGeneration++;
+    h.scope.screen = RESOLVED;
+    h.scope.nativeState = 'idle';
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(h.admissions()).toBe(0);
+    expect(h.scope.renderer.writeAndFlush).not.toHaveBeenCalled();
+  });
+
+  it('discards a drained sample if human input arrives across its await, then resamples', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    let finish!: () => void;
+    h.scope.renderer.writeAndFlush = vi.fn()
+      .mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }))
+      .mockResolvedValue(undefined);
+    h.sample(h.scope.backend);
+    await vi.advanceTimersByTimeAsync(1_000);
+    h.noteWebInput('\x1b[A');
+    finish();
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    expect(h.admissions()).toBe(0);
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(h.admissions()).toBe(1);
+  });
+
+  it('does not run a drain retry against a renderer replacement', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    h.noteWebInput('\x1b[A');
+    await vi.advanceTimersByTimeAsync(4_000);
+    h.scope.renderer.writeAndFlush = vi.fn().mockRejectedValue(new Error('transient fixture'));
+    expect(h.pending()).toBe(true);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    const replacement = { rawSnapshot: () => RESOLVED, writeAndFlush: vi.fn(async () => {}) };
+    h.scope.renderer = replacement;
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(h.admissions()).toBe(0);
+    expect(replacement.writeAndFlush).not.toHaveBeenCalled();
+  });
+
+  it('retains a human draft after recovering a failed drain', async () => {
+    const h = makeStartupSampler(RESOLVED);
+    h.scope.nativeState = 'idle';
+    h.noteWebInput('human draft');
+    await vi.advanceTimersByTimeAsync(4_000);
+    h.scope.renderer.writeAndFlush = vi.fn()
+      .mockRejectedValueOnce(new Error('transient fixture'))
+      .mockResolvedValue(undefined);
+    expect(h.pending()).toBe(true);
+    for (let i = 0; i < 12; i++) await Promise.resolve();
+    h.scope.screen = RESOLVED.replace('❯ Ask TRAE CLI to do anything', '❯ human draft');
+    h.scope.backendScreenRevision++;
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(h.admissions()).toBe(0);
+    expect(h.pending()).toBe(true);
+  });
+
+  it('rechecks released input ownership without creating another startup poller', async () => {
+    const h = makeStartupSampler();
+    h.scope.scheduleTraexFirstPromptReadiness = h.sample;
+    h.scope.webTerminalInputTargetCurrent = () => true;
+    const recheck = loadWorkerFunction<(target: unknown, ws: unknown) => void>(
+      'recheckAfterWebInput', h.scope,
+    );
+    const target = { backend: h.scope.backend };
+    h.sample(h.scope.backend);
+    expect(vi.getTimerCount()).toBe(1);
+    for (let i = 0; i < 20; i++) recheck(target, {});
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(100_000);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(h.admissions()).toBe(0);
+  });
+});
 
 describe('fresh TraeX startup input ownership', () => {
   beforeEach(() => {

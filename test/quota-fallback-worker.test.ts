@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   resolveCurrent: vi.fn(),
@@ -48,6 +48,8 @@ import {
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { __testOnly_resetQuotaFallbackEvents } from '../src/services/quota-fallback.js';
 
@@ -123,6 +125,7 @@ function fallbackReplies(sessionReply: ReturnType<typeof vi.fn>) {
 }
 
 describe('daemon quota fallback handoff', () => {
+  afterEach(() => vi.useRealTimers());
   beforeEach(() => {
     vi.clearAllMocks();
     __testOnly_resetQuotaFallbackEvents();
@@ -196,6 +199,80 @@ describe('daemon quota fallback handoff', () => {
     // The handoff uses daemon transport only; it never injects text back into
     // the exhausted worker/model input channel.
     expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('notifies the owner and fallback once when a screenshot carries the first frame of a new refusal', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    setup(sessionReply);
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const expiry = 6 * 60_000;
+    const first = { ...limit('usage'), retryAtMs: Date.now() + expiry, relativeResetKey: `usage:${expiry}:first`,
+      source: 'antigravity-error-composer' as const };
+    const emitFrame = async (type: 'screen_update' | 'screenshot_uploaded', usageLimit: CliUsageLimitState, captureRevision?: number) => {
+      const content = type === 'screen_update' ? { content: 'native quota' } : { imageKey: 'img_quota', captureRevision };
+      for (const listener of worker.listeners('message')) {
+        await listener({ type, status: 'limited', usageLimit, turnId: TURN, ...content });
+      }
+      await vi.advanceTimersByTimeAsync(0);
+    };
+    await emitFrame('screen_update', first);
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(expiry);
+    const second = { ...first, retryLabel: '1h', retryAtMs: Date.now() + 3_600_000, relativeResetKey: 'usage:3600000:second' };
+    await emitFrame('screenshot_uploaded', second, 1);
+    expect(ds.usageLimit?.relativeResetKey).toBe(first.relativeResetKey);
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+    await emitFrame('screenshot_uploaded', second);
+    await emitFrame('screen_update', second);
+    const ownerReplies = sessionReply.mock.calls.filter(call => String(call[1]).includes('<at id=ou_owner>'));
+    expect(ownerReplies).toHaveLength(2);
+    expect(String(ownerReplies.at(-1)?.[1])).toContain('1h');
+    expect(fallbackReplies(sessionReply)).toHaveLength(2);
+    expect(mocks.resolveCurrent).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['previous', 'current', 'previous with a silent successor'])('checks the active reply topic for a valid screenshot (%s)', async source => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    setup(sessionReply);
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    const oldTopic = { rootMessageId: 'om_old_topic', turnId: TURN, updatedAt: new Date().toISOString() };
+    const currentTopic = { rootMessageId: 'om_current_topic', turnId: 'om_current_turn', updatedAt: oldTopic.updatedAt };
+    ds.session.replyTargets = { [TURN]: oldTopic, [currentTopic.turnId]: currentTopic };
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const turnId = source === 'current' ? currentTopic.turnId : TURN;
+    if (source !== 'current') {
+      worker.emit('message', { type: 'capture_identity', revision: 1, turnId });
+      await flush();
+    }
+    ds.currentTurnId = currentTopic.turnId;
+    ds.currentReplyTarget = currentTopic;
+    if (source === 'previous with a silent successor') armSilentScheduledTurn(ds, currentTopic.turnId);
+    if (source === 'current') {
+      worker.emit('message', { type: 'capture_identity', revision: 1, turnId });
+      await flush();
+    }
+    worker.emit('message', {
+      type: 'screenshot_uploaded', imageKey: 'img_limit', captureRevision: 1,
+      status: 'limited', usageLimit: limit(), turnId,
+    });
+    await flush();
+    expect(ds.currentImageKey).toBe('img_limit');
+    if (source === 'previous with a silent successor') {
+      expect(sessionReply).not.toHaveBeenCalled();
+      return;
+    }
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+    const notices = sessionReply.mock.calls.filter(call => call[2] === 'text');
+    expect(notices).toHaveLength(2);
+    expect(notices.map(call => resolveSessionReplyTarget(ds, call[4] as string))).toEqual([
+      { mode: 'thread', rootMessageId: currentTopic.rootMessageId },
+      { mode: 'thread', rootMessageId: currentTopic.rootMessageId },
+    ]);
   });
 
   it('deduplicates repeated frames and a same-bot event in another session for five minutes', async () => {
@@ -367,17 +444,18 @@ describe('daemon quota fallback handoff', () => {
     expect(fallbackReplies(sessionReply)).toHaveLength(1);
   });
 
-  it('does not backfill a stale handoff during daemon restore silence', async () => {
+  it.each(['screen_update', 'screenshot_uploaded'] as const)('keeps %s quiet during daemon restore', async type => {
     const sessionReply = vi.fn(async () => 'om_reply');
     setup(sessionReply);
     const worker = fakeWorker();
     const ds = makeDs({ worker, workerPort: 9999, suppressRecoveryCard: true });
     __testOnly_setupWorkerHandlers(ds, worker);
 
-    worker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit(), turnId: TURN });
+    const evidence = type === 'screen_update' ? { content: '429' } : { imageKey: 'img_quota' };
+    worker.emit('message', { type, ...evidence, status: 'limited', usageLimit: limit(), turnId: TURN });
     await flush();
 
-    expect(fallbackReplies(sessionReply)).toHaveLength(0);
+    expect(sessionReply).not.toHaveBeenCalled();
     expect(mocks.resolveCurrent).not.toHaveBeenCalled();
   });
 });

@@ -309,7 +309,7 @@ function engageHarness(opts: {
     registerRpcEnginePidMarker: () => 'marker', clearRpcEnginePidMarker: noop,
     publishLocalProcessAttestation: noop,
     installAwaitingRpcActivation: vi.fn(), clearAwaitingRpcActivation: vi.fn(),
-    codexRolloutProbe: vi.fn(), acknowledgeNativeInputConsumed: vi.fn(),
+    codexRolloutProbe: vi.fn(), acknowledgeNativeInputConsumed: vi.fn(), recordStructuredInput: vi.fn(),
     durableTurnInFlight: false, shouldPreMarkFirstTurn: (outcome: string) => outcome === 'accepted',
     activateRpcTurnLifecycle: vi.fn(() => true), deferredFreshRpcTurn: undefined,
     codexBridgeMarkPendingTurn: vi.fn(() => 'om_first'), installRpcLifecycleFailClosedOwner: vi.fn(),
