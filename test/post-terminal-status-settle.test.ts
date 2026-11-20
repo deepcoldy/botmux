@@ -1518,7 +1518,7 @@ describe('starting card health watchdog', () => {
     expect(lastPatchedStatus()).toBe('idle');
   });
 
-  it('repaints a delivered stalled card when a healthy screenshot arrives after switching to hidden', async () => {
+  it.each(['working', 'limited'] as const)('repaints a stalled card once on a hidden screenshot (%s)', async status => {
     const ds = setupStartingDs();
     ds.displayMode = 'screenshot';
     await post(ds, TURN);
@@ -1527,11 +1527,18 @@ describe('starting card health watchdog', () => {
     ds.displayMode = 'hidden';
     updateMessageMock.mockClear();
 
-    (ds.worker as any).emit('message', {
-      type: 'screenshot_uploaded', imageKey: 'img-recovered', status: 'working', turnId: TURN,
-    });
+    const frame = {
+      type: 'screenshot_uploaded', imageKey: 'img-recovered', status, turnId: TURN,
+      usageLimit: status === 'limited' ? {
+        limited: true, kind: 'usage', retryAtMs: Date.now() + 3_600_000, retryLabel: '1h', retryReady: false,
+      } : undefined,
+    };
+    (ds.worker as any).emit('message', frame);
     await vi.advanceTimersByTimeAsync(0);
-    expect(patchedStatuses()).toEqual(['working']);
+    expect(patchedStatuses()).toEqual([status]);
+    (ds.worker as any).emit('message', frame);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(patchedStatuses()).toEqual([status]);
   });
 
   it('restores the authorized usage refresh when a screenshot proves health', async () => {

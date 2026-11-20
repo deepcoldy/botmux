@@ -2160,7 +2160,7 @@ describe('worker-authoritative handoff live card', () => {
   async function prepare(disabled = false) {
     vi.clearAllMocks();
     getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', cliId: 'claude-code', disableStreamingCard: disabled }, resolvedAllowedUsers: [] });
-    const reply = vi.fn(async () => 'om_handoff_card');
+    const reply = vi.fn<Parameters<typeof postTurnStartingCard>[1]>(async () => 'om_handoff_card');
     const onStart = vi.fn((ds: DaemonSession, title: string, turnId: string) => {
       ds.currentTurnId = turnId; ds.currentTurnTitle = title;
       ds.streamCardPending = true; ds.streamCardPendingTurnId = turnId;
@@ -2197,6 +2197,48 @@ describe('worker-authoritative handoff live card', () => {
     worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_unrelated_user' });
     await flush(); expect(reply).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['working', 'limited'] as const)('keeps a pending trigger screenshot (%s) off the old hidden card', async status => {
+    vi.useFakeTimers();
+    try {
+      const { ds, worker, reply, onStart } = await prepare();
+      const turnId = 'trg_review';
+      const captureRevision = 1;
+      const quota = {
+        limited: true, kind: 'usage', source: 'antigravity-error-composer', relativeResetKey: 'usage:3600000:queued',
+        retryAtMs: Date.now() + 3_600_000, retryLabel: '1h', retryReady: false,
+      } as const;
+      const screenshot = { type: 'screenshot_uploaded', turnId, captureRevision } as const;
+      armTriggerStreamingCard(ds, handoff, turnId);
+      worker.emit('message', { type: 'capture_identity', turnId, revision: captureRevision });
+      worker.emit('message', { ...screenshot, imageKey: 'img_queued', status, usageLimit: status === 'limited' ? quota : undefined });
+      await vi.advanceTimersByTimeAsync(0);
+      // The matching frame was accepted, but the trigger still owns no card.
+      expect(ds.currentImageKey).toBe('img_queued');
+      expect(ds.streamCardId).toBe('om_previous');
+      expect(updateMessageMock).not.toHaveBeenCalled();
+      expect(reply.mock.calls.filter(call => call[2] === 'interactive')).toHaveLength(0);
+
+      worker.emit('message', { type: 'turn_input_committed', turnId });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(onStart).toHaveBeenCalledOnce();
+      expect(reply.mock.calls.filter(call => call[2] === 'interactive')).toHaveLength(1);
+      expect(ds.streamCardId).toBe('om_handoff_card');
+      const afterCommit = updateMessageMock.mock.calls.length;
+
+      worker.emit('message', {
+        ...screenshot, imageKey: 'img_committed', status: 'limited',
+        usageLimit: { ...quota, relativeResetKey: 'usage:3600000:committed' },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(ds.currentImageKey).toBe('img_committed');
+      const framePatches = updateMessageMock.mock.calls.slice(afterCommit);
+      expect(framePatches.map(call => call.slice(0, 2))).toEqual([['app_test', 'om_handoff_card']]);
+      expect(JSON.parse(String(framePatches[0]?.[2])).status).toBe('limited');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps a manually posted replacement live and safe from repeated completion', async () => {

@@ -23844,8 +23844,10 @@ function setupWorkerHandlers(
         const mode = ds.displayMode ?? 'hidden';
         if (startingCardRecovered) syncUsageRefreshTimer(ds);
         if (mode !== 'screenshot') {
-          const limitRepaint = hasPendingTriggerStreamingCard(ds, msg.turnId)
-            || usageLimitCardChanged(previousLimit, cardUsageLimit(ds));
+          // A pending trigger card waits for turn_input_committed; an in-flight
+          // screenshot must not repaint (or re-limit) the previous card for it.
+          const limitRepaint = !hasPendingTriggerStreamingCard(ds, msg.turnId)
+            && usageLimitCardChanged(previousLimit, cardUsageLimit(ds));
           // Hidden mode has no image render to carry the recovery. A healthy
           // screenshot that cleared a delivered stalled state must nevertheless
           // repaint the status, including when the mode changed mid-upload.
