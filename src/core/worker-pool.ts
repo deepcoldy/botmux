@@ -16742,6 +16742,7 @@ function acceptCodexAppDispatch(
     quoteTargetId?: string;
     replyTargetSenderOpenId?: string;
     replyTargetSenderIsBot?: boolean;
+    crossChatOrigin?: CodexAppDispatchLedgerEntry['crossChatOrigin'];
     queuedActivationToken?: string;
     codexAppSteerable?: true;
     linkRefMode?: 'observe' | 'enabled';
@@ -16775,6 +16776,7 @@ function acceptCodexAppDispatch(
       ...(payload.replyTargetSenderIsBot !== undefined
         ? { replyTargetSenderIsBot: payload.replyTargetSenderIsBot }
         : {}),
+      ...(payload.crossChatOrigin ? { crossChatOrigin: payload.crossChatOrigin } : {}),
       deliverySink: codexAppDeliverySinkForTurn(ds, turnId, dispatchAttempt),
       ...(payload.codexAppSteerable ? { codexAppSteerable: true } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
@@ -17548,6 +17550,7 @@ export function sendWorkerInput(
       ...(replyContext.replyTargetSenderIsBot !== undefined
         ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
         : {}),
+      ...(replyContext.crossChatOrigin ? { crossChatOrigin: replyContext.crossChatOrigin } : {}),
       ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
       ...(admittedLinkRefs.mode === 'disabled'
         ? {}
@@ -18136,6 +18139,7 @@ export function promoteQueuedActivationTail(
         ...(replyContext.replyTargetSenderIsBot !== undefined
           ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
           : {}),
+        ...(replyContext.crossChatOrigin ? { crossChatOrigin: replyContext.crossChatOrigin } : {}),
         // R4-B1: COPY the frozen steer authorization from the promoted tail
         // entry's payload onto the accept-ledger (admission computed once; never
         // re-inferred at promote time).
@@ -19867,6 +19871,9 @@ function forkWorkerPrepared(
               : {}),
             ...(initReplyContext.replyTargetSenderIsBot !== undefined
               ? { replyTargetSenderIsBot: initReplyContext.replyTargetSenderIsBot }
+              : {}),
+            ...(initReplyContext.crossChatOrigin
+              ? { crossChatOrigin: initReplyContext.crossChatOrigin }
               : {}),
           } : {}),
           // R4-B1: COPY the frozen steer authorization onto the fork's

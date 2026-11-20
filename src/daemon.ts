@@ -27216,6 +27216,7 @@ function computeCodexAppSteerable(facts: {
   messageListener: boolean;
   vcMeetingReceiver: boolean;
   vcMeetingImTurnOrigin: boolean;
+  crossChatFollowUp: boolean;
 }): boolean {
   const plainHuman = facts.humanSender
     && !facts.isForeignBot
@@ -27229,7 +27230,8 @@ function computeCodexAppSteerable(facts: {
     && !facts.controlRewrite
     && !facts.messageListener
     && !facts.vcMeetingReceiver
-    && !facts.vcMeetingImTurnOrigin;
+    && !facts.vcMeetingImTurnOrigin
+    && !facts.crossChatFollowUp;
 }
 
 /**
@@ -28033,6 +28035,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageListener: !!messageListener,
       vcMeetingReceiver: false,
       vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
+      crossChatFollowUp: !!ctx.crossChatThreadFollowUp,
     }) ? { pendingCodexAppSteerable: true as const } : {}),
     ownerOpenId: ownerOpenIdForSession,
     currentTurnTitle: initialTurnTitle,
@@ -30786,6 +30789,7 @@ async function handleThreadReplyAdmitted(
     messageListener: !!ctx.messageListener,
     vcMeetingReceiver: ds?.session.vcMeetingReceiver !== undefined,
     vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
+    crossChatFollowUp: !!ctx.crossChatThreadFollowUp,
   });
 
   const liveTakeoverReady = !!ds?.worker && !ds.worker.killed

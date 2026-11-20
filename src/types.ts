@@ -2113,6 +2113,13 @@ export interface CodexAppDispatchLedgerEntry {
   quoteTargetId?: string;
   replyTargetSenderOpenId?: string;
   replyTargetSenderIsBot?: boolean;
+  /** A followed-chat reply never authenticates its sender as the origin
+   * session's human principal, including after a warm worker recovery. */
+  crossChatOrigin?: {
+    sourceChatId: string;
+    followedChatId: string;
+    followedRootMessageId: string;
+  };
   /** Exact output channel selected at acceptance. Undefined is legacy Lark. */
   deliverySink?: CodexAppDeliverySink;
   /** Explicit daemon steer grant from interactive admission or a correlated
