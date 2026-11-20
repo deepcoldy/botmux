@@ -4772,6 +4772,12 @@ export function clearUsageLimitState(ds: DaemonSession): void {
   ds.quotaFallbackAttemptToken = undefined;
 }
 
+/** 限额身份或可重试状态变化时，已有卡片需要重绘 */
+function usageLimitCardChanged(previous: CliUsageLimitState | undefined, current: CliUsageLimitState | undefined): boolean {
+  return !!current && (!previous || previous.retryReady !== current.retryReady
+    || usageLimitStateKey(previous) !== usageLimitStateKey(current));
+}
+
 export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefined {
   return ds.lastScreenStatus === 'limited' ? ds.usageLimit : undefined;
 }
@@ -23182,13 +23188,14 @@ function setupWorkerHandlers(
               }
             });
         } else {
-          // Same turn — PATCH only on a header change: the status, or the
-          // background-task count it shows. Image PATCHes go through the
+          // Same turn — PATCH on status, limit, or background-task changes.
+          // Image PATCHes go through the
           // screenshot_uploaded path; text is no longer a card body mode.
           // The post-terminal repaint is the one same-value exception: the
           // display-only idle correction left a delivered receipt while
           // execution stayed busy, so the first live busy frame must render.
           const statusChanged = prevStatus !== ds.lastScreenStatus;
+          const limitChanged = usageLimitCardChanged(previousLimit, cardUsageLimit(ds));
           const label = streamCardLabel(ds);
           const activity = typeof label === 'object' && 'activity' in label ? label.activity : undefined;
           // Capacity entry/exit keeps status=working but changes the card header.
@@ -23199,7 +23206,7 @@ function setupWorkerHandlers(
           // display-only idle correction left a delivered receipt while
           // execution stayed busy, so the first live busy frame must render.
           syncUsageRefreshTimer(ds);
-          if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount
+          if (!statusChanged && !limitChanged && prevBackgroundTaskCount === ds.backgroundTaskCount
             && prevActivity === activity && !forcePostTerminalBusyRepaint) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
@@ -23360,7 +23367,9 @@ function setupWorkerHandlers(
         // source releases the retained suppressed-source evidence.
         releaseRetainedCaptureSourceByAcceptedFrame(ds, frameVerdict.source);
         persistStreamCardState(ds);
-        if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
+        const mode = ds.displayMode ?? 'hidden';
+        if (mode !== 'screenshot' && (hasPendingTriggerStreamingCard(ds, msg.turnId)
+          || !usageLimitCardChanged(previousLimit, cardUsageLimit(ds)))) break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) break;
         const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
@@ -23372,7 +23381,7 @@ function setupWorkerHandlers(
           ds.lastScreenContent ?? '',
           ds.lastScreenStatus,
           effectiveCliId,
-          'screenshot',
+          mode,
           ds.streamCardNonce,
           streamingCardPresentationImageKey(ds),
           isAdopt,
