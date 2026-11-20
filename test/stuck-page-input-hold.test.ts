@@ -50,6 +50,11 @@ const CODEX_COMPOSER = page('codex-0.164.0-startup-menu-after-esc.txt');
 const KIMI_MENU = page('kimi-2.5.3-cache-expiry-idle-submit.txt');
 const KIMI_MENU_MOVED = page('kimi-2.5.3-cache-expiry-highlight-new-session.txt');
 const KIMI_COMPOSER = page('kimi-2.5.3-composer-after-compact-resend.txt');
+const AGY_QUESTION = page('agy-1.5.12-question-single-select.txt');
+const AGY_QUESTION_NEXT = page('agy-1.5.12-question-after-esc-skip.txt');
+const AGY_PERMISSION = page('agy-1.5.12-permission-run-command.txt');
+const AGY_HOOK_WAITING = page('agy-1.5.12-hook-waiting.txt');
+const AGY_COMPOSER = page('agy-1.5.12-composer-after-skip-all.txt');
 /** What a frame looks like while codex repaints its startup menu (rows cleared
  *  and redrawn): the heading is there, the options are not yet. */
 const GROK_LOGIN = readFileSync(join(process.cwd(), 'test/fixtures/startup-blockers/grok-1.0.70-login.txt'), 'utf-8');
@@ -271,6 +276,98 @@ describe('Kimi Code: its cache-expiry menu is its own page family', () => {
     expect(h.fn('shareableStuckScreenTail')(KIMI_COMPOSER)).toBe('');
     // Another CLI never shares the Kimi menu.
     expect(harness('codex').fn('shareableStuckScreenTail')(KIMI_MENU)).toBe('');
+  });
+});
+
+describe('Antigravity: its pickers are their own page family', () => {
+  // agy's question picker (the ask hook could not take the question) and its
+  // permission dialog read typed input as keystrokes: digits jump to an
+  // option, Enter picks the highlighted one. With type-ahead on, a queued
+  // message would be typed straight into them.
+  it('agy holds queued input on its question picker and permission dialog, not on the composer or while the hook waits', () => {
+    for (const screen of [AGY_QUESTION, AGY_QUESTION_NEXT, AGY_PERMISSION]) {
+      const h = harness('antigravity');
+      h.fn('refreshHookReviewInputHold')(screen);
+      expect(h.scope.hookReviewInputHold).toBe(true);
+    }
+    for (const screen of [AGY_HOOK_WAITING, AGY_COMPOSER, CODEX_L2, KIMI_MENU]) {
+      const h = harness('antigravity');
+      h.fn('refreshHookReviewInputHold')(screen);
+      expect(h.scope.hookReviewInputHold).toBe(false);
+    }
+  });
+
+  it.each(['codex', 'kimi', 'claude-code', 'traex'] as const)('%s never holds on an agy picker', cliId => {
+    const h = harness(cliId);
+    h.fn('refreshHookReviewInputHold')(AGY_QUESTION);
+    expect(h.scope.hookReviewInputHold).toBe(false);
+  });
+
+  it('a held message waits behind the picker and raises its card with the picker rows only', () => {
+    const h = harness('antigravity', { screen: AGY_QUESTION, pending: [{ turnId: 'turn_held', dispatchAttempt: 2 }], gateFlush: true });
+    h.scope.lastAnalyzerSnapshot = AGY_QUESTION;
+    expect(h.fn('hookReviewHoldsQueuedWrite')()).toBe(true);
+    expect(h.delivered()).toBe(0);
+    const cards = h.sent.filter(m => m.type === 'stuck_warning');
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toMatchObject({
+      reason: 'input_held', matchedPattern: 'antigravity question', turnId: 'turn_held', dispatchAttempt: 2,
+    });
+    expect(cards[0].screenTail).toContain('Question 1/2: Which database should we use?');
+    // Only the picker: not the transcript rows above it, not agy's status row.
+    expect(cards[0].screenTail).not.toContain('? Which features to enable?');
+    expect(cards[0].screenTail).not.toContain('esc to cancel');
+    // The card's one key is agy's Skip; Enter (pick the highlighted row) never.
+    expect(isAllowedStuckKeySequence('antigravity question', ['Escape'])).toBe(true);
+    expect(isAllowedStuckKeySequence('antigravity question', ['Enter'])).toBe(false);
+    expect(isAllowedStuckKeySequence('antigravity permission', ['Enter'])).toBe(false);
+    expect(isAllowedStuckKeySequence('antigravity permission', ['Escape'])).toBe(false);
+  });
+
+  it('after the card\'s Esc: the next question gets its own card; the composer releases the message exactly once', () => {
+    const h = harness('antigravity', { screen: AGY_QUESTION, pending: [{ turnId: 'turn_held' }], gateFlush: true });
+    h.scope.lastAnalyzerSnapshot = AGY_QUESTION;
+    h.fn('hookReviewHoldsQueuedWrite')();
+    // Esc skipped question 1 of 2: agy shows question 2.
+    h.scope.screen = AGY_QUESTION_NEXT;
+    h.scope.lastAnalyzerSnapshot = AGY_QUESTION_NEXT;
+    h.fn('reevaluateHoldAfterStuckKey')(AGY_QUESTION_NEXT);
+    expect(h.sent.filter(m => m.type === 'stuck_warning')).toHaveLength(2);
+    expect(h.delivered()).toBe(0);
+    // Esc on the last question: the composer is back.
+    h.scope.screen = AGY_COMPOSER;
+    h.scope.lastAnalyzerSnapshot = AGY_COMPOSER;
+    h.fn('reevaluateHoldAfterStuckKey')(AGY_COMPOSER);
+    h.runTimers();
+    expect(h.scope.hookReviewInputHold).toBe(false);
+    expect(h.delivered()).toBe(1);
+    expect(h.fn('hookReviewHoldsQueuedWrite')()).toBe(false);
+    expect(h.delivered()).toBe(1);
+  });
+
+  it('the card tail masks credential shapes and home paths on the picker rows, and the whole permission command', () => {
+    const h = harness('antigravity');
+    const question = AGY_QUESTION.split('Which database should we use?').join('Use ghp_FAKEfake0000000000 or /home/alice/db?');
+    const tail = h.fn('shareableStuckScreenTail')(question);
+    expect(tail).toContain('Question 1/2: Use');
+    expect(tail).not.toContain('ghp_FAKEfake0000000000');
+    expect(tail).not.toContain('alice');
+    const permission = AGY_PERMISSION.replace('touch /tmp/agy-probe-perm-marker-xyz && echo done',
+      'curl -H "Authorization: Bearer eyJFAKEfake0000.FAKEfake0000" https://u:pw@example.invalid');
+    const permissionTail = h.fn('shareableStuckScreenTail')(permission);
+    expect(permissionTail).toContain('Requesting permission for:');
+    expect(permissionTail).not.toMatch(/Bearer|eyJFAKE|pw@|example\.invalid/);
+  });
+
+  it('on a non-authoritative screen the hold stays and the notice names agy\'s picker, not the Codex hook menu', () => {
+    const h = harness('antigravity', { screen: AGY_PERMISSION, authoritative: false, pending: [{ turnId: 't' }] });
+    h.fn('refreshHookReviewInputHold')(AGY_PERMISSION);
+    expect(h.scope.hookReviewInputHold).toBe(true);
+    h.fn('notifyHookReviewInputHold')();
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].type).toBe('user_notify');
+    expect(h.sent[0].message).toContain('选择菜单');
+    expect(h.sent[0].message).not.toContain('Hook');
   });
 });
 

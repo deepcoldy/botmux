@@ -142,11 +142,11 @@ describe('resolveSkillInjectionSupport (dashboard control class)', () => {
       expect(resolveSkillInjectionSupport(id)).toBe('dynamic');
     }
     // global skills-dir CLIs → the global|prompt|off knob applies
-    for (const id of ['codex', 'opencode', 'coco', 'traex', 'mtr', 'kiro-cli', 'genius', 'grok'] as const) {
+    for (const id of ['codex', 'opencode', 'coco', 'traex', 'mtr', 'kiro-cli', 'genius', 'grok', 'antigravity'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('global');
     }
     // no skill mechanism → control hidden
-    for (const id of ['antigravity', 'aiden', 'hermes', 'ebsd', 'mir', 'mira', 'codex-app'] as const) {
+    for (const id of ['aiden', 'hermes', 'ebsd', 'mir', 'mira', 'codex-app'] as const) {
       expect(resolveSkillInjectionSupport(id)).toBe('none');
     }
   });
@@ -260,6 +260,37 @@ describe('built-in skill catalog', () => {
     expect(zh).toContain('botmux &lt;子命令&gt; --help');
     expect(en).toContain('&lt;botmux_routing&gt;');
     expect(en).toContain('botmux &lt;cmd&gt; --help');
+  });
+});
+
+describe('buildNewTopicPrompt built-in skill delivery (antigravity)', () => {
+  // agy 1.5.x loads ~/.gemini/config/skills; before, agy sessions got no
+  // built-in skill at all — not even the botmux-ask fallback for when its
+  // ask_question hook cannot take a question.
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-prompt-mode-agy-'));
+    vi.stubEnv('HOME', home);
+    invalidateGlobalConfigCache();
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    invalidateGlobalConfigCache();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('prompt mode (default) advertises botmux-ask and the other built-ins', () => {
+    const p = buildNewTopicPrompt('hi', 'sess-agy', 'antigravity');
+    expect(p).toContain('<botmux_builtin_skills>');
+    expect(p).toContain('- botmux-ask:');
+    expect(p).toContain('- botmux-schedule:');
+  });
+
+  it('global mode installs into the directory agy reads instead of inlining', () => {
+    writeConfig({ skills: { builtinInjection: 'global' } });
+    expect(buildNewTopicPrompt('hi', 'sess-agy', 'antigravity')).not.toContain('<botmux_builtin_skills>');
+    writeBots([{ larkAppId: 'cli_app_agy', larkAppSecret: 's', cliId: 'antigravity' }], home);
+    expect(shouldInstallGlobalSkills(join(home, '.gemini', 'config', 'skills'))).toBe(true);
   });
 });
 

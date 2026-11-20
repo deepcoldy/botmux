@@ -30,6 +30,10 @@
  *    is `initiator` because it only lets the parked message go on. With the
  *    pointer anywhere else (`kimi cache expiry moved`: new session, continue
  *    at full price, never ask again) the card offers no key at all.
+ *  - Antigravity's question picker (shown only when its ask hook could not
+ *    take the question): Esc is agy's "Skip" for the current question —
+ *    `initiator`, it persists nothing. Its permission dialog offers no key:
+ *    every row either runs the command or persists an allow rule.
  *  - No free text, no arbitrary keys: the card never carries an input box.
  *
  * Index order of the two hook-review browser pages is kept identical to the
@@ -95,6 +99,22 @@ export const STUCK_PAGE_CATALOG: Readonly<Record<StuckPageType, StuckPageSpec>> 
   },
   'kimi cache expiry moved': {
     descriptionKey: 'card.stuck.page.kimi_cache_expiry_moved',
+    options: [],
+  },
+  // agy's own question picker (the ask hook could not take the question).
+  // Esc is agy's "Skip" (on an open write-in field: "Back"): the model gets
+  // "User Skipped" for that question; nothing persists. Choosing an answer
+  // needs the picker itself (web terminal).
+  'antigravity question': {
+    descriptionKey: 'card.stuck.page.antigravity_question',
+    options: [
+      { key: 'Escape', labelKey: 'card.stuck.key.antigravity_skip_question', audience: 'initiator' },
+    ],
+  },
+  // agy's tool permission dialog: approving runs a command, and its other
+  // rows persist allow rules — no key from a card.
+  'antigravity permission': {
+    descriptionKey: 'card.stuck.page.antigravity_permission',
     options: [],
   },
 };
