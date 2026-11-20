@@ -2218,9 +2218,12 @@ async function writeResourceToDisk(res: any, savePath: string, guard?: DownloadD
       // user-visible diagnostic. The original error is always what propagates.
       try {
         if (typeof stream.destroy === 'function') stream.destroy();
-      } catch (teardownError) {
-        logger.debug(`resource download: source destroy after failure was ignored: ${
-          teardownError instanceof Error ? teardownError.message : String(teardownError)}`);
+      } catch {
+        // Fixed text only: a thrown value can be any JS value, including a
+        // null-prototype object whose String()/coercion itself throws. Touching
+        // it here would re-introduce the exact masking this guard prevents. The
+        // real download error below is the only one callers classify on.
+        logger.debug('resource download: source destroy after failure was ignored');
       }
       throw error;
     }

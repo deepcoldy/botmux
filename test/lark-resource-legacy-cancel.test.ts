@@ -37,7 +37,7 @@ import { downloadMessageResource } from '../src/im/lark/client.js';
 
 /** Pipe-only v1 readable: pipe/on/emit, no async iterator. destroy() honours the
  *  real-stream contract — it stops production and drops its listeners. */
-function pipeOnlySource(opts: { destroyThrows?: boolean } = {}) {
+function pipeOnlySource(opts: { destroyThrowValue?: unknown } = {}) {
   const s = new EventEmitter() as EventEmitter & {
     readable: boolean;
     pipe: (dest: any) => unknown;
@@ -54,7 +54,7 @@ function pipeOnlySource(opts: { destroyThrows?: boolean } = {}) {
   s.destroy = () => {
     destroyCalls++;
     clearInterval(timer);
-    if (opts.destroyThrows) throw new Error('socket already closed');
+    if (opts.destroyThrowValue !== undefined) throw opts.destroyThrowValue;
     s.removeAllListeners();
     s.emit('close');
     return s;
@@ -101,7 +101,7 @@ describe('a failed legacy download cancels its source stream', () => {
     const dir = join(root, 'attachments', 'cli_test', 'om_teardown');
     fs.mkdirSync(dir, { recursive: true });
     const savePath = join(dir, 'b.bin');
-    const source = pipeOnlySource({ destroyThrows: true });
+    const source = pipeOnlySource({ destroyThrowValue: new Error('socket already closed') });
     mocks.request.mockResolvedValueOnce({ getReadableStream: () => source.stream });
     failNextWrite.armed = true;
 
@@ -114,6 +114,25 @@ describe('a failed legacy download cancels its source stream', () => {
     )).rejects.toMatchObject({ code: 'ENOSPC' });
 
     // Cancellation was still attempted even though it threw.
+    expect(source.destroyed()).toBe(true);
+  });
+
+  it('keeps the original download error when destroy throws a non-coercible value', async () => {
+    const dir = join(root, 'attachments', 'cli_test', 'om_nullproto');
+    fs.mkdirSync(dir, { recursive: true });
+    const savePath = join(dir, 'c.bin');
+    // A null-prototype object has no toString/valueOf: String() on it throws,
+    // so a diagnostic that touches the thrown value would mask the real error.
+    const nonCoercible = Object.create(null) as Record<string, unknown>;
+    const source = pipeOnlySource({ destroyThrowValue: nonCoercible });
+    mocks.request.mockResolvedValueOnce({ getReadableStream: () => source.stream });
+    failNextWrite.armed = true;
+
+    await expect(downloadMessageResource(
+      'cli_test', 'om_nullproto', 'file_k', 'file', savePath, undefined,
+      { withinRoot: join(root, 'attachments'), allowUserTokenFallback: false },
+    )).rejects.toMatchObject({ code: 'ENOSPC' });
+
     expect(source.destroyed()).toBe(true);
   });
 });
