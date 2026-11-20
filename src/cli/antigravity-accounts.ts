@@ -5,7 +5,7 @@
  * `~/.botmux/antigravity-accounts/` and controls automatic quota-limit rotation.
  */
 import { spawn } from 'node:child_process';
-import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -111,6 +111,7 @@ export async function runAntigravityAccountsCommand(
 
   if (action === 'list' || action === 'ls') {
     const rawInfo = inspectAntigravityAccounts(storeOpts);
+    if (rawInfo.stateError) throw new Error(rawInfo.stateError);
     const info = opts.isBlockedInSession
       ? {
           ...rawInfo,
@@ -155,6 +156,7 @@ export async function runAntigravityAccountsCommand(
     const mode = pos[0] ?? 'status';
     if (mode === 'status') {
       const info = inspectAntigravityAccounts(storeOpts);
+      if (info.stateError) throw new Error(info.stateError);
       out(`auto-rotate: ${info.autoRotate ? 'on' : 'off'}`);
       return;
     }
@@ -190,9 +192,11 @@ export async function runAntigravityAccountsCommand(
       const id = pos[0];
       if (!id) throw new Error('用法：botmux agy-accounts login <别名> [--force] [--activate]');
       if (!isValidAntigravityAccountId(id)) {
-        throw new Error('账号别名只能包含字母、数字、-、_，且必须以字母或数字开头（最长 64 字符）');
+        throw new Error('账号别名只能包含字母、数字、-、_，必须以字母或数字开头（最长 64 字符），且不能使用保留字 all');
       }
-      const keyringRisk = inspectAntigravityAccounts(storeOpts).keyringRisk;
+      const inspection = inspectAntigravityAccounts(storeOpts);
+      if (inspection.stateError) throw new Error(inspection.stateError);
+      const keyringRisk = inspection.keyringRisk;
       if (keyringRisk.status === 'macos-keychain' && keyringRisk.warning) {
         err(`⚠️ ${keyringRisk.warning}`);
       }
@@ -204,23 +208,35 @@ export async function runAntigravityAccountsCommand(
       const tempTokenPath = join(tempHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
       out(`正在隔离目录启动 agy 登录账号 "${id}"（不会影响当前已登录账号与在线会话）。`);
       out('完成 Google OAuth 登录后，在 agy 界面输入 /exit 退出即可自动导入托管库。');
+      let imported = false;
       try {
         const env = buildIsolatedLoginEnv(tempHome);
         const runner = opts.runLoginProcess ?? defaultRunLoginProcess;
-        await runner({ bin, tempHome, env });
+        const exitCode = await runner({ bin, tempHome, env });
+        if (exitCode !== 0) {
+          throw new Error(`agy 登录进程未正常退出（退出码 ${exitCode ?? '未知/信号'}），未导入临时凭据`);
+        }
         const res = saveAntigravityAccount(id, {
           ...storeOpts,
           sourceTokenPath: tempTokenPath,
           force: rest.includes('--force'),
           activate: rest.includes('--activate') ? true : undefined,
         });
+        imported = true;
         out(
           `✅ 登录并导入账号 ${res.id}`
           + `${res.email ? ` (${res.email})` : ''}`
           + `${res.activated ? '（已设为当前活跃账号）' : ''}`,
         );
       } finally {
-        try { rmSync(tempHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+        if (!imported && existsSync(tempTokenPath)) {
+          // The CLI must not destroy the only remaining copy when OAuth itself
+          // succeeded but validation/import failed (including mid-flight state
+          // corruption). A durable vault recovery copy may also exist.
+          err(`⚠️ 登录凭据导入未完成，已保留临时目录供恢复：${tempHome}`);
+        } else {
+          try { rmSync(tempHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+        }
       }
       return;
     }

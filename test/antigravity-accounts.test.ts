@@ -23,6 +23,7 @@ import {
   removeAntigravityAccount,
   rotateAntigravityAccountOnQuotaLimit,
   rotateNextAntigravityAccount,
+  resolveAntigravitySpawnStoreOptions,
   saveAntigravityAccount,
   setAntigravityAccountEnabled,
   setAntigravityAutoRotate,
@@ -453,6 +454,7 @@ describe('antigravity-accounts vault & rotation', () => {
     expect(info.accounts.map(a => a.id)).toEqual(['acc1', 'acc2']);
     expect(info.activeId).toBe('acc1');
     expect(lstatSync(join(botmuxDir, 'antigravity-accounts', 'tokens', 'acc2.json')).isFile()).toBe(true);
+    expect(existsSync(join(botmuxDir, 'antigravity-accounts', 'recovery', 'acc2.json'))).toBe(false);
   });
 
   it('restores fresher vault token over stale same-email live token and immediately updates live on active re-login', () => {
@@ -632,7 +634,7 @@ describe('antigravity-accounts vault & rotation', () => {
 
     // Two concurrent legacy sessions with unknown failedAccountId within grace window:
     // 1st rotates acc1 -> acc2; 2nd adopts acc2 via already_rotated without burning acc2.
-    expect(rotateAntigravityAccountOnQuotaLimit({}, storeOpts)).toMatchObject({ outcome: 'rotated', fromId: 'acc1', toId: 'acc2' });
+    expect(rotateAntigravityAccountOnQuotaLimit({ failedAccountId: 'acc1' }, storeOpts)).toMatchObject({ outcome: 'rotated', fromId: 'acc1', toId: 'acc2' });
     nowMs += 5_000;
     expect(rotateAntigravityAccountOnQuotaLimit({}, storeOpts)).toMatchObject({ outcome: 'already_rotated', toId: 'acc2' });
     expect(inspectAntigravityAccounts(storeOpts).accounts.find(a => a.id === 'acc2')?.inCooldown).toBe(false);
@@ -663,5 +665,245 @@ describe('antigravity-accounts vault & rotation', () => {
     saveAntigravityAccount('noem', { ...storeOpts, sourceTokenPath: fNoEmail, activate: true });
     useAntigravityAccount('acc1', storeOpts);
     expect(JSON.parse(readFileSync(unmanagedBackup, 'utf8')).id_token_email).toBe('precious@example.com');
+  });
+
+  it('aborts before replacing unmanaged live credentials when their safety backup cannot be written', () => {
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+    saveAntigravityAccount('acc1', storeOpts);
+    const backupPath = join(botmuxDir, 'antigravity-accounts', 'last-unmanaged-token.json');
+    mkdirSync(backupPath, { recursive: true });
+    writeFileSync(join(backupPath, 'keep'), 'force rename-over-directory failure');
+    writeToken(liveTokenPath, makeTokenJson({ email: 'unmanaged@example.com', refreshToken: 'unique-unmanaged-refresh' }));
+
+    expect(() => useAntigravityAccount('acc1', storeOpts)).toThrow();
+    expect(JSON.parse(readFileSync(liveTokenPath, 'utf8')).token.refresh_token).toBe('unique-unmanaged-refresh');
+    expect(statSync(backupPath).isDirectory()).toBe(true);
+    expect(inspectAntigravityAccounts(storeOpts).activeId).toBe('acc1');
+
+    const reconciled = reconcileActiveAntigravityToken(storeOpts);
+    expect(reconciled.error).toBeDefined();
+    expect(JSON.parse(readFileSync(liveTokenPath, 'utf8')).token.refresh_token).toBe('unique-unmanaged-refresh');
+  });
+
+  it('uses the refreshed target snapshot after sync-back instead of regressing live to the pre-sync value', () => {
+    writeToken(liveTokenPath, makeTokenJson({
+      email: 'a@example.com', accessToken: 'ACCESS_OLD', refreshToken: 'REFRESH_OLD', expiry: '2026-11-20T13:00:00Z',
+    }));
+    saveAntigravityAccount('acc1', storeOpts);
+    writeToken(liveTokenPath, makeTokenJson({
+      email: 'a@example.com', accessToken: 'ACCESS_FRESH', refreshToken: 'REFRESH_FRESH', expiry: '2026-11-20T15:00:00Z',
+    }));
+
+    const result = useAntigravityAccount('acc1', storeOpts);
+    expect(result.syncedBackId).toBe('acc1');
+    const vault = JSON.parse(readFileSync(join(botmuxDir, 'antigravity-accounts', 'tokens', 'acc1.json'), 'utf8'));
+    const live = JSON.parse(readFileSync(liveTokenPath, 'utf8'));
+    expect(vault.token.access_token).toBe('ACCESS_FRESH');
+    expect(live.token.access_token).toBe('ACCESS_FRESH');
+    expect(live.token.refresh_token).toBe('REFRESH_FRESH');
+    expect(inspectAntigravityAccounts(storeOpts).liveTokenMatchesActive).toBe(true);
+  });
+
+  it('syncs a newly appeared email back to a unique email-less snapshot with the same refresh token', () => {
+    writeToken(liveTokenPath, makeTokenJson({ accessToken: 'ACCESS_OLD', refreshToken: 'REFRESH_SHARED', expiry: '2026-11-20T13:00:00Z' }));
+    saveAntigravityAccount('noemail', storeOpts);
+    writeToken(liveTokenPath, makeTokenJson({
+      email: 'new@example.com', accessToken: 'ACCESS_FRESH', refreshToken: 'REFRESH_SHARED', expiry: '2026-11-20T15:00:00Z',
+    }));
+
+    const rec = reconcileActiveAntigravityToken(storeOpts);
+    expect(rec.syncedBackId).toBe('noemail');
+    expect(rec.restored).toBeUndefined();
+    const vault = JSON.parse(readFileSync(join(botmuxDir, 'antigravity-accounts', 'tokens', 'noemail.json'), 'utf8'));
+    expect(vault.token.access_token).toBe('ACCESS_FRESH');
+    expect(JSON.parse(readFileSync(liveTokenPath, 'utf8')).token.access_token).toBe('ACCESS_FRESH');
+    expect(inspectAntigravityAccounts(storeOpts).accounts[0]?.email).toBe('new@example.com');
+  });
+
+  it('persists sync-back metadata before identity_unknown so duplicate emails cannot bypass uniqueness', () => {
+    writeToken(liveTokenPath, makeTokenJson({ accessToken: 'ACCESS_OLD', refreshToken: 'REFRESH_SHARED', expiry: '2026-11-20T13:00:00Z' }));
+    saveAntigravityAccount('noemail', storeOpts);
+    writeToken(liveTokenPath, makeTokenJson({
+      email: 'new@example.com', accessToken: 'ACCESS_FRESH', refreshToken: 'REFRESH_SHARED', expiry: '2026-11-20T15:00:00Z',
+    }));
+
+    expect(rotateAntigravityAccountOnQuotaLimit({}, storeOpts)).toEqual({ outcome: 'identity_unknown' });
+    const persistedState = JSON.parse(readFileSync(join(botmuxDir, 'antigravity-accounts', 'state.json'), 'utf8'));
+    expect(persistedState.accounts[0]?.email).toBe('new@example.com');
+    expect(inspectAntigravityAccounts(storeOpts).accounts[0]?.email).toBe('new@example.com');
+    const duplicate = join(root, 'duplicate.json');
+    writeToken(duplicate, makeTokenJson({ email: 'new@example.com', refreshToken: 'REFRESH_SHARED' }));
+    expect(() => saveAntigravityAccount('duplicate', { ...storeOpts, sourceTokenPath: duplicate })).toThrow(/已托管/);
+  });
+
+  it('refuses to sync or boot an account whose state and vault identities conflict', () => {
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+    saveAntigravityAccount('acc1', storeOpts);
+    const vaultPath = join(botmuxDir, 'antigravity-accounts', 'tokens', 'acc1.json');
+    writeToken(vaultPath, makeTokenJson({ email: 'b@example.com' }));
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com', accessToken: 'OLDER_A', expiry: '2026-11-20T15:00:00Z' }));
+
+    const rec = reconcileActiveAntigravityToken(storeOpts);
+    expect(rec.error).toBe('active_account_identity_conflict');
+    expect(JSON.parse(readFileSync(vaultPath, 'utf8')).id_token_email).toBe('b@example.com');
+    expect(JSON.parse(readFileSync(liveTokenPath, 'utf8')).id_token_email).toBe('a@example.com');
+    expect(() => useAntigravityAccount('acc1', storeOpts)).toThrow(/不一致/);
+  });
+
+  it('treats malformed and epoch expiry as unusable for access-token-only rotation candidates', () => {
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+    saveAntigravityAccount('acc1', storeOpts);
+    for (const [id, expiry] of [['acc2', 'not-a-date'], ['acc3', '1970-01-01T00:00:00.000Z']] as const) {
+      const source = join(root, `${id}.json`);
+      writeToken(source, makeTokenJson({ email: `${id}@example.com`, refreshToken: '', expiry }));
+      saveAntigravityAccount(id, { ...storeOpts, sourceTokenPath: source });
+    }
+
+    expect(rotateAntigravityAccountOnQuotaLimit({ failedAccountId: 'acc1' }, storeOpts)).toMatchObject({ outcome: 'exhausted', enabledCount: 1 });
+    const accounts = inspectAntigravityAccounts(storeOpts).accounts;
+    expect(accounts.find(a => a.id === 'acc2')?.hasValidToken).toBe(false);
+    expect(accounts.find(a => a.id === 'acc3')?.hasValidToken).toBe(false);
+  });
+
+  it('does not select an expired access-token-only account as healthy', () => {
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+    saveAntigravityAccount('acc1', storeOpts);
+    const expiredPath = join(root, 'expired.json');
+    writeToken(expiredPath, makeTokenJson({
+      email: 'b@example.com', accessToken: 'EXPIRED_ACCESS', refreshToken: '', expiry: '2020-01-01T00:00:00Z',
+    }));
+    saveAntigravityAccount('acc2', { ...storeOpts, sourceTokenPath: expiredPath });
+
+    const result = rotateAntigravityAccountOnQuotaLimit({ failedAccountId: 'acc1', cooldownUntilMs: nowMs + 60_000 }, storeOpts);
+    expect(result).toMatchObject({ outcome: 'exhausted', enabledCount: 1 });
+    const target = inspectAntigravityAccounts(storeOpts).accounts.find(a => a.id === 'acc2');
+    expect(target?.hasValidToken).toBe(false);
+    expect(inspectAntigravityAccounts(storeOpts).activeId).toBe('acc1');
+  });
+
+  it('fails closed on an unknown legacy account instead of blaming the global active account', () => {
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+    saveAntigravityAccount('acc1', storeOpts);
+    const second = join(root, 'second.json');
+    writeToken(second, makeTokenJson({ email: 'b@example.com' }));
+    saveAntigravityAccount('acc2', { ...storeOpts, sourceTokenPath: second });
+    useAntigravityAccount('acc2', storeOpts);
+    // A legacy pane still runs acc1 while the global live file may contain
+    // either account. Without a worker account report the victim is unprovable.
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+
+    expect(rotateAntigravityAccountOnQuotaLimit({}, storeOpts)).toEqual({ outcome: 'identity_unknown' });
+    const before = inspectAntigravityAccounts(storeOpts);
+    expect(before.activeId).toBe('acc2');
+    expect(before.accounts.every(a => !a.inCooldown)).toBe(true);
+
+    const proven = rotateAntigravityAccountOnQuotaLimit({ failedAccountId: 'acc1', cooldownUntilMs: nowMs + 60_000 }, storeOpts);
+    expect(proven).toMatchObject({ outcome: 'already_rotated', fromId: 'acc1', toId: 'acc2' });
+    const after = inspectAntigravityAccounts(storeOpts);
+    expect(after.accounts.find(a => a.id === 'acc1')?.inCooldown).toBe(true);
+    expect(after.accounts.find(a => a.id === 'acc2')?.inCooldown).toBe(false);
+  });
+
+  it('reports corrupt state as an error instead of an empty auto-rotate-enabled vault', async () => {
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+    saveAntigravityAccount('acc1', storeOpts);
+    setAntigravityAutoRotate(false, storeOpts);
+    writeFileSync(join(botmuxDir, 'antigravity-accounts', 'state.json'), '{broken-json');
+
+    const inspection = inspectAntigravityAccounts(storeOpts);
+    expect(inspection.stateError).toBeDefined();
+    expect(inspection.managed).toBe(false);
+    expect(inspection.autoRotate).toBe(false);
+    await expect(runAntigravityAccountsCommand(['auto-rotate', 'status'], { storeOptions: storeOpts })).rejects.toThrow();
+    await expect(runAntigravityAccountsCommand(['list', '--json'], { storeOptions: storeOpts })).rejects.toThrow();
+    let loginStarted = false;
+    await expect(runAntigravityAccountsCommand(['login', 'new-account'], {
+      storeOptions: storeOpts,
+      agyBin: '/fake/agy',
+      runLoginProcess: async () => { loginStarted = true; return 0; },
+    })).rejects.toThrow();
+    expect(loginStarted).toBe(false);
+  });
+
+  it('retains recovery and the temporary login when state is corrupted during OAuth', async () => {
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+    saveAntigravityAccount('acc1', storeOpts);
+    const statePath = join(botmuxDir, 'antigravity-accounts', 'state.json');
+    let observedTempHome = '';
+    await expect(runAntigravityAccountsCommand(['login', 'acc2'], {
+      storeOptions: storeOpts,
+      agyBin: '/fake/agy',
+      runLoginProcess: async ({ tempHome }) => {
+        observedTempHome = tempHome;
+        writeToken(join(tempHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), makeTokenJson({ email: 'b@example.com' }));
+        writeFileSync(statePath, '{corrupted-during-oauth');
+        return 0;
+      },
+    })).rejects.toThrow();
+
+    expect(observedTempHome).not.toBe('');
+    expect(existsSync(observedTempHome)).toBe(true);
+    const recovery = join(botmuxDir, 'antigravity-accounts', 'recovery', 'acc2.json');
+    expect(JSON.parse(readFileSync(recovery, 'utf8')).id_token_email).toBe('b@example.com');
+    expect(JSON.parse(readFileSync(liveTokenPath, 'utf8')).id_token_email).toBe('a@example.com');
+    expect(readFileSync(statePath, 'utf8')).toBe('{corrupted-during-oauth');
+  });
+
+  it('does not touch live or vault when the independent recovery pre-write fails', () => {
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+    saveAntigravityAccount('acc1', storeOpts);
+    const recoveryPath = join(botmuxDir, 'antigravity-accounts', 'recovery', 'acc1.json');
+    mkdirSync(recoveryPath, { recursive: true });
+    writeFileSync(join(recoveryPath, 'keep'), 'force recovery rename failure');
+    const source = join(root, 'new-login.json');
+    writeToken(source, makeTokenJson({ email: 'b@example.com' }));
+
+    expect(() => saveAntigravityAccount('acc1', { ...storeOpts, sourceTokenPath: source, force: true })).toThrow();
+    expect(JSON.parse(readFileSync(liveTokenPath, 'utf8')).id_token_email).toBe('a@example.com');
+    expect(JSON.parse(readFileSync(join(botmuxDir, 'antigravity-accounts', 'tokens', 'acc1.json'), 'utf8')).id_token_email).toBe('a@example.com');
+    expect(inspectAntigravityAccounts(storeOpts).accounts[0]?.email).toBe('a@example.com');
+    expect(existsSync(source)).toBe(true);
+  });
+
+  it('does not import a nonzero login and preserves the temporary credential for recovery', async () => {
+    writeToken(liveTokenPath, makeTokenJson({ email: 'primary@example.com' }));
+    let observedTempHome = '';
+    await expect(runAntigravityAccountsCommand(['login', 'acc1'], {
+      storeOptions: storeOpts,
+      agyBin: '/fake/agy',
+      runLoginProcess: async ({ tempHome }) => {
+        observedTempHome = tempHome;
+        writeToken(join(tempHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token'), makeTokenJson({ email: 'partial@example.com' }));
+        return 17;
+      },
+    })).rejects.toThrow();
+
+    expect(existsSync(observedTempHome)).toBe(true);
+    expect(inspectAntigravityAccounts(storeOpts).managed).toBe(false);
+    expect(JSON.parse(readFileSync(liveTokenPath, 'utf8')).id_token_email).toBe('primary@example.com');
+  });
+
+  it('reserves the all alias used by bulk cooldown clearing', () => {
+    expect(isValidAntigravityAccountId('all')).toBe(false);
+    writeToken(liveTokenPath, makeTokenJson({ email: 'a@example.com' }));
+    expect(() => saveAntigravityAccount('all', storeOpts)).toThrow();
+    saveAntigravityAccount('acc1', storeOpts);
+    expect(clearAntigravityAccountCooldown('all', storeOpts)).toEqual({ clearedIds: [] });
+  });
+
+  it('reconciles the effective spawn HOME while keeping the vault in the configured Botmux home', () => {
+    const childHome = join(root, 'child-home');
+    const childLive = join(childHome, '.gemini', 'antigravity-cli', 'antigravity-oauth-token');
+    writeToken(childLive, makeTokenJson({ email: 'child@example.com' }));
+    const spawnOpts = resolveAntigravitySpawnStoreOptions({
+      effectiveHome: childHome,
+      botmuxConfigDir: botmuxDir,
+      env: { HOME: childHome },
+    });
+
+    saveAntigravityAccount('child', spawnOpts);
+    expect(inspectAntigravityAccounts(spawnOpts).liveTokenMatchesActive).toBe(true);
+    expect(existsSync(join(botmuxDir, 'antigravity-accounts', 'tokens', 'child.json'))).toBe(true);
+    expect(existsSync(liveTokenPath)).toBe(false);
   });
 });

@@ -28,6 +28,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { resolveBotmuxConfigDir } from '../core/config-dir.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
@@ -107,6 +108,8 @@ export interface AntigravityAccountsInspection {
   availableCount: number;
   enabledCount: number;
   earliestRecoveryMs?: number;
+  /** Present when state.json exists but cannot be parsed or validated. */
+  stateError?: string;
 }
 
 export interface ReconcileAntigravityTokenResult {
@@ -151,6 +154,7 @@ export type QuotaRotateAntigravityResult =
       earliestRecoveryMs?: number;
       enabledCount: number;
     }
+  | { outcome: 'identity_unknown' }
   | {
       outcome: 'write_failed';
       fromId?: string;
@@ -163,6 +167,8 @@ interface ParsedTokenFile {
   normalizedEmail?: string;
   authMethod?: string;
   expiryMs?: number;
+  /** Field was present but was not a valid date (distinct from absent). */
+  expiryInvalid?: boolean;
   refreshToken: string;
   accessToken: string;
 }
@@ -188,17 +194,32 @@ function resolvePaths(opts: AntigravityAccountStoreOptions = {}): ResolvedPaths 
   };
 }
 
+/** Resolve the live credential HOME from the exact spawn environment while
+ * keeping the vault in the worker's configured Botmux home. Per-bot HOME
+ * overrides relocate agy's credentials, not the host-owned account database. */
+export function resolveAntigravitySpawnStoreOptions(input: {
+  effectiveHome?: string;
+  botmuxConfigDir: string;
+  env?: NodeJS.ProcessEnv;
+}): AntigravityAccountStoreOptions {
+  return {
+    homeDir: input.effectiveHome ?? homedir(),
+    botmuxConfigDir: input.botmuxConfigDir,
+    ...(input.env ? { env: input.env } : {}),
+  };
+}
+
 function tokenPathFor(paths: ResolvedPaths, id: string): string {
   return join(paths.tokensDir, `${id}.json`);
 }
 
 export function isValidAntigravityAccountId(id: string): boolean {
-  return typeof id === 'string' && ANTIGRAVITY_ACCOUNT_ID_RE.test(id);
+  return id !== 'all' && typeof id === 'string' && ANTIGRAVITY_ACCOUNT_ID_RE.test(id);
 }
 
 function assertValidAccountId(id: string): void {
   if (!isValidAntigravityAccountId(id)) {
-    throw new Error('账号别名只能包含字母、数字、-、_，且必须以字母或数字开头（最长 64 字符）');
+    throw new Error('账号别名只能包含字母、数字、-、_，必须以字母或数字开头（最长 64 字符），且不能使用保留字 all');
   }
 }
 
@@ -274,9 +295,17 @@ function readValidatedTokenFile(path: string): { ok: true; token: ParsedTokenFil
     ? obj.auth_method.trim()
     : undefined;
   let expiryMs: number | undefined;
-  if (typeof tokRec.expiry === 'string') {
-    const ms = Date.parse(tokRec.expiry);
-    if (Number.isFinite(ms) && ms > 0) expiryMs = ms;
+  let expiryInvalid = false;
+  if (tokRec.expiry !== undefined) {
+    if (typeof tokRec.expiry === 'string') {
+      const ms = Date.parse(tokRec.expiry);
+      // Epoch zero is a valid (and necessarily expired) timestamp, not a
+      // missing field. Any other unparseable value stays explicitly invalid.
+      if (Number.isFinite(ms) && ms >= 0) expiryMs = ms;
+      else expiryInvalid = true;
+    } else {
+      expiryInvalid = true;
+    }
   }
   return {
     ok: true,
@@ -286,6 +315,7 @@ function readValidatedTokenFile(path: string): { ok: true; token: ParsedTokenFil
       normalizedEmail: normalizeAntigravityEmail(email),
       authMethod,
       expiryMs,
+      ...(expiryInvalid ? { expiryInvalid: true } : {}),
       refreshToken,
       accessToken,
     },
@@ -308,6 +338,16 @@ function isTokenFresher(candidate: ParsedTokenFile, existing: ParsedTokenFile | 
     return candidate.expiryMs > existing.expiryMs;
   }
   return candidate.expiryMs !== undefined && existing.expiryMs === undefined;
+}
+
+/** Structural JSON validity is not enough for rotation: an access-only snapshot
+ * whose expiry is already in the past cannot authenticate a fresh process.
+ * Unknown expiry remains allowed because older agy token files may omit it. */
+function tokenCanAuthenticateAt(token: ParsedTokenFile, nowMs: number): boolean {
+  return Boolean(
+    token.refreshToken
+    || (token.accessToken && !token.expiryInvalid && (token.expiryMs === undefined || token.expiryMs > nowMs)),
+  );
 }
 
 function defaultState(): AntigravityAccountStateV1 {
@@ -368,11 +408,24 @@ function readStateUnlocked(statePath: string): AntigravityAccountStateV1 | undef
 
 function writeStateLocked(paths: ResolvedPaths, state: AntigravityAccountStateV1): void {
   ensurePrivateDir(paths.vaultDir);
-  atomicWriteFileSync(paths.statePath, JSON.stringify(state, null, 2) + '\n', {
-    mode: 0o600,
-    durable: true,
-    followTargetSymlink: false,
-  });
+  try {
+    atomicWriteFileSync(paths.statePath, JSON.stringify(state, null, 2) + '\n', {
+      mode: 0o600,
+      durable: true,
+      followTargetSymlink: false,
+    });
+  } catch (err) {
+    // rename(2) precedes the directory fsync. If the latter reports EIO, the
+    // desired state may already be visible; never let callers roll back a
+    // committed write as though it had never happened. Read-your-writes turns
+    // that ambiguous acknowledgement into a consistent success. A genuinely
+    // uncommitted write still throws and can be rolled back by the caller.
+    try {
+      const persisted = readStateUnlocked(paths.statePath);
+      if (persisted && isDeepStrictEqual(persisted, state)) return;
+    } catch { /* preserve the original write failure */ }
+    throw err;
+  }
 }
 
 function writeLiveTokenLocked(paths: ResolvedPaths, rawJson: string): void {
@@ -386,20 +439,100 @@ function writeLiveTokenLocked(paths: ResolvedPaths, rawJson: string): void {
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
   }
-  atomicWriteFileSync(paths.liveTokenPath, rawJson, {
-    mode: 0o600,
-    durable: true,
-    followTargetSymlink: false,
-  });
+  try {
+    atomicWriteFileSync(paths.liveTokenPath, rawJson, {
+      mode: 0o600,
+      durable: true,
+      followTargetSymlink: false,
+    });
+  } catch (err) {
+    // The live rename may already have committed before directory fsync failed.
+    // Continue only when read-your-writes proves the exact intended content;
+    // otherwise keep the failure and never overwrite a racing credential.
+    try {
+      if (readLiveTokenRawForRollback(paths) === rawJson) return;
+    } catch { /* preserve the original write failure */ }
+    throw err;
+  }
 }
 
 function writeVaultTokenLocked(paths: ResolvedPaths, id: string, rawJson: string): void {
   ensurePrivateDir(paths.tokensDir);
-  atomicWriteFileSync(tokenPathFor(paths, id), rawJson, {
-    mode: 0o600,
-    durable: true,
-    followTargetSymlink: false,
-  });
+  try {
+    atomicWriteFileSync(tokenPathFor(paths, id), rawJson, {
+      mode: 0o600,
+      durable: true,
+      followTargetSymlink: false,
+    });
+  } catch (err) {
+    try {
+      if (readVaultTokenRawForRollback(paths, id) === rawJson) return;
+    } catch { /* preserve the original write failure */ }
+    throw err;
+  }
+}
+
+function readVaultTokenRawForRollback(paths: ResolvedPaths, id: string): string | undefined {
+  const path = tokenPathFor(paths, id);
+  let st;
+  try { st = lstatSync(path); } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return undefined;
+    throw err;
+  }
+  if (st.isSymbolicLink() || !st.isFile()) {
+    throw new Error(`vault token for account "${id}" is not a regular file`);
+  }
+  return readFileSync(path, 'utf8');
+}
+
+function readLiveTokenRawForRollback(paths: ResolvedPaths): string | undefined {
+  let st;
+  try { st = lstatSync(paths.liveTokenPath); } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return undefined;
+    throw err;
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error('live antigravity-oauth-token is a symlink; refusing to overwrite through symlink');
+  }
+  if (!st.isFile()) {
+    throw new Error('live antigravity-oauth-token is not a regular file');
+  }
+  return readFileSync(paths.liveTokenPath, 'utf8');
+}
+
+function rollbackLiveTokenIfUnchanged(
+  paths: ResolvedPaths,
+  previousRaw: string | undefined,
+  writtenRaw: string,
+): void {
+  const currentRaw = readLiveTokenRawForRollback(paths);
+  if (currentRaw !== writtenRaw) return;
+  if (previousRaw === undefined) unlinkSync(paths.liveTokenPath);
+  else writeLiveTokenLocked(paths, previousRaw);
+}
+
+/** Commit the live credential and state as one recoverable transaction. If the
+ * state rename really did not commit, put back the previous live value, but
+ * only while it still equals this transaction's write (never clobber a racing
+ * agy refresh). Committed-but-unconfirmed state writes are handled by
+ * writeStateLocked and never reach this rollback. */
+function writeLiveThenStateLocked(
+  paths: ResolvedPaths,
+  state: AntigravityAccountStateV1,
+  rawJson: string,
+): void {
+  const previousRaw = readLiveTokenRawForRollback(paths);
+  writeLiveTokenLocked(paths, rawJson);
+  try {
+    writeStateLocked(paths, state);
+  } catch (err) {
+    try {
+      rollbackLiveTokenIfUnchanged(paths, previousRaw, rawJson);
+    } catch (rollbackErr) {
+      throw new AggregateError([err, rollbackErr], 'Antigravity state write and live-token rollback both failed');
+    }
+    throw err;
+  }
 }
 
 function withVaultLock<T>(paths: ResolvedPaths, fn: () => T): T {
@@ -407,10 +540,19 @@ function withVaultLock<T>(paths: ResolvedPaths, fn: () => T): T {
   return withFileLockSync(paths.statePath, fn);
 }
 
+function accountIdentityConflicts(
+  entry: AntigravityAccountEntry,
+  token: ParsedTokenFile,
+): boolean {
+  const stateEmail = normalizeAntigravityEmail(entry.email);
+  return Boolean(stateEmail && token.normalizedEmail && stateEmail !== token.normalizedEmail);
+}
+
 function sameTokenIdentity(live: ParsedTokenFile, target: ParsedTokenFile): boolean {
-  if (target.normalizedEmail || live.normalizedEmail) {
-    return Boolean(target.normalizedEmail && live.normalizedEmail && live.normalizedEmail === target.normalizedEmail);
-  }
+  // A known account email is never replaced by an email-less live file. The
+  // reverse is safe when the secret identity matches: agy may add the email on
+  // a later refresh of a snapshot that originally had none.
+  if (target.normalizedEmail) return live.normalizedEmail === target.normalizedEmail;
   return Boolean(
     (target.refreshToken && live.refreshToken === target.refreshToken)
     || (!target.refreshToken && target.accessToken && live.accessToken === target.accessToken),
@@ -449,6 +591,17 @@ function syncLiveTokenBackLocked(
   let match: AntigravityAccountEntry | undefined;
   if (liveEmail) {
     match = state.accounts.find(a => normalizeAntigravityEmail(a.email) === liveEmail);
+    if (!match && live.token.refreshToken) {
+      // A snapshot imported without an email may gain one on its next refresh.
+      // Only a unique refresh-token match among accounts that are email-less in
+      // BOTH state and vault is eligible; never cross two known identities.
+      const matches = state.accounts.filter(a => {
+        if (normalizeAntigravityEmail(a.email)) return false;
+        const tok = readValidatedTokenFile(tokenPathFor(paths, a.id));
+        return tok.ok && !tok.token.normalizedEmail && tok.token.refreshToken === live.token.refreshToken;
+      });
+      if (matches.length === 1) match = matches[0];
+    }
   } else if (live.token.refreshToken) {
     const matches = state.accounts.filter(a => {
       const tok = readValidatedTokenFile(tokenPathFor(paths, a.id));
@@ -459,6 +612,11 @@ function syncLiveTokenBackLocked(
   if (!match) return { liveToken: live.token };
 
   const stored = readValidatedTokenFile(tokenPathFor(paths, match.id));
+  if (stored.ok && accountIdentityConflicts(match, stored.token)) {
+    // A half-completed save may leave old state metadata beside a new vault
+    // identity. Never let a stale agy refresh overwrite that conflicting vault.
+    return { liveToken: live.token };
+  }
   const shouldSync = !stored.ok || isTokenFresher(live.token, stored.token);
   if (shouldSync) {
     writeVaultTokenLocked(paths, match.id, live.token.rawJson);
@@ -480,14 +638,14 @@ function backupUnmanagedLiveTokenLocked(
   const liveEmail = liveToken.normalizedEmail;
   const known = liveEmail && state.accounts.some(a => normalizeAntigravityEmail(a.email) === liveEmail);
   if (known) return;
-  try {
-    ensurePrivateDir(paths.vaultDir);
-    atomicWriteFileSync(paths.unmanagedBackupPath, liveToken.rawJson, {
-      mode: 0o600,
-      durable: true,
-      followTargetSymlink: false,
-    });
-  } catch { /* best-effort safety backup */ }
+  ensurePrivateDir(paths.vaultDir);
+  // This backup is a safety prerequisite, not a best-effort side effect: if it
+  // cannot be written, every caller must abort BEFORE replacing the live token.
+  atomicWriteFileSync(paths.unmanagedBackupPath, liveToken.rawJson, {
+    mode: 0o600,
+    durable: true,
+    followTargetSymlink: false,
+  });
 }
 
 function clearExpiredCooldown(entry: AntigravityAccountEntry, nowMs: number): boolean {
@@ -512,7 +670,8 @@ function isAccountHealthy(
   if (!entry.enabled) return false;
   if (opts.excludeIds?.has(entry.id)) return false;
   if (!opts.includeCooldown && isAccountInCooldown(entry, nowMs)) return false;
-  return readValidatedTokenFile(tokenPathFor(paths, entry.id)).ok;
+  const token = readValidatedTokenFile(tokenPathFor(paths, entry.id));
+  return token.ok && tokenCanAuthenticateAt(token.token, nowMs) && !accountIdentityConflicts(entry, token.token);
 }
 
 /** Pick the next candidate in round-robin order starting strictly after `afterId`. */
@@ -541,7 +700,8 @@ function earliestRecoveryAcrossEnabled(
   let earliest: number | undefined;
   for (const acc of state.accounts) {
     if (!acc.enabled) continue;
-    if (!readValidatedTokenFile(tokenPathFor(paths, acc.id)).ok) continue;
+    const token = readValidatedTokenFile(tokenPathFor(paths, acc.id));
+    if (!token.ok || !tokenCanAuthenticateAt(token.token, nowMs)) continue;
     if (acc.cooldownUntilMs !== undefined && acc.cooldownUntilMs > nowMs) {
       earliest = earliest === undefined ? acc.cooldownUntilMs : Math.min(earliest, acc.cooldownUntilMs);
     }
@@ -583,10 +743,12 @@ export function inspectAntigravityAccounts(
   const keyringRisk = detectAntigravityKeyringRisk(opts);
 
   let state: AntigravityAccountStateV1 | undefined;
+  let stateError: string | undefined;
   try {
     state = readStateUnlocked(paths.statePath);
-  } catch {
+  } catch (err) {
     state = undefined;
+    stateError = err instanceof Error ? err.message : String(err);
   }
 
   const accounts = (state?.accounts ?? []).map((entry): AntigravityAccountSnapshot => {
@@ -599,7 +761,7 @@ export function inspectAntigravityAccounts(
       ...(entry.authMethod ? { authMethod: entry.authMethod } : {}),
       enabled: entry.enabled,
       active: state?.activeId === entry.id,
-      hasValidToken: tokenRes.ok,
+      hasValidToken: tokenRes.ok && tokenCanAuthenticateAt(tokenRes.token, nowMs) && !accountIdentityConflicts(entry, tokenRes.token),
       inCooldown,
       ...(inCooldown && entry.cooldownUntilMs ? {
         cooldownUntilMs: entry.cooldownUntilMs,
@@ -626,7 +788,7 @@ export function inspectAntigravityAccounts(
 
   return {
     managed: accounts.length > 0,
-    autoRotate: state?.autoRotate ?? true,
+    autoRotate: state?.autoRotate ?? !stateError,
     activeId: state?.activeId ?? null,
     liveTokenPresent: live.ok,
     ...(liveEmail ? { liveEmail, liveMaskedEmail: maskAntigravityEmail(liveEmail) } : {}),
@@ -636,6 +798,7 @@ export function inspectAntigravityAccounts(
     availableCount,
     enabledCount,
     ...(earliestRecoveryMs !== undefined ? { earliestRecoveryMs } : {}),
+    ...(stateError ? { stateError } : {}),
   };
 }
 
@@ -673,15 +836,23 @@ export function saveAntigravityAccount(
       );
     }
 
+    if (sourcePath !== paths.liveTokenPath) {
+      preserveIndependentSourceSnapshotLocked(paths, id, parsed.token.rawJson);
+    }
     const state = readStateUnlocked(paths.statePath) ?? defaultState();
     const existingById = state.accounts.find(a => a.id === id);
 
     // Always enforce email uniqueness across distinct aliases: two aliases for
     // the same Google account would break rotation and email-based sync-back.
     if (parsed.token.normalizedEmail) {
-      const duplicate = state.accounts.find(
-        a => a.id !== id && normalizeAntigravityEmail(a.email) === parsed.token.normalizedEmail,
-      );
+      const duplicate = state.accounts.find(a => {
+        if (a.id === id) return false;
+        if (normalizeAntigravityEmail(a.email) === parsed.token.normalizedEmail) return true;
+        // state metadata may lag a successful vault sync-back after a failed
+        // state rename. Email uniqueness must cover BOTH durable representations.
+        const vault = readValidatedTokenFile(tokenPathFor(paths, a.id));
+        return vault.ok && vault.token.normalizedEmail === parsed.token.normalizedEmail;
+      });
       if (duplicate) {
         throw new Error(
           `该邮箱（${parsed.token.email}）已托管在账号 "${duplicate.id}" 下。`
@@ -706,61 +877,129 @@ export function saveAntigravityAccount(
       || state.activeId === null
       || (state.activeId === id && sourcePath !== paths.liveTokenPath);
 
-    // When updating liveTokenPath from a separate source, write liveTokenPath
-    // BEFORE mutating tokens/<id>.json or state.json so a symlink/permission
-    // failure on liveTokenPath never leaves vault token and state.json split.
-    if (shouldActivate && sourcePath !== paths.liveTokenPath) {
-      const synced = syncLiveTokenBackLocked(paths, state);
-      backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
-      writeLiveTokenLocked(paths, parsed.token.rawJson);
-    }
-
-    // Write vault token next, then state.json, so state never references a missing token.
-    writeVaultTokenLocked(paths, id, parsed.token.rawJson);
-
-    const nowIso = new Date(nowMs).toISOString();
-    let updated = false;
-    if (existingById) {
-      updated = true;
-      const identityChanged = normalizeAntigravityEmail(existingById.email) !== parsed.token.normalizedEmail;
-      if (identityChanged) {
-        delete existingById.cooldownUntilMs;
-        delete existingById.cooldownReason;
-      }
-      if (parsed.token.email) existingById.email = parsed.token.email;
-      else delete existingById.email;
-      if (parsed.token.authMethod) existingById.authMethod = parsed.token.authMethod;
-      else delete existingById.authMethod;
-      if (parsed.token.expiryMs !== undefined) existingById.tokenExpiryMs = parsed.token.expiryMs;
-      else delete existingById.tokenExpiryMs;
-      existingById.enabled = true;
-    } else {
-      state.accounts.push({
-        id,
-        ...(parsed.token.email ? { email: parsed.token.email } : {}),
-        ...(parsed.token.authMethod ? { authMethod: parsed.token.authMethod } : {}),
-        enabled: true,
-        addedAt: nowIso,
-        ...(parsed.token.expiryMs !== undefined ? { tokenExpiryMs: parsed.token.expiryMs } : {}),
-      });
-    }
-
-    if (shouldActivate) {
-      state.activeId = id;
-      const entry = state.accounts.find(a => a.id === id)!;
-      entry.lastUsedAt = nowIso;
-    }
-
+    let previousLiveRaw: string | undefined;
+    let previousVaultRaw: string | undefined;
+    let writtenLiveRaw: string | undefined;
+    let writtenVaultRaw: string | undefined;
     try {
-      writeStateLocked(paths, state);
-    } catch (err) {
-      if (!existingById) {
-        try { unlinkSync(tokenPathFor(paths, id)); } catch { /* best-effort rollback */ }
+      // Preserve the pre-transaction live value. sync-back itself is a valid
+      // independent refresh and is not rolled back; only THIS save's writes are.
+      if (shouldActivate && sourcePath !== paths.liveTokenPath) {
+        previousLiveRaw = readLiveTokenRawForRollback(paths);
+        const synced = syncLiveTokenBackLocked(paths, state);
+        backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
+        writeLiveTokenLocked(paths, parsed.token.rawJson);
+        writtenLiveRaw = parsed.token.rawJson;
       }
-      throw err;
+
+      previousVaultRaw = readVaultTokenRawForRollback(paths, id);
+      writeVaultTokenLocked(paths, id, parsed.token.rawJson);
+      writtenVaultRaw = parsed.token.rawJson;
+
+      const nowIso = new Date(nowMs).toISOString();
+      let updated = false;
+      if (existingById) {
+        updated = true;
+        const identityChanged = normalizeAntigravityEmail(existingById.email) !== parsed.token.normalizedEmail;
+        if (identityChanged) {
+          delete existingById.cooldownUntilMs;
+          delete existingById.cooldownReason;
+        }
+        if (parsed.token.email) existingById.email = parsed.token.email;
+        else delete existingById.email;
+        if (parsed.token.authMethod) existingById.authMethod = parsed.token.authMethod;
+        else delete existingById.authMethod;
+        if (parsed.token.expiryMs !== undefined) existingById.tokenExpiryMs = parsed.token.expiryMs;
+        else delete existingById.tokenExpiryMs;
+        existingById.enabled = true;
+      } else {
+        state.accounts.push({
+          id,
+          ...(parsed.token.email ? { email: parsed.token.email } : {}),
+          ...(parsed.token.authMethod ? { authMethod: parsed.token.authMethod } : {}),
+          enabled: true,
+          addedAt: nowIso,
+          ...(parsed.token.expiryMs !== undefined ? { tokenExpiryMs: parsed.token.expiryMs } : {}),
+        });
+      }
+
+      if (shouldActivate) {
+        state.activeId = id;
+        const entry = state.accounts.find(a => a.id === id)!;
+        entry.lastUsedAt = nowIso;
+      }
+      writeStateLocked(paths, state);
+      clearIndependentSourceRecoveryBestEffort(paths, id);
+      return { id, email: parsed.token.email, updated, activated: shouldActivate };
+    } catch (err) {
+      rollbackFailedSaveLocked(paths, id, {
+        previousVaultRaw,
+        writtenVaultRaw,
+        previousLiveRaw,
+        writtenLiveRaw,
+      }, err);
     }
-    return { id, email: parsed.token.email, updated, activated: shouldActivate };
   });
+}
+
+function recoveryPathFor(paths: ResolvedPaths, id: string): string {
+  return join(paths.vaultDir, 'recovery', `${id}.json`);
+}
+
+/** Durable pre-write for an independent-source save/login. This runs BEFORE
+ * state parsing or any live/vault mutation, so a failure can never strand the
+ * only copy of a newly logged-in credential in a temporary directory. */
+function preserveIndependentSourceSnapshotLocked(paths: ResolvedPaths, id: string, rawJson: string): void {
+  ensurePrivateDir(join(paths.vaultDir, 'recovery'));
+  const path = recoveryPathFor(paths, id);
+  try {
+    atomicWriteFileSync(path, rawJson, {
+      mode: 0o600,
+      durable: true,
+      followTargetSymlink: false,
+    });
+  } catch (err) {
+    try {
+      const st = lstatSync(path);
+      if (st.isFile() && !st.isSymbolicLink() && readFileSync(path, 'utf8') === rawJson) return;
+    } catch { /* preserve the original recovery write failure */ }
+    throw err;
+  }
+}
+
+function clearIndependentSourceRecoveryBestEffort(paths: ResolvedPaths, id: string): void {
+  try { unlinkSync(recoveryPathFor(paths, id)); } catch { /* a committed save needs no recovery copy */ }
+}
+
+/** Preserve an independent-source login before rolling back any part of a
+ * failed save. The recovery copy is deliberately outside tokens/ and therefore
+ * never participates in rotation or email uniqueness until explicitly rescued. */
+function rollbackFailedSaveLocked(
+  paths: ResolvedPaths,
+  id: string,
+  input: {
+    previousVaultRaw: string | undefined;
+    writtenVaultRaw?: string;
+    previousLiveRaw: string | undefined;
+    writtenLiveRaw?: string;
+  },
+  cause: unknown,
+): never {
+  const errors: unknown[] = [cause];
+  if (input.writtenLiveRaw !== undefined) {
+    try { rollbackLiveTokenIfUnchanged(paths, input.previousLiveRaw, input.writtenLiveRaw); }
+    catch (err) { errors.push(err); }
+  }
+  if (input.writtenVaultRaw !== undefined) {
+    try {
+      if (readVaultTokenRawForRollback(paths, id) === input.writtenVaultRaw) {
+        if (input.previousVaultRaw === undefined) unlinkSync(tokenPathFor(paths, id));
+        else writeVaultTokenLocked(paths, id, input.previousVaultRaw);
+      }
+    } catch (err) { errors.push(err); }
+  }
+  if (errors.length > 1) throw new AggregateError(errors, `Failed to roll back Antigravity account save for "${id}"`);
+  throw cause;
 }
 
 /** Explicitly switch active account to `id`. */
@@ -789,20 +1028,23 @@ export function useAntigravityAccount(
     if (!target.enabled && !opts.allowDisabled) {
       throw new Error(`账号 "${id}" 已禁用，请先执行 botmux agy-accounts enable ${id}`);
     }
+    const synced = syncLiveTokenBackLocked(paths, state);
+    // sync-back may have refreshed THIS target's vault snapshot. Read it only
+    // after that write; using the pre-sync value would immediately regress live.
     const targetToken = readValidatedTokenFile(tokenPathFor(paths, target.id));
     if (!targetToken.ok) {
       throw new Error(`账号 "${id}" 的凭据文件缺失或损坏（${targetToken.reason}），请重新登录`);
     }
-
-    const synced = syncLiveTokenBackLocked(paths, state);
+    if (accountIdentityConflicts(target, targetToken.token)) {
+      throw new Error(`账号 "${id}" 的 state 邮箱与凭据邮箱不一致，请先执行 save --force 修复身份后再切换`);
+    }
     backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
 
     const fromId = state.activeId;
-    writeLiveTokenLocked(paths, targetToken.token.rawJson);
     state.activeId = target.id;
     target.lastUsedAt = new Date(nowMs).toISOString();
     clearExpiredCooldown(target, nowMs);
-    writeStateLocked(paths, state);
+    writeLiveThenStateLocked(paths, state, targetToken.token.rawJson);
 
     return {
       fromId,
@@ -852,10 +1094,9 @@ export function rotateNextAntigravityAccount(
     }
     backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
     const fromId = state.activeId;
-    writeLiveTokenLocked(paths, nextToken.token.rawJson);
     state.activeId = next.id;
     next.lastUsedAt = new Date(nowMs).toISOString();
-    writeStateLocked(paths, state);
+    writeLiveThenStateLocked(paths, state, nextToken.token.rawJson);
     return {
       fromId,
       toId: next.id,
@@ -883,6 +1124,23 @@ export function setAntigravityAccountEnabled(
   });
 }
 
+function deleteAntigravityTokenSnapshotOrThrow(paths: ResolvedPaths, id: string): void {
+  try {
+    unlinkSync(tokenPathFor(paths, id));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      throw new Error(`账号 "${id}" 已从 state 移除，但凭据快照删除失败；请检查 ${tokenPathFor(paths, id)}`, { cause: err });
+    }
+  }
+}
+
+function antigravityTokenSnapshotExists(paths: ResolvedPaths, id: string): boolean {
+  try { lstatSync(tokenPathFor(paths, id)); return true; } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
 export function removeAntigravityAccount(
   id: string,
   opts: AntigravityAccountStoreOptions = {},
@@ -893,9 +1151,17 @@ export function removeAntigravityAccount(
 
   return withVaultLock(paths, () => {
     const state = readStateUnlocked(paths.statePath);
-    if (!state) throw new Error('尚未托管任何 Antigravity 账号');
-    const idx = state.accounts.findIndex(a => a.id === id);
-    if (idx < 0) throw new Error(`账号不存在: ${id}`);
+    const idx = state?.accounts.findIndex(a => a.id === id) ?? -1;
+    if (!state || idx < 0) {
+      // A previous remove may have committed state and crashed/failed before
+      // unlink. Make the same command an idempotent cleanup retry.
+      if (antigravityTokenSnapshotExists(paths, id)) {
+        deleteAntigravityTokenSnapshotOrThrow(paths, id);
+        return { removedId: id, newActiveId: state?.activeId ?? null };
+      }
+      if (!state) throw new Error('尚未托管任何 Antigravity 账号');
+      throw new Error(`账号不存在: ${id}`);
+    }
 
     const wasActive = state.activeId === id;
     // Preserve any fresher live token belonging to another hosted account (or
@@ -910,11 +1176,11 @@ export function removeAntigravityAccount(
         ?? pickNextHealthyAccount(paths, state, null, nowMs, { includeCooldown: true });
       if (replacement) {
         const repTok = readValidatedTokenFile(tokenPathFor(paths, replacement.id));
-        if (repTok.ok) {
-          backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
-          writeLiveTokenLocked(paths, repTok.token.rawJson);
-          replacement.lastUsedAt = new Date(nowMs).toISOString();
-        }
+        if (!repTok.ok) throw new Error(`替代账号 "${replacement.id}" 的凭据不可用（${repTok.reason}）`);
+        backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
+        replacement.lastUsedAt = new Date(nowMs).toISOString();
+        state.activeId = replacement.id;
+        writeLiveThenStateLocked(paths, state, repTok.token.rawJson);
         newActiveId = replacement.id;
       } else {
         newActiveId = null;
@@ -922,8 +1188,8 @@ export function removeAntigravityAccount(
       state.activeId = newActiveId;
     }
 
-    writeStateLocked(paths, state);
-    try { unlinkSync(tokenPathFor(paths, id)); } catch { /* already absent */ }
+    if (!wasActive || !newActiveId) writeStateLocked(paths, state);
+    deleteAntigravityTokenSnapshotOrThrow(paths, id);
     return { removedId: id, newActiveId };
   });
 }
@@ -1056,25 +1322,32 @@ export function reconcileActiveAntigravityToken(
     }
 
     const activeToken = readValidatedTokenFile(tokenPathFor(paths, active.id));
-    if (!activeToken.ok) {
+    if (activeToken.ok && accountIdentityConflicts(active, activeToken.token)) {
+      return {
+        managed: true,
+        activeId: active.id,
+        email: active.email,
+        error: 'active_account_identity_conflict',
+      };
+    }
+    if (!activeToken.ok || !tokenCanAuthenticateAt(activeToken.token, nowMs)) {
       if (stateDirty) writeStateLocked(paths, state);
       return {
         managed: true,
         activeId: active.id,
         email: active.email,
-        error: `active_token_${activeToken.reason}`,
+        error: activeToken.ok ? 'active_token_expired' : `active_token_${activeToken.reason}`,
       };
     }
 
     const liveMatches = liveMatchesTargetToken(synced.liveToken, activeToken.token);
     let restored = false;
     if (!liveMatches) {
-      backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
       try {
-        writeLiveTokenLocked(paths, activeToken.token.rawJson);
+        backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
+        writeLiveThenStateLocked(paths, state, activeToken.token.rawJson);
         restored = true;
       } catch (err) {
-        if (stateDirty) writeStateLocked(paths, state);
         return {
           managed: true,
           activeId: active.id,
@@ -1082,9 +1355,9 @@ export function reconcileActiveAntigravityToken(
           error: err instanceof Error ? err.message : String(err),
         };
       }
+    } else if (stateDirty) {
+      writeStateLocked(paths, state);
     }
-
-    if (stateDirty) writeStateLocked(paths, state);
 
     const allInCooldown = !state.accounts.some(a => isAccountHealthy(paths, a, nowMs));
     const earliestRecoveryMs = allInCooldown ? earliestRecoveryAcrossEnabled(paths, state, nowMs) : undefined;
@@ -1132,9 +1405,16 @@ export function rotateAntigravityAccountOnQuotaLimit(
         return { outcome: 'disabled' };
       }
 
-      for (const acc of state.accounts) clearExpiredCooldown(acc, nowMs);
+      let metadataDirty = false;
+      for (const acc of state.accounts) {
+        if (clearExpiredCooldown(acc, nowMs)) metadataDirty = true;
+      }
 
       const synced = syncLiveTokenBackLocked(paths, state);
+      // Persist sync-back/expiry metadata before ANY early return (including
+      // identity_unknown). Otherwise vault and state disagree about email
+      // uniqueness on the next save.
+      if (metadataDirty || synced.syncedBackId) writeStateLocked(paths, state);
 
       const excludeIds = new Set<string>(params.excludeAccountIds ?? []);
 
@@ -1154,18 +1434,16 @@ export function rotateAntigravityAccountOnQuotaLimit(
           const activeTok = readValidatedTokenFile(tokenPathFor(paths, freshActive.id));
           if (activeTok.ok) {
             if (!liveMatchesTargetToken(synced.liveToken, activeTok.token)) {
-              backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
               try {
-                writeLiveTokenLocked(paths, activeTok.token.rawJson);
+                backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
+                writeLiveThenStateLocked(paths, state, activeTok.token.rawJson);
               } catch (err) {
-                writeStateLocked(paths, state);
                 return {
                   outcome: 'write_failed',
                   error: err instanceof Error ? err.message : String(err),
                 };
               }
             }
-            if (synced.syncedBackId) writeStateLocked(paths, state);
             return {
               outcome: 'already_rotated',
               toId: freshActive.id,
@@ -1175,15 +1453,17 @@ export function rotateAntigravityAccountOnQuotaLimit(
         }
       }
 
+      // Outside the narrow concurrent-rotation grace window, an unbound legacy
+      // pane provides no trustworthy evidence about its account. The live file
+      // may have been overwritten by another process, so do not guess from
+      // activeId (or even live contents) and cool a healthy account.
+      if (!params.failedAccountId) return { outcome: 'identity_unknown' };
+
       // Identify the victim account. If failedAccountId was explicitly provided
       // but has since been removed from the vault, do NOT blame state.activeId.
       let victim: AntigravityAccountEntry | undefined;
       if (params.failedAccountId) {
         victim = state.accounts.find(a => a.id === params.failedAccountId);
-      } else if (state.activeId) {
-        victim = state.accounts.find(a => a.id === state.activeId);
-      } else if (synced.matchedId) {
-        victim = state.accounts.find(a => a.id === synced.matchedId);
       }
 
       const cooldownUntilMs = sanitizeCooldownUntilMs(params.cooldownUntilMs, nowMs);
@@ -1203,19 +1483,19 @@ export function rotateAntigravityAccountOnQuotaLimit(
           if (activeTok.ok) {
             const liveMatches = liveMatchesTargetToken(synced.liveToken, activeTok.token);
             if (!liveMatches) {
-              backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
               try {
-                writeLiveTokenLocked(paths, activeTok.token.rawJson);
+                backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
+                writeLiveThenStateLocked(paths, state, activeTok.token.rawJson);
               } catch (err) {
-                writeStateLocked(paths, state);
                 return {
                   outcome: 'write_failed',
                   fromId: victim?.id ?? params.failedAccountId,
                   error: err instanceof Error ? err.message : String(err),
                 };
               }
+            } else {
+              writeStateLocked(paths, state);
             }
-            writeStateLocked(paths, state);
             return {
               outcome: 'already_rotated',
               fromId: victim?.id ?? params.failedAccountId,
@@ -1231,9 +1511,7 @@ export function rotateAntigravityAccountOnQuotaLimit(
       const next = pickNextHealthyAccount(paths, state, victim?.id ?? state.activeId, nowMs, { excludeIds });
       if (!next) {
         writeStateLocked(paths, state);
-        const enabledCount = state.accounts.filter(
-          a => a.enabled && readValidatedTokenFile(tokenPathFor(paths, a.id)).ok,
-        ).length;
+        const enabledCount = state.accounts.filter(a => isAccountHealthy(paths, a, nowMs, { includeCooldown: true })).length;
         return {
           outcome: 'exhausted',
           fromId: victim?.id ?? params.failedAccountId,
@@ -1253,24 +1531,31 @@ export function rotateAntigravityAccountOnQuotaLimit(
         };
       }
 
-      backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
+      const previousActiveId = state.activeId;
+      const previousLastRotatedAtMs = state.lastRotatedAtMs;
+      const previousNextLastUsedAt = next.lastUsedAt;
       try {
-        writeLiveTokenLocked(paths, nextTok.token.rawJson);
+        backupUnmanagedLiveTokenLocked(paths, state, synced.liveToken, synced.matchedId);
+        state.activeId = next.id;
+        state.lastRotatedAtMs = nowMs;
+        next.lastUsedAt = new Date(nowMs).toISOString();
+        writeLiveThenStateLocked(paths, state, nextTok.token.rawJson);
       } catch (err) {
-        // Do NOT advance activeId when live token write failed; still persist
-        // the victim's cooldown so another retry/session does not stay blind.
-        writeStateLocked(paths, state);
+        // Roll the in-memory transaction back before making a best-effort
+        // durability record of the victim's cooldown. Never persist the new
+        // activeId when its live write/state commit did not complete.
+        state.activeId = previousActiveId;
+        if (previousLastRotatedAtMs === undefined) delete state.lastRotatedAtMs;
+        else state.lastRotatedAtMs = previousLastRotatedAtMs;
+        if (previousNextLastUsedAt === undefined) delete next.lastUsedAt;
+        else next.lastUsedAt = previousNextLastUsedAt;
+        try { writeStateLocked(paths, state); } catch { /* preserve the original failure */ }
         return {
           outcome: 'write_failed',
           fromId: victim?.id ?? params.failedAccountId,
           error: err instanceof Error ? err.message : String(err),
         };
       }
-
-      state.activeId = next.id;
-      state.lastRotatedAtMs = nowMs;
-      next.lastUsedAt = new Date(nowMs).toISOString();
-      writeStateLocked(paths, state);
 
       return {
         outcome: 'rotated',
