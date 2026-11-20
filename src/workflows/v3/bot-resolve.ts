@@ -72,6 +72,11 @@ function sandboxPathsSnapshot(
 /** BotConfig → BotSnapshot (the runtime-frozen, secret-free per-node identity). */
 export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotSnapshot {
   if (bot.codexProfile) throw new Error('Codex profile is not supported by v3 workflow; choose a Bot without a profile');
+  // Workflow workers have no per-owner session, so they would get the bot-wide
+  // BOT_HOME / attachment bucket — exactly what assistant mode isolates.
+  if (bot.assistantMode === true) {
+    throw new Error(`v3 workflow does not support personal-assistant mode; bot "${bot.name ?? bot.larkAppId}" has assistantMode=true`);
+  }
   if (bot.disableCliBypass === true) {
     throw new Error(
       `v3 workflow requires CLI bypass permissions, but bot "${bot.name ?? bot.larkAppId}" ` +

@@ -16752,6 +16752,8 @@ async function forkFromSource(
     childSession.cliId = ds.session.cliId;
     childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
     childSession.ownerOpenId = opts?.childOwnerOpenId ?? ds.session.ownerOpenId;
+    // 个人助理模式：fork 出来的会话仍在同一 chat，归属同一个助理主人。
+    if (ds.session.assistantOwnerOpenId) childSession.assistantOwnerOpenId = ds.session.assistantOwnerOpenId;
     childSession.backendType = ds.session.backendType;
     // Bot identity on the PERSISTED row. Every other createSession caller sets
     // this immediately after minting (trigger-session / session-manager /
@@ -19589,7 +19591,7 @@ function forkWorkerPrepared(
       // 当前归属重新建会话。本条消息丢弃，由用户重发。
       logger.warn(`[${tag(ds)}] assistant-mode: refusing to fork — session owner ${have ?? '(none)'} vs resolved ${expected ?? '(none)'}; retiring session`);
       reportAdmission('rejected');
-      void closeSession(ds.session.sessionId, { awaitWorkerExit: false }).catch(err =>
+      void closeSessionForBackgroundCleanup(ds.session.sessionId, 'assistant-mode owner mismatch').catch(err =>
         logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
       return false;
     }

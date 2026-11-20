@@ -5578,6 +5578,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/decision-board', async (req, res, par
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
+  // 个人助理模式：看板按 bot 汇总，不按主人隔离，助理会话不开放。
+  if (ds.session.assistantOwnerOpenId) return jsonRes(res, 403, { ok: false, error: 'decision_board_unavailable_in_assistant_mode' });
   const service = decisionBoardService;
   if (!service) return jsonRes(res, 503, { ok: false, error: 'decision_board_unavailable' });
   try {
@@ -5618,6 +5620,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/decision-board/upload', async (req, r
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
+  // 个人助理模式：看板按 bot 汇总，不按主人隔离，助理会话不开放。
+  if (ds.session.assistantOwnerOpenId) return jsonRes(res, 403, { ok: false, error: 'decision_board_unavailable_in_assistant_mode' });
   const service = decisionBoardService;
   if (!service) return jsonRes(res, 503, { ok: false, error: 'decision_board_unavailable' });
   const mime = String(req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();

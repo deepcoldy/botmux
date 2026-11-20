@@ -1217,9 +1217,9 @@ import {
 import { createGroupWithBots } from './services/group-creator.js';
 import { addBotToChat, isInChat, listChatMemberDisplays, addUsersToChatByOpenId } from './services/groups-store.js';
 import { initSessionGroups, isSessionGroup, getSessionGroup, touchSessionGroup } from './services/session-groups-store.js';
-import { assistantUserHome, assistantWorkDir, isValidAssistantOpenId, resolveAssistantOwnerOpenId, setAssistantOwnerChangedListener } from './core/assistant-mode.js';
+import { isValidAssistantOpenId, resolveAssistantOwnerOpenId, setAssistantOwnerChangedListener } from './core/assistant-mode.js';
 import { getAssistantOwner, markAssistantOwnerLeft, setAssistantOwner } from './services/assistant-owner-store.js';
-import { botHomePath } from './adapters/cli/read-isolation.js';
+import { assistantSessionStillOwned, resolveAssistantSpawn } from './core/assistant-spawn.js';
 import { maybeBirthSessionGroup, declinesSessionGroupBirthAsSlashCommand } from './core/session-group-birth.js';
 import { scheduleSessionGroupTitle, subscribeSessionGroupTitles } from './services/session-group-title.js';
 import { hasPendingGroupAutoTitle, scheduleGroupAutoTitle } from './services/group-auto-title.js';
@@ -3493,7 +3493,10 @@ async function ensureVcMeetingReceiverSession(
       ?? effectiveDefaultWorkingDir(bot.config)
       ?? bot.config.workingDir
       ?? '~';
-    const workingDir = validateWorkingDir(rawWorkingDir, localeForBot(selfAppId));
+    // 个人助理模式：会议接收会话同样归群的 owner、cwd 固定在 owner 的 work/；未认领不服务。
+    const assistantSpawn = resolveAssistantSpawn(selfAppId, chatId, 'group', undefined);
+    if (assistantSpawn.kind === 'unclaimed') throw new Error('assistant mode: this group has no assistant owner');
+    const workingDir = validateWorkingDir(assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : rawWorkingDir, localeForBot(selfAppId));
     if (!workingDir.ok) throw new Error(workingDir.error);
 
     const session = sessionStore.createSession(
@@ -3502,6 +3505,7 @@ async function ensureVcMeetingReceiverSession(
       `[Meeting] ${request.meeting.meetingId}`.slice(0, 50),
       'group',
     );
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     const now = Date.now();
     session.larkAppId = selfAppId;
     session.scope = 'chat';
@@ -23047,38 +23051,10 @@ async function maybeAutoBindDefaultOncall(
 // 每个会话有且只有一个 owner；spawn 前判定，owner 决定 cwd（<BOT_HOME>/users/<owner>/work）
 // 与随后 worker 侧的 CLI 数据目录 / 沙盒子树。群查不到 owner → 不服务（notify + return），
 // 绝不退回共享目录。设计见 docs/design/2026-11-20-assistant-mode.md。
-type AssistantSpawn =
-  | { kind: 'off' }
-  | { kind: 'owner'; openId: string; workDir: string }
-  | { kind: 'unclaimed' };
-
 /** 只要 owner（附件分桶用）；模式关 / 未认领 → undefined。 */
 function assistantOwnerForChat(larkAppId: string, chatId: string, chatType: 'group' | 'p2p', senderOpenId: string | undefined): string | undefined {
   const r = resolveAssistantSpawn(larkAppId, chatId, chatType, senderOpenId);
   return r.kind === 'owner' ? r.openId : undefined;
-}
-
-function resolveAssistantSpawn(
-  larkAppId: string,
-  chatId: string,
-  chatType: 'group' | 'p2p',
-  senderOpenId: string | undefined,
-): AssistantSpawn {
-  let cfg: BotConfig;
-  try { cfg = getBot(larkAppId).config; } catch { return { kind: 'off' }; }
-  if (cfg.assistantMode !== true) return { kind: 'off' };
-  const owner = resolveAssistantOwnerOpenId({
-    chatType,
-    senderOpenId,
-    sessionGroupOwnerOpenId: chatType === 'group' ? getSessionGroup(chatId)?.ownerOpenId : undefined,
-    stored: chatType === 'group' ? getAssistantOwner(config.session.dataDir, larkAppId, chatId) : undefined,
-  });
-  if (!owner) return { kind: 'unclaimed' };
-  const workDir = assistantWorkDir(assistantUserHome(botHomePath(dirname(config.session.dataDir), larkAppId), owner));
-  try { mkdirSync(workDir, { recursive: true, mode: 0o700 }); } catch (e) {
-    logger.warn(`[assistant-mode:${larkAppId}] cannot create ${workDir}: ${(e as Error).message}`);
-  }
-  return { kind: 'owner', openId: owner, workDir };
 }
 
 const ASSISTANT_UNCLAIMED_TEXT =
@@ -23131,7 +23107,7 @@ function stopAssistantSessionsOfChat(larkAppId: string, chatId: string | undefin
     if (!ds.worker || ds.worker.killed) continue;
     if (suspendWorker(ds, reason)) { n.suspended++; continue; }
     n.closing++;
-    void closeSessionHelper(ds.session.sessionId, { awaitWorkerExit: false }).catch(err =>
+    void closeSessionForBackgroundCleanup(ds.session.sessionId, `assistant-mode ${reason}`).catch(err =>
       logger.warn(`[assistant-mode:${larkAppId}] close ${ds.session.sessionId.slice(0, 8)} failed: ${(err as Error).message}`));
   }
   return n;
@@ -23145,7 +23121,7 @@ function onAssistantOwnerChanged(larkAppId: string, chatId: string, newOwner: st
     if (ds.larkAppId !== larkAppId || ds.chatId !== chatId) continue;
     if (newOwner !== null && ds.session.assistantOwnerOpenId === newOwner) continue;
     retired++;
-    void closeSessionHelper(ds.session.sessionId, { awaitWorkerExit: false }).catch(err =>
+    void closeSessionForBackgroundCleanup(ds.session.sessionId, 'assistant-mode owner changed').catch(err =>
       logger.warn(`[assistant-mode:${larkAppId}] retire ${ds.session.sessionId.slice(0, 8)} failed: ${(err as Error).message}`));
   }
   if (retired) logger.info(`[assistant-mode:${larkAppId}] owner of ${chatId.slice(0, 12)}… → ${newOwner?.slice(0, 12) ?? '(none)'}; retired ${retired} session(s)`);
@@ -28384,10 +28360,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   }
 
   // Download attachments
-  const { attachments, needLogin } = await downloadResources(
-    larkAppId, messageId, resources, senderOpenId,
-    assistantSpawn.kind === 'owner' ? assistantSpawn.openId : undefined,
-  );
+  // 个人助理模式：附件落主人的桶（只在助理模式下多传这一参）
+  const { attachments, needLogin } = assistantSpawn.kind === 'owner'
+    ? await downloadResources(larkAppId, messageId, resources, senderOpenId, assistantSpawn.openId)
+    : await downloadResources(larkAppId, messageId, resources, senderOpenId);
   if (attachments.length > 0) {
     parsed.attachments = attachments;
   }
@@ -31287,7 +31263,11 @@ async function handleThreadReplyAdmitted(
         logger.warn(`[${larkAppId}] topic continuity: session store unreadable, not continuing: ${err instanceof Error ? err.message : String(err)}`);
       }
       if (previous) {
-        const blocked = botSessionDirective.mode === 'fresh' ? 'fresh_requested' : topicResumeBlockReason(previous);
+        const blocked = botSessionDirective.mode === 'fresh' ? 'fresh_requested'
+          // 个人助理模式：旧会话的主人已不是本群/本私聊当前的主人（开模式前的存量会话、换了主人）
+          // → 不复活它（准入闸会再关掉，循环），直接按当前主人新建。
+          : !assistantSessionStillOwned(previous, larkAppId, threadSenderOpenId) ? 'assistant_owner_changed'
+          : topicResumeBlockReason(previous);
         if (blocked === 'fresh_requested') {
           pendingTopicContinuity = { mode: 'fresh-requested', previousSessionId: previous.sessionId };
           announceFreshTopicSession = true;
@@ -31375,7 +31355,9 @@ async function handleThreadReplyAdmitted(
     // 没有活会话（下面会自动建）时按当前归属解析 owner，附件才落进新会话读得到的 owner 桶。
     const attachmentOwner = ds?.session.assistantOwnerOpenId
       ?? assistantOwnerForChat(effectiveAppId, ctxChatId ?? data?.message?.chat_id ?? '', ctxChatType, inboundSenderOpenId);
-    const downloaded = await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId, attachmentOwner);
+    const downloaded = attachmentOwner
+      ? await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId, attachmentOwner)
+      : await downloadResources(effectiveAppId, parsed.messageId, resources, inboundSenderOpenId);
     attachments = downloaded.attachments;
     if (workflowHandoff) attachments = [...attachments, ...workflowNodeDaemon.stageInbound(workflowHandoff, parsed.messageId)];
     if (attachments.length > 0) {

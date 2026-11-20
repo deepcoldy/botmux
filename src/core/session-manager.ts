@@ -19,6 +19,7 @@ import { recordScheduledSessionRun } from './scheduled-send.js';
 import { basename, dirname, join } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
+import { resolveAssistantSpawn } from './assistant-spawn.js';
 import * as sessionStore from '../services/session-store.js';
 import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
 import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './scheduler.js';
@@ -5338,7 +5339,15 @@ export async function executeScheduledTask(
     const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
       ? 'chat'
       : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
+    // 个人助理模式：定时会话归 chat 的主人（私聊 = 建任务的人），cwd 固定在主人的 work/；
+    // 群未认领 → 本次失败（宁可漏一次，也不在共享目录里起会话）。
+    const assistantSpawn = resolveAssistantSpawn(larkAppId, task.chatId, task.chatType === 'p2p' ? 'p2p' : 'group',
+      scheduledTrustedCaller?.requestUserOpenId ?? task.ownerOpenId);
+    if (assistantSpawn.kind === 'unclaimed') {
+      throw new Error(`assistant mode: chat ${task.chatId} has no assistant owner; scheduled run refused`);
+    }
     const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group', undefined, { source: 'schedule' });
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
@@ -5383,7 +5392,7 @@ export async function executeScheduledTask(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: isContinuation,
-      workingDir: task.workingDir,
+      workingDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : task.workingDir,
       initialStartPending: true,
       pendingPrompt: firePrompt,
       // In-memory only, exactly like the trigger API's per-turn model: persisting

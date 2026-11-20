@@ -218,6 +218,22 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Admission failure cleanup; wrapper logs both.',
     count: 4,
   },
+  'core/worker-pool.ts::forkWorkerPrepared::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Assistant-mode admission gate: a session whose owner no longer matches the chat is retired '
+      + 'so the next message creates one for the current owner; nobody waits on it and the wrapper '
+      + 'logs refusal and residual.',
+  },
+  'daemon.ts::onAssistantOwnerChanged::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Assistant-mode owner change (claim / admin reassign): retires the previous owner\'s sessions; '
+      + 'the command reply already told the group, the wrapper logs refusal and residual.',
+  },
+  'daemon.ts::stopAssistantSessionsOfChat::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Assistant-mode owner left / mode enabled: stops workers that cannot be suspended; '
+      + 'no UI is waiting, the wrapper logs refusal and residual.',
+  },
   'daemon.ts::closePatrolSession::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Group-secretary patrol cleanup: only a session the patrol itself created, '
