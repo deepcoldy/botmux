@@ -52,6 +52,18 @@ describe('kernel-verified DSH process identity', () => {
     expect(capture()).toEqual(identity);
   });
 
+  it.each([
+    { name: 'nodejs', exe: '/usr/bin/nodejs', engineArgs: ['node', '/npm/dsh.js', '--profile', 'botmux'] },
+    { name: 'a replaced Node image', exe: '/usr/bin/node (deleted)', engineArgs: ['node', '/npm/dsh.js', '--profile', 'botmux'] },
+    { name: 'a replaced native DSH image', exe: '/npm/dsh.js (deleted)', engineArgs: ['/npm/dsh.js', '--profile', 'botmux'] },
+  ])('accepts $name with the same live engine identity', ({ exe, engineArgs }) => {
+    const { root, capture, identity } = fixture();
+    unlinkSync(join(root, '60/exe'));
+    symlinkSync(exe, join(root, '60/exe'));
+    writeFileSync(join(root, '60/cmdline'), engineArgs.join('\0') + '\0');
+    expect(capture()).toEqual(identity);
+  });
+
   it('ignores configuration discovery and model-created descendants', () => {
     const { root, capture, identity } = fixture();
     proc(root, 61, 50, '/bin/node', ['node', '/npm/dsh.js', '--profile', 'botmux', '--dump-config']);

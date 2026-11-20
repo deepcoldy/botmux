@@ -8204,6 +8204,8 @@ let dshProcessAttestation: {
   executable: string;
   args: string[];
   identity?: DshProcessIdentity;
+  retryTimer?: NodeJS.Timeout;
+  retryAttempts?: number;
 } | undefined;
 let codexAppEngineIdentity: CodexAppEngineIdentity | undefined;
 
@@ -20508,6 +20510,31 @@ async function handleTrustedCodexAppMarker(
   return false;
 }
 
+function scheduleDshProcessAttestationRetry(proof: NonNullable<typeof dshProcessAttestation>): void {
+  if (proof.identity || proof.retryTimer || dshProcessAttestation !== proof
+    || proof.generation !== cliSpawnGeneration) return;
+  const delays = [50, 200, 1000, 2000, 5000, 10_000];
+  const attempt = proof.retryAttempts ?? 0;
+  const delay = delays[attempt];
+  if (delay === undefined) return;
+  proof.retryTimer = setTimeout(() => {
+    proof.retryTimer = undefined;
+    if (proof.identity || dshProcessAttestation !== proof
+      || proof.generation !== cliSpawnGeneration) return;
+    proof.retryAttempts = attempt + 1;
+    // The runner root already covers the engine in the current-turn snapshot.
+    // Add only the missing trusted root; never rotate the relay token or retake
+    // preexistingProcessIdentities after tools may have started.
+    publishLocalProcessAttestation(
+      backend?.getChildPid?.() ?? undefined,
+      undefined,
+      { republishTurnOrigin: false },
+    );
+    scheduleDshProcessAttestationRetry(proof);
+  }, delay);
+  proof.retryTimer.unref?.();
+}
+
 function handleAppRunnerOscMarker(body: string): void {
   const sep = body.indexOf(':');
   if (sep < 0) return;
@@ -20518,7 +20545,9 @@ function handleAppRunnerOscMarker(body: string): void {
     // No payload field is authority. A replay must not rotate the turn's
     // pre-existing-process snapshot after tools have already started.
     if (dshProcessAttestation?.generation === cliSpawnGeneration && !dshProcessAttestation.identity) {
+      const proof = dshProcessAttestation;
       publishLocalProcessAttestation(backend?.getChildPid?.() ?? undefined);
+      scheduleDshProcessAttestationRetry(proof);
     }
     return;
   }
@@ -28895,6 +28924,7 @@ async function spawnCliBody(
     log(`Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ${cliAdapter.id}`);
   }
   if (cliExtraArgs.length) args.push(...cliExtraArgs);
+  if (dshProcessAttestation?.retryTimer) clearTimeout(dshProcessAttestation.retryTimer);
   dshProcessAttestation = cfg.cliId === 'dsh' && cfg.dshRuntime !== 'tui'
     ? { generation: cliSpawnGeneration, executable: cliAdapter.resolvedBin, args: [...args] }
     : undefined;
@@ -33044,6 +33074,7 @@ function killCli(opts: {
   // depend on that implementation detail.
   cliSpawnGeneration++;
   claudeEffortObserver.reset();
+  if (dshProcessAttestation?.retryTimer) clearTimeout(dshProcessAttestation.retryTimer);
   dshProcessAttestation = undefined;
   terminalEffortTracker.reset();
   lastNativeReasoningKey = undefined;
@@ -37620,6 +37651,7 @@ function stopHeldFailedTurnRewind(): boolean {
 function publishLocalProcessAttestation(
   cliPid?: number,
   enginePid = codexRpcEngine?.appServerPid,
+  opts: { republishTurnOrigin?: boolean } = {},
 ): boolean {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
   let dshIdentity: DshProcessIdentity | undefined;
@@ -37634,6 +37666,10 @@ function publishLocalProcessAttestation(
       && captured.enginePid === proof.identity.enginePid
       && captured.engineProcStart === proof.identity.engineProcStart))) {
       dshIdentity = proof.identity ??= captured;
+    }
+    if (dshIdentity && proof.retryTimer) {
+      clearTimeout(proof.retryTimer);
+      proof.retryTimer = undefined;
     }
   }
   // Freeze the proven birth token; explicit legacy RPC roots keep priority.
@@ -37680,6 +37716,7 @@ function publishLocalProcessAttestation(
   // before it snapshots the current turn's pre-existing descendants. This is
   // required for the opening turn, whose origin is first published before the
   // CLI process exists, and whenever a wrapper resolves to a new real CLI pid.
+  if (opts.republishTurnOrigin === false) return true;
   return currentBotmuxTurnId ? publishSandboxRelayCapability() : true;
 }
 

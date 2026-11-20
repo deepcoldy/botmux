@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const identity = { runnerPid: 50, runnerProcStart: '500', enginePid: 60, engineProcStart: '600' };
+afterEach(() => { vi.useRealTimers(); });
 function fixture(cliId = 'dsh', dshRuntime?: string) {
   const scope: any = {
     lastInitConfig: { cliId, dshRuntime }, cliSpawnGeneration: 3,
@@ -17,6 +18,7 @@ function fixture(cliId = 'dsh', dshRuntime?: string) {
   };
   const publish = loadWorkerFunction<(pid: number, enginePid?: number) => boolean>('publishLocalProcessAttestation', scope);
   scope.publishLocalProcessAttestation = vi.fn(publish);
+  scope.scheduleDshProcessAttestationRetry = loadWorkerFunction('scheduleDshProcessAttestationRetry', scope);
   const marker = loadWorkerFunction<(body: string) => void>('handleAppRunnerOscMarker', scope);
   const ready = (payload = {}) => marker(`process_ready:${Buffer.from(JSON.stringify(payload)).toString('base64')}`);
   return { scope, publish, ready };
@@ -44,6 +46,76 @@ describe('worker DSH engine attestation', () => {
     expect(scope.dshProcessAttestation.identity).toBeUndefined();
     ready();
     expect(scope.send.mock.calls[1][0].enginePid).toBe(60);
+  });
+
+  it('retries a transient capture failure without another marker or a new turn snapshot', async () => {
+    vi.useFakeTimers();
+    const { scope, ready } = fixture('dsh', 'official');
+    scope.captureDshProcessIdentity.mockReturnValueOnce(undefined);
+    ready();
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(2);
+    expect(scope.dshProcessAttestation.identity).toEqual(identity);
+    expect(scope.send.mock.calls.at(-1)[0]).toMatchObject({ enginePid: 60, engineProcStart: '600' });
+    // The initial ready edge published the snapshot once. Recovery adds only
+    // local_process_attestation, never another managed-turn origin/snapshot.
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+    expect(scope.send.mock.calls.every(([message]) => message.type === 'local_process_attestation')).toBe(true);
+    expect(scope.dshProcessAttestation.retryTimer).toBeUndefined();
+  });
+
+  it('does not rescan or rotate a frozen identity after time advances', async () => {
+    vi.useFakeTimers();
+    const { scope, ready } = fixture();
+    ready();
+    scope.captureDshProcessIdentity.mockReturnValue({ ...identity, enginePid: 99, engineProcStart: '990' });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(1);
+    expect(scope.dshProcessAttestation.identity).toEqual(identity);
+    expect(scope.send).toHaveBeenCalledTimes(1);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds unsuccessful retries within the CLI generation', async () => {
+    vi.useFakeTimers();
+    const { scope, ready } = fixture();
+    scope.captureDshProcessIdentity.mockReturnValue(undefined);
+    ready();
+    await vi.advanceTimersByTimeAsync(60_000);
+    const calls = scope.captureDshProcessIdentity.mock.calls.length;
+    const sends = scope.send.mock.calls.length;
+    expect(calls).toBeGreaterThan(1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(calls);
+    expect(scope.send).toHaveBeenCalledTimes(sends);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run a pending retry after the CLI generation changes but before the old proof is replaced', async () => {
+    vi.useFakeTimers();
+    const { scope, ready } = fixture();
+    scope.captureDshProcessIdentity.mockReturnValue(undefined);
+    ready();
+    // The real spawn window advances generation before it replaces the old
+    // proof. Keep that object here so the generation guard is tested on its own.
+    scope.cliSpawnGeneration++;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(1);
+    expect(scope.send).toHaveBeenCalledTimes(1);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run a pending retry after the old proof object is cleared', async () => {
+    vi.useFakeTimers();
+    const { scope, ready } = fixture();
+    scope.captureDshProcessIdentity.mockReturnValue(undefined);
+    ready();
+    scope.dshProcessAttestation = undefined;
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(1);
+    expect(scope.send).toHaveBeenCalledTimes(1);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
   });
 
   it.each(['enginePid', 'engineProcStart', 'runnerPid', 'runnerProcStart'])('cannot replace a frozen %s within the generation', key => {

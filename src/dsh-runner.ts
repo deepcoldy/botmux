@@ -403,6 +403,9 @@ class DshJsonRpcClient {
 
   start(): void {
     this.attestationFd = createDshProcessAttestationFd();
+    if (process.platform === 'linux' && this.attestationFd === undefined) {
+      output.error('[dsh] engine attestation unavailable; continuing without an engine root\n');
+    }
     try {
       this.child = spawn(this.dshBin, this.launchArgs, {
         env: this.env,

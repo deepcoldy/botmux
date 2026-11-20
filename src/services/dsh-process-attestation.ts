@@ -17,20 +17,30 @@ export interface DshProcessIdentity {
  * Other platforms retain their existing behavior without a weaker proof. */
 export function createDshProcessAttestationFd(): number | undefined {
   if (process.platform !== 'linux') return undefined;
-  const dir = mkdtempSync(join(tmpdir(), 'botmux-dsh-attestation-'));
-  const path = join(dir, 'proof');
+  let dir: string | undefined;
+  let path: string | undefined;
   let fd: number | undefined;
   try {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-dsh-attestation-'));
+    path = join(dir, 'proof');
     fd = openSync(path, 'wx+', 0o600);
     if (!fstatSync(fd).isFile()) throw new Error('Invalid DSH attestation fd');
     unlinkSync(path);
     return fd;
-  } catch (error) {
-    if (fd !== undefined) closeSync(fd);
-    throw error;
+  } catch {
+    // Attestation is additive: without a proof the engine gets no extra trust,
+    // but the pre-attestation SDK launch must remain available.
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best-effort cleanup after setup failure */ }
+    }
+    return undefined;
   } finally {
-    try { unlinkSync(path); } catch { /* already unlinked */ }
-    rmdirSync(dir);
+    if (path) {
+      try { unlinkSync(path); } catch { /* already unlinked or setup failed */ }
+    }
+    if (dir) {
+      try { rmdirSync(dir); } catch { /* already removed or setup failed */ }
+    }
   }
 }
 
@@ -125,10 +135,11 @@ export function captureDshProcessIdentity(
       const engineStat = processStat(enginePid, procRoot);
       if (!engineStat || engineStat.parent !== runnerPid) continue;
       try {
-        const exe = readlinkSync(join(procRoot, String(enginePid), 'exe'));
+        const exe = readlinkSync(join(procRoot, String(enginePid), 'exe')).replace(/ \(deleted\)$/, '');
         const engineArgs = argv(enginePid, procRoot);
         const native = exe === dshBin && equalArgs(engineArgs.slice(1), launchArgs);
-        const node = basename(exe) === 'node' && equalArgs(engineArgs.slice(1), [dshBin, ...launchArgs]);
+        const node = ['node', 'nodejs'].includes(basename(exe))
+          && equalArgs(engineArgs.slice(1), [dshBin, ...launchArgs]);
         if (!native && !node) continue;
         const fdPath = join(procRoot, String(enginePid), 'fd', '3');
         if (!/\/botmux-dsh-attestation-[^/]+\/proof \(deleted\)$/.test(readlinkSync(fdPath))) continue;

@@ -4,13 +4,13 @@ DSH SDK 使用两层进程：Botmux runner 桥接终端和 JSON-RPC，Node DSH �
 
 ## 身份证明
 
-Linux runner 在启动实际 RPC 子进程前创建一个权限为 0600 的文件，打开后立即删除路径，将打开的描述符作为 fd 3 传给子进程，并保留自己的描述符直到子进程退出。模型发现用的 `--dump-config` 进程不获得该描述符。没有新增环境变量或持久密钥。
+Linux runner 在启动实际 RPC 子进程前创建一个权限为 0600 的文件，打开后立即删除路径，将打开的描述符作为 fd 3 传给子进程，并保留自己的描述符直到子进程退出。模型发现用的 `--dump-config` 进程不获得该描述符。没有新增环境变量或持久密钥。临时目录不可用或创建中途失败时，已打开的描述符会关闭，runner 仅放弃本次引擎身份并让 fd 3 使用 `ignore`，不阻断修复前可用的 SDK 启动与回合。
 
-worker 从已登记 backend PID 的内核血缘中寻找唯一匹配的 runner，核对实际 executable、源码或编译版入口以及 session/bin/profile/patch 契约。runner 的直接 DSH 子进程还必须匹配实际启动参数、拥有 RPC stdin/stdout，以及与 runner 持有相同设备号和 inode 的已删除文件描述符。登记前再次核对 PID 出生时间和 engine 到 backend 的完整祖先链。
+worker 从已登记 backend PID 的内核血缘中寻找唯一匹配的 runner，核对实际 executable、源码或编译版入口以及 session/bin/profile/patch 契约。runner 的直接 DSH 子进程还必须匹配实际启动参数、拥有 RPC stdin/stdout，以及与 runner 持有相同设备号和 inode 的已删除文件描述符。Node 引擎接受内核可执行名 `node` / `nodejs`；runner 与引擎的 exe 都归一化 procfs 的 ` (deleted)` 后缀，因此原位替换磁盘镜像不会让同一存活进程失去 warm reattach 身份。登记前再次核对 PID 出生时间和 engine 到 backend 的完整祖先链。
 
-`process_ready` OSC 仅触发内核查询，其 payload 不参与身份决策。runner 在 initialize 完成后、可见 prompt 之前发送该提示；初次登记将 `enginePid/engineProcStart` 经既有 worker IPC 传入 daemon，并在当前轮快照前完成登记。重复 marker 不重新发布身份或当前轮快照。
+`process_ready` OSC 仅触发内核查询，其 payload 不参与身份决策。runner 在 initialize 完成后、可见 prompt 之前发送该提示；初次登记将 `enginePid/engineProcStart` 经既有 worker IPC 传入 daemon，并在当前轮快照前完成登记。若这次瞬时核证失败，worker 做有界重试；重试只补发 `local_process_attestation`，不轮换 relay token，也不重新发布 `managed_turn_origin` 或重拍当前轮 `preexistingProcessIdentities`。runner 根进程本身已经覆盖引擎的血缘快照，因此迟到的引擎根登记不需要改变原快照。重复 marker 或重试都不在身份已冻结后重新发布当前轮快照。
 
-证明在 CLI generation 内冻结。generation 变化、内核身份变化、证据缺失或多个候选都不授予新引擎身份。`killCli` 清除缓存；worker-pool 的既有 generation 检查和进程出生时间检查继续生效。无需修改 daemon 的 `MainThread` 判定，也不改变群路由配置或操作者权限。
+证明在 CLI generation 内冻结。generation 变化、内核身份变化、证据缺失或多个候选都不授予新引擎身份。重试 timer 同时绑定 proof 对象与 generation，成功后取消，`killCli` 与新的 spawn 初始化也会清理旧 timer；旧代际回调不能写入新代际状态。`killCli` 清除缓存；worker-pool 的既有 generation 检查和进程出生时间检查继续生效。无需修改 daemon 的 `MainThread` 判定，也不改变群路由配置或操作者权限。
 
 ## 恢复与适用范围
 
