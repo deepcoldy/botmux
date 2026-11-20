@@ -64,7 +64,8 @@ function accessTurns<Result>(
   if (write) mkdirSync(join(dataDir, 'session-turns'), { recursive: true, mode: 0o700 });
   const db = openDatabaseSyncOrThrow(databasePath(dataDir), { readOnly: !write });
   try {
-    db.exec('PRAGMA busy_timeout = 500');
+    db.exec('PRAGMA busy_timeout = 3000');
+    if (write) db.exec('PRAGMA journal_mode = WAL');
     if (write) db.exec('PRAGMA secure_delete = ON');
     if (write) db.exec(`
       CREATE TABLE IF NOT EXISTS events (

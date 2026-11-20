@@ -2986,7 +2986,11 @@ export function reactivateClosedSession(
   next.mojoCloseJournal = undefined;
   next.tokenUsage = undefined;
 
-  resumeSessionTurns(config.session.dataDir, sessionId);
+  try {
+    resumeSessionTurns(config.session.dataDir, sessionId);
+  } catch {
+    logger.warn('Failed to reset structured session turns on reactivation');
+  }
   commitContractLifecycle(session, 'resume', () => persistRow(next));
   const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
   Object.assign(session, next, committed ? JSON.parse(committed.row) : {});

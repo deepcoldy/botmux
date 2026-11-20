@@ -15,6 +15,7 @@ import {
   stageSessionTurnInbound,
   updateSessionTurnNativeAnchor,
 } from '../src/services/session-turns.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { resolveDashboardRequestGate } from '../src/dashboard/request-identity.js';
 import { mergeQueuedCliInput, type PendingCliInput } from '../src/utils/pending-input-queue.js';
 
@@ -111,6 +112,16 @@ describe('structured session turns', () => {
     recordSessionTurnInput({ dataDir, sessionId, turnId: 'message-reopened', input: 'Reopened', cliId: 'codex' });
     expect(readSessionTurns(dataDir, sessionId, Number(late.next), 50).turns.map(turn => turn.turnId))
       .toEqual(['message-reopened']);
+  });
+
+  it('persists the store in WAL mode so concurrent readers never block writers', () => {
+    stage('message-wal');
+    const db = openDatabaseSyncOrThrow(join(dataDir, 'session-turns', 'turns.sqlite'), { readOnly: true });
+    try {
+      expect((db.prepare('PRAGMA journal_mode').get() as { journal_mode: string }).journal_mode).toBe('wal');
+    } finally {
+      db.close();
+    }
   });
 
   it('validates pagination inputs and requires the actual management token', () => {
