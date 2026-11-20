@@ -474,6 +474,7 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
+import { reconcileActiveAntigravityToken } from './services/antigravity-accounts.js';
 import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
@@ -31184,6 +31185,17 @@ async function spawnCliBody(
         mkdirSync(authorityDirectory, { mode: 0o700 });
       }
       hideDirectories.add(realpathSync(authorityDirectory));
+      const agyAccountsDir = join(root, 'antigravity-accounts');
+      try {
+        const agyStat = lstatSync(agyAccountsDir);
+        if (agyStat.isDirectory() && !agyStat.isSymbolicLink()) {
+          hideDirectories.add(realpathSync(agyAccountsDir));
+        } else {
+          hideFiles.add(agyAccountsDir);
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
       for (const name of readdirSync(root)) {
         if (name === DEVICE_AUTHORITY_DIRECTORY) continue;
         if (!isCredentialIsolationReservedBasename(name)
@@ -31532,6 +31544,28 @@ async function spawnCliBody(
     }
     const spawnBackend = backend;
     const spawnCliBin = cliAdapter.resolvedBin;
+    let spawnedAntigravityAccountReport: { accountId: string | null } | undefined;
+    if (cfg.cliId === 'antigravity' && !willReattachPersistent && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
+      try {
+        const reconciled = reconcileActiveAntigravityToken();
+        if (reconciled.managed) {
+          if (reconciled.error) {
+            log(`WARN antigravity token reconcile failed: ${reconciled.error}`);
+            spawnedAntigravityAccountReport = { accountId: null };
+          } else {
+            spawnedAntigravityAccountReport = { accountId: reconciled.activeId ?? null };
+            if (reconciled.advancedFrom) {
+              log(`Antigravity account pre-spawn advance: ${reconciled.advancedFrom} -> ${reconciled.activeId}`);
+            } else if (reconciled.restored) {
+              log(`Antigravity live token restored to active account ${reconciled.activeId}`);
+            }
+          }
+        }
+      } catch (err: any) {
+        log(`WARN antigravity token reconcile threw: ${err?.message ?? err}`);
+        spawnedAntigravityAccountReport = { accountId: null };
+      }
+    }
     spawnWithCodexModelLaunch({
       dataDir: config.session.dataDir, sessionId: cfg.sessionId, launch: nativeModelLaunch,
       reattached: () => 'isReattach' in spawnBackend && spawnBackend.isReattach === true,
@@ -31594,6 +31628,9 @@ async function spawnCliBody(
         });
       },
     });
+    if (spawnedAntigravityAccountReport && !('isReattach' in spawnBackend && spawnBackend.isReattach === true)) {
+      send({ type: 'antigravity_account', accountId: spawnedAntigravityAccountReport.accountId });
+    }
     if (!willReattachPersistent) {
       writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
       // Which configured environment this CLI really got (Dashboard marks a
@@ -39958,11 +39995,21 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
       });
       await restartCliProcess(
-        msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
-        // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
-        // FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
+        msg.updateWorkingDir
+          ? `cwd-move respawn → ${msg.updateWorkingDir}`
+          : msg.reason === 'account_rotation'
+            ? 'antigravity account rotation'
+            : 'daemon request',
+        // cwd-move / topicEffort / account_rotation 是主动运维/轮换迁移、不是崩溃恢复，
+        // 不计入 tier-2 强制 FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
         // auto-restart 那条裸 restart 的计数兜底。
-        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort, ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}) },
+        {
+          preservePending: true,
+          immediate: msg.reason === 'account_rotation',
+          skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort || msg.reason === 'account_rotation',
+          ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}),
+          ...(msg.reason === 'account_rotation' ? { restartCause: 'antigravity-account-rotation' as const } : {}),
+        },
       );
       break;
     }
