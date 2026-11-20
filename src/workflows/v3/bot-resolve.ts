@@ -100,6 +100,8 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),
     ...(bot.sandboxReadonlyPaths?.length ? { sandboxReadonlyPaths: [...bot.sandboxReadonlyPaths] } : {}),
     ...(bot.sandboxNetwork === false ? { sandboxNetwork: false } : {}),
+    ...((bot.sandbox === true || bot.sandbox === 'oncall') && bot.sandboxWithholdBotSecret === true
+      ? { sandboxWithholdBotSecret: true as const } : {}),
     ...(bot.sandboxNetworkPolicy ? { sandboxNetworkPolicy: structuredClone(bot.sandboxNetworkPolicy) } : {}),
     workingDir: botWorkingDir(bot, workingDirOverride),
   };
@@ -177,6 +179,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'sandboxReadonlyPaths',
     'sandboxNetwork',
     'sandboxNetworkPolicy',
+    'sandboxWithholdBotSecret',
     'workingDir',
   ]);
   const snapshots = new Map<string, BotSnapshot>();
@@ -186,6 +189,9 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     }
     const obj = value as Record<string, unknown>;
     if (obj.envPolicy !== undefined) normalizeEnvPolicy(obj.envPolicy);
+    if (obj.sandboxWithholdBotSecret !== undefined && obj.sandboxWithholdBotSecret !== true) {
+      throw new Error(`bots.snapshot.json[${JSON.stringify(key)}].sandboxWithholdBotSecret must be true when present`);
+    }
     const extra = Object.keys(obj).filter((field) => !allowed.has(field));
     if (extra.length > 0) {
       throw new Error(`bots.snapshot.json[${JSON.stringify(key)}] has unsupported key(s): ${extra.join(', ')}`);
@@ -282,6 +288,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.sandboxReadonlyPaths !== undefined ? { sandboxReadonlyPaths: [...obj.sandboxReadonlyPaths as string[]] } : {}),
       ...(obj.sandboxNetwork !== undefined ? { sandboxNetwork: obj.sandboxNetwork as boolean } : {}),
       ...(obj.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(obj.sandboxNetworkPolicy) } : {}),
+      ...(obj.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true as const } : {}),
       workingDir: obj.workingDir,
     });
   }

@@ -2213,6 +2213,11 @@ export function startOutboxWatcher(
     if (!turnId) { finish(id, reqPath, name, [], 2, '', 'relay rejected: session tools need a live turn'); return; }
     try {
       const { runRemoteRunnerSessionTool } = await import('../../services/remote-runner-session-tool.js');
+      // Relayed `quoted` downloads land in a host-private sibling of the outbox,
+      // never in the shared attachments bucket the sandbox can write to (where a
+      // pre-planted symlink could redirect the host's write). Only bytes go back.
+      const attachmentsRoot = join(dirname(outbox), 'relay-attachments');
+      mkdirSync(attachmentsRoot, { recursive: true, mode: 0o700 });
       const result = await runRemoteRunnerSessionTool(v.value.request, {
         sessionId,
         turnId,
@@ -2220,7 +2225,7 @@ export function startOutboxWatcher(
         ...(authorization.origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: authorization.origin.dispatchAttempt }
           : {}),
-        env: baseEnv,
+        env: { ...baseEnv, BOTMUX_ATTACHMENTS_ROOT: attachmentsRoot },
         ...(opts.cliPath ? { cliPath: opts.cliPath } : {}),
         maxAttachmentBytes: RELAY_SESSION_TOOL_ATTACHMENT_BYTES,
       });

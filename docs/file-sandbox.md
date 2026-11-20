@@ -276,8 +276,17 @@ worker spawnCli
   `{command:'session-tool', tool:<RemoteRunnerSessionToolRequest>, originCapability}`。watcher 用
   remote-runner 同一份校验（`normalizeRemoteRunnerSessionToolRequest`，只放行 history / quoted），
   经 `authorize` 拿到本轮 turn，再走 `runRemoteRunnerSessionTool` 在宿主执行：session-id 由宿主
-  指定，`quoted` 带 `--remote-runner-session-tool`（消息不在本会话的群里就拒绝）。附件以 base64
-  随 `res.json` 返回（上限 32MB），沙盒侧用 O_EXCL 写进 outbox 下的子目录并替换占位路径。
+  指定，`quoted` 带 `--remote-runner-session-tool`（消息不在本会话的群里就拒绝）。宿主执行 `quoted`
+  时把 `BOTMUX_ATTACHMENTS_ROOT` 指到 `sandboxes/<会话>/relay-attachments`（沙盒不可达），下载不进
+  沙盒可写的共享附件桶；打包时按已校验的 inode 读（O_NOFOLLOW）。附件以 base64 随 `res.json` 返回
+  （上限 32MB），沙盒侧用 O_EXCL 写进 outbox 下的子目录并替换占位路径。
+- 只有服务 session tool 的 watcher 才在 outbox 写 `.botmux-session-tools` 标记；沙盒侧见到标记才走
+  中转，仅凭据隔离的会话与未开开关的 bot 保持原路径。
+- 其余凭证通道一并关闭：本 bot 的 lark-cli 密钥库（appsecret 密文 + master key）不再放行；
+  `/api/sessions/<sid>/lark-tool-identity` 对 `mode: 'bot'` 返回 403（`--as user` 不受影响）。
+- outbox 与附件桶对沙盒可写，宿主往里写都不跟随软链：`res.json` 用 `followTargetSymlink: false`，
+  附件下载写临时文件后 rename，并在 rename 前复核目录 inode 未被换成软链。
+- 开关随会话冻结，fork / 干净恢复、多人分道（principal lane）、v3 工作流 bot 快照都带着它。
 
 **沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
 

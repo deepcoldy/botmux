@@ -6,7 +6,7 @@
  * Run: npx vitest run --project unit test/lark-resource-download-symlink.test.ts
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
@@ -41,6 +41,27 @@ describe('downloadMessageResource symlink safety', () => {
     expect(readFileSync(victim, 'utf8')).toBe('HOST');
     expect(lstatSync(join(dir, 'a.js')).isSymbolicLink()).toBe(false);
     expect(readFileSync(join(dir, 'a.js'), 'utf8')).toBe('NEW');
+  });
+
+  it('does not rename into a directory swapped for a symlink after the pre-check (SDK writeFile body)', async () => {
+    const hostDir = join(root, 'host-dist');
+    mkdirSync(hostDir);
+    writeFileSync(join(hostDir, 'cli.js'), 'HOST');
+    const dir = join(root, 'om_z');
+    mkdirSync(dir);
+    // The Lark SDK hands back an object whose writeFile() opens the path itself.
+    // Swapping the directory right before that open is the exact window the
+    // network wait leaves open to another process.
+    mocks.request.mockResolvedValueOnce({
+      writeFile: async (tmp: string) => {
+        renameSync(dir, `${dir}.moved`);
+        symlinkSync(hostDir, dir);
+        writeFileSync(tmp, 'EVIL', { flag: 'wx' });
+      },
+    });
+    await expect(downloadMessageResource('cli_test', 'om_z', 'file_k', 'file', join(dir, 'cli.js'))).rejects.toThrow();
+    expect(readFileSync(join(hostDir, 'cli.js'), 'utf8')).toBe('HOST');
+    expect(readdirSync(hostDir)).toEqual(['cli.js']);
   });
 
   it('refuses a symlinked message directory', async () => {

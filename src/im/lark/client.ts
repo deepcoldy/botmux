@@ -2092,9 +2092,18 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
 /** Write to a fresh sibling file, then rename it over `savePath`: a symlink
  *  already sitting at `savePath` is replaced, never written through. */
 async function writeViaRename(savePath: string, write: (tmp: string) => Promise<void>): Promise<void> {
+  const dir = dirname(savePath);
+  const before = lstatSync(dir);
+  if (before.isSymbolicLink() || !before.isDirectory()) throw new Error(`Refusing to download into a non-directory: ${dir}`);
   const tmp = `${savePath}.${process.pid}.${randomBytes(4).toString('hex')}.part`;
   try {
     await write(tmp);
+    // The download awaited the network; the directory may have been swapped
+    // for a symlink meanwhile. Rename only into the directory we checked.
+    const after = lstatSync(dir);
+    if (after.isSymbolicLink() || !after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) {
+      throw new Error(`Download directory changed while writing: ${dir}`);
+    }
     renameSync(tmp, savePath);
   } catch (err) {
     try { unlinkSync(tmp); } catch { /* not created */ }

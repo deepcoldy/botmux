@@ -321,7 +321,7 @@ Linux 上，沙盒里的 CLI 调 `botmux send` 发文字、卡片、图片或附
 - `botmux send`、`botmux dispatch`、`botmux history`、`botmux quoted` 都写进会话中转目录，由 daemon 在沙盒外执行。macOS 也因此用上和 Linux 一样的中转；
 - daemon 执行 `history` 时固定读本会话；执行 `quoted` 时，被引用的消息必须在本会话所在的群里，否则拒绝。引用消息里的图片和文件由 daemon 下载后传回，放在会话中转目录里；
 - 经中转的 `history` 只支持 `--limit`（最多 100）、`--scope`、`--with-card-json`；`quoted` 一次只读一条，支持 `--raw`。其它选项会直接报错；
-- 其它需要在沙盒里直连飞书的命令（例如 `botmux bots list`）会失败。
+- 会话里 `lark-cli` 的 Bot 身份（默认身份和 `--as bot`）不可用，`--as user` 照常；其它需要在沙盒里直连飞书的命令（例如 `botmux bots list`）会失败。
 
 只对白名单隔离（`oncall`）生效，scratch 沙盒不受影响。和其它沙盒选项一样，在会话创建时定下来，改了之后对新会话生效。
 

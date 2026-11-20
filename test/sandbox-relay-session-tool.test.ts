@@ -15,6 +15,7 @@ import { join } from 'node:path';
 import { RELAY_SESSION_TOOLS_MARKER, startOutboxWatcher, validateRelaySessionToolRequest } from '../src/adapters/backend/sandbox.js';
 import { accessForPath, buildFsPolicy, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
 import { buildRelaySessionToolRequest, materializeRelayedAttachments } from '../src/cli/relay-session-tool.js';
+import { readVerifiedFile } from '../src/services/remote-runner-session-tool.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
@@ -73,6 +74,17 @@ describe('fs-policy: withholdSendCredential', () => {
     const p = buildFsPolicy(ctx({ outbox, withholdSendCredential: true }));
     expect(accessForPath(p.rules, `${outbox}/x.req.json`).access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sandboxes/other/outbox/x.req.json').access).not.toBe('readWrite');
+    // The host-private download root for relayed quoted sits next to the outbox
+    // and must stay out of reach on both platforms.
+    for (const platform of ['darwin', 'linux'] as const) {
+      const home = platform === 'darwin' ? '/Users/u' : '/home/u';
+      const pp = buildFsPolicy(ctx({ platform, homeDir: home, botmuxHome: `${home}/.botmux`, sessionDataDir: `${home}/.botmux/data`,
+        workingDir: `${home}/proj`, botHome: `${home}/.botmux/bots/cli_self`,
+        outbox: `${home}/.botmux/data/sandboxes/s/outbox`, withholdSendCredential: true }));
+      const a = accessForPath(pp.rules, `${home}/.botmux/data/sandboxes/s/relay-attachments/cli_self/om_x/a.png`).access;
+      expect(a, platform).not.toBe('readWrite');
+      expect(a, platform).not.toBe('readOnly');
+    }
   });
 });
 
@@ -103,7 +115,7 @@ describe('outbox watcher: session-tool requests', () => {
     const outbox = join(root, 'outbox');
     mkdirSync(outbox);
     const fixture = join(root, 'echo.mjs');
-    writeFileSync(fixture, `process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), relay: process.env.BOTMUX_HOST_RELAY_AUTHORIZED, turn: process.env.BOTMUX_TURN_ID, chat: process.env.BOTMUX_CHAT_ID }));`);
+    writeFileSync(fixture, `process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), relay: process.env.BOTMUX_HOST_RELAY_AUTHORIZED, turn: process.env.BOTMUX_TURN_ID, chat: process.env.BOTMUX_CHAT_ID, attachmentsRoot: process.env.BOTMUX_ATTACHMENTS_ROOT }));`);
     return { outbox, fixture };
   };
   const readRes = async (outbox: string, id: string) => {
@@ -125,7 +137,10 @@ describe('outbox watcher: session-tool requests', () => {
       expect(JSON.parse(res.stdout)).toEqual({
         argv: ['history', '--limit', '5', '--session-id', 'forced-sid'],
         relay: '1', turn: 'om_turn', chat: 'oc_chat',
+        // host-private sibling of the outbox, not the sandbox-writable bucket
+        attachmentsRoot: join(outbox, '..', 'relay-attachments').replace('/outbox/..', ''),
       });
+      expect(existsSync(join(outbox, '..', 'relay-attachments'))).toBe(true);
     } finally { stop(); }
   });
 
@@ -203,6 +218,24 @@ describe('buildRelaySessionToolRequest', () => {
     ['quoted', []],
   ] as const)('refuses %s %j', (tool, args) => {
     expect(buildRelaySessionToolRequest(tool, [...args], 'sid').ok).toBe(false);
+  });
+});
+
+describe('readVerifiedFile (host packaging of quoted attachments)', () => {
+  it('reads the validated inode and refuses a path swapped for a symlink or another file', () => {
+    const dir = tmp('botmux-verified-read-');
+    const good = join(dir, 'a.png');
+    writeFileSync(good, 'GOOD');
+    const info = lstatSync(good);
+    expect(readVerifiedFile(good, info).toString()).toBe('GOOD');
+    // swapped for a symlink to the withheld credential
+    const secret = join(dir, 'send-cred.json');
+    writeFileSync(secret, 'SECRET');
+    rmSync(good); symlinkSync(secret, good);
+    expect(() => readVerifiedFile(good, info)).toThrow();
+    // swapped for a different regular file (hard copy, new inode)
+    rmSync(good); writeFileSync(good, 'SECRET');
+    expect(() => readVerifiedFile(good, info)).toThrow();
   });
 });
 
