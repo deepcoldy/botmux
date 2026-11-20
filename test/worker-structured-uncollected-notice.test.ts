@@ -31,6 +31,14 @@ function harness(dropped: CodexPendingTurn[], readiness: Readiness = { isPromptR
     lastInitConfig: { adoptMode: false },
     // Stand-in: that the blocker cap is used matters here, not its value.
     STARTUP_BLOCKER_HOLD_MAX_MS: 'startup-blocker-cap',
+    // No CLI process had its fd table refused, no transcript bound yet.
+    codexBridgeRolloutPath: undefined,
+    structuredBridgeIs: (id: string) => id === 'traex',
+    currentTraexObservedPid: () => 4242,
+    currentCodexObservedPid: () => undefined,
+    backend: { cliPid: 4241, getChildPid: () => 4240 },
+    processOpenFilesDenial: vi.fn(() => undefined),
+    setuidRootBwrap: vi.fn(() => undefined),
     ...readiness,
     emitReadyCodexTurns: vi.fn(),
     pruneExpiredPreStartHeadsAndEmit: (_queue: unknown, _emit: unknown, _now: unknown,
@@ -54,7 +62,8 @@ function harness(dropped: CodexPendingTurn[], readiness: Readiness = { isPromptR
     log: vi.fn(),
     send: vi.fn(),
     t: (key: string, vars?: Record<string, string>) => (vars
-      ? `${key}|${vars.cliName}${vars.blocker ? `|${vars.blocker}` : ''}${vars.to ? `|${vars.from}→${vars.to}` : ''}`
+      ? [key, vars.cliName, vars.blocker, vars.to ? `${vars.from}→${vars.to}` : undefined,
+        vars.pid ? `pid=${vars.pid}` : undefined, vars.code, vars.hint, vars.path].filter(Boolean).join('|')
       : key),
     cliName: () => 'Pi',
     uncollectedTurnsNeedingNotice,
@@ -72,6 +81,7 @@ function harness(dropped: CodexPendingTurn[], readiness: Readiness = { isPromptR
   scope.startupBlockerVisibleNow = loadWorkerFunction('startupBlockerVisibleNow', scope);
   scope.startupUpgradeHint = loadWorkerFunction('startupUpgradeHint', scope);
   scope.startupBlockerLabel = loadWorkerFunction('startupBlockerLabel', scope);
+  scope.uncollectedTranscriptFdDenial = loadWorkerFunction('uncollectedTranscriptFdDenial', scope);
   scope.uncollectedStructuredTurnNotice = loadWorkerFunction('uncollectedStructuredTurnNotice', scope);
   scope.holdStructuredStartLeasesWhileCliStarting = loadWorkerFunction('holdStructuredStartLeasesWhileCliStarting', scope);
   scope.notifyUncollectedStructuredTurns = loadWorkerFunction('notifyUncollectedStructuredTurns', scope);
@@ -154,6 +164,46 @@ describe('worker: expired structured heads', () => {
     later.prune('structured bridge tick');
     expect(later.scope.send.mock.calls.filter(([msg]: [any]) => msg.type === 'user_notify').map(([msg]: [any]) => msg.message)).toEqual(['worker.structured_turn_not_collected|Pi']);
     expect(later.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).not.toHaveBeenCalled();
+  });
+
+  describe('when procfs refused the CLI process its open files', () => {
+    const refusedFor = (pid: number) => vi.fn((asked: number) => (asked === pid
+      ? { code: 'EACCES', stage: 'readlink', atMs: 1 }
+      : undefined));
+    const notices = (scope: Record<string, any>) => scope.send.mock.calls
+      .filter(([msg]: [any]) => msg.type === 'user_notify').map(([msg]: [any]) => msg.message);
+
+    it('says permission was denied, naming the process and a setuid bwrap behind it', () => {
+      const { scope, prune } = harness([{ turnId: 'om_ordinary', started: false }], {
+        isPromptReady: true,
+        processOpenFilesDenial: refusedFor(4242),
+        setuidRootBwrap: () => '/usr/bin/bwrap',
+      } as Readiness);
+      prune('structured bridge tick');
+      expect(notices(scope)).toEqual([
+        'worker.structured_turn_not_collected_fd_denied|Pi|pid=4242|EACCES|worker.fd_denied_setuid_bwrap_hint|/usr/bin/bwrap',
+      ]);
+    });
+
+    it('still says permission denied without a setuid bwrap, just without that cause', () => {
+      const { scope, prune } = harness([{ turnId: 'om_ordinary', started: false }], {
+        isPromptReady: true,
+        processOpenFilesDenial: refusedFor(4241),
+      } as Readiness);
+      prune('structured bridge tick');
+      expect(notices(scope)).toEqual(['worker.structured_turn_not_collected_fd_denied|Pi|pid=4241|EACCES']);
+    });
+
+    it('keeps the transcript wording once a transcript was located anyway', () => {
+      const { scope, prune } = harness([{ turnId: 'om_ordinary', started: false }], {
+        isPromptReady: true,
+        processOpenFilesDenial: refusedFor(4242),
+        setuidRootBwrap: () => '/usr/bin/bwrap',
+        codexBridgeRolloutPath: '/home/u/.trae/cli/sessions/2026/11/20/rollout-x.jsonl',
+      } as Readiness);
+      prune('structured bridge tick');
+      expect(notices(scope)).toEqual(['worker.structured_turn_not_collected|Pi']);
+    });
   });
 
   it('stays quiet when nothing expired', () => {
