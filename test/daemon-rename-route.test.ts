@@ -247,6 +247,7 @@ import {
   reserveQueuedActivationTailAdmission,
 } from '../src/core/worker-pool.js';
 import { __testOnly_resetSessionTurnQueues, runSessionTurn } from '../src/core/session-turn-queue.js';
+import { readSessionTurns, recordSessionTurnInput, stageSessionTurnInbound } from '../src/services/session-turns.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
@@ -3101,7 +3102,16 @@ describe('/rename production routing — must not pre-create a session (review P
     ds.pendingCodexAppFollowUpContexts = bufs.map(() => '');
     // Every buffered message was clean-input-accepted (all true) — must NOT leak
     // into a steer authorization at any layer.
-    ds.pendingCodexAppFollowUpGateAccepted = [...gates];
+    ds.pendingCodexAppFollowUpGateAccepted = [...gates]
+
+    // Read model: stage the inbound rows the real daemon writes on admission,
+    // BEFORE the coalesced release merges them into the last attributed turn.
+    for (const [i, tid] of turnIds.entries()) {
+      stageSessionTurnInbound(config.session.dataDir, ds.session.sessionId, tid, {
+        via: 'trigger', messageId: tid, text: bufs[i]!,
+        placement: { kind: 'thread', rootMessageId: anchor },
+      });
+    }
 
     await expect(releaseQueuedActivationReservation(ds)).resolves.toBe(true);
 
@@ -3126,6 +3136,21 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(msg.content).toContain('BUFFERED_ONE');
     if (bufs.length > 1) expect(msg.content).toContain('BUFFERED_TWO');
     expect(msg.codexAppSteerable).toBeUndefined();
+
+    // Replay the worker's default resolution (no explicit source ids) against
+    // the last attributed turnId: the release must have merged every buffered
+    // message's staged inbound into that turn.
+    const targetTurnId = turnIds.at(-1)!;
+    recordSessionTurnInput({
+      dataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      turnId: targetTurnId,
+      input: bufs.join('\n\n'),
+      cliId: 'codex',
+    });
+    const turnsPage = readSessionTurns(config.session.dataDir, ds.session.sessionId, 0, 50);
+    expect(turnsPage.turns.find(turn => turn.turnId === targetTurnId)?.inbound.map(m => m.text))
+      .toEqual(bufs);
   });
 
   it('routes Codex /fast verbatim to a live session but never cold-starts one', async () => {

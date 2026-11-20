@@ -163,7 +163,7 @@ function pruneSessionEvents(
     GROUP BY turn_id
     ORDER BY last_seq ASC
   `).all(sessionId) as TurnRetentionSummary[];
-  if (turns.length <= 1) return;
+  if (turns.length === 0) return;
 
   const newestTurnId = turns.at(-1)?.turn_id;
   const isProtected = (turnId: string): boolean => turnId === protectedTurnId || turnId === newestTurnId;
@@ -201,15 +201,56 @@ function pruneSessionEvents(
     }
   }
 
-  if (!evict.size) return;
-  const deleteEvents = db.prepare('DELETE FROM events WHERE session_id = ? AND turn_id = ?');
-  const deletePendingInbound = db.prepare('DELETE FROM pending_inbound WHERE session_id = ? AND turn_id = ?');
-  const deletePendingNative = db.prepare('DELETE FROM pending_native WHERE session_id = ? AND turn_id = ?');
-  for (const turnId of evict) {
-    deleteEvents.run(sessionId, turnId);
-    deletePendingInbound.run(sessionId, turnId);
-    deletePendingNative.run(sessionId, turnId);
+  if (evict.size) {
+    const deleteEvents = db.prepare('DELETE FROM events WHERE session_id = ? AND turn_id = ?');
+    const deletePendingInbound = db.prepare('DELETE FROM pending_inbound WHERE session_id = ? AND turn_id = ?');
+    const deletePendingNative = db.prepare('DELETE FROM pending_native WHERE session_id = ? AND turn_id = ?');
+    for (const turnId of evict) {
+      deleteEvents.run(sessionId, turnId);
+      deletePendingInbound.run(sessionId, turnId);
+      deletePendingNative.run(sessionId, turnId);
+    }
   }
+
+  // 第四阶段：保护中的当前/最新轮次不能整轮淘汰。单轮次会话（或所有旧轮次
+  // 清完后）若仍超上限，在轮内裁剪：先删被取代的旧 anchor，再删较早的
+  // progress 回执，最后才动其他旧回执。input 事件、最新 anchor 与最新回执
+  // 始终保留——input 本身超上限时以此为底线，不删用户消息。
+  let currentCount = (db.prepare('SELECT COUNT(*) AS count FROM events WHERE session_id = ?')
+    .get(sessionId) as { count: number }).count;
+  if (currentCount > maxEvents) {
+    const protectedIds = [...new Set([protectedTurnId, newestTurnId].filter(
+      (id): id is string => !!id && !evict.has(id),
+    ))];
+    for (const turnId of protectedIds) {
+      if (currentCount <= maxEvents) break;
+      currentCount -= trimTurnEvents(db, sessionId, turnId, currentCount - maxEvents);
+    }
+  }
+}
+
+/** Deletes at most `need` trim-eligible events inside one turn; returns how
+ *  many were actually removed. Never touches `input:` events. */
+function trimTurnEvents(db: DatabaseSyncLike, sessionId: string, turnId: string, need: number): number {
+  if (need <= 0) return 0;
+  const rows = db.prepare('SELECT event_key, seq FROM events WHERE session_id = ? AND turn_id = ? ORDER BY seq ASC')
+    .all(sessionId, turnId) as { event_key: string; seq: number }[];
+  const anchorSeqs = rows.filter(row => row.event_key.startsWith('anchor:')).map(row => row.seq);
+  const latestAnchorSeq = anchorSeqs.length ? Math.max(...anchorSeqs) : undefined;
+  const replySeqs = rows.filter(row => row.event_key.startsWith('reply:')).map(row => row.seq);
+  const latestReplySeq = replySeqs.length ? Math.max(...replySeqs) : undefined;
+  const orderedCandidates: number[] = [
+    ...anchorSeqs.filter(seq => seq !== latestAnchorSeq),
+    ...replySeqs.filter(seq => seq !== latestReplySeq && rows.find(row => row.seq === seq)?.event_key.startsWith('reply:progress:')),
+    ...replySeqs.filter(seq => seq !== latestReplySeq
+      && !rows.find(row => row.seq === seq)?.event_key.startsWith('reply:progress:')),
+  ];
+  const doomed = orderedCandidates.slice(0, need);
+  if (!doomed.length) return 0;
+  const placeholders = doomed.map(() => '?').join(',');
+  db.prepare(`DELETE FROM events WHERE session_id = ? AND turn_id = ? AND seq IN (${placeholders})`)
+    .run(sessionId, turnId, ...doomed);
+  return doomed.length;
 }
 
 export function projectLarkTurnInbound(

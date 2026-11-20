@@ -226,6 +226,27 @@ describe('structured session turns', () => {
     expect(Number(completedActive.next)).toBeGreaterThan(Number(afterT4.next));
   });
 
+  it('trims inside a single long-running turn so the hard cap still binds', () => {
+    const retention = { maxEventsPerSession: 4, eventTtlMs: 10 ** 12 };
+    stage('solo-turn');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'solo-turn', input: 'one', cliId: 'codex', at: 1000, retention });
+    for (const i of [1, 2, 3, 4, 5, 6]) {
+      recordSessionTurnReply(dataDir, sessionId, 'solo-turn',
+        { messageId: `p-${i}`, responseKind: 'progress', at: 1000 + i }, retention);
+    }
+    // A later native anchor supersedes the first one; only the newest survives.
+    updateSessionTurnNativeAnchor(dataDir, sessionId, 'solo-turn', 'native-s2', 'entry-2', retention);
+
+    const page = readSessionTurns(dataDir, sessionId, 0, 50);
+    expect(page.turns).toHaveLength(1);
+    const turn = page.turns[0]!;
+    // 1 input + the newest anchor + the 2 newest replies = exactly the cap.
+    expect(turn.inbound).toHaveLength(1);
+    expect(turn.anchor).toMatchObject({ cliSessionId: 'native-s2', cliEntryId: 'entry-2' });
+    expect(turn.replies.map(r => r.messageId)).toEqual(['p-5', 'p-6']);
+    expect(turn.inbound.length + 1 + turn.replies.length).toBe(4);
+  });
+
   it('prunes expired turns by TTL, bounds all-incomplete sessions, and preserves cursor monotonicity across close/reopen', () => {
     const retention = { maxEventsPerSession: 4, eventTtlMs: 10_000 };
 
