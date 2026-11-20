@@ -60,6 +60,8 @@ describe('dashboard resource row fields', () => {
         chatId: 'oc_1',
         rootMessageId: 'om_1',
         pid: 9876,
+        suspendedColdResume: true,
+        suspendReason: 'topic_recalled',
       },
       larkAppId: 'app',
       chatId: 'oc_1',
@@ -74,6 +76,11 @@ describe('dashboard resource row fields', () => {
     const row = composeRowFromActive(ds);
 
     expect(row).not.toHaveProperty('workerPid');
+    expect(row.status).toBe('dormant');
+    expect(row.suspendReason).toBe('topic_recalled');
+    expect(composeRowFromPersistedActive(ds.session).suspendReason).toBe('topic_recalled');
+    ds.session.suspendedColdResume = undefined;
+    expect(composeRowFromActive(ds).suspendReason).toBeUndefined();
   });
 
   it('does not add resource pid fields to closed rows', () => {

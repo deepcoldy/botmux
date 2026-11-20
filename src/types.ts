@@ -1250,6 +1250,8 @@ export interface Session {
    * skips redundant liveness probes. Cleared once a live worker is re-established.
    */
   suspendedColdResume?: boolean;
+  /** Last confirmed worker suspension; cleared on cold resume. */
+  suspendReason?: string;
   /** CLI used to spawn this session, frozen at creation so bot-level CLI edits only affect new sessions. */
   cliId?: import('./adapters/cli/types.js').CliId;
   /** Frozen at creation; absent on historical/adopted sessions means default. */

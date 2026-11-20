@@ -14872,6 +14872,36 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
 
 });
 
+describe('message recall lifecycle', () => {
+  let handlers: ReturnType<typeof makeHandlers> & { handleMessageRecalled: ReturnType<typeof vi.fn> };
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    handlers = { ...makeHandlers(), handleMessageRecalled: vi.fn(async () => {}) };
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it.each([false, true])('routes flat and wrapped recalls after ACK, independently of context sharing (wrapped=%s)', async wrapped => {
+    const event = { event_id: 'evt-recall-lifecycle', chat_id: 'oc_gone', message_id: 'om_root' };
+    const data = wrapped ? { event } : event;
+    await capturedHandlers['im.message.recalled_v1'](data);
+    expect(handlers.handleMessageRecalled).not.toHaveBeenCalled();
+    await flushEventWork();
+    expect(handlers.handleMessageRecalled).toHaveBeenCalledExactlyOnceWith('oc_gone', 'om_root', MY_APP_ID);
+    await capturedHandlers['im.message.recalled_v1'](data);
+    await flushEventWork();
+    expect(handlers.handleMessageRecalled).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([{ chat_id: 'oc_gone' }, { message_id: 'om_root' }, { chat_id: 'oc_gone', message_id: 1 }])('ignores incomplete recall identity: %j', async data => {
+    await capturedHandlers['im.message.recalled_v1'](data);
+    await flushEventWork();
+    expect(handlers.handleMessageRecalled).not.toHaveBeenCalled();
+  });
+});
+
 describe('chat gone: disbanded or bot removed', () => {
   let handlers: ReturnType<typeof makeHandlers> & { handleChatGone: ReturnType<typeof vi.fn> };
 

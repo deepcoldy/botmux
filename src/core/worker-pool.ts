@@ -12422,6 +12422,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   // probes. See sweepIdleWorkers + restoreActiveSessions.
   ds.hasHistory = true;
   ds.session.suspendedColdResume = true;
+  ds.session.suspendReason = reason;
   // P1-13：suspend 会销毁 CLI 与其子进程，那一代 dev server 随之消失（端口号交还
   // 内核）。会话本身还活着，所以不会走 close 路径——预览必须在这里同步失效，否则
   // 「休眠中」的会话卡片仍然挂着一条指向空端口/别人进程的预览入口。
@@ -12438,6 +12439,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
         sessionId: ds.session.sessionId,
         patch: {
           status: 'dormant',
+          suspendReason: reason,
           webPort: null,
           workerPid: null,
         },
@@ -19453,6 +19455,7 @@ function forkWorkerPrepared(
   // backing as a deliberate-missing (a genuine later zombie must still close).
   if (ds.session.suspendedColdResume) {
     ds.session.suspendedColdResume = undefined;
+    ds.session.suspendReason = undefined;
     sessionStore.updateSession(ds.session);
   }
 
@@ -22573,6 +22576,7 @@ function setupWorkerHandlers(
         // marker persists, preserving the cross-daemon-restart lazy-retry intent.
         if (ds.session.suspendedColdResume) {
           ds.session.suspendedColdResume = undefined;
+          ds.session.suspendReason = undefined;
           sessionStore.updateSession(ds.session);
         }
         if (ds.pendingRawInput && ds.worker && !ds.worker.killed) {
