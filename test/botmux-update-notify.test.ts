@@ -136,6 +136,31 @@ describe('botmux owner version reminders', () => {
     expect(deps.send).toHaveBeenCalledTimes(1);
     expect(recipient().lastNotifiedVersion).toBeUndefined(); expect(recipient().pending).toBeDefined();
   });
+  it('records the same-version uncertainty suspension in the log', async () => {
+    deps.writeState = (p, state) => {
+      const entry = Object.values(state.entries)[0];
+      if (entry.lastNotifiedVersion) throw new Error('disk full');
+      writeBotmuxUpdateNotifyState(p, state);
+    };
+    const c = controller(); await c.tick(); clock += BOTMUX_UPDATE_DEDUPE_MS;
+    await c.tick();
+    expect(deps.send).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(deps.log)).toHaveBeenCalledWith(expect.stringMatching(/suspended/i));
+  });
+  it('logs suspension when a version-source regression outlasts the dedupe cutoff', async () => {
+    let writes = 0;
+    deps.writeState = (p, state) => {
+      if (++writes === 2) throw new Error('disk full');
+      writeBotmuxUpdateNotifyState(p, state);
+    };
+    const c = controller(); await c.tick();
+    expect(deps.send).toHaveBeenCalledTimes(1);
+    clock += BOTMUX_UPDATE_DEDUPE_MS; latest = '1.0.5';
+    await c.tick();
+    expect(deps.send).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(deps.log)).toHaveBeenCalledWith(expect.stringMatching(/suspended/i));
+    expect(recipient().pending?.version).toBe('1.1.0');
+  });
   it('backs off thrown version lookup failures', async () => {
     deps.fetchLatest = vi.fn(async () => { throw new Error('network'); });
     const c = controller(); await c.tick(); await c.tick();

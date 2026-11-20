@@ -142,10 +142,14 @@ export function createBotmuxUpdateNotifier(deps: BotmuxUpdateNotifyDeps) {
         }
         state.nextCheckAt = now() + BOTMUX_UPDATE_CHECK_MS;
         // A mirror regression must not overwrite an unresolved newer delivery
-        // or discard its UUID. Retry the lookup within the dedupe window.
+        // or discard its UUID. Retry the lookup within the dedupe window; once
+        // the window has elapsed the suspension is logged like the same-version
+        // path instead of staying silent on every later tick.
         if (state.pending && isNewerVersion(state.pending.version, latest)) {
           if (now() - state.pending.createdAt < BOTMUX_UPDATE_DEDUPE_MS) {
             state.nextCheckAt = now() + BOTMUX_UPDATE_RETRY_MS;
+          } else {
+            deps.log?.(`delivery of v${state.pending.version} remains uncertain while the version source reports v${latest}; automatic retry suspended`);
           }
           write(path, ledger);
           return;
