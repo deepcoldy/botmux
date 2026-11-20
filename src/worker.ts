@@ -99,6 +99,7 @@ import {
   provenancePendingContent,
   provenancePendingNonce,
   sendCredFilePath,
+  writeSendCredFile,
   botHomePath,
   shouldRedirectCliData,
   buildCliExecutableReadCarveOuts,
@@ -28660,18 +28661,12 @@ async function spawnCliBody(
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR, cfg.larkAppId);
       mkdirSync(dirname(credPath), { recursive: true });
-      // sandboxWithholdBotSecret denies the exact file only; a sibling temp file
-      // in the readable BOT_HOME would expose the secret during (or after a
-      // crash before) the rename. BOT_HOME is shared by every session of the
-      // bot, so stage one level up for ALL of them; only a bot without the flag
-      // may fall back to the sibling when bots/ is on another filesystem.
-      const credJson = JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback });
-      try {
-        atomicWriteFileSync(credPath, credJson, { mode: 0o600, tmpDir: dirname(dirname(credPath)) });
-      } catch (e) {
-        if ((e as NodeJS.ErrnoException).code !== 'EXDEV' || cfg.sandboxWithholdBotSecret === true) throw e;
-        atomicWriteFileSync(credPath, credJson, { mode: 0o600 });
-      }
+      // In place on purpose (see writeSendCredFile): a rename would defeat the
+      // running Linux mask and leave a readable temp sibling in BOT_HOME.
+      writeSendCredFile(
+        credPath,
+        JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
+      );
     } catch (e) {
       log(`[sandbox] WARN could not write send-cred file: ${(e as Error).message}`);
     }

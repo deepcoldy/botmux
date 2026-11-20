@@ -292,18 +292,20 @@ worker spawnCli
   （实测 `(allow default)` 下可读）。开关打开时 Seatbelt 多发两条：`(deny process-info* (target others))`
   与 `(deny sysctl-read (sysctl-name-prefix "kern.procargs"))`——实测必须两条同时才拦得住，单独任一条仍可读；
   不能 deny 对自身的 process-info（会让运行时直接崩）。Linux 靠 PID namespace。
-- send-cred 两个写入点（worker 启动、feedback 配置改动）在开关打开时把原子写的临时文件放到
-  `bots/`（沙盒不可读）而不是 BOT_HOME 同级，避免 rename 前（或崩溃残留）被读到。
+- send-cred 两个写入点（worker 启动、feedback 配置改动）统一走 `writeSendCredFile`：**原地写、不换
+  inode、内容没变不写**。Linux 对该路径的 mask 挂在目录项上，temp+rename 会换成新 inode 让运行中的
+  pane 读到未遮罩的新文件；同级临时文件也会在 BOT_HOME 里短暂可读。
 - 附件文件名只取 basename，`..`/空名退回 file_key；Range 下载在 rename 前复核目录 inode；
   下载还要求目录 realpath 落在附件根下（`withinRoot`），防 `attachments/<appId>` 这一层被换成软链。
 - macOS 可写目录能被整个 rename 走（子文件从未被打开，文件级 deny 不触发），再从可写位置读回；
-  或换成软链让宿主写穿。开关打开时对 BOT_HOME 与 outbox 发 `(deny file-write-unlink (literal …))`
+  或换成软链让宿主写穿。开关打开时对 BOT_HOME、`attachments/<appId>` 与 outbox 发 `(deny file-write-unlink (literal …))`
   （实测拦住 mv/rmdir、目录内 mkdir/touch/rename 不受影响）；watcher 另记住启动时 outbox 的 inode，
   被换掉就不写 `res.json`。Linux 上这两处是 bind mount，本就不能 rename。
 - 判「这个 bot 的会话要不要扣密钥」统一走 `sandboxWithholdsBotSecret(botCfg)`（按 `resolveSandboxMode`
   含 env 强制后的实际沙盒档判），冻结、会议接收、工作流快照都用它。
-- send-cred 临时文件分流对该 bot 的**所有**会话生效（BOT_HOME 是 bot 共享的，不能按写入会话的开关判）；
-  只有未开开关的 bot 在 `bots/` 跨文件系统（EXDEV）时才退回同级临时文件。
+- 附件下载的目录校验在 mkdir **之前**做（否则 mkdir -p 会顺着被换的祖先建到外面），校验通过的目录
+  identity（dev/ino + 根内）一路带到最终 rename 前再核一次——等待网络那段是攻击窗口；macOS 另把
+  `attachments/<appId>` 也 pin 住。
 
 **沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
 

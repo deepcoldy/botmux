@@ -40,9 +40,7 @@ import { dropConfiguredCliRuntime } from '../adapters/cli/runtime.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { resolveTeamRoleFile } from '../core/role-resolver.js';
 import { existsSync, readFileSync, statSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { sendCredFilePath } from '../adapters/cli/read-isolation.js';
+import { sendCredFilePath, writeSendCredFile } from '../adapters/cli/read-isolation.js';
 import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
@@ -789,15 +787,7 @@ async function applyConfigFieldInternal(
         const cred = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
         if (effective === null || (effective as any)?.enabled !== true) delete cred.feedback;
         else cred.feedback = effective;
-        // see worker.ts send-cred write: the temp file stays out of the
-        // sandbox-readable BOT_HOME for every session of the bot
-        const credJson = JSON.stringify(cred);
-        try {
-          atomicWriteFileSync(path, credJson, { mode: 0o600, tmpDir: dirname(dirname(path)) });
-        } catch (e) {
-          if ((e as NodeJS.ErrnoException).code !== 'EXDEV' || bot.config.sandboxWithholdBotSecret === true) throw e;
-          atomicWriteFileSync(path, credJson, { mode: 0o600 });
-        }
+        writeSendCredFile(path, JSON.stringify(cred)); // in place: see writeSendCredFile
       }
     } catch (error) {
       logger.warn(`[config:${larkAppId}] failed to refresh sandbox feedback policy: ${error instanceof Error ? error.message : String(error)}`);

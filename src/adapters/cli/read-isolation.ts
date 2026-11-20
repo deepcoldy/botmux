@@ -21,6 +21,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { openSync, closeSync, ftruncateSync, writeSync, fsyncSync, fchmodSync, readFileSync, constants as fsConstants } from 'node:fs';
 import type { SessionProbe } from '../backend/types.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
@@ -57,6 +58,26 @@ export function normalizeIsolationPath(p: string): string | null {
 export function sendCredFilePath(sessionDataDir: string, appId: string): string {
   const botmuxHome = sessionDataDir.replace(/\/+$/, '').replace(/\/[^/]+$/, '');
   return `${botHomePath(botmuxHome, appId)}/send-cred.json`;
+}
+
+/**
+ * Write `send-cred.json` IN PLACE (never temp file + rename). A running Linux
+ * sandbox masks this path with a mount attached to the directory entry; a
+ * rename would swap in a fresh inode under the same name and the live pane
+ * would read the new, unmasked file. A temp sibling would also sit readable in
+ * BOT_HOME for a moment. The content is a few hundred bytes written in one
+ * call, and host readers tolerate a retry. Unchanged content is left alone.
+ * O_NOFOLLOW: BOT_HOME is sandbox-writable, never write through a planted link.
+ */
+export function writeSendCredFile(path: string, json: string): void {
+  try { if (readFileSync(path, 'utf8') === json) return; } catch { /* absent or unreadable → (re)write */ }
+  const fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
+  try {
+    ftruncateSync(fd, 0);
+    writeSync(fd, json, 0, 'utf8');
+    fsyncSync(fd);
+    fchmodSync(fd, 0o600);
+  } finally { closeSync(fd); }
 }
 
 /** A Feishu app id is safe to use as a path segment. Enforced because appId is

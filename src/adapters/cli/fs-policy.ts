@@ -1248,7 +1248,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     net: ctx.net !== false,
     ...(ctx.withholdSendCredential ? { hideHostProcessInfo: true } : {}),
     ...(ctx.withholdSendCredential
-      ? { pinnedDirs: [ctx.botHome, ...(ctx.outbox ? [ctx.outbox] : [])].map(p => normalizeFsPath(p)).filter((p): p is string => !!p) }
+      ? { pinnedDirs: [ctx.botHome, `${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`, ...(ctx.outbox ? [ctx.outbox] : [])].map(p => normalizeFsPath(p)).filter((p): p is string => !!p) }
       : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],

@@ -1948,26 +1948,26 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   // Feishu downloads video bodies through the file endpoint.
   const apiType = type === 'video' ? 'file' : type;
   const dir = dirname(savePath);
+  // The attachment bucket is writable from inside the file sandbox, so the
+  // directory, an ancestor (attachments/<appId>) or the file name may be a
+  // planted symlink. Check containment BEFORE mkdir (mkdir -p would otherwise
+  // create the message directory wherever a planted ancestor points), refuse a
+  // symlinked directory, remember which directory was validated, and land the
+  // bytes via rename only into that same directory (identity + containment are
+  // re-checked right before the rename — the network wait is the attacker's window).
+  // The root itself (<dataDir>/attachments) is host-owned and may not exist yet.
+  if (options?.withinRoot && !existsSync(options.withinRoot)) mkdirSync(options.withinRoot, { recursive: true });
+  const root = options?.withinRoot ? realpathSync(options.withinRoot) : undefined;
+  if (root) assertExistingAncestorWithinRoot(dir, root);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
-  // The attachment bucket is writable from inside the file sandbox, so the
-  // directory or the file name may be a planted symlink. Never write through
-  // one: refuse a symlinked directory, and land the bytes via rename (which
-  // replaces a symlink entry instead of following it).
   const dirInfo = lstatSync(dir);
   if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {
     throw new Error(`Refusing to download into a non-directory: ${dir}`);
   }
-  // An ancestor (attachments/<appId>) is writable too and could have been
-  // swapped for a symlink: the resolved directory must still sit under the root.
-  if (options?.withinRoot) {
-    const real = realpathSync(dir);
-    const root = realpathSync(options.withinRoot);
-    if (real !== root && !real.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)) {
-      throw new Error(`Refusing to download outside ${root}: ${dir}`);
-    }
-  }
+  if (root) assertWithinRoot(realpathSync(dir), root, dir);
+  const guard: DownloadDirGuard = { dev: dirInfo.dev, ino: dirInfo.ino, ...(root ? { root } : {}) };
 
   // Resolve resource ownership with the same app identity before borrowing a
   // user's token. A forward's outer ID, owning leaf and enclosing forward can
@@ -1977,7 +1977,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   for (const [index, candidateId] of messageIds.entries()) {
     resourceMessageId = candidateId;
     try {
-      await downloadWithAppToken(larkAppId, resourceMessageId, fileKey, apiType, savePath);
+      await downloadWithAppToken(larkAppId, resourceMessageId, fileKey, apiType, savePath, guard);
       logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
       return;
     } catch (appErr: any) {
@@ -2001,7 +2001,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
           headers: { Range: `bytes=${start}-${end}` },
           responseType: 'stream',
           timeout: 30_000,
-        }), savePath);
+        }), savePath, guard);
         logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via App Token Range)`);
         return;
       }
@@ -2039,11 +2039,43 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     );
   }
 
-  await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand);
+  await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand, guard);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
-async function downloadWithAppToken(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+/** The directory a download was validated against: same inode at rename time,
+ *  and (when confined) still resolving under the attachment root. */
+export interface DownloadDirGuard { dev: number; ino: number; root?: string }
+
+function assertWithinRoot(real: string, root: string, shown: string): void {
+  if (real !== root && !real.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)) {
+    throw new Error(`Refusing to download outside ${root}: ${shown}`);
+  }
+}
+
+/** Containment of the deepest EXISTING ancestor of `dir`, so mkdir -p cannot be
+ *  steered through a planted symlink higher up (attachments/<appId>). */
+function assertExistingAncestorWithinRoot(dir: string, root: string): void {
+  let probe = dir;
+  while (!existsSync(probe)) {
+    const parent = dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+  assertWithinRoot(realpathSync(probe), root, dir);
+}
+
+/** Re-check the validated directory right before publishing a file into it. */
+export function assertDownloadDirUnchanged(dir: string, guard: DownloadDirGuard | undefined): void {
+  if (!guard) return;
+  const st = lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== guard.dev || st.ino !== guard.ino) {
+    throw new Error(`Download directory changed while writing: ${dir}`);
+  }
+  if (guard.root) assertWithinRoot(realpathSync(dir), guard.root, dir);
+}
+
+async function downloadWithAppToken(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, guard?: DownloadDirGuard): Promise<void> {
   const c = getBotClient(larkAppId);
   // Route through client.request() (empty-GET-body guard) instead of the
   // generated messageResource.get, which sends `{}` as a GET body and trips
@@ -2055,10 +2087,10 @@ async function downloadWithAppToken(larkAppId: string, messageId: string, fileKe
     params: { type },
     responseType: 'stream',
   });
-  await writeResourceToDisk(res, savePath);
+  await writeResourceToDisk(res, savePath, guard);
 }
 
-async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, brand: Brand = 'feishu'): Promise<void> {
+async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, brand: Brand = 'feishu', guard?: DownloadDirGuard): Promise<void> {
   const url = `${larkHosts(brand).openApi}/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${userToken}` },
@@ -2082,7 +2114,7 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
         stream.statusCode = partial.status;
         stream.headers = { 'content-range': partial.headers.get('content-range') ?? undefined };
         return stream;
-      }, savePath);
+      }, savePath, guard);
       return;
     }
     // 401 = the token itself was rejected (expired / wrong scope) → genuinely
@@ -2095,24 +2127,24 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
     throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
-  await writeViaRename(savePath, async (tmp) => { writeFileSync(tmp, buf, { flag: 'wx' }); });
+  await writeViaRename(savePath, async (tmp) => { writeFileSync(tmp, buf, { flag: 'wx' }); }, guard);
 }
 
 /** Write to a fresh sibling file, then rename it over `savePath`: a symlink
  *  already sitting at `savePath` is replaced, never written through. */
-async function writeViaRename(savePath: string, write: (tmp: string) => Promise<void>): Promise<void> {
+async function writeViaRename(savePath: string, write: (tmp: string) => Promise<void>, guard?: DownloadDirGuard): Promise<void> {
   const dir = dirname(savePath);
   const before = lstatSync(dir);
   if (before.isSymbolicLink() || !before.isDirectory()) throw new Error(`Refusing to download into a non-directory: ${dir}`);
+  // Same directory the caller validated before the network wait (a later lstat
+  // alone would accept a swapped-in external directory as a fresh baseline).
+  const expected: DownloadDirGuard = guard ?? { dev: before.dev, ino: before.ino };
+  assertDownloadDirUnchanged(dir, expected);
   const tmp = `${savePath}.${process.pid}.${randomBytes(4).toString('hex')}.part`;
   try {
     await write(tmp);
-    // The download awaited the network; the directory may have been swapped
-    // for a symlink meanwhile. Rename only into the directory we checked.
-    const after = lstatSync(dir);
-    if (after.isSymbolicLink() || !after.isDirectory() || after.dev !== before.dev || after.ino !== before.ino) {
-      throw new Error(`Download directory changed while writing: ${dir}`);
-    }
+    // Rename only into that same directory.
+    assertDownloadDirUnchanged(dir, expected);
     renameSync(tmp, savePath);
   } catch (err) {
     try { unlinkSync(tmp); } catch { /* not created */ }
@@ -2120,7 +2152,7 @@ async function writeViaRename(savePath: string, write: (tmp: string) => Promise<
   }
 }
 
-async function writeResourceToDisk(res: any, savePath: string): Promise<void> {
+async function writeResourceToDisk(res: any, savePath: string, guard?: DownloadDirGuard): Promise<void> {
   await writeViaRename(savePath, async (tmp) => {
     if (res instanceof Buffer) {
       writeFileSync(tmp, res, { flag: 'wx' });
@@ -2136,7 +2168,7 @@ async function writeResourceToDisk(res: any, savePath: string): Promise<void> {
       // closes/cleans up both streams on error.
       await pipeline(res as NodeJS.ReadableStream, createWriteStream(tmp, { flags: 'wx' }));
     }
-  });
+  }, guard);
 }
 
 const EXT_TO_FILE_TYPE: Record<string, string> = {

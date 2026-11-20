@@ -17,6 +17,8 @@ import { accessForPath, buildFsPolicy, compileToSeatbelt, type FsPolicyContext }
 import { buildRelaySessionToolRequest, materializeRelayedAttachments } from '../src/cli/relay-session-tool.js';
 import { readVerifiedFile } from '../src/services/remote-runner-session-tool.js';
 import { sandboxWithholdsBotSecret } from '../src/adapters/cli/sandbox-mode.js';
+import { writeSendCredFile } from '../src/adapters/cli/read-isolation.js';
+import { statSync } from 'node:fs';
 
 const roots: string[] = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
@@ -82,7 +84,7 @@ describe('fs-policy: withholdSendCredential', () => {
   it('pins BOT_HOME and the outbox against rename/rmdir, after the write grants', () => {
     const outbox = '/Users/u/.botmux/data/sandboxes/s/outbox';
     const on = compileToSeatbelt(buildFsPolicy(ctx({ outbox, withholdSendCredential: true })));
-    for (const dir of ['/Users/u/.botmux/bots/cli_self', outbox]) {
+    for (const dir of ['/Users/u/.botmux/bots/cli_self', '/Users/u/.botmux/data/attachments/cli_self', outbox]) {
       const pin = `(deny file-write-unlink (literal "${dir}"))`;
       expect(on).toContain(pin);
       expect(on.indexOf(pin)).toBeGreaterThan(on.indexOf(`(subpath "${dir}")`));
@@ -122,6 +124,33 @@ describe('sandboxWithholdsBotSecret (one decision for every freeze / snapshot pa
     [{ sandbox: 'oncall', sandboxWithholdBotSecret: true }, 'bogus', false],
   ] as const)('%j with BOTMUX_SANDBOX=%s → %s', (cfg, env, expected) => {
     expect(sandboxWithholdsBotSecret(cfg as any, env)).toBe(expected);
+  });
+});
+
+describe('writeSendCredFile', () => {
+  it('rewrites in place (same inode, no temp sibling) and leaves unchanged content alone', () => {
+    const home = tmp('botmux-send-cred-');
+    const path = join(home, 'send-cred.json');
+    writeSendCredFile(path, '{"v":1}');
+    const first = statSync(path);
+    expect(first.mode & 0o777).toBe(0o600);
+    writeSendCredFile(path, '{"v":2,"longer":true}');
+    const second = statSync(path);
+    expect(readFileSync(path, 'utf8')).toBe('{"v":2,"longer":true}');
+    expect(second.ino).toBe(first.ino);
+    writeSendCredFile(path, '{"v":2,"longer":true}');
+    expect(statSync(path).mtimeMs).toBe(second.mtimeMs);
+    // shorter content must not leave a tail of the old bytes behind
+    writeSendCredFile(path, '{"v":3}');
+    expect(readFileSync(path, 'utf8')).toBe('{"v":3}');
+    expect(readdirSync(home)).toEqual(['send-cred.json']);
+  });
+  it('never writes through a planted symlink', () => {
+    const home = tmp('botmux-send-cred-');
+    const victim = join(home, 'victim'); writeFileSync(victim, 'keep');
+    symlinkSync(victim, join(home, 'send-cred.json'));
+    expect(() => writeSendCredFile(join(home, 'send-cred.json'), '{}')).toThrow();
+    expect(readFileSync(victim, 'utf8')).toBe('keep');
   });
 });
 

@@ -1,5 +1,6 @@
 import { lstat, mkdtemp, open, rename, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { assertDownloadDirUnchanged, type DownloadDirGuard } from './client.js';
 import type { Readable } from 'node:stream';
 
 export const LARK_RESOURCE_SIZE_LIMIT_CODE = 234037;
@@ -70,13 +71,17 @@ function transient(error: any): boolean {
 export async function downloadResourceWithRange(
   request: ResourceRangeRequest,
   savePath: string,
+  guard?: DownloadDirGuard,
 ): Promise<void> {
   let total = 0;
-  // The destination directory may be writable by a sandbox; it is checked here,
-  // before any network wait, and must be the same inode when the file lands.
+  // The destination directory may be writable by a sandbox; the caller validated
+  // it before any network wait and it must be the same directory when the file
+  // lands (identity, and containment when confined).
   const dir = dirname(savePath);
   const dirBefore = await lstat(dir);
   if (dirBefore.isSymbolicLink() || !dirBefore.isDirectory()) throw new RangeDownloadError(`Refusing to download into a non-directory: ${dir}`);
+  const expected: DownloadDirGuard = guard ?? { dev: dirBefore.dev, ino: dirBefore.ino };
+  try { assertDownloadDirUnchanged(dir, expected); } catch (e) { throw new RangeDownloadError((e as Error).message); }
   // A one-byte probe avoids the ordinary endpoint's whole-file size limit.
   // Intentionally fail fast here: data retries start only after range metadata is validated.
   let probe: ResourceStream | undefined;
@@ -130,10 +135,7 @@ export async function downloadResourceWithRange(
       }
       if ((await file.stat()).size !== total) throw new RangeDownloadError('Resource final size mismatch');
     } finally { await file.close(); }
-    const dirAfter = await lstat(dir);
-    if (dirAfter.isSymbolicLink() || !dirAfter.isDirectory() || dirAfter.dev !== dirBefore.dev || dirAfter.ino !== dirBefore.ino) {
-      throw new RangeDownloadError(`Download directory changed while writing: ${dir}`);
-    }
+    try { assertDownloadDirUnchanged(dir, expected); } catch (e) { throw new RangeDownloadError((e as Error).message); }
     await rename(temporaryPath, savePath);
   } finally {
     await rm(temporaryDir, { recursive: true, force: true });

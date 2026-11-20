@@ -11,13 +11,18 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
 
-const mocks = vi.hoisted(() => ({ request: vi.fn() }));
+const mocks = vi.hoisted(() => ({ request: vi.fn(), userToken: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({
   getBotClient: () => ({ request: mocks.request }),
   getAllBots: () => [],
   getBot: () => ({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-only', brand: 'feishu' } }),
   formatLarkError: String,
   LarkTransportDisabledError: class extends Error {},
+}));
+
+vi.mock('../src/utils/user-token.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/utils/user-token.js')>(),
+  resolveUserToken: mocks.userToken,
 }));
 
 import { downloadMessageResource } from '../src/im/lark/client.js';
@@ -94,6 +99,60 @@ describe('downloadMessageResource symlink safety', () => {
     await expect(downloadMessageResource('cli_test', 'om_a', 'file_k', 'file', join(attachments, 'app', 'om_a', 'cli.js'), undefined, { withinRoot: attachments }))
       .rejects.toThrow(/outside/);
     expect(readdirSync(join(hostDir, 'om_a'))).toEqual([]);
+    expect(mocks.request).not.toHaveBeenCalled();
+  });
+
+  it('withinRoot: an ancestor swapped during the network wait cannot redirect the final rename', async () => {
+    const hostDir = join(root, 'host-dist');
+    mkdirSync(join(hostDir, 'om_b'), { recursive: true });
+    const attachments = join(root, 'attachments');
+    mkdirSync(join(attachments, 'app', 'om_b'), { recursive: true });
+    mocks.request.mockImplementationOnce(async () => {
+      renameSync(join(attachments, 'app'), join(attachments, 'app.moved'));
+      symlinkSync(hostDir, join(attachments, 'app'));
+      return Buffer.from('EVIL');
+    });
+    await expect(downloadMessageResource('cli_test', 'om_b', 'file_k', 'file', join(attachments, 'app', 'om_b', 'cli.js'), undefined, { withinRoot: attachments }))
+      .rejects.toThrow();
+    expect(readdirSync(join(hostDir, 'om_b'))).toEqual([]);
+    expect(readdirSync(join(attachments, 'app.moved', 'om_b'))).toEqual([]);
+  });
+
+  it('withinRoot: the user-token path carries the same directory guard across the network wait', async () => {
+    const hostDir = join(root, 'host-dist');
+    mkdirSync(join(hostDir, 'om_u'), { recursive: true });
+    const attachments = join(root, 'attachments');
+    mkdirSync(join(attachments, 'app', 'om_u'), { recursive: true });
+    // app token: 403 → user-token fallback; the fetch body arrives after the swap
+    mocks.request.mockRejectedValueOnce(Object.assign(new Error('forbidden'), { response: { status: 403, data: {} } }));
+    mocks.userToken.mockResolvedValueOnce('u-token');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementationOnce(async () => ({
+      ok: true,
+      status: 200,
+      arrayBuffer: async () => {
+        renameSync(join(attachments, 'app'), join(attachments, 'app.moved'));
+        symlinkSync(hostDir, join(attachments, 'app'));
+        return new TextEncoder().encode('EVIL').buffer;
+      },
+    }) as unknown as Response);
+    try {
+      await expect(downloadMessageResource('cli_test', 'om_u', 'file_k', 'file', join(attachments, 'app', 'om_u', 'cli.js'), 'ou_x', { withinRoot: attachments }))
+        .rejects.toThrow();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(readdirSync(join(hostDir, 'om_u'))).toEqual([]);
+      expect(readdirSync(join(attachments, 'app.moved', 'om_u'))).toEqual([]);
+    } finally { fetchSpy.mockRestore(); }
+  });
+
+  it('withinRoot: does not mkdir the message directory through a planted ancestor', async () => {
+    const hostDir = join(root, 'host-dist');
+    mkdirSync(hostDir);
+    const attachments = join(root, 'attachments');
+    mkdirSync(attachments);
+    symlinkSync(hostDir, join(attachments, 'app'));
+    await expect(downloadMessageResource('cli_test', 'om_c', 'file_k', 'file', join(attachments, 'app', 'om_c', 'x.bin'), undefined, { withinRoot: attachments }))
+      .rejects.toThrow(/outside/);
+    expect(readdirSync(hostDir)).toEqual([]);
     expect(mocks.request).not.toHaveBeenCalled();
   });
 
