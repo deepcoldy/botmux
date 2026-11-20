@@ -52,6 +52,23 @@ interface StoredEvent {
   payload: string;
 }
 
+export interface SessionTurnRetention {
+  maxEventsPerSession?: number;
+  eventTtlMs?: number;
+}
+
+interface TurnRetentionSummary {
+  turn_id: string;
+  event_count: number;
+  last_seq: number;
+  last_at: number;
+  has_final: number;
+}
+
+const DEFAULT_MAX_EVENTS_PER_SESSION = 2000;
+const DEFAULT_EVENT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const LOCAL_PATH_PATTERN = /(?:file:\/\/|(?:^|(?<=[\s:：=(\[{`"'（「『【《“‘，、；]))(?:~\/|\/(?:home|Users|tmp|private|var|data\d*|workspace|mnt)\/)|\b[A-Za-z]:\\)[^\s`)"'\]}）」』】》”’，。；：、！？]+/gm;
+
 function databasePath(dataDir: string): string {
   return join(dataDir, 'session-turns', 'turns.sqlite');
 }
@@ -113,7 +130,86 @@ function inTransaction(db: DatabaseSyncLike, operation: () => void): void {
 function publicMessageText(text: string): string {
   return safeScrubAndTruncate(text, 256 * 1024).text
     .replace(/\b(?:Bearer|Basic)\s+[A-Za-z0-9+/_=.-]+/gi, '<redacted>')
-    .replace(/(?:file:\/\/|(?:^|(?<=[\s(`]))(?:~\/|\/(?:home|Users|tmp|private|var|data\d*|workspace|mnt)\/)|\b[A-Za-z]:\\)[^\s`)"']+/gm, '<redacted>');
+    .replace(LOCAL_PATH_PATTERN, '<redacted>');
+}
+
+function pruneSessionEvents(
+  db: DatabaseSyncLike,
+  sessionId: string,
+  now: number,
+  protectedTurnId?: string,
+  retention?: SessionTurnRetention,
+): void {
+  const maxEvents = Math.max(1, Math.floor(retention?.maxEventsPerSession ?? DEFAULT_MAX_EVENTS_PER_SESSION));
+  const ttlMs = Math.max(1, Math.floor(retention?.eventTtlMs ?? DEFAULT_EVENT_TTL_MS));
+  const cutoff = now - ttlMs;
+  const stats = db.prepare(
+    'SELECT COUNT(*) AS count, MIN(at) AS oldest_at FROM events WHERE session_id = ?',
+  ).get(sessionId) as { count: number; oldest_at: number | null } | undefined;
+  if (!stats || stats.count === 0) return;
+  const needsCountPrune = stats.count > maxEvents;
+  const needsTtlPrune = stats.oldest_at !== null && stats.oldest_at < cutoff;
+  if (!needsCountPrune && !needsTtlPrune) return;
+
+  const turns = db.prepare(`
+    SELECT
+      turn_id,
+      COUNT(*) AS event_count,
+      MAX(seq) AS last_seq,
+      MAX(at) AS last_at,
+      MAX(CASE WHEN event_key LIKE 'reply:final:%' THEN 1 ELSE 0 END) AS has_final
+    FROM events
+    WHERE session_id = ?
+    GROUP BY turn_id
+    ORDER BY last_seq ASC
+  `).all(sessionId) as TurnRetentionSummary[];
+  if (turns.length <= 1) return;
+
+  const newestTurnId = turns.at(-1)?.turn_id;
+  const isProtected = (turnId: string): boolean => turnId === protectedTurnId || turnId === newestTurnId;
+  const evict = new Set<string>();
+  let remainingEvents = stats.count;
+
+  // 第一阶段：按 TTL 淘汰超时未活跃的整轮事件（保护当前写入与最新轮次）
+  if (needsTtlPrune) {
+    for (const turn of turns) {
+      if (isProtected(turn.turn_id)) continue;
+      if (turn.last_at < cutoff) {
+        evict.add(turn.turn_id);
+        remainingEvents -= turn.event_count;
+      }
+    }
+  }
+
+  // 第二阶段：超过单会话事件上限时，优先按最旧活动顺序淘汰已完成轮次
+  if (remainingEvents > maxEvents) {
+    for (const turn of turns) {
+      if (remainingEvents <= maxEvents) break;
+      if (evict.has(turn.turn_id) || isProtected(turn.turn_id) || turn.has_final !== 1) continue;
+      evict.add(turn.turn_id);
+      remainingEvents -= turn.event_count;
+    }
+  }
+
+  // 第三阶段：若仅剩未完成轮次仍超上限，兜底淘汰最旧的非保护轮次以守住硬上限
+  if (remainingEvents > maxEvents) {
+    for (const turn of turns) {
+      if (remainingEvents <= maxEvents) break;
+      if (evict.has(turn.turn_id) || isProtected(turn.turn_id)) continue;
+      evict.add(turn.turn_id);
+      remainingEvents -= turn.event_count;
+    }
+  }
+
+  if (!evict.size) return;
+  const deleteEvents = db.prepare('DELETE FROM events WHERE session_id = ? AND turn_id = ?');
+  const deletePendingInbound = db.prepare('DELETE FROM pending_inbound WHERE session_id = ? AND turn_id = ?');
+  const deletePendingNative = db.prepare('DELETE FROM pending_native WHERE session_id = ? AND turn_id = ?');
+  for (const turnId of evict) {
+    deleteEvents.run(sessionId, turnId);
+    deletePendingInbound.run(sessionId, turnId);
+    deletePendingNative.run(sessionId, turnId);
+  }
 }
 
 export function projectLarkTurnInbound(
@@ -183,6 +279,7 @@ export function recordSessionTurnInput(opts: {
   cliSessionId?: string;
   cliEntryId?: string;
   at?: number;
+  retention?: SessionTurnRetention;
 }): void {
   if (!existsSync(databasePath(opts.dataDir))) return;
   const anchor: SessionTurnAnchor = {
@@ -209,8 +306,10 @@ export function recordSessionTurnInput(opts: {
       anchor.cliSessionId ??= previous.cliSessionId;
       anchor.cliEntryId ??= previous.cliEntryId;
     }
-    if (sameAnchor(previous, anchor)) return;
-    append.run(opts.sessionId, opts.turnId, at, `anchor:${randomUUID()}`, JSON.stringify({ anchor }));
+    if (!sameAnchor(previous, anchor)) {
+      append.run(opts.sessionId, opts.turnId, at, `anchor:${randomUUID()}`, JSON.stringify({ anchor }));
+    }
+    pruneSessionEvents(db, opts.sessionId, at, opts.turnId, opts.retention);
   }));
 }
 
@@ -229,7 +328,12 @@ function latestAnchor(db: DatabaseSyncLike, sessionId: string, turnId: string): 
 }
 
 export function updateSessionTurnNativeAnchor(
-  dataDir: string, sessionId: string, turnId: string, cliSessionId?: string, cliEntryId?: string,
+  dataDir: string,
+  sessionId: string,
+  turnId: string,
+  cliSessionId?: string,
+  cliEntryId?: string,
+  retention?: SessionTurnRetention,
 ): void {
   if (!existsSync(databasePath(dataDir))) return;
   accessTurns(dataDir, true, db => inTransaction(db, () => {
@@ -249,21 +353,32 @@ export function updateSessionTurnNativeAnchor(
       cliEntryId: cliEntryId ?? previous.cliEntryId,
     };
     if (sameAnchor(previous, anchor)) return;
+    const now = Date.now();
     db.prepare('INSERT OR IGNORE INTO events (session_id, turn_id, at, event_key, payload) VALUES (?, ?, ?, ?, ?)')
-      .run(sessionId, turnId, Date.now(), `anchor:${randomUUID()}`, JSON.stringify({ anchor }));
+      .run(sessionId, turnId, now, `anchor:${randomUUID()}`, JSON.stringify({ anchor }));
+    pruneSessionEvents(db, sessionId, now, turnId, retention);
   }));
 }
 
-export function recordSessionTurnReply(dataDir: string, sessionId: string, turnId: string, reply: SessionTurnReply): void {
+export function recordSessionTurnReply(
+  dataDir: string,
+  sessionId: string,
+  turnId: string,
+  reply: SessionTurnReply,
+  retention?: SessionTurnRetention,
+): void {
   if (!existsSync(databasePath(dataDir))) return;
-  accessTurns(dataDir, true, db => {
-    db.prepare(`
+  accessTurns(dataDir, true, db => inTransaction(db, () => {
+    const result = db.prepare(`
       INSERT OR IGNORE INTO events (session_id, turn_id, at, event_key, payload)
       SELECT ?, ?, ?, ?, ?
       WHERE EXISTS (SELECT 1 FROM pending_inbound WHERE session_id = ? AND turn_id = ?)
     `).run(sessionId, turnId, reply.at, `reply:${reply.responseKind}:${reply.messageId}:${reply.at}`,
       JSON.stringify({ reply: { ...reply, text: reply.text === undefined ? undefined : publicMessageText(reply.text) } }), sessionId, turnId);
-  });
+    if (Number(result.changes) > 0) {
+      pruneSessionEvents(db, sessionId, reply.at, turnId, retention);
+    }
+  }));
 }
 
 export function cleanupSessionTurns(dataDir: string, sessionId: string): void {
@@ -280,7 +395,13 @@ function purgeClosedSession(db: DatabaseSyncLike, sessionId: string): void {
 export function reconcileClosedSessionTurns(dataDir: string, closedIds: ReadonlySet<string>): void {
   if (!closedIds.size || !existsSync(databasePath(dataDir))) return;
   accessTurns(dataDir, true, db => inTransaction(db, () => {
-    const sessions = db.prepare('SELECT DISTINCT session_id FROM pending_inbound').all() as { session_id: string }[];
+    const sessions = db.prepare(`
+      SELECT DISTINCT session_id FROM pending_inbound
+      UNION
+      SELECT DISTINCT session_id FROM events
+      UNION
+      SELECT DISTINCT session_id FROM pending_native
+    `).all() as { session_id: string }[];
     for (const { session_id: sessionId } of sessions) {
       if (closedIds.has(sessionId)) purgeClosedSession(db, sessionId);
     }

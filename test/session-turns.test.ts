@@ -36,7 +36,7 @@ describe('structured session turns', () => {
     rmSync(dataDir, { recursive: true, force: true });
   });
 
-  function stage(messageId: string, rootId?: string) {
+  function stage(messageId: string, rootId?: string, content = 'Original message') {
     stageSessionTurnInbound(dataDir, sessionId, messageId, projectLarkTurnInbound({
       messageId,
       rootId: rootId ?? messageId,
@@ -45,7 +45,7 @@ describe('structured session turns', () => {
       senderType: 'user',
       createTime: '0',
       msgType: 'text',
-      content: 'Original message',
+      content,
       mentions: [{ key: 'fixture-mention', name: 'Example bot', openId: 'fixture-mentioned' }],
     }, [{ type: 'image', path: join(dataDir, 'private.png'), name: 'example.png', mimeType: 'image/png' }],
     rootId, 'Example sender'));
@@ -173,5 +173,153 @@ describe('structured session turns', () => {
     const third = readSessionTurns(dataDir, sessionId, Number(second.next), 50);
     expect(third.turns[0]?.anchor?.inputSha256).toBe(first.turns[0]?.anchor?.inputSha256);
     expect(Number(third.next)).toBeGreaterThan(Number(second.next));
+  });
+
+  it('prunes completed turns over the per-session cap while keeping active turns and monotonic cursors', () => {
+    const retention = { maxEventsPerSession: 8, eventTtlMs: 60_000 };
+    const t0 = 100_000;
+
+    stage('turn-1');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-1', input: 'one', cliId: 'codex', at: t0, retention });
+    recordSessionTurnReply(dataDir, sessionId, 'turn-1', { messageId: 'r-1', responseKind: 'final', at: t0 + 10 }, retention);
+    const afterT1 = readSessionTurns(dataDir, sessionId, 0, 50);
+    expect(afterT1.turns.map(t => t.turnId)).toEqual(['turn-1']);
+
+    // turn-2 仅收到 progress 回执，尚未收到 final，属于活跃/未完成轮次
+    stage('turn-2');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-2', input: 'two', cliId: 'codex', at: t0 + 20, retention });
+    recordSessionTurnReply(dataDir, sessionId, 'turn-2', { messageId: 'r-2p', responseKind: 'progress', at: t0 + 30 }, retention);
+
+    // turn-3 完成后总事件数达到 9 > 8，应淘汰最旧的已完成轮次 turn-1，保留活跃轮次 turn-2 与最新轮次 turn-3
+    stage('turn-3');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-3', input: 'three', cliId: 'codex', at: t0 + 40, retention });
+    recordSessionTurnReply(dataDir, sessionId, 'turn-3', { messageId: 'r-3', responseKind: 'final', at: t0 + 50 }, retention);
+
+    const afterT3 = readSessionTurns(dataDir, sessionId, 0, 50);
+    expect(afterT3.turns.map(t => t.turnId)).toEqual(['turn-2', 'turn-3']);
+    // 持有已被裁剪轮次的旧游标分页不报错且单调前进
+    const fromStaleCursor = readSessionTurns(dataDir, sessionId, Number(afterT1.next), 50);
+    expect(fromStaleCursor.turns.map(t => t.turnId)).toEqual(['turn-2', 'turn-3']);
+    expect(Number(fromStaleCursor.next)).toBeGreaterThan(Number(afterT1.next));
+
+    // turn-4 完成后再次超上限，应优先淘汰已完成的 turn-3，仍保留活跃轮次 turn-2 与最新轮次 turn-4
+    stage('turn-4');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'turn-4', input: 'four', cliId: 'codex', at: t0 + 60, retention });
+    recordSessionTurnReply(dataDir, sessionId, 'turn-4', { messageId: 'r-4', responseKind: 'final', at: t0 + 70 }, retention);
+
+    const afterT4 = readSessionTurns(dataDir, sessionId, 0, 50);
+    expect(afterT4.turns.map(t => t.turnId)).toEqual(['turn-2', 'turn-4']);
+    const deltaAfterT3 = readSessionTurns(dataDir, sessionId, Number(afterT3.next), 50);
+    expect(deltaAfterT3.turns.map(t => t.turnId)).toEqual(['turn-4']);
+    expect(Number(deltaAfterT3.next)).toBeGreaterThan(Number(afterT3.next));
+
+    // 已裁剪轮次的迟到回执被忽略，不产生孤立事件
+    recordSessionTurnReply(dataDir, sessionId, 'turn-1', { messageId: 'r-1-late', responseKind: 'auxiliary', at: t0 + 80 }, retention);
+    expect(readSessionTurns(dataDir, sessionId, Number(afterT4.next), 50)).toMatchObject({ turns: [], next: afterT4.next });
+
+    // 活跃轮次 turn-2 最终完成时仍可正常追加回执并推进游标
+    recordSessionTurnReply(dataDir, sessionId, 'turn-2', { messageId: 'r-2f', responseKind: 'final', at: t0 + 90 }, retention);
+    const completedActive = readSessionTurns(dataDir, sessionId, Number(afterT4.next), 50);
+    expect(completedActive.turns.map(t => [t.turnId, t.replies.map(r => r.responseKind)])).toEqual([
+      ['turn-2', ['progress', 'final']],
+    ]);
+    expect(Number(completedActive.next)).toBeGreaterThan(Number(afterT4.next));
+  });
+
+  it('prunes expired turns by TTL, bounds all-incomplete sessions, and preserves cursor monotonicity across close/reopen', () => {
+    const retention = { maxEventsPerSession: 4, eventTtlMs: 10_000 };
+
+    stage('old-done');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'old-done', input: 'a', cliId: 'codex', at: 1_000, retention });
+    recordSessionTurnReply(dataDir, sessionId, 'old-done', { messageId: 'r-old', responseKind: 'final', at: 1_500 }, retention);
+
+    stage('old-stale-incomplete');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'old-stale-incomplete', input: 'b', cliId: 'codex', at: 2_000, retention });
+    const beforeTtl = readSessionTurns(dataDir, sessionId, 0, 50);
+
+    // 超过 TTL 后写入新轮次，两个过期轮次均被裁剪，最新轮次保留
+    stage('fresh-turn');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'fresh-turn', input: 'c', cliId: 'codex', at: 15_000, retention });
+    const afterTtl = readSessionTurns(dataDir, sessionId, 0, 50);
+    expect(afterTtl.turns.map(t => t.turnId)).toEqual(['fresh-turn']);
+    expect(Number(afterTtl.next)).toBeGreaterThan(Number(beforeTtl.next));
+
+    // 全为未完成轮次时仍受单会话上限约束，仅保留最新的不超上限轮次
+    for (let i = 1; i <= 4; i++) {
+      const id = `incomplete-${i}`;
+      stage(id);
+      recordSessionTurnInput({ dataDir, sessionId, turnId: id, input: id, cliId: 'codex', at: 15_000 + i * 100, retention });
+    }
+    const afterIncompleteBurst = readSessionTurns(dataDir, sessionId, 0, 50);
+    expect(afterIncompleteBurst.turns.map(t => t.turnId)).toEqual(['incomplete-3', 'incomplete-4']);
+
+    const db = openDatabaseSyncOrThrow(join(dataDir, 'session-turns', 'turns.sqlite'), { readOnly: true });
+    try {
+      const row = db.prepare('SELECT COUNT(*) AS count FROM events WHERE session_id = ?').get(sessionId) as { count: number };
+      expect(row.count).toBeLessThanOrEqual(4);
+    } finally {
+      db.close();
+    }
+
+    // 关闭再重开后游标仍严格单调递增
+    cleanupSessionTurns(dataDir, sessionId);
+    expect(readSessionTurns(dataDir, sessionId, Number(afterIncompleteBurst.next), 50)).toMatchObject({
+      turns: [],
+      next: afterIncompleteBurst.next,
+    });
+    resumeSessionTurns(dataDir, sessionId);
+    stage('reopened-turn');
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'reopened-turn', input: 'reopened', cliId: 'codex', at: 20_000, retention });
+    const afterReopen = readSessionTurns(dataDir, sessionId, Number(afterIncompleteBurst.next), 50);
+    expect(afterReopen.turns.map(t => t.turnId)).toEqual(['reopened-turn']);
+    expect(Number(afterReopen.next)).toBeGreaterThan(Number(afterIncompleteBurst.next));
+  });
+
+  it('redacts local paths after non-whitespace delimiters without mangling URLs', () => {
+    const inboundText = [
+      '路径：/Users/alice/secret/a.ts，谢谢',
+      '文件:/home/bob/app.ts',
+      'PATH=/workspace/repo/secret.env',
+      '(/tmp/debug.log) [/var/log/app.log]',
+      '「~/private/key.pem」 【/Users/alice/secret/b.ts】',
+      '"/home/bob/quoted.ts" \'~/private/single.pem\'',
+      '路径：C:\\Users\\alice\\a.txt 【C:\\Users\\alice\\b.txt】',
+      '路径：file:///Users/alice/secret/c.ts',
+      '参考链接：https://example.com/Users/alice/profile',
+      'http://localhost:3000/home/dashboard',
+      'url=https://example.com/tmp/item',
+      'ssh://git@github.com/workspace/repo',
+      's3://bucket/data00/file.parquet',
+    ].join('\n');
+
+    stage('redact-turn', undefined, inboundText);
+    recordSessionTurnInput({ dataDir, sessionId, turnId: 'redact-turn', input: inboundText, cliId: 'codex' });
+    recordSessionTurnReply(dataDir, sessionId, 'redact-turn', {
+      messageId: 'reply-redact',
+      responseKind: 'final',
+      at: 100,
+      text: '结果：/Users/alice/out.txt，详情见 https://example.com/home/docs',
+    });
+
+    const page = readSessionTurns(dataDir, sessionId, 0, 50);
+    const storedInbound = page.turns[0]?.inbound[0]?.text;
+    const storedReply = page.turns[0]?.replies[0]?.text;
+
+    expect(storedInbound).toBe([
+      '路径：<redacted>，谢谢',
+      '文件:<redacted>',
+      'PATH=<redacted>',
+      '(<redacted>) [<redacted>]',
+      '「<redacted>」 【<redacted>】',
+      '"<redacted>" \'<redacted>\'',
+      '路径：<redacted> 【<redacted>】',
+      '路径：<redacted>',
+      '参考链接：https://example.com/Users/alice/profile',
+      'http://localhost:3000/home/dashboard',
+      'url=https://example.com/tmp/item',
+      'ssh://git@github.com/workspace/repo',
+      's3://bucket/data00/file.parquet',
+    ].join('\n'));
+    expect(storedReply).toBe('结果：<redacted>，详情见 https://example.com/home/docs');
   });
 });
