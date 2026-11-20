@@ -25,6 +25,16 @@ export interface BridgeReadPosition {
  *  the screen heuristics can end before that write and say nothing. */
 export const BLIND_TURN_MIN_BUSY_MS = 3_000;
 
+/** How often, and how many more times, the worker looks for an unread turn's
+ *  transcript when Claude's pid-state record was caught mid-rewrite. Claude
+ *  rewrites that record in place on the very busy→idle edge the turn is judged
+ *  on, and a loaded host can hold the rewrite between its truncate and its
+ *  write past any fixed re-read window: a single look then reports a reply as
+ *  lost that the next bridge tick delivers. A record that stays unreadable
+ *  across these looks gets the notice a few seconds later. */
+export const UNREAD_TURN_RELOCATE_RETRY_MS = 1_000;
+export const UNREAD_TURN_RELOCATE_RETRIES = 3;
+
 export type BlindTurnVerdict =
   /** No turn evidence since the last prompt, or too short to judge. */
   | { kind: 'none' }
@@ -101,6 +111,17 @@ export class BridgeBlindTurnWatch {
     this.reported = true;
   }
 
+  /** A turn has started since the last prompt edge. */
+  turnInProgress(): boolean {
+    return this.turn !== undefined;
+  }
+
+  /** The unread run that began at `blindSinceMs` is still the current one and
+   *  nobody was told about it: no turn was read since, and no teardown. */
+  isUnreportedRun(blindSinceMs: number): boolean {
+    return this.blindSinceMs === blindSinceMs && !this.reported;
+  }
+
   /** The bridge was torn down (CLI restart / exit): nothing carries over. */
   reset(): void {
     this.idleCompaction = false;
@@ -109,6 +130,25 @@ export class BridgeBlindTurnWatch {
     this.blindSinceMs = undefined;
     this.reported = false;
   }
+}
+
+/** Whether any of these transcript records is a reply Claude wrote within
+ *  [fromMs, toMs]: an assistant record, or the turn_duration closing a turn. A
+ *  switch that replays, as live, a reply written while an unread run was going
+ *  on has delivered that run; one that replays only later records (a `/resume`
+ *  typed afterwards, a newer Lark message) or bookkeeping around the run (a
+ *  `/clear` command record, a compact boundary) has not. */
+export function replyRecordsStampedWithin(
+  records: readonly { type?: unknown; subtype?: unknown; timestamp?: unknown }[],
+  fromMs: number,
+  toMs: number,
+): boolean {
+  return records.some(record => {
+    const reply = record.type === 'assistant' || (record.type === 'system' && record.subtype === 'turn_duration');
+    if (!reply || typeof record.timestamp !== 'string') return false;
+    const atMs = Date.parse(record.timestamp);
+    return atMs >= fromMs && atMs <= toMs;
+  });
 }
 
 export interface BlindTurnNoticeInput {
