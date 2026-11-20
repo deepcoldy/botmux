@@ -86,11 +86,11 @@ function waitFor(
 
 describe('dsh worker final_output integration', () => {
   it.each([
-    { scenario: 'happy', timeoutMs: undefined },
-    { scenario: 'reasoning', timeoutMs: undefined },
-    { scenario: 'progressive', timeoutMs: 300 },
-    { scenario: 'empty', timeoutMs: undefined },
-  ])('delivers one final_output with correct content/turnId after $scenario', async ({ scenario, timeoutMs }) => {
+    { scenario: 'happy', timeoutMs: undefined, dshRuntime: 'official' as const },
+    { scenario: 'reasoning', timeoutMs: undefined, dshRuntime: undefined },
+    { scenario: 'progressive', timeoutMs: 300, dshRuntime: undefined },
+    { scenario: 'empty', timeoutMs: undefined, dshRuntime: undefined },
+  ])('delivers one final_output with correct content/turnId after $scenario', async ({ scenario, timeoutMs, dshRuntime }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-'));
     tempDirs.add(root);
     const fakeDsh = join(root, 'fake-dsh-server');
@@ -139,6 +139,7 @@ describe('dsh worker final_output integration', () => {
       larkAppId: 'app_dsh_it',
       larkAppSecret: 'secret',
       turnId: 'om_dsh_it_turn_1',
+      ...(dshRuntime ? { dshRuntime } : {}),
       ...(timeoutMs ? { turnTimeoutMs: timeoutMs } : {}),
     };
 
@@ -159,6 +160,19 @@ describe('dsh worker final_output integration', () => {
         expect(finals[0].content).toContain('你好，我是 dsh。');
       }
       expect(finals[0].turnId).toBe('om_dsh_it_turn_1');
+      if (dshRuntime === 'official' && process.platform === 'linux') {
+        // This must travel through the REAL spawnCliBody initialization: the
+        // unit fixture cannot prove that an explicit official value creates
+        // dshProcessAttestation before process_ready arrives.
+        const attested = messages.filter(
+          (m): m is Extract<WorkerToDaemon, { type: 'local_process_attestation' }>
+            & { enginePid: number; engineProcStart: string } =>
+            m.type === 'local_process_attestation'
+            && m.enginePid !== undefined && m.engineProcStart !== undefined,
+        );
+        expect(attested.length).toBeGreaterThan(0);
+        expect(attested.at(-1)?.enginePid).not.toBe(attested.at(-1)?.cliPid);
+      }
       if (scenario === 'reasoning') {
         expect(finals[0].content).toBe('你好，我是 dsh。');
         const updates = messages.filter(

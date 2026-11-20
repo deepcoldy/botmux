@@ -52,12 +52,14 @@ describe('maintenance global config', () => {
         autoUpdate: { enabled: true, time: '04:00' },
         autoRestart: { enabled: true, time: '4:30' }, // time on autoRestart is meaningless now
         notifyOnRestart: false,
+        notifyOnNewVersion: true,
       },
     }));
     expect(readGlobalConfig().maintenance).toEqual({
       autoUpdate: { enabled: true, time: '04:00' },
       autoRestart: { enabled: true },
       notifyOnRestart: false,
+      notifyOnNewVersion: true,
     });
   });
 
@@ -145,5 +147,28 @@ describe('parseMaintenancePatch (dashboard PUT validation)', () => {
   it('rejects empty / non-object input', () => {
     expect(parseMaintenancePatch({})).toEqual({ ok: false, error: 'empty' });
     expect(parseMaintenancePatch(null)).toEqual({ ok: false, error: 'empty' });
+  });
+});
+
+
+describe('new version notification configuration', () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'botmux-new-version-config-'));
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(dir, 'config.json'));
+  });
+  afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+  it.each([true, false])('persists an independent boolean opt-in: %s', value => {
+    mergeMaintenanceConfig({ notifyOnNewVersion: value });
+    expect(readGlobalConfig().maintenance?.notifyOnNewVersion).toBe(value);
+    expect(readGlobalConfig().maintenance?.autoUpdate).toBeUndefined();
+    expect(parseMaintenancePatch({ notifyOnNewVersion: value }))
+      .toEqual({ ok: true, patch: { notifyOnNewVersion: value } });
+  });
+  it.each([['true'], [1], [null], [{}], [[]]])('rejects non-boolean opt-in: %s', value => {
+    expect(parseMaintenancePatch({ notifyOnNewVersion: value }))
+      .toEqual({ ok: false, error: 'invalid_notify_on_new_version' });
+    writeFileSync(globalConfigPath(), JSON.stringify({ maintenance: { notifyOnNewVersion: value } }));
+    expect(readGlobalConfig().maintenance?.notifyOnNewVersion).toBeUndefined();
   });
 });

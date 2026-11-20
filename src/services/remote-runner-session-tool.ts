@@ -1,10 +1,15 @@
 import { spawn } from 'node:child_process';
 import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
   lstatSync,
+  openSync,
   readFileSync,
   realpathSync,
 } from 'node:fs';
-import { basename, join, sep } from 'node:path';
+import { attachmentsRoot } from '../core/attachment-path.js';
+import { basename, sep } from 'node:path';
 import {
   botmuxCliInvocation,
   buildRelayHostEnv,
@@ -44,6 +49,9 @@ export interface RemoteRunnerSessionToolHostContext {
   env?: NodeJS.ProcessEnv;
   cliPath?: string;
   timeoutMs?: number;
+  /** Total quoted-attachment budget. Defaults to the remote-runner wire limit;
+   *  the local sandbox relay (outbox) passes a larger one. */
+  maxAttachmentBytes?: number;
 }
 
 function boundedDiagnostic(value: string, fallback: string): string {
@@ -160,7 +168,7 @@ export function quotedAttachments(
 
   const dataDir = env.SESSION_DATA_DIR?.trim();
   if (!dataDir) throw new Error('SESSION_DATA_DIR is unavailable for quoted attachments');
-  const attachmentRootInput = join(dataDir, 'attachments');
+  const attachmentRootInput = attachmentsRoot(env, dataDir);
   const attachmentRootInfo = lstatSync(attachmentRootInput);
   if (attachmentRootInfo.isSymbolicLink() || !attachmentRootInfo.isDirectory()) {
     throw new Error('BotMux attachment root is unsafe');
@@ -201,7 +209,7 @@ export function quotedAttachments(
       ...(typeof item.mimeType === 'string' && item.mimeType.length <= 256
         ? { mimeType: item.mimeType }
         : {}),
-      dataBase64: readFileSync(resolved).toString('base64'),
+      dataBase64: readVerifiedFile(resolved, info).toString('base64'),
     });
   };
 
@@ -320,7 +328,7 @@ export async function runRemoteRunnerSessionTool(
       }
       try {
         const packaged = request.tool === 'quoted'
-          ? quotedAttachments(stdout, env)
+          ? quotedAttachments(stdout, env, context.maxAttachmentBytes)
           : { stdout };
         finish({
           outcome: 'completed',
@@ -343,4 +351,17 @@ export async function runRemoteRunnerSessionTool(
       }
     });
   });
+}
+
+/** Read the file that was validated, not whatever the path names now: open
+ *  without following a symlink and require the same inode. */
+export function readVerifiedFile(path: string, expected: { dev: number; ino: number }): Buffer {
+  const fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.dev !== expected.dev || st.ino !== expected.ino) {
+      throw new Error('quoted attachment changed while it was being read');
+    }
+    return readFileSync(fd);
+  } finally { closeSync(fd); }
 }

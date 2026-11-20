@@ -853,7 +853,12 @@ describe('contract gateway and real worker boundaries', () => {
       expect(s.store.runtime(s.ref)).toMatchObject({ ref: middle, identity: old.identity });
       expect(s.store.binding(s.ref, bindingId)?.ref).toEqual(middle);
     }
-    expect(s.store.execution(s.ref, execution.executionId)).toMatchObject({ phase: 'reconciling', runtime: old.ref });
+    // The bare binding confirmed first and enriched in place with the same
+    // process's conversation is not reused for the old runtime, but the
+    // attempt still running in that process moves onto it (a daemon restart
+    // re-attaching agy mid-turn, 2026-11-20). Every other condition keeps it.
+    expect(s.store.execution(s.ref, execution.executionId)).toMatchObject({ phase: 'reconciling',
+      runtime: condition === 'confirmed_binding' ? middle : old.ref });
     expect(s.store.binding(s.ref, 'middle-bare')?.ref).toEqual(middle);
     if (condition === 'recover') expect(s.store.read(s.ref)?.runtimeEpoch).toBe(3);
   });

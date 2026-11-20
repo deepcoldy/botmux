@@ -22,7 +22,7 @@ export function selectReplyMessageId(
 }
 
 export interface InboundMessageLocation {
-  messageId: string;
+  messageId?: string;
   rootMessageId?: string;
 }
 
@@ -32,7 +32,7 @@ export function renderInboundMessageLocation(location: InboundMessageLocation | 
   const escape = (value: string) => value.replace(/[&<>"']/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;',
   })[c]!);
-  return `<message_location message_id="${escape(location.messageId)}" placement="${location.rootMessageId ? 'thread' : 'chat'}"${location.rootMessageId ? ` root_message_id="${escape(location.rootMessageId)}"` : ''} />`;
+  return `<message_location${location.messageId ? ` message_id="${escape(location.messageId)}"` : ''} placement="${location.rootMessageId ? 'thread' : 'chat'}"${location.rootMessageId ? ` root_message_id="${escape(location.rootMessageId)}"` : ''} />`;
 }
 
 export function parseReplyMessageTarget(value: unknown): SessionReplyTarget | undefined {

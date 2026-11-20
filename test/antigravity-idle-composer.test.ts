@@ -69,6 +69,29 @@ describe('Antigravity idle-composer viewport classifier', () => {
     expect(createAntigravityAdapter().readyPattern!.test(screen)).toBe(true);
   });
 
+  it.each([
+    '> explain this shortcut (shift+tab to cycle)',
+    '> A u t o mode: edits & safe commands auto-approved (shift+tab to cycle)',
+    '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle) continue',
+    '> explain this shortcut\n(shift+tab to cycle)',
+  ])('rejects a shortcut-shaped draft: %s', draft => {
+    expect(isAntigravityIdleComposerScreen(`output\n────\n${draft}\n────\n? for shortcuts`)).toBe(false);
+    expect(isAntigravityIdleComposerScreen(NATIVE_ERROR_SCREEN.replace('\n>\n', `\n${draft}\n`))).toBe(false);
+  });
+
+  it.each([
+    '> Auto mode: edits & safe commands\nauto-approved (shift+tab to cycle)',
+    '> Accept-edits mode: file edits auto-app\nroved (shift+tab to cycle)',
+    '> Plan mode: research & plan only\n(shift+tab to cycle)',
+    '> Best-of-N mode: fork into parallel arms\nand pick a winner (shift+tab to cycle)',
+  ])('recognizes a wrapped empty placeholder: %s', composer => {
+    const ready = `output\n────\n${composer}\n────\n? for shortcuts`;
+    expect(isAntigravityIdleComposerScreen(ready)).toBe(true);
+    expect(isAntigravityIdleComposerScreen(ready.replace('output\n────\n', ''))).toBe(true);
+    expect(isAntigravityIdleComposerScreen(ready.replace(/\n/g, '\r\n'))).toBe(true);
+    expect(isAntigravityIdleComposerScreen(NATIVE_ERROR_SCREEN.replace('\n>\n', `\n${composer}\n`))).toBe(true);
+  });
+
   it('accepts native error layouts in ANSI-colored CRLF captures', () => {
     const screen = NATIVE_ERROR_SCREEN.split('\n').map(line => `\x1b[31m${line}\x1b[0m`).join('\r\n');
     expect(isAntigravityIdleComposerScreen(screen)).toBe(true);

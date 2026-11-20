@@ -120,6 +120,21 @@ export function resolveSandboxMode(input: {
   return normalizeSandboxMode(input.configSandbox);
 }
 
+/** Whether this bot's sessions withhold the Lark app secret from the sandbox:
+ *  the flag is set AND the sandbox the worker will actually build (env override
+ *  included, see resolveSandboxMode) is the allowlist one. Every path that
+ *  freezes or snapshots a session's sandbox shape must use this, so an
+ *  env-forced or workflow pane cannot end up oncall without the flag. */
+export function sandboxWithholdsBotSecret(
+  botCfg: { sandbox?: unknown; readIsolation?: boolean; sandboxWithholdBotSecret?: boolean },
+  envValue: string | undefined = process.env.BOTMUX_SANDBOX,
+): boolean {
+  if (botCfg.sandboxWithholdBotSecret !== true) return false;
+  try {
+    return resolveSandboxMode({ configSandbox: botCfg.sandbox, readIsolation: botCfg.readIsolation, envValue }) === 'oncall';
+  } catch { return false; }
+}
+
 /**
  * Resolve the BOTMUX_SANDBOX env override.
  *   unset/'0'/'false'/'' → off (= no force; resolveSandboxMode then follows

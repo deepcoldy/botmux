@@ -32,14 +32,14 @@
 
 - `src/im/lark/transport/resilient-ws-client.ts` 在单个 SDK 实例上管理拨号和重试，沿用 SDK 的端点发现、协议、分片缓存、事件处理和 ACK。socket 创建即有永久 error 监听器，握手超时、主动关闭、领导权退出均走安全清理。SDK 私有边界与依赖锁到 1.73.0，升级时需重跑真实代理回归。
 - 每次尝试共用 35 秒 deadline，覆盖 HTTPS 配置发现和 WS 握手。超时撤销 HTTP 请求和代理 TCP 建连，过期回调不得写回配置或安装 socket。可重试失败按 1 秒为起点、60 秒为上限的指数退避加抖动继续尝试。一次只有一个请求或一个退避 timer。服务端明确拒绝凭据时保留终止状态，由外层看门狗处置。
-- `src/im/lark/transport/connection.ts` 处理长时间未连上和收不到真实入站帧两种情况。重建更换 SDK 实例，注销订阅会撤销整条链路。只有当前实例收到入站帧才能清零连续重建次数。超过预算，daemon 退出 1，由 supervisor 接管。成功、开始尝试和失败原因均进入 botmux 自身日志。
+- `src/im/lark/transport/connection.ts` 处理长时间未连上和收不到真实入站帧两种情况。重建更换 SDK 实例，注销订阅会撤销整条链路。只有当前实例收到入站帧才能清零连续重建次数。超过预算后延长重建间隔，不因网络故障退出 daemon，中断 CLI 和后台任务；真正未捕获的原生异常仍由入口的 fatal guard 退出处理。成功、开始尝试和失败原因均进入 botmux 自身日志。
 - `botmux status` 同时列出进程和飞书连接状态，Dashboard 监控页列出状态起始时间、尝试次数和最近入站。使用 daemon 现有的 30 秒心跳发布快照；Dashboard 每 10 秒刷新。入站时间只来自真实帧。API-only 实例显示 disabled。
 
 | 可选配置 | 默认 | 含义 |
 | --- | --- | --- |
 | `BOTMUX_LARK_WS_RECONNECT_STALE_MS` | 300000 | 同一代连接停在 connecting/reconnecting 等未连上状态多久后重建 |
 | `BOTMUX_LARK_WS_INBOUND_STALE_MS` | 900000 | 自最近入站或本代启动以来的静默上限，覆盖仍声称 connected 的连接 |
-| `BOTMUX_LARK_WS_MAX_REBUILDS` | 3 | 连续重建预算耗尽后，下一次仍不健康就退出 1 |
+| `BOTMUX_LARK_WS_MAX_REBUILDS` | 3 | 连续重建预算耗尽后，按两个 stale 窗口的较大值限制后续重建频率；保留客户端重试，不退出 daemon 或中断 CLI 工作 |
 
 探测周期取 60 秒与两个阈值的最小值；默认阈值触发与实际处置之间至多相差一个探测周期（事件循环正常调度时）。15 秒的独立握手计时器和发送 ping 后 30 秒无入站的看门狗继续工作。
 
@@ -53,6 +53,6 @@ primary 已经有带领导权检查的 `recoverDurablePrimaryIngressOnce()`，�
 
 - SDK `close({force:true})` 和普通 `close()` 均覆盖。SDK ping 看门狗有意保留 close 监听器，让断线进入重试。仓库 `src/platform/tunnel-client.ts` 的败方清理和 `stop()` 在 `terminate()` 前已装 error 接收器，成功候选切换到 `adoptControl()` 时同步换上正式监听器。交互选择器只摘除 stdin 的 data 监听器。
 - SDK 的 `handleEventData() → eventDispatcher.invoke()` 等待持久化完成才 ACK；这个 await 属于业务处理。补偿历史的列表、分页和 settle 有各自的时限。此次只修改连接恢复及同一中断的交接。会话目录 env-stamp、cgroup 文件缺失告警、字体安装器的 405 分别独立跟进。
-- `test/lark-ws-blackhole.test.ts` 启动独立 Bun 进程和回环网关，依次接受不响应的 WS upgrade、接受不响应的代理 CONNECT、恢复可达性，检查收到真实入站帧及代理 socket 释放。持续黑洞另行检查客户端替换、非零退出。编译版入口的顶层 await 与原生 WS ErrorEvent 单独验证。
+- `test/lark-ws-blackhole.test.ts` 启动独立 Bun 进程和回环网关，依次接受不响应的 WS upgrade、接受不响应的代理 CONNECT、恢复可达性，检查收到真实入站帧及代理 socket 释放。持续黑洞另行检查进程存活、限频替换和 socket 释放。编译版入口的顶层 await 与原生 WS ErrorEvent 单独验证。
 - `test/lark-resilient-ws-client.test.ts`、`test/lark-connection.test.ts` 覆盖单飞、deadline、指数退避、迟到响应、主动关闭、连续重建预算和旧回调。单文件探针也使用了 Bun 1.4.3 的 `--compile --minify`。
 - 上游已有握手/关闭清理修复。代理无响应使整个重试循环停住另有独立复现。[SDK PR #219](https://github.com/larksuite/node-sdk/pull/219) · [SDK issue #234](https://github.com/larksuite/node-sdk/issues/234)

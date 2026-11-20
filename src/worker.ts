@@ -42,8 +42,7 @@ import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {ClaudePermissionNoticeTracker} from './services/claude-action-prompt.js';
 import { PromptSuggestionPublisher, promptSuggestionReportTurn, type FoldedTypeAheadTurn } from './utils/prompt-suggestion-publisher.js';
-import { CliRecapObserver, RECAP_MODEL_SYSTEM_PROMPT, TurnRecapRecorder } from './services/turn-recap.js';
-import { recapModelLaunchFor, runRecapModel, type RecapModelLaunch } from './services/turn-recap-runner.js';
+import { CliRecapObserver } from './services/turn-recap.js';
 import { WrittenInputLedger } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
@@ -67,7 +66,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, rmSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -99,6 +98,8 @@ import {
   provenancePendingContent,
   provenancePendingNonce,
   sendCredFilePath,
+  sendCredUpdateLockTarget,
+  writeSendCredFile,
   botHomePath,
   shouldRedirectCliData,
   buildCliExecutableReadCarveOuts,
@@ -449,6 +450,7 @@ import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResu
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
 import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
+import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath, restoreFilteredHermesUserEvents } from './services/hermes-transcript.js';
@@ -474,7 +476,7 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
@@ -932,6 +934,7 @@ import {
 } from './utils/codex-app-turn-liveness.js';
 import { CodexAppTurnDispatchQueue } from './utils/codex-app-turn-dispatch.js';
 import { captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
+import { captureDshProcessIdentity, type DshProcessIdentity } from './services/dsh-process-attestation.js';
 import {
   committedCodexAppSequence,
   validateCodexAppManagedSendOrigin,
@@ -2319,6 +2322,22 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       }
     } else if (!nativeSessionId && lastInitConfig?.cliId === 'grok' && typeof findGrokSessionByPid === 'function') {
       nativeSessionId = findGrokSessionByPid(childPid)?.sessionId;
+    } else if (!nativeSessionId && lastInitConfig?.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput
+      && (observedBackend as { isReattach?: boolean } | null)?.isReattach === true
+      && typeof nativeSessionForkPending === 'function' && !nativeSessionForkPending()) {
+      // A daemon restart re-attaches agy mid-turn. Its conversation is the one
+      // the process holds open (the observation that later persists its id);
+      // read it here so the first binding already proves it. Bound bare, the
+      // re-attached CLI got a new runtime, and a reply that finished while no
+      // worker was attached was refused before that id caught up. A fresh
+      // launch has no predecessor to match, and while agy starts up it briefly
+      // holds sibling conversations open: leave its id to the later observation.
+      const cid = cliAdapter?.resolveActiveSessionId
+        ? cliAdapter.resolveActiveSessionId({ cliPid: childPid, cliCwd: lastInitConfig.workingDir })
+        : findAntigravityConversationIdByPid(childPid) ?? undefined;
+      if (cid && !(lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid)) {
+        nativeSessionId = cid;
+      }
     } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
       // Likewise a re-attached Claude may be mid-turn and write nothing until
       // that turn ends. Without its conversation the contract cannot tell this
@@ -4892,8 +4911,11 @@ function notifyHookReviewInputHold(freshScreen?: string): void {
   const holdNotice = cliAdapter?.stuckPageFamily === 'kimi'
     ? `⚠️ ${cliName()} 正在显示「缓存过期」选择菜单。为避免消息被菜单吞掉或误选选项，`
       + 'BotMux 已暂存后续消息；请先在 Web 终端完成选择，恢复普通输入框后会自动投递。'
-    : `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
-      + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。';
+    : cliAdapter?.stuckPageFamily === 'antigravity'
+      ? `⚠️ ${cliName()} 正在终端显示选择菜单（提问或权限确认）。为避免消息被菜单当成按键、误选选项，`
+        + 'BotMux 已暂存后续消息；请先在 Web 终端完成选择，恢复普通输入框后会自动投递。'
+      : `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
+        + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。';
   send({
     type: 'user_notify',
     turnId: currentBotmuxTurnId,
@@ -4982,6 +5004,10 @@ function shareableStuckScreenTail(screen: string): string {
   // Kimi draws its menu under the live conversation: only the menu rows leave
   // the terminal, never the transcript above them.
   if (family === 'kimi') return kimiCacheExpiryMenuTail(screen);
+  // agy draws its pickers under the live conversation: same, picker rows only
+  // (a permission dialog's command already masked), then the same credential
+  // and home-path redaction as any other page.
+  if (family === 'antigravity') return stuckScreenTail(redactStuckPageTail(antigravityBlockingPageTail(screen)));
   // Redact the whole page before bounding it: the line / char cut can drop a
   // row's label and leave its value (or a wrapped continuation) unmasked.
   const unbounded = stuckScreenTail(screen, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
@@ -8246,6 +8272,15 @@ let codexAppControlBootstrapPathForSpawn: string | undefined;
 let codexAppControlStateValue: CodexAppControlState | undefined;
 let codexAppControlProven = false;
 let codexAppRunnerProcessIdentity: CodexAppProcessIdentity | undefined;
+let dshProcessAttestation: {
+  generation: number;
+  executable: string;
+  args: string[];
+  identity?: DshProcessIdentity;
+  originPublished?: boolean;
+  retryTimer?: NodeJS.Timeout;
+  retryAttempts?: number;
+} | undefined;
 let codexAppEngineIdentity: CodexAppEngineIdentity | undefined;
 
 function clearCodexAppEngineIdentity(): void {
@@ -9425,6 +9460,7 @@ type UsageAwareScreen = {
   status: RuntimeScreenStatus | 'limited';
   usageLimit?: CliUsageLimitState;
   expiredAntigravityQuota?: CliUsageLimitState;
+  usageLimitRecovery?: 'antigravity-ready-composer';
 };
 
 function classifyScreenUsageLimit(
@@ -9443,16 +9479,25 @@ function classifyUsageLimitWithNativeEvidence(
 ): UsageAwareScreen {
   if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   let evidence = content;
+  let nativeViewportCaptured = false;
   if (cliAdapter?.id === 'antigravity' && backend) {
     // Card snapshots intentionally remove input/composer rows. Native error
     // reconciliation requires the full current viewport, not that display text.
-    try { evidence = captureBackendScreen(backend) || content; } catch { /* no stronger evidence */ }
+    try {
+      const viewport = captureBackendScreen(backend);
+      if (viewport) { evidence = viewport; nativeViewportCaptured = true; }
+    } catch { /* no stronger evidence */ }
   }
   if (cliAdapter?.id === 'antigravity') {
     // tmux capture-pane -e preserves SGR inside phrases, countdowns and error
     // IDs. Strip controls without filtering away native composer rows.
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+    // 正常输入框是当前恢复证据；保留上方历史报错，但不再用它判定本轮限额。
+    // 卡片内容会裁剪输入框，因此显式携带完整权威视口确认的恢复信号。
+    if (nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
+      return { status, usageLimitRecovery: 'antigravity-ready-composer' };
+    }
     let expiredAntigravityQuota: CliUsageLimitState | undefined;
     const result = usageLimitTracker.classify(evidence, status, state => {
       const observed = annotateAntigravityUsageLimit(evidence, state);
@@ -9906,13 +9951,6 @@ const emittedRateLimitUuids = new Set<string>();
 /** Claude Code's away summaries (「本轮回顾」), forwarded once each for the
  *  turn they recap. */
 const cliRecapObserver = new CliRecapObserver();
-/** What each turn did, for its「本轮回顾」: every activity entry counts here,
- *  unlike the capped CoT buffer below. Sent just before a completed terminal. */
-const turnRecapRecorder = new TurnRecapRecorder();
-/** How to run the optional model recap for the current CLI: its own binary
- *  and env, recorded at spawn. Undefined when the adapter has none or the CLI
- *  is not a plain local one (sandbox, read isolation, wrapper, adopt). */
-let recapModelLaunch: RecapModelLaunch | undefined;
 /** Codex collaboration sub-agents spawned during live ingest. Their quota
  *  failures land in their own rollouts and reach the parent only as tool
  *  results, so they are tailed separately and fed into the same structured
@@ -10193,7 +10231,6 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
     const withoutSentinel = cotEntryWithoutSentinel(entry);
     return withoutSentinel ? [withoutSentinel] : [];
   });
-  turnRecapRecorder.observe(turn, kept);
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
@@ -12430,13 +12467,6 @@ function bridgeIngest(): void {
   emitReadyTurns({ explicitTerminalOnly: true });
 }
 
-/** One optional「本轮回顾」model recap for the daemon. */
-async function answerRecapRequest(requestId: string, prompt: string): Promise<void> {
-  const launch = recapModelLaunch;
-  const outcome = launch ? await runRecapModel(launch, prompt) : { error: 'unavailable for this CLI' };
-  send({ type: 'recap_result', requestId, ...outcome });
-}
-
 /** Scan newly-drained Claude transcript events for a structured rate-limit
  *  record and, on the first unseen one, emit a `limited` screen_update so the
  *  session surfaces in Dashboard「需要你」with a retry countdown — identical
@@ -14031,7 +14061,12 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
           const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff);
           codexBridgeQueue.absorb(history);
           codexBridgeQueue.ingest(live);
-          if (restored > 0 && structuredBridgeIs('antigravity') && lastInitConfig?.adoptMode) {
+          // agy's last reply is held as a provisional final in driver state
+          // until a quiet tick confirms it. A turn that finished while no worker
+          // was attached (a daemon restart) ends in exactly that state, and the
+          // offset already moved past it: dropping the state dropped the reply,
+          // for a re-attached botmux-launched agy as for an adopted pane.
+          if (restored > 0 && structuredBridgeIs('antigravity')) {
             structuredBridgeDriverState = result.state;
           }
           if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
@@ -16629,10 +16664,12 @@ function applyTraexStartupLaunchMode(
   cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'adoptMode'>,
   launch: { resume: boolean; nativeSessionId?: string; persistentReattach: boolean },
 ): void {
+  // A cold resume is fenced like a fresh launch: its first frame is the same
+  // provisional composer (see shouldFenceTraexStartupInput). A reattached
+  // live pane is already past it.
   traexNativeStartupInputPending = shouldFenceTraexStartupInput({
     cliId: cfg.cliId,
     programStatusEnabled: programStatusStream !== null,
-    resume: launch.resume,
     adoptMode: cfg.adoptMode,
     remoteViewer: !!remoteWsUrl,
     persistentReattach: launch.persistentReattach,
@@ -16684,7 +16721,9 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
         traexStartupWebRecheck = setTimeout(() => {
           traexStartupWebRecheck = undefined;
           if (backend !== target || cliSpawnGeneration !== generation
-            || Date.now() >= recheckDeadline
+            // Re-read the confirmation at fire time: an owned receipt may have
+            // landed after this callback captured the finite 90s deadline.
+            || Date.now() >= (traexFirstSubmitConfirmed ? Number.POSITIVE_INFINITY : traexFirstPromptDeadlineAt)
             || (cliRestartInProgress && !replacementSpawnInProgress)) return;
           markPromptReady();
           void flushPending();
@@ -16695,20 +16734,25 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
     }
     if (traexStartupRendererWebInputGeneration !== webTerminalInputGeneration
       || traexStartupRendererScreenRevision !== backendScreenRevision) {
-      if (!traexStartupRendererDrain && renderer && Date.now() < recheckDeadline) {
+      // Only this fence's own retry timers are bounded by the 90s window. A
+      // drain driven by an idle edge, a new message or markPromptReady must
+      // still run after it: a footer can resolve later than 90s (cold resume
+      // on a slow network), and Web input after the timeout notice would
+      // otherwise wedge every later message until /restart.
+      if (!traexStartupRendererDrain && renderer) {
         const token = {};
         const target = backend;
         const observedRenderer = renderer;
         const generation = cliSpawnGeneration;
         const revision = backendScreenRevision;
         const inputGeneration = webTerminalInputGeneration;
-        const retryDeadline = recheckDeadline;
+        const retryDeadline = () => traexFirstSubmitConfirmed ? Number.POSITIVE_INFINITY : traexFirstPromptDeadlineAt;
         let accepted = false;
         traexStartupRendererDrain = token;
         void observedRenderer.writeAndFlush('').then(() => {
           if (traexStartupRendererDrain !== token || backend !== target || renderer !== observedRenderer
             || cliSpawnGeneration !== generation || backendScreenRevision !== revision
-            || webTerminalInputGeneration !== inputGeneration || Date.now() >= retryDeadline
+            || webTerminalInputGeneration !== inputGeneration
             || (cliRestartInProgress && !replacementSpawnInProgress)) return;
           traexStartupRendererWebInputGeneration = inputGeneration;
           traexStartupRendererScreenRevision = revision;
@@ -16724,15 +16768,15 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
           if (accepted || (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending)
             || backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
             || (cliRestartInProgress && !replacementSpawnInProgress)
-            || Date.now() >= retryDeadline || traexStartupWebRecheck) return;
+            || Date.now() >= retryDeadline() || traexStartupWebRecheck) return;
           traexStartupWebRecheck = setTimeout(() => {
             traexStartupWebRecheck = undefined;
             if (backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
               || (cliRestartInProgress && !replacementSpawnInProgress)
-              || Date.now() >= retryDeadline) return;
+              || Date.now() >= retryDeadline()) return;
             markPromptReady();
             void flushPending();
-          }, Math.min(1_000, Math.max(0, retryDeadline - Date.now())));
+          }, Math.min(1_000, Math.max(0, retryDeadline() - Date.now())));
           traexStartupWebRecheck.unref?.();
         });
       }
@@ -17879,8 +17923,8 @@ async function captureAndUpload(): Promise<void> {
     || capturedAttempt !== currentBotmuxDispatchAttempt;
   // Dedup is bound to the full identity: the same pixels under a new capture
   // identity or display cycle are a NEW first frame, never a duplicate.
-  const dedupKey = (pixelHash: string): string =>
-    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}`;
+  const dedupKey = (pixelHash: string, recovery?: UsageAwareScreen['usageLimitRecovery']): string =>
+    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${recovery ? `:recovery=${recovery}` : ''}`;
   let recaptureAfterStaleFrame = false;
   let ownedKey: string | null = null;
   let previousShotHash = lastShotHash;
@@ -17898,6 +17942,8 @@ async function captureAndUpload(): Promise<void> {
   try {
     let png: Buffer;
     let usageLimitContent = '';
+    let pixelHash = '';
+    let usageAware: UsageAwareScreen;
     try {
       // Preferred path: pipe-pane backends ask tmux for a fresh viewport
       // snapshot and render it through a transient xterm-headless. This
@@ -17907,13 +17953,18 @@ async function captureAndUpload(): Promise<void> {
       if (frameIsStale()) { cancelStale('snapshot'); return; }
       if (pipeResult) {
         // Same ANSI on a resized canvas is a different picture.
-        const key = dedupKey(`${pipeResult.cols}x${pipeResult.rows}:${pipeResult.ansi}`);
+        usageLimitContent = pipeResult.content;
+        pixelHash = `${pipeResult.cols}x${pipeResult.rows}:${pipeResult.ansi}`;
+        // Other CLIs never emit this recovery signal: preserve their original
+        // zero-classification fast path for unchanged pixels.
+        if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
+        usageAware = classifyScreenUsageLimit(pipeResult.content, projectedRuntimeScreenStatus());
+        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
         lastShotHash = key;
         png = pipeResult.png;
-        usageLimitContent = pipeResult.content;
       } else {
         // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
         // still drive the long-lived renderer.
@@ -17921,12 +17972,15 @@ async function captureAndUpload(): Promise<void> {
         const term = renderer.xterm;
         const startY = term.buffer.active.baseY;
         const snap = renderer.rawSnapshot();
-        const key = dedupKey(createHash('md5').update(snap).digest('hex'));
+        usageLimitContent = snap;
+        pixelHash = createHash('md5').update(snap).digest('hex');
+        if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
+        usageAware = classifyScreenUsageLimit(snap, projectedRuntimeScreenStatus());
+        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
         lastShotHash = key;
-        usageLimitContent = snap;
         const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
         const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
         // `captureToPng` is the module-scope lazy wrapper above: the canvas native
@@ -17954,7 +18008,15 @@ async function captureAndUpload(): Promise<void> {
 
     if (frameIsStale()) { cancelStale('upload'); return; }
 
-    const status = projectedRuntimeScreenStatus();
+    // Recheck after the async upload: a newer native refusal must win over
+    // the pre-upload recovery evidence used by pixel dedup.
+    const currentUsageAware = classifyScreenUsageLimit(usageLimitContent, projectedRuntimeScreenStatus());
+    // Commit the evidence actually sent, not the pre-upload classification.
+    // A capture failure during upload must leave a later ready edge deliverable.
+    if (lastShotHash === ownedKey) {
+      ownedKey = dedupKey(pixelHash, currentUsageAware.usageLimitRecovery);
+      lastShotHash = ownedKey;
+    }
     // Success is otherwise completely silent (skips and failures log above), which
     // made "loop alive and uploading" indistinguishable from "loop never started"
     // in the daemon log. One throttled line keeps the happy path observable.
@@ -17966,7 +18028,7 @@ async function captureAndUpload(): Promise<void> {
     send({
       type: 'screenshot_uploaded',
       imageKey,
-      ...classifyScreenUsageLimit(usageLimitContent, status),
+      ...currentUsageAware,
       turnId: capturedTurnId,
       dispatchAttempt: capturedAttempt,
       captureRevision: capturedRevision,
@@ -20678,11 +20740,57 @@ async function handleTrustedCodexAppMarker(
   return false;
 }
 
+function scheduleDshProcessAttestationRetry(proof: NonNullable<typeof dshProcessAttestation>): void {
+  if ((proof.identity && proof.originPublished) || proof.retryTimer || dshProcessAttestation !== proof
+    || proof.generation !== cliSpawnGeneration) return;
+  const delays = [50, 200, 1000, 2000, 5000, 10_000];
+  const attempt = proof.retryAttempts ?? 0;
+  const delay = delays[attempt];
+  if (delay === undefined) return;
+  proof.retryTimer = setTimeout(() => {
+    proof.retryTimer = undefined;
+    if ((proof.identity && proof.originPublished) || dshProcessAttestation !== proof
+      || proof.generation !== cliSpawnGeneration) return;
+    proof.retryAttempts = attempt + 1;
+    // Never rotate an already-published turn origin or retake its process
+    // snapshot. Only a FAILED origin publication may be repaired here.
+    const republishTurnOrigin = !proof.originPublished;
+    const published = publishLocalProcessAttestation(
+      backend?.getChildPid?.() ?? undefined,
+      undefined,
+      { republishTurnOrigin },
+    );
+    if (republishTurnOrigin && published) proof.originPublished = true;
+    scheduleDshProcessAttestationRetry(proof);
+  }, delay);
+  proof.retryTimer.unref?.();
+}
+
 function handleAppRunnerOscMarker(body: string): void {
   const sep = body.indexOf(':');
   if (sep < 0) return;
   const kind = body.slice(0, sep);
   const payload = decodeCodexAppPayload(body.slice(sep + 1));
+  if (kind === 'process_ready' && lastInitConfig?.cliId === 'dsh'
+    && lastInitConfig.dshRuntime !== 'tui') {
+    // No payload field is authority. A replay must not rotate the turn's
+    // pre-existing-process snapshot after tools have already started.
+    if (dshProcessAttestation?.generation === cliSpawnGeneration
+      && (!dshProcessAttestation.identity || !dshProcessAttestation.originPublished)) {
+      const proof = dshProcessAttestation;
+      const republishTurnOrigin = !proof.originPublished;
+      const published = publishLocalProcessAttestation(
+        backend?.getChildPid?.() ?? undefined,
+        undefined,
+        { republishTurnOrigin },
+      );
+      // Latch only a successful origin publication. A replay may repair a
+      // failed origin, but can never rotate an already-valid capability.
+      if (republishTurnOrigin && published) proof.originPublished = true;
+      scheduleDshProcessAttestationRetry(proof);
+    }
+    return;
+  }
   if (lastInitConfig?.cliId === 'minimax' && minimaxFinalReceiver.accept(kind,
       payload && typeof payload === 'object' ? payload : undefined,
       { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt })) return;
@@ -21059,6 +21167,10 @@ function releaseInputDeliveryQuarantine(
   if (!quarantine || inputDeliveryQuarantine !== quarantine) return false;
   quarantine.cancelReceipt?.();
   inputDeliveryQuarantine = null;
+  // Every release is receipt- or terminal-proven: the quarantined write was
+  // submitted, so a pending TraeX first-input lease may retire at its next
+  // passing admission instead of outliving its 90s recheck window.
+  traexFirstSubmitConfirmed = true;
   if (quarantine.turnId) {
     codexBridgeQueue.setInputDeliveryQuarantined(quarantine.turnId, false, quarantine.dispatchAttempt);
   }
@@ -22830,6 +22942,28 @@ function scheduleSubmitFailureNotify(
     && !!quarantineAtSchedule && turnIdentity?.dispatchAttempt === undefined
     && quarantineAtSchedule?.turnId === turnIdentity?.turnId;
   const draftContent = quarantineAtSchedule?.draftContent ?? msg;
+  if (lastInitConfig?.cliId === 'traex' && !retainTraexReceipt) {
+    // Explain why this submit has no parked-draft rescue: the chain below then
+    // warns once and stops, and only the original receipt can release it.
+    const why = !structuredTarget ? 'structured bridge inactive'
+      : !recheck ? 'adapter supplied no receipt recheck'
+        : !bridgeTurnId ? 'no bridge mark'
+          : turnIdentity?.dispatchAttempt !== undefined ? `durable dispatch attempt ${turnIdentity.dispatchAttempt}`
+            : !quarantineAtSchedule ? 'no input-delivery quarantine'
+              : 'quarantine belongs to another turn';
+    log(`TRAE draft rescue not armed for turn=${turnIdentity?.turnId ?? '-'}: ${why}`);
+  }
+  // One line per distinct reason: after the warning this chain keeps polling
+  // every 20s, and the same skip must not flood the worker log.
+  let traexRescueLastNote: string | undefined;
+  const noteTraexRescue = (note: string): void => {
+    if (note === traexRescueLastNote) return;
+    traexRescueLastNote = note;
+    log(`TRAE draft rescue ${note} turn=${turnIdentity?.turnId ?? '-'}`);
+  };
+  // Set when the one-shot submit key was handed to the backend; the next
+  // recheck reports what the receipt and the composer show after it.
+  let traexRescueReadBackPending = false;
   const deferredAttemptIsCurrent = (): boolean => (
     cliSpawnGeneration === cliGenerationAtSchedule
     && backendAtSchedule !== null
@@ -22891,6 +23025,10 @@ function scheduleSubmitFailureNotify(
           log(`Deferred recheck saw an unattributed same-text receipt — keeping TRAE draft quarantine. preview="${preview}"`);
           armDeferredRecheck();
           return;
+        }
+        if (traexRescueReadBackPending) {
+          traexRescueReadBackPending = false;
+          noteTraexRescue('read-back: owned receipt found after the submit key');
         }
         traexFirstSubmitConfirmed = true;
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
@@ -22988,6 +23126,32 @@ function scheduleSubmitFailureNotify(
       && traexComposerHoldsInput(submitDiagnosisScreen, draftContent, { requireThreadReady: false });
     const traexDraftReady = traexDraftVisible
       && traexComposerHoldsInput(submitDiagnosisScreen, draftContent);
+    if (traexRescueReadBackPending) {
+      traexRescueReadBackPending = false;
+      const stillParked = traexComposerHoldsInput(submitDiagnosisScreen, draftContent, { requireThreadReady: false });
+      noteTraexRescue(`read-back: no receipt after the submit key; composer ${stillParked ? 'still holds' : 'no longer shows'} the original draft`);
+    }
+    if (retainTraexReceipt && !traexDraftVisible) {
+      // Login / API-key screens can carry a device code or a signed URL in the
+      // last row. Keep the diagnostic reason, but apply the same outbound
+      // credential boundary as submitUnconfirmedNotice to this persistent log.
+      const credentialPage = screenShowsCredentialPage(submitDiagnosisScreen);
+      const footerRow = credentialPage ? ''
+        : submitDiagnosisScreen.trimEnd().split(/\r?\n/).at(-1)?.trim().slice(0, 120) ?? '';
+      noteTraexRescue(`skipped: ${
+        quarantineAtSchedule!.draftRescueAttempted ? 'the one-shot submit was already used'
+          : quarantineAtSchedule!.submitWarningSent ? 'the one-shot warning was already sent'
+            : lastInitConfig?.adoptMode ? 'adopted pane'
+              : externalInputGenerationAtWrite === undefined || externalInputGenerationAtWrite !== webTerminalInputGeneration
+                ? 'Web terminal input since the write'
+                : interruptGenerationAtWrite === undefined || interruptGenerationAtWrite !== cliInterruptGeneration
+                  ? 'interrupt since the write'
+                  : !backendScreenEvidenceIsAuthoritativeForMutation() ? 'screen is not authoritative'
+                    : credentialPage
+                      ? 'the live composer does not show the original draft (last row withheld: credential page)'
+                      : `the live composer does not show the original draft (last row: ${JSON.stringify(footerRow)})`
+      }`);
+    }
     if (traexDraftVisible && !traexDraftReady
       && Date.now() - activityBaselineMs < FIRST_PROMPT_HARD_TIMEOUT_MS) {
       // The provisional startup composer can display the pasted draft while its
@@ -22996,6 +23160,9 @@ function scheduleSubmitFailureNotify(
       log('Deferred recheck: TRAE draft is visible but the native thread is not ready — waiting before rescue');
       armDeferredRecheck();
       return;
+    }
+    if (traexDraftVisible && !traexDraftReady) {
+      noteTraexRescue(`skipped: native thread still not ready ${Math.round((Date.now() - activityBaselineMs) / 1000)}s after the write`);
     }
     if (traexDraftReady) {
       const freshScreen = await traexQuestionCapture();
@@ -23015,6 +23182,7 @@ function scheduleSubmitFailureNotify(
         if (receipt.stale) return;
         if (receipt.action.kind === 'suppress-confirmed'
           || (receipt.action.kind === 'suppress-active' && receipt.action.evidence !== 'pty-output')) {
+          noteTraexRescue(`deferred: ${receipt.action.kind === 'suppress-confirmed' ? 'a receipt' : receipt.action.evidence} appeared before the submit key`);
           armDeferredRecheck();
           return;
         }
@@ -23025,10 +23193,19 @@ function scheduleSubmitFailureNotify(
           quarantineAtSchedule!.draftRescueAttempted = true;
           if (cliAdapter?.pressComposerSubmit?.(adapterInputHandle(backendAtSchedule!))) {
             log('Deferred recheck: unchanged TRAE composer holds the original draft — pressing submit once');
+            noteTraexRescue('submit key accepted by the backend');
+            traexRescueReadBackPending = true;
             armDeferredRecheck();
             return;
           }
+          noteTraexRescue('failed: the backend did not accept the submit key');
+        } else {
+          noteTraexRescue(`skipped: ${receipt.recheckError !== undefined ? 'the receipt recheck threw'
+            : receipt.action.kind === 'suppress-usage-limit' ? 'usage limit reported for this turn'
+              : 'manual input or interrupt during the receipt check'}`);
         }
+      } else {
+        noteTraexRescue('skipped: the fresh capture no longer shows the original draft or input changed');
       }
     }
     // The one-shot notice does not prove the message can never be submitted.
@@ -25315,6 +25492,7 @@ function startScreenUpdates(): void {
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
   let lastSentExpiredQuotaKey: string | undefined;
+  let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
   let lastTextSnapshotHash = '';
   let lastContent = '';
@@ -25594,9 +25772,11 @@ function startScreenUpdates(): void {
       if (startupInputHeld()) return;
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
+        || usageAware.usageLimitRecovery !== lastSentRecovery
         || backgroundWaitTasks !== lastSentBackgroundWait) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
+        lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
         send({
           type: 'screen_update',
@@ -26939,7 +27119,6 @@ async function spawnCliBody(
   traexNativeStartupInputPending = shouldFenceTraexStartupInput({
     cliId: cfg.cliId,
     programStatusEnabled: programStatusStream !== null,
-    resume: cfg.resume,
     adoptMode: cfg.adoptMode,
     remoteViewer: !!remoteWsUrl,
   });
@@ -29000,10 +29179,12 @@ async function spawnCliBody(
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR, cfg.larkAppId);
       mkdirSync(dirname(credPath), { recursive: true });
-      writeFileSync(
+      // In place on purpose (see writeSendCredFile): a rename would defeat the
+      // running Linux mask and leave a readable temp sibling in BOT_HOME.
+      writeSendCredFile(
         credPath,
         JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
-        { mode: 0o600 },
+        sendCredUpdateLockTarget(process.env.SESSION_DATA_DIR, credPath),
       );
     } catch (e) {
       log(`[sandbox] WARN could not write send-cred file: ${(e as Error).message}`);
@@ -29280,6 +29461,10 @@ async function spawnCliBody(
     log(`Ignoring CLI_EXTRA_ARGS for fixed-contract adapter ${cliAdapter.id}`);
   }
   if (cliExtraArgs.length) args.push(...cliExtraArgs);
+  if (dshProcessAttestation?.retryTimer) clearTimeout(dshProcessAttestation.retryTimer);
+  dshProcessAttestation = cfg.cliId === 'dsh' && cfg.dshRuntime !== 'tui'
+    ? { generation: cliSpawnGeneration, executable: cliAdapter.resolvedBin, args: [...args] }
+    : undefined;
 
   // Claude Code 在 root/sudo 下会拒绝 --dangerously-skip-permissions 并立即 exit。
   // botmux 必须带这个 flag（话题里没法弹交互式审批），所以为 root 自动注入
@@ -29794,21 +29979,6 @@ async function spawnCliBody(
   const reproduceBaseBin = spawnBin;
   const reproduceBaseArgs = [...spawnArgs];
 
-  // The optional「本轮回顾」model recap: the same binary and env, outside any terminal.
-  recapModelLaunch = recapModelLaunchFor({
-    recapModel: cliAdapter.recapModel,
-    systemPrompt: RECAP_MODEL_SYSTEM_PROMPT,
-    bin: spawnBin,
-    env: { ...childEnv, ...perBotInjectEnv },
-    cwd: cfg.workingDir,
-    backend: effectiveBackendType,
-    sandboxed: sandboxRequested,
-    readIsolated: !!isolationBotHome,
-    wrapped: !!cfg.wrapperCli,
-    adopted: !!cfg.adoptMode,
-    credentialIsolated: credentialIsolationGate.required,
-  });
-
   // CJADK_INTERACTIVE is a cjadk-only knob we set on the cjadk wrapper branch
   // (applyWrapperCliLaunch). Strip any value inherited from the daemon's own
   // env first so a daemon launched under `cjadk feishu` (which exports it)
@@ -30046,11 +30216,21 @@ async function spawnCliBody(
       resolvedBin: canonical(cliAdapter.resolvedBin),
     }).map(canonical);
 
-    // Linux relay outbox (created by prepareDirectSandbox; in the policy so the
-    // compiled plan binds it read-write).
-    const outbox = process.platform === 'linux'
+    // Relay outbox (in the policy so the compiled plan grants it read-write).
+    // Linux: always (created by prepareDirectSandbox, bound into bwrap).
+    // macOS: only when the bot withholds its app secret from the sandbox — the
+    // Seatbelt pane then has no credential to call Lark with, so send / history /
+    // quoted go through this outbox like they do on Linux.
+    const darwinRelayOutbox = process.platform === 'darwin' && cfg.sandboxWithholdBotSecret === true;
+    const outbox = process.platform === 'linux' || darwinRelayOutbox
       ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
       : undefined;
+    // macOS has no prepareDirectSandbox: create the outbox here, before the
+    // policy drops grants for paths that do not exist. A warm reattach must
+    // reuse the pane's existing directory (checked below), never make one.
+    if (darwinRelayOutbox && outbox && !willReattachPersistent) {
+      mkdirSync(outbox, { recursive: true, mode: 0o700 });
+    }
     // Pre-create the outbox BEFORE buildFsPolicy so it survives the allow-rule
     // existence-filter below (a not-yet-existing readWrite path is dropped, and
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
@@ -30479,6 +30659,7 @@ async function spawnCliBody(
       botmuxInstallRoot,
       botmuxInstallRootMaskPaths: installRootMasks.paths,
       outbox,
+      withholdSendCredential: cfg.sandboxWithholdBotSecret === true,
       extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir]),
       userPaths,
       serviceCredentialReadOnlyPaths,
@@ -30555,9 +30736,36 @@ async function spawnCliBody(
       const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
       writeFileSync(profilePath, compileToSeatbelt(policy), { mode: 0o600 });
       seatbeltProfilePath = profilePath;
-      spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+      if (outbox) {
+        // Seatbelt has no --setenv and the tmux pane only receives allowlisted
+        // BOTMUX_* keys, so the relay location rides on the command itself.
+        spawnArgs = ['-f', profilePath, '/usr/bin/env', `BOTMUX_SEND_RELAY=${outbox}`, spawnBin, ...spawnArgs];
+      } else {
+        spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+      }
       spawnBin = 'sandbox-exec';
       log(`[file-sandbox] wrapping ${cliAdapter.id} in Seatbelt (fs-policy, ${policy.rules.length} rules): sandbox-exec -f ${profilePath}`);
+      if (outbox) {
+        // A warm reattach must re-serve the outbox the live pane already uses;
+        // if it vanished, no one would answer that pane's relay → fail closed.
+        let outboxOk = false;
+        try { const st = lstatSync(outbox); outboxOk = st.isDirectory() && !st.isSymbolicLink(); } catch { /* */ }
+        if (!outboxOk) {
+          throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: relay outbox ${outbox} is missing`);
+        }
+        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+        const sessionTree = dirname(outbox);
+        sandboxCleanup = () => { rmSync(sessionTree, { recursive: true, force: true }); };
+        sandboxRelayOutbox = outbox;
+        sandboxStopWatcher = startOutboxWatcher(
+          outbox,
+          childEnv,
+          cfg.sessionId,
+          { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
+        );
+        publishSandboxRelayCapability();
+        log(`[file-sandbox] bot secret withheld from the sandbox; send/history/quoted relay via outbox=${outbox}`);
+      }
     } else if (willReattachPersistent) {
       // Warm reattach (daemon restart / transfer) to a live bwrap'd pane:
       // backend.spawn() ignores bin/args and just re-attaches. Only re-wire the
@@ -30580,7 +30788,7 @@ async function spawnCliBody(
         att.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend, allowRouting: true },
+        { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
       );
       publishSandboxRelayCapability();
       log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
@@ -30678,7 +30886,7 @@ async function spawnCliBody(
         sbx.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend, allowRouting: true },
+        { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
       );
       publishSandboxRelayCapability();
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
@@ -33723,6 +33931,8 @@ function killCli(opts: {
   // depend on that implementation detail.
   cliSpawnGeneration++;
   claudeEffortObserver.reset();
+  if (dshProcessAttestation?.retryTimer) clearTimeout(dshProcessAttestation.retryTimer);
+  dshProcessAttestation = undefined;
   terminalEffortTracker.reset();
   lastNativeReasoningKey = undefined;
   nativeReasoningClock = undefined;
@@ -37685,10 +37895,6 @@ function emitTurnTerminal(
     ...(directFailure ? { directFailure: true as const } : {}),
     ...(composerRefusal && errorCode === 'safe_composer_required' ? { composerRefusal } : {}),
   };
-  // The「本轮回顾」material first: the daemon reads it when the terminal lands.
-  const recapInput = status === 'completed'
-    ? turnRecapRecorder.input({ turnId, dispatchAttempt }, lastInitConfig?.workingDir) : undefined;
-  if (recapInput) send({ type: 'recap_input', turnId, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}), ...recapInput });
   const scope = workerSessionEventScope;
   if (continuationFailure && scope) {
     scope.reportContinuationFailure(continuationFailure, () => {
@@ -38449,20 +38655,40 @@ function publishLocalProcessAttestation(
   opts: {
     statuslineReattach?: boolean;
     publishRelayCapability?: boolean;
+    republishTurnOrigin?: boolean;
     expectedCliProcStart?: string;
   } = {},
 ): boolean {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
   // A caller that already proved a leaf must never have that proof replaced by
   // whatever process happens to occupy the numeric PID when publication runs.
+  // This guard must stay ahead of DSH capture, identity freeze and retry
+  // cancellation so a replacement never mutates any attestation state.
   if (cliPid && opts.expectedCliProcStart !== undefined && cliProcStart !== opts.expectedCliProcStart) return false;
+  let dshIdentity: DshProcessIdentity | undefined;
+  if (lastInitConfig?.cliId === 'dsh' && lastInitConfig.dshRuntime !== 'tui'
+    && dshProcessAttestation?.generation === cliSpawnGeneration) {
+    const proof = dshProcessAttestation;
+    // A frozen identity is reused for this CLI generation. A later transient
+    // procfs failure must not revoke it, and a replacement cannot mint a new
+    // root. The daemon revalidates engineProcStart on every use; a legitimate
+    // engine exit takes down the runner, and generation replacement clears it.
+    const captured = proof.identity ?? captureDshProcessIdentity(cliPid, proof.executable, proof.args);
+    if (captured) dshIdentity = proof.identity ??= captured;
+    if (dshIdentity && proof.retryTimer) {
+      clearTimeout(proof.retryTimer);
+      proof.retryTimer = undefined;
+    }
+  }
   // Freeze the proven birth token; explicit legacy RPC roots keep priority.
-  enginePid ??= codexAppEngineIdentity?.pid ?? codexAppRunnerProcessIdentity?.enginePid;
+  enginePid ??= codexAppEngineIdentity?.pid ?? codexAppRunnerProcessIdentity?.enginePid ?? dshIdentity?.enginePid;
   const engineProcStart = codexAppEngineIdentity && enginePid === codexAppEngineIdentity.pid
     ? codexAppEngineIdentity.procStart
     : codexAppRunnerProcessIdentity && enginePid === codexAppRunnerProcessIdentity.enginePid
       ? codexAppRunnerProcessIdentity.engineProcStart
-      : enginePid ? readProcessStartIdentity(enginePid) : undefined;
+      : dshIdentity && enginePid === dshIdentity.enginePid
+        ? dshIdentity.engineProcStart
+        : enginePid ? readProcessStartIdentity(enginePid) : undefined;
   // Actual running image of the TRAE leaf, read from the kernel. The initial
   // attestation names the bwrap/forge launcher, which is not traex and must not
   // be recorded; the leaf re-attestation (applyRealPid) fills this in.
@@ -38503,7 +38729,8 @@ function publishLocalProcessAttestation(
   // before it snapshots the current turn's pre-existing descendants. This is
   // required for the opening turn, whose origin is first published before the
   // CLI process exists, and whenever a wrapper resolves to a new real CLI pid.
-  return currentBotmuxTurnId && opts.publishRelayCapability !== false ? publishSandboxRelayCapability() : true;
+  if (opts.republishTurnOrigin === false || opts.publishRelayCapability === false) return true;
+  return currentBotmuxTurnId ? publishSandboxRelayCapability() : true;
 }
 
 /** Deliver a terminal IPC message before exiting the worker. `process.send()`
@@ -40352,11 +40579,6 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'goal_update_ack': {
       if (msg.signature === nativeGoalPendingSignature) nativeGoalSignature = msg.signature;
-      break;
-    }
-
-    case 'recap_request': {
-      void answerRecapRequest(msg.requestId, msg.prompt);
       break;
     }
 

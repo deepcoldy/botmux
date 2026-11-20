@@ -462,7 +462,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string; synthetic?: true },
 ): void {
   if (isLarkChatId(replyRootId)) replyRootId = undefined;
   // #597: the frozen per-turn dispatch context — the authoritative reply target
@@ -488,11 +488,11 @@ export function beginReplyTargetTurn(
               ? { requesterIsBot: ds.session.quoteTargetSenderIsBot } : {}) } : {}),
     ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
       ? { sourceMessageId: opts.sourceMessageId } : {}),
-    ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
-    ...(ds.session.quoteTargetSenderOpenId
+    ...(!opts?.synthetic && ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
+    ...(!opts?.synthetic && ds.session.quoteTargetSenderOpenId
       ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
       : {}),
-    ...(ds.session.quoteTargetSenderIsBot !== undefined
+    ...(!opts?.synthetic && ds.session.quoteTargetSenderIsBot !== undefined
       ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
       : {}),
     // Chat-scope only: distinguishes "answered flat AT TOP LEVEL" from
@@ -542,7 +542,7 @@ export function beginReplyTargetTurn(
   );
   ds.session.replyTargets = targets;
 
-  if (ds.scope !== 'chat') return;
+  if (ds.scope !== 'chat' || opts?.synthetic) return;
   if (replyRootId) {
     const aliases = { ...(ds.replyThreadAliases ?? ds.session.replyThreadAliases ?? {}) };
     aliases[replyRootId] = {

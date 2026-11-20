@@ -112,7 +112,7 @@ import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../se
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
 import { unpinnedSessionWorkingDir } from './working-dir-range.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
-import { getAttachmentsDir } from './attachment-path.js';
+import { attachmentsRoot, getAttachmentsDir, safeAttachmentFileName } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
 import { beginReplyTargetTurn, pickTurnReplyTarget } from './reply-target.js';
 import { readDeferredTopicBinding, removeDeferredTopicBinding } from './deferred-topic-binding.js';
@@ -712,14 +712,14 @@ export async function downloadResources(larkAppId: string, messageId: string, re
   let needLogin = false;
 
   for (const res of resources) {
-    const savePath = join(dir, res.name);
+    const savePath = join(dir, safeAttachmentFileName(res.name, res.key));
     try {
       const resMessageId = res.messageId ?? messageId;
       // Whose token backs the user-token fallback: the person who sent the
       // attachment. They can see what they just posted, and the download is
       // attributed to them rather than to whoever happens to be logged in.
       await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId,
-        res.fallbackMessageIds ? { fallbackMessageIds: res.fallbackMessageIds } : undefined);
+        { withinRoot: attachmentsRoot(), ...(res.fallbackMessageIds ? { fallbackMessageIds: res.fallbackMessageIds } : {}) });
       const attachment: LarkAttachment = { type: res.type, path: savePath, name: res.name, resourceKey: res.key };
       // Sniffing is best-effort: a successfully downloaded attachment must remain available.
       try {

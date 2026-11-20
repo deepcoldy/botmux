@@ -127,6 +127,9 @@ export type ContractEvent =
   | { type: 'execution_admitted'; execution: ExecutionContract }
   | { type: 'execution_phase'; execution: ExecutionRef; runtime: RuntimeRef; phase: Exclude<ExecutionPhase, 'succeeded' | 'failed' | 'cancelled'> }
   | { type: 'execution_continued'; execution: ExecutionRef; from: RuntimeRef; runtime: RuntimeRef }
+  /** A successor worker re-attached the very CLI process `from` ran in, with
+   * the same native conversation, and that process now is `runtime`. */
+  | { type: 'execution_reattached'; execution: ExecutionRef; from: RuntimeRef; runtime: RuntimeRef }
   | { type: 'execution_terminal'; execution: ExecutionRef; runtime: RuntimeRef; status: 'succeeded' | 'failed' | 'cancelled' | 'reconciling'; evidence: string; errorCode?: string }
   | { type: 'execution_output'; execution: ExecutionRef; output: NonNullable<ExecutionContract['output']>; delivery?: ExecutionContract['deliveries'][number] }
   | { type: 'control_requested'; operation: ControlOperation }
@@ -246,6 +249,16 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
       // This logical request was already accepted by the old CLI. Do not
       // make its original bytes runnable again on a fresh worker bootstrap.
       state.execution!.runtime = event.runtime; state.execution!.phase = 'accepted'; state.execution!.revision++;
+      return finish('applied');
+    case 'execution_reattached':
+      if (!sameExecution(state.execution?.ref, event.execution) || !sameRuntime(state.execution?.runtime, event.from)
+        || !sameRuntime(state.runtime?.ref, event.runtime) || !sameRuntime(session.activeRuntime, event.runtime)
+        || session.lifecycle !== 'active' || session.activeOperationId || state.execution?.terminal
+        || ['succeeded', 'failed', 'cancelled'].includes(state.execution?.phase ?? '')
+        || sameRuntime(event.from, event.runtime)) return finish('stale');
+      // The attempt never left that process: no input is replayed and its
+      // phase stands. Only the runtime it is reported under moves to the live one.
+      state.execution!.runtime = event.runtime; state.execution!.revision++;
       return finish('applied');
     case 'execution_phase':
       if (!sameExecution(state.execution?.ref, event.execution) || !sameRuntime(state.execution?.runtime, event.runtime)) return finish('stale');

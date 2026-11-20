@@ -1,0 +1,30 @@
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     ~/work
+  ▄▀▀      ▀▀▄
+
+─────────────────────────────────────────
+> run it
+
+● Ran (touch /tmp/...) (ctrl+o to expand)
+
+Command
+────────────────────────────────────────────
+
+Requesting permission for:
+   touch
+/tmp/agy-probe-perm-marker-xyz && echo
+done
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this
+conversation for commands that start with
+'touch'
+  3. Yes, and always allow for commands that
+start with 'touch' (Persist to
+settings.json)
+  4. No, cancel
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/exp
+esc to cancel           Gemini 3.1 Pro · low
