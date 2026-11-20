@@ -134,7 +134,7 @@ describe('botmux version reminder delivery', () => {
     controllers.splice(0).forEach(c => c.stop());
     __testOnly_resetLarkGate();
     vi.useRealTimers(); vi.unstubAllEnvs();
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(dir, { recursive: true, force: true, maxRetries: 2, retryDelay: 25 });
   });
 
   it('default-off real config does no checks, creates no ledger, and enabling is live', async () => {
