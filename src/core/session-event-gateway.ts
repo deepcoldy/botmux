@@ -68,9 +68,14 @@ export class SessionEventGateway {
       // not bind/start the attempt and still require the current producer.
       // The worker announces capture identity at the CLI write boundary,
       // before turn_execution_started binds the queued execution.
+      // terminal_turn_started is that start for a turn the CLI began on its
+      // own (a background task's wake-up, terminal input, a built-in scheduled
+      // fire): the controller has just admitted its execution on the current
+      // runtime, and the daemon must record where the turn's reply goes. In a
+      // zero-prompt session a local final without that record is not delivered.
       const unboundCurrent = sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime)
         && (['turn_execution_started', 'native_input_consumed', 'turn_terminal', 'final_output'].includes(type)
-          || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition', 'capture_identity'].includes(type)));
+          || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition', 'capture_identity', 'terminal_turn_started'].includes(type)));
       const sourceRuntime = execution.runtime ? this.store.runtime(this.session, execution.runtime.runtimeId) : undefined;
       const sameContinuedExecutionRuntime = !!execution.runtime && sameWorker(state.worker, channel)
         && (this.store.runtimeContinues(this.session, execution.runtime, runtime, channel)

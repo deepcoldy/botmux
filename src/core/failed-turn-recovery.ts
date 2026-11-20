@@ -71,6 +71,13 @@ export function failedTurnCaller(ds: DaemonSession, turnId: string): TrustedCall
  * once at the native limited edge, while the authenticated turn still exists. */
 export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | undefined): void {
   if (!turnId || ds.lastCliInputTurnId !== turnId || !ds.usageLimit?.limited || ds.session.lastFailedTurn?.turnId === turnId) return;
+  // This snapshot exists for limits that never reach turn_terminal. Once the
+  // turn has an observed terminal, recordFailedTurnTerminal owns its outcome; a
+  // later `limited` frame is the sticky ds.usageLimit carried past the turn, not
+  // a new failure. A recovery turn keeps its caller in failedTurnRecovery after
+  // the terminal, so without this an answered recovery is recorded as
+  // rate_limited and offered for replay.
+  if (ds.terminalIdentityTurnIds?.has(turnId)) return;
   const caller = failedTurnCaller(ds, turnId);
   if (!caller) return;
   const record = buildFailedTurnRecord({ turnId, status: 'failed', errorCode: `${ds.usageLimit.kind}_limited` }, {

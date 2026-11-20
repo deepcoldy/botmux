@@ -21,6 +21,7 @@ const mockCreateChat = vi.fn();
 const mockTransferChatOwner = vi.fn();
 const mockGetChatOwner = vi.fn();
 const mockGetChatShareLink = vi.fn();
+const mockAddUsersByOpenId = vi.fn();
 const mockAddUsersByUnionId = vi.fn();
 const mockAddBotToChat = vi.fn();
 const mockAddChatManagers = vi.fn();
@@ -29,6 +30,7 @@ vi.mock('../src/services/groups-store.js', () => ({
   transferChatOwner: (...args: any[]) => mockTransferChatOwner(...args),
   getChatOwner: (...args: any[]) => mockGetChatOwner(...args),
   getChatShareLink: (...args: any[]) => mockGetChatShareLink(...args),
+  addUsersToChatByOpenId: (...args: any[]) => mockAddUsersByOpenId(...args),
   addUsersToChatByUnionId: (...args: any[]) => mockAddUsersByUnionId(...args),
   addBotToChat: (...args: any[]) => mockAddBotToChat(...args),
   addChatManagers: (...args: any[]) => mockAddChatManagers(...args),
@@ -92,6 +94,7 @@ describe('createGroupWithBots', () => {
     mockListChatBotMembers.mockReset();
     mockResolveAllowedUsersWithMap.mockReset();
     mockBindOncall.mockReset();
+    mockAddUsersByOpenId.mockReset();
     mockAddUsersByUnionId.mockReset();
     mockAddBotToChat.mockReset();
     mockAddChatManagers.mockReset();
@@ -100,6 +103,7 @@ describe('createGroupWithBots', () => {
     // Default: share-link fetch succeeds. group-creator always calls this after
     // createChat; individual tests override to exercise the fallback path.
     mockGetChatShareLink.mockResolvedValue({ ok: true, shareLink: SHARE_LINK });
+    mockAddUsersByOpenId.mockResolvedValue({ invalidUserIds: [] });
     mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: [] });
     mockAddChatManagers.mockResolvedValue({ ok: true, addedManagers: [] });
     mockResolveAllowedUsersWithMap.mockResolvedValue({ resolved: [], map: new Map() });
@@ -380,6 +384,79 @@ describe('createGroupWithBots', () => {
       'share-link',
       'transfer',
     ]);
+  });
+
+  it('awaits the durable hook before deferred user and bot invitations', async () => {
+    const events: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    mockCreateChat.mockImplementation(async () => {
+      events.push('create');
+      return { chatId: 'oc_deferred', invalidBotIds: [], invalidUserIds: [] };
+    });
+    mockAddUsersByOpenId.mockImplementation(async () => {
+      events.push('users');
+      return { invalidUserIds: [] };
+    });
+    mockAddBotToChat.mockImplementation(async (_app: string, _chatId: string, ids: string[]) => {
+      events.push('bots');
+      return ids.map(id => ({ id, ok: true }));
+    });
+
+    const task = createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      userOpenIds: [USER_OPEN_ID],
+      deferUserInvites: true,
+      onChatCreated: async () => {
+        events.push('hook:start');
+        await gate;
+        events.push('hook:end');
+      },
+    });
+    await vi.waitFor(() => expect(events).toContain('hook:start'));
+    expect(events).toEqual(['create', 'hook:start']);
+    expect(mockCreateChat.mock.calls[0][1].userIds).toEqual([]);
+    expect(mockAddUsersByOpenId).not.toHaveBeenCalled();
+    expect(mockAddBotToChat).not.toHaveBeenCalled();
+
+    release();
+    await task;
+    expect(events.slice(0, 4)).toEqual(['create', 'hook:start', 'hook:end', 'users']);
+    expect(events[4]).toBe('bots');
+  });
+
+  it('merges deferred invite rejections into the existing owner-transfer semantics', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_deferred_reject', invalidBotIds: [], invalidUserIds: [] });
+    mockAddUsersByOpenId.mockResolvedValue({ invalidUserIds: [USER_OPEN_ID] });
+
+    const result = await createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR],
+      userOpenIds: [USER_OPEN_ID],
+      transferOwnerTo: USER_OPEN_ID,
+      deferUserInvites: true,
+    });
+
+    expect(result.invalidUserIds).toContain(USER_OPEN_ID);
+    expect(result.ownerTransferredTo).toBeNull();
+    expect(result.transferError).toBe('invitee_rejected');
+    expect(mockTransferChatOwner).not.toHaveBeenCalled();
+  });
+
+  it('does not invite users or bots when the durable chat-created hook fails', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_hook_failed', invalidBotIds: [], invalidUserIds: [] });
+
+    await expect(createGroupWithBots({
+      creatorLarkAppId: CREATOR,
+      larkAppIds: [CREATOR, OTHER_BOT],
+      userOpenIds: [USER_OPEN_ID],
+      deferUserInvites: true,
+      onChatCreated: async () => { throw new Error('reservation_failed'); },
+    })).rejects.toThrow('reservation_failed');
+
+    expect(mockAddUsersByOpenId).not.toHaveBeenCalled();
+    expect(mockAddBotToChat).not.toHaveBeenCalled();
   });
 
   it('skips transfer when invitee was rejected by Lark', async () => {

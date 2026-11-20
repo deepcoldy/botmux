@@ -68,6 +68,8 @@ export interface RecapIo {
   setTimer(run: () => void, ms: number): () => void;
   now(): number;
   warn(message: string): void;
+  /** One line per decision that changes (or keeps off) a card. */
+  info?(message: string): void;
 }
 
 /** What the panel knows about a turn when its card settles. */
@@ -172,7 +174,10 @@ export function noteRecapCard(
 ): void {
   const state = stateFor(ds);
   const latest = latestTurn(ds, state);
-  if (latest !== undefined && latest !== turnId) return;
+  if (latest !== undefined && latest !== turnId) {
+    io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: card of ${turnId.slice(0, 16)} ignored: the session's latest turn is ${latest.slice(0, 16)}`);
+    return;
+  }
   // A turn's material is taken once: a repeated terminal (or a replaced
   // worker reporting again) may know less than the first report did.
   const keep = state.turnId === turnId && hasFacts(state.input);
@@ -240,7 +245,10 @@ async function apply(ds: DaemonSession, state: State, io: RecapIo): Promise<void
     ...(state.model?.turnId === turnId ? { model: state.model.text } : {}),
     ...(state.input && io.showFacts(ds) ? { facts: state.input.facts } : {}),
   }, locale);
-  if (!markdown) return;
+  if (!markdown) {
+    io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: nothing to show for ${turnId.slice(0, 16)} (no files, commands or recap text)`);
+    return;
+  }
   const previous = state.shown && state.shown.turnId === turnId && sameCard(state.shown.card, card) ? state.shown : undefined;
   if (previous?.confirmed && previous.markdown === markdown) return;
   if (card.kind === 'unified') {
@@ -249,6 +257,7 @@ async function apply(ds: DaemonSession, state: State, io: RecapIo): Promise<void
     state.shown = shown;
     await card.publish(markdown);
     shown.confirmed = true;
+    io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: panel shown for ${turnId.slice(0, 16)}`);
     return;
   }
   const { messageId } = card;
@@ -286,4 +295,7 @@ async function apply(ds: DaemonSession, state: State, io: RecapIo): Promise<void
     return true;
   });
   if (written) shown.confirmed = true;
+  io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: ${written
+    ? `panel ${previous?.confirmed ? 'updated' : 'placed'} on ${messageId}`
+    : `${messageId} cannot take the panel (gone, or not an editable reply card)`} for ${turnId.slice(0, 16)}`);
 }

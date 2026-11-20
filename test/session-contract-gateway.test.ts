@@ -95,6 +95,32 @@ describe('contract gateway and real worker boundaries', () => {
     expect(s.controller.ingest(reading(3), s.worker)).toMatchObject({ kind: 'reject' });
   });
 
+  // A turn the CLI starts on its own (a background task's wake-up, terminal
+  // input) has no IM input behind it. Its start is how a zero-prompt session
+  // learns where the turn replies; refusing it lost every such answer.
+  it('admits the start of a turn the live CLI began on its own, but not one from a replaced CLI', () => {
+    const s = fixture();
+    const started = (sequence: number, turnId: string) => ({ type: 'terminal_turn_started', turnId,
+      startedAtMs: Date.now(), sessionContract: s.context(sequence) });
+    expect(s.controller.ingest(started(1, 'local-headless-wake'), s.worker)).toMatchObject({ kind: 'current' });
+    expect(s.controller.ingest({ type: 'final_output', sessionId: s.ref.sessionId, turnId: 'local-headless-wake',
+      content: 'verdict', lastUuid: 'uuid-verdict', terminalLocal: true, sessionContract: s.context(2) }, s.worker))
+      .toMatchObject({ kind: 'current' });
+    // The same CLI re-bound in process (its relay resolved, a new native id):
+    // the bridge still reports under the runtime the spawn bound.
+    const rebound = s.controller.reserveBinding('binding-rebound', s.worker);
+    s.controller.bindRuntime('binding-rebound', s.worker,
+      { backend: 'tmux', physicalId: '222:start2', nativeSessionId: 'native2', proof: 'process_start' }, undefined, 'binding-old');
+    const afterRebind = s.controller.ingest(started(3, 'local-headless-after-rebind'), s.worker);
+    expect(afterRebind).toMatchObject({ kind: 'current' });
+    expect(sameRuntime((afterRebind as { context: { scope: { runtime?: unknown } } }).context.scope.runtime as any, rebound)).toBe(true);
+    s.controller.reserveBinding('binding-replacement', s.worker);
+    s.controller.bindRuntime('binding-replacement', s.worker,
+      { backend: 'tmux', physicalId: 'new-process', nativeSessionId: 'native1', proof: 'process_start' });
+    // Still scoped to the CLI that was replaced.
+    expect(s.controller.ingest(started(4, 'local-headless-late'), s.worker)).toMatchObject({ kind: 'reject' });
+  });
+
   it('admits current close receipts while closing without admitting runtime input or stale workers', () => {
     const s = fixture();
     s.controller.beginControl('close');

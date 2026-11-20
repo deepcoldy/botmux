@@ -396,6 +396,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   getChatModeStrict: vi.fn(async () => 'topic' as const),
   getMessageThreadId: vi.fn(async () => 'omt_child'),
   getMessageDetail: vi.fn(),
+  forwardMessage: vi.fn(async () => 'om_forwarded'),
   // privateCard /relay picker: chat-scope 普通群 sends the picker ephemeral
   // (visible-to-invoker) via this. Default resolves to a fake ephemeral id;
   // scenarios override with mockRejectedValueOnce to exercise the fallback.
@@ -404,25 +405,29 @@ vi.mock('../src/im/lark/client.js', () => ({
 
 vi.mock('../src/services/group-auto-title.js', () => ({
   registerGroupAutoTitle: vi.fn(),
+  scheduleGroupAutoTitle: vi.fn(),
 }));
 
 vi.mock('../src/services/group-creator.js', () => ({
-  createGroupWithBots: vi.fn(async (opts: any) => ({
-    ok: true,
-    chatId: 'oc_new_group',
-    creator: opts.creatorLarkAppId,
-    invalidBotIds: [],
-    invalidUserIds: [],
-    ownerTransferredTo: opts.transferOwnerTo ?? null,
-    transferError: null,
-    notifyMessageId: 'om_notify',
-    notifyError: null,
-    oncallBindings: [],
-    roleProfileBootstrapMessageId: null,
-    roleProfileBootstrapError: null,
-    managersAdded: [],
-    managerError: null,
-  })),
+  createGroupWithBots: vi.fn(async (opts: any) => {
+    if (opts.deferUserInvites) await opts.onChatCreated?.('oc_new_group');
+    return {
+      ok: true,
+      chatId: 'oc_new_group',
+      creator: opts.creatorLarkAppId,
+      invalidBotIds: [],
+      invalidUserIds: [],
+      ownerTransferredTo: opts.transferOwnerTo ?? null,
+      transferError: null,
+      notifyMessageId: 'om_notify',
+      notifyError: null,
+      oncallBindings: [],
+      roleProfileBootstrapMessageId: null,
+      roleProfileBootstrapError: null,
+      managersAdded: [],
+      managerError: null,
+    };
+  }),
 }));
 
 vi.mock('../src/services/p2p-force-topic-store.js', () => ({
@@ -522,6 +527,21 @@ vi.mock('../src/core/session-manager.js', () => ({
   ensureSessionWhiteboard: vi.fn((ds: any) => { ds.session.whiteboardId = 'wb_test'; }),
   getAvailableBots: vi.fn(async () => []),
   resumeSession: vi.fn(),
+  spawnDashboardSession: vi.fn(async (activeSessions: Map<string, any>, _refresh: unknown, args: any) => {
+    const sessionId = 'sess-task';
+    activeSessions.set(`${args.chatId}::${args.larkAppId}`, {
+      session: { sessionId, queued: true, status: 'active' },
+      worker: null,
+      pendingRepo: false,
+      initialStartPending: false,
+    });
+    return { ok: true, sessionId };
+  }),
+  activateQueuedSession: vi.fn(async (ds: any) => {
+    ds.session.queued = false;
+    ds.worker = { killed: false };
+    return { ok: true };
+  }),
 }));
 
 // Only the two discovery/validation entrypoints are stubbed; keep the real
@@ -763,16 +783,16 @@ import { canOperate, canOperateBotSender, isKnownPeerBot, isPlatformTeamBotTrust
 import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../src/services/worktree-cleanup-store.js';
 import { getBotUnionId } from '../src/services/bot-union-ids-store.js';
 import { isTeamBot } from '../src/services/team-bots-store.js';
-import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, resumeSession } from '../src/core/session-manager.js';
+import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, resumeSession, spawnDashboardSession, activateQueuedSession } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { resetSessionCodexModelSelection } from '../src/core/worker-pool.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError, forwardMessage, getChatName } from '../src/im/lark/client.js';
 import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/services/p2p-force-topic-store.js';
 import { buildAdoptSelectCard, buildRepoSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
-import { registerGroupAutoTitle } from '../src/services/group-auto-title.js';
+import { registerGroupAutoTitle, scheduleGroupAutoTitle } from '../src/services/group-auto-title.js';
 import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir, type ChatReplyMode } from '../src/bot-registry.js';
 import { getChatReplyModeState, resolveRegularGroupMode } from '../src/services/chat-reply-mode-store.js';
 import { t } from '../src/i18n/index.js';
@@ -9886,6 +9906,241 @@ describe('handleCommand', () => {
 
       expect(mockedCreate.mock.calls[0][0].onChatCreated).toBeUndefined();
       expect(mockedCreate.mock.calls[0][0].customization?.avatar).toBe('logo');
+    });
+
+    describe('task mode (opt-in: --start / groupCreation.autoStart: true; --no-start overrides)', () => {
+      const spawn = () => vi.mocked(spawnDashboardSession);
+      const activate = () => vi.mocked(activateQueuedSession);
+      const withAutoStart = (autoStart: boolean) => vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { autoStart } } };
+      }) as any);
+
+      it('without opt-in, /g <text> keeps its released meaning: a plain named group, nothing admitted, started, forwarded or titled', async () => {
+        const admitTaskPrompt = vi.fn(async () => true);
+        const deps = { ...makeDeps(), admitTaskPrompt };
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 支付排障', { chatId: CHAT_ID, parentId: 'om_quote' }), deps, LARK_APP_ID);
+        const opts = mockedCreate.mock.calls[0][0];
+        expect(opts.name).toBe('支付排障');
+        expect(opts.ensureBotCollaboration).toBeUndefined();
+        expect(opts.onChatCreated).toBeUndefined();
+        expect(admitTaskPrompt).not.toHaveBeenCalled();
+        expect(spawn()).not.toHaveBeenCalled();
+        expect(forwardMessage).not.toHaveBeenCalled();
+        expect(scheduleGroupAutoTitle).not.toHaveBeenCalled();
+        expect(vi.mocked(deps.sessionReply).mock.calls[0][1]).toContain('直接在新群里开聊');
+      });
+
+      it('autoStart: true names the chat from the task, starts this bot there with the source locators, and titles from the task', async () => {
+        withAutoStart(true);
+        vi.mocked(getChatName).mockResolvedValueOnce('Team');
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 修复价格展示\n第二行细节', { chatId: CHAT_ID, threadId: 'omt_src' }), deps, LARK_APP_ID);
+
+        const opts = mockedCreate.mock.calls[0][0];
+        expect(opts.name).toBe('修复价格展示');
+        expect(opts.deferUserInvites).toBe(true);
+        expect(typeof opts.ensureBotCollaboration).toBe('function');
+        expect(spawn()).toHaveBeenCalledTimes(1);
+        const reserved = lastMadeActiveSessions?.get('oc_new_group::app-1');
+        expect(reserved?.session.sessionId).toBe('sess-task');
+        expect(activate()).toHaveBeenCalledTimes(1);
+        expect(activate()).toHaveBeenCalledWith(reserved);
+        const args = spawn().mock.calls[0][2];
+        expect(args).toMatchObject({ larkAppId: LARK_APP_ID, chatId: 'oc_new_group', column: 'backlog', ownerOpenId: 'ou_sender' });
+        for (const part of ['修复价格展示\n第二行细节', CHAT_ID, 'Team', 'msg_001', 'omt_src']) expect(args.content).toContain(part);
+        expect(scheduleGroupAutoTitle).toHaveBeenCalledWith({ larkAppId: LARK_APP_ID, chatId: 'oc_new_group', userText: '修复价格展示\n第二行细节' });
+        expect(forwardMessage).not.toHaveBeenCalled();
+        const reply = vi.mocked(deps.sessionReply).mock.calls[0][1];
+        expect(reply).toContain('任务群');
+        expect(reply).not.toContain('直接在新群里开聊');
+      });
+
+      it('--start opts a single command in on a bot without autoStart', async () => {
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 修复价格展示', { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
+        expect(mockedCreate.mock.calls[0][0].name).toBe('修复价格展示');
+        expect(spawn()).toHaveBeenCalledTimes(1);
+        expect(spawn().mock.calls[0][2].content).toContain('修复价格展示');
+        expect(spawn().mock.calls[0][2].content).not.toContain('--start');
+      });
+
+      it('--no-start overrides autoStart: true and keeps a plain named group', async () => {
+        withAutoStart(true);
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --no-start 项目群', { parentId: 'om_quote' }), deps, LARK_APP_ID);
+        expect(mockedCreate.mock.calls[0][0].name).toBe('项目群');
+        expect(mockedCreate.mock.calls[0][0].ensureBotCollaboration).toBeUndefined();
+        expect(spawn()).not.toHaveBeenCalled();
+        expect(forwardMessage).not.toHaveBeenCalled();
+        expect(vi.mocked(deps.sessionReply).mock.calls[0][1]).toContain('直接在新群里开聊');
+      });
+
+      it('a bare /g with no text and no quote stays a plain group titled from its first message', async () => {
+        withAutoStart(true);
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g'), makeDeps(), LARK_APP_ID);
+        expect(mockedCreate).toHaveBeenCalledTimes(1);
+        expect(spawn()).not.toHaveBeenCalled();
+        expect(scheduleGroupAutoTitle).not.toHaveBeenCalled();
+      });
+
+      it('a quoted message carries the task: it names the chat and is forwarded in', async () => {
+        vi.mocked(getMessageDetail).mockResolvedValueOnce({ items: [{
+          message_id: 'om_quote', msg_type: 'text', body: { content: JSON.stringify({ text: '线上告警排查' }) },
+          sender: { id: 'ou_other', sender_type: 'user' }, create_time: '1',
+        }] });
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start', { chatId: CHAT_ID, parentId: 'om_quote' }), makeDeps(), LARK_APP_ID);
+        expect(mockedCreate.mock.calls[0][0].name).toBe('线上告警排查');
+        expect(forwardMessage).toHaveBeenCalledWith(LARK_APP_ID, 'om_quote', 'oc_new_group');
+        expect(spawn().mock.calls[0][2].content).toContain('om_quote');
+      });
+
+      it('admission resolves the complete quote plus command and quote attachment metadata once', async () => {
+        const commandPost = JSON.stringify({ title: '', content: [[
+          { tag: 'text', text: '/g --start' },
+          { tag: 'file', file_key: 'file_command', file_name: 'command.pdf' },
+        ]] });
+        const quotedPost = JSON.stringify({ title: '', content: [[
+          { tag: 'text', text: '机密任务' },
+          { tag: 'file', file_key: 'file_quote', file_name: 'prod.env' },
+        ]] });
+        vi.mocked(getMessageDetail).mockResolvedValueOnce({ items: [{
+          message_id: 'om_quote', msg_type: 'post', body: { content: quotedPost },
+          sender: { id: 'ou_other', sender_type: 'user' }, create_time: '1',
+        }] });
+        let resolved: any;
+        const admitTaskPrompt = vi.fn(async (input: any) => {
+          resolved = await input.resolvePrompt();
+          return true;
+        });
+        const deps = { ...makeDeps(), admitTaskPrompt };
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start', {
+          chatId: CHAT_ID, parentId: 'om_quote', msgType: 'post', rawPostContent: commandPost,
+        }), deps, LARK_APP_ID);
+
+        expect(resolved).toEqual({
+          promptContent: '机密任务[文件: prod.env]',
+          promptAttachments: [{ type: 'file', name: 'command.pdf' }, { type: 'file', name: 'prod.env' }],
+        });
+        expect(getMessageDetail).toHaveBeenCalledTimes(1);
+        expect(mockedCreate).toHaveBeenCalledTimes(1);
+        expect(spawn()).toHaveBeenCalledTimes(1);
+      });
+
+      it('fails before group creation when the quote cannot be read', async () => {
+        vi.mocked(getMessageDetail).mockRejectedValueOnce(new Error('denied'));
+        const admitTaskPrompt = vi.fn(async (input: any) => {
+          await input.resolvePrompt();
+          return true;
+        });
+        const deps = { ...makeDeps(), admitTaskPrompt };
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start', {
+          chatId: CHAT_ID, parentId: 'om_quote',
+        }), deps, LARK_APP_ID);
+
+        expect(mockedCreate).not.toHaveBeenCalled();
+        expect(spawn()).not.toHaveBeenCalled();
+        expect(scheduleGroupAutoTitle).not.toHaveBeenCalled();
+        expect(vi.mocked(deps.sessionReply).mock.calls[0][1]).toContain('无法读取引用');
+      });
+
+      it('does not repeat forwarding or activation when the source receipt fails after startup', async () => {
+        const deps = makeDeps();
+        vi.mocked(deps.sessionReply).mockRejectedValueOnce(new Error('source_reply_failed'));
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 原任务', { msgType: 'image' }), deps, LARK_APP_ID);
+
+        expect(vi.mocked(forwardMessage)).toHaveBeenCalledTimes(1);
+        expect(activate()).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(deps.sessionReply)).toHaveBeenCalledTimes(1);
+      });
+
+      it('activates the same reserved session and reports setup failure after the chat exists', async () => {
+        mockedCreate.mockImplementationOnce(async (opts: any) => {
+          await opts.onChatCreated('oc_new_group');
+          throw new Error('later_setup_failed');
+        });
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 原任务'), deps, LARK_APP_ID);
+
+        expect(spawn()).toHaveBeenCalledTimes(1);
+        expect(activate()).toHaveBeenCalledTimes(1);
+        const reply = vi.mocked(deps.sessionReply).mock.calls[0][1];
+        expect(reply).toContain('原任务');
+        expect(reply).toContain('later_setup_failed');
+        expect(reply).toContain('原始任务均已保留');
+        expect(reply).toContain('oc_new_group');
+      });
+
+      it('does not spawn a replacement when a different session generation wins during forwarding', async () => {
+        vi.mocked(forwardMessage).mockImplementationOnce(async () => {
+          lastMadeActiveSessions?.set('oc_new_group::app-1', {
+            session: { sessionId: 'sess_other', queued: false, status: 'active' }, worker: null,
+          } as any);
+          return 'om_forwarded';
+        });
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 原任务', { msgType: 'image' }), deps, LARK_APP_ID);
+
+        expect(spawn()).toHaveBeenCalledTimes(1);
+        expect(activate()).not.toHaveBeenCalled();
+        expect(vi.mocked(deps.sessionReply).mock.calls[0][1]).toContain('session_exists');
+      });
+
+      it('reports automatic worktree setup without asking the user to pick a repository', async () => {
+        activate().mockImplementationOnce(async (ds: any) => {
+          ds.pendingRepo = true;
+          ds.session.pendingRepoSetup = { mode: 'auto_worktree' };
+          return { ok: true };
+        });
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 自动建仓任务'), deps, LARK_APP_ID);
+
+        const reply = vi.mocked(deps.sessionReply).mock.calls[0][1];
+        expect(reply).toContain('自动创建 worktree');
+        expect(reply).not.toContain('等你选择仓库');
+      });
+
+      it('keeps a bot-originated opening explicitly ownerless but preserves its creator', async () => {
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start delegated task', {
+          senderType: 'app', senderId: 'ou_sender_bot', senderUnionId: 'on_sender_bot',
+        }), makeDeps(), LARK_APP_ID);
+
+        expect(spawn().mock.calls[0][2]).toMatchObject({
+          ownerOpenId: null,
+          creatorOpenId: 'ou_sender_bot',
+          column: 'backlog',
+        });
+        expect(spawn().mock.calls[0][2].ownerUnionId).toBeUndefined();
+      });
+
+      it('inside a topic the root in parent_id is not a quote', async () => {
+        withAutoStart(true);
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g', { threadId: 'omt_1', rootId: 'om_root', parentId: 'om_root' }), deps, LARK_APP_ID);
+        expect(spawn()).not.toHaveBeenCalled();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g 任务', { threadId: 'omt_1', rootId: 'om_root', parentId: 'om_root' }), deps, LARK_APP_ID);
+        expect(forwardMessage).not.toHaveBeenCalled();
+        expect(spawn().mock.calls[0][2].content).not.toContain('引用：om_root');
+      });
+
+      it('a refused task (talk/gate/quota) creates nothing', async () => {
+        const admitTaskPrompt = vi.fn(async () => false);
+        const deps = { ...makeDeps(), admitTaskPrompt };
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 任务'), deps, LARK_APP_ID);
+        expect(admitTaskPrompt).toHaveBeenCalledWith(expect.objectContaining({ larkAppId: LARK_APP_ID, content: '任务' }));
+        expect(mockedCreate).not.toHaveBeenCalled();
+        expect(spawn()).not.toHaveBeenCalled();
+      });
+
+      it('keeps the chat and reports when the session cannot start', async () => {
+        activate().mockResolvedValueOnce({ ok: false, error: 'session_exists' });
+        vi.mocked(forwardMessage).mockRejectedValueOnce(new Error('denied'));
+        const deps = makeDeps();
+        await handleCommand('/g', ROOT_ID, makeLarkMessage('/g --start 任务', { msgType: 'image' }), deps, LARK_APP_ID);
+        const reply = vi.mocked(deps.sessionReply).mock.calls[0][1];
+        expect(reply).toContain('session_exists');
+        expect(reply).toContain('转发');
+        expect(reply).toContain('oc_new_group');
+      });
     });
 
     it('/g --avatar off keeps Feishu\'s default avatar', async () => {
