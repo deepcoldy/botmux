@@ -278,6 +278,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     const message = worker.send.mock.calls.map((c: any[]) => c[0]).find((m: any) => m.type === 'message');
     expect(message?.model).toBe('opus');
+    expect(message?.replyDelivery).toBe('transcript');
     // Same for the startup commands / shell edited while parked (the recovery
     // spawn replays them).
     expect(message?.startupCommands).toEqual(['/effort xhigh']);

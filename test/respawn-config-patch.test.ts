@@ -3,7 +3,7 @@
  * before an in-worker respawn (restart IPC, or a message to a crash-parked worker).
  */
 import { describe, expect, it } from 'vitest';
-import { applyRespawnConfigPatch, type RespawnPatchTarget } from '../src/core/respawn-config-patch.js';
+import { applyRespawnConfigPatch, respawnConfigPatchFromMessage, type RespawnPatchTarget } from '../src/core/respawn-config-patch.js';
 
 type Cfg = RespawnPatchTarget & { nativeSessionTitle?: string; reasoningEffort?: string; cliId: string };
 
@@ -88,5 +88,30 @@ describe('applyRespawnConfigPatch', () => {
     expect(cfg.workingDir).toBe('/repo');
     expect(applyRespawnConfigPatch(cfg, { codexRpcInput: true }).traexReconfigure).toBe(true);
     expect(applyRespawnConfigPatch(cfg, { traexAutoModel: null }).traexReconfigure).toBe(true);
+  });
+});
+
+describe('respawnConfigPatchFromMessage', () => {
+  it('crash-park 恢复消息携带并应用新 replyDelivery 与启动配置', () => {
+    const cfg: Cfg = { ...forkSnapshot(), replyDelivery: 'send' };
+    const patch = respawnConfigPatchFromMessage({
+      model: 'sonnet', startupCommands: ['/effort low'], launchShell: 'bash', replyDelivery: 'transcript',
+    }, true);
+    applyRespawnConfigPatch(cfg, patch);
+    expect(cfg).toMatchObject({
+      model: 'sonnet', startupCommands: ['/effort low'], launchShell: 'bash', replyDelivery: 'transcript',
+    });
+  });
+
+  it('普通消息不得改变在跑 pane 的投递门控或启动配置', () => {
+    const cfg: Cfg = { ...forkSnapshot(), replyDelivery: 'transcript' };
+    const patch = respawnConfigPatchFromMessage({
+      model: 'sonnet', startupCommands: ['/effort low'], launchShell: 'bash', replyDelivery: 'send',
+    }, false);
+    applyRespawnConfigPatch(cfg, patch);
+    expect(cfg.model).toBe('sonnet');
+    expect(cfg.replyDelivery).toBe('transcript');
+    expect(cfg.startupCommands).toEqual(forkSnapshot().startupCommands);
+    expect(cfg.launchShell).toBe(forkSnapshot().launchShell);
   });
 });

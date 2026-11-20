@@ -132,6 +132,41 @@ export function effectiveReplyDelivery(
   return 'send';
 }
 
+export interface LegacyReplyDeliverySession {
+  replyDeliveryLegacy?: { cliId: string; mode: ReplyDelivery };
+}
+
+/** Resolve the pre-snapshot fallback exactly once per CLI generation. Without
+ * this freeze, every worker re-fork re-reads today's explicit config and can
+ * contradict the prompt still running in a legacy pane. The first inference is
+ * necessarily heuristic for a pane whose config was edited BEFORE the first
+ * post-upgrade reattach (no launch evidence survives); operators should restart
+ * that CLI. Later edits must never move the frozen value again. */
+export function resolveLegacyReplyDeliveryForSession(
+  session: LegacyReplyDeliverySession,
+  larkAppId: string,
+  cliId: string,
+  promptInjection: PromptInjection | undefined,
+  persist: () => void,
+): ReplyDelivery {
+  const frozen = session.replyDeliveryLegacy;
+  if (frozen?.cliId === cliId && (frozen.mode === 'send' || frozen.mode === 'transcript')) {
+    return frozen.mode;
+  }
+  const mode = effectiveReplyDelivery(larkAppId, cliId, promptInjection, { legacyDefault: true });
+  const previous = session.replyDeliveryLegacy;
+  session.replyDeliveryLegacy = { cliId, mode };
+  try {
+    persist();
+  } catch (error) {
+    // Do not leave a value that only LOOKS frozen in memory: the next fork must
+    // still resolve/persist it instead of silently skipping the durable write.
+    session.replyDeliveryLegacy = previous;
+    throw error;
+  }
+  return mode;
+}
+
 export interface SoloSessionInput {
   chatType: 'group' | 'p2p' | undefined;
   /** `getChatMode` 结果：'group' 普通群 / 'topic' 话题群；undefined = 未知。 */

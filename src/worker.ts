@@ -190,7 +190,7 @@ import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJo
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, finalBridgeSendMarkerCoversOwnThread, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideFirstWriteLiveness,
@@ -217,7 +217,7 @@ import {
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
-import { applyRespawnConfigPatch } from './core/respawn-config-patch.js';
+import { applyRespawnConfigPatch, respawnConfigPatchFromMessage } from './core/respawn-config-patch.js';
 import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import {
@@ -12023,12 +12023,18 @@ function judgeClaudeBridgeTurn(): void {
   const adoptMode = lastInitConfig?.adoptMode === true;
   const sendsDuringTurn = adoptMode ? [] : readSendMarkers()
     .filter(marker => marker.sentAtMs >= verdict.turnStartedAtMs && marker.terminalIndependent !== true);
+  const finalDeliveryTarget = {
+    sessionId: lastInitConfig?.sessionId,
+    chatId: lastInitConfig?.chatId,
+    rootMessageId: lastInitConfig?.rootMessageId,
+  };
   const needsNotice = blindTurnNeedsNotice({
     transcriptCarriesEveryReply: adoptMode || zeroPromptTerminalSync(),
     unreadLarkTurn: !!unreadLarkTurn,
     sentDuringTurn: sendsDuringTurn.length > 0,
     ...(replyDeliveryMode() === 'transcript'
-      ? { transcriptReplies: { sentFinalDuringTurn: sendsDuringTurn.some(isFinalBridgeSendMarker) } }
+      ? { transcriptReplies: { sentFinalDuringTurn: sendsDuringTurn.some(marker =>
+        finalBridgeSendMarkerCoversOwnThread(finalDeliveryTarget, marker)) } }
       : {}),
   });
   if (!needsNotice) return;
@@ -39367,18 +39373,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // restart IPC 可携带新值。三分态同 restart：undefined = 不携带（旧 daemon）
       // 保持快照；null = 明确不传模型。对已经在跑的 CLI 无影响（只在下次 spawn 用）。
       applyWorkerLaunchModel(lastInitConfig ?? undefined, msg);
-      // startupCommands / launchShell 同理，但只在**真的 parked**（下面那条恢复重启
-      // 即将执行）时才收：daemon 的 crashDiagnosticParked 在 worker 内恢复后不会清
-      // （只有 refork 的 ready 才清），之后每条消息都还捎带；而 runStartupCommands
-      // 在当前 spawn 的启动序列里实时读 lastInitConfig.startupCommands——若在启动
-      // 命令待确认时被换掉，正在跑的 CLI 会拿新列表配旧游标，两份都敲不全。
+      // startupCommands / launchShell / replyDelivery 同理，但只在**真的 parked**
+      // （下面那条恢复重启即将执行）时才收：daemon 的 crashDiagnosticParked 在
+      // worker 内恢复后不会清（只有 refork 的 ready 才清），之后每条消息都还捎带。
+      // 正在跑的 CLI 若在此换启动命令，会拿新列表配旧游标；若在此换投递方式，
+      // 则会出现旧提示配新门控。
       const parkedRespawnPending = !backend && crashDiagnosticStopped && !lastInitConfig?.adoptMode;
       if (lastInitConfig) {
-        applyRespawnConfigPatch(lastInitConfig, {
-          model: msg.model,
-          larkToolBinding: msg.larkToolBinding,
-          ...(parkedRespawnPending ? { startupCommands: msg.startupCommands, launchShell: msg.launchShell } : {}),
-        });
+        applyRespawnConfigPatch(lastInitConfig, respawnConfigPatchFromMessage(msg, parkedRespawnPending));
       }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written

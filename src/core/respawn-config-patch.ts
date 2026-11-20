@@ -65,6 +65,26 @@ export interface RespawnPatchResult {
   startupCommandsChanged: boolean;
 }
 
+/** Build the patch carried by an ordinary daemon `message`. Model/binding keep
+ * their historical always-on tri-state handling (the daemon only sends fresh
+ * values while parked). Reply delivery and launch commands are accepted ONLY
+ * when this message will trigger a crash-park respawn: applying them to a live
+ * pane would change the worker gate without rebuilding that pane's prompt. */
+export function respawnConfigPatchFromMessage(
+  msg: Pick<RespawnConfigPatch, 'model' | 'larkToolBinding' | 'startupCommands' | 'launchShell' | 'replyDelivery'>,
+  parkedRespawnPending: boolean,
+): RespawnConfigPatch {
+  return {
+    model: msg.model,
+    larkToolBinding: msg.larkToolBinding,
+    ...(parkedRespawnPending ? {
+      startupCommands: msg.startupCommands,
+      launchShell: msg.launchShell,
+      replyDelivery: msg.replyDelivery,
+    } : {}),
+  };
+}
+
 function sameList(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
   const x = a ?? [];
   const y = b ?? [];

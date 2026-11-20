@@ -22,6 +22,7 @@ import {
   computeSoloSessionForBot,
   defaultReplyDeliveryFor,
   effectiveReplyDelivery,
+  resolveLegacyReplyDeliveryForSession,
   supportsTranscriptReplyDelivery,
   type SoloSessionInput,
 } from '../src/core/reply-delivery.js';
@@ -400,5 +401,62 @@ describe('effectiveReplyDelivery', () => {
     expect(effectiveReplyDelivery('app_a', 'cursor', undefined, { sessionSandbox: false })).toBe('transcript');
     expect(effectiveReplyDelivery('app_a', 'cursor', undefined, { sessionSandbox: 'off' })).toBe('transcript');
     expect(effectiveReplyDelivery('app_a', 'codex', undefined, { sessionSandbox: 'scratch' })).toBe('transcript');
+  });
+});
+
+describe('resolveLegacyReplyDeliveryForSession', () => {
+  beforeEach(() => {
+    delete process.env.BOTMUX_SANDBOX;
+    vi.mocked(resolveReplyDelivery).mockReset();
+    vi.mocked(getBot).mockReset();
+    vi.mocked(getBot).mockReturnValue({ config: { sandbox: undefined } } as any);
+  });
+
+  it('首次推断写盘一次；之后配置从 transcript 改为 send 也不再 live 重算', () => {
+    const session: { replyDeliveryLegacy?: { cliId: string; mode: 'send' | 'transcript' } } = {};
+    const persist = vi.fn();
+    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+    expect(resolveLegacyReplyDeliveryForSession(session, 'app_a', 'claude-code', undefined, persist)).toBe('transcript');
+    expect(session.replyDeliveryLegacy).toEqual({ cliId: 'claude-code', mode: 'transcript' });
+    expect(persist).toHaveBeenCalledTimes(1);
+
+    // 模拟下一次 daemon fork：旧 pane 仍无环境快照，但 live 配置已经编辑。
+    vi.mocked(resolveReplyDelivery).mockClear();
+    vi.mocked(resolveReplyDelivery).mockReturnValue('send');
+    expect(resolveLegacyReplyDeliveryForSession(session, 'app_a', 'claude-code', undefined, persist)).toBe('transcript');
+    expect(resolveReplyDelivery).not.toHaveBeenCalled();
+    expect(persist).toHaveBeenCalledTimes(1);
+  });
+
+  it('CLI 切换作废旧冻结值并按新 CLI 重写；同 CLI 的 /restart 不重算', () => {
+    const session: { replyDeliveryLegacy?: { cliId: string; mode: 'send' | 'transcript' } } = {};
+    const persist = vi.fn();
+    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+    resolveLegacyReplyDeliveryForSession(session, 'app_a', 'claude-code', undefined, persist);
+
+    vi.mocked(resolveReplyDelivery).mockReturnValue('send');
+    expect(resolveLegacyReplyDeliveryForSession(session, 'app_a', 'codex', undefined, persist)).toBe('send');
+    expect(session.replyDeliveryLegacy).toEqual({ cliId: 'codex', mode: 'send' });
+    expect(persist).toHaveBeenCalledTimes(2);
+
+    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+    expect(resolveLegacyReplyDeliveryForSession(session, 'app_a', 'codex', undefined, persist)).toBe('send');
+    expect(persist).toHaveBeenCalledTimes(2);
+  });
+
+  it('写盘失败回滚内存冻结值；下一次 fork 不会把未落盘值当成已持久化', () => {
+    const session: { replyDeliveryLegacy?: { cliId: string; mode: 'send' | 'transcript' } } = {
+      replyDeliveryLegacy: { cliId: 'claude-code', mode: 'transcript' },
+    };
+    const previous = session.replyDeliveryLegacy;
+    vi.mocked(resolveReplyDelivery).mockReturnValue('send');
+    expect(() => resolveLegacyReplyDeliveryForSession(
+      session, 'app_a', 'codex', undefined, () => { throw new Error('SQLITE_BUSY'); },
+    )).toThrow('SQLITE_BUSY');
+    expect(session.replyDeliveryLegacy).toBe(previous);
+
+    const persist = vi.fn();
+    expect(resolveLegacyReplyDeliveryForSession(session, 'app_a', 'codex', undefined, persist)).toBe('send');
+    expect(persist).toHaveBeenCalledTimes(1);
   });
 });
