@@ -464,6 +464,42 @@ describe('controlled failed-turn recovery', () => {
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn).toMatchObject({ turnId: request.turnId, limitedSnapshot: true });
   });
+  it('rejects cross-chat caller capture and durable recovery even with a persisted trusted caller', async () => {
+    const crossChatOrigin = {
+      sourceChatId: 'oc_origin', followedChatId: 'oc_followed', followedRootMessageId: 'om_followed_root',
+    };
+    ds.session.replyTargets.om_failed.crossChatOrigin = crossChatOrigin;
+    ds.session.turnReplyContexts = {
+      om_failed: { target: { mode: 'thread', rootMessageId: 'om_root' }, crossChatOrigin },
+    };
+    expect(failedTurnCaller(ds, request.turnId)).toBeUndefined();
+    ds.lastUserPrompt = 'original task';
+    ds.lastCliInput = 'original wrapped input';
+    recordFailedTurnTerminal(ds, { turnId: request.turnId, status: 'failed' },
+      { workerGeneration: 1, caller, silent: false });
+    expect(ds.session.lastFailedTurn.crossChatOrigin).toEqual(crossChatOrigin);
+    ds.session.lastFailedTurn.failedAt = request.failedAt;
+    await expect(recoverFailedTurn('old', request)).resolves.toEqual({ ok: false, error: 'original_actor_unavailable' });
+    expect(pool.sendWorkerInput).not.toHaveBeenCalled();
+  });
+  it('rejects recovery after the short reply index is pruned but the cross-chat context survives', async () => {
+    const crossChatOrigin = {
+      sourceChatId: 'oc_origin', followedChatId: 'oc_followed', followedRootMessageId: 'om_followed_root',
+    };
+    ds.scope = ds.session.scope = 'chat';
+    beginReplyTargetTurn(ds, undefined, request.turnId, request.failedAt, {
+      senderOpenId: caller.requestUserOpenId,
+      participants: [{ openId: caller.requestUserOpenId, isBot: false }], crossChatOrigin,
+    });
+    for (let index = 0; index < 40; index++) {
+      beginReplyTargetTurn(ds, undefined, `om_later_${index}`, `2026-10-17T00:00:${String(index).padStart(2, '0')}.000Z`);
+    }
+    expect(ds.session.replyTargets[request.turnId]).toBeUndefined();
+    expect(ds.session.turnReplyContexts[request.turnId].crossChatOrigin).toEqual(crossChatOrigin);
+    expect(failedTurnCaller(ds, request.turnId)).toBeUndefined();
+    await expect(recoverFailedTurn('old', request)).resolves.toEqual({ ok: false, error: 'original_actor_unavailable' });
+    expect(pool.sendWorkerInput).not.toHaveBeenCalled();
+  });
   it('rejects bot/unknown attribution and does not infer a human from an owner', () => {
     ds.session.replyTargets = {}; delete ds.session.lastFailedTurn.trustedCaller;
     expect(failedTurnCaller(ds, request.turnId)).toBeUndefined();

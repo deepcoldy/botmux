@@ -403,6 +403,30 @@ describe('cross-chat followed thread binding', () => {
     expect(currentGatewayCallerOpenId(ds, 'om_reply_in_b')).toBeUndefined();
   });
 
+  it('keeps registry and recovery fallbacks closed when the short reply index is pruned first', () => {
+    const ds: any = {
+      larkAppId: APP_ID, scope: 'chat', chatId: GROUP_A,
+      session: { sessionId: 'sess-a', chatId: GROUP_A, rootMessageId: GROUP_A, scope: 'chat' },
+    };
+    beginReplyTargetTurn(ds, undefined, 'om_reply_in_b', '2026-11-17T12:00:00.000Z', {
+      senderOpenId: 'ou_stranger_b', participants: [{ openId: 'ou_stranger_b', isBot: false }],
+      crossChatOrigin: {
+        sourceChatId: GROUP_A, followedChatId: GROUP_B, followedRootMessageId: SENT_ROOT_IN_B,
+      },
+    });
+    for (let i = 0; i < 40; i++) {
+      beginReplyTargetTurn(ds, undefined, `om_later_${i}`, `2026-11-17T12:01:${String(i).padStart(2, '0')}.000Z`);
+    }
+    expect(ds.session.replyTargets.om_reply_in_b).toBeUndefined();
+    expect(ds.session.turnReplyContexts.om_reply_in_b.crossChatOrigin).toBeDefined();
+    expect(registryTurnMayAuthenticateHuman(ds.session, 'om_reply_in_b')).toBe(false);
+    ds.session.failedTurnRecovery = {
+      turnId: 'om_reply_in_b',
+      caller: { requestLarkAppId: APP_ID, requestUserOpenId: 'ou_stranger_b', senderType: 'user' },
+    };
+    expect(currentGatewayCallerOpenId(ds, 'om_reply_in_b')).toBeUndefined();
+  });
+
   it('parses --follow-thread-at and --no-follow-thread in send invocation', () => {
     const inv1 = parseSendInvocation(['--chat-id', GROUP_B, '--follow-thread-at', '--no-mention', 'hello']);
     expect(inv1.arityErrors).toEqual([]);

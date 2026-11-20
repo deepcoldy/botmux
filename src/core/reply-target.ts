@@ -292,11 +292,12 @@ export function registryTurnMayAuthenticateHuman(
     failedTurnRecovery?: { turnId: string };
     readonlyTaskContinuation?: { logicalTurnId: string; currentTurnId: string };
     replyTargets?: Record<string, { crossChatOrigin?: unknown; senderOpenId?: string }>;
+    turnReplyContexts?: Record<string, { crossChatOrigin?: unknown; target?: unknown }>;
   },
   turnId: string,
 ): boolean {
   if (!isHumanInboundTurnId(turnId)) return false;
-  if (s.replyTargets?.[turnId]?.crossChatOrigin) return false;
+  if (s.replyTargets?.[turnId]?.crossChatOrigin || s.turnReplyContexts?.[turnId]?.crossChatOrigin) return false;
   const ordinary = s.ordinaryTurnRecovery;
   if (ordinary && ordinary.currentTurnId === turnId && turnId !== ordinary.logicalTurnId) return false;
   if (s.failedTurnRecovery?.turnId === turnId) return false;

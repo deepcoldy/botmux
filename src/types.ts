@@ -305,6 +305,13 @@ export interface FailedTurnRecord {
   lastRetryAt?: string;    // ISO
   /** Daemon-frozen principal, never supplied by a recovery client. */
   trustedCaller?: TrustedCaller;
+  /** A followed-chat failure never authenticates the external sender for
+   * recovery, even after both per-turn indexes have been pruned. */
+  crossChatOrigin?: {
+    sourceChatId: string;
+    followedChatId: string;
+    followedRootMessageId: string;
+  };
   originalTurnId?: string;
   silent?: boolean;
   /** Provisional native quota observation, not a failed terminal. Unclaimed
