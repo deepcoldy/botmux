@@ -1,5 +1,7 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
-import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, createWriteStream, createReadStream, mkdirSync, mkdtempSync, rmSync, statSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { once } from 'node:events';
 import { dirname, extname, basename, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
@@ -2122,7 +2124,6 @@ export async function uploadFile(larkAppId: string, source: string | { name: str
   assertLarkTransport(larkAppId, 'uploadFile');
   return executeWithLarkGate(larkAppId, 'uploadFile', async () => {
     const c = getBotUploadClient(larkAppId);
-    const buf = typeof source === 'string' ? readFileSync(source) : source.bytes;
     const fileName = basename(typeof source === 'string' ? source : source.name);
     const ext = extname(fileName).toLowerCase();
     const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
@@ -2131,14 +2132,54 @@ export async function uploadFile(larkAppId: string, source: string | { name: str
     const duration = fileType === 'opus' && opts?.duration
       ? Math.max(1000, Math.round(opts.duration))
       : undefined;
-    // SDK returns { file_key } directly (not wrapped in { code, data })
-    const res = await c.im.v1.file.create({
-      data: { file_type: fileType as any, file_name: fileName, file: buf, ...(duration ? { duration } : {}) },
-    });
-    const fileKey = res?.file_key;
-    if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-    logger.info(`Uploaded file ${fileName} → ${fileKey}`);
-    return fileKey;
+    // The `file` part must be a file stream, not a Buffer. The SDK hands `data`
+    // to axios, which appends a Buffer to form-data WITHOUT a filename; Feishu
+    // then treats the part as a plain form field and rejects it with
+    // 400 code=9499 once it passes ~25–26MiB (the documented file limit is
+    // 30MiB). An fs.ReadStream carries `path`, so form-data emits
+    // `filename=` and a known Content-Length. In-memory sources are spilled to
+    // a temp file for the same reason. Built per attempt: the gate may retry
+    // and a consumed stream cannot be resent.
+    let tmpDir: string | undefined;
+    let file: ReturnType<typeof createReadStream> | undefined;
+    try {
+      let filePath: string;
+      if (typeof source === 'string') {
+        filePath = source;
+      } else {
+        tmpDir = mkdtempSync(join(tmpdir(), 'botmux-upload-'));
+        filePath = join(tmpDir, fileName);
+        writeFileSync(filePath, source.bytes);
+      }
+      const size = statSync(filePath).size;
+      file = createReadStream(filePath);
+      let res: { file_key?: string } | null | undefined;
+      try {
+        // SDK returns { file_key } directly (not wrapped in { code, data })
+        res = await c.im.v1.file.create({
+          data: { file_type: fileType as any, file_name: fileName, file, ...(duration ? { duration } : {}) },
+        });
+      } catch (err) {
+        logger.warn(`Upload file ${fileName} failed (size=${size} bytes, file_type=${fileType}): ${formatLarkError(err)}`);
+        throw err;
+      }
+      const fileKey = res?.file_key;
+      if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
+      logger.info(`Uploaded file ${fileName} (${size} bytes) → ${fileKey}`);
+      return fileKey;
+    } finally {
+      // A request that fails before reading the stream would otherwise leave
+      // the fd open. Destroy it and wait for the close before removing a temp
+      // file; the no-op listener keeps a teardown-time error (e.g. the open
+      // still in flight) from surfacing as an uncaught exception.
+      if (file && !file.closed) {
+        file.on('error', () => {});
+        const closed = once(file, 'close');
+        file.destroy();
+        await closed;
+      }
+      if (tmpDir) rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 }
 
