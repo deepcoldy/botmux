@@ -2887,6 +2887,7 @@ export function closeSession(
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
     }, { now: new Date() });
     if (applied.outcome === 'applied') {
+      next.followThreadEpoch = randomUUID();
       commitContractLifecycle(basis, 'close', () => {
         const latest = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
         const closed = latest ? JSON.parse(latest.row) as Session : undefined;

@@ -596,6 +596,9 @@ export interface Session {
   /** Model-specific topic preference; does not modify the bot or native CLI defaults. */
   topicReasoningEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort };
   sessionId: string;
+  /** Rotated on every successful close and retained on resume. Cross-chat
+   * follow bindings from an older lifecycle must never become active again. */
+  followThreadEpoch?: string;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
   messageListenerAutoClose?: boolean;
   /** Frozen origin of an isolated silent listener task; never a human reply route. */

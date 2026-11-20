@@ -250,6 +250,8 @@ export interface BridgeSendMarker {
   dispatchRootId?: string;
   /** Cross-chat thread reply follow-up policy ('at' by default when sent to another chat). */
   crossChatFollowThread?: 'at' | 'off';
+  /** Source session lifecycle captured when the provider delivery was accepted. */
+  followThreadEpoch?: string;
   responseKind?: TurnSendKind;
   turnId?: string;
   dispatchAttempt?: number;

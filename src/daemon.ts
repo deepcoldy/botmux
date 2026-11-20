@@ -4365,6 +4365,7 @@ function findCrossChatFollowedThread(
       rootMessageId: ds.session.rootMessageId,
       runtimeRoutingAnchor: ds.runtimeRoutingAnchor,
       status: ds.session.status,
+      followThreadEpoch: ds.session.followThreadEpoch,
       queued: ds.session.queued,
       messageListenerRun: ds.session.messageListenerRun,
       deferredScheduleRun: ds.session.deferredScheduleRun,

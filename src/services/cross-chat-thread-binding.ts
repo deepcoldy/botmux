@@ -25,6 +25,7 @@ export interface CrossChatCandidateSession {
   rootMessageId: string;
   runtimeRoutingAnchor?: string;
   status: 'active' | 'closed';
+  followThreadEpoch?: string;
   queued?: boolean;
   messageListenerRun?: unknown;
   deferredScheduleRun?: { routingAnchor?: string };
@@ -175,6 +176,7 @@ export function resolveCrossChatFollowedThread(input: {
     const latestByCanonicalRoot = new Map<string, BridgeSendMarker>();
     for (const marker of markers) {
       if (marker.sessionId !== s.sessionId
+        || marker.followThreadEpoch !== s.followThreadEpoch
         || marker.deliveryKind !== 'detoured_send' || marker.targetChatId !== chatId) continue;
       const matched = (marker.messageId && rootSet.has(marker.messageId))
         || (marker.targetRootMessageId && rootSet.has(marker.targetRootMessageId));

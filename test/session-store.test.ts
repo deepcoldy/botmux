@@ -128,6 +128,8 @@ import {
 } from '../src/services/session-store.js';
 import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lane-outbound-provenance.js';
 import { topicResumeBlockReason } from '../src/core/topic-session-continuity.js';
+import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { resolveCrossChatFollowedThread } from '../src/services/cross-chat-thread-binding.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 import { paneLaunchDir, writePaneLaunchFile } from '../src/adapters/backend/pane-launch.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
@@ -3334,6 +3336,35 @@ describe('closeSession()', () => {
 });
 
 describe('reactivateClosedSession()', () => {
+  it('does not revive a late cross-chat binding from the previous lifecycle', () => {
+    const session = createSession('oc_origin', 'om_root', 'Cross Chat Lifecycle');
+    const oldEpoch = session.followThreadEpoch;
+    const marker = {
+      dataDir: tempDir, sessionId: session.sessionId, sentAtMs: 1000, messageId: 'om_sent_to_b',
+      deliveryKind: 'detoured_send' as const, content: 'cross-chat', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at' as const, followThreadEpoch: oldEpoch,
+    };
+    recordBridgeReplyMarker(marker);
+    const resolve = () => resolveCrossChatFollowedThread({
+      dataDir: tempDir, larkAppId: session.larkAppId ?? 'test-app', chatId: 'oc_followed',
+      candidateRootIds: ['om_sent_to_b'],
+      sessions: [{
+        sessionId: session.sessionId, larkAppId: session.larkAppId ?? 'test-app', chatId: session.chatId,
+        rootMessageId: session.rootMessageId, scope: 'chat', status: session.status,
+        followThreadEpoch: session.followThreadEpoch,
+      }],
+    });
+    expect(resolve()).not.toBeNull();
+
+    closeSession(session.sessionId);
+    recordBridgeReplyMarker({ ...marker, sentAtMs: 2000 });
+    const resumed = reactivateClosedSession(session.sessionId);
+    expect(resumed.ok).toBe(true);
+    expect(session.followThreadEpoch).toBeDefined();
+    expect(session.followThreadEpoch).not.toBe(oldEpoch);
+    expect(resolve()).toBeNull();
+  });
+
   it.each(['awaiting_classification', 'terminal_notice_pending'] as const)(
     'does not revive %s XPI work left on a legacy closed row', (phase) => {
       const session = createSession('chat-xpi-resume', 'root-xpi-resume', 'Legacy Closed XPI');

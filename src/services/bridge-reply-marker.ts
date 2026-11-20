@@ -26,6 +26,7 @@ export interface RecordBridgeReplyMarkerInput {
   targetSessionId?: string;
   dispatchRootId?: string;
   crossChatFollowThread?: BridgeSendMarker['crossChatFollowThread'];
+  followThreadEpoch?: BridgeSendMarker['followThreadEpoch'];
 }
 
 /**
@@ -52,6 +53,7 @@ export function recordBridgeReplyMarker(input: RecordBridgeReplyMarkerInput): Br
     ...(input.targetSessionId ? { targetSessionId: input.targetSessionId } : {}),
     ...(input.dispatchRootId ? { dispatchRootId: input.dispatchRootId } : {}),
     ...(input.crossChatFollowThread ? { crossChatFollowThread: input.crossChatFollowThread } : {}),
+    ...(input.followThreadEpoch ? { followThreadEpoch: input.followThreadEpoch } : {}),
     ...buildBridgeSendMarkerContent(input.content),
   };
   const markerDir = join(input.dataDir, 'turn-sends');

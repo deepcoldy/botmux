@@ -419,6 +419,7 @@ import {
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import { recordBridgeReplyMarker } from './services/bridge-reply-marker.js';
+import { effectiveCrossChatFollowThreadMode, recordCrossChatFollowThreadBinding } from './services/cross-chat-follow-thread-store.js';
 import {
   commitRestartIntentAttemptTo,
   consumeRestartIntentTo,
@@ -4420,6 +4421,7 @@ interface AdoptedFromData {
 
 interface SessionData {
   sessionId: string;
+  followThreadEpoch?: string;
   messageListenerRun?: import('./core/message-listener-silence.js').SilentMessageListenerRun;
   chatId: string;
   chatType?: 'group' | 'p2p';
@@ -13065,6 +13067,23 @@ async function cmdSend(
     cover: await attachmentIdentity(coverPath),
     durationMs,
   })));
+  const followThreadTargetChatId = overrideChatId ?? s.chatId;
+  const effectiveFollowThreadMode = effectiveCrossChatFollowThreadMode({
+    targetChatId: followThreadTargetChatId,
+    sourceChatId: (originSession ?? s).chatId,
+    noFollowThread,
+  });
+  if (effectiveFollowThreadMode === 'off' && sendInto) {
+    const persisted = recordCrossChatFollowThreadBinding(resolveDataDir(), originSessionId ?? sid, {
+      sentAtMs: Date.now(), deliveryKind: 'detoured_send', targetChatId: followThreadTargetChatId,
+      targetRootMessageId: sendInto, crossChatFollowThread: 'off',
+      followThreadEpoch: (originSession ?? s).followThreadEpoch,
+    });
+    if (!persisted) {
+      console.error('botmux send: 无法持久化 --no-follow-thread，已中止发送（未向飞书投递）');
+      process.exit(2);
+    }
+  }
   const turnRequestIdentity = canonicalJson({
     version: 1,
     content: expectedLinkRenderedContent,
@@ -13118,6 +13137,7 @@ async function cmdSend(
     controls: {
       attention: attention.requested ? attention.kind : undefined,
       urgent: urgent.requested ? urgent.mode : undefined,
+      followThread: effectiveFollowThreadMode,
     },
     attachments: {
       images: durableImageIdentities,
@@ -13396,9 +13416,11 @@ async function cmdSend(
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
-      const voiceCrossChatFollowThread = voicePrimaryOutputChatId !== (originSession ?? s).chatId
-        ? (noFollowThread ? 'off' as const : 'at' as const)
-        : undefined;
+      const voiceCrossChatFollowThread = effectiveCrossChatFollowThreadMode({
+        targetChatId: voicePrimaryOutputChatId,
+        sourceChatId: (originSession ?? s).chatId,
+        noFollowThread,
+      });
       if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
         || !!(originTurnId ?? currentTurnId)
         || !!deferredTopicRootMessageIdForOutput
@@ -13423,6 +13445,7 @@ async function cmdSend(
             targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto,
             targetSessionId: sid,
             crossChatFollowThread: voiceCrossChatFollowThread,
+            followThreadEpoch: (originSession ?? s).followThreadEpoch,
           });
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
@@ -14113,9 +14136,7 @@ async function cmdSend(
   // 此包装自出生即无调用方；但 test/cli-send-hook-context.test.ts 对其源码文本做了断言，
   // 删除需同步改测试。
   void dispatch;
-  const crossChatFollowThread = targetChatId !== (originSession ?? s).chatId
-    ? (noFollowThread ? 'off' as const : 'at' as const)
-    : undefined;
+  const crossChatFollowThread = effectiveFollowThreadMode;
   const recordBridgeSendMarker = (
     sentAtMs: number,
     messageId: string,
@@ -14147,6 +14168,7 @@ async function cmdSend(
           ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
         targetSessionId: sid,
         crossChatFollowThread,
+        followThreadEpoch: (originSession ?? s).followThreadEpoch,
       });
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
