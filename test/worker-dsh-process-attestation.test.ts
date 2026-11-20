@@ -101,6 +101,25 @@ describe('worker DSH engine attestation', () => {
     expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(2);
   });
 
+  it('repairs a failed origin through a later marker while the identity is frozen and timers are paused', () => {
+    // Pins the marker-side `!originPublished` disjunct: with the identity already
+    // frozen but the first origin publication failed, a repeated process_ready
+    // marker (not the retry timer, which is paused here) must repair the origin.
+    vi.useFakeTimers();
+    const { scope, ready } = fixture();
+    scope.publishSandboxRelayCapability.mockReturnValueOnce(false);
+    ready();
+    expect(scope.dshProcessAttestation.identity).toEqual(identity);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(1);
+    ready();
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(2);
+    expect(scope.send.mock.calls.at(-1)[0]).toMatchObject({ enginePid: 60, engineProcStart: '600' });
+    expect(scope.captureDshProcessIdentity).toHaveBeenCalledTimes(1);
+    ready();
+    expect(scope.send).toHaveBeenCalledTimes(2);
+    expect(scope.publishSandboxRelayCapability).toHaveBeenCalledTimes(2);
+  });
+
   it('does not rescan or rotate a frozen identity after time advances', async () => {
     vi.useFakeTimers();
     const { scope, ready } = fixture();
