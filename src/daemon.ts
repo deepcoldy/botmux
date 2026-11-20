@@ -690,7 +690,7 @@ import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-cre
 import { validateRoleLibraryPath } from './core/role-library.js';
 import { assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
 import { dispatchConsentCardAvailable } from './im/lark/client.js';
-import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
+import { authorityForDispatch, resolveDispatchSenderUnionId, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
@@ -7297,6 +7297,7 @@ async function submitQueuedMessage(
     senderOpenId: message.senderId,
     participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
     inThread: !!message.threadId,
+    sourceMessageId: message.messageId,
   });
   await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
   // Identity refresh and reaction delivery both await external work.
@@ -9816,7 +9817,9 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           allowSelfManage: delegationPolicy?.selfManageEnabled === true,
         },
       } : {}),
-      resolveUnionId: resolveUnionIdFromOpenId,
+      resolveUnionId: (appId, openId) => resolveDispatchSenderUnionId(
+        ds.session, turnId, appId, openId, resolveMessageSenderUnionId, resolveUnionIdFromOpenId,
+      ),
     }) : undefined;
     if (serviceGrant) {
       const sponsor = await resolveTargetAppOpenId(ds.larkAppId, serviceGrant.controllerUnionId);
@@ -10075,7 +10078,9 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
       inherited: inherited?.authority,
       tools: [...new Set([...bot.triggerUserAuth!.tools, ...dispatchOnlyTools])],
-      resolveUnionId: resolveUnionIdFromOpenId,
+      resolveUnionId: (appId, openId) => resolveDispatchSenderUnionId(
+        ds.session, turnId, appId, openId, resolveMessageSenderUnionId, resolveUnionIdFromOpenId,
+      ),
     });
     if (!authority) {
       if (inherited) return skip('no_shared_tool');
@@ -26699,6 +26704,8 @@ function deliverPassthroughToExistingSession(
       participants: passthroughWindow.participants,
       participantsIncomplete: passthroughWindow.incomplete,
       inThread: turn.inThread,
+      // A cascade's derived turnId is not a Lark message id; keep the exact inbound id.
+      sourceMessageId: turn.messageId,
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
