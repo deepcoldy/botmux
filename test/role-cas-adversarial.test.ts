@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync, existsSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync, existsSync, unlinkSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import ts from 'typescript';
@@ -15,7 +15,7 @@ vi.mock('../src/utils/atomic-write.js', async original => {
 });
 import { handleFederationSpokeApi } from '../src/dashboard/federation-spoke-api.js';
 import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
-import { readTeamRoleInjectMode, writeTeamRoleInjectMode } from '../src/core/role-resolver.js';
+import { readTeamRoleInjectMode, readTeamRoleInjectModeStrict, writeTeamRoleInjectMode } from '../src/core/role-resolver.js';
 import { buildTeamRoster } from '../src/services/team-roster.js';
 import { setBotCapability, clearBotCapability } from '../src/services/bot-profile-store.js';
 import { jsonRes } from '../src/dashboard/http.js';
@@ -28,9 +28,10 @@ function mutatedRoute(): typeof handleFederationSpokeApi {
     || ts.isVariableStatement(n) && n.declarationList.declarations.some(d => d.name.getText(source) === 'MAX_ROLE_BYTES'))
     .map(n => n.getText(source)).join('\n');
   const guards: Record<string, [string, string]> = {
-    cas: ['body.expectedRole !== current || body.expectedInjectMode !== readTeamRoleInjectMode(larkAppId)', 'false'],
+    cas: ['body.expectedRole !== current || body.expectedInjectMode !== currentInjectMode', 'false'],
     role: ['body.expectedRole !== current', 'false'],
-    mode: ['body.expectedInjectMode !== readTeamRoleInjectMode(larkAppId)', 'false'],
+    mode: ['body.expectedInjectMode !== currentInjectMode', 'false'],
+    strict: ['currentInjectMode = readTeamRoleInjectModeStrict(larkAppId)', 'currentInjectMode = readTeamRoleInjectMode(larkAppId)'],
     budget: ["field === 'role' ? 2 * MAX_ROLE_BYTES * 6 + 1024 : undefined", 'undefined'],
     stream: ['total > maxBytes', 'false'],
     persisted: ['buf.length > MAX_ROLE_BYTES', 'false'],
@@ -41,7 +42,7 @@ function mutatedRoute(): typeof handleFederationSpokeApi {
   code = code.replace(guard[0], guard[1]);
   const compiled = ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
   const scope = { readFileSync, existsSync, unlinkSync, mkdirSync, atomicWriteFileSync, join, dirname,
-    readTeamRoleInjectMode, writeTeamRoleInjectMode, buildTeamRoster, setBotCapability, clearBotCapability, jsonRes, exports: {} };
+    readTeamRoleInjectMode, readTeamRoleInjectModeStrict, writeTeamRoleInjectMode, buildTeamRoster, setBotCapability, clearBotCapability, jsonRes, exports: {} };
   return new Function('scope', `with(scope) { ${compiled}; return handleFederationSpokeApi; }`)(scope);
 }
 const route = process.env.ROLE_CAS_REVIEW_MUTATION ? mutatedRoute() : handleFederationSpokeApi;
@@ -80,6 +81,67 @@ describe('role condition request-stream review', () => {
     expect(actual.injectMode).toBe(kind === 'injectMode' ? 'every' : 'once');
   });
 
+  it.each(['corrupt', 'eisdir'])('fails closed without touching either file when inject mode is unreadable: %s', async kind => {
+    await call({ role: 'original', injectMode: 'once' });
+    const rolePath = join(state.dataDir, 'team-roles', 'cli_test.md');
+    const metaPath = join(state.dataDir, 'team-roles', 'cli_test.meta.json');
+    if (kind === 'corrupt') writeFileSync(metaPath, '{"inject":');
+    else { unlinkSync(metaPath); mkdirSync(metaPath); }
+    expect(await call()).toMatchObject({ role: 'original', injectMode: 'every' });
+
+    const result = await call({ role: 'replacement', injectMode: 'every', expectedRole: 'original', expectedInjectMode: 'every' });
+    expect(result.status).toBe(500);
+    expect(result.error).toBe('role_read_failed');
+    expect(readFileSync(rolePath, 'utf-8')).toBe('original');
+    if (kind === 'corrupt') expect(readFileSync(metaPath, 'utf-8')).toBe('{"inject":');
+    else expect(statSync(metaPath).isDirectory()).toBe(true);
+  });
+
+  it.each([
+    ['null', 'null'],
+    ['missing inject', '{}'],
+    ['invalid inject', '{"inject":"bogus"}'],
+    ['array', '[]'],
+  ])('fails closed for syntactically valid but malformed metadata: %s', async (_kind, malformed) => {
+    await call({ role: 'original', injectMode: 'once' });
+    const rolePath = join(state.dataDir, 'team-roles', 'cli_test.md');
+    const metaPath = join(state.dataDir, 'team-roles', 'cli_test.meta.json');
+    writeFileSync(metaPath, malformed);
+    expect(await call()).toMatchObject({ role: 'original', injectMode: 'every' });
+
+    const result = await call({ role: 'replacement', injectMode: 'every', expectedRole: 'original', expectedInjectMode: 'every' });
+    expect(result.status).toBe(500);
+    expect(result.error).toBe('role_read_failed');
+    expect(readFileSync(rolePath, 'utf-8')).toBe('original');
+    expect(readFileSync(metaPath, 'utf-8')).toBe(malformed);
+  });
+
+  it('accepts an explicit valid every value in the sidecar', async () => {
+    await call({ role: 'original', injectMode: 'once' });
+    const metaPath = join(state.dataDir, 'team-roles', 'cli_test.meta.json');
+    writeFileSync(metaPath, '{"inject":"every"}');
+    const result = await call({ role: 'replacement', injectMode: 'every', expectedRole: 'original', expectedInjectMode: 'every' });
+    expect(result.status).toBe(200);
+    expect(result.role).toBe('replacement');
+  });
+
+  it('treats an actually absent sidecar as the legacy every default', async () => {
+    await call({ role: 'original' });
+    const metaPath = join(state.dataDir, 'team-roles', 'cli_test.meta.json');
+    expect(existsSync(metaPath)).toBe(false);
+    const result = await call({ role: 'replacement', injectMode: 'once', expectedRole: 'original', expectedInjectMode: 'every' });
+    expect(result.status).toBe(200);
+    expect(result.role).toBe('replacement');
+    expect((await call()).injectMode).toBe('once');
+  });
+
+  it('rejects an every expectation against a healthy once sidecar', async () => {
+    await call({ role: 'original', injectMode: 'once' });
+    const result = await call({ role: 'replacement', injectMode: 'every', expectedRole: 'original', expectedInjectMode: 'every' });
+    expect(result.status).toBe(409);
+    expect(await call()).toMatchObject({ role: 'original', injectMode: 'once' });
+  });
+
   it('allows only one of two requests with the same observed state', async () => {
     await call({ role: 'original', injectMode: 'once' });
     const bodies = ['first', 'second'].map(role => ({ role, injectMode: 'every', expectedRole: 'original', expectedInjectMode: 'once' }));
@@ -106,6 +168,7 @@ describe('role condition request-stream review', () => {
     const snapshot = await call(); expect(snapshot.role).toBe(original);
     const result = await call({ role: replacement, injectMode: 'every', expectedRole: snapshot.role, expectedInjectMode: snapshot.injectMode });
     expect(result.status).toBe(200);
+    expect(result.role).toBe(replacement);
     expect((await call()).role).toBe(replacement);
   });
 
@@ -123,7 +186,9 @@ describe('role condition request-stream review', () => {
   });
 
   it('does not enlarge the persisted role limit when increasing the JSON budget', async () => {
-    expect((await call({ role: 'x'.repeat(33000), injectMode: 'once' })).status).toBe(200);
+    const result = await call({ role: 'x'.repeat(33000), injectMode: 'once' });
+    expect(result.status).toBe(200);
+    expect(result.role).toBe('x'.repeat(32768));
     expect((await call()).role).toBe('x'.repeat(32768));
   });
 });
