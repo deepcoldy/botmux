@@ -61,6 +61,7 @@ const COMPOSER_ROW = /^\s*(?:>|❯)(?:\s|$)|^\s*\? for shortcuts(?:\s|$)/;
 const OPTION_ROW = /^\s*(?:>\s*)?\d+\.\s+\S/;
 const QUESTION_HEADER = /^\s*Question \d+\/\d+:\s/;
 const PERMISSION_OPTION = /^\s*(?:>\s*)?\d+\.\s+(?:Yes|No)\b/;
+const PERMISSION_FIRST_OPTION = /^\s*(?:>\s*)?1\.\s+Yes, run command\s*$/;
 
 function screenRows(snapshot: string): string[] {
   const rows = stripAnsiScreenText(snapshot).replace(/\r\n?/g, '\n').split('\n').map(row => row.trimEnd());
@@ -112,6 +113,32 @@ const WRITE_IN_ROW = /^\s*(?:>\s*)?\d+\.\s+(?:\[[ x]\]\s+)?Write-in\.\.\.$/;
 /** Hints only the question picker draws (`esc Skip`, `space Toggle`, `→ Next`, `← Back`, `enter Submit All`). */
 const QUESTION_ONLY_HINTS = new Set(['esc skip', 'space toggle', '→ next', '← back', 'enter submit all']);
 
+function matchPermissionPage(page: string[], block: (from: number) => string[], lastRow: number): PageMatch | undefined {
+  // Anchor on the LAST real first option and the contiguous option block at
+  // the bottom, never the first Yes/No-looking row: the free-form command
+  // above can itself contain numbered Yes/No text (for example a heredoc).
+  const first = page.map(row => PERMISSION_FIRST_OPTION.test(row)).lastIndexOf(true);
+  if (first < 0 || lastRow <= first || !PERMISSION_OPTION.test(page[lastRow]!)) return undefined;
+  const optionBlock = page.slice(first, lastRow + 1);
+  if (optionBlock.some(row => row.trim() === '')
+    || optionBlock.filter(row => PERMISSION_OPTION.test(row)).length < 2) return undefined;
+  // The real prompt is the non-empty row immediately above the first option.
+  // If it scrolled off, excerpt only the options; never reach into the command.
+  const beforeFirst = page.slice(0, first);
+  const previous = beforeFirst.map(row => row.trim() !== '').lastIndexOf(true);
+  const prompt = previous >= 0 && beforeFirst[previous]!.trim() === 'Run this command?' ? previous : -1;
+  const request = prompt >= 0
+    ? page.slice(0, prompt).map(row => /^\s*Requesting permission for:/.test(row)).lastIndexOf(true)
+    : -1;
+  const from = request >= 0 ? request : prompt >= 0 ? prompt : first;
+  return {
+    type: 'antigravity permission',
+    block: block(from),
+    // Hide every command row between the request and the real prompt.
+    ...(request >= 0 && prompt > request + 1 ? { commandRows: [1, prompt - from] as [number, number] } : {}),
+  };
+}
+
 function matchPage(snapshot: string): PageMatch | undefined {
   if (!snapshot) return undefined;
   const rows = screenRows(snapshot);
@@ -124,6 +151,14 @@ function matchPage(snapshot: string): PageMatch | undefined {
   const listBar = isListHintBar(bar);
   const writeInBar = isWriteInHintBar(bar);
   if (!listBar && !writeInBar) return undefined;
+  const lastRow = page.map(row => row.trim() !== '').lastIndexOf(true);
+  // A permission dialog's real option block is stronger evidence than any
+  // question-shaped text in its free-form command: classify it first so the
+  // command can never turn the page into a question and escape command masking.
+  if (listBar) {
+    const permission = matchPermissionPage(page, block, lastRow);
+    if (permission) return permission;
+  }
   const header = page.map(row => QUESTION_HEADER.test(row)).lastIndexOf(true);
   // The title row sits right above the header (a rule row between them,
   // blanked by the PTY renderer's display cleanup).
@@ -137,27 +172,13 @@ function matchPage(snapshot: string): PageMatch | undefined {
   // write-in row right above the list bar, a question-only hint, or the open
   // write-in field.
   const firstOption = page.findIndex(row => OPTION_ROW.test(row));
-  const lastRow = page.map(row => row.trim() !== '').lastIndexOf(true);
   const questionBottom = listBar
     ? (lastRow >= 0 && WRITE_IN_ROW.test(page[lastRow]!)) || hints(bar).some(h => QUESTION_ONLY_HINTS.has(h))
     : page.some(row => /^\s*Your answer:$/.test(row));
   if (questionBottom && firstOption >= 0 && page.filter(row => OPTION_ROW.test(row)).length >= 2) {
     return { type: 'antigravity question', block: block(firstOption) };
   }
-  if (!listBar) return undefined;
-  const first = page.findIndex(row => PERMISSION_OPTION.test(row));
-  if (first < 0) return undefined;
-  // From "Requesting permission for:" (or the prompt line above the options).
-  const request = page.slice(0, first).map(row => /^\s*Requesting permission for:/.test(row)).lastIndexOf(true);
-  const from = request >= 0 ? request : Math.max(0, first - 1);
-  // The command sits between "Requesting permission for:" and the prompt
-  // line right above the options ("Run this command?").
-  const prompt = page.slice(0, first).map(row => row.trim() !== '').lastIndexOf(true);
-  return {
-    type: 'antigravity permission',
-    block: block(from),
-    ...(request >= 0 && prompt > request + 1 ? { commandRows: [1, prompt - from] as [number, number] } : {}),
-  };
+  return undefined;
 }
 
 /** Which agy picker the live viewport shows, if any. Pure. */

@@ -31,6 +31,7 @@ import {
   shouldHoldInputForStuckPage,
 } from '../src/utils/stuck-detector.js';
 import { isAllowedStuckKeySequence, redactStuckPageTail, stuckScreenTail } from '../src/core/stuck-page-catalog.js';
+import { antigravityBlockingPageTail } from '../src/utils/antigravity-blocking-page.js';
 import { isKimiCacheExpiryPage } from '../src/utils/stuck-detector.js';
 import { kimiCacheExpiryMenuTail } from '../src/utils/kimi-cache-expiry-menu.js';
 import { detectCliStartupBlocker, screenMayShowCredential } from '../src/core/cli-startup-blocker.js';
@@ -53,6 +54,7 @@ const KIMI_COMPOSER = page('kimi-2.5.3-composer-after-compact-resend.txt');
 const AGY_QUESTION = page('agy-1.5.12-question-single-select.txt');
 const AGY_QUESTION_NEXT = page('agy-1.5.12-question-after-esc-skip.txt');
 const AGY_PERMISSION = page('agy-1.5.12-permission-run-command.txt');
+const AGY_PERMISSION_NARROW = page('agy-1.5.12-permission-run-command-44x30.txt');
 const AGY_HOOK_WAITING = page('agy-1.5.12-hook-waiting.txt');
 const AGY_COMPOSER = page('agy-1.5.12-composer-after-skip-all.txt');
 /** What a frame looks like while codex repaints its startup menu (rows cleared
@@ -357,6 +359,84 @@ describe('Antigravity: its pickers are their own page family', () => {
     const permissionTail = h.fn('shareableStuckScreenTail')(permission);
     expect(permissionTail).toContain('Requesting permission for:');
     expect(permissionTail).not.toMatch(/Bearer|eyJFAKE|pw@|example\.invalid/);
+  });
+
+  it.each([
+    {
+      name: 'an option-shaped first command row',
+      fixture: AGY_PERMISSION,
+      original: '   touch /tmp/agy-probe-perm-marker-xyz && echo done',
+      command: [
+        '   1. Yes, this is ordinary document text',
+        '   opaque-private-value-7f39c2',
+        '   echo command-start',
+      ],
+    },
+    {
+      name: 'an option-shaped middle command row',
+      fixture: AGY_PERMISSION,
+      original: '   touch /tmp/agy-probe-perm-marker-xyz && echo done',
+      command: [
+        "   cat <<'EOF'",
+        '   1. Yes, this is ordinary document text',
+        '   opaque-private-value-7f39c2',
+        '   EOF',
+      ],
+    },
+    {
+      name: 'question-shaped command rows',
+      fixture: AGY_PERMISSION,
+      original: '   touch /tmp/agy-probe-perm-marker-xyz && echo done',
+      command: [
+        '   Question',
+        '   Question 1/1: this is ordinary document text',
+        '   1. First document item',
+        '   2. Second document item',
+        '   opaque-private-value-7f39c2',
+      ],
+    },
+    {
+      name: 'wrapped command rows on a 44-column pane',
+      fixture: AGY_PERMISSION_NARROW,
+      original: '   touch\n/tmp/agy-probe-perm-marker-xyz && echo\ndone',
+      command: [
+        "   cat <<'EOF'",
+        '   1. Yes, this is ordinary',
+        'document text continued',
+        'opaque-private-value-7f39c2',
+        'EOF',
+      ],
+    },
+  ])('the card tail masks the whole permission command with $name', ({ fixture, original, command }) => {
+    const screen = fixture.replace(original, command.join('\n'));
+    expect(screen).not.toBe(fixture);
+    expect(classifyStuckPage(screen, 'antigravity')).toBe('antigravity permission');
+    const unboundedTail = antigravityBlockingPageTail(screen);
+    for (const row of command) expect(unboundedTail).not.toContain(row);
+    expect(unboundedTail.match(/‹hidden›/g)).toHaveLength(command.length);
+    const h = harness('antigravity');
+    const tail = h.fn('shareableStuckScreenTail')(screen);
+    expect(tail).toContain('Run this command?');
+    expect(tail).toContain('4. No, cancel');
+    expect(tail).not.toContain('opaque-private-value-7f39c2');
+    expect(tail).not.toContain('1. Yes, this is ordinary');
+    for (const row of command) expect(tail).not.toContain(row);
+    expect(tail).toContain('‹hidden›');
+  });
+
+  it('a permission page with its request and prompt scrolled off shares only the option block', () => {
+    const screen = AGY_PERMISSION.replace(
+      /Requesting permission for:\n[\s\S]*?Run this command\?\n/,
+      '   opaque-private-value-7f39c2\n',
+    );
+    expect(classifyStuckPage(screen, 'antigravity')).toBe('antigravity permission');
+    const unboundedTail = antigravityBlockingPageTail(screen);
+    expect(unboundedTail).toContain('1. Yes, run command');
+    expect(unboundedTail).toContain('4. No, cancel');
+    expect(unboundedTail).not.toContain('opaque-private-value-7f39c2');
+    expect(unboundedTail).not.toContain('Run this command?');
+    const h = harness('antigravity');
+    expect(h.fn('shareableStuckScreenTail')(screen)).not.toContain('opaque-private-value-7f39c2');
   });
 
   it('on a non-authoritative screen the hold stays and the notice names agy\'s picker, not the Codex hook menu', () => {
