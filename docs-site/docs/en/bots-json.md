@@ -595,7 +595,7 @@ Compared with `send`, four things change:
 3. In DMs, or 1:1 groups with only the admin and this bot, messages are no longer wrapped in `<user_message>` and `<sender/>`; the model sees the raw text.
 4. The output the model reads after `botmux send` reminds it that the final answer belongs in its reply and progress needs no send.
 
-Supported CLIs: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao. Other CLIs (Antigravity, OpenCode, Relay, codex-app, …) still default to `send`; Antigravity only captures answers in zero-injection mode, so setting it explicitly is rejected. If you set `transcript` and later switch to an unsupported CLI, runtime falls back to `send` and no answer is lost. Cursor and Doubao don't support transcript under `sandbox: "scratch"` (setting it explicitly is rejected and the default falls back to `send` at runtime); the oncall sandbox is unaffected.
+Supported CLIs: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao. Other CLIs (Antigravity, OpenCode, Relay, codex-app, …) still default to `send`; Antigravity only captures answers in zero-injection mode, so setting it explicitly is rejected. If you set `transcript` and later switch to an unsupported CLI, runtime falls back to `send` and no answer is lost. Under `sandbox: "scratch"` only Claude Code, Codex and TraeX session records are readable from the host; every other CLI falls back to `send` there at runtime (an explicit `transcript` is rejected for Cursor and Doubao); the oncall sandbox is unaffected.
 
 To get the old behavior back (the model runs `botmux send` itself), set `send` explicitly:
 
@@ -611,7 +611,8 @@ To get the old behavior back (the model runs `botmux send` itself), set `send` e
 
 A bot with an explicit `send` stays on `send`; the default never overrides it.
 
-- The per-turn reminder and wrapper change from the next turn; the system prompt is fixed when a session starts, so a running session needs `/restart` to pick it up. The same applies to bots without `replyDelivery` after upgrading to this version: running sessions get their final replies forwarded by botmux from the next turn while still on the old system prompt (which teaches `botmux send`); an answer the model sends with `--response-kind final` is not forwarded twice. `/restart` switches them to the new prompt.
+- After changing `replyDelivery`, the per-turn reminder and wrapper change from the next turn; the system prompt and how the final reply is forwarded follow the CLI process, so they switch after `/restart` or when the session relaunches its CLI. When a restarted daemon re-attaches a CLI that kept running (tmux and other persistent backends), that CLI keeps the mode it was launched with.
+- The same applies to bots without `replyDelivery` after upgrading to this version: a CLI that is already running and not relaunched keeps working in `send` mode (the model runs `botmux send`, botmux forwards only what it didn't send); `/restart` switches it to the new default.
 - Bot-to-bot collaboration is unchanged: reaching another bot, or handing results back to the bot that assigned the task, still takes `botmux send --mention` (or `--mention-back`); the final reply card does not @ the other bot.
 - Silent scheduled tasks are unchanged: their final reply never reaches the chat, and the model still runs `botmux send` when the notify condition is met.
 - Cost: 1:1 sessions lose the `<user_message>` / `<sender>` structure, so `/adopt` no longer recognizes them as botmux's own sessions by content (exclusion by session ID still applies).

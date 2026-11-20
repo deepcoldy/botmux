@@ -72,6 +72,16 @@ describe('applyRespawnConfigPatch', () => {
     });
   });
 
+  it('a carried replyDelivery replaces the fork-time one; an absent one keeps it', () => {
+    const cfg: Cfg = { ...forkSnapshot(), replyDelivery: 'transcript' };
+    applyRespawnConfigPatch(cfg, {});
+    expect(cfg.replyDelivery).toBe('transcript');
+    applyRespawnConfigPatch(cfg, { replyDelivery: 'send' });
+    expect(cfg.replyDelivery).toBe('send');
+    applyRespawnConfigPatch(cfg, { replyDelivery: 'transcript' });
+    expect(cfg.replyDelivery).toBe('transcript');
+  });
+
   it('an empty workingDir is ignored; traex reconfigure follows traexAutoModel or codexRpcInput', () => {
     const cfg = forkSnapshot();
     expect(applyRespawnConfigPatch(cfg, { workingDir: '' }).traexReconfigure).toBe(false);

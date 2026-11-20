@@ -278,7 +278,33 @@ describe('effectiveReplyDelivery', () => {
     expect(effectiveReplyDelivery('app_a', 'cursor')).toBe('transcript');
   });
 
-  it('supportsTranscriptReplyDeliveryForBot: cursor/doubao scratch=false / oncall=true / 其它 always-on CLI 不受 scratch 影响', async () => {
+  it('supportsTranscriptReplyDeliveryForBot: scratch 下只有宿主视图可读的 claude-code/codex/traex 保留 transcript', async () => {
+    const { supportsTranscriptReplyDeliveryForBot } = await import('../src/core/reply-delivery.js');
+    // worker 把 CODEX_HOME / TRAE_HOME 指向 merged 的宿主视图，claude 桥收到重映射后的数据目录。
+    for (const cliId of ['claude-code', 'codex', 'traex']) {
+      expect(supportsTranscriptReplyDeliveryForBot(cliId, { sandbox: 'scratch' })).toBe(true);
+    }
+    // 其余转写 CLI 按真实 HOME 找文件，读不到 overlay 里的写入：scratch 下回落 send，
+    // 不能让提示改口「不用 send」而转写一无所获。oncall 沙箱按目录 bind 宿主路径，不受影响。
+    for (const cliId of ['grok', 'pi', 'oh-my-pi', 'ebsd', 'coco', 'hermes', 'mtr', 'cursor', 'doubao']) {
+      expect(supportsTranscriptReplyDeliveryForBot(cliId, { sandbox: 'scratch' })).toBe(false);
+      expect(supportsTranscriptReplyDeliveryForBot(cliId, { sandbox: 'oncall' })).toBe(true);
+      expect(supportsTranscriptReplyDeliveryForBot(cliId)).toBe(true);
+    }
+  });
+
+  it('缺省值 + grok/pi + scratch → 回落 send；显式 transcript 同样回落（运行时兜底，不静默）', () => {
+    mockBotConfig({ sandbox: 'scratch' });
+    for (const cliId of ['grok', 'pi', 'oh-my-pi', 'coco']) {
+      expect(effectiveReplyDelivery('app_a', cliId)).toBe('send');
+    }
+    vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
+    expect(effectiveReplyDelivery('app_scratch_pi', 'pi')).toBe('send');
+    // 同一 scratch 下 codex 的转写可读，照常 transcript。
+    expect(effectiveReplyDelivery('app_scratch_codex', 'codex')).toBe('transcript');
+  });
+
+  it('supportsTranscriptReplyDeliveryForBot: cursor/doubao scratch=false / oncall=true', async () => {
     const { supportsTranscriptReplyDeliveryForBot } = await import('../src/core/reply-delivery.js');
     expect(supportsTranscriptReplyDeliveryForBot('cursor', { sandbox: 'scratch' })).toBe(false);
     expect(supportsTranscriptReplyDeliveryForBot('cursor', { sandbox: 'oncall' })).toBe(true);
@@ -288,7 +314,6 @@ describe('effectiveReplyDelivery', () => {
     expect(supportsTranscriptReplyDeliveryForBot('doubao', { sandbox: 'oncall' })).toBe(true);
     expect(supportsTranscriptReplyDeliveryForBot('doubao', { sandbox: true })).toBe(true);
     expect(supportsTranscriptReplyDeliveryForBot('doubao')).toBe(true);
-    // codex/grok 的 transcript 桥不经过 cursor 的 merged-mirror 路径，scratch 不收窄
     expect(supportsTranscriptReplyDeliveryForBot('codex', { sandbox: 'scratch' })).toBe(true);
     expect(supportsTranscriptReplyDeliveryForBot('antigravity', { sandbox: 'scratch' })).toBe(false);
   });

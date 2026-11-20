@@ -36,6 +36,10 @@ export interface RespawnConfigPatch {
   larkToolBinding?: boolean | null;
   startupCommands?: string[] | null;
   launchShell?: string | null;
+  /** Effective reply delivery for the replacement CLI (its system prompt is
+   *  rebuilt on spawn, and the worker gate follows it). No null: an absent
+   *  value keeps the snapshot. */
+  replyDelivery?: 'send' | 'transcript';
 }
 
 /** The `lastInitConfig` fields this patch may write. */
@@ -50,6 +54,7 @@ export interface RespawnPatchTarget {
   larkToolBinding?: boolean;
   startupCommands?: string[];
   launchShell?: string;
+  replyDelivery?: 'send' | 'transcript';
 }
 
 export interface RespawnPatchResult {
@@ -87,6 +92,7 @@ export function applyRespawnConfigPatch(cfg: RespawnPatchTarget, patch: RespawnC
     cfg.startupCommands = next;
   }
   if (patch.launchShell !== undefined) cfg.launchShell = patch.launchShell || undefined;
+  if (patch.replyDelivery !== undefined) cfg.replyDelivery = patch.replyDelivery;
   return {
     traexReconfigure: patch.traexAutoModel !== undefined || patch.codexRpcInput !== undefined,
     startupCommandsChanged,

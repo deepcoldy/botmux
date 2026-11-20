@@ -366,6 +366,7 @@ import {
 } from './bot-registry.js';
 import { HIDE_LOCAL_ADDRESSES_ENV, hideLocalAddressesEnvValue } from './im/lark/local-address-switch.js';
 import { REPLY_DELIVERY_ENV } from './services/send-completion-hint.js';
+import { paneReplyDeliveryFromProcessTree } from './services/pane-reply-delivery.js';
 import {
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
@@ -3742,8 +3743,14 @@ let traexAutoModelReasoningEfforts = new Map<string, readonly import('./services
 /** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
  *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
  *  fail-closed 等于历史行为。 */
+/** Reply delivery the CURRENT CLI process was launched with, when this worker
+ *  re-attached a surviving persistent pane instead of spawning one: its prompt
+ *  predates this worker's init (services/pane-reply-delivery.ts). Cleared by
+ *  every fresh spawn, whose prompt is built from lastInitConfig. */
+let reattachedPaneReplyDelivery: 'send' | 'transcript' | undefined;
+
 function replyDeliveryMode(): 'send' | 'transcript' {
-  return lastInitConfig?.replyDelivery === 'transcript' ? 'transcript' : 'send';
+  return (reattachedPaneReplyDelivery ?? lastInitConfig?.replyDelivery) === 'transcript' ? 'transcript' : 'send';
 }
 
 /** spawnCli resolved-mode 复核把 transcript 降级为 send 时，每个 bot+cli 组合只
@@ -31816,6 +31823,17 @@ async function spawnCliBody(
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
+  // A re-attached pane keeps the prompt it was launched with; follow it rather
+  // than this init's delivery (a daemon upgrade or config edit since then).
+  if (actuallyReattachedPersistent && !cfg.adoptMode) {
+    const pane = paneReplyDeliveryFromProcessTree(cliPid, cfg.replyDeliveryLegacy ?? (cfg.replyDelivery === 'transcript' ? 'transcript' : 'send'));
+    reattachedPaneReplyDelivery = pane;
+    if (pane && pane !== (cfg.replyDelivery === 'transcript' ? 'transcript' : 'send')) {
+      log(`[reply-delivery] re-attached pane was launched with replyDelivery=${pane} (init says ${cfg.replyDelivery ?? 'send'}); following the pane until the CLI is respawned`);
+    }
+  } else {
+    reattachedPaneReplyDelivery = undefined;
+  }
   if (cfg.existingAppServerEndpoint !== undefined) {
     // The local `codex --remote` client does not own the selected rollout fd;
     // writeInput must accept only the explicitly bound remote thread in the
@@ -39894,6 +39912,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           larkToolBinding: msg.larkToolBinding,
           startupCommands: msg.startupCommands,
           launchShell: msg.launchShell,
+          replyDelivery: msg.replyDelivery,
         });
         if (patched.traexReconfigure) configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
         if (patched.startupCommandsChanged) {

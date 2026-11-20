@@ -119,6 +119,11 @@ describe('botConfigInvariantError — sandbox tri-state', () => {
     expect(botConfigInvariantError({
       cliId: 'antigravity', replyDelivery: 'transcript', sandbox: 'scratch',
     })).toBeUndefined();
+    // grok / pi 等在 scratch 下同样采集不到，但由运行时回落 send 兜住（见
+    // reply-delivery 用例）；写盘不变量不拦，存量条目的其它字段照样能改。
+    for (const cliId of ['grok', 'pi', 'oh-my-pi', 'coco', 'hermes', 'mtr', 'ebsd']) {
+      expect(botConfigInvariantError({ cliId, replyDelivery: 'transcript', sandbox: 'scratch' })).toBeUndefined();
+    }
     // 真静默边：本有采集、scratch 让宿主桥读不到
     expect(botConfigInvariantError({
       cliId: 'doubao', replyDelivery: 'transcript', sandbox: 'scratch',

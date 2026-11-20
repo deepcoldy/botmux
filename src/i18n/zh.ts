@@ -1440,7 +1440,7 @@ export const messages: Record<string, string> = {
   // 列出场景，no_progress_send_transcript 管住进度播报与重复发送，见 shared-hints.ts）。
   'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，最终答复直接写在里面即可。',
   'ai.routing.usage_send_transcript': '- `botmux send` 只用于最终回复带不了的事：@ 别的 bot 协作，或把结果交还给派活给你的 bot（`--mention <对方 open_id>` / `--mention-back`，bot 只有被 @ 才收得到）；发附件、图片、视频或自定义卡片；发到别的群或话题；以及本轮说明明确要求用 `botmux send` 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。每条 send 必须带 `--mention <open_id>` / `--mention-back` / `--no-mention` 之一。',
-  'ai.routing.no_progress_send_transcript': '- 不要用 `botmux send` 发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍。最终答复必须走 send 时（答复本身是附件或卡片，或要 @ 对方才能收到），加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。',
+  'ai.routing.no_progress_send_transcript': '- 不要用 `botmux send` 发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍。最终答复必须走 send 时（答复本身是附件或卡片，或要 @ 对方才能收到），加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。要配附件时先 send 附件、最后再写最终答复：botmux 只转发最后一次调用工具之后的那段回复。',
   'ai.send.after_success_hint': '最终答复已成功发送。若原任务已完成或已交代具体阻碍，可让终端最终回复只输出 BOTMUX_NOTHING_TO_SEND，勿重复发送；后续补充使用 botmux send --response-kind auxiliary。',
   'ai.send.after_success_steer_advanced': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息使用 `botmux send --response-kind final` 发送完整答复（若无需回复则输出 BOTMUX_NOTHING_TO_SEND）。',
   // 本轮发送走统一回复卡片（unified reply）时的成功回显——此时内容已进卡片，
@@ -1450,7 +1450,7 @@ export const messages: Record<string, string> = {
   // replyDelivery=transcript 会话的发送回显（REPLY_DELIVERY_ENV=transcript，见
   // send-completion-hint.ts）：最终回复由 botmux 自动转发，回显不再催模型
   // `--response-kind final`，而是把它引回最终回复、劝它别用 send 发进度。
-  'ai.send.after_success_progress_transcript': '消息已发送。本会话的最终回复会由 botmux 自动发回飞书：任务完成后直接把完整答复写在最终回复里，不用再 botmux send；进度和阶段小结也不必 send。若刚发的这条已经是完整答复，最终回复只输出 BOTMUX_NOTHING_TO_SEND，避免重复。',
+  'ai.send.after_success_progress_transcript': '消息已发送。本会话的最终回复会由 botmux 自动发回飞书：任务完成后直接把完整答复写在最终回复里，不用再 botmux send；进度和阶段小结也不必 send。若刚发的这条已经是完整答复，最终回复只输出 BOTMUX_NOTHING_TO_SEND，避免重复。静默定时任务例外：那类回合的最终回复不会发到群里，要交代的结论都用 botmux send 发出。',
   'ai.send.after_success_unified_transcript': '进度已更新到本轮卡片。本会话的最终回复会由 botmux 自动发回飞书，完成后直接把完整答复写在最终回复里即可，不必再 send 进度。',
   'ai.send.after_success_auxiliary_transcript': '补充消息已发送。本会话的最终回复会由 botmux 自动发回飞书；补充消息不代表任务完成，已发出的内容不要在最终回复里重复。',
   'ai.send.after_success_steer_advanced_transcript': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息直接在最终回复里作答（botmux 会自动发回），若无需回复则只输出 BOTMUX_NOTHING_TO_SEND。',
@@ -1514,7 +1514,7 @@ export const messages: Record<string, string> = {
   // 把 botmux send 限定在最终回复带不了的场景（how_to_send / mention_gate /
   // feedback 等 send 模式专属的长段不注入，见 shared-hints.ts）。
   'ai.shell.intro_transcript': '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书。',
-  'ai.shell.send_scope_transcript': 'botmux send 只用于最终回复带不了的事：@ 别的 bot 协作，或把结果交还给派活给你的 bot（`--mention <对方 open_id>` / `--mention-back`，bot 只有被 @ 才收得到）；发附件（`--images` / `--files` / `--videos`）或自定义卡片；发到别的群或话题；以及本轮说明明确要求用 botmux send 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。每条 send 必须带 `--mention <open_id>` / `--mention-back` / `--no-mention` 之一。不要用它发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍；最终答复必须走 send 时加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。',
+  'ai.shell.send_scope_transcript': 'botmux send 只用于最终回复带不了的事：@ 别的 bot 协作，或把结果交还给派活给你的 bot（`--mention <对方 open_id>` / `--mention-back`，bot 只有被 @ 才收得到）；发附件（`--images` / `--files` / `--videos`）或自定义卡片；发到别的群或话题；以及本轮说明明确要求用 botmux send 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。每条 send 必须带 `--mention <open_id>` / `--mention-back` / `--no-mention` 之一。不要用它发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍；最终答复必须走 send 时加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。要配附件时先 send 附件、最后再写最终答复：botmux 只转发最后一次调用工具之后的那段回复。',
   'ai.shell.when_to_send_transcript': '发给你的消息直接在最终 assistant message 里作答即可,别沉默。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。',
 

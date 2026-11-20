@@ -606,7 +606,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 3. 私聊，或只有管理员和这个 bot 的 1 对 1 群里，消息不再包 `<user_message>` 壳和 `<sender/>` 标签，模型看到的就是原文。
 4. 模型执行 `botmux send` 后看到的回显会提醒它：最终答复写在回复里就行，进度不必发。
 
-支持的 CLI：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao。其余 CLI（如 Antigravity、OpenCode、Relay、codex-app）默认仍是 `send`；Antigravity 只在零注入模式下采集回答，显式设置会被拒绝。如果写好 `transcript` 后又把 CLI 换成不支持的，运行时自动回到 `send`，不会丢答复。Cursor 和 Doubao 在 `sandbox: "scratch"` 下不支持 transcript（显式设置被拒，默认值运行时回到 `send`）；oncall 沙盒不受影响。
+支持的 CLI：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao。其余 CLI（如 Antigravity、OpenCode、Relay、codex-app）默认仍是 `send`；Antigravity 只在零注入模式下采集回答，显式设置会被拒绝。如果写好 `transcript` 后又把 CLI 换成不支持的，运行时自动回到 `send`，不会丢答复。`sandbox: "scratch"` 下只有 Claude Code、Codex、TraeX 的会话记录在宿主侧读得到，其余 CLI 在 scratch 下运行时回到 `send`（Cursor、Doubao 显式设置 `transcript` 会被拒）；oncall 沙盒不受影响。
 
 想用回旧行为（模型自己 `botmux send`），显式写 `send`：
 
@@ -622,7 +622,8 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 
 显式写了 `send` 的 bot 保持 `send`，不受默认值影响。
 
-- 每轮的提醒和外壳从下一轮起变化；系统提示是会话启动时定的，已经在跑的会话要 `/restart` 才换。升级到这个版本后，没写 `replyDelivery` 的 bot 也一样：已在跑的会话从下一轮起由 botmux 转发最终回复，但系统提示还是旧的（教模型用 `botmux send`），模型用 `--response-kind final` 发出的答复不会被重复转发；`/restart` 后换成新提示。
+- 改了 `replyDelivery` 后，每轮的提醒和外壳从下一轮起变化；系统提示和最终回复的转发方式跟着 CLI 进程走，`/restart` 或会话重新拉起 CLI 后才换。daemon 重启后接回仍在运行的 CLI（tmux 等持久后端）时，沿用这个 CLI 启动时的方式。
+- 升级到这个版本后，没写 `replyDelivery` 的 bot 也一样：已在跑、没有重新拉起的 CLI 继续按 `send` 工作（模型自己 `botmux send`，botmux 只在它没发时兜底转发），`/restart` 后换成新默认。
 - bot 之间协作不变：要找别的 bot、或把结果交还给派活给你的 bot，仍然要 `botmux send --mention`（或 `--mention-back`），最终回复卡不会自动 @ 对方 bot。
 - 静默定时任务不变：它的最终回复从来不发到群里，满足通知条件时仍由模型 `botmux send`。
 - 代价：1 对 1 会话没有了 `<user_message>` / `<sender>` 结构，`/adopt` 不再按内容把它认作 botmux 自己的会话（按会话 ID 排除仍然生效）。

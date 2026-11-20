@@ -52,6 +52,14 @@ export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDeliver
   return supportsTranscriptReplyDelivery(cliId) ? 'transcript' : 'send';
 }
 
+/** The default before transcript became the default for every transcript CLI:
+ *  doubao transcript (#2828), everything else send. Only used to tell a worker
+ *  what prompt a pane started by that botmux runs with (see
+ *  services/pane-reply-delivery.ts) — never to decide a new spawn. */
+export function legacyDefaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
+  return cliId === 'doubao' ? 'transcript' : 'send';
+}
+
 const warnedUnsupported = new Set<string>();
 
 /** 运行时生效值：显式配置（send / transcript）优先，未配置按 CLI 缺省；结果为
@@ -64,12 +72,15 @@ const warnedUnsupported = new Set<string>();
  * 而不是 live bot config——sandbox 改动 next-session-only：会话以 scratch 起、
  * 运维随后关掉 sandbox 再开 transcript 时，live 解析会放 transcript（改口不
  * send），但该会话的 worker 仍在 COW overlay 里采集关闭 = 静默轮。新会话/首轮
- * 不传，走 live config + BOTMUX_SANDBOX env 的实时解析。 */
+ * 不传，走 live config + BOTMUX_SANDBOX env 的实时解析。
+ *
+ * opts.legacyDefault：未显式配置时按改动前的缺省（legacyDefaultReplyDeliveryFor）
+ * 解析，只给 worker 判断「旧版 botmux 起的 pane 用的是哪套提示」，不决定新 spawn。 */
 export function effectiveReplyDelivery(
   larkAppId: string | undefined,
   cliId: string | undefined,
   promptInjection?: PromptInjection,
-  opts?: { sessionSandbox?: ZeroPromptSandboxValue },
+  opts?: { sessionSandbox?: ZeroPromptSandboxValue; legacyDefault?: boolean },
 ): ReplyDelivery {
   if (!larkAppId) return 'send';
   if (zeroPromptInjectionForBot(larkAppId, cliId, promptInjection)) return 'transcript';
@@ -106,7 +117,8 @@ export function effectiveReplyDelivery(
       });
     }
   } catch { return 'send'; }
-  const wanted: ReplyDelivery = configured ?? defaultReplyDeliveryFor(cliId);
+  const wanted: ReplyDelivery = configured
+    ?? (opts?.legacyDefault ? legacyDefaultReplyDeliveryFor(cliId) : defaultReplyDeliveryFor(cliId));
   if (wanted !== 'transcript') return 'send';
   if (supportsTranscriptReplyDeliveryForBot(cliId, { sandbox })) return 'transcript';
   // 缺省值回落是预期内的（如 scratch 沙盒下的 cursor / doubao），不告警；只有使用者
