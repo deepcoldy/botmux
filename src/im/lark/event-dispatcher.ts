@@ -6687,7 +6687,7 @@ export function createLarkEventDispatcherRuntime(
         }
       }
 
-      const summaryCommandMatch = await resolveSummaryCommandMatch({
+      const summaryCommandMatch = crossChatFollowUp ? undefined : await resolveSummaryCommandMatch({
         larkAppId,
         chatId,
         chatType,
@@ -6832,7 +6832,7 @@ export function createLarkEventDispatcherRuntime(
         //     冲本 bot 来的，所以用 commandLeadsMessage 放行（见其定义处）。
         //   • 只认普通群顶层（regular-group-*）：话题群（topic-chat）与话题内回复
         //     （real-thread）各有自己的续话规则，不该被一条裸命令另开一路。
-        const commandTriggerCandidate = isAllowed
+        const commandTriggerCandidate = !crossChatFollowUp && isAllowed
           && (routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread')
           && triggeredCommand
           ? matchCommandTrigger(larkAppId, chatId, triggeredCommand, resolvePassthroughCommands(larkAppId))

@@ -444,6 +444,7 @@ describe('cross-chat followed thread binding', () => {
       cliId: 'claude-code',
       allowedUsers: [OWNER_OPEN_ID],
       blockedUsers: ['ou_blocked_user'],
+      commandTriggers: { enabled: true, commands: [{ cmd: '/solve', prompt: '执行模板 {args}' }] },
     });
     const bot = getBot(APP_ID);
     bot.botOpenId = BOT_OPEN_ID;
@@ -629,12 +630,15 @@ describe('cross-chat followed thread binding', () => {
         chat_id: GROUP_B,
         chat_type: 'group',
         message_type: 'text',
-        content: JSON.stringify({ text: '@_user_1 /status 看下进度' }),
+        content: JSON.stringify({ text: '@_user_1 /solve 看下进度' }),
         mentions: [{ key: '@_user_1', name: 'zzh-美国豆包', id: { open_id: BOT_OPEN_ID } }],
       },
     });
     await new Promise(r => setTimeout(r, 10));
     expect(handleThreadReply).toHaveBeenCalledTimes(1);
+    expect(handleThreadReply.mock.calls[0]![1].commandTrigger).toBeUndefined();
+    expect(handleThreadReply.mock.calls[0]![1].promptOverride).toBeUndefined();
+    expect(handleThreadReply.mock.calls[0]![1].summaryCommand).toBeUndefined();
     expect(mockReplyMessage).not.toHaveBeenCalled();
     expect(mockSendUserMessage).not.toHaveBeenCalled();
   });
