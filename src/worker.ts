@@ -42,8 +42,7 @@ import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { PromptSuggestionPublisher, promptSuggestionReportTurn, type FoldedTypeAheadTurn } from './utils/prompt-suggestion-publisher.js';
-import { CliRecapObserver, RECAP_MODEL_SYSTEM_PROMPT, TurnRecapRecorder } from './services/turn-recap.js';
-import { recapModelLaunchFor, runRecapModel, type RecapModelLaunch } from './services/turn-recap-runner.js';
+import { CliRecapObserver } from './services/turn-recap.js';
 import { WrittenInputLedger } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
@@ -449,6 +448,7 @@ import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResu
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
 import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
+import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath, restoreFilteredHermesUserEvents } from './services/hermes-transcript.js';
@@ -4893,8 +4893,11 @@ function notifyHookReviewInputHold(freshScreen?: string): void {
   const holdNotice = cliAdapter?.stuckPageFamily === 'kimi'
     ? `⚠️ ${cliName()} 正在显示「缓存过期」选择菜单。为避免消息被菜单吞掉或误选选项，`
       + 'BotMux 已暂存后续消息；请先在 Web 终端完成选择，恢复普通输入框后会自动投递。'
-    : `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
-      + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。';
+    : cliAdapter?.stuckPageFamily === 'antigravity'
+      ? `⚠️ ${cliName()} 正在终端显示选择菜单（提问或权限确认）。为避免消息被菜单当成按键、误选选项，`
+        + 'BotMux 已暂存后续消息；请先在 Web 终端完成选择，恢复普通输入框后会自动投递。'
+      : `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
+        + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。';
   send({
     type: 'user_notify',
     turnId: currentBotmuxTurnId,
@@ -4983,6 +4986,10 @@ function shareableStuckScreenTail(screen: string): string {
   // Kimi draws its menu under the live conversation: only the menu rows leave
   // the terminal, never the transcript above them.
   if (family === 'kimi') return kimiCacheExpiryMenuTail(screen);
+  // agy draws its pickers under the live conversation: same, picker rows only
+  // (a permission dialog's command already masked), then the same credential
+  // and home-path redaction as any other page.
+  if (family === 'antigravity') return stuckScreenTail(redactStuckPageTail(antigravityBlockingPageTail(screen)));
   // Redact the whole page before bounding it: the line / char cut can drop a
   // row's label and leave its value (or a wrapped continuation) unmasked.
   const unbounded = stuckScreenTail(screen, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
@@ -9916,13 +9923,6 @@ const emittedRateLimitUuids = new Set<string>();
 /** Claude Code's away summaries (「本轮回顾」), forwarded once each for the
  *  turn they recap. */
 const cliRecapObserver = new CliRecapObserver();
-/** What each turn did, for its「本轮回顾」: every activity entry counts here,
- *  unlike the capped CoT buffer below. Sent just before a completed terminal. */
-const turnRecapRecorder = new TurnRecapRecorder();
-/** How to run the optional model recap for the current CLI: its own binary
- *  and env, recorded at spawn. Undefined when the adapter has none or the CLI
- *  is not a plain local one (sandbox, read isolation, wrapper, adopt). */
-let recapModelLaunch: RecapModelLaunch | undefined;
 /** Codex collaboration sub-agents spawned during live ingest. Their quota
  *  failures land in their own rollouts and reach the parent only as tool
  *  results, so they are tailed separately and fed into the same structured
@@ -10203,7 +10203,6 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
     const withoutSentinel = cotEntryWithoutSentinel(entry);
     return withoutSentinel ? [withoutSentinel] : [];
   });
-  turnRecapRecorder.observe(turn, kept);
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
@@ -12438,13 +12437,6 @@ function bridgeIngest(): void {
   // turn immediately. Do not wait for the screen prompt: permission/AskUser
   // surfaces can resemble idle, while an explicit JSONL boundary cannot.
   emitReadyTurns({ explicitTerminalOnly: true });
-}
-
-/** One optional「本轮回顾」model recap for the daemon. */
-async function answerRecapRequest(requestId: string, prompt: string): Promise<void> {
-  const launch = recapModelLaunch;
-  const outcome = launch ? await runRecapModel(launch, prompt) : { error: 'unavailable for this CLI' };
-  send({ type: 'recap_result', requestId, ...outcome });
 }
 
 /** Scan newly-drained Claude transcript events for a structured rate-limit
@@ -29730,21 +29722,6 @@ async function spawnCliBody(
   const reproduceBaseBin = spawnBin;
   const reproduceBaseArgs = [...spawnArgs];
 
-  // The optional「本轮回顾」model recap: the same binary and env, outside any terminal.
-  recapModelLaunch = recapModelLaunchFor({
-    recapModel: cliAdapter.recapModel,
-    systemPrompt: RECAP_MODEL_SYSTEM_PROMPT,
-    bin: spawnBin,
-    env: { ...childEnv, ...perBotInjectEnv },
-    cwd: cfg.workingDir,
-    backend: effectiveBackendType,
-    sandboxed: sandboxRequested,
-    readIsolated: !!isolationBotHome,
-    wrapped: !!cfg.wrapperCli,
-    adopted: !!cfg.adoptMode,
-    credentialIsolated: credentialIsolationGate.required,
-  });
-
   // CJADK_INTERACTIVE is a cjadk-only knob we set on the cjadk wrapper branch
   // (applyWrapperCliLaunch). Strip any value inherited from the daemon's own
   // env first so a daemon launched under `cjadk feishu` (which exports it)
@@ -37623,10 +37600,6 @@ function emitTurnTerminal(
     ...(directFailure ? { directFailure: true as const } : {}),
     ...(composerRefusal && errorCode === 'safe_composer_required' ? { composerRefusal } : {}),
   };
-  // The「本轮回顾」material first: the daemon reads it when the terminal lands.
-  const recapInput = status === 'completed'
-    ? turnRecapRecorder.input({ turnId, dispatchAttempt }, lastInitConfig?.workingDir) : undefined;
-  if (recapInput) send({ type: 'recap_input', turnId, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}), ...recapInput });
   const scope = workerSessionEventScope;
   if (continuationFailure && scope) {
     scope.reportContinuationFailure(continuationFailure, () => {
@@ -40311,11 +40284,6 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'goal_update_ack': {
       if (msg.signature === nativeGoalPendingSignature) nativeGoalSignature = msg.signature;
-      break;
-    }
-
-    case 'recap_request': {
-      void answerRecapRequest(msg.requestId, msg.prompt);
       break;
     }
 

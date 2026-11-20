@@ -175,6 +175,26 @@ export function directHumanForDispatchOnly(input: {
     && caller.requestLarkAppId === sourceAppId && !!caller.requestUserOpenId;
 }
 
+/** Resolve a human already authenticated by authorityForDispatch. A thread root,
+ * destination message, or copied recovery turn cannot identify this sender. */
+export async function resolveDispatchSenderUnionId(
+  session: Session,
+  turnId: string,
+  appId: string,
+  openId: string,
+  fromMessage: (appId: string, messageId: string) => Promise<string | null>,
+  fromContact: (appId: string, openId: string) => Promise<string | null>,
+): Promise<string | null> {
+  const entry = session.replyTargets?.[turnId];
+  if (turnId.startsWith('om_') && registryTurnMayAuthenticateHuman(session, turnId)
+    && session.turnReplyContexts?.[turnId]?.sourceMessageId === turnId
+    && registryEntryProvesHumanSender(entry) && entry.senderOpenId === openId) {
+    const unionId = await fromMessage(appId, turnId);
+    if (unionId) return unionId;
+  }
+  return fromContact(appId, openId);
+}
+
 /** Only a daemon-authenticated, current human turn may originate a delegation. */
 export async function authorityForDispatch(input: {
   caller?: TrustedCaller;

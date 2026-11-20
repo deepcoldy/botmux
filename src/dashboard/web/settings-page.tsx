@@ -35,7 +35,7 @@ import {
 const GLOBAL_SESSION_ENV_SCOPE: SessionEnvScope = { kind: 'global' };
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
-interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
+interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg; notifyOnNewVersion?: boolean }
 
 interface DashboardSettings {
   groupNamePrefix: string;
@@ -1458,6 +1458,19 @@ export function SettingsBody(props: {
               />
             </div>
           </div>
+          <ToggleRow
+            dataAction="toggle-new-version-notify"
+            title={tr('settings.notifyOnNewVersion')}
+            help={tr('settings.notifyOnNewVersionHelp')}
+            checked={settings.maintenance.notifyOnNewVersion === true}
+            disabled={!canWrite || savingKey === 'notifyOnNewVersion'}
+            onChange={value => {
+              void props.onSave('notifyOnNewVersion', { maintenance: { notifyOnNewVersion: value } }, s => ({
+                ...s,
+                maintenance: { ...s.maintenance, notifyOnNewVersion: value },
+              }));
+            }}
+          />
           <HttpProxyRow
             value={settings.httpProxy}
             disabled={!canWrite || savingKey === 'httpProxy'}

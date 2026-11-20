@@ -444,6 +444,8 @@ export interface MaintenanceConfig {
   /** Whether an intentional restart sends the owner a restart report DM.
    *  Missing preserves the legacy behavior (enabled). */
   notifyOnRestart?: boolean;
+  /** Opt-in owner DMs when a newer botmux release is discovered; no installation. */
+  notifyOnNewVersion?: boolean;
 }
 
 export interface MaintenanceTask {
@@ -668,6 +670,10 @@ export function parseMaintenancePatch(
     if (typeof b.notifyOnRestart !== 'boolean') return { ok: false, error: 'invalid_notify_on_restart' };
     patch.notifyOnRestart = b.notifyOnRestart;
   }
+  if ('notifyOnNewVersion' in b) {
+    if (typeof b.notifyOnNewVersion !== 'boolean') return { ok: false, error: 'invalid_notify_on_new_version' };
+    patch.notifyOnNewVersion = b.notifyOnNewVersion;
+  }
   if (Object.keys(patch).length === 0) return { ok: false, error: 'empty' };
   return { ok: true, patch };
 }
@@ -681,6 +687,7 @@ function readMaintenance(raw: unknown): MaintenanceConfig | undefined {
   const ar = readMaintenanceToggle(m.autoRestart);
   if (ar) out.autoRestart = ar;
   if (typeof m.notifyOnRestart === 'boolean') out.notifyOnRestart = m.notifyOnRestart;
+  if (typeof m.notifyOnNewVersion === 'boolean') out.notifyOnNewVersion = m.notifyOnNewVersion;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

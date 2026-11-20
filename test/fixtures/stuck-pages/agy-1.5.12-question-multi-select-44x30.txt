@@ -1,0 +1,30 @@
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.12
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     ~/work
+  ▄▀▀      ▀▀▄
+
+─────────────────────────────────────────
+> please ask me
+
+? Which database should we use?
+? Which features to enable?
+
+Question
+────────────────────────────────────────────
+
+Question 2/2: Which features to enable?
+
+> 1. [ ] Auth
+  2. [ ] Billing
+  3. [ ] Search
+  4. Write-in...
+
+  ↑/↓ Navigate · ← Back · space Toggle · ent
+esc to cancel           Gemini 3.1 Pro · low
+
+
+
+

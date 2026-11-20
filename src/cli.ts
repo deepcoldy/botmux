@@ -18853,11 +18853,17 @@ export async function runHook(
     }
   }
   // 权限确认一旦路由到 botmux 会话，任何「没拿到人工裁决」的结局都按拒绝处理：
-  // passthrough 会让终端确认框照旧弹出，而这正是本桥要消除的静默卡死。
+  // passthrough 会让终端确认框照旧弹出，而这正是本桥要消除的静默卡死。提问同理：
+  // 实现了 formatUnanswered 的 CLI（agy）带着原因结束这次提问，不回退终端提问页。
+  const unanswered = (outcome: import('./core/ask-hook/types.js').UnansweredAsk): { stdout: string } => (
+    adapter.formatUnanswered
+      ? { stdout: adapter.formatUnanswered(outcome, parsed) }
+      : { stdout: adapter.passthrough(payload) }
+  );
   const unresolved = (message: string): { stdout: string } => (
     permissionParsed && adapter.formatPermissionDecision
       ? { stdout: adapter.formatPermissionDecision(false, message) }
-      : { stdout: adapter.passthrough(payload) }
+      : unanswered({ kind: 'undelivered' })
   );
 
   // Per-invocation identity: generated ONCE here (outside the retry loop) and
@@ -18868,7 +18874,7 @@ export async function runHook(
 
   // Freeze the issuing turn before reconnect retries. Shared-service/adopt
   // routing cannot borrow this process's ambient turn identity.
-  const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
+  const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex', 'antigravity'].includes(cliId)
     ? resolveTurnOriginFn(routeSessionId!) : undefined;
 
   const body: Record<string, unknown> = {
@@ -18974,8 +18980,10 @@ export async function runHook(
     return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers) };
   }
 
-  // timedOut / invalidated → passthrough 放行
-  return { stdout: adapter.passthrough(payload) };
+  // timedOut / invalidated → passthrough 放行（实现了 formatUnanswered 的 CLI 带原因结束）
+  return unanswered(result.kind === 'timedOut'
+    ? { kind: 'timedOut', timeoutMs }
+    : { kind: 'invalidated', reason: result.reason, ...(result.failureCode ? { failureCode: result.failureCode } : {}) });
 }
 
 /** 权限确认默认等 10 分钟；上限必须小于 hook 安装侧的进程超时（见 hook-installer）。 */
@@ -19109,6 +19117,7 @@ async function cmdHook(cliId: string): Promise<void> {
   }
 
   const env = process.env as Record<string, string | undefined>;
+  if (cliId === 'antigravity') exitWhenHookParentGone();
   const permissionRequest = !adapter.parseQuestions(payload) && !!adapter.parsePermissionRequest?.(payload, env);
   const terminated = new AbortController();
   if (permissionRequest) {
@@ -19137,6 +19146,22 @@ async function cmdHook(cliId: string): Promise<void> {
     try { await writeAndFlush(process.stdout, result.stdout + '\n'); } catch { /* passthrough */ }
   }
   process.exit(0);
+}
+
+/** agy (1.5.12) gives up on a PreToolUse handler — Esc, a stopped turn, its
+ *  timeout, its own exit — by SIGKILLing the process it started, or by simply
+ *  going away. A client that outlives it keeps its ask open: the card stays
+ *  answerable and the daemon reads the next text in the thread as the answer
+ *  to a question nobody waits for. The installed command `exec`s this client
+ *  so the kill lands here; should anything sit in between (or agy die), the
+ *  parent changes and the client leaves — the closed connection lets the
+ *  broker retire the ask. `process.ppid` is read live on Node and Bun. */
+function exitWhenHookParentGone(intervalMs = 1_000): void {
+  const parent = process.ppid;
+  const timer = setInterval(() => {
+    if (process.ppid !== parent) process.exit(0);
+  }, intervalMs);
+  timer.unref();
 }
 
 // ─── botmux session-ready ─────────────────────────────────────────────────────
