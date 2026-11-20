@@ -4423,6 +4423,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_user_transport_required' });
   }
   if (body.mode === 'bot') {
+    // sandboxWithholdBotSecret: the sandbox must not hold an app-identity
+    // credential in any form, including the tenant token lark-cli would get here.
+    const botSecretWithheld = ds ? ds.session.sandboxWithholdBotSecret === true : bot.sandboxWithholdBotSecret === true;
+    if (botSecretWithheld) {
+      return jsonRes(res, 403, { ok: false, error: 'lark_tool_bot_identity_withheld' });
+    }
     let token: unknown;
     try {
       // The app-bound SDK caches TATs and refreshes them before expiry. Resolve

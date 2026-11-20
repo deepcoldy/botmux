@@ -30251,7 +30251,7 @@ async function spawnCliBody(
           outbox,
           childEnv,
           cfg.sessionId,
-          { authorize: authorizeManagedSend, allowRouting: true, sessionToolChatId: cfg.chatId },
+          { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
         );
         publishSandboxRelayCapability();
         log(`[file-sandbox] bot secret withheld from the sandbox; send/history/quoted relay via outbox=${outbox}`);
@@ -30278,7 +30278,7 @@ async function spawnCliBody(
         att.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend, allowRouting: true, sessionToolChatId: cfg.chatId },
+        { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
       );
       publishSandboxRelayCapability();
       log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
@@ -30376,7 +30376,7 @@ async function spawnCliBody(
         sbx.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend, allowRouting: true, sessionToolChatId: cfg.chatId },
+        { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
       );
       publishSandboxRelayCapability();
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);

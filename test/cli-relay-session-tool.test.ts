@@ -21,7 +21,7 @@ const CAP = 'c'.repeat(64);
 const roots: string[] = [];
 afterEach(() => { for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true }); });
 
-function setup(withCred: boolean) {
+function setup(withCred: boolean, served = true) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-cli-relay-tool-'));
   roots.push(root);
   const home = join(root, '.botmux');
@@ -29,6 +29,7 @@ function setup(withCred: boolean) {
   const outbox = join(dataDir, 'sandboxes', SID, 'outbox');
   mkdirSync(outbox, { recursive: true });
   writeFileSync(join(outbox, '.botmux-origin-capability.json'), JSON.stringify({ sessionId: SID, capability: CAP }), { mode: 0o600 });
+  if (served) writeFileSync(join(outbox, '.botmux-session-tools'), '1\n');
   if (withCred) {
     mkdirSync(join(home, 'bots', APP), { recursive: true });
     writeFileSync(join(home, 'bots', APP, 'send-cred.json'), JSON.stringify({ larkAppId: APP, larkAppSecret: 'x' }));
@@ -108,6 +109,16 @@ describe('history / quoted through the outbox when send-cred is withheld', () =>
     const res = await run(['history', '--query', 'secret'], s);
     expect(res.status).toBe(2);
     expect(readdirSync(s.outbox).filter(n => n.endsWith('.req.json'))).toEqual([]);
+  }, 60_000);
+
+  it('keeps the direct path when the watcher does not serve session tools (credential-only relay)', async () => {
+    const s = setup(false, false);
+    const host = mockHost(s.outbox, { code: 0, stdout: 'HOST-HISTORY', stderr: '' });
+    try {
+      const res = await run(['history', '--limit', '7'], s);
+      expect(res.stdout).not.toBe('HOST-HISTORY');
+      expect(host.request()).toBeUndefined();
+    } finally { host.stop(); }
   }, 60_000);
 
   it('keeps the direct path when the sandbox can still read send-cred (default)', async () => {

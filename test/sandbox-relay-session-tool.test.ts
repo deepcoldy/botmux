@@ -12,7 +12,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { startOutboxWatcher, validateRelaySessionToolRequest } from '../src/adapters/backend/sandbox.js';
+import { RELAY_SESSION_TOOLS_MARKER, startOutboxWatcher, validateRelaySessionToolRequest } from '../src/adapters/backend/sandbox.js';
 import { accessForPath, buildFsPolicy, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
 import { buildRelaySessionToolRequest, materializeRelayedAttachments } from '../src/cli/relay-session-tool.js';
 
@@ -49,6 +49,23 @@ describe('fs-policy: withholdSendCredential', () => {
     // in-sandbox direct send / history / quoted rely on).
     const normal = buildFsPolicy(ctx(base));
     expect(accessForPath(normal.rules, `${home}/.botmux/bots/cli_self/send-cred.json`).access).toBe('readWrite');
+  });
+
+  it('closes the own lark-cli keystore carve-out (ciphertext + master key = the secret)', () => {
+    const darwinStore = '/Users/u/Library/Application Support/lark-cli';
+    const on = buildFsPolicy(ctx({ withholdSendCredential: true }));
+    const off = buildFsPolicy(ctx());
+    for (const f of ['master.key.file', 'appsecret_cli_self.enc']) {
+      expect(accessForPath(off.rules, `${darwinStore}/${f}`).access).toBe('readOnly');
+      expect(accessForPath(on.rules, `${darwinStore}/${f}`).access).toBe('deny');
+    }
+    const linux = { platform: 'linux' as const, homeDir: '/home/u', botmuxHome: '/home/u/.botmux',
+      sessionDataDir: '/home/u/.botmux/data', workingDir: '/home/u/proj', botHome: '/home/u/.botmux/bots/cli_self' };
+    const linuxStore = '/home/u/.local/share/lark-cli';
+    for (const f of ['master.key', 'appsecret_cli_self.enc']) {
+      expect(accessForPath(buildFsPolicy(ctx(linux)).rules, `${linuxStore}/${f}`).access).toBe('readOnly');
+      expect(accessForPath(buildFsPolicy(ctx({ ...linux, withholdSendCredential: true })).rules, `${linuxStore}/${f}`).access).toBe('deny');
+    }
   });
 
   it('grants the macOS relay outbox read-write', () => {
@@ -109,6 +126,30 @@ describe('outbox watcher: session-tool requests', () => {
         argv: ['history', '--limit', '5', '--session-id', 'forced-sid'],
         relay: '1', turn: 'om_turn', chat: 'oc_chat',
       });
+    } finally { stop(); }
+  });
+
+  it('advertises session tools only when it serves them', () => {
+    const a = setup();
+    const stopA = startOutboxWatcher(a.outbox, { ...process.env }, 'sid', { cliPath: a.fixture, authorize, sessionToolChatId: 'oc_chat' });
+    const b = setup();
+    const stopB = startOutboxWatcher(b.outbox, { ...process.env }, 'sid', { cliPath: b.fixture, authorize });
+    try {
+      expect(existsSync(join(a.outbox, RELAY_SESSION_TOOLS_MARKER))).toBe(true);
+      expect(existsSync(join(b.outbox, RELAY_SESSION_TOOLS_MARKER))).toBe(false);
+    } finally { stopA(); stopB(); }
+  });
+
+  it('replaces a planted res.json symlink instead of writing through it', async () => {
+    const { outbox, fixture } = setup();
+    const victim = join(outbox, '..', 'host-file');
+    writeFileSync(victim, 'HOST');
+    symlinkSync(victim, join(outbox, 'evil.res.json'));
+    writeFileSync(join(outbox, 'evil.req.json'), '{not json');
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'sid', { cliPath: fixture });
+    try {
+      await vi.waitFor(() => expect(lstatSync(join(outbox, 'evil.res.json')).isSymbolicLink()).toBe(false), { timeout: 5_000 });
+      expect(readFileSync(victim, 'utf8')).toBe('HOST');
     } finally { stop(); }
   });
 

@@ -1064,7 +1064,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // path than the deny so longest-prefix-wins. Siblings' `appsecret_*.enc` and
   // user tokens stay denied → the master key alone can't decrypt what it can't
   // read (verified: sibling ciphertext still DENIED).
-  if (ctx.platform === 'darwin' && larkTransport) {
+  // withholdSendCredential: the own appsecret + master key ARE the app secret
+  // (decryptable), so the carve-out stays closed and the store stays denied.
+  if (ctx.platform === 'darwin' && larkTransport && !ctx.withholdSendCredential) {
     const larkStore = `${ctx.homeDir}/Library/Application Support/lark-cli`;
     push([`${larkStore}/master.key.file`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
   }
@@ -1102,7 +1104,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       // outrank this deny by source rank (internal 2 > baseline 0), re-opening the whole
       // keystore rw. mandatory (4) keeps the ceiling; the deeper own-key carve-outs still win by depth.
       push([larkStore], 'deny', 'mandatory');
-      push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+      if (!ctx.withholdSendCredential) {
+        push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+      }
     }
   }
 

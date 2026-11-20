@@ -1798,6 +1798,12 @@ export function validateRelaySessionToolRequest(
   };
 }
 
+/** Written into the outbox by a watcher that serves session tools. The
+ *  sandbox CLI relays history / quoted only when it is present, so panes whose
+ *  watcher does not serve them (credential-only relay, flag off) keep their
+ *  existing direct path. Forging it only misroutes the forger's own call. */
+export const RELAY_SESSION_TOOLS_MARKER = '.botmux-session-tools';
+
 /** Quoted attachments travel back base64-encoded inside `<id>.res.json`. */
 export const RELAY_SESSION_TOOL_ATTACHMENT_BYTES = 32 * 1024 * 1024;
 
@@ -2179,10 +2185,19 @@ export function startOutboxWatcher(
     // 的 watcher（restore / transfer 之后）会把它再执行一遍。
     try { rmSync(reqPath, { force: true }); } catch { /* */ }
     // 原子写：沙盒侧 CLI 在 existsSync 轮询这个 res.json，rename 保证它读到完整 JSON。
-    try { atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr, ...extra })); } catch { /* */ }
+    // outbox 对沙盒可写：res.json 可能被预先放成指向宿主文件的软链，必须替换而不是写穿。
+    try {
+      atomicWriteFileSync(join(outbox, `${id}.res.json`), JSON.stringify({ code, stdout, stderr, ...extra }), { followTargetSymlink: false });
+    } catch { /* */ }
     for (const p of staged) { try { rmSync(p, { force: true }); } catch { /* */ } }
     inFlight.delete(name);
   };
+
+  if (opts.sessionToolChatId) {
+    try {
+      atomicWriteFileSync(join(outbox, RELAY_SESSION_TOOLS_MARKER), '1\n', { mode: 0o600, followTargetSymlink: false });
+    } catch { /* the sandbox then keeps its direct path and fails visibly */ }
+  }
 
   const serveSessionTool = async (id: string, reqPath: string, name: string, req: RelayRequest): Promise<void> => {
     const v = validateRelaySessionToolRequest(req);

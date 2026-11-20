@@ -99,7 +99,7 @@ import {
 } from './autostart.js';
 import { tmuxEnv, clientTmuxVersionForEnv, tmuxVersionAtLeast } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
-import { sandboxEnabled } from './adapters/backend/sandbox.js';
+import { RELAY_SESSION_TOOLS_MARKER, sandboxEnabled } from './adapters/backend/sandbox.js';
 import { mutateBotsJsonAtomic, writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
@@ -9979,6 +9979,9 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
 async function relaySessionToolIfSecretWithheld(tool: 'history' | 'quoted', rest: string[]): Promise<void> {
   const relayDir = process.env.BOTMUX_SEND_RELAY?.trim();
   if (!relayDir || process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1') return;
+  // Only a watcher that serves session tools advertises it (credential-only
+  // relays and bots without the flag never do).
+  if (!existsSync(join(relayDir, RELAY_SESSION_TOOLS_MARKER))) return;
   const appId = process.env.BOTMUX_LARK_APP_ID?.trim();
   const sd = process.env.SESSION_DATA_DIR?.trim();
   if (appId && sd) {

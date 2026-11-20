@@ -1,7 +1,7 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
-import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync, lstatSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
@@ -1951,6 +1951,14 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
+  // The attachment bucket is writable from inside the file sandbox, so the
+  // directory or the file name may be a planted symlink. Never write through
+  // one: refuse a symlinked directory, and land the bytes via rename (which
+  // replaces a symlink entry instead of following it).
+  const dirInfo = lstatSync(dir);
+  if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {
+    throw new Error(`Refusing to download into a non-directory: ${dir}`);
+  }
 
   // Resolve resource ownership with the same app identity before borrowing a
   // user's token. A forward's outer ID, owning leaf and enclosing forward can
@@ -2078,22 +2086,39 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
     throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
-  writeFileSync(savePath, buf);
+  await writeViaRename(savePath, async (tmp) => { writeFileSync(tmp, buf, { flag: 'wx' }); });
+}
+
+/** Write to a fresh sibling file, then rename it over `savePath`: a symlink
+ *  already sitting at `savePath` is replaced, never written through. */
+async function writeViaRename(savePath: string, write: (tmp: string) => Promise<void>): Promise<void> {
+  const tmp = `${savePath}.${process.pid}.${randomBytes(4).toString('hex')}.part`;
+  try {
+    await write(tmp);
+    renameSync(tmp, savePath);
+  } catch (err) {
+    try { unlinkSync(tmp); } catch { /* not created */ }
+    throw err;
+  }
 }
 
 async function writeResourceToDisk(res: any, savePath: string): Promise<void> {
-  if (res instanceof Buffer) {
-    writeFileSync(savePath, res);
-  } else if (res && typeof res === 'object' && 'writeFile' in res) {
-    await res.writeFile(savePath);
-  } else {
-    // Raw Readable (client.request with responseType:'stream'). Pipe straight
-    // to disk instead of buffering — this resource API serves files up to
-    // 100MB, so Buffer.concat + writeFileSync would spike memory and block the
-    // event loop under concurrent downloads. pipeline handles backpressure and
-    // closes/cleans up both streams on error.
-    await pipeline(res as NodeJS.ReadableStream, createWriteStream(savePath));
-  }
+  await writeViaRename(savePath, async (tmp) => {
+    if (res instanceof Buffer) {
+      writeFileSync(tmp, res, { flag: 'wx' });
+    } else if (res && typeof res === 'object' && 'writeFile' in res) {
+      // SDK helper: it opens the path itself, so make sure nothing is there.
+      if (existsSync(tmp)) throw new Error(`download temp already exists: ${tmp}`);
+      await res.writeFile(tmp);
+    } else {
+      // Raw Readable (client.request with responseType:'stream'). Pipe straight
+      // to disk instead of buffering — this resource API serves files up to
+      // 100MB, so Buffer.concat + writeFileSync would spike memory and block the
+      // event loop under concurrent downloads. pipeline handles backpressure and
+      // closes/cleans up both streams on error.
+      await pipeline(res as NodeJS.ReadableStream, createWriteStream(tmp, { flags: 'wx' }));
+    }
+  });
 }
 
 const EXT_TO_FILE_TYPE: Record<string, string> = {
