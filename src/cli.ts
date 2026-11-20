@@ -17860,6 +17860,8 @@ botmux create-group — 用一组机器人新建飞书群
   off 之后本机所有建群入口（本命令、/group、Dashboard 建群、会议监听群等）都不再发这条，
   群主转让、拉人、设管理员照常。写的是 ~/.botmux/config.json 的 "groupOwnerNotice": false
   （on 会删掉这个键，回到默认）；下一次建群即生效，不用重启 daemon。不带参数 = status。
+  文件沙盒内 status/on/off 均拒绝执行：那里的配置视图不代表宿主，写入也不持久。
+  请在宿主终端执行，或使用 Dashboard「设置 → 群聊创建」。
 
 团队模式（跨机建聚焦新群，走中心化平台）:
   botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
@@ -17897,6 +17899,20 @@ botmux create-group — 用一组机器人新建飞书群
   const { parseOwnerNoticeCommand, runOwnerNoticeCommand } = await import('./cli/create-group-resolver.js');
   const ownerNoticeCommand = parseOwnerNoticeCommand(rest);
   if (ownerNoticeCommand.kind !== 'none') {
+    // A sandboxed CLI cannot see the host's live config.json. Worse, its fresh
+    // tmpfs may accept a write and report "saved" while the host stays unchanged.
+    // Refuse every mode (including read-only status) instead of returning an
+    // untrustworthy value; do not expose the credential-bearing host config.
+    if (detectSandboxContext().inSandbox) {
+      console.error(
+        'ℹ️  当前在 botmux 沙盒内，建群后 @ 群主提醒开关的 status/on/off 均不可用：'
+        + '这里读到的配置不代表宿主，写入也不会落到宿主。'
+        + '\n   请在宿主终端执行 `botmux create-group owner-notice [status|on|off]`，'
+        + '或使用 Dashboard「设置 → 群聊创建」。',
+      );
+      process.exitCode = 1;
+      return;
+    }
     const { setGroupOwnerNoticeEnabled, readRawGroupOwnerNotice } = await import('./global-config.js');
     const outcome = runOwnerNoticeCommand(ownerNoticeCommand, {
       setEnabled: setGroupOwnerNoticeEnabled,
