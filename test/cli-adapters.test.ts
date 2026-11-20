@@ -421,12 +421,14 @@ describe('claude-code buildArgs', () => {
       for (const prompt of prompts) {
         expect(prompt).toContain('botmux skill show botmux-send');
       }
-      // No-transport and transcript delivery must keep their existing contract:
-      // these modes do not advertise explicit send commands in routing hints.
+      // Transcript delivery still sends attachments / cross-bot messages, so it
+      // keeps the pointer; no-transport sessions and doubao's transcript prompt
+      // (send is deliberately untaught there) do not advertise send at all.
+      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).toContain('botmux skill show botmux-send');
       expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('botmux skill show botmux-send');
       expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('botmux skill show botmux-send');
-      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('botmux skill show botmux-send');
-      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript', 'doubao').join('\n')).not.toContain('botmux skill show botmux-send');
     }
   });
 
@@ -538,24 +540,32 @@ describe('claude-code buildArgs', () => {
     expect(buildBotmuxShellHints('en', false, 'send').join('\n')).toBe(shellDefault);
   });
 
-  // ── replyDelivery=transcript（claude-code 的 daemon 缺省）：最终回复由 daemon 从
-  //    转写自动转发，两条注入路径都彻底不提 botmux send——没有 send 用法、heredoc、
-  //    @ 决策、附件用法；只留改口 intro、botmux history / bots list、哨兵（fallback
-  //    的抑制规则）、workflow 与防注入。
-  it('never mentions botmux send on EITHER injection path for replyDelivery=transcript, keeps the silence sentinel', () => {
+  // ── replyDelivery=transcript（支持转写的 CLI 的缺省）：最终回复由 daemon 从转写
+  //    自动转发。两条注入路径都不再把 botmux send 当回复通道（没有「必须 send 回复」
+  //    「唯一方式」、反馈页脚与反重发这些 send 模式专属提示），只把它留给最终回复带
+  //    不了的事：跨 bot @ / 回报、附件、多行 heredoc 的正确写法；哨兵、上下文命令与
+  //    防注入照旧。
+  it('keeps botmux send on BOTH injection paths only for what the final reply cannot carry under replyDelivery=transcript', () => {
     const sys = buildBotmuxSystemPromptText({ locale: 'en', replyDelivery: 'transcript' });
     const shell = buildBotmuxShellHints('en', false, 'transcript').join('\n');
     for (const prompt of [sys, shell]) {
       expect(prompt).toContain('automatically forwarded back to Lark');
-      expect(prompt).not.toContain('botmux send');
-      expect(prompt).not.toContain("<<'EOF'");
-      expect(prompt).not.toContain('--mention');
-      expect(prompt).not.toContain('--images');
+      // The reply channel is the final message, not a send.
       expect(prompt).not.toContain('you MUST reply via');
       expect(prompt).not.toContain('the only way');
-      // 以「send 是最终回复」为前提的两条提示不再注入。
-      expect(prompt).not.toContain('--response-kind final');
+      expect(prompt).not.toContain('feedback buttons');
       expect(prompt).not.toContain('no visible');
+      // send survives for collaboration / hand-back, attachments and other chats,
+      // with the @ decision, multi-line heredoc and a ban on progress sends.
+      expect(prompt).toContain('only for what the final reply cannot carry');
+      expect(prompt).toContain('--mention-back');
+      expect(prompt).toContain('--no-mention');
+      expect(prompt).toContain("<<'EOF'");
+      expect(prompt).toContain('--images');
+      expect(prompt).toContain('progress broadcasts');
+      // An answer that must itself go through send is declared final, so the
+      // forwarded final reply does not post it a second time.
+      expect(prompt).toContain('--response-kind final');
       // 哨兵语义与上下文命令保留。
       expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
       expect(prompt).toContain('botmux history');
@@ -565,12 +575,26 @@ describe('claude-code buildArgs', () => {
     const shellZh = buildBotmuxShellHints('zh', false, 'transcript').join('\n');
     for (const prompt of [sysZh, shellZh]) {
       expect(prompt).toContain('自动转发回飞书');
-      expect(prompt).not.toContain('botmux send');
+      expect(prompt).toContain('只用于最终回复带不了的事');
+      expect(prompt).toContain('不要用');
       expect(prompt).not.toContain('唯一方式');
+      expect(prompt).not.toContain('必须用 `botmux send` 发送回复');
       expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
       expect(prompt).toContain('botmux history');
     }
     expect(sys).not.toBe(buildBotmuxSystemPromptText({ locale: 'en' }));
+  });
+
+  // Doubao 的工具命令跑在账号级常驻进程里，模型执行的 botmux send 会按别的会话的
+  // 进程树归属（#2828）：它的 transcript 提示照旧一个字都不提 send。
+  it('doubao transcript hints keep the original no-send wording', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const doubao = buildBotmuxShellHints(locale, false, 'transcript', 'doubao').join('\n');
+      expect(doubao).not.toContain('botmux send');
+      expect(doubao).not.toContain('--mention');
+      expect(doubao).toContain('BOTMUX_NOTHING_TO_SEND');
+      expect(doubao).toContain('botmux history');
+    }
   });
 
   // ── #1504: Cursor detaches an over-long shell command into a background task
@@ -599,12 +623,14 @@ describe('claude-code buildArgs', () => {
     expect(cursorZh).toContain('不是飞书用户的新消息');
     expect(cursorZh).toContain('不要再 botmux send');
 
-    // transcript mode: same warning, but it must not reintroduce `botmux send`.
-    const cursorTranscript = buildBotmuxShellHints('en', false, 'transcript', 'cursor').join('\n');
-    expect(cursorTranscript).toContain('background task');
-    expect(cursorTranscript).toContain('BOTMUX_NOTHING_TO_SEND');
-    expect(cursorTranscript).not.toContain('botmux send');
-    expect(cursorTranscript).not.toBe(buildBotmuxShellHints('en', false, 'transcript').join('\n'));
+    // transcript mode: same warning, but the note itself must not ask for a send.
+    const cursorTranscriptLines = buildBotmuxShellHints('en', false, 'transcript', 'cursor');
+    const cursorTranscriptNote = cursorTranscriptLines.filter((l) => l.includes('Briefly inform the user about the task result'));
+    expect(cursorTranscriptNote).toHaveLength(1);
+    expect(cursorTranscriptNote[0]).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(cursorTranscriptNote[0]).not.toContain('botmux send');
+    expect(cursorTranscriptLines.filter((l) => l !== cursorTranscriptNote[0]))
+      .toEqual(buildBotmuxShellHints('en', false, 'transcript'));
 
     // Other CLIs: byte-identical to the no-cliId baseline.
     for (const cliId of ['codex', 'aiden', 'coco', 'opencode'] as const) {
@@ -616,21 +642,21 @@ describe('claude-code buildArgs', () => {
     expect(buildBotmuxShellHints('en', true, 'send', 'cursor')).toEqual(buildBotmuxShellHints('en', true));
   });
 
-  it('transcript identity keeps the three routing rules minus mention_must; solo drops routing_rules; noTransport still wins', () => {
+  it('transcript identity keeps every routing rule incl. mention_must; solo drops routing_rules; noTransport still wins', () => {
     const solo = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
     expect(solo).toContain('<name>Bot</name>');
     expect(solo).toContain('<open_id>ou_x</open_id>');
     expect(solo).not.toContain('<routing_rules>');
-    expect(solo).not.toContain('botmux send');
+    expect(solo).not.toContain('you MUST `botmux send --mention');
     const group = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: false });
     expect(group).toContain('<routing_rules>');
     expect(group).toContain('Route by @name and open_id');
     expect(group).toContain('Do only your part');
     expect(group).toContain('stay silent');
     expect(group).toContain('Do not pull other bots in');
-    // mention_must 整句围绕 botmux send --mention，transcript 下不注入。
-    expect(group).not.toContain('you MUST `botmux send --mention');
-    expect(group).not.toContain('botmux send');
+    // The transcript final card never @-s the bot that triggered the turn, so
+    // collaborating with / reporting back to a bot still needs `--mention`.
+    expect(group).toContain('you MUST `botmux send --mention');
     // noTransport 优先级最高：transcript 标志不改变 no-transport 的折叠输出。
     const noTransport = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true });
     expect(buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true, replyDelivery: 'transcript', solo: true })).toBe(noTransport);
@@ -641,18 +667,17 @@ describe('claude-code buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
     const prompt = args[args.indexOf('--append-system-prompt') + 1];
     expect(prompt).toContain('自动转发回飞书');
-    expect(prompt).not.toContain('botmux send');
-    expect(prompt).not.toContain("<<'EOF'");
-    expect(prompt).not.toContain('--mention');
+    expect(prompt).toContain('只用于最终回复带不了的事');
+    expect(prompt).not.toContain('必须用 `botmux send` 发送回复');
     expect(prompt).not.toContain('<routing_rules>');
     expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
     expect(prompt).toContain('botmux history');
-    // 非 solo：identity 保留归属三条规则，仍不提 send。
+    // 非 solo：identity 保留全部归属规则，含「跟别的 bot 协作必须 --mention」。
     const groupArgs = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: false });
     const groupPrompt = groupArgs[groupArgs.indexOf('--append-system-prompt') + 1];
     expect(groupPrompt).toContain('<routing_rules>');
     expect(groupPrompt).toContain('只做分给自己的部分');
-    expect(groupPrompt).not.toContain('botmux send');
+    expect(groupPrompt).toContain('跟别的 bot 协作必须 `botmux send --mention');
     const previous = process.env[GOAL_ENV.V3_MARKER];
     process.env[GOAL_ENV.V3_MARKER] = '1';
     try {

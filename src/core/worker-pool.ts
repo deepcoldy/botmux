@@ -129,8 +129,8 @@ import {
   initialNativeRenameStartupCommand,
   initialPiLaunchSessionTitle,
 } from './initial-native-rename.js';
-import { effectiveReplyDelivery } from './reply-delivery.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, normalizeBackgroundTaskPins, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
+import { effectiveReplyDelivery, resolveLegacyReplyDeliveryForSession } from './reply-delivery.js';
+import { fallbackTurnId, frozenReplyContextForTurn, inheritTurnReplyRouting, isSubstituteTurn, normalizeBackgroundTaskPins, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildStuckPageCard, buildStuckKeyResultCard, buildInputNotSubmittedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildRecoveryFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
@@ -141,7 +141,8 @@ import { cliModelMayKeepReasoningEffort, cliModelSupportsReasoningEffort, isBack
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
-import { refundRetryAttempt } from '../services/failed-turn-retry.js';
+import { markRetryAttempt, refundRetryAttempt } from '../services/failed-turn-retry.js';
+import { noteReplyCardTurnStarted } from './reply-card-turn-start.js';
 import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog, type RiffBackendConfig } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -1085,6 +1086,17 @@ import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { sameTrustedPrincipal } from './active-turn-authority.js';
 import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
 import { isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
+import {
+  inspectAntigravityAccounts,
+  maskAntigravityEmail,
+  rotateAntigravityAccountOnQuotaLimit,
+} from '../services/antigravity-accounts.js';
+import {
+  cancelAntigravityRotationReplay,
+  clearInFlightAntigravityRotation,
+  formatAntigravityCooldown,
+  tryAntigravityQuotaAutoRotate,
+} from './antigravity-rotation.js';
 import {
   evaluateVcMeetingManagedSend,
   resolveVcMeetingImTurnOrigin,
@@ -4104,6 +4116,7 @@ export function ensureReadonlyTaskContinuationAttached(
           turnId: dispatch.turnId,
           dispatchAttempt: dispatch.dispatchAttempt,
           ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestLaunchCommandsForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
+          ...(ds.crashDiagnosticParked ? { replyDelivery: latestReplyDeliveryForRespawn(ds) } : {}),
           trustedCaller: current.trustedCaller,
           ...(turnCallerOpenIdFor(ds, dispatch.turnId)
             ? { turnCallerOpenId: turnCallerOpenIdFor(ds, dispatch.turnId)! }
@@ -8775,6 +8788,7 @@ export function killWorker(
   }
   restartCoordinator.cancelSession(ds.session.sessionId);
   resetStartingCardHealth(ds);
+  ds.antigravityRotation = undefined;
   try {
     clearUsageLimitState(ds);
   } catch (error) {
@@ -8871,6 +8885,7 @@ export function killWorker(
 export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void {
   restartCoordinator.cancelSession(ds.session.sessionId);
   resetStartingCardHealth(ds);
+  ds.antigravityRotation = undefined;
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // SIGTERM below makes the worker killCli() — the CLI prompt is gone.
@@ -8903,6 +8918,7 @@ function clearTransferWorkerState(
 ): void {
   restartCoordinator.cancelSession(ds.session.sessionId);
   resetStartingCardHealth(ds);
+  ds.antigravityRotation = undefined;
   clearUsageLimitState(ds);
   ds.workerReady = false;
   // The transfer detaches this worker/CLI pair; the replacement must re-prove
@@ -9418,6 +9434,19 @@ function latestCodexRpcInputForRespawn(ds: DaemonSession): boolean | undefined {
  * Live-worker /restart 或崩溃恢复携带的最新 larkToolBinding 开关。
  * 三分态返回：true = 开启/默认（未配置视为开启）；null = 明确关闭；undefined = 异常保持快照不动。
  */
+/** replyDelivery for an in-worker respawn (`/restart`): the replacement CLI's
+ *  prompt and the worker gate follow today's config, like a re-fork would.
+ *  Undefined (lookup failed) keeps the worker's snapshot. */
+export function latestReplyDeliveryForRespawn(ds: DaemonSession): 'send' | 'transcript' | undefined {
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    return effectiveReplyDelivery(ds.larkAppId, sessionCliId(ds, botCfg), sessionPromptInjection(ds),
+      { sessionSandbox: ds.session.sandbox });
+  } catch {
+    return undefined;
+  }
+}
+
 export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | null | undefined {
   try {
     const binding = getBot(ds.larkAppId).config.larkToolBinding;
@@ -9499,9 +9528,10 @@ export interface SessionRestartRequest {
  * restart stays distinguishable from IM `/restart` in the worker's message.
  * The worker does not branch on it.
  */
-function restartIpcReason(source: RestartSource): { reason?: 'operator' | 'cli_crash' } {
+function restartIpcReason(source: RestartSource): { reason?: 'operator' | 'cli_crash' | 'account_rotation' } {
   if (source === 'cli_crash') return { reason: 'cli_crash' };
   if (source === 'dashboard') return { reason: 'operator' };
+  if (source === 'account_rotation') return { reason: 'account_rotation' };
   return {};
 }
 
@@ -9570,6 +9600,7 @@ export function requestSessionRestart(
             traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
             ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
               larkToolBinding: latestLarkToolBindingForRespawn(ds),
+              replyDelivery: latestReplyDeliveryForRespawn(ds),
               ...latestLaunchCommandsForRespawn(ds),
               ...(nextStatuslineLaunchGen ? { statuslineLaunchGen: nextStatuslineLaunchGen } : {}) }) } as DaemonToWorker);
         } catch (sendError) {
@@ -12767,6 +12798,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   // This worker generation is being retired: an in-flight restart of it can
   // no longer report a result. Same as killWorker / retireWorkerProcessOnly.
   restartCoordinator.cancelSession(ds.session.sessionId);
+  ds.antigravityRotation = clearInFlightAntigravityRotation(ds.antigravityRotation);
   try {
     w.send({ type: 'suspend' } as DaemonToWorker);
   } catch {
@@ -17779,6 +17811,7 @@ export function sendWorkerInput(
     // an unconditional field would be pure noise on every message.
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? { replyDelivery: latestReplyDeliveryForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
     ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
@@ -18361,6 +18394,7 @@ export function promoteQueuedActivationTail(
       // Same parked-worker launch-snapshot refresh as the ordinary send.
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? { replyDelivery: latestReplyDeliveryForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
       ...(admittedLinkRefs.mode !== 'disabled'
@@ -20432,6 +20466,15 @@ function forkWorkerPrepared(
     // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
     // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
     replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId, sessionPromptInjection(ds)),
+    // 旧版 botmux 起的 pane（环境里没有 REPLY_DELIVERY_ENV 快照）按当时的缺省起提示；
+    // 热重连时 worker 用它判这个 pane 的投递方式（services/pane-reply-delivery.ts）。
+    replyDeliveryLegacy: resolveLegacyReplyDeliveryForSession(
+      ds.session,
+      botCfg.larkAppId,
+      agentCfg.cliId,
+      sessionPromptInjection(ds),
+      () => sessionStore.updateSession(ds.session),
+    ),
     // 实验性、默认关闭：只有显式 true 才下发，worker 读不到即保持旧的失败通知。
     // adopt init 不带它：adopt 的失败兜底本就由 adoptMode 门禁抑制。
     ...(botCfg.suppressDeliveredFinalFailureNotice === true ? { suppressDeliveredFinalFailureNotice: true } : {}),
@@ -20878,6 +20921,7 @@ function setupWorkerHandlers(
   }
   ds.taskContinuationRpcProof = undefined;
   ds.codexAppInterruptTarget = undefined;
+  ds.antigravityRotation = clearInFlightAntigravityRotation(ds.antigravityRotation);
   // 新 Node worker 代次绑定即作废旧崩溃连胜：上一 worker 代次（OOM/管控死亡、
   // 或 killWorker/retire 后由任务续跑/用户消息拉起的替代进程）锚定的 readyAt
   // 不能连坐新一代——否则新 CLI 在旧 readyAt 的 60s 窗口内第一次永久退出
@@ -21221,6 +21265,234 @@ function setupWorkerHandlers(
       if (managedAuxUiSuppressed(turnId, attempt)) return;
     }
     const limitKey = usageLimitStateKey(limit);
+    // Antigravity hosted-account auto-rotation: on genuine native quota
+    // exhaustion (`antigravity-error-composer`), rotate the host vault to
+    // the next healthy account, restart the worker in place (resuming
+    // `--conversation`), and automatically replay the interrupted turn.
+    // When rotation starts, suppress duplicate `@owner` limit spam and
+    // `quotaFallbackBot` handoff; when disabled or exhausted, fall through
+    // so existing notifications and backup-bot handoff run as before.
+    const effectiveCliId = sessionCliId(ds, botCfg);
+    // Only replay when the limited frame carries a proven `provenTurn`
+    // matching the exact recorded turn. Without `provenTurn` (e.g. a
+    // direct Web Terminal prompt), rotate + restart cleanly and ask the
+    // user to resend rather than replaying an older completed Lark turn.
+    const capturedFailedTurn = ds.session.lastFailedTurn;
+    const matchesFailedTurn = Boolean(
+      provenTurn && capturedFailedTurn && capturedFailedTurn.turnId === provenTurn,
+    );
+    // A matching turn ID proves ownership, NOT that replay is side-effect safe.
+    // Only a durable direct-failure observation (no assistant text/tool calls)
+    // may be re-sent unattended. agy does not currently expose that proof, so
+    // its native quota path rotates + resumes but asks for manual continuation
+    // instead of repeating a turn that may already have performed mutations.
+    const replayPayload = matchesFailedTurn
+      && capturedFailedTurn?.directFailure === true
+      && capturedFailedTurn.status === 'failed'
+      && !capturedFailedTurn.recovery
+      && !capturedFailedTurn.limitedSnapshot
+      && capturedFailedTurn.retryable !== false
+      && capturedFailedTurn.cliInput.trim()
+      ? {
+          sourceTurnId: capturedFailedTurn.turnId,
+          cliInput: capturedFailedTurn.cliInput,
+          userPrompt: capturedFailedTurn.userPrompt,
+        }
+      : undefined;
+    const formatAccountLabel = (id?: string, email?: string): string => {
+      const masked = maskAntigravityEmail(email);
+      if (id && masked) return `\`${id}\` (${masked})`;
+      if (id) return `\`${id}\``;
+      return masked ?? 'unknown';
+    };
+    const rotationDecision = tryAntigravityQuotaAutoRotate({
+      effectiveCliId,
+      usageLimit: limit,
+      suppressRecoveryCard: ds.suppressRecoveryCard,
+      isAdoptSession: isSharedAdoptSession(ds) || Boolean(ds.adoptedFrom || ds.initConfig?.adoptMode),
+      isRemoteBackend: isRemoteBackendSession(ds),
+      isTransferring: isSessionTransferring(ds),
+      hasProtectedMutation: hasProtectedSessionMutationOwnership(ds),
+      hasPendingFork: Boolean(ds.session.pendingForkSession),
+      restartInFlight: isSessionRestartInFlight(ds),
+      sessionAccountId: ds.antigravityAccountId ?? ds.session.antigravityAccountId,
+      screenTurnId: provenTurn,
+      lastCliInputTurnId: provenTurn ? ds.lastCliInputTurnId : undefined,
+      lastMessageAt: ds.lastMessageAt,
+      replayPayload,
+      getRotationState: () => ds.antigravityRotation,
+      setRotationState: state => { ds.antigravityRotation = state; },
+      rotateAccount: params => rotateAntigravityAccountOnQuotaLimit(params),
+      requestRestart: onSettled => {
+        const req = requestSessionRestart(ds, {
+          source: 'account_rotation',
+          notify: status => onSettled(status),
+        });
+        return { started: Boolean(req && !req.startFailure && !req.joined), attemptId: req?.attemptId };
+      },
+      isStillOwned: () => ownsLifecycleMutation() && ds.session.status === 'active',
+      isSessionActive: () => ds.session.status === 'active',
+      hasManualIntervention: (startedAtLastMessageAt, capturedTurnId) => (
+        ds.lastMessageAt > startedAtLastMessageAt
+        || Boolean(ds.pendingPrompt)
+        || Boolean(ds.pendingFollowUps?.length)
+        || Boolean(ds.pendingFollowUpTurnIds?.length)
+        || (capturedTurnId !== undefined && ds.lastCliInputTurnId !== undefined && ds.lastCliInputTurnId !== capturedTurnId)
+        || hasProtectedSessionMutationOwnership(ds)
+      ),
+      updateSessionAccount: accountId => {
+        ds.antigravityAccountId = accountId;
+        if (ds.session.antigravityAccountId !== accountId) {
+          ds.session.antigravityAccountId = accountId;
+          sessionStore.updateSession(ds.session);
+        }
+      },
+      clearUsageLimit: () => {
+        try {
+          clearUsageLimitState(ds);
+          if (ds.lastScreenStatus === 'limited') {
+            ds.lastScreenStatus = 'idle';
+          }
+        } catch (err: any) {
+          logger.warn(`[${t}] Failed to clear usage limit after antigravity rotation: ${err?.message ?? err}`);
+          // The outer state machine must stop before replay: a sticky limited
+          // frame would otherwise look like a fresh failure on the next edge.
+          throw err;
+        }
+      },
+      replayTurn: payload => {
+        if (!ds.worker || ds.worker.killed) return { accepted: false };
+        const retryTurnId = `agy-rotate-${randomUUID()}`;
+        let rollbackReplyRouting: (() => void) | undefined;
+        let accepted = false;
+        try {
+          rollbackReplyRouting = inheritTurnReplyRouting(ds, payload.sourceTurnId, retryTurnId);
+          accepted = sendWorkerInput(ds, { content: payload.cliInput }, retryTurnId);
+        } catch (err: any) {
+          logger.warn(`[${t}] Antigravity rotation auto-replay failed before acceptance: ${err?.message ?? err}`);
+        }
+        if (!accepted) {
+          rollbackReplyRouting?.();
+          try { sessionStore.updateSession(ds.session); } catch { /* the replay was not accepted */ }
+          return { accepted: false };
+        }
+        try {
+          if (payload.sourceTurnId && ds.session.lastFailedTurn?.turnId === payload.sourceTurnId) {
+            markRetryAttempt(ds.session);
+          }
+          rememberLastCliInput(ds, payload.userPrompt, { content: payload.cliInput }, retryTurnId);
+          noteReplyCardTurnStarted(ds, retryTurnId);
+          // Do NOT forge `ds.lastScreenStatus = 'working'` here: a prompt-ready
+          // idle frame arriving before agy enters busy mode would otherwise create
+          // a fake working -> idle completion edge (workflow settlement / ✅ mark).
+          ds.streamCardPending = true;
+          persistStreamCardState(ds);
+          sessionStore.updateSession(ds.session);
+          return { accepted: true, retryTurnId };
+        } catch (err: any) {
+          // The worker ALREADY accepted the input. Return the retry identity so
+          // the state machine can block a second attempt and notify uncertainty;
+          // throwing here would be swallowed by RestartCoordinator.notify().
+          return {
+            accepted: true,
+            retryTurnId,
+            persistenceError: err instanceof Error ? err.message : String(err),
+          };
+        }
+      },
+      notifySwitching: ({ fromId, toId, toEmail, alreadyRotated, willAutoReplay }) => {
+        const key = willAutoReplay ? 'worker.agy_rotate.switching' : 'worker.agy_rotate.switching_no_replay';
+        const text = tr(key, {
+          fromAccount: formatAccountLabel(fromId),
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        logger.info(`[${t}] Antigravity quota auto-rotation: ${fromId ?? '?'} -> ${toId} (autoReplay=${willAutoReplay}, alreadyRotated=${alreadyRotated})`);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity rotation notice: ${err?.message ?? err}`);
+        });
+      },
+      notifyRestartFailed: ({ toId, toEmail, status }) => {
+        logger.warn(`[${t}] Antigravity rotation restart ${status} for target account ${toId}`);
+        const body = tr('worker.agy_rotate.restart_failed', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        const ownerOpenId = ds.session.ownerOpenId;
+        const text = ownerOpenId ? `<at id=${ownerOpenId}></at> ${body}` : body;
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity restart-failed notice: ${err?.message ?? err}`);
+        });
+      },
+      notifyManualReplayNeeded: ({ toId, toEmail }) => {
+        const text = tr('worker.agy_rotate.replay_manual', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity manual-replay notice: ${err?.message ?? err}`);
+        });
+      },
+      notifyReplayFailed: ({ toId, toEmail }) => {
+        const canRetryCommand = Boolean(
+          replayPayload?.sourceTurnId && ds.session.lastFailedTurn?.turnId === replayPayload.sourceTurnId,
+        );
+        const key = canRetryCommand ? 'worker.agy_rotate.replay_failed' : 'worker.agy_rotate.replay_failed_resend';
+        const text = tr(key, {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity replay-failed notice: ${err?.message ?? err}`);
+        });
+      },
+      notifySettleFailed: ({ toId, toEmail, error }) => {
+        logger.warn(`[${t}] Antigravity rotation settlement failed for ${toId}: ${error}`);
+        const text = tr('worker.agy_rotate.settle_failed', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity settlement-failure notice: ${err?.message ?? err}`);
+        });
+      },
+      notifyReplayUncertain: ({ toId, toEmail, error }) => {
+        logger.warn(`[${t}] Antigravity rotation replay uncertain for ${toId}: ${error}`);
+        const text = tr('worker.agy_rotate.replay_uncertain', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity replay-uncertain notice: ${err?.message ?? err}`);
+        });
+      },
+    });
+
+    if (rotationDecision.outcome === 'started') {
+      return;
+    }
+    if (rotationDecision.outcome === 'exhausted' && ds.rateLimitNotifiedKey !== limitKey) {
+      let exhaustText: string;
+      if (rotationDecision.reason === 'turn_budget_exhausted') {
+        exhaustText = tr('worker.agy_rotate.turn_budget_exhausted', {}, loc);
+      } else {
+        const enabledCount = rotationDecision.enabledCount ?? inspectAntigravityAccounts().enabledCount;
+        const remainingMs = rotationDecision.earliestRecoveryMs !== undefined
+          ? Math.max(0, rotationDecision.earliestRecoveryMs - Date.now())
+          : undefined;
+        exhaustText = remainingMs !== undefined && remainingMs > 0
+          ? tr('worker.agy_rotate.exhausted', {
+              count: String(enabledCount),
+              recovery: formatAntigravityCooldown(remainingMs, loc),
+            }, loc)
+          : tr('worker.agy_rotate.exhausted_no_eta', {
+              count: String(enabledCount),
+            }, loc);
+      }
+      logger.warn(`[${t}] Antigravity account pool exhausted (${rotationDecision.reason})`);
+      scopedReply(exhaustText, 'text', turnId).catch((err: any) => {
+        logger.debug(`[${t}] Failed to deliver antigravity exhaustion notice: ${err?.message ?? err}`);
+      });
+    } else if (rotationDecision.outcome === 'write_failed') {
+      logger.error(`[${t}] Antigravity account rotation write failed: ${rotationDecision.error}`);
+    } else if (rotationDecision.outcome === 'identity_unknown') {
+      logger.warn(`[${t}] Antigravity quota rotation refused: session account identity is unknown`);
+    }
+
     if (ds.rateLimitNotifiedKey !== limitKey) {
       ds.rateLimitNotifiedKey = limitKey;
       const notifyBody = tr(
@@ -23207,6 +23479,29 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'antigravity_account': {
+        if (!ownsLifecycleMutation() || ds.worker !== worker) break;
+        if (ds.antigravityRotation?.inFlightToken) {
+          const expectedAttemptId = ds.antigravityRotation.restartAttemptId;
+          if (!expectedAttemptId || msg.attemptId !== expectedAttemptId) {
+            logger.warn(`[${t}] Ignored stale/uncorrelated Antigravity account report during rotation (attempt=${msg.attemptId ?? 'missing'})`);
+            break;
+          }
+          // Stash authoritative worker observation for the in-flight rotation;
+          // commit to ds/SQLite only when `restart_result: succeeded` lands so
+          // a failed restart never leaves SQLite claiming the new account.
+          ds.antigravityRotation.workerReportedAccountId = msg.accountId;
+          break;
+        }
+        const observedAccountId = msg.accountId ?? undefined;
+        ds.antigravityAccountId = observedAccountId;
+        if (ds.session.antigravityAccountId !== observedAccountId) {
+          ds.session.antigravityAccountId = observedAccountId;
+          sessionStore.updateSession(ds.session);
+        }
+        break;
+      }
+
       case 'cli_install_changed': {
         if (!ownsLifecycleMutation()) break;
         const cliId = sessionCliId(ds, getBot(ds.larkAppId).config);
@@ -23669,6 +23964,18 @@ function setupWorkerHandlers(
 
       case 'terminal_input': {
         if (!ownsLifecycleMutation()) break;
+        if (msg.submitted && ds.antigravityRotation) {
+          if (ds.antigravityRotation.inFlightToken) {
+            // Direct terminal input is human intervention just like a new IM
+            // message or /stop: adopt the restarted account, never replay the
+            // superseded task over the user's new submission.
+            cancelAntigravityRotationReplay(ds.antigravityRotation);
+          } else {
+            // A settled rotation belongs to the previous direct-input turn.
+            // Start a fresh logical-turn budget for this new submission.
+            ds.antigravityRotation = undefined;
+          }
+        }
         if (noteIdleAutoCompactDirectInput(ds)) {
           try { sessionStore.updateSession(ds.session); }
           catch (err) { logger.warn(`[${tag(ds)}] idle auto-compact direct-input save failed: ${err instanceof Error ? err.message : String(err)}`); }
@@ -27562,7 +27869,10 @@ function setupWorkerHandlers(
     // A stale takeover worker never clears the replacement — during takeover the
     // old worker's exit fires AFTER the new worker has been assigned.
     if (ds.worker === worker) {
-      restartCoordinator.failSession(ds.session.sessionId);
+      const failedActiveRestart = restartCoordinator.failSession(ds.session.sessionId);
+      if (!failedActiveRestart && ds.antigravityRotation?.inFlightToken) {
+        ds.antigravityRotation = clearInFlightAntigravityRotation(ds.antigravityRotation);
+      }
       if (ds.session.queuedActivationPending) {
         // Journal ownership is backend-independent. The next worker replays
         // this exact head with queuedActivationResume before durable tail N+1.

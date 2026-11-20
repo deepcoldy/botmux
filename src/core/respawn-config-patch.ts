@@ -36,6 +36,10 @@ export interface RespawnConfigPatch {
   larkToolBinding?: boolean | null;
   startupCommands?: string[] | null;
   launchShell?: string | null;
+  /** Effective reply delivery for the replacement CLI (its system prompt is
+   *  rebuilt on spawn, and the worker gate follows it). No null: an absent
+   *  value keeps the snapshot. */
+  replyDelivery?: 'send' | 'transcript';
 }
 
 /** The `lastInitConfig` fields this patch may write. */
@@ -50,6 +54,7 @@ export interface RespawnPatchTarget {
   larkToolBinding?: boolean;
   startupCommands?: string[];
   launchShell?: string;
+  replyDelivery?: 'send' | 'transcript';
 }
 
 export interface RespawnPatchResult {
@@ -58,6 +63,26 @@ export interface RespawnPatchResult {
   traexReconfigure: boolean;
   /** startupCommands changed by value. */
   startupCommandsChanged: boolean;
+}
+
+/** Build the patch carried by an ordinary daemon `message`. Model/binding keep
+ * their historical always-on tri-state handling (the daemon only sends fresh
+ * values while parked). Reply delivery and launch commands are accepted ONLY
+ * when this message will trigger a crash-park respawn: applying them to a live
+ * pane would change the worker gate without rebuilding that pane's prompt. */
+export function respawnConfigPatchFromMessage(
+  msg: Pick<RespawnConfigPatch, 'model' | 'larkToolBinding' | 'startupCommands' | 'launchShell' | 'replyDelivery'>,
+  parkedRespawnPending: boolean,
+): RespawnConfigPatch {
+  return {
+    model: msg.model,
+    larkToolBinding: msg.larkToolBinding,
+    ...(parkedRespawnPending ? {
+      startupCommands: msg.startupCommands,
+      launchShell: msg.launchShell,
+      replyDelivery: msg.replyDelivery,
+    } : {}),
+  };
 }
 
 function sameList(a: readonly string[] | undefined, b: readonly string[] | undefined): boolean {
@@ -87,6 +112,7 @@ export function applyRespawnConfigPatch(cfg: RespawnPatchTarget, patch: RespawnC
     cfg.startupCommands = next;
   }
   if (patch.launchShell !== undefined) cfg.launchShell = patch.launchShell || undefined;
+  if (patch.replyDelivery !== undefined) cfg.replyDelivery = patch.replyDelivery;
   return {
     traexReconfigure: patch.traexAutoModel !== undefined || patch.codexRpcInput !== undefined,
     startupCommandsChanged,

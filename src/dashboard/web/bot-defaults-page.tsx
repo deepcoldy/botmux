@@ -6783,6 +6783,7 @@ const ZERO_PROMPT_UNSUPPORTED_COPY: Record<ZeroPromptUnsupportedReason, string> 
   cli_unsupported: 'botDefaults.promptInjectionUnsupportedCli',
   backend_unsupported: 'botDefaults.promptInjectionUnsupportedBackend',
   scratch_unsupported_for_cli: 'botDefaults.promptInjectionUnsupportedScratch',
+  oncall_unsupported_for_cli: 'botDefaults.promptInjectionUnsupportedOncall',
   zmx_unsupported_for_antigravity: 'botDefaults.promptInjectionUnsupportedZmx',
 };
 

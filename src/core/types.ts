@@ -910,6 +910,10 @@ export interface DaemonSession {
    * target lookup from posting after this episode cleared and a same-key later
    * episode started. Cross-session duplicate events use a daemon-wide TTL. */
   quotaFallbackAttemptToken?: string;
+  /** Host-managed Antigravity account alias active when this session's CLI spawned. */
+  antigravityAccountId?: string;
+  /** In-flight and per-turn state for Antigravity quota-limit auto-rotation. */
+  antigravityRotation?: import('./antigravity-rotation.js').AntigravitySessionRotationState;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */

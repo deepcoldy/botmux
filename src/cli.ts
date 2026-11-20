@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
-import { sendCompletionHintKey } from './services/send-completion-hint.js';
+import { replyDeliveryFromEnv, sendCompletionHintKey } from './services/send-completion-hint.js';
 import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
@@ -8278,6 +8278,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
+  agy-accounts list|save|login|use|next|enable|disable|remove|clear-cooldown|auto-rotate|sync
+              托管 Antigravity (agy) 多账号凭据并配置限额自动轮换（AI CLI 会话内拒绝写操作）
   actor current --json
               返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
   workspace-recycle discover|prepare|finish|status|hook
@@ -15301,7 +15303,12 @@ async function cmdSend(
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
     const sendLocale = localeForBot(appId);
-    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId), undefined, sendLocale));
+    // REPLY_DELIVERY_ENV is the spawn snapshot of how this pane's final reply
+    // reaches Lark. Under transcript the hint points the model back at its
+    // final reply instead of another `botmux send` (no hard limit on sends:
+    // collaboration and attachments legitimately need several per turn).
+    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
+      replyDeliveryFromEnv(process.env)), undefined, sendLocale));
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
@@ -21809,6 +21816,19 @@ switch (command) {
   case 'codex-instances': {
     const { runCodexInstancesCommand } = await import('./cli/codex-instances.js');
     await runCodexInstancesCommand(process.argv.slice(3));
+    break;
+  }
+  case 'agy-accounts':
+  case 'antigravity-accounts': {
+    const { runAntigravityAccountsCommand } = await import('./cli/antigravity-accounts.js');
+    try {
+      await runAntigravityAccountsCommand(process.argv.slice(3), {
+        isBlockedInSession: isolatedCliProcess() || isSessionScopedCliProcess(),
+      });
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
     break;
   }
   case 'upgrade':

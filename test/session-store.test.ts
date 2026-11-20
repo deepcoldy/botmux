@@ -2565,6 +2565,17 @@ describe('createSession()', () => {
     });
   });
 
+  it('round-trips the frozen legacy reply delivery across store reloads', () => {
+    const session = createSession('chat-legacy-delivery', 'root-legacy-delivery', 'Legacy pane');
+    session.replyDeliveryLegacy = { cliId: 'claude-code', mode: 'transcript' };
+    updateSession(session);
+
+    init('other-app');
+    init('test-app');
+    expect(getSessionFresh(session.sessionId)?.replyDeliveryLegacy)
+      .toEqual({ cliId: 'claude-code', mode: 'transcript' });
+  });
+
   it('should default chatType to undefined when not provided', () => {
     const session = createSession('chat1', 'root1', 'No ChatType');
     expect(session.chatType).toBeUndefined();

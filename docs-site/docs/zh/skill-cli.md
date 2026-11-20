@@ -11,10 +11,10 @@
 飞书消息 ──▶ botmux ──▶ CLI 里的 AI
                           │  读 Skill，知道该怎么回
                           ▼
-飞书话题 ◀── botmux ◀── botmux send "……"
+飞书话题 ◀── botmux ◀── 最终回复（自动转发）/ botmux send "……"
 ```
 
-所以「终端里有输出，飞书却没收到」，多半是 AI 没执行 `botmux send`，见 [FAQ · C](/faq#c-终端有输出但没发飞书)。
+支持读取会话记录的 CLI（Claude Code、Codex、TraeX 等）默认由 botmux 自动把最终回复发回飞书，AI 只在 @ 别的 bot、发附件或卡片、发到别的群或话题时才执行 `botmux send`；其余 CLI 仍要 AI 自己 `botmux send`。「终端里有输出，飞书却没收到」怎么查，见 [FAQ · C](/faq#c-终端有输出但没发飞书)。
 
 ## 会话里能用哪些命令
 
@@ -56,17 +56,17 @@ EOF
 - 想关掉「必须三选一」的要求：设环境变量 `BOTMUX_REQUIRE_MENTION_DECISION=false`。
 - 多行内容用 heredoc（如上例）或 `--content-file` 传，别写成 `"第一行\n第二行"`。
 
-## 不想让 AI 自己发？
+## 什么时候 AI 不用自己发？
 
 有三种情况，最终回复由 botmux 自动发回飞书，AI 不用执行 `botmux send`：
 
 | 情况 | 说明 |
 |------|------|
+| `replyDelivery: "transcript"`（支持读取会话记录的 CLI 的默认） | botmux 从 CLI 的会话记录里取本轮最后的回答发出去。`botmux send` 只用于 @ 别的 bot 协作、发附件或卡片、发到别的群或话题，提示词也要求别用它发进度 |
 | `codex-app`（Codex App 协议） | 最终回复自动转发。中途推进度、发附件、@ 别的机器人时才用 `botmux send` |
-| `replyDelivery: "transcript"` | botmux 从 CLI 的会话记录里取本轮最后的回答发出去，提示词里也不再提 `botmux send` |
 | `promptInjection: "none"`（零注入） | botmux 不往提示词里加任何东西，也不注入 Skill，最终回答自动发回 |
 
-后两项只对支持读取会话记录的 CLI 有效，配置方法见 [bots.json 配置](/bots-json)。
+`transcript` 和零注入只对支持读取会话记录的 CLI 有效。想让模型照旧自己 `botmux send`，在 bot 配置里显式写 `replyDelivery: "send"`，见 [bots.json 配置](/bots-json)。
 
 ## botmux 自带的 Skill
 

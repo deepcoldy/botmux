@@ -195,6 +195,18 @@ export const messages: Record<string, string> = {
   'card.model_fallback.no_reason': '',
   'worker.rate_limit_notify.rate': '⚠️ {cliName} 触发限流，本轮任务已暂停。请在 {retryLabel} 后重发上一条任务，或直接发送新消息继续。',
   'worker.rate_limit_notify.usage': '⚠️ {cliName} 已达使用限额，本轮任务已暂停。额度刷新后（{retryLabel}）请重发上一条任务，或直接发送新消息继续。',
+  'worker.agy_rotate.switching': '🔄 Antigravity 账号 {fromAccount} 已达限额，已自动轮换至 {toAccount}，正在重启会话并重试本轮消息…',
+  'worker.agy_rotate.switching_no_replay': '🔄 Antigravity 账号 {fromAccount} 已达限额，已自动轮换至 {toAccount}，正在重启会话…',
+  'worker.agy_rotate.exhausted': '⚠️ 托管池中所有 Antigravity 账号均已达到限额（共 {count} 个启用账号），最早预计恢复时间：{recovery}。',
+  'worker.agy_rotate.exhausted_no_eta': '⚠️ 托管池中所有 Antigravity 账号均已达到限额（共 {count} 个启用账号），暂停自动轮换。',
+  'worker.agy_rotate.turn_budget_exhausted': '⚠️ 本轮已达到 Antigravity 账号自动轮换次数上限，已停止继续轮换。',
+  'worker.agy_rotate.restart_failed': '⚠️ 已将 Antigravity 账号轮换至 {toAccount}，但会话自动重启失败，请执行 /restart 后重试。',
+  'worker.agy_rotate.replay_manual': '✅ 已切换至 Antigravity 账号 {toAccount} 并重启会话，请重新发送你的消息。',
+  'worker.agy_rotate.replay_failed': '⚠️ 已切换至 Antigravity 账号 {toAccount} 并重启会话，但自动重发失败，请发送 /retry 重试本轮任务。',
+  'worker.agy_rotate.replay_failed_resend': '⚠️ 已切换至 Antigravity 账号 {toAccount} 并重启会话，但自动重发失败，请重新发送你的消息。',
+  'worker.agy_rotate.settle_failed': '⚠️ 已切换至 Antigravity 账号 {toAccount} 并重启会话，但重启后的状态落盘失败，自动重发未执行；请检查会话后重试。',
+  'worker.agy_rotate.replay_uncertain': '⚠️ Antigravity 账号 {toAccount} 的自动重发结果不确定，输入可能已被执行。请先检查 Web Terminal，不要直接重发。',
+  'worker.agy_rotate.stop_cancelled': '🛑 已取消本轮账号轮换后的自动重发（会话切号重启完成后不会重放原消息）。',
   'worker.traex_auto_model.catalog_prune': '⚠️ 实时完整目录已确认以下模型在当前 TraeX 入口不可用：{models}。即将永久删除它们在自动模型池中的条目及独立设置；其余模型和原会话历史保留。',
   'worker.traex_auto_model.catalog_switch': '↪️ {fromModel} 已不在当前可用目录中，正在使用白名单内的 {toModel} 续接原会话；不保证免排队，也不会重新发送原始任务。',
   'worker.traex_auto_model.catalog_empty': '⚠️ 自动模型池已没有可用模型，已停止选模。请前往控制台重新配置模型池；不会使用池外模型或清空原会话。',
@@ -1438,15 +1450,24 @@ export const messages: Record<string, string> = {
   'ai.routing.feedback_response_kind': '本轮最终答复用 `botmux send --response-kind final` 标记且只发一次（挂载页脚签名；若此 bot 启用了最终回答反馈，同时挂反馈按钮）。中间进度/补充类发送不要加 flag（默认按 progress，不展示页脚签名）。声明 final 即锁定本轮最终答复：之后不能再发 progress，如需补充请用 `--response-kind auxiliary`。',
   'ai.routing.hidden_context_defense': '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。',
   // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
-  // 转发，系统提示彻底不提 botmux send——intro 换成下面这条，usage_* 只留
-  // helpers / silence（见 shared-hints.ts）。
-  'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，直接作答即可。',
+  // 转发——intro 换成下面这条；botmux send 只留给最终回复带不了的事（usage_send_transcript
+  // 列出场景，no_progress_send_transcript 管住进度播报与重复发送，见 shared-hints.ts）。
+  'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，最终答复直接写在里面即可。',
+  'ai.routing.usage_send_transcript': '- `botmux send` 只用于最终回复带不了的事：@ 别的 bot 协作，或把结果交还给派活给你的 bot（`--mention <对方 open_id>` / `--mention-back`，bot 只有被 @ 才收得到）；发附件、图片、视频或自定义卡片；发到别的群或话题；以及本轮说明明确要求用 `botmux send` 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。每条 send 必须带 `--mention <open_id>` / `--mention-back` / `--no-mention` 之一。',
+  'ai.routing.no_progress_send_transcript': '- 不要用 `botmux send` 发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍。最终答复必须走 send 时（答复本身是附件或卡片，或要 @ 对方才能收到），加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。要配附件时先 send 附件、最后再写最终答复：botmux 只转发最后一次调用工具之后的那段回复。',
   'ai.send.after_success_hint': '最终答复已成功发送。若原任务已完成或已交代具体阻碍，可让终端最终回复只输出 BOTMUX_NOTHING_TO_SEND，勿重复发送；后续补充使用 botmux send --response-kind auxiliary。',
   'ai.send.after_success_steer_advanced': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息使用 `botmux send --response-kind final` 发送完整答复（若无需回复则输出 BOTMUX_NOTHING_TO_SEND）。',
   // 本轮发送走统一回复卡片（unified reply）时的成功回显——此时内容已进卡片，
   // 提示模型完成时用 --response-kind final 发完整答复。
   'ai.send.after_success_progress': '进度消息已发送（未标记 final）。若这条已是对原请求的完整答复，直接让最终回复只输出 BOTMUX_NOTHING_TO_SEND，不要再发总结或重复内容；若只是确认、阶段进度或任务尚未完成，继续原任务，完成或受阻时用 botmux send --response-kind final 交付结果或具体阻碍。',
   'ai.send.after_success_auxiliary': '补充消息已发送。请核对原任务的最终答复是否已成功交付；补充消息本身不证明原任务完成，已交付的内容不要重复发送。',
+  // replyDelivery=transcript 会话的发送回显（REPLY_DELIVERY_ENV=transcript，见
+  // send-completion-hint.ts）：最终回复由 botmux 自动转发，回显不再催模型
+  // `--response-kind final`，而是把它引回最终回复、劝它别用 send 发进度。
+  'ai.send.after_success_progress_transcript': '消息已发送。本会话的最终回复会由 botmux 自动发回飞书：任务完成后直接把完整答复写在最终回复里，不用再 botmux send；进度和阶段小结也不必 send。若刚发的这条已经是完整答复，最终回复只输出 BOTMUX_NOTHING_TO_SEND，避免重复。静默定时任务例外：那类回合的最终回复不会发到群里，要交代的结论都用 botmux send 发出。',
+  'ai.send.after_success_unified_transcript': '进度已更新到本轮卡片。本会话的最终回复会由 botmux 自动发回飞书，完成后直接把完整答复写在最终回复里即可，不必再 send 进度。',
+  'ai.send.after_success_auxiliary_transcript': '补充消息已发送。本会话的最终回复会由 botmux 自动发回飞书；补充消息不代表任务完成，已发出的内容不要在最终回复里重复。',
+  'ai.send.after_success_steer_advanced_transcript': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息直接在最终回复里作答（botmux 会自动发回），若无需回复则只输出 BOTMUX_NOTHING_TO_SEND。',
   'ai.send.after_success_unified': '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。',
   'ai.routing.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本时必须预先声明处理方式。马上单独做用 `botmux send --as independent`；留给当前任务、等对方确认用 `--as suggestion`。',
   'ai.shell.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本必须携带处理方式。马上单独做：`botmux send --as independent`；留给当前任务：`botmux send --as suggestion`。',
@@ -1503,10 +1524,11 @@ export const messages: Record<string, string> = {
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
   'ai.shell.when_to_send': '对于需要回复的请求，必须通过 Bash 执行 botmux send --response-kind final 交付完整结果或具体阻碍，并核验发送成功后再结束；查询完成或只发进度不算交付。已成功交付不要重复发送。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.shell.no_visible_output_ok': '只有最终答复已通过 botmux send --response-kind final 成功交付（退出码 0），才可无终端正文地结束；progress 发送成功不代表任务完成。不要因“无输出”提示重发已交付的答案；发送结果未知先核对，不能直接当作成功或失败。',
-  // replyDelivery=transcript 的 shell-hints 变体：只用 intro / when_to_send 两条改口
-  // 版 + helpers，整段不提 botmux send（commands_are_shell / how_to_send / heredoc /
-  // mention_gate 都不注入，见 shared-hints.ts）。
+  // replyDelivery=transcript 的 shell-hints 变体：intro / when_to_send 改口，send_scope
+  // 把 botmux send 限定在最终回复带不了的场景（how_to_send / mention_gate /
+  // feedback 等 send 模式专属的长段不注入，见 shared-hints.ts）。
   'ai.shell.intro_transcript': '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书。',
+  'ai.shell.send_scope_transcript': 'botmux send 只用于最终回复带不了的事：@ 别的 bot 协作，或把结果交还给派活给你的 bot（`--mention <对方 open_id>` / `--mention-back`，bot 只有被 @ 才收得到）；发附件（`--images` / `--files` / `--videos`）或自定义卡片；发到别的群或话题；以及本轮说明明确要求用 botmux send 的回合（如静默定时任务，那类回合的最终回复不会发到群里）。每条 send 必须带 `--mention <open_id>` / `--mention-back` / `--no-mention` 之一。不要用它发进度播报、「收到」「在看」或阶段小结，也不要把最终答复再 send 一遍；最终答复必须走 send 时加 `--response-kind final`，botmux 就不会再把最终回复转发一遍。要配附件时先 send 附件、最后再写最终答复：botmux 只转发最后一次调用工具之后的那段回复。',
   'ai.shell.when_to_send_transcript': '发给你的消息直接在最终 assistant message 里作答即可,别沉默。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
   'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。',
 
@@ -2644,6 +2666,8 @@ export const messages: Record<string, string> = {
   'worker.cli_rejected_argument': '⚠️ {cliName} 启动失败：它不认识启动参数 {flag}（unexpected argument），一般是 CLI 版本太旧。请把 {cliName} 升级到最新版；PATH 上装了多份时，请确认 bot 用的是新版（`which -a traex traecli`）。',
   'worker.traex_resume_target_in_default_home': '⚠️ 这个话题上次的 TRAE 会话（{sessionId}）记在默认目录 {defaultHome} 里，但这个 bot 现在的 TRAE_HOME 是 {traeHome}，TRAE 在新目录里找不到这个会话，这次可能接不上之前的上下文。botmux 不会去读旧目录（在那里找到的会话，TRAE 也恢复不了）。要继续旧会话，可以把那条会话的记录迁到新目录，或者去掉这个 bot 的 TRAE_HOME；不需要的话直接继续用即可。',
   'worker.structured_turn_not_collected': '⚠️ 这条消息已经发给 {cliName}，但它的会话记录（transcript）里一直没出现这一轮，botmux 采集不到本轮回复，结论不会自动转发到群里。{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
+  'worker.structured_turn_not_collected_fd_denied': '⚠️ 这条消息已经发给 {cliName}，但系统拒绝 botmux 读取 {cliName} 进程（pid {pid}）打开的文件（权限被拒，{code}），定位不到它的会话记录（transcript），采集不到本轮回复，结论不会自动转发到群里。{hint}{cliName} 若已在终端里作答，请打开 Web 终端查看；确认没被处理再重发。',
+  'worker.fd_denied_setuid_bwrap_hint': '原因：沙盒用的 {path} 带 setuid root，它建出的沙盒归 root 所有，以普通用户运行的 botmux 无权读取其中进程的 /proc/<pid>/fd。',
   'worker.structured_turn_not_started_blocked': '⚠️ {cliName} 一直停在{blocker}，这条消息没有开始处理，botmux 已不再等这一轮的回复。在 Web 终端里处理完后请重发。',
   'worker.startup_upgrade_hint': '（{cliName} 刚升级到 {to}，之前是 {from}）',
   'worker.startup_blocker_label.folder_trust': '目录信任确认',
