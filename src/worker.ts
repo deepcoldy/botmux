@@ -356,6 +356,7 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type An
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import {
   mapAntigravityCompactOffsetToFull,
+  hasAntigravityPendingTasks,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
 import {
@@ -11649,7 +11650,7 @@ function maybeUpgradeAntigravityBridgeToFull(): void {
 function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   if (!structuredBridgeIs('antigravity')) return;
   const candidate = antigravityBridgeState().provisionalFinal;
-  if (!candidate || antigravityBridgeState().hasPendingTask) {
+  if (!candidate || hasAntigravityPendingTasks(antigravityBridgeState())) {
     // No candidate, or the transcript itself proves a background task is still
     // outstanding (the TUI shows the ready composer during that wait — do not
     // arm the quiet latch on screen evidence the transcript contradicts).
