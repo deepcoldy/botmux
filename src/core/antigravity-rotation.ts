@@ -32,6 +32,8 @@ export interface AntigravitySessionRotationState {
   pendingAccountId?: string;
   /** Turn ID of the last auto-replayed input (links a replayed turn's limit back to logicalTurnId). */
   lastReplayTurnId?: string;
+  /** Restart attempt whose worker account observation may settle this rotation. */
+  restartAttemptId?: string;
   /** Session lastMessageAt snapshot when rotation started (detects manual intervention). */
   startedAtLastMessageAt?: number;
   /** Set when worker reports the authoritative post-spawn account ID during restart.
@@ -39,6 +41,9 @@ export interface AntigravitySessionRotationState {
   workerReportedAccountId?: string | null;
   /** Set when the user explicitly ran `/stop` during an in-flight rotation restart. */
   replayCancelledByUser?: boolean;
+  /** A replay may already have been accepted, but its receipt/state could not be
+   * persisted. The same logical turn must not be replayed again automatically. */
+  replayUncertain?: boolean;
 }
 
 /** Mark an in-flight rotation restart so it adopts the new account without auto-replaying. */
@@ -61,6 +66,7 @@ export function clearInFlightAntigravityRotation(
     attemptedAccountIds: state.attemptedAccountIds,
     rotationsUsed: state.rotationsUsed,
     ...(state.lastReplayTurnId ? { lastReplayTurnId: state.lastReplayTurnId } : {}),
+    ...(state.replayUncertain ? { replayUncertain: true } : {}),
   };
 }
 
@@ -127,7 +133,7 @@ export interface AntigravityQuotaAutoRotateDeps {
   getRotationState: () => AntigravitySessionRotationState | undefined;
   setRotationState: (state: AntigravitySessionRotationState | undefined) => void;
   rotateAccount: (params: QuotaRotateAntigravityParams) => QuotaRotateAntigravityResult;
-  requestRestart: (onSettled: (status: RestartObserverStatus) => void | Promise<void>) => { started: boolean };
+  requestRestart: (onSettled: (status: RestartObserverStatus) => void | Promise<void>) => { started: boolean; attemptId?: string };
   /** True while the original worker generation still owns this active session. */
   isStillOwned: () => boolean;
   /** True while the logical session is still active in the daemon (even if the
@@ -136,7 +142,12 @@ export interface AntigravityQuotaAutoRotateDeps {
   hasManualIntervention: (startedAtLastMessageAt: number, capturedTurnId?: string) => boolean;
   updateSessionAccount: (accountId: string) => void;
   clearUsageLimit: () => void;
-  replayTurn: (payload: AntigravityReplayPayload) => { accepted: boolean; retryTurnId?: string };
+  replayTurn: (payload: AntigravityReplayPayload) => {
+    accepted: boolean;
+    retryTurnId?: string;
+    /** Accepted by the worker, but a post-acceptance state write failed. */
+    persistenceError?: string;
+  };
   notifySwitching: (info: {
     fromId?: string;
     toId: string;
@@ -147,11 +158,16 @@ export interface AntigravityQuotaAutoRotateDeps {
   notifyRestartFailed: (info: { toId: string; toEmail?: string; status: Exclude<RestartObserverStatus, 'in_progress' | 'succeeded' | 'cancelled'> }) => void;
   notifyManualReplayNeeded: (info: { toId: string; toEmail?: string }) => void;
   notifyReplayFailed: (info: { toId: string; toEmail?: string }) => void;
+  /** Restart succeeded, but account/limit settlement failed before any replay. */
+  notifySettleFailed: (info: { toId: string; toEmail?: string; error: string }) => void;
+  /** Replay acceptance/receipt is ambiguous; users must inspect before retrying. */
+  notifyReplayUncertain: (info: { toId: string; toEmail?: string; error: string }) => void;
 }
 
 export type AntigravityQuotaAutoRotateDecision =
   | { outcome: 'ineligible' }
   | { outcome: 'disabled' }
+  | { outcome: 'identity_unknown' }
   | { outcome: 'started'; fromId?: string; toId: string; toEmail?: string; alreadyRotated: boolean }
   | {
       outcome: 'exhausted';
@@ -168,6 +184,7 @@ function isContinuingLogicalTurn(
   prev: AntigravitySessionRotationState | undefined,
   screenTurnId: string | undefined,
   lastCliInputTurnId: string | undefined,
+  limitKey: string,
 ): boolean {
   if (!prev) return false;
   if (prev.lastReplayTurnId !== undefined
@@ -176,6 +193,12 @@ function isContinuingLogicalTurn(
   }
   if (screenTurnId !== undefined && screenTurnId === prev.logicalTurnId) {
     return true;
+  }
+  // Direct Web Terminal turns have no daemon turn ID. Receiving the identical
+  // native quota episode after a restart is the same recovery attempt, not a
+  // fresh budget. A new direct submission clears the settled state in the pool.
+  if (screenTurnId === undefined && lastCliInputTurnId === undefined) {
+    return prev.logicalTurnId === limitKey;
   }
   return false;
 }
@@ -208,11 +231,15 @@ export function tryAntigravityQuotaAutoRotate(
   }
 
   const limit = deps.usageLimit!;
+  const limitKey = usageLimitStateKey(limit);
   const maxRotations = deps.maxRotationsPerTurn ?? MAX_ANTIGRAVITY_ROTATIONS_PER_TURN;
-  const continuing = isContinuingLogicalTurn(prev, deps.screenTurnId, deps.lastCliInputTurnId);
+  const continuing = isContinuingLogicalTurn(prev, deps.screenTurnId, deps.lastCliInputTurnId, limitKey);
+  // Once replay acceptance is uncertain, never run the same logical turn again
+  // automatically. A genuinely new user turn starts a fresh rotation state.
+  if (continuing && prev?.replayUncertain) return { outcome: 'disabled' };
   const logicalTurnId = continuing
     ? prev!.logicalTurnId
-    : (deps.screenTurnId ?? deps.lastCliInputTurnId ?? usageLimitStateKey(limit));
+    : (deps.screenTurnId ?? deps.lastCliInputTurnId ?? limitKey);
   const attempted = continuing ? [...prev!.attemptedAccountIds] : [];
   const rotationsUsed = continuing ? prev!.rotationsUsed : 0;
 
@@ -246,6 +273,9 @@ export function tryAntigravityQuotaAutoRotate(
   if (rotation.outcome === 'disabled') {
     return { outcome: 'disabled' };
   }
+  if (rotation.outcome === 'identity_unknown') {
+    return { outcome: 'identity_unknown' };
+  }
   if (rotation.outcome === 'write_failed') {
     return { outcome: 'write_failed', error: rotation.error };
   }
@@ -270,6 +300,7 @@ export function tryAntigravityQuotaAutoRotate(
   }
 
   const nextAttempted = [...attempted];
+  const targetAlreadyAttempted = nextAttempted.includes(rotation.toId);
   if (rotation.fromId && !nextAttempted.includes(rotation.fromId)) nextAttempted.push(rotation.fromId);
   if (!nextAttempted.includes(rotation.toId)) nextAttempted.push(rotation.toId);
 
@@ -309,16 +340,16 @@ export function tryAntigravityQuotaAutoRotate(
       return;
     }
 
-    // If the worker explicitly reported a pre-spawn reconciliation failure
-    // (`null`), do NOT claim the session moved to `rotation.toId` or replay on
-    // a potentially unswitched account.
-    if (current.workerReportedAccountId === null) {
+    // A missing report is just as unproven as an explicit reconcile failure:
+    // never substitute the requested target for an actual worker observation.
+    if (current.workerReportedAccountId == null) {
       deps.setRotationState(clearInFlightAntigravityRotation(current));
       deps.notifyRestartFailed({ toId: rotation.toId, toEmail: rotation.toEmail, status: 'failed' });
       return;
     }
 
-    const effectiveAccountId = current.workerReportedAccountId ?? rotation.toId;
+    const effectiveAccountId = current.workerReportedAccountId;
+    const effectiveEmail = effectiveAccountId === rotation.toId ? rotation.toEmail : undefined;
     const settledState: AntigravitySessionRotationState = {
       logicalTurnId: current.logicalTurnId,
       attemptedAccountIds: current.attemptedAccountIds.includes(effectiveAccountId)
@@ -329,9 +360,19 @@ export function tryAntigravityQuotaAutoRotate(
     };
     deps.setRotationState(settledState);
 
-    const effectiveEmail = effectiveAccountId === rotation.toId ? rotation.toEmail : undefined;
-    deps.updateSessionAccount(effectiveAccountId);
-    deps.clearUsageLimit();
+    try {
+      deps.updateSessionAccount(effectiveAccountId);
+      deps.clearUsageLimit();
+    } catch (err) {
+      // RestartCoordinator deliberately isolates observer exceptions. Handle
+      // them HERE so a settled fence never turns into silent non-replay.
+      deps.notifySettleFailed({
+        toId: effectiveAccountId,
+        toEmail: effectiveEmail,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
 
     if (current.replayCancelledByUser || deps.hasManualIntervention(startedAtLastMessageAt, capturedTurnId)) {
       return;
@@ -342,21 +383,38 @@ export function tryAntigravityQuotaAutoRotate(
       return;
     }
 
-    const replay = deps.replayTurn(deps.replayPayload);
-    if (replay.accepted) {
-      if (replay.retryTurnId) {
-        deps.setRotationState({
-          ...settledState,
-          lastReplayTurnId: replay.retryTurnId,
-        });
-      }
+    let replay: ReturnType<AntigravityQuotaAutoRotateDeps['replayTurn']>;
+    try {
+      replay = deps.replayTurn(deps.replayPayload);
+    } catch (err) {
+      // The callback contract cannot prove whether IPC accepted the input when
+      // it throws. Block this logical turn from another automatic attempt.
+      deps.setRotationState({ ...settledState, replayUncertain: true });
+      deps.notifyReplayUncertain({
+        toId: effectiveAccountId,
+        toEmail: effectiveEmail,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    if (!replay.accepted) {
+      deps.notifyReplayFailed({ toId: effectiveAccountId, toEmail: effectiveEmail });
       return;
     }
 
-    deps.notifyReplayFailed({ toId: effectiveAccountId, toEmail: effectiveEmail });
+    const persistenceError = replay.persistenceError
+      ?? (replay.retryTurnId ? undefined : 'replay accepted without a retry turn ID');
+    deps.setRotationState({
+      ...settledState,
+      ...(replay.retryTurnId ? { lastReplayTurnId: replay.retryTurnId } : {}),
+      ...(persistenceError ? { replayUncertain: true } : {}),
+    });
+    if (persistenceError) {
+      deps.notifyReplayUncertain({ toId: effectiveAccountId, toEmail: effectiveEmail, error: persistenceError });
+    }
   };
 
-  let restartResult: { started: boolean };
+  let restartResult: { started: boolean; attemptId?: string };
   try {
     restartResult = deps.requestRestart(onRestartSettled);
   } catch {
@@ -369,12 +427,19 @@ export function tryAntigravityQuotaAutoRotate(
     if (current?.inFlightToken === inFlightToken) {
       deps.setRotationState({
         logicalTurnId: current.logicalTurnId,
-        attemptedAccountIds: current.attemptedAccountIds,
+        attemptedAccountIds: targetAlreadyAttempted
+          ? current.attemptedAccountIds
+          : current.attemptedAccountIds.filter(id => id !== rotation.toId),
         rotationsUsed: Math.max(0, current.rotationsUsed - 1),
         ...(current.lastReplayTurnId ? { lastReplayTurnId: current.lastReplayTurnId } : {}),
       });
     }
     return { outcome: 'restart_refused', toId: rotation.toId };
+  }
+
+  if (restartResult.attemptId) {
+    const current = deps.getRotationState();
+    if (current?.inFlightToken === inFlightToken) current.restartAttemptId = restartResult.attemptId;
   }
 
   const willAutoReplay = Boolean(deps.replayPayload && deps.replayPayload.cliInput.trim());
@@ -419,6 +484,7 @@ export function formatAntigravityStatusLine(input: {
   inspection: AntigravityAccountsInspection;
 }): string | undefined {
   const { inspection } = input;
+  if (inspection.stateError) return 'Antigravity account: state unavailable (corrupt state.json)';
   if (!inspection.managed) {
     if (!inspection.liveMaskedEmail) return undefined;
     return `Antigravity account: ${inspection.liveMaskedEmail} (unmanaged)`;

@@ -2792,7 +2792,7 @@ export type WorkerToDaemonBase =
    *  The daemon retires the worker once the current turn settles, so the next
    *  turn cold-starts on the new install. */
   | { type: 'cli_install_changed'; runningVersion: string; installedVersion: string }
-  | { type: 'antigravity_account'; accountId: string | null }
+  | { type: 'antigravity_account'; accountId: string | null; attemptId?: string }
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {
       type: 'restart_result';

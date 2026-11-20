@@ -201,6 +201,8 @@ export const messages: Record<string, string> = {
   'worker.agy_rotate.replay_manual': '✅ Switched to Antigravity account {toAccount} and restarted the session. Please resend your message.',
   'worker.agy_rotate.replay_failed': '⚠️ Switched to Antigravity account {toAccount} and restarted the session, but automatic replay failed. Send /retry to resend the turn.',
   'worker.agy_rotate.replay_failed_resend': '⚠️ Switched to Antigravity account {toAccount} and restarted the session, but automatic replay failed. Please resend your message.',
+  'worker.agy_rotate.settle_failed': '⚠️ Switched to Antigravity account {toAccount} and restarted, but post-restart state persistence failed. Automatic replay was not run; inspect the session before retrying.',
+  'worker.agy_rotate.replay_uncertain': '⚠️ Automatic replay for Antigravity account {toAccount} is uncertain and may already have executed. Inspect the Web Terminal before retrying; do not resend blindly.',
   'worker.agy_rotate.stop_cancelled': '🛑 Cancelled automatic turn replay for the in-flight account rotation.',
   'worker.traex_auto_model.catalog_prune': '⚠️ A complete live TraeX catalog confirms these models are unavailable for the current CLI/account: {models}. Their saved automatic-pool entries and individual settings will be permanently removed; other models and the original conversation are preserved.',
   'worker.traex_auto_model.catalog_switch': '↪️ {fromModel} is no longer in the current catalog. Resuming the original session with allowlisted {toModel}; queue-free service is not guaranteed and the original request will not be replayed.',

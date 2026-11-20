@@ -13,6 +13,7 @@ import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoni
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
 import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
 import {
+  cancelAntigravityRotationReplay,
   clearInFlightAntigravityRotation,
   formatAntigravityCooldown,
   tryAntigravityQuotaAutoRotate,
@@ -33,6 +34,7 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
   if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
+  if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
   if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
   if (key === 'formatAntigravityCooldown') return formatAntigravityCooldown;
   if (key === 'tryAntigravityQuotaAutoRotate') return tryAntigravityQuotaAutoRotate;

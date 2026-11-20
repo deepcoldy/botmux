@@ -204,6 +204,8 @@ export const messages: Record<string, string> = {
   'worker.agy_rotate.replay_manual': '✅ 已切换至 Antigravity 账号 {toAccount} 并重启会话，请重新发送你的消息。',
   'worker.agy_rotate.replay_failed': '⚠️ 已切换至 Antigravity 账号 {toAccount} 并重启会话，但自动重发失败，请发送 /retry 重试本轮任务。',
   'worker.agy_rotate.replay_failed_resend': '⚠️ 已切换至 Antigravity 账号 {toAccount} 并重启会话，但自动重发失败，请重新发送你的消息。',
+  'worker.agy_rotate.settle_failed': '⚠️ 已切换至 Antigravity 账号 {toAccount} 并重启会话，但重启后的状态落盘失败，自动重发未执行；请检查会话后重试。',
+  'worker.agy_rotate.replay_uncertain': '⚠️ Antigravity 账号 {toAccount} 的自动重发结果不确定，输入可能已被执行。请先检查 Web Terminal，不要直接重发。',
   'worker.agy_rotate.stop_cancelled': '🛑 已取消本轮账号轮换后的自动重发（会话切号重启完成后不会重放原消息）。',
   'worker.traex_auto_model.catalog_prune': '⚠️ 实时完整目录已确认以下模型在当前 TraeX 入口不可用：{models}。即将永久删除它们在自动模型池中的条目及独立设置；其余模型和原会话历史保留。',
   'worker.traex_auto_model.catalog_switch': '↪️ {fromModel} 已不在当前可用目录中，正在使用白名单内的 {toModel} 续接原会话；不保证免排队，也不会重新发送原始任务。',

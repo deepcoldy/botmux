@@ -1091,6 +1091,7 @@ import {
   rotateAntigravityAccountOnQuotaLimit,
 } from '../services/antigravity-accounts.js';
 import {
+  cancelAntigravityRotationReplay,
   clearInFlightAntigravityRotation,
   formatAntigravityCooldown,
   tryAntigravityQuotaAutoRotate,
@@ -21076,22 +21077,24 @@ function setupWorkerHandlers(
     const matchesFailedTurn = Boolean(
       provenTurn && capturedFailedTurn && capturedFailedTurn.turnId === provenTurn,
     );
-    const matchesLastCliInput = Boolean(
-      provenTurn && ds.lastCliInput?.trim() && ds.lastCliInputTurnId === provenTurn,
-    );
-    const replayPayload = matchesFailedTurn && capturedFailedTurn?.cliInput.trim()
+    // A matching turn ID proves ownership, NOT that replay is side-effect safe.
+    // Only a durable direct-failure observation (no assistant text/tool calls)
+    // may be re-sent unattended. agy does not currently expose that proof, so
+    // its native quota path rotates + resumes but asks for manual continuation
+    // instead of repeating a turn that may already have performed mutations.
+    const replayPayload = matchesFailedTurn
+      && capturedFailedTurn?.directFailure === true
+      && capturedFailedTurn.status === 'failed'
+      && !capturedFailedTurn.recovery
+      && !capturedFailedTurn.limitedSnapshot
+      && capturedFailedTurn.retryable !== false
+      && capturedFailedTurn.cliInput.trim()
       ? {
           sourceTurnId: capturedFailedTurn.turnId,
           cliInput: capturedFailedTurn.cliInput,
           userPrompt: capturedFailedTurn.userPrompt,
         }
-      : matchesLastCliInput
-        ? {
-            sourceTurnId: provenTurn,
-            cliInput: ds.lastCliInput!,
-            userPrompt: ds.lastUserPrompt ?? ds.lastCliInput!,
-          }
-        : undefined;
+      : undefined;
     const formatAccountLabel = (id?: string, email?: string): string => {
       const masked = maskAntigravityEmail(email);
       if (id && masked) return `\`${id}\` (${masked})`;
@@ -21110,7 +21113,7 @@ function setupWorkerHandlers(
       restartInFlight: isSessionRestartInFlight(ds),
       sessionAccountId: ds.antigravityAccountId ?? ds.session.antigravityAccountId,
       screenTurnId: provenTurn,
-      lastCliInputTurnId: ds.lastCliInputTurnId,
+      lastCliInputTurnId: provenTurn ? ds.lastCliInputTurnId : undefined,
       lastMessageAt: ds.lastMessageAt,
       replayPayload,
       getRotationState: () => ds.antigravityRotation,
@@ -21121,7 +21124,7 @@ function setupWorkerHandlers(
           source: 'account_rotation',
           notify: status => onSettled(status),
         });
-        return { started: Boolean(req && !req.startFailure && !req.joined) };
+        return { started: Boolean(req && !req.startFailure && !req.joined), attemptId: req?.attemptId };
       },
       isStillOwned: () => ownsLifecycleMutation() && ds.session.status === 'active',
       isSessionActive: () => ds.session.status === 'active',
@@ -21148,43 +21151,58 @@ function setupWorkerHandlers(
           }
         } catch (err: any) {
           logger.warn(`[${t}] Failed to clear usage limit after antigravity rotation: ${err?.message ?? err}`);
+          // The outer state machine must stop before replay: a sticky limited
+          // frame would otherwise look like a fresh failure on the next edge.
+          throw err;
         }
       },
       replayTurn: payload => {
         if (!ds.worker || ds.worker.killed) return { accepted: false };
         const retryTurnId = `agy-rotate-${randomUUID()}`;
-        const rollbackReplyRouting = inheritTurnReplyRouting(ds, payload.sourceTurnId, retryTurnId);
+        let rollbackReplyRouting: (() => void) | undefined;
         let accepted = false;
         try {
+          rollbackReplyRouting = inheritTurnReplyRouting(ds, payload.sourceTurnId, retryTurnId);
           accepted = sendWorkerInput(ds, { content: payload.cliInput }, retryTurnId);
         } catch (err: any) {
           logger.warn(`[${t}] Antigravity rotation auto-replay failed before acceptance: ${err?.message ?? err}`);
         }
         if (!accepted) {
-          rollbackReplyRouting();
-          sessionStore.updateSession(ds.session);
+          rollbackReplyRouting?.();
+          try { sessionStore.updateSession(ds.session); } catch { /* the replay was not accepted */ }
           return { accepted: false };
         }
-        if (payload.sourceTurnId && ds.session.lastFailedTurn?.turnId === payload.sourceTurnId) {
-          markRetryAttempt(ds.session);
+        try {
+          if (payload.sourceTurnId && ds.session.lastFailedTurn?.turnId === payload.sourceTurnId) {
+            markRetryAttempt(ds.session);
+          }
+          rememberLastCliInput(ds, payload.userPrompt, { content: payload.cliInput }, retryTurnId);
+          noteReplyCardTurnStarted(ds, retryTurnId);
+          // Do NOT forge `ds.lastScreenStatus = 'working'` here: a prompt-ready
+          // idle frame arriving before agy enters busy mode would otherwise create
+          // a fake working -> idle completion edge (workflow settlement / ✅ mark).
+          ds.streamCardPending = true;
+          persistStreamCardState(ds);
+          sessionStore.updateSession(ds.session);
+          return { accepted: true, retryTurnId };
+        } catch (err: any) {
+          // The worker ALREADY accepted the input. Return the retry identity so
+          // the state machine can block a second attempt and notify uncertainty;
+          // throwing here would be swallowed by RestartCoordinator.notify().
+          return {
+            accepted: true,
+            retryTurnId,
+            persistenceError: err instanceof Error ? err.message : String(err),
+          };
         }
-        rememberLastCliInput(ds, payload.userPrompt, { content: payload.cliInput }, retryTurnId);
-        noteReplyCardTurnStarted(ds, retryTurnId);
-        // Do NOT forge `ds.lastScreenStatus = 'working'` here: a prompt-ready
-        // idle frame arriving before agy enters busy mode would otherwise create
-        // a fake working -> idle completion edge (workflow settlement / ✅ mark).
-        ds.streamCardPending = true;
-        persistStreamCardState(ds);
-        sessionStore.updateSession(ds.session);
-        return { accepted: true, retryTurnId };
       },
-      notifySwitching: ({ fromId, toId, toEmail, willAutoReplay }) => {
+      notifySwitching: ({ fromId, toId, toEmail, alreadyRotated, willAutoReplay }) => {
         const key = willAutoReplay ? 'worker.agy_rotate.switching' : 'worker.agy_rotate.switching_no_replay';
         const text = tr(key, {
           fromAccount: formatAccountLabel(fromId),
           toAccount: formatAccountLabel(toId, toEmail),
         }, loc);
-        logger.info(`[${t}] Antigravity quota auto-rotation: ${fromId ?? '?'} -> ${toId} (autoReplay=${willAutoReplay})`);
+        logger.info(`[${t}] Antigravity quota auto-rotation: ${fromId ?? '?'} -> ${toId} (autoReplay=${willAutoReplay}, alreadyRotated=${alreadyRotated})`);
         scopedReply(text, 'text', turnId).catch((err: any) => {
           logger.debug(`[${t}] Failed to deliver antigravity rotation notice: ${err?.message ?? err}`);
         });
@@ -21220,6 +21238,24 @@ function setupWorkerHandlers(
           logger.debug(`[${t}] Failed to deliver antigravity replay-failed notice: ${err?.message ?? err}`);
         });
       },
+      notifySettleFailed: ({ toId, toEmail, error }) => {
+        logger.warn(`[${t}] Antigravity rotation settlement failed for ${toId}: ${error}`);
+        const text = tr('worker.agy_rotate.settle_failed', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity settlement-failure notice: ${err?.message ?? err}`);
+        });
+      },
+      notifyReplayUncertain: ({ toId, toEmail, error }) => {
+        logger.warn(`[${t}] Antigravity rotation replay uncertain for ${toId}: ${error}`);
+        const text = tr('worker.agy_rotate.replay_uncertain', {
+          toAccount: formatAccountLabel(toId, toEmail),
+        }, loc);
+        scopedReply(text, 'text', turnId).catch((err: any) => {
+          logger.debug(`[${t}] Failed to deliver antigravity replay-uncertain notice: ${err?.message ?? err}`);
+        });
+      },
     });
 
     if (rotationDecision.outcome === 'started') {
@@ -21249,6 +21285,8 @@ function setupWorkerHandlers(
       });
     } else if (rotationDecision.outcome === 'write_failed') {
       logger.error(`[${t}] Antigravity account rotation write failed: ${rotationDecision.error}`);
+    } else if (rotationDecision.outcome === 'identity_unknown') {
+      logger.warn(`[${t}] Antigravity quota rotation refused: session account identity is unknown`);
     }
 
     if (ds.rateLimitNotifiedKey !== limitKey) {
@@ -23238,18 +23276,22 @@ function setupWorkerHandlers(
       case 'antigravity_account': {
         if (!ownsLifecycleMutation() || ds.worker !== worker) break;
         if (ds.antigravityRotation?.inFlightToken) {
+          const expectedAttemptId = ds.antigravityRotation.restartAttemptId;
+          if (!expectedAttemptId || msg.attemptId !== expectedAttemptId) {
+            logger.warn(`[${t}] Ignored stale/uncorrelated Antigravity account report during rotation (attempt=${msg.attemptId ?? 'missing'})`);
+            break;
+          }
           // Stash authoritative worker observation for the in-flight rotation;
           // commit to ds/SQLite only when `restart_result: succeeded` lands so
           // a failed restart never leaves SQLite claiming the new account.
           ds.antigravityRotation.workerReportedAccountId = msg.accountId;
           break;
         }
-        if (msg.accountId !== null) {
-          ds.antigravityAccountId = msg.accountId;
-          if (ds.session.antigravityAccountId !== msg.accountId) {
-            ds.session.antigravityAccountId = msg.accountId;
-            sessionStore.updateSession(ds.session);
-          }
+        const observedAccountId = msg.accountId ?? undefined;
+        ds.antigravityAccountId = observedAccountId;
+        if (ds.session.antigravityAccountId !== observedAccountId) {
+          ds.session.antigravityAccountId = observedAccountId;
+          sessionStore.updateSession(ds.session);
         }
         break;
       }
@@ -23728,6 +23770,18 @@ function setupWorkerHandlers(
 
       case 'terminal_input': {
         if (!ownsLifecycleMutation()) break;
+        if (msg.submitted && ds.antigravityRotation) {
+          if (ds.antigravityRotation.inFlightToken) {
+            // Direct terminal input is human intervention just like a new IM
+            // message or /stop: adopt the restarted account, never replay the
+            // superseded task over the user's new submission.
+            cancelAntigravityRotationReplay(ds.antigravityRotation);
+          } else {
+            // A settled rotation belongs to the previous direct-input turn.
+            // Start a fresh logical-turn budget for this new submission.
+            ds.antigravityRotation = undefined;
+          }
+        }
         if (noteIdleAutoCompactDirectInput(ds)) {
           try { sessionStore.updateSession(ds.session); }
           catch (err) { logger.warn(`[${tag(ds)}] idle auto-compact direct-input save failed: ${err instanceof Error ? err.message : String(err)}`); }

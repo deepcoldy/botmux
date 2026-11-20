@@ -62,7 +62,7 @@ function makeHarness(overrides: Partial<AntigravityQuotaAutoRotateDeps> = {}) {
     requestRestart: onSettled => {
       settleRestart = onSettled;
       events.push({ type: 'restart_requested' });
-      return { started: true };
+      return { started: true, attemptId: `restart-${tokenSeq}` };
     },
     isStillOwned: () => true,
     hasManualIntervention: () => false,
@@ -82,6 +82,8 @@ function makeHarness(overrides: Partial<AntigravityQuotaAutoRotateDeps> = {}) {
     notifyRestartFailed: info => events.push({ type: 'notify_restart_failed', payload: info }),
     notifyManualReplayNeeded: info => events.push({ type: 'notify_manual_replay', payload: info }),
     notifyReplayFailed: info => events.push({ type: 'notify_replay_failed', payload: info }),
+    notifySettleFailed: info => events.push({ type: 'notify_settle_failed', payload: info }),
+    notifyReplayUncertain: info => events.push({ type: 'notify_replay_uncertain', payload: info }),
     ...overrides,
   };
 
@@ -92,7 +94,13 @@ function makeHarness(overrides: Partial<AntigravityQuotaAutoRotateDeps> = {}) {
     setRotationState: (s: AntigravitySessionRotationState | undefined) => { rotationState = s; },
     getSessionAccountId: () => sessionAccountId,
     getClearedUsageLimit: () => clearedUsageLimit,
-    triggerRestartSettled: (status: RestartObserverStatus) => settleRestart?.(status),
+    triggerRestartSettled: (status: RestartObserverStatus, opts: { withAccountReport?: boolean } = {}) => {
+      if (status === 'succeeded' && opts.withAccountReport !== false
+        && rotationState?.inFlightToken && rotationState.workerReportedAccountId === undefined) {
+        rotationState = { ...rotationState, workerReportedAccountId: rotationState.pendingAccountId ?? 'acc2' };
+      }
+      settleRestart?.(status);
+    },
   };
 }
 
@@ -233,6 +241,7 @@ describe('antigravity quota auto-rotation state machine', () => {
     expect(res).toEqual({ outcome: 'restart_refused', toId: 'acc2' });
     expect(h.getRotationState()?.inFlightToken).toBeUndefined();
     expect(h.getRotationState()?.rotationsUsed).toBe(0);
+    expect(h.getRotationState()?.attemptedAccountIds).not.toContain('acc2');
     expect(h.events.some(e => e.type === 'notify_switching')).toBe(false);
   });
 
@@ -424,5 +433,98 @@ describe('antigravity quota auto-rotation state machine', () => {
       },
     });
     expect(coord.activeAttemptId('sid-persisted')).toBe('persisted-attempt-1');
+  });
+
+  it('fails closed when the worker omits its account report instead of assuming the requested target', () => {
+    const h = makeHarness();
+    expect(tryAntigravityQuotaAutoRotate(h.deps).outcome).toBe('started');
+    h.triggerRestartSettled('succeeded', { withAccountReport: false });
+
+    expect(h.getSessionAccountId()).toBe('acc1');
+    expect(h.getClearedUsageLimit()).toBe(0);
+    expect(h.getRotationState()?.inFlightToken).toBeUndefined();
+    expect(h.events.some(e => e.type === 'notify_restart_failed')).toBe(true);
+    expect(h.events.some(e => e.type === 'replayed')).toBe(false);
+  });
+
+  it('reports settlement failures instead of letting RestartCoordinator swallow them', () => {
+    const h = makeHarness({
+      updateSessionAccount: () => { throw new Error('SQLite write failed'); },
+    });
+    expect(tryAntigravityQuotaAutoRotate(h.deps).outcome).toBe('started');
+    h.triggerRestartSettled('succeeded');
+
+    expect(h.getRotationState()?.inFlightToken).toBeUndefined();
+    expect(h.getClearedUsageLimit()).toBe(0);
+    expect(h.events.some(e => e.type === 'notify_settle_failed')).toBe(true);
+    expect(h.events.some(e => e.type === 'replayed')).toBe(false);
+  });
+
+  it('records accepted replay receipts and blocks another automatic attempt when persistence is uncertain', () => {
+    const h = makeHarness({
+      replayTurn: () => ({ accepted: true, retryTurnId: 'replay-uncertain-1', persistenceError: 'post-send SQLite write failed' }),
+    });
+    expect(tryAntigravityQuotaAutoRotate(h.deps).outcome).toBe('started');
+    h.triggerRestartSettled('succeeded');
+
+    expect(h.getRotationState()?.lastReplayTurnId).toBe('replay-uncertain-1');
+    expect(h.getRotationState()?.replayUncertain).toBe(true);
+    expect(h.events.some(e => e.type === 'notify_replay_uncertain')).toBe(true);
+    expect(tryAntigravityQuotaAutoRotate({
+      ...h.deps,
+      sessionAccountId: 'acc2',
+      screenTurnId: 'replay-uncertain-1',
+      lastCliInputTurnId: 'replay-uncertain-1',
+    }).outcome).toBe('disabled');
+    expect(h.events.filter(e => e.type === 'restart_requested')).toHaveLength(1);
+  });
+
+  it('treats a thrown replay callback as uncertain rather than silently accepting a possible duplicate', () => {
+    const h = makeHarness({
+      replayTurn: () => { throw new Error('post-send persistence failed'); },
+    });
+    expect(tryAntigravityQuotaAutoRotate(h.deps).outcome).toBe('started');
+    h.triggerRestartSettled('succeeded');
+
+    expect(h.getRotationState()?.replayUncertain).toBe(true);
+    expect(h.events.some(e => e.type === 'notify_replay_uncertain')).toBe(true);
+    expect(h.events.some(e => e.type === 'notify_replay_failed')).toBe(false);
+  });
+
+  it('allows a healthy target to be retried after a refused restart', () => {
+    let refuse = true;
+    const h = makeHarness({
+      requestRestart: () => ({ started: !refuse }),
+    });
+    expect(tryAntigravityQuotaAutoRotate(h.deps).outcome).toBe('restart_refused');
+    expect(h.getRotationState()?.attemptedAccountIds).toEqual(['acc1']);
+
+    refuse = false;
+    expect(tryAntigravityQuotaAutoRotate(h.deps).outcome).toBe('started');
+    expect(h.getRotationState()?.inFlightToken).toBeDefined();
+  });
+
+  it('keeps the rotation budget across repeated native quota frames without a proven turn ID', () => {
+    const h = makeHarness({
+      screenTurnId: undefined,
+      lastCliInputTurnId: undefined,
+      replayPayload: undefined,
+      maxRotationsPerTurn: 1,
+    });
+    expect(tryAntigravityQuotaAutoRotate(h.deps).outcome).toBe('started');
+    h.triggerRestartSettled('succeeded');
+
+    expect(tryAntigravityQuotaAutoRotate({
+      ...h.deps,
+      sessionAccountId: 'acc2',
+    })).toMatchObject({ outcome: 'exhausted', reason: 'turn_budget_exhausted' });
+  });
+
+  it('falls back to the normal limit path when account identity is unproven', () => {
+    const h = makeHarness({
+      rotateAccount: () => ({ outcome: 'identity_unknown' }),
+    });
+    expect(tryAntigravityQuotaAutoRotate(h.deps)).toEqual({ outcome: 'identity_unknown' });
+    expect(h.events.some(e => e.type === 'restart_requested')).toBe(false);
   });
 });
