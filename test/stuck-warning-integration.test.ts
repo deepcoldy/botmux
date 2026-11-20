@@ -1139,6 +1139,37 @@ describe('Claude permission dialog notice (integration)', () => {
     expect(texts()).toEqual([]);
   });
 
+  it('keeps a legacy turn-less fork notice when an unrelated main turn starts during grace', async () => {
+    const { ds, fakeWorker } = setup();
+    fakeWorker.emit('message', { type: 'user_notify', kind: 'claude_permission_prompt', message: 'fork permission' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    ds.currentTurnId = 'new-main-turn';
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(texts()).toEqual(['fork permission']);
+  });
+
+  it('drops an explicit permission notice when its attempt is superseded during grace', async () => {
+    const { ds, fakeWorker } = setup();
+    ds.currentTurnId = 'turn_1';
+    ds.turnDispatchAttemptHighWater = { turnId: 'turn_1', dispatchAttempt: 1 };
+    fakeWorker.emit('message', { type: 'user_notify', kind: 'claude_permission_prompt',
+      message: 'old attempt permission', turnId: 'turn_1', dispatchAttempt: 1 });
+    await vi.advanceTimersByTimeAsync(1_000);
+    ds.turnDispatchAttemptHighWater = { turnId: 'turn_1', dispatchAttempt: 2 };
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(texts()).toEqual([]);
+  });
+
+  it.each(['worker', 'closed'] as const)('still drops a turn-less legacy notice after %s changes', async change => {
+    const { ds, fakeWorker } = setup();
+    fakeWorker.emit('message', { type: 'user_notify', kind: 'claude_permission_prompt', message: 'fork permission' });
+    await vi.advanceTimersByTimeAsync(1_000);
+    if (change === 'worker') ds.worker = makeFakeWorker();
+    else ds.session.status = 'closed';
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(texts()).toEqual([]);
+  });
+
   it.each(['worker', 'turn', 'closed'] as const)('drops legacy delayed notices after %s changes', async change => {
     const { notice, ds } = setup();
     notice();

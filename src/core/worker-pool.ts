@@ -25423,7 +25423,13 @@ function setupWorkerHandlers(
           if (!msg.permissionPromptStable && !permissionCardPending(ds)) {
             await new Promise(resolve => setTimeout(resolve, PERMISSION_CARD_GRACE_MS));
           }
-          if (!ownsLifecycleMutation() || ds.currentTurnId !== turn) break;
+          if (!ownsLifecycleMutation()) break;
+          if (msg.turnId !== undefined) {
+            const attempt = ds.turnDispatchAttemptHighWater;
+            if (ds.currentTurnId !== turn || (turn !== undefined && turn !== msg.turnId)
+              || (msg.dispatchAttempt !== undefined && attempt?.turnId === msg.turnId
+                && attempt.dispatchAttempt > msg.dispatchAttempt)) break;
+          }
           if (permissionCardPending(ds)) {
             logger.info(`[${t}] Claude permission dialog notice skipped: PermissionRequest card pending`);
             break;

@@ -5,7 +5,7 @@ import { PromptSuggestionPublisher, promptSuggestionReportTurn } from '../src/ut
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const dialog = 'Bash command\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel';
-afterEach(() => vi.useRealTimers());
+afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
 
 function start(cliId = 'claude-code') {
   vi.useFakeTimers();
@@ -36,6 +36,75 @@ function start(cliId = 'claude-code') {
 }
 
 describe('fresh permission notice observations', () => {
+  it('recovers from a permanently pending permission read without blocking ordinary screens', async () => {
+    const run = start();
+    const read = vi.fn().mockImplementationOnce(() => new Promise<void>(() => {})).mockResolvedValue(undefined);
+    run.scope.renderer.writeAndFlush = read;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(run.messages.some(message => message.type === 'screen_update')).toBe(true);
+    expect(read.mock.calls.length).toBeGreaterThan(1);
+    expect(run.notices()).toHaveLength(1);
+  });
+
+  it('ignores an expired read that returns after a replacement has observed the dialog', async () => {
+    const run = start();
+    let release!: () => void;
+    run.scope.renderer.writeAndFlush = vi.fn()
+      .mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }))
+      .mockResolvedValue(undefined);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(run.notices()).toHaveLength(1);
+    release();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(run.notices()).toHaveLength(1);
+  });
+
+  it.each(['pty', 'observe'])('keeps ordinary updates and eventually reports a dialog when %s permission captures take longer than a tick', async backend => {
+    const run = start();
+    let pending = 0, peakPending = 0;
+    const read = () => new Promise<void>(resolve => {
+      pending++; peakPending = Math.max(peakPending, pending);
+      setTimeout(() => { pending--; resolve(); }, 2_500);
+    });
+    if (backend === 'pty') run.scope.renderer.writeAndFlush = read;
+    else {
+      run.scope.backend = { captureCurrentScreen() {} };
+      run.scope.snapshotToText = async () => { await read(); return { content: dialog }; };
+    }
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(run.messages.filter(message => message.type === 'screen_update').length).toBeGreaterThan(0);
+    expect(run.notices()).toHaveLength(1);
+    expect(peakPending).toBe(1);
+  });
+
+  it.each(['turn', 'attempt'])('does not publish a previous snapshot under a changed %s after a permission read', async kind => {
+    const run = start();
+    run.scope.currentBotmuxDispatchAttempt = 1;
+    let finish!: () => void;
+    run.scope.renderer.writeAndFlush = () => new Promise<void>(resolve => { finish = resolve; });
+    await vi.advanceTimersByTimeAsync(2_000);
+    if (kind === 'turn') run.scope.currentBotmuxTurnId = 'turn-2';
+    else run.scope.currentBotmuxDispatchAttempt = 2;
+    finish();
+    await vi.advanceTimersByTimeAsync(0);
+    const stale = run.messages.filter(message => message.type === 'screen_update' && message.content === dialog
+      && (kind === 'turn' ? message.turnId === 'turn-2' : message.dispatchAttempt === 2));
+    expect(stale).toEqual([]);
+    expect(run.notices()).toEqual([]);
+  });
+
+  it.each(['turn', 'attempt'])('does not repeat a still-visible fork dialog after an unrelated %s changes', async kind => {
+    const run = start();
+    run.scope.currentBotmuxTurnId = undefined;
+    run.scope.currentBotmuxDispatchAttempt = undefined;
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(run.notices()).toHaveLength(1);
+    if (kind === 'turn') run.scope.currentBotmuxTurnId = 'new-main-turn';
+    else run.scope.currentBotmuxDispatchAttempt = 2;
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(run.notices()).toHaveLength(1);
+  });
+
   it('does not add captures to a static idle observe backend without a dialog', async () => {
     const run = start();
     run.setScreen('Ready');
@@ -129,7 +198,7 @@ describe('fresh permission notice observations', () => {
       expect(await result).toBeUndefined();
     });
 
-  it('rejects an old capture even when no later sample or output arrived', async () => {
+  it('accepts a slow renderer flush whose fresh read still belongs to the unchanged screen', async () => {
     vi.useFakeTimers();
     let finish!: () => void;
     const scope = { backend: {}, lastInitConfig: { cliId: 'claude-code' }, SCREEN_UPDATE_INTERVAL_MS: 2_000,
@@ -137,7 +206,7 @@ describe('fresh permission notice observations', () => {
     const result = loadWorkerFunction<() => Promise<unknown>>('captureClaudePermissionNoticeScreen', scope)();
     await vi.advanceTimersByTimeAsync(4_000);
     finish();
-    expect(await result).toBeUndefined();
+    expect(await result).toMatchObject({ screen: dialog });
   });
 
   it('does not count unknown frames as evidence of a persistent dialog', () => {

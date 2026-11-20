@@ -70,24 +70,20 @@ describe('independent Claude permission notice review', () => {
     expect(run.notices()).toHaveLength(1);
   });
 
-  it('does not revive an auto-cleared dialog from two late out-of-order captures', async () => {
+  it('serializes permission reads and rejects a delayed frame after auto-clear', async () => {
     const run = start();
     run.scope.backend = { captureCurrentScreen() {} };
     const pending: Array<(value: { content: string }) => void> = [];
-    let calls = 0;
-    run.scope.snapshotToText = vi.fn(() => {
-      calls++;
-      if (calls === 3) return Promise.resolve({ content: 'Running command' });
-      return new Promise(resolve => { pending.push(resolve); });
-    });
+    run.scope.snapshotToText = vi.fn(() => new Promise(resolve => { pending.push(resolve); }));
     await vi.advanceTimersByTimeAsync(4_000);
-    expect(pending).toHaveLength(2);
+    expect(pending).toHaveLength(1);
     run.setScreen('Running command');
     await vi.advanceTimersByTimeAsync(3_000);
     pending[0]({ content: dialog }); await flush();
     expect(run.notices()).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(3_000);
-    pending[1]({ content: dialog }); await flush();
+    expect(pending).toHaveLength(2);
+    pending[1]({ content: 'Running command' }); await flush();
     expect(run.notices()).toHaveLength(0);
   });
 

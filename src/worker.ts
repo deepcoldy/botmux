@@ -25280,7 +25280,7 @@ async function captureClaudePermissionNoticeScreen(): Promise<{ screen: string; 
   const attempt = currentBotmuxDispatchAttempt;
   const input = webTerminalInputGeneration;
   const revision = backendScreenRevision;
-  const startedAt = Date.now();
+  const physicalId = workerSessionEventScope?.currentBinding()?.physicalId;
   if (!target || lastInitConfig?.cliId !== 'claude-code' || cliRestartInProgress) return;
   let screen: string | null | undefined;
   try {
@@ -25295,10 +25295,10 @@ async function captureClaudePermissionNoticeScreen(): Promise<{ screen: string; 
     || generation !== cliSpawnGeneration || lifetime !== cliLifetimeNonce
     || turn !== currentBotmuxTurnId || attempt !== currentBotmuxDispatchAttempt
     || input !== webTerminalInputGeneration || cliRestartInProgress
-    || revision !== backendScreenRevision || Date.now() - startedAt > SCREEN_UPDATE_INTERVAL_MS
+    || revision !== backendScreenRevision
     || (workerSessionEventScope && !hasCurrentSessionRuntime())) return;
-  const runtimeKey = JSON.stringify([generation, lifetime, turn, attempt]);
-  return { screen, runtimeKey, observationKey: JSON.stringify([runtimeKey, input]) };
+  const runtimeKey = JSON.stringify([generation, lifetime, physicalId]);
+  return { screen, runtimeKey, observationKey: JSON.stringify([runtimeKey, turn, attempt, input]) };
 }
 
 function startScreenUpdates(): void {
@@ -25314,7 +25314,8 @@ function startScreenUpdates(): void {
   let lastTextSnapshotHash = '';
   let lastContent = '';
   const permissionNotice = new ClaudePermissionNoticeTracker();
-  let permissionCaptureSequence = 0;
+  let permissionCapture: { backend: typeof backend; key: string; expiresAt: number } | undefined;
+  const permissionCaptureTimeoutMs = 10_000;
   // The CLI's own next-input suggestion (adapters with promptSuggestion only).
   const promptSuggestions = new PromptSuggestionPublisher();
   // PTY-activity watermark of the last tick that actually captured. The screen
@@ -25329,7 +25330,12 @@ function startScreenUpdates(): void {
   const sample = () => {
     const capacityBackend = backend;
     const capacityGeneration = cliSpawnGeneration;
+    const capacityLifetime = cliLifetimeNonce;
+    const sampleTurn = currentBotmuxTurnId;
+    const sampleAttempt = currentBotmuxDispatchAttempt;
     const ownsSample = () => backend === capacityBackend && cliSpawnGeneration === capacityGeneration
+      && cliLifetimeNonce === capacityLifetime
+      && currentBotmuxTurnId === sampleTurn && currentBotmuxDispatchAttempt === sampleAttempt
       && (!workerSessionEventScope || hasCurrentSessionRuntime());
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
@@ -25485,14 +25491,35 @@ function startScreenUpdates(): void {
       // daemon's scopedReply falls back to the session anchor. The projection
       // is narrow: only the bounded title/question/options leave the
       // terminal, never tool args.
-      if (lastInitConfig?.cliId === 'claude-code'
-        && permissionNotice.needsCapture([snapshot.nativeScreen, renderer?.rawSnapshot(), snapshot.content])) {
-        const captureSequence = ++permissionCaptureSequence;
-        const current = await captureClaudePermissionNoticeScreen();
-        if (!ownsSample() || captureSequence !== permissionCaptureSequence) return;
-        const prompt = permissionNotice.observe(current?.screen, current?.runtimeKey ?? '', Date.now(), current?.observationKey);
-        if (prompt) send({type: 'user_notify', kind: 'claude_permission_prompt', message: prompt,
-          permissionPromptStable: true, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
+      if (lastInitConfig?.cliId === 'claude-code') {
+        if (permissionCapture && Date.now() >= permissionCapture.expiresAt) {
+          permissionCapture = undefined;
+          permissionNotice.observe(undefined, '', Date.now());
+        }
+        if (permissionNotice.needsCapture([snapshot.nativeScreen, renderer?.rawSnapshot(), snapshot.content])) {
+          const key = JSON.stringify([capacityGeneration, capacityLifetime, sampleTurn, sampleAttempt,
+            webTerminalInputGeneration, workerSessionEventScope?.currentBinding()?.bindingId]);
+          if (!permissionCapture || permissionCapture.backend !== capacityBackend || permissionCapture.key !== key) {
+            const capture = { backend: capacityBackend, key, expiresAt: Date.now() + permissionCaptureTimeoutMs };
+            permissionCapture = capture;
+            // A slow permission read must not hold ordinary screen updates or be
+            // superseded by every tick. A stuck read loses its slot and late
+            // results cannot settle a newer read's observation.
+            void captureClaudePermissionNoticeScreen().then(current => {
+              if (permissionCapture !== capture || !ownsSample()) return;
+              const observedAt = Date.now();
+              if (observedAt >= capture.expiresAt) {
+                permissionNotice.observe(undefined, '', observedAt);
+                return;
+              }
+              const prompt = permissionNotice.observe(current?.screen, current?.runtimeKey ?? '', observedAt, current?.observationKey);
+              if (prompt) send({type: 'user_notify', kind: 'claude_permission_prompt', message: prompt,
+                permissionPromptStable: true, turnId: sampleTurn, dispatchAttempt: sampleAttempt});
+            }).finally(() => {
+              if (permissionCapture === capture) permissionCapture = undefined;
+            });
+          }
+        }
       }
       const screenTurn = { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt };
       const suggestion = promptSuggestions.take(usageAware.status, screenTurn,

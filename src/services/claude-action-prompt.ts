@@ -46,6 +46,7 @@ export class ClaudePermissionNoticeTracker {
     return !!this.key || !!this.notifiedKey || screens.some(screen => screen !== undefined && !!claudeActionPrompt(screen));
   }
 
+  // runtimeKey identifies the physical CLI; turn/attempt/input belong only in observationKey.
   observe(screen: string | undefined, runtimeKey: string, now: number, observationKey = runtimeKey): string | undefined {
     // An unreadable frame breaks the wait, but does not prove a dialog closed.
     if (screen === undefined) { this.key = ''; return; }
