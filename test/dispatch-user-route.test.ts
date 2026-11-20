@@ -20,8 +20,8 @@ vi.mock('node:fs/promises', async () => {
     return readFile(...args);
   }) as typeof original.readFile };
 });
-import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
-import { fallbackTurnId, frozenReplyContextForTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { authorityForDispatch, resolveDispatchSenderUnionId, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
+import { beginReplyTargetTurn, fallbackTurnId, frozenReplyContextForTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
@@ -80,11 +80,12 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     dispatchUserForTurn: vi.fn(async () => undefined),
     targetUserForDelegation: vi.fn(async () => 'ou_alice_target'),
     fallbackTurnId, frozenReplyContextForTurn,
-    authorityForDispatch, scheduleCreateCapabilities, directHumanForDispatchOnly, dispatchCallerFromReply, dispatchOnlyToolsForTurn,
+    authorityForDispatch, resolveDispatchSenderUnionId, scheduleCreateCapabilities, directHumanForDispatchOnly, dispatchCallerFromReply, dispatchOnlyToolsForTurn,
     pickTurnReplyTarget: () => undefined,
     matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
+    resolveMessageSenderUnionId: vi.fn(async () => null),
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, assertDispatchTaskApproved,
     dispatchConsentCardAvailable: async () => true,
     config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
@@ -976,6 +977,56 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect((await h.run()).status).toBe(409);
     expect(h.send).not.toHaveBeenCalled();
   });
+  it.each(['active', 'restored'])('signs the exact inbound message sender with Contact unavailable (%s)', async mode => {
+    const h = harness();
+    beginReplyTargetTurn(h.ds, undefined, 'om_human', undefined, {
+      sourceMessageId: 'om_human', senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: false }],
+    });
+    delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
+    if (mode === 'restored') {
+      h.ds.activeInteractiveTurn = undefined;
+      h.ds.session = JSON.parse(JSON.stringify(h.ds.session));
+    }
+    h.scope.pickTurnReplyTarget = pickTurnReplyTarget;
+    h.scope.resolveMessageSenderUnionId.mockResolvedValue('on_from_message');
+    h.scope.resolveUnionIdFromOpenId.mockResolvedValue(null);
+    expect((await h.run()).status).toBe(200);
+    expect(h.scope.resolveMessageSenderUnionId).toHaveBeenCalledExactlyOnceWith('cli_source', 'om_human');
+    expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+    expect((await read())?.authority).toMatchObject({ openId: 'ou_alice', unionId: 'on_from_message' });
+  });
+  it('does not deliver after the source turn changes during the message lookup', async () => {
+    const h = harness();
+    delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
+    beginReplyTargetTurn(h.ds, undefined, 'om_human', undefined, {
+      sourceMessageId: 'om_human', senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: false }],
+    });
+    h.scope.resolveMessageSenderUnionId.mockImplementation(async () => {
+      h.ds.managedTurnOrigin.turnId = 'om_next';
+      return 'on_from_message';
+    });
+    expect((await h.run()).status).toBe(409);
+    expect(h.send).not.toHaveBeenCalled();
+  });
+  it.each(['different message', 'different sender', 'unknown sender', 'copied recovery'])(
+    'never uses a message sender with inconsistent origin evidence (%s)', async scenario => {
+      const h = harness();
+      delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
+      const sender = scenario === 'different sender' ? 'ou_other' : 'ou_alice';
+      beginReplyTargetTurn(h.ds, undefined, 'om_human', undefined, {
+        sourceMessageId: scenario === 'different message' ? 'om_other' : 'om_human',
+        senderOpenId: sender, participants: [{ openId: sender, isBot: scenario === 'unknown sender' ? undefined : false }],
+      });
+      if (scenario === 'copied recovery') {
+        h.ds.session.ordinaryTurnRecovery = { currentTurnId: 'om_human', logicalTurnId: 'om_original' };
+      }
+      h.scope.resolveMessageSenderUnionId.mockResolvedValue('on_other');
+      h.scope.resolveUnionIdFromOpenId.mockResolvedValue(null);
+      expect((await h.run()).status).toBe(502);
+      expect(h.scope.resolveMessageSenderUnionId).not.toHaveBeenCalled();
+      expect(h.send).not.toHaveBeenCalled();
+    },
+  );
   it('unknown cross-app identity fails before sending a task', async () => {
     const h = harness(); delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
     h.scope.resolveUnionIdFromOpenId = async () => null;

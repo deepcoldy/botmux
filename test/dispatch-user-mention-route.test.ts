@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, resolveDispatchUser, registerPendingDispatchUser,
+  authorityForDispatch, resolveDispatchSenderUnionId, directHumanForDispatchOnly, dispatchCallerFromReply, resolveDispatchUser, registerPendingDispatchUser,
   readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage,
   dispatchUserStorePath,
 } from '../src/core/dispatch-user-delegation.js';
@@ -85,7 +85,8 @@ function harness(options: {
       triggerUserAuth: 'triggerUserAuth' in options ? options.triggerUserAuth : { enabled: true, tools: ['bytedcli'] } } }),
     delegatesOnMention, dispatchOnlyToolsForTurn,
     loadBotConfigsCached: () => (options.localBots ?? ['cli_source', 'cli_target', 'cli_third']).map(larkAppId => ({ larkAppId })),
-    authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
+    authorityForDispatch, resolveDispatchSenderUnionId, directHumanForDispatchOnly, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
+    resolveMessageSenderUnionId: vi.fn(async () => null),
     resolveUnionIdFromOpenId: vi.fn(async () => 'on_alice'),
     registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser,
     handoffMessageMatches, readHandoffMessage, getMessageDetail,
@@ -112,6 +113,16 @@ describe('mention handoff: prepare', () => {
   const scoped = { enabled: true, tools: ['lark-cli'], dispatchOnly: {
     tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_chat'],
   } };
+  it('prepares delegated tools for the verified inbound sender when Contact cannot see the user', async () => {
+    const h = harness({ caller: { senderType: 'user', requestLarkAppId: 'cli_source', requestUserOpenId: 'ou_alice' } });
+    h.ds.session.replyTargets = { om_human: { senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: false }] } };
+    h.ds.session.turnReplyContexts = { om_human: { sourceMessageId: 'om_human' } };
+    h.scope.resolveMessageSenderUnionId.mockResolvedValue('on_from_message');
+    h.scope.resolveUnionIdFromOpenId.mockResolvedValue(null);
+    const prepared = await h.prepare();
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.unionId).toBe('on_from_message');
+    expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+  });
   it('signs scoped tools when a direct human mentions the allowed local bot', async () => {
     const h = harness({ triggerUserAuth: scoped });
     const prepared = await h.prepare();

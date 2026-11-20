@@ -688,7 +688,7 @@ import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-cre
 import { validateRoleLibraryPath } from './core/role-library.js';
 import { assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
 import { dispatchConsentCardAvailable } from './im/lark/client.js';
-import { authorityForDispatch, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
+import { authorityForDispatch, resolveDispatchSenderUnionId, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
@@ -9665,7 +9665,9 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           allowSelfManage: delegationPolicy?.selfManageEnabled === true,
         },
       } : {}),
-      resolveUnionId: resolveUnionIdFromOpenId,
+      resolveUnionId: (appId, openId) => resolveDispatchSenderUnionId(
+        ds.session, turnId, appId, openId, resolveMessageSenderUnionId, resolveUnionIdFromOpenId,
+      ),
     }) : undefined;
     if (serviceGrant) {
       const sponsor = await resolveTargetAppOpenId(ds.larkAppId, serviceGrant.controllerUnionId);
@@ -9923,7 +9925,9 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
       inherited: inherited?.authority,
       tools: [...new Set([...bot.triggerUserAuth!.tools, ...dispatchOnlyTools])],
-      resolveUnionId: resolveUnionIdFromOpenId,
+      resolveUnionId: (appId, openId) => resolveDispatchSenderUnionId(
+        ds.session, turnId, appId, openId, resolveMessageSenderUnionId, resolveUnionIdFromOpenId,
+      ),
     });
     if (!authority) {
       if (inherited) return skip('no_shared_tool');
