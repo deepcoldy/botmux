@@ -27701,25 +27701,28 @@ function setupWorkerHandlers(
         // second copy.
         const uuid = absorbedReplyUuid(ds.session.sessionId, msg.turnId, msg.replyUuid);
         const finishDelivery = beginFinalOutputDelivery(ds, msg.turnId);
-        void deliverWithRetry(
-          () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid }),
-          ownsLifecycleMutation,
-          (attempt, err) => logger.warn(`[${t}] Follow-up reply attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`),
-        ).then(result => {
+        try {
+          const result = await deliverWithRetry(
+            () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid }),
+            ownsLifecycleMutation,
+            (attempt, err) => logger.warn(`[${t}] Follow-up reply attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`),
+          );
           if (!result.delivered) {
             logger.error(`[${t}] Gave up delivering follow-up reply for turn ${msg.turnId.substring(0, 8)}`);
-            return;
+            // A contract-deferred reply must stay replayable. The outer handler
+            // acknowledges it only after this delivery has actually completed.
+            throw new Error('Follow-up reply delivery did not complete');
           }
           // The POST can outlive this worker/session. Its external effect is
           // already real, but a late response must not mutate the replacement's
           // terminal state.
-          if (!ownsLifecycleMutation()) return;
-          // The turn's final (see turnReply): it is what this turn delivered.
-          if (msg.turnReply && typeof result.value === 'string' && result.value) {
+          if (ownsLifecycleMutation() && msg.turnReply && typeof result.value === 'string' && result.value) {
             recordTurnTerminalCarrier(ds, msg.turnId, { messageId: result.value, kind: 'non_patchable', responseKind: 'final' });
             noteFinalOutputReceipt(ds, msg.turnId, { text: msg.answer });
           }
-        }).finally(finishDelivery);
+        } finally {
+          finishDelivery();
+        }
         break;
       }
       case 'adopt_preamble': {
