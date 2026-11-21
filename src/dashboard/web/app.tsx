@@ -5,12 +5,16 @@ import { createRoot } from 'react-dom/client';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { bootstrap, store } from './store.js';
+import { afterNextPaint } from './deferred-task.js';
+import { runDashboardStartup } from './app-startup.js';
 import {
   attentionReason,
   attentionWaitSince,
   botDisplayName,
+  botNameForAppId,
   escapeHtml,
   loadNameMaps,
+  reloadNameMaps,
   relTime,
   t,
   ui,
@@ -28,8 +32,6 @@ import { buildBotCards, loadGroupsSnapshot } from './overview.js';
 import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
-import { initFloatingScrollbars } from './floating-scrollbars.js';
-import { initIconTooltips } from './icon-tooltip.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 import {
   updateAndRestartBotmux,
@@ -61,6 +63,8 @@ import {
 import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-palette-model.js';
 import { NAV_GROUPS, NAV_ITEMS, NAV_SUBPAGES, type NavItem } from './nav-items.js';
 import { DECISION_BOARD_CHANGED_EVENT, boardsFromResponse } from './decision-board-model.js';
+import { parseWorkflowSidebarHash } from '../../core/workflow-sidebar-link.js';
+import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import type { PalettePageEntry, PaletteShellContext } from './command-palette-sources.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
@@ -111,7 +115,6 @@ const MANAGE_ROUTES = [
   'doc-watches',
   'message-listeners',
   'plugins',
-  'team',
   'connectors',
   'insights',
   'feedback',
@@ -147,7 +150,6 @@ let appRoot: ReturnType<typeof createRoot> | null = null;
 
 const routeState = createDashboardRouteState();
 const OWNER_AVATAR_KEY = 'botmux.ownerAvatar.v1';
-const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
 const AUTH_EXPIRED_EVENT = 'botmux:auth-expired';
 let authLoginBaseUrl: string | undefined;
 
@@ -391,8 +393,7 @@ function dashboardStatusSummary(): TopbarStatusSummary {
     .map(s => ({ s, reason: attentionReason(s) }))
     .filter((x): x is { s: Record<string, any>; reason: string } => !!x.reason)
     .sort((a, b) => attentionWaitSince(a.s) - attentionWaitSince(b.s));
-  const attentionIds = new Set(attention.map(item => String(item.s.sessionId ?? '')));
-  const working = active.filter(s => BUSY_STATUSES.has(String(s.status)) && !attentionIds.has(String(s.sessionId ?? ''))).length;
+  const working = active.filter(s => deriveSessionTaskStatus(s).kind === 'working').length;
   const longest = attention[0] ?? null;
   const onlineBots = buildBotCards(sessions).filter(c => c.online || c.active.length > 0).length;
   const idle = Math.max(0, active.length - attention.length - working);
@@ -1935,9 +1936,21 @@ void (async () => {
   applyShellLocaleFromHash();
   const host = document.getElementById('app-root');
   if (!host) throw new Error('missing dashboard app root');
-  initFloatingScrollbars(host);
-  initIconTooltips();
   appRoot = createRoot(host);
+
+  // 工作流侧边栏（任务消息签名行「工作流 ›」→ /workflow/<app>/<run> 302 到这里）：飞书侧栏只有
+  // 350–800px，访问者多半是群成员而不是 Dashboard 管理员。只挂这一页、不探 /api/settings、不拉
+  // 会话快照：那些接口对群成员本就是 401，探了只会盖上登录浮层。权限完全由页面自己的只读接口判。
+  const workflowSidebar = parseWorkflowSidebarHash(location.search, location.hash);
+  if (workflowSidebar) {
+    const { WorkflowSidebarPage } = await import('./workflow-sidebar-page.js');
+    appRoot.render(
+      <div className="workbench-route-host" data-workbench-surface="workflow">
+        <main id="root"><WorkflowSidebarPage target={workflowSidebar} fetcher={origFetch} /></main>
+      </div>,
+    );
+    return;
+  }
   renderShell();
 
   ui.on(() => {
@@ -1951,40 +1964,52 @@ void (async () => {
   await loadAuthState();
   renderShell();
   window.addEventListener(PLUGIN_PINS_CHANGED_EVENT, () => { void loadPinnedPluginNavItems(); });
-  void loadPinnedPluginNavItems();
   // Bot 配置里开关管家后会发这个事件，侧边栏随之出现 / 消失。
   window.addEventListener(DECISION_BOARD_CHANGED_EVENT, () => { void loadDecisionBoardNav(); });
-  void loadDecisionBoardNav();
-  void checkUpdateBadge();
   window.setInterval(() => {
     if (document.hidden) return;
     void checkUpdateBadge();
   }, 30 * 60_000);
-  initOwnerAvatar();
-  try {
-    await bootstrap({
+  window.addEventListener('hashchange', createHashChangeHandler({
+    applyLocale: applyShellLocaleFromHash,
+    route: () => { void route(); },
+  }));
+  // Mount the selected page immediately. Its shell/skeleton and independent
+  // Bot configuration reads must not wait for global session/schedule data.
+  await runDashboardStartup({
+    route,
+    bootstrap: () => bootstrap({
       // P1-14：排程只对「本机管理身份」和「publicReadOnly 匿名访客」开放。
       // Workbench-only 身份（飞书 H5 / 平台 teammate|guest，loadAuthState 里把
       // authed 置 false、workbenchAuthed 置 true）对 /api/schedules 是既定的
       // 401，别发这一跳。注意能力判断只影响「发不发请求」，会话快照的容错不
       // 依赖它对不对。
       canReadSchedules: () => ui.authed || ui.publicReadOnly,
-    });
-  } catch (err) {
-    console.error('botmux dashboard bootstrap failed', err);
-    store.setOnline(false);
-  }
-  void loadNameMaps().then(renderShell);
-  void loadGroupsSnapshot().then(renderShell);
+    }),
+    afterNextPaint,
+    optional: () => {
+      void loadPinnedPluginNavItems();
+      void loadDecisionBoardNav();
+      void checkUpdateBadge();
+      initOwnerAvatar();
+      void loadNameMaps().then(renderShell);
+      void loadGroupsSnapshot().then(renderShell);
+    },
+    onBotsChanged: listener => { store.onBotsChanged(listener); },
+    reloadNameMaps: () => {
+      void reloadNameMaps().then(() => {
+        store.relabelBots(botNameForAppId);
+        renderShell();
+      });
+    },
+    onBootstrapError: err => {
+      console.error('botmux dashboard bootstrap failed', err);
+      store.setOnline(false);
+    },
+  });
   // 空闲时预取 ⌘K 面板 chunk，首次唤起不等网络；无边框工作台壳不挂面板，不白取。
   if (!framelessWorkbenchSurface(location.hash || '#/')) {
     if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(preloadCommandPalette, { timeout: 5_000 });
     else window.setTimeout(preloadCommandPalette, 3_000);
   }
-  // A page with unsaved edits can hold a navigation back (see leave-guard.ts).
-  window.addEventListener('hashchange', createHashChangeHandler({
-    applyLocale: applyShellLocaleFromHash,
-    route: () => { void route(); },
-  }));
-  void route();
 })();

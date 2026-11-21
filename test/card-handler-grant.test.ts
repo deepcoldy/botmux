@@ -466,3 +466,108 @@ describe('card-handler grant actions — request card forwarded to the approver 
     expect(sendMock).not.toHaveBeenCalled();
   });
 });
+
+/**
+ * 申请卡待批期间暂存的机器人消息：管理员批准后，原消息在前、暂存消息按到达顺序跟在后逐条交给
+ * replayGrantedMessage（它按调用顺序串行处理）；拒绝路径不重放。
+ */
+describe('card-handler grant replay — messages held while the card was pending', () => {
+  const ev = (id: string, sender = 'ou_g') => ({
+    message: { message_id: id, chat_id: 'oc_1', chat_type: 'group', content: `{"text":"task ${id}"}` },
+    sender: { sender_id: { open_id: sender }, sender_type: 'bot' },
+  });
+  const replayedIds = (fn: ReturnType<typeof vi.fn>) => fn.mock.calls.map(c => (c[0] as any).message.message_id);
+
+  it('approval replays the trigger, then the held messages in arrival order', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g', 3, ev('om_1'), 60 * 60 * 1000);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+    expect(pending.holdPendingMessage('h1', 'oc_1', 'ou_g', ev('om_2'))).toBe('held');
+    expect(pending.holdPendingMessage('h1', 'oc_1', 'ou_g', ev('om_3'))).toBe('held');
+
+    const replayGrantedMessage = vi.fn();
+    const res = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), { ...deps, replayGrantedMessage }, 'h1');
+    expect(res?.toast).toBeUndefined();
+    expect(replayedIds(replayGrantedMessage)).toEqual(['om_1', 'om_2', 'om_3']);
+    expect(replayGrantedMessage.mock.calls.every(c => c[1] === 'h1')).toBe(true);
+  });
+
+  it('multi-target card: every target\'s held messages are replayed, not just the first target\'s', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPendingMulti('h1', 'oc_1', ['ou_g', 'ou_h'], 3, undefined, 60 * 60 * 1000);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g', 'ou_h'], nonce);
+    pending.holdPendingMessage('h1', 'oc_1', 'ou_g', ev('om_g', 'ou_g'));
+    pending.holdPendingMessage('h1', 'oc_1', 'ou_h', ev('om_h', 'ou_h'));
+
+    const replayGrantedMessage = vi.fn();
+    const res = await handler.handleCardAction(
+      { operator: { open_id: 'ou_owner' }, action: { value: { action: 'grant_chat', target_open_ids: ['ou_g', 'ou_h'], chat_id: 'oc_1', nonce } } },
+      { ...deps, replayGrantedMessage },
+      'h1',
+    );
+    expect(res?.toast).toBeUndefined();
+    expect(replayedIds(replayGrantedMessage)).toEqual(['om_g', 'om_h']);
+  });
+
+  it('the admin answers with /grant instead of clicking: approving the /grant card replays the first card\'s messages in order', async () => {
+    const { registry, pending, handler } = await fresh();
+    const bot = registry.getBot('h1');
+    bot.botOpenId = 'ou_bot';
+    bot.resolvedAllowedUsers = ['ou_owner'];
+    const { tryHandleGrantCommand } = await import('../src/im/lark/grant-command.js');
+    const first = pending.openPending('h1', 'oc_1', 'ou_g', 3, ev('om_1'), 60 * 60 * 1000);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], first);
+    pending.holdPendingMessage('h1', 'oc_1', 'ou_g', ev('om_2'));
+    pending.holdPendingMessage('h1', 'oc_1', 'ou_g', ev('om_3'));
+
+    expect(await tryHandleGrantCommand('h1', {
+      message_id: 'om_grant_cmd', chat_id: 'oc_1', chat_type: 'group',
+      content: JSON.stringify({ text: '@_user_1 /grant @_user_2 10' }),
+      mentions: [
+        { key: '@_user_1', id: { open_id: 'ou_bot' }, name: 'Claude' },
+        { key: '@_user_2', id: { open_id: 'ou_g' }, name: 'BotA' },
+      ],
+    }, 'ou_owner')).toBe(true);
+    const card = String((replyMock.mock.calls.at(-1) as any[])[2]);
+    const nonce = card.match(/nonce[^0-9a-z]{1,12}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/)?.[1];
+    expect(nonce).toBeTruthy();
+    expect(nonce).not.toBe(first);
+
+    const replayGrantedMessage = vi.fn();
+    const res = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_grant_card'), { ...deps, replayGrantedMessage }, 'h1');
+    expect(res?.toast).toBeUndefined();
+    expect(replayedIds(replayGrantedMessage)).toEqual(['om_1', 'om_2', 'om_3']);
+  });
+
+  it('replays as soon as the grant is stored, before the post-grant contact lookup returns', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g', 3, ev('om_1'), 60 * 60 * 1000);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+    pending.holdPendingMessage('h1', 'oc_1', 'ou_g', ev('om_2'));
+    let finishLookup!: () => void;
+    isHumanMock.mockImplementationOnce(() => new Promise<boolean>(resolve => { finishLookup = () => resolve(false); }));
+
+    const replayGrantedMessage = vi.fn();
+    const result = handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), { ...deps, replayGrantedMessage }, 'h1');
+    try {
+      await vi.waitFor(() => expect(isHumanMock).toHaveBeenCalled());
+      expect(replayedIds(replayGrantedMessage)).toEqual(['om_1', 'om_2']);
+    } finally {
+      finishLookup?.();
+    }
+    expect((await result)?.toast).toBeUndefined();
+  });
+
+  it('denial replays nothing, and a late approval click on the denied card cannot replay the held messages', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_1', 'ou_g', 3, ev('om_1'), 60 * 60 * 1000);
+    pending.markPendingDelivered('h1', 'oc_1', ['ou_g'], nonce);
+    pending.holdPendingMessage('h1', 'oc_1', 'ou_g', ev('om_2'));
+
+    const replayGrantedMessage = vi.fn();
+    await handler.handleCardAction(action('grant_deny', { nonce }, 'om_card'), { ...deps, replayGrantedMessage }, 'h1');
+    const late = await handler.handleCardAction(action('grant_chat', { nonce }, 'om_card'), { ...deps, replayGrantedMessage }, 'h1');
+    expect(late?.toast?.type).toBe('error');
+    expect(replayGrantedMessage).not.toHaveBeenCalled();
+  });
+});

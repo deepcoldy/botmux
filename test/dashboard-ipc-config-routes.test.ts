@@ -8,9 +8,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { setLarkAppId, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { config } from '../src/config.js';
+import { codexCleanupArchiveEnabled } from '../src/services/codex-cleanup-archive.js';
 
 const APP_ID = 'cli_config_routes_test';
 
@@ -29,12 +30,15 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
   ['/api/bot-cantalk-daemon-commands', LEGACY],
   ['/api/bot-launch-shell', LEGACY],
   ['/api/bot-oncall-group', LEGACY],
+  ['/api/bot-owner-group-follow', LEGACY],
   ['/api/bot-actor-owner-bindings', LEGACY],
   ['/api/bot-no-progress-notify', OK_FALSE],
   ['/api/bot-feedback', LEGACY],
   ['/api/bot-env', LEGACY],
   ['/api/bot-max-live-workers', LEGACY],
   ['/api/bot-idle-suspend-minutes', LEGACY],
+  ['/api/bot-archive-codex', LEGACY],
+  ['/api/bot-bare-rename-passthrough', LEGACY],
   ['/api/bot-riff', LEGACY],
   ['/api/bot-herdr', LEGACY],
   ['/api/bot-skills', LEGACY],
@@ -45,6 +49,10 @@ const ROUTES: ReadonlyArray<readonly [string, object]> = [
 /** [path, 请求体, 期望 status, 期望 body（toMatchObject）, 期望落盘的 config 字段（undefined = 不应出现）] */
 type Case = readonly [string, string, number, unknown, Record<string, unknown>?];
 const CASES: readonly Case[] = [
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true,"excludeChatIds":["oc_skip"]}}', 200, { ok: true, ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }, { ownerGroupFollow: { enabled: true, excludeChatIds: ['oc_skip'] } }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}', 200, { ok: true, ownerGroupFollow: null }, { ownerGroupFollow: undefined }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":"true"}}', 400, { ok: false, error: 'invalid_json' }],
+  ['/api/bot-owner-group-follow', '{"ownerGroupFollow":{"excludeChatIds":["ou_other"]}}', 400, { ok: false, error: 'invalid_json' }],
   ['/api/bot-p2p-mode', '{"p2pMode":"thread"}', 200, { ok: true, p2pMode: 'thread' }, { p2pMode: 'thread' }],
   ['/api/bot-p2p-mode', '{"p2pMode":5}', 200, { ok: true, p2pMode: 'chat' }, { p2pMode: undefined }],
   ['/api/bot-envelope-injection', '{"envelopeInjection":"auto"}', 200, { ok: true, envelopeInjection: 'auto' }, { envelopeInjection: 'auto' }],
@@ -54,10 +62,11 @@ const CASES: readonly Case[] = [
   ['/api/bot-topic-unavailable-policy', '[]', 400, { ok: false, error: 'invalid_topic_unavailable_policy' }],
   // Zero injection forces transcript delivery; the response carries the effective value.
   ['/api/bot-prompt-injection', '{"promptInjection":"none"}', 200, { ok: true, promptInjection: 'none', replyDelivery: 'transcript' }, { promptInjection: 'none' }],
-  ['/api/bot-prompt-injection', '{"promptInjection":"default"}', 200, { ok: true, promptInjection: 'default', replyDelivery: 'send' }, { promptInjection: 'default' }],
+  // Leaving zero injection falls back to the CLI default (claude-code: transcript).
+  ['/api/bot-prompt-injection', '{"promptInjection":"default"}', 200, { ok: true, promptInjection: 'default', replyDelivery: 'transcript' }, { promptInjection: 'default' }],
   ['/api/bot-prompt-injection', '{"promptInjection":"x"}', 400, { ok: false, error: 'invalid_prompt_injection' }],
-  ['/api/bot-reply-delivery', '{"replyDelivery":"transcript"}', 200, { ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' }, { replyDelivery: 'transcript' }],
-  ['/api/bot-reply-delivery', '{"replyDelivery":"send"}', 200, { ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' }, { replyDelivery: 'send' }],
+  ['/api/bot-reply-delivery', '{"replyDelivery":"transcript"}', 200, { ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' }, { replyDelivery: 'transcript' }],
+  ['/api/bot-reply-delivery', '{"replyDelivery":"send"}', 200, { ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' }, { replyDelivery: 'send' }],
   ['/api/bot-skill-injection', '{"skillInjection":"global"}', 200, { ok: true, skillInjection: 'global' }, { skillInjection: 'global' }],
   ['/api/bot-skill-injection', '{"skillInjection":"zz"}', 200, { ok: true, skillInjection: null }, { skillInjection: undefined }],
   ['/api/bot-startup-commands', '{"startupCommands":"/effort high, /foo"}', 200, { ok: true, startupCommands: '/effort high\n/foo' }, { startupCommands: ['/effort high', '/foo'] }],
@@ -97,7 +106,19 @@ const CASES: readonly Case[] = [
   ['/api/bot-idle-suspend-minutes', '{"idleSuspendMinutes":null}', 200, { ok: true, idleSuspendMinutes: null }, { idleSuspendMinutes: undefined }],
   ['/api/bot-idle-suspend-minutes', '{"idleSuspendMinutes":"x"}', 400, { ok: false, error: 'invalid_number' }],
   ['/api/bot-idle-suspend-minutes', '{}', 200, { ok: true, idleSuspendMinutes: null }, { idleSuspendMinutes: undefined }],
-  ['/api/bot-sandbox-network-policy', '{"policy":null}', 200, { ok: true, sandboxNetworkPolicy: null }],
+  // 三态覆盖：显式 false 也落盘；null 才删键回到继承；缺键 / 非布尔不当清除。
+  ['/api/bot-archive-codex', '{"archiveCodex":false}', 200, { ok: true, archiveCodex: false }, { archiveCodex: false }],
+  ['/api/bot-archive-codex', '{"archiveCodex":true}', 200, { ok: true, archiveCodex: true }, { archiveCodex: true }],
+  ['/api/bot-archive-codex', '{"archiveCodex":null}', 200, { ok: true, archiveCodex: null }, { archiveCodex: undefined }],
+  ['/api/bot-archive-codex', '{"archiveCodex":"off"}', 400, { ok: false, error: 'invalid_archive_codex' }],
+  ['/api/bot-archive-codex', '{}', 400, { ok: false, error: 'invalid_archive_codex' }],
+  ['/api/bot-archive-codex', '[]', 400, { ok: false, error: 'invalid_archive_codex' }],
+  // 默认关：true 落盘，false 删键；缺键 / 非布尔一律 400，不当成关闭。
+  ['/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":true}', 200, { ok: true, bareRenamePassthrough: true }, { bareRenamePassthrough: true }],
+  ['/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":false}', 200, { ok: true, bareRenamePassthrough: false }, { bareRenamePassthrough: undefined }],
+  ['/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":"on"}', 400, { ok: false, error: 'invalid_bare_rename_passthrough' }],
+  ['/api/bot-bare-rename-passthrough', '{}', 400, { ok: false, error: 'invalid_bare_rename_passthrough' }],
+  ['/api/bot-sandbox-network-policy', '{"policy":null}', 200, { ok: true, sandboxNetworkPolicy: null, warnings: [] }],
   ['/api/bot-sandbox-network-policy', '{"policy":1,"x":2}', 400, { ok: false, error: 'policy_required' }],
   // 校验通过后由 applyConfigField 拒绝：reason 原样作为 400 的 error。
   ['/api/bot-sandbox-network-policy', '{"policy":"allow"}', 400, { ok: false, error: 'sandboxNetworkPolicy must be an object' }],
@@ -144,6 +165,7 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
   let configPath: string;
   let handle: IpcServerHandle | null = null;
   let previousBotsConfig: string | undefined;
+  let previousGlobalConfig: string | undefined;
 
   const persistedBot = () => JSON.parse(readFileSync(configPath, 'utf8'))[0] as Record<string, unknown>;
   const put = (path: string, body?: string) => fetch(`http://127.0.0.1:${handle!.port}${path}`, {
@@ -157,6 +179,10 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     configPath = join(dir, 'bots.json');
     previousBotsConfig = process.env.BOTS_CONFIG;
     process.env.BOTS_CONFIG = configPath;
+    // The network-policy warnings route composes the global sessionEnv layer;
+    // isolate it so results never depend on the developer's live config.json.
+    previousGlobalConfig = process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    process.env.BOTMUX_GLOBAL_CONFIG_FILE = join(dir, 'global-config.json');
     writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' }], null, 2));
     __testOnly_resetBotRegistry();
     loadBotConfigs().forEach((c: any) => registerBot(c));
@@ -171,6 +197,8 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     setLarkAppId('');
     if (previousBotsConfig === undefined) delete process.env.BOTS_CONFIG;
     else process.env.BOTS_CONFIG = previousBotsConfig;
+    if (previousGlobalConfig === undefined) delete process.env.BOTMUX_GLOBAL_CONFIG_FILE;
+    else process.env.BOTMUX_GLOBAL_CONFIG_FILE = previousGlobalConfig;
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -207,6 +235,105 @@ describe('config-field PUT routes (botConfigPutRoute)', () => {
     if (status !== 200) {
       expect(persistedBot()).toEqual({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' });
     }
+  });
+
+  it('/api/bot-owner-group-follow rejects new apiOnly config and permits clearing it', async () => {
+    const localAppId = 'local_config_routes_test';
+    writeFileSync(configPath, JSON.stringify([{
+      larkAppId: localAppId,
+      apiOnly: true,
+      localIdentity: true,
+      cliId: 'riff',
+      ownerGroupFollow: { enabled: true },
+    }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    setLarkAppId(localAppId);
+    const before = readFileSync(configPath, 'utf8');
+
+    const rejected = await put('/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":true}}');
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toEqual({ ok: false, error: 'owner_group_follow_api_only' });
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+
+    const defaults = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+    expect(defaults.status).toBe(200);
+    expect((await defaults.json()).apiOnly).toBe(true);
+
+    const cleared = await put('/api/bot-owner-group-follow', '{"ownerGroupFollow":{"enabled":false}}');
+    expect(cleared.status).toBe(200);
+    expect(await cleared.json()).toEqual({ ok: true, ownerGroupFollow: null });
+    expect(persistedBot()).toMatchObject({ larkAppId: localAppId, apiOnly: true, localIdentity: true });
+    expect(persistedBot()).not.toHaveProperty('ownerGroupFollow');
+  });
+
+  it.runIf(process.platform === 'linux')('/api/bot-sandbox-network-policy saves with DNS and proxy warnings', async () => {
+    // The bot's own env layer counts: its sessions inherit it.
+    writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true, backendType: 'pty', env: { HTTPS_PROXY: 'http://proxy.example:8080' } }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    const bare = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
+    const res = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: bare }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, sandboxNetworkPolicy: bare, warnings: ['dns_servers_missing', 'proxy_requires_trusted_egress'] });
+    // Saved despite the warnings: the launch env can differ from the daemon's.
+    expect(persistedBot().sandboxNetworkPolicy).toEqual(bare);
+    const ready = { ...bare, dnsServers: ['10.0.0.53'], proxyMode: 'trusted-egress' };
+    const fixed = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: ready }));
+    expect(await fixed.json()).toEqual({ ok: true, sandboxNetworkPolicy: ready, warnings: [] });
+  });
+
+  it.runIf(process.platform === 'linux')('/api/bot-sandbox-network-policy warns about a proxy in the global sessionEnv layer', async () => {
+    writeFileSync(configPath, JSON.stringify([{ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true, backendType: 'pty' }], null, 2));
+    __testOnly_resetBotRegistry();
+    loadBotConfigs().forEach((c: any) => registerBot(c));
+    // Proxy configured only in the global layer (Dashboard global env editor):
+    // every new session inherits it, so the save warning must see it too.
+    writeFileSync(join(dir, 'global-config.json'), JSON.stringify({ sessionEnv: { set: { HTTPS_PROXY: 'http://global-proxy.example:8080' }, unset: [] } }));
+    const bare = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'] };
+    const res = await put('/api/bot-sandbox-network-policy', JSON.stringify({ policy: bare }));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ ok: true, warnings: ['proxy_requires_trusted_egress'] });
+  });
+
+  it('/api/bot-archive-codex overrides the global archive switch for the next close and is echoed by the defaults GET', async () => {
+    writeFileSync(join(dir, 'global-config.json'), JSON.stringify({ sessionCleanup: { archiveCodex: true } }));
+    const shown = async () => {
+      const res = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+      expect(res.status).toBe(200);
+      return (await res.json()).archiveCodex;
+    };
+    expect(codexCleanupArchiveEnabled(APP_ID)).toBe(true);
+    expect(await shown()).toBeNull();
+
+    expect((await put('/api/bot-archive-codex', '{"archiveCodex":false}')).status).toBe(200);
+    // 关闭路径每次开始时取的就是这个判定：Dashboard 保存后无需重启即按本 Bot 的值。
+    expect(codexCleanupArchiveEnabled(APP_ID)).toBe(false);
+    expect(await shown()).toBe(false);
+
+    expect((await put('/api/bot-archive-codex', '{"archiveCodex":null}')).status).toBe(200);
+    expect(codexCleanupArchiveEnabled(APP_ID)).toBe(true);
+    expect(await shown()).toBeNull();
+    expect(persistedBot()).not.toHaveProperty('archiveCodex');
+  });
+
+  it('/api/bot-bare-rename-passthrough toggles the live switch and is echoed by the defaults GET', async () => {
+    const shown = async () => {
+      const res = await fetch(`http://127.0.0.1:${handle!.port}/api/bot-default-oncall`);
+      expect(res.status).toBe(200);
+      return (await res.json()).bareRenamePassthrough;
+    };
+    expect(await shown()).toBe(false);
+
+    expect((await put('/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":true}')).status).toBe(200);
+    // /rename 读的就是这份内存配置：保存后下一条 /rename 即按新值，无需重启。
+    expect(getBot(APP_ID).config.bareRenamePassthrough).toBe(true);
+    expect(await shown()).toBe(true);
+
+    expect((await put('/api/bot-bare-rename-passthrough', '{"bareRenamePassthrough":false}')).status).toBe(200);
+    expect(getBot(APP_ID).config.bareRenamePassthrough).toBeUndefined();
+    expect(await shown()).toBe(false);
+    expect(persistedBot()).not.toHaveProperty('bareRenamePassthrough');
   });
 
   it('/api/bot-env merges and removes keys, then clears an empty merge result', async () => {

@@ -2,6 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, validateMessageListenerUpdate } from '../src/services/message-listener-store.js';
 
 describe('message listener store', () => {
+  it('keeps silent execution through sanitize and persistence', () => {
+    const update = sanitizeMessageListenerUpdate({
+      enabled: true, prompt: 'run the configured task',
+      replyPolicy: { mode: 'none', sessionMode: 'per_message' },
+    });
+    expect(messageListenerConfigFromUpdate(update!)?.replyPolicy?.mode).toBe('none');
+  });
+
   it('keeps the custom reply card title from dashboard updates', () => {
     expect(sanitizeMessageListenerUpdate({
       enabled: true,

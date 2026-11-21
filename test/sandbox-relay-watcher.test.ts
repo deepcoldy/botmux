@@ -52,6 +52,55 @@ describe('sandbox relay watcher host handoff', () => {
     }
   });
 
+  it('hands relayed images to the host send as --images staged outside the outbox, not as --files', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-image-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'send-echo-image.mjs');
+    writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      const imagePath = argv[argv.indexOf('--images') + 1];
+      process.stdout.write(JSON.stringify({ argv, imageBytes: readFileSync(imagePath, 'utf8') }));
+    `);
+    const id = 'image-1';
+    const imageName = `${id}-deadbeef-chart.png`;
+    writeFileSync(join(outbox, `${id}.content`), 'look at this chart');
+    writeFileSync(join(outbox, imageName), 'PNG-BYTES');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      contentFile: `${id}.content`,
+      images: [imageName],
+      flags: ['--no-mention'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const argv = (JSON.parse(response.stdout) as { argv: string[] }).argv;
+      expect(argv).not.toContain('--files');
+      expect(argv).toEqual([
+        'send', '--no-mention',
+        '--content-file', expect.any(String),
+        '--images', expect.any(String),
+        '--session-id', 'forced-source',
+      ]);
+      const stagedImage = argv[argv.indexOf('--images') + 1];
+      expect(stagedImage.endsWith(`${id}-image0-${imageName}`)).toBe(true);
+      // The bytes cross via the host-private staging dir, a sibling of the outbox —
+      // never via a path that still names the sandbox-writable outbox. The fixture
+      // reads them while the child runs because finish() deletes staging right after.
+      expect(dirname(stagedImage)).toBe(join(root, 'relay-staging'));
+      expect(stagedImage.startsWith(outbox)).toBe(false);
+      const { imageBytes } = JSON.parse(response.stdout) as { imageBytes: string };
+      expect(imageBytes).toBe('PNG-BYTES');
+    } finally {
+      stop();
+    }
+  });
+
   it('re-execs dispatch on the host with a forced source session and bounded routing', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-'));
     roots.push(root);
@@ -177,6 +226,68 @@ describe('sandbox relay watcher host handoff', () => {
     }
   });
 
+  it('relays task-tree metadata flags (--kind/--task-id/--task-url) through to the host child', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-tree-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'dispatch-tree-echo.mjs');
+    writeFileSync(fixture, `
+      process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }));
+    `);
+    const id = 'dispatch-tree';
+    writeFileSync(join(outbox, `${id}.content`), 'review task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch',
+      contentFile: `${id}.content`,
+      flags: ['--title', 'work', '--bot-app', 'cli_target',
+        '--kind', 'review', '--task-id', 'REQ-1', '--task-url', 'https://example.com/req/1'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const { argv } = JSON.parse(response.stdout) as { argv: string[] };
+      expect(argv).toContain('review');
+      expect(argv).toContain('REQ-1');
+      expect(argv).toContain('https://example.com/req/1');
+      expect(argv[argv.indexOf('--kind') + 1]).toBe('review');
+    } finally {
+      stop();
+    }
+  });
+
+  it.each([
+    ['a bad --kind enum', ['--title', 't', '--kind', 'bogus'], 'dispatch --kind must be task or review'],
+    ['a non-https --task-url', ['--title', 't', '--task-url', 'http://insecure/x'], 'dispatch --task-url must be an https URL'],
+    ['a javascript --task-url', ['--title', 't', '--task-url', 'javascript:alert(1)'], 'dispatch --task-url must be an https URL'],
+  ])('rejects task-tree metadata with %s before spawning the host child', async (_label, flags, error) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-tree-reject-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'should-not-run.mjs');
+    writeFileSync(fixture, `process.stdout.write('ran');`);
+    const id = 'dispatch-tree-reject';
+    writeFileSync(join(outbox, `${id}.content`), 'task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch', contentFile: `${id}.content`, flags,
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code).toBe(1);
+      expect(response.stdout).toBe('');
+      expect(response.stderr).toContain(error);
+    } finally {
+      stop();
+    }
+  });
+
   it('materializes prepared card bytes and passes only the private path to the host child', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-watcher-'));
     roots.push(root);
@@ -276,7 +387,7 @@ describe('sandbox relay watcher host handoff', () => {
     }
   });
 
-  it('never promotes sandbox-supplied origin fields without host authorization (fail closed)', async () => {
+  it.each([false, true])('only host authorization supplies reply addressing (%s)', async (authorized) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-forged-'));
     roots.push(root);
     const outbox = join(root, 'outbox');
@@ -287,6 +398,7 @@ describe('sandbox relay watcher host handoff', () => {
       process.stdout.write(JSON.stringify({
         authorized: process.env.BOTMUX_HOST_RELAY_AUTHORIZED ?? null,
         turnId: process.env.BOTMUX_TURN_ID ?? null,
+        replyMessageId: process.env.BOTMUX_REPLY_MESSAGE_ID ?? null,
         dispatchAttempt: process.env.BOTMUX_DISPATCH_ATTEMPT ?? null,
         sessionId: process.env.BOTMUX_SESSION_ID ?? null,
       }));
@@ -307,9 +419,10 @@ describe('sandbox relay watcher host handoff', () => {
     const stop = startOutboxWatcher(outbox, {
       ...process.env,
       BOTMUX_TURN_ID: 'stale-inherited-turn',
+      BOTMUX_REPLY_MESSAGE_ID: 'om_forged',
       BOTMUX_DISPATCH_ATTEMPT: '7',
       BOTMUX_HOST_RELAY_AUTHORIZED: '',
-    }, 'forced-session', { cliPath: fixture }); // deliberately no authorize hook
+    }, 'forced-session', { cliPath: fixture, ...(authorized ? { authorize: () => ({ ok: true as const, origin: { turnId: 'om_active', replyMessageId: 'om_latest' } }) } : {}) });
 
     try {
       const responsePath = join(outbox, `${id}.res.json`);
@@ -317,13 +430,14 @@ describe('sandbox relay watcher host handoff', () => {
       const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
       expect(response.code, response.stderr).toBe(0);
       const child = JSON.parse(response.stdout) as {
-        authorized: string | null; turnId: string | null; dispatchAttempt: string | null; sessionId: string | null;
+        authorized: string | null; turnId: string | null; replyMessageId: string | null; dispatchAttempt: string | null; sessionId: string | null;
       };
       // The host re-exec itself is trusted, but with no authorize decision the
       // durable origin is dropped and inherited markers scrubbed — the forged
       // originTurnId/dispatchAttempt never reach the host send.
       expect(child.authorized).toBe('1');
-      expect(child.turnId).toBeNull();
+      expect(child.turnId).toBe(authorized ? 'om_active' : null);
+      expect(child.replyMessageId).toBe(authorized ? 'om_latest' : null);
       expect(child.dispatchAttempt).toBeNull();
       expect(child.sessionId).toBe('forced-session');
     } finally {

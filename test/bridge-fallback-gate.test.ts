@@ -10,6 +10,7 @@ import {
   bridgePostText,
   composeFailedBridgeFallbackContent,
   hasUserVisibleText,
+  isBridgeSendCompletionNarration,
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
   shouldEmitFailedBridgeFallback,
@@ -295,7 +296,7 @@ describe('buildBridgeSendMarkerContent', () => {
     // contentLength stays fingerprint-normalized (gate compares against
     // normalise(final).length); previewText keeps line breaks AND leading
     // indentation for display (indented code / nested markdown).
-    expect(buildBridgeSendMarkerContent('  hello\n  bot  ')).toEqual({
+    expect(buildBridgeSendMarkerContent('  hello\n  bot  ')).toMatchObject({
       contentLength: normalise('  hello\n  bot  ').length,
       previewText: '  hello\n  bot',
     });
@@ -417,14 +418,38 @@ describe('cross-conversation delivery boundaries', () => {
 
   it.each([
     ['cross-chat --chat-id', { deliveryKind: 'detoured_send', targetChatId: 'oc_other' }],
-    ['same-chat --into another root', {
-      deliveryKind: 'detoured_send', targetChatId: 'oc_source', targetRootMessageId: 'om_other_root',
-    }],
     ['report to an orchestrator session', {
       deliveryKind: 'dispatch_report', targetSessionId: 'session-orchestrator',
     }],
   ] as const)('keeps the source-topic final after %s', (_label, routing) => {
     expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false)).toBe(false);
+  });
+
+  it('suppresses source-topic prose after a same-chat --into final, even when the transcript is longer', () => {
+    const routing = {
+      deliveryKind: 'detoured_send' as const,
+      targetChatId: 'oc_source',
+      targetRootMessageId: 'om_other_root',
+    };
+    const long = `${finalText}${' extra transcript that was not sent.'.repeat(12)}`;
+    expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false)).toBe(true);
+    expect(shouldSuppressBridgeEmit(gate(long), 200, [marker({
+      ...routing,
+      contentLength: normalise(finalText).length,
+    })], false)).toBe(true);
+  });
+
+  it('still posts source-topic prose when the same-chat detour was only progress', () => {
+    expect(shouldSuppressBridgeEmit(gate(), 200, [marker({
+      deliveryKind: 'detoured_send',
+      targetChatId: 'oc_source',
+      targetRootMessageId: 'om_other_root',
+      responseKind: 'progress',
+    })], false)).toBe(false);
+  });
+
+  it('still posts the fallback when this turn sent no final', () => {
+    expect(shouldSuppressBridgeEmit(gate(), 200, [], false)).toBe(false);
   });
 
   it.each([
@@ -453,6 +478,32 @@ describe('cross-conversation delivery boundaries', () => {
     expect(shouldEmitEmptyCompletedBridgeFallback(
       { ...emptyGate, terminalStatus: 'completed' }, 200, [delivered], false,
     )).toBe(false);
+  });
+
+  // Transcript delivery (the default for transcript-capable CLIs): the forwarded
+  // final IS the answer, and botmux send only carries what it cannot — a
+  // cross-bot @ in another chat, a report to an orchestrator, a progress detour.
+  // Only a declared final that already answered this conversation retires it.
+  describe('under transcript delivery', () => {
+    const otherRoot = { deliveryKind: 'detoured_send', targetChatId: 'oc_source', targetRootMessageId: 'om_other_root' } as const;
+    it('a same-chat --into final already answered this conversation', () => {
+      expect(shouldSuppressBridgeEmit(gate(), 200, [marker(otherRoot)], false, 'transcript')).toBe(true);
+    });
+
+    it.each([
+      ['a cross-chat send (e.g. @-ing a bot elsewhere)', { deliveryKind: 'detoured_send', targetChatId: 'oc_other' }],
+      ['a report to an orchestrator session', { deliveryKind: 'dispatch_report', targetSessionId: 'session-orchestrator' }],
+      ['a progress-only same-chat detour', { ...otherRoot, responseKind: 'progress' }],
+    ] as const)('still forwards the source-topic final after %s', (_label, routing) => {
+      expect(shouldSuppressBridgeEmit(gate(), 200, [marker(routing)], false, 'transcript')).toBe(false);
+    });
+
+    it('a shorter progress send in this topic does not swallow the forwarded final', () => {
+      expect(shouldSuppressBridgeEmit(gate(), 200, [marker({
+        deliveryKind: 'current_session_send', targetChatId: 'oc_source', responseKind: 'progress',
+        contentLength: normalise('已收到，开始处理').length, previewText: '已收到，开始处理',
+      })], false, 'transcript')).toBe(false);
+    });
   });
 });
 
@@ -530,6 +581,262 @@ describe('worker production gate wiring', () => {
 });
 
 describe('shouldSuppressBridgeEmit', () => {
+  it('recognizes only explicit botmux-send completion narration as internal status text', () => {
+    expect(isBridgeSendCompletionNarration('已通过 botmux 发出最终结论，并已把只读 DB 查询部分交接给 Celebi。'))
+      .toBe(true);
+    expect(isBridgeSendCompletionNarration('I have sent the final answer via botmux send.'))
+      .toBe(true);
+    expect(isBridgeSendCompletionNarration('I called botmux send --response-kind final with the final reply.'))
+      .toBe(true);
+    expect(isBridgeSendCompletionNarration('botmux send --response-kind final 会写入 final marker。'))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('botmux 的最终超时配置我已经核对过，建议调到 30 秒。'))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('我回复了，用 botmux send 发的，你那边没收到吗？'))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('I used botmux to check the final result: the query returned 42 rows.'))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('I have not sent any final reply through botmux yet.'))
+      .toBe(false);
+    // Negation contractions that bare \bnot\b misses.
+    expect(isBridgeSendCompletionNarration("I haven't sent the final answer via botmux send yet."))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration("The final answer wasn't sent via botmux because it returned 500."))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('No final answer was sent via botmux; the send failed.'))
+      .toBe(false);
+    // A reported delivery failure is an alert, never a successful-delivery status.
+    expect(isBridgeSendCompletionNarration('已通过 botmux 发出最终结论，但飞书返回 400，这条没送达，请立即介入。'))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('I sent the final answer via botmux send. Note: it failed with 500.'))
+      .toBe(false);
+    expect(isBridgeSendCompletionNarration('最终答复通过 botmux 发送失败，被对方服务拒绝了。'))
+      .toBe(false);
+    // Length cap: a long self-report-shaped answer is treated as a real answer.
+    const long = '已通过 botmux 发出最终结论。' + '这是对后继问题的补充说明'.repeat(20);
+    expect(long.length).toBeGreaterThan(180);
+    expect(isBridgeSendCompletionNarration(long)).toBe(false);
+  });
+
+  it('fails open (emits) when a folded predecessor final coexists with a failure/negation report', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 220,
+      sessionId: 'session-source',
+      turnId: 'turn-original',
+      responseKind: 'final',
+      deliveryKind: 'current_session_send',
+      targetChatId: 'oc_source',
+      contentLength: 42,
+    };
+    const folded = (finalText: string) => ({
+      markTimeMs: 100,
+      isLocal: false,
+      sessionId: 'session-source',
+      turnId: 'turn-queued',
+      supersededTurns: [{ turnId: 'turn-original' }],
+      chatId: 'oc_source',
+      rootMessageId: 'om_source_root',
+      finalText,
+    });
+    // Even with a proven folded predecessor final, a failed-send / undelivered
+    // alert must reach the user rather than be swallowed as a success status.
+    expect(shouldSuppressBridgeEmit(
+      folded('已通过 botmux 发出最终结论，但飞书返回 400，这条没送达，请立即介入。'),
+      undefined, [marker], false)).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      folded('I sent the final answer via botmux send. Note: it failed with 500.'),
+      undefined, [marker], false)).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      folded("I haven't sent the final answer via botmux send yet."),
+      undefined, [marker], false)).toBe(false);
+    // The genuine post-send status line is still suppressed in the same folded setup.
+    expect(shouldSuppressBridgeEmit(
+      folded('已通过 botmux 发出最终结论，并已把只读 DB 查询部分交接给 Celebi。'),
+      undefined, [marker], false)).toBe(true);
+  });
+
+  it('suppresses send-completion narration only for a proven superseded predecessor final', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 220,
+      sessionId: 'session-source',
+      turnId: 'turn-original',
+      responseKind: 'final',
+      deliveryKind: 'current_session_send',
+      targetChatId: 'oc_source',
+      contentLength: 42,
+    };
+    const queuedTurn = {
+      markTimeMs: 100,
+      isLocal: false,
+      sessionId: 'session-source',
+      turnId: 'turn-queued',
+      supersededTurns: [{ turnId: 'turn-original' }],
+      chatId: 'oc_source',
+      rootMessageId: 'om_source_root',
+      finalText: '已通过 botmux 发出最终结论，并已把只读 DB 查询部分交接给 Celebi。',
+    };
+    expect(shouldSuppressBridgeEmit(queuedTurn, undefined, [marker], false)).toBe(true);
+
+    // No proven folding relation → the text must be delivered (no timestamp borrowing).
+    expect(shouldSuppressBridgeEmit(
+      { ...queuedTurn, supersededTurns: undefined },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    // A real short successor answer (matches neither the narration shape) stays visible.
+    expect(shouldSuppressBridgeEmit(
+      { ...queuedTurn, finalText: 'botmux 的最终超时配置我已经核对过，建议调到 30 秒。' },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      { ...queuedTurn, finalText: 'I used botmux to check the final result: the query returned 42 rows.' },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    expect(shouldSuppressBridgeEmit(
+      { ...queuedTurn, finalText: 'I have not sent any final reply through botmux yet.' },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
+  it('does not let stale, unrelated, or non-final markers explain send-completion narration', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 220,
+      sessionId: 'session-source',
+      turnId: 'turn-original',
+      responseKind: 'final',
+      deliveryKind: 'current_session_send',
+      targetChatId: 'oc_source',
+      contentLength: 42,
+    };
+    const queuedTurn = {
+      markTimeMs: 100,
+      isLocal: false,
+      sessionId: 'session-source',
+      turnId: 'turn-queued',
+      supersededTurns: [{ turnId: 'turn-original' }],
+      chatId: 'oc_source',
+      rootMessageId: 'om_source_root',
+      finalText: 'I have sent the final answer via botmux send.',
+    };
+    // Marker for an unrelated turn (not a proven predecessor).
+    expect(shouldSuppressBridgeEmit(queuedTurn, undefined, [{ ...marker, turnId: 'turn-other' }], false))
+      .toBe(false);
+    // Marker recorded in a different worker session.
+    expect(shouldSuppressBridgeEmit(queuedTurn, undefined, [{ ...marker, sessionId: 'session-other' }], false))
+      .toBe(false);
+    // Predecessor send landed BEFORE the successor input was marked (not the folded answer).
+    expect(shouldSuppressBridgeEmit(queuedTurn, undefined, [{ ...marker, sentAtMs: 90 }], false))
+      .toBe(false);
+    // Headless turn without a mark window never suppresses on this relation.
+    expect(shouldSuppressBridgeEmit(
+      { ...queuedTurn, markTimeMs: undefined },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+    // Marker at/after the next own-turn boundary does not qualify.
+    expect(shouldSuppressBridgeEmit(queuedTurn, 220, [marker], false)).toBe(false);
+    // progress / auxiliary markers are not final deliveries.
+    expect(shouldSuppressBridgeEmit(queuedTurn, undefined, [{ ...marker, responseKind: 'progress' }], false))
+      .toBe(false);
+    // Managed-card progress/auxiliary reply-card kinds never explain a final.
+    expect(shouldSuppressBridgeEmit(
+      queuedTurn,
+      undefined,
+      [{ ...marker, replyCardResponseKind: 'progress' }],
+      false,
+    )).toBe(false);
+    // terminalIndependent markers are interim side effects.
+    expect(shouldSuppressBridgeEmit(
+      queuedTurn,
+      undefined,
+      [{ ...marker, terminalIndependent: true }],
+      false,
+    )).toBe(false);
+    // A delivery into another chat/thread does not cover this conversation.
+    expect(shouldSuppressBridgeEmit(
+      queuedTurn,
+      undefined,
+      [{
+        ...marker,
+        deliveryKind: 'detoured_send',
+        targetChatId: 'oc_other',
+        targetRootMessageId: 'om_other',
+      }],
+      false,
+    )).toBe(false);
+  });
+
+  it('matches a folded predecessor by exact turn + dispatch attempt (no cross-attempt borrowing)', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 220,
+      sessionId: 'session-source',
+      turnId: 'turn-original',
+      dispatchAttempt: 0,
+      responseKind: 'final',
+      deliveryKind: 'current_session_send',
+      targetChatId: 'oc_source',
+      contentLength: 42,
+    };
+    const queuedTurn = {
+      markTimeMs: 100,
+      isLocal: false,
+      sessionId: 'session-source',
+      turnId: 'turn-queued',
+      dispatchAttempt: 1,
+      supersededTurns: [{ turnId: 'turn-original', dispatchAttempt: 0 }],
+      chatId: 'oc_source',
+      rootMessageId: 'om_source_root',
+      finalText: 'I have sent the final answer via botmux send.',
+    };
+    // Exact predecessor identity (turn-original @ attempt 0) explains the narration.
+    expect(shouldSuppressBridgeEmit(queuedTurn, undefined, [marker], false)).toBe(true);
+    // The recorded predecessor attempt differs → it is a stale marker, must not be borrowed.
+    expect(shouldSuppressBridgeEmit(
+      queuedTurn,
+      undefined,
+      [{ ...marker, dispatchAttempt: 1 }],
+      false,
+    )).toBe(false);
+    // A predecessor identity recorded without an attempt must not match an attempted marker.
+    expect(shouldSuppressBridgeEmit(
+      { ...queuedTurn, supersededTurns: [{ turnId: 'turn-original' }] },
+      undefined,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
+  it('suppresses the folded-execution self-report under transcript delivery too', () => {
+    const marker: BridgeSendMarker = {
+      sentAtMs: 220,
+      sessionId: 's1',
+      turnId: 'turn-original',
+      responseKind: 'final',
+      deliveryKind: 'current_session_send',
+      targetChatId: 'oc_1',
+      contentLength: 42,
+    };
+    const queuedTurn = {
+      markTimeMs: 100,
+      isLocal: false,
+      sessionId: 's1',
+      turnId: 'turn-queued',
+      supersededTurns: [{ turnId: 'turn-original' }],
+      chatId: 'oc_1',
+      rootMessageId: 'om_root',
+      finalText: 'I have sent the final answer via botmux send.',
+    };
+    expect(shouldSuppressBridgeEmit(queuedTurn, undefined, [marker], false, 'transcript')).toBe(true);
+  });
+
   it('compares visible marker/final lengths without memory citation metadata', () => {
     const visible = 'The answer already sent to the user.';
     const withCitation = `${visible}\n\n${memoryCitation()}`;
@@ -981,6 +1288,41 @@ describe('shouldSuppressBridgeEmit', () => {
         { markTimeMs: 100, isLocal: true, isScheduled: true },
         200, finalMarker, false,
       )).toBe(true);
+    });
+  });
+
+  describe('Claude background-task wake turns (isBackgroundWake)', () => {
+    const wake = (finalText?: string) => ({
+      markTimeMs: 100, isLocal: true, isBackgroundWake: true,
+      ...(finalText !== undefined ? { finalText } : {}),
+    });
+
+    it('transcript delivery forwards a wake turn\'s real answer', () => {
+      expect(shouldSuppressBridgeEmit(wake('CI 已全部跑完：12 项检查全绿'), 200, [], false, 'transcript')).toBe(false);
+    });
+
+    it('send delivery keeps a wake turn an ordinary suppressed local turn', () => {
+      expect(shouldSuppressBridgeEmit(wake('CI 已全部跑完：12 项检查全绿'), 200, [], false, 'send')).toBe(true);
+      expect(shouldSuppressBridgeEmit(wake('CI 已全部跑完：12 项检查全绿'), 200, [], false)).toBe(true);
+    });
+
+    it('NOTHING_TO_SEND silence still suppresses a wake turn in transcript delivery', () => {
+      expect(shouldSuppressBridgeEmit(wake(BRIDGE_NOTHING_TO_SEND_SENTINEL), 200, [], false, 'transcript')).toBe(true);
+    });
+
+    it('an explicit final botmux send in-window still dedups the wake turn', () => {
+      const body = 'CI 已全部跑完：12 项检查全绿';
+      const markers: BridgeSendMarker[] = [
+        { sentAtMs: 150, responseKind: 'final', ...buildBridgeSendMarkerContent(body)! },
+      ];
+      expect(shouldSuppressBridgeEmit(wake(body), 200, markers, false, 'transcript')).toBe(true);
+      // Pre-text: a declared final send dedups even before the text is read…
+      expect(shouldSuppressBridgeEmit(wake(), 200, markers, false, 'transcript')).toBe(true);
+      // …while a mere progress send defers the decision to the final text.
+      const progress: BridgeSendMarker[] = [
+        { sentAtMs: 150, ...buildBridgeSendMarkerContent('进展中，稍后汇报')! },
+      ];
+      expect(shouldSuppressBridgeEmit(wake(), 200, progress, false, 'transcript')).toBe(false);
     });
   });
 
@@ -1766,5 +2108,60 @@ describe('structuredFallbackKind', () => {
       false,
       false,
     )).toBe('none');
+  });
+});
+
+describe('empty completion requires delivery, not explicitly classified progress', () => {
+  const completed = {
+    ...turn(100), sessionId: 'session', turnId: 'turn', dispatchAttempt: 1,
+    terminalStatus: 'completed' as const, finalText: '',
+  };
+  const delivered: BridgeSendMarker = {
+    ...markerForContent(150, 'result'), sessionId: 'session', turnId: 'turn', dispatchAttempt: 1,
+    messageId: 'message', responseKind: 'final', deliveryKind: 'current_session_send',
+  };
+
+  it.each(['send', 'transcript'] as const)('keeps both classification and emit gates open for progress (%s)', mode => {
+    for (const marker of [
+      { ...delivered, responseKind: 'progress' as const },
+      { ...delivered, responseKind: 'auxiliary' as const },
+      { ...delivered, replyCardResponseKind: 'progress' as const },
+      { ...delivered, replyCardResponseKind: 'auxiliary' as const },
+    ]) {
+      const kind = structuredFallbackKind(completed, 200, [marker], false, true, mode);
+      expect(kind).toBe('empty_completed');
+      expect(shouldSuppressStructuredFallback(kind, completed, 200, [marker], false, mode)).toBe(false);
+    }
+  });
+
+  it('retains the real no-answer/no-send regression', () => {
+    expect(structuredFallbackKind(completed, 200, [], false, true)).toBe('empty_completed');
+  });
+
+  it('does not repost after a final, including an image-only final', () => {
+    for (const marker of [delivered, { ...delivered, contentLength: undefined, contentHash: undefined }]) {
+      expect(structuredFallbackKind(completed, 200, [marker], false, true)).toBe('none');
+    }
+  });
+
+  it('does not borrow another turn or attempt final', () => {
+    for (const marker of [{ ...delivered, turnId: 'other' }, { ...delivered, dispatchAttempt: 2 }]) {
+      expect(structuredFallbackKind(completed, 200, [marker], false, true)).toBe('empty_completed');
+    }
+  });
+
+  it('keeps legacy unclassified sends and explicit silence compatible', () => {
+    const { responseKind: _kind, ...legacy } = delivered;
+    expect(structuredFallbackKind(completed, 200, [legacy], false, true)).toBe('none');
+    const silent = { ...completed, finalText: 'BOTMUX_NOTHING_TO_SEND' };
+    expect(shouldSuppressStructuredFallback('final', silent, 200, [], false)).toBe(true);
+    expect(shouldEmitEmptyCompletedBridgeFallback(completed, 200, [], true)).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback({ ...completed, isLocal: true }, 200, [], false)).toBe(false);
+  });
+
+  it('preserves normal final text dedup independently of completion evidence', () => {
+    const progress = { ...delivered, responseKind: 'progress' as const };
+    const answer = { ...completed, finalText: 'result' };
+    expect(shouldSuppressStructuredFallback('final', answer, 200, [progress], false)).toBe(true);
   });
 });

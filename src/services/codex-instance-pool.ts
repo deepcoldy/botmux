@@ -17,7 +17,7 @@ export interface CodexInstancePool {
 }
 export interface SessionCliInstanceBindingV1 {
   version: 1;
-  source: 'pool' | 'legacy' | 'default';
+  source: 'pool' | 'legacy' | 'default' | 'goal';
   instanceId: string | null;
   cliId: 'codex';
   codexHome: string;
@@ -103,6 +103,44 @@ export function validateCodexInstanceHome(path: string, options: { requireAuth?:
   }
 }
 
+/**
+ * Read-only admission for an explicit `botmux goal run --codex-home`.
+ *
+ * Goal homes are prepared outside Botmux and may intentionally share one
+ * mode-0600 auth file through a symlink.  Keep that exception narrower than
+ * the ordinary instance-pool contract: the home itself and config must remain
+ * owned private objects, and the resolved auth target must be an owned private
+ * regular file.  No file is created or copied here.
+ */
+export function validateCodexGoalHome(path: string): string {
+  pathSyntax(path);
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077)
+        || (process.getuid && stat.uid !== process.getuid())) invalid('goal home must be an owned private directory (0700)');
+    const canonical = realpathSync(path);
+    const configPath = join(canonical, 'config.toml');
+    const config = lstatSync(configPath);
+    if (!config.isFile() || config.isSymbolicLink() || config.nlink !== 1 || (config.mode & 0o077)
+        || (process.getuid && config.uid !== process.getuid())) invalid('goal config.toml must be an owned private regular file (0600)');
+    const authPath = join(canonical, 'auth.json');
+    const authLink = lstatSync(authPath);
+    const authTargetPath = authLink.isSymbolicLink() ? realpathSync(authPath) : authPath;
+    const auth = lstatSync(authTargetPath);
+    if (!auth.isFile() || auth.isSymbolicLink() || auth.nlink !== 1 || (auth.mode & 0o077)
+        || (process.getuid && auth.uid !== process.getuid())) invalid('goal auth.json target must be an owned private regular file (0600)');
+    const parsed = JSON.parse(readFileSync(authTargetPath, 'utf8')) as { tokens?: { access_token?: unknown }; OPENAI_API_KEY?: unknown };
+    const nonempty = (value: unknown): boolean => typeof value === 'string' && value.trim().length > 0;
+    if (!parsed || (!nonempty(parsed.tokens?.access_token) && !nonempty(parsed.OPENAI_API_KEY))) {
+      invalid('goal auth.json has no credential structure');
+    }
+    return canonical;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('codexInstancePool:')) throw error;
+    invalid('goal home/config/credential is missing, unreadable or malformed');
+  }
+}
+
 export function selectWeightedCodexInstance<T extends { weight?: number }>(instances: readonly T[], rng = Math.random): T {
   if (!instances.length) invalid('no eligible random instances');
   const total = instances.reduce((sum, i) => sum + (i.weight ?? 1), 0);
@@ -174,7 +212,11 @@ export function legacyCodexInstanceBinding(session: Session, bot: BotConfig, bot
 export function codexInstanceEnv(env: NodeJS.ProcessEnv, binding?: SessionCliInstanceBindingV1): NodeJS.ProcessEnv {
   if (!binding) return { ...env };
   if (binding.version !== 1 || binding.cliId !== 'codex') invalid('unsupported binding');
-  const home = binding.source === 'legacy' ? binding.codexHome : validateCodexInstanceHome(binding.codexHome);
+  const home = binding.source === 'legacy'
+    ? binding.codexHome
+    : binding.source === 'goal'
+      ? validateCodexGoalHome(binding.codexHome)
+      : validateCodexInstanceHome(binding.codexHome);
   if (binding.source !== 'legacy' && home !== binding.codexHome) invalid('frozen instance home no longer resolves to its original directory');
   pathSyntax(home);
   const result: NodeJS.ProcessEnv = { ...env, CODEX_HOME: home };

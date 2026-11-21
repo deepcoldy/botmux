@@ -88,6 +88,25 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  // #3469: explicitly opted-in remote-runner commands use authenticated structured turns.
+  (input, legacy, next) => next.kind === 'delegated_turn'
+    && legacy.kind === 'daemon'
+    && ['/adopt', '/detach', '/disconnect'].includes(next.cmd)
+    && input.delegatedCommands?.has(next.cmd === '/disconnect' ? '/detach' : next.cmd) === true,
+
+  (input, legacy, next) => /^\s*\/modelpin(?:\s|$)/i.test(input.text)
+    && legacy.kind === 'forward' && next.kind === 'daemon' && next.cmd === '/modelpin'
+    && next.sessionPolicy === 'existing_only',
+  // /models opens the existing session's model picker; it is no longer model text.
+  (input, legacy, next) => legacy.kind === 'forward'
+    && legacy.reason === 'unknown_slash'
+    && next.kind === 'daemon' && next.cmd === '/models'
+    && next.sessionPolicy === 'sessionless',
+  // Valid Codex effort headers may include a literal task body on later lines.
+  (input, legacy, next) => ['codex', 'codex-app'].includes(input.cliId ?? '')
+    && /^\s*\/effort\s+(?:low|medium|high|xhigh|max|ultra)(?:\s|$)/i.test(input.text)
+    && legacy.kind === 'forward' && legacy.reason === 'discussion'
+    && next.kind === 'daemon' && next.cmd === '/effort' && next.sessionPolicy === 'existing_only',
   // Native Codex /effort now drives the model menu; other CLIs still pass through.
   (input, legacy, next) => input.cliId === 'codex'
     && (legacy.kind === 'passthrough' || (legacy.kind === 'forward' && legacy.reason === 'unknown_slash'))
@@ -96,6 +115,17 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
   (input, legacy, next) => legacy.kind === 'forward'
     && (legacy.reason === 'unknown_slash' || legacy.reason === 'discussion')
     && next.kind === 'daemon' && next.cmd === '/queue'
+    && next.sessionPolicy === 'existing_only',
+  // /rewind is a new existing-session daemon command; the frozen oracle treats it as unknown.
+  (input, legacy, next) => legacy.kind === 'forward'
+    && (legacy.reason === 'unknown_slash' || legacy.reason === 'discussion')
+    && next.kind === 'daemon' && next.cmd === '/rewind'
+    && next.sessionPolicy === 'existing_only',
+  // /idlecompact is a new existing-session daemon command (per-session idle
+  // auto-compact toggle); the frozen oracle treats it as unknown.
+  (input, legacy, next) => legacy.kind === 'forward'
+    && (legacy.reason === 'unknown_slash' || legacy.reason === 'discussion')
+    && next.kind === 'daemon' && next.cmd === '/idlecompact'
     && next.sessionPolicy === 'existing_only',
   // Codex App 的 /effort 由原生控制接口处理；其它 CLI 保留冻结的透传行为。
   (input, legacy, next) =>
@@ -248,6 +278,30 @@ describe('classifySlash ↔ legacySlashRoute 穷举差分', () => {
       const next = normalizeNext(classifySlash(input));
       if (INTENTIONAL.some(rule => rule(input, legacy, next))) continue; // 登记过的有意变化（PR-3 级联）
       expect(next, c.text).toEqual(legacy);
+    }
+  });
+});
+
+
+describe('remote-runner delegation oracle delta (#3469)', () => {
+  it('changes only the registered opted-in commands across entries, phases and senders', () => {
+    for (const context of ['new-topic', 'thread'] as const) {
+      for (const phase of SESSION_PHASES) {
+        const oraclePhase = toOraclePhase(phase);
+        if (!oraclePhase || (context === 'new-topic' && phase !== 'none')) continue;
+        for (const sender of SENDERS) {
+          for (const delegatedCommands of [undefined, new Set<string>(), new Set(['/adopt']), new Set(['/adopt', '/detach'])]) {
+            for (const text of ['/adopt', '/ADOPT  alpha', '/detach', '/disconnect', '/close', '/stop', '/restart', '/compact', '/model', '/fork', '/adopt <target>', '/adopt\n/detach']) {
+              const input: SlashRouteInput = { text, context, phase, cliId: 'remote-runner',
+                passthrough: BUILTIN, coldStartPassthrough: new Set(), ...sender, delegatedCommands };
+              const legacy = normalizeLegacy(legacySlashRoute({ ...input, phase: oraclePhase }));
+              const next = normalizeNext(classifySlash(input));
+              if (INTENTIONAL.some(rule => rule(input, legacy, next))) continue;
+              expect(next, JSON.stringify({ context, phase, text, sender, delegatedCommands: delegatedCommands && [...delegatedCommands] })).toEqual(legacy);
+            }
+          }
+        }
+      }
     }
   });
 });

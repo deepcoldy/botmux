@@ -13,7 +13,9 @@ describe('Codex per-Bot reasoning effort', () => {
       })),
       { larkAppId: 'codex-max', larkAppSecret: 'secret', cliId: 'codex', model: 'gpt-5.6-luna', reasoningEffort: 'max' },
       { larkAppId: 'codex-ultra', larkAppSecret: 'secret', cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' },
-      { larkAppId: 'codex-invalid-pair', larkAppSecret: 'secret', cliId: 'codex', model: 'gpt-5.4', reasoningEffort: 'ultra' },
+      // A verified table row refutes the level at load. A model without a row
+      // keeps it for the launch-time catalogue check (codex-reasoning-live-catalog.test.ts).
+      { larkAppId: 'codex-invalid-pair', larkAppSecret: 'secret', cliId: 'codex', model: 'gpt-6-luna', reasoningEffort: 'ultra' },
       {
         larkAppId: 'cli_effort_invalid',
         larkAppSecret: 'secret',
@@ -33,9 +35,10 @@ describe('Codex per-Bot reasoning effort', () => {
     const [config] = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'cli_non_codex_effort',
       larkAppSecret: 'secret',
-      cliId: 'gemini',
+      cliId: 'opencode',
       reasoningEffort: 'high',
     }]));
+    expect(config?.cliId).toBe('opencode');
     expect(config?.reasoningEffort).toBeUndefined();
   });
 

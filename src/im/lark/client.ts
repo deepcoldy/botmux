@@ -1,11 +1,13 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
-import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
-import { dirname, extname, basename, join } from 'node:path';
+import { closeSync, constants as fsConstants, openSync, readFileSync, writeFileSync, createWriteStream, createReadStream, mkdirSync, mkdtempSync, rmSync, statSync, existsSync, lstatSync, renameSync, unlinkSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, extname, basename, join, sep } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { getBotClient, getBotUploadClient, getAllBots, getBot, formatLarkError, LarkTransportDisabledError } from '../../bot-registry.js';
-import { loadBotConfigs } from '../../bot-registry.js';
+import { loadBotConfigs, LARK_REQUEST_TIMEOUT_MS } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
@@ -14,19 +16,26 @@ import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { getGroupContextSettings } from '../../services/group-context-settings-store.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry } from '../../services/bots-info-shape.js';
 import type { GroupContextDeliveryBinding } from '../../services/group-context-delivery-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
+import { prepareLocalAddressContent, sanitizeLocalAddressNode } from './local-address-policy.js';
+import { linkFieldContext } from './local-address-context.js';
 import { executeWithLarkGate } from './api-gate.js';
+import { readMessageWithinContext } from './message-read-context.js';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
   LARK_CODE_CONTACT_INVALID_PARAM,
   LARK_CODE_CONTACT_NO_SUCH_USER,
   LARK_CODE_CONTACT_NOT_VISIBLE,
   LARK_CODE_CROSS_APP_OPEN_ID,
+  LARK_CODE_EPHEMERAL_DELETED,
   LARK_CODE_EPHEMERAL_NOT_GROUP,
+  LARK_CODE_MESSAGE_DELETED,
+  LARK_CODE_MESSAGE_RECALL_EXPIRED,
   LARK_CODE_MESSAGE_UPDATE_EXPIRED,
   LARK_CODE_MESSAGE_WITHDRAWN,
   LARK_CODE_USER_SCOPE_MISSING,
@@ -36,7 +45,8 @@ import {
   type DefinitiveContactErrorCode,
 } from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
-import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
+import { downloadResourceWithRange, getResourceErrorCode, isResourceSizeLimitError, LARK_RESOURCE_SIZE_LIMIT_CODE, type ResourceStream } from './resource-range-download.js';
+import { fdWriteAll } from './async-fd.js';
 
 // larkGet lives in a dependency-free module so setup/owner-identity.ts (shared
 // by every onboarding / allowedUsers write path) can use the same no-body GET
@@ -234,8 +244,9 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  * chars, 1-hour TTL — see spike report §1.2).  When supplied, the Feishu
  * server returns the original message_id for repeat requests within TTL,
  * making the send idempotent.  Workflow runtime passes the attempt's
- * idempotencyKey here so retries don't re-send.  Existing callers omit
- * the param and get exactly the pre-Step-6 behavior.
+ * idempotencyKey here so retries don't re-send.  Callers that omit the param
+ * still get a per-call generated token (see {@link dedupeUuid}) so api-gate
+ * retries inside this call cannot post the message twice.
  */
 export interface OutboundMessageOptions {
   /** Revalidate the frozen source immediately before every provider attempt. */
@@ -338,6 +349,17 @@ async function recordPublishedGroupContext(larkAppId: string, data: any, body: s
   } catch { logger.warn('[group-context] outbound observation failed; publication remains successful'); }
 }
 
+/**
+ * Dedupe token for one logical send. The api-gate re-runs the whole closure on
+ * 429/5xx/network errors, and a request that landed server-side before the
+ * response was lost would be posted a second time. Generating the token OUTSIDE
+ * the closure keeps it stable across gate retries so Feishu returns the original
+ * message_id. Caller-supplied uuids win; the generated one is never exposed to hooks.
+ */
+function dedupeUuid(uuid?: string): string {
+  return uuid || randomUUID();
+}
+
 export async function sendMessage(
   larkAppId: string,
   chatId: string,
@@ -348,6 +370,8 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
     // A retry gets a new cache after the gate wait, never a previous attempt's
     // available result. Destination and source checks may share this lookup.
@@ -366,7 +390,7 @@ export async function sendMessage(
           receive_id: chatId,
           msg_type: msgType as any,
           content: body,
-          ...(uuid ? { uuid } : {}),
+          uuid: wireUuid,
         },
       });
     } catch (err: any) {
@@ -413,10 +437,13 @@ export async function replyMessage(
   replyInThread: boolean = false,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: OutboundMessageOptions,
+  options?: OutboundMessageOptions & { onAttemptStart?: () => void },
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
+    options?.onAttemptStart?.();
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
     // The source/authority fence follows the awaited destination lookup.
@@ -434,7 +461,7 @@ export async function replyMessage(
           msg_type: msgType as any,
           content: body,
           ...(replyInThread ? { reply_in_thread: true } : {}),
-          ...(uuid ? { uuid } : {}),
+          uuid: wireUuid,
         },
       });
     } catch (err: any) {
@@ -520,6 +547,24 @@ export async function urgentMessage(
  * Emits no outbound hook (same as {@link sendUserMessage}): the hook event
  * union is closed and a forward is not one of its members.
  */
+/** Merge up to 100 original messages using Lark's native forwarding API. */
+export async function mergeForwardMessages(larkAppId: string, messageIds: string[], chatId: string, uuid?: string): Promise<{ messageId: string; invalidMessageIds: string[] }> {
+  assertLarkTransport(larkAppId, 'mergeForwardMessages');
+  if (!messageIds.length || messageIds.length > 100) throw new Error('Merge forwarding requires 1–100 messages');
+  const wireUuid = dedupeUuid(uuid);
+  return executeWithLarkGate(larkAppId, 'mergeForwardMessages', async () => {
+    for (const id of messageIds) await assertMessageWriteAllowed(larkAppId, id);
+    const response = await getBotClient(larkAppId).im.v1.message.mergeForward({
+      params: { receive_id_type: 'chat_id', uuid: wireUuid },
+      data: { receive_id: chatId, message_id_list: messageIds },
+    });
+    if (response.code !== 0) throw larkApiError('merge forward messages', response);
+    const messageId = response.data?.message?.message_id;
+    if (!messageId) throw new Error('No message_id in merge forward response');
+    return { messageId, invalidMessageIds: response.data?.invalid_message_id_list ?? [] };
+  });
+}
+
 export async function forwardMessage(
   larkAppId: string,
   messageId: string,
@@ -527,6 +572,7 @@ export async function forwardMessage(
   uuid?: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'forwardMessage');
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'forwardMessage', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
@@ -535,7 +581,7 @@ export async function forwardMessage(
       res = await (c as any).im.v1.message.forward({
         path: { message_id: messageId },
         // NOTE: forward takes `uuid` in params (not data) — unlike create/reply.
-        params: { receive_id_type: 'chat_id', ...(uuid ? { uuid } : {}) },
+        params: { receive_id_type: 'chat_id', uuid: wireUuid },
         data: { receive_id: chatId },
       });
     } catch (err: any) {
@@ -778,12 +824,17 @@ export async function sendUserMessage(
   msgType: string = 'text',
   uuid?: string,
   requestOptions?: LarkRequestOptions,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(
     larkAppId,
     'sendUserMessage',
     async () => {
+      // The permission proof must follow every gate wait, including retries.
+      if (options?.beforeWrite) await options.beforeWrite();
       const c = getBotClient(larkAppId);
       // Stamp callback-button ownership markers on interactive DMs too: this is the
       // FIFTH card egress surface (config / write-link / substitute / overload / …
@@ -800,7 +851,7 @@ export async function sendUserMessage(
         receive_id: openId,
         msg_type: msgType as any,
         content: body,
-        ...(uuid ? { uuid } : {}),
+        uuid: wireUuid,
       };
 
       const res = requestOptions
@@ -897,8 +948,111 @@ export async function listChatUserMembers(larkAppId: string, chatId: string): Pr
   return members;
 }
 
+export async function isBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'isBotInChat');
+  return executeWithLarkGate(larkAppId, 'isBotInChat', async () => {
+    const response = await larkGet(getBotClient(larkAppId), `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+    if (response.code !== 0 || typeof response.data?.is_in_chat !== 'boolean') throw larkApiError('check bot membership', response);
+    return response.data.is_in_chat;
+  });
+}
+
+/** Strict membership probe for a configured bot, including another daemon's bot. */
+export async function isConfiguredBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'isConfiguredBotInChat');
+  // Each daemon registers only its own bot. Use the existing credential-aware
+  // probe cache without registering another daemon's bot in this process.
+  const entry = getAllBotClients({ refresh: true }).find(bot => bot.appId === larkAppId);
+  if (!entry) throw new Error(`Bot not configured for Lark: ${larkAppId}`);
+  return executeWithLarkGate(larkAppId, 'isConfiguredBotInChat', async () => {
+    const response = await larkGet(
+      entry.client,
+      `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`,
+      {},
+      // Probe clients do not inherit the registry client's axios timeout.
+      { timeoutMs: LARK_REQUEST_TIMEOUT_MS },
+    );
+    if (response.code !== 0 || typeof response.data?.is_in_chat !== 'boolean') throw larkApiError('check bot membership', response);
+    return response.data.is_in_chat;
+  });
+}
+
 export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
   return (await listChatUserMembers(larkAppId, chatId)).map(member => member.openId);
+}
+
+/** Pages {@link findCurrentChatUserMembers} reads before giving up (100/page). */
+export const CURRENT_CHAT_USER_MEMBER_PAGE_CAP = 100;
+
+/** The member list was still `has_more` at the page cap with someone unconfirmed. */
+export class ChatMemberListTooLargeError extends Error {
+  constructor(chatId: string) {
+    super(
+      `Chat ${chatId} has more than ${CURRENT_CHAT_USER_MEMBER_PAGE_CAP * 100} members; `
+      + 'could not read the member list to the end to rule anyone out',
+    );
+    this.name = 'ChatMemberListTooLargeError';
+  }
+}
+
+/**
+ * Authorization-grade: which of `openIds` are current human members of the
+ * chat, per `larkAppId`'s live `/members` list (app-scoped open_ids; the list
+ * never contains bots). Stops paging as soon as everyone is found — a row in
+ * any live page proves membership — but only rules someone out after reading
+ * the list to the end. Anything that would make the list look shorter than it
+ * is throws instead: an API error, a page without an `items` array, a
+ * non-boolean `has_more`, `has_more` without a fresh page token (missing or
+ * already used), or hitting the page cap ({@link ChatMemberListTooLargeError}).
+ * Unlike {@link listChatUserMembers} it never returns a silently partial list.
+ */
+export async function findCurrentChatUserMembers(
+  larkAppId: string,
+  chatId: string,
+  openIds: readonly string[],
+): Promise<Set<string>> {
+  if (openIds.length === 0) return new Set();
+  const c = getBotClient(larkAppId);
+  return scanChatMemberPages(chatId, openIds, pageToken => larkGet(
+    c,
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members`,
+    { member_id_type: 'open_id', page_size: '100', ...(pageToken ? { page_token: pageToken } : {}) },
+  ));
+}
+
+/** The paging rules of {@link findCurrentChatUserMembers}, over any page source. */
+export async function scanChatMemberPages(
+  chatId: string,
+  openIds: readonly string[],
+  fetchPage: (pageToken: string | undefined) => Promise<any>,
+): Promise<Set<string>> {
+  const wanted = new Set(openIds);
+  const found = new Set<string>();
+  if (wanted.size === 0) return found;
+  const usedTokens = new Set<string>();
+  let pageToken: string | undefined;
+  for (let page = 0; page < CURRENT_CHAT_USER_MEMBER_PAGE_CAP; page++) {
+    const res = await fetchPage(pageToken);
+    if (res?.code !== 0) throw larkApiError('list chat members', res);
+    const items = res.data?.items;
+    if (!Array.isArray(items)) throw new Error(`list chat members: page ${page + 1} has no items array`);
+    for (const it of items) {
+      const id = it?.member_id;
+      if (typeof id === 'string' && wanted.has(id)) found.add(id);
+    }
+    if (found.size === wanted.size) return found;
+    const hasMore = res.data?.has_more;
+    if (typeof hasMore !== 'boolean') throw new Error(`list chat members: page ${page + 1} has no boolean has_more`);
+    if (!hasMore) return found;
+    const next = res.data?.page_token;
+    if (typeof next !== 'string' || !next) {
+      throw new Error(`list chat members: page ${page + 1} has more members but no page_token`);
+    }
+    if (usedTokens.has(next)) throw new Error(`list chat members: page ${page + 1} repeats an earlier page_token`);
+    usedTokens.add(next);
+    pageToken = next;
+  }
+  throw new ChatMemberListTooLargeError(chatId);
 }
 
 /**
@@ -949,7 +1103,7 @@ export async function getChatContext(larkAppId: string, chatId: string): Promise
     else mode = 'unknown';
 
     if (mode !== 'unknown') {
-      chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+      chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now(), strict: true });
     } else {
       logger.warn(`getChatContext(${chatId}) unrecognized chat_mode='${rawMode}'`);
     }
@@ -1036,7 +1190,12 @@ export async function getChatNameAndMode(
  *                perspective (chat-scope by default) */
 export type ChatMode = 'group' | 'topic' | 'p2p';
 
-const chatModeCache = new BoundedMap<string, { mode: ChatMode; cachedAt: number }>(1000);
+/** `strict` records provenance: true only when the mode came from a successful
+ *  chat.get classification (getChatModeStrict / getChatContext). getChatMode's
+ *  lenient `unknown → group` fallback stores strict:false so callers that need
+ *  proof (e.g. the substitute-card topicGroups gate) never treat a failed
+ *  lookup as a confirmed flat group. */
+const chatModeCache = new BoundedMap<string, { mode: ChatMode; cachedAt: number; strict: boolean }>(1000);
 const CHAT_MODE_TTL_MS = 5 * 60 * 1000; // 5 min — chat_mode can change when a group is converted to topic mode
 
 /** Resolve the conversational topology of a chat (话题群 vs 普通群 vs p2p).
@@ -1089,7 +1248,7 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
       logger.warn(`getChatModeStrict(${chatId}) unrecognized chat_mode='${rawMode}' — returning 'unknown'`);
       return 'unknown';
     }
-    chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+    chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now(), strict: true });
     return mode;
   } catch (err: any) {
     logger.warn(`getChatModeStrict(${chatId}) errored: ${err?.message ?? err}`);
@@ -1100,6 +1259,15 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
 export function getCachedChatMode(larkAppId: string, chatId: string): ChatMode | undefined {
   const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
   if (cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
+  return undefined;
+}
+
+/** Like {@link getCachedChatMode}, but only returns modes proven by a successful
+ *  strict chat.get. A lenient `unknown → group` fallback is never evidence that
+ *  the chat is flat, so feature gates that must fail closed use this. */
+export function getCachedChatModeStrict(larkAppId: string, chatId: string): ChatMode | undefined {
+  const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
+  if (cached && cached.strict && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
   return undefined;
 }
 
@@ -1120,7 +1288,7 @@ export async function getChatMode(
   if (strict !== 'unknown') return strict;
   const mode: ChatMode = 'group';
   logger.warn(`getChatMode(${chatId}) unconfirmed; falling back to 'group'`);
-  chatModeCache.set(cacheKey, { mode, cachedAt: Date.now() });
+  chatModeCache.set(cacheKey, { mode, cachedAt: Date.now(), strict: false });
   return mode;
 }
 
@@ -1128,24 +1296,38 @@ export async function getChatMode(
  * Recall (delete) a message. Returns `true` only when Lark confirms success,
  * `false` on SDK throw or a non-zero response code — so callers that need to
  * know whether the withdraw actually happened (e.g. grant-card withdraw) can
- * fall back instead of assuming success. Fire-and-forget callers can ignore it.
+ * fall back instead of assuming success. Recovery callers can accept an explicit
+ * already-withdrawn response or supply a fallback when the recall window expires.
  */
-export async function deleteMessage(larkAppId: string, messageId: string): Promise<boolean> {
+export async function deleteMessage(
+  larkAppId: string,
+  messageId: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'> & { acceptWithdrawn?: boolean; onRecallExpired?: () => Promise<void> },
+): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteMessage');
-  return executeWithLarkGate(larkAppId, 'deleteMessage', async () => {
+  const outcomeFor = (code: number | undefined) => {
+    if (code === LARK_CODE_MESSAGE_RECALL_EXPIRED) return 'expired';
+    return !!options?.acceptWithdrawn && (code === LARK_CODE_MESSAGE_WITHDRAWN || code === LARK_CODE_MESSAGE_DELETED);
+  };
+  const outcome = await executeWithLarkGate(larkAppId, 'deleteMessage', async () => {
     const c = getBotClient(larkAppId);
     try {
+      if (options?.beforeWrite) await options.beforeWrite();
       const res: any = await c.im.v1.message.delete({ path: { message_id: messageId } });
       if (res && typeof res.code === 'number' && res.code !== 0) {
         logger.debug(`Delete message ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
-        return false;
+        return outcomeFor(res.code);
       }
       return true;
     } catch (err) {
       logger.debug(`Failed to delete message ${messageId}: ${err}`);
-      return false;
+      return outcomeFor(getLarkErrorCode(err));
     }
   });
+  if (outcome !== 'expired') return outcome;
+  if (!options?.onRecallExpired) return false;
+  await options.onRecallExpired();
+  return true;
 }
 
 export interface LarkPinRecord {
@@ -1275,8 +1457,10 @@ export async function unpinMessage(larkAppId: string, messageId: string): Promis
  */
 export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'sendEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
     let card: unknown;
@@ -1285,6 +1469,7 @@ export async function sendEphemeralCard(
     } catch (err) {
       throw new Error(`Invalid ephemeral card JSON: ${err}`);
     }
+    if (options?.beforeWrite) await options.beforeWrite();
     const res: any = await (c as any).request({
       method: 'POST',
       url: '/open-apis/ephemeral/v1/send',
@@ -1308,7 +1493,7 @@ export async function sendEphemeralCard(
  * is a cosmetic issue, not a correctness one, and the caller has already sent the
  * replacement by the time cleanup runs.
  */
-export async function deleteEphemeralCard(larkAppId: string, messageId: string): Promise<boolean> {
+export async function deleteEphemeralCard(larkAppId: string, messageId: string, options?: { acceptWithdrawn?: boolean }): Promise<boolean> {
   assertLarkTransport(larkAppId, 'deleteEphemeralCard');
   return executeWithLarkGate(larkAppId, 'deleteEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
@@ -1319,11 +1504,13 @@ export async function deleteEphemeralCard(larkAppId: string, messageId: string):
         data: { message_id: messageId },
       });
       if (res && typeof res.code === 'number' && res.code !== 0) {
+        if (options?.acceptWithdrawn && res.code === LARK_CODE_EPHEMERAL_DELETED) return true;
         logger.debug(`Delete ephemeral card ${messageId} returned non-zero code: ${res.code} ${res.msg ?? ''}`);
         return false;
       }
       return true;
     } catch (err) {
+      if (options?.acceptWithdrawn && getLarkErrorCode(err) === LARK_CODE_EPHEMERAL_DELETED) return true;
       logger.debug(`Failed to delete ephemeral card ${messageId}: ${err}`);
       return false;
     }
@@ -1342,6 +1529,7 @@ export async function updateMessage(
   const beforeWrite = typeof optionsOrAck === 'object' ? optionsOrAck.beforeWrite : undefined;
   const returnAcknowledgement = optionsOrAck === true || (typeof optionsOrAck === 'object' && optionsOrAck.returnAcknowledgement === true);
   assertLarkTransport(larkAppId, 'updateMessage');
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
@@ -1412,6 +1600,31 @@ export async function resolveCardKitId(larkAppId: string, messageId: string): Pr
   });
 }
 
+/** Sequenced whole-card updates prevent a delayed pre-restart frame overwriting a newer status. */
+export async function updateCardJson(larkAppId: string, cardId: string, messageId: string, content: string,
+  sequence: number, uuid: string, options?: OutboundMessageOptions): Promise<void> {
+  assertLarkTransport(larkAppId, 'updateCardJson');
+  content = prepareLocalAddressContent(content, 'interactive', linkFieldContext(larkAppId));
+  return executeWithLarkGate(larkAppId, 'updateCardJson', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    if (options?.beforeWrite) await options.beforeWrite();
+    let response: any;
+    try {
+      response = await getBotClient(larkAppId).cardkit.v1.card.update({
+        path: { card_id: cardId }, data: { card: { type: 'card_json', data: content }, sequence, uuid },
+      });
+    } catch (err) {
+      // Same withdrawn signal resolveCardKitId maps for the CardKit API.
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw err;
+    }
+    if (response.code !== 0) {
+      if (response.code === LARK_CODE_MESSAGE_WITHDRAWN) throw withdrawnWriteError(larkAppId, messageId);
+      throw larkApiError('update CardKit card', response);
+    }
+  });
+}
+
 /** Enable/finalize native CardKit streaming without replacing the whole card. */
 export async function updateCardStreamingSettings(
   larkAppId: string,
@@ -1419,6 +1632,7 @@ export async function updateCardStreamingSettings(
   settings: CardStreamingSettings,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'updateCardStreamingSettings');
+  settings = sanitizeLocalAddressNode(settings, linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'updateCardStreamingSettings', async () => {
     await assertMessageWriteAllowed(larkAppId, settings.messageId);
     const c = getBotClient(larkAppId);
@@ -1482,6 +1696,7 @@ export async function patchCardStreamElement(
   messageId?: string,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'patchCardStreamElement');
+  partialElement = sanitizeLocalAddressNode(partialElement, linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'patchCardStreamElement', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
@@ -1495,31 +1710,156 @@ export async function patchCardStreamElement(
   });
 }
 
+/** Element-level writes bypass the whole-card egress, so stamp their callback
+ * buttons here the same way (the parser drops stamped buttons from flattened
+ * text read by other bots). */
+function stampedCardNode(node: Record<string, unknown>): Record<string, unknown> {
+  return JSON.parse(stampBotmuxCallbackMarkers(JSON.stringify(node))) as Record<string, unknown>;
+}
+
+/** Insert elements into an existing CardKit card (element-level; the rest of
+ * the card, including a normalized answer body, is left untouched). */
+export async function insertCardElements(
+  larkAppId: string,
+  cardId: string,
+  placement: { type: 'insert_before' | 'insert_after'; targetElementId: string } | { type: 'append' },
+  elements: Record<string, unknown>[],
+  sequence: number,
+  uuid: string,
+  messageId?: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'insertCardElements');
+  elements = elements.map(element => stampedCardNode(sanitizeLocalAddressNode(element, linkFieldContext(larkAppId))));
+  return executeWithLarkGate(larkAppId, 'insertCardElements', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const res: any = await getBotClient(larkAppId).cardkit.v1.cardElement.create({
+      path: { card_id: cardId },
+      data: {
+        type: placement.type,
+        ...(placement.type === 'append' ? {} : { target_element_id: placement.targetElementId }),
+        elements: JSON.stringify(elements),
+        sequence,
+        uuid,
+      },
+    });
+    if (res.code !== 0) throw larkApiError('insert CardKit elements', res);
+  });
+}
+
+/** Replace one existing CardKit element as a whole, keeping its element id. */
+export async function replaceCardElement(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  element: Record<string, unknown>,
+  sequence: number,
+  uuid: string,
+  messageId?: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'replaceCardElement');
+  element = stampedCardNode(sanitizeLocalAddressNode(element, linkFieldContext(larkAppId)));
+  return executeWithLarkGate(larkAppId, 'replaceCardElement', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const res: any = await getBotClient(larkAppId).cardkit.v1.cardElement.update({
+      path: { card_id: cardId, element_id: elementId },
+      data: { element: JSON.stringify(element), sequence, uuid },
+    });
+    if (res.code !== 0) throw larkApiError('replace CardKit element', res);
+  });
+}
+
+/** Remove one element from an existing CardKit card. */
+export async function deleteCardElement(
+  larkAppId: string,
+  cardId: string,
+  elementId: string,
+  sequence: number,
+  uuid: string,
+  messageId?: string,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'deleteCardElement');
+  return executeWithLarkGate(larkAppId, 'deleteCardElement', async () => {
+    await assertMessageWriteAllowed(larkAppId, messageId);
+    const res: any = await getBotClient(larkAppId).cardkit.v1.cardElement.delete({
+      path: { card_id: cardId, element_id: elementId },
+      data: { sequence, uuid },
+    });
+    if (res.code !== 0) throw larkApiError('delete CardKit element', res);
+  });
+}
+
 export async function getMessageDetail(
   larkAppId: string,
   messageId: string,
-  options: { userCardContent?: boolean } & LarkRequestOptions = {},
+  options: { userCardContent?: boolean; userIdType?: 'open_id' } & LarkRequestOptions = {},
 ): Promise<any> {
-  const c = getBotClient(larkAppId);
-  // card_msg_content_type=user_card_content returns the original card JSON
-  // (including v2 schema/body/elements) instead of Lark's simplified fallback
-  // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
-  // fetches, but merge_forward enumeration MUST pass false — Lark returns
-  // HTTP 500 when the param is combined with a merge_forward message_id.
-  // Without the param, sub-messages still come back in the "Format A"
-  // simplified card shape which extractCardContent handles.
-  const userCardContent = options.userCardContent ?? true;
-  const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
-    ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
-    // Opt into server-side sender names (sender_name / sender_i18n_names, for
-    // user AND bot senders); without it the server omits them. Matters here for
-    // merge_forward sub-messages, whose senders appear nowhere else.
-    with_sender_name: 'true',
-  }, options);
-  if (res.code !== 0) {
-    throw larkApiError('get message', res);
+  const key = options.signal ? undefined : JSON.stringify([larkAppId, messageId, options.userCardContent ?? true, options.timeoutMs ?? null, options.userIdType ?? null]);
+  return readMessageWithinContext(key, async () => {
+    const c = getBotClient(larkAppId);
+    // card_msg_content_type=user_card_content returns the original card JSON
+    // (including v2 schema/body/elements) instead of Lark's simplified fallback
+    // ("请升级至最新版本客户端，以查看内容"). We default to true for single-message
+    // fetches, but merge_forward enumeration MUST pass false — Lark returns
+    // HTTP 500 when the param is combined with a merge_forward message_id.
+    // Without the param, sub-messages still come back in the "Format A"
+    // simplified card shape which extractCardContent handles.
+    const userCardContent = options.userCardContent ?? true;
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      ...(userCardContent ? { card_msg_content_type: 'user_card_content' } : {}),
+      // Opt into server-side sender names (sender_name / sender_i18n_names, for
+      // user AND bot senders); without it the server omits them. Matters here for
+      // merge_forward sub-messages, whose senders appear nowhere else.
+      with_sender_name: 'true',
+      ...(options.userIdType ? { user_id_type: options.userIdType } : {}),
+    }, options);
+    if (res.code !== 0) {
+      throw larkApiError('get message', res);
+    }
+    return res.data;
+  });
+
+}
+
+/** Parse the sender union_id from an IM message fetched with
+ * `user_id_type=union_id`. Kept pure so malformed provider responses can be
+ * tested without mocking the Lark SDK. */
+export function messageSenderUnionIdFromDetail(detail: unknown): string | null {
+  const item = (detail as { items?: unknown[] } | null)?.items?.[0] as {
+    sender?: { sender_type?: unknown; id_type?: unknown; id?: unknown };
+  } | undefined;
+  const sender = item?.sender;
+  const unionId = typeof sender?.id === 'string' ? sender.id.trim() : '';
+  if (sender?.sender_type !== 'user'
+    || sender.id_type !== 'union_id'
+    || !/^on_[A-Za-z0-9_-]{4,128}$/.test(unionId)) return null;
+  return unionId;
+}
+
+/**
+ * Recover the tenant-stable sender identity for one exact inbound message.
+ * Lark sometimes omits union_id from the event envelope while the message API
+ * can still return the same sender directly in union-id form.
+ */
+export async function resolveMessageSenderUnionId(
+  larkAppId: string,
+  messageId: string,
+): Promise<string | null> {
+  if (!messageId.startsWith('om_')) return null;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      user_id_type: 'union_id',
+      with_sender_name: 'false',
+    }, { timeoutMs: 2_000 });
+    if (res?.code !== 0) return null;
+    return messageSenderUnionIdFromDetail(res.data);
+  } catch (err) {
+    logger.debug(
+      `[union_id] message sender resolve failed for ${messageId.substring(0, 12)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
   }
-  return res.data;
 }
 
 /** Resolve a message's chat without collapsing provider failures into absence.
@@ -1600,7 +1940,7 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean; fallbackMessageIds?: readonly string[]; withinRoot?: string }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
@@ -1610,41 +1950,74 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   // Feishu downloads video bodies through the file endpoint.
   const apiType = type === 'video' ? 'file' : type;
   const dir = dirname(savePath);
+  // The attachment bucket is writable from inside the file sandbox, so the
+  // directory, an ancestor (attachments/<appId>) or the file name may be a
+  // planted symlink. Check containment BEFORE mkdir (mkdir -p would otherwise
+  // create the message directory wherever a planted ancestor points), refuse a
+  // symlinked directory, remember which directory was validated, and land the
+  // bytes via rename only into that same directory (identity + containment are
+  // re-checked right before the rename — the network wait is the attacker's window).
+  // The root itself (<dataDir>/attachments) is host-owned and may not exist yet.
+  if (options?.withinRoot && !existsSync(options.withinRoot)) mkdirSync(options.withinRoot, { recursive: true });
+  const root = options?.withinRoot ? realpathSync(options.withinRoot) : undefined;
+  if (root) assertExistingAncestorWithinRoot(dir, root);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
   }
+  const dirInfo = lstatSync(dir);
+  if (dirInfo.isSymbolicLink() || !dirInfo.isDirectory()) {
+    throw new Error(`Refusing to download into a non-directory: ${dir}`);
+  }
+  if (root) assertWithinRoot(realpathSync(dir), root, dir);
+  const guard: DownloadDirGuard = { dev: dirInfo.dev, ino: dirInfo.ino, ...(root ? { root } : {}) };
 
-  // Try App Token first
-  try {
-    await downloadWithAppToken(larkAppId, messageId, fileKey, apiType, savePath);
-    logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
-    return;
-  } catch (appErr: any) {
-    // 234037 is a transfer-size limit, not an identity/permission failure.
-    // Retry with the SAME app token, including passive-history downloads.
-    // A failed Range transfer must propagate, never turn into a /login prompt.
-    if (await isResourceSizeLimitError(appErr)) {
-      const c = getBotClient(larkAppId);
-      await downloadResourceWithRange((start, end) => (c as any).request({
-        method: 'GET',
-        url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(fileKey)}`,
-        params: { type },
-        headers: { Range: `bytes=${start}-${end}` },
-        responseType: 'stream',
-        timeout: 30_000,
-      }), savePath);
-      logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via App Token Range)`);
+  // Resolve resource ownership with the same app identity before borrowing a
+  // user's token. A forward's outer ID, owning leaf and enclosing forward can
+  // differ; retry only the IDs supplied by its parsed message tree.
+  const messageIds = [...new Set([messageId, ...(options?.fallbackMessageIds ?? [])])];
+  let resourceMessageId = messageId;
+  for (const [index, candidateId] of messageIds.entries()) {
+    resourceMessageId = candidateId;
+    try {
+      await downloadWithAppToken(larkAppId, resourceMessageId, fileKey, apiType, savePath, guard);
+      logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
       return;
+    } catch (appErr: any) {
+      // SDK errors can contain a one-shot JSON stream. Decode it once for both
+      // ownership and size classification.
+      const errorCode = await getResourceErrorCode(appErr);
+      if (errorCode === 234003) {
+        if (index + 1 < messageIds.length) continue;
+        // "File not in msg." is not evidence that a personal token is missing.
+        throw appErr;
+      }
+      // 234037 is a transfer-size limit, not an identity/permission failure.
+      // Retry with the SAME app token, including passive-history downloads.
+      // A failed Range transfer must propagate, never turn into a /login prompt.
+      if (errorCode === LARK_RESOURCE_SIZE_LIMIT_CODE) {
+        const c = getBotClient(larkAppId);
+        await downloadResourceWithRange((start, end) => (c as any).request({
+          method: 'GET',
+          url: `/open-apis/im/v1/messages/${encodeURIComponent(resourceMessageId)}/resources/${encodeURIComponent(fileKey)}`,
+          params: { type: apiType },
+          headers: { Range: `bytes=${start}-${end}` },
+          responseType: 'stream',
+          timeout: 30_000,
+        }), savePath, guard);
+        logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via App Token Range)`);
+        return;
+      }
+      // Passive history is only entitled to the observing app's visibility.
+      // It must never borrow a historical sender's OAuth credentials.
+      if (options?.allowUserTokenFallback === false) throw appErr;
+      // AxiosError status can be at various paths depending on SDK version
+      const status = appErr?.response?.status ?? appErr?.response?.statusCode
+        ?? appErr?.status ?? appErr?.statusCode;
+      // Only fall through to User Token for 400/403; other errors (network, etc.) re-throw
+      if (status && status !== 400 && status !== 403) throw appErr;
+      logger.debug(`App Token download failed (${status ?? 'unknown'}), trying User Token fallback...`);
+      break;
     }
-    // Passive history is only entitled to the observing app's visibility.
-    // It must never borrow a historical sender's OAuth credentials.
-    if (options?.allowUserTokenFallback === false) throw appErr;
-    // AxiosError status can be at various paths depending on SDK version
-    const status = appErr?.response?.status ?? appErr?.response?.statusCode
-      ?? appErr?.status ?? appErr?.statusCode;
-    // Only fall through to User Token for 400/403; other errors (network, etc.) re-throw
-    if (status && status !== 400 && status !== 403) throw appErr;
-    logger.debug(`App Token download failed (${status ?? 'unknown'}), trying User Token fallback...`);
   }
 
   // Fallback: User Token from botmux OAuth (/login)
@@ -1668,11 +2041,43 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     );
   }
 
-  await downloadWithUserToken(userToken, messageId, fileKey, apiType, savePath, brand);
+  await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand, guard);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
-async function downloadWithAppToken(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string): Promise<void> {
+/** The directory a download was validated against: same inode at rename time,
+ *  and (when confined) still resolving under the attachment root. */
+export interface DownloadDirGuard { dev: number; ino: number; root?: string }
+
+function assertWithinRoot(real: string, root: string, shown: string): void {
+  if (real !== root && !real.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)) {
+    throw new Error(`Refusing to download outside ${root}: ${shown}`);
+  }
+}
+
+/** Containment of the deepest EXISTING ancestor of `dir`, so mkdir -p cannot be
+ *  steered through a planted symlink higher up (attachments/<appId>). */
+function assertExistingAncestorWithinRoot(dir: string, root: string): void {
+  let probe = dir;
+  while (!existsSync(probe)) {
+    const parent = dirname(probe);
+    if (parent === probe) break;
+    probe = parent;
+  }
+  assertWithinRoot(realpathSync(probe), root, dir);
+}
+
+/** Re-check the validated directory right before publishing a file into it. */
+export function assertDownloadDirUnchanged(dir: string, guard: DownloadDirGuard | undefined): void {
+  if (!guard) return;
+  const st = lstatSync(dir);
+  if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== guard.dev || st.ino !== guard.ino) {
+    throw new Error(`Download directory changed while writing: ${dir}`);
+  }
+  if (guard.root) assertWithinRoot(realpathSync(dir), guard.root, dir);
+}
+
+async function downloadWithAppToken(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, guard?: DownloadDirGuard): Promise<void> {
   const c = getBotClient(larkAppId);
   // Route through client.request() (empty-GET-body guard) instead of the
   // generated messageResource.get, which sends `{}` as a GET body and trips
@@ -1684,10 +2089,10 @@ async function downloadWithAppToken(larkAppId: string, messageId: string, fileKe
     params: { type },
     responseType: 'stream',
   });
-  await writeResourceToDisk(res, savePath);
+  await writeResourceToDisk(res, savePath, guard);
 }
 
-async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, brand: Brand = 'feishu'): Promise<void> {
+async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, brand: Brand = 'feishu', guard?: DownloadDirGuard): Promise<void> {
   const url = `${larkHosts(brand).openApi}/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`;
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${userToken}` },
@@ -1711,7 +2116,7 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
         stream.statusCode = partial.status;
         stream.headers = { 'content-range': partial.headers.get('content-range') ?? undefined };
         return stream;
-      }, savePath);
+      }, savePath, guard);
       return;
     }
     // 401 = the token itself was rejected (expired / wrong scope) → genuinely
@@ -1724,22 +2129,107 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
     throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
   }
   const buf = Buffer.from(await res.arrayBuffer());
-  writeFileSync(savePath, buf);
+  await writeViaRename(savePath, async (fd) => { await fdWriteAll(fd, buf); }, guard);
 }
 
-async function writeResourceToDisk(res: any, savePath: string): Promise<void> {
-  if (res instanceof Buffer) {
-    writeFileSync(savePath, res);
-  } else if (res && typeof res === 'object' && 'writeFile' in res) {
-    await res.writeFile(savePath);
-  } else {
-    // Raw Readable (client.request with responseType:'stream'). Pipe straight
-    // to disk instead of buffering — this resource API serves files up to
-    // 100MB, so Buffer.concat + writeFileSync would spike memory and block the
-    // event loop under concurrent downloads. pipeline handles backpressure and
-    // closes/cleans up both streams on error.
-    await pipeline(res as NodeJS.ReadableStream, createWriteStream(savePath));
+/** Write to a fresh sibling descriptor, then rename it over `savePath`: a
+ *  symlink already sitting at `savePath` is replaced, never written through.
+ *  The descriptor is opened synchronously immediately after the directory
+ *  check. If the directory is replaced afterwards, the staging pathname cannot
+ *  name an external file created by an attacker, and the final rename fails
+ *  closed instead of publishing bytes outside the validated directory. */
+async function writeViaRename(savePath: string, write: (fd: number) => Promise<void>, guard?: DownloadDirGuard): Promise<void> {
+  const dir = dirname(savePath);
+  const before = lstatSync(dir);
+  if (before.isSymbolicLink() || !before.isDirectory()) throw new Error(`Refusing to download into a non-directory: ${dir}`);
+  // Same directory the caller validated before the network wait (a later lstat
+  // alone would accept a swapped-in external directory as a fresh baseline).
+  const expected: DownloadDirGuard = guard ?? { dev: before.dev, ino: before.ino };
+  assertDownloadDirUnchanged(dir, expected);
+  // Staging name independent of the destination name: a valid 250-char file
+  // name plus a suffix would exceed NAME_MAX. Open NOW, before any await.
+  const tmp = join(dir, `.botmux-dl-${process.pid}-${randomBytes(4).toString('hex')}.part`);
+  const fd = openSync(tmp, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL, 0o600);
+  let renamed = false;
+  try {
+    // `write` owns no descriptor lifecycle: it must never close `fd`, so this
+    // function is its single closer. A WriteStream/pipeline would close the fd
+    // on error even with autoClose:false, leaving the finally to close a number
+    // another open() may have recycled in between.
+    await write(fd);
+    // Rename only into that same directory. If an attacker swaps it after this
+    // check, `tmp` no longer resolves to the descriptor's original directory,
+    // so there is no external staging file for the rename to publish.
+    assertDownloadDirUnchanged(dir, expected);
+    renameSync(tmp, savePath);
+    renamed = true;
+  } finally {
+    try { closeSync(fd); } catch { /* already closed */ }
+    if (!renamed) {
+      // Never unlink through a replacement directory.
+      try { assertDownloadDirUnchanged(dir, expected); unlinkSync(tmp); } catch { /* */ }
+    }
   }
+}
+
+async function writeResourceToDisk(res: any, savePath: string, guard?: DownloadDirGuard): Promise<void> {
+  await writeViaRename(savePath, async (fd) => {
+    if (res instanceof Buffer) {
+      await fdWriteAll(fd, res);
+      return;
+    }
+    // SDK download responses expose getReadableStream alongside their legacy
+    // writeFile(path) helper. Never use the path helper here: it would reopen
+    // the staging pathname after the directory check and reintroduce the race.
+    const stream = res && typeof res.getReadableStream === 'function'
+      ? res.getReadableStream()
+      : res;
+    if (!stream || (typeof stream.pipe !== 'function' && typeof stream[Symbol.asyncIterator] !== 'function')) {
+      throw new Error('Resource download did not return a readable stream');
+    }
+    // Normalize a legacy pipe-only readable (v1 stream, no async iterator) into
+    // a modern Readable before iteration. pipeline() consumed both shapes; keep
+    // that compatibility. wrap() only adapts the stream — it never touches `fd`,
+    // whose sole owner stays writeViaRename.
+    const iterable: AsyncIterable<unknown> = typeof stream[Symbol.asyncIterator] === 'function'
+      ? stream
+      : new Readable().wrap(stream);
+    // Drain the stream onto the pinned descriptor with raw callback writes.
+    // Do not hand `fd` to a WriteStream: pipeline() destroys it on error and
+    // closes the descriptor despite autoClose:false, which would double-close
+    // (and potentially close a recycled fd belonging to another operation).
+    let position = 0;
+    try {
+      for await (const chunk of iterable) {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array | string);
+        await fdWriteAll(fd, buffer, position);
+        position += buffer.length;
+      }
+    } catch (error) {
+      // Abrupt for-await tears down the wrap ADAPTER, but Readable.wrap() never
+      // propagates that back to a pipe-only SOURCE (verified on Node/Bun): the
+      // underlying network stream keeps emitting and holds its listeners. Cancel
+      // it explicitly, mirroring pipeline()'s destroy-on-error. No error arg: the
+      // download already rejects with the original reason, and a sourced 'error'
+      // event without a listener could itself crash the process. Idempotent for
+      // modern streams, whose iterator return already destroyed them.
+      //
+      // Teardown must run inside its own guard: a throwing destroy() (e.g. an
+      // already-closed socket) would otherwise replace the real download error,
+      // changing caller-side classification, the user-token fallback and the
+      // user-visible diagnostic. The original error is always what propagates.
+      try {
+        if (typeof stream.destroy === 'function') stream.destroy();
+      } catch {
+        // Fixed text only: a thrown value can be any JS value, including a
+        // null-prototype object whose String()/coercion itself throws. Touching
+        // it here would re-introduce the exact masking this guard prevents. The
+        // real download error below is the only one callers classify on.
+        logger.debug('resource download: source destroy after failure was ignored');
+      }
+      throw error;
+    }
+  }, guard);
 }
 
 const EXT_TO_FILE_TYPE: Record<string, string> = {
@@ -1764,28 +2254,83 @@ export async function uploadImage(larkAppId: string, imagePath: string | Buffer)
   });
 }
 
-export async function uploadFile(larkAppId: string, filePath: string, opts?: { duration?: number }): Promise<string> {
+export async function uploadFile(larkAppId: string, source: string | { name: string; bytes: Buffer }, opts?: { duration?: number }): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadFile');
-  return executeWithLarkGate(larkAppId, 'uploadFile', async () => {
-    const c = getBotUploadClient(larkAppId);
-    const buf = readFileSync(filePath);
-    const ext = extname(filePath).toLowerCase();
-    const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
-    const fileName = basename(filePath);
-    // `duration` (ms) only applies to opus voice uploads — it sets the length
-    // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
-    const duration = fileType === 'opus' && opts?.duration
-      ? Math.max(1000, Math.round(opts.duration))
-      : undefined;
-    // SDK returns { file_key } directly (not wrapped in { code, data })
-    const res = await c.im.v1.file.create({
-      data: { file_type: fileType as any, file_name: fileName, file: buf, ...(duration ? { duration } : {}) },
+  const fileName = basename(typeof source === 'string' ? source : source.name);
+  const ext = extname(fileName).toLowerCase();
+  const fileType = EXT_TO_FILE_TYPE[ext] ?? 'stream';
+  // `duration` (ms) only applies to opus voice uploads — it sets the length
+  // shown on the Feishu voice bubble. Lark wants ≥1000ms; clamp up.
+  const duration = fileType === 'opus' && opts?.duration
+    ? Math.max(1000, Math.round(opts.duration))
+    : undefined;
+  // The `file` part must be a file stream, not a Buffer. The SDK hands `data`
+  // to axios, which appends a Buffer to form-data WITHOUT a filename; Feishu
+  // then treats the part as a plain form field and rejects it with
+  // 400 code=9499 once it passes ~25–26MiB (the documented file limit is
+  // 30MiB). An fs.ReadStream carries `path`, so form-data emits `filename=`.
+  // form-data also trusts stat(path).size for Content-Length, which is not
+  // reliable for FIFOs or virtual files (both can report zero while yielding
+  // bytes). Stage those sources and in-memory bytes ONCE before the gate: a
+  // one-shot FIFO must never be reopened for a retry. Ordinary non-empty files
+  // still stream directly, with a fresh stream for every attempt.
+  let tmpDir: string | undefined;
+  try {
+    let filePath: string;
+    if (typeof source === 'string') {
+      const sourceStat = statSync(source);
+      filePath = source;
+      if (!sourceStat.isFile() || sourceStat.size === 0) {
+        tmpDir = mkdtempSync(join(tmpdir(), 'botmux-upload-'));
+        filePath = join(tmpDir, fileName);
+        await pipeline(createReadStream(source), createWriteStream(filePath));
+      }
+    } else {
+      tmpDir = mkdtempSync(join(tmpdir(), 'botmux-upload-'));
+      filePath = join(tmpDir, fileName);
+      writeFileSync(filePath, source.bytes);
+    }
+    return await executeWithLarkGate(larkAppId, 'uploadFile', async () => {
+      const c = getBotUploadClient(larkAppId);
+      const size = statSync(filePath).size;
+      const file = createReadStream(filePath);
+      try {
+        // SDK returns { file_key } directly (not wrapped in { code, data })
+        const res: { file_key?: string } | null | undefined = await c.im.v1.file.create({
+          data: { file_type: fileType as any, file_name: fileName, file, ...(duration ? { duration } : {}) },
+        });
+        const fileKey = res?.file_key;
+        if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
+        logger.info(`Uploaded file ${fileName} (${size} bytes) → ${fileKey}`);
+        return fileKey;
+      } catch (err) {
+        logger.warn(`Upload file ${fileName} failed (size=${size} bytes, file_type=${fileType}): ${formatLarkError(err) ?? (err instanceof Error ? err.message : String(err))}`);
+        throw err;
+      } finally {
+        if (!file.closed) {
+          // events.once(file, 'close') would reject on a teardown-time error,
+          // replacing the SDK result/error and skipping the outer temp cleanup.
+          // Only close settles this wait; the error listener prevents an
+          // uncaught exception while destroy() completes the close lifecycle.
+          await new Promise<void>((resolve) => {
+            file.once('close', resolve);
+            file.on('error', () => {});
+            file.destroy();
+          });
+        }
+      }
     });
-    const fileKey = res?.file_key;
-    if (!fileKey) throw new Error(`Failed to upload file: no file_key in response (${JSON.stringify(res)})`);
-    logger.info(`Uploaded file ${filePath} → ${fileKey}`);
-    return fileKey;
-  });
+  } finally {
+    if (tmpDir) {
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch (err) {
+        // Cleanup is best-effort: never turn an uploaded file_key into a failure
+        // or hide the original upload error behind a local rm failure.
+        logger.warn(`Failed to remove upload temp dir ${tmpDir}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
 }
 
 /**
@@ -2251,6 +2796,57 @@ export async function listMessagesByThreadId(larkAppId: string, threadId: string
   return listByThread(getBotClient(larkAppId), threadId, pageSize);
 }
 
+/** Read the very first native reply to a daemon-created task seed. A later
+ * matching reply or a chat scan cannot prove who originated a legacy task. */
+export async function firstDispatchReply(appId: string, chatId: string, rootId: string, targetAppId: string): Promise<string | undefined> {
+  const item = (await getMessageDetail(appId, rootId, { userCardContent: false, timeoutMs: 5000 }))?.items?.[0];
+  if (item?.message_id !== rootId || item?.chat_id !== chatId || item?.sender?.id !== appId
+      || !['app', 'bot'].includes(item.sender.sender_type) || !/^omt_[a-zA-Z0-9_-]+$/.test(item.thread_id ?? '')) return;
+  const page = await larkGet(getBotClient(appId), '/open-apis/im/v1/messages', {
+    container_id_type: 'thread', container_id: item.thread_id, sort_type: 'ByCreateTimeAsc', page_size: 3,
+  }, { timeoutMs: 5000 });
+  if (page.code !== 0) throw larkApiError('get first dispatch reply', page);
+  const replies = page.data?.items?.filter((message: { message_id?: string }) => message.message_id !== rootId) ?? [];
+  const nativeReply = (message: any) => message?.root_id === rootId && message.chat_id === chatId
+    && message.thread_id === item.thread_id && !message.deleted
+    && message.sender?.id === appId && ['app', 'bot'].includes(message.sender.sender_type);
+  const first = replies[0];
+  if (!nativeReply(first)) return;
+  if (first.msg_type !== 'text') return first.message_id;
+  // A legacy --repo task has exactly one unsigned initialization reply before
+  // its signed kickoff. Verify that narrow shape and target; never search later
+  // replies for a grant that could belong to a different sender's follow-up.
+  const mentions = first.mentions;
+  if (!Array.isArray(mentions) || mentions.length !== 1 || mentions[0].id_type !== 'open_id'
+    || typeof mentions[0].id !== 'string' || typeof mentions[0].key !== 'string') return first.message_id;
+  let text: unknown;
+  try { text = JSON.parse(first.body?.content ?? '').text; } catch { return; }
+  const key = mentions[0].key;
+  if (typeof text !== 'string' || !text.startsWith(key)
+    || !/^[ \t]+\/repo[ \t]+\S[^\r\n]*$/.test(text.slice(key.length))) return first.message_id;
+  const targets = await resolveCurrentChatBotOpenIdsByLarkAppIds(appId, chatId, [targetAppId]);
+  if (!targets.ok || targets.mappings.length !== 1 || targets.mappings[0]?.subjectOpenId !== mentions[0].id) return;
+  const kickoff = replies[1];
+  if (nativeReply(kickoff) && kickoff.msg_type === 'post') return kickoff.message_id;
+}
+
+/** The original app reads its exact card; unavailable reads never prove deletion. */
+export async function dispatchConsentCardAvailable(appId: string, chatId: string, messageId: string): Promise<boolean> {
+  let item: any;
+  try {
+    item = (await getMessageDetail(appId, messageId, { userCardContent: false, timeoutMs: 5000 }))?.items?.[0];
+  } catch (error) {
+    const code = getLarkErrorCode(error);
+    // Both codes are terminal provider states: the message can never become
+    // readable again, so the consent flow must rotate rather than throw forever.
+    if (code === LARK_CODE_MESSAGE_WITHDRAWN || code === LARK_CODE_MESSAGE_DELETED) return false;
+    throw error;
+  }
+  return item?.message_id === messageId && item.chat_id === chatId && !item.deleted
+    && item.msg_type === 'interactive' && item.sender?.id === appId
+    && ['app', 'bot'].includes(item.sender.sender_type);
+}
+
 export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
   return (await listThreadMessagesWithContext(larkAppId, chatId, rootMessageId, pageSize)).messages;
 }
@@ -2577,7 +3173,7 @@ export type ChatBotMember = {
 type ChatBotListApiItem = { botId: string; botName: string };
 type ChatBotListApiResult =
   | { ok: true; items: ChatBotListApiItem[] }
-  | { ok: false; reason: string; cacheable: boolean };
+  | { ok: false; reason: string; cacheable: boolean; timeoutMs?: number };
 
 /**
  * A bot row returned directly by Feishu's live `/members/bots` endpoint.
@@ -2611,13 +3207,22 @@ export type CurrentChatBotAppResolution =
         | 'subject_lark_app_ambiguous';
       message: string;
       invalidSubjectLarkAppIds?: string[];
+      /** 仅当实时成员查询按 listBotsApiTimeoutMs 本地超时时存在，值为当时生效的上限。 */
+      timeoutMs?: number;
     };
+
+class LarkCallTimeoutError extends Error {
+  constructor(label: string, readonly timeoutMs: number) {
+    super(`${label} timed out after ${timeoutMs}ms`);
+    this.name = 'LarkCallTimeoutError';
+  }
+}
 
 function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => reject(new LarkCallTimeoutError(label, timeoutMs)), timeoutMs);
   });
   return Promise.race([p, timeout]).finally(() => {
     if (timer) clearTimeout(timer);
@@ -2647,7 +3252,12 @@ async function listChatBotsViaMembersBots(
       .filter((it: ChatBotListApiItem) => it.botId && it.botName);
     return { ok: true, items };
   } catch (err: any) {
-    return { ok: false, reason: err?.message ?? String(err), cacheable: true };
+    return {
+      ok: false,
+      reason: err?.message ?? String(err),
+      cacheable: true,
+      ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
+    };
   }
 }
 
@@ -2696,6 +3306,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
       ok: false,
       error: 'live_membership_unavailable',
       message: `live_chat_bot_members_unavailable: ${live.reason}`,
+      ...(live.timeoutMs !== undefined ? { timeoutMs: live.timeoutMs } : {}),
     };
   }
 
@@ -2780,6 +3391,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
         error: 'live_membership_unavailable',
         message: `is_in_chat failed for ${appId}: ${err?.message ?? String(err)}`,
         invalidSubjectLarkAppIds: subjectLarkAppIds.includes(appId) ? [appId] : undefined,
+        ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
       };
     }
   }
@@ -2991,9 +3603,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const entries = botsInfoObjectEntries(JSON.parse(readFileSync(infoPath, 'utf-8')))
+        .filter(isBotsInfoRouteEntry);
       for (const e of entries) {
-        appIdToInfo.set(e.larkAppId, { botOpenId: e.botOpenId, botName: e.botName });
+        appIdToInfo.set(e.larkAppId, {
+          botOpenId: typeof e.botOpenId === 'string' ? e.botOpenId : null,
+          botName: e.botName ?? null,
+        });
       }
     }
   } catch { /* ignore corrupt file */ }
@@ -3119,6 +3735,39 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
 }
 
 /** Current application only. Throws on missing scope/unknown membership. */
+/** Strict chat facts for an authorization gate: throws on any provider failure
+ *  or an unclassifiable chat, never guesses a default. */
+export async function getChatRoutingFacts(
+  larkAppId: string,
+  chatId: string,
+): Promise<{ external: boolean; mode: 'group' | 'p2p' }> {
+  const res: any = await larkGet(getBotClient(larkAppId), `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+  if (res.code !== 0) throw larkApiError('get chat', res);
+  const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+  const mode = rawMode === 'p2p' ? 'p2p' : rawMode === 'group' || rawMode === 'topic' ? 'group' : null;
+  if (!mode || typeof res.data?.external !== 'boolean') throw new Error('chat_facts_unknown');
+  return { external: res.data.external, mode };
+}
+
+/** Native invite links let non-members join without BotMux user authorization. */
+export async function getChatInviteLink(larkAppId: string, chatId: string): Promise<string> {
+  const response = await getBotClient(larkAppId).request({
+    method: 'POST', url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/link`,
+    data: { validity_period: 'permanently' }, ...larkRequestDeadline({ timeoutMs: 10_000 }),
+  });
+  if (response.code !== 0 || !response.data?.is_permanent || !response.data.share_link) {
+    throw new Error('人工群入群邀请暂不可用，请确认机器人在人工群中并有分享群权限');
+  }
+  const link = new URL(response.data.share_link);
+  const brand = normalizeBrand(getBot(larkAppId).config.brand);
+  const officialHost = link.hostname === larkHosts(brand).applink
+    || (brand === 'feishu' && link.hostname === 'applink.larkoffice.com');
+  if (link.protocol !== 'https:' || !officialHost
+    || link.pathname !== '/client/chat/chatter/add_by_link' || !link.searchParams.get('link_token')
+    || link.username || link.password) throw new Error('人工群未返回有效入群邀请');
+  return response.data.share_link;
+}
+
 export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
   const response: any = await larkGet(getBotClient(larkAppId),
     `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);

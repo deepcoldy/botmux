@@ -1,0 +1,50 @@
+
+  [1m[38;5;2m▄▄▄▄▄▄▄
+[0m[39m[49m  [1m[38;5;2m█[0m[39m[49m [1m[38;5;2m◆[0m[39m[49m [1m[38;5;2m◆[0m[39m[49m [1m[38;5;2m█[0m[39m[49m  [1m[38;5;2mTRAE CLI[0;2m[39m[49m (v0.214.1)
+[0m[39m[49m   [1m[38;5;2m▀▀▀▀▀▀
+[0m[39m[49m  /tmp/repo
+  [2mpermissions: [0;1m[38;5;5m[49mYOLO mode
+
+  Tip: Use /skills to list available skills.
+
+
+[2m▍ [0m[39m[49mask me
+
+
+[38;2;166;227;161m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[39m  [2mQuestion 2/3 (1 unanswered)
+[0m[39m[49m  Which features do you want to enable?
+
+    [✓] 1. Caching  [2mRedis in front of the database[0m[39m[49m
+    [ ] 2. Metrics  [2mPrometheus exporter
+[0m[39m[49m  [1;7m❯ [✓] 3. Tracing  [0;7m[39m[49mOpenTelemetry spans[1m
+[0m[39m[49m    [ ] 4. Other    [2mOptionally, add details in notes (tab).
+
+[0m[39m[49m  [1mspace[0;2m[39m[49m toggle  |  [0;1m[39m[49mtab[0;2m[39m[49m add notes  |  [0;1m[39m[49menter[0;2m[39m[49m submit answer  |  [0;1m[39m[49m←/→[0;2m[39m[49m navigate questions  |  [0;1m[39m[49mesc[0;2m[39m[49m interrupt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

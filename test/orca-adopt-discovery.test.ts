@@ -1,3 +1,6 @@
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 const state = vi.hoisted(() => ({
@@ -10,6 +13,7 @@ const state = vi.hoisted(() => ({
   readlink: vi.fn(),
   traexRollout: vi.fn(),
   traexThread: vi.fn(),
+  traexThreadIndex: vi.fn(() => new Map()),
 }));
 
 vi.mock('../src/services/orca-cli.js', async (importOriginal) => ({
@@ -30,6 +34,7 @@ vi.mock('../src/services/traex-transcript.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/services/traex-transcript.js')>(),
   findTraexRolloutByPid: state.traexRollout,
   findTraexThreadByPid: state.traexThread,
+  readTraexThreadIndex: state.traexThreadIndex,
 }));
 
 vi.mock('node:fs', async (importOriginal) => {
@@ -60,6 +65,7 @@ const terminal = {
   executionHostId: 'ssh:h',
   agentIdentity: 'trae',
   title: 'Fix login flow',
+  lastOutputAt: 1_792_000_000_000,
 };
 
 const serverTerminal = {
@@ -93,6 +99,8 @@ describe('Orca adopt discovery', () => {
     state.readlink.mockReset();
     state.traexRollout.mockReset();
     state.traexThread.mockReset();
+    state.traexThreadIndex.mockReset();
+    state.traexThreadIndex.mockReturnValue(new Map());
   });
 
   it('maps Orca TRAE identity to the Botmux traex adapter', () => {
@@ -111,6 +119,7 @@ describe('Orca adopt discovery', () => {
     const candidates = await discoverAdoptableOrcaSessions('traex');
     expect(candidates.map(item => item.orcaTerminalHandle)).toEqual(['term_1']);
     expect(candidates[0]?.orcaTerminalTitle).toBe('Fix login flow');
+    expect(candidates[0]?.lastOutputAt).toBeUndefined();
     expect(candidates[0]?.orcaInstance).toBe('relay');
   });
 
@@ -156,6 +165,7 @@ describe('Orca adopt discovery', () => {
     });
     state.readlink.mockReturnValue('/usr/bin/traecli');
     state.traexThread.mockReturnValue({ cliSessionId: 'thread_1', title: '修复登录流程' });
+    state.traexThreadIndex.mockReturnValue(new Map([['thread_1', { id: 'thread_1', updatedAtMs: 1_800_000_000_000 }]]));
 
     const [candidate] = await discoverAdoptableOrcaSessions('traex');
     expect(candidate).toMatchObject({
@@ -163,12 +173,22 @@ describe('Orca adopt discovery', () => {
       orcaPtyId: 'serve-3687641d',
       cliPid: 101,
       sessionId: 'thread_1',
-      orcaTerminalTitle: '修复登录流程',
+      orcaTerminalTitle: 'Fix login flow',
+      lastOutputAt: 1_800_000_000_000,
       paneCols: 120,
       paneRows: 40,
       paneSizeVerified: true,
     });
     expect(state.roots).not.toHaveBeenCalled();
+  });
+
+  it('does not rank TRAE terminals without thread identity by redraw output', async () => {
+    mockOrcaLists({ server: { ok: true, value: { terminals: [{ ...serverTerminal, lastOutputAt: 1_900_000_000_000 }] } } });
+
+    const [candidate] = await discoverAdoptableOrcaSessions('traex');
+
+    expect(candidate?.sessionId).toBeUndefined();
+    expect(candidate?.lastOutputAt).toBeUndefined();
   });
 
   it('uses the owned TRAE thread title when Orca has no terminal title', async () => {

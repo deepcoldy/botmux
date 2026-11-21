@@ -44,6 +44,8 @@ export interface ManagedOriginAttestation {
   scheduleOperator?: ScheduleOperatorAuthorization;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
+  /** Owning bot's live host policy. Missing on old proofs means disabled. */
+  allowArbitraryMention?: boolean;
   requiresCodexAppLedger: boolean;
 }
 
@@ -175,6 +177,7 @@ function validateProof(input: {
     || (proof.linkRefMode !== undefined
       && proof.linkRefMode !== 'observe'
       && proof.linkRefMode !== 'enabled')
+    || (proof.allowArbitraryMention !== undefined && typeof proof.allowArbitraryMention !== 'boolean')
     || typeof proof.issuedAtMs !== 'number' || !Number.isFinite(proof.issuedAtMs)
     || proof.issuedAtMs > input.nowMs + 1_000
     || input.nowMs - proof.issuedAtMs > MANAGED_ORIGIN_PROOF_TTL_MS
@@ -199,6 +202,9 @@ function validateProof(input: {
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(proof.linkRefMode === 'observe' || proof.linkRefMode === 'enabled'
       ? { linkRefMode: proof.linkRefMode }
+      : {}),
+    ...(typeof proof.allowArbitraryMention === 'boolean'
+      ? { allowArbitraryMention: proof.allowArbitraryMention }
       : {}),
     requiresCodexAppLedger: proof.requiresCodexAppLedger,
   };

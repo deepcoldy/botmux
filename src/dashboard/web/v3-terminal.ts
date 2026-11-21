@@ -7,6 +7,7 @@
  *   - replay fetches the cookie-auth `/api/v3/.../pty-log` endpoint
  */
 import type { RunNodeView } from '../../workflows/v3/ops-projection.js';
+import { XTERM_VENDOR_ASSETS, xtermVendorRootUrl } from '../../core/xterm-vendor-assets.js';
 
 export type NodeTerminalRenderKind = 'live' | 'replay' | 'empty';
 
@@ -94,11 +95,17 @@ function browserHost(): string {
 export function buildReplayTerminalSrcdoc(endpoint: string, title: string): string {
   const endpointJson = JSON.stringify(endpoint);
   const titleText = escapeHtml(title);
+  // xterm 由 Dashboard 自己在根路径下提供（#1940 固定的 5.5.0 组），不走外部 CDN。
+  // srcdoc 文档的相对地址按父页面（Dashboard，总在源站根路径）解析，与下面 fetch 的
+  // `/api/v3/…` 同理。
+  const css = escapeAttr(xtermVendorRootUrl(XTERM_VENDOR_ASSETS.css));
+  const xtermJs = escapeAttr(xtermVendorRootUrl(XTERM_VENDOR_ASSETS.xterm));
+  const fitJs = escapeAttr(xtermVendorRootUrl(XTERM_VENDOR_ASSETS.fit));
   return `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+  <link rel="stylesheet" href="${css}">
   <style>
     html,body{margin:0;height:100%;background:#0d1117;color:#c9d1d9;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
     #bar{height:31px;display:flex;align-items:center;gap:10px;padding:0 10px;background:#161b22;border-bottom:1px solid #30363d;box-sizing:border-box}
@@ -110,8 +117,8 @@ export function buildReplayTerminalSrcdoc(endpoint: string, title: string): stri
 <body>
   <div id="bar"><span>${titleText}</span><span id="status">loading...</span></div>
   <div id="term"></div>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"><\/script>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"><\/script>
+  <script src="${xtermJs}"><\/script>
+  <script src="${fitJs}"><\/script>
   <script>
   (function(){
     var endpoint=${endpointJson};

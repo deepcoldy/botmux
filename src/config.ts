@@ -8,6 +8,7 @@ import {
   isCrossPrincipalInterruptionEnabled,
   isGlobalVcMeetingAgentEnabled,
   readGlobalConfig,
+  globalTerminalEffortWritebackConfigLive,
 } from './global-config.js';
 
 /** Get the first non-loopback IPv4 address, fallback to localhost. */
@@ -268,6 +269,12 @@ export function resolveWorktreeSlugAiTimeoutMs(env: NodeJS.ProcessEnv = process.
   return resolvePositiveRuntimeTimeout(env.BOTMUX_WORKTREE_SLUG_AI_TIMEOUT_MS, 5_000);
 }
 
+/** Per `git worktree add` budget, including checkout hooks. Other Git
+ * commands and worktree target lock waits retain their own timeouts. */
+export function resolveWorktreeCreateTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  return resolvePositiveRuntimeTimeout(env.BOTMUX_WORKTREE_CREATE_TIMEOUT_MS, 60_000);
+}
+
 export const config = {
   session: {
     get dataDir() { return process.env.SESSION_DATA_DIR ?? fallbackDataDir(); },
@@ -411,6 +418,10 @@ export const config = {
   // so a Dashboard change gates the next session upgrade without restarting
   // daemons or changing the current turn.
   get autoUpgradeCodexSessions(): boolean { return readGlobalConfig().dashboard?.autoUpgradeCodexSessions === true; },
+  /** Default OFF; only confirmed user terminal choices affect durable session effort. */
+  get terminalEffortWriteback(): boolean { return globalTerminalEffortWritebackConfigLive().enabled; },
+  get terminalEffortWritebackEpoch(): number { return globalTerminalEffortWritebackConfigLive().epoch; },
+  get terminalEffortWritebackEnabledAtMs(): number { return globalTerminalEffortWritebackConfigLive().enabledAtMs; },
   // Live getter (like codexRpcInputDefault): re-reads the experimental global
   // toggle that gates the "no visible output" anti-resend guidance in the botmux
   // routing hints, so a Settings change takes effect on the next session without
@@ -427,6 +438,14 @@ export const config = {
   // without a rebuild. BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1 remains an emergency
   // kill-switch checked inside the reaper itself.
   get reapOrphanTmuxServers(): boolean { return readGlobalConfig().dashboard?.reapOrphanTmuxServers === true; },
+  // Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY: on a timer
+  // it logs displaced botmux servers/panes and never signals anything. Read
+  // live so a Dashboard flip applies to the next tick without a restart.
+  get tmuxOrphanSessionSweep(): boolean { return readGlobalConfig().dashboard?.tmuxOrphanSessionSweep !== false; },
+  // Narrow destructive arm of the session sweep: signal only a proven
+  // taken-over bare-wrapper pane. Default OFF — even with the report sweep on,
+  // no process is killed without an explicit opt-in.
+  get tmuxOrphanSessionBareWrapperKill(): boolean { return readGlobalConfig().dashboard?.tmuxOrphanSessionBareWrapperKill === true; },
   // Live getter (like noVisibleOutputHint): the experimental cross-principal
   // interruption (XPI) switch. Default OFF (absent ⇒ disabled) — with it off the
   // daemon delivers another principal's message normally instead of diverting it
@@ -443,6 +462,20 @@ export const config = {
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
   get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
+  // Live getter: whether the turn initiator may press the `initiator` (decline /
+  // skip) keys on a "CLI is stuck" card. Default ON (absent ⇒ true); an explicit
+  // stored `false` limits every key to bot operators. Read at click time by the
+  // stuck_key gate and at card build time for the who-may-press hint.
+  get stuckCardInitiatorKeys(): boolean { return readGlobalConfig().dashboard?.stuckCardInitiatorKeys !== false; },
+  // Live getter: whether a newly created group @-mentions its owner with the
+  // "group is ready" notice (services/group-creator.ts, and the bare @ after a
+  // deferred team-group owner transfer). Default ON (absent ⇒ true); an
+  // explicit stored `false` silences it on every creation path. Read per
+  // creation: a one-shot `botmux create-group` reads the file fresh and a
+  // daemon sees a Dashboard/CLI flip within the 2s cache, no restart needed.
+  // Callers compare `!== false` so a test double without the getter keeps the
+  // default.
+  get groupOwnerNotice(): boolean { return readGlobalConfig().groupOwnerNotice !== false; },
 };
 
 export type Config = typeof config;

@@ -9,6 +9,8 @@ import { ui } from '../src/dashboard/web/ui.js';
 
 const confirmMock = vi.hoisted(() => vi.fn(async (_options: { title: string; message: string }) => true));
 vi.mock('../src/dashboard/web/confirm-modal.js', () => ({ confirm: confirmMock }));
+const toastMock = vi.hoisted(() => vi.fn());
+vi.mock('../src/dashboard/web/toast.js', () => ({ toast: toastMock }));
 
 const BOT = 'cli_listener';
 const OTHER_BOT = 'cli_other';
@@ -66,7 +68,12 @@ function mockApi(options: {
   global?: unknown;
   otherGlobal?: () => Promise<Response>;
   customEnabled?: boolean;
+  chats?: Array<[string, string]>;
+  members?: (url: string) => Promise<Response> | Response;
   put?: (request: Request) => Response | undefined;
+  // A daemon that drops a custom rule saved switched off with no prompt, yet
+  // still answers mode:'custom' (with no rule).
+  dropsBlankPausedRule?: boolean;
 } = {}) {
   const requests: Request[] = [];
   const chat = (chatId: string, name: string) => ({ chatId, name, memberBots: [
@@ -87,14 +94,22 @@ function mockApi(options: {
       const rejected = options.put?.(request);
       if (rejected) return rejected;
       const chatId = url.match(new RegExp(`^/api/group-message-listeners/${BOT}/(.+)$`))?.[1];
-      if (chatId) groupState.set(chatId, { mode: request.body.mode, listener: request.body.listener ?? null });
-      return response({ ok: true });
+      if (!chatId) return response({ ok: true });
+      // Like the daemon's route (pinned in dashboard-ipc.test.ts): inherit drops
+      // the group's entry, and the answer is what a re-read returns.
+      const { mode, listener } = request.body;
+      const dropsRule = mode === 'custom' && options.dropsBlankPausedRule && !listener.enabled && !listener.prompt.trim();
+      groupState.set(chatId, mode === 'inherit' || dropsRule ? { mode: 'inherit', listener: null } : { mode, listener: listener ?? null });
+      return response(dropsRule ? { ok: true, mode: 'custom', listener: null } : { ok: true, ...groupState.get(chatId) });
     }
-    if (url === '/api/groups') return response({ chats: [chat(INHERIT, 'Inherit group'), chat(CUSTOM, 'Custom group')] });
+    const chatList: Array<[string, string]> = options.chats
+      ?? [[INHERIT, 'Inherit group'], [CUSTOM, 'Custom group']];
+    if (url === '/api/groups') return response({ chats: chatList.map(([chatId, name]) => chat(chatId, name)) });
     if (url === `/api/global-message-listener/${BOT}`) return response({ listener: options.global ?? savedGlobal() });
     if (url === `/api/global-message-listener/${OTHER_BOT}`) return options.otherGlobal?.() ?? response({ listener: savedGlobal({ name: 'other rule' }) });
     if (url === `/api/group-message-listeners/${BOT}`) return response({ groups: [...groupState].map(([chatId, state]) => ({ chatId, ...state })) });
     if (url === `/api/group-message-listeners/${OTHER_BOT}`) return response({ groups: [{ chatId: INHERIT, mode: 'inherit', listener: null }] });
+    if (url.includes('/members-display') && options.members) return options.members(url);
     if (url.includes('/members-display')) return response({ members: [
       { openId: 'ou_alice', name: 'Alice', memberType: 'user' },
       { openId: 'ou_bob', name: 'Bob', memberType: 'user' },
@@ -135,6 +150,22 @@ describe('message-listener page', () => {
   beforeEach(() => { confirmMock.mockReset(); confirmMock.mockResolvedValue(true); });
   afterEach(() => vi.restoreAllMocks());
 
+  it('saves silent execution selected in the editor and restores the hidden card title when switched back', async () => {
+    const requests = mockApi({ global: savedGlobal({ replyCardTitle: 'saved title' }) });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    await click(tab(root, 'global'));
+    const placement = () => byClass(panel(root, 'global'), 'roles-listener-reply-placement')[0]!.findByType('select');
+    await act(async () => placement().props.onChange({ currentTarget: { value: 'none' } }));
+    expect(placement().props.value).toBe('none');
+    expect(panel(root, 'global').findAll(node => node.type === 'input' && node.props.value === 'saved title')).toHaveLength(0);
+    await click(globalSave(root));
+    expect(puts(requests, GLOBAL_URL).at(-1)?.body.replyPolicy?.mode).toBe('none');
+    await act(async () => placement().props.onChange({ currentTarget: { value: 'thread' } }));
+    expect(panel(root, 'global').findAll(node => node.type === 'input' && node.props.value === 'saved title')).toHaveLength(1);
+    await act(async () => renderer.unmount());
+  });
+
   it('puts group settings first and opens on them, keeping the global panel mounted but hidden', async () => {
     mockApi();
     const renderer = await renderPage();
@@ -171,6 +202,80 @@ describe('message-listener page', () => {
     const [put] = puts(requests, GLOBAL_URL);
     expect(put?.body.senderPolicy).toEqual({ mode: 'include_only', includeSenderOpenIds: ['ou_alice'], includeSenderTypes: ['user'], excludeSelf: false });
     expect(put?.body.contentPolicy).toEqual({ includeKeywords: ['bug'], matchMode: 'all' });
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('selects and removes identity keywords through the rendered controls and saves stable IDs', async () => {
+    const requests = mockApi({ global: savedGlobal({ contentPolicy: { includeKeywords: ['ask'], includeMentionedOpenIds: ['ou_not_in_sample'], matchMode: 'all' } }) });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    const editor = () => editorOf(root, 'global');
+    const identitySelect = () => byClass(editor(), 'roles-listener-content-policy')[0]!.findAllByType('select')[0]!;
+    expect(identitySelect().findAllByType('option').map(option => option.props.value)).toContain('ou_bob');
+    act(() => identitySelect().props.onChange({ currentTarget: { value: 'ou_bob' } }));
+    const modeSelect = byClass(editor(), 'roles-listener-content-policy')[0]!.findAllByType('select')[1]!;
+    act(() => modeSelect.props.onChange({ currentTarget: { value: 'all' } }));
+    await click(globalSave(root));
+    expect(puts(requests, GLOBAL_URL)[0]?.body.contentPolicy).toEqual({ includeKeywords: ['ask'], includeMentionedOpenIds: ['ou_not_in_sample', 'ou_bob'], matchMode: 'all' });
+    const chip = () => byClass(editor(), 'roles-listener-identity-keyword').find(node => node.props.title === 'ou_bob')!;
+    await click(chip());
+    await click(globalSave(root));
+    expect(puts(requests, GLOBAL_URL).at(-1)?.body.contentPolicy.includeMentionedOpenIds).toEqual(['ou_not_in_sample']);
+    await click(byClass(editor(), 'roles-listener-identity-keyword')[0]!);
+    await click(globalSave(root));
+    expect(puts(requests, GLOBAL_URL).at(-1)?.body.contentPolicy).toEqual({ includeKeywords: ['ask'], matchMode: 'all' });
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('cannot select the previous Bot identity while the new Bot roster is loading', async () => {
+    const pendingMembers = deferred<Response>();
+    const requests = mockApi({ members: url => url.includes(`/${OTHER_BOT}/`)
+      ? pendingMembers.promise
+      : response({ members: [{ openId: 'ou_source_member', name: 'Source member', memberType: 'user' }] }),
+    });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    const editor = () => editorOf(root, 'global');
+    const select = () => byClass(editor(), 'roles-listener-content-policy')[0]!.findAllByType('select')[0]!;
+    expect(select().findAllByType('option').map(node => node.props.value)).toContain('ou_source_member');
+    await click(byClass(root, 'bd-roster-item').find(node => text(node).includes(OTHER_BOT))!);
+    expect(select().props.disabled).toBe(true);
+    expect(select().findAllByType('option').map(node => node.props.value)).not.toContain('ou_source_member');
+    act(() => select().props.onChange({ currentTarget: { value: 'ou_source_member' } }));
+    expect(editor().props.listener.contentPolicy?.includeMentionedOpenIds).toBeUndefined();
+    await act(async () => { pendingMembers.resolve(response({ members: [{ openId: 'ou_target_member', name: 'Target member', memberType: 'user' }] })); });
+    await settle();
+    expect(select().props.disabled).toBe(false);
+    act(() => select().props.onChange({ currentTarget: { value: 'ou_target_member' } }));
+    await click(globalSave(root));
+    expect(puts(requests, `/api/global-message-listener/${OTHER_BOT}`).at(-1)?.body.contentPolicy.includeMentionedOpenIds).toEqual(['ou_target_member']);
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('offers only real users as identity keywords and rejects bot or out-of-roster values', async () => {
+    const requests = mockApi({
+      members: () => response({ members: [
+        { openId: 'ou_alice', name: 'Alice', memberType: 'user' },
+        { openId: 'ou_bot_member', name: 'Bot member', memberType: 'bot' },
+      ] }),
+    });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    const editor = () => editorOf(root, 'global');
+    const select = () => byClass(editor(), 'roles-listener-content-policy')[0]!.findAllByType('select')[0]!;
+    const optionValues = () => select().findAllByType('option').map((node: any) => node.props.value);
+    expect(optionValues()).toContain('ou_alice');
+    expect(optionValues()).not.toContain('ou_bot_member');
+    // A synthesized event must not add a bot or an id outside the roster even
+    // if the option filter were bypassed — the onChange handler re-checks.
+    act(() => select().props.onChange({ currentTarget: { value: 'ou_bot_member' } }));
+    expect(editor().props.listener.contentPolicy?.includeMentionedOpenIds).toBeUndefined();
+    act(() => select().props.onChange({ currentTarget: { value: 'ou_stranger' } }));
+    expect(editor().props.listener.contentPolicy?.includeMentionedOpenIds).toBeUndefined();
+    act(() => select().props.onChange({ currentTarget: { value: 'ou_alice' } }));
+    expect(editor().props.listener.contentPolicy?.includeMentionedOpenIds).toEqual(['ou_alice']);
+    await click(globalSave(root));
+    expect(puts(requests, GLOBAL_URL).at(-1)?.body.contentPolicy.includeMentionedOpenIds).toEqual(['ou_alice']);
     await act(async () => { renderer.unmount(); });
   });
 
@@ -388,6 +493,103 @@ describe('effective state and confirmations', () => {
     await act(async () => { renderer.unmount(); });
   });
 
+});
+
+describe('a custom rule saved switched off with no prompt', () => {
+  beforeEach(() => { confirmMock.mockReset(); confirmMock.mockResolvedValue(true); toastMock.mockReset(); });
+  afterEach(() => vi.restoreAllMocks());
+
+  // With no global rule set up, a fresh custom draft starts switched off and empty.
+  const noGlobalRule = () => savedGlobal({ enabled: false, prompt: '' });
+  const status = (root: Instance, name = 'Inherit group') => text(byClass(groupItem(root, name), 'message-listener-group-status')[0]!);
+
+  it('stays custom and paused after the re-read and a reload', async () => {
+    const requests = mockApi({ global: noGlobalRule() });
+    let renderer = await renderPage();
+    await click(modeButton(renderer.root, 2));
+    await click(groupSave(renderer.root));
+    expect(puts(requests, `/api/group-message-listeners/${BOT}/${INHERIT}`)[0]?.body).toMatchObject({ mode: 'custom', listener: { enabled: false, prompt: '' } });
+    expect(editorOf(renderer.root, 'group').props.flash?.text).toBe('已保存');
+    expect(status(renderer.root)).toBe('自定义');
+    expect(text(byClass(groupItem(renderer.root, 'Inherit group'), 'message-listener-effective')[0]!)).toBe('未监听');
+    expect(text(byClass(renderer.root, 'message-listener-detail-head')[0]!)).toContain('规则未启用');
+
+    await act(async () => { renderer.unmount(); });
+    renderer = await renderPage();
+    expect(status(renderer.root)).toBe('自定义');
+    expect(toastMock).not.toHaveBeenCalled();
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('does not report a rule the daemon dropped as saved, and keeps the draft open', async () => {
+    mockApi({ global: noGlobalRule(), dropsBlankPausedRule: true });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    await click(modeButton(root, 2));
+    await click(groupSave(root));
+    expect(toastMock).toHaveBeenCalledWith(expect.stringContaining('没有保留'), { kind: 'error' });
+    expect(status(root)).toBe('使用全局');
+    // Still an unsaved switch: the user can add a prompt or pick another mode.
+    expect(hasEditor(root, 'group')).toBe(true);
+    expect(editorOf(root, 'group').props.flash).toBeNull();
+    expect(byClass(groupItem(root, 'Inherit group'), 'message-listener-unsaved-tag')).toHaveLength(1);
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('re-reads a group whose existing custom rule the daemon dropped, so it no longer shows as custom', async () => {
+    mockApi({ global: noGlobalRule(), dropsBlankPausedRule: true });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    await click(groupItem(root, 'Custom group'));
+    act(() => editorOf(root, 'group').props.onPatch({ enabled: false, prompt: '' }));
+    await click(groupSave(root));
+    expect(toastMock).toHaveBeenCalledWith(expect.stringContaining('「Custom group」'), { kind: 'error' });
+    expect(status(root, 'Custom group')).toBe('使用全局');
+    await act(async () => { renderer.unmount(); });
+  });
+});
+
+describe('group list ordering', () => {
+  beforeEach(() => { confirmMock.mockReset(); confirmMock.mockResolvedValue(true); });
+  afterEach(() => vi.restoreAllMocks());
+
+  const itemNames = (root: Instance) =>
+    byClass(root, 'message-listener-group-item').map(node => node.findByType('strong').children.join(''));
+
+  it('shows custom-rule groups first and keeps /api/groups order within each tier', async () => {
+    mockApi({
+      chats: [
+        [INHERIT, 'Inherit group'],
+        ['oc_plain_a', 'Plain A'],
+        [CUSTOM, 'Custom group'],
+        ['oc_plain_b', 'Plain B'],
+      ],
+    });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    // Source order is inherit, inherit, custom, inherit: the custom block moves
+    // to the top, while the three non-custom groups keep their relative order
+    // (the page relies on Array.prototype.sort stability).
+    expect(itemNames(root)).toEqual(['Custom group', 'Inherit group', 'Plain A', 'Plain B']);
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('keeps a paused custom rule in the top tier, and stays partitioned while searching', async () => {
+    mockApi({ customEnabled: false });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    // mode stays 'custom' with enabled=false: still a custom configuration, so
+    // it remains first even though the group currently does not listen.
+    expect(itemNames(root)).toEqual(['Custom group', 'Inherit group']);
+    expect(text(byClass(groupItem(root, 'Custom group'), 'message-listener-effective')[0]!)).toBe('未监听');
+
+    const search = byClass(root, 'message-listener-group-search')[0]!;
+    await act(async () => { search.props.onChange({ currentTarget: { value: 'inherit' } }); });
+    expect(itemNames(root)).toEqual(['Inherit group']);
+    await act(async () => { search.props.onChange({ currentTarget: { value: '' } }); });
+    expect(itemNames(root)).toEqual(['Custom group', 'Inherit group']);
+    await act(async () => { renderer.unmount(); });
+  });
 });
 
 describe('localization', () => {

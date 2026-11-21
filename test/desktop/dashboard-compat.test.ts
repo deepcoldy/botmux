@@ -53,6 +53,7 @@ describe('dashboard desktop compat manifest', () => {
       schedules: { supported: true, route: '#/schedules' },
       settings: { supported: true, route: '#/settings' },
       workflow: { supported: false },
+      team: { supported: false },
     });
     expect(manifest.capabilities).toMatchObject({
       'overview.read': true,
@@ -65,8 +66,10 @@ describe('dashboard desktop compat manifest', () => {
       'settings.manage': true,
       'workflow.read': false,
       'workflow.manage': false,
+      'team.read': false,
     });
     expect(manifest.routes).not.toContain('#/workflows');
+    expect(manifest.routes).not.toContain('#/team');
     expect(manifest.routes).toEqual(
       Object.values(manifest.modules)
         .filter(module => module.supported && module.route)

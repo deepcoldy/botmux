@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { t } from './ui.js';
 import { feedbackAnalyticsQuery, feedbackDateRange, type FeedbackPageFilters } from './feedback-filters.js';
+import { FeedbackStoragePanel } from './feedback-storage-panel.js';
 
 type Summary = { delivered: number; ratedDeliveries: number; ratings: number; positive: number; negative: number; ratingCoverage: number; positiveRate: number; deliveryFailures: number; outboxFailures: number };
 type Trend = { bucket: string; positive: number; negative: number; ratings: number };
@@ -91,6 +92,7 @@ export function FeedbackPage(): React.JSX.Element {
   const maxReason = Math.max(1, ...reasons.map(row => row.count));
   return <div className="page feedback-page" aria-busy={loading}>
     <header className="sect-header"><div><h1>{t('feedback.title')}</h1><p>{t('feedback.subtitle')}</p></div></header>
+    <FeedbackStoragePanel />
     <form className="panel feedback-filters" onSubmit={event => { event.preventDefault(); apply(draft); }}>
       <div className="feedback-filter-fields">
         <label htmlFor="feedback-from">{t('feedback.from')}<input id="feedback-from" type="date" required value={draft.fromDate} onChange={event => setDraft(old => ({ ...old, fromDate: event.target.value }))} /></label>

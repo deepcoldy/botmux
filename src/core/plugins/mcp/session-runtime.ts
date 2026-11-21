@@ -7,6 +7,7 @@ import { pluginMcpPrivatePath, pluginRuntimeDir } from '../paths.js';
 import { sessionPluginManifestPath } from '../session-manifest.js';
 import type { PluginMcpServer } from '../types.js';
 import { isPluginMcpServer, readPluginMcpDescriptor } from './private-store.js';
+import { normalizeProtectedHttpEgressPolicy } from '../../protected-http-egress.js';
 import {
   ABSOLUTE_MAX_MCP_GATEWAY_TOOL_TIMEOUT_MS,
   effectiveMcpGatewayMaxToolTimeoutMs,
@@ -91,8 +92,16 @@ export function refreshSessionMcpRuntimeManifest(opts: {
       throw new Error(`plugin_mcp_tool_timeout_exceeds_max:${pluginId}:${runtime.toolTimeoutMs}:${maxToolTimeoutMs}`);
     }
     const env = runtime?.env;
-    const sessionServer = server.transport === 'stdio' && env && Object.keys(env).length > 0
-      ? { ...server, env: { ...(server.env ?? {}), ...env } }
+    const sessionServer: PluginMcpServer = server.transport === 'stdio'
+      ? {
+          ...server,
+          ...(env && Object.keys(env).length > 0
+            ? { env: { ...(server.env ?? {}), ...env } }
+            : {}),
+          ...(server.protectedEgressPolicy
+            ? { protectedEgressPolicy: normalizeProtectedHttpEgressPolicy(server.protectedEgressPolicy)! }
+            : {}),
+        }
       : server;
     entries.push({
       pluginId,

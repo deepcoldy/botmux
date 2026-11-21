@@ -6,6 +6,9 @@
  *
  * Run:  pnpm vitest run test/session-discovery.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
@@ -56,7 +59,7 @@ vi.mock('node:os', () => {
   };
 });
 
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -77,8 +80,21 @@ import {
   bareShellLaunchKind,
   bareShellLaunchGuidance,
   settleLaunchComm,
+  readCmdline,
 } from '../src/core/session-discovery.js';
 import type { CliId } from '../src/adapters/cli/types.js';
+
+describe('exact argv inspection', () => {
+  it('does not classify words from the lossy ps fallback as command arguments', () => {
+    vi.mocked(readFileSync).mockImplementation(() => { throw new Error('procfs unavailable'); });
+    vi.mocked(execFileSync).mockReturnValue('codex --profile team debug');
+    expect(readCmdline(123, { exact: true })).toEqual([]);
+    expect(execFileSync).not.toHaveBeenCalled();
+    // Existing executable-discovery callers keep their legacy fallback.
+    expect(readCmdline(123)).toEqual(['codex', '--profile', 'team', 'debug']);
+    expect(execFileSync).toHaveBeenCalled();
+  });
+});
 
 describe('isBareShellComm()', () => {
   it('classifies interactive shells as bare shells', () => {
@@ -861,7 +877,7 @@ describe('discoverAdoptableSessions', () => {
   it('should not include sessionId for non-claude CLI types', () => {
     setupMocks({
       paneLines: 'mysession:0.0 1000\n',
-      commMap: { 1000: 'bash', 1001: 'gemini' },
+      commMap: { 1000: 'bash', 1001: 'opencode' },
       childMap: { 1000: [1001] },
       cwdMap: { 1001: '/home/user/proj' },
       dimsMap: { 'mysession:0.0': '80 24' },
@@ -870,7 +886,7 @@ describe('discoverAdoptableSessions', () => {
     const results = discoverAdoptableSessions();
 
     expect(results).toHaveLength(1);
-    expect(results[0]!.cliId).toBe('gemini');
+    expect(results[0]!.cliId).toBe('opencode');
     expect(results[0]!.sessionId).toBeUndefined();
     expect(results[0]!.startedAt).toBeUndefined();
   });

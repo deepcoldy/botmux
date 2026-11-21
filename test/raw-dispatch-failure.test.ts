@@ -42,4 +42,29 @@ describe('rewrapSubmissionFailure — WAL transaction preserves the framed-runne
     expect(classifyRawDispatchFailure(rewrapped, false)).toBe('notify');
     expect(classifyRawDispatchFailure(rewrapped, true)).toBe('workflow-node-fail');
   });
+
+  it("keeps the writer's proof that its input never left, even after the write callback ran", () => {
+    // Framed runner refused the line before buffering a byte (untouched):
+    // the transaction's "callback ran" must not erase that proof.
+    const untouched = Object.assign(new Error('refused before buffering'), { submissionStarted: false });
+    expect(rewrapSubmissionFailure(untouched, undefined, true).submissionStarted).toBe(false);
+    // Without such proof, a failure after the callback started stays started.
+    expect(rewrapSubmissionFailure(new Error('boom'), undefined, true).submissionStarted).toBe(true);
+    const unknown = Object.assign(new Error('dirty'), { submissionStarted: true });
+    expect(rewrapSubmissionFailure(unknown, undefined, true).submissionStarted).toBe(true);
+    // A transaction rejected before its write is never promoted to started.
+    expect(rewrapSubmissionFailure(unknown, 'held', false).submissionStarted).toBe(false);
+  });
+
+  it('preserves a proven TraeX catalog pre-write refusal across the WAL rewrap', () => {
+    const original = Object.assign(new Error('catalog changed before write'), {
+      submissionStarted: false, traexCatalogAdmissionRequired: true,
+    });
+    const rewrapped = rewrapSubmissionFailure(original, 'journal-cancelled', true);
+    expect(rewrapped).toMatchObject({
+      submissionStarted: false,
+      runnerGenerationUnsafe: false,
+      traexCatalogAdmissionRequired: true,
+    });
+  });
 });

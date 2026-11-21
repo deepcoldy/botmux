@@ -17,7 +17,7 @@ for (const mode of ['banner', 'resume', 'resumed-context', 'slow-resume', 'tmux-
   it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
     `holds input during loading, submits once after ${mode}, and commits only after confirmation`,
     () => runStartupScenario(mode, backendType),
-    115_000,
+    mode === 'slow-resume' ? 145_000 : 115_000,
   );
 }
 
@@ -29,6 +29,8 @@ async function runStartupScenario(mode: string, backendType: 'tmux' | 'pty'): Pr
   const botmuxDir = join(homedir(), '.botmux');
   mkdirSync(botmuxDir, { recursive: true, mode: 0o700 });
   chmodSync(botmuxDir, 0o700);
+  // The runner owns this disposable HOME; do not open zsh-newuser-install.
+  writeFileSync(join(homedir(), '.zshrc'), '# isolated worker test\n');
   const root = mkdtempSync(join(backendType === 'tmux' ? '/tmp' : tmpdir(), 'bmx-startup-'));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir);
@@ -73,12 +75,22 @@ const poll = setInterval(() => {
       ? '\x1b[1m›\x1b[0m \x1b[2mAsk Codex to do anything\x1b[0m\r\n\x1b[0m\x1b[39m\x1b[49m\r\n  \x1b[36mcustom-model\x1b[0m · \x1b[32m/tmp\x1b[0m'
       : '› Ask Codex to do anything\r\n\r\n  custom-model · /tmp')
     : '\x1b[2J\x1b[H│ model: custom-model /model to change │\r\n│ directory: /tmp │\r\n› Ask Codex to do anything\r\n  custom-model · /tmp')});
+  // Native Codex leaves the cursor at the empty composer, not at the footer.
+  process.stdout.write(${JSON.stringify('\x1b[' + (mode === 'banner' ? '3' : mode === 'resumed-context' ? '1' : '2') + ';3H')});
 }, 50);
 setInterval(() => {}, 1000);
 `);
   chmodSync(fakeCli, 0o755);
   const messages: WorkerToDaemon[] = [];
   const logs: string[] = [];
+  const workerScript = join(root, 'worker-bootstrap.ts');
+  writeFileSync(workerScript, `
+(async () => {
+await import(${JSON.stringify(resolve('src/worker-ipc-preload.ts'))});
+await import(${JSON.stringify(resolve('src/worker.ts'))});
+process.send?.({ type: 'worker_ipc_ready' });
+})().catch(error => { console.error(error); process.exitCode = 1; });
+`);
   let child: ChildProcess | undefined;
   const waitFor = async (condition: () => boolean, timeoutMs = 12_000) => {
     const deadline = Date.now() + timeoutMs;
@@ -95,10 +107,18 @@ setInterval(() => {}, 1000);
     };
     child = process.env.BOTMUX_TEST_WORKER_BINARY
       ? spawn(process.env.BOTMUX_TEST_WORKER_BINARY, ['__worker'], spawnOptions)
-      : spawnNodeTsScript(resolve('src/worker.ts'), [], spawnOptions);
+      : spawnNodeTsScript(workerScript, [], spawnOptions);
     child.on('message', m => messages.push(m as WorkerToDaemon));
     child.stdout?.on('data', b => logs.push(b.toString()));
     child.stderr?.on('data', b => logs.push(b.toString()));
+    // Cold tsx imports can exceed the CLI's first-frame window on a small
+    // runner. Source fixtures ACK only after the full handler is installed.
+    // Compiled-worker fixtures keep their existing init path.
+    const bootstrapDeadline = Date.now() + 30_000;
+    while (!process.env.BOTMUX_TEST_WORKER_BINARY && !messages.some(message => message.type === 'worker_ipc_ready')) {
+      if (Date.now() >= bootstrapDeadline || child.exitCode != null) throw new Error(`worker IPC bootstrap\n${logs.join('')}`);
+      await new Promise(r => setTimeout(r, 50));
+    }
     child.send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
       workingDir: dataDir, cliId: 'codex', cliPathOverride: fakeCli,

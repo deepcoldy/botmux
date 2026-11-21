@@ -2,7 +2,7 @@ import { ChildProcess } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import type { DaemonSession } from '../src/core/types.js';
-import { canAutoCloseMessageListenerSession, createMessageListenerAutoCloseScheduler, MESSAGE_LISTENER_CLOSE_DELAY_MS, MESSAGE_LISTENER_DELIVERY_DRAIN_TIMEOUT_MS } from '../src/core/message-listener-auto-close.js';
+import { canAutoCloseMessageListenerSession, createMessageListenerAutoCloseScheduler, recordMessageListenerTurnTerminal, MESSAGE_LISTENER_CLOSE_DELAY_MS, MESSAGE_LISTENER_DELIVERY_DRAIN_TIMEOUT_MS } from '../src/core/message-listener-auto-close.js';
 
 /** Build an idle listener session with positive, exact-turn completion evidence. */
 function session(): DaemonSession {
@@ -17,8 +17,53 @@ function session(): DaemonSession {
 }
 
 describe('message listener auto-close', () => {
+  it('closes the first submitted listener turn without a presentation turn marker', async () => {
+    vi.useFakeTimers();
+    const ds = session();
+    ds.currentTurnId = undefined;
+    ds.lastCliInputTurnId = 'turn-1';
+    ds.messageListenerCompletedTurnId = undefined;
+    const closeCompletedSession = vi.fn(async () => {});
+    const schedule = createMessageListenerAutoCloseScheduler({
+      mutate: async (_ds, action) => action(), isCurrent: () => true, closeCompletedSession, onError: vi.fn(),
+    });
+    if (recordMessageListenerTurnTerminal(ds, { turnId: 'turn-1', status: 'completed' })) schedule(ds);
+    await vi.advanceTimersByTimeAsync(MESSAGE_LISTENER_CLOSE_DELAY_MS);
+    expect(closeCompletedSession).toHaveBeenCalledExactlyOnceWith(ds);
+  });
+
   it('allows only a successfully completed idle listener session', () => {
     expect(canAutoCloseMessageListenerSession(session(), 'turn-1')).toBe(true);
+  });
+
+  it.each(['failed', 'cancelled', 'ambiguous'] as const)('retains an opening turn that %s', status => {
+    const ds = session();
+    ds.currentTurnId = undefined;
+    ds.lastCliInputTurnId = 'turn-1';
+    expect(recordMessageListenerTurnTerminal(ds, { turnId: 'turn-1', status })).toBe(true);
+    expect(canAutoCloseMessageListenerSession(ds, 'turn-1')).toBe(false);
+  });
+
+  it('does not let an old completion override a newer submitted input with a stale presentation marker', () => {
+    const ds = session();
+    ds.lastCliInputTurnId = 'turn-2';
+    ds.messageListenerCompletedTurnId = undefined;
+    expect(recordMessageListenerTurnTerminal(ds, { turnId: 'turn-1', status: 'completed' })).toBe(false);
+    expect(ds.messageListenerCompletedTurnId).toBeUndefined();
+    // Even a timer armed before the next submission must recheck the input identity.
+    ds.messageListenerCompletedTurnId = 'turn-1';
+    expect(canAutoCloseMessageListenerSession(ds, 'turn-1')).toBe(false);
+  });
+
+  it('ignores ordinary sessions and completion with no runtime input identity', () => {
+    const ds = session();
+    ds.messageListenerCompletedTurnId = undefined;
+    ds.session.messageListenerAutoClose = false;
+    expect(recordMessageListenerTurnTerminal(ds, { turnId: 'turn-1', status: 'completed' })).toBe(false);
+    ds.session.messageListenerAutoClose = true;
+    ds.currentTurnId = undefined;
+    expect(recordMessageListenerTurnTerminal(ds, { turnId: 'turn-1', status: 'completed' })).toBe(false);
+    expect(ds.messageListenerCompletedTurnId).toBeUndefined();
   });
 
   it.each(['ordinary', 'failed', 'new-turn', 'new-reply', 'working', 'closed', 'attention', 'queued', 'raw-input', 'follow-up', 'initial-start', 'follow-up-input', 'xpi', 'shared-cwd-queue', 'continuation', 'recovery'])(
@@ -127,6 +172,28 @@ describe('listener close scheduling', () => {
     schedule(ds);
     await vi.advanceTimersByTimeAsync(MESSAGE_LISTENER_CLOSE_DELAY_MS);
     expect(closeCompletedSession).toHaveBeenCalledOnce();
+  });
+
+  it('blocks the old timer after only the next input identity updates, then closes the completed next turn', async () => {
+    vi.useFakeTimers();
+    const ds = session();
+    ds.currentTurnId = undefined;
+    ds.currentReplyTarget = undefined;
+    ds.lastCliInputTurnId = 'turn-1';
+    const closeCompletedSession = vi.fn(async () => {});
+    const schedule = createMessageListenerAutoCloseScheduler({
+      mutate: async (_ds, action) => action(), isCurrent: () => true, closeCompletedSession, onError: vi.fn(),
+    });
+    schedule(ds);
+    await vi.advanceTimersByTimeAsync(MESSAGE_LISTENER_CLOSE_DELAY_MS / 2);
+    ds.lastCliInputTurnId = 'turn-2';
+    expect(recordMessageListenerTurnTerminal(ds, { turnId: 'turn-1', status: 'completed' })).toBe(false);
+    await vi.advanceTimersByTimeAsync(MESSAGE_LISTENER_CLOSE_DELAY_MS);
+    expect(closeCompletedSession).not.toHaveBeenCalled();
+    expect(recordMessageListenerTurnTerminal(ds, { turnId: 'turn-2', status: 'completed' })).toBe(true);
+    schedule(ds);
+    await vi.advanceTimersByTimeAsync(MESSAGE_LISTENER_CLOSE_DELAY_MS);
+    expect(closeCompletedSession).toHaveBeenCalledExactlyOnceWith(ds);
   });
 
 

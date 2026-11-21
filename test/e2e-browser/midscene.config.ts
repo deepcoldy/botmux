@@ -70,7 +70,7 @@ const waitForBotResponseNode = defineNode({
 
 const showStreamingOutputNode = defineNode({
   name: 'feishu.showStreamingOutput',
-  description: 'Scroll the streaming card into view and toggle 显示输出. Codex cases skip this.',
+  description: 'Unfold 更多操作 on the streaming card and turn 显示输出 on. Codex cases skip this.',
   inputSchema: phaseInput,
   async execute(ctx) {
     return showStreamingOutputPhase(ctx);

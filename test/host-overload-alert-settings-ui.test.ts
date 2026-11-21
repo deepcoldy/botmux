@@ -2,6 +2,7 @@ import React, { type ComponentProps } from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { HostOverloadAlertSettingsEditor } from '../src/dashboard/web/settings-page.js';
+import { DropdownMenu, type DropdownOption } from '../src/dashboard/web/dashboard-components.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -42,7 +43,7 @@ function renderEditor(value: EditorValue, onSave = vi.fn(async () => undefined))
 }
 
 function targetMenu(renderer: TestRenderer.ReactTestRenderer) {
-  return renderer.root.findAllByType('summary').find(s => s.props['aria-label'] === '通知 Bot');
+  return renderer.root.findAllByType(DropdownMenu).find(menu => menu.props.ariaLabel === '通知 Bot');
 }
 function toggle(renderer: TestRenderer.ReactTestRenderer) {
   return renderer.root.findAllByType('input').find(i => i.props.type === 'checkbox')!;
@@ -72,12 +73,10 @@ describe('HostOverloadAlertSettingsEditor — fresh/default state (deadlock regr
   it('selecting a target from the dropdown saves targetBotAppId (escapes the deadlock)', () => {
     const { renderer, onSave } = renderEditor(freshValue());
     const menu = targetMenu(renderer)!;
-    // DropdownMenu renders option buttons; click the one for cli_a.
-    const parent = menu.parent!;
-    const buttons = parent.findAllByType('button');
-    const pick = buttons.find(b => JSON.stringify(b.props.children ?? '').includes('Claude'));
+    const pick = (menu.props.options as DropdownOption<string>[])
+      .find(option => JSON.stringify(option.label ?? '').includes('Claude'));
     expect(pick).toBeTruthy();
-    act(() => { pick!.props.onClick?.({}); });
+    act(() => { menu.props.onChange(pick!.value); });
     expect(onSave).toHaveBeenCalledWith({ targetBotAppId: 'cli_a' });
   });
 

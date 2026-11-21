@@ -16,6 +16,7 @@
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withManagedDirectories } from './managed-directory-retention.js';
 
 /**
  * 评论触发范围：
@@ -187,7 +188,8 @@ function readFile(dataDir: string, larkAppId: string): FileShape {
 
 function writeFile(dataDir: string, larkAppId: string, data: FileShape): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  atomicWriteFileSync(filePath(dataDir, larkAppId), JSON.stringify(data, null, 2) + '\n');
+  withManagedDirectories(Object.values(data), () =>
+    atomicWriteFileSync(filePath(dataDir, larkAppId), JSON.stringify(data, null, 2) + '\n'));
 }
 
 /**

@@ -9,6 +9,8 @@ import {
   durableLarkSessionControlEventId,
   durableLarkSessionControlPartition,
   durableLarkSessionControlPartitionPrefix,
+  durableSessionControlMaxAttempts,
+  DURABLE_DISPLAY_CONTROL_MAX_ATTEMPTS,
 } from '../src/services/durable-lark-session-control.js';
 import { startDurableSessionControlConsumer } from '../src/services/durable-session-control-consumer.js';
 import { DurableSessionControlOwnerHandoffError } from '../src/services/durable-session-control-errors.js';
@@ -392,5 +394,85 @@ describe('durable session control consumer', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  describe('#2062 per-action retry budget', () => {
+    function displayEvent(sessionId: string, stableEventId: string, now: number) {
+      return durableLarkSessionControlEvent({
+        larkAppId: 'cli_test',
+        eventId: durableLarkSessionControlEventId('cli_test', stableEventId),
+        partitionKey: durableLarkSessionControlPartition('cli_test', sessionId),
+        data: {
+          ...rawControl(sessionId, stableEventId),
+          action: { value: {
+            action: 'toggle_display',
+            target_display_mode: 'screenshot',
+            session_id: sessionId,
+            root_id: `om_root_${sessionId}`,
+          } },
+        },
+        now,
+      });
+    }
+
+    async function run(
+      events: ReturnType<typeof controlEvent>[],
+      failing: (action: string) => boolean,
+      rounds: number,
+    ) {
+      let clock = 10;
+      const store = makeStore(() => clock);
+      for (const event of events) await store.enqueueInbox(event);
+      const dispatched: string[] = [];
+      const settled: Array<{ action: string; kind: string }> = [];
+      const consumer = startDurableSessionControlConsumer({
+        store,
+        workerId: 'control-budget',
+        ownedPartitionKeys: () => [durableLarkSessionControlPartition('cli_test', 'session-a')],
+        maxAttemptsFor: durableSessionControlMaxAttempts,
+        dispatch: async control => {
+          dispatched.push(control.action);
+          if (failing(control.action)) throw new Error(`${control.action} cannot be applied here`);
+          return { kind: 'settled' };
+        },
+        onSettled: ({ control, result }) => settled.push({ action: control.action, kind: result.kind }),
+        onError: () => {},
+        concurrency: 1,
+        intervalMs: 10,
+        retryDelayMs: 100,
+        now: () => clock,
+      });
+      await consumer.ready;
+      for (let round = 0; round < rounds; round += 1) {
+        clock += 100;
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      consumer.terminate();
+      await consumer.stop(0);
+      await store.close();
+      return { dispatched, settled };
+    }
+
+    it('settles an unappliable display toggle after its budget and lets the queued close run', async () => {
+      const { dispatched, settled } = await run([
+        displayEvent('session-a', 'evt-display', 1),
+        controlEvent('session-a', 'evt-close', 2),
+      ], action => action === 'toggle_display', 20);
+      expect(dispatched.filter(action => action === 'toggle_display'))
+        .toHaveLength(DURABLE_DISPLAY_CONTROL_MAX_ATTEMPTS);
+      expect(dispatched.filter(action => action === 'close')).toHaveLength(1);
+      expect(settled).toEqual([
+        { action: 'toggle_display', kind: 'ignored' },
+        { action: 'close', kind: 'settled' },
+      ]);
+    });
+
+    it('keeps retrying a lifecycle control without a budget', async () => {
+      const { dispatched, settled } = await run([
+        controlEvent('session-a', 'evt-close', 1),
+      ], () => true, 20);
+      expect(dispatched.length).toBeGreaterThan(DURABLE_DISPLAY_CONTROL_MAX_ATTEMPTS * 2);
+      expect(settled).toEqual([]);
+    });
   });
 });

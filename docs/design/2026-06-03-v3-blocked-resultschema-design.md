@@ -109,6 +109,7 @@ classifyTerminal(errorClass, opts?: {retryable?: boolean}) → 'blocked' | 'fail
 - **runtime 派发取数顺序（codex v2，防半写/restart 退回 001 或与 retry command 双算）**：若 `attempts` map 里已有该 node 的 retry intent（nextAttemptId），**用它**作为本次 attempt；否则自己 `max(dispatched, retryRequested)+1`。
 - runtime 派发时用它替换硬编码 001；attemptDir/outputDir/各 path 跟着走 NNN。
 - architect 的单发路径（architect.ts `ARCHITECT_ATTEMPT_ID='architect/attempts/001'`）**不在重试循环里，保持 001 不动**——只有 runtime 的逐节点派发要算 counter。
+  - **后续（#3129）**：固定 001 让同一 Run 每次重跑 Architect 都拿到同一个 sessionId / tmux 会话名，上一轮会话还在时新一轮建会话失败（`duplicate session`）。现在每次 `hostArchitect` 在 host 锁内用 `allocateArchitectAttempt` 分配下一个 `architect/attempts/NNN`（磁盘最大号 + 1），旧 attempt 目录保留。
 - 范围控制：第一刀 counter 只服务 blocked retry，不引入 failed retry / 任意重跑入口。
 
 ---

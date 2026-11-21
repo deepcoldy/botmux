@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: mocks.forkWorker,
   sendWorkerInput: mocks.sendWorkerInput,
   getCurrentCliVersion: () => 'test',

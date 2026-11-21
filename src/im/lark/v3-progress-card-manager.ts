@@ -27,6 +27,7 @@ import { basename, dirname, join } from 'node:path';
 import { fsyncDirectorySyncPortable } from '../../utils/fs-durability.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { readJournal } from '../../workflows/v3/journal.js';
+import { tryLoadEffectiveV3Dag } from '../../workflows/v3/dag-revision.js';
 import { isValidRunId } from '../../workflows/v3/ops-projection.js';
 import { projectV3Progress, type V3ProgressView } from '../../workflows/v3/progress-projection.js';
 import {
@@ -254,7 +255,9 @@ export class V3ProgressCardManager {
       }
       const view = projectV3Progress({
         envelope: loaded.envelope,
-        dag: loaded.dag,
+        // Count from the EFFECTIVE flow (design §13.7); an integrity failure
+        // in a revision falls back to the authorized DAG for display.
+        dag: tryLoadEffectiveV3Dag(runDir, loaded.dag, events)?.dag ?? loaded.dag,
         ...(loaded.spec ? { spec: loaded.spec } : {}),
         events,
       });

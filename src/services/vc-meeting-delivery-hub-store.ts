@@ -11,8 +11,8 @@
  * One JSON file is used per (listenerAppId, meetingId). Every RMW is protected
  * by the repository file lock and written with tmp+rename at mode 0600.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   VC_MEETING_DELIVERY_GAP_REASONS,
   VC_MEETING_DELIVERY_KINDS,
@@ -26,6 +26,13 @@ import {
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
+import {
+  StoreFileUnavailableError,
+  hasQuarantinedSibling,
+  quarantineStoreFileIfUnchanged,
+  readStoreFileStrict,
+  storeFileExistsStrict,
+} from '../utils/json-file.js';
 import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileFilter,
@@ -728,22 +735,30 @@ function normalizePersistedMemberPolicies(value: unknown): void {
 }
 
 function readStateForAccess(filePath: string): VcMeetingHubStateFile | undefined {
-  if (!existsSync(filePath)) {
-    const prefix = `${basename(filePath)}.corrupt.`;
-    let quarantined = false;
-    try { quarantined = readdirSync(dirname(filePath)).some(name => name.startsWith(prefix)); }
-    catch { /* a genuinely absent directory/state is initializable */ }
-    if (quarantined) throw new Error(`vc meeting hub state has quarantined evidence for ${filePath}`);
+  // Read failures other than ENOENT (EMFILE, EIO, EACCES, …) propagate as
+  // StoreFileUnavailableError: the bytes were never seen, so they are neither
+  // "missing" (initializable) nor "corrupt" (quarantinable).
+  const read = readStoreFileStrict(filePath, 'vc meeting hub state');
+  if (read === undefined) {
+    // A genuinely absent directory/state is initializable.
+    if (hasQuarantinedSibling(filePath, '.corrupt.', 'vc meeting hub state')) {
+      throw new Error(`vc meeting hub state has quarantined evidence for ${filePath}`);
+    }
     return undefined;
   }
   try {
-    const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
+    const parsed: unknown = JSON.parse(read.text);
     normalizePersistedMemberPolicies(parsed);
     if (!validState(parsed)) throw new Error('state failed schema/invariant validation');
     return parsed;
   } catch (err) {
     const aside = `${filePath}.corrupt.${Date.now()}.${process.pid}`;
-    try { renameSync(filePath, aside); } catch { /* another process may already quarantine it */ }
+    let moved = false;
+    try { moved = quarantineStoreFileIfUnchanged(filePath, read.ident, aside); } catch { /* another process may already quarantine it */ }
+    if (!moved && existsSync(filePath)) {
+      // Replaced after it was judged (e.g. repaired): never move the new file.
+      throw new StoreFileUnavailableError('vc meeting hub state', filePath, 'quarantine', new Error('file was replaced after it was read'));
+    }
     logger.warn(
       `[vc-meeting-delivery-hub-store] corrupt state at ${filePath}, moved aside to ${aside}: `
       + `${err instanceof Error ? err.message : String(err)}`,
@@ -786,7 +801,13 @@ function mutateState<T>(
 
 function readState(dataDir: string, listenerAppId: string, meetingId: string): VcMeetingHubStateFile | undefined {
   const filePath = meetingFilePath(dataDir, listenerAppId, meetingId);
-  if (!existsSync(filePath)) return undefined;
+  if (!storeFileExistsStrict(filePath, 'vc meeting hub state')) {
+    // Same rule as the locked read: quarantined evidence is not "no state".
+    if (hasQuarantinedSibling(filePath, '.corrupt.', 'vc meeting hub state')) {
+      throw new Error(`vc meeting hub state has quarantined evidence for ${filePath}`);
+    }
+    return undefined;
+  }
   return withFileLockSync(filePath, () => readStateForAccess(filePath));
 }
 

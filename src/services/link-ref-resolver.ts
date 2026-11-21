@@ -154,6 +154,7 @@ export function resolveOutboundLinkRefs(
   enforceFinalLinkIntegrity({
     payload: expanded,
     responseKind,
+    registrationLimited: () => ledger.readTurn(key)?.registrationLimited === true,
     registeredUrls: () => {
       try {
         return ledger.listRegistered(key).map(entry => entry.originalUrl);

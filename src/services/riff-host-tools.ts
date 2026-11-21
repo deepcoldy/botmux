@@ -7,14 +7,19 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { StringDecoder } from 'node:string_decoder';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { botmuxCliInvocation, buildRelayHostEnv } from '../adapters/backend/sandbox.js';
-import { quotedAttachments } from './remote-runner-session-tool.js';
+import { quotedAttachments, QuotedAttachmentCountError, QuotedAttachmentLimitError } from './remote-runner-session-tool.js';
 import { isStandaloneBinary } from '../core/self-spawn.js';
+import { parseRiffUploadIndex } from './riff-upload-placeholder.js';
+import { parseSendInvocation, validateHostSendInvocation } from '../cli/send-invocation.js';
+import { parseQuotedReadOptions } from '../cli/history-read.js';
 
 export const RIFF_HOST_TOOLS_ROUTE = '/api/riff-host-tools';
 export const RIFF_HOST_BINDING_ENV = 'BOTMUX_RIFF_HOST_BINDING';
 export const RIFF_HOST_MAX_BYTES = 48 * 1024 * 1024;
+// 24 MiB of binary data becomes 32 MiB in base64, leaving room for text
+// and JSON metadata within the sandbox client's 48 MiB response limit.
+export const RIFF_HOST_MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
-const UPLOAD_PREFIX = 'riff-upload:';
 const RECEIPT_LIMIT = 1000;
 const RECEIPT_TTL_MS = 7 * 24 * 60 * 60_000;
 let cliSha256: string | undefined;
@@ -33,24 +38,25 @@ export interface RiffHostContext {
 }
 
 // The remote caller supplies content and supported options, never an executable,
-// environment, host path, destination session or application. Existing CLI and
-// daemon policies still authorize the resulting operation.
+// environment, host path, destination session or application. Requested chat
+// destinations are authorized by the daemon, just like sandbox outbox sends.
 const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; files?: string }> = {
   send: {
-    values: '--response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode',
-    bools: '--mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice --text --card',
+    values: '--chat-id --response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode',
+    bools: '--top-level --mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice --text --card',
     files: '--content-file --card-file --images --image --files --file --videos --video-covers --completion-proposal-file',
   },
   ask: { sub: ['buttons'], values: '--options --timeout', bools: '--json --multi', files: '--questions-file' },
   auth: { sub: ['request', 'wait'], values: '--scope --request-id', bools: '--json --allow-unknown' },
   schedule: {
     sub: ['list', 'add', 'update', 'remove', 'pause', 'resume', 'run', 'calendars'],
-    values: '--name --id --prompt --model --reasoning-effort --calendar --calendar-day-type --topic-title',
+    values: '--name --id --prompt --schedule --model --reasoning-effort --calendar --calendar-day-type --topic-title',
     bools: '--top-level --topic --new-topic --silent --follow-active', files: '--prompt-file',
   },
-  history: { values: '--limit --scope', bools: '--with-card-json' },
-  quoted: { bools: '--raw' },
+  history: { values: '--limit --scope --view --query --type --since --until', bools: '--with-card-json' },
+  quoted: { bools: '--raw --no-download' },
   bots: { sub: ['list'], values: '--scope' },
+  chat: { sub: ['create', 'members'], values: '--name --member --chat-mode --chat-id', bools: '--json' },
   project: {
     sub: ['init', 'status', 'update', 'close', 'resume'],
     values: '--title --goal --phase --focus --remaining --progress --blocker --milestone --next-milestone',
@@ -58,8 +64,8 @@ const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; f
   },
   board: {
     sub: ['guide', 'list', 'show', 'add', 'set', 'history', 'attach', 'pending'],
-    values: '--view --key --state --stage --kind --repo --summary --progress --ask --option --recommend --reason --link --unlink --note --title',
-    bools: '--json --handled --clear-ask',
+    values: '--view --key --state --stage --kind --repo --summary --progress --ask --option --recommend --reason --link --unlink --note --title --primary-chat --no-chat --close-when --depends-on --next-check',
+    bools: '--json --handled --clear-ask --allow-unverified-chat --dismiss-hint',
   },
   workflow: { sub: ['list', 'show', 'run', 'start', 'retry', 'cancel', 'grant'], values: '--param --reason --node', bools: '--json' },
   card: { sub: ['patch'], values: '--message-id --card-json --plugin-card-action', files: '--card-file' },
@@ -115,28 +121,43 @@ export function parseRiffHostRequest(raw: unknown): RiffHostRequest {
   }
   const used = new Set<number>();
   for (const i of paths) {
-    const index = Number(r.argv[i]!.slice(UPLOAD_PREFIX.length));
-    if (!r.argv[i]!.startsWith(UPLOAD_PREFIX) || !Number.isSafeInteger(index) || index < 0 || !r.files?.[index]) throw new Error('riff_host_upload_missing');
+    const index = parseRiffUploadIndex(r.argv[i]!);
+    if (index === undefined || !r.files?.[index]) throw new Error('riff_host_upload_missing');
     used.add(index);
   }
   if (used.size !== (r.files?.length ?? 0)) throw new Error('riff_host_upload_unreferenced');
   return { operationId: r.operationId, argv: r.argv, stdin: r.stdin, files: r.files };
 }
 
+function validateRiffHostSendRequest(request: RiffHostRequest): string | null {
+  if (request.argv[0] !== 'send') return null;
+  const invocation = parseSendInvocation(request.argv.slice(1));
+  const validated = validateHostSendInvocation(invocation, { uploads: request.files ?? [] });
+  return validated.ok ? null : validated.message;
+}
+
 export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHostContext): Promise<RiffHostResult> {
   parseRiffHostRequest(request);
+  const sendError = validateRiffHostSendRequest(request);
+  if (sendError) throw new Error(sendError);
   if (!ctx.isCurrent()) throw new Error('riff_host_turn_stale');
   const dir = mkdtempSync(join(tmpdir(), 'botmux-riff-tool-'));
   try {
     const argv = [...request.argv];
     for (const i of riffHostFileArguments(argv)) {
-      const index = Number(argv[i]!.slice(UPLOAD_PREFIX.length));
+      const index = parseRiffUploadIndex(argv[i]!);
+      if (index === undefined) throw new Error('riff_host_upload_missing');
       const file = request.files![index]!;
       const path = join(dir, `${index}-${basename(file.name)}`);
       writeFileSync(path, Buffer.from(file.dataBase64, 'base64'), { mode: 0o600 });
       argv[i] = path;
     }
     if (argv[0] === 'quoted') argv.push('--remote-runner-session-tool');
+    // Batch quoted exits 1 for per-id errors while still printing the
+    // successful messages and their downloaded attachments; package those too.
+    const quotedBatch = argv[0] === 'quoted' && (() => {
+      try { return parseQuotedReadOptions(argv.slice(1)).batch; } catch { return false; }
+    })();
     if (argv[0] === 'schedule' && argv[1] === 'add') {
       if (!ctx.workingDir) throw new Error('riff_host_working_directory_unavailable');
       argv.push('--workdir', ctx.workingDir);
@@ -168,11 +189,26 @@ export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHos
         clearTimeout(deadline); clearInterval(fence);
         stdout += outDecoder.end(); stderr += errDecoder.end();
         try {
-          const packaged = argv[0] === 'quoted' && code === 0 ? quotedAttachments(stdout, env) : { stdout };
+          const packaged = argv[0] === 'quoted' && (code === 0 || (code === 1 && quotedBatch))
+            ? quotedAttachments(stdout, env, RIFF_HOST_MAX_ATTACHMENT_BYTES) : { stdout };
           resolve({ exitCode: failed || code === null ? 1 : code, stdout: packaged.stdout,
             stderr: failed ? 'riff_host_execution_unknown; do not repeat this operation automatically' : stderr,
             ...('attachments' in packaged ? { attachments: packaged.attachments } : {}) });
-        } catch { resolve({ exitCode: 1, stdout: '', stderr: 'riff_host_attachment_invalid' }); }
+        } catch (error) {
+          let diagnostic = 'riff_host_attachment_invalid';
+          if (error instanceof QuotedAttachmentLimitError) {
+            diagnostic = `riff_host_attachment_too_large: ${error.actualBytes} bytes > ${error.limitBytes} bytes; reduce the attachment size`;
+          } else if (error instanceof QuotedAttachmentCountError) {
+            diagnostic = `riff_host_attachment_too_many: ${error.actualCount} > ${error.limitCount}; request fewer message ids or add --no-download`;
+          } else {
+            // Expose filesystem failure categories without leaking host paths.
+            const code = (error as NodeJS.ErrnoException | null)?.code;
+            if (typeof code === 'string' && /^(ENOENT|EACCES|EPERM|EIO|ENOTDIR|ELOOP)$/.test(code)) {
+              diagnostic = `riff_host_attachment_read_failed: ${code}`;
+            }
+          }
+          resolve({ exitCode: 1, stdout: '', stderr: diagnostic });
+        }
       };
       child.once('error', () => { failed = true; });
       child.once('close', finish);
@@ -263,6 +299,8 @@ export class RiffHostTools {
         let length = 0; const chunks: Buffer[] = [];
         for await (const chunk of req) { length += chunk.length; if (length > RIFF_HOST_MAX_BYTES) throw new Error('riff_host_request_too_large'); chunks.push(chunk); }
         request = parseRiffHostRequest(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        const sendError = validateRiffHostSendRequest(request);
+        if (sendError) { json(400, { error: sendError }); return; }
         req.setTimeout(0);
         operationId = request.operationId;
       } else if (req.method === 'GET') {

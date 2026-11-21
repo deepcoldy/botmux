@@ -25,11 +25,26 @@ export interface BridgeReadPosition {
  *  the screen heuristics can end before that write and say nothing. */
 export const BLIND_TURN_MIN_BUSY_MS = 3_000;
 
+/** How often, and how many more times, the worker looks for an unread turn's
+ *  transcript when Claude's pid-state record was caught mid-rewrite. Claude
+ *  rewrites that record in place on the very busy→idle edge the turn is judged
+ *  on, and a loaded host can hold the rewrite between its truncate and its
+ *  write past any fixed re-read window: a single look then reports a reply as
+ *  lost that the next bridge tick delivers. A record that stays unreadable
+ *  across these looks gets the notice a few seconds later. */
+export const UNREAD_TURN_RELOCATE_RETRY_MS = 1_000;
+export const UNREAD_TURN_RELOCATE_RETRIES = 3;
+
 export type BlindTurnVerdict =
   /** No turn evidence since the last prompt, or too short to judge. */
   | { kind: 'none' }
   /** The bridge read the turn (its file grew, or it moved onto another one). */
   | { kind: 'read' }
+  /** An idle-compaction span the bridge read nothing of. Compaction writes its
+   *  records after the prompt returns and answers nobody, so it is not
+   *  reported; but terminal input the worker never sees (a client attached
+   *  straight to the pane) can run a real turn inside it. */
+  | { kind: 'maintenance'; turnStartedAtMs: number }
   | {
     kind: 'blind';
     /** When this turn started. */
@@ -42,20 +57,42 @@ export type BlindTurnVerdict =
   };
 
 export class BridgeBlindTurnWatch {
-  private turn: { startedAtMs: number; at: BridgeReadPosition } | undefined;
+  private turn: { startedAtMs: number; at: BridgeReadPosition; maintenance: boolean } | undefined;
   private blindSinceMs: number | undefined;
   private reported = false;
+  private idleCompaction = false;
+  private lastPromptAtMs = -Infinity;
+
+  /** PreCompact 是维护事件，不能当成产生回复的模型轮次。已有待处理输入时
+   *  不豁免：真实漏读仍由原来的恢复与告警路径处理。 */
+  noteCompactionStarted(hasPendingTurn: boolean, hookStartedAtMs: number): boolean {
+    if (hasPendingTurn || hookStartedAtMs <= this.lastPromptAtMs
+      || this.idleCompaction || this.turn?.maintenance) return false;
+    // 不能把压缩前已运行的模型轮次改成维护；只覆盖 hook 之后才观察到的忙碌。
+    if (this.turn && this.turn.startedAtMs < hookStartedAtMs) return false;
+    this.idleCompaction = true;
+    if (this.turn) this.turn.maintenance = true;
+    return true;
+  }
+
+  noteCompactionFinished(): void {
+    this.idleCompaction = false;
+  }
 
   /** Explicit evidence the CLI started a model turn. A turn already open keeps
    *  its start. */
   noteTurnStarted(at: BridgeReadPosition, nowMs: number): void {
-    this.turn ??= { startedAtMs: nowMs, at: { ...at } };
+    this.turn ??= { startedAtMs: nowMs, at: { ...at }, maintenance: this.idleCompaction };
   }
 
   /** The CLI is back at its prompt: judge the turn that just ended. */
-  noteTurnEnded(at: BridgeReadPosition, nowMs: number): BlindTurnVerdict {
+  noteTurnEnded(at: BridgeReadPosition, nowMs: number, hasPendingTurn = false): BlindTurnVerdict {
+    // 即使压缩被取消、没有 SessionStart(compact)，提示符也会结束这次豁免，
+    // 下一条真正的输入不能一直被当作维护。旧的漏读 run 与去重状态保留。
     const turn = this.turn;
     this.turn = undefined;
+    this.idleCompaction = false;
+    this.lastPromptAtMs = nowMs;
     if (!turn) return { kind: 'none' };
     if (at.path !== turn.at.path || at.offset > turn.at.offset) {
       this.blindSinceMs = undefined;
@@ -63,6 +100,7 @@ export class BridgeBlindTurnWatch {
       return { kind: 'read' };
     }
     if (nowMs - turn.startedAtMs < BLIND_TURN_MIN_BUSY_MS) return { kind: 'none' };
+    if (turn.maintenance && !hasPendingTurn) return { kind: 'maintenance', turnStartedAtMs: turn.startedAtMs };
     this.blindSinceMs ??= turn.startedAtMs;
     return { kind: 'blind', turnStartedAtMs: turn.startedAtMs, blindSinceMs: this.blindSinceMs, reported: this.reported };
   }
@@ -73,12 +111,44 @@ export class BridgeBlindTurnWatch {
     this.reported = true;
   }
 
+  /** A turn has started since the last prompt edge. */
+  turnInProgress(): boolean {
+    return this.turn !== undefined;
+  }
+
+  /** The unread run that began at `blindSinceMs` is still the current one and
+   *  nobody was told about it: no turn was read since, and no teardown. */
+  isUnreportedRun(blindSinceMs: number): boolean {
+    return this.blindSinceMs === blindSinceMs && !this.reported;
+  }
+
   /** The bridge was torn down (CLI restart / exit): nothing carries over. */
   reset(): void {
+    this.idleCompaction = false;
+    this.lastPromptAtMs = -Infinity;
     this.turn = undefined;
     this.blindSinceMs = undefined;
     this.reported = false;
   }
+}
+
+/** Whether any of these transcript records is a reply Claude wrote within
+ *  [fromMs, toMs]: an assistant record, or the turn_duration closing a turn.
+ *  This is only the time-window half of the delivery check. The caller must
+ *  also prove the record was attributed to the unread run: the skew below a
+ *  run's busy evidence can contain the previous turn's reply, which timestamp
+ *  inspection alone cannot distinguish from this run's early first record. */
+export function replyRecordsStampedWithin(
+  records: readonly { type?: unknown; subtype?: unknown; timestamp?: unknown }[],
+  fromMs: number,
+  toMs: number,
+): boolean {
+  return records.some(record => {
+    const reply = record.type === 'assistant' || (record.type === 'system' && record.subtype === 'turn_duration');
+    if (!reply || typeof record.timestamp !== 'string') return false;
+    const atMs = Date.parse(record.timestamp);
+    return atMs >= fromMs && atMs <= toMs;
+  });
 }
 
 export interface BlindTurnNoticeInput {
@@ -89,13 +159,23 @@ export interface BlindTurnNoticeInput {
   unreadLarkTurn: boolean;
   /** The model ran `botmux send` after the turn started. */
   sentDuringTurn: boolean;
+  /** replyDelivery=transcript: a Lark turn's answer is its forwarded final
+   *  reply, and `botmux send` is only for what that reply cannot carry (a
+   *  cross-bot @, an attachment). Only a declared final send then proves the
+   *  answer went out. Omitted = send delivery. */
+  transcriptReplies?: { sentFinalDuringTurn: boolean };
 }
 
 /** Whether an unread turn lost something the group would otherwise have got.
  *  With `botmux send` delivery the transcript is only the fallback for a Lark
  *  turn the model did not answer itself, and a terminal-local turn is never
- *  forwarded at all — telling the group about those would be noise. */
+ *  forwarded at all — telling the group about those would be noise. With
+ *  transcript delivery an ordinary send during the turn does not stand in for
+ *  the lost final; a `--response-kind final` send does. */
 export function blindTurnNeedsNotice(input: BlindTurnNoticeInput): boolean {
   if (input.transcriptCarriesEveryReply) return true;
-  return input.unreadLarkTurn && !input.sentDuringTurn;
+  if (!input.unreadLarkTurn) return false;
+  return input.transcriptReplies
+    ? !input.transcriptReplies.sentFinalDuringTurn
+    : !input.sentDuringTurn;
 }

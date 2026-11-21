@@ -6,7 +6,7 @@ import { localeForBot } from '../i18n/index.js';
 import { getAskSnapshot } from './ask-broker.js';
 import type { AskResult, CreateAskInput, PendingAsk } from './ask-types.js';
 import type { DaemonSession } from './types.js';
-import { replyCardSandboxBlocked } from './turn-reply-card.js';
+import { patchReplyCardWithAuditRedaction, replyCardSandboxBlocked } from './turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal, type TurnReplyCardTransport } from '../services/turn-reply-card.js';
 import { buildTurnReplyCard, replyCardPresentation } from '../im/lark/turn-reply-card.js';
 import { MessageWithdrawnError, replyMessage, sendMessage, uploadFile } from '../im/lark/client.js';
@@ -15,10 +15,11 @@ import type { GroupContextDeliveryBinding } from '../services/group-context-deli
 
 /** Only the authenticated, currently running turn can admit an inline Ask.
  * Input forms stay standalone: streaming progress patches would erase client drafts.
- * Large choice sets retain standalone presentation without truncation. */
+ * Large choice sets retain standalone presentation without truncation.
+ * A mention needs a new message: an inline Ask arrives by PATCH, which never notifies. */
 export function replyCardAskTarget(
   ds: DaemonSession | undefined,
-  input: Pick<CreateAskInput, 'sessionId' | 'larkAppId' | 'chatId' | 'rootMessageId' | 'questions'>,
+  input: Pick<CreateAskInput, 'sessionId' | 'larkAppId' | 'chatId' | 'rootMessageId' | 'questions' | 'mentionedOpenId'>,
   origin: { originTurnId?: unknown; originDispatchAttempt?: unknown },
 ): CreateAskInput['replyCardTarget'] {
   const sameAnchor = ds && ((ds.scope ?? ds.session.scope) === 'chat'
@@ -27,6 +28,7 @@ export function replyCardAskTarget(
   if (!ds || typeof origin.originTurnId !== 'string' || origin.originTurnId !== ds.replyCardRunningTurnId
     || input.sessionId !== ds.session.sessionId || input.larkAppId !== ds.larkAppId || input.chatId !== ds.chatId
     || !sameAnchor
+    || input.mentionedOpenId
     || input.questions.some(q => q.input)
     || input.questions.reduce((sum, q) => sum + q.options.length, 0) > 16
     || Buffer.byteLength(JSON.stringify(input.questions), 'utf8') > 3000) return undefined;
@@ -74,7 +76,8 @@ export async function publishReplyCardAsk(ask: PendingAsk, result?: AskResult, c
           groupContextAuthorOrigin ? { groupContextAuthorOrigin } : undefined)
       : sendMessage(ask.larkAppId, ask.chatId, body, 'interactive', uuid, undefined,
           groupContextAuthorOrigin ? { groupContextAuthorOrigin } : undefined),
-    patch: (messageId, body) => patchPublishedGroupCard(ask.larkAppId, ask.chatId, messageId, body, ask.rootMessageId ?? undefined, groupContextAuthorOrigin),
+    patch: (messageId, body) => patchReplyCardWithAuditRedaction(ask.larkAppId, body, `ask turn=${ask.replyCardTarget!.turnId.substring(0, 8)}`,
+      card => patchPublishedGroupCard(ask.larkAppId, ask.chatId, messageId, card, ask.rootMessageId ?? undefined, groupContextAuthorOrigin)),
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     sendOverflow: async (text, uuid) => {
       const path = join(store.directory, `${store.id(key)}-reply.md`);

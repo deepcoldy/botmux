@@ -16,6 +16,7 @@
  */
 import { postJson } from './platform-http.js';
 import { readPlatformBinding } from './binding.js';
+import { FIRST_ATTEMPT_TIMEOUT_MS, TOTAL_BUDGET_MS } from './credential-grant-budget.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 export interface CredentialGrantRequest {
@@ -36,6 +37,13 @@ export interface CredentialGrant {
   variables: Record<string, string>;
   /** Epoch ms after which the variables must not be used. */
   expiresAt: number;
+  /**
+   * bytedcli only: the partitions the platform says it tried to mint (its
+   * answer to {@link CLOUD_JWT_REGIONS_FIELD}). Absent when the platform did not
+   * answer it — one that predates regional tokens — so a region missing from
+   * {@link variables} can be told apart from one the platform could not mint.
+   */
+  cloudJwtRegions?: BytedcliGrantRegion[];
 }
 
 export type CredentialGrantFailure =
@@ -58,9 +66,34 @@ export type CredentialGrantResult = { ok: true; value: CredentialGrant } | Crede
 
 export interface CredentialGrantClientOptions {
   binding?: { platformUrl: string; machineToken: string; machineId: string } | null;
+  /** First attempt's budget (default {@link FIRST_ATTEMPT_TIMEOUT_MS}). */
   timeoutMs?: number;
+  /** Hard cap across the first attempt and its one retry (default {@link TOTAL_BUDGET_MS}). */
+  totalBudgetMs?: number;
   http?: { post: typeof postJson };
 }
+
+/**
+ * A bytedcli grant names the requested ByteCloud partitions in
+ * {@link CLOUD_JWT_REGIONS_FIELD}, and the platform
+ * returns each one it minted under these variable names.
+ *
+ * Asked for, not just accepted: a daemon from before these names rejects the
+ * WHOLE grant when it sees a variable outside its allow-list, so a platform
+ * may only send them to a daemon whose request named the regions.
+ */
+export const BYTEDCLI_REGIONAL_GRANT_VARIABLES = {
+  i18n: 'BYTEDCLI_USER_CLOUD_JWT_I18N',
+  i18nbd: 'BYTEDCLI_USER_CLOUD_JWT_I18NBD',
+  tx: 'BYTEDCLI_USER_CLOUD_JWT_TX',
+  cn: 'BYTEDCLI_USER_CLOUD_JWT_CN',
+} as const;
+export type BytedcliGrantRegion = keyof typeof BYTEDCLI_REGIONAL_GRANT_VARIABLES;
+const BYTEDCLI_GRANT_REGIONS = Object.keys(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as BytedcliGrantRegion[];
+const REGIONAL_GRANT_VARIABLE_SET: ReadonlySet<string> = new Set(Object.values(BYTEDCLI_REGIONAL_GRANT_VARIABLES));
+/** Request field naming the partitions a bytedcli grant should cover, and the
+ *  response field in which the platform says which ones it tried. */
+export const CLOUD_JWT_REGIONS_FIELD = 'cloudJwtRegions';
 
 /** Env keys a grant may carry, per tool. Anything else is rejected: the
  *  platform must not be able to inject arbitrary environment into a session. */
@@ -71,12 +104,22 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
   },
   bytedcli: {
     required: ['BYTEDCLI_USER_CLOUD_JWT'],
-    optional: ['BYTEDCLI_USER_CODE_JWT'],
+    optional: ['BYTEDCLI_USER_CODE_JWT', ...Object.values(BYTEDCLI_REGIONAL_GRANT_VARIABLES)],
   },
 };
 
-/** Default per-call budget: a grant sits on the turn's critical path. */
-const DEFAULT_TIMEOUT_MS = 6_000;
+/**
+ * Budgets: see `credential-grant-budget.ts` for the numbers and why.
+ *
+ * Why a retry at all: a request that got NO answer (silent socket, reset,
+ * timeout) never reached the platform's verdict; one new connection fixes the
+ * common cause (a dead path under a connection the client thought was alive)
+ * without making the person resend their message. An HTTP status is the
+ * platform's answer and is never retried here.
+ */
+export { FIRST_ATTEMPT_TIMEOUT_MS, TOTAL_BUDGET_MS };
+/** A retry with less time than this left is not worth starting. */
+export const MIN_RETRY_BUDGET_MS = 1_000;
 /** Defense in depth: a grant is a per-turn token. Whatever the platform says,
  *  never treat one as valid for longer than this. */
 const MAX_GRANT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -113,7 +156,12 @@ function pickVariables(tool: TriggerUserAuthTool, raw: unknown): Record<string, 
   }
   for (const key of spec.optional) {
     if (rec[key] === undefined || rec[key] === null || rec[key] === '') continue;
-    if (!isSafeValue(rec[key])) return `variable ${key} unsafe`;
+    if (!isSafeValue(rec[key])) {
+      // A broken partition ticket costs only that partition (its calls are
+      // refused as missing), not the person's default ticket with it.
+      if (REGIONAL_GRANT_VARIABLE_SET.has(key)) continue;
+      return `variable ${key} unsafe`;
+    }
     out[key] = rec[key] as string;
   }
   const allowed = new Set<string>([...spec.required, ...spec.optional]);
@@ -161,6 +209,33 @@ function classify(status: number, json: unknown, platformUrl: string): Credentia
   return { ok: false, reason: 'client', status, error: error || `http_${status}` };
 }
 
+/** Settle no later than `ms`, whatever the transport underneath does, and
+ *  abort the request then. The socket's own timeout is an IDLE timeout: a peer
+ *  that trickles bytes never trips it, and without the abort the retry would
+ *  leave the first request still running against the platform. */
+export function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`连接超时（${ms}ms）`));
+    }, ms);
+  });
+  // Start `run` in its own microtask. `postJson` parses the URL and serializes
+  // the body BEFORE its own `new Promise`, so a malformed binding (a hand-edited
+  // or stale `platform.json`) throws SYNCHRONOUSLY. Racing that directly still
+  // fails the attempt — the throw reaches the caller's catch, so the retry runs
+  // as usual — but the race itself is never built, so `timeout` has no consumer:
+  // its timer fires later as an unhandledRejection (which the daemon's guard
+  // reports as a bug in this very code), the accompanying `.finally` never runs
+  // so `clearTimeout` never happens, and the abort lands on an attempt that
+  // already ended. Deferring `run` by one microtask turns the throw into an
+  // ordinary rejection: the race consumes it and the timer is always cleared.
+  const started = Promise.resolve().then(() => run(controller.signal));
+  return Promise.race([started, timeout]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Ask the platform for this turn's credentials. Never throws.
  */
@@ -191,25 +266,51 @@ async function requestCredentialGrantInner(
   }
   const http = opts.http ?? { post: postJson };
   const url = `${binding.platformUrl.replace(/\/+$/, '')}${CREDENTIAL_GRANT_PATH}`;
-  let status: number;
+  const body: Record<string, unknown> = {
+    unionId: req.unionId,
+    tool: req.tool,
+    appId: req.appId,
+    sessionId: req.sessionId,
+    ...(req.turnId ? { turnId: req.turnId } : {}),
+    machineId: binding.machineId,
+    // A platform that predates machine consent ignores the field and keeps
+    // answering `not_teammate` for a sender outside the owner's teams.
+    machineConsent: true,
+    // A platform that predates regional tokens ignores the field (it reads
+    // only the fields it knows) and answers with the default token alone.
+    ...(req.tool === 'bytedcli' ? { [CLOUD_JWT_REGIONS_FIELD]: BYTEDCLI_GRANT_REGIONS } : {}),
+  };
+  const totalBudget = opts.totalBudgetMs ?? TOTAL_BUDGET_MS;
+  const deadline = Date.now() + totalBudget;
+  let status = 0;
   let json: unknown;
-  try {
-    const body: Record<string, unknown> = {
-      unionId: req.unionId,
-      tool: req.tool,
-      appId: req.appId,
-      sessionId: req.sessionId,
-      ...(req.turnId ? { turnId: req.turnId } : {}),
-      machineId: binding.machineId,
-    };
-    const r = await http.post(url, body, {
-      headers: { authorization: `Bearer ${binding.machineToken}` },
-      timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    });
-    status = r.status;
-    json = r.json;
-  } catch (e) {
-    return { ok: false, reason: 'network', error: e instanceof Error ? e.message : String(e) };
+  for (let attempt = 0; ; attempt++) {
+    const remaining = deadline - Date.now();
+    // The retry gets the rest of the budget: it often starts a mint over on
+    // another instance, and capping it at another first attempt would leave
+    // the total budget unreachable.
+    const timeoutMs = Math.max(1, attempt === 0
+      ? Math.min(opts.timeoutMs ?? FIRST_ATTEMPT_TIMEOUT_MS, totalBudget)
+      : remaining);
+    try {
+      // Always a connection of its own: grants are one per turn, so a pooled
+      // keep-alive socket saves one handshake but can be one the path already
+      // dropped silently — the request then waits out the whole budget with no
+      // response at all, and the platform never sees it.
+      const r = await withHardTimeout(signal => http.post(url, body, {
+        headers: { authorization: `Bearer ${binding.machineToken}` },
+        timeoutMs,
+        freshConnection: true,
+        signal,
+      }), timeoutMs);
+      status = r.status;
+      json = r.json;
+      break;
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e);
+      if (attempt === 0 && deadline - Date.now() >= MIN_RETRY_BUDGET_MS) continue;
+      return { ok: false, reason: 'network', error: attempt > 0 ? `${error} (after retry)` : error };
+    }
   }
   if (status < 200 || status >= 300) return classify(status, json, binding.platformUrl);
   const rec = (json && typeof json === 'object' ? json : {}) as Record<string, unknown>;
@@ -224,7 +325,18 @@ async function requestCredentialGrantInner(
   const expiresAt = Math.min(rawExpiresAt, now + MAX_GRANT_TTL_MS);
   const variables = pickVariables(req.tool, rec.variables);
   if (typeof variables === 'string') return { ok: false, reason: 'invalid_response', error: variables };
-  return { ok: true, value: { tool: req.tool, unionId: req.unionId, variables, expiresAt } };
+  const cloudJwtRegions = req.tool === 'bytedcli' ? pickRegions(rec[CLOUD_JWT_REGIONS_FIELD]) : undefined;
+  return {
+    ok: true,
+    value: { tool: req.tool, unionId: req.unionId, variables, expiresAt, ...(cloudJwtRegions ? { cloudJwtRegions } : {}) },
+  };
+}
+
+/** The platform's list of partitions it tried. It only words the refusal for a
+ *  missing region, so an unreadable list is dropped, never fatal to the grant. */
+function pickRegions(raw: unknown): BytedcliGrantRegion[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return BYTEDCLI_GRANT_REGIONS.filter(region => raw.includes(region));
 }
 
 /** One-line, secret-free description for logs. */
@@ -233,8 +345,8 @@ export function describeCredentialGrantFailure(f: CredentialGrantFailure): strin
     case 'unbound': return 'machine is not bound to a platform';
     case 'network': return `network: ${f.error}`;
     case 'not_authorized': return `not authorized on platform (${f.error})`;
-    case 'consent_missing': return 'authorized on platform but no consent for this team';
-    case 'not_teammate': return 'sender and machine owner share no team';
+    case 'consent_missing': return 'platform has no usable authorization for this person on this machine';
+    case 'not_teammate': return 'platform only issues to the machine owner or a teammate of theirs';
     case 'forbidden': return `forbidden (${f.status} ${f.error})`;
     case 'not_deployed': return `platform has no credential-grant endpoint (${f.status})`;
     case 'rate_limited': return `rate limited (${f.status})`;

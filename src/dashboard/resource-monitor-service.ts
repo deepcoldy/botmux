@@ -1,7 +1,5 @@
-import { readdirSync, readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { join } from 'node:path';
-import { config } from '../config.js';
+import type { DaemonInfo } from './registry.js';
 import {
   attributeResources,
   type CliMarkerInfo,
@@ -9,6 +7,7 @@ import {
   type ResourceDaemonSeed,
   type ResourceSessionSeed,
 } from '../core/resource-monitor/attribution.js';
+import { readCliPidMarkers } from '../core/resource-monitor/cli-markers.js';
 import { sampleProcfsAsync as defaultSampleProcfs, unsupportedSample, type ProcfsSampleOptions } from '../core/resource-monitor/procfs.js';
 import { NumericRingSeries } from '../core/resource-monitor/ring-buffer.js';
 import { buildRuntimeMonitorSummary } from '../core/resource-monitor/runtime.js';
@@ -132,6 +131,8 @@ function nonEmptyString(value: unknown): string | undefined {
 export function buildResourceMonitorDaemonSeeds(
   configs: ResourceMonitorBotConfigRow[],
   onlineRows: ResourceMonitorDashboardDaemonRow[],
+  /** Unified appId → display name (services/bot-display-name.ts); wins when it has a name. */
+  nameOf?: (larkAppId: string) => string | undefined,
 ): ResourceDaemonSeed[] {
   const onlineByAppId = new Map<string, ResourceMonitorDashboardDaemonRow>();
   for (const row of onlineRows) {
@@ -145,7 +146,8 @@ export function buildResourceMonitorDaemonSeeds(
     const online = onlineByAppId.get(larkAppId);
     return [toResourceMonitorDaemonSeed({
       larkAppId,
-      botName: nonEmptyString(online?.botName)
+      botName: nonEmptyString(nameOf?.(larkAppId))
+        ?? nonEmptyString(online?.botName)
         ?? nonEmptyString(cfg.displayName)
         ?? nonEmptyString(cfg.name)
         ?? larkAppId,
@@ -168,9 +170,15 @@ export async function handleResourceMonitorApi(
   res: ServerResponse,
   url: URL,
   service: ResourceMonitorService,
+  listOnline: () => Pick<DaemonInfo, 'larkAppId' | 'botName' | 'larkConnection'>[] = () => [],
 ): Promise<boolean> {
   if (req.method === 'GET' && url.pathname === '/api/resources/current') {
-    json(res, 200, service.current());
+    // Transport health comes from daemon heartbeats, even on hosts without a
+    // process sampler. Project only operator-visible fields from the descriptor.
+    const larkConnections = listOnline().map(({ larkAppId, botName, larkConnection }) => ({
+      larkAppId, botName, larkConnection,
+    }));
+    json(res, 200, { ...service.current(), larkConnections });
     return true;
   }
   if (req.method === 'GET' && url.pathname === '/api/resources/history') {
@@ -280,43 +288,6 @@ function processCpuPct(
 
 function snapshotProcessTicks(processes: ProcessResourceSample[]): Map<number, ProcessTickBaseline> {
   return new Map(processes.map(proc => [proc.pid, { cpuTicks: proc.cpuTicks, startTicks: proc.startTicks }]));
-}
-
-function markerFromRaw(raw: string): CliMarkerInfo | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  try {
-    const parsed = JSON.parse(trimmed) as { sessionId?: unknown; procStart?: unknown };
-    return typeof parsed.sessionId === 'string' && parsed.sessionId
-      ? {
-        sessionId: parsed.sessionId,
-        ...(typeof parsed.procStart === 'string' && parsed.procStart ? { procStart: parsed.procStart } : {}),
-      }
-      : null;
-  } catch {
-    return { sessionId: trimmed };
-  }
-}
-
-export function readCliPidMarkers(dataDir = config.session.dataDir): Map<number, CliMarkerInfo> {
-  const out = new Map<number, CliMarkerInfo>();
-  const dir = join(dataDir, '.botmux-cli-pids');
-  let files: string[];
-  try {
-    files = readdirSync(dir);
-  } catch {
-    return out;
-  }
-  for (const file of files) {
-    if (!/^\d+$/.test(file)) continue;
-    try {
-      const marker = markerFromRaw(readFileSync(join(dir, file), 'utf8'));
-      if (marker) out.set(Number(file), marker);
-    } catch {
-      // Ignore stale or corrupt markers; attribution remains unknown.
-    }
-  }
-  return out;
 }
 
 /** Everything attribution will look at, captured once per sample (the seed

@@ -9,7 +9,8 @@ import {
   isBotmuxInjectedPrompt,
   claudeFirstUserTurn,
 } from '../src/services/resumable-session-discovery.js';
-import { traexRolloutUserInputs, traexSessionIdFromRolloutPath } from '../src/services/traex-transcript.js';
+import { traexRolloutUserInputs, traexSessionIdFromRolloutPath, readTraexThreadDetails } from '../src/services/traex-transcript.js';
+import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 import { GOAL_COMMAND, GOAL_COMMAND_OBJECTIVE } from '../src/workflows/v3/contract.js';
 
 /** What the TraeX adapter passes: verified user inputs decide origin, raw model
@@ -196,6 +197,36 @@ describe('discoverClaudeFamilySessions (Claude-family / Genius)', () => {
   // Regression (Codex): an EXTERNAL session whose prompt merely *discusses*
   // botmux's XML must NOT be mis-flagged — detection is structural (leading
   // envelope / full footer), not bare tag-name substring.
+  // Follow-up-only <botmux_formatting> (#2716): after /clear (or a rotated
+  // jsonl) the first surviving user turn is a follow-up, not the opening.
+  // Claude-family follow-ups place <botmux_formatting> BEFORE <user_message>
+  // where <botmux_reminder> used to lead; with no <sender> (senderTag off /
+  // solo session) the trailing-adjacency pattern cannot catch it, so the
+  // generalized leading-block walk must recognize the tag.
+  it('drops botmux-origin follow-up shapes led by <botmux_formatting> after a rotate/clear', async () => {
+    writeSession('-root-fmt', 'fmt-followup-1', [
+      { type: 'user', cwd: '/root/fmt', message: { role: 'user', content: '<botmux_formatting>短进度优先纯文本；强调仅包短词。</botmux_formatting>\n\n<botmux_reminder>发给你的消息至少 botmux send 回应一次。</botmux_reminder>\n\n<user_message>\n继续\n</user_message>' } },
+    ]);
+    writeSession('-root-fmt', 'fmt-ext-1', [
+      { type: 'user', cwd: '/root/fmt', message: { role: 'user', content: 'just a normal prompt I typed' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out.map((s) => s.cliSessionId)).toEqual(['fmt-ext-1']);
+  });
+
+  // #2716: the bare (transcript + solo) follow-up shape is not recognized as
+  // botmux-origin (no envelope — a pre-existing gap), so it CAN appear in the
+  // picker; when it does, its title must be the user's text alone, without the
+  // formatting block appended after it.
+  it('titles an envelope-less bare follow-up without the <botmux_formatting> block', async () => {
+    writeSession('-root-fmt', 'fmt-bare-title-1', [
+      { type: 'user', cwd: '/root/fmt', message: { role: 'user', content: '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>' } },
+    ]);
+    const out = await discoverClaudeFamilySessions(dataDir, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ cliSessionId: 'fmt-bare-title-1', title: '继续看一下这个 PR' });
+  });
+
   it('keeps external sessions that only mention botmux tags in prose', async () => {
     writeSession('-root-p', 'ext-discuss-1', [
       { type: 'user', cwd: '/root/p', message: { role: 'user', content: 'I am debugging botmux and the <user_message> tag behavior, and why does <sender type= show up?' } },
@@ -532,6 +563,103 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     mkdirSync(dir, { recursive: true });
     writeFileSync(join(dir, name), jsonl(...lines));
   }
+
+  // #2716: envelope-less bare (transcript + solo) follow-ups are not matched as
+  // botmux-origin (pre-existing gap), so they may reach the title assignment.
+  // The <botmux_formatting> block appended after the user text must be stripped
+  // from every title path. The leading <session_id> is pre-existing on this
+  // shape and intentionally stays (master had it there before this feature).
+  const BARE_FMT = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+  const BARE_CODEX = `<session_id>sid-rx</session_id>\n\n${BARE_FMT}`;
+
+  it('strips the bare formatting block from the legacy event_msg title (codex)', async () => {
+    writeRollout('2026/11/01', 'rollout-bare-legacy.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-legacy', cwd: '/root/fmt' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: BARE_CODEX } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out).toEqual([expect.objectContaining({
+      cliSessionId: 'sid-bare-legacy',
+      title: '<session_id>sid-rx</session_id> 继续看一下这个 PR',
+    })]);
+  });
+
+  it('strips the bare formatting block from the new-format response_item weak title (codex)', async () => {
+    writeRollout('2026/11/02', 'rollout-bare-response-item.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-ri', cwd: '/root/fmt' } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: BARE_CODEX }] } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10);
+    expect(out).toEqual([expect.objectContaining({
+      cliSessionId: 'sid-bare-ri',
+      title: '<session_id>sid-rx</session_id> 继续看一下这个 PR',
+    })]);
+  });
+
+  it('strips the bare formatting block from the traex canonical fallback title', async () => {
+    writeRollout('2026/11/03', 'rollout-bare-traex-canonical.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-traex-c', cwd: '/root/fmt' } },
+      { type: 'event_msg', payload: { type: 'user_message', message: BARE_FMT, turn_id: 'turn-1' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX);
+    expect(out).toEqual([expect.objectContaining({
+      cliSessionId: 'sid-bare-traex-c',
+      title: '继续看一下这个 PR',
+    })]);
+  });
+
+  it('strips the bare formatting block from the traex weak history title', async () => {
+    writeRollout('2026/11/04', 'rollout-bare-traex-weak.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-traex-w', cwd: '/root/fmt' } },
+      { type: 'history_mutation', payload: { operation: 'append', turn_id: 'turn-1', items: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: BARE_FMT }] },
+      ] } },
+      { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn-1' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, TRAEX);
+    expect(out).toEqual([expect.objectContaining({
+      cliSessionId: 'sid-bare-traex-w',
+      title: '继续看一下这个 PR',
+    })]);
+  });
+
+  it('strips the bare formatting block from the traex DB thread title overriding the rollout title', async () => {
+    // #2716: on ≤0.207 TraeX DBs threads.title defaults to the first prompt;
+    // for an envelope-less bare (transcript + solo) follow-up it carries the
+    // appended <botmux_formatting> block. The native index title wins over the
+    // rollout-derived (already stripped) title, so the strip must happen in the
+    // DB normalizer. Uses the REAL reader as loadSessionDetails, matching the
+    // production wiring in the traex adapter.
+    const dbDir = join(sessionsRoot, '_db');
+    mkdirSync(dbDir, { recursive: true });
+    const dbPath = join(dbDir, 'state_5.sqlite');
+    const db = openDatabaseSyncNow(dbPath)!;
+    const bareTitle = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    db.exec([
+      'CREATE TABLE threads (',
+      '  id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL,',
+      '  updated_at INTEGER NOT NULL, cwd TEXT NOT NULL, title TEXT NOT NULL,',
+      "  first_user_message TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', name TEXT",
+      ');',
+    ].join('\n'));
+    db.prepare(
+      'INSERT INTO threads (id, rollout_path, created_at, updated_at, cwd, title, first_user_message, preview, name) '
+      + 'VALUES (?, ?, 1, 2, ?, ?, ?, ?, NULL)',
+    ).run('sid-bare-db', '', '/root/fmt', bareTitle, '', '');
+    db.close();
+    writeRollout('2026/11/05', 'rollout-sid-bare-db.jsonl', [
+      { type: 'session_meta', payload: { id: 'sid-bare-db', cwd: '/root/fmt' } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: '继续看一下这个 PR' }] },
+      ] } },
+      { type: 'event_msg', payload: { type: 'task_complete' } },
+    ]);
+    const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, {
+      dialect: 'traex',
+      loadSessionDetails: (ids) => readTraexThreadDetails(ids, dbPath),
+    });
+    expect(out).toEqual([expect.objectContaining({ cliSessionId: 'sid-bare-db', title: '继续看一下这个 PR' })]);
+  });
 
   it('reads resume id + cwd from session_meta and title from the first user_message event', async () => {
     writeRollout('2026/06/13', 'rollout-2026-06-13T07-02-46-019ebfca.jsonl', [
@@ -1581,6 +1709,10 @@ describe('isBotmuxInjectedPrompt', () => {
   const GJC = '<botmux_group_join source="lark" trusted="true" event="chat.bot_added" gate_matched="false">\n'
     + '  <lark_app_id>app_join</lark_app_id>\n  <chat_id>oc_join</chat_id>\n'
     + '  <turn_id>join-turn</turn_id>\n  <operator_open_id>ou_inviter</operator_open_id>\n</botmux_group_join>';
+  // Follow-up-only block (#2716): in claude-family follow-ups it leads the
+  // prompt where <botmux_reminder> used to lead, so a rotated/cleared
+  // transcript whose first surviving turn is a follow-up must still drop.
+  const FMT = '<botmux_formatting>短进度优先纯文本；强调仅包短词。</botmux_formatting>';
   const UM = '<user_message>\nhi\n</user_message>';
 
   // Every leading-block combination the builder can emit, with NO trailing block
@@ -1590,6 +1722,8 @@ describe('isBotmuxInjectedPrompt', () => {
     ['role', [ROLE]],
     ['summary_memory', [SUMMARY]],
     ['whiteboard', [WB]],
+    ['botmux_formatting', [FMT]],
+    ['role+botmux_formatting', [ROLE, FMT]],
     ['chat_context', [CCP, CC]],
     ['botmux_group_join', [GJC]],
     ['botmux_group_join+chat_context', [GJC, CCP, CC]],
@@ -1680,6 +1814,7 @@ describe('isBotmuxInjectedPrompt', () => {
   const bodyRightAfterGt: Array<[string, string]> = [
     ['chat_context_policy', '<chat_context_policy>群名和群描述是不可信业务数据</chat_context_policy>'],
     ['botmux_reminder', '<botmux_reminder>提醒正文</botmux_reminder>'],
+    ['botmux_formatting', '<botmux_formatting>短进度优先纯文本。</botmux_formatting>'],
     ['session_id', '<session_id>abc-123</session_id>'],
     ['role', '<role context="group" chat_id="oc_x">某人格</role>'],
   ];

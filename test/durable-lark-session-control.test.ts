@@ -25,6 +25,20 @@ function rawControl(action: 'close' | 'resume' | 'restart' = 'close') {
   };
 }
 
+function displayControl(target: 'hidden' | 'screenshot' = 'screenshot') {
+  return {
+    ...rawControl('close'),
+    action: {
+      value: {
+        action: 'toggle_display',
+        target_display_mode: target,
+        session_id: 'session-1',
+        root_id: 'om_root',
+      },
+    },
+  };
+}
+
 function claim(event = durableLarkSessionControlEvent({
   larkAppId: 'cli_test',
   eventId: durableLarkSessionControlEventId('cli_test', 'evt_control_1'),
@@ -106,7 +120,32 @@ describe('durable Lark session control envelope', () => {
       partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
       data: rawControl('restart'),
       now: 10,
-    })).toThrow(/close or resume/);
+    })).toThrow(/unsupported/);
+  });
+
+  it('accepts an idempotent display target and rejects legacy blind toggles', () => {
+    const event = durableLarkSessionControlEvent({
+      larkAppId: 'cli_test',
+      eventId: durableLarkSessionControlEventId('cli_test', 'evt_display_1'),
+      partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+      data: { ...displayControl(), event_id: 'evt_display_1' },
+      now: 10,
+    });
+    expect(parseDurableLarkSessionControlClaim(claim(event))).toMatchObject({
+      action: 'toggle_display',
+      sessionId: 'session-1',
+    });
+    expect(() => durableLarkSessionControlEvent({
+      larkAppId: 'cli_test',
+      eventId: durableLarkSessionControlEventId('cli_test', 'evt_display_legacy'),
+      partitionKey: durableLarkSessionControlPartition('cli_test', 'session-1'),
+      data: {
+        ...displayControl(),
+        event_id: 'evt_display_legacy',
+        action: { value: { action: 'toggle_display', session_id: 'session-1', root_id: 'om_root' } },
+      },
+      now: 10,
+    })).toThrow(/idempotent target mode/);
   });
 
   it('rejects missing stable interaction ids and mismatched durable identities', () => {

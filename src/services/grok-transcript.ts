@@ -45,6 +45,7 @@ import {
 } from './grok-paths.js';
 import { isBotmuxInjectedPrompt } from './resumable-session-discovery.js';
 import { listProcessOpenFiles } from '../utils/process-open-files.js';
+import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import type { ResumableSession } from '../adapters/cli/types.js';
 
 const SESSION_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -724,7 +725,11 @@ export async function discoverGrokSessions(
       const firstPrompt = existsSync(updatesPath) ? readFirstUserChunk(updatesPath) : undefined;
       if (firstPrompt) {
         if (looksLikeBotmuxPrompt(firstPrompt)) continue;
-        if (!title) title = truncateTitle(firstPrompt);
+        // grok has injectsSessionContext=true, so an envelope-less bare
+        // (replyDelivery=transcript + solo) follow-up is just the user text
+        // followed by <botmux_formatting>; strip that internal block (#2716)
+        // before it becomes the picker title.
+        if (!title) title = truncateTitle(stripBotmuxDisplayBlocks(firstPrompt));
       }
 
       cands.push({

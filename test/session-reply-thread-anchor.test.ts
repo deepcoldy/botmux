@@ -166,6 +166,16 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     expect(mocks.replyMessage).not.toHaveBeenCalled();
   });
 
+  it('keeps a restored listener task silent even for a forced source-group publication', async () => {
+    const ds = seedSharedSession();
+    Object.assign(ds.session, { messageListenerRun: { sourceMessageId: 'om_source', replyMode: 'none' } });
+    expect(await sessionReply(CHAT, 'task result', 'interactive', APP, 'om_source', {
+      sourceSessionId: ds.session.sessionId, placement: 'chat',
+    })).toBe('');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+  });
+
   it('strict policy permits an available topic and disabling it restores legacy fallback', async () => {
     registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'stop' });
     seedSharedSession();

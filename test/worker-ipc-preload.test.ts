@@ -43,6 +43,16 @@ describe('worker IPC preload', () => {
     expect(host.send).toHaveBeenCalledWith({ type: 'turn_input_received', turnId: 'board:cli_s:3' });
   });
 
+  it('replays a contract-enabled init without publishing an unscoped receipt', () => {
+    const host = new FakeIpcHost(); const handled = vi.fn();
+    const init = { type: 'init', prompt: 'question', turnId: 'om_scoped',
+      sessionContract: { session: { appId: 'cli_test', sessionId: 'session' }, worker: { workerId: 'worker', generation: 1 } } };
+    installWorkerIpcPreload(host); host.emit('message', init);
+    expect(host.send).not.toHaveBeenCalled();
+    host.on('message', handled); host.emit(WORKER_IPC_HANDLER_READY_EVENT);
+    expect(handled).toHaveBeenCalledExactlyOnceWith(init);
+  });
+
   it('buffers non-ordinary init without forging a delivery receipt', () => {
     const host = new FakeIpcHost();
     const handled = vi.fn();

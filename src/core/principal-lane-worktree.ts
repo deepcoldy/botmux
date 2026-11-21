@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, isAbsolute, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import type {
   HumanLaneIdentityEvidence,
@@ -12,6 +12,7 @@ import {
   createRepoWorktreeAndCommit,
   mainWorktreeFor,
   worktreeRootFor,
+  worktreeTargetPath,
 } from '../services/git-worktree.js';
 import { lanePrincipalKey } from './principal-lane-routing.js';
 
@@ -263,15 +264,18 @@ export async function materializePrincipalLaneWorktree<T>(args: {
   });
   const suffix = materializationId.slice(-16);
   const branch = `wt/principal-lane-${suffix}`;
-  const worktreePath = join(
-    dirname(sourceRepoRoot),
+  const worktreePath = worktreeTargetPath(
+    sourceRepoRoot,
     `${basename(sourceRepoRoot)}-wt-principal-lane-${suffix}`,
   );
+  // A lane materialized before `worktreeRoot` changed is reused where it already is.
+  let materializedPath = worktreePath;
   try {
     const committed = await createRepoWorktreeAndCommit(
       sourceRepoRoot,
       { branch, worktreePath, reuseExisting: true, ignoreRemoteBranch: true },
       async creation => {
+        materializedPath = creation.path;
         const worktreeRoot = realpathSync(creation.path);
         const observedMain = realpathSync(await mainWorktreeFor(worktreeRoot));
         const worktreeGit = await readPrincipalLaneGitIdentity(worktreeRoot);
@@ -315,11 +319,11 @@ export async function materializePrincipalLaneWorktree<T>(args: {
     return { status: 'ready', ...committed.result };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    if (existsSync(worktreePath)) {
+    if (existsSync(materializedPath)) {
       return {
         status: 'unknown',
         reason: 'publication_unknown',
-        orphan: { worktreePath, branch, materializationId },
+        orphan: { worktreePath: materializedPath, branch, materializationId },
         detail,
       };
     }

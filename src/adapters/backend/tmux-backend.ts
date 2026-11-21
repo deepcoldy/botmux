@@ -5,11 +5,12 @@ import type { SessionProbe } from './types.js';
 import { probeTmuxFunctional, scrubTmuxServerGlobalEnv, tmuxEnv, getTmuxVersionCached, tmuxVersionAtLeast } from '../../setup/ensure-tmux.js';
 import { BOTMUX_INJECTED_ENV_KEYS, CA_BUNDLE_ENV_KEYS, GIT_CONFIG_PAIR_ENV_KEY, GIT_CONFIG_PAIR_ENV_SHELL_PATTERN, PROXY_ENV_KEYS, REDACTED_CHILD_ENV_KEYS, SESSION_TEMP_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS } from '../../utils/child-env.js';
 import { sanitizePerBotEnv } from '../../core/per-bot-env.js';
-import { sessionEnvUnsetFlags } from '../../core/session-env.js';
+import { sessionEnvUnsetFlags, trustedSessionEnvUnsetFlags } from '../../core/session-env.js';
 import { logger } from '../../utils/logger.js';
 import { isExecutable } from '../../utils/executable.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
 import { tmuxCommand, tmuxSocketArgs } from './tmux-socket.js';
+import { createTmuxBootGate } from './tmux-anti-fork.js';
 
 /**
  * `unset KEY KEY ...` clause spliced into the shell wrapper before exec. The
@@ -80,6 +81,32 @@ let serverGlobalEnvScrubbed = false;
  */
 export function isTmuxServerLevelErrorText(stderrText: string): boolean {
   return /error connecting to|lost server|server exited unexpectedly/i.test(stderrText);
+}
+
+export type TmuxCaptureErrorKind = 'server-unreachable' | 'no-server' | 'pane-missing' | 'timeout' | 'unknown';
+
+/** Classify capture failures without turning them into a liveness verdict. The
+ * lifecycle watcher makes the actual death decision; capture only gets the same
+ * error vocabulary so operators can see which part of the frame pipeline is
+ * failing and whether it matches the watcher's last probe. */
+export function classifyTmuxCaptureError(err: unknown): { kind: TmuxCaptureErrorKind; detail: string } {
+  const anyErr = err as any;
+  // execFile({ timeout, killSignal: 'SIGKILL' }) reports code:null on both Node
+  // and Bun. Capture never kills its child for any other reason, so this is the
+  // asynchronous counterpart of execSync's ETIMEDOUT shape.
+  if (isExecTimeoutError(err) || (anyErr?.killed === true && anyErr?.signal === 'SIGKILL')) {
+    return { kind: 'timeout', detail: 'capture deadline exceeded' };
+  }
+  const stderr = String(anyErr?.stderr ?? '').trim();
+  if (isTmuxServerLevelErrorText(stderr)) return { kind: 'server-unreachable', detail: stderr || 'tmux connection failed' };
+  if (/no server running/i.test(stderr)) return { kind: 'no-server', detail: stderr };
+  if (/can't find pane|no such pane|session not found|no such session/i.test(stderr)) {
+    return { kind: 'pane-missing', detail: stderr };
+  }
+  return {
+    kind: 'unknown',
+    detail: stderr || String(anyErr?.code ?? anyErr?.message ?? 'unknown capture failure'),
+  };
 }
 
 /**
@@ -312,8 +339,8 @@ export class TmuxBackend {
    * those as its own clean exits 127/126, which this classifier would wrongly
    * read as 'missing'.
    */
-  static probeSession(name: string, socketName?: string): SessionProbe {
-    return TmuxBackend.classifyHasSession(name, false, socketName);
+  static probeSession(name: string, socketName?: string, socketRoot?: string): SessionProbe {
+    return TmuxBackend.classifyHasSession(name, false, socketName, false, socketRoot);
   }
 
   /**
@@ -363,9 +390,10 @@ export class TmuxBackend {
     socketMissingIsMissing: boolean,
     socketName?: string,
     coldEvidenceOnDefaultServer = false,
+    socketRoot?: string,
   ): SessionProbe {
     try {
-      execFileSync('tmux', [...tmuxSocketArgs(socketName), 'has-session', '-t', name], {
+      execFileSync('tmux', [...tmuxSocketArgs(socketName, socketRoot), 'has-session', '-t', name], {
         stdio: ['ignore', 'ignore', 'pipe'],
         env: tmuxEnv(),
         timeout: 3000,
@@ -488,12 +516,12 @@ export class TmuxBackend {
   }
 
   /** Kill a named tmux session (no-op if it doesn't exist). */
-  static killSession(name: string, socketName?: string): void {
+  static killSession(name: string, socketName?: string, socketRoot?: string): void {
     try {
       // Runtime recovery calls this from many workers. Bound the command so a
       // wedged shared server cannot pin every worker forever; restart jitter
       // keeps the bounded attempts from landing simultaneously.
-      execFileSync('tmux', [...tmuxSocketArgs(socketName), 'kill-session', '-t', name], {
+      execFileSync('tmux', [...tmuxSocketArgs(socketName, socketRoot), 'kill-session', '-t', name], {
         stdio: 'ignore',
         timeout: 3000,
         env: tmuxEnv(),
@@ -552,10 +580,18 @@ export class TmuxBackend {
   static parkDiagnosticSession(name: string, opts: { cwd: string; cols: number; rows: number; contentPath: string; socketName?: string }): boolean {
     try {
       TmuxBackend.killSession(name, opts.socketName);
+      // Anti-fork gate: prepend -N (tmux >= 3.2) / hold on a bound-but-silent
+      // owner rather than booting a competing server (default ON;
+      // BOTMUX_DISABLE_TMUX_ANTI_FORK=1 opts out). A blocked boot reads as a
+      // failed park (retried later), never as a second tmux server.
+      // Ambient process.env on both sides (this exec uses tmuxEnv()); pass it
+      // explicitly so the gate's probe/-N/socket-path cannot silently diverge.
+      const bootLeading = createTmuxBootGate(opts.socketName, { env: process.env }).leadingArgs();
       const shellSpec = resolveUserShell();
       const shellKind = shellKindForPath(shellSpec.shell);
       execFileSync('tmux', [
         ...tmuxSocketArgs(opts.socketName),
+        ...bootLeading,
         'new-session',
         '-d',
         '-s', name,
@@ -673,17 +709,28 @@ export function buildBotmuxEnvAssignments(
   injectEnv?: Record<string, string>,
   unsetEnv?: readonly string[],
   gitConfigPairs?: ReadonlyArray<readonly [string, string]>,
+  protectedUnsetEnv?: readonly string[],
 ): string[] {
   const out: string[] = [];
+  if (protectedUnsetEnv?.length) {
+    env = env ? { ...env } : undefined;
+    injectEnv = injectEnv ? { ...injectEnv } : undefined;
+    for (const key of protectedUnsetEnv) {
+      if (env) delete env[key];
+      if (injectEnv) delete injectEnv[key];
+    }
+  }
   // env(1) runs AFTER the login shell's rcfiles, so stripping these only from
   // the worker/client env is insufficient: rcfiles can reintroduce them.
   if (env?.BOTMUX_CODEX_INSTANCE_BINDING) {
     for (const key of ['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL']) out.push('-u', key);
   }
-  // Session env overlay removals: same reason — the pane inherits the tmux
-  // server's global env and runs the rcfile before this point. Options precede
-  // every KEY=VAL operand, so any botmux assignment below still wins.
+  // Session env overlay removals and dynamic protected-MCP credential keys:
+  // same reason — the pane inherits the tmux server's global env and runs the
+  // rcfile before this point. Protected removals are also stripped from the
+  // assignment layers above, so they remain authoritative after this prefix.
   out.push(...sessionEnvUnsetFlags(unsetEnv));
+  out.push(...trustedSessionEnvUnsetFlags(protectedUnsetEnv));
   if (env) {
     for (const key of BOTMUX_INJECTED_ENV_KEYS) {
       // GIT_CONFIG_COUNT is published below from the turn-authored pairs, never
@@ -748,6 +795,16 @@ export function buildBotmuxEnvAssignments(
       const val = env[key];
       if (val === undefined) continue;
       out.push(`${key}=${val}`);
+    }
+    // Fence marker (scripts/fenced-run.ts): tmuxEnv() strips every BOTMUX* key
+    // from the tmux client env and it is not in BOTMUX_INJECTED_ENV_KEYS, so
+    // without this per-pane assignment a CLI inside a fenced tmux/zellij/zmx
+    // pane loses BOTMUX_FENCED_RUN and userSystemdBusEnv() derives the real
+    // /run/user/<uid>/bus again. Like proxy/CA/workflow keys it is published
+    // only on the per-pane env(1) prefix (never the shared server global) and
+    // only when present, so production (unfenced) panes emit nothing.
+    if (env.BOTMUX_FENCED_RUN !== undefined) {
+      out.push(`BOTMUX_FENCED_RUN=${env.BOTMUX_FENCED_RUN}`);
     }
   }
   // Per-bot env (bots.json `env`): appended AFTER the botmux-managed keys so a

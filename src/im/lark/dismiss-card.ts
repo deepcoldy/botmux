@@ -25,20 +25,24 @@ export interface DismissCardRow {
   task: string;
 }
 
+/** 普通群没有会话群登记可移除，标题和步骤用 `group_*` 文案。 */
+const dismissKey = (key: string, ordinaryGroup?: boolean) => `cmd.dismiss.${ordinaryGroup ? 'group_' : ''}${key}`;
+
 export function buildDismissConfirmCard(args: {
   chatId: string;
   invokerOpenId: string;
   confirmationState: string;
   rows: DismissCardRow[];
+  ordinaryGroup?: boolean;
   loc: Locale;
 }): string {
-  const { loc, rows } = args;
+  const { loc, rows, ordinaryGroup } = args;
   const elements: unknown[] = [
     {
       tag: 'markdown',
       content: rows.length > 0
-        ? t('cmd.dismiss.card_steps', { count: String(rows.length) }, loc)
-        : t('cmd.dismiss.card_steps_no_session', undefined, loc),
+        ? t(dismissKey('card_steps', ordinaryGroup), { count: String(rows.length) }, loc)
+        : t(dismissKey('card_steps_no_session', ordinaryGroup), undefined, loc),
     },
   ];
   if (rows.length > 0) {
@@ -68,16 +72,17 @@ export function buildDismissConfirmCard(args: {
           chat_id: args.chatId,
           invoker_open_id: args.invokerOpenId,
           confirmation_state: args.confirmationState,
+          ...(ordinaryGroup ? { ordinary_group: true } : {}),
         },
       }],
     },
   );
-  return JSON.stringify(card(`⚠️ ${t('cmd.dismiss.card_title', undefined, loc)}`, 'red', elements));
+  return JSON.stringify(card(`⚠️ ${t(dismissKey('card_title', ordinaryGroup), undefined, loc)}`, 'red', elements));
 }
 
 /** 点击确认后原地替换：去掉按钮，防止重复点击，并说明结果会从哪里来。 */
-export function buildDismissSubmittedCard(loc: Locale): Record<string, unknown> {
-  return card(`⏳ ${t('cmd.dismiss.card_title', undefined, loc)}`, 'grey',
+export function buildDismissSubmittedCard(loc: Locale, ordinaryGroup = false): Record<string, unknown> {
+  return card(`⏳ ${t(dismissKey('card_title', ordinaryGroup), undefined, loc)}`, 'grey',
     [{ tag: 'markdown', content: t('cmd.dismiss.submitted', undefined, loc) }]);
 }
 
@@ -103,6 +108,7 @@ function safetyLine(safety: WorktreeSafetyStatus, loc: Locale): string {
 export function buildDismissReceiptCard(args: {
   offers: readonly WorktreeCleanupOffer[];
   invokerOpenId: string;
+  ordinaryGroup?: boolean;
   loc: Locale;
 }): string {
   const { loc, offers } = args;
@@ -138,7 +144,7 @@ export function buildDismissReceiptCard(args: {
       },
     );
   }
-  return JSON.stringify(card(`✅ ${t('cmd.dismiss.receipt_title', undefined, loc)}`, 'green', elements));
+  return JSON.stringify(card(`✅ ${t(dismissKey('receipt_title', args.ordinaryGroup), undefined, loc)}`, 'green', elements));
 }
 
 /** 点击清理后原地替换：去掉按钮，防止重复点击。 */

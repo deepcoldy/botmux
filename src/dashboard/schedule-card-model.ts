@@ -1,3 +1,4 @@
+import { scheduleSupportDetails, type ScheduleSupportInput } from '../core/schedule-followup.js';
 /**
  * Schedule card model (PR1) — pure projection of `ScheduleCardTaskInput` (a
  * minimal task shape mirroring fields from `ScheduledTask`, redeclared here
@@ -29,7 +30,7 @@ const DEFAULT_PROMPT_TRUNCATE = 200;
 const DEFAULT_NEXT_RUNS_COUNT = 5;
 
 /** Minimal task input — self-contained so PR1 model does not pull in `ScheduledTask`. */
-export interface ScheduleCardTaskInput {
+export interface ScheduleCardTaskInput extends ScheduleSupportInput {
   id: string;
   name: string;
   prompt?: string;
@@ -116,6 +117,7 @@ export interface ScheduleRowDto {
 }
 
 export interface ScheduleDetailDto {
+  support?: ReturnType<typeof scheduleSupportDetails>;
   id: string;
   name: string;
   enabled: boolean;
@@ -294,6 +296,7 @@ export function toScheduleDetailDto(task: ScheduleCardTaskInput, ctx: RowRenderC
   const prompt = promptTruncated ? `${promptRaw.slice(0, truncateAt)}…` : promptRaw;
 
   return {
+    support: scheduleSupportDetails(task),
     id: task.id,
     name: task.name,
     enabled: task.enabled,

@@ -200,7 +200,10 @@ export async function repairOpenPlatformRedirects(
  */
 function withDeadlineSignal(fetchImpl: typeof fetch | undefined, signal: AbortSignal): typeof fetch {
   const base = fetchImpl ?? fetch;
-  return ((input: any, init?: RequestInit) => base(input, { ...init, signal: init?.signal ?? signal })) as typeof fetch;
+  return ((input: any, init?: RequestInit) => base(input, {
+    ...init,
+    signal: init?.signal ? AbortSignal.any([signal, init.signal]) : signal,
+  })) as typeof fetch;
 }
 
 /**
@@ -210,9 +213,9 @@ function withDeadlineSignal(fetchImpl: typeof fetch | undefined, signal: AbortSi
  * 「读不到 → 零写入」，等于双保险；而且能让超时批次的循环尽快自己停下来。
  */
 function fenceStalePostJson(postJson: OpenPlatformPostJson, isCurrent: () => boolean): OpenPlatformPostJson {
-  return async (path: string, body?: unknown) => {
+  return async (path, body, options) => {
     if (!isCurrent()) throw new Error(`redirect 白名单修复批次已中止，拒绝继续调用 ${path}`);
-    return postJson(path, body);
+    return postJson(path, body, options);
   };
 }
 

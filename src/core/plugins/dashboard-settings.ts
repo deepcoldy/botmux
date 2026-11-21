@@ -2,6 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { existsSync, statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import type { createConfigApi } from './runtime.js';
+import { withPluginServiceLock } from './service-manager.js';
 
 type SettingsApi = { config: ReturnType<typeof createConfigApi> };
 /** Return only browser-safe values. Void/null becomes { ok: true }. */
@@ -11,7 +12,7 @@ export interface PluginSettingsAdapter {
 }
 
 export interface PluginSettingsDeps {
-  isInstalled(id: string): boolean;
+  installedState(id: string): string | null;
   resolveEntry(id: string): string;
   createConfig: typeof createConfigApi;
   readBody(req: IncomingMessage): Promise<unknown>;
@@ -36,20 +37,28 @@ export async function handlePluginSettingsRequest(
   catch { return respond(res, 400, { error: 'invalid_plugin_id' }); }
   let body: unknown;
   try {
-    if (!deps.isInstalled(id)) return respond(res, 404, { error: 'plugin_not_found' });
-    const entry = deps.resolveEntry(id);
-    if (!existsSync(entry)) return respond(res, 404, { error: 'plugin_settings_not_supported' });
+    const expectedState = deps.installedState(id);
+    if (!expectedState) return respond(res, 404, { error: 'plugin_not_found' });
     if (req.method === 'PUT') {
       try { body = await deps.readBody(req); }
       catch { return respond(res, 400, { error: 'bad_json' }); }
     }
-    const adapter: PluginSettingsAdapter = await import(pathToFileURL(entry).href + `?v=${statSync(entry).mtimeMs}`);
-    if (typeof adapter.getSettings !== 'function' || typeof adapter.saveSettings !== 'function') {
-      throw new TypeError('Invalid settings adapter exports');
-    }
-    const api: SettingsApi = { config: deps.createConfig(id) };
-    const result = req.method === 'GET' ? await adapter.getSettings(api) : await adapter.saveSettings(api, body);
-    return respond(res, 200, result);
+    const invoke = async () => {
+      const currentState = deps.installedState(id);
+      if (!currentState) return respond(res, 404, { error: 'plugin_not_found' });
+      if (currentState !== expectedState) return respond(res, 409, { error: 'plugin_settings_stale' });
+      const entry = deps.resolveEntry(id);
+      if (!existsSync(entry)) return respond(res, 404, { error: 'plugin_settings_not_supported' });
+      const adapter: PluginSettingsAdapter = await import(pathToFileURL(entry).href + `?v=${statSync(entry).mtimeMs}`);
+      if (typeof adapter.getSettings !== 'function' || typeof adapter.saveSettings !== 'function') {
+        throw new TypeError('Invalid settings adapter exports');
+      }
+      const api: SettingsApi = { config: deps.createConfig(id) };
+      const result = req.method === 'GET' ? await adapter.getSettings(api) : await adapter.saveSettings(api, body);
+      return respond(res, 200, result);
+    };
+    // Read the body before locking, then keep async adapters inside the lifecycle boundary.
+    return req.method === 'PUT' ? await withPluginServiceLock(invoke) : await invoke();
   } catch {
     return respond(res, 500, { error: 'plugin_settings_failed' });
   }

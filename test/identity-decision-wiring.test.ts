@@ -2,7 +2,7 @@
  * 源码结构护栏(K3)：F3 执行身份单一事实源的接线，纯行为测试够不到的部分。
  *
  * 行为测试已覆盖（见 identity-spawn-matrix / identity-decision-report /
- * worker-turn-idle）：五格矩阵的真 bwrap 探针、daemon 只读上报值、PTY
+ * worker-turn-idle）：七格矩阵的真 bwrap 探针、daemon 只读上报值、PTY
  * spawn 真发 session_identity_decision。剩下三处只能在接线层钉死：
  *
  *  1. worker 有且仅有两个决策上站点（PTY spawnCli 与 Codex RPC engage），
@@ -17,6 +17,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import ts from 'typescript';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 const workerPoolSource = readFileSync(new URL('../src/core/worker-pool.ts', import.meta.url), 'utf8');
@@ -58,14 +59,48 @@ describe('F3 identity decision wiring (source structure guard)', () => {
   it('records the published model at every actual publication site (N1/N2 flip baseline)', () => {
     // The flip detector compares against the model REALLY published, not the
     // previous report: after a daemon restart an accept-time single publish
-    // exists while no report does. Three daemon sites publish turn identity;
-    // all must run through the recording helper, and the helper must record.
+    // exists while no report does. Every publication must use the recording
+    // helper, whether inline or captured before an authorization check.
     const helper = daemonSource
       .slice(daemonSource.indexOf('function identityModelForPublication'))
       .split(/\n}\n/)[0];
     expect(helper).toContain('ds.lastPublishedIdentityModel = model');
-    const publishSites = daemonSource.match(/storageModel: identityModelForPublication\(ds\)/g) ?? [];
-    expect(publishSites).toHaveLength(3);
+    const source = ts.createSourceFile('daemon.ts', daemonSource, ts.ScriptTarget.Latest, true);
+    const publications: ts.CallExpression[] = [];
+    const visit = (node: ts.Node) => {
+      if (ts.isCallExpression(node) && node.expression.getText(source) === 'publishTurnCliIdentity') {
+        publications.push(node);
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(source);
+    expect(publications.length).toBeGreaterThan(0);
+    const recordsModel = (expression: ts.Expression | undefined) =>
+      !!expression && ts.isCallExpression(expression)
+      && expression.expression.getText(source) === 'identityModelForPublication'
+      && expression.arguments.length === 1 && expression.arguments[0]!.getText(source) === 'ds';
+    for (const call of publications) {
+      const args = call.arguments[0];
+      expect(args && ts.isObjectLiteralExpression(args), `publication at ${call.pos}`).toBe(true);
+      if (!args || !ts.isObjectLiteralExpression(args)) continue;
+      const property = args.properties.find(p => p.name?.getText(source) === 'storageModel');
+      expect(property, `missing model at ${call.pos}`).toBeDefined();
+      if (property && ts.isPropertyAssignment(property) && recordsModel(property.initializer)) continue;
+      // A captured model must be an immutable local initialized by the same
+      // recorder before this call, rather than a fresh unrecorded derivation.
+      const name = property && ts.isShorthandPropertyAssignment(property) ? property.name.text
+        : property && ts.isPropertyAssignment(property) && ts.isIdentifier(property.initializer)
+          ? property.initializer.text : undefined;
+      let enclosing: ts.Node | undefined = call.parent;
+      while (enclosing && !ts.isFunctionDeclaration(enclosing)) enclosing = enclosing.parent;
+      const declarations = enclosing && ts.isFunctionDeclaration(enclosing) ? enclosing.body?.statements : undefined;
+      const captured = declarations?.some(statement => ts.isVariableStatement(statement)
+        && !!(statement.declarationList.flags & ts.NodeFlags.Const)
+        && statement.end < call.pos
+        && statement.declarationList.declarations.some(declaration =>
+          ts.isIdentifier(declaration.name) && declaration.name.text === name && recordsModel(declaration.initializer)));
+      expect(captured, `unrecorded model at ${call.pos}`).toBe(true);
+    }
     // And no site may still bypass the recorder with the bare accessor.
     expect(daemonSource).not.toContain(
       'storageModel: identityStorageModelForDaemonSession(ds)',

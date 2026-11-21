@@ -200,6 +200,19 @@ export interface FingerprintSwitchInput {
   contentNormalized?: string;
   /** Trust set populated from initial attach, pid resolver hits, fd probes. */
   knownSessionIds: ReadonlySet<string>;
+  /** Known ids this CLI's own pid state or open files proved it writes. A
+   *  known id NOT in here (the spawn-time guess, or one taken by a fingerprint
+   *  switch) is dropped by Phase 1 once another live botmux session claims it:
+   *  a fork child starts on its parent's id, and one wrong switch must not
+   *  keep pulling the bridge back. Omitted: every known id counts as proven. */
+  cliProvenSessionIds?: ReadonlySet<string>;
+  /** Reads the native session ids owned by OTHER live botmux sessions on this
+   *  machine. Read at most once, and only when a candidate needs it. When one
+   *  broadcast reaches several topics, each sibling's transcript is an
+   *  exact-content match; adopting one binds this turn to the wrong
+   *  conversation. A sibling's id after its own `/clear` may not be published
+   *  yet, so an unclaimed match next to a claimed one is still ambiguous. */
+  readForeignSessionIds?: () => ReadonlySet<string>;
   /** Phase 1 scanner: substring fingerprint search. Caller wires it to
    *  `findJsonlContainingFingerprint`; this helper only sees the result. */
   findSubstring: (acceptCandidate: (path: string) => boolean) => string | null;
@@ -209,9 +222,42 @@ export interface FingerprintSwitchInput {
   findExact: (acceptCandidate: (path: string) => boolean) => string[];
 }
 
+/** Native Claude session ids owned by OTHER active botmux sessions: their
+ *  botmux session id (Claude is spawned with it), the CLI session id they last
+ *  published, and the id of the pane they adopted. An id a session has not
+ *  published yet is not here.
+ *
+ *  Known over-inclusion, deliberately kept: while a fork child's first spawn
+ *  is pending (`Session.pendingForkSession`), its published `cliSessionId` is
+ *  the PARENT's native id — the child resumes it and forks forward. From the
+ *  parent's row that id then looks foreign. The damage cannot reach a switch:
+ *  both scanners exclude the bridge's current path, which is the parent's own
+ *  file, and once the child's fd probes prove its own new id the borrowed id
+ *  stops mattering. The only effect is that a parent ALREADY switched off its
+ *  file cannot be pulled back to it during that window, which is the intended
+ *  "one wrong switch must not stick" behaviour. Skipping the borrowed id would
+ *  require this helper to know about `pendingForkSession` and would let two
+ *  live CLIs follow the same transcript again. */
+export function foreignNativeSessionIds(
+  sessions: Iterable<{ sessionId: string; status?: string; cliSessionId?: string; adoptedFrom?: { sessionId?: string } }>,
+  ownSessionId: string | undefined,
+): Set<string> {
+  const ids = new Set<string>();
+  // Without our own id every row would look foreign, our own included.
+  if (!ownSessionId) return ids;
+  for (const session of sessions) {
+    if (session.status !== 'active' || session.sessionId === ownSessionId) continue;
+    ids.add(session.sessionId);
+    if (session.cliSessionId) ids.add(session.cliSessionId);
+    // An adopted pane's Claude id: such rows do not publish cliSessionId.
+    if (session.adoptedFrom?.sessionId) ids.add(session.adoptedFrom.sessionId);
+  }
+  return ids;
+}
+
 export type FingerprintSwitchDecision =
   | { action: 'switch'; path: string; reason: 'known-sid-substring' | 'unknown-sid-exact' }
-  | { action: 'abstain'; reason: 'multiple-unknown-exact'; candidates: string[] }
+  | { action: 'abstain'; reason: 'multiple-unknown-exact' | 'beside-other-session'; candidates: string[] }
   | { action: 'no-match' };
 
 /**
@@ -228,7 +274,8 @@ export type FingerprintSwitchDecision =
  * which is the worst-case in-pane `/clear` scenario where the new sid
  * never reaches our trust set (pid file lags, fd probe missed the open
  * window). Run the exact-content scanner with predicate
- * `(UUID-shaped sid) AND (sid NOT in knownSessionIds)`. Decision:
+ * `(UUID-shaped sid) AND (sid NOT in knownSessionIds)`, then sets aside
+ * files owned by another live botmux session. Decision:
  *   - 0 matches → no-match
  *   - 1 match  → switch (the post-/clear file we couldn't otherwise see)
  *   - ≥2 matches → abstain; multiple untrusted files normalise to the
@@ -241,9 +288,13 @@ export type FingerprintSwitchDecision =
 export function decideFingerprintSwitch(
   input: FingerprintSwitchInput,
 ): FingerprintSwitchDecision {
+  let foreign: ReadonlySet<string> | undefined;
+  const isForeign = (sid: string): boolean =>
+    (foreign ??= input.readForeignSessionIds?.() ?? new Set<string>()).has(sid);
   const matchedKnown = input.findSubstring((path) => {
     const sid = sessionIdFromJsonlPath(path);
-    return SESSION_ID_FILENAME_RE.test(sid) && input.knownSessionIds.has(sid);
+    return SESSION_ID_FILENAME_RE.test(sid) && input.knownSessionIds.has(sid)
+      && (!input.cliProvenSessionIds || input.cliProvenSessionIds.has(sid) || !isForeign(sid));
   });
   if (matchedKnown) {
     return { action: 'switch', path: matchedKnown, reason: 'known-sid-substring' };
@@ -256,6 +307,11 @@ export function decideFingerprintSwitch(
     return SESSION_ID_FILENAME_RE.test(sid) && !input.knownSessionIds.has(sid);
   });
   if (exact.length === 0) return { action: 'no-match' };
+  const unclaimed = exact.filter(path => !isForeign(sessionIdFromJsonlPath(path)));
+  if (unclaimed.length === 0) return { action: 'no-match' };
+  if (unclaimed.length < exact.length) {
+    return { action: 'abstain', reason: 'beside-other-session', candidates: exact };
+  }
   if (exact.length > 1) {
     return { action: 'abstain', reason: 'multiple-unknown-exact', candidates: exact };
   }

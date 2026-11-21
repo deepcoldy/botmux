@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { buildCanonicalFinalReplyCard, buildContextualReplyCard, buildMarkdownCard } from '../src/im/lark/md-card.js';
 import { renderFeedbackCard } from '../src/im/lark/skill-feedback-card.js';
+import { buildOncallGroupColumn } from '../src/im/lark/oncall-group.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import MarkdownIt from 'markdown-it';
 
@@ -600,5 +601,114 @@ describe('final answer feedback card state machine', () => {
     expect(tokens.find(token => token.type === 'ordered_list_open')?.attrGet('start')).toBe(100);
     expect(tokens.filter(token => token.type === 'bullet_list_open')).toHaveLength(1);
     expect(tokens.filter(token => token.type === 'list_item_open')).toHaveLength(2);
+  });
+});
+
+describe('feedback button alignment', () => {
+  const reasons = [{ key: 'r1', label: '缺少信息' }, { key: 'r2', label: '结论错误' }];
+  const buttons = [
+    { key: 'up', label: '👍 有用', semantic: 'positive', style: 'primary' },
+    { key: 'down', label: '👎 没用', semantic: 'negative', style: 'danger' },
+  ];
+  const make = (extra: Record<string, unknown> = {}) => normalizeFeedbackPolicy({
+    enabled: true, visibleSemantics: ['positive', 'negative'], buttons, negativeFollowup: { reasons }, ...extra,
+  });
+  const feedbackElements = (card: any) => card.body.elements.filter((element: any) =>
+    String(element.element_id ?? '').startsWith('botmux_feedback'));
+  const negativeState = { feedbackId: 'fb_align', result: 'down' };
+  const render = (policy: ReturnType<typeof make>, state: Record<string, unknown> = negativeState) => {
+    const base = JSON.parse(buildCanonicalFinalReplyCard({ markdown: 'answer', feedback: { policy } }));
+    return renderFeedbackCard(base, policy, state) as any;
+  };
+
+  it('aligns the initial row, both state rows and the status line to the right', () => {
+    const align = 'right';
+    const policy = make({ buttonAlign: align });
+    const initial = JSON.parse(buildCanonicalFinalReplyCard({ markdown: 'answer', feedback: { policy } }));
+    expect(feedbackElements(initial)[0]).toMatchObject({ element_id: 'botmux_feedback', horizontal_align: align });
+
+    const byId = Object.fromEntries(feedbackElements(render(policy)).map((element: any) => [element.element_id, element]));
+    expect(byId.botmux_feedback.horizontal_align).toBe(align);
+    expect(byId.botmux_feedback_reasons.horizontal_align).toBe(align);
+    expect(byId.botmux_feedback_status.text_align).toBe(align);
+    // The comment form keeps its default layout.
+    expect(byId.botmux_feedback_comment.elements.every((element: any) => !('horizontal_align' in element) && !('text_align' in element))).toBe(true);
+    expect('horizontal_align' in byId.botmux_feedback_comment || 'text_align' in byId.botmux_feedback_comment).toBe(false);
+  });
+
+  it('emits no alignment properties when unset or left, byte for byte', () => {
+    const unset = make();
+    const left = make({ buttonAlign: 'left' });
+    for (const state of [{}, negativeState, { ...negativeState, reasonKey: 'r1' }]) {
+      const rendered = JSON.stringify(feedbackElements(render(unset, state)));
+      expect(rendered).not.toContain('horizontal_align');
+      expect(rendered).not.toContain('text_align');
+      expect(JSON.stringify(feedbackElements(render(left, state)))).toBe(rendered);
+    }
+    expect(Object.keys(feedbackElements(render(unset))[0])).toEqual(['tag', 'element_id', 'flex_mode', 'horizontal_spacing', 'columns']);
+    expect(Object.keys(feedbackElements(render(unset))[1])).toEqual(['tag', 'element_id', 'content']);
+  });
+
+  it('renders a policy snapshot stored before the field existed as left aligned', () => {
+    const legacySnapshot = JSON.parse(JSON.stringify(make()));
+    delete legacySnapshot.buttonAlign;
+    const restored = normalizeFeedbackPolicy(legacySnapshot);
+    const rendered = JSON.stringify(feedbackElements(render(restored)));
+    expect(rendered).not.toContain('horizontal_align');
+    expect(rendered).not.toContain('text_align');
+    expect(rendered).toBe(JSON.stringify(feedbackElements(render(make()))));
+  });
+
+  it('keeps alignment when a card that already carries it is re-rendered', () => {
+    const policy = make({ buttonAlign: 'right' });
+    const once = render(policy);
+    const twice = renderFeedbackCard(once, policy, { ...negativeState, reasonKey: 'r2' }) as any;
+    const byId = Object.fromEntries(feedbackElements(twice).map((element: any) => [element.element_id, element]));
+    expect(byId.botmux_feedback.horizontal_align).toBe('right');
+    expect(byId.botmux_feedback_reasons.horizontal_align).toBe('right');
+    expect(byId.botmux_feedback_status.text_align).toBe('right');
+  });
+
+  describe('single weighted column rows', () => {
+    // A card whose feedback row is one full-width weighted column (flex_mode none).
+    const weightedBase = (policy: ReturnType<typeof make>) => {
+      const card = JSON.parse(buildCanonicalFinalReplyCard({ markdown: 'answer', feedback: { policy } }));
+      const row = feedbackElements(card)[0];
+      row.flex_mode = 'none';
+      row.columns = [{ tag: 'column', width: 'weighted', weight: 1, elements: row.columns.flatMap((column: any) => column.elements) }];
+      return card;
+    };
+
+    it('puts the alignment on the single column as well as the column set', () => {
+      const policy = make({ buttonAlign: 'right' });
+      const rendered = renderFeedbackCard(weightedBase(policy), policy, negativeState) as any;
+      const byId = Object.fromEntries(feedbackElements(rendered).map((element: any) => [element.element_id, element]));
+      expect(byId.botmux_feedback.flex_mode).toBe('none');
+      expect(byId.botmux_feedback.horizontal_align).toBe('right');
+      expect(byId.botmux_feedback.columns).toHaveLength(1);
+      expect(byId.botmux_feedback.columns[0]).toMatchObject({ width: 'weighted', weight: 1, horizontal_align: 'right' });
+      expect(byId.botmux_feedback.columns[0].elements).toHaveLength(policy.buttons.length);
+    });
+
+    it('leaves the single column untouched when unset or left', () => {
+      const unset = make();
+      const rendered = JSON.stringify(feedbackElements(renderFeedbackCard(weightedBase(unset), unset, negativeState)));
+      expect(rendered).not.toContain('horizontal_align');
+      const left = make({ buttonAlign: 'left' });
+      expect(JSON.stringify(feedbackElements(renderFeedbackCard(weightedBase(left), left, negativeState)))).toBe(rendered);
+      const column: any = (feedbackElements(renderFeedbackCard(weightedBase(unset), unset, negativeState))[0] as any).columns[0];
+      expect(Object.keys(column)).toEqual(['tag', 'width', 'weight', 'elements']);
+    });
+
+    it('does not take the single-column branch once the on-call column is on the row', () => {
+      const policy = make({ buttonAlign: 'right' });
+      const base = weightedBase(policy);
+      feedbackElements(base)[0].columns.push(buildOncallGroupColumn());
+      const row: any = feedbackElements(renderFeedbackCard(base, policy, negativeState))[0];
+      expect(row.flex_mode).toBe('flow');
+      expect(row.horizontal_align).toBe('right');
+      expect(row.columns.at(-1).element_id).toBe('botmux_oncall_group_column');
+      expect(row.columns.slice(0, -1).every((column: any) => column.width === 'auto' && !('horizontal_align' in column))).toBe(true);
+    });
   });
 });

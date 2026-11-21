@@ -251,6 +251,43 @@ export function recordCompleted(
   });
 }
 
+export function recordCompletedStrict(
+  sessionId: string,
+  triggerId: string,
+  content: string,
+  completedAt: number,
+  ownerLarkAppId: string,
+  usage?: PersistedAsyncTriggerResult['usage'],
+): 'completed' | 'terminal' {
+  // Serialize with recordFailedStrict on the same per-session lock so a
+  // completed proof and a dispatch_unknown failure can't interleave-clobber.
+  // A completed proof can replace an ambiguous dispatch_unknown outcome.
+  // An explicit worker failure or caller interrupt is already terminal; a
+  // late transcript/fallback must not promote either to a successful result.
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId);
+    if (file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) throw new Error('async_trigger_owner_mismatch');
+    if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
+    const prev = file.results[triggerId];
+    // An acknowledged explicit interrupt is the caller-selected terminal
+    // boundary. A late transcript final may have been emitted concurrently
+    // with Ctrl+C, but must not rewrite the externally observed cancellation.
+    if (prev?.status === 'interrupted'
+      || (prev?.status === 'failed' && prev.reason === 'turn_terminal')) return 'terminal';
+    file.results[triggerId] = {
+      status: 'completed',
+      createdAt: prev?.createdAt ?? completedAt,
+      completedAt,
+      content,
+      ...(usage ? { usage } : {}),
+    };
+    if (!file.latestTriggerId) file.latestTriggerId = triggerId;
+    saveStrict(sessionId, file);
+    return 'completed' as const;
+  });
+}
+
 /** Park a PENDING steer-group member behind its immediate FIFO successor.
  *  Restart insurance for HTTP `options.steer` (codex-app native turn/steer):
  *  the live daemon fans the group's merged real final out in-memory; if it dies

@@ -48,7 +48,7 @@ function tripPlannerFixture(): unknown {
       },
       book_plan: {
         type: 'subagent',
-        bot: 'gemini-travel',
+        bot: 'kimi-travel',
         depends: ['plan'],
         humanGate: {
           stage: 'before',

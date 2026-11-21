@@ -52,6 +52,12 @@ describe('listener draft patches', () => {
 });
 
 describe('buildListenerSavePayload', () => {
+  it('keeps silence when another field is edited and distinguishes it from thread replies', () => {
+    const silent = { ...allowListListener(), replyPolicy: { mode: 'none' as const } };
+    expect(buildListenerSavePayload({ ...silent, name: 'renamed' }, () => undefined).replyPolicy?.mode).toBe('none');
+    expect(listenerDraftKey(silent)).not.toBe(listenerDraftKey(allowListListener()));
+  });
+
   it('persists only the list of the active sender mode', () => {
     const listener = patchListenerSenderPolicy(allowListListener(), { excludeSenderOpenIds: ['ou_stale'] });
     const payload = buildListenerSavePayload(listener, () => undefined);
@@ -133,6 +139,13 @@ describe('describeListenerWidening', () => {
     expect(widen(base, { ...base, replyPolicy: { mode: 'chat', sessionMode: 'per_message' } })).toEqual(['replyChat']);
   });
 
+  it('reports newly visible replies when leaving silence, but not when entering it', () => {
+    const silent = { ...base, replyPolicy: { mode: 'none' as const } };
+    expect(widen(silent, base)).toEqual(['replyThread']);
+    expect(widen(silent, { ...base, replyPolicy: { mode: 'chat' } })).toEqual(['replyChat']);
+    expect(widen(base, silent)).toEqual([]);
+  });
+
   it('compares keyword filters as sets under their match mode', () => {
     const any = (...keywords: string[]) => ({ ...base, contentPolicy: { includeKeywords: keywords } });
     const all = (...keywords: string[]) => ({ ...base, contentPolicy: { includeKeywords: keywords, matchMode: 'all' as const } });
@@ -146,5 +159,20 @@ describe('describeListenerWidening', () => {
     expect(widen(any('bug'), all('crash'))).toEqual(['keywords']);
     expect(widen(any('bug'), { ...base, contentPolicy: undefined })).toEqual(['keywords']);
     expect(widen({ ...base, contentPolicy: undefined }, any('bug'))).toEqual([]);
+  });
+
+  it('includes identity terms in widening checks without conflating them with text', () => {
+    const identity = { ...base, contentPolicy: { includeMentionedOpenIds: ['ou_target'], matchMode: 'all' as const } };
+    const both = patchListenerContentPolicy(identity, { includeKeywords: ['ask'] });
+    expect(widen(identity, both)).toEqual([]);
+    expect(widen(both, identity)).toEqual(['keywords']);
+    expect(widen(identity, patchListenerContentPolicy(identity, { includeMentionedOpenIds: undefined }))).toEqual(['keywords']);
+    const any = patchListenerContentPolicy(identity, { matchMode: 'any' });
+    expect(widen(any, patchListenerContentPolicy(any, { includeMentionedOpenIds: ['ou_target', 'ou_other'] }))).toEqual(['keywords']);
+    const lookalike = patchListenerContentPolicy(identity, { includeMentionedOpenIds: undefined, includeKeywords: ['ou_target'] });
+    expect(widen(identity, lookalike)).toEqual(['keywords']);
+    const invalid = patchListenerContentPolicy(identity, { includeMentionedOpenIds: [] });
+    expect(widen(invalid, identity)).toEqual(['keywords']);
+    expect(widen(identity, invalid)).toEqual([]);
   });
 });

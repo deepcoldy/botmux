@@ -1021,6 +1021,26 @@ describe('discoverGrokSessions', () => {
     expect(out.find((s) => s.cliSessionId === external)?.cwd).toBe('/tmp/a');
   });
 
+  // #2716: grok has injectsSessionContext=true, so an envelope-less bare
+  // (replyDelivery=transcript + solo) follow-up stored in updates.jsonl is the
+  // user text followed by <botmux_formatting>. It passes the structural
+  // botmux-origin filter (a pre-existing bare gap), but its picker title must
+  // still be the user's text alone.
+  it('titles an envelope-less bare follow-up without the <botmux_formatting> block', async () => {
+    const sid = '55555555-5555-4555-8555-555555555555';
+    const dir = join(ROOT, 'sessions', encodeURIComponent('/tmp/fmt'), sid);
+    mkdirSync(dir, { recursive: true });
+    const barePrompt = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    writeFileSync(
+      join(dir, 'updates.jsonl'),
+      `${JSON.stringify(userChunk(sid, barePrompt, 'e1'))}\n`,
+    );
+    // No generated_title / session_summary: discovery falls back to first prompt.
+    writeFileSync(join(dir, 'summary.json'), JSON.stringify({ info: { id: sid, cwd: '/tmp/fmt' } }));
+    const out = await discoverGrokSessions(10);
+    expect(out.find((s) => s.cliSessionId === sid)?.title).toBe('继续看一下这个 PR');
+  });
+
   it('keeps external prompts that merely discuss botmux tags (structural filter only)', async () => {
     const discuss = '33333333-3333-4333-8333-333333333333';
     // Real botmux envelope: whole turn IS the structural wrapper.

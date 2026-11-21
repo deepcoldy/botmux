@@ -233,6 +233,16 @@ describe('CLI progress timer at actual worker IPC seam', () => {
     expect(updateMessage).toHaveBeenCalledTimes(1); expect(h.reply).toHaveBeenCalledTimes(1);
   });
 
+  it('an attempt-less start (a workflow wake turn) stays on record past its terminal, marked completed', async () => {
+    const h = setup('p2p', 'claude-code');
+    const wakeTurn = 'workflow-event:run-1:7';
+    const key = JSON.stringify([wakeTurn, null]);
+    h.start(wakeTurn);
+    expect(h.ds.replyExecutionStarts?.get(key)).toMatchObject({ startedAtMs: 1_000_000 });
+    h.worker.emit('message', { type: 'turn_terminal', sessionId: 'sid-notice', turnId: wakeTurn, status: 'completed' });
+    await vi.waitFor(() => expect(h.ds.replyExecutionStarts?.get(key)).toMatchObject({ completed: true }));
+  });
+
   it('turn_terminal stops future alerts even without a final IM reply', async () => {
     const h = setup(); h.start();
     h.worker.emit('message', { type: 'turn_terminal', sessionId: 'sid-notice', turnId: 'om_turn', status: 'completed' });

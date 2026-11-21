@@ -191,4 +191,49 @@ describe('botmux root help workflow surface', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+
+  it('send --as with a bad value exits on the argv check even when stdin never reaches EOF', async () => {
+    // The --as value is pure argv derivation, like --image-mode/--response-kind:
+    // it must be validated BEFORE preflight reads stdin. With a socket held open
+    // by the peer, readStdin() would never see 'end', so validating after the
+    // read would hang until the test timeout instead of reporting the usage error.
+    const home = mkdtempSync(join(tmpdir(), 'botmux-send-as-stdin-order-'));
+    const server = createServer();
+    try {
+      const env = { ...process.env, HOME: home };
+      delete env.BOTMUX_WORKFLOW;
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      const { port } = server.address() as AddressInfo;
+      const peer = connect(port, '127.0.0.1');
+      await new Promise<void>((resolve, reject) => {
+        peer.once('connect', () => resolve());
+        peer.once('error', reject);
+      });
+      const { command, prefixArgs } = tsRunnerPrefix();
+      const child = spawn(
+        command,
+        [
+          ...prefixArgs,
+          fileURLToPath(new URL('../src/cli.ts', import.meta.url)),
+          'send',
+          '--as',
+          'bogus',
+          '--no-mention',
+        ],
+        { cwd: process.cwd(), env, stdio: [peer, 'ignore', 'pipe'] },
+      );
+      let stderr = '';
+      child.stderr.setEncoding('utf-8');
+      child.stderr.on('data', chunk => { stderr += chunk; });
+      // Must close on its own (argv error), not because we tore the pipe down.
+      const code = await new Promise<number | null>(resolve => child.once('close', resolve));
+      expect(code).toBe(2);
+      expect(stderr).toContain('--as 仅支持 independent|suggestion');
+      expect(stderr).not.toContain('正文为空');
+      peer.destroy();
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
 });

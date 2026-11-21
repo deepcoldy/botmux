@@ -16,11 +16,13 @@ describe('daemon IPC session-scoped fallback', () => {
   it('keeps the versioned form endpoint behind the same exact session-auth aperture', () => {
     expect(routeHasNarrowUntrustedAuth('POST', '/api/asks')).toBe(true);
     expect(routeHasNarrowUntrustedAuth('POST', '/api/asks/form-v1')).toBe(true);
-    for (const path of ['/api/asks/form-v1/', '/api/asks/form-v1/answer', '/api/asks/form-v10', '/api/asks/answer', '/api/asks/pending']) {
+    expect(routeHasNarrowUntrustedAuth('POST', '/api/asks/cli-resolved')).toBe(true);
+    for (const path of ['/api/asks/form-v1/', '/api/asks/form-v1/answer', '/api/asks/form-v10', '/api/asks/answer', '/api/asks/pending', '/api/asks/cli-resolved/', '/api/asks/cli-resolved/x']) {
       expect(routeHasNarrowUntrustedAuth('POST', path)).toBe(false);
     }
     for (const method of ['GET', 'PUT', 'PATCH', 'DELETE']) {
       expect(routeHasNarrowUntrustedAuth(method, '/api/asks/form-v1')).toBe(false);
+      expect(routeHasNarrowUntrustedAuth(method, '/api/asks/cli-resolved')).toBe(false);
     }
   });
 
@@ -167,7 +169,7 @@ describe('daemon session-scoped IPC route wiring', () => {
     const askInput = ask.slice(inputAt, ask.indexOf('};', inputAt));
     expect(askInput).toContain('boundAsk.larkAppId');
     expect(askInput).not.toContain('parsed.larkAppId');
-    expect(ask.indexOf('registerAskForResponse(askInput')).toBeGreaterThan(inputAt);
+    expect(ask.search(/registerAskForResponse\((\{ \.\.\.)?askInput\b/)).toBeGreaterThan(inputAt);
 
     const hook = route('/api/hooks/emit');
     const hookBindAt = hook.indexOf('boundPayload = bindSessionScopedIpcIdentity(');

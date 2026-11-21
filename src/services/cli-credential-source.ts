@@ -19,9 +19,13 @@
  * run as the shared account):
  *  - not configured                  → historical behaviour, untouched (for
  *    every sandbox setting).
- *  - configured, bot not sandboxed   → no per-bot data root exists to copy
- *    into, the CLI keeps using the global login; warn so the operator sees the
- *    field had no effect.
+ *  - configured, bot not sandboxed, supported CLI → the field itself
+ *    redirects the CLI data root into BOT_HOME (see
+ *    {@link credentialSourceForcesBotHome}) and the rules below apply; when
+ *    that redirect is impossible (wrapperCli / no SESSION_DATA_DIR) → refuse
+ *    to start, like a sandboxed bot.
+ *  - configured, bot not sandboxed, unsupported CLI → the CLI keeps using the
+ *    global login; warn so the operator sees the field had no effect.
  *  - configured, sandbox requested but the CLI data dir is not redirected
  *    (wrapperCli / adapter without redirection / no SESSION_DATA_DIR) →
  *    refuse to start, naming which of the three applies.
@@ -162,6 +166,30 @@ export const CREDENTIAL_SOURCE_SUPPORTED_CLIS: Readonly<Record<string, Credentia
   'claude-code': 'claude',
 };
 
+/** Whether `credentialsSourceDir` alone gives a NOT-sandboxed bot its own CLI
+ *  data root (`CLAUDE_CONFIG_DIR=<BOT_HOME>/claude`), the way Codex
+ *  `codexAuthSync=isolated` does for Codex. Without it an unsandboxed bot has no
+ *  per-bot data root to copy into and silently keeps the machine's global login.
+ *  Only for a CLI listed in {@link CREDENTIAL_SOURCE_SUPPORTED_CLIS} with a valid
+ *  configured path, so a bot that cannot use the source keeps today's
+ *  "ineffective" warning instead of being redirected and then refused.
+ *  Sandboxed bots already redirect; scratch is sandboxed and keeps its native
+ *  home. Shared by the worker and the daemon's mirror of the redirect decision. */
+export function credentialSourceForcesBotHome(input: {
+  sourceDir?: unknown;
+  cliId: string;
+  sandboxRequested: boolean;
+  home?: string;
+}): boolean {
+  if (input.sandboxRequested) return false;
+  if (!Object.prototype.hasOwnProperty.call(CREDENTIAL_SOURCE_SUPPORTED_CLIS, input.cliId)) return false;
+  try {
+    return normalizeCredentialsSourceDir(input.sourceDir, input.home) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
 /** Why a sandbox-requested spawn is NOT redirecting its CLI data root. */
 function redirectBlocker(input: {
   cliId: string;
@@ -170,7 +198,7 @@ function redirectBlocker(input: {
   sessionDataDirPresent: boolean;
 }): string {
   if (input.wrapperCli) {
-    return `wrapperCli is set (under the sandbox the wrapper is ignored and the CLI data dir is not redirected) — remove wrapperCli and retry`;
+    return `wrapperCli is set (a wrapper may replace the CLI env, so the CLI data dir is not redirected behind it) — remove wrapperCli and retry`;
   }
   if (!input.supportsReadIsolation) return `adapter ${input.cliId} does not support per-bot data dir redirection`;
   if (!input.sessionDataDirPresent) return 'SESSION_DATA_DIR is missing, so there is no per-bot data dir to copy into';
@@ -218,6 +246,12 @@ export function planCredentialSource(input: {
   }
   if (!sourceDir) return { kind: 'default' };
   if (notSandboxed) {
+    // A supported CLI is redirected by the field itself (credentialSourceForcesBotHome);
+    // reaching here means that redirect was impossible, and running on the shared
+    // login is exactly what the field exists to prevent.
+    if (Object.prototype.hasOwnProperty.call(CREDENTIAL_SOURCE_SUPPORTED_CLIS, input.cliId)) {
+      return cannot(redirectBlocker(input));
+    }
     return {
       kind: 'ineffective',
       warning: `credentialsSourceDir=${sourceDir} has no effect: this bot is not sandboxed, `

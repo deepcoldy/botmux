@@ -159,6 +159,89 @@ function makeDs(worker: any): DaemonSession {
 
 async function flush(): Promise<void> { await new Promise(resolve => setTimeout(resolve, 0)); }
 
+describe('TraeX fixed context receipt fencing', () => {
+  it('persists receipts only from the exact current worker generation and native thread', async () => {
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    ds.session.cliId = 'traex';
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const receipt = {
+      nativeThreadId: 'native-known', roleDigest: 'a'.repeat(64), skillCatalogDigest: 'b'.repeat(64),
+      turnId: 'om_context', status: 'accepted' as const,
+    };
+    worker.emit('message', { type: 'traex_native_context_receipt', receipt });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toEqual(receipt);
+    worker.emit('message', {
+      type: 'traex_native_context_receipt', receipt: { ...receipt, nativeThreadId: 'other-thread' },
+    });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toEqual(receipt);
+    ds.workerGeneration = (ds.workerGeneration ?? 0) + 1;
+    worker.emit('message', { type: 'traex_native_context_receipt', receipt: { ...receipt, status: 'unknown' } });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toEqual(receipt);
+  });
+
+  it('accepts the first cold-start receipt before the native id is persisted, then requires an exact match', async () => {
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    ds.session.cliId = 'traex';
+    delete (ds.session as { cliSessionId?: string }).cliSessionId;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const receipt = {
+      nativeThreadId: 'native-cold', roleDigest: 'a'.repeat(64), skillCatalogDigest: 'b'.repeat(64),
+      turnId: 'om_first_turn', status: 'accepted' as const,
+    };
+    // The worker ACKs the first turn before persistCliSessionId reaches the daemon.
+    worker.emit('message', { type: 'traex_native_context_receipt', receipt });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toEqual(receipt);
+
+    ds.session.cliSessionId = 'native-cold';
+    worker.emit('message', {
+      type: 'traex_native_context_receipt',
+      receipt: { ...receipt, turnId: 'om_second_turn', status: 'unknown' },
+    });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toMatchObject({ turnId: 'om_second_turn', status: 'unknown' });
+
+    worker.emit('message', {
+      type: 'traex_native_context_receipt',
+      receipt: { ...receipt, nativeThreadId: 'native-other', turnId: 'om_third_turn' },
+    });
+    await flush();
+    expect(ds.session.traexNativeContextReceipt).toMatchObject({ turnId: 'om_second_turn' });
+  });
+});
+
+describe('prompt_submitted_input fencing', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('delivers the live generation\'s match and drops a replaced worker\'s or an older generation\'s', async () => {
+    const onPromptSubmittedInput = vi.fn();
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(), onPromptSubmittedInput } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const match = { type: 'prompt_submitted_input', turnId: 'workflow-event:run-1:3' };
+    worker.emit('message', match);
+    await flush();
+    expect(onPromptSubmittedInput).toHaveBeenCalledWith(ds, 'workflow-event:run-1:3', { workerGeneration: ds.session.workerGeneration });
+    onPromptSubmittedInput.mockClear();
+    ds.worker = makeFakeWorker();
+    worker.emit('message', match);
+    await flush();
+    ds.worker = worker;
+    ds.session.workerGeneration = (ds.session.workerGeneration ?? 1) + 1;
+    worker.emit('message', match);
+    await flush();
+    expect(onPromptSubmittedInput).not.toHaveBeenCalled();
+  });
+});
+
 describe('native_input_consumed fencing', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 

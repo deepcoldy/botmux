@@ -2,7 +2,7 @@
  * Session Discovery — scans tmux panes for running CLI processes that can be adopted.
  *
  * Discovers non-botmux tmux sessions running known CLI binaries (Claude Code,
- * Codex, Aiden, CoCo, Cursor, Gemini, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
+ * Codex, Aiden, CoCo, Cursor, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
  */
 import { execFileSync, execSync } from 'node:child_process';
 import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
@@ -13,6 +13,7 @@ import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
 import { executableBasename } from '../adapters/cli/runtime.js';
 import { readClaudeSessionMeta } from '../services/claude-transcript.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
+import { isZombieProcess } from './session-scope.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid, readTraexThreadTitle } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
@@ -76,6 +77,8 @@ export interface AdoptableSession {
 
 const CLI_COMM_MAP: Record<string, CliId> = {
   claude: 'claude-code',
+  // Claude Code's npm package runs its native `bin/claude.exe`; that is the comm.
+  'claude.exe': 'claude-code',
   // Seed / Relay are Claude Code forks (Relay is Seed's new release
   // name). Both rebrand process.title to their product name, so a running
   // session's `/proc/<pid>/comm` is literally `seed` / `relay` (verified on a
@@ -96,7 +99,6 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // TRAE（traex）是另一套 Codex 系 CLI，可执行就叫 `traex`，与上面 CoCo 的
   // traecli 别名是两个不同的二进制（traecli 是 coco 的软链）。
   traex: 'traex',
-  gemini: 'gemini',
   opencode: 'opencode',
   opencode2: 'opencode2',
   mimo: 'mimocode',
@@ -246,6 +248,24 @@ function launcherExecutableSlots(argv: string[]): string[] {
   return slots;
 }
 
+export function isGenericLauncherComm(comm: string | undefined): boolean {
+  const normalizedComm = comm?.startsWith('.') ? comm.slice(1) : comm;
+  return normalizedComm ? COMM_ARGV_LAUNCHERS.has(normalizedComm) : false;
+}
+
+/** Canonical launcher name for worker wrapper-identity parsing. Unlike adopt
+ * discovery, a configured wrapper may use a versioned interpreter filename;
+ * normalize that name so only its script can establish wrapper identity. */
+export function wrapperGenericLauncherComm(comm: string | undefined): string | undefined {
+  const normalizedComm = comm?.startsWith('.') ? comm.slice(1) : comm;
+  if (!normalizedComm) return undefined;
+  if (COMM_ARGV_LAUNCHERS.has(normalizedComm)) return normalizedComm;
+  const match = /^(node|nodejs|bun|deno|python|ruby)(?:[-_.]?v?\d+(?:\.\d+)*)(?:\.exe)?$/.exec(normalizedComm);
+  if (!match) return undefined;
+  const launcher = match[1]!;
+  return launcher === 'nodejs' ? 'node' : launcher;
+}
+
 /** Return only argv positions that can establish executable identity for this
  * process. Generic launchers may carry the script/program after a small,
  * explicitly understood flag prefix; ordinary processes are limited to
@@ -256,10 +276,7 @@ export function processExecutableArgvSlots(
   comm: string | undefined,
   argv: string[],
 ): string[] {
-  const normalizedComm = comm?.startsWith('.') ? comm.slice(1) : comm;
-  return normalizedComm && COMM_ARGV_LAUNCHERS.has(normalizedComm)
-    ? launcherExecutableSlots(argv)
-    : argv.slice(0, 1);
+  return isGenericLauncherComm(comm) ? launcherExecutableSlots(argv) : argv.slice(0, 1);
 }
 
 export function cliIdForComm(
@@ -289,10 +306,14 @@ export function cliIdForComm(
 }
 
 /** /proc/<pid>/cmdline → argv (Linux fast path; ps fallback for macOS). */
-export function readCmdline(pid: number): string[] {
+export function readCmdline(pid: number, options: { exact?: boolean } = {}): string[] {
   try {
     return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').split('\0').filter(Boolean);
   } catch {
+    // `ps args` loses argv boundaries. It remains useful for executable
+    // discovery, but cannot distinguish a command from words inside a prompt
+    // or an option value (macOS and procfs-denied Linux).
+    if (options.exact) return [];
     try {
       const out = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], {
         encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
@@ -301,6 +322,44 @@ export function readCmdline(pid: number): string[] {
       return out.trim().split(/\s+/).filter(Boolean);
     } catch { return []; }
   }
+}
+
+const CODEX_VALUE_OPTIONS = new Set([
+  '-c', '--config', '-m', '--model', '-p', '--profile', '-s', '--sandbox',
+  '-a', '--ask-for-approval', '-C', '--cd', '-i', '--image', '--add-dir',
+  '--enable', '--disable', '--local-provider', '--remote', '--remote-auth-token-env',
+]);
+const CODEX_NONINTERACTIVE_COMMANDS = new Set([
+  'debug', 'completion', 'exec', 'e', 'review', 'login', 'logout', 'mcp',
+  'mcp-server', 'app-server', 'exec-server', 'app', 'sandbox', 'apply', 'a',
+  'cloud', 'features', 'help', 'update', 'doctor', 'plugin', 'remote-control',
+  'queue', 'archive', 'unarchive', 'delete', 'migrate-rollouts', 'migrate-nfs-db',
+]);
+
+/** A wrapper may run a Codex metadata command before starting the actual TUI.
+ *  Inspect only the root command, skipping known option values: a model/profile
+ *  called "debug", or a prompt after `--`, must not look like a probe. Missing
+ *  argv retains the comm-based contract used when process inspection is denied. */
+export function isNonInteractiveCodexArgv(argv: string[]): boolean {
+  let interactiveSubcommand = false;
+  for (let index = 1; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') return false;
+    if (CODEX_VALUE_OPTIONS.has(arg)) { index++; continue; }
+    if (arg === '--help' || arg === '-h' || arg === '--version' || arg === '-V') return true;
+    if (arg.startsWith('-')) continue;
+    if (interactiveSubcommand) continue;
+    if (arg === 'resume' || arg === 'fork') { interactiveSubcommand = true; continue; }
+    return CODEX_NONINTERACTIVE_COMMANDS.has(arg);
+  }
+  return false;
+}
+
+/** Claude's bare help/version commands are metadata probes, not the resident
+ * interactive CLI. Keep this deliberately narrow: other short-lived helpers
+ * are handled by the startup liveness monitor rather than an argv blacklist. */
+export function isClaudeMetadataProbeArgv(argv: string[]): boolean {
+  return argv.length === 2 && ['--help', '-h', '--version', '-v'].includes(argv[1]!);
 }
 
 /**
@@ -439,7 +498,7 @@ function clockTicksPerSecond(): number {
 /**
  * 进程启动时间（epoch ms），best-effort。让 /adopt 选择卡片能为**任意** CLI 显示
  * 真实运行时长，而不是只有 Claude（Claude 另有 ~/.claude/sessions/<pid>.json 带
- * startedAt）。其它 CLI（cursor/codex/coco/gemini…）之前一律落 "未知" 就是因为
+ * startedAt）。其它 CLI（cursor/codex/coco…）之前一律落 "未知" 就是因为
  * 这里没有兜底。
  *
  * Linux 走 /proc/<pid>/stat（字段 22 = starttime，单位时钟滴答，自开机起算）+
@@ -488,13 +547,24 @@ export function readProcessStartTime(pid: number): number | undefined {
  * 低频操作（只在用户 /adopt 时跑一遍）。
  */
 export function getChildPids(pid: number): number[] {
+  return snapshotChildPids()(pid);
+}
+
+/**
+ * Read the process table ONCE and answer "children of pid" from that copy.
+ * A BFS over a deep launch chain (sandbox launchers stack 7+ levels) calling
+ * {@link getChildPids} per node would fork `ps` once per visited process on
+ * every retry tick; a snapshot keeps it at one fork per walk. An unreadable
+ * table yields no children (same as getChildPids' failure mode).
+ */
+export function snapshotChildPids(): (pid: number) => number[] {
+  const byParent = new Map<number, number[]>();
   try {
     const out = execSync('ps -A -o pid= -o ppid=', {
       encoding: 'utf-8',
       maxBuffer: PROCESS_TABLE_MAX_BUFFER,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const children: number[] = [];
     for (const line of out.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -502,14 +572,15 @@ export function getChildPids(pid: number): number[] {
       if (parts.length < 2) continue;
       const childPid = Number(parts[0]);
       const parentPid = Number(parts[1]);
-      if (!isNaN(childPid) && !isNaN(parentPid) && parentPid === pid) {
-        children.push(childPid);
-      }
+      if (isNaN(childPid) || isNaN(parentPid)) continue;
+      const siblings = byParent.get(parentPid);
+      if (siblings) siblings.push(childPid);
+      else byParent.set(parentPid, [childPid]);
     }
-    return children;
   } catch {
-    return [];
+    // ps unavailable: every lookup answers "no children".
   }
+  return pid => [...(byParent.get(pid) ?? [])];
 }
 
 /**
@@ -575,6 +646,14 @@ function hasCliProcess(
 }
 
 /**
+ * How deep the Codex ownership search descends below its launch root. Under the
+ * network-policy sandbox the CLI sits 7 levels below the session-scope sh (8
+ * below an OSC relay); see the measured chain in traex-leaf-pid.ts. An npm
+ * install adds its Node launcher on top of that.
+ */
+export const CODEX_LEAF_SEARCH_DEPTH = 16;
+
+/**
  * Resolve the REAL CLI pid spawned underneath a wrapperCli launcher
  * (e.g. `aiden x claude`, where the launcher forks real Claude Code as a child).
  *
@@ -584,11 +663,12 @@ function hasCliProcess(
  * session-id discovery and leaves the JSONL bridge watching a path the real CLI
  * never writes. This walks the launcher's DESCENDANTS to find the actual CLI.
  *
- * Matching is by process `comm` ONLY — deliberately NOT argv. The launcher's own
+ * Executable matching is by process `comm`, not by searching argv. The launcher's own
  * argv carries the target name as a literal token (`aiden x claude` → "claude"
  * is in argv), so argv-scanning (cliIdFromCommArgv) would misidentify the
  * launcher itself as the CLI. The real CLI process has the binary as its comm
- * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`).
+ * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`). Codex
+ * additionally excludes noninteractive commands such as `debug models`.
  *
  * BFS starts at the launcher's children (never the launcher node) and returns
  * the shallowest descendant recognized as `targetCliId`, or null if none exists
@@ -599,21 +679,79 @@ export function findLaunchedCliPid(
   targetCliId: CliId,
   maxDepth = 6,
   // Injectable process probes (defaults hit the real OS); tests pass fakes.
-  probes: { childrenOf?: (pid: number) => number[]; commOf?: (pid: number) => string | undefined } = {},
+  probes: {
+    childrenOf?: (pid: number) => number[];
+    commOf?: (pid: number) => string | undefined;
+    cmdlineOf?: (pid: number) => string[];
+    isZombie?: (pid: number) => boolean;
+    /** A matching process to traverse rather than return as the CLI leaf. */
+    isPersistentWrapper?: (pid: number, comm: string) => boolean;
+    /** A matching candidate whose executable identity is unknown: prune its
+     * subtree instead of trusting it or a same-comm descendant. */
+    isUnknownWrapper?: (pid: number, comm: string) => boolean;
+  } = {},
   filterExecutable?: string,
+): number | null {
+  return findLaunchedCliPidWithUnknownState(
+    launcherPid, targetCliId, maxDepth, probes, filterExecutable, { sawUnknownMatch: false },
+  );
+}
+
+function findLaunchedCliPidWithUnknownState(
+  launcherPid: number,
+  targetCliId: CliId,
+  maxDepth: number,
+  probes: NonNullable<Parameters<typeof findLaunchedCliPid>[3]>,
+  filterExecutable: string | undefined,
+  unknownState: { sawUnknownMatch: boolean },
 ): number | null {
   const childrenOf = probes.childrenOf ?? getChildPids;
   const commOf = probes.commOf ?? readComm;
+  const cmdlineOf = probes.cmdlineOf ?? (pid => readCmdline(pid, { exact: true }));
+  const isZombie = probes.isZombie ?? isZombieProcess;
   let frontier = childrenOf(launcherPid);
   const seen = new Set<number>([launcherPid]);
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
     const next: number[] = [];
+    let deferredMatch: number | null = null;
+    let nestedMatch: number | null = null;
     for (const pid of frontier) {
       if (seen.has(pid)) continue;
       seen.add(pid);
       const comm = commOf(pid);
-      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) return pid;
+      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) {
+        if (targetCliId === 'codex'
+          && (isZombie(pid) || isNonInteractiveCodexArgv(cmdlineOf(pid)))) continue;
+        if (probes.isUnknownWrapper?.(pid, comm)) {
+          // An unidentified wrapper may hide the real CLI in its pruned subtree.
+          // Do not let a same-level helper become the fallback merely because
+          // wrapper evidence is temporarily unreadable; retry the whole search.
+          unknownState.sawUnknownMatch = true;
+          continue;
+        }
+        if (probes.isPersistentWrapper?.(pid, comm)) {
+          // Exhaust a proven wrapper's subtree before accepting a same-level
+          // helper sibling. Keep the global depth budget; a null result lets the
+          // deferred sibling serve as fallback without scanning this tree twice.
+          const nested = findLaunchedCliPidWithUnknownState(
+            pid, targetCliId, maxDepth - depth - 1, probes, filterExecutable, unknownState,
+          );
+          // A nested result is only usable after the whole level was scanned:
+          // a later unknown sibling invalidates it just like an earlier one.
+          if (nestedMatch === null && nested) nestedMatch = nested;
+          continue;
+        }
+        // Do not let sibling order decide whether a later wrapper at this depth
+        // gets to produce its real CLI first. Without a wrapper, the first match
+        // is returned after this level exactly as before.
+        if (deferredMatch === null) deferredMatch = pid;
+        continue;
+      }
       next.push(...childrenOf(pid));
+    }
+    if (!unknownState.sawUnknownMatch) {
+      if (nestedMatch !== null) return nestedMatch;
+      if (deferredMatch !== null) return deferredMatch;
     }
     frontier = next;
   }
@@ -652,17 +790,42 @@ export interface WrapperRealPidResolveDeps {
   getBackend: () => unknown;
   /** Backend's current child pid (the launcher while unchanged). */
   getChildPid: () => number | null | undefined;
-  /** Apply the resolved real pid: rewire backend.cliPid + bridgeCliPid. */
-  applyRealPid: (realPid: number) => void;
+  /** Apply the resolved real pid. Return false when publication failed and
+   * should be retried; void preserves the legacy stop-after-success behavior. */
+  applyRealPid: (realPid: number) => unknown;
   /** Timer scheduler (injectable for tests). */
   schedule: (fn: () => void, ms: number) => void;
+  /** Optional startup-window liveness check after a successful apply. While it
+   * returns true, keep the bounded timer alive without rescanning; when it
+   * returns false, discard that choice and resolve again. This recovers from a
+   * short-lived helper that matched the CLI comm before the interactive leaf. */
+  isAppliedPidValid?: (realPid: number) => boolean;
   /** When the launcher pid is itself the CLI leaf (e.g. a direct native
    *  install, not a wrapper), descendant discovery can never find anything
    *  realer: stop polling immediately instead of rescanning the tree on every
    *  tick. */
   isDirectLeaf?: (launcherPid: number) => boolean;
+  /** Classify the launcher once per tick. Unknown skips only this tick, direct
+   *  stops discovery, and wrapper permits descendant resolution. */
+  classifyLauncher?: (launcherPid: number) => 'direct' | 'unknown' | 'wrapper' | undefined;
   intervalMs?: number;
   maxAttempts?: number;
+  /** Optional wall-clock budget measured from scheduling, including time spent
+   * inside synchronous probes and discovery. Undefined preserves attempt-only
+   * retries. An in-flight synchronous callback may finish, but once the budget
+   * is exceeded no further discovery, publication or timer is started. */
+  maxElapsedMs?: number;
+  /** Clock paired with maxElapsedMs; injectable alongside the timer scheduler. */
+  now?: () => number;
+}
+
+/** Create an opt-in elapsed-time fence shared by PID retry loops. The budget
+ * starts at creation and uses `>` so a fast tick exactly at the deadline can
+ * finish. Undefined disables time-based expiry and preserves attempt-only
+ * behavior. An in-flight synchronous callback is never interrupted. */
+export function createElapsedDeadline(maxElapsedMs: number | undefined, now: () => number = Date.now): () => boolean {
+  const startedAt = now();
+  return () => maxElapsedMs !== undefined && now() - startedAt > maxElapsedMs;
 }
 
 /**
@@ -681,16 +844,35 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
   const backendAtSpawn = deps.getBackend();
   const intervalMs = deps.intervalMs ?? 200;
   const maxAttempts = deps.maxAttempts ?? 30;
+  const expired = createElapsedDeadline(deps.maxElapsedMs, deps.now);
   let attempts = 0;
+  let appliedPid: number | undefined;
+  const retry = () => {
+    attempts++;
+    if (attempts < maxAttempts && !expired()) deps.schedule(tick, intervalMs);
+  };
   const tick = () => {
+    if (expired()) return;
     if (!launcherRetryStillValid(deps.getBackend(), backendAtSpawn, deps.getChildPid(), launcherPid)) return;
-    if (deps.isDirectLeaf?.(launcherPid)) return;
+    const role = deps.classifyLauncher?.(launcherPid);
+    if (role === 'unknown') { retry(); return; }
+    if (role === 'direct' || (role === undefined && deps.isDirectLeaf?.(launcherPid))) return;
+    if (appliedPid !== undefined) {
+      if (deps.isAppliedPidValid?.(appliedPid)) { retry(); return; }
+      appliedPid = undefined;
+    }
+    // A synchronous stable-pane probe can consume most of the budget. Do not
+    // start (or publish) discovery after it returns past the deadline.
+    if (expired()) return;
     const realPid = deps.findRealPid(launcherPid);
+    if (expired()) return;
     if (realPid && realPid !== launcherPid) {
-      deps.applyRealPid(realPid);
+      const applied = deps.applyRealPid(realPid);
+      if (applied !== false && deps.isAppliedPidValid) appliedPid = realPid;
+      if (applied === false || appliedPid !== undefined) retry();
       return;
     }
-    if (++attempts < maxAttempts) deps.schedule(tick, intervalMs);
+    retry();
   };
   deps.schedule(tick, intervalMs);
 }
@@ -1144,7 +1326,7 @@ function resolveAdoptableSessionForPane(
 
   // 5b. Fall back to the CLI process's own start time for uptime. Without
   // this only Claude (which has a session JSON with startedAt) shows a real
-  // uptime; every other CLI — cursor/codex/coco/gemini… — rendered "未知".
+  // uptime; every other CLI — cursor/codex/coco… — rendered "未知".
   if (startedAt === undefined) {
     startedAt = readProcessStartTime(cliPid);
   }

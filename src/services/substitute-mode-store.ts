@@ -52,6 +52,7 @@ export interface SubstituteTargetResolution {
   /** What the user typed (email / ou_ / on_ / u_ — trimmed). */
   input: string;
   ok: boolean;
+  appId?: string;
   openId?: string;
   name?: string;
   avatarUrl?: string;
@@ -79,7 +80,7 @@ export interface SubstituteResolveDeps {
   >;
 }
 
-type RawTarget = { openId?: string; userId?: string; unionId?: string; email?: string; name?: string };
+type RawTarget = { appId?: unknown; openId?: string; userId?: string; unionId?: string; email?: string; name?: string };
 
 /**
  * Resolve dashboard-submitted targets into runtime-matchable ones: every
@@ -95,7 +96,7 @@ export async function resolveSubstituteTargets(
   larkAppId: string,
   rawTargets: unknown,
   deps: SubstituteResolveDeps,
-): Promise<{ targets: SubstituteTarget[]; resolution: SubstituteTargetResolution[] }> {
+): Promise<{ targets: SubstituteTarget[]; resolution: SubstituteTargetResolution[]; invalidAppId: boolean }> {
   const list: RawTarget[] = Array.isArray(rawTargets)
     ? rawTargets.filter((t): t is RawTarget => !!t && typeof t === 'object' && !Array.isArray(t))
     : [];
@@ -103,10 +104,10 @@ export async function resolveSubstituteTargets(
   // The single identifier we resolve per target, preferring the most stable id.
   const inputs = list.map(t => ({
     t,
-    raw: String(t.openId ?? t.unionId ?? t.email ?? t.userId ?? '').trim(),
+    raw: String(t.appId ?? t.openId ?? t.unionId ?? t.email ?? t.userId ?? '').trim(),
   }));
 
-  const rawList = inputs.map(i => i.raw).filter(Boolean);
+  const rawList = inputs.filter(i => i.t.appId === undefined).map(i => i.raw).filter(Boolean);
   let map = new Map<string, string>();
   let resolveErrored = false;
   if (rawList.length) {
@@ -120,9 +121,24 @@ export async function resolveSubstituteTargets(
   const targets: SubstituteTarget[] = [];
   const resolution: SubstituteTargetResolution[] = [];
   const seen = new Set<string>();
+  let invalidAppId = false;
 
   for (const { t, raw } of inputs) {
-    if (!raw) continue;
+    if (!raw && t.appId === undefined) continue;
+    if (t.appId !== undefined) {
+      const appId = raw.toLowerCase();
+      if (typeof t.appId !== 'string' || !/^cli_[a-z0-9]+$/.test(appId)) {
+        invalidAppId = true;
+        resolution.push({ input: raw, ok: false, reason: 'unresolvable' });
+        continue;
+      }
+      resolution.push({ input: raw, ok: true, appId, name: t.name });
+      if (!seen.has(appId)) {
+        seen.add(appId);
+        targets.push({ appId, ...(t.name ? { name: t.name } : {}) });
+      }
+      continue;
+    }
     const isRawOpenId = !!t.openId;
     const openId = map.get(raw) ?? (t.openId && map.has(t.openId) ? map.get(t.openId) : undefined);
 
@@ -169,5 +185,5 @@ export async function resolveSubstituteTargets(
     }
   }
 
-  return { targets, resolution };
+  return { targets, resolution, invalidAppId };
 }

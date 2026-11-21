@@ -80,7 +80,17 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   { name: '/restart', sessionPolicy: 'default', help: ['help.restart'] },
   { name: '/status', sessionPolicy: 'default', help: ['help.status'] },
+  { name: '/models', sessionPolicy: 'sessionless', help: ['help.models'] },
+  { name: '/modelpin', sessionPolicy: 'existingOnly', help: ['help.modelpin'] },
   { name: '/retry', sessionPolicy: 'default', help: ['help.retry'] },
+  {
+    name: '/rewind', sessionPolicy: 'existingOnly', help: ['help.rewind'],
+    notes: '可选 `<n>` 预览、`<n> confirm` 执行；只对 Claude Code（append-only transcript）生效',
+  },
+  {
+    name: '/idlecompact', sessionPolicy: 'existingOnly', help: ['help.idlecompact'],
+    notes: '可选 `on` / `off` / `<分钟 1–59>`，不带参数看状态；只改本会话的闲置自动压缩设置，只对 Claude Code / tmux 后端 Codex 生效',
+  },
   { name: '/queue', sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['help.queue'],
     notes: 'Codex App 活会话中的文字消息按原生 FIFO 新轮次执行；其它 CLI 明确拒绝，不创建会话' },
   { name: '/help', sessionPolicy: 'default', help: ['help.help'] },
@@ -140,6 +150,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     name: '/context-sharing', sessionPolicy: 'sessionless', help: ['help.context_sharing'],
     notes: '群级后台上下文开关；严格 owner/allowedUsers 闸，不创建或唤醒会话',
   },
+  // 多行只在这条 /g 会带任务开工时才接受（入口经 SlashRouteInput.multilineCommands 按条放行）。
   { name: '/group', aliases: ['/g'], sessionPolicy: 'sessionless', help: ['help.group'] },
   { name: '/relay', sessionPolicy: 'default', help: ['help.relay', 'help.relay_create'] },
   { name: '/quote', sessionPolicy: 'existingOnly', help: ['help.quote'] },
@@ -195,7 +206,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     notes: '恰好 1 个 token（清理任务 ID）；主干 #956 引入，rebase 时与 oracle 同步登记',
   },
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
-  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
+  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['cmd.effort.usage'] },
   {
     name: '/resume', claimWithoutSessionOnly: true, permission: 'talk', sessionPolicy: 'sessionless', help: ['help.resume'],
     notes: '无会话时恢复本话题/本群已关闭的会话（不带参数 = 最近一个）；有会话时透传给 CLI 自带的 /resume。'
@@ -226,7 +237,7 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
  * declaring one would never receive it.
  */
 const PRE_ROUTING_COMMANDS: ReadonlySet<string> = new Set([
-  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode',
+  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode', '/secretary',
   '/substitute', '/reply-mode', '/workflow', '/template', '/invite',
 ]);
 

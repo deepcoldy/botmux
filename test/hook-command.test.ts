@@ -74,15 +74,22 @@ describe('sessionReadyHookCommand', () => {
 });
 
 describe('statuslineHookCommand', () => {
-  it('指向 CLI 入口而非 index-daemon.js，并以 statusline 子命令结尾', () => {
+  it('源码态指向轻量入口 statusline-entry，不经 cli.ts、不带子命令', () => {
     const cmd = statuslineHookCommand();
-    expect(cmd).toContain('cli.ts');
+    expect(cmd).toContain('statusline-entry.ts');
+    expect(cmd).not.toContain('cli.ts');
     expect(cmd).not.toContain('index-daemon');
-    expect(cmd.endsWith(' statusline')).toBe(true);
   });
 
-  it('Node/tsx 运行时为解释器参数和 CLI 路径加引号', () => {
-    expect(statuslineHookCommand()).toBe(`${sessionRuntimePrefix()} statusline`);
+  it('dist 态指向 dist/statusline-entry.js；Bun 运行时带 JSC 线程限制前缀，Node 不带', () => {
+    const moduleUrl = pathToFileURL(join(tmpdir(), 'botmux', 'dist', 'adapters', 'hook-command.js')).href;
+    const entry = join(tmpdir(), 'botmux', 'dist', 'statusline-entry.js');
+    const quotedExec = `'${process.execPath}'`;
+    expect(statuslineHookCommand(false, moduleUrl, false, 'linux')).toBe(`${quotedExec} '${entry}'`);
+    expect(statuslineHookCommand(false, moduleUrl, true, 'linux'))
+      .toBe(`BUN_JSC_numberOfGCMarkers=1 BUN_JSC_useConcurrentJIT=false ${quotedExec} '${entry}'`);
+    // Windows 的 shell 不支持 `A=b cmd` 前缀。
+    expect(statuslineHookCommand(false, moduleUrl, true, 'win32')).toBe(`${quotedExec} '${entry}'`);
   });
 });
 

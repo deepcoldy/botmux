@@ -15,8 +15,10 @@ import type {
   GlobalConfig,
   MaintenanceConfig,
 } from '../global-config.js';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import {
   normalizeGroupNamePrefix,
+  normalizeWorktreeRoot,
   mergeDashboardConfig,
   mergeGlobalConfig,
   mergeMaintenanceConfig,
@@ -37,8 +39,10 @@ import {
   isCodexNotifierHookInstalled,
 } from '../features/codex-notifier/index.js';
 import { isLocale } from '../i18n/types.js';
+import { expandHomePath } from '../utils/working-dir.js';
 import { canonicalScheduleBotGrant, isScheduleBotGrant, overlappingScheduleBotGrants } from '../core/schedule-bot-grant.js';
 import { normalizePromptCacheConfig, type PromptCacheConfig } from '../services/prompt-cache-policy.js';
+import { normalizeProviderRecoveryConfig, type ProviderRecoveryConfig } from '../services/provider-recovery-policy.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
 import { isValidTimeZone } from '../utils/timezone.js';
@@ -51,6 +55,9 @@ import { isValidTimeZone } from '../utils/timezone.js';
  */
 export interface ResolvedDashboardSettingsView {
   groupNamePrefix: string;
+  /** Whether new groups @-mention their owner with the "group is ready" notice. Default ON. */
+  groupOwnerNotice: boolean;
+  worktreeRoot: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -59,11 +66,17 @@ export interface ResolvedDashboardSettingsView {
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
+  terminalEffortWriteback?: boolean;
   reapOrphanTmuxServers: boolean;
+  tmuxOrphanSessionSweep: boolean;
+  tmuxOrphanSessionBareWrapperKill: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
   cardBrandLabel: boolean;
+  /** Whether the turn initiator may press the safe keys on a stuck card. Default ON. */
+  stuckCardInitiatorKeys: boolean;
+  modelQueueNotify?: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -105,10 +118,11 @@ export interface ResolvedDashboardSettingsView {
   };
   noVisibleOutputHint: boolean;
   crossPrincipalInterruption: boolean;
-  /** Cross-bot schedule delegation switches and host bot grants. */
+  /** Schedule delegation switches and host bot grants. */
   scheduleBotGrants?: {
     createEnabled: boolean;
     selfManageEnabled: boolean;
+    childOneShotEnabled: boolean;
     grants: ScheduleBotGrant[];
     ignoredCount?: number;
     botOptions?: Array<{ larkAppId: string; botName: string | null }>;
@@ -123,11 +137,17 @@ export interface ResolvedDashboardSettingsView {
   localDevInstall: boolean;
   autoUpdateSupported?: boolean;
   remoteAccess?: boolean;
-  /** Machine-wide v3 Workflow feature switch. Default ON. */
-  workflow: { enabled: boolean };
+  /** Machine-wide v3 Workflow feature switch (default OFF), the
+   *  experimental node executor for newly authorized runs (default
+   *  `ephemeral`) and whether their handoffs carry the initiator's identity
+   *  (default off). */
+  workflow: { enabled: boolean; nodeExecutor?: 'ephemeral' | 'bot'; handoffIdentity?: boolean };
   /** Machine-wide Claude Code prompt-cache default (TTL + idle keep-alive);
    *  null = not configured (off). Bots override it field by field. */
   promptCache: PromptCacheConfig | null;
+  /** Machine-wide automatic continuation after transient provider failures;
+   *  null = not configured (off). Bots override it field by field. */
+  providerRecovery: ProviderRecoveryConfig | null;
   /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
    *  生效值（含默认回退），供设置页回显。 */
   sessionCleanup: {
@@ -136,8 +156,9 @@ export interface ResolvedDashboardSettingsView {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
-  /** Machine-wide multi-topic orchestration switch. Default ON. */
-  multiTopic: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON. The nested
+   *  task-tree card switch is default OFF and optional. */
+  multiTopic: { enabled: boolean; taskTreeCard?: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Proxy for binary self-update downloads, null/absent = unset. */
@@ -150,6 +171,18 @@ export interface ResolvedDashboardSettingsView {
   /** The TRUE effective zone (scheduleTimeZone(): env → config → host). The UI
    *  must use this for "currently effective", not configured||host. */
   effectiveScheduleTimeZone?: string;
+}
+
+/** Group-creation fields of the Dashboard settings snapshot. `groupOwnerNotice`
+ *  must agree with what group creation reads (config.ts `groupOwnerNotice`):
+ *  only an explicit stored `false` shows the switch off. */
+export function resolveGroupCreationSettings(
+  global: Pick<GlobalConfig, 'groupNamePrefix' | 'groupOwnerNotice'>,
+): Pick<ResolvedDashboardSettingsView, 'groupNamePrefix' | 'groupOwnerNotice'> {
+  return {
+    groupNamePrefix: global.groupNamePrefix ?? '',
+    groupOwnerNotice: global.groupOwnerNotice !== false,
+  };
 }
 
 export type ParseMaintenanceResult =
@@ -250,6 +283,8 @@ export type ApplySettingsWriteResult =
  */
 export type ApplySettingsWriteError =
   | 'invalid_groupNamePrefix'
+  | 'invalid_groupOwnerNotice'
+  | 'invalid_worktreeRoot'
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
   | 'invalid_enableLocalCliOpen'
@@ -261,10 +296,15 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
+  | 'invalid_terminalEffortWriteback'
   | 'invalid_reapOrphanTmuxServers'
+  | 'invalid_tmuxOrphanSessionSweep'
+  | 'invalid_tmuxOrphanSessionBareWrapperKill'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_cardBrandLabel'
+  | 'invalid_stuckCardInitiatorKeys'
+  | 'invalid_modelQueueNotify'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -290,6 +330,7 @@ export type ApplySettingsWriteError =
   | 'invalid_scheduleBotGrants'
   | 'invalid_scheduleBotGrants_createEnabled'
   | 'invalid_scheduleBotGrants_selfManageEnabled'
+  | 'invalid_scheduleBotGrants_childOneShotEnabled'
   | 'invalid_scheduleBotGrants_grant'
   | 'scheduleBotGrants_duplicate_id'
   | 'scheduleBotGrants_overlap'
@@ -301,7 +342,10 @@ export type ApplySettingsWriteError =
   | 'invalid_vcMeetingAgent_listenerBotAppId'
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
+  | 'invalid_workflow_nodeExecutor'
+  | 'invalid_workflow_handoffIdentity'
   | 'invalid_promptCache'
+  | 'invalid_providerRecovery'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
   | 'invalid_sessionCleanup_archiveCodex'
@@ -405,6 +449,16 @@ export function resolveCodexNotifierRecipientView(
  *   - Forbids enabling `autoRestart` unless `autoUpdate` is (or is being) enabled.
  *   - Returns `empty_patch` when no fields changed.
  */
+function isWritableDirectory(path: string): boolean {
+  try {
+    if (!statSync(path).isDirectory()) return false;
+    accessSync(path, fsConstants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function applySettingsWrite(
   body: unknown,
   deps: SettingsWriteApplierDeps,
@@ -434,6 +488,35 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_groupNamePrefix' };
     }
     groupNamePrefixPatch = groupNamePrefix ?? null;
+  }
+
+  // Default ON: only `false` is stored; writing `true` deletes the key so the
+  // file never pins the default (same shape as stuckCardInitiatorKeys).
+  let groupOwnerNoticePatch: false | null | undefined;
+  if ('groupOwnerNotice' in obj) {
+    if (typeof obj.groupOwnerNotice !== 'boolean') {
+      return { ok: false, error: 'invalid_groupOwnerNotice' };
+    }
+    groupOwnerNoticePatch = obj.groupOwnerNotice ? null : false;
+  }
+
+  // The directory must already exist: a typo would otherwise have the next
+  // `git worktree add` create it, on whatever disk holds its nearest parent.
+  // Unwritable would fail every later `git worktree add`.
+  let worktreeRootPatch: string | null | undefined;
+  if ('worktreeRoot' in obj) {
+    if (typeof obj.worktreeRoot !== 'string') {
+      return { ok: false, error: 'invalid_worktreeRoot' };
+    }
+    if (obj.worktreeRoot.trim() === '') {
+      worktreeRootPatch = null;
+    } else {
+      const worktreeRoot = normalizeWorktreeRoot(obj.worktreeRoot);
+      if (!worktreeRoot || !isWritableDirectory(expandHomePath(worktreeRoot))) {
+        return { ok: false, error: 'invalid_worktreeRoot' };
+      }
+      worktreeRootPatch = worktreeRoot;
+    }
   }
 
   const patch: DashboardGlobalConfig = {};
@@ -501,6 +584,10 @@ export async function applySettingsWrite(
     }
     patch.codexRpcInput = obj.codexRpcInput;
   }
+  if ('terminalEffortWriteback' in obj) {
+    if (typeof obj.terminalEffortWriteback !== 'boolean') return { ok: false, error: 'invalid_terminalEffortWriteback' };
+    patch.terminalEffortWriteback = obj.terminalEffortWriteback;
+  }
   if ('autoUpgradeCodexSessions' in obj) {
     if (typeof obj.autoUpgradeCodexSessions !== 'boolean') {
       return { ok: false, error: 'invalid_autoUpgradeCodexSessions' };
@@ -512,6 +599,18 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_reapOrphanTmuxServers' };
     }
     patch.reapOrphanTmuxServers = obj.reapOrphanTmuxServers;
+  }
+  if ('tmuxOrphanSessionSweep' in obj) {
+    if (typeof obj.tmuxOrphanSessionSweep !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionSweep' };
+    }
+    patch.tmuxOrphanSessionSweep = obj.tmuxOrphanSessionSweep;
+  }
+  if ('tmuxOrphanSessionBareWrapperKill' in obj) {
+    if (typeof obj.tmuxOrphanSessionBareWrapperKill !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionBareWrapperKill' };
+    }
+    patch.tmuxOrphanSessionBareWrapperKill = obj.tmuxOrphanSessionBareWrapperKill;
   }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {
@@ -530,6 +629,21 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_cardBrandLabel' };
     }
     patch.cardBrandLabel = obj.cardBrandLabel;
+  }
+  if ('stuckCardInitiatorKeys' in obj) {
+    if (typeof obj.stuckCardInitiatorKeys !== 'boolean') {
+      return { ok: false, error: 'invalid_stuckCardInitiatorKeys' };
+    }
+    // Default ON: only `false` is stored. Writing the default removes the key
+    // (mergeDashboardConfig drops undefined), so the file never pins the
+    // default and a future default change still reaches untouched installs.
+    patch.stuckCardInitiatorKeys = obj.stuckCardInitiatorKeys ? undefined : false;
+  }
+  if ('modelQueueNotify' in obj) {
+    if (typeof obj.modelQueueNotify !== 'boolean') {
+      return { ok: false, error: 'invalid_modelQueueNotify' };
+    }
+    patch.modelQueueNotify = obj.modelQueueNotify;
   }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {
@@ -669,7 +783,7 @@ export async function applySettingsWrite(
     }
     const incoming = raw as Record<string, unknown>;
     const next: Parameters<typeof writeScheduleBotGrantConfig>[0] = {};
-    for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+    for (const key of ['createEnabled', 'selfManageEnabled', 'childOneShotEnabled'] as const) {
       if (!(key in incoming)) continue;
       if (typeof incoming[key] !== 'boolean') return { ok: false, error: `invalid_scheduleBotGrants_${key}` };
       next[key] = incoming[key] as boolean;
@@ -731,12 +845,33 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_workflow' };
     }
     const wf = raw as Record<string, unknown>;
-    if (typeof wf.enabled !== 'boolean') {
+    const hasEnabled = 'enabled' in wf;
+    const hasNodeExecutor = 'nodeExecutor' in wf;
+    const hasHandoffIdentity = 'handoffIdentity' in wf;
+    if ((hasEnabled || (!hasNodeExecutor && !hasHandoffIdentity)) && typeof wf.enabled !== 'boolean') {
       return { ok: false, error: 'invalid_workflow_enabled' };
     }
+    if (hasNodeExecutor && wf.nodeExecutor !== 'ephemeral' && wf.nodeExecutor !== 'bot') {
+      return { ok: false, error: 'invalid_workflow_nodeExecutor' };
+    }
+    if (hasHandoffIdentity && typeof wf.handoffIdentity !== 'boolean') {
+      return { ok: false, error: 'invalid_workflow_handoffIdentity' };
+    }
     // Merge over existing so a future sibling key in the workflow block survives.
-    const current = deps.readGlobalConfig().workflow ?? {};
-    deps.mergeGlobalConfig({ workflow: { ...current, enabled: wf.enabled } });
+    const next: Record<string, unknown> = { ...(deps.readGlobalConfig().workflow ?? {}) };
+    if (hasEnabled) next.enabled = wf.enabled;
+    if (hasNodeExecutor) {
+      // Only the non-default value is stored: switching back to `ephemeral`
+      // removes the key so an untouched install keeps no trace of it.
+      if (wf.nodeExecutor === 'bot') next.nodeExecutor = 'bot';
+      else delete next.nodeExecutor;
+    }
+    if (hasHandoffIdentity) {
+      // Same rule: off is the default and leaves no key behind.
+      if (wf.handoffIdentity === true) next.handoffIdentity = true;
+      else delete next.handoffIdentity;
+    }
+    deps.mergeGlobalConfig({ workflow: Object.keys(next).length > 0 ? next as GlobalConfig['workflow'] : null });
     touched = true;
   }
 
@@ -797,6 +932,17 @@ export async function applySettingsWrite(
     touched = true;
   }
 
+  if ('providerRecovery' in obj) {
+    // Whole-block replacement like promptCache; null clears the machine-wide
+    // default (off). Same strict normalizer as the per-bot layer.
+    let next: ProviderRecoveryConfig | undefined;
+    try { next = normalizeProviderRecoveryConfig(obj.providerRecovery); } catch {
+      return { ok: false, error: 'invalid_providerRecovery' };
+    }
+    deps.mergeGlobalConfig({ providerRecovery: next ?? null });
+    touched = true;
+  }
+
   if ('multiTopic' in obj) {
     const raw = obj.multiTopic;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -806,8 +952,17 @@ export async function applySettingsWrite(
     if (typeof multiTopic.enabled !== 'boolean') {
       return { ok: false, error: 'invalid_multiTopic_enabled' };
     }
+    if (multiTopic.taskTreeCard !== undefined && typeof multiTopic.taskTreeCard !== 'boolean') {
+      return { ok: false, error: 'invalid_multiTopic_taskTreeCard' };
+    }
     const current = deps.readGlobalConfig().multiTopic ?? {};
-    deps.mergeGlobalConfig({ multiTopic: { ...current, enabled: multiTopic.enabled } });
+    deps.mergeGlobalConfig({
+      multiTopic: {
+        ...current,
+        enabled: multiTopic.enabled,
+        ...(typeof multiTopic.taskTreeCard === 'boolean' ? { taskTreeCard: multiTopic.taskTreeCard } : {}),
+      },
+    });
     touched = true;
   }
 
@@ -934,6 +1089,16 @@ export async function applySettingsWrite(
   // 返回失败却已经改变了 `/group` 的建群命名。
   if (groupNamePrefixPatch !== undefined) {
     deps.mergeGlobalConfig({ groupNamePrefix: groupNamePrefixPatch });
+    touched = true;
+  }
+
+  if (groupOwnerNoticePatch !== undefined) {
+    deps.mergeGlobalConfig({ groupOwnerNotice: groupOwnerNoticePatch });
+    touched = true;
+  }
+
+  if (worktreeRootPatch !== undefined) {
+    deps.mergeGlobalConfig({ worktreeRoot: worktreeRootPatch });
     touched = true;
   }
 

@@ -22,6 +22,7 @@ import { basename, join } from 'node:path';
 import type { ResumableSession } from '../adapters/cli/types.js';
 import { isInternalCodexSessionMeta } from './codex-session-meta.js';
 import { isBotmuxGoalObjective } from '../workflows/v3/contract.js';
+import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 
 const TITLE_MAX = 80;
 
@@ -152,7 +153,7 @@ const BOTMUX_INJECTION_PATTERNS: readonly RegExp[] = [
  *  ordering permutation in BOTMUX_INJECTION_PATTERNS. */
 const BOTMUX_LEADING_BLOCK_TAGS: readonly string[] = [
   'botmux_routing', 'botmux_builtin_skills', 'identity', 'session_id', 'role',
-  'summary_memory', 'botmux_reminder', 'whiteboard', 'botmux_group_join', 'chat_context_policy', 'chat_context',
+  'summary_memory', 'botmux_reminder', 'botmux_formatting', 'whiteboard', 'botmux_group_join', 'chat_context_policy', 'chat_context',
 ];
 
 /** True when `text` is an UNBROKEN CHAIN of botmux leading blocks followed by a
@@ -468,7 +469,11 @@ function rawClaudeUserText(message: unknown): string | null {
  *  returns the text otherwise. */
 function cleanUserPromptForTitle(raw: string): string | null {
   if (raw.startsWith('<command-') || raw.startsWith('<local-command')) return null;
-  return raw;
+  // Bare (replyDelivery=transcript + solo) follow-ups carry no <user_message>
+  // envelope; their <botmux_formatting> block is appended after the user text
+  // and must not enter the /adopt title (history scan and live enrich share
+  // this entry point).
+  return stripBotmuxDisplayBlocks(raw);
 }
 
 export async function discoverClaudeFamilySessions(
@@ -640,6 +645,10 @@ async function parseRolloutTranscript(
   lookupMetadata: (id: string) => RolloutSessionMetadata | undefined = id => options.metadataById?.get(id),
 ): Promise<RolloutParse> {
   const traex = options.dialect === 'traex';
+  // Title source only: strip botmux-internal blocks appended after the user
+  // text on envelope-less (bare solo follow-up) shapes. Never mutate the
+  // `text` used for first-turn mirror binding — only the title assignment.
+  const titleFromUserText = (text: string): string => truncateTitle(stripBotmuxDisplayBlocks(text));
   // Accumulate into an object — closure mutation of plain `let` defeats TS's
   // control-flow narrowing at the post-loop guard; object properties keep their
   // declared type.
@@ -682,7 +691,7 @@ async function parseRolloutTranscript(
       acc.botmux = true;
       return true;
     }
-    if (!acc.fallbackTitle) acc.fallbackTitle = truncateTitle(text);
+    if (!acc.fallbackTitle) acc.fallbackTitle = titleFromUserText(text);
     return Boolean(acc.id && acc.cwd && acc.fallbackTitle);
   };
   const isUserTurnText = (text: string): boolean =>
@@ -704,7 +713,7 @@ async function parseRolloutTranscript(
     // A botmux first turn leaves no weak title and marks the thread botmux
     // unless a canonical record of the same turn supplies a clean prompt.
     if (isBotmuxTurn(text)) acc.weakBotmux = true;
-    else acc.weakTitle = truncateTitle(text);
+    else acc.weakTitle = titleFromUserText(text);
   };
   /** A canonical input under the first-turn rule; true → stop scanning. */
   const recordFirstTurnCanonical = (rawText: string, turnId: string | undefined): boolean => {
@@ -740,7 +749,7 @@ async function parseRolloutTranscript(
       if (recordFirstTurnCanonical(payload.message, turnId)) return true;
     } else if (rec.type === 'event_msg' && payload?.type === 'user_message' && typeof payload.message === 'string') {
       if (isBotmuxTurn(payload.message)) { acc.botmux = true; return true; } // botmux-origin → drop
-      if (!acc.title) acc.title = truncateTitle(payload.message);
+      if (!acc.title) acc.title = titleFromUserText(payload.message);
     } else if (traex) {
       if (rec.type === 'event_msg' && payload?.type === 'thread_goal_updated') {
         const objective = asRecord(payload.goal)?.objective;
@@ -773,7 +782,7 @@ async function parseRolloutTranscript(
       if (!text) return; // empty / non-text content — not a title candidate
       if (isSyntheticPreamble(text)) return; // startup preamble, not a user turn
       if (isBotmuxInjected(text)) { acc.botmux = true; return true; } // botmux-origin → drop
-      if (!acc.weakTitle) acc.weakTitle = truncateTitle(text);
+      if (!acc.weakTitle) acc.weakTitle = titleFromUserText(text);
       // 新格式（>=0.147）rollout 没有 event_msg/user_message，acc.title 永远
       // 为空：不含 fallbackTitle 会扫满 MAX_HEAD_LINES_PER_FILE。首个真实用户
       // 回合即定 origin（与 legacy 路径「id+cwd+title 齐即停扫」一致）；混合

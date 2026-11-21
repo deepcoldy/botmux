@@ -1,10 +1,18 @@
 import { normalizeVcMeetingListenerPolicy, resolveVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './vc-meeting-listener-policy.js';
 import { isVcMeetingInviterGrant, type VcMeetingInviterGrant } from './vc-meeting-inviter-policy.js';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { existsSync, mkdirSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
+import {
+  StoreFileUnavailableError,
+  hasQuarantinedSibling,
+  quarantineStoreFileIfUnchanged,
+  readStoreFileStrict,
+  storeFileExistsStrict,
+  type StoreFileRead,
+} from '../utils/json-file.js';
 import { normalizeVcMeetingProfileInstructions } from './vc-meeting-profile-instructions.js';
 import type {
   VcMeetingConsumerManagedSink,
@@ -154,22 +162,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function assertNoQuarantinedEvidence(fp: string, label: string): void {
-  const prefix = `${basename(fp)}.corrupt.`;
-  let quarantined = false;
-  try {
-    quarantined = readdirSync(dirname(fp)).some(name => name.startsWith(prefix));
-  } catch {
-    // A genuinely absent directory/store is initializable.
-  }
-  if (quarantined) {
+  // A genuinely absent directory/store is initializable; an unreadable
+  // directory is not proof of absence and surfaces as StoreFileUnavailableError.
+  if (hasQuarantinedSibling(fp, '.corrupt.', `vc meeting ${label} store`)) {
     throw new Error(`vc meeting ${label} store has quarantined evidence for ${fp}`);
   }
 }
 
-function quarantineCorruptStore(fp: string, label: string, err: unknown): never {
+function quarantineCorruptStore(
+  fp: string,
+  label: string,
+  err: unknown,
+  ident: StoreFileRead['ident'],
+): never {
   const aside = `${fp}.corrupt.${Date.now()}.${process.pid}`;
-  try { renameSync(fp, aside); } catch { /* another process may already have quarantined it */ }
+  let moved = false;
+  try { moved = quarantineStoreFileIfUnchanged(fp, ident, aside); } catch { /* another process may already have quarantined it */ }
   invalidateListenerAgentIndex();
+  if (!moved && existsSync(fp)) {
+    // Replaced (e.g. repaired by an operator) after we judged it: never move the
+    // new file; let the next read judge it afresh.
+    throw new StoreFileUnavailableError(`vc meeting ${label} store`, fp, 'quarantine', new Error('file was replaced after it was read'));
+  }
   logger.warn(
     `[vc-meeting-runtime-store] corrupt ${label} store at ${fp}, moved aside to ${aside}: `
     + `${err instanceof Error ? err.message : String(err)}`,
@@ -179,12 +193,15 @@ function quarantineCorruptStore(fp: string, label: string, err: unknown): never 
 
 function readStore(dataDir: string): Record<string, VcMeetingRuntimeSessionRecord> {
   const fp = filePath(dataDir);
-  if (!existsSync(fp)) {
+  // I/O failures (EMFILE, EIO, EACCES, …) say nothing about the bytes on disk:
+  // they propagate as StoreFileUnavailableError and must never quarantine.
+  const read = readStoreFileStrict(fp, 'vc meeting runtime session store');
+  if (read === undefined) {
     assertNoQuarantinedEvidence(fp, 'runtime session');
     return {};
   }
   try {
-    const raw: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
+    const raw: unknown = JSON.parse(read.text);
     if (!isRecord(raw)) throw new Error('store root must be an object');
     const out = Object.create(null) as Record<string, VcMeetingRuntimeSessionRecord>;
     for (const [key, value] of Object.entries(raw)) {
@@ -197,13 +214,13 @@ function readStore(dataDir: string): Record<string, VcMeetingRuntimeSessionRecor
     }
     return out;
   } catch (err) {
-    return quarantineCorruptStore(fp, 'runtime session', err);
+    return quarantineCorruptStore(fp, 'runtime session', err, read.ident);
   }
 }
 
 function readStoreForAccess(dataDir: string): Record<string, VcMeetingRuntimeSessionRecord> {
   const fp = filePath(dataDir);
-  if (!existsSync(fp)) {
+  if (!storeFileExistsStrict(fp, 'vc meeting runtime session store')) {
     assertNoQuarantinedEvidence(fp, 'runtime session');
     return {};
   }
@@ -223,12 +240,13 @@ function writeStore(dataDir: string, store: Record<string, VcMeetingRuntimeSessi
 
 function readEndedTombstoneStore(dataDir: string): Record<string, VcMeetingEndedTombstoneRecord> {
   const fp = endedTombstoneFilePath(dataDir);
-  if (!existsSync(fp)) {
+  const read = readStoreFileStrict(fp, 'vc meeting ended tombstone store');
+  if (read === undefined) {
     assertNoQuarantinedEvidence(fp, 'ended tombstone');
     return {};
   }
   try {
-    const raw: unknown = JSON.parse(readFileSync(fp, 'utf-8'));
+    const raw: unknown = JSON.parse(read.text);
     if (!isRecord(raw)) throw new Error('store root must be an object');
     const out = Object.create(null) as Record<string, VcMeetingEndedTombstoneRecord>;
     for (const [key, value] of Object.entries(raw)) {
@@ -241,7 +259,7 @@ function readEndedTombstoneStore(dataDir: string): Record<string, VcMeetingEnded
     }
     return out;
   } catch (err) {
-    return quarantineCorruptStore(fp, 'ended tombstone', err);
+    return quarantineCorruptStore(fp, 'ended tombstone', err, read.ident);
   }
 }
 
@@ -249,7 +267,7 @@ function readEndedTombstoneStoreForAccess(
   dataDir: string,
 ): Record<string, VcMeetingEndedTombstoneRecord> {
   const fp = endedTombstoneFilePath(dataDir);
-  if (!existsSync(fp)) {
+  if (!storeFileExistsStrict(fp, 'vc meeting ended tombstone store')) {
     assertNoQuarantinedEvidence(fp, 'ended tombstone');
     return {};
   }
@@ -747,8 +765,12 @@ export function listVcMeetingRuntimeSessionsByListenerAndAgent(
   let stats: ReturnType<typeof statSync>;
   try {
     stats = statSync(fp);
-  } catch {
+  } catch (err) {
     invalidateListenerAgentIndex();
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+      throw new StoreFileUnavailableError('vc meeting runtime session store', fp, 'stat', err);
+    }
     assertNoQuarantinedEvidence(fp, 'runtime session');
     return [];
   }

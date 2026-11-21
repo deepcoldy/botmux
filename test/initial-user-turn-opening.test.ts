@@ -27,6 +27,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
+import { t } from '../src/i18n/index.js';
 
 const mocks = vi.hoisted(() => {
   process.env.SESSION_DATA_DIR = `${process.env.TMPDIR ?? '/tmp'}/botmux-initial-turn-${process.pid}`;
@@ -273,6 +274,10 @@ describe('empty-started session — first real business turn must use the new-to
       larkAppId: APP,
       larkAppSecret: 's',
       cliId: 'codex',
+      // These cases tell the opening envelope from the follow-up one by the
+      // follow-up's <botmux_reminder>, which only send delivery injects; codex
+      // otherwise defaults to transcript (no reminder at all).
+      replyDelivery: 'send',
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
     });
@@ -339,7 +344,7 @@ describe('empty-started session — first real business turn must use the new-to
       resume: true,
       larkAppId: APP,
       larkAppSecret: 's',
-      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'] },
       larkToolBinding: false,
     };
     const bot = registerBot({
@@ -347,7 +352,7 @@ describe('empty-started session — first real business turn must use the new-to
       larkAppSecret: 's',
       cliId: 'codex',
       larkToolBinding: false,
-      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'bot-identity' },
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'] },
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
     });
@@ -360,7 +365,92 @@ describe('empty-started session — first real business turn must use the new-to
 
     const opening = liveInputs()[0]!.content;
     expect(opening).not.toContain('<botmux_lark_tool>');
-    expect(opening).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    expect(opening).toContain('<botmux_credentials>');
+    expect(opening).not.toContain('启用按当前消息发起人身份注入授权');
+  });
+
+  it('live resumed worker receives current Feishu emphasis guidance on its next turn', async () => {
+    const anchor = 'om_live_resumed_emphasis_root';
+    seedEmptyStarted(anchor, { hasHistory: true, pending: false, cliId: 'codex' });
+
+    await handleThreadReply(
+      makeEventData('om_live_resumed_emphasis', '继续', anchor),
+      makeCtx(anchor, 'om_live_resumed_emphasis'),
+    );
+
+    const followUp = liveInputs()[0]!.content;
+    expect(followUp).toContain('<botmux_reminder>');
+    expect(followUp).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
+  });
+
+  it('live resumed Claude hook receives current Feishu emphasis guidance in its sidecar', async () => {
+    const anchor = 'om_live_resumed_hook_emphasis_root';
+    const ds = seedEmptyStarted(anchor, { hasHistory: true, pending: false, cliId: 'claude-code' });
+    ds.session.backendType = 'pty';
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+      envelopeInjection: 'auto' as const,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    preflightMock.mockReturnValue(true);
+
+    await handleThreadReply(
+      makeEventData('om_live_resumed_hook_emphasis', '继续', anchor),
+      makeCtx(anchor, 'om_live_resumed_hook_emphasis'),
+    );
+
+    const followUp = liveInputs()[0]!.content;
+    // Host metadata rides the hook envelope; the composer keeps only the user text.
+    expect(followUp).toBe('继续');
+    const envelope = claimPromptContext(
+      ds.session.sessionId,
+      'om_live_resumed_hook_emphasis',
+      fingerprintPromptText(followUp),
+      prefixOf(followUp),
+    );
+    expect(envelope).toContain('<message_location message_id="om_live_resumed_hook_emphasis" placement="thread" root_message_id="om_live_resumed_hook_emphasis_root" />');
+    expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
+  });
+
+  it('live resumed transcript Claude hook receives format-only guidance in its sidecar', async () => {
+    const anchor = 'om_live_resumed_transcript_hook_emphasis_root';
+    const ds = seedEmptyStarted(anchor, { hasHistory: true, pending: false, cliId: 'claude-code' });
+    ds.session.backendType = 'pty';
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      replyDelivery: 'transcript',
+      allowedUsers: [OWNER],
+      oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
+      envelopeInjection: 'auto' as const,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    preflightMock.mockReturnValue(true);
+
+    await handleThreadReply(
+      makeEventData('om_live_resumed_transcript_hook_emphasis', '继续', anchor),
+      makeCtx(anchor, 'om_live_resumed_transcript_hook_emphasis'),
+    );
+
+    const followUp = liveInputs()[0]!.content;
+    // Host metadata rides the hook envelope; the composer keeps only the user text.
+    expect(followUp).toBe('继续');
+    const envelope = claimPromptContext(
+      ds.session.sessionId,
+      'om_live_resumed_transcript_hook_emphasis',
+      fingerprintPromptText(followUp),
+      prefixOf(followUp),
+    );
+    expect(envelope).toContain('<message_location message_id="om_live_resumed_transcript_hook_emphasis" placement="thread" root_message_id="om_live_resumed_transcript_hook_emphasis_root" />');
+    expect(envelope).toContain('<botmux_formatting>');
+    expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
+    expect(envelope).not.toContain('botmux send');
+    expect(envelope).not.toContain('BOTMUX_NOTHING_TO_SEND');
   });
 
   it('live worker: opening carries sender, mentions, available bots and attachments', async () => {

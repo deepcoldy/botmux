@@ -21,6 +21,9 @@
  */
 
 import { createHash } from 'node:crypto';
+import { openSync, closeSync, ftruncateSync, writeSync, fsyncSync, fchmodSync, readFileSync, unlinkSync, existsSync, mkdirSync, realpathSync, constants as fsConstants } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { withFileLockSync } from '../../utils/file-lock.js';
 import type { SessionProbe } from '../backend/types.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
@@ -59,6 +62,107 @@ export function sendCredFilePath(sessionDataDir: string, appId: string): string 
   return `${botHomePath(botmuxHome, appId)}/send-cred.json`;
 }
 
+function writeAllSync(fd: number, body: Buffer): void {
+  let offset = 0;
+  while (offset < body.length) {
+    const written = writeSync(fd, body, offset, body.length - offset, offset);
+    if (written <= 0) throw new Error('Zero-byte write while updating send-cred');
+    offset += written;
+  }
+}
+
+function writeSendCredFileUnlocked(path: string, json: string): void {
+  const existed = existsSync(path);
+  // O_RDWR lets us retain the previous bytes for rollback without a second
+  // path lookup. O_NOFOLLOW keeps a planted BOT_HOME symlink out of the host.
+  const fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0), 0o600);
+  let previous = '';
+  try {
+    try { previous = readFileSync(fd, 'utf8'); } catch { /* newly created */ }
+    if (previous === json) return;
+    const next = Buffer.from(json, 'utf8');
+    try {
+      ftruncateSync(fd, 0);
+      writeAllSync(fd, next);
+      fsyncSync(fd);
+      fchmodSync(fd, 0o600);
+    } catch (error) {
+      // A short/failed write must not leave a new partial credential behind.
+      // Roll back within the same lock and descriptor, best effort.
+      try {
+        if (existed) {
+          ftruncateSync(fd, 0);
+          if (previous) writeAllSync(fd, Buffer.from(previous, 'utf8'));
+          fsyncSync(fd);
+        } else {
+          unlinkSync(path);
+        }
+      } catch { /* preserve the original failure */ }
+      throw error;
+    }
+  } finally { closeSync(fd); }
+}
+
+/** Host-private lock target for one credential. Unlike a BOT_HOME sibling,
+ *  this directory is never a sandbox writable grant or a deny-mask mountpoint.
+ *  Hashing keeps custom app ids/paths from selecting another credential's lock. */
+export function sendCredUpdateLockTarget(dataDir: string, credPath: string): string {
+  let canonical = credPath;
+  try { canonical = join(realpathSync(dirname(credPath)), basename(credPath)); } catch { /* parent not created yet */ }
+  const key = createHash('sha256').update(canonical).digest('hex').slice(0, 32);
+  return join(dataDir, 'send-cred-locks', key);
+}
+
+function withSendCredWriteLock<T>(path: string, lockTarget: string | undefined, fn: () => T): T {
+  if (!lockTarget) return withFileLockSync(path, fn);
+  mkdirSync(dirname(lockTarget), { recursive: true, mode: 0o700 });
+  return withFileLockSync(lockTarget, fn);
+}
+
+/**
+ * Write `send-cred.json` IN PLACE (never temp file + rename). A running Linux
+ * sandbox masks this path with a mount attached to the directory entry; a
+ * rename would swap in a fresh inode under the same name and the live pane
+ * would read the new, unmasked file. A temp sibling would also sit readable in
+ * BOT_HOME for a moment. Cross-process writers are serialized, every byte is
+ * written, and a failed update rolls back to the old bytes when possible.
+ */
+export function writeSendCredFile(path: string, json: string, lockTarget?: string): void {
+  withSendCredWriteLock(path, lockTarget, () => writeSendCredFileUnlocked(path, json));
+}
+
+/** Serialize the feedback read-modify-write with worker writes to the same
+ *  credential. Reading outside this lock could overwrite a concurrent update. */
+export function updateSendCredFile(
+  path: string,
+  update: (cred: Record<string, unknown>) => Record<string, unknown>,
+  lockTarget?: string,
+): void {
+  withSendCredWriteLock(path, lockTarget, () => {
+    const cred = readSendCredJsonWithRetry(path);
+    if (!cred) throw new Error(`send-cred is missing or invalid: ${path}`);
+    writeSendCredFileUnlocked(path, JSON.stringify(update(cred)));
+  });
+}
+
+/** Read one complete credential object. In-place updates are serialized, but a
+ *  reader does not take the write lock; retry only a torn JSON parse briefly.
+ *  Filesystem denials (EPERM/EACCES/ENOENT) and valid non-object JSON return
+ *  immediately, so a withheld credential never turns into a retry loop. */
+export function readSendCredJsonWithRetry(path: string): Record<string, unknown> | undefined {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const parsed: unknown = JSON.parse(readFileSync(path, 'utf8'));
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
+      return parsed as Record<string, unknown>;
+    } catch (error) {
+      if (!(error instanceof SyntaxError) || attempt === 4) return undefined;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5 * (attempt + 1));
+    }
+  }
+  return undefined;
+}
+
 /** A Feishu app id is safe to use as a path segment. Enforced because appId is
  *  concatenated into BOT_HOME (and its send-cred.json) / sessions-<appId>.json paths and
  *  into Seatbelt allow rules — a `/` or `..` (from a hand-edited bots.json) would
@@ -82,7 +186,8 @@ export function botHomePath(botmuxHome: string, appId: string): string {
 }
 
 /** Whether a worker can redirect CLI data into BOT_HOME for this session.
- * A forced per-bot home (currently Codex `codexAuthSync=isolated`) is separate
+ * A forced per-bot home (Codex `codexAuthSync=isolated`, or a Claude bot's
+ * `credentialsSourceDir`) is separate
  * from the OS sandbox: it changes CLI state ownership without implying file
  * read/write confinement. */
 export function shouldRedirectCliData(input: {
@@ -135,6 +240,7 @@ export const DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME = '.device-credential-i
 function hostDeviceAuthorityPaths(root: string): string[] {
   return [
     `${root}/${DEVICE_AUTHORITY_DIRECTORY}`,
+    `${root}/antigravity-accounts`,
     ...HOST_DEVICE_CREDENTIAL_FILES.map(file => `${root}/${file}`),
   ];
 }
@@ -156,8 +262,9 @@ export function isCredentialIsolationReservedBasename(name: string): boolean {
 export function credentialIsolationRequired(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
+  protectedHomePaths?: readonly string[];
 }): boolean {
-  return input.markerExists || input.deviceCredentialExists;
+  return input.markerExists || input.deviceCredentialExists || !!input.protectedHomePaths?.length;
 }
 
 export type CredentialOnlyIsolationGate =
@@ -182,6 +289,7 @@ export type CredentialOnlyIsolationGate =
 export function evaluateCredentialOnlyIsolationGate(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
+  protectedHomePaths?: readonly string[];
   remoteBackend: boolean;
   platform: string;
   mechanismAvailable: boolean;
@@ -222,7 +330,10 @@ function escapeForRegex(p: string): string {
 
 /** Legacy credential-only Seatbelt/bwrap rule shape. Full fs-policy sessions
  * consume the same authority paths through buildFsPolicy instead. */
-export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): {
+export function buildCredentialIsolationRules(
+  ctx: CredentialIsolationContext,
+  protectedPaths: readonly string[] = [],
+): {
   roots: string[];
   denyPaths: string[];
   denyRegexes: string[];
@@ -236,17 +347,21 @@ export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): 
   const roots = dedupe([defaultBh, bh]);
   const credentialPaths = roots.flatMap(hostDeviceAuthorityPaths);
   const markerPath = `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
+  const protectedHomePaths = dedupe(protectedPaths
+    .map(normalizeIsolationPath)
+    .filter((path): path is string => !!path && path.startsWith(`${h}/`)));
   const denyRegexes = roots.flatMap(root =>
     HOST_DEVICE_CREDENTIAL_FILES.map(file =>
       `^${escapeForRegex(root)}/${escapeForRegex(file)}(?:\\.|$)`));
   denyRegexes.push(
     `^${escapeForRegex(defaultBh)}/${escapeForRegex(DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME)}(?:\\.|$)`,
+    ...protectedHomePaths.map(path => `^${escapeForRegex(path)}(?:\\.|$)`),
   );
   return {
     roots,
-    denyPaths: dedupe([...credentialPaths, markerPath]),
+    denyPaths: dedupe([...credentialPaths, markerPath, ...protectedHomePaths]),
     denyRegexes: dedupe(denyRegexes),
-    denyWritePaths: dedupe([...credentialPaths, markerPath]),
+    denyWritePaths: dedupe([...credentialPaths, markerPath, ...protectedHomePaths]),
     denyWriteRegexes: dedupe(denyRegexes),
     denyWriteLiterals: roots,
   };
@@ -392,7 +507,10 @@ export function buildSeatbeltProfile(
 // sandbox=true). Both are new mounts: a warm reattach keeps the v17 process with
 // its ORIGINAL mount set and skips skill generation, so such a pane could never
 // read either — it must cold-spawn once.
-export const ISOLATION_PANE_MARKER_VERSION = 18;
+// 19 adds whole-directory read/write masks for project attachment, source-grant
+// and import-outbox authority below dataDir. A credential-only pane launched
+// before those mounts must not warm-reattach and retain access to the new WAL.
+export const ISOLATION_PANE_MARKER_VERSION = 19;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

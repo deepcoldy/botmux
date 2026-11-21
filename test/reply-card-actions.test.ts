@@ -130,11 +130,12 @@ describe('oncall button joins the reply chrome row', () => {
     const card = JSON.parse(attachOncallGroupButton(raw, policy as any, 'oc_x'));
     const row = card.body.elements.find((e: any) => e.element_id === 'botmux_reply_actions');
     expect(row).toBeTruthy();
-    expect(row.flex_mode).toBe('flow');
+    expect(row.flex_mode).toBe('none');
     // columns: footer + overflow menu + oncall
     expect(row.columns).toHaveLength(3);
     const oncall = row.columns[2].elements[0];
-    expect(oncall.text.content).toBe('拉起 Oncall 群');
+    expect(oncall).toMatchObject({ tag: 'button', type: 'default', size: 'small',
+      behaviors: [{ type: 'callback', value: { action: 'oncall_group_create' } }] });
     // no standalone oncall row leaked at top level
     expect(card.body.elements.some((e: any) => e.element_id === 'botmux_oncall_group')).toBe(false);
   });

@@ -8,7 +8,7 @@
  */
 import { type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -86,10 +86,11 @@ function waitFor(
 
 describe('dsh worker final_output integration', () => {
   it.each([
-    { scenario: 'happy', timeoutMs: undefined },
-    { scenario: 'progressive', timeoutMs: 300 },
-    { scenario: 'empty', timeoutMs: undefined },
-  ])('delivers one final_output with correct content/turnId after $scenario', async ({ scenario, timeoutMs }) => {
+    { scenario: 'happy', timeoutMs: undefined, dshRuntime: 'official' as const },
+    { scenario: 'reasoning', timeoutMs: undefined, dshRuntime: undefined },
+    { scenario: 'progressive', timeoutMs: 300, dshRuntime: undefined },
+    { scenario: 'empty', timeoutMs: undefined, dshRuntime: undefined },
+  ])('delivers one final_output with correct content/turnId after $scenario', async ({ scenario, timeoutMs, dshRuntime }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-'));
     tempDirs.add(root);
     const fakeDsh = join(root, 'fake-dsh-server');
@@ -138,13 +139,15 @@ describe('dsh worker final_output integration', () => {
       larkAppId: 'app_dsh_it',
       larkAppSecret: 'secret',
       turnId: 'om_dsh_it_turn_1',
+      ...(dshRuntime ? { dshRuntime } : {}),
       ...(timeoutMs ? { turnTimeoutMs: timeoutMs } : {}),
     };
 
     try {
       child.send(init);
       await waitFor(child, logs, () =>
-        messages.some(m => m.type === 'final_output'));
+        messages.some(m => m.type === 'final_output')
+        && (scenario !== 'reasoning' || messages.some(m => m.type === 'turn_terminal')));
 
       const finals = messages.filter(
         (m): m is Extract<WorkerToDaemon, { type: 'final_output' }> => m.type === 'final_output',
@@ -157,8 +160,36 @@ describe('dsh worker final_output integration', () => {
         expect(finals[0].content).toContain('你好，我是 dsh。');
       }
       expect(finals[0].turnId).toBe('om_dsh_it_turn_1');
+      if (dshRuntime === 'official' && process.platform === 'linux') {
+        // This must travel through the REAL spawnCliBody initialization: the
+        // unit fixture cannot prove that an explicit official value creates
+        // dshProcessAttestation before process_ready arrives.
+        const attested = messages.filter(
+          (m): m is Extract<WorkerToDaemon, { type: 'local_process_attestation' }>
+            & { enginePid: number; engineProcStart: string } =>
+            m.type === 'local_process_attestation'
+            && m.enginePid !== undefined && m.engineProcStart !== undefined,
+        );
+        expect(attested.length).toBeGreaterThan(0);
+        expect(attested.at(-1)?.enginePid).not.toBe(attested.at(-1)?.cliPid);
+      }
+      if (scenario === 'reasoning') {
+        expect(finals[0].content).toBe('你好，我是 dsh。');
+        const updates = messages.filter(
+          (m): m is Extract<WorkerToDaemon, { type: 'thinking_update' }> => m.type === 'thinking_update',
+        );
+        expect(updates.length).toBeGreaterThan(0);
+        for (const update of updates) expect(update.turnId).toBe('om_dsh_it_turn_1');
+        const lastUpdate = updates[updates.length - 1];
+        expect(lastUpdate.entries.map(entry => entry.kind)).toEqual([
+          'thinking', 'text', 'tool_call', 'tool_result', 'thinking',
+        ]);
+        expect(JSON.stringify(lastUpdate.entries)).not.toContain(finals[0].content);
+        const terminalIndex = messages.findIndex(m => m.type === 'turn_terminal');
+        expect(terminalIndex).toBeGreaterThan(messages.indexOf(lastUpdate));
+      }
       // Usage comes through the four-bucket shape.
-      if (scenario === 'happy') {
+      if (scenario === 'happy' || scenario === 'reasoning') {
         expect(finals[0].usage).toEqual({
           inputTokens: 100,
           outputTokens: 42,
@@ -174,6 +205,82 @@ describe('dsh worker final_output integration', () => {
         .filter(m => m.type === 'screen_update' || m.type === 'display')
         .filter(m => JSON.stringify(m).includes('\x1b]777;botmux:'));
       expect(screenLeaks).toHaveLength(0);
+    } finally {
+      await stopChild(child);
+    }
+  }, 60_000);
+
+  it('does not replay a turn the runner already finalized after its watchdog timed out', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-dsh-timeout-'));
+    tempDirs.add(root);
+    const fakeDsh = join(root, 'fake-dsh-server');
+    copyFileSync(resolve('test/fixtures/fake-dsh-server.mjs'), fakeDsh);
+    chmodSync(fakeDsh, 0o755);
+    const fakeLog = join(root, 'fake-dsh.jsonl');
+
+    const sessionId = `dsh-to-${randomBytes(4).toString('hex')}-${process.pid}`;
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        DSH_HOME: join(root, '.dsh'),
+        NODE_ENV: 'test',
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' '),
+        BOTMUX_TEST_DSH_RUNNER_PATH: resolve('src/dsh-runner.ts'),
+        SESSION_DATA_DIR: root,
+        BOTMUX_SESSION_ID: sessionId,
+        LARK_APP_ID: 'app_dsh_to',
+        LARK_APP_SECRET: 'secret',
+        FAKE_DSH_SCENARIO: 'hang',
+        FAKE_DSH_LOG: fakeLog,
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    const prompts = () => existsSync(fakeLog)
+      ? readFileSync(fakeLog, 'utf8').split('\n').filter(line => line.includes('"prompt"')).length
+      : 0;
+    const runnerStarts = () => existsSync(fakeLog)
+      ? readFileSync(fakeLog, 'utf8').split('\n').filter(line => line.includes('"initialize"')).length
+      : 0;
+
+    try {
+      child.send({
+        type: 'init',
+        sessionId,
+        chatId: 'oc_dsh_to',
+        rootMessageId: 'om_dsh_to_root',
+        workingDir: resolve('.'),
+        cliId: 'dsh',
+        cliPathOverride: fakeDsh,
+        backendType: 'pty',
+        prompt: '<user_message>跑一个很长的任务</user_message>',
+        larkAppId: 'app_dsh_to',
+        larkAppSecret: 'secret',
+        turnId: 'om_dsh_to_turn_1',
+        turnTimeoutMs: 500,
+      } satisfies DaemonToWorker);
+
+      await waitFor(child, logs, () => messages.some(m => m.type === 'final_output'));
+      // The runner exits after its timeout final and the daemon auto-restarts the
+      // CLI; wait for the replacement runner's handshake so any carried-over
+      // input would have been written to it.
+      await waitFor(child, logs, () => messages.some(m => m.type === 'claude_exit'));
+      child.send({ type: 'restart', reason: 'cli_crash' } satisfies DaemonToWorker);
+      await waitFor(child, logs, () => runnerStarts() >= 2);
+      // Carried-over input is flushed on the replacement runner's ready edge;
+      // wait for that edge instead of a fixed settle delay, then give the write
+      // a moment to reach the fake server's log.
+      await waitFor(child, logs, () => messages.filter(m => m.type === 'prompt_ready').length >= 2);
+      await new Promise(resolvePromise => setTimeout(resolvePromise, 800));
+
+      expect(prompts()).toBe(1);
     } finally {
       await stopChild(child);
     }

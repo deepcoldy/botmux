@@ -125,6 +125,7 @@ export function herdrConfigForChatType(
 }
 
 export interface BackendTurnInput {
+  sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
   content: string;
   turnId: string;
   replyTurnId?: string;
@@ -136,6 +137,7 @@ export interface BackendTurnInput {
 /** Host-owned state frozen beside a Remote Runner turn. Providers never send
  * or receive this context; it exists only on the backend → worker callbacks. */
 export interface RemoteRunnerTurnHostContext {
+  sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
   linkRefMode?: 'observe' | 'enabled';
 }
 
@@ -147,6 +149,7 @@ export interface BackendTurnSubmission {
 }
 
 export interface BackendTurnFailure {
+  sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
   turnId: string;
   code: string;
   message: string;
@@ -165,7 +168,9 @@ export interface BackendTurnFailure {
 export type PersistentBackendTarget =
   // New tmux targets freeze the server (`-L <socketName>`, see tmux-socket.ts);
   // a tmux target without it lives on the default server (every older row).
-  | { backendType: 'tmux'; sessionName: string; socketName?: string }
+  // strict workers may additionally freeze an absolute socketRoot so daemon-side
+  // workerless probe/kill addresses the SAME server with explicit -S.
+  | { backendType: 'tmux'; sessionName: string; socketName?: string; socketRoot?: string }
   | { backendType: 'zellij'; sessionName: string }
   // New ZMX targets freeze the native socket directory; older rows may omit it.
   | { backendType: 'zmx'; sessionName: string; socketDir?: string }
@@ -219,6 +224,11 @@ export interface SpawnOpts {
    */
   unsetEnv?: string[];
   /**
+   * Host-authorized protected-MCP removals. Unlike user/session `unsetEnv`,
+   * these may name reserved BOTMUX_* controls and must still run after rcfiles.
+   */
+  protectedUnsetEnv?: string[];
+  /**
    * The git `-c` pairs (config KEY/VALUE contents) botmux authored for THIS
    * turn, e.g. the trigger-user credential helper + URL rewrites from
    * gitIdentityConfigPairs. Shell-wrapped backends publish exactly this set
@@ -268,6 +278,13 @@ export interface SpawnOpts {
   modelBackendVariant?: 'standard' | 'max';
   /** Provider-neutral reasoning effort for structured remote runners. */
   reasoningEffort?: string;
+  /** Herdr facade only: retry a launch Herdr never recognises once in a fresh
+   *  pane. Set for a worker's first CLI start unless its init carries a
+   *  restartAttemptId: restarts must finish inside the restart coordinator's
+   *  deadline, and a wake-up from suspend (resume attempt id) is left off too. */
+  retryPaneAgentStart?: boolean;
+  /** Herdr: CLI session id this launch resumes; panes already running it are closed first. */
+  resumeCliSessionId?: string;
 }
 
 export type AmbiguousSubmissionRecoveryFailure =
@@ -285,6 +302,7 @@ export class AmbiguousSubmissionBlockedError extends Error {
 }
 
 export interface SessionBackend {
+  getRuntimeIdentity?(): import('../../services/session-contract.js').RuntimeIdentity | undefined;
   spawn(bin: string, args: string[], opts: SpawnOpts): void;
   /** Returns false only when the backend can prove the write was not accepted.
    * Legacy implementations may return void on success. */
@@ -327,12 +345,30 @@ export interface SessionBackend {
    */
   onScreenResync?(cb: (snapshot: string) => void): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;
+  /** After onExit: true when the exit was the multiplexer server being lost
+   *  (another server now answers on the socket), not the CLI exiting. A
+   *  restart for that exit must not spend the fresh-session fallback budget. */
+  exitedBecauseServerReplaced?(): boolean;
+  /** After onExit: how the shared multiplexer server holding the pane was lost
+   *  (tmux: `replaced` / `gone` / `unreachable`), or undefined for an ordinary
+   *  CLI exit. The daemon folds every session that lost the same server into
+   *  ONE backend outage instead of N CLI crashes. */
+  exitedBecauseServerLost?(): { kind: 'replaced' | 'gone' | 'unreachable'; socketName?: string } | undefined;
   kill(): void;
   /** Permanently destroy the backing session (e.g. kill tmux session).
    *  Called only on explicit /close. Default: same as kill(). */
   getAttachInfo?(): { type: 'tmux'; sessionName: string } | null;
   /** PID of the CLI process running inside the backend. */
   getChildPid?(): number | null;
+  /**
+   * Stable identity of the terminal/pane backing this backend, independent of
+   * worker-side `cliPid` refinement to a wrapper's descendant CLI. Unlike
+   * getChildPid(), this must not follow that mutable ownership PID. Backends
+   * participating in wrapper PID resolution must implement it whenever
+   * getChildPid() can alias `cliPid`; others may use the worker's getChildPid()
+   * fallback. Null means the identity is unavailable.
+   */
+  getStablePanePid?(): number | null;
   captureCurrentScreen?(): string;
   /**
    * Escape sequence re-asserting the pane's live input modes (mouse tracking,
@@ -360,6 +396,15 @@ export interface SessionBackend {
     viewport: string;
     cursor: { x: number; y: number };
   } | null;
+  /**
+   * The pane's current viewport as cells (dim / inverse kept), read
+   * synchronously from the backend's own screen. Unattended maintenance writes
+   * judge the composer on this rather than on the worker's long-lived
+   * renderer, which keeps its spawn size while a web terminal resizes the real
+   * pane. Null when the viewport cannot be read now; backends without an
+   * authoritative synchronous viewport omit it.
+   */
+  captureViewportCells?(): import('../../utils/terminal-cells.js').ScreenRow[] | null;
   getPaneSize?(): { cols: number; rows: number } | null;
   /**
    * Remote sandbox access URL — backends that run on a remote sandbox (e.g.
@@ -413,7 +458,7 @@ export interface SessionBackend {
    * executing anything on the host; schedule mutations still cross daemon
    * authorization. */
   onSessionTool?(
-    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
+    cb: (operation: RemoteRunnerSessionToolOperation, hostContext?: RemoteRunnerTurnHostContext) => Promise<RemoteRunnerSessionToolResult>,
   ): void;
   /** A provider-owned turn survived the host/worker process and is now being
    * observed without resubmitting its prompt. */

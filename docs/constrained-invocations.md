@@ -54,15 +54,13 @@ MiniMax 已替换为 [MiniMax Code / mcode](minimax-code.md)。`mcode exec` 保�
 
 Pi 使用空工作目录和独立 HOME，stdin 传入内容，返回 JSON 经本地 schema 校验。Pi 原生停止事件必须表示完整结束；意外工具调用或截断不能被当作成功。
 
-### 原生策略控制：Gemini / OpenCode
-
-Gemini 使用 headless stream-json、空 `tools.core` 和匹配全部工具的 deny policy。原生请求已验证没有函数定义；关闭 hooks、skills、项目上下文，替换系统提示。输入封装为 JSON 数据，避免斜杠命令和 `@file` 处理。生产入口只接 Bot 专用 OAuth 文件，不使用宿主 keychain 或 `.env`；原生合成 API 测试已通过，真实 OAuth 账号尚未验证。`reasoningEffort` 当前明确报不支持。参见 [Gemini 官方策略引擎](https://geminicli.com/docs/reference/policy-engine/)。
+### 原生策略控制：OpenCode
 
 OpenCode 使用 `run --pure --format json`，专用 agent 和全局权限均拒绝所有工具。关闭自动标题、摘要及压缩，原生测试确认每次只发出一次模型请求。只复制专用 `auth.json` 中的原生 API/OAuth 记录；拒绝可能加载远端配置的 well-known 身份，不复制用户配置或外部插件。macOS/Linux 系统管理配置存在时拒绝，不覆盖。`actualModel` 保持 null，因为该原生输出没有独立报告实际执行模型。参见 [OpenCode 官方源码](https://github.com/anomalyco/opencode)。
 
 ### 全部 CLI 适配表
 
-**7 项已适配，验证范围见下表和测试记录；其余 24 项本机暂无完整测试环境，本 PR 暂未适配，后续按需迭代。** 原生 CLI 配合合成服务的测试与真实订阅/OAuth 验收分别注明。
+**6 项已适配，验证范围见下表和测试记录；其余 24 项本机暂无完整测试环境，本 PR 暂未适配，后续按需迭代。** 原生 CLI 配合合成服务的测试与真实订阅/OAuth 验收分别注明。
 
 | CLI | 状态 | 已验证结果 / 后续安排 |
 |---|---|---|
@@ -74,7 +72,6 @@ OpenCode 使用 `run --pure --format json`，专用 agent 和全局权限均拒�
 | `codex` | 已适配 | 独立 app-server、空工具和临时线程；原生合成服务测试及 Linux 真实订阅下的外部工具调用闭环通过。 |
 | `codex-app` | 已适配 | 复用同一 Codex 可执行文件和隔离 app-server 通道；独立 IPC 路由测试通过，不连接既有服务或实例池。 |
 | `cursor` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
-| `gemini` | 已适配 | headless stream-json、空 core 工具和全部拒绝策略；原生合成服务测试通过，OAuth 登录待真实账号验证。 |
 | `genius` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
 | `opencode` | 已适配 | run/json、pure 模式、全部工具拒绝，关闭标题与压缩子调用；原生合成服务测试通过。 |
 | `opencode2` | 暂未适配 | 本机暂无可用于该模式验收的完整测试环境，后续按需迭代适配。 |
@@ -132,10 +129,9 @@ Claude Code 使用同一启动方式，将 `BOTMUX_CORE_CLI` 改为 `claude-code
 | CLI | `$STATE_DIR/bots/local_reasoner/` 下目录 | 原生文件 |
 |---|---|---|
 | `pi` | `pi` | `auth.json`（API key 或 OAuth；不支持可执行 helper） |
-| `gemini` | `gemini` | `oauth_creds.json`，可选 `google_accounts.json` |
 | `opencode` | `opencode` | `auth.json`（仅 API/OAuth 记录） |
 
-原生刷新只影响本次临时副本，不回写来源登录目录；来源登录需保持有效。Pi / Gemini / OpenCode 不复制自定义模型目录与 provider 插件。模型能力、原生认证以及操作系统管理策略不满足时明确报错。
+原生刷新只影响本次临时副本，不回写来源登录目录；来源登录需保持有效。Pi / OpenCode 不复制自定义模型目录与 provider 插件。模型能力、原生认证以及操作系统管理策略不满足时明确报错。
 
 `capabilities` 的 `mode` 为 `model_only`、`loopOwner` 为 `caller`，`adapters` 列出全部已注册 CLI 的接通状态。`supported:true` 仍不代表已经在线验证当前账号。`maxOutputTokens` capability 声明本 CLI 是否接收可选的原生生成上限；当前仅 Claude 支持，请求中可传 `maxOutputTokens`（1–128000）。其他 CLI 明确报错，具体语义和公共字段映射见[公共入口说明](model-proxy.md#协议子集与语义边界)。
 
@@ -195,14 +191,13 @@ Claude Code 使用同一启动方式，将 `BOTMUX_CORE_CLI` 改为 `claude-code
 
 ## 可复现验证
 
-本轮原生合成服务复核使用 Codex 0.153.4、Claude Code 2.1.268、Pi 0.85.1、MiniMax CLI 1.0.25、Gemini CLI 0.60.0、OpenCode 1.18.31，合计 34 项通过（含公共 SDK 与 OCR 接入测试）。这些版本是历史验证样本，不是兼容白名单；其中 MiniMax CLI 1.0.25 的 mmx 接入已被 mcode 替换，相应旧测试不再代表当前支持能力。全局 Gemini CLI 0.1.18 不具备所需的 `--policy` / `--output-format` 接口，本轮调用失败；测试环境中的 OpenCode npm 启动入口未完成 postinstall，改用同一安装包提供的原生平台二进制后 4 项通过。下面的可执行路径应指向具备所需能力且安装完整的 CLI。
+本轮原生合成服务复核使用 Codex 0.153.4、Claude Code 2.1.268、Pi 0.85.1、MiniMax CLI 1.0.25、Gemini CLI 0.60.0、OpenCode 1.18.31，合计 34 项通过（含公共 SDK 与 OCR 接入测试）；Gemini CLI 适配器之后已随上游停止维护而下线，相应用例已移除。这些版本是历史验证样本，不是兼容白名单；其中 MiniMax CLI 1.0.25 的 mmx 接入已被 mcode 替换，相应旧测试不再代表当前支持能力。测试环境中的 OpenCode npm 启动入口未完成 postinstall，改用同一安装包提供的原生平台二进制后 4 项通过。下面的可执行路径应指向具备所需能力且安装完整的 CLI。
 
 ```bash
 bun run test -- --configLoader runner test/constrained-invocation.test.ts test/ipc-constrained-invocation.test.ts test/model-only-print.test.ts
 BOTMUX_CONSTRAINED_CODEX=codex bun x vitest run --project e2e test/constrained-codex.e2e.ts
 BOTMUX_MODEL_ONLY_CLAUDE=claude bun x vitest run --project e2e test/model-only-claude.e2e.ts
 BOTMUX_MODEL_ONLY_PI=pi bun x vitest run --configLoader runner --project e2e test/model-only-print.e2e.ts
-BOTMUX_MODEL_ONLY_GEMINI=gemini bun x vitest run --configLoader runner --project e2e test/model-only-gemini.e2e.ts
 BOTMUX_MODEL_ONLY_OPENCODE=opencode bun x vitest run --configLoader runner --project e2e test/model-only-opencode.e2e.ts
 bun run build
 # 以下明确消耗现有订阅；只用合成加法 fixture，不发送 IM：
@@ -213,4 +208,4 @@ BOTMUX_CONSTRAINED_AUTH_HOME="$NATIVE_CODEX_HOME" BOTMUX_CONSTRAINED_MODEL="$MOD
 
 本次以 Codex 0.153.4 / gpt-5.6-luna 配置执行 Linux 独立原生订阅 smoke，两轮均通过：启动 348/346 ms，总耗时 4653/4424 ms，输入 token 818/806，输出 token 54/41，原生缓存计数均为 0。重复提交每轮 ID 未产生重复推理，外部加法结果为 42。此前 gpt-5.5 配置也已完成同一闭环；这些是验证样本，不是版本或模型白名单，也不代表质量评测或性能承诺。真实 daemon IPC 的鉴权与幂等由针对性测试覆盖。
 
-此前 Pi / 旧 MiniMax / Gemini / OpenCode 的原生合成 API 测试覆盖零工具请求、恶意工具回包、取消和本地 schema 校验；OpenCode 另检查无标题子调用及缓存/推理 token 归一化。这些通过的是原生 CLI 协议，真实账号登录仍需分别验证，不能与 Codex 的真实订阅 smoke 混同。
+此前 Pi / 旧 MiniMax / Gemini（已下线）/ OpenCode 的原生合成 API 测试覆盖零工具请求、恶意工具回包、取消和本地 schema 校验；OpenCode 另检查无标题子调用及缓存/推理 token 归一化。这些通过的是原生 CLI 协议，真实账号登录仍需分别验证，不能与 Codex 的真实订阅 smoke 混同。

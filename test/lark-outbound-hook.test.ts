@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +6,7 @@ import { join } from 'node:path';
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   reply: vi.fn(),
+  forward: vi.fn(),
   request: vi.fn(),
   emitHookEvent: vi.fn(),
   sharing: false,
@@ -22,7 +23,7 @@ vi.mock('../src/services/group-context-store.js', async importOriginal => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBotClient: () => ({
-    im: { v1: { message: { create: mocks.create, reply: mocks.reply } } },
+    im: { v1: { message: { create: mocks.create, reply: mocks.reply, forward: mocks.forward } } },
     request: mocks.request,
   }),
   getAllBots: () => [],
@@ -35,7 +36,7 @@ vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: mocks.emitHookEvent,
 }));
 
-import { replyMessage, sendMessage, urgentMessage } from '../src/im/lark/client.js';
+import { forwardMessage, replyMessage, sendMessage, sendUserMessage, urgentMessage } from '../src/im/lark/client.js';
 
 describe('Lark outbound hook provider replay suppression', () => {
   it.each(['create', 'reply'] as const)('preserves the provider rejection code from %s for report recovery', async method => {
@@ -78,6 +79,18 @@ describe('Lark outbound hook provider replay suppression', () => {
     mocks.getObservedMessage.mockReturnValue({ messageId: 'om_parent', conversationScope: 'main' });
     await replyMessage('app', 'om_parent', 'shared reply');
     expect(mocks.observePublished).toHaveBeenLastCalledWith('app', expect.objectContaining({ message_id: 'om_reply', chat_id: 'oc_chat' }), undefined, {});
+  });
+
+  it.each(['send', 'reply'] as const)('records the content acknowledged by the provider for %s, prose as written', async kind => {
+    mocks.sharing = true;
+    mocks.reply.mockResolvedValue({ code: 0, data: { message_id: 'om_reply', chat_id: 'oc_chat' } });
+    const raw = '协作说明：[协作技能](/home/alice/.agents/skills/collaboration/SKILL.md)';
+    const action = kind === 'send' ? sendMessage('app', 'oc_chat', raw) : replyMessage('app', 'om_parent', raw);
+    await action;
+    const wire = (kind === 'send' ? mocks.create : mocks.reply).mock.calls[0][0].data.content;
+    expect(JSON.parse(wire).text).toBe(raw);
+    expect(mocks.observePublished.mock.calls[0][1].body.content).toBe(wire);
+    expect(mocks.emitHookEvent.mock.calls[0][1].content).toBe(JSON.parse(wire).text);
   });
 
   it('carries actual publication destination when provider receipts omit topic metadata', async () => {
@@ -295,5 +308,148 @@ describe('Lark outbound hook provider replay suppression', () => {
         data: { user_id_list: ['ou_user'] },
       });
     }
+  });
+});
+
+describe('Lark send gate retry keeps one dedupe uuid', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mocks.create.mockReset();
+    mocks.reply.mockReset();
+    mocks.forward.mockReset();
+    mocks.request.mockReset();
+    mocks.emitHookEvent.mockReset();
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  const transient502 = () => Object.assign(new Error('Request failed with status code 502'), {
+    isAxiosError: true, response: { status: 502, data: {} },
+  });
+
+  it.each(['create', 'reply'] as const)('%s retried after a lost response reuses the same uuid', async method => {
+    mocks[method]
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_ok' } });
+    const action = method === 'create'
+      ? sendMessage('app-retry-uuid', 'oc_chat', 'body')
+      : replyMessage('app-retry-uuid', 'om_root', 'body');
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_ok');
+
+    expect(mocks[method]).toHaveBeenCalledTimes(2);
+    const uuids = mocks[method].mock.calls.map(c => c[0].data.uuid);
+    expect(uuids[0]).toEqual(expect.any(String));
+    expect(uuids[0]).not.toBe('');
+    expect(uuids[1]).toBe(uuids[0]);
+    expect(uuids[0]).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+  });
+
+  // A per-operation constant would also satisfy the retry tests above, so each
+  // primitive that mints a token needs its own cross-call independence check.
+  it.each(['send', 'reply', 'forward', 'dm'] as const)('separate %s calls without a caller uuid do not share one', async operation => {
+    mocks.create.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    mocks.reply.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    mocks.forward.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    const call = operation === 'send' ? () => sendMessage('app-retry-uuid', 'oc_chat', 'a')
+      : operation === 'reply' ? () => replyMessage('app-retry-uuid', 'om_root', 'a')
+        : operation === 'forward' ? () => forwardMessage('app-retry-uuid', 'om_src', 'oc_dest')
+          : () => sendUserMessage('app-retry-uuid', 'ou_user', 'a');
+    await call();
+    await call();
+    const uuids = operation === 'forward'
+      ? mocks.forward.mock.calls.map(c => c[0].params.uuid)
+      : operation === 'reply'
+        ? mocks.reply.mock.calls.map(c => c[0].data.uuid)
+        : mocks.create.mock.calls.map(c => c[0].data.uuid);
+    expect(uuids[0]).toEqual(expect.any(String));
+    expect(uuids[1]).not.toBe(uuids[0]);
+  });
+
+  it.each(['send', 'reply'] as const)('%s does not leak the generated uuid into the outbound hook', async operation => {
+    mocks.create.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    mocks.reply.mockResolvedValue({ code: 0, data: { message_id: 'om_x' } });
+    if (operation === 'send') {
+      await sendMessage('app-retry-uuid', 'oc_chat', 'a', 'text', undefined, { sessionId: 's' });
+    } else {
+      await replyMessage('app-retry-uuid', 'om_root', 'a', 'text', false, undefined, { sessionId: 's' });
+    }
+    // The wire must still carry a token; only the hook payload stays clean.
+    const wire = operation === 'send'
+      ? mocks.create.mock.calls[0][0].data.uuid
+      : mocks.reply.mock.calls[0][0].data.uuid;
+    expect(wire).toEqual(expect.any(String));
+    expect(mocks.emitHookEvent).toHaveBeenCalledOnce();
+    expect(mocks.emitHookEvent.mock.calls[0][1].uuid).toBeUndefined();
+  });
+
+  it('a caller-supplied uuid is sent unchanged on every gate retry', async () => {
+    mocks.create
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_ok' } });
+    const action = sendMessage('app-retry-uuid', 'oc_chat', 'body', 'text', 'caller-uuid');
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_ok');
+    expect(mocks.create.mock.calls.map(c => c[0].data.uuid)).toEqual(['caller-uuid', 'caller-uuid']);
+  });
+
+  it('thread reply keeps reply_in_thread and the uuid across a retry', async () => {
+    mocks.reply
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_ok' } });
+    const action = replyMessage('app-retry-uuid', 'om_root', 'body', 'text', true);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await action;
+    const [first, second] = mocks.reply.mock.calls.map(c => c[0].data);
+    expect(first.reply_in_thread).toBe(true);
+    expect(second.reply_in_thread).toBe(true);
+    // Assert the shape first: comparing only `second.uuid === first.uuid` would
+    // pass with both undefined, so it cannot prove the wire token exists.
+    expect(first.uuid).toEqual(expect.any(String));
+    expect(first.uuid).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+    expect(second.uuid).toBe(first.uuid);
+  });
+
+  it('forward retried after a lost response reuses the same uuid in params', async () => {
+    mocks.forward
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_fwd' } });
+    const action = forwardMessage('app-retry-uuid', 'om_src', 'oc_dest');
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_fwd');
+
+    expect(mocks.forward).toHaveBeenCalledTimes(2);
+    const params = mocks.forward.mock.calls.map(c => c[0].params);
+    expect(params[0].receive_id_type).toBe('chat_id');
+    expect(params[0].uuid).toEqual(expect.any(String));
+    expect(params[0].uuid).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+    expect(params[1].uuid).toBe(params[0].uuid);
+  });
+
+  it('sendUserMessage retry reuses one uuid', async () => {
+    mocks.create
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_dm' } });
+    const action = sendUserMessage('app-retry-uuid', 'ou_user', 'hi');
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_dm');
+    const uuids = mocks.create.mock.calls.map(c => c[0].data.uuid);
+    expect(uuids[0]).toEqual(expect.any(String));
+    expect(uuids[1]).toBe(uuids[0]);
+  });
+
+  // requestOptions takes a DIFFERENT wire branch (generic c.request instead of
+  // the SDK create). Deadline DMs (codex notifier, card delivery) all go through
+  // it, so it needs its own retry-reuse anchor.
+  it('sendUserMessage retry on the deadline request branch reuses one uuid', async () => {
+    mocks.request
+      .mockRejectedValueOnce(transient502())
+      .mockResolvedValueOnce({ code: 0, data: { message_id: 'om_dm_deadline' } });
+    const action = sendUserMessage('app-retry-uuid', 'ou_user', 'hi', 'text', undefined, { timeoutMs: 1_000 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(action).resolves.toBe('om_dm_deadline');
+    expect(mocks.request).toHaveBeenCalledTimes(2);
+    const uuids = mocks.request.mock.calls.map(c => c[0].data.uuid);
+    expect(uuids[0]).toEqual(expect.any(String));
+    expect(uuids[1]).toBe(uuids[0]);
   });
 });

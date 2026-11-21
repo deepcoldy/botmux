@@ -2,7 +2,8 @@ function terminalKey(sessionId: string, turnId: string, dispatchAttempt?: number
   return `${sessionId}:${turnId}:${dispatchAttempt ?? 'generic'}`;
 }
 
-/** Bounded worker-local exactly-once gate for terminal IPC emission. */
+/** Bounded worker-local gate. Observer loss may later be resolved by a real
+ * native terminal; two contradictory confirmed terminals remain suppressed. */
 export class TurnTerminalDeduper {
   /** Claimed terminal → the status it was claimed with. */
   private readonly emitted = new Map<string, string>();
@@ -15,13 +16,14 @@ export class TurnTerminalDeduper {
 
   /**
    * Claim one `(session, logical turn, dispatch attempt)` terminal. The first
-   * caller wins regardless of status; transcript-final, submit-failure and CLI
-   * exit races therefore emit one IPC message, never contradictory duplicates.
+   * confirmed caller wins. An ambiguous/unknown observation can be resolved by
+   * a later native terminal without allowing contradictory confirmed results.
    */
   claim(sessionId: string, turnId: string, dispatchAttempt?: number, status = 'unknown'): boolean {
     if (!sessionId || !turnId) return false;
     const key = terminalKey(sessionId, turnId, dispatchAttempt);
-    if (this.emitted.has(key)) return false;
+    const previous = this.emitted.get(key);
+    if (previous !== undefined && !(['ambiguous', 'unknown'].includes(previous) && ['completed', 'failed', 'cancelled'].includes(status))) return false;
     this.emitted.set(key, status);
     if (this.emitted.size > this.maxEntries) {
       const oldest = this.emitted.keys().next().value;

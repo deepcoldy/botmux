@@ -193,6 +193,17 @@ describe('resolveCurrentTurnProvenance', () => {
       });
     });
 
+    it('refuses a talk-only task owner from workflow mutation provenance', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeScheduledTask({ ownerAccess: 'talk' });
+      expect(() => resolveCurrentTurnProvenance({
+        dataDir,
+        envSessionId: 'sess-1',
+        startPid: process.pid,
+      })).toThrow(CurrentTurnProvenanceError);
+    });
+
     it('uses the chat-scope reply target root for a scheduled turn', () => {
       writeMarker('sess-1', SCHED_TURN_ID);
       writeSession({
@@ -220,10 +231,10 @@ describe('resolveCurrentTurnProvenance', () => {
       })).toThrow(/不存在或已被删除/);
     });
 
-    it('rejects a scheduled turn whose task has no ownerOpenId (legacy task)', () => {
+    it('rejects ownerless scheduled tasks, including delegated children, from workflow mutation provenance', () => {
       writeMarker('sess-1', SCHED_TURN_ID);
       writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
-      writeScheduledTask({ ownerOpenId: undefined });
+      writeScheduledTask({ ownerOpenId: undefined, ownerUnionId: undefined });
 
       expect(() => resolveCurrentTurnProvenance({
         dataDir,
@@ -350,6 +361,8 @@ describe('resolveCurrentTurnProvenance', () => {
         larkAppId: 'cli_real',
         chatId: 'oc_real',
         chatType: 'group',
+        // The registry records them as a non-bot participant.
+        callerProvenHuman: true,
       });
     });
 
@@ -465,6 +478,8 @@ describe('resolveCurrentTurnProvenance', () => {
         larkAppId: 'cli_real',
         chatId: 'oc_real',
         chatType: 'group',
+        // The registry records them as a non-bot participant.
+        callerProvenHuman: true,
       });
     });
 

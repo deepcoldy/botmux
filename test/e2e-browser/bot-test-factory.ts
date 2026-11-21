@@ -34,9 +34,11 @@ import {
   waitForCodexSideResponse,
   clickDirectStartIfPresent,
   showStreamingOutput,
+  waitForReplyMarker,
   waitForModelTextReply,
   scrollThreadToBottom,
   closeSession,
+  reopenTopic,
   type BotName,
 } from './helpers.js';
 import { publishLabeledPageVideo } from './e2e-video.js';
@@ -110,16 +112,16 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
       });
 
       await scrollThreadToBottom(agent);
-      await waitForModelTextReply(agent, {
-        botName,
-        marker: expectedReplyMarker(msg),
-        timeoutMs: 180_000,
-      });
+      const marker = expectedReplyMarker(msg);
+      await waitForModelTextReply(agent, { botName, marker, timeoutMs: 180_000 });
+      // The vision check above also accepts the prompt, which quotes the same
+      // ACK: CI once passed a case whose CLI exited before every turn.
+      await waitForReplyMarker(page, marker, 60_000);
 
       // The ACK bubble is now the last item. showStreamingOutput scrolls the
       // streaming card itself into view; scrolling to the thread bottom
       // hides that card behind the bubble.
-      await showStreamingOutput(agent, page);
+      await showStreamingOutput(agent, page, { reopen: reopenTopic(agent, page, msg) });
     }, timeoutMs);
   });
 }

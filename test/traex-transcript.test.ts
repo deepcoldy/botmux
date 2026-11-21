@@ -139,6 +139,17 @@ function historyAppend(items: unknown[], timestamp = '2000-01-01T00:00:02.000Z')
   };
 }
 
+function traexResponseItem(item: object, turnId?: string) {
+  return {
+    timestamp: '2000-01-01T00:00:02.000Z',
+    type: 'response_item',
+    payload: {
+      ...item,
+      ...(turnId ? { internal_chat_message_metadata_passthrough: { turn_id: turnId } } : {}),
+    },
+  };
+}
+
 function canonicalCompletion(item: unknown, timestamp = '2000-01-01T00:00:01.000Z') {
   return {
     ...historyAppend([], timestamp),
@@ -505,6 +516,33 @@ describe('findTraexThreadByPid', () => {
     } finally {
       if (userFdOpen) closeSync(userFd);
       closeSync(subagentFd);
+      if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousTraeHome;
+    }
+  });
+
+  it.runIf(process.platform === 'linux')('strips the bare follow-up formatting block from the DB title (#2716)', () => {
+    const previousTraeHome = process.env.TRAE_HOME;
+    const traeHome = join(dir, 'trae-home-bare');
+    const lockDir = join(traeHome, 'cli', 'thread-writer-locks');
+    const userId = '00000000-0000-7000-8000-000000000003';
+    mkdirSync(lockDir, { recursive: true });
+    const lockPath = join(lockDir, `${userId}.lock`);
+    writeFileSync(lockPath, '');
+    const fd = openSync(lockPath, 'r');
+    const db = openDatabaseSyncNow(join(traeHome, 'cli', 'state_5.sqlite'))!;
+    db.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, first_user_message TEXT, updated_at_ms INTEGER, thread_source TEXT)');
+    const bareTitle = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    db.prepare('INSERT INTO threads VALUES (?, ?, ?, ?, ?)').run(userId, bareTitle, 'fallback', 1, 'user');
+    db.close();
+    process.env.TRAE_HOME = traeHome;
+    try {
+      expect(findTraexThreadByPid(process.pid)).toEqual({
+        cliSessionId: userId,
+        title: '继续看一下这个 PR',
+      });
+    } finally {
+      closeSync(fd);
       if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
       else process.env.TRAE_HOME = previousTraeHome;
     }
@@ -938,6 +976,86 @@ describe('drainTraexRollout', () => {
     expect(queue.drainEmittable()).toEqual([
       expect.objectContaining({ turnId: 'remote-tool', finalText: 'tool completed' }),
     ]);
+  });
+
+  it('routes TraeX 0.215 response items to the active turn as they are written', () => {
+    const turnId = taskComplete().payload.turn_id;
+    const input = itemCompleted({
+      type: 'UserMessage', id: 'input-1', content: [{ type: 'text', text: 'inspect it' }],
+    }, turnId);
+    const reasoning = {
+      type: 'reasoning', id: 'rs_1', summary: [],
+      content: [{ type: 'reasoning_text', text: 'Inspect the input' }],
+      encrypted_content: 'opaque-data',
+    };
+    const call = { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'exec', arguments: '{"command":"pwd"}' };
+    const result = { type: 'function_call_output', call_id: 'call_1', output: 'ok' };
+    writeFileSync(path, [
+      line(input),
+      line(traexResponseItem(reasoning, turnId)),
+      line(traexResponseItem(call, turnId)),
+      line(traexResponseItem({ ...reasoning, id: 'unscoped' })),
+      line(assistantProgress('still running')),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0, { probe: true }).events.map(event => event.kind)).toEqual(['user']);
+    const queue = new CodexBridgeQueue();
+    const observed: string[] = [];
+    queue.mark('current-turn', 'inspect it', Date.parse(input.timestamp));
+    queue.setCotObserver((entries, turn) => {
+      observed.push(...entries.map(entry => `${turn.turnId}:${entry.kind}`));
+    });
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.map(event => event.kind)).toEqual(['user', 'cot', 'cot']);
+    expect(first.events[1]).toMatchObject({
+      sourceTurnId: turnId,
+      cotEntries: [{ kind: 'thinking', text: 'Inspect the input' }],
+    });
+    queue.ingest(first.events);
+    expect(observed).toEqual(['current-turn:thinking', 'current-turn:tool_call']);
+    expect(queue.drainEmittable()).toEqual([]);
+
+    appendFileSync(path, line({
+      ...input, payload: { ...input.payload, item: {
+        type: 'Reasoning', id: 'rs_1', raw_content: ['Inspect the input'], summary_text: [],
+      } },
+    }) + line(traexResponseItem(result, turnId)) + line(taskComplete('done')));
+    queue.ingest(drainTraexRollout(path, first.newOffset).events);
+    expect(observed).toEqual(['current-turn:thinking', 'current-turn:tool_call', 'current-turn:tool_result']);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'current-turn', finalText: 'done' }),
+    ]);
+  });
+
+  it('deduplicates both TraeX CoT formats across drains and preserves native turn ownership', () => {
+    const turnId = taskComplete().payload.turn_id;
+    const nextTurnId = '00000000-0000-7000-8000-000000000011';
+    const reasoning = {
+      type: 'reasoning', id: 'rs_1', summary: [{ type: 'summary_text', text: 'Inspect the input' }],
+    };
+    const call = { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'exec', arguments: '{}' };
+    const result = { type: 'function_call_output', call_id: 'call_1', output: 'ok' };
+    writeFileSync(path, line(historyAppend([reasoning])) + line(traexResponseItem(call, turnId)));
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.flatMap(event => event.cotEntries ?? []).map(entry => entry.kind))
+      .toEqual(['thinking', 'tool_call']);
+
+    appendFileSync(path, [
+      line(traexResponseItem(reasoning, turnId)),
+      line(historyAppend([call, result])),
+      line(traexResponseItem(result, turnId)),
+      line(taskComplete('done')),
+      line(traexResponseItem(reasoning, nextTurnId)),
+      line(traexResponseItem(call, nextTurnId)),
+    ].join(''));
+    const next = drainTraexRollout(path, first.newOffset);
+    expect(next.events.map(event => [event.kind, event.sourceTurnId, event.cotEntries?.map(entry => entry.kind)]))
+      .toEqual([
+        ['cot', turnId, ['tool_result']],
+        ['assistant_final', turnId, undefined],
+        ['cot', nextTurnId, ['thinking']],
+        ['cot', nextTurnId, ['tool_call']],
+      ]);
   });
 
   it('emits TraeX reasoning and tool calls/results as ordered CoT events', () => {
@@ -2358,6 +2476,13 @@ describe('drainTraexRollout', () => {
     });
   });
 
+  it.each(['usageLimitExceeded', 'usage_limit_exceeded'])('preserves the explicit quota code %s', code => {
+    writeFileSync(path, line(user('continue task')) + line(taskCompleteWithError({ codex_error_info: code })));
+    expect(drainTraexRollout(path, 0).events.at(-1)).toMatchObject({
+      terminalStatus: 'failed', terminalErrorCode: 'traex_usage_limit_exceeded',
+    });
+  });
+
   it('synthesises the bare sentinel when the last commentary ends with BOTMUX_NO_REPLY (path B: deliberate silence)', () => {
     writeFileSync(path, [
       line(user('do the work')),
@@ -2954,6 +3079,30 @@ describe('TraeX native thread metadata', () => {
     expect(readTraexThreadTitle('native-0210', dbPath)).toBe('回复确认收到');
     expect(readTraexThreadTitle('native-0209', dbPath)).toBe('Fix TraeX terminal fence wedge');
     expect(readTraexThreadTitle('native-unnamed', dbPath)).toBe('Legacy display title');
+  });
+
+  it('strips the bare follow-up formatting block from ≤0.207 defaulted titles', () => {
+    const dbPath = join(dir, 'state_5.sqlite');
+    const BARE_TITLE = '继续看一下这个 PR\n\n<botmux_formatting>短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。</botmux_formatting>';
+    writeModernThreads(dbPath, [
+      // ≤0.207 shape: no name/preview, title defaulted to the first prompt —
+      // which is the envelope-less bare (transcript + solo) follow-up. The
+      // structural origin filter can't see that shape; the display title must
+      // still drop the internal formatting block (#2716).
+      { id: 'bare-title', name: null, title: BARE_TITLE, firstUserMessage: '', preview: '' },
+      // Clean display name wins over a block-polluted legacy title.
+      { id: 'bare-named', name: '人工改的标题', title: BARE_TITLE, firstUserMessage: '', preview: '' },
+      // Title consisting solely of the internal block behaves like an empty title.
+      { id: 'bare-only', name: null, title: '<botmux_formatting>短进度优先纯文本。</botmux_formatting>', firstUserMessage: '', preview: '' },
+    ]);
+
+    const details = readTraexThreadDetails(['bare-title', 'bare-named', 'bare-only'], dbPath);
+    expect(details.get('bare-title')?.title).toBe('继续看一下这个 PR\n\n ');
+    expect(details.get('bare-named')?.title).toBe('人工改的标题');
+    expect(details.get('bare-only')).toEqual({ id: 'bare-only' });
+    expect(readTraexThreadTitle('bare-title', dbPath)).toBe('继续看一下这个 PR');
+    expect(readTraexThreadTitle('bare-named', dbPath)).toBe('人工改的标题');
+    expect(readTraexThreadTitle('bare-only', dbPath)).toBeUndefined();
   });
 
   it('never returns a live title for a botmux-origin thread', () => {

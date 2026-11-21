@@ -1,6 +1,6 @@
 # botmux
 
-飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Codex / Gemini 等 20+ 种，完整列表见 README）。
+飞书话题群 ↔ AI 编程 CLI 桥接。Daemon 监听飞书消息，每个新话题自动 spawn 一个独立 CLI 进程（Claude Code / Codex / Antigravity / Grok / Pi 等 20+ 种，完整列表见 README）。
 
 ## 构建 & 运行
 
@@ -20,7 +20,7 @@ SQLite 库其实完好）。**supervisor 自身不需要 SQLite，所以它照�
 —— 这个失败形状是记在这里的唯一理由：报成功、孩子全灭，看日志前无从分辨。
 现在 preflight 会在**拆掉现有 fleet 之前**按引擎能力拒绝（逃生阀 `BOTMUX_INTERPRETER=<abs>`）。
 
-**包管理器是 bun**（`packageManager: bun@1.4.3`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
+**包管理器是 bun**（`packageManager: bun@1.4.4`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
 
 ⚠️ `trustedDependencies: ["electron","node-pty"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。electron 的 postinstall 负责下载对应平台的二进制。
 
@@ -39,9 +39,15 @@ bun run dashboard:bun        # bun src/index-dashboard.ts
 bun run build:bun            # 打自包含单文件二进制（scripts/build-bun-binary.mjs）
 ```
 
-发版编译用的 Bun 版本**钉在 1.4.3**，唯一来源是 `package.json` 的 `packageManager`（`.github/workflows/` 各处与它一致，`test/release-darwin-codesign-gate.test.ts` 守着）。本地 bun 与它不一致时，编译产物、bun.lock 重写、`bun test` 的行为可能和 CI 不一致：`bun run build` 与 `scripts/build-bun-binary.mjs` 开头会比对并**告警（不拦截）**，见 `scripts/check-bun-version.mjs`。对齐用告警给出的官方安装命令装指定版本——它解压到同目录再 `mv` 换 inode，fleet 正跑着的 bun 进程不受影响。
+发版编译用的 Bun 版本**钉在 1.4.4**，唯一来源是 `package.json` 的 `packageManager`（`.github/workflows/` 各处与它一致，`test/release-darwin-codesign-gate.test.ts` 守着）。本地 bun 与它不一致时，编译产物、bun.lock 重写、`bun test` 的行为可能和 CI 不一致：`bun run build` 与 `scripts/build-bun-binary.mjs` 开头会比对并**告警（不拦截）**，见 `scripts/check-bun-version.mjs`。对齐用告警给出的官方安装命令装指定版本——它解压到同目录再 `mv` 换 inode，fleet 正跑着的 bun 进程不受影响。
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
+
+**临时探针 / 变异脚本 / 自写的 vitest 配置一律套 `bun scripts/fenced-run.ts -- <命令>`。** 仓库的 HOME 围栏和 tmux 围栏只挂在 `vitest.config.ts` 与 `bunfig.toml` 上：`bun /tmp/probe.ts` 直接调真实模块、或自写一个不带 setupFiles 的 vitest 配置，都**没有围栏**，会写真实 `~/.botmux`、`~/.config/systemd/user` 和 fleet 的 `-L botmux` tmux。2026-11-06 一个评审探针不带 HOME 调了 `enableAutostart()`，把真实 botmux.service / watchdog 改成 `ExecStart=/opt/botmux`，崩溃守护静默失效 5 小时。fenced-run 给子进程临时 HOME、私有 TMUX_TMPDIR + 拒绝宿主 socket 的 tmux shim、把 SESSION_DATA_DIR 指到临时 HOME 并清掉继承的会话身份标记和 daemon IPC 端口，并默认去掉 user bus（`systemctl --user` 碰不到真实 user manager；botmux 的 scope 代码看到 `BOTMUX_FENCED_RUN=1` 时只用环境里给出的总线变量、不再从 `/run/user/<uid>/bus` 推导，strict envPolicy 也保留这个标记；确需时加 `--keep-user-bus`）；触到宿主 socket 以退出码 3 失败。围栏只拦住经 PATH 解析的 tmux 和继承来的环境：探针里不要用绝对路径调 tmux（如 `/usr/bin/tmux`）、不要 `env -i` 清空环境后再 spawn tmux——这两种写法绕过 shim，能直达 fleet 的默认 socket；需要碰 tmux 时只用私有 `-L`/`-S` 目标或仓库 test helper。仓库根目录新增 `vitest*.config.ts` 必须挂 tmux 围栏，`test/vitest-config-fences.test.ts` 守着。
+
+**单测里不碰真实 systemd。** vitest unit 项目和 bun 腿另挂 systemd 围栏（`test/helpers/systemd-fence.ts`）：测试进程自己调 `systemd-run`、`busctl`、`systemctl --user`（含 `env …`、`sh -c` 包装和绝对路径）就让该测试失败，被测代码吞掉异常也一样；子进程经 PATH 上的 shim 被拒（退出码 1）。scope / fleet-scope 代码一律注入 `run`、`readlink` 或 `pidNamespace` 假实现，不要为了测它去连真实 user manager——在独立 PID 命名空间里，交出去的 PID 会被宿主 systemd 解释成另一个进程。
+
+**本机测试有整机并发闸**（`scripts/test-concurrency.mjs`，接在 `vitest.config.ts` 的 sequencer 与 `scripts/run-bun-tests.mjs` 上）：vitest 选中 ≥50 个文件、或跑全量 `test:bun` 时，在 `/tmp/botmux-test-slots` 的 flock 名额上排队，整机同时最多 `核数/16` 份（64 核 = 4 份）；vitest 默认 `maxWorkers = min(16, 核数/名额)`。CI（`CI=true`）上两者都不生效，行为不变。看到 `[test-gate] 名额已满` 说明机器忙——别用 `BOTMUX_TEST_GATE=0` 绕过，定向测试（少量文件）本来就不排队；其余覆盖变量见脚本头注释。
 
 worktree 里也能直接用 bun，且**不额外占依赖体积**——只要不跑 install（见下节）。实测在「源码 + `node_modules` symlink 到 canonical」的 worktree 里，`bun src/cli.ts`、`bun run build`、`tsc`、`vitest`、`build:bun`（`pty.node` 经 symlink 解析，不复制）以及编出二进制跑 smoke 六项，全部正常。
 
@@ -84,6 +90,11 @@ BOTMUX_NO_CLAIM=1 bun run use:here   # 逃生阀：本次不认领
 ```
 
 纯 `bun run build` 故意不认领——review/验证别人 PR 时不会悄悄抢走全局指向。实现见 `scripts/claim-botmux-bin.mjs`。
+
+单实例候选版本可在 daemon 启动环境设置绝对路径 `BOTMUX_WRAPPER_BIN=<candidate>/bin`，
+让 daemon 和 worker 共用独立 wrapper，保留共享全局 binary。
+不要仅为隔离 wrapper 将 daemon 放入新的 user namespace：恢复的 CLI 可能仍在宿主
+namespace，新 worker 无权读取它的 `/proc/<pid>/fd`，会导致 transcript 桥接失联。
 
 ### 改动需用户手动测试时 → 部署本 checkout 到 live daemon
 
@@ -175,4 +186,4 @@ daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）�
 - commit message 格式：`type(scope): 中文描述`。`type`（feat/fix/docs/chore 等）和 `scope`（模块名）保留英文，冒号后的描述用中文；同样**不带飞书真人名字与机器人协作花名**（见上「PR 规范」）
 - 日常 `git commit` + `git push` 不会触发发版；打 `v*` annotated tag 并 push 才发版（**仅在用户明确要求时**），CI 自动从 tag 提取版本号发布 npm + 创建 GitHub Release
 - **不要**手动修改 `package.json` 的 `version` 字段；tag message 用中文撰写，CI 会用作 Release body
-- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`botmux update canary`（或 `npm i -g botmux@canary`）
+- **正式版（latest）必须从 master 出**：正式版 tag 必须是规范的 `vX.Y.Z`，并按版本号递增的顺序打（origin 上已有更高的正式版 tag 就拒）。在此前提下，CI 放行两种 tag —— ① 被打 tag 的 commit 包含最新 `origin/master`（在 master tip、或 rebase 到最新 master 的子分支上打 tag）；② 被打 tag 的 commit 在 master 的 first-parent 链上（可以不是 tip，但 merge 进来的分支内部提交不算），且包含 npm latest 对应的 tag，以及版本号介于 npm latest 与本版之间的所有正式版（只有 tag 的、已发到 npm 的都算）的 tag；npm 上已发布过更高版本号的正式版时 ② 不成立。所以打完 tag 后 master 照常合 PR 不会让发版被拒、发版期间不用按住合码，后合入的进下一版（Actions 里 preflight 的 summary 会列出没进这一版的 master 提交）；拿不到 npm latest 或对应 tag 时只认 ①。② 被拒、提示缺的基线 tag 不在 master 上时（比如一个误打在个人分支上的正式版 tag），只能在当前 master tip 上按 ① 重打。这套判定在 preflight 先跑一次（尽早拒绝），签名审批之后、任何包发布之前在 `publish-gate` 按当时的 master、tag 和 npm 再跑一次并固定结论，`binary-subpackages` 在第一次发包前、本版本的子包还一个都没发时再判一次（应对「Re-run failed jobs」只重跑它），子包发出去之后的 `release` 只复核 publish-gate 的固定值（#1150）；这几个 job 都要 `fetch-depth: 0`，浅克隆里守门直接拒绝；所以审批期间就算有更低的版本发布、tag 被删重建或 latest 被回滚，审批后也会在发包前拒掉。例外（已知局限）：本版本只要已有任何包上了 npm，续发就沿用原判定（此时重判只能烧掉版本号），这时删 tag、发更低的热修、再在同一提交重建 tag 去续发，发出的版本会不含热修——**某个版本只要有包上了 npm，就不要删它的 tag，热修改发更高的版本号**。要删掉误打、且还没有任何包上 npm 的正式版 tag 时，先取消它那次可能还在等签名审批的 Release 运行。恢复失败的正式版只用「Re-run failed jobs」，不用「Re-run all jobs」。审批之后点 Cancel 能拦住还没开始的发包（发包 job 用 `!cancelled()`，不用 `always()`）；发到一半被取消的，用「Re-run failed jobs」续发。判定见 `.github/scripts/release-master-guard.mjs`，规则与理由见 `release.yml` preflight 的「Guard — stable release must come from master」。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`botmux update canary`（或 `npm i -g botmux@canary`）

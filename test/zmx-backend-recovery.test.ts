@@ -1,3 +1,6 @@
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   existsSync,
@@ -440,6 +443,36 @@ describe('ZmxBackend history-authoritative transport', () => {
     expect(state.cliPidPath).not.toBeNull();
     expect(readFileSync(state.cliPidPath!, 'utf8').trim())
       .toBe(String(state.launchPid));
+  });
+
+  it('re-reads the stable PTY root independently of cliPid refinement', () => {
+    const backend = spawnBackend();
+    expect(backend.getStablePanePid()).toBe(state.pid);
+    backend.cliPid = state.launchPid + 1000;
+    expect(backend.getChildPid()).toBe(state.launchPid + 1000);
+    expect(backend.getStablePanePid()).toBe(state.pid);
+    state.pid += 1;
+    expect(backend.getStablePanePid()).toBe(state.pid);
+  });
+
+  it('uses the frozen root only while the session list is unreadable', () => {
+    const backend = spawnBackend();
+    const frozenRoot = state.pid;
+    const defaultExec = childMocks.execFileSync.getMockImplementation()!;
+    let failNextList = true;
+    childMocks.execFileSync.mockImplementation((file: string, argv: string[], options?: any) => {
+      if (failNextList && argv[0] === 'list') {
+        failNextList = false;
+        throw new Error('zmx list temporarily unavailable');
+      }
+      return defaultExec(file, argv, options);
+    });
+    expect(backend.getStablePanePid()).toBe(frozenRoot);
+    expect(backend.getStablePanePid()).toBe(frozenRoot);
+    state.pid += 1;
+    expect(backend.getStablePanePid()).toBe(state.pid);
+    state.exists = false;
+    expect(backend.getStablePanePid()).toBeNull();
   });
 
   it('creates the session through a TERM-pinned client while control clients keep the invoker env', () => {

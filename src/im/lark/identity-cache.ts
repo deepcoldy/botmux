@@ -48,7 +48,12 @@ const dirty = new Set<string>();
 let flushTimer: NodeJS.Timeout | null = null;
 
 const FLUSH_DEBOUNCE_MS = 2_000;
-const RESOLVE_BUDGET_MS = 800;
+
+/** Per-step display-identity budget; strict owner verification has its own cutoff. */
+function senderResolveTimeoutMs(): number {
+  const value = Number(process.env.BOTMUX_SENDER_RESOLVE_TIMEOUT_MS);
+  return Number.isSafeInteger(value) && value > 0 && value <= 2_147_483_647 ? value : 800;
+}
 
 function cacheFile(larkAppId: string): string {
   return join(config.session.dataDir, `identities-${larkAppId}.json`);
@@ -232,7 +237,7 @@ async function ensureContactProfile(larkAppId: string, openId: string): Promise<
   }
 
   try {
-    await withTimeout(pending, RESOLVE_BUDGET_MS);
+    await withTimeout(pending, senderResolveTimeoutMs());
   } catch {
     // withTimeout rejected → either the budget elapsed or the underlying
     // request errored. If the Lark SDK call hangs forever (no built-in
@@ -314,7 +319,7 @@ export async function resolveNameViaMessage(
   try {
     const detail = await withTimeout(
       getMessageDetail(larkAppId, messageId, { userCardContent: false }),
-      RESOLVE_BUDGET_MS,
+      senderResolveTimeoutMs(),
     );
     const sender = detail?.items?.[0]?.sender;
     const name: unknown = sender?.sender_name;

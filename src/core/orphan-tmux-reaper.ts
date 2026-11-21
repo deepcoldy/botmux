@@ -96,7 +96,14 @@ import {
   managedTmuxCandidateSockets,
   tmuxSocketArgs,
 } from '../adapters/backend/tmux-socket.js';
+import { resolveTmuxSocketRoot, tmuxSocketPathIn } from '../adapters/backend/tmux-socket-root.js';
 import { logger } from '../utils/logger.js';
+import {
+  listeningServersOnPath,
+  newestBotmuxListener,
+  recoverNewestBotmuxSocket,
+  procStartTicks,
+} from './tmux-server-guard.js';
 
 /** A pid holding a unix socket bound to a pathname. */
 export interface SocketBinding {
@@ -145,6 +152,13 @@ interface ReaperSeam {
   bootstrap?: (socketName: SocketName, sessionName: string) => boolean;
   /** Remove a bootstrap session previously created on the socket. */
   cleanupBootstrap?: (socketName: SocketName, sessionName: string) => void;
+  /** Kernel listener census for the owner-down SIGUSR1 recovery branch.
+   *  Defaults to the /proc + lsof census in tmux-server-guard; injected by
+   *  tests so the recovery-before-bootstrap branch is exercisable without a
+   *  real tmux server. */
+  listeningServerPids?: (socketPath: string, platform: NodeJS.Platform) => number[] | null;
+  /** SIGUSR1 send used by the recovery branch (defaults to process.kill). */
+  recreateSocket?: (pid: number) => void;
   env?: NodeJS.ProcessEnv;
   uid?: number;
   platform?: NodeJS.Platform;
@@ -175,14 +189,16 @@ export function argvCarriesBotmuxSession(cmd: string): boolean {
   return /(?:^|\s)new-session\b.*\s-s\s+(?:bmx(?:-diag)?-[0-9a-f]{8}|bmx-reap-bootstrap-\d+)(?:\s|$)/s.test(cmd);
 }
 
-/** Filesystem pathname of a tmux server socket (undefined name = default). */
+/** Filesystem pathname of a tmux server socket (undefined name = default).
+ *  The root follows tmux's own resolution (a $TMUX_TMPDIR that is not an
+ *  existing directory falls back to /tmp) so the reaper looks at the socket
+ *  the server really listens on. */
 export function defaultSocketPath(
   env: NodeJS.ProcessEnv,
   uid: number,
   socketName?: string,
 ): string {
-  const baseDir = env.TMUX_TMPDIR || '/tmp';
-  return join(baseDir, `tmux-${uid}`, socketName || 'default');
+  return tmuxSocketPathIn(resolveTmuxSocketRoot(env), uid, socketName);
 }
 
 /**
@@ -583,17 +599,46 @@ export function ensureServerThenReapOrphanTmuxServers(
       continue;
     }
     if (owner.kind === 'down') {
-      // A listener exists but no reachable owner answers — the displaced
-      // server scenario. Pin a fresh owner with a bootstrap session.
-      bootstrappedSession = `${BOOTSTRAP_PREFIX}${process.pid}`;
-      if (!bootstrap(socketName, bootstrappedSession)) continue;
-      const reProbed = probeOwner(socketName);
-      if (reProbed.kind !== 'reachable') {
-        cleanupBootstrap(socketName, bootstrappedSession);
-        logger.warn(`[tmux-reaper] fresh owner unreachable after bootstrap on ${socketName ?? 'default'}; skipping this socket`);
-        continue;
+      // A listener exists but no reachable owner answers. Before booting a
+      // bootstrap server (which forks yet another generation), try the
+      // non-forking recovery first: on Linux, if the socket FILE is gone but a
+      // botmux server still LISTENs on the pathname, SIGUSR1 makes it recreate
+      // the socket (same pid, sessions survive). Covers the multi-orphan
+      // shape: recover the NEWEST botmux listener; older displaced generations
+      // are reaped below against the recovered owner.
+      if (platform === 'linux') {
+        const censusPids = opts.listeningServerPids ?? listeningServersOnPath;
+        const liveListeners = censusPids(socketPath, platform) ?? [];
+        const isBotmux = (pid: number) => {
+          const proc = procs.find(p => p.pid === pid);
+          return proc ? argvCarriesBotmuxSession(proc.cmd) : false;
+        };
+        const recoverPid = newestBotmuxListener(liveListeners, isBotmux, procStartTicks);
+        if (recoverPid !== null) {
+          const recovered = recoverNewestBotmuxSocket(socketPath, platform, recoverPid, {
+            listeningServerPids: censusPids, isBotmuxListener: isBotmux, recreateSocket: opts.recreateSocket,
+          });
+          if (recovered) {
+            // Give the server a beat to re-bind, then see if it now answers.
+            sleep(200);
+            const afterRecovery = probeOwner(socketName);
+            if (afterRecovery.kind === 'reachable') owner = afterRecovery;
+          }
+        }
       }
-      owner = reProbed;
+      if (owner.kind === 'down') {
+        // Recovery unavailable/failed: pin a fresh owner with a bootstrap
+        // session (original behaviour, behind the opt-in reaper switch).
+        bootstrappedSession = `${BOOTSTRAP_PREFIX}${process.pid}`;
+        if (!bootstrap(socketName, bootstrappedSession)) continue;
+        const reProbed = probeOwner(socketName);
+        if (reProbed.kind !== 'reachable') {
+          cleanupBootstrap(socketName, bootstrappedSession);
+          logger.warn(`[tmux-reaper] fresh owner unreachable after bootstrap on ${socketName ?? 'default'}; skipping this socket`);
+          continue;
+        }
+        owner = reProbed;
+      }
     }
 
     try {

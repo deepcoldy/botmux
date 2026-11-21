@@ -1,0 +1,97 @@
+name: README badges
+
+# Refreshes the data behind the README's npm downloads, CI and Midscene E2E
+# badges (scripts/update-badges.mjs). shields.io reads the files from the
+# orphan `badges` branch, which holds one force-pushed commit, so updates never
+# touch master and, pushed with GITHUB_TOKEN, start no other workflow.
+
+on:
+  workflow_run:
+    workflows: [CI, Midscene E2E]
+    types: [completed]
+    branches: [master]
+  schedule:
+    # npm publishes download counts once a day.
+    - cron: '23 3 * * *'
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/badges.yml'
+      - 'scripts/update-badges.mjs'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    # Forks would publish a badges branch of their own. A run cancelled because a
+    # newer merge superseded it changes no badge, so it starts nothing.
+    if: >-
+      github.repository == 'deepcoldy/botmux' &&
+      (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'cancelled')
+    # Job level, so a skipped run takes no slot. One update runs to the end and
+    # GitHub keeps only the newest waiting one. Cancelling would restart the wait
+    # for a runner on every upstream completion; while Actions is backed up, no
+    # update would ever be published.
+    concurrency:
+      group: readme-badges
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Load the published badge files
+        id: published
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/badges"
+          # A source that cannot be read keeps its published file, so start from those.
+          set +e
+          git ls-remote --exit-code origin refs/heads/badges > /dev/null
+          found=$?
+          set -e
+          case $found in
+            0)
+              git fetch -q --depth 1 origin refs/heads/badges
+              git archive FETCH_HEAD | tar -x -C "$RUNNER_TEMP/badges"
+              echo "tree=$(git rev-parse 'FETCH_HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+              ;;
+            2) echo "No badges branch yet." ;;
+            *) exit "$found" ;;
+          esac
+
+      - name: Compute badge data
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/update-badges.mjs "$RUNNER_TEMP/badges"
+
+      - name: Publish to the badges branch
+        env:
+          PUBLISHED_TREE: ${{ steps.published.outputs.tree }}
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          export GIT_INDEX_FILE="$RUNNER_TEMP/badges.index"
+          for file in "$RUNNER_TEMP"/badges/*.json; do
+            git update-index --add --cacheinfo "100644,$(git hash-object -w "$file"),$(basename "$file")"
+          done
+          tree=$(git write-tree)
+          if [[ "$tree" == "$PUBLISHED_TREE" ]]; then
+            echo "Badge data unchanged."
+            exit 0
+          fi
+          commit=$(git commit-tree "$tree" -m "chore(badges): update README badge data (${GITHUB_SHA::7})")
+          git push -q --force origin "$commit:refs/heads/badges"
+          echo "Published $commit."

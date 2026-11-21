@@ -234,7 +234,33 @@ export const createPluginCommandGateway = (options: PluginCommandGatewayOptions)
     }
   };
 
+  /** Notify enabled opt-in services after close; no plugin may shadow the built-in command. */
+  const afterClose = async (invocation: PluginCommandInvocation): Promise<PluginCommandOutcome[]> => {
+    if (invocation.command !== '/close' || invocation.chat.chatType !== 'group'
+      || !invocation.sender.openId || !invocation.privileges.canOperate || !invocation.privileges.canTalk) return [];
+    try {
+      const ids = enabledRecords(invocation.larkAppId).filter(record => commandsFor(record)?.afterClose === true).map(record => record.id);
+      return await Promise.all(ids.map(async id => {
+        try {
+          // Recheck enablement immediately before IO after an asynchronous close.
+          const records = enabledRecords(invocation.larkAppId);
+          const record = records.find(candidate => candidate.id === id);
+          const contribution = record ? commandsFor(record) : undefined;
+          if (!record || !contribution?.afterClose) return { ok: true as const };
+          const reply = await forward(record, contribution, records, invocation);
+          return reply ? { ok: true as const, reply } : { ok: true as const };
+        } catch (error) { return { ok: false as const, error: safeErrorCode(error) }; }
+      }));
+    } catch { return [{ ok: false, error: 'plugin_command_registry_unavailable' }]; }
+  };
+
   return {
+    /** Whether an enabled close hook explicitly owns personal classification cleanup. */
+    replacesCloseTag(larkAppId: string): boolean {
+      try { return enabledRecords(larkAppId).some(record => commandsFor(record)?.afterClose === true && commandsFor(record)?.replacesCloseTag === true); }
+      catch { return false; }
+    },
+    afterClose,
     list,
     table: (larkAppId: string): PluginCommandTable =>
       new Map(list(larkAppId).map(entry => [entry.name, entry.pluginId] as const)),

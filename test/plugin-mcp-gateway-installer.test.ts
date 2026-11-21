@@ -257,6 +257,66 @@ describe('plugin MCP Gateway installer', () => {
     expect(traex.sandboxReadonlyPaths?.()).toContain(path);
   });
 
+  // `traex mcp add` (traecli 0.213.1) rewrites traecli.toml wholesale: it drops
+  // our start marker, reorders keys, prints 600 as 600.0 and leaves the end
+  // marker after the next table. The botmux table itself is still valid.
+  function traexRewrittenConfig(command: string, timeoutSec: number): string {
+    return [
+      '[mcp_servers.botmux]',
+      `command = ${JSON.stringify(command)}`,
+      'args = ["mcp", "serve"]',
+      `env_vars = [${MCP_GATEWAY_FORWARDED_ENV_KEYS.map(value => JSON.stringify(value)).join(', ')}]`,
+      `tool_timeout_sec = ${timeoutSec}.0`,
+      '',
+      '[mcp_servers.other]',
+      'command = "/bin/true"',
+      '# <<< botmux mcp gateway',
+      '',
+    ].join('\n');
+  }
+
+  function installedTimeoutSec(path: string): number {
+    return Number(/^tool_timeout_sec = (\d+)$/m.exec(readFileSync(path, 'utf8'))![1]);
+  }
+
+  it('accepts the TraeX config as the CLI rewrote it, without rewriting it again', () => {
+    const traex = createTraexAdapter('/bin/traex');
+    const path = traex.mcpGateway!.configPath;
+    expect(ensureGatewayEntry(traex).state).toBe('installed');
+    const rewritten = traexRewrittenConfig(process.env.BOTMUX_BIN_PATH!, installedTimeoutSec(path));
+    writeFileSync(path, rewritten);
+
+    expect(inspectGatewayEntry(traex).state).toBe('configured');
+    expect(ensureGatewayEntry(traex).state).toBe('unchanged');
+    expect(ensureGatewayEntry(createCocoAdapter('/bin/coco')).state).toBe('unchanged');
+    expect(readFileSync(path, 'utf8')).toBe(rewritten);
+  });
+
+  it('still replaces a CLI-rewritten botmux entry whose values are stale', () => {
+    const traex = createTraexAdapter('/bin/traex');
+    const path = traex.mcpGateway!.configPath;
+    expect(ensureGatewayEntry(traex).state).toBe('installed');
+    writeFileSync(path, traexRewrittenConfig('/old/botmux', installedTimeoutSec(path)));
+
+    expect(ensureGatewayEntry(traex).state).toBe('installed');
+    const text = readFileSync(path, 'utf8');
+    expect(text).not.toContain('/old/botmux');
+    expect(text).toContain(`command = ${JSON.stringify(process.env.BOTMUX_BIN_PATH)}`);
+    expect(text).toContain('[mcp_servers.other]\ncommand = "/bin/true"');
+    expect(text.match(/\[mcp_servers\.botmux\]/g)).toHaveLength(1);
+    expect(ensureGatewayEntry(traex).state).toBe('unchanged');
+  });
+
+  it('does not report a commented-out or partial botmux table as configured', () => {
+    const traex = createTraexAdapter('/bin/traex');
+    const path = traex.mcpGateway!.configPath;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, '# [mcp_servers.botmux]\n# command = "botmux"\n\n[mcp_servers.other]\ncommand = "/bin/true"\n');
+    expect(inspectGatewayEntry(traex).state).toBe('absent');
+    writeFileSync(path, '[mcp_servers.botmux.env]\nBOTMUX_SESSION_ID = "x"\n');
+    expect(inspectGatewayEntry(traex).state).toBe('absent');
+  });
+
   it.each([createTraexAdapter, createCocoAdapter])('resolves TRAE_HOME dynamically for config installation and sandbox reads (%#)', (createAdapter) => {
     const adapter = createAdapter('/bin/traecli');
     for (const configured of ['~/custom-trae', join(home, 'absolute-trae')]) {

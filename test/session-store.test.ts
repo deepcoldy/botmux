@@ -6,6 +6,9 @@
  *
  * Run:  pnpm vitest run test/session-store.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import {
@@ -13,6 +16,8 @@ import {
 } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { tmpdir } from 'os';
+import { readCodexModelLaunchReceipt, recordCodexModelLaunch, refreshCodexModelSelection, spawnWithCodexModelLaunch } from '../src/services/codex-model-selection.js';
+import { resolveSessionLaunchModel } from '../src/core/session-model.js';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -33,17 +38,23 @@ vi.mock('node:fs', async (importOriginal) => {
   };
 });
 
-// Mock config so we can point session.dataDir at a temp directory
+// Override the store directory while retaining real configuration helpers
+// used by the integrated worktree creation path.
 let tempDir: string;
 let testWorktreeDirs = new Set<string>();
 
-vi.mock('../src/config.js', () => ({
-  config: {
-    session: {
-      get dataDir() { return tempDir; },
+vi.mock('../src/config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/config.js')>();
+  return {
+    ...actual,
+    config: {
+      ...actual.config,
+      session: {
+        get dataDir() { return tempDir; },
+      },
     },
-  },
-}));
+  };
+});
 
 // Mock logger to suppress output
 vi.mock('../src/utils/logger.js', () => ({
@@ -116,9 +127,11 @@ import {
   readTrustedMessageProvenance,
 } from '../src/services/session-store.js';
 import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lane-outbound-provenance.js';
+import { topicResumeBlockReason } from '../src/core/topic-session-continuity.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 import { paneLaunchDir, writePaneLaunchFile } from '../src/adapters/backend/pane-launch.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
+import { sessionContractStore } from '../src/services/session-contract-store.js';
 import {
   clearCodexInstanceBots,
   registerCodexInstanceBot,
@@ -194,6 +207,49 @@ afterEach(() => {
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
+describe('native Codex model preference persistence', () => {
+  it('keeps a native choice through a real SQLite store reopen', () => {
+    const session = createSession('chat-model', 'root-model', 'native model');
+    Object.assign(session, { cliId: 'codex', cliSessionId: 'native-1', model: 'A', backendType: 'tmux' });
+    recordCodexModelLaunch(session, 'A', 1000);
+    updateSession(session);
+    const path = join(tempDir, 'rollout-model.jsonl');
+    writeFileSync(path, JSON.stringify({ timestamp: new Date(2000).toISOString(), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'B' } },
+    }) + '\n');
+    refreshCodexModelSelection(session, path, 'A');
+    recordCodexModelLaunch(session, 'B', 3000);
+    updateSession(session);
+    init('test-app');
+    const restored = getSession(session.sessionId)!;
+    expect(resolveSessionLaunchModel({ session: restored }, { cliId: 'codex', model: 'C' })).toBe('B');
+    expect(readPersistedRows(tempDir, 'test-app')[session.sessionId].codexModelSelection.override).toBe('B');
+  });
+
+  it('rolls back a failed row write and can recover the choice from native settings on retry', () => {
+    const session = createSession('chat-model-fail', 'root-model-fail', 'native model');
+    Object.assign(session, { cliId: 'codex', cliSessionId: 'native-1', model: 'A' });
+    recordCodexModelLaunch(session, 'A', 1000);
+    updateSession(session);
+    const path = join(tempDir, 'rollout-model-fail.jsonl');
+    writeFileSync(path, JSON.stringify({ timestamp: new Date(2000).toISOString(), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'B' } },
+    }) + '\n');
+    refreshCodexModelSelection(session, path, 'A');
+    recordCodexModelLaunch(session, 'B', 3000);
+    __testOnly_setBeforeRowPersist(() => { throw new Error('injected row failure'); });
+    expect(() => updateSession(session)).toThrow('injected row failure');
+    expect(session.codexModelSelection?.override).toBeUndefined();
+    expect(session.codexModelSelection?.launchStartedAtMs).toBe(1000);
+    __testOnly_setBeforeRowPersist(undefined);
+    refreshCodexModelSelection(session, path, 'A');
+    recordCodexModelLaunch(session, 'B', 4000);
+    updateSession(session);
+    init('test-app');
+    expect(getSession(session.sessionId)?.codexModelSelection?.override).toBe('B');
+  });
+});
+
 describe('principal lane durable store', () => {
   const appId = 'app-principal-lanes';
   const now = '2026-09-19T08:00:00.000Z';
@@ -208,6 +264,53 @@ describe('principal lane durable store', () => {
     updateSession(session);
     return session;
   }
+
+  function protectedEgressPolicy(suffix = 'fixture') {
+    return {
+      pluginId: `${suffix}-plugin`,
+      capabilityId: `${suffix}.actor-write.v1`,
+      policy: {
+        id: `${suffix}.write.v1`,
+        targets: [{
+          scheme: 'https' as const,
+          host: `${suffix}.internal.example`,
+          port: 443,
+          denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+        }],
+      },
+      policyDigest: suffix[0]!.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    };
+  }
+
+  it('carries a frozen protected egress policy through stale metadata writes', () => {
+    const source = sourceSession('root-egress-stale', 'on_source', 'ou_source');
+    const staleWriter = structuredClone(source);
+    source.protectedHttpEgressPolicy = protectedEgressPolicy();
+    updateSession(source);
+
+    staleWriter.title = 'unrelated stale metadata update';
+    updateSession(staleWriter);
+
+    expect(getSessionFresh(source.sessionId)?.protectedHttpEgressPolicy)
+      .toEqual(source.protectedHttpEgressPolicy);
+    init(appId);
+    expect(getOwnedSession(source.sessionId)?.protectedHttpEgressPolicy)
+      .toEqual(source.protectedHttpEgressPolicy);
+  });
+
+  it('refuses to replace an already frozen protected egress policy', () => {
+    const source = sourceSession('root-egress-conflict', 'on_source', 'ou_source');
+    source.protectedHttpEgressPolicy = protectedEgressPolicy();
+    updateSession(source);
+    const conflictingWriter = structuredClone(source);
+    conflictingWriter.protectedHttpEgressPolicy = protectedEgressPolicy('replacement');
+
+    expect(() => updateSession(conflictingWriter))
+      .toThrow('Protected HTTP egress policy is immutable');
+    expect(getSessionFresh(source.sessionId)?.protectedHttpEgressPolicy)
+      .toEqual(source.protectedHttpEgressPolicy);
+  });
 
   function initializeSourceGitRepository(): void {
     if (existsSync(join(tempDir, '.git'))) return;
@@ -633,17 +736,34 @@ describe('principal lane durable store', () => {
     } finally { db.close(); }
   });
 
-  it('freezes the network policy in shadow lanes and restores it without the XPI ingress flag', () => {
+  it('freezes network and protected egress policies in shadow lanes and restores them without the XPI ingress flag', () => {
     const source = sourceSession('root-shadow-network', 'on_source', 'ou_source');
     source.backendType = 'pty';
     source.sandbox = true;
     source.sandboxNetwork = true;
+    source.sandboxWithholdBotSecret = true;
     source.sandboxNetworkPolicy = {
       version: 1, public: { mode: 'allow' },
       private: { mode: 'allowlist', rules: [{ cidr: '10.77.0.1', protocol: 'tcp', ports: [443] }] },
       dnsServers: ['1.1.1.1'],
     };
+    source.protectedHttpEgressPolicy = {
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy: {
+        id: 'fixture.write.v1',
+        targets: [{
+          scheme: 'https',
+          host: 'fixture.internal.example',
+          port: 443,
+          denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+        }],
+      },
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    };
     const frozen = structuredClone(source.sandboxNetworkPolicy);
+    const frozenProtectedEgress = structuredClone(source.protectedHttpEgressPolicy);
     updateSession(source);
     expect(ensurePrincipalLaneSource({
       sourceSessionId: source.sessionId,
@@ -654,16 +774,25 @@ describe('principal lane durable store', () => {
       identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' }, now,
     });
     if (shadow.status !== 'ready') throw new Error('expected ready shadow lane');
-    expect(shadow.session).toMatchObject({ sandbox: true, sandboxNetwork: true, sandboxNetworkPolicy: frozen });
+    expect(shadow.session).toMatchObject({
+      sandbox: true,
+      sandboxNetwork: true,
+      sandboxWithholdBotSecret: true,
+      sandboxNetworkPolicy: frozen,
+      protectedHttpEgressPolicy: frozenProtectedEgress,
+    });
     // Mutate the actual stored source, including nested arrays: copying only
     // the outer object must not weaken the child policy.
     const storedSource = getOwnedSession(source.sessionId)!;
     storedSource.sandboxNetworkPolicy!.private.rules![0]!.ports!.push(80);
     storedSource.sandboxNetworkPolicy!.dnsServers!.push('8.8.8.8');
     updateSession(storedSource);
+    storedSource.protectedHttpEgressPolicy!.frozenAddresses[0]!.push('10.20.30.41');
     expect(shadow.session.sandboxNetworkPolicy).toEqual(frozen);
+    expect(shadow.session.protectedHttpEgressPolicy).toEqual(frozenProtectedEgress);
     init(appId);
     expect(getOwnedSession(shadow.session.sessionId)?.sandboxNetworkPolicy).toEqual(frozen);
+    expect(getOwnedSession(shadow.session.sessionId)?.protectedHttpEgressPolicy).toEqual(frozenProtectedEgress);
   });
 
   it('publishes one isolated worktree proof atomically and hydrates only that shadow cwd', async () => {
@@ -2436,6 +2565,17 @@ describe('createSession()', () => {
     });
   });
 
+  it('round-trips the frozen legacy reply delivery across store reloads', () => {
+    const session = createSession('chat-legacy-delivery', 'root-legacy-delivery', 'Legacy pane');
+    session.replyDeliveryLegacy = { cliId: 'claude-code', mode: 'transcript' };
+    updateSession(session);
+
+    init('other-app');
+    init('test-app');
+    expect(getSessionFresh(session.sessionId)?.replyDeliveryLegacy)
+      .toEqual({ cliId: 'claude-code', mode: 'transcript' });
+  });
+
   it('should default chatType to undefined when not provided', () => {
     const session = createSession('chat1', 'root1', 'No ChatType');
     expect(session.chatType).toBeUndefined();
@@ -2640,6 +2780,22 @@ describe('write health gate', () => {
 });
 
 describe('closeSession()', () => {
+  it('preserves the first durable close time and usage when cleaning a stale active cache', () => {
+    const session = createSession('chat1', 'root1', 'stale active cache');
+    session.previewTarget = { host: '127.0.0.1', port: 4173, registeredAt: new Date().toISOString() };
+    updateSession(session);
+    const ref = { appId: 'test-app', sessionId: session.sessionId }; const contract = sessionContractStore(tempDir, ref.appId);
+    contract.ensure(ref); const { operation } = contract.beginOperation(ref, 'close');
+    contract.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+    const first = readPersistedRows(tempDir, 'test-app')[session.sessionId];
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date(Date.parse(first.closedAt!) + 3_600_000)); closeSession(session.sessionId);
+      const after = getSession(session.sessionId)!;
+      expect(after.closedAt).toBe(first.closedAt); expect(after.previewTarget).toBeUndefined();
+      expect(after.tokenUsage).toEqual(first.tokenUsage); expect(after.status).toBe('closed');
+    } finally { vi.useRealTimers(); }
+  });
   it.each(['active', 'closed'] as const)('cancels staged XPI work when closing a %s session', (status) => {
     const session = createSession('chat-xpi-close', 'root-xpi-close', 'Cancel protocol work');
     session.status = status;
@@ -2691,6 +2847,24 @@ describe('closeSession()', () => {
     expect(existsSync(unread.path)).toBe(false);
     expect(existsSync(paneLaunchDir(tempDir, closing.sessionId))).toBe(false);
     expect(existsSync(sibling.path)).toBe(true);
+  });
+
+  it('removes the Codex launch receipt of the closed session only', () => {
+    const closing = createSession('chat1', 'root-receipt-close', 'Close With Receipt');
+    const other = createSession('chat1', 'root-receipt-other', 'Stays Open');
+    const writeReceipt = (sessionId: string): void => spawnWithCodexModelLaunch({
+      dataDir: tempDir, sessionId,
+      launch: { model: 'gpt-test', startedAtMs: 1234 },
+      spawn: () => {}, reattached: () => false, publish: () => {},
+    });
+    writeReceipt(closing.sessionId);
+    writeReceipt(other.sessionId);
+    expect(readCodexModelLaunchReceipt(tempDir, closing.sessionId)).toBeDefined();
+
+    closeSession(closing.sessionId);
+
+    expect(readCodexModelLaunchReceipt(tempDir, closing.sessionId)).toBeUndefined();
+    expect(readCodexModelLaunchReceipt(tempDir, other.sessionId)).toBeDefined();
   });
 
   it('snapshots token usage in the same durable close write', () => {
@@ -3173,6 +3347,17 @@ describe('closeSession()', () => {
 });
 
 describe('reactivateClosedSession()', () => {
+  it('still reactivates when the structured session turns side-store is unreadable', () => {
+    const session = createSession('chat-turns-corrupt', 'root-turns-corrupt', 'Corrupt Turns Store');
+    closeSession(session.sessionId);
+    // Emulate a torn write / disk fault in the non-essential read model store.
+    writeFileSync(join(tempDir, 'session-turns', 'turns.sqlite'), `not a database${'x'.repeat(256)}`);
+    const result = reactivateClosedSession(session.sessionId);
+    expect(result.ok).toBe(true);
+    init('test-app');
+    expect(getSession(session.sessionId)?.status).toBe('active');
+  });
+
   it.each(['awaiting_classification', 'terminal_notice_pending'] as const)(
     'does not revive %s XPI work left on a legacy closed row', (phase) => {
       const session = createSession('chat-xpi-resume', 'root-xpi-resume', 'Legacy Closed XPI');
@@ -4006,6 +4191,37 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
     expect(onDisk.s1.status).toBe('closed');
     expect(onDisk.s1.closedAt).toBeTruthy();
     expect(onDisk.s1.workerGeneration).toBe(7);
+  });
+
+  it('a host close (offline `botmux delete`) stamps userClosedAt so the topic cannot auto-resume it', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA' }) });
+
+    const published = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    );
+
+    expect(published).toMatchObject({ outcome: 'applied' });
+    const onDisk = readPersistedSessionRows(tempDir, 'appA');
+    expect(onDisk.s1.userClosedAt).toBeTruthy();
+    expect(topicResumeBlockReason(onDisk.s1 as any)).toBe('user_closed');
+  });
+
+  it('a host prune (ledger-empty cleanup, not a human close) does not stamp userClosedAt', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA' }) });
+
+    const published = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'prune' },
+      { dataDir: tempDir },
+    );
+
+    expect(published).toMatchObject({ outcome: 'applied' });
+    const onDisk = readPersistedSessionRows(tempDir, 'appA');
+    expect(onDisk.s1.status).toBe('closed');
+    expect(onDisk.s1.userClosedAt).toBeUndefined();
+    expect(topicResumeBlockReason(onDisk.s1 as any)).toBeUndefined();
   });
 
   it('reads the fresh row without writing', () => {

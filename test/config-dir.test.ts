@@ -281,9 +281,14 @@ describe('worker pins BOTS_CONFIG onto its CLI child by daemon-frozen provenance
   // registry. Only a LOADED authority is pinned.
   async function childBotsConfig(init: Partial<DaemonToWorker & { type: 'init' }>): Promise<string | null> {
     const dir = realpathSync(root());
+    // The fake CLI publishes its report with tmp + rename: the poll below
+    // returns on existence, and a plain writeFileSync truncate-creates the file
+    // a beat before the bytes land, so the read could see an empty/partial
+    // body under CI contention (bun-test: `JSON Parse error: Unexpected EOF`;
+    // same create-vs-write window strict-env-worker.integration rides out).
     const report = join(dir, 'report.json');
     const cli = join(dir, 'fake-claude');
-    writeFileSync(cli, `#!/usr/bin/env node\nif (process.argv.includes('--version')) { console.log('2.1.0 (Claude Code)'); process.exit(0); }\nrequire('node:fs').writeFileSync(${JSON.stringify(report)}, JSON.stringify({ botsConfig: process.env.BOTS_CONFIG ?? null }));\nconsole.log('Ready >'); setInterval(() => {}, 1000);\n`, { mode: 0o755 });
+    writeFileSync(cli, `#!/usr/bin/env node\nif (process.argv.includes('--version')) { console.log('2.1.0 (Claude Code)'); process.exit(0); }\nconst fs = require('node:fs'); fs.writeFileSync(${JSON.stringify(`${report}.tmp`)}, JSON.stringify({ botsConfig: process.env.BOTS_CONFIG ?? null })); fs.renameSync(${JSON.stringify(`${report}.tmp`)}, ${JSON.stringify(report)});\nconsole.log('Ready >'); setInterval(() => {}, 1000);\n`, { mode: 0o755 });
     const logs: string[] = [];
     const child = spawnNodeTsScript(resolvePath('src/worker.ts'), [], {
       cwd: resolvePath('.'),

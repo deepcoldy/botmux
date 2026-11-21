@@ -1,101 +1,220 @@
-# Voice Summary
+import video_v6_oncall_voice_en from '../../static/img/video-v6-oncall-voice-en.mp4';
 
-Turn the AI's text reply into a **voice message** in your Lark group with one click. Every reply card gets a "🔊 Voice Summary" button at the bottom — tap it, and the bot condenses that reply into spoken language, synthesizes a voice bubble, and sends it to the current topic.
+# Voice Summary and Speech Recognition
 
-<video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421547656_voice-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+botmux voice works in two directions. Turn on either one, or both:
 
-- **On-demand trigger**: Nothing is generated automatically by default — it only happens when you tap, so you don't get a long voice clip attached to every reply.
-- **Condense first, then synthesize**: After you tap, the model compresses the original reply into a few spoken sentences (stripping out code, paths, links, and other content that doesn't read aloud well), so what you hear is a "plain-speech" summary rather than the original text read verbatim.
-- **Permission gate**: Only members with "chat / operate" permission on that bot can tap it; others who tap get a "needs authorization" prompt.
-- **Generated only once per reply**: The voice for a given reply is generated only once, so multiple taps won't flood the chat.
+| What you want | Feature | Setup command |
+|---|---|---|
+| **Listen** to a long AI reply as audio | Voice summary (TTS, text-to-speech) | `botmux voice` |
+| **Send a voice message** to the bot and have it treated as a text instruction | Speech recognition (ASR, speech-to-text) | `botmux voice asr` |
 
-> Voice is an **optional advanced feature**: you must first configure a text-to-speech (TTS) engine; until you do, the button won't appear on reply cards.
+Both are optional advanced features, off by default. Run `botmux restart` after configuring them.
 
-## Configure the voice engine
+## Voice summary: turn a reply into audio with one tap
 
-Configure interactively with the dedicated command `botmux voice` (deliberately kept separate from `botmux setup`). The configuration is written to the `voice` block of the global `~/.botmux/config.json`, and takes effect after `botmux restart`.
+<video src={video_v6_oncall_voice_en} controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
 
-Four engines are supported. Choose one for your credentials and service:
+Once a voice engine is configured, the bot's reply cards get a "🔊 语音总结" (Voice Summary) button at the bottom. Tap it and:
 
-### ByteDance tenant: SAMI (large-model speech synthesis)
+1. The bot condenses its **previous reply** into at most 5 spoken sentences. It keeps only the conclusions and drops code, commands, paths, links, and anything else that doesn't read aloud well.
+2. It synthesizes a Lark voice message and sends it back to the current session.
 
-Internal ByteDance users can use the company's large-model speech synthesis (SAMI) directly — natural voices, no need to run your own service.
+What you hear is a plain-speech summary, not the original text read word for word.
 
-**① Apply for credentials (one-time)**
+Things to know:
 
-- On the company **Speech Capability Platform**, apply for the "**Speech Synthesis (large model)**" capability (botmux only does synthesis; speech recognition is not needed).
-- You'll get three things: **appkey**, **AccessKey**, **SecretKey**.
-- If you hit a "Namespace not enabled / no route" message, go through internal **Oncall** to have the Speech team enable it in the Ops Center.
+- **Only when you ask**: replies don't get voice clips automatically.
+- **One voice clip per card**: repeated taps, or several people tapping, still produce a single clip. No flooding.
+- **Wait until the session is idle**: tapping while the AI is still working shows "The session is still running". Try again once it stops. An offline session can't generate one either.
+- **Permission gate**: only members allowed to use this bot can tap it. Others see a "not authorized to use this bot" prompt.
+- **No engine, no button.** Broadcast messages the AI sends to the group top level with `--top-level` don't carry the button either.
 
-> To find the application entry, search "Speech Synthesis Large Model / SAMI" on the internal platform, or just ask the Speech team directly.
+### Step 1: Pick a voice engine
 
-**② Configure**
+Run `botmux voice`, choose an engine, and paste your credentials. The config is written to the `voice` block of the global `~/.botmux/config.json`. This command is deliberately kept separate from `botmux setup`.
+
+| Engine | For | What you need | Default voice |
+|---|---|---|---|
+| `[1]` SAMI | ByteDance internal users | appkey, AccessKey, SecretKey | `zh_female_cancan_mars_bigtts` (Cancan) |
+| `[2]` OpenAI-compatible | OpenAI, or a self-hosted TTS service | baseUrl, model, optional apiKey | `alloy` |
+| `[3]` MiniMax | MiniMax open platform API key holders | API key, region | `female-shaonv` |
+| `[4]` Volcengine / Doubao V3 | Volcengine speech accounts | Mode (standard / agent-plan) + that mode's API key | `zh_female_vv_uranus_bigtts` |
+
+The wizard also asks for a voice and a speech-rate multiplier. Press Enter to keep the defaults.
+
+#### SAMI (ByteDance internal)
+
+1. On the company **Speech Capability Platform**, apply for "**Speech Synthesis (large model)**". botmux only synthesizes, so you don't need speech recognition.
+2. You get three items: **appkey**, **AccessKey**, and **SecretKey**. If you see "Namespace not enabled" or "no route", ask the Speech team through internal Oncall to enable it.
+3. Run `botmux voice`, select `[1]`, and paste accessKey / secretKey / appkey in turn.
+
+The service endpoint is built in, so you normally don't fill it in (the wizard asks whether to customize endpoints; press Enter to skip). The SecretKey is only used locally to sign a request for a temporary token. It is never sent out.
+
+#### OpenAI-compatible
+
+Works with OpenAI or a self-hosted service (such as Kokoro-FastAPI or openedai-speech). Prepare three items:
+
+- **baseUrl**: the service address. OpenAI is `https://api.openai.com/v1`. For self-hosted, use your own, e.g. `http://127.0.0.1:8880/v1`.
+- **model**: the model name. OpenAI uses `tts-1`. For self-hosted, follow its docs (e.g. `kokoro`).
+- **apiKey**: the service key. Leave it empty if your self-hosted service has no auth.
+
+Run `botmux voice`, select `[2]`, and fill in the prompts. The voice defaults to `alloy`; for self-hosted, use a voice your service supports.
+
+#### MiniMax (Hailuo speech)
+
+1. Enable text-to-audio (T2A) on the [MiniMax open platform](https://platform.minimax.io) and get an **API key**.
+2. Run `botmux voice`, select `[3]`, paste the API key, then pick a region:
+   - `[1]` Global `api.minimax.io` (default)
+   - `[2]` China `api.minimaxi.com`
+
+**The key and region must match.** A China account on the Global region (or the reverse) fails authentication. The model defaults to `speech-2.8-hd`. If the default voice isn't available on your account, use a system voice id listed in the MiniMax console.
+
+#### Volcengine / Doubao V3
+
+1. Run `botmux voice` and select `[4]`.
+2. Choose a mode (required, no default):
+   - `standard`: a regular pay-as-you-go account
+   - `agent-plan`: a dedicated Ark Agent Plan account
+3. Paste the API key **for that mode**.
+
+The rate defaults to `1` and is clamped to `0.5`–`2` in the request. See "Volcengine advanced notes" at the end for key inheritance, endpoints, and other details.
+
+### Step 2: Install the Opus encoder
+
+Lark voice messages use Opus, so synthesized audio is converted with the system's **opus-tools** (which provides `opusenc`). `botmux voice` checks for it when saving and offers to install it if missing. You can also install it yourself:
 
 ```bash
-botmux voice          # Interactive: select SAMI → paste accessKey / secretKey / appkey in turn
+# Debian / Ubuntu
+sudo apt-get install -y opus-tools
+# macOS
+brew install opus-tools
+```
+
+### Step 3: Restart
+
+```bash
+botmux restart
+```
+
+Reply cards now show the "🔊 语音总结" button at the bottom.
+
+## Speech recognition: send voice to the bot
+
+Once enabled, send the bot a Lark voice message (in a group or inside a topic) and botmux will:
+
+1. Reply with "🎤 正在转写语音…" (transcribing);
+2. Download the audio and transcribe it with the service you configured;
+3. Delete the placeholder and hand the text to the AI, prefixed with "🎤 语音转写：" (voice transcript). It is handled just like a typed instruction. Works for new topics and for follow-ups inside a topic.
+
+If transcription fails (download error, service error, timeout, or an empty result), the bot replies with the reason. The voice message is not passed to the AI, and no empty session is created.
+
+If speech recognition isn't configured, sending a voice message gets a "speech recognition not configured" reply instead. It is not passed to the AI either.
+
+### Configure
+
+Speech recognition uses the OpenAI-compatible `/audio/transcriptions` endpoint (Whisper API format). It works with OpenAI or a self-hosted whisper.cpp server, faster-whisper, and similar.
+
+```bash
+botmux voice asr      # Interactive: baseUrl / apiKey / model, optional language hint
 botmux restart        # Take effect
 ```
 
-The voice defaults to "灿灿" (Cancan), which you can change to another voice id during configuration. The service endpoint is built in, no need to fill it. The SecretKey is only used locally to sign and exchange for a temporary token; it's never sent out.
+| Item | Notes |
+|---|---|
+| baseUrl | Required, e.g. `https://api.openai.com/v1` |
+| model | Required, e.g. `whisper-1` |
+| apiKey | Optional. Leave empty if your self-hosted service has no auth |
+| Language hint | Optional, e.g. `zh`. Passed to the service |
 
-### External users: OpenAI-compatible engine
+Speech recognition and voice summary are independent. You can set up recognition without a voice engine.
 
-External / open-source users can connect any TTS service that's **compatible with the OpenAI speech API** — it can be OpenAI's official service, or self-hosted (e.g. Kokoro-FastAPI, openedai-speech, etc.).
-
-**① Prepare a TTS service, and get three things:**
-
-- **baseUrl**: the service address. OpenAI's official is `https://api.openai.com/v1`; for self-hosted, fill in your own (e.g. `http://127.0.0.1:8880/v1`).
-- **apiKey**: the service key (can be left empty if your self-hosted service has no auth).
-- **model**: the model name. For OpenAI it's `tts-1`; for self-hosted, follow your service's docs (e.g. `kokoro`).
-
-**② Configure**
+## Management commands
 
 ```bash
-botmux voice          # Interactive: select OpenAI-compatible → fill in baseUrl / apiKey / model
-botmux restart        # Take effect
+botmux voice              # Configure voice summary (interactive)
+botmux voice status       # Show voice summary config (credentials masked)
+botmux voice disable      # Delete the whole voice block; the button disappears
+
+botmux voice asr          # Configure speech recognition (interactive)
+botmux voice asr status   # Show speech recognition config
+botmux voice asr disable  # Turn off speech recognition only, keep the rest
 ```
 
-The voice is optional: OpenAI defaults to `alloy`; for self-hosted, fill in a voice your service supports.
+Note that `botmux voice disable` deletes the entire global `voice` block, including the speech recognition config. To turn off recognition only, use `botmux voice asr disable`. In the other direction, re-running `botmux voice` to change engines keeps your existing speech recognition config.
 
-### MiniMax (Hailuo speech)
+All changes need `botmux restart` to take effect.
 
-If you have an API key from the [MiniMax open platform](https://platform.minimax.io), you can use the official T2A v2 speech synthesis directly — no need to run your own service.
+## Config file reference
 
-**① Prepare credentials**
+You can also edit the `voice` block of `~/.botmux/config.json` directly:
 
-- Enable the text-to-audio (T2A) capability on the MiniMax open platform and get an **API key**.
-- Confirm your region: mainland China accounts usually pick "China" (`api.minimaxi.com`); overseas accounts pick "Global" (`api.minimax.io`). **The key and region must match**, otherwise you'll get an auth error.
+```jsonc
+// SAMI (ByteDance internal)
+{
+  "voice": {
+    "engine": "sami",
+    "speaker": "zh_female_cancan_mars_bigtts",   // Optional, defaults to Cancan
+    "sami": { "accessKey": "...", "secretKey": "...", "appkey": "..." }
+  }
+}
 
-**② Configure**
+// OpenAI-compatible
+{
+  "voice": {
+    "engine": "openai",
+    "speaker": "alloy",                            // Optional
+    "openai": { "baseUrl": "https://api.openai.com/v1", "apiKey": "...", "model": "tts-1" }
+  }
+}
 
-```bash
-botmux voice          # Interactive: select [3] MiniMax → paste API key → pick region
-botmux restart        # Take effect
-```
+// MiniMax (region: "cn" China / "global" international, defaults to global)
+{
+  "voice": {
+    "engine": "minimax",
+    "speaker": "female-shaonv",                   // Optional
+    "minimax": { "apiKey": "...", "region": "cn", "model": "speech-2.8-hd" }
+  }
+}
 
-The model defaults to `speech-2.8-hd` and the voice to `female-shaonv`; both can be overridden during configuration or in the config file. If the default voice isn't available on your account (voices can differ across regions / models), just fill in a system voice id listed in the MiniMax console.
-
-### Volcengine / Doubao V3
-
-Run `botmux voice`, select `[4]`, explicitly choose `standard` or `agent-plan`, and enter that mode's dedicated API key. The default speaker is `zh_female_vv_uranus_bigtts` and the default rate is `1`. Positive rates are clamped to `0.5` through `2` in the request.
-
-For a standard account, use this global configuration:
-
-```json
+// Volcengine / Doubao V3 (mode is required: "standard" or "agent-plan")
 {
   "voice": {
     "engine": "volcengine",
-    "volcengine": {
-      "mode": "standard",
-      "apiKey": "<STANDARD_API_KEY>"
-    },
-    "speaker": "zh_female_vv_uranus_bigtts",
-    "rate": 1
+    "volcengine": { "mode": "standard", "apiKey": "<STANDARD_API_KEY>" },
+    "speaker": "zh_female_vv_uranus_bigtts",      // Optional
+    "rate": 1                                     // Optional
+  }
+}
+
+// Speech recognition: can sit in the same voice block as any engine above
+{
+  "voice": {
+    "asr": {
+      "enabled": true,                            // Must be true to take effect
+      "baseUrl": "https://api.openai.com/v1",
+      "apiKey": "...",
+      "model": "whisper-1",
+      "language": "zh",                           // Optional
+      "timeoutMs": 120000                         // Optional, transcription timeout, default 120 s
+    }
   }
 }
 ```
 
-To select a dedicated Agent Plan account for one bot, add this `voice` block to that bot's existing entry in `bots.json`:
+Common fields:
+
+| Field | Notes |
+|---|---|
+| `engine` | `sami` / `openai` / `minimax` / `volcengine` |
+| `speaker` | Voice id. Omit to use the engine's default |
+| `rate` | Speech-rate multiplier, `1` is normal. Each engine clamps it to its own range (0.5–2 for SAMI, MiniMax, and Volcengine; 0.25–4 for OpenAI-compatible) |
+
+### Per-bot configuration
+
+Put a `voice` block with the same structure inside a bot object in `bots.json`. It overlays the global config **field by field**. Bots can share one global config, each have their own, or just change the voice or rate. The `asr` block can be overridden per bot too, but include `"enabled": true` in the bot's own `asr` block. Without it, speech recognition is turned off for that bot.
+
+For example, to switch one bot to a Volcengine Agent Plan account:
 
 ```json
 {
@@ -109,64 +228,14 @@ To select a dedicated Agent Plan account for one bot, add this `voice` block to 
 }
 ```
 
-Set both `engine` and `mode` explicitly. `standard` uses `/api/v3/tts/unidirectional`; `agent-plan` uses `/api/v3/plan/tts/unidirectional`. Both use the fixed host `openspeech.bytedance.com` and resource `seed-tts-2.0`. Chat API URLs and legacy app ID authentication are unsupported. Replace the key placeholders with credentials; they are not environment variable references.
+## Volcengine advanced notes
 
-Switching modes requires an explicit new key. A bot cannot inherit the global key from another mode. Within the same mode, a bot can inherit the key or override just `speaker` or `rate`. `"volcengine": null` or an explicit empty key disables account inheritance. A missing or invalid mode makes the configuration unusable. Failures never retry, follow redirects, or fall back to a standard paid endpoint. The provider determines account billing.
-
-`botmux voice status` shows only whether the new account's key is set. Saving any TTS engine interactively preserves the existing `voice.asr` block. Volcengine returns 24 kHz mono signed 16-bit PCM; Lark voice messages still require the Opus encoder described below.
-
-Synthesis buffers the complete response and returns audio after normal HTTP EOF. Playback is not streamed. The default 60-second deadline covers headers and body reads, including a connection that stays open after the completion record. Client limits are 16 MiB of response bytes, 8 MiB of PCM, and 10000 JSON records. Truncation, malformed data, nonempty audio in the completion record, or exceeded limits fail without returning partial audio.
-
-## System dependencies
-
-The synthesized output needs to be encoded into the opus format used by Lark voice bubbles, which depends on the system's **opus-tools** (providing `opusenc`). **When you run `botmux voice` to configure, it auto-detects this; if it's missing, it asks and installs it for you** (using the same package manager + sudo logic as tmux). You can also install it manually:
-
-```bash
-# Debian / Ubuntu
-sudo apt-get install -y opus-tools
-# macOS
-brew install opus-tools
-```
-
-## Management commands
-
-```bash
-botmux voice          # Configure (interactive)
-botmux voice status   # View the current configuration (credentials auto-masked)
-botmux voice disable  # Turn off voice (removes the configuration, the button disappears with it)
-```
-
-## Config file reference
-
-You can also edit the `voice` block of `~/.botmux/config.json` directly:
-
-```jsonc
-// ByteDance tenant (SAMI)
-{
-  "voice": {
-    "engine": "sami",
-    "speaker": "zh_female_cancan_mars_bigtts",   // Optional, defaults to Cancan
-    "sami": { "accessKey": "...", "secretKey": "...", "appkey": "..." }
-  }
-}
-
-// External users (OpenAI-compatible)
-{
-  "voice": {
-    "engine": "openai",
-    "speaker": "alloy",                            // Optional
-    "openai": { "baseUrl": "https://api.openai.com/v1", "apiKey": "...", "model": "tts-1" }
-  }
-}
-
-// MiniMax (region: "cn" mainland China / "global" international, defaults to global)
-{
-  "voice": {
-    "engine": "minimax",
-    "speaker": "female-shaonv",                   // Optional, defaults to female-shaonv
-    "minimax": { "apiKey": "...", "region": "cn", "model": "speech-2.8-hd" }
-  }
-}
-```
-
-**Per-bot override** is supported: put the same `voice` block inside a bot object in `bots.json`, and it overlays the global config field by field (multiple bots can share one config, or each can have its own).
+- **Set both `engine` and `mode` explicitly.** A missing or invalid mode makes the config unusable (no button). It never silently falls back to another billed endpoint.
+- Both modes use the fixed host `openspeech.bytedance.com` and resource `seed-tts-2.0`: `standard` uses `/api/v3/tts/unidirectional`, `agent-plan` uses `/api/v3/plan/tts/unidirectional`. Chat API URLs and legacy app IDs are not supported.
+- Replace the `<...>` placeholders with real keys. botmux does not read environment variables with those names.
+- **Key inheritance for per-bot overrides**:
+  - Same mode as global: you can omit the key and inherit it, or override just `speaker` or `rate`.
+  - Different mode: you must provide a new key. A key from the other mode is never inherited.
+  - `"volcengine": null` or an empty key: do not inherit the global account.
+- `botmux voice status` only shows whether a key is set, never its value.
+- Audio is sent after the full response arrives; playback is not streamed. The default timeout is 60 seconds. Failed requests are not retried, redirects are not followed, and endpoints are not switched. Incomplete data or oversized responses fail with an error instead of sending partial audio. Billing is determined by the provider.

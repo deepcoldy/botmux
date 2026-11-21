@@ -63,7 +63,9 @@ const SPACER_ELEMENT = { tag: 'markdown', text_size: 'notation', content: ' ' };
  * 返回 null 当且仅当 footer 与控件同时缺失。
  */
 export function buildReplyCardChromeRow(opts: {
-  footer: ReplyCardFooter | null;
+  /** The canonical reply footer, or a card's own signature line (workflow
+   *  node / report cards sign with a plain grey markdown element). */
+  footer: Pick<ReplyCardFooter, 'element'> | { element: Record<string, unknown> } | null;
   controls?: ReadonlyArray<Record<string, unknown>>;
 }): Record<string, unknown> | null {
   const controls = (opts.controls ?? []).filter(Boolean);

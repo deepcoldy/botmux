@@ -1,26 +1,35 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { findRealToolBinary } from '../src/core/cli-identity.js';
+import { createHash } from 'node:crypto';
+import { resolveLarkTestCli } from './helpers/lark-test-cli.js';
 import { larkToolBindingPath, larkToolChildEnv, prepareLarkToolEnv, type LarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { parseLarkToolInvocation, larkToolExecutionArgs } from '../src/core/lark-tool-command.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
-const realCli = findRealToolBinary('lark-cli', process.env.PATH);
+const realCli = resolveLarkTestCli();
+const cliDigest = realCli ? createHash('sha256').update(readFileSync(realCli)).digest('hex') : undefined;
+const verifyCli = () => resolveLarkTestCli({ ...process.env, BOTMUX_TEST_LARK_CLI: realCli!, BOTMUX_TEST_LARK_CLI_SHA256: cliDigest });
 const canIsolateNetwork = process.platform === 'linux' && spawnSync('bwrap', [
   '--unshare-net', '--ro-bind', '/', '/', '--', '/bin/true',
 ], { stdio: 'ignore', timeout: 5000 }).status === 0;
+if (process.env.BOTMUX_TEST_REQUIRE_LARK_CLI === '1' && !canIsolateNetwork) {
+  throw new Error('required lark-cli contract needs working bwrap network isolation');
+}
 describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials)', () => {
   let root: string, binding: LarkToolBinding, server: ReturnType<typeof createServer>, port: number, requests: string[];
   let credentialTypeOverride: string | undefined;
   beforeEach(async () => {
+    verifyCli();
     root = mkdtempSync(join(tmpdir(), 'real-lark-contract-')); requests = [];
     credentialTypeOverride = undefined;
-    binding = prepareLarkToolEnv({ env: { PATH: process.env.PATH }, dataDir: root, sessionId: 'contract', appId: 'cli_contract' });
+    // Build the normal isolated binding without resolving the host's business wrapper.
+    binding = prepareLarkToolEnv({ env: { PATH: process.env.PATH }, effectivePath: '', dataDir: root, sessionId: 'contract', appId: 'cli_contract' });
+    binding.realBinary = realCli!;
     server = createServer(async (req, res) => {
       const parsed = await readRequestBodyJson<{ mode: string }>(req);
       if (!parsed) { res.writeHead(400).end(); return; }
@@ -36,7 +45,11 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
     mkdirSync(join(root, 'home')); binding.ipcPort = port;
     writeFileSync(larkToolBindingPath(root, 'contract'), JSON.stringify(binding), { mode: 0o600 });
   });
-  afterEach(async () => { await new Promise<void>(r => server.close(() => r())); rmSync(root, { recursive: true, force: true }); });
+  afterEach(async () => {
+    if (server?.listening) await new Promise<void>(r => server.close(() => r()));
+    if (root) rmSync(root, { recursive: true, force: true });
+    verifyCli();
+  });
   function run(args: string[]) {
     return new Promise<{ code: number | null; out: string; err: string }>((resolveResult, reject) => {
       const child = spawnTsScript(resolve('src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(root, 'contract'), '--', ...args], {
@@ -50,17 +63,40 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
   it.skipIf(!canIsolateNetwork)('resolves the injected bot token for a real API command before the isolated network rejects it', () => {
     const env = larkToolChildEnv({ ...process.env, HOME: join(root, 'home') }, binding,
       { mode: 'bot', credential: 'fake-not-a-live-token' });
-    const result = spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/', '--',
+    const result = spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/',
+      // The verified headless sandbox exposes this isolated config read-only.
+      // Injected bot credentials must work without writing a global keystore.
+      '--ro-bind', binding.configDir, binding.configDir, '--',
       binding.realBinary, 'api', 'GET', '/open-apis/im/v1/messages/fake-message', '--as', 'bot'], {
       env, encoding: 'utf8', timeout: 10_000,
     });
     expect(result.error).toBeUndefined();
-    // lark-cli 1.0.96 classifies an unreachable API caused by --unshare-net as
+    // lark-cli 1.0.73 classifies an unreachable API caused by --unshare-net as
     // a network error and exits 4. Keep both assertions so a CLI upgrade that
     // changes this contract is diagnosed here instead of being mistaken for an
     // identity-binding regression.
     expect(result.status, result.stderr).toBe(4);
     expect(JSON.parse(result.stderr)).toMatchObject({ identity: 'bot', error: { type: 'network' } });
+  });
+  it.skipIf(!canIsolateNetwork)('preserves the existing immutable managed configuration boundary for persistent event daemons', () => {
+    const configPath = join(binding.configDir, 'config.json');
+    const before = readFileSync(configPath, 'utf8');
+    const env = larkToolChildEnv({ ...process.env, HOME: join(root, 'home') }, binding,
+      { mode: 'bot', credential: 'fake-not-a-live-token' });
+    // Normal chat sessions already mount the whole identity subtree read-only.
+    // Headless adds the same immutable tool/config boundary, not a daemon
+    // lifecycle capability or writable credential/cache tree.
+    const result = spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/',
+      '--ro-bind', binding.configDir, binding.configDir, '--',
+      binding.realBinary, 'event', 'consume', 'im.message.receive_v1', '--as', 'bot', '--timeout', '1s'], {
+      env, encoding: 'utf8', timeout: 10_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(5);
+    expect(result.stderr).toContain('read-only file system');
+    expect(result.stderr).toContain('lark-config/events');
+    expect(existsSync(join(binding.configDir, 'events'))).toBe(false);
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
   });
   it('keeps keyword --as=user and dry-run intact through the real binary', async () => {
     const result = await run(['docs', '+fetch', '--doc', 'doc-fixture', '--scope', 'keyword', '--keyword', '--as=user', '--dry-run']);

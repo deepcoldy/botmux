@@ -32,6 +32,7 @@ import { PtyBackend } from '../src/adapters/backend/pty-backend.js';
 import { isBunRuntime } from './helpers/ts-runner.js';
 import { buildWrappedLaunch } from '../src/setup/cli-selection.js';
 import { installAidenCodexShim } from '../src/services/aiden-codex-shim.js';
+import { ALL_CLI_IDS, createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
@@ -43,6 +44,8 @@ import {
   shellLaunchArgv,
   shellCommandArgv,
 } from '../src/adapters/backend/tmux-backend.js';
+import { tmuxEnv } from '../src/setup/ensure-tmux.js';
+import { userSystemdBusEnv } from '../src/core/session-scope.js';
 
 type ShellKindUnderTest = 'bash' | 'zsh' | 'sh' | 'fish';
 
@@ -297,6 +300,46 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_OWNER_OPEN_ID='))).toBe(false);
   });
 
+  it('forwards the host-resolved dispatch task-tree card switch into panes', () => {
+    // The file-sandboxed CLI cannot read ~/.botmux/config.json; the daemon
+    // projects the resolved value and it reaches the pane only because it is on
+    // the injected-keys allowlist. Removing it from the allowlist drops this.
+    const on = buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: 'true' });
+    expect(on).toContain('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=true');
+    const off = buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: 'false' });
+    expect(off).toContain('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=false');
+    // A non-allowlisted BOTMUX_* knob is not forwarded just by sharing the prefix.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_NOT_A_REAL_KNOB: 'x' }))
+      .not.toContain('BOTMUX_NOT_A_REAL_KNOB=x');
+  });
+
+  it('re-publishes the fenced-run marker so a tmux-family pane cannot derive the host user bus (issue #3174)', () => {
+    // tmuxEnv() strips EVERY BOTMUX* key from the tmux client/server env and the
+    // marker is not in BOTMUX_INJECTED_ENV_KEYS, so the pane can only recover it
+    // through this per-pane env(1) assignment.
+    const fencedWorkerEnv = { PATH: '/usr/bin', HOME: '/tmp/u', BOTMUX_FENCED_RUN: '1' };
+    const stripped = tmuxEnv(fencedWorkerEnv);
+    expect(stripped.BOTMUX_FENCED_RUN).toBeUndefined();
+    const assignments = buildBotmuxEnvAssignments(fencedWorkerEnv);
+    expect(assignments).toContain('BOTMUX_FENCED_RUN=1');
+
+    // Reconstruct the pane env the shell wrapper actually sees: the tmux server
+    // global (marker stripped) overlaid with the per-pane KEY=VAL assignments.
+    const paneEnv: NodeJS.ProcessEnv = { ...stripped };
+    for (const assignment of assignments) {
+      const eq = assignment.indexOf('=');
+      if (eq > 0) paneEnv[assignment.slice(0, eq)] = assignment.slice(eq + 1);
+    }
+    expect(paneEnv.BOTMUX_FENCED_RUN).toBe('1');
+    // Marker restored: no canonical /run/user/<uid>/bus derivation and no socket
+    // probe even when a host bus socket exists.
+    expect(userSystemdBusEnv({ env: paneEnv, isSocket: () => true })).toBeUndefined();
+
+    // Unfenced production panes never emit the marker.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1', PATH: '/usr/bin' })
+      .some(s => s.startsWith('BOTMUX_FENCED_RUN='))).toBe(false);
+  });
+
   it('forwards the reply-card usage visibility into persistent CLI panes', () => {
     const out = buildBotmuxEnvAssignments({
       BOTMUX: '1',
@@ -356,6 +399,18 @@ describe('buildBotmuxEnvAssignments()', () => {
       'EBSD_BOTMUX_REPOSITORY_ROOT=/srv/repos',
       'EBSD_NO_UPDATE_CHECK=1',
     ]));
+  });
+
+  // 适配器 spawnEnv 只写进 worker 的 childEnv；tmux / zellij / zmx 的 pane 不继承
+  // childEnv，只认这条白名单注入。漏登记 = 只有 PTY 后端生效：豆包的
+  // DOUBAO_CLI_NO_UPDATE_CHECK 曾因此在默认的 tmux 后端失效，每次启动都卡在
+  // 启动器的 `Update now? [Y/N]`，只能打开 Web 终端手动输 N。
+  it.each(ALL_CLI_IDS)('forwards every spawnEnv key of the %s adapter into the pane', (id) => {
+    const spawnEnv = createCliAdapterSync(id, '/usr/bin/true').spawnEnv ?? {};
+    const out = buildBotmuxEnvAssignments({ BOTMUX: '1', ...spawnEnv });
+    for (const [key, value] of Object.entries(spawnEnv)) {
+      expect(out).toContain(`${key}=${value}`);
+    }
   });
 
   it('forwards list-bots API discovery flags so CLI bots list matches daemon behavior', () => {

@@ -38,7 +38,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
     const {
       logScreenshotSkip, backend, renderCols, renderRows,
       renderer, createHash, clamp, captureToPng, uploadImageBuffer, logError,
-      projectedRuntimeScreenStatus, send, classifyScreenUsageLimit, log,
+      projectedRuntimeScreenStatus, send, classifyScreenUsageLimit, log, cliAdapter,
     } = deps;
     // Production snapshotToPng reports the canvas grid it rendered; mocks that
     // omit it default to the render grid.
@@ -90,6 +90,57 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
 afterEach(() => vi.useRealTimers());
 
 describe('worker screenshot upload hardening', () => {
+  it('delivers an unchanged-pixel recovery edge once without continuously reuploading it', async () => {
+    let usageLimitRecovery: 'antigravity-ready-composer' | undefined;
+    const send = vi.fn();
+    const uploadImageBuffer = vi.fn(async () => `img_${uploadImageBuffer.mock.calls.length}`);
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(),
+      snapshotToPng: vi.fn(async () => ({ ansi: 'same-frame', png: Buffer.from('png'), content: 'same-frame' })),
+      backend: {}, renderCols: 80, renderRows: 24, renderer: null,
+      createHash: vi.fn(), clamp: vi.fn(), captureToPng: vi.fn(), uploadImageBuffer,
+      logError: vi.fn(), log: vi.fn(), projectedRuntimeScreenStatus: () => 'idle', send,
+      classifyScreenUsageLimit: () => ({ status: 'idle', ...(usageLimitRecovery ? { usageLimitRecovery } : {}) }),
+      currentBotmuxTurnId: 'turn_1', currentBotmuxDispatchAttempt: 1,
+      cliAdapter: { id: 'antigravity' },
+    });
+
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[0].usageLimitRecovery).toBeUndefined();
+
+    usageLimitRecovery = 'antigravity-ready-composer';
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]?.[0]).toMatchObject({
+      type: 'screenshot_uploaded', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer',
+    });
+    expect(uploadImageBuffer).toHaveBeenCalledTimes(2);
+
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(uploadImageBuffer).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps other CLIs on the original unchanged-pixel fast path without reclassifying', async () => {
+    const classifyScreenUsageLimit = vi.fn(() => ({ status: 'idle' }));
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(),
+      snapshotToPng: vi.fn(async () => ({ ansi: 'same-frame', png: Buffer.from('png'), content: 'same-frame' })),
+      backend: {}, renderCols: 80, renderRows: 24, renderer: null,
+      createHash: vi.fn(), clamp: vi.fn(), captureToPng: vi.fn(),
+      uploadImageBuffer: vi.fn(async () => 'img'), logError: vi.fn(), log: vi.fn(),
+      projectedRuntimeScreenStatus: () => 'idle', send: vi.fn(), classifyScreenUsageLimit,
+      currentBotmuxTurnId: 'turn_1', currentBotmuxDispatchAttempt: 1,
+      cliAdapter: { id: 'codex' },
+    });
+
+    await harness.captureAndUpload();
+    const initialClassifications = classifyScreenUsageLimit.mock.calls.length;
+    await harness.captureAndUpload();
+    expect(classifyScreenUsageLimit).toHaveBeenCalledTimes(initialClassifications);
+  });
+
   it('single-flights a hanging upload, stays responsive, then retries the failed unchanged frame', async () => {
     vi.useFakeTimers();
 
@@ -404,6 +455,8 @@ function executeProductionSetCaptureIdentity(send: (msg: unknown) => void): Iden
     { compilerOptions: { module: ts.ModuleKind.None, target: ts.ScriptTarget.ES2022 } },
   ).outputText;
   const factory = new Function('send', `
+    const workerSessionEventScope = undefined;
+    const lastInitConfig = undefined;
     let currentBotmuxTurnId;
     let currentBotmuxDispatchAttempt;
     let captureRevision = 0;
@@ -467,7 +520,13 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       expect(found).toBeDefined();
       return found!;
     };
-    const functions = ['setCaptureIdentity', 'markTurnRetired', 'advanceQueuedTypeAheadTurn', 'acknowledgeTurnInputCommitted']
+    const functions = [
+      'setCaptureIdentity',
+      'markTurnRetired',
+      'rememberQueuedTurnAdvanceForPendingReady',
+      'advanceQueuedTypeAheadTurn',
+      'acknowledgeTurnInputCommitted',
+    ]
       .map(name => findNode(node => ts.isFunctionDeclaration(node) && node.name?.text === name).getText(tree));
     const preparation = findNode(node => ts.isVariableDeclaration(node)
       && ts.isIdentifier(node.name) && node.name.text === 'prepareNormalWrite') as ts.VariableDeclaration;
@@ -480,12 +539,24 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
     ).outputText;
     const send = vi.fn();
     const harness = new Function('send', 'isCodexAppCliId', `
+      const workerSessionEventScope = undefined;
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
-      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt = false;
+      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt, cliSubmissionInFlight = null;
+      const ptyOutputGeneration = { snapshot: () => 7 };
+      // The flush write-edge preferred-model hold references these traex
+      // symbols; this scenario is traex-agnostic, so stub them to make the
+      // hold a no-op (undefined controller short-circuits the optional chain).
+      const traexAutoModelController = undefined;
+      const traexAutoModelRuntimeEligible = () => false;
+      // This scenario has no writable Web terminal: the dirty-wire write gate
+      // must stay open for the queue-only capture identity harness.
+      const webTerminalInputWireDirty = () => false;
       const retiredTurnIds = new Set();
       const started = [];
       const syncQueuedTurnsFromMarkerDisk = () => false;
+      // No terminal has gone out for any queued record in this scenario.
+      const turnTerminalEmitted = () => false, dropQueuedTurnRecord = () => false;
       const readSendMarkers = () => [];
       const markActiveTurnStarted = record => started.push(record);
       const writeCliPidMarker = () => {}, publishSandboxRelayCapability = () => {}, log = () => {};
@@ -500,6 +571,10 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       const usageLimitTracker = { beginTurn: () => 1 }, currentUsageLimitSnapshot = () => undefined;
       const claudeBridgeActive = false, codexBridgeActive = false;
       const lastInitConfig = { cliId: 'dsh-tui' }, cliAdapter = { reliableTurnTerminal: false };
+      // Durable output handoff is negotiated per worker init; this queue-only
+      // harness runs without one, so the fence write stays inert (the guard
+      // short-circuits before TurnSendLedger is touched).
+      const universalOutputHandoff = undefined;
       const stampMojoTurnMark = () => {}, markTurnExecutionStart = () => {};
       const logicalMsg = 'queued input', msg = logicalMsg;
       let submissionPreparationFailed = false;

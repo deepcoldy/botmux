@@ -111,7 +111,37 @@ Botmux 从来不做简单的“套壳”，而是针对企业级复杂多会话�
 
 ---
 
-## 四、写在最后：给开发者的一句话
+## 四、各 CLI 支持情况与版本门槛
+
+只有适配器声明了 `supportsProgramStatus` 的 CLI，worker 才会在输出流上挂 `ProgramStatusFramingStream` 解析 7501；其它 CLI 的 7501 字节按普通输出处理。声明了版本门槛（`programStatusMinVersion`）的适配器，只在 daemon 探测到的安装版本不低于门槛时解析；版本未知、较旧、adopt 的既有窗格、RPC `--remote` 查看器一律走读屏，行为与接入前一致（`src/core/program-status-gate.ts`）。
+
+| CLI | 版本门槛 | 探测握手 | 启动期报告 | 说明 |
+| :--- | :--- | :--- | :--- | :--- |
+| Claude Code | 无 | 发 `7501;?`，tmux 走 pane 内中继抢答（#1881） | 可信（配合启动横幅门控） | 最早接入（#1781） |
+| Pi | 无 | 发 `7501;?` | 可信 | #1813 |
+| Kimi Code | 无 | tmux 下不发，靠 `PI_PROGRAM_STATUS=1` 强制开启；报告包在 tmux 透传封套里 | 首条输入后先报 `clear`+`idle`，提交后须等到 busy（`programStatusSubmitAwaitsBusy`） | #2640、#2665 |
+| oh-my-pi | 18.10 起才发（老版本自然走读屏） | 不发 | `init()` 时的 `idle` 早于输入框可用，启动期不信（`programStatusStartupIdleUntrusted`） | |
+| Codex | **≥ 0.163.0** | 不发，无条件直发，tmux pipe-pane 直接收到 | **不信**：见下 | 0.163.0 引入（openai/codex#52725，idle/working/blocked），0.164.0 补 `done`/`error` 与 `kind=permission\|question\|auth`（#54114）；0.162.0 不发 |
+| TraeX（traecli） | **≥ 0.214.1** | 不发 | 只作「输入框就绪」的旁证：见下 | 0.213.1 不发 |
+
+### Codex / TraeX 的状态语义（真机录制）
+
+报文均为裸 OSC、ST 终止、冒号分隔：`ESC ] 7501 ; state=working:app=codex ESC \`（TraeX 为 `app=traecli`）。在私有 tmux（pipe-pane）与 PTY 两种后端下录到的顺序（字节夹具见 `test/fixtures/program-status/codex-traex-osc7501.json`）：
+
+- **启动**：Codex 在「临时输入框」（底栏还没画出、尚不接受输入，即 #3289 的画面）就报 `idle`，紧接着 `working` → `idle`；有慢 MCP server 时会一直 `working` 到 server 起来，而这期间输入框已经能接收并执行消息。TraeX 在输入框可用时报 `idle`（即使底栏只有快捷键提示、模型列表拉取卡住），MCP 启动期同样报 `working`；但恢复一个被别的进程占用的会话时，`idle` 和「会话被锁」页面在同一批输出里。信任、hooks 审核、登录页不发任何报告。
+- **一轮对话**：第一个按键时先报 `idle`（确认上一轮的 `done`），再 `working` → `done`（Codex 0.163 为 `idle`）。审批弹窗报 `blocked:kind=permission`，批准后回到 `working`。在 MCP 启动期写入的首条消息不再报 `working`，只报该轮的 `done`。
+- **不启动对话的命令**（`/status`、`/clear`、`/rename`）：不发任何报告。
+
+botmux 据此的接法（`programStatusFollowsInputCycle` 等适配器开关，见 `src/adapters/cli/types.ts`）：
+
+1. **启动期只记不用**：第一次写入前的报告不产生空闲/忙碌边沿，首条消息仍由各自的读屏门控放行（Codex 的空输入框判定 #3289、TraeX 的启动横幅/底栏判定）。第一个 `idle` 对 Codex 是假就绪，对 TraeX 可能紧跟着锁页。唯一的用处：TraeX 最近一次报告是 `idle` 且没有 Web 终端输入时，屏幕上的底栏即使是谓词不认识的新布局，也不再拦下首条消息等到 90 秒硬超时（#3307、#3338 那类）。报告只说明「没在跑一轮」，不说明输入框在屏上：此时渲染画面仍须有提示符行、且没有任何已知阻断页（会话锁、hooks 审核、迁移菜单）或由它们挂起的输入拦截，否则照旧由谓词判定——锁页上发出 prompt_ready 会让 daemon 把锁页卡片改成已完成、废掉它的重试按钮。放行时机仍是屏幕静默。
+2. **每次写入后先交给读屏，直到 CLI 报 busy**：写入与 `working` 之间的 `idle` 是对上一轮的确认，忽略；`/status` 这类不报告的命令由屏幕静默收尾，不会卡住。CLI 一报 `working`/`blocked` 就接管：`blocked` 期间不结束本轮，`done`/`error` 立即结束。写入时 CLI 最近一次报告仍是 busy（输入排在进行中的工作后面，如 MCP 启动期的首条消息、运行中的追问），则直接以该状态接管，等这轮的 `done`。
+3. **审批期间不插队**：CLI 报 `blocked` 时，排队消息不再以 type-ahead 方式写入——审批框里的 Enter 会选中默认项（「Yes, proceed」），等这轮 `done` 后再写入（`programStatusBlockedHoldsInput`）。`kind=question` 不拦：下一条消息就是它的回答，拦到本轮结束会自己等自己，维持接入前的写入方式。
+4. **会话记录的终态优先于悬挂的 `working`**：rollout 里的 `assistant_final` / `task_complete` 仍结束本轮，即使 `working` 没有等来终态（终态报告丢失、或 Codex 对活动 goal 保持 `working`）——这也是「信号中途丢了」的兜底；`blocked` 不被覆盖（`programStatusYieldsToTranscriptTerminal`）。报告和屏幕矛盾时：接管期间以报告为准（屏幕静默、提示符、忙碌页脚都不再单独决定空闲），其余时间以屏幕为准。
+
+---
+
+## 五、写在最后：给开发者的一句话
 
 **大模型不仅需要聪明的 Prompt，更需要坚固的工程底座。**
 

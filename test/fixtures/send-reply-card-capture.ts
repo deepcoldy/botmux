@@ -9,6 +9,59 @@ import {
 import { findExecutableLinkRefs } from '../../src/services/link-ref-resolver.js';
 import { enforceFinalLinkIntegrity } from '../../src/services/final-link-integrity.js';
 
+// Opt-in file policies exercise the CLI's pre-read limit and the second limit
+// after a file grows. Other fixture callers retain the actual fs behavior.
+const forbiddenDiffRead = process.env.BOTMUX_TEST_FORBID_DIFF_READ;
+if (forbiddenDiffRead) {
+  const originalRead = fs.readFileSync.bind(fs);
+  fs.readFileSync = ((path: fs.PathOrFileDescriptor, options?: unknown) => {
+    if (String(path) === forbiddenDiffRead) throw new Error('large diff must not be read in full');
+    return originalRead(path, options as never);
+  }) as typeof fs.readFileSync;
+  syncBuiltinESMExports();
+}
+const growingDiff = process.env.BOTMUX_TEST_GROW_DIFF_AFTER_STAT;
+if (growingDiff || forbiddenDiffRead) {
+  const watched = new Map<number, number>();
+  const originalOpen = fs.openSync.bind(fs);
+  const originalFstat = fs.fstatSync.bind(fs);
+  const originalRead = fs.readSync.bind(fs);
+  const originalClose = fs.closeSync.bind(fs);
+  let grown = false;
+  fs.openSync = ((...args: any[]) => {
+    const fd = (originalOpen as (...args: any[]) => number)(...args);
+    if (String(args[0]) === growingDiff || String(args[0]) === forbiddenDiffRead) watched.set(fd, 0);
+    return fd;
+  }) as typeof fs.openSync;
+  fs.fstatSync = ((...args: any[]) => {
+    const stat = (originalFstat as (...args: any[]) => fs.Stats)(...args);
+    if (watched.has(args[0]) && growingDiff && !grown) {
+      grown = true;
+      fs.writeFileSync(growingDiff, '--- a/spec.md\n+++ b/spec.md\n@@ -0,0 +1 @@\n+' + 'x'.repeat(3 * 1024 * 1024) + '\n');
+    }
+    return stat;
+  }) as typeof fs.fstatSync;
+  fs.readSync = ((...args: any[]) => {
+    const alreadyRead = watched.get(args[0]);
+    if (alreadyRead !== undefined && args[3] > 2 * 1024 * 1024 + 1 - alreadyRead) {
+      throw new Error('diff prefix read exceeded its byte budget');
+    }
+    const bytes = (originalRead as (...args: any[]) => number)(...args);
+    if (alreadyRead !== undefined) watched.set(args[0], alreadyRead + bytes);
+    return bytes;
+  }) as typeof fs.readSync;
+  fs.closeSync = ((fd: number) => { watched.delete(fd); return originalClose(fd); }) as typeof fs.closeSync;
+  syncBuiltinESMExports();
+}
+if ((globalThis as { Bun?: unknown }).Bun && (forbiddenDiffRead || growingDiff)) {
+  // Bun does not synchronize named fs imports with syncBuiltinESMExports.
+  // Register the same opt-in fs surface using its actual module-mock API.
+  const bunTestModule = 'bun:test';
+  const { mock } = await import(bunTestModule);
+  const mockedFs = { ...fs, default: fs };
+  mock.module('node:fs', () => mockedFs);
+}
+
 // The >MAX_STRING_LENGTH regression uses a sparse attachment to prove the CLI
 // never decodes it as UTF-8. Keep the later upload path lightweight: production
 // uploadFile still asks fs for bytes, but this fixture only needs to exercise
@@ -26,10 +79,20 @@ if (stubbedLargeUpload) {
 }
 
 const topicLookups = new Map<string, number>();
+let providerMessageSequence = 0;
 
 (defaultHttpInstance as any).defaults.adapter = async (config: any) => {
   const url = new URL(config.url, 'https://open.feishu.cn');
   const method = String(config.method).toUpperCase();
+  if (process.env.BOTMUX_TEST_CAPTURE_HTTP === '1') {
+    const type = url.pathname.includes('/auth/') ? 'auth'
+      : url.pathname.includes('/im/v1/files') ? 'file'
+        : url.pathname.includes('/im/v1/images') ? 'image'
+          : url.pathname.includes('/im/v1/messages') ? 'message'
+            : url.pathname.includes('/cardkit/') ? 'card'
+              : 'other';
+    console.log('CAPTURE_HTTP=' + JSON.stringify({ method, path: url.pathname, type }));
+  }
   let data;
   if (url.pathname.includes('/auth/')) {
     data = { code: 0, tenant_access_token: 'test-token', expire: 7200 };
@@ -42,7 +105,8 @@ const topicLookups = new Map<string, number>();
   } else if (url.pathname.includes('/im/v1/messages') && ['POST', 'PATCH'].includes(method)) {
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
-    data = { code: 0, data: { message_id: 'om_separate_message' } };
+    data = { code: 0, data: { message_id: process.env.BOTMUX_TEST_DISTINCT_MESSAGE_IDS === '1'
+      ? `om_sent_${++providerMessageSequence}` : 'om_separate_message' } };
   } else if (url.pathname.includes('/cardkit/v1/cards/') && method === 'PUT') {
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
@@ -67,9 +131,14 @@ const topicLookups = new Map<string, number>();
     const state = states[id] ?? 'live';
     if (state === 'error') throw new Error('topic lookup unavailable');
     data = state === 'withdrawn-code' ? { code: 230011, msg: 'withdrawn' }
-      : { code: 0, data: { items: [{ message_id: id, chat_id: 'oc_test',
+      : { code: 0, data: { items: state === 'missing' ? [] : [{ message_id: id, chat_id: 'oc_test',
         deleted: state === 'withdrawn' || (state === 'withdraw-after-preflight' && count > 1),
         body: { content: '{"text":"hello"}' } }] } };
+  } else if (url.pathname === '/open-apis/im/v1/messages' && process.env.BOTMUX_TEST_LIST_MESSAGES === '1') {
+    // Env-gated list endpoint (message.list walks); defaults to an empty page
+    // so read-only commands such as `botmux history` complete without extra
+    // per-test fixture surface.
+    data = { code: 0, data: { has_more: false, page_token: '', items: [] } };
   } else if (url.pathname.includes('/im/v1/messages/')) {
     // BOTMUX_TEST_THREAD_ID: the looked-up message now belongs to that topic.
     const threadId = process.env.BOTMUX_TEST_THREAD_ID;
@@ -205,6 +274,61 @@ if (process.env.BOTMUX_TEST_DEFERRED_TOPIC_DAEMON === '1') {
       status: result.ok ? 200 : (result as { status: number }).status,
       headers: { 'content-type': 'application/json' },
     });
+  });
+}
+if (process.env.BOTMUX_TEST_NATIVE_COT_BARRIER) {
+  __setLoopbackTransportForTests(async (url) => {
+    const path = new URL(url).pathname;
+    if (!path.endsWith('/reply-card-ready')) throw new Error(`Unexpected native CoT test route: ${path}`);
+    console.log('CAPTURE_NATIVE_READY');
+    // ready = live native thinking; ready-hidden = display failed/switched off;
+    // ready-legacy = an older daemon that answers without visibility.
+    const barrier = process.env.BOTMUX_TEST_NATIVE_COT_BARRIER ?? '';
+    const ok = barrier.startsWith('ready');
+    const body = barrier === 'ready-legacy' || !ok ? { ok } : { ok, nativeThinkingVisible: barrier === 'ready' };
+    return new Response(JSON.stringify(body), { status: ok ? 200 : 409 });
+  });
+}
+if (process.env.BOTMUX_TEST_FEEDBACK_LEASE_DAEMON) {
+  // A read-isolated CLI: its Seatbelt policy denies the shared lease directory
+  // (EPERM), so the send lease must come from the session's daemon. The
+  // daemon side answers with BOTMUX_TEST_FEEDBACK_LEASE_DAEMON=ok|refuse.
+  const originalMkdir = fs.mkdirSync.bind(fs);
+  fs.mkdirSync = ((path: fs.PathLike, options?: unknown) => {
+    if (String(path).endsWith('/feedback-send-leases')) {
+      throw Object.assign(new Error(`EPERM: operation not permitted, mkdir '${String(path)}'`), { code: 'EPERM' });
+    }
+    return originalMkdir(path, options as never);
+  }) as typeof fs.mkdirSync;
+  syncBuiltinESMExports();
+  if ((globalThis as { Bun?: unknown }).Bun) {
+    const bunTestModule = 'bun:test';
+    const { mock } = await import(bunTestModule);
+    const mockedFs = { ...fs, default: fs };
+    mock.module('node:fs', () => mockedFs);
+  }
+  __setLoopbackTransportForTests(async (url, init) => {
+    const target = new URL(url);
+    const body = typeof init.body === 'string' ? JSON.parse(init.body) : undefined;
+    if (target.pathname.endsWith('/api/session-origin/attest')) {
+      writeManagedOriginAttestationProof({
+        dataDir: process.env.SESSION_DATA_DIR!,
+        proof: {
+          domain: MANAGED_ORIGIN_PROOF_DOMAIN, version: 1, nonce: body.nonce, channelId: body.channelId,
+          sessionId: body.sessionId, turnId: process.env.BOTMUX_TURN_ID!, requiresCodexAppLedger: false, issuedAtMs: Date.now(),
+        },
+      });
+      return new Response(null, { status: 200 });
+    }
+    if (!target.pathname.endsWith('/feedback-send-lease')) throw new Error(`Unexpected daemon request ${target.pathname}`);
+    console.log('CAPTURE_LEASE=' + JSON.stringify({ path: target.pathname, body }));
+    const refuse = process.env.BOTMUX_TEST_FEEDBACK_LEASE_DAEMON === 'refuse';
+    const result = refuse
+      ? { ok: false, error: 'feedback_storage_maintenance' }
+      : body.action === 'acquire'
+        ? { ok: true, lease: `${body.processId}-0123abcd.json`, releaseToken: 'synthetic-release-token' }
+        : { ok: true };
+    return new Response(JSON.stringify(result), { status: refuse ? 409 : 200, headers: { 'content-type': 'application/json' } });
   });
 }
 // Any non-SDK network request also fails closed; this fixture never contacts Feishu.

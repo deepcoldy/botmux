@@ -138,7 +138,8 @@ export function stripAllSchedulePreconditionMaterial(schedule: unknown): unknown
 }
 
 /** Drop `prompt` (business instructions), `workingDir` (repo/customer path),
- *  the run-as identity fields, and every executable/authority-bearing precondition field from
+ *  the until-done completion note, the run-as identity fields, and every
+ *  executable/authority-bearing precondition field from
  *  `/api/schedules` rows for anonymous visitors. The supported list projection
  *  may carry only `hasPrecondition` / `preconditionEnabled`; source/path/script/
  *  ref/hash are stripped defensively even though authenticated management rows
@@ -159,6 +160,12 @@ export function redactSchedulesForPublic(schedules: unknown[]): unknown[] {
       runAsClaim: _runAsClaim,
       ...rest
     } = projected as Record<string, unknown>;
+    // An until-done completion note is free text the model wrote about the
+    // business result, as sensitive as the prompt; status/deadline stay.
+    if (rest.untilDone && typeof rest.untilDone === 'object') {
+      const { doneNote: _doneNote, ...untilDone } = rest.untilDone as Record<string, unknown>;
+      return { ...rest, untilDone };
+    }
     return rest;
   });
 }
@@ -232,7 +239,7 @@ type SessionFieldFilter = (key: string) => boolean;
 /** Anonymous rule: named blacklist PLUS a `preview*` prefix sweep, so a future
  *  preview-prefixed field is private by default (fail-closed). */
 const isPrivateForAnonymous: SessionFieldFilter = key =>
-  PRIVATE_SESSION_FIELDS.has(key) || key.startsWith('preview');
+  key === 'modelPin' || PRIVATE_SESSION_FIELDS.has(key) || key.startsWith('preview');
 
 const isPrivateForWorkbench: SessionFieldFilter = key =>
   WORKBENCH_PRIVATE_SESSION_FIELDS.has(key);
@@ -249,7 +256,14 @@ function omitSessionFields(
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
-    if (!isPrivate(key)) out[key] = value;
+    if (isPrivate(key)) continue;
+    // lastTurn.summary 是最终回复的正文第一行，等同 preview；结果和时间本身可以公开。
+    if (key === 'lastTurn' && isPrivate === isPrivateForAnonymous && value && typeof value === 'object') {
+      const { summary: _summary, ...turn } = value as Record<string, unknown>;
+      out[key] = turn;
+      continue;
+    }
+    out[key] = value;
   }
   return out;
 }

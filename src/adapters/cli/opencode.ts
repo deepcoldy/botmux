@@ -8,7 +8,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type ResumableSession } from './types.js';
 import { opencodeDbPath } from '../../services/opencode-paths.js';
 
-import { delay } from '../../utils/timing.js';
+import { delay, scaleMs } from '../../utils/timing.js';
 
 /**
  * OpenCode 会话存储：1.17+ 是一个全局 SQLite 库（opencode.db），session 表一行一个
@@ -24,6 +24,28 @@ import { delay } from '../../utils/timing.js';
 
 const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z-]+$/;
 const OPENCODE_PASTE_THRESHOLD = 150;
+
+/** OpenCode 1.x 输入框：左边框是一列 `┃`，下边沿是 `╹▀▀▀…`，首页和会话页、空闲和
+ *  忙碌时都画着。下边沿只在主题的 backgroundElement 不透明时画，透明主题（如
+ *  lucent-orng）那一行是空格；左边框所有主题都画。画出来之前屏幕是空的，这时打
+ *  进去的字会被整段丢掉，不落库、也不发请求。 */
+const OPENCODE_COMPOSER_RE = /^[ \t]*(?:┃|╹▀{8,})/m;
+/** 启动可能比 worker 的静默窗口长（每次启动都要装插件依赖）。给足但有界：
+ *  输入框长相变了也只是首条消息晚这么久，不会卡住。 */
+const OPENCODE_COMPOSER_WAIT_MS = 45_000;
+const OPENCODE_COMPOSER_POLL_MS = 250;
+
+/** 等到终端里出现 OpenCode 的输入框或超时。只有 tmux 能读到当前画面，读不到画面的
+ *  后端不等。 */
+async function waitForOpenCodeComposer(pty: PtyHandle): Promise<void> {
+  if (!pty.captureViewportAsync) return;
+  const deadline = Date.now() + scaleMs(OPENCODE_COMPOSER_WAIT_MS);
+  while (Date.now() < deadline) {
+    const screen = await pty.captureViewportAsync().catch(() => '');
+    if (OPENCODE_COMPOSER_RE.test(screen)) return;
+    await delay(OPENCODE_COMPOSER_POLL_MS);
+  }
+}
 
 /** `models` 列表里一行模型 id 的形态：provider/name（允许多级，如 openrouter/anthropic/claude-sonnet-4）。 */
 const MODEL_ID_RE = /^[^\s/]+(?:\/[^\s]+)+$/;
@@ -466,10 +488,62 @@ export interface OpenCodeLikeAdapterOptions {
   dbPath: () => string;
   skillsDir: string;
   hookConfigPath: string;
+  resumeFindsOwnSession?: boolean;
   modelChoices: readonly string[] | undefined;
   /** live 模型枚举的子命令参数（opencode / mimo 都是 `models` 纯文本列表）。 */
   modelListArgs: readonly string[];
   startupArgs?: readonly string[];
+  /**
+   * 该 CLI 的原生「自动放行」标志（如 opencode 的 `--auto`）。
+   *
+   * 托管态里 TUI 的权限确认没人看得见：turn 会静默卡在 `once/always/reject`
+   * 上直到有人在终端点一次。opencode 自带只放行「本来要 ask」的 `--auto`
+   * （显式 deny 仍生效），所以 `disableCliBypass` 未开时按其它 adapter
+   * （copilot `--allow-all-tools`、claude `--dangerously-skip-permissions`）
+   * 的既有约定带上它。
+   *
+   * 留空表示该 CLI 没有等价标志（mimo 就没有），保持原样不注入。
+   */
+  autoApproveArg?: string;
+  /**
+   * `autoApproveArg` 的最低可用版本（含）。给了就必须能证明版本够新才注入：
+   * 版本未知 / 解析不出来一律按「不支持」处理，保持旧 argv。
+   *
+   * opencode v1 的 `--auto` 是 1.17.12 才加的，老版本收到未知 flag 会打帮助并
+   * exit 1，而 daemon 的自动重启会把它放大成 crash-loop —— 比静默卡死更难查，
+   * 所以这里宁可不加也不赌。
+   */
+  autoApproveMinVersion?: string;
+  /**
+   * 进程起来后的第一次写入先等输入框画出来（见 waitForOpenCodeComposer）。
+   * 首条消息超出启动参数预算、resume、带启动命令时都改成启动后打字，
+   * 打早了会被吞。只给确认过输入框长相的 CLI 打开。
+   */
+  waitsForComposer?: boolean;
+}
+
+/**
+ * 版本门控：`>= min` 返回 true。版本未知 / 解析失败 / 主次版本缺失一律 false
+ * （= 当作不支持），调用方据此保持旧 argv。只比较 major.minor.patch，
+ * 允许 `v` 前缀和 `-beta.1` 这类预发布后缀。
+ */
+function versionAtLeast(version: string | undefined, min: string): boolean {
+  const parse = (value: string): number[] | null => {
+    const core = value.trim().replace(/^[^0-9]*/, '').split(/[-+]/, 1)[0];
+    const parts = core.split('.');
+    if (parts.length < 2) return null;
+    const nums = parts.map(part => (/^\d+$/.test(part) ? Number(part) : Number.NaN));
+    return nums.some(n => !Number.isFinite(n)) ? null : nums;
+  };
+  const have = parse(version ?? '');
+  const want = parse(min);
+  if (!have || !want) return false;
+  for (let i = 0; i < Math.max(have.length, want.length); i++) {
+    const a = have[i] ?? 0;
+    const b = want[i] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return true;
 }
 
 export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runtime: OpenCodeLikeAdapterOptions): CliAdapter {
@@ -478,6 +552,9 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
   // is a spawn-time concern.
   const rawBin = pathOverride ?? runtime.defaultBin;
   let cachedBin: string | undefined;
+  // 已等过输入框的终端句柄。每次 spawn 都是新的 backend 句柄，所以只有启动
+  // 后的第一次写入会等；之后输入框被弹窗遮住也照常打字。
+  const composerChecked = new WeakSet<PtyHandle>();
   return {
     id: runtime.id,
     // Whole dir kept REAL, not just auth.json: opencode keeps its global SQLite DB
@@ -487,8 +564,17 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     authPaths: [...(runtime.authPaths ?? [runtime.dataRoot])],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, initialPrompt, model }) {
+    buildArgs({ sessionId, resume, resumeSessionId, initialPrompt, model, disableCliBypass, cliVersion }) {
       const args: string[] = [...(runtime.startupArgs ?? [])];
+      // 权限确认放行：不传 `--auto` 时，OpenCode 的默认 `ask`（V1 是
+      // external_directory / .env 等）会停在 TUI 里等确认，而飞书侧完全看不到，
+      // 整个 turn 静默卡死。`disableCliBypass` 显式打开时保持现状让人工把关；
+      // 声明了最低版本的 flag 还要版本够新（探测不到就不加，见
+      // autoApproveMinVersion）。
+      if (runtime.autoApproveArg && !disableCliBypass
+        && (!runtime.autoApproveMinVersion || versionAtLeast(cliVersion, runtime.autoApproveMinVersion))) {
+        args.push(runtime.autoApproveArg);
+      }
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
@@ -514,15 +600,11 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     },
 
     passesInitialPromptViaArgs: true,
-    // tmux `new-session` rejects launch command strings well below OS ARG_MAX
-    // (~12 KB ok, ~16 KB "command too long" on Linux + tmux 3.3a).  OpenCode
-    // bakes the full first-round prompt into `--prompt <content>`, so a long
-    // routing/role/user prompt blows the tmux limit before OpenCode starts.
-    // Budget set to 8 KB: the botmux routing envelope alone is ~5.8–6.2 KB
-    // (zh/en) for a typical new topic, so 8 KB keeps short user messages on
-    // the reliable `--prompt` cold-start path while leaving ~6 KB headroom
-    // below the measured tmux ceiling.  Over-limit prompts defer to the
-    // normal post-start input queue.
+    // OpenCode bakes the full first-round prompt into `--prompt <content>`.
+    // The 8 KB budget came from the old inline tmux launch, but tmux panes now
+    // load their full argv from a private pane-launch file, so that limit no
+    // longer binds. Keep the budget unchanged so short prompts retain the
+    // reliable cold-start path and longer prompts retain the post-start queue.
     maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
@@ -554,6 +636,8 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
       return `${runtime.defaultBin} -s ${sid}`;
     },
 
+    resumeFindsOwnSession: runtime.resumeFindsOwnSession,
+
     /** Resume 目标预检：id 不在 session 表 → false（worker 落回全新会话并提示），
      *  避免 `Session not found` exit 1 被放大成自动重启 crash-loop。DB 读不了
      *  （node:sqlite 缺失 / 首次运行 / sandbox 未授权该 DB 路径）→ undefined，交给
@@ -576,6 +660,10 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     },
 
     async writeInput(pty: PtyHandle, content: string) {
+      if (runtime.waitsForComposer && !composerChecked.has(pty)) {
+        composerChecked.add(pty);
+        await waitForOpenCodeComposer(pty);
+      }
       // 提交验证基线先于写入采样（traex 同款）。斜杠命令是 TUI 命令面板输入，
       // 不产生 user message 行，跳过验证（重试 Enter 还可能误触面板项）。
       const isSlashCommand = content.startsWith('/');
@@ -662,7 +750,18 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     dbPath: opencodeDbPath,
     skillsDir: '~/.config/opencode/skills',
     hookConfigPath: '~/.config/opencode/plugin/botmux-ask.js',
+    resumeFindsOwnSession: true,
+    // Data root + the global config dir: opencode.json (providers / model), the
+    // botmux ask plugin written above and global skills. Under the oncall
+    // sandbox the config dir was absent, so OpenCode fell back to its built-in
+    // hosted model and the botmux ask hook never loaded. Read-write, like
+    // MiMoCode's: OpenCode installs plugin dependencies into it on every start
+    // (package.json / node_modules) and exits on a read-only mount.
+    authPaths: ['~/.local/share/opencode', '~/.config/opencode'],
     modelListArgs: ['models'],
+    autoApproveArg: '--auto',
+    autoApproveMinVersion: '1.17.12',
+    waitsForComposer: true,
     modelChoices: CLI_MODEL_CHOICES['opencode'],
   });
 }

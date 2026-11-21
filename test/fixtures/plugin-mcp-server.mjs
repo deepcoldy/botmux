@@ -1,6 +1,6 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   CallToolRequestSchema,
@@ -18,6 +18,11 @@ import {
 
 const serverName = process.argv[2] || 'fixture';
 if (serverName === 'fail') process.exit(17);
+let inheritedSecret = '';
+if (serverName === 'secret-fd' && process.env.BOTMUX_PROTECTED_SECRET_FD === '3') {
+  inheritedSecret = readFileSync(3, 'utf8').trim();
+  closeSync(3);
+}
 
 const server = new Server(
   { name: serverName, version: '1.0.0' },
@@ -110,6 +115,25 @@ server.setRequestHandler(CallToolRequestSchema, async request => {
           responseKind: 'final',
         },
       },
+    };
+  }
+  if (serverName === 'secret-fd') {
+    return {
+      content: [{
+        type: 'text',
+        text: `secretFd=${inheritedSecret === 'fd-only-secret'}:`
+          + `secretEnv=${process.env.FIXTURE_SECRET !== undefined}:`
+          + `secretArgv=${process.argv.includes('fd-only-secret')}:`
+          + `meta=${JSON.stringify(request.params._meta ?? {})}`,
+      }],
+    };
+  }
+  if (serverName === 'egress-env') {
+    return {
+      content: [{
+        type: 'text',
+        text: `egress=${process.env.BOTMUX_PROTECTED_EGRESS_SOCKET || ''}`,
+      }],
     };
   }
   return {

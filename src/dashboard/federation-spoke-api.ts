@@ -30,7 +30,7 @@ import { createInvite, deleteInvitesForTeam } from '../services/invite-store.js'
 import { removeTeamFederation, removeDeployment } from '../services/federation-store.js';
 import { loadBotConfigs, registerBot, getBot, type BotConfig } from '../bot-registry.js';
 import { setBotCapability, clearBotCapability } from '../services/bot-profile-store.js';
-import { readTeamRoleInjectMode, writeTeamRoleInjectMode, type RoleInjectMode } from '../core/role-resolver.js';
+import { readTeamRoleInjectMode, readTeamRoleInjectModeStrict, writeTeamRoleInjectMode, type RoleInjectMode } from '../core/role-resolver.js';
 import { setBotOwner } from '../services/bot-owner-store.js';
 import { setDeploymentOwner } from '../services/deployment-identity.js';
 import { createPairing, getPairingStatus, consumePairing } from '../services/pairing-store.js';
@@ -130,7 +130,7 @@ const MAX_ROLE_BYTES = 32 * 1024;
 function teamRolePath(dataDir: string, larkAppId: string): string {
   return join(dataDir, 'team-roles', `${larkAppId}.md`);
 }
-function writeTeamRole(dataDir: string, larkAppId: string, content: string): void {
+function writeTeamRole(dataDir: string, larkAppId: string, content: string): string {
   const fp = teamRolePath(dataDir, larkAppId);
   mkdirSync(dirname(fp), { recursive: true });
   let out = content.trim();
@@ -141,6 +141,7 @@ function writeTeamRole(dataDir: string, larkAppId: string, content: string): voi
     out = buf.subarray(0, end).toString('utf-8');
   }
   atomicWriteFileSync(fp, out);
+  return out;
 }
 
 async function readBody(req: IncomingMessage, maxBytes = 64 * 1024): Promise<any> {
@@ -237,7 +238,7 @@ export async function syncAllMemberships(
           // Mirror this team's 拉群 groups onto THIS (member) deployment so its
           // auth gate sees the same trust boundary as the hub — a teammate bot
           // talking in one of these groups is then learned + trusted locally
-          // (see [[team-bots-store]] / isTeamGroupChat). Recorded regardless of
+          // (see [[team-bots-store]] / isLegacyTeamGroupChat). Recorded regardless of
           // sessionsProvider; the session-report below is the separate concern.
           for (const cid of groupChatIds) recordTeamGroup(dataDir, m.teamId, String(cid));
           if (groupChatIds.length && sessionsProvider) {
@@ -373,13 +374,36 @@ export async function handleFederationSpokeApi(
     }
     if (method === 'PUT') {
       let body: any;
-      try { body = await readBody(req); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+      // Conditional role writes carry old and new values; JSON can escape each
+      // byte as six characters. Keep the persisted role's own limit unchanged.
+      const bodyLimit = field === 'role' ? 2 * MAX_ROLE_BYTES * 6 + 1024 : undefined;
+      try { body = await readBody(req, bodyLimit); } catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return true; }
+      let storedRole: string | undefined;
       if (field === 'capability') {
         const cap = String(body?.capability ?? '').trim();
         if (cap) setBotCapability(dataDir, larkAppId, cap); else clearBotCapability(dataDir, larkAppId);
       } else {
+        // Compare after reading the request, with no await before the write.
+        // Legacy callers omit both expectations and retain their existing API.
+        if (body?.expectedRole !== undefined || body?.expectedInjectMode !== undefined) {
+          const fp = teamRolePath(dataDir, larkAppId);
+          let current: string;
+          let currentInjectMode: RoleInjectMode;
+          try {
+            current = existsSync(fp) ? readFileSync(fp, 'utf-8') : '';
+            currentInjectMode = readTeamRoleInjectModeStrict(larkAppId);
+          } catch {
+            jsonRes(res, 500, { ok: false, error: 'role_read_failed' });
+            return true;
+          }
+          if (body.expectedRole !== current || body.expectedInjectMode !== currentInjectMode) {
+            jsonRes(res, 409, { ok: false, error: 'role_changed' });
+            return true;
+          }
+        }
         const role = String(body?.role ?? '').trim();
-        if (role) writeTeamRole(dataDir, larkAppId, role);
+        storedRole = '';
+        if (role) storedRole = writeTeamRole(dataDir, larkAppId, role);
         else { try { unlinkSync(teamRolePath(dataDir, larkAppId)); } catch { /* already gone */ } }
         // Bot-level default injection mode travels with the team role. Only
         // persist when the caller sends it (older clients omit the field).
@@ -387,7 +411,11 @@ export async function handleFederationSpokeApi(
           writeTeamRoleInjectMode(larkAppId, body.injectMode as RoleInjectMode);
         }
       }
-      jsonRes(res, 200, { ok: true, injectMode: readTeamRoleInjectMode(larkAppId) });
+      jsonRes(res, 200, {
+        ok: true,
+        ...(storedRole !== undefined ? { role: storedRole } : {}),
+        injectMode: readTeamRoleInjectMode(larkAppId),
+      });
       return true;
     }
     jsonRes(res, 405, { ok: false, error: 'method_not_allowed' });

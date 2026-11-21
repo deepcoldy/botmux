@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LinkRefLedger } from '../src/services/link-ref-ledger.js';
 import { createLinkRefRuntime } from '../src/services/link-ref-runtime.js';
-import type { LinkRefDiagnostic } from '../src/services/link-ref-types.js';
+import { LINK_REF_MAX_URLS_PER_TURN, type LinkRefDiagnostic } from '../src/services/link-ref-types.js';
 import { logger } from '../src/utils/logger.js';
 
 const allowed = new Set([
@@ -128,7 +128,7 @@ describe('LinkRef observability', () => {
     roots.push(root);
     const events: LinkRefDiagnostic[] = [];
     const runtime = createLinkRefRuntime(root, { onDiagnostic: event => events.push(event) });
-    const sources = Array.from({ length: 129 }, (_, index) => ({
+    const sources = Array.from({ length: LINK_REF_MAX_URLS_PER_TURN + 1 }, (_, index) => ({
       sourceType: 'tool' as const,
       kind: 'text' as const,
       text: `https://limit-${index}.example.test/path#private-${index}`,
@@ -140,7 +140,7 @@ describe('LinkRef observability', () => {
       sources,
     });
     expect(events).toContainEqual(expect.objectContaining({
-      mode: 'enabled', registered: 128, limited: 1,
+      mode: 'enabled', registered: LINK_REF_MAX_URLS_PER_TURN, limited: 1,
       errorCode: 'link_ref_limit_exceeded',
     }));
     expect(JSON.stringify(events)).not.toContain('private-128');

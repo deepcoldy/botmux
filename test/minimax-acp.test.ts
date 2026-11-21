@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { runMinimaxAcp, type MinimaxAcpOptions } from '../src/services/minimax-acp.js';
+import { createMinimaxFrameReader, runMinimaxAcp, type MinimaxAcpOptions } from '../src/services/minimax-acp.js';
 import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { readRequestBodyJson } from './helpers/read-request-body.js';
@@ -10,6 +10,9 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 import { isLinuxZombie } from '../src/utils/process-identity.js';
 import { createServer, type ServerResponse } from 'node:http';
+import { RunnerControlDecoder } from '../src/adapters/cli/runner-control-channel.js';
+import { MinimaxFinalReceiver } from '../src/services/minimax-final-control.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const quote = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
@@ -45,6 +48,27 @@ async function stopped(pid: number) {
   });
 }
 describe('mcode ACP wire client', () => {
+  it.each(['new', 'resume', 'load'] as const)('leaves file-backed MCP configuration to mcode during session/%s', async method => {
+    const f = fixture();
+    mkdirSync(f.options.env.MINIMAX_DATA_DIR!, { recursive: true });
+    writeFileSync(join(f.options.env.MINIMAX_DATA_DIR!, 'mcp.json'), JSON.stringify({ mcpServers: {
+      account: { type: 'http', url: 'https://example.test/mcp' },
+    } }));
+    writeFileSync(join(f.root, '.mcp.json'), JSON.stringify({ mcpServers: {
+      project: { command: 'node', args: ['server.mjs'] },
+    } }));
+    if (method === 'load') f.options.env.MCODE_ACP_SCENARIO = 'load';
+    const result = await runMinimaxAcp({ ...f.options,
+      ...(method === 'new' ? {} : { nativeSessionId: 'native-existing' }),
+    }, bounded());
+    const attach = f.calls().find(c => c.message?.method === `session/${method}`);
+    // ACP session entries shadow native entries by name. An empty overlay
+    // preserves mcode's project context, auth and live configuration handling.
+    expect(attach.message.params.mcpServers).toEqual([]);
+    expect(result.sessionId).toBe(method === 'new' ? 'session_fixture' : 'native-existing');
+    expect(f.calls().filter(c => c.message?.method === 'session/new')).toHaveLength(method === 'new' ? 1 : 0);
+  });
+
   it('accepts eight simultaneous permission requests and returns each exact response', async () => {
     const f = fixture(); let release: (value: unknown) => void = () => {};
     const answer = new Promise(resolve => { release = resolve; });
@@ -323,10 +347,39 @@ describe('mcode ACP wire client', () => {
     await expect(runMinimaxAcp({ ...f.options, content: 'ask', onUserInput: async () => { throw new Error('ask timed out'); } }, bounded())).rejects.toThrow('ask timed out');
     expect(f.calls().some(c => c.message?.id === 'native-question' && !c.message.method)).toBe(false);
   });
-  it.each(['oversize', 'oversize-stderr'])('rejects %s specifically at the output byte limit', async content => {
+  it.each([['oversize', 'frame'], ['oversize-content', 'content']])('rejects %s at its retained-data limit', async (content, limit) => {
     const f = fixture();
-    await expect(runMinimaxAcp({ ...f.options, content }, bounded())).rejects.toThrow('mcode_acp_output_limit');
+    await expect(runMinimaxAcp({ ...f.options, content }, bounded())).rejects.toThrow(`mcode_acp_${limit}_limit`);
     await stopped(f.calls()[0].pid);
+  });
+  it.each([['long-stream', 'long stream complete'], ['oversize-stderr', 'stderr drained']])(
+    'processes %s without counting drained traffic against the reply budget', async (content, expected) => {
+      const f = fixture();
+      expect((await runMinimaxAcp({ ...f.options, content }, bounded())).content).toBe(expected);
+      await stopped(f.calls()[0].pid);
+    });
+  it('stops on the first invalid ACP frame even when a final follows in the same read', () => {
+    const delivered = vi.fn();
+    const read = createMinimaxFrameReader(line => delivered(JSON.parse(line)));
+    expect(() => read(Buffer.from('invalid JSON\n{"id":1,"result":{"stopReason":"end_turn"}}\n'))).toThrow();
+    expect(delivered).not.toHaveBeenCalled();
+  });
+  it('stops within a read when the consumer terminates the turn', () => {
+    const delivered = vi.fn(() => false);
+    createMinimaxFrameReader(delivered)(Buffer.from('first\nlate final\n'));
+    expect(delivered.mock.calls).toHaveLength(1);
+    expect(delivered).toHaveBeenCalledWith('first');
+  });
+  it('decodes every byte split inside a multibyte ACP frame, including before a second frame', () => {
+    const frame = Buffer.from('{"text":"你好🌍"}\n');
+    for (let split = 1; split < frame.length; split++) {
+      const lines: string[] = [];
+      const read = createMinimaxFrameReader(line => { lines.push(JSON.parse(line).text); });
+      read(frame.subarray(0, split));
+      expect(lines).toEqual([]);
+      read(Buffer.concat([frame.subarray(split), frame]));
+      expect(lines).toEqual(['你好🌍', '你好🌍']);
+    }
   });
   it.each(['foreign-ask', 'foreign-update', 'crash', 'invalid-json', 'unknown-response', 'cancelled', 'limit'])('rejects %s without a successful final', async content => {
     const f = fixture(); const input = vi.fn();
@@ -378,6 +431,55 @@ it.each([false, true])('default ACP runner preserves queue attribution, native i
     expect(markers().filter(m => m.kind === 'final').at(-1)?.payload).toMatchObject({ turnId: 'four', content: 'answer:healthy' });
     expect(f.calls().filter(c => c.message?.method === 'session/resume')).toHaveLength(resume ? 4 : 3);
     expect(markers().filter(m => m.kind === 'thread')).toEqual([{ kind: 'thread', payload: { threadId: 'session_fixture' } }]);
+  } finally { child.kill('SIGTERM'); await closed; }
+});
+
+it('settles only the second large ACP answer across the real runner control channel', async () => {
+  const f = fixture();
+  const child = spawnTsScript(resolve('src/minimax-runner.ts'), ['--mcode-bin', f.options.executable,
+    '--cwd', f.root, '--data-dir', join(f.root, 'data')], { env: f.options.env }) as ChildProcessWithoutNullStreams;
+  const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
+  const decoder = new RunnerControlDecoder();
+  const finals: Array<Record<string, unknown>> = [];
+  const frames: Array<{ kind: string; payload: Record<string, unknown> }> = [];
+  let nextTurnSettled!: () => void;
+  const settled = new Promise<void>(resolve => { nextTurnSettled = resolve; });
+  const scope = { lastInitConfig: { cliId: 'minimax' }, currentBotmuxTurnId: 'large', currentBotmuxDispatchAttempt: 0,
+    decodeCodexAppPayload: loadWorkerFunction('decodeCodexAppPayload', {}),
+    handleTrustedCodexAppMarker: () => {}, minimaxFinalReceiver: new MinimaxFinalReceiver(payload => {
+      finals.push(payload);
+      if (payload.turnId === 'large') {
+        scope.currentBotmuxTurnId = 'next';
+        scope.currentBotmuxDispatchAttempt = 1;
+      } else if (payload.turnId === 'next') nextTurnSettled();
+    }) };
+  const handleMarker = loadWorkerFunction<(body: string) => void>('handleAppRunnerOscMarker', scope);
+  const handle = (body: string) => {
+    const separator = body.indexOf(':');
+    frames.push({ kind: body.slice(0, separator),
+      payload: JSON.parse(Buffer.from(body.slice(separator + 1), 'base64').toString('utf8')) });
+    handleMarker(body);
+  };
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk: string) => decoder.push(chunk, true, handle));
+  try {
+    for (const [content, replyTurnId, replyDispatchAttempt] of [['two-large-answers', 'large', 0], ['hello', 'next', 1]] as const) {
+      child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId, replyDispatchAttempt })).toString('base64')}\n`);
+    }
+    // The following turn is a deterministic completion barrier even when the large final is lost.
+    await Promise.race([settled, closed.then(() => { throw new Error('runner exited before next final'); })]);
+    expect(finals.map(final => final.turnId)).toEqual(['large', 'next']);
+    expect(finals.map(final => final.dispatchAttempt)).toEqual([0, 1]);
+    expect(finals[0].errorCode).toBeUndefined();
+    expect(finals[0].content === '乙\0'.repeat(2_000_000)).toBe(true);
+    expect(finals[1].content).toBe('answer:hello');
+    expect(frames.find(frame => frame.kind === 'final-start')?.payload)
+      .toMatchObject({ turnId: 'large', dispatchAttempt: 0 });
+    expect(frames.find(frame => frame.kind === 'final-end')?.payload)
+      .toMatchObject({ turnId: 'large', dispatchAttempt: 0 });
+    expect(frames.filter(frame => frame.kind === 'final')).toHaveLength(1);
+    expect(frames[frames.length - 1]).toMatchObject({ kind: 'final',
+      payload: { turnId: 'next', dispatchAttempt: 1, content: 'answer:hello' } });
   } finally { child.kill('SIGTERM'); await closed; }
 });
 

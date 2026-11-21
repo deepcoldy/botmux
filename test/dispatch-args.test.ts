@@ -160,3 +160,10 @@ describe('parseDispatchArgs', () => {
     });
   });
 });
+
+describe('parseDispatchArgs task-tree options', () => {
+  it('accepts --kind, --task-id and --task-url', () => {
+    const parsed = parseDispatchArgs(['--title', 't', '--bot-app', 'cli_a', '--kind=review', '--task-id', 'REQ-1', '--task-url', 'https://x/1']);
+    expect(parsed).toMatchObject({ ok: true, value: { kind: 'review', taskId: 'REQ-1', taskUrl: 'https://x/1' } });
+  });
+});

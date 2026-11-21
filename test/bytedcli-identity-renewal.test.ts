@@ -1,0 +1,231 @@
+/**
+ * Mid-turn renewal of locally minted bytedcli identities: a long job started by
+ * one turn must keep the same person's identity on fresh tokens, and renewal
+ * must never resurrect or overwrite material the turn no longer carries.
+ *
+ * Run:  npx vitest run --project unit test/bytedcli-identity-renewal.test.ts
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const renew = vi.fn();
+vi.mock('../src/services/bytedcli-auth.js', () => ({ renewBytedcliJwts: (openId: string) => renew(openId) }));
+
+const {
+  trackBytedcliIdentityRenewal,
+  renewExpiringBytedcliIdentities,
+  forgetBytedcliIdentityRenewals,
+  trackedBytedcliRenewalCount,
+  bytedcliIdentityExpiryMs,
+} = await import('../src/core/bytedcli-identity-renewal.js');
+const {
+  writeSessionIdentity,
+  publishedIdentityShape,
+  renderIdentityEnv,
+  recallProvenIdentityContent,
+  forgetProvenIdentityContent,
+} = await import('../src/core/cli-identity.js');
+
+const jwt = (region: string, expInSec: number, tag: string) => [
+  Buffer.from('{"alg":"none"}').toString('base64url'),
+  Buffer.from(JSON.stringify({ region, exp: Math.floor(Date.now() / 1000) + expInSec, tag })).toString('base64url'),
+  'sig',
+].join('.');
+
+let dir: string;
+const SESSION = 'renew-session';
+const TURN = 'om_turn';
+const ALICE = 'ou_alice';
+
+function publish(cloudExp: number, i18nExp: number) {
+  const identity = {
+    tool: 'bytedcli' as const,
+    cloudJwt: jwt('cn', cloudExp, 'c0'),
+    codeJwt: 'code-0',
+    regionalCloudJwts: { i18n: jwt('i18n', i18nExp, 'i0') },
+    turnId: TURN,
+    openId: ALICE,
+  };
+  writeSessionIdentity(dir, SESSION, identity, 'proven');
+  trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE, identity });
+  return identity;
+}
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'bytedcli-renewal-'));
+  renew.mockReset();
+  forgetBytedcliIdentityRenewals();
+});
+afterEach(() => {
+  forgetProvenIdentityContent(dir, SESSION);
+  rmSync(dir, { recursive: true, force: true });
+});
+
+describe('bytedcli identity renewal', () => {
+  it.each(['before', 'during'])('withholds renewed material when a task authorization is revoked %s minting', async when => {
+    const identity = publish(60, 60);
+    let approved = when === 'during';
+    const check = vi.fn(async () => approved);
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity, taskAuthorized: check });
+    renew.mockImplementation(async () => { approved = false; return { cloudJwt: 'must-not-publish' }; });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).toHaveBeenCalledTimes(when === 'during' ? 1 : 0);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).not.toContain('must-not-publish');
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+  });
+
+  it('keeps the renewal entry across a transient authorization check and renews after recovery', async () => {
+    const identity = publish(60, 60);
+    const check = vi.fn()
+      .mockRejectedValueOnce(new Error('target validation unavailable'))
+      .mockResolvedValue(true);
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity, taskAuthorized: check });
+    const fresh = { cloudJwt: jwt('cn', 7200, 'recovered') };
+    renew.mockResolvedValueOnce(fresh);
+    // First sweep: the check is transiently unavailable. The entry survives.
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+    expect(trackedBytedcliRenewalCount()).toBe(1);
+    // Next sweep: the check recovers and the same entry renews normally.
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toContain(fresh.cloudJwt);
+  });
+
+  it('a stale entry cannot delete the replacement entry registered for the same turn', async () => {
+    const first = publish(60, 60);
+    let releaseStale!: () => void;
+    const staleGate = new Promise<void>(resolve => { releaseStale = resolve; });
+    // The first entry's check is held in flight while the turn gets republished.
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity: first, taskAuthorized: async () => { await staleGate; return false; } });
+    const fresh = { cloudJwt: jwt('cn', 7200, 'fresh-after-republish') };
+    renew.mockResolvedValueOnce(fresh);
+    const firstSweep = renewExpiringBytedcliIdentities();
+    // While sweep 1 awaits the stale check, a republished entry takes the same key.
+    const republished = { ...first, cloudJwt: jwt('cn', 60, 'republished') };
+    writeSessionIdentity(dir, SESSION, republished, 'proven');
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity: republished, taskAuthorized: async () => true });
+    releaseStale();
+    // The stale entry refuses but must not remove its replacement: nothing is
+    // renewed in this sweep, yet one tracked entry survives.
+    expect(await firstSweep).toBe(0);
+    expect(trackedBytedcliRenewalCount()).toBe(1);
+    // The next sweep serves the republished entry normally.
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toContain(fresh.cloudJwt);
+  });
+
+  it('leaves registered background cache to its per-invocation authority checks', async () => {
+    const ordinary = publish(600, 600);
+    forgetBytedcliIdentityRenewals();
+    const background = { ...ordinary, turnId: 'background:12345678-1234-1234-1234-123456789abc' };
+    writeSessionIdentity(dir, SESSION, background, 'proven');
+    renew.mockResolvedValueOnce({ cloudJwt: jwt('cn', 7200, 'unwanted-background-renewal') });
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity: background });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+    expect(recallProvenIdentityContent(dir, SESSION, background.turnId, 'bytedcli'))
+      .toBe(renderIdentityEnv(publishedIdentityShape(dir, SESSION, background)));
+  });
+
+  it('renews the full published shape including HOME and rejects a changed HOME after await', async () => {
+    const original = publish(7200, 600);
+    const published = publishedIdentityShape(dir, SESSION, original);
+    expect('home' in published && published.home).toBeTruthy();
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toBe(renderIdentityEnv(published));
+    renew.mockImplementationOnce(async () => {
+      writeSessionIdentity(dir, SESSION, { ...original, home: join(dir, 'replacement-home') }, 'proven');
+      return { cloudJwt: jwt('cn', 7200, 'late') };
+    });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).toHaveBeenCalledWith(ALICE);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli'))
+      .toBe(renderIdentityEnv(publishedIdentityShape(dir, SESSION, { ...original, home: join(dir, 'replacement-home') })));
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+  });
+
+  it('uses the soonest-expiring selectable ByteCloud JWT', () => {
+    const identity = publish(7200, 600);
+    expect(bytedcliIdentityExpiryMs(identity)! - Date.now()).toBeLessThan(601_000);
+  });
+
+  it('leaves identities with plenty of life alone', async () => {
+    publish(7200, 7200);
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+  });
+
+  it('republishes the same turn and person with fresh tokens before expiry', async () => {
+    publish(7200, 20 * 60);
+    const fresh = { cloudJwt: jwt('cn', 7200, 'c1'), regionalCloudJwts: { i18n: jwt('i18n', 7200, 'i1') } };
+    renew.mockResolvedValueOnce(fresh);
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(renew).toHaveBeenCalledWith(ALICE);
+    const body = recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')!;
+    expect(body).toContain(fresh.cloudJwt);
+    expect(body).toContain(fresh.regionalCloudJwts.i18n);
+    expect(body).toContain('code-0'); // not refreshed → kept
+    expect(body).toContain(`BOTMUX_IDENTITY_TURN='${TURN}'`);
+    expect(body).toContain(`BOTMUX_IDENTITY_OPEN_ID='${ALICE}'`);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'codebase')).toContain('code-0');
+    // Fresh now: the next sweep does nothing.
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+  });
+
+  // The wrapper words its refusal for a partition without a token by this
+  // marker; a renewal that dropped it would turn "this machine could not mint
+  // one" into a generic refusal for the rest of the turn.
+  it('keeps who minted the partition tokens across a renewal', async () => {
+    const identity = { ...publish(7200, 20 * 60), regionalCloudJwtSource: 'local' as const };
+    writeSessionIdentity(dir, SESSION, identity, 'proven');
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE, identity });
+    const fresh = jwt('cn', 7200, 'c1');
+    renew.mockResolvedValueOnce({ cloudJwt: fresh });
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    const body = recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')!;
+    expect(body).toContain(fresh);
+    expect(body).toContain("BOTMUX_IDENTITY_REGIONAL_SOURCE='local'");
+  });
+
+  it('keeps current tokens when renewal fails and retries later', async () => {
+    const identity = publish(7200, 20 * 60);
+    renew.mockResolvedValueOnce(null);
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toContain(identity.regionalCloudJwts.i18n);
+    expect(trackedBytedcliRenewalCount()).toBe(1);
+  });
+
+  it('drops the entry once the turn material is collected, without resurrecting it', async () => {
+    publish(7200, 20 * 60);
+    forgetProvenIdentityContent(dir, SESSION, TURN);
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toBeUndefined();
+  });
+
+  it('never overwrites a turn that was republished (e.g. a denial) meanwhile', async () => {
+    publish(7200, 20 * 60);
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', mode: 'denied', message: 'no', turnId: TURN }, 'proven');
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toContain('denied');
+  });
+
+  it('discards a renewal that lands after the turn ended', async () => {
+    publish(7200, 20 * 60);
+    renew.mockImplementationOnce(async () => {
+      forgetProvenIdentityContent(dir, SESSION, TURN);
+      return { cloudJwt: jwt('cn', 7200, 'late') };
+    });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toBeUndefined();
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+  });
+});

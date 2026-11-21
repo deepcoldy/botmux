@@ -30,6 +30,9 @@ export interface ExternalRuntimeCandidate {
   cliPath: string;
   binPath: string;
   pathEnv?: string;
+  /** Set when binPath is not directly executable: run `<interpreterPath> <cliPath> …`
+   *  (a source checkout or npm install started by `bun|node dist/cli.js`). */
+  interpreterPath?: string;
   version: string;
   runtimeSource?: 'global-cli';
 }
@@ -41,6 +44,9 @@ export interface BundledRuntimeCandidate {
   nodePath: string;
   version: string;
   runtimeSource: 'bundled';
+  /** The bundled runtime is a compiled botmux binary (nodePath === cliPath) that
+   *  dispatches its own subcommands, so no script path goes in front of the args. */
+  selfDispatching?: boolean;
 }
 
 export type RuntimeLaunchTarget = ExternalRuntimeCandidate | BundledRuntimeCandidate;
@@ -152,6 +158,15 @@ export interface RuntimeServiceDeps {
   /** Probed user shell PATH for bundled-runtime spawns (see probeShellPathEnv). */
   shellPathEnv?: () => string | undefined;
   fleetApps?: () => Promise<FleetAppSummary[]>;
+  /**
+   * Coexistence with a separately installed CLI. Returns the runtime that owns
+   * the LIVE fleet when it is not the bundled one (a global npm/curl install or a
+   * source checkout), else null. When provided, Desktop follows that owner:
+   * the fleet is reported as running/managed and start/stop/restart are routed
+   * through the owner's own CLI instead of replacing it with the bundled runtime.
+   * Switching to the bundled runtime stays an explicit `takeover`.
+   */
+  fleetOwner?: () => ExternalRuntimeCandidate | null;
 }
 
 export function createRuntimeService(deps: RuntimeServiceDeps) {
@@ -169,7 +184,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
     if (runtime.kind === 'bundled') {
       return buildBundledBotmuxCommand({
         nodePath: runtime.nodePath,
-        cliPath: runtime.cliPath,
+        cliPath: runtime.selfDispatching ? undefined : runtime.cliPath,
         botmuxHome: deps.paths.botmuxHome,
         args,
         baseEnv: deps.env,
@@ -182,6 +197,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
       args,
       baseEnv: deps.env,
       pathEnv: runtime.pathEnv,
+      interpreterPath: runtime.interpreterPath,
     });
   }
 
@@ -203,6 +219,10 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
   }
 
   async function runCliAction(args: string[]): Promise<RunResult> {
+    // A fleet owned by another install is driven through that install, so the
+    // app and a manually installed CLI never fight over the same bots.
+    const owner = deps.fleetOwner?.() ?? null;
+    if (owner) return run(command(owner, args));
     const runtime = activeRuntime();
     if (!runtime) return rejectedCliRequired();
 
@@ -313,6 +333,22 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
         const onlineDaemonCount = countActiveBotmuxDaemonApps(apps);
         if (source.running) {
           if (!isRuntimeOwned(active, source.sourcePath, source.sourceVersion)) {
+            const owner = deps.fleetOwner?.() ?? null;
+            if (owner) {
+              return {
+                status: 'running',
+                appVersion: deps.appVersion,
+                runtimeVersion: owner.version || null,
+                runtimeSource: 'global-cli',
+                runtimeManaged: true,
+                runtimePath: owner.cliPath,
+                botCount: config.count,
+                onlineDaemonCount,
+                attentionCount: 0,
+                dashboardUrl: null,
+                message: '跟随已安装的 botmux CLI（未接管）',
+              };
+            }
             return {
               status: 'degraded',
               appVersion: deps.appVersion,
@@ -324,7 +360,7 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
               onlineDaemonCount,
               attentionCount: 1,
               dashboardUrl: null,
-              message: '检测到由外置 botmux 启动的运行时，Desktop 正在切换到内置运行时。',
+              message: '检测到由其他 botmux 安装启动的运行时，无法定位它的启动方式。',
             };
           }
           return {
@@ -410,6 +446,10 @@ export function createRuntimeService(deps: RuntimeServiceDeps) {
           : 'Current botmux runtime is not controlled by the selected CLI',
         signal: null,
       };
+    },
+    async restartBundled(): Promise<RunResult> {
+      if (!deps.bundledRuntime) return rejectedCliRequired();
+      return run(command(deps.bundledRuntime, ['restart']));
     },
     async dashboard(): Promise<RunResult> {
       const runtime = activeRuntime();

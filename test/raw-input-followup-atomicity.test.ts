@@ -17,10 +17,38 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import {
   finalizeRawCommandDelivery,
+  typeRawCommandLine,
   writeRawCommandLine,
 } from '../src/core/raw-command-writer.js';
 
 describe('raw command backend acceptance', () => {
+  it.each(['write', 'sendText', 'pasteText', 'coco'] as const)(
+    'stops later command bytes after ownership changes during %s delivery', async mode => {
+      let current = true;
+      const text: string[] = [], keys: string[] = [];
+      const backend = {
+        write: (data: string) => { text.push(data); },
+        ...(mode !== 'write' ? {
+          sendText: (data: string) => { text.push(data); },
+          sendSpecialKeys: (key: string) => { keys.push(key); },
+        } : {}),
+        ...(mode === 'pasteText' ? {
+          supportsRawCommandPasteLine: true,
+          pasteText: (data: string) => { text.push(data); },
+        } : {}),
+      };
+      const opts = { coco: mode === 'coco', pasteLine: mode === 'pasteText',
+        delay: async () => { current = false; }, isCurrent: () => current };
+      expect(await writeRawCommandLine(backend, '/compact', opts)).toBe(false);
+      expect(text).toEqual([mode === 'coco' ? '/' : '/compact']);
+      expect(keys).toEqual([]);
+    },
+  );
+  it.each([typeRawCommandLine, writeRawCommandLine])('refuses a retired writer before the first byte (%s)', async writer => {
+    const write = vi.fn();
+    expect(await writer({ write }, '/compact', { isCurrent: () => false })).toBe(false);
+    expect(write).not.toHaveBeenCalled();
+  });
   const immediateDelay = vi.fn(async () => {});
 
   it('uses pasteText before Enter when pasteLine is enabled', async () => {
@@ -355,5 +383,38 @@ describe('worker input fences', () => {
     const hold = markReady.search(/if \(bareShellLaunchBlocked\)/);
     expect(hold).toBeGreaterThanOrEqual(0);
     expect(markReady.indexOf('isPromptReady = true')).toBeGreaterThan(hold);
+  });
+});
+
+describe('type / submit split', () => {
+  const noDelay = async () => {};
+
+  it('types the line without submitting it, including on key-writing backends', async () => {
+    // The effort controller types `/model`, re-checks the screen, and only then
+    // presses Enter itself. If typing also submitted, the re-check would run
+    // after the damage. Cover both delivery shapes.
+    const write = vi.fn(() => true);
+    expect(await typeRawCommandLine({ write }, '/model', { delay: noDelay })).toBe(true);
+    expect(write.mock.calls.map(call => call[0])).toEqual(['/model']);
+
+    const keys: string[] = [];
+    const sendText = vi.fn(() => true);
+    expect(await typeRawCommandLine(
+      { write: vi.fn(() => true), sendText, sendSpecialKeys: (key => { keys.push(key); return true; }) as never },
+      '/model',
+      { delay: noDelay },
+    )).toBe(true);
+    expect(sendText).toHaveBeenCalledWith('/model');
+    expect(keys).toEqual([]);
+  });
+
+  it('still submits through writeRawCommandLine', async () => {
+    const sendSpecialKeys = vi.fn(() => true);
+    expect(await writeRawCommandLine(
+      { write: vi.fn(() => true), sendText: vi.fn(() => true), sendSpecialKeys },
+      '/model',
+      { delay: noDelay },
+    )).toBe(true);
+    expect(sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 });

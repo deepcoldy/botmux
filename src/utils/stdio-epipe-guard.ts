@@ -9,9 +9,7 @@
  * stdout/stderr is a Socket, the failed write surfaces as an 'error' event;
  * with no listener Node escalates it to an uncaughtException.
  *
- * That is fatal for botmux: the daemon registers no global uncaughtException
- * handler (so a broken pipe would kill the whole daemon), and the worker's
- * handler calls process.exit(1) on any uncaught error (so a broken pipe would
+ * That is fatal for botmux: daemon and worker both exit on an uncaught error (so a broken pipe would
  * take down a live CLI session). The real logs are captured by pm2's out/err
  * files regardless, so the correct behavior is to drop the failed write
  * silently and keep running rather than crash.

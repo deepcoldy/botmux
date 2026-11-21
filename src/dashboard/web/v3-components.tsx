@@ -6,22 +6,46 @@ import { useT } from './react-hooks.js';
 import { ui } from './ui.js';
 import { cancelV3Run, fetchV3RunDetail, fetchV3Runs } from './v3-api.js';
 import {
+  V3_ATTEMPT_OUTCOME_LABEL,
   V3_DECISION_LABEL,
+  V3_DISPLAY_LABEL,
+  V3_DISPLAY_LEGEND,
+  V3_DISPLAY_STATUS,
   V3_GRAPH,
   V3_NODE_LABEL,
   V3_POLL_MS,
   buildGraphLayout,
   buildRoundMiniDagLayout,
+  formatV3Duration,
   graphNodes,
   isTerminalRunStatus,
   loopBudget,
   loopInstances,
   loopRounds,
+  nodeBotLine,
+  nodeBoxBotLine,
+  nodeInMainTopic,
+  nodeElapsedMs,
+  nodeStatusLine,
+  nodeWaitingMs,
   resolveLoopTerminalNode,
   trunc,
   v3RunIdFromHash,
+  nodeBoxHeading,
+  nodeRevisionBadge,
+  V3_NODE_HEADING,
+  V3_REVISION_ROLE_LABEL,
+  V3_REVISION_STATE_LABEL,
+  V3_INTERVENTION_LABEL,
+  V3_INTERVENTION_ROLE_LABEL,
+  V3_CHECKPOINT_LABEL,
 } from './v3-model.js';
 import { nodeTerminalSignature, renderNodeTerminal } from './v3-terminal.js';
+import { NewWorkflowEntry, WorkflowDraftPage, WorkflowDraftsSection, WorkflowNewPage, useWorkflowSwitches } from './workflow-draft-page.js';
+import { parseWorkflowsRoute, workflowEntryMode } from './workflow-draft-model.js';
+import { SaveTemplateDialog, WorkflowLibraryEntry, WorkflowLibraryPage, WorkflowTemplatePage } from './workflow-library-page.js';
+import { fetchOrchestratorBots } from './workflow-draft-api.js';
+import { CopyWorkflowButton, CopyWorkflowDialog } from './workflow-copy.js';
 import type { RunNodeView, RunSummary, RunView } from '../../workflows/v3/ops-projection.js';
 
 function isDocumentHidden(): boolean {
@@ -113,9 +137,14 @@ function useV3RunDetail(runId: string): DetailPollState {
 function V3ListPage(): React.JSX.Element {
   const tr = useT();
   const runs = useV3RunsList();
+  // Dashboard orchestration (design 2026-11-03 §4.1, §4.6): no new entry at
+  // all while the workflow switch is off (or not known yet).
+  const entryMode = workflowEntryMode(useWorkflowSwitches());
   const headingActions = (
     <div className="page-heading-actions v3r-run-toolbar">
       <span className="v3r-run-count">{runs.length}</span>
+      {entryMode === 'ready' ? <WorkflowLibraryEntry /> : null}
+      {entryMode !== 'hidden' ? <NewWorkflowEntry mode={entryMode} /> : null}
     </div>
   );
 
@@ -145,6 +174,7 @@ function V3ListPage(): React.JSX.Element {
           )}
         </div>
       </section>
+      {entryMode === 'ready' ? <WorkflowDraftsSection /> : null}
     </>
   );
 }
@@ -158,8 +188,21 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
   const [cancelBusy, setCancelBusy] = useState(false);
   const [cancelSubmitted, setCancelSubmitted] = useState(false);
   const [cancelNotice, setCancelNotice] = useState<string | null>(null);
+  // 「保存为模板」(D5): only with Dashboard orchestration on, on a finished run.
+  const entryMode = workflowEntryMode(useWorkflowSwitches());
+  const [saving, setSaving] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [botNames, setBotNames] = useState<Map<string, string>>(() => new Map());
+  useEffect(() => {
+    if (!saving || botNames.size) return;
+    void fetchOrchestratorBots().then((result) => {
+      if (result.ok) setBotNames(new Map(result.bots.map((bot) => [bot.larkAppId, bot.name])));
+    });
+  }, [botNames.size, saving]);
 
   useEffect(() => {
+    setSaving(false);
+    setCopying(false);
     setSelectedId(null);
     setInstanceId(null);
     setInstancePinned(false);
@@ -242,6 +285,11 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
           <span className={`${statusClass} v3r-run-status-pill`}>{statusText}</span>
         </div>
         <div className="page-heading-actions">
+          {entryMode === 'ready' && ui.authed && terminal && !saving ? (
+            <button type="button" onClick={() => setSaving(true)}>{tr('workflow.library.saveFromRun')}</button>
+          ) : null}
+          {/* 「复制为新工作流」(D6): any run, finished or not. */}
+          {entryMode === 'ready' && ui.authed ? <CopyWorkflowButton active={copying} onOpen={() => setCopying(true)} /> : null}
           <V3CancelButton
             runStatus={view?.runStatus}
             busy={cancelBusy || cancelSubmitted}
@@ -254,24 +302,30 @@ function V3DetailPage(props: { runId: string }): React.JSX.Element {
           {cancelNotice}
         </div>
       ) : null}
+      {saving ? <SaveTemplateDialog source={{ kind: 'run', runId: props.runId }} botNames={botNames} onClose={() => setSaving(false)} /> : null}
+      {copying && entryMode === 'ready' ? <CopyWorkflowDialog source={{ kind: 'run', runId: props.runId }} onClose={() => setCopying(false)} /> : null}
       <div className="v3r-wrap">
         <section className="overview-block v3r-graph-section">
           <SectionHeader
             title="运行拓扑"
-            hint={view ? `${view.nodes.length} 个节点` : statusText}
+            hint={view
+              ? `${view.nodes.filter((node) => node.pendingChange !== 'add').length} 个节点${view.revision ? ` · 第 ${view.revision.current} 版` : ''}`
+              : statusText}
           />
           <div className="v3r-graph-card">
             <DagGraph view={view} selectedId={selectedId} onSelect={selectNode} />
             <V3Legend />
           </div>
+          {view?.revision ? <RevisionHistory revision={view.revision} /> : null}
         </section>
         <section className="overview-block v3r-node-section">
           <SectionHeader
             title="节点详情"
             hint={selectedNode ? (
-              <span className={`v3r-pill v3r-node-status-pill st-${selectedNode.status}`}>
+              <span className={`v3r-pill v3r-node-status-pill st-${selectedNode.status} ds-${V3_DISPLAY_STATUS[selectedNode.status]}`}>
                 <i className="dot" />
-                {V3_NODE_LABEL[selectedNode.status]}
+                {V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[selectedNode.status]]}
+                {V3_DISPLAY_STATUS[selectedNode.status] === 'needsHuman' ? `（${V3_NODE_LABEL[selectedNode.status]}）` : ''}
               </span>
             ) : '选择一个节点'}
           />
@@ -315,26 +369,27 @@ export function V3CancelButton(props: {
   );
 }
 
-function V3Legend(): React.JSX.Element {
+export function V3Legend(): React.JSX.Element {
   return (
     <div className="v3r-legend">
-      <span className="lg st-pending">待机</span>
-      <span className="lg st-running">运行中</span>
-      <span className="lg st-gateWaiting">等审批</span>
-      <span className="lg st-done">完成</span>
-      <span className="lg st-skipped">已跳过</span>
-      <span className="lg st-cancelled">已取消</span>
-      <span className="lg st-blocked">受阻</span>
-      <span className="lg st-failed">失败</span>
+      {V3_DISPLAY_LEGEND.map((status) => (
+        <span key={status} className={`lg ds-${status}`}>{V3_DISPLAY_LABEL[status]}</span>
+      ))}
       <span className="lg lg-loop">⟳ 循环容器</span>
     </div>
   );
 }
 
-function DagGraph(props: {
+/** The run-detail flow graph. Also the draft page's (design 2026-11-03
+ *  workflow-dashboard-orchestration §4.4): `statusLineOf` replaces the third
+ *  row, `interactive` makes boxes keyboard-focusable buttons. */
+export function DagGraph(props: {
   view: RunView | null;
   selectedId: string | null;
   onSelect: (nodeId: string) => void;
+  statusLineOf?: (node: RunNodeView) => string;
+  interactive?: boolean;
+  nodeLabelOf?: (node: RunNodeView) => string;
 }): React.JSX.Element {
   const layout = useMemo(() => props.view ? buildGraphLayout(props.view) : null, [props.view]);
   const topologyKey = layout
@@ -382,7 +437,7 @@ function DagGraph(props: {
             {layout.edges.map((edge) => (
               <path
                 key={`${edge.fromId}->${edge.toId}`}
-                className={`v3r-edge${edge.live ? ' live' : ''}`}
+                className={`v3r-edge${edge.live ? ' live' : ''}${edge.pending ? ' pending' : ''}`}
                 d={`M${edge.x1},${edge.y1} C${edge.mx},${edge.y1} ${edge.mx},${edge.y2} ${edge.x2},${edge.y2}`}
                 markerEnd="url(#v3arrow)"
               />
@@ -391,8 +446,11 @@ function DagGraph(props: {
               <DagNode
                 key={box.node.id}
                 box={box}
+                generatedAt={props.view?.generatedAt}
                 selected={box.node.id === props.selectedId}
                 onSelect={props.onSelect}
+                {...(props.statusLineOf ? { statusLine: props.statusLineOf(box.node) } : {})}
+                {...(props.interactive ? { ariaLabel: props.nodeLabelOf?.(box.node) ?? box.node.id } : {})}
               />
             ))}
           </svg>
@@ -402,53 +460,101 @@ function DagGraph(props: {
   );
 }
 
-function DagNode(props: {
+export function DagNode(props: {
   box: ReturnType<typeof buildGraphLayout>['nodes'][number];
+  generatedAt: number | undefined;
   selected: boolean;
   onSelect: (nodeId: string) => void;
+  /** Third row override (draft flow graph). */
+  statusLine?: string;
+  /** Set: the box is a focusable button with this accessible name. */
+  ariaLabel?: string;
 }): React.JSX.Element {
   const { box, selected } = props;
   const node = box.node;
   if (node.isLoop) {
-    return <LoopGraphNode box={box} selected={selected} onSelect={props.onSelect} />;
+    return <LoopGraphNode box={box} generatedAt={props.generatedAt} selected={selected} onSelect={props.onSelect} statusLine={props.statusLine} ariaLabel={props.ariaLabel} />;
   }
+  const botLine = nodeBoxBotLine(node);
+  const fit = boxTextFit(box.width);
+  const heading = nodeBoxHeading(node, box.width, fit(22));
   return (
     <g
-      className={`v3r-node st-${node.status}${selected ? ' sel' : ''}`}
+      className={`v3r-node st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}${node.pendingChange ? ` pending pending-${node.pendingChange}` : ''}${node.revisionMark ? ` rev-${node.revisionMark}` : ''}`}
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
+      {...nodeButtonProps(props.ariaLabel, selected, () => props.onSelect(node.id))}
     >
-      <rect className="v3r-box" x={box.x} y={box.y} width={V3_GRAPH.nodeWidth} height={V3_GRAPH.plainHeight} rx="10" />
-      <text className="v3r-nid" x={box.x + 14} y={box.y + 20}>{trunc(node.id, 18)}</text>
-      <text className="v3r-nstatus" x={box.x + 14} y={box.y + 37}>{V3_NODE_LABEL[node.status]}</text>
+      {heading.badgeTitle ? <title>{heading.badgeTitle}</title> : null}
+      <rect className="v3r-box" x={box.x} y={box.y} width={box.width} height={V3_GRAPH.plainHeight} rx="10" />
+      <text className="v3r-nid" x={box.x + V3_NODE_HEADING.inset} y={box.y + 20}>{trunc(node.id, heading.idChars)}</text>
+      {heading.badge ? (
+        <text className="v3r-nrev" x={box.x + box.width - V3_NODE_HEADING.badgeInset} y={box.y + 20} textAnchor="end">{heading.badge}</text>
+      ) : null}
+      <text className={`v3r-nbot${botLine ? '' : ' empty'}`} x={box.x + 14} y={box.y + 38}>
+        {botLine ? trunc(botLine, fit(24)) : '—'}
+      </text>
+      <text className="v3r-nstatus" x={box.x + 14} y={box.y + 55}>
+        {trunc(props.statusLine ?? nodeStatusLine(node, props.generatedAt), fit(22))}
+      </text>
     </g>
   );
 }
 
+/** Keyboard affordance of a graph box (draft page only; run detail keeps its markup). */
+function nodeButtonProps(ariaLabel: string | undefined, selected: boolean, activate: () => void): React.SVGProps<SVGGElement> {
+  if (ariaLabel === undefined) return {};
+  return {
+    role: 'button',
+    tabIndex: 0,
+    'aria-label': ariaLabel,
+    'aria-pressed': selected,
+    onKeyDown: (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      activate();
+    },
+  };
+}
+
+/** Truncation budget for a box narrower than the standard width (the sidebar's
+ *  vertical layout); the standard box keeps its historical budgets. */
+function boxTextFit(width: number): (chars: number) => number {
+  return (chars) => (width >= V3_GRAPH.nodeWidth ? chars : Math.max(8, Math.floor(chars * width / V3_GRAPH.nodeWidth)));
+}
+
 function LoopGraphNode(props: {
   box: ReturnType<typeof buildGraphLayout>['nodes'][number];
+  generatedAt: number | undefined;
   selected: boolean;
   onSelect: (nodeId: string) => void;
+  statusLine?: string;
+  ariaLabel?: string;
 }): React.JSX.Element {
   const { box, selected } = props;
   const node = box.node;
   const ls = node.loopState;
   const budget = loopBudget(node);
-  const statusLine = ls
-    ? `${V3_NODE_LABEL[node.status]} · 第${ls.iteration}${budget !== undefined ? `/${budget}` : ''}轮`
-    : `${V3_NODE_LABEL[node.status]} · loop`;
+  const label = V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[node.status]];
+  const elapsed = props.generatedAt !== undefined ? nodeElapsedMs(node, props.generatedAt) : undefined;
+  const statusLine = props.statusLine ?? [
+    label,
+    ls ? `第${ls.iteration}${budget !== undefined ? `/${budget}` : ''}轮` : 'loop',
+    ...(elapsed !== undefined ? [formatV3Duration(elapsed)] : []),
+  ].join(' · ');
   const maxIterations = ls?.maxIterations;
 
   return (
     <g
-      className={`v3r-node v3r-loopnode st-${node.status}${selected ? ' sel' : ''}`}
+      className={`v3r-node v3r-loopnode st-${node.status} ds-${V3_DISPLAY_STATUS[node.status]}${selected ? ' sel' : ''}`}
       data-node={node.id}
       onClick={() => props.onSelect(node.id)}
+      {...nodeButtonProps(props.ariaLabel, selected, () => props.onSelect(node.id))}
     >
-      <rect className="v3r-cap" x={box.x - 4} y={box.y - 4} width={V3_GRAPH.nodeWidth + 8} height={V3_GRAPH.loopHeight + 8} rx="14" />
-      <rect className="v3r-box" x={box.x} y={box.y} width={V3_GRAPH.nodeWidth} height={V3_GRAPH.loopHeight} rx="10" />
+      <rect className="v3r-cap" x={box.x - 4} y={box.y - 4} width={box.width + 8} height={V3_GRAPH.loopHeight + 8} rx="14" />
+      <rect className="v3r-box" x={box.x} y={box.y} width={box.width} height={V3_GRAPH.loopHeight} rx="10" />
       <text className="v3r-spin" x={box.x + 14} y={box.y + 21}>⟳</text>
-      <text className="v3r-nid" x={box.x + 30} y={box.y + 21}>{trunc(node.id, 16)}</text>
+      <text className="v3r-nid" x={box.x + 30} y={box.y + 21}>{trunc(node.id, boxTextFit(box.width)(20))}</text>
       <text className="v3r-nstatus" x={box.x + 14} y={box.y + 39}>{statusLine}</text>
       {ls && budget !== undefined && budget <= V3_GRAPH.maxDots ? (
         <LoopBudgetDots node={node} x={box.x} y={box.y} budget={budget} maxIterations={maxIterations} />
@@ -518,7 +624,26 @@ function NodePanel(props: {
   return (
     <div id="v3-node-panel" className="v3r-panel">
       <div id="v3-node-meta">
+        {nodeRevisionBadge(node) ? (
+          <p className="v3r-rev-note">流程修改：{nodeRevisionBadge(node)}</p>
+        ) : null}
         {node.goal ? <p className="v3r-goal">{node.goal}</p> : null}
+        <NodeExecution node={node} generatedAt={props.view?.generatedAt} />
+        {nodeInMainTopic(node) ? (
+          // §5.5: no stable link to a single message — say when and what to
+          // look for in the main topic.
+          <p className="v3r-exec-row">
+            <span>落点</span>主话题
+            {node.handoff?.at !== undefined ? ` · ${formatClock(node.handoff.at)} 交接` : '（还没交接）'}
+            {node.handoff?.queued ? ' · 排队中：等执行 Bot 在主话题里的当前一轮结束' : ''}
+            {node.handoff?.title ? ` · 在主话题里找「${node.handoff.title}」` : ''}
+          </p>
+        ) : null}
+        {node.checkpoint ? <p className="v3r-checkpoint">{V3_CHECKPOINT_LABEL[node.checkpoint]}</p> : null}
+        {node.waitingOnCheckpoint?.length ? (
+          <p className="v3r-checkpoint">等检查点 {node.waitingOnCheckpoint.join('、')} 由主 Bot 看完结果后再开始</p>
+        ) : null}
+        <NodeInterventions node={node} />
         {node.depends.length ? (
           <p className="v3r-deps">
             <span>依赖</span>
@@ -546,7 +671,110 @@ function NodePanel(props: {
   );
 }
 
-function NodeErrorLine(props: { node: RunNodeView }): React.JSX.Element {
+/** Revision history (design §13.7): time, who, summary, confirmed or not.
+ *  Also the workflow sidebar's version panel (§11.3). */
+export function RevisionHistory(props: { revision: NonNullable<RunView['revision']> }): React.JSX.Element {
+  const { revision } = props;
+  return (
+    <div className="v3r-revisions">
+      <p className="v3r-revisions-title">
+        流程版本：第 {revision.current} 版
+        {revision.pending ? <span className="v3r-rev-pending"> · 第 {revision.pending.revision} 版待发起人确认</span> : null}
+        {revision.integrityError ? <span className="v3r-rev-error"> · 修改记录校验失败</span> : null}
+      </p>
+      <ol className="v3r-revisions-list">
+        {revision.history.map((entry) => (
+          <li key={entry.revision} className={`v3r-rev-entry rev-${entry.state}`}>
+            <span className="v3r-rev-num">第 {entry.revision} 版</span>
+            <span className="v3r-rev-time">{formatClock(entry.at)}</span>
+            <span className="v3r-rev-by">{V3_REVISION_ROLE_LABEL[entry.by]}</span>
+            <span className="v3r-rev-summary">{entry.summary}</span>
+            <span className="v3r-rev-state">
+              {V3_REVISION_STATE_LABEL[entry.state]}{entry.confirmed ? ' · 已确认' : ''}
+            </span>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+function formatClock(ts: number): string {
+  const d = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/** Who runs the node, how long it took / has been waiting, and every attempt. */
+export function NodeExecution(props: { node: RunNodeView; generatedAt: number | undefined }): React.JSX.Element | null {
+  const { node, generatedAt } = props;
+  const botLine = nodeBotLine(node);
+  const elapsed = generatedAt !== undefined ? nodeElapsedMs(node, generatedAt) : undefined;
+  const waiting = generatedAt !== undefined ? nodeWaitingMs(node, generatedAt) : undefined;
+  if (!botLine && elapsed === undefined && waiting === undefined && node.attempts.length === 0) return null;
+  return (
+    <div className="v3r-exec">
+      {botLine ? (
+        <p className="v3r-exec-row"><span>执行</span>{botLine}{node.bot?.model ? ` · ${node.bot.model}` : ''}</p>
+      ) : null}
+
+      {elapsed !== undefined ? (
+        <p className="v3r-exec-row">
+          <span>耗时</span>{formatV3Duration(elapsed)}{node.status === 'running' ? '（进行中）' : ''}
+        </p>
+      ) : null}
+      {waiting !== undefined ? (
+        <p className="v3r-exec-row">
+          <span>等人</span>已等 {formatV3Duration(waiting)}（{node.status === 'gateWaiting' ? '等审批' : '受阻，等人处理'}）
+        </p>
+      ) : null}
+      {node.attempts.length > 1 || node.attempts.some((attempt) => attempt.outcome && attempt.outcome !== 'succeeded') ? (
+        <ol className="v3r-attempts">
+          {node.attempts.map((attempt, index) => {
+            const end = attempt.endedAt ?? (attempt.outcome === undefined ? generatedAt : undefined);
+            return (
+              <li key={attempt.attemptId}>
+                <span className="n">第 {index + 1} 次</span>
+                <span className="t">{formatClock(attempt.startedAt)}</span>
+                {end !== undefined ? <span className="d">{formatV3Duration(end - attempt.startedAt)}</span> : null}
+                <span className={`o${attempt.outcome ? ` o-${attempt.outcome}` : ' o-running'}`}>
+                  {attempt.outcome ? V3_ATTEMPT_OUTCOME_LABEL[attempt.outcome] ?? attempt.outcome : '进行中'}
+                  {attempt.errorCode ? ` (${attempt.errorCode})` : ''}
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+      ) : null}
+    </div>
+  );
+}
+
+/** Every automatic handling by the main bot and every hand-over to a
+ *  person, with the reason as given (design §13.6). */
+export function NodeInterventions(props: { node: RunNodeView }): React.JSX.Element | null {
+  const items = props.node.interventions ?? [];
+  if (items.length === 0) return null;
+  return (
+    <div className="v3r-interventions">
+      <p className="v3r-interventions-title">自动处理与交给人</p>
+      <ol className="v3r-interventions-list">
+        {items.map((item, index) => (
+          <li key={`${item.at}-${index}`} className={`v3r-intervention kind-${item.kind}`}>
+            <span className="t">{formatClock(item.at)}</span>
+            <span className="k">{V3_INTERVENTION_LABEL[item.kind]}</span>
+            {item.kind === 'handedToHuman' && item.by !== 'mainBot' ? (
+              <span className="b">（{V3_INTERVENTION_ROLE_LABEL[item.by]}）</span>
+            ) : null}
+            {item.reason ? <span className="r">{item.reason}</span> : null}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
+
+export function NodeErrorLine(props: { node: RunNodeView }): React.JSX.Element {
   const node = props.node;
   return (
     <p className="v3r-err">
@@ -682,7 +910,7 @@ function RoundMiniDag(props: {
   );
 }
 
-function TerminalSlot(props: { runId: string; node: RunNodeView | null }): React.JSX.Element {
+export function TerminalSlot(props: { runId: string; node: RunNodeView | null }): React.JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
   const renderedSignatureRef = useRef<string | null>(null);
   const signature = props.node ? `${props.runId}|${props.node.id}|${nodeTerminalSignature(props.node)}` : null;
@@ -703,11 +931,27 @@ function TerminalSlot(props: { runId: string; node: RunNodeView | null }): React
   return <div id="v3-term-slot" className="v3r-term-slot" ref={ref} />;
 }
 
+/** The template pages exist only with Dashboard orchestration on (§10). */
+function LibraryGate(props: { children: React.ReactNode }): React.JSX.Element {
+  const mode = workflowEntryMode(useWorkflowSwitches());
+  return mode === 'ready' ? <>{props.children}</> : <V3ListPage />;
+}
+
 export function V3RunsPage(): React.JSX.Element {
-  const runId = v3RunIdFromHash();
+  // Route table (E13): new / drafts / library before run detail.
+  const route = parseWorkflowsRoute(typeof location !== 'undefined' ? location.hash : '');
+  const runId = route.kind === 'run' ? v3RunIdFromHash() : null;
   return (
     <section className="page workflows-page v3-page">
-      {runId ? <V3DetailPage runId={runId} /> : <V3ListPage />}
+      {route.kind === 'new'
+        ? <WorkflowNewPage />
+        : route.kind === 'draft'
+          ? <WorkflowDraftPage runId={route.runId} />
+          : route.kind === 'library'
+            ? <LibraryGate><WorkflowLibraryPage /></LibraryGate>
+            : route.kind === 'template'
+              ? <LibraryGate><WorkflowTemplatePage workflowId={route.workflowId} /></LibraryGate>
+              : runId ? <V3DetailPage runId={runId} /> : <V3ListPage />}
     </section>
   );
 }

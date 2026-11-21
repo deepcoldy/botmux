@@ -47,6 +47,20 @@ describe('installHook — claude-settings', () => {
     configPath = join(tmpDir, '.claude', 'settings.json');
   });
 
+  it('幂等安装 PreCompact 维护 hook，保留用户已有 hook 与压缩开关', () => {
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    const userHook = { hooks: [{ type: 'command', command: '/usr/local/bin/user-compact-hook' }] };
+    writeFileSync(configPath, JSON.stringify({ idleCompaction: true, hooks: { PreCompact: [userHook] } }));
+    for (let i = 0; i < 2; i++) {
+      installHook('claude-code', { configPath, format: 'claude-settings', preCompactCommand: '/usr/bin/node /path/to/cli.js __claude-compaction-v1' }, hookCommand);
+    }
+    const settings = JSON.parse(readFileSync(configPath, 'utf8'));
+    expect(settings.idleCompaction).toBe(true);
+    expect(settings.hooks.PreCompact).toHaveLength(2);
+    expect(settings.hooks.PreCompact[0]).toEqual(userHook);
+    expect(settings.hooks.PreCompact[1].hooks[0].command).toBe('/usr/bin/node /path/to/cli.js __claude-compaction-v1');
+  });
+
   it('(a) 写入 PreToolUse AskUserQuestion hook 指向给定 hookCommand', () => {
     installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
 

@@ -19,6 +19,8 @@ import type { ModelFallbackState } from '../types.js';
 // cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
 // dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
+// provider-retry-hint 同样零依赖（只用语言内建）。
+import { parseProviderRetryAtMs } from './provider-retry-hint.js';
 
 /** Read the session identity published by one live Claude Code process. */
 export function readClaudeSessionMeta(
@@ -133,9 +135,13 @@ export interface TranscriptEvent {
    *  Background launches are read from here — see {@link backgroundTaskLaunches}. */
   toolUseResult?: unknown;
   /** `type:"queue-operation"` lines: `enqueue` / `dequeue` / `remove` on Claude
-   *  Code's input queue, with the queued text in the top-level `content`. */
+   *  Code's input queue, with the queued text in the top-level `content`.
+   *  `remove` records additionally carry the queued item's `commandUuid`
+   *  (and often its `deliveryId`); `enqueue` / `dequeue` carry neither. */
   operation?: string;
   content?: unknown;
+  commandUuid?: string;
+  deliveryId?: string;
 }
 
 /**
@@ -538,7 +544,15 @@ export class ClaudeModelFallbackTracker {
  * retryable only when its bounded text matches a verified transient signature. */
 export type ClaudeTerminalOutcome =
   | { status: 'completed' }
-  | { status: 'failed'; errorCode: string; retryable: boolean }
+  | {
+    status: 'failed';
+    errorCode: string;
+    retryable: boolean;
+    /** Retryable failures only: when the provider's own error text says the
+     *  request may be retried (gateway "available at", Retry-After, "try
+     *  again in 30s"). Absent when it names no usable time. */
+    retryAtMs?: number;
+  }
   | { status: 'ambiguous'; errorCode: string; retryable: false }
   | { status: 'rate_limited'; errorCode: 'provider_rate_limited'; retryable: false };
 
@@ -548,6 +562,16 @@ function normalizedApiErrorCode(ev: TranscriptEvent): string {
 
 function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
   return pattern.test(apiErrorMessageText(ev));
+}
+
+/** Attach the provider's own "retry at" to a retryable failure. Relative hints
+ *  are anchored at the record's timestamp, not at whenever it is read. */
+function withProviderRetryHint(
+  ev: TranscriptEvent,
+  outcome: { status: 'failed'; errorCode: string; retryable: true },
+): Extract<ClaudeTerminalOutcome, { status: 'failed' }> {
+  const retryAtMs = parseProviderRetryAtMs(apiErrorMessageText(ev), eventTimeMs(ev) ?? Date.now());
+  return retryAtMs === undefined ? outcome : { ...outcome, retryAtMs };
 }
 
 /** Model placeholder Claude Code writes on assistant records no model produced. */
@@ -603,18 +627,28 @@ export function classifyClaudeTerminalEvent(
     }
     if (code.includes('invalid') || code.includes('terms')
       || (typeof status === 'number' && status >= 400 && status <= 499)) {
+      // A 400 caused by an under-sized image is not an ordinary bad request:
+      // Claude Code's Read tool returned the image bytes into the turn, and
+      // the image block now lives in the session transcript. EVERY later
+      // request replays it, so the session stays 400 until the history is
+      // cleared (/clear) — re-sending the prompt or continuing cannot work.
+      // Give it its own code so the failure card can say that instead of the
+      // generic "invalid request, don't retry" line.
+      if (hasApiErrorSignature(ev, /image data \d+ failed: Image dimensions are too small/i)) {
+        return { status: 'failed', errorCode: 'provider_image_too_small', retryable: false };
+      }
       return { status: 'failed', errorCode: 'provider_invalid_request', retryable: false };
     }
     if (code.includes('cancel')) {
       return { status: 'failed', errorCode: 'provider_cancelled', retryable: false };
     }
     if (code === 'unknown' && hasApiErrorSignature(ev, /unexpected\s+eof/i)) {
-      return { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true };
+      return withProviderRetryHint(ev, { status: 'failed', errorCode: 'provider_unexpected_eof', retryable: true });
     }
     if (code === 'server_error'
       || (typeof status === 'number' && status >= 500 && status <= 599)
       || hasApiErrorSignature(ev, /(?:connection\s+(?:reset|lost|closed)|econnreset|http2:\s*client\s+connection\s+lost|closed\s+mid-response|internalserverexception|server\s+unavailable|temporarily\s+unavailable|overload(?:ed)?)/i)) {
-      return { status: 'failed', errorCode: 'provider_server_error', retryable: true };
+      return withProviderRetryHint(ev, { status: 'failed', errorCode: 'provider_server_error', retryable: true });
     }
     return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
   }
@@ -842,6 +876,8 @@ export interface BackgroundTaskLaunch {
   kind: BackgroundTaskKind;
   /** Hard end Claude Code itself enforces (non-persistent Monitor timeout). */
   expiresAtMs?: number;
+  /** A stopped agent started again (SendMessage), under its original id. */
+  resumed?: true;
 }
 
 export function eventTimeMs(ev: TranscriptEvent): number | undefined {
@@ -857,7 +893,12 @@ export function eventTimeMs(ev: TranscriptEvent): number | undefined {
  *    `{ backgroundTaskId }`;
  *  - Monitor → `{ taskId, timeoutMs, persistent }`. A non-persistent Monitor
  *    expires after `timeoutMs` even if no end record is read, so it carries
- *    that deadline.
+ *    that deadline;
+ *  - SendMessage to an agent that had stopped (2.1.322) →
+ *    `{ success:true, message:'Resuming agent …', resumedAgentId, revivedAgentId }`:
+ *    the agent runs again in the background under its original id, and its
+ *    next stop is reported the same way. A message to an agent that is still
+ *    running (`Message queued for delivery …`) changes nothing.
  *  The id is the one the task's `<task-notification>` later reports as `<task-id>`. */
 export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunch[] {
   if (!ev || ev.isSidechain === true) return [];
@@ -875,6 +916,11 @@ export function backgroundTaskLaunches(ev: TranscriptEvent): BackgroundTaskLaunc
     const at = eventTimeMs(ev);
     const expiresAtMs = !r.persistent && r.timeoutMs > 0 && at !== undefined ? at + r.timeoutMs : undefined;
     return [{ taskId: r.taskId, kind: 'monitor', ...(expiresAtMs !== undefined ? { expiresAtMs } : {}) }];
+  }
+  const resumedAgentId = typeof r.resumedAgentId === 'string' && r.resumedAgentId ? r.resumedAgentId
+    : typeof r.revivedAgentId === 'string' && r.revivedAgentId ? r.revivedAgentId : undefined;
+  if (r.success !== false && resumedAgentId) {
+    return [{ taskId: resumedAgentId, kind: 'agent', resumed: true }];
   }
   return [];
 }
@@ -958,6 +1004,9 @@ interface TrackedBackgroundTask {
   expiresAtMs?: number;
   /** Value of `promptSeq` when launched — see {@link BackgroundTaskTracker.pendingTurnAgents}. */
   promptSeq: number;
+  /** When this run started (its launch or resume was written). A stop written
+   *  before it belongs to an earlier run of the same agent. */
+  sinceMs?: number;
 }
 
 /** Live set of background work (Agent / Bash / Monitor) the main thread has
@@ -984,9 +1033,11 @@ interface TrackedBackgroundTask {
  *  so a duplicate notification or a re-drained launch cannot double-count. */
 export class BackgroundTaskTracker {
   private readonly live = new Map<string, TrackedBackgroundTask>();
-  /** Ids already seen stopping. A rotation re-drain can re-read a launch after
-   *  its stop (/clear writes the stop into the NEW file); it must not revive it. */
-  private readonly settled = new Set<string>();
+  /** Ids already seen stopping, with the stop's time when known. A rotation
+   *  re-drain can re-read a launch after its stop (/clear writes the stop into
+   *  the NEW file); it must not revive it. Only a resume written after the stop
+   *  does. */
+  private readonly settled = new Map<string, number | undefined>();
   /** tool_use_id → agentId, so a dispatch seen before its ack can be paired. */
   private readonly ackByToolUse = new Map<string, string>();
   /** Dispatch tool_use ids awaiting their launch-ack (async not yet confirmed). */
@@ -1007,7 +1058,7 @@ export class BackgroundTaskTracker {
     }
     const atMs = eventTimeMs(ev);
     for (const launch of backgroundTaskLaunches(ev)) {
-      this.launch(launch.taskId, launch.kind, { atMs, expiresAtMs: launch.expiresAtMs });
+      this.launch(launch.taskId, launch.kind, { atMs, expiresAtMs: launch.expiresAtMs, resumed: launch.resumed });
     }
     // Builds that predate the structured `toolUseResult` are still recognised
     // from the dispatch tool_use + launch-ack text pair.
@@ -1020,33 +1071,60 @@ export class BackgroundTaskTracker {
       this.ackByToolUse.set(ack.toolUseId, ack.agentId);
       if (this.awaitingAck.delete(ack.toolUseId)) this.launch(ack.agentId, 'agent', { atMs });
     }
-    for (const id of backgroundTaskSettledIds(ev)) this.settle(id);
+    for (const id of backgroundTaskSettledIds(ev)) this.settle(id, atMs);
   }
 
   /** Record a running task. `atMs` is when the launch was written; one older
-   *  than the current CLI process (see {@link reset}) is ignored. */
-  launch(taskId: string, kind: BackgroundTaskKind, opts: { atMs?: number; expiresAtMs?: number } = {}): void {
+   *  than the current CLI process (see {@link reset}) is ignored. A `resumed`
+   *  agent runs again after it stopped: it revives a settled id, but only when
+   *  written after that stop (a re-drained resume is older than the next stop). */
+  launch(taskId: string, kind: BackgroundTaskKind, opts: { atMs?: number; expiresAtMs?: number; resumed?: boolean } = {}): void {
     if (opts.atMs !== undefined && opts.atMs < this.liveSinceMs) return;
-    if (this.settled.has(taskId) || this.live.has(taskId)) return;
+    const running = this.live.get(taskId);
+    if (running) {
+      // Resumed again before its previous stop was read: this run is newer.
+      if (opts.resumed && opts.atMs !== undefined && (running.sinceMs === undefined || opts.atMs > running.sinceMs)) {
+        running.sinceMs = opts.atMs;
+      }
+      return;
+    }
+    if (this.settled.has(taskId)) {
+      const stoppedAtMs = this.settled.get(taskId);
+      if (!opts.resumed || opts.atMs === undefined || stoppedAtMs === undefined || opts.atMs <= stoppedAtMs) return;
+      this.settled.delete(taskId);
+    }
     this.live.set(taskId, {
       kind,
       promptSeq: this.promptSeq,
       ...(opts.expiresAtMs !== undefined ? { expiresAtMs: opts.expiresAtMs } : {}),
+      ...(opts.atMs !== undefined ? { sinceMs: opts.atMs } : {}),
     });
   }
 
-  settle(taskId: string): void {
-    this.live.delete(taskId);
-    this.settled.add(taskId);
+  /** Record a task's stop, written at `atMs` when known. A stop written before
+   *  the current run started ends an earlier run: an agent that finished while
+   *  the main turn was still busy has that notice delivered at the next tool
+   *  round, after the SendMessage that resumed it, under the earlier time. */
+  settle(taskId: string, atMs?: number): void {
+    const running = this.live.get(taskId);
+    if (!(running?.sinceMs !== undefined && atMs !== undefined && atMs < running.sinceMs)) this.live.delete(taskId);
+    const previous = this.settled.get(taskId);
+    this.settled.set(taskId, previous !== undefined && (atMs === undefined || previous > atMs) ? previous : atMs);
   }
 
   /** Background tasks still running at `nowMs`. */
   pending(nowMs = Date.now()): number {
-    let n = 0;
-    for (const task of this.live.values()) {
-      if (task.expiresAtMs === undefined || task.expiresAtMs > nowMs) n++;
+    return this.liveTaskIds(nowMs).length;
+  }
+
+  /** Ids of the background tasks still running at `nowMs` (what
+   *  {@link pending} counts). */
+  liveTaskIds(nowMs = Date.now()): string[] {
+    const ids: string[] = [];
+    for (const [taskId, task] of this.live) {
+      if (task.expiresAtMs === undefined || task.expiresAtMs > nowMs) ids.push(taskId);
     }
-    return n;
+    return ids;
   }
 
   /** Mark the main turn open or ended from a source other than a Claude
@@ -1827,7 +1905,9 @@ export interface JsonlFingerprintSearchOptions {
   /** Drop events whose `timestamp` field is older than this (millis since
    *  epoch). Defends against short fingerprints ("hello", "test") matching
    *  old user lines in unrelated sibling jsonls — file mtime alone isn't
-   *  enough since a sibling Claude pane could be actively writing. */
+   *  enough since a sibling Claude pane could be actively writing. Events
+   *  with no parseable timestamp are dropped as well (see
+   *  {@link eventAtOrAfter}). */
   minEventTimestampMs?: number;
   /** Also match Claude Code type-ahead enqueue events, whose content is not role:user. */
   includeQueueOperations?: boolean;
@@ -1839,6 +1919,39 @@ export interface JsonlFingerprintSearchOptions {
    *  under a busier sibling. Default (no callback): accept the first
    *  fingerprint match like the original behaviour. */
   acceptCandidate?: (path: string) => boolean;
+  /** Also scan Task/Agent subagent transcripts at
+   *  `<projectDir>/<sessionId>/subagents/*.jsonl`. While the TUI is viewing a
+   *  subagent, Claude Code hands a submitted prompt to THAT agent and records
+   *  it only in its jsonl — the session jsonl the bridge is watching gets no
+   *  record of it, so the top-level-only scan reports a false
+   *  submit_unconfirmed although the prompt landed. Subagent candidates only
+   *  accept the records Claude writes for a human message forwarded to the
+   *  agent (see jsonlTailMatchFingerprint). Only `<uuid>/subagents/` is
+   *  descended (one level), matching Claude Code's on-disk layout, so
+   *  unrelated nested directories are not walked. Callers that PIN the matched
+   *  path as the new bridge target must leave this off: a subagent jsonl must
+   *  never replace the session jsonl as the watched transcript. */
+  includeSubagentTranscripts?: boolean;
+  /** Also match `attachment(queued_command)` records (text in
+   *  `attachment.prompt`), except task notifications. A prompt handed to a
+   *  RUNNING subagent is only ever written this way, once the agent takes its
+   *  next step. Independent of includeSubagentTranscripts, which only widens
+   *  the file set: this widens what counts as a submit record in every
+   *  scanned file, so callers that pin the matched path or treat a match as
+   *  session-switch evidence must leave it off. */
+  includeQueuedCommandAttachments?: boolean;
+}
+
+/** True when the event carries a parseable timestamp at or after `floorMs`.
+ *  An event without one cannot be placed after the floor: Claude Code writes
+ *  `api-request-blob` records (a copy of a request's user content, no
+ *  timestamp) next to the original prompt, so letting them through matched a
+ *  new Lark turn against an hours-old identical prompt in another session's
+ *  file. */
+function eventAtOrAfter(ev: { timestamp?: unknown }, floorMs: number): boolean {
+  if (typeof ev.timestamp !== 'string') return false;
+  const evMs = Date.parse(ev.timestamp);
+  return Number.isFinite(evMs) && evMs >= floorMs;
 }
 
 /** Scan a single jsonl file's tail for a Lark message fingerprint. Same
@@ -1886,10 +1999,7 @@ export function jsonlContainsFingerprint(
     // mtime can be recent if a sibling Claude pane is actively writing
     // its own turns). We compare against `event.timestamp` rather than
     // file mtime to be precise.
-    if (minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-      const evMs = Date.parse(ev.timestamp);
-      if (Number.isFinite(evMs) && evMs < minEventTimestampMs) continue;
-    }
+    if (minEventTimestampMs !== undefined && !eventAtOrAfter(ev, minEventTimestampMs)) continue;
     const role = ev.message?.role ?? ev.type;
     let lineText = '';
     if (role === 'user') {
@@ -1914,6 +2024,111 @@ export function jsonlContainsFingerprint(
   return false;
 }
 
+/** A Claude Code session directory is named by the session uuid; subagent
+ *  transcripts live directly under `<uuid>/subagents/`. Matching this shape
+ *  (instead of descending every subdirectory) keeps the fingerprint fan-out
+ *  bounded when a project dir accumulates unrelated nested folders. */
+const SESSION_SUBDIR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Tail-scan one jsonl file for the fingerprint. Mirrors the event-decoding
+ *  rules used everywhere else: role:user text (pure tool_result events
+ *  skipped), optionally queue-operation enqueue and queued_command
+ *  attachments, whitespace-normalised substring match, with a per-event
+ *  timestamp guard. Returns:
+ *  - 'match' when a fingerprint-bearing event was found,
+ *  - 'veto' when a match was found but acceptCandidate rejected the file,
+ *  - 'none' otherwise. */
+function jsonlTailMatchFingerprint(
+  path: string,
+  fingerprint: string,
+  opts: JsonlFingerprintSearchOptions,
+  requireForwardedSubagentMessage = false,
+): 'match' | 'veto' | 'none' {
+  let hit = false;
+  try {
+    const fd = openSync(path, 'r');
+    try {
+      const size = statSync(path).size;
+      // Read at most the trailing 1MB — fingerprints land near the end
+      // of the jsonl when Claude just wrote them. Cheaper than reading
+      // an entire long-lived session.
+      const len = Math.min(size, 1024 * 1024);
+      const buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+      const text = buf.toString('utf8');
+      // We must NOT do a raw includes() here: Claude writes user content
+      // as a JSON-encoded string, so any newline in the Lark message is
+      // serialized as `\n` on disk while our fingerprint has it
+      // collapsed to a single space. Parse each complete jsonl line,
+      // pick role:user events, and apply the same stringify+normalise
+      // we use in BridgeTurnQueue.ingest. Skip the leading partial line
+      // when we read a strict tail (size > len), since it likely begins
+      // mid-line.
+      const lines = text.split('\n');
+      const startIdx = size > len ? 1 : 0;
+      for (let i = startIdx; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        let ev: any;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (!ev || typeof ev !== 'object') continue;
+        // Per-event timestamp guard — see jsonlContainsFingerprint for
+        // the full rationale. Required to keep short fingerprints
+        // ("hello", "test") from matching old user lines in unrelated
+        // sibling jsonls.
+        if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
+        const role = ev.message?.role ?? ev.type;
+        let text = '';
+        if (role === 'user') {
+          // A subagent transcript opens with its task instruction and also
+          // gets meta user records that no human sent (system reminders, task
+          // notifications, messages from the parent agent), any of which may
+          // quote the same text. Only a human message forwarded to the agent
+          // proves this submission landed: Claude writes it (when the message
+          // resumes a stopped agent) with isMeta and origin.kind 'human'.
+          if (requireForwardedSubagentMessage && !(ev.isMeta === true && ev.origin?.kind === 'human')) continue;
+          // Skip pure tool_result events — see jsonlContainsFingerprint
+          // for the full rationale; in short, tool_result content is
+          // log output, not user input, and would false-match short
+          // fingerprints like "hello" in unrelated jsonls.
+          if (isPureToolResultUserEvent(ev.message?.content)) continue;
+          text = stringifyUserContent(ev.message?.content);
+        } else if (
+          opts.includeQueueOperations &&
+          // Subagent candidates accept only the forwarded-human shapes.
+          !requireForwardedSubagentMessage &&
+          ev.type === 'queue-operation' &&
+          ev.operation === 'enqueue'
+        ) {
+          text = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
+        } else if (
+          opts.includeQueuedCommandAttachments &&
+          ev.type === 'attachment' &&
+          ev.attachment?.type === 'queued_command' &&
+          ev.attachment.commandMode !== 'task-notification'
+        ) {
+          // A running subagent also receives queued_command records from its
+          // parent agent (origin 'coordinator') and task notifications.
+          if (requireForwardedSubagentMessage && ev.attachment.origin?.kind !== 'human') continue;
+          const prompt = ev.attachment.prompt;
+          text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
+        } else {
+          continue;
+        }
+        const normalisedText = normaliseForFingerprint(text);
+        if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
+          hit = true;
+          break;
+        }
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch { /* unreadable — treat as no match */ }
+  if (!hit) return 'none';
+  return opts.acceptCandidate && !opts.acceptCandidate(path) ? 'veto' : 'match';
+}
+
 export function findJsonlContainingFingerprint(
   dir: string,
   fingerprint: string,
@@ -1933,90 +2148,48 @@ export function findJsonlContainingFingerprint(
   // Walk newest-first so a recently-rotated jsonl is found before older
   // ones; if two files contain the fingerprint (rare, e.g. user pasted
   // the same message into two panes) we prefer the more recent.
-  const candidates: Array<{ path: string; mtime: number }> = [];
+  const candidates: Array<{ path: string; mtime: number; subagent: boolean }> = [];
+  const addCandidateFile = (full: string, mtimeMs: number, subagent = false): void => {
+    if (opts.excludePath && full === opts.excludePath) return;
+    if (opts.minMtimeMs !== undefined && mtimeMs < opts.minMtimeMs) return;
+    candidates.push({ path: full, mtime: mtimeMs, subagent });
+  };
   for (const name of entries) {
-    if (!name.endsWith('.jsonl')) continue;
     const full = join(dir, name);
-    if (opts.excludePath && full === opts.excludePath) continue;
     try {
       const st = statSync(full);
-      if (!st.isFile()) continue;
-      if (opts.minMtimeMs !== undefined && st.mtimeMs < opts.minMtimeMs) continue;
-      candidates.push({ path: full, mtime: st.mtimeMs });
+      if (st.isFile()) {
+        if (name.endsWith('.jsonl')) addCandidateFile(full, st.mtimeMs);
+        continue;
+      }
+      // Subagent transcripts: <projectDir>/<session-uuid>/subagents/*.jsonl.
+      // A prompt submitted while the TUI views a subagent lands in the
+      // SUBAGENT's jsonl, not the session jsonl. Only this exact shape is
+      // descended (one level) — see SESSION_SUBDIR_RE.
+      if (!st.isDirectory() || !opts.includeSubagentTranscripts) continue;
+      if (!SESSION_SUBDIR_RE.test(name)) continue;
+      const subDir = join(full, 'subagents');
+      let subEntries: string[];
+      try {
+        subEntries = readdirSync(subDir);
+      } catch {
+        continue;
+      }
+      for (const subName of subEntries) {
+        if (!subName.endsWith('.jsonl')) continue;
+        const subFull = join(subDir, subName);
+        try {
+          const subSt = statSync(subFull);
+          if (subSt.isFile()) addCandidateFile(subFull, subSt.mtimeMs, true);
+        } catch { /* ignore */ }
+      }
     } catch { /* ignore */ }
   }
   candidates.sort((a, b) => b.mtime - a.mtime);
-  for (const { path } of candidates) {
-    try {
-      const fd = openSync(path, 'r');
-      try {
-        const size = statSync(path).size;
-        // Read at most the trailing 1MB — fingerprints land near the end
-        // of the jsonl when Claude just wrote them. Cheaper than reading
-        // an entire long-lived session.
-        const len = Math.min(size, 1024 * 1024);
-        const buf = Buffer.alloc(len);
-        readSync(fd, buf, 0, len, size - len);
-        const text = buf.toString('utf8');
-        // We must NOT do a raw includes() here: Claude writes user content
-        // as a JSON-encoded string, so any newline in the Lark message is
-        // serialized as `\n` on disk while our fingerprint has it
-        // collapsed to a single space. Parse each complete jsonl line,
-        // pick role:user events, and apply the same stringify+normalise
-        // we use in BridgeTurnQueue.ingest. Skip the leading partial line
-        // when we read a strict tail (size > len), since it likely begins
-        // mid-line.
-        const lines = text.split('\n');
-        const startIdx = size > len ? 1 : 0;
-        for (let i = startIdx; i < lines.length; i++) {
-          const line = lines[i].trim();
-          if (!line) continue;
-          let ev: any;
-          try { ev = JSON.parse(line); } catch { continue; }
-          if (!ev || typeof ev !== 'object') continue;
-          // Per-event timestamp guard — see jsonlContainsFingerprint for
-          // the full rationale. Required to keep short fingerprints
-          // ("hello", "test") from matching old user lines in unrelated
-          // sibling jsonls.
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
-          const role = ev.message?.role ?? ev.type;
-          let text = '';
-          if (role === 'user') {
-            // Skip pure tool_result events — see jsonlContainsFingerprint
-            // for the full rationale; in short, tool_result content is
-            // log output, not user input, and would false-match short
-            // fingerprints like "hello" in unrelated jsonls.
-            if (isPureToolResultUserEvent(ev.message?.content)) continue;
-            text = stringifyUserContent(ev.message?.content);
-          } else if (
-            opts.includeQueueOperations &&
-            ev.type === 'queue-operation' &&
-            ev.operation === 'enqueue'
-          ) {
-            text = typeof ev.content === 'string' ? ev.content : stringifyUserContent(ev.content);
-          } else {
-            continue;
-          }
-          const normalisedText = normaliseForFingerprint(text);
-          if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
-            // Allow caller to veto this candidate (e.g., sibling-pane
-            // hijack guard rejecting an untrusted sessionId). On veto,
-            // break out of the line loop so we move to the next, older
-            // candidate instead of returning `null` after the first
-            // fingerprint hit.
-            if (opts.acceptCandidate && !opts.acceptCandidate(path)) {
-              break;
-            }
-            return path;
-          }
-        }
-      } finally {
-        closeSync(fd);
-      }
-    } catch { /* unreadable — skip */ }
+  for (const { path, subagent } of candidates) {
+    // A veto moves on to the next-older candidate instead of returning null
+    // after the first fingerprint hit (sibling-pane hijack guard).
+    if (jsonlTailMatchFingerprint(path, fingerprint, opts, subagent) === 'match') return path;
   }
   return null;
 }
@@ -2091,10 +2264,7 @@ export function findJsonlsContainingExactContent(
           let ev: any;
           try { ev = JSON.parse(line); } catch { continue; }
           if (!ev || typeof ev !== 'object') continue;
-          if (opts.minEventTimestampMs !== undefined && typeof ev.timestamp === 'string') {
-            const evMs = Date.parse(ev.timestamp);
-            if (Number.isFinite(evMs) && evMs < opts.minEventTimestampMs) continue;
-          }
+          if (opts.minEventTimestampMs !== undefined && !eventAtOrAfter(ev, opts.minEventTimestampMs)) continue;
           const role = ev.message?.role ?? ev.type;
           let raw = '';
           if (role === 'user') {

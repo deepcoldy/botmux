@@ -12,9 +12,20 @@ import {
   AskArgsError,
   findMissingAskEnv,
   normalizeAskDispatch,
+  parseAskMention,
   parseAskOptions,
   parseAskTimeoutSeconds,
+  parseAskRequestId,
 } from '../src/core/ask-args.js';
+
+describe('explicit Ask invocation identity', () => {
+  it('accepts an opt-in stable request id and rejects empty or oversized ids', () => {
+    expect(parseAskRequestId(undefined)).toBeUndefined();
+    expect(parseAskRequestId('mr-42-round-1')).toBe('mr-42-round-1');
+    expect(() => parseAskRequestId('')).toThrow();
+    expect(() => parseAskRequestId('x'.repeat(257))).toThrow();
+  });
+});
 
 describe('parseAskOptions', () => {
   it('parses bare keys with key==label', () => {
@@ -96,6 +107,14 @@ describe('parseAskOptions', () => {
 });
 
 describe('parseAskTimeoutSeconds', () => {
+  it('accepts explicit zero as no deadline without changing finite defaults or bounds', () => {
+    expect(parseAskTimeoutSeconds('0')).toBe(0);
+    expect(parseAskTimeoutSeconds(undefined)).toBe(300_000);
+    expect(parseAskTimeoutSeconds('3600')).toBe(3_600_000);
+    expect(() => parseAskTimeoutSeconds('-1')).toThrowError(AskArgsError);
+    expect(() => parseAskTimeoutSeconds('1')).toThrowError(AskArgsError);
+  });
+
   it('defaults to 300s when unset', () => {
     expect(parseAskTimeoutSeconds(undefined)).toBe(300_000);
     expect(parseAskTimeoutSeconds('')).toBe(300_000);
@@ -121,6 +140,33 @@ describe('parseAskTimeoutSeconds', () => {
     expect(() =>
       parseAskTimeoutSeconds('3', { default: 5, min: 1, max: 2 }),
     ).toThrowError(/范围/);
+  });
+});
+
+describe('parseAskMention', () => {
+  it('returns undefined when flag absent', () => {
+    expect(parseAskMention(undefined)).toBeUndefined();
+  });
+
+  it('accepts a bare human open_id', () => {
+    expect(parseAskMention('ou_humanTarget0001'))
+      .toBe('ou_humanTarget0001');
+  });
+
+  it('accepts open_id:Display Name form and drops the name', () => {
+    expect(parseAskMention('ou_abcdef123456:张伟'))
+      .toBe('ou_abcdef123456');
+    expect(parseAskMention('  ou_abcdef123456 :Some One  '))
+      .toBe('ou_abcdef123456');
+  });
+
+  it('rejects empty value, union_id, and other id shapes', () => {
+    expect(() => parseAskMention('')).toThrowError(AskArgsError);
+    expect(() => parseAskMention('   ')).toThrowError(/open_id/);
+    // union_id / 其它 ID 形态进卡片 <at> 会被飞书整卡拒收
+    expect(() => parseAskMention('on_6741d98b6423c1b46e1ef7a5e6dd'))
+      .toThrowError(/ou_/);
+    expect(() => parseAskMention('not-an-open-id')).toThrowError(/ou_/);
   });
 });
 

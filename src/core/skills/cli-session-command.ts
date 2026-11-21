@@ -1,8 +1,10 @@
 import { readSessionSkillManifest, SkillManifestReadError, SkillManifestParseError } from './manifest-store.js';
 import { listSkillResources, readSkillEntrypoint, readSkillResource } from './resource-reader.js';
-import { builtinSkillContent, builtinSkillEntries } from '../../skills/injection-mode.js';
+import { builtinSkillContent, builtinSkillEntries, isWithheldFromWorkflowNodeSession } from '../../skills/injection-mode.js';
 import type { SessionSkillManifest } from './types.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
+import { workflowSessionKind } from '../../workflows/session-kind.js';
+import { findActiveSessionIdByCliSessionId } from '../../services/session-store.js';
 
 export interface SkillCommandResult {
   code: number;
@@ -14,19 +16,94 @@ function sessionIdFromEnv(env: Record<string, string | undefined>): string | und
   return env.BOTMUX_SESSION_ID;
 }
 
+/** Doubao native conversation ids are decimal snowflakes. Mirrors
+ *  DOUBAO_SESSION_ID in adapters/cli/doubao.ts; kept local so the lightweight
+ *  skill CLI path does not pull in the TUI adapter module. */
+const DOUBAO_CONVERSATION_ID_RE = /^\d{10,24}$/;
+
+/** Reverse lookup handed to resolveSessionId. Kept narrower than the real
+ *  store function (no dataDir) so the gating logic can be tested with a plain
+ *  recording fake instead of a SQLite fixture. */
+export type CliSessionIdLookup = (opts: { cliId: string; cliSessionId: string }) => string | undefined;
+
+/**
+ * Resolve the owning botmux session for a skill invocation.
+ *
+ * Normally BOTMUX_SESSION_ID is inherited from the CLI's tool shell. Doubao's
+ * sbox launches tool shells from the shared resident service with a sanitized
+ * environment (BOTMUX_SESSION_ID/BASH_ENV are stripped, no config knob exists),
+ * but it keeps the native conversation id in MCP_VM_CONVERSATION_ID. Map that
+ * back to the botmux session via the persisted doubao cliSessionId binding.
+ * Unknown / ambiguous / malformed ids stay undefined so the caller fails
+ * closed; any other CLI keeps the env-only path untouched.
+ */
+export function resolveSessionId(
+  env: Record<string, string | undefined>,
+  lookup: CliSessionIdLookup = findActiveSessionIdByCliSessionId,
+): string | undefined {
+  const explicit = env.BOTMUX_SESSION_ID?.trim();
+  if (explicit) return explicit;
+  const nativeId = env.MCP_VM_CONVERSATION_ID?.trim();
+  if (!nativeId || !DOUBAO_CONVERSATION_ID_RE.test(nativeId)) return undefined;
+  try {
+    return lookup({ cliId: 'doubao', cliSessionId: nativeId });
+  } catch {
+    // An unreadable session store must not guess a session: fail closed.
+    return undefined;
+  }
+}
+
 /** name\tdescription lines for the built-in botmux bridge skills — the ones the
  *  `prompt`-mode catalog advertises, so `botmux skill list` stays consistent
  *  with what the model was told even when there is no user-skill manifest. */
-function builtinListLines(): string[] {
-  return builtinSkillEntries({ asksViaHook: false, whiteboardEnabled: whiteboardEnabled() })
-    .map((e) => `${e.name}\t${e.description}`.trimEnd());
+function builtinListLines(env: Record<string, string | undefined>): string[] {
+  return builtinSkillEntries({
+    asksViaHook: false,
+    whiteboardEnabled: whiteboardEnabled(),
+    sessionKind: workflowSessionKind(env),
+  }).map((e) => `${e.name}\t${e.description}`.trimEnd());
+}
+
+function skillUsage(): string {
+  return [
+    'usage:',
+    '  botmux skill list                    list the skills available in this session (user + built-in)',
+    '  botmux skill show <name>             print a skill\'s full SKILL.md',
+    '  botmux skill resources <name>        list a skill\'s resource files',
+    '  botmux skill read <name> <path>      print one of a skill\'s resource files',
+  ].join('\n') + '\n';
+}
+
+/** `skill --help` / `-h` / `help` and `skill <sub> --help` must print usage
+ *  without touching the session id or manifest. */
+function isSkillHelpRequest(args: string[]): boolean {
+  return args[0] === 'help' || args.some((arg) => arg === '--help' || arg === '-h');
 }
 
 export function runSkillSessionCommand(
   args: string[],
   env: Record<string, string | undefined> = process.env,
 ): SkillCommandResult {
+  if (isSkillHelpRequest(args)) return { code: 0, stdout: skillUsage(), stderr: '' };
+  // doubao sbox shells arrive without BOTMUX_SESSION_ID; resolve it from the
+  // native conversation id and expose it through the canonical env so manifest
+  // lookup and downstream helpers observe the same session identity.
+  const resolvedSessionId = resolveSessionId(env);
+  if (resolvedSessionId && resolvedSessionId !== env.BOTMUX_SESSION_ID) {
+    env = { ...env, BOTMUX_SESSION_ID: resolvedSessionId };
+  }
   const sub = args[0] ?? 'list';
+  // A session executing a workflow node does that node itself: it is not
+  // offered the multi-bot dispatch skills or the workflow skills its kind does
+  // not use, and asking for one by name gets the reason instead of "not found".
+  if ((sub === 'show' || sub === 'resources' || sub === 'read') && args[1]
+    && isWithheldFromWorkflowNodeSession(args[1], env)) {
+    return {
+      code: 1,
+      stdout: '',
+      stderr: `${args[1]} is not available while executing a workflow node: do this node's work in this session instead of starting a workflow or handing it to another bot.\n`,
+    };
+  }
   // Built-in botmux bridge skills are delivered by prompt-catalog (no user-skill
   // manifest), so `show <builtin>` must resolve even when a session has no user
   // skills registered. Check built-ins first for `show`.
@@ -84,7 +161,7 @@ export function runSkillSessionCommand(
   if (!manifest) {
     // No user-skill manifest — still surface built-ins for discovery.
     if (sub === 'list') {
-      const lines = builtinListLines();
+      const lines = builtinListLines(env);
       return { code: 0, stdout: lines.join('\n') + (lines.length > 0 ? '\n' : ''), stderr: '' };
     }
     return { code: 2, stdout: '', stderr: `skill manifest not found for session ${sessionId}\n` };
@@ -92,7 +169,7 @@ export function runSkillSessionCommand(
   try {
     if (sub === 'list') {
       const userLines = manifest.prioritySkills.map((skill) => `${skill.name}\t${skill.description ?? ''}`.trimEnd());
-      const lines = [...userLines, ...builtinListLines()];
+      const lines = [...userLines, ...builtinListLines(env)];
       return { code: 0, stdout: lines.join('\n') + (lines.length > 0 ? '\n' : ''), stderr: '' };
     }
     if (sub === 'show') {

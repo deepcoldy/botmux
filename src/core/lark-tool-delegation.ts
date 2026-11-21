@@ -36,6 +36,28 @@ export function getLarkToolDelegation(dataDir: string, sessionId: string, turnId
   return identity ? { ...identity, tools: [...identity.tools] } : undefined;
 }
 
+/**
+ * The delegation in force for `turnId` right now. A workflow handoff's
+ * delegation is re-checked on every use (`recheck`); once it no longer holds
+ * it is replaced, for good, by a refusal (`delegation_inactive`, no target,
+ * no tools), which is what this returns from then on. Every other delegation
+ * is returned exactly as remembered.
+ */
+export function currentLarkToolDelegation(dataDir: string, sessionId: string, turnId: string): DelegatedCliIdentity | undefined {
+  const identity = sessions.get(sessionKey(dataDir, sessionId))?.get(turnId);
+  if (!identity?.recheck) return getLarkToolDelegation(dataDir, sessionId, turnId);
+  let refusal: string | undefined;
+  try {
+    refusal = identity.recheck();
+  } catch {
+    refusal = 'recheck_failed';
+  }
+  if (!refusal) return getLarkToolDelegation(dataDir, sessionId, turnId);
+  const { recheck: _drop, targetOpenId: _target, ...rest } = identity;
+  rememberLarkToolDelegation(dataDir, sessionId, turnId, { ...rest, tools: [], denialReason: 'delegation_inactive' });
+  return getLarkToolDelegation(dataDir, sessionId, turnId);
+}
+
 export function clearLarkToolDelegations(dataDir: string, sessionId: string): void {
   sessions.delete(sessionKey(dataDir, sessionId));
 }

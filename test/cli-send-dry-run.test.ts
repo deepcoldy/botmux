@@ -8,7 +8,7 @@ import { classifyRemoteRunnerOutboundHostResult } from '../src/services/remote-r
 
 const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url));
 
-function run(args: string[], body?: string) {
+function run(args: string[], body?: string, input?: string) {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-send-dry-run-'));
   try {
     const file = join(dir, 'body.md');
@@ -17,6 +17,7 @@ function run(args: string[], body?: string) {
     // No session, relay or bot configuration: a dry run must not need any.
     return spawnSyncTsScript(cli, resolved, {
       env: { PATH: process.env.PATH, HOME: dir, SESSION_DATA_DIR: join(dir, 'data'), BOTS_CONFIG: join(dir, 'bots.json') },
+      ...(input !== undefined ? { input } : {}),
       encoding: 'utf8', timeout: 30_000,
     });
   } finally {
@@ -84,11 +85,104 @@ describe('send --dry-run', () => {
     expect(empty.status).toBe(2);
   });
 
-  it('is documented in send help', () => {
-    const result = run(['send', '--help']);
+  it('renders a lone dash from stdin', () => {
+    const result = run(['send', '--dry-run', '--no-mention', '-'], undefined, 'REAL BODY');
     expect(result.status).toBe(0);
-    expect(result.stdout).toContain('--dry-run');
-    expect(result.stdout).toContain('```vega-lite');
+    expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({ tag: 'markdown', content: 'REAL BODY' });
+  });
+
+  it('reads stdin for a lone dash even when attachment flags are present', () => {
+    const result = run(['send', '--dry-run', '--no-mention', '--images', '/tmp/not-used.png', '-'], undefined, 'REAL BODY');
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({ tag: 'markdown', content: 'REAL BODY' });
+  });
+
+  it('rejects a dash mixed with other body tokens', () => {
+    const result = run(['send', '--dry-run', '--no-mention', '-', 'extra'], undefined, 'REAL BODY');
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("'-' 只能作为唯一位置参数");
+  });
+
+  it('rejects extra attachment paths that are real files before rendering', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-send-preflight-'));
+    try {
+      const a = join(dir, 'a.sql');
+      const b = join(dir, 'b.sql');
+      writeFileSync(a, 'a');
+      writeFileSync(b, 'b');
+      const result = run(['send', '--dry-run', '--files', a, b], undefined, 'REAL BODY');
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('额外路径');
+      expect(result.stderr).toContain('多个附件请重复写 --files');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('accepts repeated --files flags without a positional body collision', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-send-preflight-'));
+    try {
+      const a = join(dir, 'a.sql');
+      const b = join(dir, 'b.sql');
+      writeFileSync(a, 'a');
+      writeFileSync(b, 'b');
+      const result = run(['send', '--dry-run', '--files', a, '--files', b], undefined, 'REAL BODY');
+      expect(result.status).toBe(0);
+      expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({ tag: 'markdown', content: 'REAL BODY' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects exact -- before free help', () => {
+    const result = run(['send', '--help', '--']);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain("'--' 分隔符尚未支持");
+  });
+
+  it('rejects --version and value-position help deterministically', () => {
+    const version = run(['send', '--version']);
+    expect(version.status).toBe(2);
+    expect(version.stderr).toContain('未知参数 --version');
+    const valueHelp = run(['send', '--mention', '--help']);
+    expect(valueHelp.status).toBe(2);
+    expect(valueHelp.stderr).toContain('--mention 缺少值');
+  });
+
+  it('keeps free help winning over unknown flags', () => {
+    const result = run(['send', '--version', '--help']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('send [content]');
+  });
+
+  it('lets attachment-only sends pass preflight with blank stdin, but lone dash still wins', () => {
+    const attachmentOnly = run(['send', '--dry-run', '--images', '/tmp/not-used.png'], undefined, '   ');
+    expect(attachmentOnly.status).toBe(2);
+    expect(attachmentOnly.stderr).toContain('--dry-run: 正文为空');
+    expect(attachmentOnly.stderr).not.toContain("'-' 表示从 stdin");
+
+    const dashWithAttachment = run(['send', '--dry-run', '--images', '/tmp/not-used.png', '-'], undefined, '   ');
+    expect(dashWithAttachment.status).toBe(2);
+    expect(dashWithAttachment.stderr).toContain("'-' 表示从 stdin 读正文");
+    expect(dashWithAttachment.stderr).not.toContain('--dry-run: 正文为空');
+  });
+
+  it('runs parameter validation before the blank-stdin body check', () => {
+    const mode = run(['send', '--dry-run', '--image-mode=SMALL', '-'], undefined, '   ');
+    expect(mode.status).toBe(2);
+    expect(mode.stderr).toContain('--image-mode 仅支持');
+    expect(mode.stderr).not.toContain('stdin 没有内容');
+
+    const kind = run(['send', '--dry-run', '--response-kind=bogus', '-'], undefined, '   ');
+    expect(kind.status).toBe(2);
+    expect(kind.stderr).toContain('--response-kind 仅支持');
+    expect(kind.stderr).not.toContain('stdin 没有内容');
+  });
+
+  it('rejects client hand-written riff placeholders', () => {
+    const result = run(['send', '--dry-run', '--files', 'riff-upload:0'], undefined, 'REAL BODY');
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('riff-upload 占位符');
   });
 });
 

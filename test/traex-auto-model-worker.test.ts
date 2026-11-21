@@ -1,18 +1,52 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
-import { TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime } from '../src/services/traex-auto-model.js';
+import {
+  TraexAutoModelController,
+  resolveTraexAutoModelRuntimeSettings,
+  resolveTraexAutoModelSettings,
+  traexAutoModelPreflightEnabled,
+  validTraexAutoModelRuntime,
+} from '../src/services/traex-auto-model.js';
 import { knownTraexReasoningEffortsForModel } from '../src/services/codex-reasoning-effort.js';
 import { buildSessionChildEnv, botInjectedEnv } from '../src/core/env-policy.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
+import { isTransientStartupFailure } from '../src/core/worker-startup-retry.js';
 import { execFileSync } from 'node:child_process';
-import { createReadStream, mkdtempSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { createReadStream, mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, delimiter } from 'node:path';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { traexCapacityQueueVisible, traexModelProgressVisible, traexQueuedTypeAheadVisible } from '../src/adapters/cli/traex.js';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { restartInterruptionNote, restartInterruptionNotice, restartNoteMayPrefix, prefixRestartNote } from '../src/services/restart-interruption.js';
+import { codexRpcEligible } from '../src/codex-rpc-lifecycle.js';
+import { sandboxEnabled } from '../src/adapters/backend/sandbox.js';
+
+function wireAutoModelSettings(scope: Record<string, any>): Record<string, any> {
+  Object.assign(scope, {
+    resolveTraexAutoModelRuntimeSettings,
+    traexAutoModelPreflightEnabled,
+    traexAutoModelReasoningEfforts: scope.traexAutoModelReasoningEfforts ?? new Map(),
+    log: scope.log ?? vi.fn(),
+  });
+  scope.applyTraexAutoModelSettings = loadWorkerFunction('applyTraexAutoModelSettings', scope);
+  return scope;
+}
+
+function loadAutoModelReset(scope: Record<string, any>): () => boolean {
+  Object.assign(scope, {
+    traexAutoModelPreflightEnabled,
+    traexQuotaPending: scope.traexQuotaPending,
+    traexAutoModelPreflightPending: scope.traexAutoModelPreflightPending,
+  });
+  return loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+}
+
+function configureAutoModel(scope: Record<string, any>, cfg: any): void {
+  wireAutoModelSettings(scope);
+  loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+}
 
 function harness(extra: Record<string, unknown> = {}) {
   const controller = new TraexAutoModelController({ enabled: true, models: ['core', 'backup'], queueTimeoutMs: 5_000, reselectPerTurn: true });
@@ -25,6 +59,7 @@ function harness(extra: Record<string, unknown> = {}) {
   const scope: Record<string, any> = {
     traexAutoModelRuntimeEligible: () => true, traexAutoModelSwitching: false,
     cliRestartInProgress: false, isFlushing: false, traexAutoModelTurnReplayForbidden: false,
+    currentInputDeliveryQuarantine: () => null,
     lastInitConfig: { cliId: 'traex', cliSessionId: 'native', model: 'core' },
     activeTurnAuthority: authority, traexAutoModelController: controller,
     inflightInputs: tracker, currentBotmuxCallerOpenId: 'caller', pendingMessages: [],
@@ -33,6 +68,7 @@ function harness(extra: Record<string, unknown> = {}) {
     restartCliProcess: vi.fn(async () => {}), t: (key: string) => key,
     ...extra,
   };
+  wireAutoModelSettings(scope);
   scope.enqueueTraexAutoModelRecovery = loadWorkerFunction('enqueueTraexAutoModelRecovery', scope);
   return { scope, controller, tracker, switchModel: loadWorkerFunction<(action: any, options: any) => boolean>('executeTraexAutoModelSwitch', scope) };
 }
@@ -60,6 +96,43 @@ function admissionHarness(extra: Record<string, unknown> = {}) {
 }
 
 describe('auto-model Worker admission and original-input retirement', () => {
+  it.each([undefined, 'native'])('retries an admitted quota input after a viewport race (native session: %s)', async nativeId => {
+    const controller = new TraexAutoModelController({ enabled: true, trigger: 'quota', models: ['core', 'backup'], queueTimeoutMs: 5_000 });
+    const h = admissionHarness({
+      traexAutoModelController: controller, activeTurnAuthority: new ActiveTurnAuthority(),
+      isPromptReady: true, queuedTypeAheadTurns: [],
+      lastInitConfig: { cliId: 'traex', cliSessionId: nativeId },
+      currentTraexQuotas: vi.fn(), executeTraexAutoModelSwitch: vi.fn(),
+    });
+    h.scope.selectTraexQuotaModelBeforeTurn = loadWorkerFunction('selectTraexQuotaModelBeforeTurn', h.scope);
+    const reset = loadAutoModelReset(h.scope);
+    // The real flush clears readiness before its asynchronous viewport read.
+    expect(reset()).toBe(false);
+    h.scope.isPromptReady = false;
+    h.scope.backend.captureViewportAsync = async () => {
+      h.scope.backendScreenRevision++;
+      return '❯ Ask anything';
+    };
+    expect(await h.admit()).toBe(false);
+    expect(h.scope.retryTraexAutoModelAdmission).toHaveBeenCalledOnce();
+    expect(h.scope.pendingMessages).toEqual([h.item]);
+
+    // A static composer emits no new ready edge. The same unsent turn must
+    // reach admission again, without remote quota IO or a model restart.
+    h.scope.backend.captureViewportAsync = async () => '❯ Ask anything';
+    expect(reset()).toBe(false);
+    expect(await h.admit()).toBe(true);
+    expect(controller.currentTurnId()).toBe(h.item.turnId);
+    expect(h.scope.currentTraexQuotas).not.toHaveBeenCalled();
+    expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+
+    // Admission is not submission: successors remain fenced once the actual
+    // input has landed and we are still seeing its old composer.
+    controller.markInputSubmitted(h.item.turnId);
+    h.scope.pendingMessages = [{ content: 'successor', turnId: 'later' }];
+    expect(await h.admit()).toBe(false);
+  });
+
   it('does not admit a follow-up on the stale composer after the first input was submitted', async () => {
     const h = admissionHarness({ backend: { captureViewportAsync: async () => '❯ Ask anything' } });
     const controller = h.scope.traexAutoModelController as TraexAutoModelController;
@@ -212,7 +285,7 @@ describe('auto-model Worker admission and original-input retirement', () => {
         sessionRenamePhase: 'sent', sessionRenameIdleTimer: null, SESSION_RENAME_IDLE_TIMEOUT_MS: 5_000,
         executeTraexAutoModelSwitch: h.switchModel,
       });
-      const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', h.scope);
+      const reset = loadAutoModelReset(h.scope);
       h.scope.flushPending = vi.fn(() => reset());
       expect(h.scope.activeTurnAuthority.snapshot()).toMatchObject({ turnId: 'turn', started: true });
       loadWorkerFunction<() => void>('armSessionRenameIdleTimeout', h.scope)();
@@ -251,7 +324,7 @@ describe('auto-model Worker admission and original-input retirement', () => {
     });
     expect(recovery.content).toBe(`${restartInterruptionNote(work)}\n\n${recovery.logicalContent}`);
     expect(h.scope.send).toHaveBeenLastCalledWith({
-      type: 'user_notify', turnId: 'turn',
+      type: 'user_notify', kind: 'restart_interruption', turnId: 'turn',
       message: restartInterruptionNotice(work, { cliName: 'TRAE', noteDelivered: true }),
     });
     expect(h.scope.pendingRestartInterruption).toBeUndefined();
@@ -260,6 +333,7 @@ describe('auto-model Worker admission and original-input retirement', () => {
 
   it.each([
     { isFlushing: true }, { cliRestartInProgress: true }, { traexAutoModelTurnReplayForbidden: true },
+    { currentInputDeliveryQuarantine: () => ({ generation: 1 }) },
     { lastInitConfig: { cliId: 'traex', model: 'core' } },
     { traexAutoModelRuntimeEligible: () => false },
   ])('does not advance the model or enqueue recovery when the runtime cannot safely resume (%j)', extra => {
@@ -292,6 +366,197 @@ describe('auto-model Worker admission and original-input retirement', () => {
   });
 });
 
+
+// The first `new-session` on a private socket forks the server. Under shard
+// load that cold start exceeds a 2s client wall (`spawnSync tmux ETIMEDOUT`,
+// including a timeout that also carries a numeric status) even though the
+// server is coming up. Retry only this command: pipe-pane, send-keys,
+// capture-pane, and kill-server stay on the 2s helper so the viewport test's
+// repaint deadline and slow-client heartbeat still measure a live server.
+const COLD_TMUX_NEW_SESSION_TIMEOUT_MS = 5_000;
+const COLD_TMUX_ATTEMPTS = 3;
+const COLD_TMUX_DEADLINE_MS = 12_000;
+const COLD_TMUX_BACKOFF_MS = [100, 300];
+const COLD_TMUX_HAS_SESSION_TIMEOUT_MS = 1_000;
+
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function tmuxThrownText(err: unknown): { reason: string; stderr: string } {
+  const error = err as { code?: unknown; message?: unknown; stderr?: unknown };
+  const stderr = typeof error?.stderr === 'string'
+    ? error.stderr
+    : Buffer.isBuffer(error?.stderr) ? error.stderr.toString('utf8') : '';
+  const reason = [error?.code, error?.message, stderr]
+    .filter(part => part != null && part !== '')
+    .map(part => String(part))
+    .join('\n');
+  return { reason, stderr };
+}
+
+/** kill-server proved this private server is gone. A timeout, a refused
+ *  connect, or any other answer is not that proof — the caller still owns
+ *  the socket name and must report it. A missing socket file means this
+ *  name never held a server; a server that merely exited leaves the file
+ *  and answers "no server running". */
+function coldStartKillReleased(err: unknown): boolean {
+  const error = err as { code?: unknown; signal?: unknown };
+  if (error?.signal || error?.code === 'ETIMEDOUT') return false;
+  const { reason } = tmuxThrownText(err);
+  if (/\bETIMEDOUT\b/.test(reason)) return false;
+  if (/no server running/i.test(reason)) return true;
+  return /error connecting to .*\(No such file or directory\)/i.test(reason);
+}
+
+function coldStartSessionName(args: readonly string[]): string {
+  const index = args.indexOf('-s');
+  const name = index >= 0 ? args[index + 1] : undefined;
+  if (!name || name.startsWith('-')) throw new Error('tmux new-session cold start requires -s <name>');
+  return name;
+}
+
+/** `has-session` timing out, or any other transient probe failure, is not yet
+ *  a verdict. A clean non-zero answer means the session is absent. */
+function coldStartSessionProbe(socket: string, session: string): 'present' | 'absent' | 'unconfirmed' {
+  try {
+    execFileSync('tmux', ['-L', socket, 'has-session', '-t', session], {
+      encoding: 'utf8',
+      timeout: COLD_TMUX_HAS_SESSION_TIMEOUT_MS,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return 'present';
+  } catch (err) {
+    return isTransientStartupFailure(tmuxThrownText(err).reason) ? 'unconfirmed' : 'absent';
+  }
+}
+
+function startColdTmuxSession(socket: string, args: readonly string[]): void {
+  const session = coldStartSessionName(args);
+  const deadline = Date.now() + COLD_TMUX_DEADLINE_MS;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < COLD_TMUX_ATTEMPTS; attempt += 1) {
+    if (Date.now() >= deadline) break;
+    try {
+      execFileSync('tmux', ['-L', socket, ...args], {
+        encoding: 'utf8',
+        timeout: COLD_TMUX_NEW_SESSION_TIMEOUT_MS,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      return;
+    } catch (err) {
+      lastError = err;
+      const { reason, stderr } = tmuxThrownText(err);
+      // A timeout is never a deterministic rejection, even when Node also
+      // attached a numeric status. Same transient class as worker startup.
+      const transient = isTransientStartupFailure(reason);
+      const duplicate = /duplicate session/i.test(stderr);
+      const probe = (transient || duplicate) ? coldStartSessionProbe(socket, session) : 'absent';
+      // The killed client may already have created the session. A duplicate
+      // on retry counts as success only when this probe exits 0. On a private
+      // socket the only possible duplicate is our own timed-out create.
+      if (probe === 'present') return;
+      const retryable = transient || (duplicate && probe === 'unconfirmed');
+      const backoff = COLD_TMUX_BACKOFF_MS[attempt];
+      if (!retryable || backoff === undefined || Date.now() >= deadline || Date.now() + backoff >= deadline) {
+        throw err;
+      }
+      sleepSyncMs(backoff);
+    }
+  }
+  if (lastError instanceof Error) throw lastError;
+  throw new Error('tmux new-session cold start exceeded its deadline');
+}
+
+const privateTmuxColdStartAvailable = (() => {
+  try {
+    execFileSync('tmux', ['-V'], { stdio: 'ignore', timeout: 2_000 });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function withPrivateTmuxColdStartHarness<TMode extends string>(
+  sockets: string[],
+  buildShim: (fixture: {
+    mode: TMode;
+    tmuxBin: string;
+    countFile: string;
+    socket: string;
+  }) => string,
+  run: (fixture: {
+    tmuxBin: string;
+    countFile: string;
+    writeShim: (mode: TMode, socket: string) => void;
+  }) => void,
+): void {
+  const root = mkdtempSync(join(tmpdir(), 'auto-admission-cold-'));
+  const countFile = join(root, 'new-session-count');
+  const shim = join(root, 'tmux');
+  const originalPath = process.env.PATH;
+  let tmuxBin = '';
+  let bodyError: unknown;
+  try {
+    tmuxBin = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim();
+    const writeShim = (mode: TMode, socket: string) => {
+      writeFileSync(countFile, '0');
+      writeFileSync(shim, `#!/bin/sh\n${buildShim({ mode, tmuxBin, countFile, socket })}`);
+      chmodSync(shim, 0o755);
+    };
+    process.env.PATH = `${root}${delimiter}${originalPath ?? ''}`;
+    run({ tmuxBin, countFile, writeShim });
+  } catch (err) {
+    bodyError = err;
+  } finally {
+    const cleanupFailures: Error[] = [];
+    const keep = (resource: string, err: unknown) => {
+      const detail = tmuxThrownText(err).reason || (err instanceof Error ? err.message : String(err));
+      cleanupFailures.push(new Error(`failed to release ${resource}: ${detail}`, {
+        cause: err instanceof Error ? err : undefined,
+      }));
+    };
+    try {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    } catch (err) {
+      keep('PATH', err);
+    }
+    // One socket's failure must not skip the others or the temp dir.
+    // Only an authoritative "already gone" answer drops the error; every
+    // other failure keeps that socket's name and is reported below.
+    for (const socket of sockets) {
+      const resource = `tmux socket ${socket}`;
+      try {
+        if (!tmuxBin) throw new Error('real tmux binary was not resolved');
+        execFileSync(tmuxBin, ['-L', socket, 'kill-server'], {
+          encoding: 'utf8',
+          timeout: 2_000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err) {
+        if (!coldStartKillReleased(err)) keep(resource, err);
+      }
+    }
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch (err) {
+      keep(root, err);
+    }
+    const failures = [...(bodyError === undefined ? [] : [bodyError]), ...cleanupFailures];
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(
+        failures,
+        failures.map(failure => failure instanceof Error ? failure.message : String(failure)).join('\n'),
+      );
+    }
+  }
+}
 
 describe('Auto live follow-up input policy', () => {
   it.each([
@@ -416,8 +681,8 @@ describe('Auto live follow-up input policy', () => {
     const tmux = (...args: string[]) => execFileSync('tmux', ['-L', socket, ...args], { encoding: 'utf8', timeout: 2_000 });
     let reader: ReturnType<typeof createReadStream> | undefined;
     try {
-      tmux('new-session', '-d', '-s', 'test', '-x', '100', '-y', '24',
-        'stty -echo; while IFS= read -r line; do printf "\\033[2J\\033[H%s\\r\\n" "$line"; done');
+      startColdTmuxSession(socket, ['new-session', '-d', '-s', 'test', '-x', '100', '-y', '24',
+        'stty -echo; while IFS= read -r line; do printf "\\033[2J\\033[H%s\\r\\n" "$line"; done']);
       execFileSync('mkfifo', [fifo]);
       reader = createReadStream(fifo, { flags: 'r+' });
       let revision = 0;
@@ -471,7 +736,7 @@ describe('Auto live follow-up input policy', () => {
       expect(h.scope.pendingMessages).toEqual([h.item]);
       process.env.PATH = originalPath;
       repaint('◆ Working… (3s • esc to interrupt)');
-      expect(await h.admit()).toBe(true);
+      await vi.waitFor(async () => expect(await h.admit()).toBe(true));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
@@ -479,6 +744,120 @@ describe('Auto live follow-up input policy', () => {
       try { tmux('kill-server'); } catch { /* isolated server already gone */ }
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it.skipIf(!privateTmuxColdStartAvailable)('allows a private tmux cold start past the old 2s wall and retries a refused first connect', () => {
+    const sockets: string[] = [];
+    withPrivateTmuxColdStartHarness<'slow' | 'refuse'>(sockets, ({ mode, tmuxBin, countFile, socket }) => {
+      // Phase 1 sleeps past the old 2s wall, then creates the session.
+      // Phase 2's first client never creates one; only the retry may.
+      const first = mode === 'slow'
+        ? 'sleep 2.5\n'
+        : 'echo "error connecting to $socket (Connection refused)" >&2\nexit 1\n';
+      return `real=${shellQuote(tmuxBin)}
+count_file=${shellQuote(countFile)}
+socket=${shellQuote(socket)}
+is_new=0
+for arg in "$@"; do
+  if [ "$arg" = "new-session" ]; then
+    is_new=1
+    break
+  fi
+done
+if [ "$is_new" != 1 ]; then
+  exec "$real" "$@"
+fi
+n=$(cat "$count_file" 2>/dev/null || echo 0)
+n=$((n + 1))
+printf '%s' "$n" > "$count_file"
+if [ "$n" = 1 ]; then
+${first}fi
+exec "$real" "$@"
+`;
+    }, ({ tmuxBin, countFile, writeShim }) => {
+      const phase = (mode: 'slow' | 'refuse') => {
+        const socket = `cold-${process.pid}-${Date.now()}-${mode}`;
+        sockets.push(socket);
+        writeShim(mode, socket);
+        startColdTmuxSession(socket, ['new-session', '-d', '-s', 'test']);
+        execFileSync(tmuxBin, ['-L', socket, 'has-session', '-t', 'test'], { encoding: 'utf8', timeout: 2_000 });
+      };
+      phase('slow');
+      phase('refuse');
+      // The refused first connect forced at least one retry. A real cold start
+      // that itself overruns the client wall may add a probe-confirmed attempt,
+      // so only the lower bound is load-independent.
+      expect(Number(readFileSync(countFile, 'utf8'))).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it.skipIf(!privateTmuxColdStartAvailable)('recognizes a session a timed-out client already built, and retries a duplicate while the probe is unconfirmed', () => {
+    const sockets: string[] = [];
+    // One second past the helper's own client wall, so this always overruns
+    // whatever COLD_TMUX_NEW_SESSION_TIMEOUT_MS is rather than pinning the
+    // shim to a hard-coded 6s that silently stops triggering a timeout.
+    const overrunSleepSec = COLD_TMUX_NEW_SESSION_TIMEOUT_MS / 1000 + 1;
+    withPrivateTmuxColdStartHarness<'timeout-present' | 'duplicate-unconfirmed'>(sockets, ({ mode, tmuxBin, countFile }) => {
+      // timeout-present: the real client forks the server and builds the
+      // session in the background while the shim sleeps past the client wall,
+      // so spawnSync sees ETIMEDOUT although the session comes alive.
+      // duplicate-unconfirmed: the first create answers "duplicate session"
+      // with no server on the socket yet, so the has-session probe can only be
+      // unconfirmed; only the retry is allowed to create.
+      return `real=${shellQuote(tmuxBin)}
+count_file=${shellQuote(countFile)}
+mode=${shellQuote(mode)}
+is_new=0
+for arg in "$@"; do
+  if [ "$arg" = "new-session" ]; then
+    is_new=1
+    break
+  fi
+done
+if [ "$is_new" != 1 ]; then
+  exec "$real" "$@"
+fi
+n=$(cat "$count_file" 2>/dev/null || echo 0)
+n=$((n + 1))
+printf '%s' "$n" > "$count_file"
+if [ "$n" = 1 ]; then
+  if [ "$mode" = "timeout-present" ]; then
+    "$real" "$@" &
+    sleep ${overrunSleepSec}
+    exit 0
+  fi
+  echo "duplicate session: test" >&2
+  exit 1
+fi
+exec "$real" "$@"
+`;
+    }, ({ tmuxBin, countFile, writeShim }) => {
+      // Phase 1: the killed client already built the session. The has-session
+      // probe must confirm it and return without a second new-session. Warm the
+      // server first on a generous wall outside the helper, so the background
+      // create below is a warm create and stays ahead of the client wall even
+      // on a starved runner.
+      const presentSocket = `cold-present-${process.pid}-${Date.now()}`;
+      sockets.push(presentSocket);
+      execFileSync(tmuxBin, ['-L', presentSocket, 'new-session', '-d', '-s', 'warm'], {
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+      writeShim('timeout-present', presentSocket);
+      startColdTmuxSession(presentSocket, ['new-session', '-d', '-s', 'test']);
+      expect(Number(readFileSync(countFile, 'utf8'))).toBe(1);
+      execFileSync(tmuxBin, ['-L', presentSocket, 'has-session', '-t', 'test'], { encoding: 'utf8', timeout: 2_000 });
+      // Phase 2: a duplicate answer while no server answers the probe is
+      // unconfirmed, so the helper retries and the second create succeeds. A
+      // cold start that itself overruns the wall may add more attempts, so only
+      // the lower bound is load-independent.
+      const duplicateSocket = `cold-duplicate-${process.pid}-${Date.now()}`;
+      sockets.push(duplicateSocket);
+      writeShim('duplicate-unconfirmed', duplicateSocket);
+      startColdTmuxSession(duplicateSocket, ['new-session', '-d', '-s', 'test']);
+      expect(Number(readFileSync(countFile, 'utf8'))).toBeGreaterThanOrEqual(2);
+      execFileSync(tmuxBin, ['-L', duplicateSocket, 'has-session', '-t', 'test'], { encoding: 'utf8', timeout: 2_000 });
+    });
   });
 
   it('holds follow-ups through the resumed continuation until its first model activity', async () => {
@@ -532,7 +911,7 @@ describe('Auto live follow-up input policy', () => {
       isPromptReady: false, traexAutoModelInputHold: () => false, activeTurnAuthority,
       queuedTypeAheadTurns: [],
       lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
-    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    const reset = loadAutoModelReset(scope);
     expect(reset()).toBe(false);
     expect(controller.currentModel()).toBe('backup');
     expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
@@ -554,7 +933,7 @@ describe('Auto live follow-up input policy', () => {
       isPromptReady: false, traexAutoModelInputHold: () => false, activeTurnAuthority,
       queuedTypeAheadTurns: [],
       lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
-    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    const reset = loadAutoModelReset(scope);
     expect(reset()).toBe(true);
     expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
     // Once the composer is observed, the normal switch branch restarts core.
@@ -576,7 +955,7 @@ describe('Auto live follow-up input policy', () => {
       isPromptReady: false, traexAutoModelInputHold: () => false,
       activeTurnAuthority: new ActiveTurnAuthority(), queuedTypeAheadTurns: [],
       lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
-    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    const reset = loadAutoModelReset(scope);
     expect(reset()).toBe(true);
     expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
     // With reselection off, the composer edge releases the write without a switch.
@@ -601,7 +980,7 @@ describe('Auto live follow-up input policy', () => {
       activeTurnAuthority: new ActiveTurnAuthority(),
       queuedTypeAheadTurns: [{ turnId: 'successor-turn' }],
       lastInitConfig: { cliSessionId: 'native' }, executeTraexAutoModelSwitch: vi.fn(() => true) };
-    const reset = loadWorkerFunction<() => boolean>('resetTraexAutoModelBeforePendingTurn', scope);
+    const reset = loadAutoModelReset(scope);
     expect(reset()).toBe(false);
     expect(scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
   });
@@ -614,7 +993,7 @@ describe('Worker Auto configuration boundary', () => {
     const cfg: any = { cliId: 'traex', model: 'auto', codexRpcInput: true, traexAutoModel: pool, prompt: '', ...extra };
     const scope: Record<string, any> = { lastInitConfig: { ...cfg }, TraexAutoModelController,
       resolveTraexAutoModelSettings, validTraexAutoModelRuntime: () => false };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    configureAutoModel(scope, cfg);
     return { cfg, scope };
   }
   it('selects a concrete managed model and adapts the old RPC preference before launch', () => {
@@ -642,9 +1021,11 @@ describe('Worker read-only capacity query', () => {
     controller.beginTurn('turn');
     const authority = new ActiveTurnAuthority();
     authority.reserve({ turnId: 'turn' }); authority.markStarted({ turnId: 'turn' });
-    let resolveLoads!: (loads: Map<string, number>) => void;
-    const loads = new Promise<Map<string, number>>(resolve => { resolveLoads = resolve; });
-    const read = vi.fn((_options: any) => loads);
+    let resolveSnapshot!: (snapshot: { loads: Map<string, number>; reasoningEfforts: Map<string, readonly string[]> }) => void;
+    const snapshot = new Promise<{ loads: Map<string, number>; reasoningEfforts: Map<string, readonly string[]> }>(
+      resolve => { resolveSnapshot = resolve; },
+    );
+    const read = vi.fn((_options: any) => snapshot);
     const scope: Record<string, any> = {
       traexAutoModelController: controller, traexAutoModelRuntimeEligible: () => true,
       traexAutoModelSwitching: false, cliRestartInProgress: false, isFlushing: false,
@@ -655,13 +1036,16 @@ describe('Worker read-only capacity query', () => {
       cliAdapter: { resolvedBin: 'traex' }, buildSessionChildEnv, botInjectedEnv,
       process: { env: { HTTP_PROXY: 'host-proxy', API_TOKEN: 'host-token', KEEP: 'yes' } },
       traexCapacityQueueVisible: () => true, traexCapacityQueuePosition: () => undefined,
-      traexModelProgressVisible: () => false, traexQueuedTypeAheadVisible: () => false, readTraexModelLoads: read,
+      traexModelProgressVisible: () => false, traexQueuedTypeAheadVisible: () => false,
+      readTraexModelLoadSnapshot: read, rememberTraexModelLoadSnapshot: vi.fn(),
       executeTraexAutoModelSwitch: vi.fn(), publishActiveRuntime: vi.fn(), send: vi.fn(), log: vi.fn(),
     };
     const observe = loadWorkerFunction<(screen: string) => void>('observeTraexAutoModelCapacity', scope);
     vi.useFakeTimers(); vi.setSystemTime(0); observe('queue');
     vi.setSystemTime(5_000); observe('queue'); vi.useRealTimers();
-    return { scope, read, resolveLoads, observe };
+    return { scope, read,
+      resolveLoads: (loads: Map<string, number>) => resolveSnapshot({ loads, reasoningEfforts: new Map() }),
+      observe };
   }
   it('uses the composed set and unset layers for the read-only helper', async () => {
     const h = query();
@@ -671,17 +1055,27 @@ describe('Worker read-only capacity query', () => {
     expect(options.env).not.toHaveProperty('HTTP_PROXY');
     expect(options.env).not.toHaveProperty('API_TOKEN');
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
-    await Promise.resolve(); await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
     expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(expect.objectContaining({ toModel: 'backup' }), { resumeCurrentTurn: true });
   });
   it.each([
-    { currentBotmuxTurnId: 'passthrough' }, { commandLineWritesPending: 1 },
-    { traexAutoModelTurnReplayForbidden: true }, { isFlushing: true },
-  ])('ignores a completed query after the input boundary changed (%j)', async changed => {
+    [{ currentBotmuxTurnId: 'passthrough' }, 'botmuxTurnChanged'], [{ commandLineWritesPending: 1 }, 'commandWritesPending'],
+    [{ traexAutoModelTurnReplayForbidden: true }, 'replayForbidden'], [{ isFlushing: true }, 'flushing'],
+  ] as const)('ignores a completed query after the input boundary changed (%j), naming the change', async (changed, label) => {
     const h = query(); Object.assign(h.scope, changed);
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
-    await Promise.resolve(); await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
     expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
+    // The ordered fallback that follows must not look like a skipped choice.
+    expect(h.scope.log).toHaveBeenCalledWith(`TraeX model load reply discarded (${label}; snapshot=present)`);
+  });
+  it('logs why a capacity load read was unavailable', () => {
+    const h = query();
+    const options = h.read.mock.calls[0]![0] as { onUnavailable?: (reason: string) => void };
+    options.onUnavailable?.('timed out after 8000ms (waiting for model/list page 1); 8001ms after launch');
+    expect(h.scope.log).toHaveBeenCalledWith(
+      'TraeX model load read unavailable: timed out after 8000ms (waiting for model/list page 1); 8001ms after launch',
+    );
   });
   it.each([
     { currentBotmuxTurnId: 'passthrough' }, { commandLineWritesPending: 1 },
@@ -691,7 +1085,7 @@ describe('Worker read-only capacity query', () => {
     const previous = Object.fromEntries(Object.keys(changed).map(key => [key, h.scope[key]]));
     Object.assign(h.scope, changed);
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
-    await Promise.resolve(); await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
     expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
     Object.assign(h.scope, previous);
     vi.useFakeTimers();
@@ -712,7 +1106,7 @@ describe('Worker read-only capacity query', () => {
     h.observe('working');
     h.scope.isFlushing = true;
     h.resolveLoads(new Map([['core', 180], ['backup', 100]]));
-    await Promise.resolve(); await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
     expect(h.scope.executeTraexAutoModelSwitch).not.toHaveBeenCalled();
     h.scope.isFlushing = false;
     vi.useFakeTimers();
@@ -721,11 +1115,12 @@ describe('Worker read-only capacity query', () => {
       expect(h.read).toHaveBeenCalledOnce();
       vi.setSystemTime(15_000); h.observe('queue');
       expect(h.read).toHaveBeenCalledTimes(2);
-      await Promise.resolve(); await Promise.resolve();
-      expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
+      // Catalog reconciliation adds another async boundary. Advancing zero
+      // timer milliseconds is not proof that that promise chain has settled.
+      await vi.waitFor(() => expect(h.scope.executeTraexAutoModelSwitch).toHaveBeenCalledWith(
         expect.objectContaining({ turnId: 'turn', toModel: 'backup' }),
         { resumeCurrentTurn: true },
-      );
+      ));
     } finally { vi.useRealTimers(); }
   });
 });
@@ -763,7 +1158,7 @@ describe('Auto input and shared-setting continuity', () => {
       setCaptureIdentity: vi.fn(() => { expect(h.scope.traexAutoModelTurnReplayForbidden).toBe(true); }),
       markTurnRetired: vi.fn(), markTurnExecutionStart: vi.fn(), stampMojoTurnMark: vi.fn(),
       writeCliPidMarker: vi.fn(), publishSandboxRelayCapability: vi.fn(),
-      isEffortLevelCommand: () => false, claudeBtwQuestion: () => undefined,
+      claudeSwitchKindForCommand: () => null, claudeBtwQuestion: () => undefined,
       finalizeRawCommandDelivery: (input: any) => { if (input.accepted) input.onAccepted(); return input.accepted; },
       idleDetector: { reset: vi.fn() }, flushPending: vi.fn(async () => {}),
     });
@@ -781,7 +1176,7 @@ describe('Auto input and shared-setting continuity', () => {
       } };
     h.scope.lastInitConfig = cfg;
     h.scope.TraexAutoModelController = TraexAutoModelController;
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', h.scope)(cfg);
+    configureAutoModel(h.scope, cfg);
     expect(cfg).toMatchObject({ model: 'core', reasoningEffort: 'high', modelBackendVariant: 'max' });
     h.scope.traexAutoModelController.beginTurn('turn');
     expect(h.switchModel(action, { resumeCurrentTurn: true })).toBe(true);
@@ -789,7 +1184,7 @@ describe('Auto input and shared-setting continuity', () => {
     // A fresh first init has resume=false; /restart still starts from the
     // last resolved model rather than the original daemon shared settings.
     cfg.traexAutoModel = { ...cfg.traexAutoModel, models: ['core', 'backup', 'new-backup'] };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', h.scope)(cfg);
+    configureAutoModel(h.scope, cfg);
     expect(cfg).toMatchObject({ model: 'core', reasoningEffort: 'high', modelBackendVariant: 'max' });
     h.scope.traexAutoModelController.beginTurn('turn'); h.scope.traexAutoModelSwitching = false;
     expect(h.switchModel(action, { resumeCurrentTurn: true })).toBe(true);
@@ -813,11 +1208,16 @@ describe('same-worker Auto restart model continuity', () => {
       traexAutoModelRuntimeEligible: () => eligible,
       deliveredPluginSkillCatalogFingerprint: 'delivered',
       resolvePluginGenerationBot: () => ({ larkAppId: 'app' }), readGlobalConfig: () => ({}),
-      prepareCliPluginGeneration: prepare, config: { session: { dataDir: '/data' } }, log: vi.fn() };
+      prepareCliPluginGeneration: prepare, config: { session: { dataDir: '/data' } },
+      codexRpcEligible, sandboxEnabled, log: vi.fn() };
     loadWorkerFunction<(cfg: any, adapter: any) => void>('refreshCliPluginGeneration', scope)(
       { ...cfg, sessionId: 'session', workingDir: '/workspace', prompt: '' }, { id: cfg.cliId });
     expect(prepare).toHaveBeenCalledWith(expect.objectContaining({
       previousSkillCatalogFingerprint: preserved ? 'delivered' : undefined,
+      // These minimal Auto-restart cfgs never satisfy codexRpcEligible, so the
+      // TraeX RPC compact/defer flags must stay off on the legacy catalog path.
+      compactCatalog: false,
+      deferCatalogToContextManager: false,
     }));
   });
 
@@ -836,7 +1236,7 @@ describe('same-worker Auto restart model continuity', () => {
       traexAutoModel: pool, traexAutoModelRuntime: runtime };
     const scope: Record<string, any> = { lastInitConfig: { ...cfg }, traexAutoModelController: null,
       TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    configureAutoModel(scope, cfg);
     expect(cfg).toMatchObject({ model: 'backup', reasoningEffort: 'low', modelBackendVariant: 'standard' });
     expect(scope.lastInitConfig.model).toBe('backup');
     expect(scope.traexAutoModelController.runtimeState('native')).toMatchObject({ waitingOnFinalModel: true });
@@ -853,7 +1253,7 @@ describe('same-worker Auto restart model continuity', () => {
     const scope: Record<string, any> = { lastInitConfig, traexAutoModelController: waitingController(),
       deliveredPluginSkillCatalogFingerprint: 'new-catalog',
       TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)({ ...lastInitConfig, prompt: '' });
+    configureAutoModel(scope, { ...lastInitConfig, prompt: '' });
     expect(lastInitConfig.model).toBe('backup');
     expect(scope.traexAutoModelController.runtimeState('native')).toMatchObject({ model: 'backup', waitingOnFinalModel: true });
     expect(scope.deliveredPluginSkillCatalogFingerprint).toBe('new-catalog');
@@ -866,7 +1266,7 @@ describe('same-worker Auto restart model continuity', () => {
       traexAutoModelRuntime: { ...waitingController().runtimeState('native'), skillCatalogFingerprint: 'unrelated', ...changed } };
     const scope: Record<string, any> = { lastInitConfig: cfg, traexAutoModelController: null,
       TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    configureAutoModel(scope, cfg);
     expect(cfg.model).toBe('core');
     expect(scope.traexAutoModelController.runtimeState('native').waitingOnFinalModel).toBe(false);
     expect(scope.deliveredPluginSkillCatalogFingerprint).toBeUndefined();
@@ -881,7 +1281,7 @@ describe('same-worker Auto restart model continuity', () => {
       traexAutoModelRuntime: persisted };
     const scope: Record<string, any> = { traexAutoModelController: controller, lastInitConfig: cfg,
       TraexAutoModelController, resolveTraexAutoModelSettings, validTraexAutoModelRuntime };
-    loadWorkerFunction<(cfg: any) => void>('configureTraexAutoModel', scope)(cfg);
+    configureAutoModel(scope, cfg);
     expect(cfg.model).toBe('backup');
     expect(scope.traexAutoModelController.currentModel()).toBe('backup');
   });

@@ -18,7 +18,7 @@ import { TraexAutoModelController } from '../src/services/traex-auto-model.js';
 vi.mock('../src/adapters/cli/model-catalog-json.js', async importOriginal => ({
   ...await importOriginal<typeof import('../src/adapters/cli/model-catalog-json.js')>(),
   detectModelCapabilitiesViaExec: vi.fn(async () => [
-    { slug: 'gpt-5.6-sol', serviceTiers: [], reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
+    { slug: 'gpt-5.6-sol', serviceTiers: [], reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
       contextVariants: [{ id: 'standard', contextWindow: 272000 }, { id: 'max', contextWindow: 800000 }] },
     { slug: 'future-live-model', serviceTiers: [], reasoningEfforts: ['low', 'medium', 'high', 'xhigh'],
       contextVariants: [{ id: 'standard', contextWindow: 272000, reasoningEfforts: ['low', 'medium', 'high', 'xhigh'] }] },
@@ -83,6 +83,23 @@ describe('TraeX auto-model settings', () => {
       expect(getBot('auto_test').config.traexAutoModel).toEqual(configuredPool);
       expect(loadBotConfigs()[0]!.traexAutoModel).toEqual(configuredPool);
       expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ traexAutoModel: configuredPool });
+      const preflightPool = {
+        enabled: true, models: ['gpt-5.6-sol'], queueTimeoutMs: 12_000,
+        preflightLoadCheck: true, overloadThresholdPercent: 100, preflightTimeoutMs: 1_500,
+        unknownLoadPolicy: 'skip', allOverloadedPolicy: 'lowest_load',
+        modelSettings: { 'gpt-5.6-sol': { reasoningEffort: 'max', modelBackendVariant: 'max' } },
+      };
+      const preflightSaved = await save({ cliId: 'traex', model: 'auto', traexAutoModel: preflightPool });
+      expect(preflightSaved.status).toBe(200);
+      expect((await preflightSaved.json()).traexAutoModel).toEqual(preflightPool);
+      const preflightLower = await save({ cliId: 'traex', model: 'auto', traexAutoModel: {
+        ...preflightPool, modelSettings: { 'gpt-5.6-sol': { reasoningEffort: 'high' } },
+      } });
+      expect(preflightLower.status).toBe(400);
+      const preflightNotHighest = await save({ cliId: 'traex', model: 'auto', traexAutoModel: {
+        ...preflightPool, modelSettings: { 'gpt-5.6-sol': { reasoningEffort: 'xhigh' } },
+      } });
+      expect(preflightNotHighest.status).toBe(400);
       const invalidEffort = await save({ cliId: 'traex', model: 'auto', traexAutoModel: {
         ...configuredPool, modelSettings: { 'gpt-6-astra': { reasoningEffort: 'ultra' } },
       } });
@@ -147,17 +164,30 @@ describe('TraeX auto-model settings', () => {
       const root = rendered!.root;
       expect(root.findByProps({ 'data-input': 'autoModelEnabled' }).props.checked).toBe(false);
       act(() => root.findByProps({ 'data-input': 'autoModelEnabled' }).props.onChange({ currentTarget: { checked: true } }));
+      expect(root.findByProps({ 'data-input': 'autoModelPreflightLoadCheck' }).props.checked).toBe(false);
       expect(root.findByProps({ 'data-input': 'autoModelReselectPerTurn' }).props.checked).toBe(false);
       expect(root.findAllByType('span').some(span => span.children.includes('话题内每轮重新择优'))).toBe(true);
       act(() => root.findByProps({ 'data-action': 'autoModelAdd' }).props.onClick());
       act(() => root.findAllByType(ModelPickerField).find(field => field.props.dataInput === 'autoModel1')!.props.onChange('m2'));
       act(() => root.findAllByProps({ 'aria-label': '上移模型' })[1]!.props.onClick());
-      act(() => root.findByProps({ dataInput: 'autoModelEffort0' }).props.onChange('high'));
+      act(() => root.findByProps({ dataInput: 'autoModelEffort0' }).props.onChange('medium'));
       act(() => root.findByProps({ dataInput: 'autoModelContext0' }).props.onChange('max'));
+      act(() => root.findByProps({ 'data-input': 'autoModelPreflightLoadCheck' }).props.onChange({ currentTarget: { checked: true } }));
+      act(() => root.findByProps({ 'data-input': 'autoModelOverloadThreshold' }).props.onChange({ currentTarget: { value: '110' } }));
+      act(() => root.findByProps({ 'data-input': 'autoModelPreflightTimeout' }).props.onChange({ currentTarget: { value: '1.5' } }));
+      expect(root.findByProps({ dataInput: 'autoModelEffort0' }).props.value).toBe('high');
+      expect(root.findByProps({ dataInput: 'autoModelEffort0' }).props.disabled).toBe(true);
+      act(() => root.findByProps({ dataInput: 'autoModelTrigger' }).props.onChange('quota'));
+      expect(root.findByProps({ dataInput: 'autoModelEffort0' }).props.value).toBe('medium');
+      expect(root.findByProps({ dataInput: 'autoModelEffort0' }).props.disabled).toBe(false);
+      act(() => root.findByProps({ dataInput: 'autoModelTrigger' }).props.onChange('capacity'));
+      act(() => root.findByProps({ 'data-input': 'autoModelPreflightLoadCheck' }).props.onChange({ currentTarget: { checked: true } }));
       act(() => root.findByProps({ 'data-input': 'autoModelTimeout' }).props.onChange({ currentTarget: { value: '15' } }));
       await act(async () => { await root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); });
       expect(saved).toMatchObject({ model: 'auto', traexAutoModel: { enabled: true, models: ['m2', 'm1'],
-        modelSettings: { m2: { reasoningEffort: 'high', modelBackendVariant: 'max' }, m1: {} },
+        modelSettings: { m2: { reasoningEffort: 'high', modelBackendVariant: 'max' }, m1: { reasoningEffort: 'high' } },
+        preflightLoadCheck: true, overloadThresholdPercent: 110, preflightTimeoutMs: 1_500,
+        unknownLoadPolicy: 'skip', allOverloadedPolicy: 'lowest_load',
         reselectPerTurn: false, queueTimeoutMs: 15_000, switchCooldownMs: 60_000 } });
       expect(patchBot).toHaveBeenLastCalledWith('auto_ui', expect.objectContaining({ traexAutoModel: saved.traexAutoModel }));
     } finally {

@@ -428,6 +428,7 @@ export function cleanPromptText(raw: string): string {
   let s = raw
     .replace(/<(mentions|attachments|available_bots|system-reminder|quoted_messages|sender)\b[\s\S]*?<\/\1>/g, ' ')
     .replace(/<botmux_reminder>[\s\S]*?<\/botmux_reminder>/g, ' ')
+    .replace(/<botmux_formatting>[\s\S]*?<\/botmux_formatting>/g, ' ')
     .replace(/<\/?(user_message|local-command-[a-z]+)>/g, ' ')
     .replace(/<sender\b[^>]*\/?>/g, ' ')
     .replace(/<mention\b[^>]*\/?>/g, ' ')

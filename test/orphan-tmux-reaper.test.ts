@@ -350,6 +350,67 @@ describe('ensureServerThenReapOrphanTmuxServers (multi-socket orchestrator)', ()
     expect(r.cleaned).toEqual(r.booted);     // bootstrap removed
   });
 
+  it('Linux: recovered server becomes the reachable owner — no bootstrap, no kill (own seam)', () => {
+    const PATH = namedSocket('botmux');
+    const booted: string[] = [];
+    const recreated: number[] = [];
+    const killed: number[] = [];
+    let ownerState: { kind: 'down' } | { kind: 'reachable'; pid: number } = { kind: 'down' };
+    const n = ensureServerThenReapOrphanTmuxServers({
+      socketNames: ['botmux'],
+      procs: [tmuxServer(200)],
+      socketBindings: [{ pid: 200, path: PATH }],
+      env: process.env,
+      platform: 'linux',
+      uid: process.getuid(),
+      probeOwner: () => ownerState.kind === 'down' ? { kind: 'down' } : { kind: 'reachable', pid: ownerState.pid },
+      listeningServerPids: () => [200],
+      recreateSocket: (pid) => { recreated.push(pid); ownerState = { kind: 'reachable', pid }; },
+      bootstrap: () => { booted.push('boot'); return true; },
+      cleanupBootstrap: () => {},
+      kill: (pid) => { killed.push(pid); },
+      ...DEAD_ON_SIGNAL,
+    });
+    expect(recreated).toEqual([200]);
+    expect(booted).toEqual([]);           // recovery worked → no bootstrap fork
+    expect(killed).toEqual([]);           // pid 200 now owns its socket → nothing displaced
+    expect(n).toBe(0);
+  });
+
+  it('Linux: SIGUSR1 recovery that leaves the owner down falls back to bootstrap and reaps the displaced server', () => {
+    const PATH = namedSocket('botmux');
+    const booted: string[] = [];
+    const recreated: number[] = [];
+    const n = ensureServerThenReapOrphanTmuxServers({
+      socketNames: ['botmux'],
+      procs: [
+        tmuxServer(200),
+        { pid: 300, ppid: 1, cmd: 'tmux new-session -d -s bmx-reap-bootstrap-7 -x 80 -y 24' },
+      ],
+      socketBindings: [{ pid: 200, path: PATH }],
+      env: process.env,
+      platform: 'linux',
+      uid: process.getuid(),
+      probeOwner: (() => {
+        let calls = 0;
+        return () => {
+          calls += 1;
+          // down, still down after USR1, then reachable as the bootstrap owner
+          return calls < 3 ? { kind: 'down' as const } : { kind: 'reachable' as const, pid: 300 };
+        };
+      })(),
+      listeningServerPids: () => [200],
+      recreateSocket: (pid) => { recreated.push(pid); }, // server never comes back
+      bootstrap: () => { booted.push('boot'); return true; },
+      cleanupBootstrap: () => {},
+      kill: () => {},
+      ...DEAD_ON_SIGNAL,
+    });
+    expect(recreated).toEqual([200]);     // recovery attempted first
+    expect(booted).toEqual(['boot']);     // then the original bootstrap fallback
+    expect(n).toBe(1);                    // displaced 200 reaped against owner 300
+  });
+
   it('skips a socket whose owner probe is unknown (never boots, never kills)', () => {
     const PATH = namedSocket('botmux');
     const r = harness({

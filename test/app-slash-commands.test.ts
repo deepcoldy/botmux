@@ -89,6 +89,12 @@ describe('native Lark slash-command catalog', () => {
     expect(buildAppSlashCommandCatalog().some(command => command.command === 'effort')).toBe(false);
   });
 
+  it('offers the model picker in the native menu without registering raw /model passthrough', () => {
+    const catalog = buildAppSlashCommandCatalog({ cliId: 'traex' });
+    expect(catalog.find(c => c.command === 'models')).toMatchObject({ source: 'botmux' });
+    expect(catalog.some(c => c.command === 'model')).toBe(false);
+  });
+
   it('builds short bilingual descriptions from the /help i18n lines, marking aliases', () => {
     const catalog = buildAppSlashCommandCatalog();
     for (const command of catalog) {

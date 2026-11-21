@@ -1,3 +1,8 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件把 bots.json、.dashboard-token、.dashboard-secret、.data-dir 和 dashboard 的 daemon
+// 注册表写进 homedir()/.botmux；在绕过 setupFiles 的运行（如 0 字节 vitest 配置）里，这些写入会
+// 直接覆盖真实的 ~/.botmux（bots.json 是全部 bot 的配置）。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
@@ -18,6 +23,10 @@ import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 const appId = 'cli_port_change';
 const managementToken = 'port-change-test-management-token';
 const botmuxDir = join(homedir(), '.botmux');
+// 下面所有写入都落在 botmuxDir 里：它不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(botmuxDir, process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: ${botmuxDir} is not inside the test fence`);
+}
 const dataDir = join(botmuxDir, 'data');
 const registryDir = join(dataDir, 'dashboard-daemons');
 let child: ChildProcess;

@@ -53,19 +53,34 @@ export async function collectNativePrint(executable: string, args: string[], run
     hardKill ??= setTimeout(() => kill('SIGKILL'), 1000);
   });
   child.on('error', () => fail(new Error('native_spawn_failed')));
-  const exited = new Promise<number | null>(resolve => child.once('close', resolve));
+  // Classify on 'exit' ('close' still covers a failed spawn, which never exits):
+  // 'close' also waits for stdout/stderr, and a descendant left holding them
+  // keeps it from ever arriving.
+  const exited = new Promise<number | null>(resolve => { child.once('exit', resolve); child.once('close', resolve); });
+  const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
   signal.addEventListener('abort', abort, { once: true });
   try {
     if (signal.aborted) abort(); else child.stdin.end(runtime.input);
     const code = await exited;
+    // Reap what the run left in its group, then drain the pipes, bounded in case
+    // a descendant escaped the group.
+    kill('SIGTERM');
+    hardKill ??= setTimeout(() => kill('SIGKILL'), 1000);
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([closed, new Promise<void>(resolve => { drainTimer = setTimeout(resolve, 2000); })]);
+    clearTimeout(drainTimer);
     if (failure) throw failure;
     if (code !== 0) throw new Error('native_inference_failed');
-    if (stdinClosed) throw new Error('native_transport_closed');
+    // 'close' does not wait for stdin, so EPIPE may not have landed yet: an
+    // unfinished write is undelivered input too.
+    if (stdinClosed || !child.stdin.writableFinished) throw new Error('native_transport_closed');
     output += decoder.end();
     if (runtime.onLine && pending.trim()) runtime.onLine(pending);
     return output;
   } finally {
     signal.removeEventListener('abort', abort);
     if (hardKill) clearTimeout(hardKill);
+    child.stdout.destroy();
+    child.stderr.destroy();
   }
 }

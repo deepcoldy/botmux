@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, realpathSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { getClaudeSessionJsonlPath } from '../src/services/transcript-resolver.js';
@@ -72,5 +72,31 @@ describe('getClaudeSessionJsonlPath — symlinked cwd', () => {
     writeFileSync(expected, '{}');
 
     expect(getClaudeSessionJsonlPath(sid, ghost, dataDir)).toBe(expected);
+  });
+
+  // Oncall bindings persist the owner's raw string, which often carries a
+  // trailing slash or '.'/'..' segment. Once that directory is deleted
+  // realpathSync throws; the fallback must still NORMALIZE lexically so the
+  // project key matches — hashing the raw spelling would never match.
+  it.each([
+    ['trailing slash', (ghost: string) => `${ghost}/`],
+    ['trailing /. ', (ghost: string) => `${ghost}/.`],
+    ['double slash', (_ghost: string, base: string) => `${base}//gone//work`],
+    ['parent segment', (_ghost: string, base: string) => `${base}/gone/sub/../work`],
+  ])('lexical fallback normalizes a raw oncall string (%s)', (_label, spell) => {
+    const base = mkdtempSync(join(tmpdir(), 'botmux-symlink-'));
+    trash.push(base);
+    const ghost = join(base, 'gone', 'work');
+    const dataDir = join(base, '.claude');
+    // Transcript stored under the key of the NORMALIZED path (what resolve yields).
+    const key = resolve(ghost).replace(/[^A-Za-z0-9-]/g, '-');
+    const sid = 'sess-4';
+    mkdirSync(join(dataDir, 'projects', key), { recursive: true });
+    const expected = join(dataDir, 'projects', key, `${sid}.jsonl`);
+    writeFileSync(expected, '{}');
+
+    const raw = spell(ghost, base);
+    expect(resolve(raw)).toBe(resolve(ghost)); // sanity: spelling resolves to same dir
+    expect(getClaudeSessionJsonlPath(sid, raw, dataDir)).toBe(expected);
   });
 });

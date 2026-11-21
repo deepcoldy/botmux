@@ -129,6 +129,7 @@ export async function handleV3RunSaveAction(
         humanVersion: alreadySaved.revision.payload.humanVersion,
         revisionId: alreadySaved.revision.revisionId,
         scope: alreadySaved.metadata.scope.kind,
+        runtimeRevisions: alreadySaved.runtimeRevisions,
         requestedScope: value.scope,
       }));
     } catch (err) {
@@ -158,6 +159,7 @@ export async function handleV3RunSaveAction(
       humanVersion: result.revision.payload.humanVersion,
       revisionId: result.revision.revisionId,
       scope: result.metadata.scope.kind,
+      runtimeRevisions: result.runtimeRevisions,
       requestedScope: value.scope,
     }));
   } catch (err) {

@@ -1,5 +1,10 @@
 import { spawnSync } from 'node:child_process';
-import { isBotmuxSessionScopeUnit, userSystemdBusEnv } from './session-scope.js';
+import {
+  isBotmuxSessionScopeUnit,
+  systemdPidNamespace,
+  userSystemdBusEnv,
+  type SystemdPidNamespace,
+} from './session-scope.js';
 import { readProcessSystemdUnit } from '../utils/systemd-unit.js';
 
 /**
@@ -42,6 +47,7 @@ export interface FleetScopeRuntime {
   pid: number;
   readUnit(pid: number): string | undefined;
   busEnv(): Record<string, string> | undefined;
+  pidNamespace(): SystemdPidNamespace;
   run(command: string, args: readonly string[], env: Record<string, string>): { status: number | null; stderr: string };
   now(): number;
   sleepMs(ms: number): void;
@@ -62,6 +68,7 @@ const defaultRuntime: FleetScopeRuntime = {
   pid: process.pid,
   readUnit: pid => readProcessSystemdUnit(pid),
   busEnv: () => userSystemdBusEnv(),
+  pidNamespace: () => systemdPidNamespace(),
   run: (command, args, env) => {
     const r = spawnSync(command, [...args], {
       encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'],
@@ -91,6 +98,10 @@ export function moveSupervisorIntoFleetScope(
   if (!isBotmuxSessionScopeUnit(unit)) return { action: 'kept', unit };
   const busEnv = rt.busEnv();
   if (!busEnv) return { action: 'unsupported', reason: `no user systemd bus (staying in ${unit})` };
+  // PIDs=[our pid] goes over as a plain number that the manager resolves in its
+  // own PID namespace; from any other it names, and moves, some other process.
+  const pidNamespace = rt.pidNamespace();
+  if (!pidNamespace.shared) return { action: 'unsupported', reason: `${pidNamespace.reason} (staying in ${unit})` };
   const target = fleetScopeUnitName(rt.pid, rt.now());
   const r = rt.run('busctl', [
     '--user', 'call', 'org.freedesktop.systemd1', '/org/freedesktop/systemd1',

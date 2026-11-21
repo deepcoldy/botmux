@@ -1,9 +1,22 @@
 // test/terminal-url.test.ts
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件会写入并删除 dashboardSecretPath()（由 homedir() 推导）；2026-11-06 一次
+// 绕过 setupFiles 的全量运行里，这类写入和删除落在了真实的 ~/.botmux/.dashboard-secret 上。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { config } from '../src/config.js';
 import { dashboardSecretPath } from '../src/core/dashboard-secret.js';
+/** dashboardSecretPath()，但只在它落在本文件的测试围栏里时才返回，否则拒绝读写。 */
+function fencedSecretPath(): string {
+  const path = dashboardSecretPath();
+  if (!isInsideDir(path, process.env.__TEST_DATA_DIR_FENCE)) {
+    throw new Error(`refusing to touch ${path}: it is not inside the test fence`);
+  }
+  return path;
+}
+
 import { deriveTerminalCardViewToken } from '../src/core/terminal-write-auth.js';
 
 vi.mock('../src/global-config.js', () => ({
@@ -263,11 +276,11 @@ describe('buildTerminalUrl — restored session without a worker (#2279)', () =>
     vi.mocked(devboxDashboardBaseUrl).mockReturnValue(null);
     setTerminalProxyPort(8801);
     // homedir() 在单测里被 unit-setup 围到本文件的临时 HOME。
-    mkdirSync(dirname(dashboardSecretPath()), { recursive: true, mode: 0o700 });
-    writeFileSync(dashboardSecretPath(), secret, { mode: 0o600 });
+    mkdirSync(dirname(fencedSecretPath()), { recursive: true, mode: 0o700 });
+    writeFileSync(fencedSecretPath(), secret, { mode: 0o600 });
   });
   afterEach(() => {
-    rmSync(dashboardSecretPath(), { force: true });
+    rmSync(fencedSecretPath(), { force: true });
     resetTerminalProxy();
   });
 
@@ -291,7 +304,7 @@ describe('buildTerminalUrl — restored session without a worker (#2279)', () =>
   });
 
   it('leaves the link bare when the secret is unavailable', () => {
-    rmSync(dashboardSecretPath(), { force: true });
+    rmSync(fencedSecretPath(), { force: true });
     expect(buildTerminalUrl(restored)).toBe(bare());
   });
 

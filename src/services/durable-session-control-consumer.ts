@@ -40,6 +40,13 @@ export interface DurableSessionControlConsumerOptions {
   retryDelayMs?: number;
   /** Fast requeue used only when a prefix failover raced the exact owner. */
   ownerHandoffRetryDelayMs?: number;
+  /**
+   * Per-control claim budget. undefined (the default, and the answer for
+   * lifecycle controls) keeps retrying until the control settles; a number
+   * settles the control as ignored once that many claims have failed, so a
+   * best-effort control cannot block its partition's FIFO forever.
+   */
+  maxAttemptsFor?(control: DurableLarkSessionControlClaim): number | undefined;
   /** Give an exact local owner time to claim before cluster-prefix failover. */
   fallbackClaimIntervalMs?: number;
   concurrency?: number;
@@ -243,6 +250,24 @@ export function startDurableSessionControlConsumer(
       if (renewing) await renewing;
       if (ownershipLost || controller.signal.aborted) return;
       reportError(error);
+      const maxAttempts = control ? options.maxAttemptsFor?.(control) : undefined;
+      if (control && maxAttempts !== undefined && claim.attempts >= maxAttempts) {
+        const completed = await options.store.completeInboxClaim(claim);
+        if (completed.kind === 'stale') {
+          reportError(new Error(`durable session control retry limit lost ${claim.event.eventId}`));
+          return;
+        }
+        reportError(new Error(
+          `durable session control retry limit reached for ${claim.event.eventId} after ${claim.attempts} attempts`,
+        ));
+        try {
+          options.onSettled?.({
+            control,
+            result: { kind: 'ignored', reason: 'durable session control retry limit reached' },
+          });
+        } catch (observerError) { reportError(observerError); }
+        return;
+      }
       const delayMs = error instanceof DurableSessionControlOwnerHandoffError
         ? ownerHandoffRetryDelayMs
         : retryDelayMs;

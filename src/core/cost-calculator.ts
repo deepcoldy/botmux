@@ -1,6 +1,7 @@
 /**
  * Session cost calculator — computes token usage from JSONL logs.
  */
+import { createHash } from 'node:crypto';
 import { closeSync, constants, existsSync, fstatSync, openSync, readFileSync, readSync, statSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -11,7 +12,9 @@ import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBy
 import {
   __resetTranscriptResolverCacheForTest,
   cachedTranscriptPathLookup,
+  kimiEnvForBot,
   resolveSessionTranscriptPath,
+  resolveSessionTranscriptPaths,
 } from '../services/transcript-resolver.js';
 import { scanJsonlFromFd, scanJsonlFromOffset, type JsonlCursor } from '../services/jsonl-cursor.js';
 import { estimateCostCny, type ResolvedModelPricing } from '../services/model-pricing.js';
@@ -26,10 +29,12 @@ import { readZcodeUsage } from '../services/zcode-usage.js';
 import { readZcodeSessionMarker, zcodeSessionDbPath } from '../services/zcode-session.js';
 import { readMinimaxUsage } from '../services/minimax-usage.js';
 import { readCursorUsage } from '../services/cursor-usage.js';
+import { readKimiModelContextWindow } from '../services/kimi-transcript.js';
 import { cursorConfigDirForBot } from '../services/cursor-paths.js';
 import { getBot } from '../bot-registry.js';
 import { botOneShotEnv } from './session-env-resolve.js';
 import { config } from '../config.js';
+import type { ModelTokenUsage } from '../services/model-token-usage.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -45,6 +50,9 @@ export interface SessionCost {
 export interface SessionTokenUsage extends SessionCost, SessionTokenUsageSnapshot {
   in: number;
   out: number;
+  /** Cumulative native execution-model attribution (when the CLI exposes it). */
+  models?: ModelTokenUsage[];
+  nativeCheckpoint?: string;
 }
 
 /** Latest Context Usage reported by the Agent CLI. A missing window means the
@@ -282,10 +290,15 @@ interface TokenUsageAggregate {
 
 /** Per-CLI transcript dialect. Each kind only counts the events that dialect
  *  defines as billable turns — no cross-CLI guessing on usage-shaped lines. */
-type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'grok' | 'generic';
+type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'grok' | 'kimi' | 'generic';
 
 interface UsageSourceRecord {
   offset: number;
+  checkpoint: string;
+}
+
+function checkpointHash(line: string): string {
+  return createHash('sha256').update(line).digest('hex');
 }
 
 const CODEX_USAGE_SOURCE_RECORD_MAX_BYTES = 64 * 1024;
@@ -295,6 +308,7 @@ function sourceRecordForLine(line: string, lineStart: number | undefined): Usage
   if (Buffer.byteLength(line, 'utf8') > CODEX_USAGE_SOURCE_RECORD_MAX_BYTES) return null;
   return {
     offset: lineStart,
+    checkpoint: checkpointHash(line),
   };
 }
 
@@ -320,6 +334,8 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
       return 'pi';
     case 'grok':
       return 'grok';
+    case 'kimi':
+      return 'kimi';
     default:
       return 'generic';
   }
@@ -600,6 +616,65 @@ function foldGrokLine(agg: TokenUsageAggregate, entry: any): void {
   agg.turns++;
 }
 
+/** Kimi Code main-agent wire log (`agents/main/wire.jsonl`, see
+ *  services/kimi-transcript.ts). `usage.record` is the single billed source:
+ *  one record per model call, including the compaction call
+ *  (`usageScope: "session"`). The same numbers are mirrored on `step.end` and
+ *  message metadata and must not be added again. Sub-agents log to their own
+ *  files and are not counted, like the other CLIs' main-transcript totals.
+ *  `token_counting.measured` / `.rebased` (after compaction) carry the current
+ *  context size; `llm.request` the model alias and thinking effort. */
+function foldKimiLine(agg: TokenUsageAggregate, entry: any): void {
+  if (!entry || typeof entry !== 'object') return;
+  if (typeof entry.agentId === 'string' && entry.agentId !== 'main') return;
+  switch (entry.type) {
+    case 'turn.prompt':
+      agg.turnInputTokens = 0;
+      agg.turnOutputTokens = 0;
+      return;
+    case 'llm.request': {
+      if (entry.kind !== undefined && entry.kind !== 'loop') return;
+      const model = firstNonEmptyString(entry.modelAlias, entry.model);
+      if (model) agg.model = model;
+      const effort = firstNonEmptyString(entry.thinkingEffort);
+      if (effort) agg.reasoningEffort = effort;
+      return;
+    }
+    case 'token_counting.measured':
+    case 'token_counting.rebased': {
+      const tokens = num(entry.tokens);
+      if (tokens > 0) {
+        agg.latestContextUsage = { usedTokens: tokens };
+        agg.latestContextAtMs = num(entry.time) > 0 ? num(entry.time) : null;
+      }
+      return;
+    }
+    case 'usage.record': {
+      const u = entry.usage;
+      if (!u || typeof u !== 'object') return;
+      const input = num(u.inputOther);
+      const output = num(u.output);
+      const cacheRead = num(u.inputCacheRead);
+      const cacheCreate = num(u.inputCacheCreation);
+      agg.inputTokens += input;
+      agg.outputTokens += output;
+      agg.cacheReadTokens += cacheRead;
+      agg.cacheCreateTokens += cacheCreate;
+      // Same "this turn" convention as Claude: new prompt-side tokens (cache
+      // reads only re-read context) plus output.
+      agg.turnInputTokens += input + cacheCreate;
+      agg.turnOutputTokens += output;
+      const model = firstNonEmptyString(entry.model);
+      if (model && !agg.model) agg.model = model;
+      agg.turns++;
+      return;
+    }
+  }
+}
+
+/** Wire records the Kimi fold reads; other (often large) lines skip JSON.parse. */
+const KIMI_USAGE_LINE_RE = /"(?:usage\.record|turn\.prompt|token_counting\.(?:measured|rebased)|llm\.request)"/;
+
 function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
   if (entry?.type !== 'message' || entry?.message?.role !== 'assistant') return;
   const msg = entry.message;
@@ -675,6 +750,8 @@ function foldUsageLine(
       return foldPiLine(agg, seenMessageIds, entry);
     case 'grok':
       return foldGrokLine(agg, entry);
+    case 'kimi':
+      return foldKimiLine(agg, entry);
     case 'generic':
       return foldGenericLine(agg, seenMessageIds, entry);
   }
@@ -778,6 +855,7 @@ const warnedOversizedUsageFiles = new Set<string>();
 
 export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
+  usageRecoveryCursor.clear();
   warnedOversizedUsageFiles.clear();
   piModelsCache = null;
   __resetCodexCompactionCountForTest();
@@ -805,6 +883,7 @@ function foldUsageJsonLine(
   lineStart?: number,
 ): void {
   if (!line.trim()) return;
+  if (kind === 'kimi' && !KIMI_USAGE_LINE_RE.test(line)) return;
   try {
     const entry = JSON.parse(line);
     if (kind !== 'codex') {
@@ -1432,6 +1511,7 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   if (!resolved || !existsSync(resolved.path)) return null;
   const cached = readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
   const read = cached ? { ...cached, transcriptPath: resolved.path } : cached;
+  if (q.cliId === 'kimi' && read) return withKimiContextWindow(read, kimiEnvForBot(q.larkAppId));
   if (q.cliId !== 'grok' || !read) return read;
   // signals.json is a small rewritten snapshot beside updates.jsonl. Read it
   // on every card refresh: the append-only JSONL cache may legitimately be
@@ -1486,9 +1566,132 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   return { agg, result, transcriptPath: resolved.path };
 }
 
-export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
+/** Kimi's context window is per model in its config.toml; read it on every
+ *  refresh (small file) so a model switch is reflected immediately. */
+function withKimiContextWindow(read: UsageReadResult, env: NodeJS.ProcessEnv): UsageReadResult {
+  const used = read.agg.latestContextUsage?.usedTokens;
+  if (!used || used <= 0) return read;
+  const windowTokens = readKimiModelContextWindow(read.agg.model || undefined, env);
+  if (!windowTokens) return read;
+  const agg = cloneAggregate(read.agg);
+  agg.latestContextUsage = {
+    usedTokens: used,
+    windowTokens,
+    percentUsed: Math.round(Math.max(0, Math.min(1, used / windowTokens)) * 100),
+  };
+  return { ...read, agg };
+}
+
+// Cache the last verified checkpoint so ordinary turns only read the new tail.
+const usageRecoveryCursor = new Map<string, {
+  dev: number; ino: number; offset: number; line: string; model: string;
+}>();
+
+/** Recover only a complete, monotone interval anchored by an exact native checkpoint. */
+export function getSessionUsageRecovery(
+  q: SessionTokenUsageQuery, previous: SessionTokenUsage, current: SessionTokenUsage,
+): Array<{ at: Date; usage: SessionTokenUsage; reset?: true }> | null {
+  if (q.cliId !== 'codex' && q.cliId !== 'traex') return null;
+  const fields = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheCreateTokens'] as const;
+  const equal = (a: SessionTokenUsage, b: SessionTokenUsage) => fields.every(k => a[k] === b[k]);
+  const recover = (paths: string[], resume?: typeof cursor) => {
+    const aggregate = newTokenUsageAggregate();
+    const recovered: Array<{ at: Date; usage: SessionTokenUsage; reset?: true }> = [];
+    let last = previous;
+    let anchored = false;
+    let previousAt: number | null = null;
+    let checkpoint: typeof cursor;
+    let invalid = false;
+    let remainingScanBytes = MAX_USAGE_TRANSCRIPT_BYTES;
+    const seenCheckpoints = new Set<string>();
+    for (const path of paths) {
+      const st = statSync(path);
+      if (resume && (st.dev !== resume.dev || st.ino !== resume.ino)) return null;
+      const fromOffset = resume?.offset ?? 0;
+      const scanBytes = Math.max(0, st.size - fromOffset);
+      if (scanBytes > remainingScanBytes) return null;
+      remainingScanBytes -= scanBytes;
+      const priorSegmentEnd = anchored ? previousAt : null;
+      // Model context belongs to this segment. A prior segment cannot supply it.
+      aggregate.model = resume?.model ?? '';
+      const scan = scanJsonlFromOffset(path, fromOffset, { endOffset: st.size, onLine(line, offset) {
+        if (invalid || !line.trim()) return;
+        if (resume && offset === resume.offset && line !== resume.line) { invalid = true; return; }
+        let entry: any;
+        try { entry = JSON.parse(line); } catch { invalid = anchored; return; }
+        foldCodexLine(aggregate, entry, () => null);
+        const usage = extractCodexTokenCountUsage(entry);
+        if (!usage) return;
+        usage.nativeCheckpoint = checkpointHash(line);
+        usage.model = firstNonEmptyString(entry.payload.context?.model, aggregate.model) ?? '';
+        const ms = entryTimestampMs(entry);
+        if (!anchored) {
+          seenCheckpoints.add(usage.nativeCheckpoint);
+          anchored = equal(usage, previous)
+            && (!previous.nativeCheckpoint || usage.nativeCheckpoint === previous.nativeCheckpoint);
+          if (anchored) previousAt = ms;
+          return;
+        }
+        if (seenCheckpoints.has(usage.nativeCheckpoint)) {
+          // A continuation may replay history across counter resets. Native row
+          // identity, not cumulative totals, distinguishes replay from new usage.
+          // Keep the cursor with the newest physical copy of the current point.
+          if (equal(usage, last) && usage.nativeCheckpoint === last.nativeCheckpoint) {
+            checkpoint = { dev: st.dev, ino: st.ino, offset, line, model: aggregate.model };
+          }
+          return;
+        }
+        seenCheckpoints.add(usage.nativeCheckpoint);
+        if (ms !== null && priorSegmentEnd !== null && ms <= priorSegmentEnd
+          && fields.every(k => usage[k] <= last[k])) return;
+        if (equal(usage, last)) {
+          last = usage;
+          checkpoint = { dev: st.dev, ino: st.ino, offset, line, model: aggregate.model };
+          return;
+        }
+        if (ms === null || (previousAt !== null && ms < previousAt)) {
+          invalid = true; return;
+        }
+        const reset = fields.some(k => usage[k] < last[k]);
+        if (reset && !previous.nativeCheckpoint) {
+          // Legacy totals alone cannot disambiguate the same checkpoint across resets.
+          invalid = true;
+          return;
+        }
+        recovered.push({ at: new Date(ms), usage, ...(reset ? { reset: true as const } : {}) });
+        checkpoint = { dev: st.dev, ino: st.ino, offset, line, model: aggregate.model };
+        last = usage;
+        previousAt = ms;
+      } });
+      // A trailing partial record is not durable. It cannot veto an interval
+      // whose final current checkpoint is proved by complete records below.
+      if (!scan || invalid) return null;
+    }
+    if (!anchored || !equal(last, current)
+      || (current.nativeCheckpoint && last.nativeCheckpoint !== current.nativeCheckpoint)) return null;
+    return { recovered, checkpoint };
+  };
+  const path = resolveSessionTranscriptPath(q)?.path;
+  if (!path) return null;
+  const cursor = usageRecoveryCursor.get(path);
+  try {
+    const result = (cursor && recover([path], cursor)) || recover(resolveSessionTranscriptPaths(q));
+    if (!result) return null;
+    if (result.checkpoint) {
+      if (usageRecoveryCursor.size >= USAGE_FILE_CACHE_MAX_ENTRIES && !usageRecoveryCursor.has(path)) {
+        usageRecoveryCursor.delete(usageRecoveryCursor.keys().next().value!);
+      }
+      usageRecoveryCursor.set(path, result.checkpoint);
+    }
+    return result.recovered;
+  } catch { return null; }
+}
+
+export function getSessionTokenUsage(q: SessionTokenUsageQuery, includeCheckpoint = false): SessionTokenUsage | null {
   if (q.cliId === 'minimax' || q.cliId === 'cursor') return getSessionUsageSnapshot(q).tokens;
-  return readSessionUsage(q)?.result ?? null;
+  const read = readSessionUsage(q);
+  const checkpoint = includeCheckpoint ? read?.agg.latestCodexUsageSource?.checkpoint : undefined;
+  return read?.result && checkpoint ? { ...read.result, nativeCheckpoint: checkpoint } : read?.result ?? null;
 }
 
 /** Provenance of the latest context measurement for `botmux observe`: only the
@@ -1566,8 +1769,8 @@ function usageSnapshotFromRead(q: SessionTokenUsageQuery, read: UsageReadResult 
     // Grok exposes a stable user-facing primaryModelId in signals.json.
     // Keep other CLIs unchanged: Relay-family transcript model strings may
     // be internal routing codes and intentionally never surface on cards.
-    ...((q.cliId === 'grok' || q.cliId === 'zcode') && agg?.model ? { model: agg.model } : {}),
-    ...((q.cliId === 'grok' || q.cliId === 'zcode') && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode' || q.cliId === 'kimi') && agg?.model ? { model: agg.model } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode' || q.cliId === 'kimi') && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
     ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}),
   };
 }

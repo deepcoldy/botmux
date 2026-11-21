@@ -17,20 +17,39 @@
  * This reader runs for the session, streaming thinking, mid-turn text, tool calls
  * and tool results into the native Feishu CoT bubble (message_cot).
  */
-import { existsSync, statSync, watch, type FSWatcher } from 'node:fs';
+import { closeSync, constants, existsSync, fstatSync, openSync, statSync, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { scanJsonlFromOffset } from './jsonl-cursor.js';
+import { dirname, join } from 'node:path';
+import { scanJsonlBackwardFd, scanJsonlFromFd, scanJsonlFromOffset } from './jsonl-cursor.js';
+import { antigravityRuntimeSignature, readLatestAntigravityRuntimeObservation } from './antigravity-usage.js';
 import {
   antigravityFullSiblingPath,
   mapAntigravityCompactOffsetToFull,
+  recordTimestampMs,
   resolveAntigravityTranscriptPath,
+  unwrapAntigravityUserInput,
 } from './antigravity-transcript.js';
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 
 export const COT_TOOL_ARGS_MAX_CHARS = 600;
 export const COT_TOOL_RESULT_MAX_CHARS = 800;
 const POLL_INTERVAL_MS = 1_000;
+
+/** The native user turn an entry batch belongs to. In adopt mode a person can
+ *  type in the pane while a Lark turn runs, so the worker must not attribute
+ *  CoT entries by "current turn" alone: it matches this input against its
+ *  pending Lark fingerprints and drops batches owned by a local/unknown turn. */
+export interface AntigravityCotTurnInput {
+  /** Submitted payload with agy's USER_REQUEST envelope removed. */
+  text: string;
+  /** Transcript timestamp of the boundary USER_INPUT record. */
+  timestampMs: number;
+}
+
+export type AntigravityCotEntriesHandler = (
+  entries: readonly AntigravityCotEntry[],
+  turnInput: AntigravityCotTurnInput | undefined,
+) => void;
 
 export type AntigravityCotEntry =
   | { kind: 'thinking'; text: string }
@@ -140,7 +159,18 @@ interface ReaderState {
   timer: NodeJS.Timeout;
   watcher: FSWatcher | null;
   pendingTools: Array<{ id: string; name: string }>;
-  onEntries: (entries: readonly AntigravityCotEntry[]) => void;
+  /** Boundary of the native user turn the currently scanned records belong
+   *  to. Undefined only for lines predating the first USER_INPUT the reader
+   *  has observed. */
+  turnInput?: AntigravityCotTurnInput;
+  onEntries: AntigravityCotEntriesHandler;
+  onRuntime?: (runtime: { model: string }, info?: { seeded?: boolean }) => void;
+  runtimeSignature?: string;
+  /** Latest gen_metadata row observed by this reader. A DB/WAL write without a
+   * newer row is not evidence that the historical model became live. */
+  runtimeLatestRowIdx?: number;
+  /** Baseline readers wait for a newer metadata row before clearing seeded. */
+  runtimeAwaitingLiveEvidence: boolean;
 }
 
 const readers = new Map<string, ReaderState>();
@@ -198,6 +228,32 @@ function bindTranscript(state: ReaderState): boolean {
 }
 
 function readNewTranscriptLines(state: ReaderState): void {
+  // Identity is useful even when thinking is disabled or no log bytes arrived.
+  // Reuse this reader's lifetime and exact native session, not a global setting.
+  if (state.onRuntime) {
+    try {
+      const opts = { conversationsDir: join(dirname(state.brainDir), 'conversations') };
+      const signature = antigravityRuntimeSignature(state.cliSessionId, opts);
+      if (!signature || signature !== state.runtimeSignature) {
+        const runtime = readLatestAntigravityRuntimeObservation(state.cliSessionId, opts);
+        if (runtime.model) {
+          const hasNewEvidence = runtime.latestRowIdx !== undefined
+            && state.runtimeLatestRowIdx !== undefined
+            && runtime.latestRowIdx > state.runtimeLatestRowIdx;
+          const seeded = state.runtimeAwaitingLiveEvidence && !hasNewEvidence;
+          // Keep the pre-seed callback shape for live observations; only the
+          // historical baseline carries the optional marker.
+          if (seeded) state.onRuntime({ model: runtime.model }, { seeded: true });
+          else state.onRuntime({ model: runtime.model });
+          if (!seeded) state.runtimeAwaitingLiveEvidence = false;
+          if (runtime.latestRowIdx !== undefined) state.runtimeLatestRowIdx = runtime.latestRowIdx;
+          // Failed/unknown reads and failed delivery stay retryable without a
+          // file change. Unchanged successful snapshots need no SQLite open.
+          state.runtimeSignature = signature;
+        }
+      }
+    } catch { /* cosmetic model reporting must not stop tool progress */ }
+  }
   if (!bindTranscript(state) || !state.transcriptPath) return;
   try {
     const st = statSync(state.transcriptPath);
@@ -209,9 +265,20 @@ function readNewTranscriptLines(state: ReaderState): void {
         if (!trimmed) return;
         try {
           const record = JSON.parse(trimmed);
+          // Track the same explicit-submit boundary the reply drainer uses:
+          // only agy's own USER_EXPLICIT submits start a native turn. Every
+          // following entry batch is tagged with this turn's submitted input
+          // so the worker can keep local-terminal turns off Lark cards.
+          if (record?.type === 'USER_INPUT'
+            && (record.source === undefined || record.source === 'USER_EXPLICIT')) {
+            const text = unwrapAntigravityUserInput(
+              typeof record.content === 'string' ? record.content : '',
+            );
+            state.turnInput = { text, timestampMs: recordTimestampMs(record) };
+          }
           const entries = extractAntigravityCotEntriesFromRecord(record, state.pendingTools);
           if (entries.length > 0) {
-            state.onEntries(entries);
+            state.onEntries(entries, state.turnInput ? { ...state.turnInput } : undefined);
           }
         } catch {
           // Half-written or malformed JSON line; skip
@@ -234,6 +301,42 @@ export interface StartAntigravityCotOptions {
   brainDir?: string;
   mode?: 'baseline-existing' | 'fresh';
   pollIntervalMs?: number;
+  /** Observed native model, independent of the thinking-display switch. */
+  onRuntime?: (runtime: { model: string }, info?: { seeded?: boolean }) => void;
+}
+
+/** Pending tools reset at USER_INPUT. Locate that boundary backwards, then
+ * replay only the latest turn's correlation state, not the whole conversation.
+ * Use one regular-file fd for both passes and retain an incomplete EOF line. */
+function restorePendingTools(path: string, endOffset: number, pendingTools: Array<{ id: string; name: string }>): number {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    const st = fstatSync(fd);
+    if (!st.isFile()) return endOffset;
+    const end = Math.min(endOffset, st.size);
+    let completeEnd = end;
+    let turnStart = 0;
+    scanJsonlBackwardFd(fd, {
+      endOffset: end,
+      onLine: (line, start) => {
+        if (start + line.length === end) { completeEnd = start; return; }
+        if (!line.includes('"USER_INPUT"') && !line.includes('"USER_EXPLICIT"')) return;
+        try {
+          const record = JSON.parse(line.toString('utf8'));
+          if (record.type === 'USER_INPUT' || record.source === 'USER_EXPLICIT') { turnStart = start; return true; }
+        } catch { /* malformed old record is not an input boundary */ }
+      },
+    });
+    const primed = scanJsonlFromFd(fd, turnStart, {
+      endOffset: completeEnd,
+      onLine: line => {
+        try { extractAntigravityCotEntriesFromRecord(JSON.parse(line), pendingTools); } catch { /* malformed record */ }
+      },
+    });
+    return primed?.newOffset ?? completeEnd;
+  } catch { return endOffset; }
+  finally { if (fd !== undefined) closeSync(fd); }
 }
 
 /**
@@ -244,7 +347,7 @@ export interface StartAntigravityCotOptions {
  */
 export function startAntigravityCot(
   cliSessionId: string,
-  onEntries: (entries: readonly AntigravityCotEntry[]) => void,
+  onEntries: AntigravityCotEntriesHandler,
   opts?: StartAntigravityCotOptions,
 ): boolean {
   if (!cliSessionId || !/^[a-zA-Z0-9._-]+$/.test(cliSessionId)) return false;
@@ -264,6 +367,13 @@ export function startAntigravityCot(
     }
   }
 
+  // Restore correlation for a tool that started before this reader attached,
+  // without replaying any old thinking or tool-call display entries.
+  const pendingTools: Array<{ id: string; name: string }> = [];
+  if (initialOffset > 0 && transcriptPath) {
+    initialOffset = restorePendingTools(transcriptPath, initialOffset, pendingTools);
+  }
+
   const pollInterval = opts?.pollIntervalMs ?? POLL_INTERVAL_MS;
   const timer = setInterval(() => {
     const current = readers.get(cliSessionId);
@@ -279,15 +389,17 @@ export function startAntigravityCot(
     offset: initialOffset,
     timer,
     watcher: null,
-    pendingTools: [],
+    pendingTools,
     onEntries,
+    onRuntime: opts?.onRuntime,
+    runtimeAwaitingLiveEvidence: opts?.mode !== 'fresh',
   };
 
   readers.set(cliSessionId, state);
   if (transcriptPath && existsSync(transcriptPath)) watchTranscript(state);
 
-  // If starting in fresh mode, perform initial read immediately
-  if (opts?.mode === 'fresh') {
+  // Seed runtime immediately on resume too; the EOF cursor still skips history.
+  if (opts?.mode === 'fresh' || opts?.onRuntime) {
     readNewTranscriptLines(state);
   }
 

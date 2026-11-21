@@ -30,17 +30,26 @@ export function isScratchSandbox(opts?: {
  *    bridge is part of the ALWAYS set — default mode harvests send-less turns
  *    with the send-marker gate, though it is still suppressed under scratch.)
  *
- * Sandbox: cursor/antigravity are supported under the oncall bwrap sandbox
- * (and read isolation / the BOTMUX_SANDBOX switch) — their adapters declare
- * the whole `~/.cursor` / `~/.gemini` tree as readWrite authPaths, which
- * bind-mount the REAL host directories, so the daemon tails the same files the
- * CLI writes (this also keeps cursor's store.db fcntl locks working).
+ * Sandbox: cursor/antigravity/doubao are supported under the oncall bwrap
+ * sandbox (and read isolation / the BOTMUX_SANDBOX switch) — their adapters
+ * declare the whole `~/.cursor` / `~/.gemini` /
+ * `~/.local/share/doubao_cli` tree as readWrite authPaths, which bind-mount
+ * the REAL host directories, so the daemon tails the same files the CLI
+ * writes (this also keeps cursor's store.db fcntl locks working).
  *
- * The full-root COW `sandbox: 'scratch'` mode is rejected for these two for
+ * The full-root COW `sandbox: 'scratch'` mode is rejected for these three for
  * now: it bind-mounts a merged overlay as / and ignores authPaths, so their
  * transcripts land in the upper tree the host-side structured bridge does not
  * resolve yet (the existing structured bridges codex/grok have the same open
  * gap). Fail loudly here rather than silently dropping every reply.
+ *
+ * doubao is rejected under scratch despite being an ALWAYS-bridge CLI:
+ * #2828 made transcript its DEFAULT reply mode, and its
+ * `agent_mode/<uid>/workspace/.sessions` tree has no scratch host-view
+ * mapping (only codex/trae get an env redirect and claude a data-dir remap),
+ * so under scratch both the first-turn id capture and transcript harvest
+ * resolve nothing — the reply-delivery capability gate rejects the same
+ * combination independently.
  *
  * This capability predicate only sees the CONFIG/session value, so the
  * machine-wide `BOTMUX_SANDBOX=scratch` switch (which is not materialised into
@@ -55,23 +64,117 @@ export function isScratchSandbox(opts?: {
  * final immediately rather than through that gate). */
 const ZERO_PROMPT_LOCAL_BACKENDS = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'] as const;
 
-export function supportsZeroPromptInjection(cliId: string | undefined, opts?: {
+export type ZeroPromptUnsupportedReason =
+  | 'cli_unsupported'
+  | 'backend_unsupported'
+  | 'scratch_unsupported_for_cli'
+  | 'oncall_unsupported_for_cli'
+  | 'zmx_unsupported_for_antigravity';
+
+export interface ZeroPromptSupportOpts {
   backendType?: string; codexRpcInput?: boolean;
   sandbox?: ZeroPromptSandboxValue;
   readIsolation?: boolean;
-}): boolean {
+}
+
+/** Why zero injection is unavailable for this CLI / backend / sandbox combo,
+ *  checked in the order below; null = supported. The Dashboard uses the reason
+ *  to say WHAT to change instead of one generic "unsupported" line. */
+export function zeroPromptInjectionUnsupportedReason(
+  cliId: string | undefined,
+  opts?: ZeroPromptSupportOpts,
+): ZeroPromptUnsupportedReason | null {
   const localTranscript = supportsTranscriptReplyDelivery(cliId)
     || supportsZeroPromptStructuredBridge(cliId);
-  if (!localTranscript) return false;
+  if (!localTranscript) return 'cli_unsupported';
   if (opts?.backendType
     && !ZERO_PROMPT_LOCAL_BACKENDS.includes(opts.backendType as typeof ZERO_PROMPT_LOCAL_BACKENDS[number])) {
-    return false;
+    return 'backend_unsupported';
   }
-  if ((cliId === 'cursor' || cliId === 'antigravity') && isScratchSandbox(opts)) {
-    return false;
+  if ((cliId === 'cursor' || cliId === 'antigravity' || cliId === 'doubao') && isScratchSandbox(opts)) {
+    return 'scratch_unsupported_for_cli';
+  }
+  if ((opts?.sandbox === true || opts?.sandbox === 'oncall') && !ZERO_PROMPT_ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS.has(cliId!)) {
+    return 'oncall_unsupported_for_cli';
   }
   if (cliId === 'antigravity' && opts?.backendType === 'zmx') {
-    return false;
+    return 'zmx_unsupported_for_antigravity';
   }
+  return null;
+}
+
+export function supportsZeroPromptInjection(cliId: string | undefined, opts?: ZeroPromptSupportOpts): boolean {
+  return zeroPromptInjectionUnsupportedReason(cliId, opts) === null;
+}
+
+/** Per-bot options that can make transcript delivery unusable even when the
+ *  CLI itself harvests transcripts. Lives in this leaf module (no
+ *  bot-registry/config-store deps) so config-write invariants can reuse the
+ *  exact same predicate without closing an import cycle back through
+ *  core/reply-delivery → bot-registry (a cycle bun rejects at module link
+ *  time: "Export named 'resolveReplyDelivery' not found"). */
+export interface TranscriptDeliveryCapabilityOpts {
+  sandbox?: ZeroPromptSandboxValue;
+}
+
+/** Whether `replyDelivery: transcript` works for this CLI under its sandbox
+ *  configuration.
+ *
+ *  Full-root COW scratch: only codex/trae get an env redirect to the merged
+ *  host view and claude a data-dir remap. Every other transcript CLI's files
+ *  (cursor's agent-transcript mirror, doubao's `agent_mode/<uid>/workspace/
+ *  .sessions` tree, grok/pi/omp/ebsd/coco/hermes/mtr session stores) live in
+ *  the merged overlay the host-side bridge cannot read. Enabling the
+ *  transcript envelope there would steer the model away from `botmux send`
+ *  while harvest produced nothing — a fully silent turn — so they fall back to
+ *  `send` (see SCRATCH_HOST_VIEW_TRANSCRIPT_CLI_IDS). The oncall bwrap has the
+ * same failure mode whenever the adapter has no host-state mount: hermes has no
+ * `authPaths`, so its `~/.hermes/state.db` would exist only in the sandbox's
+ * tmpfs. Oncall therefore also uses an allowlist (see
+ * ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS); don't add Hermes until a per-bot isolated
+ * host-state mount exists. */
+export function supportsTranscriptReplyDeliveryForBot(
+  cliId: string | undefined,
+  opts?: TranscriptDeliveryCapabilityOpts,
+): boolean {
+  if (!supportsTranscriptReplyDelivery(cliId)) return false;
+  if (isScratchSandbox(opts) && !SCRATCH_HOST_VIEW_TRANSCRIPT_CLI_IDS.has(cliId!)) return false;
+  if ((opts?.sandbox === true || opts?.sandbox === 'oncall') && !ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS.has(cliId!)) return false;
   return true;
+}
+
+/** CLIs whose oncall sandbox exposes the CLI's state directory to the host-side
+ * transcript bridge. Every listed non-claude adapter declares `authPaths`;
+ * claude-code instead uses its dedicated data-dir remap. Hermes deliberately has
+ * no entry: its adapter declares no mount, so `~/.hermes/state.db` would be
+ * written only into the sandbox's private tmpfs. An allowlist makes a newly added
+ * transcript CLI without host-state mounts fall back to `send` by default. */
+export const ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS: ReadonlySet<string> = new Set([
+  'claude-code', 'codex', 'traex', 'coco', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'cursor', 'doubao',
+]);
+
+/** Zero-injection has one extra transcript-capable CLI: antigravity only
+ * harvests in zero-prompt mode and has its own host-state mount, so it must not
+ * be rejected by the ordinary replyDelivery allowlist above. */
+const ZERO_PROMPT_ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS: ReadonlySet<string> = new Set([
+  ...ONCALL_HOST_VIEW_TRANSCRIPT_CLI_IDS, 'antigravity',
+]);
+
+/** CLIs whose transcript the host-side bridge can still read under the full-root
+ *  COW scratch sandbox: the worker points CODEX_HOME / TRAE_HOME at the merged
+ *  host view, and the claude bridge receives the remapped data dir. Every other
+ *  transcript CLI (cursor, doubao, grok, pi, oh-my-pi, ebsd, coco, hermes, mtr)
+ *  locates its files from the real host home, which never sees the overlay's
+ *  writes — a transcript prompt there would tell the model not to send while
+ *  nothing is harvested. An allowlist, so a newly added transcript CLI starts
+ *  out falling back to `send` under scratch instead of silently. */
+const SCRATCH_HOST_VIEW_TRANSCRIPT_CLI_IDS: ReadonlySet<string> = new Set(['claude-code', 'codex', 'traex']);
+
+/** Config-write gate (bot-config-invariants): explicit `transcript` + scratch is
+ *  refused for these two only. They were refused since #2828; the other CLIs
+ *  that {@link supportsTranscriptReplyDeliveryForBot} now also rules out under
+ *  scratch fall back to `send` at runtime instead — refusing them at write time
+ *  would lock every later edit of an existing bots.json entry of that shape. */
+export function scratchRefusesExplicitTranscript(cliId: string | undefined): boolean {
+  return cliId === 'cursor' || cliId === 'doubao';
 }

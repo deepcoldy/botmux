@@ -179,7 +179,7 @@ describe('driveV3Run — suspend gate → 发卡 → 点击 redrive', () => {
       const shared = stubDeps(base, {
         // If runtime re-resolves the live bot this unsupported CLI would fail;
         // the definition run must use bots.snapshot.json instead.
-        loadBots: () => [{ larkAppId: 'cli_test', larkAppSecret: 's', cliId: 'gemini' } as any],
+        loadBots: () => [{ larkAppId: 'cli_test', larkAppSecret: 's', cliId: 'opencode' } as any],
       });
       const outcome = await driveV3Run('saved-run', shared.deps);
       expect(outcome.reason).toBe('awaitingGate');
@@ -1491,5 +1491,57 @@ describe('createV3GateRunner — coalescing：drive 期间 click 不丢（codex 
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  });
+});
+
+describe('driveV3Run — workflow.concurrency 配置接到 daemon 入口', () => {
+  function seedParallelRun(base: string, runId: string): void {
+    const { runDir } = birthRun({ goal: 'g', baseDir: base, runId, chatBinding: BINDING });
+    const dagPath = join(runDir, 'dag.json');
+    writeFileSync(dagPath, JSON.stringify({
+      runId,
+      nodes: ['a', 'b', 'c', 'd'].map((id) => ({ id, type: 'goal', goal: id, depends: [], inputs: [] })),
+    }));
+    const state = readGrillState(runDir)!;
+    writeGrillState(runDir, { ...state, status: 'dag_approved', dagPath });
+  }
+
+  async function peak(concurrencyConfig?: V3DaemonRunDeps['concurrencyConfig'], maxParallel?: number): Promise<number> {
+    const base = freshBase();
+    try {
+      seedParallelRun(base, 'par-run');
+      let live = 0;
+      let max = 0;
+      const runNode: RunNode = async (req) => {
+        live++;
+        max = Math.max(max, live);
+        await new Promise((r) => setTimeout(r, 30));
+        live--;
+        return { status: 'ok', manifestPath: join(req.outputDir, 'manifest.json') };
+      };
+      const { deps } = stubDeps(base, {
+        makeRunNode: () => runNode,
+        concurrencyConfig: concurrencyConfig ?? (() => undefined),
+        ...(maxParallel ? { maxParallel } : {}),
+      });
+      const outcome = await driveV3Run('par-run', deps);
+      expect(outcome).toMatchObject({ reason: 'terminal', runStatus: 'succeeded' });
+      return max;
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  }
+
+  it('不配置时同一个 bot 的节点串行（perBot 默认 1）', async () => {
+    expect(await peak()).toBe(1);
+  });
+
+  it('配置 perBot / perCli 后同一个 bot 的节点并行', async () => {
+    expect(await peak(() => ({ perBot: 4, perCli: 4 }))).toBe(4);
+    expect(await peak(() => ({ perBot: 4, perCliById: { 'claude-code': 3 } }))).toBe(3);
+  });
+
+  it('deps.maxParallel 仍然优先于配置的 global', async () => {
+    expect(await peak(() => ({ global: 8, perBot: 8, perCli: 8 }), 2)).toBe(2);
   });
 });

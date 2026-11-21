@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { parseAuthRequestArgs } from '../src/cli/auth-request.js';
+import { parseAuthRequestArgs, providerAuthExitCode } from '../src/cli/auth-request.js';
 import {
   managedOriginCapabilityPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
@@ -40,6 +40,38 @@ describe('auth request arguments', () => {
     expect(() => parseAuthRequestArgs(args)).toThrow();
   });
 
+  it('accepts a provider request from the bytedcli wrapper', () => {
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego']))
+      .toEqual({ help: false, command: 'request', scopes: [], allowUnknown: false, provider: 'meego', json: false });
+    expect(parseAuthRequestArgs(['request', '--json', '--provider', 'bytedcli']))
+      .toEqual({ help: false, command: 'request', scopes: [], allowUnknown: false, provider: 'bytedcli', json: true });
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego', '--tenant', 'dcar']))
+      .toEqual({ help: false, command: 'request', scopes: [], allowUnknown: false, provider: 'meego', tenant: 'dcar', json: false });
+  });
+
+  it.each([
+    [['request', '--provider']], [['request', '--provider', 'lark']], [['request', '--provider', '--json']],
+    [['request', '--provider', 'meego', '--provider', 'meego']],
+    [['request', '--provider', 'meego', '--scope', 'im:chat:read']],
+    [['request', '--provider', 'meego', '--allow-unknown']],
+    [['request', '--provider', 'meego', '--tenant']], [['request', '--provider', 'meego', '--tenant', 'other']],
+    [['request', '--provider', 'bytedcli', '--tenant', 'dcar']], [['request', '--tenant', 'dcar']],
+    [['request', '--provider', 'meego', '--tenant', 'dcar', '--tenant', 'dcar']],
+    [['wait', '--request-id', 'r', '--provider', 'meego']],
+  ])('rejects provider arguments %j', args => {
+    expect(() => parseAuthRequestArgs(args)).toThrow();
+  });
+
+  it('maps provider outcomes to the exit codes the wrapper reads', () => {
+    expect(providerAuthExitCode(true, 'ready')).toBe(0);
+    for (const status of ['delivered', 'pending', 'undeliverable']) expect(providerAuthExitCode(true, status)).toBe(3);
+    expect(providerAuthExitCode(true, 'unavailable')).toBe(4);
+    for (const status of ['undelivered', 'platform_undelivered']) expect(providerAuthExitCode(true, status)).toBe(5);
+    expect(providerAuthExitCode(false, 'refused')).toBe(3);
+    expect(providerAuthExitCode(false, undefined)).toBe(1);
+    expect(providerAuthExitCode(true, 'something-new')).toBe(1);
+  });
+
   it('rejects an empty argument list', () => {
     expect(() => parseAuthRequestArgs([])).toThrow();
   });
@@ -59,6 +91,7 @@ describe('auth request CLI', () => {
   let status: number;
   let responseBody: Record<string, unknown>;
   let responseQueue: Array<Record<string, unknown>>;
+  let beforeResponse: ((body: Record<string, unknown>) => void) | undefined;
   const channelId = 'ab'.repeat(32);
   const capability = 'cd'.repeat(32);
 
@@ -81,6 +114,7 @@ describe('auth request CLI', () => {
       requestId: 'request-1', scopes: ['im:chat:read'], expiresIn: 300, autoCallback: true,
     };
     responseQueue = [];
+    beforeResponse = undefined;
     server = createServer(async (request, response) => {
       // Parse defensively: this mock binds a loopback port, and the host's port
       // scanner probes `GET /` with an empty body. A bare JSON.parse would throw
@@ -89,8 +123,10 @@ describe('auth request CLI', () => {
       const body = await readRequestBodyJson<Record<string, unknown>>(request, { strict: true });
       if (body === undefined) { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{}'); return; }
       requests.push({ method: request.method, url: request.url, headers: request.headers, body });
+      const payload = responseQueue.shift() ?? responseBody;
+      beforeResponse?.(payload);
       response.writeHead(status, { 'content-type': 'application/json' });
-      response.end(JSON.stringify(responseQueue.shift() ?? responseBody));
+      response.end(JSON.stringify(payload));
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
@@ -185,6 +221,50 @@ describe('auth request CLI', () => {
     expect(Boolean(requests[0].headers['x-botmux-cli-auth'])).toBe(true);
   });
 
+  it('a provider request prints only the daemon\'s message and exits with its status', async () => {
+    const binding = prepareLarkToolEnv({ env, dataDir, sessionId: 'session', appId: 'cli_auth' });
+    responseBody = { ok: true, provider: 'meego', status: 'delivered', delivery: 'dm', message: 'botmux: 链接已私聊发给发起人' };
+    const result = await run(['request', '--provider', 'meego']);
+    expect(result.code).toBe(3);
+    expect(result.stdout.trim()).toBe('botmux: 链接已私聊发给发起人\n[reason=authorization_requested]');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      url: '/api/sessions/session/auth-request', body: { provider: 'meego' },
+      headers: { 'x-botmux-lark-session': binding.accessKey },
+    });
+    expect(requests[0].body).not.toHaveProperty('scopes');
+
+    responseBody = { ok: true, provider: 'meego', status: 'ready', message: 'botmux: Meego 已登录' };
+    const ready = await run(['request', '--provider', 'meego']);
+    expect(ready.code).toBe(0);
+    expect(ready.stdout.trim()).toBe('botmux: Meego 已登录');
+    status = 409;
+    responseBody = { ok: false, status: 'refused', error: 'delegated', message: 'botmux: 本轮不能为发起人发起 Meego 授权' };
+    const refused = await run(['request', '--provider', 'meego']);
+    // Same exit code as a delivered entry, but nothing went to the person: no tag.
+    expect(refused.code).toBe(3);
+    expect(refused.stdout.trim()).toBe('botmux: 本轮不能为发起人发起 Meego 授权');
+
+    status = 200;
+    await run(['request', '--provider', 'meego', '--tenant', 'dcar']);
+    expect(requests.at(-1)?.body).toMatchObject({ provider: 'meego', tenant: 'dcar' });
+  });
+
+  it.each([
+    ['pending', 3, '[reason=authorization_requested]'],
+    ['undeliverable', 3, '[reason=authorization_requested]'],
+    ['unavailable', 4, '[reason=authorization_unavailable]'],
+  ])('a provider answer %s ends with its reason tag; --json stays pure JSON', async (answer, code, tag) => {
+    prepareLarkToolEnv({ env, dataDir, sessionId: 'session', appId: 'cli_auth' });
+    responseBody = { ok: true, provider: 'bytedcli', status: answer, message: `botmux: ${answer}` };
+    const result = await run(['request', '--provider', 'bytedcli']);
+    expect(result.code).toBe(code);
+    expect(result.stdout.trim().split('\n')).toEqual([`botmux: ${answer}`, tag]);
+    const json = await run(['request', '--json', '--provider', 'bytedcli']);
+    expect(json.code).toBe(code);
+    expect(JSON.parse(json.stdout)).toEqual(responseBody);
+  });
+
   it('forwards allowUnknown flag to the daemon auth-request endpoint', async () => {
     writeFileSync(join(root, '.botmux', '.dashboard-secret'), 'test-ipc-secret', { mode: 0o600 });
     delete env.BOTMUX_ORIGIN_CHANNEL_ID;
@@ -241,7 +321,9 @@ describe('auth request CLI', () => {
     env.BOTMUX_SEND_RELAY = join(root, 'relay');
     writeClaim('turn-current');
     responseQueue = [{ ok: true, status: 'pending' }, { ok: true, status: 'ready' }];
-    server.on('request', () => writeClaim('turn-later'));
+    // Select the first pending response before publishing the next claim. The
+    // following poll can only start after that response, so it must see later.
+    beforeResponse = body => { if (body.status === 'pending') writeClaim('turn-later'); };
     const result = await run(['wait', '--request-id', 'request-1']);
     expect(result.code, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({ ok: true, status: 'ready' });
@@ -275,5 +357,13 @@ describe('auth request CLI', () => {
     expect(invalid.stderr).toContain('未知或重复参数: --user');
     expect(invalid.stderr).not.toContain('用法:');
     expect(requests).toHaveLength(0);
+  });
+});
+
+describe('auth request --unattended', () => {
+  it('is a provider-only flag', () => {
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego', '--unattended'])).toMatchObject({ provider: 'meego', unattended: true });
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego'])).not.toHaveProperty('unattended');
+    expect(() => parseAuthRequestArgs(['request', '--unattended'])).toThrow(/--provider/);
   });
 });

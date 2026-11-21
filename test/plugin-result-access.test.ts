@@ -63,8 +63,8 @@ describe('controlled plugin result page', () => {
     });
     const tokens = ['b'.repeat(43), 'c'.repeat(43)];
     const sessions = new DashboardSessionStore({ randomToken: () => tokens.shift()! });
-    const owner = sessions.create('ou_owner', 'on_owner123', true);
-    const other = sessions.create('ou_other', 'on_other123', true);
+    const owner = sessions.create('ou_owner', 'on_owner123', 'result');
+    const other = sessions.create('ou_other', 'on_other123', 'result');
     const server = createServer(async (req, res) => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       if (await handlePluginResultAccess(req, res, url, {

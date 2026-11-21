@@ -19,6 +19,7 @@ type Journal = {
 export function isDefiniteReportPublicationRejection(error: unknown): boolean {
   const e = error as { name?: string; code?: unknown; response?: { status?: number; data?: { code?: unknown } } } | undefined;
   if (e?.name === 'MessageWithdrawnError') return true;
+  if (e?.name === 'ReportReplySourceChangedError') return true;
   // The opt-in topic policy converts a withdrawn root into TopicSendError with
   // TOPIC_SEND_BLOCKED — the same deterministic "no message created" outcome.
   // TOPIC_SEND_CHECK_FAILED (lookup could not run) stays ambiguous on purpose.
@@ -39,9 +40,11 @@ export async function deliverPublishedReport(input: {
   chatId: string;
   delivery: 'publish' | 'publish-and-relay';
   validate(): void;
+  /** 仅在首次发送前检查任务是否仍允许直投；已有回执不重新触发发送。 */
+  beforeFirstPublication?(): void;
   publish(uuid: string): Promise<string>;
   relay(meta: { requestId: string; receivedAt: string; turnIdempotencyKey: string; publishedMessageId: string }): Promise<ReportDeliveryResponse>;
-  syncProject(): Promise<{ projectSynced: boolean; projectSyncError?: string }>;
+  syncProject(messageId: string): Promise<{ projectSynced: boolean; projectSyncError?: string }>;
 }): Promise<ReportDeliveryResponse> {
   if (!/^[a-f0-9]{64}$/.test(input.key)) throw new Error('invalid_report_delivery_key');
   const requestBytes = turnReplyCardRequestBytes(input.cardJson, input.chatId);
@@ -53,7 +56,6 @@ export async function deliverPublishedReport(input: {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, `${input.key}.json`);
   return withFileLock(path, async () => {
-    input.validate();
     let saved: Journal | undefined;
     try {
       saved = JSON.parse(readFileSync(path, 'utf8'));
@@ -64,11 +66,19 @@ export async function deliverPublishedReport(input: {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
+    // A settled receipt replays as-is and a pending outcome stays unknown.
+    // Neither branch writes to the provider or starts another turn, so they must
+    // not depend on live session state: running validate() here would turn a
+    // retry after the source session drifted into a false "proven unsent"
+    // signal, letting callers repost or switch sinks despite a message that may
+    // already exist. The turn-validity gate below covers only real writes.
     if (saved?.response) return saved.response;
     if (saved?.publication === 'pending') {
       return { status: 409, body: { ok: false, error: 'report_publication_unknown', deliveryKey: input.key } };
     }
+    input.validate();
     if (!saved) {
+      input.beforeFirstPublication?.();
       saved = { version: 1, key: input.key, receivedAt: new Date().toISOString(), publication: 'pending' };
       atomicWriteFileSync(path, JSON.stringify(saved), { mode: 0o600, durable: true, followTargetSymlink: false });
       let messageId: string;
@@ -78,6 +88,9 @@ export async function deliverPublishedReport(input: {
       } catch (error) {
         if (isDefiniteReportPublicationRejection(error)) {
           unlinkSync(path);
+          if (error instanceof Error && error.name === 'ReportReplySourceChangedError') {
+            return { status: 409, body: { ok: false, error: 'report_reply_source_changed', deliveryKey: input.key } };
+          }
           return { status: 422, body: { ok: false, error: 'report_publication_rejected', deliveryKey: input.key } };
         }
         return { status: 502, body: { ok: false, error: 'report_publication_unknown', deliveryKey: input.key } };
@@ -95,7 +108,7 @@ export async function deliverPublishedReport(input: {
     try {
       input.validate();
       response = input.delivery === 'publish'
-        ? { status: 200, body: { ok: true, ...await input.syncProject() } }
+        ? { status: 200, body: { ok: true, ...await input.syncProject(saved.messageId!) } }
         : await input.relay({
           requestId: `report:${input.key}`, receivedAt: saved.receivedAt,
           turnIdempotencyKey: `report:${input.key}`, publishedMessageId: saved.messageId!,

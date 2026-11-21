@@ -32,6 +32,10 @@ export const DAEMON_ENV_KEYS = [
   'BOTMUX_DASHBOARD_EXTERNAL_HOST',
   'BOTMUX_DASHBOARD_HOST',
   'BOTMUX_DASHBOARD_PORT',
+  // Provider-neutral address published for cross-instance terminal routing.
+  // Platform-specific discovery belongs in the deployment layer.
+  'BOTMUX_TERMINAL_ROUTE_HOST',
+  'BOTMUX_TERMINAL_ROUTE_PORT',
   'BOTMUX_DAEMON_IPC_BASE_PORT',
   'BOTMUX_DASHBOARD_PUBLIC_READONLY',
   // Closed local companion control surface. The values are lifecycle settings:
@@ -49,6 +53,9 @@ export const DAEMON_ENV_KEYS = [
   // non-secret environment value: the daemon inherits it, worker/session
   // children retain it, and individual Go commands may still override -p.
   'GOFLAGS',
+  // Dashboard-editable, non-secret connection settings must refresh on restart.
+  'ONCALL_GROUP_ENDPOINT',
+  'ONCALL_EMAIL_DOMAIN',
   // Dashboard-only, non-secret settings: the control-audit destination
   // (dashboard/control-audit.ts defaultControlAuditPath) and the terminal
   // takeover lease TTL (dashboard/terminal-control.ts terminalControlTtlFromEnv).
@@ -63,6 +70,9 @@ export const DAEMON_ENV_KEYS = [
   // old read-only key remains a compatibility alias during rollout.
   'BOTMUX_TASK_CONTINUATION_ENABLED',
   'BOTMUX_READONLY_CONTINUATION_ENABLED',
+  // Session wrappers may scrub this non-secret rollout switch from inherited
+  // env; managed restart must re-read it from the authoritative file.
+  'BOTMUX_FINAL_OUTPUT_HANDOFF',
   // Provider-neutral durable coordination bootstrap. Secrets remain in
   // provider-owned environment/files; the executable path and JSON argv must
   // stay credential-free as required by the public provider contract.
@@ -72,6 +82,22 @@ export const DAEMON_ENV_KEYS = [
   'BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS',
   'BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS',
   'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS',
+  // Per-step sender display-name lookup budget. Must ride the file snapshot:
+  // unlike a shell start, a restart issued from inside a session (or a
+  // detached self-upgrade restart) inherits the old daemon's value through the
+  // CLI pane, which unsets neither this key nor its peers, and the daemon's
+  // dotenv load never overrides an inherited key. Without this entry a changed
+  // value would be ignored on those paths, and deleting the key from
+  // ~/.botmux/.env could never restore the default budget.
+  'BOTMUX_SENDER_RESOLVE_TIMEOUT_MS',
+  // Per `git worktree add` budget (config.ts resolveWorktreeCreateTimeoutMs,
+  // default 60s). Same file-authority requirement as the sender timeout: the
+  // CLI pane does not scrub this key, so a session-origin (or detached
+  // self-upgrade) restart inherits the old daemon's budget and the daemon's
+  // dotenv load never overrides it. Without this entry a changed budget is
+  // ignored on those restarts and deleting the key can never restore the 60s
+  // default.
+  'BOTMUX_WORKTREE_CREATE_TIMEOUT_MS',
   // Extra source addresses accepted by the local-peer ring of the internal
   // HMAC endpoints (utils/loopback-peers.ts): hosts whose kernel reports a
   // same-machine loopback peer as a LAN IP. Consumed by both the daemons

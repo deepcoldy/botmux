@@ -29,6 +29,7 @@ import {
   suspendWorker,
 } from '../src/core/worker-pool.js';
 import { isSuspendableBackendType } from '../src/core/persistent-backend.js';
+import { hasFeedbackMaintenanceSessionWork } from '../src/core/feedback-maintenance-health.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { startUnreachableTmuxServer } from './helpers/unreachable-tmux-server.js';
 
@@ -40,7 +41,6 @@ const CLI_IDS: CliId[] = [
   'codex',
   'codex-app',
   'cursor',
-  'gemini',
   'opencode',
   'antigravity',
   'mtr',
@@ -86,6 +86,14 @@ function fakeWorker() {
 }
 
 describe('suspendWorker', () => {
+  it('does not retire resources when the request-bound ownership predicate has changed', () => {
+    const worker = fakeWorker();
+    const ds: any = { session: { sessionId: 'sid-managed', status: 'active' }, worker,
+      larkAppId: 'cli_test', initConfig: { backendType: 'tmux' } };
+    expect(suspendWorker(ds, 'managed_ask_retired', () => false)).toBe(false);
+    expect(ds.worker).toBe(worker);
+    expect(worker.send).not.toHaveBeenCalled();
+  });
   it('kills the exact backing and requires a positive missing post-probe', () => {
     const ds: any = {
       session: { sessionId: 'sid-verified', status: 'active' },
@@ -270,6 +278,7 @@ describe('suspendWorker', () => {
     // --resume) and persist the suspend intent (→ restore won't zombie-close it).
     expect(ds.hasHistory).toBe(true);
     expect(ds.session.suspendedColdResume).toBe(true);
+    expect(hasFeedbackMaintenanceSessionWork(ds)).toBe(false);
     expect(dashboardEventBus.publish).toHaveBeenCalledWith({
       type: 'session.update',
       body: {

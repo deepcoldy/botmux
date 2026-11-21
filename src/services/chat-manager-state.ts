@@ -11,6 +11,8 @@ export interface ChatManagerClaim {
   enabled: boolean;
   originalName: string;
   managedName: string;
+  /** Lead-only mode (opt-in, default off): the manager's sessions here may only run `botmux` commands. */
+  leadOnly?: boolean;
 }
 
 function key(value: string): string {
@@ -30,11 +32,22 @@ export function readManagerClaim(app: string, chat: string): ChatManagerClaim | 
     const claim = JSON.parse(readFileSync(claimPath(app, chat), 'utf8'));
     if (claim?.schemaVersion !== 1 || claim.larkAppId !== app || claim.chatId !== chat
       || typeof claim.enabled !== 'boolean' || typeof claim.originalName !== 'string'
-      || typeof claim.managedName !== 'string') throw new Error('invalid_local_claim');
+      || typeof claim.managedName !== 'string'
+      || (claim.leadOnly !== undefined && typeof claim.leadOnly !== 'boolean')) throw new Error('invalid_local_claim');
     return claim;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
+  }
+}
+
+/** Sync check used on session spawn; any read failure means not lead-only. */
+export function isLeadOnlyManagerClaim(app: string, chat: string): boolean {
+  try {
+    const claim = readManagerClaim(app, chat);
+    return claim?.enabled === true && claim.leadOnly === true;
+  } catch {
+    return false;
   }
 }
 

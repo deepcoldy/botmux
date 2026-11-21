@@ -25,6 +25,7 @@ function resolve(
   const ledger = {
     resolveBatch: () => new Map(),
     listRegistered: () => registered,
+    readTurn: () => undefined,
   } as unknown as LinkRefLedger;
   return resolveOutboundLinkRefs(ledger, key, { text }, responseKind);
 }
@@ -32,6 +33,67 @@ function resolve(
 describe('registered-source final link integrity', () => {
   it('accepts the exact byte-identical URL in a final', () => {
     expect(resolve(`问题详情：${fullUrl}`, 'final').text).toBe(`问题详情：${fullUrl}`);
+  });
+
+  it.each(['**', '*', '__', '_'])('accepts an exact source URL in a link wrapped by %s', (markup) => {
+    const text = `${markup}[问题标题](${fullUrl})${markup}`;
+    expect(resolve(text, 'final').text).toBe(text);
+  });
+
+  it('still rejects a changed URL inside a bold link', () => {
+    expect(() => resolve(`**[问题标题](${fullUrl.replace('problemId=14067', 'problemId=14068')})**`, 'final'))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it('preserves literal asterisks in the URL while excluding bold link delimiters', () => {
+    const sourceUrl = `${fullUrl}&wild=**`;
+    const text = `**[问题标题](${sourceUrl})**`;
+    expect(resolve(text, 'final', [sourceUrl]).text).toBe(text);
+    expect(() => resolve(`**[问题标题](${fullUrl})**`, 'final', [sourceUrl]))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it.each([
+    `](${fullUrl})&changed=1`,
+    String.raw`\[问题](${fullUrl})&changed=1`,
+    `\`[问题](${fullUrl})&changed=1\``,
+    ['```text', `[问题](${fullUrl})&changed=1`, '```'].join('\n'),
+    `    [问题](${fullUrl})&changed=1`,
+    `[问题\n\n](${fullUrl})&changed=1`,
+    `[问题](\n\n${fullUrl})&changed=1`,
+    `[问题\n---\n](${fullUrl})&changed=1`,
+  ])('does not shorten a changed visible URL outside an executable Markdown link: %s', (text) => {
+    expect(() => resolve(text, 'final'))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it('does not let a link parsed inside image alt text shorten a separate URL', () => {
+    const sourceUrl = 'https://detail.example.test/p?x=1';
+    const altUrl = 'https://other.test/' + 'x'.repeat(sourceUrl.length - 'https://other.test/'.length);
+    const text = `see ${sourceUrl})&changed=1 ![[x](${altUrl})](https://image.test/p)`;
+    expect(() => resolve(text, 'final', [sourceUrl]))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it('checks a changed destination even when the label and following text contain URLs', () => {
+    const changed = fullUrl.replace('problemId=14067', 'problemId=14068');
+    expect(() => resolve(`[https://other.test/p](${changed})https://next.test/p`, 'final'))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it('checks bold links and changed targets inside a Markdown table', () => {
+    const text = `| **[问题](${fullUrl})** |\n| --- |`;
+    expect(resolve(text, 'final').text).toBe(text);
+    expect(() => resolve(`| [https://other.test/p](${fullUrl.replace('problemId=14067', 'problemId=14068')}) |\n| --- |`, 'final'))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
+  });
+
+  it('preserves escaped pipes in table destinations and rejects a changed target', () => {
+    const sourceUrl = String.raw`https://detail.example.test/p?x=1&q=a\|b`;
+    const text = `| **[问题](${sourceUrl})** |\n| --- |`;
+    expect(resolve(text, 'final', [sourceUrl]).text).toBe(text);
+    expect(() => resolve(`| [https://other.test/p](${sourceUrl.replace('x=1', 'x=2')}) |\n| --- |`, 'final', [sourceUrl]))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_final_url_mismatch' }));
   });
 
   it.each([
@@ -136,6 +198,7 @@ describe('registered-source final link integrity', () => {
     const ledger = {
       resolveBatch: () => new Map(),
       listRegistered: () => registered,
+      readTurn: () => undefined,
     } as unknown as LinkRefLedger;
     expect(() => resolveOutboundLinkRefs(ledger, key, {
       text: `隐藏回退：${fullUrl}`,

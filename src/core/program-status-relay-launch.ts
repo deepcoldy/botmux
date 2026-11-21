@@ -10,11 +10,10 @@ import { isStandaloneBinary, resolveEntrySpawn } from './self-spawn.js';
  *
  * The wrapped command travels in a private plan FILE; the relay's argv carries
  * only its path. Two reasons:
- *   - tmux rejects a `new-session` command around 16 KB ("command too long"),
- *     and the CLI argv already spends most of that budget on a first prompt
- *     (TMUX_INITIAL_PROMPT_ARG_BUDGET). Re-encoding it inline would push
- *     prompts that fit today over the limit; a path keeps the relay's
- *     overhead constant.
+ *   - the relay's process argv stays constant-sized regardless of the wrapped
+ *     CLI command. This is a bounded-overhead invariant, not a current tmux
+ *     hard limit: panes now load their full launch argv from a private
+ *     pane-launch file.
  *   - discovery (`cliIdFromCommArgv`) scans the argv of interpreter-named
  *     processes (`node`, `bun`) for a CLI basename, and a bun-run relay keeps
  *     comm `bun` (process.title does not rename it there). A plain `claude`

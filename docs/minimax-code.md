@@ -41,6 +41,20 @@ mcode 的 OAuth 账号键包含数据目录的原始路径。Linux 上 HOME 或�
 
 默认权限对应 ACP 的 `bypassPermissions`，`disableCliBypass: true` 时对应原生 `auto`（与原 exec 的 `full` / `smart` 一致）。模型和思考等级通过原生 `session/set_config_option` 配置，只接受 CLI 实际提供的选项，不支持时明确失败。Botmux 会话 fork 仍明确拒绝。
 
+### MCP 配置
+
+MCP 由 mcode 原生管理。mcode 0.7.4 的 ACP 会话可以直接读取账号的 `<data-dir>/mcp.json` 和项目的 `.mcp.json`；Botmux 在 `session/new`、`session/resume`、`session/load` 中传入空的 `mcpServers` 会话覆盖列表，不表示禁用原生 MCP。
+
+请按 mcode 的原生配置方式添加服务，并确保对应 bot 使用正确的 `MINIMAX_DATA_DIR`、项目工作目录和环境变量。两类文件均使用 `mcpServers` 对象；账号与项目的优先级、变量展开、认证、超时、项目工作区状态、配置更新及 HTTP 请求头重定向保护均交给 mcode 处理。Botmux 不复制这些配置为同名 ACP 会话条目，避免遮住原生条目或丢失原生选项；也不另行缓存、修改配置或读取 OAuth token。
+
+真实集成测试使用本地合成模型 Provider 与 MCP 服务，覆盖账号／项目 HTTP、stdio、原生 timeout，以及工具发现、实际调用和新进程按精确 Session ID 恢复后的再次调用。项目 stdio 用例还检查原生工作目录和环境变量展开。测试须显式提供独立安装的 mcode：
+
+```bash
+BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun run test:e2e -- test/minimax-mcp.e2e.ts --maxWorkers=1
+```
+
+未设置该变量时，上述真实 CLI 用例会跳过；普通协议测试仍会检查新建、恢复和加载请求不覆盖原生 MCP。已验收环境为 Linux、mcode 0.7.4，未验收真实 SSE、macOS/Windows、生产 Provider 或 MCP 凭证。下文 mcode 0.6.5 的早期记录不证明同一行为适用于该版本；历史工具不可见问题仍需在对应版本和实际配置下单独复现。
+
 ### 单轮预算与压缩
 
 Dashboard 的机器人 Agent 设置支持 MiniMax Code 的「单轮总预算（分钟）」，保存到 `turnTimeoutMs` 并传入 runner 的 `--turn-timeout-ms`。**缺省不设置整轮时长上限**，正常长任务不再被 Botmux 在 10 分钟时中止；需要主动限制成本时可设为 60 分钟（`3600000`ms）。合法范围为 `1..2147483647` 毫秒，清空取消上限，修改其他设置保留原值。保存后在下一次会话拉起时生效，不会更新已运行 runner 的参数。
@@ -101,6 +115,7 @@ MiniMax 的 final `errorCode` 会进入 worker 的真实终态：`turn_budget_ex
 bun run test -- test/minimax-acp.test.ts test/minimax-user-input.test.ts test/minimax-acp-continuation.test.ts test/minimax-usage.test.ts test/sandbox.test.ts test/fs-policy.test.ts
 bun x vitest run --project unit test/minimax-runner.test.ts test/cli-adapters.test.ts test/cli-runner-compiled-entries.test.ts test/cli-id-roster-derivation.test.ts test/ipc-constrained-invocation.test.ts test/worker-app-runner-control-wiring.test.ts test/worker-pipe-initial-screen-order.test.ts test/runner-control-channel.test.ts test/constrained-invocation.test.ts test/model-only-print.test.ts
 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts
+BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun run test:e2e -- test/minimax-mcp.e2e.ts
 # 本地显式运行：真实 exec 默认预算的 610 秒边界探针
 BOTMUX_MCODE_LONG_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-exec-long.e2e.ts
 BOTMUX_MCODE_SANDBOX_E2E=1 BOTMUX_MCODE_E2E_BIN=/absolute/path/to/mcode bun x vitest run --project e2e test/minimax-mcode.e2e.ts

@@ -1,8 +1,10 @@
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { mountsAtOrUnder } from '../src/adapters/backend/sandbox.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
@@ -99,9 +101,13 @@ describe('zero-prompt capability under the machine-wide sandbox switch', () => {
       expect(messages.some(m => m.type === 'ready')).toBe(false);
       const launches = existsSync(launched) ? readFileSync(launched, 'utf8').trim().split('\n') : [];
       expect(launches.filter(line => !line.includes('--version'))).toEqual([]);
+      // Refused BEFORE the sandbox: nothing mounted. (A build that prepared the
+      // full-root overlay first left its whole tree mounted on the host.)
+      expect(mountsAtOrUnder(root)).toEqual([]);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
-      rmSync(root, { recursive: true, force: true });
+      // Never rm through a mount: under a lowerdir=/ overlay that walks the host.
+      rmSandboxScratch(root);
     }
   }, 30_000);
 });

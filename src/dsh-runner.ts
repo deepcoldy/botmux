@@ -28,7 +28,7 @@
  * DSH_SESSION_ROOT but cross-process resume is not wired up yet).
  */
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -41,6 +41,8 @@ import { createRunnerTerminal } from './runner-common.js';
 import { parseArgs, MAX_TURN_TIMEOUT_MS, type Args } from './dsh-runner-args.js';
 import { appendPendingNotification } from './dsh-runner-pending.js';
 import { resolveDshModel } from './dsh-runner-config.js';
+import { cotEntriesFromAssistantMessage, cotEntryFromToolCall, cotEntryFromToolResult } from './services/dsh-cot.js';
+import { createDshProcessAttestationFd } from './services/dsh-process-attestation.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const EMPTY_TURN_REPLY = 'DeepSeek Harness 已结束本轮处理，但没有生成最终回复；无法确认任务是否成功，请查看会话执行记录。';
@@ -59,6 +61,7 @@ const MAX_TURN_DURATION_MULTIPLIER = 4;
 /** Upper bound on notifications buffered while waiting for this turn's inbox
  *  spliced receipt — see dsh-runner-pending.ts. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+const INITIALIZE_RETRY_INTERVAL_MS = 1_000;
 const PROMPT_ACK_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 const DEFAULT_MAX_TOKENS = 49152;
@@ -145,7 +148,7 @@ function migrateGeneratedBotmuxProfile(name: string, pkgJson: string, cordisPatc
   const pkg = readJsonRecord(pkgJson);
   if (pkg) {
     const deps = isRecord(pkg.dependencies) ? { ...pkg.dependencies } : {};
-    if (deps[DSH_TOOL_ASK_USER_PACKAGE] !== DSH_TOOL_ASK_USER_DEP) {
+    if (deps[DSH_TOOL_ASK_USER_PACKAGE] === undefined) {
       deps[DSH_TOOL_ASK_USER_PACKAGE] = DSH_TOOL_ASK_USER_DEP;
       pkg.dependencies = deps;
       writeFileSync(pkgJson, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
@@ -379,6 +382,7 @@ function addUsage(a: DshUsage, b: DshUsage): DshUsage {
 /** Minimal JSON-RPC client over the dsh runtime's stdio transport. */
 class DshJsonRpcClient {
   private child?: ChildProcessWithoutNullStreams;
+  private attestationFd?: number;
   private readonly rpc = new JsonRpcStdioCore({
     mapRpcError: (_method, error) => new Error(`dsh error: ${error.message ?? JSON.stringify(error)}`),
     onMessage: msg => {
@@ -398,21 +402,40 @@ class DshJsonRpcClient {
   ) {}
 
   start(): void {
-    this.child = spawn(this.dshBin, this.launchArgs, {
-      env: this.env,
-      cwd: this.cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
+    this.attestationFd = createDshProcessAttestationFd();
+    if (process.platform === 'linux' && this.attestationFd === undefined) {
+      output.error('[dsh] engine attestation unavailable; continuing without an engine root\n');
+    }
+    try {
+      this.child = spawn(this.dshBin, this.launchArgs, {
+        env: this.env,
+        cwd: this.cwd,
+        stdio: ['pipe', 'pipe', 'pipe', this.attestationFd ?? 'ignore'],
+      }) as ChildProcessWithoutNullStreams;
+    } catch (error) {
+      this.closeAttestationFd();
+      throw error;
+    }
     this.child.stdout.setEncoding('utf8');
     this.child.stdout.on('data', chunk => this.rpc.push(String(chunk)));
     this.child.stderr.setEncoding('utf8');
     this.child.stderr.on('data', chunk => output.error(`[dsh] ${String(chunk)}`));
-    this.child.on('error', err => this.rpc.failAll(err));
+    this.child.on('error', err => {
+      this.closeAttestationFd();
+      this.rpc.failAll(err);
+    });
     this.child.on('exit', (code, signal) => {
       this.exited = true;
+      this.closeAttestationFd();
       this.rpc.failAll(new Error(`dsh process exited (code=${code}, signal=${signal})`));
       this.onExit?.(code, signal);
     });
+  }
+
+  private closeAttestationFd(): void {
+    if (this.attestationFd === undefined) return;
+    closeSync(this.attestationFd);
+    this.attestationFd = undefined;
   }
 
   request<T>(method: string, params: unknown, timeoutMs: number): Promise<T> {
@@ -526,6 +549,8 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       if (callId) turn.toolNames.set(callId, name);
       const argsText = typeof ev.data?.arguments === 'string' ? ev.data.arguments : '';
       writeLine(`🔧 ${name} ${truncate(argsText, 200)}`);
+      const entry = cotEntryFromToolCall(ev.data);
+      if (entry) emitMarker('cot', { entries: [entry] });
       break;
     }
     case 'tool/result': {
@@ -534,6 +559,8 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       const name = turn.toolNames.get(callId) ?? 'tool';
       const isError = Array.isArray(message?.content) && message.content.some(c => c?.isError === true);
       writeLine(`${isError ? '✗' : '✓'} ${name}`);
+      const entry = cotEntryFromToolResult(ev.data);
+      if (entry) emitMarker('cot', { entries: [entry] });
       break;
     }
     case 'turn/end': {
@@ -560,6 +587,9 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       // usage is per model call; accumulate across steps for a turn total.
       const usage = normalizeUsage(ev.data?.usage);
       if (usage) turn.usage = turn.usage ? addUsage(turn.usage, usage) : usage;
+      for (const entry of cotEntriesFromAssistantMessage(ev.data?.message)) {
+        emitMarker('cot', { entries: [entry] });
+      }
       break;
     }
     default:
@@ -672,10 +702,19 @@ async function runTurn(content: string): Promise<void> {
   });
 
   try {
-    const ack = await client.request<unknown>('session/prompt', {
-      sessionId: dshSessionId,
-      contentBlocks: [{ type: 'text', text: promptContent }],
-    }, PROMPT_ACK_TIMEOUT_MS);
+    // The watchdog may fire (or the runtime exit) before the prompt is ACKed,
+    // e.g. on a loaded host. Awaiting only the request would leave that
+    // rejection unhandled — the runner dies with exit 1 and no final reply —
+    // and would keep a timed-out turn waiting for an ACK that may never come.
+    // Racing the turn is safe: it cannot resolve before the ACK, because its
+    // notifications stay buffered until the ACK's messageId claims the receipt.
+    const ack = await Promise.race([
+      client.request<unknown>('session/prompt', {
+        sessionId: dshSessionId,
+        contentBlocks: [{ type: 'text', text: promptContent }],
+      }, PROMPT_ACK_TIMEOUT_MS),
+      turnPromise,
+    ]);
     const messageId = parsePromptMessageId(ack);
     // The ACK's messageId correlates this turn's events: notifications may
     // already be buffered (they can precede the response), and a late idle
@@ -830,13 +869,30 @@ async function main(): Promise<void> {
   };
   client.start();
 
-  const initializeResult = await client.request<unknown>(
-    'initialize',
-    { cwd, provider: selection.provider, model: selection.model, maxTokens: DEFAULT_MAX_TOKENS },
-    HANDSHAKE_TIMEOUT_MS,
-  );
+  // A plugin provider registers its models asynchronously after the plugin
+  // loader settles, so an initialize sent right after spawn can be rejected
+  // with "has no configured model" until that finishes.
+  const handshakeDeadline = Date.now() + HANDSHAKE_TIMEOUT_MS;
+  let initializeResult: unknown;
+  for (;;) {
+    try {
+      initializeResult = await client.request<unknown>(
+        'initialize',
+        { cwd, provider: selection.provider, model: selection.model, maxTokens: DEFAULT_MAX_TOKENS },
+        Math.max(1, handshakeDeadline - Date.now()),
+      );
+      break;
+    } catch (err) {
+      if (!errorMessage(err).includes('has no configured model')
+        || Date.now() + INITIALIZE_RETRY_INTERVAL_MS >= handshakeDeadline) throw err;
+      await new Promise(resolve => setTimeout(resolve, INITIALIZE_RETRY_INTERVAL_MS));
+    }
+  }
   const { serverInfo } = parseInitializeResult(initializeResult);
   writeLine(`dsh connected (${serverInfo.name} ${serverInfo.version}).`);
+  // A hint only: the worker discovers the exact runner/RPC child in procfs.
+  // Emit before the visible prompt can release the first queued model input.
+  emitMarker('process_ready', {});
 
   if (process.stdin.isTTY) process.stdin.setRawMode(true);
   process.stdin.resume();

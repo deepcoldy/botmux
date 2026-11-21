@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  credentialSourceForcesBotHome,
   normalizeCredentialsSourceDir,
   planCredentialSource,
   readCredentialSource,
@@ -58,11 +59,21 @@ describe('planCredentialSource', () => {
     expect(planCredentialSource({ ...base, sandboxRequested: false, sourceDir: '/acc/b' }))
       .toEqual({ kind: 'copy', family: 'claude', sourceDir: '/acc/b' });
   });
-  it('only warns for a non-redirected bot — it keeps the global login, as today', () => {
-    const plan = planCredentialSource({ ...notSandboxed, sourceDir: '/acc/b' });
-    expect(plan.kind).toBe('ineffective');
-    const bad = planCredentialSource({ ...notSandboxed, sourceDir: 'rel' });
-    expect(bad.kind).toBe('ineffective');
+  it('refuses an unsandboxed claude-code bot whose data dir could not be redirected', () => {
+    for (const [extra, re] of [
+      [{ wrapperCli: 'aiden x' }, /wrapperCli is set/],
+      [{ sessionDataDirPresent: false }, /SESSION_DATA_DIR is missing/],
+    ] as const) {
+      const plan = planCredentialSource({ ...notSandboxed, ...extra, sourceDir: '/acc/b' });
+      expect(plan).toMatchObject({ kind: 'refuse' });
+      expect((plan as { reason: string }).reason).toMatch(re);
+    }
+  });
+  it('only warns for an unsandboxed bot on an unsupported CLI or with an unusable path — it keeps the global login', () => {
+    for (const cliId of ['codex', 'seed']) {
+      expect(planCredentialSource({ ...notSandboxed, cliId, sourceDir: '/acc/b' }).kind).toBe('ineffective');
+    }
+    expect(planCredentialSource({ ...notSandboxed, sourceDir: 'rel' }).kind).toBe('ineffective');
   });
   it.each([
     ['wrapperCli', { wrapperCli: 'aiden x' }, /wrapperCli is set/],
@@ -94,6 +105,32 @@ describe('planCredentialSource', () => {
   it('refuses a relative path and the codexAuthSync=isolated conflict on a redirected bot', () => {
     expect(planCredentialSource({ ...base, sourceDir: 'rel/b' }).kind).toBe('refuse');
     expect(planCredentialSource({ ...base, sourceDir: '/acc/b', codexAuthSync: 'isolated' }).kind).toBe('refuse');
+  });
+});
+
+describe('credentialSourceForcesBotHome', () => {
+  const unsandboxed = { cliId: 'claude-code', sandboxRequested: false, home: '/h/u' };
+  it('forces a per-bot home for an unsandboxed claude-code bot with a source', () => {
+    expect(credentialSourceForcesBotHome({ ...unsandboxed, sourceDir: '~/accounts/b' })).toBe(true);
+    expect(credentialSourceForcesBotHome({ ...unsandboxed, sourceDir: '/acc/b' })).toBe(true);
+    // ...and the plan then copies instead of only warning.
+    expect(planCredentialSource({
+      cliId: 'claude-code', sandboxRequested: false, willRedirectCliData: true, isClaudeFamily: true,
+      supportsReadIsolation: true, sessionDataDirPresent: true, sourceDir: '/acc/b',
+    })).toEqual({ kind: 'copy', family: 'claude', sourceDir: '/acc/b' });
+  });
+  it('leaves sandboxed bots to the sandbox redirect (scratch keeps its native home)', () => {
+    expect(credentialSourceForcesBotHome({ ...unsandboxed, sandboxRequested: true, sourceDir: '/acc/b' })).toBe(false);
+  });
+  it('is off when unset, blank, or not a valid path, so those bots keep the historical behaviour', () => {
+    for (const sourceDir of [undefined, null, '', '   ', 'rel/b', 42]) {
+      expect(credentialSourceForcesBotHome({ ...unsandboxed, sourceDir })).toBe(false);
+    }
+  });
+  it('is off for CLIs outside the allow-list, so they keep the warning instead of being refused', () => {
+    for (const cliId of ['codex', 'seed', 'relay', 'constructor', '__proto__']) {
+      expect(credentialSourceForcesBotHome({ ...unsandboxed, cliId, sourceDir: '/acc/b' })).toBe(false);
+    }
   });
 });
 

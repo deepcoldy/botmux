@@ -57,6 +57,9 @@ export function openV3WorkerAttempts(events: readonly StoredEvent[]): V3OpenWork
   const closed = new Set<string>();
 
   for (const event of events) {
+    // A bot-executed attempt has no local worker to fence or orphan-recover;
+    // its close proof lives in the external attempt ledger instead.
+    if (event.type === 'nodeDispatched' && event.nodeExecutor === 'bot') continue;
     if (isAttemptOpened(event)) {
       const prior = opened.get(event.attemptId);
       if (

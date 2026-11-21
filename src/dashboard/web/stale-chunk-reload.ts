@@ -15,7 +15,9 @@ export interface BrowserStaleChunkReloadEnv {
 const STALE_CHUNK_RELOAD_KEY_PREFIX = 'botmux.dashboard.stale-chunk-reload.v1:';
 const DYNAMIC_IMPORT_ERROR_RE =
   /Failed to fetch dynamically imported module|Importing a module script failed|error loading dynamically imported module|dynamically imported module/i;
-const MODULE_URL_RE = /\b(?:https?:\/\/|\/assets\/)\S+?\.js\b/;
+const MISSING_EXPORT_ERROR_RE = /(?:does not|doesn't) provide an export named/i;
+const MODULE_URL_RE = /(?:https?:\/\/|\/assets\/|\.{1,2}\/)[^\s"'<>]+?\.js\b/;
+const DASHBOARD_CHUNK_URL_RE = /(?:\/chunks\/|\/chunk-)[^/?#]+\.js$/;
 
 function errorText(err: unknown): string {
   if (err instanceof Error) return `${err.name}: ${err.message}`;
@@ -23,7 +25,12 @@ function errorText(err: unknown): string {
 }
 
 export function isLikelyStaleRouteChunkError(err: unknown): boolean {
-  return DYNAMIC_IMPORT_ERROR_RE.test(errorText(err));
+  const text = errorText(err);
+  if (DYNAMIC_IMPORT_ERROR_RE.test(text)) return true;
+  // An old successful shim response may still be in the browser's module map.
+  // Recognize its linking error, without reloading for unrelated module bugs.
+  const moduleUrl = text.match(MODULE_URL_RE)?.[0];
+  return MISSING_EXPORT_ERROR_RE.test(text) && !!moduleUrl && DASHBOARD_CHUNK_URL_RE.test(moduleUrl);
 }
 
 function reloadKeyFor(err: unknown, env: StaleChunkReloadEnv): string {

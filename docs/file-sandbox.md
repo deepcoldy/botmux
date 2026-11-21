@@ -8,13 +8,16 @@ BotMux 有**两种正交的文件沙盒**，一个开关三档：
 | `oncall`（缺省沙盒） | **保密**：分享给半受信任的人 | deny-by-default 白名单 | 白名单内直达宿主、即时落盘 | Linux + macOS |
 | `scratch`（2026-09 新增） | **完整可弃**：owner 自己的一次性草稿环境 | 整个真实文件系统 | Linux：全部进 COW upper 宿主永不变；mac：$HOME/项目写进 APFS 克隆副本，系统路径只读 | Linux + macOS |
 
-> scratch **不防恶意载荷**（agent 仍能读到磁盘上的密钥并经网络外发）；它防的是「写污染」——破坏性/试验性操作不影响真实机器。需要保密时用 oncall。
+> scratch **只隔离写入，不隔离凭据**：agent 仍能读到这台机器上的密钥，以及其他人的 token 和登录态（`~/.botmux/data/` 下的 `user-token-*`、`lark-cli-home/` 等），并能经网络外发。它防的是「写污染」：破坏性、试验性的操作不影响真实机器。多人共用的 bot 要隔离凭据，请用白名单隔离（oncall）。
+>
+> scratch 仍会遮住 botmux 自身的传输凭证（bots.json、dashboard secret、各 bot 的 send-cred 等），也会整目录遮住几个按人存放凭据的目录（`bytedcli-home/`、`meego-home/`、`cli-identity/` 里别的会话、`vc-meeting-daemon-auth/`、`oauth-pending/`），会话期间在里面新建的文件同样读不到。这些只是减少暴露，不构成凭据边界：`user-token-*` 只遮会话启动时已存在的文件，`lark-cli-home/` 不遮（scratch 里按人身份的 lark-cli 依赖它）。`meego-home/` 被遮住后，沙盒会话用不了在本机器人里共用的 Meego 登录：群里的 `bytedcli meego login` 会被拒绝，私聊里仍可在本会话内登录。Dashboard 的按触发人鉴权面板和 worker 日志据此只把白名单隔离算作「token 已受保护」。
 
 ## 三模式的配置
 
 - dashboard：bot 默认设置面板「文件沙盒」三选一分段控件（关闭 / oncall / scratch），scratch 下可选存储（内存即焚 / 磁盘可跨重启续跑）。
 - `bots.json`：`"sandbox": true`（=oncall，向后兼容）、`"sandbox": "oncall"`、`"sandbox": "scratch"`、省略/`false`/`"off"`。
 - 环境变量：`BOTMUX_SANDBOX=1`（=oncall，向后兼容）、`BOTMUX_SANDBOX=scratch`；未识别取值**报错拒绝启动**（绝不静默关沙盒）。
+- 优先级：`BOTMUX_SANDBOX` 为 `1`/`oncall`/`scratch` > 旧字段 `readIsolation: true`（= oncall）> bot 自己的 `sandbox`。未设、空、`0`、`false` 都是「不强制」，按 bot 配置走，**不会关掉 bot 自己开的沙盒**——这个变量只能全局强制开，不能全局关。
 
 scratch 专属字段（均可选）：
 
@@ -73,7 +76,40 @@ bwrap:
 3. **daemon 侧读改写**：CLI 在容器里写的 transcript/rollout/events，宿主真实路径看不到，daemon/worker 统一从 `<merged>/<绝对路径>` 读（`scratchHostView`；transcript-resolver 按会话冻结的 scratch 状态自动 remap，unmount 时自然 ENOENT，**不回退读宿主真实路径**）。worker 是每会话进程，CODEX_HOME/TRAE_HOME 在进程内重指 merged、对容器子进程经 `--setenv/--unsetenv` 强制保持原生路径。
 4. **resume**：活 pane（tmux 等）跨 daemon 重启 / 话题转移时整棵会话树（overlay、上层、outbox）保留，reattach 只重接 outbox watcher，绝不重挂；disk 模式重启后用同一 upper/work 重挂可冷恢复（实测数据完整）；tmpfs 模式机器重启后 upper 消亡，会话标记不可恢复，提示开新会话（不伪造新 upper）。
 5. **生命周期**：正常关闭/sweep 按「子 bind → 子 overlay → 主 overlay → tmpfs 槽」逆序卸载并删目录；daemon 启动与周期 reconciler 调 `sweepOrphanScratchSandboxes`，/proc cmdline 活进程守卫 + 60s grace（沿用 oncall sweep 的事故教训）。
-6. 非 root：自动走 `fuse-overlayfs`（需 /dev/fuse），storage 强制为 disk 语义；依赖缺失自动装失败则**报错不裸跑**。
+6. 非 root：写时复制层走 `fuse-overlayfs`；**tmpfs 存储不可用**（宿主命名空间里挂 tmpfs 需要 root），不会自动改成 disk，选了 tmpfs 的会话直接失败并提示改 disk。依赖缺失时 root 会尝试自动安装，装不上则**报错不裸跑**。前置条件见下一节。
+
+### scratch 前置条件（Linux）
+
+Dashboard 选中 scratch 时会显示 daemon 对本机的只读预检结果（不挂载、不起沙盒）：「这台机器不能用 scratch」或「这台机器只能用 disk」，以及缺什么、怎么装。预检只是提示，不阻止保存；第一个会话才是真正的验证。
+
+| 运行身份 | tmpfs 存储（默认） | disk 存储 |
+|---|---|---|
+| root | `bwrap`；内核支持 overlay（`/proc/filesystems` 里有 `overlay`）。tmpfs 模式的主 overlay 没有 FUSE 回退 | `bwrap`；内核 overlay，挂载失败时回退 `fuse-overlayfs`（此时需要 `/dev/fuse`） |
+| 非 root | **不可用**，提示改 disk | `bwrap` + 允许非特权 user namespace（`user.max_user_namespaces` > 0；有 `kernel.unprivileged_userns_clone` 的发行版须为 1）；`fuse-overlayfs`；`/dev/fuse` 存在（由 setuid 的 `fusermount3` 以 root 身份打开，所以本用户打不开时预检只标「无法确定」）；setuid 的 `fusermount3`（fuse3 包）；daemon 不能带 NoNewPrivileges（systemd `NoNewPrivileges=yes` 会让 fusermount3 失去权限）。根文件系统以外的挂载盘（如 `/data00`）在沙盒里只读，工作目录不能放在上面 |
+| root + `BOTMUX_SANDBOX_FUSE=1` | 同上表 root，但 overlay 一律走 `fuse-overlayfs`，需要 `/dev/fuse` | 同左 |
+
+没有 `/dev/fuse` 的机器（部分 devbox / 容器）：非 root 时 tmpfs 和 disk 都起不来；root 时 tmpfs 可用，disk 依赖内核 overlay 接受 upper 在 `/` 之下（部分加固内核会拒绝，需回退 FUSE）。Ubuntu 23.10+ 开着 `kernel.apparmor_restrict_unprivileged_userns=1` 时，非 root 能否建 user namespace 取决于 bwrap 是否有对应 AppArmor profile，预检标「无法确定」。
+
+会话起不来时，飞书里会直接给出原因和修法；daemon / worker 日志里对应的 `[scratch-sandbox]` 行：
+
+| 日志 | 原因 | 修法 |
+|---|---|---|
+| `missing deps (…); auto-install unavailable — <命令>` | 缺 bubblewrap / fuse-overlayfs，自动安装失败（非 root 无免密 sudo，或没有包管理器） | 执行日志里给出的安装命令后重试 |
+| `tmpfs upper slot mount failed (non-root host? …)` | 非 root：不能挂 tmpfs；root：`/var/tmp` 不可写或内存不足 | 非 root 把 scratch 存储改成「磁盘」；root 检查 `/var/tmp` 与内存，或改「磁盘」 |
+| `kernel overlay mount failed: …` | root + tmpfs，内核 overlay 挂不上 | `modprobe overlay`，或改「磁盘」（disk 会回退 fuse-overlayfs） |
+| `overlay mount failed (kernel/fuse): …` | fuse-overlayfs 挂不上 | 装 fuse-overlayfs，确认 `/dev/fuse` 可读写；非 root 还要 setuid `fusermount3` 且无 NoNewPrivileges |
+| `tmpfs upper for recorded session … is gone (machine reboot wiped it)` | 机器重启，内存里的写时复制层已丢 | 新开会话（唯一需要新开会话的情况） |
+| `on-disk scratch meta (X) conflicts with requested Y` | 会话建立后改了 scratch 存储 | 改回 X；新设置只对之后新建的会话生效 |
+| `another live process is preparing this sandbox` | 同一会话的另一次准备还在进行 | 稍后重试 |
+| `cannot record the prepare in progress` / `setup failed at meta-write: …` | 数据目录写不进去 | 检查数据目录所在磁盘是否已满、是否可写 |
+| `<merged> already mounted but meta missing/mismatch` | 上次残留的挂载，缺少对应记录 | `umount -R <merged>` 后重试 |
+| `working dir … sits on a submount that cannot be overlaid` | 工作目录所在挂载做不了写时复制（非 root 时根文件系统以外的挂载都是这样） | 把工作目录放到根文件系统，或以 root 运行 daemon |
+| `working dir … is not writable inside the COW view` | 工作目录不存在或无权限 | 检查目录与 daemon 用户权限 |
+| `cwd COW probe leaked to the real host` | 自检发现写入穿透到真实目录，已拒绝启动 | 把这几行日志反馈给维护者 |
+| `setup failed at mcp-socket-…` | MCP 网关 socket 不可用 | 重试；仍失败看 MCP gateway 日志 |
+| `N host submounts exceed the overlay limit …` | 子挂载超过单会话上限，超出部分只读（会话照常启动） | 多半是残留挂载，清理宿主后新开会话 |
+| `reclaiming a half-prepared tree …` / `its mounted view does not match its marker — re-mounting …` / `skipped N mount(s) inside other scratch session trees` | 自动修复 / 正常跳过，仅记录 | 无需处理 |
+| `setup failed at <位置> — aborting spawn` | 汇总行，具体原因看它前面一行 | 按前一行处理 |
 
 scratch 与 oncall 共用：`botmux send` outbox 中转（凭证不进沙盒）、seccomp nice 隔离判据、owner env 冻结、proxy/CA env、shim/trusted 命令穿透 bind。互斥项与 oncall 相同（riff 远端、forge-traex、codexBrowser、existingAppServer、Codex instance routing、codexAuthSync: isolated、legacy readIsolation）。
 
@@ -132,8 +168,8 @@ Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`s
 
 ## Claude 的 per-bot 账号（`credentialsSourceDir`）
 
-默认所有沙盒 bot 共用本机登录的同一个 Claude 账号（每次冷启动把全局凭证写进
-`<BOTMUX_HOME>/bots/<larkAppId>/claude`）。要让不同 bot 用不同账号，给 bot 配一个
+默认所有 bot 共用本机登录的同一个 Claude 账号：沙盒 bot 每次冷启动把全局凭证写进
+`<BOTMUX_HOME>/bots/<larkAppId>/claude`，非沙盒 bot 直接用全局 `~/.claude`。要让不同 bot 用不同账号，给 bot 配一个
 凭证来源目录，目录下按 CLI 分子目录：
 
 ```json
@@ -161,7 +197,20 @@ Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`s
   `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN`、
   Bedrock/Vertex/Foundry 开关或 `apiKeyHelper`；与 `codexAuthSync: "isolated"` 同配。
 - 持久后端（tmux 等）的存活 pane 若是用别的来源启动的，会被杀掉并冷启动，不会复用。
-- 完全没开沙盒的 bot 不生效（仅打 WARN），仍用全局登录；未配置该字段的 bot 行为不变。
+- 没开沙盒的 `claude-code` bot 也生效：配了该字段就和 Codex `codexAuthSync: "isolated"`
+  一样，把 CLI 数据目录重定向到 `<BOTMUX_HOME>/bots/<larkAppId>/claude`（只换数据目录，
+  不加任何文件读写限制），再按上面的规则复制凭证；无法重定向（设了 `wrapperCli`、缺
+  `SESSION_DATA_DIR`）时拒绝启动，与沙盒 bot 一致。CLI 不在支持清单时仍只打 WARN、继续用
+  全局登录。未配置该字段的 bot 行为不变。
+- 一直用全局 `~/.claude` 的非沙盒 bot 切过来时要注意，per-bot 目录与沙盒 bot 的规则相同，
+  **不是**全局目录的副本：
+  - 已有会话的转写/记忆不会迁移，续接旧会话会退化为新会话（需要的话先把
+    `~/.claude/projects/<cwd 对应目录>` 拷到新目录再切）；
+  - `settings.json` 只继承 `env`，顶层 `permissions`、`hooks`、`enabledPlugins`、`model`、
+    `statusLine` 等都不继承；
+  - `~/.claude` 下的 `CLAUDE.md`、`skills`、`agents`、`commands`、`plugins` 不会带过去；
+  - `.claude.json` 按「全局减去 `projects`」seed 一次；
+  - 和沙盒 bot 一样关闭 turn recap；`/g` 一次性标题也不会用全局登录去跑，保留占位名。
 - **token 刷新不归 botmux 管**：外部脚本负责刷新来源目录里的凭证（必须赶在 CLI 自己
   刷新之前），并 suspend 使用该账号的 bot 让其冷启动取新凭证。
 - 修改某个 bot 的 `credentialsSourceDir`（或换掉它背后的账号）前，先 suspend 该 bot 的
@@ -193,6 +242,10 @@ worker spawnCli
 
 **per-CLI authPaths**：每个适配器用 `authPaths` 声明自己的认证/登录状态目录，沙盒把它们真实 `--bind` 进来，token refresh / login 直接持久化到宿主。默认窄（仅 auth）；CLI 若在 `$HOME` 下放 SQLite DB（codex 系），把整个状态目录加进 `authPaths`（否则该路径不在白名单 → 沙盒里不存在 → DB 打不开或拿不到 fcntl 锁）。macOS 用同一份 policy 经 Seatbelt（`compileToSeatbelt`）落地。
 
+**botmux 数据根**：`~/.botmux`（及自定义 `SESSION_DATA_DIR` 所在的根）对有飞书通道的会话也是 mandatory 整根 deny，再在更深路径开回本会话需要的面（自己的 BOT_HOME、`bin`、插件目录、本会话的 session-store/attachments/turn-sends 等）。所以 `workingDir=~` 或更上层时，沙盒里看到的 `~/.botmux` 与项目工作目录时一样：`bots.json`、`.dashboard-secret`、兄弟 bot 目录都不可读写。实际加载的 bots 配置另按精确路径 deny（`BOTS_CONFIG` 可能在根外）。`workingDir` 落在数据根内部（自己的 BOT_HOME 除外）时 `buildFsPolicy` 抛 `working-dir-in-botmux-home`，拒绝启动。`dirname(SESSION_DATA_DIR)` 不是真正的 botmux 根时（`SESSION_DATA_DIR=$HOME/data`、`/data` 这类，按 `plausibleConfiguredBotmuxHome` 判；或数据目录在安装目录里，`<checkout>/data`），不整根 deny 这个父目录，只 deny 其中的 `bots/` 和数据目录本身（默认 `~/.botmux` 仍整根 deny），工作目录拒绝启动的判断也只看这两处。
+
+**安装根**：botmux 安装目录只读挂入。它是 git checkout 时，worker 用 `git ls-files --others [--ignored] --directory` 列出未跟踪/忽略项（`dist`/`dist-bin`/`node_modules` 路径段、`.example` 模板、软链除外）加上 `.git`，作为 mandatory deny（`adapters/cli/install-root-masks.ts`）；git 不可用时退回固定名单。只有 `workingDir` 本身在安装目录内时，才不遮工作目录下面的部分（bot 就是在改这个仓库）；`sandboxPaths` 授予安装目录或其祖先、`workingDir` 是安装目录的祖先，都不解除遮罩。
+
 **角色库子树**：开沙盒的 bot 还会拿到 `<角色库根>/<自己 appId>/` 的 `readWrite`。`workingDir` 只覆盖**当前**角色目录，而角色系统要越过它：「有哪些角色 / 切换角色」枚举兄弟角色目录并读各自 `.botmux-dir.json`，「新建角色」写 `users/<openId>/<slug>/` 并复制库根的 `_role-protocol.md`，切换后「沉淀知识」写的是**新**角色目录下的 `knowledge/`。给 `readWrite` 而非 `readOnly` 正是因为最后一条——只读的话枚举和切换都正常，等到写知识才 EPERM。按 appId 限定（不是整个角色库根）：别的 bot 的角色目录、以及其中别的用户的私有角色，仍在白名单外。两道收口：① `botmux-roles` 与 `<appId>` 这**最后两段各自必须是真目录**，任一段是符号链接就不产生规则——否则被预先摆成指向 `~/.ssh` 或别的 bot 角色库的链接时，跟随解析会把链接目标当成本 bot 的子树授 rw（更上层如 `$HOME` 允许是链接，且必须 realpath，否则 canonical 匹配会 fail-open）；② 任何 deny（baseline / 机主 `sandboxPaths.deny` / mandatory）覆盖该子树时这条规则**整条不产生**——source rank 只裁同路径冲突，否则更深的 internal rw 会在被 deny 的库根上重新开个洞。
 
 两件明确不在射程内、也不该只为这条规则加固的：**TOCTOU**（校验后到 spawn/bind 前把目录换成链接）与**挂载点**（末段是 bind/FUSE 挂载点仍算真目录）。两者都需要宿主级写权限，而拿到宿主级写权限的人本来就能改 `bots.json` 关掉沙盒；且策略里每条路径规则（`workingDir`、`botHome`、`cliDataPaths`…）都在同一时点做一次性检查，同样成立。
@@ -205,7 +258,60 @@ worker spawnCli
 2. daemon 侧 `startOutboxWatcher` 拾取请求，在**沙盒外**用真实凭证重跑 `send` 投递，结果写回
 3. 附件被拷进 `outbox`（共享路径）后路径改写，host 侧才读得到
 
-→ **所有飞书密钥全程不进沙盒**。
+→ send 这条路不需要沙盒里有飞书密钥。但白名单隔离默认仍授 BOT_HOME 读写，其中的
+`send-cred.json` 是明文 App Secret，`history` / `quoted` 等命令就靠它直连飞书。
+
+**`sandboxWithholdBotSecret`（会话创建时冻结进 `session.sandboxWithholdBotSecret`）**：
+
+- fs-policy 对 `<BOT_HOME>/send-cred.json` 加 mandatory deny（`ctx.withholdSendCredential`），
+  BOT_HOME 其余部分照旧读写。worker 仍会写这个文件，给宿主侧重执行用。
+- macOS 白名单隔离也建 `<数据目录>/sandboxes/<会话>/outbox`、授读写、起 outbox watcher、发布
+  relay capability。Seatbelt 没有 `--setenv`、tmux pane 只透传白名单里的 `BOTMUX_*`，所以
+  `BOTMUX_SEND_RELAY` 放在命令里传：`sandbox-exec -f <sb> /usr/bin/env BOTMUX_SEND_RELAY=<outbox> <cli>`。
+  热重连时 outbox 不在就拒绝启动。孤儿目录清扫依赖 `/proc`，macOS 上不会扫到这类目录，
+  会话正常关闭时由 worker 删除。
+- `cmdSend`：macOS 的 Seatbelt pane 看得到宿主的进程标记，所以「有活标记」不能当成「不在沙盒」；
+  有 `BOTMUX_SEND_RELAY` 且内核探针被拒时，和 Linux 一样只认 outbox 里的 capability。
+- `history` / `quoted`：沙盒内读不到 send-cred 且有中转目录时，写一条
+  `{command:'session-tool', tool:<RemoteRunnerSessionToolRequest>, originCapability}`。watcher 用
+  remote-runner 同一份校验（`normalizeRemoteRunnerSessionToolRequest`，只放行 history / quoted），
+  经 `authorize` 拿到本轮 turn，再走 `runRemoteRunnerSessionTool` 在宿主执行：session-id 由宿主
+  指定，`quoted` 带 `--remote-runner-session-tool`（消息不在本会话的群里就拒绝）。宿主执行 `quoted`
+  时把 `BOTMUX_ATTACHMENTS_ROOT` 指到 `sandboxes/<会话>/relay-attachments`（沙盒不可达），下载不进
+  沙盒可写的共享附件桶；打包时按已校验的 inode 读（O_NOFOLLOW）。附件以 base64 随 `res.json` 返回
+  （上限 32MB），沙盒侧用 O_EXCL 写进 outbox 下的子目录并替换占位路径。
+- 只有服务 session tool 的 watcher 才在 outbox 写 `.botmux-session-tools` 标记；沙盒侧见到标记才走
+  中转，仅凭据隔离的会话与未开开关的 bot 保持原路径。
+- 其余凭证通道一并关闭：本 bot 的 lark-cli 密钥库（appsecret 密文 + master key）不再放行；
+  `/api/sessions/<sid>/lark-tool-identity` 对 `mode: 'bot'` 返回 403（`--as user` 不受影响）。
+- outbox 与附件桶对沙盒可写，宿主往里写都不跟随软链：`res.json` 用 `followTargetSymlink: false`，
+  附件下载写临时文件后 rename，并在 rename 前复核目录 inode 未被换成软链。
+- 开关随会话冻结，fork / 干净恢复、多人分道（principal lane）、v3 工作流 bot 快照都带着它；
+  `BOTMUX_SANDBOX=1` 强制开 oncall 的会话也带。
+- macOS 宿主 worker 进程 env 里有 `LARK_APP_SECRET`，同用户进程可用 `sysctl(KERN_PROCARGS2)` 读回
+  （实测 `(allow default)` 下可读）。开关打开时 Seatbelt 多发两条：`(deny process-info* (target others))`
+  与 `(deny sysctl-read (sysctl-name-prefix "kern.procargs"))`——实测必须两条同时才拦得住，单独任一条仍可读；
+  不能 deny 对自身的 process-info（会让运行时直接崩）。Linux 靠 PID namespace。
+- send-cred 两个写入点（worker 启动、feedback 配置改动）统一走 `writeSendCredFile`：**原地写、不换
+  inode、内容没变不写**。Linux 对该路径的 mask 挂在目录项上，temp+rename 会换成新 inode 让运行中的
+  pane 读到未遮罩的新文件；同级临时文件也会在 BOT_HOME 里短暂可读。跨进程写入与 feedback 的读改写用
+  同一把文件锁串行化，写满全部字节并在失败时尽力恢复旧内容；CLI 读取只对撕裂 JSON 做有界重试，明确
+  EPERM/EACCES 不重试。锁目标放在 `<数据目录>/send-cred-locks/` 的宿主私有目录，不使用 BOT_HOME
+  同级锁文件，避免 Linux deny mask 把不存在的锁路径预建成目录后让后续更新 EISDIR。
+- 附件文件名只取 basename，`..`/空名退回 file_key；Range 下载在 rename 前复核目录 inode；
+  下载还要求目录 realpath 落在附件根下（`withinRoot`），防 `attachments/<appId>` 这一层被换成软链。
+- macOS 可写目录能被整个 rename 走（子文件从未被打开，文件级 deny 不触发），再从可写位置读回；
+  或换成软链让宿主写穿。开关打开时对 BOT_HOME 与 outbox 发 `(deny file-write-unlink (literal …))`
+  （实测拦住 mv/rmdir、目录内 mkdir/touch/rename 不受影响）；watcher 另记住启动时 outbox 的 inode，
+  被换掉就不写 `res.json`。Linux 上这两处是 bind mount，本就不能 rename。
+- 判「这个 bot 的会话要不要扣密钥」统一走 `sandboxWithholdsBotSecret(botCfg)`（按 `resolveSandboxMode`
+  含 env 强制后的实际沙盒档判），冻结、会议接收、工作流快照都用它。
+- 附件下载的目录校验在 mkdir **之前**做（否则 mkdir -p 会顺着被换的祖先建到外面），校验通过的目录
+  identity（dev/ino + 根内）一路带到最终 rename 前再核一次——等待网络那段是攻击窗口；macOS 另把
+  开关打开时 `attachments/<appId>` 对沙盒改成**只读**（两个平台）：这时桶的唯一写者是宿主（入站消息；
+  中转的 `quoted` 落在宿主私有的 relay-attachments），沙盒不再能在宿主「校验→open/rename」两个系统调用
+  之间换目录——这是路径式检查关不掉的跨进程竞态，只读直接消灭这一类。Range 下载的暂存文件在校验后
+  同步打开、暂存名与目标文件名无关（避免 NAME_MAX）。开关关着时桶仍可写（原有设计），上述守卫只是缩小窗口。
 
 **沙盒目录的生命周期**（oncall / scratch / 仅凭据隔离一致，`<数据目录>/sandboxes/<会话>`）：
 
@@ -320,6 +426,67 @@ fs-policy 模型下 agent 在 **readWrite 白名单区（含 workingDir）直接
 - send 中转：沙盒内 `botmux send`（含文件附件）→ outbox → daemon 代投 → 真实到达飞书，全程零凭证入沙盒
 - 真实 worker：codex 经 worker spawn 钩子在 bwrap 内正常启动运行
 - macOS：同一份 policy 经 Seatbelt（`sandbox-exec -f <profile>`）落地，deny 路径被挡、正常路径可跑
+
+## 开源 CLI 兼容性（白名单隔离，Linux）
+
+每格都是真实 worker（`dist/worker.js`，`sandbox: "oncall"`）+ 真实 CLI，tmux / pty 两个后端各跑一遍。CLI 用假 key 指向本机回环上的脚本化模型，由它让 CLI 调一次 shell 工具。检查项：
+
+- 启动：worker 报 ready，CLI 没有退出
+- 首轮收发：消息送到模型，并且一轮跑完
+- shell 工具：工具调用在沙盒里真的执行了
+- 工作目录读写：写入的文件在宿主上能看到
+- 联网：沙盒内 HTTPS 访问公网模型 API，返回任意状态码即算通
+- botmux send：沙盒内的 send 经 outbox 到了宿主
+- 宿主凭证不可读：家目录下的探针文件读不到
+- /restart 恢复：重启后接回同一段对话（模型在第二轮的历史里看到第一轮）
+
+脚本在 `scripts/oncall-cli-matrix/`，必须在 isolate-run 里跑，详见 `lab.sh` 开头的注释。
+
+实测时间 2026-10-30（Antigravity 行 2026-11-01 复测），宿主 Linux 5.15（root daemon），CLI 版本：Claude Code 2.1.312、Codex 0.164.0、Antigravity（agy）1.4.12、OpenCode 1.19.3、Kimi 0.31.0、Pi 1.3.0、Oh My Pi 18.10.1、Grok 1.0.70。Antigravity、Kimi 的「/restart 恢复」一列是接上会话恢复之后复测的结果（开沙盒、不开沙盒都通过）。Gemini CLI 停维，矩阵行 2026-11-01 起被 Antigravity 取代，适配器已移除。
+
+| CLI | 后端 | 启动 | 首轮收发 | shell 工具 | 工作目录读写 | 联网 | botmux send | 宿主凭证不可读 | /restart 恢复 |
+|---|---|---|---|---|---|---|---|---|---|
+| Claude Code | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Claude Code | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Codex | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Codex | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Codex App | tmux | ⛔ 按设计拒绝启动（见下）| — | — | — | — | — | — | — |
+| Codex App | pty | ⛔ 按设计拒绝启动（见下）| — | — | — | — | — | — | — |
+| Antigravity（agy） | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Antigravity（agy） | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| OpenCode | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| OpenCode | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Kimi | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Kimi | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Pi | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Pi | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Oh My Pi | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Oh My Pi | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Grok | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Grok | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| OpenCode（配置写在 `~/.config/opencode/opencode.json`） | tmux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| OpenCode（配置写在 `~/.config/opencode/opencode.json`） | pty | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+
+**不在表里的 CLI**
+
+- 闭源 / 公司内部（本次不在范围）：Seed、Relay、Aiden、CoCo、TRAE（traex）、MTR、Mira、Mir CLI、Genius、ebsd、Riff、Mojo、Remote Runner。Riff、Remote Runner 和全远端的 Mojo 不在本机执行，本地沙盒不包裹；在本机执行的 Mojo 开沙盒会拒绝启动。
+- Codex App：Linux 文件沙盒下按设计拒绝启动（runner 的控制 socket 与 bootstrap 文件在沙盒里不可见），开了白名单隔离的 bot 请改用 Codex。
+- 本机没能配通假模型、未验证：OpenCode 2（不开沙盒时假模型配置也不生效）、Hermes（本机有宿主侧的命令拦截，不开沙盒也起不来）。
+- 只能用官方账号调模型、未验证模型调用：Cursor、Copilot、Kiro。（Antigravity 2026-11-01 起已用 `modelProvider: "gemini"` + 假模型按上表实测，不再在此列。）
+- 本机未安装、未验证：DeepSeek Harness（dsh / dsh-tui）、MiniMax Code、Reasonix、MiMoCode、CodeM、ZCode。
+
+**本次为白名单隔离补的路径**（每项都只放行该 CLI 自己的目录）
+
+这些目录是读写放行的，里面也有 CLI 会自动加载并执行的内容：Pi 的 `extensions/`、Antigravity 的 `config/hooks.json`、OpenCode 的 `plugin/`。所以沙盒里的 agent 写进去的东西，之后同机不开沙盒的同一个 CLI 也会加载。这与 Codex（`config.toml`）、Oh My Pi、MiMoCode 原有的整目录读写是同一类问题，属于跨适配器的收紧项，这次没有改。
+
+- Antigravity：`~/.gemini` 整个目录读写放行（原有的放行，本次没有改）。
+  - 已知边界：这包括 `antigravity-cli/` 下的 OAuth token、`history.jsonl`、`brain/` 和 `config/hooks.json`；同机其它 Antigravity 会话的记录在沙盒里也能读到。
+- Pi：`~/.pi/agent` 整个目录，但把共享的 `sessions/` 遮掉，只重新放行本会话的 `sessions/botmux/<会话 id>`，并给 Pi 传 `--session-dir`（与 Oh My Pi / ebsd 同一做法；scratch 不传，那里整盘都是一次性副本）。会话文件的位置跟着会话走：开沙盒恢复一个原来不开沙盒的会话时，先把按工作目录分组的子目录里的旧文件复制进来；一个会话一旦在自己的目录下有了文件，之后不开沙盒重启、关闭态卡片和本地终端给出的恢复命令都继续用它，桥接也只读它；会话 `/cd` 到新目录后再恢复时，新目录的旧记录同样先复制进来。原来看不到 `models.json` / `settings.json`，Pi 退回内置 provider，请求根本没发给配置的模型；会话文件也只写在沙盒的临时 tmpfs 里，宿主侧的桥接读不到。不开沙盒的 Pi 会话布局不变。
+- OpenCode：加放行 `~/.config/opencode`（读写）。原来看不到这里的 `opencode.json`，按配置文件配的 provider 失效，退回 OpenCode 自带的托管模型；botmux 的 ask 插件也加载不了。OpenCode 每次启动都会往这里装插件依赖，只读挂载会让它直接退出。
+- Kimi：放行整个 `~/.kimi-code`（`bin/` 只读）。原来只放行 `credentials/` 和 `oauth/`，会话记录和 `session_index.jsonl` 都写在沙盒的临时 tmpfs 里，恢复必然新开会话。
+  - 已知边界：同机其它 Kimi 会话的记录在沙盒里也能读到，与 Antigravity 相同。
+- 所有 CLI（只限白名单隔离；scratch 与仅凭据隔离不设）：daemon 以 root 运行时，沙盒内设 `TAR_OPTIONS=--no-same-owner`。`--unshare-user` 只映射当前 uid，GNU tar 以 root 身份解包别人的归档时 chown 失败。Pi 每次启动都会重新下载 fd / rg，启动期间会吞掉送进来的第一条输入。
 
 ## 后续
 

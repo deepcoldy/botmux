@@ -20,8 +20,9 @@ import { sanitizePerBotEnv, sessionEnvLock, type SessionEnvLock, type SessionEnv
 export const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 const utf8 = new TextEncoder();
-/** Every name lands in the pane argv (`env -u NAME`), which tmux caps at one
- *  16 KiB IPC message; real variable names are far shorter. */
+/** Keep session-env names bounded to a practical ASCII length. The old inline
+ *  pane argv also needed this guard, but pane-launch now removes tmux's 16 KiB
+ *  IPC message from the full launch argv; real variable names are far shorter. */
 export const MAX_SESSION_ENV_NAME_LENGTH = 256;
 
 /** A name the session-env layers accept (shape + byte length; locks are
@@ -220,6 +221,15 @@ export function sessionEnvUnsetFlags(unset: readonly string[] | undefined): stri
   const out: string[] = [];
   for (const key of unset ?? []) {
     if (isSessionEnvName(key) && sessionEnvLock(key) === null) out.push('-u', key);
+  }
+  return out;
+}
+
+/** Host-authorized removals that may include otherwise reserved control names. */
+export function trustedSessionEnvUnsetFlags(unset: readonly string[] | undefined): string[] {
+  const out: string[] = [];
+  for (const key of unset ?? []) {
+    if (isSessionEnvName(key)) out.push('-u', key);
   }
   return out;
 }

@@ -19,11 +19,18 @@ import { normalizeVcMeetingListenerPolicy, vcMeetingListenerPoliciesEqual, type 
  * read-modify-write 经 withFileLockSync 跨进程串行化。不引 SQLite。
  * 会议正文不落盘——这里只有位置、身份与 hash（§12.1）。
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { logger } from '../utils/logger.js';
+import {
+  StoreFileUnavailableError,
+  quarantineStoreFileIfUnchanged,
+  readStoreFileStrict,
+  readStoreFileTextStrict,
+  storeFileExistsStrict,
+} from '../utils/json-file.js';
 import type {
   VcMeetingConsumerManagedSink,
   VcMeetingConsumerProfileFilter,
@@ -316,10 +323,27 @@ function normalizePersistedProjectionPolicies(state: VcMeetingDeliveryStateFile)
   }
 }
 
-function readStateFile(fp: string): VcMeetingDeliveryStateFile | undefined {
-  if (!existsSync(fp)) return undefined;
+/**
+ * Soft read for read-only lookups. `ioErrors: 'throw'` lets a caller that must
+ * tell "no projection" from "could not read the state" (IM turn routing) see
+ * read failures as StoreFileUnavailableError; the default keeps the historical
+ * "unreadable → undefined" behaviour for every other caller.
+ */
+function readStateFile(
+  fp: string,
+  ioErrors: VcMeetingDeliveryReadIoErrors = 'skip',
+): VcMeetingDeliveryStateFile | undefined {
+  let text: string | undefined;
   try {
-    const raw = JSON.parse(readFileSync(fp, 'utf-8')) as VcMeetingDeliveryStateFile;
+    text = readStoreFileTextStrict(fp, 'vc meeting delivery state');
+  } catch (err) {
+    if (ioErrors === 'throw') throw err;
+    logger.warn(`[vc-meeting-delivery-store] failed to read ${fp}: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
+  if (text === undefined) return undefined;
+  try {
+    const raw = JSON.parse(text) as VcMeetingDeliveryStateFile;
     if (!raw || typeof raw !== 'object' || typeof raw.schemaVersion !== 'number') return undefined;
     normalizePersistedProjectionPolicies(raw);
     return raw;
@@ -336,9 +360,12 @@ function readStateFile(fp: string): VcMeetingDeliveryStateFile | undefined {
  * 只会导致 at-least-once 重放，由 action gate 兜副作用；静默覆盖才是事故。
  */
 function readStateFileForMutation(fp: string): VcMeetingDeliveryStateFile | undefined {
-  if (!existsSync(fp)) return undefined;
+  // 读错误（EMFILE/EIO/EACCES…）不是损坏：既不隔离也不当缺失重建，按暂时失败
+  // 抛 StoreFileUnavailableError，否则一次 I/O 抖动就会把完好的 cursor 状态重置。
+  const read = readStoreFileStrict(fp, 'vc meeting delivery state');
+  if (read === undefined) return undefined;
   try {
-    const raw = JSON.parse(readFileSync(fp, 'utf-8')) as VcMeetingDeliveryStateFile;
+    const raw = JSON.parse(read.text) as VcMeetingDeliveryStateFile;
     if (!raw || typeof raw !== 'object' || typeof raw.schemaVersion !== 'number') {
       throw new Error('not a delivery state file');
     }
@@ -346,7 +373,12 @@ function readStateFileForMutation(fp: string): VcMeetingDeliveryStateFile | unde
     return raw;
   } catch (err) {
     const aside = `${fp}.corrupt.${Date.now()}`;
-    try { renameSync(fp, aside); } catch { /* 已被并发处理，容忍 */ }
+    let moved = false;
+    try { moved = quarantineStoreFileIfUnchanged(fp, read.ident, aside); } catch { /* 已被并发处理，容忍 */ }
+    if (!moved && existsSync(fp)) {
+      // 读完后文件被替换（如运维修复）：不能挪走新文件，也不能当缺失重建覆盖它。
+      throw new StoreFileUnavailableError('vc meeting delivery state', fp, 'quarantine', new Error('file was replaced after it was read'));
+    }
     logger.warn(
       `[vc-meeting-delivery-store] corrupt state at ${fp}, moved aside to ${aside}: `
       + `${err instanceof Error ? err.message : String(err)}`,
@@ -648,11 +680,14 @@ export function getVcMeetingMemberProjection(
   return state?.members[key.memberId]?.projections[String(key.memberEpoch)];
 }
 
+export type VcMeetingDeliveryReadIoErrors = 'skip' | 'throw';
+
 export function listVcMeetingMemberProjections(
   dataDir: string,
   scope: { listenerAppId: string; meetingId: string },
+  opts: { ioErrors?: VcMeetingDeliveryReadIoErrors } = {},
 ): VcMeetingMemberProjectionRecord[] {
-  const state = readStateFile(meetingFilePath(dataDir, scope.listenerAppId, scope.meetingId));
+  const state = readStateFile(meetingFilePath(dataDir, scope.listenerAppId, scope.meetingId), opts.ioErrors);
   if (!state) return [];
   const out: VcMeetingMemberProjectionRecord[] = [];
   for (const member of Object.values(state.members)) {
@@ -1138,38 +1173,58 @@ export function reconcileVcMeetingDeliveriesOnBoot(
   const dir = join(dataDir, DIR_NAME);
   if (!existsSync(dir)) return [];
   const affected: VcMeetingAmbiguousReceiptRef[] = [];
-  for (const name of readdirSync(dir)) {
+  // Runs synchronously in daemon startup for every bot, over every meeting file
+  // (filtering by agent happens after the read). One unreadable file must not
+  // abort startup host-wide: skip it. Receipts in OTHER files are reconciled
+  // here and, if this bot is not restarting, by the periodic lease sweep
+  // (expireVcMeetingDeliveryLeases) — both isolate per file. The bad file's
+  // own stale receipts stay untouched until the file is repaired/removed
+  // (a persistent error such as EISDIR/EACCES is never self-healing).
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    logger.warn(`[vc-meeting-delivery-store] boot reconcile skipped: cannot list ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+  for (const name of names) {
     if (!name.endsWith('.json')) continue;
     const fp = join(dir, name);
-    withFileLockSync(fp, () => {
-      const state = readStateFileForMutation(fp);
-      if (!state) return;
-      let changed = false;
-      for (const stream of Object.values(state.streams)) {
-        const projection = state.members[stream.memberId]?.projections[String(stream.memberEpoch)];
-        if (projection?.agentAppId !== input.agentAppId) continue;
-        const active = stream.activeDeliveryKey ? stream.receipts[stream.activeDeliveryKey] : undefined;
-        if (!active || active.status !== 'dispatched') continue;
-        if (active.receiverBootId === input.receiverBootId) continue;
-        active.status = 'ambiguous';
-        active.ambiguousReplayCount += 1;
-        active.updatedAt = now;
-        stream.updatedAt = now;
-        changed = true;
-        affected.push({
-          listenerAppId: stream.listenerAppId,
-          meetingId: stream.meetingId,
-          memberId: stream.memberId,
-          memberEpoch: stream.memberEpoch,
-          deliveryKey: active.deliveryKey,
-          receiverSessionId: stream.receiverSessionId,
-          workerGeneration: active.workerGeneration,
-          dispatchAttempt: active.dispatchAttempt,
-          ambiguousReplayCount: active.ambiguousReplayCount,
-        });
-      }
-      if (changed) writeStateFile(fp, state, now);
-    });
+    try {
+      withFileLockSync(fp, () => {
+        const state = readStateFileForMutation(fp);
+        if (!state) return;
+        let changed = false;
+        for (const stream of Object.values(state.streams)) {
+          const projection = state.members[stream.memberId]?.projections[String(stream.memberEpoch)];
+          if (projection?.agentAppId !== input.agentAppId) continue;
+          const active = stream.activeDeliveryKey ? stream.receipts[stream.activeDeliveryKey] : undefined;
+          if (!active || active.status !== 'dispatched') continue;
+          if (active.receiverBootId === input.receiverBootId) continue;
+          active.status = 'ambiguous';
+          active.ambiguousReplayCount += 1;
+          active.updatedAt = now;
+          stream.updatedAt = now;
+          changed = true;
+          affected.push({
+            listenerAppId: stream.listenerAppId,
+            meetingId: stream.meetingId,
+            memberId: stream.memberId,
+            memberEpoch: stream.memberEpoch,
+            deliveryKey: active.deliveryKey,
+            receiverSessionId: stream.receiverSessionId,
+            workerGeneration: active.workerGeneration,
+            dispatchAttempt: active.dispatchAttempt,
+            ambiguousReplayCount: active.ambiguousReplayCount,
+          });
+        }
+        if (changed) writeStateFile(fp, state, now);
+      });
+    } catch (err) {
+      logger.warn(
+        `[vc-meeting-delivery-store] boot reconcile skipped ${fp}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   return affected;
 }
@@ -1186,6 +1241,10 @@ export function reconcileVcMeetingDeliveriesOnBoot(
  *   转移后同 key 重派会 bump attempt，旧派发的迟到 terminal 被世代证据拒。
  * - 幂等：已 ambiguous / 已 terminal / 未到期 / 别的 agent 一律不动，
  *   重复调用返回空增量。
+ * - 逐文件隔离（与 reconcileOnBoot 同形）：readdirSync 失败返回空增量；
+ *   单个会议文件读不了只 warn 跳过这一轮的该文件——文件名排序在它之后的
+ *   健康会议不能被一个坏文件拖成永久 dispatched。坏文件自身的回执需人工
+ *   修复后才会被处理。
  * - lease 时间锚 = dispatchedAt（老记录缺席时以 updatedAt 兜底——dispatched
  *   期间没有其它转移刷新它，两者等价）。
  */
@@ -1198,39 +1257,52 @@ export function expireVcMeetingDeliveryLeases(
   const dir = join(dataDir, DIR_NAME);
   if (!existsSync(dir)) return [];
   const affected: VcMeetingAmbiguousReceiptRef[] = [];
-  for (const name of readdirSync(dir)) {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    logger.warn(`[vc-meeting-delivery-store] lease sweep skipped: cannot list ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
+  for (const name of names) {
     if (!name.endsWith('.json')) continue;
     const fp = join(dir, name);
-    withFileLockSync(fp, () => {
-      const state = readStateFileForMutation(fp);
-      if (!state) return;
-      let changed = false;
-      for (const stream of Object.values(state.streams)) {
-        const projection = state.members[stream.memberId]?.projections[String(stream.memberEpoch)];
-        if (projection?.agentAppId !== input.agentAppId) continue;
-        const active = stream.activeDeliveryKey ? stream.receipts[stream.activeDeliveryKey] : undefined;
-        if (!active || active.status !== 'dispatched') continue;
-        const anchoredAt = active.dispatchedAt ?? active.updatedAt;
-        if (now - anchoredAt <= input.leaseMs) continue;
-        active.status = 'ambiguous';
-        active.ambiguousReplayCount += 1;
-        active.updatedAt = now;
-        stream.updatedAt = now;
-        changed = true;
-        affected.push({
-          listenerAppId: stream.listenerAppId,
-          meetingId: stream.meetingId,
-          memberId: stream.memberId,
-          memberEpoch: stream.memberEpoch,
-          deliveryKey: active.deliveryKey,
-          receiverSessionId: stream.receiverSessionId,
-          workerGeneration: active.workerGeneration,
-          dispatchAttempt: active.dispatchAttempt,
-          ambiguousReplayCount: active.ambiguousReplayCount,
-        });
-      }
-      if (changed) writeStateFile(fp, state, now);
-    });
+    try {
+      withFileLockSync(fp, () => {
+        const state = readStateFileForMutation(fp);
+        if (!state) return;
+        let changed = false;
+        for (const stream of Object.values(state.streams)) {
+          const projection = state.members[stream.memberId]?.projections[String(stream.memberEpoch)];
+          if (projection?.agentAppId !== input.agentAppId) continue;
+          const active = stream.activeDeliveryKey ? stream.receipts[stream.activeDeliveryKey] : undefined;
+          if (!active || active.status !== 'dispatched') continue;
+          const anchoredAt = active.dispatchedAt ?? active.updatedAt;
+          if (now - anchoredAt <= input.leaseMs) continue;
+          active.status = 'ambiguous';
+          active.ambiguousReplayCount += 1;
+          active.updatedAt = now;
+          stream.updatedAt = now;
+          changed = true;
+          affected.push({
+            listenerAppId: stream.listenerAppId,
+            meetingId: stream.meetingId,
+            memberId: stream.memberId,
+            memberEpoch: stream.memberEpoch,
+            deliveryKey: active.deliveryKey,
+            receiverSessionId: stream.receiverSessionId,
+            workerGeneration: active.workerGeneration,
+            dispatchAttempt: active.dispatchAttempt,
+            ambiguousReplayCount: active.ambiguousReplayCount,
+          });
+        }
+        if (changed) writeStateFile(fp, state, now);
+      });
+    } catch (err) {
+      logger.warn(
+        `[vc-meeting-delivery-store] lease sweep skipped ${fp}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
   return affected;
 }
@@ -1423,15 +1495,26 @@ export function latestVcMeetingDeliveryForSession(
 export function listVcMeetingActiveProjectionsForReceiverSession(
   dataDir: string,
   receiverSessionId: string,
+  opts: { ioErrors?: VcMeetingDeliveryReadIoErrors } = {},
 ): VcMeetingMemberProjectionRecord[] {
   if (!receiverSessionId.trim()) return [];
   const dir = join(dataDir, DIR_NAME);
-  if (!existsSync(dir)) return [];
+  // A directory we cannot stat is not "no projections": for a caller that must
+  // tell them apart (IM turn routing) it surfaces like every other read error,
+  // instead of demoting a sealed receiver route to ordinary on a transient EIO.
+  // Other callers keep the historical "unreadable → []".
+  try {
+    if (!storeFileExistsStrict(dir, 'vc meeting delivery state')) return [];
+  } catch (err) {
+    if (opts.ioErrors === 'throw') throw err;
+    logger.warn(`[vc-meeting-delivery-store] failed to stat ${dir}: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
+  }
 
   const out: VcMeetingMemberProjectionRecord[] = [];
   for (const name of readdirSync(dir)) {
     if (!name.endsWith('.json')) continue;
-    const state = readStateFile(join(dir, name));
+    const state = readStateFile(join(dir, name), opts.ioErrors);
     if (!state) continue;
     for (const member of Object.values(state.members)) {
       const current = member.projections[String(member.maxKnownEpoch)];

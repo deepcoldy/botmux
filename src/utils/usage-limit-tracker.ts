@@ -18,7 +18,11 @@ import {
 export interface UsageLimitTracker<S extends string = string> {
   currentTurn(): number;
   beginTurn(snapshot: string): number;
-  classify(content: string, status: S): { status: S | 'limited'; usageLimit?: CliUsageLimitState };
+  classify(
+    content: string,
+    status: S,
+    refineDetection?: (state: CliUsageLimitState) => CliUsageLimitState | undefined,
+  ): { status: S | 'limited'; usageLimit?: CliUsageLimitState };
   detectedThisTurn(seq: number): boolean;
   noteStructuredLimit(state: CliUsageLimitState): void;
   /**
@@ -50,7 +54,8 @@ export interface UsageLimitTracker<S extends string = string> {
  * same banner I saw earlier?" comparison must therefore use this instead.
  */
 function bannerTextIdentity(state: CliUsageLimitState): string {
-  return `${state.kind}:${state.retryLabel}`;
+  const key = `${state.kind}:${state.retryLabel}`;
+  return state.relativeResetKey ? `${key}:${state.relativeResetKey}` : key;
 }
 
 /** Whether a bridge turn's terminal is positive evidence the CLI produced an
@@ -131,8 +136,8 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
    *    run 7 more turns / 12 more user messages afterwards. Unlike the 429 path
    *    (one appended record per refusal), a usage refusal is recorded once.
    *
-   * Consequence, deliberately: CLIs that never reach noteTurnCompleted (gemini
-   * is not in STRUCTURED_BRIDGE_ALWAYS_CLI_IDS) keep the previous behavior
+   * Consequence, deliberately: CLIs that never reach noteTurnCompleted (those
+   * not in STRUCTURED_BRIDGE_ALWAYS_CLI_IDS) keep the previous behavior
    * exactly. Those are the CLIs with no authoritative limit signal at all, where
    * suppressing a repeated banner would risk hiding a real block.
    */
@@ -171,6 +176,7 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
     classify(
       content: string,
       status: S,
+      refineDetection?: (state: CliUsageLimitState) => CliUsageLimitState | undefined,
     ): { status: S | 'limited'; usageLimit?: CliUsageLimitState } {
       // Gate the screen-scan verdict on the runtime status: while the CLI is
       // actively working, limit-shaped text on screen is its own output (a
@@ -186,7 +192,8 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
         suppressRateKind: opts.isRateKindSuppressed(),
         ...(outputActive !== undefined ? { outputActive } : {}),
       });
-      if (!detected.limited) {
+      const limit = detected.limited ? (refineDetection ? refineDetection(detected) : detected) : undefined;
+      if (!limit) {
         // Re-emit an authoritative structured limit recorded this turn so a
         // genuinely blocked CLI keeps its card (see activeStructured).
         if (activeStructured?.seq === turnSeq) {
@@ -195,7 +202,7 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
         return { status };
       }
 
-      const key = usageLimitStateKey(detected);
+      const key = usageLimitStateKey(limit);
       // (a) master's rule: a banner already on screen whose reset time has
       //     already passed is definitionally leftover.
       // (b) the new rule: a banner that was ALREADY on screen when this turn
@@ -204,13 +211,13 @@ export function createUsageLimitTracker<S extends string = string>(opts: {
       //     text is leftover no matter what its clock says. Without an
       //     answer we never suppress — a genuine re-refusal still reports.
       if (key === staleBannerKey
-        || (turnProducedAnswer && bannerTextIdentity(detected) === preExistingBannerKey)) {
+        || (turnProducedAnswer && bannerTextIdentity(limit) === preExistingBannerKey)) {
         return { status };
       }
 
       staleBannerKey = undefined;
       detectedTurn = turnSeq;
-      return { status: 'limited', usageLimit: detected };
+      return { status: 'limited', usageLimit: limit };
     },
     detectedThisTurn(seq: number): boolean {
       return detectedTurn === seq;

@@ -58,6 +58,7 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSession: vi.fn(),
   createSession: vi.fn(),
   updateSessionPid: vi.fn(),
+  listSessions: vi.fn(() => []),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -67,9 +68,10 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
   LoggerLevel: { info: 2 },
 }));
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { initWorkerPool, __testOnly_setupWorkerHandlers, isSessionTransferring,
+  setActiveSessionsRegistry, transferSession } from '../src/core/worker-pool.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from '../src/core/deferred-schedule-settlement.js';
-import type { DaemonSession } from '../src/core/types.js';
+import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import { EventEmitter } from 'node:events';
 
 const TURN = 'schedule:task-1607:run-1';
@@ -125,7 +127,7 @@ describe('hidden schedule run terminal → settlement', () => {
       onDeferredScheduleTurnSettled: settled,
     } as any);
   });
-  afterEach(() => { vi.clearAllMocks(); });
+  afterEach(() => { setActiveSessionsRegistry(undefined); vi.clearAllMocks(); vi.useRealTimers(); });
 
   it('passes the undelivered verdict of a failed terminal on to the settlement', async () => {
     const ds = makeHiddenRun();
@@ -150,5 +152,85 @@ describe('hidden schedule run terminal → settlement', () => {
     });
 
     await vi.waitFor(() => expect(settled).toHaveBeenCalledWith(ds, { turnId: TURN, source: 'terminal' }));
+  });
+
+  it('forwards screen-only completion for an ordinary retained scheduled session', async () => {
+    const ds = makeHiddenRun();
+    delete ds.session.deferredScheduleRun;
+    const turnId = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
+    ds.session.scheduledRuns = { [turnId]: { taskId: 'abcdef12', runId: 'run-1', turnId } };
+    ds.workerReady = true;
+    ds.lastScreenStatus = 'working';
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', sessionId: ds.session.sessionId, turnId,
+      status: 'idle', content: 'done',
+    });
+    await vi.waitFor(() => expect(settled).toHaveBeenCalledWith(ds, { turnId, source: 'idle' }), { timeout: 500 });
+    settled.mockClear();
+    ds.lastScreenStatus = 'working';
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', sessionId: ds.session.sessionId, turnId: 'om_unrelated',
+      status: 'idle', content: 'done',
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(settled).not.toHaveBeenCalled();
+  });
+
+  it.each(['worker', 'generation', 'routing'] as const)(
+    'does not settle a retained schedule idle from stale %s ownership', async ownership => {
+      vi.useFakeTimers();
+      const ds = makeHiddenRun();
+      delete ds.session.deferredScheduleRun;
+      const turnId = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
+      ds.session.scheduledRun = { taskId: 'abcdef12', runId: 'run-1', turnId };
+      ds.workerReady = true;
+      ds.lastScreenStatus = 'working';
+      const originalWorker = ds.worker as any;
+      __testOnly_setupWorkerHandlers(ds, originalWorker);
+      if (ownership === 'worker') ds.worker = new EventEmitter() as any;
+      if (ownership === 'generation') ds.workerGeneration = (ds.workerGeneration ?? 0) + 1;
+      if (ownership === 'routing') {
+        ds.chatId = 'oc_moved';
+        ds.session.chatId = 'oc_moved';
+      }
+      await originalWorker.listeners('message')[0]({ type: 'screen_update',
+        sessionId: ds.session.sessionId, turnId, status: 'idle', content: 'done' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).not.toHaveBeenCalled();
+      expect(ds.lastScreenStatus).toBe('working');
+    });
+
+  it('does not settle retained schedule idle while the real transfer gate holds the source worker', async () => {
+    vi.useFakeTimers();
+    const ds = makeHiddenRun();
+    delete ds.session.deferredScheduleRun;
+    const turnId = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
+    ds.session.scheduledRun = { taskId: 'abcdef12', runId: 'run-1', turnId };
+    ds.workerReady = true;
+    ds.hasHistory = true;
+    ds.lastScreenStatus = 'idle';
+    const originalWorker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, originalWorker);
+    setActiveSessionsRegistry(new Map([[sessionKey(ds.chatId, ds.larkAppId), ds]]));
+    let finishDetach!: (detached: boolean) => void;
+    const moving = transferSession(ds.session.sessionId, 'oc_target', 'om_target', 'group', 'chat', {
+      mutationHeld: true, detachWorkerImpl: () => new Promise<boolean>(resolve => { finishDetach = resolve; }),
+      forkWorkerImpl: vi.fn(() => false) as any,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(isSessionTransferring(ds)).toBe(true);
+    try {
+      ds.lastScreenStatus = 'working';
+      await originalWorker.listeners('message')[0]({ type: 'screen_update',
+        sessionId: ds.session.sessionId, turnId, status: 'idle', content: 'done' });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(settled).not.toHaveBeenCalled();
+      expect(ds.lastScreenStatus).toBe('working');
+    } finally {
+      finishDetach(false);
+      await moving;
+    }
+    expect(isSessionTransferring(ds)).toBe(false);
   });
 });

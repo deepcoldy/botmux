@@ -11,7 +11,9 @@
 import { config } from '../../config.js';
 import { buildV3RunDetailUrl, buildV3TerminalUrl } from '../../core/dashboard-url.js';
 import type { V3ProgressView } from '../../workflows/v3/progress-projection.js';
+import { readRunEnvelope } from '../../workflows/v3/run-envelope.js';
 import type { V3RunSaveActionValue } from './v3-run-save-card.js';
+import { buildWorkflowSidebarEntryV1Button, type WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
 
 export interface V3ProgressCardOptions {
   /** Override the dashboard link (primarily for tests). */
@@ -23,6 +25,40 @@ export interface V3ProgressCardOptions {
   saveActions?: {
     chat: V3RunSaveActionValue;
   };
+  /**
+   * §11.1: for runs whose nodes are handed to bots in the chat, the「Web 详情
+   * （需登录）」button becomes the same「工作流 ›」sidebar entry the task
+   * messages carry. Absent = the card is exactly what it always was.
+   */
+  workflowEntry?: WorkflowSidebarEntryLink;
+}
+
+/**
+ * The progress card's sidebar entry: only a run pinned to `nodeExecutor:
+ * "bot"` gets one (design §11.1 / §15.1 — every other run keeps its card
+ * byte-for-byte), and only when the host can name its Dashboard address.
+ */
+export function v3ProgressWorkflowEntry(
+  envelope: { runId: string; nodeExecutor?: 'bot'; chatBinding?: { larkAppId: string } },
+  entryFor: (mainLarkAppId: string, runId: string) => WorkflowSidebarEntryLink | undefined,
+): WorkflowSidebarEntryLink | undefined {
+  if (envelope.nodeExecutor !== 'bot' || !envelope.chatBinding?.larkAppId) return undefined;
+  return entryFor(envelope.chatBinding.larkAppId, envelope.runId);
+}
+
+/**
+ * The same entry for the other main-topic cards of a run known only by its
+ * directory — the flow-revision confirmation and rerun-grant cards (§11.1):
+ * read from its run.json, so again only a run pinned to `nodeExecutor: "bot"`
+ * gets one. Unreadable run.json → no entry (the card keeps its old shape).
+ */
+export function v3RunWorkflowEntry(
+  runDir: string,
+  runId: string,
+  entryFor: (mainLarkAppId: string, runId: string) => WorkflowSidebarEntryLink | undefined,
+): WorkflowSidebarEntryLink | undefined {
+  const read = readRunEnvelope(runDir, runId);
+  return read.kind === 'ok' ? v3ProgressWorkflowEntry(read.envelope, entryFor) : undefined;
 }
 
 const MAX_INLINE_IDS = 5;
@@ -98,6 +134,16 @@ export function buildV3ProgressCard(
         return `${escapeMd(loop.loopId)}：第 ${loop.iteration}${budget} 轮${grant}${decision}`;
       }).join('\n'),
     );
+  }
+
+  if (view.revision) {
+    const latest = view.revision.edits > 0
+      ? `第 ${view.revision.current} 版 · 最近修改：${escapeMd(view.revision.lastSummary ?? '')}`
+      : `第 ${view.revision.current} 版`;
+    const pending = view.revision.pending !== undefined
+      ? `\n第 ${view.revision.pending} 版待发起人确认，涉及的节点暂停派发`
+      : '';
+    appendSection(elements, '📝 流程版本', `${latest}${pending}`);
   }
 
   if (view.revisit.count > 0) {
@@ -180,17 +226,19 @@ export function buildV3ProgressCard(
   elements.push({
     tag: 'action',
     actions: [
-      {
-        tag: 'button',
-        text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
-        type: 'default',
-        multi_url: {
-          url: webDetailUrl,
-          pc_url: webDetailUrl,
-          android_url: webDetailUrl,
-          ios_url: webDetailUrl,
-        },
-      },
+      options.workflowEntry
+        ? buildWorkflowSidebarEntryV1Button(options.workflowEntry)
+        : {
+            tag: 'button',
+            text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
+            type: 'default',
+            multi_url: {
+              url: webDetailUrl,
+              pc_url: webDetailUrl,
+              android_url: webDetailUrl,
+              ios_url: webDetailUrl,
+            },
+          },
     ],
   });
 

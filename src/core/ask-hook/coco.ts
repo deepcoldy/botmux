@@ -23,7 +23,10 @@ import type { HookAskAdapter, ParsedAsk } from './types.js';
 const cocoAdapter: HookAskAdapter = {
   // payload 形状与 Claude 一致，直接复用其解析（不依赖 this）。
   parseQuestions(payload: unknown): ParsedAsk | null {
-    return claude.parseQuestions(payload);
+    const parsed = claude.parseQuestions(payload);
+    // PTY picker can only inject one global comment, not mixed per-question text.
+    if (parsed) parsed.questions = parsed.questions.map(q => ({ ...q, allowCustom: false }));
+    return parsed;
   },
 
   // CoCo 不能用 directive 代答 → 永远 passthrough（空 stdout）。答案由 daemon

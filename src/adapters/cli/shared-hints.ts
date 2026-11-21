@@ -6,7 +6,7 @@
  * push `buildBotmuxSystemPromptText` via that flag instead:
  *   - Claude Code / genius: `--append-system-prompt`
  *   - Grok: `--rules` (docs: Claude's append alias)
- * This constant is only for CLIs without such a flag (coco / codex / gemini /
+ * This constant is only for CLIs without such a flag (coco / codex /
  * opencode / aiden / mtr / hermes / …).
  *
  * Each array element becomes one line inside the `<botmux_routing>` XML block
@@ -15,11 +15,12 @@
 import { t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 import { isWorkflowFeatureEnabled } from '../../global-config.js';
+import { workflowSessionKind, workflowSessionPolicy, type WorkflowSessionKind } from '../../workflows/session-kind.js';
 import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
-import { triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
+import { larkUserNative, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import { larkToolPrompt } from '../../core/lark-tool-binding.js';
 import type { CliId } from './types.js';
 
@@ -49,9 +50,13 @@ function workflowDiscoveryHintText(locale?: Locale): string {
 
 /** Keep Workflow discoverable even when the full skill catalog is not injected.
  *  Gated by the machine-wide workflow switch (isWorkflowFeatureEnabled) so a
- *  disabled host never advertises `/workflow`; returns undefined when off. */
-function workflowDiscoveryHint(locale?: Locale): string | undefined {
+ *  disabled host never advertises `/workflow`; returns undefined when off.
+ *  A session executing a workflow node (either kind, workflows/session-kind.ts)
+ *  must not be told to offer starting one, so it never gets it. In-worker
+ *  callers read the kind from env; daemon-side builders pass the session's. */
+function workflowDiscoveryHint(locale?: Locale, opts: { sessionKind?: WorkflowSessionKind } = {}): string | undefined {
   if (!isWorkflowFeatureEnabled()) return undefined;
+  if (!workflowSessionPolicy(opts.sessionKind ?? workflowSessionKind()).discoveryHint) return undefined;
   return workflowDiscoveryHintText(locale);
 }
 
@@ -64,6 +69,17 @@ function workflowDiscoveryHint(locale?: Locale): string | undefined {
  *  Migrated to i18n key `ai.routing.feedback_response_kind` for customization. */
 function feedbackResponseKindHint(locale?: Locale): string {
   return t('ai.routing.feedback_response_kind', undefined, locale);
+}
+
+/** Per-turn Lark presentation rules, shared by inline and hook envelopes. Every
+ *  follow-up carries these, so the local-address rule is one sentence here; the
+ *  full rule rides once in the system prompt or opening routing hints. Both
+ *  appear only for a bot that hides local addresses (BotConfig.hideLocalAddresses). */
+export function feishuReplyPresentationGuidance(locale?: Locale, hideLocalAddresses = false): string {
+  return [
+    t('ai.followup.feishu_safe_emphasis', undefined, locale),
+    ...(hideLocalAddresses ? [t('ai.followup.no_local_addresses', undefined, locale)] : []),
+  ].join('\n');
 }
 
 /** Multiline/JSON-escaping rule plus a real, copy-pasteable quoted-heredoc
@@ -99,6 +115,17 @@ function cursorBackgroundTaskNote(cliId: CliId | undefined, transcript: boolean,
   return [t(transcript ? 'ai.cursor.background_task_note_transcript' : 'ai.cursor.background_task_note', undefined, locale)];
 }
 
+/** Claude Code-only, transcript delivery only: a background-task wake turn's
+ *  final is forwarded to Lark there (send mode leaves it to `botmux send`), so
+ *  the model needs to know to stay silent on routine task events. Claude Code
+ *  is an injectsSessionContext adapter — session-manager never gives it shell
+ *  hints — so this rides {@link buildBotmuxSystemPromptText}'s transcript
+ *  branch (its `--append-system-prompt`). Returns [] for every other CLI. */
+function claudeBackgroundTaskNote(cliId: CliId | undefined, locale?: Locale): string[] {
+  if (cliId !== 'claude-code') return [];
+  return [t('ai.claude.background_task_note_transcript', undefined, locale)];
+}
+
 /** ZCode-only interim-report line. ZCode emits nothing of its own mid-turn, so
  *  a long task is indistinguishable from a hang unless the model says
  *  something. The equivalent line used to live in the adapter's `systemHints`
@@ -111,11 +138,23 @@ function zcodeProgressReportNote(cliId: CliId | undefined, locale?: Locale): str
   return [t('ai.zcode.progress_report', undefined, locale)];
 }
 
+/** Whether a transcript-delivery prompt may teach `botmux send` for the cases
+ *  the final reply cannot carry (cross-bot @ / hand-back, attachments, other
+ *  chats). False only for doubao: its tool commands run in the account-wide
+ *  resident `doubao --type=service` process, whose environment and process tree
+ *  come from whichever terminal started it first, so a model-run `botmux send`
+ *  can be attributed to another session or bot (#2828). Its transcript prompt
+ *  therefore keeps the original no-send wording. */
+export function transcriptPromptTeachesSend(cliId: string | undefined): boolean {
+  return cliId !== 'doubao';
+}
+
 export function buildBotmuxShellHints(
   locale?: Locale,
   noTransport?: boolean,
   replyDelivery?: ReplyDelivery,
   cliId?: CliId,
+  opts: { sessionKind?: WorkflowSessionKind; hideLocalAddresses?: boolean } = {},
 ): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
@@ -129,15 +168,27 @@ export function buildBotmuxShellHints(
     return [hiddenContextDefense(locale)].map(escapeXmlTagLikeTokens);
   }
   // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
-  // 转发，提示里彻底不提 `botmux send`——只留 intro / helpers / when_to_send 的改口
-  // 版、workflow 与防注入；围绕 send 的 commands_are_shell / how_to_send / heredoc /
-  // mention_gate / feedback / 反重发提示全部不注入（附件、跨 bot @ 等场景模型可经
-  // 内置 botmux-send skill 自行发现）。缺省 / 'send' 时下面每一行与改动前逐字相同。
+  // 转发——intro / when_to_send 换成改口版，send_scope 把 `botmux send` 限定在最终
+  // 回复带不了的事（@ 别的 bot 协作 / 回报、附件或卡片、跨群或话题、本轮说明明确
+  // 要求 send 的回合），并劝阻进度播报与重复发送；commands_are_shell、heredoc 与
+  // 附件行照旧（这些场景仍要正确地 send）。how_to_send / mention_gate / feedback /
+  // 反重发这几段 send 模式专属的长段不注入。'send' 时下面每一行与改动前逐字相同。
+  // doubao 例外（transcriptPromptTeachesSend）：只留 intro / helpers / when_to_send
+  // 改口版，与改动前逐字相同，不把 send 教给归属不可靠的常驻进程。
   const transcript = replyDelivery === 'transcript';
-  const workflowHint = workflowDiscoveryHint(locale);
+  const teachSend = transcriptPromptTeachesSend(cliId);
+  const workflowHint = workflowDiscoveryHint(locale, opts);
   const hints = (transcript
     ? [
       t('ai.shell.intro_transcript', undefined, locale),
+      ...(teachSend
+        ? [
+          t('ai.shell.commands_are_shell', undefined, locale),
+          t('ai.shell.send_scope_transcript', undefined, locale),
+          ...multilineHeredocLines(locale),
+          t('ai.routing.usage_attachments', undefined, locale),
+        ]
+        : []),
       t('ai.shell.helpers', undefined, locale),
       t('ai.shell.when_to_send_transcript', undefined, locale),
       // XPI 身份提示与投递方式无关（谁在说话 ≠ 回复怎么送），两个分支都要。
@@ -177,6 +228,7 @@ export function buildBotmuxShellHints(
       locale,
     )));
   }
+  if (opts.hideLocalAddresses) hints.push(escapeXmlTagLikeTokens(t('ai.routing.no_local_addresses', undefined, locale)));
   return hints;
 }
 
@@ -224,32 +276,51 @@ export const BOTMUX_SHELL_HINTS: string[] = [
  * because the likeliest path to that happening is an agent grepping the data
  * directory to debug an auth failure — which a clear instruction does prevent —
  * and it does NOT survive a determined user or a prompt injection.
+ *
+ * Authorization itself is not taught here: a refused command's own output
+ * says what happened, and botmux sends any link to the person directly.
+ * `larkAuthFlow` is the exception, for a lark-cli session without the managed
+ * binding: it gets no `<botmux_lark_tool>`, so nothing else tells it to add
+ * Feishu scopes through `botmux auth request --scope` instead of the
+ * `lark-cli auth login --scope` that lark-cli's own hints suggest, which
+ * prints a device link to the agent.
  */
-export function buildCredentialBoundaryBlock(policy: TriggerUserAuthConfig | undefined, locale?: Locale): string {
-  if (!policy?.enabled || policy.tools.length === 0) return '';
-  const lark = triggerUserAuthApplies(policy, 'lark-cli');
-  const bytedcli = triggerUserAuthApplies(policy, 'bytedcli');
-  const line = (key: string, params?: Record<string, string>): string => `  ${escapeXmlTagLikeTokens(t(key, params, locale))}`;
-  return [
-    '<botmux_credentials>',
-    line('ai.credentials.acting_identity', { tools: policy.tools.join(' / ') }),
-    ...(bytedcli && policy.gitHost ? [line('ai.credentials.git_identity', { host: policy.gitHost })] : []),
-    line('ai.credentials.never_read_others'),
-    line('ai.credentials.never_forward'),
-    ...(lark ? [line('ai.credentials.on_auth_failure')] : []),
-    ...(bytedcli ? [line('ai.credentials.on_bytedcli_auth_failure')] : []),
-    line('ai.credentials.on_auth_link'),
-    ...(lark ? [line('ai.credentials.on_missing_scope')] : []),
-    '</botmux_credentials>',
-  ].join('\n');
+function turnSpeakersLines(speakers: ReadonlyArray<{ openId: string; name?: string }> | undefined, locale?: Locale): string[] {
+  return speakers && speakers.length > 1
+    ? [`  ${escapeXmlTagLikeTokens(t('ai.credentials.turn_speakers', {
+      speakers: speakers.map(s => s.name ? `${s.name} (${s.openId})` : s.openId).join(', '),
+    }, locale))}`]
+    : [];
 }
 
-function buildCredentialSafetyBlock(locale?: Locale): string {
-  const line = (key: string): string => `  ${escapeXmlTagLikeTokens(t(key, undefined, locale))}`;
+/** The credentials block of a follow-up message: only what changed for this turn, its speakers. */
+export function buildTurnSpeakersBlock(
+  speakers: ReadonlyArray<{ openId: string; name?: string }> | undefined, locale?: Locale,
+): string {
+  const lines = turnSpeakersLines(speakers, locale);
+  return lines.length ? ['<botmux_credentials>', ...lines, '</botmux_credentials>'].join('\n') : '';
+}
+
+export function buildCredentialBoundaryBlock(
+  policy: TriggerUserAuthConfig | undefined,
+  locale?: Locale,
+  larkAuthFlow = false,
+  /** The people who spoke in the running turn; listed only when there are several. */
+  speakers?: ReadonlyArray<{ openId: string; name?: string }>,
+): string {
+  if (!policy?.enabled || policy.tools.length === 0) return '';
+  const line = (key: string, vars?: Record<string, string>): string => `  ${escapeXmlTagLikeTokens(t(key, vars, locale))}`;
+  const lark = larkAuthFlow && triggerUserAuthApplies(policy, 'lark-cli');
   return [
     '<botmux_credentials>',
     line('ai.credentials.never_read_others'),
     line('ai.credentials.never_forward'),
+    ...turnSpeakersLines(speakers, locale),
+    ...(lark ? [
+      line('ai.credentials.on_auth_failure'),
+      line('ai.credentials.on_auth_link'),
+      line('ai.credentials.on_missing_scope'),
+    ] : []),
     '</botmux_credentials>',
   ].join('\n');
 }
@@ -260,23 +331,22 @@ function buildCredentialSafetyBlock(locale?: Locale): string {
  * trigger-user wrapper: it defaults to the receiving bot and switches to the
  * current user only with an explicit `--as user`. Keep that statement beside
  * the credential block so both system-prompt and inline-prompt paths use the
- * same wording and the same filtered legacy policy. */
+ * same wording. */
 export function buildManagedLarkToolPromptBlocks(
   policy: TriggerUserAuthConfig | undefined,
   larkToolAppId: string | undefined,
   locale?: Locale,
+  /** Only takes effect with larkToolAppId set; the only transport-less
+   *  sessions that get a managed binding are verified headless sessions. */
+  headlessNoUserChannel = false,
+  /** The people of the running turn, when it has several. */
+  speakers?: ReadonlyArray<{ openId: string; name?: string }>,
 ): string {
-  const effectivePolicy = larkToolAppId && policy
-    ? { ...policy, tools: policy.tools.filter(tool => tool !== 'lark-cli') }
-    : policy;
-  const credentialBoundary = buildCredentialBoundaryBlock(effectivePolicy, locale)
-    || (larkToolAppId && policy?.enabled && policy.tools.includes('lark-cli')
-      ? buildCredentialSafetyBlock(locale)
-      : '');
+  const credentialBoundary = buildCredentialBoundaryBlock(policy, locale, !larkToolAppId, speakers);
   const larkToolBoundary = larkToolAppId
     ? [
       '<botmux_lark_tool>',
-      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale))}`,
+      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale, headlessNoUserChannel, larkUserNative(policy)))}`,
       '</botmux_lark_tool>',
     ].join('\n')
     : '';
@@ -317,20 +387,34 @@ export function buildBotmuxSystemPromptText(opts: {
   larkToolAppId?: string;
   /** Per-bot replyDelivery frozen for this session (core/reply-delivery.ts).
    *  'transcript': the daemon forwards the final assistant message from the CLI
-   *  transcript, so the routing block never mentions `botmux send` at all —
-   *  only intro_transcript, helpers, the BOTMUX_NOTHING_TO_SEND silence sentinel
-   *  (still the fallback's suppression rule), workflow, hidden-context defense
-   *  and whiteboard survive; usage_send / heredoc / mention gate / attachments /
-   *  feedback / anti-resend are dropped, and <identity> keeps its routing_rules
-   *  minus mention_must (the model can discover the built-in botmux-send skill
-   *  on its own for attachments / cross-bot @). `noTransport` wins over it.
-   *  Omitted/'send' = today. */
+   *  transcript, so the routing block reframes `botmux send` as the channel for
+   *  what the final reply cannot carry — intro_transcript, usage_send_transcript
+   *  (cross-bot @ / hand-back, attachments or cards, other chats/topics, turns
+   *  that explicitly require send), heredoc, attachments, no_progress_send_transcript,
+   *  helpers, the BOTMUX_NOTHING_TO_SEND silence sentinel, XPI, workflow,
+   *  hidden-context defense and whiteboard; the send-mode usage_send / mention
+   *  gate / feedback / anti-resend lines are dropped. <identity> keeps its full
+   *  routing_rules (mention_must included) unless the session is solo.
+   *  `noTransport` wins over it. Omitted/'send' = today. */
   replyDelivery?: ReplyDelivery;
   /** transcript-only: solo chat (owner + this bot). The identity block keeps
    *  name/open_id but drops routing_rules — there is no other bot to route to. */
   solo?: boolean;
+  /** Lead-only chat manager: append the lead-only role block. */
+  leadOnly?: boolean;
+  /** BotConfig.hideLocalAddresses frozen for this session: append the full
+   *  local-address rule to the routing block. Required for the same reason as
+   *  `cliId`: a producer that left it out would silently drop the rule for a
+   *  bot that turned it on. */
+  hideLocalAddresses: boolean | undefined;
+  /** The adapter building this prompt. Required (not optional) so every
+   *  producer states it: CLI-specific lines key off it, and a producer that
+   *  left it out would silently lose them. Today only `claude-code` adds one
+   *  (the transcript-mode background-task note); every other id renders the
+   *  same text as before the field existed. */
+  cliId: CliId | undefined;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, leadOnly, cliId, hideLocalAddresses } = opts;
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
@@ -347,8 +431,9 @@ export function buildBotmuxSystemPromptText(opts: {
   // would leave the same @-rules leaking via identity. Mirrors the session-manager
   // non-injects path (short_routing) which is gated the same way.
   // transcript + solo（只有 owner 和本 bot）同样只留 name/open_id：多 bot 归属规则
-  // 在 solo 会话里没有对象。transcript 非 solo 保留归属四条，但去掉 mention_must
-  // ——它整句围绕 `botmux send --mention`，transcript 模式的提示不再提 send。
+  // 在 solo 会话里没有对象。transcript 非 solo 保留全部归属规则，含 mention_must：
+  // transcript 的最终回复卡不会 @ 触发本轮的 bot，跟别的 bot 协作 / 回报仍只能靠
+  // `botmux send --mention`。
   const identityBlock =
     botName || botOpenId
       ? [
@@ -364,7 +449,7 @@ export function buildBotmuxSystemPromptText(opts: {
             `    ${prose('ai.identity.rule_own_part')}`,
             `    ${prose('ai.identity.rule_silent_when_other')}`,
             `    ${prose('ai.identity.rule_no_proactive_pull')}`,
-            ...(transcript ? [] : [`    ${prose('ai.identity.mention_must')}`]),
+            `    ${prose('ai.identity.mention_must')}`,
             '  </routing_rules>',
           ]),
         '</identity>',
@@ -390,19 +475,30 @@ export function buildBotmuxSystemPromptText(opts: {
   // The identity block's routing_rules carry the same @/collaboration semantics
   // and are gated on the SAME flag — see identityBlock above, which keeps the
   // harmless name/open_id and drops only the rules.
-  // transcript（三分支中优先级低于 noTransport）：提示里彻底不提 `botmux send`——
-  // 只留改口 intro、helpers、usage_silence 的哨兵（仍是转写 fallback 的抑制规则）、
-  // workflow、防注入与白板；usage_send / heredoc / mention_gate / attachments /
-  // feedback_response_kind / no_visible_output_ok 全部不注入。
+  // transcript（三分支中优先级低于 noTransport）：最终答复写在最终回复里，`botmux
+  // send` 只留给最终回复带不了的事——改口 intro、usage_send_transcript（场景清单 +
+  // @ 三选一）、heredoc、附件、no_progress_send_transcript（不发进度、最终答复走
+  // send 时标 final）、helpers、usage_silence 的哨兵（仍是转写 fallback 的抑制规则）、
+  // XPI、workflow、防注入与白板；send 模式的 usage_send / mention_gate /
+  // feedback_response_kind / no_visible_output_ok 不注入。
   const routingInner = noTransport
     ? [hiddenContextDefense(locale)]
     : transcript
     ? [
       prose('ai.routing.intro_transcript'),
       '',
+      prose('ai.routing.usage_send_transcript'),
+      `- ${heredocRule}`,
+      heredocExample,
+      prose('ai.routing.usage_attachments'),
+      prose('ai.routing.no_progress_send_transcript'),
       prose('ai.routing.usage_helpers'),
       prose('ai.routing.ask_wait'),
       prose('ai.routing.usage_silence'),
+      // Follows the sentinel line it relies on (BOTMUX_NOTHING_TO_SEND).
+      ...claudeBackgroundTaskNote(cliId, locale).map(escapeXmlTagLikeTokens),
+      // XPI governs sends to other bots, which transcript sessions still make.
+      ...(xpiAsHintOn() ? [prose('ai.routing.xpi_as_hint')] : []),
       ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
       hiddenContextDefense(locale),
       ...whiteboardRouting,
@@ -429,6 +525,7 @@ export function buildBotmuxSystemPromptText(opts: {
       hiddenContextDefense(locale),
       ...whiteboardRouting,
     ];
+  if (!noTransport && hideLocalAddresses) routingInner.push(prose('ai.routing.no_local_addresses'));
   // Trigger-user auth: this session acts with ONE person's credentials, and the
   // token store on disk holds everyone else's. Nothing in the OS stops a curious
   // agent from reading those files today, so the boundary is stated here.
@@ -437,13 +534,14 @@ export function buildBotmuxSystemPromptText(opts: {
   // determined user or a prompt injection. It exists because the likeliest way
   // these files get read is an agent troubleshooting an auth failure and
   // grepping the data directory, which a clear instruction does prevent.
-  const credentialBoundaryBlock = buildManagedLarkToolPromptBlocks(triggerUserAuth, larkToolAppId, locale);
+  const credentialBoundaryBlock = buildManagedLarkToolPromptBlocks(triggerUserAuth, larkToolAppId, locale, noTransport);
   return [
     '<botmux_routing>',
     ...routingInner,
     '</botmux_routing>',
     ...identityBlock,
     ...(credentialBoundaryBlock ? ['', credentialBoundaryBlock] : []),
+    ...(leadOnly ? ['', '<lead_only_manager>', escapeXmlTagLikeTokens(t('ai.lead_only.rules', undefined, locale)), '</lead_only_manager>'] : []),
     ...(builtinSkillBlock ? ['', builtinSkillBlock] : []),
   ].join('\n');
 }

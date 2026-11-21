@@ -99,6 +99,7 @@ export function enforceFinalLinkIntegrity(input: {
   payload: OutboundLinkRefPayload;
   responseKind?: LinkIntegrityResponseKind;
   registeredUrls: readonly string[] | (() => readonly string[]);
+  registrationLimited?: boolean | (() => boolean);
 }): void {
   if (input.responseKind !== 'final') return;
   const strings = payloadStrings(input.payload);
@@ -109,9 +110,18 @@ export function enforceFinalLinkIntegrity(input: {
     ? input.registeredUrls()
     : input.registeredUrls;
   const endpoints = registeredEndpoints(urls);
-  if (endpoints.length === 0) return;
+  const limited = typeof input.registrationLimited === 'function'
+    ? input.registrationLimited() : input.registrationLimited === true;
+  if (endpoints.length === 0 && !limited) return;
+  const originals = new Set(urls);
   for (const value of strings) {
     for (const candidate of extractHttpUrlSpans(value)) {
+      // An incomplete source ledger cannot prove that a new endpoint is a
+      // legitimate omitted source rather than a changed URL. Keep exact
+      // retained URLs usable, and refuse every other URL with the real cause.
+      if (limited && !originals.has(candidate.originalUrl)) {
+        throw new LinkRefError('link_ref_limit_exceeded');
+      }
       const parsed = new URL(candidate.originalUrl);
       const sameEndpoint = endpoints.filter(endpoint => (
         endpoint.origin === parsed.origin && endpoint.pathname === parsed.pathname

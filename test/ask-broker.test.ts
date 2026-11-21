@@ -19,6 +19,7 @@ import {
   registerHostAsk,
   setCardDispatcher,
   setCanTalkChecker,
+  setExplicitAskSessionChecker,
   submitAsk,
   submitAskFromDesktop,
   submitCustomReply,
@@ -92,6 +93,67 @@ afterEach(() => {
 });
 
 describe('registerAsk happy path', () => {
+  it.each([0, 1])('rejects a click %i ms after the deadline before its timer runs', async offset => {
+    const dispatcher = mockDispatcher();
+    setCardDispatcher(dispatcher);
+    const waiting = registerAsk(makeInput());
+    await Promise.resolve();
+    const card = dispatcher.sendCalls[0]!;
+    vi.setSystemTime(card.deadlineAt + offset);
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'yes', by: 'ou_owner' }))
+      .toBe('already_settled');
+    await expect(waiting).resolves.toMatchObject({ kind: 'timedOut', by: null, timedOut: true });
+    await vi.runAllTimersAsync();
+    expect(dispatcher.settleCalls).toHaveLength(1);
+  });
+
+  it('rejects an answer immediately after a no-deadline session closes, before the recovery sweep', async () => {
+    const dispatcher = mockDispatcher();
+    setCardDispatcher(dispatcher);
+    let live = true;
+    setExplicitAskSessionChecker(() => live);
+    const waiting = registerHostAsk(makeInput({ originKind: 'host_explicit', requestId: 'closed', timeoutMs: 0 }));
+    const card = dispatcher.sendCalls[0]!;
+    live = false;
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'yes', by: 'ou_owner' })).toBe('already_settled');
+    await expect(waiting).resolves.toMatchObject({ kind: 'invalidated' });
+  });
+
+  it('keeps a managed explicit Ask pending without timers until an authorized winner or manual revocation', async () => {
+    const dispatcher = mockDispatcher();
+    setCardDispatcher(dispatcher);
+    const input = makeInput({ originKind: 'host_explicit', requestId: 'indefinite', timeoutMs: 0,
+      answererOpenId: 'ou_owner' });
+    const waiting = registerHostAsk(input);
+    await Promise.resolve();
+    const card = dispatcher.sendCalls[0]!;
+    expect(_getPending(card.askId)?.deadlineAt).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(30 * 24 * 3600_000);
+    expect(_pendingCount()).toBe(1);
+    await expect(registerHostAsk({ ...input, timeoutMs: 5000 })).resolves.toMatchObject({ kind: 'invalidated' });
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'yes', by: 'ou_a' })).toBe('unauthorized');
+    expect(tryResolveAsk({ askId: card.askId, nonce: 'old-nonce', selected: 'yes', by: 'ou_owner' })).toBe('stale');
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'yes', by: 'ou_owner' })).toBe('accepted');
+    expect(tryResolveAsk({ askId: card.askId, nonce: card.nonce, selected: 'no', by: 'ou_owner' })).toBe('already_settled');
+    await expect(waiting).resolves.toMatchObject({ kind: 'answered', answers: [['yes']], by: 'ou_owner' });
+    const revoked = registerHostAsk({ ...input, requestId: 'revoked' });
+    await vi.advanceTimersByTimeAsync(30 * 24 * 3600_000);
+    expect(invalidateAll('manually revoked')).toBe(1);
+    await expect(revoked).resolves.toMatchObject({ kind: 'invalidated', reason: 'manually revoked' });
+  });
+
+  it.each(['hook', 'explicit', 'host_cross_principal_classification', 'host_explicit'])
+  ('rejects unmanaged zero timeout from %s before creating a card', async originKind => {
+    const dispatcher = mockDispatcher();
+    setCardDispatcher(dispatcher);
+    const input = makeInput({ originKind, requestId: 'unmanaged', timeoutMs: 0 });
+    expect(() => originKind.startsWith('host_')
+      ? registerHostAsk({ ...input, requestId: originKind === 'host_explicit' ? undefined : input.requestId })
+      : registerAsk(input)).toThrow();
+    expect(dispatcher.sendCalls).toHaveLength(0);
+  });
+
   it('register → tryResolveAsk("yes") resolves with kind:answered', async () => {
     const d = mockDispatcher();
     setCardDispatcher(d);

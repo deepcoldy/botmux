@@ -80,18 +80,26 @@ describe('cursor plan B worker wiring (on #2009)', () => {
   // 不支持转写 → 冻结值降级 send + warn」必须存在，否则 BOTMUX_SANDBOX=scratch
   // 机器开关下 cursor 会系统提示改口不 send 而采集关闭 = 整轮静默。
   it('spawnCli re-validates the frozen replyDelivery=transcript against the resolved sandbox mode and degrades to send', () => {
-    const start = source.indexOf('function spawnCli');
+    // 按函数边界切（到下一个顶层 function 止），不用定长窗口：spawnCliBody 前段
+    // 随功能增长，定长窗口会把 gate 块挤出切片。
+    const start = source.indexOf('async function spawnCliBody(');
     expect(start).toBeGreaterThanOrEqual(0);
-    const spawnBody = source.slice(start, start + 60000);
+    const nextTopLevel = source.slice(start + 1).search(/\n(?:export )?(?:async )?function /);
+    expect(nextTopLevel).toBeGreaterThan(0);
+    const spawnBody = source.slice(start, start + 1 + nextTopLevel);
     const anchor = 'lastResolvedSandboxMode = sandboxMode;';
     const predicate = 'supportsTranscriptReplyDeliveryForBot(cfg.cliId, { sandbox: sandboxMode })';
+    const anchorAt = spawnBody.indexOf(anchor);
+    expect(anchorAt).toBeGreaterThanOrEqual(0);
     const predAt = spawnBody.indexOf(predicate);
-    expect(predAt).toBeGreaterThan(spawnBody.indexOf(anchor));
+    expect(predAt).toBeGreaterThan(anchorAt);
     // 切片从 if 条件行起（predicate 在跨行 && 的第二行），到其后的 scratch 平台
     // throw 止：只切 gate 块本身，避免命中 spawnCli 别处的同名字符串。
     const gateStart = spawnBody.lastIndexOf("if (cfg.replyDelivery === 'transcript'", predAt);
     expect(gateStart).toBeGreaterThanOrEqual(0);
-    const gate = spawnBody.slice(gateStart, spawnBody.indexOf('scratchRequested && process.platform', predAt));
+    const gateEnd = spawnBody.indexOf('scratchRequested && process.platform', predAt);
+    expect(gateEnd).toBeGreaterThan(predAt);
+    const gate = spawnBody.slice(gateStart, gateEnd);
     expect(gate).toContain("cfg.replyDelivery = 'send';");
     expect(gate).toContain('warnedTranscriptDeliveryDegraded');
     // 降级必须带 transcript 前提，不能误伤 send。

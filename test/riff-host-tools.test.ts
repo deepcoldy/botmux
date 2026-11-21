@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, truncateSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,8 +11,11 @@ import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-card.js';
 import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE, executeRiffHostTool, parseRiffHostRequest,
+  RIFF_HOST_MAX_ATTACHMENT_BYTES, RIFF_HOST_MAX_BYTES,
   type RiffHostContext, type RiffHostBinding } from '../src/services/riff-host-tools.js';
-import { callRiffHostTool, installRiffHostBinding, prepareRiffHostRequest, maybeRunRiffHostTool, restoreRiffHostAttachments } from '../src/cli/riff-host-tools.js';
+import { quotedAttachments, QuotedAttachmentLimitError } from '../src/services/remote-runner-session-tool.js';
+import { callRiffHostTool, installRiffHostBinding, prepareRiffHostRequest, maybeRunRiffHostTool, restoreRiffHostAttachments,
+  type RiffHostHttpResponse } from '../src/cli/riff-host-tools.js';
 import { assertCardPatchChat } from '../src/cli/card-dispatch.js';
 
 const roots: string[] = [], servers: Server[] = [];
@@ -180,7 +183,8 @@ describe('Riff host boundary', () => {
   }, 30_000);
 
   it.each([
-    ['send', '--session-id', 'other', 'body'], ['send', '--chat-id=oc_other', 'body'],
+    ['send', '--session-id', 'other', 'body'], ['send', '--into=om_other', 'body'],
+    ['chat', 'create', '--bot', 'other'], ['chat', 'members', '--lark-app-id', 'other'],
     ['schedule', 'add', 'every 1h', 'prompt', '--lark-app-id', 'other'],
     ['send', '--content-file', '/etc/passwd'], ['card', 'patch', '--card-file=/etc/passwd'],
     ['restart'], ['plugin', 'install', 'anything'], ['board', 'attach', '1', '/etc/passwd'],
@@ -369,6 +373,224 @@ describe('Riff host boundary', () => {
     expect(readFileSync(parsed.attachments[0].path, 'utf8')).toBe('quoted bytes');
   });
 
+  function quotedFixture(sizes: number[]): { ctx: RiffHostContext; stdout: string; paths: string[] } {
+    const dataDir = root(), attachmentDir = join(dataDir, 'attachments');
+    mkdirSync(attachmentDir);
+    const paths = sizes.map((size, index) => {
+      const path = join(attachmentDir, `image-${index}.png`);
+      writeFileSync(path, '');
+      truncateSync(path, size);
+      return path;
+    });
+    const stdout = JSON.stringify({ attachments: paths.map((path, index) => ({
+      path, name: `image-${index}.png`, type: 'image',
+    })) });
+    const fixture = join(dataDir, 'quoted.mjs');
+    writeFileSync(fixture, `process.stdout.write(${JSON.stringify(stdout)});`);
+    return { ctx: context(dataDir, { cliPath: fixture }), stdout, paths };
+  }
+
+  it('transfers a multi-megabyte image through Riff while retaining the Remote Runner limit', async () => {
+    const { ctx, stdout, paths } = quotedFixture([3_644_784]);
+    writeFileSync(paths[0]!, Buffer.alloc(3_644_784, 0xa5));
+    expect(() => quotedAttachments(stdout, { SESSION_DATA_DIR: ctx.dataDir }))
+      .toThrow(QuotedAttachmentLimitError);
+    const gateway = new RiffHostTools();
+    const binding = gateway.bind(await listen(gateway), ctx);
+    const result = await callRiffHostTool(binding, request(['quoted', 'om_image']));
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(RIFF_HOST_MAX_BYTES);
+    expect(result.stdout).not.toContain(ctx.dataDir);
+    const restored = JSON.parse(restoreRiffHostAttachments(result).stdout);
+    roots.push(join(restored.attachments[0].path, '..'));
+    expect(readFileSync(restored.attachments[0].path)).toEqual(readFileSync(paths[0]!));
+  });
+
+  it.each(['single', 'aggregate'])('accepts the exact %s byte limit within the HTTP response budget', async mode => {
+    const sizes = mode === 'single' ? [RIFF_HOST_MAX_ATTACHMENT_BYTES]
+      : [RIFF_HOST_MAX_ATTACHMENT_BYTES / 2, RIFF_HOST_MAX_ATTACHMENT_BYTES / 2];
+    const { ctx } = quotedFixture(sizes);
+    const gateway = new RiffHostTools();
+    const binding = gateway.bind(await listen(gateway), ctx);
+    const result = await callRiffHostTool(binding, request(['quoted', 'om_boundary']));
+    expect(result.exitCode, result.stderr).toBe(0);
+    expect(result.attachments?.map(item => Buffer.from(item.dataBase64, 'base64').length)).toEqual(sizes);
+    expect(Buffer.byteLength(JSON.stringify({ state: 'completed', result }))).toBeLessThan(RIFF_HOST_MAX_BYTES);
+    expect(result.stdout).not.toContain(ctx.dataDir);
+  }, 30_000);
+
+  it.each(['single', 'aggregate'])('reports byte counts for %s attachment overflow', async mode => {
+    const sizes = mode === 'single' ? [RIFF_HOST_MAX_ATTACHMENT_BYTES + 1]
+      : [RIFF_HOST_MAX_ATTACHMENT_BYTES / 2, RIFF_HOST_MAX_ATTACHMENT_BYTES / 2 + 1];
+    const { ctx } = quotedFixture(sizes);
+    const result = await executeRiffHostTool(request(['quoted', 'om_large']), ctx);
+    expect(result).toMatchObject({ exitCode: 1, stdout: '' });
+    expect(result.attachments).toBeUndefined();
+    expect(result.stderr).toContain('riff_host_attachment_too_large');
+    expect(result.stderr).toContain(`${sizes.reduce((sum, size) => sum + size, 0)} bytes`);
+    expect(result.stderr).toContain(`${RIFF_HOST_MAX_ATTACHMENT_BYTES} bytes`);
+    expect(result.stderr).not.toContain(ctx.dataDir);
+  });
+
+  it('reports missing attachment files without exposing host paths', async () => {
+    const { ctx, paths } = quotedFixture([1]);
+    rmSync(paths[0]!);
+    const result = await executeRiffHostTool(request(['quoted', 'om_missing']), ctx);
+    expect(result).toMatchObject({ exitCode: 1, stdout: '', stderr: 'riff_host_attachment_read_failed: ENOENT' });
+    expect(result.attachments).toBeUndefined();
+  });
+
+  it.each(['file-symlink', 'root-symlink', 'outside-root', 'directory'])('retains attachment path validation for %s', async mode => {
+    const { ctx, paths } = quotedFixture([1]);
+    const outside = join(root(), 'outside.png');
+    writeFileSync(outside, 'private-host-content');
+    if (mode === 'root-symlink') {
+      const attachmentRoot = join(ctx.dataDir, 'attachments');
+      const movedRoot = join(ctx.dataDir, 'moved-attachments');
+      renameSync(attachmentRoot, movedRoot);
+      symlinkSync(movedRoot, attachmentRoot, 'junction');
+    } else if (mode === 'outside-root') {
+      writeFileSync(join(ctx.dataDir, 'quoted.mjs'), `process.stdout.write(${JSON.stringify(JSON.stringify({
+        attachments: [{ path: outside, name: 'outside.png', type: 'image' }],
+      }))});`);
+    } else {
+      rmSync(paths[0]!);
+      if (mode === 'file-symlink') symlinkSync(outside, paths[0]!);
+      else mkdirSync(paths[0]!);
+    }
+    const result = await executeRiffHostTool(request(['quoted', 'om_unsafe']), ctx);
+    expect(result).toEqual({ exitCode: 1, stdout: '', stderr: 'riff_host_attachment_invalid' });
+    expect(JSON.stringify(result)).not.toContain(outside);
+    expect(JSON.stringify(result)).not.toContain('private-host-content');
+  });
+
+  it('keeps attachment count limits independent of the larger byte budget', async () => {
+    const { ctx } = quotedFixture(Array(9).fill(1));
+    expect(await executeRiffHostTool(request(['quoted', 'om_many']), ctx)).toEqual({ exitCode: 1, stdout: '',
+      stderr: 'riff_host_attachment_too_many: 9 > 8; request fewer message ids or add --no-download' });
+  });
+
+  it.each(['plain text', '{broken json', '{"content":"no images"}', '{"attachments":[]}'])('preserves quoted output without attachments: %s', async stdout => {
+    const { ctx } = quotedFixture([]);
+    writeFileSync(join(ctx.dataDir, 'quoted.mjs'), `process.stdout.write(${JSON.stringify(stdout)});`);
+    expect(await executeRiffHostTool(request(['quoted', 'om_text']), ctx))
+      .toEqual({ exitCode: 0, stdout, stderr: '' });
+  });
+
+  it('admits evidence-retrieval history filters and quoted --no-download while refusing unknown flags', () => {
+    expect(() => parseRiffHostRequest(request([
+      'history', '--view', 'index', '--query', 'queue', '--type', 'text,interactive',
+      '--since', '2026-11-14T00:00:00+08:00', '--until', '2026-11-15T00:00:00+08:00', '--limit', '50',
+    ]))).not.toThrow();
+    expect(() => parseRiffHostRequest(request(['quoted', 'om_one', 'om_two', '--no-download', '--raw']))).not.toThrow();
+    expect(() => parseRiffHostRequest(request(['history', '--bogus']))).toThrow('riff_host_flag_unsupported');
+    expect(() => parseRiffHostRequest(request(['quoted', 'om_one', '--bogus']))).toThrow('riff_host_flag_unsupported');
+  });
+
+  it('packs nested attachments from batch quoted envelopes and keeps host paths out of stdout', () => {
+    const dataDir = root();
+    const attachmentDir = join(dataDir, 'attachments');
+    mkdirSync(attachmentDir);
+    const first = join(attachmentDir, 'a.txt');
+    const second = join(attachmentDir, 'b.png');
+    writeFileSync(first, 'alpha');
+    writeFileSync(second, 'beta');
+    const stdout = JSON.stringify({
+      sessionId: 'session-1',
+      messages: [
+        { messageId: 'om_one', attachments: [{ path: first, name: 'a.txt', type: 'file' }] },
+        { messageId: 'om_two', attachments: [{ path: second, name: 'b.png', type: 'image' }] },
+      ],
+      errors: [], requestedCount: 2, total: 2, incomplete: false,
+    });
+    const packaged = quotedAttachments(stdout, { SESSION_DATA_DIR: dataDir });
+    expect(packaged.attachments).toHaveLength(2);
+    expect(packaged.attachments?.map(item => item.placeholder)).toEqual([
+      'botmux-session-tool://attachment/0',
+      'botmux-session-tool://attachment/1',
+    ]);
+    const rewritten = JSON.parse(packaged.stdout);
+    expect(rewritten.messages[0].attachments[0].path).toBe(packaged.attachments![0]!.placeholder);
+    expect(rewritten.messages[1].attachments[0].path).toBe(packaged.attachments![1]!.placeholder);
+    expect(packaged.stdout).not.toContain(dataDir);
+  });
+
+  it('rejects batch attachments outside the attachment root and caps the count across messages', () => {
+    const dataDir = root();
+    const attachmentDir = join(dataDir, 'attachments');
+    mkdirSync(attachmentDir);
+    const outside = join(dataDir, 'secret.txt');
+    writeFileSync(outside, 'no');
+    const escapeStdout = JSON.stringify({
+      messages: [{ messageId: 'om_one', attachments: [{ path: outside, name: 'secret.txt', type: 'file' }] }],
+    });
+    expect(() => quotedAttachments(escapeStdout, { SESSION_DATA_DIR: dataDir }))
+      .toThrow('escaped the BotMux attachment root');
+
+    const items = Array.from({ length: 9 }, (_, index) => {
+      const path = join(attachmentDir, `f-${index}.txt`);
+      writeFileSync(path, 'x');
+      return { path, name: `f-${index}.txt`, type: 'file' as const };
+    });
+    const overCapStdout = JSON.stringify({
+      messages: [
+        { messageId: 'om_one', attachments: items.slice(0, 4) },
+        { messageId: 'om_two', attachments: items.slice(4) },
+      ],
+    });
+    expect(() => quotedAttachments(overCapStdout, { SESSION_DATA_DIR: dataDir }))
+      .toThrow('more than 8 attachments');
+  });
+
+  function batchQuotedFixture(exitCode: number) {
+    const dataDir = root(), attachmentDir = join(dataDir, 'attachments', 'cli_app', 'om_one');
+    mkdirSync(attachmentDir, { recursive: true });
+    const hostPath = join(attachmentDir, 'chart.png');
+    writeFileSync(hostPath, 'chart bytes');
+    // Same envelope cmdQuoted prints for several ids: per-id errors exit 1.
+    const stdout = JSON.stringify({
+      sessionId: 'session-1',
+      messages: [{ messageId: 'om_one', attachments: [{ path: hostPath, name: 'chart.png', type: 'image' }] }],
+      errors: exitCode ? [{ messageId: 'om_gone', error: 'not found' }] : [],
+      requestedCount: 2, total: 1, incomplete: exitCode !== 0,
+    });
+    writeFileSync(join(dataDir, 'quoted.mjs'), `process.stdout.write(${JSON.stringify(stdout)}); process.exitCode = ${exitCode};`);
+    return { ctx: context(dataDir, { cliPath: join(dataDir, 'quoted.mjs') }), dataDir };
+  }
+
+  it.each([0, 1])('restores batch quoted attachments into sandbox files end to end (exit %i)', async exitCode => {
+    const { ctx, dataDir } = batchQuotedFixture(exitCode);
+    const gateway = new RiffHostTools();
+    const binding = gateway.bind(await listen(gateway), ctx);
+    const wire = await callRiffHostTool(binding, request(['quoted', 'om_one', 'om_gone']));
+    expect(wire.exitCode).toBe(exitCode);
+    expect(wire.stdout).not.toContain(dataDir);
+    const restored = JSON.parse(restoreRiffHostAttachments(wire).stdout);
+    const path = restored.messages[0].attachments[0].path as string;
+    expect(path).not.toContain('botmux-session-tool://');
+    roots.push(join(path, '..'));
+    expect(readFileSync(path, 'utf8')).toBe('chart bytes');
+    expect(restored.errors).toEqual(exitCode ? [{ messageId: 'om_gone', error: 'not found' }] : []);
+  });
+
+  it('keeps a single quoted failure unpackaged for every non-zero status', async () => {
+    const { ctx, stdout, paths } = quotedFixture([1]);
+    rmSync(paths[0]!);
+    writeFileSync(join(ctx.dataDir, 'quoted.mjs'), `process.stdout.write(${JSON.stringify(stdout)});
+      process.stderr.write('quoted resource unavailable'); process.exitCode = 1;`);
+    expect(await executeRiffHostTool(request(['quoted', 'om_failed']), ctx))
+      .toEqual({ exitCode: 1, stdout, stderr: 'quoted resource unavailable' });
+  });
+
+  it('preserves a failed quoted command instead of replacing its error with packaging failure', async () => {
+    const { ctx, stdout, paths } = quotedFixture([1]);
+    rmSync(paths[0]!);
+    writeFileSync(join(ctx.dataDir, 'quoted.mjs'), `process.stdout.write(${JSON.stringify(stdout)});
+      process.stderr.write('quoted resource unavailable'); process.exitCode = 2;`);
+    expect(await executeRiffHostTool(request(['quoted', 'om_failed']), ctx))
+      .toEqual({ exitCode: 2, stdout, stderr: 'quoted resource unavailable' });
+  });
+
   it('refuses a damaged operation receipt without executing again', async () => {
     const execute = vi.fn(async () => ({ exitCode: 0, stdout: 'ok', stderr: '' }));
     const gateway = new RiffHostTools(execute), ctx = context();
@@ -386,7 +608,7 @@ describe('Riff host boundary', () => {
     expect(await maybeRunRiffHostTool(['project', 'status'], async () => '', {})).toBe(false);
     await expect(maybeRunRiffHostTool(['project', 'status'], async () => '', {
       BOTMUX_SESSION_ID: 'session-1', BOTMUX_RIFF_HOST_TOOLS: '1', SESSION_DATA_DIR: root(),
-    })).rejects.toThrow();
+    })).rejects.toThrow(/^riff_host_binding_missing: run this turn's <botmux_host_tools> bootstrap/);
   });
 
   it('does not activate an old binding without this invocation explicitly enabling host tools', async () => {
@@ -405,5 +627,135 @@ describe('Riff host boundary', () => {
     installRiffHostBinding(Buffer.from(JSON.stringify(b)).toString('base64url'), env);
     const dir = join(env.SESSION_DATA_DIR, 'riff-host-bindings');
     expect(JSON.parse(readFileSync(join(dir, readdirSync(dir)[0]!), 'utf8'))).toEqual(b);
+  });
+});
+
+describe('Riff host client failure reporting', () => {
+  const token = 'T'.repeat(43);
+  const binding = (url: string): RiffHostBinding => ({ url, token, sessionId: 'session-1', turnId: 'turn-1' });
+  /** A stand-in for whatever answers at the configured endpoint (gateway or worker).
+   * Only requests carrying this test's token are answered and recorded, so a
+   * stray client hitting a reused loopback port cannot skew the counts. */
+  async function endpoint(answer: (req: { method?: string; url?: string }) => { status: number; body?: string; type?: string }) {
+    const seen: string[] = [], foreign: string[] = [];
+    const s = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        if (req.headers['x-riff-host-token'] !== token) {
+          foreign.push(`${req.method} ${req.url}`);
+          res.writeHead(403); res.end(); return;
+        }
+        seen.push(req.method!);
+        const { status, body, type = 'text/plain' } = answer(req);
+        res.writeHead(status, { 'content-type': type });
+        res.end(body);
+      });
+    });
+    servers.push(s);
+    await new Promise<void>(resolve => s.listen(0, '127.0.0.1', resolve));
+    return { url: `http://127.0.0.1:${(s.address() as { port: number }).port}${RIFF_HOST_TOOLS_ROUTE}`, seen, foreign };
+  }
+  const failure = (promise: Promise<unknown>) => promise.then(() => { throw new Error('expected a failure'); }, (e: Error) => e.message);
+
+  it('reports a plain-text gateway 502 by status and body, with the endpoint configuration to check', async () => {
+    const gateway = await endpoint(() => ({ status: 502, body: 'Bad Gateway' }));
+    const message = await failure(callRiffHostTool(binding(gateway.url), request()));
+    expect(message).toMatch(/^riff_host_http_502: Bad Gateway — /);
+    expect(message).toContain('riff.hostToolsUrl');
+    expect(message).not.toContain('JSON');
+    // An HTTP answer is definitive: no GET reconciliation, the command was not resent.
+    expect(gateway.seen, `foreign: ${gateway.foreign.join(', ')}`).toEqual(['POST']);
+  });
+
+  it.each([502, 204])('reports an empty %i answer instead of a parse error or a crash', async status => {
+    const gateway = await endpoint(() => ({ status }));
+    const message = await failure(callRiffHostTool(binding(gateway.url), request()));
+    const head = status === 502 ? 'riff_host_http_502' : 'riff_host_response_invalid (HTTP 204)';
+    expect(message.startsWith(`${head}: <empty body> — `), message).toBe(true);
+    expect(message).toContain('riff.hostToolsUrl');
+  });
+
+  it('reports a non-JSON 200 page as an invalid response from something other than the worker', async () => {
+    const gateway = await endpoint(() => ({ status: 200, type: 'text/html', body: '<!doctype html><html><head><title>Sign in</title></head><body>Login required</body></html>' }));
+    const message = await failure(callRiffHostTool(binding(gateway.url), request()));
+    expect(message).toMatch(/^riff_host_response_invalid \(HTTP 200\): Sign in Login required — /);
+    expect(message).toContain('riff.hostToolsUrl');
+  });
+
+  it('masks the token, strips control characters and markup, and truncates a gateway page', async () => {
+    const page = `<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>x-riff-host-token: ${token}\u0007\u202e\u001b[31m ${'filler '.repeat(200)}</body></html>`;
+    const message = await failure(callRiffHostTool(binding('http://gateway.example/api/riff-host-tools'), request(),
+      async () => new Response(page, { status: 502 })));
+    const excerpt = message.slice('riff_host_http_502: '.length, message.indexOf(' — '));
+    expect(excerpt.startsWith('502 Bad Gateway x-riff-host-token: ***'), excerpt).toBe(true);
+    expect(message).not.toContain(token);
+    expect(message).not.toMatch(/[\u0000-\u001f\u007f\u202e]/);
+    expect(excerpt.endsWith('…')).toBe(true);
+    expect(Array.from(excerpt).length).toBeLessThanOrEqual(121);
+  });
+
+  it('keeps worker JSON errors as worker errors with their HTTP status and no reachability hint', async () => {
+    const gateway = new RiffHostTools(vi.fn()), url = await listen(gateway), ctx = context();
+    const old = gateway.bind(url, ctx);
+    gateway.bind(url, { ...ctx, turnId: 'turn-2' });
+    const message = await failure(callRiffHostTool(old, request()));
+    expect(message).toBe('riff_host_http_403: riff_host_turn_unavailable');
+  });
+
+  it('treats a JSON body on a gateway status as a gateway answer', async () => {
+    const message = await failure(callRiffHostTool(binding('http://gateway.example/api/riff-host-tools'), request(),
+      async () => Response.json({ error: 'no healthy upstream' }, { status: 503 })));
+    expect(message).toMatch(/^riff_host_http_503: \{"error":"no healthy upstream"\} — /);
+    expect(message).toContain('riff.hostToolsUrl');
+  });
+
+  it('names the transport error code without the private address when the endpoint never answers', async () => {
+    // The transport is injected instead of probing a closed ephemeral port: a
+    // port that was just released can be re-bound by a concurrent process before
+    // the client connects, which turned this case into a 404 from a stranger
+    // server instead of ECONNREFUSED (flaky on busy CI shards). The error shape
+    // mirrors what node:http hands the client for a refused loopback connect.
+    const port = 61234;
+    const refused = async (): Promise<RiffHostHttpResponse> => {
+      throw Object.assign(new Error(`connect ECONNREFUSED 127.0.0.1:${port}`), { code: 'ECONNREFUSED' });
+    };
+    const message = await failure(callRiffHostTool(binding(`http://127.0.0.1:${port}/api/riff-host-tools`), request(), refused));
+    expect(message).toMatch(/^riff_host_transport_unknown \(ECONNREFUSED\); do not repeat automatically — /);
+    expect(message).toContain('riff.hostToolsUrl');
+    expect(message).not.toContain(String(port));
+  });
+
+  it('keeps the code of a real transport failure and hides the address', async () => {
+    // The injected case above pins the classification; this one runs the real
+    // client, so the code must survive its own error path. The listener stays
+    // bound for the whole case (no released port another process could take)
+    // and drops each connection after reading the request.
+    const dropped: string[] = [];
+    const s = createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        if (req.headers['x-riff-host-token'] === token) dropped.push(req.method!);
+        res.socket?.destroy();
+      });
+    });
+    servers.push(s);
+    await new Promise<void>(resolve => s.listen(0, '127.0.0.1', resolve));
+    const port = (s.address() as { port: number }).port;
+    const message = await failure(callRiffHostTool(binding(`http://127.0.0.1:${port}${RIFF_HOST_TOOLS_ROUTE}`), request()));
+    expect(message).toMatch(/^riff_host_transport_unknown \(ECONNRESET\); do not repeat automatically — /);
+    expect(message).toContain('riff.hostToolsUrl');
+    expect(message).not.toContain(String(port));
+    // The command went out once; the retries only asked for its outcome.
+    expect(dropped).toEqual(['POST', 'GET', 'GET']);
+  });
+
+  it('still completes a normal running → completed exchange through the direct client', async () => {
+    let polls = 0;
+    const worker = await endpoint(req => req.method === 'POST'
+      ? { status: 202, type: 'application/json', body: JSON.stringify({ state: 'running' }) }
+      : ++polls < 2 ? { status: 202, type: 'application/json', body: JSON.stringify({ state: 'running' }) }
+        : { status: 200, type: 'application/json', body: JSON.stringify({ state: 'completed', result: { exitCode: 0, stdout: 'sent', stderr: '' } }) });
+    expect(await callRiffHostTool(binding(worker.url), request())).toEqual({ exitCode: 0, stdout: 'sent', stderr: '' });
+    expect(worker.seen, `foreign: ${worker.foreign.join(', ')}`).toEqual(['POST', 'GET', 'GET']);
   });
 });

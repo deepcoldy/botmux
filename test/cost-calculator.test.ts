@@ -3,6 +3,9 @@
  *
  * Run:  pnpm vitest run test/cost-calculator.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 
@@ -18,6 +21,9 @@ vi.mock('node:os', async (importOriginal) => ({
 vi.mock('node:fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs')>();
   const readFileSyncMock = vi.fn(() => '');
+  // statSync consults this as its existence oracle, mirroring the real fs:
+  // tests flip existence via the imported existsSync mock and statSync follows.
+  const existsSyncMock = vi.fn(() => false);
   const fdContent = new Map<number, string>();
   let nextFd = 10_000;
   const statsForContent = (content: string) => ({
@@ -31,7 +37,7 @@ vi.mock('node:fs', async (importOriginal) => {
   return {
     ...original,
     closeSync: vi.fn((fd: number) => { fdContent.delete(fd); }),
-    existsSync: vi.fn(() => false),
+    existsSync: existsSyncMock,
     fstatSync: vi.fn((fd: number) => statsForContent(fdContent.get(fd) ?? '')),
     lstatSync: vi.fn(() => ({
       isFile: () => true,
@@ -50,7 +56,17 @@ vi.mock('node:fs', async (importOriginal) => {
       slice.copy(buffer, offset);
       return slice.length;
     }),
-    statSync: vi.fn((path: string) => statsForContent(String(readFileSyncMock(path, 'utf-8') ?? ''))),
+    // Mimic the real fs: statSync throws ENOENT for paths that don't exist.
+    // The transcript resolver now gates on statSync().isFile() (not
+    // existsSync); a statSync that never throws would make every path "exist".
+    statSync: vi.fn((path: string) => {
+      if (!existsSyncMock(path)) {
+        const err = new Error(`ENOENT: no such file or directory, stat '${path}'`) as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return statsForContent(String(readFileSyncMock(path, 'utf-8') ?? ''));
+    }),
   };
 });
 
@@ -115,7 +131,7 @@ vi.mock('../src/services/session-store.js', () => ({
   getSession: vi.fn(() => undefined),
 }));
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../src/services/aiden-checkpoints.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../src/services/codex-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from '../src/services/traex-transcript.js';
@@ -125,6 +141,8 @@ import {
   getSessionCost,
   getSessionUsageSnapshot,
   getSessionTokenUsage,
+  getSessionUsageRecovery,
+  MAX_USAGE_TRANSCRIPT_BYTES,
   __resetSessionUsageCachesForTest,
   type SessionCost,
 } from '../src/core/cost-calculator.js';
@@ -196,7 +214,7 @@ describe('getSessionJsonlPath', () => {
       'abc-123.jsonl',
     );
     expect(result).toBe(expectedPath);
-    expect(existsSync).toHaveBeenCalledWith(expectedPath);
+    expect(statSync).toHaveBeenCalledWith(expectedPath);
   });
 
   it('returns null when the jsonl file does not exist', () => {
@@ -588,7 +606,7 @@ describe('getSessionTokenUsage', () => {
     vi.mocked(existsSync).mockReturnValue(false);
 
     expect(getSessionTokenUsage({
-      cliId: 'gemini',
+      cliId: 'opencode',
       sessionId: 's1',
       cwd: '/tmp',
     })).toBeNull();
@@ -1513,5 +1531,69 @@ describe('getSessionTokenUsage', () => {
       turns: 2,
       model: 'claude-sonnet-4-20250514',
     });
+  });
+});
+
+describe('usage recovery checkpoints', () => {
+  it.each(['codex', 'traex'] as const)('recovers %s dates and model switches only from an exact baseline', cliId => {
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/tmp/recovery.jsonl');
+    vi.mocked(findTraexRolloutBySessionId).mockReturnValue('/tmp/recovery.jsonl');
+    const query = { cliId, sessionId: 'bot', cliSessionId: 'native' };
+    const checkpoint = (input: number, timestamp: string) => JSON.stringify({ timestamp,
+      type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: {
+        input_tokens: input, output_tokens: 0, cached_input_tokens: 0,
+      } } } });
+    const snapshot = (input: number) => ({ in: input, out: 0, inputTokens: input, outputTokens: 0,
+      cacheReadTokens: 0, cacheCreateTokens: 0, model: 'b', turns: 0 });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue([
+      JSON.stringify({ type: 'turn_context', payload: { model: 'a' } }),
+      checkpoint(100, '2026-01-01T10:00:00Z'),
+      checkpoint(150, '2026-01-01T23:00:00Z'),
+      JSON.stringify({ type: 'turn_context', payload: { model: 'b' } }),
+      checkpoint(200, '2026-01-02T01:00:00Z'), '',
+    ].join('\n'));
+    expect(getSessionUsageRecovery(query, snapshot(100), snapshot(200))?.map(p =>
+      [p.at.toISOString(), p.usage.model, p.usage.inputTokens])).toEqual([
+        ['2026-01-01T23:00:00.000Z', 'a', 150], ['2026-01-02T01:00:00.000Z', 'b', 200],
+      ]);
+    expect(getSessionUsageRecovery(query, snapshot(125), snapshot(200))).toBeNull();
+    expect(getSessionUsageRecovery(query, snapshot(100), snapshot(250))).toBeNull();
+    vi.mocked(readFileSync).mockReturnValue([
+      JSON.stringify({ type: 'turn_context', payload: { model: 'a' } }),
+      checkpoint(100, '2026-01-02T10:00:00Z'), checkpoint(200, '2026-01-01T23:00:00Z'), '',
+    ].join('\n'));
+    expect(getSessionUsageRecovery(query, snapshot(100), snapshot(200))).toBeNull();
+  });
+
+  it('fails closed before recovery exceeds the shared transcript scan budget', () => {
+    vi.mocked(findCodexRolloutBySessionId).mockReturnValue('/tmp/recovery.jsonl');
+    const query = { cliId: 'codex' as const, sessionId: 'bot', cliSessionId: 'native' };
+    const checkpoint = (input: number, timestamp: string) => JSON.stringify({ timestamp,
+      type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: {
+        input_tokens: input, output_tokens: 0, cached_input_tokens: 0,
+      } } } });
+    const snapshot = (input: number) => ({ in: input, out: 0, inputTokens: input, outputTokens: 0,
+      cacheReadTokens: 0, cacheCreateTokens: 0, model: 'a', turns: 0 });
+    vi.mocked(existsSync).mockReturnValue(true);
+    vi.mocked(readFileSync).mockReturnValue([
+      JSON.stringify({ type: 'turn_context', payload: { model: 'a' } }),
+      checkpoint(100, '2026-01-01T10:00:00Z'),
+      checkpoint(150, '2026-01-01T11:00:00Z'), '',
+    ].join('\n'));
+    const defaultStat = vi.mocked(statSync).getMockImplementation()!;
+    try {
+      vi.mocked(statSync).mockImplementation((path: any) => {
+        const stat = defaultStat(path);
+        return path === '/tmp/recovery.jsonl'
+          ? { ...stat, size: MAX_USAGE_TRANSCRIPT_BYTES + 1 } as any
+          : stat;
+      });
+      // The small in-memory fixture would recover 50 if the scanner were allowed
+      // to run; the enlarged stat proves the byte guard fails before that work.
+      expect(getSessionUsageRecovery(query, snapshot(100), snapshot(150))).toBeNull();
+    } finally {
+      vi.mocked(statSync).mockImplementation(defaultStat);
+    }
   });
 });

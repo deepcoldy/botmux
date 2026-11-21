@@ -47,6 +47,12 @@ vi.mock('../src/core/fleet-command-queue.js', () => ({
   drainFleetCommands: () => [],
 }));
 
+// Run from inside a bot session, the real one would move this test process
+// into a fleet scope of the host's user systemd.
+vi.mock('../src/core/fleet-scope.js', () => ({
+  moveSupervisorIntoFleetScope: () => ({ action: 'kept', unit: 'test.scope' }),
+}));
+
 vi.mock('../src/utils/logger.js', () => ({
   logger: { info: vi.fn() },
 }));

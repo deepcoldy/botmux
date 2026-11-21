@@ -2,6 +2,21 @@ import { describe, expect, it } from 'vitest';
 import { DAEMON_ENV_KEYS, resolveDaemonEnv } from '../src/cli/daemon-lifecycle-env.js';
 import { DASHBOARD_H5_ENV_KEYS, DASHBOARD_H5_ENV_PREFIX } from '../src/utils/child-env.js';
 import { resolveDashboardH5AuthConfig } from '../src/dashboard/h5-auth.js';
+import { resolveWorktreeCreateTimeoutMs } from '../src/config.js';
+
+it('reloads final-output handoff and clears a removed switch on managed restart', () => {
+  expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', BOTMUX_FINAL_OUTPUT_HANDOFF: '0' }, 'BOTMUX_FINAL_OUTPUT_HANDOFF=1'))
+    .toMatchObject({ BOTMUX_FINAL_OUTPUT_HANDOFF: '1' });
+  expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', BOTMUX_FINAL_OUTPUT_HANDOFF: '1' }, 'WEB_HOST=0.0.0.0'))
+    .toMatchObject({ BOTMUX_FINAL_OUTPUT_HANDOFF: '' });
+});
+
+it('reloads edited Oncall connection settings instead of inheriting an old session snapshot', () => {
+  const resolved = resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', ONCALL_GROUP_ENDPOINT: 'https://old.example.test/chat/', ONCALL_EMAIL_DOMAIN: 'old.example.test' },
+    'ONCALL_GROUP_ENDPOINT=https://new.example.test/chat/\nONCALL_EMAIL_DOMAIN=new.example.test');
+  expect(resolved).toMatchObject({ ONCALL_GROUP_ENDPOINT: 'https://new.example.test/chat/', ONCALL_EMAIL_DOMAIN: 'new.example.test' });
+  expect(resolveDaemonEnv({ ...resolved, BOTMUX_SESSION_ID: 'session-1' }, '')).toMatchObject({ ONCALL_GROUP_ENDPOINT: '', ONCALL_EMAIL_DOMAIN: '' });
+});
 
 /**
  * Every key resolves to '' unless a source sets it, except the terminal and
@@ -63,6 +78,8 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_DASHBOARD_EXTERNAL_HOST=dashboard.example.com',
       'BOTMUX_DASHBOARD_HOST=127.0.0.1',
       'BOTMUX_DASHBOARD_PORT=7991',
+      'BOTMUX_TERMINAL_ROUTE_HOST=10.0.0.8',
+      'BOTMUX_TERMINAL_ROUTE_PORT=11419',
       'BOTMUX_DAEMON_IPC_BASE_PORT=7992',
       'BOTMUX_DASHBOARD_PUBLIC_READONLY=false',
       // The regression this pins: a bot session's pane wrapper unsets BOTMUX_*,
@@ -82,6 +99,8 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DASHBOARD_EXTERNAL_HOST: 'dashboard.example.com',
       BOTMUX_DASHBOARD_HOST: '127.0.0.1',
       BOTMUX_DASHBOARD_PORT: '7991',
+      BOTMUX_TERMINAL_ROUTE_HOST: '10.0.0.8',
+      BOTMUX_TERMINAL_ROUTE_PORT: '11419',
       BOTMUX_DAEMON_IPC_BASE_PORT: '7992',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       BOTMUX_PUBLIC_URL: 'http://botmux.example.com',
@@ -109,6 +128,62 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_GLOBAL_CONFIG_FILE: '/mnt/shared/global-config.json',
       BOTMUX_GROUP_CONTEXT_SETTINGS_FILE: '/mnt/shared/group-context-settings.json',
     });
+  });
+
+  it('re-reads the sender resolve timeout from .env on a session-origin restart, including rollback', () => {
+    // P2 regression: the CLI pane wrapper does not unset this key, so a
+    // restart from inside a session (or a detached self-upgrade restart)
+    // inherits the OLD daemon's value, and the daemon's dotenv load never
+    // overrides an inherited key. The lifecycle snapshot must therefore
+    // resolve it from the persisted file like the other machine-wide knobs —
+    // otherwise editing it has no effect and, worse, deleting it from the
+    // file can never restore the documented 800ms default.
+    const inheritedWithStaleValue = {
+      BOTMUX_SESSION_ID: 'session-1',
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '3000',
+    };
+
+    expect(resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_SENDER_RESOLVE_TIMEOUT_MS=1500',
+    ].join('\n'))).toMatchObject({
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '1500',
+    });
+
+    // Rollback: key removed from the file must resolve to '' so the consumer
+    // falls back to its default instead of keeping the inherited stale value.
+    expect(resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=1500',
+    ].join('\n'))).toMatchObject({
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '',
+    });
+  });
+
+  it('re-reads the worktree create timeout from .env on a session-origin restart, including rollback', () => {
+    // Same lifecycle gap as the sender-resolve timeout above: this key is not
+    // scrubbed at the CLI pane boundary, so a restart from inside a session
+    // inherits the OLD daemon's value and the daemon's dotenv load never
+    // overrides an inherited key. The lifecycle snapshot must resolve it from
+    // the persisted file; otherwise editing ~/.botmux/.env has no effect and
+    // deleting the key can never restore the documented 60s default.
+    const inheritedWithStaleValue = {
+      BOTMUX_SESSION_ID: 'session-1',
+      BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: '60000',
+    };
+
+    const edited = resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_WORKTREE_CREATE_TIMEOUT_MS=90000',
+    ].join('\n'));
+    expect(edited).toMatchObject({ BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: '90000' });
+    // End-to-end consumption: the restarted daemon resolves the fresh budget.
+    expect(resolveWorktreeCreateTimeoutMs(edited)).toBe(90_000);
+
+    // Rollback: key removed from the file resolves to '' and the consumer
+    // falls back to its 60s default instead of keeping the stale value.
+    const removed = resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=1500',
+    ].join('\n'));
+    expect(removed).toMatchObject({ BOTMUX_WORKTREE_CREATE_TIMEOUT_MS: '' });
+    expect(resolveWorktreeCreateTimeoutMs(removed)).toBe(60_000);
   });
 
   it('keeps ordinary shell overrides ahead of .env', () => {

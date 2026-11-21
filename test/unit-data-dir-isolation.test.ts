@@ -5,7 +5,7 @@ import { config } from '../src/config.js';
 import * as sessionStore from '../src/services/session-store.js';
 
 describe.sequential('unit-test session persistence', () => {
-  const unitRoot = inject('unitSessionDataRoot');
+  const unitRoot = inject('testSessionDataRoot');
   let isolatedDataDir: string;
 
   it('isolates both DATA_DIR and BOTMUX_HOME from the invoking environment', () => {

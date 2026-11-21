@@ -52,6 +52,23 @@ describe('buildBotmuxEnvAssignments', () => {
     expect(buildBotmuxEnvAssignments(env, inject, undefined)).toEqual(buildBotmuxEnvAssignments(env, inject));
     expect(buildBotmuxEnvAssignments(env, inject, [])).toEqual(buildBotmuxEnvAssignments(env, inject));
   });
+
+  it('honors host-authorized protected removals even for reserved keys', () => {
+    const argv = buildBotmuxEnvAssignments(
+      { BOTMUX_PROTECTED_SECRET_FD: '3', KEEP: 'base' },
+      { FIXTURE_SECRET: 'configured', KEEP_INJECTED: 'yes' },
+      undefined,
+      undefined,
+      ['BOTMUX_PROTECTED_SECRET_FD', 'FIXTURE_SECRET'],
+    );
+    expect(argv.slice(0, 4)).toEqual([
+      '-u', 'BOTMUX_PROTECTED_SECRET_FD',
+      '-u', 'FIXTURE_SECRET',
+    ]);
+    expect(argv).not.toContain('BOTMUX_PROTECTED_SECRET_FD=3');
+    expect(argv).not.toContain('FIXTURE_SECRET=configured');
+    expect(argv).toContain('KEEP_INJECTED=yes');
+  });
 });
 
 describe('pane wrapper (real /usr/bin/env)', () => {

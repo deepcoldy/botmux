@@ -1,7 +1,7 @@
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   detectGlobalInstallManager,
   formatGlobalInstallCommand,
@@ -91,6 +91,53 @@ describe('resolveGlobalInstallPlan', () => {
   it('recognises the pnpm 11 store realpath behind a global symlink', () => {
     const root = '/home/bot/.local/share/pnpm/store/v11/links/@/botmux/3.11.0/hash/node_modules/botmux';
     expect(detectGlobalInstallManager(root, 'linux')).toBe('pnpm');
+  });
+
+  it('recognises the pnpm 11 store realpath under a custom PNPM_HOME only (#1127)', () => {
+    const root = '/root/.pnpm-bin/store/v11/links/@/botmux/3.18.9/x/node_modules/botmux';
+    try {
+      vi.stubEnv('PNPM_HOME', '/root/.pnpm-bin/');
+      expect(detectGlobalInstallManager(root, 'linux')).toBe('pnpm');
+      vi.stubEnv('PNPM_HOME', '/data/pnpm-global');
+      expect(detectGlobalInstallManager(root, 'linux')).toBe('unknown');
+      expect(detectGlobalInstallManager(
+        '/data/pnpm-global/store/v11/links/@/botmux/3.18.9/x/node_modules/botmux', 'linux',
+      )).toBe('pnpm');
+      vi.stubEnv('PNPM_HOME', '');
+      expect(detectGlobalInstallManager(root, 'linux')).toBe('unknown');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('plans a pnpm update for a store realpath under a custom PNPM_HOME', () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), 'botmux-pnpm11-custom-home-'));
+    const previousPath = process.env.PATH;
+    try {
+      const pnpmHome = join(tempRoot, '.pnpm-bin');
+      const packageRoot = join(pnpmHome, 'store', 'v11', 'links', '@', 'botmux', '3.18.9', 'hash', 'node_modules', 'botmux');
+      const globalRoot = join(pnpmHome, 'global', 'v11');
+      const runtimeRoot = join(globalRoot, 'runtime');
+      const stableDir = join(globalRoot, 'stable-hash');
+      const fakePnpm = join(tempRoot, 'bin', 'pnpm');
+      mkdirSync(packageRoot, { recursive: true });
+      mkdirSync(join(runtimeRoot, 'node_modules'), { recursive: true });
+      symlinkSync(packageRoot, join(runtimeRoot, 'node_modules', 'botmux'), 'dir');
+      symlinkSync(runtimeRoot, stableDir, 'dir');
+      mkdirSync(join(tempRoot, 'bin'), { recursive: true });
+      writeFileSync(fakePnpm, `#!/bin/sh\nprintf '%s\\n' '[{"path":"${globalRoot}"}]'\n`);
+      chmodSync(fakePnpm, 0o755);
+      process.env.PATH = `${join(tempRoot, 'bin')}:${previousPath ?? ''}`;
+      vi.stubEnv('PNPM_HOME', pnpmHome);
+
+      const plan = resolveGlobalInstallPlan(packageRoot, 'linux');
+      expect(plan.args).toEqual(['add', '-g', '--global-dir', join(pnpmHome, 'global'), 'botmux@latest']);
+      expect(plan.activePackageRoot).toBe(join(stableDir, 'node_modules', 'botmux'));
+    } finally {
+      vi.unstubAllEnvs();
+      process.env.PATH = previousPath;
+      rmSync(tempRoot, { recursive: true, force: true });
+    }
   });
 
   it('uses pnpm root -g for a custom global-dir and fails closed without its stable link', () => {

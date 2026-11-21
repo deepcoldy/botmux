@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { connect, createServer, type Server as NetServer, type Socket } from 'node:net';
-import { spawnSyncTsEvalWithRepoImports, isBunRuntime } from './helpers/ts-runner.js';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { bridgeDataChannel } from '../src/platform/tunnel-client.js';
 
 /**
@@ -355,9 +355,9 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
     expect(maxAhead).toBeLessThan(TOTAL / 3);
   }, 30_000);
 
-  // Node-only for the same reason as the case below: bun 1.4.3's `ws` server
-  // ignores `autoPong: false` and still answers with the original payload.
-  it.runIf(!isBunRuntime())('does not count a pong that carries no offset as a confirmation', async () => {
+  // Needs a ws server that honours `autoPong: false`: npm ws, or bun >= 1.4.4
+  // (bun 1.4.3's server still answered with the original payload).
+  it('does not count a pong that carries no offset as a confirmation', async () => {
     // A hop that answers pings itself without echoing the payload must not open
     // the gate: such a pong proves nothing about what the platform has read.
     const TOTAL = 24 * 1024 * 1024;
@@ -401,11 +401,10 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
     expect(received).toBeLessThan(TOTAL / 3);
   }, 30_000);
 
-  // The platform stand-in pauses the raw upgrade socket. That pause holds under
-  // Node; Bun's `ws` server ignores it (documented above), so this case is the
-  // Node-only half of the backpressure guard. The production bridge still runs
-  // under bun on the other tests in this file.
-  it.runIf(!isBunRuntime())('stops reading the dashboard when the platform stops consuming', async () => {
+  // The platform stand-in pauses its server-side socket. npm ws and bun >= 1.4.4
+  // honour that pause; bun 1.4.3's server ignored both it and a raw
+  // `req.socket.pause()`.
+  it('stops reading the dashboard when the platform stops consuming', async () => {
     // THE BACKPRESSURE GUARD. `bufferedAmount` is permanently 0 on Bun and
     // `ws.pause()` is a no-op there, so the bridge must gate on something that
     // reflects real delivery. Without a working gate the bridge drains the local
@@ -430,14 +429,12 @@ describe('platform tunnel data bridge — flow control and shutdown', () => {
     await new Promise<void>((r) => srv.listen(0, '127.0.0.1', () => r()));
     const tcpPort = (srv.address() as { port: number }).port;
 
-    // Platform stand-in that NEVER reads: accept the upgrade, then pause the raw
-    // socket so nothing is consumed. Note this holds under Node (the runtime this
-    // suite runs on) — Bun's ws server ignores the pause, which is why production
-    // parity is argued from the client side, not from here.
+    // Platform stand-in that NEVER reads: accept the upgrade, then pause the
+    // socket so nothing is consumed.
     const wss = new WebSocketServer({ port: 0, perMessageDeflate: false });
     servers.push(wss);
     await new Promise<void>((r) => wss.on('listening', () => r()));
-    wss.on('connection', (sock, req) => { sockets.push(sock); req.socket.pause(); });
+    wss.on('connection', (sock) => { sockets.push(sock); sock.pause(); });
     const platformPort = (wss.address() as { port: number }).port;
 
     // The bridge under test: production function, platform side stalled.

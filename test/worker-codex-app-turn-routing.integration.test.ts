@@ -3,8 +3,10 @@ import { randomBytes } from 'node:crypto';
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -12,18 +14,29 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { nodeTsRunnerPrefix, spawnNodeTsScript } from './helpers/ts-runner.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
+import { DEFAULT_MANAGED_TMUX_SOCKET } from '../src/adapters/backend/tmux-socket.js';
 import { codexAppControlStatePath } from '../src/utils/codex-app-control.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { buildCredentialOnlySandboxArgs } from '../src/adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityUserMessage } from '../src/adapters/backend/session-backend-selector.js';
 
-// The worker inherits process.env, so its panes live on this server.
-const managedTmuxArgs = tmuxSocketArgs(preferredManagedTmuxSocket(process.env));
+// 自带私有 tmux 目录，不依赖全局 tmux 围栏。没有它时，TMUX_TMPDIR 为空的运行（例如绕过
+// setupFiles 的全量）会让 worker 的 `-L botmux` 落到宿主 /tmp/tmux-<uid>/botmux，和线上
+// fleet 共用同一个 server；2026-11-06 就有测试 worker 在宿主 socket 上起了 server，线上会话被
+// 迁到它上面，测试结束 server 退出，又断了一次。目录必须预先存在（tmux 对不存在的
+// TMUX_TMPDIR 会静默回落 /tmp），路径要短（unix socket 路径上限约 104 字节）。
+const tmuxRoot = mkdtempSync('/tmp/bmx-cr-');
+const tmuxEnv = privateTmuxEnv(tmuxRoot);
+// socket 名由 BOTMUX_TMUX_SOCKET 决定，测试围栏不清这个变量；固定成默认的 botmux。
+delete tmuxEnv.BOTMUX_TMUX_SOCKET;
+// 测试侧按绝对路径找 worker 的 server：worker 一旦没用上私有目录，下面的 tmux 断言会直接失败，
+// 不会因为全局围栏恰好也给了私有目录而继续变绿。
+const managedTmuxArgs = ['-S', join(tmuxRoot, `tmux-${process.getuid?.() ?? 0}`, DEFAULT_MANAGED_TMUX_SOCKET)];
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -86,6 +99,17 @@ afterEach(async () => {
   tempDirs.clear();
 });
 
+afterAll(() => {
+  // 只关本文件私有目录里的 server，再删目录。
+  const uidDir = join(tmuxRoot, `tmux-${process.getuid?.() ?? 0}`);
+  let sockets: string[] = [];
+  try { sockets = readdirSync(uidDir); } catch { /* no server was ever started */ }
+  for (const socket of sockets) {
+    spawnSync('tmux', ['-S', join(uidDir, socket), 'kill-server'], { stdio: 'ignore', timeout: 3_000 });
+  }
+  rmSync(tmuxRoot, { recursive: true, force: true });
+});
+
 function replacementSessionId(label: string): string {
   return `${randomBytes(4).toString('hex')}-${label}-${process.pid}-${Date.now()}`;
 }
@@ -104,7 +128,7 @@ function spawnWorker(
   const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
-      ...process.env,
+      ...tmuxEnv,
       HOME: root,
       NODE_ENV: 'test',
       NODE_OPTIONS: [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' '),
@@ -230,6 +254,11 @@ describe.skipIf(process.platform !== 'linux')('Codex App worker engine identity'
         await waitFor(child, logs, () => readJsonLines<{ ack: number }>(report).some(entry => entry.ack === finalSeq));
         const replacement = readJsonLines<{ replacement?: { pid: number; procStart: string } }>(report)
           .find(entry => entry.replacement)!.replacement!;
+        // The runner's ack travels over the control socket; the attestation over
+        // worker IPC. They are not ordered with each other, so wait for the IPC
+        // side instead of assuming it already arrived.
+        const lastAttestation = () => messages.filter(message => message.type === 'local_process_attestation').at(-1);
+        await waitFor(child, logs, () => lastAttestation()?.enginePid === replacement.pid, 10_000);
         const attestations = messages.filter(message => message.type === 'local_process_attestation');
         expect(attestations.at(-1)).toMatchObject({ enginePid: replacement.pid, engineProcStart: replacement.procStart });
         expect(replacement.pid).not.toBe(proofs[0]!.pid);
@@ -247,7 +276,8 @@ describe.skipIf(process.platform !== 'linux')('Codex App worker engine identity'
       } else {
         const exit = await waitForChildExit(child, logs, 10_000);
         expect(exit.code).not.toBe(0);
-        expect(messages.some(message => message.type === 'error')).toBe(true);
+        // The process exit and its last IPC messages are separate channels.
+        await vi.waitFor(() => expect(messages.some(message => message.type === 'error')).toBe(true), { timeout: 5_000 });
         expect(logs.join('')).toContain(mode === 'changed'
           ? 'invalid or changed app-server process' : 'dropped its attested app-server process');
         // A rejected frame must neither gain a new engine root nor be ACKed.
@@ -407,7 +437,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
-        ...process.env,
+        ...tmuxEnv,
         HOME: root,
         NODE_ENV: 'test',
         NODE_OPTIONS: nodeOptions,
@@ -547,7 +577,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
-        ...process.env,
+        ...tmuxEnv,
         HOME: root,
         NODE_ENV: 'test',
         NODE_OPTIONS: nodeOptions,
@@ -626,7 +656,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
-        ...process.env,
+        ...tmuxEnv,
         HOME: root,
         NODE_ENV: 'test',
         NODE_OPTIONS: nodeOptions,
@@ -703,7 +733,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
-        ...process.env,
+        ...tmuxEnv,
         HOME: root,
         NODE_ENV: 'test',
         NODE_OPTIONS: nodeOptions,
@@ -1403,6 +1433,76 @@ describe('Codex App worker replacement durable handoff', () => {
   }, 45_000);
 });
 
+describe('Codex App worker native stop', () => {
+  it('settles the exact interrupted dispatch and accepts another turn on the same thread', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-interrupt-'));
+    tempDirs.add(root);
+    const fakeCodex = join(root, 'fake-codex');
+    const requestLog = join(root, 'requests.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const sessionId = replacementSessionId('interrupt');
+    tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const worker = spawnWorker(root, sessionId, fakeCodex, requestLog, 'operator-interrupt', logs, messages,
+      (message, child) => {
+        const requestId = message.type === 'codex_app_dispatch_transition' ? message.requestId
+          : message.type === 'final_output' ? message.codexAppSettlement?.requestId : undefined;
+        if (requestId) child.send({ type: 'codex_app_dispatch_persisted', requestId, ok: true } satisfies DaemonToWorker);
+      }, { BOTMUX_TEST_CODEX_APP_RUNNER_PATH: resolve('src/codex-app-runner.ts') });
+    const target = (turnId: string) => messages.find(
+      message => message.type === 'codex_app_interrupt_target' && message.target?.replyTurnId === turnId,
+    ) as Extract<WorkerToDaemon, { type: 'codex_app_interrupt_target' }> | undefined;
+    const stop = (requestId: string, turnId: string) => {
+      const { generation, turnEpoch } = target(turnId)!.target!;
+      worker.send({ type: 'codex_app_interrupt', requestId, generation, turnEpoch } satisfies DaemonToWorker);
+    };
+    worker.send(replacementInit(sessionId, fakeCodex, 'first task', {
+      backendType: 'pty',
+      env: { FAKE_CODEX_LOG: requestLog, FAKE_CODEX_BEHAVIOR: 'operator-interrupt' },
+      turnId: 'om_first', codexAppDispatchId: 'dispatch-first',
+      promptCodexAppInput: { text: 'first task', clientUserMessageId: 'om_first' },
+    }));
+    await waitFor(worker, logs, () => !!target('om_first'));
+    stop('first', 'om_first');
+    // The interrupt reply and the terminal event arrive independently over IPC.
+    await waitFor(worker, logs, () => messages.some(
+      message => message.type === 'turn_terminal' && message.turnId === 'om_first' && message.status === 'cancelled',
+    ) && messages.some(
+      message => message.type === 'codex_app_interrupt_result' && message.requestId === 'first',
+    ));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'codex_app_interrupt_result', requestId: 'first', status: 'delivered',
+    }));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'final_output', turnId: 'om_first', content: '', codexAppCancelled: true, suppressDelivery: true,
+      codexAppSettlement: expect.objectContaining({ dispatchId: 'dispatch-first' }),
+    }));
+    worker.send({
+      type: 'message', content: 'next task', turnId: 'om_next', codexAppDispatchId: 'dispatch-next',
+      codexAppInput: { text: 'next task', clientUserMessageId: 'om_next' },
+    } satisfies DaemonToWorker);
+    await waitFor(worker, logs, () => !!target('om_next'));
+    stop('old-card', 'om_first');
+    await waitFor(worker, logs, () => messages.some(
+      message => message.type === 'codex_app_interrupt_result' && message.requestId === 'old-card',
+    ));
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'codex_app_interrupt_result', requestId: 'old-card', status: 'stale_turn',
+    }));
+    stop('next', 'om_next');
+    await waitFor(worker, logs, () => messages.some(
+      message => message.type === 'turn_terminal' && message.turnId === 'om_next' && message.status === 'cancelled',
+    ));
+    expect(readRequests(requestLog).filter(request => request.method === 'turn/interrupt').map(request => request.params)).toEqual([
+      { threadId: 'thread-fake', turnId: 'turn-fake-1' },
+      { threadId: 'thread-fake', turnId: 'turn-fake-2' },
+    ]);
+    expect(worker.exitCode).toBeNull();
+  }, 45_000);
+});
+
 describe('Codex App worker live effort', () => {
   it.each([
     ['effort-complete', 'applied', undefined],
@@ -1446,5 +1546,90 @@ describe('Codex App worker live effort', () => {
     expect(requests.filter(r => r.method === 'turn/settings/update').map(r => r.params)).toEqual([
       { threadId: 'thread-fake', turnId: 'turn-fake-1', effort: 'high' },
     ]);
+  }, 35_000);
+});
+
+describe('Codex App resume reasoning gate', () => {
+  function prepareUnavailableCatalog(root: string) {
+    const fixture = join(root, 'fake-codex-fixture.mjs');
+    const fakeCodex = join(root, 'fake-codex.mjs');
+    const requestLog = join(root, 'requests.jsonl');
+    const probeLog = join(root, 'debug-models.jsonl');
+    copyFileSync(resolve('test/fixtures/fake-codex-app-server.mjs'), fixture);
+    writeFileSync(fakeCodex, `#!/usr/bin/env node
+import { appendFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+if (process.argv[2] === 'debug' && process.argv[3] === 'models') {
+  appendFileSync(${JSON.stringify(probeLog)}, JSON.stringify({ pid: process.pid }) + '\\n');
+  process.exit(1);
+}
+const child = spawn(process.execPath, [${JSON.stringify(fixture)}, ...process.argv.slice(2)], {
+  stdio: 'inherit', env: process.env,
+});
+child.on('error', error => { console.error(error); process.exit(1); });
+child.on('exit', code => process.exit(code ?? 1));
+`);
+    chmodSync(fakeCodex, 0o755);
+    return { fakeCodex, requestLog, probeLog };
+  }
+
+  function resumeInit(sessionId: string, fakeCodex: string, requestLog: string, behavior: string) {
+    return replacementInit(sessionId, fakeCodex, '', {
+      backendType: 'pty',
+      model: 'gpt-6.3-sol',
+      reasoningEffort: 'max',
+      resume: true,
+      cliSessionId: 'thread-existing-1',
+      turnId: 'om_resume_gate',
+      env: { FAKE_CODEX_LOG: requestLog, FAKE_CODEX_BEHAVIOR: behavior },
+    });
+  }
+
+  it('successful thread resume neither probes nor claims a default-effort launch', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-resume-gate-'));
+    tempDirs.add(root);
+    const { fakeCodex, requestLog, probeLog } = prepareUnavailableCatalog(root);
+    const sessionId = replacementSessionId('resume-gate-success');
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const worker = spawnWorker(root, sessionId, fakeCodex, requestLog, 'success', logs, messages);
+    worker.send(resumeInit(sessionId, fakeCodex, requestLog, 'success'));
+    await waitFor(worker, logs, () => readRequests(requestLog).some(r => r.method === 'thread/resume')
+      && messages.some(message => message.type === 'prompt_ready'));
+
+    const resume = readRequests(requestLog).find(r => r.method === 'thread/resume');
+    expect(resume.params.config?.model_reasoning_effort).toBeUndefined();
+    expect(resume.params.model).toBeUndefined();
+    expect(existsSync(probeLog)).toBe(false);
+    expect(messages.filter(message => message.type === 'user_notify'
+      && message.message.includes('本次启动未使用思考强度'))).toEqual([]);
+  }, 35_000);
+
+  it('missing-thread fallback still gates the real fresh thread/start and notifies once', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-resume-fallback-gate-'));
+    tempDirs.add(root);
+    const { fakeCodex, requestLog, probeLog } = prepareUnavailableCatalog(root);
+    const sessionId = replacementSessionId('resume-gate-fallback');
+    const logs: string[] = [];
+    const messages: WorkerToDaemon[] = [];
+    const worker = spawnWorker(root, sessionId, fakeCodex, requestLog, 'resume-not-found', logs, messages);
+    worker.send(resumeInit(sessionId, fakeCodex, requestLog, 'resume-not-found'));
+    await waitFor(worker, logs, () => readRequests(requestLog).some(r => r.method === 'thread/start')
+      && messages.some(message => message.type === 'user_notify'
+        && message.message.includes('本次启动未使用思考强度 max')));
+
+    const requests = readRequests(requestLog);
+    expect(requests.filter(r => r.method === 'thread/resume')).toHaveLength(1);
+    const start = requests.find(r => r.method === 'thread/start');
+    expect(start.params.model).toBe('gpt-6.3-sol');
+    expect(start.params.config?.model_reasoning_effort).toBeUndefined();
+    expect(readFileSync(probeLog, 'utf8').trim().split('\n')).toHaveLength(1);
+    const notices = messages.filter(message => message.type === 'user_notify'
+      && message.message.includes('本次启动未使用思考强度'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      turnId: 'om_resume_gate',
+      message: expect.stringContaining('已按 CLI 默认强度启动；设置未改动'),
+    });
   }, 35_000);
 });

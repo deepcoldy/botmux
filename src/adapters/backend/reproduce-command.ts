@@ -29,9 +29,10 @@ function shq(value: string): string {
  *
  * 输入是**基础 CLI** 的 bin/args（cliAdapter.resolvedBin + buildArgs 产出，未经任何
  * Seatbelt/bwrap/credential 改写）。规则：
- *   - wrapperCli 生效**且** sandbox 关闭时 → 返回 wrapper 形态（`aiden x claude …`）。
- *     worker 侧 wrapperCli 与 file sandbox 互斥（sandboxOn 时忽略 wrapper），这里同构。
- *   - 其余（无 wrapper，或 sandbox 开启）→ 返回基础 CLI bin/args 原样。
+ *   - wrapperCli 生效时 → 返回 wrapper 形态（`aiden x claude …`）。sandbox 关闭时 wrapper
+ *     总是生效；sandbox 开启时只有 worker 把 wrapper 放进沙盒执行（wrapperInsideSandbox）
+ *     才生效，其余后端在沙盒下仍忽略 wrapper，这里同构。
+ *   - 其余 → 返回基础 CLI bin/args 原样。
  * 无论如何都**不**含 sandbox-exec / bwrap 外层——那是机器相关、裸 bash 跑不起来的包装。
  */
 export function selectReproduceLaunch(input: {
@@ -40,6 +41,8 @@ export function selectReproduceLaunch(input: {
   wrapperCli?: string;
   cliLaunchMode?: CliLaunchMode;
   sandboxOn: boolean;
+  /** worker 把 wrapperCli 放进了文件沙盒内执行。 */
+  wrapperInsideSandbox?: boolean;
   binResolver?: (bin: string) => string;
   ttadkModel?: string;
 }): { bin: string; args: string[] } {
@@ -48,7 +51,7 @@ export function selectReproduceLaunch(input: {
     const launch = buildForgeTraexLaunch(baseArgs, input.binResolver ?? ((b) => b));
     return { bin: launch.bin, args: launch.args };
   }
-  if (wrapperCli && wrapperCli.trim() && !sandboxOn) {
+  if (wrapperCli && wrapperCli.trim() && (!sandboxOn || input.wrapperInsideSandbox)) {
     const launch = buildWrappedLaunch(
       wrapperCli,
       baseArgs,
@@ -73,26 +76,51 @@ export interface ReproduceCommandInput {
   env?: NodeJS.ProcessEnv;
   /** 每 bot 注入 env（bots.json env，含 provider 凭证）。 */
   injectEnv?: Record<string, string>;
+  /** SpawnOpts.unsetEnv：pane/子进程要移除的继承变量。裸 bash 的 `KEY=VAL cmd`
+   *  前缀删不掉已导出的变量，因此这里表达成 `env -u KEY …`——与 pane wrapper
+   *  在 rcfile 之后的 exec 位置一致。 */
+  unsetEnv?: readonly string[];
   /** Turn-authored git `-c` pairs; rebuilt into GIT_CONFIG_* assignments. */
   gitConfigPairs?: ReadonlyArray<readonly [string, string]>;
 }
 
 // 组装近似复现命令。riff / mojo（远端后端）返回 null。其余后端返回：
-//   cd '<cwd>' && KEY='v' KEY2='v2' ... '<bin>' '<arg>' ...
+//   cd '<cwd>' && KEY='v' ... /usr/bin/env -u KEY '<bin>' '<arg>' ...
 // env 前缀取 buildBotmuxEnvAssignments（BOTMUX_* / SESSION_DATA_DIR /
 // CLAUDE_CONFIG_DIR / CODEX_HOME / 代理 / per-bot 凭证），每个 VAL 做 bash 单引号转义。
+// 该函数把 `-u KEY` token 识别为「移除」，不再被 `eq <= 0` 静默丢掉：Dashboard
+// 复制出来的命令必须和真实 spawn 一致，否则 demoted/fresh 会话会被误 resume。
 export function buildReproduceCommand(input: ReproduceCommandInput): string | null {
   if (isRemoteBackendId(input.backendType)) return null;
   if (!input.bin) return null;
 
-  const parts: string[] = [];
-  // 权威注入 env（KEY=VAL 列表），VAL 做 bash 转义后作为命令前缀。
-  for (const assignment of buildBotmuxEnvAssignments(input.env, input.injectEnv, undefined, input.gitConfigPairs)) {
-    const eq = assignment.indexOf('=');
+  const assignments: string[] = [];
+  const removals: string[] = [];
+  // buildBotmuxEnvAssignments is the single source of truth for WHICH keys are
+  // removable (it applies the same session-env lock rule as the panes).
+  const tokens = buildBotmuxEnvAssignments(input.env, input.injectEnv, input.unsetEnv, input.gitConfigPairs);
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i]!;
+    if (token === '-u') {
+      const key = tokens[i + 1];
+      i += 1;
+      if (key) removals.push(key);
+      continue;
+    }
+    const eq = token.indexOf('=');
     if (eq <= 0) continue;
-    const key = assignment.slice(0, eq);
-    const val = assignment.slice(eq + 1);
-    parts.push(`${key}=${shq(val)}`);
+    const key = token.slice(0, eq);
+    const val = token.slice(eq + 1);
+    assignments.push(`${key}=${shq(val)}`);
+  }
+
+  const parts: string[] = [];
+  if (removals.length > 0) {
+    // `env -u K KEY=VAL cmd` applies the assignments and drops K before exec —
+    // exactly what the pane wrapper does for the real child.
+    parts.push('/usr/bin/env', ...removals.flatMap(key => ['-u', key]), ...assignments);
+  } else {
+    parts.push(...assignments);
   }
   parts.push(shq(input.bin), ...input.args.map(shq));
   const cmd = parts.join(' ');

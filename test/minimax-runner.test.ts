@@ -50,8 +50,9 @@ function runner(extra: string[] = [], hiddenEntry = false) {
   const h = { ...f, child, closed, stdout: '', stderr: '' };
   child.stdout.on('data', chunk => { h.stdout += chunk.toString(); });
   child.stderr.on('data', chunk => { h.stderr += chunk.toString(); });
-  return { h, send(content: string, id: string) {
-    child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId: id })).toString('base64')}\n`);
+  return { h, send(content: string, id: string, dispatchAttempt?: number) {
+    child.stdin.write(`::botmux-minimax:${Buffer.from(JSON.stringify({ type: 'message', content, replyTurnId: id,
+      ...(dispatchAttempt !== undefined ? { replyDispatchAttempt: dispatchAttempt } : {}) })).toString('base64')}\n`);
   } };
 }
 
@@ -152,6 +153,16 @@ describe('MiniMax Code adapter', () => {
     expect(adapter.buildArgs(options)).not.toContain('--turn-timeout-ms');
     const args = adapter.buildArgs({ ...options, turnTimeoutMs: 3_600_000 });
     expect(args[args.indexOf('--turn-timeout-ms') + 1]).toBe('3600000');
+  });
+
+  it('encodes the dispatch attempt into the runner input frame', async () => {
+    const adapter = createMinimaxAdapter('/bin/true');
+    const writes: string[] = [];
+    await adapter.writeInput({ write(chunk: string) { writes.push(chunk); return true; } } as any,
+      'replay', { turnId: 'om_replay', dispatchAttempt: 0 });
+    expect(writes).toHaveLength(1);
+    const payload = JSON.parse(Buffer.from(writes[0].slice('::botmux-minimax:'.length, -1), 'base64').toString('utf8'));
+    expect(payload).toEqual({ type: 'message', content: 'replay', replyTurnId: 'om_replay', replyDispatchAttempt: 0 });
   });
 });
 
@@ -299,16 +310,16 @@ it.each([
     content, nativeSessionId: 'session_fixture', timeoutMs: 5000, permission: 'full' }, AbortSignal.timeout(8000))).rejects.toThrow(error);
 });
 
-it('reports native exec failure with its cause and resumes the next turn', async () => {
+it('reports native exec failure with its cause and resumes the next turn with exact attempt identity', async () => {
   const { h, send } = runner();
   const finals = () => markers(h.stdout).filter(m => m.kind === 'final').map(m => m.payload);
-  send('failed', 'failed');
+  send('failed', 'failed', 0);
   await waitFor(() => finals().length === 1);
-  expect(finals()[0]).toMatchObject({ turnId: 'failed', errorCode: 'execution_failed',
+  expect(finals()[0]).toMatchObject({ turnId: 'failed', dispatchAttempt: 0, errorCode: 'execution_failed',
     content: expect.stringContaining('INTERACTION_NOT_AVAILABLE') });
-  send('healthy', 'next');
+  send('healthy', 'next', 1);
   await waitFor(() => finals().length === 2);
-  expect(finals()[1]).toMatchObject({ turnId: 'next', content: 'answer:healthy' });
+  expect(finals()[1]).toMatchObject({ turnId: 'next', dispatchAttempt: 1, content: 'answer:healthy' });
   expect(finals()[1].errorCode).toBeUndefined();
   const calls = readFileSync(h.log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
   expect(calls[1].args[calls[1].args.indexOf('--session') + 1]).toBe('session_fixture');

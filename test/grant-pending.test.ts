@@ -9,16 +9,19 @@ import {
   openPending,
   openPendingMulti,
   checkNonce,
+  claimPendingGrant,
   clearPending,
   getPendingGrantLimits,
   getPendingMessage,
   markDenied,
   markPendingDelivered,
   isThrottled,
+  holdPendingMessage,
   throttleReason,
   updatePendingGrantLimits,
   tryReserveOwnerDmSlot,
   releaseOwnerDmSlot,
+  MAX_HELD_GRANT_MESSAGES,
   OWNER_DM_MAX_PER_WINDOW,
   _resetForTest,
   _simulateRestartForTest,
@@ -26,6 +29,7 @@ import {
   _filePathForTest,
   _ownerDmKeyCountForTest,
 } from '../src/im/lark/grant-pending.js';
+import { logger } from '../src/utils/logger.js';
 
 beforeEach(() => { _resetForTest(); vi.useFakeTimers(); });
 afterEach(() => vi.useRealTimers());
@@ -359,5 +363,115 @@ describe('grant-pending — survives daemon restart', () => {
     markDenied('a1', 'oc_1', 'ou_denied');
     const persisted = JSON.parse(readFileSync(_filePathForTest('a1'), 'utf-8'));
     expect(Object.keys(persisted.entries).sort()).toEqual(['oc_1:ou_denied', 'oc_1:ou_sent']);
+  });
+});
+
+// ─── 待批期间机器人发送方被节流挡下的消息：挂在 pending 上，批准后按到达顺序交回重放 ──────────
+describe('grant-pending — messages held while a request card is pending', () => {
+  const HOUR = 60 * 60 * 1000;
+  const ev = (id: string) => ({
+    message: { message_id: id, chat_id: 'oc_1', content: `{"text":"task ${id}"}` },
+    sender: { sender_id: { open_id: 'ou_bot' }, sender_type: 'bot' },
+  });
+  const hold = (id: string) => holdPendingMessage('a1', 'oc_1', 'ou_bot', ev(id));
+
+  afterEach(() => vi.restoreAllMocks());
+
+  function deliveredCard(): string {
+    const nonce = openPending('a1', 'oc_1', 'ou_bot', 3, ev('om_1'), HOUR);
+    markPendingDelivered('a1', 'oc_1', ['ou_bot'], nonce);
+    return nonce;
+  }
+  function claimIds(nonce: string): { trigger?: string; held: string[] } {
+    const claim = claimPendingGrant('a1', 'oc_1', ['ou_bot'], nonce);
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return { held: [] };
+    return { trigger: claim.messageData?.message?.message_id, held: (claim.heldMessages ?? []).map(m => m.message.message_id) };
+  }
+
+  it('approval hands back the trigger and then the held messages in arrival order', () => {
+    const nonce = deliveredCard();
+    expect(hold('om_2')).toBe('held');
+    expect(hold('om_3')).toBe('held');
+    expect(claimIds(nonce)).toEqual({ trigger: 'om_1', held: ['om_2', 'om_3'] });
+  });
+
+  it('held messages survive a restart with the card, including ones held before the delivery ack', () => {
+    const nonce = openPending('a1', 'oc_1', 'ou_bot', 3, ev('om_1'), HOUR);
+    expect(hold('om_2')).toBe('held');
+    markPendingDelivered('a1', 'oc_1', ['ou_bot'], nonce);
+    expect(hold('om_3')).toBe('held');
+    _simulateRestartForTest();
+    expect(claimIds(nonce)).toEqual({ trigger: 'om_1', held: ['om_2', 'om_3'] });
+  });
+
+  it('an approval rolled back by restore keeps the held messages for the next click, across a restart too', () => {
+    const nonce = deliveredCard();
+    hold('om_2');
+    const first = claimPendingGrant('a1', 'oc_1', ['ou_bot'], nonce);
+    expect(first.ok).toBe(true);
+    if (first.ok) first.restore();
+    _simulateRestartForTest();
+    expect(claimIds(nonce)).toEqual({ trigger: 'om_1', held: ['om_2'] });
+  });
+
+  it('refuses to hold without a pending card or after a denial', () => {
+    expect(hold('om_x')).toBe('not_pending');
+    deliveredCard();
+    markDenied('a1', 'oc_1', 'ou_bot');
+    expect(hold('om_y')).toBe('not_pending');
+  });
+
+  it('a redelivered message is held once, and the trigger itself is never held again', () => {
+    const nonce = deliveredCard();
+    expect(hold('om_1')).toBe('duplicate');
+    expect(hold('om_2')).toBe('held');
+    expect(hold('om_2')).toBe('duplicate');
+    expect(claimIds(nonce).held).toEqual(['om_2']);
+  });
+
+  it('one sender cannot grow the hold list without bound', () => {
+    deliveredCard();
+    for (let i = 0; i < MAX_HELD_GRANT_MESSAGES; i++) expect(hold(`om_cap_${i}`)).toBe('held');
+    expect(hold('om_overflow')).toBe('full');
+  });
+
+  it.each([
+    ['denied', () => { markDenied('a1', 'oc_1', 'ou_bot'); }],
+    ['withdrawn', () => { clearPending('a1', 'oc_1', 'ou_bot'); }],
+    ['left to expire', () => { vi.advanceTimersByTime(24 * HOUR + 1); isThrottled('a1', 'oc_1', 'ou_bot'); }],
+  ])('held messages dropped because the card was %s are named in an info log', (_why, drop) => {
+    const nonce = deliveredCard();
+    hold('om_held');
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+    drop();
+    expect(info.mock.calls.some(c => String(c[0]).includes('om_held'))).toBe(true);
+    expect(claimPendingGrant('a1', 'oc_1', ['ou_bot'], nonce).ok).toBe(false);
+  });
+
+  it('a new card replacing an unhandled one carries its trigger and held messages over, past the cap only with a log', () => {
+    deliveredCard();
+    for (let i = 2; i <= MAX_HELD_GRANT_MESSAGES + 1; i++) hold(`om_${i}`);
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+    const nonce = openPendingMulti('a1', 'oc_1', ['ou_bot'], 10, undefined, HOUR);
+    expect(info.mock.calls.some(c => String(c[0]).includes(`om_${MAX_HELD_GRANT_MESSAGES + 1}`))).toBe(true);
+    const { trigger, held } = claimIds(nonce);
+    expect(trigger).toBeUndefined();
+    expect(held).toEqual(Array.from({ length: MAX_HELD_GRANT_MESSAGES }, (_, i) => `om_${i + 1}`));
+  });
+
+  it('a carried message that is also the new card\'s trigger is replayed only once', () => {
+    deliveredCard();
+    hold('om_2');
+    const nonce = openPending('a1', 'oc_1', 'ou_bot', 3, ev('om_2'), HOUR);
+    expect(claimIds(nonce)).toEqual({ trigger: 'om_2', held: ['om_1'] });
+  });
+
+  it('a card replacing a denied entry carries nothing over', () => {
+    deliveredCard();
+    hold('om_2');
+    markDenied('a1', 'oc_1', 'ou_bot');
+    const nonce = openPendingMulti('a1', 'oc_1', ['ou_bot'], 10, undefined, HOUR);
+    expect(claimIds(nonce)).toEqual({ trigger: undefined, held: [] });
   });
 });

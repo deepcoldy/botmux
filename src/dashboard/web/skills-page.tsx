@@ -103,6 +103,24 @@ interface SkillsInstallPanelProps {
   onOpenNativeDiscovery: () => void;
 }
 
+/**
+ * 更新一个已安装 Skill：起 update 任务并等它跑完。成功后提示「运行中的会话要 /restart
+ * 或新开会话」——运行中的会话用的是技能快照（core/skills/snapshot.ts），更新不会推给它们。
+ * 失败原样抛给调用方（toast）。
+ */
+export async function runSkillUpdate(name: string, deps: {
+  request(url: string, init: { method: string; body: string }): Promise<any>;
+  waitForJob(job: SkillJob): Promise<SkillJob | null>;
+  isMounted(): boolean;
+  setStatus(status: StatusMessage): void;
+  tr(key: string): string;
+}): Promise<void> {
+  const body = await deps.request(`/api/skills/${encodeURIComponent(name)}/update`, { method: 'POST', body: '{}' });
+  if (!deps.isMounted()) return;
+  const done = await deps.waitForJob(body.job as SkillJob);
+  if (done && deps.isMounted()) deps.setStatus({ text: `${deps.tr('skills.saved')} ${deps.tr('skills.updateRestartHint')}`, ok: true });
+}
+
 export function SkillsInstallPanel(props: SkillsInstallPanelProps) {
   const tr = useT();
   const selectionDialogRef = useRef<HTMLDialogElement | null>(null);
@@ -1278,9 +1296,13 @@ export function SkillsPage() {
   async function updateSkill(name: string): Promise<void> {
     setSkillBusy(`${name}:update`);
     try {
-      const body = await requestJson(`/api/skills/${encodeURIComponent(name)}/update`, { method: 'POST', body: '{}' });
-      if (!mountedRef.current) return;
-      await waitForSkillJob(body.job as SkillJob, setInstallStatus);
+      await runSkillUpdate(name, {
+        request: requestJson,
+        waitForJob: job => waitForSkillJob(job, setInstallStatus),
+        isMounted: () => mountedRef.current,
+        setStatus: setInstallStatus,
+        tr,
+      });
     } catch (err: any) {
       if (mountedRef.current) toast(`${tr('skills.failed')}: ${mapInstallError(err?.message ?? String(err))}`, { kind: 'error' });
     } finally {

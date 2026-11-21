@@ -1,10 +1,11 @@
-import { type ChildProcess } from 'node:child_process';
+import { spawnSync, type ChildProcess } from 'node:child_process';
 import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
 import {
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -34,11 +35,16 @@ interface WorkerHarness {
   projectHooksBefore: string;
   root: string;
   sessionId: string;
+  /** Private TMUX_TMPDIR the worker was spawned with; its `-L botmux` socket must live here. */
+  tmuxRoot: string;
 }
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
-const tmuxSessions = new Set<string>();
+/** tmux session → the env its worker ran with (so cleanup reaches the same private server). */
+const tmuxSessions = new Map<string, NodeJS.ProcessEnv>();
+/** Private TMUX_TMPDIR roots created for workers; their servers are killed via -S before removal. */
+const tmuxRoots = new Set<string>();
 let sequence = 0;
 
 const tmuxAvailable = probeTmuxFunctional().ok;
@@ -141,7 +147,9 @@ if (argv[0] === '--version') {
   process.stdout.write('fake cli 1.0.0\\n');
   process.exit(0);
 }
-if (argv[0] === 'app-server') {
+// The engine legitimately prepends a global --dangerously-bypass-hook-trust
+// before the app-server subcommand, so dispatch on presence, not argv[0].
+if (argv.includes('app-server')) {
   await import(pathToFileURL(process.env.RPC_FIXTURE_PATH).href);
 } else {
   process.stdout.write('\\n› \\n');
@@ -154,8 +162,16 @@ if (argv[0] === 'app-server') {
   const sessionId = `h${(++sequence).toString(36)}${process.pid.toString(36)}${Date.now().toString(36)}`;
   const logs: string[] = [];
   const messages: WorkerToDaemon[] = [];
-  const workerEnv = {
+  // 自带私有 tmux 目录，不依赖全局 tmux 围栏。没有它时，TMUX_TMPDIR 为空的运行（例如绕过
+  // setupFiles 的全量）会让 worker 的 `-L botmux` 落到宿主 /tmp/tmux-<uid>/botmux，和线上
+  // fleet 共用同一个 server：2026-11-06 本文件的 worker 就在宿主 socket 上起了 server，线上
+  // 会话被迁到它上面，测试结束 server 退出，又断了一次。目录必须预先存在（tmux 对不存在的
+  // TMUX_TMPDIR 会静默回落 /tmp），路径要短（unix socket 路径上限约 104 字节）。
+  const tmuxRoot = mkdtempSync('/tmp/bmx-tx-');
+  tmuxRoots.add(tmuxRoot);
+  const workerEnv: NodeJS.ProcessEnv = {
     ...process.env,
+    TMUX_TMPDIR: tmuxRoot,
     HOME: root,
     USERPROFILE: root,
     NODE_ENV: 'test',
@@ -165,6 +181,12 @@ if (argv[0] === 'app-server') {
     LARK_APP_ID: 'ambient-app-id-must-be-redacted',
     LARK_APP_SECRET: 'ambient-secret-must-be-redacted',
   };
+  delete workerEnv.TMUX;
+  delete workerEnv.TMUX_PANE;
+  // socket 名由 BOTMUX_TMUX_SOCKET 决定（preferredManagedTmuxSocket，文档化的逃生阀），
+  // 而测试围栏不清这个变量；继承宿主环境会让下面的私有 socket 断言随宿主配置假红。
+  // 本文件只断言默认命名（-L botmux）下的私有目录语义。
+  delete workerEnv.BOTMUX_TMUX_SOCKET;
   const child = spawnTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: workerEnv,
@@ -215,11 +237,23 @@ if (argv[0] === 'app-server') {
   };
   child.send(init);
 
-  if (options.backendType === 'tmux') tmuxSessions.add(`bmx-${sessionId.slice(0, 8)}`);
+  if (options.backendType === 'tmux') tmuxSessions.set(`bmx-${sessionId.slice(0, 8)}`, workerEnv);
   return {
     child, capturePath, globalHooksPath, globalHooksBefore, logs, messages,
-    projectHooksPath, projectHooksBefore, root, sessionId,
+    projectHooksPath, projectHooksBefore, root, sessionId, tmuxRoot,
   };
+}
+
+/**
+ * Where the worker's managed (`-L botmux`) server socket MUST be. Pinning this
+ * is the regression tripwire for the private TMUX_TMPDIR below: the global test
+ * fence injects a TMUX_TMPDIR of its own, so a run under the standard config
+ * stays green even if the worker stopped overriding it — the worker would
+ * silently depend on the fence again and a fence-bypassing run would land on
+ * the host socket (2026-11-06 outage).
+ */
+function privateManagedSocketPath(harness: WorkerHarness): string {
+  return join(harness.tmuxRoot, `tmux-${process.getuid?.() ?? 0}`, 'botmux');
 }
 
 function expectAuthenticatedSessionEnv(record: LaunchRecord, sessionId: string): void {
@@ -250,10 +284,21 @@ function expectHookFilesUnchanged(harness: WorkerHarness): void {
 afterEach(async () => {
   await Promise.all([...children].map(stopChild));
   children.clear();
-  for (const session of tmuxSessions) {
-    killWorkerTmuxSession(session);
+  for (const [session, env] of tmuxSessions) {
+    killWorkerTmuxSession(session, env);
   }
   tmuxSessions.clear();
+  // Only this file's own servers: every socket lives under a root it created.
+  const uidDir = `tmux-${process.getuid?.() ?? 0}`;
+  for (const tmuxRoot of tmuxRoots) {
+    let sockets: string[] = [];
+    try { sockets = readdirSync(join(tmuxRoot, uidDir)); } catch { /* no server was ever started */ }
+    for (const socket of sockets) {
+      spawnSync('tmux', ['-S', join(tmuxRoot, uidDir, socket), 'kill-server'], { stdio: 'ignore', timeout: 3_000 });
+    }
+    rmSync(tmuxRoot, { recursive: true, force: true });
+  }
+  tmuxRoots.clear();
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
   tempDirs.clear();
 });
@@ -302,6 +347,10 @@ describe('TRAE native subagent hook worker launches', () => {
     expectSingleNativeHook(launches[0]);
     expectAuthenticatedSessionEnv(launches[0], harness.sessionId);
     expectHookFilesUnchanged(harness);
+    expect(
+      existsSync(privateManagedSocketPath(harness)),
+      'managed tmux server must run under the harness private TMUX_TMPDIR, not the fence/host socket',
+    ).toBe(true);
   }, 25_000);
 
   it.skipIf(!tmuxAvailable)('puts the hook on the Trae RPC app-server but not its remote viewer', async () => {
@@ -310,22 +359,25 @@ describe('TRAE native subagent hook worker launches', () => {
       harness,
       () => {
         const launches = readLaunches(harness.capturePath);
-        return launches.some(record => record.argv[0] === 'app-server')
-          && launches.some(record => record.argv[0] === '--remote')
+        return launches.some(record => record.argv.includes('app-server'))
+          && launches.some(record => record.argv.includes('--remote'))
           && harness.messages.some(message => message.type === 'ready');
       },
       'Trae app-server and remote viewer launches',
       20_000,
     );
     const launches = readLaunches(harness.capturePath);
-    const appServer = launches.find(record => record.argv[0] === 'app-server');
-    const viewer = launches.find(record => record.argv[0] === '--remote');
+    const appServer = launches.find(record => record.argv.includes('app-server'));
+    const viewer = launches.find(record => record.argv.includes('--remote'));
     expect(appServer).toBeDefined();
     expect(viewer).toBeDefined();
     expectSingleNativeHook(appServer!);
     expect(appServer!.argv).toContain('default_mode_request_user_input');
     expect(hookOverrides(viewer!.argv)).toEqual([]);
+    // The RPC viewer shares the app-server's hook-trust version gate: the flag
+    // leads before the --remote subcommand, while no native subagent hook rides.
     expect(viewer!.argv).toEqual([
+      '--dangerously-bypass-hook-trust',
       '--remote', expect.stringMatching(/^ws:\/\/127\.0\.0\.1:\d+$/),
       'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false',
       '-c', 'notice.hide_rate_limit_model_nudge=true', 'thread-fake-1',
@@ -334,6 +386,10 @@ describe('TRAE native subagent hook worker launches', () => {
     expectAuthenticatedSessionEnv(viewer!, harness.sessionId);
     expect(appServer!.env.BOTMUX_SESSION_SCOPE).toBe('thread');
     expectHookFilesUnchanged(harness);
+    expect(
+      existsSync(privateManagedSocketPath(harness)),
+      'managed tmux server must run under the harness private TMUX_TMPDIR, not the fence/host socket',
+    ).toBe(true);
   }, 25_000);
 
   it.skipIf(directPtyUnavailableInBun)(`keeps a non-Trae worker launch free of the Trae hook (${DIRECT_PTY_BUN_SKIP_REASON})`, async () => {
@@ -372,5 +428,9 @@ describe('TRAE native subagent hook worker launches', () => {
     expectAuthenticatedSessionEnv(appServer!, harness.sessionId);
     expectAuthenticatedSessionEnv(viewer!, harness.sessionId);
     expectHookFilesUnchanged(harness);
+    expect(
+      existsSync(privateManagedSocketPath(harness)),
+      'managed tmux server must run under the harness private TMUX_TMPDIR, not the fence/host socket',
+    ).toBe(true);
   }, 25_000);
 });

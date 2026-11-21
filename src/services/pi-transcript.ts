@@ -66,7 +66,7 @@
  * matching turn — identical to Codex/Grok. Non-steered turns stay strictly
  * interleaved (user → assistant_final → user → assistant_final).
  */
-import { closeSync, existsSync, openSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { codexTaskFailureCode, safeFailureSummary, type CodexCotEntry } from './codex-transcript.js';
@@ -326,8 +326,20 @@ export function findPiTranscriptBySessionId(
   sessionsRoot: string = PI_SESSIONS_ROOT,
 ): string | undefined {
   if (!cliSessionId || !SESSION_UUID_RE.test(cliSessionId)) return undefined;
-  const suffix = `_${cliSessionId}.jsonl`;
   const cwds = cwd ? piCwdVariants(cwd) : [];
+  // Once the session has its own dir, Pi only ever reads and writes there
+  // (see piBotmuxSessionTranscript): look nowhere else, or a stale copy in a
+  // native bucket pins the bridge to a file Pi will not write again. No match
+  // for this cwd yet = Pi has not written this cwd's file; wait for it.
+  if (piSessionUsesBotmuxDir(cliSessionId, sessionsRoot)) {
+    return piBotmuxSessionTranscript(cliSessionId, sessionsRoot, cwds);
+  }
+  return findPiNativeTranscript(cliSessionId, cwds, sessionsRoot);
+}
+
+/** Pi's native layout: cwd buckets first, then a cwd-checked walk of the tree. */
+function findPiNativeTranscript(cliSessionId: string, cwds: string[], sessionsRoot: string): string | undefined {
+  const suffix = `_${cliSessionId}.jsonl`;
   for (const variant of cwds) {
     const dir = join(sessionsRoot, piSessionDirName(variant));
     let names: string[];
@@ -357,6 +369,81 @@ export function findPiTranscriptBySessionId(
     }
   }
   return undefined;
+}
+
+/** `<sessionsRoot>/botmux/<sessionId>`: the transcript dir of one session
+ *  under the file sandbox (the shared tree around it is masked there). */
+export function piBotmuxSessionDirIn(sessionsRoot: string, sessionId: string): string {
+  return join(sessionsRoot, 'botmux', sessionId);
+}
+
+/** The session already keeps its transcripts in its own dir (any file there,
+ *  whatever its cwd): from then on Pi is always given that `--session-dir`. */
+export function piSessionUsesBotmuxDir(sessionId: string, sessionsRoot: string = PI_SESSIONS_ROOT): boolean {
+  return piBotmuxSessionTranscript(sessionId, sessionsRoot) !== undefined;
+}
+
+/** The session's transcript in its own dir, if it has one. Once a session has
+ *  run sandboxed, that dir is where its history is, sandbox on or off: Pi only
+ *  looks up `--session-id` inside its `--session-dir`. */
+export function piBotmuxSessionTranscript(
+  sessionId: string,
+  sessionsRoot: string = PI_SESSIONS_ROOT,
+  /** Resolved cwd variants. Pi keeps one file per cwd in the dir (a `/cd`
+   *  starts a new one), so a file naming another cwd is not this run's. */
+  cwds: readonly string[] = [],
+): string | undefined {
+  if (!sessionId || !SESSION_UUID_RE.test(sessionId)) return undefined;
+  const dir = piBotmuxSessionDirIn(sessionsRoot, sessionId);
+  let names: string[];
+  try { names = readdirSync(dir); } catch { return undefined; }
+  const name = names
+    .filter(n => n.endsWith(`_${sessionId}.jsonl`))
+    .sort()
+    .reverse()
+    .find(n => {
+      if (cwds.length === 0) return true;
+      // Strict, as Pi is when it looks a session up inside --session-dir: a
+      // file without a cwd header is one Pi would skip, so the bridge must too.
+      const headerCwd = piTranscriptHeaderCwd(join(dir, n));
+      return headerCwd !== undefined && cwds.includes(resolve(headerCwd));
+    });
+  return name ? join(dir, name) : undefined;
+}
+
+/**
+ * Before a sandboxed resume: copy the session's transcript from Pi's native
+ * cwd bucket into its own dir, so `--session-dir` resumes the conversation the
+ * session had before the sandbox was turned on instead of silently starting a
+ * new one. Copy, not move: the original stays where an unsandboxed Pi (or a
+ * user) would look for it; the bridge prefers the own dir from now on.
+ */
+export function adoptPiTranscriptIntoBotmuxDir(
+  sessionId: string,
+  cwd: string | undefined,
+  sessionsRoot: string = PI_SESSIONS_ROOT,
+): { status: 'copied'; from: string; to: string } | { status: 'skipped'; reason: 'already-own' | 'not-found' } {
+  const cwds = cwd ? piCwdVariants(cwd) : [];
+  // Per cwd, as Pi resumes per cwd: a session that moved dirs may have history
+  // for this cwd only in the native bucket even though its own dir has another.
+  if (piBotmuxSessionTranscript(sessionId, sessionsRoot, cwds)) return { status: 'skipped', reason: 'already-own' };
+  // Native buckets only: the own-dir lookup above already came up empty.
+  const from = findPiNativeTranscript(sessionId, cwds, sessionsRoot);
+  if (!from) return { status: 'skipped', reason: 'not-found' };
+  const dir = piBotmuxSessionDirIn(sessionsRoot, sessionId);
+  const to = join(dir, from.slice(from.lastIndexOf('/') + 1));
+  // Never leave a half copy behind: it would read as "already adopted" next
+  // time and orphan the real history.
+  const tmp = `${to}.copying`;
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    copyFileSync(from, tmp);
+    renameSync(tmp, to);
+  } catch (err) {
+    rmSync(tmp, { force: true });
+    throw err;
+  }
+  return { status: 'copied', from, to };
 }
 
 export function findPiTranscriptByPid(pid: number): { path: string; cliSessionId: string } | undefined {

@@ -20,13 +20,15 @@ import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.j
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { validateCodexAppManagedSendOrigin } from '../src/utils/codex-app-dispatch-ledger.js';
-import { DISPATCH_USER_DELIVERY_MAX_BYTES, dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
+import { DISPATCH_USER_DELIVERY_MAX_BYTES, directHumanForDispatchOnly, dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import {
   isDispatchOriginNotSendableError,
   isolatedDispatchOutputSinkAllowed,
   withIsolatedDispatchSinkFence,
 } from '../src/core/dispatch-output-sink.js';
+import { dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
+import { allowsPersonalIdentityForTurn } from '../src/core/workflow-event-turn.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 function routeHandler(routeConstant: string): string {
@@ -121,6 +123,7 @@ function run(
     getDashboardAdminOpenIds: () => [],
     dispatchUserForTurn: async () => undefined,
     pickTurnReplyTarget: () => undefined, dispatchCallerFromReply,
+    dispatchOnlyToolsForTurn, directHumanForDispatchOnly, allowsPersonalIdentityForTurn,
     fallbackTurnId, frozenReplyContextForTurn,
     config: { session: { dataDir: '/nonexistent' } },
     join, logger: { info: vi.fn(), warn: vi.fn() },

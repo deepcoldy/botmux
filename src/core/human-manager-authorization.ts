@@ -5,7 +5,7 @@ interface ManagerAuthorizationInput {
   sessionId: string;
   appId: string;
   chatId: string;
-  action: 'set' | 'clear';
+  action: 'set' | 'clear' | 'lead-only-on' | 'lead-only-off';
   targetOpenId?: string;
   claim: Record<string, unknown>;
   liveOrigin(): VcMeetingLiveManagedOrigin | undefined;
@@ -59,7 +59,7 @@ export async function authorizeHumanManager(input: ManagerAuthorizationInput): P
     text = text.split(mention.key).join('');
   }
   text = text.trim();
-  const command = text.match(/^(?:请\s*)?(?:执行\s*)?(?:botmux\s+)?\/?manager\s+(set|clear)[。.!！]?$/i)?.[1]?.toLowerCase();
+  const command = text.match(/^(?:请\s*)?(?:执行\s*)?(?:botmux\s+)?\/?manager\s+(set|clear|lead-only\s+on|lead-only\s+off)[。.!！]?$/i)?.[1]?.toLowerCase().replace(/\s+/, '-');
   const nomination = /^(?:请)?(?:你)?(?:作为|担任|担任本群的|作为本群的|设为本群的|设为)(?:本群)?(?:负责人|管理员)(?:[，,]\s*(?:请)?执行\s*(?:botmux\s+)?manager\s+set)?[。！!]?$/i.test(text);
   if (command !== input.action && !(input.action === 'set' && nomination)) return { ok: false, error: 'explicit_manager_instruction_required' };
   return { ok: true, requester: sender.id, turnId, stillCurrent: () => proof().ok };

@@ -76,18 +76,18 @@ describe('GET /api/cli-options/models — 200 响应 shape', () => {
   });
 
   it('live 能力目录作为可选 modelCapabilities 字段追加，不替换旧三字段', async () => {
-    const body = await buildModelChoicesResponse('gemini', {
+    const body = await buildModelChoicesResponse('opencode', {
       now: () => 1_700_000_000_002,
       adapterFactory: () => ({
-        detectModelCapabilities: async () => [{ slug: 'gemini-live', serviceTiers: ['priority'] }],
+        detectModelCapabilities: async () => [{ slug: 'opencode-live', serviceTiers: ['priority'] }],
       } as any),
     });
     expect(body.modelCapabilities).toEqual([
-      { slug: 'gemini-live', serviceTiers: ['priority'] },
+      { slug: 'opencode-live', serviceTiers: ['priority'] },
     ]);
     expect(body.source).toBe('live');
     expect(body.detectedAt).toBe(1_700_000_000_002);
-    expect(body.models).toContain('gemini-live');
+    expect(body.models).toContain('opencode-live');
   });
 
   it('未知 key 的响应构造也是 fail-soft（空 models + static），400 由路由在更外层拦截', async () => {

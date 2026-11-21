@@ -1,3 +1,7 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件会写入并删除 dashboardSecretPath()（由 homedir() 推导）；2026-11-06 一次
+// 绕过 setupFiles 的全量运行里，这类写入和删除落在了真实的 ~/.botmux/.dashboard-secret 上。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { type ChildProcess } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -14,6 +18,15 @@ import {
   deriveTerminalWriteToken,
 } from '../src/core/terminal-write-auth.js';
 import { dashboardSecretPath } from '../src/core/dashboard-secret.js';
+/** dashboardSecretPath()，但只在它落在本文件的测试围栏里时才返回，否则拒绝读写。 */
+function fencedSecretPath(): string {
+  const path = dashboardSecretPath();
+  if (!isInsideDir(path, process.env.__TEST_DATA_DIR_FENCE)) {
+    throw new Error(`refusing to touch ${path}: it is not inside the test fence`);
+  }
+  return path;
+}
+
 import { buildTerminalUrl, resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
 import {
   deriveWorkerViewGeneration,
@@ -676,8 +689,8 @@ setInterval(() => {}, 1_000);
     writeFileSync(join(botmuxDir, '.dashboard-secret'), secret, { mode: 0o600 });
     // daemon 侧（本进程）读同一把 host-only secret；单测进程的 HOME 被 unit-setup
     // 围到另一个临时目录，所以在那边放同样的值。
-    mkdirSync(dirname(dashboardSecretPath()), { recursive: true, mode: 0o700 });
-    writeFileSync(dashboardSecretPath(), secret, { mode: 0o600 });
+    mkdirSync(dirname(fencedSecretPath()), { recursive: true, mode: 0o700 });
+    writeFileSync(fencedSecretPath(), secret, { mode: 0o600 });
     const fakeCli = join(root, 'fake-claude');
     writeFileSync(fakeCli, `#!/usr/bin/env node
 process.stdin.setRawMode?.(true);
@@ -701,7 +714,7 @@ setInterval(() => {}, 1_000);
       });
     } finally {
       resetTerminalProxy();
-      rmSync(dashboardSecretPath(), { force: true });
+      rmSync(fencedSecretPath(), { force: true });
     }
     const viewToken = new URL(rebuiltLink).searchParams.get('viewToken');
     expect(viewToken).toBeTruthy();

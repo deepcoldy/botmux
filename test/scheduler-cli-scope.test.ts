@@ -59,4 +59,22 @@ describe('botmux schedule add flag validation', () => {
       expect(run.stderr, position).toContain('--follow-active');
     }
   }, 240_000);
+
+  it.each([
+    ['spaced', ['--run-as', 'ou_abcd1234']],
+    ['equals', ['--run-as=ou_abcd1234']],
+  ])('lets a host-terminal %s --run-as through to chat inference', (_label, flag) => {
+    const run = scheduleAdd(...flag);
+    expect(run.status).toBe(1);
+    expect(run.stderr).not.toContain('--run-as');
+  }, 180_000);
+
+  it.each([
+    ['spaced', ['--run-as', '']],
+    ['equals', ['--run-as=']],
+  ])('rejects an empty host-terminal %s --run-as value', (_label, flag) => {
+    const run = scheduleAdd(...flag);
+    expect(run.status).toBe(1);
+    expect(run.stderr).toContain('--run-as');
+  }, 180_000);
 });

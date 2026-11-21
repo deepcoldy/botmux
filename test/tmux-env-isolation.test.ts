@@ -45,6 +45,25 @@ describe('tmuxEnv()', () => {
     expect(stripped.LANG).toBe('en_US.UTF-8');
   });
 
+  it('strips only Trae git-attribution injection before contacting tmux', () => {
+    const stripped = tmuxEnv({
+      PATH: '/usr/bin',
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'core.hooksPath',
+      GIT_CONFIG_VALUE_0: '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a',
+      GIT_CONFIG_KEY_1: 'core.hooksPath',
+      GIT_CONFIG_VALUE_1: '.githooks',
+      TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
+    });
+    // The Trae entry is filtered first; tmuxEnv then applies its pre-existing
+    // rule that no per-turn GIT_CONFIG slots may seed a shared tmux server.
+    expect(stripped.GIT_CONFIG_COUNT).toBeUndefined();
+    expect(stripped.GIT_CONFIG_KEY_0).toBeUndefined();
+    expect(stripped.GIT_CONFIG_VALUE_0).toBeUndefined();
+    expect(stripped.GIT_CONFIG_KEY_1).toBeUndefined();
+    expect(stripped.TRAE_GIT_ATTRIBUTION_HELPER).toBeUndefined();
+  });
+
   it('leaves TMUX_TMPDIR alone (user override, not tmux-injected)', () => {
     const stripped = tmuxEnv({
       TMUX: '/tmp/tmux-99999/missing,12345,0',
@@ -326,6 +345,14 @@ describe('tmux subcommand with stale $TMUX', () => {
         // transcripts (CLAUDE_CODE_CHILD_SESSION → nested-child mode).
         CLAUDE_CODE_CHILD_SESSION: '1',
         CLAUDE_CODE_SESSION_ID: 'stale-claude-session',
+        GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: 'user.name',
+        GIT_CONFIG_VALUE_0: 'Example User',
+        GIT_CONFIG_KEY_1: 'core.hooksPath',
+        GIT_CONFIG_VALUE_1: '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a',
+        GIT_CONFIG_PARAMETERS:
+          "'user.email=dev@example.com' 'core.hookspath=/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a'",
+        TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
         HOME: '/safe/home',
       };
       delete pollutedEnv.TMUX;
@@ -349,6 +376,12 @@ describe('tmux subcommand with stale $TMUX', () => {
         ]));
         expect(scrub.removed).not.toContain('GITHUB_TOKEN');
         expect(scrub.removed).not.toContain('GH_TOKEN');
+        expect(scrub.removed).toEqual(expect.arrayContaining([
+          'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1', 'TRAE_GIT_ATTRIBUTION_HELPER',
+        ]));
+        expect(scrub.updated).toEqual(expect.arrayContaining([
+          'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+        ]));
 
         const globalEnv = spawnSync('tmux', ['-L', sock, 'show-environment', '-g'], {
           env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
@@ -357,6 +390,12 @@ describe('tmux subcommand with stale $TMUX', () => {
         expect(globalEnv.stdout).toContain('HOME=/safe/home');
         expect(globalEnv.stdout).toContain('GITHUB_TOKEN=ghp_server_global');
         expect(globalEnv.stdout).toContain('GH_TOKEN=ghs_server_global');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_COUNT=1');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_KEY_0=user.name');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_VALUE_0=Example User');
+        expect(globalEnv.stdout).toContain("GIT_CONFIG_PARAMETERS='user.email=dev@example.com'");
+        expect(globalEnv.stdout).not.toContain('commit-attribution');
+        expect(globalEnv.stdout).not.toContain('TRAE_GIT_ATTRIBUTION_HELPER');
         for (const key of [
           'BOTMUX_SESSION_ID', 'BOTMUX_CHAT_ID', 'CODEX_HOME', 'HERMES_HOME', 'LARK_APP_ID',
           'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
@@ -403,6 +442,236 @@ describe('tmux subcommand with stale $TMUX', () => {
       } finally {
         spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
         rmSync(dir, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub preserves complete user numbered slots when only GIT_CONFIG_PARAMETERS carries the Trae hook',
+    () => {
+      // The promotion block in scrubTmuxServerGlobalEnv has one job no other
+      // branch covers: when the Trae entry arrives ONLY via GIT_CONFIG_PARAMETERS
+      // while the numbered slots are the user's own complete config, COUNT's
+      // value is unchanged and therefore absent from changedKeys — but COUNT
+      // rides BOTMUX_INJECTED_ENV_KEYS into the generic unset list. Without the
+      // promotion it is unset while KEY_0..n survive, orphaning the user's
+      // config (git only reads slots below COUNT).
+      const sock = `bmx-scrub-trae-params-${process.pid}-${Date.now()}`;
+      const traeHooks = '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a';
+      try {
+        const seededEnv = { ...process.env };
+        delete seededEnv.TMUX;
+        delete seededEnv.TMUX_PANE;
+        Object.assign(seededEnv, {
+          GIT_CONFIG_COUNT: '2',
+          GIT_CONFIG_KEY_0: 'user.name',
+          GIT_CONFIG_VALUE_0: 'Example User',
+          GIT_CONFIG_KEY_1: 'user.email',
+          GIT_CONFIG_VALUE_1: 'dev@example.com',
+          GIT_CONFIG_PARAMETERS: `'core.hooksPath=${traeHooks}'`,
+          TRAE_GIT_ATTRIBUTION_HELPER: '/old/traex',
+        });
+        const boot = spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', '--', '/bin/sh', '-c', 'sleep 30'], {
+          env: seededEnv, encoding: 'utf-8', timeout: 10_000,
+        });
+        expect(boot.status, boot.stderr).toBe(0);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+        expect(scrub.failed).toEqual([]);
+        expect(scrub.removed).toEqual(expect.arrayContaining([
+          'GIT_CONFIG_PARAMETERS', 'TRAE_GIT_ATTRIBUTION_HELPER',
+        ]));
+        expect(scrub.removed.some(name => /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(name))).toBe(false);
+        expect(scrub.updated).toContain('GIT_CONFIG_COUNT');
+
+        const globalEnv = spawnSync('tmux', ['-L', sock, 'show-environment', '-g'], {
+          env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
+        });
+        expect(globalEnv.status, globalEnv.stderr).toBe(0);
+        // The complete user-owned numbered contract survives intact.
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_COUNT=2');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_KEY_0=user.name');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_VALUE_0=Example User');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_KEY_1=user.email');
+        expect(globalEnv.stdout).toContain('GIT_CONFIG_VALUE_1=dev@example.com');
+        // …while every trace of the Trae hook contract is repaired out.
+        expect(globalEnv.stdout).not.toContain('commit-attribution');
+        expect(globalEnv.stdout).not.toMatch(/(?:^|\n)-?TRAE_GIT_ATTRIBUTION_HELPER(?:=|\n|$)/);
+        expect(globalEnv.stdout).not.toMatch(/(?:^|\n)-?GIT_CONFIG_PARAMETERS(?:=|\n|$)/);
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
+      }
+    },
+    30_000,
+  );
+
+  // 行为护栏：`tmux show-environment` 的渲染是有损的——值里的非 ASCII 字节按
+  // CLIENT 的 locale 变成 `_`（本机 fleet 的 daemon 没有 LANG/LC_*，即 C 语义），
+  // 多行值还会在第一条含 `=` 的续行处被截断。修复逻辑必须"读到什么写回什么"，
+  // 所以它只能走一条不会拿有损渲染去重新落盘的路；下面两条都在真 socket 上把
+  // 用户 git config 的**真实字节**（新 pane 里 printenv 的结果）作为判据。
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub keeps a non-ASCII user token byte-exact when it has to rewrite GIT_CONFIG_PARAMETERS',
+    () => {
+      // Trae 与用户 token 同在 PARAMETERS 里：过滤会让 PARAMETERS 变化，于是
+      // 该键必须被改写。若改写用的是 show-environment 读回的值，C locale 下
+      // "张三" 会变成 "____"。
+      const sock = `bmx-scrub-trae-unicode-${process.pid}-${Date.now()}`;
+      const traeHooks = '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a';
+      const seededEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete seededEnv.TMUX;
+      delete seededEnv.TMUX_PANE;
+      // 本机 daemon 进程的真相：没有 LANG/LC_*（等价 C locale）。
+      delete seededEnv.LANG;
+      delete seededEnv.LANGUAGE;
+      delete seededEnv.LC_ALL;
+      delete seededEnv.LC_CTYPE;
+      seededEnv.GIT_CONFIG_PARAMETERS = `'user.email=张三@example.com' 'core.hooksPath=${traeHooks}'`;
+      const readParam = (tag: string): string => {
+        const out = join(tmpdir(), `bmx-trae-unicode-${process.pid}-${tag}.txt`);
+        const pane = spawnSync('tmux', [
+          '-L', sock, 'new-session', '-d', '-s', tag, '--',
+          '/bin/sh', '-c', `printenv GIT_CONFIG_PARAMETERS > ${out}; sleep 2`,
+        ], { env: tmuxEnv(), encoding: 'utf-8', timeout: 10_000 });
+        expect(pane.status, pane.stderr).toBe(0);
+        spawnSync('sleep', ['0.6']);
+        const value = readFileSync(out, 'utf-8').replace(/\n$/, '');
+        rmSync(out, { force: true });
+        return value;
+      };
+      try {
+        const boot = spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', '--', '/bin/sh', '-c', 'sleep 30'], {
+          env: seededEnv, encoding: 'utf-8', timeout: 10_000,
+        });
+        expect(boot.status, boot.stderr).toBe(0);
+        expect(readParam('before')).toBe(seededEnv.GIT_CONFIG_PARAMETERS);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+        expect(scrub.failed).toEqual([]);
+
+        const after = readParam('after');
+        expect(after).not.toContain('commit-attribution');
+        // 用户自己的那条必须逐字节保留。
+        expect(after).toBe("'user.email=张三@example.com'");
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub keeps user slot values byte-exact through a reindex (multi-line value)',
+    () => {
+      // Trae 占 slot 0、用户 slot 1 是多行 credential.helper：重排必然改写
+      // KEY_0/VALUE_0。show-environment 会把多行值截断成第一行，写回即毁掉
+      // 用户的 credential helper（git 之后直接解析失败）。
+      const sock = `bmx-scrub-trae-reindex-${process.pid}-${Date.now()}`;
+      const traeHooks = '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a';
+      const helper = '!f() {\n  echo username=alice\n  echo password=s3cret\n  echo\n}; f';
+      const seededEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete seededEnv.TMUX;
+      delete seededEnv.TMUX_PANE;
+      Object.assign(seededEnv, {
+        GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: 'core.hooksPath',
+        GIT_CONFIG_VALUE_0: traeHooks,
+        GIT_CONFIG_KEY_1: 'credential.helper',
+        GIT_CONFIG_VALUE_1: helper,
+      });
+      const readSlot = (tag: string, name: string): string => {
+        const out = join(tmpdir(), `bmx-trae-reindex-${process.pid}-${tag}.txt`);
+        const pane = spawnSync('tmux', [
+          '-L', sock, 'new-session', '-d', '-s', tag, '--',
+          '/bin/sh', '-c', `printenv ${name} > ${out}; sleep 2`,
+        ], { env: tmuxEnv(), encoding: 'utf-8', timeout: 10_000 });
+        expect(pane.status, pane.stderr).toBe(0);
+        spawnSync('sleep', ['0.6']);
+        const value = readFileSync(out, 'utf-8').replace(/\n$/, '');
+        rmSync(out, { force: true });
+        return value;
+      };
+      try {
+        const boot = spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', '--', '/bin/sh', '-c', 'sleep 30'], {
+          env: seededEnv, encoding: 'utf-8', timeout: 10_000,
+        });
+        expect(boot.status, boot.stderr).toBe(0);
+        expect(readSlot('before', 'GIT_CONFIG_VALUE_1')).toBe(helper);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+        expect(scrub.failed).toEqual([]);
+        expect(scrub.removed.some(name => /^GIT_CONFIG_(?:VALUE)_1$/.test(name))).toBe(true);
+
+        // 重排后用户的值落在 slot 0，必须与原来逐字节相同。
+        expect(readSlot('after', 'GIT_CONFIG_VALUE_0')).toBe(helper);
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(!tmuxAvailable)(
+    'startup scrub fails closed (writes nothing) when a git value cannot be read byte-exact',
+    () => {
+      // The exact-value read runs `base64`/`tr` inside the server's own shell.
+      // When that is unavailable the fix must NOT fall back to the rendered
+      // value: doing so re-introduces the very corruption it prevents (a CJK
+      // user.name would be written back as '____'). Leaving the group alone and
+      // reporting it is the safe side — a stale Trae hook is loud and
+      // recoverable, a silently rewritten git config is not.
+      const sock = `bmx-scrub-trae-failclosed-${process.pid}-${Date.now()}`;
+      const traeHooks = '/Users/test/.trae/cli/hooks/commit-attribution/v10/profile-a';
+      const seededEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete seededEnv.TMUX;
+      delete seededEnv.TMUX_PANE;
+      delete seededEnv.LANG;
+      delete seededEnv.LANGUAGE;
+      delete seededEnv.LC_ALL;
+      delete seededEnv.LC_CTYPE;
+      Object.assign(seededEnv, {
+        GIT_CONFIG_COUNT: '2',
+        GIT_CONFIG_KEY_0: 'core.hooksPath',
+        GIT_CONFIG_VALUE_0: traeHooks,
+        GIT_CONFIG_KEY_1: 'user.name',
+        GIT_CONFIG_VALUE_1: '张三',
+      });
+      const readSlot = (tag: string, name: string): string => {
+        const out = join(tmpdir(), `bmx-trae-failclosed-${process.pid}-${tag}.txt`);
+        const pane = spawnSync('tmux', [
+          '-L', sock, 'new-session', '-d', '-s', tag, '--',
+          '/bin/sh', '-c', `printenv ${name} > ${out}; sleep 2`,
+        ], { env: tmuxEnv(), encoding: 'utf-8', timeout: 10_000 });
+        expect(pane.status, pane.stderr).toBe(0);
+        spawnSync('sleep', ['0.6']);
+        const value = readFileSync(out, 'utf-8').replace(/\n$/, '');
+        rmSync(out, { force: true });
+        return value;
+      };
+      try {
+        const boot = spawnSync('tmux', ['-L', sock, 'new-session', '-d', '-s', 'holder', '--', '/bin/sh', '-c', 'sleep 30'], {
+          env: seededEnv, encoding: 'utf-8', timeout: 10_000,
+        });
+        expect(boot.status, boot.stderr).toBe(0);
+        // Make `base64`/`tr` unresolvable INSIDE the server, without breaking
+        // the tmux client the test itself spawns.
+        const pathOverride = spawnSync('tmux', ['-L', sock, 'set-environment', '-g', 'PATH', '/nonexistent-only'], {
+          env: tmuxEnv(), encoding: 'utf-8', timeout: 5000,
+        });
+        expect(pathOverride.status, pathOverride.stderr).toBe(0);
+
+        const scrub = scrubTmuxServerGlobalEnv(sock);
+
+        // Reported, not silently degraded...
+        expect(scrub.failed).toEqual(expect.arrayContaining([
+          'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0', 'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
+        ]));
+        expect(scrub.updated).toEqual([]);
+        // ...and the user's value is untouched rather than rewritten as '____'.
+        expect(readSlot('after-1', 'GIT_CONFIG_VALUE_1')).toBe('张三');
+        expect(readSlot('after-2', 'GIT_CONFIG_COUNT')).toBe('2');
+      } finally {
+        spawnSync('tmux', ['-L', sock, 'kill-server'], { env: tmuxEnv(), timeout: 5000 });
       }
     },
     30_000,

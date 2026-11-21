@@ -75,6 +75,22 @@ describe('buildDismissConfirmCard', () => {
     expect(card.body.elements.some((e: any) => e.tag === 'table')).toBe(false);
     expect(JSON.stringify(card)).toContain('没有运行中的会话');
   });
+
+  it('words an ordinary group card for the whole group, with no registration to remove', () => {
+    const build = (ordinaryGroup?: boolean) => JSON.parse(buildDismissConfirmCard({
+      chatId: CHAT, invokerOpenId: OWNER, confirmationState: STATE, loc: 'zh', ordinaryGroup,
+      rows: [{ bot: 'Claude', task: '修 bug' }],
+    }));
+    const group = build(true);
+    expect(group.header.title.content).toBe('⚠️ 解散本群');
+    expect(JSON.stringify(group)).toContain('全部 1 个会话');
+    expect(JSON.stringify(group)).toContain('群里所有人');
+    expect(JSON.stringify(group)).not.toContain('会话群登记');
+    expect(group.body.elements.find((e: any) => e.tag === 'button').behaviors[0].value.ordinary_group).toBe(true);
+    const sessionGroup = build();
+    expect(sessionGroup.header.title.content).toBe('⚠️ 解散会话群');
+    expect(JSON.stringify(sessionGroup)).toContain('会话群登记');
+  });
 });
 
 describe('dismiss_confirm card action', () => {
@@ -88,6 +104,11 @@ describe('dismiss_confirm card action', () => {
       messageId: 'om_card', rootId: CHAT, chatId: CHAT, senderId: OWNER, senderType: 'user',
       content: `/dismiss --confirm=${STATE}`,
     }), expect.objectContaining({ activeSessions: deps.activeSessions, sessionReply: deps.sessionReply }), APP);
+  });
+
+  it.each([[{}, '解散会话群'], [{ ordinary_group: true }, '解散本群']])('keeps the title of the group kind on the swapped card: %o', async (value, title) => {
+    const res: any = await click(value);
+    expect(res.card.data.header.title.content).toBe(`⏳ ${title}`);
   });
 
   it('rejects anyone but the invoker without touching the card', async () => {
@@ -124,6 +145,11 @@ describe('buildDismissReceiptCard', () => {
     const button = card.body.elements.find((e: any) => e.tag === 'button');
     expect(button.type).toBe('danger');
     expect(button.behaviors[0].value).toEqual({ action: DISMISS_CLEANUP_WT_ACTION, job_ids: JOB_A, invoker_open_id: OWNER });
+  });
+  it('titles the receipt by the kind of group disbanded', () => {
+    const title = (ordinaryGroup?: boolean) => JSON.parse(buildDismissReceiptCard({ invokerOpenId: OWNER, loc: 'zh', offers: [], ordinaryGroup })).header.title.content;
+    expect(title()).toBe('✅ 会话群已解散');
+    expect(title(true)).toBe('✅ 群已解散');
   });
   it('uses a non-danger button when every offered worktree is clean', () => {
     const card = JSON.parse(buildDismissReceiptCard({

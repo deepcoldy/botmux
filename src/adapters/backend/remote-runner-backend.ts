@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { logger } from '../../utils/logger.js';
@@ -19,6 +20,7 @@ import {
   normalizeRemoteRunnerBackendState,
   normalizeRemoteRunnerUsageReport,
   parseRemoteRunnerEventLine,
+  projectRemoteRunnerTrustedCaller,
   remoteRunnerCommand,
   type RemoteRunnerBackendState,
   type RemoteRunnerCapability,
@@ -116,6 +118,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private activeTurnId: string | null = null;
   private activeTurnHostContext: RemoteRunnerTurnHostContext = {};
   private activeTurnAccepted = false;
+  private readonly enforceFinalBindingCommit: boolean;
   private ready = false;
   private killed = false;
   private closing = false;
@@ -157,7 +160,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     message: RemoteRunnerOutboundMessage,
     hostContext: RemoteRunnerTurnHostContext,
   ) => Promise<RemoteRunnerOutboundMessageResult>) | null = null;
-  private sessionToolCb: ((operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>) | null = null;
+  private sessionToolCb: ((operation: RemoteRunnerSessionToolOperation, hostContext?: RemoteRunnerTurnHostContext) => Promise<RemoteRunnerSessionToolResult>) | null = null;
   private readyCb: (() => void) | null = null;
   private stateCb: ((state: RemoteRunnerBackendState) => void) | null = null;
   private usageCb: ((usage: RemoteRunnerUsageReport) => void) | null = null;
@@ -168,6 +171,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     private readonly sessionId: string,
     initialState?: RemoteRunnerBackendState,
   ) {
+    this.enforceFinalBindingCommit = (config.delegatedSlashCommands?.length ?? 0) > 0;
     this.requiredCapabilities = config.requiredCapabilities ?? REMOTE_RUNNER_BASE_CAPABILITIES;
     this.handshakeTimeoutMs = boundedTimeout(config.handshakeTimeoutMs, 15_000);
     this.operationTimeoutMs = boundedTimeout(config.operationTimeoutMs, 30_000);
@@ -269,7 +273,8 @@ export class RemoteRunnerBackend implements SessionBackend {
       };
     }
     this.activeTurnId = input.turnId;
-    this.activeTurnHostContext = input.linkRefMode ? { linkRefMode: input.linkRefMode } : {};
+    this.activeTurnHostContext = { ...(input.linkRefMode ? { linkRefMode: input.linkRefMode } : {}),
+      ...(input.sessionOrigin ? { sessionOrigin: structuredClone(input.sessionOrigin) } : {}) };
     this.activeTurnAccepted = false;
     this.outboundOperations.clear();
     this.outboundOperationCount = 0;
@@ -286,7 +291,9 @@ export class RemoteRunnerBackend implements SessionBackend {
         turnId: input.turnId,
         content: input.content,
         ...(input.dispatchAttempt !== undefined ? { dispatchAttempt: input.dispatchAttempt } : {}),
-        ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
+        ...(input.trustedCaller
+          ? { trustedCaller: projectRemoteRunnerTrustedCaller(input.trustedCaller as typeof input.trustedCaller & Record<string, unknown>) }
+          : {}),
       }), event => event.type === 'status' && event.status === 'busy', this.operationTimeoutMs);
       if (acknowledgement.type === 'failure') {
         const failure: BackendTurnFailure = {
@@ -369,9 +376,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     if (!this.recoveredTurnHostContextPending
       || this.recoveredTurn?.turnId !== turnId
       || this.activeTurnId !== turnId) return false;
-    this.activeTurnHostContext = context.linkRefMode
-      ? { linkRefMode: context.linkRefMode }
-      : {};
+    this.activeTurnHostContext = structuredClone(context);
     this.recoveredTurnHostContextPending = false;
     const deferred = this.deferredRecoveredEvents.splice(0);
     for (const event of deferred) {
@@ -387,7 +392,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     ) => Promise<RemoteRunnerOutboundMessageResult>,
   ): void { this.outboundMessageCb = cb; }
   onSessionTool(
-    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
+    cb: (operation: RemoteRunnerSessionToolOperation, hostContext?: RemoteRunnerTurnHostContext) => Promise<RemoteRunnerSessionToolResult>,
   ): void { this.sessionToolCb = cb; }
   onReady(cb: () => void): void {
     this.readyCb = cb;
@@ -597,7 +602,7 @@ export class RemoteRunnerBackend implements SessionBackend {
         && ready.state.generation <= this.state.generation) {
       throw new Error('remote runner rebuild did not advance the backend generation');
     }
-    if (!this.applyState(ready.state)) throw new Error('remote runner ready state is invalid');
+    if (!this.applyState(ready.state, true)) throw new Error('remote runner ready state is invalid');
     this.ready = true;
     this.readyCb?.();
   }
@@ -706,15 +711,20 @@ export class RemoteRunnerBackend implements SessionBackend {
         this.failProtocol('remote runner emitted final before a host operation result was returned');
         return;
       }
-      if (event.state && !this.applyState(event.state)) return;
-      if (event.usage) {
-        const usage = normalizeRemoteRunnerUsageReport(event.usage);
-        if (!usage || usage.generation !== this.state?.generation) {
-          this.failProtocol('remote runner emitted usage for an invalid backend generation');
-          return;
-        }
-        this.usageCb?.(usage);
+      // Validate the entire final before publishing either durable state or usage.
+      // A malformed usage report must not leave a failed turn partially bound.
+      const usage = event.usage ? normalizeRemoteRunnerUsageReport(event.usage) : undefined;
+      const invalidUsage = !!event.usage && (!usage || usage.generation !== (event.state ?? this.state)?.generation);
+      if (this.enforceFinalBindingCommit && invalidUsage) {
+        this.failProtocol('remote runner emitted usage for an invalid backend generation');
+        return;
       }
+      if (event.state && !this.applyState(event.state, true)) return;
+      if (invalidUsage) {
+        this.failProtocol('remote runner emitted usage for an invalid backend generation');
+        return;
+      }
+      if (usage) this.usageCb?.(usage);
       // `outbound_message_final` is a bilateral terminal-delivery contract:
       // once the host has a verified delivered receipt, the provider's later
       // final event settles lifecycle only. Rejected/unknown outbound attempts
@@ -992,8 +1002,9 @@ export class RemoteRunnerBackend implements SessionBackend {
     } else {
       this.sessionToolOperationCount++;
       const callback = this.sessionToolCb;
+      const context = structuredClone(this.activeTurnHostContext);
       result = callback
-        ? Promise.resolve().then(() => callback(operation)).catch((error): RemoteRunnerSessionToolResult => ({
+        ? Promise.resolve().then(() => context.sessionOrigin ? callback(operation, context) : callback(operation)).catch((error): RemoteRunnerSessionToolResult => ({
             outcome: 'unknown',
             code: 'session_tool_execution_unknown',
             message: (error instanceof Error ? error.message : String(error)).slice(0, 4096)
@@ -1036,7 +1047,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   }
 
   private emitTurnFailure(failure: BackendTurnFailure): void {
-    this.turnFailureCb?.(failure);
+    this.turnFailureCb?.({ ...failure, ...(this.activeTurnHostContext.sessionOrigin ? { sessionOrigin: this.activeTurnHostContext.sessionOrigin } : {}) });
     this.finishActiveTurn();
     this.taskDoneCb?.();
   }
@@ -1061,7 +1072,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     settle?.();
   }
 
-  private applyState(value: RemoteRunnerBackendState): boolean {
+  private applyState(value: RemoteRunnerBackendState, finalBindingCommit = false): boolean {
     const state = normalizeRemoteRunnerBackendState(value);
     if (!state || (this.provider && state.provider !== this.provider)) {
       this.failProtocol('remote runner emitted invalid or foreign backend state');
@@ -1078,6 +1089,15 @@ export class RemoteRunnerBackend implements SessionBackend {
         this.failProtocol('remote runner changed or cleared remote session without advancing generation');
         return false;
       }
+    }
+    // Business bindings are a provider-session invariant, including idle gaps
+    // and late events after a turn settles. Compute lineage may still advance
+    // independently as long as it preserves the committed business snapshot.
+    if (this.enforceFinalBindingCommit && this.state && !finalBindingCommit
+        && (state.agentThreadId !== this.state.agentThreadId
+          || !isDeepStrictEqual(state.providerState, this.state.providerState))) {
+      this.failProtocol('delegated slash binding changes must be published in final.state');
+      return false;
     }
     const generationAdvanced = this.state !== undefined && state.generation > this.state.generation;
     this.state = state;

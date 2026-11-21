@@ -1,3 +1,4 @@
+import { claudePromptSuggestion } from '../../utils/claude-prompt-suggestion.js';
 import { randomBytes } from 'node:crypto';
 import {
   closeSync,
@@ -23,7 +24,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
-import { claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
+import { claudeCompactionHookCommand, claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -32,6 +33,9 @@ import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
+import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { ensureLeadOnlyPluginDir } from '../../skills/lead-only-guard.js';
+import { decideStartupSwitchConfirm } from '../../utils/claude-switch-confirm.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -99,8 +103,11 @@ export function claudeJsonlPathForSession(sessionId: string, cwd: string, dataDi
  *  exact slug path when it exists (normal case), the unique glob hit for long
  *  slugs, or null when absent/ambiguous. */
 export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | null {
+  const isFile = (path: string): boolean => {
+    try { return statSync(path).isFile(); } catch { return false; }
+  };
   const exact = claudeJsonlPathForSession(sessionId, cwd, dataDir);
-  if (existsSync(exact)) return exact;
+  if (isFile(exact)) return exact;
   const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
   if (projectHash.length <= 200) return null;
   const projectsDir = join(dataDir, 'projects');
@@ -111,7 +118,7 @@ export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: 
   const hits = entries
     .filter(name => name === projectHash || name.startsWith(`${prefix}-`))
     .map(name => join(projectsDir, name, target))
-    .filter(p => existsSync(p));
+    .filter(isFile);
   return hits.length === 1 ? hits[0]! : null;
 }
 
@@ -494,6 +501,7 @@ const BOTMUX_ENVELOPE_TAGS = new Set([
   'role',
   'summary_memory',
   'botmux_reminder',
+  'botmux_formatting',
   'whiteboard',
   'chat_context_policy',
   'chat_context',
@@ -684,9 +692,14 @@ export function setClaudePidStateRereadSleepForTests(fn: ((ms: number) => void) 
   pidStateRereadSleepFn = fn ?? sleepSyncMs;
 }
 
-/** The parsed pid-state record; undefined when there is none or it never
- *  parses. Only a record that exists but does not parse is re-read: a missing
- *  one is the common answer for a pid that is not Claude, polled every tick. */
+/** readClaudePidState's answer for a record that exists but never parsed
+ *  within the re-reads: still mid-rewrite, not absent. */
+const PID_STATE_MID_REWRITE = Symbol('pid-state record mid-rewrite');
+
+/** The parsed pid-state record; undefined when there is none, or
+ *  PID_STATE_MID_REWRITE when it never parses. Only a record that exists but
+ *  does not parse is re-read: a missing one is the common answer for a pid that
+ *  is not Claude, polled every tick. */
 function readClaudePidState(path: string): unknown {
   for (let attempt = 0; ; attempt++) {
     let text: string;
@@ -698,7 +711,7 @@ function readClaudePidState(path: string): unknown {
     try {
       return JSON.parse(text);
     } catch {
-      if (attempt >= PID_STATE_REREAD_DELAYS_MS.length) return undefined;
+      if (attempt >= PID_STATE_REREAD_DELAYS_MS.length) return PID_STATE_MID_REWRITE;
       pidStateRereadSleepFn(PID_STATE_REREAD_DELAYS_MS[attempt]!);
     }
   }
@@ -711,8 +724,17 @@ function readClaudePidState(path: string): unknown {
  *  procStart is present but cannot be verified on Linux, fail closed; callers
  *  fall back to fingerprint detection. */
 export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): { path: string; cliSessionId: string } | null {
+  const resolved = resolveJsonlFromPidState(pid, expectedCwd, dataDir);
+  return resolved === 'mid-rewrite' ? null : resolved;
+}
+
+/** resolveJsonlFromPid, telling a record Claude is still rewriting past the
+ *  re-reads ('mid-rewrite': an answer exists but cannot be read yet) apart
+ *  from no usable answer at all (null). */
+export function resolveJsonlFromPidState(pid: number, expectedCwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): { path: string; cliSessionId: string } | 'mid-rewrite' | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   const parsed: any = readClaudePidState(claudePidStatePath(pid, dataDir));
+  if (parsed === PID_STATE_MID_REWRITE) return 'mid-rewrite';
   if (!parsed || typeof parsed !== 'object') return null;
   if (parsed.pid !== pid) return null;
   if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return null;
@@ -737,10 +759,11 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: s
     }
   }
   if (!procStartVerified && realpathCwd(parsed.cwd) !== realpathCwd(expectedCwd)) return null;
-  return {
-    path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, dataDir),
-    cliSessionId: parsed.sessionId,
-  };
+  // An in-session cwd change updates the pid record, not the transcript's original bucket.
+  const path = resolveClaudeJsonlPath(parsed.sessionId, parsed.cwd, dataDir)
+    ?? resolveClaudeJsonlPath(parsed.sessionId, expectedCwd, dataDir)
+    ?? claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, dataDir);
+  return { path, cliSessionId: parsed.sessionId };
 }
 
 /** Linux-only: probe `/proc/<pid>/fd` for any signal that reveals Claude's
@@ -795,6 +818,26 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
   return [...out];
 }
 
+/** The conversation a live Claude process itself declares, for its runtime
+ *  identity: its own pid-state record (the source a write's session id comes
+ *  from), held to the stricter standard an identity needs. The record must name
+ *  this pid and carry a start time equal to the live process's, so a recycled
+ *  pid's leftover never counts; a platform where that cannot be checked gets
+ *  nothing. Any session file the process holds open must be that same
+ *  conversation: a pre-2.1.305 record keeps its spawn-time id across `/clear`,
+ *  and an answer that disagrees with what the process has open is no answer. */
+export function readClaudeLiveSessionId(pid: number, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | undefined {
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  const parsed: any = readClaudePidState(claudePidStatePath(pid, dataDir));
+  if (!parsed || typeof parsed !== 'object' || parsed.pid !== pid) return undefined;
+  if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return undefined;
+  const live = readProcStarttime(pid);
+  if (typeof parsed.procStart !== 'string' || live === null || parsed.procStart !== live) return undefined;
+  const open = findOpenClaudeSessionIds(pid, dataDir);
+  if (open.some(sid => sid !== parsed.sessionId)) return undefined;
+  return parsed.sessionId;
+}
+
 /** Fingerprint search that fans out from the pinned project dir to every
  *  sibling under `~/.claude/projects/`. Used as the writeInput fallback
  *  when the pinned `claudeJsonlPath` doesn't contain the submit marker —
@@ -809,7 +852,18 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
 function findJsonlAcrossProjectsRoot(
   searchPath: string,
   fingerprint: string,
-  options: { minMtimeMs?: number; minEventTimestampMs?: number; includeQueueOperations?: boolean },
+  options: {
+    minMtimeMs?: number;
+    minEventTimestampMs?: number;
+    includeQueueOperations?: boolean;
+    /** Include Task/Agent subagent transcripts (<sid>/subagents/*.jsonl).
+     *  Only safe for boolean "did the prompt land" checks: the matched
+     *  subagent path must NOT be pinned as the watched session jsonl. */
+    includeSubagentTranscripts?: boolean;
+    /** Also match queued_command attachments. Same restriction: boolean
+     *  checks only, never pin the match. */
+    includeQueuedCommandAttachments?: boolean;
+  },
 ): string | null {
   if (fingerprint.length < CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) return null;
   const primaryDir = dirname(searchPath);
@@ -1123,6 +1177,8 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     },
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     supportsTypeAhead: true,
+    // Every Claude-family variant runs the same TUI and input box.
+    promptSuggestion: claudePromptSuggestion,
     supportsProgramStatus: variant.supportsProgramStatus,
     reliableTurnTerminal: variant.reliableTurnTerminal,
     // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in
@@ -1197,7 +1253,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection, promptCacheTtl }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, leadOnly, promptInjection, promptCacheTtl, hideLocalAddresses }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1306,17 +1362,29 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       if (process.env[GOAL_ENV.V3_MARKER] === '1') {
         disallowedTools.push('AskUserQuestion');
       }
+      const leadOnlyActive = leadOnly === true && variant.id === 'claude-code';
+      // Lead-only chat manager: no self-service reading/research either. The plugin
+      // PreToolUse guard additionally limits Bash to `botmux ...` and blocks MCP tools.
+      let leadOnlyPluginDir: string | undefined;
+      if (leadOnlyActive) {
+        disallowedTools.push('Edit', 'Write', 'NotebookEdit', 'MultiEdit', 'Read', 'Grep', 'Glob', 'Agent', 'Task', 'WebFetch', 'WebSearch');
+        leadOnlyPluginDir = ensureLeadOnlyPluginDir(CLAUDE_PLUGIN_DIR);
+        // Guard plugin unavailable: fail closed rather than leave Bash unrestricted.
+        if (!leadOnlyPluginDir) disallowedTools.push('Bash');
+      }
       args.push('--disallowed-tools', disallowedTools.join(','));
+      // Enforcement is orthogonal to promptInjection: mount the guard plugin before the early return below.
+      if (leadOnlyPluginDir) args.push('--plugin-dir', leadOnlyPluginDir);
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
       if (promptInjection === 'none') return args;
-      args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
+      args.push('--plugin-dir', builtinPluginDirForSession(CLAUDE_PLUGIN_DIR));
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, leadOnly: leadOnlyActive, hideLocalAddresses, cliId: 'claude-code' }));
       return args;
     },
 
@@ -1343,6 +1411,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         return !!current && current !== path && !!readDeltaText(current, 0)?.includes(marker);
       };
     },
+
+    // `/effort <level>` / `/model <name>` replayed into a resumed conversation
+    // whose prompt cache may still be warm: Claude asks before re-reading the
+    // history, and records the command only once that is answered.
+    startupCommandConfirmation: decideStartupSwitchConfirm,
 
     async writeInput(pty, content) {
       // HERDR advertises an explicit bracketed-paste frame: send the complete
@@ -1447,12 +1520,19 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // drift like worker thinking `-foo-bar/` while Claude actually appends
         // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
         // fallback so a stale historical match can't suppress the warning.
+        // Subagent transcripts and queued_command attachments are included
+        // here only (boolean use — the matched path is never pinned): while
+        // the TUI views a subagent, a prompt is recorded solely in
+        // <sid>/subagents/*.jsonl, as a queued_command attachment written at
+        // the agent's next step when it is still running.
         const searchPath = currentPath ?? pty.claudeJsonlPath;
         if (!searchPath) return false;
         const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
           minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
+          includeSubagentTranscripts: true,
+          includeQueuedCommandAttachments: true,
         });
         return !!matched;
       };
@@ -1621,6 +1701,28 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return { ...buildResult(false), recheck };
     },
 
+    // One-shot re-submit for a draft parked in the composer (the cold-start
+    // late-SessionStart rescue in scheduleSubmitFailureNotify). Uses the SAME
+    // submit-key resolution as writeInput: with a remapped submit
+    // (keybindings.json / CLAUDE_CODE_SUBMIT_KEY, Enter possibly bound to
+    // chat:newline) plain Enter would only insert a newline and strand the
+    // draft again. False means no terminal-sendable submit key or an
+    // unconfirmed backend send — the caller must not guess with another key.
+    pressComposerSubmit(pty) {
+      const keybindings = resolveClaudeChatKeybindings(join(variant.dataDir, 'keybindings.json'));
+      try {
+        if (pty.sendSpecialKeys && keybindings.submitKeys) {
+          return pty.sendSpecialKeys(...keybindings.submitKeys) !== false;
+        }
+        if (!pty.sendSpecialKeys && keybindings.rawSubmitSequence) {
+          return pty.write(keybindings.rawSubmitSequence) !== false;
+        }
+      } catch {
+        return false;
+      }
+      return false;
+    },
+
     completionPattern: COMPLETION_RE,
     readyPattern: /❯/,
     // 忙碌正证据：Claude Code 工作时输入框 ❯ 常驻（readyPattern 在忙时也命中），
@@ -1648,12 +1750,15 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     // `/effort` 不在此处——它是全局 PASSTHROUGH_COMMANDS 的成员（所有 CLI 尽力透传，
     // 且刻意不带冷启动语义）。这里只保留 `/goal`：它是「开启一段目标工作」的命令，需要
     // 空 topic 冷启动能力（isInitialSessionPassthrough 只认 adapter 层的这个字段）。
-    defaultPassthroughCommands: variant.id === 'claude-code' ? ['/goal'] : undefined,
+    defaultPassthroughCommands: ['claude-code', 'seed', 'relay'].includes(variant.id) ? ['/goal'] : undefined,
     // Seed shares most of this adapter but has not been verified to expose the
     // same native session-rename command. Keep the capability exact to Claude.
     buildSessionRenameCommand: variant.id === 'claude-code'
       ? (title) => `/rename ${title}`
       : undefined,
+    // Bare `/rename` makes Claude Code pick a name from the conversation and
+    // answer "Session renamed to: …" (verified on 2.1.323).
+    sessionAutoRenameCommand: variant.id === 'claude-code' ? '/rename' : undefined,
     systemHints: [],
     altScreen: false,
     // Claude Code (及 seed 同源 fork) 的 TUI 自管重绘整段 transcript，xterm/tmux
@@ -1680,6 +1785,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // claude` 剥掉（aiden 硬拒 --settings），全局这条是它唯一能拿到就绪信号的渠道，
       // 避免首条 prompt 空等 45s；原生 Claude 也只从这一个来源读取 ready hook。
       sessionStartCommand: sessionReadyHookCommand(),
+      preCompactCommand: variant.id === 'claude-code' ? claudeCompactionHookCommand() : undefined,
       // UserPromptSubmit per-turn 上下文 hook（#794）：同样写全局 settings.json。
       // 仅当 per-bot envelopeInjection=auto 时 daemon 才写 sidecar 走注入路径，
       // 其余情况 hook 触发但读不到 sidecar，空输出 no-op。

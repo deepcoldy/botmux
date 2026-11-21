@@ -11,7 +11,7 @@
  *      authority (real SQLite store and scheduler).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { connect, createServer, type Server as NetServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -195,6 +195,7 @@ describe('daemon records the Dashboard Feishu-login person as creator', () => {
   let lightweight: IpcServerHandle | undefined;
   let allowed: string[];
   let resolveOpenId: ReturnType<typeof vi.spyOn>;
+  let bot: ReturnType<typeof registerBot>;
 
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'dash-schedule-creator-'));
@@ -208,8 +209,9 @@ describe('daemon records the Dashboard Feishu-login person as creator', () => {
     scheduler.setOwnerFilter(APP, true);
     setDeploymentOwner(config.session.dataDir, { unionId: 'on_bot_owner', name: 'Owner' });
     allowed = [OWNER, ALICE.open];
-    const bot = registerBot({
+    bot = registerBot({
       larkAppId: APP, larkAppSecret: '', cliId: 'codex', apiOnly: true, allowedUsers: [...allowed],
+      defaultWorkingDir: dir,
     });
     Object.defineProperty(bot, 'resolvedAllowedUsers', { get: () => allowed, configurable: true });
     bot.rawAllowedUserResolution.set('on_bot_owner', OWNER);
@@ -255,6 +257,127 @@ describe('daemon records the Dashboard Feishu-login person as creator', () => {
   }
 
   const record = (id: string) => store.getRecord(APP, id)!;
+
+  it('uses the target chat oncall directory when the Dashboard omits workingDir', async () => {
+    const oncallDir = join(dir, 'oncall-project');
+    mkdirSync(oncallDir);
+    bot.config.oncallChats = [{ chatId: 'oc_target', workingDir: oncallDir }];
+
+    const id = await create();
+
+    expect(record(id).task.workingDir).toBe(oncallDir);
+  });
+
+  it('tests a new task precondition in the target chat oncall directory the task will use', async () => {
+    const oncallDir = join(dir, 'oncall-project');
+    mkdirSync(oncallDir);
+    bot.config.oncallChats = [{ chatId: 'oc_target', workingDir: oncallDir }];
+
+    const response = await signed('POST', '/api/schedules/precondition/test', {
+      larkAppId: APP,
+      chatId: 'oc_target',
+      source: { kind: 'inline', script: `[ "$(pwd -P)" = ${JSON.stringify(realpathSync(oncallDir))} ] && printf 1 || printf 0` },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, result: 'pass' });
+  });
+
+  it('reports the missing Bot default directory when testing a new task precondition', async () => {
+    bot.config.defaultWorkingDir = undefined;
+
+    const response = await signed('POST', '/api/schedules/precondition/test', {
+      larkAppId: APP, chatId: 'oc_target', source: { kind: 'inline', script: 'printf 1' },
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      errorCode: 'schedule_working_dir_unavailable',
+      field: 'workingDir',
+    });
+  });
+
+  it('uses an explicit request directory ahead of the target chat oncall directory', async () => {
+    const oncallDir = join(dir, 'oncall-project');
+    const explicitDir = join(dir, 'explicit-project');
+    mkdirSync(oncallDir);
+    mkdirSync(explicitDir);
+    bot.config.oncallChats = [{ chatId: 'oc_target', workingDir: oncallDir }];
+
+    const response = await signed('POST', '/api/schedules', {
+      name: '日报', schedule: 'every 1h', prompt: '汇总告警', chatId: 'oc_target', workingDir: explicitDir,
+    });
+
+    expect(response.status).toBe(200);
+    const id = (await response.json()).task.id;
+    expect(record(id).task.workingDir).toBe(explicitDir);
+  });
+
+  it('rejects an invalid target chat oncall directory instead of falling back to the Bot default', async () => {
+    bot.config.oncallChats = [{ chatId: 'oc_target', workingDir: '' }];
+
+    const response = await signed('POST', '/api/schedules', {
+      name: '日报', schedule: 'every 1h', prompt: '汇总告警', chatId: 'oc_target',
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      error: 'invalid_working_dir',
+      field: 'workingDir',
+    });
+    expect(scheduleStore.listTasks()).toHaveLength(0);
+  });
+
+  it('uses the Bot default directory when the target chat has no oncall binding', async () => {
+    const id = await create();
+
+    expect(record(id).task.workingDir).toBe(dir);
+  });
+
+  it('uses the enabled default-oncall directory as the effective Bot default', async () => {
+    const defaultOncallDir = join(dir, 'default-oncall-project');
+    mkdirSync(defaultOncallDir);
+    bot.config.defaultWorkingDir = undefined;
+    bot.config.defaultOncall = { enabled: true, workingDir: defaultOncallDir, since: Date.now() };
+
+    const id = await create();
+
+    expect(record(id).task.workingDir).toBe(defaultOncallDir);
+  });
+
+  it('rejects creation when neither the request nor the Bot supplies a working directory', async () => {
+    bot.config.defaultWorkingDir = undefined;
+
+    const response = await signed('POST', '/api/schedules', {
+      name: '日报', schedule: 'every 1h', prompt: '汇总告警', chatId: 'oc_target',
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      error: 'schedule_working_dir_unavailable',
+      field: 'workingDir',
+    });
+    expect(scheduleStore.listTasks()).toHaveLength(0);
+  });
+
+  it('rejects an explicit working directory that is not an existing directory', async () => {
+    const missing = join(dir, 'missing-project');
+
+    const response = await signed('POST', '/api/schedules', {
+      name: '日报', schedule: 'every 1h', prompt: '汇总告警', chatId: 'oc_target', workingDir: missing,
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      error: 'invalid_working_dir',
+      field: 'workingDir',
+    });
+    expect(scheduleStore.listTasks()).toHaveLength(0);
+  });
 
   it('creates the task as the platform-signed-in person, in the authority record', async () => {
     const id = await create(ALICE.union);
@@ -318,6 +441,19 @@ describe('daemon records the Dashboard Feishu-login person as creator', () => {
     expect(record(id).task).toMatchObject({ ownerOpenId: OWNER, runAsClaim: claim });
   });
 
+  it('checks the editor against the chat in the authority record, not a rewritten schedules.json', async () => {
+    const id = await create();
+    // The sandboxed agent can rewrite its BOT_HOME projection; the authority
+    // row still targets oc_target.
+    scheduleStore.projectAuthoritativeTask({ ...record(id).task, chatId: 'oc_projection_only' }, APP);
+    const info = vi.spyOn(logger, 'info');
+    const response = await signed('PATCH', `/api/schedules/${id}`, { prompt: '编辑' }, ALICE.union);
+    expect(response.status).toBe(200);
+    const recorded = info.mock.calls.map(call => String(call[0])).filter(line => line.includes('recorded as creator'));
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toContain('chat=oc_target');
+  });
+
   it('keeps a creator captured under another app, while still applying the edit', async () => {
     const id = await create();
     scheduler.updateRuntimeTaskState(id, { creatorLarkAppId: 'cli_other_app', ownerOpenId: 'ou_other_scope' }, APP);
@@ -362,7 +498,7 @@ describe('taskAcceptsRecordedCreator', () => {
       targetGeneration: 1, maxTasksPerTurn: 64,
     });
     scheduler.addTask({ id: 'a1b2c3d4', name: 'n', schedule: 'every 1h', prompt: 'p', workingDir: '/repo',
-      chatId: 'oc_chat', larkAppId: APP });
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'ownerless' } });
     expect(scheduler.taskAcceptsRecordedCreator('d1d2d3d4', APP)).toBe(false);
     expect(scheduler.taskAcceptsRecordedCreator('a1b2c3d4', APP)).toBe(true);
     // And the scheduler refuses it outright if a caller tries anyway.
@@ -381,12 +517,23 @@ describe('taskAcceptsRecordedCreator', () => {
       targetGeneration: 1, maxTasksPerTurn: 64,
     });
     scheduler.addTask({ id: 'a1b2c3d4', name: 'n', schedule: 'every 1h', prompt: 'p', workingDir: '/repo',
-      chatId: 'oc_chat', larkAppId: APP, ownerOpenId: 'ou_first', ownerUnionId: 'on_first' });
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'human', openId: 'ou_first', unionId: 'on_first' } });
     const reown = (task: any) => ({ ...task, ownerOpenId: 'ou_next', ownerUnionId: 'on_next' });
     store.updateTask(APP, 'a1b2c3d4', reown);
     store.updateTask(APP, 'd1d2d3d4', reown);
     expect(store.getRecord(APP, 'a1b2c3d4')).toMatchObject({ controlOpenId: 'ou_next', controlUnionId: 'on_next' });
     expect(store.getRecord(APP, 'd1d2d3d4')).toMatchObject({ controlOpenId: 'ou_delegate', controlUnionId: 'on_delegate' });
+  });
+  it('clears talk-only runtime authorization when an edit records a new creator', () => {
+    scheduler.addTask({ id: 'a1b2c3d4', name: 'n', schedule: 'every 1h', prompt: 'p', workingDir: '/repo',
+      chatId: 'oc_chat', larkAppId: APP, owner: { kind: 'human', openId: 'ou_first', unionId: 'on_first' }, ownerAccess: 'talk' });
+    expect(scheduler.updateTask('a1b2c3d4', { creator: { openId: 'ou_admin', unionId: 'on_admin' } })).toMatchObject({ ok: true });
+    const record = store.getRecord(APP, 'a1b2c3d4')!;
+    expect(record).toMatchObject({
+      controlOpenId: 'ou_admin',
+      task: { ownerOpenId: 'ou_admin' },
+    });
+    expect(record.task.ownerAccess).toBeUndefined();
   });
 });
 
@@ -418,7 +565,7 @@ describe('a failed edit does not keep the new creator', () => {
   it('restores who the task runs as, its claim and control columns when the precondition step fails', () => {
     const created = createTaskWithOptionalPrecondition({
       name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
-      ownerOpenId: 'ou_first', ownerUnionId: 'on_first',
+      owner: { kind: 'human', openId: 'ou_first', unionId: 'on_first' }, ownerAccess: 'talk',
     }, APP, 'printf 1');
     const claim = { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: APP, claimedAt: '2026-10-27T02:00:00.000Z' };
     expect(scheduler.claimTaskRunAs(created.id, APP, claim, null)).toMatchObject({ ok: true });
@@ -434,14 +581,14 @@ describe('a failed edit does not keep the new creator', () => {
       { action: 'replace', source: { kind: 'inline', script: 'printf 0' } },
     )).toThrow('staged protected record is missing');
     const record = store.getRecord(APP, created.id)!;
-    expect(record.task).toMatchObject({ prompt: 'p', ownerOpenId: 'ou_first', ownerUnionId: 'on_first', runAsClaim: claim });
+    expect(record.task).toMatchObject({ prompt: 'p', ownerOpenId: 'ou_first', ownerUnionId: 'on_first', runAsClaim: claim, ownerAccess: 'talk' });
     expect(record).toMatchObject({ controlOpenId: 'ou_first', controlUnionId: 'on_first' });
   });
 
   it('also restores the per-task model and reasoning effort the edit changed', () => {
     const created = createTaskWithOptionalPrecondition({
       name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
-      model: 'model-before', reasoningEffort: 'high',
+      model: 'model-before', reasoningEffort: 'high', owner: { kind: 'ownerless' },
     }, APP, 'printf 1');
     scheduleStore.__setScheduleStoreBeforeRenameTestHook(() => {
       scheduleStore.__setScheduleStoreBeforeRenameTestHook(undefined);
@@ -459,6 +606,7 @@ describe('a failed edit does not keep the new creator', () => {
   it('restores from the authority record even when the JSON projection lags behind it', () => {
     const created = createTaskWithOptionalPrecondition({
       name: 'guarded', schedule: 'every 1h', prompt: 'p', workingDir: dir, chatId: 'oc_chat', larkAppId: APP,
+      owner: { kind: 'ownerless' },
     }, APP, 'printf 1');
     const claim = { openId: 'ou_claimant', unionId: 'on_claimant', larkAppId: APP, claimedAt: '2026-10-27T02:00:00.000Z' };
     scheduler.claimTaskRunAs(created.id, APP, claim, null);

@@ -1,0 +1,13 @@
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.213.1)
+   ▀▀▀▀▀▀
+  ~/workspace
+
+  Tip: Use /stop to stop all background tasks.
+
+
+  🔒  This conversation is open in another app                                                                        R to Retry
+      Owner: PID 91565
+      Close it there and press R to continue here.
+
+   r retry  |  esc/ctrl+c/q exit  |  ctrl+o transcript

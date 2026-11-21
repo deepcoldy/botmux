@@ -164,3 +164,25 @@ describe('plugin command gateway', () => {
     expect(await executeReply({ text })).toEqual({ ok: true, reply: { kind: 'text', text } });
   });
 });
+
+it('notifies only enabled opt-in services after a privileged group close and isolates failures', async () => {
+  const enabled = makeRecord('labels', { commands: [{ name: '/p0' }] });
+  enabled.contributions!.commands!.afterClose = true;
+  enabled.contributions!.commands!.replacesCloseTag = true;
+  const regular = makeRecord('regular', { commands: [{ name: '/rg' }] });
+  const request = vi.fn(async () => jsonResponse({ schemaVersion: 1, reply: { text: 'cleared' } }));
+  const gateway = gatewayWith([enabled, regular], request);
+  expect(gateway.replacesCloseTag('cli_app')).toBe(true);
+  const close = { ...invocation('/close'), args: '', issuedAt: 123456 };
+  expect(await gateway.afterClose(close)).toEqual([{ ok: true, reply: { kind: 'text', text: 'cleared' } }]);
+  expect(JSON.parse(String(request.mock.calls[0][1].body))).toMatchObject({ command: '/close', sender: { openId: 'ou_sender' }, chat: { chatId: 'oc_chat' } });
+  for (const input of [
+    { ...close, command: '/stop' },
+    { ...close, chat: { ...close.chat, chatType: 'p2p' as const } },
+    { ...close, privileges: { canTalk: true, canOperate: false } },
+  ]) expect(await gateway.afterClose(input)).toEqual([]);
+  expect(request).toHaveBeenCalledTimes(1);
+  request.mockRejectedValue(new Error('offline'));
+  expect(await gateway.afterClose(close)).toEqual([{ ok: false, error: expect.any(String) }]);
+  expect(gateway.table('cli_app').has('/close')).toBe(false);
+});

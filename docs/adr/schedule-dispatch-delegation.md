@@ -18,7 +18,7 @@
 
 ## 身份与撤权
 
-控制主体与运行身份分离。v1 只支持即时 `lark-cli/bytedcli`；v2 的 `schedule:create` 不从 inherited authority 签发。持久 `runScopes` 只支持显式配置的 `bytedcli`；未配置时为空。无论是否授予该 scope，scheduled turn 都不成为真人 current actor，且 `lark-cli` 始终不随任务持久化。
+控制主体与运行身份分离。v1 只支持即时 `lark-cli/bytedcli`；v2 的 `schedule:create` 不从 inherited authority 签发。持久 `runScopes` 只支持显式配置的 `bytedcli`；未配置时为空。普通 delegated scheduled turn 无论是否授予该 scope，都不成为真人 current actor，且 `lark-cli` 始终不随任务持久化。唯一例外是下文的限域 one-shot child：它只在精确回合发布已重新验证的父控制者作为 tool actor 和 current actor，task 仍保持 ownerless，不获得 workflow/schedule mutation authority。
 
 为避免复用会话继承历史凭据，委托任务仅在目标 Bot 开启 `triggerUserAuth` wrapper 时运行；wrapper 依赖精确 turn 绑定拒绝陈旧身份。每次进入 worker 前重新检查：
 
@@ -32,7 +32,9 @@
 
 ## 管理动作
 
-`schedule:create` 只允许初始 dispatch turn 执行 `add`。真人当前回合创建的 direct task 天然携带同 Bot、同群的控制者记录；它自己的 scheduled turn 可用 `schedule pause self` / `schedule remove self` 管理当前 task。跨 Bot delegated task 仍必须由宿主额外启用固定的 self-management 能力。两类 self-management 都只允许 pause/remove 当前精确 task，不能管理其他 task，也不能 update prompt/目标、resume、force-run 或创建后继任务；每次执行仍重新校验控制者是目标 Bot 管理员和目标群成员。其他管理动作继续通过独立 daemon route 验证当前真人管理员；delegated task 的 canonical update 仍拒绝，等待后续显式 rebind 协议。
+`schedule:create` 的跨 Bot 能力仍只允许初始 dispatch turn 执行 `add`。独立的 `childOneShotEnabled` 例外允许真人直接创建或迁移的 direct/legacy task 在自己的已认证 scheduled turn 创建限域 one-shot：同 Bot、同群、当前话题、精确工作目录，默认 24 小时内且每轮 1 个。父控制人每次创建前重新校验为目标 Bot 管理员和群成员；子任务作为 ownerless delegated authority 落盘，只在触发的精确回合把这个已验证控制人发布为 `lark-cli` / `bytedcli` tool actor 和 `botmux actor current` 执行人。这个例外仍保持 `runScopes=[]`、`selfManage=false`，不接受调用方指定 owner；因为 task 没有 owner，它不能取得 workflow/schedule mutation authority，其 parent kind 也已是 delegated，不能继续创建后继任务。grant 绑定 parent task、精确 scheduled turn 和 canonical request；同请求重放幂等，删除不返还额度。`runEnabled=false` 同时阻止创建和执行这类子任务。普通跨 Bot delegated task 继续匿名运行。
+
+真人当前回合创建的 direct task 天然携带同 Bot、同群的控制者记录；它自己的 scheduled turn 可用 `schedule pause self` / `schedule remove self` 管理当前 task。跨 Bot delegated task 仍必须由宿主额外启用固定的 self-management 能力。各类 self-management 都只允许 pause/remove（until-done 任务另有 done）当前精确 task，不能管理其他 task，也不能 update prompt/目标、resume 或 force-run；除上述显式 one-shot 例外外不能创建后继任务。每次执行仍重新校验控制者是目标 Bot 管理员和目标群成员。不记录控制者的 direct task（结构条件：两个控制者字段都未记录；例如宿主终端经 daemon HMAC 创建——宿主管理员就是创建者，没有会失效的真人授权）的 scheduled turn 同样可以 pause/remove/done 当前精确 task，跳过这项真人复核；只要记录了任一控制者字段（含空字符串），就照常复核，缺一半按失败处理。其他管理动作继续通过独立 daemon route 验证当前真人管理员；delegated task 的 canonical update 仍拒绝，等待后续显式 rebind 协议。
 
 需要“发送最终结果并结束任务”时使用单个 `botmux send --response-kind final --schedule-remove-self`。CLI 只能从当前受认证的 `schedule:<taskId>:<runId>` 推导 task ID，不接受调用方指定；final 投递成功并写入幂等账本后，通过 owning daemon 删除该精确 task，再推进长驻 CLI 的排队 turn。删除失败不得创建或改写另一条 final，结果以结构化 `scheduleSelfCleanup` 返回；原样重试同一命令会复用已投递的 final，只补做自删，已撤销的精确 task 视为幂等成功。
 
@@ -126,3 +128,49 @@
 
 配置仅属于同一宿主信任域；跨部署不共享签名存储时不适用。PR 不修改实际团队授权
 或重启服务。上线时应先在隔离测试群验证机器人触发、report 后再次派单、精确清理和撤权。
+
+## 对话用户自建定时任务（`scheduleCreateByTalkers`）
+
+默认情况下，会话内 `botmux schedule add` 的 direct 路径只认本 Bot 管理员
+（`getDashboardAdminOpenIds`），其余真人返回 `schedule_delegation_operator_denied`。
+面向全公司的业务 Bot（p2pOpen / defaultOncall，普通同事只有 talk 权限）里，这让管理员成为
+「帮我每天 9 点发个汇总」类需求的瓶颈，而把人加进 allowedUsers 又会连带给出全部 canOperate。
+
+Bot 级开关 `scheduleCreateByTalkers`（Dashboard「授权与额度」同步；默认关）开启后，
+`directHuman` 且非管理员、但通过 `evaluateTalk` 的调用方也可以创建定时任务，边界如下
+（实现见 `core/schedule-talker.ts`）：
+
+- **任务归发起人本人**：`owner = { openId, unionId }` 即发起人，authority 记录为 `direct`，
+  `runScopes=[]`、`selfManage=false`，task 带 `ownerAccess: 'talk'` 标记（只从宿主 authority
+  记录读取，不信 CLI 可写的 schedules.json 投影）。
+- **只能投到当前会话**：`task.chatId === ds.chatId`，`executionPosition` 只允许 `top-level`
+  或当前话题（`rootMessageId` 必须等于本轮话题根）；不接受 `new-topic`、`follow-active`、
+  `topicTitle`、`deliver=local`、多群、until-done、notify。工作目录边界沿用
+  `capabilityScheduleWorkingDir`。
+- **配额**：每轮最多 1 个（复用 `directTurn.maxTasksPerTurn`，删除不退额度）；每人每 Bot
+  最多 `scheduleTalkerMaxTasks`（1–100，缺省 5）个存活（active/paused）任务。每人配额由
+  `createDirect` 在同一个 `BEGIN IMMEDIATE` 事务内最终判定；相同 id + canonical input 的
+  replay 先于配额计数返回，因此响应丢失后的重试不会被自己刚创建的任务挡住。
+- **到点复核（fail-closed）**：每次执行进入队列前、以及等待 precondition/admission 后实际派发前，
+  都重新检查：开关仍开、authority 控制人与 task owner 一致且无 claim、`union_id` 仍解析回同一
+  `open_id`、本人仍可在目标群 `canTalk`、群聊时仍是群成员。第二道复核不依赖
+  `triggerUserAuth` 是否开启；异步身份/成员查询结束后还会重读开关并复查 talk，凭据发布完成后
+  再复核一次。任一不满足即拒跑，**不**发认领卡（认领卡会把任务交给管理员接手，与「不借到别人权限」
+  相悖）。关闭开关 = 所有此类任务停止触发，再打开即恢复。创建路由在成员查询结束后、提交前也复查
+  开关和 talk，等待期间撤权不会落盘任务或消耗配额。
+- **管理**：`SCHEDULE_MANAGED_MUTATE_ROUTE` 对非管理员只放行 authority 控制人 == 本人、
+  任务所在群 == 当前会话、开关仍开 的任务（update/remove/pause/resume/run 都可）；管理员行为不变。
+  Dashboard 编辑记录新 creator 时同时清除 `ownerAccess: 'talk'`，新 owner 回到普通管理员授权语义；
+  若复合编辑失败，旧 owner 与该标记一起回滚。talker 任务自己的 scheduled turn 不能
+  `pause/remove self`（`authorizeScheduleSelfManage` 仍要求管理员），也不能创建 one-shot 子任务、
+  不能驾驭 v3 workflow（共享 scheduled-turn owner gate 对 talk-only owner 直接拒绝；chat-bound
+  signed-envelope 请求还必须携带每轮 session capability，daemon 用它绑定 live turn 并从宿主
+  `schedule-authority.sqlite` 复核 owner，删除 schedules.json 或进程 marker 字段都不能取得权限）。
+- **执行身份**：与本人直接发消息一致——开了 `triggerUserAuth` 时 scheduled turn 以本人身份发布
+  工具凭据；没开时用 Bot 自己的工具。开关的帮助文案明示这一点。
+- **判定「真人直接发起」**：沿用 `scheduleCallerForTurn` 的 `senderType === 'user'
+  && !source && requestLarkAppId === ds.larkAppId`，定时轮次（`source: 'schedule_creator'`）、
+  bot 轮次、Remote Runner provider actor 都不算 talker。
+
+bot→bot 委托链路（`--delegate schedule:create`、`scheduleDelegation.*`）完全不受影响，仍只认管理员。
+

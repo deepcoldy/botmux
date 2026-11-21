@@ -54,7 +54,7 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // per-session --plugin-dir (claude family, oh-my-pi) or --skill (pi)
       'claude-code': 'dynamic', seed: 'dynamic', relay: 'dynamic', pi: 'dynamic', 'oh-my-pi': 'dynamic', cursor: 'dynamic',
       // shared global skills dir → global|prompt|off all apply
-      coco: 'global', codex: 'global', gemini: 'global',
+      coco: 'global', codex: 'global',
       genius: 'global', opencode: 'global', mtr: 'global', traex: 'global',
       // Added by upstream #821; shares ~/.config/opencode/skills with opencode,
       // so the shared-root dedup below covers it.
@@ -62,8 +62,10 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       mimocode: 'global',
       grok: 'global', 'kiro-cli': 'global',
       reasonix: 'global', mojo: 'global',
+      // agy 1.5.x discovers global skills from ~/.gemini/config/skills (verified on 1.5.12).
+      antigravity: 'global',
       // no skill mechanism at all
-      aiden: 'none', 'codex-app': 'none', antigravity: 'none', hermes: 'none', ebsd: 'none',
+      aiden: 'none', 'codex-app': 'none', hermes: 'none', ebsd: 'none',
       // Added by upstream #858: a bundled Node JSON-RPC runner with no skills dir.
       dsh: 'none',
       // PTY-driven TUI variant of dsh; no skills dir of its own.
@@ -76,6 +78,8 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // MiniMax Code loads native skills from its persistent data directory.
       minimax: 'global',
       zcode: 'global',
+      // Doubao CLI discovers user skills under ~/Doubao/skills.
+      doubao: 'global',
     };
     // Two-way key equality. `Record<CliId, …>` looks like tsc enforces
     // exhaustiveness, but this file lives in test/ and tsconfig only includes

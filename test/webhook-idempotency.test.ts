@@ -970,3 +970,156 @@ describe('dispatch outcome classification (dispatchDidRun)', () => {
     expect(dispatchDidRun({ ok: false, errorCode: 'wait_timeout' })).toBe(false);
   });
 });
+
+describe('durable virtual async webhook service contract', () => {
+  const setup = async () => {
+    await seedConnector({ target: { mode: 'dynamic', kind: 'turn', botId: 'app1', allowChats: [] } });
+    proxyToDaemon.mockImplementation(async (_bot: string, _path: string, init: any) => {
+      const request = JSON.parse(init.body);
+      return { status: 200, text: async () => JSON.stringify({ ok: true, action: 'queued',
+        triggerId: 'original-trigger', target: { kind: 'turn', sessionId: 'original-session' },
+        idempotencyKey: request.options.idempotencyKey }) };
+    });
+  };
+  it('forwards a stable connector-scoped durable lease, preserving full references on retry', async () => {
+    await setup();
+    const a = await post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'stable' }, '?async=1&durable=1');
+    const b = await post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'stable' }, '?async=1&durable=1');
+    expect(a.body).toMatchObject({ durableAsync: true, triggerId: 'original-trigger', target: { sessionId: 'original-session' } });
+    expect(b.body.target.sessionId).toBe('original-session');
+    expect(proxyToDaemon).toHaveBeenCalledTimes(2); // daemon, not edge memory, owns retries
+    const first = JSON.parse(proxyToDaemon.mock.calls[0][2].body);
+    const second = JSON.parse(proxyToDaemon.mock.calls[1][2].body);
+    expect(first).toEqual(second);
+    expect(first.options.idempotencyKey).toMatch(/^whapi:[a-f0-9]{64}$/);
+    expect(first.source).toEqual({ type: 'webhook', connectorId: 'conn_idem' });
+  });
+  it('strips allowlisted per-delivery headers from durable requests so retries hash equal', async () => {
+    await setup();
+    // The connector owner allowlists a tracing header the gateway varies on
+    // every delivery. Non-durable turns forward it; durable turns must not, or
+    // the daemon's requestHash differs and the same-key retry gets 409.
+    await seedConnector({
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1', allowChats: [] },
+      promptEnvelope: { sourceName: 'codebase', headerAllowlist: ['x-request-id'], includeRawText: false, maxBodyBytes: 4096 },
+    });
+    const a = await post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'hdr', 'x-request-id': 'req-aaa' }, '?async=1&durable=1');
+    const b = await post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'hdr', 'x-request-id': 'req-bbb' }, '?async=1&durable=1');
+    expect(a.status).toBe(200);
+    expect(b.status).toBe(200);
+    const first = JSON.parse(proxyToDaemon.mock.calls[0][2].body);
+    const second = JSON.parse(proxyToDaemon.mock.calls[1][2].body);
+    expect(first.envelope.headers).toEqual({});
+    expect(first).toEqual(second);
+  });
+  it('forwards allowlisted headers on the non-durable async path', async () => {
+    await setup();
+    await seedConnector({
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1', allowChats: [] },
+      promptEnvelope: { sourceName: 'codebase', headerAllowlist: ['x-request-id'], includeRawText: false, maxBodyBytes: 4096 },
+    });
+    const response = await post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'plain', 'x-request-id': 'req-aaa' }, '?async=1');
+    expect(response.status).toBe(200);
+    const forwarded = JSON.parse(proxyToDaemon.mock.calls[0][2].body);
+    expect(forwarded.envelope.headers).toEqual({ 'x-request-id': 'req-aaa' });
+  });
+  it('checks capabilities with the connector credential before a caller submits', async () => {
+    await setup();
+    const response = await fetch(baseUrl + '/webhook/conn_idem?capabilities=1', {
+      headers: { Authorization: 'Bearer tok_secret_value' },
+    });
+    expect(await response.json()).toMatchObject({ ok: true, capabilities: { durableAsync: true } });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+  it('rejects every unsupported durable shape without dispatch', async () => {
+    await setup();
+    // Fixed-mode connector (the seed default) and a signed HMAC connector both
+    // fall outside the durable contract even with the exact durable query.
+    await seedConnector({}, 'conn_fixed_dur');
+    await seedConnector({
+      verify: {
+        type: 'hmac-sha256',
+        secretRef: (await import('../src/services/webhook-key.js')).createWebhookSecret('hmac_secret_value').ref,
+        signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp',
+        nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300,
+      },
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1', allowChats: [] },
+      promptEnvelope: { sourceName: 'signed', headerAllowlist: [], includeRawText: false, maxBodyBytes: 99999 },
+    } as any, 'conn_hmac_dur');
+
+    const signedHmacPost = async () => {
+      const raw = JSON.stringify(MR_EVENT);
+      const ts = String(Date.now());
+      const sig = createHmac('sha256', 'hmac_secret_value').update(ts).update('.').update(raw).digest('base64url');
+      const res = await fetch(`${baseUrl}/webhook/conn_hmac_dur?async=1&durable=1`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-botmux-timestamp': ts, 'x-botmux-nonce': `nonce-${Math.random()}`,
+          'x-botmux-signature': sig, 'Idempotency-Key': 'hmac-key',
+        },
+        body: raw,
+      });
+      return { status: res.status, body: await res.json() };
+    };
+
+    const cases: ReadonlyArray<readonly [string, () => Promise<{ status: number; body: any }>]> = [
+      ['missing idempotency key', () => post('conn_idem', MR_EVENT, {}, '?async=1&durable=1')],
+      ['injected sessionId', () => post('conn_idem', { ...MR_EVENT, sessionId: 'another-session' }, { 'Idempotency-Key': 'k' }, '?async=1&durable=1')],
+      ['injected chatId', () => post('conn_idem', { ...MR_EVENT, chatId: 'oc_other' }, { 'Idempotency-Key': 'k' }, '?async=1&durable=1')],
+      ['injected rootMessageId', () => post('conn_idem', { ...MR_EVENT, rootMessageId: 'om_root' }, { 'Idempotency-Key': 'k' }, '?async=1&durable=1')],
+      ['wait mode', () => post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'k' }, '?async=1&durable=1&wait=1')],
+      ['async flag absent', () => post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'k' }, '?durable=1')],
+      ['dry run', () => post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'k' }, '?async=1&durable=1&dryRun=1')],
+      ['overlong key', () => post('conn_idem', MR_EVENT, { 'Idempotency-Key': 'k'.repeat(201) }, '?async=1&durable=1')],
+      ['fixed-mode connector', async () => post('conn_fixed_dur', MR_EVENT, { 'Idempotency-Key': 'k' }, '?async=1&durable=1')],
+      ['hmac connector', signedHmacPost],
+    ];
+    for (const [label, send] of cases) {
+      // The durable gate's OWN error pins the edge rejection: a downstream 400
+      // (e.g. target_required without async) must not make a removed guard look
+      // covered.
+      const response = await send();
+      expect(response.status, label).toBe(400);
+      expect(response.body.error, label).toContain('durable async requires');
+    }
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+  it('reports durableAsync=false for fixed, idempotency-disabled, and hmac connectors', async () => {
+    await setup();
+    await seedConnector({}, 'conn_cap_fixed');
+    await seedConnector({
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1', allowChats: [] },
+      idempotency: { disabled: true },
+    } as any, 'conn_cap_noidem');
+    await seedConnector({
+      verify: {
+        type: 'hmac-sha256',
+        secretRef: (await import('../src/services/webhook-key.js')).createWebhookSecret('hmac_secret_value').ref,
+        signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp',
+        nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300,
+      },
+      target: { mode: 'dynamic', kind: 'turn', botId: 'app1', allowChats: [] },
+      promptEnvelope: { sourceName: 'signed', headerAllowlist: [], includeRawText: false, maxBodyBytes: 99999 },
+    } as any, 'conn_cap_hmac');
+
+    const probe = async (path: string, init?: RequestInit) => (await fetch(baseUrl + path, init)).json();
+    expect(await probe('/webhook/conn_idem?capabilities=1', {
+      headers: { Authorization: 'Bearer tok_secret_value' },
+    })).toMatchObject({ capabilities: { async: true, durableAsync: true } });
+    expect(await probe('/webhook/conn_cap_fixed?capabilities=1', {
+      headers: { Authorization: 'Bearer tok_secret_value' },
+    })).toMatchObject({ capabilities: { async: true, durableAsync: false } });
+    expect(await probe('/webhook/conn_cap_noidem?capabilities=1', {
+      headers: { Authorization: 'Bearer tok_secret_value' },
+    })).toMatchObject({ capabilities: { async: true, durableAsync: false } });
+    const ts = String(Date.now());
+    const sig = createHmac('sha256', 'hmac_secret_value').update(ts).update('.').update(Buffer.alloc(0)).digest('base64url');
+    expect(await probe('/webhook/conn_cap_hmac?capabilities=1', {
+      headers: {
+        'x-botmux-timestamp': ts, 'x-botmux-nonce': 'cap-nonce', 'x-botmux-signature': sig,
+      },
+    })).toMatchObject({ capabilities: { async: true, durableAsync: false } });
+    expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+});

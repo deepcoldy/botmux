@@ -2,6 +2,7 @@ import React, { type ComponentProps } from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { CodexNotifierSettingsEditor } from '../src/dashboard/web/settings-page.js';
+import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -47,8 +48,8 @@ function renderEditor(
 }
 
 function menus(renderer: TestRenderer.ReactTestRenderer) {
-  return renderer.root.findAllByType('summary')
-    .filter(summary => ['通知 Bot', '通知时机'].includes(summary.props['aria-label']));
+  return renderer.root.findAllByType(DropdownMenu)
+    .filter(menu => ['通知 Bot', '通知时机'].includes(menu.props.ariaLabel));
 }
 
 function toggle(renderer: TestRenderer.ReactTestRenderer) {
@@ -82,7 +83,7 @@ describe('CodexNotifierSettingsEditor', () => {
     expect(toggle(renderer).props.checked).toBe(true);
     expect(menus(renderer)).toHaveLength(2);
     const labels = menus(renderer)
-      .map(menu => menu.findByProps({ className: 'sect-sort-value' }).children.join(''));
+      .map(menu => String(menu.props.label));
     expect(labels).toContain('Codex 助理 · codex');
     expect(labels).toContain('仅锁屏时（推荐）');
     expect(JSON.stringify(renderer.toJSON())).toContain('接收人：ou_7f3a…c921');

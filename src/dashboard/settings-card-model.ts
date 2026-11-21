@@ -19,6 +19,7 @@ export interface MaintenanceTaskCfgInput {
 export interface MaintenanceCfgInput {
   autoUpdate?: MaintenanceTaskCfgInput;
   autoRestart?: MaintenanceTaskCfgInput;
+  notifyOnNewVersion?: boolean;
 }
 
 /** Raw dashboard settings as persisted in ~/.botmux/config.json's `dashboard` + `maintenance` segments. */
@@ -26,6 +27,7 @@ export interface DashboardSettingsInput {
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
+  modelQueueNotify?: boolean;
   maintenance: MaintenanceCfgInput;
   localDevInstall: boolean;
   /** Defaults to supported when absent for older dashboard payloads. */
@@ -44,8 +46,10 @@ export type SettingsToggleKey =
   | 'publicReadOnly'
   | 'openTerminalInFeishu'
   | 'enableLocalCliOpen'
+  | 'modelQueueNotify'
   | 'autoUpdate'
-  | 'autoRestart';
+  | 'autoRestart'
+  | 'notifyOnNewVersion';
 
 /** A single toggle row inside a settings section. */
 export interface SettingsToggleDTO {
@@ -124,6 +128,13 @@ export function composeSections(
     titleKey: 'settings.sectionCards',
     toggles: [
       {
+        key: 'modelQueueNotify',
+        labelKey: 'settings.modelQueueNotify',
+        hintKey: 'settings.modelQueueNotifyHelp',
+        enabled: settings.modelQueueNotify === true,
+        state: { enabled: canWrite },
+      },
+      {
         key: 'openTerminalInFeishu',
         labelKey: 'settings.openTerminalInFeishu',
         hintKey: 'settings.openTerminalInFeishuHelp',
@@ -174,6 +185,13 @@ export function composeSections(
         hintKey: 'settings.autoRestartHelp',
         enabled: settings.maintenance?.autoRestart?.enabled === true,
         state: { enabled: autoRestartEnabledUi, reasonKey: autoRestartReasonKey },
+      },
+      {
+        key: 'notifyOnNewVersion',
+        labelKey: 'settings.notifyOnNewVersion',
+        hintKey: 'settings.notifyOnNewVersionHelp',
+        enabled: settings.maintenance?.notifyOnNewVersion === true,
+        state: { enabled: canWrite },
       },
     ],
     hintKey: settings.localDevInstall

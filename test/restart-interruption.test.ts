@@ -14,6 +14,7 @@ import {
   restartNoteInput,
   restartNoteMayPrefix,
   shouldSuppressRestartInterruptionScan,
+  shouldSynthesizeJournalInterruption,
   structuredTurnOpen,
   transcriptTailOffset,
   withoutReportedTasks,
@@ -49,11 +50,29 @@ describe('shouldSuppressRestartInterruptionScan', () => {
     });
 });
 
+describe('shouldSynthesizeJournalInterruption', () => {
+  const base = {
+    scanEligible: true,
+    existingAppServerEndpoint: false,
+    pendingWork: undefined,
+    hasStaleTurn: true,
+  } as const;
+  it('synthesises only in the narrow journal-proof window', () => {
+    expect(shouldSynthesizeJournalInterruption(base)).toBe(true);
+  });
+  it.each([
+    ['scan ineligible (e.g. TraeX auto-model rotation keeps the native turn)', { scanEligible: false }],
+    ['shared external app-server owns turn recovery', { existingAppServerEndpoint: true }],
+    ['tail scan already found the interruption', { pendingWork: { turnOpen: true, tasks: [] } }],
+    ['replay produced no started restored mark', { hasStaleTurn: false }],
+  ] as const)('does not synthesise when %s', (_label, overrides) => {
+    expect(shouldSynthesizeJournalInterruption({ ...base, ...overrides })).toBe(false);
+  });
+});
+
 // Record shapes follow Claude Code 2.1.305 transcripts from the 10-21 tmux
 // server loss (ids and texts are synthetic).
-const at = (hhmmss: string): string => `2026-10-20T${hhmmss}.000Z`;
-
-function prompt(uuid: string, ts: string, text = 'please watch CI'): TranscriptEvent {
+const at = (hhmmss: string): string => `2026-10-20T${hhmmss}.000Z`;function prompt(uuid: string, ts: string, text = 'please watch CI'): TranscriptEvent {
   return { type: 'user', uuid, timestamp: at(ts), message: { role: 'user', content: text } } as TranscriptEvent;
 }
 
@@ -194,6 +213,54 @@ describe('claudeInterruptedWork — background tasks', () => {
 
     const old = [...bashLaunch(1, '10:00:00', 'ancient', 'forgotten'), ...endTurn('a-end', '10:00:05')];
     expect(claudeInterruptedWork(old, Date.parse(at('10:00:06')) + RESTART_TASK_MAX_AGE_MS + 1).tasks).toEqual([]);
+  });
+
+  it('reports an agent resumed with SendMessage after it stopped, also when the old stop notice is delivered late', () => {
+    const resumed = (ts: string) => toolResult(`u-send-${ts}`, ts, `call-send-${ts}`, {
+      success: true, message: 'Resuming agent agent-9', resumedAgentId: 'agent-9', revivedAgentId: 'agent-9',
+    });
+    const events = [
+      toolUse('a1', '10:00:00', 'tu-1', 'Agent', { description: 'Review the gate', prompt: 'p', run_in_background: true }),
+      toolResult('u1', '10:00:01', 'tu-1', { isAsync: true, status: 'async_launched', agentId: 'agent-9' }),
+      enqueue('10:20:00', notice(['agent-9'], 'completed', 'round one')),
+      resumed('10:20:09'),
+      // The first round's notice, delivered after the resume under its own time.
+      { type: 'attachment', timestamp: at('10:20:00'), attachment: { type: 'queued_command', commandMode: 'task-notification', prompt: notice(['agent-9'], 'completed', 'round one') } } as unknown as TranscriptEvent,
+      ...endTurn('a-end', '10:20:20'),
+    ];
+    expect(claudeInterruptedWork(events, Date.parse(at('10:30:00'))).tasks.map(task => task.taskId)).toEqual(['agent-9']);
+    // Its second round's own stop settles it.
+    expect(claudeInterruptedWork([...events, enqueue('10:28:00', notice(['agent-9'], 'completed', 'round two'))],
+      Date.parse(at('10:30:00'))).tasks).toEqual([]);
+  });
+
+  describe('which records start a stopped agent again', () => {
+    const launched = toolResult('u1', '10:00:01', 'tu-1', { isAsync: true, status: 'async_launched', agentId: 'agent-9' });
+    const resumedAt = (ts: string) => toolResult(`u-send-${ts}`, ts, `call-send-${ts}`, {
+      success: true, message: 'Resuming agent agent-9', resumedAgentId: 'agent-9',
+    });
+    const stopAt = (ts: string) => enqueue(ts, notice(['agent-9'], 'completed', 'done'));
+    const copyAt = (ts: string) => ({ type: 'attachment', timestamp: at(ts), attachment: {
+      type: 'queued_command', commandMode: 'task-notification', prompt: notice(['agent-9'], 'completed', 'done'),
+    } } as unknown as TranscriptEvent);
+    const reported = (events: TranscriptEvent[]) =>
+      claudeInterruptedWork([...events, ...endTurn('a-end', '10:29:00')], Date.parse(at('10:30:00'))).tasks.map(task => task.taskId);
+
+    it('only a resume, and only one written after the stop', () => {
+      // A launch record for the same id does not start it again.
+      expect(reported([launched, stopAt('10:20:00'), toolResult('u2', '10:21:00', 'tu-2', { isAsync: true, status: 'async_launched', agentId: 'agent-9' })])).toEqual([]);
+      // A resume stamped no later than the stop belongs to the run that stop ended.
+      expect(reported([launched, stopAt('10:20:00'), resumedAt('10:20:00')])).toEqual([]);
+      // The latest stop counts, even when an older copy of a stop is read after it.
+      expect(reported([launched, stopAt('10:20:00'), copyAt('10:10:00'), resumedAt('10:15:00')])).toEqual([]);
+    });
+
+    it('a second resume moves the run start, and a stop at the run start ends it', () => {
+      // Resumed twice; the copy of a stop between the two resumes ends the earlier run only.
+      expect(reported([launched, stopAt('10:20:00'), resumedAt('10:21:00'), resumedAt('10:25:00'), copyAt('10:23:00')])).toEqual(['agent-9']);
+      // A stop written at the instant the run started is its stop.
+      expect(reported([launched, stopAt('10:20:00'), resumedAt('10:21:00'), stopAt('10:21:00')])).toEqual([]);
+    });
   });
 
   it('pairs the legacy Agent dispatch with its launch-ack', () => {

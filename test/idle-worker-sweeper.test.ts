@@ -30,6 +30,7 @@ import {
   reclaimIdleWorkersForAdmission,
   reclaimIdleWorkersForAdmissionAsync,
   reclaimIdleWorkersForAdmissionAfterTurnDrain,
+  suspendSelectedIdleCandidatesAsync,
   DEFAULT_MAX_LIVE_WORKERS,
 } from '../src/core/idle-worker-sweeper.js';
 import {
@@ -258,6 +259,27 @@ describe('maintenance idle suspension', () => {
     ['queued suspend generation', (d: any) => { d.pendingSuspendGeneration = 0; }],
     ['remote close state', (d: any) => { d.remoteCloseState = { phase: 'preparing', requestId: 'r' }; }],
     ['remote shutdown state', (d: any) => { d.remoteShutdownState = { phase: 'preparing', requestId: 'r' }; }],
+    ['queued backlog activation', (d: any) => { d.session.queued = true; }],
+    ['queued activation pending', (d: any) => { d.session.queuedActivationPending = true; }],
+    ['queued activation tail', (d: any) => { d.session.queuedActivationTail = [{ turnId: 't' }]; }],
+    ['initial start pending', (d: any) => { d.initialStartPending = true; }],
+    ['pending prompt', (d: any) => { d.pendingPrompt = 'hello'; }],
+    ['pending turn id', (d: any) => { d.pendingTurnId = 't'; }],
+    ['deferred schedule run', (d: any) => {
+      d.session.deferredScheduleRun = { taskId: 'task', turnId: 'turn', routingAnchor: 'a', createdAt: 'x' };
+    }],
+    ['deferred schedule undelivered', (d: any) => { d.deferredScheduleUndeliveredTurnId = 't'; }],
+    ['deferred schedule unconfirmed', (d: any) => { d.deferredScheduleUnconfirmedTurnId = 't'; }],
+    ['prompt cache keepalive', (d: any) => { d.promptCacheKeepalive = { pings: 1, idleSinceAt: now }; }],
+    ['idle auto compact arm', (d: any) => { d.idleAutoCompactArm = { at: now, busy: false }; }],
+    ['idle auto compact warm (enabled)', (d: any) => {
+      d.session.idleAutoCompact = { enabled: true };
+      d.idleAutoCompactWarmSince = now;
+    }],
+    ['accepted input', (d: any) => {
+      d.workerGeneration = 0;
+      d.acceptedInputTurns = new Map([['t', { workerGeneration: 0, turnId: 't', phase: 'native-submit', at: now }]]);
+    }],
   ] as const)('excludes a session with %s', (_label, mutate) => {
     const session = ds('unsettled', 'tmux', now - 8 * day);
     mutate(session);
@@ -265,6 +287,15 @@ describe('maintenance idle suspension', () => {
       olderThanMs: 7 * day,
       now,
     })).toEqual([]);
+  });
+
+  it('does not block on a warm idle-auto-compact clock while the feature is off', () => {
+    const session = ds('warm-off', 'tmux', now - 8 * day);
+    session.idleAutoCompactWarmSince = now - 60_000;
+    expect(selectIdleSuspendCandidates(new Map([['warm-off', session]]), {
+      olderThanMs: 7 * day,
+      now,
+    })).toHaveLength(1);
   });
 
   it('yields to the event loop once per candidate in the async batch sweep', async () => {
@@ -306,6 +337,57 @@ describe('maintenance idle suspension', () => {
       { candidate: expect.objectContaining({ sessionId: 'bbb' }), error: 'session_changed' },
     ]);
     expect(b.worker).not.toBe(null);
+  });
+
+  it('uses the same strict guard for the selected-candidate action loop', async () => {
+    const a = ds('sel-a', 'tmux', now - 9 * day);
+    const b = ds('sel-b', 'tmux', now - 8 * day);
+    const sessions = new Map<string, any>([['sel-a', a], ['sel-b', b]]);
+    __testOnly_setSuspendBackingVerifier((target: any) => {
+      if (target.session.sessionId === 'sel-a') {
+        b.session.deferredScheduleRun = {
+          taskId: 'task', turnId: 'turn', routingAnchor: 'a', createdAt: 'x',
+        };
+      }
+      return true;
+    });
+
+    const result = await suspendSelectedIdleCandidatesAsync(
+      sessions,
+      undefined,
+      { olderThanMs: 7 * day, now, reason: 'idle_spin' },
+      () => Promise.resolve(),
+    );
+
+    expect(result.suspended.map(c => c.sessionId)).toEqual(['sel-a']);
+    expect(result.failures).toEqual([
+      { candidate: expect.objectContaining({ sessionId: 'sel-b' }), error: 'session_changed' },
+    ]);
+    expect(b.worker).not.toBe(null);
+  });
+
+  it('stops the action loop per-candidate once shouldAbort flips (shutdown fence)', async () => {
+    // Candidates are ordered oldest-first: abort-a, then abort-b, then abort-c.
+    const a = ds('abort-a', 'tmux', now - 9 * day);
+    const b = ds('abort-b', 'tmux', now - 8 * day);
+    const c = ds('abort-c', 'tmux', now - 7 * day);
+    const sessions = new Map<string, any>([['abort-a', a], ['abort-b', b], ['abort-c', c]]);
+    let abortChecks = 0;
+    const shouldAbort = () => { abortChecks += 1; return abortChecks > 1; };
+
+    const result = await suspendSelectedIdleCandidatesAsync(
+      sessions,
+      undefined,
+      { olderThanMs: 7 * day, now, reason: 'idle_spin', shouldAbort },
+      () => Promise.resolve(),
+    );
+
+    // First candidate completes before the flag flips; the remaining two are
+    // never touched once shutdown is observed between candidates.
+    expect(result.suspended.map(item => item.sessionId)).toEqual(['abort-a']);
+    expect(a.worker).toBe(null);
+    expect(b.worker).not.toBe(null);
+    expect(c.worker).not.toBe(null);
   });
 });
 

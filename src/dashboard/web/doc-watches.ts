@@ -52,6 +52,31 @@ export interface DocWatchBotResult {
   error?: string;
 }
 
+/** 会话创建之前的失败也必须可见；这些记录仍属于文档监听，不伪造会话行。 */
+export function failedDocWatches(results: readonly DocWatchBotResult[]): Array<DocWatchRow & { botName: string }> {
+  return results.flatMap(result => result.error ? [] : result.watches
+    .filter(row => row.lastOutcome === 'no-comment' || row.lastOutcome === 'trigger-missing'
+      || outcomeMeta(row.lastOutcome).kind === 'error')
+    .map(row => ({ ...row, larkAppId: result.larkAppId, botName: result.botName ?? result.larkAppId })))
+    .sort((a, b) => (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0));
+}
+
+export async function loadDocWatchResults(): Promise<DocWatchBotResult[]> {
+  const response = await fetch('/api/bots');
+  const body = await readJson(response);
+  if (!response.ok) throw new Error(body?.error ?? `HTTP ${response.status}`);
+  const bots: Array<{ larkAppId: string; botName?: string }> = Array.isArray(body?.bots) ? body.bots : [];
+  return Promise.all(bots.map(async bot => ({ ...bot, ...await loadDocWatches(bot.larkAppId) })));
+}
+
+export function docWatchUrl(row: DocWatchRow): string | null {
+  const paths: Record<string, string> = {
+    docx: 'docx', doc: 'docs', sheet: 'sheets', bitable: 'base', slides: 'slides', mindnote: 'mindnote',
+  };
+  const path = Object.hasOwn(paths, row.fileType) ? paths[row.fileType] : undefined;
+  return path ? `https://feishu.cn/${path}/${encodeURIComponent(row.fileToken)}` : null;
+}
+
 export async function loadDocWatches(larkAppId: string): Promise<{ watches: DocWatchRow[]; error?: string }> {
   try {
     const r = await fetch(`/api/doc-watches/${encodeURIComponent(larkAppId)}`);
@@ -147,7 +172,7 @@ export function outcomeMeta(o: DocWatchOutcome | undefined): {
     case 'empty-text':
       return { kind: 'warn', label: '纯 @ 无正文', hint: '有人 @ 了 bot 但一个字没打；文档里已留 ❌ 标记' };
     case 'no-comment':
-      return { kind: 'warn', label: '读不到评论正文', hint: '拉取评论失败（权限/网络）；文档里已留 ❌ 标记' };
+      return { kind: 'error', label: '读不到评论正文', hint: '评论未投递给会话；请查看具体错误并检查文档权限、授权或网络' };
     case 'trigger-missing':
       return { kind: 'warn', label: '回复串未补全', hint: '飞书分页未补全，这条评论的正文读不到' };
     case 'audit-rejected':

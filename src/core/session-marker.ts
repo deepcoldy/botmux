@@ -18,6 +18,8 @@ export {
 
 export interface QueuedTypeAheadTurn {
   turnId: string;
+  /** The CLI consumed this input; queue admission alone is insufficient. */
+  inputConsumed?: true;
   dispatchAttempt?: number;
   linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   trustedCaller?: TrustedCaller;
@@ -120,6 +122,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
             const attempt = parseDispatchAttempt(t.dispatchAttempt);
             return {
               turnId: String(t.turnId),
+              ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
               ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}),
               ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
                 ? { linkRefMode: t.linkRefMode }

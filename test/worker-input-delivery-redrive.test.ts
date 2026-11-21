@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 
 function harness() {
   const backend = {};
@@ -10,6 +11,7 @@ function harness() {
     cliRestartInProgress: false,
     isPromptReady: true,
     inputDeliveryQuarantine: quarantine as typeof quarantine | null,
+    codexBridgeQueue: new CodexBridgeQueue(),
     flushPending: vi.fn(async () => {}),
     idleDetector: { fireIdle: vi.fn() },
     log: vi.fn(),
@@ -30,12 +32,15 @@ describe('worker input delivery terminal redrive', () => {
     expect(scope.idleDetector.fireIdle).not.toHaveBeenCalled();
   });
 
-  it('requests idle detection when the composer is not ready', async () => {
+  it('re-drives the queue and requests idle detection when the composer is not ready', async () => {
+    // While the predecessor turn is still open its idle edge is fenced, so
+    // fireIdle alone never flushes; type-ahead admission (gated inside
+    // flushPending) must be re-driven directly (#2642).
     const { scope, quarantine, release } = harness();
     scope.isPromptReady = false;
     release(quarantine, 'native completion', { redriveTerminal: true });
     await Promise.resolve();
-    expect(scope.flushPending).not.toHaveBeenCalled();
+    expect(scope.flushPending).toHaveBeenCalledTimes(1);
     expect(scope.idleDetector.fireIdle).toHaveBeenCalledTimes(1);
   });
 

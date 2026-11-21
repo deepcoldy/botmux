@@ -4,6 +4,9 @@
  *  - 写和删都失败（目标路径被一个非空目录占住）→ 回滚、拒绝本次处置。
  * Run: pnpm vitest run test/grant-pending-persist-failure.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach, vi } from 'vitest';

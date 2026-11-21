@@ -13,6 +13,10 @@
  * binary logging "$@"), not the config object, so a future refactor that keeps
  * the field but stops passing it to the CLI still fails.
  */
+// Must stay the first import: this file writes mojo-containment-handles.json under
+// SESSION_DATA_DIR and isolated workspaces under the mojo workspace root, so refuse
+// to run outside the test fence instead of touching live botmux data (see the helper).
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -48,6 +52,11 @@ import {
   normalizeMojoConfig,
 } from '../src/adapters/backend/mojo-types.js';
 import { builtinSkillBlockForInjectsSessionContext } from '../src/skills/injection-mode.js';
+import { mojoIsolatedWorkspacePath } from '../src/adapters/backend/mojo-isolated-workspace.js';
+
+if (!isInsideDir(mojoIsolatedWorkspacePath('fence-probe'), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: mojo workspace ${mojoIsolatedWorkspacePath('fence-probe')} is not inside the test fence`);
+}
 
 /** What the worker actually computes for a mojo session in the given mode. */
 function resolvedBlockForMode(mode: string | undefined): string {

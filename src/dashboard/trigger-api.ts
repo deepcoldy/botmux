@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
-import { validateTriggerRequest } from '../services/trigger-types.js';
+import { hasTriggerActor, validateTriggerRequest } from '../services/trigger-types.js';
 import {
   appendTriggerLog,
   type TriggerLogRequest,
@@ -116,7 +116,7 @@ export async function dispatchTriggerRequest(
 
   let upstream: Response;
   try {
-    upstream = await deps.proxyToDaemon(botId, '/api/trigger', {
+    upstream = await deps.proxyToDaemon(botId, body.actor === 'owner' ? '/api/trigger/owner' : '/api/trigger', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
@@ -152,6 +152,7 @@ export async function dispatchTriggerRequest(
     appendTriggerLog({
       triggerId: parsed.triggerId ?? newTriggerId(),
       connectorId: body.source.connectorId,
+      ...(body.actor ? { actor: body.actor, sourceName: body.envelope.sourceName } : {}),
       requestId: logContext?.requestId ?? body.source.requestId,
       action: parsed.ok ? (parsed.action ?? 'delivered') : 'failed',
       status: parsed.ok ? 'ok' : 'error',
@@ -181,6 +182,7 @@ export async function handleDashboardTriggerApi(
   req: IncomingMessage,
   res: ServerResponse,
   deps: TriggerApiDeps,
+  allowOwnerActor = false,
 ): Promise<void> {
   let raw: unknown;
   try {
@@ -190,10 +192,20 @@ export async function handleDashboardTriggerApi(
     return jsonRes(res, 400, { ok: false, errorCode: 'bad_json', error });
   }
 
+  if (!allowOwnerActor && hasTriggerActor(raw)) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed', error: 'actor requires the local Dashboard administrator token' });
+  }
   const valid = validateTriggerRequest(raw);
   if (!valid.ok) return jsonRes(res, valid.status, valid.body);
 
   const body = valid.request;
   const result = await dispatchTriggerRequest(body, deps);
   return jsonRes(res, result.status, result.body);
+}
+
+export async function rejectActorOnDeniedTrigger(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
+  const raw = await readJsonBodyWithLimit(req).catch(() => undefined);
+  if (!hasTriggerActor(raw)) return false;
+  jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed', error: 'actor requires the local Dashboard administrator token' });
+  return true;
 }

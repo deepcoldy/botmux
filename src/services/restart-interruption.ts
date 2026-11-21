@@ -32,17 +32,21 @@ import type { PendingCliInput } from '../utils/pending-input-queue.js';
 import { t } from '../i18n/index.js';
 
 /** Transient reason for one CLI restart; never stored in session config. */
-export type CliRestartCause = 'traex-auto-model';
+export type CliRestartCause = 'traex-auto-model' | 'antigravity-account-rotation';
 
 /** Only a planned TraeX continuation resuming the requested native session
- *  may skip interruption scanning. Preferred-model resets without a queued
- *  continuation and later crash recovery leave restartCause unset. */
+ *  or an automatic Antigravity account-rotation restart (where the daemon owns
+ *  turn replay) may skip interruption scanning. Preferred-model resets without
+ *  a queued continuation and later crash recovery leave restartCause unset. */
 export function shouldSuppressRestartInterruptionScan(input: {
   restartCause?: CliRestartCause;
   cliId: string;
   exactResumeSessionId?: string;
   effectiveCliSessionId?: string;
 }): boolean {
+  if (input.restartCause === 'antigravity-account-rotation' && input.cliId === 'antigravity') {
+    return true;
+  }
   return input.restartCause === 'traex-auto-model'
     && input.cliId === 'traex'
     && input.exactResumeSessionId !== undefined
@@ -93,6 +97,27 @@ export interface InterruptedWork {
 
 export function hasInterruptedWork(work: InterruptedWork | undefined): work is InterruptedWork {
   return !!work && (work.turnOpen || work.tasks.length > 0);
+}
+
+/** Whether journal-replayed activity may substitute for a missed tail scan:
+ *  the 16MB restart-interruption scan can see no open turn when the dead
+ *  turn's boundary lies outside its window, while the durable journal proves
+ *  the previous process started one. Synthesis is allowed only for a spawn
+ *  the scan itself was eligible for — a TraeX auto-model rotation
+ *  intentionally keeps the native turn running, and adopt / Codex App /
+ *  remote / shared-app-server sessions own recovery elsewhere — and only
+ *  when the scan did not already produce interruption work. `hasStaleTurn`
+ *  is the caller's check that the replay produced a started restored mark. */
+export function shouldSynthesizeJournalInterruption(input: {
+  scanEligible: boolean;
+  existingAppServerEndpoint: boolean;
+  pendingWork: InterruptedWork | undefined;
+  hasStaleTurn: boolean;
+}): boolean {
+  return input.scanEligible
+    && !input.existingAppServerEndpoint
+    && input.pendingWork === undefined
+    && input.hasStaleTurn;
 }
 
 function eventTimeMs(ev: TranscriptEvent): number | undefined {
@@ -170,19 +195,33 @@ export function claudeInterruptedWork(
   const toolUses = new Map<string, string | undefined>();
   const legacyAwaitingAck = new Map<string, string | undefined>();
   const live = new Map<string, TrackedTask>();
-  const settled = new Set<string>();
+  /** Stopped task ids, with the stop's time. An agent resumed (SendMessage)
+   *  after its stop runs again under the same id. */
+  const settled = new Map<string, number>();
   /** Tasks whose only stop so far is a `killed` record, with its time. */
   const killed = new Map<string, { task: TrackedTask; atMs: number }>();
   let lastRecordAtMs = -Infinity;
 
-  const launch = (task: TrackedTask): void => {
-    if (settled.has(task.taskId) || live.has(task.taskId) || killed.has(task.taskId)) return;
+  const launch = (task: TrackedTask, resumed = false): void => {
+    const running = live.get(task.taskId);
+    if (running) {
+      if (resumed && task.atMs !== undefined && (running.atMs === undefined || task.atMs > running.atMs)) running.atMs = task.atMs;
+      return;
+    }
+    if (killed.has(task.taskId)) return;
+    const stoppedAtMs = settled.get(task.taskId);
+    if (stoppedAtMs !== undefined || settled.has(task.taskId)) {
+      if (!resumed || task.atMs === undefined || task.atMs <= stoppedAtMs!) return;
+      settled.delete(task.taskId);
+    }
     live.set(task.taskId, task);
   };
-  const settle = (taskId: string): void => {
-    live.delete(taskId);
+  const settle = (taskId: string, atMs: number): void => {
+    // A stop written before the current run started ends an earlier run.
+    const running = live.get(taskId);
+    if (!(running?.atMs !== undefined && atMs < running.atMs)) live.delete(taskId);
     killed.delete(taskId);
-    settled.add(taskId);
+    settled.set(taskId, Math.max(settled.get(taskId) ?? -Infinity, atMs));
   };
 
   for (const ev of events) {
@@ -236,7 +275,7 @@ export function claudeInterruptedWork(
           atMs,
           ...(l.expiresAtMs !== undefined ? { expiresAtMs: l.expiresAtMs } : {}),
           ...(launchDescription ? { description: launchDescription } : {}),
-        });
+        }, l.resumed === true);
       }
       // Builds that predate the structured `toolUseResult`.
       for (const ack of backgroundTaskDispatchAcks(ev)) {
@@ -246,7 +285,7 @@ export function claudeInterruptedWork(
         launch({ taskId: ack.agentId, kind: 'agent', atMs, ...(description ? { description } : {}) });
       }
     }
-    for (const id of backgroundTaskSettledIds(ev)) settle(id);
+    for (const id of backgroundTaskSettledIds(ev)) settle(id, atMs);
   }
 
   const reportable = (task: TrackedTask): boolean =>

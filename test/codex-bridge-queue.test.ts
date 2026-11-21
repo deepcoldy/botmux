@@ -5,6 +5,7 @@ import {
   STRUCTURED_TASK_START_CORROBORATION_GRACE_MS,
   STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS,
   STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS,
+  selectStaleRestoredJournalTurns,
 } from '../src/services/codex-bridge-queue.js';
 import { buildBridgeSendMarkerContent, shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';
@@ -580,6 +581,43 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
 });
 
 describe('CodexBridgeQueue', () => {
+  describe('ownsTurnForNativeInput (adopt CoT attribution)', () => {
+    it('recognizes the marked Lark input before its transcript user event and rejects a local input', () => {
+      const q = new CodexBridgeQueue();
+      q.mark('om_lark', 'Run the build and report failures', 10_000);
+      // The mark exists before the literal write, so the boundary already owns
+      // the turn even though the transcript user event has not been ingested.
+      expect(q.ownsTurnForNativeInput('Run the build and report failures', 10_200)).toBe(true);
+      // A terminal-only input sharing no fingerprint with the mark is rejected.
+      expect(q.ownsTurnForNativeInput('Deploy to staging from the pane', 10_300)).toBe(false);
+      // Replay tolerance matches the ingest path: older than mark-5s is stale.
+      expect(q.ownsTurnForNativeInput('Run the build and report failures', 4_900)).toBe(false);
+    });
+
+    it('requires an exact hash match when the mark demands exact input and stops owning after the terminal', () => {
+      const q = new CodexBridgeQueue();
+      q.mark('om_exact', '/status', 20_000, undefined, undefined, undefined, true);
+      expect(q.ownsTurnForNativeInput('/status', 20_100)).toBe(true);
+      // Fingerprint containment would accept this prefix variant; the exact
+      // hash must not.
+      expect(q.ownsTurnForNativeInput('/status --verbose', 20_200)).toBe(false);
+
+      q.ingest([userEv('/status', 'u-exact', 20_300)]);
+      q.ingest([asstEv('idle', 'a-exact', 20_400)]);
+      q.drainEmittable();
+      // A closed turn must not capture a later local boundary.
+      expect(q.ownsTurnForNativeInput('/status', 20_500)).toBe(false);
+    });
+
+    it('never attributes a boundary to a synthesized local turn', () => {
+      const q = new CodexBridgeQueue();
+      q.setLocalTurns(true, 0);
+      q.ingest([userEv('something typed locally', 'u-local', 30_000)]);
+      expect(q.peek().some(turn => turn.isLocal)).toBe(true);
+      expect(q.ownsTurnForNativeInput('something typed locally', 30_000)).toBe(false);
+    });
+  });
+
   it('reports lifecycle busy only after transcript start until assistant_final closes the turn', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'long-running prompt', 100);
@@ -742,6 +780,43 @@ describe('CodexBridgeQueue', () => {
     expect(q.peek().map(turn => turn.turnId)).toEqual(['verifying']);
     expect(q.pruneExpiredPreStartHeads(STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS + 1)
       .map(turn => turn.turnId)).toEqual(['verifying']);
+  });
+
+  it('keeps a quarantined delivery head past every lease until the flag clears', () => {
+    let now = 100;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('parked', 'draft waiting in the TRAE composer', now);
+    q.beginSubmitVerification('parked', now);
+    now = 500;
+    q.finishSubmitVerification('parked', now);
+    q.setInputDeliveryQuarantined('parked', true);
+    // Past both verification and attribution graces: an ordinary unattributed
+    // head would be pruned here, but a quarantined draft must survive so a
+    // later manual submit can still release the successors held behind it.
+    const expired = now + STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS
+      + STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads(expired)).toEqual([]);
+    expect(q.hasPendingTurn('parked')).toBe(true);
+    // Clearing the flag makes the same head prunable again instead of
+    // pinning it forever.
+    q.setInputDeliveryQuarantined('parked', false);
+    expect(q.pruneExpiredPreStartHeads(expired).map(turn => turn.turnId)).toEqual(['parked']);
+  });
+
+  it('scopes the quarantine flag to the exact dispatch attempt', () => {
+    const q = new CodexBridgeQueue(() => 100);
+    q.mark('retry', 'first attempt', 100, undefined);
+    q.mark('retry', 'replayed attempt', 100, 1);
+    q.setInputDeliveryQuarantined('retry', true);
+    expect(q.peek().map(turn => [turn.turnId, turn.dispatchAttempt, turn.inputDeliveryQuarantined === true]))
+      .toEqual([['retry', undefined, true], ['retry', 1, false]]);
+    // Clearing a replay attempt must not touch the original attempt's flag:
+    // the worker releases each quarantine with its own dispatchAttempt.
+    q.setInputDeliveryQuarantined('retry', false, 1);
+    expect(q.peek().map(turn => [turn.dispatchAttempt, turn.inputDeliveryQuarantined === true]))
+      .toEqual([[undefined, true], [1, false]]);
+    q.setInputDeliveryQuarantined('retry', false, undefined);
+    expect(q.peek().every(turn => turn.inputDeliveryQuarantined === undefined)).toBe(true);
   });
 
   it('atomically transitions in-flight verification to a confirmed start lease', () => {
@@ -1221,6 +1296,20 @@ describe('CodexBridgeQueue', () => {
         finalText: 'replayed answer',
       }),
     ]);
+  });
+
+  it('a replayed attempt terminal never satisfies an exact-attempt lookup for the retired attempt', () => {
+    // #2648 follow-up: a stale deferred submit timer keeps the OLD
+    // dispatchAttempt. Once a replay with the same turnId has run and closed,
+    // hasTerminalTurn must answer only for the new attempt — otherwise the
+    // stale timer would settle against the replacement delivery.
+    const q = new CodexBridgeQueue();
+    q.mark('delivery', 'same durable body', 100, 1);
+    expect(q.dropPendingTurn('delivery', 1, true)?.turnId).toBe('delivery');
+    q.mark('delivery', 'same durable body', 200, 2);
+    q.ingest([userEv('same durable body', 'u2', 300), asstEv('done', 'a2', 400)]);
+    expect(q.hasTerminalTurn('delivery', 2)).toBe(true);
+    expect(q.hasTerminalTurn('delivery', 1)).toBe(false);
   });
 
   it('does not let stale submit lifecycle callbacks mutate a replay attempt with the same turnId', () => {
@@ -2055,5 +2144,31 @@ describe('input the CLI holds in its own queue', () => {
     expect(q.peek().map(turn => turn.cliQueuedAtMs !== undefined)).toEqual([true, false]);
     q.ingest([queuedEv('queued-2', now + 400)]);
     expect(q.peek().map(turn => turn.cliQueuedAtMs !== undefined)).toEqual([true, true]);
+  });
+});
+
+describe('selectStaleRestoredJournalTurns — cold-resume stale-turn retirement', () => {
+  const turn = (overrides: Partial<import('../src/services/codex-bridge-queue.js').CodexPendingTurn>)
+    : import('../src/services/codex-bridge-queue.js').CodexPendingTurn => ({
+      turnId: 'om_x',
+      started: false,
+      restoredFromJournal: true,
+      ...overrides,
+    });
+  it.each([
+    ['started', { started: true }],
+    ['rpcActive', { started: false, rpcActive: true }],
+    ['cliQueuedAtMs', { cliQueuedAtMs: 1 }],
+    ['submitConfirmedAtMs', { submitConfirmedAtMs: 1 }],
+    ['submitVerificationStartedAtMs', { submitVerificationStartedAtMs: 1 }],
+  ] as const)('retires a journal mark the dead process had already accepted via %s', (_label, overrides) => {
+    expect(selectStaleRestoredJournalTurns([turn(overrides)]).map(t => t.turnId)).toEqual(['om_x']);
+  });
+  it.each([
+    ['bare mark never reached the transcript', {}, 'retained'],
+    ['started turn already has a final', { started: true, finalText: 'done' }, 'retained'],
+    ['new-generation mark without journal provenance', { started: true, restoredFromJournal: undefined }, 'retained'],
+  ] as const)('keeps a %s', (_label, overrides) => {
+    expect(selectStaleRestoredJournalTurns([turn(overrides)])).toEqual([]);
   });
 });

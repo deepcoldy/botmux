@@ -215,16 +215,6 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* ═══ 滚动条 ═══ */
-::-webkit-scrollbar { width: 10px; height: 10px; }
-::-webkit-scrollbar-thumb {
-  background: var(--border-strong);
-  border-radius: var(--radius-full);
-  border: 3px solid var(--bg);
-}
-::-webkit-scrollbar-thumb:hover { background: var(--fg-4); }
-::-webkit-scrollbar-track { background: transparent; }
-
 /* ═══ 焦点 ═══ */
 :focus-visible {
   outline: 2px solid var(--accent);

@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync, watch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
 import { DAEMON_HEARTBEAT_STALE_MS } from '../utils/daemon-heartbeat.js';
+import { parseLarkConnectionHealth, type LarkConnectionHealth } from '../im/lark/transport/connection-health.js';
 
 export interface DaemonInfo {
+  larkConnection?: LarkConnectionHealth | null;
   larkAppId: string;
   botName: string;
   /** CLI adapter id from bots.json, e.g. codex / claude-code / traex. */
@@ -212,6 +214,7 @@ export class DaemonRegistry {
       if (!n.endsWith('.json')) continue;
       try {
         const d = JSON.parse(readFileSync(join(this.dir, n), 'utf8')) as DaemonInfo;
+        d.larkConnection = parseLarkConnectionHealth(d.larkConnection);
         if (typeof d.sessionStoreProtocol !== 'string' || !d.sessionStoreProtocol) {
           delete d.sessionStoreProtocol;
         }

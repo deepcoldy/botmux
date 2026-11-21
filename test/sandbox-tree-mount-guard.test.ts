@@ -29,6 +29,7 @@ import { isMountpoint, sweepOrphanScratchSandboxes, teardownScratchSession } fro
 import { teardownSessionSandboxTree } from '../src/adapters/backend/sandbox-tree-teardown.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { detachTestMount, unmountTestMount } from './helpers/unmount-test-mount.js';
+import { onTestProcessExit } from './helpers/exit-cleanup.js';
 
 const isRoot = process.getuid?.() === 0;
 
@@ -39,14 +40,24 @@ function mountFuseOverlay(target: string, scratch: string): boolean {
   const upper = join(scratch, 'upper');
   const work = join(scratch, 'work');
   for (const d of [lower, upper, work]) mkdirSync(d, { recursive: true });
-  return spawnSync('fuse-overlayfs', ['-o', `lowerdir=${lower},upperdir=${upper},workdir=${work}`, target], { stdio: 'ignore' }).status === 0;
+  return detachedOnInterrupt(target,
+    spawnSync('fuse-overlayfs', ['-o', `lowerdir=${lower},upperdir=${upper},workdir=${work}`, target], { stdio: 'ignore' }).status === 0);
+}
+
+/** An interrupted run never reaches the `finally` that unmounts a fixture: a
+ *  mount left in the session TMPDIR is one more submount every scratch
+ *  session would wrap. A no-op once the test unmounted it itself. */
+function detachedOnInterrupt(target: string, mounted: boolean): boolean {
+  if (mounted) onTestProcessExit(() => { detachTestMount(target); });
+  return mounted;
 }
 
 /** Mount a small writable filesystem at `target`; null when impossible here. */
 function mountSmallFs(target: string, scratch: string): boolean {
   if (!isRoot) return mountFuseOverlay(target, scratch);
   mkdirSync(target, { recursive: true });
-  return spawnSync('mount', ['-t', 'tmpfs', '-o', 'mode=700,size=1m', 'tmpfs', target], { stdio: 'ignore' }).status === 0;
+  return detachedOnInterrupt(target,
+    spawnSync('mount', ['-t', 'tmpfs', '-o', 'mode=700,size=1m', 'tmpfs', target], { stdio: 'ignore' }).status === 0);
 }
 
 const mountsAvailable = process.platform === 'linux' && (() => {

@@ -68,6 +68,9 @@ describe('dashboard monitoring session table', () => {
       initialCurrent: {
         supported: false,
         reason: 'procfs_unavailable',
+        larkConnections: [
+          { larkAppId: 'example', botName: 'Example', larkConnection: { state: 'reconnecting', since: 1000, attempts: 3, lastInboundAt: 500 } },
+        ],
         runtime: {
           sampleHealth: { status: 'fresh', ageMs: 5_000 },
           daemons: { total: 2, online: 1, offline: 1 },
@@ -89,6 +92,9 @@ describe('dashboard monitoring session table', () => {
     }));
     const root = renderer.root;
 
+    const wsCells = root.findByType('tbody').findAllByType('td').map(textContent);
+    const date = new Intl.DateTimeFormat('zh', { dateStyle: 'short', timeStyle: 'long' });
+    expect(wsCells).toEqual(['reconnecting', date.format(1000), '3', date.format(500)]);
     const health = root.findByProps({ className: 'panel runtime-health-panel' });
     expect(health.findByProps({ className: 'runtime-status-pill fresh' })).toBeTruthy();
     expect(textContent(health)).toContain('1/2');

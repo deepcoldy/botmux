@@ -1,4 +1,11 @@
-export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting' | 'headless';
+/** Connector kinds a Trigger request may arrive from. This runtime list is
+ *  the single source of truth: TriggerSourceType is derived from it,
+ *  validateTriggerRequest rejects every other string, and the turn-origin
+ *  table (core/turn-origin) imports the same list. Adding a connector kind is
+ *  therefore a one-line change here plus the CLI-side literal, and the K4
+ *  consistency test fails until the CLI side catches up. */
+export const TRIGGER_SOURCE_TYPES = ['webhook', 'ui', 'workflow', 'schedule', 'vc_meeting', 'headless'] as const;
+export type TriggerSourceType = typeof TRIGGER_SOURCE_TYPES[number];
 export type TriggerTargetKind = 'turn' | 'workflow';
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
 export type TriggerAsyncStatus = 'pending' | 'completed';
@@ -9,6 +16,7 @@ export type LegacyWorkflowRetirementReason =
   | 'identity_conflict';
 
 export interface TriggerRequest {
+  actor?: 'owner';
   source: {
     type: TriggerSourceType;
     connectorId?: string;
@@ -35,6 +43,12 @@ export interface TriggerRequest {
   // OUTSIDE envelope so it is never serialized into the untrusted event JSON;
   // the prompt builder renders it as a trusted directive above the event data.
   instruction?: string;
+  /** Connector-owner opt-in (`promptEnvelope.trustPayload`): the envelope came
+   * from an authenticated caller whose body IS the task, so the prompt renders
+   * it as a trusted task request instead of untrusted event data. Webhook turns
+   * only; absent = the default untrusted rendering, byte-for-byte. Kept outside
+   * `envelope`, which stays `trusted: false` as the schema invariant. */
+  payloadTrusted?: true;
   /** Trusted presentation chosen by the connector owner. Undefined keeps the
    * localized default topic seed; null suppresses the seed entirely. */
   presentation?: {
@@ -117,6 +131,8 @@ export interface TriggerRequest {
 export type TriggerErrorCode =
   | 'bad_json'
   | 'bad_request'
+  | 'actor_not_allowed'
+  | 'owner_unresolved'
   | 'bot_not_found'
   | 'bot_not_in_chat'
   | 'daemon_offline'
@@ -149,6 +165,7 @@ export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'interrupte
 
 export interface TriggerResponse {
   ok: boolean;
+  actor?: 'owner';
   triggerId?: string;
   action?: TriggerAction;
   /** Four-state async lifecycle. Present on trigger-result (async polling)
@@ -165,6 +182,11 @@ export interface TriggerResponse {
   message?: string;
   errorCode?: TriggerErrorCode;
   terminalErrorCode?: string;
+  /** In-process lookups only (the workflow draft's failure panel), never on
+   *  the HTTP trigger-result route: the provider's raw error text and the
+   *  CLI screen tail of a worker-terminal failure, masked and clipped. */
+  terminalErrorDetail?: string;
+  terminalScreenTail?: string;
   error?: string;
   /** Structured recovery metadata when a v2 definition is no longer runnable. */
   reason?: LegacyWorkflowRetirementReason;
@@ -228,6 +250,10 @@ export function isRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
+export function hasTriggerActor(raw: unknown): boolean {
+  return isRecord(raw) && Object.hasOwn(raw, 'actor');
+}
+
 export function validateTriggerRequest(raw: unknown): { ok: true; request: TriggerRequest } | { ok: false; status: number; body: TriggerResponse } {
   if (!isRecord(raw)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'request body must be an object' } };
@@ -237,6 +263,27 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   const envelope = raw.envelope;
   if (!isRecord(source) || !isRecord(target) || !isRecord(envelope)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'source, target, and envelope are required objects' } };
+  }
+  if (hasTriggerActor(raw)) {
+    if (raw.actor !== 'owner' || Object.hasOwn(envelope, 'payload') || Object.hasOwn(envelope, 'rawText')) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'actor must be owner and cannot carry envelope.payload or envelope.rawText' } };
+    }
+    if (target.kind !== 'turn' || typeof target.botId !== 'string' || !target.botId.trim()
+      || typeof target.sessionId !== 'string' || !target.sessionId.trim()
+      || typeof raw.instruction !== 'string' || !raw.instruction.trim()) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'owner actor requires a turn target with botId, sessionId, and a non-empty instruction' } };
+    }
+  }
+  // An unknown source.type must fail at the edge: triggerSessionTurn records
+  // it verbatim and `execution current` then fails its own origin enum check
+  // for the whole turn, so accepting garbage here turns one bad request into
+  // an unusable execution-identity read instead of a 400 at submission.
+  if (typeof source.type !== 'string'
+    || !(TRIGGER_SOURCE_TYPES as readonly string[]).includes(source.type)) {
+    return { ok: false, status: 400, body: {
+      ok: false, errorCode: 'bad_request',
+      error: `source.type must be one of ${TRIGGER_SOURCE_TYPES.join(', ')}`,
+    } };
   }
   if (target.kind !== 'turn' && target.kind !== 'workflow') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'target_required', error: 'target.kind must be turn or workflow' } };
@@ -278,6 +325,10 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (typeof envelope.sourceName !== 'string' || envelope.trusted !== false) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'envelope.sourceName is required and envelope.trusted must be false' } };
+  }
+  if (raw.payloadTrusted !== undefined
+    && (raw.payloadTrusted !== true || source.type !== 'webhook' || target.kind !== 'turn')) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'payloadTrusted must be true and is only supported for webhook turn triggers' } };
   }
   if (raw.presentation !== undefined) {
     if (!isRecord(raw.presentation)) {

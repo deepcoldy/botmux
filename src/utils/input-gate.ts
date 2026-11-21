@@ -249,17 +249,62 @@ export function firstPromptSeedStillWaiting(state: {
 
 /** A full-width light horizontal rule, as Claude draws above and below its input box. */
 const INPUT_BOX_RULE = /^\s*─{8,}\s*$/;
+/** The input box's TOP rule with text written into it: Claude Code 2.1.3xx
+ *  puts the session name there after `/rename` (`──────── <name> ─`), its
+ *  effort / fast-mode tags at the right end and `History n/m` near the left
+ *  end while browsing history — always one space on each side of the text and
+ *  rule on both ends. The bottom rule never carries text. */
+const INPUT_BOX_TITLED_RULE = /^\s*(─+) \S(?:.*\S)? (─+)\s*$/;
+
+/** A plain input box rule (`bottom` only) or, for the top rule, one that may
+ *  carry text. */
+export function isInputBoxRule(line: string, edge: 'top' | 'bottom'): boolean {
+  if (INPUT_BOX_RULE.test(line)) return true;
+  if (edge === 'bottom') return false;
+  const titled = INPUT_BOX_TITLED_RULE.exec(line);
+  return !!titled && titled[1].length + titled[2].length >= 8;
+}
+
+function isInputBoxTopRule(line: string): boolean {
+  return isInputBoxRule(line, 'top');
+}
+
+/** Where Claude's input box starts a row: the prompt marker, or `!` in bash mode. */
+const INPUT_BOX_FIRST_ROW = /^[❯!](?:[\u00a0 ]|$)/;
+
+/**
+ * The LAST input box on screen, as line indices of its two rules: the last
+ * plain rule, the nearest rule above it as the top rule, and the box's first
+ * non-blank row starting in column 0 with the prompt marker (or `!`, bash
+ * mode). Unlike screenShowsFramedPrompt this also finds a box holding several
+ * rows — a multi-line or wrapped draft, which never frames a single prompt
+ * row. Selectors and dialogs do not start their rows that way.
+ */
+export function lastInputBox(screen: string): { top: number; bottom: number } | undefined {
+  const lines = screen.split('\n');
+  let bottom = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (INPUT_BOX_RULE.test(lines[i])) { bottom = i; break; }
+  }
+  if (bottom < 1) return undefined;
+  let top = bottom - 1;
+  while (top >= 0 && !isInputBoxTopRule(lines[top])) top--;
+  if (top < 0) return undefined;
+  const first = lines.slice(top + 1, bottom).find(line => line.trim() !== '');
+  return first !== undefined && INPUT_BOX_FIRST_ROW.test(first) ? { top, bottom } : undefined;
+}
 
 /**
  * The LAST line matching `readyPattern` sits inside a framed input box: the
- * nearest non-blank line above and below it are both horizontal rules.
+ * nearest non-blank line above is the box's top rule (plain or carrying the
+ * session name / tags) and the one below is a plain horizontal rule.
  *
  * A bare `readyPattern.test(screen)` also matches a selector's `❯ 1. Yes`
  * (startup / trust / hook dialogs) and any ❯ left in the replayed transcript.
  * Neither is framed by rules on both sides, so they are rejected here. Pass the
- * rendered viewport with box drawing kept
- * (`renderer.rawSnapshot({ preserveFormatting: true })`) — the default snapshot
- * turns every `─` into a space — and never the appended PTY log.
+ * current viewport with box drawing kept (the backend's own capture, or
+ * `renderer.rawSnapshot({ preserveFormatting: true })` — the default snapshot
+ * turns every `─` into a space) and never the appended PTY log.
  */
 export function screenShowsFramedPrompt(screen: string, readyPattern: RegExp): boolean {
   if (!screen) return false;
@@ -278,7 +323,7 @@ export function screenShowsFramedPrompt(screen: string, readyPattern: RegExp): b
   const above = nearestNonBlank(promptLine, -1);
   const below = nearestNonBlank(promptLine, 1);
   return above !== undefined && below !== undefined
-    && INPUT_BOX_RULE.test(above) && INPUT_BOX_RULE.test(below);
+    && isInputBoxTopRule(above) && INPUT_BOX_RULE.test(below);
 }
 
 export function shouldReleaseFirstPromptTimeout(state: {
@@ -290,9 +335,14 @@ export function shouldReleaseFirstPromptTimeout(state: {
   elapsedMs: number;
   /** Absolute hard cap for keeping the first prompt queued. */
   hardTimeoutMs: number;
+  /** The adapter verified its empty input box on the backend's own screen.
+   *  The output pipe can attach after that box was drawn, so the readyPattern
+   *  the deferral waits for may never reach the stream. */
+  inputBoxReady?: boolean;
 }): boolean {
   if (!state.deferFirstPromptTimeoutUntilReady) return true;
   if (!state.hasReadyPattern) return true;
+  if (state.inputBoxReady === true) return true;
   return state.elapsedMs >= state.hardTimeoutMs;
 }
 
@@ -405,6 +455,11 @@ export function decideHardTimeoutAction(supportsTypeAhead: boolean): 'flush' | '
  * check (unchanged behavior). The first-prompt hard cap stays a real deadline:
  * past it the write goes through as before, so a stale readyPattern can delay
  * the first prompt but never trap it.
+ *
+ * An adapter that judges its own input box (inputBoxReady) outranks all of
+ * that: its writeInput refuses a box that is not empty, so a prompt marker, a
+ * ready signal or the hard cap would only turn a held first message into a
+ * rejected one. It stays queued until the box is ready.
  */
 export function decideFirstWriteLiveness(state: {
   readyPattern: RegExp | undefined;
@@ -414,7 +469,15 @@ export function decideFirstWriteLiveness(state: {
   readySignal: boolean;
   /** The spawn's first-prompt hard cap has elapsed. */
   hardCapReached: boolean;
-}): { write: boolean; reason: 'no-ready-pattern' | 'no-viewport' | 'ready-signal' | 'prompt-visible' | 'hard-cap' | 'prompt-not-visible' } {
+  /** The adapter's verdict on the backend's own input state; undefined when
+   *  the adapter or backend cannot judge it. */
+  inputBoxReady?: boolean;
+}): { write: boolean; reason: 'input-box-ready' | 'input-box-not-ready' | 'no-ready-pattern' | 'no-viewport' | 'ready-signal' | 'prompt-visible' | 'hard-cap' | 'prompt-not-visible' } {
+  if (state.inputBoxReady !== undefined) {
+    return state.inputBoxReady
+      ? { write: true, reason: 'input-box-ready' }
+      : { write: false, reason: 'input-box-not-ready' };
+  }
   if (!state.readyPattern) return { write: true, reason: 'no-ready-pattern' };
   if (state.readySignal) return { write: true, reason: 'ready-signal' };
   if (state.viewport === undefined) return { write: true, reason: 'no-viewport' };

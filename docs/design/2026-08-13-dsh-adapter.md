@@ -18,7 +18,7 @@ dsh 是 DeepSeek 开源的 agent harness（cordis 插件架构，opencode 血统
 
 ### 2.1 botmux 侧
 
-- 主流 adapter（kimi/gemini/…）是 PTY 驱动 TUI：打字进 stdin、静默检测判 turn 结束、agent 自己执行 `botmux send` 回消息。**dsh 没有 TUI，这条路不适用。**
+- 主流 adapter（kimi/cursor/…）是 PTY 驱动 TUI：打字进 stdin、静默检测判 turn 结束、agent 自己执行 `botmux send` 回消息。**dsh 没有 TUI，这条路不适用。**
 - botmux 已有 **runner 型 adapter** 模式（codex-app/mira/mir）：spawn 一个小 Node runner，runner 对 botmux 说输入帧协议 + OSC 控制帧，对真实 agent 说原生协议。thin adapter 仅 ~120 行（`src/adapters/cli/codex-app.ts`），重活在 runner。
 - 输入帧协议（`src/adapters/cli/runner-input.ts`）：botmux 写 `::botmux-<id>:<base64(JSON)>\n`，`writeRunnerInput` 负责分块（1024B/块、20ms 节流）、pre-flush、提交重试，返回 `{submitted, submissionDisposition}`。
 - 回包通道（`src/adapters/cli/runner-control-channel.ts`）：runner 在 stdout 混 OSC 帧 `\x1b]777;botmux:<kind>:<base64>\x07`。worker 对 `final` 帧有通用投递路径（`src/worker.ts:8401`，mira/mir 走 8483 的 else 分支），`final` 的 `content` 即投递到飞书的最终文本。

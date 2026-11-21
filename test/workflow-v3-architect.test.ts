@@ -1,19 +1,28 @@
-import { describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 
 import {
+  allocateArchitectAttempt,
   buildArchitectGoal,
   runArchitect,
 } from '../src/workflows/v3/architect.js';
 import {
   GOAL_ENV,
+  SPEC_SCHEMA_VERSION,
   type BotSnapshot,
   type Manifest,
   type RunNode,
 } from '../src/workflows/v3/contract.js';
+import { createEphemeralPool } from '../src/workflows/v3/ephemeral-pool.js';
+import { hostApproveSpec, hostArchitect, hostNew, hostSpecFinalize, type ArchitectDeps } from '../src/workflows/v3/host.js';
+import { DagValidationError } from '../src/workflows/v3/dag.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
+import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 
 const BOT: BotSnapshot = {
   larkAppId: 'cli_architect',
@@ -105,9 +114,11 @@ describe('runArchitect', () => {
 
       let seenGoal = '';
       let seenInputs = '';
+      let seenAttemptId = '';
       const runNode: RunNode = async (req) => {
         seenGoal = req.node.goal;
         seenInputs = req.inputsPath;
+        seenAttemptId = req.attemptId;
         const dag = writeProduct(req.outputDir, 'dag.json', JSON.stringify({ runId: 'x', nodes: [] }));
         const notes = writeProduct(req.outputDir, 'architect-notes.md', '# Notes');
         const manifestPath = writeManifest(req, {
@@ -122,6 +133,7 @@ describe('runArchitect', () => {
       const res = await runArchitect({
         runId: 'r1',
         runDir: dir,
+        attempt: allocateArchitectAttempt(dir),
         specPath,
         specJsonPath,
         botSnapshot: BOT,
@@ -135,6 +147,7 @@ describe('runArchitect', () => {
       expect(seenGoal).toContain(specJsonPath);
       expect(seenGoal).toContain('Do not start or run the workflow');
       expect(seenInputs).toBe(join(dir, 'architect', 'attempts', '001', 'inputs.json'));
+      expect(seenAttemptId).toBe('architect/attempts/001');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -161,7 +174,7 @@ describe('runArchitect', () => {
         };
       };
 
-      const res = await runArchitect({ runId: 'r1', runDir: dir, specPath, specJsonPath, botSnapshot: BOT, runNode });
+      const res = await runArchitect({ runId: 'r1', runDir: dir, attempt: allocateArchitectAttempt(dir), specPath, specJsonPath, botSnapshot: BOT, runNode });
       expect(res.status).toBe('fail');
       expect(res.problems).toContain('architect manifest must include architect-notes.md');
     } finally {
@@ -190,12 +203,270 @@ describe('runArchitect', () => {
         }),
       });
 
-      const res = await runArchitect({ runId: 'r1', runDir: dir, specPath, specJsonPath, botSnapshot: BOT, runNode });
+      const res = await runArchitect({ runId: 'r1', runDir: dir, attempt: allocateArchitectAttempt(dir), specPath, specJsonPath, botSnapshot: BOT, runNode });
       expect(res.status).toBe('fail');
       expect(res.dagPath).toBeUndefined();
       expect(res.problems?.join('\n')).toMatch(/must stay inside outputDir|does not exist|bytes mismatch/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('allocateArchitectAttempt', () => {
+  const attemptsOf = (dir: string) => join(dir, 'architect', 'attempts');
+
+  it('hands out 001, 002, 003 as fresh directories', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-architect-alloc-'));
+    try {
+      const ids = [1, 2, 3].map(() => allocateArchitectAttempt(dir));
+      expect(ids.map((a) => a.attemptId)).toEqual([
+        'architect/attempts/001',
+        'architect/attempts/002',
+        'architect/attempts/003',
+      ]);
+      for (const a of ids) {
+        expect(a.attemptDir).toBe(join(dir, a.attemptId));
+        expect(readdirSync(a.attemptDir)).toEqual([]);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('gives a run that only has 001 the attempt 002 and leaves 001 as it was', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-architect-alloc-old-'));
+    try {
+      const old = join(attemptsOf(dir), '001');
+      mkdirSync(join(old, 'work'), { recursive: true });
+      writeFileSync(join(old, 'manifest.json'), '{"status":"ok"}');
+      writeFileSync(join(old, 'work', 'dag.json'), '{"nodes":[]}');
+
+      const next = allocateArchitectAttempt(dir);
+
+      expect(next.attemptId).toBe('architect/attempts/002');
+      expect(readFileSync(join(old, 'manifest.json'), 'utf8')).toBe('{"status":"ok"}');
+      expect(readFileSync(join(old, 'work', 'dag.json'), 'utf8')).toBe('{"nodes":[]}');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('counts past the highest number on disk and ignores names that are not attempts', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-architect-alloc-gap-'));
+    try {
+      for (const name of ['001', '007', 'tmp', '12', '.003']) mkdirSync(join(attemptsOf(dir), name), { recursive: true });
+      expect(allocateArchitectAttempt(dir).attemptId).toBe('architect/attempts/008');
+      expect(existsSync(join(attemptsOf(dir), '002'))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps counting past 999', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-architect-alloc-wide-'));
+    try {
+      mkdirSync(join(attemptsOf(dir), '999'), { recursive: true });
+      expect(allocateArchitectAttempt(dir).attemptId).toBe('architect/attempts/1000');
+      expect(allocateArchitectAttempt(dir).attemptId).toBe('architect/attempts/1001');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores numeric names beyond MAX_SAFE_INTEGER instead of looping or emitting exponent names', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-architect-alloc-huge-'));
+    try {
+      // 16 nines parses to 1e16 (not a safe integer); 255 nines to 1e255.
+      mkdirSync(join(attemptsOf(dir), '9'.repeat(16)), { recursive: true });
+      mkdirSync(join(attemptsOf(dir), '9'.repeat(255)), { recursive: true });
+
+      const next = allocateArchitectAttempt(dir);
+      expect(next.attemptId).toBe('architect/attempts/001');
+      expect(existsSync(join(attemptsOf(dir), '10000000000000000'))).toBe(false);
+      expect(existsSync(join(attemptsOf(dir), '1e+255'))).toBe(false);
+
+      // The junk names stay ignored, so ordinary counting continues beside them.
+      expect(allocateArchitectAttempt(dir).attemptId).toBe('architect/attempts/002');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('throws instead of spinning when the next number is past MAX_SAFE_INTEGER', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-architect-alloc-boundary-'));
+    try {
+      // MAX_SAFE_INTEGER parses to a safe integer, so the readdir filter lets
+      // it through; the next n would be 2^53 — the in-loop guard must fail
+      // closed instead of entering the stuck EEXIST retry loop.
+      const boundary = String(Number.MAX_SAFE_INTEGER);
+      mkdirSync(join(attemptsOf(dir), boundary), { recursive: true });
+
+      expect(() => allocateArchitectAttempt(dir)).toThrow(/安全整数/);
+      // It throws before mkdir, so no unsafe-numbered directory is left behind.
+      expect(readdirSync(attemptsOf(dir))).toEqual([boundary]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * A terminal server where sessions never end, behind workers that create
+ * their session the way the real worker does: named `bmx-<sessionId 8>`,
+ * refused with tmux's own error when the name is taken.
+ */
+class LingeringTmux {
+  readonly sessions = new Map<string, string>();
+  readonly refused: string[] = [];
+
+  factory(): WorkerProcessFactory {
+    return { spawn: (opts) => new TmuxWorker(this, opts) };
+  }
+}
+
+class TmuxWorker extends EventEmitter implements WorkerHandle {
+  readonly pid = process.pid;
+  private exited = false;
+  private contractScope?: WorkerSessionEventScope;
+
+  constructor(private readonly tmux: LingeringTmux, private readonly opts: WorkerSpawnOptions) {
+    super();
+  }
+
+  send(msg: unknown): void {
+    const m = msg as { type?: string; sessionId?: string; sessionContract?: any; bindingId?: string; runtime?: any };
+    if (m.type === 'init') {
+      const name = TmuxBackend.sessionName(m.sessionId!);
+      if (this.tmux.sessions.has(name)) {
+        this.tmux.refused.push(name);
+        setImmediate(() => {
+          this.emitMessage({ type: 'error', message: `tmux 创建会话失败：duplicate session: ${name}` });
+          this.exit(1);
+        });
+        return;
+      }
+      this.tmux.sessions.set(name, m.sessionId!);
+      if (m.sessionContract) {
+        this.contractScope = new WorkerSessionEventScope(m.sessionContract.session, m.sessionContract.worker);
+        const binding = this.contractScope.beginRuntime();
+        this.contractScope.enterRuntime(binding);
+        this.emitMessage({ type: 'runtime_binding_started', bindingId: binding.bindingId });
+        this.emitMessage({ type: 'runtime_binding', bindingId: binding.bindingId, identity: { backend: 'tmux', physicalId: name, proof: 'opaque' } });
+      }
+      setImmediate(() => {
+        this.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+        this.emitMessage({ type: 'prompt_ready' });
+      });
+    } else if (m.type === 'runtime_contract_assigned') {
+      this.contractScope?.assign(m.bindingId!, m.runtime);
+    } else if (m.type === 'raw_input') {
+      this.writeProducts();
+    } else if (m.type === 'close') {
+      setImmediate(() => this.exit(0));
+    }
+  }
+
+  kill(): void {
+    setImmediate(() => this.exit(0));
+  }
+
+  private writeProducts(): void {
+    const outputDir = this.opts.env[GOAL_ENV.OUTPUT_DIR]!;
+    const files = [
+      writeProduct(outputDir, 'dag.json', JSON.stringify({ schemaVersion: 2, runId: 'r', nodes: [] })),
+      writeProduct(outputDir, 'architect-notes.md', `# Notes ${this.opts.env[GOAL_ENV.ATTEMPT_DIR]}`),
+    ];
+    writeFileSync(this.opts.env[GOAL_ENV.MANIFEST_PATH]!, JSON.stringify({ schemaVersion: 1, status: 'ok', summary: 'ok', files }));
+  }
+
+  private emitMessage(msg: Record<string, unknown>): void {
+    const binding = this.contractScope?.currentBinding();
+    this.emit('message', binding && this.contractScope ? { ...msg, sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime }) } : msg);
+  }
+
+  private exit(code: number): void {
+    if (this.exited) return;
+    this.exited = true;
+    this.emit('exit', code);
+    this.emit('close', code);
+  }
+}
+
+function toApprovedSpec(baseDir: string): { runDir: string; runId: string } {
+  const { runDir, runId } = hostNew({ goal: 'g', baseDir, runId: 'r' });
+  const spec = {
+    schemaVersion: SPEC_SCHEMA_VERSION,
+    runId,
+    title: 'demo',
+    requirement: 'list files, then summarize',
+    nodes: [
+      { sketchId: 'list', goal: 'list files', input_needs: [], expected_outputs: ['files.md'], acceptance: 'non-empty', risk_gate: false, unknowns: [] },
+    ],
+  };
+  writeFileSync(join(runDir, 'spec.md'), `# Spec\n\n## 草图\n\`\`\`json\n${JSON.stringify(spec, null, 2)}\n\`\`\`\n`);
+  hostSpecFinalize(runDir);
+  hostApproveSpec(runDir);
+  return { runDir, runId };
+}
+
+describe('Architect rerun in one run (#3129)', () => {
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it('starts the next round while the previous round\'s terminal session is still alive, and leaves that round\'s attempt as it was', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-architect-rerun-'));
+    vi.stubEnv('SESSION_DATA_DIR', join(base, 'data'));
+    try {
+      const { runDir } = toApprovedSpec(base);
+      const tmux = new LingeringTmux();
+      const pool = createEphemeralPool({
+        factory: tmux.factory(),
+        workerPath: '/tmp/worker.js',
+        quiesceMs: 1,
+        cancelGraceMs: 2_000,
+        manifestPollMs: 5,
+        manifestSettleMs: 15,
+        resolveLarkAppSecret: () => 'secret',
+      });
+      let validations = 0;
+      const refusal = '节点 summarize：检查点后面没有节点';
+      const deps: ArchitectDeps = {
+        runArchitect: (input) => runArchitect({ ...input, runNode: pool.runNode }),
+        // The first round's DAG is turned down by the host, as in run C.
+        loadDag: () => {
+          validations += 1;
+          if (validations === 1) throw new DagValidationError([refusal]);
+          return { schemaVersion: 2, runId: 'r', nodes: [] };
+        },
+        botSnapshot: BOT,
+        resolveLarkAppSecret: () => 'secret',
+        timeoutMs: 60_000,
+      };
+      const attempts = join(runDir, 'architect', 'attempts');
+
+      const first = await hostArchitect(runDir, deps);
+      expect(first).toMatchObject({ ok: false, problems: [refusal], state: { status: 'spec_approved' } });
+      expect(first.attemptDir).toBe(join(attempts, '001'));
+      expect(tmux.sessions.size).toBe(1);
+      const firstRound = ['manifest.json', 'work/dag.json', 'work/architect-notes.md', 'goal.txt']
+        .map((file) => [file, readFileSync(join(attempts, '001', file), 'utf8')] as const);
+
+      const second = await hostArchitect(runDir, deps);
+
+      expect(tmux.refused).toEqual([]);
+      expect(second).toMatchObject({ ok: true, state: { status: 'dag_ready' } });
+      expect(second.attemptDir).toBe(join(attempts, '002'));
+      expect(second.state.dagPath).toBe(join(attempts, '002', 'work', 'dag.json'));
+      expect(second.state.notesPath).toBe(join(attempts, '002', 'work', 'architect-notes.md'));
+      expect(second.state.architectManifestPath).toBe(join(attempts, '002', 'manifest.json'));
+      // Both rounds' sessions exist side by side under different names.
+      expect(tmux.sessions.size).toBe(2);
+      expect(readFileSync(join(attempts, '002', 'goal.txt'), 'utf8')).toContain(refusal);
+      for (const [file, content] of firstRound) {
+        expect(readFileSync(join(attempts, '001', file), 'utf8'), file).toBe(content);
+      }
+    } finally {
+      rmSync(base, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
   });
 });

@@ -1,0 +1,65 @@
+---
+description: "开源、可自托管的 botmux 中心化平台：飞书登录，在一个网站里管理各台机器、远程打开 Dashboard 和终端、和团队协作。"
+---
+
+import platformIntro from '../../static/img/platform-intro.mp4';
+
+# 中心化平台（开源）
+
+botmux 跑在你自己的机器上，单机使用不依赖任何中心服务。机器一多、想在外面打开、或者要和团队一起用时，可以再部署一个**中心化平台**：[Botmux Platform](https://github.com/botmux-ai/botmux-platform)。它以 MIT 协议开源、可以自托管：用飞书登录，把各台机器上的 botmux 汇总到一个网站里。
+
+<video src={platformIntro} controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
+
+适合这些情况：
+
+- 好几台机器（开发机、云主机、自己的电脑）都跑着 botmux，想在一个地方看它们的状态、打开它们的 Dashboard。
+- 人不在机器所在的网络里，也想打开 Web 终端，又不想自己配反向代理或开端口。
+- 团队里每人各跑各的机器人，想共用 Issue 看板，跨机器找到彼此的机器人一起干活。
+- 多人共用一个机器人，希望每个人用自己的飞书身份调用 lark-cli。
+
+## 能做什么
+
+| 功能 | 说明 |
+|---|---|
+| 远程打开 Dashboard 和终端 | 每台机器有独立子域名，在网页上点一下就能打开它的 [Dashboard](/dashboard) 和会话的 [Web 终端](/web-terminal)。机器不用开入站端口 |
+| 飞书单点登录 | 链接里不带 token。平台先认出你是谁，再按你是机器的 owner、协管者还是其他人，决定能看什么、能做什么 |
+| 机器总览 | 在线状态、daemon 版本、一键升级；可以给机器加协管者 |
+| 团队协作 | 团队与飞书协作群、Issue 看板；能按专长找到同团队、在别人机器上的机器人，拉进群协作（见 [多机器人协作](/multi-bot#团队维度找别人机器上的机器人来协作)） |
+| 个人凭据库 | 在平台上授权一次飞书，平台按需给已绑定的机器发放短期凭据。开了 [按触发人鉴权](/bots-json#trigger-user-auth) 的机器人，就能以你的身份调用 lark-cli |
+
+## 工作方式
+
+- 机器通常在平台访问不到的网络里，所以由 botmux **主动出站**连平台，建立一条 WebSocket 控制隧道。你在网页上打开某台机器时，平台让它再拨一条数据连接回来，在上面转发本机的 Dashboard。浏览器全程只和平台的 HTTPS 域名通信。
+- 每台机器有两个子域名：Dashboard 是 `https://m-<machineId>.<平台域名>/`，会话终端是 `https://t-<machineId>.<平台域名>/s/<会话 ID>`。登录状态只对这一台机器有效。
+- 会话、CLI 和代码都还在你的机器上。平台只保存机器、用户、团队、Issue、凭据这类数据（存在 MongoDB 里）。
+
+## 把机器接入平台
+
+1. 打开平台网页，用飞书登录，点「绑定新机器」，复制给出的 `botmux bind <绑定凭证>` 命令。
+2. 在**这台机器的终端**里执行。凭证里已经带着平台地址，不用另外配置。
+3. 绑定当场完成。botmux 正在运行的话会立刻连上平台，不用重启。命令输出里会给出这台机器在平台上的 Dashboard 链接，之后 `botmux dashboard` 给出的也是平台链接。
+
+还没装 botmux 的机器，可以复制平台上「一键安装 Botmux」给出的命令：它会装好 botmux 和常用依赖（Node.js、tmux、Codex、lark-cli 等），最后提示你去绑定。
+
+几点说明：
+
+- `botmux bind` 只能在宿主终端里执行。在 AI CLI 会话里执行会被拒绝，免得 AI 拿到绑定凭证。
+- 重复绑定是安全的，机器身份（machineId）不变。绑定信息存在 `~/.botmux/platform.json`。
+- 如果你没设置过「远程访问终端」（`remoteAccess`），绑定时会顺带打开它：会话终端、卡片上的终端按钮和 webhook 地址都换成平台链接。想用回本机链接，到 Dashboard「通用设置 → 访问权限」里关掉，见 [全局设置](/global-settings)。
+
+## 自己部署
+
+平台是 Go 后端 + React 前端，需要 MongoDB；多副本部署时再加 Redis。
+
+- **本地试用**：克隆仓库后执行 `docker compose up --build`，打开 `http://localhost:8080`。MongoDB 会一起启动；登录用的是开发用假身份（`DEV_LOGIN`），不需要飞书应用。
+- **生产部署**需要准备：
+  - 一个飞书自建应用，重定向 URL 配成 `<平台地址>/auth/callback`；
+  - 根域名和 `*.<根域名>` 通配子域名的 DNS 与 TLS 证书，机器子域名要用；
+  - 入口网关透传 WebSocket，并调大空闲超时（控制隧道是长连接）。
+
+可以直接用仓库里的 `Dockerfile` 构建镜像。环境变量和完整说明见 [仓库 README](https://github.com/botmux-ai/botmux-platform#readme)。
+
+## 相关链接
+
+- 源码、部署说明、提 Issue：[github.com/botmux-ai/botmux-platform](https://github.com/botmux-ai/botmux-platform)
+- 版本发布：[Releases](https://github.com/botmux-ai/botmux-platform/releases)

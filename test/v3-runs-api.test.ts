@@ -146,6 +146,25 @@ describe('v3-runs-api', () => {
     } finally { rmSync(base, { recursive: true, force: true }); }
   });
 
+  it('GET /api/v3/runs/:id 用宿主提供的 Bot 名称解析器标注负责 Bot', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'v3-api-'));
+    try {
+      const runDir = buildRun(base, 'r-261103-0101');
+      writeFileSync(join(runDir, 'bots.snapshot.json'), JSON.stringify({
+        '': { larkAppId: 'cli_owner', cliId: 'claude-code', workingDir: '/private/wd' },
+      }));
+      const { req, url } = get('/api/v3/runs/r-261103-0101');
+      const m = mockRes();
+      const botName = vi.fn((appId: string) => (appId === 'cli_owner' ? '主Bot' : undefined));
+      await handleV3RunsApi(req, m.res, url, { ...apiDeps(base), botName }, true);
+      expect(m.status).toBe(200);
+      const view = m.json() as { generatedAt: number; nodes: Array<{ bot?: Record<string, unknown> }> };
+      expect(view.nodes[0].bot).toEqual({ larkAppId: 'cli_owner', cliId: 'claude-code', name: '主Bot' });
+      expect(typeof view.generatedAt).toBe('number');
+      expect(m.body()).not.toContain('/private/wd');
+    } finally { rmSync(base, { recursive: true, force: true }); }
+  });
+
   it('GET /api/v3/runs/:id 未知 → 404；非法字符 id → 404（isValidRunId 拒）', async () => {
     const base = mkdtempSync(join(tmpdir(), 'v3-api-'));
     try {

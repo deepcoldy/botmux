@@ -9,7 +9,10 @@ export function groupContextQuery(content: string, options?: { configuredTrigger
   const header = parseTopicHeader(content);
   if (header !== null) return isTopicHeader(header) ? header.prompt.trim() || undefined : undefined;
   const query = content.trim();
-  return !query || /^[/!]/.test(query) ? undefined : query;
+  // A bare @mention (nothing left after stripping mentions) asks the bot to
+  // look at the conversation above: background is the whole point, so prepare
+  // it with an empty query. Only commands skip preparation.
+  return /^[/!]/.test(query) ? undefined : query;
 }
 
 export interface GroupContextTurnRequest {
@@ -20,7 +23,7 @@ export interface GroupContextTurnRequest {
   createTime: number;
   rootId?: string;
   /** Physical conversation boundary, distinct from session reply-mode. */
-  scope?: 'main' | 'thread';
+  scope?: 'main' | 'thread' | 'all';
   threadId?: string;
   sessionId?: string;
   epoch?: string;
@@ -62,6 +65,39 @@ export interface LocalConversationRender {
   truncated: boolean;
   gaps: Set<string>;
   alreadyDeliveredSeqs: number[];
+}
+
+/** A later revision of a covered message is a re-observation, not new
+ * content, when it carries the same platform `update_time`, message type and
+ * resources and its text differs only in whitespace: e.g. a bot reply recorded
+ * locally at send time and later read back through the API as a card
+ * projection with different blank lines. Treat it as covered too, otherwise
+ * the session's own reply returns as fresh background. A same-version body
+ * that is fuller than the covered one (a degraded card fallback later
+ * resolved) is real unseen content and stays uncovered. Without a known
+ * `update_time` on both sides nothing is inferred. */
+export function withReobservedRevisions(
+  messages: readonly GroupContextRenderMessage[], delivered: readonly number[],
+): number[] {
+  if (!delivered.length) return [...delivered];
+  const covered = new Set(delivered);
+  const fingerprint = (message: GroupContextRenderMessage) => JSON.stringify([
+    message.updateTime, message.msgType, message.text.replace(/\s+/g, ''),
+    (message.resourceRefs ?? []).map(ref => `${ref.type}:${ref.key ?? ''}`).sort(),
+  ]);
+  const coveredVersions = new Map<string, Set<string>>();
+  for (const message of messages) {
+    if (!covered.has(message.seq) || message.deleted || message.updateTime === undefined) continue;
+    let versions = coveredVersions.get(message.messageId);
+    if (!versions) coveredVersions.set(message.messageId, versions = new Set());
+    versions.add(fingerprint(message));
+  }
+  const out = [...delivered];
+  for (const message of messages) {
+    if (covered.has(message.seq) || message.deleted || message.updateTime === undefined) continue;
+    if (coveredVersions.get(message.messageId)?.has(fingerprint(message))) { out.push(message.seq); covered.add(message.seq); }
+  }
+  return out;
 }
 
 /** Render the conversation window for one turn from local records only.
@@ -117,6 +153,7 @@ export function renderLocalConversation(
       alreadyDeliveredSeqs = deps.deliveredSeqs(request.appId, request.chatId, request.sessionId, request.epoch);
     } catch { /* An uncertain receipt repeats history instead of skipping it. */ }
   }
+  alreadyDeliveredSeqs = withReobservedRevisions(messages, alreadyDeliveredSeqs);
   // Deduplicate before coverage filtering: an older uncovered revision must
   // not revive text/resources when its latest version was already supplied.
   const latest = new Map<string, GroupContextRenderMessage>();
@@ -159,7 +196,9 @@ export interface GroupContextPreparationDeps {
     reason?: string;
   };
   deliveredSeqs: (appId: string, chatId: string, sessionId: string, epoch: string) => number[];
-  resolveAttachments?: (request: GroupContextTurnRequest, messages: GroupContextRenderMessage[], signal: AbortSignal) => Promise<{
+  /** Reports each attachment through `onResolved` as soon as it is on disk:
+   * those are kept when the budget runs out before the rest resolve. */
+  resolveAttachments?: (request: GroupContextTurnRequest, messages: GroupContextRenderMessage[], signal: AbortSignal, onResolved: (attachment: LarkAttachment) => void) => Promise<{
     attachments: LarkAttachment[];
     incomplete: boolean;
   }>;
@@ -217,11 +256,15 @@ export function createGroupContextPreparer(deps: GroupContextPreparationDeps) {
       const gapsBeforeAttachments = gaps.size;
       let attachments: LarkAttachment[] = [];
       if (deps.resolveAttachments && unseen.length) {
+        const resolvedSoFar: LarkAttachment[] = [];
         try {
-          const resolved = await bounded(signal => deps.resolveAttachments!(request, unseen, signal), deps.timeoutMs ?? 5_000);
+          const resolved = await bounded(signal => deps.resolveAttachments!(request, unseen, signal, attachment => { resolvedSoFar.push(attachment); }), deps.timeoutMs ?? 5_000);
           attachments = resolved.attachments;
           if (resolved.incomplete) gaps.add('attachments_unavailable');
-        } catch { gaps.add('attachments_unavailable'); }
+        } catch {
+          attachments = [...resolvedSoFar];
+          gaps.add('attachments_unavailable');
+        }
       }
       // Attachment resolution may have added a gap after the body was rendered;
       // the stored incompleteness flag must reflect it, so re-render once.

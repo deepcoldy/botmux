@@ -1,12 +1,21 @@
 import type { ScheduledTask } from '../types.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
-import { TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { isManualScheduleRun, isManualScheduledTurn } from './scheduled-turn-provenance.js';
+import { capabilityOn, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { capabilityOfTool } from './identity-policy.js';
+import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 
 export interface DelegatedScheduleRuntimeDependencies {
+  manualRunId?: string;
+  manualTurnId?: string;
+  /** Re-preparing an already admitted turn (identity-model replay, recovery
+   * continuation): a dispatched one-shot is completed before its turn ends. */
+  allowCompletedOnce?: boolean;
+  assertAuthorityCurrent?: () => void;
   runEnabled: boolean;
   validateBotGrant?: (record: ScheduleAuthorityRecord) => void;
   hostRunScopes: readonly TriggerUserAuthTool[];
-  triggerUserAuthTools: readonly TriggerUserAuthTool[];
+  triggerUserAuth: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | undefined;
   adminOpenIds: readonly string[];
   resolveTargetOpenId: (unionId: string) => Promise<string | undefined>;
   listChatMemberOpenIds: (chatId: string) => Promise<readonly string[]>;
@@ -15,6 +24,28 @@ export interface DelegatedScheduleRuntimeDependencies {
 export interface AuthorizedDelegatedScheduleRun {
   task: ScheduledTask;
   targetOpenId: string;
+  usesControllerToolActor: boolean;
+}
+
+/** A same-topic one-shot child keeps delegated lifecycle limits (no descendants
+ * or self-management), but may publish the direct parent's controller as an
+ * exact-turn tool actor. The task itself stays ownerless, so workflow and
+ * schedule mutation authority remain unavailable. Generic cross-bot delegated
+ * tasks remain anonymous. All fields come from the host authority store; no
+ * request body can nominate this identity. */
+export function delegatedScheduleUsesControllerToolActor(
+  task: ScheduledTask,
+  authority: ScheduleAuthorityRecord,
+): boolean {
+  return authority.kind === 'delegated'
+    && authority.grantId?.startsWith('schedule-child:') === true
+    && !!authority.controlOpenId
+    && !!authority.controlUnionId
+    && authority.credentialOpenId === authority.controlOpenId
+    && authority.runScopes.length === 0
+    && authority.selfManage === false
+    && task.ownerOpenId === undefined
+    && task.ownerUnionId === undefined;
 }
 
 async function revalidateController(
@@ -60,23 +91,37 @@ export async function authorizeDelegatedScheduleRun(
   authority: ScheduleAuthorityRecord,
   deps: DelegatedScheduleRuntimeDependencies,
 ): Promise<AuthorizedDelegatedScheduleRun> {
+  deps.assertAuthorityCurrent?.();
   assertBotGrantStillActive(authority, deps.validateBotGrant);
   if (authority.kind !== 'delegated') throw new Error('schedule authority is not delegated');
-  if (authority.state !== 'active') throw new Error(`schedule authority state is ${authority.state}`);
+  const manual = authority.state === 'paused' && (deps.manualTurnId
+    ? isManualScheduledTurn(authority.task, deps.manualTurnId)
+    : isManualScheduleRun(authority.task, deps.manualRunId));
+  const completedOnce = deps.allowCompletedOnce === true
+    && authority.state === 'completed' && isAutoCompletedSchedule(authority.task);
+  if (authority.state !== 'active' && !manual && !completedOnce) {
+    throw new Error(`schedule authority state is ${authority.state}`);
+  }
   if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
-  if (!TRIGGER_USER_AUTH_TOOLS.every(tool => deps.triggerUserAuthTools.includes(tool))) {
-    throw new Error('delegated schedule requires triggerUserAuth isolation for every identity tool');
+  if (!capabilityOn(deps.triggerUserAuth, 'lark-user') || !capabilityOn(deps.triggerUserAuth, 'bytecloud')) {
+    throw new Error('delegated schedule requires triggerUserAuth isolation for lark-user and bytecloud');
   }
   if (authority.runScopes.some(scope => !deps.hostRunScopes.includes(scope)
-    || !deps.triggerUserAuthTools.includes(scope))) {
+    || !capabilityOn(deps.triggerUserAuth, capabilityOfTool(scope)))) {
     throw new Error('delegated schedule run scope is no longer allowed by host policy');
   }
   if (authority.runScopes.length > 0 && !authority.credentialOpenId) {
     throw new Error('delegated schedule credential identity is missing');
   }
   const targetOpenId = await revalidateController(task, authority, deps);
+  deps.assertAuthorityCurrent?.();
   assertBotGrantStillActive(authority, deps.validateBotGrant);
-  return { task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined }, targetOpenId };
+  const usesControllerToolActor = delegatedScheduleUsesControllerToolActor(task, authority);
+  return {
+    task: usesControllerToolActor ? task : { ...task, ownerOpenId: undefined, ownerUnionId: undefined },
+    targetOpenId,
+    usesControllerToolActor,
+  };
 }
 
 export async function authorizeScheduleSelfManage(
@@ -98,6 +143,12 @@ export async function authorizeScheduleSelfManage(
     throw new Error(`schedule authority state is ${authority.state}`);
   }
   if (authority.kind === 'direct') {
+    // A task added from the host terminal carries no controller at all: its
+    // creator is the host administrator, so there is no person whose access
+    // could have lapsed. It may still only stop itself (the route limits the
+    // action and the exact task). A task with any controller field recorded,
+    // even an empty one, keeps the live re-check and fails closed inside it.
+    if (authority.controlOpenId === undefined && authority.controlUnionId === undefined) return;
     await revalidateController(authority.task, authority, deps, deps.targetChatId);
     return;
   }

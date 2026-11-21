@@ -18,7 +18,7 @@ bun run daemon:logs
 
 > Every code change requires `bun run build` then `bun run daemon:restart`.
 
-> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.3`,
+> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.4`,
 > lockfile `bun.lock`). `trustedDependencies` in `package.json` must keep
 > `node-pty`: bun does not run dependency lifecycle scripts by default, and
 > `node-pty` needs its install hook to build `build/Release/pty.node` — without
@@ -77,7 +77,7 @@ Daemon (daemon.ts → core/ modules)
     |-- core/scheduler: cron scheduling
     |
 Worker (worker.ts) -- forked per session
-    |-- adapters/cli/*: CLI adapters (Claude Code / Codex / Gemini / OpenCode)
+    |-- adapters/cli/*: CLI adapters (Claude Code / Codex / OpenCode / Antigravity / ...)
     |-- adapters/backend: PtyBackend or TmuxBackend
     |-- utils/idle-detector: idle detection
     |-- HTTP + WebSocket: xterm.js web terminal
@@ -85,7 +85,7 @@ Worker (worker.ts) -- forked per session
     |-- IPC: daemon communication
     |
 AI Coding CLI (interactive TTY)
-    |-- Auto-installed Skills (~/.claude/skills/, ~/.gemini/skills/, ~/.config/opencode/skills/)
+    |-- Auto-installed Skills (~/.claude/skills/, ~/.config/opencode/skills/, ...)
     |-- ~/.botmux/bin/botmux wrapper on PATH → `botmux send/schedule/bots/thread` subcommands
     |
 Lark API
@@ -108,7 +108,7 @@ src/
       registry.ts           # Adapter factory + resolveCommand
       claude-code.ts        # Claude Code adapter
       codex.ts              # Codex adapter
-      gemini.ts             # Gemini CLI adapter
+      antigravity.ts        # Antigravity adapter
     backend/
       types.ts              # SessionBackend interface
       pty-backend.ts        # node-pty backend
@@ -153,8 +153,8 @@ teach the agent when/how to use them.
 **Runtime setup per CLI worker spawn** (see `src/core/worker-pool.ts`):
 
 1. `ensureCliSkills(cliId)` — writes `src/skills/definitions.ts` content
-   into the CLI's native skill dir (`~/.claude/skills/`, `~/.gemini/skills/`,
-   `~/.config/opencode/skills/`). Synchronous, idempotent per lifecycle.
+   into the CLI's native skill dir (`~/.claude/skills/`,
+   `~/.config/opencode/skills/`, ...). Synchronous, idempotent per lifecycle.
 2. Worker `PATH` is prepended with `~/.botmux/bin`, which contains a
    `botmux` shell wrapper written by the daemon at startup (points at the
    running daemon's `dist/cli.js` — always in sync).
@@ -227,10 +227,27 @@ bun run test:all            # Unit + E2E (needs real CLIs / browser session)
 bun run test:e2e            # All *.e2e.ts (sequential)
 bun run test:e2e-browser    # Feishu browser cases through Midscene Test
 bun run test:codex          # Codex input E2E
-bun run test:gemini         # Gemini CLI input E2E
 bun run test:bench          # Benchmark the unit suite (see docs/test-benchmark.md)
 bun run test:bench --compare   # serial vs parallel vs parallel+time-scale table
 ```
+
+CI also runs the eligible unit files on Bun in four independent shards, retaining
+one process per file. The stable `bun-test` check verifies complete coverage and
+publishes per-file wall times. See [Bun CI shards and timing artifacts](docs/bun-ci-shards.md)
+for local reproduction and refreshing the separate Bun duration table.
+
+The TraeX Auto and startup-readiness fixtures cache an isolated JavaScript
+emission per test file. They copy current source and compiler/dependency inputs,
+then emit that private tree with the project's TypeScript compiler. Normal build
+and type checks still run through `bun run build`; this test-local emission only
+avoids paying Node+tsx transformation at every worker startup.
+
+Hooks and workers use the same read-only snapshot on Node with real PTY/tmux.
+New spawns verify the selected inputs and snapshot, and teardown removes the
+cache after the workers stop. Source changes during capture or compilation fail
+the fixture; each compilation has its own output directory. Symlinked source
+inputs use source execution. Set `BOTMUX_TEST_WORKER_SOURCE=1` for reproduction;
+`BOTMUX_TEST_WORKER_BINARY` remains the single-file executable path.
 
 > **Speed knob:** adapter `writeInput()` waits real wall-clock time to confirm a
 > submit (poll the CLI history/transcript). `BOTMUX_TIME_SCALE` (read by

@@ -11,7 +11,16 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A new push to a PR replaces the run for the old head. On master every
+  # merge used to cancel the run before it, so no master run finished; there
+  # the running one now completes and only the newest pending one waits.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # No job runs the Electron binary that electron's postinstall downloads (the
+  # desktop release lets electron-builder fetch its own copy), and that download
+  # has no retry: one 504 fails the whole bun install (#3193).
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
 
 jobs:
   # Compile + workflow-core only. The unit suite used to live here and dominated
@@ -32,14 +41,14 @@ jobs:
         with:
           node-version: 22
 
-      # Bun is the package manager (packageManager: bun@1.4.3). node-pty's install
+      # Bun is the package manager (packageManager: bun@1.4.4). node-pty's install
       # script runs only because it is in `trustedDependencies` — bun skips
       # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
       # need a loadable pty.node (here node-pty's own linux-x64 prebuild).
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.4
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - run: bun run build
       - run: bun run workflow-core:test
 
@@ -51,12 +60,25 @@ jobs:
   # Four shards, split by recorded per-file duration (vitest.config.ts →
   # scripts/duration-shards.mjs; table test/shard-timings.json) rather than
   # vitest's equal-file-count hash split, which left one shard at 19–20 of its
-  # 20 minutes while another finished in 9. Rebalance instead of raising the
-  # limit, so the timeout keeps catching a genuinely hung shard.
+  # limit while another finished in 9.
+  #
+  # The planner balances the SUM of recorded per-file wall times, so the four
+  # shard plans are near-identical (~2560s each), but real shard wall time also
+  # depends on in-shard fork parallelism, PTY integration-test contention and
+  # runner hot/cold state — none of which is in the table. Measured
+  # actual/plan ratios across fully-green runs span ~0.79–0.94 (≈±15%), i.e.
+  # ~±6 min between shards at this size. With a 20-min limit the longest shard
+  # observed 19.2/19.7/20.1 min on three runs and was step-cancelled at 20m06s
+  # (no failing test). As the suite grew, run 43209206162 shard 2 took 1456.47s
+  # for 12,924 passing tests plus ~45s of setup: the 25-min job limit cancelled
+  # it just after the green summary. 30 min leaves room for setup, teardown and
+  # measured runner variance while still bounding a hung shard. A stale table
+  # only makes shards less even, never drops a file (refresh with
+  # scripts/update-shard-timings.mjs). See #2986.
   test:
     name: test (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -69,38 +91,24 @@ jobs:
         with:
           node-version: 22
 
-      # dsh 沙盒集成用例要在 runner 上真跑 bwrap:ubuntu-24.04 默认
-      # kernel.apparmor_restrict_unprivileged_userns=1 且 bubblewrap 包不带
-      # AppArmor profile,bwrap 一起 userns 就秒退("setting up uid map:
-      # Permission denied",exit 1)。这里放开限制并预装 bubblewrap,让沙盒
-      # 用例在 CI 上真正执行。整步 best-effort:哪一步失败都不阻塞——测试侧
-      # 有 bwrap 运行时探测 gate,跑不了会 loud skip。sudo/apt 卡住时 `|| true`
-      # 不会返回,所以整段准备限时 90s,避免吃掉 job 的 20 分钟超时。
-      # install 前必须先 apt-get update:runner 镜像自带的 apt 索引会滞后于镜像源,
-      # 实测索引里的 bubblewrap 0.9.0-1ubuntu0.1 被 0.9.0-1ubuntu0.2 顶替后,
-      # 不 update 直接 install 全部镜像源 404(2026-09-19 master 自身 CI 因此红)。
+      # dsh 沙盒、linux-isolation 等集成用例要在 runner 上真跑 bwrap(含 bwrap
+      # 里再起 bwrap 的嵌套形态)。各镜像要补的系统设置(放开
+      # apparmor_restrict_unprivileged_userns、24.04 预装 bubblewrap、26.04 卸掉
+      # AppArmor 的 bwrap-userns-restrict profile)及实测依据都写在脚本头注释里;
+      # 脚本最后用与用例相同的 bwrap 参数探测单层与嵌套两种形态,不可用时打
+      # ::warning:: 注解。整步 best-effort,不阻塞:测试侧有运行时探测 gate,
+      # 跑不了会 loud skip。
       - name: Enable bwrap sandbox for integration tests (best-effort)
-        run: |
-          # Healthy runners finish this in ~10s. A hung sudo/apt produces no
-          # output and otherwise burns the whole job timeout.
-          timeout -k 15s 90s bash -c '
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-            command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
-          ' || echo "bwrap setup timed out — continuing without a confirmed sandbox"
-          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
-            echo "bwrap userns OK — sandbox integration tests will run for real"
-          else
-            echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
-          fi
+        run: bash scripts/ci-enable-bwrap.sh
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.4
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - run: bun run build
-      # No rerun on failure: a shard spends 10–12 of its 20 minutes in vitest,
-      # so a second pass cannot finish anyway, and a flake must surface to be
-      # fixed rather than be retried away (#2464).
+      # No rerun on failure: a shard spends up to ~24 of its 30 minutes in
+      # vitest, so a second pass cannot finish anyway, and a flake must surface
+      # to be fixed rather than be retried away (#2464).
       - name: Unit tests (shard ${{ matrix.shard }}/4)
         run: bun run test -- --shard=${{ matrix.shard }}/4
 
@@ -159,13 +167,18 @@ jobs:
   # If a future environmental flake shows up, fix the cause (or gate the offending
   # test to a blocking sub-job); do not quietly flip this back to advisory.
   #
-  # The generous timeout is inherent to the design: the runner spawns ONE bun
-  # process PER FILE, because `bun test` otherwise runs every file in a single
-  # process and cross-file interference cascades (measured: 933 failures batched
-  # vs ~2% one-per-process). Startup cost therefore dominates the wall clock.
-  bun-test:
+  # Keep ONE process PER FILE: batching leaks module mocks across files.
+  # Four independent duration-balanced shards shorten the 46–51 minute Bun leg.
+  # First run uses Node timing estimates; subsequent runs can use the separate
+  # test/bun-shard-timings.json generated from the Bun timing artifacts.
+  bun-test-shards:
+    name: bun-test (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
 
     steps:
       - uses: actions/checkout@v6
@@ -186,28 +199,17 @@ jobs:
       #
       # ⚠️ Unlike vitest, `bun test` has no host-level skip gate here: the suite
       # under `describe.skipIf(process.platform !== 'linux')` DOES run on this
-      # linux runner and can only fail once bwrap is absent. Keep this step in
-      # sync with the `test` job's copy.
+      # linux runner and can only fail once bwrap is absent. Both jobs run the
+      # same script, so the two copies cannot drift apart.
       - name: Enable bwrap sandbox for integration tests (best-effort)
-        run: |
-          # Healthy runners finish this in ~10s. A hung sudo/apt produces no
-          # output and otherwise burns the whole job timeout.
-          timeout -k 15s 90s bash -c '
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-            command -v bwrap >/dev/null || (sudo apt-get update && sudo apt-get install -y bubblewrap) || true
-          ' || echo "bwrap setup timed out — continuing without a confirmed sandbox"
-          if bwrap --bind / / --unshare-user -- /bin/true 2>/dev/null; then
-            echo "bwrap userns OK — sandbox integration tests will run for real"
-          else
-            echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
-          fi
+        run: bash scripts/ci-enable-bwrap.sh
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.4
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - run: bun run build
-      # Exercise the runner itself before the 20-minute suite. `node --check` cannot
+      # Exercise the runner itself before the sharded suite. `node --check` cannot
       # catch a missing binding (a ReferenceError is a RUNTIME error, verified), so a
       # commit that deleted two constants still printed `994 files` and then ran ZERO
       # — the whole leg's cost with none of its value. This runs one file in ~6s and
@@ -217,7 +219,47 @@ jobs:
       # below is meaningless, so it runs first and its failure is the one worth
       # reading.
       - run: bun run test:bun:self-check
-      - run: bun run test:bun
+      - name: Bun tests (shard ${{ matrix.shard }}/4)
+        run: bun run test:bun -- --shard=${{ matrix.shard }}/4 --timings-output=artifacts/bun-shard-${{ matrix.shard }}.json
+      - name: Upload Bun file timings (including partial failures)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-test-timings-${{ matrix.shard }}
+          path: artifacts/bun-shard-${{ matrix.shard }}.json
+          if-no-files-found: error
+          overwrite: true
+
+  # Preserve the required check name and verify actual cross-shard coverage.
+  bun-test:
+    needs: bun-test-shards
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require every Bun shard
+        run: |
+          case "${{ needs.bun-test-shards.result }}" in
+            success) exit 0 ;;
+            *) echo "Bun shards: ${{ needs.bun-test-shards.result }}"; exit 1 ;;
+          esac
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bun-test-timings-*
+          path: artifacts/bun-shards
+          merge-multiple: true
+      - name: Verify complete coverage and merge Bun timings
+        run: node scripts/merge-bun-test-timings.mjs artifacts/bun-shards --shards=4 --output=artifacts/bun-shard-timings.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bun-test-timings
+          path: artifacts/bun-shard-timings.json
+          if-no-files-found: error
+          overwrite: true
 
   # The Bun single-file executable is a SHIPPED artifact (attached to every
   # GitHub Release), but until this job existed nothing built or ran it before a
@@ -240,6 +282,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # Only image download is retried. The glibc build and binary smoke still
+      # execute once, so their deterministic failures cannot be retried away.
+      - name: Pull the glibc builder image with network retries
+        run: node scripts/ci-net-retry.mjs docker pull quay.io/pypa/manylinux_2_28_x86_64:latest
 
       - name: Build and smoke on the supported glibc 2.28 floor
         # node-pty is compiled on the build host. ubuntu-latest raised the embedded
@@ -294,20 +344,21 @@ jobs:
             -v "$PWD:/work" -w /work \
             -e CI_RUN_NUMBER="${{ github.run_number }}" \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
             node:22-alpine sh -euc '
               # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty must compile
               # here because its linux prebuilds are glibc-only. binutils supplies
               # readelf.
               apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
-              npm i -g bun@1.4.3 --loglevel=error
+              node scripts/ci-net-retry.mjs npm i -g bun@1.4.4 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the entire point of this job.
               # build_from_source makes node-pty'"'"'s install script delete its
               # (glibc) prebuilds and run node-gyp. It only takes effect when
               # node-pty is actually (re)installed — a clean checkout here.
-              npm_config_build_from_source=true bun install --frozen-lockfile
+              npm_config_build_from_source=true node scripts/ci-net-retry.mjs bun install --frozen-lockfile
 
               # Fail closed rather than compiling a musl binary around a glibc
               # native: that mistake survives the build and surfaces only when the
@@ -403,7 +454,7 @@ jobs:
   # that does not exist there. The signature path was reachable ONLY in a
   # release run, which is precisely why it kept escaping to users.
   #
-  # WHY macos-14 SPECIFICALLY, and not "some macOS runner": it is arm64, which
+  # WHY macos-15 SPECIFICALLY, and not "some macOS runner": it is arm64, which
   # is what makes darwin-x64 a CROSS-COMPILE — and cross-compiling is the only
   # configuration that reproduces the v3.19.0 defect at all (the native arm64
   # output was valid on the very same run). On an x64 macOS runner the broken
@@ -413,8 +464,19 @@ jobs:
   #
   # Free for this repo: macOS runners bill 10× minutes on private repos, but
   # public repos consume no included minutes at all.
+  #
+  # TROUBLESHOOTING a `cancelled` conclusion with ZERO steps and an empty
+  # runner_name: that is NOT a build failure. macos-15 is the arm64 hosted pool,
+  # and under capacity pressure GitHub gives up acquiring a runner after ~15
+  # minutes and marks the job `cancelled` before any step runs (annotation:
+  # "The job was not acquired by Runner of type hosted"). This job is NOT in the
+  # master ruleset (which requires only `build` + `test`), so let a later run
+  # cover it naturally. Do NOT re-run a non-tip older master SHA to rescue it:
+  # all master push runs share concurrency group `ci-<workflow>-<ref>`, and a
+  # freshly created re-run supersedes a newer run that is still queued
+  # (cancel-in-progress:false protects only the run that already started).
   bun-binary-darwin:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
@@ -424,9 +486,9 @@ jobs:
         with:
           node-version: 22
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
 
       # node-pty SHIPS darwin prebuilds (prebuilds/darwin-{x64,arm64}/pty.node
       # plus the spawn-helper sidecar), which is why ONE macOS runner can emit
@@ -434,7 +496,7 @@ jobs:
       # arch only. This install is also the only place in CI where the darwin
       # branch of scripts/build-bun-binary.mjs (`resolveNodePtyNative` picking a
       # prebuild, and the spawn-helper embed) is exercised at all.
-      - run: bun install --frozen-lockfile
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
 
       # Same reason and same ORDER as the linux/musl legs: the compiled binary
       # has no package.json on disk, so the version is baked at compile time,
@@ -444,7 +506,15 @@ jobs:
       # manifest, and BEFORE the compile that bakes the value in.
       - run: npm version "0.0.0-ci.${{ github.run_number }}" --no-git-tag-version --allow-same-version
 
+      # macos-15 runners have 7 GB RAM, so Node's default old-space cap is
+      # smaller than on the 16 GB linux runners, and the whole-repo `tsc` in
+      # `bun run build` (~2.4 GB used locally, `tsc --extendedDiagnostics`)
+      # now sits right at it: a PR adding ~30 MB of types aborted with
+      # "Reached heap limit … JavaScript heap out of memory" (exit 134) while
+      # its base passed. Give it explicit headroom instead of riding the edge.
       - run: bun run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
 
       - name: Compile both darwin binaries
         # BOTH arches, because the shipped set is both and the defect lives in

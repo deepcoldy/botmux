@@ -1,10 +1,31 @@
-# 通用单轮结果
+# 单轮结果（TurnResult）
 
-`TurnResult` 把执行结束、最终正文和实际投递分开。它用于读取本轮已经产生的结果，不会重新运行模型、发送消息或执行业务动作。
+机器人在飞书里回答完一个问题后，你的本机程序可以通过一个接口，拿到这一轮的**结构化结果**：执行结束了没有、最终回答是什么、有没有真的发到群里。
 
-## 启用与权限
+这个接口**只读**。它不会重新跑模型，不会发消息，也不会替你执行任何业务动作。
 
-在目标机器人的 `bots.json` 中显式启用：
+适合这样的场景：
+
+- 同一台机器上的宿主程序想知道「刚才那条提问，机器人到底答了什么、送达没有」；
+- 想把机器人的最终回答接进自己的后续流程（比如存档、二次处理），又不想去解析群消息。
+
+> 想从外部**发起**任务并拿结果，用 [Webhook 接入](/webhook) 或 [Core-only API](/api-core-only) 的触发接口。本页只负责读取普通飞书对话里已经产生的结果。
+
+## 三件事分开看
+
+一轮对话有三个互相独立的事实，结果里分开记录：
+
+| 字段 | 回答的问题 | 可能的值 |
+|---|---|---|
+| `execution.status` | CLI 这一轮跑完了吗？ | `completed` 完成 / `failed` 失败 / `cancelled` 被取消 / `ambiguous` 无法确定 |
+| `output.status` | 有没有最终回答？ | `available` 有正文 / `empty` 明确没有输出 / `unavailable` 拿不到 |
+| `deliveries[].status` | 回答发到飞书了吗？ | `delivered` 已送达 / `partial` 部分送达 / `failed` 失败 / `unknown` 不确定 / `suppressed` 被主动不发 |
+
+所以「模型答完了」不等于「消息送达了」，「接口返回 200」也不等于「任务成功」，要分别看这三个字段。
+
+## 第 1 步：给机器人打开开关
+
+在目标机器人的 `bots.json` 条目里加上：
 
 ```json
 {
@@ -12,27 +33,68 @@
 }
 ```
 
-默认关闭。启用后只收集受支持的普通 IM 轮次；按现有机器人配置加载方式生效。关闭或撤回时，后续读取/收集会清除该机器人的缓存正文。
+- 默认关闭，只有写成 `true` 才算打开。
+- 只对之后的新轮次生效，打开前的历史轮次查不到。
+- 关掉开关后，这个机器人已缓存的结果会被清空。
+- `apiOnly`（[Core-only](/api-core-only)）机器人和开了读隔离（`readIsolation`）的机器人不支持，查询会返回 `unsupported_mode`。
 
-结果读取仅供具有既有 trusted-host HMAC 权限的宿主调用者使用。该端点不加入 core-only 免鉴权白名单，不接受模型提供的应用身份或当前会话 capability 作为跨会话读取许可。结果引用本身不是权限。
+## 第 2 步：找到要查的那一轮
 
-## 读取结果
+你需要两个 ID：
+
+| 参数 | 是什么 |
+|---|---|
+| `sessionId` | 会话 ID（话题对应的 botmux 会话） |
+| `turnId` | 轮次 ID，是一条 `om_` 开头的飞书消息 ID，通常就是触发这一轮的那条消息（新开话题时可能是话题的锚点消息） |
+| `dispatchAttempt`（可选） | 同一条消息被重新派发时的尝试序号，非负整数 |
+
+`dispatchAttempt` 不传，表示「这一轮本来就没有尝试序号」，**不是**「取最新一次」。
+
+## 第 3 步：发请求
 
 ```text
-GET /api/sessions/:sessionId/turns/:turnId/result
-GET /api/sessions/:sessionId/turns/:turnId/result?dispatchAttempt=1
+GET /api/sessions/<sessionId>/turns/<turnId>/result
+GET /api/sessions/<sessionId>/turns/<turnId>/result?dispatchAttempt=1
 ```
 
-使用与其他 trusted-host IPC 调用相同的签名方式和 daemon 发现机制。机器人身份取自处理请求的 daemon；不提供跨机器人查询字段。`dispatchAttempt` 缺省表示该轮没有 attempt 值，不表示“最新一次”。
+请求要发给**这个机器人自己的 daemon**，并带上本机可信宿主签名：
 
-成功查询 HTTP 200；错误参数 HTTP 400，缺少 HMAC HTTP 401，非可信宿主 handler HTTP 403。HTTP 成功只证明查询成功，任务是否成功要看对象内状态。
+1. **找端口**：每个在线 daemon 会在数据目录写一个描述文件，默认是 `~/.botmux/data/dashboard-daemons/<机器人 App ID>.json`，里面的 `ipcPort` 就是端口。
+2. **签名**：和 Core-only API 的签名接口用同一套方法，三个请求头 `X-Botmux-Cli-Ts` / `X-Botmux-Cli-Nonce` / `X-Botmux-Cli-Auth`，密钥是 `~/.botmux/.dashboard-secret`。具体算法和参考代码见 [Core-only API](/api-core-only) 第 6 节「签名怎么算」。
+3. 请求地址是本机回环 `http://127.0.0.1:<ipcPort>`。回环只是能连上，权限仍然靠签名。
 
-| `status` | 含义 |
+查哪个机器人由收到请求的 daemon 决定，没有「跨机器人查询」的参数。知道某个结果的 ID 也不等于有权读它，签名才是权限。
+
+## 读懂返回
+
+HTTP 状态码只说明**查询本身**是否成功：
+
+| HTTP | 什么时候 |
 |---|---|
-| `ready` | 附带 `result`；已具备本轮执行终态及可证明的最终输出/投递事实 |
-| `not_ready` | 仅观察到部分事实，尚不能判定完整结果 |
-| `unavailable` | 功能关闭、模式不支持、结果依据过期等；不返回猜测正文 |
-| `not_found` | 没有此精确引用，或已经被淘汰；不从历史文件恢复 |
+| `200` | 查询完成，具体情况看 body 里的 `status` |
+| `400` | 参数不对，比如 `dispatchAttempt` 不是非负整数、带了别的查询参数（`reason: invalid_reference`） |
+| `401` | 没签名或签名不对 |
+| `403` | 请求没通过可信宿主校验（`reason: trusted_host_required`） |
+
+body 里的 `status`：
+
+| `status` | 含义 | 该怎么办 |
+|---|---|---|
+| `ready` | 结果齐了，带 `result` 对象 | 直接用 |
+| `not_ready` | 只看到一部分事实（比如跑完了但还没确认送达） | 稍后再查 |
+| `unavailable` | 拿不到，`reason` 说明原因 | 看下表 |
+| `not_found` | 没有这一轮的记录，或已过期被清掉 | 不会从历史文件里恢复 |
+
+常见的 `reason`：
+
+| `reason` | 含义 |
+|---|---|
+| `disabled` | 这个机器人没开 `turnResults` |
+| `unsupported_mode` | 机器人或这一轮属于不支持的模式（见下文「哪些轮次不收集」） |
+| `result_not_settled` | 等了 5 分钟仍没凑齐结果，已放弃 |
+| `result_too_large` | 出现在 `output.reason`：正文超过 1 MiB，不返回截断版 |
+
+`ready` 时的完整示例：
 
 ```json
 {
@@ -71,37 +133,52 @@ GET /api/sessions/:sessionId/turns/:turnId/result?dispatchAttempt=1
 }
 ```
 
-## 独立状态
+几个容易误解的点：
 
-- `execution.status`：`completed`、`failed`、`cancelled`、`ambiguous`，来自真实 native terminal；缺失时间/耗时保持缺省。
-- `output.status`：`available`、`empty`、`unavailable`。正文是已采用的权威最终回答，不是思考、进度或之后不同的 transcript。明确空输出需要 positive silence evidence。
-- `deliveries[].status`：`delivered`、`partial`、`failed`、`unknown`、`suppressed`。`messages` 仅列已证明发送成功的主消息及本轮最终附件。已有卡片并不证明最后 PATCH 成功。
+- `output.content` 是这一轮**最终采用的回答**，不含思考过程和中间进度。
+- 执行失败（`failed`）时不会给出半截回答。
+- `messages` 只列**确认发送成功**的消息：`primary` 是主回复，`attachment` 是回答太长时另发的完整 Markdown 附件。卡片已经存在不代表最后一次更新成功。
+- 如果回答被平台内容审核拦下，这个接口也不会把正文给你，不能用它绕过审核。
+- 拿不到的时间、耗时字段直接省略，不会填猜测值。
 
-模型完成不等于消息送达；正文被审核拒绝时不通过结果接口绕过审核。失败执行不暴露部分模型答案。超长内容既可能存在于原群独立 Markdown 附件，也可能超过结果接口容量；后者返回 `output.status=unavailable`、`reason=result_too_large`，不截断冒充全文。
+## 哪些轮次会收集
 
-## 覆盖与限制
+支持：在飞书群/话题里由真实消息触发的**普通轮次**，回答以普通方式发回原群。
 
-首版支持具有可信 IM 入站来源、当前代次及本次发布回执的普通 transcript final。跨进程 explicit final、已有卡片复用和不能证明完整载体的发送形态保持 unavailable/not_ready；不从 `turn-sends`、旧回复卡、最后消息或历史 transcript 推测正文、代次和全部附件。
+不收集（查询返回 `unavailable` 或 `not_found`）：
 
-已有会话的 raw passthrough（用户直接输入的 CLI 原生命令）不写入可信 `sourceMessageId`，因此该路径的轮次不收集结果。冷启动的初始 passthrough 可携带真实入站消息来源，仍须满足相同模式、所有权及发布回执检查；不从回复目标补造入站来源。
+- 会议助手、[文档评论](/doc-comment)、私密回复、沙盒里不能直接发卡片的会话；
+- [静默定时任务](/schedule)、[接管（adopt）](/adopt) 的会话、headless / HTTP 触发的轮次；
+- 在已有会话里直接输入 CLI 原生命令（raw passthrough）的轮次，因为它没有可信的来源消息。冷启动时的首条 passthrough 如果带着真实来源消息，仍可能被收集；
+- 回复复用旧卡片、或者无法证明完整送达的发送方式，这类保持 `not_ready` / `unavailable`，不会去猜。
 
-会议接收器、文档、私有回复、沙盒/读隔离、静默任务、adopt、headless/HTTP 结果等特殊路径不通过本功能外发正文。已有 HTTP trigger/headless 和 workflow 结果协议保持原样；本功能不强行合并它们。
+[Webhook](/webhook)、[headless](/headless-session)、[工作流](/workflow) 各自的结果接口保持不变，本功能不替代它们。
 
-单个会话或轮次变为不支持时，只删除该精确结果引用，不清空同一机器人的其他会话或 attempt。关闭功能或撤回机器人级策略时仍清空该机器人的结果。
+某个会话或某一轮变成不支持时，只清掉那一条结果，同一机器人的其它结果不受影响。
 
-快照只保留在 daemon 内存中：
+## 保留多久
 
-- 总计最多 128 个 pending/ready 上下文和 16 MiB 缓存；
-- 单个结果最多 1 MiB；
-- ready 保留 15 分钟，pending 最多 5 分钟；
-- 访问时惰性清理，daemon 重启后不可用；读取不会延长保留期。
+结果只放在 daemon 内存里：
 
-该缓存不是副作用去重或恢复账本，不保证跨重启读取、自动重投或 exactly-once。现有 `turn.completed` Webhook 与反馈数据库继续只含元数据，不增加全文。
+| 限制 | 数值 |
+|---|---|
+| 同时保留的轮次 | 最多 128 个（含未完成的） |
+| 总容量 | 16 MiB，超出时先淘汰最早的 |
+| 单个结果 | 最多 1 MiB |
+| 已完成结果 | 保留 15 分钟 |
+| 未完成结果 | 最多等 5 分钟 |
 
-## 内部完成通知
+- 读取不会延长保留时间。
+- daemon 重启后全部清空。
+- 它**不是**去重或恢复账本：不保证重启后还能读到，不会自动重投，也不保证 exactly-once。
+- 现有的 `turn.completed` Webhook 和反馈数据库仍然只记元数据，不会因此多存全文。
 
-嵌入宿主可使用 worker-pool 的可选 `onTurnResult(result)` 回调取得同一不可变快照。默认没有消费者，不执行外部命令，不新增公共生命周期广播。
+## 进阶：嵌入宿主的完成回调
 
-通知在结果会合后发出，异步错误或 10 秒观察超时独立报告，不改变原模型结果、重发原群分析或进入模型重试。超时不代表能够取消任意观察者代码，也不代表业务动作没有发生。
+如果你是把 botmux 当库嵌入的宿主，可以给 worker-pool 传一个可选回调 `onTurnResult(result)`。每一轮结果凑齐后，会把和接口里一样的只读快照推给它。
 
-需要使用结果执行其他动作时，应由调用方另行核验身份、目标范围和写权限。读取能力不授权建群、邀请、部署、改配置或任意跨群转发。
+- 默认没有回调，不会执行任何外部命令。
+- 回调抛错或 10 秒内没结束，只会记一条日志，不会重发原回答、不会让模型重试。
+- 超时不会中断你的回调代码，也不能说明你的业务动作没发生。
+
+拿到结果后要去做别的事（建群、邀请、部署、改配置、转发到别的群），请自己另外核验身份、目标范围和写权限。读到结果不代表拥有这些权限。

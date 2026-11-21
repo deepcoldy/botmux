@@ -113,7 +113,7 @@ describe('opencode2 buildArgs resume', () => {
 
     const adapter = createOpenCode2Adapter();
     const args = adapter.buildArgs({ sessionId: BOTMUX_SESSION_ID, resume: true });
-    expect(args).toEqual(['--session', 'ses_new']);
+    expect(args).toEqual(['--auto', '--session', 'ses_new']);
   });
 
   it('prefers the persisted cliSessionId over the text lookup', () => {
@@ -124,7 +124,7 @@ describe('opencode2 buildArgs resume', () => {
 
     const adapter = createOpenCode2Adapter();
     const args = adapter.buildArgs({ sessionId: BOTMUX_SESSION_ID, resume: true, resumeSessionId: 'ses_persisted' });
-    expect(args).toEqual(['--session', 'ses_persisted']);
+    expect(args).toEqual(['--auto', '--session', 'ses_persisted']);
   });
 
   it('never injects --model (V2 TUI top-level rejects it with help-and-exit)', () => {
@@ -134,6 +134,20 @@ describe('opencode2 buildArgs resume', () => {
       resume: false,
       model: 'anthropic/claude-sonnet-4',
     });
+    expect(args).toEqual(['--auto']);
+  });
+
+  it('passes --auto so a TUI permission ask cannot silently stall a managed turn', () => {
+    // V2 base policy asks for `read *.env`; nobody can see the TUI prompt from
+    // Feishu, so an unanswered ask freezes the whole turn. `--auto` only
+    // releases what would have asked — explicit `deny` still wins.
+    const adapter = createOpenCode2Adapter();
+    expect(adapter.buildArgs({ sessionId: BOTMUX_SESSION_ID, resume: false })).toEqual(['--auto']);
+  });
+
+  it('omits --auto when disableCliBypass is set', () => {
+    const adapter = createOpenCode2Adapter();
+    const args = adapter.buildArgs({ sessionId: BOTMUX_SESSION_ID, resume: false, disableCliBypass: true });
     expect(args).toEqual([]);
   });
 
@@ -150,7 +164,7 @@ describe('opencode2 buildArgs resume', () => {
       initialPrompt: 'first lark message',
     });
     // 首条消息改走输入队列（paste+Enter，DB 验证），不依赖 args 自动提交
-    expect(args).toEqual(['--session', 'ses_x']);
+    expect(args).toEqual(['--auto', '--session', 'ses_x']);
     expect(adapter.passesInitialPromptViaArgs).toBe(false);
   });
 });

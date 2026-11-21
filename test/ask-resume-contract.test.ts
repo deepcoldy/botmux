@@ -256,6 +256,22 @@ describe('clause 3 — identity mismatch on a shared key FAILS CLOSED (codex P1-
     expect(result.kind).toBe('invalidated');
     expect(d.sendCalls).toHaveLength(1);
   });
+
+  it('questionsShape distinguishes a changed option DESCRIPTION', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    const withDescription = (description: string) => brokerInput({
+      questions: [{ prompt: '继续发版吗？', options: [
+        { key: 'yes', label: '继续', description },
+        { key: 'no', label: '回滚' },
+      ], multiSelect: false }],
+    });
+    registerAsk(withDescription('先灰度 5%'));
+    await new Promise((r) => setTimeout(r, 5));
+    const result = await registerAsk(withDescription('直接全量'));
+    expect(result.kind).toBe('invalidated');
+    expect(d.sendCalls).toHaveLength(1);
+  });
 });
 
 describe('clause 5 — dispatch partial-success converges (codex P1-3)', () => {

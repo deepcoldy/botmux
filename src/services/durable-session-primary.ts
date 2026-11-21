@@ -68,6 +68,14 @@ export type DurableLarkSessionAdmissionResult =
     }
   | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
 
+export type DurableLarkSessionCheckpointResult =
+  | {
+      kind: 'checkpointed';
+      lease: SessionLease;
+      record: DurableSessionRecord;
+    }
+  | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
+
 export type DurableLarkSessionControlCommitResult =
   | {
       kind: 'committed';
@@ -104,6 +112,13 @@ function cloneSession(session: Session): DurableJson {
   const encoded = JSON.stringify(session);
   if (encoded === undefined) throw new Error('durable primary Session is not JSON-serializable');
   return JSON.parse(encoded) as DurableJson;
+}
+function preserveContractCheckpoint(current: Session, next: Session): Session {
+  if (current.sessionId !== next.sessionId || !current.sessionRuntimeContract) return next;
+  const saved = current.sessionRuntimeContract;
+  if ((next.sessionRuntimeContract?.session.revision ?? -1) >= saved.session.revision) return next;
+  return { ...next, sessionRuntimeContract: saved, sessionContractRevision: saved.session.revision,
+    sessionLifecycle: saved.session.lifecycle, status: saved.session.lifecycle === 'closed' ? 'closed' : 'active' };
 }
 
 function sameAdmission(
@@ -150,7 +165,7 @@ function parseControl(
     throw new Error(`durable primary Session ${recordSessionKey} has an invalid control commit`);
   }
   const action = raw.action;
-  if (action !== 'close' && action !== 'resume') {
+  if (action !== 'close' && action !== 'resume' && action !== 'toggle_display') {
     throw new Error(`durable primary Session ${recordSessionKey} has an invalid control action`);
   }
   const result = raw.result;
@@ -207,6 +222,15 @@ export function durablePrimarySessionProjection(
     admissions: [admission],
   };
   return { sessionKey: identity.sessionKey, value: value as unknown as DurableJson };
+}
+
+/** The canonical Session behind a primary key, or undefined when there is none.
+ * A shadow row left at the same key from before a controlled switch to primary
+ * mode counts as none, exactly as admission treats it (see
+ * mergePrimaryProjection); a malformed primary envelope still throws. */
+export function canonicalPrimarySession(record: DurableSessionRecord | undefined): Session | undefined {
+  if (!record || object(record.value)?.type !== 'botmux.session.primary') return undefined;
+  return parseDurablePrimarySessionRecord(record).session;
 }
 
 /** Parse a full primary snapshot for failover restore and validate its routing key. */
@@ -319,6 +343,7 @@ function mergePrimaryProjection(
         throw new Error(`durable primary Session ${current.sessionKey} has an invalid next snapshot`);
       }
       if (parsed.session.sessionId === nextSession.sessionId) {
+        next = { ...next, session: cloneSession(preserveContractCheckpoint(parsed.session, nextSession)) };
         previousAdmissions = parsed.admissions;
         previousControls = parsed.controls;
       } else if (parsed.session.status === 'active') {
@@ -342,6 +367,60 @@ function mergePrimaryProjection(
       ? { control: previousControls.at(-1), controls: previousControls }
       : {}),
   } as unknown as DurableJson;
+}
+
+/**
+ * Hand a closed canonical row to a same-anchor successor that reaches the lane
+ * before any inbound admission. mergePrimaryProjection already lets a brand-new
+ * logical Session follow a deliberately closed one at the same anchor, but only
+ * once a message is admitted for it. The /repo switch closes the predecessor
+ * and forks the replacement from a command or card path that never admits a
+ * message, so the replacement's first contract checkpoint is the earliest
+ * write that can claim the row. Returns undefined, so the caller keeps failing
+ * closed, unless the current row is the exact closed predecessor recorded at
+ * creation and the successor itself is active. Acquiring a new lease after a
+ * pause does not authorize replacing a later session, even if it is now closed.
+ *
+ * The predecessor's control history is bound to its sessionId and is dropped.
+ * The envelope requires an admission, so the predecessor's latest one stays as
+ * the only entry: it names a message this anchor already admitted under the
+ * predecessor, so no successor turn resolves output through it, and the
+ * successor's first admission appends its own.
+ */
+export function successorPrimarySessionValue(
+  current: DurableSessionRecord | undefined,
+  successor: Session,
+): DurableJson | undefined {
+  const value = object(current?.value);
+  const predecessor = object(value?.session);
+  const proof = successor.durablePrimaryPredecessor;
+  // Screen before the strict parse: a row that is not a closed predecessor is
+  // rejected by the caller exactly as before, whatever else is wrong with it.
+  if (!current
+      || value?.type !== 'botmux.session.primary'
+      || predecessor?.status !== 'closed'
+      || !proof
+      || predecessor.sessionId !== proof.sessionId
+      || !Number.isSafeInteger(proof.contractRevision) || proof.contractRevision < 0
+      || predecessor.sessionId === successor.sessionId
+      || successor.status !== 'active') {
+    return undefined;
+  }
+  const parsed = parseDurablePrimarySessionRecord(current);
+  // A resumed and closed-again predecessor has the same id but belongs to a
+  // later lifecycle; an old candidate must not inherit that new close.
+  if ((parsed.session.sessionRuntimeContract?.session.revision ?? 0) !== proof.contractRevision) return undefined;
+  if (primarySessionIdentity(successor, parsed.session.larkAppId).sessionKey !== current.sessionKey) {
+    throw new Error(`durable primary successor Session does not belong to ${current.sessionKey}`);
+  }
+  const next: DurablePrimarySessionProjection = {
+    version: DURABLE_PRIMARY_SESSION_VERSION,
+    type: 'botmux.session.primary',
+    session: cloneSession(successor),
+    admission: parsed.admission,
+    admissions: [parsed.admission],
+  };
+  return next as unknown as DurableJson;
 }
 
 /** Commit one completed control result and the resulting full Session snapshot. */
@@ -383,7 +462,7 @@ export async function commitDurableLarkSessionControl(input: {
     const next: DurablePrimarySessionProjection = {
       version: DURABLE_PRIMARY_SESSION_VERSION,
       type: 'botmux.session.primary',
-      session: sessionValue,
+      session: cloneSession(preserveContractCheckpoint(parsed.session, sessionValue as unknown as Session)),
       admission: parsed.admission,
       admissions: parsed.admissions,
       control,
@@ -399,6 +478,66 @@ export async function commitDurableLarkSessionControl(input: {
 }
 
 /**
+ * Save pre-admission Session state under the existing active canonical identity.
+ * This never admits the pending message or creates an input-acceptance receipt.
+ * The caller may guard its Inbox claim/lifecycle again when the FIFO builder
+ * actually runs and after the fenced write returns.
+ */
+export async function checkpointDurableLarkSession(input: {
+  facade: DurableSessionFacade;
+  message: DurableLarkMessageClaim;
+  session: Session;
+  assertCurrent?: () => void;
+}): Promise<DurableLarkSessionCheckpointResult> {
+  input.assertCurrent?.();
+  const sessionValue = cloneSession(input.session);
+  const nextSession = sessionValue as unknown as Session;
+  const messageAppId = boundedText(input.message.larkAppId, 'durable checkpoint larkAppId', 256);
+  const identity = primarySessionIdentity(nextSession, messageAppId);
+  if (identity.larkAppId !== input.message.larkAppId) {
+    throw new Error('durable checkpoint Session does not belong to the inbox application');
+  }
+  if (nextSession.status !== 'active') {
+    throw new Error('durable pre-admission checkpoint requires an active Session');
+  }
+  const written = await input.facade.writeExactFromCurrent(identity.sessionKey, current => {
+    input.assertCurrent?.();
+    if (!current) throw new Error('durable checkpoint canonical Session is missing');
+    const parsed = parseDurablePrimarySessionRecord(current);
+    if (current.sessionKey !== identity.sessionKey
+        || parsed.session.sessionId !== nextSession.sessionId
+        || parsed.session.larkAppId !== identity.larkAppId
+        || parsed.session.status !== 'active') {
+      throw new Error('durable checkpoint canonical Session changed before write');
+    }
+    input.assertCurrent?.();
+    // Preserve the exact admission/control envelope, including legacy optional
+    // fields. Only this frozen Session snapshot belongs to the checkpoint.
+    const confirmations = [...(parsed.session.codexEffortTaskConfirmations ?? [])];
+    for (const item of nextSession.codexEffortTaskConfirmations ?? []) {
+      const index = confirmations.findIndex(saved => saved.messageId === item.messageId);
+      const canonical = confirmations[index];
+      if (canonical && canonical.inputHash !== item.inputHash) throw new Error('canonical effort task identity changed');
+      if (index < 0) confirmations.push(item);
+      else confirmations[index] = canonical?.terminal ? { ...item, terminal: canonical.terminal } : item;
+    }
+    const pending = confirmations.filter(item => !item.terminal && !nextSession.durablePrimaryInputCommits?.some(proof => proof.turnId === item.messageId));
+    if (pending.length > 64) throw new Error('canonical pending effort task capacity is exhausted');
+    const terminal = confirmations.filter(item => !pending.includes(item));
+    const retained = [...(pending.length < 64 ? terminal.slice(-(64 - pending.length)) : []), ...pending];
+    const value = retained.length ? { ...nextSession, codexEffortTaskConfirmations: retained } : nextSession;
+    return { ...object(current.value)!, session: cloneSession(preserveContractCheckpoint(parsed.session, value)) } as DurableJson;
+  });
+  input.assertCurrent?.();
+  if (written.kind !== 'written' && written.kind !== 'unchanged') return written;
+  if (written.coalescedCount !== 1) {
+    throw new Error('durable pre-admission checkpoint was unexpectedly coalesced');
+  }
+  input.session.codexEffortTaskConfirmations = parseDurablePrimarySessionRecord(written.record).session.codexEffortTaskConfirmations;
+  return { kind: 'checkpointed', lease: written.lease, record: written.record };
+}
+
+/**
  * Persist one exact canonical Session snapshot and mint the only committed
  * result accepted by the primary inbox consumer.
  */
@@ -407,7 +546,10 @@ export async function admitDurableLarkSession(input: {
   message: DurableLarkMessageClaim;
   session: Session;
 }): Promise<DurableLarkSessionAdmissionResult> {
-  const projection = durablePrimarySessionProjection(input.session, input.message);
+  const confirmation = input.session.codexEffortTaskConfirmations?.find(item => item.messageId === input.message.messageId);
+  const snapshot = confirmation ? { ...input.session, codexEffortTaskConfirmations:
+    input.session.codexEffortTaskConfirmations!.map(item => item === confirmation ? { ...item, terminal: 'admitted' as const } : item) } : input.session;
+  const projection = durablePrimarySessionProjection(snapshot, input.message);
   const next = projection.value as unknown as DurablePrimarySessionProjection;
   const written = await input.facade.writeExactFromCurrent(
     projection.sessionKey,
@@ -417,6 +559,7 @@ export async function admitDurableLarkSession(input: {
   if (written.coalescedCount !== 1) {
     throw new Error('durable primary admission was unexpectedly coalesced');
   }
+  if (confirmation) confirmation.terminal = 'admitted';
   return {
     kind: 'committed',
     receipt: durableLarkAdmissionReceipt({

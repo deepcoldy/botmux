@@ -37,12 +37,14 @@ describe('Feishu Midscene lanes', () => {
     const core = selectLaneFiles(files).map(laneProject);
     expect(core).toEqual([
       'feishu-core-claude',
+      'feishu-core-clis',
       'feishu-core-codex',
       'feishu-core-conversation',
       'feishu-core-dm-modes-claude',
       'feishu-core-dm-modes-codex',
       'feishu-core-group-modes',
       'feishu-core-queue',
+      'feishu-core-sandbox',
     ]);
     expect(selectLaneFiles(files, 'all')).toEqual(files);
     expect(selectLaneFiles(files, 'core-codex, full-group').map(laneProject)).toEqual([

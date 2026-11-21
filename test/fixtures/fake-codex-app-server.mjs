@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { appendFileSync, closeSync, existsSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -28,6 +28,10 @@ const updatedDelayReads = Number(process.env.FAKE_CODEX_UPDATED_DELAY_READS ?? '
 // 超时容错只在这种条件下可复现）。只影响成功响应，不影响错误分支。
 const threadReadDelayMs = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_MS ?? '0');
 const threadReadDelayReads = Number(process.env.FAKE_CODEX_THREAD_READ_DELAY_READS ?? '1');
+// Slow every thread/name/set reply, as a loaded runner slows a local round trip.
+const nameSetDelayMs = Number(process.env.FAKE_CODEX_NAME_SET_DELAY_MS ?? '0');
+// Same for the thread/read that verifies a written name (reads after name/set).
+const verifyReadDelayMs = Number(process.env.FAKE_CODEX_VERIFY_READ_DELAY_MS ?? '0');
 const updatedBefore = Number(process.env.FAKE_CODEX_UPDATED_BEFORE ?? '100');
 const updatedAfter = Number(process.env.FAKE_CODEX_UPDATED_AFTER ?? '101');
 const finalText = process.env.FAKE_CODEX_FINAL_TEXT;
@@ -54,10 +58,13 @@ if (process.env.FAKE_CODEX_INHERITED_STDIO) {
 }
 if (envLogPath) {
   const codexHome = process.env.CODEX_HOME ?? '';
+  const configPath = join(codexHome, 'config.toml');
   writeFileSync(envLogPath, JSON.stringify({
     codexHome,
     authExists: existsSync(join(codexHome, 'auth.json')),
-    configExists: existsSync(join(codexHome, 'config.toml')),
+    configExists: existsSync(configPath),
+    // 隔离 home 的实际落盘内容，用来断言白名单：只允许 provider 接线进来。
+    configText: existsSync(configPath) ? readFileSync(configPath, 'utf8') : null,
   }));
 }
 let inputBuffer = '';
@@ -70,6 +77,7 @@ let reconciledTurn = null;
 let activeTurn;
 let pendingUserInput;
 let steerCount = 0;
+let ignoredOperatorInterrupt = false;
 /** For steer-group-mismatch: the clientIds actually sent (root + steers), so the
  *  fixture can emit a full-items terminal turn that OMITS one — exercising the
  *  runner's B5 group-aware identity defense (must fail closed). */
@@ -150,6 +158,18 @@ function completeTurn(request) {
   // Exercise duplicate pre-response lifecycle notifications: the runner must
   // buffer one edge and must not misclassify a duplicate as autonomous work.
   if (responseLast) notify('turn/started', { threadId, turn: { id: turnId } });
+  if (behavior === 'capacity-error') {
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'failed',
+      error: { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'ServerOverloaded' } } });
+    return;
+  }
+  if (behavior === 'failed-no-error') {
+    // Protocol variant: terminal failure that omits the error object entirely.
+    // The runner must settle it as a generic failure, never crash the process
+    // (JSON.stringify(undefined) returns undefined → toLowerCase TypeError).
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'failed' } });
+    return;
+  }
   if (request.params.outputSchema) {
     write({
       id: 9000 + turnAttempt,
@@ -167,8 +187,10 @@ function completeTurn(request) {
     ];
     if (behavior === 'user-input-unsupported') questions[1].options = [{ label: 'Only one' }];
     if (behavior === 'user-input-text') questions[1].options = null;
-    write({ id: pendingUserInput.requestId, method: 'item/tool/requestUserInput', params: { threadId, turnId, questions } });
-    if (behavior === 'user-input-cancelled') {
+    // Protocol variant: the owning turn id only rides on the nested turn object.
+    const turnRef = behavior === 'user-input-cancelled-nested' ? { turn: { id: turnId } } : { turnId };
+    write({ id: pendingUserInput.requestId, method: 'item/tool/requestUserInput', params: { threadId, ...turnRef, questions } });
+    if (behavior === 'user-input-cancelled' || behavior === 'user-input-cancelled-nested') {
       setTimeout(() => { notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } }); pendingUserInput = undefined; }, 200);
     }
     if (behavior === 'user-input-exit') setTimeout(() => process.exit(1), 200);
@@ -326,7 +348,13 @@ function completeTurn(request) {
     }
     if (responseLast) respond(request.id, { turn: { id: turnId } });
   };
-  if (behavior === 'delayed-first' && turnAttempt === 1) setTimeout(finish, 300);
+  if (process.env.FAKE_CODEX_FINISH_GATE) {
+    const gate = setInterval(() => {
+      if (!existsSync(process.env.FAKE_CODEX_FINISH_GATE)) return;
+      clearInterval(gate);
+      finish();
+    }, 10);
+  } else if (behavior === 'delayed-first' && turnAttempt === 1) setTimeout(finish, 300);
   else finish();
 }
 
@@ -568,6 +596,10 @@ function handle(request) {
       setTimeout(sendThreadRead, threadReadDelayMs);
       return;
     }
+    if (verifyReadDelayMs > 0 && nameSetSeen) {
+      setTimeout(sendThreadRead, verifyReadDelayMs);
+      return;
+    }
     sendThreadRead();
     return;
   }
@@ -580,6 +612,48 @@ function handle(request) {
     if (behavior === 'hang-name') return;
     currentThreadName = request.params.name;
     nameSetSeen = true;
+    if (nameSetDelayMs > 0) setTimeout(() => respond(request.id, {}), nameSetDelayMs);
+    else respond(request.id, {});
+    return;
+  }
+  if (request.method === 'turn/interrupt' && behavior.startsWith('operator-interrupt')) {
+    if (!activeTurn || request.params.threadId !== activeTurn.threadId || request.params.turnId !== activeTurn.turnId) {
+      reject(request.id, -32600, 'turn no longer active');
+      return;
+    }
+    if (behavior === 'operator-interrupt-timeout' && !ignoredOperatorInterrupt) {
+      ignoredOperatorInterrupt = true;
+      return;
+    }
+    if (behavior === 'operator-interrupt-reject') {
+      reject(request.id, -32000, 'interrupt unavailable');
+      return;
+    }
+    const { threadId, turnId } = activeTurn;
+    if (behavior === 'operator-interrupt-late') {
+      // Never answer the request, but abort the turn after the runner's 8s RPC
+      // timeout: the stop reached the server even though no response arrived.
+      setTimeout(() => {
+        if (activeTurn?.turnId !== turnId) return;
+        activeTurn = undefined;
+        notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } });
+      }, 10_000);
+      return;
+    }
+    if (behavior === 'operator-interrupt-steer') {
+      // Acknowledge first and report the interrupted terminal later, like an
+      // app-server that is still aborting tools. The turn stays steerable on
+      // this side, so input arriving in the window proves the runner's gate.
+      respond(request.id, {});
+      setTimeout(() => {
+        if (activeTurn?.turnId !== turnId) return;
+        activeTurn = undefined;
+        notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } });
+      }, 1500);
+      return;
+    }
+    activeTurn = undefined;
+    notify('turn/completed', { threadId, turn: { id: turnId, status: 'interrupted' } });
     respond(request.id, {});
     return;
   }
@@ -601,6 +675,14 @@ function handle(request) {
     return;
   }
   if (request.method === 'turn/steer') {
+    if (behavior === 'operator-interrupt-steer' || behavior === 'operator-interrupt-late') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      respond(request.id, { turnId: activeTurn.turnId });
+      return;
+    }
     if (behavior === 'async-user-input-live-steer') {
       if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
         reject(request.id, -32602, 'expected turn is not active'); return;
@@ -672,6 +754,43 @@ function handle(request) {
         completion,
         { id: request.id, error: { code: -32601, message: 'active turn not steerable' } },
       ]);
+      activeTurn = undefined;
+      return;
+    }
+    if (behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error') {
+      if (!activeTurn || request.params.expectedTurnId !== activeTurn.turnId) {
+        reject(request.id, -32602, 'expectedTurnId does not match active turn');
+        return;
+      }
+      steerCount += 1;
+      groupClientIds.push(request.params.clientUserMessageId ?? null);
+      respond(request.id, { turnId: activeTurn.turnId });
+      const { threadId, turnId } = activeTurn;
+      const failedGroupTurn = {
+        id: turnId,
+        status: 'failed',
+        itemsView: 'full',
+        // steer-failed-no-error: protocol variant with NO error key at all.
+        ...(behavior === 'steer-failed-no-error'
+          ? {}
+          : { error: { message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'ServerOverloaded' } }),
+        items: [
+          { id: 'user-root', type: 'userMessage', clientId: groupClientIds[0], content: [] },
+          { id: 'user-follow', type: 'userMessage', clientId: groupClientIds[1], content: [] },
+        ],
+      };
+      if (behavior === 'steer-capacity-history') {
+        // Non-canonical completion id; the authoritative failed full-group turn
+        // is reachable only via thread/turns/list, exercising the runner's
+        // reconcileSteeredGroupFromHistory group settle path.
+        reconciledTurn = failedGroupTurn;
+        notify('turn/completed', {
+          threadId,
+          turn: { id: 'turn-foreign-noncanonical', status: 'completed' },
+        });
+      } else {
+        notify('turn/completed', { threadId, turn: failedGroupTurn });
+      }
       activeTurn = undefined;
       return;
     }
@@ -864,6 +983,15 @@ function handle(request) {
   }
 
   turnAttempt += 1;
+  if (behavior.startsWith('operator-interrupt')) {
+    const { threadId } = request.params;
+    const turnId = `turn-fake-${turnAttempt}`;
+    activeTurn = { threadId, turnId };
+    respond(request.id, { turn: { id: turnId } });
+    notify('turn/started', { threadId, turn: { id: turnId } });
+    notify('item/agentMessage/delta', { threadId, turnId, itemId: 'partial-answer', delta: 'partial response' });
+    return;
+  }
   if (behavior === 'capability-error' && turnAttempt === 1) {
     reject(request.id, -32602, 'unknown field additionalContext; experimentalApi unsupported');
     return;
@@ -872,11 +1000,11 @@ function handle(request) {
     reject(request.id, -32000, 'model overloaded');
     return;
   }
-  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+  if (behavior.startsWith('effort-') || behavior === 'steer' || behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
     const threadId = request.params.threadId;
     const turnId = `turn-fake-${turnAttempt}`;
     activeTurn = { threadId, turnId, outputSchema: request.params.outputSchema };
-    if (behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
+    if (behavior === 'steer-capacity' || behavior === 'steer-capacity-history' || behavior === 'steer-failed-no-error' || behavior === 'steer-group-mismatch' || behavior === 'steer-noncanonical' || behavior === 'steer-group-history-match' || behavior === 'steer-group-history-multi') {
       groupClientIds = [request.params.clientUserMessageId ?? null];
     }
     respond(request.id, { turn: { id: turnId } });

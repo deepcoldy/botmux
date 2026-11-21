@@ -1010,6 +1010,27 @@ async function fetchAuthorizedUser(
  * Try to parse a callback URL and exchange the code for a token.
  * Returns a success message or null if the URL is not a valid callback.
  */
+/**
+ * Whether this process started the login a callback URL belongs to.
+ *
+ * The loopback callback listener (127.0.0.1:9768) answers for whatever BotMux
+ * happens to own that port on the BROWSER's machine — often not the daemon that
+ * issued the link (a bot deployed elsewhere, while the person also runs BotMux
+ * locally). Such a callback is not ours to consume: the code is still good on
+ * the issuing daemon, so the page must say where to send it instead of
+ * reporting an expired link.
+ */
+export function callbackOrigin(url: string): 'own' | 'expired' | 'unknown' {
+  const stateMatch = url.match(/[?&]state=([^&]+)/);
+  if (!stateMatch) return 'unknown';
+  let state: string;
+  try { state = decodeURIComponent(stateMatch[1]); } catch { return 'unknown'; }
+  if (pendingLogins.has(state) || loadPendingLogin(state)) return 'own';
+  // Started here but past its lifetime: the file lingers until cleanup.
+  const path = pendingPath(state);
+  return path && existsSync(path) ? 'expired' : 'unknown';
+}
+
 export async function handleCallbackUrl(url: string): Promise<string | null> {
   // Match callback URL pattern
   const match = url.match(/[?&]code=([^&]+)/);

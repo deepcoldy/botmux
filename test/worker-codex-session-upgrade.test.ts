@@ -7,6 +7,7 @@ import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CodexExecutable, CodexProcess } from '../src/services/codex-session-upgrade.js';
 import { classifyMergedRestart, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings } from '../src/core/restart-followup-policy.js';
+import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 
 const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 const parsed = ts.createSourceFile('worker.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -25,7 +26,7 @@ type Upgrade = (target: CodexExecutable, running: CodexProcess[]) => Promise<voi
 function evaluate<T>(name: string, state: Record<string, any>): T {
   // A separate lexical scope per harness keeps mutable worker globals isolated.
   // eslint-disable-next-line no-new-func
-  return new Function('state', `with (state) { ${extracted(name)}; return ${name}; }`)(state) as T;
+  return new Function('state', `with (state) { ${extracted('nativeSessionForkPending')} ${extracted(name)}; return ${name}; }`)(state) as T;
 }
 
 function deferred<T>() {
@@ -45,6 +46,7 @@ function harness() {
   const delivered: unknown[] = [];
   const state: Record<string, any> = {
     config: { autoUpgradeCodexSessions: true },
+    isCodexAppCliId,
     lastInitConfig: {
       cliId: 'codex', cliSessionId: threadId, sessionId: 'botmux-session',
       workingDir: '/project', prompt: 'previous already executed prompt',
@@ -70,6 +72,17 @@ function harness() {
     injectionFlushing: false,
     commandLineWritesPending: 0,
     initialInputOwnershipPending: false,
+    // The TraeX native startup first-input fence is traex-only and fresh-only;
+    // these Codex upgrade scenarios never arm it (see traex-startup-input).
+    traexNativeStartupInputPending: false,
+    traexFirstInputAdmissionPending: false,
+    traexNativeStartupInputIsPending: () => false,
+    // Captured unconditionally at every flush entry; unused while the fence
+    // above stays disarmed.
+    webTerminalInputGeneration: 0,
+    // No writable web terminal exists in these Codex upgrade scenarios, so the
+    // paste-uncertainty gate must never hold a flush.
+    webTerminalInputWireDirty: () => false,
     remoteRunnerRecoveredTurnInFlight: false,
     pendingMessages: [], pendingRawInputs: [], pendingInjections: [], pendingAdoptMessages: [],
     sessionRenameInFlight: () => false,
@@ -103,6 +116,7 @@ function harness() {
     clearTimeout,
     // Correlated restart attempt bookkeeping (#1863).
     activeRestartAttemptId: undefined,
+    pendingTopicEffortRestart: undefined,
     restartWindowLaunch: undefined,
     pendingLaunchConvergence: undefined,
     decideRestartReceipt,
@@ -156,6 +170,10 @@ function harness() {
     expect(state.cliRestartInProgress).toBe(false);
     expect(state.rawInputRestartGate).toBe(false);
   });
+  // Failed-turn rewind wiring flushPending calls into, real: none in flight here.
+  state.failedTurnRewindInFlight = null;
+  state.settleFailedTurnRewindOffQueue = evaluate<() => void>('settleFailedTurnRewindOffQueue', state);
+  state.putBackStoppedRewindCutBeforeWrites = evaluate<() => boolean>('putBackStoppedRewindCutBeforeWrites', state);
   const realFlush = evaluate<() => Promise<void>>('flushPending', state);
   state.flushPending = vi.fn(async () => {
     steps.push('flush requested');

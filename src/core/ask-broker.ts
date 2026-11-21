@@ -24,10 +24,13 @@ import type {
   AskCardDispatcher,
   AskClickOutcome,
   AskResult,
+  CliPermissionOutcome,
   CreateAskInput,
   PendingAsk,
 } from './ask-types.js';
 import { AskDispatchError } from './ask-types.js';
+import { supportsAskCustomInput, parseAskCustomFields } from './ask-custom-input.js';
+import { isHookPermissionAsk } from './ask-hook/types.js';
 
 /** Origins for which restart-resume + durable handoff are enabled. Only a
  *  caller that has a reconnecting claimant after a daemon restart may persist:
@@ -105,6 +108,11 @@ let dispatcher: AskCardDispatcher | null = null;
  *  a no-op (unit tests that don't exercise restart-resume需要绑定各自 temp
  *  store，绝不回落到全局目录). */
 let persistStore: AskPersistStore | null = null;
+let explicitAskSessionChecker: ((ask: PendingAsk) => boolean) | null = null;
+
+export function setExplicitAskSessionChecker(checker: (ask: PendingAsk) => boolean): void {
+  explicitAskSessionChecker = checker;
+}
 
 /** Effective handoff-retention window. Defaults to the durable-store constant;
  *  a test may shrink it via `_setHandoffRetentionForTest` so the absolute-expiry
@@ -156,6 +164,8 @@ export interface AskAnswerActor {
   botSender?: boolean;
   /** Bot-locked union (evaluateTalk teamBot leg / evaluateBotTalk). */
   senderUnionId?: string;
+  /** Feishu-stamped bot app_id, paired with senderUnionId for external roster entries. */
+  senderAppId?: string;
   /** Raw sender union (evaluateTalk teamMember leg — may be a human union). */
   memberUnionId?: string;
 }
@@ -187,10 +197,28 @@ function isAuthorizedToAnswer(ask: InternalPending, by: string, actor?: AskAnswe
   return canTalkChecker?.(ask.larkAppId, ask.chatId, by, ask.deliveryTarget ? 'p2p' : ask.chatType, actor) ?? false;
 }
 
+function invalidateClosedExplicitAsk(ask: InternalPending | undefined): void {
+  if (ask && !ask.settled && ask.originKind === 'host_explicit' && ask.timeoutMs === 0
+    && explicitAskSessionChecker && !explicitAskSessionChecker(snapshot(ask))) {
+    settle(ask.askId, { kind: 'invalidated', reason: 'explicit Ask session closed or binding changed',
+      selected: null, by: null, comment: null, timedOut: false });
+  }
+}
+
+function expireAskAtDeadline(ask: InternalPending | undefined): void {
+  if (ask && !ask.settled && ask.timeoutMs !== 0
+    && (!ask.timeoutStartsAfterDelivery || ask.timeoutStartedAt !== undefined)
+    && Date.now() >= ask.deadlineAt) {
+    settle(ask.askId, { kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
+  }
+}
+
 function gateAskDecision(
   ask: InternalPending | undefined,
   input: { nonce?: string; by: string; actor?: AskAnswerActor },
 ): Exclude<AskClickOutcome, 'accepted' | 'toggled' | 'needs_empty_confirm'> | 'ready' {
+  invalidateClosedExplicitAsk(ask);
+  expireAskAtDeadline(ask);
   const gate = gateHumanDecisionAttempt({
     exists: !!ask,
     nonceMatches: !!ask && (input.nonce === undefined || ask.nonce === input.nonce),
@@ -248,6 +276,9 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
   }
 
   const originKind = input.originKind ?? 'hook';
+  if (input.timeoutMs === 0 && !(hostManaged && originKind === 'host_explicit' && input.requestId?.trim())) {
+    throw new Error('ask-broker: no deadline requires a managed explicit Ask with a stable requestId');
+  }
   // CLI-origin resumability is gated by TWO independent facts (codex P1-4):
   //  1. the origin has a reconnecting claimant (only 'hook' re-POSTs after a
   //     restart; an explicit `botmux ask buttons` process exits), AND
@@ -315,7 +346,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
   const askId = randomUUID();
   const nonce = randomUUID().slice(0, 8);
   const createdAt = Date.now();
-  const deadlineAt = createdAt + input.timeoutMs;
+  const deadlineAt = input.timeoutMs === 0 ? 0 : createdAt + input.timeoutMs;
 
   return new Promise<AskResult>((resolve) => {
     const selections = new Map<number, Set<string>>();
@@ -331,9 +362,11 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       larkAppId: input.larkAppId,
       chatId: input.chatId,
       rootMessageId: input.rootMessageId,
+      cardRootMessageId: input.cardRootMessageId,
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
+      mentionedOpenId: input.mentionedOpenId,
       deliveryTarget: input.deliveryTarget ? { ...input.deliveryTarget } : undefined,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
@@ -407,6 +440,7 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.chatId === input.chatId &&
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
+    (ask.timeoutMs === 0) === (input.timeoutMs === 0) &&
     ask.answererOpenId === input.answererOpenId &&
     JSON.stringify(ask.deliveryTarget) === JSON.stringify(input.deliveryTarget) &&
     questionsShape(ask.questions) === questionsShape(input.questions)
@@ -414,9 +448,10 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
 }
 
 /** Stable shape string for question-set equality (prompt + multiSelect + each
- *  option's key AND label, order-sensitive). Two question sets that would render
- *  a DIFFERENT card to the user — including a relabelled option whose key is
- *  unchanged — must not re-attach/replay (codex P1-2). */
+ *  option's key, label AND description, order-sensitive). Two question sets that
+ *  would render a DIFFERENT card to the user — including a relabelled option or
+ *  one whose description changed while its key is unchanged — must not
+ *  re-attach/replay (codex P1-2). */
 function questionsShape(qs: PendingAsk['questions']): string {
   return JSON.stringify(
     qs.map((q) => ({
@@ -425,7 +460,8 @@ function questionsShape(qs: PendingAsk['questions']): string {
       d: q.defaultSelectedKeys,
       input: q.inputMode,
       field: q.input,
-      o: q.options.map((o) => [o.key, o.label]),
+      custom: q.allowCustom !== false,
+      o: q.options.map((o) => [o.key, o.label, o.description ?? null]),
     })),
   );
 }
@@ -461,13 +497,14 @@ function sendCardForAsk(ask: InternalPending): void {
         // The displayed deadline is a best estimate made immediately before
         // dispatch. Correctness does not depend on it: the broker clock below
         // starts only after the Lark API confirms delivery.
-        if (live.timeoutStartsAfterDelivery && live.timeoutStartedAt === undefined) {
+        if (live.timeoutMs !== 0 && live.timeoutStartsAfterDelivery && live.timeoutStartedAt === undefined) {
           live.deadlineAt = Date.now() + live.timeoutMs;
         }
         const { messageId } = await dispatcher!.send(snapshot(ask));
         const cur = pending.get(ask.askId);
         if (cur) {
           cur.cardMessageId = messageId;
+          cur.cardDeliveredAt ??= Date.now();
           // The caller can disconnect while send is in flight. The earlier
           // standalone-card notification had no messageId to patch; update it
           // now. Reply-card settlement does not need that id and is idempotent.
@@ -510,6 +547,7 @@ function sendCardForAsk(ask: InternalPending): void {
 
 function armAskTimeout(ask: InternalPending, timeoutMs: number, startedAt: number): void {
   clearTimeout(ask.timeoutHandle);
+  if (ask.timeoutMs === 0) return;
   ask.timeoutStartedAt = startedAt;
   ask.deadlineAt = startedAt + timeoutMs;
   ask.timeoutHandle = setTimeout(() => {
@@ -561,11 +599,11 @@ function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<
     attachWaiter(ask, resolve, signal);
     clearTimeout(ask.timeoutHandle);
     const awaitsDelivery = ask.timeoutStartsAfterDelivery && !ask.cardMessageId;
-    const remaining = awaitsDelivery ? ask.timeoutMs : Math.max(0, ask.deadlineAt - Date.now());
+    const remaining = ask.timeoutMs === 0 ? 0 : awaitsDelivery ? ask.timeoutMs : Math.max(0, ask.deadlineAt - Date.now());
     if (!awaitsDelivery) armAskTimeout(ask, remaining, Date.now());
     logger.info?.(
       `ask-broker: re-attached hook to restored ask ${ask.askId} (key=${ask.askKey}, ` +
-      `${Math.round(remaining / 1000)}s left, card=${ask.cardMessageId ? 'live' : 'MISSING→resend'})`,
+      `${ask.timeoutMs === 0 ? 'no deadline' : `${Math.round(remaining / 1000)}s left`}, card=${ask.cardMessageId ? 'live' : 'MISSING→resend'})`,
     );
     if (!ask.cardMessageId) sendCardForAsk(ask);
   });
@@ -573,7 +611,7 @@ function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<
 
 /** Build the persisted projection from a live internal ask and write it. Only
  *  called for resumable asks. */
-function persistFromInternal(ask: InternalPending): void {
+function persistFromInternal(ask: InternalPending, strict = false): void {
   if (!persistStore || !ask.resumable) return;
   // A settled ask with a stashed answer is a durable handoff that must be KEPT
   // until claimed; a settled ask without one has nothing left to resume.
@@ -591,19 +629,23 @@ function persistFromInternal(ask: InternalPending): void {
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
+    mentionedOpenId: ask.mentionedOpenId,
     deliveryTarget: ask.deliveryTarget,
     questions: ask.questions,
+    customAnswers: ask.customAnswers,
+    customRevision: ask.customRevision,
     createdAt: ask.createdAt,
     deadlineAt: ask.deadlineAt,
     timeoutMs: ask.timeoutMs,
     timeoutStartsAfterDelivery: ask.timeoutStartsAfterDelivery,
     timeoutStartedAt: ask.timeoutStartedAt,
     cardMessageId: ask.cardMessageId,
+    cardDeliveredAt: ask.cardDeliveredAt,
     replyCardTarget: ask.replyCardTarget,
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     ...(ask.answeredResult ? { answeredResult: ask.answeredResult, answeredAt: ask.settledAt ?? Date.now() } : {}),
   };
-  persistStore.put(persisted);
+  persistStore.put(persisted, { strict });
 }
 
 /**
@@ -628,7 +670,7 @@ export function toggleAsk(args: {
   const ask = pending.get(args.askId);
   const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
   if (gate !== 'ready') return gate;
-  if (!ask || hasAskForm(ask.questions)) return 'stale';
+  if (!ask || hasAskForm(ask.questions) || ask.customRevision !== undefined) return 'stale';
 
   const question = ask.questions[args.questionIndex];
   if (!question) return 'stale';
@@ -678,7 +720,7 @@ export function submitAsk(args: {
   const ask = pending.get(args.askId);
   const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
   if (gate !== 'ready') return gate;
-  if (!ask || hasAskForm(ask.questions)) return 'stale';
+  if (!ask || hasAskForm(ask.questions) || ask.customRevision !== undefined) return 'stale';
 
   // 构建最终答案数组（严格按 ask.questions 规范化，长度恒 = questions.length）
   let answers: ReadonlyArray<ReadonlyArray<string>>;
@@ -745,6 +787,70 @@ export function submitAskForm(args: { askId: string; nonce: string; by: string; 
   if (!values) return 'invalid_form';
   settle(args.askId, { kind: 'answered', ...values, by: args.by, comment: null, timedOut: false });
   return 'accepted';
+}
+
+/** Validate and persist per-question custom drafts before settling. */
+export function applyAskForm(args: {
+  askId: string; nonce: string; by: string; revision: number;
+  fields: Record<string, unknown>;
+  canRenderDraft?: (draft: PendingAsk) => boolean;
+  toggle?: { questionIndex: number; key: string; custom?: boolean };
+  confirmEmpty?: boolean;
+}): AskClickOutcome {
+  gcSettled();
+  const ask = pending.get(args.askId);
+  const gate = gateAskDecision(ask, { nonce: args.nonce, by: args.by });
+  if (gate !== 'ready') return gate;
+  if (!ask || !supportsAskCustomInput(ask)) return 'stale';
+  if (!Number.isSafeInteger(args.revision) || args.revision !== (ask.customRevision ?? 0)) return 'draft_conflict';
+  const custom = parseAskCustomFields(args.fields, ask.questions, ask.customAnswers);
+  if (!custom) return 'invalid_custom';
+  const selections = ask.questions.map((_, i) => [...(ask.selections.get(i) ?? [])]);
+  if (args.toggle) {
+    const { questionIndex: i, key } = args.toggle;
+    const q = ask.questions[i];
+    if (!Number.isInteger(i) || !q) return 'stale';
+    if (args.toggle.custom) {
+      if (q.allowCustom === false || q.inputMode === 'text') return 'stale';
+      selections[i] = [];
+      custom[i] = custom[i] ?? '';
+    } else {
+      if (!q.options.some(o => o.key === key)) return 'stale';
+      const selected = new Set(selections[i]);
+      if (!q.multiSelect) selected.clear();
+      if (q.multiSelect && selected.has(key)) selected.delete(key); else selected.add(key);
+      selections[i] = [...selected];
+      custom[i] = null; // explicitly picking an option switches this question back
+    }
+  }
+  const answers = selections.map((keys, i) => custom[i] ? [] : keys);
+  const candidate = { ...snapshot(ask), selections, customAnswers: custom, customRevision: (ask.customRevision ?? 0) + 1 };
+  if (args.canRenderDraft && !args.canRenderDraft(candidate)) return 'invalid_custom';
+  const saveDraft = () => {
+    const nextSelections = new Map(selections.map((keys, i) => [i, new Set(keys)]));
+    const revision = (ask.customRevision ?? 0) + 1;
+    persistFromInternal({ ...ask, selections: nextSelections, customAnswers: custom, customRevision: revision }, true);
+    ask.selections = nextSelections;
+    ask.customAnswers = custom;
+    ask.customRevision = revision;
+  };
+  if (!args.toggle) {
+    if (custom.some(text => text === '')) return 'invalid_custom';
+    if (ask.questions.some((q, i) => !q.multiSelect && !custom[i] && answers[i].length !== 1)) return 'invalid_custom';
+    if (!args.confirmEmpty && answers.every(keys => !keys.length) && custom.every(text => !text)) {
+      saveDraft();
+      return 'needs_empty_confirm';
+    }
+    settle(args.askId, {
+      kind: 'answered', answers,
+      ...(custom.some(Boolean) ? { customAnswers: custom } : {}),
+      by: args.by, comment: null, timedOut: false,
+    });
+    return 'accepted';
+  }
+  // One durable projection holds both the option state and text drafts.
+  saveDraft();
+  return 'toggled';
 }
 
 /**
@@ -959,10 +1065,11 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     // time out). A still-awaiting-click restore arms the ORIGINAL absolute
     // deadline so it can't linger forever if the CLI never returns.
     const awaitsDelivery = p.timeoutStartsAfterDelivery === true && !p.cardMessageId;
-    const remaining = awaitsDelivery
+    const noDeadline = p.timeoutMs === 0;
+    const remaining = noDeadline ? 0 : awaitsDelivery
       ? (p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt))
       : Math.max(0, p.deadlineAt - now);
-    const timeoutHandle = hasStashedAnswer || awaitsDelivery
+    const timeoutHandle = hasStashedAnswer || awaitsDelivery || noDeadline
       ? undefined
       : setTimeout(() => {
           settle(p.askId, {
@@ -984,14 +1091,18 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
+      mentionedOpenId: p.mentionedOpenId,
       deliveryTarget: p.deliveryTarget,
       questions: p.questions,
+      customAnswers: p.customAnswers,
+      customRevision: p.customRevision,
       createdAt: p.createdAt,
       deadlineAt: p.deadlineAt,
       timeoutMs: p.timeoutMs ?? Math.max(1, p.deadlineAt - p.createdAt),
       timeoutStartsAfterDelivery: p.timeoutStartsAfterDelivery === true,
       timeoutStartedAt: p.timeoutStartedAt,
       cardMessageId: p.cardMessageId,
+      cardDeliveredAt: p.cardDeliveredAt,
       replyCardTarget: p.replyCardTarget,
       // A stashed-answer restore is terminal-but-unclaimed: settled=true so
       // gcSettled/other paths treat it as done, dormant=true so a hook re-POST
@@ -1003,12 +1114,9 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       // Carry a stashed answer forward (user answered before restart): the
       // reconnecting hook claims it via reattachByRequest.
       ...(p.answeredResult ? { answeredResult: p.answeredResult, terminalResult: p.answeredResult } : {}),
-      // timeoutHandle is only meaningful for the awaiting-click case; a stashed
-      // restore uses a no-op cleared handle so clearTimeout calls stay safe.
-      timeoutHandle: timeoutHandle ?? setTimeout(() => {}, 0),
+      timeoutHandle,
       selections,
     };
-    if (timeoutHandle === undefined) { clearTimeout(ask.timeoutHandle); }
     pending.set(p.askId, ask);
     // Re-arm the absolute handoff-expiry reaper for a restored stash (codex
     // P1-4): a SECOND restart before the hook claims must still reap memory +
@@ -1018,7 +1126,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
     restored++;
     logger.info?.(
       `ask-broker: restored pending ask ${p.askId} (key=${p.askKey}, session=${p.sessionId}, ` +
-      `dormant${p.answeredResult ? '+answered' : ''}, ${Math.round((p.deadlineAt - now) / 1000)}s left) — awaiting hook re-attach`,
+      `dormant${p.answeredResult ? '+answered' : ''}, ${noDeadline ? 'no deadline' : `${Math.round((p.deadlineAt - now) / 1000)}s left`}) — awaiting claimant re-attach`,
     );
   }
   // Always log the boot sweep outcome (even 0) so a live restart test can
@@ -1104,6 +1212,45 @@ function abandonUnclaimedHookAsk(askId: string): void {
   }, result);
 }
 
+/**
+ * The asking CLI ended a hook permission confirmation itself (its built-in
+ * timeout, a terminal choice, an interrupt), so nothing is waiting on this card
+ * any more: settle it with that outcome now instead of at its own deadline.
+ * Only a hook permission ask of this exact session/request matches. An answer
+ * stashed while dormant was never delivered, so it yields to the CLI outcome.
+ */
+export function resolveHookAskFromCli(args: {
+  larkAppId: string;
+  sessionId: string;
+  requestId: string;
+  outcome: CliPermissionOutcome;
+}): 'settled' | 'already_settled' | 'not_found' {
+  const ask = findByKey(askKeyFor(args.larkAppId, args.sessionId, 'hook', args.requestId));
+  if (!ask || !isHookPermissionAsk(ask)) return 'not_found';
+  const result: AskResult = {
+    kind: 'invalidated',
+    reason: `the asking CLI ended this permission confirmation itself (${args.outcome})`,
+    failureCode: 'cli_resolved',
+    cliOutcome: args.outcome,
+    selected: null, by: null, comment: null, timedOut: false,
+  };
+  if (ask.settled) {
+    if (!ask.dormant || ask.answeredResult === undefined || ask.waiters.length > 0) return 'already_settled';
+    clearTimeout(ask.timeoutHandle);
+    clearTimeout(ask.handoffExpiryHandle);
+    clearTimeout(ask.reclaimHandle);
+    pending.delete(ask.askId);
+    persistStore?.remove(ask.askKey);
+    notifyOnSettle({
+      ...ask, settledAt: Date.now(), dormant: false, answeredResult: undefined, terminalResult: result,
+    }, result);
+    return 'settled';
+  }
+  logger.info?.(`ask-broker: ${ask.askId} ended by the asking CLI (${args.outcome}) (key=${ask.askKey})`);
+  settle(ask.askId, result);
+  return 'settled';
+}
+
 /** Internal — settle an ask exactly once and notify the dispatcher's onSettle
  *  hook (best-effort, never blocks broker state transitions). The settled
  *  entry stays in the map for `SETTLED_RETENTION_MS` so late race-losers get
@@ -1186,6 +1333,32 @@ export function hasExplicitAskHandoff(input: CreateAskInput): boolean {
   return !!findByKey(key) || !!persistStore?.list().some(ask => ask.askKey === key);
 }
 
+export function invalidateExplicitAsk(input: CreateAskInput, reason: string): void {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  const ask = findByKey(key);
+  if (ask?.originKind === 'host_explicit' && sameIdentity(ask, input)) {
+    settle(ask.askId, { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false });
+  }
+}
+
+export function explicitAskSnapshot(input: CreateAskInput): PendingAsk | undefined {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  const ask = findByKey(key);
+  return ask?.originKind === 'host_explicit' && sameIdentity(ask, input) ? snapshot(ask) : undefined;
+}
+
+export function retireExplicitAsk(input: CreateAskInput, reason: string): AskResult | undefined {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  const ask = findByKey(key);
+  if (!ask || ask.originKind !== 'host_explicit' || ask.timeoutMs !== 0 || !sameIdentity(ask, input)) return undefined;
+  if (ask.terminalResult) return ask.terminalResult;
+  if (!persistStore) throw new Error('explicit Ask retirement requires durable storage');
+  const result: AskResult = { kind: 'invalidated', reason, selected: null, by: null, comment: null, timedOut: false };
+  persistFromInternal({ ...ask, answeredResult: result, settledAt: Date.now() }, true);
+  settle(ask.askId, result);
+  return ask.terminalResult;
+}
+
 export function releaseExplicitAskHandoff(input: CreateAskInput): void {
   const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
   const ask = findByKey(key);
@@ -1226,6 +1399,7 @@ function snapshot(ask: InternalPending): PendingAsk {
   } = ask;
   return {
     ...rest,
+    ...(ask.customAnswers ? { customAnswers: [...ask.customAnswers] } : {}),
     ...(ask.deliveryTarget ? { deliveryTarget: { ...ask.deliveryTarget } } : {}),
     ...(ask.terminalResult ? { result: ask.terminalResult } : {}),
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
@@ -1325,10 +1499,16 @@ export function submitAskFromDesktop(args: {
 }): AskClickOutcome {
   gcSettled();
   const ask = pending.get(args.askId);
+  invalidateClosedExplicitAsk(ask);
+  expireAskAtDeadline(ask);
   if (!ask) return 'stale';
   if (ask.settled) return 'already_settled';
 
   if (hasAskForm(ask.questions)) return 'invalid_form';
+  // A per-question custom form may hold answerer text drafts this selections-only
+  // API cannot express. Once such a draft exists, desktop must not settle the ask
+  // with options and silently drop the typed answers.
+  if (ask.customRevision !== undefined) return 'stale';
 
   // 同 submitAsk：按 ask.questions 规范化，拒绝超长输入、缺失尾部补空集，越界槽不进结果。
   if (args.selections.length > ask.questions.length) return 'stale';
@@ -1377,6 +1557,7 @@ export function _resetForTest(): void {
   pending.clear();
   dispatcher = null;
   canTalkChecker = null;
+  explicitAskSessionChecker = null;
   handoffRetentionMs = HANDOFF_RETENTION_MS; // restore default retention
   hookReclaimGraceMs = HOOK_RECLAIM_GRACE_MS;
   reclaimClockStarted = false;

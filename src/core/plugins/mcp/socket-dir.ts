@@ -4,7 +4,7 @@
  * these directories without loading the MCP SDK.
  */
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, readdirSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from 'node:fs';
 import { createConnection } from 'node:net';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -50,6 +50,30 @@ export function sessionMcpGatewaySocketDir(sessionId: string, dataDir: string): 
 /** Deterministic per-session Gateway socket path (see sessionMcpGatewaySocketDir). */
 export function sessionMcpGatewaySocketPath(sessionId: string, dataDir: string): string {
   return join(sessionMcpGatewaySocketDir(sessionId, dataDir), 'g.sock');
+}
+
+/** Deterministic protected HTTP egress socket beside the session MCP socket. */
+export function sessionProtectedHttpEgressSocketPath(sessionId: string, dataDir: string): string {
+  return join(sessionMcpGatewaySocketDir(sessionId, dataDir), 'e.sock');
+}
+
+/** Create-or-verify the deterministic session socket directory. */
+export function ensurePrivateGatewayDir(dir: string): void {
+  try {
+    mkdirSync(dir, { mode: 0o700 });
+    return;
+  } catch (err: any) {
+    if (err?.code !== 'EEXIST') throw err;
+  }
+  const stat = lstatSync(dir);
+  if (!stat.isDirectory()) {
+    throw new Error(`Gateway socket dir ${dir} exists and is not a directory (planted symlink/file?)`);
+  }
+  const uid = process.getuid?.();
+  if (uid !== undefined && stat.uid !== uid) {
+    throw new Error(`Gateway socket dir ${dir} is owned by uid ${stat.uid} (expected ${uid})`);
+  }
+  if ((stat.mode & 0o077) !== 0) chmodSync(dir, 0o700);
 }
 
 function gatewayDirName(sessionId: string, dataDir: string, uid: number): string {

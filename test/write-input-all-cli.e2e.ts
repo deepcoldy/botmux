@@ -20,7 +20,6 @@ import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
@@ -123,7 +122,6 @@ const ADAPTERS = [
   { name: 'aiden', create: () => safeCreate(() => createAidenAdapter()) },
   { name: 'coco', create: () => safeCreate(() => createCocoAdapter()) },
   { name: 'codex', create: () => safeCreate(() => createCodexAdapter()) },
-  { name: 'gemini', create: () => safeCreate(() => createGeminiAdapter()) },
   { name: 'opencode', create: () => safeCreate(() => createOpenCodeAdapter()) },
   { name: 'mtr', create: () => safeCreate(() => createMtrAdapter()) },
   { name: 'hermes', create: () => safeCreate(() => createHermesAdapter()) },

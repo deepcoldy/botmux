@@ -310,6 +310,77 @@ describe('dispatch boundary: attachments and transports', () => {
     expect(a.seq).toBeGreaterThan(0);
   });
 
+  it('removes a dropped background video hint from every transport while keeping the current attachment', async () => {
+    const a = say('om_a', 'a video was shared '.repeat(60), T0 + 1_000, [{ type: 'video', key: 'vid_a' }]);
+    const frozenA = await prepare('om_turn_1', T0 + 5_000);
+    const epoch2 = groupContextEpoch(SESSION, NATIVE, 'codex', 'om_turn_2');
+    const base = (await prepare('om_turn_x', T0 + 6_000)).prepared;
+    const video = { type: 'video' as const, path: '/tmp/old-context.mp4', name: 'old-context.mp4', resourceKey: 'vid_a' };
+    const frozen = writePreparedGroupContext({ ...base, turnId: 'om_turn_2', epoch: epoch2, attachments: [video] }, dataDir);
+    expect(frozen.body.length).toBeGreaterThan(900); // forces Codex context chunking
+    const current = { type: 'image' as const, path: '/tmp/current-user.png', name: 'current-user.png', resourceKey: 'img_now' };
+    const payload = {
+      content: buildBridgeInputContent('inspect current task', { sharedGroupContext: frozen.body, attachments: [current, video] }),
+      codexAppInput: { additionalContext: {} as Record<string, { kind: 'untrusted' | 'application'; value: string }>, localImages: [{ path: current.path }, { path: video.path }] },
+    };
+    addCodexAppContext(payload.codexAppInput.additionalContext, 'botmux_group_history', frozen.body, 'untrusted');
+    addCodexAppContext(payload.codexAppInput.additionalContext, 'botmux_attachments', formatAttachmentsHint([current, video]), 'untrusted');
+    expect(Object.keys(payload.codexAppInput.additionalContext).filter(key => key.startsWith('botmux_group_history_')).length).toBeGreaterThan(1);
+    consume('om_turn_1', frozenA.epoch);
+    const committed = commitGroupContextDispatchIntoPayload(payload, identity('om_turn_2', epoch2), dataDir)!;
+    expect(committed.dispatched.includedSeqs).toEqual([]);
+    // Prose: no background video item or orphan video hint; the user's own attachment kept.
+    expect(payload.content).not.toContain(video.path);
+    expect(payload.content).not.toContain('<video');
+    expect(payload.content).toContain(current.path);
+    // Codex App sidecar: attachment hint rewritten, local images filtered.
+    const hint = Object.keys(payload.codexAppInput.additionalContext).filter(key => key.startsWith('botmux_attachments')).sort().map(key => payload.codexAppInput.additionalContext[key].value).join('');
+    expect(hint).toContain(current.path);
+    expect(hint).not.toContain(video.path);
+    expect(hint).not.toContain('<video');
+    expect(payload.codexAppInput.localImages).toEqual([{ path: current.path }]);
+    expect(a.seq).toBeGreaterThan(0);
+  });
+
+  it('removes the covered video item and its video hint while a remaining background image stays listed', async () => {
+    const v = say('om_v', 'the video message', T0 + 1_000, [{ type: 'video', key: 'vid_v' }]);
+    const frozenV = await prepare('om_turn_1', T0 + 5_000);
+    say('om_i', 'the image message', T0 + 2_000, [{ type: 'image', key: 'img_i' }]);
+    const epoch2 = groupContextEpoch(SESSION, NATIVE, 'codex', 'om_turn_2');
+    const base = (await prepare('om_turn_x', T0 + 6_000)).prepared;
+    const video = { type: 'video' as const, path: '/tmp/bg-video.mp4', name: 'bg-video.mp4', resourceKey: 'vid_v' };
+    const image = { type: 'image' as const, path: '/tmp/bg-image.png', name: 'bg-image.png', resourceKey: 'img_i' };
+    const frozen = writePreparedGroupContext({ ...base, turnId: 'om_turn_2', epoch: epoch2, attachments: [video, image] }, dataDir);
+    const payload = { content: `${frozen.body}\n\n<user_message>q</user_message>\n\n${formatAttachmentsHint([video, image])}` };
+    // Only the video source is covered by the previous dispatch; the image source stays.
+    consume('om_turn_1', frozenV.epoch);
+    const committed = commitGroupContextDispatchIntoPayload(payload, identity('om_turn_2', epoch2), dataDir)!;
+    expect(committed.dispatched.includedSeqs).toEqual(base.includedSeqs.filter(seq => seq !== v.seq));
+    expect(payload.content).toContain(image.path);
+    expect(payload.content).toContain('<image');
+    expect(payload.content).not.toContain(video.path);
+    expect(payload.content).not.toContain('<video');
+  });
+
+  it('keeps the video hint when a remaining background video item survives the subtraction', async () => {
+    say('om_old', 'the covered video message', T0 + 1_000, [{ type: 'video', key: 'vid_old' }]);
+    const frozenOld = await prepare('om_turn_1', T0 + 5_000);
+    say('om_new', 'the newer video message', T0 + 2_000, [{ type: 'video', key: 'vid_new' }]);
+    const epoch2 = groupContextEpoch(SESSION, NATIVE, 'codex', 'om_turn_2');
+    const base = (await prepare('om_turn_x', T0 + 6_000)).prepared;
+    const oldVideo = { type: 'video' as const, path: '/tmp/covered.mp4', name: 'covered.mp4', resourceKey: 'vid_old' };
+    const newVideo = { type: 'video' as const, path: '/tmp/kept.mp4', name: 'kept.mp4', resourceKey: 'vid_new' };
+    const frozen = writePreparedGroupContext({ ...base, turnId: 'om_turn_2', epoch: epoch2, attachments: [oldVideo, newVideo] }, dataDir);
+    const payload = { content: `${frozen.body}\n\n<user_message>q</user_message>\n\n${formatAttachmentsHint([oldVideo, newVideo])}` };
+    consume('om_turn_1', frozenOld.epoch);
+    const committed = commitGroupContextDispatchIntoPayload(payload, identity('om_turn_2', epoch2), dataDir)!;
+    expect(committed.dispatched.includedSeqs).toEqual(base.includedSeqs.filter(seq => seq !== frozenOld.prepared.includedSeqs[0]));
+    // Only the covered item goes; the surviving video keeps its item AND its hint.
+    expect(payload.content).not.toContain(oldVideo.path);
+    expect(payload.content).toContain(newVideo.path);
+    expect(payload.content).toContain('<video_hint>');
+  });
+
   it('keeps the Claude hook sidecar claimable by the final PTY text after the background is subtracted', async () => {
     const a = say('om_a', 'already read background', T0 + 1_000);
     const first = await prepare('om_turn_1', T0 + 5_000);
@@ -329,5 +400,32 @@ describe('dispatch boundary: attachments and transports', () => {
     expect(claimPromptContext(SESSION, 'om_turn_2', fingerprintPromptText(assembled), prefixOf(assembled))).toBeUndefined();
     expect(claimPromptContext(SESSION, 'om_turn_2', fingerprintPromptText(payload.content), prefixOf(payload.content))).toBe(envelope);
     expect(claimPromptContext(SESSION, 'om_turn_2', fingerprintPromptText(payload.content), prefixOf(payload.content))).toBeUndefined();
+  });
+});
+
+describe('context rewind keeps covered background out', () => {
+  // /rewind truncates the Claude transcript and cold-resumes under the SAME
+  // native session id; it touches no group-context state. The dropped turn's
+  // background therefore stays covered for that epoch and is not re-injected.
+  // A fresh native id (what --fork-session would mint) is a new epoch and gets
+  // the whole background again — the reason /rewind must not fork.
+  it('same native id: the poisoned source stays covered; new native id: it comes back', async () => {
+    const poison = say('om_poison', 'poisoned instructions', T0 + 1_000);
+    const first = await prepare('om_turn_1', T0 + 5_000, 'poisoned');
+    expect(first.prepared.includedSeqs).toEqual([poison.seq]);
+    consume('om_turn_1', first.epoch);
+
+    const fresh = say('om_fresh', 'later normal message', T0 + 7_000);
+    const second = await prepare('om_turn_2', T0 + 8_000, 'poisoned');
+    // Preparation in the same epoch already leaves the covered source out.
+    expect(second.prepared.includedSeqs).toEqual([fresh.seq]);
+    const sameNative = commitGroupContextDispatchIntoPayload(
+      payloadWith(second.prepared.body), identity('om_turn_2', second.epoch), dataDir)!.dispatched;
+    expect(sameNative.includedSeqs).toEqual([fresh.seq]);
+    expect(sameNative.body).not.toContain('poisoned instructions');
+
+    const forkEpoch = groupContextEpoch(SESSION, 'native_forked', 'codex', 'om_turn_3');
+    const forked = await prepareGroupContextForTurn({ appId: APP, chatId: CHAT, turnId: 'om_turn_3', query: 'poisoned', createTime: T0 + 9_000, scope: 'main', sessionId: SESSION, epoch: forkEpoch });
+    expect(forked!.includedSeqs).toContain(poison.seq);
   });
 });

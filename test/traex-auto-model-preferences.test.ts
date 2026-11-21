@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   strongestTraexModelSettings, readAutoModelDraft, writeAutoModelDraft, clearAutoModelDraft,
-  autoModelDraftFromConfig,
+  autoModelDraftFromConfig, strongestTraexPreflightModelSettings,
   type AutoModelDraftStorage,
 } from '../src/dashboard/web/traex-auto-model-preferences.js';
 
@@ -20,6 +20,17 @@ describe('Auto model defaults and reload persistence', () => {
       .toEqual({ reasoningEffort: 'xhigh', modelBackendVariant: 'max' });
     expect(strongestTraexModelSettings('unknown', { slug: 'unknown', serviceTiers: [], contextVariants: [] }).modelBackendVariant)
       .toBeUndefined();
+    expect(strongestTraexPreflightModelSettings('GPT-5.6-Sol', catalog))
+      .toEqual({ reasoningEffort: 'xhigh', modelBackendVariant: 'max' });
+    expect(strongestTraexPreflightModelSettings('max-model', {
+      slug: 'max-model', serviceTiers: [], reasoningEfforts: ['xhigh', 'max'], contextVariants: [],
+    })).toEqual({ reasoningEffort: 'max' });
+    expect(strongestTraexPreflightModelSettings('high-model', {
+      slug: 'high-model', serviceTiers: [], reasoningEfforts: ['low', 'medium', 'high'], contextVariants: [],
+    })).toEqual({ reasoningEffort: 'high' });
+    expect(strongestTraexPreflightModelSettings('unknown', {
+      slug: 'unknown', serviceTiers: [], contextVariants: [],
+    })).toEqual({ reasoningEffort: 'high' });
   });
 
   it('stores unfinished selections synchronously and isolates bots; clearing one after save preserves another', () => {
@@ -29,7 +40,10 @@ describe('Auto model defaults and reload persistence', () => {
       setItem: (key, value) => { entries.set(key, value); },
       removeItem: key => { entries.delete(key); },
     };
-    const draft = { enabled: true, reselectPerTurn: true, models: ['GPT-5.6-Sol', ''], modelSettings: {
+    const draft = { enabled: true, preflightLoadCheck: true, overloadThresholdPercent: '110',
+      preflightTimeoutSeconds: '1.5', unknownLoadPolicy: 'skip' as const,
+      allOverloadedPolicy: 'lowest_load' as const, reselectPerTurn: true,
+      models: ['GPT-5.6-Sol', ''], modelSettings: {
       'GPT-5.6-Sol': { reasoningEffort: 'xhigh' as const, modelBackendVariant: 'standard' as const },
     }, timeoutSeconds: '30', cooldownSeconds: '60' };
     const { enabled: _enabled, ...preferences } = draft;
@@ -42,6 +56,7 @@ describe('Auto model defaults and reload persistence', () => {
     expect(readAutoModelDraft('bot1', storage)).toBeUndefined();
     expect(readAutoModelDraft('bot2', storage)).toEqual(preferences);
     expect(autoModelDraftFromConfig().reselectPerTurn).toBe(false);
+    expect(autoModelDraftFromConfig().preflightLoadCheck).toBe(false);
   });
 
   it('ignores the switch carried by old drafts and restores only saved activation', () => {

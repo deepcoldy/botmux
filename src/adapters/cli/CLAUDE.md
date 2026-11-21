@@ -7,9 +7,10 @@
 1. 本目录下创建新文件，实现 `CliAdapter` 接口
 2. `types.ts` 的 `CliId` 联合类型中添加新 ID
 3. `registry.ts` 添加 import、switch case、export
-4. `display-names.ts` 的 `CLI_DISPLAY_NAMES` 添加显示名（飞书卡片、worker 提示、setup / dashboard 下拉共用这一份；键类型是完整的 `CliId`，漏加会编译失败）
-5. `src/setup/bot-config-editor.ts` 的 `CLI_ID_CHOICES`（序号映射，**新 CLI 一律追加到尾部**——历史序号是脚本化 setup 的稳定接口，插位会让老脚本静默选错）。setup 级联菜单、dashboard 下拉与 sessions 页 CLI 过滤器均从 `CLI_OPTIONS` 派生，自动跟随，无需另改
-6. `README.md`、`README.en.md` 更新 CLI 列表
+4. `registry.ts` 的 `CLI_SHORT_ALIASES` 写上 `/cli` 认的简写（没有就写空数组；`RAW_CLI_EXECUTABLES` 里的程序名自动算别名，不用重复）。简写或程序名和别的 CLI 的简写、程序名重名会变成歧义，两边都不再直接选中（新 CLI 的程序名撞上已有简写，老用户在用的那个简写也随之失效）；和某个 cliId 重名则被完整 ID 盖住、永远选不中。加之前先用 `resolveCliName` 看一眼
+5. `display-names.ts` 的 `CLI_DISPLAY_NAMES` 添加显示名（飞书卡片、worker 提示、setup / dashboard 下拉共用这一份；键类型是完整的 `CliId`，漏加会编译失败）
+6. `src/setup/bot-config-editor.ts` 的 `CLI_ID_CHOICES`（序号映射，**新 CLI 一律追加到尾部**——历史序号是脚本化 setup 的稳定接口，插位会让老脚本静默选错）。setup 级联菜单、dashboard 下拉与 sessions 页 CLI 过滤器均从 `CLI_OPTIONS` 派生，自动跟随，无需另改
+7. `README.md`、`README.en.md` 更新 CLI 列表
 
 ## 文件沙盒（`sandbox: true`）适配三项必查
 

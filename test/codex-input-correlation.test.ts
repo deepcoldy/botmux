@@ -30,7 +30,8 @@ function pane(onEnter: (text: string) => void) {
   let text = '';
   return {
     cliPid: 1234,
-    write(data: string) { text = data.replace(/^\x1b\[200~/, '').replace(/\x1b\[201~$/, ''); },
+    write(data: string) { if (data === '\r') onEnter(text); else text = data.replace(/^\x1b\[200~/, '').replace(/\x1b\[201~$/, ''); },
+    submitBracketedPaste(data: string) { text = data; onEnter(text); },
     pasteText(data: string) { text = data; },
     sendSpecialKeys() { onEnter(text); },
     text: () => text,
@@ -62,7 +63,7 @@ describe('owned Codex input when rollout fds are unavailable', () => {
       history(FOREIGN_SID, INPUT); // Concurrent same-text submit must not win.
       history(SID, text);
     });
-    if (mode === 'raw') delete (target as Partial<PtyHandle>).pasteText;
+    if (mode === 'raw') delete (target as Partial<PtyHandle>).submitBracketedPaste;
     const handle = mode === 'strict' ? strictInputHandle(target) : target;
     const result = await createCodexAdapter().writeInput(handle, INPUT, { correlateTranscript: true });
     expect(result).toMatchObject({ submitted: true, cliSessionId: SID, ownershipProven: true });

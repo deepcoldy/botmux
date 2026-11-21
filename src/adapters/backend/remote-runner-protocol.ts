@@ -129,6 +129,20 @@ export interface RemoteRunnerTrustedCaller {
   };
 }
 
+export function projectRemoteRunnerTrustedCaller(
+  caller: RemoteRunnerTrustedCaller & Record<string, unknown>,
+): RemoteRunnerTrustedCaller {
+  return {
+    ...(caller.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
+    ...(caller.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
+    ...(caller.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
+    ...(caller.source ? { source: caller.source } : {}),
+    ...(caller.taskId ? { taskId: caller.taskId } : {}),
+    ...(caller.senderType ? { senderType: caller.senderType } : {}),
+    ...(caller.botOwner ? { botOwner: { ...caller.botOwner } } : {}),
+  };
+}
+
 export interface RemoteRunnerRecoveredTurn {
   turnId: string;
   generation: number;
@@ -207,6 +221,7 @@ export type RemoteRunnerSessionToolRequest =
   | {
       tool: 'schedule.update';
       taskId: string;
+      schedule?: string;
       prompt?: string;
       calendar?: string | null;
       calendarDayType?: 'workday' | 'restday';
@@ -891,9 +906,10 @@ export function normalizeRemoteRunnerSessionToolRequest(
   }
 
   if (raw.tool === 'schedule.update') {
-    const allowed = new Set(['tool', 'taskId', 'prompt', 'calendar', 'calendarDayType']);
+    const allowed = new Set(['tool', 'taskId', 'schedule', 'prompt', 'calendar', 'calendarDayType']);
     if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
     const taskId = boundedUtf8String(raw.taskId, 8, true);
+    const schedule = raw.schedule === undefined ? undefined : boundedUtf8String(raw.schedule, 256, true);
     const prompt = raw.prompt === undefined ? undefined : boundedUtf8String(raw.prompt, 32 * 1024);
     const calendar = raw.calendar === undefined || raw.calendar === null
       ? raw.calendar
@@ -902,15 +918,17 @@ export function normalizeRemoteRunnerSessionToolRequest(
       ? undefined
       : String(raw.calendarDayType);
     if (!taskId || !SCHEDULE_TASK_ID_RE.test(taskId)
+      || (raw.schedule !== undefined && !schedule)
       || (raw.prompt !== undefined && !prompt)
       || (raw.calendar !== undefined && raw.calendar !== null && !calendar)
       || (calendarDayType !== undefined && !['workday', 'restday'].includes(calendarDayType))
-      || (prompt === undefined && raw.calendar === undefined && calendarDayType === undefined)) {
+      || (schedule === undefined && prompt === undefined && raw.calendar === undefined && calendarDayType === undefined)) {
       return undefined;
     }
     return {
       tool: 'schedule.update',
       taskId,
+      ...(schedule !== undefined ? { schedule } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
       ...(raw.calendar !== undefined ? { calendar: calendar as string | null } : {}),
       ...(calendarDayType ? { calendarDayType: calendarDayType as 'workday' | 'restday' } : {}),

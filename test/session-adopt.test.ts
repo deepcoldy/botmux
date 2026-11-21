@@ -824,5 +824,13 @@ describe('Adopt card actions', () => {
       expect(adoptSandboxBlocked({})).toBe(true);
       vi.unstubAllEnvs();
     });
+
+    it.each(['oncall', 'scratch'])('global BOTMUX_SANDBOX=%s blocks adopt like =1', async raw => {
+      const { adoptSandboxBlocked } = await import('../src/core/worker-pool.js');
+      vi.stubEnv('BOTMUX_SANDBOX', raw);
+      try {
+        expect(adoptSandboxBlocked({}, {})).toBe(true);
+      } finally { vi.unstubAllEnvs(); }
+    });
   });
 });

@@ -25,8 +25,14 @@ describe('settings-card-model · composeSections', () => {
     const dto = composeSections(makeSettings());
     expect(dto.sections.map(s => s.key)).toEqual(['access', 'cards', 'maintenance']);
     expect(dto.sections[0].toggles.map(t => t.key)).toEqual(['publicReadOnly']);
-    expect(dto.sections[1].toggles.map(t => t.key)).toEqual(['openTerminalInFeishu', 'enableLocalCliOpen']);
-    expect(dto.sections[2].toggles.map(t => t.key)).toEqual(['autoUpdate', 'autoRestart']);
+    expect(dto.sections[1].toggles.map(t => t.key)).toEqual(['modelQueueNotify', 'openTerminalInFeishu', 'enableLocalCliOpen']);
+    expect(dto.sections[2].toggles.map(t => t.key)).toEqual(['autoUpdate', 'autoRestart', 'notifyOnNewVersion']);
+  });
+
+  it.each([undefined, false, true])('projects queue notification with default-off semantics: %s', modelQueueNotify => {
+    const row = composeSections(makeSettings({ modelQueueNotify })).sections[1].toggles.find(t => t.key === 'modelQueueNotify');
+    expect(row?.enabled).toBe(modelQueueNotify === true);
+    expect(row?.state.enabled).toBe(true);
   });
 
   it('marks every toggle disabled when canWrite=false and surfaces readOnlyHintKey', () => {
@@ -167,5 +173,18 @@ describe('settings-card-model · invariants', () => {
     const explicit = composeSections(makeSettings(), { canWrite: true } as ComposeOptions);
     const omitted = composeSections(makeSettings());
     expect(omitted).toEqual(explicit);
+  });
+});
+
+
+describe('version reminder settings', () => {
+  it.each([undefined, false, true])('uses explicit opt-in even with auto-update unavailable: %s', value => {
+    const settings = makeSettings({ localDevInstall: true, autoUpdateSupported: false,
+      maintenance: { notifyOnNewVersion: value } });
+    const row = composeSections(settings).sections[2].toggles.find(t => t.key === 'notifyOnNewVersion');
+    expect(row?.enabled).toBe(value === true);
+    expect(row?.state.enabled).toBe(true);
+    const readOnly = composeSections(settings, { canWrite: false }).sections[2].toggles.find(t => t.key === 'notifyOnNewVersion');
+    expect(readOnly?.state.enabled).toBe(false);
   });
 });

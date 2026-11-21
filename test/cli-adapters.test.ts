@@ -3,11 +3,15 @@
  *
  * Run:  pnpm vitest run test/cli-adapters.test.ts
  */
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件有用例会写 homedir() 推导的目录（PI_PLUGIN_DIR/extensions、~/.botmux/dsh-question-bridge 等）；
+// 2026-11-06 一次绕过 setupFiles 的全量运行里，这些写入落在了真实的 ~/.botmux 下。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { codexHome } from '../src/services/codex-paths.js';
 
 // ---------------------------------------------------------------------------
@@ -24,7 +28,8 @@ vi.mock('node:child_process', () => ({
   execFile: vi.fn((_bin, _args, _opts, cb) => { cb(null, '{}'); }),
 }));
 
-import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { createCliAdapterSync, resolveEffectiveCliId } from '../src/adapters/cli/registry.js';
+import { t } from '../src/i18n/index.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { shouldWriteNow } from '../src/utils/input-gate.js';
 import { isTypeAheadBlockedByBypass, resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
@@ -35,11 +40,11 @@ import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/cursor.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
-import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
+import { statuslineHookCommand } from '../src/adapters/hook-command.js';
+import { createAntigravityAdapter, resolveShadowedAntigravityStatusLine, supportsAntigravityStatusline } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
 import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
@@ -58,6 +63,7 @@ import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { createDshTuiAdapter } from '../src/adapters/cli/dsh-tui.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
+import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import { isRemoteCliId } from '../src/core/remote-cli-ids.js';
 import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
@@ -119,7 +125,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'mimocode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'genius', 'opencode', 'opencode2', 'mimocode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -184,6 +190,30 @@ describe('Codex zero injection isolation', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+});
+
+// The full local-address rule rides the Botmux system prompt only for a bot that
+// turned on BotConfig.hideLocalAddresses; the worker hands the flag to every
+// adapter that builds that prompt.
+describe('local-address rule in adapter-built system prompts', () => {
+  const rule = t('ai.routing.no_local_addresses', undefined, 'zh');
+  const adapters = [
+    ['claude-code', () => createClaudeCodeAdapter()],
+    ['genius', () => createGeniusAdapter('/bin/genius')],
+    ['grok', () => createGrokAdapter('/bin/grok')],
+    ['pi', () => createPiAdapter('/bin/pi', () => '/tmp/boundary.js')],
+    ['oh-my-pi', () => createOhMyPiAdapter('/bin/omp', () => '/tmp/boundary.js')],
+  ] as const;
+  it.each(adapters.flatMap(([name, create]) => [true, false, undefined].map(on => [name, create, on] as const)))(
+    '%s carries the rule when hideLocalAddresses=%s', (_name, create, hideLocalAddresses) => {
+      const env: Record<string, string> = {};
+      const args = create().buildArgs({ sessionId: 'sess-local-rule', resume: false, locale: 'zh', botName: 'B',
+        botOpenId: 'ou_b', env, ...(hideLocalAddresses === undefined ? {} : { hideLocalAddresses }) });
+      const prompt = [...args, ...Object.values(env)].join('\n');
+      expect(prompt).toContain('<botmux_routing>');
+      if (hideLocalAddresses) expect(prompt).toContain(rule);
+      else expect(prompt).not.toContain(rule);
+    });
 });
 
 describe('zero injection with structured final reply adapters', () => {
@@ -340,7 +370,7 @@ describe('claude-code buildArgs', () => {
     const parsed = JSON.parse(args[idx + 1]);
     expect(Object.keys(parsed)).toEqual(['statusLine']);
     expect(parsed.statusLine.type).toBe('command');
-    expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
+    expect(parsed.statusLine.command).toBe(statuslineHookCommand());
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
@@ -391,12 +421,14 @@ describe('claude-code buildArgs', () => {
       for (const prompt of prompts) {
         expect(prompt).toContain('botmux skill show botmux-send');
       }
-      // No-transport and transcript delivery must keep their existing contract:
-      // these modes do not advertise explicit send commands in routing hints.
+      // Transcript delivery still sends attachments / cross-bot messages, so it
+      // keeps the pointer; no-transport sessions and doubao's transcript prompt
+      // (send is deliberately untaught there) do not advertise send at all.
+      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).toContain('botmux skill show botmux-send');
       expect(buildBotmuxSystemPromptText({ locale, noTransport: true })).not.toContain('botmux skill show botmux-send');
       expect(buildBotmuxShellHints(locale, true).join('\n')).not.toContain('botmux skill show botmux-send');
-      expect(buildBotmuxSystemPromptText({ locale, replyDelivery: 'transcript' })).not.toContain('botmux skill show botmux-send');
-      expect(buildBotmuxShellHints(locale, false, 'transcript').join('\n')).not.toContain('botmux skill show botmux-send');
+      expect(buildBotmuxShellHints(locale, false, 'transcript', 'doubao').join('\n')).not.toContain('botmux skill show botmux-send');
     }
   });
 
@@ -508,24 +540,32 @@ describe('claude-code buildArgs', () => {
     expect(buildBotmuxShellHints('en', false, 'send').join('\n')).toBe(shellDefault);
   });
 
-  // ── replyDelivery=transcript（claude-code 的 daemon 缺省）：最终回复由 daemon 从
-  //    转写自动转发，两条注入路径都彻底不提 botmux send——没有 send 用法、heredoc、
-  //    @ 决策、附件用法；只留改口 intro、botmux history / bots list、哨兵（fallback
-  //    的抑制规则）、workflow 与防注入。
-  it('never mentions botmux send on EITHER injection path for replyDelivery=transcript, keeps the silence sentinel', () => {
+  // ── replyDelivery=transcript（支持转写的 CLI 的缺省）：最终回复由 daemon 从转写
+  //    自动转发。两条注入路径都不再把 botmux send 当回复通道（没有「必须 send 回复」
+  //    「唯一方式」、反馈页脚与反重发这些 send 模式专属提示），只把它留给最终回复带
+  //    不了的事：跨 bot @ / 回报、附件、多行 heredoc 的正确写法；哨兵、上下文命令与
+  //    防注入照旧。
+  it('keeps botmux send on BOTH injection paths only for what the final reply cannot carry under replyDelivery=transcript', () => {
     const sys = buildBotmuxSystemPromptText({ locale: 'en', replyDelivery: 'transcript' });
     const shell = buildBotmuxShellHints('en', false, 'transcript').join('\n');
     for (const prompt of [sys, shell]) {
       expect(prompt).toContain('automatically forwarded back to Lark');
-      expect(prompt).not.toContain('botmux send');
-      expect(prompt).not.toContain("<<'EOF'");
-      expect(prompt).not.toContain('--mention');
-      expect(prompt).not.toContain('--images');
+      // The reply channel is the final message, not a send.
       expect(prompt).not.toContain('you MUST reply via');
       expect(prompt).not.toContain('the only way');
-      // 以「send 是最终回复」为前提的两条提示不再注入。
-      expect(prompt).not.toContain('--response-kind final');
+      expect(prompt).not.toContain('feedback buttons');
       expect(prompt).not.toContain('no visible');
+      // send survives for collaboration / hand-back, attachments and other chats,
+      // with the @ decision, multi-line heredoc and a ban on progress sends.
+      expect(prompt).toContain('only for what the final reply cannot carry');
+      expect(prompt).toContain('--mention-back');
+      expect(prompt).toContain('--no-mention');
+      expect(prompt).toContain("<<'EOF'");
+      expect(prompt).toContain('--images');
+      expect(prompt).toContain('progress broadcasts');
+      // An answer that must itself go through send is declared final, so the
+      // forwarded final reply does not post it a second time.
+      expect(prompt).toContain('--response-kind final');
       // 哨兵语义与上下文命令保留。
       expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
       expect(prompt).toContain('botmux history');
@@ -535,12 +575,26 @@ describe('claude-code buildArgs', () => {
     const shellZh = buildBotmuxShellHints('zh', false, 'transcript').join('\n');
     for (const prompt of [sysZh, shellZh]) {
       expect(prompt).toContain('自动转发回飞书');
-      expect(prompt).not.toContain('botmux send');
+      expect(prompt).toContain('只用于最终回复带不了的事');
+      expect(prompt).toContain('不要用');
       expect(prompt).not.toContain('唯一方式');
+      expect(prompt).not.toContain('必须用 `botmux send` 发送回复');
       expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
       expect(prompt).toContain('botmux history');
     }
     expect(sys).not.toBe(buildBotmuxSystemPromptText({ locale: 'en' }));
+  });
+
+  // Doubao 的工具命令跑在账号级常驻进程里，模型执行的 botmux send 会按别的会话的
+  // 进程树归属（#2828）：它的 transcript 提示照旧一个字都不提 send。
+  it('doubao transcript hints keep the original no-send wording', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const doubao = buildBotmuxShellHints(locale, false, 'transcript', 'doubao').join('\n');
+      expect(doubao).not.toContain('botmux send');
+      expect(doubao).not.toContain('--mention');
+      expect(doubao).toContain('BOTMUX_NOTHING_TO_SEND');
+      expect(doubao).toContain('botmux history');
+    }
   });
 
   // ── #1504: Cursor detaches an over-long shell command into a background task
@@ -569,15 +623,17 @@ describe('claude-code buildArgs', () => {
     expect(cursorZh).toContain('不是飞书用户的新消息');
     expect(cursorZh).toContain('不要再 botmux send');
 
-    // transcript mode: same warning, but it must not reintroduce `botmux send`.
-    const cursorTranscript = buildBotmuxShellHints('en', false, 'transcript', 'cursor').join('\n');
-    expect(cursorTranscript).toContain('background task');
-    expect(cursorTranscript).toContain('BOTMUX_NOTHING_TO_SEND');
-    expect(cursorTranscript).not.toContain('botmux send');
-    expect(cursorTranscript).not.toBe(buildBotmuxShellHints('en', false, 'transcript').join('\n'));
+    // transcript mode: same warning, but the note itself must not ask for a send.
+    const cursorTranscriptLines = buildBotmuxShellHints('en', false, 'transcript', 'cursor');
+    const cursorTranscriptNote = cursorTranscriptLines.filter((l) => l.includes('Briefly inform the user about the task result'));
+    expect(cursorTranscriptNote).toHaveLength(1);
+    expect(cursorTranscriptNote[0]).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(cursorTranscriptNote[0]).not.toContain('botmux send');
+    expect(cursorTranscriptLines.filter((l) => l !== cursorTranscriptNote[0]))
+      .toEqual(buildBotmuxShellHints('en', false, 'transcript'));
 
     // Other CLIs: byte-identical to the no-cliId baseline.
-    for (const cliId of ['codex', 'gemini', 'coco', 'opencode'] as const) {
+    for (const cliId of ['codex', 'aiden', 'coco', 'opencode'] as const) {
       expect(buildBotmuxShellHints('en', false, 'send', cliId).join('\n')).toBe(base);
       expect(buildBotmuxShellHints('en', false, 'transcript', cliId))
         .toEqual(buildBotmuxShellHints('en', false, 'transcript'));
@@ -586,21 +642,21 @@ describe('claude-code buildArgs', () => {
     expect(buildBotmuxShellHints('en', true, 'send', 'cursor')).toEqual(buildBotmuxShellHints('en', true));
   });
 
-  it('transcript identity keeps the three routing rules minus mention_must; solo drops routing_rules; noTransport still wins', () => {
+  it('transcript identity keeps every routing rule incl. mention_must; solo drops routing_rules; noTransport still wins', () => {
     const solo = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
     expect(solo).toContain('<name>Bot</name>');
     expect(solo).toContain('<open_id>ou_x</open_id>');
     expect(solo).not.toContain('<routing_rules>');
-    expect(solo).not.toContain('botmux send');
+    expect(solo).not.toContain('you MUST `botmux send --mention');
     const group = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: false });
     expect(group).toContain('<routing_rules>');
     expect(group).toContain('Route by @name and open_id');
     expect(group).toContain('Do only your part');
     expect(group).toContain('stay silent');
     expect(group).toContain('Do not pull other bots in');
-    // mention_must 整句围绕 botmux send --mention，transcript 下不注入。
-    expect(group).not.toContain('you MUST `botmux send --mention');
-    expect(group).not.toContain('botmux send');
+    // The transcript final card never @-s the bot that triggered the turn, so
+    // collaborating with / reporting back to a bot still needs `--mention`.
+    expect(group).toContain('you MUST `botmux send --mention');
     // noTransport 优先级最高：transcript 标志不改变 no-transport 的折叠输出。
     const noTransport = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true });
     expect(buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', noTransport: true, replyDelivery: 'transcript', solo: true })).toBe(noTransport);
@@ -611,18 +667,17 @@ describe('claude-code buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
     const prompt = args[args.indexOf('--append-system-prompt') + 1];
     expect(prompt).toContain('自动转发回飞书');
-    expect(prompt).not.toContain('botmux send');
-    expect(prompt).not.toContain("<<'EOF'");
-    expect(prompt).not.toContain('--mention');
+    expect(prompt).toContain('只用于最终回复带不了的事');
+    expect(prompt).not.toContain('必须用 `botmux send` 发送回复');
     expect(prompt).not.toContain('<routing_rules>');
     expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
     expect(prompt).toContain('botmux history');
-    // 非 solo：identity 保留归属三条规则，仍不提 send。
+    // 非 solo：identity 保留全部归属规则，含「跟别的 bot 协作必须 --mention」。
     const groupArgs = adapter.buildArgs({ sessionId: 's', resume: false, botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: false });
     const groupPrompt = groupArgs[groupArgs.indexOf('--append-system-prompt') + 1];
     expect(groupPrompt).toContain('<routing_rules>');
     expect(groupPrompt).toContain('只做分给自己的部分');
-    expect(groupPrompt).not.toContain('botmux send');
+    expect(groupPrompt).toContain('跟别的 bot 协作必须 `botmux send --mention');
     const previous = process.env[GOAL_ENV.V3_MARKER];
     process.env[GOAL_ENV.V3_MARKER] = '1';
     try {
@@ -922,14 +977,21 @@ describe('codex buildArgs', () => {
     expect(args).not.toContain('--dangerously-bypass-hook-trust');
   });
 
-  it('traex RPC mode: same --remote viewer args + update-check disabled', () => {
+  it.each([
+    { toggle: true, restricted: false, flag: true },
+    { toggle: true, restricted: true, flag: false },
+    { toggle: false, restricted: false, flag: false },
+    { toggle: false, restricted: true, flag: false },
+  ])('traex RPC viewer: toggle=$toggle restricted=$restricted', ({ toggle, restricted, flag }) => {
     const traex = createTraexAdapter('/bin/traex');
     const args = traex.buildArgs({
       sessionId: 'sess-rpc', resume: true,
       remoteWsUrl: 'ws://127.0.0.1:9932', remoteThreadId: 'thread-xyz',
-      bypassHookTrust: true,
+      bypassHookTrust: toggle,
+      disableCliBypass: restricted,
     });
     expect(args).toEqual([
+      ...(flag ? ['--dangerously-bypass-hook-trust'] : []),
       '--remote', 'ws://127.0.0.1:9932', 'resume', '--no-alt-screen',
       '-c', 'check_for_update_on_startup=false', 'thread-xyz',
     ]);
@@ -1169,6 +1231,28 @@ describe('codex buildArgs', () => {
     expect(fullArgs.includes('tui.auto_recap=false')).toBe(!forkSession);
   });
 
+  it.each([
+    { command: 'resume', forkSession: false },
+    { command: 'fork', forkSession: true },
+  ])('keeps the protected provider base URL override before $command', ({ command, forkSession }) => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-protected-provider',
+      resume: true,
+      resumeSessionId: 'codex-existing',
+      forkSession,
+      modelProviderBaseUrlOverride: {
+        providerId: 'mixoul',
+        baseUrl: 'http://127.0.0.1:0/dev_portal/relay/model',
+      },
+    });
+    const commandIdx = args.indexOf(command);
+    const override = 'model_providers.mixoul.base_url="http://127.0.0.1:0/dev_portal/relay/model"';
+    const overrideIdx = args.indexOf(override);
+    expect(overrideIdx).toBeGreaterThan(0);
+    expect(args[overrideIdx - 1]).toBe('-c');
+    expect(overrideIdx).toBeLessThan(commandIdx);
+  });
+
   it('disables automatic recap for a quiet resume without adding a prompt', () => {
     const normal = adapter.buildArgs({ sessionId: 'sess-quiet', resume: true, resumeSessionId: 'codex-existing' });
     const quiet = adapter.buildArgs({ sessionId: 'sess-quiet', resume: true, resumeSessionId: 'codex-existing', quietResume: true });
@@ -1234,6 +1318,19 @@ describe('codex-app buildArgs', () => {
     expect(args).not.toContain('--strict-resume');
   });
 
+  it('disables the runner fallback catalogue when the bare Codex runtime cannot attest the provider', () => {
+    const direct = adapter.buildArgs({ sessionId: 'sess-app', resume: false });
+    expect(direct).not.toContain('--codex-reasoning-catalog');
+
+    const blind = adapter.buildArgs({
+      sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123',
+      allowCodexReasoningCatalog: false,
+    });
+    const index = blind.indexOf('--codex-reasoning-catalog');
+    expect(index).toBeGreaterThanOrEqual(0);
+    expect(blind[index + 1]).toBe('off');
+  });
+
   it('requires strict thread resume for a quiet maintenance restore without injecting a prompt', () => {
     const normal = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123' });
     const quiet = adapter.buildArgs({ sessionId: 'sess-app', resume: true, resumeSessionId: 'thread-123', quietResume: true });
@@ -1294,11 +1391,13 @@ describe('codex-app buildArgs', () => {
         enabled: true,
         family: 'edge',
         pluginRoot: '/opt/codex/chrome-plugin',
+        autoApproveOrigins: true,
       },
     });
     expect(enabled).toEqual(expect.arrayContaining([
       '--browser-family', 'edge',
       '--browser-plugin-root', '/opt/codex/chrome-plugin',
+      '--browser-auto-approve-origins',
     ]));
   });
 });
@@ -1532,15 +1631,71 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
     expect(args.some(a => /runner\.js$/.test(a))).toBe(false);
   });
 
-  it('passes --resume for session resume', () => {
+  it('passes --resume <native id> for a precise session resume', () => {
     const args = adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'abc-123' });
-    expect(args).toContain('--resume');
-    expect(args).toContain('abc-123');
+    // Behaviour, not an argv snapshot: the id follows --resume, and nothing else
+    // (no bare --patch split, no stray resume flag) is added.
+    const resumeAt = args.indexOf('--resume');
+    expect(resumeAt).toBeGreaterThanOrEqual(0);
+    expect(args[resumeAt + 1]).toBe('abc-123');
+    expect(args.filter(arg => arg === '--resume')).toHaveLength(1);
   });
 
-  it('passes bare --resume (no session id) to read resume.txt', () => {
-    const args = adapter.buildArgs({ sessionId: 's', resume: true });
-    expect(args).toEqual(['--resume']);
+  // Regression: the launcher's bare `--resume` does NOT mean "this session" —
+  // it reads ~/.dsh-tui/resume.txt, the machine-wide pointer to whatever
+  // conversation any process touched last (possibly a sibling bot's). Without a
+  // native id the only safe launch is a fresh one: a bare --resume would
+  // silently resume somebody else's history.
+  it('never emits a bare --resume: a resume without a native id starts fresh', () => {
+    const args = adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: undefined });
+    expect(args).not.toContain('--resume');
+    expect(args.filter(arg => arg.startsWith('--resume'))).toEqual([]);
+  });
+
+  // The adapter capability behind the worker's Tier-0 fresh demotion: without
+  // it the launch stays `resume: true` in every upper layer (closed card,
+  // resume receipt) even though the CLI starts blank.
+  it('declares resumeRequiresCliSessionId (an id is required to restore history)', () => {
+    expect(adapter.resumeRequiresCliSessionId).toBe(true);
+  });
+
+  // The worker never constructs the adapter from the raw bot `cliId`: a dsh
+  // bot with dshRuntime='tui' resolves through `resolveEffectiveCliId`. Pin the
+  // behaviour on THAT path, so a regression in the mapping (not just in the
+  // adapter literal) is caught.
+  it('the worker-resolved dsh-tui adapter cannot emit a bare --resume', () => {
+    const resolved = createCliAdapterSync(resolveEffectiveCliId('dsh', 'tui'));
+    expect(resolved.id).toBe('dsh-tui');
+    expect(resolved.resumeRequiresCliSessionId).toBe(true);
+    expect(resolved.buildArgs({ sessionId: 's', resume: true })).not.toContain('--resume');
+    expect(resolved.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'native-9' }))
+      .toContain('native-9');
+    // Headless dsh is a different adapter and keeps its own behaviour.
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', 'official')).id).toBe('dsh');
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', undefined)).id).toBe('dsh');
+  });
+
+  // dsh-tui paints the alternate screen and owns its transcript redraw, so a
+  // read-only web terminal has no xterm/tmux scrollback to page. The only way
+  // to reach history is forwarding SGR wheel events back to the CLI — the
+  // narrow, rate-limited `type:'scroll'` path this flag opts into.
+  it('declares readOnlyRemoteScroll so read-only viewers can forward wheel scroll', () => {
+    expect(createDshTuiAdapter().readOnlyRemoteScroll).toBe(true);
+  });
+
+  it('the worker-resolved dsh-tui adapter also forwards wheel scroll', () => {
+    const resolved = createCliAdapterSync(resolveEffectiveCliId('dsh', 'tui'));
+    expect(resolved.id).toBe('dsh-tui');
+    expect(resolved.readOnlyRemoteScroll).toBe(true);
+  });
+
+  // The opt-in is dsh-tui-only: headless dsh speaks JSON-RPC over a plain log
+  // and never parses SGR wheel input, so forwarding a wheel there would be a
+  // no-op while wrongly suppressing the read-only page's own fallback path.
+  it('headless dsh never opts into remote scroll', () => {
+    expect(createDshAdapter('/opt/dsh/bin/dsh').readOnlyRemoteScroll).toBeUndefined();
+    expect(createCliAdapterSync(resolveEffectiveCliId('dsh', 'official')).readOnlyRemoteScroll)
+      .toBeUndefined();
   });
 
   it('omits --resume on fresh spawn when the question bridge is disabled', () => {
@@ -1570,6 +1725,11 @@ describe('dsh-tui buildArgs (PTY TUI model)', () => {
       expect(args).not.toContain('--patch');
       expect(args).toContain('--resume');
       expect(args).toContain('abc-123');
+      // A resume intent WITHOUT the native id demotes to a fresh launch, but
+      // the question-bridge overlay must still ride along.
+      const demoted = bridgeAdapter.buildArgs({ sessionId: 's', resume: true });
+      expect(demoted).not.toContain('--resume');
+      expect(demoted.some(arg => arg.startsWith('--patch='))).toBe(true);
       const readonly = bridgeAdapter.sandboxReadonlyPaths?.();
       expect(readonly?.length).toBe(1);
       expect(patchArg).toContain(readonly![0]);
@@ -1972,8 +2132,9 @@ describe('cursor buildArgs', () => {
 
   it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
-    // Positional prompt is inside the tmux launch command. 8192 matches
-    // OpenCode: short turns stay on argv; longer ones defer until readyPattern.
+    // The positional prompt historically counted toward the inline launch
+    // budget; 8192 matches OpenCode and is retained so short turns stay on
+    // argv while longer ones defer until readyPattern.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
     expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
@@ -2077,62 +2238,54 @@ describe('genius buildArgs', () => {
   });
 });
 
-describe('gemini buildArgs', () => {
-  const adapter = createGeminiAdapter('/usr/bin/gemini');
-
-  it('basic args include --yolo', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false });
-    expect(args).toContain('--yolo');
-    expect(args).not.toContain('-i');
-  });
-
-  it('omits --yolo when disableCliBypass is true while preserving initial prompt', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, initialPrompt: 'do something', disableCliBypass: true });
-    expect(args).not.toContain('--yolo');
-    expect(args).toEqual(['-i', 'do something']);
-  });
-
-  it('passes initialPrompt via -i flag', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, initialPrompt: 'do something' });
-    expect(args).toContain('-i');
-    const idx = args.indexOf('-i');
-    expect(args[idx + 1]).toBe('do something');
-  });
-
-  it('passes configured model with --model', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false, model: 'gemini-3-pro-preview' });
-    const idx = args.indexOf('--model');
-    expect(idx).toBeGreaterThanOrEqual(0);
-    expect(args[idx + 1]).toBe('gemini-3-pro-preview');
-  });
-
-  it('passesInitialPromptViaArgs is true', () => {
-    expect(adapter.passesInitialPromptViaArgs).toBe(true);
-  });
-
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
-    // -i bakes the full first prompt into argv, same tmux ceiling as OpenCode.
-    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
-  });
-
-  it('does not include session id', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-5', resume: false });
-    expect(args).not.toContain('sess-5');
-  });
-});
-
 describe('opencode buildArgs', () => {
   const adapter = createOpenCodeAdapter('/usr/bin/opencode');
 
   it('keeps the whole opencode data dir real in the sandbox (SQLite needs fcntl locks the home overlay lacks)', () => {
     // Not just auth.json: opencode's global opencode.db (WAL) lives here and
-    // can't lock on the overlayfs home — same failure mode as codex.
-    expect(adapter.authPaths).toEqual(['~/.local/share/opencode']);
+    // can't lock on the overlayfs home — same failure mode as codex. (The
+    // config dir next to it is covered in fs-policy.test.ts.)
+    expect(adapter.authPaths).toContain('~/.local/share/opencode');
   });
 
   it('returns empty args for basic case', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false });
     expect(args).toEqual([]);
+  });
+
+  it('passes --auto when the probed CLI version accepts it (>= 1.17.12)', () => {
+    // V1 的默认 ask（external_directory / .env）在托管态没人看得见，turn 会
+    // 静默卡在原生弹窗上；--auto 是 opencode 1.17.12 才加的。
+    for (const cliVersion of ['1.17.12', '1.17.13', '1.19.1', 'v1.18.32', '2.1.4']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual(['--auto']);
+    }
+  });
+
+  it('omits --auto on versions that predate the flag (help-and-exit would crash-loop)', () => {
+    // adapter 注释里的实测基线就是 1.17.11 —— 传未知 flag 会打帮助退出 1，
+    // 再被 daemon 的自动重启放大成 crash-loop。
+    for (const cliVersion of ['1.17.11', '1.17.8', '1.16.0', '1.4.1', '1.0.0']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual([]);
+    }
+  });
+
+  it('omits --auto when the version was never probed', () => {
+    for (const cliVersion of [undefined, '', 'unknown']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual([]);
+    }
+  });
+
+  it('omits --auto when disableCliBypass is set even on a new version', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion: '1.19.1', disableCliBypass: true });
+    expect(args).toEqual([]);
+  });
+
+  it('mimo (same adapter family) never gets --auto: it has no such flag', () => {
+    const mimo = createMiMoCodeAdapter('/usr/bin/mimo');
+    expect(mimo.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion: '2.1.4' })).toEqual(['--trust']);
   });
 
   it('passes initialPrompt via --prompt flag', () => {
@@ -2153,11 +2306,10 @@ describe('opencode buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+  it('declares the retained maxInitialPromptArgBytes budget', () => {
     // OpenCode bakes the full first-round prompt into `--prompt <content>`.
-    // tmux new-session rejects long command strings well below OS ARG_MAX,
-    // so the adapter must declare a byte budget: short prompts keep --prompt,
-    // over-limit prompts defer to the post-start input queue.
+    // Keep the historical byte budget so short prompts retain --prompt while
+    // over-budget prompts retain the post-start input queue.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
@@ -2255,6 +2407,8 @@ describe('pi buildArgs', () => {
   });
 
   it('materializes turn-boundary extension to ~/.botmux/pi-skills/extensions for compiled binaries', () => {
+    // 写入目标 PI_PLUGIN_DIR 在模块加载时由 homedir() 推导：只在它落在本文件的测试围栏里时才写。
+    expect(isInsideDir(PI_PLUGIN_DIR, process.env.__TEST_DATA_DIR_FENCE)).toBe(true);
     const extPath = materializePiTurnBoundaryExtension();
     expect(extPath).toBeTruthy();
     expect(existsSync(extPath!)).toBe(true);
@@ -2969,7 +3123,7 @@ describe('mtr buildArgs', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
 
-  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+  it('declares the retained maxInitialPromptArgBytes budget', () => {
     // `--prompt` bakes the full first prompt into argv, same budget as OpenCode.
     expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
@@ -3036,14 +3190,20 @@ describe('hermes buildArgs', () => {
 describe('antigravity buildArgs', () => {
   const adapter = createAntigravityAdapter('/usr/local/bin/agy');
 
-  it('fresh session passes --dangerously-skip-permissions only', () => {
+  it('fresh sessions keep permission bypass and use separate native identity logs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false });
-    expect(args).toEqual(['--dangerously-skip-permissions']);
+    const other = adapter.buildArgs({ sessionId: 'sess-8', resume: false });
+    expect(args).toContain('--dangerously-skip-permissions');
+    expect(args).toContain('--log-file');
+    expect(other).toContain('--log-file');
+    expect(args[args.indexOf('--log-file') + 1]).not.toBe(other[other.indexOf('--log-file') + 1]);
+    expect(args).not.toContain('--conversation');
   });
 
   it('omits dangerous permission flag when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, disableCliBypass: true });
-    expect(args).toEqual([]);
+    expect(args).not.toContain('--dangerously-skip-permissions');
+    expect(args).toContain('--log-file');
   });
 
   it('does NOT inject initialPrompt via -i (agy -i does not auto-submit)', () => {
@@ -3107,6 +3267,74 @@ describe('antigravity buildArgs', () => {
     expect(args).not.toContain('sess-7');
     expect(args).not.toContain('--session-id');
   });
+
+  it('injects ephemeral --settings statusLine with stack_with_default for agy >= 1.5.8', () => {
+    for (const cliVersion of ['1.5.8', '1.5.12', '2.0.0', '1.5.8+build.1']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, cliVersion });
+      const idx = args.indexOf('--settings');
+      expect(idx, `cliVersion=${cliVersion}`).toBeGreaterThanOrEqual(0);
+      expect(JSON.parse(args[idx + 1]!)).toEqual({
+        statusLine: {
+          type: 'command',
+          enabled: true,
+          command: statuslineHookCommand(),
+          stack_with_default: true,
+        },
+      });
+    }
+    // disableCliBypass keeps --settings (statusLine only, no bypass flag)
+    const noBypass = adapter.buildArgs({ sessionId: 'sess-7', resume: false, disableCliBypass: true, cliVersion: '1.5.12' });
+    expect(noBypass).not.toContain('--dangerously-skip-permissions');
+    expect(noBypass).toContain('--settings');
+  });
+
+  it.each([undefined, '', 'unknown', '1.0.8', '1.5.4', '1.5.7', '1.5.8-beta.1'])(
+    'omits --settings when cliVersion is missing, older, or pre-release (%j)',
+    cliVersion => {
+      expect(supportsAntigravityStatusline(cliVersion)).toBe(false);
+      const args = adapter.buildArgs({ sessionId: 'sess-7', resume: false, cliVersion });
+      expect(args).not.toContain('--settings');
+    },
+  );
+});
+
+describe('resolveShadowedAntigravityStatusLine', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+  const makeSettings = (content: string): string => {
+    const dir = mkdtempSync(join(tmpdir(), 'bmx-agy-sl-'));
+    dirs.push(dir);
+    const file = join(dir, 'settings.json');
+    writeFileSync(file, content, 'utf-8');
+    return file;
+  };
+
+  it('returns the user statusLine command (including UTF-8 BOM files)', () => {
+    const plain = makeSettings(JSON.stringify({ statusLine: { type: 'command', enabled: true, command: 'bash ~/.gemini/sl.sh' } }));
+    expect(resolveShadowedAntigravityStatusLine({ userSettingsPath: plain })).toEqual({ command: 'bash ~/.gemini/sl.sh' });
+    const withBom = makeSettings('\uFEFF' + JSON.stringify({ statusLine: { command: 'my-sl' } }));
+    expect(resolveShadowedAntigravityStatusLine({ userSettingsPath: withBom })).toEqual({ command: 'my-sl' });
+  });
+
+  it('returns {} when disabled, non-command, blank, corrupt, or missing', () => {
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings(JSON.stringify({ statusLine: { type: 'command', enabled: false, command: 'my-sl' } })),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings(JSON.stringify({ statusLine: { type: 'builtin', command: 'my-sl' } })),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings(JSON.stringify({ statusLine: { type: 'command', command: '   ' } })),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: makeSettings('{corrupt'),
+    })).toEqual({});
+    expect(resolveShadowedAntigravityStatusLine({
+      userSettingsPath: join(tmpdir(), 'definitely-missing-agy-settings-99999.json'),
+    })).toEqual({});
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3156,10 +3384,6 @@ describe('completionPattern', () => {
 
   it('mira has no completionPattern', () => {
     expect(createMiraAdapter().completionPattern).toBeUndefined();
-  });
-
-  it('gemini has no completionPattern', () => {
-    expect(createGeminiAdapter('/bin/gemini').completionPattern).toBeUndefined();
   });
 
   it('opencode has no completionPattern', () => {
@@ -3466,6 +3690,70 @@ describe('busyPattern', () => {
 });
 
 describe('idleToBusyPattern', () => {
+  it('oh-my-pi only revives idle from an active footer, not legacy Working prose', () => {
+    const adapter = createOhMyPiAdapter('/bin/omp');
+    const active = [
+      '⠇ 1h │ ⬢ model · xhigh │ 📁 …/repo ─────67%┃─272K─',
+      '  ⠋ 1.5s │ model │ 12%┃',
+      '● 🐴 ponytail: ⚡ FULL',
+    ];
+    for (const footer of active) {
+      expect(adapter.busyPattern!.test(footer)).toBe(true);
+      expect(adapter.idleToBusyPattern!.test(footer)).toBe(true);
+    }
+    for (const text of [
+      'Working... on the fix',
+      'The previous log contained Working… but the task is finished.',
+      'π │ model │ 📁 …/repo ─────67%┃─272K─',
+      '○ 🐴 ponytail: ⚡ FULL',
+      'The log said ● 🐴 ponytail: ⚡ FULL',
+      'Quoted footer: ⠇ 1h │ model │ 67%┃',
+      '⠇ 1h │ model\n67%┃',
+    ]) {
+      expect(adapter.idleToBusyPattern!.test(text)).toBe(false);
+    }
+    // Preserve the legacy viewport guard without using it as a new-turn edge.
+    expect(adapter.busyPattern!.test('Working…')).toBe(true);
+  });
+
+  it('oh-my-pi recognizes the real omp 18.10.1 default band footer, not its idle footer', () => {
+    const adapter = createOhMyPiAdapter('/bin/omp');
+    const fx = JSON.parse(readFileSync(new URL('./fixtures/omp-band-footer-v18.10.1.json', import.meta.url), 'utf8'));
+    for (const frame of [fx.workingFrame, fx.workingFrameWithStatusRow]) {
+      const stripped = stripAnsiScreenText(frame);
+      expect(adapter.idleToBusyPattern!.test(stripped)).toBe(true);
+      expect(adapter.busyPattern!.test(stripped)).toBe(true);
+    }
+    // Interrupted/finished turn: status glyph instead of a braille spinner.
+    expect(adapter.idleToBusyPattern!.test(stripAnsiScreenText(fx.idleFrame))).toBe(false);
+    // Plain-text equivalents of what the band footer renders.
+    expect(adapter.idleToBusyPattern!.test(' \ue0b6 ⠦ 1s \ue0b1 4o 1M \ue0b1 repo \ue0b0─0.9%────1M─')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test(' ⠦ 1m30s  model   repo ─12%────')).toBe(true);
+    for (const text of [
+      // A spinner + elapsed line quoted in a reply, with no footer gauge.
+      '⠦ 1s waiting for the build',
+      'Quoted footer: ⠦ 1s  model   repo ─0.9%───',
+      // Footer split across lines must not combine.
+      '\ue0b6 ⠦ 1s \ue0b1 model\n─0.9%───',
+      // Idle band footer redrawn right after the previous row (no newline).
+      '  Working…\ue0b6 \u{f0d57} \ue0b1 4o 1M \ue0b0─0.9%───',
+      // Percentages not followed by the footer rule.
+      '⠦ 1s finished 100% of the tests.',
+    ]) {
+      expect(adapter.idleToBusyPattern!.test(text)).toBe(false);
+    }
+  });
+
+  it('oh-my-pi opts into OSC 7501 program status', () => {
+    expect(createOhMyPiAdapter('/bin/omp').supportsProgramStatus).toBe(true);
+  });
+
+  it('only oh-my-pi distrusts its startup OSC 7501 idle report (reported before session_start hooks)', () => {
+    expect(createOhMyPiAdapter('/bin/omp').programStatusStartupIdleUntrusted).toBe(true);
+    expect(createPiAdapter('/bin/pi').programStatusStartupIdleUntrusted).toBeUndefined();
+    expect(createClaudeCodeAdapter('/bin/claude').programStatusStartupIdleUntrusted).toBeUndefined();
+  });
+
   it('codex explicitly opts into idle→busy recovery with the strict active marker', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const busy = adapter.idleToBusyPattern;
@@ -3604,10 +3892,6 @@ describe('readyPattern', () => {
 
   it('aiden has no readyPattern', () => {
     expect(createAidenAdapter('/bin/aiden').readyPattern).toBeUndefined();
-  });
-
-  it('gemini has no readyPattern', () => {
-    expect(createGeminiAdapter('/bin/gemini').readyPattern).toBeUndefined();
   });
 
   it('opencode has no readyPattern', () => {
@@ -3812,7 +4096,6 @@ describe('systemHints', () => {
     ['aiden', () => createAidenAdapter('/bin/aiden')],
     ['coco', () => createCocoAdapter('/bin/coco')],
     ['codex', () => createCodexAdapter('/bin/codex')],
-    ['gemini', () => createGeminiAdapter('/bin/gemini')],
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
@@ -3844,7 +4127,6 @@ describe('id property', () => {
     ['coco', () => createCocoAdapter('/bin/coco')],
     ['codex', () => createCodexAdapter('/bin/codex')],
     ['codex-app', () => createCodexAppAdapter('/bin/codex')],
-    ['gemini', () => createGeminiAdapter('/bin/gemini')],
     ['opencode', () => createOpenCodeAdapter('/bin/opencode')],
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
@@ -3866,10 +4148,6 @@ describe('id property', () => {
 // ---------------------------------------------------------------------------
 
 describe('altScreen property', () => {
-  it('gemini uses alt screen', () => {
-    expect(createGeminiAdapter('/bin/gemini').altScreen).toBe(true);
-  });
-
   it('opencode uses alt screen', () => {
     expect(createOpenCodeAdapter('/bin/opencode').altScreen).toBe(true);
   });
@@ -3991,11 +4269,6 @@ describe('buildResumeCommand', () => {
     expect(a.buildResumeCommand?.({ sessionId: 'bm-x', cliSessionId: 'mira-session-1' })).toBeNull();
   });
 
-  it('gemini does not implement buildResumeCommand (no precise resume)', () => {
-    const a = createGeminiAdapter('/bin/gemini');
-    expect(a.buildResumeCommand).toBeUndefined();
-  });
-
   it('opencode emits `opencode -s <cliSessionId>` when known', () => {
     const a = createOpenCodeAdapter('/bin/opencode');
     expect(a.buildResumeCommand?.({ sessionId: 'bm-oc', cliSessionId: 'ses_0123abcDEF' }))
@@ -4044,11 +4317,12 @@ describe('buildResumeCommand', () => {
     expect(a.buildResumeCommand?.({ sessionId: 'bm-cp' })).toBeNull();
   });
 
-  it('kimi emits `kimi --resume <cliSessionId>` when known, null otherwise', () => {
+  it('kimi emits `kimi --session <id>` for a Kimi session id it knows, null otherwise', () => {
+    // Kimi 0.31 has no --resume; -S/--session resumes an existing session_<uuid>.
     const a = createKimiAdapter('/usr/bin/kimi');
-    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi', cliSessionId: 'kimi-sess-1' }))
-      .toBe('kimi --resume kimi-sess-1');
-    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi' })).toBeNull();
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi', cliSessionId: 'session_0a1b2c3d-0000-4000-8000-000000000000' }))
+      .toBe('kimi --session session_0a1b2c3d-0000-4000-8000-000000000000');
+    expect(a.buildResumeCommand?.({ sessionId: 'bm-kimi-not-found-anywhere' })).toBeNull();
   });
 
   it('grok emits `grok --resume <id>` preferring cliSessionId, falling back to sessionId', () => {
@@ -4158,7 +4432,10 @@ describe('grok buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false, initialPrompt: 'hello grok' });
     expect(args[args.length - 1]).toBe('hello grok');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
-    // Tighter than 8192: `--rules` is already in the tmux command.
+    // Tighter than 8192: the historical inline launch had to fit `--rules`
+    // and the first prompt together; pane-launch now carries both via a
+    // private file, so 4096 is retained only to keep the argv vs queue split
+    // unchanged.
     expect(adapter.maxInitialPromptArgBytes).toBe(4096);
   });
 
@@ -4401,9 +4678,12 @@ describe('grok buildArgs', () => {
 describe('kimi buildArgs', () => {
   const adapter = createKimiAdapter('/usr/bin/kimi');
 
-  it('new session passes --yolo by default', () => {
+  it('new session bypasses approvals with --auto (Never Ask) by default', () => {
+    // Kimi Code 2.x `--yolo` is "Ask When Needed": risky actions still stop
+    // for a human, which an unattended IM session cannot answer.
     const args = adapter.buildArgs({ sessionId: 'sess-1', resume: false });
-    expect(args).toContain('--yolo');
+    expect(args).toContain('--auto');
+    expect(args).not.toContain('--yolo');
     expect(args).not.toContain('--resume');
   });
 
@@ -4414,8 +4694,9 @@ describe('kimi buildArgs', () => {
     expect(args[idx + 1]).toBe('kimi-k2.5');
   });
 
-  it('omits --yolo when disableCliBypass is true', () => {
+  it('passes no permission-mode flag when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-1', resume: false, disableCliBypass: true });
+    expect(args).not.toContain('--auto');
     expect(args).not.toContain('--yolo');
   });
 
@@ -4436,10 +4717,11 @@ describe('kimi buildArgs', () => {
     expect(args).not.toContain('--resume');
   });
 
-  it('resumes the provided cli session id when available', () => {
-    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true, resumeSessionId: 'kimi-session-123' });
-    expect(args).toContain('--resume');
-    expect(args[args.indexOf('--resume') + 1]).toBe('kimi-session-123');
+  it('resumes a known Kimi session id with --session (Kimi 0.31 has no --resume)', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-1', resume: true, resumeSessionId: 'session_0a1b2c3d-0000-4000-8000-000000000000' });
+    expect(args).toContain('--session');
+    expect(args[args.indexOf('--session') + 1]).toBe('session_0a1b2c3d-0000-4000-8000-000000000000');
+    expect(args).not.toContain('--resume');
     expect(args).not.toContain('--continue');
   });
 
@@ -4475,7 +4757,8 @@ describe('resume without cliSessionId — cross-session isolation (cursor / copi
       expect(args).not.toContain('--resume');
     });
 
-    it(`${name}: resume=true WITH resumeSessionId still resumes the exact session`, () => {
+    // Kimi resumes with --session and finds its id itself (kimi-session.test.ts).
+    it.skipIf(name === 'kimi')(`${name}: resume=true WITH resumeSessionId still resumes the exact session`, () => {
       const adapter = factory();
       const args = adapter.buildArgs({
         sessionId: 'bm-session-b',
@@ -4506,7 +4789,10 @@ describe('resumeRequiresCliSessionId capability', () => {
   it('cursor / copilot / kimi declare the capability (resume without an id starts fresh)', () => {
     expect(createCursorAdapter('/usr/bin/cursor-agent').resumeRequiresCliSessionId).toBe(true);
     expect(createCopilotAdapter('/usr/bin/copilot').resumeRequiresCliSessionId).toBe(true);
-    expect(createKimiAdapter('/usr/bin/kimi').resumeRequiresCliSessionId).toBe(true);
+    // Kimi no longer needs a captured id: it finds its own session by the
+    // botmux session id (kimi-session.ts) and checks the target before resume.
+    expect(createKimiAdapter('/usr/bin/kimi').resumeRequiresCliSessionId).toBeUndefined();
+    expect(createKimiAdapter('/usr/bin/kimi').checkResumeTargetExists).toBeTypeOf('function');
   });
 
   it('adapters whose botmux sessionId IS the CLI session id do not declare it', () => {
@@ -4514,13 +4800,6 @@ describe('resumeRequiresCliSessionId capability', () => {
     // is always available, so no demotion is needed.
     expect(createClaudeCodeAdapter('/usr/bin/claude').resumeRequiresCliSessionId).toBeUndefined();
     expect(createGrokAdapter('/usr/bin/grok').resumeRequiresCliSessionId).toBeUndefined();
-  });
-
-  it('adapters that ignore resume entirely do not declare it', () => {
-    // gemini always starts fresh regardless — but its resume story is "no
-    // resume at all", not "resume requires an id"; keep it out of the demotion
-    // path so its existing card copy is unchanged.
-    expect(createGeminiAdapter('/usr/bin/gemini').resumeRequiresCliSessionId).toBeUndefined();
   });
 });
 
@@ -4680,6 +4959,14 @@ describe('reasonix buildArgs', () => {
 });
 
 describe('traex/coco sandbox authPaths', () => {
+  const home = (...parts: string[]) => join(homedir(), '.trae', ...parts);
+  let previousTraeHome: string | undefined;
+  beforeEach(() => { previousTraeHome = process.env.TRAE_HOME; delete process.env.TRAE_HOME; });
+  afterEach(() => {
+    if (previousTraeHome === undefined) delete process.env.TRAE_HOME;
+    else process.env.TRAE_HOME = previousTraeHome;
+  });
+
   it('traex keeps ~/.trae/cli real (RW SQLite state) and exposes migration markers READ-ONLY (not the whole ~/.trae)', () => {
     // authPaths (readWrite) stays scoped to cli/ — widening to the whole ~/.trae
     // would give a chat-driven sandbox RW to sibling hooks/plugins/skills/config
@@ -4687,15 +4974,15 @@ describe('traex/coco sandbox authPaths', () => {
     // migration prompt (which wedges goal-mode's human-less PTY) is instead
     // silenced by exposing the done-markers READ-ONLY via sandboxReadonlyPaths.
     const adapter = createTraexAdapter('/bin/traex');
-    expect(adapter.authPaths).toEqual(['~/.trae/cli']);
+    expect(adapter.authPaths).toEqual([home('cli')]);
     expect(adapter.mcpGateway).toEqual({
-      configPath: join(homedir(), '.trae', 'traecli.toml'),
+      configPath: home('traecli.toml'),
       format: 'codex-toml',
     });
     expect(adapter.sandboxReadonlyPaths?.()).toEqual([
-      join(homedir(), '.trae', 'traecli.toml'),
-      '~/.trae/.coco-rollouts-migrated',
-      '~/.trae/.coco-migrated',
+      home('traecli.toml'),
+      home('.coco-rollouts-migrated'),
+      home('.coco-migrated'),
     ]);
   });
 
@@ -4704,15 +4991,35 @@ describe('traex/coco sandbox authPaths', () => {
     // exposed read-only, authPaths NOT widened past cli/ (+ the coco cache the
     // transcript bridge reads).
     const adapter = createCocoAdapter('/bin/coco');
-    expect(adapter.authPaths).toEqual(['~/.trae/cli', '~/.cache/coco']);
+    expect(adapter.authPaths).toEqual([home('cli'), '~/.cache/coco']);
     expect(adapter.mcpGateway).toEqual({
-      configPath: join(homedir(), '.trae', 'traecli.toml'),
+      configPath: home('traecli.toml'),
       format: 'codex-toml',
     });
     expect(adapter.sandboxReadonlyPaths?.()).toEqual([
-      join(homedir(), '.trae', 'traecli.toml'),
-      '~/.trae/.coco-rollouts-migrated',
-      '~/.trae/.coco-migrated',
+      home('traecli.toml'),
+      home('.coco-rollouts-migrated'),
+      home('.coco-migrated'),
     ]);
+  });
+
+  it.each([
+    ['traex', () => createTraexAdapter('/bin/traex'), (root: string) => [join(root, 'cli')]],
+    ['coco', () => createCocoAdapter('/bin/coco'), (root: string) => [join(root, 'cli'), '~/.cache/coco']],
+  ])('%s follows a bot-specific TRAE_HOME for its sandbox binds', (_id, create, expectedAuth) => {
+    const custom = '/srv/bot-a/trae';
+    const adapter = create();
+    // Read-only binds come from the child's env (the worker passes the per-bot
+    // env); the worker's own process.env still has no TRAE_HOME here.
+    expect(adapter.sandboxReadonlyPaths?.({ TRAE_HOME: custom })).toEqual([
+      join(custom, 'traecli.toml'),
+      home('.coco-rollouts-migrated'),
+      home('.coco-migrated'),
+      join(custom, '.coco-rollouts-migrated'),
+      join(custom, '.coco-migrated'),
+    ]);
+    // The RW state dir follows the TRAE_HOME the worker pins for the spawn.
+    process.env.TRAE_HOME = custom;
+    expect(adapter.authPaths).toEqual(expectedAuth(custom));
   });
 });

@@ -5,9 +5,10 @@
  * to `Lark.WSClient({ agent })`. Under Node the `ws` package drives the agent
  * through `agent.connect()`, so the CONNECT tunnel is built and the proxy is
  * honoured. Bun replaces the `ws` package with its own implementation, which
- * never calls `agent.connect()` — it only reads a proxy URL off the agent
- * object (`agent.proxy` / `agent.connectOpts.proxy`, the shape `HttpsProxyAgent`
- * exposes). `ProxyAgent` has neither, so on Bun the proxy was silently dropped,
+ * up to 1.4.3 never calls `agent.connect()` — it only reads a proxy URL off the
+ * agent object (`agent.proxy` / `agent.connectOpts.proxy`, the shape
+ * `HttpsProxyAgent` exposes); 1.4.4's rewritten port drives custom agents the way
+ * Node does. `ProxyAgent` has neither, so on Bun the proxy was silently dropped,
  * the client dialled `open.feishu.cn` directly and, on a proxy-only host, the
  * log filled with `[ws] ws connect failed` while `status` still read healthy.
  *
@@ -104,6 +105,15 @@ function legacyProxyAgent(): ProxyAgent {
   return agent;
 }
 
+/** Bun <=1.4.3's built-in ws only reads `agent.proxy`; 1.4.4 calls the agent like Node's ws. */
+export function bunWsIgnoresCustomAgents(
+  bunVersion = (process.versions as Record<string, string | undefined>).bun,
+): boolean {
+  if (!bunVersion) return false;
+  const [major = 0, minor = 0, patch = 0] = bunVersion.split(/[.-]/).map(Number);
+  return major < 1 || (major === 1 && (minor < 4 || (minor === 4 && patch < 4)));
+}
+
 /** Build the agent for `resolution`, or `undefined` for a direct connection
  *  (identical to the pre-fix behaviour when no proxy env is set). */
 export function larkWsAgentFor(resolution: LarkWsProxyResolution): Agent | undefined {
@@ -114,7 +124,7 @@ export function larkWsAgentFor(resolution: LarkWsProxyResolution): Agent | undef
     // require); Bun's built-in ws reads `agent.proxy` and tunnels itself.
     return new HttpsProxyAgent(resolution.proxyUrl);
   }
-  if ((process.versions as Record<string, string | undefined>).bun) {
+  if (bunWsIgnoresCustomAgents()) {
     logger.warn(
       `[ws] proxy=${describeLarkWsProxy(resolution)} is not an HTTP proxy; `
       + `Bun's WebSocket cannot tunnel through it and will connect directly`,

@@ -1,0 +1,350 @@
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { atomicWriteFileSync, isAtomicWriteTempName } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
+import { readDurableProcessIdentity } from '../utils/process-identity.js';
+import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
+import { readFeedbackStorageConfig } from './feedback-storage-config.js';
+import { FEEDBACK_TABLES } from './feedback-tables.js';
+// `pg`-backed modules are loaded lazily: this module is statically imported by
+// daemon startup and `botmux send`, which must run with SQLite-only installs.
+import { inspectSendRecovery, recoveryAcknowledged, webhookRecoveryFingerprint } from './feedback-recovery.js';
+
+export interface MaintenanceReport {
+  migrationId: string;
+  state: 'draining' | 'frozen' | 'blocked' | 'complete';
+  generation: number;
+  participants: Array<{ processId: number; processStartId: string; generation: number; ready: boolean }>;
+  blockers: string[];
+}
+interface Participant {
+  processId: number;
+  processStartId: string;
+  generation: number;
+  migrationId?: string;
+  ready: boolean;
+  updatedAt: number;
+  blockers: string[];
+}
+const controlPath = (dataDir: string) => join(dataDir, 'feedback-maintenance.json');
+function readControl(dataDir: string): MaintenanceReport | undefined {
+  const path = controlPath(dataDir);
+  if (!existsSync(path)) return undefined;
+  try {
+    const value = JSON.parse(readFileSync(path, 'utf8'));
+    if (!value || typeof value.migrationId !== 'string' || !['draining', 'frozen', 'blocked', 'complete'].includes(value.state) || !Number.isSafeInteger(value.generation)) throw new Error();
+    return value;
+  } catch { throw new Error('feedback_maintenance_state_invalid'); }
+}
+function writeControl(dataDir: string, value: MaintenanceReport): void {
+  atomicWriteFileSync(controlPath(dataDir), JSON.stringify(value), { mode: 0o600, durable: true, followTargetSymlink: false });
+}
+export function assertFeedbackAdmission(dataDir: string): void {
+  const state = readControl(dataDir);
+  if (state && state.state !== 'complete') throw new Error('feedback_storage_maintenance');
+}
+export function feedbackMaintenanceActive(dataDir: string): boolean {
+  try { assertFeedbackAdmission(dataDir); return false; } catch { return true; }
+}
+const sendLeaseDirectory = (dataDir: string) => join(dataDir, 'feedback-send-leases');
+/** Admission and the lease write share the control lock, so a lease either
+ *  lands before maintenance starts (and blocks freezing) or is refused. */
+function writeSendLease(
+  dataDir: string,
+  processId: number,
+  identity: string,
+  ownership?: { sessionId: string; releaseTokenHash: string },
+): string {
+  const directory = sendLeaseDirectory(dataDir);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const name = `${processId}-${crypto.randomUUID()}.json`;
+  withFileLockSync(controlPath(dataDir), () => {
+    assertFeedbackAdmission(dataDir);
+    atomicWriteFileSync(join(directory, name), JSON.stringify({
+      processId, processStartId: identity, ...(ownership ?? {}),
+    }), { mode: 0o600, durable: true, followTargetSymlink: false });
+  });
+  return name;
+}
+export function acquireFeedbackSendLease(dataDir: string): () => void {
+  mkdirSync(dataDir, { recursive: true });
+  const identity = readDurableProcessIdentity(process.pid);
+  if (!identity) throw new Error('feedback_process_identity_unavailable');
+  const path = join(sendLeaseDirectory(dataDir), writeSendLease(dataDir, process.pid, identity));
+  return () => { try { unlinkSync(path); } catch {} };
+}
+
+/**
+ * Daemon-side lease for a session CLI that cannot take one itself: a macOS
+ * read-isolated `botmux send` can neither exec the setuid `ps` (its own birth
+ * identity) nor write the data dir (denied by the session's Seatbelt policy).
+ * The daemon runs outside the sandbox, so it reads the CLI's exact identity and
+ * writes the same lease the CLI would have written — inspection, liveness and
+ * acknowledgement stay unchanged. The CLI is blocked on this request, so the
+ * pid it reports cannot be recycled before the identity is read.
+ *
+ * Trust boundary: the caller passed `sessionCliIpcAuth` for `sessionId`. The
+ * worst it can do is keep a lease on another of its user's live processes,
+ * which delays a maintenance freeze until that process exits — something a
+ * non-isolated CLI can do by writing the lease directory directly. It can only
+ * release leases recorded for its own session and pid. Acquisition returns a
+ * separate high-entropy release credential; only its SHA-256 hash is persisted,
+ * so a later turn rotation, session close or daemon restart cannot strand a
+ * delivered send without its release path.
+ */
+export function acquireFeedbackSendLeaseFor(
+  dataDir: string,
+  input: { processId: number; sessionId: string },
+): { lease: string; releaseToken: string } {
+  if (!Number.isSafeInteger(input.processId) || input.processId < 2 || input.processId === process.pid || !input.sessionId) {
+    throw new Error('feedback_send_lease_invalid');
+  }
+  mkdirSync(dataDir, { recursive: true });
+  const identity = readDurableProcessIdentity(input.processId);
+  if (!identity) throw new Error('feedback_process_identity_unavailable');
+  const releaseToken = randomBytes(32).toString('base64url');
+  const releaseTokenHash = createHash('sha256').update(releaseToken).digest('hex');
+  const lease = writeSendLease(dataDir, input.processId, identity, { sessionId: input.sessionId, releaseTokenHash });
+  return { lease, releaseToken };
+}
+export function releaseFeedbackSendLeaseFor(
+  dataDir: string,
+  input: { lease: string; processId: number; sessionId: string; releaseToken: string },
+): void {
+  if (!Number.isSafeInteger(input.processId)
+    || !/^[A-Za-z0-9_-]{43}$/.test(input.releaseToken)
+    || !new RegExp(`^${input.processId}-[0-9a-f-]+\\.json$`).test(input.lease)) {
+    throw new Error('feedback_send_lease_invalid');
+  }
+  const path = join(sendLeaseDirectory(dataDir), input.lease);
+  let lease: { processId?: unknown; sessionId?: unknown; releaseTokenHash?: unknown };
+  try { lease = JSON.parse(readFileSync(path, 'utf8')); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw new Error('feedback_send_lease_invalid');
+  }
+  const storedHash = typeof lease.releaseTokenHash === 'string' && /^[a-f0-9]{64}$/.test(lease.releaseTokenHash)
+    ? Buffer.from(lease.releaseTokenHash, 'hex')
+    : undefined;
+  const actualHash = createHash('sha256').update(input.releaseToken).digest();
+  if (lease.processId !== input.processId || lease.sessionId !== input.sessionId
+    || !storedHash || !timingSafeEqual(storedHash, actualHash)) {
+    throw new Error('feedback_send_lease_not_owned');
+  }
+  try { unlinkSync(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+}
+export function writeFeedbackParticipant(dataDir: string, input: Omit<Participant, 'processId' | 'processStartId' | 'updatedAt'>): void {
+  const identity = readDurableProcessIdentity(process.pid);
+  if (!identity) throw new Error('feedback_process_identity_unavailable');
+  const directory = join(dataDir, 'feedback-participants');
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  atomicWriteFileSync(join(directory, `${process.pid}.json`), JSON.stringify({
+    ...input, processId: process.pid, processStartId: identity, updatedAt: Date.now(),
+  }), { mode: 0o600, durable: true, followTargetSymlink: false });
+}
+export function currentFeedbackMaintenance(dataDir: string): MaintenanceReport | undefined { return readControl(dataDir); }
+
+export function startFeedbackMaintenanceParticipant(
+  dataDir: string,
+  health: () => { busy: boolean; failed: number; pending: number },
+  stopOutbox: () => Promise<void>,
+  resumeOutbox: () => Promise<void>,
+): () => void {
+  let running = false;
+  let stoppedOutbox = false;
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      const config = await readFeedbackStorageConfig(dataDir);
+      const maintenance = readControl(dataDir);
+      const state = health();
+      let ready = false;
+      const blockers: string[] = [];
+      if (maintenance && maintenance.state !== 'complete') {
+        if (state.busy) blockers.push('active_turns');
+        if (state.pending) blockers.push('pending_terminal_writes');
+        if (state.failed) blockers.push('failed_terminal_writes');
+        if (!blockers.length) {
+          await stopOutbox();
+          stoppedOutbox = true;
+          // Lazy import keeps `pg` out of the daemon/send module-load graph.
+          const { closeFeedbackStorage, getFeedbackStorage } = await import('./feedback-storage.js');
+          await closeFeedbackStorage(dataDir);
+          if (config.generation !== maintenance.generation && config.active.backend !== 'sqlite') await getFeedbackStorage(dataDir);
+          ready = true;
+        }
+      } else if (stoppedOutbox) {
+        await resumeOutbox();
+        stoppedOutbox = false;
+      }
+      writeFeedbackParticipant(dataDir, { generation: config.generation, migrationId: maintenance?.migrationId, ready, blockers });
+    } catch {
+      writeFeedbackParticipant(dataDir, { generation: -1, ready: false, blockers: ['participant_check_failed'] });
+    } finally { running = false; }
+  };
+  const timer = setInterval(() => { void tick(); }, 500);
+  timer.unref();
+  void tick();
+  return () => clearInterval(timer);
+}
+
+export async function beginFeedbackMaintenance(dataDir: string, migrationId: string): Promise<MaintenanceReport> {
+  if (!/^[A-Za-z0-9_-]{1,100}$/.test(migrationId)) throw new Error('feedback_migration_id_invalid');
+  const config = await readFeedbackStorageConfig(dataDir);
+  return withFileLockSync(controlPath(dataDir), () => {
+    const existing = readControl(dataDir);
+    if (existing && existing.state !== 'complete') {
+      if (existing.migrationId !== migrationId) throw new Error('feedback_migration_conflict');
+      return existing;
+    }
+    const report: MaintenanceReport = { migrationId, state: 'draining', generation: config.generation, participants: [], blockers: [] };
+    writeControl(dataDir, report);
+    return report;
+  });
+}
+
+export async function inspectFeedbackMaintenance(dataDir: string, migrationId: string): Promise<MaintenanceReport> {
+  const state = readControl(dataDir);
+  if (!state || state.migrationId !== migrationId) throw new Error('feedback_migration_identity_conflict');
+  const blockers: string[] = [];
+  const participants: Participant[] = [];
+  const directory = join(dataDir, 'feedback-participants');
+  for (const name of existsSync(directory) ? readdirSync(directory) : []) {
+    // Ignore atomic-write rename intermediates (see inspectSendRecovery).
+    if (isAtomicWriteTempName(name)) continue;
+    let participant: Participant;
+    try { participant = JSON.parse(readFileSync(join(directory, name), 'utf8')); }
+    catch { throw new Error('feedback_participant_state_invalid'); }
+    const current = readDurableProcessIdentity(participant.processId);
+    if (!current || current !== participant.processStartId) continue;
+    participants.push(participant);
+    if (participant.migrationId !== migrationId || !participant.ready || Date.now() - participant.updatedAt > 10000) {
+      blockers.push(`participant_not_ready:${participant.processId}`);
+    }
+    blockers.push(...participant.blockers);
+  }
+  for (const lease of inspectSendRecovery(dataDir)) {
+    if (lease.live) blockers.push(`send_in_progress:${lease.processId}`);
+    else if (!lease.acknowledged) blockers.push(`send_outcome_unknown:${lease.processId}`);
+  }
+  const fleetPath = join(process.env.HOME ?? homedir(), '.botmux', 'fleet-state.json');
+  if (existsSync(fleetPath)) {
+    let fleet;
+    try { fleet = JSON.parse(readFileSync(fleetPath, 'utf8')); }
+    catch { throw new Error('feedback_fleet_state_invalid'); }
+    if (!Array.isArray(fleet.procs)) throw new Error('feedback_fleet_state_invalid');
+    for (const processState of fleet.procs) {
+      if (processState.name === 'botmux-dashboard' || processState.entry === 'dashboard' || processState.external || !processState.pid) continue;
+      const identity = readDurableProcessIdentity(processState.pid);
+      if (!identity) continue;
+      if (!participants.some(participant => participant.processId === processState.pid && participant.processStartId === identity)) {
+        blockers.push(`unsupported_daemon:${processState.pid}`);
+      }
+    }
+  }
+  return { ...state, participants, blockers, state: blockers.length ? 'blocked' : state.state };
+}
+
+async function source(dataDir: string): Promise<DatabaseSyncLike> {
+  const database = await openDatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
+  return database;
+}
+export async function freezeFeedbackSource(dataDir: string, migrationId: string): Promise<void> {
+  const config = await readFeedbackStorageConfig(dataDir);
+  const report = await inspectFeedbackMaintenance(dataDir, migrationId);
+  if (report.blockers.length) throw new Error(`feedback_maintenance_blocked:${report.blockers.join(',')}`);
+  const database = await source(dataDir);
+  try {
+    database.exec('BEGIN IMMEDIATE');
+    if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_outbox'").get()) {
+      const unsettled = database.prepare("SELECT * FROM feedback_outbox WHERE status='inflight' OR last_error LIKE 'webhook_outcome_unknown:%'").all() as Array<{
+        outbox_id: string; event_id: string; destination_id: string; last_error: string; status: string; attempts: number;
+      }>;
+      if (unsettled.some(row => row.status === 'inflight' || !recoveryAcknowledged(dataDir, webhookRecoveryFingerprint(config.instanceId, config.active, row)))) throw new Error('feedback_outbox_unsettled');
+    }
+    const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
+    if (version < 1 || version > 8) throw new Error('feedback_source_schema_unsupported');
+    const known = new Set<string>([...FEEDBACK_TABLES, 'feedback_source_guard', 'feedback_source_restorations', 'feedback_event_stream', 'feedback_event_stream_counter']);
+    const tables = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
+    if (tables.some(table => !known.has(table.name))) throw new Error('feedback_source_schema_unsupported');
+    if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_source_restorations'").get()
+      && database.prepare('SELECT 1 FROM feedback_source_restorations WHERE migration_id=?').get(migrationId)) {
+      throw new Error('feedback_migration_source_restored');
+    }
+    database.exec("CREATE TABLE IF NOT EXISTS feedback_source_guard(singleton INTEGER PRIMARY KEY CHECK(singleton=1),migration_id TEXT NOT NULL,state TEXT NOT NULL)");
+    const guard = database.prepare('SELECT * FROM feedback_source_guard WHERE singleton=1').get() as { migration_id: string; state: string } | undefined;
+    if (guard && guard.migration_id !== migrationId) throw new Error('feedback_migration_identity_conflict');
+    if (!guard) database.prepare("INSERT INTO feedback_source_guard VALUES(1,?,'frozen')").run(migrationId);
+    for (const table of FEEDBACK_TABLES) {
+      if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(table)) continue;
+      for (const action of ['INSERT', 'UPDATE', 'DELETE']) {
+        database.exec(`CREATE TRIGGER IF NOT EXISTS feedback_guard_${table}_${action.toLowerCase()} BEFORE ${action} ON ${table} BEGIN SELECT RAISE(ABORT,'feedback_source_frozen'); END`);
+      }
+    }
+    database.exec('COMMIT');
+    withFileLockSync(controlPath(dataDir), () => writeControl(dataDir, { ...report, state: 'frozen' }));
+  } catch (error) {
+    try { database.exec('ROLLBACK'); } catch {}
+    throw error;
+  } finally { database.close(); }
+}
+export async function retireFeedbackSource(dataDir: string, migrationId: string): Promise<void> {
+  const database = await source(dataDir);
+  try {
+    const result = database.prepare("UPDATE feedback_source_guard SET state='retired' WHERE singleton=1 AND migration_id=?").run(migrationId);
+    if (Number(result.changes) !== 1) throw new Error('feedback_migration_identity_conflict');
+  } finally { database.close(); }
+}
+export async function restoreFeedbackSource(dataDir: string, migrationId: string): Promise<void> {
+  const control = readControl(dataDir);
+  if (!control || control.migrationId !== migrationId) throw new Error('feedback_migration_identity_conflict');
+  if (!existsSync(join(dataDir, 'botmux-feedback.sqlite'))) {
+    if (control.state !== 'draining' && control.state !== 'complete') throw new Error('feedback_source_missing');
+    withFileLockSync(controlPath(dataDir), () => {
+      const current = readControl(dataDir);
+      if (!current || current.migrationId !== migrationId) throw new Error('feedback_migration_identity_conflict');
+      writeControl(dataDir, { ...current, state: 'complete' });
+    });
+    return;
+  }
+  const database = await source(dataDir);
+  try {
+    database.exec('BEGIN IMMEDIATE');
+    const hasGuard = database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_source_guard'").get();
+    const guard = hasGuard ? database.prepare('SELECT * FROM feedback_source_guard WHERE singleton=1').get() as { migration_id: string; state: string } | undefined : undefined;
+    if (guard && guard.migration_id !== migrationId) throw new Error('feedback_migration_identity_conflict');
+    if (guard?.state === 'retired') throw new Error('feedback_source_retired');
+    database.exec('CREATE TABLE IF NOT EXISTS feedback_source_restorations(migration_id TEXT PRIMARY KEY)');
+    database.prepare('INSERT OR IGNORE INTO feedback_source_restorations VALUES(?)').run(migrationId);
+    for (const table of FEEDBACK_TABLES) {
+      for (const action of ['insert', 'update', 'delete']) database.exec(`DROP TRIGGER IF EXISTS feedback_guard_${table}_${action}`);
+    }
+    if (hasGuard) database.exec('DELETE FROM feedback_source_guard');
+    database.exec('COMMIT');
+    withFileLockSync(controlPath(dataDir), () => {
+      const control = readControl(dataDir);
+      if (!control || control.migrationId !== migrationId) throw new Error('feedback_migration_identity_conflict');
+      writeControl(dataDir, { ...control, state: 'complete' });
+    });
+  } catch (error) { try { database.exec('ROLLBACK'); } catch {} throw error; }
+  finally { database.close(); }
+}
+export async function releaseFeedbackMaintenance(dataDir: string, migrationId: string, generation: number): Promise<void> {
+  const report = await inspectFeedbackMaintenance(dataDir, migrationId);
+  if (report.blockers.length || report.participants.some(participant => participant.generation !== generation)) {
+    throw new Error('feedback_maintenance_generation_pending');
+  }
+  withFileLockSync(controlPath(dataDir), () => writeControl(dataDir, { ...report, generation, state: 'complete' }));
+}
+
+export function cancelFeedbackMaintenance(dataDir: string, migrationId: string, generation: number): void {
+  withFileLockSync(controlPath(dataDir), () => {
+    const control = readControl(dataDir);
+    if (!control || control.migrationId !== migrationId || control.generation !== generation) throw new Error('feedback_migration_identity_conflict');
+    writeControl(dataDir, { ...control, state: 'complete' });
+  });
+}

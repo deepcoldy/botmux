@@ -1,11 +1,14 @@
+import type { TurnSpeaker } from './turn-speakers.js';
 import type { ChildProcess } from 'node:child_process';
 import type {
   CodexAppTurnInput,
   CliTurnPayload,
+  AcceptedCommandInput,
   ChatContext,
   CotEntry,
   Session,
   DaemonToWorker,
+  WorkerToDaemon,
   LarkAttachment,
   LarkMention,
   ModelFallbackState,
@@ -102,7 +105,9 @@ export interface DaemonSession {
   workerReady?: boolean;
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
-   *  `claude_exit` / worker retirement. Deliberately NOT cleared by the
+   *  `claude_exit` / worker retirement, and when a MiniMax compact card request
+   *  is accepted for delivery. A false value can therefore also mean a pending
+   *  or in-flight compact on a live worker. Deliberately NOT cleared by the
    *  worker's `ready` IPC: `prompt_ready` frequently arrives BEFORE `ready`
    *  (riff / mojo synthesize the first one inside spawnCli, fast TUIs under
    *  Herdr do too), so clearing on `ready` would erase a just-set value.
@@ -146,9 +151,25 @@ export interface DaemonSession {
     credentialIsolated: boolean;
     cliPid?: number;
     cliProcStart?: string;
+    /** Actual running executable image (Linux `/proc/<pid>/exe`). Absent when
+     * unknown; an unknown identity never authorizes an automatic reclaim. */
+    cliExe?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Install entry the worker's adapter resolved at spawn. */
+    cliInstallEntry?: string;
+    /** What `cliInstallEntry` resolved to right before this CLI spawn. Only a
+     *  process whose `cliExe` is this very object was launched from the entry. */
+    cliInstallAtSpawn?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Worker-local CLI spawn counter that produced `cliExe`. */
+    cliSpawnGeneration?: number;
     enginePid?: number;
     engineProcStart?: string;
     workerGeneration?: number;
+  };
+  /** Per-worker-generation HMAC key for the protected local-service proxy.
+   * It exists only in daemon/worker memory and crosses only their private IPC. */
+  protectedLoopbackProxyAttestation?: {
+    secret: string;
+    workerGeneration: number;
   };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
@@ -187,6 +208,17 @@ export interface DaemonSession {
   /** Epoch ms of the last HUMAN input routed here (see Session.lastHumanMessageAt). */
   lastHumanMessageAt?: number;
   hasHistory: boolean;   // true after CLI has run at least once for this session
+  /**
+   * This session already received its ONE "resume fell back to a fresh
+   * session" notice.
+   *
+   * Daemon-side on purpose: `/restart` forks a new worker, so a worker-level
+   * latch would re-post the notice on every restart. The worker reports the
+   * demotion fact each time (and the daemon logs every report); only the
+   * user-visible notice is spent once. In-memory only — a daemon restart is a
+   * new conversation surface as far as this once-per-session courtesy goes.
+   */
+  resumeFreshFallbackNotified?: boolean;
   workingDir?: string;
   initConfig?: Extract<DaemonToWorker, { type: 'init' }>;   // stored for restart
   /**
@@ -243,6 +275,8 @@ export interface DaemonSession {
    *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
    *  re-fork of the same session launches identically. */
   spawnModelOverride?: string;
+  /** Formerly pinned workers must also clear their effort launch snapshot. */
+  modelPinCleared?: boolean;
   /** True while this session's worker sits in the crash-loop park state: its CLI
    *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
    *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with
@@ -320,6 +354,7 @@ export interface DaemonSession {
    * selection delays the first turn. The legacy enriched prompt remains the
    * compatibility source for every other CLI. */
   pendingCodexAppText?: string;
+  pendingAcceptedInput?: AcceptedCommandInput;
   /** Trusted, Botmux-authored instructions held out of the visible Codex App
    * user message while the first turn waits for repo selection/worktree setup. */
   pendingCodexAppApplicationContext?: string;
@@ -378,6 +413,7 @@ export interface DaemonSession {
    *  mixed callers so the combined prompt fails closed instead of borrowing. */
   pendingFollowUpTurnId?: string;
   pendingFollowUpTurnIds?: string[];   // matching inbound ids; last id attributes a folded buffered batch
+  pendingStructuredOpeningTurnId?: string;
   pendingCodexAppFollowUps?: string[]; // matching raw user texts for clean Codex App materialization
   pendingCodexAppFollowUpContexts?: string[]; // matching metadata-only context; never duplicates the raw follow-up text
   /** Arrival-time clean-input decisions matching pendingCodexAppFollowUps.
@@ -389,6 +425,9 @@ export interface DaemonSession {
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
+  /** Whether the streaming card's terminal-key grid is expanded. Daemon-owned
+   *  and carried through every card PATCH so streaming refreshes keep it open. */
+  keysPanelOpen?: boolean;
   /** Visible Lark destination of the live streaming card. Unlike
    * currentReplyTarget this remains bound to the card after a newer turn is
    * accepted, so parking cannot attribute the predecessor to the new topic. */
@@ -438,6 +477,11 @@ export interface DaemonSession {
    *  never recorded; its settlement reports the run instead of closing it
    *  quietly. In-memory: a restart closes unmaterialized hidden runs anyway. */
   deferredScheduleUndeliveredTurnId?: string;
+  /** The turn a task-position hidden run was re-fired to before it materialized,
+   *  until a worker frame carries that id. Until then an unattributed frame may
+   *  be the previous turn's tail and must not settle the new turn. In-memory,
+   *  like deferredScheduleUndeliveredTurnId. */
+  deferredScheduleUnconfirmedTurnId?: string;
   /** Turn-exact ids for loud external triggers whose connector opted into
    *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
    *  (the streaming card / start notice still show); keyed on the trigger turn
@@ -465,14 +509,26 @@ export interface DaemonSession {
   /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
   turnReceivedAtMs?: Map<string, number>;
   /** Native write observations, scoped to the worker generation and exact attempt. */
-  replyExecutionStarts?: Map<string, { startedAtMs: number; workerGeneration: number }>;
+  replyExecutionStarts?: Map<string, {
+    startedAtMs: number; workerGeneration: number;
+    /** Exact terminal observed; retain timing for reply rendering, suppress reminders. */
+    completed?: boolean;
+    stage?: 'model_output' | 'tool_started' | 'tool_returned';
+    lastProgressAtMs?: number;
+    /** Ephemeral Dashboard publication throttle, scoped to this exact turn. */
+    lastDashboardPublishedAtMs?: number;
+  }>;
+  /** Bounded terminal facts keyed by worker generation, turn and exact attempt.
+   * Values are receipt epoch milliseconds, also fencing older legacy starts
+   * when a compatibility terminal omitted its attempt before any start arrived. */
+  replyExecutionTerminals?: Map<string, number>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
    *  batched messages each get their own reaction). Every pending ✋ here is
    *  flipped to ✅ when the turn returns to idle. In-memory only (a daemon
    *  restart mid-turn just leaves a stale ✋ — purely cosmetic). */
-  pendingAckReactions?: Array<{ messageId: string; reactionId?: string }>;
+  pendingAckReactions?: Array<{ messageId: string; reactionId?: string; turnId?: string }>;
   /** Card body display mode. Default 'hidden'. When user clicks 显示输出, defaults to 'screenshot'. */
   displayMode?: DisplayMode;
   /** Latest uploaded screenshot image_key for the streaming card. */
@@ -533,6 +589,23 @@ export interface DaemonSession {
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
    *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
+  /** Wall-clock of the most recent `turn_terminal` observed for this session,
+   *  and the turn it named. The terminal edge is the daemon's authority that a
+   *  turn is over, so these drive the post-terminal display settle (see
+   *  schedulePostTerminalStatusSettle) and the periodic stale-card self-heal.
+   *  In-memory only. */
+  lastTurnTerminalAt?: number;
+  lastTurnTerminalTurnId?: string;
+  lastTurnTerminalDispatchAttempt?: number;
+  /** Wall-clock of the first genuine LIVE-work signal observed after the last
+   *  completed terminal, when that work has no managed turn of its own (Web
+   *  Terminal / sandbox direct-submit). Managed turns and retry attempts are
+   *  recognized via currentTurnId / the dispatch high-water instead. This epoch
+   *  keeps the post-terminal settle and self-heal from re-idling a card that a
+   *  direct-submit episode legitimately put back to work. Reset on every
+   *  turn_terminal so a fresh post-terminal window starts clean. In-memory only. */
+  postTerminalLiveWorkAt?: number;
+  lastTurnTerminalStatus?: Extract<import('../types.js').WorkerToDaemon, { type: 'turn_terminal' }>['status'];
   /**
    * Timestamp (ms) since which the session has CONTINUOUSLY been `idle`
    * (stamped on the non-idle → idle edge, cleared on any other status). Drives
@@ -545,6 +618,35 @@ export interface DaemonSession {
    *  (core/prompt-cache-keepalive.ts). In-memory only; cleared by any real
    *  turn or busy edge that is not a keep-alive. */
   promptCacheKeepalive?: import('../services/prompt-cache-policy.js').PromptCacheKeepaliveState;
+  /** Idle auto-compact topic notice waiting for the next sweep tick: posted
+   *  only once the compact's own busy→idle edge (or the worker's refusal) is
+   *  seen, so the topic never claims a compact that did not run
+   *  (core/idle-auto-compact.ts). In-memory only. */
+  idleAutoCompactPendingNotice?: import('./idle-auto-compact.js').IdleAutoCompactPendingNotice;
+  /** TurnId of the idle auto-compact this process itself dispatched. In-memory
+   *  ONLY (never persisted): a marker inherited from a restarted daemon folded
+   *  as handled must not be announced as a successful compact, because this
+   *  process never saw it run. Cleared on the finishing edge / terminal. */
+  idleAutoCompactDispatchedTurnId?: string;
+  /** Start of the current warm idle stretch for idle auto-compact: the idle
+   *  edge that followed the last botmux turn (core/idle-auto-compact.ts).
+   *  Undefined = no stretch is known to follow a model request (cold). Tracked
+   *  while the feature is off too. In-memory; mirrored to the row while on. */
+  idleAutoCompactWarmSince?: number;
+  /** A botmux turn started and its idle edge has not been seen yet
+   *  (core/idle-auto-compact.ts). In-memory; mirrored to the row while on. */
+  idleAutoCompactArm?: import('./idle-auto-compact.js').IdleAutoCompactArm;
+  /** Non-keep-alive busy observed before this idle compact settles. This
+   *  in-memory witness survives session-store's durable-row rollback on a
+   *  failed save; the persisted inFlight flag is the restart-safe counterpart. */
+  idleAutoCompactBusyBeforeSettledTurnId?: string;
+  /** Completed terminal observed for this idle compact. Kept after settlement
+   *  so a durable-row rollback cannot split warm/notice state from the row or
+   *  allow a later duplicate compact. In-memory only; reconciled before sweep. */
+  idleAutoCompactCompletedTurnId?: string;
+  /** A locally answered CLI turn whose own busy repaint must not cancel an
+   *  idle-compact retry. In-memory only; cleared by its terminal or idle edge. */
+  idleAutoCompactLocalTurn?: { turnId: string; since: number };
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
@@ -581,6 +683,7 @@ export interface DaemonSession {
   messageListenerCompletedTurnId?: string;
   /** Actual input-committed turn for the managed reply card's Stop control. */
   replyCardRunningTurnId?: string;
+  codexAppInterruptTarget?: Extract<WorkerToDaemon, { type: 'codex_app_interrupt_target' }>['target'];
   /**
    * Authenticated human principal that owns the currently executing interactive
    * turn. Set only after a worker accepts the turn and cleared by its exact
@@ -604,6 +707,11 @@ export interface DaemonSession {
    * daemon-minted schedule turn id and never persisted. The worker can name a
    * turn id but cannot add or change the identity behind it. */
   scheduledTurnCallers?: Map<string, TrustedCaller>;
+  /** Exact-turn controller identity exposed only to tool credential publication
+   * and `botmux actor current` for a bounded schedule child. Unlike
+   * scheduledTurnCallers, this does not authorize workflow or schedule
+   * mutations and is never persisted. */
+  scheduledToolActors?: Map<string, { openId: string; unionId: string }>;
   /** Exact principal-lane turn/generation that still owns the worker until a
    * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
    * the worker's earlier managed-origin revoke must not clear this FIFO fence,
@@ -657,8 +765,35 @@ export interface DaemonSession {
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */
   activeModel?: string;
+  /** True when `activeModel` was only re-seeded from pre-spawn transcript/DB
+   *  history (not a live post-spawn turn), so statusline validation prefers the
+   *  new launch model over the historical seed. */
+  activeModelFromSeed?: boolean;
+  /** Floor timestamp (ms) for accepting on-disk statusline quota snapshots:
+   *  advanced when launch model or CLI launch generation changes so a
+   *  pre-switch snapshot cannot bleed into the new launch. */
+  statuslineNotBeforeMs?: number;
+  /** Expected per-spawn statusline generation token (`BOTMUX_STATUSLINE_GEN`)
+   *  for the current CLI process; rejects late writes from a dying prior CLI. */
+  statuslineLaunchGen?: string;
+  /** True after a launch-model / CLI restart invalidation until the new
+   *  generation publishes a fresh live `activeModel`, so statusline model
+   *  checks compare against the new launch model instead of a pre-restart `activeModel`. */
+  statuslineActiveModelStale?: boolean;
+  /** State captured before a speculative launch generation is assigned. A real
+   * fresh-spawn attestation discards it; a folded restart or warm reattach
+   * restores the last attested generation and time/model fences instead of
+   * clearing them. */
+  statuslineLaunchFenceRollback?: {
+    launchGen?: string;
+    notBeforeMs?: number;
+    activeModelStale?: boolean;
+    activeModelFromSeed?: boolean;
+  };
   /** Latest reasoning effort reported by the live executor. */
   activeReasoningEffort?: string;
+  /** Native current selection, separate from the last executed turn_context. */
+  nativeReasoningObservation?: import('../services/native-reasoning-observation.js').NativeReasoningObservation & { workerGeneration: number };
   /** A confirmed native-menu preference awaiting its first new turn. */
   codexCliEffortConfirmed?: { effort: string; workerGeneration?: number };
   /** Undefined means no observation; null means native/default context. */
@@ -688,6 +823,49 @@ export interface DaemonSession {
    *  read-isolation switch suspended first) survives into the NEXT generation
    *  and suspends it on its first idle. See clearPendingSuspendClaim. */
   pendingSuspendGeneration?: number;
+  /** Exact running CLI an install-change reclaim was requested for. The claim
+   *  is re-validated immediately before the suspend: an in-worker CLI restart
+   *  (same worker generation, new spawn), a reverted install entry, or an
+   *  unprovable identity must not consume it against the replacement.
+   *  In-memory only, like the queued suspend it belongs to. */
+  pendingSuspendInstallClaim?: {
+    entry: string;
+    running: import('../services/cli-install-identity.js').ExecutableIdentity;
+    installAtSpawn: import('../services/cli-install-identity.js').ExecutableIdentity;
+    workerGeneration: number;
+    cliSpawnGeneration?: number;
+    cliPid?: number;
+    cliProcStart?: string;
+  };
+  /** Turns a live worker has ACCEPTED but not yet finished, keyed by
+   *  `turnId + dispatchAttempt`. `turn_input_committed` only proves the worker
+   *  queue took ownership — the native PTY flush is asynchronous and the turn
+   *  has not run yet. Keeping this responsibility until the EXACT execution
+   *  reaches a terminal/rejection stops an install-change reclaim from
+   *  destroying accepted work while the screen still shows a cached idle.
+   *  Cleared when the worker generation ends. */
+  acceptedInputTurns?: Map<string, {
+    workerGeneration: number;
+    turnId: string;
+    dispatchAttempt?: number;
+    phase: 'queue-commit' | 'native-submit';
+    at: number;
+  }>;
+  /** Executions that already reached a terminal/rejection in this generation,
+   *  keyed the same way. The worker deliberately re-ACKs a committed duplicate
+   *  (`worker.ts` re-sends `turn_input_committed` without re-queueing), so a
+   *  late duplicate ACK is a transport retry, not new work: it must not revive
+   *  an obligation that will never terminal again. Bounded LRU of settled
+   *  dedupe facts only — never an unresolved obligation. */
+  settledInputTurns?: Map<string, number>;
+  /** Key (in acceptedInputTurns) of the input this generation accepted last.
+   *  The idle reclaim hold waits on that turn only: an earlier one that never
+   *  reported a terminal is over once a later input was accepted. */
+  latestAcceptedInputKey?: string;
+  /** Conservative overflow latch. When more unresolved obligations exist than
+   *  the ledger tracks, an automatic reclaim stays blocked for the rest of the
+   *  generation instead of silently dropping an unresolved obligation. */
+  acceptedInputOverflow?: boolean;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */
@@ -718,6 +896,9 @@ export interface DaemonSession {
     taskId?: string | null;
   };
   usageLimit?: CliUsageLimitState;
+  antigravityQuotaHistory?: readonly CliUsageLimitState[];
+  /** A failed persistence must be retried even if the next frame is identical. */
+  usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;
   /** Latch for the proactive rate/usage-limit owner notification: the
    *  usageLimitStateKey of the limit episode we already posted about. Exactly
@@ -729,15 +910,40 @@ export interface DaemonSession {
    * target lookup from posting after this episode cleared and a same-key later
    * episode started. Cross-session duplicate events use a daemon-wide TTL. */
   quotaFallbackAttemptToken?: string;
+  /** Host-managed Antigravity account alias active when this session's CLI spawned. */
+  antigravityAccountId?: string;
+  /** In-flight and per-turn state for Antigravity quota-limit auto-rotation. */
+  antigravityRotation?: import('./antigravity-rotation.js').AntigravitySessionRotationState;
   /** Interval that re-PATCHes the live streaming card with fresh Context/Token
    *  usage while a turn is executing (streaming display mode). Armed on the
    *  working edge, cleared on idle/turn-end/card removal. */
   usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
+  lastCliInputTurnId?: string;
+  /** Inputs sent with a failed-turn rewind directive, until the worker says
+   *  whether it cut the failed turn (`failed_turn_rewind`). Keyed by the
+   *  input's turn id; bounded, in-memory (a dead worker never reports). */
+  pendingFailedTurnRewinds?: Map<string, {
+    failedTurnId: string;
+    mode: 'merge' | 'resend';
+    content: string;
+    failedUserPrompt: string;
+    /** The worker process that was asked; another one never answers. */
+    worker: DaemonSession['worker'];
+  }>;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
+  /** Lark turns that a still-running Claude background task was launched
+   *  from, as last reported by THIS worker generation
+   *  (`background_task_pins_sync`). Their replyTargets records are exempt from
+   *  eviction like a live CronCreate task's (see replyTargetPinnedTurnIds), so
+   *  the task's wake answer still finds its topic after many newer turns.
+   *  In-memory only and cleared when the worker exits: the anchors live in
+   *  the worker's memory, so a new worker never forwards an older one's wake. */
+  backgroundTaskPinnedTurnIds?: readonly string[];
   /** One-shot runtime flag set by the daemon when creating a substitute
    *  (分身) session. The worker-pool consumes and clears it once the worker
    *  reports ready, triggering a one-time substitute control card post so the
@@ -757,7 +963,7 @@ export interface DaemonSession {
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
-  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void; createdAt?: number }>;
   /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
   settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads
@@ -771,6 +977,11 @@ export interface DaemonSession {
     content?: string;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
+    /** In memory only (never in the durable async store): the provider's raw
+     *  error text and the screen tail the worker's failed terminal carried,
+     *  masked and clipped (services/turn-failure-diagnostics). */
+    terminalErrorDetail?: string;
+    terminalScreenTail?: string;
     interruptedAt?: number;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
@@ -825,6 +1036,9 @@ export interface DaemonSession {
     identityTurnId?: string;
     dispatchAttempt?: number;
     trustedCaller?: TrustedCaller | null;
+    /** Humans whose messages are in the running turn, in order of their latest
+     * message (the last one spoke last). Worker-reported, never CLI-supplied. */
+    speakers?: TurnSpeaker[];
     /** Admission-frozen LinkRef mode. Absence is the byte-compatible disabled mode. */
     linkRefMode?: 'observe' | 'enabled';
     /** Current human caller, carried over private worker IPC from the
@@ -912,6 +1126,11 @@ export interface DaemonSession {
    *  Forwarded back to the worker in tui_keys so it can verify the backend
    *  hasn't been replaced within the same worker process. */
   stuckWarningCliLifetime?: number;
+  /** Turn initiator frozen when the active stuck-warning card was posted
+   *  (same rule as the recovery-retry card: daemon-authenticated caller or a
+   *  reply-registry entry proving a human sender). They may press the card's
+   *  `initiator` keys; undefined = operators only. */
+  stuckWarningInitiatorOpenId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;
@@ -923,8 +1142,12 @@ export interface DaemonSession {
    *  Cleared when the user next replies to the session or when the session
    *  closes. Distinct from tuiPromptCardId (which is a
    *  rendered TUI menu detected by screen-analyzer) — this is deliberate,
-   *  agent-initiated, and carries no rendered options. */
-  agentAttention?: { kind: string; reason: string; at: number };
+   *  agent-initiated, and carries no rendered options. `source: 'agent'` marks
+   *  the agent's own raise; daemon-raised failure notices leave it unset. */
+  agentAttention?: { kind: string; reason: string; at: number; source?: 'agent' };
+  /** Start of the current busy stretch (edge into starting/working/analyzing/
+   *  active). A prompt-cache keep-alive's own busy period is not stamped. */
+  busySinceAt?: number;
   /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput

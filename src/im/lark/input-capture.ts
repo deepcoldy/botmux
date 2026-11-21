@@ -8,7 +8,8 @@ import type { CaptureAttachment } from '../../core/plugins/input-capture/attachm
  * command / callback routing stays with the existing dispatcher. Attachments
  * enter only explicitly subscribed bindings, as durable resource references. */
 export function captureInboundText(data: any, runtime: InputCaptureRuntime,
-  knownBot: (openId: string) => boolean): boolean {
+  knownBot: (openId: string) => boolean,
+  p2pReplyFoldsToChat: (chatId: string, rootId: string) => boolean = () => false): boolean {
   const message = data?.message;
   if (data?.sender?.sender_type !== 'user' || !message || !['text', 'post', 'image', 'file', 'audio', 'media', 'merge_forward'].includes(message.message_type)
     || (message.root_id && !/^om_[A-Za-z0-9_-]+$/.test(message.root_id))
@@ -45,7 +46,16 @@ export function captureInboundText(data: any, runtime: InputCaptureRuntime,
     messageId: parsed.messageId, chatId: message.chat_id, senderOpenId: parsed.senderId, threadId: message.thread_id,
   }) : message.chat_id);
   if (!anchor) return false;
-  return runtime.capture({ messageId: parsed.messageId, chatId: message.chat_id,
-    anchor, senderOpenId: parsed.senderId, ...(message.thread_id ? { threadId: message.thread_id } : {}),
-    memberUnionId: parsed.senderUnionId, text, ...(attachments.length ? { attachments } : {}), botSender: false });
+  const input = { messageId: parsed.messageId, chatId: message.chat_id, senderOpenId: parsed.senderId,
+    memberUnionId: parsed.senderUnionId, text, ...(attachments.length ? { attachments } : {}), botSender: false };
+  if (runtime.capture({ ...input, ...(message.thread_id ? { threadId: message.thread_id } : {}), anchor })) return true;
+  // Lark's quote bubble sets root_id without thread_id. Routing treats such a message as top-level
+  // (decideRouting), so when no binding claims the quoted message itself, a chat-anchored binding
+  // gets it — otherwise a quote-reply in a captured chat would fall through to the bound session.
+  // A DM reply also carries thread_id, but p2p chat mode routes it to the chat session as well.
+  if (message.root_id && anchor !== message.chat_id && (!message.thread_id
+    || message.chat_type === 'p2p' && p2pReplyFoldsToChat(message.chat_id, message.root_id))) {
+    return runtime.capture({ ...input, anchor: message.chat_id });
+  }
+  return false;
 }

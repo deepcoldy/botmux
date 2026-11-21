@@ -1,3 +1,6 @@
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -18,6 +21,7 @@ const params = {
   id: 'task', name: 'Daily report', schedule: '0 12 * * *',
   parsed: { kind: 'cron' as const, expr: '0 12 * * *', display: 'daily' },
   prompt: 'Report public news', workingDir: '/workspace', chatId: 'oc_test', larkAppId: app,
+  owner: { kind: 'ownerless' as const },
 };
 
 beforeEach(() => {

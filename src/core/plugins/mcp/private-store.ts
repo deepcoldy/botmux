@@ -22,6 +22,8 @@ import type {
   PluginMcpContribution,
   PluginMcpServer,
 } from '../types.js';
+import { isValidProtectedMcpCapabilityId } from '../../protected-mcp-capabilities.js';
+import { normalizeProtectedHttpEgressPolicy } from '../../protected-http-egress.js';
 
 export const PLUGIN_MCP_PRIVATE_REF = 'private/mcp.json';
 
@@ -51,9 +53,14 @@ export function isPluginMcpServer(value: unknown): value is PluginMcpServer {
     return Array.isArray(server.command)
       && server.command.length > 0
       && server.command.every(part => typeof part === 'string' && part.length > 0)
-      && (server.env === undefined || isStringRecord(server.env));
+      && (server.env === undefined || isStringRecord(server.env))
+      && (server.protectedCapability === undefined
+        || isValidProtectedMcpCapabilityId(server.protectedCapability))
+      && (server.protectedEgressPolicy === undefined
+        || normalizeProtectedHttpEgressPolicy(server.protectedEgressPolicy) !== undefined);
   }
   if (server.transport === 'streamable-http') {
+    if (server.protectedCapability !== undefined || server.protectedEgressPolicy !== undefined) return false;
     if (typeof server.url !== 'string' || !server.url) return false;
     try {
       const protocol = new URL(server.url).protocol;
@@ -69,7 +76,11 @@ export function isPluginMcpServer(value: unknown): value is PluginMcpServer {
 export function isPluginMcpContribution(value: unknown): value is PluginMcpContribution {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const entry = value as Record<string, unknown>;
-  return typeof entry.name === 'string'
+  return Object.keys(entry).length === 3
+    && Object.hasOwn(entry, 'name')
+    && Object.hasOwn(entry, 'transport')
+    && Object.hasOwn(entry, 'privateRef')
+    && typeof entry.name === 'string'
     && !!entry.name
     && (entry.transport === 'stdio' || entry.transport === 'streamable-http')
     && entry.privateRef === PLUGIN_MCP_PRIVATE_REF;

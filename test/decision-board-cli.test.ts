@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { BOARD_ACTIONS, formatBoardResult, parseBoardArgs, readBoardAttachFiles } from '../src/cli/board-command.js';
 import { stewardGuidePreset } from '../src/core/decision-board/model.js';
+import { validateMentionDecision } from '../src/services/send-policy.js';
 
 function parsed(argv: string[]) {
   const r = parseBoardArgs(argv);
@@ -83,6 +84,40 @@ describe('parseBoardArgs', () => {
         const argv = [...add.matchAll(/"([^"]*)"|(\S+)/g)].map(m => m[1] ?? m[2]!).slice(2);
         const res = parseBoardArgs(argv) as { parsed: { request: { links?: string[]; noChat?: string } } };
         expect(res.parsed.request.links?.some(l => l.startsWith('chat=')) || res.parsed.request.noChat, `${locale}: ${add}`).toBeTruthy();
+      }
+    }
+  });
+
+  it('guide 里 botmux send 示例都过得了 @ 决策门禁：巡检节是定时回合、没有触发发送者，--mention-back 必被拒', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const sections = stewardGuidePreset(locale).split(/^## /m);
+      for (const section of sections) {
+        const isPatrol = /定时巡检|Scheduled patrol/.test(section.split('\n')[0] ?? '');
+        const commands = [...section.matchAll(/`(botmux send [^`]+)`/g)].map(m => m[1]!);
+        for (const command of commands) {
+          const flags = [...command.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g)].map(m => m[1] ?? m[2] ?? m[3]!).slice(2);
+          // 真人回合（「要 owner 拍板」等）有触发消息发送者；巡检是 --silent 定时
+          // chat 级回合，daemon 不发 banner、不播种 reply-target，没有可 @ 回的人。
+          const decision = validateMentionDecision({
+            enabled: true,
+            sendTopLevel: flags.includes('--top-level'),
+            hasMentionArgs: flags.includes('--mention'),
+            mentionBack: flags.includes('--mention-back'),
+            noMention: flags.includes('--no-mention'),
+            hasQuoteTargetSender: !isPatrol,
+          });
+          expect(decision.ok, `${locale} ${isPatrol ? 'patrol' : 'human'}: ${command}\n${decision.error ?? ''}`).toBe(true);
+        }
+      }
+      // 巡检节必须真有一条 decision 上报；它用哪种合法写法（--no-mention 或显式
+      // --mention）由上面的真实门禁校验，这里只钉硬不变量：定时回合没有触发发送者，
+      // 巡检节不能出现 --mention-back（它在这种回合确定性 exit 2）。
+      const patrol = sections.find(s => /定时巡检|Scheduled patrol/.test(s.split('\n')[0] ?? ''));
+      expect(patrol, `${locale}: guide 缺巡检节`).toBeTruthy();
+      const patrolDecisionSends = [...patrol!.matchAll(/`(botmux send [^`]*--attention=decision[^`]*)`/g)].map(m => m[1]!);
+      expect(patrolDecisionSends.length).toBeGreaterThan(0);
+      for (const command of patrolDecisionSends) {
+        expect(command).not.toContain('--mention-back');
       }
     }
   });

@@ -21,6 +21,15 @@ export function productionFunction(path: string, name: string, scope: Record<str
   if (!declaration) throw new Error(`Missing function ${name}`);
   return evaluate(declaration.getText(file), scope);
 }
+export function productionConst(path: string, name: string, scope: Record<string, any>): any {
+  const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
+  for (const statement of file.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    const declaration = statement.declarationList.declarations.find(d => d.name.getText(file) === name);
+    if (declaration?.initializer) return evaluate(declaration.initializer.getText(file), scope);
+  }
+  throw new Error(`Missing const ${name}`);
+}
 export function delivery(scope: Record<string, any>): any {
   const path = 'src/daemon.ts';
   const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
@@ -48,18 +57,7 @@ export function deliveryIsCurrent(scope: Record<string, any>): any {
   const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
   let expression: ts.Expression | undefined;
   function visit(node: ts.Node): void {
-    if (ts.isCallExpression(node) && node.expression.getText(file) === 'deliverCodexAsyncAnswer') {
-      let parent: ts.Node | undefined = node.parent;
-      while (parent && !ts.isBlock(parent)) parent = parent.parent;
-      if (parent && ts.isBlock(parent)) {
-        for (const statement of parent.statements) {
-          if (!ts.isVariableStatement(statement)) continue;
-          for (const declaration of statement.declarationList.declarations) {
-            if (declaration.name.getText(file) === 'isCurrent') expression = declaration.initializer;
-          }
-        }
-      }
-    }
+    if (ts.isVariableDeclaration(node) && node.name.getText(file) === 'isAsyncAskCurrent') expression = node.initializer;
     ts.forEachChild(node, visit);
   }
   visit(file);

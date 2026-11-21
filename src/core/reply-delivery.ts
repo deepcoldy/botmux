@@ -6,91 +6,84 @@
  *
  * - `send`：模型必须自己 `botmux send`，系统提示与每轮 reminder 都这么要求。
  * - `transcript`：daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡
- *   （bridge fallback 升为主通道）；系统提示不再提及 `botmux send`、不注入每轮
+ *   （bridge fallback 升为主通道）；系统提示只把 `botmux send` 留给最终回复带不了
+ *   的事（@ 别的 bot 协作/回报、附件或卡片、发到别的群或话题），不注入每轮
  *   reminder；solo 会话去掉 `<user_message>` 壳与 `<sender/>`。
  *
- * 缺省值统一是 `send`（`defaultReplyDeliveryFor`），与上游一致；bots.json 显式写
- * `transcript` 才切换，写 `send` 亦持久化。所有判定 fail-closed：
- * 拿不准就回到 `send` / 非 solo。
+ * 缺省按 CLI 能力区分（`defaultReplyDeliveryFor`）：有转写采集通道的 CLI 缺省
+ * `transcript`，其余缺省 `send`；bots.json 显式写 `transcript` / `send` 都覆盖缺省。
+ * 所有判定 fail-closed：拿不准就回到 `send` / 非 solo。
  */
 import { getBot, getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
-import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 import { logger } from '../utils/logger.js';
 import { zeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
-import { isScratchSandbox, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
+import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
+import { supportsTranscriptReplyDeliveryForBot, supportsZeroPromptInjection, type ZeroPromptSandboxValue } from './zero-prompt-support.js';
 
 export type ReplyDelivery = 'send' | 'transcript';
 
-/** claude-code 走 `claudeDataDir` 转写桥（worker.ts bridge fallback），其余按
- *  结构化转写白名单（codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok/cursor）。
- *  antigravity 只有零注入转写，不算；codex-app 天然是转写模式，不需要本开关。 */
-export { supportsTranscriptReplyDelivery };
+/** 能力判据在 zero-prompt-support（无 bot-registry 依赖的叶子模块）实现，这里原样
+ *  转出：daemon / worker-pool / dashboard / 测试的既有导入路径不变，且 config 写盘
+ *  不变量可以直接用叶子模块而不必经本文件绕回 bot-registry 形成 import 环。 */
+export { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
+export { supportsTranscriptReplyDeliveryForBot } from './zero-prompt-support.js';
+export type { TranscriptDeliveryCapabilityOpts } from './zero-prompt-support.js';
 
 /**
- * 未显式配置时的缺省投递方式：**一律 `send`**，与上游行为逐字节一致——模型仍被
- * 教「botmux send」，最终回复由它自己发。
+ * 未显式配置时的缺省投递方式：CLI 有转写采集通道（`supportsTranscriptReplyDelivery`：
+ * claude-code 与 structured bridge ALWAYS 集合）就缺省 `transcript`，否则 `send`。
  *
- * `transcript` 是 opt-in：它改的不只是投递路径，还会改写系统提示、去掉逐轮
- * `<botmux_reminder>`、并让 solo 会话的信封去壳，且 `/adopt` 不再把这类会话识别
- * 为本 bot 自产。这些都是对既有会话可感知的变化，不该由升级顺带发生，所以交给
- * 使用者在 bots.json 或 dashboard 上显式打开。
+ * 为什么缺省 transcript：send 模式要求模型每轮自己 `botmux send`，部分模型（典型是
+ * GPT 系）会把进度、阶段结论、最终答复都 send 一遍，群里被频繁打扰；transcript 下
+ * 最终答复由 daemon 从转写取、只发一张卡，`botmux send` 退回到协作与附件这类最终
+ * 回复带不了的场景。
  *
- * 保留 `cliId` 形参而不直接写死常量：缺省策略的唯一出口就在这里，将来若要为某个
- * CLI 单独换缺省，只改这一个函数即可，不必回头翻所有调用点。
+ * 只按 CLI 判，不看沙盒：cursor / doubao 在 scratch 沙盒下采集不到，这一层仍返回
+ * `transcript`，由 `effectiveReplyDelivery` 在运行时按沙盒回落 `send`（缺省值回落
+ * 不告警，只有显式配置的 transcript 回落才告警）。Dashboard 的「当前 CLI 缺省」
+ * 展示也取这里，与沙盒无关。
+ *
+ * 显式写 `send` 的 bot 保持 send：`effectiveReplyDelivery` 先取显式配置，缺省只在
+ * 未配置时补位。Doubao 历来缺省 transcript（账号级常驻 service 进程使 `botmux
+ * send` 归属不可靠，#2828），现在只是与其它可采集 CLI 同一条规则。
  */
-export function defaultReplyDeliveryFor(_cliId: string | undefined): ReplyDelivery {
-  return 'send';
+export function defaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
+  return supportsTranscriptReplyDelivery(cliId) ? 'transcript' : 'send';
 }
 
-/** Per-bot options that can make transcript delivery unusable even when the
- *  CLI itself harvests transcripts. */
-export interface TranscriptDeliveryCapabilityOpts {
-  sandbox?: ZeroPromptSandboxValue;
-}
-
-/** Whether `replyDelivery: transcript` works for this bot's CLI under its
- *  sandbox configuration. The plain `supportsTranscriptReplyDelivery` predicate
- *  is CLI-only; callers that know the bot config (config write validation,
- *  dashboard switch gating, the runtime envelope decision) must go through
- *  this so an unusable combination is rejected at write time rather than
- *  accepted and silently degraded at runtime.
- *
- *  Full-root COW scratch: cursor's agent-transcript mirror lives in the merged
- *  overlay, which the host-side bridge cannot read. Enabling the transcript
- *  envelope there would strip the `botmux send` instructions from the prompt
- *  while harvest produced nothing — a fully silent turn, the exact shape the
- *  fallback exists to prevent. Reject it (same scratch boundary zero-injection
- *  already enforces). */
-export function supportsTranscriptReplyDeliveryForBot(
-  cliId: string | undefined,
-  opts?: TranscriptDeliveryCapabilityOpts,
-): boolean {
-  if (!supportsTranscriptReplyDelivery(cliId)) return false;
-  if (cliId === 'cursor' && isScratchSandbox(opts)) return false;
-  return true;
+/** The default before transcript became the default for every transcript CLI:
+ *  doubao transcript (#2828), everything else send. Only used to tell a worker
+ *  what prompt a pane started by that botmux runs with (see
+ *  services/pane-reply-delivery.ts) — never to decide a new spawn. */
+export function legacyDefaultReplyDeliveryFor(cliId: string | undefined): ReplyDelivery {
+  return cliId === 'doubao' ? 'transcript' : 'send';
 }
 
 const warnedUnsupported = new Set<string>();
 
 /** 运行时生效值：显式配置（send / transcript）优先，未配置按 CLI 缺省；结果为
- *  transcript 但当前 CLI 不支持时回落 send（每个 bot+cli 组合只 warn 一次，避免
- *  每轮刷日志）。无 larkAppId / registry 异常 → send（fail-closed）。
+ *  transcript 但当前 CLI / 沙盒组合不支持时回落 send（显式配置的才 warn，每个
+ *  bot+cli 组合只 warn 一次，避免每轮刷日志）。无 larkAppId / registry 异常 → send
+ *  （fail-closed）。
  *
  * opts.sessionSandbox：为**已存活会话的续轮**传该会话 spawn 时冻结的沙箱
  * （session.sandbox）。信封判定必须按「这个会话的 worker 实际有没有采集」来，
  * 而不是 live bot config——sandbox 改动 next-session-only：会话以 scratch 起、
  * 运维随后关掉 sandbox 再开 transcript 时，live 解析会放 transcript（改口不
  * send），但该会话的 worker 仍在 COW overlay 里采集关闭 = 静默轮。新会话/首轮
- * 不传，走 live config + BOTMUX_SANDBOX env 的实时解析。 */
+ * 不传，走 live config + BOTMUX_SANDBOX env 的实时解析。
+ *
+ * opts.legacyDefault：未显式配置时按改动前的缺省（legacyDefaultReplyDeliveryFor）
+ * 解析，只给 worker 判断「旧版 botmux 起的 pane 用的是哪套提示」，不决定新 spawn。 */
 export function effectiveReplyDelivery(
   larkAppId: string | undefined,
   cliId: string | undefined,
   promptInjection?: PromptInjection,
-  opts?: { sessionSandbox?: ZeroPromptSandboxValue },
+  opts?: { sessionSandbox?: ZeroPromptSandboxValue; legacyDefault?: boolean },
 ): ReplyDelivery {
   if (!larkAppId) return 'send';
-  if (zeroPromptInjectionForBot(larkAppId, cliId, promptInjection)) return 'transcript';
+  const zeroPrompt = zeroPromptInjectionForBot(larkAppId, cliId, promptInjection);
   let configured: ReplyDelivery | undefined;
   let sandbox: ZeroPromptSandboxValue | undefined;
   try {
@@ -102,12 +95,18 @@ export function effectiveReplyDelivery(
       // resolveLocalSandboxMode 实际跑在 scratch（采集关闭）。只信冻结值会在
       // 续轮把 transcript 错放回去（改口不 send + 采集关 = 静默）。任一源为
       // scratch 即按 scratch 降级；env=0 不追溯翻案已冻成 scratch 的会话
-      // （spawn 时它确实在 scratch 里）。oncall 不收窄（authPaths bind 宿主
-      // 目录，桥可读）。env 非法值由 envSandboxMode throw，落到外层 catch
-      // fail-closed → send。
+      // （spawn 时它确实在 scratch 里）。oncall 按宿主挂载白名单判定；env 非法值
+      // 由 envSandboxMode throw，落到外层 catch fail-closed → send。
       const frozen = opts.sessionSandbox;
       const envResolved = resolveSandboxMode({ configSandbox: undefined, envValue: process.env.BOTMUX_SANDBOX });
-      sandbox = frozen === 'scratch' || envResolved === 'scratch' ? 'scratch' : frozen;
+      // 任一来源为 scratch 即按 scratch 降级；任一来源为 oncall 即按 oncall
+      // 做宿主挂载能力判定。冻结 off 只证明 config 未显式开沙盒，不能抵消
+      // 机器级 BOTMUX_SANDBOX=oncall 强制启用后的真实运行形态。
+      sandbox = frozen === 'scratch' || envResolved === 'scratch'
+        ? 'scratch'
+        : frozen === 'oncall' || envResolved === 'oncall'
+          ? 'oncall'
+          : frozen;
     } else {
       const cfg = getBot(larkAppId).config;
       // 机器级 BOTMUX_SANDBOX 开关不会 materialise 进 cfg（与零注入同一约定，见
@@ -124,15 +123,57 @@ export function effectiveReplyDelivery(
       });
     }
   } catch { return 'send'; }
-  const wanted: ReplyDelivery = configured ?? defaultReplyDeliveryFor(cliId);
+  // 零注入强制 transcript，但仍受同一宿主采集能力约束；否则 Hermes oncall
+  // 会绕过下面的运行时回落，再次形成「提示不 send、宿主也采不到」的静默轮。
+  if (zeroPrompt) return supportsZeroPromptInjection(cliId, { sandbox }) ? 'transcript' : 'send';
+  const wanted: ReplyDelivery = configured
+    ?? (opts?.legacyDefault ? legacyDefaultReplyDeliveryFor(cliId) : defaultReplyDeliveryFor(cliId));
   if (wanted !== 'transcript') return 'send';
   if (supportsTranscriptReplyDeliveryForBot(cliId, { sandbox })) return 'transcript';
+  // 缺省值回落是预期内的（如 scratch 沙盒下的 cursor / doubao），不告警；只有使用者
+  // 显式写了 transcript 却用不上时才提示一次。
+  if (configured !== 'transcript') return 'send';
   const key = `${larkAppId}:${cliId ?? ''}`;
   if (!warnedUnsupported.has(key)) {
     warnedUnsupported.add(key);
     logger.warn(`[reply-delivery] bot ${larkAppId} 配置 replyDelivery=transcript，但 cliId=${cliId ?? '(none)'} 在当前沙盒配置下没有转写采集，回落 send`);
   }
   return 'send';
+}
+
+export interface LegacyReplyDeliverySession {
+  replyDeliveryLegacy?: { cliId: string; mode: ReplyDelivery };
+}
+
+/** Resolve the pre-snapshot fallback exactly once per CLI generation. Without
+ * this freeze, every worker re-fork re-reads today's explicit config and can
+ * contradict the prompt still running in a legacy pane. The first inference is
+ * necessarily heuristic for a pane whose config was edited BEFORE the first
+ * post-upgrade reattach (no launch evidence survives); operators should restart
+ * that CLI. Later edits must never move the frozen value again. */
+export function resolveLegacyReplyDeliveryForSession(
+  session: LegacyReplyDeliverySession,
+  larkAppId: string,
+  cliId: string,
+  promptInjection: PromptInjection | undefined,
+  persist: () => void,
+): ReplyDelivery {
+  const frozen = session.replyDeliveryLegacy;
+  if (frozen?.cliId === cliId && (frozen.mode === 'send' || frozen.mode === 'transcript')) {
+    return frozen.mode;
+  }
+  const mode = effectiveReplyDelivery(larkAppId, cliId, promptInjection, { legacyDefault: true });
+  const previous = session.replyDeliveryLegacy;
+  session.replyDeliveryLegacy = { cliId, mode };
+  try {
+    persist();
+  } catch (error) {
+    // Do not leave a value that only LOOKS frozen in memory: the next fork must
+    // still resolve/persist it instead of silently skipping the durable write.
+    session.replyDeliveryLegacy = previous;
+    throw error;
+  }
+  return mode;
 }
 
 export interface SoloSessionInput {

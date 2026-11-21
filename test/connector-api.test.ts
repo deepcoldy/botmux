@@ -342,6 +342,114 @@ describe('connector-api write routes', () => {
     expect(cleared.connector.suppressFinalOutput).toBeUndefined();
   });
 
+  describe('promptEnvelope.trustPayload', () => {
+    async function seedConnector(input: { verifyType?: string; secretPresent?: boolean; trustPayload?: boolean } = {}) {
+      const { createWebhookSecret, deleteWebhookSecret } = await import('../src/services/webhook-key.js');
+      const { upsertConnector } = await import('../src/services/connector-store.js');
+      const secret = createWebhookSecret('seed-secret');
+      if (input.secretPresent === false) deleteWebhookSecret(secret.ref);
+      return upsertConnector({
+        id: 'conn_seed',
+        name: 'Seeded',
+        enabled: true,
+        verify: { type: (input.verifyType ?? 'token') as any, secretRef: secret.ref, signatureHeader: 'x-botmux-signature', timestampHeader: 'x-botmux-timestamp', nonceHeader: 'x-botmux-nonce', toleranceSeconds: 300 },
+        target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+        promptEnvelope: {
+          sourceName: 'seeded', headerAllowlist: [], includeRawText: false, maxBodyBytes: 1024,
+          ...(input.trustPayload === undefined ? {} : { trustPayload: input.trustPayload }),
+        },
+        loggingPolicy: { storePayload: false, storeHeaders: false, retentionDays: 14 },
+        lifecycleExtractors: null,
+        createdAt: '2026-07-01T00:00:00.000Z',
+        updatedAt: '2026-07-01T00:00:00.000Z',
+      });
+    }
+    const put = (id: string, body: unknown) => fetch(`${baseUrl}/api/connectors/${encodeURIComponent(id)}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+
+    it('defaults to off and is not written to the store unless enabled', async () => {
+      const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'Plain', target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' } }),
+      }));
+      expect(created.ok).toBe(true);
+      expect('trustPayload' in created.connector.promptEnvelope).toBe(false);
+      const stored = JSON.parse(readFileSync(join(dataDir, 'connectors.json'), 'utf-8'));
+      expect('trustPayload' in stored.connectors[0].promptEnvelope).toBe(false);
+    });
+
+    it('enables on a token and an HMAC connector, survives unrelated edits, and clears on false', async () => {
+      for (const type of ['token', 'hmac-sha256'] as const) {
+        const created = await json(await fetch(`${baseUrl}/api/connectors`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            name: `Agent ${type}`,
+            verify: { type },
+            target: { mode: 'fixed', kind: 'turn', botId: 'app1', chatId: 'oc_1' },
+            promptEnvelope: { sourceName: 'agent', trustPayload: true },
+          }),
+        }));
+        expect(created.ok).toBe(true);
+        expect(created.connector.promptEnvelope.trustPayload).toBe(true);
+        const id = created.connector.id;
+        // Dashboard edits resend promptEnvelope without the flag only from old
+        // clients; the log-retention toggle omits promptEnvelope entirely.
+        const renamed = await json(await put(id, { name: 'Renamed' }));
+        expect(renamed.connector.promptEnvelope.trustPayload).toBe(true);
+        const instructionOnly = await json(await put(id, { promptEnvelope: { sourceName: 'agent', instruction: 'x' } }));
+        expect(instructionOnly.connector.promptEnvelope.trustPayload).toBe(true);
+        const cleared = await json(await put(id, { promptEnvelope: { sourceName: 'agent', trustPayload: false } }));
+        expect(cleared.ok).toBe(true);
+        expect('trustPayload' in cleared.connector.promptEnvelope).toBe(false);
+      }
+    });
+
+    it('rejects enabling on a connector without usable verification and explains why', async () => {
+      for (const seed of [{ verifyType: 'none' }, { secretPresent: false }]) {
+        const { deleteConnector } = await import('../src/services/connector-store.js');
+        deleteConnector('conn_seed');
+        await seedConnector(seed);
+        const res = await put('conn_seed', { promptEnvelope: { sourceName: 'seeded', trustPayload: true } });
+        expect(res.status).toBe(400);
+        const body = await json(res);
+        expect(body.error).toBe('trust_payload_requires_verification');
+        expect(typeof body.message).toBe('string');
+        const { getConnector } = await import('../src/services/connector-store.js');
+        expect(getConnector('conn_seed')?.promptEnvelope.trustPayload).toBeUndefined();
+      }
+    });
+
+    it('lets a trusted connector whose secret went missing be repaired by setting or rotating the secret', async () => {
+      for (const body of [{ secret: 'fresh-secret' }, { rotateSecret: true }]) {
+        const { deleteConnector } = await import('../src/services/connector-store.js');
+        deleteConnector('conn_seed');
+        await seedConnector({ trustPayload: true, secretPresent: false });
+        const blocked = await put('conn_seed', { name: 'Edited' });
+        expect(blocked.status).toBe(400);
+        const repaired = await put('conn_seed', body);
+        expect(repaired.status).toBe(200);
+        expect((await json(repaired)).connector.promptEnvelope.trustPayload).toBe(true);
+      }
+    });
+
+    it('rejects trustPayload on a legacy workflow connector', async () => {
+      await seedLegacyWorkflowConnector();
+      const res = await put('conn_legacy_workflow', { promptEnvelope: { sourceName: 'legacy-report', trustPayload: true } });
+      expect(res.status).toBe(400);
+      expect((await json(res)).error).toBe('trust_payload_requires_turn_target');
+    });
+
+    it('keeps an older connector (no field) off across edits, byte-identical promptEnvelope', async () => {
+      const seeded = await seedConnector();
+      const res = await json(await put('conn_seed', { name: 'Edited' }));
+      expect(res.ok).toBe(true);
+      expect(res.connector.promptEnvelope).toEqual(seeded.promptEnvelope);
+    });
+  });
+
   it('rejects empty and overlong custom topic messages', async () => {
     for (const text of ['   ', 'x'.repeat(201)]) {
       const res = await fetch(`${baseUrl}/api/connectors`, {

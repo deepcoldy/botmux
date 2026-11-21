@@ -97,6 +97,14 @@ describe('resolveCommand shell output parsing', () => {
     expect(resolveCommand('tool with space')).toBe('/opt/fake/bin/tool with space');
   });
 
+  it('returns relative executable paths without invoking a shell', () => {
+    const marker = join(dir, 'relative-path-shell-was-called');
+    useFakeShell(`#!/bin/sh\ntouch '${marker}'\necho "/opt/should-not-be-used"\n`);
+    expect(resolveCommand('./vendorCodex')).toBe('./vendorCodex');
+    expect(resolveCommand('tools/vendor Codex')).toBe('tools/vendor Codex');
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it('does not evaluate semicolons from the command name', () => {
     useSystemShell();
     const marker = join(dir, 'semicolon-was-evaluated');
@@ -165,6 +173,18 @@ describe('asynchronous shell discovery', () => {
     expect(result).toEqual({ resolved: command, inconclusive: false });
     expect(existsSync(join(dir, 'marker'))).toBe(false);
   });
+  it('passes relative executable paths through without asynchronous shell probes', async () => {
+    const { dir } = fixture();
+    const marker = join(dir, 'relative-path-shell-was-called');
+    const shell = join(dir, 'unexpected-shell');
+    writeFileSync(shell, `#!/bin/sh\ntouch '${marker}'\necho "/opt/should-not-be-used"\n`);
+    chmodSync(shell, 0o755);
+    expect(await resolveCommandAsync('./vendorCodex', {
+      env: { HOME: dir, SHELL: shell, PATH: '/usr/bin:/bin' },
+    })).toEqual({ resolved: './vendorCodex', inconclusive: false });
+    expect(existsSync(marker)).toBe(false);
+  });
+
   it('keeps a timed-out shell inconclusive and releases the event loop', async () => {
     const { dir } = fixture();
     const shell = join(dir, 'slow-shell');
@@ -225,8 +245,29 @@ describe('async shell process-group retirement', () => {
       if (control.pid) { try { process.kill(-control.pid, 'SIGKILL'); } catch { /* exited */ } }
       for (const pid of manual) { try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ } }
       writeFileSync(pidfile, '');
-      const result = await resolveCommandAsync('probe-child-tool', { env, timeoutMs: 100 });
-      expect(pids().length).toBeGreaterThan(0);
+      // Spawn budget for BOTH modes: the rc must have wall time to START and
+      // record its background child before the resolver can retire its group.
+      // 100ms used to fire before /bin/sh was ever scheduled on a loaded
+      // bun-test runner (1823 files concurrent), so the resolver SIGKILLed the
+      // group before the fixture's `echo $!` ran and this positive control read
+      // an empty pidfile — the timeout variant failed in CI (run 41023870882,
+      // job 123957266873); the complete variant carries the identical startup
+      // window and fails the same way once the rc is delayed past the budget
+      // (verified by injecting a 150-250ms pre-echo stall locally: at 100ms
+      // BOTH variants fail, at 2s BOTH pass). 2s covers process spawn on a
+      // busy runner. It does not slow the complete variant (its rc exits on its
+      // own well before the budget), and the timeout variant's foreground
+      // `sleep 5` keeps its timeout outcome deterministic.
+      const result = await resolveCommandAsync('probe-child-tool', { env, timeoutMs: 2_000 });
+      // Bounded observation of the recorded child (the spawn budget above is
+      // what closes the startup race; this only absorbs read timing).
+      let spawned = pids();
+      const spawnedDeadline = Date.now() + 2_000;
+      while (!spawned.length && Date.now() < spawnedDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        spawned = pids();
+      }
+      expect(spawned.length).toBeGreaterThan(0);
       if (mode === 'complete') expect(result.resolved).toBe(tool);
       else expect(result.inconclusive).toBe(true);
       // Having exited is final, so assert on the observation that ended the wait
@@ -242,5 +283,11 @@ describe('async shell process-group retirement', () => {
       for (const pid of [...manual, ...pids()]) { try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ } }
       rmSync(root, { recursive: true, force: true });
     }
-  });
+    // Per-test wall budget 30s: the timeout variant legitimately burns ~2 × the
+    // 2s resolver budget (probes run -lc then -ic) ≈ 4s. CI legs pass an explicit
+    // --timeout (180s bun leg, 60s vitest), but a bare `bun test <file>` uses
+    // Bun's 5000ms default and killed a passing variant at ~4.5-5.1s on a loaded
+    // 1-CPU host (4/8 rounds). This lifts only the runner ceiling; the timeout
+    // semantics themselves stay asserted (inconclusive / group retirement).
+  }, 30_000);
 });

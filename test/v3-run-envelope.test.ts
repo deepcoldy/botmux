@@ -1,3 +1,6 @@
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, expect, it, vi } from 'vitest';
 vi.mock('node:fs', () => {
   // `require` inside the factory, not the vitest-only `importOriginal` argument
@@ -31,6 +34,8 @@ import {
   RunEnvelopeValidationError,
   V3_RUN_ENVELOPE_FILE,
   artifactRef,
+  frozenNodeProjectDir,
+  frozenNodeWorkingDir,
   loadAuthorizedV3Run,
   makeAdHocRunEnvelope,
   makeLegacyV3RunEnvelope,
@@ -216,6 +221,41 @@ describe('v3 run envelope — strict schema + builders', () => {
       });
       expect('spec' in legacy.artifacts).toBe(false);
       expect('specSha256' in legacy.authorization).toBe(false);
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it('nodeProjectDir: bot-executed ad-hoc and template runs only, an absolute path, never beside nodeWorkingDir', () => {
+    const { base, runDir, runId } = freshRun();
+    try {
+      const artifacts = seedAdHocArtifacts(runDir, runId);
+      const common = { runId, createdAt: CREATED_AT, authorizedAt: AUTHORIZED_AT, artifacts };
+      const withProject = makeAdHocRunEnvelope({ ...common, nodeExecutor: 'bot', nodeProjectDir: '/work/repo' });
+      expect(validateRunEnvelope(withProject, runId)).toEqual(withProject);
+      expect(frozenNodeProjectDir(withProject)).toBe('/work/repo');
+      expect(frozenNodeWorkingDir(withProject)).toBeUndefined();
+      expect(frozenNodeProjectDir(makeAdHocRunEnvelope({ ...common, nodeExecutor: 'bot' }))).toBeUndefined();
+      expect(() => makeAdHocRunEnvelope({ ...common, nodeProjectDir: '/work/repo' })).toThrow(/requires nodeExecutor/);
+      expect(() => makeAdHocRunEnvelope({ ...common, nodeExecutor: 'bot', nodeProjectDir: 'work/repo' })).toThrow(/absolute/);
+      expect(() => makeAdHocRunEnvelope({ ...common, nodeExecutor: 'bot', nodeWorkingDir: '/a', nodeProjectDir: '/b' }))
+        .toThrow(/must be absent when nodeWorkingDir is set/);
+
+      writeJson(join(runDir, 'params.resolved.json'), {});
+      writeJson(join(runDir, 'definition.snapshot.json'), { workflowId: 'weekly-report' });
+      const saved = makeSavedDefinitionRunEnvelope({
+        runId, workflowId: 'weekly-report', revisionId: 'sha256:revision', humanVersion: 1,
+        createdAt: CREATED_AT, authorizedAt: AUTHORIZED_AT, nodeExecutor: 'bot', nodeProjectDir: '/work/repo',
+        artifacts: {
+          ...artifacts,
+          resolvedParams: artifactRef(runDir, 'params.resolved.json'),
+          definitionSnapshot: artifactRef(runDir, 'definition.snapshot.json'),
+        },
+      });
+      expect(frozenNodeProjectDir(saved)).toBe('/work/repo');
+      // Strict at every other source: the key is unknown there.
+      const manual = makeManualCliRunEnvelope({ runId, createdAt: CREATED_AT, authorizedAt: AUTHORIZED_AT, artifacts: { dag: artifacts.dag, botSnapshots: artifacts.botSnapshots } });
+      expect(() => validateRunEnvelope({ ...manual, nodeProjectDir: '/work/repo' })).toThrow(RunEnvelopeValidationError);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

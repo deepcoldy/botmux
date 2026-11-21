@@ -69,9 +69,14 @@ export interface PersistedAsk {
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */
   answererOpenId?: string;
+  /** 显式 ask 要 @ 的人（daemon 已核实），跨重启保留以保证重发卡片仍带通知。 */
+  mentionedOpenId?: string;
   deliveryTarget?: CreateAskInput['deliveryTarget'];
   questions: ReadonlyArray<AskQuestion>;
+  customAnswers?: ReadonlyArray<string | null>;
+  customRevision?: number;
   createdAt: number;
+  /** Absolute epoch milliseconds; paired with timeoutMs=0 for no deadline. */
   deadlineAt: number;
   /** Original relative timeout. Host-owned asks defer this clock until the
    *  interaction card is confirmed delivered; ordinary CLI asks start it at
@@ -86,6 +91,7 @@ export interface PersistedAsk {
    *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
    *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
+  cardDeliveredAt?: number;
   replyCardTarget?: CreateAskInput['replyCardTarget'];
   /** Accumulated per-question selections (checkbox state), so a restart mid-
    *  multi-select keeps the boxes the user already ticked. */
@@ -149,7 +155,7 @@ export interface AskPersistStore {
   /** Absolute directory this store owns. */
   readonly dir: string;
   /** Create-or-update a record. Best-effort durable (atomic rename + fsync). */
-  put(ask: PersistedAsk): void;
+  put(ask: PersistedAsk, options?: { strict?: boolean }): void;
   /** Remove a record by key. Idempotent (missing file is not an error). */
   remove(askKey: string): void;
   /** Load all valid, unexpired records (reaps corrupt / wrong-version / expired). */
@@ -167,7 +173,7 @@ export function createAskPersistStore(dir: string): AskPersistStore {
 
   return {
     dir,
-    put(ask: PersistedAsk): void {
+    put(ask: PersistedAsk, options?: { strict?: boolean }): void {
       try {
         decisions.put(ask);
       } catch (e) {
@@ -183,7 +189,7 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         // uncaughtException — the daemon installs no trap for that, and explicit
         // records are exempt from disk reaping below, so it would crash-loop on
         // every restart until the disk recovered. Those writes stay best-effort.
-        if (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered') throw e;
+        if (options?.strict || (ask.originKind === 'host_explicit' && ask.answeredResult?.kind === 'answered')) throw e;
         // Persistence is a resilience enhancement, never a correctness gate for
         // the live path: a failed write just means this ask won't survive a
         // restart.
@@ -207,6 +213,11 @@ export function createAskPersistStore(dir: string): AskPersistStore {
         const parsed = raw as unknown as PersistedAsk;
         if (!parsed || parsed.v !== 2 || !parsed.askKey || !parsed.requestId || !Array.isArray(parsed.questions)) {
           if (parsed?.askKey) decisions.remove(parsed.askKey);
+          continue;
+        }
+        if ((parsed.timeoutMs === 0 || parsed.deadlineAt === 0)
+          && !(parsed.originKind === 'host_explicit' && parsed.timeoutMs === 0 && parsed.deadlineAt === 0)) {
+          decisions.remove(parsed.askKey);
           continue;
         }
         // Reap rules:

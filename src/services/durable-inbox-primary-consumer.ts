@@ -16,7 +16,19 @@ import {
 export type DurableInboxPrimaryDispatchResult =
   | { kind: 'committed'; receipt: DurableLarkAdmissionReceipt }
   | { kind: 'ignored'; reason: string }
-  | { kind: 'retry'; reason: string };
+  | {
+      kind: 'retry';
+      reason: string;
+      /**
+       * Opaque identity of the state the retry is waiting on (e.g. the live
+       * worker generation). Omitted = a wait-state that resolves on its own
+       * (busy / unfinished turn) and is retried without limit. Present = the
+       * retry only helps once that state changes, so consecutive retries with
+       * the same token are counted and the event is settled as ignored after
+       * maxStalledRetries, instead of blocking its partition forever (#2062 F7).
+       */
+      progressToken?: string;
+    };
 
 export interface DurableInboxPrimaryDispatchContext {
   claim: InboxClaim;
@@ -54,6 +66,8 @@ export interface DurableInboxPrimaryConsumerOptions {
   retryDelayMs?: number;
   /** Stop retrying one permanently failing row before it can block the whole partition forever. */
   maxAttempts?: number;
+  /** Consecutive explicit retries carrying an unchanged progressToken. */
+  maxStalledRetries?: number;
   concurrency?: number;
   batchSize?: number;
   shutdownMs?: number;
@@ -129,6 +143,11 @@ export function startDurableInboxPrimaryConsumer(
   );
   const retryDelayMs = boundedInteger(options.retryDelayMs ?? 5_000, 'retryDelayMs', 100, 3_600_000);
   const maxAttempts = boundedInteger(options.maxAttempts ?? 16, 'maxAttempts', 1, 1_000);
+  const maxStalledRetries = boundedInteger(options.maxStalledRetries ?? 3, 'maxStalledRetries', 1, 1_000);
+  // eventId -> last progressToken and how many retries in a row carried it.
+  // In-memory on purpose: a restart is itself progress (new worker generation).
+  const stalls = new Map<string, { token: string; count: number }>();
+  const MAX_TRACKED_STALLS = 1_024;
   const concurrency = boundedInteger(options.concurrency ?? 4, 'concurrency', 1, 32);
   const batchSize = boundedInteger(options.batchSize ?? 32, 'batchSize', 1, 1_000);
   const shutdownMs = boundedInteger(options.shutdownMs ?? 5_000, 'shutdownMs', 0, 300_000);
@@ -192,6 +211,44 @@ export function startDurableInboxPrimaryConsumer(
         if (!reason || reason.length > 512) {
           throw new Error('durable inbox primary retry result requires a bounded reason');
         }
+        const eventId = claim.event.eventId;
+        const token = typeof result.progressToken === 'string' && result.progressToken
+          ? result.progressToken
+          : undefined;
+        if (token === undefined) {
+          stalls.delete(eventId);
+        } else {
+          const previous = stalls.get(eventId);
+          const count = previous?.token === token ? previous.count + 1 : 1;
+          stalls.delete(eventId);
+          if (count >= maxStalledRetries) {
+            const completed = await options.store.completeInboxClaim(claim);
+            if (completed.kind === 'stale') {
+              loseOwnership(new Error(`durable inbox primary stalled retry lost claim ${eventId}`));
+              return;
+            }
+            reportError(new Error(
+              `durable inbox primary gave up on ${eventId} after ${count} retries without progress: ${reason}`,
+            ));
+            try {
+              options.onCommitted?.({
+                message,
+                result: { kind: 'ignored', reason: `durable primary retry made no progress: ${reason}` },
+              });
+            } catch (error) {
+              reportError(new Error(
+                `durable inbox primary commit observer failed for ${eventId}: `
+                + `${error instanceof Error ? error.message : String(error)}`,
+              ));
+            }
+            return;
+          }
+          stalls.set(eventId, { token, count });
+          if (stalls.size > MAX_TRACKED_STALLS) {
+            const oldest = stalls.keys().next().value;
+            if (oldest !== undefined) stalls.delete(oldest);
+          }
+        }
         const retried = await options.store.retryInboxClaim({
           claim,
           visibleAt: now() + retryDelayMs,
@@ -207,6 +264,7 @@ export function startDurableInboxPrimaryConsumer(
       if (result.kind === 'ignored' && (!result.reason.trim() || result.reason.length > 512)) {
         throw new Error('durable inbox primary ignored result requires a bounded reason');
       }
+      stalls.delete(claim.event.eventId);
       const completed = await options.store.completeInboxClaim(claim);
       if (completed.kind === 'stale') {
         loseOwnership(new Error(`durable inbox primary completion lost claim ${claim.event.eventId}`));

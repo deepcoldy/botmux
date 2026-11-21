@@ -26,8 +26,13 @@ export const BROWSER_CONFIG = {
   locale: 'zh-CN',
 };
 
-/** All bot display names available for testing (except Gemini). */
-export const BOT_NAMES = ['Claude', 'CoCo', 'Codex', 'OpenCode', 'Aiden'] as const;
+/**
+ * The test bots, named after their CLI. Claude, Codex and the public CLIs of
+ * the core-clis lane run on CI against the mock LLM; ClaudeSandbox is Claude
+ * Code with `sandbox: true` (core-sandbox lane); Aiden and CoCo are internal
+ * CLIs that only run where they are installed.
+ */
+export const BOT_NAMES = ['Claude', 'CoCo', 'Codex', 'OpenCode', 'Aiden', 'Pi', 'OhMyPi', 'Kimi', 'Antigravity', 'Grok', 'ClaudeSandbox'] as const;
 export type BotName = (typeof BOT_NAMES)[number];
 
 // ---------------------------------------------------------------------------
@@ -163,15 +168,15 @@ export function createAgent(page: Page): PlaywrightAgent {
 // CI), so pages load one at a time; a loaded page then works normally.
 let messengerLoadQueue: Promise<void> = Promise.resolve();
 
-function messengerShellReady(requireChatList: boolean): boolean {
+function messengerShellReady({ requireChatList, names }: { requireChatList: boolean; names: string[] }): boolean {
   const title = document.title;
   const titleReady = /messenger|飞书|lark/i.test(title);
   const body = document.body?.innerText ?? '';
   const searchReady = /search|搜索/i.test(body);
   const messengerReady = /messenger|消息/i.test(body);
   // The shell renders before the chat list; skeleton rows carry no text, so
-  // require a real chat entry (every test account has [Botmux] bot DMs).
-  const chatListReady = !requireChatList || body.includes('[Botmux]');
+  // require a real chat entry (every test account has the bot DMs).
+  const chatListReady = !requireChatList || names.some((name) => body.includes(name));
   return titleReady && searchReady && messengerReady && chatListReady;
 }
 
@@ -199,7 +204,11 @@ async function loadMessenger(page: Page, url: string): Promise<void> {
     });
     try {
       // A deep link (the test group) may open a view without the chat list.
-      await page.waitForFunction(messengerShellReady, url === getMessengerUrl(), { timeout: MESSENGER_LOAD_WAIT_MS });
+      await page.waitForFunction(
+        messengerShellReady,
+        { requireChatList: url === getMessengerUrl(), names: BOT_NAMES.flatMap(botDisplayNames) },
+        { timeout: MESSENGER_LOAD_WAIT_MS },
+      );
       return;
     } catch {
       console.warn(`[e2e] Feishu Messenger chat list not loaded (attempt ${attempt}/${MESSENGER_LOAD_ATTEMPTS}); reopening`);
@@ -217,17 +226,24 @@ async function loadMessenger(page: Page, url: string): Promise<void> {
  * Falls back to Feishu search (Ctrl+K) if not visible in sidebar.
  */
 /**
- * Display name of the Botmux bot conversation in Feishu.
+ * Display names the bot's Feishu app may have, preferred first.
  *
- * The test account also has same-named *native* Feishu AI agents (labelled
- * 智能体, e.g. a DM literally named "codex"/"claude") that never reply to
- * botmux traffic. The Botmux-backed bots are the conversations explicitly
- * named `[Botmux]<Name>` with a 机器人/Bot badge. Opening the bare name makes
- * the visual agent click the native agent, so always resolve and match the
- * prefixed bot conversation.
+ * The test bots are named after their CLI (`Claude`, `Codex`, …). They used to
+ * be `[Botmux]<Name>`, and either may be live while the apps are renamed, so
+ * both are accepted. Names compare exactly and case-sensitively: the test
+ * tenant also holds unrelated apps such as `codex` and `Nash_Claude` that
+ * never answer botmux traffic. The badge does not tell them apart: apps that
+ * `botmux setup` creates from the agent template show 智能体, older ones 机器人.
  */
-export function botChatName(botName: string): string {
-  return botName.startsWith('[Botmux]') ? botName : `[Botmux]${botName}`;
+export function botDisplayNames(botName: string): string[] {
+  const bare = botName.replace(/^\[Botmux\]/, '');
+  return [bare, `[Botmux]${bare}`];
+}
+
+/** How the bot is described to the vision agent: either name counts. */
+function botNameForVision(botName: string): string {
+  const [bare, legacy] = botDisplayNames(botName);
+  return `"${bare}" 或 "${legacy}"（两个名字任意一个都算，飞书上可能还是旧名）`;
 }
 
 /** A text box of TITLE_BOXES: `onTop` when hit-testing its middle lands on it. */
@@ -236,7 +252,7 @@ export interface TitleBox extends ScreenBox {
 }
 
 /**
- * The chat list's entry titled exactly `[Botmux]<Name>`: on top, left of 30%
+ * The chat list's entry titled exactly with the bot's name: on top, left of 30%
  * of the width (the main area shows the name too, as its title and as the
  * bot's sender line). Text scrolled out of the list is not on top. A pinned
  * shortcut ahead of the list, if it holds the full name, opens the same chat.
@@ -284,22 +300,23 @@ export async function openChat(
   // Concurrent lanes share this bot's DM; a case that switches its DM mode
   // holds the lease exclusively (see chat-lease.ts).
   await holdLeaseForPage(page, dmLeaseKey(botName.replace(/^\[Botmux\]/, '')), 'shared');
-  // Match the Botmux-backed bot conversation, never the same-named native AI
-  // agent. The display name is `[Botmux]<Name>` and it carries a Bot badge
-  // (机器人), whereas the native agent is labelled 智能体 and has no prefix.
-  const chatName = botChatName(botName);
-  if (await openChatFromList(page, chatName)) return;
+  // Match the bot conversation by its exact name, never a similarly named
+  // native AI agent (智能体 badge) or another app (see botDisplayNames).
+  const names = botDisplayNames(botName);
+  for (const chatName of names) {
+    if (await openChatFromList(page, chatName)) return;
+  }
+  const described = botNameForVision(botName);
   let opened = false;
   // The entry is not listed (or did not open): ask the vision agent.
   try {
     await agent.aiAct(
-      `在左侧"消息"列表或其置顶会话中，点击 Botmux 机器人的私聊会话 ` +
-        `"${chatName}"（名称以 [Botmux] 开头、带"机器人/Bot"徽标）。` +
-        `不要点同名的原生智能体（名称只有"${botName}"、带"智能体"徽标、没有 [Botmux] 前缀），` +
-        '也不要点话题里的消息或群聊。',
+      `在左侧"消息"列表或其置顶会话中，点击私聊会话 ${described}` +
+        '（名称大小写完全一致；徽标可能是"机器人"也可能是"智能体"，两者都可以）。' +
+        '不要点名称相近的其它会话（例如大小写不同、多了前后缀），也不要点话题里的消息或群聊。',
     );
     await agent.aiWaitFor(
-      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      `右侧聊天区域顶部标题栏的会话名是 ${described}，大小写完全一致`,
       { timeoutMs: 8_000, checkIntervalMs: 2_000 },
     );
     opened = true;
@@ -311,18 +328,18 @@ export async function openChat(
     // Chat not visible or direct click failed — use search to find it
     await page.keyboard.press('Control+k');
     await page.waitForTimeout(1000);
-    await page.keyboard.type(chatName);
+    await page.keyboard.type(names[0]);
     await page.waitForTimeout(2000);
     await agent.aiAct(
-      `在搜索结果中点击 Botmux 机器人会话 "${chatName}"（[Botmux] 前缀、机器人徽标），` +
-        `不要点名称仅为"${botName}"的原生智能体。`,
+      `在搜索结果中点击会话 ${described}（名称大小写完全一致，徽标是"机器人"或"智能体"都可以），` +
+        '不要点名称相近（大小写不同、多了前后缀）的其它会话。',
     );
     // Close search overlay if still open
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
     // Wait for chat to load
     await agent.aiWaitFor(
-      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      `右侧聊天区域顶部标题栏的会话名是 ${described}，大小写完全一致`,
       { timeoutMs: 15_000, checkIntervalMs: 3_000 },
     );
   }
@@ -475,7 +492,7 @@ export interface MentionListSnapshot {
  * apart from the chat's sender labels: its rows are the fresh ones. A string
  * for the same reason as FIND_EDITOR.
  */
-const MENTION_LIST = `(({ name, bare, mark, before }) => {
+const MENTION_LIST = `(({ names, mark, before }) => {
   const editor = ${FIND_EDITOR};
   if (!editor) return null;
   const clean = (text) => (text || '').replace(/[\\u200b-\\u200d\\u2060\\ufeff]/g, '').replace(/\\s+/g, ' ').trim();
@@ -506,10 +523,11 @@ const MENTION_LIST = `(({ name, bare, mark, before }) => {
     }
     return found;
   };
-  // A row may hold the badge too (「[Botmux]Claude 机器人 | Claude」), or split
-  // the name around the highlighted query; the name must still lead it.
-  const isName = (text) => text === name || (text.startsWith(name) && !/^[\w-]/.test(text.slice(name.length)));
-  const options = find(isName, ['Botmux', bare]);
+  // A row may hold the badge too (「Claude 机器人 | Claude」), or split the
+  // name around the highlighted query; the name must still lead it.
+  const leads = (text, name) => text === name || (text.startsWith(name) && !/^[\w-]/.test(text.slice(name.length)));
+  const isName = (text) => names.some((name) => leads(text, name));
+  const options = find(isName, names);
   if (before) {
     // Per attempt: a node the list reuses across attempts must count as new.
     for (const el of document.querySelectorAll('[' + mark + ']')) el.removeAttribute(mark);
@@ -528,7 +546,7 @@ const MENTION_LIST = `(({ name, bare, mark, before }) => {
 const MENTION_MARK = 'data-e2e-before-mention';
 
 async function mentionList(page: Page, name: string, before = false): Promise<MentionListSnapshot | null> {
-  const args = { name: botChatName(name), bare: name, mark: MENTION_MARK, before };
+  const args = { names: botDisplayNames(name), mark: MENTION_MARK, before };
   return page.evaluate(`(${MENTION_LIST})(${JSON.stringify(args)})`);
 }
 
@@ -752,15 +770,36 @@ async function describeMentionList(page: Page, name: string): Promise<string> {
   );
 }
 /**
- * The input holds exactly one mention and it is `botName`. A selected mention
- * renders the member's display name (`[Botmux]<Name>`); the filter query typed
- * after `@` is the bare name, so an unselected query never passes. `@@` means
- * a stray literal `@` stayed in front of the chip, which breaks command parsing.
+ * The input holds exactly one mention and it is `botName`. `chips` are the
+ * texts of the editor's mention chips (MENTION_CHIPS): a selected member
+ * becomes a non-editable chip reading `@<display name>`, while the filter
+ * query typed after `@` stays plain text, so an unselected query never passes
+ * even though it reads the same. `@@` in the input means a stray literal `@`
+ * stayed in front of the chip, which breaks command parsing.
  */
-export function holdsOnlyMention(text: string, botName: string): boolean {
-  // `[Botmux]Claude` in the editor; `BotmuxClaude` where brackets are dropped.
-  const mentioned = [...text.matchAll(/\[?Botmux\]?\s*([A-Za-z][\w-]*)/g)].map((match) => match[1]);
-  return mentioned.length === 1 && mentioned[0] === botName && !text.includes('@@');
+export function holdsOnlyMention(chips: readonly string[], text: string, botName: string): boolean {
+  const names = botDisplayNames(botName).map((name) => `@${name}`);
+  return chips.length === 1 && names.includes(chips[0].trim()) && !text.includes('@@');
+}
+
+/**
+ * In-page: texts of the mention chips in the message editor. Feishu renders a
+ * picked member as `<span contenteditable="false">…<bdi>@Name</bdi>…</span>`;
+ * the placeholder is non-editable too but does not start with `@`. A string
+ * for the same reason as FIND_EDITOR.
+ */
+const MENTION_CHIPS = `(() => {
+  const editor = ${FIND_EDITOR};
+  if (!editor) return [];
+  return [...editor.querySelectorAll('[contenteditable="false"]')]
+    .filter((el) => !el.parentElement?.closest('[contenteditable="false"]'))
+    .map((el) => (el.textContent || '').replace(/[\u200b-\u200d\u2060\ufeff]/g, '').trim())
+    .filter((text) => text.startsWith('@'));
+})()`;
+
+async function inputHoldsOnlyMention(page: Page, botName: string): Promise<boolean> {
+  const chips = ((await page.evaluate(MENTION_CHIPS).catch(() => [])) ?? []) as string[];
+  return holdsOnlyMention(chips, await focusedInputText(page), botName);
 }
 
 /**
@@ -1112,9 +1151,9 @@ async function typeMention(
       await page.waitForTimeout(600);
       text = await focusedInputText(page);
       if (
-        holdsOnlyMention(text, name) &&
+        (await inputHoldsOnlyMention(page, name)) &&
         (await typeVerified(page, ` ${message}${message.startsWith('/') ? ' ' : ''}`, 20, text)) &&
-        holdsOnlyMention(await focusedInputText(page), name)
+        (await inputHoldsOnlyMention(page, name))
       ) {
         await page.keyboard.press('Enter');
         await page.waitForTimeout(1_000);
@@ -1122,14 +1161,14 @@ async function typeMention(
       }
     } else {
       console.warn(
-        `[e2e] @${name}: the member list never offered ${botChatName(name)} (attempt ${attempt}): ` +
+        `[e2e] @${name}: the member list never offered ${botDisplayNames(name).join(' / ')} (attempt ${attempt}): ` +
           (await describeMentionList(page, name)),
       );
     }
     text = await focusedInputText(page);
     console.warn(`[e2e] @${name} selection attempt ${attempt} left the input as ${JSON.stringify(text)}; retrying`);
   }
-  throw new Error(`Could not mention ${botChatName(name)}: the input still read ${JSON.stringify(text)}`);
+  throw new Error(`Could not mention ${name}: the input still read ${JSON.stringify(text)}`);
 }
 
 /** @mention `botName` from the reply input of the topic open in the main area. */
@@ -1290,7 +1329,8 @@ export async function waitForStreamingCard(
   // Step 5: Wait for streaming card.
   await agent.aiWaitFor(
     '主内容区正在显示的测试话题里出现当前会话的流式卡片；' +
-      '卡片必须带有"显示输出"、"打开 Web 终端"、"获取操作链接"或"关闭会话"这类会话操作按钮；' +
+      '卡片主行必须带有"打开 Web 终端"、"压缩"、"停止"或"关闭会话"这类会话操作按钮' +
+      '（"显示输出"等低频操作收在下方默认折叠的"更多操作"里，看不到是正常的）；' +
       '卡片标题包含"启动中"、"工作中"、"等待输入"或"正在分析"之一，或正文已经出现 Codex 的 usage/rate limit/model switch 提示；' +
       '"项目仓库管理"和"直接开启会话"的仓库选择卡不能算作流式卡片',
     { timeoutMs, checkIntervalMs: 5_000 },
@@ -1727,45 +1767,155 @@ export async function clickDirectStartIfPresent(
   }
 }
 
+/** The card's output toggle as shown; undefined while 「更多操作」 is folded. */
+export type OutputToggle = 'show' | 'hide' | undefined;
+
+/** What turnOutputOn needs from the page; injected so it can be tested. */
+export interface OutputToggleDeps {
+  toggle: () => Promise<OutputToggle>;
+  /** Click the card's 「更多操作」 header. */
+  unfoldMore: () => Promise<void>;
+  /** Click 「📖 显示输出」; false when the click did not go through. */
+  clickShow: () => Promise<boolean>;
+  /** Load Messenger afresh and open the topic again. Without it the view is never reloaded. */
+  reopen?: () => Promise<void>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
+/** How long a landed click may go without the card reading 「隐藏输出」 before the topic is reloaded. */
+const OUTPUT_STALE_MS = 25_000;
+/** What a reload that outlasted the budget still gets to unfold the panel and read the toggle. */
+const OUTPUT_AFTER_RELOAD_MS = 15_000;
+
 /**
- * Show the streaming card body in its current screenshot mode.
- * Current cards use "显示输出/隐藏输出".
+ * Turn the streaming card's output on. The toggle sits in the card's
+ * 「更多操作」 panel, folded by default, and a card update folds it again —
+ * the update this very click causes included. So unfold it whenever the toggle
+ * is out of sight or will not take a click (a panel folded by clipping keeps
+ * the label readable), and click 「显示输出」 once: a second click turns the
+ * output off again. Done when the toggle reads 「隐藏输出」.
+ *
+ * With `reopen`, a click that landed but left the card unchanged for
+ * OUTPUT_STALE_MS reloads the topic once and reads the card again, without a
+ * second click. CI: in most such failures the daemon had taken the click,
+ * switched the worker to screenshots and updated the card without an error,
+ * while the open view kept showing 「显示输出」. A card that still reads
+ * 「显示输出」 after the reload was not updated at all, and fails.
  */
+export async function turnOutputOn(
+  deps: OutputToggleDeps,
+  timeoutMs: number,
+): Promise<{ on: boolean; clicked: boolean; unfolds: number; reloaded: boolean }> {
+  let deadline = deps.now() + timeoutMs;
+  let clicked = false;
+  let clickedAt = 0;
+  let reloaded = false;
+  let unfolds = 0;
+  while (deps.now() < deadline) {
+    const toggle = await deps.toggle();
+    if (toggle === 'hide') return { on: true, clicked, unfolds, reloaded };
+    if (clicked && !reloaded && deps.reopen && deps.now() - clickedAt >= OUTPUT_STALE_MS) {
+      reloaded = true;
+      await deps.reopen();
+      deadline = Math.max(deadline, deps.now() + OUTPUT_AFTER_RELOAD_MS);
+      continue;
+    }
+    let unfold = toggle === undefined;
+    if (!unfold && !clicked) {
+      clicked = await deps.clickShow();
+      if (clicked) clickedAt = deps.now();
+      unfold = !clicked;
+    }
+    if (unfold) {
+      await deps.unfoldMore();
+      unfolds += 1;
+    }
+    await deps.sleep(1_000);
+  }
+  return { on: false, clicked, unfolds, reloaded };
+}
+
+const MORE_ACTIONS_LABEL = '更多操作';
+// Button labels only: a stale-card toast also mentions 「显示/隐藏输出」.
+const OUTPUT_TOGGLE_LABEL = /^\s*(📖|📕)?\s*(显示|隐藏)输出\s*$/;
+const SHOW_OUTPUT_LABEL = /^\s*(📖\s*)?显示输出\s*$/;
+const OUTPUT_ON_BUDGET_MS = 45_000;
+
+/** Show the streaming card body in screenshot mode (turnOutputOn). */
 export async function showStreamingOutput(
   agent: PlaywrightAgent,
   page: Page,
+  opts?: { reopen?: () => Promise<void> },
 ): Promise<void> {
+  const cardClause =
+    '主内容区正在显示的测试话题里，当前会话的流式卡片（主行带"打开 Web 终端"和"关闭会话"的那张，可能在 ACK 文本气泡上方）。' +
+    '不要把文本气泡右侧的点赞、复制、转发或更多选项当成卡片按钮。';
+  const moreHeader = () => lastVisible(page.getByText(MORE_ACTIONS_LABEL, { exact: true }));
   // The ACK text bubble is the last item after a successful reply, so "the
   // bottom of the thread" is that bubble (thumbs-up / copy / forward), not
-  // the streaming card. Bring the card's own button into view first.
-  const cardButton = page.getByRole('button', { name: /显示输出|隐藏输出/ }).last();
-  try {
-    await cardButton.scrollIntoViewIfNeeded({ timeout: 15_000 });
-  } catch {
-    // The vision checks below report a real miss.
-  }
-  const cardClause =
-    '主内容区正在显示的测试话题里，当前会话的流式卡片（带"打开 Web 终端"或"显示输出/隐藏输出"的那张，可能在 ACK 文本气泡上方）。' +
-    '不要把文本气泡右侧的点赞、复制、转发或更多选项当成卡片按钮。';
-  const needShow = await agent.aiBoolean(
-    `${cardClause}这张卡片的操作按钮中有"📖 显示输出"按钮`,
+  // the streaming card. Bring the card's own controls into view first.
+  const header = await moreHeader();
+  await header?.scrollIntoViewIfNeeded({ timeout: 15_000 }).catch(() => {});
+
+  let reloadError: string | undefined;
+  const result = await turnOutputOn(
+    {
+      toggle: async () => {
+        const button = await lastVisible(page.getByText(OUTPUT_TOGGLE_LABEL));
+        if (!button) return undefined;
+        return (await button.innerText().catch(() => '')).includes('隐藏输出') ? 'hide' : 'show';
+      },
+      unfoldMore: async () => {
+        try {
+          const current = await moreHeader();
+          if (!current) throw new Error('no 「更多操作」 header on the page');
+          await current.click({ timeout: 5_000 });
+        } catch {
+          await agent
+            .aiAct(`点击${cardClause}按钮下方的"更多操作"（折叠面板的标题，右侧有向下的箭头），把它展开`)
+            .catch(() => {});
+        }
+      },
+      clickShow: async () => {
+        const button = await lastVisible(page.getByText(SHOW_OUTPUT_LABEL));
+        if (!button) return false;
+        return button
+          .click({ timeout: 5_000 })
+          .then(() => true)
+          .catch(() => false);
+      },
+      reopen: opts?.reopen
+        ? async () => {
+            console.warn('[e2e] The card still reads 「显示输出」 after the click; reloading the topic');
+            try {
+              await opts.reopen!();
+            } catch (error) {
+              reloadError = (error as Error).message.split('\n')[0];
+              console.warn(`[e2e] Reloading the topic failed: ${reloadError}`);
+            }
+          }
+        : undefined,
+      now: () => Date.now(),
+      sleep: (ms) => page.waitForTimeout(ms),
+    },
+    OUTPUT_ON_BUDGET_MS,
   );
-  if (needShow) {
-    try {
-      await page
-        .getByRole('button', { name: /显示输出/ })
-        .last()
-        .click({ timeout: 5_000 });
-    } catch {
-      await agent.aiAct(
-        `点击${cardClause}里的"📖 显示输出"按钮；不要点击"打开 Web 终端"，也不要点文本气泡上的按钮`,
-      );
-    }
-    await page.waitForTimeout(1000);
+  if (result.on && result.reloaded) {
+    console.warn('[e2e] The card read 「隐藏输出」 only after a reload: the open view had not rendered the card update');
   }
+  if (!result.on) {
+    const detail =
+      `the card's output toggle never read 「📕 隐藏输出」 within ${OUTPUT_ON_BUDGET_MS / 1000}s ` +
+      `(clicked 「显示输出」: ${result.clicked ? 'yes' : 'no'}; unfolded 「更多操作」 ${result.unfolds}×; ` +
+      `reloaded the topic: ${!result.reloaded ? 'no' : reloadError ? `failed (${reloadError})` : 'yes'})`;
+    await recordFailureState(agent, page, MORE_ACTIONS_LABEL, detail);
+    throw new Error(`showStreamingOutput: ${detail}`);
+  }
+
+  await (await moreHeader())?.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => {});
   await agent.aiWaitFor(
-    `${cardClause}这张卡片的操作按钮中有"📕 隐藏输出"，` +
-      '并且卡片正文显示终端截图、终端区域，或"等待第一张截图"占位',
+    `${cardClause}这张卡片正文显示终端截图、终端区域，或"等待第一张截图"占位`,
     { timeoutMs: 30_000, checkIntervalMs: 2_000 },
   );
 }
@@ -1909,6 +2059,35 @@ export async function revealNewMessages(page: Page): Promise<boolean> {
 }
 
 /** Occurrences of `text` in the rendered page text, including off-screen parts. */
+/**
+ * Text nodes on the page that hold `marker` outside the prompt asking for it.
+ * The prompt quotes the same ACK inside its instruction (「请立刻调用 botmux
+ * send …」), and the chat list previews it; the reply bubble only carries the
+ * marker, possibly after an @mention in its own element.
+ */
+export async function replyMarkerCount(page: Page, marker: string): Promise<number> {
+  return page.evaluate((wanted) => {
+    let count = 0;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+      const text = (walker.currentNode as Text).data;
+      if (text.includes(wanted) && !text.includes('请立刻调用') && !text.includes('请在最终回复中')) count += 1;
+    }
+    return count;
+  }, marker);
+}
+
+/** Wait until the bot's reply carrying `marker` is on the page (replyMarkerCount). */
+export async function waitForReplyMarker(page: Page, marker: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await replyMarkerCount(page, marker).catch(() => 0)) > 0) return;
+    await scrollConversation(page);
+    await page.waitForTimeout(3_000);
+  }
+  throw new Error(`No reply carrying "${marker}" outside the prompt appeared within ${timeoutMs}ms`);
+}
+
 export async function pageTextCount(page: Page, text: string): Promise<number> {
   return (await page.locator('body').innerText()).split(text).length - 1;
 }
@@ -2099,14 +2278,70 @@ function escapeRegExp(text: string): string {
 }
 
 /**
- * Send a command and wait for the bot's answer to it: text matching `pattern`
- * that appears after the last echo of `command` (the user's bubble, or the
- * quote in the bot's reply). Returns the match. DOM order instead of counts,
- * because older messages drop out of Feishu's partial rendering. With
- * `reopen`, a view that shows nothing by half time is opened again once: CI
- * saw a mode restore fail three times while the bot had answered each within
- * a second, because the group view had stopped rendering new messages.
+ * The bot's answer to `command` in the page text `text`: text matching
+ * `pattern` that appears after the last echo of `command` (the user's bubble,
+ * or the quote in the bot's reply). DOM order instead of counts, because older
+ * messages drop out of Feishu's partial rendering.
  */
+export function replyAfterCommand(text: string, command: string, pattern: RegExp): RegExpMatchArray | null {
+  const echo = new RegExp(`${escapeRegExp(command.trim())}[ \\t]*\\n`, 'g');
+  const last = [...text.matchAll(echo)].at(-1);
+  if (!last) return null;
+  return text.slice(last.index! + last[0].length).match(pattern);
+}
+
+/** What awaitCommandReply needs from the page; injected so it can be tested. */
+export interface CommandReplyDeps {
+  /** The rendered page text. */
+  read: () => Promise<string>;
+  /** Scroll toward the newest messages and click 「N 条新消息」. */
+  nudge: () => Promise<void>;
+  /** Load Messenger afresh and open the chat again. Without it the view is never reopened. */
+  reopen?: () => Promise<void>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  log: (message: string) => void;
+}
+
+/**
+ * Wait for the answer to an already sent `command` (replyAfterCommand). With
+ * `reopen`, a view that shows nothing by half time is opened again once, and
+ * read once more if that reload outlasted the budget: CI saw a mode restore
+ * fail three times while the bot had answered each within a second, because
+ * the view had stopped rendering new messages — the answers were all there
+ * after a reload.
+ */
+export async function awaitCommandReply(
+  deps: CommandReplyDeps,
+  command: string,
+  pattern: RegExp,
+  timeoutMs: number,
+): Promise<RegExpMatchArray | null> {
+  const started = deps.now();
+  const deadline = started + timeoutMs;
+  let reopened = false;
+  while (deps.now() < deadline) {
+    const match = replyAfterCommand(await deps.read(), command, pattern);
+    if (match) return match;
+    if (deps.reopen && !reopened && deps.now() - started > timeoutMs / 2) {
+      reopened = true;
+      deps.log(`No reply to "${command}" yet; re-opening the view`);
+      try {
+        await deps.reopen();
+      } catch (error) {
+        deps.log(`Re-opening the view failed: ${(error as Error).message.split('\n')[0]}`);
+      }
+      continue;
+    }
+    await deps.nudge();
+    await deps.sleep(2_000);
+  }
+  if (!reopened) return null;
+  await deps.nudge();
+  return replyAfterCommand(await deps.read(), command, pattern);
+}
+
+/** Send a command and wait for the bot's answer to it (awaitCommandReply). Returns the match. */
 export async function sendAndAwaitReply(
   page: Page,
   send: () => Promise<void>,
@@ -2115,30 +2350,21 @@ export async function sendAndAwaitReply(
   timeoutMs = 60_000,
   reopen?: () => Promise<void>,
 ): Promise<RegExpMatchArray> {
-  const echo = new RegExp(`${escapeRegExp(command.trim())}[ \\t]*\\n`, 'g');
   await send();
-  const started = Date.now();
-  const deadline = started + timeoutMs;
-  let reopened = false;
-  while (Date.now() < deadline) {
-    const body = await page.locator('body').innerText();
-    const echoes = [...body.matchAll(echo)];
-    const after = echoes.length > 0 ? body.slice(echoes.at(-1)!.index! + echoes.at(-1)![0].length) : '';
-    const match = after.match(pattern);
-    if (match) return match;
-    if (reopen && !reopened && Date.now() - started > timeoutMs / 2) {
-      reopened = true;
-      console.warn(`[e2e] No reply to "${command}" yet; re-opening the view`);
-      try {
-        await reopen();
-      } catch (error) {
-        console.warn(`[e2e] Re-opening the view failed: ${(error as Error).message.split('\n')[0]}`);
-      }
-      continue;
-    }
-    await scrollConversation(page);
-    await page.waitForTimeout(2_000);
-  }
+  const match = await awaitCommandReply(
+    {
+      read: () => page.locator('body').innerText(),
+      nudge: () => scrollConversation(page),
+      reopen,
+      now: () => Date.now(),
+      sleep: (ms) => page.waitForTimeout(ms),
+      log: (message) => console.warn(`[e2e] ${message}`),
+    },
+    command,
+    pattern,
+    timeoutMs,
+  );
+  if (match) return match;
   throw new Error(`No reply matching ${pattern} after "${command}" within ${timeoutMs}ms`);
 }
 
@@ -2169,6 +2395,17 @@ async function anyVisible(locator: ReturnType<Page['getByText']>): Promise<boole
     if (await locator.nth(i).isVisible().catch(() => false)) return true;
   }
   return false;
+}
+
+/** The last visible match: hidden cached copies of a chat share the same text. */
+async function lastVisible(
+  locator: ReturnType<Page['getByText']>,
+): Promise<ReturnType<Page['getByText']> | undefined> {
+  const count = await locator.count().catch(() => 0);
+  for (let i = count - 1; i >= 0; i--) {
+    if (await locator.nth(i).isVisible().catch(() => false)) return locator.nth(i);
+  }
+  return undefined;
 }
 
 /** What the page held when a reply never came: tells "no card" from "not clicked". */

@@ -66,6 +66,83 @@ async function addDecideItem(title = 'PR #1 合不合') {
   return res.item;
 }
 
+describe('close in chat', () => {
+  it.each(['zh', 'en'] as const)('仅关闭（%s）：记录本地化历史、清本项草稿和提示，重复请求与重启不重复记账，不投递', async language => {
+    locale = language;
+    const historyText = language === 'en' ? 'Owner closed this item (no further decision needed)' : '本人关闭（无需再拍板）';
+    const item = await addDecideItem();
+    const other = await addDecideItem('other');
+    const draft = service.putDraft(item.seq, 'owner', { choice: 'A', baseRev: item.rev }).draft!;
+    service.putDraft(other.seq, 'owner', { choice: 'B', baseRev: other.rev });
+    const store = service.store();
+    const nextCheckAt = Date.now() + 1000;
+    store.updateItem(APP, item.seq, { nextCheckAt });
+    store.sweepHints(APP, { now: nextCheckAt + 60_000, locale: 'zh', prState: () => undefined });
+    expect(store.getItem(APP, item.seq)?.hint).toBeDefined();
+    const res = service.closeInChat(item.seq, item.rev, 'local');
+    expect(res).toMatchObject({ duplicate: false, item: { state: 'closed', rev: item.rev + 1 } });
+    expect(res.item.stateAt).toBe(res.item.updatedAt);
+    expect(res.item.hint).toBeUndefined();
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(service.detail(other.seq, 'owner').draft).toBeDefined();
+    expect(service.closeInChat(item.seq, item.rev, 'local').duplicate).toBe(true);
+    expect(store.detail(APP, item.seq)?.events.filter(e => e.text === historyText)).toHaveLength(1);
+    await expect(service.submit({ author: 'owner', nonce: 'late', items: [{ seq: item.seq, draftUpdatedAt: draft.updatedAt }] }))
+      .rejects.toMatchObject({ code: 'draft_missing' });
+    expect(() => service.putDraft(item.seq, 'owner', { text: 'late save', baseRev: item.rev })).toThrow();
+    expect(store.listBatches(APP)).toEqual([]);
+    service.close();
+    expect(service.closeInChat(item.seq, item.rev, 'local').duplicate).toBe(true);
+    await service.redeliverUndelivered();
+    expect(delivered).toEqual([]);
+  });
+  it('rejects stale versions, wrong state and disabled steward without modifying anything', async () => {
+    const item = await addDecideItem();
+    expect(() => service.closeInChat(item.seq, item.rev - 1, 'local')).toThrow();
+    expect(service.detail(item.seq, 'owner').item.state).toBe('decide');
+    service.store().updateItem(APP, item.seq, { state: 'active' });
+    expect(() => service.closeInChat(item.seq, item.rev + 1, 'local')).toThrow();
+    steward = undefined;
+    expect(() => service.closeInChat(item.seq, item.rev, 'local')).toThrow();
+    expect(delivered).toEqual([]);
+  });
+  it('管家把带草稿的事项置为 done 后，迟到提交按 item_ended 拒绝且不建批次、不动草稿', async () => {
+    const item = await addDecideItem();
+    const draft = service.putDraft(item.seq, 'owner', { choice: 'A', text: '还没提交的草稿', baseRev: item.rev }).draft!;
+    // 既有管家路径：updateItem 改状态不清草稿，所以终态事项可能仍带着草稿（旧页面/迟到批量提交会撞上）。
+    service.store().updateItem(APP, item.seq, { state: 'done' }, 'steward-1');
+    expect(service.detail(item.seq, 'owner').draft).toBeDefined();
+    await expect(service.submit({ author: 'owner', nonce: 'late-after-done',
+      items: [{ seq: item.seq, draftUpdatedAt: draft.updatedAt }] }))
+      .rejects.toMatchObject({ code: 'item_ended' });
+    expect(service.store().listBatches(APP)).toEqual([]);
+    expect(delivered).toEqual([]);
+    // 事务回滚：草稿原样留着，没有被失败的提交消费掉。
+    expect(service.detail(item.seq, 'owner').draft?.updatedAt).toBe(draft.updatedAt);
+  });
+  it('已结束事项上留下的草稿：不能再改成别的内容，但能清空，清空后不再算在待提交里', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { choice: 'A', text: '还没提交的草稿', baseRev: item.rev });
+    service.store().updateItem(APP, item.seq, { state: 'closed' }, 'steward-1');
+    const rev = service.detail(item.seq, 'owner').item.rev;
+    expect(() => service.putDraft(item.seq, 'owner', { text: '改一下', baseRev: rev })).toThrow(expect.objectContaining({ code: 'item_ended' }));
+    expect(service.list('all', 'owner').drafts.map(d => d.seq)).toEqual([item.seq]);
+    service.putDraft(item.seq, 'owner', { text: '', fileIds: [], baseRev: rev });
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(service.list('all', 'owner').drafts).toEqual([]);
+  });
+  it('待验收（accept）事项也允许 owner 关闭，落 closed 并清草稿', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { choice: 'A', baseRev: item.rev });
+    service.store().updateItem(APP, item.seq, { state: 'accept' }, 'steward-1');
+    const acceptRev = service.detail(item.seq, 'owner').item.rev;
+    const res = service.closeInChat(item.seq, acceptRev, 'local');
+    expect(res).toMatchObject({ duplicate: false, item: { state: 'closed', rev: acceptRev + 1 } });
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(service.store().listBatches(APP)).toEqual([]);
+  });
+});
+
 describe('管家开关', () => {
   it('没开管家时 CLI 一律拒绝，且不建库', async () => {
     steward = undefined;
@@ -501,6 +578,41 @@ describe('事项关联群', () => {
     expect(again).toMatchObject({ created: false, item: { seq: 1, stage: '在审' } });
     // set 也不强制。
     await cli({ action: 'set', ref: '1', fields: { stage: '在修' } });
+  });
+
+  it('同 key 的 add 碰到已结束的事项时拒绝，不改它；set 照常能重开', async () => {
+    await cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1' }, noChat: '先建着' });
+    for (const state of ['done', 'closed']) {
+      await cli({ action: 'set', ref: '1', fields: { state } });
+      const err = await cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1', state: 'decide', question: '合不合？' } })
+        .catch((e: unknown) => e);
+      expect(boardErrorStatus(err)).toMatchObject({ status: 409, error: 'item_ended' });
+      expect((await cli({ action: 'show', ref: '1' })).item).toMatchObject({ state });
+      expect((await cli({ action: 'show', ref: '1' })).item.question).toBeUndefined();
+    }
+    const items = (await cli({ action: 'list' })).items;
+    expect(items).toHaveLength(1);
+    await cli({ action: 'set', ref: 'pr:o/r#1', fields: { state: 'decide' } });
+    expect((await cli({ action: 'show', ref: '1' })).item).toMatchObject({ state: 'decide' });
+    // 没结束的照旧按 set 更新。
+    expect(await cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1', stage: '在审' } }))
+      .toMatchObject({ created: false, item: { seq: 1, stage: '在审' } });
+  });
+
+  it('add 等查群期间事项被关掉：放行后照样拒绝，不改回待拍板', async () => {
+    await cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1' }, noChat: '先建着' });
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    lookupImpl = async chatId => { await gate; return { ok: true, chatId, appId: APP, name: `群名-${chatId}` }; };
+    const pending = cli({ action: 'add', title: 'PR #1', fields: { key: 'pr:o/r#1', state: 'decide', question: '合不合？' },
+      links: ['chat=oc_a'] }).catch((e: unknown) => e);
+    await vi.waitFor(() => expect(lookups).toEqual(['oc_a']));
+    await cli({ action: 'set', ref: '1', fields: { state: 'closed' } });
+    release();
+    expect(boardErrorStatus(await pending)).toMatchObject({ status: 409, error: 'item_ended' });
+    const item = (await cli({ action: 'show', ref: '1' })).item;
+    expect(item.state).toBe('closed');
+    expect(item.question).toBeUndefined();
   });
 
   it('写群前用本机 bot 核实：查到了用群名当默认标签，给了标签就用调用方的；第一个群是主群', async () => {

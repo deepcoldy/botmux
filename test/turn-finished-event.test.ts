@@ -124,7 +124,11 @@ describe('turn.finished', () => {
         const body = Buffer.concat(chunks).toString('utf8');
         const turnId = JSON.parse(body).turnId;
         fs.mkdirSync(${JSON.stringify(markerDir)}, { recursive: true });
-        fs.writeFileSync(${JSON.stringify(markerDir)} + '/' + turnId, body);
+        // Publish the marker atomically: the test polls for it, and a plain
+        // writeFileSync is visible as an empty file between create and write.
+        const marker = ${JSON.stringify(markerDir)} + '/' + turnId;
+        fs.writeFileSync(marker + '.tmp', body);
+        fs.renameSync(marker + '.tmp', marker);
       });
     `);
     const hooksFile = join(root, 'hooks.json');
@@ -155,7 +159,7 @@ describe('turn.finished', () => {
       while (Date.now() - started < 4000) {
         try {
           ordinaryBody = readFileSync(join(markerDir, 'om_hook'), 'utf8');
-          break;
+          if (ordinaryBody) break;
         } catch { /* hook still running */ }
         await new Promise(resolve => setTimeout(resolve, 20));
       }

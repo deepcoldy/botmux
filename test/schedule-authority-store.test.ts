@@ -87,6 +87,31 @@ describe('host-only schedule authority store', () => {
       .toThrow('schedule_authority_app_required');
   });
 
+  it('enforces the live per-owner talker quota transactionally after identical replay', () => {
+    store.initializeApp(APP, []);
+    const turn = (turnId: string) => ({ turnId, maxTasksPerTurn: 1, maxLiveTasksPerOwner: 1 });
+    const first = task('talker01', { ownerAccess: 'talk', ownerOpenId: 'ou_alice', ownerUnionId: 'on_alice' });
+    expect(store.createDirect(first, turn('om_one'))).toMatchObject({ id: 'talker01' });
+    // The committed row fills the quota, but its own identical retry returns
+    // before counting and remains a successful no-op.
+    expect(store.createDirect(first, turn('om_one'))).toMatchObject({ id: 'talker01' });
+    expect(() => store.createDirect(task('talker02', {
+      ownerAccess: 'talk', ownerOpenId: 'ou_alice', ownerUnionId: 'on_alice',
+    }), turn('om_two'))).toThrow('schedule_talker_task_limit');
+
+    store.updateTask(APP, first.id, current => ({ ...current, enabled: false, disabledReason: 'manual' }));
+    expect(store.getRecord(APP, first.id)?.state).toBe('paused');
+    expect(() => store.createDirect(task('talker03', {
+      ownerAccess: 'talk', ownerOpenId: 'ou_alice', ownerUnionId: 'on_alice',
+    }), turn('om_three'))).toThrow('schedule_talker_task_limit');
+
+    store.updateTask(APP, first.id, current => ({ ...current, enabled: false, disabledReason: 'once_completed' }));
+    expect(store.getRecord(APP, first.id)?.state).toBe('completed');
+    expect(store.createDirect(task('talker04', {
+      ownerAccess: 'talk', ownerOpenId: 'ou_alice', ownerUnionId: 'on_alice',
+    }), turn('om_four'))).toMatchObject({ id: 'talker04' });
+  });
+
   it('atomically commits one grant and returns the same receipt after response loss', () => {
     store.initializeApp(APP, []);
     const input = {

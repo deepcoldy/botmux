@@ -18,35 +18,22 @@
  * app-scoped, the platform only knows the union_id) and checks `canOperate`.
  */
 
-import { isPlatformTunnelPeer } from '../platform/tunnel-peers.js';
+import {
+  readDashboardPlatformActor,
+  singleUnionId,
+  trustedPlatformActorUnionId,
+} from './dashboard-platform-actor.js';
 import { logger } from '../utils/logger.js';
 
 /** Dashboard → daemon request header carrying the verified union_id. */
 export const DASHBOARD_SCHEDULE_CREATOR_HEADER = 'x-botmux-schedule-creator-union-id';
-
-const UNION_ID = /^on_[A-Za-z0-9_-]{1,64}$/;
-
-function singleUnionId(raw: unknown): string | undefined {
-  // A repeated header arrives as an array: treat it as absent, like the
-  // dashboard's other platform headers.
-  if (typeof raw !== 'string') return undefined;
-  const value = raw.trim();
-  return UNION_ID.test(value) ? value : undefined;
-}
 
 /**
  * Dashboard side: the person a schedule write is attributed to, or undefined
  * for a token-only write. `fromPlatformTunnel` must come from the connection
  * itself (isPlatformTunnelPeer), never from anything the request says.
  */
-export function dashboardScheduleCreatorUnionId(input: {
-  platformBound: boolean;
-  fromPlatformTunnel: boolean;
-  actorHeader: unknown;
-}): string | undefined {
-  if (!input.platformBound || !input.fromPlatformTunnel) return undefined;
-  return singleUnionId(input.actorHeader);
-}
+export const dashboardScheduleCreatorUnionId = trustedPlatformActorUnionId;
 
 /** Headers for a schedule create/edit the Dashboard forwards to its daemon:
  *  the Feishu-login person rides along only when the platform tunnel delivered
@@ -56,18 +43,13 @@ export function dashboardScheduleWriteHeaders(
   req: { socket?: { remoteAddress?: string | null; remotePort?: number | null }; headers: Record<string, unknown> },
   platformBound: boolean,
 ): Record<string, string> {
-  const fromPlatformTunnel = isPlatformTunnelPeer(req.socket);
-  const unionId = dashboardScheduleCreatorUnionId({
-    platformBound,
-    fromPlatformTunnel,
-    actorHeader: req.headers['x-botmux-actor'],
-  });
+  const actor = readDashboardPlatformActor(req, platformBound);
   // The platform can also reach a machine directly on its LAN dashboard port
   // (the `directHosts` it learns from heartbeats), bypassing the tunnel. That
   // path cannot be told apart from any other LAN client, so its actor header
   // is not believed either. Say so, or "sometimes it records me, sometimes
   // the owner" has no explanation anywhere.
-  if (platformBound && !fromPlatformTunnel && req.headers['x-botmux-actor'] !== undefined) {
+  if (actor.ignoredActorHeader) {
     logger.info(
       `[schedule-creator] X-Botmux-Actor ignored: not a platform tunnel connection `
       + `(peer=${req.socket?.remoteAddress ?? '?'}:${req.socket?.remotePort ?? '?'}); this write keeps the token-login attribution`,
@@ -75,7 +57,7 @@ export function dashboardScheduleWriteHeaders(
   }
   return {
     'content-type': 'application/json',
-    ...(unionId ? { [DASHBOARD_SCHEDULE_CREATOR_HEADER]: unionId } : {}),
+    ...(actor.unionId ? { [DASHBOARD_SCHEDULE_CREATOR_HEADER]: actor.unionId } : {}),
   };
 }
 

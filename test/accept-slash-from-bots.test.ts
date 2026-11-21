@@ -7,6 +7,9 @@
  * is routed as a command; human senders are never gated by it. See daemon.ts's
  * two invocation-parse sites.
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('node:fs', async (importOriginal) => {

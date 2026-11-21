@@ -17,7 +17,7 @@ it('returns the HTTP 400 contract without probing an invalid selection', async (
 it('does not apply Bot env when its launch identity does not match the selected CLI', async () => {
   const probe = vi.fn<typeof checkCliAvailabilityAsync>(async () => available);
   const base = { PATH: '/host/bin' };
-  const response = await cliAvailabilityResponse('gemini', bot, base, probe, createCliAvailabilityCache());
+  const response = await cliAvailabilityResponse('opencode', bot, base, probe, createCliAvailabilityCache());
   expect(probe.mock.calls[0]![1]!.env).toEqual(base);
   expect(response).toEqual({ statusCode: 200, body: { status: 'available', command: '/private/tool' } });
   expect(JSON.stringify(response)).not.toContain('secret');

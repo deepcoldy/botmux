@@ -1,11 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
+import { Readable } from 'node:stream';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
 // Avoid real trigger-log writes to ~/.botmux/data during dispatch tests.
 vi.mock('../src/services/trigger-log-store.js', () => ({ appendTriggerLog: vi.fn() }));
 
 import { buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
-import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
-import { dispatchTriggerRequest, queryTriggerResult } from '../src/dashboard/trigger-api.js';
+import { validateTriggerRequest, TRIGGER_SOURCE_TYPES, type TriggerRequest } from '../src/services/trigger-types.js';
+import { dispatchTriggerRequest, handleDashboardTriggerApi, queryTriggerResult, rejectActorOnDeniedTrigger } from '../src/dashboard/trigger-api.js';
+import { resolveDashboardRequestGate } from '../src/dashboard/request-identity.js';
+import { appendTriggerLog } from '../src/services/trigger-log-store.js';
 
 function request(): TriggerRequest {
   return {
@@ -22,6 +26,79 @@ function request(): TriggerRequest {
   };
 }
 
+function ownerRequest() {
+  return {
+    actor: 'owner',
+    source: { type: 'webhook', connectorId: 'example-connector' },
+    target: { kind: 'turn', botId: 'fixture-bot', sessionId: 'fixture-session' },
+    instruction: 'Continue the tests',
+    envelope: { format: 'text', sourceName: 'Example client', trusted: false },
+  };
+}
+
+describe('owner actor at the dashboard edge', () => {
+  const token = 'fixture-admin-token';
+  const gateInput = { method: 'POST', pathname: '/api/trigger', hasTokenParam: false, publicReadOnly: true, activeToken: token };
+  const platform = { userId: 'fixture-user', authSessionId: 'fixture-auth', expiresAt: 100,
+    previewCapability: 'operate' as const, canManageHost: true };
+
+  async function post(body: unknown, identity: Parameters<typeof resolveDashboardRequestGate>[0]['identity'], tokenFromRequest?: string) {
+    const gate = resolveDashboardRequestGate({ ...gateInput, identity, tokenFromRequest });
+    const req = Readable.from([Buffer.from(JSON.stringify(body))]) as unknown as IncomingMessage;
+    const writeHead = vi.fn();
+    const end = vi.fn();
+    const res = { writeHead, end } as unknown as ServerResponse;
+    const proxyToDaemon = vi.fn(async () => Response.json({ ok: true, actor: 'owner' }));
+    if (gate.decision.kind === 'deny401') {
+      expect(await rejectActorOnDeniedTrigger(req, res)).toBe(true);
+    } else {
+      await handleDashboardTriggerApi(req, res, { proxyToDaemon }, gate.allowOwnerActor);
+    }
+    return { status: writeHead.mock.calls[0]?.[0], body: JSON.parse(end.mock.calls[0]?.[0]), proxyToDaemon };
+  }
+
+  it('forwards only with the local management credential and audits the stated source', async () => {
+    const result = await post(ownerRequest(), null, token);
+    expect(result).toMatchObject({ status: 200, body: { ok: true, actor: 'owner' } });
+    expect(result.proxyToDaemon).toHaveBeenCalledWith('fixture-bot', '/api/trigger/owner', expect.objectContaining({
+      body: JSON.stringify(ownerRequest()),
+    }));
+    expect(appendTriggerLog).toHaveBeenCalledWith(expect.objectContaining({
+      actor: 'owner', connectorId: 'example-connector', sourceName: 'Example client',
+    }));
+  });
+
+  it('rejects public-read, H5, and platform management identities before proxying', async () => {
+    for (const [identity, presented] of [
+      [null, 'fixture-read-token'],
+      [{ ...platform, kind: 'feishu-h5' as const }, token],
+      [{ ...platform, kind: 'platform-dashboard' as const }, token],
+    ] as const) {
+      const result = await post(ownerRequest(), identity, presented);
+      expect(result).toMatchObject({ status: 403, body: { errorCode: 'actor_not_allowed' } });
+      expect(result.proxyToDaemon).not.toHaveBeenCalled();
+    }
+  });
+
+  it('returns 400 for invalid actor values, conflicting payloads, and incomplete targets', async () => {
+    const request = ownerRequest();
+    for (const body of [
+      { ...request, actor: null },
+      { ...request, actor: 'ou_other' },
+      { ...request, actor: true },
+      { ...request, envelope: { ...request.envelope, payload: null } },
+      { ...request, envelope: { ...request.envelope, rawText: '' } },
+      { ...request, target: { ...request.target, kind: 'workflow' } },
+      { ...request, target: { ...request.target, sessionId: undefined } },
+      { ...request, target: { ...request.target, botId: undefined } },
+    ]) {
+      const result = await post(body, null, token);
+      expect(result).toMatchObject({ status: 400, body: { errorCode: 'bad_request' } });
+      expect(result.proxyToDaemon).not.toHaveBeenCalled();
+    }
+  });
+});
+
 describe('trigger request contract', () => {
   it('accepts the P1 turn schema', () => {
     const v = validateTriggerRequest(request());
@@ -34,6 +111,45 @@ describe('trigger request contract', () => {
     const v = validateTriggerRequest(bad);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('accepts payloadTrusted only as literal true on a webhook turn', () => {
+    const ok = request();
+    ok.payloadTrusted = true;
+    expect(validateTriggerRequest(ok).ok).toBe(true);
+    for (const mutate of [
+      (r: any) => { r.payloadTrusted = 'true'; },
+      (r: any) => { r.payloadTrusted = false; },
+      (r: any) => { r.payloadTrusted = 1; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'headless'; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'vc_meeting'; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'ui'; },
+      (r: any) => { r.payloadTrusted = true; r.target = { kind: 'workflow', botId: 'app1', chatId: 'oc_1', workflowId: 'w' }; },
+    ]) {
+      const bad = request() as any;
+      mutate(bad);
+      const v = validateTriggerRequest(bad);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.status).toBe(400);
+    }
+  });
+
+  it('accepts every known connector source type and rejects unknown ones', () => {
+    for (const type of TRIGGER_SOURCE_TYPES) {
+      const req = request();
+      req.source = { ...req.source, type };
+      expect(validateTriggerRequest(req).ok, type).toBe(true);
+    }
+    for (const badType of ['email', 'EMAIL', '', 'webhoox', 42, undefined]) {
+      const bad = request() as any;
+      bad.source = { ...bad.source, type: badType };
+      const v = validateTriggerRequest(bad);
+      expect(v.ok, String(badType)).toBe(false);
+      if (!v.ok) {
+        expect(v.status).toBe(400);
+        expect(v.body.errorCode).toBe('bad_request');
+      }
+    }
   });
 
   it('accepts a custom or suppressed topic message and rejects malformed presentation', () => {

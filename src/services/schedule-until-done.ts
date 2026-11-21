@@ -396,7 +396,7 @@ export function scheduleNotificationText(
 /** Hidden run context appended to every until-done run's prompt, so the task
  *  author only states what to wait for and what to do. */
 export function buildUntilDoneRunPrompt(
-  task: Pick<ScheduledTask, 'id' | 'untilDone'>,
+  task: Pick<ScheduledTask, 'id' | 'untilDone' | 'silent'>,
   runId: string,
   formatTime: (iso: string) => string,
 ): string | undefined {
@@ -407,15 +407,19 @@ export function buildUntilDoneRunPrompt(
   if (state.finalRunId === runId) {
     return [
       `[botmux 跟进任务] 定时任务 ${task.id} 已到截止时间${deadline}，这是最后一次执行（第 ${attempt} 次）。`,
-      '- 按现状收尾：已经完成就先运行 `botmux schedule done self --note "<一句话结果>"`，再发最终答复。',
-      '- 做不完就用 botmux send 说明现状与原因。本轮结束后任务自动关闭，不会再执行。',
+      task.silent === true
+        ? '- 按现状收尾：已经完成就先运行 `botmux schedule done self --note "<一句话结果>"`，再用 `botmux send --response-kind final` 交付结果（静默回合的最终回复不会发到群里，必须显式 send）。'
+        : '- 按现状收尾：已经完成就先运行 `botmux schedule done self --note "<一句话结果>"`，再发最终答复。',
+      task.silent === true
+        ? '- 做不完就用 `botmux send --response-kind final` 说明现状与原因（静默回合的最终回复不会发到群里，必须显式 send）。本轮结束后任务自动关闭，不会再执行。'
+        : '- 做不完就在最终答复里说明现状与原因。本轮结束后任务自动关闭，不会再执行。',
     ].join('\n');
   }
   return [
     `[botmux 跟进任务] 这是「直到完成」定时任务 ${task.id} 的第 ${attempt} 次执行${deadline}。`,
     '- 先判断要等的条件是否已经满足、要做的事是否已经做完。',
     '- 已完成：先运行 `botmux schedule done self --note "<一句话结果>"`，再发最终答复；任务随即结束。',
-    '- 未完成：直接结束本轮即可，不要删除或暂停任务，系统会按计划再次执行。',
+    '- 未完成：最终回复只输出 `BOTMUX_NOTHING_TO_SEND`，不发进度；不要删除或暂停任务，系统会按计划再次执行。',
   ].join('\n');
 }
 

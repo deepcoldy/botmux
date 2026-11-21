@@ -1,6 +1,7 @@
 /** Shared client for authenticated Workflow v3 daemon mutations. */
 
 import type { OnlineDaemonInfo } from '../../utils/daemon-discovery.js';
+import { findAuthenticatedAncestorSessionContext } from '../../core/session-marker.js';
 import { loopbackFetchImpl } from '../../core/loopback-fetch.js';
 import {
   generateWorkflowDaemonIpcNonce,
@@ -11,7 +12,7 @@ import {
   type WorkflowDaemonIpcTarget,
 } from './daemon-ipc-auth.js';
 
-export type WorkflowDaemonMutation = 'start' | 'cancel' | 'retry' | 'grant';
+export type WorkflowDaemonMutation = 'start' | 'cancel' | 'retry' | 'grant' | 'edit' | 'ask-human';
 
 export interface WorkflowDaemonMutationResponse {
   ok: boolean;
@@ -69,11 +70,30 @@ export async function postWorkflowDaemonMutation(input: {
   fetchImpl?: typeof fetch;
   timestamp?: string;
   nonce?: string;
+  /** Process context used to attach the current per-turn proof. Tests may
+   *  supply a real marker directory; production uses the ambient process. */
+  env?: NodeJS.ProcessEnv;
+  startPid?: number;
 }): Promise<WorkflowDaemonMutationResponse> {
   const target = workflowDaemonMutationTarget(input.daemon);
   const secret = input.secret ?? loadWorkflowDaemonIpcSecret(input.secretPath);
   const pathWithQuery = workflowDaemonMutationPath(input.runId, input.mutation);
-  const bodyRaw = JSON.stringify(input.body ?? {});
+  const env = input.env ?? process.env;
+  const turn = env.SESSION_DATA_DIR
+    ? findAuthenticatedAncestorSessionContext(env.SESSION_DATA_DIR, input.startPid ?? process.ppid)
+    : null;
+  // The HMAC covers these claims, but the daemon still verifies the capability
+  // against its live session and reads schedule authority itself. A child can
+  // delete marker fields only to lose admission, never to gain a different one.
+  const bodyRaw = JSON.stringify({
+    ...(input.body ?? {}),
+    ...(turn ? {
+      sessionId: turn.sessionId,
+      originTurnId: turn.turnId,
+      ...(turn.capability ? { originCapability: turn.capability } : {}),
+      ...(turn.dispatchAttempt !== undefined ? { originDispatchAttempt: turn.dispatchAttempt } : {}),
+    } : {}),
+  });
   const timestamp = input.timestamp ?? String(Date.now());
   const nonce = input.nonce ?? generateWorkflowDaemonIpcNonce();
   const headers = workflowDaemonIpcHeaders({

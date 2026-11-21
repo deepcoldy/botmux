@@ -85,13 +85,20 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
-// 团队拉群（bot 免 /grant 的信任根）。只把 oc_team_group 标成拉群，其余不变。
+// 团队拉群（bot 免 /grant 的信任根）。只把 oc_team_group 登记成旧版联邦团队群
+//（无 platform: 前缀，按群放行），其余不变。
 vi.mock('../src/services/team-groups-store.js', async () => {
   const actual = await vi.importActual<any>('../src/services/team-groups-store.js');
-  return { ...actual, isTeamGroupChat: (_dataDir: string, chatId?: string) => chatId === 'oc_team_group' };
+  const bindings = [{ teamId: 'legacy-team', chatId: 'oc_team_group', createdAt: 0 }];
+  return {
+    ...actual,
+    listTeamGroups: (_dataDir: string, teamId?: string) => bindings.filter(b => teamId === undefined || b.teamId === teamId),
+  };
 });
 
 import { registerBot, getBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
+import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { parseSlashCommandInvocation } from '../src/core/command-handler.js';
 import {
@@ -162,6 +169,34 @@ describe('message quota enforcement', () => {
         undefined, undefined, 'group', true,
       ),
     ).resolves.toBe(true);
+  });
+
+  it('external roster bot 在 quota 复查仍需 union + appId 配对', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-quota-external-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dir;
+    applyPlatformTeamSync(dir, { rev: 'r-ext', teams: [{
+      teamId: 't1', teamName: 'T1', groupChatIds: [],
+      bots: [{ appId: 'quota_app', unionId: 'on_quota' }, { appId: 'cli_ext', unionId: 'on_ext', external: true }],
+      memberUnionIds: [],
+    }] });
+    try {
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_public', 'ou_ext', 'om_ext_pair', 'om_anchor', 'on_ext', undefined, 'group', true,
+        { skipCharge: true, senderAppId: 'cli_ext' },
+      )).resolves.toBe(true);
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_public', 'ou_ext', 'om_ext_mismatch', 'om_anchor', 'on_ext', undefined, 'group', true,
+        { skipCharge: true, senderAppId: 'cli_other' },
+      )).resolves.toBe(false);
+      await expect(enforceMessageQuotaForCliInput(
+        'quota_app', 'oc_public', 'ou_ext', 'om_ext_missing', 'om_anchor', 'on_ext', undefined, 'group', true,
+        { skipCharge: true },
+      )).resolves.toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('同一条消息不标 bot（人的路径）仍按 evaluateTalk 拦下——团队拉群不放行真人', async () => {
@@ -693,6 +728,58 @@ describe("p2pMode='group' 建群前扣费点：命令判定必须早于扣费", 
         senderOpenId: 'ou_chat',
         chatId: 'oc_1',
       });
+    });
+
+    it('resolves an indirect prompt only after talk authorization', async () => {
+      const resolvePrompt = vi.fn(async () => ({
+        promptContent: 'quoted task',
+        promptAttachments: [{ type: 'file', name: 'prod.env' }],
+      }));
+
+      await expect(enforceMessageQuotaForCliInput(
+        APP, DM_CHAT, 'ou_stranger', 'om_gate_unauthorized_resolver', 'om_anchor',
+        undefined, undefined, 'group', false, { resolvePrompt },
+      )).resolves.toBe(false);
+
+      expect(resolvePrompt).not.toHaveBeenCalled();
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
+    });
+
+    it('adjudicates resolved text and attachment metadata before charging', async () => {
+      const seen = join(gateDir, 'seen-resolved.json');
+      installGate(`
+        import { writeFileSync } from 'node:fs';
+        let input = '';
+        process.stdin.setEncoding('utf8');
+        process.stdin.on('data', c => { input += c; });
+        process.stdin.on('end', () => {
+          const p = JSON.parse(input);
+          writeFileSync(${JSON.stringify(seen)}, JSON.stringify(p));
+          const denied = String(p.content ?? '').includes('机密')
+            || (p.attachments ?? []).some(a => a.name.endsWith('.env'));
+          console.log(JSON.stringify(denied
+            ? { decision: 'deny', reason: 'resolved task rejected' }
+            : { decision: 'allow' }));
+        });
+      `);
+      const resolvePrompt = vi.fn(async () => ({
+        promptContent: '机密任务',
+        promptAttachments: [{ type: 'file', name: 'prod.env' }],
+      }));
+
+      await expect(enforceMessageQuotaForCliInput(
+        APP, DM_CHAT, GRANTEE, 'om_gate_resolved_deny', 'om_anchor',
+        undefined, undefined, 'group', false, { resolvePrompt },
+      )).resolves.toBe(false);
+
+      expect(resolvePrompt).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(readFileSync(seen, 'utf-8'))).toMatchObject({
+        content: '机密任务',
+        attachments: [{ type: 'file', name: 'prod.env' }],
+      });
+      expect(mocks.beginCharge).not.toHaveBeenCalled();
+      expect(mocks.consumeQuota).not.toHaveBeenCalled();
     });
 
     it('sees attachment metadata even though the files are not downloaded yet', async () => {

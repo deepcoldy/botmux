@@ -1,311 +1,125 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
-import { spawnNodeTsScript } from './helpers/ts-runner.js';
-import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { resolveCodexRpcInput } from '../src/services/codex-rpc-input-policy.js';
-import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
-import { readJsonLines } from './helpers/read-json-lines.js';
+import { writeFileSync } from 'node:fs';
+import { describe, expect, it } from 'vitest';
+import type { DaemonToWorker } from '../src/types.js';
 import { t } from '../src/i18n/index.js';
-import { lookupCliDisplayName } from '../src/adapters/cli/display-names.js';
-import { restartInterruptionNote, restartInterruptionNotice } from '../src/services/restart-interruption.js';
+import { fixture, rows, interruptionNote, interruptionNotices, modelOrderNoticeFragment, useTraexAutoModelIntegrationCleanup } from './helpers/traex-auto-model-integration.js';
 
-const interruptedTurn = { turnOpen: true, tasks: [] };
-const interruptionNote = () => restartInterruptionNote(interruptedTurn);
-const interruptionNotices = (messages: WorkerToDaemon[]) => messages.filter(message =>
-  message.type === 'user_notify' && [true, false].some(noteDelivered =>
-    message.message === restartInterruptionNotice(interruptedTurn, {
-      cliName: lookupCliDisplayName('traex') ?? 'CLI', noteDelivered,
-    })));
-import { messages as zhMessages } from '../src/i18n/zh.js';
-
-// Structural match for the capacity-switch notice, not a hard-coded copy line:
-// take the longest placeholder-free literal of the SAME zh template the worker
-// renders (the test worker runs with the default zh locale). A copy edit in
-// zh.ts then moves this fragment, the assertion and the worker-side delay hook
-// together, so the hook can never silently stop matching.
-const modelOrderNoticeFragment = zhMessages['worker.traex_auto_model.available_model']
-  .split(/\{[^}]*\}/).map(part => part.trim()).filter(part => part.length >= 4)
-  .sort((a, b) => b.length - a.length)[0];
-// Fail at module load with an actionable message if the template is ever edited
-// down to placeholders only: otherwise the value would silently be undefined,
-// the worker delay hook would never match, and the regression would only show
-// up as a confusing notice-count timeout deep inside the test.
-if (!modelOrderNoticeFragment) {
-  throw new Error('worker.traex_auto_model.available_model has no >=4-char literal fragment to match');
-}
-
-const children: ChildProcess[] = [];
-const roots: string[] = [];
-const panes: string[] = [];
-afterEach(async () => {
-  for (const child of children.splice(0)) {
-    if (child.exitCode === null && child.signalCode === null) {
-      const stopped = new Promise(resolveExit => child.once('exit', resolveExit));
-      child.kill('SIGKILL');
-      await Promise.race([stopped, new Promise(resolveWait => setTimeout(resolveWait, 2_000))]);
-    }
-  }
-  for (const pane of panes.splice(0)) {
-    killWorkerTmuxSession(`=${pane}`);
-  }
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
-});
-
-function rows(path: string): any[] {
-  return readJsonLines(path);
-}
-
-async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = false, reselectPerTurn = false,
-  rpcPolicy?: { override?: boolean; global: boolean }, restoreWithoutBanner = false, startupExtraArgs?: string,
-  freshStart = false, activityMode?: 'working' | 'queue-after-second' | 'delayed-first-queue', terminalDelayMs = 0,
-  delaySecondModelOrderNoticeMs = 0, exitFirstReplacement = false, holdPreferredSuccessor = false) {
-  const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
-  roots.push(root);
-  const dataDir = join(root, 'session');
-  const traeHome = join(root, '.trae');
-  const cliDir = join(traeHome, 'cli');
-  const nativeId = '00000000-0000-7000-8000-000000000555';
-  const rollouts = join(cliDir, 'sessions', '2026', '10', '21');
-  mkdirSync(dataDir, { recursive: true });
-  mkdirSync(rollouts, { recursive: true });
-  const rolloutPath = join(rollouts, `rollout-2026-10-21T00-00-00-${nativeId}.jsonl`);
-  const historyPath = join(cliDir, 'history.jsonl');
-  const submissions = join(root, 'submissions.jsonl');
-  const launches = join(root, 'launches.jsonl');
-  const rpcRequests = join(root, 'catalog-requests.jsonl');
-  const release = join(root, 'release');
-  const crash = join(root, 'crash');
-  const replacementExit = join(root, 'replacement-exit');
-  if (exitFirstReplacement) writeFileSync(replacementExit, '1');
-  writeFileSync(rolloutPath, '');
-  writeFileSync(historyPath, '');
-  const fake = join(root, 'fake-traex');
-  writeFileSync(fake, `#!/usr/bin/env node
-const fs = require('node:fs');
-if (process.argv[2] === 'app-server') {
-  let pending = '';
-  process.stdin.setEncoding('utf8');
-  process.stdin.on('data', chunk => {
-    pending += chunk;
-    let end;
-    while ((end = pending.indexOf('\\n')) >= 0) {
-      const request = JSON.parse(pending.slice(0, end)); pending = pending.slice(end + 1);
-      fs.appendFileSync(${JSON.stringify(rpcRequests)}, JSON.stringify({ method: request.method }) + '\\n');
-      if (request.method === 'initialize') process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n');
-      if (request.method === 'model/list') process.stdout.write(JSON.stringify({ id: request.id, result: {
-        data: ${JSON.stringify(loadData ? [
-          { id: 'core', businessMetadata: { load: { load_percent: 180 } } },
-          { id: 'backup', businessMetadata: { load: { load_percent: loadData === 'ordered' ? 100 : 160 } } },
-          { id: 'last', businessMetadata: { load: { load_percent: loadData === 'ordered' ? 50 : 120 } } },
-          { id: 'outside', businessMetadata: { load: { load_percent: 0 } } },
-        ] : [])}, nextCursor: null } }) + '\\n');
-    }
-  });
-} else {
-const model = process.argv[process.argv.indexOf('--model') + 1];
-const nativeId = ${JSON.stringify(nativeId)};
-const release = ${JSON.stringify(release)};
-const rollout = ${JSON.stringify(rolloutPath)};
-// Fresh-session discovery follows the native CLI's open rollout descriptor.
-const rolloutFd = fs.openSync(rollout, 'a');
-if (!process.argv.includes('resume')) fs.writeSync(rolloutFd, JSON.stringify({
-  type: 'session_meta', payload: { id: nativeId, cwd: process.cwd() },
-}) + '\\n');
-fs.appendFileSync(${JSON.stringify(launches)}, JSON.stringify({ model, args: process.argv.slice(2) }) + '\\n');
-const exitBeforePrompt = model !== 'core' && fs.existsSync(${JSON.stringify(replacementExit)});
-if (exitBeforePrompt) {
-  fs.unlinkSync(${JSON.stringify(replacementExit)});
-  // Let persistent backends establish their pane/pipe before the process
-  // exits, while still preceding the worker's first-prompt readiness edge.
-  setTimeout(() => process.exit(1), 1_000);
-}
-process.stdin.setRawMode?.(true);
-process.stdin.setEncoding('utf8');
-process.stdout.write('\\x1b[?2004h');
-let input = '', pasted = '', submitted = false, completed = false, submissionCount = 0;
-let turnId;
-const startedAt = Date.now();
-function line(payload) { fs.writeSync(rolloutFd, JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload }) + '\\n'); }
-function idle() {
-  if (exitBeforePrompt) {
-    process.stdout.write('\\x1b[2J\\x1b[H│ model: loading /model to change │\\n❯ Ask anything\\n');
-    return;
-  }
-  if (${JSON.stringify(restoreWithoutBanner)} && model !== 'core') {
-    if (Date.now() - startedAt < 400) {
-      process.stdout.write('\\x1b[2J\\x1b[H│ model: loading /model to change │\\n│ directory: ${dataDir} │\\n❯ Explain this codebase\\n');
-    } else {
-      process.stdout.write('\\x1b[2J\\x1b[H■ Conversation interrupted - use /feedback if something went wrong\\n⚠ This session was recorded with model core but is resuming with backup. Consider switching back as it may affect TRAE CLI performance.\\n──────── Configure botmux environment ─\\n❯ Explain this codebase\\n───────────────────────────────────────\\n  ' + model + ' xhigh · ~ · Context 89% left\\n  ☢ Full Access · ? for shortcuts\\n');
-    }
-    return;
-  }
-  process.stdout.write('\\x1b[2J\\x1b[H╭──────────────────────────────────────────╮\\n│ model: ' + model + ' /model to change │\\n│ directory: ${dataDir} │\\n╰──────────────────────────────────────────╯\\n❯ Ask TraeCode CLI to do anything\\nContext 99% left\\n');
-}
-function queued() {
-  const rank = model === 'core' ? 1590 : model === 'backup' ? 1000 : 10;
-  process.stdout.write('\\x1b[2J\\x1b[H◆ Queued for capacity (20s • esc to interrupt)\\n  └ Too many requests right now. You\\'re in the queue at position ' + rank + '.\\nContext 99% left\\n');
-}
-idle();
-for (const delay of [200, 500, 1000]) setTimeout(() => { if (!submitted) idle(); }, delay);
-process.stdin.on('data', chunk => {
-  input += chunk;
-  const start = input.indexOf('\\x1b[200~');
-  const end = input.indexOf('\\x1b[201~', start + 6);
-  if (start >= 0 && end >= 0) { pasted = input.slice(start + 6, end); input = input.slice(end + 6); }
-  if (pasted && /[\\r\\n]/.test(input)) {
-    const text = pasted; pasted = ''; input = ''; submitted = true; completed = false;
-    turnId = require('node:crypto').randomUUID();
-    fs.appendFileSync(${JSON.stringify(submissions)}, JSON.stringify({ model, text }) + '\\n');
-    fs.appendFileSync(${JSON.stringify(historyPath)}, JSON.stringify({ session_id: nativeId, ts: Date.now() / 1000, text }) + '\\n');
-    line({ type: 'task_started', turn_id: turnId });
-    line({ type: 'user_message', message: text, images: [], local_images: [], text_elements: [], turn_id: turnId });
-    // Real interrupted work leaves model/tool history beyond the user receipt.
-    // This also exercises the restart scan after that receipt was already read.
-    fs.writeSync(rolloutFd, JSON.stringify({ timestamp: new Date().toISOString(), type: 'history_mutation',
-      payload: { version: 1, commit_id: turnId, turn_id: turnId, operation: 'append',
-        items: [{ type: 'function_call', name: 'read_file', call_id: turnId, arguments: '{"path":"src/a.ts"}' }] },
-    }) + '\\n');
-    submissionCount++;
-    // The preferred-model successor starts on core only AFTER the pool walk
-    // already reached 'last' (a prior launch row exists). Its turn is open
-    // work — the release file was removed by the last model — not a capacity
-    // queue. Painting Queued here would start a second pool walk for the
-    // successor turn and race the later crash (observed under the tmux
-    // backend, whose slower restart window let the walk fire first).
-    const successorAfterReset = ${JSON.stringify(holdPreferredSuccessor)} && model === 'core'
-      && fs.existsSync(${JSON.stringify(launches)})
-      && fs.readFileSync(${JSON.stringify(launches)}, 'utf8').includes('"model":"last"');
-    if (successorAfterReset) {
-      process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
-    } else if (${JSON.stringify(activityMode === 'delayed-first-queue')} && model === 'core') {
-      // Native submission is acknowledged before its first activity repaint.
-      // Keep the previous composer visible while follow-up IPC is received.
-      idle();
-      setTimeout(queued, 1_500);
-    } else if (${JSON.stringify(activityMode !== undefined)} && (${JSON.stringify(activityMode === 'working' || activityMode === 'delayed-first-queue')} || submissionCount === 1)) {
-      process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
-    } else queued();
-  }
-});
-setInterval(() => {
-  if (fs.existsSync(${JSON.stringify(crash)})) { fs.unlinkSync(${JSON.stringify(crash)}); process.exit(1); }
-  if (submitted && !completed && fs.existsSync(release)) {
-    completed = true;
-    // Keep the preferred successor open so its later crash exercises the
-    // ordinary interruption scan after a resumeCurrentTurn=false reset.
-    if (${JSON.stringify(holdPreferredSuccessor)} && model === 'last') fs.unlinkSync(release);
-    const complete = () => line({ type: 'task_complete', turn_id: turnId, last_agent_message: 'done', duration_ms: 1000 });
-    // terminalDelayMs paints the composer BEFORE the authoritative terminal:
-    // the exact window where a capacity-held follow-up must not be type-ahead
-    // written into the still-running degraded pane.
-    if (${terminalDelayMs} > 0) { idle(); setTimeout(complete, ${terminalDelayMs}); }
-    else { complete(); idle(); }
-  }
-}, 100);
-}
-`);
-  chmodSync(fake, 0o755);
-  const messages: WorkerToDaemon[] = [];
-  const logs: string[] = [];
-  const sessionId = randomUUID();
-  const binary = process.env.BOTMUX_TEST_WORKER_BINARY;
-  const backendType = binary || process.env.BOTMUX_TEST_WORKER_BACKEND === 'tmux' ? 'tmux' : 'pty';
-  if (backendType === 'tmux') panes.push(`bmx-${sessionId.slice(0, 8)}`);
-  const options = {
-    cwd: resolve('.'),
-    env: { ...process.env, HOME: root, TRAE_HOME: traeHome, BOTMUX_TIME_SCALE: '0.01',
-      CLI_EXTRA_ARGS: startupExtraArgs ?? '', SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'secret' },
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'] as any,
-  };
-  let entry = resolve('src/worker.ts');
-  if (!binary && (activityMode || delaySecondModelOrderNoticeMs > 0)) {
-    // Test-only worker bootstrap, generated into the fixture's cleaned root.
-    // - activityMode: heartbeats + capture timing for admission measurements;
-    // - delaySecondModelOrderNoticeMs: delay the worker-side send of the 2nd
-    //   capacity-switch notice, reproducing IPC/backpressure delivery lag. The
-    //   notice rides the worker IPC channel while the relaunched CLI's
-    //   submission rides the PTY channel; the notice leads the 3rd submission
-    //   by only a few seconds locally, so 4s reliably inverts their arrival.
-    const tmuxImport = JSON.stringify(pathToFileURL(resolve('src/adapters/backend/tmux-pipe-backend.ts')).href);
-    const workerImport = JSON.stringify(pathToFileURL(resolve('src/worker.ts')).href);
-    const heartbeatProbe = activityMode ? `
-let previous = performance.now();
-setInterval(() => {
-  const now = performance.now();
-  if (process.connected) process.send?.({ type: 'admission_heartbeat', atMs: Date.now(), gapMs: now - previous });
-  previous = now;
-}, 5).unref();
-const { TmuxPipeBackend } = await import(${tmuxImport});
-const capture = TmuxPipeBackend.prototype.captureViewportAsync;
-TmuxPipeBackend.prototype.captureViewportAsync = async function () {
-  const started = performance.now();
-  try { return await capture.call(this); }
-  finally { if (process.connected) process.send?.({ type: 'admission_capture', elapsedMs: performance.now() - started }); }
-};
-` : '';
-    const delayedNoticeSend = delaySecondModelOrderNoticeMs > 0 ? `
-const __modelOrderNoticeFragment = ${JSON.stringify(modelOrderNoticeFragment)};
-let __modelOrderNotices = 0;
-const __realSend = process.send?.bind(process);
-if (__realSend) process.send = function (msg: any, callback?: any): boolean {
-  if (msg && msg.type === 'user_notify' && typeof msg.message === 'string'
-    && msg.message.includes(__modelOrderNoticeFragment)) {
-    __modelOrderNotices++;
-    if (__modelOrderNotices === 2) {
-      setTimeout(() => __realSend(msg, callback), ${delaySecondModelOrderNoticeMs});
-      return true;
-    }
-  }
-  return __realSend(msg, callback) as boolean;
-} as typeof process.send;
-` : '';
-    entry = join(root, activityMode ? 'observed-worker.mts' : 'delayed-notice-worker.mts');
-    writeFileSync(entry, `${delayedNoticeSend}${heartbeatProbe}await import(${workerImport});
-`);
-  }
-  const child = binary ? spawn(binary, ['__worker'], options) : spawnNodeTsScript(entry, [], options);
-  children.push(child);
-  const measurements: any[] = [];
-  child.on('message', (raw: any) => {
-    if (raw.type === 'admission_heartbeat' || raw.type === 'admission_capture') measurements.push(raw);
-    else messages.push(raw as WorkerToDaemon);
-  });
-  child.stdout?.on('data', chunk => logs.push(chunk.toString()));
-  child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-  async function wait(predicate: () => boolean, description: string, timeout = 35_000) {
-    const deadline = Date.now() + timeout;
-    while (Date.now() < deadline) {
-      if (predicate()) return;
-      if (child.exitCode !== null || child.signalCode !== null) throw new Error(`worker exited: ${description}\n${logs.join('')}`);
-      await new Promise(resolveWait => setTimeout(resolveWait, 50));
-    }
-    throw new Error(`timeout: ${description}\n${logs.join('')}`);
-  }
-  const init = { type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
-    workingDir: dataDir, cliId: 'traex', cliPathOverride: fake, cliSessionId: freshStart ? undefined : nativeId,
-    resume: !freshStart, model: 'core', backendType, prompt: '',
-    ...(rpcPolicy ? { codexRpcInput: resolveCodexRpcInput('traex', rpcPolicy.override, rpcPolicy.global) } : {}),
-    ...(enabled ? { traexAutoModel: { enabled: true, models: ['core', 'backup', 'last'], queueTimeoutMs: 5_000, switchCooldownMs: 5_000,
-      reselectPerTurn,
-      ...(loadData ? { modelSettings: {
-        core: { reasoningEffort: 'high', modelBackendVariant: 'standard' },
-        backup: { reasoningEffort: 'xhigh', modelBackendVariant: 'standard' },
-        last: { reasoningEffort: 'xhigh', modelBackendVariant: 'max' },
-      } } : {}),
-    } } : {}),
-    larkAppId: 'app_test', larkAppSecret: 'secret' } satisfies DaemonToWorker;
-  child.send(init);
-  if (startupExtraArgs) await wait(() => messages.some(message => message.type === 'error' && message.message.includes('cannot be overridden')), 'rejected external model argv');
-  else await wait(() => messages.some(message => message.type === 'prompt_ready'), 'startup prompt');
-  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake };
-}
+useTraexAutoModelIntegrationCleanup();
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it('releases a cold-restored interrupted structured turn before accepting new input', async () => {
+    const f = await fixture(false, false, false, undefined, false, undefined, false,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, true);
+    await f.wait(() => f.logs.join('').includes('Cleared 1 stale structured turn(s)'), 'stale structured turn cleared');
+    expect(interruptionNotices(f.messages)).toHaveLength(1);
+    expect(f.logs.join('')).not.toContain('Ignoring prompt-ready heuristic while a structured turn is unfinished');
+
+    f.child.send({ type: 'message', content: 'new request after cold recovery', turnId: 'om_after_recovery' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'new request submitted after recovery');
+    expect(rows(f.submissions)[0]).toMatchObject({ model: 'core' });
+    expect(rows(f.submissions)[0].text).toMatch(/^new request after cold recovery(?:\r|\n|$)/);
+    expect(rows(f.submissions)[0].text).not.toContain('interrupted cold resume ask');
+  }, 45_000);
+
+  it('preflights a cold first turn before the only spawn and submits the original prompt once', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined,
+      { enabled: true, initialPrompt: 'cold preflight task' });
+    await f.wait(() => rows(f.submissions).length === 1, 'cold prompt submitted');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['backup']);
+    expect(rows(f.launches)[0].args).toContain('model_reasoning_effort="xhigh"');
+    expect(rows(f.submissions)).toEqual([expect.objectContaining({ model: 'backup', text: 'cold preflight task' })]);
+    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(1);
+  }, 45_000);
+
+  it.each(['failure', 'timeout'] as const)('fails open on a preflight probe %s without duplicating the first prompt', async probe => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined,
+      { enabled: true, initialPrompt: `${probe} task`, probe, timeoutMs: 100 });
+    await f.wait(() => rows(f.submissions).length === 1, `${probe} prompt submitted`);
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
+    expect(rows(f.submissions)).toEqual([expect.objectContaining({ model: 'core', text: `${probe} task` })]);
+  }, 45_000);
+
+  it('preflights an idle warm turn with exact resume, then keeps busy type-ahead on that model', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
+      'working', 0, 0, false, false, undefined, undefined, { enabled: true });
+    f.child.send({ type: 'message', content: 'warm independent task', turnId: 'om_warm' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'warm task submitted');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
+    expect(rows(f.launches)[1].args).toContain(f.nativeId);
+    expect(rows(f.submissions)[0]).toMatchObject({ model: 'backup' });
+    expect(rows(f.submissions)[0].text).toMatch(/^warm independent task(?:\r|\n|$)/);
+    const loadReads = rows(f.rpcRequests).filter(row => row.method === 'model/list').length;
+
+    f.child.send({ type: 'message', content: 'busy correction', turnId: 'om_correction' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 2, 'busy correction submitted');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
+    expect(rows(f.submissions)[1]).toMatchObject({ model: 'backup', text: 'busy correction' });
+    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(loadReads);
+  }, 45_000);
+
+  it('routes a durable dispatch through the same idle Worker admission before writing', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
+      'working', 0, 0, false, false, undefined, undefined, { enabled: true });
+    f.child.send({ type: 'message', content: 'dispatch task', turnId: 'dispatch-turn', dispatchAttempt: 1 } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'dispatch submitted');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
+    expect(rows(f.submissions)).toHaveLength(1);
+    expect(rows(f.submissions)[0]).toMatchObject({ model: 'backup' });
+    expect(rows(f.submissions)[0].text).toMatch(/^dispatch task(?:\r|\n|$)/);
+  }, 45_000);
+
+  it('quota initial prompts use admission instead of bypassing persisted blocks', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      { code: 'usage_limit_exceeded', initial: true, blocked: true });
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_initial_quota' && m.status === 'failed'), 'blocked initial input settled');
+    expect(rows(f.submissions)).toHaveLength(0);
+  }, 45_000);
+
+  it('quota initial fresh prompts recover on the discovered exact native session', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, true, undefined, 0, 0, false, false,
+      { code: 'usage_limit_exceeded', initial: true });
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_initial_quota' && m.status === 'completed'), 'fresh initial recovery');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('initial quota task'))).toHaveLength(1);
+    expect(rows(f.launches).slice(1).every(row => row.args.includes(f.nativeId))).toBe(true);
+  }, 60_000);
+
+  it('quota recovery preserves native identity, ordered models and one original input', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      { code: 'usage_limit_exceeded' });
+    f.child.send({ type: 'message', content: 'original quota task', turnId: 'om_quota' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_quota' && m.status === 'completed'), 'quota recovery complete');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.launches).every(row => row.args.includes(f.nativeId))).toBe(true);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('original quota task'))).toHaveLength(1);
+    expect(rows(f.submissions).slice(1).every(row => row.text.includes(t('worker.traex_auto_model.continue_prompt')))).toBe(true);
+    expect(f.messages.filter(m => m.type === 'turn_terminal' && m.turnId === 'om_quota')).toHaveLength(1);
+    // Only the two structured failures query quotas; initial admission does not.
+    expect(rows(f.rpcRequests).filter(row => row.method === 'debug/models')).toHaveLength(2);
+  }, 60_000);
+
+  it('quota mode stops after all models fail without cycling or replaying', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      { code: 'usageLimitExceeded', exhaustLast: true });
+    f.child.send({ type: 'message', content: 'all depleted task', turnId: 'om_all' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_all' && m.status === 'failed'), 'all quotas failed');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
+    expect(rows(f.submissions)).toHaveLength(3);
+    expect(f.messages.filter(m => m.type === 'turn_terminal' && m.turnId === 'om_all')).toHaveLength(1);
+  }, 60_000);
+
+  it('quota mode does not turn ordinary rate limits into model switches', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      { code: 'rateLimitExceeded' });
+    f.child.send({ type: 'message', content: 'rate limited task', turnId: 'om_rate' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_rate' && m.status === 'failed'), 'ordinary failure');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
+    expect(rows(f.submissions)).toHaveLength(1);
+    expect(rows(f.rpcRequests).filter(row => row.method === 'debug/models')).toHaveLength(0);
+  }, 45_000);
+
   it('keeps planned model recovery silent and still reports a later genuine crash', async () => {
     const f = await fixture(true, 'busy');
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_original' } satisfies DaemonToWorker);
@@ -346,7 +160,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
     const f = await fixture(true, 'busy');
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_original' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 1, 'original submit');
-    rmSync(f.fake);
+    writeFileSync(f.removeCliAfterCatalog, '1');
     await f.wait(() => f.messages.some(message => message.type === 'error'), 'failed Auto launch error');
     expect(rows(f.launches)).toHaveLength(1);
     expect(rows(f.submissions)).toHaveLength(1);
@@ -412,6 +226,29 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(rows(f.submissions).filter(row => row.text.startsWith('held successor'))).toHaveLength(1);
   }, 45_000);
 
+  // A late history receipt quarantines one write while the original turn is
+  // still open. The hold must be released by the deferred recheck and the
+  // type-ahead queue re-driven; neither release may wait for the open turn.
+  it.each([
+    { name: 'the original ask', submission: 1, quarantinedTurn: 'om_working' },
+    { name: 'the capacity-changing correction', submission: 2, quarantinedTurn: 'om_capacity' },
+  ])('delivers queued follow-ups after a late receipt quarantines $name', async ({ submission, quarantinedTurn }) => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, 'queue-after-second',
+      0, 0, false, false, undefined, { submission, ms: 400 });
+    f.child.send({ type: 'message', content: 'original working ask', turnId: 'om_working' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original working submit');
+    f.child.send({ type: 'message', content: 'correction changes capacity', turnId: 'om_capacity' } satisfies DaemonToWorker);
+    f.child.send({ type: 'message', content: 'held successor', turnId: 'om_held' } satisfies DaemonToWorker);
+    await f.wait(() => f.logs.join('').includes(`after unconfirmed submit turn=${quarantinedTurn} `), 'late receipt quarantined');
+    await f.wait(() => rows(f.submissions).length === 2, 'correction submitted');
+    writeFileSync(f.release, 'finish');
+    await f.wait(() => rows(f.submissions).length === 3, 'held input after deferred recheck');
+    expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
+      'original working ask', 'correction changes capacity', 'held successor',
+    ]);
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
+  }, 75_000);
+
   it('preserves a fresh topic selection, final wait and catalog across an in-worker restart', async () => {
     const f = await fixture(true, 'busy', false, undefined, false, undefined, true);
     expect(f.init.resume).toBe(false);
@@ -453,7 +290,9 @@ describe('TraeX auto-model real Worker and PTY', () => {
   it('refuses environment argv before launching an out-of-pool model', async () => {
     const f = await fixture(true, false, false, undefined, false, '--model outside');
     expect(rows(f.launches)).toEqual([]);
-    expect(rows(f.rpcRequests)).toEqual([]);
+    // Catalog admission is read-only; invalid argv must still prevent the
+    // actual terminal launch and every thread/turn RPC.
+    expect(rows(f.rpcRequests).map(row => row.method)).toEqual(['initialize', 'initialized', 'model/list']);
     expect(f.messages.some(message => message.type === 'prompt_ready')).toBe(false);
   });
 
@@ -483,7 +322,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
   it('automatically uses terminal input for legacy Auto even when the daemon sends inherited RPC', async () => {
     const f = await fixture(true, false, false, { global: true });
     expect(f.messages.some(message => message.type === 'user_notify' && message.message.includes('RPC'))).toBe(false);
-    expect(rows(f.rpcRequests)).toHaveLength(0);
+    expect(rows(f.rpcRequests).map(row => row.method)).toEqual(['initialize', 'initialized', 'model/list']);
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_legacy' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 2, 'legacy Auto continuation');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup']);
@@ -576,11 +415,46 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toEqual([expect.objectContaining({ model: 'core' })]);
   }, 100_000);
 
+  it('holds a follow-up stamped before the capacity latch until the preferred reset', async () => {
+    // The follow-up arrives right after the submit, before any screen tick
+    // has seen the queue, so nothing tags it to wait behind the active turn.
+    const f = await fixture(true, false, true, undefined, false, undefined, false, undefined, 5_500);
+    f.child.send({ type: 'message', content: 'original ask', turnId: 'om_first' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original submit');
+    f.child.send({ type: 'message', content: 'next ask', turnId: 'om_next' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(message => message.type === 'user_notify' && message.message.includes('均持续排队')), 'exhaustion', 55_000);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toHaveLength(0);
+    writeFileSync(f.release, 'go');
+    await f.wait(() => {
+      const nextSubmissions = rows(f.submissions).filter(row => row.text.startsWith('next ask'));
+      return rows(f.launches).length === 4
+        && nextSubmissions.length === 1
+        && nextSubmissions[0]!.model === 'core';
+    }, 'next ask relaunched on the preferred model, never typed into the fallback pane');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last', 'core']);
+  }, 100_000);
+
+  it('writes a redelivered turn on an exhausted fallback model restored at idle', async () => {
+    // The entry check keeps a redelivered turn on the current model. The
+    // preferred-reset hold must not re-queue it: the idle composer that
+    // admitted it never draws another ready edge.
+    const f = await fixture(true, false, true, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      undefined, undefined, undefined, false, true);
+    writeFileSync(f.release, 'go');
+    f.child.send({ type: 'message', content: 'redelivered ask', turnId: 'om_redo', dispatchAttempt: 1 } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).some(row => row.text.startsWith('redelivered ask')), 'redelivered turn written');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['last']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('redelivered ask')))
+      .toEqual([expect.objectContaining({ model: 'last' })]);
+  }, 60_000);
+
   it('when all loads are high, holds the lowest allowlisted model and publishes its card identity', async () => {
     const f = await fixture(true, 'busy', false, { global: true, override: false });
     f.child.send({ type: 'message', content: 'original ask', turnId: 'om_first' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).length === 2, 'lowest-load continuation');
-    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'last']);
+    // A walk to 'backup' means the capacity load read was unavailable or its
+    // reply was discarded; the worker log names which (#3535).
+    expect(rows(f.launches).map(row => row.model), f.logs.join('')).toEqual(['core', 'last']);
     expect(rows(f.launches)[0].args).toContain('model_reasoning_effort="high"');
     expect(rows(f.launches)[0].args).toContain('model_backend_variant="standard"');
     expect(rows(f.launches)[1].args).toContain('model_reasoning_effort="xhigh"');
@@ -593,7 +467,10 @@ describe('TraeX auto-model real Worker and PTY', () => {
     await new Promise(resolveWait => setTimeout(resolveWait, 8_000));
     expect(rows(f.launches)).toHaveLength(2);
     expect(rows(f.submissions).filter(row => row.text.startsWith('original ask'))).toHaveLength(1);
-    expect(rows(f.rpcRequests).map(row => row.method)).toEqual(['initialize', 'initialized', 'model/list']);
+    // Initial catalog + capacity load + replacement catalog; no inference RPC.
+    expect(rows(f.rpcRequests).map(row => row.method)).toEqual(
+      Array.from({ length: 3 }, () => ['initialize', 'initialized', 'model/list']).flat(),
+    );
     writeFileSync(f.release, 'go');
     f.child.send({ type: 'message', content: 'next ask', turnId: 'om_next' } satisfies DaemonToWorker);
     await f.wait(() => rows(f.submissions).some(row => row.text === 'next ask'), 'sticky input without repeated skill catalog');
@@ -640,7 +517,8 @@ describe('TraeX auto-model real Worker and PTY', () => {
     await new Promise(resolveWait => setTimeout(resolveWait, 6_000));
     expect(rows(f.launches)).toHaveLength(3);
     expect(new Set(rows(f.rpcRequests).map(row => row.method))).toEqual(new Set(['initialize', 'initialized', 'model/list']));
-    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(3);
+    // Three launch catalogs and one load check for each queued candidate.
+    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(6);
     writeFileSync(f.release, 'go');
     await f.wait(() => rows(f.submissions).some(row => row.text.startsWith('next ask')), 'next turn on retained model');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);

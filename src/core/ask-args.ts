@@ -18,12 +18,19 @@ export class AskArgsError extends Error {
       | 'options_empty_key'
       | 'options_duplicate_key'
       | 'timeout_out_of_range'
-      | 'timeout_not_number',
+      | 'timeout_not_number'
+      | 'mention_not_open_id',
     message: string,
   ) {
     super(message);
     this.name = 'AskArgsError';
   }
+}
+
+export function parseAskRequestId(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(raw)) throw new AskArgsError('questions_invalid', '--request-id 需要1至256位字母数字或_-');
+  return raw;
 }
 
 /** Parse `--options` CSV. Each item is either `key` (key==label) or `key=label`.
@@ -87,7 +94,8 @@ export function parseAskOptions(raw: string | undefined): AskOption[] {
 
 /** Parse `--timeout <seconds>` → milliseconds. Bounds match §7:
  *   - lower bound: 10s (sub-10s asks are almost always a bug)
- *   - upper bound: 3600s (1h — past that, recovery should kick in v0.1.8)
+ *   - upper bound: 3600s (1h)
+ *   - explicit 0: no deadline for a managed explicit Ask
  *   - default: 300s (caller passes `undefined` to use it) */
 export function parseAskTimeoutSeconds(
   raw: string | undefined,
@@ -107,13 +115,36 @@ export function parseAskTimeoutSeconds(
       `--timeout 必须是整数秒数，收到 "${raw}"`,
     );
   }
-  if (n < defaults.min || n > defaults.max) {
+  if (n !== 0 && (n < defaults.min || n > defaults.max)) {
     throw new AskArgsError(
       'timeout_out_of_range',
-      `--timeout 范围 [${defaults.min}, ${defaults.max}] 秒，收到 ${n}`,
+      `--timeout 范围 [${defaults.min}, ${defaults.max}] 秒，或 0 表示无限等待，收到 ${n}`,
     );
   }
   return n * 1000;
+}
+
+/** Parse `--mention <value>` → a human open_id.
+ *
+ *  与 `botmux send --mention` 的入参形态对齐：接受裸 open_id（`ou_xxx`）或
+ *  `open_id:显示名`（显示名仅为可读性，卡片里直接渲染真实 at，不需要它）。
+ *  其它 ID 形态（union_id `on_*`、user_id、邮箱）进了卡片 `<at>` 会被飞书
+ *  整卡拒收，这里直接 fail loud。 */
+export function parseAskMention(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const value = raw.trim();
+  if (value === '') {
+    throw new AskArgsError('mention_not_open_id', '--mention 需要一个 open_id（ou_ 开头）');
+  }
+  // 第一个冒号前是 open_id（与 send 的 "open_id:Display Name" 约定一致）。
+  const openId = (value.includes(':') ? value.slice(0, value.indexOf(':')) : value).trim();
+  if (!/^ou_[A-Za-z0-9_-]{1,128}$/.test(openId)) {
+    throw new AskArgsError(
+      'mention_not_open_id',
+      `--mention 只接受成员的 open_id（ou_ 开头），收到 "${value}"`,
+    );
+  }
+  return openId;
 }
 
 /** Resolve the `(sub, rest)` pair for `botmux ask`'s top-level dispatch.

@@ -83,7 +83,7 @@ codex 整体同意三层拆分（grill/spec → architect/dag → runtime）和�
 
 ### 3.3 `/goal` 命令现状
 
-**仓库内、用户级 skills 目录都没有 `/goal`**（已 grep）。这是要新建的抽象，不是复用已有命令。codex 关键提醒：**不要把它实现成依赖 CLI 真认识 slash command**——不同 CLI（Claude / Codex / Gemini / OpenCode / Antigravity）对 slash/skill 支持不一致。落地为 skill + bootstrap prompt + env（见 §4.2）。
+**仓库内、用户级 skills 目录都没有 `/goal`**（已 grep）。这是要新建的抽象，不是复用已有命令。codex 关键提醒：**不要把它实现成依赖 CLI 真认识 slash command**——不同 CLI（Claude / Codex / OpenCode / Antigravity）对 slash/skill 支持不一致。落地为 skill + bootstrap prompt + env（见 §4.2）。
 
 ### 3.4 botmux-orchestrate skill
 

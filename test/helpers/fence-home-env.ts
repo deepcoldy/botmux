@@ -46,7 +46,8 @@ export function fenceHomeRootedEnv(fencedHome: string, env: NodeJS.ProcessEnv = 
   // control-audit mkdir+append (a key the daemon genuinely persists),
   // mir-local-runtime read-modify-write+rename of the miramcp config and
   // create/delete of its pidfile (and it can start a bridge process),
-  // index-core-only mkdir at module load which then becomes SESSION_DATA_DIR.
+  // index-core-only mkdir at module load which then becomes SESSION_DATA_DIR,
+  // global-config atomic rewrite on every dashboard settings save.
   const exactPathOverrides = [
     'BOTS_CONFIG',
     'PM2_HOME',
@@ -54,6 +55,7 @@ export function fenceHomeRootedEnv(fencedHome: string, env: NodeJS.ProcessEnv = 
     'BOTMUX_USAGE_DIR',
     'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
     'BOTMUX_CORE_STATE_DIR',
+    'BOTMUX_GLOBAL_CONFIG_FILE',
     'MIRAMCP_CONFIG_PATH',
     'MIRA_CONFIG_PATH',
     'MIRAMCP_PID_FILE',

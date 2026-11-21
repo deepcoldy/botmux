@@ -1,6 +1,7 @@
 import type { Session } from '../types.js';
 
 export type DurablePrimaryExistingTurnDisposition = 'committed' | 'retry' | 'ready';
+export type DurablePrimaryRejectedLiveSendDisposition = 'retry' | 'ignored';
 export type DurablePrimaryInputCommit = NonNullable<Session['durablePrimaryInputCommits']>[number];
 export type DurablePrimaryWorkerStartBlocker = 'pending-repo' | 'in-flight-claim';
 
@@ -32,6 +33,33 @@ export function durablePrimaryExistingTurnDisposition(
     return 'retry';
   }
   return 'ready';
+}
+
+/** A primary Inbox claim cannot settle until the worker proves input acceptance. */
+export function durablePrimaryRejectedLiveSendDisposition(
+  durablePrimaryDispatch: boolean,
+): DurablePrimaryRejectedLiveSendDisposition {
+  return durablePrimaryDispatch ? 'retry' : 'ignored';
+}
+
+/** Progress identity for a live-worker refusal: the worker generation plus
+ * process id. Unchanged across retries ⇒ the refusal cannot heal by itself. */
+export function durablePrimaryLiveWorkerProgressToken(ds: {
+  workerGeneration?: number;
+  worker?: { pid?: number } | null;
+}): string {
+  return `live-worker:${ds.workerGeneration ?? 0}:${ds.worker?.pid ?? 0}`;
+}
+
+/** Primary retries remain replayable until canonical admission is committed. */
+export function shouldPersistTriggeredMessage(input: {
+  durablePrimaryDispatch: boolean;
+  handlerCompleted: boolean;
+  admitted: boolean;
+}): boolean {
+  return input.durablePrimaryDispatch
+    ? input.admitted
+    : input.handlerCompleted || input.admitted;
 }
 
 export function appendDurablePrimaryInputCommit(

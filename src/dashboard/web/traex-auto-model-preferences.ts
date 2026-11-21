@@ -1,5 +1,10 @@
 import { isCodexReasoningEffort, reasoningEffortsForCliModel } from '../../services/codex-reasoning-effort.js';
-import { resolveTraexAutoModelSettings, type TraexAutoModelConfig, type TraexAutoModelSettings } from '../../services/traex-auto-model.js';
+import {
+  resolveTraexAutoModelSettings,
+  strongestTraexPreflightReasoningEffort,
+  type TraexAutoModelConfig,
+  type TraexAutoModelSettings,
+} from '../../services/traex-auto-model.js';
 import type { ModelCapabilities } from './bot-defaults.js';
 
 /** Pick the strongest combination advertised for the largest context variant.
@@ -19,7 +24,26 @@ export function strongestTraexModelSettings(model: string, capability?: ModelCap
   };
 }
 
+export function strongestTraexPreflightModelSettings(model: string, capability?: ModelCapabilities): TraexAutoModelSettings {
+  const variant = capability?.contextVariants?.length
+    ? capability.contextVariants.reduce((largest, item) => item.contextWindow > largest.contextWindow ? item : largest)
+    : undefined;
+  const efforts = variant?.reasoningEfforts ?? capability?.reasoningEfforts
+    ?? reasoningEffortsForCliModel('traex', model);
+  const reasoningEffort = strongestTraexPreflightReasoningEffort(model, efforts);
+  return {
+    ...(reasoningEffort ? { reasoningEffort } : {}),
+    ...(variant ? { modelBackendVariant: variant.id } : {}),
+  };
+}
+
 export interface TraexAutoModelPreferences {
+  trigger?: 'capacity' | 'quota';
+  preflightLoadCheck?: boolean;
+  overloadThresholdPercent?: string;
+  preflightTimeoutSeconds?: string;
+  unknownLoadPolicy?: 'skip';
+  allOverloadedPolicy?: 'lowest_load';
   reselectPerTurn: boolean;
   models: string[];
   modelSettings: Record<string, TraexAutoModelSettings>;
@@ -38,11 +62,20 @@ export function autoModelDraftFromConfig(
   enabled = config?.enabled === true,
 ): TraexAutoModelDraft {
   return {
+    ...(config?.trigger ? { trigger: config.trigger } : {}),
+    preflightLoadCheck: config?.preflightLoadCheck === true,
+    overloadThresholdPercent: String(config?.overloadThresholdPercent ?? 100),
+    preflightTimeoutSeconds: String((config?.preflightTimeoutMs ?? 8_000) / 1_000),
+    unknownLoadPolicy: config?.unknownLoadPolicy ?? 'skip',
+    allOverloadedPolicy: config?.allOverloadedPolicy ?? 'lowest_load',
     reselectPerTurn: config?.reselectPerTurn === true,
     models: config?.models ?? [],
-    modelSettings: Object.fromEntries((config?.models ?? []).map(model => [
-      model, resolveTraexAutoModelSettings(config!, model, legacy),
-    ])),
+    modelSettings: Object.fromEntries((config?.models ?? []).map(model => {
+      const settings = resolveTraexAutoModelSettings(config!, model, legacy);
+      return [model, config?.preflightLoadCheck === true
+        ? { ...settings, reasoningEffort: strongestTraexPreflightModelSettings(model).reasoningEffort }
+        : settings];
+    })),
     timeoutSeconds: String((config?.queueTimeoutMs ?? 30_000) / 1_000),
     cooldownSeconds: String((config?.switchCooldownMs ?? 60_000) / 1_000),
     ...preferences,
@@ -81,7 +114,19 @@ export function readAutoModelDraft(botId: string, storage = autoModelDraftStorag
       }
     }
     if (value.draft.reselectPerTurn !== undefined && typeof value.draft.reselectPerTurn !== 'boolean') return undefined;
+    if (value.draft.preflightLoadCheck !== undefined && typeof value.draft.preflightLoadCheck !== 'boolean') return undefined;
+    if (value.draft.overloadThresholdPercent !== undefined && typeof value.draft.overloadThresholdPercent !== 'string') return undefined;
+    if (value.draft.preflightTimeoutSeconds !== undefined && typeof value.draft.preflightTimeoutSeconds !== 'string') return undefined;
+    if (value.draft.unknownLoadPolicy !== undefined && value.draft.unknownLoadPolicy !== 'skip') return undefined;
+    if (value.draft.allOverloadedPolicy !== undefined && value.draft.allOverloadedPolicy !== 'lowest_load') return undefined;
+    if (value.draft.trigger !== undefined && !['capacity', 'quota'].includes(value.draft.trigger)) return undefined;
     return {
+      ...(value.draft.trigger ? { trigger: value.draft.trigger } : {}),
+      preflightLoadCheck: value.draft.preflightLoadCheck === true,
+      overloadThresholdPercent: value.draft.overloadThresholdPercent ?? '100',
+      preflightTimeoutSeconds: value.draft.preflightTimeoutSeconds ?? '8',
+      unknownLoadPolicy: value.draft.unknownLoadPolicy ?? 'skip',
+      allOverloadedPolicy: value.draft.allOverloadedPolicy ?? 'lowest_load',
       reselectPerTurn: value.draft.reselectPerTurn === true,
       models: value.draft.models,
       modelSettings: value.draft.modelSettings,
@@ -96,9 +141,13 @@ export function readAutoModelDraft(botId: string, storage = autoModelDraftStorag
 export function writeAutoModelDraft(botId: string, draft: TraexAutoModelPreferences, storage = autoModelDraftStorage()): boolean {
   try {
     if (!storage) return false;
-    const { reselectPerTurn, models, modelSettings, timeoutSeconds, cooldownSeconds } = draft;
+    const { trigger, preflightLoadCheck, overloadThresholdPercent, preflightTimeoutSeconds,
+      unknownLoadPolicy, allOverloadedPolicy, reselectPerTurn, models, modelSettings,
+      timeoutSeconds, cooldownSeconds } = draft;
     storage.setItem(keyFor(botId), JSON.stringify({
-      version: 1, draft: { reselectPerTurn, models, modelSettings, timeoutSeconds, cooldownSeconds },
+      version: 1, draft: { trigger, preflightLoadCheck, overloadThresholdPercent,
+        preflightTimeoutSeconds, unknownLoadPolicy, allOverloadedPolicy,
+        reselectPerTurn, models, modelSettings, timeoutSeconds, cooldownSeconds },
     }));
     return true;
   } catch { return false; }

@@ -1,3 +1,9 @@
+import MarkdownIt from 'markdown-it';
+import type { RuleInline } from 'markdown-it/lib/parser_inline.mjs';
+// @ts-expect-error markdown-it does not publish a declaration for this inline rule
+import markdownLink from 'markdown-it/lib/rules_inline/link.mjs';
+// @ts-expect-error markdown-it does not publish a declaration for this inline rule
+import markdownImage from 'markdown-it/lib/rules_inline/image.mjs';
 import type {
   LinkRefCandidate,
   LinkRefExtractionResult,
@@ -61,20 +67,166 @@ function isValidHttpUrl(originalUrl: string): boolean {
   }
 }
 
+const MARKDOWN = new MarkdownIt();
+interface MarkdownDestination {
+  start: number;
+  end: number;
+  labelEnd: number;
+}
+interface DestinationEnv {
+  sourceText?: string;
+  destinations?: MarkdownDestination[];
+}
+
+function trackInlineDestinations(rule: RuleInline, bracketOffset: number): RuleInline {
+  return (state, silent) => {
+    const env = state.env as DestinationEnv;
+    // Image alt text is tokenized again in a substring with the same env.
+    // Only ranges in this block's root inline source have matching offsets.
+    if (silent || state.src !== env.sourceText || !env.destinations
+      || state.src[state.pos + bracketOffset] !== '[') return rule(state, silent);
+    const labelEnd = state.md.helpers.parseLinkLabel(state, state.pos + bracketOffset, bracketOffset === 0);
+    const handled = rule(state, silent);
+    if (!handled || labelEnd < 0 || state.src[labelEnd + 1] !== '('
+      || state.pos <= labelEnd + 2 || state.src[state.pos - 1] !== ')') return handled;
+
+    let start = labelEnd + 2;
+    while (/[ \t\n]/u.test(state.src[start] ?? '')) start += 1;
+    const destination = state.md.helpers.parseLinkDestination(state.src, start, state.posMax);
+    if (destination.ok) {
+      const angle = state.src[start] === '<';
+      env.destinations.push({
+        start: start + (angle ? 1 : 0),
+        end: destination.pos - (angle ? 1 : 0),
+        labelEnd,
+      });
+    }
+    return handled;
+  };
+}
+MARKDOWN.inline.ruler.at('link', trackInlineDestinations(markdownLink, 0));
+MARKDOWN.inline.ruler.at('image', trackInlineDestinations(markdownImage, 1));
+
+function lineStarts(text: string): number[] {
+  const starts = [0];
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === '\n') starts.push(index + 1);
+  }
+  return starts;
+}
+
+function lineAt(starts: readonly number[], offset: number): number {
+  let low = 0;
+  let high = starts.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (starts[middle]! <= offset) low = middle + 1;
+    else high = middle;
+  }
+  return low - 1;
+}
+
+function inlineLinkDestinations(text: string): { ends: Map<number, number>; boundaries: number[] } {
+  const ends = new Map<number, number>();
+  const boundaries = new Set<number>();
+  if (!text.includes('](')) return { ends, boundaries: [] };
+  const rawStarts = lineStarts(text);
+  const env = {};
+  let row: { text: string; offsets: number[]; cursor: number } | undefined;
+  // Use actual block-inline regions: links cannot cross paragraphs or execute
+  // inside code blocks. Map normalized inline offsets back to untouched bytes.
+  for (const token of MARKDOWN.parse(text, env)) {
+    if (token.type === 'tr_open' && token.map) {
+      const start = rawStarts[token.map[0]]!;
+      const raw = text.slice(start, rawStarts[token.map[0] + 1] ?? text.length).replace(/\r?\n$/, '');
+      row = { text: '', offsets: [], cursor: 0 };
+      for (let index = 0; index < raw.length; index += 1) {
+        // The table block rule removes the backslash from escaped pipes in cells.
+        if (raw[index] === '\\' && raw[index + 1] === '|') continue;
+        row.text += raw[index];
+        row.offsets.push(start + index);
+      }
+    } else if (token.type === 'tr_close') row = undefined;
+    if (token.type !== 'inline') continue;
+    let cellStart: number | undefined;
+    if (!token.map) {
+      if (!row) continue;
+      const match = row.text.indexOf(token.content, row.cursor);
+      if (match < 0) continue;
+      cellStart = match;
+      row.cursor = match + token.content.length;
+    }
+    const destinations: MarkdownDestination[] = [];
+    MARKDOWN.inline.parse(token.content, MARKDOWN, { ...env, sourceText: token.content, destinations }, []);
+    if (destinations.length === 0) continue;
+    const inlineStarts = lineStarts(token.content);
+    const lineBases = new Map<number, number | undefined>();
+    const mapOffset = (offset: number): number | undefined => {
+      if (cellStart !== undefined) return row?.offsets[cellStart + offset];
+      const line = lineAt(inlineStarts, offset);
+      if (lineBases.has(line)) {
+        const base = lineBases.get(line);
+        return base === undefined ? undefined : base + offset;
+      }
+      const rawStart = rawStarts[token.map![0] + line];
+      if (rawStart === undefined) return undefined;
+      const rawLine = text.slice(rawStart, rawStarts[token.map![0] + line + 1] ?? text.length).replace(/\r?\n$/, '');
+      const inlineStart = inlineStarts[line]!;
+      const inlineLine = token.content.slice(inlineStart, inlineStarts[line + 1] ?? token.content.length).replace(/\n$/, '');
+      const trimmed = inlineLine.trimStart();
+      const leading = inlineLine.length - trimmed.length;
+      const match = rawLine.indexOf(trimmed);
+      const base = match < 0 ? undefined : rawStart + match - inlineStart - leading;
+      lineBases.set(line, base);
+      return base === undefined ? undefined : base + offset;
+    };
+    for (const destination of destinations) {
+      const start = mapOffset(destination.start);
+      const end = mapOffset(destination.end);
+      const labelEnd = mapOffset(destination.labelEnd);
+      if (start === undefined || end === undefined || labelEnd === undefined) continue;
+      const rawDestination = text.slice(start, end);
+      const inlineDestination = cellStart === undefined
+        ? rawDestination : rawDestination.replace(/\\\|/gu, '|');
+      if (inlineDestination !== token.content.slice(destination.start, destination.end)
+        || text[labelEnd] !== ']') continue;
+      ends.set(start, end);
+      boundaries.add(start);
+      boundaries.add(labelEnd);
+    }
+  }
+  return { ends, boundaries: [...boundaries].sort((left, right) => left - right) };
+}
+
 export function extractHttpUrlSpans(text: string): HttpUrlSpan[] {
+  // A complete URL string is an opaque value, including any Markdown-looking
+  // characters in its path/query. Do not reinterpret structured URL fields.
+  if (/^https?:\/\//iu.test(text) && !HARD_URL_TERMINATOR_RE.test(text) && isValidHttpUrl(text)) {
+    return [{ start: 0, end: text.length, originalUrl: text }];
+  }
   const spans: HttpUrlSpan[] = [];
+  const { ends: destinationEnds, boundaries } = inlineLinkDestinations(text);
+  let boundaryIndex = 0;
   URL_SCHEME_RE.lastIndex = 0;
   for (let match = URL_SCHEME_RE.exec(text); match; match = URL_SCHEME_RE.exec(text)) {
     const start = match.index;
-    let scanEnd = URL_SCHEME_RE.lastIndex;
-    while (scanEnd < text.length && !HARD_URL_TERMINATOR_RE.test(text[scanEnd]!)) {
-      scanEnd += 1;
+    const destinationEnd = destinationEnds.get(start);
+    while (boundaryIndex < boundaries.length && boundaries[boundaryIndex]! <= start) boundaryIndex += 1;
+    const limit = boundaries[boundaryIndex] ?? text.length;
+    let scanEnd = destinationEnd ?? URL_SCHEME_RE.lastIndex;
+    if (destinationEnd === undefined) {
+      while (scanEnd < limit && !HARD_URL_TERMINATOR_RE.test(text[scanEnd]!)) scanEnd += 1;
     }
-    const originalUrl = trimExternalUrlSuffix(text.slice(start, scanEnd));
+    // A closed inline link provides an exact boundary. Its closing parenthesis,
+    // emphasis markers and following text are not part of the destination URL.
+    const end = destinationEnd ?? scanEnd;
+    const originalUrl = destinationEnd === undefined
+      ? trimExternalUrlSuffix(text.slice(start, end))
+      : text.slice(start, end);
     if (originalUrl && isValidHttpUrl(originalUrl)) {
       spans.push({ start, end: start + originalUrl.length, originalUrl });
     }
-    URL_SCHEME_RE.lastIndex = Math.max(scanEnd, URL_SCHEME_RE.lastIndex);
+    URL_SCHEME_RE.lastIndex = Math.max(end, URL_SCHEME_RE.lastIndex);
   }
   return spans;
 }

@@ -11,11 +11,16 @@
  * would restart the per-bot idle-suspend clock and reset the ping budget. So the
  * screen-status hook below recognises an in-flight keep-alive and restores the
  * idle stretch's original `idleSinceAt`; any other busy edge ends the stretch.
+ * Its idle→busy edge is not a new round either: worker-pool leaves
+ * `busySinceAt` unset for it, so a raised hand or a manual board column
+ * survives the ping.
  */
 import type { DaemonSession } from './types.js';
 import type { BotConfig } from '../bot-registry.js';
 import { readGlobalConfig } from '../global-config.js';
 import { readStatuslineSnapshot } from '../services/statusline-snapshot.js';
+import { dashboardEventBus } from './dashboard-events.js';
+import { BUSY_RUNTIME_STATUSES } from './session-task-status.js';
 import {
   KEEPALIVE_IN_FLIGHT_STALE_MS,
   buildPromptCacheKeepalivePrompt,
@@ -53,10 +58,15 @@ export function promptCacheKeepaliveIneligibility(ds: DaemonSession): string | u
   // Background tasks report back into the conversation on their own; a
   // keep-alive turn would only interleave with them.
   if (ds.backgroundTaskCount) return 'background_tasks';
+  // A failed turn waits for the provider and its continuation refreshes the
+  // cache. A keep-alive turn finishing in that wait would read as someone
+  // taking over in the web terminal, and cancel the continuation.
+  if (ds.session.ordinaryTurnRecovery?.status === 'backoff') return 'recovery_wait';
   return undefined;
 }
 
-function contextTokens(dataDir: string, sessionId: string, now: number): number | undefined {
+/** Context size from the Claude Code statusline snapshot; undefined when absent/stale. */
+export function statuslineContextTokens(dataDir: string, sessionId: string, now: number): number | undefined {
   const snap = readStatuslineSnapshot(dataDir, sessionId, { now });
   if (snap?.contextPercent === undefined || snap.contextWindowTokens === undefined) return undefined;
   return Math.round(snap.contextPercent * snap.contextWindowTokens / 100);
@@ -90,7 +100,7 @@ export function runPromptCacheKeepaliveSweep(
       minuteOfDay,
       idleSinceAt: ds.idleSinceAt,
       state: ds.promptCacheKeepalive,
-      contextTokens: contextTokens(opts.dataDir, sessionId, now),
+      contextTokens: statuslineContextTokens(opts.dataDir, sessionId, now),
     });
     if (!verdict.due) continue;
     const text = buildPromptCacheKeepalivePrompt(ds.initConfig?.locale);
@@ -119,9 +129,44 @@ export function notePromptCacheKeepaliveResult(ds: DaemonSession, injected: bool
   }
 }
 
-/** A real turn started: the idle stretch (and its ping budget) is over. */
-export function resetPromptCacheKeepalive(ds: DaemonSession): void {
+/** A keep-alive prompt was typed and its busy period has not ended yet. */
+export function promptCacheKeepaliveInFlight(ds: DaemonSession, now = Date.now()): boolean {
+  const since = ds.promptCacheKeepalive?.inFlightSince;
+  return since !== undefined && now - since < KEEPALIVE_IN_FLIGHT_STALE_MS;
+}
+
+/**
+ * A real turn started: the idle stretch (and its ping budget) is over. A busy
+ * screen without `busySinceAt` is a keep-alive's busy period (or one the worker
+ * refused to type into); it now belongs to the real turn, so stamp it here
+ * instead of waiting for the next screen update.
+ */
+export function resetPromptCacheKeepalive(ds: DaemonSession, now = Date.now()): void {
   ds.promptCacheKeepalive = undefined;
+  if (ds.busySinceAt !== undefined || !BUSY_RUNTIME_STATUSES.has(ds.lastScreenStatus ?? '')) return;
+  ds.busySinceAt = now;
+  dashboardEventBus.publish({
+    type: 'session.update',
+    body: { sessionId: ds.session.sessionId, patch: { busySinceAt: now } },
+  });
+}
+
+/**
+ * A botmux turn is starting: it ends the idle stretch the keep-alive was
+ * extending. Except an unattended maintenance write (auto / idle /compact):
+ * the worker may still refuse it before typing anything, and resetting here
+ * would make the keep-alive fire again at once over a stretch nothing
+ * touched. If it does run, its busy edge ends the stretch in
+ * notePromptCacheKeepaliveScreenStatus. With a keep-alive in flight it resets
+ * as before: that busy edge would otherwise be taken for the keep-alive's.
+ */
+export function notePromptCacheKeepaliveTurnStarted(
+  ds: DaemonSession,
+  opts: { unattended?: boolean } = {},
+  now = Date.now(),
+): void {
+  if (opts.unattended && !promptCacheKeepaliveInFlight(ds, now)) return;
+  resetPromptCacheKeepalive(ds, now);
 }
 
 /**
@@ -137,8 +182,7 @@ export function notePromptCacheKeepaliveScreenStatus(
 ): void {
   const state = ds.promptCacheKeepalive;
   if (!state || prev === ds.lastScreenStatus) return;
-  const inFlight = state.inFlightSince !== undefined && now - state.inFlightSince < KEEPALIVE_IN_FLIGHT_STALE_MS;
-  if (!inFlight) {
+  if (!promptCacheKeepaliveInFlight(ds, now)) {
     if (ds.lastScreenStatus !== 'idle') ds.promptCacheKeepalive = undefined;
     return;
   }

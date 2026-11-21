@@ -100,7 +100,15 @@ export function decideRestartFollowup(input: RestartFollowupInput): RestartFollo
 }
 
 /** The launch settings a `restart` request can change (see the worker's
- *  `case 'restart'`): what a replacement must run to satisfy that request. */
+ *  `case 'restart'`): what a replacement must run to satisfy that request.
+ *  The startup command TEXT is deliberately absent: runStartupCommands reads
+ *  `lastInitConfig.startupCommands` when the replacement's first flush runs,
+ *  not from the spawn snapshot, so a folded request's new commands reach the
+ *  window's replacement without another respawn (and a Codex auto-upgrade
+ *  restore, which never types them, must not converge just for them). Only
+ *  their PRESENCE is part of the spawn: it decides Codex RPC eligibility
+ *  (codexRpcEligible fails closed with startup commands), so a fold that flips
+ *  it needs a replacement built under the new answer. */
 export interface RestartLaunchSettings extends TraexAutoModelSettings {
   workingDir?: string;
   env?: Record<string, string>;
@@ -110,6 +118,10 @@ export interface RestartLaunchSettings extends TraexAutoModelSettings {
   model?: string;
   larkToolBinding?: boolean;
   codexRpcInput?: boolean;
+  /** Read by spawnCli when the replacement is built (shell wrapper). */
+  launchShell?: string;
+  /** Raw list as stored on the config; only `hasStartupCommands` is compared. */
+  startupCommands?: string[];
 }
 
 export function restartLaunchSettings(cfg: RestartLaunchSettings | null | undefined): RestartLaunchSettings {
@@ -124,6 +136,8 @@ export function restartLaunchSettings(cfg: RestartLaunchSettings | null | undefi
     model: cfg?.model,
     larkToolBinding: cfg?.larkToolBinding,
     codexRpcInput: cfg?.codexRpcInput,
+    launchShell: cfg?.launchShell,
+    ...(cfg?.startupCommands?.length ? { startupCommands: cfg.startupCommands } : {}),
   };
 }
 
@@ -149,7 +163,9 @@ export function sameRestartLaunchSettings(a: RestartLaunchSettings, b: RestartLa
     && a.modelBackendVariant === b.modelBackendVariant
     && (a.model ?? undefined) === (b.model ?? undefined)
     && (a.larkToolBinding ?? undefined) === (b.larkToolBinding ?? undefined)
-    && a.codexRpcInput === b.codexRpcInput;
+    && a.codexRpcInput === b.codexRpcInput
+    && (a.launchShell || undefined) === (b.launchShell || undefined)
+    && !!a.startupCommands?.length === !!b.startupCommands?.length;
 }
 
 export type MergedRestartDisposition = 'adopt' | 'converge';

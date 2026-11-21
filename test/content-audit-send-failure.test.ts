@@ -86,4 +86,16 @@ describe('content audit notice i18n', () => {
     expect(zh).toMatch(/审计/);
     expect(en).toMatch(/audit/i);
   });
+
+  // 这是模型输出触发的拦截：两种失败提示都只说明情况、指向 Web 终端，
+  // 不要求用户去脱敏或重发。
+  it.each(['worker.final_output_content_audit_blocked', 'worker.final_output_content_audit_blocked_unredacted'])(
+    '%s asks nothing of the user', key => {
+      const zh = translate(key, { code: '230028' }, 'zh');
+      const en = translate(key, { code: '230028' }, 'en');
+      expect(zh).toContain('230028');
+      expect(en).toContain('230028');
+      expect(zh).not.toMatch(/脱敏|重发|请/);
+      expect(en).not.toMatch(/redact|resend|please/i);
+    });
 });

@@ -1,13 +1,33 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+import './helpers/require-fenced-data-dir.js';
 import { describe, expect, it, vi } from 'vitest';
+import { accessSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Tests run as root here, where a real permission check always passes.
+// `require` inside the factory, not the vitest-only `importOriginal` argument:
+// bun passes none, so taking it would drop this whole file from the bun leg.
+vi.mock('node:fs', () => {
+  const actual = require('node:fs') as typeof import('node:fs');
+  return { ...actual, accessSync: vi.fn(actual.accessSync) };
+});
 
 import type {
   DashboardGlobalConfig,
   GlobalConfig,
   MaintenanceConfig,
 } from '../src/global-config.js';
-import { GROUP_NAME_PREFIX_MAX_LENGTH } from '../src/global-config.js';
+import {
+  GROUP_NAME_PREFIX_MAX_LENGTH,
+  invalidateGlobalConfigCache,
+  mergeGlobalConfig as realMergeGlobalConfig,
+  readGlobalConfig as realReadGlobalConfig,
+} from '../src/global-config.js';
+import { config } from '../src/config.js';
 import {
   applySettingsWrite,
+  resolveGroupCreationSettings,
   hasResolvedCodexNotifierRecipient,
   resolveCodexNotifierRecipientView,
   type ResolvedDashboardSettingsView,
@@ -20,6 +40,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
   const storedGlobal: GlobalConfig = {};
   const settingsView: ResolvedDashboardSettingsView = {
     groupNamePrefix: '',
+    worktreeRoot: '',
     publicReadOnly: false,
     openTerminalInFeishu: false,
     enableLocalCliOpen: false,
@@ -47,6 +68,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     workflow: { enabled: true },
     sessionCleanup: { enabled: false, olderThanHours: 168, intervalMinutes: 60 },
     promptCache: null,
+    providerRecovery: null,
     multiTopic: { enabled: true },
     maintenance: {},
     localDevInstall: false,
@@ -150,6 +172,25 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ groupNamePrefix: null });
   });
 
+  it('writes a trimmed worktreeRoot that names an existing directory', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-worktree-root-'));
+    try {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ worktreeRoot: ` ${dir} ` }, deps);
+      expect(r.ok).toBe(true);
+      expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ worktreeRoot: dir });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('clears worktreeRoot when the dashboard saves an empty value', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ worktreeRoot: '  ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ worktreeRoot: null });
+  });
+
   it('writes publicReadOnly toggle and echoes the resolved snapshot', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ publicReadOnly: true }, deps);
@@ -194,11 +235,39 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ cardBrandLabel: enabled });
   });
 
+  it.each([false, true])('persists modelQueueNotify=%s without replacing unrelated settings', async enabled => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ modelQueueNotify: enabled }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ modelQueueNotify: enabled });
+  });
+
+  it.each(['true', 1, null, {}])('rejects malformed model queue notification without writing: %s', async modelQueueNotify => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ modelQueueNotify }, deps);
+    expect(result).toMatchObject({ ok: false, error: 'invalid_modelQueueNotify' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
+  });
+
   it('writes noVisibleOutputHint toggle (on) through the dashboard segment', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ noVisibleOutputHint: true }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ noVisibleOutputHint: true });
+  });
+
+  it.each([false, true])('writes terminalEffortWriteback=%s without touching other settings', async enabled => {
+    const deps = makeDeps();
+    const result = await applySettingsWrite({ terminalEffortWriteback: enabled }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ terminalEffortWriteback: enabled });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it.each(['true', 1, null])('refuses invalid terminal effort writeback value %s', async value => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ terminalEffortWriteback: value }, deps)).toEqual({ ok: false, error: 'invalid_terminalEffortWriteback' });
+    expect(deps.mergeDashboardConfig).not.toHaveBeenCalled();
   });
 
   it.each([false, true])('writes autoUpgradeCodexSessions=%s through the dashboard segment', async (enabled) => {
@@ -358,6 +427,25 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ multiTopic: { enabled: false } }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ multiTopic: { enabled: false, futureFlag: 1 } });
+  });
+
+  it('writes the nested taskTreeCard switch while preserving enabled and other siblings', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true, futureFlag: 1 } as any })),
+    });
+    const r = await applySettingsWrite({ multiTopic: { enabled: true, taskTreeCard: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith(
+      { multiTopic: { enabled: true, futureFlag: 1, taskTreeCard: true } },
+    );
+  });
+
+  it('rejects a non-boolean nested taskTreeCard', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true } })),
+    });
+    expect(await applySettingsWrite({ multiTopic: { enabled: true, taskTreeCard: 'yes' } }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic_taskTreeCard' });
   });
 
   it('rejects invalid multiTopic patches', async () => {
@@ -521,6 +609,41 @@ describe('applySettingsWrite — validation errors', () => {
       if (r.ok) throw new Error('expected failure');
       expect(r.error).toBe('invalid_groupNamePrefix');
       expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    }
+  });
+
+  it('rejects a worktreeRoot that is not an existing absolute directory without writing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-worktree-root-'));
+    const file = join(dir, 'not-a-dir');
+    writeFileSync(file, '');
+    try {
+      for (const worktreeRoot of [42, null, 'relative/dir', '~other/wts', join(dir, 'missing'), file]) {
+        const deps = makeDeps();
+        const r = await applySettingsWrite({ worktreeRoot }, deps);
+        expect(r.ok).toBe(false);
+        if (r.ok) throw new Error('expected failure');
+        expect(r.error).toBe('invalid_worktreeRoot');
+        expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a worktreeRoot directory that is not writable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-worktree-root-'));
+    vi.mocked(accessSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    });
+    try {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ worktreeRoot: dir }, deps);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error('expected failure');
+      expect(r.error).toBe('invalid_worktreeRoot');
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 
@@ -1141,10 +1264,12 @@ describe('applySettingsWrite — scheduleBotGrants', () => {
   it('writes the switches and the whole grant list through the bot-grant writer', async () => {
     const deps = makeDeps();
     const r = await applySettingsWrite({ scheduleBotGrants: {
-      createEnabled: true, selfManageEnabled: false, grants: [grant], baseGrants: [] } }, deps);
+      createEnabled: true, selfManageEnabled: false, childOneShotEnabled: true,
+      grants: [grant], baseGrants: [] } }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeScheduleBotGrantConfig).toHaveBeenCalledWith({
-      createEnabled: true, selfManageEnabled: false, botGrants: [grant] });
+      createEnabled: true, selfManageEnabled: false, childOneShotEnabled: true,
+      botGrants: [grant] });
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
   });
 
@@ -1157,6 +1282,7 @@ describe('applySettingsWrite — scheduleBotGrants', () => {
   it.each([
     [{ createEnabled: 'yes' }, 'invalid_scheduleBotGrants_createEnabled'],
     [{ selfManageEnabled: 1 }, 'invalid_scheduleBotGrants_selfManageEnabled'],
+    [{ childOneShotEnabled: 'yes' }, 'invalid_scheduleBotGrants_childOneShotEnabled'],
     [{}, 'invalid_scheduleBotGrants'],
     [{ grants: 'team' }, 'invalid_scheduleBotGrants_grant'],
     // An app-scoped open_id is never a cross-app controller identity.
@@ -1300,6 +1426,23 @@ describe('applySettingsWrite — hostOverloadAlert', () => {
   });
 });
 
+describe('applySettingsWrite providerRecovery', () => {
+  it('writes a normalized block and clears it with null', async () => {
+    const deps = makeDeps();
+    expect((await applySettingsWrite({ providerRecovery: { enabled: true, maxWaitMinutes: 30 } }, deps)).ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ providerRecovery: { enabled: true, maxWaitMinutes: 30 } });
+    expect((await applySettingsWrite({ providerRecovery: null }, deps)).ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenLastCalledWith({ providerRecovery: null });
+  });
+
+  it('rejects out-of-range values instead of silently falling back to defaults', async () => {
+    const deps = makeDeps();
+    expect(await applySettingsWrite({ providerRecovery: { enabled: true, maxWaitMinutes: 999 } }, deps))
+      .toEqual({ ok: false, error: 'invalid_providerRecovery' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+});
+
 describe('applySettingsWrite promptCache', () => {
   it('writes a normalized block and clears it with null', async () => {
     const deps = makeDeps();
@@ -1400,5 +1543,63 @@ describe('Codex idle cleanup setting', () => {
     const deps = makeDeps();
     expect(await applySettingsWrite({ sessionCleanup: { archiveCodex: 'true' } }, deps)).toEqual({ ok: false, error: 'invalid_sessionCleanup_archiveCodex' });
     expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe('applySettingsWrite — groupOwnerNotice', () => {
+  it('a Dashboard flip lands in config.json and is what the next group creation reads', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-owner-notice-'));
+    const configFile = join(dir, 'config.json');
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', configFile);
+    invalidateGlobalConfigCache();
+    try {
+      writeFileSync(configFile, JSON.stringify({ groupNamePrefix: 'AI·' }));
+      const deps = makeDeps({ mergeGlobalConfig: realMergeGlobalConfig, readGlobalConfig: realReadGlobalConfig });
+      expect(config.groupOwnerNotice).toBe(true);
+
+      // The page reloads its snapshot from the same file it just wrote.
+      const snapshot = () => resolveGroupCreationSettings(realReadGlobalConfig());
+      expect(snapshot()).toEqual({ groupNamePrefix: 'AI·', groupOwnerNotice: true });
+
+      expect((await applySettingsWrite({ groupOwnerNotice: false }, deps)).ok).toBe(true);
+      expect(JSON.parse(readFileSync(configFile, 'utf-8'))).toEqual({ groupNamePrefix: 'AI·', groupOwnerNotice: false });
+      expect(config.groupOwnerNotice).toBe(false);
+      expect(snapshot().groupOwnerNotice).toBe(false);
+
+      // Back on removes the key rather than pinning the default.
+      expect((await applySettingsWrite({ groupOwnerNotice: true }, deps)).ok).toBe(true);
+      expect(JSON.parse(readFileSync(configFile, 'utf-8'))).toEqual({ groupNamePrefix: 'AI·' });
+      expect(config.groupOwnerNotice).toBe(true);
+      expect(snapshot().groupOwnerNotice).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+      invalidateGlobalConfigCache();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a non-boolean without writing', async () => {
+    for (const groupOwnerNotice of ['false', 0, null, {}]) {
+      const deps = makeDeps();
+      expect(await applySettingsWrite({ groupOwnerNotice }, deps)).toEqual({ ok: false, error: 'invalid_groupOwnerNotice' });
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    }
+  });
+
+  it('does not persist the switch when another field in the same save is invalid', async () => {
+    const deps = makeDeps();
+    expect((await applySettingsWrite({ groupOwnerNotice: false, publicReadOnly: 'yes' }, deps)).ok).toBe(false);
+    expect((await applySettingsWrite({ groupOwnerNotice: false, repoPickerMode: 'invalid' }, deps)).ok).toBe(false);
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('new version notification settings writes', () => {
+  it('allows reminders on source installs with automatic updates disabled', async () => {
+    const deps = makeDeps({ isLocalDevInstall: () => true, isAutoUpdateSupportedInstall: () => false });
+    const result = await applySettingsWrite({ maintenance: { notifyOnNewVersion: true } }, deps);
+    expect(result.ok).toBe(true);
+    expect(deps.mergeMaintenanceConfig).toHaveBeenCalledWith({ notifyOnNewVersion: true });
   });
 });

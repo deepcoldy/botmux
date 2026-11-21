@@ -5,13 +5,8 @@
  *
  *   1. **Default off, and off means absent.** A bot without the field takes no
  *      part in credential resolution at all.
- *   2. **No "borrow another person's login" setting exists.** The fallback
- *      accepts only "the bot's own identity" or "fail" — asking for the machine
- *      login is refused with a message saying so, not silently normalized.
- *
- * Plus the asymmetry between the two CLIs: `bytedcli` has no non-human
- * identity, so for it "unauthorized" always means the call cannot run, even
- * when the configured fallback says `bot-identity`.
+ *   2. **No "borrow another person's login" setting exists.** The legacy
+ *      `fallback` field is parsed and ignored; nothing asks for a machine login.
  *
  * Run:  npx vitest run --project unit test/trigger-user-auth.test.ts
  */
@@ -21,7 +16,8 @@ import {
   triggerUserAuthApplies,
   TriggerUserAuthConfigError,
   TRIGGER_USER_AUTH_TOOLS,
-  tokenStoreProtection, credentialSourceOf, delegatesOnMention } from '../src/services/trigger-user-auth.js';
+  tokenStoreProtection, credentialSourceOf, delegatesOnMention, dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 
 describe('parseTriggerUserAuthConfig', () => {
   it('treats an absent field as "not configured at all"', () => {
@@ -34,7 +30,6 @@ describe('parseTriggerUserAuthConfig', () => {
       enabled: false,
       credentialSource: 'auto',
       tools: [...TRIGGER_USER_AUTH_TOOLS],
-      fallback: 'bot-identity',
     });
   });
 
@@ -52,26 +47,30 @@ describe('parseTriggerUserAuthConfig', () => {
       .toEqual(['bytedcli']);
   });
 
-  it('defaults the fallback to the bot\'s own identity', () => {
-    expect(parseTriggerUserAuthConfig({ enabled: true })?.fallback).toBe('bot-identity');
-  });
-
-  it('accepts fallback: none', () => {
-    expect(parseTriggerUserAuthConfig({ enabled: true, fallback: 'none' })?.fallback).toBe('none');
-  });
-
-  // The whole point of the feature is to stop using someone else's login, so
-  // there must be no config value that asks for it — and the refusal has to say
-  // why, or an operator will read it as a typo and keep trying.
-  it('refuses a machine-login fallback and explains that it never exists', () => {
-    for (const asked of ['device', 'machine', 'runtime', 'device-identity']) {
-      let thrown: Error | undefined;
-      try { parseTriggerUserAuthConfig({ enabled: true, fallback: asked }); }
-      catch (e) { thrown = e as Error; }
-      expect(thrown).toBeInstanceOf(TriggerUserAuthConfigError);
-      expect(thrown!.message).toContain(asked);
-      expect(thrown!.message).toContain('never available');
+  it('parses a legacy fallback without error and ignores it', () => {
+    for (const fallback of ['bot-identity', 'none', 'device', 42]) {
+      const config = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], fallback });
+      expect(config).not.toHaveProperty('fallback');
+      expect(config?.tools).toEqual(['bytedcli']);
     }
+  });
+
+  it('leaves `capabilities` unset for a tools-only config', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] }))
+      .not.toHaveProperty('capabilities');
+  });
+
+  it('`capabilities` overrides `tools`, which then follows the capabilities', () => {
+    expect(parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'], capabilities: ['meego', 'meego'] }))
+      .toMatchObject({ capabilities: ['meego'], tools: ['bytedcli'] });
+    expect(parseTriggerUserAuthConfig({ enabled: true, capabilities: ['lark-user', 'bytecloud'] }))
+      .toMatchObject({ capabilities: ['lark-user', 'bytecloud'], tools: ['lark-cli', 'bytedcli'] });
+    expect(parseTriggerUserAuthConfig({ enabled: true, capabilities: [] })).toMatchObject({ capabilities: [], tools: [] });
+  });
+
+  it('rejects unknown or mistyped capabilities by name', () => {
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, capabilities: ['lark-user', 'bits'] })).toThrow(/bits/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, capabilities: 'meego' })).toThrow(/capabilities/);
   });
 
   // A typo'd tool name must not leave the operator believing a boundary is
@@ -86,6 +85,39 @@ describe('parseTriggerUserAuthConfig', () => {
     expect(() => parseTriggerUserAuthConfig([])).toThrow(TriggerUserAuthConfigError);
     expect(() => parseTriggerUserAuthConfig({ enabled: 'true' })).toThrow(/enabled/);
     expect(() => parseTriggerUserAuthConfig({ enabled: true, tools: 'lark-cli' })).toThrow(/tools/);
+  });
+
+  it('parses exact dispatch-only scopes and keeps them out of source CLI auth', () => {
+    const config = parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'],
+      dispatchOnly: { tools: ['bytedcli', 'bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] } });
+    expect(config?.dispatchOnly).toEqual({ tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] });
+    expect(triggerUserAuthApplies(config, 'bytedcli')).toBe(false);
+    expect(delegatesOnMention(config)).toBe(true);
+  });
+
+  it('rejects malformed dispatch-only scopes while the policy is enabled', () => {
+    const valid = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] };
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: { ...valid, chatIds: [] } })).toThrow(/chatIds/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: { ...valid, targetAppIds: ['*'] } })).toThrow(/targetAppIds/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: { ...valid, tools: ['git'] } })).toThrow(/tools/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: 'nope' })).toThrow(/object/);
+  });
+
+  it('accepts and ignores dispatch-only scopes while the policy is disabled', () => {
+    const valid = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] };
+    // A natural manual kill switch: turning `enabled` off must not invalidate
+    // the whole bots.json load, even if the dormant scope is malformed.
+    const disabled = parseTriggerUserAuthConfig({ enabled: false, tools: [], dispatchOnly: valid });
+    expect(disabled).not.toHaveProperty('dispatchOnly');
+    expect(disabled?.enabled).toBe(false);
+    const malformed = parseTriggerUserAuthConfig({ enabled: false, dispatchOnly: { tools: ['nope'] } });
+    expect(malformed).not.toHaveProperty('dispatchOnly');
+    // And the disabled policy neither hands off on mention nor signs tools.
+    expect(delegatesOnMention(disabled)).toBe(false);
+    expect(dispatchOnlyToolsForTurn(disabled, {
+      sourceChatId: 'oc_group', targetChatId: 'oc_group', targetAppIds: ['cli_target'],
+      directHuman: true, inherited: false,
+    })).toEqual([]);
   });
 });
 
@@ -112,21 +144,33 @@ describe('triggerUserAuthApplies', () => {
 });
 
 // An honest report, not a reassurance. Botmux keeps each token 0600, but the
-// agent runs as the SAME OS user, so without the file sandbox it can read every
-// person's token file directly. Per-person storage still fixes attribution and
-// the overwrite bug; only the sandbox makes the isolation OS-enforced.
+// agent runs as the SAME OS user, so unless the OS stops it the agent can read
+// every person's token file directly. Only the allowlist sandbox stops it:
+// scratch isolates writes and keeps the disk (other people's tokens and login
+// state included) readable.
 describe('tokenStoreProtection', () => {
-  it('reports enforced only when the file sandbox is on', () => {
-    expect(tokenStoreProtection(true)).toEqual({ enforced: true });
+  it('counts only the allowlist sandbox as protecting the token store', () => {
+    expect(tokenStoreProtection('oncall')).toEqual({ enforced: true });
+    expect(tokenStoreProtection('scratch').enforced).toBe(false);
+    expect(tokenStoreProtection('off').enforced).toBe(false);
   });
 
-  it('admits the gap when there is no sandbox, and names the fix', () => {
-    const report = tokenStoreProtection(false);
-    expect(report.enforced).toBe(false);
-    expect(report.advisory).toContain('sandbox');
-    // It must say what an agent can actually do, not just that something is
-    // "less secure" — an operator cannot weigh a vague warning.
-    expect(report.advisory).toContain('同一个系统用户');
+  it('tells a scratch bot something different from a bot with no sandbox', () => {
+    expect(tokenStoreProtection('scratch').advisory).toBeTruthy();
+    expect(tokenStoreProtection('off').advisory).toBeTruthy();
+    expect(tokenStoreProtection('scratch').advisory).not.toBe(tokenStoreProtection('off').advisory);
+  });
+
+  it('points at the Dashboard entry and mode the operator actually sees', () => {
+    // Both sides come from real data: the advisory must name the labels the
+    // Dashboard renders, or an operator cannot find the switch it describes.
+    const tr = createDashboardTranslator('zh');
+    for (const mode of ['off', 'scratch'] as const) {
+      const advisory = tokenStoreProtection(mode).advisory!;
+      for (const label of [tr('nav.botDefaults'), tr('botDefaults.tabSecurity'), tr('botDefaults.sectionSandbox'), tr('botDefaults.sandboxModeOncall')]) {
+        expect(advisory, `${mode}: ${label}`).toContain(label);
+      }
+    }
   });
 });
 

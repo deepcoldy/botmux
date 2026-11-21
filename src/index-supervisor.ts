@@ -121,6 +121,7 @@ async function main(): Promise<void> {
   const scope = moveSupervisorIntoFleetScope();
   if (scope.action === 'moved') logger.info(`[supervisor] moved out of ${scope.from} into ${scope.to}`);
   else if (scope.action === 'failed') logger.warn(`[supervisor] staying in ${scope.unit}: could not create an own systemd scope (${scope.reason})`);
+  else if (scope.action === 'unsupported' && process.platform === 'linux') logger.info(`[supervisor] no own systemd scope: ${scope.reason}`);
 
   logger.info(`[supervisor] starting fleet: ${botCount} bot(s) + dashboard`);
   if (!supervisor.start(members)) {

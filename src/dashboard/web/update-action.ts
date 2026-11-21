@@ -1,3 +1,5 @@
+import type { ConfirmOptions } from './confirm-modal.js';
+
 export type BotmuxUpdatePhase = 'updating' | 'restarting';
 
 export interface BotmuxUpdateResult {
@@ -277,4 +279,32 @@ export async function updateAndRestartBotmux(
   return alreadyScheduled
     ? { ...result, restarted: true, alreadyScheduled: true }
     : { ...result, restarted: true };
+}
+
+export function localForceUpdateError(body: { error?: string; detail?: string }, tr: (key: string, args?: Record<string, string>) => string): string {
+  const codes = new Set(['local_update_preview_stale', 'local_update_operation_in_progress', 'local_update_no_upstream',
+    'local_update_ignored_collision', 'local_update_backup_incomplete', 'local_update_shared_deps', 'local_update_untracked_directory']);
+  return codes.has(body.error ?? '') ? tr(`update.${body.error}`) : String(body.detail ?? body.error ?? 'update_failed');
+}
+
+/** Preview is read-only for the checkout; cancellation never posts an update. */
+export async function confirmLocalForceUpdate(
+  fetchImpl: typeof fetch,
+  confirmImpl: (options: ConfirmOptions) => Promise<boolean>,
+  tr: (key: string, args?: Record<string, string>) => string,
+): Promise<string | null> {
+  const response = await fetchImpl('/api/update/local-dev/preview', { method: 'POST' });
+  const body = await response.json();
+  if (!response.ok || body.ok !== true || typeof body.token !== 'string') throw new Error(localForceUpdateError(body, tr));
+  const summary = (value: unknown): string => {
+    const lines = String(value ?? '').trim().split('\n').filter(Boolean);
+    return lines.length ? lines.slice(0, 50).join('\n') + (lines.length > 50 ? `\n… (${lines.length})` : '') : tr('update.forceNone');
+  };
+  const accepted = await confirmImpl({
+    title: tr('update.forceTitle'), danger: true,
+    message: tr('update.forceConfirm', { dir: String(body.dir), target: String(body.target),
+      head: String(body.targetHead).slice(0, 12), files: summary(body.status), commits: summary(body.localCommits) }),
+    confirmLabel: tr('update.forceConfirmButton'), cancelLabel: tr('update.btnCancel'),
+  });
+  return accepted ? body.token : null;
 }

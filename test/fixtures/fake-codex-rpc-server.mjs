@@ -17,6 +17,32 @@
 import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { appendFileSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+
+// An ordinary tool descendant has no app-server/listen identity in its argv.
+// Tests can release a late tool with SIGUSR2 after start() has captured identity,
+// without assuming the handshake finishes within a fixed wall-clock delay.
+if (process.env.FAKE_GROUP_CHILD_PID_FILE) {
+  const spawnTool = () => {
+    const tool = spawn(process.execPath, ['-e',
+      "process.on('SIGTERM', () => {}); process.on('message', () => process.send('ready')); setInterval(() => {}, 1000);",
+    ], { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
+    tool.once('spawn', () => {
+      // Wait for the child's handler, rather than treating spawn as readiness.
+      tool.send('ready');
+    });
+    tool.on('message', () => {
+      writeFileSync(process.env.FAKE_GROUP_CHILD_PID_FILE, `${tool.pid}\n`);
+      tool.disconnect();
+      tool.unref();
+    });
+  };
+  if (process.env.FAKE_GROUP_CHILD_ON_SIGNAL === '1') {
+    process.once('SIGUSR2', spawnTool);
+  } else {
+    spawnTool();
+  }
+}
 
 if (process.env.FAKE_ENV_PROBE_PATH) {
   const e = process.env;

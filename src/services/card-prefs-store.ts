@@ -18,6 +18,8 @@ import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } 
  *                                  messages in any card mode
  *   • writableTerminalLinkInCard — embed a directly-usable writable terminal
  *                                  link in the streaming card body
+ *   • goalStatusCard            — Codex / TRAE native-goal status card
+ *                                  (opt-in, default off)
  *   • privateCard               — `/card` sends a private ephemeral snapshot
  *                                  (visible to the talk-grant audience) instead
  *                                  of the group-visible live card
@@ -50,8 +52,13 @@ import {
 } from './pin-streaming-card-change.js';
 import {
   normalizeHiddenStreamingCardButtons,
+  resolveStreamingCardFoldedLayout,
   type StreamingCardButtonId,
 } from '../im/lark/streaming-card-buttons.js';
+
+import { normalizeCodexBrowserConfig, type CodexBrowserConfig } from '../core/codex-browser-config.js';
+
+class BrowserBridgeDisabledError extends Error {}
 
 export interface BotCardPrefs extends ReplyFooterPreferences {
   showReplyTiming: boolean;
@@ -62,6 +69,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   disableStreamingCard: boolean;
   replyCardMode: ReplyCardMode;
   hiddenStreamingCardButtons: StreamingCardButtonId[];
+  /** Default true; only false is persisted to restore the classic live-card layout. */
+  streamingCardFoldedLayout: boolean;
   pinStreamingCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
@@ -71,16 +80,31 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   /** Codex App browser bridge. Default false; the dashboard toggle uses the
    * default Chrome family. Edge/pluginRoot remain JSON-only advanced options. */
   codexBrowser: boolean;
+  codexBrowserAutoApproveOrigins: boolean;
   writableTerminalLinkInCard: boolean;
+  /** Codex / TRAE native-goal status card. Default false; only true persists. */
+  goalStatusCard: boolean;
   privateCard: boolean;
   /** Compact overflow menu (terminal/model/close) on ordinary reply cards.
    *  Default false; only an explicit true enables it. */
   replyCardActions: boolean;
-  /** Bot-level master switch for the native CoT (thinking process) message.
+  /** Next-input suggestion button on the last reply card of a turn.
+   *  Default false; only an explicit true enables it. */
+  replyCardNextStep: boolean;
+  /** Collapsed「本轮回顾」panel on the last reply card of a turn.
+   *  Default false; only an explicit true enables it. */
+  replyCardRecap: boolean;
+  /** In-card activity in unified replies, native CoT in legacy replies.
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
   cotEnabled: boolean;
   thinkingCardToolResult: boolean;
+  /** Unified reply cards show tool calls/commands/results/counts.
+   *  Default TRUE (absent = show; only explicit false persists). Only takes
+   *  effect with replyCardMode 'unified'; the value survives mode switches. */
+  replyCardShowTools: boolean;
+  /** Native CoT alongside unified replies; default false, independent of cotEnabled. */
+  replyCardNativeCot: boolean;
   /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
    *  Default TRUE (absent = on; only an explicit false persists), same
    *  convention as cotEnabled. Off also drops the cursor anti-echo note (it is
@@ -88,6 +112,9 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   senderTag: boolean;
   /** Hide email only in newly rendered sender tags. Default false. */
   senderTagHideEmail: boolean;
+  /** Keep development-host addresses out of Lark replies (BotConfig.hideLocalAddresses).
+   *  Default false; only an explicit true persists. */
+  hideLocalAddresses: boolean;
   /** When true, this bot's daemon watches host load/mem and DMs the owner on
    *  overload enter/recover edges. Machine-wide signal, so designate one bot;
    *  a shared episode lock de-dups if several have it on. Default false. */
@@ -109,6 +136,10 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   autoStartOnNewTopic: boolean;
   /** 群负责人（默认接待者）开关，默认关。 */
   chatManagerEnabled: boolean;
+  /** 共享回复模式下，群负责人免 @ 接的顶层消息也开话题，默认关。 */
+  chatManagerSharedTopic: boolean;
+  /** 群秘书（/secretary）开关，默认关。 */
+  groupSecretaryEnabled: boolean;
   autoStartExcludedChats: string[];
   /** 主动开工 — 入群执行命令开关（不经 LLM，见 BotConfig.groupJoinCommandEnabled）。 */
   groupJoinCommandEnabled: boolean;
@@ -138,17 +169,25 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       disableStreamingCard: c.disableStreamingCard === true,
       replyCardMode: normalizeReplyCardMode(c.replyCardMode),
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
+      streamingCardFoldedLayout: resolveStreamingCardFoldedLayout(c),
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
       codexBrowser: c.codexBrowser?.enabled === true,
+      codexBrowserAutoApproveOrigins: c.codexBrowser?.autoApproveOrigins === true,
       thinkingCardToolResult: c.thinkingCardToolResult !== false,
+      replyCardShowTools: c.replyCardShowTools !== false,
+      replyCardNativeCot: c.replyCardNativeCot === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
+      goalStatusCard: c.goalStatusCard === true,
       privateCard: c.privateCard === true,
       replyCardActions: c.replyCardActions === true,
+      replyCardNextStep: c.replyCardNextStep === true,
+      replyCardRecap: c.replyCardRecap === true,
       cotEnabled: c.cotEnabled !== false,
       senderTag: c.senderTag !== false,
       senderTagHideEmail: c.senderTagHideEmail === true,
+      hideLocalAddresses: c.hideLocalAddresses === true,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
       autoInviteOwnerOnGroupAdd: c.autoInviteOwnerOnGroupAdd !== false,
@@ -157,6 +196,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinSeed: typeof c.autoStartOnGroupJoinSeed === 'string' ? c.autoStartOnGroupJoinSeed : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
       chatManagerEnabled: c.chatManagerEnabled === true,
+      chatManagerSharedTopic: c.chatManagerSharedTopic === true,
+      groupSecretaryEnabled: c.groupSecretaryEnabled === true,
       autoStartExcludedChats: c.autoStartExcludedChats ?? [],
       groupJoinCommandEnabled: c.groupJoinCommandEnabled === true,
       groupJoinCommand: typeof c.groupJoinCommand === 'string' ? c.groupJoinCommand : '',
@@ -175,17 +216,25 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       disableStreamingCard: false,
       replyCardMode: 'legacy',
       hiddenStreamingCardButtons: [],
+      streamingCardFoldedLayout: true,
       pinStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
       codexBrowser: false,
+      codexBrowserAutoApproveOrigins: false,
       thinkingCardToolResult: true,
+      replyCardShowTools: true,
+      replyCardNativeCot: false,
       writableTerminalLinkInCard: false,
+      goalStatusCard: false,
       privateCard: false,
       replyCardActions: false,
+      replyCardNextStep: false,
+      replyCardRecap: false,
       cotEnabled: true,
       senderTag: true,
       senderTagHideEmail: false,
+      hideLocalAddresses: false,
       overloadAlert: false,
       botToBotSameDir: true,
       autoInviteOwnerOnGroupAdd: true,
@@ -194,6 +243,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinSeed: '',
       autoStartOnNewTopic: false,
       chatManagerEnabled: false,
+      chatManagerSharedTopic: false,
+      groupSecretaryEnabled: false,
       autoStartExcludedChats: [],
       groupJoinCommandEnabled: false,
       groupJoinCommand: '',
@@ -231,6 +282,7 @@ async function updateBotCardPrefsInternal(
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   const previousPinStreamingCard = bot.config.pinStreamingCard === true;
+  let savedBrowser: CodexBrowserConfig | undefined = bot.config.codexBrowser;
 
   const apply = (entry: any, key: keyof BotCardPrefs, val: boolean | undefined) => {
     if (val === undefined) return;
@@ -299,19 +351,36 @@ async function updateBotCardPrefsInternal(
       else entry.replyCardMode = patch.replyCardMode;
     }
     applyHiddenButtons(entry, patch.hiddenStreamingCardButtons);
+    applyDefaultTrue(entry, 'streamingCardFoldedLayout', patch.streamingCardFoldedLayout);
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
-    apply(entry, 'codexBrowser', patch.codexBrowser);
+    if (patch.codexBrowser === false) delete entry.codexBrowser;
+    else if (patch.codexBrowser === true && !entry.codexBrowser) entry.codexBrowser = true;
+    if (patch.codexBrowser !== undefined || patch.codexBrowserAutoApproveOrigins !== undefined) {
+      savedBrowser = normalizeCodexBrowserConfig(entry.codexBrowser);
+      if (patch.codexBrowserAutoApproveOrigins === true && !savedBrowser) throw new BrowserBridgeDisabledError();
+      if (savedBrowser && patch.codexBrowserAutoApproveOrigins !== undefined) {
+        const { autoApproveOrigins: _previous, ...browser } = savedBrowser;
+        savedBrowser = patch.codexBrowserAutoApproveOrigins ? { ...browser, autoApproveOrigins: true } : browser;
+        entry.codexBrowser = savedBrowser;
+      }
+    }
     applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
+    applyDefaultTrue(entry, 'replyCardShowTools', patch.replyCardShowTools);
+    apply(entry, 'replyCardNativeCot', patch.replyCardNativeCot);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
+    apply(entry, 'goalStatusCard', patch.goalStatusCard);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'replyCardActions', patch.replyCardActions);
+    apply(entry, 'replyCardNextStep', patch.replyCardNextStep);
+    apply(entry, 'replyCardRecap', patch.replyCardRecap);
     // [legacy-thinkingCard] 显式拨开关时清旧名（懒迁移）；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
     if (patch.cotEnabled !== undefined) delete entry.thinkingCard;
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
     apply(entry, 'senderTagHideEmail', patch.senderTagHideEmail);
+    apply(entry, 'hideLocalAddresses', patch.hideLocalAddresses);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
     applyDefaultTrue(entry, 'autoInviteOwnerOnGroupAdd', patch.autoInviteOwnerOnGroupAdd);
@@ -320,6 +389,8 @@ async function updateBotCardPrefsInternal(
     applyStr(entry, 'autoStartOnGroupJoinSeed', patch.autoStartOnGroupJoinSeed);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
     apply(entry, 'chatManagerEnabled', patch.chatManagerEnabled);
+    apply(entry, 'chatManagerSharedTopic', patch.chatManagerSharedTopic);
+    apply(entry, 'groupSecretaryEnabled', patch.groupSecretaryEnabled);
     if (patch.autoStartExcludedChats !== undefined) {
       if (patch.autoStartExcludedChats.length) entry.autoStartExcludedChats = patch.autoStartExcludedChats;
       else delete entry.autoStartExcludedChats;
@@ -340,18 +411,26 @@ async function updateBotCardPrefsInternal(
         disableStreamingCard: entry.disableStreamingCard === true,
         replyCardMode: normalizeReplyCardMode(entry.replyCardMode),
         hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons) ?? [],
+        streamingCardFoldedLayout: entry.streamingCardFoldedLayout !== false,
         pinStreamingCard: entry.pinStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
         codexBrowser: entry.codexBrowser === true
           || (typeof entry.codexBrowser === 'object' && entry.codexBrowser?.enabled === true),
+        codexBrowserAutoApproveOrigins: entry.codexBrowser?.autoApproveOrigins === true,
         thinkingCardToolResult: entry.thinkingCardToolResult !== false,
+        replyCardShowTools: entry.replyCardShowTools !== false,
+        replyCardNativeCot: entry.replyCardNativeCot === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
+        goalStatusCard: entry.goalStatusCard === true,
         privateCard: entry.privateCard === true,
         replyCardActions: entry.replyCardActions === true,
+        replyCardNextStep: entry.replyCardNextStep === true,
+        replyCardRecap: entry.replyCardRecap === true,
         cotEnabled: normalizeCotEnabled(entry),
         senderTag: entry.senderTag !== false,
         senderTagHideEmail: entry.senderTagHideEmail === true,
+        hideLocalAddresses: entry.hideLocalAddresses === true,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
         autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd !== false,
@@ -360,6 +439,8 @@ async function updateBotCardPrefsInternal(
         autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' ? entry.autoStartOnGroupJoinSeed : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
         chatManagerEnabled: entry.chatManagerEnabled === true,
+        chatManagerSharedTopic: entry.chatManagerSharedTopic === true,
+        groupSecretaryEnabled: entry.groupSecretaryEnabled === true,
         autoStartExcludedChats: entry.autoStartExcludedChats ?? [],
         groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true,
         groupJoinCommand: typeof entry.groupJoinCommand === 'string' ? entry.groupJoinCommand : '',
@@ -374,6 +455,9 @@ async function updateBotCardPrefsInternal(
         summaryMemoryPath: typeof entry.summaryMemoryPath === 'string' && entry.summaryMemoryPath.trim() ? entry.summaryMemoryPath.trim() : 'summary.md',
       },
     };
+  }).catch(error => {
+    if (error instanceof BrowserBridgeDisabledError) return { ok: false as const, reason: 'codex_browser_not_enabled' };
+    throw error;
   });
   if (!r.ok) return { ok: false, reason: r.reason };
 
@@ -397,6 +481,9 @@ async function updateBotCardPrefsInternal(
   if (patch.hiddenStreamingCardButtons !== undefined) {
     bot.config.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(patch.hiddenStreamingCardButtons);
   }
+  if (patch.streamingCardFoldedLayout !== undefined) {
+    bot.config.streamingCardFoldedLayout = patch.streamingCardFoldedLayout ? undefined : false;
+  }
   if (patch.pinStreamingCard !== undefined) {
     bot.config.pinStreamingCard = patch.pinStreamingCard || undefined;
   }
@@ -406,13 +493,14 @@ async function updateBotCardPrefsInternal(
   if (patch.codexAppCleanInput !== undefined) {
     bot.config.codexAppCleanInput = patch.codexAppCleanInput || undefined;
   }
-  if (patch.codexBrowser !== undefined) {
-    bot.config.codexBrowser = patch.codexBrowser
-      ? { enabled: true, family: 'chrome' }
-      : undefined;
+  if (patch.codexBrowser !== undefined || patch.codexBrowserAutoApproveOrigins !== undefined) {
+    bot.config.codexBrowser = savedBrowser;
   }
   if (patch.writableTerminalLinkInCard !== undefined) {
     bot.config.writableTerminalLinkInCard = patch.writableTerminalLinkInCard || undefined;
+  }
+  if (patch.goalStatusCard !== undefined) {
+    bot.config.goalStatusCard = patch.goalStatusCard || undefined;
   }
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
@@ -420,8 +508,21 @@ async function updateBotCardPrefsInternal(
   if (patch.replyCardActions !== undefined) {
     bot.config.replyCardActions = patch.replyCardActions || undefined;
   }
+  if (patch.replyCardNextStep !== undefined) {
+    bot.config.replyCardNextStep = patch.replyCardNextStep || undefined;
+  }
+  if (patch.replyCardRecap !== undefined) {
+    bot.config.replyCardRecap = patch.replyCardRecap || undefined;
+  }
   if (patch.thinkingCardToolResult !== undefined) {
     bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;
+  }
+  if (patch.replyCardNativeCot !== undefined) {
+    bot.config.replyCardNativeCot = patch.replyCardNativeCot || undefined;
+  }
+  if (patch.replyCardShowTools !== undefined) {
+    // Default true: store false explicitly, clear (→ default show) when true.
+    bot.config.replyCardShowTools = patch.replyCardShowTools === false ? false : undefined;
   }
   if (patch.cotEnabled !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
@@ -429,6 +530,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.senderTagHideEmail !== undefined) {
     bot.config.senderTagHideEmail = patch.senderTagHideEmail || undefined;
+  }
+  if (patch.hideLocalAddresses !== undefined) {
+    bot.config.hideLocalAddresses = patch.hideLocalAddresses || undefined;
   }
   if (patch.senderTag !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.
@@ -460,6 +564,12 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.chatManagerEnabled !== undefined) {
     bot.config.chatManagerEnabled = patch.chatManagerEnabled || undefined;
+  }
+  if (patch.chatManagerSharedTopic !== undefined) {
+    bot.config.chatManagerSharedTopic = patch.chatManagerSharedTopic || undefined;
+  }
+  if (patch.groupSecretaryEnabled !== undefined) {
+    bot.config.groupSecretaryEnabled = patch.groupSecretaryEnabled || undefined;
   }
   if (patch.groupJoinCommandEnabled !== undefined) {
     bot.config.groupJoinCommandEnabled = patch.groupJoinCommandEnabled || undefined;
@@ -503,11 +613,12 @@ async function updateBotCardPrefsInternal(
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `codexBrowser=${r.result.codexBrowser} ` +
-    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} privateCard=${r.result.privateCard} ` +
+    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} goalStatusCard=${r.result.goalStatusCard} privateCard=${r.result.privateCard} ` +
     `cotEnabled=${r.result.cotEnabled} ` +
     `thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +
     `senderTagHideEmail=${r.result.senderTagHideEmail} ` +
+    `hideLocalAddresses=${r.result.hideLocalAddresses} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `groupJoinCommandEnabled=${r.result.groupJoinCommandEnabled} groupJoinCommand.len=${r.result.groupJoinCommand.length} ` +

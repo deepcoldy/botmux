@@ -4,6 +4,8 @@ import type {
 } from './role-profile-match.js';
 import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
 import { readJson } from './dashboard-api.js';
+import type { GroupDefaultModels } from '../../core/group-default-models.js';
+import type { ListenerContentPolicy } from '../../services/message-listener-content-policy.js';
 
 export interface BotInfo {
   larkAppId: string;
@@ -11,6 +13,11 @@ export interface BotInfo {
   inChat: boolean;
   hasRole: boolean;
   hasMessageListener?: boolean;
+  hasMessageListenerConfig?: boolean;
+  agentCliId?: string;
+  agentModel?: string;
+  agentReasoningEffort?: string;
+  defaultModels?: GroupDefaultModels;
   oncallChat: unknown;
 }
 
@@ -69,12 +76,8 @@ export interface MessageListenerData {
    * V1 is keyword-only: regexes are not evaluated on the daemon main loop
    * (catastrophic-backtracking DoS risk).
    */
-  contentPolicy?: {
-    includeKeywords?: string[];
-    matchMode?: 'any' | 'all';
-    resolveDocumentTitles?: boolean;
-  };
-  replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
+  contentPolicy?: ListenerContentPolicy;
+  replyPolicy?: { mode?: import('../../services/message-listener-reply-policy.js').MessageListenerReplyMode; sessionMode?: 'per_message' };
 }
 
 export function mergeListenerContentPolicy(
@@ -95,7 +98,7 @@ export interface MessageListenerPreviewItem {
   senderType: 'user' | 'bot';
 }
 
-export type MessageListenerRunPreviewState = 'triggered' | 'running' | 'replied' | 'failed';
+export type MessageListenerRunPreviewState = import('../../services/message-listener-run-preview-store.js').MessageListenerRunPreviewState;
 
 export interface MessageListenerRunPreviewResult {
   runId?: string;
@@ -132,6 +135,8 @@ export interface GroupMemberDisplay {
   openId: string;
   name: string;
   memberType: 'user' | 'bot' | 'unknown';
+  /** The viewing bot's own row (it cannot be granted access to itself). */
+  self?: boolean;
 }
 
 export interface RoleProfileSummary {
@@ -217,6 +222,14 @@ export function entryForBot(entries: RoleProfileEntry[], larkAppId: string | nul
   return larkAppId ? entries.find(entry => entry.larkAppId === larkAppId) : undefined;
 }
 
+/** Rank by configured listener count, then present Bot count; preserve the API order on ties. */
+export function sortRoleGroups(groups: readonly GroupInfo[]): GroupInfo[] {
+  return groups.map(group => {
+    const bots = group.memberBots.filter(bot => bot.inChat);
+    return { group, bots: bots.length, listeners: bots.filter(bot => bot.hasMessageListenerConfig ?? bot.hasMessageListener).length };
+  }).sort((a, b) => b.listeners - a.listeners || b.bots - a.bots).map(entry => entry.group);
+}
+
 export function filterRoleGroups(groups: GroupInfo[], filter: string): GroupInfo[] {
   const q = filter.toLowerCase();
   if (!q) return groups;
@@ -252,6 +265,11 @@ export async function loadGroups(): Promise<{ groups: GroupInfo[]; bots: Dashboa
         inChat: member.inChat ?? false,
         hasRole: member.hasRole ?? false,
         hasMessageListener: member.hasMessageListener ?? false,
+        hasMessageListenerConfig: member.hasMessageListenerConfig ?? member.hasMessageListener ?? false,
+        agentCliId: member.agentCliId ?? member.cliId,
+        agentModel: member.agentModel,
+        agentReasoningEffort: member.agentReasoningEffort,
+        defaultModels: member.defaultModels,
         oncallChat: member.oncallChat ?? null,
       })),
     })),

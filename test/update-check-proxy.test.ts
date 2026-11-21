@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createServer, request as httpRequest, type Server } from 'node:http';
+import { createServer, request as httpRequest, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -12,7 +12,19 @@ import { getReleaseStream, proxyForUrl } from '../src/core/release-download.js';
 vi.mock('../src/global-config.js', () => ({ readGlobalConfig: () => ({}) }));
 const servers: Server[] = [];
 const sockets = new Set<Socket>();
+// 宿主机端口扫描器可能向假服务器发 GET / 之类的请求。非目标路径一律回 404，
+// 不进入断言用的请求记录，也不在 listener 里同步抛错（会变成未捕获异常）；
+// 非目标的 POST（被测代码从不 POST）记入 strayRequests，afterEach 清理完后断言为空。
+const strayRequests: string[] = [];
+function rejectStray(req: IncomingMessage, res: ServerResponse, isTarget: (url: string) => boolean): boolean {
+  if (isTarget(req.url ?? '')) return false;
+  if (req.method === 'POST') strayRequests.push(`${req.method} ${req.url}`);
+  res.writeHead(404); res.end();
+  return true;
+}
+const isAbsoluteHttpUrl = (url: string) => url.startsWith('http://');
 beforeEach(() => {
+  strayRequests.length = 0;
   for (const key of Object.keys(process.env)) {
     if (/proxy$/i.test(key)) vi.stubEnv(key, '');
   }
@@ -22,6 +34,7 @@ afterEach(async () => {
   for (const socket of sockets) socket.destroy();
   sockets.clear();
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
+  expect(strayRequests).toEqual([]);
 });
 async function listen(server: Server): Promise<string> {
   servers.push(server);
@@ -37,6 +50,7 @@ describe('registry metadata proxy transport', () => {
     const archive = Buffer.from('test platform archive');
     const integrity = `sha512-${createHash('sha512').update(archive).digest('base64')}`;
     const registry = await listen(createServer((req, res) => {
+      if (rejectStray(req, res, url => url === '/pkg.tgz' || url.endsWith('/latest') || url.startsWith('/botmux-darwin-arm64/'))) return;
       requests.push(req.url!);
       if (req.url === '/pkg.tgz') { res.end(archive); return; }
       res.end(JSON.stringify(req.url!.endsWith('/latest') ? { version: '3.48.0' } : {
@@ -45,6 +59,7 @@ describe('registry metadata proxy transport', () => {
       }));
     }));
     const proxy = await listen(createServer((req, res) => {
+      if (rejectStray(req, res, isAbsoluteHttpUrl)) return;
       proxyRequests.push(req.url!);
       if (mode === 'env') {
         const forwarded = httpRequest(req.url!, reply => {
@@ -120,10 +135,12 @@ describe('registry metadata proxy transport', () => {
     const proxyRequests: string[] = [];
     const directRequests: string[] = [];
     const registry = await listen(createServer((req, res) => {
+      if (rejectStray(req, res, url => url === '/mirror')) return;
       directRequests.push(req.url!);
       res.writeHead(302, { location: 'http://registry.invalid/final' }); res.end();
     }));
     const proxy = await listen(createServer((req, res) => {
+      if (rejectStray(req, res, isAbsoluteHttpUrl)) return;
       proxyRequests.push(req.url!);
       if (req.url === 'http://registry.invalid/botmux/latest') {
         res.writeHead(302, { location: `${registry}/mirror` }); res.end();
@@ -142,6 +159,7 @@ describe('registry metadata proxy transport', () => {
     const seen: string[] = [];
     const integrity = `sha512-${Buffer.alloc(64, 7).toString('base64')}`;
     const proxy = await listen(createServer((req, res) => {
+      if (rejectStray(req, res, isAbsoluteHttpUrl)) return;
       seen.push(req.url!);
       expect(req.headers.accept).toBe('application/json');
       res.setHeader('content-type', 'application/json');
@@ -164,6 +182,7 @@ describe('registry metadata proxy transport', () => {
   it('follows metadata redirects through the same proxy', async () => {
     const seen: string[] = [];
     const proxy = await listen(createServer((req, res) => {
+      if (rejectStray(req, res, isAbsoluteHttpUrl)) return;
       seen.push(req.url!);
       if (seen.length === 1) { res.writeHead(302, { location: '/redirected' }); res.end(); }
       else res.end(JSON.stringify({ version: '3.48.0' }));

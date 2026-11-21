@@ -34,6 +34,19 @@ Other relay failures fail as before: an unverifiable caller, a stale turn, a bin
 
 Status is independent of delivery. Pass `--status completed --progress 100` only when the task is actually complete; sending a report does not infer completion.
 
+## Source-topic replies
+
+For a new single-bot dispatch, `--result-delivery reply` delivers the final report through the source bot directly into the original source thread, without starting another source model turn:
+
+```sh
+botmux dispatch --bot-app cli_worker --chat-id oc_project --title review --brief-file request.md --result-delivery reply
+botmux report --dispatch-root om_seed --status completed --content-file result.md
+```
+
+This requires a native human-origin thread turn and default prompt injection. Existing threads (`--into`), multiple targets, private-card sources, principal lanes, standby dispatches, and repository/model overrides retain the existing delivery modes. The signed binding fixes the source session, thread, input and reporting bot. Only a completed relay report uses direct delivery; questions and blocked/in-progress updates still return to the source model.
+
+New human input or `/stop` invalidates the pending direct reply. In that case the report returns to the source session for handling. A lost publication response retains the unknown journal and never switches sinks automatically. Successful delivery stores the published message reference for the source session's next turn and updates the normal project task status. Existing bindings keep their original behavior.
+
 ## Receipts and retries
 
 Publication returns `publishedMessageId` and `publicationTarget`. Combined delivery also returns the source session receipt. If publication succeeds but relay fails, the error includes the published message ID and `deliveryKey`; retry the same command in the same active turn to retry only relay. The daemon journals publication and completion under `report-deliveries/` and serializes concurrent retries. A successful receipt can be replayed after a daemon restart if the same turn is still authorized.

@@ -1992,7 +1992,7 @@ function InsightsPage() {
         <input type="search" name="q" placeholder={tr('insights.search')} value={q} onChange={event => setQ(event.currentTarget.value)} />
         <DropdownMenu
           id="insight-project"
-          className="insight-filter-menu"
+          className="insight-filter-menu dashboard-toolbar-menu"
           ariaLabel={tr('insights.projectAll')}
           label={projectLabel}
           value={project}
@@ -2001,7 +2001,7 @@ function InsightsPage() {
         />
         <DropdownMenu
           id="insight-time"
-          className="insight-filter-menu"
+          className="insight-filter-menu dashboard-toolbar-menu"
           ariaLabel={tr('insights.timeAll')}
           label={timeLabel}
           value={timeWin}
@@ -2010,7 +2010,7 @@ function InsightsPage() {
         />
         <DropdownMenu
           id="insight-review-filter"
-          className="insight-filter-menu insight-review-menu"
+          className="insight-filter-menu dashboard-toolbar-menu insight-review-menu"
           ariaLabel={tr('insights.filter')}
           label={reviewLabel}
           value={filter}
@@ -2019,7 +2019,7 @@ function InsightsPage() {
         />
         <DropdownMenu
           id="insight-cli-filter"
-          className="insight-filter-menu insight-cli-menu"
+          className="insight-filter-menu dashboard-toolbar-menu insight-cli-menu"
           ariaLabel={tr('insights.filter')}
           label={cliFilterLabel}
           value={cliFilterValue}

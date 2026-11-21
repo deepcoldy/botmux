@@ -15,6 +15,9 @@ export interface DispatchLifecycleUpdate {
   errorCode?: string | null;
   acceptedBotAppIds?: readonly string[];
   missingBotAppIds?: readonly string[];
+  /** When this dispatch attempt began (before the kickoff went out). Reports
+   *  older than it describe an earlier task in the same topic. */
+  attemptStartedAt?: string;
   now?: string;
 }
 
@@ -87,6 +90,7 @@ export async function persistDispatchLifecycle(input: DispatchLifecycleUpdate): 
     if (input.missingBotAppIds) entry.missingBotAppIds = [...input.missingBotAppIds];
     if (input.status === 'accepted') entry.acceptedAt = now;
     if (input.status === 'failed' || input.status === 'timed_out') entry.failedAt = now;
+    if (input.attemptStartedAt) entry.attemptAt = input.attemptStartedAt;
     entry.updatedAt = now;
   });
   return dispatchReceiptState(input);

@@ -442,3 +442,24 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[0].contentTriggers?.map(t => t.name)).toEqual(['good-regex']);
   });
 });
+
+describe('bot-registry talker schedule policy (scheduleCreateByTalkers / scheduleTalkerMaxTasks)', () => {
+  it('keeps only an explicit true switch and an integer quota in 1..100', () => {
+    const on = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'ts1', larkAppSecret: 's', scheduleCreateByTalkers: true, scheduleTalkerMaxTasks: 7,
+    }]))[0];
+    expect(on.scheduleCreateByTalkers).toBe(true);
+    expect(on.scheduleTalkerMaxTasks).toBe(7);
+
+    for (const [sw, quota] of [[false, 0], ['true', 101], [undefined, 2.5], [1, '5'], [null, -1]] as const) {
+      const cfg = parseBotConfigsFromText(JSON.stringify([{
+        larkAppId: 'ts2', larkAppSecret: 's', scheduleCreateByTalkers: sw, scheduleTalkerMaxTasks: quota,
+      }]))[0];
+      expect(cfg.scheduleCreateByTalkers).toBeUndefined();
+      expect(cfg.scheduleTalkerMaxTasks).toBeUndefined();
+    }
+    const absent = parseBotConfigsFromText(JSON.stringify([{ larkAppId: 'ts3', larkAppSecret: 's' }]))[0];
+    expect(absent.scheduleCreateByTalkers).toBeUndefined();
+    expect(absent.scheduleTalkerMaxTasks).toBeUndefined();
+  });
+});

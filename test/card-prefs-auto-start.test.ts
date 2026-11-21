@@ -281,6 +281,28 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(registry.getBot('app_default').config.hiddenStreamingCardButtons).toBeUndefined();
   });
 
+  it('persists classic layout, hot-updates it, and restores the default without changing other preferences', async () => {
+    writeConfig({ hiddenStreamingCardButtons: ['close'], replyCardMode: 'unified', model: 'model-to-preserve' });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    const before = readConfig();
+    expect(store.getBotCardPrefs('app_default').streamingCardFoldedLayout).toBe(true);
+    expect(store.getBotCardPrefs('missing-bot').streamingCardFoldedLayout).toBe(true);
+
+    const off = await store.updateBotCardPrefs('app_default', { streamingCardFoldedLayout: false });
+    expect(off.ok && off.prefs.streamingCardFoldedLayout).toBe(false);
+    expect(readConfig()).toEqual({ ...before, streamingCardFoldedLayout: false });
+    expect(registry.getBot('app_default').config.streamingCardFoldedLayout).toBe(false);
+    expect(registry.loadBotConfigs()[0]!.streamingCardFoldedLayout).toBe(false);
+
+    await store.updateBotCardPrefs('app_default', { privateCard: true });
+    expect(readConfig().streamingCardFoldedLayout).toBe(false);
+    const on = await store.updateBotCardPrefs('app_default', { streamingCardFoldedLayout: true });
+    expect(on.ok && on.prefs.streamingCardFoldedLayout).toBe(true);
+    expect(readConfig()).toEqual({ ...before, privateCard: true });
+    expect(registry.getBot('app_default').config.streamingCardFoldedLayout).toBeUndefined();
+  });
+
   it('autoStartOnGroupJoinSeed round-trips; blank clears back to the built-in i18n fallback', async () => {
     writeConfig();
     const { registry, store } = await freshModules();

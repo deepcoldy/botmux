@@ -158,6 +158,17 @@ describe('reader: resolveSiblingBotNameByUnionId returns the CURRENT name (renam
     expect(resolveSiblingBotNameByUnionId(dataDir, RECEIVER_APP, SIBLING_UNION_ID)).toBe('CurrentName');
   });
 
+  it('ignores null and non-object rows before the sibling and still resolves its current name', () => {
+    writeFileSync(join(dataDir, 'bots-info.json'), JSON.stringify([
+      null,
+      42,
+      'malformed',
+      { larkAppId: SIBLING_APP, botOpenId: 'ou_sibling_self', botName: 'CurrentName', cliId: 'codex' },
+    ]));
+
+    expect(resolveSiblingBotNameByUnionId(dataDir, RECEIVER_APP, SIBLING_UNION_ID)).toBe('CurrentName');
+  });
+
   it('returns undefined for an unknown/empty union_id (caller falls back to cross-ref)', () => {
     seedBotsInfo('CurrentName');
     expect(resolveSiblingBotNameByUnionId(dataDir, RECEIVER_APP, undefined)).toBeUndefined();

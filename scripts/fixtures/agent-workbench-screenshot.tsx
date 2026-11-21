@@ -17,7 +17,7 @@ const sessions: WorkbenchSessionRow[] = Array.from({ length: 320 }, (_, index) =
       ? 'Ship Agent Workbench — contract and accessibility review'
       : (index % 4 === 0 ? 'Review preview interaction lease and safe relock' : 'Agent task ' + String(index + 1) + ' — implementation stream'),
     botName: index % 3 === 0 ? 'Release Builder' : (index % 3 === 1 ? 'Contract Reviewer' : 'Release Scout'),
-    cliId: index % 4 === 0 ? 'codex' : (index % 4 === 1 ? 'claude' : (index % 4 === 2 ? 'gemini' : 'cursor')),
+    cliId: index % 4 === 0 ? 'codex' : (index % 4 === 1 ? 'claude' : (index % 4 === 2 ? 'antigravity' : 'cursor')),
     repoName: index % 2 === 0 ? 'botmux' : 'platform-shell',
     workingDir: index % 2 === 0 ? '/workspace/botmux' : '/workspace/platform-shell',
     gitBranch: index === 0 ? 'feat/agent-workbench' : 'agent/session-' + String(index + 1),

@@ -30,6 +30,7 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   recordPending,
   recordCompleted,
+  recordCompletedStrict,
   recordFailedStrict,
   recordTerminalFailureStrict,
   supersedePendingTriggerByCompletedSuccessorStrict,
@@ -480,5 +481,23 @@ describe('recordSteerParked (HTTP steer group restart insurance)', () => {
     file.results.trg_bad = { status: 'completed', createdAt: 1, completedAt: 2, steerParkedBy: 'trg_q' };
     writeFileSync(fp, JSON.stringify(file));
     expect(() => lookupStrict('sessS4', 'trg_bad')).toThrow();
+  });
+});
+
+describe('strict final result capture', () => {
+  it('retains a pending result when the atomic completion write fails', () => {
+    const sid = 's'.repeat(240);
+    mkdirSync(join(tempDir, 'async-triggers'), { recursive: true });
+    writeFileSync(join(tempDir, 'async-triggers', `${sid}.json`), JSON.stringify({ ownerLarkAppId: 'cli_owner', results: { turn: { status: 'pending', createdAt: 1 } } }));
+    expect(() => recordCompletedStrict(sid, 'turn', 'answer', 2, 'cli_owner')).toThrow();
+    expect(lookupStrict(sid, 'turn')?.result.status).toBe('pending');
+  });
+  it('does not promote an interrupted turn or overwrite another bot owner', () => {
+    recordPending('strict-session', 'turn', 1, 'cli_owner');
+    recordInterruptedStrict('strict-session', 'turn', 2, 'cli_owner');
+    expect(recordCompletedStrict('strict-session', 'turn', 'late', 3, 'cli_owner')).toBe('terminal');
+    expect(lookupStrict('strict-session', 'turn')?.result.status).toBe('interrupted');
+    expect(() => recordCompletedStrict('strict-session', 'turn', 'cross bot', 4, 'cli_other')).toThrow('owner_mismatch');
+    expect(lookupStrict('strict-session', 'turn')?.ownerLarkAppId).toBe('cli_owner');
   });
 });

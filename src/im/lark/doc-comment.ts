@@ -19,7 +19,7 @@ import { resolveUserToken } from '../../utils/user-token.js';
 import { logger } from '../../utils/logger.js';
 import { UserTokenMissingError, assertLarkTransport } from './client.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
-import { structuredLarkCode } from './lark-errors.js';
+import { LARK_CODE_USER_SCOPE_MISSING, structuredLarkCode } from './lark-errors.js';
 import { getDocSubscription, type CommentTriggerMode } from '../../services/doc-subs-store.js';
 import { compareReplyIds } from '../../core/doc-comment-poller.js';
 import { config } from '../../config.js';
@@ -333,13 +333,13 @@ const DOC_SUBSCRIPTION_PERMISSION_CODE = 1069603;
  * 403 重新 OAuth 不会增加文档角色，但仍可回退 tenant（应用可能已被加为文档应用）。
  */
 class UserTokenForbiddenError extends Error {
-  readonly httpStatus = 403;
-
   constructor(
     readonly larkCode?: number,
     readonly larkMessage?: string,
+    readonly httpStatus = 403,
   ) {
-    super(`User Token 无权访问该文档（HTTP 403${larkCode !== undefined ? `, code: ${larkCode}` : ''}）。`);
+    const reason = larkCode === LARK_CODE_USER_SCOPE_MISSING ? '缺少接口所需授权' : '无权访问该文档';
+    super(`User Token ${reason}（HTTP ${httpStatus}${larkCode !== undefined ? `, code: ${larkCode}` : ''}）。${larkMessage ? ` ${larkMessage}` : ''}`);
     this.name = 'UserTokenForbiddenError';
   }
 }
@@ -582,7 +582,7 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
     return res;
   }
 
-  // 默认：优先 user（有 token），401/403 回退 tenant。
+  // 默认：优先 user（有 token），凭据失效、失权或缺少 scope 时回退 tenant。
   let userForbidden: UserTokenForbiddenError | undefined;
   // Token resolution may refresh over the network, so retain the original
   // managed-origin fence even though reads do not participate in send-ledger
@@ -681,11 +681,13 @@ async function fetchWithUserToken(brand: Brand, userToken: string, opts: DriveCa
   if (res.status === 401) {
     throw new UserTokenMissingError('User Token 已失效（HTTP 401）。请在话题中 /login 重新授权。');
   }
-  if (res.status === 403) {
-    // token 有效但无权访问该文档 —— 视作可回退（也许 tenant 有权）
+  if (res.status === 403 || (res.status < 500 && body?.code === LARK_CODE_USER_SCOPE_MISSING)) {
+    // 缺少用户 scope 通常返回 HTTP 400，也可能只通过业务码表示。
+    // 同 403 一样，应用身份可能已被授予文档权限；其它 400/5xx 仍保留原错误。
     throw new UserTokenForbiddenError(
       typeof body?.code === 'number' ? body.code : undefined,
       typeof body?.msg === 'string' ? body.msg : undefined,
+      res.status,
     );
   }
   if (!res.ok) {
@@ -764,6 +766,7 @@ export async function getDocComment(
   larkAppId: string,
   file: ResolvedDocFile,
   commentId: string,
+  options: { onError?: (message: string) => void } = {},
 ): Promise<DocComment | null> {
   try {
     // 用 batch_query 而非 GET /comments/{id}——后者只认「全文评论」，对**局部/锚定
@@ -786,7 +789,10 @@ export async function getDocComment(
       preferTenant: false,
     });
   } catch (err) {
-    logger.warn(`[doc-comment] getDocComment ${commentId.slice(0, 12)} failed: ${err instanceof Error ? err.message : err}`);
+    const message = err instanceof Error ? err.message : String(err);
+    logger.warn(`[doc-comment] getDocComment ${commentId.slice(0, 12)} failed: ${message}`);
+    // 诊断失败不改变既有的 null 返回契约，也不影响事件丢弃/审计处理。
+    try { options.onError?.(message); } catch { /* best-effort diagnostics */ }
     return null;
   }
 }

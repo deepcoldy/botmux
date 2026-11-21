@@ -26,7 +26,7 @@ export function parseWorkflowGrillTrigger(content: string): WorkflowGrillTrigger
 export function buildWorkflowGrillPrompt(goal: string): string {
   return [
     '[/workflow new] 用户通过 `/workflow new` 显式发起了一个即兴 workflow。',
-    '请使用 `botmux-workflow` skill 处理下面这个目标：直接进入 grill（用户已显式发起，"确认意图"那步可省略），',
+    '先运行 `botmux skill show botmux-workflow` 读完整流程，再按它处理下面这个目标：直接进入 grill（用户已显式发起，"确认意图"那步可省略），',
     '在当前飞书话题里一问一答澄清需求，然后自动编排成 DAG 流程并跑完。',
     '',
     `目标：${goal}`,

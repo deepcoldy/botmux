@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, rmSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
@@ -18,6 +18,7 @@ vi.mock('../src/im/lark/client.js', async () => ({
   getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' })),
 }));
 vi.mock('../src/core/worker-pool.js', async () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   ...await vi.importActual<any>('../src/core/worker-pool.js'), forkWorker: mocks.fork,
 }));
 
@@ -42,6 +43,7 @@ afterEach(() => {
 
 it('finish(succeeded) keeps the retired row closed: a new group message starts fresh, /resume is refused', async () => {
   const workspace = join(mocks.dataDir, 'workspace'); mkdirSync(workspace, { recursive: true });
+  const canonicalWorkspace = realpathSync(workspace);
   const bot = registerBot({ larkAppId: APP, larkAppSecret: 'fixture', cliId: 'claude-code', allowedUsers: ['ou_fixture'] });
   bot.resolvedAllowedUsers = ['ou_fixture'];
   store.init(APP); initSessionGroups(APP); pool.setActiveSessionsRegistry(active);
@@ -89,13 +91,13 @@ it('finish(succeeded) keeps the retired row closed: a new group message starts f
   await ingress('om_resume', '/resume');
   await vi.waitFor(() => expect([...mocks.reply.mock.calls, ...mocks.send.mock.calls].flat().join(' '))
     .toMatch(/工作区已回收|workspace has been reclaimed/));
-  expect(retired()).toMatchObject({ status: 'closed', workspaceRetirement: { operationId: 'retire-group', workspacePath: workspace } });
+  expect(retired()).toMatchObject({ status: 'closed', workspaceRetirement: { operationId: 'retire-group', workspacePath: canonicalWorkspace } });
   expect(active.size).toBe(0);
   expect(mocks.fork).not.toHaveBeenCalled();
 
   // An ordinary message no longer auto-resumes the closed row: it opens a fresh session.
   await ingress('om_continue', 'continue');
-  expect(retired()).toMatchObject({ status: 'closed', workspaceRetirement: { operationId: 'retire-group', workspacePath: workspace } });
+  expect(retired()).toMatchObject({ status: 'closed', workspaceRetirement: { operationId: 'retire-group', workspacePath: canonicalWorkspace } });
   const fresh = getSessionGroup(CHAT)?.lastSessionId;
   expect(fresh).toBeTruthy();
   expect(fresh).not.toBe(session.sessionId);

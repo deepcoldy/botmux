@@ -35,7 +35,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import { MojoBackend } from '../src/adapters/backend/mojo-backend.js';
 import {
@@ -231,13 +231,28 @@ exit 0`);
         // Z until its parent reaps it, and kill(pid, 0) answers TRUE for a zombie. So
         // the cheap check would call an un-reaped corpse "still running" and make this
         // assertion flap depending on reap timing.
+        //
+        // Wait for the death window to close before judging: destroySession's scanner
+        // treats an ENOENT/ESRCH on /proc/<pid>/environ as "the process vanished", and
+        // that file can disappear a few milliseconds BEFORE /proc/<pid>/stat stops
+        // reporting a running state. A zero-delay liveness read here therefore races
+        // the kernel teardown — the close honestly says ok (the SIGKILL was delivered
+        // and the scan no longer sees the member) while stat still says "running".
+        // Same wait pattern as the PROBE 1b handle case below.
+        const settled = await waitFor(() => {
+            const live = readProcLiveness(escaped);
+            return live === 'gone' || live === 'zombie';
+        });
         const liveness = readProcLiveness(escaped);
         const stillExecuting = liveness === 'running' || liveness === 'unreadable';
         note(`P2: escaped still alive after close=${alive(escaped)}`);
-        note(`P2: escaped liveness=${liveness} stillExecuting=${stillExecuting}`);
+        note(`P2: escaped liveness=${liveness} stillExecuting=${stillExecuting} settled=${settled}`);
 
         // The real invariant: the close may only succeed once nothing is executing.
+        // If a survivor were genuinely unkillable the wait above would time out
+        // (settled=false), so an ok:true in that case still fails this assertion.
         if (result.ok) {
+            expect(settled).toBe(true);
             expect(stillExecuting).toBe(false);
         } else {
             note('P2: close refused — acceptable, but then the blocker must be retained');
@@ -259,7 +274,8 @@ exit 0`);
         const dataDir = mkdtempSync(join(binDir, 'p2c-store-'));
         const procRoot = mkdtempSync(join(binDir, 'p2c-proc-'));
         const nonce = `botmux-mojo-p2c-${process.pid}`;
-        const immortal = 4242;
+        // Synthetic members must differ from the runner identities excluded by scans.
+        const immortal = Math.max(process.pid, process.ppid) + 1;
         mkdirSync(join(procRoot, 'sys/kernel/random'), { recursive: true });
         const bootId = '99999999-8888-7777-6666-555555555555';
         writeFileSync(join(procRoot, 'sys/kernel/random/boot_id'), `${bootId}\n`);
@@ -274,6 +290,9 @@ exit 0`);
 
         const { config } = await import('../src/config.js');
         const prevDataDir = config.session.dataDir;
+        // A fake /proc does not isolate process.kill: its PIDs still address the
+        // host. Intercept this synthetic case only; the other probes use real children.
+        const killSpy = vi.spyOn(process, 'kill').mockReturnValue(true);
         config.session.dataDir = dataDir;
         try {
             recordContainmentHandle({
@@ -294,6 +313,7 @@ exit 0`);
             const result = await gen2.destroySession();
             note(`P2c: unkillable inherited member -> ${JSON.stringify(result)}`);
             note(`P2c: quiescence -> ${JSON.stringify(gen2.lastTurnQuiescence)}`);
+            expect(killSpy).toHaveBeenCalledWith(immortal, 'SIGKILL');
 
             // THE ASSERTION: an undischargeable handle must refuse the close.
             expect(result.ok).toBe(false);
@@ -302,6 +322,7 @@ exit 0`);
             expect(hasUnprovenContainment('probe2c-session', dataDir)).toBe(true);
             note(`P2c: blocker_retained=${hasUnprovenContainment('probe2c-session', dataDir)}`);
         } finally {
+            killSpy.mockRestore();
             config.session.dataDir = prevDataDir;
         }
     }, 40_000);

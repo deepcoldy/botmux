@@ -6,7 +6,7 @@ import { sessionScopePayloadPid, wrapCommandInSessionScope } from '../src/core/s
 // scope supervisor's or the relay's command line shape shows up here.
 const RELAY_ARGV = ['/usr/bin/node', '/opt/botmux/dist/program-status-relay.js', 'a'.repeat(64), '/tmp/botmux-psr-x/plan.json'];
 const SCOPE_ARGV = wrapCommandInSessionScope('6b50f4a4-3392-43df-837b-02261f498b43', '/root/.local/bin/claude', ['--resume', 'x'],
-  undefined, { cleanupSupported: true, memoryControllerSupported: false }, {}).args;
+  undefined, { cleanupSupported: true, memoryControllerSupported: false }, {}, undefined, { shared: true, basis: 'initial-namespace', namespace: 'pid:[4026531836]' }).args;
 const CLAUDE_ARGV = ['/root/.local/bin/claude', '--resume', 'x'];
 
 interface Proc { argv: string[]; children?: number[]; comm?: string; zombie?: boolean }

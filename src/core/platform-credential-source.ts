@@ -17,14 +17,18 @@ import {
   requestCredentialGrant,
   platformCredentialsUrl,
   describeCredentialGrantFailure,
+  BYTEDCLI_REGIONAL_GRANT_VARIABLES,
+  type BytedcliGrantRegion,
+  type CredentialGrant,
   type CredentialGrantResult,
   type CredentialGrantRequest,
 } from '../platform/credential-grant-client.js';
 import { resolveUnionIdFromOpenId } from '../im/lark/client.js';
+import { jwtClaims } from '../utils/bytecloud-jwt-claims.js';
 import { logger } from '../utils/logger.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
-import type { LarkCliIdentity, BytedCliIdentity } from './cli-identity.js';
+import type { LarkCliIdentity, BytedCliIdentity, BytedcliRegion } from './cli-identity.js';
 
 export type PlatformIdentityResolution =
   | { state: 'granted'; identity: LarkCliIdentity | BytedCliIdentity; expiresAt: number }
@@ -71,11 +75,16 @@ const realDeps: Deps = {
   now: () => Date.now(),
 };
 let deps: Deps = realDeps;
+/** Bumped when deps are swapped, so a lookup started under the old ones
+ *  cannot write its answer into the fresh cache. */
+let depsGeneration = 0;
 
 /** @internal test-only */
 export function __setPlatformCredentialDepsForTest(override: Partial<Deps> | null): void {
   deps = override ? { ...realDeps, ...override } : realDeps;
+  depsGeneration++;
   unionIdCache.clear();
+  unionIdLookups.clear();
 }
 
 /** open_id → union_id is stable for a person within an app; cache it so a
@@ -133,7 +142,15 @@ export function noteSenderUnionId(larkAppId: string, openId: unknown, unionId: u
   rememberUnionId(`${larkAppId}|${openId}`, unionId);
 }
 
-async function unionIdFor(larkAppId: string, openId: string): Promise<string | null> {
+/** Lookups in flight, so the tools of one turn (prepared side by side) share
+ *  one contact call. Only the call is shared; a failure is still not cached.
+ *  The contact call has no deadline of its own, so sharing ends after
+ *  {@link UNION_ID_SHARE_MS}: a hung call can hold up the turns that joined it,
+ *  never the ones that come later. */
+const unionIdLookups = new Map<string, Promise<string | null>>();
+export const UNION_ID_SHARE_MS = 5_000;
+
+export async function platformUnionIdFor(larkAppId: string, openId: string): Promise<string | null> {
   const key = `${larkAppId}|${openId}`;
   const hit = unionIdCache.get(key);
   if (hit && deps.now() - hit.at < UNION_ID_TTL_MS) {
@@ -142,10 +159,24 @@ async function unionIdFor(larkAppId: string, openId: string): Promise<string | n
     unionIdCache.set(key, hit);
     return hit.unionId;
   }
+  const inFlight = unionIdLookups.get(key);
+  if (inFlight) return inFlight;
+  const lookup = lookupUnionId(larkAppId, openId, key, depsGeneration);
+  unionIdLookups.set(key, lookup);
+  const stopSharing = () => { if (unionIdLookups.get(key) === lookup) unionIdLookups.delete(key); };
+  const timer = setTimeout(stopSharing, UNION_ID_SHARE_MS);
+  timer.unref?.();
+  try { return await lookup; } finally {
+    clearTimeout(timer);
+    stopSharing();
+  }
+}
+
+async function lookupUnionId(larkAppId: string, openId: string, key: string, generation: number): Promise<string | null> {
   let unionId: string | null = null;
   try { unionId = await deps.resolveUnionId(larkAppId, openId); } catch { unionId = null; }
   if (unionId && UNION_ID_RE.test(unionId)) {
-    rememberUnionId(key, unionId);
+    if (generation === depsGeneration) rememberUnionId(key, unionId);
     return unionId;
   }
   return null;
@@ -158,8 +189,20 @@ async function unionIdFor(larkAppId: string, openId: string): Promise<string | n
  *
  * Note `LARKSUITE_CLI_APP_ID` is the PLATFORM's Feishu app (the issuer of the
  * user token), deliberately not this bot's app id — the two differ by design.
+ *
+ * Regional ByteCloud JWTs come in the same grant as the default one — same
+ * request, same union_id — so they are this turn's sender's as much as it is.
+ * Each must claim the partition it is filed under, as the local mint requires,
+ * and not be expired already: one that fails either would only move the
+ * failure, so it is dropped and that partition's calls are refused like any
+ * other missing region.
  */
-function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>): LarkCliIdentity | BytedCliIdentity | null {
+function toIdentity(
+  tool: TriggerUserAuthTool,
+  grant: Pick<CredentialGrant, 'variables' | 'cloudJwtRegions'>,
+  now: number,
+): LarkCliIdentity | BytedCliIdentity | null {
+  const { variables } = grant;
   const nonEmpty = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
   if (tool === 'lark-cli') {
     const appId = variables.LARKSUITE_CLI_APP_ID;
@@ -170,7 +213,28 @@ function toIdentity(tool: TriggerUserAuthTool, variables: Record<string, string>
   const cloudJwt = variables.BYTEDCLI_USER_CLOUD_JWT;
   if (!nonEmpty(cloudJwt)) return null;
   const codeJwt = variables.BYTEDCLI_USER_CODE_JWT;
-  return { tool, cloudJwt, ...(nonEmpty(codeJwt) ? { codeJwt } : {}) };
+  const regionalCloudJwts: Partial<Record<BytedcliRegion, string>> = {};
+  let regionalIssued = false;
+  for (const [region, key] of Object.entries(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as Array<[BytedcliGrantRegion, string]>) {
+    const jwt = variables[key];
+    if (!nonEmpty(jwt)) continue;
+    regionalIssued = true;
+    const claims = jwtClaims(jwt);
+    if (claims?.region !== region) {
+      logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} does not claim partition ${region}; dropped`);
+    } else if (typeof claims.exp === 'number' && claims.exp * 1_000 <= now) {
+      logger.warn(`[trigger-user-auth] platform bytedcli grant: ${key} has already expired; dropped`);
+    } else {
+      regionalCloudJwts[region] = jwt;
+    }
+  }
+  return {
+    tool,
+    cloudJwt,
+    ...(nonEmpty(codeJwt) ? { codeJwt } : {}),
+    ...(Object.keys(regionalCloudJwts).length ? { regionalCloudJwts } : {}),
+    regionalCloudJwtSource: grant.cloudJwtRegions || regionalIssued ? 'platform' : 'platform-legacy',
+  };
 }
 
 /** The platform page a refused person should open (null when unbound). */
@@ -188,7 +252,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
 
   const unionId = args.unionId !== undefined
     ? (UNION_ID_RE.test(args.unionId) && !args.unionId.startsWith('ou_') ? args.unionId : null)
-    : await unionIdFor(args.botConfig.larkAppId, args.openId);
+    : await platformUnionIdFor(args.botConfig.larkAppId, args.openId);
   if (!unionId) {
     logger.warn(`[trigger-user-auth] platform grant skipped for ${args.tool}: could not resolve union_id for sender`);
     return { state: 'unavailable', detail: 'sender union_id unresolved' };
@@ -203,7 +267,7 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
   }, { binding });
 
   if (result.ok) {
-    const identity = toIdentity(args.tool, result.value.variables);
+    const identity = toIdentity(args.tool, result.value, deps.now());
     if (!identity) {
       logger.warn(`[trigger-user-auth] platform ${args.tool} grant malformed: required variable missing`);
       return { state: 'unavailable', detail: 'malformed grant' };
@@ -229,3 +293,29 @@ export async function resolvePlatformIdentity(args: ResolvePlatformIdentityArgs)
       return { state: 'unavailable', detail };
   }
 }
+
+/**
+ * Machine-readable reason for a refusal, appended to the text the agent and
+ * the person see (`[reason=…]`). Without it every failure read as "no usable
+ * credentials", and nobody could tell an unauthorized person from a platform
+ * that timed out — the two need opposite next steps (authorize vs. wait).
+ */
+export function platformRefusalReason(resolution: Exclude<PlatformIdentityResolution, { state: 'granted' }>): string {
+  switch (resolution.state) {
+    case 'unbound': return 'platform_unbound';
+    case 'not_authorized': return resolution.consent ? 'platform_consent_missing' : 'platform_not_authorized';
+    case 'denied': return resolution.reason === 'not_teammate' ? 'platform_not_teammate' : 'platform_forbidden';
+    case 'unavailable': {
+      const d = String(resolution.detail ?? '').toLowerCase();
+      if (d.includes('union_id unresolved')) return 'union_id_unresolved';
+      if (d.includes('超时') || d.includes('timed out') || d.includes('timeout') || d.includes('etimedout') || /\b504\b/.test(d)) {
+        return 'platform_timeout';
+      }
+      if (d.startsWith('network')) return 'platform_unreachable';
+      if (d.startsWith('rate limited')) return 'platform_rate_limited';
+      return 'platform_unavailable';
+    }
+  }
+}
+
+export { reasonTag } from './refusal-reasons.js';

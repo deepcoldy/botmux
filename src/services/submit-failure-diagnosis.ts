@@ -9,10 +9,12 @@
  * extra silences, never a conclusion about what happened to the message.
  */
 import { stripAnsiScreenText } from '../utils/idle-detector.js';
+import { classifyStuckPage } from '../utils/stuck-detector.js';
 
 export type SubmitFailureDiagnosisReason =
   | 'logged_out'        // 登录/鉴权门
   | 'interactive_menu'  // 菜单/迁移/hooks review/确认框等键盘选择界面
+  | 'session_locked'
   | 'draft_parked'      // 正文停在 composer，尚未提交
   | 'still_active'      // CLI 仍有持续活动证据（弱证据，只用于有限度静默，不用于下结论）
   | 'unknown';
@@ -57,7 +59,9 @@ const LOGGED_OUT_RULES: readonly ScreenRule[] = [
 ];
 
 const INTERACTIVE_MENU_RULES: readonly ScreenRule[] = [
-  { id: 'interactive_menu:hooks_need_review', re: /hooks need review/i },
+  // 启动页 "Hooks need review"、浏览页 "2 hooks need review before they can run."、
+  // 详情页单数 "1 hook needs review before it can run."（Codex 0.162+ / traex）
+  { id: 'interactive_menu:hooks_need_review', re: /\bhooks?\s+needs?\s+review\b/i },
   // 真机迁移菜单 "Legacy TraeCode … migrate"
   { id: 'interactive_menu:legacy_trae_migrate', re: /legacy\s*trae(?:code)?[^\n]{0,40}migrat/i },
   { id: 'interactive_menu:migration_target', re: /\bmigrat(?:e|ion)[^\n]{0,30}(?:data|session|legacy)/i },
@@ -90,23 +94,56 @@ function matchScreenRule(rules: readonly ScreenRule[], screen: string): string |
 // on-screen evidence the payload is stuck unsubmitted.
 const CLAUDE_PASTED_TEXT_CHIP = /\[\s*pasted text\s+#\d+(?:\s*\+\d+\s+lines?)?\s*\]/i;
 
-function claudeComposerDraftMatch(screen: string): string | undefined {
+// A long draft scrolls inside the composer: its border becomes "─── ↑ 18 more ───"
+// and the ❯ row with the head of the draft is no longer visible.
+const CLAUDE_COMPOSER_SCROLL_RULE = /^\s*[─━═╌-]{3,}\s*[↑↓]\s*\d+\s+more\s*[─━═╌-]*\s*$/;
+
+/** Bodies of the ❯ input boxes on screen, bottom-most first. */
+function* claudeComposerBodies(screen: string): Generator<{ body: string; scrolled: boolean }> {
   const rows = screen.split(/\r?\n/);
-  const separator = (line: string) => /^\s*[─━═╌-]{10,}\s*$/.test(line);
-  // Only the last input box, bounded by two full-width rules, is evidence.
-  // Assistant transcript text or an idle suggestion outside it is not a draft.
+  const separator = (line: string) => /^\s*[─━═╌-]{10,}\s*$/.test(line) || CLAUDE_COMPOSER_SCROLL_RULE.test(line);
   for (let bottom = rows.length - 1; bottom >= 0; bottom--) {
     if (!separator(rows[bottom])) continue;
     let top = bottom - 1;
     while (top >= 0 && !separator(rows[top])) top--;
     if (top < 0) continue;
     const body = rows.slice(top + 1, bottom);
-    if (!/^\s*❯/.test(body[0] ?? '')) continue;
-    const bodyText = body.join('\n');
-    if (bodyText.includes('<user_message>')) return 'draft_parked:claude_composer';
-    if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return 'draft_parked:claude_pasted_chip';
+    const scrolled = CLAUDE_COMPOSER_SCROLL_RULE.test(rows[top]);
+    if (!/^\s*❯/.test(body[0] ?? '') && !scrolled) continue;
+    yield { body: body.join('\n'), scrolled };
+  }
+}
+
+function claudeComposerDraftMatch(screen: string): string | undefined {
+  // Only the last input box, bounded by two full-width rules, is evidence.
+  // Assistant transcript text or an idle suggestion outside it is not a draft.
+  for (const { body } of claudeComposerBodies(screen)) {
+    if (/<\/?user_message>/.test(body)) return 'draft_parked:claude_composer';
+    if (CLAUDE_PASTED_TEXT_CHIP.test(body)) return 'draft_parked:claude_pasted_chip';
+    return undefined;
   }
   return undefined;
+}
+
+/** Whether Claude's last input box still holds `input`: the chip of a multi-line
+ *  paste, or the opening or closing text of its `<user_message>` body, else of the whole input (compared without whitespace and the `\` of typed
+ *  soft newlines, so wrapped or multi-line drafts still match). */
+export function claudeComposerHoldsInput(screenText: string, input: string): boolean {
+  const compact = (text: string) => text.replace(/[\s\\]+/g, '');
+  const open = input.indexOf('<user_message>');
+  const close = input.lastIndexOf('</user_message>');
+  const compactInput = compact(open >= 0 && close > open ? input.slice(open + '<user_message>'.length, close) : input);
+  const head = compactInput.slice(0, 40);
+  const tail = compactInput.slice(-40);
+  for (const { body: bodyText, scrolled } of claudeComposerBodies(stripAnsiScreenText(screenText))) {
+    if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return true;
+    const body = compact(bodyText.replace(/^\s*❯/, ''));
+    // Tail evidence is meaningful only when the head has scrolled out. In an
+    // unscrolled composer a different draft can share a fixed suffix; its visible
+    // head must disprove the match instead of being overridden by that suffix.
+    return head.length > 0 && (body.includes(head) || (scrolled && body.includes(tail)));
+  }
+  return false;
 }
 
 export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): SubmitFailureDiagnosis {
@@ -115,6 +152,9 @@ export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): Submi
   const screen = stripAnsiScreenText(input.screenText ?? '');
   const loggedOut = matchScreenRule(LOGGED_OUT_RULES, screen);
   if (loggedOut) return { reason: 'logged_out', evidence: 'screen', matched: loggedOut };
+  if (classifyStuckPage(screen) === 'session lock') {
+    return { reason: 'session_locked', evidence: 'screen', matched: 'session_locked:writer_lock' };
+  }
   const interactiveMenu = matchScreenRule(INTERACTIVE_MENU_RULES, screen);
   if (interactiveMenu) return { reason: 'interactive_menu', evidence: 'screen', matched: interactiveMenu };
   const draftParked = matchScreenRule(DRAFT_PARKED_RULES, screen);
@@ -250,5 +290,6 @@ export function shouldWaitThroughBusyTurn(state: {
   // A gate screen means the CLI is parked on a question; it is not executing.
   if (state.diagnosisReason === 'logged_out') return false;
   if (state.diagnosisReason === 'interactive_menu') return false;
+  if (state.diagnosisReason === 'session_locked') return false;
   return state.waitsSoFar < (state.maxWaits ?? SUBMIT_BUSY_TURN_MAX_WAITS);
 }

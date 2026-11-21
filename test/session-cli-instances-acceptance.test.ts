@@ -10,6 +10,7 @@ import {
   newSessionCodexInstanceState,
   normalizeCodexInstancePool,
   selectWeightedCodexInstance,
+  validateCodexGoalHome,
   validateCodexInstanceHome,
   clearCodexInstanceBots,
   registerCodexInstanceBot,
@@ -153,6 +154,63 @@ describe('A2/A3/A7: explicit home, default and scope', () => {
     const created = newSessionCodexInstanceState(configured, 'http');
     expect(created.agentFrozen).toBe(true);
     expect(created.reasoningEffort).toBe('high');
+  });
+});
+
+describe('goal-scoped Codex home admission', () => {
+  it('accepts a private profile with a symlink to a private shared auth file', () => {
+    const goalHome = join(root, 'goal-home');
+    const sharedAuth = join(root, 'shared-auth.json');
+    mkdirSync(goalHome, { mode: 0o700 });
+    writeFileSync(join(goalHome, 'config.toml'), 'model = "gpt-6.1-sol"\n', { mode: 0o600 });
+    writeFileSync(sharedAuth, JSON.stringify({ tokens: { access_token: 'NOT-A-REAL-TOKEN' } }), { mode: 0o600 });
+    symlinkSync(sharedAuth, join(goalHome, 'auth.json'));
+
+    const canonical = realpathSync(goalHome);
+    expect(validateCodexGoalHome(canonical)).toBe(canonical);
+    const env = codexInstanceEnv(
+      { OPENAI_API_KEY: 'must-be-removed', OPENAI_BASE_URL: 'must-be-removed' },
+      { version: 1, source: 'goal', instanceId: null, cliId: 'codex', codexHome: canonical, authMode: 'shared' },
+    );
+    expect(env).toMatchObject({ CODEX_HOME: canonical });
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.OPENAI_BASE_URL).toBeUndefined();
+  });
+
+  it('rejects an unsafe shared auth target and revalidates a frozen goal home', () => {
+    const goalHome = join(root, 'goal-home-unsafe');
+    const sharedAuth = join(root, 'shared-auth-unsafe.json');
+    mkdirSync(goalHome, { mode: 0o700 });
+    writeFileSync(join(goalHome, 'config.toml'), 'model = "gpt-6.1-sol"\n', { mode: 0o600 });
+    writeFileSync(sharedAuth, JSON.stringify({ OPENAI_API_KEY: 'NOT-A-REAL-TOKEN' }), { mode: 0o600 });
+    symlinkSync(sharedAuth, join(goalHome, 'auth.json'));
+    const canonical = realpathSync(goalHome);
+    const binding = { version: 1 as const, source: 'goal' as const, instanceId: null, cliId: 'codex' as const, codexHome: canonical, authMode: 'shared' as const };
+
+    expect(validateCodexGoalHome(canonical)).toBe(canonical);
+    chmodSync(sharedAuth, 0o644);
+    expect(() => validateCodexGoalHome(canonical)).toThrow(/auth\.json target/);
+    expect(() => codexInstanceEnv(process.env, binding)).toThrow(/auth\.json target/);
+  });
+
+  it('rejects a shared home directory, a shared config, and an auth file without credentials', () => {
+    const goalHome = join(root, 'goal-home-private');
+    mkdirSync(goalHome, { mode: 0o700 });
+    writeFileSync(join(goalHome, 'config.toml'), 'model = "gpt-6.1-sol"\n', { mode: 0o600 });
+    writeFileSync(join(goalHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'NOT-A-REAL-TOKEN' } }), { mode: 0o600 });
+    const canonical = realpathSync(goalHome);
+    expect(validateCodexGoalHome(canonical)).toBe(canonical);
+
+    chmodSync(canonical, 0o755);
+    expect(() => validateCodexGoalHome(canonical)).toThrow(/goal home must be an owned private directory/);
+    chmodSync(canonical, 0o700);
+
+    chmodSync(join(canonical, 'config.toml'), 0o644);
+    expect(() => validateCodexGoalHome(canonical)).toThrow(/goal config\.toml must be an owned private regular file/);
+    chmodSync(join(canonical, 'config.toml'), 0o600);
+
+    writeFileSync(join(canonical, 'auth.json'), JSON.stringify({ tokens: { access_token: '  ' } }), { mode: 0o600 });
+    expect(() => validateCodexGoalHome(canonical)).toThrow(/goal auth\.json has no credential structure/);
   });
 });
 

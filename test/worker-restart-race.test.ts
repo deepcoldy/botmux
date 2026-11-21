@@ -80,6 +80,7 @@ describe('worker fatal error — correlated restart receipts', () => {
       sendAndFlush: vi.fn(async (msg: Record<string, unknown>) => { sent.push(msg); }),
       log: vi.fn(),
       chatSafeFatalErrorMessage,
+      sandboxNamespaceDiagnosis: () => undefined,
       process: { exit: vi.fn() },
     };
     const fatal = loadWorkerFunction<(err: unknown) => Promise<void>>('sendFatalWorkerErrorAndExit', scope);

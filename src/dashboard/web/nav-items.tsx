@@ -79,6 +79,7 @@ export const NAV_ITEMS: NavItem[] = [
     ),
   },
   { id: 'insights', href: '#/insights', labelKey: 'nav.insights', manage: true, icon: <><path d="M2 2v12h12M5 11V7M8.5 11V4.5M12 11V8.5" /></> },
+  { id: 'usage', href: '#/usage', labelKey: 'nav.usage', manage: true, aliases: ['token', '用量', '消耗', 'cost'], icon: <><path d="M2 13h12M4 10V6M8 10V2M12 10V4" /><circle cx="8" cy="13" r="1" /></> },
   { id: 'feedback', href: '#/feedback', labelKey: 'nav.feedback', manage: true, icon: <><path d="M2.2 3.2h11.6v8H8l-3.2 2.6v-2.6H2.2z" /><path d="M5 6.2h6M5 8.3h4" /></> },
   {
     id: 'workflows',
@@ -101,7 +102,6 @@ export const NAV_ITEMS: NavItem[] = [
   { id: 'skills', href: '#/skills', labelKey: 'nav.skills', aliases: ['技能'], manage: true, icon: <><path d="M3 2.5h10v3H3zM3 7h10v6.5H3z" /><path d="M5.4 9.2h5.2M5.4 11.2h3.8" /></> },
   { id: 'customization', href: '#/customization', labelKey: 'nav.customization', manage: true, icon: <><path d="M11.5 2.5l2 2-7 7-2.6.6.6-2.6z" /><path d="M2.5 13.5h5" /></> },
   { id: 'plugins', href: '#/plugins', label: '插件', manage: true, icon: <><path d="M6.4 1.8h3.2v3h2.8v3.2H9.6v2.8H6.4V8H3.6V4.8h2.8z" /><path d="M2.2 11.8h11.6v2.4H2.2z" /></> },
-  { id: 'team', href: '#/team', labelKey: 'nav.team', manage: true, icon: <><circle cx="8" cy="8" r="6.2" /><path d="M1.8 8h12.4M8 1.8c-2 1.8-2 10.6 0 12.4 2-1.8 2-10.6 0-12.4z" /></> },
   { id: 'connectors', href: '#/connectors', labelKey: 'nav.connectors', manage: true, icon: <><path d="M5.5 6.5v-3a2.5 2.5 0 0 1 5 0v3" /><rect x="3.5" y="6.5" width="9" height="7" rx="2" /></> },
   // 宿主网页终端：本机 shell / tmux / herdr。只给本机 owner（ui.hostTerminal），客户端壳里不出现。
   { id: 'terminal', href: '#/terminal', labelKey: 'nav.terminal', manage: true, icon: <><rect x="1.8" y="2.6" width="12.4" height="10.8" rx="1.8" /><path d="M4.4 6.2l2.2 1.8-2.2 1.8M8 10.6h3.4" /></> },
@@ -119,7 +119,7 @@ export const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }
   { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'decision-board', 'agent-workbench', 'groups', 'schedules', 'workflows'] },
   { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'doc-watches', 'bot-defaults', 'agents'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
-  { id: 'manage', labelKey: 'nav.group.manage', items: ['terminal', 'connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
+  { id: 'manage', labelKey: 'nav.group.manage', items: ['terminal', 'connectors', 'plugins', 'whiteboards', 'settings'] },
 ];
 
 /**
@@ -138,7 +138,6 @@ export interface NavSubPage {
 export const NAV_SUBPAGES: readonly NavSubPage[] = [
   { id: 'monitor-room', parentId: 'sessions', href: '#/monitor-room', labelKey: 'monitorRoom.title' },
   { id: 'roles-profile', parentId: 'roles', href: '#/roles/profile', labelKey: 'roles.tabProfiles', aliases: ['角色 Profile', 'role profiles'] },
-  { id: 'team-manage', parentId: 'team', href: '#/team/manage', labelKey: 'team.navManage' },
   { id: 'connectors-logs', parentId: 'connectors', href: '#/connectors/logs', labelKey: 'connectors.tabLogs', aliases: ['Webhook 日志', 'webhook logs'] },
   // 数据洞察的 tab 直接按 INSIGHT_TABS 生成，新加 tab 自动进索引；overview 就是 #/insights 本身。
   ...INSIGHT_TABS.filter(tab => tab.key !== 'overview').map(tab => ({
@@ -157,3 +156,6 @@ export const PALETTE_UNINDEXED_ROUTES: Readonly<Record<string, string>> = {
   'agent-workbench-dock': '桌面壳 / 沉浸式入口嵌入的驾驶舱界面，不是独立页面',
   'webhook-logs': '#/connectors/logs 的旧别名',
 };
+
+// Register Token usage in the analytics navigation group.
+NAV_GROUPS.find(group => group.id === 'analytics')?.items.push('usage');

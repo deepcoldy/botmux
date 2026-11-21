@@ -68,6 +68,9 @@ export function decideSubmitConfirmationAction(input: SubmitConfirmationDecision
 
 export interface StructuredSubmitLifecycleController {
   hasPendingTurn(turnId: string, dispatchAttempt?: number): boolean;
+  /** The exact attempt is still queued but already closed by its native
+   *  terminal (e.g. FIFO-held behind an unfinished predecessor). */
+  hasTerminalTurn(turnId: string, dispatchAttempt?: number): boolean;
   confirmPendingTurn(turnId: string, confirmedAtMs?: number, dispatchAttempt?: number): boolean;
   finishSubmitVerification(turnId: string, finishedAtMs?: number, dispatchAttempt?: number): boolean;
 }
@@ -138,13 +141,21 @@ export async function settleDeferredSubmitConfirmation(
   controller: StructuredSubmitLifecycleController,
   input: DeferredSubmitConfirmationInput,
 ): Promise<DeferredSubmitConfirmationSettlement> {
+  const closedButUndrained = (): boolean => !!input.structuredTarget && !!input.turnId
+    && controller.hasTerminalTurn(input.turnId, input.dispatchAttempt);
   const targetStillCurrent = (): StaleDeferredSubmitConfirmationSettlement | undefined => {
     if (input.isCurrent && !input.isCurrent()) {
       return { stale: true, staleReason: 'generation', lifecycle: 'unchanged' };
     }
+    // Only a missing exact attempt (pruned, or replaced by attempt N+1) is
+    // stale. A closed-but-undrained attempt is the same delivery with a native
+    // terminal: discarding its recheck would drop the input-delivery
+    // quarantine's only release while that terminal waits behind its FIFO
+    // predecessor, holding every later input in BotMux (#2642).
     if (input.structuredTarget
       && input.turnId
-      && !controller.hasPendingTurn(input.turnId, input.dispatchAttempt)) {
+      && !controller.hasPendingTurn(input.turnId, input.dispatchAttempt)
+      && !closedButUndrained()) {
       return { stale: true, staleReason: 'attempt', lifecycle: 'unchanged' };
     }
     return undefined;
@@ -154,6 +165,17 @@ export async function settleDeferredSubmitConfirmation(
   // function is called. Never run its old adapter closure against a new CLI.
   const staleBeforeRecheck = targetStillCurrent();
   if (staleBeforeRecheck) return staleBeforeRecheck;
+  // Its native terminal already proves the submit, and the FIFO drain owns its
+  // final/terminal. Settle as structured success without the adapter recheck:
+  // a missed receipt plus usage-limit/no-activity must not fail or drop a
+  // turn that has already answered.
+  if (closedButUndrained()) {
+    return {
+      stale: false,
+      action: { kind: 'suppress-active', evidence: 'structured-transcript' },
+      lifecycle: 'unchanged',
+    };
+  }
 
   let recheckSubmitted = false;
   let cliSessionId: string | undefined;

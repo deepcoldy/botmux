@@ -36,6 +36,10 @@ import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import { createDispatchReportBinding, dispatchReportBindingSecretPath } from '../src/core/dispatch-report-binding.js';
 import { loadOrCreateDashboardSecret } from '../src/dashboard/auth.js';
+import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { REPORT_SOURCE_REPLY_ROUTE, buildReportReplyContext } from '../src/core/report-source-reply.js';
+import { authorizeReportSessionRelayRequest, deliverReportSessionRelay } from '../src/core/report-session-relay.js';
 import {
   UNDELIVERED_REPORT_RELAY_REASON_TEXT,
   type UndeliveredReportRelayReason,
@@ -97,6 +101,171 @@ function journals() {
   const dir = join(root, 'report-deliveries');
   return existsSync(dir) ? readdirSync(dir).filter(name => name.endsWith('.json')) : [];
 }
+
+describe('source reply IPC', () => {
+  beforeEach(() => {
+    sessionStore.init(APP);
+    ds.session.quoteTargetId = 'om_request';
+    ds.session.reportReplyInputId = 'om_request';
+    sessionStore.updateSession(ds.session);
+  });
+  afterEach(() => { sessionStore.init(APP); });
+  function request() {
+    const secret = loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(root));
+    return { dispatchRoot: 'om_child', sourceLarkAppId: 'cli_project', content: '## Result\n\n原文结果',
+      binding: createDispatchReportBinding(secret, {
+        dispatchRoot: 'om_child', targetLarkAppId: APP, targetSessionId: 'source',
+        targetChatId: CHAT, targetScope: 'thread', sourceName: 'Review', issuedAt: new Date().toISOString(),
+        reply: { rootMessageId: 'om_dispatch', sourceTurnId: 'om_request', reporterLarkAppId: 'cli_project' },
+      }) };
+  }
+  async function reply(body = request(), trusted = true) {
+    const headers = trusted ? daemonIpcAuthHeaders({ secret: 'test-ipc-secret', port: server.port,
+      method: 'POST', path: REPORT_SOURCE_REPLY_ROUTE, headers: { 'content-type': 'application/json' } })
+      : { 'content-type': 'application/json' };
+    const response = await fetch(`http://127.0.0.1:${server.port}${REPORT_SOURCE_REPLY_ROUTE}`, {
+      method: 'POST', headers, body: JSON.stringify(body),
+    });
+    return { status: response.status, body: await response.json() as any };
+  }
+  it('requires host authentication before any source-topic write', async () => {
+    expect((await reply(request(), false)).status).toBe(401);
+    expect(mocks.reply).not.toHaveBeenCalled();
+  });
+  it('returns to the existing relay path when the saved source session has no live executor', async () => {
+    sessions.clear();
+    expect(await reply()).toMatchObject({ status: 409, body: { error: 'report_reply_source_changed' } });
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(journals()).toEqual([]);
+  });
+  it('posts once at the original root, stores context durably, and never triggers a model', async () => {
+    const body = request();
+    expect(await reply(body)).toMatchObject({ status: 200, body: { delivery: 'reply', publishedMessageId: 'om_reply' } });
+    expect((await reply(body)).status).toBe(200);
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(mocks.reply.mock.calls[0].slice(0, 2)).toEqual([APP, 'om_dispatch']);
+    expect(mocks.fetch).not.toHaveBeenCalled();
+    sessionStore.init(APP);
+    const persisted = sessionStore.getSession('source');
+    expect(persisted?.reportReplyReferences).toEqual([{ messageId: 'om_reply', dispatchRoot: 'om_child' }]);
+    expect(buildReportReplyContext(persisted?.reportReplyReferences)).toContain('om_reply');
+  });
+  it('routes an authenticated completed report through the direct sink', async () => {
+    const body = request();
+    const decision = authorizeReportSessionRelayRequest({
+      trustedHost: true, selfLarkAppId: 'cli_project',
+      session: { sessionId: 'project', larkAppId: 'cli_project', chatId: 'oc_project', receiver: false,
+        scope: 'thread', rootMessageId: 'om_child', liveOrigin: { capability: CAP, turnId: 'om_work' } },
+      raw: { sessionId: 'project', dispatchRoot: 'om_child', content: body.content,
+        originCapability: CAP, status: 'completed' },
+      registry: { om_child: { reportBinding: body.binding } },
+      bindingSecret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(root)),
+    });
+    expect(decision.ok).toBe(true);
+    if (!decision.ok) throw new Error(decision.error);
+    const paths: string[] = [];
+    const postProjectUpdate = vi.fn(async () => ({ projectSynced: true }));
+    const result = await deliverReportSessionRelay({ decision,
+      triggerMeta: { requestId: 'r1', receivedAt: new Date().toISOString() },
+      fetchTarget: async (path, init) => {
+        paths.push(path);
+        return fetch(`http://127.0.0.1:${server.port}${path}`, { ...init,
+          headers: daemonIpcAuthHeaders({ secret: 'test-ipc-secret', port: server.port,
+            method: 'POST', path, headers: init.headers }) });
+      }, postProjectUpdate,
+    });
+    expect(result).toMatchObject({ status: 200, body: { delivery: 'reply', projectSynced: true } });
+    expect(postProjectUpdate).toHaveBeenCalledWith(decision.target);
+    expect(paths).toEqual([REPORT_SOURCE_REPLY_ROUTE]);
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+  });
+  it('keeps an unknown publication outcome at the direct sink and never falls through to a model trigger', async () => {
+    // 结果未知（pending 账本、响应丢失）时禁止切换出口：既不能重发，也不能改走 /api/trigger
+    // 再启动一个来源模型回合（那会造成同一结果既直投又回注）。
+    const body = request();
+    const decide = () => authorizeReportSessionRelayRequest({
+      trustedHost: true, selfLarkAppId: 'cli_project',
+      session: { sessionId: 'project', larkAppId: 'cli_project', chatId: 'oc_project', receiver: false,
+        scope: 'thread', rootMessageId: 'om_child', liveOrigin: { capability: CAP, turnId: 'om_work' } },
+      raw: { sessionId: 'project', dispatchRoot: 'om_child', content: body.content,
+        originCapability: CAP, status: 'completed' },
+      registry: { om_child: { reportBinding: body.binding } },
+      bindingSecret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(root)),
+    });
+    const authorized = decide();
+    expect(authorized.ok).toBe(true);
+    if (!authorized.ok) throw new Error(authorized.error);
+    const paths: string[] = [];
+    const unknown = await deliverReportSessionRelay({ decision: authorized,
+      triggerMeta: { requestId: 'r2', receivedAt: new Date().toISOString() },
+      fetchTarget: vi.fn(async (path: string) => {
+        paths.push(path);
+        return { ok: false, status: 409,
+          json: async () => ({ ok: false, error: 'report_publication_unknown', deliveryKey: 'k' }) } as any;
+      }),
+      postProjectUpdate: vi.fn(async () => ({ projectSynced: false })),
+    });
+    expect(unknown).toMatchObject({ status: 409, body: { error: 'report_publication_unknown' } });
+    expect(paths).toEqual([REPORT_SOURCE_REPLY_ROUTE]);
+
+    // 只有「确定未发送」的 source_changed 409 才回退到原 relay，触发来源模型回合。
+    const changedPaths: string[] = [];
+    const changed = await deliverReportSessionRelay({ decision: decide() as any,
+      triggerMeta: { requestId: 'r3', receivedAt: new Date().toISOString() },
+      fetchTarget: vi.fn(async (path: string) => {
+        changedPaths.push(path);
+        return path === REPORT_SOURCE_REPLY_ROUTE
+          ? { ok: false, status: 409, json: async () => ({ ok: false, error: 'report_reply_source_changed' }) } as any
+          : { ok: true, status: 200, json: async () => ({ ok: true, triggerId: 't1' }) } as any;
+      }),
+      postProjectUpdate: vi.fn(async () => ({ projectSynced: false })),
+    });
+    expect(changed.status).toBe(200);
+    expect(changedPaths).toEqual([REPORT_SOURCE_REPLY_ROUTE, '/api/trigger']);
+  });
+  it('replays a settled direct reply after the source session drifts, never via /api/trigger', async () => {
+    // 首投成功且回执已落盘；此后来源会话行消失/漂移（话题关闭、重启恢复期）。
+    // 重试必须只凭持久账本重放 200：不重发卡片，也不得回退 /api/trigger 再启
+    // 一个来源模型回合（否则同一已投递结果被二次处理）。
+    const body = request();
+    expect(await reply(body)).toMatchObject({ status: 200, body: { delivery: 'reply' } });
+    sessions.clear();
+    sessionStore.init(APP);
+    const drifted = sessionStore.getSession('source');
+    expect(drifted).toBeDefined();
+    drifted!.rootMessageId = 'om_other';
+    drifted!.quoteTargetId = 'om_followup';
+    drifted!.reportReplyInputId = 'om_followup';
+    sessionStore.updateSession(drifted!);
+
+    const decision = authorizeReportSessionRelayRequest({
+      trustedHost: true, selfLarkAppId: 'cli_project',
+      session: { sessionId: 'project', larkAppId: 'cli_project', chatId: 'oc_project', receiver: false,
+        scope: 'thread', rootMessageId: 'om_child', liveOrigin: { capability: CAP, turnId: 'om_work' } },
+      raw: { sessionId: 'project', dispatchRoot: 'om_child', content: body.content,
+        originCapability: CAP, status: 'completed' },
+      registry: { om_child: { reportBinding: body.binding } },
+      bindingSecret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(root)),
+    });
+    expect(decision.ok).toBe(true);
+    if (!decision.ok) throw new Error(decision.error);
+    const paths: string[] = [];
+    const result = await deliverReportSessionRelay({ decision,
+      triggerMeta: { requestId: 'r4', receivedAt: new Date().toISOString() },
+      fetchTarget: async (path, init) => {
+        paths.push(path);
+        return fetch(`http://127.0.0.1:${server.port}${path}`, { ...init,
+          headers: daemonIpcAuthHeaders({ secret: 'test-ipc-secret', port: server.port,
+            method: 'POST', path, headers: init.headers }) });
+      },
+      postProjectUpdate: vi.fn(async () => ({ projectSynced: true })),
+    });
+    expect(result).toMatchObject({ status: 200, body: { delivery: 'reply', publishedMessageId: 'om_reply' } });
+    expect(paths).toEqual([REPORT_SOURCE_REPLY_ROUTE]);
+    expect(mocks.reply).toHaveBeenCalledTimes(1);
+    expect(mocks.fetch).not.toHaveBeenCalled();
+  });
+});
 
 describe('report publication IPC', () => {
   it.each(['thread', 'chat'] as const)('publishes to the dispatch thread from %s scope', async scope => {

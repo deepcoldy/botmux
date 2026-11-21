@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { __testOnly_resetTriggerTurns, rememberTriggerTurn } from '../src/core/turn-origin.js';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import * as workerPool from '../src/core/worker-pool.js';
@@ -9,10 +10,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { publishActiveTurn, writeSessionIdentity, recallProvenIdentityContent } from '../src/core/cli-identity.js';
 import { config } from '../src/config.js';
+import { trackTurnIdentityPublication } from '../src/core/turn-cli-identity.js';
 
 let ipc: IpcServerHandle | null = null;
 let previousDataDir = '';
 afterEach(async () => {
+  __testOnly_resetTriggerTurns();
   if (ipc) await ipc.close(); ipc = null; setIpcAuthSecret(null); vi.restoreAllMocks();
   if (previousDataDir) { config.session.dataDir = previousDataDir; previousDataDir = ''; }
 });
@@ -106,6 +109,8 @@ const mockDocument = {
   turnId: 'trigger-current',
   workerGeneration: 7,
   dispatchAttempt: 3,
+  // The real CLI asks for the origin; the mock turn has no daemon record.
+  origin: 'unknown',
 };
 
 describe('POST /api/current-execution', () => {
@@ -165,6 +170,211 @@ describe('POST /api/current-execution', () => {
     expect(await response.json()).toMatchObject({ error: 'identity_material_unavailable' });
   });
 
+  it('waits for a publication still in flight instead of refusing the first call', async () => {
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'identity-in-flight-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      // The opening turn's replay is still resolving (e.g. a slow platform grant).
+      void trackTurnIdentityPublication(dataDir, 's-execution', new Promise<void>(resolve => setTimeout(() => {
+        writeSessionIdentity(dataDir, 's-execution', {
+          tool: 'bytedcli', cloudJwt: 'jwt-late', turnId: 'trigger-current', openId: 'ou-late',
+        }, 'proven');
+        resolve();
+      }, 300)));
+      const response = await fetch(`http://127.0.0.1:${ipc.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+      });
+      expect(response.status).toBe(200);
+      expect(JSON.stringify(await response.json())).toContain('jwt-late');
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
+  });
+
+  it.each([
+    ['recovers when the bot still takes credentials from the platform', 'platform', true],
+    ['does not re-ask once the bot was switched to local credentials mid-turn', 'local', false],
+  ] as const)('re-asks the platform on the wrapper\'s next fetch after a transient grant failure: %s', async (_label, liveSource, recovers) => {
+    const { publishTurnCliIdentity, __resetTransientRefusalsForTest } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    const atTurnStart = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
+    // What the bot registry holds when the wrapper fetches (Dashboard edits apply in place).
+    const live = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: liveSource });
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty', triggerUserAuth: live,
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-transient-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    const grants: Array<'down' | 'up'> = ['down', 'up'];
+    let calls = 0;
+    __resetTransientRefusalsForTest();
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice',
+      requestGrant: async () => {
+        calls++;
+        return grants.shift() === 'up'
+          ? { ok: true, value: { tool: 'bytedcli', unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+            variables: { BYTEDCLI_USER_CLOUD_JWT: 'jwt-recovered' } } }
+          : { ok: false, reason: 'network', error: '连接超时（5000ms）' };
+      },
+    });
+    const fetchIdentity = async () => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+      });
+      expect(response.status).toBe(200);
+      return ((await response.json()) as { env: string }).env;
+    };
+    try {
+      await publishTurnCliIdentity({
+        botConfig: { larkAppId: 'cli_execution', larkAppSecret: 's', brand: 'feishu', triggerUserAuth: atTurnStart } as any,
+        sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId: 'ou_alice',
+        turnId: 'trigger-current', storageModel: 'proven',
+      });
+      expect(calls).toBe(1);
+      const env = await fetchIdentity();
+      if (recovers) {
+        expect(calls).toBe(2);
+        expect(env).toContain("BYTEDCLI_USER_CLOUD_JWT='jwt-recovered'");
+      } else {
+        expect(calls).toBe(1);
+        expect(env).toContain("BOTMUX_IDENTITY_MODE='denied'");
+      }
+    } finally {
+      __setPlatformCredentialDepsForTest(null);
+      __resetTransientRefusalsForTest();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('a requester who authorizes mid-turn gets the grant on a later fetch of the same turn (#3312)', async () => {
+    const { publishTurnCliIdentity, __resetTransientRefusalsForTest, NOT_AUTHORIZED_RETRY_INTERVAL_MS } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    const policy = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty', triggerUserAuth: policy,
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-not-authorized-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    let authorized = false;
+    let calls = 0;
+    __resetTransientRefusalsForTest();
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice',
+      requestGrant: async () => {
+        calls++;
+        return authorized
+          ? { ok: true, value: { tool: 'bytedcli', unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+            variables: { BYTEDCLI_USER_CLOUD_JWT: 'jwt-after-authorizing' } } }
+          : { ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' };
+      },
+    });
+    const fetchIdentity = async () => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+      });
+      expect(response.status).toBe(200);
+      return ((await response.json()) as { env: string }).env;
+    };
+    try {
+      await publishTurnCliIdentity({
+        botConfig: { larkAppId: 'cli_execution', larkAppSecret: 's', brand: 'feishu', triggerUserAuth: policy } as any,
+        sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId: 'ou_alice',
+        turnId: 'trigger-current', storageModel: 'proven',
+      });
+      // The turn starts refused, and its next call right away is not a new platform request.
+      expect(await fetchIdentity()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+      expect(calls).toBe(1);
+      // They authorize on the platform; once the spacing has passed, the same turn picks the grant up.
+      authorized = true;
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + NOT_AUTHORIZED_RETRY_INTERVAL_MS + 1_000);
+      expect(await fetchIdentity()).toContain("BYTEDCLI_USER_CLOUD_JWT='jwt-after-authorizing'");
+      expect(calls).toBe(2);
+    } finally {
+      __setPlatformCredentialDepsForTest(null);
+      __resetTransientRefusalsForTest();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('re-reads the live bot policy after the platform answers: a mid-flight switch to local is not written', async () => {
+    const { publishTurnCliIdentity, __resetTransientRefusalsForTest } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    const platformPolicy = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
+    const localPolicy = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'local' });
+    // The registry returns a NEW config object per call, exactly like
+    // bot-registry.ts's `bots.set(appId, { config: cfg, … })` on a Dashboard edit.
+    let live: any = platformPolicy;
+    const getBot = vi.spyOn(await import('../src/bot-registry.js'), 'getBot');
+    getBot.mockImplementation(() => ({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty', triggerUserAuth: live,
+    } }) as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-transient-inflight-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    let release!: (v: unknown) => void;
+    let calls = 0;
+    __resetTransientRefusalsForTest();
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice',
+      requestGrant: () => {
+        calls++;
+        if (calls === 1) return Promise.resolve({ ok: false, reason: 'network', error: '连接超时（5000ms）' } as any);
+        return new Promise(r => { release = r; }) as any;   // the re-ask, held open
+      },
+    });
+    try {
+      await publishTurnCliIdentity({
+        botConfig: { larkAppId: 'cli_execution', larkAppSecret: 's', brand: 'feishu', triggerUserAuth: platformPolicy } as any,
+        sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId: 'ou_alice',
+        turnId: 'trigger-current', storageModel: 'proven',
+      });
+      expect(calls).toBe(1);
+      const pending = fetch(`http://127.0.0.1:${ipc.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+      });
+      await vi.waitFor(() => expect(calls).toBe(2));
+      live = localPolicy;              // operator switches the bot while the re-ask is in flight
+      release({ ok: true, value: { tool: 'bytedcli', unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+        variables: { BYTEDCLI_USER_CLOUD_JWT: 'jwt-should-not-land' } } });
+      const response = await pending;
+      expect(response.status).toBe(200);
+      const env = ((await response.json()) as { env: string }).env;
+      expect(env).toContain("BOTMUX_IDENTITY_MODE='denied'");
+      expect(env).not.toContain('jwt-should-not-land');
+    } finally {
+      __setPlatformCredentialDepsForTest(null);
+      __resetTransientRefusalsForTest();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('refuses identity content for a session on the single model', async () => {
     const ds = session();
     vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
@@ -179,7 +389,103 @@ describe('POST /api/current-execution', () => {
       body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
     });
     expect(response.status).toBe(403);
-    expect(await response.json()).toMatchObject({ error: 'current_execution_unverified' });
+    expect(await response.json()).toMatchObject({ error: 'current_execution_unverified', reason: 'identity_decision_conflict' });
+  });
+
+  it.each([
+    ['no identity decision ever reached the daemon', (ds: any) => { delete ds.reportedIdentityModel; }, 'identity_decision_missing'],
+    ['the worker reported the single model', (ds: any) => { ds.reportedIdentityModel.model = 'single'; }, 'identity_model_single'],
+    ['the caller is not in the live turn', (ds: any) => { ds.localProcessAttestation.cliProcStart = 'stale'; }, 'lineage_unproven'],
+    // An unproven caller learns only that it is not proven, never the model.
+    ['an unproven caller asks about a session that has no decision', (ds: any) => {
+      ds.localProcessAttestation.cliProcStart = 'stale'; delete ds.reportedIdentityModel; }, 'lineage_unproven'],
+    ['an unproven caller asks about a single-model session', (ds: any) => {
+      ds.localProcessAttestation.cliProcStart = 'stale'; ds.reportedIdentityModel.model = 'single'; }, 'lineage_unproven'],
+  ])('names the refused step when %s', async (_label, mutate, reason) => {
+    const ds = session(); mutate(ds);
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const response = await fetch(`http://127.0.0.1:${ipc.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ schema: 'botmux.current-execution-identity.v1', status: 'blocked',
+      error: 'current_execution_unverified', reason });
+  });
+
+  it('logs each kind of refusal once a minute per live session, and nothing a caller chose', async () => {
+    const { logger } = await import('../src/utils/logger.js');
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    const ds = session(); delete ds.reportedIdentityModel;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const refuse = async (sessionId: string) => (await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId, tool: 'bytedcli' }),
+    })).status;
+    const refusals = () => warn.mock.calls.map(([line]) => String(line)).filter(line => line.includes('refused bytedcli identity'));
+    // Clear of any refusal another case in this file logged (the limiter is daemon-wide state).
+    const start = Date.now() + 3_600_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    for (let i = 0; i < 3; i++) expect(await refuse('s-execution')).toBe(403);
+    expect(refusals()).toEqual([expect.stringMatching(/for s-execut: identity_decision_missing$/)]);
+    // Sessions the daemon does not know share one key, and their ids never reach the log.
+    for (let i = 0; i < 5; i++) expect(await refuse(`forged-${i}\nFORGED LOG LINE`)).toBe(403);
+    expect(refusals()).toHaveLength(2);
+    expect(refusals()[1]).toMatch(/for an unknown session: lineage_unproven/);
+    expect(refusals().join('\n')).not.toContain('FORGED');
+    // The live session's own limit was not reset by them; it reopens after a minute.
+    expect(await refuse('s-execution')).toBe(403);
+    expect(refusals()).toHaveLength(2);
+    clock.mockReturnValue(start + 61_000);
+    expect(await refuse('s-execution')).toBe(403);
+    expect(refusals()).toHaveLength(3);
+  });
+
+  it.skipIf(process.platform !== 'linux')('the wrapper runner tells a proven caller which step refused, and prints no identity', async () => {
+    const ds = session(); delete ds.reportedIdentityModel;
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty',
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-refusal-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    writeSessionIdentity(dataDir, 's-execution', {
+      tool: 'bytedcli', cloudJwt: 'jwt-must-not-leak', turnId: 'trigger-current', openId: 'ou-original',
+    }, 'proven');
+    const run = () => new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+      const child = spawnTsScript('src/cli-identity-runner.ts', [
+        '--data-dir', dataDir, '--session-id', 's-execution', '--app-id', 'cli_execution',
+        '--ipc-port', String(ipc!.port), '--tool', 'bytedcli',
+      ], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '', stderr = '';
+      child.stdout!.on('data', data => { stdout += data; }); child.stderr!.on('data', data => { stderr += data; });
+      child.once('error', reject); child.once('close', code => resolve({ code, stdout, stderr }));
+    });
+    try {
+      const result = await run();
+      expect(result.code).toBe(77);
+      expect(result.stdout).toBe('');
+      const lines = result.stderr.trim().split('\n');
+      expect(lines[0]).toBe('botmux: current_execution_unverified [reason=identity_decision_missing]');
+      // A cause and a next step follow, naming the tool; never the identity.
+      expect(lines).toHaveLength(3);
+      expect(lines[1]).toContain('bytedcli');
+      expect(result.stderr).not.toContain('jwt-must-not-leak');
+      // Once the decision is known, the same caller is served its identity.
+      ds.reportedIdentityModel = session().reportedIdentityModel;
+      const served = await run();
+      expect(served.code, served.stderr).toBe(0);
+      expect(served.stdout).toBe(recallProvenIdentityContent(dataDir, 's-execution', 'trigger-current', 'bytedcli'));
+    } finally { rmSync(dataDir, { recursive: true, force: true }); }
   });
 
   it('does not let a valid host HMAC bypass current process attestation', async () => {
@@ -248,6 +554,22 @@ describe('POST /api/current-execution', () => {
     expect((await request({ sessionId: 'another-session' })).status).toBe(403);
     ds.workerGeneration++;
     expect((await request({ sessionId: 's-execution' })).status).toBe(403);
+  });
+
+  it.skipIf(process.platform !== 'linux')('returns origin only to a caller that asks for it', async () => {
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const plain = await (await request({ sessionId: 's-execution' })).json();
+    expect(plain).not.toHaveProperty('origin');
+    rememberTriggerTurn('trigger-current', 'webhook');
+    const asked = await (await request({ sessionId: 's-execution', fields: ['origin'] })).json();
+    expect(asked).toMatchObject({ turnId: 'trigger-current', origin: 'trigger', triggerSource: 'webhook' });
+    // A caller cannot pick the answer: forged origin fields in the request are ignored.
+    const forged = await (await request({
+      sessionId: 's-execution', fields: ['origin'], origin: 'im', scheduleTaskId: 'abcdef12',
+    })).json();
+    expect(forged).toEqual(asked);
   });
 
   it('rejects invalid and oversized bodies before using session state', async () => {

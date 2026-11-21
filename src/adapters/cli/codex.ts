@@ -18,11 +18,15 @@ import {
   findCodexSessionIdByBotmuxSessionId,
   type CodexDrainState,
 } from '../../services/codex-transcript.js';
-import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeFooterRows, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
+import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeComposerState, codexNativeFooterRows, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
+import { codexTranscriptCloseable, prepareCodexTranscriptInput, settleCodexInputBox } from '../../services/codex-transcript-input.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
+/** First codex-cli release that emits OSC 7501 program status (see the
+ *  adapter's supportsProgramStatus note). */
+export const CODEX_PROGRAM_STATUS_MIN_VERSION = '0.163.0';
 const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
 
 /**
@@ -157,8 +161,15 @@ function normaliseHistoryText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+// Codex stores the submitted composer text trimmed (0.150 through 0.167), so a
+// message with leading/trailing whitespace never appears byte-for-byte.
 function historyTextMatches(actual: string, expected: string): boolean {
-  return actual === expected || normaliseHistoryText(actual) === normaliseHistoryText(expected);
+  if (actual === expected) return true;
+  const a = normaliseHistoryText(actual);
+  const e = normaliseHistoryText(expected);
+  if (a === e) return true;
+  const trimmed = e.trim();
+  return trimmed !== '' && a.trim() === trimmed;
 }
 
 /** Optional ownership filter for a history match. `history.jsonl` is a single
@@ -265,6 +276,8 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
   return {
     id: 'codex',
     bridgeSpec: codexBridgeSpec,
+    // codex_core renders the hook-review flow classifyStuckPage recognises.
+    stuckPageFamily: 'codex-family',
     mcpGateway: {
       get configPath(): string { return join(codexHome(), 'config.toml'); },
       format: 'codex-toml',
@@ -294,7 +307,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, serviceTier, codexProfile, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, modelProviderBaseUrlOverride, reasoningEffort, serviceTier, codexProfile, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
       if (promptInjection === 'none') {
         assertNoGlobalBotmuxSkills(join(codexHome(), 'skills'));
       }
@@ -307,6 +320,14 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // independent of approval/sandbox bypass and leave user config untouched.
       const modelNudgeArgs = hideRateLimitModelNudge
         ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
+      const providerBaseUrlArgs = modelProviderBaseUrlOverride
+        ? (() => {
+            if (!/^[A-Za-z0-9_-]{1,128}$/.test(modelProviderBaseUrlOverride.providerId)) {
+              throw new Error('invalid Codex model provider id for process override');
+            }
+            return ['-c', `model_providers.${modelProviderBaseUrlOverride.providerId}.base_url=${JSON.stringify(modelProviderBaseUrlOverride.baseUrl)}`];
+          })()
         : [];
       if (remoteWsUrl && remoteThreadId) {
         if (codexProfile) throw new Error('Codex profile is not supported by the RPC app-server/viewer');
@@ -326,6 +347,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // `resume`; --no-alt-screen retains its original subcommand scope.
         return ['--remote', remoteWsUrl,
           '-c', 'check_for_update_on_startup=false',
+          ...providerBaseUrlArgs,
           ...modelNudgeArgs,
           ...(quietResume ? ['-c', 'tui.auto_recap=false'] : []),
           'resume', '--no-alt-screen', remoteThreadId];
@@ -361,6 +383,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // not); the host-side daily monitor reports newer versions to the owner.
         '-c',
         'check_for_update_on_startup=false',
+        ...providerBaseUrlArgs,
         // Codex 0.151+ opens a "Switch to <luna-tier model> for lower credit
         // usage?" selection view once the primary usage limit is >=90% used
         // (upstream RATE_LIMIT_SWITCH_PROMPT_THRESHOLD). Its first item is the
@@ -475,38 +498,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string, context?: WriteInputContext) {
+      const blocked = await prepareCodexTranscriptInput(pty);
+      if (blocked) return { submitted: false, failureReason: blocked };
       const terminalSession = await refreshCodexTerminalSession(pty);
-      // Codex's input mode treats every literal \n as Enter. The old path
-      // (`send-keys -l` with the whole multi-line blob) therefore submitted
-      // each line as its own turn — a single Lark message fragmented into
-      // several user messages / "Queued follow-up inputs" in the TUI, and a
-      // literal \t in the content also leaked through as a Tab keystroke.
-      //
-      // Fix: bracketed paste, same as coco.ts. tmux `load-buffer` +
-      // `paste-buffer -d -p` wraps the content in \x1b[200~...\x1b[201~ when
-      // the pane has bracketed paste on (Codex enables it), so embedded \n
-      // stay content and only the trailing Enter after the delay submits.
-      // The old "Codex exits on bracketed paste (parses ESC as abort)" note
-      // was true for a much earlier build; verified on codex 0.134.0 that a
-      // bracketed paste lands the whole multi-line message in the composer
-      // un-submitted, with the process staying alive and \t absorbed cleanly.
-      //
-      // The history.jsonl verification loop below is unchanged: it polls for
-      // the submitted prefix and, if it never appears, surfaces the failure
-      // via the worker's deferred recheck + Lark warning rather than silently
-      // dropping the message.
-      const trySendEnter = (): boolean => {
-        try {
-          if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
-          else pty.write('\r');
-          return true;
-        } catch {
-          // tmux session is gone (CLI exited mid-write) — bail out cleanly
-          // rather than crashing the worker on an unhandled execFileSync error.
-          return false;
-        }
-      };
-
+      // Paste frame and Enter go out back to back: no timer window in which a
+      // human can submit/replace the draft or open backtrack before a delayed
+      // Enter. Receipt checks below are read-only, including after an
+      // ambiguous transport result.
       const historyPath = codexHistoryPath();
       const baseByte = currentFileSize(historyPath);
 
@@ -534,6 +532,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const correlated = context?.correlateTranscript === true && !!cliPid
         && !expectedRemoteSid && (!initialOwned || initialOwned.size === 0);
       if (correlated) content += `\n\n<botmux_routing>\nbotmux_input_id: ${randomBytes(16).toString('hex')}\n</botmux_routing>`;
+      context?.onInputPrepared?.(content);
       const acceptSid: HistorySidFilter | undefined = expectedRemoteSid
         ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
         : cliPid
@@ -560,32 +559,18 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           : undefined;
 
       try {
-        if (pty.pasteText) {
-          // tmux mode: load-buffer + paste-buffer -d -p. The `-p` flag emits
-          // bracketed-paste markers when the pane has them on (Codex default);
-          // `-d` deletes the buffer after so it doesn't accumulate.
-          pty.pasteText(content);
-        } else {
-          // Non-tmux fallback (raw PTY): wrap the markers ourselves.
-          pty.write(wrapBracketedPaste(content));
-        }
-      } catch {
-        return { submitted: false };
-      }
-      await delay(200);
-      if (!trySendEnter()) return { submitted: false };
-
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
-        if (match.found) return historyMatchResult(match, cliPid !== undefined);
-        if (!trySendEnter()) return { submitted: false };
-      }
-      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
+        // Enter is a separate write right after the frame (see the tmux
+        // backend's submitBracketedPaste): in one write it can be stranded in
+        // the tty when the frame fills Codex's 1024-byte read exactly.
+        if (pty.submitBracketedPaste) pty.submitBracketedPaste(content);
+        else if (pty.write(wrapBracketedPaste(content)) !== false) pty.write('\r');
+      } catch { /* The frame may have landed before acknowledgement failed. */ }
+      const match = await waitForHistoryAppend(historyPath, baseByte, content, 3200, acceptSid, proveSid);
       if (match.found) return historyMatchResult(match, cliPid !== undefined);
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy
-      // initial prompt) may still append our marker after the retries gave
-      // up, and the worker re-scans on a delay before warning the user.
+      // initial prompt) may still append our marker after the wait expires,
+      // and the worker re-scans on a delay before warning the user.
       const recheck = () => {
         const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid, proveSid);
         return late.found ? historyMatchResult(late, cliPid !== undefined) : false;
@@ -614,6 +599,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
     startupReadyPattern: CODEX_STARTUP_READY_PATTERN,
     startupReadyFromHistory: restoredCodexHistoryReady,
+    // 0.166+ first paints a provisional `›` with no footer and only later the
+    // initialized composer; writeInput refuses anything but the latter, or a
+    // transcript pager it closes first.
+    inputBoxReady: state => codexNativeComposerState(state) === 'empty'
+      || codexTranscriptCloseable(state.viewport),
+    settleInputBox: settleCodexInputBox,
     startupResume: {
       historyPattern: /Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript/,
       isReady: resumedCodexPromptReady,
@@ -648,6 +639,30 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // submit immediately and never spuriously reports a mid-turn send failure.
     supportsTypeAhead: true,
     reliableTurnTerminal: true,
+    // OSC 7501 (`ESC]7501;state=…:app=codex ESC\`), sent unprompted on any
+    // TTY incl. tmux (no `7501;?` probe, so no relay). First in 0.163.0
+    // (openai/codex#52725: idle/working/blocked; 0.162.0 sends none); 0.164.0
+    // adds done/error and kind=permission|question|auth (#54114). Recorded on
+    // 0.163.0 / 0.164.0 / 0.167.0, tmux and PTY:
+    //   startup  idle on the provisional composer → working → idle; with a
+    //            slow MCP server `working` lasts until it is up, although
+    //            the composer already accepts and runs input (that first
+    //            turn then reports only its done).
+    //   turn     [idle on the first keystroke, acknowledging the last done]
+    //            → working → done (0.163: idle); an approval reports
+    //            blocked kind=permission, then working once answered.
+    //   /status, /clear, /rename: no report at all.
+    // So startup stays on the composer gates (#3289), a write hands idle to
+    // the screen until codex reports busy, and from there working → blocked →
+    // done is authoritative (an approval no longer reads as a finished turn,
+    // and nothing is typed ahead into it while it is blocked).
+    // The rollout's assistant_final still ends a turn whose `working` lingers
+    // (active goal, lost report). Older/unknown versions keep the screen path.
+    supportsProgramStatus: true,
+    programStatusMinVersion: CODEX_PROGRAM_STATUS_MIN_VERSION,
+    programStatusFollowsInputCycle: true,
+    programStatusYieldsToTranscriptTerminal: true,
+    programStatusBlockedHoldsInput: true,
     // Worker's maybeEmitCodexStructuredRateLimit reads the rollout's
     // `codex_rate_limited` terminal (isCodexRateLimitEvent) and emits a
     // structured `limited` state — so codex is the rate-limit authority and the
@@ -662,7 +677,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // (skills.directories/paths/dirs/extra_dirs/...), env vars
     // (CODEX_SKILLS_DIR/...), and `[[skills.config]]`'s `path` (enable/disable
     // only — can't register an arbitrary path) all fail to add a scan root.
-    // Codex only reads hard-coded roots, so — like gemini/opencode/cursor — we
+    // Codex only reads hard-coded roots, so — like opencode/cursor — we
     // install into Codex's global skills dir under CODEX_HOME (default ~/.codex;
     // a getter so a custom CODEX_HOME is honored, matching where Codex actually
     // scans). This is visible to a standalone `codex` too, but every botmux-*

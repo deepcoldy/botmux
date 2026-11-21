@@ -220,10 +220,16 @@ export interface BotSnapshot {
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /** Frozen per-bot Claude credential source. This is a directory path, not a
+   *  secret, so replay can preserve account selection without persisting tokens. */
+  credentialsSourceDir?: string;
   /** Frozen configured launch prefix.  Workflow workers must use
    *  the same gateway/runtime selection as ordinary bot sessions. */
   wrapperCli?: string;
   model?: string;
+  /** Frozen explicit reasoning override. Goal CLI uses this with model and
+   *  the goal-scoped Codex home so the worker cannot fall back to Bot defaults. */
+  reasoningEffort?: import('../../services/codex-reasoning-effort.js').CodexReasoningEffort;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. Tri-state:
    *  'oncall' (fs-policy whitelist) or 'scratch' (full-root COW). */
@@ -239,6 +245,7 @@ export interface BotSnapshot {
   sandboxReadonlyPaths?: string[];
   sandboxNetwork?: boolean;
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy;
+  sandboxWithholdBotSecret?: boolean;
   /** The resolved working directory for this run. */
   workingDir: string;
 }
@@ -309,6 +316,22 @@ export interface RunNodeResult {
    *  attemptDir). */
   manifestPath: string;
   sessionInfo?: WorkerSessionInfo;
+  /** Executor attestation captured from the worker's active-runtime event.
+   * Goal-scoped Codex runs fail closed when it does not match the frozen
+   * model/effort selected by the caller. */
+  runtime?: RuntimeAttestation;
+  /** Precise infrastructure failure. A worker may still leave a valid
+   * manifest behind, so this channel takes precedence when status=fail. */
+  error?: { code: string; message: string };
+}
+
+export interface RuntimeAttestation {
+  cliId: CliId;
+  source: 'worker-active-runtime';
+  model: string | null;
+  reasoningEffort: string | null;
+  /** Present only for an explicitly bound Codex goal home. */
+  codexHome?: string;
 }
 
 /**
@@ -341,6 +364,11 @@ export interface SpecNodeSketch {
   acceptance: string;
   risk_gate: boolean;
   unknowns: string[];
+  /** The bot the user explicitly named for this step (a larkAppId or a bot
+   *  display name), verbatim. Only consulted when the run's goal nodes are
+   *  handed to bots in the group chat (design 2026-11-03 §6.2). Omitted =
+   *  the user named nobody. */
+  assignee?: string;
 }
 
 /**

@@ -34,3 +34,26 @@ export function isSharedAdoptSession(
     || ds.initConfig?.adoptMode === true
     || isSharedAdoptPersistedSession(ds.session);
 }
+
+/**
+ * Whether a pin must be suspended for a launch-resolution subject.
+ *
+ * Mirrors {@link isSharedAdoptSession} but accepts the slimmer session-shaped
+ * object the launch resolvers receive: its model may be either a live
+ * DaemonSession (carrying the in-memory `adoptedFrom` / `initConfig.adoptMode`
+ * flags) or a detached/persisted Session row (which only has the durable
+ * fields). Read and write paths must agree on all four shapes, otherwise a pin
+ * could be rejected on write yet displayed as active (or vice versa).
+ */
+export function isPinSuspendedForAdopt(subject: {
+  session: { adoptedFrom?: unknown; existingAppServerEndpoint?: unknown };
+  adoptedFrom?: unknown;
+  initConfig?: { adoptMode?: boolean };
+}): boolean {
+  // Same truthiness shape as isSharedAdoptPersistedSession, but accepting the
+  // slimmer (unknown-typed) launch-resolution subject.
+  return !!subject.adoptedFrom
+    || subject.initConfig?.adoptMode === true
+    || !!subject.session.adoptedFrom
+    || !!subject.session.existingAppServerEndpoint;
+}
