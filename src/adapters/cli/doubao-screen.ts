@@ -42,7 +42,15 @@ export function doubaoComposerState(screen: string): DoubaoComposerState {
   for (let i = lines.length - 1; i > 0; i--) {
     const row = /^\s*❯\s?(.*)$/.exec(lines[i]!);
     if (!row || !DOUBAO_COMPOSER_RULE.test(lines[i - 1]!)) continue;
-    const text = row[1]!.trim();
+    // Continuation rows are indented and sit between the ❯ row and the closing
+    // rule. A blank first visual row does not make a multiline draft empty.
+    const body = [row[1]!];
+    for (let j = i + 1; j < lines.length && !DOUBAO_COMPOSER_RULE.test(lines[j]!); j++) {
+      const continuation = /^\s+(.*)$/.exec(lines[j]!);
+      if (!continuation) break;
+      body.push(continuation[1]!);
+    }
+    const text = body.join(' ').trim();
     return !text || DOUBAO_COMPOSER_PLACEHOLDER.test(text) ? 'empty' : 'draft';
   }
   return 'unknown';
