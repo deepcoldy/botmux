@@ -16,6 +16,7 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
+import { crossChatFollowThreadPath } from './cross-chat-follow-thread-store.js';
 import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
 import { removeCodexModelLaunchReceipt } from './codex-model-selection.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
@@ -2504,15 +2505,25 @@ function findInOtherFiles(sessionId: string): Session | undefined {
 
 export function cleanupSessionBridgeSendMarkersNow(sessionId: string): void {
   try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+  try { unlinkSync(crossChatFollowThreadPath(config.session.dataDir, sessionId)); } catch { /* absent/best effort */ }
 }
 
 export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
   const fence = bridgeMarkerCleanupFences.get(sessionId);
   if (fence) {
-    void fence.then(
-      () => cleanupSessionBridgeSendMarkersNow(sessionId),
-      () => cleanupSessionBridgeSendMarkersNow(sessionId),
-    );
+    const expectedEpoch = getOwnedSession(sessionId)?.followThreadEpoch;
+    const cleanupIfLifecycleUnchanged = () => {
+      try {
+        const current = getOwnedSession(sessionId);
+        // A close fence belongs to the lifecycle that created it. If resume or
+        // another close has moved the session forward, its cleanup must not
+        // delete the new lifecycle's host binding.
+        if (current?.status === 'closed' && current.followThreadEpoch === expectedEpoch) {
+          cleanupSessionBridgeSendMarkersNow(sessionId);
+        }
+      } catch { /* an unreadable lifecycle is not proof it is safe to delete */ }
+    };
+    void fence.then(cleanupIfLifecycleUnchanged, cleanupIfLifecycleUnchanged);
     return;
   }
   cleanupSessionBridgeSendMarkersNow(sessionId);
@@ -2886,6 +2897,7 @@ export function closeSession(
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
     }, { now: new Date() });
     if (applied.outcome === 'applied') {
+      next.followThreadEpoch = randomUUID();
       commitContractLifecycle(basis, 'close', () => {
         const latest = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
         const closed = latest ? JSON.parse(latest.row) as Session : undefined;
@@ -2960,6 +2972,7 @@ export function reactivateClosedSession(
   // starts a new lifecycle, so the previous close-time token snapshot must not
   // survive into the active row or the next close.
   const next: Session = { ...session };
+  if (next.followThreadEpoch === undefined) next.followThreadEpoch = randomUUID();
   next.status = 'active';
   next.closedAt = undefined;
   next.userClosedAt = undefined;

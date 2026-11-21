@@ -281,6 +281,12 @@ export interface ReplyTargetEntry {
    *  `botmux send` treats an incomplete window as ambiguous → forces an explicit
    *  --mention decision rather than risk auto-@-ing the wrong single counterpart. */
   participantsIncomplete?: boolean;
+  /** When this turn arrived from a cross-chat followed thread in another group. */
+  crossChatOrigin?: {
+    sourceChatId: string;
+    followedChatId: string;
+    followedRootMessageId: string;
+  };
 }
 
 /** Record of the most recent failed/interrupted turn, persisted so `/retry`
@@ -299,6 +305,13 @@ export interface FailedTurnRecord {
   lastRetryAt?: string;    // ISO
   /** Daemon-frozen principal, never supplied by a recovery client. */
   trustedCaller?: TrustedCaller;
+  /** A followed-chat failure never authenticates the external sender for
+   * recovery, even after both per-turn indexes have been pruned. */
+  crossChatOrigin?: {
+    sourceChatId: string;
+    followedChatId: string;
+    followedRootMessageId: string;
+  };
   originalTurnId?: string;
   silent?: boolean;
   /** Provisional native quota observation, not a failed terminal. Unclaimed
@@ -583,6 +596,9 @@ export interface Session {
   /** Model-specific topic preference; does not modify the bot or native CLI defaults. */
   topicReasoningEffort?: { model: string; effort: import('./services/codex-reasoning-effort.js').CodexReasoningEffort };
   sessionId: string;
+  /** Rotated on every successful close and retained on resume. Cross-chat
+   * follow bindings from an older lifecycle must never become active again. */
+  followThreadEpoch?: string;
   /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
   messageListenerAutoClose?: boolean;
   /** Frozen origin of an isolated silent listener task; never a human reply route. */
@@ -2085,6 +2101,12 @@ export interface FrozenSessionReplyContext {
    * reads as "unknown" and callers must fail toward the pre-existing behavior.
    */
   inThread?: boolean;
+  /** When this turn arrived from a cross-chat followed thread in another group. */
+  crossChatOrigin?: {
+    sourceChatId: string;
+    followedChatId: string;
+    followedRootMessageId: string;
+  };
 }
 
 /** Host-side destination frozen when a Codex App turn crosses daemon
@@ -2121,6 +2143,13 @@ export interface CodexAppDispatchLedgerEntry {
   quoteTargetId?: string;
   replyTargetSenderOpenId?: string;
   replyTargetSenderIsBot?: boolean;
+  /** A followed-chat reply never authenticates its sender as the origin
+   * session's human principal, including after a warm worker recovery. */
+  crossChatOrigin?: {
+    sourceChatId: string;
+    followedChatId: string;
+    followedRootMessageId: string;
+  };
   /** Exact output channel selected at acceptance. Undefined is legacy Lark. */
   deliverySink?: CodexAppDeliverySink;
   /** Explicit daemon steer grant from interactive admission or a correlated

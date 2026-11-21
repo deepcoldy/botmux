@@ -1,0 +1,222 @@
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import type { BridgeSendMarker } from './bridge-fallback-gate.js';
+import { crossChatFollowThreadPath } from './cross-chat-follow-thread-store.js';
+
+export type CrossChatFollowThreadMode = 'at' | 'off';
+
+export interface CrossChatFollowedThreadOrigin {
+  sourceChatId: string;
+  followedChatId: string;
+  followedRootMessageId: string;
+}
+
+export interface CrossChatFollowedThreadMatch extends CrossChatFollowedThreadOrigin {
+  sourceSessionId: string;
+  followThreadEpoch?: string;
+  scope: 'chat' | 'thread';
+  anchor: string;
+  runtimeRoutingAnchor?: string;
+}
+
+export interface CrossChatCandidateSession {
+  sessionId: string;
+  larkAppId?: string;
+  chatId: string;
+  scope?: 'thread' | 'chat';
+  rootMessageId: string;
+  runtimeRoutingAnchor?: string;
+  status: 'active' | 'closed';
+  followThreadEpoch?: string;
+  queued?: boolean;
+  messageListenerRun?: unknown;
+  deferredScheduleRun?: { routingAnchor?: string };
+}
+
+const MESSAGE_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
+
+interface CachedFollowBindings {
+  mtimeMs: number;
+  size: number;
+  markers: BridgeSendMarker[];
+}
+
+const followBindingCache = new Map<string, CachedFollowBindings>();
+const MAX_CACHE_ENTRIES = 512;
+
+function readSessionFollowBindings(dataDir: string, sessionId: string): readonly BridgeSendMarker[] {
+  const filePath = crossChatFollowThreadPath(dataDir, sessionId);
+  let stat: ReturnType<typeof statSync>;
+  try {
+    if (!existsSync(filePath)) {
+      followBindingCache.delete(filePath);
+      return [];
+    }
+    stat = statSync(filePath);
+  } catch {
+    followBindingCache.delete(filePath);
+    return [];
+  }
+
+  const cached = followBindingCache.get(filePath);
+  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+    return cached.markers;
+  }
+
+  let raw = '';
+  try {
+    raw = readFileSync(filePath, 'utf-8');
+  } catch {
+    return [];
+  }
+
+  const markers: BridgeSendMarker[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as BridgeSendMarker;
+      if (parsed && typeof parsed === 'object') {
+        markers.push(parsed);
+      }
+    } catch {
+      // Ignore malformed/partial lines.
+    }
+  }
+
+  if (followBindingCache.size >= MAX_CACHE_ENTRIES && !followBindingCache.has(filePath)) {
+    const oldestKey = followBindingCache.keys().next().value;
+    if (oldestKey) followBindingCache.delete(oldestKey);
+  }
+  followBindingCache.set(filePath, {
+    mtimeMs: stat.mtimeMs,
+    size: stat.size,
+    markers,
+  });
+  return markers;
+}
+
+/**
+ * Resolve whether an inbound message in `chatId` (under `candidateRootIds`, e.g.
+ * `[message.root_id, message.parent_id]`) is replying to a cross-chat message
+ * sent by an active session of `larkAppId` in ANOTHER chat.
+ *
+ * Precedence:
+ *  1. An active thread-scope session in `chatId` itself anchored at one of
+ *     `candidateRootIds` always wins (returns `null`).
+ *  2. Among active non-listener sessions in other chats (`s.chatId !== chatId`),
+ *     scan their host-only `cross-chat-follow-thread/<sessionId>.jsonl` bindings
+ *     for a cross-chat `detoured_send` targeting `chatId` whose `messageId` or
+ *     `targetRootMessageId` matches a candidate root id.
+ *  3. If the latest matching marker for that `(session, canonicalRootId)` did
+ *     not opt out (`crossChatFollowThread !== 'off'`), select the match with the
+ *     newest `sentAtMs`.
+ */
+export function resolveCrossChatFollowedThread(input: {
+  dataDir: string;
+  larkAppId: string;
+  chatId: string;
+  candidateRootIds: ReadonlyArray<string | undefined | null>;
+  sessions: Iterable<CrossChatCandidateSession>;
+}): CrossChatFollowedThreadMatch | null {
+  const { dataDir, larkAppId, chatId } = input;
+  if (!dataDir || !larkAppId || !chatId) return null;
+
+  const validRoots: string[] = [];
+  for (const raw of input.candidateRootIds) {
+    if (typeof raw === 'string' && MESSAGE_ID_RE.test(raw) && !validRoots.includes(raw)) {
+      validRoots.push(raw);
+    }
+  }
+  if (validRoots.length === 0) return null;
+
+  const sessionById = new Map<string, CrossChatCandidateSession>();
+  for (const s of input.sessions) {
+    if (!s?.sessionId) continue;
+    // Prefer the first-seen entry (caller passes live activeSessions before disk rows).
+    if (!sessionById.has(s.sessionId)) {
+      sessionById.set(s.sessionId, s);
+    }
+  }
+
+  const rootSet = new Set(validRoots);
+  for (const s of sessionById.values()) {
+    if (
+      s.status === 'active'
+      && s.larkAppId === larkAppId
+      && s.scope !== 'chat'
+      && s.chatId === chatId
+      && rootSet.has(s.rootMessageId)
+    ) {
+      return null;
+    }
+  }
+
+  let best: {
+    session: CrossChatCandidateSession;
+    canonicalRootId: string;
+    sentAtMs: number;
+  } | null = null;
+
+  for (const s of sessionById.values()) {
+    if (
+      s.status !== 'active'
+      || s.queued === true
+      || s.larkAppId !== larkAppId
+      || !s.chatId
+      || s.chatId === chatId
+      || s.messageListenerRun !== undefined
+    ) {
+      continue;
+    }
+
+    const markers = readSessionFollowBindings(dataDir, s.sessionId);
+    if (markers.length === 0) continue;
+
+    // Append order is the durable override order for this session/root: an off
+    // tombstone must win even if the wall clock moves backward between writes.
+    const latestByCanonicalRoot = new Map<string, BridgeSendMarker>();
+    for (const marker of markers) {
+      if (marker.sessionId !== s.sessionId
+        || marker.followThreadEpoch !== s.followThreadEpoch
+        || marker.deliveryKind !== 'detoured_send' || marker.targetChatId !== chatId) continue;
+      const matched = (marker.messageId && rootSet.has(marker.messageId))
+        || (marker.targetRootMessageId && rootSet.has(marker.targetRootMessageId));
+      if (!matched) continue;
+      const canonicalRoot = (marker.targetRootMessageId && MESSAGE_ID_RE.test(marker.targetRootMessageId))
+        ? marker.targetRootMessageId
+        : (marker.messageId && MESSAGE_ID_RE.test(marker.messageId))
+          ? marker.messageId
+          : validRoots[0];
+      latestByCanonicalRoot.set(canonicalRoot, marker);
+    }
+
+    for (const [canonicalRootId, marker] of latestByCanonicalRoot) {
+      if (marker.crossChatFollowThread === 'off') continue;
+      const sentAtMs = Number.isFinite(marker.sentAtMs) ? marker.sentAtMs : 0;
+      if (!best || sentAtMs > best.sentAtMs) {
+        best = { session: s, canonicalRootId, sentAtMs };
+      }
+    }
+  }
+
+  if (!best) return null;
+
+  const isChat = best.session.scope === 'chat';
+  const runtimeRoutingAnchor = best.session.runtimeRoutingAnchor
+    ?? best.session.deferredScheduleRun?.routingAnchor;
+
+  return {
+    sourceSessionId: best.session.sessionId,
+    followThreadEpoch: best.session.followThreadEpoch,
+    sourceChatId: best.session.chatId,
+    scope: isChat ? 'chat' : 'thread',
+    anchor: isChat ? best.session.chatId : best.session.rootMessageId,
+    ...(runtimeRoutingAnchor ? { runtimeRoutingAnchor } : {}),
+    followedChatId: chatId,
+    followedRootMessageId: best.canonicalRootId,
+  };
+}
+
+export function __clearCrossChatFollowBindingCacheForTest(): void {
+  followBindingCache.clear();
+}

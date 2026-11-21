@@ -74,6 +74,7 @@ const { noteSenderUnionId } = await import('../src/core/platform-credential-sour
 const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
 const { prepareScheduledRecoveryRun } = await import('../src/core/scheduled-send.js');
 const { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn } = await import('../src/core/scheduled-turn-provenance.js');
+const { beginReplyTargetTurn } = await import('../src/core/reply-target.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -571,7 +572,7 @@ describe('target daemon consumes signed message authority', () => {
   async function targetHarness(options: { taskConsent?: boolean; botAccess?: boolean; mapping?: 'resolved' | 'transient' | 'definitive'; member?: boolean; memberError?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
     const ts = (await import('typescript')).default;
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
-    const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
+    const { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } = await import('../src/core/reply-target.js');
     const { resolveScheduledRunIdentity } = await import('../src/core/schedule-identity-claim.js');
     const { isTalkerScheduledTask, authorizeTalkerScheduleRun, talkerSchedulePolicy, talkerScheduleChatType } = await import('../src/core/schedule-talker.js');
     const { buildUntilDoneRunPrompt, isAutoCompletedSchedule } = await import('../src/services/schedule-until-done.js');
@@ -618,7 +619,7 @@ describe('target daemon consumes signed message authority', () => {
     const resolveTargetAppOpenId = vi.fn(async () => options.mapping && options.mapping !== 'resolved'
       ? { status: options.mapping } : { status: 'resolved', openId: 'ou_alice_target' });
     const scopeValues = {
-      config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
+      config: { session: { dataDir: dir } }, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveDispatchUser, dispatchCallerFromReply,
       readTaskBinding, capabilityOn, getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       dispatchConsentCardAvailable: async () => true,
       loadOrCreateDispatchReportBindingSecret: () => secret,
@@ -980,6 +981,42 @@ describe('target daemon consumes signed message authority', () => {
     await h.run('om_human');
     expect(identityBody('bytedcli', 'om_human')).toContain('direct-human');
     expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
+  });
+  it('does not publish a cross-chat followed-thread sender as the origin human', async () => {
+    const h = await targetHarness();
+    beginReplyTargetTurn(h.ds, 'om_root', 'om_cross_chat', '2026-11-20T00:00:00.000Z', {
+      senderOpenId: BOB,
+      participants: [{ openId: BOB, isBot: false }],
+      crossChatOrigin: {
+        sourceChatId: 'oc_origin', followedChatId: 'oc_followed', followedRootMessageId: 'om_sent_in_followed',
+      },
+    });
+    bytedcliJwts.set(BOB, { cloudJwt: 'must-not-use-cross-chat-sender' });
+    await h.run('om_cross_chat');
+    const env = identityBody('bytedcli', 'om_cross_chat');
+    expect(env).not.toContain('must-not-use-cross-chat-sender');
+    expect(env).toContain('[reason=no_sender]');
+  });
+  it('keeps a cross-chat sender blocked when its pinned reply target outlives the context map', async () => {
+    const h = await targetHarness();
+    h.ds.session.cronTaskReplyAnchors = { task: { turnId: 'om_cross_chat', createdAtMs: 0 } };
+    beginReplyTargetTurn(h.ds, 'om_root', 'om_cross_chat', '2026-11-20T00:00:00.000Z', {
+      senderOpenId: BOB,
+      participants: [{ openId: BOB, isBot: false }],
+      crossChatOrigin: {
+        sourceChatId: 'oc_origin', followedChatId: 'oc_followed', followedRootMessageId: 'om_sent_in_followed',
+      },
+    });
+    for (let i = 0; i < 1000 && h.ds.session.turnReplyContexts.om_cross_chat; i++) {
+      beginReplyTargetTurn(h.ds, 'om_root', `om_later_${i}`, new Date(Date.parse('2026-11-20T00:00:00.000Z') + (i + 1) * 1000).toISOString());
+    }
+    expect(h.ds.session.turnReplyContexts.om_cross_chat).toBeUndefined();
+    expect(h.ds.session.replyTargets.om_cross_chat.crossChatOrigin).toBeDefined();
+    bytedcliJwts.set(BOB, { cloudJwt: 'must-not-use-pruned-cross-chat-sender' });
+    await h.run('om_cross_chat');
+    const env = identityBody('bytedcli', 'om_cross_chat');
+    expect(env).not.toContain('must-not-use-pruned-cross-chat-sender');
+    expect(env).toContain('[reason=no_sender]');
   });
   it('a delegated bot turn still refuses a corrupt delegation store', async () => {
     const h = await targetHarness();

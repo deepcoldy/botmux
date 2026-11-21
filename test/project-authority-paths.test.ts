@@ -34,6 +34,7 @@ describe('project authority directory isolation', () => {
         join(dataDir, '.dashboard-secret.project-source-grants'),
         join(dataDir, '.dashboard-secret.project-imports'),
         join(dataDir, '.dashboard-secret.dispatch-task-decisions'),
+        join(dataDir, '.dashboard-secret.cross-chat-follow-thread'),
       ]);
     },
   );

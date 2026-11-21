@@ -6713,6 +6713,27 @@ describe('Codex App clean-input feature gate', () => {
     });
   });
 
+  it('copies cross-chat origin into the durable Codex App ledger for recovery fencing', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'codex-app';
+    const crossChatOrigin = {
+      sourceChatId: 'oc_origin', followedChatId: 'oc_followed', followedRootMessageId: 'om_followed_root',
+    };
+    ds.session.turnReplyContexts = {
+      om_cross: {
+        target: { mode: 'thread', rootMessageId: 'om_origin_root' },
+        replyTargetSenderOpenId: 'ou_stranger_b', replyTargetSenderIsBot: false, crossChatOrigin,
+      },
+    };
+
+    expect(sendWorkerInput(ds, 'cross-chat reply', 'om_cross', { codexAppSteerable: true })).toBe(true);
+    expect(ds.session.codexAppDispatchLedger?.[0]).toMatchObject({
+      turnId: 'om_cross', replyTargetSenderOpenId: 'ou_stranger_b', codexAppSteerable: true, crossChatOrigin,
+    });
+  });
+
   it('rejects an empty double-fork before mutating or killing a ledger-owned live worker', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app' }));
     const worker = makeFakeWorker();

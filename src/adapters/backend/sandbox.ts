@@ -1751,6 +1751,8 @@ const RELAY_FLAGS_NOVAL = new Set([
   '--slash',
   '--urgent',
   '--schedule-remove-self',
+  '--follow-thread-at',
+  '--no-follow-thread',
 ]);
 const RELAY_FLAGS_VAL = new Set([
   '--mention',

@@ -2608,6 +2608,7 @@ export function buildReforkCliInput(
   ds: DaemonSession,
   content: string,
   opts?: {
+    messageLocation?: InboundMessageLocation;
     attachments?: LarkAttachment[];
     mentions?: LarkMention[];
     cliId?: CliId;
@@ -2638,6 +2639,7 @@ export function buildReforkCliInput(
     };
   }
   return buildFollowUpCliInput(content, ds.session.sessionId, {
+    ...(opts?.messageLocation ? { messageLocation: opts.messageLocation } : {}),
     attachments: opts?.attachments,
     mentions: opts?.mentions,
     isAdoptMode: false,

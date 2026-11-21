@@ -291,10 +291,13 @@ export function registryTurnMayAuthenticateHuman(
     ordinaryTurnRecovery?: { logicalTurnId: string; currentTurnId: string };
     failedTurnRecovery?: { turnId: string };
     readonlyTaskContinuation?: { logicalTurnId: string; currentTurnId: string };
+    replyTargets?: Record<string, { crossChatOrigin?: unknown; senderOpenId?: string }>;
+    turnReplyContexts?: Record<string, { crossChatOrigin?: unknown; target?: unknown }>;
   },
   turnId: string,
 ): boolean {
   if (!isHumanInboundTurnId(turnId)) return false;
+  if (s.replyTargets?.[turnId]?.crossChatOrigin || s.turnReplyContexts?.[turnId]?.crossChatOrigin) return false;
   const ordinary = s.ordinaryTurnRecovery;
   if (ordinary && ordinary.currentTurnId === turnId && turnId !== ordinary.logicalTurnId) return false;
   if (s.failedTurnRecovery?.turnId === turnId) return false;
@@ -308,8 +311,9 @@ export function registryTurnMayAuthenticateHuman(
  * the turn's own participant window as a non-bot. Entries predating the
  * participant window (or written without it) fail closed. */
 export function registryEntryProvesHumanSender(
-  entry: Pick<ReplyTargetEntry, 'senderOpenId' | 'participants'> | undefined,
+  entry: Pick<ReplyTargetEntry, 'senderOpenId' | 'participants' | 'crossChatOrigin'> | undefined,
 ): entry is ReplyTargetEntry & { senderOpenId: string } {
+  if (entry?.crossChatOrigin) return false;
   const sender = entry?.senderOpenId;
   return !!sender && !!entry?.participants?.some(p => p.openId === sender && p.isBot === false);
 }
@@ -462,7 +466,7 @@ export function beginReplyTargetTurn(
   replyRootId: string | undefined,
   turnId: string,
   nowIso = new Date().toISOString(),
-  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string; synthetic?: true },
+  opts?: { quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: TurnParticipant[]; participantsIncomplete?: boolean; inThread?: boolean; foldedRootId?: string; sourceMessageId?: string; synthetic?: true; crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string } },
 ): void {
   if (isLarkChatId(replyRootId)) replyRootId = undefined;
   // #597: the frozen per-turn dispatch context — the authoritative reply target
@@ -488,13 +492,19 @@ export function beginReplyTargetTurn(
               ? { requesterIsBot: ds.session.quoteTargetSenderIsBot } : {}) } : {}),
     ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
       ? { sourceMessageId: opts.sourceMessageId } : {}),
-    ...(!opts?.synthetic && ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
-    ...(!opts?.synthetic && ds.session.quoteTargetSenderOpenId
-      ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId }
-      : {}),
-    ...(!opts?.synthetic && ds.session.quoteTargetSenderIsBot !== undefined
-      ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot }
-      : {}),
+    ...(!opts?.synthetic && ds.session.quoteTargetId && !opts?.crossChatOrigin ? { quoteTargetId: ds.session.quoteTargetId } : {}),
+    ...(opts?.crossChatOrigin
+      ? ((opts.senderOpenId ?? ds.session.quoteTargetSenderOpenId)
+        ? { replyTargetSenderOpenId: (opts.senderOpenId ?? ds.session.quoteTargetSenderOpenId)! } : {})
+      : (!opts?.synthetic && ds.session.quoteTargetSenderOpenId
+        ? { replyTargetSenderOpenId: ds.session.quoteTargetSenderOpenId } : {})),
+    ...(opts?.crossChatOrigin
+      ? (opts.participants?.find(p => p.openId === opts.senderOpenId)?.isBot !== undefined
+        ? { replyTargetSenderIsBot: opts.participants.find(p => p.openId === opts.senderOpenId)!.isBot }
+        : {})
+      : (!opts?.synthetic && ds.session.quoteTargetSenderIsBot !== undefined
+        ? { replyTargetSenderIsBot: ds.session.quoteTargetSenderIsBot } : {})),
+    ...(opts?.crossChatOrigin ? { crossChatOrigin: opts.crossChatOrigin } : {}),
     // Chat-scope only: distinguishes "answered flat AT TOP LEVEL" from
     // "answered flat but the inbound was already inside a topic" (a native
     // topic seed). Thread-scope turns route off session.rootMessageId and
@@ -534,6 +544,7 @@ export function beginReplyTargetTurn(
     ...(opts?.senderOpenId ? { senderOpenId: opts.senderOpenId } : {}),
     ...(opts?.participants?.length ? { participants: dedupeParticipants(opts.participants) } : {}),
     ...(opts?.participantsIncomplete ? { participantsIncomplete: true } : {}),
+    ...(opts?.crossChatOrigin ? { crossChatOrigin: opts.crossChatOrigin } : {}),
   };
   ds.session.replyTargetsPrunedThrough = pruneReplyTargets(
     targets,
@@ -715,6 +726,7 @@ export function rehomeReplyTargetState(ds: DaemonSession): void {
         ...(context.replyTargetSenderIsBot !== undefined
           ? { replyTargetSenderIsBot: context.replyTargetSenderIsBot }
           : {}),
+        ...(context.crossChatOrigin ? { crossChatOrigin: context.crossChatOrigin } : {}),
         // `inThread` is deliberately NOT carried over: it describes the shape of
         // the inbound message in the SOURCE chat, which says nothing about the
         // new destination. Readers treat its absence as "unknown" and fall back
@@ -732,6 +744,7 @@ export function rehomeReplyTargetState(ds: DaemonSession): void {
         ...(entry.senderOpenId ? { senderOpenId: entry.senderOpenId } : {}),
         ...(entry.participants?.length ? { participants: entry.participants } : {}),
         ...(entry.participantsIncomplete ? { participantsIncomplete: true } : {}),
+        ...(entry.crossChatOrigin ? { crossChatOrigin: entry.crossChatOrigin } : {}),
       };
     }
     ds.session.replyTargets = targets;

@@ -10,7 +10,7 @@ import { isBunRuntime, spawnNodeTsScript } from './helpers/ts-runner.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { handleSkillFeedbackCardAction } from '../src/im/lark/skill-feedback-card.js';
-import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE, executeRiffHostTool, parseRiffHostRequest,
+import { RiffHostTools, RIFF_HOST_TOOLS_ROUTE, executeRiffHostTool, parseRiffHostRequest, riffHostFileArguments,
   RIFF_HOST_MAX_ATTACHMENT_BYTES, RIFF_HOST_MAX_BYTES,
   type RiffHostContext, type RiffHostBinding } from '../src/services/riff-host-tools.js';
 import { quotedAttachments, QuotedAttachmentLimitError } from '../src/services/remote-runner-session-tool.js';
@@ -142,6 +142,25 @@ describe('Riff host boundary', () => {
     expect(parseRiffHostRequest(request(['whiteboard', 'status'])).argv[1]).toBe('status');
     expect(() => parseRiffHostRequest(request(['whiteboard', 'read', '--id', 'other']))).toThrow();
   });
+  it.each(['--follow-thread-at', '--no-follow-thread'])('accepts the cross-chat follow flag %s at the Riff host boundary', flag => {
+    expect(riffHostFileArguments(['send', '--chat-id', 'oc_followed', flag, 'hello'])).toEqual([]);
+  });
+
+  it('accepts the complete followed-thread reply command at the Riff host boundary', () => {
+    expect(riffHostFileArguments([
+      'send', '--chat-id', 'oc_followed', '--into', 'om_followed_root', '--no-follow-thread', 'hello',
+    ])).toEqual([]);
+    expect(riffHostFileArguments(['send', '--into=om_other', 'body'])).toEqual([]);
+  });
+
+  it.each([
+    ['separate', ['send', '--chat-id', 'oc_followed', '--into', '/etc/passwd', 'hello']],
+    ['inline', ['send', '--into=../../etc/passwd', 'body']],
+    ['bad-prefix', ['send', '--into', 'not_an_om_id', 'body']],
+  ])('rejects a non-om --into topic root (%s)', (_label, argv) => {
+    expect(() => riffHostFileArguments(argv)).toThrow('riff_host_invalid_into');
+  });
+
   it('delivers through the real host send path, indexes feedback and accepts a click without resending', async () => {
     const directory = root(), dataDir = join(directory, 'data'), app = 'cli_test', turnId = 'om_turn_host';
     mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
@@ -183,7 +202,7 @@ describe('Riff host boundary', () => {
   }, 30_000);
 
   it.each([
-    ['send', '--session-id', 'other', 'body'], ['send', '--into=om_other', 'body'],
+    ['send', '--session-id', 'other', 'body'],
     ['chat', 'create', '--bot', 'other'], ['chat', 'members', '--lark-app-id', 'other'],
     ['schedule', 'add', 'every 1h', 'prompt', '--lark-app-id', 'other'],
     ['send', '--content-file', '/etc/passwd'], ['card', 'patch', '--card-file=/etc/passwd'],

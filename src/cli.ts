@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
 import { replyDeliveryFromEnv, sendCompletionHintKey } from './services/send-completion-hint.js';
-import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
+import { selectReplyMessageId, parseReplyMessageTarget, crossChatOriginForSend, crossChatSenderForSend } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
@@ -419,6 +419,7 @@ import {
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import { recordBridgeReplyMarker } from './services/bridge-reply-marker.js';
+import { effectiveCrossChatFollowThreadMode, ensureCrossChatFollowThreadAtBinding, persistCrossChatFollowThreadOffBeforeProvider } from './services/cross-chat-follow-thread-store.js';
 import { recordSessionTurnReply } from './services/session-turns.js';
 import {
   commitRestartIntentAttemptTo,
@@ -4421,6 +4422,7 @@ interface AdoptedFromData {
 
 interface SessionData {
   sessionId: string;
+  followThreadEpoch?: string;
   messageListenerRun?: import('./core/message-listener-silence.js').SilentMessageListenerRun;
   chatId: string;
   chatType?: 'group' | 'p2p';
@@ -4464,11 +4466,12 @@ interface SessionData {
   ownerUnionId?: string;
   creatorOpenId?: string;
   lastCallerOpenId?: string;
+  lastCallerIsBot?: boolean;
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
-  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: import('./types.js').TurnParticipant[] }>;
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: import('./types.js').TurnParticipant[]; crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string } }>;
   /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
    *  `botmux send` 读取发送人类型，并用 `inThread` 判断 quote 目标当初是否从**顶层**
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
@@ -4478,6 +4481,7 @@ interface SessionData {
     inThread?: boolean;
     replyTargetSenderOpenId?: string;
     replyTargetSenderIsBot?: boolean;
+    crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string };
   }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
@@ -8231,6 +8235,9 @@ const SEND_HELP_BODY = [
   '       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）',
   '       --top-level                     发顶层消息（不回复进当前话题）',
   '       --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）',
+  '       --into <om_xxx>                 指定回复进目标群的话题根消息（root_id）',
+  '       --follow-thread-at              跨群发送时追踪该消息话题内的 @本bot 回复回源会话（默认开启）',
+  '       --no-follow-thread              跨群发送时不追踪该消息话题内的回复回源会话',
   '       --attention[=kind]              举手：发消息的同时把本会话标进 dashboard',
   '                                       「需要你」列并通知你——撞到只有你能解的硬阻碍',
   '                                       （授权/拍板/缺权限）无法继续时用。消息正文即看板',
@@ -10663,7 +10670,7 @@ async function relaySend(
   // identity and the routing wish (must match the watcher's allowlist); path
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
-  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level', '--follow-thread-at', '--no-follow-thread']);
   const FLAGS_VAL = new Set(['--mention', '--quote', '--reply-to', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
@@ -12034,6 +12041,12 @@ async function cmdSend(
   // another thread, etc.) instead of the session's own location. Wins over the
   // auto/scope default; `dispatch` opens topics, `send --into` posts into them.
   const sendInto = argValue(rest, '--into');
+  const followThreadAt = rest.includes('--follow-thread-at');
+  const noFollowThread = rest.includes('--no-follow-thread');
+  if (followThreadAt && noFollowThread) {
+    console.error('botmux send: --follow-thread-at 与 --no-follow-thread 不能同时使用');
+    process.exit(2);
+  }
   // --voice: synthesize the content into a Feishu voice bubble instead of a
   // text/card message. The content should be spoken-style prose (the 🔊 button
   // injects a condense-first instruction before the model calls this).
@@ -12354,10 +12367,7 @@ async function cmdSend(
     process.exit(2);
   }
   const turnReplyTarget = pickTurnReplyTarget(s, replyMessageId);
-  const turnBoundQuoteTarget = turnReplyTarget?.rootMessageId
-    ?? s.turnReplyContexts?.[replyMessageId ?? '']?.quoteTargetId
-    ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
-    ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined);
+  const replyContextForQuote = s.turnReplyContexts?.[replyMessageId ?? ''];
   if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
     console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
     process.exit(2);
@@ -12456,6 +12466,17 @@ async function cmdSend(
   const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
     ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
   const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
+  const isCrossChatOriginTurn = !!crossChatOriginForSend({
+    replyContext: replyContextForQuote,
+    replyTarget: s.replyTargets?.[replyMessageId ?? ''],
+    frozenTurnDispatch,
+  });
+  const turnBoundQuoteTarget = isCrossChatOriginTurn
+    ? ((!overrideChatId || overrideChatId === s.chatId) ? s.quoteTargetId : undefined)
+    : (turnReplyTarget?.rootMessageId
+      ?? replyContextForQuote?.quoteTargetId
+      ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
+      ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined));
   if (exactOriginDispatch?.deliverySink === 'http_wait'
     || exactOriginDispatch?.deliverySink === 'http_async'
     || exactOriginDispatch?.deliverySink === 'suppressed') {
@@ -12915,18 +12936,34 @@ async function cmdSend(
     console.error('botmux send refused: ' + (error instanceof Error ? error.message : 'LOCAL_ADDRESS_OUTBOUND_REJECTED'));
     process.exit(2);
   }
+  const currentTurnCrossChatOrigin = currentTurnId
+    ? crossChatOriginForSend({
+        replyContext: s.turnReplyContexts?.[currentTurnId],
+        replyTarget: s.replyTargets?.[currentTurnId],
+        frozenTurnDispatch,
+      })
+    : undefined;
+  const sendingToOriginSessionChat = (!overrideChatId || overrideChatId === s.chatId) && !sendInto;
+  // #750: legacySender is consulted only for a true no-turn send. A turn-scoped
+  // map miss never borrows the mutable latest quote slot for mention-back.
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-    ?? frozenTurnDispatch?.replyTargetSenderOpenId
-    ?? pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
-    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
-    // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
-    // borrowed as a legacy fallback when there is NO currentTurnId (true
-    // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
-    // resolve to NO sender — never the global slot, which may have advanced to a
-    // DIFFERENT turn B and would mis-@ B as A's --mention-back (the cross-turn
-    // bug #750 fixed). pickTurnReplyTarget already enforces
-    // quoteTargetId===currentTurnId for its own hit.
-    ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
+    ?? crossChatSenderForSend({
+      crossChatOrigin: currentTurnCrossChatOrigin,
+      sendingToOriginSessionChat,
+      frozenTurnSender: frozenTurnDispatch?.replyTargetSenderOpenId,
+      perTurnSender: pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
+        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId,
+      legacySender: currentTurnId ? undefined : s.quoteTargetSenderOpenId,
+      originQuoteSender: s.quoteTargetSenderOpenId,
+      originLastCaller: s.lastCallerOpenId,
+      originOwner: s.ownerOpenId,
+    });
+  const replyTargetSenderIsBot = currentTurnCrossChatOrigin && sendingToOriginSessionChat
+    ? (replyTargetSenderOpenId ? (s.quoteTargetSenderIsBot ?? s.lastCallerIsBot ?? false) : undefined)
+    : frozenTurnDispatch?.replyTargetSenderIsBot
+      ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
+      ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
+      ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
   const proposalRequesterIsExactHuman = !!currentTurnId
     && !!replyTargetSenderOpenId
     && collectTurnWindowParticipants(s, currentTurnId).participants
@@ -13114,6 +13151,12 @@ async function cmdSend(
     cover: await attachmentIdentity(coverPath),
     durationMs,
   })));
+  const followThreadTargetChatId = overrideChatId ?? s.chatId;
+  const effectiveFollowThreadMode = effectiveCrossChatFollowThreadMode({
+    targetChatId: followThreadTargetChatId,
+    sourceChatId: (originSession ?? s).chatId,
+    noFollowThread,
+  });
   const turnRequestIdentity = canonicalJson({
     version: 1,
     content: expectedLinkRenderedContent,
@@ -13153,11 +13196,7 @@ async function cmdSend(
       mentions: mentionArgs,
       mentionBack,
       noMention,
-      replyTargetSenderOpenId: explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-        ?? frozenTurnDispatch?.replyTargetSenderOpenId
-        ?? turnReplyTarget?.senderOpenId
-        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
-        ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId),
+      replyTargetSenderOpenId,
     },
     presentation: {
       voice: asVoice,
@@ -13171,6 +13210,7 @@ async function cmdSend(
     controls: {
       attention: attention.requested ? attention.kind : undefined,
       urgent: urgent.requested ? urgent.mode : undefined,
+      followThread: effectiveFollowThreadMode,
     },
     attachments: {
       images: durableImageIdentities,
@@ -13198,16 +13238,29 @@ async function cmdSend(
       effectiveResponseKind = 'final';
     }
   }
+  const persistOffBeforeProvider = (): void => {
+    if (effectiveFollowThreadMode !== 'off' || !sendInto) return;
+    persistCrossChatFollowThreadOffBeforeProvider({
+      dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, targetChatId: followThreadTargetChatId,
+      targetRootMessageId: sendInto, followThreadEpoch: (originSession ?? s).followThreadEpoch,
+    });
+  };
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
   ): Promise<{ messageId: string; replayed: boolean }> => {
     return turnSendKey
       ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
+          beforeDispatch: persistOffBeforeProvider,
           ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
             !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
         })
-      : { messageId: await dispatch(), replayed: false };
+      : (async () => {
+          // No-turn sends have no ledger to validate, but the same pre-provider
+          // off contract still applies: a failed tombstone aborts before Lark.
+          persistOffBeforeProvider();
+          return { messageId: await dispatch(), replayed: false };
+        })();
   };
   let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
   try {
@@ -13219,6 +13272,15 @@ async function cmdSend(
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    if (effectiveFollowThreadMode === 'at') {
+      const bound = ensureCrossChatFollowThreadAtBinding({
+        dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs: Date.now(),
+        messageId: existingTurnPrimary.messageId, targetChatId: followThreadTargetChatId,
+        ...(sendInto ? { targetRootMessageId: sendInto } : {}),
+        followThreadEpoch: (originSession ?? s).followThreadEpoch,
+      });
+      if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
+    }
     // A retry after a lost reply-card mark completes it; a final already on
     // the card is left alone by the store.
     if (effectiveResponseKind === 'final' && currentTurnId) {
@@ -13449,9 +13511,25 @@ async function cmdSend(
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
+      const voiceCrossChatFollowThread = effectiveCrossChatFollowThreadMode({
+        targetChatId: voicePrimaryOutputChatId,
+        sourceChatId: (originSession ?? s).chatId,
+        noFollowThread,
+      });
+      if (voiceDelivery.replayed && voiceCrossChatFollowThread === 'at') {
+        const voiceFollowRoot = deferredTopicRootMessageIdForOutput ?? sendInto;
+        const bound = ensureCrossChatFollowThreadAtBinding({
+          dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs, messageId,
+          targetChatId: voicePrimaryOutputChatId,
+          ...(voiceFollowRoot ? { targetRootMessageId: voiceFollowRoot } : {}),
+          followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        });
+        if (!bound) console.error('botmux send: 已复用语音投递，但跨群话题绑定补建失败');
+      }
       if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
         || !!(originTurnId ?? currentTurnId)
-        || !!deferredTopicRootMessageIdForOutput)) {
+        || !!deferredTopicRootMessageIdForOutput
+        || voiceCrossChatFollowThread !== undefined)) {
         try {
           const markerSessionId = originSessionId ?? sid;
           const markerTurnId = originTurnId ?? currentTurnId;
@@ -13472,6 +13550,8 @@ async function cmdSend(
             targetChatId: voicePrimaryOutputChatId,
             targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto,
             targetSessionId: sid,
+            crossChatFollowThread: voiceCrossChatFollowThread,
+            followThreadEpoch: (originSession ?? s).followThreadEpoch,
           });
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
@@ -13897,7 +13977,7 @@ async function cmdSend(
   // right one instead of guessing (or mis-@-ing the lone human). Reads the
   // persisted per-turn participant window — no group-stats round-trip. Explicit
   // VC turns carry their own single-target origin, so they skip this gate.
-  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
+  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel && !(currentTurnCrossChatOrigin && sendingToOriginSessionChat)) {
     const window = collectTurnWindowParticipants(s, currentTurnId);
     const selectedWindow = selectedReplyContext ? collectTurnWindowParticipants(s, replyMessageId) : window;
     window.participants = dedupeParticipants([...window.participants, ...selectedWindow.participants]);
@@ -14164,6 +14244,7 @@ async function cmdSend(
   // 此包装自出生即无调用方；但 test/cli-send-hook-context.test.ts 对其源码文本做了断言，
   // 删除需同步改测试。
   void dispatch;
+  const crossChatFollowThread = effectiveFollowThreadMode;
   function recordStructuredSendReceipt(
     markerSessionId: string,
     markerTurnId: string | undefined,
@@ -14213,6 +14294,8 @@ async function cmdSend(
         targetRootMessageId: deferredTopicRootMessageIdForOutput
           ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
         targetSessionId: sid,
+        crossChatFollowThread,
+        followThreadEpoch: (originSession ?? s).followThreadEpoch,
       });
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
@@ -14220,8 +14303,12 @@ async function cmdSend(
   // A detoured send is still positive user-visible output for its exact source
   // turn. Require an exact turn before recording a detour so a manually-run,
   // unattributed publish cannot suppress a real empty reply by timestamp alone.
+  // Cross-chat sends also record their messageId in turn-sends/<sessionId>.jsonl
+  // so replies in that cross-chat thread can route back to the origin session
+  // (detoured_send without turnId is ignored by evaluateBridgeFallbackGate).
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto
-    || !!(originTurnId ?? currentTurnId);
+    || !!(originTurnId ?? currentTurnId)
+    || crossChatFollowThread !== undefined;
   let unifiedReplyUsed = false;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
@@ -14657,13 +14744,15 @@ async function cmdSend(
     // （Codex review P2）。--top-level 同样无特定收件人。
     const frozenFooterAddressingSource = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
       ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
-      : frozenTurnDispatch?.replyTargetSenderOpenId
-        ? {
-            ...s,
-            lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId,
-            lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot,
-          }
-        : s;
+      : currentTurnCrossChatOrigin && sendingToOriginSessionChat
+        ? { ...s, lastCallerOpenId: replyTargetSenderOpenId ?? s.ownerOpenId, lastCallerIsBot: replyTargetSenderIsBot }
+        : frozenTurnDispatch?.replyTargetSenderOpenId
+          ? {
+              ...s,
+              lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId,
+              lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot,
+            }
+          : s;
     const footerAddressing = (sendTopLevel || noMention)
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
       : buildFooterAddressing(frozenFooterAddressingSource, {
@@ -14941,10 +15030,6 @@ async function cmdSend(
       if (feedbackBaseCard && replyCardJson !== withOncall) feedbackBaseCard = JSON.parse(replyCardJson);
       const replyStore = new TurnReplyCardStore(resolveDataDir());
       const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
-      const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
-        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
-        ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
-        ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
       // Mentioning this turn's human requester is still an ordinary reply.
       // Peer bots, other recipients and unknown identities need a new message
       // so their notification/automation cannot be swallowed by a PATCH.
@@ -15053,6 +15138,15 @@ async function cmdSend(
     // after waiting. Stop here so the losing process cannot repeat indexing,
     // attachments, urgency, bridge markers, or attention side effects.
     if (turnPrimaryReplayed) {
+      if (crossChatFollowThread === 'at') {
+        const bound = ensureCrossChatFollowThreadAtBinding({
+          dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs, messageId,
+          targetChatId,
+          ...(sendTarget.mode !== 'plain' ? { targetRootMessageId: sendTarget.rootMessageId } : {}),
+          followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        });
+        if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
+      }
       // Reusing a receipt is not a new send. Preserve the original marker's
       // time, including when another input arrived while we waited on the lock.
       // The first sender may have lost the reply-card mark; it is idempotent.
