@@ -160,18 +160,17 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
     }
   }, 90_000);
 
-  it('never deletes a manifest root outside the private /tmp/bmxt-* topology', () => {
+  // One independent runner per victim so each manifest carries exactly ONE
+  // illegal record. The runner fails closed on ANY invalid record and skips
+  // every deletion, so putting two victims in one runner would let one invalid
+  // record mask the deletion of the other during a partial-guard mutation.
+  function runManifestGuard(victim: string, marker: string) {
     const root = mkdtempSync('/tmp/bmx-bun-runner-manifest-guard-');
     roots.push(root);
     mkdirSync(join(root, 'test'));
-    symlinkSync(resolve('test/helpers'), join(root, 'test', 'helpers'), 'dir');
+    symlinkSync(resolve('test/helpers'), join(root, 'test/helpers'), 'dir');
     symlinkSync(resolve('node_modules'), join(root, 'node_modules'), 'dir');
-    // A complete, newline-terminated record that is NOT a /tmp/bmxt-* child.
-    // The manifest is writable by test code, so it must never become an
-    // arbitrary directory-deletion primitive.
-    const victim = mkdtempSync('/tmp/bmx-bun-runner-victim-');
-    roots.push(victim);
-    writeFileSync(join(victim, 'do-not-delete.txt'), 'preserve me');
+    writeFileSync(join(victim, marker), 'preserve me');
     const scratchFile = join(root, 'scratch.path');
     const fenceRootFile = join(root, 'fence.path');
     const fenceHelper = pathToFileURL(resolve('test/helpers/tmux-fence.ts')).href;
@@ -193,22 +192,42 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
       cwd: root, encoding: 'utf8', timeout: 60_000,
       env: { ...process.env, CI: 'true', BOTMUX_BUN_TEST_CONCURRENCY: '1' },
     });
+    return { result, scratchFile, fenceRootFile, victim, marker };
+  }
 
+  function expectVictimPreserved(
+    run: ReturnType<typeof runManifestGuard>,
+  ): void {
     let scratch = '';
     let fenceRoot = '';
     try {
-      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
-      expect(result.stderr).toContain('invalid tmux fence root record');
+      expect(run.result.status, `${run.result.stdout}\n${run.result.stderr}`).toBe(1);
+      expect(run.result.stderr).toContain('invalid tmux fence root record');
       // The external directory is preserved, not removed as a fence root.
-      expect(existsSync(join(victim, 'do-not-delete.txt'))).toBe(true);
-      scratch = readFileSync(scratchFile, 'utf8');
-      fenceRoot = readFileSync(fenceRootFile, 'utf8');
+      expect(existsSync(join(run.victim, run.marker))).toBe(true);
+      scratch = readFileSync(run.scratchFile, 'utf8');
+      fenceRoot = readFileSync(run.fenceRootFile, 'utf8');
       expect(existsSync(scratch)).toBe(true);
       expect(existsSync(fenceRoot)).toBe(true);
     } finally {
       if (scratch) rmSync(scratch, { recursive: true, force: true });
       if (fenceRoot) rmSync(fenceRoot, { recursive: true, force: true });
     }
+  }
+
+  it('rejects a manifest record whose basename lacks the bmxt- prefix', () => {
+    // Parent IS /tmp, but the name is outside the bmxt-* family.
+    const victim = mkdtempSync('/tmp/bmx-bun-runner-victim-');
+    roots.push(victim);
+    expectVictimPreserved(runManifestGuard(victim, 'do-not-delete.txt'));
+  }, 90_000);
+
+  it('rejects a bmxt-named manifest record whose parent is outside /tmp', () => {
+    // The name looks like a fence root, but the parent is a fixture dir, not /tmp.
+    const fixture = mkdtempSync('/tmp/bmx-bun-runner-manifest-parent-');
+    roots.push(fixture);
+    const victim = mkdtempSync(join(fixture, 'bmxt-evil-'));
+    expectVictimPreserved(runManifestGuard(victim, 'do-not-delete.txt'));
   }, 90_000);
 
   it('settles a server that starts only after the test process exits', () => {
