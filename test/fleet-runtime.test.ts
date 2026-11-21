@@ -33,6 +33,9 @@ describe('topic index fleet member', () => {
       expect(fleetHealthMembers().map(m => m.name)).not.toContain('topic-index');
       expect(entryForSubcommand('__topic-indexer')).toBe('topic-indexer');
       expect(resolveEntrySpawn('topic-indexer', '/private/dist').args.at(-1)).toBe('/private/dist/index-topic-indexer.js');
+      expect(entryForSubcommand('__topic-search-query')).toBe('topic-search-query');
+      expect(resolveEntrySpawn('topic-search-query', '/private/dist').args.at(-1)).toBe('/private/dist/index-topic-search-query.js');
+      expect(resolveFleetMembers().some(member => member.entry === 'topic-search-query')).toBe(false);
       vi.stubEnv('BOTMUX_TOPIC_SEARCH', '0');
       expect(resolveFleetMembers().some(member => member.name === 'topic-index')).toBe(false);
       vi.stubEnv('BOTMUX_TOPIC_SEARCH', 'false');

@@ -141,6 +141,12 @@ function summary(db: DatabaseSyncLike, anchor: string, sessionIndex: SessionInde
 
 export interface TopicSearchOptions {
   sessions?: readonly Session[];
+  /** Restrict candidates before ranking/truncation (Dashboard's visible rows). */
+  anchors?: ReadonlySet<string>;
+  /** Maximum light rows materialized per term; excess rows mark the result truncated. */
+  candidateLimit?: number;
+  /** Read/filter session stores in the caller (the Dashboard query child). */
+  visibleSessionIds?: ReadonlySet<string>;
   busyTimeoutMs?: number;
 }
 
@@ -148,6 +154,21 @@ export function searchTopics(dataDir: string, input: SearchRequest, providedBots
   query: string; results: TopicResult[]; truncated: boolean;
 } {
   const request = parseTopicQuery(input);
+  const candidateLimit = options.candidateLimit ?? 10_000;
+  if (!Number.isInteger(candidateLimit) || candidateLimit < 1 || candidateLimit > 100_000) {
+    throw new TopicQueryError('invalid_topic_candidate_limit');
+  }
+  if (options.anchors?.size === 0 || (options.visibleSessionIds?.size === 0 && !options.sessions)) {
+    return { query: request.query,results: [],truncated: false };
+  }
+  const scopedSessions = options.visibleSessionIds
+    ? (options.sessions ?? readTopicSessions(dataDir).sessions).filter(session => options.visibleSessionIds!.has(session.sessionId))
+    : options.sessions;
+  const effectiveAnchors = options.anchors ?? (options.visibleSessionIds
+    ? new Set((scopedSessions ?? []).map(sessionQueueAnchor)) : undefined);
+  if (effectiveAnchors?.size === 0) return { query: request.query,results: [],truncated: false };
+  const allowedAnchors = effectiveAnchors ? JSON.stringify([...effectiveAnchors]) : undefined;
+  let candidateTruncated = false;
   const db = openTopicIndex(dataDir,{ readOnly: true, busyTimeoutMs: options.busyTimeoutMs });
   try {
     const long = request.terms.filter(term => Array.from(term).length >= 3);
@@ -162,10 +183,15 @@ export function searchTopics(dataDir: string, input: SearchRequest, providedBots
       const params: unknown[] = [isLong ? `"${term.replace(/"/g,'""')}"` : `%${term.replace(/[\\%_]/g,'\\$&')}%`];
       let sql = isLong ? `SELECT ${columns} FROM docs d JOIN docs_fts ON docs_fts.rowid=d.id WHERE docs_fts MATCH ?`
         : `SELECT ${columns} FROM docs d WHERE d.text LIKE ? ESCAPE '\\'`;
+      if (allowedAnchors) { sql += ' AND d.anchor IN (SELECT value FROM json_each(?))'; params.push(allowedAnchors); }
       if (request.since !== undefined) { sql += ' AND d.time_ms>=?'; params.push(request.since); }
       if (request.until !== undefined) { sql += ' AND d.time_ms<=?'; params.push(request.until); }
       if (!isLong && candidates) { sql += ' AND d.anchor IN (SELECT value FROM json_each(?))'; params.push(JSON.stringify([...candidates])); }
-      const rows = db.prepare(sql).all(...params);
+      sql += ` ORDER BY d.time_ms DESC,CASE d.kind WHEN 'final' THEN 0 WHEN 'group' THEN 1 WHEN 'inbound' THEN 2 WHEN 'reply' THEN 3 ELSE 4 END,d.id LIMIT ?`;
+      params.push(candidateLimit + 1);
+      const selectedRows = db.prepare(sql).all(...params);
+      if (selectedRows.length > candidateLimit) candidateTruncated = true;
+      const rows = selectedRows.slice(0,candidateLimit);
       const anchors = new Set<string>();
       for (const raw of rows) {
         const doc = parseHit(raw);
@@ -176,11 +202,12 @@ export function searchTopics(dataDir: string, input: SearchRequest, providedBots
       }
       if (isLong) candidates = candidates ? new Set([...candidates].filter(anchor => anchors.has(anchor))) : anchors;
     }
-    const sessions = indexSessions(options.sessions ?? readTopicSessions(dataDir).sessions);
+    const sessions = indexSessions(scopedSessions ?? readTopicSessions(dataDir).sessions);
     const bots = configuredBots(providedBots);
     const botApps = new Set(bots.filter(bot => bot.name === request.bot).map(bot => bot.larkAppId));
     const ranked: Array<{ anchor: string; docs: MatchingHit[]; lastActiveAt: number; notes: HitNotes }> = [];
     for (const [anchor,group] of matching) {
+      if (effectiveAnchors && !effectiveAnchors.has(anchor)) continue;
       if (group.terms.size !== request.terms.length) continue;
       const topicSessions = sessions.byAnchor.get(anchor) ?? [];
       if (request.bot && !topicSessions.some(session => session.larkAppId === request.bot
@@ -212,7 +239,7 @@ export function searchTopics(dataDir: string, input: SearchRequest, providedBots
           ? bots.find(bot => bot.larkAppId === doc.lark_app_id)?.name ?? doc.lark_app_id ?? undefined : undefined,
       })) } };
     });
-    return { query: request.query,results,truncated: ranked.length > request.limit };
+    return { query: request.query,results,truncated: candidateTruncated || ranked.length > request.limit };
   } finally { db.close(); }
 }
 

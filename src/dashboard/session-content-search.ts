@@ -1,8 +1,6 @@
-import type { Session } from '../types.js';
 import type { searchTopics, TopicSearchOptions } from '../services/topic-search/query.js';
 import type { SessionBoardAudience } from './public-redact.js';
 
-const SNAPSHOT_MAX_AGE_MS = 5_000;
 const WARN_INTERVAL_MS = 10 * 60_000;
 const READ_BUSY_TIMEOUT_MS = 250;
 
@@ -17,33 +15,27 @@ export interface ContentSearchResult<T> {
   contentSearch: 'ok' | 'not_allowed' | 'too_short' | 'unavailable';
 }
 interface ContentSearchDependencies {
-  search(request: Parameters<typeof searchTopics>[1], options: TopicSearchOptions): ReturnType<typeof searchTopics>;
-  readSessions(): readonly Session[];
+  search(request: Parameters<typeof searchTopics>[1], options: TopicSearchOptions): ReturnType<typeof searchTopics> | Promise<ReturnType<typeof searchTopics>>;
   now(): number;
   warn(reason: string): void;
 }
 
-/** All I/O is supplied by the caller; one Dashboard instance owns this cache. */
+/** All session-store/SQLite I/O belongs to the supplied query worker. */
 export function createSessionContentSearch(deps: ContentSearchDependencies) {
-  let snapshot: { sessions: readonly Session[]; at: number } | undefined;
   const warned = new Map<string, number>();
-  return function searchSessionContent<T extends { sessionId: string }>(
+  return async function searchSessionContent<T extends { sessionId: string }>(
     query: string, audience: SessionBoardAudience, rows: readonly T[],
-  ): ContentSearchResult<T> {
+  ): Promise<ContentSearchResult<T>> {
     const empty = (contentSearch: ContentSearchResult<T>['contentSearch']): ContentSearchResult<T> => ({
       sessions: [], contentMatches: [], contentSearch,
     });
     if (audience === 'anonymous') return empty('not_allowed');
     if (Array.from(query.replace(/\s/g, '')).length < 2) return empty('too_short');
     try {
-      const now = deps.now();
-      if (!snapshot || now - snapshot.at >= SNAPSHOT_MAX_AGE_MS) {
-        snapshot = { sessions: deps.readSessions(), at: now };
-      }
-      const result = deps.search({ query, limit: 20, hits: 1 }, {
-        sessions: snapshot.sessions, busyTimeoutMs: READ_BUSY_TIMEOUT_MS,
-      });
       const byId = new Map(rows.map(row => [row.sessionId, row]));
+      const result = await deps.search({ query, limit: 20, hits: 1 }, {
+        visibleSessionIds: new Set(byId.keys()), candidateLimit: 5_000, busyTimeoutMs: READ_BUSY_TIMEOUT_MS,
+      });
       const sessions: T[] = [];
       const contentMatches: ContentMatch[] = [];
       const seen = new Set<string>();

@@ -43,7 +43,7 @@ describe('Dashboard browser content search store', () => {
     const before = request.mock.calls.length;
     await store.searchContent(' \u0000 ');
     expect(request).toHaveBeenCalledTimes(before);
-    expect(store.getSnapshot().contentSearch.matches.size).toBe(0);
+    expect(store.getSnapshot().contentSearch.get('default')!.matches.size).toBe(0);
   });
 
   it('drops an older response before merging its rows or snippets', async () => {
@@ -54,8 +54,8 @@ describe('Dashboard browser content search store', () => {
     current.resolve(page('new', 'current answer')); await second;
     old.resolve(page('old', 'stale answer')); await first;
     expect([...store.sessions.keys()]).toEqual(['new']);
-    expect(store.getSnapshot().contentSearch.query).toBe('current');
-    expect([...store.getSnapshot().contentSearch.matches.keys()]).toEqual(['new']);
+    expect(store.getSnapshot().contentSearch.get('default')!.query).toBe('current');
+    expect([...store.getSnapshot().contentSearch.get('default')!.matches.keys()]).toEqual(['new']);
   });
 
   it('retries after snapshot replacement and replays SSE received while the content page was pending', async () => {
@@ -73,7 +73,7 @@ describe('Dashboard browser content search store', () => {
     await pending;
     expect(store.sessions.get('history')).toMatchObject({ title: 'SSE title', status: 'closed' });
     expect(store.getSnapshot().closedCursor).toBe('older');
-    expect(store.getSnapshot().contentSearch.matches.has('history')).toBe(true);
+    expect(store.getSnapshot().contentSearch.get('default')!.matches.has('history')).toBe(true);
   });
 
   it('keeps existing rows authoritative and silently degrades request failures or unavailable responses', async () => {
@@ -86,9 +86,35 @@ describe('Dashboard browser content search store', () => {
     await store.searchContent('needle');
     expect(store.sessions.get('s1')?.title).toBe('current row');
     await expect(store.searchContent('offline')).resolves.toBeUndefined();
-    expect(store.getSnapshot().contentSearch.matches.size).toBe(0);
+    expect(store.getSnapshot().contentSearch.get('default')!.matches.size).toBe(0);
     await store.searchContent('unavailable');
-    expect(store.getSnapshot().contentSearch.matches.size).toBe(0);
+    expect(store.getSnapshot().contentSearch.get('default')!.matches.size).toBe(0);
     expect(store.sessions.get('s1')?.title).toBe('current row');
+  });
+
+  it('keeps Workbench matches when the command palette searches and closes, and deduplicates identical queries per consumer', async () => {
+    const request = vi.fn(async (path: string) => {
+      const query = new URL(path, 'http://localhost').searchParams.get('q') ?? '';
+      return page(query, `${query} answer`);
+    });
+    const store = new Store(request);
+    store.replaceSessionsSnapshot([], { closedCursor: null, closedTotal: 0 });
+    await store.searchContent('workbench','workbench');
+    await store.searchContent('palette','command-palette');
+    // Closing the palette issues no new Workbench request; its existing snapshot must survive.
+    expect(contentMatchesForQuery(store.getSnapshot().contentSearch, 'workbench', 'workbench').has('workbench')).toBe(true);
+    expect(contentMatchesForQuery(store.getSnapshot().contentSearch, 'palette', 'command-palette').has('palette')).toBe(true);
+
+    const shared = deferred<Response>();
+    const sameQuery = vi.fn(() => shared.promise.then(() => page('shared')));
+    const concurrent = new Store(sameQuery);
+    concurrent.replaceSessionsSnapshot([], { closedCursor: null, closedTotal: 0 });
+    const workbench = concurrent.searchContent('shared','workbench');
+    const palette = concurrent.searchContent('shared','command-palette');
+    shared.resolve(page('shared'));
+    await Promise.all([workbench,palette]);
+    expect(sameQuery).toHaveBeenCalledTimes(2);
+    expect(contentMatchesForQuery(concurrent.getSnapshot().contentSearch, 'shared', 'workbench').has('shared')).toBe(true);
+    expect(contentMatchesForQuery(concurrent.getSnapshot().contentSearch, 'shared', 'command-palette').has('shared')).toBe(true);
   });
 });

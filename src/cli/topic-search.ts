@@ -85,6 +85,7 @@ export async function topicSearchCommand(args: readonly string[], io: {
       const sync = await syncTopicIndex(dataDir,{ rebuild: parsed.rebuild });
       io.out(JSON.stringify({ schema: 'botmux.topic-search.v1',...sync,...readTopicStatus(dataDir,'query') })+'\n'); return 0;
     }
+    if (!topicSearchEnabled()) throw new TopicIndexError('话题检索已关闭');
     const status = readTopicStatus(dataDir,'query');
     if (!status.available) throw new TopicIndexError('索引尚未建立或不可用：确认 botmux status 里有 topic-index，或执行 botmux topic reindex --rebuild');
     if (parsed.command === 'search') {

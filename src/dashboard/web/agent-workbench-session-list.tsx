@@ -230,9 +230,9 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
   const touchRows = useTouchRowMetrics();
   const [query, setQuery] = useState('');
   // 首屏只带最近的已关闭会话：搜索时去服务端补查更早的已关闭会话（合进 store 后按本地规则过滤）。
-  useClosedHistorySearch(query);
+  useClosedHistorySearch(query, undefined, 'workbench');
   const snapshot = useDashboardStore();
-  const contentIds = useMemo(() => new Set(contentMatchesForQuery(snapshot.contentSearch, query).keys()),
+  const contentIds = useMemo(() => new Set(contentMatchesForQuery(snapshot.contentSearch, query, 'workbench').keys()),
     [snapshot.contentSearch, query]);
   const [scrollTop, setScrollTop] = useState(0);
   const scrollerRef = useRef<HTMLDivElement | null>(null);

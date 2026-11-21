@@ -115,6 +115,18 @@ describe('topic CLI', () => {
     vi.spyOn(indexStore,'syncTopicIndex').mockRejectedValueOnce(new TopicIndexError('lock timeout',5));
     expect((await command(['reindex'])).code).toBe(5);
   });
+  it('refuses search and show while disabled even when a readable old index remains', async () => {
+    seed(); expect((await command(['reindex'])).code).toBe(0);
+    vi.stubEnv('BOTMUX_TOPIC_SEARCH','0');
+    for (const args of [['search','needle'],['show','om_message']]) {
+      const result = await command(args);
+      expect(result).toMatchObject({ code: 4,out: '' });
+      expect(result.err).toContain('话题检索已关闭');
+    }
+    const status = await command(['status']);
+    expect(status.code).toBe(0);
+    expect(JSON.parse(status.out).indexer.state).toBe('disabled');
+  });
   it('uses the same persisted lifecycle setting as supervisor startup', async () => {
     const directory = join(homedir(),'.botmux'); mkdirSync(directory,{ recursive: true });
     const path = join(directory,'.env');

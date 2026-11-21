@@ -254,9 +254,9 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
 
   // 首屏只带最近的已关闭会话：有查询词时去服务端补查更早的已关闭会话，合进 store 后
   // 和其它会话一起参与下面的匹配与排序（#2071：会话含已关闭的历史会话都能搜）。
-  useClosedHistorySearch(open && (scope === 'all' || scope === 'session') ? deferredQuery : '');
+  useClosedHistorySearch(open && (scope === 'all' || scope === 'session') ? deferredQuery : '', undefined, 'command-palette');
 
-  const contentMatches = useMemo(() => contentMatchesForQuery(snapshot.contentSearch, deferredQuery),
+  const contentMatches = useMemo(() => contentMatchesForQuery(snapshot.contentSearch, deferredQuery, 'command-palette'),
     [snapshot.contentSearch, deferredQuery]);
 
   // 每次唤起都是新实例：会话条目按行对象缓存到本次关闭为止，相对时间以唤起时刻为准。

@@ -46,7 +46,7 @@ describe('content hits in palette and Workbench models', () => {
     expect(loaded.find(item => item.key === 'session:content-a')?.excerpt).toBe('风险初稿');
     const changed = buildSessionItems(rows, 5000, cache, matches([['content-a', 0, '风险修订']]));
     expect(changed.find(item => item.key === 'session:content-a')?.excerpt).toBe('风险修订');
-    const stale = { query: '风险', matches: content };
+    const stale = new Map([['default',{ query: '风险', matches: content }]]);
     const eligible = contentMatchesForQuery(stale, '另一个词');
     const next = buildSessionItems(rows, 5000, cache, eligible);
     expect(next.every(item => item.excerpt === undefined)).toBe(true);

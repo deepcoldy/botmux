@@ -27,7 +27,7 @@ describe('shared metadata and content search debounce', () => {
     expect(searches.searchContent).not.toHaveBeenCalled();
     await act(async () => { await vi.advanceTimersByTimeAsync(1); });
     expect(searches.searchClosedSessions).toHaveBeenCalledExactlyOnceWith('new');
-    expect(searches.searchContent).toHaveBeenCalledExactlyOnceWith('new');
+    expect(searches.searchContent).toHaveBeenCalledExactlyOnceWith('new','default');
     act(() => { renderer?.update(createElement(Probe, { query: '', searches })); });
     await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
     expect(searches.searchContent).toHaveBeenCalledTimes(1);
@@ -38,7 +38,7 @@ describe('shared metadata and content search debounce', () => {
       searchContent: vi.fn<(query: string) => Promise<void>>().mockResolvedValue(undefined) };
     act(() => { renderer = TestRenderer.create(createElement(Probe, { query: 'needle', searches })); });
     await act(async () => { await vi.advanceTimersByTimeAsync(250); });
-    expect(searches.searchContent).toHaveBeenCalledExactlyOnceWith('needle');
+    expect(searches.searchContent).toHaveBeenCalledExactlyOnceWith('needle','default');
     expect(searches.searchClosedSessions).toHaveBeenCalledExactlyOnceWith('needle');
   });
 });

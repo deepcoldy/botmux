@@ -14,13 +14,17 @@ export const CLOSED_HISTORY_SEARCH_DEBOUNCE_MS = 250;
  * Best effort on purpose: a failed lookup leaves the already-loaded results on
  * screen, and a toast per keystroke would be noise. Pass '' to disable.
  */
-export function useClosedHistorySearch(query: string, searches: Pick<typeof store, 'searchClosedSessions' | 'searchContent'> = store): void {
+export function useClosedHistorySearch(
+  query: string,
+  searches: Pick<typeof store, 'searchClosedSessions' | 'searchContent'> = store,
+  owner = 'default',
+): void {
   useEffect(() => {
     if (!query.trim()) return undefined;
     const timer = setTimeout(() => {
       searches.searchClosedSessions(query).catch(() => undefined);
-      searches.searchContent(query).catch(() => undefined);
+      searches.searchContent(query,owner).catch(() => undefined);
     }, CLOSED_HISTORY_SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [query, searches]);
+  }, [query, searches, owner]);
 }

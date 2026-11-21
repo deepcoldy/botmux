@@ -462,6 +462,17 @@ if (!topicReady || topicRow?.status !== 'online' || !alive(topicRow.pid) || topi
   fail('topic-index',`expected online with zero restarts: ${JSON.stringify(topicRow)}`);
 }
 console.log('smoke: ✅ topic-index — online, 0 restarts');
+const queryResultPath = join(home,'topic-query-result.json');
+execFileSync(binary,['__topic-search-query',queryResultPath],{
+  cwd: home,env: childEnv,encoding: 'utf8',timeout: 5000,
+  input: JSON.stringify({ dataDir: join(home,'.botmux','data'),request: { query: 'smoke',limit: 1,hits: 1 },options: { sessions: [] } }),
+  stdio: ['pipe','ignore','pipe'],
+});
+const queryEnvelope = JSON.parse(readFileSync(queryResultPath,'utf8'));
+if (!queryEnvelope.ok || !Array.isArray(queryEnvelope.result?.results)) {
+  fail('topic-search-query',`compiled query worker failed: ${JSON.stringify(queryEnvelope)}`);
+}
+console.log('smoke: ✅ topic-search-query — compiled worker returns a query envelope');
 
 // ── 4. the dashboard actually serves ────────────────────────────────────────
 // ANY HTTP status proves the listener bound (an unauthenticated `/` legitimately

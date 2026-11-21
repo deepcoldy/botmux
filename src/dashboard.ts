@@ -1,7 +1,7 @@
 import { selectSessionPage } from './dashboard/session-pagination.js';
 import { createSessionContentSearch } from './dashboard/session-content-search.js';
-import { searchTopics, TopicIndexError } from './services/topic-search/query.js';
-import { readTopicSessions } from './services/topic-search/sources.js';
+import { TopicIndexError } from './services/topic-search/query.js';
+import { queryTopicSearchOffMainThread } from './dashboard/topic-search-client.js';
 import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -941,9 +941,8 @@ const previewGuardPage = createPreviewGuardPage({
 const sessionContentSearch = createSessionContentSearch({
   search: (request, options) => {
     if (process.env.BOTMUX_TOPIC_SEARCH === '0') throw new TopicIndexError('topic_search_disabled');
-    return searchTopics(config.session.dataDir, request, undefined, options);
+    return queryTopicSearchOffMainThread(config.session.dataDir, request, options);
   },
-  readSessions: () => readTopicSessions(config.session.dataDir).sessions,
   now: Date.now,
   warn: reason => logger.warn(`[dashboard] content search unavailable: ${reason}`),
 });
@@ -4981,7 +4980,7 @@ const server = createServer(async (req, res) => {
           ],
         });
         if (url.searchParams.get('view') === 'content') {
-          page = sessionContentSearch(url.searchParams.get('q') ?? '', sessionBoardAudience, rows);
+          page = await sessionContentSearch(url.searchParams.get('q') ?? '', sessionBoardAudience, rows);
         }
       }
       catch (error) {

@@ -1,4 +1,5 @@
 import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, readdirSync } from 'node:fs';
+import { createHash, type Hash } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { sessionQueueAnchor } from '../../core/session-message-preview.js';
@@ -80,11 +81,28 @@ const replySchema = z.object({
 export type InboundRow = z.infer<typeof inboundSchema>;
 export type ReplyRow = z.infer<typeof replySchema>;
 export type JsonlRow = { kind: 'inbound'; value: InboundRow } | { kind: 'reply'; value: ReplyRow };
-export interface JsonlCursor { revision: FileRevision; offset: number }
+export interface JsonlCursor { revision: FileRevision; offset: number; fingerprint: string | null }
 export interface JsonlPage {
   status: 'ready' | 'absent' | 'unreadable'; reset: boolean;
   rows: { offset: number; row: JsonlRow }[]; cursor?: JsonlCursor;
   malformedLines: number; hasMore: boolean;
+}
+
+/** Stream the complete consumed prefix. One hash verifies the old cursor while
+ * the other continues with the next complete page, avoiding a second prefix read. */
+function readPrefix(fd: number, offset: number): { continued: Hash;value: string } | null {
+  const continued = createHash('sha256');
+  const verification = createHash('sha256');
+  const bytes = Buffer.alloc(64 * 1024);
+  let position = 0;
+  while (position < offset) {
+    const count = readSync(fd,bytes,0,Math.min(bytes.length,offset-position),position);
+    if (!count) return null;
+    const chunk = bytes.subarray(0,count);
+    continued.update(chunk); verification.update(chunk);
+    position += count;
+  }
+  return { continued,value: verification.digest('hex') };
 }
 
 /** Offsets count bytes, including malformed rows; a partial UTF-8 line stays unconsumed. */
@@ -96,9 +114,16 @@ export function readJsonlPage(source: SourceFile, previous?: JsonlCursor): Jsonl
     const stat = fstatSync(fd);
     if (!stat.isFile()) return { ...empty, status: 'unreadable', reset: true };
     const revision: FileRevision = { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs };
-    const reset = !previous || previous.revision.dev !== revision.dev || previous.revision.ino !== revision.ino
+    let reset = !previous || previous.revision.dev !== revision.dev || previous.revision.ino !== revision.ino
       || revision.size < previous.revision.size;
-    const start = reset ? 0 : previous.offset;
+    let prefixHash: Hash | undefined;
+    if (!reset && previous && previous.offset > 0) {
+      const prefix = previous.fingerprint ? readPrefix(fd,previous.offset) : undefined;
+      if (!prefix || prefix.value !== previous.fingerprint) reset = true;
+      else prefixHash = prefix.continued;
+    }
+    const start = reset || !previous ? 0 : previous.offset;
+    if (!prefixHash) prefixHash = createHash('sha256');
     const chunks: Buffer[] = [];
     let position = start;
     let completeLength = 0;
@@ -137,8 +162,11 @@ export function readJsonlPage(source: SourceFile, previous?: JsonlCursor): Jsonl
         }
       } catch { malformedLines++; }
     }
+    const offset = start + completeLength;
+    prefixHash.update(bytes);
+    const fingerprint = offset > 0 ? prefixHash.digest('hex') : null;
     return { status: 'ready', reset, rows, malformedLines,
-      cursor: { revision, offset: start + completeLength }, hasMore: position < revision.size };
+      cursor: { revision, offset, fingerprint }, hasMore: position < revision.size };
   } catch (error) {
     const absent = error instanceof Error && 'code' in error && error.code === 'ENOENT';
     return { ...empty, status: absent ? 'absent' : 'unreadable', reset: true };

@@ -39,7 +39,7 @@ export interface StoreSnapshot {
   closedTotal: number;
   /** Changes only when an authoritative session snapshot replaces cached rows. */
   sessionSnapshotVersion: number;
-  contentSearch: ContentSearchSnapshot;
+  contentSearch: ReadonlyMap<string, ContentSearchSnapshot>;
 }
 
 /** A page read whose snapshot generation was replaced while it was in flight. */
@@ -56,9 +56,12 @@ export function normalizeSessionSearchQuery(query: string): string {
     .slice(0, SESSION_QUERY_MAX_LENGTH).trim();
 }
 const NO_CONTENT_MATCHES: ReadonlyMap<string, ContentSearchMatch> = new Map();
-export function contentMatchesForQuery(snapshot: ContentSearchSnapshot, query: string): ReadonlyMap<string, ContentSearchMatch> {
+export function contentMatchesForQuery(
+  snapshots: ReadonlyMap<string, ContentSearchSnapshot>, query: string, owner = 'default',
+): ReadonlyMap<string, ContentSearchMatch> {
   const normalized = normalizeSessionSearchQuery(query);
-  return normalized && normalized === snapshot.query ? snapshot.matches : NO_CONTENT_MATCHES;
+  const snapshot = snapshots.get(owner);
+  return normalized && snapshot && normalized === snapshot.query ? snapshot.matches : NO_CONTENT_MATCHES;
 }
 
 export class Store {
@@ -77,7 +80,8 @@ export class Store {
   private historyLoad: Promise<void> | null = null;
   private sessionReadEvents = new Set<Array<{ type: string; body: Record<string, unknown> }>>();
   private contentRequest = 0;
-  private contentSearch: ContentSearchSnapshot = { query: '', matches: NO_CONTENT_MATCHES };
+  private contentRequests = new Map<string, number>();
+  private contentSearch = new Map<string, ContentSearchSnapshot>();
   private version = 0;
   private snapshot: StoreSnapshot = {
     sessions: this.sessions,
@@ -208,44 +212,51 @@ export class Store {
     ), false).then(() => undefined);
   }
 
-  /** Content can belong to active rows too; never gate it on the history cursor. */
-  searchContent(query: string): Promise<void> {
+  /** Content can belong to active rows too; never gate it on the history cursor.
+   * Each mounted consumer owns an independent query generation and snapshot. */
+  searchContent(query: string, owner = 'default'): Promise<void> {
     const q = normalizeSessionSearchQuery(query);
     const request = ++this.contentRequest;
-    this.contentSearch = { query: q, matches: NO_CONTENT_MATCHES };
+    this.contentRequests.set(owner,request);
+    this.contentSearch.set(owner,{ query: q,matches: NO_CONTENT_MATCHES });
     this.emit();
     if (!q) return Promise.resolve();
-    return this.readCurrent(() => request === this.contentRequest
+    return this.readCurrent(() => this.contentRequests.get(owner) === request
       ? `/api/sessions?view=content&q=${encodeURIComponent(q)}` : null, false, page => {
-      if (request !== this.contentRequest) return false;
+      if (this.contentRequests.get(owner) !== request) return false;
       const matches = new Map<string, ContentSearchMatch>();
       if (page.contentSearch === 'ok') {
         for (const [rank, match] of (page.contentMatches ?? []).entries()) {
           matches.set(match.sessionId, { snippet: match.snippet, time: match.time, rank });
         }
       }
-      this.contentSearch = { query: q, matches };
+      this.contentSearch.set(owner,{ query: q,matches });
       return true;
-    }).then(() => undefined).catch(() => undefined);
+    }, owner).then(() => undefined).catch(() => undefined);
   }
 
   /** Read one page; when a snapshot replacement made it stale, retry once against
    *  the new snapshot. Resolves to the number of rows added, or null when there is
    *  nothing left to read or the retry went stale too. */
-  private async readCurrent(path: () => string | null, history: boolean, accept?: (page: SessionPageResponse) => boolean): Promise<number | null> {
+  private async readCurrent(
+    path: () => string | null, history: boolean,
+    accept?: (page: SessionPageResponse) => boolean, dedupKey = '',
+  ): Promise<number | null> {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const next = path();
       if (next === null) return null;
-      const result = await this.readSessionPage(next, history, accept);
+      const result = await this.readSessionPage(next, history, accept, dedupKey);
       if (result !== STALE_PAGE) return result;
     }
     return null;
   }
 
   /** Merge missing rows, replay racing session events, and discard responses from an older snapshot. */
-  private readSessionPage(path: string, history: boolean, accept?: (page: SessionPageResponse) => boolean): Promise<number | typeof STALE_PAGE> {
+  private readSessionPage(
+    path: string, history: boolean, accept?: (page: SessionPageResponse) => boolean, dedupKey = '',
+  ): Promise<number | typeof STALE_PAGE> {
     const generation = this.sessionGeneration;
-    const key = `${generation}:${path}`;
+    const key = `${generation}:${path}:${dedupKey}`;
     const existing = this.sessionReads.get(key);
     if (existing) return existing;
     const events: Array<{ type: string; body: Record<string, unknown> }> = [];

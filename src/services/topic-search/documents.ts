@@ -8,12 +8,12 @@ import type { GroupMessage } from './group-context.js';
 export const entryKindSchema = z.enum(['inbound', 'reply', 'final', 'group', 'title']);
 export const entrySchema = z.object({
   source_path: z.string(), source_key: z.string(), kind: entryKindSchema,
-  anchor: z.string(), dedup_key: z.string(), message_id: z.string().nullable(), session_id: z.string().nullable(),
+  anchor: z.string(), anchor_explicit: z.number().int().min(0).max(1), dedup_key: z.string(), message_id: z.string().nullable(), session_id: z.string().nullable(),
   lark_app_id: z.string().nullable(), sender_type: z.string().nullable(), sender_id: z.string().nullable(),
   sender_name: z.string().nullable(), time_ms: z.number().nullable(), text: z.string(),
 });
 export type Entry = z.infer<typeof entrySchema>;
-export const docSchema = entrySchema.omit({ source_path: true, source_key: true }).extend({
+export const docSchema = entrySchema.omit({ source_path: true, source_key: true, anchor_explicit: true }).extend({
   id: z.number(), sources: z.string().transform(value => z.array(entryKindSchema).parse(JSON.parse(value))),
 });
 export type TopicDocument = z.infer<typeof docSchema>;
@@ -25,7 +25,7 @@ export function timeMs(value: string | number | undefined): number | null {
   return Number.isFinite(number) ? number : null;
 }
 function base(source: SourceFile, key: string): Entry {
-  return { source_path: source.relativePath, source_key: key, kind: 'title', anchor: '', dedup_key: '',
+  return { source_path: source.relativePath, source_key: key, kind: 'title', anchor: '', anchor_explicit: 0, dedup_key: '',
     message_id: null, session_id: null, lark_app_id: null, sender_type: null, sender_id: null,
     sender_name: null, time_ms: null, text: '' };
 }
@@ -38,19 +38,21 @@ export function replyEntry(source: SourceFile, offset: number, row: ReplyRow, lo
   if (!row.previewText) return undefined;
   const sessionId = row.sessionId ?? source.key;
   const session = lookup(sessionId);
-  const anchor = session ? sessionQueueAnchor(session) : row.targetRootMessageId ?? row.targetChatId;
+  const explicitAnchor = row.targetRootMessageId || row.targetChatId;
+  const anchor = explicitAnchor || (session ? sessionQueueAnchor(session) : undefined);
   if (!anchor) return undefined;
   const hash = row.contentHash ?? createHash('sha256').update(row.previewText).digest('hex');
-  return { ...base(source, String(offset)), kind: 'reply', anchor, message_id: row.messageId ?? null,
+  return { ...base(source, String(offset)), kind: 'reply', anchor, anchor_explicit: explicitAnchor ? 1 : 0, message_id: row.messageId ?? null,
     dedup_key: row.messageId ?? `reply:${JSON.stringify([sessionId, row.sentAtMs, hash])}`,
     session_id: sessionId, lark_app_id: session?.larkAppId ?? null, sender_type: 'bot',
     time_ms: row.sentAtMs, text: row.previewText };
 }
 export function finalEntry(source: SourceFile, row: FinalOutput, lookup: SessionLookup): Entry | undefined {
   const session = lookup(row.sessionId);
-  const anchor = session ? sessionQueueAnchor(session) : row.rootMessageId ?? row.chatId;
+  const explicitAnchor = row.rootMessageId || row.chatId;
+  const anchor = explicitAnchor || (session ? sessionQueueAnchor(session) : undefined);
   if (!anchor) return undefined;
-  return { ...base(source, row.id), kind: 'final', anchor, dedup_key: row.messageId ?? `final:${row.id}`,
+  return { ...base(source, row.id), kind: 'final', anchor, anchor_explicit: explicitAnchor ? 1 : 0, dedup_key: row.messageId ?? `final:${row.id}`,
     message_id: row.messageId ?? null, session_id: row.sessionId, lark_app_id: source.key,
     sender_type: 'bot', time_ms: row.createdAt, text: row.text };
 }

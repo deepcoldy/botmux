@@ -172,4 +172,25 @@ describe('FTS and LIKE topic search', () => {
     expect(readFileSync(path)).toEqual(before); expect(statSync(path).mtimeMs).toBe(mtime);
     expect(readFileSync(source)).toEqual(sourceBefore); expect(statSync(source).mtimeMs).toBe(sourceTime);
   });
+
+  it('restricts visible anchors before ranking and bounds candidate materialization', async () => {
+    topic('om_newest'); const visible = topic('om_visible'); topic('om_oldest');
+    queue('om_newest',[{ id: 'om_n',text: 'needle newest',time: 3000 }]);
+    queue('om_visible',[{ id: 'om_v',text: 'needle visible',time: 2000 }]);
+    queue('om_oldest',[{ id: 'om_o',text: 'needle oldest',time: 1000 }]);
+    await syncTopicIndex(dataDir);
+    expect(searchTopics(dataDir,{ query: 'needle',limit: 1 },bots,{ anchors: new Set(['om_visible']) }).results)
+      .toEqual([expect.objectContaining({ anchor: 'om_visible' })]);
+    expect(searchTopics(dataDir,{ query: 'needle',limit: 1 },bots,{ visibleSessionIds: new Set([visible.sessionId]) }).results)
+      .toEqual([expect.objectContaining({ anchor: 'om_visible' })]);
+    expect(searchTopics(dataDir,{ query: 'needle' },bots,{ anchors: new Set() }).results).toEqual([]);
+
+    queue('om_many',Array.from({ length: 30 },(_,i) => ({ id: `om_many_${i}`,text: 'budget needle',time: i+1 })));
+    await syncTopicIndex(dataDir);
+    const full = searchTopics(dataDir,{ query: 'budget',hits: 20 },bots).results.find(result => result.anchor === 'om_many');
+    const bounded = searchTopics(dataDir,{ query: 'budget',hits: 20 },bots,{ candidateLimit: 5 });
+    expect(full?.hits.count).toBe(30);
+    expect(bounded.results.find(result => result.anchor === 'om_many')?.hits.count).toBe(5);
+    expect(bounded.truncated).toBe(true);
+  });
 });

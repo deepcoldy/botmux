@@ -14,18 +14,18 @@ import { entrySchema, docSchema, finalEntry, groupEntry, inboundEntry, kindPrior
   type Entry } from './documents.js';
 
 const APPLICATION_ID = 0x42545331;
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const TABLES = ['sync_meta', 'sources', 'gc_chat_state', 'gc_pending', 'entries', 'docs', 'recalled',
   'docs_fts', 'docs_fts_data', 'docs_fts_idx', 'docs_fts_docsize', 'docs_fts_config'];
 const SCHEMA = `
 CREATE TABLE sync_meta(singleton INTEGER PRIMARY KEY CHECK(singleton=1),last_sync_started_at INTEGER,last_sync_finished_at INTEGER,last_full_check_at INTEGER,last_skipped INTEGER,last_malformed_lines INTEGER) STRICT;
 INSERT INTO sync_meta(singleton) VALUES(1);
 CREATE TABLE sources(path TEXT PRIMARY KEY,kind TEXT NOT NULL,dev INTEGER,ino INTEGER,size INTEGER,mtime_ms REAL,
- wal_size INTEGER,wal_mtime_ms REAL,offset INTEGER NOT NULL DEFAULT 0,cursor_seq INTEGER,cursor_updated_at INTEGER) STRICT;
+ wal_size INTEGER,wal_mtime_ms REAL,offset INTEGER NOT NULL DEFAULT 0,cursor_seq INTEGER,cursor_updated_at INTEGER,cursor_fingerprint TEXT) STRICT;
 CREATE TABLE gc_chat_state(source_path TEXT NOT NULL,chat_id TEXT NOT NULL,pruned_count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source_path,chat_id)) STRICT;
 CREATE TABLE gc_pending(source_path TEXT NOT NULL,seq INTEGER NOT NULL,reason TEXT NOT NULL,anchor TEXT,PRIMARY KEY(source_path,seq)) STRICT;
 CREATE TABLE entries(id INTEGER PRIMARY KEY,source_path TEXT NOT NULL,source_key TEXT NOT NULL,kind TEXT NOT NULL,anchor TEXT NOT NULL,dedup_key TEXT NOT NULL,
- message_id TEXT,session_id TEXT,lark_app_id TEXT,sender_type TEXT,sender_id TEXT,sender_name TEXT,time_ms INTEGER,text TEXT NOT NULL,UNIQUE(source_path,source_key)) STRICT;
+ message_id TEXT,session_id TEXT,lark_app_id TEXT,sender_type TEXT,sender_id TEXT,sender_name TEXT,time_ms INTEGER,text TEXT NOT NULL,anchor_explicit INTEGER NOT NULL DEFAULT 0,UNIQUE(source_path,source_key)) STRICT;
 CREATE INDEX ix_entries_merge ON entries(anchor,dedup_key);
 CREATE TABLE docs(id INTEGER PRIMARY KEY,anchor TEXT NOT NULL,dedup_key TEXT NOT NULL,kind TEXT NOT NULL,sources TEXT NOT NULL,
  message_id TEXT,session_id TEXT,lark_app_id TEXT,sender_type TEXT,sender_id TEXT,sender_name TEXT,time_ms INTEGER,text TEXT NOT NULL,UNIQUE(anchor,dedup_key)) STRICT;
@@ -34,7 +34,7 @@ CREATE VIRTUAL TABLE docs_fts USING fts5(text,content='docs',content_rowid='id',
 export const sourceSchema = z.object({ path: z.string(), kind: z.enum(['queue','turn_sends','session_store','group_context','output_journal']),
   dev: z.number().nullable(), ino: z.number().nullable(), size: z.number().nullable(), mtime_ms: z.number().nullable(),
   wal_size: z.number().nullable(), wal_mtime_ms: z.number().nullable(), offset: z.number(),
-  cursor_seq: z.number().nullable(), cursor_updated_at: z.number().nullable() });
+  cursor_seq: z.number().nullable(), cursor_updated_at: z.number().nullable(), cursor_fingerprint: z.string().nullable() });
 type StoredSource = z.infer<typeof sourceSchema>;
 export class TopicIndexError extends Error {
   constructor(message: string, readonly exitCode: 4 | 5 = 4) { super(message); this.name = 'TopicIndexError'; }
@@ -137,14 +137,15 @@ function replaced(stored: StoredSource | undefined, current: SourceRevision): bo
   return !!stored && (stored.dev !== current.dev || stored.ino !== current.ino);
 }
 function saveSource(db: DatabaseSyncLike, source: SourceFile, revision: SourceRevision, progress: {
-  offset?: number; seq?: number; updatedAt?: number; complete: boolean;
+  offset?: number; seq?: number; updatedAt?: number; fingerprint?: string | null; complete: boolean;
 }): void {
-  db.prepare(`INSERT INTO sources(path,kind,dev,ino,size,mtime_ms,wal_size,wal_mtime_ms,offset,cursor_seq,cursor_updated_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind=excluded.kind,dev=excluded.dev,ino=excluded.ino,
+  db.prepare(`INSERT INTO sources(path,kind,dev,ino,size,mtime_ms,wal_size,wal_mtime_ms,offset,cursor_seq,cursor_updated_at,cursor_fingerprint)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET kind=excluded.kind,dev=excluded.dev,ino=excluded.ino,
     size=excluded.size,mtime_ms=excluded.mtime_ms,wal_size=excluded.wal_size,wal_mtime_ms=excluded.wal_mtime_ms,
-    offset=excluded.offset,cursor_seq=excluded.cursor_seq,cursor_updated_at=excluded.cursor_updated_at`)
+    offset=excluded.offset,cursor_seq=excluded.cursor_seq,cursor_updated_at=excluded.cursor_updated_at,cursor_fingerprint=excluded.cursor_fingerprint`)
     .run(source.relativePath, source.kind, revision.dev, revision.ino, revision.size, progress.complete ? revision.mtimeMs : null,
-      revision.wal?.size ?? null, revision.wal?.mtimeMs ?? null, progress.offset ?? 0, progress.seq ?? null, progress.updatedAt ?? null);
+      revision.wal?.size ?? null, revision.wal?.mtimeMs ?? null, progress.offset ?? 0, progress.seq ?? null, progress.updatedAt ?? null,
+      progress.fingerprint ?? null);
 }
 
 function touchEntry(db: DatabaseSyncLike, sourcePath: string, sourceKey: string, touched: Set<string>): void {
@@ -158,12 +159,12 @@ function removeEntry(db: DatabaseSyncLike, sourcePath: string, sourceKey: string
 function putEntry(db: DatabaseSyncLike, entry: Entry, touched: Set<string>): void {
   touchEntry(db, entry.source_path, entry.source_key, touched);
   touched.add(entry.dedup_key);
-  db.prepare(`INSERT INTO entries(source_path,source_key,kind,anchor,dedup_key,message_id,session_id,lark_app_id,sender_type,sender_id,sender_name,time_ms,text)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_path,source_key) DO UPDATE SET kind=excluded.kind,anchor=excluded.anchor,
+  db.prepare(`INSERT INTO entries(source_path,source_key,kind,anchor,dedup_key,message_id,session_id,lark_app_id,sender_type,sender_id,sender_name,time_ms,text,anchor_explicit)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_path,source_key) DO UPDATE SET kind=excluded.kind,anchor=excluded.anchor,
     dedup_key=excluded.dedup_key,message_id=excluded.message_id,session_id=excluded.session_id,lark_app_id=excluded.lark_app_id,
-    sender_type=excluded.sender_type,sender_id=excluded.sender_id,sender_name=excluded.sender_name,time_ms=excluded.time_ms,text=excluded.text`)
+    sender_type=excluded.sender_type,sender_id=excluded.sender_id,sender_name=excluded.sender_name,time_ms=excluded.time_ms,text=excluded.text,anchor_explicit=excluded.anchor_explicit`)
     .run(entry.source_path,entry.source_key,entry.kind,entry.anchor,entry.dedup_key,entry.message_id,entry.session_id,
-      entry.lark_app_id,entry.sender_type,entry.sender_id,entry.sender_name,entry.time_ms,entry.text);
+      entry.lark_app_id,entry.sender_type,entry.sender_id,entry.sender_name,entry.time_ms,entry.text,entry.anchor_explicit);
 }
 function removeSource(db: DatabaseSyncLike, path: string, touched: Set<string>): void {
   for (const raw of db.prepare('SELECT dedup_key FROM entries WHERE source_path=? UNION SELECT message_id AS dedup_key FROM recalled WHERE source_path=?').all(path,path)) {
@@ -241,7 +242,7 @@ function syncTitles(db: DatabaseSyncLike, source: SourceFile, sessions: readonly
 function reanchorEntries(db: DatabaseSyncLike, sessions: ReadonlyMap<string,Session | undefined>): void {
   const touched = new Set<string>();
   const changes = new Map<string,string>();
-  for (const raw of db.prepare("SELECT DISTINCT session_id,anchor FROM entries WHERE kind IN ('reply','final') AND session_id IS NOT NULL").all()) {
+  for (const raw of db.prepare("SELECT DISTINCT session_id,anchor FROM entries WHERE kind IN ('reply','final') AND session_id IS NOT NULL AND anchor_explicit=0").all()) {
     const { session_id: id,anchor: previous } = z.object({ session_id: z.string(),anchor: z.string() }).parse(raw);
     const session = sessions.get(id);
     if (!session) continue;
@@ -250,7 +251,7 @@ function reanchorEntries(db: DatabaseSyncLike, sessions: ReadonlyMap<string,Sess
   }
   if (!changes.size) return;
   for (const [id,anchor] of changes) {
-    for (const row of db.prepare(`UPDATE entries SET anchor=? WHERE session_id=? AND kind IN ('reply','final')
+    for (const row of db.prepare(`UPDATE entries SET anchor=? WHERE session_id=? AND kind IN ('reply','final') AND anchor_explicit=0
       AND anchor<>? RETURNING dedup_key`).all(anchor,id,anchor)) touched.add(z.object({ dedup_key: z.string() }).parse(row).dedup_key);
   }
   mergeDocuments(db,touched);
@@ -357,7 +358,8 @@ export async function syncTopicIndex(dataDir: string, options: {
             if (reset) { removeSource(db,source.relativePath,touched); old = undefined; pageAfter = undefined; }
             const pending = kind === 'group_context' && !!db.prepare(`SELECT 1 FROM gc_pending WHERE source_path=?
               AND (reason='unverified_card' OR (? AND reason='no_session')) LIMIT 1`).get(source.relativePath,sessionsChanged ? 1 : 0);
-            if (!reset && firstPage && sameRevision(old,revision) && !pending) return { more: false, changed: false };
+            const unchangedRevision = !reset && firstPage && sameRevision(old,revision) && !pending;
+            if (unchangedRevision && kind !== 'queue' && kind !== 'turn_sends') return { more: false, changed: false };
             if (kind === 'session_store') {
               if (loadSnapshot().unreadableAppIds.includes(source.key)) return { more: false,changed: false };
               syncTitles(db,source,sessionsByApp.get(source.key) ?? [],touched);
@@ -366,20 +368,27 @@ export async function syncTopicIndex(dataDir: string, options: {
               saveSource(db,source,revision,{ complete: false });
             } else if (kind === 'queue' || kind === 'turn_sends') {
               const previous = old && old.dev !== null && old.ino !== null && old.size !== null && old.mtime_ms !== null
-                ? { revision: { dev: old.dev, ino: old.ino, size: old.size, mtimeMs: old.mtime_ms }, offset: old.offset } : undefined;
+                ? { revision: { dev: old.dev, ino: old.ino, size: old.size, mtimeMs: old.mtime_ms }, offset: old.offset,
+                  fingerprint: old.cursor_fingerprint } : undefined;
               // A partially processed page has a NULL mtime; the other revision fields still own its offset.
               const cursor = previous ?? (old && old.dev !== null && old.ino !== null && old.size !== null
-                ? { revision: { dev: old.dev, ino: old.ino, size: old.size, mtimeMs: 0 }, offset: old.offset } : undefined);
+                ? { revision: { dev: old.dev, ino: old.ino, size: old.size, mtimeMs: 0 }, offset: old.offset,
+                  fingerprint: old.cursor_fingerprint } : undefined);
               const page = readJsonlPage(source,cursor);
               requireReadable(page.status);
+              if (unchangedRevision && !page.reset) return { more: false, changed: false };
               if (!page.cursor) throw new Error('topic_jsonl_cursor_missing');
+              // The reader can detect an in-place rewrite only after opening the
+              // file. Drop every old offset before replaying from byte zero.
+              if (page.reset && old) { removeSource(db,source.relativePath,touched); old = undefined; }
               result.malformedLines += page.malformedLines;
               for (const row of page.rows) {
                 const entry = row.row.kind === 'inbound' ? inboundEntry(source,row.offset,row.row.value)
                   : replyEntry(source,row.offset,row.row.value,lookupSession);
                 if (entry) putEntry(db,entry,touched);
               }
-              saveSource(db,source,{ ...page.cursor.revision, wal: null },{ offset: page.cursor.offset, complete: !page.hasMore });
+              saveSource(db,source,{ ...page.cursor.revision, wal: null },{ offset: page.cursor.offset,
+                fingerprint: page.cursor.fingerprint, complete: !page.hasMore });
               mergeDocuments(db,touched);
               return { more: page.hasMore, changed: true };
             } else if (kind === 'output_journal') {

@@ -70,8 +70,8 @@ describe('topic index synchronization and merge', () => {
     finally { db.close(); }
   });
 
-  it('rebuilds truncated or replaced JSONL files and removes deleted sources', async () => {
-    const path = jsonl('queues/om_root.jsonl',[inbound('om_old','old content longer than replacement')]);
+  it('rebuilds multi-line truncated or replaced JSONL files and removes deleted sources', async () => {
+    const path = jsonl('queues/om_root.jsonl',[inbound('om_old_1','old one'),inbound('om_old_2','old two'),inbound('om_old_3','old three')]);
     await syncTopicIndex(dataDir);
     writeFileSync(path,JSON.stringify(inbound('om_new','new'))+'\n');
     await syncTopicIndex(dataDir);
@@ -82,6 +82,38 @@ describe('topic index synchronization and merge', () => {
     expect(documents().map(doc => doc.message_id)).toEqual(['om_replaced']);
     rmSync(path); await syncTopicIndex(dataDir);
     expect(documents()).toEqual([]);
+  });
+
+  it('detects same-size and regrown in-place rewrites from the consumed cursor fingerprint', async () => {
+    const path = jsonl('queues/om_root.jsonl',[inbound('om_old1','aaaa'),inbound('om_old2','bbbb')]);
+    await syncTopicIndex(dataDir);
+    const size = statSync(path).size;
+    writeFileSync(path,[inbound('om_new1','cccc'),inbound('om_new2','dddd')].map(row => JSON.stringify(row)+'\n').join(''));
+    expect(statSync(path).size).toBe(size);
+    utimesSync(path,new Date(),new Date(Date.now()+1000));
+    await syncTopicIndex(dataDir);
+    expect(documents().map(doc => doc.message_id)).toEqual(['om_new1','om_new2']);
+    writeFileSync(path,[inbound('om_regrown_1','regrown '.repeat(20)),inbound('om_regrown_2','content '.repeat(20))]
+      .map(row => JSON.stringify(row)+'\n').join(''));
+    expect(statSync(path).size).toBeGreaterThan(size);
+    utimesSync(path,new Date(),new Date(Date.now()+2000));
+    await syncTopicIndex(dataDir);
+    expect(documents().map(doc => doc.message_id)).toEqual(['om_regrown_1','om_regrown_2']);
+  });
+
+  it('detects an earlier-line rewrite when the final line and revision metadata are unchanged', async () => {
+    const path = jsonl('queues/om_root.jsonl',[inbound('om_first','OLD_FIRST'),inbound('om_last','UNCHANGED_LAST')]);
+    await syncTopicIndex(dataDir);
+    const { size,mtimeMs } = statSync(path);
+    writeFileSync(path,[inbound('om_first','NEW_FIRST'),inbound('om_last','UNCHANGED_LAST')].map(row => JSON.stringify(row)+'\n').join(''));
+    utimesSync(path,mtimeMs/1000,mtimeMs/1000);
+    expect(statSync(path)).toMatchObject({ size,mtimeMs });
+    await syncTopicIndex(dataDir);
+    expect(documents().map(doc => ({ message_id: doc.message_id,text: doc.text }))).toEqual([
+      { message_id: 'om_first',text: 'NEW_FIRST' },{ message_id: 'om_last',text: 'UNCHANGED_LAST' },
+    ]);
+    expect(searchTopics(dataDir,{ query: 'OLD_FIRST' }).results).toEqual([]);
+    expect(searchTopics(dataDir,{ query: 'NEW_FIRST' }).results).toHaveLength(1);
   });
 
   it('a rebuild landing between two output-journal pages of another sync keeps every final answer', async () => {
@@ -169,41 +201,35 @@ describe('topic index synchronization and merge', () => {
     } finally { db.close(); }
   });
 
-  it('uses current session rows for replies and reanchors missing metadata when a session store appears', async () => {
+  it('uses current session rows for implicit replies and preserves explicit targets when metadata appears', async () => {
     const own = session('om_correct');
     renameSync(join(dataDir,'session-stores',app),join(dataDir,'saved_store'));
-    jsonl(`turn-sends/${own.sessionId}.jsonl`,[{ sessionId: own.sessionId,sentAtMs: 2000,previewText: 'reanchor body',targetRootMessageId: 'om_fallback' }]);
+    jsonl(`turn-sends/${own.sessionId}.jsonl`,[{ sessionId: own.sessionId,sentAtMs: 2000,previewText: 'explicit body',targetRootMessageId: 'om_explicit' }]);
     await syncTopicIndex(dataDir);
-    expect(searchTopics(dataDir,{ query: 'reanchor' }).results[0]).toMatchObject({ anchor: 'om_fallback',notes: ['meta_missing'] });
+    expect(searchTopics(dataDir,{ query: 'explicit' }).results[0]).toMatchObject({ anchor: 'om_explicit',notes: ['meta_missing'] });
     renameSync(join(dataDir,'saved_store'),join(dataDir,'session-stores',app));
     await syncTopicIndex(dataDir);
-    expect(searchTopics(dataDir,{ query: 'reanchor' }).results[0]).toMatchObject({ anchor: 'om_correct',notes: [] });
+    expect(searchTopics(dataDir,{ query: 'explicit' }).results[0].anchor).toBe('om_explicit');
     const fresh = session('om_fresh');
-    jsonl(`turn-sends/${fresh.sessionId}.jsonl`,[{ sessionId: fresh.sessionId,sentAtMs: 3000,previewText: 'fresh point read',targetRootMessageId: 'om_wrong' }]);
+    jsonl(`turn-sends/${fresh.sessionId}.jsonl`,[{ sessionId: fresh.sessionId,sentAtMs: 3000,previewText: 'implicit point read' }]);
     await syncTopicIndex(dataDir,{ paths: [`turn-sends/${fresh.sessionId}.jsonl`] });
-    expect(searchTopics(dataDir,{ query: 'fresh' }).results[0].anchor).toBe('om_fresh');
+    expect(searchTopics(dataDir,{ query: 'implicit' }).results[0].anchor).toBe('om_fresh');
   });
 
-  it('corrects existing reply/final anchors in place after a metadata change without rereading their sources or restarting group scans', async () => {
-    const own = session();
-    renameSync(join(dataDir,'session-stores',app),join(dataDir,'saved_store'));
-    jsonl(`turn-sends/${own.sessionId}.jsonl`,[{ sessionId: own.sessionId,messageId: 'om_reply',sentAtMs: 2000,
-      previewText: 'reply body',targetRootMessageId: 'om_fallback' }]);
+  it('corrects implicit reply anchors in place after a metadata change without replaying sources or restarting group scans', async () => {
+    const own = session('om_fallback');
+    jsonl(`turn-sends/${own.sessionId}.jsonl`,[{ sessionId: own.sessionId,messageId: 'om_reply',sentAtMs: 2000,previewText: 'reply body' }]);
     const pending = group('group body');
-    journal = new OutputDeliveryJournal(dataDir,app);
-    const final = outputSnapshot(app,{ type: 'final_output',sessionId: own.sessionId,turnId: 'turn',lastUuid: 'uuid',content: 'final body' });
-    journal.accept(final,{ kind: 'im',context: { target: { mode: 'thread',rootMessageId: 'om_fallback' } },chatId: 'oc_chat',chatType: 'group' });
-    journal.claim(final.id,'owner'); journal.complete(final.id,'owner',{ status: 'delivered',messageId: 'om_final' });
     await syncTopicIndex(dataDir);
     const db = openTopicIndex(dataDir);
     const sql = "SELECT id,kind,anchor FROM entries WHERE kind IN ('reply','final') ORDER BY kind";
     const rowSchema = z.object({ id: z.number(),kind: z.string(),anchor: z.string() });
     const before = db.prepare(sql).all().map(row => rowSchema.parse(row));
     try {
-      expect(before).toHaveLength(2);
+      expect(before).toEqual([expect.objectContaining({ kind: 'reply',anchor: 'om_fallback' })]);
       db.exec("CREATE TRIGGER reject_reply_rebuild BEFORE DELETE ON entries WHEN OLD.kind IN ('reply','final') BEGIN SELECT RAISE(ABORT,'entry_must_survive_metadata_change'); END");
     } finally { db.close(); }
-    renameSync(join(dataDir,'saved_store'),join(dataDir,'session-stores',app));
+    init(app); own.rootMessageId = 'om_root'; updateSession(own); init('cli_detached',{ owner: false });
     const snapshots = vi.spyOn(sourceReaders,'readTopicSessions');
     const points = vi.spyOn(sourceReaders,'readTopicSession');
     const jsonlReads = vi.spyOn(sourceReaders,'readJsonlPage');
@@ -211,7 +237,8 @@ describe('topic index synchronization and merge', () => {
     const groupReads = vi.spyOn(groupReader,'readGroupContextPage');
     await syncTopicIndex(dataDir);
     expect(snapshots).toHaveBeenCalledTimes(1); expect(points).not.toHaveBeenCalled();
-    expect(jsonlReads).not.toHaveBeenCalled(); expect(journalReads).not.toHaveBeenCalled();
+    expect(jsonlReads).toHaveBeenCalledTimes(1); expect(jsonlReads.mock.results[0]?.value.rows).toEqual([]);
+    expect(journalReads).not.toHaveBeenCalled();
     expect(groupReads.mock.calls.some(call => call[2]?.pendingSeqs === undefined && (call[2]?.afterSeq ?? 0) === 0)).toBe(false);
     expect(groupReads.mock.calls.some(call => call[2]?.pendingSeqs?.includes(pending.seq))).toBe(true);
     const check = openTopicIndex(dataDir,{ readOnly: true });
@@ -220,6 +247,28 @@ describe('topic index synchronization and merge', () => {
         .toEqual(before.map(row => ({ ...row,anchor: 'om_root' })));
     } finally { check.close(); }
     expect(documents().find(doc => doc.kind === 'group')?.anchor).toBe('om_root');
+  });
+
+  it('keeps explicit reply/final targets through merges and later source-session metadata changes', async () => {
+    const own = session('om_source'); session('om_target');
+    jsonl(`turn-sends/${own.sessionId}.jsonl`,[{ sessionId: own.sessionId,messageId: 'om_reply',sentAtMs: 2000,
+      previewText: 'explicit reply',targetChatId: 'oc_chat',targetRootMessageId: 'om_target' }]);
+    journal = new OutputDeliveryJournal(dataDir,app);
+    const final = outputSnapshot(app,{ type: 'final_output',sessionId: own.sessionId,turnId: 'turn',lastUuid: 'uuid',content: 'explicit final' });
+    journal.accept(final,{ kind: 'im',context: { target: { mode: 'thread',rootMessageId: 'om_target' } },chatId: 'oc_chat',chatType: 'group' });
+    journal.claim(final.id,'owner'); journal.complete(final.id,'owner',{ status: 'delivered',messageId: 'om_final' });
+    upsertGroupContextMessage(app,{ messageId: 'om_final',chatId: 'oc_chat',rootId: 'om_target',threadId: 'omt_thread',
+      conversationScope: 'thread',senderId: app,senderType: 'bot',msgType: 'text',text: 'explicit final',createTime: 3000,resourceRefs: [],sourceAppId: app });
+    await syncTopicIndex(dataDir);
+    expect(searchTopics(dataDir,{ query: 'explicit' }).results.map(result => result.anchor)).toEqual(['om_target']);
+    init(app); own.rootMessageId = 'om_moved'; updateSession(own); init('cli_detached',{ owner: false });
+    await syncTopicIndex(dataDir);
+    expect(searchTopics(dataDir,{ query: 'explicit' }).results.map(result => result.anchor)).toEqual(['om_target']);
+    const db = openTopicIndex(dataDir,{ readOnly: true });
+    try {
+      expect(db.prepare("SELECT kind,anchor,anchor_explicit FROM entries WHERE kind IN ('reply','final') ORDER BY kind").all())
+        .toEqual([{ kind: 'final',anchor: 'om_target',anchor_explicit: 1 },{ kind: 'reply',anchor: 'om_target',anchor_explicit: 1 }]);
+    } finally { db.close(); }
   });
 
   it('compares titles individually, leaves unchanged titles untouched, and omits empty or deleted sessions', async () => {

@@ -29,7 +29,7 @@ import { pathToFileURL } from 'node:url';
  */
 
 export type BotmuxEntry =
-  | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard' | 'topic-indexer'
+  | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard' | 'topic-indexer' | 'topic-search-query'
   | 'plugin-supervisor' | 'sandbox-network-runner' | 'program-status-relay' | 'background-execution-runner'
   | 'zellij-socket-probe' | 'reply-file-sanitizer'
   // CLI-adapter runners. Unlike the entries above these are not fleet processes:
@@ -47,6 +47,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'supervisor': '__supervisor',
   'dashboard': '__dashboard',
   'topic-indexer': '__topic-indexer',
+  'topic-search-query': '__topic-search-query',
   'plugin-supervisor': '__plugin-supervisor',
   'sandbox-network-runner': '__sandbox-network-runner',
   'program-status-relay': '__program-status-relay',
@@ -71,6 +72,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'supervisor': 'index-supervisor.js',
   'dashboard': 'index-dashboard.js',
   'topic-indexer': 'index-topic-indexer.js',
+  'topic-search-query': 'index-topic-search-query.js',
   'plugin-supervisor': 'index-plugin-supervisor.js',
   'sandbox-network-runner': 'sandbox-network-runner.js',
   'program-status-relay': 'program-status-relay.js',
