@@ -81,6 +81,7 @@ import { locateOnPath } from '../cli/registry.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
 import type {
+    BackendTurnFailure,
     SessionBackend,
     SessionAbortDestroyResult,
     SessionDestroyResult,
@@ -111,7 +112,12 @@ import type {
     MojoLocalCloseResidual,
     MojoStreamEvent,
 } from './mojo-types.js';
-import { MOJO_CLI_TIMEOUT_MS, MOJO_DESTROY_SETTLE_MS, MOJO_CHILD_TERMINATION_PROOF_MS } from './mojo-budgets.js';
+import {
+    MOJO_CLI_TIMEOUT_MS,
+    MOJO_DESTROY_SETTLE_MS,
+    MOJO_CHILD_TERMINATION_PROOF_MS,
+    MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS,
+} from './mojo-budgets.js';
 
 /** mojo silently drops an agent clarifying question in headless mode and marks
  *  the turn cancelled. Matching this is the difference between a helpful nudge
@@ -119,15 +125,65 @@ import { MOJO_CLI_TIMEOUT_MS, MOJO_DESTROY_SETTLE_MS, MOJO_CHILD_TERMINATION_PRO
 const ASK_USER_SKIPPED_RE = /ask-?user|提问.*被自动跳过/i;
 
 /**
- * The server-side session stays RUNNING for a short window AFTER the foreground
- * process has already emitted its `result` event and exited. Verified: firing the
- * next turn immediately fails with
+ * The CLI's own pre-check refusal for `-r <sid>`: the remote session is RUNNING
+ * and its event history still shows a live turn. Emitted on stderr BEFORE
+ * anything reaches stdout, so nothing was submitted and resubmitting is safe:
  *     mojo: 会话 <sid> 正在执行中（RUNNING），稍后再试   (exit 1)
- * A human typing in IM rarely hits this, but botmux flushes queued follow-ups the
- * instant a turn boundary fires — so it hits reliably there. Retry with backoff
- * instead of surfacing a spurious error to the user.
+ * Hit when a turn from another client — or one that outlived a botmux restart —
+ * is still executing, and (on older CLIs) right after a turn's own `result`.
+ * Handled by waiting for the remote turn to end, see runTurnWithBusyRetry.
  */
 const SESSION_BUSY_RE = /正在执行中|RUNNING）|already running/i;
+
+/**
+ * Default for `mojo.busyWaitSec`: how long one message waits for a still
+ * executing remote turn before it is failed as not delivered.
+ */
+const DEFAULT_BUSY_WAIT_SEC = 60;
+/** Probe backoff while waiting: 1s, doubling, capped. A probe is a single
+ *  `session get` read, so the cap only bounds latency, not load. */
+const BUSY_PROBE_INITIAL_MS = 1_000;
+const BUSY_PROBE_MAX_MS = 10_000;
+/** A probe is a quick read; it must not eat the whole busy-wait budget. */
+const BUSY_PROBE_TIMEOUT_MS = 15_000;
+const BUSY_PROBE_MIN_TIMEOUT_MS = 2_000;
+/**
+ * Resubmissions a single message may spend on the CLI's pre-check refusing
+ * AFTER a probe said the remote turn ended (or could not say). Same order as
+ * the fixed ladder this replaced (4 relaunches), which is what absorbs an
+ * older CLI's short "still RUNNING right after result" window; beyond it the
+ * remote is contradicting itself and each relaunch is a full client start.
+ */
+const MAX_REFUSED_BUSY_RESUBMITS = 4;
+/** How often a waiting turn re-checks an in-progress close / detach. */
+const BUSY_ADMISSION_POLL_MS = 250;
+const MOJO_FENCED_FAILURE: MojoTurnFailure = {
+    code: 'mojo_admission_fenced',
+    message: '会话关闭没能证明本地 mojo 进程已经结束，本会话已停止接收消息，这条消息没有送达。请重新 /close 本会话。',
+    retryable: false,
+};
+const MOJO_CLOSE_UNRESOLVED_FAILURE: MojoTurnFailure = {
+    code: 'mojo_close_unresolved',
+    message: '会话关闭一直没有结论，这条消息没有送达。请稍后重新 /close，或发 /retry 重投。',
+    retryable: true,
+};
+const MOJO_CLOSE_UNRESOLVED_AFTER_SUBMIT_FAILURE: MojoTurnFailure = {
+    code: 'mojo_close_unresolved_after_submit',
+    message: '会话关闭一直没有结论，已经提交的这条消息结果未知：本地 Mojo 客户端被结束，远端可能仍在执行或已经完成。写入准入尚未恢复，请稍后重新 /close 确认会话状态；确认原回合未执行后可发 /retry，重投可能重复操作。',
+    retryable: true,
+};
+/**
+ * `session get` states (1.0.13 schema-v1) in which the remote turn has not
+ * ended yet. Everything else — completed / failed / cancelled / idle /
+ * already_terminal / unknown — lets the message be submitted again.
+ */
+const REMOTE_TURN_LIVE_STATES: ReadonlySet<string> = new Set([
+    'queued', 'accepted', 'running', 'waiting_confirmation', 'waiting_user', 'cancel_requested',
+]);
+/** Provider error codes a resend cannot fix (config / identity problems). */
+const NON_RETRYABLE_MOJO_CODES: ReadonlySet<string> = new Set([
+    'invalid_argument', 'unauthenticated', 'forbidden',
+]);
 
 /**
  * A resumed session id can stop being resumable (server-side GC, expiry, or a
@@ -144,7 +200,33 @@ const SESSION_BUSY_RE = /正在执行中|RUNNING）|already running/i;
  */
 const RESUME_DEAD_RE =
     /会话.*(不存在|已过期|已结束|无效|未找到)|session.*(not\s*found|expired|invalid|does not exist)|not_found|invalid_session/i;
-const BUSY_RETRY_DELAYS_MS: readonly number[] = [1_000, 2_000, 4_000, 8_000];
+
+/**
+ * How one CLI launch ended, from the busy loop's point of view.
+ *  - settled:     the turn boundary already fired (answer or failure).
+ *  - busy:        the CLI's pre-check refused before submitting anything.
+ *  - queued_busy: the prompt WAS submitted and queued, but no remote turn ever
+ *                 started (1.0.13 `result.error.code === "session_busy"`). The
+ *                 boundary is left to the caller, which first asks the remote
+ *                 what state it is in.
+ */
+type MojoTurnAttempt =
+    | { kind: 'settled' }
+    | { kind: 'busy' }
+    | { kind: 'queued_busy'; providerMessage: string };
+
+/** What `session get` reported about the remote session's current turn. */
+interface MojoRemoteTurnState {
+    state: string;
+    turnId: string | null;
+}
+
+/** A turn boundary that must NOT be reported as a delivered answer. */
+interface MojoTurnFailure {
+    code: string;
+    message: string;
+    retryable: boolean;
+}
 
 /**
  * Pre-exec cgroup enrolment shim (P0: the spawn→enrolment window).
@@ -188,7 +270,8 @@ export class MojoBackend implements SessionBackend {
     private taskDoneCb: (() => void) | null = null;
     private exitCb: ((code: number | null, signal: string | null) => void) | null = null;
     private taskIdCb: ((taskId: string | null) => void) | null = null;
-    private turnFinalCb: ((text: string) => void) | null = null;
+    private turnFinalCb: ((text: string, turnId?: string) => void) | null = null;
+    private turnFailureCb: ((failure: BackendTurnFailure) => void) | null = null;
 
     private outputBuffer = '';
     /**
@@ -270,6 +353,33 @@ export class MojoBackend implements SessionBackend {
      *  The turn is accounted for by its result event, never by the client
      *  process ending — see runTurn for why the process may outlive the turn. */
     private turnResolve: (() => void) | null = null;
+    /** Companion of turnResolve for the queued-but-never-started outcome: it
+     *  ends the CURRENT launch without firing the turn boundary, because the
+     *  caller still has to ask the remote what state it is in. */
+    private turnQueuedBusy: ((providerMessage: string) => void) | null = null;
+    /**
+     * Positive evidence that the remote actually ran THIS turn: model text, a
+     * tool call or a tool result streamed for it. `system/init` is NOT evidence
+     * — 1.0.13 emits it before the prompt is even submitted, and a prompt that
+     * is only queued never produces anything else. Reset per launch.
+     */
+    private turnEvidence = false;
+    /** The launch's positional prompt reached mojo as a bare slash command (no
+     *  preamble). Mojo command results produce no stream output at all, so
+     *  "no output" proves nothing for them. */
+    private turnIsCommand = false;
+    /** This launch emitted at least one stream-json event (see runTurn's busy
+     *  classification). */
+    private turnSawEvent = false;
+    /**
+     * botmux turn id handed over by the worker for the NEXT write() (see
+     * bindNextTurn), and the id of the turn currently in flight. Mojo turns are
+     * serialized but a passthrough command may be written while an earlier turn
+     * is still waiting on a busy remote; carrying the id with the write is what
+     * keeps that earlier turn's outcome off the later turn's card.
+     */
+    private nextWriteTurnId: string | undefined;
+    private currentTurnId: string | undefined;
     /**
      * Latched once a strong boundary proved unusable at runtime — the shim's
      * enrolment write was rejected (exit 97). The prepare-time probe only opens
@@ -636,6 +746,10 @@ export class MojoBackend implements SessionBackend {
     }
 
     write(data: string): boolean {
+        // Consumed by THIS write whatever happens below, so a refused write can
+        // never leak its id onto the next one.
+        const turnId = this.nextWriteTurnId;
+        this.nextWriteTurnId = undefined;
         if (this.killed || this.closing || this.shutdownDetaching) return false;
         if (this.containmentUnrecorded) {
             // A prior turn's subtree could not be recorded AND could not be proven
@@ -658,11 +772,14 @@ export class MojoBackend implements SessionBackend {
         // and a second message arriving before the first init event would fork a
         // duplicate session (cliSessionId still null).
         this.writeChain = this.writeChain
-            .then(() => (this.killed || this.closing) ? undefined : this.runTurnWithBusyRetry(text, turnLiveJwt))
+            .then(() => this.killed ? undefined : this.runTurnWithBusyRetry(text, turnLiveJwt, turnId))
             .catch((err: unknown) => {
                 logger.warn(`[mojo] turn failed: ${String(err)}`);
-                this.emitLine(`❌ mojo 执行失败：${this.fmtErr(err)}`, 'err');
-                this.settleTurn();
+                this.failTurn({
+                    code: 'mojo_turn_crashed',
+                    message: `mojo 执行失败：${this.fmtErr(err)}。这条消息没有确认被执行，可发 /retry 重投。`,
+                    retryable: true,
+                });
             });
         return true;
     }
@@ -711,7 +828,22 @@ export class MojoBackend implements SessionBackend {
     /** This turn's assistant answer, for the worker's final_output bridge. A
      *  headless mojo session has no terminal the user could read instead, so an
      *  answer the agent never `botmux send`s would otherwise reach nobody. */
-    onTurnFinal(cb: (text: string) => void): void { this.turnFinalCb = cb; }
+    onTurnFinal(cb: (text: string, turnId?: string) => void): void { this.turnFinalCb = cb; }
+
+    /**
+     * The botmux turn the NEXT write() carries. The worker calls this right
+     * before each mojo write (queued flush and passthrough alike); both turn
+     * boundaries then report it, so the worker attributes the outcome exactly
+     * instead of to whatever its current turn is by the time the turn ends.
+     */
+    bindNextTurn(turnId: string | undefined): void { this.nextWriteTurnId = turnId; }
+
+    /** A turn that ended WITHOUT a delivered answer — remote busy, an explicit
+     *  provider error, a client exit with no result, or a result with no output
+     *  at all. Fires instead of onTurnFinal (never both), immediately before
+     *  onTaskDone, so the worker closes the turn as failed rather than as an
+     *  empty success. */
+    onTurnFailure(cb: (failure: BackendTurnFailure) => void): void { this.turnFailureCb = cb; }
 
     /** Lineage id updates — forwarded to the daemon so multi-turn context
      *  survives a daemon restart. */
@@ -1743,30 +1875,289 @@ export class MojoBackend implements SessionBackend {
         return args;
     }
 
-    /** Retry the "session still RUNNING" race with backoff (see SESSION_BUSY_RE). */
-    private async runTurnWithBusyRetry(prompt: string, turnLiveJwt?: string | null): Promise<void> {
-        for (let attempt = 0; ; attempt++) {
-            const busy = await this.runTurn(prompt, turnLiveJwt);
-            if (!busy) return;
-            const delay = BUSY_RETRY_DELAYS_MS[attempt];
-            if (delay === undefined) {
-                this.emitLine('❌ mojo 会话持续处于执行中，本条消息未能送达，请稍后重发。', 'err');
-                this.settleTurn();
+    /** Overridable so a behaviour test can walk a long probe ladder without
+     *  burning the production backoff in wall-clock. Production never changes it. */
+    protected get busyProbeLadderMs(): { initial: number; max: number } {
+        return { initial: BUSY_PROBE_INITIAL_MS, max: BUSY_PROBE_MAX_MS };
+    }
+
+    private get busyWaitMs(): number {
+        return (this.config.busyWaitSec ?? DEFAULT_BUSY_WAIT_SEC) * 1_000;
+    }
+
+    /**
+     * Run one IM message as one remote turn, and make the turn boundary say
+     * what really happened to it.
+     *
+     * Two different "busy" shapes, handled differently on purpose:
+     *  - The CLI's pre-check refused (`正在执行中`, nothing submitted): a remote
+     *    turn is still executing. Wait for it with `session get` probes — a
+     *    control-plane read, unlike a full `-p` launch, which in host execution
+     *    also starts (and stops) a local mojo-daemon every time — and resubmit
+     *    once the remote turn has ended. Bounded by `mojo.busyWaitSec`.
+     *  - The prompt was submitted but only queued (`session_busy` result): the
+     *    session holds its lock without a live turn. The prompt already sits in
+     *    the remote queue, so it is never resubmitted here; the turn fails at
+     *    once, with the remote's own view of its current turn as evidence.
+     * Either way an undelivered message ends as a FAILED turn (onTurnFailure),
+     * never as an empty answer.
+     */
+    private async runTurnWithBusyRetry(
+        prompt: string,
+        turnLiveJwt: string | null | undefined,
+        turnId: string | undefined,
+    ): Promise<void> {
+        this.currentTurnId = turnId;
+        const deadline = Date.now() + this.busyWaitMs;
+        const ladder = this.busyProbeLadderMs;
+        let step = ladder.initial;
+        let announced = false;
+        let lastRemote: MojoRemoteTurnState | null = null;
+        let refusedResubmits = 0;
+        // A close / shutdown detach that began while this message was still
+        // queued behind another turn must not swallow it (write() accepted it).
+        if (!(await this.admitBusyTurn(true))) return;
+        for (let resubmit = false; ; resubmit = true) {
+            const attempt = await this.runTurn(prompt, turnLiveJwt);
+            if (attempt.kind === 'settled') return;
+            if (attempt.kind === 'queued_busy') {
+                const remote = await this.probeRemoteTurn(turnLiveJwt, deadline);
+                if (!(await this.admitBusyTurn())) return;
+                this.reportRemoteBusyMismatch('queued_without_turn', remote);
+                this.failTurn(this.queuedBusyFailure(attempt.providerMessage, remote));
                 return;
             }
-            logger.info(`[mojo] session busy; retrying in ${delay}ms`);
-            await new Promise<void>(r => setTimeout(r, delay));
-            if (this.killed || this.closing) return;
+            // Pre-check refusal: nothing was submitted, the remote is executing.
+            if (resubmit && ++refusedResubmits >= MAX_REFUSED_BUSY_RESUBMITS) {
+                // The remote keeps saying its turn ended (or cannot say), yet
+                // keeps refusing a new one: more launches will not change that.
+                this.reportRemoteBusyMismatch('refused_after_turn_ended', lastRemote);
+                this.failTurn(this.busyFailure(lastRemote, 'refused'));
+                return;
+            }
+            if (!announced) {
+                announced = true;
+                this.emitLine(
+                    `⏳ 远端 Mojo 会话还在执行上一回合，等它结束后再投递这条消息（最多等 ${Math.round(this.busyWaitMs / 1_000)} 秒）…`,
+                    'info',
+                );
+            }
+            for (;;) {
+                const remaining = deadline - Date.now();
+                if (remaining <= 0) {
+                    this.reportRemoteBusyMismatch('turn_still_executing', lastRemote);
+                    this.failTurn(this.busyFailure(lastRemote, 'timeout'));
+                    return;
+                }
+                logger.info(`[mojo] session busy; probing remote turn in ${Math.min(step, remaining)}ms`);
+                await new Promise<void>(r => setTimeout(r, Math.min(step, remaining)));
+                step = Math.min(step * 2, ladder.max);
+                if (!(await this.admitBusyTurn())) return;
+                if (Date.now() >= deadline) continue;
+                if (this.failIfCredentialChanged(turnLiveJwt)) return;
+                const remote = await this.probeRemoteTurn(turnLiveJwt, deadline);
+                if (!(await this.admitBusyTurn())) return;
+                if (remote) lastRemote = remote;
+                // Still executing: keep waiting. Refusals are deliberately NOT
+                // forgiven here — a remote flapping between "running" and
+                // "ended" must stay bounded by the resubmit cap too.
+                if (remote && REMOTE_TURN_LIVE_STATES.has(remote.state)) continue;
+                // Ended — or unreadable, which proves nothing either way; the
+                // CLI's own pre-check keeps a resubmission safe. The credential
+                // may have changed during the probe itself.
+                if (this.failIfCredentialChanged(turnLiveJwt)) return;
+                break;
+            }
         }
     }
 
-    /** Resolves `true` when the turn was rejected because the session is still
-     *  RUNNING (caller should retry), `false` once the turn is accounted for. */
-    private runTurn(prompt: string, turnLiveJwt?: string | null): Promise<boolean> {
-        return new Promise<boolean>((resolve, reject) => {
-            const { bin, args } = this.resolveLaunch(this.buildArgs(prompt));
+    /**
+     * Gate for a turn that is between launches (waiting, probing, or still
+     * queued behind another turn). While an explicit close or a shutdown detach
+     * is in progress it launches nothing and waits for that lifecycle to
+     * conclude: a completed teardown ends the turn silently (the close owns the
+     * session's outcome), a rolled-back close or aborted detach lets it go on,
+     * and a close that fenced admission fails it visibly. Returning early on
+     * `closing` used to strand the turn — no boundary ever fired, so after a
+     * rolled-back close the session never took another message.
+     *
+     * Returns true when the turn may continue.
+     */
+    private async admitBusyTurn(beforeFirstLaunch = false): Promise<boolean> {
+        const verdict = await this.awaitLifecycleConclusion();
+        if (verdict === 'proceed') return true;
+        if (verdict === 'torn_down') return false;
+        if (beforeFirstLaunch) {
+            // Nothing has run for this message yet: open its boundary so the
+            // failure is attributed to it, not to an already settled turn.
+            this.turnSettled = false;
+            this.turnFinalText = '';
+        }
+        this.failTurn(verdict === 'fenced' ? MOJO_FENCED_FAILURE : MOJO_CLOSE_UNRESOLVED_FAILURE);
+        return false;
+    }
+
+    /**
+     * Wait out an explicit close or shutdown detach that is in progress.
+     *  - torn_down:  the session is gone (close succeeded, or kill()).
+     *  - proceed:    no lifecycle in progress, or it was rolled back / aborted.
+     *  - fenced:     the close could not prove local termination; this session
+     *                will never take a turn again.
+     *  - unresolved: still in progress after the daemon's own close-result
+     *                budget — e.g. destroySession threw — so stop waiting.
+     */
+    private async awaitLifecycleConclusion(): Promise<'proceed' | 'torn_down' | 'fenced' | 'unresolved'> {
+        const startedAt = Date.now();
+        for (;;) {
+            if (this.killed) return 'torn_down';
+            if (this.admissionFenced) return 'fenced';
+            if (!this.closing && !this.shutdownDetaching) return 'proceed';
+            if (Date.now() - startedAt > this.lifecycleConclusionBudgetMs) return 'unresolved';
+            await new Promise<void>(r => setTimeout(r, BUSY_ADMISSION_POLL_MS));
+        }
+    }
+
+    /** Overridable so a lifecycle test can exercise an unresolved close without
+     *  burning the production close-result budget in wall-clock. */
+    protected get lifecycleConclusionBudgetMs(): number {
+        return MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS;
+    }
+
+    /**
+     * The client running this turn ended while the session was being closed or
+     * killed. A completed teardown owns the outcome (unchanged: the turn closes
+     * quietly). But a close that kills the client and then rolls back leaves a
+     * live session with a turn whose result never arrived — closing that as an
+     * empty success is exactly the "已读不回" shape, so it fails visibly.
+     */
+    private async settleTurnInterruptedByTeardown(): Promise<void> {
+        const verdict = await this.awaitLifecycleConclusion();
+        if (verdict === 'torn_down') {
+            this.settleTurn();
+            return;
+        }
+        if (verdict === 'fenced') {
+            this.failTurn(MOJO_FENCED_FAILURE);
+            return;
+        }
+        if (verdict === 'unresolved') {
+            this.failTurn(MOJO_CLOSE_UNRESOLVED_AFTER_SUBMIT_FAILURE);
+            return;
+        }
+        this.failTurn({
+            code: 'mojo_interrupted_by_close',
+            message: '关闭会话时结束了正在处理这条消息的 mojo 客户端，随后关闭没有完成、会话继续使用。远端可能仍在执行这条消息，结果没有拿到。可发 /retry 重投（若远端其实已执行完，会再执行一次）。',
+            retryable: true,
+        });
+    }
+
+    /** The credential this turn was written with is no longer the live one. */
+    private failIfCredentialChanged(turnLiveJwt: string | null | undefined): boolean {
+        if (this.liveJwt === turnLiveJwt) return false;
+        // Rotated — or cleared, i.e. revoked — while this message was
+        // waiting: it must not go out on the stale credential.
+        this.failTurn({
+            code: 'mojo_credential_changed',
+            message: '等待远端空闲期间，这个 Bot 的 Mojo 凭据被更新或清除了，这条消息没有用旧凭据继续投递，没有送达。可发 /retry 用当前凭据重投。',
+            retryable: true,
+        });
+        return true;
+    }
+
+    /**
+     * Ask the remote what its session's current turn is doing (`mojo session
+     * get`). Team sessions carry the same workspace id as their normal turn
+     * launches. Null when that cannot be known — no lineage, an older CLI, or
+     * any error.
+     */
+    private async probeRemoteTurn(
+        turnLiveJwt: string | null | undefined,
+        deadline: number,
+    ): Promise<MojoRemoteTurnState | null> {
+        const sessionId = this.cliSessionId;
+        if (!sessionId) return null;
+        try {
+            // Bounded by what is left of the busy budget (with a floor so a
+            // last-moment probe still has time to answer at all).
+            const timeoutMs = Math.min(BUSY_PROBE_TIMEOUT_MS, Math.max(deadline - Date.now(), BUSY_PROBE_MIN_TIMEOUT_MS));
+            const args = ['session', 'get', sessionId];
+            if (this.config.workspaceId) args.push('--workspace-id', this.config.workspaceId);
+            const env = await this.runCliJson(args, { turnLiveJwt, timeoutMs });
+            if (env.operation !== 'session.get' || typeof env.state !== 'string' || !env.state) return null;
+            return { state: env.state, turnId: typeof env.turn_id === 'string' && env.turn_id ? env.turn_id : null };
+        } catch (err: unknown) {
+            logger.warn(`[mojo] session get ${sessionId} failed while busy: ${String(err)}`);
+            return null;
+        }
+    }
+
+    /** botmux has no turn of its own in flight (turns are serialized through
+     *  writeChain), yet the remote refuses a new one — say so explicitly. */
+    private reportRemoteBusyMismatch(kind: string, remote: MojoRemoteTurnState | null): void {
+        logger.warn(
+            `[mojo] remote/local state mismatch (${kind}): session ${this.cliSessionId ?? '-'} refused a new turn `
+            + `while botmux has none in flight; remote current turn ${remote?.turnId ?? '?'} state=${remote?.state ?? 'unknown'}`,
+        );
+    }
+
+    private describeRemoteTurn(remote: MojoRemoteTurnState | null): string {
+        if (!remote) return '未能查询到远端当前回合的状态';
+        const turn = remote.turnId ? `远端当前回合 ${remote.turnId.slice(0, 8)}` : '远端当前回合';
+        return REMOTE_TURN_LIVE_STATES.has(remote.state)
+            ? `${turn} 状态为 ${remote.state}`
+            : `${turn} 已是 ${remote.state}，会话却仍不接受新回合`;
+    }
+
+    private describeReportedTurn(remote: MojoRemoteTurnState | null): string {
+        if (!remote) return '查询不到远端当前回合的状态';
+        const turn = remote.turnId ? `远端报告当前回合 ${remote.turnId.slice(0, 8)}` : '远端报告当前回合';
+        return REMOTE_TURN_LIVE_STATES.has(remote.state) ? `${turn} 状态为 ${remote.state}` : `${turn} 已是 ${remote.state}`;
+    }
+
+    private queuedBusyFailure(providerMessage: string, remote: MojoRemoteTurnState | null): MojoTurnFailure {
+        return {
+            code: 'mojo_session_busy',
+            retryable: true,
+            message: [
+                '远端会话一直忙，这条消息没有送达：Mojo 把它排进了会话队列，但一直没有开始新回合。',
+                `状态异常：本地没有进行中的回合，远端会话却仍被占用（${this.describeRemoteTurn(remote)}），多半是远端会话卡在了忙碌状态。`,
+                '消息已保留：远端恢复后可发 /retry 重投（Mojo 可能仍把这条消息留在会话队列里，反复重试会在队列里堆积）；一直不恢复的话，/close 后新开话题会换一个新的远端会话。',
+                `Mojo 返回：${providerMessage}`,
+            ].join('\n\n'),
+        };
+    }
+
+    private busyFailure(remote: MojoRemoteTurnState | null, why: 'timeout' | 'refused'): MojoTurnFailure {
+        const waitedSec = Math.round(this.busyWaitMs / 1_000);
+        const headline = why === 'timeout'
+            ? `远端会话一直忙，这条消息没有送达：远端会话一直在执行别的回合，等了 ${waitedSec} 秒仍未结束（${this.describeRemoteTurn(remote)}）。`
+            : `远端会话一直忙，这条消息没有送达：${this.describeReportedTurn(remote)}，但重投 ${MAX_REFUSED_BUSY_RESUBMITS} 次都被 Mojo 以「正在执行中」拒绝。`;
+        return {
+            code: 'mojo_session_busy',
+            retryable: true,
+            message: [
+                headline,
+                why === 'timeout'
+                    ? '状态异常：本地没有进行中的回合，远端却在执行——可能是其他客户端，或 botmux 重启前留下的回合仍在跑。'
+                    : '状态异常：本地没有进行中的回合，远端的回合状态与它是否接受新回合互相矛盾，多半是远端会话卡在了忙碌状态。',
+                why === 'timeout'
+                    ? `消息已保留：远端空闲后可发 /retry 重投；等待上限可用 mojo.busyWaitSec 调整（当前 ${waitedSec} 秒）。`
+                    : '消息已保留：远端恢复后可发 /retry 重投；一直不恢复的话，/close 后新开话题会换一个新的远端会话。',
+            ].join('\n\n'),
+        };
+    }
+
+    /** One CLI launch. Resolves once the launch is accounted for — see
+     *  MojoTurnAttempt for the three ways that can happen. */
+    private runTurn(prompt: string, turnLiveJwt?: string | null): Promise<MojoTurnAttempt> {
+        return new Promise<MojoTurnAttempt>((resolve, reject) => {
+            const turnArgs = this.buildArgs(prompt);
+            const { bin, args } = this.resolveLaunch(turnArgs);
             this.turnSettled = false;
             this.streamedThisTurn = false;
+            this.turnEvidence = false;
+            this.turnSawEvent = false;
+            this.turnIsCommand = (turnArgs[turnArgs.length - 1] ?? '').trimStart().startsWith('/');
             this.turnFinalText = '';
             this.stdoutTail = '';
             // The client PROCESS is not the turn. In host execution the CLI
@@ -1776,14 +2167,18 @@ export class MojoBackend implements SessionBackend {
             // turn is accounted for the moment settleTurn() runs; resolve
             // there, and treat any later process end as bookkeeping only.
             let resolved = false;
-            const resolveOnce = (busy: boolean): void => {
+            const resolveOnce = (attempt: MojoTurnAttempt): void => {
                 if (resolved) return;
                 resolved = true;
                 if (this.turnResolve === settleHook) this.turnResolve = null;
-                resolve(busy);
+                if (this.turnQueuedBusy === queuedBusyHook) this.turnQueuedBusy = null;
+                resolve(attempt);
             };
-            const settleHook = (): void => resolveOnce(false);
+            const settleHook = (): void => resolveOnce({ kind: 'settled' });
+            const queuedBusyHook = (providerMessage: string): void =>
+                resolveOnce({ kind: 'queued_busy', providerMessage });
             this.turnResolve = settleHook;
+            this.turnQueuedBusy = queuedBusyHook;
 
             // The strong boundary must exist BEFORE the child does, and the child
             // must enter it BEFORE exec (see MOJO_CGROUP_ENROLL_SHIM): post-spawn
@@ -1885,7 +2280,6 @@ export class MojoBackend implements SessionBackend {
                 }
             }
             let stderr = '';
-
             child.stdout.on('data', (chunk: Buffer) => {
                 // Fence on child identity for the SAME reason finalize() does:
                 // this client is not awaited (settleTurn resolves the turn), so
@@ -1935,6 +2329,8 @@ export class MojoBackend implements SessionBackend {
                 // Same child fence as the stdout handler: never flush an OLD
                 // client's tail into whichever turn currently owns the stream.
                 if (wasCurrent) this.flushTail();
+                // The flushed tail may itself have been the `result` line.
+                if (resolved) return;
                 // The pre-exec shim's handshake: enrolment into the prepared cgroup
                 // failed, so it exited WITHOUT exec'ing mojo (nothing credentialed
                 // ran). Gated on `usedEnrolShim` so a genuine mojo exit 97 (on a
@@ -1950,35 +2346,63 @@ export class MojoBackend implements SessionBackend {
                         '[mojo] cgroup enrolment was rejected at write time (exit 97); this host cannot '
                         + 'host a strong boundary, degrading to the weak handle for subsequent turns',
                     );
-                    this.emitLine('❌ mojo 启动失败：无法进入进程围栏（cgroup 入组被拒），本轮未执行，后续改用降级隔离。', 'err');
-                    this.settleTurn();
-                    return resolveOnce(false);
+                    this.failTurn({
+                        code: 'mojo_containment_enroll_failed',
+                        message: 'mojo 启动失败：无法进入进程围栏（cgroup 入组被拒），本轮未执行，后续改用降级隔离。这条消息没有送达，可发 /retry 重投。',
+                        retryable: true,
+                    });
+                    return resolveOnce({ kind: 'settled' });
                 }
                 // exit 2 == unknown model; stderr carries the authoritative list.
                 if (code === 2 && /未知模型|unknown model/i.test(stderr)) {
-                    this.emitLine(`❌ 模型名无效。${stderr.trim()}`, 'err');
-                    this.settleTurn();
-                    return resolveOnce(false);
+                    this.failTurn({ code: 'mojo_invalid_model', message: `模型名无效。${stderr.trim()}`, retryable: false });
+                    return resolveOnce({ kind: 'settled' });
                 }
-                // Busy race: nothing was streamed and the session is still RUNNING.
-                if (!this.turnSettled && SESSION_BUSY_RE.test(stderr)) return resolveOnce(true);
+                // Pre-check refusal: nothing was submitted, a remote turn is live.
+                // The CLI's busy pre-check refuses before emitting any event.
+                // Once this launch emitted one (init comes right before the
+                // submit), a busy-looking stderr no longer proves the prompt
+                // was NOT submitted, so it must not be resubmitted. Plain-text
+                // notices (update hints) on stdout do not count.
+                if (!this.turnSettled && !this.turnSawEvent && SESSION_BUSY_RE.test(stderr)) return resolveOnce({ kind: 'busy' });
                 // Dead resume lineage → drop it and let the user retry fresh.
                 if (!this.turnSettled && this.maybeDropLineage(stderr)) {
-                    this.settleTurn();
-                    return resolveOnce(false);
+                    this.failTurn({
+                        code: 'mojo_resume_lineage_dead',
+                        message: '之前的 mojo 会话已失效，这条消息没有被处理。发 /retry 会在新会话里重投（上下文不会延续）。',
+                        retryable: true,
+                    });
+                    return resolveOnce({ kind: 'settled' });
                 }
                 // A `result` event already settled the turn in the normal path
                 // (including the ask-user cancellation, which also exits 1).
                 if (!this.turnSettled) {
-                    if (code !== 0) {
-                        this.emitLine(
-                            `❌ mojo 退出码 ${code}${stderr.trim() ? `：${stderr.trim()}` : ''}`,
-                            'err',
-                        );
+                    const detail = stderr.trim();
+                    if (this.killed || this.closing) {
+                        // Teardown ended the client: what this turn amounts to
+                        // depends on how that teardown concludes.
+                        if (code !== 0) this.emitLine(`❌ mojo 退出码 ${code}${detail ? `：${detail}` : ''}`, 'err');
+                        void this.settleTurnInterruptedByTeardown()
+                            .catch((err: unknown) => logger.error(`[mojo] interrupted-turn settle failed: ${String(err)}`))
+                            .finally(() => resolveOnce({ kind: 'settled' }));
+                        return;
+                    } else if (code !== 0) {
+                        // No `result` ⇒ no proof the remote ran the turn.
+                        const how = code === null ? 'mojo 进程被信号终止' : `mojo 退出码 ${code}`;
+                        this.failTurn({
+                            code: `mojo_exit_${code ?? 'signal'}`,
+                            message: `${how}${detail ? `：${detail}` : ''}。没有拿到本回合结果，无法确认这条消息被执行，可发 /retry 重投。`,
+                            retryable: code !== 2,
+                        });
+                    } else {
+                        this.failTurn({
+                            code: 'mojo_no_turn_result',
+                            message: 'mojo 进程已退出，但没有给出本回合的结果，无法确认这条消息被执行。可发 /retry 重投。',
+                            retryable: true,
+                        });
                     }
-                    this.settleTurn();
                 }
-                resolveOnce(false);
+                resolveOnce({ kind: 'settled' });
             };
             child.on('close', (code: number | null) => finalize(code));
             child.on('exit', (code: number | null) => {
@@ -2049,6 +2473,7 @@ export class MojoBackend implements SessionBackend {
             logger.warn(`[mojo] unparseable stream line: ${trimmed.slice(0, 200)}`);
             return;
         }
+        this.turnSawEvent = true;
         switch (ev.type) {
             case 'system': {
                 const e = ev as Extract<MojoStreamEvent, { type: 'system' }>;
@@ -2059,6 +2484,7 @@ export class MojoBackend implements SessionBackend {
                 const e = ev as Extract<MojoStreamEvent, { type: 'text_delta' }>;
                 if (e.text) {
                     this.streamedThisTurn = true;
+                    this.turnEvidence = true;
                     this.emitText(e.text);
                 }
                 return;
@@ -2066,11 +2492,13 @@ export class MojoBackend implements SessionBackend {
             case 'text': {
                 // With --include-partial the deltas already rendered this text.
                 const e = ev as Extract<MojoStreamEvent, { type: 'text' }>;
+                if (e.text) this.turnEvidence = true;
                 if (!this.streamedThisTurn && e.text) this.emitText(e.text);
                 return;
             }
             case 'tool_call': {
                 const e = ev as Extract<MojoStreamEvent, { type: 'tool_call' }>;
+                this.turnEvidence = true;
                 this.emitLine(`🔧 ${e.name ?? '(tool)'}${this.summarizeInput(e.input)}`, 'info');
                 return;
             }
@@ -2079,6 +2507,7 @@ export class MojoBackend implements SessionBackend {
                 // air while the tool runs, then a sudden final answer — it reads
                 // like a hang. Surface a one-line outcome instead.
                 const e = ev as Extract<MojoStreamEvent, { type: 'tool_result' }>;
+                this.turnEvidence = true;
                 this.emitLine(this.summarizeToolResult(e.output), 'plain');
                 return;
             }
@@ -2102,10 +2531,16 @@ export class MojoBackend implements SessionBackend {
     }
 
     private handleResult(ev: Extract<MojoStreamEvent, { type: 'result' }>): void {
-        // Some flows emit only `result` without any text event.
-        if (!this.streamedThisTurn && typeof ev.result === 'string' && ev.result) {
+        // Some flows emit only `result` without any text event. Without
+        // --include-partial, `result` usually repeats the last `text` segment
+        // already shown — skip exactly that, never a final answer that only
+        // `result` carries.
+        if (!this.streamedThisTurn && typeof ev.result === 'string' && ev.result
+            && !this.turnFinalText.trimEnd().endsWith(ev.result.trimEnd())) {
+            this.turnEvidence = true;
             this.emitText(ev.result);
         }
+        if (typeof ev.num_tool_calls === 'number' && ev.num_tool_calls > 0) this.turnEvidence = true;
 
         const warnings: unknown[] = Array.isArray(ev.warnings) ? ev.warnings : [];
         const askSkipped = warnings.some(w => ASK_USER_SKIPPED_RE.test(String(w)));
@@ -2118,12 +2553,67 @@ export class MojoBackend implements SessionBackend {
         } else {
             for (const w of warnings) this.emitLine(`⚠️ ${String(w)}`, 'warn');
         }
-        if (ev.error && !askSkipped) this.emitLine(`❌ ${this.fmtErr(ev.error)}`, 'err');
+        const error = ev.error ? this.normalizeProviderError(ev.error) : null;
+        if (askSkipped && (error || !this.turnEvidence)) {
+            // The `cancelled` error is a CONSEQUENCE of the skipped question —
+            // the explanation above is the reason, not a second failure.
+            this.settleTurn({
+                code: 'mojo_ask_user_skipped',
+                message: 'mojo 想向你追问以确认细节，但无头模式下提问会被自动跳过，本回合已中断。请把缺少的信息（例如具体文件 / 路径 / 目标）补全后重新发一次。',
+                retryable: false,
+            });
+            return;
+        }
+        if (error) {
+            this.emitLine(`❌ ${this.fmtErr(ev.error)}`, 'err');
+            // Submitted, queued, never started: the caller asks the remote for
+            // its state before failing the turn (see runTurnWithBusyRetry).
+            if (error.code === 'session_busy' && !this.turnEvidence && this.turnQueuedBusy) {
+                this.turnQueuedBusy(this.fmtErr(ev.error));
+                return;
+            }
+            this.settleTurn({
+                code: `mojo_${error.code}`,
+                message: `Mojo 回合失败：${this.fmtErr(ev.error)}`,
+                retryable: error.retryable,
+            });
+            return;
+        }
+        if (!this.turnEvidence && !this.turnIsCommand) {
+            // A bare success envelope is not proof of delivery: nothing shows
+            // the remote ever ran this prompt.
+            this.failTurn({
+                code: 'mojo_no_turn_output',
+                message: '远端没有返回任何输出（没有文字、没有工具调用），无法确认这条消息被执行。消息已保留，可发 /retry 重投。',
+                retryable: true,
+            });
+            return;
+        }
         this.settleTurn();
     }
 
+    /** `{code, retryable}` of a provider error, with a stable code slug. */
+    private normalizeProviderError(err: MojoError | string): { code: string; retryable: boolean } {
+        const raw = typeof err === 'object' && typeof err.code === 'string' && err.code.trim() ? err.code : 'turn_error';
+        const code = raw.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'turn_error';
+        const retryable = typeof err === 'object' && typeof err.retryable === 'boolean'
+            ? err.retryable
+            : !NON_RETRYABLE_MOJO_CODES.has(code);
+        return { code, retryable };
+    }
+
+    /** Fail the current turn: the reason goes to the terminal AND, through
+     *  onTurnFailure, to the thread. */
+    private failTurn(failure: MojoTurnFailure): void {
+        // emitLine writes raw: a bare \n would staircase in xterm.
+        this.emitLine(`❌ ${failure.message.replace(/\r?\n/g, '\r\n')}`, 'err');
+        this.settleTurn(failure);
+    }
+
     /**
-     * Fire the turn boundary exactly once.
+     * Fire the turn boundary exactly once — as a delivered answer
+     * (onTurnFinal) or, given `failure`, as a failed turn (onTurnFailure).
+     * Never both: a failed turn must not also close as an empty success.
      *
      * This is the ONLY authority on when a mojo turn ends, which is why the
      * worker must not run its generic IdleDetector for this backend: that
@@ -2133,7 +2623,7 @@ export class MojoBackend implements SessionBackend {
      * still RUNNING (rejected — see SESSION_BUSY_RE) and attributing the reply
      * to the wrong turn/card. See the `isRemoteBackendType` gate in worker.ts.
      */
-    private settleTurn(): void {
+    private settleTurn(failure?: MojoTurnFailure): void {
         // `turnSettled` alone provides the once-per-turn guarantee. A
         // `seenResults` Set used to be maintained alongside it and described as
         // "session ids whose boundary already fired", but nothing ever queried it
@@ -2146,11 +2636,24 @@ export class MojoBackend implements SessionBackend {
         // BEFORE taskDoneCb: that callback re-arms prompt-ready and flushes
         // queued follow-ups, so emitting the answer afterwards would race the
         // next turn's card/turn attribution. A turn that produced no prose
-        // (tool-only, cancelled, failed) hands over '' and the worker's gate
-        // drops it — the backend does not decide deliverability.
+        // (tool-only) hands over '' and the worker's gate drops it — the
+        // backend does not decide deliverability.
         const finalText = this.turnFinalText;
         this.turnFinalText = '';
-        this.turnFinalCb?.(finalText);
+        if (failure) {
+            // Whatever the model did say before the failure is kept, above
+            // the reason, so a partial answer is not lost with the turn.
+            const partial = finalText.trim();
+            this.turnFailureCb?.({
+                ...(this.currentTurnId ? { turnId: this.currentTurnId } : {}),
+                code: failure.code,
+                message: partial ? `${partial}\n\n---\n❌ ${failure.message}` : `❌ ${failure.message}`,
+                status: 'failed',
+                retryable: failure.retryable,
+            });
+        } else {
+            this.turnFinalCb?.(finalText, this.currentTurnId);
+        }
         this.taskDoneCb?.();
         // Free the runTurn promise (and with it the write chain) NOW: the
         // client process is deliberately not awaited — with an embedded
@@ -2345,8 +2848,11 @@ export class MojoBackend implements SessionBackend {
     }
 
     /** Single-shot CLI call returning one JSON envelope (session.* subcommands). */
-    private async runCliJson(args: string[]): Promise<MojoCliEnvelope> {
-        const out = await this.runCli(args);
+    private async runCliJson(
+        args: string[],
+        opts?: { turnLiveJwt?: string | null; timeoutMs?: number },
+    ): Promise<MojoCliEnvelope> {
+        const out = await this.runCli(args, opts);
         // Startup notices can precede the envelope — take the last JSON line
         // rather than parsing the whole buffer.
         const line = out.split(/\r?\n/).map(l => l.trim())
@@ -2357,20 +2863,23 @@ export class MojoBackend implements SessionBackend {
         return env;
     }
 
-    private runCli(args: string[]): Promise<string> {
+    /** `turnLiveJwt` pins the credential snapshot of the turn this call serves
+     *  (see write()); omitted, the current live credential applies. */
+    private runCli(args: string[], opts?: { turnLiveJwt?: string | null; timeoutMs?: number }): Promise<string> {
         return new Promise<string>((resolve, reject) => {
             const launch = this.resolveLaunch(args);
+            const timeoutMs = opts?.timeoutMs ?? this.cliTimeoutMs;
             const child = spawnProcess(launch.bin, launch.args, {
                 cwd: this.resolveCwd(),
-                env: this.buildEnv(),
+                env: this.buildEnv(opts?.turnLiveJwt),
                 stdio: ['ignore', 'pipe', 'pipe'],
             });
             let stdout = '';
             let stderr = '';
             const timer = setTimeout(() => {
                 child.kill('SIGKILL');
-                reject(new Error(`mojo ${args.join(' ')} timed out after ${this.cliTimeoutMs}ms`));
-            }, this.cliTimeoutMs);
+                reject(new Error(`mojo ${args.join(' ')} timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
             child.stdout.on('data', (d: Buffer) => { stdout += d.toString(); });
             child.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
             child.on('error', (err: Error) => { clearTimeout(timer); reject(err); });

@@ -55,9 +55,15 @@ import {
   parseDoubaoAvailableModels,
   parseDoubaoModelListJson,
   parseDoubaoVersion,
-  pollDoubaoSessionForSubmit,
+  awaitDoubaoSubmitReceipt,
   DOUBAO_SUBMIT_CAPTURE_BUDGET_MS,
+  DOUBAO_SUBMIT_RECEIPT_BUDGET_MS,
 } from '../src/adapters/cli/doubao.js';
+import {
+  doubaoComposerState,
+  doubaoScreenHoldsSubmittedInput,
+  doubaoScreenShowsNoPendingInput,
+} from '../src/adapters/cli/doubao-screen.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 import { resolveDispatchLaunchSpec } from '../src/core/dispatch-launch-spec.js';
 import { STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS } from '../src/services/codex-bridge-queue.js';
@@ -215,6 +221,22 @@ describe('doubao screen patterns (captured from doubao 2.31.0)', () => {
 
   it('does not treat the login / startup banner as ready', () => {
     expect(DOUBAO_READY_PATTERN.test('Good morning\nmodel: GPT-6.1 Sol · High /model to change')).toBe(false);
+  });
+});
+
+describe('doubao: nothing pending anywhere', () => {
+  const rule = '─'.repeat(40);
+  const box = (composer: string, extra: string[] = []) => ['◆ answer', rule, composer, rule, '  Default model · Default · /work', ...extra].join('\n');
+  it('only an empty composer with no running turn and no queued input counts', () => {
+    expect(doubaoScreenShowsNoPendingInput(box('❯  Ask Doubao to do anything'))).toBe(true);
+    // The draft is still there.
+    expect(doubaoScreenShowsNoPendingInput(box('❯ second task'))).toBe(false);
+    // Submitted by hand and running now — its receipt is on the way.
+    expect(doubaoScreenShowsNoPendingInput(['◈ Running tool… (2s • esc to interrupt)', box('❯  Ask Doubao to do anything')].join('\n'))).toBe(false);
+    // Waiting in Doubao's own send queue.
+    expect(doubaoScreenShowsNoPendingInput(box('❯  Ask Doubao to do anything', ['1 queued · second task · Ctrl+Q manage']))).toBe(false);
+    // No composer on screen: cannot tell.
+    expect(doubaoScreenShowsNoPendingInput('Good morning')).toBe(false);
   });
 });
 
@@ -533,8 +555,8 @@ describe('doubao session capture', () => {
   );
 });
 
-describe('doubao submit capture polling', () => {
-  /** Fake clock: each sleep advances time; `find` sees the current time. */
+describe('doubao submit receipt wait', () => {
+  /** Fake clock: each sleep advances time; the receipt sees the current time. */
   function fakeClock() {
     let t = 0;
     return {
@@ -542,28 +564,31 @@ describe('doubao submit capture polling', () => {
       sleep: async (ms: number) => { t += ms; },
     };
   }
+  const hit = { submitted: true, cliSessionId: SID, ownershipProven: true };
+  const rule = '─'.repeat(40);
+  const screen = (composer: string, extra: string[] = []) => ({
+    captureViewportAsync: async () => ['◆ earlier answer', rule, composer, rule, '  Default model · Default · /work', ...extra].join('\n'),
+  });
 
   it('still captures an id that appears 8s after submit (cold service start)', async () => {
     const clock = fakeClock();
-    const sid = await pollDoubaoSessionForSubmit(
-      () => (clock.now() >= 8_000 ? SID : undefined),
-      clock,
-    );
-    expect(sid).toBe(SID);
+    const result = await awaitDoubaoSubmitReceipt({}, () => (clock.now() >= 8_000 ? hit : false),
+      { budgetMs: DOUBAO_SUBMIT_CAPTURE_BUDGET_MS, ...clock });
+    expect(result).toEqual(hit);
   });
 
-  it('returns immediately once the id is found instead of waiting out the budget', async () => {
+  it('returns immediately once the receipt is found instead of waiting out the budget', async () => {
     const clock = fakeClock();
     let calls = 0;
-    const sid = await pollDoubaoSessionForSubmit(() => (++calls >= 3 ? SID : undefined), clock);
-    expect(sid).toBe(SID);
+    const result = await awaitDoubaoSubmitReceipt({}, () => (++calls >= 3 ? hit : false), clock);
+    expect(result).toEqual(hit);
     expect(clock.now()).toBeLessThan(1_000);
   });
 
   it('gives up after the budget so a turn without a record does not block forever', async () => {
     const clock = fakeClock();
-    const sid = await pollDoubaoSessionForSubmit(() => undefined, clock);
-    expect(sid).toBeUndefined();
+    const result = await awaitDoubaoSubmitReceipt({}, () => false, { budgetMs: DOUBAO_SUBMIT_CAPTURE_BUDGET_MS, ...clock });
+    expect(result).toBeUndefined();
     expect(clock.now()).toBeGreaterThanOrEqual(DOUBAO_SUBMIT_CAPTURE_BUDGET_MS);
     expect(clock.now()).toBeLessThan(DOUBAO_SUBMIT_CAPTURE_BUDGET_MS + 1_000);
   });
@@ -572,6 +597,73 @@ describe('doubao submit capture polling', () => {
     // The structured queue prunes the head once this grace lapses; the in-band
     // poll (plus the paste/Enter delay) has to end before that.
     expect(DOUBAO_SUBMIT_CAPTURE_BUDGET_MS + 1_000).toBeLessThan(STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS);
+    expect(DOUBAO_SUBMIT_RECEIPT_BUDGET_MS).toBeLessThanOrEqual(DOUBAO_SUBMIT_CAPTURE_BUDGET_MS);
+  });
+
+  it('stops waiting once Doubao has parked the input in its own send queue', async () => {
+    const clock = fakeClock();
+    const result = await awaitDoubaoSubmitReceipt(
+      screen('❯  Ask Doubao to do anything', ['1 queued · second task · Ctrl+Q manage']), () => false, clock);
+    // Unverified, not failed: Doubao sends it when its running work ends.
+    expect(result).toBeUndefined();
+    expect(clock.now()).toBeLessThan(DOUBAO_SUBMIT_RECEIPT_BUDGET_MS / 2);
+  });
+
+  it('reports a draft that is still in the composer as not submitted, with a recheck', async () => {
+    const clock = fakeClock();
+    let landed = false;
+    const result = await awaitDoubaoSubmitReceipt(screen('❯ second task: summarize the failures'),
+      () => (landed ? hit : false), clock);
+    expect(result).toMatchObject({ submitted: false });
+    const recheck = (result as { recheck: () => unknown }).recheck;
+    expect(recheck()).toBe(false);
+    // A later manual Enter in the terminal confirms the same input.
+    landed = true;
+    expect(recheck()).toEqual(hit);
+  });
+
+  it('leaves an emptied composer without a receipt unverified rather than failed', async () => {
+    const clock = fakeClock();
+    expect(await awaitDoubaoSubmitReceipt(screen('❯  Ask Doubao to do anything'), () => false, clock)).toBeUndefined();
+  });
+});
+
+describe('doubao composer and held-input screens', () => {
+  const rule = '─'.repeat(40);
+  const frame = (rows: string[]) => ['◆ DONE-42', '', ...rows].join('\n');
+
+  it('reads the composer box (captured 2.31 layout, 2.37 composer rows)', () => {
+    expect(doubaoComposerState(frame([rule, '❯  Ask Doubao to do anything', rule, '  Enter send · Ctrl+J newline']))).toBe('empty');
+    expect(doubaoComposerState(frame([rule, '❯ second task', rule]))).toBe('draft');
+    expect(doubaoComposerState(frame([rule, '❯ [Pasted text #1 +12 lines]', rule]))).toBe('draft');
+    expect(doubaoComposerState(frame([rule, '\x1b[36m❯ \x1b[0m\x1b[2mAsk Doubao to do anything\x1b[0m', rule]))).toBe('empty');
+    // No composer box: startup banner or a panel covering the conversation.
+    expect(doubaoComposerState('Good morning\nmodel: Doubao · High')).toBe('unknown');
+    // A `❯` row that is not right under a rule (transcript / suggestions).
+    expect(doubaoComposerState(frame(['❯ earlier prompt', 'answer']))).toBe('unknown');
+  });
+
+  it('reads continuation rows before calling a multiline composer empty', () => {
+    expect(doubaoComposerState(frame([
+      rule, '❯ ', '  first surviving line', '  second surviving line', rule,
+    ]))).toBe('draft');
+    expect(doubaoComposerState(frame([
+      rule, '❯ ', '  ', '   ', rule,
+    ]))).toBe('empty');
+    expect(doubaoScreenShowsNoPendingInput(frame([
+      rule, '❯ ', '  first surviving line', rule,
+    ]))).toBe(false);
+  });
+
+  it('holds input while a turn runs or Doubao shows its own send queue', () => {
+    const idle = [rule, '❯  Ask Doubao to do anything', rule, '  Default model · Default · /work'];
+    expect(doubaoScreenHoldsSubmittedInput(frame(idle))).toBe(false);
+    expect(doubaoScreenHoldsSubmittedInput(frame(['◈ Running tool… (8s • esc to interrupt)', ...idle]))).toBe(true);
+    expect(doubaoScreenHoldsSubmittedInput(frame([...idle, '1 queued · second task · Ctrl+Q manage']))).toBe(true);
+    expect(doubaoScreenHoldsSubmittedInput(frame([...idle, 'Queue paused · 1 queued · second task · Ctrl+Q manage']))).toBe(true);
+    // Footer text quoted far up in the conversation is not the live footer.
+    const quoted = ['the footer reads (3s • esc to interrupt)', ...Array.from({ length: 30 }, () => ''), ...idle];
+    expect(doubaoScreenHoldsSubmittedInput(quoted.join('\n'))).toBe(false);
   });
 });
 
@@ -592,7 +684,7 @@ describe('doubao writeInput', () => {
     });
     const result = await adapter.writeInput(pty, envelope);
     await landed;
-    expect(result).toEqual({ submitted: true, cliSessionId: OTHER_SID });
+    expect(result).toEqual({ submitted: true, cliSessionId: OTHER_SID, ownershipProven: true });
   });
 
   it('rotates the capture id when another CLI generation starts', async () => {
@@ -610,7 +702,7 @@ describe('doubao writeInput', () => {
           resolve();
         }, 500);
       });
-      expect(await adapter.writeInput(pty, envelope)).toEqual({ submitted: true, cliSessionId: sid });
+      expect(await adapter.writeInput(pty, envelope)).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
       await landed;
       captureIds.push(/^botmux_input_id: ([0-9a-f]{32})$/m.exec(pty.log[0]!)?.[1]!);
     }
@@ -633,7 +725,7 @@ describe('doubao writeInput', () => {
     const resultA = adapter.writeInput(ptyA, envelope);
     // Replace the launch while A is still awaiting its assignment/poll.
     adapter.buildArgs({ sessionId: 'bmx-first', resume: false });
-    expect(await resultA).toEqual({ submitted: true, cliSessionId: SID });
+    expect(await resultA).toEqual({ submitted: true, cliSessionId: SID, ownershipProven: true });
     await landedA;
 
     const ptyB = fakeTmuxPty();
@@ -643,7 +735,7 @@ describe('doubao writeInput', () => {
         resolve();
       }, 500);
     });
-    expect(await adapter.writeInput(ptyB, envelope)).toEqual({ submitted: true, cliSessionId: OTHER_SID });
+    expect(await adapter.writeInput(ptyB, envelope)).toEqual({ submitted: true, cliSessionId: OTHER_SID, ownershipProven: true });
     await landedB;
     const idOf = (log: string[]) => /^botmux_input_id: ([0-9a-f]{32})$/m.exec(log[0]!)?.[1];
     expect(idOf(ptyB.log)).toBeDefined();
@@ -672,7 +764,7 @@ describe('doubao writeInput', () => {
 
     const result = await adapter.writeInput(pty, envelope);
     await Promise.all([oldLanded, currentLanded]);
-    expect(result).toEqual({ submitted: true, cliSessionId: OTHER_SID });
+    expect(result).toEqual({ submitted: true, cliSessionId: OTHER_SID, ownershipProven: true });
   });
 
   it('captures an appended reattach turn without reviving an unchanged generation', async () => {
@@ -693,12 +785,17 @@ describe('doubao writeInput', () => {
     });
     const result = await adapter.writeInput(pty, current);
     await landed;
-    expect(result).toEqual({ submitted: true, cliSessionId: OTHER_SID });
+    expect(result).toEqual({ submitted: true, cliSessionId: OTHER_SID, ownershipProven: true });
   });
 
+  /** Virtual clock for the post-Enter receipt wait. */
+  function submitClock() {
+    let t = 0;
+    return { now: () => t, sleep: async (ms: number) => { t += ms; } };
+  }
+
   it('pastes the whole prompt once and submits with a single Enter', async () => {
-    const adapter = createDoubaoAdapter('/bin/doubao');
-    // A precise resume disarms id capture, so writeInput returns right after Enter.
+    const adapter = createDoubaoAdapter('/bin/doubao', { submitClock: submitClock() });
     adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: SID });
     const pty = fakeTmuxPty();
     await adapter.writeInput(pty, 'line one\nline two');
@@ -706,18 +803,89 @@ describe('doubao writeInput', () => {
   });
 
   it('wraps raw PTY input in bracketed paste so newlines do not submit', async () => {
-    const adapter = createDoubaoAdapter('/bin/doubao');
+    const adapter = createDoubaoAdapter('/bin/doubao', { submitClock: submitClock() });
     adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: SID });
     const log: string[] = [];
     await adapter.writeInput({ write: (d: string) => { log.push(d); } }, 'a\nb');
     expect(log).toEqual(['\x1b[200~a\nb\x1b[201~', '\r']);
   });
 
-  it('reports an unconfirmed Enter as not submitted', async () => {
-    const adapter = createDoubaoAdapter('/bin/doubao');
+  it('reports an unconfirmed Enter as not submitted, keeping a receipt recheck', async () => {
+    const adapter = createDoubaoAdapter('/bin/doubao', { submitClock: submitClock() });
     adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: SID });
     const pty = { ...fakeTmuxPty(), sendSpecialKeys: () => false };
-    expect(await adapter.writeInput(pty, 'hi')).toEqual({ submitted: false });
+    const result = await adapter.writeInput(pty, 'hi');
+    expect(result).toMatchObject({ submitted: false });
+    expect(typeof (result as { recheck?: unknown }).recheck).toBe('function');
+  });
+
+  it('never sends Enter after a paste the backend did not confirm', async () => {
+    const rule = '─'.repeat(40);
+    for (const [composer, expected] of [
+      // Nothing landed: a definite non-submission the user hears about at once.
+      ['❯  Ask Doubao to do anything', { submitted: false, failureReason: expect.stringContaining('Enter was not sent') }],
+      // Something landed (or cannot be seen): an ambiguous draft, never submitted by botmux.
+      ['❯ hi', { submitted: false, recheck: expect.any(Function) }],
+    ] as const) {
+      const adapter = createDoubaoAdapter('/bin/doubao', { submitClock: submitClock() });
+      adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: SID });
+      const log: string[] = [];
+      const pty: PtyHandle = {
+        write: data => { log.push(`write:${data}`); },
+        pasteText: text => { log.push(`paste:${text}`); return false; },
+        sendSpecialKeys: (...keys) => { log.push(`keys:${keys.join(',')}`); },
+        captureViewportAsync: async () => [rule, composer, rule].join('\n'),
+      };
+      expect(await adapter.writeInput(pty, 'hi')).toEqual(expected);
+      expect(log).toEqual(['paste:hi']);
+    }
+  });
+
+  it('confirms an input to a bound session only from its own new assignment section', async () => {
+    const root = makeSessionsRootFromEnv();
+    const assignment = writeAssignment(root, SID, 'second task');
+    const adapter = createDoubaoAdapter('/bin/doubao', { submitClock: submitClock() });
+    adapter.buildArgs({ sessionId: 's', resume: true, resumeSessionId: SID });
+
+    // The same text already in history is not this submit's receipt.
+    expect(await adapter.writeInput(fakeTmuxPty(), 'second task')).toBeUndefined();
+
+    const pty = fakeTmuxPty();
+    const pasted = pty.pasteText!.bind(pty);
+    pty.pasteText = (text: string) => {
+      pasted(text);
+      // Doubao sends it: the request is appended to the session's own log.
+      appendFileSync(assignment, `## [2026-11-21T03:15:52Z] 需求\n${text}\n\n`);
+    };
+    expect(await adapter.writeInput(pty, 'second task')).toEqual({
+      submitted: true, cliSessionId: SID, ownershipProven: true,
+    });
+  });
+
+  it('keeps taking receipts from the session it captured on the first submit', async () => {
+    const root = makeSessionsRootFromEnv();
+    const envelope = '<session_id>bmx-first</session_id>\n<user_message>first</user_message>';
+    const adapter = createDoubaoAdapter('/bin/doubao');
+    adapter.buildArgs({ sessionId: 'bmx-first', resume: false });
+    const first = fakeTmuxPty();
+    const landed = new Promise<void>(resolve => setTimeout(() => {
+      writeAssignment(root, SID, first.log[0]!.slice('paste:'.length));
+      resolve();
+    }, 300));
+    expect(await adapter.writeInput(first, envelope)).toEqual({ submitted: true, cliSessionId: SID, ownershipProven: true });
+    await landed;
+
+    const next = fakeTmuxPty();
+    const pasted = next.pasteText!.bind(next);
+    next.pasteText = (text: string) => {
+      pasted(text);
+      appendAssignment(root, SID, text);
+    };
+    expect(await adapter.writeInput(next, 'follow-up question')).toEqual({
+      submitted: true, cliSessionId: SID, ownershipProven: true,
+    });
+    // Continuation input carries no capture id.
+    expect(next.log[0]).toBe('paste:follow-up question');
   });
 });
 

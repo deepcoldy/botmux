@@ -104,6 +104,14 @@ describe('normalizeMojoConfig', () => {
     expect(normalizeMojoConfig({ idleTimeoutSec: 30 }).ok).toBe(true);
   });
 
+  it('bounds busyWaitSec: a whole message (and its follow-ups) is held for the wait', () => {
+    for (const bad of [0, -5, 1.5, 3601, '60', true]) {
+      expect(normalizeMojoConfig({ busyWaitSec: bad }).ok, String(bad)).toBe(false);
+    }
+    expect(normalizeMojoConfig({ busyWaitSec: 1 }).ok).toBe(true);
+    expect(normalizeMojoConfig({ busyWaitSec: 3600 }).ok).toBe(true);
+  });
+
   it('validates env as a string→string map', () => {
     for (const bad of ['oops', ['a'], { A: 1 }, { A: null }, { A: { nested: 'x' } }]) {
       expect(normalizeMojoConfig({ env: bad }).ok, JSON.stringify(bad)).toBe(false);

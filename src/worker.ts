@@ -4431,6 +4431,113 @@ function holdStructuredStartLeasesWhileCliStarting(): void {
   codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), STARTUP_BLOCKER_HOLD_MAX_MS);
 }
 
+/** Same bound as a startup blocker: positive evidence that the CLI holds the
+ *  input keeps its turn attributable through a long tool run, but a screen
+ *  stuck on that evidence cannot hold a head forever. */
+const CLI_HELD_INPUT_MAX_MS = STARTUP_BLOCKER_HOLD_MAX_MS;
+/** The prune helper runs on every ingest; one viewport read serves a burst. */
+const CLI_HELD_INPUT_PROBE_INTERVAL_MS = 750;
+/** A write that settled at least this long before a screen showing the CLI
+ *  free (nothing running, nothing queued) had time to be drawn as taken. */
+const CLI_HELD_INPUT_SETTLE_MS = 2_000;
+let cliHeldInputProbe: { atMs: number; generation: number; held: boolean } | undefined;
+/** Heads the CLI was seen holding nothing pending at all after their write
+ *  settled (screenShowsNoPendingInput). A later busy screen belongs to other
+ *  work (e.g. a successor) and must not keep them. */
+let cliHeldInputReleased = new WeakSet<CodexPendingTurn>();
+
+/** An input the CLI took while busy (Doubao: into its own send queue) gets
+ *  its native user record only when the running work ends — possibly minutes
+ *  after the write. While the authoritative viewport proves the CLI still
+ *  holds such input (cliAdapter.screenHoldsSubmittedInput), keep every
+ *  unstarted head's pre-start lease alive; the 20s countdown starts once that
+ *  evidence is gone. Non-adopt only: an adopted pane's expired mark degrades
+ *  to a local turn instead. */
+function holdStructuredStartLeasesWhileCliHoldsInput(): void {
+  const be = backend;
+  const holds = cliAdapter?.screenHoldsSubmittedInput;
+  if (!be || !holds || lastInitConfig?.adoptMode) return;
+  if (!codexBridgeQueue.peek().some(turn => !turn.started && turn.finalText === undefined)) return;
+  const now = Date.now();
+  if (!cliHeldInputProbe || cliHeldInputProbe.generation !== cliSpawnGeneration
+    || now - cliHeldInputProbe.atMs >= CLI_HELD_INPUT_PROBE_INTERVAL_MS) {
+    let held = false;
+    let free = false;
+    if (backendScreenEvidenceIsAuthoritativeForMutation()) {
+      try {
+        const screen = captureBackendScreen(be);
+        held = !!screen && holds(screen);
+        // Only a screen that positively shows nothing pending ends a hold for
+        // good. A panel or menu covering the composer shows neither.
+        free = !!screen && !held && cliAdapter?.screenShowsNoPendingInput?.(screen) === true;
+      } catch { held = false; }
+    }
+    if (cliHeldInputProbe && cliHeldInputProbe.generation !== cliSpawnGeneration) cliHeldInputReleased = new WeakSet();
+    cliHeldInputProbe = { atMs: now, generation: cliSpawnGeneration, held };
+    if (free) {
+      for (const turn of codexBridgeQueue.peek()) {
+        if (!turn.started && turn.writeSettledAtMs !== undefined
+          && now - turn.writeSettledAtMs >= CLI_HELD_INPUT_SETTLE_MS) cliHeldInputReleased.add(turn);
+      }
+    }
+  }
+  if (cliHeldInputProbe.held) {
+    codexBridgeQueue.refreshUnstartedHeadAttributionLease(now, CLI_HELD_INPUT_MAX_MS,
+      turn => !cliHeldInputReleased.has(turn));
+  }
+}
+
+function driverPendingInputTurn(): CodexPendingTurn | undefined {
+  const spec = bridgeSpecFor(lastInitConfig?.cliId);
+  if (!spec?.awaitsPendingInput?.(structuredBridgeDriverState)) return undefined;
+  const owner = spec.pendingInputOwner?.(structuredBridgeDriverState);
+  if (owner) {
+    return codexBridgeQueue.peek().find(turn => turn.turnId === owner.turnId
+      && turn.dispatchAttempt === owner.dispatchAttempt && !turn.started && turn.finalText === undefined);
+  }
+  // State written before owner identity was introduced retains the old
+  // next-head behavior for this generation only.
+  return codexBridgeQueue.peek().find(turn => !turn.started && turn.finalText === undefined);
+}
+
+/** The transcript driver is waiting at a native record of the next pending
+ *  input whose prompt record is not readable yet (bridgeSpec.awaitsPendingInput;
+ *  the driver bounds that wait itself). The CLI may already be idle, so no
+ *  screen evidence covers this head: keep its own lease alive meanwhile. */
+function holdStructuredStartLeaseWhileDriverAwaitsInput(): void {
+  if (lastInitConfig?.adoptMode) return;
+  const next = driverPendingInputTurn();
+  if (!next) return;
+  codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CLI_HELD_INPUT_MAX_MS, turn => turn === next);
+}
+
+/** The CLI sends input it holds in submit order (screenHoldsSubmittedInput
+ *  contract). A receipt for this later input therefore ends every earlier,
+ *  still unstarted hold: expire those heads now (with the usual notice)
+ *  instead of letting them sit ahead of this turn's native start. */
+function expireHeldInputBeforeReceivedTurn(turnId: string, dispatchAttempt?: number): void {
+  if (!cliAdapter?.screenHoldsSubmittedInput) return;
+  // A driver-parked row is positive native-start evidence, not an input the
+  // CLI lost. Keep that exact head while its assignment section is late; a
+  // later receipt only expires older heads with no such evidence. Legacy
+  // parked state has no owner: never guess it from queue order (the row can
+  // belong to B while A is first); let the driver's bounded wait resolve it.
+  const spec = bridgeSpecFor(lastInitConfig?.cliId);
+  const waiting = spec?.awaitsPendingInput?.(structuredBridgeDriverState) === true;
+  const owner = spec?.pendingInputOwner?.(structuredBridgeDriverState);
+  if (waiting && !owner) return;
+  const driverParked = owner
+    ? codexBridgeQueue.peek().find(turn => turn.turnId === owner.turnId
+      && turn.dispatchAttempt === owner.dispatchAttempt && !turn.started && turn.finalText === undefined)
+    : undefined;
+  const expired = codexBridgeQueue.expireUnstartedBefore(turnId, dispatchAttempt,
+    turn => turn === driverParked);
+  if (expired.length === 0) return;
+  for (const turn of expired) cliHeldInputReleased.add(turn);
+  log(`Later input ${turnId.slice(0, 12)} was received; expiring ${expired.length} earlier unstarted head(s) the CLI no longer holds`);
+  pruneExpiredStructuredHeadsAndEmit('later input received');
+}
+
 /** Notice for a structured turn dropped before it ever started. Behind a
  *  recognized startup blocker the honest message is "not started", not "sent
  *  but missing from the transcript"; a first turn that stalled right after a
@@ -11064,7 +11171,36 @@ let mojoTurnMark: {
 function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number | undefined): void {
   if (effectiveBackendType !== 'mojo') return;
   mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
+  // Same instant, same turn: the backend binds it to the write about to land,
+  // so its final/failure reports this turn even if a passthrough has rotated
+  // currentBotmuxTurnId by the time a busy remote lets it end. Duck-typed for
+  // the same reason as pushMojoLivePatchToBackend.
+  const current = backend as (SessionBackend & { bindNextTurn?: (id: string | undefined) => void }) | null;
+  current?.bindNextTurn?.(turnId);
 }
+
+/**
+ * A mojo turn that the worker retired — a passthrough was written while it
+ * still waited on the remote — keeps executing: mojo serializes its turns, and
+ * the backend reports this turn's own id when it finally ends. Its outcome
+ * belongs to its own thread. Dropping it as stale would silently lose that
+ * message; attributing it to the current turn (as before exact ids) closed the
+ * wrong card. Remote-runner keeps its strict stale rule.
+ */
+function retiredMojoTurnEndsLate(turnId: string): boolean {
+  return effectiveBackendType === 'mojo' && retiredTurnIds.has(turnId);
+}
+
+/**
+ * Set by the final/failure handler when the boundary it just handled belongs
+ * to such a retired mojo turn; consumed by the onTaskDone that the backend
+ * fires right after it. That boundary is not the end of the turn the worker is
+ * waiting on, so it must not re-arm prompt-ready: doing so flushed the next
+ * message (and moved turn authority to it) while mojo was still executing the
+ * current one. Type-ahead attribution is unaffected — those boundaries belong
+ * to the current turn and still advance it.
+ */
+let mojoRetiredBoundaryPending = false;
 
 function deliverRemoteTurnFinal(
   text: string,
@@ -11077,7 +11213,8 @@ function deliverRemoteTurnFinal(
   // wrong reason. Falling back to an unmarked window degrades to "always
   // deliver" (shouldSuppressBridgeEmit needs markTimeMs to suppress on sends),
   // which is the safe direction for a bug whose symptom is silence.
-  const mark = mojoTurnMark && mojoTurnMark.turnId === currentBotmuxTurnId ? mojoTurnMark : null;
+  const markedTurnId = exactTurnId ?? currentBotmuxTurnId;
+  const mark = mojoTurnMark && mojoTurnMark.turnId === markedTurnId ? mojoTurnMark : null;
   const turnId = exactTurnId ?? mark?.turnId ?? currentBotmuxTurnId;
   // Without a turn id the daemon cannot resolve a reply target, and lastUuid
   // would not dedupe a retry. Dropping is right: this can only be output that
@@ -11086,7 +11223,8 @@ function deliverRemoteTurnFinal(
     log('Remote final bridge skipped: no turn id for this answer');
     return;
   }
-  const dispatchAttempt = mark?.dispatchAttempt ?? currentBotmuxDispatchAttempt;
+  const dispatchAttempt = mark?.dispatchAttempt
+    ?? (turnId === currentBotmuxTurnId ? currentBotmuxDispatchAttempt : undefined);
   // adoptMode is structurally impossible for mojo (no pane to adopt); passing
   // the real flag keeps this call identical in shape to the other gate callers.
   const adoptMode = lastInitConfig?.adoptMode === true;
@@ -13783,6 +13921,15 @@ function structuredBridgeIngestPath(
       openTurns: structuredBridgeIs('doubao')
         ? codexBridgeQueue.peek().filter(turn => turn.started && turn.finalText === undefined).length
         : undefined,
+      ownsNativeInput: structuredBridgeIs('doubao') && lastInitConfig?.adoptMode !== true
+        ? text => codexBridgeQueue.ownsTurnForNativeInput(text, Date.now(), true)
+        : undefined,
+      ownsNativeInputByFingerprint: structuredBridgeIs('doubao') && lastInitConfig?.adoptMode !== true
+        ? text => codexBridgeQueue.ownsTurnForNativeInput(text, Date.now())
+        : undefined,
+      nativeInputOwner: structuredBridgeIs('doubao') && lastInitConfig?.adoptMode !== true
+        ? (text, requireCompleteInput) => codexBridgeQueue.nativeInputOwner(text, Date.now(), requireCompleteInput)
+        : undefined,
       // The two flags are never set for the "other" driver: every caller sits
       // under its own structuredBridgeIs('oh-my-pi' | 'antigravity') guard.
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
@@ -16239,6 +16386,8 @@ function retireStructuredTurnAttribution(turns: readonly Pick<CodexPendingTurn, 
  *  through this helper and drains ready output in the same call stack. */
 function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   holdStructuredStartLeasesWhileCliStarting();
+  holdStructuredStartLeasesWhileCliHoldsInput();
+  holdStructuredStartLeaseWhileDriverAwaitsInput();
   let fenceCurrentRpcEngine = false;
   const settledByTerminal = new Set<CodexPendingTurn>();
   const displayRetirements: CodexPendingTurn[] = [];
@@ -21509,19 +21658,25 @@ function armInputDeliveryQuarantine(
   };
   inputDeliveryQuarantine?.cancelReceipt?.();
   inputDeliveryQuarantine = quarantine;
-  if (lastInitConfig?.cliId === 'traex' && item.turnId && item.dispatchAttempt === undefined) {
+  // Keep the exact bridge mark for a later manual submit of the parked draft
+  // (the structured start lease must not expire it in the meantime).
+  if (item.turnId && item.dispatchAttempt === undefined) {
     codexBridgeQueue.setInputDeliveryQuarantined(item.turnId, true);
   }
-  if (recheck) {
+  if (recheck || cliAdapter?.screenShowsNoPendingInput) {
     // Notification/attribution leases are bounded, but an ambiguous submit can
     // be accepted much later (e.g. a parked draft submitted in the terminal).
     // Keep its read-only receipt closure, not a live bridge mark or replayable
-    // queue entry.
+    // queue entry. A throwing write has no receipt closure: the same observer
+    // still supplies the bounded two-empty-screen release instead of wedging
+    // every successor until restart.
     // The ordinary recheck may accept a sibling's same-text history line;
     // recovery after attribution is gone requires positive pane ownership.
     const nativeSessionId = inputDeliveryObservedCliSessionId;
     const receipts = createQueuedActivationReceiptObserver(SUBMIT_DEFERRED_RECHECK_MS);
     quarantine.cancelReceipt = () => receipts.clear();
+    // Consecutive polls on which the CLI showed no pending input at all.
+    let noPendingInputPolls = 0;
     receipts.watch('quarantined-input', {
       isCurrent: () => inputDeliveryQuarantine === quarantine
         && backend === target && cliSpawnGeneration === quarantine.generation
@@ -21530,15 +21685,28 @@ function armInputDeliveryQuarantine(
       recheck: async () => {
         // While attribution is live, its existing confirmation/terminal path
         // owns recovery. In particular, do not race its awaited recheck.
-        if (quarantine.turnId
+        if (recheck && quarantine.turnId
           && (codexBridgeQueue.hasPendingTurn(quarantine.turnId, quarantine.dispatchAttempt)
             || codexBridgeQueue.hasTerminalTurn(quarantine.turnId, quarantine.dispatchAttempt))) return false;
-        const result = await recheck();
+        const result = recheck ? await recheck() : false;
         const expectedSessionId = nativeSessionId ?? inputDeliveryObservedCliSessionId;
-        return typeof result === 'object' && result && result.ownershipProven === true
+        if (typeof result === 'object' && result && result.ownershipProven === true
           && !!result.cliSessionId
-          && (!expectedSessionId || result.cliSessionId === expectedSessionId)
-          ? result : false;
+          && (!expectedSessionId || result.cliSessionId === expectedSessionId)) return result;
+        // Without attribution left (a durable attempt's mark is settled at its
+        // warning), this observer is the only release: a draft cleared or
+        // replaced by hand never produces a receipt.
+        const screen = cliAdapter?.screenShowsNoPendingInput && backendScreenEvidenceIsAuthoritativeForMutation()
+          ? captureBackendScreen(target) : '';
+        if (screen && cliAdapter!.screenShowsNoPendingInput!(screen)) {
+          if (++noPendingInputPolls >= 2) {
+            log(`${cliName()} no longer holds the quarantined input (empty idle composer on two receipt polls) — releasing`);
+            releaseInputDeliveryQuarantine(quarantine, 'unconfirmed input no longer pending in the CLI', { redriveTerminal: true });
+          }
+        } else {
+          noPendingInputPolls = 0;
+        }
+        return false;
       },
       onConfirmed: () => {
         // The native terminal may already have passed without a bridge mark.
@@ -23333,14 +23501,20 @@ function scheduleSubmitFailureNotify(
     dispatchAttempt: turnIdentity?.dispatchAttempt,
     cliGeneration: cliGenerationAtSchedule,
   });
-  const quarantineAtSchedule = lastInitConfig?.cliId === 'traex' && structuredTarget
+  // Adapters that quarantine an unconfirmed submit (TRAE, Doubao) keep its
+  // bridge mark and receipt recheck alive past the one warning: the draft may
+  // still be submitted by hand, and its late native start must find the turn.
+  const quarantineAtSchedule = cliAdapter?.quarantineUnconfirmedSubmits === true && structuredTarget
     ? currentInputDeliveryQuarantine() : null;
-  const retainTraexReceipt = lastInitConfig?.cliId === 'traex'
+  const retainQuarantinedReceipt = cliAdapter?.quarantineUnconfirmedSubmits === true
     && structuredTarget && !!recheck && !!bridgeTurnId
     && !!quarantineAtSchedule && turnIdentity?.dispatchAttempt === undefined
     && quarantineAtSchedule?.turnId === turnIdentity?.turnId;
+  // Only TRAE additionally presses submit once for a parked draft it can
+  // recognise on screen (traexComposerHoldsInput).
+  const traexDraftRescue = lastInitConfig?.cliId === 'traex' && retainQuarantinedReceipt;
   const draftContent = quarantineAtSchedule?.draftContent ?? msg;
-  if (lastInitConfig?.cliId === 'traex' && !retainTraexReceipt) {
+  if (lastInitConfig?.cliId === 'traex' && !retainQuarantinedReceipt) {
     // Explain why this submit has no parked-draft rescue: the chain below then
     // warns once and stops, and only the original receipt can release it.
     const why = !structuredTarget ? 'structured bridge inactive'
@@ -23376,6 +23550,9 @@ function scheduleSubmitFailureNotify(
     cliGeneration: cliGenerationAtSchedule,
   };
   let deferredRecheckAttempts = 0;
+  // Consecutive rechecks on which the CLI showed that it no longer holds this
+  // unconfirmed input anywhere (screenShowsNoPendingInput).
+  let noPendingInputChecks = 0;
   let activeSilenceExtra = 0;
   let busySilenceExtra = 0;
   let composerSubmitRescued = false;
@@ -23403,7 +23580,7 @@ function scheduleSubmitFailureNotify(
       log(`Discarded stale deferred submit recheck (${settlement.staleReason}) turn=${bridgeTurnId ?? '-'} attempt=${turnIdentity?.dispatchAttempt ?? '-'}`);
       return;
     }
-    if (retainTraexReceipt && currentInputDeliveryQuarantine() !== quarantineAtSchedule) return;
+    if (retainQuarantinedReceipt && currentInputDeliveryQuarantine() !== quarantineAtSchedule) return;
     if (settlement.recheckError !== undefined) {
       const err = settlement.recheckError as any;
       log(`Deferred recheck threw (${err?.message ?? err}); falling through to warning.`);
@@ -23419,7 +23596,7 @@ function scheduleSubmitFailureNotify(
         // parked composer as one merged message. Keep read-only polling until
         // an owned receipt (cliSessionId) or a native structured terminal
         // releases the quarantine via its exact-turn path.
-        if (retainTraexReceipt && !cliSessionId) {
+        if (retainQuarantinedReceipt && !cliSessionId) {
           log(`Deferred recheck saw an unattributed same-text receipt — keeping TRAE draft quarantine. preview="${preview}"`);
           armDeferredRecheck();
           return;
@@ -23455,7 +23632,7 @@ function scheduleSubmitFailureNotify(
         redriveRejectedStructuredReady();
         return;
       case 'suppress-usage-limit':
-        if (retainTraexReceipt) {
+        if (retainQuarantinedReceipt) {
           // A quota notice is not an exact receipt or cancellation of the
           // parked draft. Keep its later manual-submit path observable.
           armDeferredRecheck();
@@ -23510,10 +23687,32 @@ function scheduleSubmitFailureNotify(
       cliId: lastInitConfig?.cliId,
       lastActivityAtMs: lastPtyActivityAtMs,
     });
+    // A retained (quarantined) draft can stop being submittable without any
+    // receipt: the user cleared it in the Web terminal, or typed and sent
+    // something else. Once two rechecks in a row (20s apart, receipt still
+    // missing) see an empty composer and nothing held by the CLI, the input is
+    // gone. Release its quarantine and attribution so later input is not held
+    // until a restart; warn once if that has not happened yet.
+    let pendingInputGone = false;
+    if (retainQuarantinedReceipt && cliAdapter?.screenShowsNoPendingInput
+      && backendScreenEvidenceIsAuthoritativeForMutation() && submitDiagnosisScreen
+      && cliAdapter.screenShowsNoPendingInput(submitDiagnosisScreen)) {
+      noPendingInputChecks += 1;
+      pendingInputGone = noPendingInputChecks >= 2;
+    } else {
+      noPendingInputChecks = 0;
+    }
+    if (pendingInputGone) {
+      log(`Deferred recheck: ${cliName()} no longer holds the unconfirmed input (empty idle composer on two rechecks) — releasing its quarantine. preview="${preview}"`);
+      releaseInputDeliveryQuarantine(quarantineAtSchedule, 'unconfirmed input no longer pending in the CLI', { redriveTerminal: true });
+      dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
+      redriveRejectedStructuredReady();
+      if (quarantineAtSchedule!.submitWarningSent) return;
+    }
     // Receipt checks are read-only. A parked TRAE draft gets at most one
     // additional submit, after a fresh authoritative composer and a second
     // receipt check; any manual input disables this automatic intervention.
-    const traexRescueEligible = retainTraexReceipt && !quarantineAtSchedule!.draftRescueAttempted && !quarantineAtSchedule!.submitWarningSent
+    const traexRescueEligible = traexDraftRescue && !quarantineAtSchedule!.draftRescueAttempted && !quarantineAtSchedule!.submitWarningSent
       && !lastInitConfig?.adoptMode
       && externalInputGenerationAtWrite !== undefined
       && externalInputGenerationAtWrite === webTerminalInputGeneration
@@ -23529,7 +23728,7 @@ function scheduleSubmitFailureNotify(
       const stillParked = traexComposerHoldsInput(submitDiagnosisScreen, draftContent, { requireThreadReady: false });
       noteTraexRescue(`read-back: no receipt after the submit key; composer ${stillParked ? 'still holds' : 'no longer shows'} the original draft`);
     }
-    if (retainTraexReceipt && !traexDraftVisible) {
+    if (traexDraftRescue && !traexDraftVisible) {
       // Login / API-key screens can carry a device code or a signed URL in the
       // last row. Keep the diagnostic reason, but apply the same outbound
       // credential boundary as submitUnconfirmedNotice to this persistent log.
@@ -23609,7 +23808,7 @@ function scheduleSubmitFailureNotify(
     // The one-shot notice does not prove the message can never be submitted.
     // Retain attribution and keep reading the original receipt while this
     // exact quarantine exists, so manual submission also releases successors.
-    if (retainTraexReceipt && quarantineAtSchedule!.submitWarningSent) {
+    if (retainQuarantinedReceipt && !pendingInputGone && quarantineAtSchedule!.submitWarningSent) {
       armDeferredRecheck();
       return;
     }
@@ -23678,7 +23877,7 @@ function scheduleSubmitFailureNotify(
       return;
     }
 
-    if (sessionStartGated) {
+    if (sessionStartGated && !pendingInputGone) {
       const gated = decideSessionStartGatedSubmitWarning({
         sessionStartAtMs: sessionStartSignalAtMs,
         waitingSinceMs: activityBaselineMs,
@@ -23693,6 +23892,7 @@ function scheduleSubmitFailureNotify(
     }
     if (
       submitDiagnosis.reason === 'still_active'
+      && !pendingInputGone
       && !sessionStartGated
       && activeSilenceExtra < SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA
       && chainIsCurrent()
@@ -23704,11 +23904,11 @@ function scheduleSubmitFailureNotify(
     }
     log(`Submit failure diagnosis: ${submitDiagnosis.reason} (${submitDiagnosis.evidence})${submitDiagnosis.matched ? ` match=${submitDiagnosis.matched}` : ''} preview="${preview}"`);
 
-    if (!retainTraexReceipt) dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
+    if (!retainQuarantinedReceipt) dropFailedBridgeMark(bridgeTurnId, turnIdentity?.dispatchAttempt);
     redriveRejectedStructuredReady();
     log(`Deferred recheck still missing — notifying user. preview="${preview}"`);
     emitDurableTerminal('submit_unconfirmed');
-    if (retainTraexReceipt) {
+    if (retainQuarantinedReceipt && !pendingInputGone) {
       quarantineAtSchedule!.submitWarningSent = true;
       armDeferredRecheck();
     }
@@ -23729,7 +23929,8 @@ function scheduleSubmitFailureNotify(
                   : submitDiagnosis.reason === 'interactive_menu'
                     ? 'submitDiag.interactive_menu'
                     : submitDiagnosis.reason === 'draft_parked'
-                      ? 'submitDiag.draft_parked'
+                      // Later input is held behind this exact draft: say so.
+                      ? (quarantineAtSchedule && !pendingInputGone ? 'submitDiag.draft_parked_held' : 'submitDiag.draft_parked')
                       : 'worker.submit_unconfirmed',
           {
             cliName: cliName(),
@@ -25473,6 +25674,7 @@ async function flushPending(): Promise<void> {
       }
       if (result?.submitted === true && bridgeTurnId) {
         codexBridgeQueue.confirmPendingTurn(bridgeTurnId, undefined, item.dispatchAttempt);
+        expireHeldInputBeforeReceivedTurn(bridgeTurnId, item.dispatchAttempt);
       } else if (bridgeTurnId && !(result?.submitted === false && result.recheck && !result.failureReason)) {
         // Keep verification pending only while an adapter-supplied deferred
         // recheck can still produce authoritative submit evidence.
@@ -25617,6 +25819,11 @@ async function flushPending(): Promise<void> {
       if (directRpcTurnBlocksTypeAhead()) break;
       if (item.taskContinuation) break;
       if (item.trustedCaller && lastInitConfig?.cliId === 'codex') break;
+      // Doubao's write waits for its submit receipt, and anything typed while
+      // the turn it just started runs only lands in Doubao's own send queue.
+      // A successor that arrived meanwhile waits for the next prompt-ready
+      // edge (Doubao idle again), never for this write to return.
+      if (lastInitConfig?.cliId === 'doubao') break;
       // A type-ahead adapter may accept several queued submits in one flush.
       // Keep that optimization only within one authenticated principal: a
       // different sender must wait for this turn's terminal boundary.
@@ -33681,10 +33888,15 @@ async function spawnCliBody(
       }
       // Pi/OMP/EBSD transcript finals can also precede clearing their busy
       // marker. Defer on that explicit marker, while other reliable-terminal
-      // CLIs retain their established immediate terminal behavior.
+      // CLIs retain their established immediate terminal behavior. Doubao has
+      // no end-of-turn record at all (a content-only assistant row is read as
+      // the final) and keeps working after such a row; flushing a queued
+      // follow-up then only parks it in Doubao's own send queue, behind work
+      // botmux already considers finished. Its footer is the arbiter.
       const busyGuardedIdle = evidenceSource === 'screen'
         || (evidenceSource === 'external'
-          && (structuredBridgeIs('pi') || structuredBridgeIs('oh-my-pi') || structuredBridgeIs('ebsd')));
+          && (structuredBridgeIs('pi') || structuredBridgeIs('oh-my-pi') || structuredBridgeIs('ebsd')
+            || structuredBridgeIs('doubao')));
       if (busyGuardedIdle && idleBackend
         && deferPromptReadyWhileBusy(`${cliName()} ${evidenceSource}-idle`, idleBackend)) return;
       ptyIdleSettle.request(() => {
@@ -33751,6 +33963,13 @@ async function spawnCliBody(
   // in pendingMessages forever once the task finishes.
   backend.onTaskDone?.(bindSessionExecutionEvent(() => {
     if (fatalWorkerErrorPending) return;
+    if (mojoRetiredBoundaryPending) {
+      mojoRetiredBoundaryPending = false;
+      if (backend === observedBackend) {
+        log(`${cliName()} retired turn finished — prompt-ready stays with the current turn`);
+        return;
+      }
+    }
     // Generation fence (matches the onAgentStatus above and the onExit below):
     // a stale RiffBackend's `fetchAndEmitOutput(...).finally(taskDoneCb)` can
     // resolve AFTER destroySession()/kill() during a restart (neither clears
@@ -33771,8 +33990,11 @@ async function spawnCliBody(
     if (fatalWorkerErrorPending) return;
     if (backend !== observedBackend) return;
     if (turnId && currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
-      log(`Ignored stale remote final for turn ${turnId.substring(0, 12)}`);
-      return;
+      if (!retiredMojoTurnEndsLate(turnId)) {
+        log(`Ignored stale remote final for turn ${turnId.substring(0, 12)}`);
+        return;
+      }
+      mojoRetiredBoundaryPending = true;
     }
     try {
       deliverRemoteTurnFinal(text, turnId, hostContext?.linkRefMode);
@@ -33785,7 +34007,7 @@ async function spawnCliBody(
         completedTurnId,
         'completed',
         undefined,
-        currentBotmuxDispatchAttempt,
+        completedTurnId === currentBotmuxTurnId ? currentBotmuxDispatchAttempt : undefined,
       );
     }
   }, args => ({ turnId: args[1], origin: args[2]?.sessionOrigin })));
@@ -33878,23 +34100,35 @@ async function spawnCliBody(
   }, args => ({ turnId: args[0].turnId, dispatchAttempt: args[0].dispatchAttempt })));
   backend.onTurnFailure?.(bindSessionExecutionEvent((failure) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
-    if (currentBotmuxTurnId && failure.turnId !== currentBotmuxTurnId) {
-      log(`Ignored stale remote failure for turn ${failure.turnId.substring(0, 12)}`);
+    // A failure without a turn id (a mojo write the worker never bound to a
+    // turn, see stampMojoTurnMark) belongs to the current turn — the same
+    // attribution onTurnFinal uses. Without a turn there is no reply target.
+    const turnId = failure.turnId ?? currentBotmuxTurnId;
+    if (!turnId) {
+      log(`Remote failure ${failure.code} skipped: no turn id`);
       return;
     }
+    if (currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
+      if (!retiredMojoTurnEndsLate(turnId)) {
+        log(`Ignored stale remote failure for turn ${turnId.substring(0, 12)}`);
+        return;
+      }
+      mojoRetiredBoundaryPending = true;
+    }
+    const dispatchAttempt = turnId === currentBotmuxTurnId ? currentBotmuxDispatchAttempt : undefined;
     send({
       type: 'final_output',
       content: failure.message,
-      lastUuid: failure.turnId,
-      turnId: failure.turnId,
-      dispatchAttempt: currentBotmuxDispatchAttempt,
+      lastUuid: turnId,
+      turnId,
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       turnFailed: true,
     });
     emitTurnTerminal(
-      failure.turnId,
+      turnId,
       failure.status,
       failure.code,
-      currentBotmuxDispatchAttempt,
+      dispatchAttempt,
       undefined,
       failure.retryable,
     );

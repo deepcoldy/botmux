@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { waitForJsonFile } from './helpers/wait-for-json-file.js';
 import { t } from '../src/i18n/index.js';
 
 const WORKER_RESULT_WAIT_MS = 60_000;
@@ -36,10 +37,21 @@ setInterval(()=>{},1000);
       workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
       larkAppId: 'cli_current_app', larkAppSecret: 'test-only-secret', locale: 'zh',
       ...(replyDelivery ? { replyDelivery } : {}) });
-    const deadline = Date.now() + WORKER_RESULT_WAIT_MS;
-    while (!existsSync(output) && child.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
-    expect(existsSync(output), logs).toBe(true);
-    const { prompt, snapshot } = JSON.parse(readFileSync(output, 'utf8'));
+    // 不能只等 existsSync：fake CLI 的 writeFileSync 在 truncate 后、内容写完前
+    // 文件就已存在，立刻 readFileSync 会读到空/截断内容、JSON.parse 抛 EOF（#3692）。
+    // waitForJsonFile 会对空读/半截内容重试，直到能完整解析；子进程退出则提前失败。
+    let result: { prompt: string; snapshot: unknown };
+    try {
+      result = await waitForJsonFile<{ prompt: string; snapshot: unknown }>(output, {
+        timeoutMs: WORKER_RESULT_WAIT_MS,
+        // 子进程被 SIGKILL 时 exitCode 仍可能为 null、只填 signalCode，两个都要看，
+        // 否则生产方已死还会空等到超时。
+        shouldStop: () => child.exitCode !== null || child.signalCode !== null,
+      });
+    } catch (err) {
+      throw new Error(`${(err as Error).message}\n--- worker logs ---\n${logs}`);
+    }
+    const { prompt, snapshot } = result;
     expect(prompt).toContain('<botmux_routing>');
     const transcriptIntro = t('ai.routing.intro_transcript', undefined, 'zh');
     if (replyDelivery === 'transcript') {

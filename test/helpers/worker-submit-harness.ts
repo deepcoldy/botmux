@@ -72,6 +72,7 @@ export function workerSubmitHarness() {
     settleVerifiableSubmissionForJournal: vi.fn(),
     armInputDeliveryQuarantine: vi.fn(() => null),
     redriveRejectedStructuredReady: vi.fn(), observeQueuedActivationReceipt: vi.fn(),
+    expireHeldInputBeforeReceivedTurn: vi.fn(),
     inputDeliveryEvidence, submitFailureChains, SUBMIT_DEFERRED_RECHECK_MS: 20_000,
     screenMayShowCredential, diagnoseSubmitFailure,
     SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS: 2, unscopedSubmitFailureChainSequence: 0,

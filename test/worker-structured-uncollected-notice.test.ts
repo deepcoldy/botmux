@@ -5,7 +5,7 @@
  * the thread, and which are already covered by something else.
  */
 import { describe, expect, it, vi } from 'vitest';
-import type { CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from '../src/services/structured-uncollected-notice.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
@@ -20,9 +20,24 @@ interface Readiness {
   startupBlocker?: unknown;
 }
 
-function harness(dropped: CodexPendingTurn[], readiness: Readiness = { isPromptReady: true }) {
+function harness(
+  dropped: CodexPendingTurn[],
+  readiness: Readiness = { isPromptReady: true },
+  extra: Record<string, unknown> = {},
+) {
   const scope: Record<string, any> = {
-    codexBridgeQueue: { refreshUnstartedHeadAttributionLease: vi.fn() },
+    codexBridgeQueue: { refreshUnstartedHeadAttributionLease: vi.fn(), peek: () => dropped },
+    // No adapter evidence that the CLI still holds submitted input.
+    cliAdapter: undefined,
+    cliHeldInputProbe: undefined,
+    cliHeldInputReleased: new WeakSet(),
+    CLI_HELD_INPUT_MAX_MS: 'held-input-cap',
+    CLI_HELD_INPUT_PROBE_INTERVAL_MS: 750,
+    CLI_HELD_INPUT_SETTLE_MS: 2_000,
+    backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+    captureBackendScreen: vi.fn(() => ''),
+    bridgeSpecFor: () => undefined,
+    structuredBridgeDriverState: undefined,
     isPromptReady: false,
     promptReadyEdges: 1,
     promptReadyEdgesAtFreshCliStart: -1,
@@ -76,6 +91,7 @@ function harness(dropped: CodexPendingTurn[], readiness: Readiness = { isPromptR
     submitFailureChains: {
       has: (key: { turnId?: string; cliGeneration: number }) => key.turnId === 'om_rechecking' && key.cliGeneration === 3,
     },
+    ...extra,
   };
   scope.freshCliNeverReady = loadWorkerFunction('freshCliNeverReady', scope);
   scope.startupBlockerVisibleNow = loadWorkerFunction('startupBlockerVisibleNow', scope);
@@ -84,6 +100,9 @@ function harness(dropped: CodexPendingTurn[], readiness: Readiness = { isPromptR
   scope.uncollectedTranscriptFdDenial = loadWorkerFunction('uncollectedTranscriptFdDenial', scope);
   scope.uncollectedStructuredTurnNotice = loadWorkerFunction('uncollectedStructuredTurnNotice', scope);
   scope.holdStructuredStartLeasesWhileCliStarting = loadWorkerFunction('holdStructuredStartLeasesWhileCliStarting', scope);
+  scope.holdStructuredStartLeasesWhileCliHoldsInput = loadWorkerFunction('holdStructuredStartLeasesWhileCliHoldsInput', scope);
+  scope.driverPendingInputTurn = loadWorkerFunction('driverPendingInputTurn', scope);
+  scope.holdStructuredStartLeaseWhileDriverAwaitsInput = loadWorkerFunction('holdStructuredStartLeaseWhileDriverAwaitsInput', scope);
   scope.notifyUncollectedStructuredTurns = loadWorkerFunction('notifyUncollectedStructuredTurns', scope);
   const prune = loadWorkerFunction<(source: string) => boolean>('pruneExpiredStructuredHeadsAndEmit', scope);
   return { scope, prune };
@@ -164,6 +183,152 @@ describe('worker: expired structured heads', () => {
     later.prune('structured bridge tick');
     expect(later.scope.send.mock.calls.filter(([msg]: [any]) => msg.type === 'user_notify').map(([msg]: [any]) => msg.message)).toEqual(['worker.structured_turn_not_collected|Pi']);
     expect(later.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).not.toHaveBeenCalled();
+  });
+
+  describe('while the CLI visibly holds input it already took (Doubao send queue)', () => {
+    const heldScreen = '◈ Running tool… (40s • esc to interrupt)\n❯  Ask Doubao to do anything\n1 queued · second task · Ctrl+Q manage';
+    const adapter = {
+      screenHoldsSubmittedInput: (screen: string) => screen.includes('queued'),
+      screenShowsNoPendingInput: (screen: string) => screen.includes('Ask Doubao') && !screen.includes('queued'),
+    };
+
+    it('keeps the unstarted heads\' lease alive, bounded, before anything can expire', () => {
+      const held = harness([{ turnId: 'om_ordinary', started: false }], undefined, {
+        cliAdapter: adapter, captureBackendScreen: vi.fn(() => heldScreen),
+      });
+      held.prune('structured bridge tick');
+      expect(held.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease)
+        .toHaveBeenCalledWith(expect.any(Number), 'held-input-cap', expect.any(Function));
+      // One viewport read serves the burst of prunes an ingest produces.
+      held.prune('structured ingest');
+      expect(held.scope.captureBackendScreen).toHaveBeenCalledTimes(1);
+      expect(held.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).toHaveBeenCalledTimes(2);
+    });
+
+    it('stops covering a head the CLI was seen free of after its write settled', () => {
+      const now = Date.now();
+      const dead: CodexPendingTurn = { turnId: 'om_removed', started: false, writeSettledAtMs: now - 10_000 };
+      const fresh: CodexPendingTurn = { turnId: 'om_just_written', started: false, writeSettledAtMs: now - 500 };
+      // A panel covers the composer: nothing is proven either way.
+      let screen = 'Queued messages · remove';
+      const h = harness([dead, fresh], undefined, { cliAdapter: adapter, captureBackendScreen: vi.fn(() => screen) });
+      h.prune('structured bridge tick');
+      screen = heldScreen;
+      h.scope.cliHeldInputProbe.atMs -= 1_000;
+      h.prune('structured bridge tick');
+      const before = h.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease.mock.calls[0][2] as (t: CodexPendingTurn) => boolean;
+      expect(before(dead)).toBe(true);
+      h.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease.mockClear();
+      // Doubao idle with nothing queued: neither head is refreshed.
+      screen = '❯  Ask Doubao to do anything';
+      h.scope.cliHeldInputProbe.atMs -= 1_000;
+      h.prune('structured bridge tick');
+      expect(h.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).not.toHaveBeenCalled();
+      // A successor keeps Doubao busy: only a head written too recently to
+      // have been drawn as taken is still covered.
+      screen = heldScreen;
+      h.scope.cliHeldInputProbe.atMs -= 1_000;
+      h.prune('structured bridge tick');
+      const eligible = h.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease.mock.calls[0][2] as (t: CodexPendingTurn) => boolean;
+      expect(eligible(dead)).toBe(false);
+      expect(eligible(fresh)).toBe(true);
+    });
+
+    it('lets the normal lease run once the evidence is gone, in adopt mode, or on a non-authoritative screen', () => {
+      for (const extra of [
+        { captureBackendScreen: vi.fn(() => '❯  Ask Doubao to do anything') },
+        { captureBackendScreen: vi.fn(() => heldScreen), lastInitConfig: { adoptMode: true } },
+        { captureBackendScreen: vi.fn(() => heldScreen), backendScreenEvidenceIsAuthoritativeForMutation: () => false },
+      ]) {
+        const h = harness([{ turnId: 'om_ordinary', started: false }], undefined, { cliAdapter: adapter, ...extra });
+        h.prune('structured bridge tick');
+        expect(h.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).not.toHaveBeenCalled();
+      }
+      // Nothing unstarted: the screen is not even read.
+      const idle = harness([], undefined, { cliAdapter: adapter, captureBackendScreen: vi.fn(() => heldScreen) });
+      idle.prune('structured bridge tick');
+      expect(idle.scope.captureBackendScreen).not.toHaveBeenCalled();
+    });
+  });
+
+  it('keeps only the next pending head while the transcript driver waits at its request row', () => {
+    const next: CodexPendingTurn = { turnId: 'om_next', started: false };
+    const later: CodexPendingTurn = { turnId: 'om_later', started: false };
+    const spec = { awaitsPendingInput: (state: unknown) => (state as { parked?: boolean })?.parked === true };
+    const waiting = harness([next, later], undefined, { bridgeSpecFor: () => spec, structuredBridgeDriverState: { parked: true } });
+    waiting.prune('structured bridge tick');
+    const [, cap, eligible] = waiting.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease.mock.calls[0];
+    expect(cap).toBe('held-input-cap');
+    expect([next, later].map(turn => eligible(turn))).toEqual([true, false]);
+    for (const extra of [
+      { bridgeSpecFor: () => spec, structuredBridgeDriverState: { parked: false } },
+      { bridgeSpecFor: () => spec, structuredBridgeDriverState: { parked: true }, lastInitConfig: { adoptMode: true } },
+    ]) {
+      const idle = harness([next, later], undefined, extra);
+      idle.prune('structured bridge tick');
+      expect(idle.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).not.toHaveBeenCalled();
+    }
+  });
+
+  it('does not expire the driver-parked head when a later submit receipt arrives', () => {
+    const q = new CodexBridgeQueue(() => 1_000);
+    q.mark('om_A', 'A request', 1_000);
+    q.mark('om_B', 'B request', 1_000);
+    q.confirmPendingTurn('om_B', 1_000);
+    const h = harness([], undefined, {
+      codexBridgeQueue: q,
+      cliAdapter: { screenHoldsSubmittedInput: () => true },
+      bridgeSpecFor: () => ({ awaitsPendingInput: (state: unknown) => state === 'parked-A' }),
+      structuredBridgeDriverState: 'parked-A',
+      pruneExpiredStructuredHeadsAndEmit: vi.fn(),
+    });
+    const expire = loadWorkerFunction('expireHeldInputBeforeReceivedTurn', h.scope);
+    expire('om_B');
+    expect(q.hasPendingTurn('om_A')).toBe(true);
+    expect(q.peek()[0]?.unconfirmedAttributionStartedAtMs).toBe(1_000);
+    expect(q.hasPendingTurn('om_B')).toBe(true);
+  });
+
+  it('does not guess a parked owner from queue order for legacy driver state', () => {
+    const q = new CodexBridgeQueue(() => 1_000);
+    for (const turnId of ['om_A', 'om_B', 'om_C']) {
+      q.mark(turnId, `${turnId} request`, 1_000);
+      q.confirmPendingTurn(turnId, 1_000);
+    }
+    const h = harness([], undefined, {
+      codexBridgeQueue: q,
+      cliAdapter: { screenHoldsSubmittedInput: () => true },
+      bridgeSpecFor: () => ({ awaitsPendingInput: () => true }),
+      structuredBridgeDriverState: { parkedUserRow: { offset: 10, sinceMs: 1_000 } },
+      pruneExpiredStructuredHeadsAndEmit: vi.fn(),
+    });
+    const expire = loadWorkerFunction('expireHeldInputBeforeReceivedTurn', h.scope);
+    expire('om_C');
+    expect(q.peek().map(turn => [turn.turnId, turn.submitConfirmedAtMs])).toEqual([
+      ['om_A', 1_000], ['om_B', 1_000], ['om_C', 1_000],
+    ]);
+    expect(h.scope.pruneExpiredStructuredHeadsAndEmit).not.toHaveBeenCalled();
+  });
+
+  it('expires a dead predecessor rather than protecting it for a successor\'s parked row', () => {
+    const q = new CodexBridgeQueue(() => 1_000);
+    q.mark('om_deleted_A', 'A request', 1_000);
+    q.mark('om_B', 'B request', 1_000);
+    q.confirmPendingTurn('om_B', 1_000);
+    const h = harness([], undefined, {
+      codexBridgeQueue: q,
+      cliAdapter: { screenHoldsSubmittedInput: () => true },
+      bridgeSpecFor: () => ({
+        awaitsPendingInput: (state: unknown) => state === 'parked-B',
+        pendingInputOwner: (state: unknown) => state === 'parked-B' ? { turnId: 'om_B' } : undefined,
+      }),
+      structuredBridgeDriverState: 'parked-B',
+      pruneExpiredStructuredHeadsAndEmit: vi.fn(),
+    });
+    const expire = loadWorkerFunction('expireHeldInputBeforeReceivedTurn', h.scope);
+    expire('om_B');
+    expect(q.peek()[0]).toMatchObject({ turnId: 'om_deleted_A', unconfirmedAttributionStartedAtMs: Number.NEGATIVE_INFINITY });
+    expect(q.peek()[1]).toMatchObject({ turnId: 'om_B', submitConfirmedAtMs: 1_000 });
   });
 
   describe('when procfs refused the CLI process its open files', () => {
