@@ -84,6 +84,8 @@ export interface FakeMojoControl {
   getDelayMs?: number;
   /** `-p` prints a plain-text notice line on stdout first (update hint). */
   stdoutNotice?: boolean;
+  /** The pre-check refusal is written only after this delay (slow runner). */
+  precheckDelayMs?: number;
 }
 
 export interface FakeMojoRemote {
@@ -207,6 +209,7 @@ async function main() {
     if (!sess) { save(s); process.stderr.write('mojo: 会话 ' + resume + ' 不存在或不可访问\n'); process.exit(1); }
     if (RUNNING_SET.has(sess.status) && observeLive(sess)) {
       save(s);
+      if (control.precheckDelayMs) await sleep(control.precheckDelayMs);
       process.stderr.write('mojo: 会话 ' + resume + ' 正在执行中（' + 'RUNNING' + '），稍后再试\n');
       process.exit(1);
     }

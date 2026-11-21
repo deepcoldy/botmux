@@ -207,11 +207,21 @@ function openSession(fake: FakeMojoRemote, extra: Partial<EffectiveMojoConfig> =
   }, 'session-busy-lifecycle');
   const boundaries: Boundary[] = [];
   let done = 0;
+  let out = '';
+  backend.onData((d) => { out += d; });
   backend.onTurnFinal((text, turnId) => { boundaries.push({ kind: 'final', text, turnId }); });
   backend.onTurnFailure?.((failure) => { boundaries.push({ kind: 'failure', failure, turnId: failure.turnId }); });
   backend.onTaskDone(() => { done += 1; });
   backend.spawn('', [], {} as never);
-  return { backend, boundaries, done: () => done };
+  return { backend, boundaries, done: () => done, out: () => out };
+}
+
+/** The backend has processed the pre-check refusal and is now waiting on the
+ *  remote (it announces the wait on its terminal). Acting on the fake's
+ *  invocation log alone races the refused client, which may still be alive —
+ *  a close would then kill a RUNNING client, a different scenario. */
+async function untilWaitingOnRemote(s: { out: () => string }): Promise<void> {
+  await until(() => s.out().includes('⏳'), 15_000, () => `never started waiting: ${s.out()}`);
 }
 
 async function until(predicate: () => boolean, timeoutMs: number, what: () => string): Promise<void> {
@@ -231,7 +241,7 @@ describe('mojo busy wait × session lifecycle', () => {
     fake.control({ sessions: { [SID]: 'live' }, cancelFails: true, cancelDelayMs: 3_000 });
     const s = openSession(fake);
     s.backend.write('第一条');
-    await until(() => fake.printInvocations().length >= 1, 15_000, () => 'never launched');
+    await untilWaitingOnRemote(s);
 
     const closed = await s.backend.destroySession();
     expect(closed).toMatchObject({ ok: false, recovery: 'retryable', admission: 'restorable' });
@@ -245,10 +255,12 @@ describe('mojo busy wait × session lifecycle', () => {
 
   it('a /close that succeeds mid-wait ends the message silently and launches nothing more', async () => {
     const fake = remote({ [SID]: liveSession(1) });
-    fake.control({ sessions: { [SID]: 'live' } });
+    // A slow refusal: closing while the refused client is still alive is a
+    // different scenario (teardown of a running client), not "mid-wait".
+    fake.control({ sessions: { [SID]: 'live' }, precheckDelayMs: 800 });
     const s = openSession(fake);
     s.backend.write('第一条');
-    await until(() => fake.printInvocations().length >= 1, 15_000, () => 'never launched');
+    await untilWaitingOnRemote(s);
 
     expect(await s.backend.destroySession()).toMatchObject({ ok: true });
     fake.control({ sessions: { [SID]: 'free' } });
@@ -262,7 +274,7 @@ describe('mojo busy wait × session lifecycle', () => {
     fake.control({ sessions: { [SID]: 'live' } });
     const s = openSession(fake);
     s.backend.write('第一条');
-    await until(() => fake.printInvocations().length >= 1, 15_000, () => 'never launched');
+    await untilWaitingOnRemote(s);
 
     expect(await s.backend.prepareShutdownDetach()).toMatchObject({ ok: true });
     fake.control({ sessions: { [SID]: 'free' } });
@@ -284,7 +296,7 @@ describe('mojo busy wait × session lifecycle', () => {
     const s = openSession(fake, { busyWaitSec: 2 });
     s.backend.bindNextTurn?.('om_T1');
     s.backend.write('第一条');
-    await until(() => fake.printInvocations().length >= 1, 15_000, () => 'never launched');
+    await untilWaitingOnRemote(s);
     // A passthrough command lands while the first message is still waiting.
     s.backend.bindNextTurn?.('om_T2');
     s.backend.write('/model');
@@ -317,7 +329,7 @@ describe('mojo busy wait × session lifecycle', () => {
     fake.control({ sessions: { [SID]: 'live' } });
     const s = openSession(fake, { jwt: 'tok-A' });
     s.backend.write('第一条');
-    await until(() => fake.printInvocations().length >= 1, 15_000, () => 'never launched');
+    await untilWaitingOnRemote(s);
 
     s.backend.applyLivePatch({ jwt: null });
     fake.control({ sessions: { [SID]: 'free' } });
@@ -395,7 +407,7 @@ describe('mojo busy wait: further lifecycle and remote edges', () => {
     fake.control({ sessions: { [SID]: 'live' }, stdoutNotice: true });
     const s = openSession(fake);
     s.backend.write('第一条');
-    await until(() => fake.printInvocations().length >= 1, 15_000, () => 'never launched');
+    await untilWaitingOnRemote(s);
     fake.control({ sessions: { [SID]: 'free' }, stdoutNotice: true });
     await until(() => s.done() > 0, 30_000, () => 'never settled');
     expect(s.boundaries).toEqual([expect.objectContaining({ kind: 'final', text: '提示行之后送达' })]);
@@ -424,7 +436,7 @@ describe('mojo busy wait: further lifecycle and remote edges', () => {
     fake.control({ sessions: { [SID]: 'live' } });
     const s = openSession(fake, { jwt: 'tok-A' });
     s.backend.write('第一条');
-    await until(() => fake.printInvocations().length >= 1, 15_000, () => 'never launched');
+    await untilWaitingOnRemote(s);
     fake.control({ sessions: { [SID]: 'free' }, getDelayMs: 1_500 });
     await until(() => fake.sessionGetInvocations().length >= 1, 15_000, () => 'never probed');
     s.backend.applyLivePatch({ jwt: null });
