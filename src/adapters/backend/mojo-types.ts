@@ -26,6 +26,19 @@ export interface MojoConfig {
     cloud?: boolean;
     /** `--idle-timeout <sec>`. */
     idleTimeoutSec?: number;
+    /**
+     * How long a message may wait for the remote session to finish a turn that
+     * is still EXECUTING (the CLI refuses `-r` with "正在执行中") before the
+     * message is failed as not delivered. Default 60, range 1–3600 seconds.
+     *
+     * The wait polls `mojo session get` (a plain control-plane read — no
+     * per-turn client launch, no local mojo-daemon start) and resubmits once the
+     * remote turn has ended. It does NOT apply to a prompt the backend accepted
+     * into its queue but never started (`session_busy`): that prompt is already
+     * on the remote side, so it is failed at once and never resubmitted —
+     * resubmitting would only pile duplicates into the remote queue.
+     */
+    busyWaitSec?: number;
     /** Default true. When false, `--include-partial` is omitted (no deltas). */
     stream?: boolean;
     /** Prepended to every prompt (botmux routing/identity block). */
@@ -828,6 +841,7 @@ const MOJO_FIELD_VALIDATORS: Readonly<Record<keyof MojoConfig, (v: unknown) => s
     agentId: nonEmptyString,
     cloud: strictBoolean,
     idleTimeoutSec: positiveInteger,
+    busyWaitSec: busyWaitSeconds,
     stream: strictBoolean,
     systemPrompt: plainString,
     jwt: nonEmptyString,
@@ -850,6 +864,16 @@ function positiveInteger(v: unknown): string | undefined {
     return typeof v === 'number' && Number.isInteger(v) && v > 0
         ? undefined
         : 'must be a positive integer';
+}
+
+/** Upper bound for `busyWaitSec`: a turn is held (and its follow-ups queued)
+ *  for the whole wait, so an unbounded value would wedge the session. */
+const MOJO_BUSY_WAIT_SEC_MAX = 3600;
+
+function busyWaitSeconds(v: unknown): string | undefined {
+    return typeof v === 'number' && Number.isInteger(v) && v > 0 && v <= MOJO_BUSY_WAIT_SEC_MAX
+        ? undefined
+        : `must be an integer between 1 and ${MOJO_BUSY_WAIT_SEC_MAX}`;
 }
 
 function plainString(v: unknown): string | undefined {

@@ -150,7 +150,10 @@ export interface BackendTurnSubmission {
 
 export interface BackendTurnFailure {
   sessionOrigin?: import('../../services/session-event-scope.js').CapturedSessionOrigin;
-  turnId: string;
+  /** The turn this failure ends. Omitted when the backend has no id for it
+   *  (a Mojo write the worker never bound via bindNextTurn); the worker then
+   *  attributes it to its current turn, exactly as it does for onTurnFinal. */
+  turnId?: string;
   code: string;
   message: string;
   status: 'failed' | 'ambiguous' | 'cancelled';
