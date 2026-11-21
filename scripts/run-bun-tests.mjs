@@ -38,6 +38,7 @@ import { join, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { availableParallelism, tmpdir as realTmpdir } from 'node:os';
 import { acquireTestSlot, resolveTestConcurrency } from './test-concurrency.mjs';
+import { reapRegisteredTestProcesses } from './test-process-reaper.mjs';
 import { bunSuiteHash, parseBunRunnerArgs, selectBunShard, writeBunTimingReport } from './bun-test-shards.mjs';
 
 let options;
@@ -123,6 +124,9 @@ function mintFencedEnv() {
   // Mirrors test/helpers/fence-home-env.ts; kept here as well because that file
   // only runs after Bun has started.
   for (const name of ['BOTS_CONFIG', 'PM2_HOME', 'PLUGIN_PM2_HOME']) delete env[name];
+  // Keep the child's tmux registry inside the scratch owned by this runner. If
+  // the child is SIGKILLed, removeScratch can still reap by pid before deleting.
+  env.BOTMUX_TMUX_FENCE_PARENT = scratch;
 
   return { scratch, env };
 }
@@ -327,6 +331,20 @@ const liveChildren = new Map();
  * nuisance, losing the whole run's results is not.
  */
 function removeScratch(scratch) {
+  // A detached tmux server is outside the child's process group. Reap its
+  // registered pid (and any sandbox fake CLI) BEFORE removing the evidence.
+  const reaped = reapRegisteredTestProcesses(scratch);
+  for (const ref of reaped.tmuxFailed) {
+    process.stderr.write(`[runner] tmux server pid ${ref.pid} is still alive for ${ref.socket}\n`);
+  }
+  if (reaped.sandboxFailed.length > 0) {
+    process.stderr.write(`[runner] sandbox process(es) still alive: ${reaped.sandboxFailed.join(', ')}\n`);
+  }
+  if (reaped.tmuxFailed.length > 0 || reaped.sandboxFailed.length > 0) {
+    process.exitCode = 1;
+    process.stderr.write(`[runner] keeping ${scratch} because process cleanup could not be confirmed\n`);
+    return;
+  }
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       rmSync(scratch, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -386,6 +404,9 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     if (shuttingDown) return;
     shuttingDown = true;
     for (const [child, scratch] of liveChildren) {
+      // Let an already-issued new-session publish its server before the group
+      // is killed; removeScratch repeats this after the group sweep.
+      reapRegisteredTestProcesses(scratch);
       killTree(child, 'SIGKILL');
       // Cancellation is exactly when these would otherwise accumulate: the close
       // handler that normally removes them never runs.
@@ -472,6 +493,9 @@ function runOne(file) {
       // survived a NORMAL file close as a PPID=1 process holding a port. Deleting
       // the scratch dir without this made a directory-based check look clean while
       // the process was still alive, so sweep BEFORE removing the evidence.
+      // Give a mid-start tmux server a bounded chance to bind before the
+      // client's process group is swept, then repeat the check in removeScratch.
+      reapRegisteredTestProcesses(scratch);
       killTree(child, 'SIGKILL');
       removeScratch(scratch);
       // A signal death (wall-clock kill, OOM) leaves code null — never let that

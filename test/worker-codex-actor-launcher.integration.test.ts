@@ -1,4 +1,5 @@
-import { execFileSync, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
+import { killPrivateTmuxServer } from '../scripts/test-process-reaper.mjs';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -183,7 +184,8 @@ exec '${node}' '${launcherScript}'
       if (pid) try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ }
     }
     if (backendType === 'tmux') {
-      try { execFileSync('tmux', ['kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
+      const privateSocket = join(root, `tmux-${process.getuid?.() ?? 0}`, 'default');
+      killPrivateTmuxServer('tmux', privateSocket, { env: privateTmuxEnv(root) });
     }
     rmSync(root, { recursive: true, force: true });
   }

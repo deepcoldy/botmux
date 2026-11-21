@@ -14,7 +14,8 @@
  * relay needs bun to run from source, the session scope needs a user systemd).
  */
 import { randomUUID } from 'node:crypto';
-import { execFileSync, spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { killPrivateTmuxServer } from '../../scripts/test-process-reaper.mjs';
 import { EventEmitter } from 'node:events';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -527,7 +528,7 @@ child.on('exit', code => process.exit(code ?? 1));
     // Managed sessions live on the dedicated socket, both under this root.
     for (const name of new Set(['default', preferredManagedTmuxSocket() ?? 'default'])) {
       const socket = join(root, `tmux-${process.getuid?.() ?? 0}`, name);
-      try { execFileSync('tmux', ['-S', socket, 'kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* gone */ }
+      killPrivateTmuxServer('tmux', socket, { env: privateTmuxEnv(root) });
     }
   };
   cleanups.push(() => {

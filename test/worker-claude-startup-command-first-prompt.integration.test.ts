@@ -36,7 +36,8 @@
  *      SessionStart, and the warning must follow it despite the redraws.
  */
 import { randomUUID } from 'node:crypto';
-import { execFileSync, spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { killPrivateTmuxServer } from '../scripts/test-process-reaper.mjs';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -321,7 +322,7 @@ async function runScenario(scenario: Scenario): Promise<ScenarioRun> {
     // Never a bare kill-server: should TMUX_TMPDIR be missing, tmux silently
     // falls back to /tmp and the host's default server would be the target.
     const privateSocket = join(root, `tmux-${process.getuid?.() ?? 0}`, 'default');
-    try { execFileSync('tmux', ['-S', privateSocket, 'kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
+    killPrivateTmuxServer('tmux', privateSocket, { env: privateTmuxEnv(root) });
     rmSync(root, { recursive: true, force: true });
   }
   return run;
