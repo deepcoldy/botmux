@@ -1232,6 +1232,39 @@ describe('launcher-chain recovery guards', () => {
   });
 });
 
+describe('historical follow-up reply delivery', () => {
+  it('runs a historical absorbed reply through its delivery handler before acknowledging it', async () => {
+    const effects: string[] = [];
+    const ds: any = { larkAppId: 'a', session: { sessionId: 's', status: 'active', cliId: 'codex' } };
+    const worker: any = { connected: true };
+    ds.worker = worker;
+    const contractWorker: any = { workerId: 'w', generation: 1 };
+    const context: any = {
+      version: 2, session: { appId: 'a', sessionId: 's' }, producer: contractWorker,
+      bindingId: 'b', eventId: 'w:1', sequence: 1, scope: {},
+    };
+    const admission = { kind: 'historical' as const, context };
+    const controller: any = {
+      ingest: () => admission,
+      flushPrimary: async () => {},
+      gateway: { admit: () => admission },
+      store: { acknowledgeDeferred: () => { effects.push('ack'); } },
+      run: async (_admission: unknown, work: () => Promise<void>) => work(),
+    };
+    const env: any = {
+      ds, worker, contractWorker, sessionController: controller,
+      logger: { warn() {}, info() {}, debug() {}, error() {} }, t: 'probe', cb: {},
+      handleLegacyWorkerMessage: async () => { effects.push('deliver'); },
+    };
+    const handle = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', env);
+    await handle({
+      type: 'absorbed_reply', turnId: 'om_fold', answer: 'answer', replyUuid: 'a1', source: 'text', turnReply: true,
+      sessionContract: context,
+    });
+    expect(effects).toEqual(['deliver', 'ack']);
+  });
+});
+
 describe('re-publication through the real worker and daemon paths after a launcher-bound turn survives a restart', () => {
   it('re-signs the observed turn on the recovered leaf runtime once, and the daemon restores its managed origin', async () => {
     const data = mkdtempSync(join(tmpdir(), 'reattach-real-publish-'));

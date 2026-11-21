@@ -27967,7 +27967,7 @@ function setupWorkerHandlers(
       if (msg.type === 'turn_terminal' && msg.continuationFailure) enqueueContinuationFailureNotice(ds, msg.continuationFailure);
       if (deliveryAdmission.kind === 'historical') {
         if (msg.type === 'turn_terminal') await cb.onTurnTerminal?.(ds, msg, { workerGeneration: metadata!.producer.generation });
-        if (msg.type === 'final_output') await sessionController.run(deliveryAdmission, () => handleLegacyWorkerMessage(msg));
+        if (msg.type === 'final_output' || msg.type === 'absorbed_reply') await sessionController.run(deliveryAdmission, () => handleLegacyWorkerMessage(msg));
       } else {
         if (msg.type === 'final_output') msg = { ...msg, sessionOutputOrigin: msg.sessionOutputOrigin ?? deliveryAdmission.context };
         await sessionController.run(deliveryAdmission, () => handleLegacyWorkerMessage(msg));
