@@ -167,6 +167,11 @@ const MOJO_CLOSE_UNRESOLVED_FAILURE: MojoTurnFailure = {
     message: '会话关闭一直没有结论，这条消息没有送达。请稍后重新 /close，或发 /retry 重投。',
     retryable: true,
 };
+const MOJO_CLOSE_UNRESOLVED_AFTER_SUBMIT_FAILURE: MojoTurnFailure = {
+    code: 'mojo_close_unresolved_after_submit',
+    message: '会话关闭一直没有结论，已经提交的这条消息结果未知：本地 Mojo 客户端被结束，远端可能仍在执行或已经完成。写入准入尚未恢复，请稍后重新 /close 确认会话状态；确认原回合未执行后可发 /retry，重投可能重复操作。',
+    retryable: true,
+};
 /**
  * `session get` states (1.0.13 schema-v1) in which the remote turn has not
  * ended yet. Everything else — completed / failed / cancelled / idle /
@@ -1923,7 +1928,7 @@ export class MojoBackend implements SessionBackend {
                 return;
             }
             // Pre-check refusal: nothing was submitted, the remote is executing.
-            if (resubmit && ++refusedResubmits > MAX_REFUSED_BUSY_RESUBMITS) {
+            if (resubmit && ++refusedResubmits >= MAX_REFUSED_BUSY_RESUBMITS) {
                 // The remote keeps saying its turn ended (or cannot say), yet
                 // keeps refusing a new one: more launches will not change that.
                 this.reportRemoteBusyMismatch('refused_after_turn_ended', lastRemote);
@@ -2007,9 +2012,15 @@ export class MojoBackend implements SessionBackend {
             if (this.killed) return 'torn_down';
             if (this.admissionFenced) return 'fenced';
             if (!this.closing && !this.shutdownDetaching) return 'proceed';
-            if (Date.now() - startedAt > MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS) return 'unresolved';
+            if (Date.now() - startedAt > this.lifecycleConclusionBudgetMs) return 'unresolved';
             await new Promise<void>(r => setTimeout(r, BUSY_ADMISSION_POLL_MS));
         }
+    }
+
+    /** Overridable so a lifecycle test can exercise an unresolved close without
+     *  burning the production close-result budget in wall-clock. */
+    protected get lifecycleConclusionBudgetMs(): number {
+        return MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS;
     }
 
     /**
@@ -2027,6 +2038,10 @@ export class MojoBackend implements SessionBackend {
         }
         if (verdict === 'fenced') {
             this.failTurn(MOJO_FENCED_FAILURE);
+            return;
+        }
+        if (verdict === 'unresolved') {
+            this.failTurn(MOJO_CLOSE_UNRESOLVED_AFTER_SUBMIT_FAILURE);
             return;
         }
         this.failTurn({
@@ -2051,8 +2066,9 @@ export class MojoBackend implements SessionBackend {
 
     /**
      * Ask the remote what its session's current turn is doing (`mojo session
-     * get`). Null when that cannot be known — no lineage, an older CLI, a team
-     * session it cannot find without --workspace-id, or any error.
+     * get`). Team sessions carry the same workspace id as their normal turn
+     * launches. Null when that cannot be known — no lineage, an older CLI, or
+     * any error.
      */
     private async probeRemoteTurn(
         turnLiveJwt: string | null | undefined,
@@ -2064,7 +2080,9 @@ export class MojoBackend implements SessionBackend {
             // Bounded by what is left of the busy budget (with a floor so a
             // last-moment probe still has time to answer at all).
             const timeoutMs = Math.min(BUSY_PROBE_TIMEOUT_MS, Math.max(deadline - Date.now(), BUSY_PROBE_MIN_TIMEOUT_MS));
-            const env = await this.runCliJson(['session', 'get', sessionId], { turnLiveJwt, timeoutMs });
+            const args = ['session', 'get', sessionId];
+            if (this.config.workspaceId) args.push('--workspace-id', this.config.workspaceId);
+            const env = await this.runCliJson(args, { turnLiveJwt, timeoutMs });
             if (env.operation !== 'session.get' || typeof env.state !== 'string' || !env.state) return null;
             return { state: env.state, turnId: typeof env.turn_id === 'string' && env.turn_id ? env.turn_id : null };
         } catch (err: unknown) {

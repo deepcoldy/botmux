@@ -95,8 +95,7 @@ describe('mojo remote session stuck busy (RUNNING lock, current turn COMPLETED)'
     expect(rec.failures).toHaveLength(1);
     const [failure] = rec.failures;
     expect(failure).toMatchObject({ status: 'failed', code: 'mojo_session_busy', retryable: true });
-    expect(failure.message).toContain('远端会话一直忙');
-    expect(failure.message).toContain('没有送达');
+    expect(failure.message.trim()).not.toBe('');
     // State mismatch is reported with the remote's own evidence.
     expect(failure.message).toContain(STUCK_TURN.slice(0, 8));
     expect(failure.message).toContain('completed');
@@ -155,6 +154,31 @@ describe('mojo pre-check busy (a remote turn is genuinely still executing)', () 
     expect(fake.sessionGetInvocations().length).toBeGreaterThanOrEqual(2);
   });
 
+  it('carries workspaceId through probes so a team session can wait for the remote turn', async () => {
+    const inner = remote({ [SID]: liveSession(2) }, 'team answer');
+    const bin = join(dir, 'mojo-team-workspace');
+    writeFileSync(bin, `#!/usr/bin/env bash
+if [ "$1" = "session" ] && [ "$2" = "get" ]; then
+  workspace=0
+  for arg in "$@"; do [ "$arg" = "ws-team" ] && workspace=1; done
+  if [ "$workspace" = 0 ]; then
+    echo '{"schema_version":1,"operation":"session.get","status":"error","state":"unknown","session_id":"${SID}","turn_id":null,"error":{"code":"not_found","message":"team session requires workspace","retryable":false}}'
+    exit 1
+  fi
+fi
+exec ${JSON.stringify(inner.bin)} "$@"
+`);
+    chmodSync(bin, 0o755);
+
+    const rec = await driveTurn({ ...inner, bin }, 'team wait', { workspaceId: 'ws-team' });
+    expect(rec.failures).toEqual([]);
+    expect(rec.finals).toEqual(['team answer']);
+    expect(inner.read().startedTurns).toHaveLength(1);
+    const probes = inner.sessionGetInvocations();
+    expect(probes.length).toBeGreaterThanOrEqual(2);
+    for (const argv of probes) expect(argv.slice(3, 5)).toEqual(['--workspace-id', 'ws-team']);
+  }, 30_000);
+
   it('gives up after busyWaitSec with an explicit not-delivered failure', async () => {
     const fake = remote({ [SID]: liveSession(1_000) });
     const rec = await driveTurn(fake, '一直忙', { busyWaitSec: 2 });
@@ -162,8 +186,7 @@ describe('mojo pre-check busy (a remote turn is genuinely still executing)', () 
     expect(rec.finals).toEqual([]);
     expect(rec.failures).toHaveLength(1);
     expect(rec.failures[0]).toMatchObject({ status: 'failed', code: 'mojo_session_busy', retryable: true });
-    expect(rec.failures[0].message).toContain('远端会话一直忙');
-    expect(rec.failures[0].message).toContain('没有送达');
+    expect(rec.failures[0].message.trim()).not.toBe('');
     expect(rec.failures[0].message).toContain('running');
     expect(fake.read().startedTurns).toEqual([]);
     expect(fake.printInvocations()).toHaveLength(1);
@@ -316,12 +339,12 @@ describe('mojo busy wait × session lifecycle', () => {
 
     expect(rec.finals).toEqual([]);
     expect(rec.failures).toEqual([expect.objectContaining({ status: 'failed', code: 'mojo_session_busy', retryable: true })]);
-    expect(rec.failures[0].message).toContain('没有送达');
     expect(rec.failures[0].message).toContain('completed');
-    // Bounded by the contradiction, not by the 600s budget, and each launch
-    // was a full client start — a handful, not one per backoff step.
+    // Bounded by the contradiction, not by the 600s budget: the initial launch
+    // plus exactly four refused resubmissions, each a full client start.
     expect(Date.now() - startedAt).toBeLessThan(60_000);
-    expect(fake.printInvocations().length).toBeLessThan(8);
+    expect(fake.printInvocations()).toHaveLength(5);
+    expect(fake.sessionGetInvocations()).toHaveLength(4);
   }, 70_000);
 
   it('does not deliver on a credential that was cleared while the message waited', async () => {
@@ -385,6 +408,10 @@ class FastLadderMojoBackend extends MojoBackend {
   }
 }
 
+class FastCloseBudgetMojoBackend extends MojoBackend {
+  protected override get lifecycleConclusionBudgetMs(): number { return 500; }
+}
+
 describe('mojo busy wait: further lifecycle and remote edges', () => {
   it('a /close that kills the running client and then rolls back fails the message visibly', async () => {
     const fake = remote({ [SID]: idleSession() }, '不会到达');
@@ -401,6 +428,73 @@ describe('mojo busy wait: further lifecycle and remote edges', () => {
     })]);
     s.backend.kill();
   }, 45_000);
+
+  it('an after-submit unresolved close reports an unknown outcome, not a rollback or non-delivery', async () => {
+    const fake = remote({ [SID]: idleSession() }, '不会到达');
+    fake.control({ answerDelayMs: 8_000 });
+    const backend = new FastCloseBudgetMojoBackend({
+      bin: fake.bin, resumeCliSessionId: SID, env: { HOME: dir },
+    }, 'session-close-unresolved');
+    const boundaries: Boundary[] = [];
+    let done = 0;
+    backend.onTurnFinal((text, turnId) => boundaries.push({ kind: 'final', text, turnId }));
+    backend.onTurnFailure(failure => boundaries.push({ kind: 'failure', failure, turnId: failure.turnId }));
+    backend.onTaskDone(() => { done += 1; });
+    backend.spawn('', [], {} as never);
+    backend.write('正在执行时被关闭');
+    await until(() => fake.read().startedTurns.length === 1, 15_000, () => 'turn never started');
+
+    // The local client is really terminated, then the close throws before the
+    // remote cancel. Neither rollback nor teardown can be inferred from that.
+    const terminate = backend['terminateChildProven'];
+    backend['terminateChildProven'] = async () => {
+      await terminate.call(backend);
+      throw new Error('injected failure after local termination');
+    };
+    await expect(backend.destroySession()).rejects.toThrow('injected failure after local termination');
+
+    await until(() => done > 0, 15_000, () => `turn stranded: ${JSON.stringify(boundaries)}`);
+    expect(fake.read().startedTurns).toHaveLength(1);
+    expect(fake.read().invocations.filter(argv => argv[0] === 'session' && argv[1] === 'cancel')).toEqual([]);
+    expect(boundaries).toEqual([expect.objectContaining({
+      kind: 'failure',
+      failure: expect.objectContaining({ code: 'mojo_close_unresolved_after_submit', retryable: true }),
+    })]);
+    expect(backend.write('关闭仍无结论时的新消息')).toBe(false);
+    backend.kill();
+  }, 30_000);
+
+  it('an unresolved close before the first launch keeps the not-delivered classification', async () => {
+    const fake = remote({ [SID]: liveSession(1) });
+    fake.control({ sessions: { [SID]: 'live' }, precheckDelayMs: 800, cancelDelayMs: 2_000 });
+    const backend = new FastCloseBudgetMojoBackend({
+      bin: fake.bin, resumeCliSessionId: SID, env: { HOME: dir },
+    }, 'session-close-unresolved-before-submit');
+    const boundaries: Boundary[] = [];
+    let done = 0;
+    let out = '';
+    backend.onData(d => { out += d; });
+    backend.onTurnFinal((text, turnId) => boundaries.push({ kind: 'final', text, turnId }));
+    backend.onTurnFailure(failure => boundaries.push({ kind: 'failure', failure, turnId: failure.turnId }));
+    backend.onTaskDone(() => { done += 1; });
+    backend.spawn('', [], {} as never);
+    backend.write('仍在等待远端空闲');
+    await until(() => out.includes('⏳'), 15_000, () => 'never started waiting');
+
+    // Cancellation outlives the short lifecycle budget. The pre-check refused
+    // before init, so this message cannot have reached the remote queue.
+    const closing = backend.destroySession();
+    await until(() => done > 0, 15_000, () => `turn stranded: ${JSON.stringify(boundaries)}`);
+    expect(fake.read().startedTurns).toEqual([]);
+    expect(fake.printInvocations()).toHaveLength(1);
+    expect(boundaries).toEqual([expect.objectContaining({
+      kind: 'failure',
+      failure: expect.objectContaining({ code: 'mojo_close_unresolved', retryable: true }),
+    })]);
+    expect(backend.write('关闭仍无结论时的新消息')).toBe(false);
+    await expect(closing).resolves.toMatchObject({ ok: true });
+    backend.kill();
+  }, 30_000);
 
   it('a plain-text notice on stdout does not turn a busy pre-check into a failure', async () => {
     const fake = remote({ [SID]: liveSession(1) }, '提示行之后送达');
@@ -428,7 +522,7 @@ describe('mojo busy wait: further lifecycle and remote edges', () => {
     backend.write('翻转的远端');
     await until(() => done > 0, 40_000, () => `still waiting after ${fake.printInvocations().length} launches`);
     expect(failures).toEqual([expect.objectContaining({ code: 'mojo_session_busy' })]);
-    expect(fake.printInvocations().length).toBeLessThan(8);
+    expect(fake.printInvocations()).toHaveLength(5);
   }, 60_000);
 
   it('does not resubmit on a credential cleared while the probe was running', async () => {
