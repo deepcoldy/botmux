@@ -160,6 +160,57 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
     }
   }, 90_000);
 
+  it('never deletes a manifest root outside the private /tmp/bmxt-* topology', () => {
+    const root = mkdtempSync('/tmp/bmx-bun-runner-manifest-guard-');
+    roots.push(root);
+    mkdirSync(join(root, 'test'));
+    symlinkSync(resolve('test/helpers'), join(root, 'test', 'helpers'), 'dir');
+    symlinkSync(resolve('node_modules'), join(root, 'node_modules'), 'dir');
+    // A complete, newline-terminated record that is NOT a /tmp/bmxt-* child.
+    // The manifest is writable by test code, so it must never become an
+    // arbitrary directory-deletion primitive.
+    const victim = mkdtempSync('/tmp/bmx-bun-runner-victim-');
+    roots.push(victim);
+    writeFileSync(join(victim, 'do-not-delete.txt'), 'preserve me');
+    const scratchFile = join(root, 'scratch.path');
+    const fenceRootFile = join(root, 'fence.path');
+    const fenceHelper = pathToFileURL(resolve('test/helpers/tmux-fence.ts')).href;
+    writeFileSync(join(root, 'test', 'manifest-guard.test.ts'), `
+      import { appendFileSync, writeFileSync } from 'node:fs';
+      import { dirname } from 'node:path';
+      import { it } from 'bun:test';
+      import { createTmuxFence } from ${JSON.stringify(fenceHelper)};
+      it('registers a legal fence then poisons the manifest', () => {
+        const fence = createTmuxFence(process.env);
+        const manifest = process.env.BOTMUX_TMUX_FENCE_ROOTS!;
+        writeFileSync(${JSON.stringify(scratchFile)}, dirname(manifest));
+        writeFileSync(${JSON.stringify(fenceRootFile)}, fence.root);
+        appendFileSync(manifest, ${JSON.stringify(victim)} + '\\n');
+      });
+    `);
+
+    const result = spawnSync(process.execPath, [resolve('scripts/run-bun-tests.mjs')], {
+      cwd: root, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CI: 'true', BOTMUX_BUN_TEST_CONCURRENCY: '1' },
+    });
+
+    let scratch = '';
+    let fenceRoot = '';
+    try {
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
+      expect(result.stderr).toContain('invalid tmux fence root record');
+      // The external directory is preserved, not removed as a fence root.
+      expect(existsSync(join(victim, 'do-not-delete.txt'))).toBe(true);
+      scratch = readFileSync(scratchFile, 'utf8');
+      fenceRoot = readFileSync(fenceRootFile, 'utf8');
+      expect(existsSync(scratch)).toBe(true);
+      expect(existsSync(fenceRoot)).toBe(true);
+    } finally {
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+      if (fenceRoot) rmSync(fenceRoot, { recursive: true, force: true });
+    }
+  }, 90_000);
+
   it('settles a server that starts only after the test process exits', () => {
     const root = mkdtempSync('/tmp/bmx-bun-runner-startup-reaper-');
     roots.push(root);
