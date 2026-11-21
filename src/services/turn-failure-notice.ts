@@ -91,6 +91,10 @@ const USER_ABORT_ERROR_CODE_PREFIXES: readonly string[] = [
  */
 const SUPERSEDED_BY_NEWER_INPUT_ERROR_CODES: ReadonlySet<string> = new Set([
   'grok_turn_cancelled',
+  // Antigravity conversation rotation (/new, /fork, or rebinding to the
+  // authoritative conversation) retires the old owner; the replacement
+  // conversation owns subsequent delivery, so a continue button is misleading.
+  'antigravity_conversation_retired',
 ]);
 
 /** Whether this code marks a cancellation the user themselves caused. */

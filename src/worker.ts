@@ -497,6 +497,8 @@ import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntig
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
+  hasAntigravityPendingTasks,
+  drainAntigravityTranscript,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
 import {
@@ -10518,6 +10520,9 @@ let mtrBridgeBaselineDone = false;
  *  Codex's first user submit, but with some race delay after our submit
  *  returns. Cleared once attached. */
 let codexBridgePendingSessionId: string | undefined;
+/** Antigravity-only: the pending authoritative id corrects an early misbind,
+ *  so its eventual ticker rotation must preserve (not retire) the live owner. */
+let antigravityPendingRebind = false;
 /** Codex session id whose history line matched our submit before the pid
  *  held its rollout open (the rollout is created lazily at that same submit).
  *  Only a candidate: the poller binds it once the observed pid holds that
@@ -13616,6 +13621,94 @@ function ompBridgeState(): OmpTranscriptState {
   return (structuredBridgeDriverState as OmpTranscriptState | undefined) ?? {};
 }
 
+/** Finish the old queue owner before abandoning its transcript. A quiet
+ *  flush may refuse waiting narration; detach alone cannot settle that owner,
+ *  especially when adopt's next input has a different sourceTurnId. */
+function retireAntigravityBridgeTurn(): void {
+  const settleRetiredOwner = () => {
+    // The drain itself may discover a queued input or advance to another input
+    // in the retired log. Select its remaining owner after that attribution.
+    const retired = codexBridgeQueue.peek().find(turn => turn.started && turn.finalText === undefined);
+    if (retired) {
+      codexBridgeQueue.ingest([{
+        uuid: `${codexBridgeRolloutPath}:retired:${retired.turnId}:${retired.dispatchAttempt ?? 0}`,
+        timestampMs: Date.now(),
+        kind: 'turn_aborted',
+        text: '',
+        sourceSessionId: retired.sourceSessionId,
+        sourceTurnId: retired.sourceTurnId,
+        terminalErrorCode: 'antigravity_conversation_retired',
+      }]);
+    }
+    emitReadyCodexTurns();
+  };
+  try {
+    codexBridgeIngest({
+      flushAntigravityTrailingFinal: true,
+      retireAntigravityPendingTurns: true,
+    });
+  } catch (err: any) {
+    // Post-ingest hooks can fail after the old owner became visible. Still
+    // settle it before the caller detaches, without masking the original error.
+    try { settleRetiredOwner(); } catch (settleErr: any) {
+      log(`Antigravity retirement settlement failed after ${err.message}: ${settleErr.message}`);
+    }
+    throw err;
+  }
+  settleRetiredOwner();
+}
+
+/** An authoritative startup id corrects an early sibling bind for the SAME
+ *  live turn. Replay the real file read-only, bind active owners to its actual
+ *  user records, then ingest only from the first live user offset. Older REAL
+ *  history is never replayed, and byte offsets need not match the sibling's. */
+function rebindAntigravityBridgeTurn(nextPath: string): boolean {
+  const previousPath = codexBridgeRolloutPath;
+  const started = codexBridgeQueue.peek().filter(turn => turn.started && turn.finalText === undefined);
+  const pendingHead = started.length === 0
+    ? codexBridgeQueue.peek().find(turn => !turn.started && turn.finalText === undefined)
+    : undefined;
+  const replay = drainAntigravityTranscript(nextPath, 0, {}, { adoptMode: lastInitConfig?.adoptMode === true });
+  type Match = { turnId: string; event: (typeof replay.events)[number]; offset: number };
+  const startedMatches = new Map<string, Match[]>();
+  const pendingMatches: Match[] = [];
+  for (const event of replay.events) {
+    if (event.kind !== 'user') continue;
+    const prefix = `${nextPath}:`;
+    if (!event.uuid.startsWith(prefix)) continue;
+    const offset = Number(event.uuid.slice(prefix.length));
+    if (!Number.isSafeInteger(offset) || offset < 0) continue;
+    for (const turn of started) {
+      if (!codexBridgeQueue.rebindStartedTurnToUser(turn.turnId, event, false)) continue;
+      const matches = startedMatches.get(turn.turnId) ?? [];
+      matches.push({ turnId: turn.turnId, event, offset });
+      startedMatches.set(turn.turnId, matches);
+    }
+    if (pendingHead && codexBridgeQueue.matchPendingTurnToUser(pendingHead.turnId, event)) {
+      pendingMatches.push({ turnId: pendingHead.turnId, event, offset });
+    }
+  }
+  // Zero matches cannot prove this live turn; duplicate same-text matches are
+  // ambiguous too. Never guess the first record or partially migrate owners.
+  if ([...startedMatches.values()].some(matches => matches.length !== 1)) return false;
+  if (started.length > 0 && startedMatches.size !== started.length) return false;
+  if (pendingHead && pendingMatches.length !== 1) return false;
+  const committed = [...startedMatches.values()].map(matches => matches[0]);
+  const firstLiveOffset = started.length > 0
+    ? Math.min(...committed.map(match => match.offset))
+    : pendingHead ? pendingMatches[0].offset : undefined;
+  for (const match of committed) codexBridgeQueue.rebindStartedTurnToUser(match.turnId, match.event);
+  // These started users already belong to their mapped owners. Suppress only
+  // their replay: an id-less managed user must not start a same-text successor.
+  // The unstarted head's own record is deliberately NOT absorbed below.
+  codexBridgeQueue.absorb(committed.map(match => match.event));
+  log(`Antigravity bridge authoritatively rebound ${previousPath ?? '?'} → ${nextPath}`);
+  codexBridgeDetachFile();
+  codexBridgeAttach(nextPath, 'fresh-empty');
+  if (firstLiveOffset !== undefined) codexBridgeOffset = firstLiveOffset;
+  return true;
+}
+
 /** Antigravity's held provisional terminal (valid only while that driver is active). */
 function antigravityBridgeState(): AntigravityTranscriptState {
   return (structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {};
@@ -13675,7 +13768,11 @@ function observeNativeGoal(): void {
 function structuredBridgeIngestPath(
   path: string,
   offset: number,
-  opts: { flushOmpTrailingFinal?: boolean; flushAntigravityTrailingFinal?: boolean } = {},
+  opts: {
+    flushOmpTrailingFinal?: boolean;
+    flushAntigravityTrailingFinal?: boolean;
+    retireAntigravityPendingTurns?: boolean;
+  } = {},
 ): StructuredBridgeDrainResult {
   const spec = bridgeSpecFor(lastInitConfig?.cliId);
   if (spec) {
@@ -13696,6 +13793,7 @@ function structuredBridgeIngestPath(
       // The two flags are never set for the "other" driver: every caller sits
       // under its own structuredBridgeIs('oh-my-pi' | 'antigravity') guard.
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
+      retirePendingTurns: opts.retireAntigravityPendingTurns,
     });
     if (spec.stateCommit === 'drain') structuredBridgeDriverState = result.state;
     if ((nativeGoalSourcePath !== path || nativeGoalGeneration !== cliSpawnGeneration) && nativeGoalCardEnabled()) {
@@ -13839,7 +13937,11 @@ function codexBridgeStartTimer(): void {
         return;
       }
       if (structuredBridgeIs('antigravity')) {
-        if (lastInitConfig?.adoptMode) {
+        const authoritativeRebindPending = lastInitConfig?.adoptMode
+          && codexBridgeRolloutPath
+          && codexBridgePendingSessionId
+          && antigravityPendingRebind;
+        if (lastInitConfig?.adoptMode && !authoritativeRebindPending) {
           // A new pane can create its conversation and log on the first submit.
           if (!codexBridgeRolloutPath && codexBridgeQueue.peek().length > 0) {
             const pid = currentAntigravityObservedPid();
@@ -13855,6 +13957,9 @@ function codexBridgeStartTimer(): void {
             }
           }
         } else if (!codexBridgeRolloutPath || codexBridgePendingSessionId) {
+          // Managed rotation plus the narrow adopt authoritative-rebind case:
+          // ordinary adopt /new still uses notify, while a pending correction
+          // must be retried here once the authoritative brain file appears.
           // A managed process can announce a new ID before its transcript
           // exists, while the previous conversation remains bound.
           const action = decideAntigravityTickerAction({
@@ -13875,26 +13980,34 @@ function codexBridgeStartTimer(): void {
             },
           });
           if (action.kind === 'rotate') {
-            // A new conversation resolved while the previous one was bound
-            // (either the pending SID authoritatively, or the pid's open
-            // conversation switched): flush the retired conversation's held
-            // final only when an earlier turn belongs to it, then bind the new
-            // one fresh so its live turn is ingested from byte 0.
-            codexBridgePendingSessionId = undefined;
-            codexAdoptPendingPid = undefined;
-            if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
-              try {
-                codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-                emitReadyCodexTurns();
-              } catch (err: any) {
-                log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
+            if (antigravityPendingRebind) {
+              // This is an authoritative correction for the same live turn,
+              // not a /new. Failed reconciliation keeps both the old binding
+              // and the pending marker so a later REAL append can retry.
+              if (rebindAntigravityBridgeTurn(action.path)) {
+                codexBridgePendingSessionId = undefined;
+                antigravityPendingRebind = false;
+                codexAdoptPendingPid = undefined;
               }
+            } else {
+              codexBridgePendingSessionId = undefined;
+              codexAdoptPendingPid = undefined;
+              // A real /new abandons the retired conversation's unfinished
+              // work; never promote its waiting narration to a final.
+              if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
+                try {
+                  retireAntigravityBridgeTurn();
+                } catch (err: any) {
+                  log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
+                }
+              }
+              log(`Antigravity bridge late-rotated ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
+              codexBridgeDetachFile();
+              codexBridgeAttach(action.path, 'fresh-empty');
             }
-            log(`Antigravity bridge late-rotated ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
-            codexBridgeDetachFile();
-            codexBridgeAttach(action.path, 'fresh-empty');
           } else if (action.kind === 'bind-initial') {
             codexBridgePendingSessionId = undefined;
+            antigravityPendingRebind = false;
             codexAdoptPendingPid = undefined;
             codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
           } else if (action.kind === 'clear-pending') {
@@ -13902,6 +14015,7 @@ function codexBridgeStartTimer(): void {
             // bound path returns 'idle' and leaves a pending NEW id intact
             // (the retired conversation's fd can still be the one open).
             codexBridgePendingSessionId = undefined;
+            antigravityPendingRebind = false;
           }
         }
         maybeUpgradeAntigravityBridgeToFull();
@@ -14984,7 +15098,10 @@ function noteTraexProcessFileSource(pid: number): void {
 /** Called from flushPending after writeInput first returns a cliSessionId.
  *  Tries to locate the rollout file immediately; if it's not on disk yet,
  *  remembers the sid so the 1s poller can keep retrying. */
-function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
+function codexBridgeNotifyCliSessionId(
+  cliSessionId: string,
+  options: { preserveLiveTurn?: boolean } = {},
+): void {
   if (!codexBridgeFallbackActive()) return;
   // A reported (proven) id supersedes any not-yet-owned history candidate.
   codexBridgeUnprovenSession = undefined;
@@ -15203,18 +15320,29 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
     const action = decideAntigravityNotifyAction(codexBridgeRolloutPath, agyPath);
     if (action.kind === 'same') {
       codexBridgePendingSessionId = undefined;
+      antigravityPendingRebind = false;
+      return;
+    }
+    if (action.kind === 'rotate' && options.preserveLiveTurn) {
+      // The startup observer corrected an early sibling bind for this same
+      // live turn. Attach only after every active owner matches the REAL file.
+      if (rebindAntigravityBridgeTurn(action.path)) {
+        codexBridgePendingSessionId = undefined;
+        antigravityPendingRebind = false;
+        codexBridgeIngest();
+      } else {
+        codexBridgePendingSessionId = cliSessionId;
+        antigravityPendingRebind = true;
+        codexBridgeStartTimer();
+      }
       return;
     }
     if (action.kind !== 'wait-pending') {
       if (action.kind === 'rotate') {
-        // Conversation rotated (/new) or corrected from an early misbind:
-        // drain the retired transcript only when an earlier turn actually
-        // belongs to it, then rebind fresh-empty so the current conversation's
-        // existing bytes are ingested from byte 0.
+        // A real /new abandons unfinished work in the retired conversation.
         if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
           try {
-            codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-            emitReadyCodexTurns();
+            retireAntigravityBridgeTurn();
           } catch (err: any) {
             log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
           }
@@ -15226,11 +15354,13 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
       }
       codexBridgePendingSessionId = undefined;
+      antigravityPendingRebind = false;
       codexBridgeIngest();
     } else {
       // The brain file is created lazily after submit — keep id pending and
       // let the 1s ticker late-attach or rotate once the file appears.
       codexBridgePendingSessionId = cliSessionId;
+      antigravityPendingRebind = options.preserveLiveTurn === true;
       codexBridgeStartTimer();
     }
     return;
@@ -15405,7 +15535,12 @@ function codexBridgeIngest(opts: {
   hydrationOwnerKey?: string;
   flushOmpTrailingFinal?: boolean;
   flushAntigravityTrailingFinal?: boolean;
+  retireAntigravityPendingTurns?: boolean;
 } = {}): void {
+  // An authoritative rebind is pending: freeze the possibly-misbound file.
+  // This includes quiet flushes, whose waiting narration or sibling answer
+  // could otherwise settle the live owner before REAL becomes readable.
+  if (structuredBridgeIs('antigravity') && antigravityPendingRebind) return;
   // Follow-up RPC turns install their exact bridge mark only after the
   // turn/start ACK passes the generation fence. Ordinary ingest must not
   // advance the rollout cursor in that window. Terminal hydration for an
@@ -15431,6 +15566,7 @@ function codexBridgeIngest(opts: {
   if (
     structuredBridgeIs('antigravity')
     && !opts.flushAntigravityTrailingFinal
+    && !opts.retireAntigravityPendingTurns
     && codexBridgePendingSessionId
     && !(codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1)
   ) {
@@ -15439,6 +15575,7 @@ function codexBridgeIngest(opts: {
   const result = structuredBridgeIngestPath(codexBridgeRolloutPath, codexBridgeOffset, {
     flushOmpTrailingFinal: opts.flushOmpTrailingFinal,
     flushAntigravityTrailingFinal: opts.flushAntigravityTrailingFinal,
+    retireAntigravityPendingTurns: opts.retireAntigravityPendingTurns,
   });
   codexBridgeOffset = result.newOffset;
   codexBridgePendingTail = result.pendingTail;
@@ -15591,7 +15728,7 @@ function maybeFlushOmpTrailingFinalOnQuietTick(): void {
  *  driver state: the same records continue, only the file and its byte space
  *  change. */
 function maybeUpgradeAntigravityBridgeToFull(): void {
-  if (!structuredBridgeIs('antigravity') || !codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
+  if (!structuredBridgeIs('antigravity') || antigravityPendingRebind || !codexBridgeRolloutPath || !codexBridgeBaselineDone) return;
   const action = decideAntigravityFullUpgrade({
     boundPath: codexBridgeRolloutPath,
     offset: codexBridgeOffset,
@@ -15645,8 +15782,13 @@ function maybeUpgradeAntigravityBridgeToFull(): void {
  * before it is flushed. */
 function maybeFlushAntigravityTrailingFinalOnQuietTick(): void {
   if (!structuredBridgeIs('antigravity')) return;
+  if (antigravityPendingRebind) {
+    antigravityQuietCandidateKey = undefined;
+    antigravityQuietCandidateCompleteOffset = undefined;
+    return;
+  }
   const candidate = antigravityBridgeState().provisionalFinal;
-  if (!candidate || antigravityBridgeState().hasPendingTask) {
+  if (!candidate || hasAntigravityPendingTasks(antigravityBridgeState())) {
     // No candidate, or the transcript itself proves a background task is still
     // outstanding (the TUI shows the ready composer during that wait — do not
     // arm the quiet latch on screen evidence the transcript contradicts).
@@ -22995,7 +23137,7 @@ function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
       // Bind the zero-prompt transcript bridge as soon as the conversation is
       // known (its brain file may not exist yet — notify then leaves the id
       // pending for the 1s ticker). No-op in default mode (bridge inactive).
-      if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cid);
+      if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cid, { preserveLiveTurn: true });
       return;
     }
     attempts++;
