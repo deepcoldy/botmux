@@ -8,7 +8,7 @@
 
 目标 daemon 将精确消息绑定的 v2 委托兑换为当前目标 dispatch turn 的创建权。首版严格单跳；同一 live turn 可以创建多个不同任务，turn 结束即失效，不使用固定墙钟 TTL。仅允许目标 Bot 在原群顶层或当前 dispatch 话题执行，不支持多群、`new-topic`、`follow-active` 或继续转委托。真实 current actor 仍是发消息的 Bot，不冒充原真人。
 
-宿主可显式允许 delegated task 在未来运行时使用粗粒度 `bytedcli` scope。该 scope 只有在来源 dispatch 同时携带即时 `bytedcli` 委托、来源/目标宿主策略都允许、且目标 Bot 对 `lark-cli` 与 `bytedcli` 均启用 `triggerUserAuth` wrapper 时才能落盘。每次触发重新解析控制者身份并检查管理员与群成员资格，再为精确 scheduled turn 发布凭据；不会恢复通用 current actor。
+宿主可显式允许 delegated task 在未来运行时使用粗粒度 `bytedcli` scope。该 scope 只有在来源 dispatch 同时携带即时 `bytedcli` 委托、来源/目标宿主策略都允许、且目标处于完整受管模式或显式完整原生模式时才能落盘。每次触发重新解析控制者身份并检查管理员与群成员资格；受管模式按精确 scheduled turn 发布获准的个人凭据，原生模式沿用宿主登录，不取委托人的凭据。
 
 ## 持久边界
 
@@ -18,9 +18,9 @@
 
 ## 身份与撤权
 
-控制主体与运行身份分离。v1 只支持即时 `lark-cli/bytedcli`；v2 的 `schedule:create` 不从 inherited authority 签发。持久 `runScopes` 只支持显式配置的 `bytedcli`；未配置时为空。普通 delegated scheduled turn 无论是否授予该 scope，都不成为真人 current actor，且 `lark-cli` 始终不随任务持久化。唯一例外是下文的限域 one-shot child：它只在精确回合发布已重新验证的父控制者作为 tool actor 和 current actor，task 仍保持 ownerless，不获得 workflow/schedule mutation authority。
+控制主体与运行身份分离。v1 只支持即时 `lark-cli/bytedcli`；v2 的 `schedule:create` 不从 inherited authority 签发。持久 `runScopes` 只支持显式配置的 `bytedcli`；未配置时为空。受管模式的普通 delegated scheduled turn 无论是否授予该 scope，都不成为真人 current actor，且 `lark-cli` 始终不随任务持久化。原生模式可以独立公开已重新核验的控制人 Actor，仅用于控制主体证明，不表示新的真人指令或工具平台账号。受管模式唯一例外是下文的限域 one-shot child：它只在精确回合发布已重新验证的父控制者作为 tool actor 和 current actor，task 仍保持 ownerless，不获得 workflow/schedule mutation authority。
 
-为避免复用会话继承历史凭据，委托任务仅在目标 Bot 开启 `triggerUserAuth` wrapper 时运行；wrapper 依赖精确 turn 绑定拒绝陈旧身份。每次进入 worker 前重新检查：
+受管模式通过完整 `triggerUserAuth` wrapper 的精确 turn 绑定拒绝陈旧身份；显式关闭全部个人能力和 Lark 应用绑定的原生模式则沿用宿主全局 CLI，不签发委托人的个人凭据，也不把 `runScopes` 当作宿主账号的逐命令隔离。原生 scheduled turn 仅发布已重新核验的控制人用于 Actor/操作权限证明，不恢复 task owner 或授予其它任务操作权。每次进入 worker 前重新检查：
 
 - host `scheduleDelegation.runEnabled` 未关闭；
 - 控制者仍是目标 Bot 管理员；
@@ -28,7 +28,7 @@
 - 控制者仍是目标群成员；
 - 持久 runScopes 仍受当前版本支持。
 
-查询失败一律拒绝，不回退机器或 session owner 身份。撤权保证在下一次 admission/恢复/身份注入前生效，不承诺中止已经发出的外部命令。
+查询失败一律拒绝；受管配置缺少能力、凭据或当前人时不自动降级到机器或 session owner。撤权保证在下一次 admission/恢复/身份注入前生效，不承诺中止已经发出的外部命令。
 
 ## 管理动作
 

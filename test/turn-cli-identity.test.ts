@@ -66,7 +66,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
 const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
 const { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
-const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper, sessionIdentityPath } = await import('../src/core/cli-identity.js');
+const { writeSessionIdentity, recallProvenIdentityContent, rememberProvenIdentityContent, renderIdentityWrapper, sessionIdentityPath } = await import('../src/core/cli-identity.js');
 const { renewExpiringBytedcliIdentities, trackedBytedcliRenewalCount, forgetBytedcliIdentityRenewals } = await import('../src/core/bytedcli-identity-renewal.js');
 const { renewBytedcliJwts } = await import('../src/services/bytedcli-auth.js');
 const { capabilityOn, parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
@@ -74,6 +74,8 @@ const { noteSenderUnionId } = await import('../src/core/platform-credential-sour
 const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
 const { prepareScheduledRecoveryRun } = await import('../src/core/scheduled-send.js');
 const { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn } = await import('../src/core/scheduled-turn-provenance.js');
+const { getLarkToolDelegation, rememberLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
+const { activeIdentityTurns } = await import('../src/core/active-identity-turns.js');
 const { beginReplyTargetTurn } = await import('../src/core/reply-target.js');
 
 const APP = 'cli_bot';
@@ -571,6 +573,8 @@ describe('queued identities stay separate from the executing task', () => {
 describe('target daemon consumes signed message authority', () => {
   async function targetHarness(options: { taskConsent?: boolean; botAccess?: boolean; mapping?: 'resolved' | 'transient' | 'definitive'; member?: boolean; memberError?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
     const ts = (await import('typescript')).default;
+    const { configuredCliExecutionMode } = await import('../src/core/cli-execution-mode.js');
+    const { resolveNativeScheduledControlActor } = await import('../src/core/scheduled-control-actor.js');
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } = await import('../src/core/reply-target.js');
     const { resolveScheduledRunIdentity } = await import('../src/core/schedule-identity-claim.js');
@@ -578,8 +582,11 @@ describe('target daemon consumes signed message authority', () => {
     const { buildUntilDoneRunPrompt, isAutoCompletedSchedule } = await import('../src/services/schedule-until-done.js');
     const { scheduleTimeZone } = await import('../src/utils/timezone.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
-    const { clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers } = await import('../src/core/cli-identity.js');
-    const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
+    const { clearSessionIdentity, clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers } = await import('../src/core/cli-identity.js');
+    const { rememberLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
+    const { releaseActiveIdentityTurn } = await import('../src/core/active-identity-turns.js');
+    const { TRIGGER_USER_AUTH_TOOLS } = await import('../src/services/trigger-user-auth.js');
+    const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity', 'prepareNativeScheduledControlIdentity',
       'dispatchUserForTurn', 'targetUserForDelegation', 'checkDelegationRecipient', 'delegatedScheduleRuntimeDeps',
       'talkerScheduleRuntimeDeps',
       'delegatedScheduleCliIdentity', 'prepareScheduledTurnCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
@@ -620,7 +627,8 @@ describe('target daemon consumes signed message authority', () => {
       ? { status: options.mapping } : { status: 'resolved', openId: 'ou_alice_target' });
     const scopeValues = {
       config: { session: { dataDir: dir } }, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveDispatchUser, dispatchCallerFromReply,
-      readTaskBinding, capabilityOn, getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
+      readTaskBinding, capabilityOn, configuredCliExecutionMode, resolveNativeScheduledControlActor,
+      getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       dispatchConsentCardAvailable: async () => true,
       loadOrCreateDispatchReportBindingSecret: () => secret,
       resolveTargetAppOpenId, evaluateTalk: (_app: string, chat?: string, _user?: string, botUnion?: string, humanUnion?: string) => ({
@@ -641,7 +649,8 @@ describe('target daemon consumes signed message authority', () => {
       // A session whose worker has not reported yet publishes under the
       // fail-closed single default; tests set ds.reportedModel to stage that.
       identityStorageModelForDaemonSession: (session: any) => session.reportedModel ?? 'proven',
-      clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers,
+      clearSessionIdentity, clearSingleIdentityArtifacts, forgetProvenIdentityContent, removeUngovernedIdentityWrappers,
+      rememberLarkToolDelegation, releaseActiveIdentityTurn, TRIGGER_USER_AUTH_TOOLS,
       // worker-pool's liveness rule (importing worker-pool here would pull in
       // the full IM stack against this file's narrow user-token mock).
       identityDecisionTurnIsLive: (session: any, turnId: string) => session.session.status === 'active'
@@ -1214,6 +1223,195 @@ describe('target daemon consumes signed message authority', () => {
     expect(identityBody('bytedcli', turnId))
       .toContain('scheduled-original-user');
     expect(h.ds.scheduledToolActors).toBeUndefined();
+  });
+
+  it('rejects a native-admitted delegated turn after config becomes auth-off managed before preparation', async () => {
+    const h = await targetHarness();
+    const { authorizeDelegatedScheduleRun } = await import('../src/core/schedule-delegated-runtime.js');
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const task = { id: 'a1b2c3d4', chatId: 'oc_chat', larkAppId: APP };
+    const authority = {
+      kind: 'delegated' as const, state: 'active' as const, task,
+      controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+      credentialOpenId: 'ou_alice_target', runScopes: [], selfManage: false,
+    };
+    const native = { ...botConfig({ enabled: false }), larkToolBinding: false };
+    let cliConfig = native;
+    const publication = vi.fn(async () => []);
+    h.scopeValues.getBot = () => ({ config: cliConfig });
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => authority };
+    h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: { runEnabled: true, runScopes: [] } });
+    h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
+    h.scopeValues.publishTurnCliIdentity = publication;
+    (h.scopeValues as any).authorizeDelegatedScheduleRun = authorizeDelegatedScheduleRun;
+
+    await authorizeDelegatedScheduleRun(task, authority as any, {
+      runEnabled: true, hostRunScopes: [], adminOpenIds: ['ou_alice_target'],
+      triggerUserAuth: native.triggerUserAuth, larkToolBinding: false,
+      resolveTargetOpenId: async () => 'ou_alice_target',
+      listChatMemberOpenIds: async () => ['ou_alice_target'],
+    });
+    cliConfig = { ...botConfig({ enabled: false }), larkToolBinding: true };
+    await expect(h.run(turnId)).rejects.toThrow('requires triggerUserAuth isolation');
+    expect(publication).not.toHaveBeenCalled();
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => undefined };
+    await expect(h.run(turnId)).rejects.toThrow('authority record missing');
+  });
+
+  it('clears a native controller actor when the same delegated turn is prepared as managed', async () => {
+    const h = await targetHarness();
+    const { authorizeDelegatedScheduleRun } = await import('../src/core/schedule-delegated-runtime.js');
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const task = { id: 'a1b2c3d4', chatId: 'oc_chat', larkAppId: APP };
+    const authority = {
+      kind: 'delegated' as const, state: 'active' as const, task,
+      controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+      credentialOpenId: 'ou_alice_target', runScopes: [], selfManage: false,
+    };
+    let cliConfig = { ...botConfig({ enabled: false }), larkToolBinding: false };
+    h.scopeValues.getBot = () => ({ config: cliConfig });
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => authority };
+    h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: { runEnabled: true, runScopes: [] } });
+    h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
+    h.scopeValues.publishTurnCliIdentity = vi.fn(async () => []);
+    (h.scopeValues as any).authorizeDelegatedScheduleRun = authorizeDelegatedScheduleRun;
+
+    await h.run(turnId);
+    expect(h.ds.scheduledControlActors?.get(turnId)?.openId).toBe('ou_alice_target');
+    cliConfig = { ...botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] }), larkToolBinding: true };
+    await h.run(turnId);
+    expect(h.ds.scheduledControlActors).toBeUndefined();
+  });
+
+  it.each([
+    { from: 'native', to: 'managed', intermediate: undefined, expectedError: 'CLI execution policy changed during scheduled turn admission', expectedPublications: 0 },
+    { from: 'managed', to: 'native', intermediate: undefined, expectedError: 'CLI execution policy changed during scheduled turn admission', expectedPublications: 1 },
+    { from: 'native', to: 'native', intermediate: 'managed', expectedError: 'native scheduled control actor missing', expectedPublications: 0 },
+  ] as const)('rejects an admission whose execution policy changes during delegated identity lookup: $from → $to', async ({ from, to, intermediate, expectedError, expectedPublications }) => {
+    const h = await targetHarness();
+    const { authorizeDelegatedScheduleRun } = await import('../src/core/schedule-delegated-runtime.js');
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const task = { id: 'a1b2c3d4', chatId: 'oc_chat', larkAppId: APP };
+    const authority = {
+      kind: 'delegated' as const, state: 'active' as const, task,
+      controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+      credentialOpenId: 'ou_alice_target', runScopes: [], selfManage: false,
+    };
+    const native = { ...botConfig({ enabled: false }), larkToolBinding: false };
+    const managed = { ...botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] }), larkToolBinding: true };
+    let cliConfig = from === 'native' ? native : managed;
+    const publication = vi.fn(async () => []);
+    let markLookupStarted!: () => void;
+    let releaseLookup!: () => void;
+    const lookupStarted = new Promise<void>(resolve => { markLookupStarted = resolve; });
+    const lookupGate = new Promise<void>(resolve => { releaseLookup = resolve; });
+    const lookup = vi.fn(async () => {
+      markLookupStarted();
+      await lookupGate;
+      return { status: 'resolved' as const, openId: 'ou_alice_target' };
+    });
+    h.scopeValues.getBot = () => ({ config: cliConfig });
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => authority };
+    h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: { runEnabled: true, runScopes: [] } });
+    h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
+    h.scopeValues.publishTurnCliIdentity = publication;
+    h.scopeValues.resolveTargetAppOpenId = lookup;
+    (h.scopeValues as any).authorizeDelegatedScheduleRun = authorizeDelegatedScheduleRun;
+
+    const work = h.run(turnId);
+    if (intermediate) cliConfig = intermediate === 'native' ? native : managed;
+    await lookupStarted;
+    cliConfig = to === 'native' ? native : managed;
+    releaseLookup();
+    await expect(work).rejects.toThrow(expectedError);
+    expect(publication).toHaveBeenCalledTimes(expectedPublications);
+    expect(h.ds.scheduledControlActors).toBeUndefined();
+  });
+
+  it('rejects a managed ABA when the only identity publication used native config', async () => {
+    const h = await targetHarness();
+    const { authorizeDelegatedScheduleRun } = await import('../src/core/schedule-delegated-runtime.js');
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const task = { id: 'a1b2c3d4', chatId: 'oc_chat', larkAppId: APP };
+    const authority = {
+      kind: 'delegated' as const, state: 'active' as const, task,
+      controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+      credentialOpenId: 'ou_alice_target', runScopes: [], selfManage: false,
+    };
+    const native = { ...botConfig({ enabled: false }), larkToolBinding: false };
+    const managed = { ...botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] }), larkToolBinding: true };
+    let cliConfig = managed;
+    let markLookupStarted!: () => void;
+    let releaseLookup!: () => void;
+    let markPublicationStarted!: () => void;
+    let releasePublication!: () => void;
+    const lookupStarted = new Promise<void>(resolve => { markLookupStarted = resolve; });
+    const lookupGate = new Promise<void>(resolve => { releaseLookup = resolve; });
+    const publicationStarted = new Promise<void>(resolve => { markPublicationStarted = resolve; });
+    const publicationGate = new Promise<void>(resolve => { releasePublication = resolve; });
+    const publication = vi.fn(async () => {
+      markPublicationStarted();
+      await publicationGate;
+      return [];
+    });
+    h.scopeValues.getBot = () => ({ config: cliConfig });
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => authority };
+    h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: { runEnabled: true, runScopes: [] } });
+    h.scopeValues.getDashboardAdminOpenIds = () => ['ou_alice_target'];
+    h.scopeValues.resolveTargetAppOpenId = vi.fn(async () => {
+      markLookupStarted();
+      await lookupGate;
+      return { status: 'resolved' as const, openId: 'ou_alice_target' };
+    });
+    h.scopeValues.publishTurnCliIdentity = publication;
+    (h.scopeValues as any).authorizeDelegatedScheduleRun = authorizeDelegatedScheduleRun;
+
+    const work = h.run(turnId);
+    await lookupStarted;
+    cliConfig = native;
+    releaseLookup();
+    await publicationStarted;
+    expect(publication.mock.calls[0]![0]?.botConfig.larkToolBinding).toBe(false);
+    cliConfig = managed;
+    releasePublication();
+    await expect(work).rejects.toThrow('CLI execution policy changed during scheduled identity publication');
+    expect(h.ds.scheduledControlActors).toBeUndefined();
+    expect(h.ds.lastPublishedIdentityModel).toBeUndefined();
+  });
+
+  it('rejects a delegated turn whose controller is revoked during managed identity publication', async () => {
+    const h = await targetHarness();
+    const { authorizeDelegatedScheduleRun } = await import('../src/core/schedule-delegated-runtime.js');
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const task = { id: 'a1b2c3d4', chatId: 'oc_chat', larkAppId: APP, ownerOpenId: undefined, ownerUnionId: undefined };
+    const authority = {
+      kind: 'delegated' as const, state: 'active' as const, task,
+      grantId: 'schedule-child:cli_bot:parent01:schedule:parent01:run-1',
+      controlOpenId: 'ou_alice_target', controlUnionId: 'on_alice',
+      credentialOpenId: 'ou_alice_target', runScopes: [], selfManage: false,
+    };
+    let operators = ['ou_alice_target'];
+    h.scopeValues.getBot = () => ({ config: { ...botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] }), larkToolBinding: true } });
+    h.scopeValues.scheduleAuthorityStore = { getRecord: () => authority };
+    h.scopeValues.readGlobalConfig = () => ({ scheduleDelegation: { runEnabled: true, runScopes: [] } });
+    h.scopeValues.getDashboardAdminOpenIds = () => operators;
+    h.scopeValues.publishTurnCliIdentity = vi.fn(async () => {
+      rememberProvenIdentityContent(dir, SESSION, turnId, 'bytedcli', 'must-be-revoked');
+      rememberLarkToolDelegation(dir, SESSION, turnId, {
+        credentialOpenId: 'ou_alice_target', unionId: 'on_alice', tools: ['bytedcli'], dispatchRoot: 'om_root',
+      });
+      operators = [];
+      return [];
+    });
+    (h.scopeValues as any).authorizeDelegatedScheduleRun = authorizeDelegatedScheduleRun;
+
+    await expect(h.run(turnId)).rejects.toThrow('schedule controller is no longer an allowed bot operator');
+    expect(h.ds.scheduledControlActors).toBeUndefined();
+    expect(h.ds.scheduledToolActors).toBeUndefined();
+    expect(recallProvenIdentityContent(dir, SESSION, turnId, 'bytedcli')).toBeUndefined();
+    expect(getLarkToolDelegation(dir, SESSION, turnId)).toBeUndefined();
+    expect(activeIdentityTurns(dir, SESSION)).not.toContain(turnId);
+    expect(h.ds.lastPublishedIdentityModel).toBeUndefined();
   });
 
   it('publishes an ownerless schedule child controller only as the exact-turn tool actor', async () => {

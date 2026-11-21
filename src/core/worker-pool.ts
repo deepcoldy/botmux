@@ -1,3 +1,4 @@
+import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecution } from './cli-execution-mode.js';
 import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
@@ -1898,6 +1899,9 @@ export function identityDecisionConflict(ds: DaemonSession): string | undefined 
   const report = ds.reportedIdentityModel;
   if (!report) return undefined;
   if (report.conflict) return report.conflict;
+  if (report.cliExecution && report.cliExecution.mode !== configuredCliExecutionMode(getBot(ds.larkAppId).config)) {
+    return 'CLI execution mode changed; restart the session before using tool credentials';
+  }
   if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
     return 'worker reported the proven identity model for a session that structurally cannot run proven';
   }
@@ -1913,7 +1917,7 @@ export function recordWorkerIdentityDecision(
   ds: DaemonSession,
   worker: ChildProcess,
   workerGeneration: number,
-  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean },
+  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean; cliExecution?: WorkerCliExecution },
 ): { model: IdentityStorageModel; flipped: boolean } {
   let conflict: string | undefined;
   if (report.model !== 'single' && report.model !== 'proven') {
@@ -1936,6 +1940,7 @@ export function recordWorkerIdentityDecision(
     workerPid: worker.pid ?? -1,
     workerGeneration,
     reportedAt: Date.now(),
+    ...(isWorkerCliExecution(report.cliExecution) ? { cliExecution: { ...report.cliExecution, executor: { ...report.cliExecution.executor } } } : {}),
     ...(conflict ? { conflict } : {}),
   };
   return { model, flipped };
@@ -9434,6 +9439,12 @@ function latestCodexRpcInputForRespawn(ds: DaemonSession): boolean | undefined {
  * Live-worker /restart 或崩溃恢复携带的最新 larkToolBinding 开关。
  * 三分态返回：true = 开启/默认（未配置视为开启）；null = 明确关闭；undefined = 异常保持快照不动。
  */
+/** 与应用绑定一起随每次 CLI respawn 更新，查不到时保留旧快照。 */
+export function latestTriggerUserAuthForRespawn(ds: DaemonSession): import('../services/trigger-user-auth.js').TriggerUserAuthConfig | null | undefined {
+  try { return getBot(ds.larkAppId).config.triggerUserAuth ?? null; }
+  catch { return undefined; }
+}
+
 /** replyDelivery for an in-worker respawn (`/restart`): the replacement CLI's
  *  prompt and the worker gate follow today's config, like a re-fork would.
  *  Undefined (lookup failed) keeps the worker's snapshot. */
@@ -9446,6 +9457,7 @@ export function latestReplyDeliveryForRespawn(ds: DaemonSession): 'send' | 'tran
     return undefined;
   }
 }
+
 
 export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | null | undefined {
   try {
@@ -9600,6 +9612,7 @@ export function requestSessionRestart(
             traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
             ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
               larkToolBinding: latestLarkToolBindingForRespawn(ds),
+              triggerUserAuth: latestTriggerUserAuthForRespawn(ds),
               replyDelivery: latestReplyDeliveryForRespawn(ds),
               ...latestLaunchCommandsForRespawn(ds),
               ...(nextStatuslineLaunchGen ? { statuslineLaunchGen: nextStatuslineLaunchGen } : {}) }) } as DaemonToWorker);
@@ -17408,6 +17421,8 @@ function forgetScheduledTurnCaller(ds: DaemonSession, turnId: string | undefined
   if (ds.scheduledTurnCallers?.size === 0) ds.scheduledTurnCallers = undefined;
   ds.scheduledToolActors?.delete(turnId);
   if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
+  ds.scheduledControlActors?.delete(turnId);
+  if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
 }
 
 /** Reuse the daemon's normal per-turn credential publication, including scheduled authority checks. */
@@ -17813,7 +17828,7 @@ export function sendWorkerInput(
     // itself. Only while parked: an ordinary turn changes no launch config, and
     // an unconditional field would be pure noise on every message.
     ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
-    ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds), triggerUserAuth: latestTriggerUserAuthForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? { replyDelivery: latestReplyDeliveryForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
@@ -18397,7 +18412,7 @@ export function promoteQueuedActivationTail(
       ...(promotedTitlePlan?.nativePrompt ? { nativeSessionTitlePrompt: promotedTitlePlan.nativePrompt } : {}),
       // Same parked-worker launch-snapshot refresh as the ordinary send.
       ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
-      ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds), triggerUserAuth: latestTriggerUserAuthForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { replyDelivery: latestReplyDeliveryForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
@@ -27179,6 +27194,7 @@ function setupWorkerHandlers(
           model: msg.model,
           sandboxEngaged: msg.sandboxEngaged,
           loopbackShared: msg.loopbackShared,
+          cliExecution: msg.cliExecution,
         });
         await cb.onIdentityDecision?.(ds, {
           model: decision.model, flipped: decision.flipped, turnId: msg.turnId,
@@ -27916,6 +27932,7 @@ function setupWorkerHandlers(
       ds.managedTurnOrigin = undefined;
       ds.scheduledTurnCallers = undefined;
       ds.scheduledToolActors = undefined;
+      ds.scheduledControlActors = undefined;
       ds.taskContinuationRpcProof = undefined;
       ds.activeInteractiveTurn = undefined;
       if (ds.remoteCloseState) {

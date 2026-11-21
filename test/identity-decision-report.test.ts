@@ -56,6 +56,20 @@ afterEach(() => {
 });
 
 describe('identityStorageModelForDaemonSession follows the worker report', () => {
+  it('withholds credentials when actual native spawn no longer matches the bot mode', () => {
+    const cfg = { larkAppId: 'cli_decision', apiOnly: false, backendType: 'pty', larkToolBinding: false };
+    vi.mocked(botRegistry.getBot).mockReturnValue({ config: cfg } as any);
+    const ds = sessionFixture();
+    recordWorkerIdentityDecision(ds, worker, 9, { model: 'proven', sandboxEngaged: false, loopbackShared: true,
+      cliExecution: { mode: 'native', executor: { kind: 'os-user', username: 'operator', uid: 1000 } } });
+    expect(identityStorageModelForDaemonSession(ds)).toBe('proven');
+    cfg.larkToolBinding = true;
+    expect(identityStorageModelForDaemonSession(ds)).toBe('single');
+    expect(identityDecisionConflict(ds)).toBeDefined();
+    cfg.larkToolBinding = false;
+    expect(identityStorageModelForDaemonSession(ds)).toBe('proven');
+  });
+
   it('defaults to single before any report regardless of frozen sandbox fields', () => {
     const ds = sessionFixture();
     expect(identityStorageModelForDaemonSession(ds)).toBe('single');

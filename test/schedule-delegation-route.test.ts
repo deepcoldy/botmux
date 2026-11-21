@@ -1,3 +1,4 @@
+import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from '../src/core/cli-execution-mode.js';
 import { matchingScheduleBotGrant } from '../src/core/schedule-bot-grant.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -120,7 +121,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     parseScheduledTurnId,
     readScheduledTaskFromAuthority,
     SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
-    capabilityOn,
+    capabilityOn, configuredCliExecutionMode, delegatedCliExecutionAllowed,
     capabilityOfTool,
     scheduleAuthorityStore: { getRecord: vi.fn(() => undefined), listRecords: vi.fn((): unknown[] => []) },
     createHash,
@@ -487,6 +488,15 @@ describe('scheduled turn one-shot child creation', () => {
       status: 403, value: { error: 'schedule_child_one_shot_identity_isolation_required' },
     });
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('commits a bounded native child while retaining controller and ownerless limits', async () => {
+    const h = childHarness();
+    h.scope.getBot = () => ({ config: { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] } } });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      control: expect.objectContaining({ runScopes: [], selfManage: false }),
+    }));
   });
 
   it('maps the per-turn authority-store quota to the child-specific refusal', async () => {

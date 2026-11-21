@@ -167,12 +167,15 @@ import {
 } from '../cli/current-actor.js';
 import {
   CURRENT_EXECUTION_ROUTE,
+  CURRENT_EXECUTION_CLI_FIELD,
   CURRENT_EXECUTION_ORIGIN_FIELD,
   CURRENT_EXECUTION_SCHEMA,
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
+import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
+import { getDashboardAdminOpenIds } from '../bot-registry.js';
 import {
   attestCurrentExecutionLoopbackPeer,
   currentTurnPeerAttestationStable,
@@ -1645,7 +1648,9 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   if (!peer.ok) return jsonRes(res, 403, blocked);
   const document = resolveDaemonCurrentExecution(
     { sessionId, peer: peer.peer, findSession: findActiveBySessionId },
-    { includeOrigin },
+    { includeOrigin, includeCli: Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_CLI_FIELD),
+      cliExecution: ds => sessionCliExecutionInfo(ds, getBot(ds.larkAppId).config,
+        getDashboardAdminOpenIds(ds.larkAppId)) },
   );
   return document ? jsonRes(res, 200, document) : jsonRes(res, 403, blocked);
 });
@@ -1900,6 +1905,10 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
+    scheduledControlActorMode: ds => {
+      try { return configuredCliExecutionMode(getBot(ds.larkAppId).config); }
+      catch { return 'managed'; }
+    },
     ...(expectedScheduledTurnId ? { expectedScheduledTurnId } : {}),
   });
   return result.ok

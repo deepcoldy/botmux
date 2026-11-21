@@ -22,6 +22,19 @@ function forkSnapshot(): Cfg {
 }
 
 describe('applyRespawnConfigPatch', () => {
+  it('updates both CLI identity switches on an in-worker respawn', () => {
+    const cfg = forkSnapshot();
+    cfg.triggerUserAuth = { enabled: true, tools: ['lark-cli', 'bytedcli'] };
+    applyRespawnConfigPatch(cfg, { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] } });
+    expect(cfg.larkToolBinding).toBe(false);
+    expect(cfg.triggerUserAuth?.enabled).toBe(false);
+    applyRespawnConfigPatch(cfg, { triggerUserAuth: null });
+    expect(cfg.triggerUserAuth).toBeUndefined();
+    applyRespawnConfigPatch(cfg, { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } });
+    applyRespawnConfigPatch(cfg, {});
+    expect(cfg.triggerUserAuth?.tools).toEqual(['bytedcli']);
+  });
+
   it('replaces the fork-time startup commands with the carried ones', () => {
     const cfg = forkSnapshot();
     const result = applyRespawnConfigPatch(cfg, { startupCommands: ['/effort xhigh'] });
@@ -113,5 +126,19 @@ describe('respawnConfigPatchFromMessage', () => {
     expect(cfg.replyDelivery).toBe('transcript');
     expect(cfg.startupCommands).toEqual(forkSnapshot().startupCommands);
     expect(cfg.launchShell).toBe(forkSnapshot().launchShell);
+  });
+
+  it('triggerUserAuth 与 model/binding 一样不受 parked 门控，并保留 null 清空语义', () => {
+    const next = { enabled: false, tools: [] as string[] };
+    for (const parked of [false, true]) {
+      const cfg: Cfg = { ...forkSnapshot(), triggerUserAuth: { enabled: true, tools: ['bytedcli'] } };
+      const patch = respawnConfigPatchFromMessage({ triggerUserAuth: next }, parked);
+      expect(patch.triggerUserAuth).toBe(next);
+      applyRespawnConfigPatch(cfg, patch);
+      expect(cfg.triggerUserAuth).toEqual(next);
+    }
+    const cfg: Cfg = { ...forkSnapshot(), triggerUserAuth: { enabled: true, tools: ['bytedcli'] } };
+    applyRespawnConfigPatch(cfg, respawnConfigPatchFromMessage({ triggerUserAuth: null }, false));
+    expect(cfg.triggerUserAuth).toBeUndefined();
   });
 });

@@ -6,6 +6,7 @@ import { CURRENT_ACTOR_SCHEMA, normalizeActorEmail, type CurrentActorDocument } 
 import { resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { collectSessionLineagePids } from './preview-port-owner.js';
 import { larkTransportEnabled, type DaemonSession } from './types.js';
+import type { CliExecutionMode } from './cli-execution-mode.js';
 import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 import {
   PROC_STAT_STARTTIME_INDEX,
@@ -366,6 +367,8 @@ export interface CurrentTurnPeerAttestationInput {
   /** Current-actor only: let the daemon's live ownerless-child tool actor
    * satisfy the human caller requirement without promoting workflow authority. */
   allowScheduledToolActor?: boolean;
+  /** 仅 Actor 查询提供当前模式解析；只有 native 才可读取控制人，工具凭据证明保持独立。 */
+  scheduledControlActorMode?: (ds: DaemonSession) => CliExecutionMode;
 }
 
 /**
@@ -402,9 +405,17 @@ export function attestCurrentExecutionLoopbackPeer(
   const expectedScheduledToolActor = input.allowScheduledToolActor && input.expectedScheduledTurnId
     ? ds?.scheduledToolActors?.get(input.expectedScheduledTurnId)
     : undefined;
-  const attestedCallerOpenId = callerOpenId ?? scheduledToolActor?.openId;
+  const scheduledControlActorMode = (() => {
+    try { return ds ? input.scheduledControlActorMode?.(ds) : undefined; }
+    catch { return undefined; }
+  })();
+  const scheduledControlActor = scheduledControlActorMode === 'native' && turnId
+    ? ds?.scheduledControlActors?.get(turnId) : undefined;
+  const expectedScheduledControlActor = scheduledControlActorMode === 'native' && input.expectedScheduledTurnId
+    ? ds?.scheduledControlActors?.get(input.expectedScheduledTurnId) : undefined;
+  const attestedCallerOpenId = callerOpenId ?? scheduledToolActor?.openId ?? scheduledControlActor?.openId;
   const expectedScheduledCallerOpenId = scheduledCaller?.requestUserOpenId
-    ?? expectedScheduledToolActor?.openId;
+    ?? expectedScheduledToolActor?.openId ?? expectedScheduledControlActor?.openId;
   const refuse = (reason: string): null => { input.onRefusal?.(reason); return null; };
   if (!ds) return refuse('no session');
   if (ds.session.status !== 'active') return refuse('session not active');
@@ -511,12 +522,16 @@ export async function resolveDaemonCurrentActor(input: {
   resolveIdentity?: typeof resolveVerifiedUserIdentity;
   procRoot?: string;
   expectedScheduledTurnId?: string;
+  scheduledControlActorMode?: CurrentTurnPeerAttestationInput['scheduledControlActorMode'];
 }): Promise<CurrentActorDaemonResult> {
   const procRoot = input.procRoot ?? '/proc';
   const attestInput = {
     sessionId: input.sessionId, peer: input.peer,
     findSession: input.findSession, procRoot,
     allowScheduledToolActor: true,
+    ...(input.scheduledControlActorMode
+      ? { scheduledControlActorMode: input.scheduledControlActorMode }
+      : {}),
     ...(input.expectedScheduledTurnId
       ? { expectedScheduledTurnId: input.expectedScheduledTurnId }
       : {}),

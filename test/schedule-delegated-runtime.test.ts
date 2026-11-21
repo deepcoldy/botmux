@@ -26,6 +26,38 @@ const deps = () => ({
 });
 
 describe('delegated schedule runtime authorization', () => {
+  it('admits a controlled native run without borrowing the credential owner', async () => {
+    const input = { ...deps(), larkToolBinding: false,
+      triggerUserAuth: { enabled: false, tools: [] } };
+    const before = JSON.stringify(authority);
+    expect(await authorizeDelegatedScheduleRun(task, authority, input)).toMatchObject({
+      targetOpenId: 'ou_user_target', task: { ownerOpenId: undefined, ownerUnionId: undefined },
+    });
+    expect(JSON.stringify(authority)).toBe(before);
+    await expect(authorizeDelegatedScheduleRun(task, authority, { ...input, adminOpenIds: [] }))
+      .rejects.toThrow('allowed bot operator');
+    await expect(authorizeDelegatedScheduleRun(task, authority, { ...input, runEnabled: false }))
+      .rejects.toThrow('revoked by host policy');
+    await expect(authorizeDelegatedScheduleRun(task, authority, { ...input, hostRunScopes: [] }))
+      .rejects.toThrow('run scope is no longer allowed');
+  });
+
+  it('rechecks live native policy and controller after awaited identity lookups', async () => {
+    let cli = { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] as string[] } };
+    let operators = ['ou_user_target'];
+    const input = { ...deps(), larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] },
+      currentCliConfig: () => cli as any, currentAdminOpenIds: () => operators,
+      listChatMemberOpenIds: async () => {
+        cli = { larkToolBinding: true, triggerUserAuth: { enabled: false, tools: [] } };
+        return ['ou_user_target'];
+      } };
+    await expect(authorizeDelegatedScheduleRun(task, authority, input))
+      .rejects.toThrow('requires triggerUserAuth isolation');
+    cli = { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] } };
+    input.listChatMemberOpenIds = async () => { operators = []; return ['ou_user_target']; };
+    await expect(authorizeDelegatedScheduleRun(task, authority, input)).rejects.toThrow('allowed bot operator');
+  });
+
   it('rechecks operator and membership then strips generic human identity', async () => {
     const input = deps();
     await expect(authorizeDelegatedScheduleRun(task, authority, input)).resolves.toEqual({

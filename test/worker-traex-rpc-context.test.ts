@@ -303,6 +303,7 @@ function engageHarness(opts: {
     applySessionOwnerEnv: noop, usesLarkToolBinding: () => false, isWorkflowWorker: () => false,
     cleanupLarkToolBinding: noop, resolveIdentityStorageModel: () => 'none',
     prepareTurnGitConfigEnv: noop, parseDaemonIpcPort: noop, prepareLarkToolEnv: noop,
+    workerCliExecutionReport: () => undefined,
     protectedMcpRedactedEnvKeys: () => [], traexNativeSubagentHookConfig: noop,
     nativeSubagentRuntimeHookCommand: noop, bridgeCodexUserInput: noop, handleRpcTurnTerminal: noop,
     codexCleanupLaunchTarget: undefined, freezeCodexCleanupLaunch: noop,

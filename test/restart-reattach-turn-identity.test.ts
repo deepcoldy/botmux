@@ -20,6 +20,7 @@ import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-turn-authority.js';
 import { recallProvenIdentityContent, rememberProvenIdentityContent } from '../src/core/cli-identity.js';
+import { configuredCliExecutionMode } from '../src/core/cli-execution-mode.js';
 import { isHumanInboundTurnId, pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { isOwnerActorTurnId } from '../src/core/workflow-event-turn.js';
 import { prepareScheduledRecoveryRun } from '../src/core/scheduled-send.js';
@@ -96,9 +97,13 @@ function restartedWorld(turnId: string, opts: { endedBeforeRestart?: boolean } =
     config: { session: { dataDir: data } },
     logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn() },
     triggerUserAuthEnabledFor: () => true,
+    configuredCliExecutionMode,
+    getBot: () => ({ config: { larkToolBinding: true,
+      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'] } } }),
     identityStorageModelForDaemonSession: (session: any) => session.reportedIdentityModel?.model ?? 'single',
     parseScheduledTurnId, isHumanInboundTurnId, isOwnerActorTurnId, identityDecisionTurnIsLive, trackTurnIdentityPublication, prepareScheduledRecoveryRun,
-    scheduleAuthorityStore: { getRecord: () => undefined },
+    scheduleAuthorityStore: { getRecord: () => ({ kind: 'direct', state: 'active',
+      task: { id: 'daily_report', larkAppId: appId, chatId: 'oc_chat' } }) },
     scheduler: { admitManualRunTurn: () => false },
     sessionStore: { updateSession: vi.fn() },
     ownerActorIdentityRestores: new WeakMap(),

@@ -712,6 +712,8 @@ export interface DaemonSession {
    * scheduledTurnCallers, this does not authorize workflow or schedule
    * mutations and is never persisted. */
   scheduledToolActors?: Map<string, { openId: string; unionId: string }>;
+  /** 原生 scheduled turn 的已核验控制人，仅用于 Actor/操作权限证明，不用于个人凭据。 */
+  scheduledControlActors?: Map<string, { openId: string; unionId: string }>;
   /** Exact principal-lane turn/generation that still owns the worker until a
    * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
    * the worker's earlier managed-origin revoke must not clear this FIFO fence,
@@ -1061,6 +1063,7 @@ export interface DaemonSession {
    *  disabled after restart): identity publication is withheld on both models
    *  until a live worker reports again. */
   reportedIdentityModel?: {
+    cliExecution?: import('./cli-execution-mode.js').WorkerCliExecution;
     model: import('./lark-tool-binding.js').IdentityStorageModel;
     sandboxEngaged: boolean;
     loopbackShared: boolean;
