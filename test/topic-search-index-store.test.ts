@@ -103,6 +103,12 @@ describe('topic index synchronization and merge', () => {
 
   it('detects an earlier-line rewrite when the final line and revision metadata are unchanged', async () => {
     const path = jsonl('queues/om_root.jsonl',[inbound('om_first','OLD_FIRST'),inbound('om_last','UNCHANGED_LAST')]);
+    // Pin a whole-second mtime before the first sync so the index records it. A
+    // sub-microsecond mtime does not survive the seconds-based utimesSync round-trip
+    // on every filesystem (CI storage truncates to microseconds), which would make
+    // the metadata-identity guard below flake. Integer seconds round-trip exactly.
+    const pinnedSeconds = Math.floor(Date.now()/1000);
+    utimesSync(path,pinnedSeconds,pinnedSeconds);
     await syncTopicIndex(dataDir);
     const { size,mtimeMs } = statSync(path);
     writeFileSync(path,[inbound('om_first','NEW_FIRST'),inbound('om_last','UNCHANGED_LAST')].map(row => JSON.stringify(row)+'\n').join(''));
