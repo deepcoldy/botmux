@@ -11064,7 +11064,36 @@ let mojoTurnMark: {
 function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number | undefined): void {
   if (effectiveBackendType !== 'mojo') return;
   mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
+  // Same instant, same turn: the backend binds it to the write about to land,
+  // so its final/failure reports this turn even if a passthrough has rotated
+  // currentBotmuxTurnId by the time a busy remote lets it end. Duck-typed for
+  // the same reason as pushMojoLivePatchToBackend.
+  const current = backend as (SessionBackend & { bindNextTurn?: (id: string | undefined) => void }) | null;
+  current?.bindNextTurn?.(turnId);
 }
+
+/**
+ * A mojo turn that the worker retired — a passthrough was written while it
+ * still waited on the remote — keeps executing: mojo serializes its turns, and
+ * the backend reports this turn's own id when it finally ends. Its outcome
+ * belongs to its own thread. Dropping it as stale would silently lose that
+ * message; attributing it to the current turn (as before exact ids) closed the
+ * wrong card. Remote-runner keeps its strict stale rule.
+ */
+function retiredMojoTurnEndsLate(turnId: string): boolean {
+  return effectiveBackendType === 'mojo' && retiredTurnIds.has(turnId);
+}
+
+/**
+ * Set by the final/failure handler when the boundary it just handled belongs
+ * to such a retired mojo turn; consumed by the onTaskDone that the backend
+ * fires right after it. That boundary is not the end of the turn the worker is
+ * waiting on, so it must not re-arm prompt-ready: doing so flushed the next
+ * message (and moved turn authority to it) while mojo was still executing the
+ * current one. Type-ahead attribution is unaffected — those boundaries belong
+ * to the current turn and still advance it.
+ */
+let mojoRetiredBoundaryPending = false;
 
 function deliverRemoteTurnFinal(
   text: string,
@@ -11077,7 +11106,8 @@ function deliverRemoteTurnFinal(
   // wrong reason. Falling back to an unmarked window degrades to "always
   // deliver" (shouldSuppressBridgeEmit needs markTimeMs to suppress on sends),
   // which is the safe direction for a bug whose symptom is silence.
-  const mark = mojoTurnMark && mojoTurnMark.turnId === currentBotmuxTurnId ? mojoTurnMark : null;
+  const markedTurnId = exactTurnId ?? currentBotmuxTurnId;
+  const mark = mojoTurnMark && mojoTurnMark.turnId === markedTurnId ? mojoTurnMark : null;
   const turnId = exactTurnId ?? mark?.turnId ?? currentBotmuxTurnId;
   // Without a turn id the daemon cannot resolve a reply target, and lastUuid
   // would not dedupe a retry. Dropping is right: this can only be output that
@@ -11086,7 +11116,8 @@ function deliverRemoteTurnFinal(
     log('Remote final bridge skipped: no turn id for this answer');
     return;
   }
-  const dispatchAttempt = mark?.dispatchAttempt ?? currentBotmuxDispatchAttempt;
+  const dispatchAttempt = mark?.dispatchAttempt
+    ?? (turnId === currentBotmuxTurnId ? currentBotmuxDispatchAttempt : undefined);
   // adoptMode is structurally impossible for mojo (no pane to adopt); passing
   // the real flag keeps this call identical in shape to the other gate callers.
   const adoptMode = lastInitConfig?.adoptMode === true;
@@ -33770,6 +33801,13 @@ async function spawnCliBody(
   // in pendingMessages forever once the task finishes.
   backend.onTaskDone?.(bindSessionExecutionEvent(() => {
     if (fatalWorkerErrorPending) return;
+    if (mojoRetiredBoundaryPending) {
+      mojoRetiredBoundaryPending = false;
+      if (backend === observedBackend) {
+        log(`${cliName()} retired turn finished — prompt-ready stays with the current turn`);
+        return;
+      }
+    }
     // Generation fence (matches the onAgentStatus above and the onExit below):
     // a stale RiffBackend's `fetchAndEmitOutput(...).finally(taskDoneCb)` can
     // resolve AFTER destroySession()/kill() during a restart (neither clears
@@ -33790,8 +33828,11 @@ async function spawnCliBody(
     if (fatalWorkerErrorPending) return;
     if (backend !== observedBackend) return;
     if (turnId && currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
-      log(`Ignored stale remote final for turn ${turnId.substring(0, 12)}`);
-      return;
+      if (!retiredMojoTurnEndsLate(turnId)) {
+        log(`Ignored stale remote final for turn ${turnId.substring(0, 12)}`);
+        return;
+      }
+      mojoRetiredBoundaryPending = true;
     }
     try {
       deliverRemoteTurnFinal(text, turnId, hostContext?.linkRefMode);
@@ -33804,7 +33845,7 @@ async function spawnCliBody(
         completedTurnId,
         'completed',
         undefined,
-        currentBotmuxDispatchAttempt,
+        completedTurnId === currentBotmuxTurnId ? currentBotmuxDispatchAttempt : undefined,
       );
     }
   }, args => ({ turnId: args[1], origin: args[2]?.sessionOrigin })));
@@ -33897,23 +33938,35 @@ async function spawnCliBody(
   }, args => ({ turnId: args[0].turnId, dispatchAttempt: args[0].dispatchAttempt })));
   backend.onTurnFailure?.(bindSessionExecutionEvent((failure) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
-    if (currentBotmuxTurnId && failure.turnId !== currentBotmuxTurnId) {
-      log(`Ignored stale remote failure for turn ${failure.turnId.substring(0, 12)}`);
+    // A failure without a turn id (a mojo write the worker never bound to a
+    // turn, see stampMojoTurnMark) belongs to the current turn — the same
+    // attribution onTurnFinal uses. Without a turn there is no reply target.
+    const turnId = failure.turnId ?? currentBotmuxTurnId;
+    if (!turnId) {
+      log(`Remote failure ${failure.code} skipped: no turn id`);
       return;
     }
+    if (currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
+      if (!retiredMojoTurnEndsLate(turnId)) {
+        log(`Ignored stale remote failure for turn ${turnId.substring(0, 12)}`);
+        return;
+      }
+      mojoRetiredBoundaryPending = true;
+    }
+    const dispatchAttempt = turnId === currentBotmuxTurnId ? currentBotmuxDispatchAttempt : undefined;
     send({
       type: 'final_output',
       content: failure.message,
-      lastUuid: failure.turnId,
-      turnId: failure.turnId,
-      dispatchAttempt: currentBotmuxDispatchAttempt,
+      lastUuid: turnId,
+      turnId,
+      ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       turnFailed: true,
     });
     emitTurnTerminal(
-      failure.turnId,
+      turnId,
       failure.status,
       failure.code,
-      currentBotmuxDispatchAttempt,
+      dispatchAttempt,
       undefined,
       failure.retryable,
     );
