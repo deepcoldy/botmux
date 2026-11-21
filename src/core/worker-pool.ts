@@ -192,7 +192,8 @@ import {
 } from './shared-adopt.js';
 import { closeResidualClause } from './close-residual.js';
 import { logger } from '../utils/logger.js';
-import { createCliAdapterSync, type CliAdapterOptions } from '../adapters/cli/registry.js';
+import { createCliAdapterSync, resolveEffectiveCliId, type CliAdapterOptions } from '../adapters/cli/registry.js';
+import { antigravityTransport } from '../services/antigravity-transport.js';
 import { cliSupportsConfigDir } from './cli-config-dir.js';
 import {
   resolveCliRuntime,
@@ -1020,7 +1021,7 @@ import { isBotMentionEntry, knownBotOpenIdsFromCrossRef, type BotMentionEntry } 
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import { isCodexAppCliId, type CliId } from '../adapters/cli/types.js';
-import { isStructuredBridgeAdoptCli, isStructuredBridgeLifecycleBlockingCli } from '../services/structured-bridge-clis.js';
+import { isStructuredBridgeAdoptCli, isStructuredBridgeLifecycleBlockingCli, sessionEmitsTurnTerminal } from '../services/structured-bridge-clis.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
 import { readBotsInfoJson } from '../services/bots-info-cache.js';
@@ -24281,6 +24282,11 @@ function setupWorkerHandlers(
             recordUsageForDaemonSession(ds);
             if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
               void finishTurnReactions(ds);
+              if (screenTurnId && !sessionUsesTurnTerminal(ds, botCfg)) {
+                finalizeCotMessage(ds, screenTurnId, 'completed', msg.dispatchAttempt);
+                ds.cotForced = undefined;
+                ds.lastThinkingUpdate = undefined;
+              }
               if (ds.session.workflowNode && !ds.session.workflowNode.submittedAt) {
                 cb.onWorkflowNodeTurnSettled?.(ds, { ...(screenTurnId ? { turnId: screenTurnId } : {}), at: Date.now() });
               }
@@ -28639,6 +28645,25 @@ function shouldDropMismatchedHermesFinalOutput(
 /** Screen-only CLIs retain their legacy idle signal. For drivers with an
  * authoritative terminal, a quiet screen is not evidence of answer delivery.
  * Adopt/workflow/meeting lanes retain their existing dedicated UI contracts. */
+function sessionUsesTurnTerminal(ds: DaemonSession, botCfg: BotConfig): boolean {
+  const cliId = sessionCliId(ds, botCfg);
+  const dshRuntime = dshRuntimeForSession(ds);
+  const effectiveCliId = resolveEffectiveCliId(cliId, dshRuntime);
+  const agyTransport = effectiveCliId === 'antigravity' ? antigravityTransport(botCfg.env) : undefined;
+  const adapter = createCliAdapterSync(effectiveCliId, botCfg.cliPathOverride, {
+    configDir: botCfg.cliConfigDir,
+    ...(agyTransport ? { antigravityTransport: agyTransport } : {}),
+  });
+  return sessionEmitsTurnTerminal({
+    cliId,
+    dshRuntime,
+    adoptMode: isSharedAdoptSession(ds),
+    zeroPrompt: sessionPromptInjection(ds) === 'none',
+    sandboxScratch: sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged) === 'scratch',
+    adapter,
+  });
+}
+
 function usesOutcomeBasedTurnReactions(ds: DaemonSession): boolean {
   return isStructuredBridgeLifecycleBlockingCli(sessionCliId(ds, getBot(ds.larkAppId).config))
     && !isSharedAdoptSession(ds) && !ds.session.workflowNode && !ds.session.vcMeetingReceiver;
