@@ -478,9 +478,9 @@ import {
   STRUCTURED_BRIDGE_ZERO_PROMPT_CLI_IDS,
   isStructuredBridgeAdoptIdleCli,
   isStructuredBridgeAdoptInputCli,
-  isStructuredBridgeFallbackActive,
   isStructuredBridgeLifecycleBlockingCli,
 } from './services/structured-bridge-clis.js';
+import { hasAppRunnerOscControlChannel, hasStructuredBridgeTurnTerminal } from './services/turn-terminal-capability.js';
 import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from './services/antigravity-cot.js';
@@ -13822,28 +13822,13 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 // shared with the Claude path.
 
 function codexBridgeFallbackActive(): boolean {
-  if (lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput) return false;
-  // scratch full-root COW: cursor's transcript mirror lands in the overlay
-  // and the host-side reader (~/.cursor/projects) cannot resolve it, so the
-  // send-less harvest would silently vanish. `botmux send` still works, so
-  // stay on send-only (same as pre-#932). Adopted panes are not sandboxed by
-  // botmux; zero-prompt spawns under scratch are rejected loudly earlier in
-  // spawnCli.
-  if (lastInitConfig?.cliId === 'cursor'
-    && lastInitConfig?.adoptMode !== true
-    && lastResolvedSandboxMode === 'scratch') {
-    return false;
-  }
-  // Transcript-backed CLIs whose final output can be harvested when the
-  // model forgets to call `botmux send` — see
-  // services/structured-bridge-clis.ts (single source of the allowlist).
-  // Antigravity additionally activates for botmux-spawned sessions only
-  // under promptInjection:'none' (it has no send channel to fall back on).
-  return isStructuredBridgeFallbackActive(
-    lastInitConfig?.cliId,
-    lastInitConfig?.adoptMode === true,
-    lastInitConfig?.promptInjection === 'none',
-  );
+  return hasStructuredBridgeTurnTerminal({
+    cliId: lastInitConfig?.cliId,
+    adapter: cliAdapter,
+    adoptMode: lastInitConfig?.adoptMode === true,
+    zeroPrompt: lastInitConfig?.promptInjection === 'none',
+    scratch: lastResolvedSandboxMode === 'scratch',
+  });
 }
 
 /** A Codex App shared-adopt starts a SECOND official `codex --remote` client
@@ -20555,11 +20540,8 @@ function handleVisibleStartupInteraction(data: string): boolean {
   return true;
 }
 
-// Mira/Mir/dsh send terminal OSC control messages. Codex App deliberately
-// does not (PR #597): its signed Unix-socket channel is independent of the
-// terminal/backend rendering (including Herdr and Zellij), so it is no longer
-// in the terminal-OSC decode set.
-const APP_RUNNER_OSC_CLI_IDS = new Set(['mira', 'mir', 'dsh', 'minimax']);
+// Codex App deliberately does not use terminal OSC (PR #597): its signed
+// Unix-socket channel is independent of terminal/backend rendering.
 const appRunnerControlDecoder = new RunnerControlDecoder();
 const minimaxFinalReceiver = new MinimaxFinalReceiver(
   payload => { void handleTrustedCodexAppMarker('final', payload); },
@@ -21533,8 +21515,7 @@ function maybeCaptureKiroSessionId(data: string): void {
 function splitCodexAppControl(data: string): string {
   return appRunnerControlDecoder.push(
     data,
-    APP_RUNNER_OSC_CLI_IDS.has(lastInitConfig?.cliId ?? '')
-      || (lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput === true),
+    hasAppRunnerOscControlChannel(lastInitConfig?.cliId, cliAdapter),
     handleAppRunnerOscMarker,
   );
 }
