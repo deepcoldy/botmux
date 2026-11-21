@@ -16,6 +16,14 @@ afterEach(() => {
   dirs.length = 0;
 });
 
+// 在 fake timer 下排空全部定时器直到目标 promise settle。交给 vi 自己按到期时间
+// 调度（runAllTimersAsync 会递归推进并 flush 微任务），不写死 helper 的私有轮询间隔
+// POLL_INTERVAL_MS——把它从 20 改成 40 用例同样通过，测试不复制内部节拍。
+async function settle(p: Promise<unknown>): Promise<void> {
+  await vi.runAllTimersAsync();
+  await p; // 此刻 helper 已因成功 resolve 或 deadline/shouldStop 而结束
+}
+
 describe('waitForJsonFile', () => {
   it('returns parsed JSON from an already-complete file', async () => {
     const f = join(tmp(), 'ready.json');
@@ -26,21 +34,27 @@ describe('waitForJsonFile', () => {
 
   // 回归 #3692：文件被 create/truncate 后 existsSync 立即为真，但内容尚未写完。
   // 直接 read/parse 会在这一刻读到空文件抛 EOF；helper 必须重试到内容完整。
-  it('retries through the create→write window when the file exists empty first', async () => {
+  // 用 fake timer + 推进到 settle，不依赖真实 event-loop 调度顺序或轮询间隔常量。
+  it('retries through the create→write window when the file exists empty first (fake timers)', async () => {
+    vi.useFakeTimers();
     const f = join(tmp(), 'empty-first.json');
     writeFileSync(f, '');
     const payload = { prompt: '<botmux_routing>', snapshot: 'send' };
     setTimeout(() => writeFileSync(f, JSON.stringify(payload)), 60);
-    await expect(waitForJsonFile<typeof payload>(f, { timeoutMs: 2_000 })).resolves.toEqual(payload);
+    const done = waitForJsonFile<typeof payload>(f, { timeoutMs: 2_000 });
+    await settle(done);
+    await expect(done).resolves.toEqual(payload);
   });
 
-  it('retries when the file briefly holds truncated (unclosed) JSON', async () => {
+  it('retries when the file briefly holds truncated (unclosed) JSON (fake timers)', async () => {
+    vi.useFakeTimers();
     const f = join(tmp(), 'truncated.json');
     const full = JSON.stringify({ a: 1, b: 2 });
     writeFileSync(f, full.slice(0, 5));
     setTimeout(() => writeFileSync(f, full), 60);
-    await expect(waitForJsonFile<{ a: number; b: number }>(f, { timeoutMs: 2_000 }))
-      .resolves.toEqual({ a: 1, b: 2 });
+    const done = waitForJsonFile<{ a: number; b: number }>(f, { timeoutMs: 2_000 });
+    await settle(done);
+    await expect(done).resolves.toEqual({ a: 1, b: 2 });
   });
 
   // read/parse 必须先于 shouldStop：生产方已退出但完整结果已落盘时仍要成功，不能丢结果。
@@ -54,19 +68,17 @@ describe('waitForJsonFile', () => {
   });
 
   // P2 回归（#3693 二轮）：writer 在 deadline 临近时写完，循环因到期退出后的 final read
-  // 必须兜住，不能「抛超时但文件其实已完整」。用 fake timers 确定性推进，不依赖墙钟
-  // 余量——真实 timer 在高负载下 poll 被延迟、final read 抢在 writer 之前时会 flake。
-  // 序列：t20/t40 两次 poll 都读到空 → t45 writer 写完整 → t50 到 deadline、final read 成功。
+  // 必须兜住，不能「抛超时但文件其实已完整」。用 fake timer 推进到 settle，不写死轮询
+  // 间隔或推进次数（与 POLL_INTERVAL_MS 解耦）：writer 在 45ms 写完、deadline 50ms 到期，
+  // helper 退出 while 后的 final read 命中完整 JSON。
   it('still returns the result when the writer finishes just before the deadline (fake timers)', async () => {
     vi.useFakeTimers();
     const f = join(tmp(), 'deadline-edge.json');
-    writeFileSync(f, ''); // 初始为空，前两次 poll 都解析失败
+    writeFileSync(f, '');
     const payload = { ok: 1 };
     setTimeout(() => writeFileSync(f, JSON.stringify(payload)), 45);
     const done = waitForJsonFile<typeof payload>(f, { timeoutMs: 50 });
-    await vi.advanceTimersByTimeAsync(20); // t=20 第一次 poll：仍空
-    await vi.advanceTimersByTimeAsync(20); // t=40 第二次 poll：仍空（writer 在 45）
-    await vi.advanceTimersByTimeAsync(20); // t=60：跨过 deadline 50，writer 已在 45 写完，final read 命中
+    await settle(done);
     await expect(done).resolves.toEqual(payload);
   });
 
