@@ -3,7 +3,9 @@ import { CodexBridgeQueue } from '../../src/services/codex-bridge-queue.js';
 import { InputDeliveryEvidenceTracker } from '../../src/services/input-delivery-evidence.js';
 import { createSubmitFailureChainController } from '../../src/services/submit-failure-chain.js';
 import { combineSubmitCurrentFences, settleDeferredSubmitConfirmation } from '../../src/services/submit-confirmation.js';
+import { screenMayShowCredential } from '../../src/core/cli-startup-blocker.js';
 import { buildSubmitMessagePreview } from '../../src/services/submit-notification.js';
+import { diagnoseSubmitFailure } from '../../src/services/submit-failure-diagnosis.js';
 import { CodexAppFlushPromptReplay } from '../../src/utils/codex-app-turn-liveness.js';
 import { CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS } from '../../src/utils/codex-app-control.js';
 import { loadWorkerFunction } from './worker-function-harness.js';
@@ -71,6 +73,7 @@ export function workerSubmitHarness() {
     armInputDeliveryQuarantine: vi.fn(() => null),
     redriveRejectedStructuredReady: vi.fn(), observeQueuedActivationReceipt: vi.fn(),
     inputDeliveryEvidence, submitFailureChains, SUBMIT_DEFERRED_RECHECK_MS: 20_000,
+    screenMayShowCredential, diagnoseSubmitFailure,
     SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS: 2, unscopedSubmitFailureChainSequence: 0,
     combineSubmitCurrentFences,
     settleDeferredSubmitConfirmation: async (...args: Parameters<typeof settleDeferredSubmitConfirmation>) => {
@@ -102,6 +105,7 @@ export function workerSubmitHarness() {
     shouldStopPendingBatch: () => true,
   };
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
+  scope.screenShowsCredentialPage = loadWorkerFunction('screenShowsCredentialPage', scope);
   // Real write-edge transport fold: a no-op unless an item carries a parked
   // TraeX RPC catalog and no RPC engine will write it.
   scope.inlineParkedTraexSkillCatalog = loadWorkerFunction('inlineParkedTraexSkillCatalog', scope);

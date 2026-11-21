@@ -143,6 +143,7 @@ import {
 } from './decision-board-model.js';
 import {
   STREAMING_CARD_BUTTON_IDS,
+  resolveStreamingCardFoldedLayout,
   type StreamingCardButtonId,
 } from '../../im/lark/streaming-card-buttons.js';
 
@@ -656,6 +657,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     disableStreamingCard: body.disableStreamingCard,
     replyCardMode: body.replyCardMode,
     hiddenStreamingCardButtons: body.hiddenStreamingCardButtons,
+    streamingCardFoldedLayout: resolveStreamingCardFoldedLayout(body),
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
@@ -667,7 +669,6 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     replyCardActions: body.replyCardActions,
     replyCardNextStep: body.replyCardNextStep,
     replyCardRecap: body.replyCardRecap,
-    replyCardRecapModel: body.replyCardRecapModel,
     cotEnabled: body.cotEnabled,
     replyCardShowTools: body.replyCardShowTools,
     replyCardNativeCot: body.replyCardNativeCot,
@@ -6114,6 +6115,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [disableStreaming, setDisableStreaming] = useState(bot.disableStreamingCard === true);
   const [replyMode, setReplyMode] = useState(bot.replyCardMode ?? 'legacy');
   const [hiddenButtons, setHiddenButtons] = useState<StreamingCardButtonId[]>(bot.hiddenStreamingCardButtons ?? []);
+  const [foldedLayout, setFoldedLayout] = useState(resolveStreamingCardFoldedLayout(bot));
   const [pinStreamingCard, setPinStreamingCard] = useState(bot.pinStreamingCard === true);
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
@@ -6122,7 +6124,6 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [replyActions, setReplyActions] = useState(bot.replyCardActions === true);
   const [nextStep, setNextStep] = useState(bot.replyCardNextStep === true);
   const [recap, setRecap] = useState(bot.replyCardRecap === true);
-  const [recapModel, setRecapModel] = useState(bot.replyCardRecapModel === true);
   const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [showTools, setShowTools] = useState(bot.replyCardShowTools !== false);
   const [nativeCot, setNativeCot] = useState(bot.replyCardNativeCot === true);
@@ -6134,6 +6135,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setDisableStreaming(bot.disableStreamingCard === true);
     setReplyMode(bot.replyCardMode ?? 'legacy');
     setHiddenButtons(bot.hiddenStreamingCardButtons ?? []);
+    setFoldedLayout(resolveStreamingCardFoldedLayout(bot));
     setPinStreamingCard(bot.pinStreamingCard === true);
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
@@ -6142,11 +6144,10 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setReplyActions(bot.replyCardActions === true);
     setNextStep(bot.replyCardNextStep === true);
     setRecap(bot.replyCardRecap === true);
-    setRecapModel(bot.replyCardRecapModel === true);
     setCotEnabled(bot.cotEnabled !== false);
     setShowTools(bot.replyCardShowTools !== false);
     setNativeCot(bot.replyCardNativeCot === true);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.replyCardRecapModel, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.streamingCardFoldedLayout, bot.pinStreamingCard, bot.privateCard, bot.replyCardActions, bot.replyCardNextStep, bot.replyCardRecap, bot.cotEnabled, bot.replyCardShowTools, bot.replyCardNativeCot, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard, bot.goalStatusCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     await saveBotField({
@@ -6319,6 +6320,18 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
         <section className="bd-card-setting-group" data-card-buttons-group>
           <h4 className="bd-card-setting-heading">{tr(replyMode === 'legacy' ? 'botDefaults.streamingButtons' : 'botDefaults.replyCardControls')}</h4>
           {replyMode !== 'legacy' && <p className="bd-card-setting-copy">{tr('botDefaults.replyCardControlsHelp')}</p>}
+          <ToggleRow
+            checked={foldedLayout}
+            disabled={busy !== null}
+            dataAction="toggle-streaming-card-folded-layout"
+            title={tr('botDefaults.streamingCardFoldedLayout')}
+            help={tr('botDefaults.streamingCardFoldedLayoutHelp')}
+            onChange={checked => {
+              const previous = foldedLayout;
+              setFoldedLayout(checked);
+              void savePatch({ streamingCardFoldedLayout: checked }, 'folded-layout', () => setFoldedLayout(previous));
+            }}
+          />
           <div className="bd-card-button-grid" data-card-button-grid>
             {buttonOptions.map(option => {
               const visible = !hiddenButtons.includes(option.id);
@@ -6450,19 +6463,6 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
                 const previous = recap;
                 setRecap(checked);
                 void savePatch({ replyCardRecap: checked }, 'reply-recap', () => setRecap(previous));
-              }}
-            />
-            <ToggleRow
-              checked={recapModel}
-              disabled={busy !== null || !recap}
-              dataAction="toggle-reply-card-recap-model"
-              title={tr('botDefaults.replyCardRecapModel')}
-              description={tr('botDefaults.replyCardRecapModelDescription')}
-              help={tr('botDefaults.replyCardRecapModelHelp')}
-              onChange={checked => {
-                const previous = recapModel;
-                setRecapModel(checked);
-                void savePatch({ replyCardRecapModel: checked }, 'reply-recap-model', () => setRecapModel(previous));
               }}
             />
           </div>
@@ -6783,6 +6783,7 @@ const ZERO_PROMPT_UNSUPPORTED_COPY: Record<ZeroPromptUnsupportedReason, string> 
   cli_unsupported: 'botDefaults.promptInjectionUnsupportedCli',
   backend_unsupported: 'botDefaults.promptInjectionUnsupportedBackend',
   scratch_unsupported_for_cli: 'botDefaults.promptInjectionUnsupportedScratch',
+  oncall_unsupported_for_cli: 'botDefaults.promptInjectionUnsupportedOncall',
   zmx_unsupported_for_antigravity: 'botDefaults.promptInjectionUnsupportedZmx',
 };
 

@@ -467,6 +467,15 @@ export const config = {
   // stored `false` limits every key to bot operators. Read at click time by the
   // stuck_key gate and at card build time for the who-may-press hint.
   get stuckCardInitiatorKeys(): boolean { return readGlobalConfig().dashboard?.stuckCardInitiatorKeys !== false; },
+  // Live getter: whether a newly created group @-mentions its owner with the
+  // "group is ready" notice (services/group-creator.ts, and the bare @ after a
+  // deferred team-group owner transfer). Default ON (absent ⇒ true); an
+  // explicit stored `false` silences it on every creation path. Read per
+  // creation: a one-shot `botmux create-group` reads the file fresh and a
+  // daemon sees a Dashboard/CLI flip within the 2s cache, no restart needed.
+  // Callers compare `!== false` so a test double without the getter keeps the
+  // default.
+  get groupOwnerNotice(): boolean { return readGlobalConfig().groupOwnerNotice !== false; },
 };
 
 export type Config = typeof config;

@@ -692,9 +692,14 @@ export function setClaudePidStateRereadSleepForTests(fn: ((ms: number) => void) 
   pidStateRereadSleepFn = fn ?? sleepSyncMs;
 }
 
-/** The parsed pid-state record; undefined when there is none or it never
- *  parses. Only a record that exists but does not parse is re-read: a missing
- *  one is the common answer for a pid that is not Claude, polled every tick. */
+/** readClaudePidState's answer for a record that exists but never parsed
+ *  within the re-reads: still mid-rewrite, not absent. */
+const PID_STATE_MID_REWRITE = Symbol('pid-state record mid-rewrite');
+
+/** The parsed pid-state record; undefined when there is none, or
+ *  PID_STATE_MID_REWRITE when it never parses. Only a record that exists but
+ *  does not parse is re-read: a missing one is the common answer for a pid that
+ *  is not Claude, polled every tick. */
 function readClaudePidState(path: string): unknown {
   for (let attempt = 0; ; attempt++) {
     let text: string;
@@ -706,7 +711,7 @@ function readClaudePidState(path: string): unknown {
     try {
       return JSON.parse(text);
     } catch {
-      if (attempt >= PID_STATE_REREAD_DELAYS_MS.length) return undefined;
+      if (attempt >= PID_STATE_REREAD_DELAYS_MS.length) return PID_STATE_MID_REWRITE;
       pidStateRereadSleepFn(PID_STATE_REREAD_DELAYS_MS[attempt]!);
     }
   }
@@ -719,8 +724,17 @@ function readClaudePidState(path: string): unknown {
  *  procStart is present but cannot be verified on Linux, fail closed; callers
  *  fall back to fingerprint detection. */
 export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): { path: string; cliSessionId: string } | null {
+  const resolved = resolveJsonlFromPidState(pid, expectedCwd, dataDir);
+  return resolved === 'mid-rewrite' ? null : resolved;
+}
+
+/** resolveJsonlFromPid, telling a record Claude is still rewriting past the
+ *  re-reads ('mid-rewrite': an answer exists but cannot be read yet) apart
+ *  from no usable answer at all (null). */
+export function resolveJsonlFromPidState(pid: number, expectedCwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): { path: string; cliSessionId: string } | 'mid-rewrite' | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   const parsed: any = readClaudePidState(claudePidStatePath(pid, dataDir));
+  if (parsed === PID_STATE_MID_REWRITE) return 'mid-rewrite';
   if (!parsed || typeof parsed !== 'object') return null;
   if (parsed.pid !== pid) return null;
   if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return null;
@@ -1093,9 +1107,6 @@ export interface ClaudeFamilyVariant {
    *  own leave it undefined, so `reasoningEffort` is silently ignored for
    *  them rather than producing an unknown-flag launch. */
   readonly supportsEffortFlag?: boolean;
-  /** Offers the optional「本轮回顾」model recap (CLAUDE_RECAP_MODEL). Only
-   *  Claude Code itself, whose print-mode flags it was verified against. */
-  readonly recapModel?: boolean;
   /** Env the user must prefix to `resumeBin` to resume by hand. Only set when the
    *  data root is a non-default profile a bare binary would not resolve on its own
    *  (relay/seed pin their own default, so they need none). */
@@ -1140,7 +1151,6 @@ export function createClaudeCodeAdapter(pathOverride?: string, configDir?: strin
     supportsProgramStatus: true,
     // Claude Code 2.1.x accepts `--effort low|medium|high|xhigh|max`.
     supportsEffortFlag: true,
-    recapModel: true,
     authPaths: ['~/.claude/.credentials.json'],
     resumeBin: 'claude',
     dataDir: DEFAULT_CLAUDE_DATA_DIR,
@@ -1152,29 +1162,6 @@ export function createClaudeCodeAdapter(pathOverride?: string, configDir?: strin
     modelChoices: CLI_MODEL_CHOICES['claude-code'],
   }, pathOverride ?? 'claude');
 }
-
-/**
- * The optional「本轮回顾」model recap on Claude Code: print mode on the haiku
- * alias, no tools, no MCP servers, no hooks (user and plugin hooks would
- * otherwise run for this throwaway session), nothing persisted, low effort.
- * User settings still load, so the session's own auth applies. CLAUDE.md and
- * auto memory stay out (they would multiply the input: a 16k-character turn
- * record measured 10.7k input tokens without them, 38.7k with this
- * repository's), and so does prompt caching (the call is never repeated, so a
- * cache write only costs more).
- */
-export const CLAUDE_RECAP_MODEL: NonNullable<CliAdapter['recapModel']> = {
-  args: systemPrompt => [
-    '-p', '--no-session-persistence', '--model', 'haiku', '--effort', 'low',
-    '--tools', '', '--strict-mcp-config', '--settings', JSON.stringify({ disableAllHooks: true }),
-    '--output-format', 'json', '--system-prompt', systemPrompt,
-  ],
-  env: {
-    CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1',
-    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
-    DISABLE_PROMPT_CACHING: '1',
-  },
-};
 
 export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: string): CliAdapter {
   // resolvedBin is resolved lazily on first read (memoised) so merely
@@ -1192,7 +1179,6 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
     supportsTypeAhead: true,
     // Every Claude-family variant runs the same TUI and input box.
     promptSuggestion: claudePromptSuggestion,
-    ...(variant.recapModel ? { recapModel: CLAUDE_RECAP_MODEL } : {}),
     supportsProgramStatus: variant.supportsProgramStatus,
     reliableTurnTerminal: variant.reliableTurnTerminal,
     // Isolation = worker-side whole-process Seatbelt wrapper. Claude's built-in

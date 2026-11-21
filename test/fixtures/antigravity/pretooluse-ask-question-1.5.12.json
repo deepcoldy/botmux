@@ -1,0 +1,38 @@
+{
+  "artifactDirectoryPath": "/home/dev/.gemini/antigravity-cli/brain/66b5cb9c-db04-41d1-a889-cc5158b6bc2c",
+  "conversationId": "66b5cb9c-db04-41d1-a889-cc5158b6bc2c",
+  "cwd": "/home/dev/work",
+  "hookEventName": "PreToolUse",
+  "lastUserInput": "please ask me",
+  "modelName": "gemini-3.1-pro-low",
+  "stepIdx": 2,
+  "toolCall": {
+    "args": {
+      "questions": [
+        {
+          "options": [
+            "(Recommended) PostgreSQL",
+            "SQLite",
+            "MySQL"
+          ],
+          "question": "Which database should we use?"
+        },
+        {
+          "is_multi_select": true,
+          "options": [
+            "Auth",
+            "Billing",
+            "Search"
+          ],
+          "question": "Which features to enable?"
+        }
+      ]
+    },
+    "id": "ff9a8089-a3c7-4e42-8454-179cfe0d3bca",
+    "name": "ask_question"
+  },
+  "transcriptPath": "/home/dev/.gemini/antigravity-cli/brain/66b5cb9c-db04-41d1-a889-cc5158b6bc2c/.system_generated/logs/transcript_full.jsonl",
+  "workspacePaths": [
+    "/home/dev/work"
+  ]
+}

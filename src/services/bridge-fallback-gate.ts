@@ -278,6 +278,19 @@ export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'response
   return marker.responseKind === 'final';
 }
 
+/** Whether an explicit final actually answers THIS conversation. Target-less
+ * legacy markers keep their historical credit; a final sent to another chat,
+ * another topic, or an orchestrator does not prove the source turn was delivered. */
+export function finalBridgeSendMarkerCoversOwnThread(
+  turn: Pick<BridgeGateInput, 'sessionId' | 'chatId' | 'rootMessageId'>,
+  marker: BridgeSendMarker,
+): boolean {
+  return isFinalBridgeSendMarker(marker)
+    && marker.terminalIndependent !== true
+    && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final')
+    && markerCoversOwnThread(turn, marker);
+}
+
 /** Recognize the narrow self-report a model appends after it has already
  *  delivered a folded execution's answer through `botmux send`
  *  ("已通过 botmux 发出最终结论…" / "I have sent the final answer via botmux
@@ -615,7 +628,10 @@ function supersededFinalMarkerExplainsCompletionNarration(
  * notice. A same-chat detour into another topic is handled separately: an
  * explicit final there already answered this turn. Legacy markers predate
  * routing metadata and retain their historical credit. */
-function markerCoversOwnThread(turn: BridgeGateInput, marker: BridgeSendMarker): boolean {
+function markerCoversOwnThread(
+  turn: Pick<BridgeGateInput, 'sessionId' | 'chatId' | 'rootMessageId'>,
+  marker: BridgeSendMarker,
+): boolean {
   if (marker.deliveryKind === undefined) return true;
   if (turn.chatId && marker.targetChatId && marker.targetChatId !== turn.chatId) {
     return false;

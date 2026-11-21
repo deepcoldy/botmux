@@ -32,17 +32,21 @@ import type { PendingCliInput } from '../utils/pending-input-queue.js';
 import { t } from '../i18n/index.js';
 
 /** Transient reason for one CLI restart; never stored in session config. */
-export type CliRestartCause = 'traex-auto-model';
+export type CliRestartCause = 'traex-auto-model' | 'antigravity-account-rotation';
 
 /** Only a planned TraeX continuation resuming the requested native session
- *  may skip interruption scanning. Preferred-model resets without a queued
- *  continuation and later crash recovery leave restartCause unset. */
+ *  or an automatic Antigravity account-rotation restart (where the daemon owns
+ *  turn replay) may skip interruption scanning. Preferred-model resets without
+ *  a queued continuation and later crash recovery leave restartCause unset. */
 export function shouldSuppressRestartInterruptionScan(input: {
   restartCause?: CliRestartCause;
   cliId: string;
   exactResumeSessionId?: string;
   effectiveCliSessionId?: string;
 }): boolean {
+  if (input.restartCause === 'antigravity-account-rotation' && input.cliId === 'antigravity') {
+    return true;
+  }
   return input.restartCause === 'traex-auto-model'
     && input.cliId === 'traex'
     && input.exactResumeSessionId !== undefined

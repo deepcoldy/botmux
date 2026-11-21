@@ -3,6 +3,7 @@ import claude from './claude-code.js';
 import opencode from './opencode.js';
 import coco from './coco.js';
 import dsh from './dsh.js';
+import antigravity from './antigravity.js';
 
 const REGISTRY: Record<string, HookAskAdapter> = {
   'claude-code': claude,
@@ -29,6 +30,9 @@ const REGISTRY: Record<string, HookAskAdapter> = {
   // payload shape and expect a plain DSH AskUserQuestionAnswer JSON object back.
   dsh,
   'dsh-tui': dsh,
+  // Antigravity CLI: PreToolUse on ask_question; the answer goes back as the
+  // reason of a deny decision (agy has no hook-supplied tool result).
+  antigravity,
 };
 
 export function getHookAdapter(cliId: string): HookAskAdapter | undefined {

@@ -1,6 +1,7 @@
 import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from './core/cli-execution-mode.js';
 import { resolveNativeScheduledControlActor } from './core/scheduled-control-actor.js';
 import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
+import { sandboxWithholdsBotSecret } from './adapters/cli/sandbox-mode.js';
 import { renderInboundMessageLocation } from './core/reply-message.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
@@ -171,7 +172,7 @@ import {
   type VcMeetingConsumerAgentConfig,
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
-import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
+import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from './im/lark/streaming-card-buttons.js';
 import { buildMarkdownCard, contextPercentUsed } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
@@ -3512,6 +3513,7 @@ async function ensureVcMeetingReceiverSession(
     session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
     session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
     session.sandboxNetworkPolicy = bot.config.sandboxNetworkPolicy ? structuredClone(bot.config.sandboxNetworkPolicy) : undefined;
+    session.sandboxWithholdBotSecret = sandboxWithholdsBotSecret(bot.config) ? true : undefined;
     session.backendType = isolation.backendType;
     sessionStore.updateSession(session);
 
@@ -7242,6 +7244,8 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string, opts: { 
       false,
       substituteCardControlFor(ds),
       ds.keysPanelOpen === true,
+      undefined,
+      resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -25637,6 +25641,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.sandboxReadonlyPaths = source.sandboxReadonlyPaths;
   child.sandboxNetwork = source.sandboxNetwork;
   child.sandboxNetworkPolicy = source.sandboxNetworkPolicy ? structuredClone(source.sandboxNetworkPolicy) : undefined;
+  child.sandboxWithholdBotSecret = source.sandboxWithholdBotSecret;
   child.reasoningEffort = source.reasoningEffort;
   child.modelBackendVariant = source.modelBackendVariant;
   child.model = source.model;

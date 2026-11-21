@@ -3,15 +3,15 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { reconcileUsageLimitState, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
 
-function classifier(raw: () => string, cliId = 'antigravity') {
+function classifier(raw: () => string, cliId = 'antigravity', authoritative = true) {
   const capture = vi.fn(raw);
   const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false });
   const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
-    backendScreenEvidenceIsAuthoritativeForMutation: () => true,
-    stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit,
+    backendScreenEvidenceIsAuthoritativeForMutation: () => authoritative,
+    stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, annotateAntigravityUsageLimit,
     usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
   });
@@ -155,5 +155,75 @@ describe('raw ANSI tmux quota classification', () => {
     const { classify, capture } = classifier(() => quota + composer, 'traex');
     expect(classify('ordinary output', 'working')).toEqual({ status: 'working' });
     expect(capture).not.toHaveBeenCalled();
+  });
+
+  it.each(['idle', 'working'])('does not re-read a historical refusal at a recovered %s composer', status => {
+    const recovered = quota + `\nError ID: ${id}` + composer
+      + '\n> continue\n\nBOTMUX_NOTHING_TO_SEND\n────\n'
+      + '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)\n────\n? for shortcuts';
+    const { classify } = classifier(() => recovered);
+    expect(classify('display snapshot retains old quota', status)).toEqual({
+      status, usageLimitRecovery: 'antigravity-ready-composer',
+    });
+  });
+
+  it('detects a new native refusal after a recovered composer', () => {
+    let screen = quota + `\nError ID: ${id}` + composer;
+    const { classify } = classifier(() => screen);
+    expect(classify('', 'idle').status).toBe('limited');
+    screen += '\nBOTMUX_NOTHING_TO_SEND\n────\n>\n────\n? for shortcuts';
+    expect(classify('', 'idle').usageLimit).toBeUndefined();
+    screen += '\n> next task\n' + quota + '\nError ID: new-episode' + composer;
+    expect(classify('', 'idle').usageLimit).toMatchObject({
+      source: 'antigravity-error-composer', relativeResetKey: expect.stringContaining('new-episode'),
+    });
+  });
+
+  it.each(['empty', 'failed'])('does not clear a limit from display-only evidence when native capture is %s', mode => {
+    const display = quota + `\nError ID: ${id}` + composer
+      + '\n>\n────\n? for shortcuts';
+    const { classify } = classifier(() => {
+      if (mode === 'failed') throw new Error('native capture unavailable');
+      return '';
+    });
+    const result = classify(display, 'idle');
+    expect(result.usageLimitRecovery).toBeUndefined();
+    expect(result.status).toBe('limited');
+  });
+
+  it('does not accept recovery evidence from a backend that cannot prove screen authority', () => {
+    const ready = '\n────\n>\n────\n? for shortcuts';
+    const { classify, capture } = classifier(() => ready, 'antigravity', false);
+    expect(classify(ready, 'idle')).toEqual({ status: 'idle' });
+    expect(capture).not.toHaveBeenCalled();
+  });
+
+  it('rejects a non-empty draft that ends with the exact placeholder suffix', () => {
+    const screen = quota + `\nError ID: ${id}` + composer
+      + '> explain this shortcut (shift+tab to cycle)\n────\n? for shortcuts';
+    expect(isAntigravityReadyComposerScreen(screen)).toBe(false);
+  });
+
+  it.each([
+    '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)',
+    '> Accept-edits mode: file edits auto-approved (shift+tab to cycle)',
+    '> Plan mode: research & plan only (shift+tab to cycle)',
+    '> Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)',
+  ])('accepts an exact empty placeholder split across terminal rows: %s', placeholder => {
+    const splitAt = 23;
+    const folded = `${placeholder.slice(0, splitAt)}\n${placeholder.slice(splitAt)}`;
+    const screen = quota + `\nError ID: ${id}` + composer + `${folded}\n────\n? for shortcuts`;
+    expect(isAntigravityReadyComposerScreen(screen)).toBe(true);
+  });
+
+  it.each([
+    '> drafted next request\n────\n? for shortcuts',
+    '>\n────\n? for shortcuts\nnew output after the footer',
+  ])('does not clear a limit using a historical ready footer or a drafted composer (%#)', tail => {
+    const screen = quota + `\nError ID: ${id}` + composer + '\n' + tail;
+    const { classify } = classifier(() => screen);
+    const result = classify('', 'idle');
+    expect(result.usageLimitRecovery).toBeUndefined();
+    expect(result.status).toBe('limited');
   });
 });

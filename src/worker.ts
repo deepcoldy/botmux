@@ -40,10 +40,9 @@ import {
 import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
-import {claudeActionPrompt} from './services/claude-action-prompt.js';
+import {ClaudePermissionNoticeTracker} from './services/claude-action-prompt.js';
 import { PromptSuggestionPublisher, promptSuggestionReportTurn, type FoldedTypeAheadTurn } from './utils/prompt-suggestion-publisher.js';
-import { CliRecapObserver, RECAP_MODEL_SYSTEM_PROMPT, TurnRecapRecorder } from './services/turn-recap.js';
-import { recapModelLaunchFor, runRecapModel, type RecapModelLaunch } from './services/turn-recap-runner.js';
+import { CliRecapObserver } from './services/turn-recap.js';
 import { WrittenInputLedger } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
@@ -67,7 +66,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, rmSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -100,6 +99,8 @@ import {
   provenancePendingContent,
   provenancePendingNonce,
   sendCredFilePath,
+  sendCredUpdateLockTarget,
+  writeSendCredFile,
   botHomePath,
   shouldRedirectCliData,
   buildCliExecutableReadCarveOuts,
@@ -191,7 +192,7 @@ import { stageBridgeFinalOutput, acknowledgeBridgeFinalOutput, type BridgeTurnJo
 import { TurnSendLedger } from './services/turn-send-ledger.js';
 import { restartSpendsFreshBudget, exitMarksServerReplaced } from './core/restart-fresh-budget.js';
 import { createTranscriptTerminalSettle, type TranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { attributableBridgeReplyMarkers, bridgeGateInputForTurn, bridgePostText, composeFailedBridgeFallbackContent, finalBridgeSendMarkerCoversOwnThread, hasTrailingBridgeSentinelLine, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
   decideFirstWriteLiveness,
@@ -218,7 +219,7 @@ import {
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
 import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
-import { applyRespawnConfigPatch } from './core/respawn-config-patch.js';
+import { applyRespawnConfigPatch, respawnConfigPatchFromMessage } from './core/respawn-config-patch.js';
 import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
 import {
@@ -366,6 +367,8 @@ import {
   type BotConfig,
 } from './bot-registry.js';
 import { HIDE_LOCAL_ADDRESSES_ENV, hideLocalAddressesEnvValue } from './im/lark/local-address-switch.js';
+import { REPLY_DELIVERY_ENV } from './services/send-completion-hint.js';
+import { paneReplyDeliveryFromProcessTree } from './services/pane-reply-delivery.js';
 import {
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
@@ -419,7 +422,14 @@ import {
 } from './services/bridge-rotation-policy.js';
 import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
-import { BridgeBlindTurnWatch, blindTurnNeedsNotice, type BridgeReadPosition } from './services/claude-bridge-blind-turn.js';
+import {
+  BridgeBlindTurnWatch,
+  blindTurnNeedsNotice,
+  replyRecordsStampedWithin,
+  UNREAD_TURN_RELOCATE_RETRIES,
+  UNREAD_TURN_RELOCATE_RETRY_MS,
+  type BridgeReadPosition,
+} from './services/claude-bridge-blind-turn.js';
 import { terminalInputSubmits, wrapBracketedPaste } from './adapters/cli/tui-input.js';
 import { WebTerminalInputController, WebTerminalInputWireState } from './core/web-terminal-input-controller.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
@@ -446,10 +456,11 @@ import {
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
-import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
+import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, resolveTraexResumeSessionId, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, traexProcessFileSource, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput, postCodexAsk } from './services/codex-user-input.js';
 import { TraexQuestionBridge } from './core/traex-question-bridge.js';
 import { traexQuestionFlowVisible } from './utils/traex-question-page.js';
+import { antigravityBlockingPageTail } from './utils/antigravity-blocking-page.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
 import { doubaoTrajectoryPathForSession, doubaoLiveUser } from './services/doubao-transcript.js';
 import { currentHermesStateOffset, drainHermesStateDb, resolveHermesStateDbPath, restoreFilteredHermesUserEvents } from './services/hermes-transcript.js';
@@ -475,7 +486,14 @@ import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from '
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import {
+  inspectAntigravityAccounts,
+  reconcileActiveAntigravityToken,
+  resolveAntigravitySpawnStoreOptions,
+  type AntigravityAccountStoreOptions,
+  type ReconcileAntigravityTokenResult,
+} from './services/antigravity-accounts.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
@@ -571,7 +589,7 @@ import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } fro
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { restoredTurnLabel } from './services/restored-turn-label.js';
-import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, resolveJsonlFromPidState, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { resolveShadowedAntigravityStatusLine } from './adapters/cli/antigravity.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
@@ -685,7 +703,8 @@ import {
   bwrapNamespaceFailure,
   coreOnlyPidNamespaceDegrade,
 } from './adapters/backend/sandbox.js';
-import { diagnoseSandboxNamespaceFailure, type BwrapNamespaceFailure } from './core/system-bwrap.js';
+import { diagnoseSandboxNamespaceFailure, setuidRootBwrap, type BwrapNamespaceFailure } from './core/system-bwrap.js';
+import { processOpenFilesDenial } from './utils/process-open-files.js';
 import {
   prepareScratchSandboxDetailed,
   attachScratchSession,
@@ -2322,6 +2341,22 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       }
     } else if (!nativeSessionId && lastInitConfig?.cliId === 'grok' && typeof findGrokSessionByPid === 'function') {
       nativeSessionId = findGrokSessionByPid(childPid)?.sessionId;
+    } else if (!nativeSessionId && lastInitConfig?.cliId === 'antigravity' && !cliAdapter?.runnerFramedInput
+      && (observedBackend as { isReattach?: boolean } | null)?.isReattach === true
+      && typeof nativeSessionForkPending === 'function' && !nativeSessionForkPending()) {
+      // A daemon restart re-attaches agy mid-turn. Its conversation is the one
+      // the process holds open (the observation that later persists its id);
+      // read it here so the first binding already proves it. Bound bare, the
+      // re-attached CLI got a new runtime, and a reply that finished while no
+      // worker was attached was refused before that id caught up. A fresh
+      // launch has no predecessor to match, and while agy starts up it briefly
+      // holds sibling conversations open: leave its id to the later observation.
+      const cid = cliAdapter?.resolveActiveSessionId
+        ? cliAdapter.resolveActiveSessionId({ cliPid: childPid, cliCwd: lastInitConfig.workingDir })
+        : findAntigravityConversationIdByPid(childPid) ?? undefined;
+      if (cid && !(lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid)) {
+        nativeSessionId = cid;
+      }
     } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
       // Likewise a re-attached Claude may be mid-turn and write nothing until
       // that turn ends. Without its conversation the contract cannot tell this
@@ -3744,8 +3779,14 @@ let traexAutoModelReasoningEfforts = new Map<string, readonly import('./services
 /** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
  *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
  *  fail-closed 等于历史行为。 */
+/** Reply delivery the CURRENT CLI process was launched with, when this worker
+ *  re-attached a surviving persistent pane instead of spawning one: its prompt
+ *  predates this worker's init (services/pane-reply-delivery.ts). Cleared by
+ *  every fresh spawn, whose prompt is built from lastInitConfig. */
+let reattachedPaneReplyDelivery: 'send' | 'transcript' | undefined;
+
 function replyDeliveryMode(): 'send' | 'transcript' {
-  return lastInitConfig?.replyDelivery === 'transcript' ? 'transcript' : 'send';
+  return (reattachedPaneReplyDelivery ?? lastInitConfig?.replyDelivery) === 'transcript' ? 'transcript' : 'send';
 }
 
 /** spawnCli resolved-mode 复核把 transcript 降级为 send 时，每个 bot+cli 组合只
@@ -4459,9 +4500,39 @@ function uncollectedStructuredTurnNotice(): string {
   if (blocked) {
     return t('worker.structured_turn_not_started_blocked', { cliName: cliName(), blocker: startupBlockerLabel(blocked) });
   }
+  const fdDenied = uncollectedTranscriptFdDenial();
+  if (fdDenied) {
+    const bwrap = setuidRootBwrap();
+    return t('worker.structured_turn_not_collected_fd_denied', {
+      cliName: cliName(),
+      pid: String(fdDenied.pid),
+      code: fdDenied.code,
+      hint: bwrap ? t('worker.fd_denied_setuid_bwrap_hint', { path: bwrap }) : '',
+    });
+  }
   const firstTurnOfFreshStart = promptReadyEdges === promptReadyEdgesAtFreshCliStart && !lastInitConfig?.adoptMode;
   return t('worker.structured_turn_not_collected', { cliName: cliName() })
     + (firstTurnOfFreshStart ? startupUpgradeHint() : '');
+}
+
+/** The observed CLI process whose fd table procfs refused, while no
+ *  transcript is bound. That is why the turn could not be collected, and the
+ *  notice says so ("permission denied") rather than implying the CLI never
+ *  wrote one. A bound transcript means the file was located after all (TRAE's
+ *  writer-lock fallback): whatever lost the turn then, it was not this. */
+function uncollectedTranscriptFdDenial(): { pid: number; code: string } | undefined {
+  if (codexBridgeRolloutPath) return undefined;
+  const pids = [
+    structuredBridgeIs('traex') ? currentTraexObservedPid() : undefined,
+    structuredBridgeIs('codex') ? currentCodexObservedPid() : undefined,
+    (backend as { cliPid?: number } | null)?.cliPid,
+    backend?.getChildPid?.(),
+  ];
+  for (const pid of pids) {
+    const denial = pid ? processOpenFilesDenial(pid) : undefined;
+    if (pid && denial) return { pid, code: denial.code };
+  }
+  return undefined;
 }
 
 /** Folders whose explicit "do not trust" this worker already reported. */
@@ -4895,8 +4966,11 @@ function notifyHookReviewInputHold(freshScreen?: string): void {
   const holdNotice = cliAdapter?.stuckPageFamily === 'kimi'
     ? `⚠️ ${cliName()} 正在显示「缓存过期」选择菜单。为避免消息被菜单吞掉或误选选项，`
       + 'BotMux 已暂存后续消息；请先在 Web 终端完成选择，恢复普通输入框后会自动投递。'
-    : `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
-      + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。';
+    : cliAdapter?.stuckPageFamily === 'antigravity'
+      ? `⚠️ ${cliName()} 正在终端显示选择菜单（提问或权限确认）。为避免消息被菜单当成按键、误选选项，`
+        + 'BotMux 已暂存后续消息；请先在 Web 终端完成选择，恢复普通输入框后会自动投递。'
+      : `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
+        + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。';
   send({
     type: 'user_notify',
     turnId: currentBotmuxTurnId,
@@ -4985,6 +5059,10 @@ function shareableStuckScreenTail(screen: string): string {
   // Kimi draws its menu under the live conversation: only the menu rows leave
   // the terminal, never the transcript above them.
   if (family === 'kimi') return kimiCacheExpiryMenuTail(screen);
+  // agy draws its pickers under the live conversation: same, picker rows only
+  // (a permission dialog's command already masked), then the same credential
+  // and home-path redaction as any other page.
+  if (family === 'antigravity') return stuckScreenTail(redactStuckPageTail(antigravityBlockingPageTail(screen)));
   // Redact the whole page before bounding it: the line / char cut can drop a
   // row's label and leave its value (or a wrapped continuation) unmasked.
   const unbounded = stuckScreenTail(screen, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
@@ -9437,6 +9515,7 @@ type UsageAwareScreen = {
   status: RuntimeScreenStatus | 'limited';
   usageLimit?: CliUsageLimitState;
   expiredAntigravityQuota?: CliUsageLimitState;
+  usageLimitRecovery?: 'antigravity-ready-composer';
 };
 
 function classifyScreenUsageLimit(
@@ -9455,16 +9534,25 @@ function classifyUsageLimitWithNativeEvidence(
 ): UsageAwareScreen {
   if (cliAdapter?.id === 'antigravity' && !backendScreenEvidenceIsAuthoritativeForMutation()) return { status };
   let evidence = content;
+  let nativeViewportCaptured = false;
   if (cliAdapter?.id === 'antigravity' && backend) {
     // Card snapshots intentionally remove input/composer rows. Native error
     // reconciliation requires the full current viewport, not that display text.
-    try { evidence = captureBackendScreen(backend) || content; } catch { /* no stronger evidence */ }
+    try {
+      const viewport = captureBackendScreen(backend);
+      if (viewport) { evidence = viewport; nativeViewportCaptured = true; }
+    } catch { /* no stronger evidence */ }
   }
   if (cliAdapter?.id === 'antigravity') {
     // tmux capture-pane -e preserves SGR inside phrases, countdowns and error
     // IDs. Strip controls without filtering away native composer rows.
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
+    // 正常输入框是当前恢复证据；保留上方历史报错，但不再用它判定本轮限额。
+    // 卡片内容会裁剪输入框，因此显式携带完整权威视口确认的恢复信号。
+    if (nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
+      return { status, usageLimitRecovery: 'antigravity-ready-composer' };
+    }
     let expiredAntigravityQuota: CliUsageLimitState | undefined;
     const result = usageLimitTracker.classify(evidence, status, state => {
       const observed = annotateAntigravityUsageLimit(evidence, state);
@@ -9580,6 +9668,9 @@ let bridgeStalePidStateSessionId: string | undefined;
 let bridgePathConfirmedAtMs = 0;
 /** Turns Claude ran that the bridge read nothing of (see claude-bridge-blind-turn). */
 const bridgeBlindTurnWatch = new BridgeBlindTurnWatch();
+/** The next look for an unread run's transcript, while the notice about it
+ *  waits on that look (recheckUnreadClaudeTurn). */
+let unreadClaudeTurnLook: { run: UnreadClaudeTurnRun; timer: ReturnType<typeof setTimeout> } | undefined;
 /** Old jsonl paths we keep polling AFTER a rotation switched
  *  bridgeJsonlPath away — needed when a started turn was stamped with the
  *  old path but its assistant text hasn't been written yet. We continue to
@@ -9918,13 +10009,6 @@ const emittedRateLimitUuids = new Set<string>();
 /** Claude Code's away summaries (「本轮回顾」), forwarded once each for the
  *  turn they recap. */
 const cliRecapObserver = new CliRecapObserver();
-/** What each turn did, for its「本轮回顾」: every activity entry counts here,
- *  unlike the capped CoT buffer below. Sent just before a completed terminal. */
-const turnRecapRecorder = new TurnRecapRecorder();
-/** How to run the optional model recap for the current CLI: its own binary
- *  and env, recorded at spawn. Undefined when the adapter has none or the CLI
- *  is not a plain local one (sandbox, read isolation, wrapper, adopt). */
-let recapModelLaunch: RecapModelLaunch | undefined;
 /** Codex collaboration sub-agents spawned during live ingest. Their quota
  *  failures land in their own rollouts and reach the parent only as tool
  *  results, so they are tailed separately and fed into the same structured
@@ -10205,7 +10289,6 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
     const withoutSentinel = cotEntryWithoutSentinel(entry);
     return withoutSentinel ? [withoutSentinel] : [];
   });
-  turnRecapRecorder.observe(turn, kept);
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
@@ -10469,6 +10552,8 @@ let grokBridgePidProbeLastMs = 0;
 const GROK_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
 let traexBridgePidProbeLastMs = 0;
 const TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
+/** `<pid>|<source>` of the TRAE fd-access outcome last written to the log. */
+let traexFileSourceLogKey: string | undefined;
 
 /** Adopt-only: 一次性发送的 "/adopt 前最后一轮" preamble 是否已经触发过。
  *  codexBridgeAttach 在 split-live 分支会查 history 取最后一对 user/assistant
@@ -11481,7 +11566,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // re-proves `seen` if the new file carries a marker.
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
-  if (live.length > 0) bridgeQueue.ingest(live, matched);
+  ingestClaudeSwitchLiveAndSettleUnreadTurn(live, matched);
   // The switch moved us onto another Claude session: rebind the fallback
   // tracker to it (seed always publishes, so the daemon drops whatever the
   // previous session left behind) before folding this file's own events in.
@@ -11766,7 +11851,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // not carry over; absorb re-proves `seen` from the new file.
   beginNewBridgeTranscriptGeneration();
   bridgeQueue.absorb(history);
-  if (live.length > 0) bridgeQueue.ingest(live, newPath);
+  ingestClaudeSwitchLiveAndSettleUnreadTurn(live, newPath);
   // Same as the fingerprint switch: rebind the fallback tracker to the Claude
   // session we just rotated onto, then fold this file's own events in.
   seedModelFallbackFromTranscript();
@@ -11995,7 +12080,9 @@ function handleClaudeCompactionSignal(startedAtMs: number): void {
 /** Prompt-ready edge: did the bridge read the turn Claude just ran? For an
  *  unread one, first locate the transcript Claude really writes and replay the
  *  unread run from it; failing that, tell the group once rather than let the
- *  replies vanish without a trace. */
+ *  replies vanish without a trace — unless Claude's record of where it writes
+ *  was caught mid-rewrite, which a later look can still read
+ *  (recheckUnreadClaudeTurn). */
 function judgeClaudeBridgeTurn(): void {
   if (!bridgeJsonlPath) return;
   // Judge what is on disk now, not what the last poll happened to drain.
@@ -12011,42 +12098,213 @@ function judgeClaudeBridgeTurn(): void {
     // the queue nor the web counters, so a turn may have run inside this span.
     // Recover it if Claude demonstrably writes another transcript; never report.
     log(`Bridge read nothing during a ${Math.round((Date.now() - verdict.turnStartedAtMs) / 1000)}s ${cliName()} compaction span; not reporting it as an unread turn`);
-    if (relocateUnreadClaudeTranscript(verdict.turnStartedAtMs)) {
+    if (relocateUnreadClaudeTranscript(verdict.turnStartedAtMs) === 'moved') {
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit after transcript recovery failed: ${err.message}`); }
     }
     return;
   }
   if (verdict.kind !== 'blind') return;
   log(`Bridge read nothing from ${bridgeJsonlPath} during a ${Math.round((Date.now() - verdict.turnStartedAtMs) / 1000)}s ${cliName()} turn; locating the transcript it writes`);
-  if (relocateUnreadClaudeTranscript(verdict.blindSinceMs)) {
+  const located = relocateUnreadClaudeTranscript(verdict.blindSinceMs);
+  if (located === 'moved') {
     try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit after transcript recovery failed: ${err.message}`); }
     return;
   }
-  if (verdict.reported) return;
+  // Already told, or still looking for this run's transcript.
+  if (verdict.reported || unreadClaudeTurnLook) return;
   const unreadLarkTurn = bridgeQueue.peek().find(turn => !turn.started && !turn.isLocal);
   const adoptMode = lastInitConfig?.adoptMode === true;
+  const sendsDuringTurn = adoptMode ? [] : readSendMarkers()
+    .filter(marker => marker.sentAtMs >= verdict.turnStartedAtMs && marker.terminalIndependent !== true);
+  const finalDeliveryTarget = {
+    sessionId: lastInitConfig?.sessionId,
+    chatId: lastInitConfig?.chatId,
+    rootMessageId: lastInitConfig?.rootMessageId,
+  };
   const needsNotice = blindTurnNeedsNotice({
     transcriptCarriesEveryReply: adoptMode || zeroPromptTerminalSync(),
     unreadLarkTurn: !!unreadLarkTurn,
-    sentDuringTurn: !adoptMode && readSendMarkers()
-      .some(marker => marker.sentAtMs >= verdict.turnStartedAtMs && marker.terminalIndependent !== true),
+    sentDuringTurn: sendsDuringTurn.length > 0,
+    ...(replyDeliveryMode() === 'transcript'
+      ? { transcriptReplies: { sentFinalDuringTurn: sendsDuringTurn.some(marker =>
+        finalBridgeSendMarkerCoversOwnThread(finalDeliveryTarget, marker)) } }
+      : {}),
   });
   if (!needsNotice) return;
+  const run: UnreadClaudeTurnRun = {
+    path: bridgeJsonlPath,
+    blindSinceMs: verdict.blindSinceMs,
+    ...(unreadLarkTurn ? { turnId: unreadLarkTurn.turnId } : {}),
+    judgedAtMs: Date.now(),
+    promptReadyEdge: promptReadyEdges,
+    writtenInput: lastWrittenCliInput,
+    webSubmitGeneration: webTerminalSubmitGeneration,
+  };
+  if (located !== 'mid-rewrite') {
+    notifyUnreadClaudeTurn(run);
+    return;
+  }
+  // Claude rewrites the record in place on this very busy→idle edge, and a
+  // loaded host can stall that rewrite past the re-reads: look again before
+  // telling anyone (see UNREAD_TURN_RELOCATE_RETRY_MS). A worker killed while
+  // looking takes the notice with it; that window is these few seconds.
+  log(`Bridge caught ${cliName()}'s session record mid-rewrite; looking again before telling the group`);
+  scheduleUnreadClaudeTurnLook(run, 1);
+}
+
+/** An unread run whose transcript the bridge is still looking for: the
+ *  transcript it was blind on, when the run began and was judged, the Lark turn
+ *  a notice about it answers, and where Claude stood when it was judged. */
+interface UnreadClaudeTurnRun {
+  path: string;
+  blindSinceMs: number;
+  judgedAtMs: number;
+  turnId?: string;
+  promptReadyEdge: number;
+  writtenInput: typeof lastWrittenCliInput;
+  webSubmitGeneration: number;
+}
+
+function scheduleUnreadClaudeTurnLook(run: UnreadClaudeTurnRun, attempt: number): void {
+  const timer = setTimeout(() => recheckUnreadClaudeTurn(run, attempt), UNREAD_TURN_RELOCATE_RETRY_MS);
+  timer.unref?.();
+  unreadClaudeTurnLook = { run, timer };
+}
+
+/** Nothing has moved Claude since the unread run was judged: it sits at that
+ *  same prompt — no turn started, no input written from Lark, a passthrough or
+ *  the Web terminal. Only then is the transcript it writes now the one holding
+ *  the run, with nothing after it, so that a replay found now delivers the run
+ *  whole. Otherwise the group is told, as it would have been at the prompt. */
+function unreadClaudeTurnUndisturbed(run: UnreadClaudeTurnRun): boolean {
+  return isPromptReady
+    && promptReadyEdges === run.promptReadyEdge
+    && !bridgeBlindTurnWatch.turnInProgress()
+    && lastWrittenCliInput === run.writtenInput
+    && webTerminalSubmitGeneration === run.webSubmitGeneration;
+}
+
+/** A reply the switch's ingest actually attributed to a turn. Raw transcript
+ *  presence is not delivery evidence: an already-seen reply from the previous
+ *  turn can fall inside the replay skew window, but the queue consumes it
+ *  nowhere and the current run stays stranded. */
+interface UnreadTurnReplyAttribution {
+  record: { type?: unknown; subtype?: unknown; timestamp?: unknown };
+  turnId: string;
+  isLocal: boolean;
+}
+
+/** Ingest a switch's live records before deciding whether they settle a
+ *  deferred unread-turn notice. Keeping settlement after ingest also means an
+ *  ingest failure leaves the look alive, so its ordinary fail-closed path can
+ *  still report the run. */
+function ingestClaudeSwitchLiveAndSettleUnreadTurn(live: TranscriptEvent[], path: string): void {
+  const attributed: UnreadTurnReplyAttribution[] = [];
+  if (live.length > 0) {
+    bridgeQueue.ingest(live, path, (record, turn) => {
+      if (record.type === 'assistant') attributed.push({ record, turnId: turn.turnId, isLocal: turn.isLocal === true });
+    }, (record, turn) => {
+      attributed.push({ record, turnId: turn.turnId, isLocal: turn.isLocal === true });
+    });
+  }
+  settleUnreadClaudeTurnLookOnSwitch(attributed);
+}
+
+/** A transcript switch — a bridge follower's, or a look's own — while the
+ *  bridge looks for an unread run's transcript. It consumed the run if Claude
+ *  is still where the run left it and ingest attributed a reply written during
+ *  the run to that run's own Lark turn. Adopt / zero-injection local turns have
+ *  no Lark id to match; for those, actual attribution to a local turn is the
+ *  equivalent evidence. Anything less — including an old reply merely present
+ *  in the live time window — leaves the look to tell the group. */
+function settleUnreadClaudeTurnLookOnSwitch(attributed: readonly UnreadTurnReplyAttribution[]): void {
+  const look = unreadClaudeTurnLook;
+  if (!look || !unreadClaudeTurnUndisturbed(look.run)) return;
+  // The same skew the relocation replays from: a turn's records can precede
+  // the busy evidence its run starts from. Attribution, not the timestamp
+  // alone, distinguishes such a reply from the previous turn's replay.
+  const consumed = attributed.some(({ record, turnId, isLocal }) =>
+    (look.run.turnId ? turnId === look.run.turnId : isLocal)
+    && replyRecordsStampedWithin([record], look.run.blindSinceMs - PENDING_MARK_SKEW_MS, look.run.judgedAtMs));
+  if (!consumed) return;
+  clearTimeout(look.timer);
+  unreadClaudeTurnLook = undefined;
+  log(`Bridge transcript switch attributed the unread ${cliName()} run's reply; no notice needed`);
+}
+
+/** Look for an unread run's transcript once more. Its notice is dropped only on
+ *  evidence the run was delivered (settleUnreadClaudeTurnLookOnSwitch);
+ *  anything less tells the group. */
+function recheckUnreadClaudeTurn(run: UnreadClaudeTurnRun, attempt: number): void {
+  const look = unreadClaudeTurnLook;
+  // Over already: a later turn was read, or the bridge was torn down.
+  if (!bridgeBlindTurnWatch.isUnreportedRun(run.blindSinceMs)) {
+    unreadClaudeTurnLook = undefined;
+    return;
+  }
+  // Moved since it was judged, or switched by a follower without replaying
+  // the run: whether the run reaches the group is no longer known.
+  if (!unreadClaudeTurnUndisturbed(run) || bridgeJsonlPath !== run.path) {
+    unreadClaudeTurnLook = undefined;
+    notifyUnreadClaudeTurn(run);
+    return;
+  }
+  let located: ReturnType<typeof relocateUnreadClaudeTranscript>;
+  try {
+    located = relocateUnreadClaudeTranscript(run.blindSinceMs);
+  } catch (err: any) {
+    // This look's timer has already fired. If its own switch fails mid-ingest,
+    // leaving the look merely alive would strand it with no timer left.
+    unreadClaudeTurnLook = undefined;
+    log(`Bridge transcript recovery during the unread-turn recheck failed: ${err.message}`);
+    notifyUnreadClaudeTurn(run);
+    return;
+  }
+  if (look && unreadClaudeTurnLook !== look) {
+    // The switch replayed the run, at the prompt it was judged on: drain as
+    // that edge would have.
+    try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit after transcript recovery failed: ${err.message}`); }
+    return;
+  }
+  if (located === 'mid-rewrite' && attempt < UNREAD_TURN_RELOCATE_RETRIES) {
+    scheduleUnreadClaudeTurnLook(run, attempt + 1);
+    return;
+  }
+  // Still unreadable, nothing else to read, or moved onto a transcript that
+  // does not hold the run.
+  unreadClaudeTurnLook = undefined;
+  notifyUnreadClaudeTurn(run);
+}
+
+/** The bridge is being torn down (CLI exit or restart) while still looking for
+ *  an unread run's transcript: tell the group now rather than lose the notice
+ *  with the bridge. */
+function settleUnreadClaudeTurnLookOnTeardown(): void {
+  if (!unreadClaudeTurnLook) return;
+  const { run, timer } = unreadClaudeTurnLook;
+  clearTimeout(timer);
+  unreadClaudeTurnLook = undefined;
+  if (bridgeBlindTurnWatch.isUnreportedRun(run.blindSinceMs)) notifyUnreadClaudeTurn(run);
+}
+
+function notifyUnreadClaudeTurn(run: UnreadClaudeTurnRun): void {
   bridgeBlindTurnWatch.noteReported();
   log(`Bridge could not locate the transcript ${cliName()} writes; telling the group its replies are not being read`);
   send({
     type: 'user_notify',
     message: t('worker.claude_bridge_turn_unread', { cliName: cliName() }),
-    ...(unreadLarkTurn ? { turnId: unreadLarkTurn.turnId } : {}),
+    ...(run.turnId ? { turnId: run.turnId } : {}),
   });
 }
 
 /** Find the transcript Claude writes from Claude's own state — never from
  *  directory recency, which a sibling pane in the same project dir would win —
  *  and move the bridge onto it, replaying what it holds since `blindSinceMs`.
- *  Returns true when the bridge moved. */
-function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
-  if (!bridgeCliCwd || !lastInitConfig) return false;
+ *  'moved' when the bridge moved; 'mid-rewrite' when it did not because
+ *  Claude's pid-state record was caught mid-rewrite, so a later look may still
+ *  read it; 'none' otherwise. */
+function relocateUnreadClaudeTranscript(blindSinceMs: number): 'moved' | 'mid-rewrite' | 'none' {
+  if (!bridgeCliCwd || !lastInitConfig) return 'none';
   // A bound pid that is not Claude means the launch-layer resolution stopped
   // short on a layer it does not know. The shallowest Claude process under our
   // own pane is the CLI, whatever sits in between — recognised by comm or, for
@@ -12068,14 +12326,15 @@ function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
       bridgeCliPid = cliPid;
     }
   }
-  if (bridgeCliPid === undefined) return false;
+  if (bridgeCliPid === undefined) return 'none';
   const confirmedAtMs = Math.min(bridgePathConfirmedAtMs, blindSinceMs - PENDING_MARK_SKEW_MS);
-  const resolved = resolveJsonlFromPid(bridgeCliPid, bridgeCliCwd, bridgeDataDir);
-  if (resolved && resolved.path !== bridgeJsonlPath && resolved.cliSessionId !== bridgeStalePidStateSessionId) {
+  const resolved = resolveJsonlFromPidState(bridgeCliPid, bridgeCliCwd, bridgeDataDir);
+  if (resolved && resolved !== 'mid-rewrite'
+    && resolved.path !== bridgeJsonlPath && resolved.cliSessionId !== bridgeStalePidStateSessionId) {
     bridgeObservedCliSessionId = resolved.cliSessionId;
     bridgeRememberSessionIdForPath(resolved.path, 'cli');
     switchBridgeToPidStatePath(resolved.path, 'unread turn → pid state', confirmedAtMs);
-    return true;
+    return 'moved';
   }
   // A pid-state record that keeps the spawn-time id (older Claude) cannot see
   // an in-pane /clear; the session files Claude holds open can — accepted only
@@ -12085,11 +12344,11 @@ function relocateUnreadClaudeTranscript(blindSinceMs: number): boolean {
     .map(sid => claudeJsonlPathForSession(sid, cwd, bridgeDataDir))
     .filter(path => path !== bridgeJsonlPath && (statSafe(path)?.mtimeMs ?? 0) >= confirmedAtMs);
   const newest = newestPath(written);
-  if (!newest) return false;
+  if (!newest) return resolved === 'mid-rewrite' ? 'mid-rewrite' : 'none';
   bridgeRememberSessionIdForPath(newest, 'cli');
   switchBridgeToPidStatePath(newest, 'unread turn → open session files', confirmedAtMs);
   bridgeMarkStalePidStateForAcceptedSid(sessionIdFromJsonlPath(newest));
-  return true;
+  return 'moved';
 }
 
 /** True while the head Lark/API turn is still being written to the Claude
@@ -12442,13 +12701,6 @@ function bridgeIngest(): void {
   emitReadyTurns({ explicitTerminalOnly: true });
 }
 
-/** One optional「本轮回顾」model recap for the daemon. */
-async function answerRecapRequest(requestId: string, prompt: string): Promise<void> {
-  const launch = recapModelLaunch;
-  const outcome = launch ? await runRecapModel(launch, prompt) : { error: 'unavailable for this CLI' };
-  send({ type: 'recap_result', requestId, ...outcome });
-}
-
 /** Scan newly-drained Claude transcript events for a structured rate-limit
  *  record and, on the first unseen one, emit a `limited` screen_update so the
  *  session surfaces in Dashboard「需要你」with a retry countdown — identical
@@ -12699,6 +12951,7 @@ function stopBridgeWatcher(): void {
   bridgeSecondaryPaths.clear();
   orcaClaudeWebHistorySignature = undefined;
   bridgeFingerprintScanLastMs.clear();
+  settleUnreadClaudeTurnLookOnTeardown();
   bridgeBlindTurnWatch.reset();
   claudeCompactionInputSnapshot = undefined;
   // Attribution belongs to the CLI generation whose transcript we watched.
@@ -14043,7 +14296,12 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
           const { history, live, restored } = restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff);
           codexBridgeQueue.absorb(history);
           codexBridgeQueue.ingest(live);
-          if (restored > 0 && structuredBridgeIs('antigravity') && lastInitConfig?.adoptMode) {
+          // agy's last reply is held as a provisional final in driver state
+          // until a quiet tick confirms it. A turn that finished while no worker
+          // was attached (a daemon restart) ends in exactly that state, and the
+          // offset already moved past it: dropping the state dropped the reply,
+          // for a re-attached botmux-launched agy as for an adopted pane.
+          if (restored > 0 && structuredBridgeIs('antigravity')) {
             structuredBridgeDriverState = result.state;
           }
           if (restored > 0) log(`Structured bridge baseline-existing restored ${restored} pending turn(s) without re-submitting input`);
@@ -14690,8 +14948,37 @@ function traexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
   const owned = traexHistorySidIsOwned(cliSessionId, ownedRollouts);
   if (!owned) {
     log(`TRAE session id ${cliSessionId} not owned by pid ${pid ?? '?'} (open rollouts: ${ownedRollouts ? [...ownedRollouts].join(',') || 'none' : 'unknown'})`);
+    if (pid) noteTraexProcessFileSource(pid);
   }
   return owned;
+}
+
+/** Say once (per pid and outcome) that procfs refused a TRAE process's fd
+ *  table, and what located its thread instead. Without this line a sandbox
+ *  whose namespace this uid cannot read looked exactly like a TRAE that never
+ *  wrote a transcript: the fd reads were skipped one by one, silently. */
+function noteTraexProcessFileSource(pid: number): void {
+  const source = traexProcessFileSource(pid);
+  if (!source || source.via === 'fd') return;
+  const key = `${pid}|${source.via === 'writer-lock'
+    ? `lock:${source.sessionIds.join(',')}:${source.sessionIds.length === 0 && source.exclusiveHolds > 0}`
+    : 'none'}`;
+  if (traexFileSourceLogKey === key) return;
+  traexFileSourceLogKey = key;
+  const bwrap = setuidRootBwrap();
+  let located: string;
+  if (source.via === 'none') {
+    located = '; the kernel lock table (/proc/locks) is unreadable too, so this TRAE process\'s transcript cannot be located';
+  } else if (source.sessionIds.length > 0) {
+    located = `; located its TRAE thread through the kernel lock table (/proc/locks) instead: ${source.sessionIds.join(', ')}`;
+  } else if (source.exclusiveHolds > 0) {
+    located = `; it holds ${source.exclusiveHolds} exclusive lock(s) in /proc/locks, but none is a TRAE thread writer lock under TRAE_HOME=${process.env.TRAE_HOME || '~/.trae'}, so its transcript cannot be located`;
+  } else {
+    located = '; it holds no TRAE thread writer lock yet (/proc/locks), so there is no transcript to locate so far';
+  }
+  log(`TRAE pid ${pid}: permission denied reading /proc/${pid}/fd (${source.denial.stage} ${source.denial.code})`
+    + (bwrap ? `; ${bwrap} is setuid root, so the sandbox's user namespace belongs to root and this uid cannot read its processes' open files` : '')
+    + located);
 }
 
 /** Called from flushPending after writeInput first returns a cliSessionId.
@@ -15031,6 +15318,7 @@ function maybeFollowTraexSessionRotationViaPid(): void {
   if (!pid) return;
   const currentSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
   const observed = findTraexRolloutByPid(pid, currentSid);
+  noteTraexProcessFileSource(pid);
   if (!observed) return;
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
   persistCliSessionId(observed.cliSessionId);
@@ -16256,6 +16544,7 @@ function stopCodexBridge(): void {
   lastResolvedSandboxMode = undefined;
   grokBridgePidProbeLastMs = 0;
   traexBridgePidProbeLastMs = 0;
+  traexFileSourceLogKey = undefined;
 }
 
 /** When a rotation moves bridgeJsonlPath away from `oldPath`, queue turns
@@ -16641,10 +16930,12 @@ function applyTraexStartupLaunchMode(
   cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'adoptMode'>,
   launch: { resume: boolean; nativeSessionId?: string; persistentReattach: boolean },
 ): void {
+  // A cold resume is fenced like a fresh launch: its first frame is the same
+  // provisional composer (see shouldFenceTraexStartupInput). A reattached
+  // live pane is already past it.
   traexNativeStartupInputPending = shouldFenceTraexStartupInput({
     cliId: cfg.cliId,
     programStatusEnabled: programStatusStream !== null,
-    resume: launch.resume,
     adoptMode: cfg.adoptMode,
     remoteViewer: !!remoteWsUrl,
     persistentReattach: launch.persistentReattach,
@@ -16696,7 +16987,9 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
         traexStartupWebRecheck = setTimeout(() => {
           traexStartupWebRecheck = undefined;
           if (backend !== target || cliSpawnGeneration !== generation
-            || Date.now() >= recheckDeadline
+            // Re-read the confirmation at fire time: an owned receipt may have
+            // landed after this callback captured the finite 90s deadline.
+            || Date.now() >= (traexFirstSubmitConfirmed ? Number.POSITIVE_INFINITY : traexFirstPromptDeadlineAt)
             || (cliRestartInProgress && !replacementSpawnInProgress)) return;
           markPromptReady();
           void flushPending();
@@ -16707,20 +17000,25 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
     }
     if (traexStartupRendererWebInputGeneration !== webTerminalInputGeneration
       || traexStartupRendererScreenRevision !== backendScreenRevision) {
-      if (!traexStartupRendererDrain && renderer && Date.now() < recheckDeadline) {
+      // Only this fence's own retry timers are bounded by the 90s window. A
+      // drain driven by an idle edge, a new message or markPromptReady must
+      // still run after it: a footer can resolve later than 90s (cold resume
+      // on a slow network), and Web input after the timeout notice would
+      // otherwise wedge every later message until /restart.
+      if (!traexStartupRendererDrain && renderer) {
         const token = {};
         const target = backend;
         const observedRenderer = renderer;
         const generation = cliSpawnGeneration;
         const revision = backendScreenRevision;
         const inputGeneration = webTerminalInputGeneration;
-        const retryDeadline = recheckDeadline;
+        const retryDeadline = () => traexFirstSubmitConfirmed ? Number.POSITIVE_INFINITY : traexFirstPromptDeadlineAt;
         let accepted = false;
         traexStartupRendererDrain = token;
         void observedRenderer.writeAndFlush('').then(() => {
           if (traexStartupRendererDrain !== token || backend !== target || renderer !== observedRenderer
             || cliSpawnGeneration !== generation || backendScreenRevision !== revision
-            || webTerminalInputGeneration !== inputGeneration || Date.now() >= retryDeadline
+            || webTerminalInputGeneration !== inputGeneration
             || (cliRestartInProgress && !replacementSpawnInProgress)) return;
           traexStartupRendererWebInputGeneration = inputGeneration;
           traexStartupRendererScreenRevision = revision;
@@ -16736,15 +17034,15 @@ function traexNativeStartupInputIsPending(screenOverride?: string): boolean {
           if (accepted || (!traexNativeStartupInputPending && !traexFirstInputAdmissionPending)
             || backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
             || (cliRestartInProgress && !replacementSpawnInProgress)
-            || Date.now() >= retryDeadline || traexStartupWebRecheck) return;
+            || Date.now() >= retryDeadline() || traexStartupWebRecheck) return;
           traexStartupWebRecheck = setTimeout(() => {
             traexStartupWebRecheck = undefined;
             if (backend !== target || renderer !== observedRenderer || cliSpawnGeneration !== generation
               || (cliRestartInProgress && !replacementSpawnInProgress)
-              || Date.now() >= retryDeadline) return;
+              || Date.now() >= retryDeadline()) return;
             markPromptReady();
             void flushPending();
-          }, Math.min(1_000, Math.max(0, retryDeadline - Date.now())));
+          }, Math.min(1_000, Math.max(0, retryDeadline() - Date.now())));
           traexStartupWebRecheck.unref?.();
         });
       }
@@ -17891,8 +18189,8 @@ async function captureAndUpload(): Promise<void> {
     || capturedAttempt !== currentBotmuxDispatchAttempt;
   // Dedup is bound to the full identity: the same pixels under a new capture
   // identity or display cycle are a NEW first frame, never a duplicate.
-  const dedupKey = (pixelHash: string): string =>
-    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}`;
+  const dedupKey = (pixelHash: string, recovery?: UsageAwareScreen['usageLimitRecovery']): string =>
+    `${capturedRevision}:${capturedDisplayGeneration}:${pixelHash}${recovery ? `:recovery=${recovery}` : ''}`;
   let recaptureAfterStaleFrame = false;
   let ownedKey: string | null = null;
   let previousShotHash = lastShotHash;
@@ -17910,6 +18208,8 @@ async function captureAndUpload(): Promise<void> {
   try {
     let png: Buffer;
     let usageLimitContent = '';
+    let pixelHash = '';
+    let usageAware: UsageAwareScreen;
     try {
       // Preferred path: pipe-pane backends ask tmux for a fresh viewport
       // snapshot and render it through a transient xterm-headless. This
@@ -17919,13 +18219,18 @@ async function captureAndUpload(): Promise<void> {
       if (frameIsStale()) { cancelStale('snapshot'); return; }
       if (pipeResult) {
         // Same ANSI on a resized canvas is a different picture.
-        const key = dedupKey(`${pipeResult.cols}x${pipeResult.rows}:${pipeResult.ansi}`);
+        usageLimitContent = pipeResult.content;
+        pixelHash = `${pipeResult.cols}x${pipeResult.rows}:${pipeResult.ansi}`;
+        // Other CLIs never emit this recovery signal: preserve their original
+        // zero-classification fast path for unchanged pixels.
+        if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
+        usageAware = classifyScreenUsageLimit(pipeResult.content, projectedRuntimeScreenStatus());
+        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
         lastShotHash = key;
         png = pipeResult.png;
-        usageLimitContent = pipeResult.content;
       } else {
         // Fallback path: non-pipe backends (PtyBackend, legacy TmuxBackend)
         // still drive the long-lived renderer.
@@ -17933,12 +18238,15 @@ async function captureAndUpload(): Promise<void> {
         const term = renderer.xterm;
         const startY = term.buffer.active.baseY;
         const snap = renderer.rawSnapshot();
-        const key = dedupKey(createHash('md5').update(snap).digest('hex'));
+        usageLimitContent = snap;
+        pixelHash = createHash('md5').update(snap).digest('hex');
+        if (cliAdapter?.id !== 'antigravity' && dedupKey(pixelHash) === lastShotHash) return;
+        usageAware = classifyScreenUsageLimit(snap, projectedRuntimeScreenStatus());
+        const key = dedupKey(pixelHash, usageAware.usageLimitRecovery);
         if (key === lastShotHash) return;
         previousShotHash = lastShotHash;
         ownedKey = key;
         lastShotHash = key;
-        usageLimitContent = snap;
         const shotCols = clamp(term.cols, MIN_RENDER_COLS, MAX_RENDER_COLS);
         const shotRows = clamp(term.rows, MIN_RENDER_ROWS, MAX_RENDER_ROWS);
         // `captureToPng` is the module-scope lazy wrapper above: the canvas native
@@ -17966,7 +18274,15 @@ async function captureAndUpload(): Promise<void> {
 
     if (frameIsStale()) { cancelStale('upload'); return; }
 
-    const status = projectedRuntimeScreenStatus();
+    // Recheck after the async upload: a newer native refusal must win over
+    // the pre-upload recovery evidence used by pixel dedup.
+    const currentUsageAware = classifyScreenUsageLimit(usageLimitContent, projectedRuntimeScreenStatus());
+    // Commit the evidence actually sent, not the pre-upload classification.
+    // A capture failure during upload must leave a later ready edge deliverable.
+    if (lastShotHash === ownedKey) {
+      ownedKey = dedupKey(pixelHash, currentUsageAware.usageLimitRecovery);
+      lastShotHash = ownedKey;
+    }
     // Success is otherwise completely silent (skips and failures log above), which
     // made "loop alive and uploading" indistinguishable from "loop never started"
     // in the daemon log. One throttled line keeps the happy path observable.
@@ -17978,7 +18294,7 @@ async function captureAndUpload(): Promise<void> {
     send({
       type: 'screenshot_uploaded',
       imageKey,
-      ...classifyScreenUsageLimit(usageLimitContent, status),
+      ...currentUsageAware,
       turnId: capturedTurnId,
       dispatchAttempt: capturedAttempt,
       captureRevision: capturedRevision,
@@ -21117,6 +21433,10 @@ function releaseInputDeliveryQuarantine(
   if (!quarantine || inputDeliveryQuarantine !== quarantine) return false;
   quarantine.cancelReceipt?.();
   inputDeliveryQuarantine = null;
+  // Every release is receipt- or terminal-proven: the quarantined write was
+  // submitted, so a pending TraeX first-input lease may retire at its next
+  // passing admission instead of outliving its 90s recheck window.
+  traexFirstSubmitConfirmed = true;
   if (quarantine.turnId) {
     codexBridgeQueue.setInputDeliveryQuarantined(quarantine.turnId, false, quarantine.dispatchAttempt);
   }
@@ -22888,6 +23208,28 @@ function scheduleSubmitFailureNotify(
     && !!quarantineAtSchedule && turnIdentity?.dispatchAttempt === undefined
     && quarantineAtSchedule?.turnId === turnIdentity?.turnId;
   const draftContent = quarantineAtSchedule?.draftContent ?? msg;
+  if (lastInitConfig?.cliId === 'traex' && !retainTraexReceipt) {
+    // Explain why this submit has no parked-draft rescue: the chain below then
+    // warns once and stops, and only the original receipt can release it.
+    const why = !structuredTarget ? 'structured bridge inactive'
+      : !recheck ? 'adapter supplied no receipt recheck'
+        : !bridgeTurnId ? 'no bridge mark'
+          : turnIdentity?.dispatchAttempt !== undefined ? `durable dispatch attempt ${turnIdentity.dispatchAttempt}`
+            : !quarantineAtSchedule ? 'no input-delivery quarantine'
+              : 'quarantine belongs to another turn';
+    log(`TRAE draft rescue not armed for turn=${turnIdentity?.turnId ?? '-'}: ${why}`);
+  }
+  // One line per distinct reason: after the warning this chain keeps polling
+  // every 20s, and the same skip must not flood the worker log.
+  let traexRescueLastNote: string | undefined;
+  const noteTraexRescue = (note: string): void => {
+    if (note === traexRescueLastNote) return;
+    traexRescueLastNote = note;
+    log(`TRAE draft rescue ${note} turn=${turnIdentity?.turnId ?? '-'}`);
+  };
+  // Set when the one-shot submit key was handed to the backend; the next
+  // recheck reports what the receipt and the composer show after it.
+  let traexRescueReadBackPending = false;
   const deferredAttemptIsCurrent = (): boolean => (
     cliSpawnGeneration === cliGenerationAtSchedule
     && backendAtSchedule !== null
@@ -22949,6 +23291,10 @@ function scheduleSubmitFailureNotify(
           log(`Deferred recheck saw an unattributed same-text receipt — keeping TRAE draft quarantine. preview="${preview}"`);
           armDeferredRecheck();
           return;
+        }
+        if (traexRescueReadBackPending) {
+          traexRescueReadBackPending = false;
+          noteTraexRescue('read-back: owned receipt found after the submit key');
         }
         traexFirstSubmitConfirmed = true;
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
@@ -23046,6 +23392,32 @@ function scheduleSubmitFailureNotify(
       && traexComposerHoldsInput(submitDiagnosisScreen, draftContent, { requireThreadReady: false });
     const traexDraftReady = traexDraftVisible
       && traexComposerHoldsInput(submitDiagnosisScreen, draftContent);
+    if (traexRescueReadBackPending) {
+      traexRescueReadBackPending = false;
+      const stillParked = traexComposerHoldsInput(submitDiagnosisScreen, draftContent, { requireThreadReady: false });
+      noteTraexRescue(`read-back: no receipt after the submit key; composer ${stillParked ? 'still holds' : 'no longer shows'} the original draft`);
+    }
+    if (retainTraexReceipt && !traexDraftVisible) {
+      // Login / API-key screens can carry a device code or a signed URL in the
+      // last row. Keep the diagnostic reason, but apply the same outbound
+      // credential boundary as submitUnconfirmedNotice to this persistent log.
+      const credentialPage = screenShowsCredentialPage(submitDiagnosisScreen);
+      const footerRow = credentialPage ? ''
+        : submitDiagnosisScreen.trimEnd().split(/\r?\n/).at(-1)?.trim().slice(0, 120) ?? '';
+      noteTraexRescue(`skipped: ${
+        quarantineAtSchedule!.draftRescueAttempted ? 'the one-shot submit was already used'
+          : quarantineAtSchedule!.submitWarningSent ? 'the one-shot warning was already sent'
+            : lastInitConfig?.adoptMode ? 'adopted pane'
+              : externalInputGenerationAtWrite === undefined || externalInputGenerationAtWrite !== webTerminalInputGeneration
+                ? 'Web terminal input since the write'
+                : interruptGenerationAtWrite === undefined || interruptGenerationAtWrite !== cliInterruptGeneration
+                  ? 'interrupt since the write'
+                  : !backendScreenEvidenceIsAuthoritativeForMutation() ? 'screen is not authoritative'
+                    : credentialPage
+                      ? 'the live composer does not show the original draft (last row withheld: credential page)'
+                      : `the live composer does not show the original draft (last row: ${JSON.stringify(footerRow)})`
+      }`);
+    }
     if (traexDraftVisible && !traexDraftReady
       && Date.now() - activityBaselineMs < FIRST_PROMPT_HARD_TIMEOUT_MS) {
       // The provisional startup composer can display the pasted draft while its
@@ -23054,6 +23426,9 @@ function scheduleSubmitFailureNotify(
       log('Deferred recheck: TRAE draft is visible but the native thread is not ready — waiting before rescue');
       armDeferredRecheck();
       return;
+    }
+    if (traexDraftVisible && !traexDraftReady) {
+      noteTraexRescue(`skipped: native thread still not ready ${Math.round((Date.now() - activityBaselineMs) / 1000)}s after the write`);
     }
     if (traexDraftReady) {
       const freshScreen = await traexQuestionCapture();
@@ -23073,6 +23448,7 @@ function scheduleSubmitFailureNotify(
         if (receipt.stale) return;
         if (receipt.action.kind === 'suppress-confirmed'
           || (receipt.action.kind === 'suppress-active' && receipt.action.evidence !== 'pty-output')) {
+          noteTraexRescue(`deferred: ${receipt.action.kind === 'suppress-confirmed' ? 'a receipt' : receipt.action.evidence} appeared before the submit key`);
           armDeferredRecheck();
           return;
         }
@@ -23083,10 +23459,19 @@ function scheduleSubmitFailureNotify(
           quarantineAtSchedule!.draftRescueAttempted = true;
           if (cliAdapter?.pressComposerSubmit?.(adapterInputHandle(backendAtSchedule!))) {
             log('Deferred recheck: unchanged TRAE composer holds the original draft — pressing submit once');
+            noteTraexRescue('submit key accepted by the backend');
+            traexRescueReadBackPending = true;
             armDeferredRecheck();
             return;
           }
+          noteTraexRescue('failed: the backend did not accept the submit key');
+        } else {
+          noteTraexRescue(`skipped: ${receipt.recheckError !== undefined ? 'the receipt recheck threw'
+            : receipt.action.kind === 'suppress-usage-limit' ? 'usage limit reported for this turn'
+              : 'manual input or interrupt during the receipt check'}`);
         }
+      } else {
+        noteTraexRescue('skipped: the fresh capture no longer shows the original draft or input changed');
       }
     }
     // The one-shot notice does not prove the message can never be submitted.
@@ -25329,6 +25714,41 @@ function sendToPty(
 
 // ─── Screen Update Timer ─────────────────────────────────────────────────────
 
+async function captureClaudePermissionNoticeScreen(): Promise<{ screen: string; runtimeKey: string; observationKey: string; turnKey: string; episodeKey?: string } | undefined> {
+  const target = backend;
+  const targetRenderer = renderer;
+  const generation = cliSpawnGeneration;
+  const lifetime = cliLifetimeNonce;
+  const turn = currentBotmuxTurnId;
+  const attempt = currentBotmuxDispatchAttempt;
+  const input = webTerminalInputGeneration;
+  const revision = backendScreenRevision;
+  const physicalId = workerSessionEventScope?.currentBinding()?.physicalId;
+  if (!target || lastInitConfig?.cliId !== 'claude-code' || cliRestartInProgress) return;
+  let screen: string | null | undefined;
+  // PTY revisions count every output chunk. Snapshot-only backends have no
+  // equivalent episode evidence, so they leave this undefined and fail open.
+  let episodeKey: string | undefined;
+  try {
+    if (target.captureViewport || target.captureCurrentScreen) {
+      screen = (await snapshotToText(target, renderCols, renderRows, { filter: false }))?.content;
+    } else if (targetRenderer) {
+      await targetRenderer.writeAndFlush('');
+      screen = targetRenderer.rawSnapshot();
+      episodeKey = String(revision);
+    }
+  } catch { return; }
+  if (screen == null || backend !== target || renderer !== targetRenderer
+    || generation !== cliSpawnGeneration || lifetime !== cliLifetimeNonce
+    || turn !== currentBotmuxTurnId || attempt !== currentBotmuxDispatchAttempt
+    || input !== webTerminalInputGeneration || cliRestartInProgress
+    || revision !== backendScreenRevision
+    || (workerSessionEventScope && !hasCurrentSessionRuntime())) return;
+  const runtimeKey = JSON.stringify([generation, lifetime, physicalId]);
+  return { screen, runtimeKey, observationKey: JSON.stringify([runtimeKey, turn, attempt, input]),
+    turnKey: JSON.stringify([turn, attempt]), episodeKey };
+}
+
 function startScreenUpdates(): void {
   // renderCols / renderRows were set by the init handler from cfg, so
   // adopt-mode panes (e.g. 270x57) get an xterm-headless of matching
@@ -25338,12 +25758,17 @@ function startScreenUpdates(): void {
   renderer = new TerminalRenderer(renderCols, renderRows);
   let lastSentStatus: string | undefined;
   let lastSentExpiredQuotaKey: string | undefined;
+  let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
   let lastTextSnapshotHash = '';
   let lastContent = '';
-  // Last Claude permission dialog already notified (dedup by projection text;
-  // cleared when the dialog leaves the screen so the next one notifies again).
-  let lastClaudeActionPrompt = '';
+  const permissionNotice = new ClaudePermissionNoticeTracker();
+  let permissionCapture: { backend: typeof backend; key: string; expiresAt: number } | undefined;
+  const permissionCaptureTimeoutMs = 10_000;
+  let screenSampleSequence = 0;
+  let latestCommittedScreenSample = 0;
+  let generalCaptureAttempt: { activityKey: string; startedAt: number; retried: boolean } | undefined;
+  const generalCaptureRetryTimeoutMs = 10_000;
   // The CLI's own next-input suggestion (adapters with promptSuggestion only).
   const promptSuggestions = new PromptSuggestionPublisher();
   // PTY-activity watermark of the last tick that actually captured. The screen
@@ -25355,9 +25780,18 @@ function startScreenUpdates(): void {
   // watermark — there we must capture every tick (see shouldCaptureScreen).
   let lastSnapshotPtyActivity = -1;
   let lastSnapshotGridRevision = observedPaneGridRevision;
-  screenUpdateTimer = setInterval(() => {
+  const sample = () => {
+    const sampleSequence = ++screenSampleSequence;
     const capacityBackend = backend;
     const capacityGeneration = cliSpawnGeneration;
+    const capacityLifetime = cliLifetimeNonce;
+    const sampleTurn = currentBotmuxTurnId;
+    const sampleAttempt = currentBotmuxDispatchAttempt;
+    const screenTurn = { turnId: sampleTurn, dispatchAttempt: sampleAttempt };
+    const ownsSample = () => backend === capacityBackend && cliSpawnGeneration === capacityGeneration
+      && cliLifetimeNonce === capacityLifetime
+      && currentBotmuxTurnId === sampleTurn && currentBotmuxDispatchAttempt === sampleAttempt
+      && (!workerSessionEventScope || hasCurrentSessionRuntime());
     if (awaitingFirstPrompt) {
       inspectAidenCodexUpdateDialogOnScreen();
       if (renderer) observeTraexAutoModelCapacity(renderer.rawSnapshot());
@@ -25414,11 +25848,13 @@ function startScreenUpdates(): void {
     }
 
     void (async () => {
+      let captureAttempt: typeof generalCaptureAttempt;
       const { snapshot, status } = await snapshotWithLatestRuntimeStatus(async () => {
         let content = lastContent;
         let changed = false;
         let refreshed = false;
         let nativeScreen: string | undefined;
+        let commitCapture: (() => void) | undefined;
         const observedAtMs = Date.now();
 
         // Capture only when the pane has emitted output since our last snapshot.
@@ -25430,49 +25866,94 @@ function startScreenUpdates(): void {
         // watermark can't be trusted there, so capture every tick.
         const ptyActivity = lastPtyActivityAtMs;
         const gridRevision = observedPaneGridRevision;
-        if (gridRevision !== lastSnapshotGridRevision || shouldCaptureScreen({
+        const activityKey = JSON.stringify([ptyActivity, gridRevision]);
+        const pendingCapture = generalCaptureAttempt?.activityKey === activityKey ? generalCaptureAttempt : undefined;
+        const retryReady = !!pendingCapture && !pendingCapture.retried
+          && Date.now() - pendingCapture.startedAt >= generalCaptureRetryTimeoutMs;
+        const needsCapture = gridRevision !== lastSnapshotGridRevision || shouldCaptureScreen({
           ptyActivity,
           lastCapturedPtyActivity: lastSnapshotPtyActivity,
           screenSelfDriven: isScreenSelfDriven(backend),
-        })) {
+        });
+        // Keep one read per activity, plus one timeout retry. A genuinely new
+        // activity bypasses the stalled slot; a second stalled read does not
+        // accumulate another pending renderer on every tick.
+        if (needsCapture && (!pendingCapture || retryReady)) {
+          captureAttempt = { activityKey, startedAt: Date.now(), retried: !!pendingCapture };
+          generalCaptureAttempt = captureAttempt;
           refreshed = true;
-          lastSnapshotPtyActivity = ptyActivity;
-          lastSnapshotGridRevision = gridRevision;
+          const capturedPtyActivity = ptyActivity;
+          const capturedGridRevision = gridRevision;
+          let textSnapshotHash = lastTextSnapshotHash;
+          let analyzerSnapshot = lastAnalyzerSnapshot;
+          let replaceAnalyzerSnapshot = false;
+          let observeSuggestion: (() => void) | undefined;
           // Preferred path: pipe-pane backends pull a fresh viewport snapshot
           // from tmux every tick. This eliminates the accumulated-buffer drift
           // that produced duplicated/staircase text in 'text' display mode.
           const suggestionReader = cliAdapter?.promptSuggestion;
-          const pipeText = await snapshotToText(backend, renderCols, renderRows, { filter: true, ...(suggestionReader ? { cells: true } : {}) });
+          const pipeText = await snapshotToText(capacityBackend, renderCols, renderRows, { filter: true, ...(suggestionReader ? { cells: true } : {}) });
+          if (!ownsSample()) return null;
           if (pipeText) {
             content = pipeText.content;
-            if (suggestionReader && pipeText.cells) promptSuggestions.observe(suggestionReader(pipeText.cells), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+            if (suggestionReader && pipeText.cells) {
+              const cells = pipeText.cells;
+              observeSuggestion = () => promptSuggestions.observe(suggestionReader(cells), screenTurn);
+            }
             // Geometry is part of the frame: the same ANSI re-wrapped on a
             // resized pane renders different text.
             const hash = `${pipeText.cols}x${pipeText.rows}:${pipeText.ansi}`;
             changed = hash !== lastTextSnapshotHash;
-            lastTextSnapshotHash = hash;
+            textSnapshotHash = hash;
             // Refresh the unfiltered cache that ScreenAnalyzer reads from. Same
             // tmux call would otherwise need to fire twice per tick.
             if (changed) {
-              const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
-              if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
+              const rawSnap = await snapshotToText(capacityBackend, renderCols, renderRows, { filter: false });
+              if (!ownsSample()) return null;
+              if (rawSnap) {
+                analyzerSnapshot = rawSnap.content;
+                replaceAnalyzerSnapshot = true;
+              }
             }
-            nativeScreen = lastAnalyzerSnapshot;
+            nativeScreen = analyzerSnapshot;
           } else if (renderer) {
-            const snap = renderer.snapshot();
+            const currentRenderer = renderer;
+            const snap = currentRenderer.snapshot();
             content = snap.content;
             changed = snap.changed;
-            nativeScreen = renderer.rawSnapshot();
-            if (suggestionReader) promptSuggestions.observe(suggestionReader(renderer.viewportCells()), { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+            nativeScreen = currentRenderer.rawSnapshot();
+            if (suggestionReader) {
+              const cells = currentRenderer.viewportCells();
+              observeSuggestion = () => promptSuggestions.observe(suggestionReader(cells), screenTurn);
+            }
           } else {
             return null;
           }
-          lastContent = content;
+          // Async captures finish out of order. Keep every write sample-local
+          // until the outer sequence fence selects this sample for commit.
+          commitCapture = () => {
+            lastSnapshotPtyActivity = capturedPtyActivity;
+            lastSnapshotGridRevision = capturedGridRevision;
+            lastTextSnapshotHash = textSnapshotHash;
+            if (replaceAnalyzerSnapshot) lastAnalyzerSnapshot = analyzerSnapshot;
+            lastContent = content;
+            observeSuggestion?.();
+          };
         }
 
-        return { content, changed, refreshed, nativeScreen, observedAtMs };
-      }, projectedRuntimeScreenStatus);
-      if (!snapshot) return;
+        return { content, changed, refreshed, nativeScreen, observedAtMs, commitCapture };
+      }, projectedRuntimeScreenStatus).finally(() => {
+        if (captureAttempt && generalCaptureAttempt === captureAttempt) generalCaptureAttempt = undefined;
+      });
+      if (!snapshot || !ownsSample()) return;
+      // Status-only ticks reuse the committed cache and must not invalidate an
+      // older capture that is still in flight. Only a fresh capture advances
+      // the ordering high-water and can supersede another capture's commit.
+      if (snapshot.refreshed) {
+        if (sampleSequence < latestCommittedScreenSample) return;
+        latestCommittedScreenSample = sampleSequence;
+      }
+      snapshot.commitCapture?.();
       // TRAE's question page sits still once drawn: the tick's screen catches
       // one the per-chunk hold check missed (its card is raised from a fresh
       // capture, see core/traex-question-bridge.ts).
@@ -25511,15 +25992,35 @@ function startScreenUpdates(): void {
       // is narrow: only the bounded title/question/options leave the
       // terminal, never tool args.
       if (lastInitConfig?.cliId === 'claude-code') {
-        const prompt = claudeActionPrompt(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
-        if (prompt && prompt !== lastClaudeActionPrompt) {
-          lastClaudeActionPrompt = prompt;
-          send({type: 'user_notify', kind: 'claude_permission_prompt', message: prompt, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
-        } else if (!prompt) {
-          lastClaudeActionPrompt = '';
+        if (permissionCapture && Date.now() >= permissionCapture.expiresAt) {
+          permissionCapture = undefined;
+          permissionNotice.observe(undefined, '', Date.now());
+        }
+        if (permissionNotice.needsCapture([snapshot.nativeScreen, renderer?.rawSnapshot(), snapshot.content])) {
+          const key = JSON.stringify([capacityGeneration, capacityLifetime, sampleTurn, sampleAttempt,
+            webTerminalInputGeneration, workerSessionEventScope?.currentBinding()?.bindingId]);
+          if (!permissionCapture || permissionCapture.backend !== capacityBackend || permissionCapture.key !== key) {
+            const capture = { backend: capacityBackend, key, expiresAt: Date.now() + permissionCaptureTimeoutMs };
+            permissionCapture = capture;
+            // A slow permission read must not hold ordinary screen updates or be
+            // superseded by every tick. A stuck read loses its slot and late
+            // results cannot settle a newer read's observation.
+            void captureClaudePermissionNoticeScreen().then(current => {
+              if (permissionCapture !== capture || !ownsSample()) return;
+              const observedAt = Date.now();
+              if (observedAt >= capture.expiresAt) {
+                permissionNotice.observe(undefined, '', observedAt);
+                return;
+              }
+              const prompt = permissionNotice.observe(current?.screen, current?.runtimeKey ?? '', observedAt, current?.observationKey, current?.episodeKey, current?.turnKey);
+              if (prompt) send({type: 'user_notify', kind: 'claude_permission_prompt', message: prompt,
+                permissionPromptStable: true, turnId: sampleTurn, dispatchAttempt: sampleAttempt});
+            }).finally(() => {
+              if (permissionCapture === capture) permissionCapture = undefined;
+            });
+          }
         }
       }
-      const screenTurn = { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt };
       const suggestion = promptSuggestions.take(usageAware.status, screenTurn,
         promptSuggestionReportTurn(screenTurn, foldedTypeAheadTurn, turnTerminalEmitted));
       if (suggestion) {
@@ -25537,20 +26038,31 @@ function startScreenUpdates(): void {
       if (startupInputHeld()) return;
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
+        || usageAware.usageLimitRecovery !== lastSentRecovery
         || backgroundWaitTasks !== lastSentBackgroundWait) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
+        lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
         send({
           type: 'screen_update',
           content: snapshot.content,
           ...usageAware,
           ...backgroundWaitPayload(),
-          turnId: currentBotmuxTurnId,
-          dispatchAttempt: currentBotmuxDispatchAttempt,
+          turnId: screenTurn.turnId,
+          dispatchAttempt: screenTurn.dispatchAttempt,
         });
       }
     })();
+  };
+  screenUpdateTimer = setInterval(() => {
+    // This worker-wide timer starts before spawn; pin each sample, not the timer,
+    // to the runtime it observes so delayed frames retain their original fence.
+    const scope = workerSessionEventScope;
+    const binding = scope?.currentBinding();
+    if (scope && !binding) return;
+    if (scope && binding) scope.run(binding, sample);
+    else sample();
   }, SCREEN_UPDATE_INTERVAL_MS);
 }
 
@@ -26346,6 +26858,61 @@ function resolveCliExtraArgs(): string[] {
   return cliExtraArgs;
 }
 
+/** Keep the credential-only mount target present even before the first account
+ * is imported. Otherwise a later host-side save/login becomes visible through
+ * the pane's bind-mounted root. */
+function prepareAntigravityAccountsCredentialMask(
+  root: string,
+  hideDirectories: Set<string>,
+  hideFiles: Set<string>,
+): void {
+  const directory = join(root, 'antigravity-accounts');
+  try {
+    const stat = lstatSync(directory);
+    if (stat.isDirectory() && !stat.isSymbolicLink()) {
+      hideDirectories.add(realpathSync(directory));
+    } else {
+      hideFiles.add(directory);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    mkdirSync(directory, { mode: 0o700 });
+    hideDirectories.add(realpathSync(directory));
+  }
+}
+
+/** Reconcile the exact credential HOME visible to the child. A managed vault
+ * error is a pre-spawn failure, never permission to boot a disabled/unknown
+ * account with whatever live file happens to remain. */
+function reconcileAntigravitySpawnAccount(
+  opts: AntigravityAccountStoreOptions,
+): { reconciled: ReconcileAntigravityTokenResult; accountId: string } | undefined {
+  const reconciled = reconcileActiveAntigravityToken(opts);
+  if (!reconciled.managed) return undefined;
+  if (reconciled.error || !reconciled.activeId) {
+    throw new Error(`Antigravity 账号预检失败：${reconciled.error ?? 'active_account_missing'}`);
+  }
+  return { reconciled, accountId: reconciled.activeId };
+}
+
+/** A post-spawn observation is only an account hint when the live file still
+ * matches the account we reconciled. A racing agy rewrite becomes UNKNOWN, not
+ * a false attestation for automatic recovery. */
+function confirmAntigravitySpawnAccount(
+  opts: AntigravityAccountStoreOptions,
+  expectedAccountId: string,
+): string | null {
+  try {
+    const inspection = inspectAntigravityAccounts(opts);
+    const active = inspection.accounts.find(account => account.id === expectedAccountId);
+    return inspection.activeId === expectedAccountId && active?.hasValidToken && inspection.liveTokenMatchesActive
+      ? expectedAccountId
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 /** One-shot guard for the tmux version / crash-exit-code degradation self-check. */
 let hasLoggedTmuxVersionSelfCheck = false;
 
@@ -26873,7 +27440,6 @@ async function spawnCliBody(
   traexNativeStartupInputPending = shouldFenceTraexStartupInput({
     cliId: cfg.cliId,
     programStatusEnabled: programStatusStream !== null,
-    resume: cfg.resume,
     adoptMode: cfg.adoptMode,
     remoteViewer: !!remoteWsUrl,
   });
@@ -28934,10 +29500,12 @@ async function spawnCliBody(
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR, cfg.larkAppId);
       mkdirSync(dirname(credPath), { recursive: true });
-      writeFileSync(
+      // In place on purpose (see writeSendCredFile): a rename would defeat the
+      // running Linux mask and leave a readable temp sibling in BOT_HOME.
+      writeSendCredFile(
         credPath,
         JSON.stringify({ larkAppId: cfg.larkAppId, larkAppSecret: cfg.larkAppSecret, brand: cfg.brand, apiOnly: cfg.apiOnly, feedback: cfg.feedback }),
-        { mode: 0o600 },
+        sendCredUpdateLockTarget(process.env.SESSION_DATA_DIR, credPath),
       );
     } catch (e) {
       log(`[sandbox] WARN could not write send-cred file: ${(e as Error).message}`);
@@ -29477,6 +30045,13 @@ async function spawnCliBody(
   // A sandboxed `botmux send` cannot read bots.json; it keeps this bot's
   // local-address policy from the snapshot taken when the worker was forked.
   childEnv[HIDE_LOCAL_ADDRESSES_ENV] = hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true);
+  // The reply delivery this pane's prompt was built with (after the resolved-
+  // sandbox degrade above). `botmux send` words its post-send hint from it: in
+  // a transcript session a progress send is answered with "the final reply is
+  // forwarded automatically" instead of "deliver with --response-kind final".
+  // A warm reattach keeps the env of the original spawn, matching the system
+  // prompt that pane still runs with.
+  childEnv[REPLY_DELIVERY_ENV] = cfg.replyDelivery === 'transcript' ? 'transcript' : 'send';
   // The stable native/global skill loader and `botmux send` must see one exact
   // normalized snapshot for the lifetime of this pane. Always inject `{}` for
   // defaults so an inherited stale value can never bleed across bot sessions.
@@ -29733,21 +30308,6 @@ async function spawnCliBody(
   const reproduceBaseBin = spawnBin;
   const reproduceBaseArgs = [...spawnArgs];
 
-  // The optional「本轮回顾」model recap: the same binary and env, outside any terminal.
-  recapModelLaunch = recapModelLaunchFor({
-    recapModel: cliAdapter.recapModel,
-    systemPrompt: RECAP_MODEL_SYSTEM_PROMPT,
-    bin: spawnBin,
-    env: { ...childEnv, ...perBotInjectEnv },
-    cwd: cfg.workingDir,
-    backend: effectiveBackendType,
-    sandboxed: sandboxRequested,
-    readIsolated: !!isolationBotHome,
-    wrapped: !!cfg.wrapperCli,
-    adopted: !!cfg.adoptMode,
-    credentialIsolated: credentialIsolationGate.required,
-  });
-
   // CJADK_INTERACTIVE is a cjadk-only knob we set on the cjadk wrapper branch
   // (applyWrapperCliLaunch). Strip any value inherited from the daemon's own
   // env first so a daemon launched under `cjadk feishu` (which exports it)
@@ -29985,11 +30545,21 @@ async function spawnCliBody(
       resolvedBin: canonical(cliAdapter.resolvedBin),
     }).map(canonical);
 
-    // Linux relay outbox (created by prepareDirectSandbox; in the policy so the
-    // compiled plan binds it read-write).
-    const outbox = process.platform === 'linux'
+    // Relay outbox (in the policy so the compiled plan grants it read-write).
+    // Linux: always (created by prepareDirectSandbox, bound into bwrap).
+    // macOS: only when the bot withholds its app secret from the sandbox — the
+    // Seatbelt pane then has no credential to call Lark with, so send / history /
+    // quoted go through this outbox like they do on Linux.
+    const darwinRelayOutbox = process.platform === 'darwin' && cfg.sandboxWithholdBotSecret === true;
+    const outbox = process.platform === 'linux' || darwinRelayOutbox
       ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
       : undefined;
+    // macOS has no prepareDirectSandbox: create the outbox here, before the
+    // policy drops grants for paths that do not exist. A warm reattach must
+    // reuse the pane's existing directory (checked below), never make one.
+    if (darwinRelayOutbox && outbox && !willReattachPersistent) {
+      mkdirSync(outbox, { recursive: true, mode: 0o700 });
+    }
     // Pre-create the outbox BEFORE buildFsPolicy so it survives the allow-rule
     // existence-filter below (a not-yet-existing readWrite path is dropped, and
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
@@ -30418,6 +30988,7 @@ async function spawnCliBody(
       botmuxInstallRoot,
       botmuxInstallRootMaskPaths: installRootMasks.paths,
       outbox,
+      withholdSendCredential: cfg.sandboxWithholdBotSecret === true,
       extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir]),
       userPaths,
       serviceCredentialReadOnlyPaths,
@@ -30494,9 +31065,36 @@ async function spawnCliBody(
       const profilePath = join(profileDir, `${cfg.sessionId}.sb`);
       writeFileSync(profilePath, compileToSeatbelt(policy), { mode: 0o600 });
       seatbeltProfilePath = profilePath;
-      spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+      if (outbox) {
+        // Seatbelt has no --setenv and the tmux pane only receives allowlisted
+        // BOTMUX_* keys, so the relay location rides on the command itself.
+        spawnArgs = ['-f', profilePath, '/usr/bin/env', `BOTMUX_SEND_RELAY=${outbox}`, spawnBin, ...spawnArgs];
+      } else {
+        spawnArgs = ['-f', profilePath, spawnBin, ...spawnArgs];
+      }
       spawnBin = 'sandbox-exec';
       log(`[file-sandbox] wrapping ${cliAdapter.id} in Seatbelt (fs-policy, ${policy.rules.length} rules): sandbox-exec -f ${profilePath}`);
+      if (outbox) {
+        // A warm reattach must re-serve the outbox the live pane already uses;
+        // if it vanished, no one would answer that pane's relay → fail closed.
+        let outboxOk = false;
+        try { const st = lstatSync(outbox); outboxOk = st.isDirectory() && !st.isSymbolicLink(); } catch { /* */ }
+        if (!outboxOk) {
+          throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: relay outbox ${outbox} is missing`);
+        }
+        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+        const sessionTree = dirname(outbox);
+        sandboxCleanup = () => { rmSync(sessionTree, { recursive: true, force: true }); };
+        sandboxRelayOutbox = outbox;
+        sandboxStopWatcher = startOutboxWatcher(
+          outbox,
+          childEnv,
+          cfg.sessionId,
+          { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
+        );
+        publishSandboxRelayCapability();
+        log(`[file-sandbox] bot secret withheld from the sandbox; send/history/quoted relay via outbox=${outbox}`);
+      }
     } else if (willReattachPersistent) {
       // Warm reattach (daemon restart / transfer) to a live bwrap'd pane:
       // backend.spawn() ignores bin/args and just re-attaches. Only re-wire the
@@ -30519,7 +31117,7 @@ async function spawnCliBody(
         att.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend, allowRouting: true },
+        { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
       );
       publishSandboxRelayCapability();
       log(`Sandbox REATTACH (${cfg.cliId}): live pane CLI kept, re-wired outbox=${att.outbox}`);
@@ -30617,7 +31215,7 @@ async function spawnCliBody(
         sbx.outbox,
         childEnv,
         cfg.sessionId,
-        { authorize: authorizeManagedSend, allowRouting: true },
+        { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
       );
       publishSandboxRelayCapability();
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
@@ -31247,6 +31845,7 @@ async function spawnCliBody(
         mkdirSync(authorityDirectory, { mode: 0o700 });
       }
       hideDirectories.add(realpathSync(authorityDirectory));
+      prepareAntigravityAccountsCredentialMask(root, hideDirectories, hideFiles);
       for (const name of readdirSync(root)) {
         if (name === DEVICE_AUTHORITY_DIRECTORY) continue;
         if (!isCredentialIsolationReservedBasename(name)
@@ -31595,6 +32194,26 @@ async function spawnCliBody(
     }
     const spawnBackend = backend;
     const spawnCliBin = cliAdapter.resolvedBin;
+    let spawnedAntigravityAccountReport: { accountId: string } | undefined;
+    let antigravitySpawnStoreOptions: AntigravityAccountStoreOptions | undefined;
+    if (cfg.cliId === 'antigravity' && !willReattachPersistent && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
+      const effectiveChildEnv = { ...spawnEnvPlan.childEnv, ...spawnEnvPlan.injectEnv };
+      antigravitySpawnStoreOptions = resolveAntigravitySpawnStoreOptions({
+        effectiveHome: effectiveChildEnv.HOME,
+        botmuxConfigDir: configuredBotmuxHome,
+        env: effectiveChildEnv,
+      });
+      const prepared = reconcileAntigravitySpawnAccount(antigravitySpawnStoreOptions);
+      if (prepared) {
+        const { reconciled } = prepared;
+        spawnedAntigravityAccountReport = { accountId: prepared.accountId };
+        if (reconciled.advancedFrom) {
+          log(`Antigravity account pre-spawn advance: ${reconciled.advancedFrom} -> ${reconciled.activeId}`);
+        } else if (reconciled.restored) {
+          log(`Antigravity live token restored to active account ${reconciled.activeId}`);
+        }
+      }
+    }
     spawnWithCodexModelLaunch({
       dataDir: config.session.dataDir, sessionId: cfg.sessionId, launch: nativeModelLaunch,
       reattached: () => 'isReattach' in spawnBackend && spawnBackend.isReattach === true,
@@ -31657,6 +32276,17 @@ async function spawnCliBody(
         });
       },
     });
+    if (spawnedAntigravityAccountReport && antigravitySpawnStoreOptions
+      && !('isReattach' in spawnBackend && spawnBackend.isReattach === true)) {
+      send({
+        type: 'antigravity_account',
+        accountId: confirmAntigravitySpawnAccount(
+          antigravitySpawnStoreOptions,
+          spawnedAntigravityAccountReport.accountId,
+        ),
+        ...(activeRestartAttemptId ? { attemptId: activeRestartAttemptId } : {}),
+      });
+    }
     if (!willReattachPersistent) {
       writeEnvPolicyStamp(config.session.dataDir, cfg.sessionId, cfg.envPolicy);
       // Which configured environment this CLI really got (Dashboard marks a
@@ -31867,6 +32497,17 @@ async function spawnCliBody(
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
+  // A re-attached pane keeps the prompt it was launched with; follow it rather
+  // than this init's delivery (a daemon upgrade or config edit since then).
+  if (actuallyReattachedPersistent && !cfg.adoptMode) {
+    const pane = paneReplyDeliveryFromProcessTree(cliPid, cfg.replyDeliveryLegacy ?? (cfg.replyDelivery === 'transcript' ? 'transcript' : 'send'));
+    reattachedPaneReplyDelivery = pane;
+    if (pane && pane !== (cfg.replyDelivery === 'transcript' ? 'transcript' : 'send')) {
+      log(`[reply-delivery] re-attached pane was launched with replyDelivery=${pane} (init says ${cfg.replyDelivery ?? 'send'}); following the pane until the CLI is respawned`);
+    }
+  } else {
+    reattachedPaneReplyDelivery = undefined;
+  }
   if (cfg.existingAppServerEndpoint !== undefined) {
     // The local `codex --remote` client does not own the selected rollout fd;
     // writeInput must accept only the explicitly bound remote thread in the
@@ -37626,10 +38267,6 @@ function emitTurnTerminal(
     ...(directFailure ? { directFailure: true as const } : {}),
     ...(composerRefusal && errorCode === 'safe_composer_required' ? { composerRefusal } : {}),
   };
-  // The「本轮回顾」material first: the daemon reads it when the terminal lands.
-  const recapInput = status === 'completed'
-    ? turnRecapRecorder.input({ turnId, dispatchAttempt }, lastInitConfig?.workingDir) : undefined;
-  if (recapInput) send({ type: 'recap_input', turnId, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}), ...recapInput });
   const scope = workerSessionEventScope;
   if (continuationFailure && scope) {
     scope.reportContinuationFailure(continuationFailure, () => {
@@ -39423,19 +40060,14 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // restart IPC 可携带新值。三分态同 restart：undefined = 不携带（旧 daemon）
       // 保持快照；null = 明确不传模型。对已经在跑的 CLI 无影响（只在下次 spawn 用）。
       applyWorkerLaunchModel(lastInitConfig ?? undefined, msg);
-      // startupCommands / launchShell 同理，但只在**真的 parked**（下面那条恢复重启
-      // 即将执行）时才收：daemon 的 crashDiagnosticParked 在 worker 内恢复后不会清
-      // （只有 refork 的 ready 才清），之后每条消息都还捎带；而 runStartupCommands
-      // 在当前 spawn 的启动序列里实时读 lastInitConfig.startupCommands——若在启动
-      // 命令待确认时被换掉，正在跑的 CLI 会拿新列表配旧游标，两份都敲不全。
+      // startupCommands / launchShell / replyDelivery 同理，但只在**真的 parked**
+      // （下面那条恢复重启即将执行）时才收：daemon 的 crashDiagnosticParked 在
+      // worker 内恢复后不会清（只有 refork 的 ready 才清），之后每条消息都还捎带。
+      // 正在跑的 CLI 若在此换启动命令，会拿新列表配旧游标；若在此换投递方式，
+      // 则会出现旧提示配新门控。
       const parkedRespawnPending = !backend && crashDiagnosticStopped && !lastInitConfig?.adoptMode;
       if (lastInitConfig) {
-        applyRespawnConfigPatch(lastInitConfig, {
-          model: msg.model,
-          larkToolBinding: msg.larkToolBinding,
-          triggerUserAuth: msg.triggerUserAuth,
-          ...(parkedRespawnPending ? { startupCommands: msg.startupCommands, launchShell: msg.launchShell } : {}),
-        });
+        applyRespawnConfigPatch(lastInitConfig, respawnConfigPatchFromMessage(msg, parkedRespawnPending));
       }
       // NOTE: the mojo credential snapshot is deliberately NOT applied here. It
       // rides on the queue item and is applied when THIS turn is actually written
@@ -39970,6 +40602,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           triggerUserAuth: msg.triggerUserAuth,
           startupCommands: msg.startupCommands,
           launchShell: msg.launchShell,
+          replyDelivery: msg.replyDelivery,
         });
         if (patched.traexReconfigure) configureTraexAutoModel({ ...lastInitConfig, prompt: '' });
         if (patched.startupCommandsChanged) {
@@ -40046,11 +40679,21 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         release: () => { durableTurnInFlight = false; inflightInputs.onTurnComplete(); },
       });
       await restartCliProcess(
-        msg.updateWorkingDir ? `cwd-move respawn → ${msg.updateWorkingDir}` : 'daemon request',
-        // cwd-move 是用户主动的目录迁移、不是崩溃恢复，不计入 tier-2 强制
-        // FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
+        msg.updateWorkingDir
+          ? `cwd-move respawn → ${msg.updateWorkingDir}`
+          : msg.reason === 'account_rotation'
+            ? 'antigravity account rotation'
+            : 'daemon request',
+        // cwd-move / topicEffort / account_rotation 是主动运维/轮换迁移、不是崩溃恢复，
+        // 不计入 tier-2 强制 FRESH 的重启预算；respawn 真失败仍有 claude_exit → daemon
         // auto-restart 那条裸 restart 的计数兜底。
-        { preservePending: true, skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort, ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}) },
+        {
+          preservePending: true,
+          immediate: msg.reason === 'account_rotation',
+          skipRestartBudget: !!msg.updateWorkingDir || !!msg.topicEffort || msg.reason === 'account_rotation',
+          ...(msg.topicEffort ? { exactResumeSessionId: msg.topicEffort.nativeSessionId } : {}),
+          ...(msg.reason === 'account_rotation' ? { restartCause: 'antigravity-account-rotation' as const } : {}),
+        },
       );
       break;
     }
@@ -40316,11 +40959,6 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'goal_update_ack': {
       if (msg.signature === nativeGoalPendingSignature) nativeGoalSignature = msg.signature;
-      break;
-    }
-
-    case 'recap_request': {
-      void answerRecapRequest(msg.requestId, msg.prompt);
       break;
     }
 
