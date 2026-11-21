@@ -30446,6 +30446,8 @@ export function forkAdoptWorker(
     // matching observe backend from adoptSource and those source-specific fields.
     backendType: adoptBackendType,
     adoptMode: true,
+    // Follow-up replies are mostly an adopt feature: same switch as the primary init.
+    ...(botCfg.followUpReply === true ? { followUpReply: true as const } : {}),
     envPolicy: botCfg.envPolicy,
     protectedMcpPolicy: protectedMcpProvisioning.workerPolicy,
     adoptSource: adopted.source ?? adoptBackendType,

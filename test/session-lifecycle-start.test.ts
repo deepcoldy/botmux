@@ -12477,6 +12477,22 @@ describe('folded-turn reply relay', () => {
     expect(noTransport.sessionReply).not.toHaveBeenCalled();
   });
 
+  it.each([true, false])('hands followUpReply=%s to the worker of a new and of an adopted session alike', followUpReply => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ followUpReply }));
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    const fresh = makeDs(claudeSession);
+    expect(forkWorker(fresh, 'hello', false)).toBe(true);
+    const inits = [fresh.initConfig];
+    for (const cliId of ['claude-code', 'codex']) {
+      const ds = makeDs({ adoptedFrom: { tmuxTarget: 'adopt-switch:0.0', originalCliPid: 23456, sessionId: 'adopted-native', cliId, cwd: REPO } });
+      forkMock.mockImplementationOnce(() => makeFakeWorker());
+      expect(forkAdoptWorker(ds)).toBe('accepted');
+      expect(ds.initConfig?.adoptMode).toBe(true);
+      inits.push(ds.initConfig);
+    }
+    expect(inits.map(init => init?.followUpReply)).toEqual(Array(3).fill(followUpReply ? true : undefined));
+  });
+
   it('posts nothing while followUpReply is off, checked when the reply arrives', async () => {
     const { sessionReply, worker } = forkWithReply(adopted);
     vi.mocked(getBot).mockImplementation(() => defaultBot());
