@@ -192,13 +192,21 @@ export function selectStaleRestoredJournalTurns(
       || turn.submitVerificationStartedAtMs !== undefined));
 }
 
+/** Byte offset of the rollout line a Codex event came from (`<path>:<offset>`). */
+function rolloutLineOffset(uuid: string): number | undefined {
+  const offset = Number(uuid.slice(uuid.lastIndexOf(':') + 1));
+  return Number.isSafeInteger(offset) ? offset : undefined;
+}
+
 /**
  * The answer to an input Codex pulled into the running execution (a
  * same-turn steer). Fed the 'cot' records attributed to that input's turn in
  * order, it keeps the first assistant message(s) and reports them once the
  * model moves on to a tool call: the model answered and went back to work.
  * A message the turn simply ends with is its final answer, which the turn's
- * own reply already carries, so that never completes here.
+ * own reply already carries, so that never completes here. A tool record
+ * written before the answer (a deferred shell call surfacing at the turn's
+ * end) is not the model moving on.
  */
 export class CodexSteerReplyCollector {
   private readonly run: Array<{ text: string; uuid: string }> = [];
@@ -212,7 +220,11 @@ export class CodexSteerReplyCollector {
       this.run.push({ text: message, uuid: ev.uuid });
       return undefined;
     }
-    if (this.run.length === 0 || !ev.cotEntries?.some(entry => entry.kind === 'tool_call')) return undefined;
+    const toolCall = ev.toolCallBoundary === true || ev.cotEntries?.some(entry => entry.kind === 'tool_call');
+    if (this.run.length === 0 || !toolCall) return undefined;
+    const at = rolloutLineOffset(ev.uuid);
+    const answeredAt = rolloutLineOffset(this.run[this.run.length - 1].uuid);
+    if (at !== undefined && answeredAt !== undefined && at < answeredAt) return undefined;
     this.done = true;
     return { text: this.run.map(part => part.text).join('\n\n'), lastUuid: this.run[this.run.length - 1].uuid };
   }

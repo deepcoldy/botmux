@@ -12434,7 +12434,7 @@ describe('folded-turn reply relay', () => {
     expect(ds.finalOutputDeliveriesInFlight?.size ?? 0).toBe(0);
   });
 
-  it('records a reply that is its turn\'s only one as what the turn delivered', async () => {
+  it('records a reply marked as its turn\'s final as what the turn delivered', async () => {
     const { sessionReply, ds, worker } = forkWithReply(adopted);
     worker.emit('message', { ...reply('om_folded', 'answer'), turnReply: true });
     worker.emit('message', reply('om_steered', 'answer'));

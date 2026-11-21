@@ -13,6 +13,13 @@ function ev(obj: any): string {
   return JSON.stringify(obj) + '\n';
 }
 
+/** Reader output without the bare tool-call boundaries (`toolCallBoundary`):
+ *  the thinking timeline and turn records the exec-wrapper tests pin. */
+function drainTimeline(...args: Parameters<typeof drainCodexRollout>): ReturnType<typeof drainCodexRollout> {
+  const r = drainCodexRollout(...args);
+  return { ...r, events: r.events.filter(e => e.toolCallBoundary !== true) };
+}
+
 function userResponseItem(text: string, ts = '2026-04-29T07:00:00.000Z') {
   return {
     timestamp: ts,
@@ -204,6 +211,10 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
     ({ timestamp: at(sec), type: 'response_item', payload: { type: 'custom_tool_call', name: 'js', call_id: id, input: 'run()' } });
   const toolOutput = (id: string, sec: number) =>
     ({ timestamp: at(sec), type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: id, output: 'ok' } });
+  /** A wrapped shell call: its timeline entry is deferred to the command's
+   *  completion or the turn's end. */
+  const execCall = (id: string, sec: number) => ({ timestamp: at(sec), type: 'response_item', payload: {
+    type: 'custom_tool_call', name: 'exec', call_id: id, input: 'await tools.exec_command({ cmd: "npm test" })' } });
 
   /** Rollout of one execution with a second Lark message steered into it. */
   function run(afterSteer: object[]) {
@@ -244,6 +255,26 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
     expect(replies).toEqual([['om_followup', '可以关闭下载窗口，下载已经完成。']]);
     const ready = q.drainEmittable();
     expect(ready.map(t => [t.turnId, t.finalText])).toEqual([['om_followup', 'All done.']]);
+  });
+
+  it('answers at a wrapped shell call, without the final message', () => {
+    const { replies } = run([
+      assistantMessageResponseItem('下载已完成，可以关窗口。', 'commentary', at(6)),
+      execCall('c2', 7), toolOutput('c2', 8),
+      assistantMessageResponseItem('All tests pass. Done.', 'final_answer', at(9)),
+      { timestamp: at(10), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'All tests pass. Done.' } },
+    ]);
+    expect(replies).toEqual([['om_followup', '下载已完成，可以关窗口。']]);
+  });
+
+  it('is not completed by a shell call recorded before the answer and surfaced at the turn\'s end', () => {
+    const { replies } = run([
+      execCall('c2', 6), toolOutput('c2', 7),
+      assistantMessageResponseItem('Yes, it finished.', 'commentary', at(8)),
+      assistantMessageResponseItem('All done.', 'final_answer', at(9)),
+      { timestamp: at(10), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'All done.' } },
+    ]);
+    expect(replies).toEqual([]);
   });
 
   it('leaves an answer that is the final message to the turn\'s own reply', () => {
@@ -660,7 +691,7 @@ describe('drainCodexRollout', () => {
       })
       + ev(assistantFinalResponseItem('done')));
 
-    const result = drainCodexRollout(path, 0);
+    const result = drainTimeline(path, 0);
     const cot = result.events.filter(event => event.kind === 'cot');
     expect(cot).toHaveLength(1);
     expect(cot[0].cotEntries).toEqual([
@@ -682,7 +713,7 @@ describe('drainCodexRollout', () => {
           input: 'await tools.exec_command({ cmd: "code --list-extensions --show-versions 2>/dev/null | rg -i \'openai|codex|chatgpt|continue|cline\' | head -35" })',
         },
       }));
-    const first = drainCodexRollout(path, 0);
+    const first = drainTimeline(path, 0);
     expect(first.events).toEqual([]);
 
     appendFileSync(path,
@@ -718,7 +749,7 @@ describe('drainCodexRollout', () => {
           },
         },
       }));
-    const second = drainCodexRollout(path, first.newOffset);
+    const second = drainTimeline(path, first.newOffset);
     expect(second.events).toHaveLength(1);
     expect(second.events[0].cotEntries).toMatchObject([
       { kind: 'tool_call', id: 'native-2', name: 'shell', subject: "code --list-extensions --show-versions 2>/dev/null | rg -i 'openai|codex|chatgpt|continue|cline' | head -35" },
@@ -732,7 +763,7 @@ describe('drainCodexRollout', () => {
         timestamp: '2026-04-29T07:00:00.100Z', type: 'response_item',
         payload: { type: 'custom_tool_call', name: 'apply_patch', call_id: 'patch-1', input: '*** Begin Patch' },
       }));
-    const first = drainCodexRollout(path, 0);
+    const first = drainTimeline(path, 0);
     expect(first.events.filter(event => event.kind === 'cot')).toHaveLength(1);
 
     appendFileSync(path, ev({
@@ -747,7 +778,7 @@ describe('drainCodexRollout', () => {
         },
       })
       + ev(assistantFinalResponseItem('complete')));
-    const completed = drainCodexRollout(path, first.newOffset);
+    const completed = drainTimeline(path, first.newOffset);
     expect(completed.events.filter(event => event.kind === 'cot')).toHaveLength(1);
     expect(completed.events.find(event => event.kind === 'cot')?.cotEntries).toEqual([
       { kind: 'tool_result', id: 'patch-1', result: 'Done' },
@@ -761,17 +792,17 @@ describe('drainCodexRollout', () => {
         input: 'await tools.exec_command({ cmd: "echo fallback" })',
       },
     }));
-    const first = drainCodexRollout(path, 0);
+    const first = drainTimeline(path, 0);
     expect(first.events.map(event => event.kind)).toEqual(['user']);
     appendFileSync(path, ev({
       type: 'response_item', payload: {
         type: 'custom_tool_call_output', call_id: 'fallback-1', output: '{"output":"ok"}'
       },
     }) + ev({ type: 'event_msg', payload: { type: 'ignored', blob: 'x'.repeat(70 * 1024) } }));
-    const second = drainCodexRollout(path, first.newOffset);
+    const second = drainTimeline(path, first.newOffset);
     expect(second.events).toEqual([]);
     appendFileSync(path, ev(assistantFinalResponseItem('done')));
-    const third = drainCodexRollout(path, second.newOffset);
+    const third = drainTimeline(path, second.newOffset);
     expect(third.events.map(event => event.kind)).toEqual(['cot', 'assistant_final']);
     expect(third.events[0].cotEntries).toMatchObject([
       { kind: 'tool_call', id: 'fallback-1', name: 'exec' },
@@ -795,7 +826,7 @@ describe('drainCodexRollout', () => {
         type: 'CommandExecution', id: 'native-empty', command: ['true'], formatted_output: ''
       } } })
       + ev(assistantFinalResponseItem('second done')));
-    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const cot = drainTimeline(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot).toHaveLength(2);
     expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'old' });
     expect(cot[1].cotEntries).toEqual([
@@ -820,7 +851,7 @@ describe('drainCodexRollout', () => {
         type: 'CommandExecution', id: 'native-3', command: ['git', 'diff'], stdout: 'diff'
       } } })
       + ev(assistantFinalResponseItem('done')));
-    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const cot = drainTimeline(path, 0).events.filter(event => event.kind === 'cot');
     const calls = cot.flatMap(event => event.cotEntries ?? []).filter(entry => entry.kind === 'tool_call');
     expect(calls.map(entry => entry.id)).toEqual(['mixed', 'native-3']);
   });
@@ -847,7 +878,7 @@ describe('drainCodexRollout', () => {
       } } })
       + ev(assistantFinalResponseItem('done')));
 
-    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const cot = drainTimeline(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot.flatMap(event => event.cotEntries ?? [])).toEqual([
       expect.objectContaining({ kind: 'tool_call', id: 'plan-wrapper', name: 'exec' }),
       { kind: 'tool_result', id: 'plan-wrapper', result: 'updated' },
@@ -863,13 +894,13 @@ describe('drainCodexRollout', () => {
         type: 'custom_tool_call', name: 'exec', call_id: 'mixed-wrapper',
         input: 'await Promise.allSettled([tools.web__run({ query: "status" }), tools.exec_command({ cmd: "sleep 1" }), tools.write_stdin({ session_id: 7, chars: "" })])',
       } }));
-    const first = drainCodexRollout(path, 0);
+    const first = drainTimeline(path, 0);
     expect(first.events.map(event => event.kind)).toEqual(['user']);
 
     appendFileSync(path, ev({ type: 'response_item', payload: {
         type: 'custom_tool_call_output', call_id: 'mixed-wrapper', output: '{"output":"poll complete"}',
       } }));
-    const second = drainCodexRollout(path, first.newOffset);
+    const second = drainTimeline(path, first.newOffset);
     expect(second.events).toEqual([]);
 
     appendFileSync(path, ev({ type: 'event_msg', payload: { type: 'item_completed', item: {
@@ -877,7 +908,7 @@ describe('drainCodexRollout', () => {
       } } })
       + ev(assistantFinalResponseItem('done')));
 
-    const entries = drainCodexRollout(path, second.newOffset).events
+    const entries = drainTimeline(path, second.newOffset).events
       .filter(event => event.kind === 'cot')
       .flatMap(event => event.cotEntries ?? []);
     expect(entries).toEqual([
@@ -899,7 +930,7 @@ describe('drainCodexRollout', () => {
         input: 'const example = "tools.exec_command({ cmd: \\\"fake\\\" })"; text(example)',
       } }));
 
-    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const cot = drainTimeline(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot).toHaveLength(1);
     expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'example-wrapper', name: 'exec' });
   });
@@ -926,7 +957,7 @@ describe('drainCodexRollout', () => {
       } } })
       + ev(assistantFinalResponseItem('done')));
 
-    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const cot = drainTimeline(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot.map(event => event.cotEntries?.[0]?.id)).toEqual(['native-late', 'early-wrapper']);
   });
 
@@ -945,7 +976,7 @@ describe('drainCodexRollout', () => {
       } })
       + ev(assistantFinalResponseItem('done')));
 
-    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const cot = drainTimeline(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot).toHaveLength(1);
     expect(cot[0].cotEntries).toEqual([
       expect.objectContaining({ kind: 'tool_call', id: 'legacy-unmatched', name: 'exec_command' }),
@@ -972,7 +1003,7 @@ describe('drainCodexRollout', () => {
       } })
       + ev(assistantFinalResponseItem('done')));
 
-    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const cot = drainTimeline(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot).toHaveLength(1);
     expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'native-copy' });
   });
@@ -992,7 +1023,7 @@ describe('drainCodexRollout', () => {
       } } })
       + ev(assistantFinalResponseItem('done')));
 
-    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const cot = drainTimeline(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot).toHaveLength(1);
     expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'legacy-call', name: 'shell' });
   });
@@ -1013,9 +1044,28 @@ describe('drainCodexRollout', () => {
       } } })
       + ev(assistantFinalResponseItem('done')));
 
-    const cot = drainCodexRollout(path, 0).events.filter(event => event.kind === 'cot');
+    const cot = drainTimeline(path, 0).events.filter(event => event.kind === 'cot');
     expect(cot).toHaveLength(1);
     expect(cot[0].cotEntries?.[0]).toMatchObject({ kind: 'tool_call', id: 'native-template' });
+  });
+
+  it('marks where a deferred shell call was made, apart from its thinking-timeline entry', () => {
+    writeFileSync(path,
+      ev(userResponseItem('inspect the readme'))
+      + ev({ timestamp: '2026-04-29T07:00:00.100Z', type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'outer-1',
+        input: 'await tools.exec_command({ cmd: "sed -n 1,20p README.md" })' } })
+      + ev({ timestamp: '2026-04-29T07:00:00.200Z', type: 'response_item', payload: {
+        type: 'function_call', name: 'exec_command', call_id: 'legacy-1', arguments: '{"cmd":"ls"}' } })
+      + ev({ timestamp: '2026-04-29T07:00:00.300Z', type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'apply_patch', call_id: 'patch-1', input: '*** Begin Patch' } }));
+    const r = drainCodexRollout(path, 0);
+    // One bare boundary per deferred call, at its own line; an ordinary call
+    // keeps its timeline entry and needs none.
+    const boundaries = r.events.filter(e => e.toolCallBoundary === true);
+    expect(boundaries.map(e => [e.kind, e.cotEntries, e.text])).toEqual([['cot', [], ''], ['cot', [], '']]);
+    expect(new Set(r.events.map(e => e.uuid)).size).toBe(r.events.length);
+    expect(r.events.filter(e => e.kind === 'cot' && !e.toolCallBoundary).flatMap(e => e.cotEntries ?? []).map(e => e.kind)).toEqual(['tool_call']);
   });
 
   it('skips developer role messages', () => {
@@ -1480,7 +1530,7 @@ describe('drainCodexRollout', () => {
         input: 'await tools.exec_command({ cmd: "echo 0" })',
       },
     }));
-    let drained = drainCodexRollout(path, 0);
+    let drained = drainTimeline(path, 0);
 
     const startedAt = performance.now();
     for (let i = 0; i < 128; i++) {
@@ -1499,7 +1549,7 @@ describe('drainCodexRollout', () => {
             input: `await tools.exec_command({ cmd: "echo ${i + 1}" })`,
           },
         }));
-      drained = drainCodexRollout(path, drained.newOffset, drained.state);
+      drained = drainTimeline(path, drained.newOffset, drained.state);
       expect(drained.events).toEqual([]);
       expect(drained.state).toEqual({
         nextOffset: drained.newOffset,

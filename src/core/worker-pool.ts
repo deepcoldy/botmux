@@ -27710,7 +27710,7 @@ function setupWorkerHandlers(
             logger.error(`[${t}] Gave up delivering follow-up reply for turn ${msg.turnId.substring(0, 8)}`);
             return;
           }
-          // The turn's only reply: it is what this turn delivered.
+          // The turn's final (see turnReply): it is what this turn delivered.
           if (msg.turnReply && typeof result.value === 'string' && result.value) {
             recordTurnTerminalCarrier(ds, msg.turnId, { messageId: result.value, kind: 'non_patchable', responseKind: 'final' });
             noteFinalOutputReceipt(ds, msg.turnId, { text: msg.answer });

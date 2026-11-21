@@ -50,7 +50,7 @@ const apiError = (uuid: string): TranscriptEvent => ({
 const duration = (uuid: string): TranscriptEvent =>
   ({ type: 'system', subtype: 'turn_duration', uuid, timestamp: at() }) as TranscriptEvent;
 
-function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: boolean } = {}) {
+function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: boolean; replyDelivery?: 'send' | 'transcript' } = {}) {
   const sent: Array<Record<string, unknown>> = [];
   const terminals: Array<{ turnId: string; status: string; disposition?: string }> = [];
   const reads: number[] = [];
@@ -79,7 +79,7 @@ function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: 
     drainTranscript: (file: string, offset: number) => { reads.push(offset); return transcriptModule.drainTranscript(file, offset); },
     foldReadOffsets: new Map(),
     FOLD_READ_OFFSETS_MAX: 32,
-    replyDeliveryMode: () => 'transcript',
+    replyDeliveryMode: () => opts.replyDelivery ?? 'transcript',
     sessionId: 'session-under-test',
     bridgeJsonlPath: path,
     workerFinalOutputHandoff: undefined,
@@ -120,7 +120,9 @@ function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: 
   const replies = () => sent.filter(msg => msg.type === 'absorbed_reply')
     .map(msg => [msg.turnId, msg.answer, msg.source] as const);
   const finals = () => sent.filter(msg => msg.type === 'final_output').map(msg => [msg.turnId, msg.content] as const);
-  return { live, unobserved, emit, emitAtIdle, replies, finals, sent, terminals, reads, path };
+  /** The CLI rewrote the transcript (shorter) without the worker reading it. */
+  const rewrite = (events: TranscriptEvent[]) => writeFileSync(path, events.map(ev => `${JSON.stringify(ev)}\n`).join(''));
+  return { live, unobserved, rewrite, emit, emitAtIdle, replies, finals, sent, terminals, reads, path };
 }
 
 describe('worker: replies to folded Lark messages (adopt)', () => {
@@ -148,6 +150,24 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     expect(h.replies()).toEqual([['om_B', '用的是 gpt-6-astra。', 'text']]);
     expect(foldBatch).toBeGreaterThan(0);
     expect(h.reads).toEqual([foldBatch]);
+  });
+
+  it('falls back to the whole transcript when its fold is no longer where it was read', () => {
+    const h = harness();
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0')]);
+    const batch = [fold('qB', PROMPT_B), text('aB', '用的是 gpt-6-astra。')];
+    h.live(batch);
+    h.rewrite(batch);
+    h.live([tool('t1')]);
+    expect(h.replies()).toEqual([['om_B', '用的是 gpt-6-astra。', 'text']]);
+    expect(h.reads.at(-1)).toBe(0);
+  });
+
+  it('marks the reply as the turn\'s final only under transcript delivery', () => {
+    const h = harness({ replyDelivery: 'send' });
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', 'answer'), tool('t1')]);
+    expect(h.replies()).toEqual([['om_B', 'answer', 'text']]);
+    expect(h.sent.find(msg => msg.type === 'absorbed_reply')).not.toHaveProperty('turnReply');
   });
 
   it('answers with a thinking summary, marked as such', () => {

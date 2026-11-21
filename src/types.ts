@@ -2998,8 +2998,10 @@ export type WorkerToDaemonBase =
    *  the host turn's. `replyUuid` is the transcript record the answer ends
    *  at (stable across re-sends, so it keys the provider's idempotency);
    *  `source: 'thinking'` marks an answer the model gave only in a thinking
-   *  summary. `turnReply` marks the turn's only reply (a Claude folded turn
-   *  has no other output); a Codex steered turn still ends with its final. */
+   *  summary. `turnReply` marks the reply as the turn's final: a Claude
+   *  folded turn has no other output, and under transcript delivery no
+   *  completion receipt needs a carrier it can be written into. A Codex
+   *  steered turn still ends with its own final, so it never sets this. */
   | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking'; turnReply?: true }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt

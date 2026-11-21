@@ -10352,7 +10352,9 @@ function sendAbsorbedReply(turn: BridgePendingTurn, reply: AbsorbedInputReply, w
     answer: reply.text,
     replyUuid: reply.lastUuid,
     source: reply.source,
-    turnReply: true,
+    // The folded turn has no other reply. Under transcript delivery, which
+    // posts no completion receipt, it stands as the turn's final.
+    ...(replyDeliveryMode() === 'transcript' ? { turnReply: true as const } : {}),
   });
   log(`Folded turn ${turn.turnId.substring(0, 8)} answered ${when} (${reply.source}, ${reply.text.length} chars)`);
 }
