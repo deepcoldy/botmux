@@ -727,6 +727,42 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     expect(h.queue.peek()).toEqual([]);
   });
 
+  it.each([false, true])('deduplicates started users without absorbing same-text successors (adopt=%s)', adoptMode => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.lastInitConfig.adoptMode = adoptMode;
+    if (adoptMode) h.queue.setLocalTurns(true, Date.now() - 1000);
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    h.queue.mark('turn-a', 'Repeat', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(siblingPath, 1, 'Repeat');
+    appendFileSync(siblingPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(siblingPath, 3, 'Sibling waiting narration');
+    h.scope.codexBridgeIngest();
+    h.queue.mark('turn-b', 'Repeat', Date.now(), undefined, undefined, undefined, adoptMode);
+
+    const realPath = h.makeTranscript(REAL_ID);
+    writeAntigravityUserStep(realPath, 1, 'Repeat');
+    writeAntigravityFinalStep(realPath, 2, 'REAL_A');
+    h.notify(REAL_ID, { preserveLiveTurn: true });
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([{ turnId: 'turn-a', text: 'REAL_A' }]);
+    expect(h.queue.peek()).toHaveLength(1);
+    expect(h.queue.peek()[0]).toMatchObject({ turnId: 'turn-b', started: false });
+    expect(h.queue.peek()[0]?.finalText).toBeUndefined();
+
+    // Only A's already-owned user was absorbed. B's later record must still
+    // start and settle its own same-text turn normally.
+    writeAntigravityUserStep(realPath, 3, 'Repeat');
+    writeAntigravityFinalStep(realPath, 4, 'REAL_B');
+    h.scope.codexBridgeIngest();
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([
+      { turnId: 'turn-a', text: 'REAL_A' },
+      { turnId: 'turn-b', text: 'REAL_B' },
+    ]);
+    expect(h.queue.peek()).toEqual([]);
+  });
+
   it.each([false, true])('reconciles REAL history instead of replaying it (adopt=%s)', adoptMode => {
     const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
     h.scope.lastInitConfig.adoptMode = adoptMode;

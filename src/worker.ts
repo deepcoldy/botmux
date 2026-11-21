@@ -13696,6 +13696,10 @@ function rebindAntigravityBridgeTurn(nextPath: string): boolean {
     ? Math.min(...committed.map(match => match.offset))
     : pendingHead ? pendingMatches[0].offset : undefined;
   for (const match of committed) codexBridgeQueue.rebindStartedTurnToUser(match.turnId, match.event);
+  // These started users already belong to their mapped owners. Suppress only
+  // their replay: an id-less managed user must not start a same-text successor.
+  // The unstarted head's own record is deliberately NOT absorbed below.
+  codexBridgeQueue.absorb(committed.map(match => match.event));
   log(`Antigravity bridge authoritatively rebound ${previousPath ?? '?'} → ${nextPath}`);
   codexBridgeDetachFile();
   codexBridgeAttach(nextPath, 'fresh-empty');
