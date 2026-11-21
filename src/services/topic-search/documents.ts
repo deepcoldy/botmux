@@ -5,12 +5,13 @@ import { sessionQueueAnchor, type InboundRow, type ReplyRow, type SourceFile } f
 import type { FinalOutput } from './output-journal.js';
 import type { GroupMessage } from './group-context.js';
 
+const relatedSessionIdsSchema = z.string().nullable().transform(value => value === null ? null : z.array(z.string()).parse(JSON.parse(value)));
 export const entryKindSchema = z.enum(['inbound', 'reply', 'final', 'group', 'title']);
 export const entrySchema = z.object({
   source_path: z.string(), source_key: z.string(), kind: entryKindSchema,
   anchor: z.string(), anchor_explicit: z.number().int().min(0).max(1), dedup_key: z.string(), message_id: z.string().nullable(), session_id: z.string().nullable(),
   lark_app_id: z.string().nullable(), sender_type: z.string().nullable(), sender_id: z.string().nullable(),
-  sender_name: z.string().nullable(), time_ms: z.number().nullable(), text: z.string(),
+  sender_name: z.string().nullable(), time_ms: z.number().nullable(), text: z.string(), related_session_ids: relatedSessionIdsSchema,
 });
 export type Entry = z.infer<typeof entrySchema>;
 export const docSchema = entrySchema.omit({ source_path: true, source_key: true, anchor_explicit: true }).extend({
@@ -18,6 +19,7 @@ export const docSchema = entrySchema.omit({ source_path: true, source_key: true,
 });
 export type TopicDocument = z.infer<typeof docSchema>;
 export type SessionLookup = (sessionId: string) => Session | undefined;
+export type AnchorLookup = (anchor: string) => readonly Session[];
 export const kindPriority = (kind: Entry['kind']): number => ({ final: 0, group: 1, inbound: 2, reply: 3, title: 4 })[kind];
 export function timeMs(value: string | number | undefined): number | null {
   if (value === undefined) return null;
@@ -27,11 +29,13 @@ export function timeMs(value: string | number | undefined): number | null {
 function base(source: SourceFile, key: string): Entry {
   return { source_path: source.relativePath, source_key: key, kind: 'title', anchor: '', anchor_explicit: 0, dedup_key: '',
     message_id: null, session_id: null, lark_app_id: null, sender_type: null, sender_id: null,
-    sender_name: null, time_ms: null, text: '' };
+    sender_name: null, time_ms: null, text: '', related_session_ids: null };
 }
-export function inboundEntry(source: SourceFile, offset: number, row: InboundRow): Entry {
-  return { ...base(source, String(offset)), kind: 'inbound', anchor: source.key, dedup_key: row.messageId,
-    message_id: row.messageId, sender_type: row.senderType ?? null, sender_id: row.senderId ?? null,
+export function inboundEntry(source: SourceFile, offset: number, row: InboundRow, lookupAnchor: AnchorLookup): Entry {
+  const related = lookupAnchor(source.key);
+  return { ...base(source, String(offset)), kind: 'inbound', anchor: row.rootId || row.chatId || source.key, dedup_key: row.messageId,
+    message_id: row.messageId, lark_app_id: related[0]?.larkAppId ?? null, related_session_ids: related.length ? related.map(session => session.sessionId) : null,
+    sender_type: row.senderType ?? null, sender_id: row.senderId ?? null,
     sender_name: row.senderName ?? null, time_ms: timeMs(row.createTime), text: row.content };
 }
 export function replyEntry(source: SourceFile, offset: number, row: ReplyRow, lookup: SessionLookup): Entry | undefined {

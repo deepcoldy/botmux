@@ -11,10 +11,10 @@ import { readOutputJournalPage, type OutputPagePosition } from './output-journal
 import { beginPinnedRead } from './readonly-sqlite.js';
 import { readGroupContextPage, readGroupContextExistingIds, type GroupChange } from './group-context.js';
 import { entrySchema, docSchema, finalEntry, groupEntry, inboundEntry, kindPriority, replyEntry, titleEntry,
-  type Entry } from './documents.js';
+  type Entry, type AnchorLookup } from './documents.js';
 
 const APPLICATION_ID = 0x42545331;
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const TABLES = ['sync_meta', 'sources', 'gc_chat_state', 'gc_pending', 'entries', 'docs', 'recalled',
   'docs_fts', 'docs_fts_data', 'docs_fts_idx', 'docs_fts_docsize', 'docs_fts_config'];
 const SCHEMA = `
@@ -25,10 +25,10 @@ CREATE TABLE sources(path TEXT PRIMARY KEY,kind TEXT NOT NULL,dev INTEGER,ino IN
 CREATE TABLE gc_chat_state(source_path TEXT NOT NULL,chat_id TEXT NOT NULL,pruned_count INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(source_path,chat_id)) STRICT;
 CREATE TABLE gc_pending(source_path TEXT NOT NULL,seq INTEGER NOT NULL,reason TEXT NOT NULL,anchor TEXT,PRIMARY KEY(source_path,seq)) STRICT;
 CREATE TABLE entries(id INTEGER PRIMARY KEY,source_path TEXT NOT NULL,source_key TEXT NOT NULL,kind TEXT NOT NULL,anchor TEXT NOT NULL,dedup_key TEXT NOT NULL,
- message_id TEXT,session_id TEXT,lark_app_id TEXT,sender_type TEXT,sender_id TEXT,sender_name TEXT,time_ms INTEGER,text TEXT NOT NULL,anchor_explicit INTEGER NOT NULL DEFAULT 0,UNIQUE(source_path,source_key)) STRICT;
+ message_id TEXT,session_id TEXT,lark_app_id TEXT,sender_type TEXT,sender_id TEXT,sender_name TEXT,time_ms INTEGER,text TEXT NOT NULL,anchor_explicit INTEGER NOT NULL DEFAULT 0,related_session_ids TEXT,UNIQUE(source_path,source_key)) STRICT;
 CREATE INDEX ix_entries_merge ON entries(anchor,dedup_key);
 CREATE TABLE docs(id INTEGER PRIMARY KEY,anchor TEXT NOT NULL,dedup_key TEXT NOT NULL,kind TEXT NOT NULL,sources TEXT NOT NULL,
- message_id TEXT,session_id TEXT,lark_app_id TEXT,sender_type TEXT,sender_id TEXT,sender_name TEXT,time_ms INTEGER,text TEXT NOT NULL,UNIQUE(anchor,dedup_key)) STRICT;
+ message_id TEXT,session_id TEXT,lark_app_id TEXT,sender_type TEXT,sender_id TEXT,sender_name TEXT,time_ms INTEGER,text TEXT NOT NULL,related_session_ids TEXT,UNIQUE(anchor,dedup_key)) STRICT;
 CREATE TABLE recalled(source_path TEXT NOT NULL,message_id TEXT NOT NULL,PRIMARY KEY(source_path,message_id)) STRICT;
 CREATE VIRTUAL TABLE docs_fts USING fts5(text,content='docs',content_rowid='id',tokenize='trigram');`;
 export const sourceSchema = z.object({ path: z.string(), kind: z.enum(['queue','turn_sends','session_store','group_context','output_journal']),
@@ -159,12 +159,14 @@ function removeEntry(db: DatabaseSyncLike, sourcePath: string, sourceKey: string
 function putEntry(db: DatabaseSyncLike, entry: Entry, touched: Set<string>): void {
   touchEntry(db, entry.source_path, entry.source_key, touched);
   touched.add(entry.dedup_key);
-  db.prepare(`INSERT INTO entries(source_path,source_key,kind,anchor,dedup_key,message_id,session_id,lark_app_id,sender_type,sender_id,sender_name,time_ms,text,anchor_explicit)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_path,source_key) DO UPDATE SET kind=excluded.kind,anchor=excluded.anchor,
+  db.prepare(`INSERT INTO entries(source_path,source_key,kind,anchor,dedup_key,message_id,session_id,lark_app_id,sender_type,sender_id,sender_name,time_ms,text,anchor_explicit,related_session_ids)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_path,source_key) DO UPDATE SET kind=excluded.kind,anchor=excluded.anchor,
     dedup_key=excluded.dedup_key,message_id=excluded.message_id,session_id=excluded.session_id,lark_app_id=excluded.lark_app_id,
-    sender_type=excluded.sender_type,sender_id=excluded.sender_id,sender_name=excluded.sender_name,time_ms=excluded.time_ms,text=excluded.text,anchor_explicit=excluded.anchor_explicit`)
+    sender_type=excluded.sender_type,sender_id=excluded.sender_id,sender_name=excluded.sender_name,time_ms=excluded.time_ms,text=excluded.text,
+    anchor_explicit=excluded.anchor_explicit,related_session_ids=excluded.related_session_ids`)
     .run(entry.source_path,entry.source_key,entry.kind,entry.anchor,entry.dedup_key,entry.message_id,entry.session_id,
-      entry.lark_app_id,entry.sender_type,entry.sender_id,entry.sender_name,entry.time_ms,entry.text,entry.anchor_explicit);
+      entry.lark_app_id,entry.sender_type,entry.sender_id,entry.sender_name,entry.time_ms,entry.text,entry.anchor_explicit,
+      entry.related_session_ids === null ? null : JSON.stringify(entry.related_session_ids));
 }
 function removeSource(db: DatabaseSyncLike, path: string, touched: Set<string>): void {
   for (const raw of db.prepare('SELECT dedup_key FROM entries WHERE source_path=? UNION SELECT message_id AS dedup_key FROM recalled WHERE source_path=?').all(path,path)) {
@@ -193,9 +195,13 @@ function mergeDocuments(db: DatabaseSyncLike, touched: ReadonlySet<string>): voi
     const winner = entries[0];
     if (!winner || (winner.message_id && db.prepare('SELECT 1 FROM recalled WHERE message_id=? LIMIT 1').get(winner.message_id))) continue;
     const sources = [...new Set(entries.map(entry => entry.kind))].sort((a,b) => kindPriority(a)-kindPriority(b));
-    const inserted = db.prepare(`INSERT INTO docs(anchor,dedup_key,kind,sources,message_id,session_id,lark_app_id,sender_type,sender_id,sender_name,time_ms,text)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(winner.anchor,key,winner.kind,JSON.stringify(sources),winner.message_id,winner.session_id,
-        winner.lark_app_id,winner.sender_type,winner.sender_id,winner.sender_name,winner.time_ms,winner.text);
+    const related = [...new Set(entries.flatMap(entry => [
+      ...(entry.session_id ? [entry.session_id] : []),...(entry.related_session_ids ?? []),
+    ]))].sort();
+    const inserted = db.prepare(`INSERT INTO docs(anchor,dedup_key,kind,sources,message_id,session_id,lark_app_id,sender_type,sender_id,sender_name,time_ms,text,related_session_ids)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(winner.anchor,key,winner.kind,JSON.stringify(sources),winner.message_id,winner.session_id,
+        winner.lark_app_id,winner.sender_type,winner.sender_id,winner.sender_name,winner.time_ms,winner.text,
+        related.length ? JSON.stringify(related) : null);
     db.prepare('INSERT INTO docs_fts(rowid,text) VALUES(?,?)').run(inserted.lastInsertRowid,winner.text);
   }
 }
@@ -256,6 +262,29 @@ function reanchorEntries(db: DatabaseSyncLike, sessions: ReadonlyMap<string,Sess
   }
   mergeDocuments(db,touched);
 }
+function refreshInboundRelations(db: DatabaseSyncLike, lookupAnchor: AnchorLookup, unreadableAppIds: readonly string[]): void {
+  // related_session_ids may span apps. Freeze the whole refresh whenever any
+  // store is unreadable so a healthy app cannot erase an unreadable app's IDs.
+  if (unreadableAppIds.length) return;
+  const touched = new Set<string>();
+  const rowSchema = z.object({ source_path: z.string(),source_key: z.string(),dedup_key: z.string(),
+    lark_app_id: z.string().nullable(),related_session_ids: z.string().nullable() });
+  for (const raw of db.prepare("SELECT source_path,source_key,dedup_key,lark_app_id,related_session_ids FROM entries WHERE kind='inbound'").all()) {
+    const row = rowSchema.parse(raw);
+    if (!row.source_path.startsWith('queues/') || !row.source_path.endsWith('.jsonl')) continue;
+    const anchor = row.source_path.slice('queues/'.length,-'.jsonl'.length);
+    const sessions = lookupAnchor(anchor);
+    const relatedIds = sessions.map(session => session.sessionId).sort();
+    const related = relatedIds.length ? JSON.stringify(relatedIds) : null;
+    const appId = sessions[0]?.larkAppId ?? null;
+    if (row.related_session_ids === related && row.lark_app_id === appId) continue;
+    db.prepare('UPDATE entries SET related_session_ids=?,lark_app_id=? WHERE source_path=? AND source_key=?')
+      .run(related,appId,row.source_path,row.source_key);
+    touched.add(row.dedup_key);
+  }
+  mergeDocuments(db,touched);
+}
+
 function requireReadable(status: SourceStatus): void {
   if (status !== 'ready' && status !== 'empty') throw new Error(`topic_source_${status}`);
 }
@@ -293,6 +322,7 @@ export async function syncTopicIndex(dataDir: string, options: {
     let snapshot: ReturnType<typeof readTopicSessions> | undefined;
     const sessionsById = new Map<string,Session | undefined>();
     const sessionsByApp = new Map<string,Session[]>();
+    const sessionsByAnchor = new Map<string,Session[]>();
     const anchors = new Set<string>();
     const loadSnapshot = (): ReturnType<typeof readTopicSessions> => {
       if (snapshot) return snapshot;
@@ -301,6 +331,9 @@ export async function syncTopicIndex(dataDir: string, options: {
       for (const session of snapshot.sessions) {
         if (countedBadApps.has(session.larkAppId ?? '')) continue;
         sessionsById.set(session.sessionId,session); anchors.add(sessionQueueAnchor(session));
+        const anchor = sessionQueueAnchor(session);
+        const anchorSessions = sessionsByAnchor.get(anchor);
+        if (anchorSessions) anchorSessions.push(session); else sessionsByAnchor.set(anchor,[session]);
         const appId = session.larkAppId ?? '';
         const appSessions = sessionsByApp.get(appId);
         if (appSessions) appSessions.push(session); else sessionsByApp.set(appId,[session]);
@@ -312,6 +345,13 @@ export async function syncTopicIndex(dataDir: string, options: {
       if (full) loadSnapshot();
       if (!snapshot && !sessionsById.has(id)) sessionsById.set(id,readTopicSession(dataDir,id));
       return sessionsById.get(id);
+    };
+    const lookupAnchor = (anchor: string): readonly Session[] => {
+      if (full) loadSnapshot();
+      if (!snapshot && !sessionsByAnchor.has(anchor)) {
+        sessionsByAnchor.set(anchor,readTopicSessions(dataDir).sessions.filter(session => sessionQueueAnchor(session) === anchor));
+      }
+      return sessionsByAnchor.get(anchor) ?? [];
     };
     const kinds: SourceKind[] = full ? ['session_store','queue','turn_sends','group_context','output_journal']
       : ['queue','turn_sends','group_context','output_journal'];
@@ -383,7 +423,7 @@ export async function syncTopicIndex(dataDir: string, options: {
               if (page.reset && old) { removeSource(db,source.relativePath,touched); old = undefined; }
               result.malformedLines += page.malformedLines;
               for (const row of page.rows) {
-                const entry = row.row.kind === 'inbound' ? inboundEntry(source,row.offset,row.row.value)
+                const entry = row.row.kind === 'inbound' ? inboundEntry(source,row.offset,row.row.value,lookupAnchor)
                   : replyEntry(source,row.offset,row.row.value,lookupSession);
                 if (entry) putEntry(db,entry,touched);
               }
@@ -440,7 +480,13 @@ export async function syncTopicIndex(dataDir: string, options: {
           await finishGroupSync(db,source,groupRevision,getAnchors,sessionsChanged,stop,result);
         }
       }
-      if (kind === 'session_store' && sessionsChanged && !stop()) { loadSnapshot(); indexTransaction(db, () => reanchorEntries(db,sessionsById)); }
+      if (kind === 'session_store' && sessionsChanged && !stop()) {
+        loadSnapshot();
+        indexTransaction(db, () => {
+          reanchorEntries(db,sessionsById);
+          refreshInboundRelations(db,lookupAnchor,snapshot?.unreadableAppIds ?? []);
+        });
+      }
     }
     if (!stop()) indexTransaction(db, () => {
       for (const [path,revision] of sessionRevisions) {

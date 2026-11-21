@@ -42,7 +42,7 @@ export function createSessionContentSearch(deps: ContentSearchDependencies) {
       for (const topic of result.results) {
         const hit = topic.hits.items[0];
         if (!hit) continue;
-        for (const session of topic.sessions) {
+        for (const session of [...topic.sessions,...(topic.relatedSessions ?? [])]) {
           const row = byId.get(session.sessionId);
           if (!row || seen.has(row.sessionId)) continue;
           seen.add(row.sessionId);

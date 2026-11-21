@@ -71,6 +71,16 @@ describe('Dashboard content search', () => {
     expect([...f.search.mock.calls[0][1].visibleSessionIds!]).toEqual(['visible']);
   });
 
+  it('expands related source sessions even when the physical topic has no visible session row', async () => {
+    const f = fixture();
+    const cross = topic(['target'],'cross answer');
+    cross.relatedSessions = [{ sessionId: 'source',bot: 'bot',cliId: 'codex',status: 'active' }];
+    f.search.mockReturnValue({ query: 'needle',results: [cross],truncated: false });
+    const result = await f.run('needle','management',[{ sessionId: 'source' }]);
+    expect(result.sessions.map(row => row.sessionId)).toEqual(['source']);
+    expect(result.contentMatches).toEqual([{ sessionId: 'source',snippet: 'cross answer',time: 100 }]);
+  });
+
   it('does not settle before the asynchronous query completes', async () => {
     const f = fixture();
     let complete: ((value: QueryResult) => void) | undefined;

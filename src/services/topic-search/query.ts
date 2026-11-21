@@ -21,6 +21,8 @@ export interface TopicSummary {
   anchor: string; scope: 'chat' | 'thread'; chatId: string | null; chatName: string | null;
   title: string; link: string | null; lastActiveAt: number; status: 'open' | 'closed';
   sessions: { sessionId: string; bot: string; cliId: string | null; status: Session['status'] }[];
+  /** Sessions that delivered the message into this topic from another anchor. */
+  relatedSessions?: { sessionId: string; bot: string; cliId: string | null; status: Session['status'] }[];
   notes: string[];
 }
 export interface TopicHit {
@@ -87,22 +89,24 @@ function parseHit(raw: unknown): MatchingHit {
 }
 interface SessionIndex {
   byAnchor: Map<string, Session[]>;
+  byId: Map<string, Session>;
   ids: Set<string>;
 }
 interface HitNotes { metaMissing: boolean; replyTruncated: boolean }
 
 function indexSessions(sessions: readonly Session[]): SessionIndex {
   const byAnchor = new Map<string, Session[]>();
+  const byId = new Map<string, Session>();
   const ids = new Set<string>();
   for (const session of sessions) {
     const anchor = sessionQueueAnchor(session);
     const group = byAnchor.get(anchor);
     if (group) group.push(session); else byAnchor.set(anchor, [session]);
-    ids.add(session.sessionId);
+    byId.set(session.sessionId,session); ids.add(session.sessionId);
   }
   for (const group of byAnchor.values()) group.sort((a,b) =>
     (timeMs(b.lastMessageAt ?? b.createdAt) ?? 0)-(timeMs(a.lastMessageAt ?? a.createdAt) ?? 0) || a.sessionId.localeCompare(b.sessionId));
-  return { byAnchor, ids };
+  return { byAnchor, byId, ids };
 }
 function lastActiveAt(sessions: readonly Session[]): number {
   return sessions.reduce((latest, session) => Math.max(latest, timeMs(session.lastMessageAt ?? session.createdAt) ?? 0), 0);
@@ -114,9 +118,16 @@ function missingHitSession(hit: Pick<TopicDocument, 'kind' | 'session_id'>, sess
   return (hit.kind === 'reply' || hit.kind === 'final')
     && (hit.session_id === null || !sessions.ids.has(hit.session_id));
 }
-function summary(db: DatabaseSyncLike, anchor: string, sessionIndex: SessionIndex, bots: readonly BotDisplay[], hitNotes: HitNotes): TopicSummary {
+function summary(db: DatabaseSyncLike, anchor: string, sessionIndex: SessionIndex, bots: readonly BotDisplay[], hitNotes: HitNotes,
+  documents: readonly TopicDocument[]): TopicSummary {
   const sessions = sessionIndex.byAnchor.get(anchor) ?? [];
-  const representative = sessions[0];
+  const physicalIds = new Set(sessions.map(session => session.sessionId));
+  const relatedIds = new Set(documents.flatMap(doc => doc.related_session_ids ?? []));
+  const relatedSessions = [...relatedIds].map(id => sessionIndex.byId.get(id)).filter((session): session is Session => !!session)
+    .filter(session => !physicalIds.has(session.sessionId))
+    .sort((a,b) => (timeMs(b.lastMessageAt ?? b.createdAt) ?? 0)-(timeMs(a.lastMessageAt ?? a.createdAt) ?? 0) || a.sessionId.localeCompare(b.sessionId));
+  const displaySessions = sessions.length ? sessions : relatedSessions;
+  const representative = displaySessions[0];
   const scope = representative?.scope ?? (anchor.startsWith('oc_') ? 'chat' : 'thread');
   const chatId = representative?.chatId ?? (scope === 'chat' ? anchor : null);
   const bot = bots.find(item => item.larkAppId === representative?.larkAppId);
@@ -124,19 +135,22 @@ function summary(db: DatabaseSyncLike, anchor: string, sessionIndex: SessionInde
   const earliest = representative ? undefined : db.prepare("SELECT text FROM docs WHERE anchor=? AND kind='inbound' ORDER BY time_ms,id LIMIT 1").get(anchor);
   const title = representative?.title || (earliest ? z.object({ text: z.string() }).parse(earliest).text : anchor);
   const notes: string[] = [];
-  if (!sessions.length || hitNotes.metaMissing) notes.push('meta_missing');
-  const closed = sessions.length > 0 && sessions.every(session => session.status === 'closed');
+  if (!displaySessions.length || hitNotes.metaMissing) notes.push('meta_missing');
+  const closed = displaySessions.length > 0 && displaySessions.every(session => session.status === 'closed');
   if (closed && !db.prepare("SELECT 1 FROM docs WHERE anchor=? AND (kind IN ('reply','final') OR (kind='group' AND sender_type IN ('bot','app'))) LIMIT 1").get(anchor)) {
     notes.push('replies_removed_on_close');
   }
   if (hitNotes.replyTruncated) notes.push('reply_truncated');
+  const view = (session: Session) => ({ sessionId: session.sessionId,
+    bot: bots.find(item => item.larkAppId === session.larkAppId)?.name ?? session.larkAppId ?? '',
+    cliId: session.cliId ?? null,status: session.status });
   return { anchor,scope,chatId,chatName: representative?.chatDisplayName ?? null,title,
     link: !chatId ? null : scope === 'thread' && isNativeTopicId(threadId)
       ? threadAppLink(chatId,threadId,bot?.brand) : chatAppLink(chatId,bot?.brand),
-    lastActiveAt: lastActiveAt(sessions),
+    lastActiveAt: lastActiveAt(displaySessions),
     status: closed ? 'closed' : 'open',
-    sessions: sessions.map(session => ({ sessionId: session.sessionId, bot: bots.find(item => item.larkAppId === session.larkAppId)?.name
-      ?? session.larkAppId ?? '',cliId: session.cliId ?? null,status: session.status })), notes };
+    sessions: sessions.map(view),
+    ...(relatedSessions.length ? { relatedSessions: relatedSessions.map(view) } : {}),notes };
 }
 
 export interface TopicSearchOptions {
@@ -161,16 +175,25 @@ export function searchTopics(dataDir: string, input: SearchRequest, providedBots
   if (options.anchors?.size === 0 || (options.visibleSessionIds?.size === 0 && !options.sessions)) {
     return { query: request.query,results: [],truncated: false };
   }
+  const allSessions = options.sessions ?? readTopicSessions(dataDir).sessions;
   const scopedSessions = options.visibleSessionIds
-    ? (options.sessions ?? readTopicSessions(dataDir).sessions).filter(session => options.visibleSessionIds!.has(session.sessionId))
-    : options.sessions;
-  const effectiveAnchors = options.anchors ?? (options.visibleSessionIds
+    ? allSessions.filter(session => options.visibleSessionIds!.has(session.sessionId))
+    : allSessions;
+  const effectiveAnchors = options.anchors ? new Set(options.anchors) : (options.visibleSessionIds
     ? new Set((scopedSessions ?? []).map(sessionQueueAnchor)) : undefined);
   if (effectiveAnchors?.size === 0) return { query: request.query,results: [],truncated: false };
-  const allowedAnchors = effectiveAnchors ? JSON.stringify([...effectiveAnchors]) : undefined;
   let candidateTruncated = false;
   const db = openTopicIndex(dataDir,{ readOnly: true, busyTimeoutMs: options.busyTimeoutMs });
   try {
+    if (options.visibleSessionIds?.size && options.anchors === undefined) {
+      const visibleIds = JSON.stringify([...options.visibleSessionIds]);
+      const related = db.prepare(`SELECT DISTINCT anchor FROM entries
+        WHERE session_id IN (SELECT value FROM json_each(?))
+        OR EXISTS (SELECT 1 FROM json_each(entries.related_session_ids)
+          WHERE value IN (SELECT value FROM json_each(?)))`).all(visibleIds,visibleIds);
+      for (const row of related) effectiveAnchors!.add(z.object({ anchor: z.string() }).parse(row).anchor);
+    }
+    const allowedAnchors = effectiveAnchors ? JSON.stringify([...effectiveAnchors]) : undefined;
     const long = request.terms.filter(term => Array.from(term).length >= 3);
     const short = request.terms.filter(term => Array.from(term).length < 3);
     const matching = new Map<string, { terms: Set<string>; docs: Map<number, MatchingHit> }>();
@@ -202,7 +225,7 @@ export function searchTopics(dataDir: string, input: SearchRequest, providedBots
       }
       if (isLong) candidates = candidates ? new Set([...candidates].filter(anchor => anchors.has(anchor))) : anchors;
     }
-    const sessions = indexSessions(scopedSessions ?? readTopicSessions(dataDir).sessions);
+    const sessions = indexSessions(allSessions);
     const bots = configuredBots(providedBots);
     const botApps = new Set(bots.filter(bot => bot.name === request.bot).map(bot => bot.larkAppId));
     const ranked: Array<{ anchor: string; docs: MatchingHit[]; lastActiveAt: number; notes: HitNotes }> = [];
@@ -231,7 +254,7 @@ export function searchTopics(dataDir: string, input: SearchRequest, providedBots
       }
     }
     const results: TopicResult[] = selected.map(({ anchor, docs, notes }) => {
-      const topic = summary(db,anchor,sessions,bots,notes);
+      const topic = summary(db,anchor,sessions,bots,notes,fullByAnchor.get(anchor) ?? []);
       const hits = (fullByAnchor.get(anchor) ?? []).sort(compareHits);
       return { ...topic,hits: { count: docs.length,items: hits.map(doc => ({
         kind: doc.kind,messageId: doc.message_id ?? undefined,senderType: doc.sender_type ?? undefined,time: doc.time_ms,
@@ -261,7 +284,7 @@ export function showTopic(dataDir: string, target: string, limit = 200, provided
       metaMissing: rows.some(doc => missingHitSession(doc, sessions)),
       replyTruncated: rows.some(doc => doc.kind === 'reply' && doc.text.endsWith('…')),
     };
-    return { topic: summary(db,anchor,sessions,configuredBots(providedBots),notes),
+    return { topic: summary(db,anchor,sessions,configuredBots(providedBots),notes,rows),
       documents: rows.slice(0,limit),truncated: rows.length > limit };
   } finally { db.close(); }
 }

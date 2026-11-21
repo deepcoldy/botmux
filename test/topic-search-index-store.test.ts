@@ -178,6 +178,97 @@ describe('topic index synchronization and merge', () => {
     await syncTopicIndex(dataDir); expect(documents().find(doc => doc.message_id === 'om_message')?.kind).toBe('reply');
   });
 
+  it('preserves actual cross-chat anchors and every source session link through group merges and source removal', async () => {
+    const sourceA = session('om_source'); const sourceB = session('om_source'); const target = session('om_target');
+    init(app); target.status = 'closed'; updateSession(target); init('cli_detached',{ owner: false });
+    const path = jsonl('queues/om_source.jsonl',[{ messageId: 'om_cross',content: 'cross inbound body',rootId: 'om_target',chatId: 'oc_target',createTime: 1000,senderType: 'user' }]);
+    await syncTopicIndex(dataDir);
+    const related = [sourceA.sessionId,sourceB.sessionId].sort();
+    expect(documents().find(doc => doc.message_id === 'om_cross')).toMatchObject({ kind: 'inbound',anchor: 'om_target',related_session_ids: related });
+    for (const source of [sourceA,sourceB]) {
+      const result = searchTopics(dataDir,{ query: 'cross inbound' },[],{ visibleSessionIds: new Set([source.sessionId]) }).results[0];
+      expect(result).toMatchObject({ anchor: 'om_target' });
+      expect(result.relatedSessions?.map(session => session.sessionId).sort()).toEqual(related);
+    }
+    upsertGroupContextMessage(app,{ messageId: 'om_cross',chatId: 'oc_target',rootId: 'om_target',threadId: 'omt_target',conversationScope: 'thread',
+      senderId: 'ou_sender',senderType: 'user',msgType: 'text',text: 'cross inbound body',createTime: 1000,resourceRefs: [],sourceAppId: app });
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_cross')).toMatchObject({ kind: 'group',anchor: 'om_target',related_session_ids: related });
+    const afterGroup = searchTopics(dataDir,{ query: 'cross inbound' },[],{ visibleSessionIds: new Set([sourceA.sessionId]) }).results[0];
+    expect(afterGroup.anchor).toBe('om_target');
+    expect(afterGroup.relatedSessions?.map(session => session.sessionId).sort()).toEqual(related);
+    // A v3 database is rebuilt as derived data, then reindexed with the new link column.
+    const old = openTopicIndex(dataDir); old.exec('PRAGMA user_version=3'); old.close();
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_cross')).toMatchObject({ kind: 'group',anchor: 'om_target',related_session_ids: related });
+    rmSync(path); await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_cross')).toMatchObject({ kind: 'group',related_session_ids: null });
+    expect(searchTopics(dataDir,{ query: 'cross inbound' },[],{ visibleSessionIds: new Set([sourceA.sessionId]) }).results).toEqual([]);
+    _resetGroupContextStoreForTest(); rmSync(groupContextDbPath(app)); await syncTopicIndex(dataDir);
+
+    const normal = session('om_normal');
+    jsonl('queues/om_normal.jsonl',[{ messageId: 'om_normal_message',content: 'ordinary body',rootId: 'om_normal',chatId: 'oc_normal',createTime: 1000 }]);
+    await syncTopicIndex(dataDir);
+    const ordinary = searchTopics(dataDir,{ query: 'ordinary' }).results[0];
+    expect(ordinary).toMatchObject({ anchor: 'om_normal' });
+    expect(ordinary.relatedSessions ?? []).toEqual([]);
+    expect(ordinary.sessions.map(session => session.sessionId)).toEqual([normal.sessionId]);
+  });
+
+  it('backfills source links when session metadata arrives later and preserves them through unreadable stores', async () => {
+    session('om_target');
+    const path = jsonl('queues/om_source.jsonl',[{ messageId: 'om_late_1',content: 'late first',rootId: 'om_target',chatId: 'oc_target',createTime: 1000 }]);
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_late_1')).toMatchObject({ anchor: 'om_target',related_session_ids: null });
+    const source = session('om_source');
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_late_1')).toMatchObject({ related_session_ids: [source.sessionId] });
+    expect(searchTopics(dataDir,{ query: 'late first' },[],{ visibleSessionIds: new Set([source.sessionId]) }).results[0].anchor).toBe('om_target');
+    appendFileSync(path,JSON.stringify({ messageId: 'om_late_2',content: 'late second',rootId: 'om_target',chatId: 'oc_target',createTime: 2000 })+'\n');
+    await syncTopicIndex(dataDir);
+    for (const id of ['om_late_1','om_late_2']) expect(documents().find(doc => doc.message_id === id)).toMatchObject({ related_session_ids: [source.sessionId] });
+
+    renameSync(join(dataDir,'session-stores',app),join(dataDir,'saved_store'));
+    mkdirSync(join(dataDir,'session-stores',app),{ recursive: true });
+    writeFileSync(join(dataDir,'session-stores',app,'sessions.db'),'corrupt sqlite');
+    init('cli_other'); createSession('oc_other','om_other','other','group','thread'); init('cli_detached',{ owner: false });
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_late_1')).toMatchObject({ related_session_ids: [source.sessionId] });
+    rmSync(join(dataDir,'session-stores',app),{ recursive: true });
+    renameSync(join(dataDir,'saved_store'),join(dataDir,'session-stores',app));
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_late_1')).toMatchObject({ related_session_ids: [source.sessionId] });
+    rmSync(join(dataDir,'session-stores',app),{ recursive: true });
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_late_1')).toMatchObject({ related_session_ids: null });
+  });
+
+  it('preserves every app link when a non-first source store is unreadable', async () => {
+    const appA = 'cli_multi_a'; const appB = 'cli_multi_b';
+    init(appA); const sourceA = createSession('oc_source','om_source','source A','group','thread');
+    init(appB); const sourceB = createSession('oc_source','om_source','source B','group','thread');
+    init('cli_detached',{ owner: false });
+    session('om_target');
+    jsonl('queues/om_source.jsonl',[{ messageId: 'om_multi',content: 'multi app body',rootId: 'om_target',chatId: 'oc_target',createTime: 1000 }]);
+    await syncTopicIndex(dataDir);
+    const related = [sourceA.sessionId,sourceB.sessionId].sort();
+    expect(documents().find(doc => doc.message_id === 'om_multi')).toMatchObject({ related_session_ids: related });
+
+    renameSync(join(dataDir,'session-stores',appB),join(dataDir,'saved_b'));
+    mkdirSync(join(dataDir,'session-stores',appB),{ recursive: true });
+    writeFileSync(join(dataDir,'session-stores',appB,'sessions.db'),'corrupt sqlite');
+    init('cli_other'); createSession('oc_other','om_other','other','group','thread'); init('cli_detached',{ owner: false });
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_multi')).toMatchObject({ related_session_ids: related });
+    rmSync(join(dataDir,'session-stores',appB),{ recursive: true });
+    renameSync(join(dataDir,'saved_b'),join(dataDir,'session-stores',appB));
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_multi')).toMatchObject({ related_session_ids: related });
+    rmSync(join(dataDir,'session-stores',appB),{ recursive: true });
+    await syncTopicIndex(dataDir);
+    expect(documents().find(doc => doc.message_id === 'om_multi')).toMatchObject({ related_session_ids: [sourceA.sessionId] });
+  });
+
   it('deduplicates queue copies and message-id-less replies using contentHash', async () => {
     jsonl('queues/om_root.jsonl',[inbound()]); jsonl('queues/om_copy.jsonl',[inbound()]);
     const reply = { sessionId: 's',sentAtMs: 2000,previewText: 'reply',contentHash: 'same_hash',targetChatId: 'oc_chat' };
