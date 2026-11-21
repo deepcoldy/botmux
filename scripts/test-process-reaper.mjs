@@ -101,6 +101,9 @@ function registryFiles(root, basename) {
   if (existsSync(direct)) files.push(direct);
   let entries = [];
   try { entries = readdirSync(root, { withFileTypes: true }); } catch { return files; }
+  // Bun can surface undefined (rather than throwing) when the fence root is
+  // removed concurrently during teardown. A vanished root holds no registry.
+  if (!Array.isArray(entries)) return files;
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith('bmxt-')) continue;
     const nested = join(root, entry.name, basename);

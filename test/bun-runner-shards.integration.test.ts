@@ -14,7 +14,7 @@ function fixture(files: Record<string, string>) {
   temporary.push(dir);
   mkdirSync(join(dir, 'scripts'));
   mkdirSync(join(dir, 'test/helpers'), { recursive: true });
-  for (const file of ['run-bun-tests.mjs', 'bun-test-shards.mjs', 'duration-shards.mjs', 'test-concurrency.mjs', 'merge-bun-test-timings.mjs']) {
+  for (const file of ['run-bun-tests.mjs', 'bun-test-shards.mjs', 'duration-shards.mjs', 'test-concurrency.mjs', 'merge-bun-test-timings.mjs', 'test-process-reaper.mjs']) {
     copyFileSync(join(ROOT, 'scripts', file), join(dir, 'scripts', file));
   }
   copyFileSync(join(ROOT, 'test/helpers/bun-leg-selectors.ts'), join(dir, 'test/helpers/bun-leg-selectors.ts'));
