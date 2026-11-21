@@ -15,7 +15,7 @@ export { TMUX_SERVER_LOG_BASENAME } from '../../scripts/test-process-reaper.mjs'
 // would otherwise hand the end-of-run denial check that fixture as "denials",
 // and a mocked spawnSync would silently skip the private-server cleanup.
 const {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync,
+  appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync,
   realpathSync, rmSync, statSync, writeFileSync,
 } = { ...nodeFs };
 const { spawnSync } = { ...nodeChildProcess };
@@ -231,17 +231,28 @@ exec "$REAL" "$@"
 `;
 }
 
-/** Create the per-run fence (vitest globalSetup / bun preload). */
+/**
+ * Create the per-run fence (vitest globalSetup / bun preload).
+ *
+ * A Bun runner child sets BOTMUX_TMUX_FENCE_ROOTS to a manifest in its scratch
+ * directory. In that mode the root MUST stay at /tmp/bmxt-*: nesting it below
+ * the already-long scratch path can exceed Linux's 108-byte sockaddr_un limit
+ * for otherwise valid tmux labels. The manifest lets the outer runner find and
+ * reap every root if this process is killed before its afterAll teardown.
+ */
 export function createTmuxFence(env: NodeJS.ProcessEnv = process.env): TmuxFence {
-  const exactRoot = env.BOTMUX_TMUX_FENCE_ROOT;
-  if (exactRoot) {
-    if (!/^\/tmp\/bmxt-[A-Za-z0-9]+$/.test(exactRoot)) throw new Error(`invalid private tmux fence root: ${exactRoot}`);
-    mkdirSync(exactRoot, { recursive: true });
-    if (readdirSync(exactRoot).length !== 0) throw new Error(`private tmux fence root is not empty: ${exactRoot}`);
+  // The runner deliberately does not set ROOTS on Windows. Also ignore an
+  // inherited one here: Windows has no tmux socket, and /tmp is not a reliable
+  // system temp directory there; its runner supplies PARENT=scratch instead.
+  const manifest = process.platform === 'win32' ? undefined : env.BOTMUX_TMUX_FENCE_ROOTS;
+  const root = manifest || !env.BOTMUX_TMUX_FENCE_PARENT
+    ? mkdtempSync(FENCE_ROOT_PREFIX)
+    : mkdtempSync(join(env.BOTMUX_TMUX_FENCE_PARENT, 'bmxt-'));
+  if (manifest) {
+    // Synchronous registration closes the startup window before any test can
+    // spawn a detached server. Append because one process may create fixtures.
+    appendFileSync(manifest, `${root}\n`, 'utf8');
   }
-  const root = exactRoot ?? (env.BOTMUX_TMUX_FENCE_PARENT
-    ? mkdtempSync(join(env.BOTMUX_TMUX_FENCE_PARENT, 'bmxt-'))
-    : mkdtempSync(FENCE_ROOT_PREFIX));
   const denyLog = join(root, 'denied.log');
   const serverLog = join(root, TMUX_SERVER_LOG_BASENAME);
   writeFileSync(denyLog, '');

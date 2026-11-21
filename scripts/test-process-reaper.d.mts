@@ -1,5 +1,6 @@
 export declare const TMUX_SERVER_LOG_BASENAME: string;
 export declare const SANDBOX_SCRIPT_LOG_BASENAME: string;
+export declare const TMUX_FENCE_ROOTS_BASENAME: string;
 
 export interface RegisteredTmuxServer {
   pid: number;

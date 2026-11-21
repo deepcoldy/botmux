@@ -17,6 +17,9 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 export const TMUX_SERVER_LOG_BASENAME = 'tmux-servers.tsv';
 export const SANDBOX_SCRIPT_LOG_BASENAME = 'sandbox-scripts.log';
+// A Bun child records each short fence root here so its outer runner can reap
+// and remove roots that live outside the child's scratch directory.
+export const TMUX_FENCE_ROOTS_BASENAME = 'tmux-fence-roots.log';
 
 const PS_ENV = () => ({ ...process.env, LC_ALL: 'C' });
 const sleep = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);

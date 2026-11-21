@@ -33,8 +33,16 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
       it('leaves a private server for the outer runner', () => {
         const fence = createTmuxFence(process.env);
         applyTmuxFenceEnv(fence);
-        const socketRoot = process.env.TMUX_TMPDIR;
+        // A test fixture may create another fence after the preload's one.
+        // Each root must remain short and independently reapable.
+        const auxiliaryFence = createTmuxFence(process.env);
+        expect(auxiliaryFence.root).not.toBe(fence.root);
+        const socketRoot = process.env.TMUX_TMPDIR!;
         const label = 'botmux-osc7501-45772-144f3677-cd8c-4889-936b-0777ee1f0ebd';
+        const uid = typeof process.getuid === 'function' ? process.getuid() : 0;
+        const socket = join(socketRoot, \`tmux-\${uid}\`, label);
+        // Linux sockaddr_un.sun_path is 108 bytes INCLUDING the trailing NUL.
+        expect(Buffer.byteLength(socket, 'utf8')).toBeLessThanOrEqual(107);
         const tmux = join(fence.binDir, 'tmux');
         const started = spawnSync(tmux, ['-L', label, 'new-session', '-d', '-s', 'leak', 'sleep 60'], { encoding: 'utf8' });
         expect(started.status).toBe(0);
@@ -75,6 +83,80 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
       if (ref && testProcessIdentity(ref.pid) === ref.identity) {
         try { process.kill(ref.pid, 'SIGKILL'); } catch { /* already gone */ }
       }
+    }
+  }, 90_000);
+
+  it('reaps the scratch registry despite a truncated fence-root manifest', async () => {
+    const root = mkdtempSync('/tmp/bmx-bun-runner-broken-manifest-');
+    roots.push(root);
+    mkdirSync(join(root, 'test'));
+    symlinkSync(resolve('test/helpers'), join(root, 'test', 'helpers'), 'dir');
+    symlinkSync(resolve('node_modules'), join(root, 'node_modules'), 'dir');
+    const pidFile = join(root, 'sandbox.pid');
+    const identityFile = join(root, 'sandbox.identity');
+    const scratchFile = join(root, 'scratch.path');
+    const fenceRootFile = join(root, 'fence.path');
+    const readyFile = join(root, 'sandbox.ready');
+    const script = join(root, 'fake-cli.mjs');
+    writeFileSync(script, `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(readyFile)}, '1');\nsetInterval(() => {}, 1000);\n`);
+    const fenceHelper = pathToFileURL(resolve('test/helpers/tmux-fence.ts')).href;
+    const reaperHelper = pathToFileURL(resolve('scripts/test-process-reaper.mjs')).href;
+    writeFileSync(join(root, 'test', 'broken-manifest.test.ts'), `
+      import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+      import { dirname, join } from 'node:path';
+      import { spawn } from 'node:child_process';
+      import { expect, it } from 'bun:test';
+      import { createTmuxFence } from ${JSON.stringify(fenceHelper)};
+      import { registerSandboxScriptForCleanup, testProcessIdentity } from ${JSON.stringify(reaperHelper)};
+      it('leaves a registered process and a partial manifest', async () => {
+        const manifest = process.env.BOTMUX_TMUX_FENCE_ROOTS!;
+        const scratch = dirname(manifest);
+        const fence = createTmuxFence(process.env);
+        const script = ${JSON.stringify(script)};
+        registerSandboxScriptForCleanup(script, {
+          ...process.env, BOTMUX_TEST_SANDBOX_SCRIPT_LOG: join(scratch, 'sandbox-scripts.log'),
+        });
+        const child = spawn(process.execPath, [script], { detached: true, stdio: 'ignore' });
+        child.unref();
+        expect(child.pid).toBeGreaterThan(1);
+        for (let i = 0; i < 100 && !existsSync(${JSON.stringify(readyFile)}); i++) {
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        expect(existsSync(${JSON.stringify(readyFile)})).toBe(true);
+        writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+        writeFileSync(${JSON.stringify(identityFile)}, testProcessIdentity(child.pid!));
+        writeFileSync(${JSON.stringify(scratchFile)}, scratch);
+        writeFileSync(${JSON.stringify(fenceRootFile)}, fence.root);
+        // No trailing newline: this is a partial record, not a root to delete.
+        appendFileSync(manifest, '/tmp/bm');
+      });
+    `);
+
+    const result = spawnSync(process.execPath, [resolve('scripts/run-bun-tests.mjs')], {
+      cwd: root, encoding: 'utf8', timeout: 60_000,
+      env: { ...process.env, CI: 'true', BOTMUX_BUN_TEST_CONCURRENCY: '1' },
+    });
+    let pid = 0;
+    let identity = '';
+    let scratch = '';
+    let fenceRoot = '';
+    try {
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
+      expect(result.stderr).toContain('invalid tmux fence root record');
+      pid = Number(readFileSync(pidFile, 'utf8'));
+      identity = readFileSync(identityFile, 'utf8');
+      scratch = readFileSync(scratchFile, 'utf8');
+      fenceRoot = readFileSync(fenceRootFile, 'utf8');
+      expect(testProcessIdentity(pid)).not.toBe(identity);
+      // The malformed manifest fails the run and preserves both directories.
+      expect(existsSync(scratch)).toBe(true);
+      expect(existsSync(fenceRoot)).toBe(true);
+    } finally {
+      if (pid > 1 && identity && testProcessIdentity(pid) === identity) {
+        try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+      if (scratch) rmSync(scratch, { recursive: true, force: true });
+      if (fenceRoot) rmSync(fenceRoot, { recursive: true, force: true });
     }
   }, 90_000);
 
