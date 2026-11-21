@@ -115,6 +115,7 @@ vi.mock('../src/core/session-manager.js', async () => {
 });
 
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
 
 import { registerBot, getBot } from '../src/bot-registry.js';
 import {
@@ -181,6 +182,14 @@ function resumeRegisters(): void {
 }
 
 const replies = (): string[] => mocks.replyMessage.mock.calls.map(call => String(call[2] ?? ''));
+
+function writeFollowBinding(sessionId: string, followThreadEpoch?: string): void {
+  recordBridgeReplyMarker({
+    dataDir: mocks.dataDir, sessionId, sentAtMs: 1000, messageId: 'om_external_followed_root',
+    deliveryKind: 'detoured_send', content: 'cross-chat', targetChatId: 'oc_external_followed',
+    crossChatFollowThread: 'at', followThreadEpoch,
+  });
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -308,6 +317,68 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(mocks.resumeSession).not.toHaveBeenCalled();
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.createdSessions[0].continuity).toMatchObject({ mode: 'fresh-requested', previousSessionId: 'sess-live' });
+  });
+
+  it('cross-chat follow-up treats @session fresh as literal and never closes the origin session', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const { data, ctx } = event('@session fresh\n换一件事', 'bot');
+    ctx.crossChatThreadFollowUp = {
+      sourceSessionId: 'sess-live', sourceChatId: CHAT, followedChatId: 'oc_external_followed',
+      followedRootMessageId: 'om_external_followed_root', scope: 'thread', anchor: ROOT,
+    };
+    writeFollowBinding('sess-live');
+    await handleThreadReply(data, ctx);
+    expect(mocks.closeSession).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.get(sessionKey(ROOT, APP))?.session.sessionId).toBe('sess-live');
+    expect(String(mocks.forkWorker.mock.calls[0]?.[1].content)).toContain('@session fresh');
+  });
+
+  it('rejects a cross-chat follow-up when the source lifecycle changed before admission', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    source.session.followThreadEpoch = 'epoch-new';
+    writeFollowBinding('sess-live', 'epoch-old');
+    const { data, ctx } = event('stale cross-chat turn', 'bot');
+    ctx.crossChatThreadFollowUp = {
+      sourceSessionId: 'sess-live', sourceChatId: CHAT, followedChatId: 'oc_external_followed',
+      followedRootMessageId: 'om_external_followed_root', scope: 'thread', anchor: ROOT,
+      followThreadEpoch: 'epoch-old',
+    };
+    await handleThreadReply(data, ctx);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.resumeSession).not.toHaveBeenCalled();
+  });
+
+  it('rejects a cross-chat follow-up when the source closes during attachment download', async () => {
+    resumeRegisters();
+    await mocks.resumeSession('sess-live');
+    mocks.resumeSession.mockClear();
+    const source = activeSessions.get(sessionKey(ROOT, APP))!;
+    source.session.followThreadEpoch = 'epoch-old';
+    writeFollowBinding('sess-live', 'epoch-old');
+    let finishDownload!: (value: { attachments: never[]; needLogin: boolean }) => void;
+    mocks.downloadResources.mockImplementationOnce(() => new Promise(resolve => { finishDownload = resolve; }));
+    const { data, ctx } = event('download waits for lifecycle', 'bot');
+    ctx.crossChatThreadFollowUp = {
+      sourceSessionId: 'sess-live', sourceChatId: CHAT, followedChatId: 'oc_external_followed',
+      followedRootMessageId: 'om_external_followed_root', scope: 'thread', anchor: ROOT,
+      followThreadEpoch: 'epoch-old',
+    };
+    const handling = handleThreadReply(data, ctx);
+    await vi.waitFor(() => expect(mocks.downloadResources).toHaveBeenCalled());
+    source.session.status = 'closed';
+    source.session.followThreadEpoch = 'epoch-new';
+    activeSessions.delete(sessionKey(ROOT, APP));
+    finishDownload({ attachments: [], needLogin: false });
+    await handling;
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(source.session.replyTargets?.[ctx.messageId]?.crossChatOrigin).toBeUndefined();
   });
 
   it('a refused close keeps the live session handling the message', async () => {

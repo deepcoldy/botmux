@@ -48,7 +48,7 @@ const nodePath = await import('node:path');
 const nodeOs = await import('node:os');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
-const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
+const { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } = await import('../src/core/reply-target.js');
 const { readDispatchRegistryLoose, revokeWorkflowHandoff, lookupWorkflowHandoff } = await import('../src/core/workflow-handoff-binding.js');
 const { workflowDelegationRefusal, checkWorkflowHandoffIdentityTarget, inheritWorkflowDelegation } = await import('../src/core/workflow-handoff-identity.js');
 const { authorityForDispatch, deliverDispatchWithUser } = await import('../src/core/dispatch-user-delegation.js');
@@ -127,7 +127,7 @@ async function receiver(opts: { self?: boolean; alsoApproved?: string[]; main?: 
   const members = new Set([INITIATOR_OU_IN[appId]!]);
   const scope: Record<string, any> = {
     config: { session: { dataDir: world.dataDir } },
-    pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
+    pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveDispatchUser, dispatchCallerFromReply,
     getBot: () => ({ config: botConfig(appId, ['bytedcli', 'lark-cli']) }),
     loadOrCreateDispatchReportBindingSecret: () => SECRET,
     // The target app's own contact directory: union_id → ITS open_id.

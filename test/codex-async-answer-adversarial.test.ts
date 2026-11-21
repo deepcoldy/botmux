@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable, codexAsyncSteerTargetMatches } from '../src/services/codex-async-user-input.js';
 import { buildCodexAppTurnStartParams, supportsClientUserMessageId } from '../src/adapters/cli/codex-app-turn.js';
 import { productionFunction, productionClass, delivery, deliveryIsCurrent } from './helpers/codex-async-answer-function-harness.js';
-import { beginReplyTargetTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { beginReplyTargetTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
 import { publishTurnCliIdentity } from '../src/core/turn-cli-identity.js';
 import { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } from '../src/core/workflow-event-turn.js';
@@ -59,7 +59,7 @@ function daemonScope(): Record<string, any> {
     randomUUID: () => 'probe', getBot: () => ({ config: {}, botName: 'Bot', botOpenId: 'ou_bot' }),
     asyncOriginMessageId: 'om_original', asyncOriginTurn: 'om_original', audience: { kind: 'human', answererOpenId: 'ou_owner' },
     boundAsk: { sessionId: 'session', larkAppId: 'app', chatId: 'oc_chat', rootMessageId: 'om_root' },
-    beginReplyTargetTurn: vi.fn(), sessionPromptInjection: () => undefined,
+    beginReplyTargetTurn: vi.fn(), registryTurnMayAuthenticateHuman, sessionPromptInjection: () => undefined,
     buildFollowUpCliInput: (_text: string, _session: string, opts: any) => ({ content: _text, codexAppInput: { text: opts.codexAppText } }),
     documentDelivery: undefined, asyncDocumentTarget: undefined,
     noteTurnReceived: vi.fn(async () => undefined),

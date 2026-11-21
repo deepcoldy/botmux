@@ -94,6 +94,8 @@ import {
   markMojoClosePrepared,
   finishMojoCloseAbort,
   closeSession,
+  cleanupSessionBridgeSendMarkers,
+  registerSessionBridgeSendMarkerCleanupFence,
   reactivateClosedSession,
   updateSession,
   updateSessionPid,
@@ -128,6 +130,9 @@ import {
 } from '../src/services/session-store.js';
 import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lane-outbound-provenance.js';
 import { topicResumeBlockReason } from '../src/core/topic-session-continuity.js';
+import { recordBridgeReplyMarker } from '../src/services/bridge-reply-marker.js';
+import { resolveCrossChatFollowedThread } from '../src/services/cross-chat-thread-binding.js';
+import { crossChatFollowThreadPath } from '../src/services/cross-chat-follow-thread-store.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 import { paneLaunchDir, writePaneLaunchFile } from '../src/adapters/backend/pane-launch.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
@@ -3347,6 +3352,80 @@ describe('closeSession()', () => {
 });
 
 describe('reactivateClosedSession()', () => {
+  it('does not revive a late cross-chat binding from the previous lifecycle', () => {
+    const session = createSession('oc_origin', 'om_root', 'Cross Chat Lifecycle');
+    const oldEpoch = session.followThreadEpoch;
+    const marker = {
+      dataDir: tempDir, sessionId: session.sessionId, sentAtMs: 1000, messageId: 'om_sent_to_b',
+      deliveryKind: 'detoured_send' as const, content: 'cross-chat', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at' as const, followThreadEpoch: oldEpoch,
+    };
+    recordBridgeReplyMarker(marker);
+    const resolve = () => resolveCrossChatFollowedThread({
+      dataDir: tempDir, larkAppId: session.larkAppId ?? 'test-app', chatId: 'oc_followed',
+      candidateRootIds: ['om_sent_to_b'],
+      sessions: [{
+        sessionId: session.sessionId, larkAppId: session.larkAppId ?? 'test-app', chatId: session.chatId,
+        rootMessageId: session.rootMessageId, scope: 'chat', status: session.status,
+        followThreadEpoch: session.followThreadEpoch,
+      }],
+    });
+    expect(resolve()).not.toBeNull();
+
+    closeSession(session.sessionId);
+    recordBridgeReplyMarker({ ...marker, sentAtMs: 2000 });
+    const resumed = reactivateClosedSession(session.sessionId);
+    expect(resumed.ok).toBe(true);
+    expect(session.followThreadEpoch).toBeDefined();
+    expect(session.followThreadEpoch).not.toBe(oldEpoch);
+    expect(resolve()).toBeNull();
+  });
+
+  it('does not let an old cleanup fence delete a resumed lifecycle binding', async () => {
+    const session = createSession('oc_origin', 'om_root', 'Deferred Binding Cleanup');
+    let release!: () => void;
+    const fence = new Promise<void>(resolve => { release = resolve; });
+    registerSessionBridgeSendMarkerCleanupFence(session.sessionId, fence);
+    closeSession(session.sessionId);
+    cleanupSessionBridgeSendMarkers(session.sessionId);
+    expect(reactivateClosedSession(session.sessionId).ok).toBe(true);
+    recordBridgeReplyMarker({
+      dataDir: tempDir, sessionId: session.sessionId, sentAtMs: 1000, messageId: 'om_new_lifecycle',
+      deliveryKind: 'detoured_send', content: 'new lifecycle', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at', followThreadEpoch: session.followThreadEpoch,
+    });
+
+    release();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    // The old fence used to unlink the new lifecycle file immediately.
+    expect(existsSync(crossChatFollowThreadPath(tempDir, session.sessionId))).toBe(true);
+  });
+
+  it('assigns a new epoch when resuming a pre-epoch closed row', () => {
+    const session = createSession('oc_origin', 'om_root', 'Legacy Closed Cross Chat');
+    closeSession(session.sessionId);
+    session.followThreadEpoch = undefined;
+    updateSession(session);
+    recordBridgeReplyMarker({
+      dataDir: tempDir, sessionId: session.sessionId, sentAtMs: 1000, messageId: 'om_sent_to_b',
+      deliveryKind: 'detoured_send', content: 'legacy binding', targetChatId: 'oc_followed',
+      crossChatFollowThread: 'at',
+    });
+
+    const resumed = reactivateClosedSession(session.sessionId);
+    expect(resumed.ok).toBe(true);
+    expect(session.followThreadEpoch).toBeDefined();
+    expect(resolveCrossChatFollowedThread({
+      dataDir: tempDir, larkAppId: session.larkAppId ?? 'test-app', chatId: 'oc_followed',
+      candidateRootIds: ['om_sent_to_b'],
+      sessions: [{
+        sessionId: session.sessionId, larkAppId: session.larkAppId ?? 'test-app', chatId: session.chatId,
+        rootMessageId: session.rootMessageId, scope: 'chat', status: session.status,
+        followThreadEpoch: session.followThreadEpoch,
+      }],
+    })).toBeNull();
+  });
+
   it('still reactivates when the structured session turns side-store is unreadable', () => {
     const session = createSession('chat-turns-corrupt', 'root-turns-corrupt', 'Corrupt Turns Store');
     closeSession(session.sessionId);

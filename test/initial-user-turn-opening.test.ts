@@ -1016,6 +1016,7 @@ describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)',
     messageListener: false,
     vcMeetingReceiver: false,
     vcMeetingImTurnOrigin: false,
+    crossChatFollowUp: false,
   };
 
   it('authorizes ONLY a positive human sender with no special semantics', () => {
@@ -1032,7 +1033,7 @@ describe('computeCodexAppSteerable — fail-closed positive-human gate (R7-B1)',
   it('each special-source fact independently forces serial', () => {
     for (const key of [
       'adopted', 'isForeignBot', 'isBotSenderType', 'substituteTrigger',
-      'controlRewrite', 'messageListener', 'vcMeetingReceiver', 'vcMeetingImTurnOrigin',
+      'controlRewrite', 'messageListener', 'vcMeetingReceiver', 'vcMeetingImTurnOrigin', 'crossChatFollowUp',
     ] as const) {
       expect(computeCodexAppSteerable({ ...humanFacts, [key]: true })).toBe(false);
     }

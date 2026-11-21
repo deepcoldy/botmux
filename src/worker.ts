@@ -20274,6 +20274,7 @@ function restoreCodexAppAttestedTurn(
   if (entry.turnId !== signedTurnId || entry.dispatchId !== reservations[0].dispatchId
       || entry.turnId !== reservations[0].turnId
       || entry.dispatchAttempt !== reservations[0].dispatchAttempt
+      || entry.crossChatOrigin
       || entry.codexAppSteerable !== true || entry.replyTargetSenderIsBot !== false
       || typeof sender !== 'string' || !sender.startsWith('ou_') || !lastInitConfig?.larkAppId) return;
   const caller: TrustedCaller = {

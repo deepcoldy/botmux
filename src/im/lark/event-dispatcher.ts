@@ -3263,6 +3263,9 @@ export interface RoutingContext {
   commandTrigger?: CommandTriggerMatch;
   /** This turn was triggered by a configured group message listener. */
   messageListener?: MessageListenerMatch;
+  /** This turn arrived in another group's thread on a message sent by this
+   *  bot's session in `sourceChatId` (follow-thread-at). */
+  crossChatThreadFollowUp?: import('../../services/cross-chat-thread-binding.js').CrossChatFollowedThreadMatch;
   /** Daemon-minted turn created after a requester accepted a Completion
    * Proposal. It has no native inbound Lark message, so consumers must not
    * emit message reactions, quote its synthetic turn id, or run unrelated
@@ -3939,6 +3942,12 @@ async function dispatchHumanMessageViaHandlers(
   if (key) pendingMessageTriggers.add(key);
   let completed = false;
   try {
+    if (payload.ctx.crossChatThreadFollowUp) {
+      const targetAnchor = payload.ctx.runtimeRoutingAnchor ?? payload.ctx.anchor;
+      await serializeByAnchor(targetAnchor, () => handlers.handleThreadReply(payload.data, payload.ctx), capMs);
+      completed = true;
+      return;
+    }
     const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId)
       ?? payload.ownsSession;
     if (handlers.handlePrincipalLaneMessage
@@ -4250,6 +4259,14 @@ export interface EventHandlers {
   ) => SubtopicMentionlessHandoff | null | Promise<SubtopicMentionlessHandoff | null>;
   /** Resolve a persisted topic reply alias back to its owning chat-scope session. */
   resolveReplyThreadAlias?: (rootId: string, chatId: string, larkAppId: string) => { chatId: string; sessionId: string; anchor?: string } | null;
+  /** Resolve whether an inbound message in `chatId` under `candidateRootIds`
+   *  replies to a cross-chat message sent by an active session of `larkAppId`
+   *  in another chat. */
+  resolveCrossChatFollowedThread?: (
+    candidateRootIds: readonly string[],
+    chatId: string,
+    larkAppId: string,
+  ) => import('../../services/cross-chat-thread-binding.js').CrossChatFollowedThreadMatch | null;
   /** True when this chat's chat-scope session already answered `rootId` as a FLAT
    *  top-level turn. Identifies the "user @'d at top level, then opened a 话题 on
    *  that same message" case, where the regular-group fold must keep the turn in
@@ -5940,6 +5957,46 @@ export function createLarkEventDispatcherRuntime(
         if (botTalk.reason === 'sameOwnerBot') {
           learnSameOwnerSiblingCrossRef(config.session.dataDir, larkAppId, senderOpenId, senderUnionId);
         }
+        const botCrossChatCandidates = [message.root_id, message.parent_id]
+          .filter((id): id is string => typeof id === 'string' && id.startsWith('om_'));
+        const botCrossChatFollowUp = explicitlyMentionedThisBot
+          && !substituteTrigger
+          && chatType === 'group'
+          && botCrossChatCandidates.length > 0
+          && botTalk.reason !== 'blocked'
+          ? (handlers.resolveCrossChatFollowedThread?.(botCrossChatCandidates, chatId, larkAppId) ?? null)
+          : null;
+        if (botCrossChatFollowUp) {
+          logger.info(
+            `[cross-chat-thread:${larkAppId}] bot @mention in chat=${chatId.substring(0, 12)} `
+            + `root=${botCrossChatFollowUp.followedRootMessageId.substring(0, 12)} → `
+            + `sourceChat=${botCrossChatFollowUp.sourceChatId.substring(0, 12)} session=${botCrossChatFollowUp.sourceSessionId.substring(0, 8)}`,
+          );
+          const routedCtx: RoutingContext = {
+            scope: botCrossChatFollowUp.scope,
+            anchor: botCrossChatFollowUp.anchor,
+            ...(botCrossChatFollowUp.runtimeRoutingAnchor
+              ? { runtimeRoutingAnchor: botCrossChatFollowUp.runtimeRoutingAnchor }
+              : {}),
+            chatId: botCrossChatFollowUp.sourceChatId,
+            messageId,
+            chatType: 'group',
+            larkAppId,
+            crossChatThreadFollowUp: botCrossChatFollowUp,
+          };
+          const targetAnchor = routedCtx.runtimeRoutingAnchor ?? routedCtx.anchor;
+          if (primary) {
+            preparePrimaryRoutingContext(routedCtx, primary);
+            if (await assertPrimaryRouteOwner(routedCtx, primary) === 'retry') {
+              return primaryResult(routedCtx, primary);
+            }
+            await serializeByAnchor(targetAnchor, () => handlers.handleThreadReply(data, routedCtx), 0);
+            return primaryResult(routedCtx, primary);
+          }
+          void serializeByAnchor(targetAnchor, () => handlers.handleThreadReply(data, routedCtx), 0)
+            .catch(err => logger.error(`Error handling cross-chat bot @mention: ${err}`));
+          return;
+        }
         if (botTalk.allowed) {
           await promoteExplicitP2pTopicIfNeeded({
             larkAppId, chatId, chatType, message, routing: ctx, routingSource: decision.source,
@@ -6548,10 +6605,34 @@ export function createLarkEventDispatcherRuntime(
 
       let ownsSession = handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false;
 
-      if (!importedTopicCoordinatorFolded && !yieldToImportedTopicHandler) {
-        const ownsThreadSessionBeforeFold = routing.scope === 'thread'
-          ? (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)
-          : false;
+      const ownsThreadSessionBeforeFold = routing.scope === 'thread'
+        ? (handlers.isSessionOwner?.(routing.anchor, larkAppId) ?? false)
+        : false;
+      const candidateCrossChatRoots = [message.root_id, message.parent_id]
+        .filter((id): id is string => typeof id === 'string' && id.startsWith('om_'));
+      const crossChatFollowUp = !forceTopicApplied
+        && !ownsThreadSessionBeforeFold
+        && !messageListener
+        && !substituteTrigger
+        && explicitlyMentionedThisBot
+        && chatType === 'group'
+        && candidateCrossChatRoots.length > 0
+        && evaluateTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType).reason !== 'blocked'
+        ? (handlers.resolveCrossChatFollowedThread?.(candidateCrossChatRoots, chatId, larkAppId) ?? null)
+        : null;
+      if (crossChatFollowUp) {
+        isAllowed = true;
+        routing.scope = crossChatFollowUp.scope;
+        routing.anchor = crossChatFollowUp.anchor;
+        routingSource = crossChatFollowUp.scope === 'chat' ? 'regular-group-chat' : 'real-thread';
+        replyRootId = undefined;
+        ownsSession = true;
+        logger.info(
+          `[cross-chat-thread:${larkAppId}] human @mention in chat=${chatId.substring(0, 12)} `
+          + `root=${crossChatFollowUp.followedRootMessageId.substring(0, 12)} → `
+          + `sourceChat=${crossChatFollowUp.sourceChatId.substring(0, 12)} session=${crossChatFollowUp.sourceSessionId.substring(0, 8)}`,
+        );
+      } else if (!importedTopicCoordinatorFolded && !yieldToImportedTopicHandler) {
         const foldedReplyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
           larkAppId, chatId, chatType, message, routing, forceTopicApplied, mentionedThisBot: explicitlyMentionedThisBot, ownsThreadSession: ownsThreadSessionBeforeFold,
           answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
@@ -6587,7 +6668,7 @@ export function createLarkEventDispatcherRuntime(
       // Skip p2p: a DM is always 'p2p' and can never be a topic group, so the
       // check can only waste a forceRefresh roundtrip (relevant now that
       // p2pMode==='chat' makes DMs land on chat-scope).
-      if (routing.scope === 'chat' && ownsSession && chatType !== 'p2p') {
+      if (!crossChatFollowUp && routing.scope === 'chat' && ownsSession && chatType !== 'p2p') {
         const freshMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
         if (freshMode === 'topic') {
           logger.info(
@@ -6606,7 +6687,7 @@ export function createLarkEventDispatcherRuntime(
         }
       }
 
-      const summaryCommandMatch = await resolveSummaryCommandMatch({
+      const summaryCommandMatch = crossChatFollowUp ? undefined : await resolveSummaryCommandMatch({
         larkAppId,
         chatId,
         chatType,
@@ -6645,7 +6726,7 @@ export function createLarkEventDispatcherRuntime(
       // stays in the buffer and flushes on its original timer. Paired seeds
       // only arise under never/ambient modes, where a legitimate merge always
       // requires isAllowed anyway.
-      if (!yieldToImportedTopicHandler && senderOpenId && isAllowed && message.root_id && !isControlCommand) {
+      if (!crossChatFollowUp && !yieldToImportedTopicHandler && senderOpenId && isAllowed && message.root_id && !isControlCommand) {
         await waitForSeedRoutingGate(message.root_id);
         const pairingInput = {
           larkAppId,
@@ -6751,7 +6832,7 @@ export function createLarkEventDispatcherRuntime(
         //     冲本 bot 来的，所以用 commandLeadsMessage 放行（见其定义处）。
         //   • 只认普通群顶层（regular-group-*）：话题群（topic-chat）与话题内回复
         //     （real-thread）各有自己的续话规则，不该被一条裸命令另开一路。
-        const commandTriggerCandidate = isAllowed
+        const commandTriggerCandidate = !crossChatFollowUp && isAllowed
           && (routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread')
           && triggeredCommand
           ? matchCommandTrigger(larkAppId, chatId, triggeredCommand, resolvePassthroughCommands(larkAppId))
@@ -6832,7 +6913,8 @@ export function createLarkEventDispatcherRuntime(
           );
           return;
         }
-        const relax = (!!replyRootId && isAllowed)
+        const relax = !!crossChatFollowUp
+          || (!!replyRootId && isAllowed)
           || (!!substituteTrigger && isAllowed)
           || !!messageListener
           || (isAllowed && mentionMode === 'never')
@@ -6942,12 +7024,16 @@ export function createLarkEventDispatcherRuntime(
         );
       }
       const ctx: RoutingContext = {
-        chatId,
+        chatId: crossChatFollowUp?.sourceChatId ?? chatId,
         messageId,
         chatType,
         larkAppId,
         ...routing,
-        regularGroupTopLevel: routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread',
+        ...(crossChatFollowUp?.runtimeRoutingAnchor
+          ? { runtimeRoutingAnchor: crossChatFollowUp.runtimeRoutingAnchor }
+          : {}),
+        ...(crossChatFollowUp ? { crossChatThreadFollowUp: crossChatFollowUp } : {}),
+        regularGroupTopLevel: !crossChatFollowUp && (routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread'),
         replyRootId,
         promptOverride,
         commandTrigger,
@@ -6975,7 +7061,7 @@ export function createLarkEventDispatcherRuntime(
             : {}
         ),
       };
-      if (explicitlyMentionedThisBot) {
+      if (explicitlyMentionedThisBot && !crossChatFollowUp) {
         const before = await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
         if (before?.block) return;
         if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
