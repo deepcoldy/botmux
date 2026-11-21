@@ -33,12 +33,12 @@ describe.skipIf(process.platform !== 'linux' || !realTmux)('Bun runner process r
       it('leaves a private server for the outer runner', () => {
         const fence = createTmuxFence(process.env);
         applyTmuxFenceEnv(fence);
-        const socketRoot = mkdtempSync('/tmp/bmx-bun-runner-leaked-socket-');
-        const socket = join(socketRoot, 'socket');
+        const socketRoot = process.env.TMUX_TMPDIR;
+        const label = 'botmux-osc7501-45772-144f3677-cd8c-4889-936b-0777ee1f0ebd';
         const tmux = join(fence.binDir, 'tmux');
-        const started = spawnSync(tmux, ['-S', socket, 'new-session', '-d', '-s', 'leak', 'sleep 60'], { encoding: 'utf8' });
+        const started = spawnSync(tmux, ['-L', label, 'new-session', '-d', '-s', 'leak', 'sleep 60'], { encoding: 'utf8' });
         expect(started.status).toBe(0);
-        const query = spawnSync(tmux, ['-S', socket, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' });
+        const query = spawnSync(tmux, ['-L', label, 'display-message', '-p', '#{pid}'], { encoding: 'utf8' });
         const pid = Number(query.stdout.trim());
         expect(pid).toBeGreaterThan(1);
         writeFileSync(${JSON.stringify(pidFile)}, String(pid));

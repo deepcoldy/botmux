@@ -233,9 +233,15 @@ exec "$REAL" "$@"
 
 /** Create the per-run fence (vitest globalSetup / bun preload). */
 export function createTmuxFence(env: NodeJS.ProcessEnv = process.env): TmuxFence {
-  const root = env.BOTMUX_TMUX_FENCE_PARENT
+  const exactRoot = env.BOTMUX_TMUX_FENCE_ROOT;
+  if (exactRoot) {
+    if (!/^\/tmp\/bmxt-[A-Za-z0-9]+$/.test(exactRoot)) throw new Error(`invalid private tmux fence root: ${exactRoot}`);
+    mkdirSync(exactRoot, { recursive: true });
+    if (readdirSync(exactRoot).length !== 0) throw new Error(`private tmux fence root is not empty: ${exactRoot}`);
+  }
+  const root = exactRoot ?? (env.BOTMUX_TMUX_FENCE_PARENT
     ? mkdtempSync(join(env.BOTMUX_TMUX_FENCE_PARENT, 'bmxt-'))
-    : mkdtempSync(FENCE_ROOT_PREFIX);
+    : mkdtempSync(FENCE_ROOT_PREFIX));
   const denyLog = join(root, 'denied.log');
   const serverLog = join(root, TMUX_SERVER_LOG_BASENAME);
   writeFileSync(denyLog, '');

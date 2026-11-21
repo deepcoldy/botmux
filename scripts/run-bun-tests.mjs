@@ -33,7 +33,7 @@
 // The exclusion list is COMPUTED, never hardcoded: a stale literal list would
 // quietly start skipping files (or fail on files that have since been fixed).
 
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { availableParallelism, tmpdir as realTmpdir } from 'node:os';
@@ -124,9 +124,12 @@ function mintFencedEnv() {
   // Mirrors test/helpers/fence-home-env.ts; kept here as well because that file
   // only runs after Bun has started.
   for (const name of ['BOTS_CONFIG', 'PM2_HOME', 'PLUGIN_PM2_HOME']) delete env[name];
-  // Keep the child's tmux registry inside the scratch owned by this runner. If
-  // the child is SIGKILLed, removeScratch can still reap by pid before deleting.
-  env.BOTMUX_TMUX_FENCE_PARENT = scratch;
+  // Keep the socket root SHORT (/tmp/bmxt-*): nesting it in this scratch made
+  // long session labels exceed the Unix socket path limit. The scratch records
+  // only the mapping so removeScratch can still reap a SIGKILLed child's server.
+  const tmuxRoot = mkdtempSync('/tmp/bmxt-');
+  writeFileSync(join(scratch, 'tmux-root'), tmuxRoot);
+  env.BOTMUX_TMUX_FENCE_ROOT = tmuxRoot;
 
   return { scratch, env };
 }
@@ -330,10 +333,16 @@ const liveChildren = new Map();
  * file 950 (measured). Retry briefly, then give up: a leftover temp dir is a
  * nuisance, losing the whole run's results is not.
  */
+function tmuxRootForScratch(scratch) {
+  try { return readFileSync(join(scratch, 'tmux-root'), 'utf8').trim() || undefined; }
+  catch { return undefined; }
+}
+
 function removeScratch(scratch) {
   // A detached tmux server is outside the child's process group. Reap its
   // registered pid (and any sandbox fake CLI) BEFORE removing the evidence.
-  const reaped = reapRegisteredTestProcesses(scratch);
+  const tmuxRoot = tmuxRootForScratch(scratch);
+  const reaped = reapRegisteredTestProcesses(tmuxRoot || scratch);
   for (const ref of reaped.tmuxFailed) {
     process.stderr.write(`[runner] tmux server pid ${ref.pid} is still alive for ${ref.socket}\n`);
   }
@@ -344,6 +353,10 @@ function removeScratch(scratch) {
     process.exitCode = 1;
     process.stderr.write(`[runner] keeping ${scratch} because process cleanup could not be confirmed\n`);
     return;
+  }
+  if (tmuxRoot) {
+    try { rmSync(tmuxRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+    catch (err) { process.stderr.write(`[runner] could not remove ${tmuxRoot}: ${err?.code ?? err}\n`); }
   }
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
@@ -406,7 +419,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     for (const [child, scratch] of liveChildren) {
       // Let an already-issued new-session publish its server before the group
       // is killed; removeScratch repeats this after the group sweep.
-      reapRegisteredTestProcesses(scratch);
+      reapRegisteredTestProcesses(tmuxRootForScratch(scratch) ?? scratch);
       killTree(child, 'SIGKILL');
       // Cancellation is exactly when these would otherwise accumulate: the close
       // handler that normally removes them never runs.
@@ -495,7 +508,7 @@ function runOne(file) {
       // the process was still alive, so sweep BEFORE removing the evidence.
       // Give a mid-start tmux server a bounded chance to bind before the
       // client's process group is swept, then repeat the check in removeScratch.
-      reapRegisteredTestProcesses(scratch);
+      reapRegisteredTestProcesses(tmuxRootForScratch(scratch) ?? scratch);
       killTree(child, 'SIGKILL');
       removeScratch(scratch);
       // A signal death (wall-clock kill, OOM) leaves code null — never let that
