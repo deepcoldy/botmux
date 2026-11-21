@@ -3,7 +3,11 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { finalizeCotMessageMock, botState } = vi.hoisted(() => ({
   finalizeCotMessageMock: vi.fn(),
-  botState: { cliId: 'antigravity' as string },
+  botState: {
+    cliId: 'antigravity' as string,
+    dshRuntime: undefined as 'official' | 'tui' | undefined,
+    env: undefined as Record<string, string> | undefined,
+  },
 }));
 
 vi.mock('../src/im/lark/cot-message.js', () => ({
@@ -33,7 +37,13 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
-    config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: botState.cliId },
+    config: {
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      cliId: botState.cliId,
+      ...(botState.dshRuntime ? { dshRuntime: botState.dshRuntime } : {}),
+      ...(botState.env ? { env: botState.env } : {}),
+    },
     resolvedAllowedUsers: [],
     botOpenId: 'ou_bot',
     botName: 'Castor',
@@ -80,13 +90,6 @@ vi.mock('../src/skills/installer.js', () => ({
   ensureSkills: vi.fn(),
 }));
 
-vi.mock('../src/adapters/cli/registry.js', () => ({
-  createCliAdapterSync: vi.fn((cliId: string) => ({
-    id: cliId,
-    runnerFramedInput: cliId === 'dsh' || cliId === 'opencode2',
-  })),
-}));
-
 vi.mock('../src/adapters/cli/claude-code.js', () => ({
   claudeJsonlPathForSession: vi.fn(),
 }));
@@ -109,9 +112,20 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import { __testOnly_setupWorkerHandlers, initWorkerPool } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 
-function setup(opts: { cliId?: string; promptInjection?: 'default' | 'none'; adopted?: boolean } = {}) {
+interface SetupOpts {
+  cliId?: string;
+  dshRuntime?: 'official' | 'tui';
+  env?: Record<string, string>;
+  promptInjection?: 'default' | 'none';
+  adopted?: boolean;
+  sandbox?: boolean | 'off' | 'scratch';
+}
+
+function setup(opts: SetupOpts = {}) {
   const cliId = opts.cliId ?? 'antigravity';
   botState.cliId = cliId;
+  botState.dshRuntime = opts.dshRuntime;
+  botState.env = opts.env;
   const worker = Object.assign(new EventEmitter(), {
     killed: false, send: vi.fn(), kill: vi.fn(), pid: 4242,
     stdout: new EventEmitter(), stderr: new EventEmitter(),
@@ -128,6 +142,7 @@ function setup(opts: { cliId?: string; promptInjection?: 'default' | 'none'; ado
       workingDir: '/repo',
       ...(opts.promptInjection ? { promptInjection: opts.promptInjection } : {}),
       ...(opts.adopted ? { adoptedFrom: { source: 'tmux', paneId: '%1' } } : {}),
+      ...(opts.sandbox !== undefined ? { sandbox: opts.sandbox } : {}),
     },
     worker,
     workerPort: 9999,
@@ -145,6 +160,8 @@ function setup(opts: { cliId?: string; promptInjection?: 'default' | 'none'; ado
     lastScreenStatus: 'working',
     activeTurnId: 'om_turn',
     activeDispatchAttempt: 1,
+    cotForced: true,
+    lastThinkingUpdate: { turnId: 'om_turn', entries: [] },
     ...(opts.adopted ? { adoptedFrom: { source: 'tmux', paneId: '%1' } } : {}),
   } as unknown as DaemonSession;
   initWorkerPool({
@@ -157,13 +174,19 @@ function setup(opts: { cliId?: string; promptInjection?: 'default' | 'none'; ado
   return { ds, worker };
 }
 
-describe('screen_update working -> idle CoT finalization', () => {
+describe('screen_update working -> idle CoT finalization (real adapter registry)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('finalizes CoT on working -> idle for ordinary antigravity sessions', () => {
-    const { ds, worker } = setup({ cliId: 'antigravity' });
+  it.each([
+    ['antigravity ordinary PTY', { cliId: 'antigravity' }],
+    ['opencode2', { cliId: 'opencode2' }],
+    ['kimi', { cliId: 'kimi' }],
+    ['dsh-tui', { cliId: 'dsh', dshRuntime: 'tui' as const }],
+    ['cursor under scratch', { cliId: 'cursor', sandbox: 'scratch' as const }],
+  ])('finalizes CoT and clears cached CoT state on working -> idle for %s', (_label, opts) => {
+    const { ds, worker } = setup(opts);
     worker.emit('message', {
       type: 'screen_update',
       content: 'ready',
@@ -173,16 +196,25 @@ describe('screen_update working -> idle CoT finalization', () => {
     });
     expect(finalizeCotMessageMock).toHaveBeenCalledTimes(1);
     expect(finalizeCotMessageMock).toHaveBeenCalledWith(ds, 'om_turn', 'completed', 1);
+    expect(ds.cotForced).toBeUndefined();
+    expect(ds.lastThinkingUpdate).toBeUndefined();
   });
 
   it.each([
     ['antigravity zero-prompt', { cliId: 'antigravity', promptInjection: 'none' as const }],
     ['antigravity adopt', { cliId: 'antigravity', adopted: true }],
-    ['codex', { cliId: 'codex' }],
+    ['antigravity ACP', { cliId: 'antigravity', env: { AGY_BOTMUX_TRANSPORT: 'acp' } }],
     ['claude-code', { cliId: 'claude-code' }],
-    ['opencode2 runner-framed', { cliId: 'opencode2' }],
+    ['seed (claude-family)', { cliId: 'seed' }],
+    ['relay (claude-family)', { cliId: 'relay' }],
+    ['genius (claude-family)', { cliId: 'genius' }],
+    ['codex', { cliId: 'codex' }],
+    ['codex-app', { cliId: 'codex-app' }],
+    ['headless dsh', { cliId: 'dsh' }],
+    ['minimax (runnerFramedInput)', { cliId: 'minimax' }],
+    ['cursor (non-scratch)', { cliId: 'cursor' }],
   ])('does not finalize CoT on idle for %s (uses turn_terminal)', (_label, opts) => {
-    const { worker } = setup(opts);
+    const { ds, worker } = setup(opts);
     worker.emit('message', {
       type: 'screen_update',
       content: 'ready',
@@ -191,5 +223,7 @@ describe('screen_update working -> idle CoT finalization', () => {
       dispatchAttempt: 1,
     });
     expect(finalizeCotMessageMock).not.toHaveBeenCalled();
+    expect(ds.cotForced).toBe(true);
+    expect(ds.lastThinkingUpdate).toBeDefined();
   });
 });

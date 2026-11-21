@@ -19,7 +19,7 @@
  * their dedicated attach paths. Full driver-table platformization is a
  * follow-up; this file only collapses the OR-list tax.
  */
-import type { CliId } from '../adapters/cli/types.js';
+import type { CliAdapter, CliId } from '../adapters/cli/types.js';
 
 /** Always-on structured-bridge CLIs (including SQLite-backed hermes/mtr). */
 export const STRUCTURED_BRIDGE_ALWAYS_CLI_IDS = [
@@ -205,4 +205,30 @@ const ADOPT_INPUT_SET: ReadonlySet<string> = new Set(STRUCTURED_BRIDGE_ADOPT_INP
 
 export function isStructuredBridgeAdoptInputCli(cliId: string | undefined): boolean {
   return !!cliId && ADOPT_INPUT_SET.has(cliId);
+}
+
+/**
+ * Whether a session emits an authoritative `turn_terminal` (via Claude-family
+ * transcript bridge, structured transcript bridge, Codex App signed-socket
+ * marker, headless dsh OSC decoder, or runner-framed input such as MiniMax /
+ * Antigravity ACP). Sessions that do NOT emit `turn_terminal` (ordinary
+ * Antigravity PTY, Kimi, OpenCode2, dsh-tui, cursor under scratch, etc.)
+ * settle their CoT bubble on the `working/analyzing -> idle` screen edge.
+ */
+export function sessionEmitsTurnTerminal(opts: {
+  cliId: string | undefined;
+  dshRuntime?: 'official' | 'tui';
+  adoptMode?: boolean;
+  zeroPrompt?: boolean;
+  sandboxScratch?: boolean;
+  adapter?: Pick<CliAdapter, 'claudeDataDir' | 'runnerFramedInput'>;
+}): boolean {
+  if (!opts.cliId) return false;
+  const effectiveCliId = opts.cliId === 'dsh' && opts.dshRuntime === 'tui' ? 'dsh-tui' : opts.cliId;
+  if (opts.adapter?.claudeDataDir) return true;
+  if (effectiveCliId === 'codex-app') return true;
+  if (effectiveCliId === 'dsh') return true;
+  if (opts.adapter?.runnerFramedInput) return true;
+  if (effectiveCliId === 'cursor' && !opts.adoptMode && opts.sandboxScratch) return false;
+  return isStructuredBridgeFallbackActive(effectiveCliId, opts.adoptMode, opts.zeroPrompt);
 }

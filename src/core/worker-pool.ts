@@ -192,7 +192,8 @@ import {
 } from './shared-adopt.js';
 import { closeResidualClause } from './close-residual.js';
 import { logger } from '../utils/logger.js';
-import { createCliAdapterSync, type CliAdapterOptions } from '../adapters/cli/registry.js';
+import { createCliAdapterSync, resolveEffectiveCliId, type CliAdapterOptions } from '../adapters/cli/registry.js';
+import { antigravityTransport } from '../services/antigravity-transport.js';
 import { cliSupportsConfigDir } from './cli-config-dir.js';
 import {
   resolveCliRuntime,
@@ -1020,7 +1021,7 @@ import { isBotMentionEntry, knownBotOpenIdsFromCrossRef, type BotMentionEntry } 
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import { isCodexAppCliId, type CliId } from '../adapters/cli/types.js';
-import { isStructuredBridgeAdoptCli, isStructuredBridgeFallbackActive, isStructuredBridgeLifecycleBlockingCli } from '../services/structured-bridge-clis.js';
+import { isStructuredBridgeAdoptCli, isStructuredBridgeLifecycleBlockingCli, sessionEmitsTurnTerminal } from '../services/structured-bridge-clis.js';
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
 import { readBotsInfoJson } from '../services/bots-info-cache.js';
@@ -28646,11 +28647,21 @@ function shouldDropMismatchedHermesFinalOutput(
  * Adopt/workflow/meeting lanes retain their existing dedicated UI contracts. */
 function sessionUsesTurnTerminal(ds: DaemonSession, botCfg: BotConfig): boolean {
   const cliId = sessionCliId(ds, botCfg);
-  if (cliId === 'claude-code') return true;
-  if (isStructuredBridgeFallbackActive(cliId, isSharedAdoptSession(ds), sessionPromptInjection(ds) === 'none')) {
-    return true;
-  }
-  return !!createCliAdapterSync(cliId, botCfg.cliPathOverride, { configDir: botCfg.cliConfigDir })?.runnerFramedInput;
+  const dshRuntime = dshRuntimeForSession(ds);
+  const effectiveCliId = resolveEffectiveCliId(cliId, dshRuntime);
+  const agyTransport = effectiveCliId === 'antigravity' ? antigravityTransport(botCfg.env) : undefined;
+  const adapter = createCliAdapterSync(effectiveCliId, botCfg.cliPathOverride, {
+    configDir: botCfg.cliConfigDir,
+    ...(agyTransport ? { antigravityTransport: agyTransport } : {}),
+  });
+  return sessionEmitsTurnTerminal({
+    cliId,
+    dshRuntime,
+    adoptMode: isSharedAdoptSession(ds),
+    zeroPrompt: sessionPromptInjection(ds) === 'none',
+    sandboxScratch: sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged) === 'scratch',
+    adapter,
+  });
 }
 
 function usesOutcomeBasedTurnReactions(ds: DaemonSession): boolean {
