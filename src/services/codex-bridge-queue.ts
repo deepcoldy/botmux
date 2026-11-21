@@ -123,6 +123,10 @@ export interface CodexPendingTurn {
    *  began. This closes the race where screen-ready arrives while writeInput
    *  is still polling history, before it can return `submitted: true`. */
   submitVerificationStartedAtMs?: number;
+  /** When the adapter write/verification for this mark ended. Unlike the
+   *  lease anchors it is never refreshed, so it can be compared with later
+   *  screen observations of whether the CLI still holds the input. */
+  writeSettledAtMs?: number;
   /** The worker still owns an ambiguous draft in this CLI generation. Keep
    * its exact fingerprint for a later manual submit, without claiming success. */
   inputDeliveryQuarantined?: true;
@@ -600,14 +604,17 @@ export class CodexBridgeQueue {
    *    "busy" screen (swallowed Enter / modal redraw) can refresh only up to
    *    it, after which the head prunes and the structured_start_timeout /
    *    successor queue recover — no permanent wedge.
+   *  `eligible` narrows the refresh to heads the caller's evidence covers.
    *  Returns the number of refreshed heads. */
   refreshUnstartedHeadAttributionLease(
     nowMs: number = this.now(),
     maxSinceMarkMs?: number,
+    eligible?: (turn: CodexPendingTurn) => boolean,
   ): number {
     let refreshed = 0;
     for (const head of this.queue) {
       if (head.started || head.finalText !== undefined) continue;
+      if (eligible && !eligible(head)) continue;
       if (head.rpcActive) continue;
       if (this.isProvisionalTaskStart(head)) continue;
       if (head.submitVerificationStartedAtMs !== undefined
@@ -645,7 +652,33 @@ export class CodexBridgeQueue {
     turn.submitVerificationStartedAtMs = undefined;
     turn.unconfirmedAttributionStartedAtMs = undefined;
     turn.submitConfirmedAtMs = confirmedAtMs;
+    turn.writeSettledAtMs ??= confirmedAtMs;
     return true;
+  }
+
+  /** Expire, on their ordinary pre-start lease, the unstarted heads queued
+   *  AHEAD of a later input the CLI has positively received. For a CLI that
+   *  sends held input strictly in submit order, an earlier input that has not
+   *  started by then is no longer held anywhere; keeping its lease alive
+   *  would only park the successor's native start behind a dead head.
+   *  Quarantined, verifying, RPC-active and CLI-queued heads are left alone.
+   *  The caller prunes (and notifies) through its usual expiry path. */
+  expireUnstartedBefore(turnId: string, dispatchAttempt?: number): CodexPendingTurn[] {
+    const index = this.queue.findIndex(candidate => candidate.turnId === turnId
+      && candidate.dispatchAttempt === dispatchAttempt);
+    if (index <= 0) return [];
+    const expired: CodexPendingTurn[] = [];
+    for (const turn of this.queue.slice(0, index)) {
+      if (turn.started || turn.finalText !== undefined || turn.rpcActive
+        || turn.inputDeliveryQuarantined || turn.cliQueuedAtMs !== undefined
+        || turn.submitVerificationStartedAtMs !== undefined) continue;
+      if (turn.submitConfirmedAtMs !== undefined) turn.submitConfirmedAtMs = Number.NEGATIVE_INFINITY;
+      else if (turn.unconfirmedAttributionStartedAtMs !== undefined) {
+        turn.unconfirmedAttributionStartedAtMs = Number.NEGATIVE_INFINITY;
+      } else continue;
+      expired.push(turn);
+    }
+    return expired;
   }
 
   /** Mark a turn as actively running server-side via Codex RPC. The app-server
@@ -707,6 +740,7 @@ export class CodexBridgeQueue {
       && candidate.dispatchAttempt === dispatchAttempt);
     if (!turn || turn.submitVerificationStartedAtMs === undefined) return false;
     turn.submitVerificationStartedAtMs = undefined;
+    turn.writeSettledAtMs ??= finishedAtMs;
     if (!turn.started && turn.submitConfirmedAtMs === undefined) {
       turn.unconfirmedAttributionStartedAtMs = finishedAtMs;
     }

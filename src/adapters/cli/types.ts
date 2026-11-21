@@ -32,8 +32,10 @@ export interface PtyHandle {
    * double-Ctrl+C exit gestures can keep their own recovery outside the window.
    */
   readonly lastInjectedCancelAt?: number;
-  /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it). */
-  pasteText?(text: string): void;
+  /** Paste text via tmux load-buffer + paste-buffer (auto-brackets if terminal supports it).
+   *  `false` means the backend could not confirm the paste: some bytes may
+   *  still have landed, so callers must not follow it with a submit key. */
+  pasteText?(text: string): void | boolean;
   /** Absolute path to Claude Code's session JSONL; set by worker for claude-code adapter.
    *  Used by writeInput to verify a paste+Enter actually committed (new user-content
    *  line appended) and retry Enter if not — rather than trusting fixed sleep timing. */
@@ -992,6 +994,27 @@ export interface CliAdapter {
    *  inputs survive for explicit recovery. */
   readonly quarantineUnconfirmedSubmits?: boolean;
 
+  /** The authoritative viewport proves the CLI still holds input it has
+   *  already taken and will start by itself: it is busy with earlier work, or
+   *  its own send queue is drawn (Doubao parks an Enter pressed during a turn
+   *  and writes the native user record only when that turn ends). While this
+   *  holds, unstarted structured heads keep their pre-start lease (bounded
+   *  from each mark), instead of being reported uncollected 20s after the
+   *  write. Undefined = no such evidence; leases run on their normal clock.
+   *  Contract: the CLI sends held input in submit order. A head the screen
+   *  showed NOT held after its write settled is not covered by a later busy
+   *  screen, and a receipt for a later input expires every earlier unstarted
+   *  head at once. */
+  screenHoldsSubmittedInput?(screen: string): boolean;
+
+  /** The authoritative viewport proves the CLI holds no pending input at all:
+   *  its composer is empty and it is neither busy nor showing queued input.
+   *  For an adapter that quarantines unconfirmed submits, two consecutive
+   *  receipt rechecks seeing this (receipt still missing) mean the parked
+   *  draft was cleared or replaced by hand; the quarantine and the turn's
+   *  attribution are released so later input is no longer held. */
+  screenShowsNoPendingInput?(screen: string): boolean;
+
   /** Which blocking pages this CLI renders, as recognised by
    *  `classifyStuckPage(screen, family)` (utils/stuck-detector.ts):
    *  `codex-family` = the codex_core hook-review / migration / session-lock
@@ -1308,6 +1331,11 @@ export interface StructuredBridgeDrainContext {
    *  any transcript record (Esc interrupt), which a file-derived counter can
    *  never observe and would then over-count forever. */
   openTurns?: number;
+  /** Whether a native user record with this text would start a turn the
+   *  attribution queue is waiting for (non-adopt; the queue's own fingerprint
+   *  / exact-hash rule). Lets a two-file driver tell botmux's request row,
+   *  whose prompt record has not been read yet, from any other user row. */
+  ownsNativeInput?: (text: string) => boolean;
 }
 
 /**
@@ -1320,6 +1348,11 @@ export interface StructuredBridgeDrainContext {
 export interface StructuredBridgeSpec {
   /** Incrementally read the transcript at `path` from `offset`. */
   drain(path: string, offset: number, ctx: StructuredBridgeDrainContext): StructuredBridgeDrainResult;
+  /** Pure view of the driver state: the driver is waiting at a native record
+   *  of the NEXT pending input whose prompt record has not been read yet
+   *  (Doubao: a request row ahead of its assignment section). The worker keeps
+   *  that head's pre-start lease alive meanwhile. */
+  awaitsPendingInput?(state: unknown): boolean;
   /**
    * When the worker commits `result.state` back into its single state slot:
    *  - `'drain'`: on every drain, including the one-off attach-time drains

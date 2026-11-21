@@ -2852,6 +2852,7 @@ export const messages: Record<string, string> = {
   'submitDiag.logged_out': '⚠️ 消息没有进入模型：{cliName} 停在登录/鉴权页面\n阶段：输入提交\n错误码：submit_unconfirmed\n终端当前停在 {cliName} 的登录或鉴权页面（要求先登录，或登录态已失效），这条消息没有进入模型。CLI 自身登录与飞书授权是两层，互不代表。\n请打开 Web 终端完成登录后，再重发这条消息。\n原消息：{preview}',
   'submitDiag.interactive_menu': '⚠️ 消息没有进入模型：{cliName} 停在等待键盘选择的界面\n阶段：输入提交\n错误码：submit_unconfirmed\n终端当前停在需要键盘选择的界面（更新、数据迁移、hooks review 或确认框等），这条消息没有进入模型。\n请打开 Web 终端完成选择，或按 Esc 取消该界面后再重发；BotMux 不会替你做选择。\n原消息：{preview}',
   'submitDiag.draft_parked': '⚠️ 消息已粘贴但没有提交：正文停在 {cliName} 输入框\n阶段：输入提交\n错误码：submit_unconfirmed\n消息正文仍停在输入框，提交尚未成功。\n请打开 Web 终端按 Enter 提交；若确认不需要执行，再回到飞书重发。\n原消息：{preview}',
+  'submitDiag.draft_parked_held': '⚠️ 消息已粘贴但没有提交：正文停在 {cliName} 输入框\n阶段：输入提交\n错误码：submit_unconfirmed\n消息正文仍停在输入框，提交尚未成功；在它被提交或清空之前，后续消息先暂存，不会贴进输入框。\n请打开 Web 终端：要执行就按 Enter 提交，回复照常转发到这里；不需要就清空输入框，暂存的后续消息随后发出。不要在飞书重发这一条，否则可能执行两次。\n原消息：{preview}',
   'submitDiag.session_locked': '⚠️ 会话被占用，消息提交未确认：{cliName}\n阶段：输入提交\n错误码：submit_unconfirmed\n当前会话的写锁被另一进程持有。请核对终端中的 Owner PID，正常退出持锁的那份会话后按 R 重试。\nBotMux 不会终止占用进程或自动重发这条未确认消息；请先核对会话记录，避免重复执行。\n原消息：{preview}',
   // ─── schedulePos: 定时任务「本任务专属话题」执行位置（opt-in 任务级隔离） ─────
   'schedulePos.positionNote': '执行位置：本任务专属话题（首次触发时自动创建；同一任务之后每次触发都在该话题内继续，不同任务各自独立、互不串扰；仅支持单个群聊）',

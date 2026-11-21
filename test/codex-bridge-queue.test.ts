@@ -2147,6 +2147,66 @@ describe('input the CLI holds in its own queue', () => {
   });
 });
 
+describe('input a FIFO CLI is holding (Doubao send queue)', () => {
+  it('lets a later received input expire the dead heads ahead of it, so its own start is not parked', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+    // Turn 2 went into Doubao's queue and was removed there by hand.
+    q.mark('t2', 'second task: summarize the failures', now);
+    q.beginSubmitVerification('t2', now);
+    q.finishSubmitVerification('t2', now);
+    now = 5_000;
+    q.mark('t3', 'third task: list the owners', now);
+    q.beginSubmitVerification('t3', now);
+    // Doubao writes turn 3's request; it cannot start turn 2's head.
+    q.ingest([userEv('third task: list the owners', 'u-t3', 5_300)]);
+    expect(q.peek().map(turn => [turn.turnId, turn.started])).toEqual([['t2', false], ['t3', false]]);
+    // The receipt for turn 3 arrives: turn 2 can no longer be sent before it.
+    q.confirmPendingTurn('t3', 5_400);
+    expect(q.expireUnstartedBefore('t3').map(turn => turn.turnId)).toEqual(['t2']);
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['t2']);
+    // The buffered request of turn 3 now starts it; its answer is its own.
+    expect(q.peek()[0]).toMatchObject({ turnId: 't3', started: true });
+    q.ingest([asstEv('THIRD_ANSWER', 'a-t3', 40_000)]);
+    expect(q.drainEmittable()).toEqual([expect.objectContaining({ turnId: 't3', finalText: 'THIRD_ANSWER' })]);
+  });
+
+  it('never expires a head that is quarantined, verifying, CLI-queued or behind the received input', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('parked', 'draft left in the composer', now);
+    q.beginSubmitVerification('parked', now);
+    q.finishSubmitVerification('parked', now);
+    q.setInputDeliveryQuarantined('parked', true);
+    q.mark('verifying', 'write still awaiting its receipt', now);
+    q.beginSubmitVerification('verifying', now);
+    q.mark('received', 'later input', now);
+    q.confirmPendingTurn('received', now);
+    q.mark('after', 'queued behind it', now);
+    q.confirmPendingTurn('after', now);
+    expect(q.expireUnstartedBefore('received')).toEqual([]);
+    expect(q.expireUnstartedBefore('missing')).toEqual([]);
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+  });
+
+  it('refreshes only the heads the caller\'s evidence still covers', () => {
+    let now = 0;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('dead', 'removed from the CLI queue', now);
+    q.beginSubmitVerification('dead', now);
+    q.finishSubmitVerification('dead', now);
+    q.mark('held', 'still in the CLI queue', now);
+    q.beginSubmitVerification('held', now);
+    q.finishSubmitVerification('held', now);
+    expect(q.peek().map(turn => turn.writeSettledAtMs)).toEqual([0, 0]);
+    for (now = 1_000; now <= 30_000; now += 1_000) {
+      expect(q.refreshUnstartedHeadAttributionLease(now, undefined, turn => turn.turnId !== 'dead')).toBe(1);
+    }
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['dead']);
+    expect(q.peek().map(turn => turn.turnId)).toEqual(['held']);
+  });
+});
+
 describe('selectStaleRestoredJournalTurns — cold-resume stale-turn retirement', () => {
   const turn = (overrides: Partial<import('../src/services/codex-bridge-queue.js').CodexPendingTurn>)
     : import('../src/services/codex-bridge-queue.js').CodexPendingTurn => ({

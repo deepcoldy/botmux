@@ -48,6 +48,20 @@ export interface DoubaoBridgeDrainState {
   /** A resume baseline retained an unfinished historical row. Its completion
    *  belongs to history too, even if it lands alongside the next live prompt. */
   skipTrajectoryTail?: true;
+  /** A request row of an input the attribution queue is waiting for, whose
+   *  assignment section was not parsed yet: the trajectory frontier waits at
+   *  it (bounded in time) instead of passing its answer as ownerless. */
+  parkedUserRow?: { offset: number; sinceMs: number };
+  /** This session's trajectory opens requests with a row carrying the request
+   *  text (seen at least once). Only then is a section that arrives without
+   *  its row held back briefly for that row. */
+  userRowsMatch?: true;
+  /** A complete section held back (with the trajectory frontier) waiting for
+   *  its request row, bounded in time. */
+  sectionRowWait?: { assignmentOffset: number; sinceMs: number };
+  /** Digests of request texts already started in this attach (bounded). A
+   *  later row repeating one of them is not a new request to wait for. */
+  startedRequests?: string[];
 }
 
 /** Drain context understood by the doubao driver (beyond the shared fields). */
@@ -56,6 +70,10 @@ export interface DoubaoBridgeDrainContext {
   /** Started, unterminated turns in the attribution queue, measured by the
    *  worker at drain time. See StructuredBridgeDrainContext.openTurns. */
   openTurns?: number;
+  /** See StructuredBridgeDrainContext.ownsNativeInput. */
+  ownsNativeInput?: (text: string) => boolean;
+  /** Clock for the bounded wait at a parked request row. */
+  nowMs?: number;
 }
 
 export interface DoubaoDrainResult {
@@ -110,6 +128,64 @@ function safeMtimeMs(path: string): number {
 export function doubaoTrajectoryPathForSession(sessionId: string): string | undefined {
   const systemDir = doubaoSystemDirForSession(sessionId);
   return systemDir ? join(systemDir, TRAJECTORY_FILE) : undefined;
+}
+
+/** assignment.md of a bound session's main agent — the per-turn log Doubao
+ *  appends a user request to once it actually sends it. Same agent choice as
+ *  doubaoSystemDirForSession, keyed on assignment.md so a receipt baseline can
+ *  be taken before the agent has written any trajectory row. */
+export function doubaoAssignmentPathForSession(
+  sessionId: string,
+  roots: readonly string[] = doubaoSessionRoots(),
+): string | undefined {
+  if (!SESSION_ID_RE.test(sessionId)) return undefined;
+  const candidates: string[] = [];
+  for (const root of roots) {
+    const agentsDir = join(root, sessionId, 'agents');
+    let agents: string[];
+    try { agents = readdirSync(agentsDir); } catch { continue; }
+    for (const agent of agents) {
+      const assignment = join(agentsDir, agent, 'system', ASSIGNMENT_FILE);
+      if (existsSync(assignment)) candidates.push(assignment);
+    }
+  }
+  if (candidates.length <= 1) return candidates[0];
+  for (const assignment of candidates) {
+    try {
+      if (/^- Role:\s*main\s*$/m.test(readFileSync(assignment, 'utf8'))) return assignment;
+    } catch { /* keep scanning */ }
+  }
+  return candidates.sort((a, b) => safeMtimeMs(b) - safeMtimeMs(a))[0];
+}
+
+/** Byte size of a native log, 0 when it does not exist yet (Doubao creates it
+ *  lazily), undefined when it cannot be read and is no baseline. */
+export function doubaoLogSize(path: string): number | undefined {
+  try { return statSync(path).size; } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ENOTDIR' ? 0 : undefined;
+  }
+}
+
+/** Whether a request section appended to assignment.md at or after
+ *  `fromOffset` carries exactly `content` (whitespace-insensitive). This is the
+ *  submit receipt: Doubao writes the section when the request leaves its own
+ *  send queue, so an Enter it parked behind running work has no receipt yet.
+ *  Only bytes past the pre-write size count — an older identical request in
+ *  history is never mistaken for this one. */
+export function doubaoAssignmentHasInputSince(path: string, fromOffset: number, content: string): boolean {
+  const wanted = content.replace(/\s+/g, ' ').trim();
+  if (!wanted) return false;
+  try {
+    const size = statSync(path).size;
+    // A rewritten (shorter) log has no stable frontier; read all of it.
+    const start = size < fromOffset ? 0 : fromOffset;
+    if (size <= start) return false;
+    const window = readJsonlWindow(path, start, size);
+    return parseAssignmentSections(path, window.completeText + window.pendingTail, start)
+      .some(section => !section.incomplete
+        && section.event?.text.replace(/\s+/g, ' ').trim() === wanted);
+  } catch { return false; }
 }
 
 /** Account-level artifact workspace selected by an exact, unique bound
@@ -228,9 +304,36 @@ export function doubaoLiveUser(path: string,
   } catch { return; }
 }
 
+/** One parsed trajectory row: a bridge event, or the whitespace-normalised
+ *  text of a `role:user` row (a request boundary, never emitted itself). */
 interface ParsedTrajectoryEvent {
-  event: CodexBridgeEvent;
+  event?: CodexBridgeEvent;
+  userRow?: string;
   start: number;
+}
+
+/** How long a request row of an input botmux is waiting for may hold the
+ *  trajectory frontier until its assignment section is parsed. */
+const PARKED_USER_ROW_MAX_MS = 120_000;
+/** How long a section that arrived without its request row is held back,
+ *  in a session whose requests do get such rows, before pairing by K. */
+const SECTION_ROW_WAIT_MS = 3_000;
+const STARTED_REQUESTS_KEPT = 32;
+const requestDigest = (text: string): string => createHash('sha256').update(text).digest('hex').slice(0, 32);
+
+const normaliseRequestText = (text: string): string => text.replace(/\s+/g, ' ').trim();
+
+function userRowText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map(part => (part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string'
+    ? (part as { text: string }).text : '')).join('\n');
+}
+
+/** Whether a `role:user` row opens the request whose section text is `request`.
+ *  The row may wrap the request in extra context, never the other way round. */
+function userRowOpens(row: string, request: string): boolean {
+  return !!request && (row === request || row.includes(request));
 }
 
 function parseTrajectoryWindow(path: string, completeText: string, startOffset: number): ParsedTrajectoryEvent[] {
@@ -241,15 +344,20 @@ function parseTrajectoryWindow(path: string, completeText: string, startOffset: 
     const start = lineStart;
     lineStart += Buffer.byteLength(line, 'utf8');
     if (rawLine.length === 0) continue;
-    const event = parseTrajectoryLine(path, rawLine, start);
-    if (event) out.push({ event, start });
+    const parsed = parseTrajectoryLine(path, rawLine, start);
+    if (parsed && 'userRow' in parsed) out.push({ userRow: parsed.userRow, start });
+    else if (parsed) out.push({ event: parsed, start });
   }
   return out;
 }
 
-function parseTrajectoryLine(path: string, line: string, lineStart: number): CodexBridgeEvent | null {
+function parseTrajectoryLine(path: string, line: string, lineStart: number): CodexBridgeEvent | { userRow: string } | null {
   let obj: any;
   try { obj = JSON.parse(line); } catch { return null; }
+  if (obj?.role === 'user') {
+    const text = normaliseRequestText(userRowText(obj.content));
+    return text ? { userRow: text } : null;
+  }
   const base = { uuid: `${path}:${lineStart}`, timestampMs: Date.now(), text: '' };
   if (obj?.role === 'tool') {
     if (typeof obj.tool_call_id !== 'string' || !obj.tool_call_id || typeof obj.content !== 'string') return null;
@@ -314,7 +422,23 @@ function parseTrajectoryLine(path: string, line: string, lineStart: number): Cod
  *       the closing finals (they then start the next turns); any final beyond
  *       K + the paired prompts has no owner and is not emitted.
  *  When openTurns is omitted (standalone use) K = 0: every final must pair
- *  with a prompt in the same or a later window. */
+ *  with a prompt in the same or a later window.
+ *
+ *  Request rows. When trajectory.jsonl opens a request with a `role:user` row
+ *  carrying that request's text, the ordering question above has a direct
+ *  answer inside the window that holds both: rows before the request's row
+ *  belong to earlier work, rows after it to the request. That matters when no
+ *  turn is open, e.g. a request Doubao held in its own send queue and sent
+ *  right after other work ended with a content-only row — pairing "first
+ *  ownerless row ↔ first pending section" would hand that row to the request.
+ *  So a pending section whose own row is further on in the window starts at
+ *  that row, and the ownerless rows before it stay unattributed; a section
+ *  with no matching row in the window keeps the K-based pairing. A row only
+ *  counts when its text contains the section's (a mid-turn user row of other
+ *  text is never a boundary). The other order — the row of an input the queue
+ *  is waiting for (`ctx.ownsNativeInput`) before its section — holds the
+ *  trajectory frontier at that row, bounded in time, instead of letting the
+ *  request's own answer pass as ownerless. */
 export function drainDoubaoTranscript(
   path: string,
   fromOffset: number,
@@ -385,11 +509,88 @@ export function drainDoubaoTranscript(
 
   // ── pair the two streams against queue-owned open turns ──────────────────
   const events: CodexBridgeEvent[] = [];
+  const nowMs = ctx.nowMs ?? Date.now();
+  const sectionText = (section: ParsedAssignmentSection) => normaliseRequestText(section.event!.text);
+  // Where, in this window, each pending section's own request row is. Rows
+  // and sections of the same text pair up in order; only rows in EXCESS of
+  // that text's pending sections are stale repeats, and those are the earliest
+  // ones. A section whose row is missing ends the in-window pairing.
+  const sectionRowAt: number[] = [];
+  {
+    const texts = userSections.map(sectionText);
+    const rowsByText = new Map<string, number[]>();
+    for (let j = 0; j < trajectoryEvents.length; j++) {
+      const row = trajectoryEvents[j]!.userRow;
+      if (row === undefined) continue;
+      const text = texts.find(candidate => userRowOpens(row, candidate));
+      if (text === undefined) continue;
+      rowsByText.set(text, [...(rowsByText.get(text) ?? []), j]);
+    }
+    const nextOfText = new Map<string, number>();
+    for (const [text, rows] of rowsByText) {
+      const sections = texts.filter(candidate => candidate === text).length;
+      nextOfText.set(text, Math.max(0, rows.length - sections));
+    }
+    for (let i = 0; i < userSections.length; i++) {
+      const rows = rowsByText.get(texts[i]!);
+      const k = nextOfText.get(texts[i]!) ?? 0;
+      const at = rows?.[k];
+      if (at === undefined) break;
+      nextOfText.set(texts[i]!, k + 1);
+      sectionRowAt.push(at);
+    }
+  }
+  const startedRequests = [...(prevState.startedRequests ?? [])];
+  const noteStarted = (section: ParsedAssignmentSection) => {
+    startedRequests.push(requestDigest(sectionText(section)));
+    if (startedRequests.length > STARTED_REQUESTS_KEPT) startedRequests.shift();
+  };
+  const userRowsMatch = prevState.userRowsMatch === true || sectionRowAt.length > 0;
+  let parkedUserRow: DoubaoBridgeDrainState['parkedUserRow'];
+  let sectionRowWait: DoubaoBridgeDrainState['sectionRowWait'];
+  let holdSectionsFrom: number | undefined;
   let remainingOpen = openTurns;
   let nextUser = 0;
   let hasOwner = remainingOpen > 0;
-  for (const { event, start } of trajectoryEvents) {
-    if (!hasOwner && nextUser < userSections.length) {
+  for (let index = 0; index < trajectoryEvents.length; index++) {
+    const { event, userRow, start } = trajectoryEvents[index]!;
+    if (userRow !== undefined) {
+      if (nextUser < userSections.length && sectionRowAt[nextUser] === index) {
+        // A new request starts here; whatever ran before it is over.
+        noteStarted(userSections[nextUser]!);
+        events.push(userSections[nextUser++]!.event!);
+        hasOwner = true;
+        remainingOpen = 1;
+        continue;
+      }
+      if (!hasOwner && nextUser >= userSections.length
+        && !startedRequests.includes(requestDigest(userRow)) && ctx.ownsNativeInput?.(userRow)) {
+        const sinceMs = prevState.parkedUserRow?.offset === start ? prevState.parkedUserRow.sinceMs : nowMs;
+        if (nowMs - sinceMs <= PARKED_USER_ROW_MAX_MS) {
+          // botmux's own next request, its section not in assignment.md yet:
+          // wait here rather than pass its answer as an ownerless row.
+          parkedUserRow = { offset: start, sinceMs };
+          trajectoryOffset = start;
+          break;
+        }
+        logger.warn(`[doubao-transcript] request row at ${path}:${start} found no assignment section in ${PARKED_USER_ROW_MAX_MS / 1000}s; reading on`);
+      }
+      continue;
+    }
+    if (!hasOwner && nextUser < userSections.length
+      && !(sectionRowAt[nextUser] !== undefined && sectionRowAt[nextUser]! > index)) {
+      const waitKey = userSections[nextUser]!.start;
+      const sinceMs = prevState.sectionRowWait?.assignmentOffset === waitKey ? prevState.sectionRowWait.sinceMs : nowMs;
+      if (userRowsMatch && sectionRowAt[nextUser] === undefined && nowMs - sinceMs <= SECTION_ROW_WAIT_MS) {
+        // This session writes a request row, and this request's is not here
+        // yet: the ownerless row ahead may be earlier work's. Hold both the
+        // section and this frontier briefly for the row.
+        sectionRowWait = { assignmentOffset: waitKey, sinceMs };
+        holdSectionsFrom = nextUser;
+        trajectoryOffset = start;
+        break;
+      }
+      noteStarted(userSections[nextUser]!);
       events.push(userSections[nextUser++]!.event!);
       hasOwner = true;
     }
@@ -402,18 +603,25 @@ export function drainDoubaoTranscript(
       }
       continue; // Ownerless history/cosmetic rows cannot claim a later turn.
     }
-    events.push(event);
-    if (event.kind === 'assistant_final') {
+    events.push(event!);
+    if (event!.kind === 'assistant_final') {
       if (remainingOpen > 0) remainingOpen--;
       hasOwner = remainingOpen > 0;
     }
   }
   // A pending prompt may precede its first trajectory row by several polls.
-  for (; nextUser < userSections.length; nextUser++) events.push(userSections[nextUser]!.event!);
+  if (holdSectionsFrom === undefined) {
+    for (; nextUser < userSections.length; nextUser++) {
+      noteStarted(userSections[nextUser]!);
+      events.push(userSections[nextUser]!.event!);
+    }
+  }
 
   // Park assignment bytes at a torn trailing heading, if any; every complete
-  // section above has been emitted and its bytes may be committed.
-  if (trailingIncomplete) assignmentOffset = trailingIncomplete.start;
+  // section above has been emitted and its bytes may be committed. A section
+  // held back for its request row is re-read from its own start.
+  if (holdSectionsFrom !== undefined) assignmentOffset = userSections[holdSectionsFrom]!.start;
+  else if (trailingIncomplete) assignmentOffset = trailingIncomplete.start;
   else assignmentOffset = assignmentWindowEnd;
 
   return {
@@ -423,6 +631,14 @@ export function drainDoubaoTranscript(
     // be re-drained on the next tick either; take the max of the two frontiers.
     newOffset: Math.max(trajectoryOffset, fromOffset),
     pendingTail,
-    state: { assignmentOffset, trajectoryOffset, ...(skipTrajectoryTail ? { skipTrajectoryTail: true } : {}) },
+    state: {
+      assignmentOffset,
+      trajectoryOffset,
+      ...(skipTrajectoryTail ? { skipTrajectoryTail: true } : {}),
+      ...(parkedUserRow ? { parkedUserRow } : {}),
+      ...(userRowsMatch ? { userRowsMatch: true } : {}),
+      ...(sectionRowWait ? { sectionRowWait } : {}),
+      ...(startedRequests.length > 0 ? { startedRequests } : {}),
+    },
   };
 }

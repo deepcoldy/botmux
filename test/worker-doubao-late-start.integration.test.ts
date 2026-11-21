@@ -1,0 +1,397 @@
+/**
+ * Doubao input that reaches the CLI while it is still busy.
+ *
+ * Real worker (src/worker.ts) over daemon IPC, a private tmux server, and a
+ * Doubao TUI double (test/helpers/fake-doubao-tui.ts) that follows Doubao
+ * 2.37's composer/queue semantics: Enter while a turn runs parks the input in
+ * Doubao's own send queue, and its native user record is written only when
+ * that queue is pumped after the running work ends.
+ */
+import { execFileSync, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { spawnTsScript } from './helpers/ts-runner.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
+import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
+import { writeFakeDoubaoTui } from './helpers/fake-doubao-tui.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+
+let child: ChildProcess | undefined;
+let root: string | undefined;
+let sessionName: string | undefined;
+let tmuxEnv: NodeJS.ProcessEnv | undefined;
+let tmuxRoot: string | undefined;
+const tmuxAvailable = (() => {
+  try { execFileSync('tmux', ['-V'], { stdio: 'ignore' }); return true; } catch { return false; }
+})();
+
+afterEach(async () => {
+  if (child && child.exitCode === null && child.signalCode === null) {
+    const exited = new Promise<void>(done => child!.once('exit', () => done()));
+    child.kill('SIGKILL');
+    await Promise.race([exited, new Promise<void>(done => setTimeout(done, 2_000))]);
+  }
+  child = undefined;
+  if (sessionName) killWorkerTmuxSession(sessionName, tmuxEnv);
+  if (tmuxEnv) {
+    try { execFileSync('tmux', ['-L', 'botmux', 'kill-server'], { env: tmuxEnv, timeout: 3_000, stdio: 'ignore' }); }
+    catch { /* This test may not have started its private server. */ }
+  }
+  sessionName = undefined;
+  tmuxEnv = undefined;
+  if (tmuxRoot) rmSync(tmuxRoot, { recursive: true, force: true });
+  tmuxRoot = undefined;
+  if (root) rmSync(root, { recursive: true, force: true });
+  root = undefined;
+});
+
+const pause = (ms: number) => new Promise(done => setTimeout(done, ms));
+
+function startScenario(opts: { submitDelayMs?: number } = {}) {
+  root = mkdtempSync(join(tmpdir(), 'doubao-late-start-'));
+  const dataDir = join(root, 'data');
+  mkdirSync(dataDir);
+  const sessionId = randomUUID();
+  const nativeId = '38451111111111111';
+  const systemDir = join(root, '.local', 'share', 'doubao_cli', 'agent_mode', '100', 'workspace',
+    '.sessions', nativeId, 'agents', 'main', 'system');
+  mkdirSync(systemDir, { recursive: true });
+  const assignment = join(systemDir, 'assignment.md');
+  writeFileSync(assignment, '## [2026-01-01T00:00:00Z] 需求\nOld prompt\n\n');
+  writeFileSync(join(systemDir, 'trajectory.jsonl'), JSON.stringify({ role: 'assistant', content: 'Old answer' }) + '\n');
+  const ctlDir = join(root, 'ctl');
+  const inputLog = join(root, 'input.jsonl');
+  const fakeCli = writeFakeDoubaoTui(root, { systemDir, ctlDir, inputLog });
+  if (opts.submitDelayMs) writeFileSync(join(ctlDir, 'submit-delay'), String(opts.submitDelayMs));
+  // Unix socket paths are bounded; keep the private tmux dir short.
+  tmuxRoot = mkdtempSync('/tmp/bmx-dl-');
+  tmuxEnv = privateTmuxEnv(tmuxRoot);
+  delete tmuxEnv.BOTMUX_TMUX_SOCKET;
+  execFileSync('tmux', ['-L', 'botmux', 'new-session', '-d', '-s', 'anchor', 'sleep', '300'],
+    { env: tmuxEnv, timeout: 5_000 });
+  const messages: WorkerToDaemon[] = [];
+  const logs: string[] = [];
+  child = spawnTsScript(resolve('src/worker.ts'), [], {
+    cwd: resolve('.'),
+    env: {
+      ...tmuxEnv, HOME: root, USERPROFILE: root, XDG_DATA_HOME: join(root, '.local', 'share'),
+      SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, BOTMUX_NO_CLAIM: '1',
+      LARK_APP_ID: 'app_doubao', LARK_APP_SECRET: 'test-only',
+    },
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  child.on('message', raw => messages.push(raw as WorkerToDaemon));
+  child.stdout?.on('data', data => logs.push(data.toString()));
+  child.stderr?.on('data', data => logs.push(data.toString()));
+  sessionName = TmuxBackend.sessionName(sessionId);
+  child.send({
+    type: 'init', sessionId, daemonBootId: 'doubao-late-start-boot', chatId: 'oc_test', chatType: 'group',
+    rootMessageId: 'om_root', workingDir: dataDir, cliId: 'doubao', cliPathOverride: fakeCli,
+    cliSessionId: nativeId, resume: true, backendType: 'tmux', launchShell: '/bin/bash',
+    prompt: 'first task: inspect the build', turnId: 'om_turn_1',
+    larkAppId: 'app_doubao', larkAppSecret: 'test-only', apiOnly: true,
+  } satisfies DaemonToWorker);
+  const waitUntil = async (check: () => boolean, what: string, timeoutMs = 20_000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!check()) {
+      if (Date.now() >= deadline || child?.exitCode != null || child?.signalCode != null) {
+        throw new Error(`timed out: ${what}\n${logs.join('').slice(-8000)}`);
+      }
+      await pause(50);
+    }
+  };
+  const control = (name: string, content = '') => writeFileSync(join(ctlDir, name), content);
+  const clear = (name: string) => { try { unlinkSync(join(ctlDir, name)); } catch { /* absent */ } };
+  const assignmentText = () => readFileSync(assignment, 'utf8');
+  const pastes = (needle: string) => (existsSync(inputLog) ? readFileSync(inputLog, 'utf8') : '')
+    .split('\n').filter(Boolean).map(line => JSON.parse(line).data as string)
+    .join('').split(needle).length - 1;
+  const finals = (turnId: string) => messages.filter(msg => msg.type === 'final_output' && msg.turnId === turnId);
+  const uncollected = (turnId: string) => messages.filter(msg => msg.type === 'user_notify'
+    && (msg as { kind?: string }).kind === 'structured_turn_not_collected' && msg.turnId === turnId);
+  const sendMessage = (turnId: string, content: string, dispatchAttempt?: number) => child!.send({
+    type: 'message', turnId, content, ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+  } satisfies DaemonToWorker);
+  /** A person pressing keys in the Web terminal. */
+  const pressInTerminal = (...keys: string[]) => execFileSync('tmux', ['-L', 'botmux', 'send-keys', '-t', sessionName!, ...keys],
+    { env: tmuxEnv, timeout: 5_000 });
+  const pressEnterInTerminal = () => pressInTerminal('Enter');
+  const pane = () => execFileSync('tmux', ['-L', 'botmux', 'capture-pane', '-p', '-t', sessionName!],
+    { env: tmuxEnv, timeout: 5_000 }).toString();
+  const notices = (turnId: string) => messages.filter(msg => msg.type === 'user_notify' && msg.turnId === turnId);
+  return {
+    messages, logs, waitUntil, control, clear, assignmentText, pastes, finals, uncollected, sendMessage,
+    pressEnterInTerminal, pressInTerminal, pane, notices,
+  };
+}
+
+async function finishFirstTurn(s: ReturnType<typeof startScenario>): Promise<void> {
+  await s.waitUntil(() => s.messages.some(msg => msg.type === 'ready'), 'worker ready');
+  await s.waitUntil(() => s.assignmentText().includes('first task'), 'turn 1 native start', 30_000);
+  s.control('finish-1', 'FIRST_ANSWER');
+  await s.waitUntil(() => s.finals('om_turn_1').length > 0, 'turn 1 reply forwarded');
+  await s.waitUntil(() => s.messages.filter(msg => msg.type === 'prompt_ready').length >= 2, 'idle after turn 1');
+}
+
+describe.skipIf(process.platform === 'win32' || !tmuxAvailable)('Doubao input accepted while the CLI is busy', () => {
+  it('holds a follow-up in botmux while Doubao is still running, then delivers it and its reply', async () => {
+    const s = startScenario({ submitDelayMs: 3_000 });
+    await s.waitUntil(() => s.messages.some(msg => msg.type === 'ready'), 'worker ready');
+    await s.waitUntil(() => s.pastes('first task') === 1, 'turn 1 pasted', 30_000);
+    // Arrives while turn 1's write still waits for its receipt.
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.assignmentText().includes('first task'), 'turn 1 native start', 30_000);
+    await pause(1_000);
+    // Doubao writes a content-only assistant record mid-turn and keeps
+    // running tools; its busy footer stays on screen.
+    s.control('midfinal-1', 'Interim note.');
+    // Well past the 20s pre-start lease that used to expire the follow-up.
+    await pause(26_000);
+    // Nothing is typed into Doubao while it visibly works.
+    expect(s.pastes('second task: summarize the failures')).toBe(0);
+    expect(s.uncollected('om_turn_2')).toEqual([]);
+
+    s.control('finish-1', 'FIRST_ANSWER');
+    await s.waitUntil(() => s.assignmentText().includes('second task'), 'turn 2 native start', 30_000);
+    s.control('finish-2', 'SECOND_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'turn 2 reply forwarded');
+    await pause(1_500);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['SECOND_ANSWER']);
+    expect(s.uncollected('om_turn_2')).toEqual([]);
+    expect(s.pastes('second task: summarize the failures')).toBe(1);
+  }, 120_000);
+
+  it('keeps an input that Doubao queued behind its own work attributable until Doubao sends it', async () => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    // Doubao looks idle, but the Enter finds it busy with work that is not a
+    // botmux turn: the input waits in Doubao's own send queue.
+    s.control('background-busy');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.pastes('second task: summarize the failures') === 1, 'turn 2 pasted');
+    await pause(30_000);
+    expect(s.assignmentText()).not.toContain('second task');
+    expect(s.uncollected('om_turn_2')).toEqual([]);
+
+    s.clear('background-busy');
+    await s.waitUntil(() => s.assignmentText().includes('second task'), 'turn 2 native start', 15_000);
+    s.control('finish-2', 'SECOND_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'turn 2 reply forwarded');
+    await pause(1_500);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['SECOND_ANSWER']);
+    expect(s.notices('om_turn_2')).toEqual([]);
+    expect(s.pastes('second task: summarize the failures')).toBe(1);
+  }, 120_000);
+
+  it('stops holding once the queued input is removed in Doubao, reports it once and keeps the session usable', async () => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    s.control('background-busy');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.pastes('second task: summarize the failures') === 1, 'turn 2 pasted');
+    await pause(5_000);
+    // The user removes it from Doubao's queue; Doubao then goes idle without sending it.
+    s.control('drop-queue');
+    s.clear('background-busy');
+    await s.waitUntil(() => s.uncollected('om_turn_2').length > 0, 'uncollected notice once the hold ends', 40_000);
+    expect(s.assignmentText()).not.toContain('second task');
+
+    s.clear('drop-queue');
+    s.sendMessage('om_turn_3', 'third task: list the owners');
+    await s.waitUntil(() => s.assignmentText().includes('third task'), 'next input delivered', 20_000);
+    s.control('finish-2', 'THIRD_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_3').length > 0, 'next reply forwarded');
+    await pause(1_500);
+    expect(s.uncollected('om_turn_2')).toHaveLength(1);
+    expect(s.finals('om_turn_2')).toEqual([]);
+    expect(s.finals('om_turn_3').map(msg => (msg as { content: string }).content)).toEqual(['THIRD_ANSWER']);
+    expect(s.pastes('second task: summarize the failures')).toBe(1);
+  }, 120_000);
+
+  it('keeps a draft Doubao did not submit for a manual Enter, holding later input instead of re-pasting', async () => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    // Doubao's composer refuses the Enter (canSubmit=false): the draft stays.
+    s.control('drop-enter');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.logs.some(line => line.includes('Quarantined input delivery')), 'unconfirmed submit quarantined', 30_000);
+    // A follow-up must not be pasted onto the parked draft.
+    s.sendMessage('om_turn_3', 'third task: list the owners');
+    // The user is told once that the submit was not confirmed.
+    // Two 20s receipt rechecks precede the single warning.
+    await s.waitUntil(() => s.notices('om_turn_2').length > 0, 'unconfirmed-submit notice', 75_000);
+    await pause(5_000);
+    expect(s.pastes('third task: list the owners')).toBe(0);
+    expect(s.uncollected('om_turn_2')).toEqual([]);
+
+    // Well after every lease, the user submits the parked draft by hand.
+    s.clear('drop-enter');
+    s.pressEnterInTerminal();
+    await s.waitUntil(() => s.assignmentText().includes('second task'), 'manual submit reaches Doubao', 10_000);
+    s.control('finish-2', 'SECOND_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'late reply forwarded');
+    // The held follow-up goes out only after that turn, as its own input.
+    await s.waitUntil(() => s.assignmentText().includes('third task'), 'held follow-up delivered', 20_000);
+    s.control('finish-3', 'THIRD_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_3').length > 0, 'follow-up reply forwarded');
+    await pause(1_500);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['SECOND_ANSWER']);
+    expect(s.finals('om_turn_3').map(msg => (msg as { content: string }).content)).toEqual(['THIRD_ANSWER']);
+    expect(s.pastes('second task: summarize the failures')).toBe(1);
+    expect(s.pastes('third task: list the owners')).toBe(1);
+    expect(s.assignmentText().split('third task').length - 1).toBe(1);
+  }, 180_000);
+
+  it.each([
+    ['an ordinary turn', undefined],
+    ['a durable delivery attempt', 1],
+  ] as const)('stops holding later input once the parked draft of %s is cleared by hand', async (_kind, dispatchAttempt) => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    s.control('drop-enter');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures', dispatchAttempt);
+    await s.waitUntil(() => s.logs.some(line => line.includes('Quarantined input delivery')), 'unconfirmed submit quarantined', 30_000);
+    // The user deletes the draft in the Web terminal instead of submitting it.
+    s.clear('drop-enter');
+    for (let i = 0; i < 20 && !s.pane().includes('Ask Doubao to do anything'); i++) {
+      s.pressInTerminal(...Array(120).fill('BSpace'));
+      await pause(300);
+    }
+    s.sendMessage('om_turn_3', 'third task: list the owners');
+    await s.waitUntil(() => s.assignmentText().includes('third task'), 'held follow-up delivered after the draft is gone', 90_000);
+    s.control('finish-2', 'THIRD_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_3').length > 0, 'follow-up reply forwarded');
+    await pause(1_500);
+    expect(s.finals('om_turn_3').map(msg => (msg as { content: string }).content)).toEqual(['THIRD_ANSWER']);
+    expect(s.finals('om_turn_2')).toEqual([]);
+    // An ordinary turn is told once that it was not submitted (a durable
+    // attempt settles through its receiver instead); never re-pasted.
+    expect(s.notices('om_turn_2')).toHaveLength(dispatchAttempt === undefined ? 1 : 0);
+    expect(s.pastes('second task: summarize the failures')).toBe(1);
+    expect(s.pastes('third task: list the owners')).toBe(1);
+  }, 180_000);
+
+  it('does not let a removed queued input park the next turn behind it', async () => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    s.control('background-busy');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.pastes('second task: summarize the failures') === 1, 'turn 2 pasted');
+    await pause(3_000);
+    // Removed from Doubao's queue by hand; the other work then ends.
+    s.control('drop-queue');
+    await pause(600);
+    s.clear('background-busy');
+    await pause(1_000);
+    s.clear('drop-queue');
+    await pause(1_000);
+    // Within 20s of Doubao going idle the next message comes. Its receipt
+    // proves the removed input will never be sent, so its own start and
+    // answer are not parked behind that dead head's lease.
+    s.sendMessage('om_turn_3', 'third task: list the owners');
+    await s.waitUntil(() => s.assignmentText().includes('third task'), 'turn 3 native start', 30_000);
+    await pause(3_000);
+    s.control('finish-2', 'THIRD_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_3').length > 0, 'turn 3 reply forwarded promptly', 8_000);
+    await pause(1_500);
+    expect(s.finals('om_turn_3').map(msg => (msg as { content: string }).content)).toEqual(['THIRD_ANSWER']);
+    expect(s.uncollected('om_turn_2')).toHaveLength(1);
+    expect(s.uncollected('om_turn_3')).toEqual([]);
+  }, 150_000);
+
+  it('keeps a queued input attributable when a panel briefly covers Doubao\'s screen', async () => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    s.control('background-busy');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.pastes('second task: summarize the failures') === 1, 'turn 2 pasted');
+    await pause(3_000);
+    // The user glances at Doubao's queue manager: footer, composer and queue
+    // line are all covered for a moment, nothing is changed.
+    s.control('panel');
+    await pause(3_000);
+    s.clear('panel');
+    await pause(30_000);
+    expect(s.uncollected('om_turn_2')).toEqual([]);
+    s.clear('background-busy');
+    await s.waitUntil(() => s.assignmentText().includes('second task'), 'turn 2 native start', 15_000);
+    s.control('finish-2', 'SECOND_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'turn 2 reply forwarded');
+    await pause(1_500);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['SECOND_ANSWER']);
+    expect(s.uncollected('om_turn_2')).toEqual([]);
+  }, 150_000);
+
+  it('collects a reply whose request row reaches trajectory.jsonl long before its assignment section', async () => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    s.control('row-first', '15000');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.pastes('second task: summarize the failures') === 1, 'turn 2 pasted');
+    // The answer is written while the section is still missing.
+    await pause(4_000);
+    s.control('finish-2', 'SECOND_ANSWER');
+    await s.waitUntil(() => s.assignmentText().includes('second task'), 'turn 2 section', 30_000);
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'turn 2 reply forwarded');
+    await pause(1_500);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['SECOND_ANSWER']);
+    expect(s.uncollected('om_turn_2')).toEqual([]);
+  }, 120_000);
+
+  it('keeps a reply whose request row came first while Doubao went idle long before the section', async () => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    s.control('row-first', '45000');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.pastes('second task: summarize the failures') === 1, 'turn 2 pasted');
+    // Doubao answers within seconds and is idle well past the 20s lease.
+    await pause(2_000);
+    s.control('finish-2', 'SECOND_ANSWER');
+    await s.waitUntil(() => s.assignmentText().includes('second task'), 'turn 2 section', 60_000);
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'turn 2 reply forwarded');
+    await pause(1_500);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['SECOND_ANSWER']);
+    expect(s.uncollected('om_turn_2')).toEqual([]);
+  }, 150_000);
+
+  it('keeps earlier work\'s answer away when the request row of the queued input lands a poll later', async () => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    s.control('submit-delay', '1');
+    s.control('row-after', '400');
+    s.control('background-final', 'LOCAL_ANSWER_NOT_FOR_TURN_2');
+    s.control('background-busy');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.pastes('second task: summarize the failures') === 1, 'turn 2 pasted');
+    await pause(5_000);
+    s.clear('background-busy');
+    await s.waitUntil(() => s.assignmentText().includes('second task'), 'turn 2 native start', 15_000);
+    await pause(1_500);
+    s.control('finish-2', 'SECOND_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'turn 2 reply forwarded');
+    await pause(1_500);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['SECOND_ANSWER']);
+  }, 120_000);
+
+  it('keeps the answer of earlier work away from a queued input Doubao sends right after it', async () => {
+    const s = startScenario();
+    await finishFirstTurn(s);
+    s.control('submit-delay', '1');
+    s.control('background-final', 'LOCAL_ANSWER_NOT_FOR_TURN_2');
+    s.control('background-busy');
+    s.sendMessage('om_turn_2', 'second task: summarize the failures');
+    await s.waitUntil(() => s.pastes('second task: summarize the failures') === 1, 'turn 2 pasted');
+    await pause(5_000);
+    s.clear('background-busy');
+    await s.waitUntil(() => s.assignmentText().includes('second task'), 'turn 2 native start', 15_000);
+    await pause(1_500);
+    s.control('finish-2', 'SECOND_ANSWER');
+    await s.waitUntil(() => s.finals('om_turn_2').length > 0, 'turn 2 reply forwarded');
+    await pause(1_500);
+    expect(s.finals('om_turn_2').map(msg => (msg as { content: string }).content)).toEqual(['SECOND_ANSWER']);
+  }, 120_000);
+});
