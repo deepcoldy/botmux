@@ -49,6 +49,15 @@ const apiError = (uuid: string): TranscriptEvent => ({
 }) as TranscriptEvent;
 const duration = (uuid: string): TranscriptEvent =>
   ({ type: 'system', subtype: 'turn_duration', uuid, timestamp: at() }) as TranscriptEvent;
+/** Claude Code ≥ 2.1.31x: a uuid-less copy of the request's user content,
+ *  written after a fold and before the model's answer to it. */
+const requestCopy = (prompt: string): TranscriptEvent => ({
+  type: 'api-request-blob', sessionId: 's', hash: 'h',
+  message: { role: 'user', content: [
+    { type: 'tool_result', tool_use_id: 'x', content: 'ok' },
+    { type: 'text', text: `<system-reminder>\nThe user sent a new message while you were working:\n${prompt}\n</system-reminder>` },
+  ] },
+}) as unknown as TranscriptEvent;
 
 function harness(opts: { adoptMode?: boolean; folds?: string[]; followUpReply?: boolean; replyDelivery?: 'send' | 'transcript' } = {}) {
   const sent: Array<Record<string, unknown>> = [];
@@ -199,6 +208,18 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     h.emitAtIdle();
     expect(h.replies()).toEqual([['om_B', 'answer', 'text']]);
     expect(h.terminals.find(term => term.turnId === 'om_B')).toEqual({ turnId: 'om_B', status: 'completed' });
+  });
+
+  it('reads past the request copy Claude Code writes before the answer, live and at the turn end', () => {
+    const h = harness();
+    h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), requestCopy(PROMPT_B), text('aB', '用的是 gpt-6-astra。')]);
+    h.live([tool('t1')]);
+    expect(h.replies()).toEqual([['om_B', '用的是 gpt-6-astra。', 'text']]);
+    const atEnd = harness();
+    atEnd.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), requestCopy(PROMPT_B),
+      text('a-final', 'answer and summary', 'end_turn'), duration('dur')]);
+    atEnd.emit();
+    expect(atEnd.replies()).toEqual([['om_B', 'answer and summary', 'text']]);
   });
 
   it('gives a later folded message its own answer and the earlier silent one none', () => {

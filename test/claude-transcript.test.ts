@@ -2349,6 +2349,31 @@ describe('absorbedInputReplyText', () => {
     expect(absorbedInputReplyText(events, 'qB')).toBeUndefined();
     expect(absorbedInputReplyText(events, 'qC')).toEqual({ text: 'CI is green.', lastUuid: 'aC', source: 'text' });
   });
+
+  it('reads past the request copy Claude Code writes before the answer', () => {
+    // Shape of a live 2.1.323 transcript: two messages folded together, then
+    // a uuid-less copy of the request's user content, then the answer.
+    const reminder = (uuid: string, prompt: string): TranscriptEvent => ({
+      type: 'attachment', uuid, renderedRole: 'system',
+      attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+    } as TranscriptEvent);
+    const requestCopy = {
+      type: 'api-request-blob', sessionId: 's', hash: 'h',
+      message: { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'x', content: 'ok' },
+        { type: 'text', text: '<system-reminder>\nThe user sent a new message while you were working:\n等一下，先让我登录\n</system-reminder>' },
+        { type: 'text', text: '<system-reminder>\nThe user sent a new message while you were working:\n你先启动一个 case\n</system-reminder>' },
+      ] },
+    } as unknown as TranscriptEvent;
+    const events = [
+      tool('t0'), toolResult('r0'),
+      reminder('q1', '等一下，先让我登录'), reminder('q2', '你先启动一个 case'),
+      requestCopy, { type: 'api-request' } as unknown as TranscriptEvent,
+      thinking('a1', ''), thinking('a2', '已登录，先启动一个 case。'), tool('t1'),
+    ];
+    expect(absorbedInputReplyText(events, 'q1')).toBeUndefined();
+    expect(absorbedInputReplyText(events, 'q2')).toEqual({ text: '已登录，先启动一个 case。', lastUuid: 'a2', source: 'thinking' });
+  });
 });
 
 describe('AbsorbedReplyCollector (live feed)', () => {

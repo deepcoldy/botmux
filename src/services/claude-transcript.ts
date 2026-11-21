@@ -1469,6 +1469,11 @@ export class AbsorbedReplyCollector {
   feed(ev: TranscriptEvent): boolean {
     if (this.complete) return true;
     if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+    // Claude Code ≥ 2.1.31x writes an `api-request-blob` (a copy of the
+    // request's user content: role "user", no uuid) between a folded input and
+    // the model's answer to it. Read only uuid records, as the bridge queue
+    // does, or that copy passes for the next user prompt.
+    if (!ev.uuid) return false;
     if (isClaudeTurnDurationEvent(ev) || isMeaningfulUserEvent(ev) || isMidTurnAbsorbedQueuedCommand(ev)) {
       return (this.complete = true);
     }
