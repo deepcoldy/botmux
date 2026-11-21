@@ -110,6 +110,8 @@ export async function fixture(enabled: boolean, loadData: false | 'busy' | 'orde
   const rpcRequests = join(root, 'catalog-requests.jsonl');
   const poolConfigPath = join(root, 'pool-config.json');
   const release = join(root, 'release');
+  const capacityPaint = join(root, 'capacity-paint');
+  const dequeued = join(root, 'dequeued.jsonl');
   const crash = join(root, 'crash');
   const replacementExit = join(root, 'replacement-exit');
   const removeCliAfterCatalog = join(root, 'remove-cli-after-catalog');
@@ -205,6 +207,53 @@ function queued() {
 }
 idle();
 for (const delay of [200, 500, 1000]) setTimeout(() => { if (!submitted) idle(); }, delay);
+// queue-after-second models native capacity separately from PTY receipt. The
+// worker may legally type ahead several inputs while the capacity repaint is
+// delayed; only this fixture's native dequeue records execution, not the
+// submissions receipt log or the worker's literal-write IPC events.
+const capacityTurns = [];
+const pendingCapacitySubmissions = [];
+let capacityActive, capacityBlocked = false, capacityPainted = false;
+function paintCapacityQueue() {
+  if (capacityPainted || !fs.existsSync(${JSON.stringify(capacityPaint)})) return;
+  capacityPainted = true;
+  queued();
+}
+function dequeueCapacityTurn(turn) {
+  turn.state = 'dequeued';
+  capacityActive = turn;
+  fs.appendFileSync(${JSON.stringify(dequeued)}, JSON.stringify({ model, text: turn.text, turnId: turn.turnId }) + '\\n');
+  line({ type: 'task_started', turn_id: turn.turnId });
+  line({ type: 'user_message', message: turn.text, images: [], local_images: [], text_elements: [], turn_id: turn.turnId });
+  fs.writeSync(rolloutWriter(), JSON.stringify({ timestamp: new Date().toISOString(), type: 'history_mutation',
+    payload: { version: 1, commit_id: turn.turnId, turn_id: turn.turnId, operation: 'append',
+      items: [{ type: 'function_call', name: 'read_file', call_id: turn.turnId, arguments: '{"path":"src/a.ts"}' }] },
+  }) + '\\n');
+  process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
+}
+function acceptCapacityTurn(turnId, text, first) {
+  const turn = { turnId, text, state: 'queued' };
+  capacityTurns.push(turn);
+  if (!first) capacityBlocked = true;
+  if (!capacityActive && !capacityBlocked) dequeueCapacityTurn(turn);
+  else paintCapacityQueue();
+}
+function settleCapacityTurns() {
+  paintCapacityQueue();
+  if (!fs.existsSync(release)) return;
+  capacityBlocked = false;
+  let completedAny = false;
+  if (capacityActive) {
+    const finished = capacityActive;
+    capacityActive = undefined;
+    finished.state = 'completed';
+    completedAny = true;
+    line({ type: 'task_complete', turn_id: finished.turnId, last_agent_message: 'done', duration_ms: 1000 });
+  }
+  const next = capacityTurns.find(turn => turn.state === 'queued');
+  if (next) dequeueCapacityTurn(next);
+  else if (completedAny) idle();
+}
 process.stdin.on('data', chunk => {
   input += chunk;
   const start = input.indexOf('\\x1b[200~');
@@ -213,13 +262,32 @@ process.stdin.on('data', chunk => {
   if (pasted && /[\\r\\n]/.test(input)) {
     const text = pasted; pasted = ''; input = ''; submitted = true; completed = false;
     turnId = require('node:crypto').randomUUID();
-    fs.appendFileSync(${JSON.stringify(submissions)}, JSON.stringify({ model, text }) + '\\n');
+    const submissionRow = JSON.stringify({ model, text }) + '\\n';
+    if (${JSON.stringify(activityMode === 'queue-after-second')} && submissionCount > 0 && !fs.existsSync(release)) {
+      // Both rows are produced by real PTY input. Appending them together makes
+      // the test observe the CI 1 -> 3 window deterministically rather than
+      // depending on whether its 50ms poll happens to sample the intermediate 2.
+      pendingCapacitySubmissions.push(submissionRow);
+      if (pendingCapacitySubmissions.length === 2) {
+        fs.appendFileSync(${JSON.stringify(submissions)}, pendingCapacitySubmissions.join(''));
+        pendingCapacitySubmissions.length = 0;
+      }
+    } else {
+      pendingCapacitySubmissions.push(submissionRow);
+      fs.appendFileSync(${JSON.stringify(submissions)}, pendingCapacitySubmissions.join(''));
+      pendingCapacitySubmissions.length = 0;
+    }
     // delayedHistoryReceipt: the Nth submit's history receipt lands after
     // writeInput's (time-scaled) in-band confirmation budget — the
     // loaded-runner timing that leaves that submit unconfirmed.
     const appendHistory = () => fs.appendFileSync(${JSON.stringify(historyPath)}, JSON.stringify({ session_id: nativeId, ts: Date.now() / 1000, text }) + '\\n');
     if (submissionCount + 1 === ${delayedHistoryReceipt?.submission ?? 0}) setTimeout(appendHistory, ${delayedHistoryReceipt?.ms ?? 0});
     else appendHistory();
+    if (${JSON.stringify(activityMode === 'queue-after-second')}) {
+      submissionCount++;
+      acceptCapacityTurn(turnId, text, submissionCount === 1);
+      return;
+    }
     line({ type: 'task_started', turn_id: turnId });
     line({ type: 'user_message', message: text, images: [], local_images: [], text_elements: [], turn_id: turnId });
     // Real interrupted work leaves model/tool history beyond the user receipt.
@@ -266,6 +334,7 @@ process.stdin.on('data', chunk => {
 });
 setInterval(() => {
   if (fs.existsSync(${JSON.stringify(crash)})) { fs.unlinkSync(${JSON.stringify(crash)}); process.exit(1); }
+  if (${JSON.stringify(activityMode === 'queue-after-second')}) { settleCapacityTurns(); return; }
   if (submitted && !completed && fs.existsSync(release)) {
     completed = true;
     // Keep the preferred successor open so its later crash exercises the
@@ -477,6 +546,6 @@ if (__realSend) process.send = function (msg, callback) {
         sessionCommand: { version: 2, execution } }) } : {}) };
     child.send(message);
   };
-  return { child, spawnWorker, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake, removeCliAfterCatalog,
+  return { child, spawnWorker, messages, wait, submissions, launches, release, capacityPaint, dequeued, nativeId, logs, rpcRequests, init, measurements, crash, fake, removeCliAfterCatalog,
     sendInput, controller, hostErrors, terminalDeliveries, noticeDeliveries, options, entry, ds, poolConfigPath };
 }

@@ -215,14 +215,24 @@ describe('TraeX auto-model real Worker and PTY', () => {
     await f.wait(() => rows(f.submissions).length === 1, 'original working submit');
     f.child.send({ type: 'message', content: 'correction changes capacity', turnId: 'om_capacity' } satisfies DaemonToWorker);
     f.child.send({ type: 'message', content: 'held successor', turnId: 'om_held' } satisfies DaemonToWorker);
-    await f.wait(() => rows(f.submissions).length === 2, 'correction submitted');
-    await new Promise(resolveWait => setTimeout(resolveWait, 1_000));
+    await f.wait(() => rows(f.submissions).length >= 2, 'correction submitted');
+    // The fake CLI received both real type-ahead writes before its capacity
+    // repaint and appended their receipts in one observation window (1 -> 3).
+    // Receipt is not execution: the native FIFO must still hold both successors.
     expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
-      'original working ask', 'correction changes capacity',
+      'original working ask', 'correction changes capacity', 'held successor',
     ]);
+    writeFileSync(f.capacityPaint, 'paint');
+    await f.wait(() => f.messages.some(message => message.type === 'screen_update'
+      && message.content.includes('position 1590')), 'capacity queue painted');
+    expect(rows(f.dequeued).map(row => row.text.split(/[\r\n]/)[0])).toEqual(['original working ask']);
     expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
     writeFileSync(f.release, 'finish');
-    await f.wait(() => rows(f.submissions).length === 3, 'held input after composer');
+    await f.wait(() => rows(f.dequeued).filter(row => row.text.startsWith('held successor')).length === 1,
+      'held input dequeued after composer');
+    expect(rows(f.dequeued).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
+      'original working ask', 'correction changes capacity', 'held successor',
+    ]);
     expect(rows(f.submissions).filter(row => row.text.startsWith('held successor'))).toHaveLength(1);
   }, 45_000);
 
@@ -240,10 +250,18 @@ describe('TraeX auto-model real Worker and PTY', () => {
     f.child.send({ type: 'message', content: 'correction changes capacity', turnId: 'om_capacity' } satisfies DaemonToWorker);
     f.child.send({ type: 'message', content: 'held successor', turnId: 'om_held' } satisfies DaemonToWorker);
     await f.wait(() => f.logs.join('').includes(`after unconfirmed submit turn=${quarantinedTurn} `), 'late receipt quarantined');
-    await f.wait(() => rows(f.submissions).length === 2, 'correction submitted');
-    writeFileSync(f.release, 'finish');
-    await f.wait(() => rows(f.submissions).length === 3, 'held input after deferred recheck');
+    await f.wait(() => rows(f.submissions).length >= 2, 'correction submitted');
     expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
+      'original working ask', 'correction changes capacity', 'held successor',
+    ]);
+    writeFileSync(f.capacityPaint, 'paint');
+    await f.wait(() => f.messages.some(message => message.type === 'screen_update'
+      && message.content.includes('position 1590')), 'capacity queue painted');
+    expect(rows(f.dequeued).filter(row => row.text.startsWith('held successor'))).toHaveLength(0);
+    writeFileSync(f.release, 'finish');
+    await f.wait(() => rows(f.dequeued).filter(row => row.text.startsWith('held successor')).length === 1,
+      'held input dequeued after deferred recheck');
+    expect(rows(f.dequeued).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
       'original working ask', 'correction changes capacity', 'held successor',
     ]);
     expect(rows(f.launches).map(row => row.model)).toEqual(['core']);
