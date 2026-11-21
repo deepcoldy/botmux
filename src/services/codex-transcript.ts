@@ -277,6 +277,10 @@ export interface CodexBridgeEvent {
    *  offset and of parse-time timestamp fallbacks. Absent only for events
    *  synthesized without a single backing record. */
   rawId?: string;
+  /** Byte offset of the originating record in this rollout generation. Kept
+   *  separately from {@link uuid} so content-addressed stable ids do not erase
+   *  the physical ordering evidence needed for deferred tool records. */
+  rolloutOffset?: number;
   /** Physical tool-progress position for drivers without native timestamps.
    * Compared only with the same file's submit cursor; never final evidence. */
   progressCursor?: { jsonlPath: string; offset: number };

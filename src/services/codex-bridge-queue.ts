@@ -209,7 +209,7 @@ function rolloutLineOffset(uuid: string): number | undefined {
  * end) is not the model moving on.
  */
 export class CodexSteerReplyCollector {
-  private readonly run: Array<{ text: string; uuid: string }> = [];
+  private readonly run: Array<{ text: string; uuid: string; offset?: number }> = [];
   private done = false;
 
   /** Feed the next record; returns the reply exactly once, when complete. */
@@ -217,13 +217,13 @@ export class CodexSteerReplyCollector {
     if (this.done) return undefined;
     const message = ev.assistantMessage?.trim();
     if (message) {
-      this.run.push({ text: message, uuid: ev.uuid });
+      this.run.push({ text: message, uuid: ev.uuid, offset: ev.rolloutOffset ?? rolloutLineOffset(ev.uuid) });
       return undefined;
     }
     const toolCall = ev.toolCallBoundary === true || ev.cotEntries?.some(entry => entry.kind === 'tool_call');
     if (this.run.length === 0 || !toolCall) return undefined;
-    const at = rolloutLineOffset(ev.uuid);
-    const answeredAt = rolloutLineOffset(this.run[this.run.length - 1].uuid);
+    const at = ev.rolloutOffset ?? rolloutLineOffset(ev.uuid);
+    const answeredAt = this.run[this.run.length - 1].offset;
     if (at !== undefined && answeredAt !== undefined && at < answeredAt) return undefined;
     this.done = true;
     return { text: this.run.map(part => part.text).join('\n\n'), lastUuid: this.run[this.run.length - 1].uuid };

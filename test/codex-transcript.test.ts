@@ -6,6 +6,8 @@ import { CodexBridgeQueue, CodexSteerReplyCollector, type CodexPendingTurn } fro
 import { shouldSuppressStructuredFallback, structuredFallbackKind, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
+import { codexEventsWithStableIds } from '../src/services/codex-rollout-replay.js';
+
 let dir: string;
 let path: string;
 
@@ -217,7 +219,7 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
     type: 'custom_tool_call', name: 'exec', call_id: id, input: 'await tools.exec_command({ cmd: "npm test" })' } });
 
   /** Rollout of one execution with a second Lark message steered into it. */
-  function run(afterSteer: object[]) {
+  function run(afterSteer: object[], withStableIds = false) {
     const now = Date.parse(at(0));
     const q = new CodexBridgeQueue(() => now);
     q.mark('om_task', 'Keep working', now);
@@ -230,6 +232,8 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
       const reply = c.feed(ev);
       if (reply) replies.push([turn.turnId, reply.text]);
     });
+    const ingest = (events: CodexBridgeEvent[]) =>
+      q.ingest(withStableIds ? codexEventsWithStableIds(path, events) : events);
     writeFileSync(path, [
       { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', turn_id: native } },
       userResponseItem('Keep working', at(1)),
@@ -237,9 +241,9 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
       toolCall('c1', 3), toolOutput('c1', 4),
     ].map(ev).join(''));
     const first = drainCodexRollout(path, 0);
-    q.ingest(first.events);
+    ingest(first.events);
     appendFileSync(path, [userResponseItem('下载弄完了吗？可以关窗口了吗', at(5)), ...afterSteer].map(ev).join(''));
-    q.ingest(drainCodexRollout(path, first.newOffset, first.state).events);
+    ingest(drainCodexRollout(path, first.newOffset, first.state).events);
     return { q, replies };
   }
 
@@ -267,13 +271,19 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
     expect(replies).toEqual([['om_followup', '下载已完成，可以关窗口。']]);
   });
 
-  it('is not completed by a shell call recorded before the answer and surfaced at the turn\'s end', () => {
+  it.each([
+    ['raw offset events', false],
+    ['production stable-id events', true],
+  ])('is not completed by a shell call recorded before the answer and surfaced at the turn\'s end (%s)', (_label, withStableIds) => {
+    if (withStableIds) {
+      path = join(dir, 'rollout-2026-04-29T07-00-00-019dd80d-d922-7a11-8339-0208d8c5b4ec.jsonl');
+    }
     const { replies } = run([
       execCall('c2', 6), toolOutput('c2', 7),
       assistantMessageResponseItem('Yes, it finished.', 'commentary', at(8)),
       assistantMessageResponseItem('All done.', 'final_answer', at(9)),
       { timestamp: at(10), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'All done.' } },
-    ]);
+    ], withStableIds);
     expect(replies).toEqual([]);
   });
 
