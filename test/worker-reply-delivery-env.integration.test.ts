@@ -44,7 +44,9 @@ setInterval(()=>{},1000);
     try {
       result = await waitForJsonFile<{ prompt: string; snapshot: unknown }>(output, {
         timeoutMs: WORKER_RESULT_WAIT_MS,
-        shouldStop: () => child.exitCode !== null,
+        // 子进程被 SIGKILL 时 exitCode 仍可能为 null、只填 signalCode，两个都要看，
+        // 否则生产方已死还会空等到超时。
+        shouldStop: () => child.exitCode !== null || child.signalCode !== null,
       });
     } catch (err) {
       throw new Error(`${(err as Error).message}\n--- worker logs ---\n${logs}`);
