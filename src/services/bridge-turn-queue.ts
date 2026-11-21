@@ -312,7 +312,7 @@ export function takeAbsorbedReplyCandidates(
       collector = new AbsorbedReplyCollector();
       collectors.set(absorbed, collector);
     }
-    if (!collector.feed(ev) || !collector.reply()) continue;
+    if (!collector.feed(ev)) continue;
     absorbed.absorbedLiveChecked = true;
     due.push(absorbed);
   }

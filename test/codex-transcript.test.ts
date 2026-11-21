@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexSteerReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { shouldSuppressStructuredFallback, structuredFallbackKind, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
@@ -195,6 +195,101 @@ describe('Codex environment updates in adopted turns', () => {
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe('Codex same-turn steer: the steered message gets its own answer', () => {
+  const native = 'native-turn-steer';
+  const at = (sec: number) => `2026-04-29T07:00:${String(sec).padStart(2, '0')}.000Z`;
+  const toolCall = (id: string, sec: number) =>
+    ({ timestamp: at(sec), type: 'response_item', payload: { type: 'custom_tool_call', name: 'js', call_id: id, input: 'run()' } });
+  const toolOutput = (id: string, sec: number) =>
+    ({ timestamp: at(sec), type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: id, output: 'ok' } });
+
+  /** Rollout of one execution with a second Lark message steered into it. */
+  function run(afterSteer: object[]) {
+    const now = Date.parse(at(0));
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('om_task', 'Keep working', now);
+    q.mark('om_followup', '下载弄完了吗？可以关窗口了吗', now);
+    const collectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
+    const replies: Array<[string, string]> = [];
+    q.setSteerReplyObserver((ev, turn) => {
+      let c = collectors.get(turn);
+      if (!c) collectors.set(turn, c = new CodexSteerReplyCollector());
+      const reply = c.feed(ev);
+      if (reply) replies.push([turn.turnId, reply.text]);
+    });
+    writeFileSync(path, [
+      { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', turn_id: native } },
+      userResponseItem('Keep working', at(1)),
+      assistantMessageResponseItem('Working on it.', 'commentary', at(2)),
+      toolCall('c1', 3), toolOutput('c1', 4),
+    ].map(ev).join(''));
+    const first = drainCodexRollout(path, 0);
+    q.ingest(first.events);
+    appendFileSync(path, [userResponseItem('下载弄完了吗？可以关窗口了吗', at(5)), ...afterSteer].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, first.newOffset, first.state).events);
+    return { q, replies };
+  }
+
+  it('answers it once the model goes back to work, and the turn still ends with its final', () => {
+    const { q, replies } = run([
+      assistantMessageResponseItem('可以关闭下载窗口，下载已经完成。', 'commentary', at(6)),
+      toolCall('c2', 7), toolOutput('c2', 8),
+      assistantMessageResponseItem('Next step done.', 'commentary', at(9)),
+      toolCall('c3', 10), toolOutput('c3', 11),
+      assistantMessageResponseItem('All done.', 'final_answer', at(12)),
+      { timestamp: at(13), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'All done.' } },
+    ]);
+    expect(replies).toEqual([['om_followup', '可以关闭下载窗口，下载已经完成。']]);
+    const ready = q.drainEmittable();
+    expect(ready.map(t => [t.turnId, t.finalText])).toEqual([['om_followup', 'All done.']]);
+  });
+
+  it('leaves an answer that is the final message to the turn\'s own reply', () => {
+    const { replies } = run([
+      toolCall('c2', 6), toolOutput('c2', 7),
+      assistantMessageResponseItem('Yes, it finished; all done.', 'final_answer', at(8)),
+      { timestamp: at(9), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'Yes, it finished; all done.' } },
+    ]);
+    expect(replies).toEqual([]);
+  });
+
+  it('does not treat the first message of an ordinary turn as a steer answer', () => {
+    const now = Date.parse(at(0));
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('om_task', 'Keep working', now);
+    const seen: string[] = [];
+    q.setSteerReplyObserver((_ev, turn) => seen.push(turn.turnId));
+    writeFileSync(path, [
+      { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', turn_id: native } },
+      userResponseItem('Keep working', at(1)),
+      assistantMessageResponseItem('Working on it.', 'commentary', at(2)),
+      toolCall('c1', 3), toolOutput('c1', 4),
+    ].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(seen).toEqual([]);
+  });
+});
+
+describe('CodexSteerReplyCollector', () => {
+  const message = (uuid: string, text: string): CodexBridgeEvent =>
+    ({ uuid, timestampMs: 0, kind: 'cot', text: '', cotEntries: [], assistantMessage: text });
+  const tool = (uuid: string): CodexBridgeEvent =>
+    ({ uuid, timestampMs: 0, kind: 'cot', text: '', cotEntries: [{ kind: 'tool_call', id: uuid, name: 'js', args: '' }] });
+  const thinking = (uuid: string): CodexBridgeEvent =>
+    ({ uuid, timestampMs: 0, kind: 'cot', text: '', cotEntries: [{ kind: 'thinking', text: 'hmm' }] });
+
+  it('waits through tool calls before any answer, joins the answer, and reports it once', () => {
+    const c = new CodexSteerReplyCollector();
+    expect(c.feed(tool('t0'))).toBeUndefined();
+    expect(c.feed(message('m1', 'First part.'))).toBeUndefined();
+    expect(c.feed(thinking('r1'))).toBeUndefined();
+    expect(c.feed(message('m2', '  Second part. '))).toBeUndefined();
+    expect(c.feed(tool('t1'))).toEqual({ text: 'First part.\n\nSecond part.', lastUuid: 'm2' });
+    expect(c.feed(message('m3', 'later narration'))).toBeUndefined();
+    expect(c.feed(tool('t2'))).toBeUndefined();
+  });
 });
 
 describe('codexSessionIdFromRolloutPath', () => {
@@ -949,11 +1044,14 @@ describe('drainCodexRollout', () => {
       ev(assistantFinalResponseItem('step1 step2 DONE')));            // the real terminal
     const r = drainCodexRollout(path, 0);
     // Exactly one user + one assistant_final (from task_complete). Neither
-    // assistant response_item produced an event.
-    expect(r.events).toHaveLength(2);
-    expect(r.events[0].kind).toBe('user');
-    expect(r.events[1].kind).toBe('assistant_final');
-    expect(r.events[1].text).toBe('step1 step2 DONE');
+    // assistant response_item is a boundary: each surfaces only as a 'cot'
+    // record carrying its text, with no thinking-timeline entries.
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'cot', 'cot', 'assistant_final']);
+    expect(r.events.filter(e => e.kind === 'cot').map(e => [e.assistantMessage, e.cotEntries, e.text])).toEqual([
+      ["I'll run the commands.", [], ''],
+      ['step1 step2 DONE', [], ''],
+    ]);
+    expect(r.events[3].text).toBe('step1 step2 DONE');
   });
 
   // Old codex (0.139 / 0.145) still tags the final message phase:'final_answer'

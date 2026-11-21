@@ -313,6 +313,11 @@ export interface CodexBridgeEvent {
   inputTextAliases?: string[];
   /** For kind 'cot': the thinking / tool-call entries parsed from this line. */
   cotEntries?: CodexCotEntry[];
+  /** For kind 'cot' (Codex): the text of an assistant message written inside
+   *  the turn — commentary, or the final answer just before `task_complete`.
+   *  Never a turn boundary and never part of the thinking timeline; it lets
+   *  the worker see what the model said right after a same-turn steer. */
+  assistantMessage?: string;
   /** Optional durable-delivery terminal outcome carried by bridges with an
    *  explicit completion record (for example Grok `turn_completed`). Codex
    *  final-answer records omit it and retain the historical completed
@@ -1909,6 +1914,15 @@ export function drainCodexRollout(
     // collecting turn for the native CoT message; they never start or close
     // a turn (the boundaries above/below stay authoritative).
     if (obj.type === 'response_item') {
+      // Assistant messages: the final answer is still taken from task_complete
+      // (see below); this only exposes what the model said mid-turn.
+      if (p.type === 'message' && p.role === 'assistant') {
+        const message = joinTextBlocks(p.content, 'output_text');
+        if (message.trim()) {
+          events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries: [], assistantMessage: message });
+        }
+        continue;
+      }
       if (p.type === 'custom_tool_call' && typeof p.call_id === 'string' && p.call_id) {
         const deferred = p.name === 'exec' && hasWrappedExecCommand(typeof p.input === 'string' ? p.input : '');
         toolCallDeferralById.set(p.call_id, deferred);

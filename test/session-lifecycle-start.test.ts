@@ -12373,10 +12373,13 @@ describe('folded-turn reply relay', () => {
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
-    expect(forkWorker(makeDs(overrides), 'hello', false)).toBe(true);
-    return { sessionReply, worker: forkMock.mock.results.at(-1)!.value };
+    const ds = makeDs(overrides);
+    expect(forkWorker(ds, 'hello', false)).toBe(true);
+    return { sessionReply, ds, worker: forkMock.mock.results.at(-1)!.value };
   };
   const adopted = { adoptedFrom: { tmuxTarget: 'adopt-folded:0.0', originalCliPid: 23456, cliId: 'claude-code', cwd: REPO } };
+  const claudeSession = { session: { ...makeDs().session, cliId: 'claude-code' } } as Partial<DaemonSession>;
+  beforeEach(() => vi.mocked(getBot).mockImplementation(() => defaultBot({ followUpReply: true })));
   const reply = (turnId: string, answer: string, source: 'text' | 'thinking' = 'text', replyUuid = `${turnId}-a1`) =>
     ({ type: 'absorbed_reply', turnId, answer, replyUuid, source });
   const settle = () => new Promise(resolveTick => setTimeout(resolveTick, 20));
@@ -12416,6 +12419,31 @@ describe('folded-turn reply relay', () => {
     expect((sessionReply.mock.calls[2][5] as { uuid?: string }).uuid).not.toBe(keys[0]);
   });
 
+  it('holds graceful shutdown while a delivery is in flight, and stops retrying once the session moves on', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply')
+      .mockRejectedValueOnce(new Error('lark 5xx (transient)'));
+    const { ds, worker } = forkWithReply(adopted, sessionReply);
+    worker.emit('message', reply('om_followup', 'answer'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.finalOutputDeliveriesInFlight?.size).toBe(1);
+    ds.session.status = 'closed';
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.finalOutputDeliveriesInFlight?.size ?? 0).toBe(0);
+  });
+
+  it('records a reply that is its turn\'s only one as what the turn delivered', async () => {
+    const { sessionReply, ds, worker } = forkWithReply(adopted);
+    worker.emit('message', { ...reply('om_folded', 'answer'), turnReply: true });
+    worker.emit('message', reply('om_steered', 'answer'));
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    await settle();
+    expect(ds.turnTerminalCarriers?.get('om_folded')).toEqual({ messageId: 'om_reply', kind: 'non_patchable', responseKind: 'final' });
+    expect(ds.turnTerminalCarriers?.get('om_steered')).toBeUndefined();
+  });
+
   it('posts an answer from a thinking summary only while thinking is shown', async () => {
     const { sessionReply, worker } = forkWithReply(adopted);
     worker.emit('message', reply('om_text', 'from text', 'text'));
@@ -12425,14 +12453,14 @@ describe('folded-turn reply relay', () => {
     // The card says which kind of output answered.
     expect(thinkingCard.replace('from thinking', '')).not.toBe(textCard.replace('from text', ''));
 
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cotEnabled: false }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ followUpReply: true, cotEnabled: false }));
     worker.emit('message', reply('om_thinking_off', 'hidden thinking', 'thinking'));
     worker.emit('message', reply('om_text_off', 'still shown', 'text'));
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(3));
     await settle();
     expect(sessionReply.mock.calls.map(call => call[4])).toEqual(['om_text', 'om_thinking', 'om_text_off']);
 
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ noCotChats: [makeDs().chatId] }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ followUpReply: true, noCotChats: [makeDs().chatId] }));
     worker.emit('message', reply('om_thinking_chat_off', 'hidden thinking', 'thinking'));
     await settle();
     expect(sessionReply).toHaveBeenCalledTimes(3);
@@ -12449,11 +12477,22 @@ describe('folded-turn reply relay', () => {
     expect(noTransport.sessionReply).not.toHaveBeenCalled();
   });
 
-  it('ignores it from a session that is not adopted', async () => {
-    const { sessionReply, worker } = forkWithReply();
+  it('posts nothing while followUpReply is off, checked when the reply arrives', async () => {
+    const { sessionReply, worker } = forkWithReply(adopted);
+    vi.mocked(getBot).mockImplementation(() => defaultBot());
     worker.emit('message', reply('om_followup', 'a'));
     await settle();
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('takes it from a Codex session, adopted or not, and ignores other sessions that cannot fold input', async () => {
+    const codex = forkWithReply();
+    codex.worker.emit('message', reply('om_steer', 'answered mid-turn'));
+    await vi.waitFor(() => expect(codex.sessionReply).toHaveBeenCalledTimes(1));
+    const claude = forkWithReply(claudeSession);
+    claude.worker.emit('message', reply('om_followup', 'a'));
+    await settle();
+    expect(claude.sessionReply).not.toHaveBeenCalled();
   });
 });
 

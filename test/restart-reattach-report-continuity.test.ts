@@ -614,6 +614,21 @@ describe('same-worker multi-hop in-process runtime continuation (epoch 1 -> 2 ->
         worker,
       ),
     ).toEqual({ kind: 'reject', reason: 'execution_scope_unproven' });
+    // A reply the replaced runtime already produced for that turn is a fact
+    // about it, like its final: still admitted, as history.
+    expect(
+      controller.ingest(
+        {
+          type: 'absorbed_reply',
+          turnId,
+          answer: 'answered before the respawn',
+          replyUuid: 'a1',
+          source: 'text',
+          sessionContract: ctx(7, { runtime: r3, execution }, 'b3-real'),
+        },
+        worker,
+      ),
+    ).toMatchObject({ kind: 'historical' });
   });
 
   it('resolves WorkerSessionEventScope.origin cleanly across same-process binding continuations while failing closed across distinct processes', () => {

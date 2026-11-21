@@ -20636,6 +20636,9 @@ function forkWorkerPrepared(
     // Opt-in native goal status card: the worker reads the CLI goal store only
     // when this is on at worker start; the daemon also checks the live value.
     ...(botCfg.goalStatusCard === true ? { goalStatusCard: true as const } : {}),
+    // Opt-in replies to follow-ups the CLI folded into its running turn: read
+    // at worker start; the daemon also checks the live value before posting.
+    ...(botCfg.followUpReply === true ? { followUpReply: true as const } : {}),
     // Per-session 缓存过期自动压缩 (core/kimi-cache-expiry.ts); later toggles
     // reach the live worker as `kimi_cache_expiry_auto_compact`.
     ...(isKimiCacheExpiryAutoCompactEnabled(ds.session) ? { kimiCacheExpiryAutoCompact: true as const } : {}),
@@ -27654,12 +27657,20 @@ function setupWorkerHandlers(
         break;
       }
       case 'absorbed_reply': {
-        // Adopt: the answer to a message Claude Code folded into the running
-        // turn — live while that turn keeps working, or when it ends. Replied
-        // under the folded message, which the reply quotes, so the card omits
-        // the question. Presentation only: the folded turn ends with its host.
-        if (!ds.adoptedFrom) {
-          logger.warn(`[${t}] Ignored absorbed_reply from non-adopt worker`);
+        // The answer to a Lark message the CLI folded into its running turn
+        // (Claude Code adopt: a mid-turn system reminder; Codex: a same-turn
+        // steer), posted as soon as the model answered it. Replied under that
+        // message, which the reply quotes, so the card omits the question.
+        // Presentation only: the turn's lifecycle is unchanged.
+        if (!ds.adoptedFrom && effectiveCliId !== 'codex') {
+          logger.warn(`[${t}] Ignored absorbed_reply from a session that cannot fold input`);
+          break;
+        }
+        // Opt-in per bot, read live: turning it off stops posting at once.
+        let followUpReply = false;
+        try { followUpReply = getBot(ds.larkAppId).config.followUpReply === true; } catch { /* bot gone */ }
+        if (!followUpReply) {
+          logger.info(`[${t}] Follow-up reply not posted: followUpReply is off`);
           break;
         }
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
@@ -27684,17 +27695,27 @@ function setupWorkerHandlers(
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
         });
-        // The worker sends a folded turn's reply once. Retry it like a bridge
-        // final; the provider key keeps an attempt whose response was lost
-        // from posting a second copy.
+        // The worker sends this reply once. Retry it like a bridge final — a
+        // daemon-owned delivery a graceful shutdown waits for — and let the
+        // provider key keep an attempt whose response was lost from posting a
+        // second copy.
         const uuid = absorbedReplyUuid(ds.session.sessionId, msg.turnId, msg.replyUuid);
+        const finishDelivery = beginFinalOutputDelivery(ds, msg.turnId);
         void deliverWithRetry(
           () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid }),
-          ownsWorkerSession,
-          (attempt, err) => logger.warn(`[${t}] Folded-turn reply attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`),
-        ).then(delivered => {
-          if (!delivered) logger.error(`[${t}] Gave up delivering folded-turn reply for turn ${msg.turnId.substring(0, 8)}`);
-        });
+          ownsLifecycleMutation,
+          (attempt, err) => logger.warn(`[${t}] Follow-up reply attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`),
+        ).then(result => {
+          if (!result.delivered) {
+            logger.error(`[${t}] Gave up delivering follow-up reply for turn ${msg.turnId.substring(0, 8)}`);
+            return;
+          }
+          // The turn's only reply: it is what this turn delivered.
+          if (msg.turnReply && typeof result.value === 'string' && result.value) {
+            recordTurnTerminalCarrier(ds, msg.turnId, { messageId: result.value, kind: 'non_patchable', responseKind: 'final' });
+            noteFinalOutputReceipt(ds, msg.turnId, { text: msg.answer });
+          }
+        }).finally(finishDelivery);
         break;
       }
       case 'adopt_preamble': {
@@ -28294,25 +28315,23 @@ export function absorbedReplyUuid(sessionId: string, turnId: string, replyUuid: 
 }
 
 /** Run `attempt` on the bridge-final backoff until it resolves. Retries stop
- *  once `stillOwned` says the session moved on. Resolves true when an attempt
- *  succeeded. */
-export async function deliverWithRetry(
-  attempt: () => Promise<unknown>,
+ *  once `stillOwned` says the session moved on. */
+export async function deliverWithRetry<T>(
+  attempt: () => Promise<T>,
   stillOwned: () => boolean,
   onFailure: (attemptNo: number, err: unknown) => void,
-): Promise<boolean> {
+): Promise<{ delivered: true; value: T } | { delivered: false }> {
   for (let i = 0; i < FINAL_OUTPUT_RETRY_BACKOFF_MS.length; i++) {
     const delay = FINAL_OUTPUT_RETRY_BACKOFF_MS[i] ?? 0;
     if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
-    if (i > 0 && !stillOwned()) return false;
+    if (i > 0 && !stillOwned()) return { delivered: false };
     try {
-      await attempt();
-      return true;
+      return { delivered: true, value: await attempt() };
     } catch (err) {
       onFailure(i + 1, err);
     }
   }
-  return false;
+  return { delivered: false };
 }
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
