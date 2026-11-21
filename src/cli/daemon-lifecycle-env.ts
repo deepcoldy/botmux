@@ -19,6 +19,7 @@ import { parse } from 'dotenv';
 // (stripDashboardH5Env / redactChildEnv) keeps the family out of the daemon
 // process and every CLI child.
 export const DAEMON_ENV_KEYS = [
+  'BOTMUX_TOPIC_SEARCH',
   'WEB_HOST',
   'WEB_EXTERNAL_HOST',
   'WEB_EXTERNAL_PORT',

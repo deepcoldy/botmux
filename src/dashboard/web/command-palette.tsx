@@ -5,6 +5,7 @@ import { useDeferredValue, useEffect, useId, useLayoutEffect, useMemo, useRef, u
 import type { ReactNode } from 'react';
 import { ModalDialog } from './modal-dialog.js';
 import { useClosedHistorySearch } from './closed-history-search.js';
+import { contentMatchesForQuery } from './store.js';
 import { navigateToHash } from './leave-guard.js';
 import { Html } from './dashboard-components.js';
 import { useDashboardLocale, useDashboardStore } from './react-hooks.js';
@@ -19,6 +20,8 @@ import {
   pushRecentKey,
   readRecentKeys,
   searchPalette,
+  excerptMatchRanges,
+  focusExcerpt,
   splitHighlights,
   type PaletteAction,
   type PaletteGroup,
@@ -251,7 +254,10 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
 
   // 首屏只带最近的已关闭会话：有查询词时去服务端补查更早的已关闭会话，合进 store 后
   // 和其它会话一起参与下面的匹配与排序（#2071：会话含已关闭的历史会话都能搜）。
-  useClosedHistorySearch(open && (scope === 'all' || scope === 'session') ? deferredQuery : '');
+  useClosedHistorySearch(open && (scope === 'all' || scope === 'session') ? deferredQuery : '', undefined, 'command-palette');
+
+  const contentMatches = useMemo(() => contentMatchesForQuery(snapshot.contentSearch, deferredQuery, 'command-palette'),
+    [snapshot.contentSearch, deferredQuery]);
 
   // 每次唤起都是新实例：会话条目按行对象缓存到本次关闭为止，相对时间以唤起时刻为准。
   const sessionCacheRef = useRef<{ key: string; now: number; items: WeakMap<object, PaletteItem> } | null>(null);
@@ -262,9 +268,9 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
       sessionCacheRef.current = { key: cacheKey, now: Date.now(), items: new WeakMap() };
     }
     const cache = sessionCacheRef.current;
-    return buildSessionItems(snapshot.sessions.values(), cache.now, cache.items);
+    return buildSessionItems(snapshot.sessions.values(), cache.now, cache.items, contentMatches);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- store 原地更新 Map，version 才是变化信号
-  }, [open, snapshot.version, locale, authed, namesVersion]);
+  }, [open, snapshot.version, locale, authed, namesVersion, contentMatches]);
   const remoteItems = useMemo(() => (open && authed ? [
     ...buildSkillItems(remote.skills ?? []),
     ...buildAgentItems(remote.agents?.agents ?? [], remote.agents?.links ?? {}),
@@ -285,8 +291,8 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
   );
 
   const result = useMemo(
-    () => searchPalette({ items, query: deferredQuery, scope, recentKeys, expanded }),
-    [deferredQuery, expanded, items, recentKeys, scope],
+    () => searchPalette({ items, query: deferredQuery, scope, recentKeys, expanded, contentMatches }),
+    [deferredQuery, expanded, items, recentKeys, scope, contentMatches],
   );
   const { rows, groups, counts } = result;
   const foundIndex = activeKey ? rows.findIndex(row => rowKey(row) === activeKey) : -1;
@@ -371,7 +377,7 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
       // 选中它，键盘接着往下走。
       const grown = expandGroup(expanded, row.kind);
       setExpanded(grown);
-      const next = searchPalette({ items, query: deferredQuery, scope, recentKeys, expanded: grown });
+      const next = searchPalette({ items, query: deferredQuery, scope, recentKeys, expanded: grown, contentMatches });
       const replacement = next.rows[rows.indexOf(row)];
       setActiveKey(replacement ? rowKey(replacement) : null);
       inputRef.current?.focus();
@@ -536,6 +542,7 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
                     );
                   }
                   const { item, match } = row;
+                  const excerpt = item.excerpt ? focusExcerpt(item.excerpt, deferredQuery) : '';
                   return (
                     <div
                       key={rowKey(row)}
@@ -554,6 +561,11 @@ export function CommandPalette(props: CommandPaletteProps): React.JSX.Element {
                         {item.subtitle ? (
                           <span className="cmdk-item-sub">
                             <Highlighted text={item.subtitle} ranges={match?.subtitleRanges ?? []} />
+                          </span>
+                        ) : null}
+                        {excerpt ? (
+                          <span className="cmdk-item-excerpt">
+                            <Highlighted text={excerpt} ranges={excerptMatchRanges(excerpt, deferredQuery)} />
                           </span>
                         ) : null}
                       </span>

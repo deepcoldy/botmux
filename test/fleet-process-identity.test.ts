@@ -25,6 +25,10 @@ describe('fleet process identity', () => {
     expect(builtinFleetEntryMatches('daemon', '/new/botmux __dashboard')).toBe(false);
     expect(builtinFleetEntryMatches('daemon', '/tmp/index-daemon.js.backup')).toBe(false);
     expect(builtinFleetEntryMatches('dashboard', '/usr/bin/node /new/dist/index-dashboard.js')).toBe(true);
+    expect(builtinFleetEntryMatches('topic-indexer', '/usr/bin/node /old/dist/index-topic-indexer.js')).toBe(true);
+    expect(builtinFleetEntryMatches('topic-indexer', '/new/botmux __topic-indexer')).toBe(true);
+    expect(builtinFleetEntryMatches('topic-indexer', '/new/botmux __daemon')).toBe(false);
+    expect(builtinFleetEntryMatches('topic-indexer', '/new/botmux __topic-indexer-helper')).toBe(false);
     expect(builtinFleetEntryMatches('supervisor', '/usr/bin/node /old/dist/index-supervisor.js')).toBe(true);
     expect(builtinFleetEntryMatches('supervisor', '/new/botmux __supervisor')).toBe(true);
     expect(builtinFleetEntryMatches('supervisor', '/new/botmux __supervisor-helper')).toBe(false);

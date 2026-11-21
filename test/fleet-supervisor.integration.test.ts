@@ -8,8 +8,10 @@ import { FleetSupervisor, pidAlive, type FleetBotSpec } from '../src/core/fleet-
 import { fleetProcessIdentityRuntime } from '../src/core/fleet-process-identity.js';
 import { readDurableProcessIdentity } from '../src/utils/process-identity.js';
 import { readFleetState, mutateFleetState } from '../src/core/fleet-state-store.js';
-import { waitFleetOnline } from '../src/core/fleet-runtime.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { resolveTopicIndexSpec, waitFleetOnline } from '../src/core/fleet-runtime.js';
+import { spawnTsScript, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { pathToFileURL } from 'node:url';
+import { readTopicStatus } from '../src/services/topic-search/status.js';
 
 const dirs: string[] = [];
 const hostProcs: ChildProcess[] = [];
@@ -98,6 +100,63 @@ async function waitFor(fn: () => boolean, timeoutMs = 5000): Promise<boolean> {
 }
 
 describe('FleetSupervisor (live, integration)', () => {
+  it('launches the real topic indexer, restarts it after a crash, and stops its child', async () => {
+    const root = tmp(); const statePath = join(root, 'fleet.json'); const dataDir = join(root, 'data');
+    const distDir = fakeDist(root, STAY);
+    writeFileSync(join(distDir, 'index-topic-indexer.js'), `import(${JSON.stringify(pathToFileURL(resolve('src/index-topic-indexer.ts')).href)});`);
+    const sup = new FleetSupervisor({ statePath, distDir, cwd: process.cwd(), logDir: join(root, 'logs'), daemonNodeArgs: tsRunnerPrefix().prefixArgs,
+      daemonEnv: { ...process.env, HOME: root, USERPROFILE: root, SESSION_DATA_DIR: dataDir, BOTMUX_TOPIC_SEARCH: '1' },
+      policy: { maxRestarts: 3, restartDelayMs: 20 }, log: () => {} });
+    let currentPid = 0;
+    try {
+      sup.start([resolveTopicIndexSpec()]);
+      expect(await waitFor(() => readTopicStatus(dataDir).index.lastSyncAt !== null, 15_000)).toBe(true);
+      currentPid = readFleetState(statePath)?.procs[0]?.pid ?? 0; expect(currentPid).toBeGreaterThan(1);
+      const original = currentPid; process.kill(original, 'SIGKILL');
+      expect(await waitFor(() => {
+        const row = readFleetState(statePath)?.procs[0];
+        return !!row && row.status === 'online' && row.pid > 1 && row.pid !== original && row.restarts >= 1;
+      }, 15_000)).toBe(true);
+      currentPid = readFleetState(statePath)?.procs[0]?.pid ?? 0;
+    } finally { await sup.stopAll(); }
+    expect(await waitFor(() => currentPid > 1 && !pidAlive(currentPid))).toBe(true);
+  }, 40_000);
+
+  it('reclaims a legacy topic-index orphan using the topic entry marker', async () => {
+    const root = tmp(); const statePath = join(root, 'fleet.json'); const distDir = fakeDist(root, STAY);
+    writeFileSync(join(distDir, 'index-topic-indexer.js'), STAY);
+    const orphan = await spawnReadyOrphan([join(distDir, 'index-topic-indexer.js')]);
+    const orphanPid = orphan.pid; if (!orphanPid) throw new Error('orphan failed to spawn');
+    mutateFleetState(statePath, () => ({ supervisorPid: 999_999, supervisorStartedAt: 'old', procs: [{
+      name: 'topic-index', appId: '', pid: orphanPid, generation: 1, status: 'online', restarts: 0, lastExitCode: null, startedAt: 'old',
+    }] }));
+    const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, log: () => {} });
+    try {
+      sup.start([resolveTopicIndexSpec()]);
+      expect(await waitFor(() => !pidAlive(orphanPid))).toBe(true);
+      expect(await waitFor(() => {
+        const row = readFleetState(statePath)?.procs[0];
+        return !!row && row.status === 'online' && row.pid > 1 && row.pid !== orphanPid;
+      })).toBe(true);
+    } finally { await sup.stopAll(); }
+  });
+
+  it('retires a removed topic-index orphan when topic search is off', async () => {
+    const root = tmp(); const statePath = join(root, 'fleet.json'); const distDir = fakeDist(root, STAY);
+    writeFileSync(join(distDir, 'index-topic-indexer.js'), STAY);
+    const orphan = await spawnReadyOrphan([join(distDir, 'index-topic-indexer.js')]);
+    const orphanPid = orphan.pid; if (!orphanPid) throw new Error('orphan failed to spawn');
+    mutateFleetState(statePath, () => ({ supervisorPid: 999_999, supervisorStartedAt: 'old', procs: [{
+      name: 'topic-index', appId: '', pid: orphanPid, generation: 1, status: 'online', restarts: 0, lastExitCode: null, startedAt: 'old',
+    }] }));
+    const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, log: () => {} });
+    try {
+      sup.start([]);
+      expect(await waitFor(() => !pidAlive(orphanPid))).toBe(true);
+      expect(await waitFor(() => readFleetState(statePath)?.procs.some(row => row.name === 'topic-index') === false)).toBe(true);
+    } finally { await sup.stopAll(); }
+  });
+
   it('does not overwrite an unverifiable old App when its process name is reassigned', async () => {
     const root = tmp(); const statePath = join(root, 'fleet.json');
     const distDir = fakeDist(root, STAY);

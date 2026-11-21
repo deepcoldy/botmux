@@ -868,7 +868,7 @@ describe('Agent Workbench 搜索覆盖更早的已关闭会话', () => {
     const titles = () => renderer.root.findAll(node => node.props.role === 'option').map(node => String(node.props['aria-label']));
     expect(titles().some(label => label.includes('Archived ledger migration'))).toBe(false);
     await act(async () => { await vi.advanceTimersByTimeAsync(CLOSED_HISTORY_SEARCH_DEBOUNCE_MS); });
-    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(['/api/sessions?view=closed&q=ledger']);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(['/api/sessions?view=closed&q=ledger', '/api/sessions?view=content&q=ledger']);
     expect(titles().some(label => label.includes('Archived ledger migration'))).toBe(true);
     act(() => renderer.unmount());
   });

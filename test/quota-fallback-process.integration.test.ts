@@ -5,6 +5,7 @@ import {
   readFileSync,
   rmSync,
   writeFileSync,
+  symlinkSync,lstatSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -61,6 +62,26 @@ function cyclicBots() {
 }
 
 describe('quota fallback process boundaries', () => {
+  it.each([false, true])('disabled topic search deletes only a real index directory (symlink=%s)', async linked => {
+    const home = tmp(); const configDir = join(home, '.botmux');
+    const dataDir = join(configDir, 'data'); const directory = join(dataDir, 'topic-search');
+    mkdirSync(dataDir, { recursive: true }); writeFileSync(join(configDir, 'bots.json'), '[]');
+    const protectedDir = join(home, 'protected'); mkdirSync(protectedDir); writeFileSync(join(protectedDir, 'keep'), 'keep');
+    if (linked) symlinkSync(protectedDir, directory, 'dir'); else { mkdirSync(directory); writeFileSync(join(directory, 'index.sqlite'), 'old index'); }
+    const child = spawnTsScript(SUPERVISOR_PATH, [], { cwd: process.cwd(), env: { ...process.env, HOME: home, USERPROFILE: home,
+      SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(configDir, 'bots.json'), BOTMUX_TOPIC_SEARCH: '0', BOTMUX_WORKFLOW: '' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    try {
+      const state = await waitFor(() => {
+        const state = readFleetState(join(configDir, 'fleet-state.json'));
+        return state?.procs.some(proc => proc.name === 'botmux-dashboard' && proc.status === 'online') ? state : null;
+      });
+      expect(state?.procs.some(proc => proc.name === 'topic-index')).toBe(false);
+    } finally {
+      if (child.exitCode === null) { child.kill('SIGTERM'); await new Promise<void>(resolve => child.once('close', () => resolve())); }
+    }
+    if (linked) expect(lstatSync(directory).isSymbolicLink()).toBe(true); else expect(existsSync(directory)).toBe(false);
+    expect(readFileSync(join(protectedDir, 'keep'), 'utf8')).toBe('keep');
+  });
   it('projects only non-cyclic bot daemons into the startup fleet', () => {
     expect(resolveFleetBotsFromEntries(cyclicBots()).map(bot => bot.appId)).toEqual(['cli_safebot']);
   });
@@ -79,6 +100,7 @@ describe('quota fallback process boundaries', () => {
         SESSION_DATA_DIR: join(configDir, 'data'),
         BOTS_CONFIG: join(configDir, 'bots.json'),
         BOTMUX_WORKFLOW: '',
+        BOTMUX_TOPIC_SEARCH: '1',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -87,15 +109,15 @@ describe('quota fallback process boundaries', () => {
       const state = await waitFor(() => {
         if (!existsSync(statePath)) return null;
         const state = JSON.parse(readFileSync(statePath, 'utf8'));
-        return state.procs.length === 1
-          && state.procs[0].name === 'botmux-dashboard'
-          && state.procs[0].status === 'online' ? state : null;
+        return state.procs.length === 2
+          && state.procs.every((proc: { status: string }) => proc.status === 'online')
+          && state.procs.some((proc: { name: string }) => proc.name === 'topic-index') ? state : null;
       });
       // 'online' records a spawn, not Dashboard readiness. Assert the observed
       // snapshot: a child exit can move the on-disk state to 'launching' before
       // a second read, even though this cold-boot observation succeeded.
       expect(state).not.toBeNull();
-      expect(state.procs.map((proc: any) => proc.name)).toEqual(['botmux-dashboard']);
+      expect(state.procs.map((proc: { name: string }) => proc.name)).toEqual(['botmux-dashboard', 'topic-index']);
       expect(state.procs[0].status).toBe('online');
     } finally {
       child.kill('SIGTERM');

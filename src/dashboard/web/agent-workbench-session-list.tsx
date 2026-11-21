@@ -35,6 +35,8 @@ import {
 import { buildChatAppLink } from './agent-workbench-chat.js';
 import { botDisplayName, t } from './ui.js';
 import { useClosedHistorySearch } from './closed-history-search.js';
+import { useDashboardStore } from './react-hooks.js';
+import { contentMatchesForQuery } from './store.js';
 
 /** 行操作按钮用短文字，不用图标——图标要靠猜，两个字直接说清楚做什么。 */
 
@@ -228,7 +230,10 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
   const touchRows = useTouchRowMetrics();
   const [query, setQuery] = useState('');
   // 首屏只带最近的已关闭会话：搜索时去服务端补查更早的已关闭会话（合进 store 后按本地规则过滤）。
-  useClosedHistorySearch(query);
+  useClosedHistorySearch(query, undefined, 'workbench');
+  const snapshot = useDashboardStore();
+  const contentIds = useMemo(() => new Set(contentMatchesForQuery(snapshot.contentSearch, query, 'workbench').keys()),
+    [snapshot.contentSearch, query]);
   const [scrollTop, setScrollTop] = useState(0);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const lastScrolledSelectionRef = useRef<string | null>(props.selectedSessionId ?? null);
@@ -249,8 +254,8 @@ export function WorkbenchSessionList(props: WorkbenchSessionListProps): React.JS
   // 直接进依赖会让 300+ 会话的列表每帧重排一次；量化到分钟就够用了。
   const bucketNow = Math.floor((props.now ?? Date.now()) / 60_000) * 60_000;
   const groups = useMemo(
-    () => groupWorkbenchSessionsForDimension(props.sessions, { query, dimension, unreadIds, now: bucketNow }),
-    [bucketNow, dimension, props.sessions, query, unreadIds],
+    () => groupWorkbenchSessionsForDimension(props.sessions, { query, dimension, unreadIds, now: bucketNow }, contentIds),
+    [bucketNow, dimension, props.sessions, query, unreadIds, contentIds],
   );
   const items = useMemo(() => flattenWorkbenchGroups(groups, collapsedGroups), [collapsedGroups, groups]);
   const visible = useMemo(

@@ -51,6 +51,7 @@ export interface PaletteItem {
   kind: PaletteKind;
   title: string;
   subtitle?: string;
+  excerpt?: string;
   /** 参与匹配但不展示：另一语言的文案、id、路径等。 */
   keywords?: readonly string[];
   /** 行尾弱化信息（相对时间、来源）。 */
@@ -127,6 +128,30 @@ export function nextScope(scope: PaletteScope, delta: 1 | -1, scopes: readonly P
 const CJK_RE = /[⺀-鿿가-힯豈-﫿]/;
 const SEPARATOR_RE = /[\s\-_./\\:·@#()[\]{}|,，。、：（）《》「」【】›>]/;
 const ASCII_PRINTABLE_RE = /^[\x20-\x7e]+$/;
+
+/** Literal query-word highlights for snippets; excerpts never affect metadata scoring. */
+export function excerptMatchRanges(text: string, query: string): TextRange[] {
+  const lower = text.toLowerCase();
+  const ranges: TextRange[] = [];
+  for (const token of tokenizeQuery(query)) {
+    let start = lower.indexOf(token);
+    while (start >= 0) {
+      ranges.push({ start, end: start + token.length });
+      start = lower.indexOf(token, start + token.length);
+    }
+  }
+  return mergeRanges(ranges);
+}
+
+/** Keep the earliest literal hit visible at the start of a single-line excerpt. */
+export function focusExcerpt(excerpt: string, query: string): string {
+  const first = excerptMatchRanges(excerpt, query)[0];
+  if (!first) return excerpt;
+  const before = Array.from(excerpt.slice(0, first.start)).length;
+  if (before <= 20) return excerpt;
+  const focused = Array.from(excerpt).slice(before - 20).join('').replace(/^…+/, '');
+  return `…${focused}`;
+}
 
 export function tokenizeQuery(query: string): string[] {
   return query.trim().toLowerCase().split(/\s+/).filter(Boolean);
@@ -408,6 +433,7 @@ export function searchPalette(input: {
   query: string;
   scope: PaletteScope;
   recentKeys?: readonly string[];
+  contentMatches?: ReadonlyMap<string, { rank: number }>;
   /** 各组被「再显示」放开了几档（见 expandGroup）。 */
   expanded?: ReadonlyMap<PaletteKind, number>;
 }): PaletteSearchResult {
@@ -447,22 +473,26 @@ export function searchPalette(input: {
     return { groups, rows: flatten(groups), counts };
   }
 
-  const matchedByKind = new Map<PaletteKind, Array<{ item: PaletteItem; match: ItemMatch; order: number }>>();
+  const matchedByKind = new Map<PaletteKind, Array<{ item: PaletteItem; match: ItemMatch; order: number; contentRank?: number }>>();
   items.forEach((item, order) => {
-    const match = matchItem(item, tokens);
-    if (!match) return;
+    const metadata = matchItem(item, tokens);
+    const content = item.kind === 'session' ? input.contentMatches?.get(item.key.slice('session:'.length)) : undefined;
+    if (!metadata && !content) return;
+    const match = metadata ?? { score: 0, titleRanges: [], subtitleRanges: [] };
     counts.all++;
     const itemScope = scopeOfKind(item.kind);
     if (itemScope) counts[itemScope]++;
     if (!inScope(item.kind, scope)) return;
     const list = matchedByKind.get(item.kind) ?? [];
-    list.push({ item, match, order });
+    list.push({ item, match, order, contentRank: metadata ? undefined : content?.rank });
     matchedByKind.set(item.kind, list);
   });
 
   const ranked = [...matchedByKind.entries()].map(([kind, list]) => {
     list.sort((a, b) =>
-      b.match.score - a.match.score
+      Number(a.contentRank !== undefined) - Number(b.contentRank !== undefined)
+      || (a.contentRank !== undefined && b.contentRank !== undefined ? a.contentRank - b.contentRank : 0)
+      || b.match.score - a.match.score
       || (b.item.boost ?? 0) - (a.item.boost ?? 0)
       || a.order - b.order);
     return { kind, list, best: list[0]!.match.score + (list[0]!.item.boost ?? 0) };

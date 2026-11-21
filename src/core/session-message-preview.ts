@@ -155,6 +155,13 @@ function safeJsonlKey(value: unknown): string | undefined {
   return /^[A-Za-z0-9_-]+$/.test(key) ? key : undefined;
 }
 
+export function sessionQueueAnchor(
+  session: Pick<Session, 'deferredScheduleRun' | 'scope' | 'chatId' | 'rootMessageId'>,
+): string {
+  return session.deferredScheduleRun?.routingAnchor
+    ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
+}
+
 /**
  * Build the latest user/bot exchange shown on dashboard session cards.
  *
@@ -168,8 +175,7 @@ export function buildSessionMessagePreview(session: Session): SessionMessagePrev
     return { ...CLEARED_SESSION_MESSAGE_PREVIEW };
   }
 
-  const queueAnchor = session.deferredScheduleRun?.routingAnchor
-    ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
+  const queueAnchor = sessionQueueAnchor(session);
   const safeQueueAnchor = safeJsonlKey(queueAnchor);
   // Queue files are keyed by routing anchor, not session id. Both chat-scope
   // (chatId) and thread-scope (rootMessageId) anchors can be re-used after an
