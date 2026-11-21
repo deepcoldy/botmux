@@ -1295,6 +1295,9 @@ export interface StructuredBridgeDrainContext {
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */
   flushTrailingFinal?: boolean;
+  /** Retire a whole conversation: later explicit inputs abandon earlier pending
+   *  turns instead of confirming their waiting narration (Antigravity only). */
+  retirePendingTurns?: boolean;
   /** Number of turns the ATTRIBUTION QUEUE currently holds as started with no
    *  terminal yet, measured by the worker immediately before the drain.
    *  Drivers whose user and final records live in SEPARATE files (doubao:

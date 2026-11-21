@@ -379,6 +379,41 @@ export class CodexBridgeQueue {
    *  to start this turn. Pre-path-known marking is allowed: the worker can
    *  call this before late-attach has located the rollout file, and the
    *  ingest call after attach will still match correctly. */
+  /** Read-only live-offset evidence for an unstarted mark during an
+   *  authoritative transcript rebind. Uses the same fingerprint and freshness
+   *  rules as started-turn rebinding, but never changes native ownership. */
+  matchPendingTurnToUser(turnId: string, ev: CodexBridgeEvent): boolean {
+    if (ev.kind !== 'user') return false;
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && !candidate.started && candidate.finalText === undefined);
+    if (!turn || !this.matchesUserInput(turn, ev)) return false;
+    return turn.markTimeMs === undefined || ev.timestampMs >= turn.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
+  }
+
+  /** Rebind an already-started owner to the SAME logical user record in an
+   *  authoritative replacement transcript. The fingerprint and normal replay
+   *  freshness window must both match; the real event supplies its exact native
+   *  id (including byte offsets) and user proof. No event is ingested here.
+   *  `commit=false` is a side-effect-free match for atomic multi-turn rebinds. */
+  rebindStartedTurnToUser(turnId: string, ev: CodexBridgeEvent, commit = true): boolean {
+    if (ev.kind !== 'user') return false;
+    const turn = this.queue.find(candidate => candidate.turnId === turnId
+      && candidate.started && candidate.finalText === undefined);
+    if (!turn || (turn.sourceTurnId && !ev.sourceTurnId) || !this.matchesUserInput(turn, ev)) return false;
+    if (turn.markTimeMs !== undefined && ev.timestampMs < turn.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS) return false;
+    if (!commit) return true;
+    turn.sourceSessionId = ev.sourceSessionId;
+    if (ev.sourceTurnId) turn.sourceTurnId = ev.sourceTurnId;
+    turn.sourceMessageId = ev.sourceMessageId;
+    turn.transcriptStartTimeMs = ev.timestampMs;
+    turn.nativeUserProof = {
+      uuid: ev.uuid,
+      hash: createHash('sha256').update(ev.text).digest('hex'),
+      timestampMs: ev.timestampMs,
+    };
+    return true;
+  }
+
   mark(
     turnId: string,
     message: string,

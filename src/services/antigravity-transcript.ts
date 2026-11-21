@@ -292,6 +292,14 @@ export interface AntigravityTranscriptState {
   /** Legacy command wait, separate from subagent waits: foreground work can
    *  clear this even when an agy build omitted the command callback. */
   hasPendingTask?: boolean;
+  /** The RUNNING record's logical step. Only its immediate DONE successor is
+   *  accepted as callback-less command-result evidence; poll results can be
+   *  physically written before their lower-step tool_call. */
+  pendingTaskRunningStep?: number;
+  /** The command RUNNING step's immediate non-launch DONE successor landed.
+   *  invoke_subagent may use this narrower callback-less recovery signal;
+   *  the launch alone does not prove an independent command ended. */
+  hasPendingTaskResult?: boolean;
   /** Launched subagents whose first notifications have not arrived,
    *  deduplicated by id. A notification can request guidance rather than
    *  finish the work; send_message does not re-arm this wait because it does
@@ -327,6 +335,10 @@ export interface AntigravityDrainOptions {
   /** Worker-only: release the held trailing candidate after the viewport
    *  quiet-tick probe confirmed the TUI is idle and on the ready marker. */
   flushTrailingFinal?: boolean;
+  /** Worker-only: the whole conversation is being retired. A later explicit
+   *  input abandons earlier pending work in managed mode too, rather than
+   *  promoting its waiting narration to a normal final. */
+  retirePendingTurns?: boolean;
   /** Bind replies to native inputs when a person can also type in the pane. */
   adoptMode?: boolean;
 }
@@ -350,9 +362,17 @@ export function hasAntigravityPendingTasks(state: AntigravityTranscriptState): b
   return !!state.hasPendingTask || !!state.pendingSubagentIds?.length;
 }
 
+function commandState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
+  return state?.hasPendingTask ? {
+    hasPendingTask: true,
+    ...(state.pendingTaskRunningStep !== undefined ? { pendingTaskRunningStep: state.pendingTaskRunningStep } : {}),
+    ...(state.hasPendingTaskResult ? { hasPendingTaskResult: true } : {}),
+  } : {};
+}
+
 function pendingState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
   return {
-    ...(state?.hasPendingTask ? { hasPendingTask: true } : {}),
+    ...commandState(state),
     ...(state?.pendingSubagentIds?.length ? { pendingSubagentIds: [...state.pendingSubagentIds] } : {}),
   };
 }
@@ -423,21 +443,20 @@ function abandonSubagentWaits(state: AntigravityTranscriptState, toolCalls: any[
  *  these tools must NOT clear it — the wait it is part of is still in flight.
  *  Empirically the RUNNING record and these calls are written out of
  *  step_index order, so clearing on every PLANNER tool_call dropped the flag
- *  for the majority of real build/review waits (63%). */
-const TASK_POLL_TOOL_NAMES = new Set(['manage_task', 'schedule']);
+ *  for the majority of real build/review waits (63%). manage_subagents also
+ *  preserves both waits: managing agents says nothing about a command.
+ *  invoke_subagent is deliberately NOT in this set. It is substantive new
+ *  work, so the ordinary foreground branch clears the legacy command wait
+ *  and old candidate while retaining every outstanding subagent id. */
+const TASK_POLL_TOOL_NAMES = new Set(['manage_task', 'schedule', 'manage_subagents']);
 
 function isTaskPollToolCall(toolCall: any): boolean {
   const name = toolCall?.name ?? toolCall?.function?.name;
-  if (typeof name !== 'string') return false;
-  if (TASK_POLL_TOOL_NAMES.has(name)) return true;
-  // Cancellation abandons selected subagents, not an independent command.
-  // Launches and ordinary subagent management (e.g. list) remain foreground
-  // transitions for the legacy missing-command-callback recovery heuristic.
-  // Their foreground path still carries every outstanding subagent id.
-  const action = name === 'manage_subagents'
-    ? decodeArgumentValue(toolCallArguments(toolCall)?.Action)
-    : undefined;
-  return action === 'kill' || action === 'kill_all';
+  return typeof name === 'string' && TASK_POLL_TOOL_NAMES.has(name);
+}
+
+function isSubagentLaunchToolCall(toolCall: any): boolean {
+  return (toolCall?.name ?? toolCall?.function?.name) === 'invoke_subagent';
 }
 
 /** Fold one parsed record into the drain: push confirmed events, hold/cancel
@@ -451,6 +470,7 @@ function foldRecord(
   events: CodexBridgeEvent[],
   state: AntigravityTranscriptState,
   adoptMode: boolean,
+  retirePendingTurns: boolean,
 ): AntigravityTranscriptState {
   const type = obj?.type;
   const turn = state.sourceTurnId ? { sourceTurnId: state.sourceTurnId } : {};
@@ -458,13 +478,17 @@ function foldRecord(
     // Only agy's own explicit submits start bridge turns. Any other source is
     // ignored entirely (and neither confirms nor cancels a candidate).
     if (obj.source !== undefined && obj.source !== 'USER_EXPLICIT') return state;
-    // A new explicit user turn proves the previous loop really ended AND no
-    // background task from it is outstanding: release its held final BEFORE
-    // the user event so turns stay interleaved, and reset the turn state.
+    // A new explicit user turn normally confirms the previous loop. During
+    // conversation retirement, pending work is abandoned in managed mode too:
+    // its waiting narration must not become the old turn's normal answer.
     const uuid = `${path}:${lineStart}`;
-    if (state.provisionalFinal && !(adoptMode && hasAntigravityPendingTasks(state))) {
+    const pending = hasAntigravityPendingTasks(state);
+    const abandonPending = retirePendingTurns && pending;
+    if (state.provisionalFinal && !((adoptMode || retirePendingTurns) && pending)) {
       events.push(state.provisionalFinal);
-    } else if (state.sourceTurnId) {
+    } else if (state.sourceTurnId || abandonPending) {
+      // Managed states have no native id; the queue's current collecting owner
+      // receives this abort. Adopt states route by their exact sourceTurnId.
       events.push({ uuid: `${uuid}:abort`, timestampMs, kind: 'turn_aborted', text: '', ...turn });
     }
     const raw = typeof obj.content === 'string' ? obj.content : '';
@@ -494,7 +518,18 @@ function foldRecord(
       //    final instead of latching forever.
       state = abandonSubagentWaits(state, obj.tool_calls);
       if (obj.tool_calls.every(isTaskPollToolCall)) return state;
-      return { ...turn, ...subagentState(state.pendingSubagentIds) };
+      const hasOrdinaryForeground = obj.tool_calls.some((call: any) =>
+        !isTaskPollToolCall(call) && !isSubagentLaunchToolCall(call));
+      // Ordinary foreground work retains the legacy recovery heuristic. A
+      // subagent launch is narrower: it recovers a missing callback only after
+      // a command-result DONE, never while the command is still merely RUNNING.
+      const launchRecovery = state.hasPendingTaskResult
+        && obj.tool_calls.some(isSubagentLaunchToolCall);
+      return {
+        ...turn,
+        ...(!hasOrdinaryForeground && !launchRecovery ? commandState(state) : {}),
+        ...subagentState(state.pendingSubagentIds),
+      };
     }
     const text = typeof obj.content === 'string' ? obj.content : '';
     if (!text.trim() || (adoptMode && !state.sourceTurnId)) {
@@ -523,16 +558,30 @@ function foldRecord(
   // outstanding-task state must survive it; the completion SYSTEM_MESSAGE is
   // the actual wake-up that clears it.
   if (isBackgroundTaskRunningRecord(obj)) {
-    return { ...state, hasPendingTask: true };
+    const { hasPendingTaskResult: _staleResult, pendingTaskRunningStep: _staleStep, ...rest } = state;
+    const runningStep = typeof obj.step_index === 'number' && Number.isInteger(obj.step_index)
+      ? obj.step_index
+      : undefined;
+    return { ...rest, hasPendingTask: true, ...(runningStep !== undefined ? { pendingTaskRunningStep: runningStep } : {}) };
   }
   if (type === 'GENERIC') {
     // Foreground tool output after a content-only step cancels the candidate;
-    // a possibly-outstanding background task stays recorded.
+    // a possibly-outstanding background task stays recorded. A DONE result can
+    // later support invoke_subagent's callback-less recovery, but a subagent
+    // creation result is not evidence about the independent command.
     const content = typeof obj.content === 'string' ? obj.content : '';
     const ids = obj.status === 'DONE' ? createdSubagentIds(content) : [];
+    // Real background RUNNING/result pairs are consecutive logical steps even
+    // when lower-step planner records physically land between them. Poll DONE
+    // or ERROR records have no such relationship, including reversed writes.
+    const commandResult = state.hasPendingTask
+      && obj.status === 'DONE'
+      && ids.length === 0
+      && state.pendingTaskRunningStep !== undefined
+      && obj.step_index === state.pendingTaskRunningStep + 1;
     return {
       ...turn,
-      ...pendingState(state),
+      ...pendingState(commandResult ? { ...state, hasPendingTaskResult: true } : state),
       ...subagentState([...new Set([...(state.pendingSubagentIds ?? []), ...ids])]),
     };
   }
@@ -558,7 +607,7 @@ function foldRecord(
     const ids = state.pendingSubagentIds?.filter(id => id !== sender);
     return {
       ...turn,
-      ...(!taskSender && !legacyTaskResult && state.hasPendingTask ? { hasPendingTask: true } : {}),
+      ...(!taskSender && !legacyTaskResult ? commandState(state) : {}),
       ...subagentState(ids),
     };
   }
@@ -615,7 +664,7 @@ export function drainAntigravityTranscript(
   for (const { line, lineStart } of iterateJsonlLines(completeText, fromOffset)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state, options.adoptMode === true);
+    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state, options.adoptMode === true, options.retirePendingTurns === true);
   }
 
   // The final object may sit at EOF without a trailing \n until the next turn.
@@ -623,7 +672,7 @@ export function drainAntigravityTranscript(
   if (pendingTail.length > 0) {
     try {
       const obj = JSON.parse(pendingTail);
-      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state, options.adoptMode === true);
+      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state, options.adoptMode === true, options.retirePendingTurns === true);
       newOffset = size;
       pendingTail = '';
     } catch {

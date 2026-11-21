@@ -383,7 +383,11 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
     path,
     offset,
     (ctx.state as AntigravityTranscriptState | undefined) ?? {},
-    { flushTrailingFinal: ctx.flushTrailingFinal, adoptMode: ctx.adoptMode },
+    {
+      flushTrailingFinal: ctx.flushTrailingFinal,
+      retirePendingTurns: ctx.retirePendingTurns,
+      adoptMode: ctx.adoptMode,
+    },
   ),
   stateCommit: 'ingest',
   locate: {

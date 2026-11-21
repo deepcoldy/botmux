@@ -317,22 +317,139 @@ describe('Antigravity subagent final delivery', () => {
     expect(state.pendingSubagentIds).toEqual(['agent-1']);
   });
 
-  it.each(['invoke_subagent', 'manage_subagents'])('recovers a missing command callback before %s work without dropping subagent waits', name => {
-    const call = name === 'manage_subagents' ? { name, args: { Action: '"list"' } } : { name, args: {} };
+  it('recovers a callback-less command at invoke_subagent without flushing before creation lands', () => {
     const first = drain([
       { type: 'USER_INPUT', content: query },
       { type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task' },
       { type: 'GENERIC', status: 'DONE', content: 'Command exited with code 0.\nCommand output:\nDone' },
-      ...(name === 'manage_subagents' ? [created('agent-1')] : []),
-      tools(call),
-      ...(name === 'invoke_subagent' ? [created('agent-1')] : []),
-      planner('Waiting for the reviewer'),
+      planner('Waiting for the command'),
     ]);
     expect(first.map(e => e.kind)).toEqual(['user']);
-    expect(state.pendingSubagentIds).toEqual(['agent-1']);
-    expect(drain()).toEqual([]);
-    expect(drain([reply('agent-1'), planner('Combined final report')]).map(e => e.text)).toEqual(['Combined final report']);
+    expect(state).toMatchObject({ hasPendingTask: true, provisionalFinal: { text: 'Waiting for the command' } });
+
+    // The launch recovers the legacy command wait. Its old narration must be
+    // cancelled, not released before the creation record can block a flush.
+    expect(drain([tools({ name: 'invoke_subagent', args: {} })])).toEqual([]);
     expect(hasAntigravityPendingTasks(state)).toBe(false);
+    expect(state.provisionalFinal).toBeUndefined();
+
+    expect(drain([created('agent-1'), planner('Waiting for the reviewer')])).toEqual([]);
+    expect(state.pendingSubagentIds).toEqual(['agent-1']);
+    expect(state.hasPendingTask).toBeUndefined();
+    expect(drain([reply('agent-1'), planner('Combined final report')]).map(e => e.text))
+      .toEqual(['Combined final report']);
+    expect(state).toEqual({});
+  });
+
+  it('does not treat manage_subagents polling as proof that an independent command ended', () => {
+    drain([
+      { type: 'USER_INPUT', content: query },
+      { type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task' },
+      { type: 'GENERIC', status: 'DONE', content: 'Command exited with code 0.\nCommand output:\nDone' },
+      created('agent-1'),
+      planner('Waiting for the command and reviewer'),
+      tools({ name: 'manage_subagents', args: { Action: '"list"' } }),
+    ]);
+    expect(state).toMatchObject({
+      hasPendingTask: true,
+      pendingSubagentIds: ['agent-1'],
+      provisionalFinal: { text: 'Waiting for the command and reviewer' },
+    });
+    expect(drain()).toEqual([]);
+
+    // The agent's reply clears only its own wait. In particular, a prior list
+    // call must not have made this interim report flushable.
+    expect(drain([reply('agent-1'), planner('Review returned; command still running')])).toEqual([]);
+    expect(state.hasPendingTask).toBe(true);
+    expect(state.pendingSubagentIds).toBeUndefined();
+    expect(drain([reply('parent/task-1'), planner('Combined final report')]).map(e => e.text))
+      .toEqual(['Combined final report']);
+    expect(state).toEqual({});
+  });
+
+  it('keeps a merely RUNNING command across launches and their creation results', () => {
+    drain([
+      { type: 'USER_INPUT', content: query },
+      { type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task' },
+      planner('Command is still running'),
+    ]);
+    expect(drain([tools({ name: 'invoke_subagent', args: {} })])).toEqual([]);
+    expect(state).toMatchObject({ hasPendingTask: true });
+    expect(state.hasPendingTaskResult).toBeUndefined();
+
+    // A second launch after the first creation result must not mistake that
+    // launch-specific DONE for the independent command's result.
+    expect(drain([
+      created('agent-1'),
+      tools({ name: 'invoke_subagent', args: {} }),
+      created('agent-2'),
+      planner('Waiting for reviewers; command still running'),
+    ])).toEqual([]);
+    expect(drain([reply('agent-1'), planner('Waiting for second review; command still running')])).toEqual([]);
+    expect(drain([reply('agent-2'), planner('Review returned; command still running')])).toEqual([]);
+    expect(state.hasPendingTask).toBe(true);
+
+    expect(drain([reply('parent/task-1'), planner('Combined build and review report')]).map(e => e.text))
+      .toEqual(['Combined build and review report']);
+    expect(state).toEqual({});
+  });
+
+  it.each(['manage_task', 'manage_subagents'])('does not use a %s poll result as launch recovery evidence', name => {
+    const call = name === 'manage_subagents' ? { name, args: { Action: '"list"' } } : { name, args: {} };
+    drain([
+      { type: 'USER_INPUT', content: query },
+      { type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task' },
+      tools(call),
+      { type: 'GENERIC', status: 'DONE', content: 'Polling result: task is still running' },
+      planner('Command is still running'),
+    ]);
+    expect(drain([tools({ name: 'invoke_subagent', args: {} })])).toEqual([]);
+    expect(state.hasPendingTask).toBe(true);
+    expect(state.hasPendingTaskResult).toBeUndefined();
+
+    expect(drain([created('agent-1'), planner('Waiting for reviewer; command still running')])).toEqual([]);
+    expect(drain([reply('agent-1'), planner('Review returned; command still running')])).toEqual([]);
+    expect(drain([reply('parent/task-1'), planner('Combined build and review report')]).map(e => e.text))
+      .toEqual(['Combined build and review report']);
+    expect(state).toEqual({});
+  });
+
+  it.each(['manage_task', 'schedule', 'manage_subagents'])('ignores a reversed %s DONE/tool_call write without weakening the command wait', name => {
+    const call = name === 'manage_subagents' ? { name, args: { Action: '"list"' } } : { name, args: {} };
+    drain([
+      { type: 'USER_INPUT', content: query },
+      { type: 'GENERIC', status: 'RUNNING', step_index: 100, content: 'Tool is running as a background task' },
+      { type: 'GENERIC', status: 'DONE', step_index: 3, content: 'Polling result: task is still running' },
+      { ...tools(call), step_index: 2 },
+      planner('Command is still running'),
+      tools({ name: 'invoke_subagent', args: {} }),
+      created('agent-1'),
+      planner('Waiting for reviewer; command still running'),
+    ]);
+    expect(drain([reply('agent-1'), planner('Review returned; command still running')])).toEqual([]);
+    expect(state.hasPendingTask).toBe(true);
+    expect(drain([reply('parent/task-1'), planner('Combined build and review report')]).map(e => e.text))
+      .toEqual(['Combined build and review report']);
+    expect(state).toEqual({});
+  });
+
+  it('keeps the logical command DONE adjacent to RUNNING across an intervening poll ERROR', () => {
+    drain([
+      { type: 'USER_INPUT', content: query },
+      { type: 'GENERIC', status: 'RUNNING', step_index: 100, content: 'Tool is running as a background task' },
+      { ...tools({ name: 'manage_task', args: {} }), step_index: 2 },
+      { type: 'GENERIC', status: 'ERROR', step_index: 3, content: 'Polling failed' },
+      { type: 'GENERIC', status: 'DONE', step_index: 101, content: 'Command exited with code 0.\nCommand output:\nDone' },
+      planner('Waiting for the command'),
+    ]);
+    expect(state).toMatchObject({ hasPendingTask: true, hasPendingTaskResult: true });
+    expect(drain([tools({ name: 'invoke_subagent', args: {} })])).toEqual([]);
+    expect(state.hasPendingTask).toBeUndefined();
+
+    expect(drain([created('agent-1'), planner('Waiting for the reviewer')])).toEqual([]);
+    expect(drain([reply('agent-1'), planner('Combined final report')]).map(e => e.text))
+      .toEqual(['Combined final report']);
+    expect(state).toEqual({});
   });
 
 });
