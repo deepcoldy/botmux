@@ -914,6 +914,7 @@ export class CodexBridgeQueue {
     if (turn.supersededTurns?.length && (turn.sourceTurnId !== ev.sourceTurnId
       || turn.sourceSessionId !== ev.sourceSessionId)) {
       turn.supersededTurns = undefined;
+      turn.steeredMidTurn = undefined;
     }
   }
 

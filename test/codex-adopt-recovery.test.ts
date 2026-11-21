@@ -170,6 +170,38 @@ describe('adopted Codex turn recovery', () => {
     expect(replies).toEqual(['answer']);
   });
 
+  it.each([
+    ['new', true],
+    ['missing', false],
+  ])('disarms a restored steer with %s native execution proof', (_proof, withNativeProof) => {
+    const native = { sourceTurnId: 'native-old', sourceSessionId: 's' } as const;
+    const user = (text: string, timestampMs: number): CodexBridgeEvent => ({
+      ...native, uuid: `user-${text}`, sourceMessageId: `message-${text}`, timestampMs, kind: 'user', text,
+    });
+    const beforeRestart = new CodexBridgeQueue(() => 10_000);
+    beforeRestart.mark('om_host', 'main task', 10_000);
+    beforeRestart.mark('om_followup', 'question', 10_000);
+    beforeRestart.ingest([user('main task', 10_000), user('question', 11_000)]);
+    checkpointCodexAdoptTurns(path, rollout, beforeRestart);
+
+    const { queue } = restore([], 20_000);
+    const collectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
+    const replies: string[] = [];
+    queue.setSteerReplyObserver((ev, turn) => {
+      let collector = collectors.get(turn);
+      if (!collector) collectors.set(turn, collector = new CodexSteerReplyCollector());
+      const reply = collector.feed(ev);
+      if (reply) replies.push(reply.text);
+    });
+    const rebound = withNativeProof ? { sourceTurnId: 'native-new', sourceSessionId: 's' } as const : {};
+    queue.ingest([
+      { ...rebound, uuid: 'user-new-proof', sourceMessageId: 'message-new-proof', timestampMs: 20_000, kind: 'user', text: 'question' },
+      { ...rebound, uuid: `${rollout}:200`, timestampMs: 21_000, kind: 'cot', text: '', cotEntries: [], assistantMessage: 'ordinary interim narration' },
+      { ...rebound, uuid: `${rollout}:300`, timestampMs: 22_000, kind: 'cot', text: '', cotEntries: [], toolCallBoundary: true },
+    ]);
+    expect(replies).toEqual([]);
+  });
+
   it('keeps this generation as the owner of an already marked message', () => {
     checkpoint();
     const queue = new CodexBridgeQueue(() => 20_000);
