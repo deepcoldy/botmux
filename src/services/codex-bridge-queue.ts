@@ -517,6 +517,9 @@ export class CodexBridgeQueue {
           sourceTurnId: entry.mergedExecution.sourceTurnId,
           sourceSessionId: entry.mergedExecution.sourceSessionId,
           supersededTurns: entry.mergedExecution.supersededTurnIds.map(turnId => ({ turnId })),
+          // A persisted superseded host is the same same-turn steer evidence
+          // that armed the observer before the worker restarted.
+          ...(entry.mergedExecution.supersededTurnIds.length > 0 ? { steeredMidTurn: true } : {}),
         } : {}),
         unconfirmedAttributionStartedAtMs: entry.markTimeMs });
     }

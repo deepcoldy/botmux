@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexSteerReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { splitCodexEventsByCutoff, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from '../src/services/codex-adopt-recovery.js';
 import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
@@ -137,6 +137,37 @@ describe('adopted Codex turn recovery', () => {
     queue.absorb(result.history);
     queue.ingest(result.live);
     expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_new', finalText: 'Finished' }]);
+  });
+
+  it('resumes live replies for a restored same-turn steer after its host is gone', () => {
+    const native = { sourceTurnId: 'native-steer', sourceSessionId: 's' } as const;
+    const user = (text: string, timestampMs: number): CodexBridgeEvent => ({
+      ...native, uuid: `user-${text}`, sourceMessageId: `message-${text}`, timestampMs, kind: 'user', text,
+    });
+    const beforeRestart = new CodexBridgeQueue(() => 10_000);
+    beforeRestart.mark('om_host', 'main task', 10_000);
+    beforeRestart.mark('om_followup', 'question', 10_000);
+    beforeRestart.ingest([user('main task', 10_000), user('question', 11_000)]);
+    checkpointCodexAdoptTurns(path, rollout, beforeRestart);
+    expect(readBridgeTurnJournal(path)).toMatchObject([{
+      turnId: 'om_followup', mergedExecution: { sourceTurnId: 'native-steer', supersededTurnIds: ['om_host'] },
+    }]);
+
+    const { queue } = restore([], 20_000);
+    const collectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
+    const replies: string[] = [];
+    queue.setSteerReplyObserver((ev, turn) => {
+      let collector = collectors.get(turn);
+      if (!collector) collectors.set(turn, collector = new CodexSteerReplyCollector());
+      const reply = collector.feed(ev);
+      if (reply) replies.push(reply.text);
+    });
+    queue.ingest([
+      user('question', 11_000),
+      { ...native, uuid: `${rollout}:200`, timestampMs: 20_000, kind: 'cot', text: '', cotEntries: [], assistantMessage: 'answer' },
+      { ...native, uuid: `${rollout}:300`, timestampMs: 21_000, kind: 'cot', text: '', cotEntries: [], toolCallBoundary: true },
+    ]);
+    expect(replies).toEqual(['answer']);
   });
 
   it('keeps this generation as the owner of an already marked message', () => {
