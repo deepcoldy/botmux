@@ -7,7 +7,8 @@ import { createSubmitFailureChainController } from '../src/services/submit-failu
 import { combineSubmitCurrentFences, settleDeferredSubmitConfirmation } from '../src/services/submit-confirmation.js';
 import { buildSubmitMessagePreview } from '../src/services/submit-notification.js';
 import { claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning, diagnoseBackendSubmitFailure,
-  shouldWaitThroughBusyTurn } from '../src/services/submit-failure-diagnosis.js';
+  diagnoseSubmitFailure, shouldWaitThroughBusyTurn } from '../src/services/submit-failure-diagnosis.js';
+import { screenMayShowCredential } from '../src/core/cli-startup-blocker.js';
 import { loadWorkerMessageHandler, loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { classifyStuckPage } from '../src/utils/stuck-detector.js';
 
@@ -58,6 +59,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     SUBMIT_DIAG_BUSY_SILENCE_MAX_EXTRA: 12, SUBMIT_DIAG_ACTIVE_SILENCE_MAX_EXTRA: 3,
     unscopedSubmitFailureChainSequence: 0, effectiveBackendType: 'tmux', lastPtyActivityAtMs: 0,
     captureBackendScreen: () => screen, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+    screenMayShowCredential, diagnoseSubmitFailure,
     traexComposerHoldsInput, diagnoseBackendSubmitFailure, shouldWaitThroughBusyTurn,
     claudeComposerHoldsInput, decideSessionStartGatedSubmitWarning,
     busyProbeRegion: (text: string) => text,
@@ -74,6 +76,7 @@ function fixture(options: { acceptsRescue?: boolean; screen?: string; dispatchAt
     isPromptReady: false, flushPending: vi.fn(),
   };
   scope.currentInputDeliveryQuarantine = loadWorkerFunction('currentInputDeliveryQuarantine', scope);
+  scope.screenShowsCredentialPage = loadWorkerFunction('screenShowsCredentialPage', scope);
   scope.releaseInputDeliveryQuarantine = loadWorkerFunction('releaseInputDeliveryQuarantine', scope);
   scope.traexQuestionCapture = loadWorkerFunction('traexQuestionCapture', scope);
   scope.submitUnconfirmedNotice = loadWorkerFunction('submitUnconfirmedNotice', scope);

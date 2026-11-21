@@ -1936,8 +1936,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 
   // ─── transcript 模式：最终回复卡投递成功后给本轮打「已完成」标签 ──────────
   // replyDelivery=transcript 时最终回复由这条 bridge fallback 主投递；成功后
-  // ds.completedIdleTurnId 记住该轮，idle 卡头改「已完成」。send 模式（缺省）
-  // 必须一个字节都不变。
+  // ds.completedIdleTurnId 记住该轮，idle 卡头改「已完成」。send 模式（显式配置或
+  // CLI 不支持转写）必须一个字节都不变。
   describe('transcript replyDelivery → completedIdleTurnId', () => {
     function armTranscript(): ReturnType<typeof vi.fn> {
       vi.mocked(resolveReplyDelivery).mockReturnValue('transcript');
@@ -1992,8 +1992,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(ds.completedIdleTurnId).toBeUndefined();
     });
 
-    it('unconfigured replyDelivery on claude-code = send by default → does NOT mark the turn', async () => {
-      // 缺省不随 CLI 翻转：没显式配 transcript 就是 send，走不到 completedIdleTurnId。
+    it('unconfigured replyDelivery on claude-code = transcript by default → marks the turn', async () => {
+      // 缺省按 CLI 能力：claude-code 未配置即 transcript，最终回复卡投递成功后打「已完成」。
       vi.mocked(resolveReplyDelivery).mockReturnValue(undefined);
       const sessionReply = vi.fn(async () => 'om_reply');
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
@@ -2002,7 +2002,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
       await vi.advanceTimersByTimeAsync(10);
       expect(sessionReply).toHaveBeenCalledTimes(1);
-      expect(ds.completedIdleTurnId).toBeUndefined();
+      expect(ds.completedIdleTurnId).toBe('turn-1');
     });
 
     it('explicit send mode never sets completedIdleTurnId', async () => {

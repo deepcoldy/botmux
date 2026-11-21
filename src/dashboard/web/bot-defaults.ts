@@ -176,6 +176,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.streamingButton.writeLink', 'botDefaults.streamingButton.compact',
       'botDefaults.streamingButton.stop', 'botDefaults.streamingButton.close',
       'botDefaults.streamingButton.substitute',
+      'botDefaults.streamingCardFoldedLayout',
       'quietPreset.title', 'quietPreset.switch',
     ],
   },
@@ -488,6 +489,7 @@ export type BotDefaultsRow = {
   disableStreamingCard?: boolean;
   replyCardMode?: 'legacy' | 'unified';
   hiddenStreamingCardButtons?: StreamingCardButtonId[];
+  streamingCardFoldedLayout?: boolean;
   pinStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;

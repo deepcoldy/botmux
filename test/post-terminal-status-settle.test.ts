@@ -134,6 +134,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 }));
 
 import { config } from '../src/config.js';
+import { persistStreamCardState } from '../src/core/session-manager.js';
 import {
   initWorkerPool,
   setActiveSessionsRegistry,
@@ -1885,6 +1886,29 @@ describe('starting card health watchdog', () => {
     releaseExitIdle();
     await vi.advanceTimersByTimeAsync(0);
     expect(delivered).toEqual(['working', 'idle', 'working']);
+  });
+});
+
+describe('Antigravity recovery card retry', () => {
+  it('does not repaint a terminalized turn as working when persistence retry finally succeeds', async () => {
+    const ds = makeDs();
+    ds.session.cliId = 'antigravity';
+    activate(ds);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const dispatch = async (message: WorkerToDaemon) => {
+      for (const listener of (ds.worker as any).listeners('message')) await listener(message);
+      await vi.advanceTimersByTimeAsync(0);
+    };
+    await dispatch(terminalMsg(TURN));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(lastPatchedStatus()).toBe('idle');
+    ds.usageLimit = { limited: true, kind: 'usage', retryAtMs: Date.now() + 60_000, retryLabel: '1m', retryReady: false, source: 'antigravity-error-composer' };
+    ds.lastScreenStatus = 'limited';
+    vi.mocked(persistStreamCardState).mockImplementationOnce(() => { throw new Error('first clear fails'); });
+    await dispatch({ type: 'screen_update', content: 'composer', status: 'working', turnId: TURN, usageLimitRecovery: 'antigravity-ready-composer' });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(ds.usageLimit).toBeUndefined();
+    expect(lastPatchedStatus()).not.toBe('working');
   });
 });
 

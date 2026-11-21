@@ -1,8 +1,9 @@
+import { spawn } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { closeSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { listProcessOpenFiles } from '../src/utils/process-open-files.js';
+import { listProcessOpenFiles, probeProcessOpenFiles, processOpenFilesDenial } from '../src/utils/process-open-files.js';
 
 let dir: string;
 
@@ -44,6 +45,24 @@ describe('listProcessOpenFiles', () => {
       expect(listProcessOpenFiles(process.pid, { skipDeleted: true })).not.toContain(`${file} (deleted)`);
     } finally {
       closeSync(fd);
+    }
+  });
+
+  // procfs gives an exited-but-unreaped process's fd directory to root, so a
+  // non-root caller is refused it exactly like a sandbox it may not read. That
+  // process is gone, not hidden: it must never be reported as a refusal.
+  it.skipIf(process.platform !== 'linux')('never reports an exited, unreaped process as a refusal', async () => {
+    // `sleep 0` exits; its parent execs into a `sleep` that never reaps it.
+    const parent = spawn('sh', ['-c', 'sleep 0 & echo $!; exec sleep 5'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    try {
+      const pid = Number(await new Promise<string>(resolve => parent.stdout!.once('data', d => resolve(String(d).trim()))));
+      const state = () => { try { return readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { return ''; } };
+      for (let i = 0; i < 100 && !/\) Z /.test(state()); i++) await new Promise(r => setTimeout(r, 20));
+      expect(state()).toMatch(/\) Z /);
+      expect(probeProcessOpenFiles(pid).status).not.toBe('denied');
+      expect(processOpenFilesDenial(pid)).toBeUndefined();
+    } finally {
+      parent.kill('SIGKILL');
     }
   });
 

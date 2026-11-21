@@ -99,7 +99,9 @@ const EMPTY_COMPOSER_HINTS = new Set([
  * A collapsed chip is usable only together with the worker's unchanged
  * external-input generation: its character count alone is not ownership.
  * The provisional shortcut-only startup composer can show a pasted draft while
- * still dropping Enter, so it must not consume the worker's one-shot rescue. */
+ * still dropping Enter, so it must not consume the worker's one-shot rescue.
+ * A parked draft changes the hint row (see `draftFooter`), so the footer is
+ * judged with the draft-surface hints, never as an empty composer. */
 export function traexComposerHoldsInput(
   screen: string,
   input: string,
@@ -111,7 +113,10 @@ export function traexComposerHoldsInput(
   if (composer < 0 || !input.trim()) return false;
   for (let end = composer + 1; end < rows.length; end++) {
     const empty = [...rows.slice(0, composer), '❯', ...rows.slice(end)].join('\n');
-    if (!traexRestoredComposerReady(empty, { requireThreadReady: opts.requireThreadReady !== false })) continue;
+    if (!traexRestoredComposerReady(empty, {
+      requireThreadReady: opts.requireThreadReady !== false,
+      draftFooter: true,
+    })) continue;
     const body = [rows[composer]!.slice(1), ...rows.slice(composer + 1, end)]
       .join('\n').trim();
     const chip = /^\[Pasted Content (\d+) chars?\]$/i.exec(body);
@@ -130,7 +135,15 @@ export function traexComposerHoldsInput(
  */
 export function traexRestoredComposerReady(
   screen: string,
-  opts: { resumedSession?: boolean; requireThreadReady?: boolean; nativeIdleReported?: boolean } = {},
+  opts: {
+    resumedSession?: boolean;
+    requireThreadReady?: boolean;
+    nativeIdleReported?: boolean;
+    /** The footer belongs to a composer holding a draft (the caller blanked
+     * the draft rows). TraeX swaps the native hint row for draft-only hints
+     * then; only traexComposerHoldsInput judges such a surface. */
+    draftFooter?: boolean;
+  } = {},
 ): boolean {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
@@ -154,6 +167,18 @@ export function traexRestoredComposerReady(
   // its host-provided launch context replaces the banner requirement only
   // for this known nonblocking notification, never arbitrary dialog text.
   const startupRows = rows.slice(0, composer);
+  // With [tui] status_line=[] and approval_policy=never the initialized
+  // footer is intentionally identical to the provisional bare-hint row.
+  // Native idle cannot distinguish them (a stalled catalog also reports it),
+  // but the native content ABOVE the composer can: 0.214.1 PTY recordings with
+  // a hung catalog proxy show the welcome/tip only after initialization, and
+  // cold-resume recordings likewise paint restored transcript rows only after
+  // the resume has completed. This is independent of the hidden status cells.
+  const initializedStartupContent = startupRows.some(row =>
+    /^[ \t]*Good (?:morning|afternoon|evening),[ \t]*\S/.test(row)
+    || /^[ \t]*Tip:[ \t]+\S/.test(row)
+    || /^[ \t]*▍[ \t]+\S/.test(row)
+    || /^[ \t]*Worked for \d/.test(row));
   const repositoryNotice = footer.length === 1
     && /^[ \t]*无法访问 Git 仓库 `[^`\r\n]+`，请确认该仓库权限或地址。[ \t]*$/.test(footer[0]!)
     && (opts.resumedSession === true || (
@@ -179,16 +204,32 @@ export function traexRestoredComposerReady(
   // dropped and the warning indicator becomes the whole footer row.
   const warningIndicator = '⚠[ \\t]+\\d+(?:[ \\t]+warnings?[ \\t]+·[ \\t]+f2[ \\t]+to[ \\t]+view|[ \\t]+·[ \\t]+f2)?';
   const warningSuffix = `(?:[ \\t]+${warningIndicator})?`;
-  const hintOnlyRow = new RegExp(`^[ \\t]*(?:\\? for shortcuts|← for agents)(?:[ \\t]+·[ \\t]+(?:\\? for shortcuts|← for agents))*${warningSuffix}[ \\t]*$`);
+  // A large paste collapses into a `[Pasted Content N chars]` chip and the
+  // hint row becomes the chip's own key hint (0.214.1 and 0.216.0, recorded:
+  // bold `paste again` + dim ` expand`). Below the provisional composer it is
+  // the whole footer; below an initialized one it follows the model/context
+  // row and stays until the footer is redrawn. It never renders under an empty
+  // composer, so only a draft-holding footer may carry it.
+  const hintToken = opts.draftFooter
+    ? '(?:\\? for shortcuts|← for agents|paste again expand)'
+    : '(?:\\? for shortcuts|← for agents)';
+  const hintOnlyRow = new RegExp(`^[ \\t]*${hintToken}(?:[ \\t]+·[ \\t]+${hintToken})*${warningSuffix}[ \\t]*$`);
   const warningOnlyRow = new RegExp(`^[ \\t]*${warningIndicator}[ \\t]*$`);
   const warningOnlyFooter = warningOnlyRow.test(footer[footer.length - 1]!);
   const shortcutOnlyFooter = footer.length === 1 && (hintOnlyRow.test(footer[0]!) || warningOnlyFooter);
   // A fresh 0.214.1 TUI paints this provisional surface BEFORE its app-server
   // thread/start response. It accepts paste then, but drops Enter; the draft
   // survives once initialization finishes. The general restoration predicate
-  // keeps its legacy hint/notice support. Only the native first-input fence
-  // requires either a resolved model footer or a separately observed idle.
-  if (opts.requireThreadReady && (repositoryNotice || shortcutOnlyFooter)) return false;
+  // keeps its legacy hint/notice support. The native first-input fence
+  // requires either a resolved model footer or the independently initialized
+  // startup/transcript content above (which also covers a hidden status line).
+  // A native idle cannot vouch for the shortcut-only surface itself: 0.214.1
+  // and 0.216.0 (fresh and resumed) report idle on it while the model catalog
+  // fetch stalls, and still drop Enter. It still vouches for the repository
+  // notice, which hides both footer rows of an otherwise unknown state.
+  if (opts.requireThreadReady
+    && ((shortcutOnlyFooter && !initializedStartupContent)
+      || (repositoryNotice && !opts.nativeIdleReported))) return false;
   // A working directory wider than the pane truncates the model/context row
   // with a U+2026 ellipsis before the Context cell can render. Such a row
   // still contains the native ` · ` cell separator and ends on the

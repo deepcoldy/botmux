@@ -296,15 +296,36 @@ Other limits:
 
 ## What works inside the sandbox, and what does not
 
-### `botmux send` still works, credentials stay outside
+### `botmux send` still works
 
-When the CLI inside the sandbox calls `botmux send` to post text, cards, images or files, it never gets Lark credentials. The request is written to a session-private relay directory and the daemon outside the sandbox sends it. **The Lark App Secret never enters the sandbox.**
+On Linux, when the CLI inside the sandbox calls `botmux send` to post text, cards, images or files, the request is written to a session-private relay directory and the daemon outside the sandbox sends it. On macOS the allowlist sandbox by default calls Lark itself, after the daemon confirms this turn's origin.
+
+Note: by default the allowlist sandbox **can read** this bot's own Lark App Secret (`<BOT_HOME>/send-cred.json`); `botmux history`, `botmux quoted` and similar commands use it to call Lark directly. Anyone who can steer the agent can therefore have it trade the secret for an app-identity token and skip every daemon-side check. Turn on `sandboxWithholdBotSecret` below if that is not acceptable.
 
 Sending somewhere other than the current topic (`--top-level` for the group's top level, `--chat-id` for another group, `--into` for another message's thread) also works, but the daemon re-checks the destination:
 
 - The session's own chat is always allowed;
 - Any other chat must be a regular group (not a DM, not an external chat) that the bot is in, and the person who sent this turn's message (or the session owner when there is none) must be a member there and allowed to talk to the bot;
 - If any of this cannot be confirmed, the send is refused.
+
+### Keep the bot secret out of the sandbox (`sandboxWithholdBotSecret`) {#withhold-bot-secret}
+
+```json
+"sandbox": "oncall",
+"sandboxWithholdBotSecret": true
+```
+
+When on:
+
+- The sandbox cannot read `send-cred.json`, so the agent never sees this bot's App Secret and cannot mint an app-identity token;
+- `botmux send`, `botmux dispatch`, `botmux history` and `botmux quoted` are written to the session relay directory and executed by the daemon outside the sandbox. This also gives macOS the same relay Linux has;
+- For `history` the daemon always reads the current session; for `quoted` the message must be in this session's chat or it is refused. Images and files from a quoted message are downloaded by the daemon and handed back inside the session relay directory;
+- Relayed `history` supports only `--limit` (at most 100), `--scope` and `--with-card-json`; `quoted` reads one message per call and supports `--raw`. Other options are refused;
+- Other host processes' arguments and environment are hidden from the sandbox (on macOS, process-info on other processes and `kern.procargs` sysctls are denied);
+- This bot's attachment directory `attachments/<appId>` becomes read-only inside the sandbox (incoming attachments stay readable; all writes are done by the daemon);
+- The session's `lark-cli` bot identity (the default and `--as bot`) is unavailable; `--as user` keeps working. Other commands that need to call Lark directly from the sandbox (for example `botmux bots list`) fail.
+
+Applies to the allowlist sandbox (`oncall`) only; scratch is unaffected. Like the other sandbox options it is fixed when a session is created, so a change applies to new sessions.
 
 ### Fleet commands belong on the host
 
@@ -345,6 +366,7 @@ The Linux sandbox relies on kernel namespaces, which Docker-style containers and
 Notes:
 
 - **Which bwrap**: the distro binary at `/usr/bin/bwrap` or `/bin/bwrap` is preferred; only when neither exists is a bwrap from `PATH` used, with a one-time warning in the log. Codex installs its own build at `~/.local/bin/bwrap`; when that comes first, sandboxed sessions exit right after launch. Install the distro `bubblewrap` package to fix it.
+- **A setuid system bwrap** (such as Debian 10's `/usr/bin/bwrap` 0.3.1) creates the sandbox's user namespace as root. When botmux runs as an ordinary user, the kernel then refuses it the sandboxed CLI process's `/proc/<pid>/fd`, even under the same uid. TRAE (`traex`) identifies its session from the kernel lock table `/proc/locks` instead, so replies are still collected; other CLIs that locate their transcript through the files their process has open may not get their replies collected on such a host — the notice in the thread then says "permission denied", and the worker log names the process and the cause. There is no need to remove the setuid bit or loosen kernel settings for this, and you should not.
 - **Symlinked system directories**: when `/opt`, `/usr` or `/etc` is itself a symlink, the sandbox recreates the same symlink inside. If the real path is a directory of the same name (`/opt -> /data00/opt`), it is mounted read-only as before; if it points anywhere else (such as the root of a data disk, `/opt -> /data00`), only the link is recreated and the target is not granted — just the working directory, the CLI runtime and whatever `sandboxPaths` grants explicitly are visible under it, so the baseline `/opt` grant never exposes a whole disk. Add the toolchain subdirectories a session needs from `/opt` to `sandboxPaths.readOnly`.
 - **No downgrade by dropping PID isolation**: other bots' processes on the same host hold plaintext credentials in their environment, which a sandbox without PID isolation could read through `/proc`. So a normal deployment refuses to start when procfs cannot be mounted (only the core-only deployment `BOTMUX_CORE_ONLY=1` allows it).
 

@@ -97,6 +97,26 @@ describe.skipIf(!runnable)('Claude transcript rotation across a daemon restart',
     expect(g.notices().map(n => n.message)).not.toContain(UNREAD_NOTICE);
   }, 150_000);
 
+  it('a pid-state record caught mid-rewrite when the unread turn is judged raises no notice: a later look finds the turn', async () => {
+    // Claude rewrites the record in place on the busy→idle edge the turn is
+    // judged on; on a loaded host the writer can wait between its truncate and
+    // its write past the worker's re-reads (#3639). Here it lands only after
+    // the judgement.
+    const h = setup({ turnMs: 3_500, unknownLayer: 'cli-named-launcher' });
+    const g = h.startWorker();
+    await g.waitFor(() => promptReadyCount(g) > 0, 'the CLI to be ready');
+    await backgroundTurn(h, g, 'R1 before the clear');
+    await passthrough(h, g, '/clear');
+    h.stallPidStateRewrite();
+    // Settled: the prompt edge that judged the turn has passed, the record empty.
+    await runBackgroundTurn(h, g, 'R2 after the clear');
+    expect(g.finals().filter(text => text.includes('R2 ')), g.logs.join('')).toEqual([]);
+    h.landPidStateRewrite();
+    await g.waitFor(() => g.finals().some(text => text.includes('R2 after the clear')), 'the forwarded reply "R2 after the clear"');
+    expect(g.finals().filter(text => text.includes('R2 '))).toHaveLength(1);
+    expect(g.notices().map(n => n.message), g.logs.join('')).not.toContain(UNREAD_NOTICE);
+  }, 150_000);
+
   it('with a pid-state record that keeps the spawn id, /clear is followed through the session files Claude holds open', async () => {
     // The record still names the pre-clear transcript after /clear; the tasks
     // dir Claude holds open names the session it writes now.

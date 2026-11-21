@@ -18,6 +18,7 @@ import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vites
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setImmediate as realSetImmediate, setTimeout as realSetTimeout, clearTimeout as realClearTimeout } from 'node:timers';
 
 // Factories use a synchronous `require`, never `await vi.importActual(...)`: bun's `vi`
 // shim has no `importActual`, and a fill that resolved without loading the module would
@@ -1704,6 +1705,28 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
 
   const logged = (text: string) => errSpy.mock.calls.some((call: unknown[]) => String(call[0]).includes(text));
 
+  /** Step the fake clock while draining the real Promise chain. A chain that
+   * schedules its next fake timer during the drain can never be released by
+   * realSetImmediate alone; the real wall clock only bounds the whole wait. */
+  async function untilSettled(check: () => boolean, message: string): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = realSetTimeout(() => reject(new Error(message)), 10_000);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([
+        (async () => {
+          while (!check()) {
+            await vi.advanceTimersByTimeAsync(100);
+            await new Promise<void>(r => realSetImmediate(r));
+          }
+        })(),
+        timeout,
+      ]);
+    } finally { if (timer) realClearTimeout(timer); }
+  }
+
   function watch(world: TmuxWorld, target = TARGET, opts: { ownsSession?: boolean; cliPid?: number } = { ownsSession: true }) {
     installTmuxWorld(world, { execFileSync: mockedExecFileSync, execFile: mockedExecFile });
     const be = new TmuxPipeBackend(target, opts);
@@ -1810,6 +1833,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     await vi.advanceTimersByTimeAsync(INITIAL + 3_000 + 100);
     expect(exits).toEqual([]);
     await vi.advanceTimersByTimeAsync(9_000 + 1_000);
+    await untilSettled(() => exits.length === 1, 'dead pane did not settle after the debounce');
     expect(exits).toEqual([[77, null]]);
     expect(syncProbes(world)).toBe(0);
   });
@@ -1821,6 +1845,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     world.pane = { dead: '77' };
 
     await vi.advanceTimersByTimeAsync(LIFECYCLE_IDLE_PROBE_MAX_MS + DEBOUNCE);
+    await untilSettled(() => exits.length === 1, 'idle dead pane did not settle after the debounce');
     expect(exits).toEqual([[77, null]]);
     expect(syncProbes(world)).toBe(0);
   });
@@ -1832,6 +1857,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     await vi.advanceTimersByTimeAsync(INITIAL + 3_000 + 100);
     expect(exits).toEqual([]);
     await vi.advanceTimersByTimeAsync(9_000 + 1_000);
+    await untilSettled(() => exits.length === 1, 'vanished pane did not settle after the debounce');
     expect(exits).toEqual([[1, null]]);
     expect(syncProbes(world)).toBe(0);
   });
@@ -1848,6 +1874,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     };
     const { exits } = watch(world);
     await vi.advanceTimersByTimeAsync(INITIAL + 30_000);
+    await untilSettled(() => logged('recovered on final check'), 'final lenient probe did not settle');
     expect(exits).toEqual([]);
     expect(logged('recovered on final check')).toBe(true);
     expect(syncProbes(world)).toBe(0);

@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type StructuredBridgeSpec } from './types.js';
 import { sessionReadyHookCommand } from '../hook-command.js';
@@ -215,6 +216,8 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       larkToolAppId,
       hideLocalAddresses,
       promptInjection,
+      replyDelivery,
+      solo,
     }) {
       const args: string[] = [];
       if (!disableCliBypass) {
@@ -276,6 +279,12 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
             whiteboardEnabled: whiteboardEnabled(),
           }),
           hideLocalAddresses,
+          // replyDelivery / solo frozen by the daemon for this session, like the
+          // claude / pi / omp system prompts: without them a transcript-default
+          // grok session would be told to `botmux send` every answer while the
+          // daemon also forwards its final. v3 workflow nodes keep send wording.
+          replyDelivery: process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery,
+          solo,
           cliId: 'grok',
         }),
       );

@@ -245,6 +245,7 @@ describe('PromptInjectionSection — reason-specific unsupported note', () => {
   it.each([
     [{ cliId: 'opencode' }, 'cli_unsupported'],
     [{ cliId: 'cursor', sandboxMode: 'scratch' as const }, 'scratch_unsupported_for_cli'],
+    [{ cliId: 'hermes', sandboxMode: 'oncall' as const }, 'oncall_unsupported_for_cli'],
     [{ cliId: 'antigravity', backendType: 'zmx' }, 'zmx_unsupported_for_antigravity'],
   ])('%j → %s', (over, reason) => {
     const view = mount(React.createElement(PromptInjectionSection, { bot: bot({ promptInjection: 'default', ...over }), patchBot: vi.fn() }));

@@ -25,6 +25,16 @@ export interface BridgeReadPosition {
  *  the screen heuristics can end before that write and say nothing. */
 export const BLIND_TURN_MIN_BUSY_MS = 3_000;
 
+/** How often, and how many more times, the worker looks for an unread turn's
+ *  transcript when Claude's pid-state record was caught mid-rewrite. Claude
+ *  rewrites that record in place on the very busy→idle edge the turn is judged
+ *  on, and a loaded host can hold the rewrite between its truncate and its
+ *  write past any fixed re-read window: a single look then reports a reply as
+ *  lost that the next bridge tick delivers. A record that stays unreadable
+ *  across these looks gets the notice a few seconds later. */
+export const UNREAD_TURN_RELOCATE_RETRY_MS = 1_000;
+export const UNREAD_TURN_RELOCATE_RETRIES = 3;
+
 export type BlindTurnVerdict =
   /** No turn evidence since the last prompt, or too short to judge. */
   | { kind: 'none' }
@@ -101,6 +111,17 @@ export class BridgeBlindTurnWatch {
     this.reported = true;
   }
 
+  /** A turn has started since the last prompt edge. */
+  turnInProgress(): boolean {
+    return this.turn !== undefined;
+  }
+
+  /** The unread run that began at `blindSinceMs` is still the current one and
+   *  nobody was told about it: no turn was read since, and no teardown. */
+  isUnreportedRun(blindSinceMs: number): boolean {
+    return this.blindSinceMs === blindSinceMs && !this.reported;
+  }
+
   /** The bridge was torn down (CLI restart / exit): nothing carries over. */
   reset(): void {
     this.idleCompaction = false;
@@ -111,6 +132,25 @@ export class BridgeBlindTurnWatch {
   }
 }
 
+/** Whether any of these transcript records is a reply Claude wrote within
+ *  [fromMs, toMs]: an assistant record, or the turn_duration closing a turn.
+ *  This is only the time-window half of the delivery check. The caller must
+ *  also prove the record was attributed to the unread run: the skew below a
+ *  run's busy evidence can contain the previous turn's reply, which timestamp
+ *  inspection alone cannot distinguish from this run's early first record. */
+export function replyRecordsStampedWithin(
+  records: readonly { type?: unknown; subtype?: unknown; timestamp?: unknown }[],
+  fromMs: number,
+  toMs: number,
+): boolean {
+  return records.some(record => {
+    const reply = record.type === 'assistant' || (record.type === 'system' && record.subtype === 'turn_duration');
+    if (!reply || typeof record.timestamp !== 'string') return false;
+    const atMs = Date.parse(record.timestamp);
+    return atMs >= fromMs && atMs <= toMs;
+  });
+}
+
 export interface BlindTurnNoticeInput {
   /** The transcript carries every reply of this session to the group, local
    *  turns included: adopt mode, or zero-injection terminal sync. */
@@ -119,13 +159,23 @@ export interface BlindTurnNoticeInput {
   unreadLarkTurn: boolean;
   /** The model ran `botmux send` after the turn started. */
   sentDuringTurn: boolean;
+  /** replyDelivery=transcript: a Lark turn's answer is its forwarded final
+   *  reply, and `botmux send` is only for what that reply cannot carry (a
+   *  cross-bot @, an attachment). Only a declared final send then proves the
+   *  answer went out. Omitted = send delivery. */
+  transcriptReplies?: { sentFinalDuringTurn: boolean };
 }
 
 /** Whether an unread turn lost something the group would otherwise have got.
  *  With `botmux send` delivery the transcript is only the fallback for a Lark
  *  turn the model did not answer itself, and a terminal-local turn is never
- *  forwarded at all — telling the group about those would be noise. */
+ *  forwarded at all — telling the group about those would be noise. With
+ *  transcript delivery an ordinary send during the turn does not stand in for
+ *  the lost final; a `--response-kind final` send does. */
 export function blindTurnNeedsNotice(input: BlindTurnNoticeInput): boolean {
   if (input.transcriptCarriesEveryReply) return true;
-  return input.unreadLarkTurn && !input.sentDuringTurn;
+  if (!input.unreadLarkTurn) return false;
+  return input.transcriptReplies
+    ? !input.transcriptReplies.sentFinalDuringTurn
+    : !input.sentDuringTurn;
 }

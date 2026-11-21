@@ -94,10 +94,22 @@ const record = o => {
 // they control whether identity exists, rather than racing the 200ms writer.
 // Withheld until the gate file exists when the scenario wants a transcript
 // nobody can locate.
+const pidStateFile = path.join(cfg.claudeDir, 'sessions', process.pid + '.json');
+// While the stall file exists, a turn's end leaves the record the way Claude's
+// own rewrite on that busy→idle edge reads while the writer waits between its
+// truncate and its write: empty, until the test removes the file.
+let rewriteStalled = false;
+const stallPidStateRewrite = () => {
+  if (!fs.existsSync(cfg.rewriteStallFile) || !fs.existsSync(pidStateFile)) return;
+  fs.writeFileSync(pidStateFile, '');
+  rewriteStalled = true;
+};
 const pidState = () => {
   if (cfg.pidStateGate && !fs.existsSync(cfg.pidStateGate)) return;
+  if (rewriteStalled && fs.existsSync(cfg.rewriteStallFile)) return;
+  rewriteStalled = false;
   fs.mkdirSync(path.join(cfg.claudeDir, 'sessions'), { recursive: true });
-  const file = path.join(cfg.claudeDir, 'sessions', process.pid + '.json');
+  const file = pidStateFile;
   const contents = JSON.stringify({
     pid: process.pid, cwd: cfg.workingDir, procStart, kind: 'interactive',
     // 2.1.123 keeps the spawn-time sessionId in the record across /clear.
@@ -160,6 +172,7 @@ const runTurn = (prompt, reply) => {
     record({ type: 'assistant', message: { role: 'assistant', model: 'claude-fake', content: [{ type: 'text', text: reply }], stop_reason: 'end_turn' } });
     record({ type: 'system', subtype: 'turn_duration', durationMs: cfg.turnMs });
     busy = false;
+    stallPidStateRewrite();
     render();
     programStatus('idle');
     ev({ kind: 'turn', reply });
@@ -293,6 +306,10 @@ export interface Harness {
   /** The id a `--fork-session` launch mints. */
   forkSid: string;
   pidStateGate: string;
+  /** From now on a turn's end leaves the pid-state record mid-rewrite (empty)
+   *  until `landPidStateRewrite`. */
+  stallPidStateRewrite: () => void;
+  landPidStateRewrite: () => void;
   notify: (reply: string) => void;
   commands: () => string[];
   /** Every CLI launch: the session it opened and its argv. */
@@ -460,6 +477,7 @@ export function setupFakeClaude(opts: {
   const transcript = (sid: string) => claudeJsonlPathForSession(sid, workingDir, claudeDir);
   const events = join(root, 'events.jsonl');
   const pidStateGate = join(root, 'pid-state-gate');
+  const rewriteStallFile = join(root, 'pid-state-rewrite-stall');
   if (opts.history) {
     // An older conversation of this session, answered an hour ago.
     const ago = (ms: number) => new Date(Date.now() - 3_600_000 + ms).toISOString();
@@ -472,7 +490,7 @@ export function setupFakeClaude(opts: {
   }
   const configFile = join(root, 'fake-claude.json');
   writeFileSync(configFile, JSON.stringify({
-    events, claudeDir, workingDir, notifyDir, clearSid, forkSid, turnMs: opts.turnMs,
+    events, claudeDir, workingDir, notifyDir, clearSid, forkSid, turnMs: opts.turnMs, rewriteStallFile,
     projectDir: dirname(transcript(sessionId)),
     ...(opts.pidStateGated ? { pidStateGate } : {}),
     ...(opts.atomicPidState ? { atomicPidState: true } : {}),
@@ -556,6 +574,8 @@ child.on('exit', code => process.exit(code ?? 1));
     hideCli: () => renameSync(fakeCli, parkedCli),
     restoreCli: () => renameSync(parkedCli, fakeCli),
     root, sessionId, workingDir, claudeDir, transcript, clearSid, forkSid, pidStateGate, killCli,
+    stallPidStateRewrite: () => writeFileSync(rewriteStallFile, ''),
+    landPidStateRewrite: () => rmSync(rewriteStallFile, { force: true }),
     // Staged outside notifyDir and renamed in: the fake polls notifyDir every
     // 100ms, and a file it reads between creation and write is an empty reply.
     notify: reply => {

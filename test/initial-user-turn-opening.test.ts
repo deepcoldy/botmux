@@ -274,6 +274,10 @@ describe('empty-started session — first real business turn must use the new-to
       larkAppId: APP,
       larkAppSecret: 's',
       cliId: 'codex',
+      // These cases tell the opening envelope from the follow-up one by the
+      // follow-up's <botmux_reminder>, which only send delivery injects; codex
+      // otherwise defaults to transcript (no reminder at all).
+      replyDelivery: 'send',
       allowedUsers: [OWNER],
       oncallChats: [{ chatId: CHAT, workingDir: '/tmp' }],
     });

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
-import { sendCompletionHintKey } from './services/send-completion-hint.js';
+import { replyDeliveryFromEnv, sendCompletionHintKey } from './services/send-completion-hint.js';
 import { selectReplyMessageId, parseReplyMessageTarget, crossChatOriginForSend, crossChatSenderForSend } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
@@ -43,7 +43,7 @@ import type { ManagedScheduleUpdateReceipt } from './core/schedule-managed-updat
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, rmSync, realpathSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
-import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
+import { underReadIsolation, sendCredFilePath, readSendCredJsonWithRetry } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { writeAndFlush } from './cli/stdout-flush.js';
@@ -99,7 +99,7 @@ import {
 } from './autostart.js';
 import { tmuxEnv, clientTmuxVersionForEnv, tmuxVersionAtLeast } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
-import { sandboxEnabled } from './adapters/backend/sandbox.js';
+import { RELAY_SESSION_TOOLS_MARKER, sandboxEnabled } from './adapters/backend/sandbox.js';
 import { mutateBotsJsonAtomic, writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
@@ -8285,6 +8285,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
+  agy-accounts list|save|login|use|next|enable|disable|remove|clear-cooldown|auto-rotate|sync
+              托管 Antigravity (agy) 多账号凭据并配置限额自动轮换（AI CLI 会话内拒绝写操作）
   actor current --json
               返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
   workspace-recycle discover|prepare|finish|status|hook
@@ -8462,6 +8464,8 @@ ${SEND_HELP_BODY}
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"] [--chat-mode group|topic]
                                        用指定 bot 起新群（--chat-mode topic 建话题群）；详见 \`botmux create-group --help\`
+  create-group owner-notice [status|on|off]
+                                       建群后 @ 群主提醒的本机开关（默认开，所有建群入口通用）
 
 精确群对话授权（talk-only）:
   grant chat --bot <receiver> --chat-id <oc_...> --subject-bot <larkAppId>
@@ -9978,6 +9982,63 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
   }
 }
 
+/**
+ * `sandboxWithholdBotSecret`: the sandbox cannot read this bot's send-cred, so
+ * history / quoted go to the host through the session outbox (see
+ * cli/relay-session-tool.ts). Returns only when the direct path should run:
+ * no relay, a host re-exec, or a sandbox that can still read its credential.
+ */
+async function relaySessionToolIfSecretWithheld(tool: 'history' | 'quoted', rest: string[]): Promise<void> {
+  const relayDir = process.env.BOTMUX_SEND_RELAY?.trim();
+  if (!relayDir || process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1') return;
+  // Only a watcher that serves session tools advertises it (credential-only
+  // relays and bots without the flag never do).
+  if (!existsSync(join(relayDir, RELAY_SESSION_TOOLS_MARKER))) return;
+  const appId = process.env.BOTMUX_LARK_APP_ID?.trim();
+  const sd = process.env.SESSION_DATA_DIR?.trim();
+  if (appId && sd) {
+    try { if (readSendCredJsonWithRetry(sendCredFilePath(sd, appId))) return; } catch { /* withheld → relay */ }
+  }
+  const { buildRelaySessionToolRequest, materializeRelayedAttachments } = await import('./cli/relay-session-tool.js');
+  const sid = process.env.BOTMUX_SESSION_ID?.trim();
+  const built = buildRelaySessionToolRequest(tool, rest, sid);
+  if (!built.ok) { console.error(built.error); process.exit(2); }
+  const originCapability = sid
+    ? readManagedOriginCapability(resolveDataDir(), sid, relayDir, process.env.BOTMUX_ORIGIN_CHANNEL_ID)?.capability
+    : undefined;
+  if (!originCapability) {
+    console.error(`botmux ${tool} refused: managed host relay capability is stale or missing`);
+    process.exit(2);
+  }
+  const id = randomBytes(8).toString('hex');
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({
+    command: 'session-tool',
+    tool: built.request,
+    originCapability,
+  }));
+  const resPath = join(relayDir, `${id}.res.json`);
+  const deadlineMs = Date.now() + 120_000;
+  while (Date.now() < deadlineMs) {
+    if (existsSync(resPath)) {
+      let res: { code?: number; stdout?: string; stderr?: string; attachments?: any[] };
+      try { res = JSON.parse(readFileSync(resPath, 'utf-8')); }
+      catch { await new Promise(r => setTimeout(r, 150)); continue; /* partial write */ }
+      try { unlinkSync(resPath); } catch { /* */ }
+      let stdout = res.stdout ?? '';
+      try {
+        stdout = materializeRelayedAttachments(stdout, res.attachments, join(relayDir, `${tool}-${id}`));
+      } catch (e) {
+        console.error(`relay: 无法写出附件：${(e as Error).message}`);
+        process.exit(1);
+      }
+      await mirrorRelayResponseAndExit({ code: res.code, stdout, stderr: res.stderr }, 0);
+    }
+    await new Promise(r => setTimeout(r, 150));
+  }
+  console.error(`relay: 等待宿主执行 ${tool} 超时（120s）`);
+  process.exit(1);
+}
+
 async function cmdHistory(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) { console.log(HISTORY_READ_USAGE); return; }
   // Reject unrecognized flags BEFORE anything else. Every flag below is pulled
@@ -10000,6 +10061,7 @@ async function cmdHistory(rest: string[]): Promise<void> {
   catch (err: any) { console.error(err.message); process.exit(2); }
   // No-transport turn has no Feishu chat history to read — central hard gate.
   assertTurnTransportOrExit('history');
+  await relaySessionToolIfSecretWithheld('history', rest);
   // Read isolation: register this bot from its cred file so the Lark client is
   // available without reading the denied bots.json (same as cmdSend).
   await registerSelfFromCredFile();
@@ -10153,6 +10215,7 @@ async function cmdQuoted(rest: string[]): Promise<void> {
     console.error("botmux quoted refused: --remote-runner-session-tool requires the owning worker\'s live turn authority");
     process.exit(2);
   }
+  await relaySessionToolIfSecretWithheld('quoted', rest);
   await registerSelfFromCredFile();
   const { sid, larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
   assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
@@ -10867,7 +10930,7 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
     if (process.env.BOTMUX_API_ONLY === '1') return true;
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR as string, larkAppId);
-      return JSON.parse(readFileSync(credPath, 'utf-8'))?.apiOnly === true;
+      return readSendCredJsonWithRetry(credPath)?.apiOnly === true;
     } catch {
       // No readable cred file: we cannot tell. Say "not apiOnly" rather than
       // crash — the transport boundary still fail-closes downstream
@@ -11054,15 +11117,15 @@ async function registerSelfFromCredFile(): Promise<void> {
   const appId = process.env.BOTMUX_LARK_APP_ID;
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
-  const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean; feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput };
-  try {
-    // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
-    // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
-    cred = JSON.parse(readFileSync(sendCredFilePath(sd, appId), 'utf-8'));
-  } catch {
-    return; // no cred file → not isolated (or first layer supplies creds elsewhere)
-  }
+  const { sendCredFilePath, readSendCredJsonWithRetry } = await import('./adapters/cli/read-isolation.js');
+  // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
+  // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
+  // A short parse retry covers an in-place update without treating EPERM as transient.
+  const cred = readSendCredJsonWithRetry(sendCredFilePath(sd, appId)) as {
+    larkAppSecret?: string; brand?: string; apiOnly?: boolean;
+    feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput;
+  } | undefined;
+  if (!cred) return; // no cred file → not isolated (or first layer supplies creds elsewhere)
   // apiOnly bots legitimately have an empty secret — don't bail on that, but DO
   // carry the apiOnly flag through so the reconstructed config keeps the
   // transport boundary (getBotClient throws for apiOnly). A non-apiOnly bot with
@@ -11533,6 +11596,13 @@ async function cmdSend(
     || managedOriginLegacyIsolationProbeAccess(osUserHomeDir)
     === 'sandbox_denied'
     || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
+  // A relay pane the kernel isolates must authorize through the outbox
+  // capability. On Linux the PID namespace already hides host markers; on
+  // macOS (Seatbelt + outbox, `sandboxWithholdBotSecret`) the markers stay
+  // visible, so without this the pane would fall through to the direct path
+  // it has no credential for.
+  const relayIsolationDetected = linuxKernelIsolationDetected
+    || (!!relayDir && kernelReadIsolationDetected);
   const isolatedSendRequired = !relayDir
     && (kernelReadIsolationDetected
       || process.env.BOTMUX_READ_ISOLATED === '1'
@@ -11573,7 +11643,7 @@ async function cmdSend(
     process.env.SESSION_DATA_DIR = sendDataDir;
     liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
   }
-  const isolatedCapabilityCtx = !isolatedSendRequired && !linuxKernelIsolationDetected && liveMarkerCtx?.sessionId
+  const isolatedCapabilityCtx = !isolatedSendRequired && !relayIsolationDetected && liveMarkerCtx?.sessionId
     ? null
     : readWorkflowSessionRelayContext({
         env: process.env,
@@ -11581,7 +11651,7 @@ async function cmdSend(
         // Keep one marker snapshot for the whole decision. In particular, do
         // not let resolveSessionContext's protected-capability fallback get
         // mislabeled as a live process marker.
-        findMarker: () => isolatedSendRequired || linuxKernelIsolationDetected ? null : liveMarkerCtx,
+        findMarker: () => isolatedSendRequired || relayIsolationDetected ? null : liveMarkerCtx,
       });
   if (isolatedSendRequired
     && (isolatedCapabilityCtx?.sessionId !== isolatedBoundSessionId
@@ -11622,7 +11692,7 @@ async function cmdSend(
     await relaySend(rest, relayDir, replyLayout, sendPlan);
     return;
   }
-  if (relayDir && (linuxKernelIsolationDetected || !liveMarkerCtx?.sessionId)) {
+  if (relayDir && (relayIsolationDetected || !liveMarkerCtx?.sessionId)) {
     // The child may delete or replace its writable outbox capability, while
     // the immutable default snapshot remains visible. That snapshot is only a
     // routing hint and can survive worker death; never fall through to direct
@@ -15327,7 +15397,12 @@ async function cmdSend(
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
     const sendLocale = localeForBot(appId);
-    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId), undefined, sendLocale));
+    // REPLY_DELIVERY_ENV is the spawn snapshot of how this pane's final reply
+    // reaches Lark. Under transcript the hint points the model back at its
+    // final reply instead of another `botmux send` (no hard limit on sends:
+    // collaboration and attachments legitimately need several per turn).
+    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
+      replyDeliveryFromEnv(process.env)), undefined, sendLocale));
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
@@ -17945,6 +18020,16 @@ botmux create-group — 用一组机器人新建飞书群
   --json-status    可选；在 chatId 后追加一行结构化完成状态。默认 stdout 无论完整成功或
                    部分失败都保持历史兼容，只输出单行 chatId；显式 kickoff 未发出时以非零退出表示。
 
+建群后 @ 群主提醒（本机全局开关，默认开）:
+  botmux create-group owner-notice [status|on|off]
+
+  新群建好后，创建群的 bot 默认会 @ 群主发「群已创建，后续进展将在本群同步。」。
+  off 之后本机所有建群入口（本命令、/group、Dashboard 建群、会议监听群等）都不再发这条，
+  群主转让、拉人、设管理员照常。写的是 ~/.botmux/config.json 的 "groupOwnerNotice": false
+  （on 会删掉这个键，回到默认）；下一次建群即生效，不用重启 daemon。不带参数 = status。
+  文件沙盒内 status/on/off 均拒绝执行：那里的配置视图不代表宿主，写入也不持久。
+  请在宿主终端执行，或使用 Dashboard「设置 → 群聊创建」。
+
 团队模式（跨机建聚焦新群，走中心化平台）:
   botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
 
@@ -17959,7 +18044,7 @@ botmux create-group — 用一组机器人新建飞书群
 行为:
   - 第一个解析到的 bot 作为 creator（决定建群身份 + 初始群主 + open_id app scope）。
   - 邀请用户 / 转让群主 / @通知 对象都从 creator 的 resolvedAllowedUsers 取首个 open_id（email 自动转换；
-    转不出来或为空则跳过对应步骤，stderr warning）。
+    转不出来或为空则跳过对应步骤，stderr warning）。@通知 受上面的 owner-notice 开关控制。
   - 不依赖 botmux 会话，任何环境都能跑。
   - --working-dir 会先校验路径存在且是目录；绑定失败不会重复建群，会在 stderr 给出逐 bot 结果。
   - --kickoff-bot/--kickoff-prompt：creator 建群后 @ 指定 bot 并发 prompt；该 bot 收到 @ 会自动起会话。
@@ -17973,6 +18058,38 @@ botmux create-group — 用一组机器人新建飞书群
   - 只有缺 --bot / 解析失败 / chat.create 未成功时 stdout 才为空。只要 stdout 已有 chatId，
     即使超时或 exit 非零也必须先检查并复用该群，不得重建。
 `);
+    return;
+  }
+
+  // `create-group owner-notice …` is a settings write, not a group creation:
+  // route it before every creation gate (transport, bots.json, --bot).
+  const { parseOwnerNoticeCommand, runOwnerNoticeCommand } = await import('./cli/create-group-resolver.js');
+  const ownerNoticeCommand = parseOwnerNoticeCommand(rest);
+  if (ownerNoticeCommand.kind !== 'none') {
+    // A sandboxed CLI cannot see the host's live config.json. Worse, its fresh
+    // tmpfs may accept a write and report "saved" while the host stays unchanged.
+    // Refuse every mode (including read-only status) instead of returning an
+    // untrustworthy value; do not expose the credential-bearing host config.
+    if (detectSandboxContext().inSandbox) {
+      console.error(
+        'ℹ️  当前在 botmux 沙盒内，建群后 @ 群主提醒开关的 status/on/off 均不可用：'
+        + '这里读到的配置不代表宿主，写入也不会落到宿主。'
+        + '\n   请在宿主终端执行 `botmux create-group owner-notice [status|on|off]`，'
+        + '或使用 Dashboard「设置 → 群聊创建」。',
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const { setGroupOwnerNoticeEnabled, readRawGroupOwnerNotice } = await import('./global-config.js');
+    const outcome = runOwnerNoticeCommand(ownerNoticeCommand, {
+      setEnabled: setGroupOwnerNoticeEnabled,
+      isEnabled: () => config.groupOwnerNotice,
+      rawValue: readRawGroupOwnerNotice,
+      configPath: globalConfigPath,
+    });
+    for (const line of outcome.stdout) console.log(line);
+    for (const line of outcome.stderr) console.error(line);
+    if (outcome.exitCode !== 0) process.exitCode = outcome.exitCode;
     return;
   }
 
@@ -18903,11 +19020,17 @@ export async function runHook(
     }
   }
   // 权限确认一旦路由到 botmux 会话，任何「没拿到人工裁决」的结局都按拒绝处理：
-  // passthrough 会让终端确认框照旧弹出，而这正是本桥要消除的静默卡死。
+  // passthrough 会让终端确认框照旧弹出，而这正是本桥要消除的静默卡死。提问同理：
+  // 实现了 formatUnanswered 的 CLI（agy）带着原因结束这次提问，不回退终端提问页。
+  const unanswered = (outcome: import('./core/ask-hook/types.js').UnansweredAsk): { stdout: string } => (
+    adapter.formatUnanswered
+      ? { stdout: adapter.formatUnanswered(outcome, parsed) }
+      : { stdout: adapter.passthrough(payload) }
+  );
   const unresolved = (message: string): { stdout: string } => (
     permissionParsed && adapter.formatPermissionDecision
       ? { stdout: adapter.formatPermissionDecision(false, message) }
-      : { stdout: adapter.passthrough(payload) }
+      : unanswered({ kind: 'undelivered' })
   );
 
   // Per-invocation identity: generated ONCE here (outside the retry loop) and
@@ -18918,7 +19041,7 @@ export async function runHook(
 
   // Freeze the issuing turn before reconnect retries. Shared-service/adopt
   // routing cannot borrow this process's ambient turn identity.
-  const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
+  const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex', 'antigravity'].includes(cliId)
     ? resolveTurnOriginFn(routeSessionId!) : undefined;
 
   const body: Record<string, unknown> = {
@@ -19024,8 +19147,10 @@ export async function runHook(
     return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers) };
   }
 
-  // timedOut / invalidated → passthrough 放行
-  return { stdout: adapter.passthrough(payload) };
+  // timedOut / invalidated → passthrough 放行（实现了 formatUnanswered 的 CLI 带原因结束）
+  return unanswered(result.kind === 'timedOut'
+    ? { kind: 'timedOut', timeoutMs }
+    : { kind: 'invalidated', reason: result.reason, ...(result.failureCode ? { failureCode: result.failureCode } : {}) });
 }
 
 /** 权限确认默认等 10 分钟；上限必须小于 hook 安装侧的进程超时（见 hook-installer）。 */
@@ -19159,6 +19284,7 @@ async function cmdHook(cliId: string): Promise<void> {
   }
 
   const env = process.env as Record<string, string | undefined>;
+  if (cliId === 'antigravity') exitWhenHookParentGone();
   const permissionRequest = !adapter.parseQuestions(payload) && !!adapter.parsePermissionRequest?.(payload, env);
   const terminated = new AbortController();
   if (permissionRequest) {
@@ -19187,6 +19313,22 @@ async function cmdHook(cliId: string): Promise<void> {
     try { await writeAndFlush(process.stdout, result.stdout + '\n'); } catch { /* passthrough */ }
   }
   process.exit(0);
+}
+
+/** agy (1.5.12) gives up on a PreToolUse handler — Esc, a stopped turn, its
+ *  timeout, its own exit — by SIGKILLing the process it started, or by simply
+ *  going away. A client that outlives it keeps its ask open: the card stays
+ *  answerable and the daemon reads the next text in the thread as the answer
+ *  to a question nobody waits for. The installed command `exec`s this client
+ *  so the kill lands here; should anything sit in between (or agy die), the
+ *  parent changes and the client leaves — the closed connection lets the
+ *  broker retire the ask. `process.ppid` is read live on Node and Bun. */
+function exitWhenHookParentGone(intervalMs = 1_000): void {
+  const parent = process.ppid;
+  const timer = setInterval(() => {
+    if (process.ppid !== parent) process.exit(0);
+  }, intervalMs);
+  timer.unref();
 }
 
 // ─── botmux session-ready ─────────────────────────────────────────────────────
@@ -21768,6 +21910,19 @@ switch (command) {
   case 'codex-instances': {
     const { runCodexInstancesCommand } = await import('./cli/codex-instances.js');
     await runCodexInstancesCommand(process.argv.slice(3));
+    break;
+  }
+  case 'agy-accounts':
+  case 'antigravity-accounts': {
+    const { runAntigravityAccountsCommand } = await import('./cli/antigravity-accounts.js');
+    try {
+      await runAntigravityAccountsCommand(process.argv.slice(3), {
+        isBlockedInSession: isolatedCliProcess() || isSessionScopedCliProcess(),
+      });
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
     break;
   }
   case 'upgrade':
