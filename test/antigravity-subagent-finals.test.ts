@@ -452,4 +452,30 @@ describe('Antigravity subagent final delivery', () => {
     expect(state).toEqual({});
   });
 
+  it('a second background RUNNING resets the prior command-result evidence before any invoke recovery', () => {
+    drain([
+      { type: 'USER_INPUT', content: query },
+      // First command cycle: RUNNING then its adjacent DONE lands the result flag.
+      { type: 'GENERIC', status: 'RUNNING', step_index: 5, content: 'Tool is running as a background task' },
+      { type: 'GENERIC', status: 'DONE', step_index: 6, content: 'Command exited with code 0.\nCommand output:\nfirst' },
+    ]);
+    expect(state).toMatchObject({ hasPendingTask: true, hasPendingTaskResult: true, pendingTaskRunningStep: 5 });
+    // A second command goes RUNNING before any SYSTEM_MESSAGE cleared the first wait.
+    // Its RUNNING must discard the stale result and rebind the adjacency anchor.
+    drain([
+      { type: 'GENERIC', status: 'RUNNING', step_index: 8, content: 'Tool is running as a background task' },
+    ]);
+    expect(state.hasPendingTask).toBe(true);
+    expect(state.hasPendingTaskResult).toBeUndefined();
+    expect(state.pendingTaskRunningStep).toBe(8);
+    // The launch must not recover on the FIRST cycle's evidence while the second
+    // command is still merely RUNNING with no DONE of its own.
+    expect(drain([tools({ name: 'invoke_subagent', args: {} }), planner('Waiting on the second command')])).toEqual([]);
+    expect(state.hasPendingTask).toBe(true);
+    expect(state.hasPendingTaskResult).toBeUndefined();
+    // The second command's own adjacent DONE re-arms the narrow recovery.
+    drain([{ type: 'GENERIC', status: 'DONE', step_index: 9, content: 'Command exited with code 0.\nCommand output:\nsecond' }]);
+    expect(state).toMatchObject({ hasPendingTask: true, hasPendingTaskResult: true, pendingTaskRunningStep: 8 });
+  });
+
 });
