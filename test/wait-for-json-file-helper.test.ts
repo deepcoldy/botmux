@@ -53,13 +53,21 @@ describe('waitForJsonFile', () => {
     ).resolves.toEqual(payload);
   });
 
-  // P2 回归（#3693 二轮）：writer 在 deadline 临近时写完，循环因到期退出后补读一次，
-  // 不能出现「抛超时但文件其实已完整」的漏读。用真实 timer 验证功能，不卡墙钟余量。
-  it('still returns the result when the writer finishes just before the deadline', async () => {
+  // P2 回归（#3693 二轮）：writer 在 deadline 临近时写完，循环因到期退出后的 final read
+  // 必须兜住，不能「抛超时但文件其实已完整」。用 fake timers 确定性推进，不依赖墙钟
+  // 余量——真实 timer 在高负载下 poll 被延迟、final read 抢在 writer 之前时会 flake。
+  // 序列：t20/t40 两次 poll 都读到空 → t45 writer 写完整 → t50 到 deadline、final read 成功。
+  it('still returns the result when the writer finishes just before the deadline (fake timers)', async () => {
+    vi.useFakeTimers();
     const f = join(tmp(), 'deadline-edge.json');
+    writeFileSync(f, ''); // 初始为空，前两次 poll 都解析失败
     const payload = { ok: 1 };
     setTimeout(() => writeFileSync(f, JSON.stringify(payload)), 45);
-    await expect(waitForJsonFile<typeof payload>(f, { timeoutMs: 55 })).resolves.toEqual(payload);
+    const done = waitForJsonFile<typeof payload>(f, { timeoutMs: 50 });
+    await vi.advanceTimersByTimeAsync(20); // t=20 第一次 poll：仍空
+    await vi.advanceTimersByTimeAsync(20); // t=40 第二次 poll：仍空（writer 在 45）
+    await vi.advanceTimersByTimeAsync(20); // t=60：跨过 deadline 50，writer 已在 45 写完，final read 命中
+    await expect(done).resolves.toEqual(payload);
   });
 
   it('rejects when the file never appears, distinguishing "never created" in the message', async () => {
@@ -98,22 +106,25 @@ describe('waitForJsonFile', () => {
     expect(calls).toBe(1);
   });
 
-  // 永久错误（路径是目录/中间组件非目录等）立即抛出，不空转到 deadline。
-  it('throws immediately on a permanent read error (EISDIR) instead of retrying', async () => {
+  // 永久错误（路径是目录）在第一次 read 就抛，根本不安排轮询 sleep。用 fake timers +
+  // spy 断言零定时器，替代墙钟 <1000ms，避免 CI 调度停顿误红。
+  it('throws immediately on EISDIR without scheduling any poll timer (fake timers)', async () => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
     const dir = join(tmp(), 'actually-a-directory');
     mkdirSync(dir);
-    const start = Date.now();
     await expect(waitForJsonFile(dir, { timeoutMs: 2_000 })).rejects.toThrow(/EISDIR|目录|directory/i);
-    expect(Date.now() - start).toBeLessThan(1_000);
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
   });
 
-  // ENOTDIR 不经 existsSync 预检（已移除），直接 read 就能暴露并立即失败。
-  it('throws immediately on ENOTDIR instead of waiting out the timeout', async () => {
+  // ENOTDIR 不经 existsSync 预检（已移除），直接 read 就暴露并立即失败；同样零轮询。
+  it('throws immediately on ENOTDIR without scheduling any poll timer (fake timers)', async () => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
     const blocker = join(tmp(), 'regular-file');
     writeFileSync(blocker, 'x');
     const enotdir = join(blocker, 'child.json');
-    const start = Date.now();
     await expect(waitForJsonFile(enotdir, { timeoutMs: 2_000 })).rejects.toThrow(/ENOTDIR/);
-    expect(Date.now() - start).toBeLessThan(1_000);
+    expect(setTimeoutSpy).not.toHaveBeenCalled();
   });
 });
