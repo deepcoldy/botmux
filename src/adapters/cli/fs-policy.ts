@@ -97,8 +97,21 @@ export interface FsPolicyContext {
    *  session's markers. Optional: when absent, no turn-sends grant is emitted
    *  (a non-session policy has no marker to write). */
   sessionId?: string;
-  /** This bot's BOT_HOME (`<botmuxHome>/bots/<appId>`) — always readWrite. */
+  /** This bot's BOT_HOME (`<botmuxHome>/bots/<appId>`) — always readWrite.
+   *  个人助理模式下 worker 传的是 owner 的 USER_HOME（`<BOT_HOME>/users/<open_id>`）：
+   *  真正的 BOT_HOME 留在 botmux 根的 deny 里，别的 owner 的目录与 bot 级 claude/
+   *  数据目录对这个会话都不存在。 */
   botHome: string;
+  /** 个人助理模式：owner 的附件桶 `attachments/<appId>/u/<open_id>`，替代整 bot 的
+   *  `attachments/<appId>` readWrite。缺省（非助理模式）仍授整个 bot 桶。 */
+  attachmentsBucket?: string;
+  /** 个人助理模式开关。开了之后：① 不授整 bot 的 `session-stores/<appId>`（sessions.db
+   *  里存着每个会话最近一条用户输入，不是纯元数据；CLI 走 daemon IPC 解析会话）；② 不给
+   *  lark-cli 自己的 appsecret 密文 + 主密钥（拿到就能自己换 tenant token，绕过「bot 身份
+   *  默认关」的 IPC 闸）；③ 真 BOT_HOME 的 `send-cred.json` 也**不**放行——它存着明文
+   *  larkAppSecret，与 ② 同一个洞。助理模式隐含 sandboxWithholdBotSecret：`botmux send` /
+   *  `history` / `quoted` 都经 outbox 由宿主代执行；`list` 要读会话库，仍不可用。 */
+  assistantMode?: boolean;
   /** This bot's OWN role-library subtree (`<roleLibraryRoot>/<appId>`) — readWrite.
    *  Optional: absent when the subtree does not exist (bot never used roles) or
    *  when building a non-session policy. See the emission site for why the whole
@@ -957,9 +970,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // would keep reading the dead WAL forever. A directory bind resolves names
   // live. Sibling bots' store dirs stay uncovered (deny-by-default).
   //
-  push([
-    `${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`,
-  ], 'readOnly', 'internal');
+  if (!ctx.assistantMode) {
+    push([
+      `${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`,
+    ], 'readOnly', 'internal');
+  }
+  // 助理模式：sessions.db 与真 BOT_HOME（含 send-cred.json）都不授，见 ctx.assistantMode。
   // Own upload bucket — readWRITE: `botmux quoted` / downloadResources writes the
   // downloaded attachment under attachments/<self>/<messageId>/… (not just reads
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the
@@ -970,7 +986,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // bucket lets the pane swap a message directory for a symlink between the
   // host's validation and its open/rename — a cross-process race no path-based
   // check can close — and a read-only bucket removes that class outright.
-  push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], ctx.withholdSendCredential ? 'readOnly' : 'readWrite', 'internal');
+  push([ctx.attachmentsBucket ?? `${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], ctx.withholdSendCredential ? 'readOnly' : 'readWrite', 'internal');
   // Own per-turn hook context（UserPromptSubmit sidecar，#794）——read-only。
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
@@ -1091,9 +1107,13 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // read (verified: sibling ciphertext still DENIED).
   // withholdSendCredential: the own appsecret + master key ARE the app secret
   // (decryptable), so the carve-out stays closed and the store stays denied.
-  if (ctx.platform === 'darwin' && (larkTransport || ctx.withholdSendCredential)) {
+  // 密钥库密封条件：显式 withhold（#3649）或助理模式。生产链路上助理模式隐含
+  // withhold（worker 传 withholdSendCredential=true），但 buildFsPolicy 是纯函数、
+  // 两个入参独立，assistantMode 单独为 true 时也必须 deny（不依赖调用方传对 withhold）。
+  const sealLarkKeyStore = ctx.withholdSendCredential === true || ctx.assistantMode === true;
+  if (ctx.platform === 'darwin' && (larkTransport || ctx.withholdSendCredential || ctx.assistantMode)) {
     const larkStore = `${ctx.homeDir}/Library/Application Support/lark-cli`;
-    if (ctx.withholdSendCredential) {
+    if (sealLarkKeyStore) {
       withheldLarkStores.add(larkStore);
       // Both levels are mandatory: the baseline store deny alone loses to a
       // same-path internal workingDir/user grant, while a deeper exact-key
@@ -1128,7 +1148,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // no custom LARKSUITE_CLI_DATA_DIR → resolved == default → one store). `deny` tagged
   // `mandatory` (not `baseline` like darwin's): see the rank-collision note in the loop.
   // No-transport denies both stores wholesale via authorityRoots and gets NO carve-out.
-  if (ctx.platform === 'linux' && (larkTransport || ctx.withholdSendCredential)) {
+  if (ctx.platform === 'linux' && (larkTransport || ctx.withholdSendCredential || ctx.assistantMode)) {
     const stores = new Set<string>();
     const resolved = larkCliLinuxStorePath(ctx.homeDir, ctx.larkCliLinuxStore);
     if (resolved) stores.add(resolved);
@@ -1140,7 +1160,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       // the internal BOT_HOME readWrite grant lands on the SAME path and would otherwise
       // outrank this deny by source rank (internal 2 > baseline 0), re-opening the whole
       // keystore rw. mandatory (4) keeps the ceiling; the deeper own-key carve-outs still win by depth.
-      if (!ctx.withholdSendCredential) {
+      if (!sealLarkKeyStore) {
         push([larkStore], 'deny', 'mandatory');
         push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
       } else {
@@ -1194,13 +1214,42 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // Seatbelt re-emits these paths after every ordinary rule so they can carve
   // a narrow read-only exception out of a broader deny. Never carry a path
   // inside a host-only root into that final pass, or it would undo the
-  // daemon-owned boundary that `push()` enforced above.
+  // daemon-owned boundary that `push()` enforced above. Assistant mode has one
+  // additional boundary: the final pass must not grant bot homes, session stores,
+  // other owners' attachments, bot config secrets, or any of their ancestors.
+  // Only the owner's USER_HOME and their own attachment bucket remain eligible.
+  const assistantOwnerHome = ctx.assistantMode ? normalizeFsPath(ctx.botHome) : null;
+  const assistantUsersRoot = assistantOwnerHome?.slice(0, assistantOwnerHome.lastIndexOf('/')) ?? null;
+  const assistantBotHome = assistantUsersRoot?.endsWith('/users')
+    ? normalizeFsPath(assistantUsersRoot.slice(0, -'/users'.length) || '/')
+    : null;
+  const assistantAllowedRoots = [
+    assistantOwnerHome,
+    ctx.assistantMode && ctx.attachmentsBucket ? normalizeFsPath(ctx.attachmentsBucket) : null,
+  ].filter((p): p is string => !!p);
+  const assistantProtectedRoots = [
+    assistantBotHome,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.botmuxHome}/bots`) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.sessionDataDir}/session-stores`) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.sessionDataDir}/attachments`) : null,
+  ].filter((p): p is string => !!p);
+  const assistantProtectedFiles = [
+    ctx.assistantMode && ctx.loadedBotsConfigPath ? normalizeFsPath(ctx.loadedBotsConfigPath) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.botmuxHome}/bots.json`) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.botmuxHome}/.dashboard-secret`) : null,
+    ctx.assistantMode ? normalizeFsPath(`${ctx.botmuxHome}/.dashboard-token`) : null,
+  ].filter((p): p is string => !!p);
+  const outsideAssistantAllowedRoots = (p: string): boolean => {
+    if (assistantAllowedRoots.some(root => coversPath(root, p))) return false;
+    return assistantProtectedRoots.some(root => coversPath(root, p) || coversPath(p, root))
+      || assistantProtectedFiles.some(file => coversPath(file, p) || coversPath(p, file));
+  };
   const finalReadOnlyPaths = [
     ...serviceCredentialReadOnlyPaths,
     ...(ctx.mandatoryReadOnlyPaths ?? []),
   ].filter((path) => {
     const normalized = normalizeFsPath(path);
-    if (!normalized || insideHostOnlyRoot(normalized)) return false;
+    if (!normalized || insideHostOnlyRoot(normalized) || outsideAssistantAllowedRoots(normalized)) return false;
     // This final pass runs after ordinary rules. A service-credential exception
     // under a withheld lark-cli store would otherwise re-open the exact key the
     // mandatory ceiling just denied.
@@ -1226,7 +1275,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     //    own-app-scoped — NOT the shared secret/port table).
     push([
       `${ctx.sessionDataDir}/bots-info.json`,               // display names for <available_bots> (public-ish)
-      `${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`,
+      // 助理模式仍不得经 no-transport carve-out 读回 bot 级 sessions.db；其余
+      // routing/bin 等合法最小授权保持不变。
+      ...(!ctx.assistantMode ? [`${ctx.sessionDataDir}/session-stores/${ctx.currentAppId}`] : []),
       `${ctx.sessionDataDir}/bot-openids-${ctx.currentAppId}.json`,
       // Core-only writes its `botmux` wrapper into <dataDir>/bin (dedicated, NOT
       // the shared ~/.botmux/bin) and prepends it to the worker PATH — read-only
@@ -1291,7 +1342,22 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
-    ...(ctx.withholdSendCredential ? { finalDenyPaths: [...withheldLarkStores] } : {}),
+    // The final Seatbelt pass must also cover assistant session stores (all
+    // bots, including WAL/SHM) and config/dashboard secrets: an ancestor
+    // finalReadOnly grant would otherwise re-open them even when the ordinary
+    // rules and the no-transport carve-out both exclude them.
+    ...(sealLarkKeyStore ? {
+      finalDenyPaths: [
+        ...withheldLarkStores,
+        ...(ctx.assistantMode ? [
+          `${ctx.sessionDataDir}/session-stores`,
+          ...(ctx.loadedBotsConfigPath ? [ctx.loadedBotsConfigPath] : []),
+          `${ctx.botmuxHome}/bots.json`,
+          `${ctx.botmuxHome}/.dashboard-secret`,
+          `${ctx.botmuxHome}/.dashboard-token`,
+        ] : []),
+      ],
+    } : {}),
     finalReadOnlyPaths,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()

@@ -4436,10 +4436,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   if (body.mode === 'bot') {
     // sandboxWithholdBotSecret: the sandbox must not hold an app-identity
     // credential in any form, including the tenant token lark-cli would get here.
-    const botSecretWithheld = ds
+    // Personal-assistant mode is enforced against the LIVE bot as well: a session
+    // that predates the mode froze no withhold flag and has no owner.
+    const botSecretWithheld = (cfg: typeof bot): boolean => (ds
       ? ds.session.sandboxWithholdBotSecret === true
-      : detachedScheduled?.session.sandboxWithholdBotSecret === true;
-    if (botSecretWithheld) {
+      : detachedScheduled?.session.sandboxWithholdBotSecret === true)
+      || cfg.assistantMode === true;
+    if (botSecretWithheld(bot)) {
       return jsonRes(res, 403, { ok: false, error: 'lark_tool_bot_identity_withheld' });
     }
     let token: unknown;
@@ -4452,6 +4455,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     }
     if (typeof token !== 'string' || !token) {
       return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
+    }
+    // Token lookup may await across an assistantMode transition. The config and
+    // session flags captured above are stale now: repeat the complete withholding
+    // decision against the live bot before any credential enters the response.
+    try { bot = getBot(targetLarkAppId!).config; }
+    catch { return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' }); }
+    if (botSecretWithheld(bot)) {
+      return jsonRes(res, 403, { ok: false, error: 'lark_tool_bot_identity_withheld' });
     }
     const validHeadlessSessionAfterToken = !!ds?.session.headless
       && ds.session.headless.source === 'cli'
@@ -5570,6 +5581,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/decision-board', async (req, res, par
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
+  // 个人助理模式：看板按 bot 汇总，不按主人隔离，助理会话不开放。
+  if (ds.session.assistantOwnerOpenId) return jsonRes(res, 403, { ok: false, error: 'decision_board_unavailable_in_assistant_mode' });
   const service = decisionBoardService;
   if (!service) return jsonRes(res, 503, { ok: false, error: 'decision_board_unavailable' });
   try {
@@ -5610,6 +5623,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/decision-board/upload', async (req, r
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (ds.larkAppId !== cachedLarkAppId) return jsonRes(res, 403, { ok: false, error: 'session_bot_mismatch' });
+  // 个人助理模式：看板按 bot 汇总，不按主人隔离，助理会话不开放。
+  if (ds.session.assistantOwnerOpenId) return jsonRes(res, 403, { ok: false, error: 'decision_board_unavailable_in_assistant_mode' });
   const service = decisionBoardService;
   if (!service) return jsonRes(res, 503, { ok: false, error: 'decision_board_unavailable' });
   const mime = String(req.headers['content-type'] ?? '').split(';')[0]!.trim().toLowerCase();
@@ -6143,6 +6158,10 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
   // ownAppId 收窄到本 bot 自己的角色库子树：不收窄就能切进别的 bot 的角色目录，
   // 下面 repinSessionWorkingDir 把 ds.workingDir 钉过去之后，那个 bot 的沙盒会话
   // 就拿到了对方整棵角色库的 readWrite（打穿 fs-policy 的跨 bot 隔离）。
+  // 个人助理模式不支持角色系统：cwd 由 owner 决定，切角色等于切出 owner 子树。
+  if (ds.session.assistantOwnerOpenId) {
+    return jsonRes(res, 403, { ok: false, error: 'role_system_unavailable_in_assistant_mode' });
+  }
   const v = validateRoleLibraryPath(body?.dir ?? '', undefined, ds.larkAppId);
   if (!v.ok) {
     const forbidden = v.error === 'outside_role_library' || v.error === 'outside_own_role_library';

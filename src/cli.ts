@@ -5927,7 +5927,11 @@ function cmdManagedZmxAttach(args: string[]): void {
 
 async function cmdList(): Promise<void> {
   const sessions = loadSessions();
-  const active = [...sessions.values()].filter(s => s.status === 'active');
+  // 个人助理模式：从某个 owner 的会话里跑 list，只列同一 owner 的会话。
+  const selfSid = findAncestorSessionId() ?? process.env.BOTMUX_SESSION_ID;
+  const selfOwner = selfSid ? (sessions.get(selfSid) as any)?.assistantOwnerOpenId as string | undefined : undefined;
+  const active = [...sessions.values()].filter(s => s.status === 'active'
+    && (!selfOwner || (s as any).assistantOwnerOpenId === selfOwner));
   if (process.argv.includes('--json')) {
     console.log(JSON.stringify({
       sessions: active.map(session => ({
@@ -9828,6 +9832,27 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
  *  prelude for `history` / `quoted` / similar commands that need to talk to
  *  Lark on behalf of the session that spawned them. Exits with stderr on
  *  failure so callers can stay focused on the happy path. */
+/**
+ * 个人助理模式的宿主侧读闸：沙盒里 sessions.db 对所有 owner 只读可见，`--session-id`
+ * 指向别人会话时，history/quoted 会替它读别人的聊天。规则：当前进程所属会话有
+ * assistantOwnerOpenId 时，目标会话必须是同一 owner 的（或就是自己）。当前会话推不
+ * 出来（宿主终端）不拦——宿主本来就能读一切。
+ */
+async function assertAssistantPeerSessionOrExit(target: SessionData, what: string): Promise<void> {
+  const selfSid = findAncestorSessionId() ?? process.env.BOTMUX_SESSION_ID;
+  if (!selfSid || selfSid === target.sessionId) return;
+  // 自己的会话经 daemon IPC 解析（助理模式沙盒里 sessions.db 不可读；loadSessions 会是空表，
+  // 不能拿它当「没有 owner」的证据）。目标带 owner 而自己解析不出来 → fail-closed。
+  const resolved = await resolveSessionById(selfSid, { dataDir: resolveDataDir() });
+  const owner = resolved.ok ? (resolved.session as any).assistantOwnerOpenId as string | undefined : undefined;
+  const targetOwner = (target as any).assistantOwnerOpenId as string | undefined;
+  if (!owner && !targetOwner) return;
+  if (!owner || targetOwner !== owner) {
+    console.error(`botmux ${what} refused: session ${target.sessionId} belongs to another assistant owner`);
+    process.exit(2);
+  }
+}
+
 async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ sid: string; larkAppId: string; session: SessionData }> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
   const sid = sessionIdArg ?? findAncestorSessionId() ?? process.env.BOTMUX_SESSION_ID;
@@ -10090,6 +10115,7 @@ async function cmdHistory(rest: string[]): Promise<void> {
   // Target-aware gate: a --session-id pointing at a virtual/apiOnly session must
   // be refused even from a normal turn (env gate above can't see the argument).
   assertSessionTransportOrExit({ chatId: s.chatId, larkAppId: appId }, 'history');
+  await assertAssistantPeerSessionOrExit(s, 'history');
 
   const validScopes = new Set(['session', 'thread', 'chat', 'ambient']);
   if (!validScopes.has(scopeArg)) {
@@ -10232,18 +10258,24 @@ async function cmdQuoted(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
   assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
+  await assertAssistantPeerSessionOrExit(quotedSession, 'quoted');
+  // 个人助理模式：引用只能引本会话所在群的消息（message_id 是全局的，不限就能读到
+  // bot 所在任何群/私聊里别人的消息）。
+  const chatLocked = remoteRunnerSessionTool || Boolean((quotedSession as any).assistantOwnerOpenId);
+
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
   const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   try {
     const result = await readQuotedMessages(appId, {
       ...readOptions, raw: rest.includes('--raw'),
-      ...(remoteRunnerSessionTool ? { currentChatId: quotedSession.chatId } : {}),
+      ...(chatLocked ? { currentChatId: quotedSession.chatId } : {}),
     }, {
       getMessageDetail, expandMergeForward, resolveMergedCard: resolveMergedCardContent,
-      downloadResources: async (...args) => {
+      downloadResources: async (resAppId, resMessageId, resources) => {
         const { downloadResources } = await import('./core/session-manager.js');
-        return downloadResources(...args);
+        // 个人助理模式：附件落在 owner 自己的桶
+        return downloadResources(resAppId, resMessageId, resources, undefined, (quotedSession as any).assistantOwnerOpenId);
       },
       decorate: message => decorateSessionCliLinkRefResult({
         sessionId: sid, appId, sourceType: 'quoted', sourceId: message.messageId, value: message,

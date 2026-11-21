@@ -2100,6 +2100,19 @@ export interface BotConfig {
   /** 每位对话用户在本 bot 最多保留的存活（启用或暂停）talker 任务数；1–100，缺省 5。 */
   scheduleTalkerMaxTasks?: number;
   /**
+   * 个人助理模式：每个会话有且只有一个 owner（私聊 = 发消息的人；群 = 把 bot 拉进群
+   * 的人，记在 assistant-owners 表；查不到 owner 的群不服务，等 `/assistant claim`）。
+   * owner 决定一切：cwd = `<BOT_HOME>/users/<owner>/work`，CLI 数据目录 =
+   * `<BOT_HOME>/users/<owner>/claude`，沙盒只授这棵子树，角色库不授，`botmux quoted /
+   * history / list` 只认同 owner，`lark-cli --as bot` 一律拒绝。**必须配合 oncall 沙盒**
+   * （worker spawn 处 fail-closed）。不支持角色系统（role switch / cd / repo 拒绝）。
+   * 设计：docs/design/2026-11-20-assistant-mode.md。
+   */
+  assistantMode?: boolean;
+  /** 助理模式的人设模板目录：每次 spawn 覆盖同步进 owner 的 work/（模板有的覆盖、
+   *  用户自己的文件保留）。缺省 = effectiveDefaultWorkingDir。 */
+  assistantTemplateDir?: string;
+  /**
    * 是否接受**其他 bot** 通过 `botmux send --slash` 发来的原生斜杠命令
    * （/clear、/model、/close…）。默认开（undefined = 开）；只有显式 false 才关。
    *
@@ -4520,7 +4533,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
-      ...(entry.sandboxWithholdBotSecret === true ? { sandboxWithholdBotSecret: true } : {}),
+      // assistantMode implies it (see sandboxWithholdsBotSecret)
+      ...(entry.sandboxWithholdBotSecret === true || entry.assistantMode === true ? { sandboxWithholdBotSecret: true } : {}),
       ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
@@ -4594,6 +4608,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.scheduleTalkerMaxTasks)
         && entry.scheduleTalkerMaxTasks >= 1 && entry.scheduleTalkerMaxTasks <= 100
         ? entry.scheduleTalkerMaxTasks
+        : undefined,
+      assistantMode: entry.assistantMode === true || undefined,
+      assistantTemplateDir: typeof entry.assistantTemplateDir === 'string' && entry.assistantTemplateDir.trim()
+        ? entry.assistantTemplateDir.trim()
         : undefined,
       messageQuota,
       grantDefaultDurationMs,

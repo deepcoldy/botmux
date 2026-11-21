@@ -19,6 +19,7 @@ import { recordScheduledSessionRun } from './scheduled-send.js';
 import { basename, dirname, join } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
+import { resolveAssistantSpawn } from './assistant-spawn.js';
 import * as sessionStore from '../services/session-store.js';
 import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
 import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState } from './scheduler.js';
@@ -693,7 +694,7 @@ export function getProjectScanDirs(ds?: DaemonSession): string[] {
 
 // ─── Attachment download ─────────────────────────────────────────────────────
 
-export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
+export async function downloadResources(larkAppId: string, messageId: string, resources: MessageResource[], senderOpenId?: string, assistantOwnerOpenId?: string): Promise<{ attachments: LarkAttachment[]; needLogin: boolean }> {
   if (resources.length === 0) return { attachments: [], needLogin: false };
 
   const attachments: LarkAttachment[] = [];
@@ -704,7 +705,7 @@ export async function downloadResources(larkAppId: string, messageId: string, re
   // return no attachments, same shape as a download failure — the text still processes.
   let dir: string;
   try {
-    dir = getAttachmentsDir(larkAppId, messageId);
+    dir = getAttachmentsDir(larkAppId, messageId, assistantOwnerOpenId);
   } catch (err: any) {
     logger.warn(`[${larkAppId}] skipping attachment download — unusable appId as path segment: ${err.message}`);
     return { attachments: [], needLogin: false };
@@ -5338,7 +5339,15 @@ export async function executeScheduledTask(
     const runtimeScope: 'thread' | 'chat' = deferredFreshTopic
       ? 'chat'
       : scope === 'chat' && anchor !== task.chatId ? 'thread' : scope;
+    // 个人助理模式：定时会话归 chat 的主人（私聊 = 建任务的人），cwd 固定在主人的 work/；
+    // 群未认领 → 本次失败（宁可漏一次，也不在共享目录里起会话）。
+    const assistantSpawn = resolveAssistantSpawn(larkAppId, task.chatId, task.chatType === 'p2p' ? 'p2p' : 'group',
+      scheduledTrustedCaller?.requestUserOpenId ?? task.ownerOpenId);
+    if (assistantSpawn.kind === 'unclaimed') {
+      throw new Error(`assistant mode: chat ${task.chatId} has no assistant owner; scheduled run refused`);
+    }
     const session = sessionStore.createSession(task.chatId, anchor, `${t('schedule.title_prefix', undefined, localeForBot(larkAppId))} ${task.name}`, task.chatType === 'p2p' ? 'p2p' : 'group', undefined, { source: 'schedule' });
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
@@ -5383,7 +5392,7 @@ export async function executeScheduledTask(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: isContinuation,
-      workingDir: task.workingDir,
+      workingDir: assistantSpawn.kind === 'owner' ? assistantSpawn.workDir : task.workingDir,
       initialStartPending: true,
       pendingPrompt: firePrompt,
       // In-memory only, exactly like the trigger API's per-turn model: persisting
@@ -6139,6 +6148,9 @@ export async function spawnDashboardSession(
   let bot: ReturnType<typeof getBot>;
   try { bot = getBot(larkAppId); } catch { return { ok: false, error: 'bot_not_found' }; }
   const locale = localeForBot(larkAppId);
+  // 个人助理模式：看板任务也归该群的主人、cwd 在主人 work/；群未认领就不建。
+  const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', args.ownerOpenId ?? undefined);
+  if (assistantSpawn.kind === 'unclaimed') return { ok: false, error: 'assistant_unclaimed' };
 
   // chat-scope：锚点就是 chatId。先挡掉「同群同 bot 已有真会话」的撞键（会被
   // Map.set 覆盖而泄漏 worker）。queued 占位 / 纯 scratch 不算冲突。
@@ -6228,8 +6240,11 @@ export async function spawnDashboardSession(
       session.kanbanColumn = 'backlog';
     }
 
-    const workingDir = resolveDashboardSpawnWorkingDir(larkAppId, chatId);
+    const workingDir = assistantSpawn.kind === 'owner'
+      ? assistantSpawn.workDir
+      : resolveDashboardSpawnWorkingDir(larkAppId, chatId);
     if (workingDir) session.workingDir = workingDir;
+    if (assistantSpawn.kind === 'owner') session.assistantOwnerOpenId = assistantSpawn.openId;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 

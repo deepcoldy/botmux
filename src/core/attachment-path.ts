@@ -21,6 +21,13 @@ export function safeAttachmentFileName(name: string | undefined, fallback: strin
 }
 
 /** Per-bot attachment bucket shared by Lark downloads and Dashboard uploads. */
-export function getAttachmentsDir(larkAppId: string, messageId: string): string {
-  return join(attachmentsRoot(), assertSafeAppId(larkAppId), messageId);
+export function getAttachmentsDir(larkAppId: string, messageId: string, assistantOwnerOpenId?: string): string {
+  const bucket = join(attachmentsRoot(), assertSafeAppId(larkAppId));
+  // 个人助理模式：按 owner 分桶（attachments/<appId>/u/<open_id>/<messageId>），沙盒只授
+  // owner 自己的桶。open_id 形状在这里再校验一次——它要拼进路径。
+  if (assistantOwnerOpenId !== undefined) {
+    if (!/^ou_[a-f0-9]{32}$/.test(assistantOwnerOpenId)) throw new Error('attachments: invalid assistant owner open_id');
+    return join(bucket, 'u', assistantOwnerOpenId, messageId);
+  }
+  return join(bucket, messageId);
 }

@@ -65,7 +65,9 @@ function fixture({ preAdmit = false, cliId = 'codex-app' } = {}) {
   const drain = async () => { while (pending.length) await Promise.all(pending.splice(0)); };
   const sender: any = { controllerForSession: () => controller, pendingOrdinaryImDeliveries: new Map(),
     workerIpcBootstrapStates: new Map(), logger: hostEnv.logger, tag: () => 'tracked-origin', ORDINARY_IM_TRANSPORT_TIMEOUT_MS: 2_000, ORDINARY_IM_MAX_ATTEMPTS: 3,
+    getBot: () => ({ config: {} }),
     failOrdinaryImDelivery: vi.fn() };
+  sender.assistantLiveInputAdmission = loadWorkerPoolFunction('assistantLiveInputAdmission', sender);
   for (const name of ['ordinaryImDeliveryKey', 'ensurePrincipalLaneInboundTurnBinding', 'clearOrdinaryImDeliveryTimer',
     'clearOrdinaryImDelivery', 'acknowledgeOrdinaryImDeliveryReceipt', 'completeOrdinaryImDelivery',
     'retryOrFailOrdinaryImDelivery', 'afterWorkerIpcBootstrap', 'releaseWorkerIpcBootstrap',

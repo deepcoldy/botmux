@@ -126,10 +126,12 @@ export function resolveSandboxMode(input: {
  *  freezes or snapshots a session's sandbox shape must use this, so an
  *  env-forced or workflow pane cannot end up oncall without the flag. */
 export function sandboxWithholdsBotSecret(
-  botCfg: { sandbox?: unknown; readIsolation?: boolean; sandboxWithholdBotSecret?: boolean },
+  botCfg: { sandbox?: unknown; readIsolation?: boolean; sandboxWithholdBotSecret?: boolean; assistantMode?: boolean },
   envValue: string | undefined = process.env.BOTMUX_SANDBOX,
 ): boolean {
-  if (botCfg.sandboxWithholdBotSecret !== true) return false;
+  // Personal-assistant mode always withholds the secret: an owner's sandbox
+  // must not be able to mint the bot's tenant token and read other owners' chats.
+  if (botCfg.sandboxWithholdBotSecret !== true && botCfg.assistantMode !== true) return false;
   try {
     return resolveSandboxMode({ configSandbox: botCfg.sandbox, readIsolation: botCfg.readIsolation, envValue }) === 'oncall';
   } catch { return false; }

@@ -1,5 +1,6 @@
 import { configuredCliExecutionMode, isWorkerCliExecution, type WorkerCliExecution } from './cli-execution-mode.js';
 import { isLeadOnlySession } from './lead-only.js';
+import { decideAssistantAdmission, decideAssistantLiveInputAdmission } from './assistant-spawn.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime, sameExecution, executionObserverSupported, contractTerminalStatus } from '../services/session-contract.js';
 import { runtimeStartRefusal } from '../services/runtime-reservation.js';
@@ -275,6 +276,7 @@ import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { assistantInitFields } from './assistant-mode.js';
 import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from '../im/lark/streaming-card-buttons.js';
 import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/lark/substitute-card-control.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
@@ -15045,6 +15047,14 @@ function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
     });
   }
 
+  // IPC bootstrap / 重试可能跨越 owner 改绑。实际发送前再查一次；入口处的
+  // allow 不能授权这个较晚的投递点。拒绝由共用闸提示重发并退役，清掉投递
+  // 记录以免传输超时再补一张含义不准确的失败卡。
+  if (!assistantLiveInputAdmission(record.ds, record.turnId, { context: 'worker IPC delivery' })) {
+    clearOrdinaryImDelivery(record);
+    return false;
+  }
+
   if (record.timer) clearTimeout(record.timer);
   record.timer = undefined;
   record.received = false;
@@ -15487,6 +15497,18 @@ function withTurnCaller(ds: DaemonSession, message: TransferBufferedInput): Tran
   return { ...message, turnCallerOpenId: openId } as TransferBufferedInput;
 }
 
+/** Content input must be re-authorized at the actual IPC boundary. Control-only
+ * messages deliberately avoid getBot: teardown and unregistered-app IPC rely on
+ * their cheap no-registry path. */
+function assistantTransferInputDeliveryAllowed(
+  ds: DaemonSession,
+  message: TransferBufferedInput,
+  context: string,
+): boolean {
+  if (message.type !== 'message' && message.type !== 'raw_input' && message.type !== 'inject_command') return true;
+  return assistantLiveInputAdmission(ds, 'turnId' in message ? message.turnId : undefined, { context });
+}
+
 /** Route user/automation input through the transfer fence. Messages accepted
  * during detach are replayed byte-for-byte to the replacement generation. */
 export function sendWorkerSessionInput(
@@ -15522,6 +15544,7 @@ export function sendWorkerSessionInput(
     ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
     : message;
   const annotated = withTurnCaller(ds, scoped);
+  if (!assistantTransferInputDeliveryAllowed(ds, annotated, 'worker session input')) return false;
   if (bufferTransferInput(ds, annotated)) {
     if (onIpcDispatched) transferInputDispatchCallbacks.set(annotated, onIpcDispatched);
     return true;
@@ -15529,6 +15552,7 @@ export function sendWorkerSessionInput(
   const worker = ds.worker;
   if (!worker || worker.killed) return false;
   return afterWorkerIpcBootstrap(worker, () => {
+    if (!assistantTransferInputDeliveryAllowed(ds, annotated, 'worker session input after bootstrap')) return;
     const sent = worker.send(annotated);
     if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) onIpcDispatched();
     return sent;
@@ -15946,6 +15970,7 @@ function releaseTransferInputGate(
           }
         } else {
           if (!afterWorkerIpcBootstrap(worker, () => {
+            if (!assistantTransferInputDeliveryAllowed(ds, message, 'transfer replay after bootstrap')) return;
             const sent = worker.send(message);
             if (onIpcDispatched && sent !== false && ds.worker === worker && canForkRegisteredSession(ds)) {
               onIpcDispatched();
@@ -16749,6 +16774,8 @@ async function forkFromSource(
     childSession.cliId = ds.session.cliId;
     childSession.workingDir = ds.workingDir ?? ds.session.workingDir;
     childSession.ownerOpenId = opts?.childOwnerOpenId ?? ds.session.ownerOpenId;
+    // 个人助理模式：fork 出来的会话仍在同一 chat，归属同一个助理主人。
+    if (ds.session.assistantOwnerOpenId) childSession.assistantOwnerOpenId = ds.session.assistantOwnerOpenId;
     childSession.backendType = ds.session.backendType;
     // Bot identity on the PERSISTED row. Every other createSession caller sets
     // this immediately after minting (trigger-session / session-manager /
@@ -17618,6 +17645,37 @@ export function applyFailedTurnRewindResult(
   }
 }
 
+/** 现有会话接收任何输入前的统一助理归属闸。队列写入、journal promotion、
+ * 普通 IPC 与 bootstrap 后的 init 都必须在各自实际边界重新调用，不能只靠入口检查。 */
+export function assistantLiveInputAdmission(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  opts: {
+    notifyRejection?: false;
+    context?: string;
+    bot?: ReturnType<typeof getBot>;
+  } = {},
+): boolean {
+  const bot = opts.bot ?? getBot(ds.larkAppId);
+  if (bot.config.assistantMode !== true) return true;
+  const decision = decideAssistantLiveInputAdmission(ds.larkAppId, {
+    chatId: ds.chatId,
+    chatType: ds.session.chatType === 'p2p' ? 'p2p' : 'group',
+    ownerOpenId: ds.session.ownerOpenId,
+    assistantOwnerOpenId: ds.session.assistantOwnerOpenId,
+    sandboxWithholdBotSecret: ds.session.sandboxWithholdBotSecret,
+  });
+  if (decision.kind === 'allow') return true;
+  const context = opts.context ?? 'input';
+  logger.warn(`[${tag(ds)}] assistant-mode: refusing ${context} ${turnId ?? '?'} to a session not owned by the current owner; retiring it`);
+  if (opts.notifyRejection !== false) void callbacks?.sessionReply(
+    sessionAnchorId(ds), tr('worker.assistant.session_retired', {}, localeForBot(ds.larkAppId)), 'text', ds.larkAppId, turnId,
+  ).catch(err => logger.warn(`[${tag(ds)}] assistant-mode: failed to report retired session: ${String(err)}`));
+  void closeSessionForBackgroundCleanup(ds.session.sessionId, `assistant-mode ${context} to unowned session`).catch(err =>
+    logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
+  return false;
+}
+
 export function sendWorkerInput(
   ds: DaemonSession,
   payload: string | CliTurnPayload,
@@ -17691,6 +17749,8 @@ export function sendWorkerInput(
   let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
+  // 个人助理模式：活着的 worker 也要按当前归属核对（开模式时没能退役的存量会话、主人已变）。
+  if (!assistantLiveInputAdmission(ds, turnId, { notifyRejection: opts.notifyRejection, bot })) return false;
   const effectiveCliId = sessionCliId(ds, bot.config);
   const effectiveTurnId = turnId ?? (isCodexAppCliId(effectiveCliId)
     ? `codex-app-dispatch-${randomUUID()}`
@@ -17707,7 +17767,7 @@ export function sendWorkerInput(
       ?? routingTurnId
       ?? `queued-activation-followup-${randomUUID()}`;
     try {
-      admitQueuedActivationTail(ds, {
+      const admitted = admitQueuedActivationTail(ds, {
         userPrompt: normalized.content,
         cliInput: {
           content: normalized.content,
@@ -17727,6 +17787,7 @@ export function sendWorkerInput(
           ? { dispatchAttempt: opts.dispatchAttempt }
           : {}),
       });
+      if (!admitted) return false;
       logger.info(
         `[${tag(ds)}] Staged turn ${queuedTurnId} behind queued activation ACK`,
       );
@@ -18287,6 +18348,9 @@ export function promoteQueuedActivationTail(
     .sort((a, b) => a.order - b.order || a.id.localeCompare(b.id));
   const head = ordered[0];
   if (!head) return false;
+  // owner 可能在 tail 落盘后、ACK promotion 前改变。必须在移动 journal 之前拒绝，
+  // 否则旧会话会把新主人的输入推进成自己的下一个持久化回合。
+  if (!assistantLiveInputAdmission(ds, head.turnId, { context: 'queued activation promotion' })) return false;
 
   const priorJournal = snapshotQueuedActivationJournal(ds.session);
   const priorTail = ds.session.queuedActivationTail?.map(entry => ({
@@ -18489,15 +18553,18 @@ export function reserveQueuedActivationTailAdmission(
 
 /** Admit one exact successor behind a queued activation. The response boundary
  * is the session-store write: callers must not report acceptance or use live
- * worker IPC unless this returns. `reservation` lets routes reserve FIFO order
+ * worker IPC unless this returns an entry. `reservation` lets routes reserve FIFO order
  * before asynchronous prompt construction without duplicating persistence
- * logic. */
+ * logic. A live assistant-owner mismatch returns undefined before any journal
+ * or FIFO-counter mutation, after the common retire/resend handling. */
 export function admitQueuedActivationTail(
   ds: DaemonSession,
   entry: Omit<QueuedActivationTailEntry, 'id' | 'order'>,
-  reservation: QueuedActivationTailReservation = reserveQueuedActivationTailAdmission(ds),
+  reservation?: QueuedActivationTailReservation,
   opts: { codexAppInputGateFrozen?: boolean } = {},
-): QueuedActivationTailEntry {
+): QueuedActivationTailEntry | undefined {
+  if (!assistantLiveInputAdmission(ds, entry.turnId, { context: 'queued activation input' })) return undefined;
+  const fifoReservation = reservation ?? reserveQueuedActivationTailAdmission(ds);
   const admittedLinkRefs = entry.cliInput.linkRefs
     ? freezeDeferredLinkRefPayload({
         ds,
@@ -18507,12 +18574,12 @@ export function admitQueuedActivationTail(
   const frozenInput = admittedLinkRefs.payload;
   const acceptedCodexAppInput = opts.codexAppInputGateFrozen === true
     ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
-    : reservation.codexAppInputAccepted === true
+    : fifoReservation.codexAppInputAccepted === true
       ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
       : undefined;
   const admitted: QueuedActivationTailEntry = {
-    id: reservation.id,
-    order: reservation.order,
+    id: fifoReservation.id,
+    order: fifoReservation.order,
     ...entry,
     cliInput: {
       content: frozenInput.content,
@@ -18992,6 +19059,10 @@ function queueBehindPendingProtectedHttpEgressFork(
           && resumeOrTurnId !== null
           && resumeOrTurnId.codexAppInputGateFrozen === true,
       });
+      if (!admitted) {
+        opts.onAdmission?.('rejected');
+        return true;
+      }
       queuedActivationTailId = admitted.id;
     } catch (error) {
       logger.error(
@@ -19497,7 +19568,7 @@ function forkWorkerPrepared(
       const turnId = initTurnId
         ?? ds.currentReplyTarget?.turnId
         ?? `queued-activation-followup-${randomUUID()}`;
-      admitQueuedActivationTail(ds, {
+      const admitted = admitQueuedActivationTail(ds, {
         userPrompt: prompt,
         cliInput: {
           content: prompt,
@@ -19516,6 +19587,10 @@ function forkWorkerPrepared(
           ? { dispatchAttempt: initDispatchAttempt }
           : {}),
       });
+      if (!admitted) {
+        reportAdmission('rejected');
+        return true;
+      }
       logger.info(
         `[${tag(ds)}] Staged double-fork prompt behind queued activation ACK `
         + `(turn=${turnId})`,
@@ -19568,6 +19643,45 @@ function forkWorkerPrepared(
     }
     reportAdmission('rejected');
     return true;
+  }
+  // 个人助理模式：每次起 worker 都重新核对归属（判定见 core/assistant-spawn.ts）。这是最后
+  // 一道闸：这里放过去，worker 就会拿共享 BOT_HOME 和默认 cwd 起来。
+  if (botCfg.assistantMode === true) {
+    const decision = decideAssistantAdmission(ds.larkAppId, {
+      chatId: ds.chatId,
+      chatType: ds.session.chatType === 'p2p' ? 'p2p' : 'group',
+      ownerOpenId: ds.session.ownerOpenId,
+      assistantOwnerOpenId: ds.session.assistantOwnerOpenId,
+      everRan: ds.hasHistory || !!ds.session.cliSessionId,
+      sandboxFrozenWithoutWithhold: ds.session.sandbox !== undefined && ds.session.sandboxWithholdBotSecret !== true,
+    });
+    if (decision.kind === 'adopt') {
+      ds.session.assistantOwnerOpenId = decision.openId;
+      ds.session.workingDir = decision.workDir;
+      ds.workingDir = decision.workDir;
+      sessionStore.updateSession(ds.session);
+      logger.info(`[${tag(ds)}] assistant-mode: new session adopted by its chat owner`);
+    } else if (decision.kind === 'reject') {
+      // 拒绝之外还要退役这个会话：chat-scope 会话会被后续消息一直复用，不退役就永远卡在
+      // 这里（换了主人 / 开模式前的存量会话都是这种）。关掉后下一条消息走新建路径，按
+      // 当前归属重新建会话。本条消息丢弃，由用户重发。
+      logger.warn(`[${tag(ds)}] assistant-mode: refusing to fork — session owner ${decision.have ?? '(none)'} vs resolved ${decision.expected ?? '(none)'}; retiring session`);
+      reportAdmission('rejected');
+      // 告诉用户这条没处理、要重发（否则消息静默丢失）。
+      const retiredTurnId = fallbackTurnId(ds, initTurnId);
+      const retiredNotice = tr('worker.assistant.session_retired', {}, botLocale(botCfg));
+      if (opts.onAdmissionBlocked) {
+        opts.onAdmissionBlocked({ content: retiredNotice, ...(retiredTurnId ? { turnId: retiredTurnId } : {}) });
+      } else if (prompt.length > 0 || initTurnId) {
+        void cb.sessionReply(sessionAnchorId(ds), retiredNotice, 'text', ds.larkAppId, retiredTurnId,
+          { sourceSessionId: ds.session.sessionId }).catch(error => logger.error(
+            `[${tag(ds)}] assistant-mode: failed to report retired session: ${String(error)}`,
+          ));
+      }
+      void closeSessionForBackgroundCleanup(ds.session.sessionId, 'assistant-mode owner mismatch').catch(err =>
+        logger.warn(`[${tag(ds)}] assistant-mode: retire failed: ${(err as Error).message}`));
+      return false;
+    }
   }
   const admission = checkWorkerAdmission(readGlobalConfig().worker);
   for (const warning of admission.pressure.warnings) {
@@ -20351,6 +20465,10 @@ function forkWorkerPrepared(
     // Raw configured value; the worker normalizes + enforces the fail-closed
     // contract (services/cli-credential-source.ts).
     ...(botCfg.credentialsSourceDir ? { credentialsSourceDir: botCfg.credentialsSourceDir } : {}),
+    // 模板缺省 = bot 默认工作目录（同 effectiveDefaultWorkingDir；不从 bot-registry 引入，
+    // 大量单测对该模块做了白名单 mock）。
+    ...assistantInitFields(botCfg, ds.session.assistantOwnerOpenId,
+      botCfg.defaultWorkingDir || (botCfg.defaultOncall?.enabled ? botCfg.defaultOncall.workingDir : undefined)),
     cliInstanceBinding: ds.session.cliInstanceBinding,
     // Trigger-user CLI auth: the worker needs the policy to know which tools to
     // wrap at spawn. Absent → the worker installs nothing and PATH is untouched.
@@ -20662,8 +20780,11 @@ function forkWorkerPrepared(
     }
   } else {
     afterWorkerIpcBootstrap(worker, () => {
-      // Bootstrap may wait while a human stops or supersedes the task. A blank
-      // worker can still serve that new input, but must not inherit the claim.
+      // Bootstrap may wait while a human stops, supersedes the task, or rebinds
+      // the assistant owner. The fork-time admission does not cover this later
+      // IPC boundary; never release the old opening prompt into a stale worker.
+      if (!assistantLiveInputAdmission(ds, initAttributionTurnId, { context: 'worker init delivery' })) return;
+      // A blank worker can still serve a new input, but must not inherit the claim.
       if (!continuationStillAllowed()) delete initMsg.deploymentContinuation;
       onIpcDispatchAttempted?.();
       const sent = worker.send(initMsg);

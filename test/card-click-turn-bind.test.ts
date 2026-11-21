@@ -14,7 +14,9 @@ const mocks = vi.hoisted(() => ({
   updateSession: vi.fn(),
   isTeamBot: vi.fn(() => false),
   secretPaths: [] as string[],
+  assistantSpawn: { kind: 'off' } as { kind: 'off' } | { kind: 'unclaimed' } | { kind: 'owner'; openId: string; workDir: string },
 }));
+vi.mock('../src/core/assistant-spawn.js', () => ({ resolveAssistantSpawn: () => mocks.assistantSpawn }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
@@ -85,6 +87,7 @@ afterEach(() => {
   mocks.isTeamBot.mockReturnValue(false);
   mocks.createSession.mockReset();
   mocks.secretPaths.length = 0;
+  mocks.assistantSpawn = { kind: 'off' };
   delete process.env.BOTMUX_XPI_ENABLED;
 });
 
@@ -210,6 +213,38 @@ describe('card click turn binder', () => {
       trustedCaller: { requestUserOpenId: 'ou_clicker', senderType: 'user' },
     });
     expect(mocks.sendWorkerInput).not.toHaveBeenCalled();
+  });
+
+  it('assistant mode: the created session belongs to the chat owner and runs in the owner work dir; unclaimed chats get none', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'card-click-bind-'));
+    dirs.push(dataDir);
+    mocks.createSession.mockImplementation((chatId: string, root: string, title: string, chatType: 'group' | 'p2p', scope: 'chat') => ({
+      sessionId: 'created-session-a', chatId, rootMessageId: root, title, chatType, scope, status: 'active',
+    }));
+    const run = async (nonce: string) => {
+      const activeSessions = new Map<string, DaemonSession>();
+      const binder = createCardClickTurnBinder({
+        activeSessions, dataDir: () => dataDir, noteTurnReceived: async () => undefined, beginNewTurn: () => undefined,
+        trustedCallerForInboundTurn: async (_app, openId) => ({ requestUserOpenId: openId, requestLarkAppId: 'cli_app', senderType: 'user' as const }),
+      });
+      const issued = issueCardClickTurn({ secret: 'secret', larkAppId: 'cli_app', prompt: 'p', chatId: 'oc_new', workingDir: '/tmp', now: Date.now(), nonce });
+      if (!issued.ok) throw new Error(issued.error);
+      const accepted = await binder.accept({ larkAppId: 'cli_app', operatorOpenId: 'ou_clicker', payload: issued.payload, sig: issued.sig });
+      const started = accepted.ok ? await accepted.run() : accepted;
+      return { started, created: [...activeSessions.values()][0] };
+    };
+    mocks.assistantSpawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+    const owned = await run('nonce-assistant-own1');
+    expect(owned.started.ok).toBe(true);
+    expect(owned.created?.session.assistantOwnerOpenId).toBe('ou_owner_a');
+    expect(owned.created?.session.workingDir).toBe('/home/u/ou_owner_a/work');
+
+    mocks.forkWorker.mockClear();
+    mocks.assistantSpawn = { kind: 'unclaimed' };
+    const refused = await run('nonce-assistant-unc1');
+    expect(refused.started.ok).toBe(false);
+    expect(refused.created).toBeUndefined();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
   });
 
   it('does not start a turn when the clicker is a cached app', async () => {

@@ -11,6 +11,8 @@ export function inheritSessionLaunchConfiguration(source: Session, target: Sessi
     'codexProfile', 'codexProfileHome', 'model', 'modelBackendVariant', 'reasoningEffort', 'serviceTier',
     'sandbox', 'sandboxPaths', 'sandboxScratch', 'sandboxHidePaths',
     'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy', 'sandboxWithholdBotSecret', 'autoWorktreeFallbackDir',
+    // 个人助理模式的归属是启动决定的一部分（cwd / CLI 数据目录 / 沙盒子树都跟着它）。
+    'assistantOwnerOpenId',
   ] as const satisfies readonly (keyof Session)[];
   Object.assign(target, structuredClone(Object.fromEntries(fields.map(key => [key, source[key]]))));
 }

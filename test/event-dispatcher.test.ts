@@ -14946,6 +14946,26 @@ describe('chat.bot_added observer hook', () => {
     expect(emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added')).toHaveLength(1);
   });
 
+  // 个人助理模式：成员退群事件透传给 daemon（判 owner 是否退群）。只取 users[].user_id.open_id，
+  // 缺 chat_id / 没有合法 open_id 不回调；回调抛错不影响缓存失效。
+  it('forwards im.chat.member.user.deleted_v1 to handleChatMemberUserDeleted with the leaving open_ids', async () => {
+    const handleChatMemberUserDeleted = vi.fn(async () => {});
+    Object.assign(handlers, { handleChatMemberUserDeleted });
+    capturedHandlers['im.chat.member.user.deleted_v1']({
+      chat_id: 'oc_leave_1',
+      operator_id: { open_id: USER_OPEN_ID },
+      users: [{ user_id: { open_id: 'ou_left_a' } }, { name: 'no id' }, { user_id: { open_id: 'ou_left_b' } }],
+    });
+    await flushEventWork();
+    expect(handleChatMemberUserDeleted).toHaveBeenCalledTimes(1);
+    expect(handleChatMemberUserDeleted).toHaveBeenCalledWith('oc_leave_1', ['ou_left_a', 'ou_left_b'], MY_APP_ID);
+
+    capturedHandlers['im.chat.member.user.deleted_v1']({ chat_id: 'oc_leave_2', users: [] });
+    capturedHandlers['im.chat.member.user.deleted_v1']({ users: [{ user_id: { open_id: 'ou_x' } }] });
+    await flushEventWork();
+    expect(handleChatMemberUserDeleted).toHaveBeenCalledTimes(1);
+  });
+
   it('runs the per-bot group-join command once when enabled, independent of autoStart', async () => {
     runGroupJoinCommandMock.mockClear();
     const state = setupBotState({ allowedUsers: [USER_OPEN_ID] });
