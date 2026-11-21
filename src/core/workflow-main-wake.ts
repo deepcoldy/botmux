@@ -132,6 +132,7 @@ export function workflowMainWakeAcceptanceReported(
     ...(ds.session.cliConfigDir ? { cliConfigDir: ds.session.cliConfigDir } : {}),
     ...(ds.session.backendType ? { sessionBackendType: ds.session.backendType } : {}),
     larkAppId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
   });
 }
 

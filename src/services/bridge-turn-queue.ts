@@ -661,14 +661,20 @@ export class BridgeTurnQueue {
   ingest(
     events: TranscriptEvent[],
     sourceJsonlPath?: string,
-    /** Cosmetic side-channel observer: called at the moment an event is
+    /** Read-only side-channel observer: called at the moment an event is
      *  attributed to a turn (the then-collecting turn) for
      *    - every non-sidechain, non-error assistant event, and
      *    - every non-sidechain pure-tool_result user event (intra-turn tool
      *      output — skipped by turn-start handling but part of the turn).
-     *  Used by the worker to extract thinking/tool entries for the native
-     *  CoT message. Must never mutate the queue or influence attribution. */
+     *  The worker uses this for the native CoT message and for proof that a
+     *  replay actually attributed a reply to a turn. It must never mutate the
+     *  queue or influence attribution. */
     onAssistantAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
+    /** Read-only observer for a main-thread duration marker actually closing
+     *  the then-collecting turn. Unlike a raw timestamp match, this carries the
+     *  turn identity, so a replayed previous turn's marker cannot settle the
+     *  current unread run. Must not mutate the queue or influence attribution. */
+    onTurnDurationAttributed?: (ev: TranscriptEvent, turn: BridgePendingTurn) => void,
   ): void {
     if (sourceJsonlPath && events.length > 0) this.onEventsRead?.(events, sourceJsonlPath);
     for (const ev of events) {
@@ -717,7 +723,7 @@ export class BridgeTurnQueue {
           if (this.collecting && onAssistantAttributed
             && (ev as any).isSidechain !== true
             && isPureToolResultUserEvent(ev.message?.content)) {
-            try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+            try { onAssistantAttributed(ev, this.collecting); } catch { /* observer channel — never break attribution */ }
           }
           continue;
         }
@@ -879,7 +885,7 @@ export class BridgeTurnQueue {
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {
-          try { onAssistantAttributed(ev, this.collecting); } catch { /* cosmetic channel — never break attribution */ }
+          try { onAssistantAttributed(ev, this.collecting); } catch { /* observer channel — never break attribution */ }
         }
         if (isClaudeTurnTerminalEvent(ev) && this.collecting) {
           this.collecting.terminalObserved = true;
@@ -906,7 +912,10 @@ export class BridgeTurnQueue {
         if (this.collecting) {
           this.collecting.terminalObserved = true;
           this.collecting.awaitingDurationMarker = false;
-          if (isClaudeTurnDurationEvent(ev)) this.collecting.closedByDurationMarker = true;
+          if (isClaudeTurnDurationEvent(ev)) {
+            this.collecting.closedByDurationMarker = true;
+            try { onTurnDurationAttributed?.(ev, this.collecting); } catch { /* observer channel — never break attribution */ }
+          }
           if (!this.collecting.rateLimited) {
             this.collecting.terminalOutcome ??= { status: 'completed' };
           }

@@ -117,6 +117,7 @@ export interface RestartLaunchSettings extends TraexAutoModelSettings {
   traexAutoModel?: TraexAutoModelConfig;
   model?: string;
   larkToolBinding?: boolean;
+  triggerUserAuth?: import('../services/trigger-user-auth.js').TriggerUserAuthConfig;
   codexRpcInput?: boolean;
   /** Read by spawnCli when the replacement is built (shell wrapper). */
   launchShell?: string;
@@ -135,6 +136,7 @@ export function restartLaunchSettings(cfg: RestartLaunchSettings | null | undefi
     modelBackendVariant: cfg?.modelBackendVariant,
     model: cfg?.model,
     larkToolBinding: cfg?.larkToolBinding,
+    triggerUserAuth: cfg?.triggerUserAuth,
     codexRpcInput: cfg?.codexRpcInput,
     launchShell: cfg?.launchShell,
     ...(cfg?.startupCommands?.length ? { startupCommands: cfg.startupCommands } : {}),
@@ -163,6 +165,7 @@ export function sameRestartLaunchSettings(a: RestartLaunchSettings, b: RestartLa
     && a.modelBackendVariant === b.modelBackendVariant
     && (a.model ?? undefined) === (b.model ?? undefined)
     && (a.larkToolBinding ?? undefined) === (b.larkToolBinding ?? undefined)
+    && JSON.stringify(a.triggerUserAuth) === JSON.stringify(b.triggerUserAuth)
     && a.codexRpcInput === b.codexRpcInput
     && (a.launchShell || undefined) === (b.launchShell || undefined)
     && !!a.startupCommands?.length === !!b.startupCommands?.length;

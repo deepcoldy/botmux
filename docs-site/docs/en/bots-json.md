@@ -117,6 +117,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `providerRecovery` | Claude Code only: continue automatically after a transient model-service failure, e.g. `{"enabled":true,"maxWaitMinutes":30}`. Fields you leave out follow the global setting; off by default. See [Global settings: auto-continue after provider failures](/global-settings#provider-recovery) |
 | `skillInjection` | How botmux's built-in skills reach the CLI: `prompt` (per session), `global` (installed into the CLI's global skills dir), or `off`. If unset, it follows the global setting, which defaults to `prompt`. See [Skills](/en/skill-cli) |
 | `customPassthroughCommands` | Extra slash commands passed through to the CLI, e.g. `["/export"]`. Entries that would clash with botmux's own commands are dropped. `/list-slash-command` shows the full list. See [Slash commands](/en/slash-commands) |
+| `bareRenamePassthrough` | Off by default. When `true`, a `/rename` without a title goes to the CLI as is, and the CLI names the session from the conversation (Claude Code only for now, adopted sessions included). See [Slash commands](/en/slash-commands#rename-cli) |
 | `startupCommands` | Commands sent to the CLI after it starts and before the first message, e.g. `["/effort ultracode"]`. Re-sent on every fresh start and resume |
 | `quotaFallbackBot` | Hand the session to another bot when CLI quota runs out. Off by default. See [Quota handoff](#quota-fallback) below |
 | `codexCapacityRecovery` | Codex / Codex App only: automatically continue after an explicit model-capacity error. Off by default; at most two recovery inputs per task. Ordinary rate limits and exhausted quota don't count |
@@ -407,7 +408,8 @@ Details in [File sandbox](/en/sandbox).
 | `scratchDenyPaths` | `scratch` only: extra paths to hide. botmux's own credentials are always hidden |
 | `sandboxNetwork` | Default `true` keeps network access; `false` cuts ordinary outbound network |
 | `sandboxNetworkPolicy` | Advanced network policy that filters target IPs separately for public and private ranges |
-| `credentialsSourceDir` | A sandboxed bot copies its CLI login from this directory on every start, instead of the machine's shared login. Useful for several accounts on one machine |
+| `sandboxWithholdBotSecret` | `oncall` only, off by default. When on, the sandbox cannot read this bot's Lark App Secret; `botmux send` / `history` / `quoted` are all carried out by the daemon outside the sandbox. See [File sandbox](/en/sandbox#withhold-bot-secret) |
+| `credentialsSourceDir` | A `claude-code` bot copies its login from this directory on every cold start instead of using the machine's shared login, with allowlist isolation (`oncall`) or the sandbox off; `scratch` refuses to start. An unsandboxed bot switches to its own CLI data directory. Useful for several accounts on one machine |
 | `codexAuthSync` | Codex login policy: `shared` (default) uses the global login; `isolated` always uses this bot's own `CODEX_HOME` and never reads or copies global credentials |
 | `triggerUserAuth` | Off by default. When on, tools such as `lark-cli` in the session run with the authorization of the person who sent the message; people who haven't authorized get an authorization link |
 | `larkToolBinding` | On by default: `lark-cli` in the session uses the current bot's app identity, and `--as user` / `--profile` can switch. `false` injects no bot credentials at all |
@@ -574,7 +576,7 @@ Edit it visually in Dashboard "Bot Config → Message Cards → Final answer fee
 
 | Field | Description |
 |------|------|
-| `replyDelivery` | How the final answer reaches Feishu. `send` (default for every CLI except Doubao): the model runs `botmux send` itself; `transcript`: botmux takes the turn's last answer from the CLI's session record and sends it. See below |
+| `replyDelivery` | How the final answer reaches Feishu. `transcript` (default for CLIs whose session record botmux can read): botmux takes the turn's last answer from the CLI's session record and sends it; `send` (default for every other CLI, and can be set explicitly): the model runs `botmux send` itself. See below |
 | `senderTag` | On by default: every message forwarded to the CLI carries a `<sender ... />` tag saying who spoke. Only `false` turns it off |
 | `senderTagHideEmail` | Off by default. When on, the `<sender>` tag leaves out the email; name and ID stay |
 | `hideLocalAddresses` | Off by default: model replies reach Feishu as written. When on, host paths and local service addresses are kept out of replies. See [Hide development host addresses](#hide-local-addresses) below |
@@ -585,25 +587,38 @@ Edit it visually in Dashboard "Bot Config → Message Cards → Final answer fee
 
 ### Transcript replies (`replyDelivery: "transcript"`)
 
-Doubao defaults to `transcript` (its tool commands run in an account-wide resident process, so a model-run `botmux send` can land in the wrong topic; see [CLI Adapters](/en/adapters)). Every other CLI defaults to `send`, where the model has to run `botmux send` to post its answer to Feishu. With `transcript`, botmux takes the turn's last answer from the CLI's session record and sends it; the model just answers.
+CLIs whose session record botmux can read default to `transcript`: botmux takes the turn's last answer from the CLI's session record and posts it to Feishu, so the model just answers instead of running `botmux send`. Models no longer `botmux send` every progress note, interim conclusion and final answer, which keeps chats much quieter.
 
-Three things change:
+Compared with `send`, four things change:
 
-1. The system prompt no longer teaches `botmux send`. When the model really needs it (attachments, mentioning another bot), it can find out how through the built-in `botmux-send` skill.
+1. The system prompt says "write the final answer in your reply" and keeps `botmux send` for what the final reply cannot carry: mentioning another bot to collaborate or handing results back to the bot that assigned the task, attachments or cards, posting to another chat or topic, and turns whose instructions explicitly ask for it (such as silent scheduled tasks). It also tells the model not to use it for progress broadcasts.
 2. No more `<botmux_reminder>` each turn.
 3. In DMs, or 1:1 groups with only the admin and this bot, messages are no longer wrapped in `<user_message>` and `<sender/>`; the model sees the raw text.
+4. The output the model reads after `botmux send` reminds it that the final answer belongs in its reply and progress needs no send.
 
-Supported CLIs: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao. Antigravity only captures answers in zero-injection mode, so setting it explicitly is rejected; if you later switch to an unsupported CLI, runtime falls back to `send` and no answer is lost. Cursor and Doubao don't support transcript under `sandbox: "scratch"` (setting it is rejected and the default falls back to `send` at runtime); the oncall sandbox is unaffected.
+Supported CLIs: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao. Other CLIs (Antigravity, OpenCode, Relay, codex-app, …) still default to `send`; Antigravity only captures answers in zero-injection mode, so setting it explicitly is rejected. If you set `transcript` and later switch to an unsupported CLI, runtime falls back to `send` and no answer is lost. Under `sandbox: "scratch"` only Claude Code, Codex and TraeX session records are readable from the host; every other CLI falls back to `send` there at runtime (an explicit `transcript` is rejected for Cursor and Doubao); The oncall sandbox has one exception: Hermes' adapter does not mount `~/.hermes/state.db` into the host, so it also falls back to `send` at runtime; other CLIs are unaffected by oncall.
 
-```text
-/botconfig set replyDelivery transcript   # turn on
-/botconfig set replyDelivery send         # explicitly use botmux send (not recommended for Doubao)
-/botconfig unset replyDelivery            # back to default
+To get the old behavior back (the model runs `botmux send` itself), set `send` explicitly:
+
+```json
+{ "replyDelivery": "send" }
 ```
 
-- Per-turn reminders and wrappers change from the next turn. The system prompt is set when a session starts, so running sessions need `/restart`.
-- Trade-off: 1:1 sessions lose the `<user_message>` / `<sender>` structure, so `/adopt` no longer recognizes them as botmux's own sessions.
-- The Dashboard "Transcript reply mode" switch writes this field; it's greyed out when the current CLI doesn't support it.
+```text
+/botconfig set replyDelivery send         # back to botmux send (not recommended for Doubao)
+/botconfig set replyDelivery transcript   # pin transcript explicitly
+/botconfig unset replyDelivery            # back to this CLI's default
+```
+
+A bot with an explicit `send` stays on `send`; the default never overrides it.
+
+- After changing `replyDelivery`, the per-turn reminder and wrapper change from the next turn; the system prompt and how the final reply is forwarded follow the CLI process, so they switch after `/restart` or when the session relaunches its CLI. When a restarted daemon re-attaches a CLI that kept running (tmux and other persistent backends), that CLI keeps the mode it was launched with.
+- The same applies to bots without `replyDelivery` after upgrading to this version: a CLI that is already running and not relaunched keeps working in `send` mode (the model runs `botmux send`, botmux forwards only what it didn't send); `/restart` switches it to the new default.
+- When a legacy pane has no launch snapshot, the compatibility value inferred on its first reattach is frozen into the session record; later daemon reattachments no longer recompute it from live config, and only a CLI switch invalidates it. If you edited `replyDelivery` **before that first post-upgrade reattach** without restarting the CLI, no evidence can exactly recover its historical config: run `/restart` once so its prompt and forwarding gate converge on the new config.
+- Bot-to-bot collaboration is unchanged: reaching another bot, or handing results back to the bot that assigned the task, still takes `botmux send --mention` (or `--mention-back`); the final reply card does not @ the other bot.
+- Silent scheduled tasks are unchanged: their final reply never reaches the chat, and the model still runs `botmux send` when the notify condition is met.
+- Cost: 1:1 sessions lose the `<user_message>` / `<sender>` structure, so `/adopt` no longer recognizes them as botmux's own sessions by content (exclusion by session ID still applies).
+- The Dashboard "Transcript reply mode" switch writes this field, in both directions; it's greyed out when the current CLI doesn't support it.
 
 ### Turning off the sender tag (`senderTag: false`)
 
@@ -649,7 +664,7 @@ What happens:
 
 - **Only the task and attachments are passed**: no botmux system prompt, per-turn reminders, identity info, role, whiteboard, memory or skill catalog. The CLI's own system prompt and the project's `AGENTS.md` are still handled by the CLI.
 - **Answers are forwarded automatically**: the final answer is taken from the CLI's session record and sent back to Feishu, mentioning the person who sent the task by default. Names of other bots in the group (like `@Reviewer`) become real Feishu mentions.
-- **Supported CLIs**: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao, Antigravity. Local backends only: tmux / pty / zellij / herdr / zmx (Antigravity doesn't support zmx). Cursor and Antigravity don't support the `scratch` sandbox. Remote backends and v3 workflows are not supported yet.
+- **Supported CLIs**: Claude Code, Codex, TraeX, CoCo, Hermes, MTR, Pi, Oh My Pi, ebsd, Grok, Cursor, Doubao, Antigravity. Local backends only: tmux / pty / zellij / herdr / zmx (Antigravity doesn't support zmx). Cursor and Antigravity don't support the `scratch` sandbox. Hermes doesn't support the `oncall` sandbox (`~/.hermes/state.db` is not mounted into the host). Remote backends and v3 workflows are not supported yet.
 
 Technical details: [`docs/zero-prompt-injection.md`](https://github.com/deepcoldy/botmux/blob/master/docs/zero-prompt-injection.md).
 

@@ -33,6 +33,12 @@ export class SessionEventGateway {
     if (context.session.appId !== this.session.appId || context.session.sessionId !== this.session.sessionId || !sameWorker(context.producer, channel)) return { kind: 'reject', reason: 'session_event_channel_mismatch' };
     if (!Number.isSafeInteger(context.sequence) || context.sequence < 1 || context.eventId !== `${channel.workerId}:${context.sequence}`) return { kind: 'reject', reason: 'invalid_session_event_sequence' };
     const state = this.store.read(this.session); if (!state) return { kind: 'reject', reason: 'session_contract_missing' };
+    // Close receipts are control-channel facts, including while closing. The
+    // pool correlates requestId, session, worker and operation before commit;
+    // input/runtime readiness must not discard the ACK it is waiting for.
+    if (['close_result', 'close_abort_result'].includes(type) && sameWorker(state.worker, channel)) {
+      return { kind: 'worker', context };
+    }
     const runtime = context.scope.runtime;
     if (!runtime) {
       if (context.scope.execution) {
@@ -62,9 +68,14 @@ export class SessionEventGateway {
       // not bind/start the attempt and still require the current producer.
       // The worker announces capture identity at the CLI write boundary,
       // before turn_execution_started binds the queued execution.
+      // terminal_turn_started is that start for a turn the CLI began on its
+      // own (a background task's wake-up, terminal input, a built-in scheduled
+      // fire): the controller has just admitted its execution on the current
+      // runtime, and the daemon must record where the turn's reply goes. In a
+      // zero-prompt session a local final without that record is not delivered.
       const unboundCurrent = sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime)
         && (['turn_execution_started', 'native_input_consumed', 'turn_terminal', 'final_output'].includes(type)
-          || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition', 'capture_identity'].includes(type)));
+          || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition', 'capture_identity', 'terminal_turn_started'].includes(type)));
       const sourceRuntime = execution.runtime ? this.store.runtime(this.session, execution.runtime.runtimeId) : undefined;
       const sameContinuedExecutionRuntime = !!execution.runtime && sameWorker(state.worker, channel)
         && (this.store.runtimeContinues(this.session, execution.runtime, runtime, channel)

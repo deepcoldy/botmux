@@ -134,4 +134,85 @@ describe('passthrough delivery is reported at the worker-accept boundary', () =>
     // The bookkeeping failure must actually have happened for this test to mean anything.
     expect(thrown).toBeInstanceOf(Error);
   });
+
+  it('persists a real turn\'s retry invalidation before worker admission', () => {
+    const ds = liveSession();
+    ds.session.idleAutoCompact = {
+      enabled: true, idleSince: 1000,
+      retry: { stretch: 1000, attempts: 1, reason: 'unconfirmed' },
+    };
+    const saves: unknown[] = [];
+    mocks.updateSession.mockImplementation((session: unknown) => { saves.push(structuredClone(session)); });
+    expect(deliverPassthrough(ds, '/compact', '/compact', 'om_root', ds.larkAppId, {
+      messageId: 'om_root', senderIsBot: false, substitute: false, turnId: 'om_real_turn',
+    })).toBe(true);
+    expect((ds.worker as any).send).toHaveBeenCalled();
+    expect(ds.session.idleAutoCompact.retry).toBeUndefined();
+    expect(ds.session.idleAutoCompact.handledIdleSince).toBe(1000);
+    const saved = saves.at(-1) as DaemonSession['session'];
+    expect(saved.idleAutoCompact?.retry).toBeUndefined();
+    expect(saved.idleAutoCompact?.handledIdleSince).toBe(1000);
+  });
+
+  it('invalidates an older in-flight compact before worker admission', () => {
+    const ds = liveSession();
+    ds.session.idleAutoCompact = {
+      enabled: true, idleSince: 1000, handledIdleSince: 1000,
+      inFlight: { turnId: 'auto-compact:idle:old', since: 900, idleMinutes: 55, stretch: 1000, attempt: 1 },
+    };
+    const saves: Array<DaemonSession['session']> = [];
+    mocks.updateSession.mockImplementation((session: DaemonSession['session']) => { saves.push(structuredClone(session)); });
+    (ds.worker as any).send.mockImplementation(() => {
+      // At the actual admission boundary the durable cancellation must already
+      // exist; deleting it later in beginNewTurn would pass only the final check.
+      expect(ds.session.idleAutoCompact.inFlight).toBeUndefined();
+      expect(saves.at(-1)?.idleAutoCompact?.inFlight).toBeUndefined();
+      return true;
+    });
+    expect(deliverPassthrough(ds, '/compact', '/compact', 'om_root', ds.larkAppId, {
+      messageId: 'om_root', senderIsBot: false, substitute: false, turnId: 'om_real_turn',
+    })).toBe(true);
+    expect(ds.session.idleAutoCompact.inFlight).toBeUndefined();
+    expect(saves.at(-1)?.idleAutoCompact?.inFlight).toBeUndefined();
+  });
+
+  it('does not admit a real turn when its retry invalidation cannot be saved', () => {
+    const ds = liveSession();
+    const retry = { stretch: 1000, attempts: 1, reason: 'unconfirmed' as const };
+    ds.session.idleAutoCompact = {
+      enabled: true, idleSince: 1000, retry: { ...retry },
+      inFlight: { turnId: 'auto-compact:idle:old', since: 900, idleMinutes: 55, stretch: 1000, attempt: 1 },
+    };
+    let writes = 0;
+    mocks.updateSession.mockImplementation(() => {
+      writes += 1;
+      if (writes === 2) throw new Error('injected retry-invalidation write failure');
+    });
+    const onDelivered = vi.fn();
+    expect(() => deliverPassthrough(ds, '/compact', '/compact', 'om_root', ds.larkAppId, {
+      messageId: 'om_root', senderIsBot: false, substitute: false, turnId: 'om_real_turn', onDelivered,
+    })).toThrow('injected retry-invalidation write failure');
+    expect((ds.worker as any).send).not.toHaveBeenCalled();
+    expect(onDelivered).not.toHaveBeenCalled();
+    expect(ds.session.idleAutoCompact.retry).toEqual(retry);
+    expect(ds.session.idleAutoCompact.inFlight?.turnId).toBe('auto-compact:idle:old');
+  });
+
+  it('a local CLI command preserves the retry in memory and in every saved row', () => {
+    const ds = liveSession();
+    const retry = { stretch: 1000, attempts: 1, reason: 'unconfirmed' as const };
+    ds.session.idleAutoCompact = { enabled: true, idleSince: 1000, retry: { ...retry } };
+    const saves: Array<DaemonSession['session']> = [];
+    mocks.updateSession.mockImplementation((session: DaemonSession['session']) => { saves.push(structuredClone(session)); });
+    expect(deliverPassthrough(ds, '/cost', '/cost', 'om_root', ds.larkAppId, {
+      messageId: 'om_root', senderIsBot: false, substitute: false, turnId: 'om_cost',
+    })).toBe(true);
+    expect(ds.session.idleAutoCompact.retry).toEqual(retry);
+    expect(ds.session.idleAutoCompact.handledIdleSince).toBeUndefined();
+    expect(saves.length).toBeGreaterThan(0);
+    for (const saved of saves) {
+      expect(saved.idleAutoCompact?.retry).toEqual(retry);
+      expect(saved.idleAutoCompact?.handledIdleSince).toBeUndefined();
+    }
+  });
 });

@@ -5,7 +5,8 @@
 // transcript bridge is the callback the spawn left behind, as in production.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
@@ -52,7 +53,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function startWorker({ opening = true, cliPid = process.ppid, restart = false, wake = false }: { opening?: boolean; cliPid?: number; restart?: boolean; wake?: boolean } = {}) {
+async function startWorker({ opening = true, cliPid = process.ppid, restart = false, wake = false, zeroPrompt = false }: { opening?: boolean; cliPid?: number; restart?: boolean; wake?: boolean; zeroPrompt?: boolean } = {}) {
   const sessionReply = vi.fn(async () => 'om_reply');
   const screenStatuses: Array<{ prevStatus?: string; status: string; turnId?: string }> = [];
   workerPool.initWorkerPool({
@@ -66,7 +67,9 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
     { rootMessageId: turnId, senderOpenId: `ou_${turnId}`, updatedAt: new Date().toISOString() }]));
   const ds = {
     session: { sessionId: SESSION, chatId: 'oc_group', chatType: 'group', status: 'active', cliId: 'claude-code',
-      createdAt: new Date().toISOString(), workerGeneration: 1, replyTargets },
+      createdAt: new Date().toISOString(), workerGeneration: 1, replyTargets,
+      // Zero-prompt: the CLI's own turns answer the latest message of the chat.
+      ...(zeroPrompt ? { promptInjection: 'none', quoteTargetId: TURNS[0] } : {}) },
     larkAppId: APP, chatId: 'oc_group', chatType: 'group', scope: 'chat',
     worker, workerGeneration: 1, workerPort: 0, workerToken: 'token',
     spawnedAt: Date.now(), cliVersion: '1', lastMessageAt: Date.now(), hasHistory: true,
@@ -233,7 +236,7 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
 
 const answers = (...turnIds: string[]) => turnIds.map(turnId => expect.stringContaining(`answer for ${turnId}`));
 const lostTurnWarnings = (warn: ReturnType<typeof vi.spyOn>) => warn.mock.calls.map(([line]) => String(line))
-  .filter(line => /Dropped managed_turn_origin|not delivered|Worker user_notify/.test(line));
+  .filter(line => /Dropped (managed_turn_origin|terminal_turn_started)|not delivered|Worker user_notify/.test(line));
 
 describe('turns around a semantic runtime rebind', () => {
   it('settles the live screen after a semantic rebind without moving the execution origin', async () => {
@@ -283,6 +286,28 @@ describe('turns around a semantic runtime rebind', () => {
 
     await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0], TURNS[1])));
     expect(s.ds.managedTurnOrigin?.turnId).toBeUndefined();
+    expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+
+  it('delivers the opening reply whose prompt rode the spawn argv once the relay resolves the real CLI', async () => {
+    // Pi and Grok take the opening prompt in their argv: nothing is written to
+    // the CLI, and the worker's start report precedes any runtime, so no
+    // runtime ever binds that turn. Its transcript bridge was armed under the
+    // launcher's binding, which the relay then continued into the real CLI's
+    // (2026-11-14..19: 10 of 15 opening replies of one Pi bot were refused).
+    const warn = vi.spyOn(logger, 'warn');
+    const s = await startWorker();
+    const opening = () => s.controller.store.executions(s.controller.ref, TURNS[0])[0];
+    expect(opening()?.runtime).toBeUndefined();
+    await s.relayResolvesRealCli();
+    await s.publishNativeSession('native-argv');
+    expect(s.scope.currentBinding()).not.toBe(s.binding);
+    expect(opening()?.runtime).toBeUndefined();
+
+    await s.bridge({ type: 'final_output', content: `answer for ${TURNS[0]}`, lastUuid: `uuid-${TURNS[0]}`, turnId: TURNS[0] });
+    await s.bridge({ type: 'turn_terminal', sessionId: SESSION, turnId: TURNS[0], status: 'completed' });
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0])));
+    expect(opening()).toMatchObject({ phase: 'succeeded', runtime: s.controller.currentRuntime() });
     expect(lostTurnWarnings(warn)).toEqual([]);
   });
 
@@ -451,6 +476,31 @@ describe('turns around a semantic runtime rebind', () => {
     await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0], 'local-wake-before', 'local-wake-after')));
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(s.replies()).toHaveLength(3);
+    expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+
+  // Zero-prompt: the answer to a turn the CLI starts on its own (a background
+  // task's wake-up) goes out only to where the turn's start said it replies.
+  // The transcript bridge reports that start under the binding the spawn left
+  // behind, which every production start has rebound since.
+  it.each([
+    ['the relay resolved the real CLI and it reported its session id', { cliPid: process.ppid },
+      async (s: Awaited<ReturnType<typeof startWorker>>) => { await s.relayResolvesRealCli(); await s.publishNativeSession('native-cold'); }],
+    ['/clear moved the CLI to another session id', { cliPid: process.pid },
+      async (s: Awaited<ReturnType<typeof startWorker>>) => { await s.publishNativeSession('native-before-clear'); await s.publishNativeSession('native-after-clear'); }],
+  ] as const)('zero-prompt: posts the answer to a turn the CLI starts on its own after %s', async (_shape, opts, rebind) => {
+    const warn = vi.spyOn(logger, 'warn');
+    const s = await startWorker({ opening: false, zeroPrompt: true, ...opts });
+    await rebind(s);
+    expect(s.scope.currentBinding()).not.toBe(s.binding);
+    const turnId = 'local-headless-wake';
+    await s.bridge({ type: 'terminal_turn_started', turnId, startedAtMs: Date.now() });
+    await s.bridge({ type: 'final_output', content: `answer for ${turnId}`, lastUuid: `uuid-${turnId}`, turnId, terminalLocal: true });
+    await s.bridge({ type: 'turn_terminal', sessionId: SESSION, turnId, status: 'completed' });
+
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(turnId)));
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(s.replies()).toHaveLength(1);
     expect(lostTurnWarnings(warn)).toEqual([]);
   });
 });
@@ -626,12 +676,22 @@ describe('replies that genuinely cannot be posted', () => {
   it('warns and tells the group when the daemon refuses the live worker\'s final', async () => {
     const warn = vi.spyOn(logger, 'warn');
     const { s, first } = await respawnMidTurn();
+    config.session.dataDir = join(dir, 'data with space');
     await s.answer(TURNS[0], first);
 
     await vi.waitFor(() => expect(s.replies()).toEqual([expect.stringContaining('⚠️')]));
     expect(s.replies()[0]).not.toContain(`answer for ${TURNS[0]}`);
     expect(warn.mock.calls.map(([line]) => String(line))).toContainEqual(
       expect.stringMatching(new RegExp(`Final output from current worker not delivered turn=${TURNS[0]}`)));
+    // Run the command the notice actually carries, not just a quoting helper:
+    // a custom data dir with spaces must still be copy/paste recoverable.
+    const command = /`(find [^`]+)`/.exec(s.replies()[0]!)?.[1];
+    expect(command).toBeDefined();
+    const found = spawnSync('/bin/sh', ['-c', command!], { encoding: 'utf8' });
+    expect(found.status, found.stderr).toBe(0);
+    const kept = readdirSync(join(config.session.dataDir, 'undelivered-replies'), { recursive: true }).map(String).filter(name => name.endsWith('.md'));
+    expect(kept).toHaveLength(1);
+    expect(found.stdout).toContain(kept[0]!);
     await s.answer(TURNS[0], first);
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(s.replies()).toHaveLength(1);
@@ -647,6 +707,11 @@ describe('replies that genuinely cannot be posted', () => {
       expect.stringMatching(new RegExp(`Final output from current worker not delivered turn=${TURNS[0]}`))));
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(s.replies()).toEqual([]);
+    // Quiet, but not thrown away: the reply is kept on the host.
+    const archive = join(dir, 'undelivered-replies');
+    const kept = readdirSync(archive, { recursive: true }).map(String).filter(name => name.endsWith('.md'));
+    expect(kept).toHaveLength(1);
+    expect(readFileSync(join(archive, kept[0]!), 'utf8')).toContain(`answer for ${TURNS[0]}`);
   });
 
   // A replaced CLI's observer drops its copy; the live CLI's observer posts it.

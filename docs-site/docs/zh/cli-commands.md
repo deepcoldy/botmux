@@ -173,6 +173,22 @@ botmux term-link [id]
 
 获取会话的可写 Web 终端。链接不会打印在终端里，而是由 daemon 以私密卡片发给机器人主人（群里只有你能看到，话题或单聊里退回私聊发送）。只有一个活跃会话时可以省略 `id`。详见 [Web 终端](/web-terminal)。
 
+## 从宿主 shell 主动发消息
+
+CI、告警系统和外部 Agent 可以用 `botmux post` 把已有内容作为飞书文本发送。指定运行中的 Bot App ID 和收件位置即可，无需会话 ID 或启动 AI 会话。
+
+```bash
+botmux post --bot cli_xxx --chat-id oc_xxx --request-id build_12345 --text "构建完成"
+botmux post --bot cli_xxx --chat-id oc_xxx --into om_xxx --text-file ./result.txt
+printf '%s\n' "需要人工处理" | botmux post --bot cli_xxx --user-open-id ou_xxx --text-file -
+```
+
+命令在有权访问本机 Botmux daemon 的宿主 shell 中运行。群消息要求 Bot 已入群。话题使用所属群 ID 和根消息 ID（`om_…`）。私聊使用发送 Bot 应用视角下的用户 `open_id`，接收人须在应用可见范围内。正文可用 `--text` 或 `--text-file`，上限为 8192 个 UTF-8 字节。
+
+`--bot` 只接受 `cli_` 开头的飞书 App ID。CI 或告警系统应通过 `--request-id` 传入稳定的事件 ID（8–64 个字母、数字、下划线或连字符），省略时 CLI 自动生成。成功时 stdout 的 JSON 回执包含 `requestId`、`messageId`、`replayed`、Bot 和目的地。群消息与请求绑定群发送 API 共用去重记录。
+
+参数无效退出 2。投递出错退出 1，stderr 输出 JSON。超时、连接中断或无法确认回执时返回 `outcome_unknown`，消息可能已发出。`retryable: true` 时，在首次尝试后 50 分钟内用相同的 Bot、目的地、正文和请求 ID 重试。窗口过期且结果仍未知时返回 `retryable: false`，请人工核对。相同 ID 改正文会返回 `request_conflict`，首次明确遭飞书拒绝后，记录保留期间用原 ID 和正文重试会返回原来的 `send_failed`。修改正文需使用新 ID。已成功的请求在有界归档保留期内返回原消息 ID。
+
 ## Dashboard 登录链接
 
 ```bash
@@ -181,6 +197,12 @@ botmux dashboard rotate    # 换一个新 token，旧链接失效
 ```
 
 Dashboard 的功能见 [Dashboard](/dashboard)。
+
+## 内存启动保护
+
+`botmux worker-budget status` 查看可用内存、预留余量、内存 PSI 门槛和当前是否允许启动 worker。内存不足时，daemon 的后台恢复只记录日志并汇总私信机器人 owner；群内的当前请求被拒绝时，只回复简短的暂不可用状态。
+
+owner 私信在 2 秒窗口内按机器人合并，受影响会话按唯一 session 计数。每个机器人与 owner 组合最多每 5 分钟尝试发送一次，冷却记录跨 daemon 重启保留；发送失败也进入冷却，后续拒绝在冷却结束后可再次触发通知。owner 暂时无法解析时只记日志。无法写入冷却记录时退化为进程内去重。此通知独立于 Dashboard 中可选的主机负载监控。
 
 ## 开机自启
 
@@ -268,7 +290,7 @@ botmux autostart status   # 查看状态
 | 命令 | 说明 |
 |------|------|
 | `botmux observe [--session <id>] [--lark-app <appId>] [--include-task] [--active\|--since <时长>]` | 通过 daemon 实时查询会话和 worker 状态（JSON）。查不到就显示 unknown，不读缓存。`--include-task` 给每个会话加上任务状态（需要你 / 进行中 / 本轮已交付 / 没做完 / 空闲 / 已关闭，与 Dashboard 看板同一套判断）；`--active` 只列没关闭、并且在跑或 24 小时内有消息的会话，`--since 6h` 把窗口改成 6 小时 |
-| `botmux execution current --json` | 核对当前进程属于哪个机器人、会话、轮次和 worker |
+| `botmux execution current --json [--cli]` | 核对当前进程所属执行；`--cli` 另返回实际 CLI 模式、系统账号和原生操作权限 |
 | `botmux actor current --json` | 返回经 daemon 验证的本轮发起人企业邮箱，以及当前群 ID 和轮次 ID（不含 open_id）。不在会话进程里运行时会拒绝 |
 
 ### 进阶能力（各有专页）
@@ -351,3 +373,9 @@ botmux quoted om_example_one --raw
 筛选仅覆盖 `--limit` 读取的最近消息窗口，不能据此断言全群没有匹配。`--since` 包含边界，`--until` 不包含边界；时间推荐带时区。`retrieval` 报告读取窗口、筛选数量、详情失败和待展开 id。index 中 `queryMatch=deferred` 表示卡片/转发内容未核验，应按 id 读详情；index 与 `--with-card-json` 互斥。
 
 批量 quoted 返回 `messages` 和 `errors`；重复 id 去重，成功消息保持输入顺序，部分失败退出码 1 并保留已成功结果。请求缓存只在单次命令内生效，区分应用和卡片表示形式；下一次命令重新读取。两个命令均支持 `--help`。
+
+## 后台恢复诊断
+
+后台恢复遇到执行进程启动、DNS/执行环境准备失败时，诊断会汇总私信机器人当前 owner；当前请求只收到简短暂不可用状态。Pi 检测到安装版本变化也汇总通知 owner，并继续在当前任务结束后休眠、下次输入使用新版本启动。启动、安装变化和内存告警各自按 2 秒窗口聚合、5 分钟冷却，避免不同问题互相抑制。
+
+Mojo 的旧谱系隔离和历史配置提示保留为待交付状态。空白恢复及仅通知 owner 的历史输入重放都不会消费该状态；有明确 turn 的非空新输入接纳后，提示才投递到该输入的会话。输入拒绝或提示投递失败时保留待交付标记，后续输入可重试。静默任务、会议接收和无飞书通道仍遵循原有输出限制。

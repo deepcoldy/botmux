@@ -1,12 +1,15 @@
 import { CURRENT_EXECUTION_SCHEMA, isCurrentExecutionDocument, type CurrentExecutionDocument } from '../cli/current-execution.js';
 import { resolveTurnOrigin } from './turn-origin.js';
 import { attestCurrentExecutionLoopbackPeer, type CurrentTurnPeerAttestationInput } from './current-actor-attestation.js';
+import type { CliExecutionInfo } from './cli-execution-mode.js';
+import type { DaemonSession } from './types.js';
 
 /** Synchronous, read-only snapshot. Caller/permission, business success and
  * durable input acceptance are deliberately not implied by an execution proof. */
 export function resolveDaemonCurrentExecution(
   input: CurrentTurnPeerAttestationInput,
-  options: { includeOrigin?: boolean } = {},
+  options: { includeOrigin?: boolean; includeCli?: boolean;
+    cliExecution?: (session: DaemonSession) => CliExecutionInfo } = {},
 ): CurrentExecutionDocument | null {
   const proof = attestCurrentExecutionLoopbackPeer(input);
   if (!proof || proof.ds.session.sessionId !== input.sessionId || proof.ds.worker?.connected === false) return null;
@@ -20,6 +23,8 @@ export function resolveDaemonCurrentExecution(
     ...(proof.dispatchAttempt !== undefined ? { dispatchAttempt: proof.dispatchAttempt } : {}),
     ...(identityTurnId ? { identityTurnId } : {}),
     ...(origin ?? {}),
+    ...(options.includeCli ? { cliExecution: options.cliExecution?.(proof.ds)
+      ?? { mode: 'unknown' as const, nativeAuthorized: false } } : {}),
   };
   return isCurrentExecutionDocument(document) ? document : null;
 }

@@ -16,9 +16,11 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
+import { crossChatFollowThreadPath } from './cross-chat-follow-thread-store.js';
 import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
 import { removeCodexModelLaunchReceipt } from './codex-model-selection.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
+import { cleanupSessionTurns, resumeSessionTurns } from './session-turns.js';
 import {
   applySessionRowCommand,
   type HostSessionCommand,
@@ -2503,15 +2505,25 @@ function findInOtherFiles(sessionId: string): Session | undefined {
 
 export function cleanupSessionBridgeSendMarkersNow(sessionId: string): void {
   try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+  try { unlinkSync(crossChatFollowThreadPath(config.session.dataDir, sessionId)); } catch { /* absent/best effort */ }
 }
 
 export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
   const fence = bridgeMarkerCleanupFences.get(sessionId);
   if (fence) {
-    void fence.then(
-      () => cleanupSessionBridgeSendMarkersNow(sessionId),
-      () => cleanupSessionBridgeSendMarkersNow(sessionId),
-    );
+    const expectedEpoch = getOwnedSession(sessionId)?.followThreadEpoch;
+    const cleanupIfLifecycleUnchanged = () => {
+      try {
+        const current = getOwnedSession(sessionId);
+        // A close fence belongs to the lifecycle that created it. If resume or
+        // another close has moved the session forward, its cleanup must not
+        // delete the new lifecycle's host binding.
+        if (current?.status === 'closed' && current.followThreadEpoch === expectedEpoch) {
+          cleanupSessionBridgeSendMarkersNow(sessionId);
+        }
+      } catch { /* an unreadable lifecycle is not proof it is safe to delete */ }
+    };
+    void fence.then(cleanupIfLifecycleUnchanged, cleanupIfLifecycleUnchanged);
     return;
   }
   cleanupSessionBridgeSendMarkersNow(sessionId);
@@ -2885,6 +2897,7 @@ export function closeSession(
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
     }, { now: new Date() });
     if (applied.outcome === 'applied') {
+      next.followThreadEpoch = randomUUID();
       commitContractLifecycle(basis, 'close', () => {
         const latest = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
         const closed = latest ? JSON.parse(latest.row) as Session : undefined;
@@ -2909,6 +2922,11 @@ export function closeSession(
     // user-visible, so workerless/forced closes must apply the same cleanup;
     // otherwise closed sessions retain private reply text indefinitely.
     if (opts.cleanupBridgeMarkers !== false) cleanupSessionBridgeSendMarkers(sessionId);
+    try {
+      cleanupSessionTurns(config.session.dataDir, sessionId);
+    } catch {
+      logger.warn('Failed to clean structured session turns');
+    }
     // #794: per-turn hook sidecar 与 turn-sends 同生命周期，关会话一并清掉，
     // 否则 prompt-ctx/<sid>/ 成为孤儿目录（24h TTL 兜底但 daemon 长命会累积）。
     removePromptContextDir(sessionId);
@@ -2954,6 +2972,7 @@ export function reactivateClosedSession(
   // starts a new lifecycle, so the previous close-time token snapshot must not
   // survive into the active row or the next close.
   const next: Session = { ...session };
+  if (next.followThreadEpoch === undefined) next.followThreadEpoch = randomUUID();
   next.status = 'active';
   next.closedAt = undefined;
   next.userClosedAt = undefined;
@@ -2980,6 +2999,11 @@ export function reactivateClosedSession(
   next.mojoCloseJournal = undefined;
   next.tokenUsage = undefined;
 
+  try {
+    resumeSessionTurns(config.session.dataDir, sessionId);
+  } catch {
+    logger.warn('Failed to reset structured session turns on reactivation');
+  }
   commitContractLifecycle(session, 'resume', () => persistRow(next));
   const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
   Object.assign(session, next, committed ? JSON.parse(committed.row) : {});
@@ -4022,7 +4046,7 @@ const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'modelPin', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
-  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
+  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy', 'sandboxWithholdBotSecret',
   'protectedHttpEgressPolicy',
 ] as const satisfies readonly (keyof Session)[];
 

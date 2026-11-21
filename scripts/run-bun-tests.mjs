@@ -34,10 +34,11 @@
 // quietly start skipping files (or fail on files that have since been fixed).
 
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
-import { join, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { availableParallelism, tmpdir as realTmpdir } from 'node:os';
 import { acquireTestSlot, resolveTestConcurrency } from './test-concurrency.mjs';
+import { reapRegisteredTestProcesses, TMUX_FENCE_ROOTS_BASENAME } from './test-process-reaper.mjs';
 import { bunSuiteHash, parseBunRunnerArgs, selectBunShard, writeBunTimingReport } from './bun-test-shards.mjs';
 
 let options;
@@ -123,6 +124,23 @@ function mintFencedEnv() {
   // Mirrors test/helpers/fence-home-env.ts; kept here as well because that file
   // only runs after Bun has started.
   for (const name of ['BOTS_CONFIG', 'PM2_HOME', 'PLUGIN_PM2_HOME']) delete env[name];
+  // Keep the tmux socket topology short on POSIX: the child's fence root is
+  // /tmp/bmxt-*, NOT scratch/bmxt-*. The latter adds the scratch path to every
+  // sun_path and pushes long but valid -L labels over Linux's 108-byte limit.
+  // Windows has no tmux socket here and its \tmp directory is not guaranteed
+  // to exist, so retain the original scratch/PARENT topology there.
+  if (process.platform === 'win32') {
+    env.BOTMUX_TMUX_FENCE_PARENT = scratch;
+    delete env.BOTMUX_TMUX_FENCE_ROOT;
+    delete env.BOTMUX_TMUX_FENCE_ROOTS;
+  } else {
+    // The preload appends each root to this manifest so removeScratch can still
+    // reap a child SIGKILLed before its own teardown. Clear inherited pointers:
+    // a nested runner must not silently reintroduce the long topology.
+    delete env.BOTMUX_TMUX_FENCE_PARENT;
+    delete env.BOTMUX_TMUX_FENCE_ROOT;
+    env.BOTMUX_TMUX_FENCE_ROOTS = join(scratch, TMUX_FENCE_ROOTS_BASENAME);
+  }
 
   return { scratch, env };
 }
@@ -317,6 +335,97 @@ console.log(
 const liveChildren = new Map();
 
 /**
+ * Read the short fence roots registered by a child. The child is allowed to
+ * create more than one fence (some integration fixtures do), so this is a list
+ * rather than a single path. Only direct /tmp/bmxt-* children are accepted:
+ * the manifest is writable by test code and must never become an arbitrary
+ * directory-deletion primitive.
+ */
+function readScratchFenceRoots(scratch) {
+  const manifest = join(scratch, TMUX_FENCE_ROOTS_BASENAME);
+  let contents;
+  try {
+    contents = readFileSync(manifest, 'utf8');
+  } catch (err) {
+    // Selector probes and children that die before preload have no manifest.
+    if (err?.code === 'ENOENT') return { roots: [], invalid: [] };
+    throw err;
+  }
+  const parent = resolve('/tmp');
+  const roots = [];
+  const invalid = [];
+  const lines = contents.split('\n');
+  // An unterminated final record may be a truncated path. Never resolve it as
+  // a valid root; complete records before it remain actionable for cleanup.
+  const trailing = lines[lines.length - 1];
+  if (contents && !contents.endsWith('\n') && trailing.trim()) invalid.push(trailing.trim());
+  for (const line of lines.slice(0, -1)) {
+    const value = line.trim();
+    if (!value) continue;
+    const root = resolve(value);
+    if (dirname(root) !== parent || !basename(root).startsWith('bmxt-')) {
+      invalid.push(value);
+      continue;
+    }
+    roots.push(root);
+  }
+  return { roots: [...new Set(roots)], invalid };
+}
+
+/**
+ * Reap the scratch registry and every short fence root in its manifest. This
+ * is also called BEFORE killing a child's process group: a detached tmux
+ * server can publish its socket in that window, and the later removeScratch
+ * call repeats the same manifest-driven sweep.
+ */
+function reapScratchProcesses(scratch) {
+  let roots = [scratch];
+  let ok = true;
+  try {
+    const parsed = readScratchFenceRoots(scratch);
+    roots.push(...parsed.roots);
+    if (parsed.invalid.length > 0) {
+      ok = false;
+      process.stderr.write(
+        `[runner] invalid tmux fence root record(s) in ${join(scratch, TMUX_FENCE_ROOTS_BASENAME)}: `
+        + `${parsed.invalid.map(value => JSON.stringify(value)).join(', ')}; preserving cleanup evidence\n`,
+      );
+    }
+  } catch (err) {
+    process.stderr.write(`[runner] could not read tmux fence roots for ${scratch}: ${err?.message ?? err}\n`);
+    // The manifest may be unreadable, but the scratch's own registry is still
+    // actionable. Reap it before preserving the tree for diagnosis.
+    ok = false;
+  }
+  roots = [...new Set(roots)];
+  for (const root of roots) {
+    const reaped = reapRegisteredTestProcesses(root);
+    for (const ref of reaped.tmuxFailed) {
+      process.stderr.write(`[runner] tmux server pid ${ref.pid} is still alive for ${ref.socket}\n`);
+    }
+    if (reaped.sandboxFailed.length > 0) {
+      process.stderr.write(`[runner] sandbox process(es) still alive: ${reaped.sandboxFailed.join(', ')}\n`);
+    }
+    if (reaped.tmuxFailed.length > 0 || reaped.sandboxFailed.length > 0) ok = false;
+  }
+  return { ok, roots };
+}
+
+function removeTree(root) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      return true;
+    } catch (err) {
+      if (attempt === 4) {
+        process.stderr.write(`[runner] could not remove ${root}: ${err?.code ?? err}\n`);
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Remove a scratch tree without ever taking the run down with it.
  *
  * `rmSync({ recursive: true, force: true })` still THROWS `ENOTEMPTY` when
@@ -327,15 +436,18 @@ const liveChildren = new Map();
  * nuisance, losing the whole run's results is not.
  */
 function removeScratch(scratch) {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      rmSync(scratch, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
-      return;
-    } catch (err) {
-      if (attempt === 4) {
-        process.stderr.write(`[runner] could not remove ${scratch}: ${err?.code ?? err}\n`);
-      }
-    }
+  // A detached tmux server is outside the child's process group. Reap its
+  // registered pid (and any sandbox fake CLI) BEFORE removing the evidence.
+  const { ok, roots } = reapScratchProcesses(scratch);
+  if (!ok) {
+    process.exitCode = 1;
+    process.stderr.write(`[runner] keeping ${scratch} because process cleanup could not be confirmed\n`);
+    return;
+  }
+  // Delete external fence roots first and scratch last: the manifest is the
+  // recovery evidence if a later removal races a still-writing process.
+  for (const root of [...roots].reverse()) {
+    if (!removeTree(root)) return;
   }
 }
 
@@ -386,6 +498,9 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
     if (shuttingDown) return;
     shuttingDown = true;
     for (const [child, scratch] of liveChildren) {
+      // Let an already-issued new-session publish its server before the group
+      // is killed; removeScratch repeats this after the group sweep.
+      reapScratchProcesses(scratch);
       killTree(child, 'SIGKILL');
       // Cancellation is exactly when these would otherwise accumulate: the close
       // handler that normally removes them never runs.
@@ -472,6 +587,9 @@ function runOne(file) {
       // survived a NORMAL file close as a PPID=1 process holding a port. Deleting
       // the scratch dir without this made a directory-based check look clean while
       // the process was still alive, so sweep BEFORE removing the evidence.
+      // Give a mid-start tmux server a bounded chance to bind before the
+      // client's process group is swept, then repeat the check in removeScratch.
+      reapScratchProcesses(scratch);
       killTree(child, 'SIGKILL');
       removeScratch(scratch);
       // A signal death (wall-clock kill, OOM) leaves code null — never let that

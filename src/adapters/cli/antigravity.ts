@@ -1,9 +1,10 @@
 import { detectModelsViaExec } from './model-catalog-json.js';
 import { parseAntigravityModels } from './antigravity-models.js';
-import { existsSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, fstatSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
+import { statuslineHookCommand } from '../hook-command.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { wrapBracketedPaste } from './tui-input.js';
@@ -62,11 +63,26 @@ import {
  *      "line1" + M-Enter + "line2" + Enter produces ONE history line with
  *      `display:"line1\nline2"`.
  *
- *  Skills layout note: Antigravity loads SKILL.md only inside plugin
- *  bundles (`plugins/<plugin>/{plugin.json, skills/<name>/SKILL.md}`),
- *  not from a flat `skills/` dir. botmux's installer writes the flat
- *  layout, so `skillsDir` is intentionally undefined; routing guidance
- *  is injected via `systemHints` instead.
+ *  Skills: agy 1.5.x discovers global skills from `~/.gemini/config/skills/
+ *  <name>/SKILL.md` (listed under "Available skills" in its system prompt,
+ *  verified on 1.5.12; 1.0.0 only loaded plugin bundles). That is `skillsDir`,
+ *  so the built-in catalog — botmux-ask included — reaches agy sessions the
+ *  same way as codex/opencode (prompt mode by default, files in global mode).
+ *
+ *  Questions to the user (agy 1.5.12):
+ *    - `ask_question` (main agent and subagents) is taken over by a
+ *      PreToolUse hook in `~/.gemini/config/hooks.json` (hook-installer
+ *      `antigravity-hooks`, core/ask-hook/antigravity.ts): a Lark question
+ *      card, the answer back as the hook's deny reason; the picker never
+ *      opens. botmux-ask stays installed as the fallback for when the hook
+ *      cannot take it (it fails open to agy's own picker).
+ *    - agy's own pickers that can still come up — the question picker
+ *      (hook unavailable) and the tool permission dialog — are the
+ *      `antigravity` stuck-page family: queued input and raw passthrough
+ *      commands are held off them (utils/antigravity-blocking-page.ts).
+ *    - A plan artifact with RequestFeedback does not block the composer: agy
+ *      only shows "N artifact · /artifact to review" in its footer, and the
+ *      next message reaches the model.
  */
 
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
@@ -146,13 +162,19 @@ async function waitForHistoryAppend(
   return historyDeltaContains(path, fromByte, marker);
 }
 
-/** agy ≥1.2 renders the active permission mode INSIDE an otherwise empty
- *  composer as a placeholder after the prompt marker, e.g.
- *  `> Accept-edits mode: file edits auto-approved (shift+tab to cycle)`.
- *  All four modes (Auto / Accept-edits / Plan / Best-of-N) share the
- *  `(shift+tab to cycle)` suffix; older builds rendered a bare `>`. A real
- *  draft (including botmux's own <user_message> envelopes) matches neither. */
-const EMPTY_COMPOSER_ROW = /(?:>|> .+\(shift\+tab to cycle\))/;
+/** Only the four native permission placeholders prove an empty composer.
+ * Allow terminal line wrapping (including a split inside a word), but never
+ * accept an arbitrary draft just because it ends with the shortcut hint. */
+const COMPOSER_PLACEHOLDERS = [
+  'Auto mode: edits & safe commands auto-approved (shift+tab to cycle)',
+  'Accept-edits mode: file edits auto-approved (shift+tab to cycle)',
+  'Plan mode: research & plan only (shift+tab to cycle)',
+  'Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)',
+];
+const wrappedPlaceholder = (text: string): string => text.split(' ').map(word =>
+  [...word].map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('(?:[ \t]*\\r?\\n[ \t]*)?'),
+).join('[ \t\\r\\n]+');
+const EMPTY_COMPOSER_ROW = new RegExp(`(?:>|> (?:${COMPOSER_PLACEHOLDERS.map(wrappedPlaceholder).join('|')}))`);
 
 function isEmptyComposerRow(row: string): boolean {
   return new RegExp(`^${EMPTY_COMPOSER_ROW.source}$`).test(row);
@@ -186,13 +208,27 @@ export function annotateAntigravityUsageLimit(screen: string, state: CliUsageLim
   return state;
 }
 
+export const ANTIGRAVITY_QUOTA_HISTORY_LIMIT = 32;
+
+/** 保留最近首次见到的原生拒绝，重复帧既不改截止时间，也不改变淘汰顺序 */
+export function rememberAntigravityQuota(
+  history: readonly CliUsageLimitState[] | undefined,
+  state: CliUsageLimitState,
+): readonly CliUsageLimitState[] | undefined {
+  const key = state.relativeResetKey;
+  if (state.source !== 'antigravity-error-composer' || !key || history?.some(entry => entry.relativeResetKey === key)) {
+    return history;
+  }
+  return [...(history?.slice(1 - ANTIGRAVITY_QUOTA_HISTORY_LIMIT) ?? []), state];
+}
+
 /** Walk the tail of a viewport (ready footer → separators → composer) and
  *  decide whether agy is parked at an EMPTY composer with its ready footer —
  *  i.e. the live TUI is demonstrably waiting for input. Returns the index of
- *  the row immediately above the composer block, or -1 when the tail does not
+ *  the row immediately above the composer block, or undefined when the tail does not
  *  match. One walk shared by the interruption and generic idle-composer
  *  classifiers. */
-function readyComposerRowAbove(plain: string): number {
+function readyComposerRowAbove(plain: string): number | undefined {
   const rows = plain.split('\n').map(row => row.trim());
   let end = rows.length;
   const skipBlankRows = (): void => {
@@ -204,11 +240,22 @@ function readyComposerRowAbove(plain: string): number {
     while (end > 0 && /^[─━]*$/.test(rows[end - 1])) end--;
   };
   skipBlankRows();
-  if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return -1;
+  if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return undefined;
   skipSeparators();
-  if (end === 0 || !isEmptyComposerRow(rows[--end])) return -1;
+  const composerEnd = end;
+  // A wrapped placeholder ends above the separator; walk back only within
+  // that composer block, without consuming earlier output or a draft prompt.
+  while (end > 0 && !rows[end - 1]!.startsWith('>') && !/^[─━]*$/.test(rows[end - 1]!)) end--;
+  if (end === 0 || !isEmptyComposerRow(rows.slice(--end, composerEnd).join('\n'))) return undefined;
   skipSeparators();
   return end - 1;
+}
+
+/** 正常输入框及快捷键页脚证明旧额度错误已退出；原生错误输入框没有此页脚。
+ * 只检查当前视口尾部，不能用历史里的输入框证明当前状态。 */
+export function isAntigravityReadyComposerScreen(screen: string): boolean {
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  return !isAntigravityWorkingScreen(plain) && readyComposerRowAbove(plain) !== undefined;
 }
 
 /** Cancellation can leave the transcript at a tool result forever. Accept only
@@ -221,7 +268,7 @@ export function isAntigravityInterruptedScreen(screen: string): boolean {
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
   if (/esc to cancel/i.test(plain)) return false;
   const rowAbove = readyComposerRowAbove(plain);
-  if (rowAbove < 0) return false;
+  if (rowAbove === undefined || rowAbove < 0) return false;
   return /^⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?$/.test(plain.split('\n').map(row => row.trim())[rowAbove]);
 }
 
@@ -236,7 +283,7 @@ export function isAntigravityInterruptedScreen(screen: string): boolean {
 export function isAntigravityIdleComposerScreen(screen: string): boolean {
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
   if (/esc to cancel/i.test(plain)) return false;
-  return readyComposerRowAbove(plain) >= 0 || ERROR_COMPOSER_PATTERN.test(plain);
+  return readyComposerRowAbove(plain) !== undefined || ERROR_COMPOSER_PATTERN.test(plain);
 }
 
 export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
@@ -336,7 +383,11 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
     path,
     offset,
     (ctx.state as AntigravityTranscriptState | undefined) ?? {},
-    { flushTrailingFinal: ctx.flushTrailingFinal, adoptMode: ctx.adoptMode },
+    {
+      flushTrailingFinal: ctx.flushTrailingFinal,
+      retirePendingTurns: ctx.retirePendingTurns,
+      adoptMode: ctx.adoptMode,
+    },
   ),
   stateCommit: 'ingest',
   locate: {
@@ -349,12 +400,56 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
   spawn: { sessionId: 'cli', baseline: 'birth-aware' },
 };
 
-/** Only release versions with the verified paste contract opt into the fast path. */
-function supportsAntigravityBracketedPaste(version: string | undefined): boolean {
+function antigravityVersionAtLeast(
+  version: string | undefined,
+  minMajor: number,
+  minMinor: number,
+  minPatch: number,
+): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version?.trim() ?? '');
   if (!match) return false;
   const [major = 0, minor = 0, patch = 0] = match.slice(1, 4).map(Number);
-  return major > 1 || (major === 1 && (minor > 5 || (minor === 5 && patch >= 4)));
+  return major > minMajor
+    || (major === minMajor && (minor > minMinor || (minor === minMinor && patch >= minPatch)));
+}
+
+/** Only release versions with the verified paste contract opt into the fast path. */
+function supportsAntigravityBracketedPaste(version: string | undefined): boolean {
+  return antigravityVersionAtLeast(version, 1, 5, 4);
+}
+
+/** Verified release baseline supporting ephemeral `--settings` JSON with
+ *  `statusLine.stack_with_default: true` and quota buckets on stdin
+ *  (`stack_with_default` landed in 1.0.6, statusLine quota in 1.0.8 / 1.1.12,
+ *  and `--settings` is documented in 1.5.8+ and verified live on 1.5.12).
+ *  Older or unknown versions skip `--settings` so they never fail on an
+ *  unknown flag or hide the `? for shortcuts` ready footer. */
+export function supportsAntigravityStatusline(version: string | undefined): boolean {
+  return antigravityVersionAtLeast(version, 1, 5, 8);
+}
+
+/** 找回被进程级 `--settings` 遮蔽的用户 Antigravity statusLine 命令。
+ *  读取 `~/.gemini/antigravity-cli/settings.json` 中的 `statusLine`：
+ *  仅当未显式禁用（`enabled !== false`）、未指定非 command 类型、且 `command` 非空时返回。
+ *  纯函数、fail-open：文件缺失或损坏返回 `{}`。 */
+export function resolveShadowedAntigravityStatusLine(
+  opts?: { userSettingsPath?: string },
+): { command?: string } {
+  const settingsPath = opts?.userSettingsPath ?? join(homedir(), '.gemini', 'antigravity-cli', 'settings.json');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(settingsPath, 'utf-8').replace(/^\uFEFF/, ''));
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const sl = (parsed as Record<string, unknown>).statusLine;
+  if (!sl || typeof sl !== 'object' || Array.isArray(sl)) return {};
+  const o = sl as Record<string, unknown>;
+  if (o.enabled === false) return {};
+  if (o.type !== undefined && o.type !== 'command') return {};
+  if (typeof o.command !== 'string' || o.command.trim() === '') return {};
+  return { command: o.command };
 }
 
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
@@ -440,6 +535,20 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       }
       if (reasoningEffort && (reasoningEffort === 'low' || reasoningEffort === 'medium' || reasoningEffort === 'high')) {
         args.push('--effort', reasoningEffort);
+      }
+      // statusLine（agy >= 1.5.8）：通过进程级 --settings 临时注入，不修改用户
+      // ~/.gemini/antigravity-cli/settings.json；stack_with_default=true 保留
+      // 默认底部栏（保证 `? for shortcuts` readyPattern 与 idle 判定不受影响）。
+      // 用户原有的自定义 statusLine.command 由 worker 通过 BOTMUX_STATUSLINE_CHAIN 透传。
+      if (supportsAntigravityStatusline(cliVersion)) {
+        args.push('--settings', JSON.stringify({
+          statusLine: {
+            type: 'command',
+            enabled: true,
+            command: statuslineHookCommand(),
+            stack_with_default: true,
+          },
+        }));
       }
       // agy 1.5.4 supports -i, but its startup prompt bypasses history.jsonl.
       // Keep the same verified stdin submit path for initial and later turns.
@@ -590,14 +699,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     // conversation without cancelling the in-flight tool. Without
     // --dangerously-skip-permissions (disableCliBypass: true), agy can block on
     // a permission dialog where Enter approves and digit keys jump options, so
-    // runtimePtyInputPolicy suppresses type-ahead for restricted bots.
-    // Known issue (unified screen-hold follow-up): busy `raw_input` passthrough
-    // commands (/effort, /compact, /model, /btw, /clear) bypass
-    // runtimePtyInputPolicy, and interactive selection menus that still appear
-    // with bypass enabled (`ask_question`, Plan artifact review) also capture
-    // digit keys + Enter; both belong in one unified screen-based hold
-    // alongside hookReviewInputHold.
+    // runtimePtyInputPolicy suppresses type-ahead for restricted bots. Selection
+    // pickers that do come up (the question picker when the ask hook could not
+    // take it, the permission dialog) take digit keys + Enter: the
+    // `antigravity` stuck-page family holds queued input and busy raw
+    // passthrough commands (/effort, /compact, /model, …) off them.
     supportsTypeAhead: true,
+    stuckPageFamily: 'antigravity',
     isSessionBusy({ cliSessionId, getCurrentScreen }) {
       if (cliSessionId) knownCliSessionId = cliSessionId;
       if (lastConfirmedSubmitAtMs > 0) {
@@ -656,6 +764,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       return true;
     },
     systemHints: BOTMUX_SHELL_HINTS,
+    skillsDir: '~/.gemini/config/skills',
+    hookInstall: { configPath: '~/.gemini/config/hooks.json', format: 'antigravity-hooks' },
+    // The hook takes ask_question over, but falls back to agy's own picker
+    // when it cannot (agy without hooks, an unparseable hooks.json, botmux
+    // moved): keep the botmux-ask skill as the fallback, like TRAE does next
+    // to its native question bridge.
+    asksViaHook: false,
     altScreen: true,
   };
 }

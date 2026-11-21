@@ -13,7 +13,12 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { TmuxPipeBackend, paneLossWasServerReplacement } from '../src/adapters/backend/tmux-pipe-backend.js';
+import {
+  TmuxPipeBackend,
+  classifyServerLossAtPaneLoss,
+  paneLossWasServerReplacement,
+  probeTmuxServerUp,
+} from '../src/adapters/backend/tmux-pipe-backend.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
 let realTmux: string | undefined;
@@ -27,6 +32,26 @@ describe('paneLossWasServerReplacement', () => {
     expect(paneLossWasServerReplacement(100, 100)).toBe(false);
     expect(paneLossWasServerReplacement(undefined, 200)).toBe(false);
     expect(paneLossWasServerReplacement(100, undefined)).toBe(false);
+  });
+});
+
+describe('classifyServerLossAtPaneLoss', () => {
+  it('needs a live-server pid anchored while the pane was alive', () => {
+    expect(classifyServerLossAtPaneLoss(undefined, { state: 'down' })).toBeUndefined();
+    expect(classifyServerLossAtPaneLoss(undefined, { state: 'pid', pid: 2 })).toBeUndefined();
+  });
+
+  it('a socket nobody listens on means the server itself is gone', () => {
+    expect(classifyServerLossAtPaneLoss(1, { state: 'down' })).toBe('gone');
+  });
+
+  it('a different server on the socket means it was replaced; the same one means the CLI exited', () => {
+    expect(classifyServerLossAtPaneLoss(1, { state: 'pid', pid: 2 })).toBe('replaced');
+    expect(classifyServerLossAtPaneLoss(1, { state: 'pid', pid: 1 })).toBeUndefined();
+  });
+
+  it('an unreadable answer is never taken as a server loss', () => {
+    expect(classifyServerLossAtPaneLoss(1, { state: 'unknown' })).toBeUndefined();
   });
 });
 
@@ -123,11 +148,39 @@ describe.skipIf(!realTmux)('TmuxPipeBackend tells a lost tmux server apart from 
     expect(backend.exitedBecauseServerReplaced()).toBe(true);
   }, EXIT_TIMEOUT_MS + 30_000);
 
+  // 2026-11-19: the shared server died (SIGSEGV) and nothing had started a new
+  // one yet, so every probe read "no server running". Those exits must be
+  // reported as a server loss too, not as N CLI crashes.
+  it('reports the server as gone when it dies and nothing replaces it', async () => {
+    const { backend, exited } = launch('exec sleep 600');
+    await waitSeenAlive(backend);
+    const pid = Number(String(tmux('display-message', '-p', '#{pid}').stdout).trim());
+    expect(pid).toBeGreaterThan(0);
+    // This test's own private server (TMUX_TMPDIR is its temp dir).
+    process.kill(pid, 'SIGKILL');
+    await exited;
+    expect(backend.exitedBecauseServerLost()).toEqual({ kind: 'gone', socketName: socket });
+    expect(backend.exitedBecauseServerReplaced()).toBe(true);
+  }, EXIT_TIMEOUT_MS + 30_000);
+
+  it('probeTmuxServerUp answers whether a server listens, without starting one', async () => {
+    expect(await probeTmuxServerUp(socket)).toBe(false);
+    expect(tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'probe-up', 'sleep 600').status).toBe(0);
+    expect(await probeTmuxServerUp(socket)).toBe(true);
+    const pid = Number(String(tmux('display-message', '-p', '#{pid}').stdout).trim());
+    process.kill(pid, 'SIGKILL');
+    await new Promise(r => setTimeout(r, 200));
+    expect(await probeTmuxServerUp(socket)).toBe(false);
+    // Still nothing started by the probe itself.
+    expect(tmux('list-sessions').status).not.toBe(0);
+  });
+
   it('does not mark a CLI that exits on its own while the server stays', async () => {
     expect(tmux('-f', '/dev/null', 'new-session', '-d', '-s', 'keepalive', 'sleep 600').status).toBe(0);
     const { backend, exited } = launch('sleep 4; exit 0');
     await waitSeenAlive(backend);
     await exited;
     expect(backend.exitedBecauseServerReplaced()).toBe(false);
+    expect(backend.exitedBecauseServerLost()).toBeUndefined();
   }, EXIT_TIMEOUT_MS + 30_000);
 });

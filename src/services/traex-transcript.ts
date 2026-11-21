@@ -40,6 +40,7 @@ import {
   closeSync,
   existsSync,
   openSync,
+  readFileSync,
   readSync,
   readdirSync,
   statSync,
@@ -78,7 +79,7 @@ import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import { beginJsonlDrain, iterateJsonlLines } from './jsonl-cursor.js';
 import { traeHome, traeSessionsRoot, traeStateDbPath } from './traex-paths.js';
 import { traexHistoryInputMatches, traexSkillInputAliases } from './traex-skill-input.js';
-import { listProcessOpenFiles } from '../utils/process-open-files.js';
+import { probeProcessOpenFiles, type ProcessOpenFilesDenial } from '../utils/process-open-files.js';
 
 export { splitCodexEventsByCutoff as splitTraexEventsByCutoff };
 export { extractLastCodexTurn as extractLastTraexTurn };
@@ -1611,6 +1612,233 @@ function selectTraexRollout(
   return newest;
 }
 
+const PROC_LOCKS_PATH = '/proc/locks';
+const TRAEX_WRITER_LOCK_FILE_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.lock$/i;
+// `<id>: [-> ]<kind> <ADVISORY|MANDATORY> <access> <pid> <major>:<minor>:<inode> …`
+// (fs/locks.c lock_get_status: major/minor in hex, inode in decimal). A `->`
+// line is a task blocked waiting for that lock, not its holder.
+const PROC_LOCKS_LINE_RE = /^\d+:\s+(->\s+)?(\S+)\s+\S+\s+(\S+)\s+(-?\d+)\s+([0-9a-f]+):([0-9a-f]+):(\d+)\s/i;
+
+export interface ProcLockHold {
+  major: number;
+  minor: number;
+  inode: bigint;
+}
+
+/** Files `pid` holds an exclusive advisory lock on, from /proc/locks text.
+ *  FLOCK and POSIX locks record their holder's pid as the INIT pid namespace
+ *  sees it, so a process inside a sandbox's own pid namespace still shows up
+ *  under the pid the host observes; OFD locks carry no pid (-1) and never
+ *  match. Pure: the caller reads the table. */
+export function procLocksExclusiveHoldsOf(table: string, pid: number): ProcLockHold[] {
+  if (!Number.isInteger(pid) || pid <= 0) return [];
+  const holds: ProcLockHold[] = [];
+  for (const line of table.split('\n')) {
+    const m = PROC_LOCKS_LINE_RE.exec(line);
+    if (!m || m[1]) continue;
+    const kind = m[2]!.toUpperCase();
+    if ((kind !== 'FLOCK' && kind !== 'POSIX') || m[3]!.toUpperCase() !== 'WRITE' || Number(m[4]) !== pid) continue;
+    holds.push({ major: parseInt(m[5]!, 16), minor: parseInt(m[6]!, 16), inode: BigInt(m[7]!) });
+  }
+  return holds;
+}
+
+/** glibc's dev_t layout (what Node and Bun stat report) → major / minor. */
+function devMajorMinor(dev: bigint): { major: number; minor: number } {
+  return {
+    major: Number(((dev >> 8n) & 0xfffn) | ((dev >> 32n) & ~0xfffn)),
+    minor: Number((dev & 0xffn) | ((dev >> 12n) & ~0xffn)),
+  };
+}
+
+function traexWriterLockDir(): string {
+  return join(traeHome(), 'cli', 'thread-writer-locks');
+}
+
+// The lock table is a full kernel walk on every read (≈5ms for 1k lines,
+// ≈110ms for 20k), and in the refused mode several finders run back to back
+// for one decision. A lock that appears inside this window is seen by the
+// next poll; a released one cannot be re-taken by anyone else's pid.
+const PROC_LOCKS_CACHE_MS = 500;
+let procLocksCache: { path: string; atMs: number; table: string } | undefined;
+let procLocksPathOverride: string | undefined;
+
+function readProcLocks(path: string): string | undefined {
+  const now = Date.now();
+  if (procLocksCache?.path === path && now - procLocksCache.atMs < PROC_LOCKS_CACHE_MS) return procLocksCache.table;
+  try {
+    const table = readFileSync(path, 'utf8');
+    procLocksCache = { path, atMs: now, table };
+    return table;
+  } catch {
+    procLocksCache = undefined;
+    return undefined;
+  }
+}
+
+/** Test-only: read the lock table from `path` (undefined → /proc/locks). */
+export function __testOnly_setProcLocksPath(path: string | undefined): void {
+  procLocksPathOverride = path;
+  procLocksCache = undefined;
+}
+
+/** `linux:<starttime>` — how TRAE names a writer in `<id>.owner.json`. The
+ *  start time (clock ticks since boot, /proc/<pid>/stat field 22) is the same
+ *  seen from any pid namespace, unlike the pid TRAE writes beside it. */
+function linuxProcessStartId(pid: number): string | undefined {
+  let stat: string;
+  try { stat = readFileSync(`/proc/${pid}/stat`, 'utf8'); } catch { return undefined; }
+  const startTime = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+  return startTime && /^\d+$/.test(startTime) ? `linux:${startTime}` : undefined;
+}
+
+function ownerRecordNames(lockDir: string, id: string, startId: string | undefined): boolean {
+  if (!startId) return false;
+  try {
+    const record = JSON.parse(readFileSync(join(lockDir, `${id}.owner.json`), 'utf8')) as { process_start_id?: unknown };
+    return record?.process_start_id === startId;
+  } catch {
+    return false;
+  }
+}
+
+interface TraexWriterLockScan {
+  sessionIds: string[];
+  /** Exclusive locks the pid holds anywhere — kept for the log when none of
+   *  them turns out to be a thread lock of this TRAE_HOME. */
+  exclusiveHolds: number;
+}
+
+function scanTraexWriterLocks(
+  pid: number,
+  opts: { procLocksPath?: string; lockDir?: string } = {},
+): TraexWriterLockScan | undefined {
+  const table = readProcLocks(opts.procLocksPath ?? procLocksPathOverride ?? PROC_LOCKS_PATH);
+  if (table === undefined) return undefined;
+  const holds = procLocksExclusiveHoldsOf(table, pid);
+  if (holds.length === 0) return { sessionIds: [], exclusiveHolds: 0 };
+  const lockDir = opts.lockDir ?? traexWriterLockDir();
+  let names: string[];
+  try { names = readdirSync(lockDir); } catch { return { sessionIds: [], exclusiveHolds: holds.length }; }
+  let startId: string | undefined | null = null;
+  const sessionIds: string[] = [];
+  for (const name of names) {
+    const id = TRAEX_WRITER_LOCK_FILE_RE.exec(name)?.[1];
+    if (!id) continue;
+    let st: { dev: bigint; ino: bigint };
+    try { st = statSync(join(lockDir, name), { bigint: true }); } catch { continue; }
+    const sameInode = holds.filter(h => h.inode === st.ino);
+    if (sameInode.length === 0) continue;
+    const dev = devMajorMinor(st.dev);
+    if (sameInode.some(h => h.major === dev.major && h.minor === dev.minor)) {
+      sessionIds.push(id);
+      continue;
+    }
+    // stat() and /proc/locks can disagree on the device of the very same file:
+    // btrfs reports a per-subvolume st_dev, an overlay without xino a per-layer
+    // one, while the lock table prints the superblock's (measured). There the
+    // inode alone could also be another filesystem's, so it counts only when
+    // TRAE's own record of this lock names a writer started exactly when pid was.
+    if (startId === null) startId = linuxProcessStartId(pid);
+    if (ownerRecordNames(lockDir, id, startId)) sessionIds.push(id);
+  }
+  return { sessionIds, exclusiveHolds: holds.length };
+}
+
+/** TRAE thread ids whose writer lock `pid` holds, from the kernel lock table.
+ *
+ *  TRAE takes an exclusive flock on `<TRAE_HOME>/cli/thread-writer-locks/
+ *  <thread-id>.lock` for every thread it writes, from startup on (measured on
+ *  0.213.1, 0.214.1 and 0.216.0: `FLOCK ADVISORY WRITE <traex pid>`). Unlike
+ *  `/proc/<pid>/fd`, /proc/locks is world-readable and needs no ptrace access
+ *  to the holder, so this is what still names the thread of a TRAE process
+ *  inside a sandbox whose fd table procfs refuses. A lock file counts by
+ *  device + inode, so a lock the process holds on another filesystem cannot
+ *  be mistaken for a thread lock of this TRAE_HOME (where the two disagree on
+ *  the device, see scanTraexWriterLocks). Undefined when the lock table itself
+ *  cannot be read; an empty list when the pid holds no thread lock here. The
+ *  pid in `<id>.owner.json` is no substitute on its own: it is the one inside
+ *  the sandbox's pid namespace. */
+export function findTraexWriterLockSessionIdsByPid(
+  pid: number,
+  opts: { procLocksPath?: string; lockDir?: string } = {},
+): string[] | undefined {
+  return scanTraexWriterLocks(pid, opts)?.sessionIds;
+}
+
+/** How the files of a TRAE process were last enumerated, per pid. */
+export type TraexProcessFileSource =
+  | { via: 'fd' }
+  /** procfs refused the fd table; the kernel lock table named these threads
+   *  (`exclusiveHolds`: every exclusive lock the pid holds, matched or not). */
+  | { via: 'writer-lock'; denial: ProcessOpenFilesDenial; sessionIds: string[]; exclusiveHolds: number }
+  /** procfs refused the fd table and the lock table could not be read either. */
+  | { via: 'none'; denial: ProcessOpenFilesDenial };
+
+const TRAEX_FILE_SOURCE_MAX = 64;
+const traexFileSources = new Map<number, TraexProcessFileSource>();
+
+function recordTraexFileSource(pid: number, source: TraexProcessFileSource): void {
+  traexFileSources.delete(pid);
+  traexFileSources.set(pid, source);
+  if (traexFileSources.size > TRAEX_FILE_SOURCE_MAX) {
+    const oldest = traexFileSources.keys().next().value as number | undefined;
+    if (oldest !== undefined) traexFileSources.delete(oldest);
+  }
+}
+
+/** Drop the last enumeration of a pid whose procfs entry is gone (exited and
+ *  reaped) or otherwise unreadable. The map is keyed by bare pid with no
+ *  incarnation check, so a stale entry could otherwise be read back as the
+ *  diagnosis of whichever process the kernel later reuses that pid for. */
+function invalidateTraexProcessFileSource(pid: number): void {
+  traexFileSources.delete(pid);
+}
+
+/** The result of the latest enumeration of `pid` by the finders below, for
+ *  logs and notices. Undefined before the first one. */
+export function traexProcessFileSource(pid: number): TraexProcessFileSource | undefined {
+  return traexFileSources.get(pid);
+}
+
+/** Paths a TRAE process holds, in the shape the finders parse: its real fd
+ *  targets when procfs lets us read them. When procfs refuses (a sandbox
+ *  namespace this uid does not own — see ProcessOpenFilesDenial), the writer
+ *  locks it holds stand in: each thread's lock file plus that thread's
+ *  rollout, located by id like any resume target. The selection below still
+ *  reads each rollout's own session_meta, so a subagent / guardian thread
+ *  the process also holds stays as unadoptable as with real fds. Undefined
+ *  when neither source is readable — "cannot prove ownership". */
+function traexProcessFileTargets(pid: number): string[] | undefined {
+  const probe = probeProcessOpenFiles(pid);
+  if (probe.status === 'ok') {
+    recordTraexFileSource(pid, { via: 'fd' });
+    return probe.targets;
+  }
+  if (probe.status !== 'denied') {
+    // Unavailable (the pid has exited and been reaped, or enumeration cannot
+    // run): fail closed and forget the previous process's diagnosis so a pid
+    // reuse cannot inherit it.
+    invalidateTraexProcessFileSource(pid);
+    return undefined;
+  }
+  const denial: ProcessOpenFilesDenial = { code: probe.code, stage: probe.stage };
+  const scan = scanTraexWriterLocks(pid);
+  if (!scan) {
+    recordTraexFileSource(pid, { via: 'none', denial });
+    return undefined;
+  }
+  recordTraexFileSource(pid, { via: 'writer-lock', denial, ...scan });
+  const lockDir = traexWriterLockDir();
+  const targets: string[] = [];
+  for (const id of scan.sessionIds) {
+    targets.push(join(lockDir, `${id}.lock`));
+    const rollout = findTraexRolloutBySessionId(id);
+    if (rollout) targets.push(rollout);
+  }
+  return targets;
+}
+
 /** Find the visible top-level rollout an externally-running TRAE process owns.
  *  TRAE can keep the parent rollout and internal guardian/subagent rollouts open
  *  in the same process. Internal rollouts are never adoptable. When a current
@@ -1620,7 +1848,7 @@ export function findTraexRolloutByPid(
   pid: number,
   preferredSessionId?: string,
 ): { path: string; cliSessionId: string } | undefined {
-  const targets = listProcessOpenFiles(pid);
+  const targets = traexProcessFileTargets(pid);
   if (!targets) return undefined;
   const selected = selectTraexRollout(traexRolloutRefs(targets), preferredSessionId);
   return selected ? { path: selected.path, cliSessionId: selected.cliSessionId } : undefined;
@@ -1632,7 +1860,7 @@ export function findTraexRolloutByPid(
 export function findTraexThreadByPid(
   pid: number,
 ): { cliSessionId: string; title?: string } | undefined {
-  const targets = listProcessOpenFiles(pid);
+  const targets = traexProcessFileTargets(pid);
   if (!targets) return undefined;
   const ids = [...new Set(targets.flatMap(target => {
     const match = /[\\/]thread-writer-locks[\\/]([0-9a-f-]{36})\.lock(?: \(deleted\))?$/i.exec(target);
@@ -1670,15 +1898,17 @@ export function findTraexThreadByPid(
   }) ?? undefined;
 }
 
-/** Lowercased set of TRAE session ids whose rollout the pid holds open. The
+/** Lowercased set of TRAE session ids whose rollout the pid holds open (or,
+ *  when procfs refuses its fd table, whose writer lock it holds — see
+ *  traexProcessFileTargets). The
  *  ownership gate for a shared-history.jsonl submit match: only a sid this pid
  *  actually owns is safe to accept, so a concurrent sibling pane's identical
  *  text can't hand back a foreign session id. Empty Set = pid holds no TRAE
- *  rollout; undefined = fd enumeration unavailable (callers must treat undefined
+ *  rollout; undefined = enumeration unavailable (callers must treat undefined
  *  as "cannot prove ownership" — fail closed, do not bind). Mirrors
  *  findCodexRolloutSetByPid. */
 export function findTraexRolloutSetByPid(pid: number): Set<string> | undefined {
-  const targets = listProcessOpenFiles(pid);
+  const targets = traexProcessFileTargets(pid);
   if (!targets) return undefined;
   const set = new Set<string>();
   for (const ref of selectableTraexRollouts(traexRolloutRefs(targets))) {
@@ -1872,4 +2102,9 @@ export function findTraexSessionIdByBotmuxSessionId(botmuxSessionId: string): st
     }
     return undefined;
   }) ?? undefined;
+}
+
+/** One exact-id resolution path for launch arguments and resume receipts. */
+export function resolveTraexResumeSessionId(botmuxSessionId?: string, persistedNativeId?: string): string | undefined {
+  return persistedNativeId || (botmuxSessionId ? findTraexSessionIdByBotmuxSessionId(botmuxSessionId) : undefined);
 }

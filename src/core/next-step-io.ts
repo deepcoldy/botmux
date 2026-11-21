@@ -44,4 +44,5 @@ export const nextStepIo: NextStepIo = {
     deleteCardElement(ds.larkAppId, cardId, NEXT_STEP_ELEMENT_ID, sequence, uuid, messageId),
   now: () => Date.now(),
   warn: message => logger.warn(message),
+  info: message => logger.info(message),
 };

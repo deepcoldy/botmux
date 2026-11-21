@@ -20,7 +20,9 @@ import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-turn-authority.js';
 import { recallProvenIdentityContent, rememberProvenIdentityContent } from '../src/core/cli-identity.js';
+import { configuredCliExecutionMode } from '../src/core/cli-execution-mode.js';
 import { isHumanInboundTurnId, pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { isOwnerActorTurnId } from '../src/core/workflow-event-turn.js';
 import { prepareScheduledRecoveryRun } from '../src/core/scheduled-send.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 import { SessionController } from '../src/core/session-controller.js';
@@ -51,6 +53,7 @@ const sessionId = 'session-restart-identity';
 const person = 'ou_trigger_person';
 const scheduleRunAs = 'ou_schedule_run_as';
 const interactiveTurn = 'om_in_flight_turn';
+const ownerTurn = 'trg_owner_in_flight_turn';
 const scheduledTurn = 'schedule:daily_report:720d6b52-3df7-4343-9d76-9597688e8cb3';
 const cli = { backend: 'tmux', physicalId: '222:cliStart', nativeSessionId: '703fc6a9-0000-4000-8000-000000000001', proof: 'process_start' as const };
 
@@ -64,7 +67,10 @@ function restartedWorld(turnId: string, opts: { endedBeforeRestart?: boolean } =
   const data = mkdtempSync(join(tmpdir(), 'restart-turn-identity-')); directories.push(data);
   const ref = { appId, sessionId };
   const persistedSession = { sessionId, larkAppId: appId, chatId: 'oc_chat', status: 'active',
-    replyTargets: { [interactiveTurn]: { senderOpenId: person } } };
+    replyTargets: {
+      [interactiveTurn]: { senderOpenId: person },
+      [ownerTurn]: { senderOpenId: person, participants: [{ openId: person, isBot: false }] },
+    } };
 
   const store1 = new SessionContractStore(data, appId);
   const controller1 = new SessionController({ larkAppId: appId, chatId: 'oc_chat', session: structuredClone(persistedSession) } as any, store1);
@@ -91,11 +97,16 @@ function restartedWorld(turnId: string, opts: { endedBeforeRestart?: boolean } =
     config: { session: { dataDir: data } },
     logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn() },
     triggerUserAuthEnabledFor: () => true,
+    configuredCliExecutionMode,
+    getBot: () => ({ config: { larkToolBinding: true,
+      triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'] } } }),
     identityStorageModelForDaemonSession: (session: any) => session.reportedIdentityModel?.model ?? 'single',
-    parseScheduledTurnId, isHumanInboundTurnId, identityDecisionTurnIsLive, trackTurnIdentityPublication, prepareScheduledRecoveryRun,
-    scheduleAuthorityStore: { getRecord: () => undefined },
+    parseScheduledTurnId, isHumanInboundTurnId, isOwnerActorTurnId, identityDecisionTurnIsLive, trackTurnIdentityPublication, prepareScheduledRecoveryRun,
+    scheduleAuthorityStore: { getRecord: () => ({ kind: 'direct', state: 'active',
+      task: { id: 'daily_report', larkAppId: appId, chatId: 'oc_chat' } }) },
     scheduler: { admitManualRunTurn: () => false },
     sessionStore: { updateSession: vi.fn() },
+    ownerActorIdentityRestores: new WeakMap(),
     refreshTurnCliIdentity: vi.fn(async (session: any, id: string) => {
       const sender = pickTurnReplyTarget(session.session, id)?.senderOpenId;
       if (sender) rememberProvenIdentityContent(data, sessionId, id, 'bytedcli', bytedcliBody(sender));
@@ -132,7 +143,7 @@ function restartedWorld(turnId: string, opts: { endedBeforeRestart?: boolean } =
   const reattachedWorker = (producer: WorkerRef, markerTurnId: string, deliver: (message: any) => Promise<void>) => {
     const scope = new WorkerSessionEventScope(ref, producer);
     const authority = new ActiveTurnAuthority();
-    const caller = turnId === interactiveTurn
+    const caller = turnId === interactiveTurn || turnId === ownerTurn
       ? { requestLarkAppId: appId, requestUserOpenId: person, senderType: 'user' as const } : undefined;
     authority.reserve({ turnId: markerTurnId, ...(caller ? { caller } : {}) });
     authority.markStarted({ turnId: markerTurnId, ...(caller ? { caller } : {}) });
@@ -188,6 +199,17 @@ describe('a turn executing across a daemon restart regains its identity on re-at
     await w.drain();
     expect(w.successor.wire.filter(message => message.type === 'managed_turn_origin')).toHaveLength(2);
     expect(w.daemon.refreshTurnCliIdentity).toHaveBeenCalledTimes(1);
+  });
+
+  it('restores the resolved sender of an in-flight owner actor turn', async () => {
+    const w = restartedWorld(ownerTurn);
+    expect(w.material(ownerTurn)).toBeUndefined();
+    await w.successor.reattach();
+    expect(w.ds.managedTurnOrigin).toMatchObject({ turnId: ownerTurn, callerOpenId: person });
+    expect(w.daemon.refreshTurnCliIdentity).toHaveBeenCalledTimes(1);
+    expect(w.daemon.refreshTurnCliIdentity).toHaveBeenCalledWith(w.ds, ownerTurn);
+    expect(w.daemon.prepareScheduledTurnCliIdentity).not.toHaveBeenCalled();
+    expect(w.material(ownerTurn)).toBe(bytedcliBody(person));
   });
 
   it('restores the run identity of an in-flight scheduled turn from its schedule authority entry', async () => {

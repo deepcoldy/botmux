@@ -122,7 +122,7 @@ import {
   WORKFLOW_DAEMON_IPC_ROUTE_PREFIX,
   type WorkflowDaemonIpcTarget,
 } from './workflows/v3/daemon-ipc-auth.js';
-import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
+import { handleDashboardTriggerApi, rejectActorOnDeniedTrigger } from './dashboard/trigger-api.js';
 import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from './dashboard/daemon-proxy-routes.js';
 import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
@@ -298,6 +298,7 @@ import {
   defaultSettingsWriteApplierDeps,
   hasResolvedCodexNotifierRecipient,
   resolveCodexNotifierRecipientView,
+  resolveGroupCreationSettings,
 } from './dashboard/settings-write-applier.js';
 import {
   addBotsToGroup,
@@ -379,7 +380,7 @@ import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './c
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig } from './dashboard/bot-payload.js';
+import { botDefaultsPayload, botSummaryPayload, brandMapByAppId, mergeBotOncallFields, sparseOverridesFromRawBotConfig, withConfiguredCliId, type ConfiguredBotAgentFields } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -1254,6 +1255,8 @@ const attaching = new Set<string>();   // dedup concurrent attaches per appId
 interface ResolvedDashboardSettings {
   /** Machine-wide prefix applied only by the `/group` and `/g` slash commands. */
   groupNamePrefix: string;
+  /** Machine-wide "group is ready" @-owner notice on every creation path. Default ON. */
+  groupOwnerNotice: boolean;
   /** Machine-wide directory for new botmux-created worktrees; '' = next to the repo. */
   worktreeRoot: string;
   publicReadOnly: boolean;
@@ -1942,7 +1945,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   const codexNotifierState = readCodexNotifierWorkerState(config.session.dataDir);
   const larkCli = checkLarkCliVersion();
   return {
-    groupNamePrefix: global.groupNamePrefix ?? '',
+    ...resolveGroupCreationSettings(global),
     worktreeRoot: global.worktreeRoot ?? '',
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
@@ -3296,16 +3299,11 @@ function configuredBrands(): Map<string, string | undefined> {
   return brandMapByAppId(loadBotConfigs);
 }
 
-type ConfiguredBotAgentFields = Partial<Pick<BotConfig,
-  'cliRuntime' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'model'
-  | 'modelBackendVariant' | 'reasoningEffort' | 'codexProfile' | 'serviceTier' | 'nativeSubagentRuntime'
-  | 'traexAutoModel' | 'turnTimeoutMs' | 'dshRuntime' | 'dshProfile' | 'cliConfigDir'
->> & { cliId?: string };
-
 function configuredBotAgentFields(): Map<string, ConfiguredBotAgentFields> {
   try {
     return new Map(loadBotConfigs().map(b => [b.larkAppId, {
       cliId: b.cliId,
+      apiOnly: b.apiOnly,
       cliRuntime: b.cliRuntime,
       // loadBotConfigs mirrors structured runtime.executable into this legacy
       // field in memory. Only forward a genuine path-only config to the private
@@ -3381,6 +3379,7 @@ async function configuredBotDefaultsRecoveryRows(
           larkAppId: bot.larkAppId,
           botName: nameOf(bot.larkAppId) ?? bot.name ?? null,
           cliId: bot.cliId,
+          apiOnly: bot.apiOnly,
           brand: bot.brand,
           cliRuntime: bot.cliRuntime,
           cliPathOverride: bot.cliRuntime ? undefined : bot.cliPathOverride,
@@ -3415,33 +3414,6 @@ async function configuredBotDefaultsRecoveryRows(
   } catch {
     return [];
   }
-}
-
-function withConfiguredCliId<T extends { larkAppId: string } & ConfiguredBotAgentFields>(
-  bot: T,
-  ids: Map<string, string> | Map<string, ConfiguredBotAgentFields>,
-): T & ConfiguredBotAgentFields {
-  const raw = ids.get(bot.larkAppId);
-  const fallback: ConfiguredBotAgentFields | undefined = typeof raw === 'string' ? { cliId: raw } : raw;
-  return {
-    ...bot,
-    cliId: bot.cliId || fallback?.cliId,
-    cliRuntime: bot.cliRuntime || fallback?.cliRuntime,
-    cliPathOverride: bot.cliPathOverride || fallback?.cliPathOverride,
-    wrapperCli: bot.wrapperCli || fallback?.wrapperCli,
-    cliLaunchMode: bot.cliLaunchMode || fallback?.cliLaunchMode,
-    model: bot.model || fallback?.model,
-    traexAutoModel: bot.traexAutoModel ?? fallback?.traexAutoModel,
-    modelBackendVariant: bot.modelBackendVariant ?? fallback?.modelBackendVariant,
-    reasoningEffort: bot.reasoningEffort || fallback?.reasoningEffort,
-    codexProfile: bot.codexProfile ?? fallback?.codexProfile,
-    serviceTier: bot.serviceTier || fallback?.serviceTier,
-    nativeSubagentRuntime: bot.nativeSubagentRuntime ?? fallback?.nativeSubagentRuntime,
-    turnTimeoutMs: bot.turnTimeoutMs ?? fallback?.turnTimeoutMs,
-    dshRuntime: bot.dshRuntime ?? fallback?.dshRuntime,
-    dshProfile: bot.dshProfile ?? fallback?.dshProfile,
-    cliConfigDir: bot.cliConfigDir ?? fallback?.cliConfigDir,
-  };
 }
 
 function liveBots(): { larkAppId: string; botName: string; cliId?: string; larkTransportEnabled?: boolean }[] {
@@ -4530,7 +4502,7 @@ const server = createServer(async (req, res) => {
     // Only the local legacy Dashboard cookie is management authority. Platform
     // identities — owner included — retain terminal/preview capability through
     // signed proxy grants, but cannot cross into host administration APIs.
-    const { legacyAuthed, canManageHost, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
+    const { legacyAuthed, allowOwnerActor, canManageHost, workbenchOnlyIdentity, decision } = resolveDashboardRequestGate({
       method: req.method ?? 'GET',
       pathname: url.pathname,
       hasTokenParam: url.searchParams.has('t'),
@@ -4584,6 +4556,8 @@ const server = createServer(async (req, res) => {
     if (workflowInitiatorPreGateDenial(res, url.pathname, requestIdentity, canManageHost)) return;
 
     if (decision.kind === 'deny401') {
+      if (req.method === 'POST' && url.pathname === '/api/trigger'
+        && await rejectActorOnDeniedTrigger(req, res)) return;
       const loginUrl = buildPlatformDashboardLoginUrl();
       res.writeHead(401, {
         'content-type': 'text/html; charset=utf-8',
@@ -6211,7 +6185,7 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/trigger') {
-      return handleDashboardTriggerApi(req, res, { proxyToDaemon });
+      return handleDashboardTriggerApi(req, res, { proxyToDaemon }, allowOwnerActor);
     }
 
     // CLI 下拉选项 (id=选择键 + 展示名), 单一事实源在 cli-selection.CLI_SELECT_OPTIONS,
@@ -6406,11 +6380,24 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
       }
       const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
-      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web 或 compat' });
+      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat' && registrationModeRaw !== 'local') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web、compat 或 local' });
       }
-      const registrationMode = registrationModeRaw === 'compat' ? 'compat' as const : 'web' as const;
+      const registrationMode = registrationModeRaw === 'compat'
+        ? 'compat' as const
+        : registrationModeRaw === 'local'
+          ? 'local' as const
+          : 'web' as const;
+      if (registrationMode === 'local' && typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()) {
+        return jsonRes(res, 400, { ok: false, error: 'local_clone_unsupported', message: '本地模式不克隆飞书机器人。' });
+      }
+      if (registrationMode === 'local' && parsed.requireCriticalScopesBeforeActivation === true) {
+        return jsonRes(res, 400, { ok: false, error: 'local_scope_gate_unsupported', message: '本地机器人没有飞书权限可校验。' });
+      }
       const sessionModeRaw = typeof parsed.sessionMode === 'string' ? parsed.sessionMode.trim() : '';
+      if (registrationMode !== 'web' && sessionModeRaw) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 只用于飞书 Web 登录' });
+      }
       if (registrationMode === 'web' && sessionModeRaw && sessionModeRaw !== 'reuse' && sessionModeRaw !== 'qr') {
         return jsonRes(res, 400, { ok: false, error: 'invalid_session_mode', message: 'sessionMode 必须是 reuse 或 qr' });
       }
@@ -6764,6 +6751,16 @@ const server = createServer(async (req, res) => {
     // 会话 insight（只读 trace 分析：动作 span / 失败聚合 / 规则建议）。
     // owner-only：不在公开读白名单 → decideDashboardAuth 已对只读访客 401，
     // 公开/联邦访客看不到 tab 也拿不到 span。代理到 owner daemon 的同名 IPC。
+    if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/turns$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${encodeURIComponent(sid)}/turns${url.search}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      res.end(await upstream.text());
+      return;
+    }
+
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/insight$/))) {
       const sid = decodeURIComponent(m[1]);
       const owner = aggregator.ownerOf(sid);

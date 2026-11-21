@@ -175,7 +175,7 @@ export interface NativeOncallResultQuery {
   region: string;
   preparedAtMs?: number;
 }
-export interface NativeOncallResult { flowId: string; openChatId: string; createdAtMs: number }
+export interface NativeOncallResult { flowId: string; openChatId: string; launchedAtMs: number }
 export interface NativeOncallResultCandidate<T extends NativeOncallResultQuery = NativeOncallResultQuery> {
   attempt: T;
   result: NativeOncallResult;
@@ -215,6 +215,7 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
   // Lark/platform may normalize channel parameters. Match the opaque form ID
   // inside source_location, rather than requiring an identical query string.
   // Legacy unmarked forms retain exact-source matching for verified migration.
+  // create_time can belong to a platform draft that predates the Botmux form.
   const found = new Map<number, { row: any; attempts: T[] }>();
   const fallbackPreparedAtMs = Date.now() - 24 * 60 * 60_000;
   const preparedAtMs = Math.min(...queries.map(item => item.preparedAtMs ?? fallbackPreparedAtMs));
@@ -227,7 +228,7 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
         signal: AbortSignal.timeout(10_000), headers: { Authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
         body: JSON.stringify({ filter_fields: [
           { field: 'tenant_id', value: [target.tenantId], operator: 'in' },
-          ...(formId ? [{ field: 'create_time', value: since, operator: 'greater_or_equals' }]
+          ...(formId ? [{ field: 'oncall_start_time', value: since, operator: 'greater_or_equals' }]
             : [{ field: 'source_location', value: [queries[0]!.sourceLocation], operator: 'in' }]),
           { field: 'originator_user', value: username, operator: 'equals' },
           { field: 'stage', value: ['launch_oncall'], operator: 'in' },
@@ -253,19 +254,19 @@ export async function readNativeOncallResultCandidates<T extends NativeOncallRes
   if (!found.size) return [];
   const { row, attempts } = [...found.values()][0]!;
   if (!attempts.length) return [];
-  const timestamp = String(row.create_time ?? '');
+  if (!row.chat_id || !row.oncall_start_time) return [];
+  const timestamp = String(row.oncall_start_time);
   // This platform's unqualified timestamps are China Standard Time, in both
   // T- and space-separated forms. Qualify them explicitly: an unqualified
   // string passed to Date.parse is interpreted in the daemon's local timezone,
   // which silently shifts the result on a host outside UTC+8.
   const qualified = /^\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(\.\d+)?$/.test(timestamp)
     ? `${timestamp.replace(' ', 'T')}+08:00` : timestamp;
-  const createdAtMs = Date.parse(qualified);
-  if (!Number.isFinite(createdAtMs)) throw new Error('Oncall 提单时间无效');
-  if (!row.chat_id) return []; // The ticket may exist before its group is ready.
+  const launchedAtMs = Date.parse(qualified);
+  if (!Number.isFinite(launchedAtMs)) throw new Error('Oncall 发起人工时间无效');
   const openChatId = await get(target, secret, '', 'platform/chat_id_to_open_chat_id', { chat_id: String(row.chat_id) }, fetcher);
   if (typeof openChatId !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(openChatId)) throw new Error('Oncall 人工群标识无效');
-  const result = { flowId: String(row.id), openChatId, createdAtMs };
+  const result = { flowId: String(row.id), openChatId, launchedAtMs };
   return attempts.map(attempt => ({ attempt, result }));
 }
 

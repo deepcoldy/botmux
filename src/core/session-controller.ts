@@ -15,6 +15,7 @@ import {
 import { SessionEventGateway, type SessionEventAdmission } from './session-event-gateway.js';
 import { isOutputJournalAppId } from '../services/universal-output-handoff.js';
 import { commitPrimarySessionContract, sessionContractPrimary } from './session-contract-primary.js';
+import { isCodexFamilyCliId } from '../adapters/cli/types.js';
 
 export type SessionContractBootstrap = import('../services/session-contract.js').SessionContractBootstrap;
 export interface WorkerContractContext extends SessionEventContext { bindingId?: string }
@@ -161,6 +162,10 @@ export class SessionController {
         this.store.continueRuntime(this.ref, continued, bound.ref, worker);
         this.store.inheritExecutionContinuation(this.ref, continuesBindingId!, bindingId, worker);
       }
+      // A re-attached CLI may prove its native conversation only after its
+      // first binding; attempts a predecessor worker left running in this very
+      // process then report under the live runtime again.
+      if (this.reattachesPredecessorExecutions()) this.store.reattachPredecessorExecutions(this.ref, bound.ref, worker);
       return bound;
     });
     // Physical binding is a fact even if granting execution continuation fails.
@@ -245,7 +250,24 @@ export class SessionController {
   }
   controlStarted(operationId: string): boolean { const result = this.store.apply(this.ref, { type: 'control_started', operationId }); this.refresh(); return result.decision === 'applied'; }
   controlResult(operationId: string, phase: 'confirmed' | 'failed_before_effect' | 'rejected' | 'uncertain', runtime?: RuntimeRef, error?: string): void {
-    this.store.apply(this.ref, { type: 'control_result', operationId, phase, ...(runtime ? { runtime } : {}), ...(error ? { error } : {}) }); this.refresh();
+    this.store.atomic(() => {
+      this.store.apply(this.ref, { type: 'control_result', operationId, phase, ...(runtime ? { runtime } : {}), ...(error ? { error } : {}) });
+      this.reattachToLiveRuntime();
+    }); this.refresh();
+  }
+  /** Codex and Codex App settle a predecessor's attempt in the re-attached
+   * CLI through the host's observer grant instead: the live runtime stays
+   * selected and that attempt finishes under the runtime it ran on. */
+  private reattachesPredecessorExecutions(): boolean {
+    return !isCodexFamilyCliId(this.ds.initConfig?.cliId ?? this.ds.session.cliId);
+  }
+  /** An operation that settled may have held back a re-attachment the live
+   *  runtime already proved (a /stop sent before the conversation id arrived). */
+  private reattachToLiveRuntime(): void {
+    const state = this.store.read(this.ref);
+    if (this.reattachesPredecessorExecutions() && state?.activeRuntime && state.worker && !state.activeOperationId) {
+      this.store.reattachPredecessorExecutions(this.ref, state.activeRuntime, state.worker);
+    }
   }
   allowsInput(): boolean {
     const state = this.store.read(this.ref)!;
@@ -305,7 +327,8 @@ export class SessionController {
       if (!execution) return undefined;
       if (execution.runtime && !sameRuntime(execution.runtime, runtime)) {
         if (!this.store.runtimeContinues(this.ref, execution.runtime, runtime, value.producer)
-          && !this.store.runtimeContinues(this.ref, runtime, execution.runtime, value.producer)) return undefined;
+          && !this.store.runtimeContinues(this.ref, runtime, execution.runtime, value.producer)
+          && !this.store.executionReattachedFrom(this.ref, execution.ref, runtime, execution.runtime)) return undefined;
         value.scope.runtime = execution.runtime;
       }
     }
@@ -385,6 +408,14 @@ export class SessionController {
         && this.sameOrContinuedRuntime(stored.runtime, context.scope.runtime, channel)) {
         context.scope.runtime = stored.runtime;
       }
+      // An attempt no runtime has bound yet — an opening turn whose input rode
+      // the spawn argv before any runtime existed (Pi, Grok, …) — is reported
+      // under the binding its observer captured, often the launcher's. Once this
+      // worker continued that CLI in process into the active runtime (the relay
+      // resolving the real CLI behind its launcher), the attempt runs there.
+      // Judged under the launcher's binding its final was refused, and the
+      // opening reply never reached the chat.
+      if (stored && !stored.runtime) context.scope.runtime = this.continuedInto(context.scope.runtime, channel);
     }
     if (sidecar) {
       const proven = this.outputOrigin(sidecar);
@@ -395,14 +426,20 @@ export class SessionController {
     // input is still queued. Do not reconstruct execution authority from the
     // notification's display-only turnId (or create an input admission for it).
     if (message.type !== 'cli_session_id' && !context.scope.execution && typeof message.turnId === 'string' && context.scope.runtime && this.store.authorizedProducer(this.ref, context.scope.runtime, channel)) {
-      const preliminary = this.gateway.admit(message.type, context, channel);
-      if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       const existing = this.store.executions(this.ref, message.turnId, message.dispatchAttempt);
       const current = this.currentRuntime();
       // A turn the CLI starts itself is reported under the binding it was
       // spawned with; an in-process continuation moved that CLI to `current`.
-      if (current && !sameRuntime(current, context.scope.runtime) && !existing.some(value => sameRuntime(value.runtime, context.scope.runtime))
-        && this.store.runtimeContinues(this.ref, context.scope.runtime, current, channel)) context.scope.runtime = current;
+      const continuedInto = current && !sameRuntime(current, context.scope.runtime) && !existing.some(value => sameRuntime(value.runtime, context.scope.runtime))
+        && this.store.runtimeContinues(this.ref, context.scope.runtime, current, channel) ? current : undefined;
+      // Its start is a fact of the live CLI, never of an earlier runtime: judged
+      // under the spawn binding it would be refused as stale after any rebind
+      // (the relay resolving the real CLI, a new native session id), and a
+      // zero-prompt session would lose where that turn replies.
+      if (continuedInto && message.type === 'terminal_turn_started') context.scope.runtime = continuedInto;
+      const preliminary = this.gateway.admit(message.type, context, channel);
+      if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
+      if (continuedInto) context.scope.runtime = continuedInto;
       if (existing.length === 1) context.scope.execution = existing[0].ref;
       else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
     }
@@ -473,6 +510,7 @@ export class SessionController {
     if (event) {
       const result = this.store.apply(this.ref, event, context.eventId);
       if (result.decision === 'conflict' || result.decision === 'stale') return { kind: 'reject', reason: result.reason ?? `contract_${result.decision}` };
+      if (event.type === 'control_result') this.reattachToLiveRuntime();
       if (continuationFailure) this.store.rejectExecutionContinuation(this.ref, continuationFailure.bindingId);
       if (this.ds.initConfig?.cliId === 'traex' && event.type === 'execution_phase' && event.execution.dispatchAttempt === undefined
         && (event.phase === 'submitting' || event.phase === 'accepted')) {

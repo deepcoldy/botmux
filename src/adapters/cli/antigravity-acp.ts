@@ -51,6 +51,13 @@ export function createAntigravityAcpAdapter(pathOverride?: string): CliAdapter {
     staticBusyClearPattern: /^›\r?$/m,
     deferFirstPromptTimeoutUntilReady: true,
     systemHints: BOTMUX_SHELL_HINTS,
+    // agy runs hooks.json PreToolUse handlers under `agy acp` too: with the
+    // ask hook, ask_question becomes a Lark question card instead of agy
+    // posting the questions as plain text and ending the turn. The file is
+    // global and shared with the terminal transport, so both declare it —
+    // otherwise whether an ACP session gets cards would depend on which
+    // transport happened to start first.
+    hookInstall: { configPath: '~/.gemini/config/hooks.json', format: 'antigravity-hooks' },
     altScreen: false,
     modelChoices: CLI_MODEL_CHOICES.antigravity,
     /** Discover account-visible models without starting a conversation. */

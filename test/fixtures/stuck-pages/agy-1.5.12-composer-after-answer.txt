@@ -1,0 +1,40 @@
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.12
+     ▀▀▀▀▀▀       Gemini API key
+    ▀▀▀▀▀▀▀▀      Gemini 3.1 Pro (Low)
+   ▄▀▀    ▀▀▄     ~/work
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> please ask me
+
+? Which database should we use?
+> SQLite
+? Which features to enable?
+> Auth, Search, also audit logs
+
+  TOOL_RESULT_ECHO: {"id":"1042169a-ab82-496b-b4c8-8e45652b1b6c","name":"ask_question","response":{"output":"Created
+  At: 2026-11-20T14:03:17+08:00\nCompleted At: 2026-11-20T14:03:23+08:00\nA1: SQLite\nA2: Auth, Search, also audit
+  logs"}}
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                     Gemini 3.1 Pro · low
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

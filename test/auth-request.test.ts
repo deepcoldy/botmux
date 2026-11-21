@@ -91,6 +91,7 @@ describe('auth request CLI', () => {
   let status: number;
   let responseBody: Record<string, unknown>;
   let responseQueue: Array<Record<string, unknown>>;
+  let beforeResponse: ((body: Record<string, unknown>) => void) | undefined;
   const channelId = 'ab'.repeat(32);
   const capability = 'cd'.repeat(32);
 
@@ -113,6 +114,7 @@ describe('auth request CLI', () => {
       requestId: 'request-1', scopes: ['im:chat:read'], expiresIn: 300, autoCallback: true,
     };
     responseQueue = [];
+    beforeResponse = undefined;
     server = createServer(async (request, response) => {
       // Parse defensively: this mock binds a loopback port, and the host's port
       // scanner probes `GET /` with an empty body. A bare JSON.parse would throw
@@ -121,8 +123,10 @@ describe('auth request CLI', () => {
       const body = await readRequestBodyJson<Record<string, unknown>>(request, { strict: true });
       if (body === undefined) { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{}'); return; }
       requests.push({ method: request.method, url: request.url, headers: request.headers, body });
+      const payload = responseQueue.shift() ?? responseBody;
+      beforeResponse?.(payload);
       response.writeHead(status, { 'content-type': 'application/json' });
-      response.end(JSON.stringify(responseQueue.shift() ?? responseBody));
+      response.end(JSON.stringify(payload));
     });
     await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
@@ -317,7 +321,9 @@ describe('auth request CLI', () => {
     env.BOTMUX_SEND_RELAY = join(root, 'relay');
     writeClaim('turn-current');
     responseQueue = [{ ok: true, status: 'pending' }, { ok: true, status: 'ready' }];
-    server.on('request', () => writeClaim('turn-later'));
+    // Select the first pending response before publishing the next claim. The
+    // following poll can only start after that response, so it must see later.
+    beforeResponse = body => { if (body.status === 'pending') writeClaim('turn-later'); };
     const result = await run(['wait', '--request-id', 'request-1']);
     expect(result.code, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout)).toEqual({ ok: true, status: 'ready' });

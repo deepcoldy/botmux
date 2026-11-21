@@ -475,8 +475,19 @@ describe('recallFrozenCards', () => {
 });
 
 describe('restoreUsageLimitRuntimeState', () => {
-  it('marks restored limit sessions limited and re-arms the retry timer', () => {
+  it.each([
+    { label: 'default folded', configured: undefined, expected: true },
+    { label: 'explicit folded', configured: true, expected: true },
+    { label: 'classic', configured: false, expected: false },
+  ])('marks restored limit sessions limited and re-arms the retry timer ($label layout)', ({ configured, expected }) => {
     vi.useFakeTimers();
+    getBotMock.mockReturnValue({
+      config: {
+        larkAppId: APP_ID,
+        cliId: 'claude-code',
+        ...(configured === undefined ? {} : { streamingCardFoldedLayout: configured }),
+      },
+    });
     const now = Date.now();
     const ds = makeDs();
     ds.streamCardId = 'om_live_limit';
@@ -541,6 +552,9 @@ describe('restoreUsageLimitRuntimeState', () => {
       false,
       // 26th arg: captured Codex App native-stop target — absent for this Claude fixture.
       undefined,
+      // 27th arg: retry-ready redraw preserves the per-bot layout preference,
+      // including the legacy/default configuration where the key is absent.
+      expected,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });

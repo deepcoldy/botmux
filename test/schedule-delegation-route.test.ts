@@ -1,3 +1,4 @@
+import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from '../src/core/cli-execution-mode.js';
 import { matchingScheduleBotGrant } from '../src/core/schedule-bot-grant.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,6 +15,7 @@ import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-co
 import { capabilityOn, parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { capabilityOfTool } from '../src/core/identity-policy.js';
 import { validateScheduleChildOneShot } from '../src/core/schedule-child-one-shot.js';
+import { countLiveTalkerTasks, talkerSchedulePolicy, talkerScheduleScopeError } from '../src/core/schedule-talker.js';
 import {
   assertScheduledAuthorityCurrent,
   authorizeScheduledTurn,
@@ -109,6 +111,9 @@ function harness(overrides: Record<string, unknown> = {}) {
     getDashboardAdminOpenIds: () => ['ou_user_target'],
     listChatMemberOpenIds: async () => ['ou_user_target'],
     resolveUnionIdFromOpenId: async () => 'on_user',
+    // Talker policy inputs (core/schedule-talker): off unless a test enables it.
+    talkerSchedulePolicy, talkerScheduleScopeError, countLiveTalkerTasks,
+    evaluateTalk: vi.fn(() => ({ allowed: true, reason: 'p2pOpen' })),
     computeInputHash,
     validateScheduleChildOneShot,
     assertScheduledAuthorityCurrent,
@@ -116,9 +121,9 @@ function harness(overrides: Record<string, unknown> = {}) {
     parseScheduledTurnId,
     readScheduledTaskFromAuthority,
     SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
-    capabilityOn,
+    capabilityOn, configuredCliExecutionMode, delegatedCliExecutionAllowed,
     capabilityOfTool,
-    scheduleAuthorityStore: {},
+    scheduleAuthorityStore: { getRecord: vi.fn(() => undefined), listRecords: vi.fn((): unknown[] => []) },
     createHash,
     scheduler: { parseSchedule, commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
   };
@@ -483,6 +488,15 @@ describe('scheduled turn one-shot child creation', () => {
       status: 403, value: { error: 'schedule_child_one_shot_identity_isolation_required' },
     });
     expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+  });
+
+  it('commits a bounded native child while retaining controller and ownerless limits', async () => {
+    const h = childHarness();
+    h.scope.getBot = () => ({ config: { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] } } });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      control: expect.objectContaining({ runScopes: [], selfManage: false }),
+    }));
   });
 
   it('maps the per-turn authority-store quota to the child-specific refusal', async () => {
@@ -1307,5 +1321,223 @@ describe('host-terminal --run-as identity', () => {
     expect(addTaskArg(h)).toMatchObject({
       owner: { kind: 'human', openId: 'ou_runner1', unionId: 'on_runner' }, creatorLarkAppId: 'cli_target',
     });
+  });
+});
+
+/** A direct human who is NOT a bot administrator, on a bot that lets talkers
+ *  create their own tasks (scheduleCreateByTalkers). Same group turn as
+ *  directHumanHarness, shaped to the talker boundary (top level, own chat). */
+function talkerHarness() {
+  const h = directHumanHarness();
+  h.scope.getDashboardAdminOpenIds = () => [];
+  h.scope.getBot = () => ({ config: { scheduleCreateByTalkers: true } });
+  h.body.task.executionPosition = 'top-level';
+  return h;
+}
+
+const TALKER_TURN = { directTurn: { turnId: 'om_kickoff', maxTasksPerTurn: 1, maxLiveTasksPerOwner: 5 },
+  creatingTurn: { sessionId: 'target-session', turnId: 'om_kickoff' } };
+
+const talkerRecord = (controlOpenId: string, state = 'active', shape: { ownerAccess?: string; kind?: string } = { ownerAccess: 'talk' }) =>
+  ({ kind: shape.kind ?? 'direct', state, controlOpenId, task: { ownerAccess: shape.ownerAccess } });
+
+describe('talker schedule creation (scheduleCreateByTalkers)', () => {
+  it('lets a talk-only human create a task owned by themselves, one per turn, marked ownerAccess=talk', async () => {
+    const h = talkerHarness();
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: {
+      owner: { kind: 'human', openId: 'ou_user_target', unionId: 'on_user' },
+      ownerAccess: 'talk', chatId: 'oc_chat', executionPosition: 'top-level', larkAppId: 'cli_target',
+    } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ ownerAccess: 'talk' }), TALKER_TURN);
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    // Talk access is re-evaluated for this exact chat and sender, not assumed from the turn.
+    expect(h.scope.evaluateTalk).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_user_target', undefined, 'on_user', 'group');
+  });
+
+  it('admits a human whose only talk source is platform team membership', async () => {
+    const h = talkerHarness();
+    h.scope.evaluateTalk = vi.fn((_app: string, _chat: string, _open: string, senderUnion: string | undefined, memberUnion: string | undefined) => ({
+      allowed: senderUnion === undefined && memberUnion === 'on_user',
+      reason: memberUnion === 'on_user' ? 'teamMember' : 'none',
+    }));
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerAccess: 'talk' } } });
+  });
+
+  it('keeps an administrator on the ordinary path (no talker marker, default per-turn limit)', async () => {
+    const h = talkerHarness();
+    h.scope.getDashboardAdminOpenIds = () => ['ou_user_target'];
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledWith(
+      expect.not.objectContaining({ ownerAccess: 'talk' }), DIRECT_TURN);
+  });
+
+  it.each([
+    ['switch absent', {}],
+    ['switch explicitly off', { scheduleCreateByTalkers: false }],
+    ['switch as a truthy non-boolean', { scheduleCreateByTalkers: 'yes' }],
+  ])('refuses a non-administrator with the historical code when the %s', async (_label, config) => {
+    const h = talkerHarness();
+    h.scope.getBot = () => ({ config });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_operator_denied' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the talker has no resolvable union_id', async () => {
+    const h = talkerHarness();
+    h.scope.resolveUnionIdFromOpenId = async () => null;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_identity_unresolved' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['new-topic position', { executionPosition: 'new-topic' }],
+    ['another chat', { chatId: 'oc_elsewhere' }],
+    ['multi-chat targets', { chatIds: ['oc_chat', 'oc_other'] }],
+    ['local delivery', { deliver: 'local' }],
+    ['follow-active', { followActive: true }],
+    ['a topic title', { topicTitle: 'mine' }],
+    ['until-done', { untilDone: { deadline: '2099-01-01T00:00:00Z' } }],
+    ['notify', { notify: ['failing'] }],
+  ])('refuses a talker task that widens the scope: %s', async (_label, patch) => {
+    const h = talkerHarness();
+    Object.assign(h.body.task, patch);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_scope_invalid' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('binds a topic task to the current topic only', async () => {
+    const other = talkerHarness();
+    other.body.task.executionPosition = 'topic';
+    other.body.task.rootMessageId = 'om_other_topic';
+    expect(await other.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_root_mismatch' } });
+    expect(other.scope.scheduler.addTask).not.toHaveBeenCalled();
+
+    const current = talkerHarness();
+    current.body.task.executionPosition = 'topic';
+    current.body.task.rootMessageId = 'om_root';
+    expect(await current.run()).toMatchObject({ status: 201, value: { task: {
+      ownerAccess: 'talk', executionPosition: 'topic', rootMessageId: 'om_root',
+    } } });
+  });
+
+  it('refuses a root on a top-level task with 400', async () => {
+    const h = talkerHarness();
+    h.body.task.rootMessageId = 'om_root';
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'schedule_talker_root_forbidden' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses a talker who can no longer talk here, even though the turn was admitted', async () => {
+    const h = talkerHarness();
+    h.scope.evaluateTalk = vi.fn(() => ({ allowed: false, reason: 'denied' }));
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_operator_denied' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses a talker who is not a member of the group', async () => {
+    const h = talkerHarness();
+    h.scope.listChatMemberOpenIds = vi.fn(async () => ['ou_someone_else']);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_operator_denied' } });
+    expect(h.scope.listChatMemberOpenIds).toHaveBeenCalledWith('cli_target', 'oc_chat');
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('lets a p2p talker schedule into the private chat without a membership lookup', async () => {
+    const h = talkerHarness();
+    h.ds.chatType = 'p2p';
+    h.scope.listChatMemberOpenIds = vi.fn(async () => []);
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { ownerAccess: 'talk' } } });
+    expect(h.scope.listChatMemberOpenIds).not.toHaveBeenCalled();
+    expect(h.scope.evaluateTalk).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_user_target', undefined, 'on_user', 'p2p');
+  });
+
+  it('counts only this person\'s live talker tasks against the per-person quota (default 5)', async () => {
+    const h = talkerHarness();
+    h.scope.scheduleAuthorityStore.listRecords = vi.fn(() => [
+      talkerRecord('ou_user_target'), talkerRecord('ou_user_target'), talkerRecord('ou_user_target'),
+      talkerRecord('ou_user_target', 'paused'),
+      // None of these count: finished, revoked, someone else's, an administrator's, delegated.
+      talkerRecord('ou_user_target', 'completed'), talkerRecord('ou_user_target', 'revoked'),
+      talkerRecord('ou_other'), talkerRecord('ou_user_target', 'active', {}),
+      talkerRecord('ou_user_target', 'active', { ownerAccess: 'talk', kind: 'delegated' }),
+    ]);
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(h.scope.scheduleAuthorityStore.listRecords).toHaveBeenCalledWith('cli_target');
+
+    const full = talkerHarness();
+    full.scope.scheduleAuthorityStore.listRecords = () => [
+      talkerRecord('ou_user_target'), talkerRecord('ou_user_target'), talkerRecord('ou_user_target'),
+      talkerRecord('ou_user_target'), talkerRecord('ou_user_target', 'paused'),
+    ];
+    expect(await full.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_task_limit' } });
+    expect(full.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('lets an identical replay reach the store after the first task filled the quota', async () => {
+    const h = talkerHarness();
+    h.scope.getBot = () => ({ config: { scheduleCreateByTalkers: true, scheduleTalkerMaxTasks: 1 } });
+    const existing = talkerRecord('ou_user_target');
+    h.scope.scheduler.addTask = vi.fn((value: unknown) => {
+      h.scope.scheduleAuthorityStore.getRecord = () => existing;
+      h.scope.scheduleAuthorityStore.listRecords = () => [existing];
+      return value;
+    });
+    expect(await h.run()).toMatchObject({ status: 201 });
+    expect(await h.run()).toMatchObject({ status: 201, value: { task: { id: 'a1b2c3d4' } } });
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledTimes(2);
+  });
+
+  it('honours a bot-level quota override', async () => {
+    const h = talkerHarness();
+    h.scope.getBot = () => ({ config: { scheduleCreateByTalkers: true, scheduleTalkerMaxTasks: 1 } });
+    h.scope.scheduleAuthorityStore.listRecords = () => [talkerRecord('ou_user_target')];
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_task_limit' } });
+  });
+
+  it('commits nothing when the switch is turned off during the identity lookups', async () => {
+    const h = talkerHarness();
+    h.scope.listChatMemberOpenIds = async () => {
+      h.scope.getBot = () => ({ config: {} });
+      return ['ou_user_target'];
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_create_disabled' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('commits nothing when talk access is revoked during the membership lookup', async () => {
+    const h = talkerHarness();
+    let allowed = true;
+    h.scope.evaluateTalk = vi.fn(() => ({ allowed, reason: allowed ? 'chatGrant' : 'none' }));
+    h.scope.listChatMemberOpenIds = async () => {
+      allowed = false;
+      return ['ou_user_target'];
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_operator_denied' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('maps the per-turn direct limit to 403 for a talker too', async () => {
+    const h = talkerHarness();
+    h.scope.scheduler.addTask = vi.fn(() => { throw new Error('schedule_direct_task_limit'); });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_direct_task_limit' } });
+  });
+
+  it('maps the transactional per-owner limit to 403 when the fast path was stale', async () => {
+    const h = talkerHarness();
+    h.scope.scheduler.addTask = vi.fn(() => { throw new Error('schedule_talker_task_limit'); });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_talker_task_limit' } });
+  });
+
+  it('does not admit a scheduled-turn or bot caller as a talker', async () => {
+    const h = talkerHarness();
+    h.ds.activeInteractiveTurn = { turnId: 'om_kickoff', caller: {
+      senderType: 'user', source: 'schedule_creator', taskId: 'deadbeef',
+      requestLarkAppId: 'cli_target', requestUserOpenId: 'ou_user_target', requestUserUnionId: 'on_user',
+    } };
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: {} });
+    const result = await h.run();
+    expect(result.status).toBe(403);
+    expect(result.value.error).not.toMatch(/talker/);
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
   });
 });

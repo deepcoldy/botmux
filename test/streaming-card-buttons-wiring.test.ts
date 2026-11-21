@@ -87,6 +87,9 @@ describe('streaming-card button policy wiring', () => {
       // the identifier: `false` or a look-alike name must not pass.
       const missingKeysPanel = sites.filter(s => !/ds\.keysPanelOpen\s*===\s*true/.test(s));
       expect(missingKeysPanel).toEqual([]);
+      const missingLayout = sites.filter(s =>
+        !s.includes('resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config)'));
+      expect(missingLayout).toEqual([]);
     });
   }
 

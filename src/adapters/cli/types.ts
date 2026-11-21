@@ -92,6 +92,7 @@ export type RunnerSubmissionDisposition =
  * keep protocol ids separate from reply-routing ids. */
 export interface WriteInputContext {
   turnId?: string;
+  onInputPrepared?: (content: string) => void;
   /** Durable replay identity. Runner adapters may forward this with turnId so
    * late output from an older attempt cannot settle its successor. */
   dispatchAttempt?: number;
@@ -110,6 +111,8 @@ export interface WriteInputContext {
 }
 
 export interface SubmitGuard {
+  /** May reject before any paste bytes, after an adapter's awaited setup. */
+  beforeWrite?(): void;
   /** A reason (shown to the user) while the surface is taken, else undefined.
    *  `draft` = the message was pasted and its first Enter is pending (it sits
    *  in the composer under the page); `retry` = a resend of an Enter that
@@ -437,8 +440,11 @@ export interface CliAdapter {
   /** Only meaningful with passesInitialPromptViaArgs. If set, prompts whose
    *  UTF-8 byte length is GREATER than this adapter-specific limit are not
    *  baked into launch args; the worker defers them to the normal post-start
-   *  input queue. This guards backend launchers (notably tmux) whose command
-   *  string limit can be much lower than OS ARG_MAX. */
+   *  input queue. The budget dates from the old inline tmux launch, whose
+   *  command string tmux capped far below OS ARG_MAX; panes now read the full
+   *  launch argv from a private pane-launch file, so that cap no longer binds
+   *  and the number is retained only to keep the args-baked vs queued split
+   *  unchanged. */
   readonly maxInitialPromptArgBytes?: number;
 
   /** Only meaningful with passesInitialPromptViaArgs. When true, the CLI
@@ -648,7 +654,7 @@ export interface CliAdapter {
     /** 待写入的配置文件路径（~ 由 installer 展开）。 */
     readonly configPath: string;
     /** 写入格式：决定 installer 如何合并进既有配置。 */
-    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks';
+    readonly format: 'claude-settings' | 'opencode-plugin' | 'opencode2-plugin' | 'grok-hooks' | 'zcode-hooks' | 'antigravity-hooks';
     /** 可选：SessionStart「真就绪」hook 命令。
      *  - claude-settings：写进全局 settings.json（兼进程级 --settings）
      *  - grok-hooks：写进 `~/.grok/hooks/*.json` 的 SessionStart
@@ -1002,16 +1008,6 @@ export interface CliAdapter {
    *  it never offer a next-step suggestion. */
   readonly promptSuggestion?: (rows: readonly import('../../utils/terminal-cells.js').ScreenRow[]) => string | undefined;
 
-  /** A one-off, tool-less, small-model call with this CLI's own credentials:
-   *  the optional「本轮回顾」model recap. The prompt is written to stdin;
-   *  stdout is the CLI's JSON result (`services/turn-recap.ts`
-   *  parseRecapModelOutput). Adapters without it never make that call. */
-  readonly recapModel?: {
-    args(systemPrompt: string): string[];
-    /** Added to the session's own CLI env for that call. */
-    readonly env: Readonly<Record<string, string>>;
-  };
-
   /** The adapter PUBLISHES a structured `limited` screen_update from a machine
    *  rate-limit signal in its transcript (not from scraping screen text). When
    *  true, `isStructuredRateLimitAuthoritative` treats it as the sole rate-limit
@@ -1252,6 +1248,12 @@ export interface CliAdapter {
    *  command and must never receive a best-guess slash command. */
   buildSessionRenameCommand?(title: string): string;
 
+  /** CLI-native command that makes the CLI name the current interactive
+   *  session itself (Claude Code: a bare `/rename` derives a name from the
+   *  conversation). Botmux types it verbatim when `/rename` arrives without a
+   *  title. Undefined means a bare `/rename` keeps botmux's usage reply. */
+  readonly sessionAutoRenameCommand?: string;
+
   /** Structured-transcript bridge capability (see {@link StructuredBridgeSpec}).
    *  Declared by CLIs whose final answer can be harvested from an append-only
    *  transcript file when the model forgets `botmux send`. Absent = no
@@ -1293,6 +1295,9 @@ export interface StructuredBridgeDrainContext {
   state: unknown;
   /** Release a provisionally held trailing final (drivers that hold one). */
   flushTrailingFinal?: boolean;
+  /** Retire a whole conversation: later explicit inputs abandon earlier pending
+   *  turns instead of confirming their waiting narration (Antigravity only). */
+  retirePendingTurns?: boolean;
   /** Number of turns the ATTRIBUTION QUEUE currently holds as started with no
    *  terminal yet, measured by the worker immediately before the drain.
    *  Drivers whose user and final records live in SEPARATE files (doubao:

@@ -11,13 +11,14 @@ import {
   hasAnyTeamDirectorySource,
 } from '../src/services/team-bot-directory.js';
 import { buildFederatedRoster } from '../src/services/federation-roster.js';
+import { applyPlatformTeamSync } from '../src/services/platform-team-store.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'team-bot-dir-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
 function writePlatformSync(teams: any[]) {
-  writeFileSync(join(dir, 'platform-team-sync.json'), JSON.stringify({ rev: 'r1', teams, updatedAt: Date.now() }));
+  applyPlatformTeamSync(dir, { rev: 'r1', teams });
 }
 function writeHostedFederations(teams: Record<string, any[]>) {
   writeFileSync(join(dir, 'federations.json'), JSON.stringify({ version: 1, teams }));

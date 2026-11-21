@@ -32,6 +32,8 @@ export interface DispatchReportBindingPayload {
   issuedAt: string;
   /** 单项目直投范围由来源宿主签发，执行端不能改写落点。 */
   reply?: { rootMessageId: string; sourceTurnId: string; reporterLarkAppId: string };
+  /** Owner of the dedicated cross-chat workstream, frozen at seed creation. */
+  taskOwner?: { openId: string; receivingAppId: string; receivingChatId: string; consentMessageId?: string };
   attachment?: DispatchReportAttachment;
 }
 
@@ -176,6 +178,7 @@ function canonicalPayload(input: {
   sourceName?: string;
   issuedAt?: string;
   reply?: DispatchReportBindingPayload['reply'];
+  taskOwner?: DispatchReportBindingPayload['taskOwner'];
   attachment?: DispatchReportAttachment;
 }): DispatchReportBindingPayload {
   const dispatchRoot = input.dispatchRoot.trim();
@@ -198,6 +201,14 @@ function canonicalPayload(input: {
   if (input.reply && (!validDispatchRoot(input.reply.rootMessageId)
     || !validDispatchRoot(input.reply.sourceTurnId) || !/^cli_[A-Za-z0-9_]+$/.test(input.reply.reporterLarkAppId)
     || !targetChatId || input.targetScope !== 'thread')) throw new Error('invalid dispatch reply target');
+  const owner = input.taskOwner;
+  if (owner !== undefined && (!owner || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(owner.openId)
+      || !/^cli_[A-Za-z0-9_-]{1,128}$/.test(owner.receivingAppId)
+      || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(owner.receivingChatId)
+      || (owner.consentMessageId !== undefined && !validDispatchRoot(owner.consentMessageId))
+      || !targetChatId || owner.receivingChatId === targetChatId || input.targetScope !== 'thread')) {
+    throw new Error('invalid dispatch task owner');
+  }
   return {
     domain: DOMAIN,
     dispatchRoot,
@@ -209,6 +220,8 @@ function canonicalPayload(input: {
     issuedAt,
     ...(input.reply ? { reply: { rootMessageId: input.reply.rootMessageId,
       sourceTurnId: input.reply.sourceTurnId, reporterLarkAppId: input.reply.reporterLarkAppId } } : {}),
+    ...(owner ? { taskOwner: { openId: owner.openId, receivingAppId: owner.receivingAppId, receivingChatId: owner.receivingChatId,
+      ...(owner.consentMessageId ? { consentMessageId: owner.consentMessageId } : {}) } } : {}),
     ...(input.attachment !== undefined ? { attachment: canonicalAttachment(input.attachment) } : {}),
   };
 }
@@ -254,6 +267,7 @@ export function verifyDispatchReportBinding(
       sourceName: typeof candidate.sourceName === 'string' ? candidate.sourceName : '',
       issuedAt: typeof candidate.issuedAt === 'string' ? candidate.issuedAt : '',
       ...(candidate.reply !== undefined ? { reply: candidate.reply as DispatchReportBindingPayload['reply'] } : {}),
+      ...(candidate.taskOwner !== undefined ? { taskOwner: candidate.taskOwner as DispatchReportBindingPayload['taskOwner'] } : {}),
       ...(candidate.attachment !== undefined
         ? { attachment: candidate.attachment as DispatchReportAttachment } : {}),
     });

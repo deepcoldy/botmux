@@ -10,6 +10,7 @@ import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { traexRestoredComposerReady } from '../src/adapters/cli/traex-footer.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+import { WebSocket } from './helpers/node-ws.js';
 
 // 0.211.1 uses cursor-positioned redraws: the rendered prompt starts a row,
 // while stripped PTY bytes concatenate it with the preceding horizontal rule.
@@ -26,12 +27,12 @@ function redraw(rows: string[]): string {
 
 // per-bot-home: TRAE_HOME comes only from the bot's env (the worker's own env
 // has none), so the submit receipt is only visible if the worker follows it.
-type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer' | 'provisional-thread-start';
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer' | 'initialized-single-hint-fresh' | 'initialized-single-hint-resume' | 'provisional-thread-start' | 'provisional-thread-resume' | 'web-protocol-replies' | 'web-protocol-missing-resume';
 
 useWorkerTestModulesCleanup();
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer', 'provisional-thread-start'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer', 'initialized-single-hint-fresh', 'initialized-single-hint-resume', 'provisional-thread-start', 'provisional-thread-resume', 'web-protocol-replies', 'web-protocol-missing-resume'] as const) {
     if (mode.startsWith('native-viewport') && backendType !== 'tmux') continue;
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
@@ -66,7 +67,18 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
   const fakeCli = join(root, 'traex');
   const nativeViewport = mode.startsWith('native-viewport');
   const heldIdle = mode === 'resumed-repository-notice-held-idle';
-  const provisionalThread = mode === 'provisional-thread-start';
+  const initializedSingleHint = mode === 'initialized-single-hint-fresh' || mode === 'initialized-single-hint-resume';
+  // provisional-thread-resume replays the recorded 0.216.0 cold resume: the
+  // resumed TUI paints the shortcut-only composer, reports idle on it, and
+  // only a later redraw with the model/context row can submit.
+  const coldResume = mode === 'provisional-thread-resume' || mode === 'initialized-single-hint-resume';
+  const provisionalThread = mode === 'provisional-thread-start' || mode === 'provisional-thread-resume';
+  const idleReported = join(root, 'idle-reported');
+  const recordedFrame = (name: string) => readFileSync(
+    resolve(`test/fixtures/traex-cold-resume/0.216.0-resume-${name}.txt`), 'utf8').trimEnd().split('\n');
+  const webProtocol = mode.startsWith('web-protocol');
+  let web: WebSocket | undefined;
+  let replyTimer: ReturnType<typeof setInterval> | undefined;
   let nextFrame = 0;
   function paint(rows: string[]): number {
     const id = ++nextFrame;
@@ -76,6 +88,14 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
   }
   const initial = mode === 'session-lock'
     ? readFileSync(resolve('test/fixtures/stuck-pages/traex-0.213.1-session-lock.txt'), 'utf8').trimEnd().split('\n')
+    : initializedSingleHint
+    ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo', '',
+        '  Good afternoon, user', '',
+        coldResume ? '  ▍ earlier native request' : '  Tip: Use /fork to branch the current chat into a new thread.', '',
+        ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+        '  ? for shortcuts']
+    : mode === 'provisional-thread-resume'
+    ? recordedFrame('provisional')
     : nativeViewport
     ? COMPOSER.map(row => mode === 'native-viewport-loading' ? row.replace('GPT-6-Astra xhigh', 'loading') : row)
     : mode.startsWith('resumed-repository-notice')
@@ -95,7 +115,7 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
     : mode === 'loaded-banner'
       ? ['│ model: GPT-6-Astra xhigh /model to change │', '│ directory: /tmp/loading │',
         ...COMPOSER.map(row => row.replace(' · ~ · ', ' · /tmp/loading · '))]
-      : mode === 'shortcut-only-footer' || provisionalThread
+      : mode === 'shortcut-only-footer' || provisionalThread || webProtocol
         // TraeX 0.214.1 cold start: empty composer plus a bare shortcut hint,
         // with no model/context footer until the model list fetch resolves.
         ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo', '  permissions: YOLO mode',
@@ -176,9 +196,10 @@ process.stdin.on('data', chunk => {
 });
 setInterval(() => {
   paint();
-  if (${JSON.stringify(provisionalThread)} && !reportedReady && fs.existsSync(${JSON.stringify(threadReady)})) {
+  if (${JSON.stringify(provisionalThread || webProtocol || initializedSingleHint)} && !reportedReady && fs.existsSync(${JSON.stringify(threadReady)})) {
     reportedReady = true;
     process.stdout.write('\\x1b]7501;state=idle:app=traex\\x07');
+    fs.writeFileSync(${JSON.stringify(idleReported)}, 'idle');
   }
   if (!receipt && text && fs.existsSync(${JSON.stringify(confirmFile)})) {
     receipt = true;
@@ -303,7 +324,12 @@ process.send?.({ type: 'worker_ipc_ready' });
   async function waitFor(predicate: () => boolean, description: string, timeoutMs = 12_000): Promise<void> {
     const until = Date.now() + timeoutMs;
     while (!predicate()) {
-      if (Date.now() >= until || child?.exitCode != null) throw new Error(`${description}\n${logs.join('')}`);
+      if (Date.now() >= until || child?.exitCode != null) {
+        const received = existsSync(inputFile) ? readFileSync(inputFile, 'utf8').slice(-4096) : '';
+        const events = messages.map(message => ({ type: message.type,
+          ...('reason' in message ? { reason: message.reason } : {}) }));
+        throw new Error(`${description}\n${logs.join('')}\nreceived=${JSON.stringify(received)}\nevents=${JSON.stringify(events)}`);
+      }
       await new Promise(resolveWait => setTimeout(resolveWait, 25));
     }
   }
@@ -329,7 +355,9 @@ process.send?.({ type: 'worker_ipc_ready' });
     child.send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_test',
       workingDir: dataDir, cliId: 'traex', cliPathOverride: fakeCli, backendType,
-      ...(provisionalThread ? { cliVersion: '0.214.1' } : {}),
+      ...(provisionalThread || webProtocol || initializedSingleHint ? { cliVersion: coldResume ? '0.216.0' : '0.214.1' } : {}),
+      ...(coldResume ? { resume: true, cliSessionId: nativeId } : {}),
+      ...(mode === 'web-protocol-missing-resume' ? { resume: true } : {}),
       ...(mode === 'resume' || mode === 'session-lock' || mode.startsWith('resumed-repository-notice') || nativeViewport ? { resume: true, cliSessionId: nativeId } : {}),
       ...(mode === 'per-bot-home' ? { env: { TRAE_HOME: traeHome } } : {}),
       prompt: 'only-this-traex-startup-input', turnId: 'om_first',
@@ -337,14 +365,49 @@ process.send?.({ type: 'worker_ipc_ready' });
       larkAppId: 'app_test', larkAppSecret: 'test',
     } satisfies DaemonToWorker);
     await waitFor(() => existsSync(seenFile), 'first frame', mode === 'session-lock' ? 60_000 : 12_000);
+    if (initializedSingleHint) writeFileSync(threadReady, 'initialized');
+    if (webProtocol) {
+      await waitFor(() => messages.some(message => message.type === 'ready'), 'writable Web terminal');
+      const ready = messages.find(message => message.type === 'ready') as Extract<WorkerToDaemon, { type: 'ready' }>;
+      expect(ready.token).toBeTruthy();
+      web = new WebSocket(`ws://127.0.0.1:${ready.port}/?token=${encodeURIComponent(ready.token)}`);
+      await new Promise<void>((resolveOpen, rejectOpen) => {
+        web!.once('open', resolveOpen);
+        web!.once('error', rejectOpen);
+      });
+      const reply = '\x1b]11;rgb:1e1e/1e1e/2e2e\x1b\\';
+      const sendReply = () => {
+        if (web?.readyState === WebSocket.OPEN) web.send(JSON.stringify({ type: 'input', data: reply }));
+      };
+      sendReply();
+      replyTimer = setInterval(sendReply, 250);
+      // No keyboard action: the actual writable WS keeps delivering the
+      // neutral response while native thread initialization is still pending.
+      await new Promise(resolveWait => setTimeout(resolveWait, 4_000));
+      const early = existsSync(inputFile) ? readFileSync(inputFile, 'utf8') : '';
+      expect(early).toContain(reply);
+      expect(early).not.toContain('only-this-traex-startup-input');
+      expect(messages.some(message => message.type === 'turn_input_committed')).toBe(false);
+      writeFileSync(threadReady, 'initialized');
+      paint(['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '', ...COMPOSER]);
+    }
     if (provisionalThread) {
       await waitFor(() => existsSync(startupVetoed) || existsSync(inputFile)
         || messages.some(message => message.type === 'prompt_ready'), 'startup admission attempted');
       expect(existsSync(inputFile), logs.join('')).toBe(false);
       expect(messages.some(message => message.type === 'prompt_ready')).toBe(false);
-      // Thread initialization completes independently of the already visible
-      // hint-only composer. Its native idle must re-drive the first admission.
+      // The native idle arrives while the hint-only composer is still drawn
+      // (recorded on 0.214.1 and 0.216.0 while the model catalog fetch
+      // stalls); an Enter there is dropped. Idle alone must not admit.
       writeFileSync(threadReady, 'ready');
+      await waitFor(() => existsSync(idleReported), 'native idle on the provisional composer');
+      // Past the next quiet-screen idle edge (~3s), which is where an
+      // idle-trusting admission would write.
+      await new Promise(resolveWait => setTimeout(resolveWait, 5_000));
+      expect(existsSync(inputFile), logs.join('')).toBe(false);
+      expect(messages.some(message => message.type === 'prompt_ready')).toBe(false);
+      // The model/context row resolves: the first admission happens now.
+      paint(coldResume ? recordedFrame('resolved') : ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '', ...COMPOSER]);
     }
     if (mode === 'session-lock') {
       await waitFor(() => messages.some(message => message.type === 'stuck_warning'
@@ -421,6 +484,8 @@ process.send?.({ type: 'worker_ipc_ready' });
     expect(readFileSync(inputFile, 'utf8').match(/only-this-traex-startup-input/g)).toHaveLength(1);
     expect(logs.join('')).not.toContain('WARN First prompt hard timeout');
   } finally {
+    if (replyTimer) clearInterval(replyTimer);
+    web?.terminate();
     if (child && child.exitCode === null && child.signalCode === null) {
       const exited = new Promise<void>(resolveExit => child!.once('exit', () => resolveExit()));
       child.kill('SIGKILL');

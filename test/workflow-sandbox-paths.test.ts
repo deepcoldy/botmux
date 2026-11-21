@@ -55,6 +55,27 @@ describe('blocker #2: sandboxPaths threads through the workflow chain', () => {
     });
   });
 
+  it('sandboxWithholdBotSecret rides the whole chain for an oncall bot only', () => {
+    const snap = botToSnapshot(bot({ sandboxWithholdBotSecret: true }), '/w');
+    expect(snap.sandboxWithholdBotSecret).toBe(true);
+    const frozen = serializeFrozenBotSnapshots(new Map([['app_x', snap]]));
+    const roundTrip = parseFrozenBotSnapshots(JSON.parse(JSON.stringify(frozen)));
+    expect(roundTrip.get('app_x')!.sandboxWithholdBotSecret).toBe(true);
+    expect(workflowSandboxInitFields(roundTrip.get('app_x')!).sandboxWithholdBotSecret).toBe(true);
+    // scratch / off bots never carry it, and the default stays unset.
+    expect(botToSnapshot(bot({ sandbox: 'scratch', sandboxWithholdBotSecret: true }), '/w').sandboxWithholdBotSecret).toBeUndefined();
+    expect(botToSnapshot(bot(), '/w').sandboxWithholdBotSecret).toBeUndefined();
+    expect(workflowSandboxInitFields(botToSnapshot(bot(), '/w')).sandboxWithholdBotSecret).toBeUndefined();
+    // BOTMUX_SANDBOX=1 forces oncall on a bot configured without a sandbox: the flag follows.
+    const prev = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTMUX_SANDBOX = '1';
+      const forced = botToSnapshot(bot({ sandbox: undefined, sandboxWithholdBotSecret: true } as Partial<BotConfig>), '/w');
+      expect(forced.sandboxWithholdBotSecret).toBe(true);
+      expect(workflowSandboxInitFields(forced).sandboxWithholdBotSecret).toBe(true);
+    } finally { if (prev === undefined) delete process.env.BOTMUX_SANDBOX; else process.env.BOTMUX_SANDBOX = prev; }
+  });
+
   it('serialize → parseFrozenBotSnapshots round-trips sandboxPaths', () => {
     const snap = botToSnapshot(bot(), '/w');
     const frozen = serializeFrozenBotSnapshots(new Map([['app_x', snap]]));

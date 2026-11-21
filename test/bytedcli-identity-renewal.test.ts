@@ -64,6 +64,62 @@ afterEach(() => {
 });
 
 describe('bytedcli identity renewal', () => {
+  it.each(['before', 'during'])('withholds renewed material when a task authorization is revoked %s minting', async when => {
+    const identity = publish(60, 60);
+    let approved = when === 'during';
+    const check = vi.fn(async () => approved);
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity, taskAuthorized: check });
+    renew.mockImplementation(async () => { approved = false; return { cloudJwt: 'must-not-publish' }; });
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).toHaveBeenCalledTimes(when === 'during' ? 1 : 0);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).not.toContain('must-not-publish');
+    expect(trackedBytedcliRenewalCount()).toBe(0);
+  });
+
+  it('keeps the renewal entry across a transient authorization check and renews after recovery', async () => {
+    const identity = publish(60, 60);
+    const check = vi.fn()
+      .mockRejectedValueOnce(new Error('target validation unavailable'))
+      .mockResolvedValue(true);
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity, taskAuthorized: check });
+    const fresh = { cloudJwt: jwt('cn', 7200, 'recovered') };
+    renew.mockResolvedValueOnce(fresh);
+    // First sweep: the check is transiently unavailable. The entry survives.
+    expect(await renewExpiringBytedcliIdentities()).toBe(0);
+    expect(renew).not.toHaveBeenCalled();
+    expect(trackedBytedcliRenewalCount()).toBe(1);
+    // Next sweep: the check recovers and the same entry renews normally.
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toContain(fresh.cloudJwt);
+  });
+
+  it('a stale entry cannot delete the replacement entry registered for the same turn', async () => {
+    const first = publish(60, 60);
+    let releaseStale!: () => void;
+    const staleGate = new Promise<void>(resolve => { releaseStale = resolve; });
+    // The first entry's check is held in flight while the turn gets republished.
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity: first, taskAuthorized: async () => { await staleGate; return false; } });
+    const fresh = { cloudJwt: jwt('cn', 7200, 'fresh-after-republish') };
+    renew.mockResolvedValueOnce(fresh);
+    const firstSweep = renewExpiringBytedcliIdentities();
+    // While sweep 1 awaits the stale check, a republished entry takes the same key.
+    const republished = { ...first, cloudJwt: jwt('cn', 60, 'republished') };
+    writeSessionIdentity(dir, SESSION, republished, 'proven');
+    trackBytedcliIdentityRenewal({ sessionDataDir: dir, sessionId: SESSION, credentialOpenId: ALICE,
+      identity: republished, taskAuthorized: async () => true });
+    releaseStale();
+    // The stale entry refuses but must not remove its replacement: nothing is
+    // renewed in this sweep, yet one tracked entry survives.
+    expect(await firstSweep).toBe(0);
+    expect(trackedBytedcliRenewalCount()).toBe(1);
+    // The next sweep serves the republished entry normally.
+    expect(await renewExpiringBytedcliIdentities()).toBe(1);
+    expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli')).toContain(fresh.cloudJwt);
+  });
+
   it('leaves registered background cache to its per-invocation authority checks', async () => {
     const ordinary = publish(600, 600);
     forgetBytedcliIdentityRenewals();

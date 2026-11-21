@@ -18,6 +18,7 @@ import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vites
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setImmediate as realSetImmediate, setTimeout as realSetTimeout, clearTimeout as realClearTimeout } from 'node:timers';
 
 // Factories use a synchronous `require`, never `await vi.importActual(...)`: bun's `vi`
 // shim has no `importActual`, and a fill that resolved without loading the module would
@@ -1135,6 +1136,17 @@ describe('TmuxPipeBackend.getChildPid', () => {
     expect(cmd).toContain('#{pane_pid}');
     expect(cmd).not.toContain('list-panes');
   });
+  it('re-reads the stable pane pid independently of cliPid rewrites', () => {
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecSync.mockClear();
+    mockedExecSync.mockReturnValue('45678\n' as any);
+    expect(be.getStablePanePid()).toBe(45678);
+    be.cliPid = 999;
+    expect(be.getChildPid()).toBe(45678);
+    mockedExecSync.mockReturnValue('56789\n' as any);
+    expect(be.getStablePanePid()).toBe(56789);
+  });
 });
 
 describe('TmuxPipeBackend.captureCurrentScreen', () => {
@@ -1307,6 +1319,80 @@ describe('TmuxPipeBackend.captureViewportAsync', () => {
       expect(await pending).toBe('');
       expect(await be.captureViewportAsync()).toBe('');
     }
+  });
+});
+
+describe('capture failure observability', () => {
+  function captureError(stderr: string): Error {
+    return Object.assign(new Error(stderr), { status: 1, signal: null, stderr: Buffer.from(stderr) });
+  }
+
+  it.each([
+    ['error connecting to /tmp/tmux-0/private-test (Connection refused)', 'server-unreachable'],
+    ['no server running on /tmp/tmux-0/private-test', 'no-server'],
+    ["can't find pane: 0:2.0", 'pane-missing'],
+  ])('classifies %s without changing the empty capture result', (stderr, kind) => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    mockedExecSync.mockImplementation(() => { throw captureError(stderr); });
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    expect(be.captureViewport()).toBe('');
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    const line = String(errSpy.mock.calls[0][0]);
+    expect(line).toContain(`kind=${kind}`);
+    expect(line).toContain('socket=private-test');
+    expect(line).toContain('target=0:2.0');
+    errSpy.mockRestore();
+  });
+
+  it('rate-limits identical errors but logs again after the interval', () => {
+    vi.useFakeTimers();
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    mockedExecSync.mockImplementation(() => { throw captureError('no server running on /tmp/tmux-0/private-test'); });
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    be.captureViewport();
+    be.captureViewport();
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(31_000);
+    be.captureViewport();
+    expect(errSpy).toHaveBeenCalledTimes(2);
+    errSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('classifies async capture errors while preserving rejection', async () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      cb(captureError('error connecting to /tmp/tmux-0/private-test (Connection refused)'), '');
+      return {};
+    }) as any);
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    await expect(be.captureViewportAsync()).rejects.toThrow('error connecting');
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(String(errSpy.mock.calls[0][0])).toContain('kind=server-unreachable');
+    errSpy.mockRestore();
+  });
+
+  it('recognizes the real execFile timeout shape without changing rejection', async () => {
+    const errSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
+    const timeoutError = Object.assign(new Error('Command failed: tmux capture-pane'), {
+      code: null,
+      killed: true,
+      signal: 'SIGKILL',
+      stderr: '',
+    });
+    vi.mocked(execFile).mockImplementation(((_bin: string, _args: string[], _options: any, cb: any) => {
+      cb(timeoutError, '');
+      return {};
+    }) as any);
+    const be = new TmuxPipeBackend('0:2.0', { socketName: 'private-test' });
+
+    await expect(be.captureViewportAsync()).rejects.toBe(timeoutError);
+    expect(errSpy).toHaveBeenCalledTimes(1);
+    expect(String(errSpy.mock.calls[0][0])).toContain('kind=timeout');
+    errSpy.mockRestore();
   });
 });
 
@@ -1619,6 +1705,28 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
 
   const logged = (text: string) => errSpy.mock.calls.some((call: unknown[]) => String(call[0]).includes(text));
 
+  /** Step the fake clock while draining the real Promise chain. A chain that
+   * schedules its next fake timer during the drain can never be released by
+   * realSetImmediate alone; the real wall clock only bounds the whole wait. */
+  async function untilSettled(check: () => boolean, message: string): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = realSetTimeout(() => reject(new Error(message)), 10_000);
+      timer.unref?.();
+    });
+    try {
+      await Promise.race([
+        (async () => {
+          while (!check()) {
+            await vi.advanceTimersByTimeAsync(100);
+            await new Promise<void>(r => realSetImmediate(r));
+          }
+        })(),
+        timeout,
+      ]);
+    } finally { if (timer) realClearTimeout(timer); }
+  }
+
   function watch(world: TmuxWorld, target = TARGET, opts: { ownsSession?: boolean; cliPid?: number } = { ownsSession: true }) {
     installTmuxWorld(world, { execFileSync: mockedExecFileSync, execFile: mockedExecFile });
     const be = new TmuxPipeBackend(target, opts);
@@ -1725,6 +1833,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     await vi.advanceTimersByTimeAsync(INITIAL + 3_000 + 100);
     expect(exits).toEqual([]);
     await vi.advanceTimersByTimeAsync(9_000 + 1_000);
+    await untilSettled(() => exits.length === 1, 'dead pane did not settle after the debounce');
     expect(exits).toEqual([[77, null]]);
     expect(syncProbes(world)).toBe(0);
   });
@@ -1736,6 +1845,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     world.pane = { dead: '77' };
 
     await vi.advanceTimersByTimeAsync(LIFECYCLE_IDLE_PROBE_MAX_MS + DEBOUNCE);
+    await untilSettled(() => exits.length === 1, 'idle dead pane did not settle after the debounce');
     expect(exits).toEqual([[77, null]]);
     expect(syncProbes(world)).toBe(0);
   });
@@ -1747,6 +1857,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     await vi.advanceTimersByTimeAsync(INITIAL + 3_000 + 100);
     expect(exits).toEqual([]);
     await vi.advanceTimersByTimeAsync(9_000 + 1_000);
+    await untilSettled(() => exits.length === 1, 'vanished pane did not settle after the debounce');
     expect(exits).toEqual([[1, null]]);
     expect(syncProbes(world)).toBe(0);
   });
@@ -1763,6 +1874,7 @@ describe('TmuxPipeBackend lifecycle watcher', () => {
     };
     const { exits } = watch(world);
     await vi.advanceTimersByTimeAsync(INITIAL + 30_000);
+    await untilSettled(() => logged('recovered on final check'), 'final lenient probe did not settle');
     expect(exits).toEqual([]);
     expect(logged('recovered on final check')).toBe(true);
     expect(syncProbes(world)).toBe(0);

@@ -52,6 +52,7 @@ import {
 } from './pin-streaming-card-change.js';
 import {
   normalizeHiddenStreamingCardButtons,
+  resolveStreamingCardFoldedLayout,
   type StreamingCardButtonId,
 } from '../im/lark/streaming-card-buttons.js';
 
@@ -68,6 +69,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   disableStreamingCard: boolean;
   replyCardMode: ReplyCardMode;
   hiddenStreamingCardButtons: StreamingCardButtonId[];
+  /** Default true; only false is persisted to restore the classic live-card layout. */
+  streamingCardFoldedLayout: boolean;
   pinStreamingCard: boolean;
   silentTurnReactions: boolean;
   /** Experimental Codex App presentation mode. Default false preserves the
@@ -91,9 +94,6 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   /** Collapsed「本轮回顾」panel on the last reply card of a turn.
    *  Default false; only an explicit true enables it. */
   replyCardRecap: boolean;
-  /** Small-model recap for turns the CLI left without one (extra model call).
-   *  Default false; only an explicit true enables it. */
-  replyCardRecapModel: boolean;
   /** In-card activity in unified replies, native CoT in legacy replies.
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
@@ -169,6 +169,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       disableStreamingCard: c.disableStreamingCard === true,
       replyCardMode: normalizeReplyCardMode(c.replyCardMode),
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(c.hiddenStreamingCardButtons) ?? [],
+      streamingCardFoldedLayout: resolveStreamingCardFoldedLayout(c),
       pinStreamingCard: c.pinStreamingCard === true,
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
@@ -183,7 +184,6 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       replyCardActions: c.replyCardActions === true,
       replyCardNextStep: c.replyCardNextStep === true,
       replyCardRecap: c.replyCardRecap === true,
-      replyCardRecapModel: c.replyCardRecapModel === true,
       cotEnabled: c.cotEnabled !== false,
       senderTag: c.senderTag !== false,
       senderTagHideEmail: c.senderTagHideEmail === true,
@@ -216,6 +216,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       disableStreamingCard: false,
       replyCardMode: 'legacy',
       hiddenStreamingCardButtons: [],
+      streamingCardFoldedLayout: true,
       pinStreamingCard: false,
       silentTurnReactions: false,
       codexAppCleanInput: false,
@@ -230,7 +231,6 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       replyCardActions: false,
       replyCardNextStep: false,
       replyCardRecap: false,
-      replyCardRecapModel: false,
       cotEnabled: true,
       senderTag: true,
       senderTagHideEmail: false,
@@ -351,6 +351,7 @@ async function updateBotCardPrefsInternal(
       else entry.replyCardMode = patch.replyCardMode;
     }
     applyHiddenButtons(entry, patch.hiddenStreamingCardButtons);
+    applyDefaultTrue(entry, 'streamingCardFoldedLayout', patch.streamingCardFoldedLayout);
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
@@ -374,7 +375,6 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'replyCardActions', patch.replyCardActions);
     apply(entry, 'replyCardNextStep', patch.replyCardNextStep);
     apply(entry, 'replyCardRecap', patch.replyCardRecap);
-    apply(entry, 'replyCardRecapModel', patch.replyCardRecapModel);
     // [legacy-thinkingCard] 显式拨开关时清旧名（懒迁移）；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
     if (patch.cotEnabled !== undefined) delete entry.thinkingCard;
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
@@ -411,6 +411,7 @@ async function updateBotCardPrefsInternal(
         disableStreamingCard: entry.disableStreamingCard === true,
         replyCardMode: normalizeReplyCardMode(entry.replyCardMode),
         hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons) ?? [],
+        streamingCardFoldedLayout: entry.streamingCardFoldedLayout !== false,
         pinStreamingCard: entry.pinStreamingCard === true,
         silentTurnReactions: entry.silentTurnReactions === true,
         codexAppCleanInput: entry.codexAppCleanInput === true,
@@ -426,7 +427,6 @@ async function updateBotCardPrefsInternal(
         replyCardActions: entry.replyCardActions === true,
         replyCardNextStep: entry.replyCardNextStep === true,
         replyCardRecap: entry.replyCardRecap === true,
-        replyCardRecapModel: entry.replyCardRecapModel === true,
         cotEnabled: normalizeCotEnabled(entry),
         senderTag: entry.senderTag !== false,
         senderTagHideEmail: entry.senderTagHideEmail === true,
@@ -481,6 +481,9 @@ async function updateBotCardPrefsInternal(
   if (patch.hiddenStreamingCardButtons !== undefined) {
     bot.config.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(patch.hiddenStreamingCardButtons);
   }
+  if (patch.streamingCardFoldedLayout !== undefined) {
+    bot.config.streamingCardFoldedLayout = patch.streamingCardFoldedLayout ? undefined : false;
+  }
   if (patch.pinStreamingCard !== undefined) {
     bot.config.pinStreamingCard = patch.pinStreamingCard || undefined;
   }
@@ -510,9 +513,6 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.replyCardRecap !== undefined) {
     bot.config.replyCardRecap = patch.replyCardRecap || undefined;
-  }
-  if (patch.replyCardRecapModel !== undefined) {
-    bot.config.replyCardRecapModel = patch.replyCardRecapModel || undefined;
   }
   if (patch.thinkingCardToolResult !== undefined) {
     bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;

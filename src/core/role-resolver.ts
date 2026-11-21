@@ -279,19 +279,39 @@ function teamRoleMetaFilePath(larkAppId: string): string {
 }
 
 /**
+ * Strict bot-level injection-mode read for compare-and-set. Only an actually
+ * absent sidecar means the legacy 'every' default: an unreadable or malformed
+ * sidecar must not be mistaken for a matching expected value.
+ */
+export function readTeamRoleInjectModeStrict(larkAppId: string): RoleInjectMode {
+  if (!larkAppId) return 'every';
+  let raw: string;
+  try {
+    raw = readFileSync(teamRoleMetaFilePath(larkAppId), 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 'every';
+    throw err;
+  }
+  const parsed: unknown = JSON.parse(raw);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('invalid team role inject mode metadata');
+  }
+  const inject = (parsed as { inject?: unknown }).inject;
+  if (inject === 'once' || inject === 'every') return inject;
+  throw new Error('invalid team role inject mode metadata');
+}
+
+/**
  * Read the bot-level DEFAULT injection mode (applies to any chat that hasn't set
  * its own). Defaults to 'every' (legacy) when unset/unparseable. This is the
  * fallback consulted by readRoleInjectMode — it lets an operator make the bot's
  * default role inject-once across all its chats from the Bot config page,
- * without touching each chat individually.
+ * without touching each chat individually. Display paths keep this tolerant
+ * behavior; conditional writes use readTeamRoleInjectModeStrict instead.
  */
 export function readTeamRoleInjectMode(larkAppId: string): RoleInjectMode {
-  if (!larkAppId) return 'every';
   try {
-    const fp = teamRoleMetaFilePath(larkAppId);
-    if (!existsSync(fp)) return 'every';
-    const meta = JSON.parse(readFileSync(fp, 'utf-8')) as { inject?: unknown };
-    return meta?.inject === 'once' ? 'once' : 'every';
+    return readTeamRoleInjectModeStrict(larkAppId);
   } catch {
     return 'every';
   }

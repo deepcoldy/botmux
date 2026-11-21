@@ -589,6 +589,8 @@ describe('scrubSessionTurnMarkerEnv()', () => {
       'BOTMUX_SEND_RELAY',
       // per-session shadowed user statusLine command (worker-computed from cwd)
       'BOTMUX_STATUSLINE_CHAIN',
+      // per-CLI-spawn statusline generation token
+      'BOTMUX_STATUSLINE_GEN',
     ]) {
       expect(SESSION_TURN_MARKER_ENV_KEYS, key).toContain(key);
     }
@@ -854,6 +856,8 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     // command; without transport it would silently drop the user's own statusLine.
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_STATUSLINE_GEN');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_STATUSLINE_GEN');
   });
 
   it('keeps SSL_CERT_FILE OUT of the injected list and in its own CA-bundle list', () => {

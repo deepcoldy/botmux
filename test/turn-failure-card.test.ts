@@ -110,6 +110,13 @@ describe('shouldNotifyTurnFailure', () => {
     // alert, so the two arms must not collapse.
     expect(shouldNotifyTurnFailure({ status: 'failed', errorCode: 'grok_turn_cancelled' }))
       .toBe(true);
+    // Antigravity /new, /fork and authoritative rebinding retire the old
+    // conversation owner. The replacement owns delivery; continuing in that
+    // fresh conversation would not resume the abandoned subagent work.
+    expect(shouldNotifyTurnFailure({ status: 'ambiguous', errorCode: 'antigravity_conversation_retired' }))
+      .toBe(false);
+    expect(turnRetryOffer({ status: 'ambiguous', errorCode: 'antigravity_conversation_retired' }))
+      .toBe('none');
   });
 
   it('surfaces an unattributable abort rather than guessing', () => {

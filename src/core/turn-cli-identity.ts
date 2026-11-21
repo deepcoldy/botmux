@@ -21,7 +21,7 @@ import { readCliAuthEpoch } from '../services/cli-auth-epoch.js';
 import type { BotConfig } from '../bot-registry.js';
 import { isLarkToolBound } from './lark-tool-binding.js';
 import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
-import { registerActiveIdentityTurn } from './active-identity-turns.js';
+import { registerActiveIdentityTurn, releaseActiveIdentityTurn } from './active-identity-turns.js';
 import {
   TRIGGER_USER_AUTH_TOOLS,
   type TriggerUserAuthConfig,
@@ -44,7 +44,7 @@ import {
   type BytedCliIdentity,
   type CliIdentity,
 } from './cli-identity.js';
-import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
 import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
 
@@ -76,10 +76,10 @@ export interface DelegatedCliIdentity {
   dispatchRoot: string;
   /** `delegation_inactive`: a workflow handoff's delegation whose run attempt
    *  ended, or whose handoff was withdrawn (design 2026-11-03 §10.3). */
-  denialReason?: 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive'
+  denialReason?: 'target_chat_membership_required' | 'target_identity_unresolved' | 'target_access_denied' | 'target_validation_unavailable' | 'delegation_inactive'
     /** A workflow delegation passed on from a node session into a session
      *  that keeps identities on disk: it could not be re-checked per use. */
-    | 'passed_on_unsupported';
+    | 'passed_on_unsupported' | 'task_turn_isolation_required';
   /** A workflow handoff's delegation (design 2026-11-03 §10). */
   workflowHandoff?: true;
   /** Workflow handoff only: re-run its run / attempt / revocation checks
@@ -87,6 +87,8 @@ export interface DelegatedCliIdentity {
    *  so a stop that never reached this daemon still ends it. Daemon memory
    *  only; never serialized. */
   recheck?: () => string | undefined;
+  /** Recheck a cross-chat task's signed user decision before publishing or renewing. */
+  taskAuthorized?: () => Promise<boolean>;
 }
 
 /** Replace one tool's published identity for `turnId` with the refusal for
@@ -133,6 +135,16 @@ export interface PublishTurnIdentityArgs {
    *  may a refusal carry an authorization link for the agent to relay: in a
    *  group, whoever opens the link authorizes as themselves. */
   privateChat?: boolean;
+  /** Synchronous final fence for authority that can change while credentials
+   *  resolve (owner replacement/revocation, opt-out, terminal or generation
+   *  replacement). Checked before credential resolution and again immediately
+   *  before each personal-identity write. A publication that becomes invalid
+   *  is removed rather than left readable by a later policy flip. */
+  validateBeforeWrite?: () => boolean;
+}
+
+function publicationValid(validate: (() => boolean) | undefined): boolean {
+  try { return validate?.() !== false; } catch { return false; }
 }
 
 /**
@@ -199,6 +211,10 @@ export function publishTurnCliIdentity(
 async function publishTurnCliIdentityNow(
   args: PublishTurnIdentityArgs,
 ): Promise<ToolIdentityOutcome[]> {
+  const personalIdentityAllowedAtStart = allowsPersonalIdentityForTurn(args.turnId, args.botConfig.triggerUserAuth);
+  if (!personalIdentityAllowedAtStart || !publicationValid(args.validateBeforeWrite)) {
+    args = { ...args, senderOpenId: undefined, delegatedIdentity: undefined };
+  }
   const { sessionDataDir, sessionId, turnId } = args;
   const privateChat = args.privateChat === true;
   const outcomes: ToolIdentityOutcome[] = [];
@@ -217,6 +233,13 @@ async function publishTurnCliIdentityNow(
   // closed on its own, and this settles only after every tool has settled, so
   // a turn is never released with one identity still being written.
   const settled = await Promise.allSettled(TRIGGER_USER_AUTH_TOOLS.map(tool => publishToolIdentity(tool, args, privateChat)));
+  // Only an initially eligible personal publication is revoked here. A turn
+  // that started with owner credentials disabled keeps its ordinary denial.
+  if (personalIdentityAllowedAtStart && args.validateBeforeWrite && !publicationValid(args.validateBeforeWrite)) {
+    for (const tool of TRIGGER_USER_AUTH_TOOLS) clearSessionIdentity(sessionDataDir, sessionId, tool, turnId, args.storageModel);
+    if (turnId) releaseActiveIdentityTurn(sessionDataDir, sessionId, turnId);
+    return TRIGGER_USER_AUTH_TOOLS.map(tool => ({ tool, state: 'off' as const }));
+  }
   for (const result of settled) {
     if (result.status === 'rejected') throw result.reason;
     outcomes.push(result.value);
@@ -250,7 +273,7 @@ async function publishToolIdentity(
       // session creator's or the owner's credentials to fill the gap.
       return await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
     }
-    return await publishOne(tool, botConfig, sessionDataDir, sessionId, principal.openId, locale, turnId, storageModel, privateChat, policy);
+    return await publishOne(tool, botConfig, sessionDataDir, sessionId, principal.openId, locale, turnId, storageModel, privateChat, policy, args.validateBeforeWrite);
   } catch (e) {
     // Fail closed through the SAME policy as an ordinary missing token, so a
     // credential-store outage and "this person never authorized" cannot end
@@ -277,15 +300,16 @@ async function publishToolIdentity(
 }
 
 function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): ToolIdentityOutcome {
-  const reason = user.denialReason === 'target_validation_unavailable'
-    ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
-    : user.denialReason === 'target_access_denied'
-      ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
-      : user.denialReason === 'delegation_inactive'
-        ? 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn), so the requester\'s identity no longer applies; do not request another login.'
-        : user.denialReason === 'passed_on_unsupported'
-          ? 'This workflow identity was passed on by another bot; it can only be used in a session that re-checks it on every call, and this session does not. Tools that need the person\'s authorization refuse here; do not request another login.'
-          : 'The source must ask the original human to authorize.';
+  const reasons = {
+    target_validation_unavailable: 'Target user or group membership verification is unavailable. Restore verification before retrying.',
+    target_access_denied: 'The target bot does not allow this requester to talk in the destination context.',
+    target_identity_unresolved: 'The target bot could not resolve the requester in its own application.',
+    target_chat_membership_required: 'The requester is outside the internal dispatch chat. Its membership rule blocked this task before credential issuance. Report to the original topic; another login will not change membership.',
+    task_turn_isolation_required: 'This task requires a thread session with proven per-turn identity isolation.',
+    delegation_inactive: 'This workflow handoff is no longer active (its run attempt ended or the handoff was withdrawn).',
+    passed_on_unsupported: 'This workflow identity was passed on by another bot; it can only be used in a session that re-checks it on every call.',
+  } satisfies Record<NonNullable<DelegatedCliIdentity['denialReason']>, string>;
+  const reason = user.denialReason ? reasons[user.denialReason] : 'The source must ask the original human to authorize.';
   try {
     writeSessionIdentity(args.sessionDataDir, args.sessionId, {
       tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),
@@ -335,17 +359,29 @@ async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIden
       if (token) identity = { tool, appId: args.botConfig.larkAppId, userAccessToken: token };
     }
   }
-  if (!identity) return denyDelegated(tool, args, user);
+  let taskHolds = true;
+  if (user.taskAuthorized) {
+    try {
+      taskHolds = await user.taskAuthorized();
+    } catch {
+      // Transient validation unavailability fails closed at publication; the
+      // renewal sweep treats the same throw as retryable rather than dropping.
+      taskHolds = false;
+    }
+  }
+  if (!identity || !taskHolds) return denyDelegated(tool, args, user);
   const stamped = withMeegoStore({
     ...identity,
     ...(args.turnId ? { turnId: args.turnId } : {}),
     ...(user.targetOpenId ? { openId: user.targetOpenId } : {}),
   }, policy);
+  if (!publicationValid(args.validateBeforeWrite)) return { tool, state: 'off' };
   writeSessionIdentity(args.sessionDataDir, args.sessionId, stamped, args.storageModel);
   if (localMint && args.turnId && args.storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {
     trackBytedcliIdentityRenewal({
       sessionDataDir: args.sessionDataDir, sessionId: args.sessionId,
       credentialOpenId: user.credentialOpenId, identity: { ...stamped, turnId: args.turnId },
+      taskAuthorized: user.taskAuthorized,
     });
   }
   return { tool, state: 'user' };
@@ -370,6 +406,7 @@ async function publishMeegoOnly(
     }, storageModel);
     return { tool: 'bytedcli', state: 'needs-authorization' };
   }
+  if (!publicationValid(args.validateBeforeWrite)) return { tool: 'bytedcli', state: 'off' };
   writeSessionIdentity(sessionDataDir, sessionId, withMeegoStore({
     tool: 'bytedcli', cloudJwt: '', meegoOnly: true, ...(turnId ? { turnId } : {}), openId,
   }, policy), storageModel);
@@ -387,11 +424,13 @@ async function publishOne(
   storageModel: IdentityStorageModel,
   privateChat: boolean,
   policy: IdentityPolicy,
+  validateBeforeWrite?: () => boolean,
 ): Promise<ToolIdentityOutcome> {
   const withheld = async () =>
     withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, privateChat);
 
   const publish = (identity: CliIdentity, localMint = false): ToolIdentityOutcome => {
+    if (!publicationValid(validateBeforeWrite)) return { tool, state: 'off' };
     const stamped = withMeegoStore({ ...identity, ...(turnId ? { turnId } : {}), openId: senderOpenId }, policy);
     writeSessionIdentity(sessionDataDir, sessionId, stamped, storageModel);
     if (localMint && turnId && storageModel === 'proven' && stamped.tool === 'bytedcli' && !('mode' in stamped)) {

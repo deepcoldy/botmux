@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatSlashGroupName, parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents, resolveGroupDecorations } from '../src/services/group-creation-options.js';
+import { formatSlashGroupName, groupCommandStartsTask, groupCommandStartsTaskForRouting, parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents, resolveGroupDecorations } from '../src/services/group-creation-options.js';
 
 describe('/g customization', () => {
   it('preserves punctuation, spaces and the first non-empty name line', () => {
@@ -7,16 +7,16 @@ describe('/g customization', () => {
   });
   it('accepts quoted flags before/after the name and keeps role profiles', () => {
     expect(parseGroupCreationArgs('--agents="Review,Build" 项目名称 --tag "Project work" --avatar=name --role-profile suite')).toEqual({
-      name: '项目名称', agents: ['Review', 'Build'], tag: 'Project work', avatar: 'name', roleProfileId: 'suite',
+      name: '项目名称', body: '项目名称', agents: ['Review', 'Build'], tag: 'Project work', avatar: 'name', roleProfileId: 'suite',
     });
   });
   it('merges defaults; --no-tag/--no-agents drop defaults without producing a tombstone', () => {
     expect(parseGroupCreationArgs('--no-agents Work --no-tag --avatar off', { agents: ['Review'], tag: 'Work', avatar: 'name' })).toEqual({
-      name: 'Work', agents: [], avatar: 'off', roleProfileId: undefined,
+      name: 'Work', body: 'Work', agents: [], avatar: 'off', roleProfileId: undefined,
     });
   });
   it('normalizes whitespace-only default tags to absent (opt-in requires real content)', () => {
-    expect(parseGroupCreationArgs('Hello', { tag: '   ' })).toEqual({ name: 'Hello', roleProfileId: undefined });
+    expect(parseGroupCreationArgs('Hello', { tag: '   ' })).toEqual({ name: 'Hello', body: 'Hello', roleProfileId: undefined });
     expect(parseGroupCreationDefaults({ tag: '   ' })).toEqual({});
   });
   it('keeps unknown --flags as group-name content and does not raise', () => {
@@ -24,7 +24,7 @@ describe('/g customization', () => {
     expect(parseGroupCreationArgs('项目\n正文 --rfc 建议').name).toBe('项目');
     expect(parseGroupCreationArgs('--oops value Project').name).toBe('--oops value Project');
     expect(parseGroupCreationArgs('--notaknownflag Work --tag Keep')).toEqual({
-      name: '--notaknownflag Work', tag: 'Keep', roleProfileId: undefined,
+      name: '--notaknownflag Work', body: '--notaknownflag Work', tag: 'Keep', roleProfileId: undefined,
     });
   });
   it('does not treat known-flag prefixes fused with other characters as flags', () => {
@@ -33,7 +33,7 @@ describe('/g customization', () => {
     expect(parseGroupCreationArgs('Project --avatar:off').name).toBe('Project --avatar:off');
     expect(parseGroupCreationArgs('Project --no-tag.foo').name).toBe('Project --no-tag.foo');
     expect(parseGroupCreationArgs('Project --no-agents.x').name).toBe('Project --no-agents.x');
-    expect(parseGroupCreationArgs('Project --tagged')).toEqual({ name: 'Project --tagged', roleProfileId: undefined });
+    expect(parseGroupCreationArgs('Project --tagged')).toEqual({ name: 'Project --tagged', body: 'Project --tagged', roleProfileId: undefined });
   });
   it('rejects malformed values that fuse into the next token (no partial consumption)', () => {
     expect(() => parseGroupCreationArgs('Project --tag="A"suffix')).toThrow(/Malformed value for --tag/);
@@ -42,20 +42,20 @@ describe('/g customization', () => {
     // The last case is intentional: `A--avatar=name` is a legal unquoted value
     // ending on EOF, so it is accepted whole and preserved as tag content.
     expect(parseGroupCreationArgs('Project --tag=A--avatar=name')).toEqual({
-      name: 'Project', tag: 'A--avatar=name', roleProfileId: undefined,
+      name: 'Project', body: 'Project', tag: 'A--avatar=name', roleProfileId: undefined,
     });
   });
   it('treats bare -- as end-of-options but preserves --=xxx and --<nonboundary>', () => {
     expect(parseGroupCreationArgs('-- 项目名 --tag Keep').name).toBe('项目名 --tag Keep');
     expect(parseGroupCreationArgs('--tag Keep -- 项目 --avatar name')).toEqual({
-      name: '项目 --avatar name', tag: 'Keep', roleProfileId: undefined,
+      name: '项目 --avatar name', body: '项目 --avatar name', tag: 'Keep', roleProfileId: undefined,
     });
     // `--=foo` and `--=` are NOT the sentinel; they stay in the body.
     expect(parseGroupCreationArgs('Project --=foo').name).toBe('Project --=foo');
     expect(parseGroupCreationArgs('Project --=').name).toBe('Project --=');
   });
   it('accepts --avatar logo and logo defaults', () => {
-    expect(parseGroupCreationArgs('Project --avatar logo')).toEqual({ name: 'Project', avatar: 'logo', roleProfileId: undefined });
+    expect(parseGroupCreationArgs('Project --avatar logo')).toEqual({ name: 'Project', body: 'Project', avatar: 'logo', roleProfileId: undefined });
     expect(parseGroupCreationDefaults({ avatar: 'logo' })).toEqual({ avatar: 'logo' });
   });
   it.each([
@@ -108,5 +108,100 @@ describe('formatSlashGroupName', () => {
     const long = formatSlashGroupName('😀'.repeat(60));
     expect(long.endsWith('…')).toBe(true);
     expect(long.length).toBeLessThanOrEqual(51);
+  });
+});
+
+describe('/g task mode (opt-in: --start / autoStart: true; --no-start overrides)', () => {
+  it('keeps the whole multi-line body without the options', () => {
+    const args = parseGroupCreationArgs('修复价格展示 --tag Work\n第二行细节');
+    expect(args.autoStart).toBeUndefined();
+    expect(args.tag).toBe('Work');
+    expect(args.body).toBe('修复价格展示\n第二行细节');
+  });
+  it('--no-start turns task mode off for one command and takes no value', () => {
+    expect(parseGroupCreationArgs('--no-start 项目群', { autoStart: true })).toMatchObject({ autoStart: false, name: '项目群' });
+    expect(() => parseGroupCreationArgs('--no-start=yes 任务')).toThrow(/takes no value/);
+    expect(() => parseGroupCreationArgs('--no-start --no-start 任务')).toThrow(/Duplicate option/);
+  });
+  it('reads options from the first line only; later task lines stay verbatim', () => {
+    const task = '排查镜像构建失败\n复现：docker build --tag app:dev .\n还原：git checkout -- src/foo.ts\n对比 --tag 和 --tag=x、--avatar off、--agents a,b、--no-start';
+    const args = parseGroupCreationArgs(task);
+    expect(args).toMatchObject({ name: '排查镜像构建失败', body: task });
+    expect(args.tag).toBeUndefined();
+    expect(args.avatar).toBeUndefined();
+    expect(args.agents).toBeUndefined();
+    expect(args.autoStart).toBeUndefined();
+    expect(parseGroupCreationArgs(`--tag Work ${task}`)).toMatchObject({ tag: 'Work', body: task });
+    // Options-only first line: the name falls through to the task's first line.
+    expect(parseGroupCreationArgs('--no-start\n项目群\n--tag x')).toMatchObject({ autoStart: false, name: '项目群', body: '项目群\n--tag x' });
+  });
+  it('task mode stays off unless asked for: no default, --start opts one command in', () => {
+    expect(parseGroupCreationArgs('支付排障').autoStart).toBeUndefined();
+    expect(parseGroupCreationArgs('--start 任务')).toMatchObject({ autoStart: true, name: '任务', body: '任务' });
+    expect(parseGroupCreationArgs('任务 --start', { autoStart: false }).autoStart).toBe(true);
+    expect(() => parseGroupCreationArgs('--start=yes 任务')).toThrow(/takes no value/);
+    expect(() => parseGroupCreationArgs('--start --no-start 任务')).toThrow(/Duplicate option/);
+  });
+  it('groupCommandStartsTask: only a /g that will start a task (routing accepts multi-line only then)', () => {
+    expect(groupCommandStartsTask('/g 修复价格\n第二行', undefined)).toBe(false);
+    expect(groupCommandStartsTask('/g 修复价格\n第二行', { avatar: 'name' })).toBe(false);
+    expect(groupCommandStartsTask('/g --start 修复价格\n第二行', undefined)).toBe(true);
+    expect(groupCommandStartsTask('/GROUP 修复价格 --start', undefined)).toBe(true);
+    expect(groupCommandStartsTask('/g 修复价格\n第二行', { autoStart: true })).toBe(true);
+    expect(groupCommandStartsTask('/g --no-start 项目群\n说明', { autoStart: true })).toBe(false);
+    // Options live on the first line only, so a later `--start` is task text.
+    expect(groupCommandStartsTask('/g 修复价格\n--start', undefined)).toBe(false);
+    expect(groupCommandStartsTask('/gx --start 任务', undefined)).toBe(false);
+    expect(groupCommandStartsTask('修复 /g --start', undefined)).toBe(false);
+    // Unparseable options or defaults fall back to the legacy routing.
+    expect(groupCommandStartsTask('/g --start --start 任务', undefined)).toBe(false);
+    expect(groupCommandStartsTask('/g 任务\n细节', { autoStart: 'yes' })).toBe(false);
+  });
+  it('validates autoStart in bot defaults', () => {
+    expect(parseGroupCreationDefaults({ autoStart: false })).toEqual({ autoStart: false });
+    expect(() => parseGroupCreationDefaults({ autoStart: 'yes' })).toThrow(/autoStart/);
+  });
+});
+
+describe('/g multiline routing uses the shared first-mentioned creator, never receiver defaults', () => {
+  const text = '/g 排查价格\n第二行细节';
+  const A = { botName: 'A', groupCreation: { autoStart: false } };
+  const B = { botName: 'B', groupCreation: { autoStart: true } };
+  const route = (ownDefaults: unknown, mentions: Array<Record<string, string>>, knownBots = [A, B], commandText = text) =>
+    groupCommandStartsTaskForRouting({ commandText, ownDefaults, mentions, knownBots });
+
+  it('is identical with opposite receiver defaults in either creator order', () => {
+    for (const own of [{ autoStart: false }, { autoStart: true }]) {
+      expect(route(own, [{ name: 'A', openId: 'ou_A_receiver_1' }, { name: 'B' }])).toBe(false);
+      expect(route(own, [{ name: 'B', openId: 'ou_B_receiver_2' }, { name: 'A' }])).toBe(true);
+    }
+  });
+
+  it('honors explicit switches and preserves no-mention behavior', () => {
+    expect(route({ autoStart: false }, [{ name: 'A' }, { name: 'B' }], [A, B], '/g --start 任务\n细节')).toBe(true);
+    expect(route({ autoStart: true }, [{ name: 'B' }], [A, B], '/g --no-start 群名\n说明')).toBe(false);
+    expect(route({ autoStart: true }, [])).toBe(true);
+    expect(route({ autoStart: false }, [])).toBe(false);
+    // Human mentions do not displace the first known bot; human-only mentions
+    // leave this daemon as creator, matching handleCommand's election input.
+    expect(route({ autoStart: false }, [{ name: 'human' }, { name: 'B' }])).toBe(true);
+    expect(route({ autoStart: true }, [{ name: 'human' }])).toBe(true);
+  });
+
+  it('fails closed for implicit task mode with an empty registry or ambiguous duplicate names', () => {
+    for (const own of [{ autoStart: false }, { autoStart: true }]) {
+      expect(route(own, [{ name: 'A' }], [])).toBe(false);
+      expect(route(own, [{ name: 'A' }], [], '/g --start 任务\n细节')).toBe(true);
+      expect(route(own, [{ name: 'A' }], [A, { botName: 'a', groupCreation: { autoStart: true } }])).toBe(false);
+      expect(route(own, [{ name: 'A' }], [
+        { botName: 'A', groupCreation: { autoStart: true } },
+        { botName: 'a', groupCreation: { autoStart: true } },
+      ])).toBe(true);
+    }
+  });
+
+  it('does not reinterpret non-/g text', () => {
+    expect(route({ autoStart: true }, [], [A, B], '/gx --start 任务\n细节')).toBe(false);
+    expect(route({ autoStart: true }, [], [A, B], '普通文本')).toBe(false);
   });
 });

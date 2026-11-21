@@ -11,10 +11,10 @@ Inside a botmux session, the AI talks to Lark (sending messages, reading history
 Lark message ──▶ botmux ──▶ AI inside the CLI
                               │  reads Skills, knows how to reply
                               ▼
-Lark topic   ◀── botmux ◀── botmux send "…"
+Lark topic   ◀── botmux ◀── final reply (forwarded) / botmux send "…"
 ```
 
-So when "the terminal shows output but nothing reaches Lark", the AI usually didn't run `botmux send`. See [FAQ · C](/en/faq#c-terminal-has-output-but-nothing-reached-lark).
+For CLIs whose session record botmux can read (Claude Code, Codex, TraeX and others), botmux posts the final reply to Lark by default; the AI runs `botmux send` only to @ another bot, send attachments or cards, or post to another chat or topic. Other CLIs still need the AI to `botmux send` itself. If "the terminal shows output but nothing reaches Lark", see [FAQ · C](/en/faq#c-terminal-has-output-but-nothing-reached-lark).
 
 ## Commands available in a session
 
@@ -56,17 +56,17 @@ A few rules:
 - To drop the "must pick one of three" requirement, set `BOTMUX_REQUIRE_MENTION_DECISION=false`.
 - Pass multi-line content with a heredoc (as above) or `--content-file`, not `"line one\nline two"`.
 
-## Don't want the AI to send replies itself?
+## When doesn't the AI send replies itself?
 
 In three cases botmux sends the final reply to Lark for you, and the AI doesn't need `botmux send`:
 
 | Case | What happens |
 |------|------|
+| `replyDelivery: "transcript"` (default for CLIs whose transcripts botmux can read) | botmux takes the last answer of the turn from the CLI's transcript and sends it. `botmux send` is kept for @-ing another bot, attachments or cards, and posting to another chat or topic; the prompt asks the model not to use it for progress |
 | `codex-app` (Codex App protocol) | The final reply is forwarded automatically. Use `botmux send` only for mid-turn progress, attachments, or @-ing another bot |
-| `replyDelivery: "transcript"` | botmux takes the last answer of the turn from the CLI's transcript and sends it. The prompt stops mentioning `botmux send` |
 | `promptInjection: "none"` (zero injection) | botmux adds nothing to the prompt and injects no Skills; the final answer is sent back automatically |
 
-The last two only work with CLIs whose transcripts botmux can read. See [bots.json](/en/bots-json) for setup.
+`transcript` and zero injection only work with CLIs whose transcripts botmux can read. To keep the model sending replies itself, set `replyDelivery: "send"` explicitly in the bot config; see [bots.json](/en/bots-json).
 
 ## Built-in Skills
 

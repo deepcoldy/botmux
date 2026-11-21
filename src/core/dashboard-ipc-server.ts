@@ -127,7 +127,7 @@ import {
   SchedulePreconditionError,
 } from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
-import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage } from '../services/request-bound-group-send.js';
+import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage, sendRequestBoundMessage, type GroupSendInput } from '../services/request-bound-group-send.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
@@ -167,12 +167,15 @@ import {
 } from '../cli/current-actor.js';
 import {
   CURRENT_EXECUTION_ROUTE,
+  CURRENT_EXECUTION_CLI_FIELD,
   CURRENT_EXECUTION_ORIGIN_FIELD,
   CURRENT_EXECUTION_SCHEMA,
   CURRENT_EXECUTION_IDENTITY_ROUTE,
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
 } from '../cli/current-execution.js';
 import { resolveDaemonCurrentExecution } from './current-execution.js';
+import { configuredCliExecutionMode, sessionCliExecutionInfo } from './cli-execution-mode.js';
+import { getDashboardAdminOpenIds } from '../bot-registry.js';
 import {
   attestCurrentExecutionLoopbackPeer,
   currentTurnPeerAttestationStable,
@@ -221,6 +224,7 @@ import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptRepl
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn-reply-card.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
+import { FEEDBACK_SEND_LEASE_ROUTE, handleFeedbackSendLeaseRelay } from '../services/feedback-send-lease-relay.js';
 import {
   emptyLinkRefExtractionStats,
   LINK_REF_REGISTER_MAX_BODY_BYTES,
@@ -243,6 +247,7 @@ import {
 import { coordinationModeIsPrimary } from '../services/durable-coordination-runtime.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
+import { parseSessionTurnsPage, readSessionTurns } from '../services/session-turns.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
 import {
   findQuotaFallbackCycle,
@@ -280,12 +285,14 @@ import {
 import { findOnlineDaemon, listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { ensureBotChatGrantMatrix } from '../cli/exact-chat-grant-client.js';
 import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
+import { HOST_POST_MAX_BODY_BYTES, HOST_POST_PATH, hostPostRequest } from './host-post-request.js';
 import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { updateMessage, sendUserMessage, sendEphemeralCard } from '../im/lark/client.js';
+import { updateMessage, sendUserMessage, sendEphemeralCard, isCurrentBotInChat, lookupMessageChatId } from '../im/lark/client.js';
 import { deliverAuthLink, type AuthLinkDelivery } from './auth-link-delivery.js';
 import { AUTH_PROVIDERS, PROVIDER_LABEL, deliverProviderLink, platformAuthLink, requestProviderAuth, type AuthProvider, type ProviderAuthResult } from './provider-auth-request.js';
+import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
 import { completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge, startBytedcliLogin } from '../services/bytedcli-auth.js';
@@ -375,8 +382,10 @@ import { DEFAULT_LONG_TASK_REMINDER } from '../services/long-task-reminder-polic
 import { updateLongTaskReminderConfig } from '../services/long-task-reminder-config-store.js';
 import {
   selectIdleSuspendCandidates,
+  suspendSelectedIdleCandidatesAfterTurnDrain,
   sweepIdleWorkersByAgeAfterTurnDrain,
 } from './idle-worker-sweeper.js';
+import { parseTmuxSwitchSuspendRequest, selectTmuxSwitchCandidates } from './tmux-switch-candidates.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
@@ -607,7 +616,7 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope, isValidLarkScopeSyntax } from '../utils/lark-scope-catalog.js';
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
-import { isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import {
   resolveRegisteredBackgroundContext,
   backgroundContextStillValid,
@@ -1310,7 +1319,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-send-lease|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1639,7 +1648,9 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   if (!peer.ok) return jsonRes(res, 403, blocked);
   const document = resolveDaemonCurrentExecution(
     { sessionId, peer: peer.peer, findSession: findActiveBySessionId },
-    { includeOrigin },
+    { includeOrigin, includeCli: Array.isArray(fields) && fields.includes(CURRENT_EXECUTION_CLI_FIELD),
+      cliExecution: ds => sessionCliExecutionInfo(ds, getBot(ds.larkAppId).config,
+        getDashboardAdminOpenIds(ds.larkAppId)) },
   );
   return document ? jsonRes(res, 200, document) : jsonRes(res, 403, blocked);
 });
@@ -1737,6 +1748,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // Without `BOTMUX_AS` the call runs as the turn principal; the speakers of the turn only validate a named one.
     let policy: TriggerUserAuthConfig | undefined;
     try { policy = getBot(ds.larkAppId).config.triggerUserAuth; } catch { /* bot missing: nothing is governed */ }
+    if (!allowsPersonalIdentityForTurn(identityTurnId, policy)) return jsonRes(res, 403, blocked('unattended_turn'));
     const governed = governedSpeakers({
       policy, tool, sessionDataDir: config.session.dataDir, sessionId,
       origin: { identityTurnId, speakers: ds.managedTurnOrigin?.speakers },
@@ -1893,6 +1905,10 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
+    scheduledControlActorMode: ds => {
+      try { return configuredCliExecutionMode(getBot(ds.larkAppId).config); }
+      catch { return 'managed'; }
+    },
     ...(expectedScheduledTurnId ? { expectedScheduledTurnId } : {}),
   });
   return result.ok
@@ -2470,6 +2486,30 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
   } catch (error) {
     return jsonRes(res, 409, { ok: false, error: error instanceof Error ? error.message : String(error) });
   }
+});
+
+/** Feedback send lease for an isolated CLI that cannot take it in-process
+ * (see acquireFeedbackSendLeaseFor); bound to the authenticated session. */
+ipcRoute('POST', `/api/sessions/:sessionId/${FEEDBACK_SEND_LEASE_ROUTE}`, async (req, res, params) => {
+  let body: Record<string, unknown> | undefined;
+  try { body = await readJsonBody<Record<string, unknown>>(req, 4096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  // Release uses the lease-scoped credential returned at acquisition, not the
+  // origin turn's current capability. The handler verifies its persisted hash
+  // together with the exact lease/pid/session, so rotation, session close and
+  // daemon restart cannot strand an already-delivered send.
+  if (body.action === 'release') {
+    const result = handleFeedbackSendLeaseRelay(config.session.dataDir, params.sessionId, body);
+    return jsonRes(res, result.status, result.body);
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  // Managed meeting sends originate in a receiver session too. This route only
+  // guards feedback maintenance; it does not perform a managed session action.
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
+  if (!auth.ok || !ds) return jsonRes(res, 403, { ok: false, error: auth.ok ? 'session_not_active' : auth.error });
+  const result = handleFeedbackSendLeaseRelay(config.session.dataDir, ds.session.sessionId, body);
+  return jsonRes(res, result.status, result.body);
 });
 
 ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, params) => {
@@ -3478,6 +3518,50 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
   return jsonRes(res, 400, { ok: false, error: 'bad_mode' });
 });
 
+/**
+ * tmux upgrade: suspend (or, with dryRun, only count) THIS daemon's idle tmux
+ * sessions on the server being replaced, so it can empty out and be recreated
+ * from the upgraded binary. Driven by the primary daemon's tmux-upgrade card /
+ * idle-switch monitor, which fans this out to every online daemon.
+ *
+ * Execution goes through the same bot-turn mutation gate and per-candidate
+ * re-check as the maintenance idle sweep: a session that starts a turn while
+ * earlier candidates are being suspended is skipped, never interrupted. A busy
+ * gate answers 409 so the caller counts this daemon as not done.
+ */
+ipcRoute('POST', '/api/tmux-upgrade/suspend-idle', async (req, res) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res);
+  if (body === BAD_JSON) return;
+  const request = parseTmuxSwitchSuspendRequest(body);
+  if (!request) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const registry = getActiveSessionsRegistry();
+  if (!registry) return jsonRes(res, 503, { ok: false, error: 'session_registry_unavailable' });
+  const socketName = request.socketName ?? undefined;
+  const candidates = selectTmuxSwitchCandidates(registry, { socketName, olderThanMs: request.olderThanMs });
+  if (request.dryRun) return jsonRes(res, 200, { ok: true, candidates: candidates.length, affected: 0 });
+  if (candidates.length === 0) return jsonRes(res, 200, { ok: true, candidates: 0, affected: 0 });
+  const runtimeAppIds = new Set([...registry.values()].map(ds => ds.larkAppId).filter(Boolean));
+  // The turn-mutation gate is per app. Never drain one bot while acting on a
+  // mixed/transferred registry: fail closed exactly like the maintenance sweep.
+  if (runtimeAppIds.size > 1
+    || (cachedLarkAppId && runtimeAppIds.size === 1 && !runtimeAppIds.has(cachedLarkAppId))) {
+    return jsonRes(res, 409, { ok: false, error: 'ambiguous_daemon_scope' });
+  }
+  const larkAppId = cachedLarkAppId || (runtimeAppIds.size === 1 ? [...runtimeAppIds][0] : undefined);
+  if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'daemon_scope_unavailable' });
+  const selected = new Set(candidates.map(c => c.sessionId));
+  const result = await suspendSelectedIdleCandidatesAfterTurnDrain(larkAppId, registry, selected, {
+    olderThanMs: request.olderThanMs,
+    reason: 'tmux_upgrade_switch',
+  });
+  if (result === null) return jsonRes(res, 409, { ok: false, error: 'mutation_gate_busy' });
+  for (const failure of result.failures) {
+    logger.info(`[tmux-upgrade] not suspended ${failure.candidate.sessionId.slice(0, 8)}: ${failure.error}`);
+  }
+  logger.info(`[tmux-upgrade] suspended ${result.suspended.length}/${candidates.length} idle tmux session(s) for the server switch`);
+  return jsonRes(res, 200, { ok: true, candidates: candidates.length, affected: result.suspended.length });
+});
+
 /** 会话级 CLI IPC（slash/cd）的调用方证明：trusted-host（.dashboard-secret HMAC，
  *  外层 gate 已验）直接放行；否则（沙箱/读隔离 CLI 读不到 secret，走
  *  routeHasNarrowUntrustedAuth 窄孔进来）必须出示该会话当前轮换的 capability，
@@ -4350,6 +4434,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     return jsonRes(res, 403, { ok: false, error: 'lark_tool_user_transport_required' });
   }
   if (body.mode === 'bot') {
+    // sandboxWithholdBotSecret: the sandbox must not hold an app-identity
+    // credential in any form, including the tenant token lark-cli would get here.
+    const botSecretWithheld = ds
+      ? ds.session.sandboxWithholdBotSecret === true
+      : detachedScheduled?.session.sandboxWithholdBotSecret === true;
+    if (botSecretWithheld) {
+      return jsonRes(res, 403, { ok: false, error: 'lark_tool_bot_identity_withheld' });
+    }
     let token: unknown;
     try {
       // The app-bound SDK caches TATs and refreshes them before expiry. Resolve
@@ -4417,6 +4509,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     });
   }
   const identityTurnId = liveOrigin?.identityTurnId;
+  if (!allowsPersonalIdentityForTurn(identityTurnId ?? turnId, bot.triggerUserAuth)) {
+    return jsonRes(res, 403, { ok: false, error: 'unattended_turn' });
+  }
   if (process.platform === 'linux' && !execution && !detachedForUser) {
     return jsonRes(res, 403, { ok: false, error: 'current_execution_unverified' });
   }
@@ -4587,6 +4682,9 @@ async function handleProviderAuthRequest(
     return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
   }
   const turnId = origin.identityTurnId ?? origin.turnId;
+  if (!allowsPersonalIdentityForTurn(turnId, cfg.triggerUserAuth)) {
+    return jsonRes(res, 403, { ok: false, error: 'unattended_turn' });
+  }
   if (!capabilityOn(cfg.triggerUserAuth, provider === 'meego' ? 'meego' : provider === 'lark-cli' ? 'lark-user' : 'bytecloud')) {
     return jsonRes(res, 409, {
       ok: false, status: 'refused', error: 'native_capability',
@@ -4834,6 +4932,7 @@ for (const action of ['auth-request', 'auth-status']) {
       const liveOrigin = ds.managedTurnOrigin;
       if (!liveOrigin?.turnId) return undefined;
       const liveIdentityTurnId = liveOrigin.identityTurnId ?? liveOrigin.turnId;
+      if (!allowsPersonalIdentityForTurn(liveIdentityTurnId, getBot(ds.larkAppId).config.triggerUserAuth)) return undefined;
       const grant = currentLarkToolDelegation(config.session.dataDir, params.sessionId, liveIdentityTurnId);
       if (!grant) {
         // `BOTMUX_AS` names the speaker asked; else the turn principal.
@@ -7060,6 +7159,17 @@ ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req
 // 与输出永不进结构。detail=summary 只返聚合+建议（/insight 卡片、抽屉概览用）；
 // detail=spans 才带脱敏 span（详情 tab 用）。owner-only 由 dashboard 外层 authed-only
 // 路由 + /insight 命令层把关，IPC 自身 loopback-trusted。
+ipcRoute('GET', '/api/sessions/:sessionId/turns', (req, res, params) => {
+  const session = findSessionRecord(params.sessionId);
+  if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  const page = parseSessionTurnsPage(new URL(req.url ?? '/', 'http://localhost').searchParams);
+  if (!page) return jsonRes(res, 400, { ok: false, error: 'invalid_turns_cursor_or_limit' });
+  res.setHeader('cache-control', 'no-store');
+  return jsonRes(res, 200, session.status === 'closed'
+    ? readSessionTurns(config.session.dataDir, params.sessionId, page.since, 0)
+    : readSessionTurns(config.session.dataDir, params.sessionId, page.since, page.limit));
+});
+
 ipcRoute('GET', '/api/sessions/:sessionId/insight', (req, res, params) => {
   const session = findSessionRecord(params.sessionId);
   if (!session) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
@@ -8735,7 +8845,10 @@ ipcRoute('DELETE', '/api/schedules/:id', requireBoundBot((_req, res, p) => {
   }
 }, NOT_BOUND_BODY.okFalse));
 
-ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
+async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, ownerActorEndpoint: boolean): Promise<void> {
+  if (ownerActorEndpoint && !isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
+  }
   const activeSessions = getActiveSessionsRegistry();
   if (!activeSessions) return jsonRes(res, 503, { ok: false, errorCode: 'trigger_failed', error: 'active session registry unavailable' });
   let body: unknown;
@@ -8746,6 +8859,9 @@ ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
   }
   const valid = validateTriggerRequest(body);
   if (!valid.ok) return jsonRes(res, valid.status, valid.body);
+  if (ownerActorEndpoint !== (valid.request.actor === 'owner')) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
+  }
   if (valid.request.target.botId && valid.request.target.botId !== cachedLarkAppId) {
     return jsonRes(res, 400, {
       ok: false,
@@ -8783,7 +8899,9 @@ ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
         ? 200
       : result.errorCode === 'idempotency_conflict'
         ? 409
-      : result.errorCode === 'bot_not_in_chat'
+      : ownerActorEndpoint && result.errorCode === 'session_not_runnable'
+        ? 409
+      : result.errorCode === 'bot_not_in_chat' || result.errorCode === 'owner_unresolved'
         ? 403
         : result.errorCode === 'session_not_found'
           ? 404
@@ -8796,7 +8914,11 @@ ipcRoute('POST', '/api/trigger', requireBoundBot(async (req, res) => {
   } catch (e: any) {
     return jsonRes(res, 500, { ok: false, errorCode: 'trigger_failed', error: e?.message ?? String(e) });
   }
-}, { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' }));
+}
+
+const unboundTriggerResponse = { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' };
+ipcRoute('POST', '/api/trigger', requireBoundBot((req, res) => handleTriggerIpc(req, res, false), unboundTriggerResponse));
+ipcRoute('POST', '/api/trigger/owner', requireBoundBot((req, res) => handleTriggerIpc(req, res, true), unboundTriggerResponse));
 
 // ─── Exact chat grants (talk-only) ─────────────────────────────────────────
 
@@ -9210,6 +9332,77 @@ ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, r
   }
 }));
 
+function postBoundGroupMessage(larkAppId: string, input: GroupSendInput, beforeAttempt?: () => Promise<void>) {
+  return sendRequestBoundGroupMessage({
+    larkAppId, storePath: groupSendStorePath(larkAppId), beforeAttempt,
+    send: (chatId, text, uuid, beforeWrite) => sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: true, beforeWrite }),
+    onCommitted: (payload) => emitHookEventLocal('outbound.send', { ...payload }),
+  }, input);
+}
+
+class HostPostDestinationError extends Error {
+  constructor(readonly status: number, message: string, readonly providerCode?: number) { super(message); }
+}
+
+async function checkHostPostDestination(larkAppId: string, chatId: string, rootMessageId?: string) {
+  try {
+    if (!await isCurrentBotInChat(larkAppId, chatId)) throw new HostPostDestinationError(403, 'bot_not_in_chat');
+    if (rootMessageId) {
+      const owner = await lookupMessageChatId(larkAppId, rootMessageId, { timeoutMs: 10_000 });
+      if (!owner) throw new HostPostDestinationError(404, 'topic_not_visible');
+      if (owner !== chatId) throw new HostPostDestinationError(409, 'topic_chat_mismatch');
+    }
+  } catch (error) {
+    if (error instanceof HostPostDestinationError) throw error;
+    throw new HostPostDestinationError(502, 'destination_lookup_failed', extractLarkBusinessCode(error));
+  }
+}
+
+ipcRoute('POST', HOST_POST_PATH, requireBoundBot(async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBodyOrBadJson(req, res, HOST_POST_MAX_BODY_BYTES);
+  if (body === BAD_JSON) return;
+  const parsed = hostPostRequest.safeParse(body);
+  if (!parsed.success) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  const { larkAppId, text, requestId, ...target } = parsed.data;
+  const { chatId, rootMessageId, userOpenId } = target;
+  // Discovery can race an IPC port being reused. The bound Bot must match.
+  if (larkAppId !== cachedLarkAppId) return jsonRes(res, 409, { ok: false, error: 'bot_mismatch' });
+  if (getBot(larkAppId).config.apiOnly) return jsonRes(res, 400, { ok: false, error: 'lark_transport_disabled' });
+  const beforeAttempt = chatId ? () => checkHostPostDestination(larkAppId, chatId, rootMessageId) : undefined;
+  try {
+    const result = chatId && !rootMessageId
+      ? await postBoundGroupMessage(larkAppId, { chatId, requestId, content: text }, beforeAttempt)
+      : await sendRequestBoundMessage({
+        larkAppId,
+        beforeAttempt,
+        // Keep legacy group records readable by older daemons after a downgrade.
+        storePath: join(config.session.dataDir, `host-posts-${larkAppId}.json`),
+        send: (uuid, beforeWrite, onAttemptStart) => userOpenId !== undefined
+          ? sendUserMessage(larkAppId, userOpenId, text, 'text', uuid, undefined, { beforeWrite })
+          : replyMessage(larkAppId, rootMessageId!, text, 'text', true, uuid, { chatId }, { suppressHook: true, beforeWrite, onAttemptStart }),
+        onCommitted: (replyId, uuid) => {
+          if (rootMessageId) emitHookEventLocal('outbound.reply', {
+            larkAppId, chatId, messageId: rootMessageId, replyId, uuid, requestId,
+            content: text, msgType: 'text', replyInThread: true,
+          });
+        },
+      }, target, requestId, text);
+    if (!result.ok) {
+      const error = result.error === 'send_failed' && result.retryable ? 'outcome_unknown' : result.error;
+      return jsonRes(res, result.status, { ok: false, error, retryable: result.retryable ?? false, requestId,
+        ...('providerCode' in result ? { providerCode: result.providerCode } : {}), });
+    }
+    return jsonRes(res, 200, { ok: true, larkAppId, ...target, messageId: result.messageId, requestId, replayed: result.replayed });
+  } catch (error) {
+    if (error instanceof HostPostDestinationError) {
+      return jsonRes(res, error.status, { ok: false, error: error.message, retryable: error.status === 502, providerCode: error.providerCode, requestId });
+    }
+    logger.warn(`[host-post] store unavailable: ${error instanceof Error ? error.message : String(error)}`);
+    return jsonRes(res, 503, { ok: false, error: 'outcome_unknown', requestId, retryable: true });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
 /**
  * Request-bound send (see services/request-bound-group-send.ts): body exactly
  * `{requestId, content}` (plain text). Returns `{ok, messageId, replayed}`.
@@ -9227,11 +9420,7 @@ ipcRoute('POST', '/api/groups/:chatId/messages', requireBoundBot(async (req, res
   if (!input) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
   const larkAppId = cachedLarkAppId;
   try {
-    const result = await sendRequestBoundGroupMessage({
-      larkAppId, storePath: groupSendStorePath(larkAppId),
-      send: (chatId, text, uuid) => sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: true }),
-      onCommitted: (payload) => emitHookEventLocal('outbound.send', { ...payload }),
-    }, { chatId: p.chatId, ...input });
+    const result = await postBoundGroupMessage(larkAppId, { chatId: p.chatId, ...input });
     const { status, ...rest } = result;
     return jsonRes(res, status, rest);
   } catch (e) {
@@ -10478,6 +10667,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
   const sandboxPathsForDashboard = sandboxStore.getBotSandboxPaths(cachedLarkAppId);
   jsonRes(res, 200, {
     larkAppId: cachedLarkAppId,
+    apiOnly: getBot(cachedLarkAppId).config.apiOnly === true,
     botName: getBotName(),
     displayName,
     larkBotName,
@@ -10619,6 +10809,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     disableStreamingCard: cardPrefs.disableStreamingCard,
     replyCardMode: cardPrefs.replyCardMode,
     hiddenStreamingCardButtons: cardPrefs.hiddenStreamingCardButtons,
+    streamingCardFoldedLayout: cardPrefs.streamingCardFoldedLayout,
     pinStreamingCard: cardPrefs.pinStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
@@ -10630,7 +10821,6 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     replyCardActions: cardPrefs.replyCardActions,
     replyCardNextStep: cardPrefs.replyCardNextStep,
     replyCardRecap: cardPrefs.replyCardRecap,
-    replyCardRecapModel: cardPrefs.replyCardRecapModel,
     cotEnabled: cardPrefs.cotEnabled,
     replyCardShowTools: cardPrefs.replyCardShowTools,
     replyCardNativeCot: cardPrefs.replyCardNativeCot,
@@ -10675,6 +10865,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     grantRequestToOwnerDm: grantPrefs.grantRequestToOwnerDm,
     trustSameOwnerBots: grantPrefs.trustSameOwnerBots,
     grantDelegateBots: grantPrefs.grantDelegateBots,
+    scheduleCreateByTalkers: grantPrefs.scheduleCreateByTalkers,
     messageQuotaDefaultLimit: grantPrefs.messageQuotaDefaultLimit,
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
@@ -10702,6 +10893,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     defaultPassthroughCommands: [...resolvePassthroughCommands(cachedLarkAppId, undefined, false)],
     customPassthroughCommands,
     canTalkDaemonCommands,
+    bareRenamePassthrough: getBot(cachedLarkAppId).config.bareRenamePassthrough === true,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
     envRevision,
@@ -10795,7 +10987,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; replyCardRecapModel?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; streamingCardFoldedLayout?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -10817,7 +11009,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; replyCardRecapModel?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; streamingCardFoldedLayout?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -10845,6 +11037,12 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     patch.replyCardMode = body.replyCardMode;
   }
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
+  if (body.streamingCardFoldedLayout !== undefined) {
+    if (typeof body.streamingCardFoldedLayout !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_streaming_card_folded_layout' });
+    }
+    patch.streamingCardFoldedLayout = body.streamingCardFoldedLayout;
+  }
   if (Array.isArray(body.hiddenStreamingCardButtons)
       && body.hiddenStreamingCardButtons.every(isStreamingCardButtonId)) {
     patch.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(body.hiddenStreamingCardButtons) ?? [];
@@ -10887,7 +11085,6 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
   if (typeof body.replyCardNextStep === 'boolean') patch.replyCardNextStep = body.replyCardNextStep;
   if (typeof body.replyCardRecap === 'boolean') patch.replyCardRecap = body.replyCardRecap;
-  if (typeof body.replyCardRecapModel === 'boolean') patch.replyCardRecapModel = body.replyCardRecapModel;
   if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
   // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
@@ -11031,6 +11228,7 @@ ipcRoute('PUT', '/api/bot-summary-range', requireBoundBot(async (req, res) => {
 //   • grantDefaultDurationMs: number|null   — 新授权默认有限时长（null = 产品默认 1 小时）
 //   • trustSameOwnerBots: boolean          — 信任同一 owner 的同机 Bot（管理命令 + 点名授权）
 //   • grantDelegateBots: string[]|null     — 委托授权外部 bot 名单（ou_/cli_）；[]/null = 清空
+//   • scheduleCreateByTalkers: boolean     — 允许只能对话的真人为自己创建定时任务（默认关）
 ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
   const raw = await readJsonBodyOrBadJson<unknown>(req, res);
   if (raw === BAD_JSON) return;
@@ -11047,6 +11245,7 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantDefaultDurationMs?: unknown;
     trustSameOwnerBots?: unknown;
     grantDelegateBots?: unknown;
+    scheduleCreateByTalkers?: unknown;
   };
 
   const patch: {
@@ -11058,12 +11257,14 @@ ipcRoute('PUT', '/api/bot-grant-prefs', requireBoundBot(async (req, res) => {
     grantDefaultDurationMs?: number | null;
     trustSameOwnerBots?: boolean;
     grantDelegateBots?: string[];
+    scheduleCreateByTalkers?: boolean;
   } = {};
   if (typeof body.restrictGrantCommands === 'boolean') patch.restrictGrantCommands = body.restrictGrantCommands;
   if (typeof body.autoGrantRequestCards === 'boolean') patch.autoGrantRequestCards = body.autoGrantRequestCards;
   if (typeof body.p2pOpen === 'boolean') patch.p2pOpen = body.p2pOpen;
   if (typeof body.grantRequestToOwnerDm === 'boolean') patch.grantRequestToOwnerDm = body.grantRequestToOwnerDm;
   if (typeof body.trustSameOwnerBots === 'boolean') patch.trustSameOwnerBots = body.trustSameOwnerBots;
+  if (typeof body.scheduleCreateByTalkers === 'boolean') patch.scheduleCreateByTalkers = body.scheduleCreateByTalkers;
   // null = 清空名单；字符串数组 = 设定名单（store 内 trim/去空白/去重，空名单不写盘）。
   if (body.grantDelegateBots === null) patch.grantDelegateBots = [];
   else if (Array.isArray(body.grantDelegateBots) && body.grantDelegateBots.every((x): x is string => typeof x === 'string')) {
@@ -12263,6 +12464,18 @@ botConfigPutRoute<{ canTalkDaemonCommands?: unknown }>('/api/bot-cantalk-daemon-
 // Per-bot launch-shell override launchShell。Body `{ launchShell: string }`：
 // 空字符串＝清除（回 $SHELL）。走 applyConfigField（与 /config launchShell 同一写盘
 // + 内存热更新路径），next-session 生效（下个会话起用新 shell 启动 CLI）。
+// Per-bot 裸 /rename 交给 CLI 自己起名。Body `{ bareRenamePassthrough: boolean }`；
+// 缺键或非布尔一律 400。走 applyConfigField（与 /botconfig 同一写盘 + 内存热更新路径），
+// 下一条 /rename 即生效；false 删 key，bots.json 保持干净。
+botConfigPutRoute('/api/bot-bare-rename-passthrough', 'bareRenamePassthrough', {
+  normalize: raw => {
+    const value = typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).bareRenamePassthrough : undefined;
+    return typeof value === 'boolean' ? fieldOk(value) : fieldInvalid('invalid_bare_rename_passthrough');
+  },
+  respond: value => ({ ok: true, bareRenamePassthrough: value === true }),
+});
+
 botConfigPutRoute<{ launchShell?: unknown }>('/api/bot-launch-shell', 'launchShell', {
   normalize: (body, spec) => optionalTextField(spec, body.launchShell),
   respond: value => ({ ok: true, launchShell: (value as string | null) ?? '' }),
@@ -13476,7 +13689,9 @@ ipcRoute('POST', '/api/groups/transfer-owner', requireBoundBot(async (req, res) 
   });
   let notifyMessageId: string | null = null;
   let notifyError: string | null = null;
-  if (transferred.ownerTransferredTo) {
+  // This bare @ is the deferred team-group form of the "group is ready" owner
+  // notice, so the same machine-wide switch silences it; the transfer stays.
+  if (transferred.ownerTransferredTo && config.groupOwnerNotice !== false) {
     try {
       // Feishu accepts union_id in an @ tag; keeping it stable avoids a second
       // app-scope lookup after the owner was added by another deployment.

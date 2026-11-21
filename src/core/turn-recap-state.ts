@@ -1,24 +1,19 @@
 /**
  * Keeps the「本轮回顾」panel (im/lark/turn-recap-card.ts) on the last card of
- * a session's latest turn in step with what is known about that turn.
+ * a session's latest turn in step with the CLI's own recap of that turn.
  *
  * Facts, in any order:
  *   - a turn starts (every entry point that takes over the last reply card,
  *     core/reply-card-turn-start.ts) → the previous card keeps its panel as
  *     written (a recap is history), it just stops being updated;
- *   - the worker reports what the turn did (just before its terminal) → kept
- *     for that turn until the next one starts, so a repeated terminal finds
- *     the same material;
- *   - the turn's last card has settled → the panel goes on with those facts;
- *   - the CLI writes its own recap (Claude Code's away summary, a few minutes
- *     into an idle session) → the panel is updated in place;
- *   - with the model switch on, a card that stays idle for
- *     RECAP_MODEL_IDLE_MS without a CLI recap gets one written by a small
- *     model, at most once per turn (unless the chat hides a turn's
- *     activity); a new turn or the CLI's own recap cancels the wait, and an
- *     answer arriving after either is dropped.
- * A late fact for an older turn is ignored. State lives in this process: after
- * a daemon restart a card keeps its panel but no longer gets updates.
+ *   - the turn's last card has settled → remembered as the card the panel
+ *     goes on; nothing is written to it yet;
+ *   - the CLI writes its own recap (Claude Code's away summary, minutes into
+ *     an idle session) → the panel goes on that card, or is updated in place
+ *     when a later summary of the same turn arrives.
+ * A turn the CLI never recaps gets no panel. A late fact for an older turn is
+ * ignored. State lives in this process: after a daemon restart a card keeps
+ * its panel but no longer gets updates.
  *
  * Writes for one session run one at a time. A legacy card's read-back and the
  * write that depends on it hold that card's write lock (core/card-element-writes.ts),
@@ -28,18 +23,13 @@
 import { createHash } from 'node:crypto';
 import type { DaemonSession } from './types.js';
 import { nextCardSequence, withCardWriteLock } from './card-element-writes.js';
-import { renderRecapMarkdown, type RecapFacts, type RecapTurnInput } from '../services/turn-recap.js';
+import { renderRecapMarkdown } from '../services/turn-recap.js';
 import {
   buildRecapElement,
   isDuplicateElementIdError,
   recapPlacement,
   type RecapPlacement,
 } from '../im/lark/turn-recap-card.js';
-
-/** Claude Code writes its away summary 3.1-5.0 minutes after a turn's last
- * reply (149 live samples). The optional model recap waits a little longer,
- * so it only runs for turns the CLI did not recap itself. */
-export const RECAP_MODEL_IDLE_MS = 6 * 60_000;
 
 export type RecapCard =
   | { kind: 'legacy'; messageId: string }
@@ -51,11 +41,6 @@ type InsertPlacement = Extract<RecapPlacement, { kind: 'insert' }>['placement'];
 export interface RecapIo {
   /** Bot switch for the panel, read at use time. */
   enabled(ds: DaemonSession): boolean;
-  /** Bot switch for the optional model recap (and whether this session may
-   * make that call at all), read at use time. */
-  modelEnabled(ds: DaemonSession): boolean;
-  /** Whether this chat shows a turn's activity (files, commands) at all. */
-  showFacts(ds: DaemonSession): boolean;
   locale(ds: DaemonSession): 'zh' | 'en';
   readCard(ds: DaemonSession, messageId: string): Promise<string | undefined>;
   cardId(ds: DaemonSession, messageId: string): Promise<string>;
@@ -63,18 +48,10 @@ export interface RecapIo {
     element: Record<string, unknown>, sequence: number, uuid: string): Promise<void>;
   replace(ds: DaemonSession, cardId: string, messageId: string,
     element: Record<string, unknown>, sequence: number, uuid: string): Promise<void>;
-  /** One small-model recap of `prompt`, or undefined when none could be made. */
-  modelRecap(ds: DaemonSession, prompt: string): Promise<string | undefined>;
-  setTimer(run: () => void, ms: number): () => void;
   now(): number;
   warn(message: string): void;
-}
-
-/** What the panel knows about a turn when its card settles. */
-export interface RecapCardInput {
-  facts: RecapFacts;
-  /** Undefined when the turn left nothing to recap. */
-  modelPrompt?: string;
+  /** One line per decision that changes (or keeps off) a card. */
+  info?(message: string): void;
 }
 
 interface Shown {
@@ -88,15 +65,7 @@ interface Shown {
 interface State {
   turnId?: string;
   card?: RecapCard;
-  input?: RecapCardInput;
-  /** What the worker reported per turn, until the next turn starts. */
-  reported: Map<string, RecapTurnInput>;
   cli?: { turnId: string; text: string };
-  model?: { turnId: string; text: string };
-  /** The turn a model recap was asked for: at most once per turn, whatever
-   * became of the answer. */
-  modelAttempted?: string;
-  cancelModelTimer?: () => void;
   shown?: Shown;
   chain: Promise<void>;
 }
@@ -106,7 +75,7 @@ const states = new WeakMap<DaemonSession, State>();
 function stateFor(ds: DaemonSession): State {
   let state = states.get(ds);
   if (!state) {
-    state = { reported: new Map(), chain: Promise.resolve() };
+    state = { chain: Promise.resolve() };
     states.set(ds, state);
   }
   return state;
@@ -126,66 +95,27 @@ function writeUuid(messageId: string, operation: string, sequence: number): stri
   return `rcp_${createHash('sha256').update(`${messageId}\0${operation}\0${sequence}`).digest('hex').slice(0, 40)}`;
 }
 
-function cancelModel(state: State): void {
-  state.cancelModelTimer?.();
-  state.cancelModelTimer = undefined;
-}
-
-function hasFacts(input: RecapCardInput | undefined): boolean {
-  return !!input && (input.facts.files.length > 0 || input.facts.commands > 0 || input.modelPrompt !== undefined);
-}
-
 export function noteRecapTurnStarted(ds: DaemonSession, turnId: string): void {
   const state = stateFor(ds);
   if (state.turnId === turnId) return;
-  cancelModel(state);
   state.turnId = turnId;
   state.card = undefined;
-  state.input = undefined;
-  for (const reported of [...state.reported.keys()]) if (reported !== turnId) state.reported.delete(reported);
   if (state.cli?.turnId !== turnId) state.cli = undefined;
-  if (state.model?.turnId !== turnId) state.model = undefined;
   // The previous card keeps its panel; it is simply no longer this turn's.
   state.shown = undefined;
 }
 
-/** The worker's record of what `turnId` did, sent just before its terminal. */
-export function noteRecapReported(ds: DaemonSession, turnId: string, input: RecapTurnInput): void {
+/** The turn's last reply card has settled: the card its panel goes on once
+ * the CLI recaps the turn (at once, when that recap is already here). */
+export function noteRecapCard(ds: DaemonSession, turnId: string, card: RecapCard, io: RecapIo): void {
   const state = stateFor(ds);
   const latest = latestTurn(ds, state);
-  if (latest !== undefined && latest !== turnId) return;
-  state.reported.set(turnId, input);
-  while (state.reported.size > 4) state.reported.delete(state.reported.keys().next().value!);
-}
-
-/** What the worker reported for `turnId`, if anything. */
-export function recapReported(ds: DaemonSession, turnId: string): RecapTurnInput | undefined {
-  return states.get(ds)?.reported.get(turnId);
-}
-
-export function noteRecapCard(
-  ds: DaemonSession,
-  turnId: string,
-  card: RecapCard,
-  input: RecapCardInput,
-  io: RecapIo,
-): void {
-  const state = stateFor(ds);
-  const latest = latestTurn(ds, state);
-  if (latest !== undefined && latest !== turnId) return;
-  // A turn's material is taken once: a repeated terminal (or a replaced
-  // worker reporting again) may know less than the first report did.
-  const keep = state.turnId === turnId && hasFacts(state.input);
+  if (latest !== undefined && latest !== turnId) {
+    io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: card of ${turnId.slice(0, 16)} ignored: the session's latest turn is ${latest.slice(0, 16)}`);
+    return;
+  }
   state.turnId = turnId;
   state.card = card;
-  if (!keep) state.input = input;
-  if (state.input?.modelPrompt && !state.cli && !state.model && state.modelAttempted !== turnId && !state.cancelModelTimer
-    && io.enabled(ds) && io.modelEnabled(ds)) {
-    state.cancelModelTimer = io.setTimer(() => {
-      state.cancelModelTimer = undefined;
-      requestModelRecap(ds, state, turnId, io);
-    }, RECAP_MODEL_IDLE_MS);
-  }
   reconcile(ds, io);
 }
 
@@ -198,24 +128,8 @@ export function noteCliRecap(ds: DaemonSession, turnId: string | undefined, text
   if (state.cli?.turnId === turnId && state.cli.text === trimmed) return;
   state.turnId = turnId;
   state.cli = { turnId, text: trimmed };
-  // The CLI recapped this turn itself: no model call for it.
-  cancelModel(state);
+  io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: CLI recap for ${turnId.slice(0, 16)} (${trimmed.length} chars)${state.card ? '' : '; its card has not settled yet'}`);
   reconcile(ds, io);
-}
-
-function requestModelRecap(ds: DaemonSession, state: State, turnId: string, io: RecapIo): void {
-  // A new turn or the CLI's own recap cancelled the timer; the switches are
-  // read now, as they may have been turned off meanwhile. A chat that hides a
-  // turn's activity gets no model recap either: the model reads that activity.
-  const prompt = state.input?.modelPrompt;
-  if (!prompt || !io.enabled(ds) || !io.modelEnabled(ds) || !io.showFacts(ds)) return;
-  state.modelAttempted = turnId;
-  void io.modelRecap(ds, prompt).then(text => {
-    // A new turn, the CLI's own recap, or a switch turned off since.
-    if (!text?.trim() || state.turnId !== turnId || state.cli || !io.enabled(ds) || !io.modelEnabled(ds)) return;
-    state.model = { turnId, text: text.trim() };
-    reconcile(ds, io);
-  }, error => io.warn(`[recap] ${ds.session.sessionId.slice(0, 8)}: model recap failed: ${error instanceof Error ? error.message : String(error)}`));
 }
 
 /** Resolves once every write queued so far for this session has settled. */
@@ -235,11 +149,8 @@ async function apply(ds: DaemonSession, state: State, io: RecapIo): Promise<void
   const card = state.card;
   if (!card || turnId === undefined || !io.enabled(ds)) return;
   const locale = io.locale(ds);
-  const markdown = renderRecapMarkdown({
-    ...(state.cli?.turnId === turnId ? { cli: state.cli.text } : {}),
-    ...(state.model?.turnId === turnId ? { model: state.model.text } : {}),
-    ...(state.input && io.showFacts(ds) ? { facts: state.input.facts } : {}),
-  }, locale);
+  // No panel until the CLI has recapped this turn.
+  const markdown = renderRecapMarkdown(state.cli?.turnId === turnId ? state.cli.text : undefined, locale);
   if (!markdown) return;
   const previous = state.shown && state.shown.turnId === turnId && sameCard(state.shown.card, card) ? state.shown : undefined;
   if (previous?.confirmed && previous.markdown === markdown) return;
@@ -249,6 +160,7 @@ async function apply(ds: DaemonSession, state: State, io: RecapIo): Promise<void
     state.shown = shown;
     await card.publish(markdown);
     shown.confirmed = true;
+    io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: panel shown for ${turnId.slice(0, 16)}`);
     return;
   }
   const { messageId } = card;
@@ -286,4 +198,7 @@ async function apply(ds: DaemonSession, state: State, io: RecapIo): Promise<void
     return true;
   });
   if (written) shown.confirmed = true;
+  io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: ${written
+    ? `panel ${previous?.confirmed ? 'updated' : 'placed'} on ${messageId}`
+    : `${messageId} cannot take the panel (gone, or not an editable reply card)`} for ${turnId.slice(0, 16)}`);
 }

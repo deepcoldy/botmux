@@ -4,6 +4,7 @@ import { isManualScheduleRun, isManualScheduledTurn } from './scheduled-turn-pro
 import { capabilityOn, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 import { capabilityOfTool } from './identity-policy.js';
 import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
+import { delegatedCliExecutionAllowed, configuredCliExecutionMode, type CliExecutionConfig } from './cli-execution-mode.js';
 
 export interface DelegatedScheduleRuntimeDependencies {
   manualRunId?: string;
@@ -16,6 +17,11 @@ export interface DelegatedScheduleRuntimeDependencies {
   validateBotGrant?: (record: ScheduleAuthorityRecord) => void;
   hostRunScopes: readonly TriggerUserAuthTool[];
   triggerUserAuth: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | undefined;
+  larkToolBinding?: boolean;
+  currentCliConfig?: () => CliExecutionConfig;
+  currentRunEnabled?: () => boolean;
+  currentAdminOpenIds?: () => readonly string[];
+  currentRunScopes?: () => readonly TriggerUserAuthTool[];
   adminOpenIds: readonly string[];
   resolveTargetOpenId: (unionId: string) => Promise<string | undefined>;
   listChatMemberOpenIds: (chatId: string) => Promise<readonly string[]>;
@@ -52,11 +58,11 @@ async function revalidateController(
   task: ScheduledTask,
   authority: ScheduleAuthorityRecord,
   deps: Pick<DelegatedScheduleRuntimeDependencies,
-    'adminOpenIds' | 'resolveTargetOpenId' | 'listChatMemberOpenIds'>,
+    'adminOpenIds' | 'currentAdminOpenIds' | 'resolveTargetOpenId' | 'listChatMemberOpenIds'>,
   targetChatId: string = task.chatId,
 ): Promise<string> {
   if (!authority.controlOpenId || !authority.controlUnionId
-    || !deps.adminOpenIds.includes(authority.controlOpenId)) {
+    || !(deps.currentAdminOpenIds?.() ?? deps.adminOpenIds).includes(authority.controlOpenId)) {
     throw new Error('schedule controller is no longer an allowed bot operator');
   }
   const currentOpenId = await deps.resolveTargetOpenId(authority.controlUnionId);
@@ -66,6 +72,9 @@ async function revalidateController(
   const members = await deps.listChatMemberOpenIds(targetChatId);
   if (!members.includes(authority.controlOpenId)) {
     throw new Error('schedule controller is no longer a target chat member');
+  }
+  if (!(deps.currentAdminOpenIds?.() ?? deps.adminOpenIds).includes(authority.controlOpenId)) {
+    throw new Error('schedule controller is no longer an allowed bot operator');
   }
   return currentOpenId;
 }
@@ -102,18 +111,25 @@ export async function authorizeDelegatedScheduleRun(
   if (authority.state !== 'active' && !manual && !completedOnce) {
     throw new Error(`schedule authority state is ${authority.state}`);
   }
-  if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
-  if (!capabilityOn(deps.triggerUserAuth, 'lark-user') || !capabilityOn(deps.triggerUserAuth, 'bytecloud')) {
+  const checkCliPolicy = () => {
+  const cli = deps.currentCliConfig?.() ?? deps;
+  if (!(deps.currentRunEnabled?.() ?? deps.runEnabled)) throw new Error('delegated schedule execution is revoked by host policy');
+  if (!delegatedCliExecutionAllowed(cli)) {
     throw new Error('delegated schedule requires triggerUserAuth isolation for lark-user and bytecloud');
   }
-  if (authority.runScopes.some(scope => !deps.hostRunScopes.includes(scope)
-    || !capabilityOn(deps.triggerUserAuth, capabilityOfTool(scope)))) {
+  if (authority.runScopes.some(scope => !(deps.currentRunScopes?.() ?? deps.hostRunScopes).includes(scope)
+    || configuredCliExecutionMode(cli) !== 'native'
+      && !capabilityOn(cli.triggerUserAuth, capabilityOfTool(scope)))) {
     throw new Error('delegated schedule run scope is no longer allowed by host policy');
   }
   if (authority.runScopes.length > 0 && !authority.credentialOpenId) {
     throw new Error('delegated schedule credential identity is missing');
   }
+  };
+  checkCliPolicy();
   const targetOpenId = await revalidateController(task, authority, deps);
+  // 成员/身份查询期间可能切换 CLI 策略；缺失受管能力不准降级。
+  checkCliPolicy();
   deps.assertAuthorityCurrent?.();
   assertBotGrantStillActive(authority, deps.validateBotGrant);
   const usesControllerToolActor = delegatedScheduleUsesControllerToolActor(task, authority);

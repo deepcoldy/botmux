@@ -4,7 +4,7 @@ import { parseSandboxNetworkPolicy } from '../core/sandbox-network-policy.js';
 // bot-config-store → config-store 回到本文件，取道 reply-delivery 会闭合环，
 // bun 在模块链接期报 "Export named 'resolveReplyDelivery' not found"
 // （CI bun-test test/summary-command-window.test.ts 实测）。
-import { supportsTranscriptReplyDeliveryForBot, zeroPromptInjectionUnsupportedReason } from '../core/zero-prompt-support.js';
+import { scratchRefusesExplicitTranscript, zeroPromptInjectionUnsupportedReason } from '../core/zero-prompt-support.js';
 import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 export type BotConfigInvariantError =
   | 'codex_browser_requires_codex_app'
@@ -57,14 +57,17 @@ export function botConfigInvariantError(entry: any): BotConfigInvariantError | u
   //  失效。master 上 {codex,scratch,transcript} 切 cliId 到它们不拦，存量 bots.json
   //  可能有此形状；把它们也算进来会让该 bot 的任何字段编辑都被
   //  reply_delivery_unsupported 锁死（与静默无关，无收益）。
-  // 判据复用 core/reply-delivery 的两个谓词，CLI 名单只有那一份。
+  // CLI 名单只在 core/zero-prompt-support（supportsTranscriptReplyDelivery 与 scratchRefusesExplicitTranscript）。
   // 注意：未配置的缺省值（如 doubao 缺省 transcript）不在 entry.replyDelivery 里，
   // 缺省组合由运行时回落 send 处理；机器级 BOTMUX_SANDBOX 不 materialize 进 entry，
   // 那条边由运行时回落与 worker spawnCli 的 resolved-mode 复核负责。
+  // 只拦 cursor / doubao（#2828 起的口径）：grok / pi 等在 scratch 下同样采集不到，
+  // 但由运行时回落 send 兜住；写盘时也拦会把存量 {grok, scratch, transcript} 条目的
+  // 任何字段编辑锁死（见 scratchRefusesExplicitTranscript）。
   if (entry.replyDelivery === 'transcript'
       && entry.sandbox === 'scratch'
       && supportsTranscriptReplyDelivery(entry.cliId)
-      && !supportsTranscriptReplyDeliveryForBot(entry.cliId, { sandbox: 'scratch' })) {
+      && scratchRefusesExplicitTranscript(entry.cliId)) {
     return 'reply_delivery_unsupported';
   }
   // promptInjection=none × scratch × 「scratch 使零注入失效」的 CLI（cursor/doubao/antigravity）：

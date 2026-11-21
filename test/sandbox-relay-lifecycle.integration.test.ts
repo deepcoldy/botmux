@@ -46,6 +46,11 @@ import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-cap
 import { recordedSandboxTreeFlavour } from '../src/adapters/backend/sandbox-tree-teardown.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { onTestProcessExit } from './helpers/exit-cleanup.js';
+import {
+  killPrivateTmuxServer,
+  registerSandboxScriptForCleanup,
+  registerTmuxServer,
+} from '../scripts/test-process-reaper.mjs';
 
 type SandboxFlavour = 'off' | 'credential-only' | 'oncall' | 'scratch';
 type Backend = 'tmux' | 'pty';
@@ -163,6 +168,7 @@ process.stdin.on('data', (chunk) => {
 console.log('Ready >');
 setInterval(() => {}, 1 << 30);
 `, { mode: 0o755 });
+  registerSandboxScriptForCleanup(script);
   const reportFile = (): string => join(flavour === 'off' ? workDir : outbox, 'fake-cli-report.jsonl');
   const bin = join(dir, 'bin');
   mkdirSync(bin);
@@ -232,6 +238,12 @@ if (mode === 'fail') {
 process.exit(run(queued ? args.slice(boundary + 1) : args));
 `, { mode: 0o700 });
   writeFileSync(join(bin, 'tmux'), `#!/bin/sh
+# A strict worker pins its server with a leading explicit
+# \`-S <root>/tmux-<uid>/<label>\` (tmuxSocketArgs with a socket root). tmux
+# honours the LAST -S, which would beat this lab's own -S below and send the
+# call to a server that does not exist here; drop it so every call still lands
+# on the lab's private server, exactly like a -L or default-server call.
+if [ "$1" = -S ]; then shift 2; fi
 if [ -e '${failNewSessionFlag}' ]; then
   creating=0; ours=0
   for arg in "$@"; do
@@ -323,7 +335,13 @@ exec '${realTmux}' -S '${socket}' "$@"
     ...(flavour === 'scratch' ? { sandbox: 'scratch', scratchStorage } : {}),
   });
   const workers = new Set<ChildProcess>();
-  const tmuxCommand = (args: string[]) => spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+  const tmuxCommand = (args: string[]) => {
+    const result = spawnSync(realTmux!, ['-S', socket, ...args], { encoding: 'utf8' });
+    // The lab deliberately uses the real binary for its private socket; record
+    // the same durable identity the fence shim would capture on PATH.
+    registerTmuxServer(realTmux!, socket);
+    return result;
+  };
   const lab = {
     sessionId, dataDir, sessionRoot, outbox, capabilityLeaf, script, socket,
     reports: (): Report[] => readJsonLines<Report>(reportFile()),
@@ -456,7 +474,7 @@ exec '${realTmux}' -S '${socket}' "$@"
    *  pane outlives a worker by design), the CLI, the scratch overlay, the dir. */
   const takeDown = (): void => {
     for (const worker of workers) { try { worker.kill('SIGKILL'); } catch { /* gone */ } }
-    try { execFileSync(realTmux!, ['-S', socket, 'kill-server'], { stdio: 'ignore' }); } catch { /* gone */ }
+    killPrivateTmuxServer(realTmux!, socket);
     for (const pid of lab.cliHostPids()) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
     // Never leave a host overlay / tmpfs slot behind a failed assertion.
     if (everScratch) teardownScratchSession(sessionId, dataDir);

@@ -1,22 +1,46 @@
 /** Execute a production closure with explicit host dependencies, matching the
  * worker-function harness while the pool still has no importable host seam. */
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { controllerForSession } from '../../src/core/session-controller.js';
+import { activeSessionKey } from '../../src/core/types.js';
 import { isCodexAppCliId } from '../../src/adapters/cli/types.js';
 import { contractTerminalStatus, executionObserverSupported, sameExecution } from '../../src/services/session-contract.js';
 import { hasConfirmedNativeGrokEffort, noteExplicitEffortPreferenceEdit } from '../../src/core/terminal-effort-writeback.js';
 import { assertSessionLaunchModelChoiceAllowed } from '../../src/core/session-model.js';
 import { cliModelMayKeepReasoningEffort } from '../../src/services/codex-reasoning-effort.js';
 import { runtimeStartRefusal } from '../../src/services/runtime-reservation.js';
+import { resetStartingCardHealth } from '../../src/core/starting-card-health.js';
+import {
+  cancelAntigravityRotationReplay,
+  clearInFlightAntigravityRotation,
+  formatAntigravityCooldown,
+  tryAntigravityQuotaAutoRotate,
+} from '../../src/core/antigravity-rotation.js';
+import {
+  inspectAntigravityAccounts,
+  maskAntigravityEmail,
+  rotateAntigravityAccountOnQuotaLimit,
+} from '../../src/services/antigravity-accounts.js';
 
 /** Untracked handler fixtures still have the daemon's empty delivery registry.
  * Resolve settlement through production functions so fixtures exercise its
  * identity checks rather than substituting a no-op completion callback. */
 function resolvePoolDependency(scope: Record<string, any>, key: string | symbol): unknown {
   if (key in scope) return scope[key as string];
+  if (key === 'randomUUID') return randomUUID;
   if (key === 'controllerForSession') return controllerForSession;
+  if (key === 'activeSessionKey') return activeSessionKey;
   if (key === 'runtimeStartRefusal') return runtimeStartRefusal;
+  if (key === 'resetStartingCardHealth') return resetStartingCardHealth;
+  if (key === 'cancelAntigravityRotationReplay') return cancelAntigravityRotationReplay;
+  if (key === 'clearInFlightAntigravityRotation') return clearInFlightAntigravityRotation;
+  if (key === 'formatAntigravityCooldown') return formatAntigravityCooldown;
+  if (key === 'tryAntigravityQuotaAutoRotate') return tryAntigravityQuotaAutoRotate;
+  if (key === 'inspectAntigravityAccounts') return inspectAntigravityAccounts;
+  if (key === 'maskAntigravityEmail') return maskAntigravityEmail;
+  if (key === 'rotateAntigravityAccountOnQuotaLimit') return rotateAntigravityAccountOnQuotaLimit;
   if (key === 'isCodexAppCliId') return isCodexAppCliId;
   if (key === 'executionObserverSupported') return executionObserverSupported;
   if (key === 'contractTerminalStatus') return contractTerminalStatus;
@@ -28,8 +52,9 @@ function resolvePoolDependency(scope: Record<string, any>, key: string | symbol)
   if (key === 'config') return { terminalEffortWriteback: false };
   if (key === 'pendingOrdinaryImDeliveries') return scope.pendingOrdinaryImDeliveries ??= new Map();
   if (key === 'workerCommittedTurnIds') return scope.workerCommittedTurnIds ??= new WeakMap();
-  if (typeof key === 'string' && ['ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
-    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn'].includes(key)) {
+  if (typeof key === 'string' && ['canForkRegisteredSession', 'ownsCodexAppFinalDelivery', 'completeWorkerOrdinaryImDelivery',
+    'clearOrdinaryImDelivery', 'recordWorkerCommittedTurn', 'speculateStatuslineLaunchGen',
+    'recordLaunchModel'].includes(key)) {
     return scope[key] ??= loadWorkerPoolFunction(key, scope);
   }
   return (globalThis as any)[key];

@@ -1,3 +1,5 @@
+import { answerDispatchTaskConsent, TASK_CONSENT_ACTION } from './dispatch-task-consent.js';
+import { readDispatchReportBindingSecret } from '../../core/dispatch-report-binding.js';
 import { modelPinText } from '../../core/model-pin.js';
 import { resolveSessionModelPinView } from '../../core/session-model.js';
 import { sessionContractPrimary } from '../../core/session-contract-primary.js';
@@ -23,13 +25,14 @@ import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-rep
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { NEXT_STEP_CLICK_NOTICE } from './next-step-card.js';
 import { noteReplyCardTurnStarted } from '../../core/reply-card-turn-start.js';
-import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
+import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from './streaming-card-buttons.js';
 import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
 import { failedTurnRewindInFlight } from '../../core/failed-turn-rewind.js';
 import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
+import { handleTmuxUpgradeCardAction, isTmuxUpgradeAction } from '../../core/tmux-upgrade.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
 import type { GrantCardDelivery } from './card-builder.js';
@@ -1829,6 +1832,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     logger.info(`[overload] browser ${label} restarted by owner ${operatorOpenId} (relaunched=${result.relaunched})`);
     return JSON.parse(buildOverloadAlertCard(st));
   }
+  // ─── tmux 升级提醒卡（tmux_upgrade_*）────────────────────────────────────
+  // 不绑 session。管理员闸门 + 卡片 nonce + 同时只跑一个任务都在 advisor 里；
+  // 只有主 daemon 注册了 advisor，别的进程收到点击只回「稍后再试」。
+  if (isTmuxUpgradeAction(value?.action) && larkAppId) {
+    return handleTmuxUpgradeCardAction({
+      action: value.action,
+      nonce: value.nonce,
+      messageId: cardMessageId,
+      operatorOpenId,
+      larkAppId,
+    }, localeForBot(larkAppId));
+  }
   // ─── 群内授权卡片动作（限制提交 + grant/revoke，talk-only）──────────────────
   // 不绑定 session，必须在 session 解析之前处理。owner 强闸门 + nonce 校验。
   if (value?.action && (
@@ -2217,6 +2232,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       result[key].data = reconcileOncallReplyCard(larkAppId, data.context.open_message_id, result[key].data);
     }
     return result;
+  }
+
+  if (value?.action === TASK_CONSENT_ACTION && larkAppId) {
+    const secret = readDispatchReportBindingSecret(config.session.dataDir);
+    const ok = secret && await answerDispatchTaskConsent(config.session.dataDir, secret, larkAppId, data);
+    return { toast: { type: ok ? 'success' : 'error', content: ok
+      ? value.choice === 'approve' ? '已授权本任务' : '已停止本任务的后续授权'
+      : '仅发起人可在原话题的有效授权卡上操作。' } };
   }
 
   if (
@@ -4292,6 +4315,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -5002,6 +5026,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         return { cardJson, unavailable };
       };
@@ -5237,6 +5262,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -5335,6 +5361,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -5643,6 +5670,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           substituteCardControlFor(ds),
           ds.keysPanelOpen === true,
           codexAppStopCardTarget(ds),
+          resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

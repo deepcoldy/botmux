@@ -249,6 +249,36 @@ function expectNothingLeftBehind(launchDir: string, startCommand: string) {
 }
 
 describe.skipIf(!realTmux)('worst-case launch through TmuxPipeBackend on a real tmux', () => {
+  it('strict cold launch keeps the host socket root without exposing it to the CLI', async () => {
+    const root = scratch('strict-socket-');
+    const socketName = `strict-${process.pid}`;
+    const report = join(root, 'report.linger');
+    const probe = join(root, 'probe.cjs');
+    writeFileSync(probe, PROBE);
+    // The worker strips transport settings from the CLI environment. The tmux
+    // client still has to reach the same private server as backend discovery.
+    const env = { PATH: process.env.PATH!, HOME: root, SHELL: '/bin/sh' };
+    const backend = new TmuxPipeBackend('bmx-strict-socket', {
+      createSession: true, ownsSession: true, socketName,
+    });
+    try {
+      backend.spawn(nodeBin, [probe, report], {
+        cwd: root, cols: 80, rows: 24, env, strictEnv: true,
+        paneLaunchDir: join(root, 'launch'),
+      });
+      const got = await waitForReport(report);
+      expect(got.env).not.toHaveProperty('TMUX_TMPDIR');
+      expect(got.env.PATH).toBe(env.PATH);
+      const serverSocket = execFileSync(realTmux!, [
+        '-L', socketName, 'display-message', '-p', '-t', '=bmx-strict-socket:', '#{socket_path}',
+      ], { encoding: 'utf8' }).trim();
+      expect(serverSocket).toBe(join(process.env.TMUX_TMPDIR!, `tmux-${process.getuid!()}`, socketName));
+    } finally {
+      backend.destroySession();
+      spawnSync(realTmux!, ['-L', socketName, 'kill-server'], { timeout: 5000 });
+    }
+  }, 30_000);
+
   for (const spec of CANDIDATE_SHELLS) {
     it.skipIf(!isExecutable(spec.shell))(`${spec.shell}: starts, gets exact argv/env, removals hold, nothing left behind`, async () => {
       const w = worstCase(spec.shell);

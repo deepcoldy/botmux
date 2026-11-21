@@ -90,6 +90,7 @@ const forkWorkerMock = vi.fn();
 const sendWorkerInputMock = vi.fn(() => true);
 const closeSessionMock = vi.fn();
 const sessionStoreCloseMock = vi.fn();
+const getActiveSessionsRegistryMock = vi.fn(() => null as any);
 vi.mock('../src/core/worker-pool.js', () => ({
   dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => {
@@ -119,7 +120,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     return true;
   }),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, k: string, ds: any) => { map.set(k, ds); }),
-  getActiveSessionsRegistry: vi.fn(() => null),
+  getActiveSessionsRegistry: (...args: unknown[]) => getActiveSessionsRegistryMock(...args),
   // Daemon.ts module-load wires a couple of registry lookups at top level.
   findActiveBySessionId: vi.fn(() => undefined),
   retiringWorkersForSession: vi.fn(() => []),
@@ -1373,7 +1374,9 @@ describe('executeScheduledTask — live-session injection', () => {
       const existing = liveSession('idle');
       existing.session.cliId = 'claude-code';
       existing.session.backendType = 'pty' as never;
+      existing.initConfig = { cliId: 'claude-code', backendType: 'pty' } as DaemonSession['initConfig'];
       active.set(sessionKey(ROOT, APP), existing);
+      getActiveSessionsRegistryMock.mockReturnValue(active);
 
       await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);
 
@@ -1385,6 +1388,7 @@ describe('executeScheduledTask — live-session injection', () => {
       // #794 后续：hook 模式连 <user_message> 外壳也剥掉，PTY 文本只剩正文
       expect(content).not.toContain('<user_message>');
     } finally {
+      getActiveSessionsRegistryMock.mockReturnValue(null);
       (BOT.config as Record<string, unknown>).envelopeInjection = prev;
     }
   });

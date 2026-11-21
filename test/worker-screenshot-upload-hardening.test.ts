@@ -38,7 +38,7 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
     const {
       logScreenshotSkip, backend, renderCols, renderRows,
       renderer, createHash, clamp, captureToPng, uploadImageBuffer, logError,
-      projectedRuntimeScreenStatus, send, classifyScreenUsageLimit, log,
+      projectedRuntimeScreenStatus, send, classifyScreenUsageLimit, log, cliAdapter,
     } = deps;
     // Production snapshotToPng reports the canvas grid it rendered; mocks that
     // omit it default to the render grid.
@@ -90,6 +90,57 @@ function executeProductionCapture(deps: Record<string, unknown>): CaptureHarness
 afterEach(() => vi.useRealTimers());
 
 describe('worker screenshot upload hardening', () => {
+  it('delivers an unchanged-pixel recovery edge once without continuously reuploading it', async () => {
+    let usageLimitRecovery: 'antigravity-ready-composer' | undefined;
+    const send = vi.fn();
+    const uploadImageBuffer = vi.fn(async () => `img_${uploadImageBuffer.mock.calls.length}`);
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(),
+      snapshotToPng: vi.fn(async () => ({ ansi: 'same-frame', png: Buffer.from('png'), content: 'same-frame' })),
+      backend: {}, renderCols: 80, renderRows: 24, renderer: null,
+      createHash: vi.fn(), clamp: vi.fn(), captureToPng: vi.fn(), uploadImageBuffer,
+      logError: vi.fn(), log: vi.fn(), projectedRuntimeScreenStatus: () => 'idle', send,
+      classifyScreenUsageLimit: () => ({ status: 'idle', ...(usageLimitRecovery ? { usageLimitRecovery } : {}) }),
+      currentBotmuxTurnId: 'turn_1', currentBotmuxDispatchAttempt: 1,
+      cliAdapter: { id: 'antigravity' },
+    });
+
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledOnce();
+    expect(send.mock.calls[0]?.[0].usageLimitRecovery).toBeUndefined();
+
+    usageLimitRecovery = 'antigravity-ready-composer';
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]?.[0]).toMatchObject({
+      type: 'screenshot_uploaded', status: 'idle', usageLimitRecovery: 'antigravity-ready-composer',
+    });
+    expect(uploadImageBuffer).toHaveBeenCalledTimes(2);
+
+    await harness.captureAndUpload();
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(uploadImageBuffer).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps other CLIs on the original unchanged-pixel fast path without reclassifying', async () => {
+    const classifyScreenUsageLimit = vi.fn(() => ({ status: 'idle' }));
+    const harness = executeProductionCapture({
+      logScreenshotSkip: vi.fn(),
+      snapshotToPng: vi.fn(async () => ({ ansi: 'same-frame', png: Buffer.from('png'), content: 'same-frame' })),
+      backend: {}, renderCols: 80, renderRows: 24, renderer: null,
+      createHash: vi.fn(), clamp: vi.fn(), captureToPng: vi.fn(),
+      uploadImageBuffer: vi.fn(async () => 'img'), logError: vi.fn(), log: vi.fn(),
+      projectedRuntimeScreenStatus: () => 'idle', send: vi.fn(), classifyScreenUsageLimit,
+      currentBotmuxTurnId: 'turn_1', currentBotmuxDispatchAttempt: 1,
+      cliAdapter: { id: 'codex' },
+    });
+
+    await harness.captureAndUpload();
+    const initialClassifications = classifyScreenUsageLimit.mock.calls.length;
+    await harness.captureAndUpload();
+    expect(classifyScreenUsageLimit).toHaveBeenCalledTimes(initialClassifications);
+  });
+
   it('single-flights a hanging upload, stays responsive, then retries the failed unchanged frame', async () => {
     vi.useFakeTimers();
 
@@ -498,6 +549,9 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       // hold a no-op (undefined controller short-circuits the optional chain).
       const traexAutoModelController = undefined;
       const traexAutoModelRuntimeEligible = () => false;
+      // This scenario has no writable Web terminal: the dirty-wire write gate
+      // must stay open for the queue-only capture identity harness.
+      const webTerminalInputWireDirty = () => false;
       const retiredTurnIds = new Set();
       const started = [];
       const syncQueuedTurnsFromMarkerDisk = () => false;

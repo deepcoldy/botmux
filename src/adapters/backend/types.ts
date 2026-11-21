@@ -168,7 +168,9 @@ export interface BackendTurnFailure {
 export type PersistentBackendTarget =
   // New tmux targets freeze the server (`-L <socketName>`, see tmux-socket.ts);
   // a tmux target without it lives on the default server (every older row).
-  | { backendType: 'tmux'; sessionName: string; socketName?: string }
+  // strict workers may additionally freeze an absolute socketRoot so daemon-side
+  // workerless probe/kill addresses the SAME server with explicit -S.
+  | { backendType: 'tmux'; sessionName: string; socketName?: string; socketRoot?: string }
   | { backendType: 'zellij'; sessionName: string }
   // New ZMX targets freeze the native socket directory; older rows may omit it.
   | { backendType: 'zmx'; sessionName: string; socketDir?: string }
@@ -281,6 +283,8 @@ export interface SpawnOpts {
    *  restartAttemptId: restarts must finish inside the restart coordinator's
    *  deadline, and a wake-up from suspend (resume attempt id) is left off too. */
   retryPaneAgentStart?: boolean;
+  /** Herdr: CLI session id this launch resumes; panes already running it are closed first. */
+  resumeCliSessionId?: string;
 }
 
 export type AmbiguousSubmissionRecoveryFailure =
@@ -345,12 +349,26 @@ export interface SessionBackend {
    *  (another server now answers on the socket), not the CLI exiting. A
    *  restart for that exit must not spend the fresh-session fallback budget. */
   exitedBecauseServerReplaced?(): boolean;
+  /** After onExit: how the shared multiplexer server holding the pane was lost
+   *  (tmux: `replaced` / `gone` / `unreachable`), or undefined for an ordinary
+   *  CLI exit. The daemon folds every session that lost the same server into
+   *  ONE backend outage instead of N CLI crashes. */
+  exitedBecauseServerLost?(): { kind: 'replaced' | 'gone' | 'unreachable'; socketName?: string } | undefined;
   kill(): void;
   /** Permanently destroy the backing session (e.g. kill tmux session).
    *  Called only on explicit /close. Default: same as kill(). */
   getAttachInfo?(): { type: 'tmux'; sessionName: string } | null;
   /** PID of the CLI process running inside the backend. */
   getChildPid?(): number | null;
+  /**
+   * Stable identity of the terminal/pane backing this backend, independent of
+   * worker-side `cliPid` refinement to a wrapper's descendant CLI. Unlike
+   * getChildPid(), this must not follow that mutable ownership PID. Backends
+   * participating in wrapper PID resolution must implement it whenever
+   * getChildPid() can alias `cliPid`; others may use the worker's getChildPid()
+   * fallback. Null means the identity is unavailable.
+   */
+  getStablePanePid?(): number | null;
   captureCurrentScreen?(): string;
   /**
    * Escape sequence re-asserting the pane's live input modes (mouse tracking,
@@ -378,6 +396,15 @@ export interface SessionBackend {
     viewport: string;
     cursor: { x: number; y: number };
   } | null;
+  /**
+   * The pane's current viewport as cells (dim / inverse kept), read
+   * synchronously from the backend's own screen. Unattended maintenance writes
+   * judge the composer on this rather than on the worker's long-lived
+   * renderer, which keeps its spawn size while a web terminal resizes the real
+   * pane. Null when the viewport cannot be read now; backends without an
+   * authoritative synchronous viewport omit it.
+   */
+  captureViewportCells?(): import('../../utils/terminal-cells.js').ScreenRow[] | null;
   getPaneSize?(): { cols: number; rows: number } | null;
   /**
    * Remote sandbox access URL — backends that run on a remote sandbox (e.g.
