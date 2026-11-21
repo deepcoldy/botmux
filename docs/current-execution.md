@@ -81,3 +81,9 @@ wrapper runner 另外区分本地判定的 `daemon_unreachable` / `daemon_timeou
 这是即时观察，不能缓存为授权令牌，也不证明输入已提交、业务已完成或真人已批准。消费者仍需关联自己的原请求和当前修订，在每个受保护操作前重新观察，并独立验证权限、输入依据及结果回执。接口不派发、续租、消费事件或修改会话。机器触发可在没有真人 actor 时凭当前执行证明和有效工具委托申请目标用户授权，委托范围与该用户的实际授权仍须满足工具要求。
 
 持久pane与普通PTY使用同一宿主计算的 `BOTMUX_SESSION_SCOPE`。tmux、tmux-pipe、Zellij与Zmx的共享启动包装器在加载shell配置后清掉继承值，再传入当前会话的thread/chat；未提供scope时保持缺省，bots.json的env不能覆盖。该变量仅用于会话路由，不充当当前执行证明；旧已启动pane需在后续受控重建时才能获得此修复。
+
+## CLI 执行模式
+
+`botmux execution current --json --cli` 显式请求 `cliExecution` 字段。`mode` 为 `native`、`managed` 或 `unknown`；`executor` 是 worker 实际启动进程的系统账号，不代表平台登录账号；`nativeAuthorized` 表示当前发起/定时控制人仍在宿主操作权限范围内。原生模式要求关闭所有个人能力并关闭 Lark 应用绑定，受管失败不会转为原生模式。`managed` 也包括部分能力开启的组合，并不表示每个 CLI 都按提问人运行。
+
+模式来自当前 worker 的私有启动报告，核对进程、代次和当前配置。旧 worker 没有报告、配置切换尚未重启或报告冲突时返回 `unknown`，调用者不得据环境变量补齐权限。系统账号无法从 OS 核证时同样省略报告并返回 `unknown`，不中止 CLI 启动。原来的命令不接收新增字段，保持旧客户端严格键检查兼容。该字段是模式与操作权限证明，不签发平台凭据；平台身份仍由原生 CLI 的实际登录决定。

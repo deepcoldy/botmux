@@ -24,8 +24,8 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
-import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/im/lark/client.js', async importOriginal => ({
@@ -83,7 +83,12 @@ const answered = (h: Harness) => events(h).some(e => e.kind === 'turn' && String
  *  for a persistent backend, and a new daemon session object and contract
  *  controller fork the next worker for the surviving pane. */
 function liveSession(opts: { turnMs: number; pidStateGated?: boolean; recordReadable?: boolean }) {
-  const h = setupFakeClaude({ turnMs: opts.turnMs, ...(opts.pidStateGated ? { pidStateGated: true } : {}) });
+  // These scenarios control identity availability through pidStateGated.
+  // An unrelated torn periodic rewrite during runtime registration must not
+  // turn a known-conversation handoff into the missing-identity scenario.
+  // In-place rewrite/re-read behavior remains covered by its own tests.
+  const h = setupFakeClaude({ turnMs: opts.turnMs, atomicPidState: true,
+    ...(opts.pidStateGated ? { pidStateGated: true } : {}) });
   if (opts.pidStateGated && opts.recordReadable !== false) writeFileSync(h.pidStateGate, '');
   const transcript = h.transcript(h.sessionId);
   const ago = (ms: number) => new Date(Date.now() - 3_600_000 + ms).toISOString();
@@ -166,8 +171,9 @@ function liveSession(opts: { turnMs: number; pidStateGated?: boolean; recordRead
   const first = fork(ds1, 1);
   const replies = () => sessionReply.mock.calls.map(args => String(args[1]));
   const turnReplies = () => replies().filter(text => text.includes(`reply: ${TEXT}`));
-  const notice = new Set((['zh', 'en'] as const).map(locale => t('worker.final_output_undelivered', undefined, locale)));
-  const undeliveredNotices = () => replies().filter(text => notice.has(text));
+  // The notice ends with where the held-back reply can be found.
+  const notice = (['zh', 'en'] as const).map(locale => t('worker.final_output_undelivered', undefined, locale).split('{recovery}')[0]!);
+  const undeliveredNotices = () => replies().filter(text => notice.some(head => text.startsWith(head)));
   /** The reply says which turn it answers: the turn's input began with TEXT. */
   const namesItsTurn = (reply: string) => reply.includes(`「${TEXT}」`) || reply.includes(`(\"${TEXT}\")`);
 
@@ -296,5 +302,12 @@ describe.skipIf(!runnable)('a turn running across a daemon restart', () => {
     await sleep(3_000);
     expect(s.turnReplies(), next.logs.join('')).toEqual([]);
     expect(s.undeliveredNotices()).toHaveLength(1);
+    // Held back, not destroyed: the reply is kept on the bot's machine, and
+    // the notice says where to find it.
+    const archive = join(config.session.dataDir, 'undelivered-replies');
+    const kept = readdirSync(archive, { recursive: true }).map(String).filter(name => name.endsWith('.md'));
+    expect(kept).toHaveLength(1);
+    expect(readFileSync(join(archive, kept[0]!), 'utf8')).toContain(`reply: ${TEXT}`);
+    expect(s.undeliveredNotices()[0]).toContain(basename(kept[0]!).slice(0, 24));
   }, 240_000);
 });

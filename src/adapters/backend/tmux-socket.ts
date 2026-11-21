@@ -22,6 +22,8 @@
  * `$TMUX_TMPDIR/tmux-<uid>/`, so private test roots stay private.
  */
 
+import { resolveTmuxSocketRoot, tmuxSocketPathIn } from './tmux-socket-root.js';
+
 /** Env override for the socket NEW managed sessions use. `default` opts out. */
 export const MANAGED_TMUX_SOCKET_ENV = 'BOTMUX_TMUX_SOCKET';
 export const DEFAULT_MANAGED_TMUX_SOCKET = 'botmux';
@@ -71,8 +73,14 @@ export function managedTmuxCandidateSockets(
   return order.filter((socket, i) => order.indexOf(socket) === i);
 }
 
-/** Leading tmux argv selecting the server (`[]` = default server). */
-export function tmuxSocketArgs(socketName?: string): string[] {
+/** Leading tmux argv selecting the server. An explicit root uses -S so the
+ * command cannot be retargeted by its cwd or ambient TMUX_TMPDIR. */
+export function tmuxSocketArgs(socketName?: string, socketRoot?: string): string[] {
+  if (socketRoot !== undefined) {
+    const uid = typeof process.getuid === 'function' ? process.getuid() : -1;
+    const root = resolveTmuxSocketRoot({ TMUX_TMPDIR: socketRoot });
+    return ['-S', tmuxSocketPathIn(root, uid, socketName)];
+  }
   return socketName ? ['-L', socketName] : [];
 }
 

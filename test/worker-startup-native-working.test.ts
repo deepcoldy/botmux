@@ -1,6 +1,7 @@
 /** Startup publication must expose active native work without admitting queued input. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { PromptSuggestionPublisher } from '../src/utils/prompt-suggestion-publisher.js';
 
 afterEach(() => vi.useRealTimers());
 
@@ -30,6 +31,7 @@ function start(options: { cli?: string; authoritative?: boolean; busy?: boolean;
     currentBotmuxTurnId: 'existing-turn', currentBotmuxDispatchAttempt: undefined,
     send: (message: Record<string, unknown>) => messages.push(message), log() {},
     SCREEN_UPDATE_INTERVAL_MS: 100, setInterval,
+    PromptSuggestionPublisher,
   };
   loadWorkerFunction<() => void>('startScreenUpdates', scope)();
   return { scope, messages, snapshots: () => snapshots, nextFrame(text: string) { screen = text; changed = true; } };

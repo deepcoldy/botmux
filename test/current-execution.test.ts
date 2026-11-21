@@ -2,8 +2,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { resolveDaemonCurrentActor } from '../src/core/current-actor-attestation.js';
+import { resolveDaemonCurrentActor, attestCurrentExecutionLoopbackPeer } from '../src/core/current-actor-attestation.js';
 import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
+import { configuredCliExecutionMode } from '../src/core/cli-execution-mode.js';
 import {
   CURRENT_EXECUTION_IDENTITY_SCHEMA,
   CURRENT_EXECUTION_ORIGINS, CURRENT_EXECUTION_SCHEMA, CURRENT_EXECUTION_TRIGGER_SOURCES,
@@ -43,6 +44,43 @@ const document = { schema: CURRENT_EXECUTION_SCHEMA, status: 'verified', larkApp
   sessionId: 'session-a', chatId: 'oc_chat', turnId: 'trigger-a', workerGeneration: 7, dispatchAttempt: 3 };
 
 describe('current execution proof', () => {
+  it('keeps native control identity out of managed actor and tool credential attestation', async () => {
+    const { ds, input } = fixture();
+    ds.scheduledControlActors = new Map([['trigger-a', { openId: 'ou_controller', unionId: 'on_controller' }]]);
+    let config = { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] as string[] } };
+    const scheduledControlActorMode = () => configuredCliExecutionMode(config);
+    expect(attestCurrentExecutionLoopbackPeer({ ...input, allowScheduledToolActor: true })?.callerOpenId)
+      .toBeUndefined();
+    expect(attestCurrentExecutionLoopbackPeer({ ...input, scheduledControlActorMode })?.callerOpenId)
+      .toBe('ou_controller');
+    const resolveIdentity = vi.fn(async () => ({ type: 'user' as const, openId: 'ou_controller', email: 'operator@example.com' }));
+    expect(await resolveDaemonCurrentActor({ ...input, scheduledControlActorMode, resolveIdentity }))
+      .toMatchObject({ ok: true, document: { actor: { email: 'operator@example.com' } } });
+
+    config = { larkToolBinding: true, triggerUserAuth: { enabled: false, tools: [] } };
+    expect(attestCurrentExecutionLoopbackPeer({ ...input, scheduledControlActorMode })?.callerOpenId)
+      .toBeUndefined();
+    expect(await resolveDaemonCurrentActor({ ...input, scheduledControlActorMode, resolveIdentity }))
+      .toEqual({ ok: false, error: 'current_actor_unverified' });
+  });
+
+  it('returns CLI mode only when requested and keeps the original protocol unchanged', async () => {
+    const { input } = fixture();
+    const cliExecution = { mode: 'native' as const, nativeAuthorized: true,
+      executor: { kind: 'os-user' as const, username: 'operator', uid: 1000 } };
+    expect(resolveDaemonCurrentExecution(input)).toEqual(document);
+    expect(resolveDaemonCurrentExecution(input, { includeCli: true, cliExecution: () => cliExecution }))
+      .toEqual({ ...document, cliExecution });
+    expect(resolveDaemonCurrentExecution(input, { includeCli: true }))
+      .toEqual({ ...document, cliExecution: { mode: 'unknown', nativeAuthorized: false } });
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ ...document, cliExecution })));
+    expect(await resolveCurrentExecution({ ipcPort: 12345, sessionId: 'session-a', larkAppId: 'cli_a',
+      includeCli: true, fetchImpl })).toMatchObject({ cliExecution });
+    expect(JSON.parse(String(fetchImpl.mock.calls[0][1]?.body))).toEqual({ sessionId: 'session-a', fields: ['origin', 'cli'] });
+    expect(parseCurrentExecutionArgs(['current', '--json', '--cli'])).toBe(true);
+    expect(isCurrentExecutionDocument({ ...document, cliExecution: { ...cliExecution, token: 'forbidden' } })).toBe(false);
+  });
+
   it('proves a machine turn without resolving or authorizing a human actor', async () => {
     const { ds, input } = fixture(); const before = JSON.stringify(ds);
     expect(resolveDaemonCurrentExecution(input)).toEqual(document);

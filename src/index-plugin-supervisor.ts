@@ -8,6 +8,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { isLinuxZombie, readDurableProcessIdentity } from './utils/process-identity.js';
 import { scrubExternalMemberEnv } from './utils/child-env.js';
 import { installStdioEpipeGuard } from './utils/stdio-epipe-guard.js';
+import { moveSupervisorIntoFleetScope } from './core/fleet-scope.js';
 import { botmuxHome } from './core/plugins/paths.js';
 import {
   pluginSupervisorDir, pluginSupervisorStatePath, pluginSupervisorResultPath,
@@ -67,11 +68,16 @@ async function reapOrphans(): Promise<void> {
   }
 }
 
+/** Isolate plugin processes from session cleanup before starting or recovering children. */
 async function main(): Promise<void> {
   mkdirSync(pluginSupervisorDir(), { recursive: true, mode: 0o700 });
   // A lifetime lock prevents concurrent CLI launches from creating two owners.
   // The shared lock implementation verifies process birth identity on recovery.
   await withFileLock(join(pluginSupervisorDir(), 'owner'), async () => {
+    const scope = moveSupervisorIntoFleetScope();
+    if (scope.action === 'moved') console.info(`[plugin-supervisor] moved out of ${scope.from} into ${scope.to}`);
+    else if (scope.action === 'failed') console.warn(`[plugin-supervisor] staying in ${scope.unit}: ${scope.reason}`);
+    else if (scope.action === 'unsupported' && process.platform === 'linux') console.info(`[plugin-supervisor] no own systemd scope: ${scope.reason}`);
     await reapOrphans();
     const supervisor = new FleetSupervisor({
       statePath: pluginSupervisorStatePath(), distDir: '', cwd: botmuxHome(),

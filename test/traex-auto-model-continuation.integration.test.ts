@@ -1,6 +1,5 @@
 import { writeFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
-import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { t } from '../src/i18n/index.js';
 import { SessionController } from '../src/core/session-controller.js';
@@ -34,7 +33,7 @@ describe('TraeX auto-model current-turn continuation real Worker and PTY', () =>
     contractHandles.splice(contractHandles.indexOf(f.controller!.store), 1); f.controller!.store.close();
     const store = new SessionContractStore(f.options.env.SESSION_DATA_DIR, 'app_test'); contractHandles.push(store);
     const controller = new SessionController(restartedDs, store); const bootstrap = controller.bindWorker(2);
-    const second = spawnNodeTsScript(f.entry, [], f.options); children.push(second);
+    const second = f.spawnWorker(); children.push(second);
     restartedDs.worker = second; restartedDs.workerGeneration = 2;
     const secondMessages: WorkerToDaemon[] = [];
     const secondLogs: string[] = [];
@@ -255,12 +254,23 @@ describe('TraeX auto-model current-turn continuation real Worker and PTY', () =>
     expect(fixtureState.noticeDeliveries.filter(message => message.type === 'user_notify'
       && message.message === t('worker.traex_auto_model.continuation_timeout'))).toHaveLength(1);
     pausedGrant?.mockRestore();
-    const registration = [...fixtureState.messages].reverse().find(message => message.type === 'runtime_binding');
-    expect(registration?.type).toBe('runtime_binding');
-    if (registration?.type === 'runtime_binding') {
-      controller.bindRuntime(registration.bindingId, registration.sessionContract!.producer, registration.identity);
-      expect(controller.store.executionContinuation(controller.ref, registration.bindingId)?.status).toBe('rejected');
-    }
+    // The replacement is the runtime the worker announced with the continuation
+    // plan. Without native identity (missing-native-identity) the worker first
+    // registers it only when the grant times out, right before it writes the
+    // queued follow-up; the follow-up wait above reads the fake CLI's file and
+    // can pass before that IPC registration reaches this host. Wait for it
+    // instead of taking whichever runtime_binding happens to be last.
+    const replacement = fixtureState.messages.find((message): message is Extract<WorkerToDaemon, { type: 'runtime_binding_started' }> =>
+      message.type === 'runtime_binding_started' && !!message.continuation);
+    expect(replacement).toBeDefined();
+    const replacementRegistration = () => [...fixtureState.messages].reverse().find((message): message is Extract<WorkerToDaemon, { type: 'runtime_binding' }> =>
+      message.type === 'runtime_binding' && message.bindingId === replacement!.bindingId);
+    await fixtureState.wait(() => !!replacementRegistration(), 'replacement runtime registration');
+    const registration = replacementRegistration()!;
+    controller.bindRuntime(registration.bindingId, registration.sessionContract!.producer, registration.identity);
+    const registered = new Set(fixtureState.messages.flatMap(message => message.type === 'runtime_binding' ? [message.bindingId] : []));
+    expect([...registered].filter(bindingId =>
+      controller.store.executionContinuation(controller.ref, bindingId)?.status === 'rejected')).toEqual([replacement!.bindingId]);
     expect(controller.store.executions(controller.ref, 'om_ungranted')[0]!.phase).toBe('failed');
     if (mode === 'lost-approval') {
       expect(withheldApproval).toBeDefined();
@@ -286,7 +296,8 @@ describe('TraeX auto-model current-turn continuation real Worker and PTY', () =>
     expect(rows(f.launches).slice(1).every(row => row.args.includes(f.nativeId))).toBe(true);
     expect(rows(f.submissions).filter(row => row.text.startsWith('original restricted task'))).toHaveLength(1);
     expect(f.messages.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_access')).toHaveLength(1);
-    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(2);
+    // Initial/replacement catalogs (3) plus the two access-recovery reads.
+    expect(rows(f.rpcRequests).filter(row => row.method === 'model/list')).toHaveLength(5);
     expect(f.messages.filter(message => message.type === 'active_runtime' && message.traexAutoModelRuntime?.modelAccessRecovery?.blockedModels.length === 2).length).toBeGreaterThan(0);
   }, 45_000);
 

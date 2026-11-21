@@ -21,12 +21,13 @@
  * 升级注意：升级前的 ledger 记录没有 costCny，状态丢失重建时一律计 0——
  * 预算统计从升级后开始累加，不回溯历史花费。
  */
-import { mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { mkdirSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { readJsonFileSoft } from '../utils/json-file.js';
 import { logger } from '../utils/logger.js';
 import { defaultLedgerDir } from './usage-ledger.js';
+import { scanJsonlFromOffset } from './jsonl-cursor.js';
 
 export interface BudgetConfig {
   monthlyCny: number;
@@ -59,6 +60,8 @@ interface BudgetState {
   /** Thresholds already alerted this month, so a lingering spend can't
    *  re-fire the same line every turn. */
   alertedThresholds: number[];
+  ledgerStamp?: string;
+  untrackedSpendCny?: number;
 }
 
 // ─── Config parsing (loose; garbage in → feature off, never throws) ──────────
@@ -115,9 +118,16 @@ interface CachedState {
   state: BudgetState;
 }
 const stateCache = new Map<string, CachedState>();
+const ledgerCache = new Map<string, {
+  month: string;
+  files: Map<string, { stamp: string; dev: number; ino: number; size: number; offset: number }>;
+  seen: Set<string>;
+  spentCny: number;
+}>();
 
 export function _resetBudgetTrackerForTest(): void {
   stateCache.clear();
+  ledgerCache.clear();
 }
 
 function normalizeState(parsed: unknown, month: string): BudgetState | null {
@@ -133,12 +143,13 @@ function normalizeState(parsed: unknown, month: string): BudgetState | null {
       p.alertedThresholds.filter((t): t is number => typeof t === 'number' && Number.isFinite(t)),
     )]
     : [];
-  return { month: p.month, spentCny, alertedThresholds: alerted };
+  return { month: p.month, spentCny, alertedThresholds: alerted,
+    ...(typeof p.untrackedSpendCny === 'number' && Number.isFinite(p.untrackedSpendCny)
+      ? { untrackedSpendCny: p.untrackedSpendCny } : {}),
+    ...(typeof p.ledgerStamp === 'string' ? { ledgerStamp: p.ledgerStamp } : {}) };
 }
 
-/** Rebuild this month's spend from the daily ledger files when the state
- *  file is missing (deleted, or first run after upgrade). Records without
- *  costCny (pre-upgrade) count as 0 — historical spend is NOT backfilled. */
+/** Replay current-month ledger rows, including writes missed by the sink. */
 function rebuildBudgetStateFromLedger(dir: string, larkAppId: string, month: string): BudgetState {
   const state = freshState(month);
   let files: string[];
@@ -147,25 +158,59 @@ function rebuildBudgetStateFromLedger(dir: string, larkAppId: string, month: str
   } catch {
     return state;
   }
-  for (const name of files.sort()) {
-    let content: string;
-    try {
-      content = readFileSync(join(dir, name), 'utf8');
-    } catch {
-      continue;
-    }
-    for (const line of content.split('\n')) {
-      if (!line.includes(larkAppId)) continue;
+  files.sort();
+  const stats = files.map(name => {
+    const st = statSync(join(dir, name));
+    return {name, st, stamp: `${name}:${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`};
+  });
+  if (!files.length) return state;
+  state.ledgerStamp = stats.map(f => f.stamp).join('|');
+  const key = statePath(dir, larkAppId);
+  let cached = ledgerCache.get(key);
+  const byName = new Map(stats.map(f => [f.name, f]));
+  if (!cached || cached.month !== month || [...cached.files].some(([name, prior]) => {
+    const file = byName.get(name);
+    return !file || file.st.dev !== prior.dev || file.st.ino !== prior.ino
+      || (file.stamp !== prior.stamp && file.st.size <= prior.size);
+  })) {
+    cached = {month, files: new Map(), seen: new Set(), spentCny: 0};
+  }
+  const ledger = cached;
+  for (const {name, st, stamp} of stats) {
+    const prior = ledger.files.get(name);
+    if (prior?.stamp === stamp) continue;
+    const scan = scanJsonlFromOffset(join(dir, name), prior?.offset ?? 0, {endOffset: st.size, onLine(line) {
+      if (!line.includes(larkAppId)) return;
       try {
         const rec = JSON.parse(line);
         if (rec?.larkAppId === larkAppId
           && typeof rec.costCny === 'number'
           && Number.isFinite(rec.costCny)
           && rec.costCny > 0) {
-          state.spentCny += rec.costCny;
+          if (typeof rec.recordId === 'string') {
+            if (ledger.seen.has(rec.recordId)) return;
+            ledger.seen.add(rec.recordId);
+          }
+          ledger.spentCny += rec.costCny;
         }
       } catch { /* skip malformed lines */ }
+    }});
+    if (!scan) {
+      ledgerCache.delete(key);
+      throw new Error(`Could not read budget ledger ${name}`);
     }
+    ledger.files.set(name, {stamp, dev: st.dev, ino: st.ino, size: st.size, offset: scan.newOffset});
+  }
+  ledgerCache.set(key, ledger);
+  state.spentCny = ledger.spentCny;
+  return state;
+}
+
+function reconcileLedger(dir: string, larkAppId: string, month: string, state: BudgetState): BudgetState {
+  const ledger = rebuildBudgetStateFromLedger(dir, larkAppId, month);
+  if (ledger.ledgerStamp !== undefined && ledger.ledgerStamp !== state.ledgerStamp) {
+    state = { ...state, spentCny: ledger.spentCny + (state.untrackedSpendCny ?? 0), ledgerStamp: ledger.ledgerStamp };
+    persistState(dir, larkAppId, state);
   }
   return state;
 }
@@ -183,7 +228,8 @@ function loadState(dir: string, larkAppId: string, month: string): BudgetState {
     const cached = stateCache.get(path);
     if (cached && cached.mtimeMs === fileMtime) {
       // Cache hit — still apply lazy rollover on the way out.
-      return cached.state.month === month ? cached.state : freshState(month);
+      return reconcileLedger(dir, larkAppId, month,
+        cached.state.month === month ? cached.state : freshState(month));
     }
     // A corrupt or wrongly-shaped state file is quarantined rather than
     // treated as a zero-spend month: returning a fresh state here used to let
@@ -196,7 +242,7 @@ function loadState(dir: string, larkAppId: string, month: string): BudgetState {
     const state = parsed === undefined ? null : normalizeState(parsed, month);
     if (state) {
       stateCache.set(path, { mtimeMs: fileMtime, state });
-      return state;
+      return reconcileLedger(dir, larkAppId, month, state);
     }
   }
   // State file missing, externally deleted, or just quarantined: rebuild once
@@ -247,16 +293,22 @@ function resolveOpts(opts?: BudgetTrackerOpts): { now: Date; dir: string; month:
 export function trackBudgetSpend(
   larkAppId: string,
   costCny: number,
-  opts?: BudgetTrackerOpts,
+  opts?: BudgetTrackerOpts & { occurredAt?: Date; recordId?: string },
 ): BudgetAlert | null {
   try {
     if (!larkAppId || typeof larkAppId !== 'string') return null;
     if (!Number.isFinite(costCny)) return null;
     const { dir, month, budget } = resolveOpts(opts);
+    // Late ledger entries belong to their event month, never to today's budget.
+    if (opts?.occurredAt && monthOf(opts.occurredAt) !== month) return null;
 
     const state = loadState(dir, larkAppId, month);
     state.month = month;
-    state.spentCny += costCny;
+    // Ledger sinks run after append. Reconciliation already includes this ID.
+    if (!opts?.recordId) {
+      state.spentCny += costCny;
+      state.untrackedSpendCny = (state.untrackedSpendCny ?? 0) + costCny;
+    }
 
     let alert: BudgetAlert | null = null;
     if (budget && budget.monthlyCny > 0) {

@@ -5,7 +5,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { expandHome } from '../core/working-dir.js';
-import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from './codex-transcript.js';
+import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, rolloutHeaderCheck } from './codex-transcript.js';
 import { codexHome as configuredCodexHome } from './codex-paths.js';
 import { getSession } from './session-store.js';
 import { config } from '../config.js';
@@ -50,6 +50,49 @@ export interface TranscriptPathQuery {
 export interface ResolvedTranscriptPath {
   path: string;
   kind: TranscriptKind;
+  /** Set when the path runs through a tree the session's CLI can write to (a
+   *  sandboxed bot's BOT_HOME, a scratch view): the directory, outside that
+   *  tree, below which every component must be a real directory and the leaf
+   *  a regular file. The check made here is only as good as the moment it is
+   *  made, so a reader of such a path re-checks the file it actually opened
+   *  (see context-rewind's transcript reads). */
+  writableTreeRoot?: string;
+}
+
+/** Continuations share a native thread ID but may live on different dates. */
+export function resolveSessionTranscriptPaths(q: TranscriptPathQuery): string[] {
+  const current = resolveSessionTranscriptPath({ ...q, fresh: true });
+  if (!current) return [];
+  if (q.cliId !== 'codex' && q.cliId !== 'traex') return [current.path];
+  const id = q.cliSessionId;
+  if (!id || !/^[a-f0-9-]{36}$/i.test(id)) return [current.path];
+  const day = dirname(current.path);
+  const month = dirname(day);
+  const year = dirname(month);
+  if (!/^\d{2}$/.test(day.split(sep).pop()!) || !/^\d{2}$/.test(month.split(sep).pop()!)
+    || !/^\d{4}$/.test(year.split(sep).pop()!)) return [current.path];
+  const root = dirname(year);
+  const found = new Set([current.path]);
+  const suffix = new RegExp(`-${id}(?:_[a-f0-9-]{36})?\\.jsonl$`, 'i');
+  const walk = (dir: string, depth: number): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name);
+      if (depth < 3 && entry.isDirectory() && (depth === 0 ? /^\d{4}$/ : /^\d{2}$/).test(entry.name)) {
+        walk(path, depth + 1);
+      } else if (depth === 3 && entry.isFile() && entry.name.startsWith('rollout-')
+        && suffix.test(entry.name)) {
+        const header = rolloutHeaderCheck(path, true);
+        if (header.verified && !header.internal && (!header.sid || header.sid.toLowerCase() === id.toLowerCase())) {
+          found.add(path);
+        }
+      }
+    }
+  };
+  try { walk(root, 0); } catch { return [current.path]; }
+  const ordered = [...found].sort();
+  // The single-path resolver's indexed generation is authoritative. A later-
+  // named sibling cannot be its ancestor and must not poison the current end.
+  return ordered.slice(0, ordered.indexOf(current.path) + 1);
 }
 
 const sessionPathCache = new Map<string, { path: string | null; atMs: number }>();
@@ -211,6 +254,45 @@ function botHomeCliDataDir(
     return cliDataDir;
   } catch {
     return null; // unsafe app id — never build a path from it
+  }
+}
+
+/** The root of the CLI-writable tree `path` runs through, if any: for a
+ *  scratch view, the view's own root (the session cannot replace the view it
+ *  lives in); for a path under a bot's BOT_HOME, the `bots` directory holding
+ *  it, so BOT_HOME itself is checked too (the resolver rejects a replaced app
+ *  root for the same reason). Decided from where the path lies, never from
+ *  the tree's current state: a check that fails here must not drop the root
+ *  and leave the path unguarded. */
+export function claudeWritableTreeRoot(
+  path: string,
+  scratch: ScratchPathMapping[] | undefined,
+  larkAppId: string | undefined,
+): string | undefined {
+  const within = (root: string) => {
+    const rel = relative(resolve(root), resolve(path));
+    return !!rel && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+  };
+  if (scratch) {
+    // Longest view prefix first, like scratchViewPath's host-side lookup. A
+    // scratch path outside every view is not one this resolver hands out;
+    // should it happen, the longest view is still the tree to check against.
+    const views = scratch.map(m => m.to).sort((a, b) => b.length - a.length);
+    return views.find(within) ?? views[0];
+  }
+  const bots = botsDirOf(larkAppId);
+  return bots && within(bots) ? bots : undefined;
+}
+
+/** `<botmuxHome>/bots`, derived exactly like botHomeCliDataDir but without
+ *  looking at the disk. */
+function botsDirOf(larkAppId: string | undefined): string | undefined {
+  const sessionDataDir = process.env.SESSION_DATA_DIR;
+  if (!larkAppId || !sessionDataDir) return undefined;
+  try {
+    return dirname(botHomePath(dirname(sessionDataDir), larkAppId));
+  } catch {
+    return undefined; // unsafe app id: botHomeCliDataDir never builds a path from it either
   }
 }
 
@@ -399,7 +481,9 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       const path = svMappings
         ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, homeRoot) : null)
         : claudeJsonlWithBotHomeFallback(sid, sq, dataRoot);
-      return path ? { path, kind: 'claude' } : null;
+      if (!path) return null;
+      const writableTreeRoot = claudeWritableTreeRoot(path, svMappings, q.larkAppId);
+      return { path, kind: 'claude', ...(writableTreeRoot ? { writableTreeRoot } : {}) };
     }
     case 'aiden': {
       const homeRoot = v(join(homedir(), '.claude'));
@@ -467,7 +551,7 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
           : findTraexSessionIdByBotmuxSessionId(q.sessionId);
         const traexSid = q.cliSessionId || mappedSid || q.sessionId;
         return foundWrap(findTraexRolloutBySessionId(traexSid), v);
-      }, { retryMiss: q.fresh });
+      }, { retryMiss: q.fresh, refreshHit: q.fresh });
       return path ? { path, kind: 'traex' } : null;
     }
     case 'grok': {

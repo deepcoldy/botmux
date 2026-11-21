@@ -3,7 +3,7 @@
  * before an in-worker respawn (restart IPC, or a message to a crash-parked worker).
  */
 import { describe, expect, it } from 'vitest';
-import { applyRespawnConfigPatch, type RespawnPatchTarget } from '../src/core/respawn-config-patch.js';
+import { applyRespawnConfigPatch, respawnConfigPatchFromMessage, type RespawnPatchTarget } from '../src/core/respawn-config-patch.js';
 
 type Cfg = RespawnPatchTarget & { nativeSessionTitle?: string; reasoningEffort?: string; cliId: string };
 
@@ -22,6 +22,19 @@ function forkSnapshot(): Cfg {
 }
 
 describe('applyRespawnConfigPatch', () => {
+  it('updates both CLI identity switches on an in-worker respawn', () => {
+    const cfg = forkSnapshot();
+    cfg.triggerUserAuth = { enabled: true, tools: ['lark-cli', 'bytedcli'] };
+    applyRespawnConfigPatch(cfg, { larkToolBinding: false, triggerUserAuth: { enabled: false, tools: [] } });
+    expect(cfg.larkToolBinding).toBe(false);
+    expect(cfg.triggerUserAuth?.enabled).toBe(false);
+    applyRespawnConfigPatch(cfg, { triggerUserAuth: null });
+    expect(cfg.triggerUserAuth).toBeUndefined();
+    applyRespawnConfigPatch(cfg, { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } });
+    applyRespawnConfigPatch(cfg, {});
+    expect(cfg.triggerUserAuth?.tools).toEqual(['bytedcli']);
+  });
+
   it('replaces the fork-time startup commands with the carried ones', () => {
     const cfg = forkSnapshot();
     const result = applyRespawnConfigPatch(cfg, { startupCommands: ['/effort xhigh'] });
@@ -72,11 +85,60 @@ describe('applyRespawnConfigPatch', () => {
     });
   });
 
+  it('a carried replyDelivery replaces the fork-time one; an absent one keeps it', () => {
+    const cfg: Cfg = { ...forkSnapshot(), replyDelivery: 'transcript' };
+    applyRespawnConfigPatch(cfg, {});
+    expect(cfg.replyDelivery).toBe('transcript');
+    applyRespawnConfigPatch(cfg, { replyDelivery: 'send' });
+    expect(cfg.replyDelivery).toBe('send');
+    applyRespawnConfigPatch(cfg, { replyDelivery: 'transcript' });
+    expect(cfg.replyDelivery).toBe('transcript');
+  });
+
   it('an empty workingDir is ignored; traex reconfigure follows traexAutoModel or codexRpcInput', () => {
     const cfg = forkSnapshot();
     expect(applyRespawnConfigPatch(cfg, { workingDir: '' }).traexReconfigure).toBe(false);
     expect(cfg.workingDir).toBe('/repo');
     expect(applyRespawnConfigPatch(cfg, { codexRpcInput: true }).traexReconfigure).toBe(true);
     expect(applyRespawnConfigPatch(cfg, { traexAutoModel: null }).traexReconfigure).toBe(true);
+  });
+});
+
+describe('respawnConfigPatchFromMessage', () => {
+  it('crash-park 恢复消息携带并应用新 replyDelivery 与启动配置', () => {
+    const cfg: Cfg = { ...forkSnapshot(), replyDelivery: 'send' };
+    const patch = respawnConfigPatchFromMessage({
+      model: 'sonnet', startupCommands: ['/effort low'], launchShell: 'bash', replyDelivery: 'transcript',
+    }, true);
+    applyRespawnConfigPatch(cfg, patch);
+    expect(cfg).toMatchObject({
+      model: 'sonnet', startupCommands: ['/effort low'], launchShell: 'bash', replyDelivery: 'transcript',
+    });
+  });
+
+  it('普通消息不得改变在跑 pane 的投递门控或启动配置', () => {
+    const cfg: Cfg = { ...forkSnapshot(), replyDelivery: 'transcript' };
+    const patch = respawnConfigPatchFromMessage({
+      model: 'sonnet', startupCommands: ['/effort low'], launchShell: 'bash', replyDelivery: 'send',
+    }, false);
+    applyRespawnConfigPatch(cfg, patch);
+    expect(cfg.model).toBe('sonnet');
+    expect(cfg.replyDelivery).toBe('transcript');
+    expect(cfg.startupCommands).toEqual(forkSnapshot().startupCommands);
+    expect(cfg.launchShell).toBe(forkSnapshot().launchShell);
+  });
+
+  it('triggerUserAuth 与 model/binding 一样不受 parked 门控，并保留 null 清空语义', () => {
+    const next = { enabled: false, tools: [] as string[] };
+    for (const parked of [false, true]) {
+      const cfg: Cfg = { ...forkSnapshot(), triggerUserAuth: { enabled: true, tools: ['bytedcli'] } };
+      const patch = respawnConfigPatchFromMessage({ triggerUserAuth: next }, parked);
+      expect(patch.triggerUserAuth).toBe(next);
+      applyRespawnConfigPatch(cfg, patch);
+      expect(cfg.triggerUserAuth).toEqual(next);
+    }
+    const cfg: Cfg = { ...forkSnapshot(), triggerUserAuth: { enabled: true, tools: ['bytedcli'] } };
+    applyRespawnConfigPatch(cfg, respawnConfigPatchFromMessage({ triggerUserAuth: null }, false));
+    expect(cfg.triggerUserAuth).toBeUndefined();
   });
 });

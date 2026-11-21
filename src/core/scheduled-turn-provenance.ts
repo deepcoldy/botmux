@@ -22,15 +22,12 @@
  *      (larkAppId/chatId) — the task cannot authorize a workflow command in a
  *      session belonging to another chat/bot.
  *   4. The injected owner gate still accepts the task's creator. The daemon
- *      (session-relay) injects the live resolvedAllowedUsers check, so a
- *      creator removed from the bot loses workflow authority immediately. The
- *      sandboxed CLI cannot read bots.json and injects a pass-through; the
- *      daemon re-checks before every mutation on the relay path. Note: the
- *      signed-envelope route (non-sandboxed CLIs with .dashboard-secret)
- *      verifies the shared secret but does not re-check owner membership —
- *      a removed creator's scheduled task can still start/cancel/retry runs
- *      in that configuration. This is a known limitation, not a regression:
- *      scheduled tasks themselves (prompt execution) never checked owner.
+ *      (session-relay and signed-envelope chat mutations) injects the live
+ *      resolvedAllowedUsers check after authenticating the per-turn session
+ *      capability, so a removed creator loses workflow authority immediately.
+ *      The sandboxed CLI cannot read bots.json and injects a pass-through;
+ *      its daemon re-checks before every mutation on the relay path. The CLI
+ *      schedules.json projection is only a preflight, never the final boundary.
  */
 import { randomUUID } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
@@ -292,7 +289,10 @@ export function authorizeScheduledTurn(input: {
   }
 
   const taskLarkAppId = task.larkAppId ?? input.sessionLarkAppId;
-  if (!input.isOwnerAllowed(taskLarkAppId, ownerOpenId)) {
+  if (task.ownerAccess === 'talk' || !input.isOwnerAllowed(taskLarkAppId, ownerOpenId)) {
+    // Talk-only creators never receive workflow mutation authority. Keep this
+    // in the shared authorizer: daemon relays read the host authority record,
+    // so removing the marker from a CLI-writable projection cannot bypass it.
     return { error: 'owner_revoked' };
   }
 

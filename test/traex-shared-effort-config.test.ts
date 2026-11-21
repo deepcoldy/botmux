@@ -54,7 +54,9 @@ describe('handwritten shared TraeX effort', () => {
 
   it('still rejects invalid effort syntax and preserves static capability validation for other CLIs', () => {
     expect(parse('traex', 'deepseek-v4-pro', 'unrecognized').reasoningEffort).toBeUndefined();
-    const parsed = parse('codex', 'gpt-5.2', 'ultra');
+    // gpt-6-luna has a verified five-level row; a model without one is kept for
+    // the launch-time catalogue check (codex-reasoning-live-catalog.test.ts).
+    const parsed = parse('codex', 'gpt-6-luna', 'ultra');
     expect(parsed.reasoningEffort).toBeUndefined();
     const ds = { larkAppId: 'shared', session: { cliId: 'codex', reasoningEffort: 'ultra' } } as Parameters<typeof __testOnly_sessionAgentConfig>[0];
     const update = vi.spyOn(sessionStore, 'updateSession').mockImplementation(() => {});

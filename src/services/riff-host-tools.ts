@@ -7,14 +7,18 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { StringDecoder } from 'node:string_decoder';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { botmuxCliInvocation, buildRelayHostEnv } from '../adapters/backend/sandbox.js';
-import { quotedAttachments } from './remote-runner-session-tool.js';
+import { quotedAttachments, QuotedAttachmentCountError, QuotedAttachmentLimitError } from './remote-runner-session-tool.js';
 import { isStandaloneBinary } from '../core/self-spawn.js';
 import { parseRiffUploadIndex } from './riff-upload-placeholder.js';
 import { parseSendInvocation, validateHostSendInvocation } from '../cli/send-invocation.js';
+import { parseQuotedReadOptions } from '../cli/history-read.js';
 
 export const RIFF_HOST_TOOLS_ROUTE = '/api/riff-host-tools';
 export const RIFF_HOST_BINDING_ENV = 'BOTMUX_RIFF_HOST_BINDING';
 export const RIFF_HOST_MAX_BYTES = 48 * 1024 * 1024;
+// 24 MiB of binary data becomes 32 MiB in base64, leaving room for text
+// and JSON metadata within the sandbox client's 48 MiB response limit.
+export const RIFF_HOST_MAX_ATTACHMENT_BYTES = 24 * 1024 * 1024;
 const OUTPUT_LIMIT = 2 * 1024 * 1024;
 const RECEIPT_LIMIT = 1000;
 const RECEIPT_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -38,8 +42,8 @@ export interface RiffHostContext {
 // destinations are authorized by the daemon, just like sandbox outbox sends.
 const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; files?: string }> = {
   send: {
-    values: '--chat-id --response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode',
-    bools: '--top-level --mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice --text --card',
+    values: '--chat-id --into --response-kind --mention --layout --expected-link --quote --as --plugin-card-action --card-json --image-mode',
+    bools: '--top-level --mention-back --no-mention --no-quote --anyway --attention --urgent --schedule-remove-self --voice --text --card --follow-thread-at --no-follow-thread',
     files: '--content-file --card-file --images --image --files --file --videos --video-covers --completion-proposal-file',
   },
   ask: { sub: ['buttons'], values: '--options --timeout', bools: '--json --multi', files: '--questions-file' },
@@ -49,8 +53,8 @@ const SPECS: Record<string, { sub?: string[]; values?: string; bools?: string; f
     values: '--name --id --prompt --schedule --model --reasoning-effort --calendar --calendar-day-type --topic-title',
     bools: '--top-level --topic --new-topic --silent --follow-active', files: '--prompt-file',
   },
-  history: { values: '--limit --scope', bools: '--with-card-json' },
-  quoted: { bools: '--raw' },
+  history: { values: '--limit --scope --view --query --type --since --until', bools: '--with-card-json' },
+  quoted: { bools: '--raw --no-download' },
   bots: { sub: ['list'], values: '--scope' },
   chat: { sub: ['create', 'members'], values: '--name --member --chat-mode --chat-id', bools: '--json' },
   project: {
@@ -99,6 +103,8 @@ export function riffHostFileArguments(argv: string[]): number[] {
       if (++i >= argv.length || argv[i]!.startsWith('--')) throw new Error('riff_host_missing_flag_value');
       if (files.has(flag!)) paths.push(i);
     }
+    const value = inline.length ? inline.join('=') : argv[i]!;
+    if (flag === '--into' && !/^om_[A-Za-z0-9_-]{1,128}$/.test(value)) throw new Error('riff_host_invalid_into');
   }
   return paths;
 }
@@ -149,6 +155,11 @@ export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHos
       argv[i] = path;
     }
     if (argv[0] === 'quoted') argv.push('--remote-runner-session-tool');
+    // Batch quoted exits 1 for per-id errors while still printing the
+    // successful messages and their downloaded attachments; package those too.
+    const quotedBatch = argv[0] === 'quoted' && (() => {
+      try { return parseQuotedReadOptions(argv.slice(1)).batch; } catch { return false; }
+    })();
     if (argv[0] === 'schedule' && argv[1] === 'add') {
       if (!ctx.workingDir) throw new Error('riff_host_working_directory_unavailable');
       argv.push('--workdir', ctx.workingDir);
@@ -180,11 +191,26 @@ export async function executeRiffHostTool(request: RiffHostRequest, ctx: RiffHos
         clearTimeout(deadline); clearInterval(fence);
         stdout += outDecoder.end(); stderr += errDecoder.end();
         try {
-          const packaged = argv[0] === 'quoted' && code === 0 ? quotedAttachments(stdout, env) : { stdout };
+          const packaged = argv[0] === 'quoted' && (code === 0 || (code === 1 && quotedBatch))
+            ? quotedAttachments(stdout, env, RIFF_HOST_MAX_ATTACHMENT_BYTES) : { stdout };
           resolve({ exitCode: failed || code === null ? 1 : code, stdout: packaged.stdout,
             stderr: failed ? 'riff_host_execution_unknown; do not repeat this operation automatically' : stderr,
             ...('attachments' in packaged ? { attachments: packaged.attachments } : {}) });
-        } catch { resolve({ exitCode: 1, stdout: '', stderr: 'riff_host_attachment_invalid' }); }
+        } catch (error) {
+          let diagnostic = 'riff_host_attachment_invalid';
+          if (error instanceof QuotedAttachmentLimitError) {
+            diagnostic = `riff_host_attachment_too_large: ${error.actualBytes} bytes > ${error.limitBytes} bytes; reduce the attachment size`;
+          } else if (error instanceof QuotedAttachmentCountError) {
+            diagnostic = `riff_host_attachment_too_many: ${error.actualCount} > ${error.limitCount}; request fewer message ids or add --no-download`;
+          } else {
+            // Expose filesystem failure categories without leaking host paths.
+            const code = (error as NodeJS.ErrnoException | null)?.code;
+            if (typeof code === 'string' && /^(ENOENT|EACCES|EPERM|EIO|ENOTDIR|ELOOP)$/.test(code)) {
+              diagnostic = `riff_host_attachment_read_failed: ${code}`;
+            }
+          }
+          resolve({ exitCode: 1, stdout: '', stderr: diagnostic });
+        }
       };
       child.once('error', () => { failed = true; });
       child.once('close', finish);

@@ -158,7 +158,7 @@ describe('worker TRAE rollout discovery', () => {
       TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS: 2000,
       currentTraexObservedPid: vi.fn(() => 10),
       traexSessionIdFromRolloutPath: () => 'native_current',
-      findTraexRolloutByPid: vi.fn(), persistCliSessionId: vi.fn(),
+      findTraexRolloutByPid: vi.fn(), noteTraexProcessFileSource: vi.fn(), persistCliSessionId: vi.fn(),
       log: vi.fn(),
       codexBridgeAttach: vi.fn(), codexBridgePendingSessionId: undefined,
       codexBridgeNotifyCliSessionId: vi.fn(), ...overrides,

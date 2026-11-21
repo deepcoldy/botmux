@@ -347,12 +347,17 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
   const service = scanService(runtimeDir, manifest.service?.mode);
   const cardActions = scanCardActions(runtimeDir, service);
   const commands = scanCommands(runtimeDir, service);
+  const prerequisiteEntry = 'prerequisites/index.mjs';
+  if (manifest.prerequisites && !isFile(resolvePluginPath(runtimeDir, prerequisiteEntry, 'prerequisites_entry'))) {
+    throw new Error('plugin_prerequisites_entry_not_found');
+  }
   const contributions: ScannedPluginContributions = {
     ...(skills ? { skills } : {}),
     ...(mcp ? { mcp } : {}),
     ...(dashboard ? { dashboard } : {}),
     ...(cli ? { cli } : {}),
     ...(service ? { service } : {}),
+    ...(manifest.prerequisites ? { prerequisites: { entry: prerequisiteEntry } } : {}),
   };
   if (cardActions) contributions.cardActions = cardActions;
   if (commands) contributions.commands = commands;

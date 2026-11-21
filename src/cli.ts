@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { sendCompletionHintKey } from './services/send-completion-hint.js';
-import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
+import { scheduleCreatePlacement, scheduleSupportLines } from './core/schedule-followup.js';
+import { replyDeliveryFromEnv, sendCompletionHintKey } from './services/send-completion-hint.js';
+import { selectReplyMessageId, parseReplyMessageTarget, crossChatOriginForSend, crossChatSenderForSend } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
@@ -12,6 +13,7 @@ import { buildReplyConsoleUrl } from './core/dashboard-url.js';
  *   botmux setup          — interactive first-time configuration
  *   botmux setup --no-open-platform-auto — skip Feishu Open Platform automation
  *   botmux setup list|add|configure|edit|remove — scripted (non-TUI) bot management, see `botmux setup help`
+ *   botmux setup add --local — persist a local bot with no Feishu app id or secret
  *   botmux clone <bot> [--name <name>] — create a new app, then copy an existing bot's configuration
  *   botmux start [--companion-secret-file <path> --companion-bot <appId>]
  *                         — start daemon and optionally its closed local companion API
@@ -41,10 +43,13 @@ import type { ManagedScheduleUpdateReceipt } from './core/schedule-managed-updat
 import { planScheduleFinalCleanup } from './cli/schedule-final-cleanup.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { constants as fsConstants, existsSync, mkdirSync, copyFileSync, createReadStream, readFileSync, writeFileSync, renameSync, readdirSync, statSync, unlinkSync, rmSync, realpathSync, openSync, fstatSync, readSync, closeSync } from 'node:fs';
-import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
+import { underReadIsolation, sendCredFilePath, readSendCredJsonWithRetry } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { writeAndFlush } from './cli/stdout-flush.js';
+import { parseHistoryReadOptions, parseQuotedReadOptions, readHistoryMessages, HISTORY_READ_USAGE, QUOTED_READ_USAGE } from './cli/history-read.js';
+import { withMessageReadContext } from './im/lark/message-read-context.js';
+import { readQuotedMessages } from './cli/quoted-read.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -94,8 +99,8 @@ import {
 } from './autostart.js';
 import { tmuxEnv, clientTmuxVersionForEnv, tmuxVersionAtLeast } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
-import { sandboxEnabled } from './adapters/backend/sandbox.js';
-import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
+import { RELAY_SESSION_TOOLS_MARKER, sandboxEnabled } from './adapters/backend/sandbox.js';
+import { mutateBotsJsonAtomic, writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
 import {
@@ -130,11 +135,13 @@ import {
   editInputFromFlags,
   isScriptedSetupInvocation,
   maskAppSecret,
+  parseCliRuntimeFlag,
   parseSetupCommand,
   resolveWelcomeMessageFile,
   SETUP_CLI_USAGE,
   type SetupCommand,
 } from './setup/setup-args.js';
+import { buildLocalBotRecord, findInvalidFleetCredentials, isLocalBotId, reallocateLocalBotId } from './setup/local-bot.js';
 import {
   detectUnusableOwnerEntries,
   normalizeManagedOwnerEntries,
@@ -144,7 +151,7 @@ import { interactiveSelect, pickChoice, pickCliSelection } from './setup/interac
 import { buildPreset, serializePreset, presetFilename } from './setup/agent-preset.js';
 import bundledScopeManifest from './setup/lark-scopes.json' with { type: 'json' };
 import type { CliId } from './adapters/cli/types.js';
-import type { CliLaunchMode } from './core/cli-launch-mode.js';
+import { validateCliLaunchModeConfig, type CliLaunchMode } from './core/cli-launch-mode.js';
 import type { CodexAppDispatchLedgerEntry } from './types.js';
 import {
   validateCodexAppManagedSendOrigin,
@@ -412,6 +419,8 @@ import {
   stripTrailingOaiMemoryCitation,
 } from './services/bridge-fallback-gate.js';
 import { recordBridgeReplyMarker } from './services/bridge-reply-marker.js';
+import { effectiveCrossChatFollowThreadMode, ensureCrossChatFollowThreadAtBinding, persistCrossChatFollowThreadOffBeforeProvider } from './services/cross-chat-follow-thread-store.js';
+import { recordSessionTurnReply } from './services/session-turns.js';
 import {
   commitRestartIntentAttemptTo,
   consumeRestartIntentTo,
@@ -743,12 +752,50 @@ function printInputHelp(title: string, lines: string[]): void {
   }
 }
 
+function normalizeBotsForWrite(bots: any[]): any[] {
+  const normalized = bots.map(bot => normalizeBotConfig(bot));
+  ensureUniqueBotProcessNames(normalized);
+  return normalized;
+}
+
 // Thin wrapper around setup/bots-store.writeBotsJsonAtomic so call-sites keep
 // the same name without passing BOTS_JSON_FILE explicitly each time.
 function writeBotsJsonAtomic(bots: any[]): void {
-  const normalized = bots.map(bot => normalizeBotConfig(bot));
-  ensureUniqueBotProcessNames(normalized);
-  writeBotsAtomic(BOTS_JSON_FILE, normalized);
+  writeBotsAtomic(BOTS_JSON_FILE, normalizeBotsForWrite(bots));
+}
+
+/**
+ * Append a local bot against the latest locked fleet generation. Both scripted
+ * and interactive setup use this path: id allocation and process-name checks
+ * cannot depend on the snapshot that happened to be read before prompting.
+ */
+function appendLocalBotConfigWithLock<T extends {
+  larkAppId?: string;
+  displayName?: string;
+  name?: string;
+}>(bot: T): {
+  bot: T & { larkAppId: string };
+  index: number;
+  migratedEnv: boolean;
+} {
+  return mutateBotsJsonAtomic(BOTS_JSON_FILE, latest => {
+    let existing = latest;
+    let migratedEnv = false;
+    if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
+      const legacy = parseDotEnvToBotConfig();
+      if (legacy.larkAppId && legacy.larkAppSecret) {
+        existing = [legacy];
+        migratedEnv = true;
+      }
+    }
+    const allocated = reallocateLocalBotId(
+      bot,
+      existing.map(entry => String(entry?.larkAppId ?? '')).filter(Boolean),
+    );
+    const index = existing.length;
+    const bots = normalizeBotsForWrite([...existing, allocated]);
+    return { bots, result: { bot: bots[index], index, migratedEnv } };
+  });
 }
 
 /**
@@ -878,6 +925,10 @@ async function finishOpenPlatformSetup(
   } = {},
 ): Promise<SetupOpenPlatformOutcome> {
   const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
+  if (isLocalBotId(appId)) {
+    say('\n本地机器人不关联飞书应用（larkAppId 只是本地身份），已跳过开放平台自动配置。');
+    return { status: 'skipped' };
+  }
   const {
     parseSetupOpenPlatformAutoFlag,
     automateOpenPlatformSetup,
@@ -1143,6 +1194,12 @@ export async function obtainCredentials(
 ): Promise<
   | {
       ok: true;
+      local: true;
+      displayName?: string;
+    }
+  | {
+      ok: true;
+      local?: false;
       appId: string;
       appSecret: string;
       brand: Brand;
@@ -1163,6 +1220,7 @@ export async function obtainCredentials(
         { label: t('setup.credentials.one_scan'), hint: t('setup.credentials.one_scan_hint') },
         { label: t('setup.credentials.pick_existing'), hint: t('setup.credentials.pick_existing_hint') },
         { label: t('setup.credentials.manual'), hint: t('setup.credentials.manual_hint') },
+        { label: '仅本地机器人', hint: '不扫码、不创建飞书应用，也不需要 App ID / Secret' },
       ],
       defaultIndex: 0,
       footer: t('setup.menu.footer_cancel'),
@@ -1298,6 +1356,11 @@ export async function obtainCredentials(
       console.log('   降级到手动输入 AppID/Secret。\n');
     }
 
+    if (method === 3) {
+      const displayName = (await ask(rl, '本地机器人显示名（可留空，将生成 local_bot）: ')).trim();
+      return { ok: true, local: true, ...(displayName ? { displayName } : {}) };
+    }
+
     // 手动输入（method 2；非 TTY 下也是 0/1 失败后的直落兜底）：扫码路径已用
     // tenant_brand 自动识别；手动路径没有这个信号，兜底让用户手选租户类型
     // （决定建应用 / 运行时的域名）。
@@ -1368,8 +1431,10 @@ async function promptBotConfig(
 ): Promise<Record<string, any> | null> {
   const creds = await obtainCredentials(rl, options);
   if (!creds.ok) return null;
+  const localBot = creds.local === true;
 
-  // 凭证立刻验证. 通不过不写 bots.json.
+  // 凭证立刻验证. 通不过不写 bots.json. 本地机器人没有飞书凭证，不走这条。
+  if (!localBot) {
   console.log(`\n${t('setup.credentials.validating')}`);
   const { validateCredentials } = await import('./setup/verify-permissions.js');
   const v = await validateCredentials(creds.appId, creds.appSecret, creds.brand);
@@ -1379,6 +1444,7 @@ async function promptBotConfig(
     return null;
   }
   console.log(`${t('setup.credentials.valid')}\n`);
+  }
 
   // CLI 适配器：可搜索的级联选择器（Aiden / Forge 等分组可进入二级菜单）。
   // 非交互终端自动回退为序号 / ID 文本输入。
@@ -1441,6 +1507,22 @@ async function promptBotConfig(
         break;
       }
     }
+  }
+
+  if (localBot) {
+    const record = buildLocalBotRecord({
+      displayName: creds.displayName,
+      cliId,
+      wrapperCli,
+      cliLaunchMode,
+      workingDir,
+      defaultWorkingDir,
+      existingIds: loadBotsJson().map(b => String(b?.larkAppId ?? '')).filter(Boolean),
+      ...(getDefaultLocale() === 'en' ? { lang: 'en' as const } : {}),
+    });
+    if (!ensureBotWorkingDirsExist(record, '仓库扫描根目录') || !ensureBotDefaultWorkingDirExists(record)) return null;
+    console.log(`\n本地机器人 ${record.larkAppId} 不关联飞书应用。这个 id 只是稳定的本地身份。`);
+    return normalizeBotConfig(record);
   }
 
   const bot: Record<string, any> = {
@@ -1992,6 +2074,103 @@ export async function cmdSetupScripted(
     return;
   }
 
+  if (cmd.action === 'add' && cmd.local) {
+    let cliChoice: ReturnType<typeof resolveCliSelection>;
+    try {
+      cliChoice = resolveCliSelection((cmd.flags.cli ?? 'claude-code').trim());
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    const draft = buildLocalBotRecord({
+      displayName: cmd.flags.name,
+      name: cmd.flags.name,
+      cliId: cliChoice.cliId,
+      wrapperCli: cmd.flags.wrapperCli?.trim() || cliChoice.wrapperCli,
+      cliLaunchMode: cliChoice.cliLaunchMode,
+      cliPathOverride: cmd.flags.cliPath?.trim(),
+      workingDir: cmd.flags.workingDir?.trim(),
+      defaultWorkingDir: cmd.flags.defaultWorkingDir?.trim() || (cmd.flags.workingDir?.trim() ? undefined : '~'),
+      model: cmd.flags.model,
+      backendType: cmd.flags.backend?.trim(),
+      lang: cmd.flags.lang?.trim(),
+      // Provisional only: appendLocalBotConfigWithLock reallocates under the lock.
+      existingIds: [],
+    });
+    let bot = draft;
+    try {
+      if (cmd.flags.cliRuntime?.trim()) {
+        // Shared editor semantics: validate the runtime against cliId/wrapper
+        // and persist its executable as the exact downgrade path shadow.
+        bot = applyBotConfigEdits(draft, {
+          cliRuntime: parseCliRuntimeFlag(cmd.flags.cliRuntime),
+          cliPathOverride: cmd.flags.cliPath,
+        });
+      }
+      validateCliLaunchModeConfig({
+        cliId: bot.cliId,
+        cliLaunchMode: bot.cliLaunchMode,
+        wrapperCli: bot.wrapperCli,
+        cliRuntime: bot.cliRuntime,
+        cliPathOverride: bot.cliPathOverride,
+      }, 'setup add --local');
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    const badDirs = invalidBotDirs(bot);
+    if (badDirs.length > 0) {
+      failSetupScripted(cmd.json, `目录不存在或不是目录: ${badDirs.join(', ')}。请先创建，未写入配置。`);
+      return;
+    }
+    const cliAvailability = checkCliAvailability({
+      cliId: bot.cliId ?? 'claude-code',
+      cliPathOverride: bot.cliPathOverride,
+      wrapperCli: bot.wrapperCli,
+      cliLaunchMode: bot.cliLaunchMode,
+    });
+    if (!cliAvailability.available) {
+      failSetupScripted(cmd.json, `所选 Agent 当前无法启动：${cliAvailability.reason ?? '本地启动依赖不可用'}。请先安装或修正 PATH / CLI 路径，未写入配置。`);
+      return;
+    }
+    let appended: { bot: typeof bot; index: number; migratedEnv: boolean };
+    try {
+      appended = appendLocalBotConfigWithLock(bot);
+    } catch (err) {
+      failSetupScripted(cmd.json, `写入 bot 配置失败: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    bot = appended.bot;
+    if (appended.migratedEnv) {
+      try { renameSync(ENV_FILE, ENV_FILE + '.bak'); } catch { /* config is already durable */ }
+    }
+    const index = appended.index;
+    const live = await ensureBotDaemonStarted(String(bot.larkAppId), { quiet: cmd.json });
+    const next = live.ok ? 'live' : (live.reason === 'fleet_down' ? 'botmux start' : 'botmux restart');
+    if (cmd.json) {
+      console.log(JSON.stringify({
+        ok: true,
+        action: 'add',
+        localIdentity: true,
+        appId: bot.larkAppId,
+        note: 'larkAppId 是稳定的本地身份，不是飞书 App ID',
+        bot: botJsonView(bot, index),
+        botsFile: BOTS_JSON_FILE,
+        openPlatform: { status: 'skipped' },
+        live,
+        next,
+      }, null, 2));
+    } else {
+      console.log(`✅ 已添加本地机器人 ${botProcessName(bot, index, PM2_NAME)} (${bot.larkAppId})`);
+      console.log('   未创建飞书应用，也未写入 App Secret。这个 id 只是本地身份。');
+      console.log(`   配置文件: ${BOTS_JSON_FILE}`);
+      if (live.ok) console.log(`✅ 已自动上线（${live.processName}）`);
+      else if (live.reason === 'fleet_down') console.log('下一步: botmux start（daemon 尚未运行）');
+      else console.log(`⚠️  自动上线失败（${live.message}）。下一步: botmux restart`);
+    }
+    return;
+  }
+
   if (cmd.action === 'add') {
     // 单机器人 .env 老配置：与 TUI「添加新机器人」一致，先迁移进 bots.json 再追加。
     let existing = bots;
@@ -2453,7 +2632,7 @@ export async function cmdSetupScripted(
       failSetupScripted(cmd.json, `AppID ${edited.larkAppId} 已被另一个机器人使用，配置未修改。`);
       return;
     }
-    if (appIdChanged || edited.larkAppSecret !== original.larkAppSecret) {
+    if ((appIdChanged || edited.larkAppSecret !== original.larkAppSecret) && edited.apiOnly !== true) {
       const { validateCredentials } = await import('./setup/verify-permissions.js');
       const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
       if (!v.ok) {
@@ -2544,6 +2723,11 @@ async function cmdClone(argv: string[]): Promise<void> {
     return;
   }
   const source = bots[sourceIndex];
+  if (source.localIdentity === true) {
+    console.error('本地机器人不支持克隆；请改用 setup add --local 新建本地机器人，或使用飞书机器人作为克隆源。');
+    process.exitCode = 1;
+    return;
+  }
   const owners = cloneOwnerEntries(
     source,
     process.env.BOTMUX_LARK_APP_ID,
@@ -2677,7 +2861,7 @@ async function cmdSetup(): Promise<void> {
         // (cmdRestart 不校验凭证, 只 cmdStart 校验, 所以编辑路径必须自己兜.)
         const appIdChanged = edited.larkAppId !== original.larkAppId;
         const appSecretChanged = edited.larkAppSecret !== original.larkAppSecret;
-        if (appIdChanged || appSecretChanged) {
+        if ((appIdChanged || appSecretChanged) && edited.apiOnly !== true) {
           console.log(`\n${t('setup.credentials.validating')}`);
           const { validateCredentials } = await import('./setup/verify-permissions.js');
           const v = await validateCredentials(edited.larkAppId, edited.larkAppSecret, botBrand(edited));
@@ -2739,14 +2923,21 @@ async function cmdSetup(): Promise<void> {
       }
 
       console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
-      const newBot = await promptBotConfig(rl);
+      let newBot = await promptBotConfig(rl);
       rl.close();
       if (!newBot) {
         console.log(`\n${t('setup.common.aborted_bots_json_untouched')}`);
         return;
       }
-      writeBotsJsonAtomic([...bots, newBot]);
-      console.log(`\n${t('setup.common.bot_added', { appId: newBot.larkAppId, count: bots.length + 1 })}`);
+      let addedIndex = bots.length;
+      if (newBot.localIdentity === true) {
+        const appended = appendLocalBotConfigWithLock(newBot);
+        newBot = appended.bot;
+        addedIndex = appended.index;
+      } else {
+        writeBotsJsonAtomic([...bots, newBot]);
+      }
+      console.log(`\n${t('setup.common.bot_added', { appId: newBot.larkAppId, count: addedIndex + 1 })}`);
       console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);
       await finishInteractiveOpenPlatformSetup(newBot);
       await printAddBotLiveHint(newBot.larkAppId);
@@ -2792,7 +2983,7 @@ async function cmdSetup(): Promise<void> {
     }
     console.log(`\n当前机器人: ${existingBot.larkAppId} (${existingBot.cliId ?? 'claude-code'})`);
     console.log(`\n── ${t('setup.menu.add_bot')} ──\n`);
-    const newBot = await promptBotConfig(rl);
+    let newBot = await promptBotConfig(rl);
     rl.close();
     if (!newBot) {
       console.log(`\n${t('setup.common.aborted_env_untouched')}`);
@@ -2800,7 +2991,12 @@ async function cmdSetup(): Promise<void> {
     }
 
     // 写新文件成功后才备份 .env. 失败不动两边.
-    writeBotsJsonAtomic([existingBot, newBot]);
+    if (newBot.localIdentity === true) {
+      const appended = appendLocalBotConfigWithLock(newBot);
+      newBot = appended.bot;
+    } else {
+      writeBotsJsonAtomic([existingBot, newBot]);
+    }
     renameSync(ENV_FILE, ENV_FILE + '.bak');
     console.log(`\n✅ 已迁移到多机器人配置`);
     console.log(`   ${t('setup.common.config_file', { path: BOTS_JSON_FILE })}`);
@@ -2961,24 +3157,12 @@ async function preflightConfiguredBotCredentials() {
   ]);
   if (botsForCheck.length > 0) {
     const { validateCredentials } = await import('./setup/verify-permissions.js');
-    const invalid: Array<{ appId: string; reason: string }> = [];
-    for (const b of botsForCheck) {
-      if (blockedBotIds.has(b.larkAppId)) continue;
-      if (!b.larkAppId || !b.larkAppSecret) {
-        invalid.push({ appId: b.larkAppId || '(空 appId)', reason: 'larkAppId/larkAppSecret 缺失' });
-        continue;
-      }
-      const v = await validateCredentials(b.larkAppId, b.larkAppSecret, botBrand(b));
-      if (!v.ok) {
-        if (v.error === 'invalid_credentials') {
-          invalid.push({ appId: b.larkAppId, reason: v.message });
-        } else {
-          // network / unknown — 不应该拦下启动, 走 WARN
-          console.warn(`⚠️  [${b.larkAppId}] 启动前凭证验证未成功（${v.error}）: ${v.message}`);
-          console.warn(`   daemon 仍会启动；启动后 dispatcher 会自行重试。`);
-        }
-      }
-    }
+    const invalid = await findInvalidFleetCredentials(botsForCheck, {
+      blockedBotIds,
+      validate: (appId, secret, brand) => validateCredentials(appId, secret, brand),
+      brandOf: botBrand,
+      warn: line => console.warn(line),
+    });
     if (invalid.length > 0) {
       console.error('\n❌ 以下机器人凭证无效，botmux start 中止：\n');
       for (const e of invalid) console.error(`   - ${e.appId}: ${e.reason}`);
@@ -3230,7 +3414,7 @@ async function cmdRestart(): Promise<void> {
 
       // Stop the live supervisor (graceful, then killed if it overruns) and
       // start a fresh one, which re-reads bots.json and (re)spawns every bot.
-      const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
+      const { restartFleet, resolveFleetMembers, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
         const r = restartFleet({
@@ -3245,8 +3429,8 @@ async function cmdRestart(): Promise<void> {
         }
         // Health-gate on every supervised member (bot daemons + dashboard), so a
         // restart that leaves the dashboard down is reported unhealthy, not "ok".
-        const names = fleetMemberNames();
-        health = waitFleetOnline(names, pm2StartVerifyTimeoutMs(names.length));
+        const members = resolveFleetMembers();
+        health = waitFleetOnline(members, pm2StartVerifyTimeoutMs(members.length));
         if (!health.healthy) {
           throw new Error(
             `[restart] fleet 未在超时时间内全部上线 (${health.online}/${health.expected})；`
@@ -3762,12 +3946,33 @@ async function cmdStatus(): Promise<void> {
   }
   const restartHint = formatRunningDaemonsRestartSummary(verCells.map(v => v === '-' ? undefined : v), resolveCurrentVersion());
   if (restartHint) console.log(restartHint);
+  await printTmuxStatusAdvice();
   if (sandbox.inSandbox) console.log(SANDBOX_STATUS_NOTE);
   warnIfLegacyBotmuxAlive();
   // The pm2 read-only projection print is gone: the fleet-state table above IS
   // the authoritative status now (supervisor-owned), so there is no second
   // registry to reconcile against. Legacy pm2 still gets surfaced by
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
+}
+
+/** tmux below the recommended version, or upgraded but the botmux server
+ *  still on the old one. Advisory only; read-only probes (never boots a server). */
+async function printTmuxStatusAdvice(): Promise<void> {
+  try {
+    // Not loadBotsJson(): that exits the process on a malformed file, and an
+    // advisory line must never turn `status` into a failure.
+    let bots: any[] = [];
+    try { bots = existsSync(BOTS_JSON_FILE) ? parseBotConfigsJson(readFileSync(BOTS_JSON_FILE, 'utf-8'), BOTS_JSON_FILE) : []; }
+    catch { return; }
+    if (!bots.some(b => (b?.backendType ?? config.daemon.backendType) === 'tmux')) return;
+    const [{ probeTmuxFacts, formatTmuxStatusAdvice }, { preferredManagedTmuxSocket }, { getDefaultLocale }] = await Promise.all([
+      import('./core/tmux-upgrade.js'),
+      import('./adapters/backend/tmux-socket.js'),
+      import('./i18n/index.js'),
+    ]);
+    const advice = formatTmuxStatusAdvice(await probeTmuxFacts(preferredManagedTmuxSocket()), getDefaultLocale());
+    if (advice) console.log(advice);
+  } catch { /* advisory */ }
 }
 
 function printUpgradeHelp(): void {
@@ -4230,6 +4435,7 @@ interface AdoptedFromData {
 
 interface SessionData {
   sessionId: string;
+  followThreadEpoch?: string;
   messageListenerRun?: import('./core/message-listener-silence.js').SilentMessageListenerRun;
   chatId: string;
   chatType?: 'group' | 'p2p';
@@ -4273,11 +4479,12 @@ interface SessionData {
   ownerUnionId?: string;
   creatorOpenId?: string;
   lastCallerOpenId?: string;
+  lastCallerIsBot?: boolean;
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
   quoteTargetId?: string;
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
   /** Per-turn reply targets（见 Session.replyTargets in types.ts）——排队/并发轮次各自的回复锚点。 */
-  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: import('./types.js').TurnParticipant[] }>;
+  replyTargets?: Record<string, { rootMessageId?: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean; senderOpenId?: string; participants?: import('./types.js').TurnParticipant[]; crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string } }>;
   /** Frozen per-turn reply contexts（见 Session.turnReplyContexts in types.ts）。
    *  `botmux send` 读取发送人类型，并用 `inThread` 判断 quote 目标当初是否从**顶层**
    *  进来，据此拦住「顶层 @ 之后那条消息才被开成话题」时 quote 把回复带进话题。 */
@@ -4287,6 +4494,7 @@ interface SessionData {
     inThread?: boolean;
     replyTargetSenderOpenId?: string;
     replyTargetSenderIsBot?: boolean;
+    crossChatOrigin?: { sourceChatId: string; followedChatId: string; followedRootMessageId: string };
   }>;
   codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
   codexAppGenerationCommits?: unknown;
@@ -6275,8 +6483,9 @@ async function noteTurnFinalOutsideReplyCard(
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | typeof FEEDBACK_SEND_LEASE_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
   let hostSecret: string | undefined;
@@ -6309,6 +6518,7 @@ async function postSessionCliIpc(
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(requestBody),
+    ...(signal ? { signal } : {}),
   } satisfies RequestInit;
   return hostSecret
     ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
@@ -6958,7 +7168,10 @@ async function cmdProject(argv: string[]): Promise<void> {
   botmux project resume [--phase <阶段>] [--focus <当前焦点>]
   botmux project workstream inspect --root <om_root> --source-app <cli_app> --source-session <id>
   botmux project workstream attach --root <om_root> --source-app <cli_app> --source-session <id>
-                                  --title <24字内标题> [--purpose <说明>] [--revision <n>] [--grant <id>]
+                                  --title <24字内标题> [--purpose <说明>] [--revision <n>]
+                                  [--grant <id> | --claim-owner]
+  botmux project workstream confirm --root <om_root> --source-app <cli_app> --source-session <id>
+                                   [--title <24字内标题>] [--purpose <说明>]
   botmux project workstream rename --root <om_root> --title <24字内标题>
   botmux project workstream update --root <om_root> --status <任务状态> [--content <说明>]
   botmux project workstream status [--root <om_root>]
@@ -7003,9 +7216,10 @@ async function cmdProject(argv: string[]): Promise<void> {
     'workstream' in parsed ? parsed.workstream : parsed.action as unknown as Record<string, unknown>,
   );
   if ('workstream' in parsed) {
-    const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; result?: unknown; grantId?: string };
+    const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; hint?: string; result?: unknown; grantId?: string };
     if (!response.ok || !result.ok) {
-      console.error(`workstream 操作失败: ${result.error ?? response.status}`);
+      const hintLine = typeof result.hint === 'string' && result.hint ? `\n提示: ${result.hint}` : '';
+      console.error(`workstream 操作失败: ${result.error ?? response.status}${hintLine}`);
       process.exitCode = 1;
     } else console.log(JSON.stringify(result.result ?? result, null, 2));
     return;
@@ -7171,12 +7385,23 @@ async function readCardUsageSnapshotForSend(
       // 定价覆盖：从 bot 配置解析，未配置时 undefined（costCny 缺省）。
       pricing: larkAppId ? resolvePricingForCli(larkAppId) : undefined,
     });
-    // Claude statusline 配额段（与 daemon 侧 getDaemonSessionUsageSnapshot 同口径）：
+    // Claude / Antigravity statusline 配额段（与 daemon 侧 getDaemonSessionUsageSnapshot 同口径）：
     // 本地直接读 <DATA_DIR>/statusline/<sid>/latest.json；沙盒内该目录对本会话可读写。
-    // 非空才带 key；读取失败不影响 transcript 用量。
+    // 严格按 CLI 门控（仅 claude-code / antigravity；unknown 失败闭合），并校验启动代际与模型兼容。
     try {
-      const quota = toCardQuota(readStatuslineSnapshot(resolveDataDir(), session.sessionId));
-      if (quota) return { ...configuredRuntime, ...snapshot, quota };
+      let botCliId: CliId | undefined;
+      try { botCliId = larkAppId ? getBot(larkAppId).config.cliId : undefined; } catch { /* sandbox / unknown bot */ }
+      const resolvedCliId = (session.cliId ?? session.adoptedFrom?.cliId ?? botCliId ?? 'unknown') as CliId | 'unknown';
+      if (resolvedCliId === 'claude-code' || resolvedCliId === 'antigravity') {
+        const launchGen = process.env.BOTMUX_STATUSLINE_GEN?.trim() || undefined;
+        const snap = readStatuslineSnapshot(resolveDataDir(), session.sessionId, { launchGen });
+        const observedModel = snapshot.tokens?.model?.trim();
+        const expectedModel = observedModel || configuredRuntime.model || session.model;
+        if (snap && isStatuslineModelCompatible(resolvedCliId, snap.model, expectedModel)) {
+          const quota = toCardQuota(snap);
+          if (quota) return { ...configuredRuntime, ...snapshot, quota };
+        }
+      }
     } catch { /* best-effort */ }
     return { ...configuredRuntime, ...snapshot };
   } catch {
@@ -8023,6 +8248,9 @@ const SEND_HELP_BODY = [
   '       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）',
   '       --top-level                     发顶层消息（不回复进当前话题）',
   '       --chat-id <oc_xxx>              指定目标群（默认当前话题所在群）',
+  '       --into <om_xxx>                 指定回复进目标群的话题根消息（root_id）',
+  '       --follow-thread-at              跨群发送时追踪该消息话题内的 @本bot 回复回源会话（默认开启）',
+  '       --no-follow-thread              跨群发送时不追踪该消息话题内的回复回源会话',
   '       --attention[=kind]              举手：发消息的同时把本会话标进 dashboard',
   '                                       「需要你」列并通知你——撞到只有你能解的硬阻碍',
   '                                       （授权/拍板/缺权限）无法继续时用。消息正文即看板',
@@ -8070,12 +8298,14 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               显式轮换 token，并打印新的登录 URL
   device enroll|status|logout
               在宿主终端注册、查看或清除 desktop device 凭证（AI CLI 会话内拒绝）
+  agy-accounts list|save|login|use|next|enable|disable|remove|clear-cooldown|auto-rotate|sync
+              托管 Antigravity (agy) 多账号凭据并配置限额自动轮换（AI CLI 会话内拒绝写操作）
   actor current --json
               返回当前 BotMux turn 的已验证企业用户名，不暴露 open_id/邮箱；脱离当前进程树时拒绝
   workspace-recycle discover|prepare|finish|status|hook
                          按精确工作区发现、回收会话并读取资源验证结果
-  execution current --json
-              只读核验当前进程所属的 bot/session/turn、执行尝试和 Worker 代次
+  execution current --json [--cli]
+              --cli 另返回实际启动模式、系统执行账号与原生操作权限；只读核验当前进程所属的 bot/session/turn、执行尝试和 Worker 代次
   execution background [--ttl-seconds <秒>] -- <命令> [参数...]
               在已验证定时轮次登记并启动后台任务，返回任务 ID、PID 与日志位置
   execution background-revoke <任务ID> --json
@@ -8165,6 +8395,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
 定时任务（可在 CLI 会话内自动推断 chat）:
 ${SCHEDULE_HELP_BODY}
 
+飞书主动发送（宿主 shell）:
+  post --bot <cli_...> --chat-id <oc_...> --text <正文>
+                       用指定 Bot 发到群、话题或私聊，详见 botmux post --help
+
 飞书消息（在 CLI 会话内自动推断 session）:
   chat rename <新群名称>               修改当前会话所在群的名称
   manager set|clear|status             设置、取消或查看当前群负责人（会话内使用）
@@ -8180,11 +8414,13 @@ ${SEND_HELP_BODY}
   bots invite --chat <chatId> --team <id> --agent <appId>...
                                        往「已存在的团队群」补人：把同团队、已 opt-in 的 agent + 各自 owner 一起拉进；
                                        详见 \`botmux bots invite --help\`
-  history [--limit N] [--scope session|thread|chat|ambient] [--with-card-json]
+  history [--limit N] [--scope session|thread|chat|ambient] [--view full|index]
+          [--query text] [--type text,interactive] [--since ISO] [--until ISO] [--with-card-json]
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
                                        thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文；
                                        --with-card-json 为每张卡片附原始结构化 JSON（消息均带 resources 附件 key）
-  quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
+  quoted <message_id> [<id> ...] [--raw] [--no-download]
+                                       按消息 id 定向读取（最多 20 条）；默认下载附件，--no-download 只取文本和资源信息；
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
@@ -8241,6 +8477,8 @@ ${SEND_HELP_BODY}
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"] [--chat-mode group|topic]
                                        用指定 bot 起新群（--chat-mode topic 建话题群）；详见 \`botmux create-group --help\`
+  create-group owner-notice [status|on|off]
+                                       建群后 @ 群主提醒的本机开关（默认开，所有建群入口通用）
 
 精确群对话授权（talk-only）:
   grant chat --bot <receiver> --chat-id <oc_...> --subject-bot <larkAppId>
@@ -9178,6 +9416,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     if (rest.includes('--calendar-day-type') && !calendarDayType) throw new Error('--calendar-day-type requires workday or restday');
     const { normalizeCalendarDayType } = await import('./services/work-calendar.js');
     const normalizedDayType = normalizeCalendarDayType(calendarDayType);
+    // Do not manufacture a work-calendar option when the caller supplied no
+    // calendar flags. `normalizeCalendarDayType(undefined)` returns the runtime
+    // default (`workday`), but serializing that default makes a plain `--topic`
+    // child look like it requested calendar expansion at the daemon boundary.
+    // Keep an explicitly supplied day type so the daemon can still reject an
+    // invalid `--calendar-day-type restday` without a calendar.
+    const scheduleCalendarFields = {
+      ...(calendar !== undefined ? { calendar } : {}),
+      ...(calendar !== undefined || calendarDayType !== undefined
+        ? { calendarDayType: normalizedDayType }
+        : {}),
+    };
     const model = argValue(rest, '--model')?.trim();
     if (rest.includes('--model') && !model) {
       console.error('--model 需要一个模型 id，例如 --model gpt-5.6-sol。');
@@ -9199,18 +9449,12 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       console.error('无法推断 chat-id。请加上 --chat-id <CHAT_ID>，或从 Lark 话题内的 CLI 会话中运行本命令。');
       process.exit(1);
     }
-    // Default to group top-level: a schedule created inside a topic session
-    // (including an adopted one) must not pin its results to that topic.
-    // --topic opts in explicitly; p2p sessions keep the legacy inference.
-    const executionPosition: 'top-level' | 'topic' | 'new-topic' = wantsNewTopic
-      ? 'new-topic'
-      : wantsTopLevel
-        ? 'top-level'
-        : wantsTopic || wantsFollowActive
-          ? 'topic'
-          : cur?.chatType === 'p2p'
-            ? (cur?.scope === 'chat' ? 'top-level' : rootMessageId ? 'topic' : 'top-level')
-            : 'top-level';
+    const placement = scheduleCreatePlacement({
+      newTopic: wantsNewTopic, topLevel: wantsTopLevel, topic: wantsTopic,
+      followActive: wantsFollowActive, untilDone: rest.includes('--until-done'),
+      chatId, currentChatId: cur?.chatId, currentChatType: cur?.chatType, currentScope: cur?.scope, rootMessageId,
+    });
+    const executionPosition = placement.position;
     const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
     if (scope === 'thread' && !rootMessageId) {
       console.error(wantsFollowActive
@@ -9301,8 +9545,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               silent,
               model,
               reasoningEffort,
-              calendar,
-              calendarDayType: normalizedDayType,
+              ...scheduleCalendarFields,
               ...(wantsFollowActive ? { followActive: true } : {}),
               ...(topicTitle ? { topicTitle } : {}),
               ...untilDoneFields,
@@ -9316,8 +9559,15 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         if (response) {
           const body = await response.json() as { ok?: boolean; task?: any; error?: string; detail?: string };
           if (!response.ok || body.ok !== true || !body.task) {
+            const daemonMessage = scheduleIpcErrorMessage(body.error);
+            // A live owning daemon can make a more specific, authority-backed
+            // decision than the CLI's preliminary creator probe. Preserve the
+            // probe error only for unrecognized / legacy daemon responses; in
+            // particular, a delegated child must surface the explicit
+            // no-grandchildren or per-turn quota refusal.
+            if (daemonMessage) throw new Error(daemonMessage);
             if (creatorAuthError) throw creatorAuthError;
-            throw new Error(scheduleIpcErrorMessage(body.error) ?? body.detail ?? body.error ?? `HTTP ${response.status}`);
+            throw new Error(body.detail ?? body.error ?? `HTTP ${response.status}`);
           }
           task = body.task;
         }
@@ -9335,8 +9585,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
             executionPosition, larkAppId, silent, model, reasoningEffort,
             deliver,
-            calendar,
-            calendarDayType: normalizedDayType,
+            ...scheduleCalendarFields,
             ...(wantsFollowActive ? { followActive: true } : {}),
             ...(topicTitle ? { topicTitle } : {}),
             ...(runAs ? { runAs } : {}),
@@ -9371,6 +9620,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     console.log(`   工作目录: ${workingDir}`);
     console.log(`   执行位置: ${executionPosition === 'new-topic' ? '每次新话题' : executionPosition === 'top-level' ? '群消息顶层' : '话题下'}`);
     if (executionPosition === 'new-topic' && topicTitle?.trim()) console.log(`   新话题标题: ${topicTitle.trim()}`);
+    if (placement.inferredFollowup) console.log('   跟进落点: 当前问题的原话题（显式 --top-level / --new-topic 可覆盖）');
+    for (const line of scheduleSupportLines(task, 'zh').slice(1)) console.log(`   ${line}`);
     if (wantsFollowActive) console.log(`   跟随活跃话题: 上次落点没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点 ${rootMessageId}）`);
     if (silent) console.log('   静默: 触发时不发「执行中」提示，由模型判断是否需要 botmux send 报警');
     if (task.untilDone) {
@@ -9744,7 +9995,65 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
   }
 }
 
+/**
+ * `sandboxWithholdBotSecret`: the sandbox cannot read this bot's send-cred, so
+ * history / quoted go to the host through the session outbox (see
+ * cli/relay-session-tool.ts). Returns only when the direct path should run:
+ * no relay, a host re-exec, or a sandbox that can still read its credential.
+ */
+async function relaySessionToolIfSecretWithheld(tool: 'history' | 'quoted', rest: string[]): Promise<void> {
+  const relayDir = process.env.BOTMUX_SEND_RELAY?.trim();
+  if (!relayDir || process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1') return;
+  // Only a watcher that serves session tools advertises it (credential-only
+  // relays and bots without the flag never do).
+  if (!existsSync(join(relayDir, RELAY_SESSION_TOOLS_MARKER))) return;
+  const appId = process.env.BOTMUX_LARK_APP_ID?.trim();
+  const sd = process.env.SESSION_DATA_DIR?.trim();
+  if (appId && sd) {
+    try { if (readSendCredJsonWithRetry(sendCredFilePath(sd, appId))) return; } catch { /* withheld → relay */ }
+  }
+  const { buildRelaySessionToolRequest, materializeRelayedAttachments } = await import('./cli/relay-session-tool.js');
+  const sid = process.env.BOTMUX_SESSION_ID?.trim();
+  const built = buildRelaySessionToolRequest(tool, rest, sid);
+  if (!built.ok) { console.error(built.error); process.exit(2); }
+  const originCapability = sid
+    ? readManagedOriginCapability(resolveDataDir(), sid, relayDir, process.env.BOTMUX_ORIGIN_CHANNEL_ID)?.capability
+    : undefined;
+  if (!originCapability) {
+    console.error(`botmux ${tool} refused: managed host relay capability is stale or missing`);
+    process.exit(2);
+  }
+  const id = randomBytes(8).toString('hex');
+  atomicWriteFileSync(join(relayDir, `${id}.req.json`), JSON.stringify({
+    command: 'session-tool',
+    tool: built.request,
+    originCapability,
+  }));
+  const resPath = join(relayDir, `${id}.res.json`);
+  const deadlineMs = Date.now() + 120_000;
+  while (Date.now() < deadlineMs) {
+    if (existsSync(resPath)) {
+      let res: { code?: number; stdout?: string; stderr?: string; attachments?: any[] };
+      try { res = JSON.parse(readFileSync(resPath, 'utf-8')); }
+      catch { await new Promise(r => setTimeout(r, 150)); continue; /* partial write */ }
+      try { unlinkSync(resPath); } catch { /* */ }
+      let stdout = res.stdout ?? '';
+      try {
+        stdout = materializeRelayedAttachments(stdout, res.attachments, join(relayDir, `${tool}-${id}`));
+      } catch (e) {
+        console.error(`relay: 无法写出附件：${(e as Error).message}`);
+        process.exit(1);
+      }
+      await mirrorRelayResponseAndExit({ code: res.code, stdout, stderr: res.stderr }, 0);
+    }
+    await new Promise(r => setTimeout(r, 150));
+  }
+  console.error(`relay: 等待宿主执行 ${tool} 超时（120s）`);
+  process.exit(1);
+}
+
 async function cmdHistory(rest: string[]): Promise<void> {
+  if (rest.includes('--help') || rest.includes('-h')) { console.log(HISTORY_READ_USAGE); return; }
   // Reject unrecognized flags BEFORE anything else. Every flag below is pulled
   // out of argv by name; a flag that is not pulled is simply not there, so a
   // typo or an invented flag used to be answered with the default behaviour and
@@ -9752,16 +10061,20 @@ async function cmdHistory(rest: string[]): Promise<void> {
   // `--scope thread`) came back as session scope, which for a thread-scope
   // session is the same window — so the mistake was invisible in the output too.
   const unknown = unknownFlags(rest, {
-    valueFlags: ['--limit', '--scope', '--session-id'],
+    valueFlags: ['--limit', '--scope', '--session-id', '--view', '--query', '--type', '--since', '--until'],
     boolFlags: ['--with-card-json'],
   });
   if (unknown.length > 0) {
     console.error(`未知参数: ${unknown.join(' ')}`);
-    console.error('  botmux history [--limit <n>] [--scope session|thread|chat|ambient] [--session-id <id>] [--with-card-json]');
+    console.error(HISTORY_READ_USAGE);
     process.exit(2);
   }
+  let readOptions: ReturnType<typeof parseHistoryReadOptions>;
+  try { readOptions = parseHistoryReadOptions(rest); }
+  catch (err: any) { console.error(err.message); process.exit(2); }
   // No-transport turn has no Feishu chat history to read — central hard gate.
   assertTurnTransportOrExit('history');
+  await relaySessionToolIfSecretWithheld('history', rest);
   // Read isolation: register this bot from its cred file so the Lark client is
   // available without reading the denied bots.json (same as cmdSend).
   await registerSelfFromCredFile();
@@ -9786,149 +10099,116 @@ async function cmdHistory(rest: string[]): Promise<void> {
 
   const withCardJson = rest.includes('--with-card-json');
   const { getMessageDetail, listAmbientChatMessages, listThreadMessages, listChatMessages } = await import('./im/lark/client.js');
-  const { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, extractResources, createImgNumberer } = await import('./im/lark/message-parser.js');
+  const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
   try {
-    // Chat-scope sessions (普通群整群一会话) have no thread to walk — list the
-    // chat container directly and let the caller cap with --limit. Thread-scope
-    // sessions walk the thread container by root_id. `--scope chat|ambient`
-    // lets a thread-scope session intentionally read outside its thread when
-    // it needs the surrounding group conversation (for example `/t` spawned
-    // from an ongoing 普通群 discussion).
-    const isChatScope = s.scope === 'chat';
-    const effectiveScope = scopeArg === 'session'
-      ? (isChatScope ? 'chat' : 'thread')
-      : scopeArg;
+    await withMessageReadContext(async () => {
+      // Chat-scope sessions (普通群整群一会话) have no thread to walk — list the
+      // chat container directly and let the caller cap with --limit. Thread-scope
+      // sessions walk the thread container by root_id. `--scope chat|ambient`
+      // lets a thread-scope session intentionally read outside its thread when
+      // it needs the surrounding group conversation (for example `/t` spawned
+      // from an ongoing 普通群 discussion).
+      const isChatScope = s.scope === 'chat';
+      const effectiveScope = scopeArg === 'session'
+        ? (isChatScope ? 'chat' : 'thread')
+        : scopeArg;
 
-    if (effectiveScope === 'thread' && isChatScope) {
-      console.error('当前 session 是 chat-scope，没有 thread 历史可读取。请使用 --scope chat。');
-      process.exit(1);
-    }
-
-    if (effectiveScope === 'ambient' && isChatScope) {
-      console.error('当前 session 是 chat-scope，没有 thread root 可作为 ambient 边界。请使用 --scope chat。');
-      process.exit(1);
-    }
-
-    // Silent listener sessions anchor on an internal `ml:` route id that must
-    // never reach Lark read APIs; use the frozen real source message id.
-    const threadRootMessageId = s.messageListenerRun?.sourceMessageId ?? s.rootMessageId;
-
-    let ambientBeforeCreateTime: string | undefined;
-    if (effectiveScope === 'ambient') {
-      try {
-        const detail = await getMessageDetail(appId, threadRootMessageId, { userCardContent: false });
-        ambientBeforeCreateTime = detail?.items?.[0]?.create_time;
-      } catch {
-        // Best-effort only: ambient history should still work if the root
-        // message was withdrawn or is otherwise unavailable; it will then fall
-        // back to the chat tail with current-thread messages filtered out.
+      if (effectiveScope === 'thread' && isChatScope) {
+        console.error('当前 session 是 chat-scope，没有 thread 历史可读取。请使用 --scope chat。');
+        process.exit(1);
       }
-    }
 
-    const raw = effectiveScope === 'chat'
-      ? await listChatMessages(appId, s.chatId, limit)
-      : effectiveScope === 'ambient'
-        ? await listAmbientChatMessages(appId, s.chatId, limit, {
-            beforeCreateTime: ambientBeforeCreateTime,
-            excludeRootMessageId: threadRootMessageId,
-          })
-        : await listThreadMessages(appId, s.chatId, threadRootMessageId, limit);
-    // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
-    // path in daemon.ts. Each message gets its own numberer with resources
-    // assigned BEFORE text extraction, so in-body [图片 N] placeholders match
-    // the surfaced `resources` order (same contract as parseEventMessage).
-    // Resources carry key+name only — no download here; `botmux quoted <om_id>`
-    // fetches any message's full text AND downloads its attachments locally.
-    const messages = await Promise.all(raw.map(async (m: any) => {
-      const numberer = createImgNumberer();
-      let resources = extractResources(m.msg_type ?? 'text', m.body?.content ?? '', numberer);
-      const parsed = parseApiMessage(m, numberer);
-      let cardJson: unknown;
-      // `im.v1.message.list` returns Lark's simplified "请升级客户端" fallback for
-      // complex cards — the whole body (user-forwarded) or nested sub-cards
-      // buried mid-body (Argos alarms). Those are the cards where the list view
-      // alone is incomplete, so resolve them by unioning both `im.message.get`
-      // representations (server-rendered + full structured). Failures keep the
-      // list text. Simple cards (no fallback) already render fully here —
-      // --with-card-json resolves ALL cards since the structured JSON only
-      // exists on the `im.message.get` representation.
-      if (parsed.msgType === 'interactive' && (withCardJson || cardContentHasUpgradeFallback(parsed.content))) {
-        // Fresh numberer: the resolve REPLACES both content and resources, so
-        // its [图片 N] numbering must restart at 1 alongside merged.resources.
-        // Keeping the list-view resources would leak the upgrade-fallback
-        // shell's phantom image (a "请升级" placeholder, absent from the real
-        // card) into every complex card's resource list.
-        const cardNumberer = createImgNumberer();
-        const merged = await resolveMergedCardContent(appId, parsed.messageId, cardNumberer).catch(() => null);
-        if (merged) {
-          parsed.content = merged.text;
-          resources = merged.resources;
-          if (withCardJson) {
-            try { cardJson = JSON.parse(merged.structuredContent); }
-            catch { cardJson = merged.structuredContent; }
-          }
+      if (effectiveScope === 'ambient' && isChatScope) {
+        console.error('当前 session 是 chat-scope，没有 thread root 可作为 ambient 边界。请使用 --scope chat。');
+        process.exit(1);
+      }
+
+      // Listener routes are internal; Lark reads require the frozen source message.
+      const threadRootMessageId = s.messageListenerRun?.sourceMessageId ?? s.rootMessageId;
+      let ambientBeforeCreateTime: string | undefined;
+      if (effectiveScope === 'ambient') {
+        try {
+          const detail = await getMessageDetail(appId, threadRootMessageId, { userCardContent: false });
+          ambientBeforeCreateTime = detail?.items?.[0]?.create_time;
+        } catch {
+          // Best-effort only: ambient history should still work if the root
+          // message was withdrawn or is otherwise unavailable; it will then fall
+          // back to the chat tail with current-thread messages filtered out.
         }
       }
-      if (parsed.msgType === 'merge_forward') {
-        const { extraResources } = await expandMergeForward(appId, parsed.messageId, parsed, numberer);
-        if (extraResources.length) resources = [...resources, ...extraResources];
-      }
-      return {
-        ...parsed,
-        ...(resources.length ? { resources } : {}),
-        ...(cardJson !== undefined ? { cardJson } : {}),
-      };
-    }));
-    // Range guidance, emitted at the moment the model is actually reading
-    // history. The decisive fact is `sessionScope` (this session's own scope),
-    // NOT the chat's `chat_mode`: a thread opened inside a 普通群 keeps
-    // chat_mode='group' while its session is thread-scope, so reasoning from the
-    // group type would wrongly conclude "I may search the whole chat". Both
-    // `--scope` gates above key on isChatScope for exactly that reason.
-    //
-    // Wording note: describe only what the model can OBSERVE. Daemon-side
-    // invocations (`/t` and friends) are stripped before the prompt is built, so
-    // the model never sees them — naming them here would be an instruction it
-    // cannot act on. Describe the symptom instead: the topic starts mid-discussion
-    // and its own history looks too short to explain the task.
-    const rangeHint = isChatScope
-      ? '范围：本次返回当前群整群最近 N 条（不限于 session 创建之后）。需要更早的消息就把 `--limit` 调大。当前是 chat-scope 会话，没有话题边界，`--scope thread` / `--scope ambient` 在此不适用。'
-      : effectiveScope === 'thread'
-        ? '范围：本次只返回当前话题内的消息。如果话题内的内容不足以说明任务背景（例如任务像是延续话题之外的讨论、出现没有出处的指代或结论），说明上下文在话题外的群聊里：用 `botmux history --scope ambient --limit 20` 读取本话题之外、话题根之前的群聊消息（自动排除本话题）。注意隐私边界：ambient 会读到话题外的群聊内容，仅在确实需要群聊背景时使用，并优先用较小的 limit。'
+
+      const raw = effectiveScope === 'chat'
+        ? await listChatMessages(appId, s.chatId, limit)
         : effectiveScope === 'ambient'
-          ? '范围：本次返回的是话题之外的群聊消息（话题根之前，已排除本话题）。要回到本话题内的消息用 `botmux history`（默认即本话题）。'
-          : '范围：本次按 `--scope chat` 返回整群最近 N 条（含本话题内的消息）。只要本话题内的用 `botmux history`（默认即本话题）。';
-    const historyResult = {
-      sessionId: sid,
-      chatId: s.chatId,
-      scope: effectiveScope,
-      sessionScope: isChatScope ? 'chat' : 'thread',
-      ...(isChatScope ? {} : { rootMessageId: s.rootMessageId }),
-      ...(effectiveScope === 'ambient' ? {
-        ambient: {
-          source: 'chat',
-          beforeCreateTime: ambientBeforeCreateTime,
-          excludeRootMessageId: s.rootMessageId,
-        },
-      } : {}),
-      messages,
-      total: messages.length,
-      rangeHint,
-      // Discoverability: agents reading history often need the actual image
-      // bytes (alert charts) or the raw card JSON — both live one command away.
-      ...(messages.some(m => (m as any).resources?.length || m.msgType === 'interactive') ? {
-        hint: '查看某条消息的附件图片/文件或卡片全文：botmux quoted <messageId>（任意消息 id 均可，附件会下载到本地）；需要原始卡片 JSON：botmux quoted <messageId> --raw 或本命令加 --with-card-json',
-      } : {}),
-    };
-    const decorated = await decorateSessionCliLinkRefResult({
-      sessionId: sid,
-      appId,
-      sourceType: 'history',
-      sourceId: `${effectiveScope}:${messages.length}`,
-      value: historyResult,
+          ? await listAmbientChatMessages(appId, s.chatId, limit, {
+              beforeCreateTime: ambientBeforeCreateTime,
+              excludeRootMessageId: threadRootMessageId,
+            })
+          : await listThreadMessages(appId, s.chatId, threadRootMessageId, limit);
+      // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
+      // path in daemon.ts. Each message gets its own numberer with resources
+      // assigned BEFORE text extraction, so in-body [图片 N] placeholders match
+      // the surfaced `resources` order (same contract as parseEventMessage).
+      // Resources carry key+name only — no download here; `botmux quoted <om_id>`
+      // fetches any message's full text AND downloads its attachments locally.
+      const { messages, retrieval } = await readHistoryMessages(appId, raw, readOptions, withCardJson, {
+        expandMergeForward, resolveMergedCard: resolveMergedCardContent,
+      });
+      // Range guidance, emitted at the moment the model is actually reading
+      // history. The decisive fact is `sessionScope` (this session's own scope),
+      // NOT the chat's `chat_mode`: a thread opened inside a 普通群 keeps
+      // chat_mode='group' while its session is thread-scope, so reasoning from the
+      // group type would wrongly conclude "I may search the whole chat". Both
+      // `--scope` gates above key on isChatScope for exactly that reason.
+      //
+      // Wording note: describe only what the model can OBSERVE. Daemon-side
+      // invocations (`/t` and friends) are stripped before the prompt is built, so
+      // the model never sees them — naming them here would be an instruction it
+      // cannot act on. Describe the symptom instead: the topic starts mid-discussion
+      // and its own history looks too short to explain the task.
+      const rangeHint = isChatScope
+        ? '范围：本次返回当前群整群最近 N 条（不限于 session 创建之后）。需要更早的消息就把 `--limit` 调大。当前是 chat-scope 会话，没有话题边界，`--scope thread` / `--scope ambient` 在此不适用。'
+        : effectiveScope === 'thread'
+          ? '范围：本次只返回当前话题内的消息。如果话题内的内容不足以说明任务背景（例如任务像是延续话题之外的讨论、出现没有出处的指代或结论），说明上下文在话题外的群聊里：用 `botmux history --scope ambient --limit 20` 读取本话题之外、话题根之前的群聊消息（自动排除本话题）。注意隐私边界：ambient 会读到话题外的群聊内容，仅在确实需要群聊背景时使用，并优先用较小的 limit。'
+          : effectiveScope === 'ambient'
+            ? '范围：本次返回的是话题之外的群聊消息（话题根之前，已排除本话题）。要回到本话题内的消息用 `botmux history`（默认即本话题）。'
+            : '范围：本次按 `--scope chat` 返回整群最近 N 条（含本话题内的消息）。只要本话题内的用 `botmux history`（默认即本话题）。';
+      const historyResult = {
+        sessionId: sid,
+        chatId: s.chatId,
+        scope: effectiveScope,
+        sessionScope: isChatScope ? 'chat' : 'thread',
+        ...(isChatScope ? {} : { rootMessageId: s.rootMessageId }),
+        ...(effectiveScope === 'ambient' ? {
+          ambient: {
+            source: 'chat',
+            beforeCreateTime: ambientBeforeCreateTime,
+            excludeRootMessageId: threadRootMessageId,
+          },
+        } : {}),
+        messages,
+        total: messages.length,
+        incomplete: retrieval.detailFailures.length > 0,
+        retrieval: { ...retrieval, requestedLimit: limit, countLimitReached: raw.length >= limit },
+        rangeHint,
+        // Discoverability: agents reading history often need the actual image
+        // bytes (alert charts) or the raw card JSON — both live one command away.
+        ...(readOptions.view === 'index' || messages.some(m => (m as any).resources?.length || m.msgType === 'interactive') ? {
+          hint: readOptions.view === 'index'
+            ? '索引未展开卡片或转发。用 botmux quoted <id> [<id> ...] --no-download 定向读全文；需要附件时去掉 --no-download。queryMatch=deferred 表示未展开内容尚未核验关键词。筛选仅覆盖本次 --limit 窗口，需要更早消息请增大 --limit。'
+            : '查看某条消息的附件图片/文件或卡片全文：botmux quoted <messageId>（附件会下载到本地）；只读文本用 --no-download，可一次指定多个 id；原始卡片用 --raw。筛选仅覆盖本次 --limit 窗口。',
+        } : {}),
+      };
+      const decorated = readOptions.view === 'index' ? historyResult : await decorateSessionCliLinkRefResult({
+        sessionId: sid,
+        appId,
+        sourceType: 'history',
+        sourceId: `${effectiveScope}:${messages.length}`,
+        value: historyResult,
+      });
+      console.log(JSON.stringify(decorated, null, 2));
     });
-    console.log(JSON.stringify(decorated, null, 2));
   } catch (err: any) {
     console.error(`获取消息失败: ${err.message}`);
     process.exit(1);
@@ -9937,92 +10217,46 @@ async function cmdHistory(rest: string[]): Promise<void> {
 
 
 async function cmdQuoted(rest: string[]): Promise<void> {
-  // No-transport turn cannot fetch a quoted Feishu message — central hard gate.
+  if (rest.includes('--help') || rest.includes('-h')) { console.log(QUOTED_READ_USAGE); return; }
   assertTurnTransportOrExit('quoted');
+  let readOptions: ReturnType<typeof parseQuotedReadOptions>;
+  try { readOptions = parseQuotedReadOptions(rest); }
+  catch (err: any) { console.error(err.message); process.exit(2); }
   const sessionIdArg = argValue(rest, '--session-id');
   const remoteRunnerSessionTool = rest.includes('--remote-runner-session-tool');
   if (remoteRunnerSessionTool && process.env.BOTMUX_HOST_RELAY_AUTHORIZED !== '1') {
-    console.error('botmux quoted refused: --remote-runner-session-tool requires the owning worker\'s live turn authority');
+    console.error("botmux quoted refused: --remote-runner-session-tool requires the owning worker\'s live turn authority");
     process.exit(2);
   }
-  // Positional message_id is required. The id comes verbatim from the
-  // `[用户引用了消息 用 botmux quoted om_xxx 查看]` prompt prefix the daemon
-  // injects when the user used the Lark quote-reply UI. Skip --session-id and
-  // its value so `botmux quoted --session-id <uuid> om_xxx` doesn't pick up
-  // the uuid as the message id.
-  const messageId = firstPositional(rest, ['--session-id']);
-  const rawFlag = rest.includes('--raw');
-  if (!messageId) {
-    console.error('用法: botmux quoted <message_id> [--raw] [--session-id <id>]');
-    process.exit(1);
-  }
-
-  // Read isolation: register this bot from its own send-cred file so the Lark
-  // client (getMessageDetail below) is available WITHOUT reading the denied
-  // bots.json — same as cmdHistory / cmdSend. Missing this was why a sandboxed
-  // isolated bot's `botmux quoted` failed "Bot not registered".
+  await relaySessionToolIfSecretWithheld('quoted', rest);
   await registerSelfFromCredFile();
   const { sid, larkAppId: appId, session: quotedSession } = await resolveSessionAppId(sessionIdArg);
-  // Target-aware gate (see cmdHistory).
   assertSessionTransportOrExit({ chatId: quotedSession.chatId, larkAppId: appId }, 'quoted');
-
   const { getMessageDetail } = await import('./im/lark/client.js');
   const { expandMergeForward } = await import('./im/lark/merge-forward.js');
-  const { getQuotedMessageDetail, renderQuotedMessage } = await import('./cli/quoted-render.js');
   const { resolveMergedCardContent } = await import('./im/lark/message-parser.js');
   try {
-    const detail = await getQuotedMessageDetail(appId, messageId, getMessageDetail);
-    const msg = detail?.items?.[0];
-    if (!msg) {
-      console.error(`未找到消息 ${messageId}`);
-      process.exit(1);
-    }
-    if (remoteRunnerSessionTool && (msg as any).chat_id !== quotedSession.chatId) {
-      console.error('botmux quoted refused: message is outside the current session chat');
-      process.exit(2);
-    }
-    // Interactive cards are re-resolved inside the render pipeline (both
-    // im.message.get representations unioned, content + resources replaced
-    // wholesale with fresh [图片 N] numbering — see renderQuotedMessage).
-    const rendered = await renderQuotedMessage(appId, msg, expandMergeForward, resolveMergedCardContent, detail);
-    if (rawFlag) {
-      if (rendered.mergedStructuredContent !== undefined) {
-        // --raw: surface the full structured card JSON (v2 body/elements) so
-        // automation can read exact field values, button URLs and image keys
-        // instead of re-parsing the rendered text (告警自动化场景).
-        try { (rendered as { cardJson?: unknown }).cardJson = JSON.parse(rendered.mergedStructuredContent); }
-        catch { (rendered as { cardJson?: unknown }).cardJson = rendered.mergedStructuredContent; }
-      } else {
-        // Non-card messages (and cards whose merge failed): expose the
-        // original body content verbatim for the same automation use case.
-        (rendered as { rawContent?: string }).rawContent = msg.body?.content ?? '';
-      }
-    }
-    delete rendered.mergedStructuredContent;
-    // The referenced message's file/media resources arrive as key+name only. A
-    // read-isolated agent can't call the Lark resource API itself (bots.json
-    // creds are deny-read), so download the bytes HERE — via the bot client
-    // registered above — into this bot's OWN attachment bucket
-    // (attachments/<appId>/<messageId>/, read-allowed by its carve-out; sandbox
-    // denies file *reads*, not writes). Surface the local paths so the agent can
-    // actually open the file instead of only seeing its key.
-    if (rendered.resources?.length) {
-      const { downloadResources } = await import('./core/session-manager.js');
-      const { attachments, needLogin } = await downloadResources(appId, messageId, rendered.resources);
-      (rendered as { attachments?: unknown }).attachments = attachments;
-      if (needLogin) (rendered as { needLogin?: boolean }).needLogin = true;
-    }
-    const decorated = await decorateSessionCliLinkRefResult({
-      sessionId: sid,
-      appId,
-      sourceType: 'quoted',
-      sourceId: messageId,
-      value: rendered,
+    const result = await readQuotedMessages(appId, {
+      ...readOptions, raw: rest.includes('--raw'),
+      ...(remoteRunnerSessionTool ? { currentChatId: quotedSession.chatId } : {}),
+    }, {
+      getMessageDetail, expandMergeForward, resolveMergedCard: resolveMergedCardContent,
+      downloadResources: async (...args) => {
+        const { downloadResources } = await import('./core/session-manager.js');
+        return downloadResources(...args);
+      },
+      decorate: message => decorateSessionCliLinkRefResult({
+        sessionId: sid, appId, sourceType: 'quoted', sourceId: message.messageId, value: message,
+      }),
     });
-    console.log(JSON.stringify(decorated, null, 2));
+    if (readOptions.batch) {
+      console.log(JSON.stringify({ sessionId: sid, ...result, requestedCount: readOptions.messageIds.length,
+        total: result.messages.length, incomplete: result.errors.length > 0 }, null, 2));
+      if (result.errors.length) process.exitCode = 1;
+    } else console.log(JSON.stringify(result.messages[0], null, 2));
   } catch (err: any) {
     console.error(`获取被引用消息失败: ${err.message}`);
-    process.exit(1);
+    process.exit(err.exitCode ?? 1);
   }
 }
 
@@ -10209,7 +10443,7 @@ import { applyCompanionStartupOptions } from './cli/companion-startup-options.js
 import { unknownFleetArgs } from './cli/fleet-args.js';
 import { getSessionUsageSnapshot } from './core/cost-calculator.js';
 import { normalizeCardUsageSnapshot } from './cli/card-usage-normalize.js';
-import { readStatuslineSnapshot, toCardQuota } from './services/statusline-snapshot.js';
+import { isStatuslineModelCompatible, readStatuslineSnapshot, toCardQuota } from './services/statusline-snapshot.js';
 import {
   resolveQuoteTarget,
   shouldSuppressImplicitReplyTarget,
@@ -10449,7 +10683,7 @@ async function relaySend(
   // identity and the routing wish (must match the watcher's allowlist); path
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
-  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
+  const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level', '--follow-thread-at', '--no-follow-thread']);
   const FLAGS_VAL = new Set(['--mention', '--quote', '--reply-to', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
@@ -10709,7 +10943,7 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
     if (process.env.BOTMUX_API_ONLY === '1') return true;
     try {
       const credPath = sendCredFilePath(process.env.SESSION_DATA_DIR as string, larkAppId);
-      return JSON.parse(readFileSync(credPath, 'utf-8'))?.apiOnly === true;
+      return readSendCredJsonWithRetry(credPath)?.apiOnly === true;
     } catch {
       // No readable cred file: we cannot tell. Say "not apiOnly" rather than
       // crash — the transport boundary still fail-closes downstream
@@ -10896,15 +11130,15 @@ async function registerSelfFromCredFile(): Promise<void> {
   const appId = process.env.BOTMUX_LARK_APP_ID;
   const sd = process.env.SESSION_DATA_DIR;
   if (!appId || !sd) return;
-  const { sendCredFilePath } = await import('./adapters/cli/read-isolation.js');
-  let cred: { larkAppSecret?: string; brand?: string; apiOnly?: boolean; feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput };
-  try {
-    // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
-    // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
-    cred = JSON.parse(readFileSync(sendCredFilePath(sd, appId), 'utf-8'));
-  } catch {
-    return; // no cred file → not isolated (or first layer supplies creds elsewhere)
-  }
+  const { sendCredFilePath, readSendCredJsonWithRetry } = await import('./adapters/cli/read-isolation.js');
+  // send-cred lives in the bot's BOT_HOME (<BOTMUX_HOME>/bots/<appId>/send-cred.json);
+  // sendCredFilePath takes SESSION_DATA_DIR and derives BOTMUX_HOME (its parent).
+  // A short parse retry covers an in-place update without treating EPERM as transient.
+  const cred = readSendCredJsonWithRetry(sendCredFilePath(sd, appId)) as {
+    larkAppSecret?: string; brand?: string; apiOnly?: boolean;
+    feedback?: import('./services/feedback-policy.js').FeedbackPolicyInput;
+  } | undefined;
+  if (!cred) return; // no cred file → not isolated (or first layer supplies creds elsewhere)
   // apiOnly bots legitimately have an empty secret — don't bail on that, but DO
   // carry the apiOnly flag through so the reconstructed config keeps the
   // transport boundary (getBotClient throws for apiOnly). A non-apiOnly bot with
@@ -11285,7 +11519,11 @@ function resolveDispatchDispatcherAppId(input: {
   return !dispatcherAppId || dispatcherAppId === input.selfAppId ? undefined : dispatcherAppId;
 }
 
-async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflight?: SendPreflight): Promise<void> {
+async function cmdSend(
+  rest: string[],
+  beginFeedbackEffect?: (relay?: FeedbackSendLeaseRelay) => Promise<void>,
+  preflight?: SendPreflight,
+): Promise<void> {
   const resolved = preflight ?? await preflightSendInvocation(rest);
   if (resolved.kind === 'help') {
     console.log(SEND_HELP_BODY);
@@ -11371,6 +11609,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     || managedOriginLegacyIsolationProbeAccess(osUserHomeDir)
     === 'sandbox_denied'
     || managedOriginIsolationSentinelAccess(osUserHomeDir) === 'sandbox_denied';
+  // A relay pane the kernel isolates must authorize through the outbox
+  // capability. On Linux the PID namespace already hides host markers; on
+  // macOS (Seatbelt + outbox, `sandboxWithholdBotSecret`) the markers stay
+  // visible, so without this the pane would fall through to the direct path
+  // it has no credential for.
+  const relayIsolationDetected = linuxKernelIsolationDetected
+    || (!!relayDir && kernelReadIsolationDetected);
   const isolatedSendRequired = !relayDir
     && (kernelReadIsolationDetected
       || process.env.BOTMUX_READ_ISOLATED === '1'
@@ -11411,7 +11656,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     process.env.SESSION_DATA_DIR = sendDataDir;
     liveMarkerCtx = findLiveAncestorSessionContext(sendDataDir);
   }
-  const isolatedCapabilityCtx = !isolatedSendRequired && !linuxKernelIsolationDetected && liveMarkerCtx?.sessionId
+  const isolatedCapabilityCtx = !isolatedSendRequired && !relayIsolationDetected && liveMarkerCtx?.sessionId
     ? null
     : readWorkflowSessionRelayContext({
         env: process.env,
@@ -11419,7 +11664,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         // Keep one marker snapshot for the whole decision. In particular, do
         // not let resolveSessionContext's protected-capability fallback get
         // mislabeled as a live process marker.
-        findMarker: () => isolatedSendRequired || linuxKernelIsolationDetected ? null : liveMarkerCtx,
+        findMarker: () => isolatedSendRequired || relayIsolationDetected ? null : liveMarkerCtx,
       });
   if (isolatedSendRequired
     && (isolatedCapabilityCtx?.sessionId !== isolatedBoundSessionId
@@ -11460,7 +11705,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     await relaySend(rest, relayDir, replyLayout, sendPlan);
     return;
   }
-  if (relayDir && (linuxKernelIsolationDetected || !liveMarkerCtx?.sessionId)) {
+  if (relayDir && (relayIsolationDetected || !liveMarkerCtx?.sessionId)) {
     // The child may delete or replace its writable outbox capability, while
     // the immutable default snapshot remains visible. That snapshot is only a
     // routing hint and can survive worker death; never fall through to direct
@@ -11809,6 +12054,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // another thread, etc.) instead of the session's own location. Wins over the
   // auto/scope default; `dispatch` opens topics, `send --into` posts into them.
   const sendInto = argValue(rest, '--into');
+  const followThreadAt = rest.includes('--follow-thread-at');
+  const noFollowThread = rest.includes('--no-follow-thread');
+  if (followThreadAt && noFollowThread) {
+    console.error('botmux send: --follow-thread-at 与 --no-follow-thread 不能同时使用');
+    process.exit(2);
+  }
   // --voice: synthesize the content into a Feishu voice bubble instead of a
   // text/card message. The content should be spoken-style prose (the 🔊 button
   // injects a condense-first instruction before the model calls this).
@@ -12129,10 +12380,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     process.exit(2);
   }
   const turnReplyTarget = pickTurnReplyTarget(s, replyMessageId);
-  const turnBoundQuoteTarget = turnReplyTarget?.rootMessageId
-    ?? s.turnReplyContexts?.[replyMessageId ?? '']?.quoteTargetId
-    ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
-    ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined);
+  const replyContextForQuote = s.turnReplyContexts?.[replyMessageId ?? ''];
   if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
     console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
     process.exit(2);
@@ -12231,6 +12479,17 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
     ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
   const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
+  const isCrossChatOriginTurn = !!crossChatOriginForSend({
+    replyContext: replyContextForQuote,
+    replyTarget: s.replyTargets?.[replyMessageId ?? ''],
+    frozenTurnDispatch,
+  });
+  const turnBoundQuoteTarget = isCrossChatOriginTurn
+    ? ((!overrideChatId || overrideChatId === s.chatId) ? s.quoteTargetId : undefined)
+    : (turnReplyTarget?.rootMessageId
+      ?? replyContextForQuote?.quoteTargetId
+      ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
+      ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined));
   if (exactOriginDispatch?.deliverySink === 'http_wait'
     || exactOriginDispatch?.deliverySink === 'http_async'
     || exactOriginDispatch?.deliverySink === 'suppressed') {
@@ -12327,12 +12586,24 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       throw error;
     }
   };
+  // A read-isolated CLI can neither read its own birth identity (setuid `ps`)
+  // nor write the data dir, so the feedback send lease falls back to the
+  // origin session's daemon, which takes it on this process's behalf.
+  const feedbackSendLeaseRelay = (): FeedbackSendLeaseRelay | undefined => {
+    const leaseSessionId = originSessionId;
+    const ipcPort = resolveDaemonIpcPort(isolatedAttestationContext?.ipcPortFallback, process.env.BOTMUX_DAEMON_IPC_PORT);
+    if (!leaseSessionId || !ipcPort) return undefined;
+    return async (body, signal) => {
+      const response = await postSessionCliIpc(ipcPort, leaseSessionId, FEEDBACK_SEND_LEASE_ROUTE, body, signal);
+      return { ok: response.ok, status: response.status, body: await response.json().catch(() => undefined) };
+    };
+  };
   const revalidateIsolatedOriginBeforeEffect = async (
     lookup?: TopicMessageLookup,
   ): Promise<ManagedOriginAttestation | undefined> => {
     await checkSendTopics?.(lookup);
     const origin = await revalidateIsolatedOrigin();
-    beginFeedbackEffect?.();
+    await beginFeedbackEffect?.(feedbackSendLeaseRelay());
     return origin;
   };
   const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
@@ -12678,18 +12949,34 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     console.error('botmux send refused: ' + (error instanceof Error ? error.message : 'LOCAL_ADDRESS_OUTBOUND_REJECTED'));
     process.exit(2);
   }
+  const currentTurnCrossChatOrigin = currentTurnId
+    ? crossChatOriginForSend({
+        replyContext: s.turnReplyContexts?.[currentTurnId],
+        replyTarget: s.replyTargets?.[currentTurnId],
+        frozenTurnDispatch,
+      })
+    : undefined;
+  const sendingToOriginSessionChat = (!overrideChatId || overrideChatId === s.chatId) && !sendInto;
+  // #750: legacySender is consulted only for a true no-turn send. A turn-scoped
+  // map miss never borrows the mutable latest quote slot for mention-back.
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-    ?? frozenTurnDispatch?.replyTargetSenderOpenId
-    ?? pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
-    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
-    // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
-    // borrowed as a legacy fallback when there is NO currentTurnId (true
-    // legacy/no-turn send). With a turnId, an exact-turn map miss/eviction must
-    // resolve to NO sender — never the global slot, which may have advanced to a
-    // DIFFERENT turn B and would mis-@ B as A's --mention-back (the cross-turn
-    // bug #750 fixed). pickTurnReplyTarget already enforces
-    // quoteTargetId===currentTurnId for its own hit.
-    ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId);
+    ?? crossChatSenderForSend({
+      crossChatOrigin: currentTurnCrossChatOrigin,
+      sendingToOriginSessionChat,
+      frozenTurnSender: frozenTurnDispatch?.replyTargetSenderOpenId,
+      perTurnSender: pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
+        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId,
+      legacySender: currentTurnId ? undefined : s.quoteTargetSenderOpenId,
+      originQuoteSender: s.quoteTargetSenderOpenId,
+      originLastCaller: s.lastCallerOpenId,
+      originOwner: s.ownerOpenId,
+    });
+  const replyTargetSenderIsBot = currentTurnCrossChatOrigin && sendingToOriginSessionChat
+    ? (replyTargetSenderOpenId ? (s.quoteTargetSenderIsBot ?? s.lastCallerIsBot ?? false) : undefined)
+    : frozenTurnDispatch?.replyTargetSenderIsBot
+      ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
+      ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
+      ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
   const proposalRequesterIsExactHuman = !!currentTurnId
     && !!replyTargetSenderOpenId
     && collectTurnWindowParticipants(s, currentTurnId).participants
@@ -12877,6 +13164,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     cover: await attachmentIdentity(coverPath),
     durationMs,
   })));
+  const followThreadTargetChatId = overrideChatId ?? s.chatId;
+  const effectiveFollowThreadMode = effectiveCrossChatFollowThreadMode({
+    targetChatId: followThreadTargetChatId,
+    sourceChatId: (originSession ?? s).chatId,
+    noFollowThread,
+  });
   const turnRequestIdentity = canonicalJson({
     version: 1,
     content: expectedLinkRenderedContent,
@@ -12916,11 +13209,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       mentions: mentionArgs,
       mentionBack,
       noMention,
-      replyTargetSenderOpenId: explicitVcMeetingImOrigin?.replyTargetSenderOpenId
-        ?? frozenTurnDispatch?.replyTargetSenderOpenId
-        ?? turnReplyTarget?.senderOpenId
-        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
-        ?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId),
+      replyTargetSenderOpenId,
     },
     presentation: {
       voice: asVoice,
@@ -12934,6 +13223,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     controls: {
       attention: attention.requested ? attention.kind : undefined,
       urgent: urgent.requested ? urgent.mode : undefined,
+      followThread: effectiveFollowThreadMode,
     },
     attachments: {
       images: durableImageIdentities,
@@ -12961,16 +13251,29 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       effectiveResponseKind = 'final';
     }
   }
+  const persistOffBeforeProvider = (): void => {
+    if (effectiveFollowThreadMode !== 'off' || !sendInto) return;
+    persistCrossChatFollowThreadOffBeforeProvider({
+      dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, targetChatId: followThreadTargetChatId,
+      targetRootMessageId: sendInto, followThreadEpoch: (originSession ?? s).followThreadEpoch,
+    });
+  };
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
   ): Promise<{ messageId: string; replayed: boolean }> => {
     return turnSendKey
       ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
+          beforeDispatch: persistOffBeforeProvider,
           ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
             !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
         })
-      : { messageId: await dispatch(), replayed: false };
+      : (async () => {
+          // No-turn sends have no ledger to validate, but the same pre-provider
+          // off contract still applies: a failed tombstone aborts before Lark.
+          persistOffBeforeProvider();
+          return { messageId: await dispatch(), replayed: false };
+        })();
   };
   let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
   try {
@@ -12982,6 +13285,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    if (effectiveFollowThreadMode === 'at') {
+      const bound = ensureCrossChatFollowThreadAtBinding({
+        dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs: Date.now(),
+        messageId: existingTurnPrimary.messageId, targetChatId: followThreadTargetChatId,
+        ...(sendInto ? { targetRootMessageId: sendInto } : {}),
+        followThreadEpoch: (originSession ?? s).followThreadEpoch,
+      });
+      if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
+    }
     // A retry after a lost reply-card mark completes it; a final already on
     // the card is left alone by the store.
     if (effectiveResponseKind === 'final' && currentTurnId) {
@@ -13212,12 +13524,29 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);
       // 语音也是一次可见回复。当前会话和具备精确 source turn 的 detour
       // 都记录；无 turn 的手工 detour 不写，避免靠时间窗压掉别的回复。
+      const voiceCrossChatFollowThread = effectiveCrossChatFollowThreadMode({
+        targetChatId: voicePrimaryOutputChatId,
+        sourceChatId: (originSession ?? s).chatId,
+        noFollowThread,
+      });
+      if (voiceDelivery.replayed && voiceCrossChatFollowThread === 'at') {
+        const voiceFollowRoot = deferredTopicRootMessageIdForOutput ?? sendInto;
+        const bound = ensureCrossChatFollowThreadAtBinding({
+          dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs, messageId,
+          targetChatId: voicePrimaryOutputChatId,
+          ...(voiceFollowRoot ? { targetRootMessageId: voiceFollowRoot } : {}),
+          followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        });
+        if (!bound) console.error('botmux send: 已复用语音投递，但跨群话题绑定补建失败');
+      }
       if (!voiceDelivery.replayed && ((!sendTopLevel && !overrideChatId && !sendInto)
         || !!(originTurnId ?? currentTurnId)
-        || !!deferredTopicRootMessageIdForOutput)) {
+        || !!deferredTopicRootMessageIdForOutput
+        || voiceCrossChatFollowThread !== undefined)) {
         try {
           const markerSessionId = originSessionId ?? sid;
           const markerTurnId = originTurnId ?? currentTurnId;
+          recordStructuredSendReceipt(markerSessionId, markerTurnId, messageId, sentAtMs, content);
           const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
             || markerSessionId !== sid;
           recordBridgeReplyMarker({
@@ -13234,6 +13563,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
             targetChatId: voicePrimaryOutputChatId,
             targetRootMessageId: deferredTopicRootMessageIdForOutput ?? sendInto,
             targetSessionId: sid,
+            crossChatFollowThread: voiceCrossChatFollowThread,
+            followThreadEpoch: (originSession ?? s).followThreadEpoch,
           });
         } catch { /* best-effort：漏记只多一条兜底，不致命 */ }
       }
@@ -13353,6 +13684,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       }
       // 写 bridge send marker → 抑制 worker 的 final_output 兜底（否则会再补一条评论）。
       if (!docDelivery.replayed) {
+        recordStructuredSendReceipt(originSessionId!, originTurnId ?? exactDocTarget.turnId,
+          docDelivery.messageId, sentAtMs, content);
         try {
           recordBridgeReplyMarker({
             dataDir: resolveDataDir(),
@@ -13657,7 +13990,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // right one instead of guessing (or mis-@-ing the lone human). Reads the
   // persisted per-turn participant window — no group-stats round-trip. Explicit
   // VC turns carry their own single-target origin, so they skip this gate.
-  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
+  if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel && !(currentTurnCrossChatOrigin && sendingToOriginSessionChat)) {
     const window = collectTurnWindowParticipants(s, currentTurnId);
     const selectedWindow = selectedReplyContext ? collectTurnWindowParticipants(s, replyMessageId) : window;
     window.participants = dedupeParticipants([...window.participants, ...selectedWindow.participants]);
@@ -13924,15 +14257,35 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // 此包装自出生即无调用方；但 test/cli-send-hook-context.test.ts 对其源码文本做了断言，
   // 删除需同步改测试。
   void dispatch;
+  const crossChatFollowThread = effectiveFollowThreadMode;
+  function recordStructuredSendReceipt(
+    markerSessionId: string,
+    markerTurnId: string | undefined,
+    messageId: string | undefined,
+    sentAtMs: number,
+    text?: string,
+  ): void {
+    if (!markerTurnId || !messageId) return;
+    try {
+      recordSessionTurnReply(resolveDataDir(), markerSessionId, markerTurnId, {
+        messageId, responseKind: effectiveResponseKind, at: sentAtMs,
+        ...(text ? { text } : {}),
+      });
+    } catch {
+      console.error('botmux: could not record structured reply');
+    }
+  }
   const recordBridgeSendMarker = (
     sentAtMs: number,
     messageId: string,
     sentContent: string,
     terminalCarrier?: TurnTerminalCarrierKind,
+    structuredText?: string,
   ): void => {
+    const markerSessionId = originSessionId ?? sid;
+    const markerTurnId = originTurnId ?? currentTurnId;
+    recordStructuredSendReceipt(markerSessionId, markerTurnId, messageId, sentAtMs, structuredText);
     try {
-      const markerSessionId = originSessionId ?? sid;
-      const markerTurnId = originTurnId ?? currentTurnId;
       const detoured = !!sendTopLevel || !!overrideChatId || !!sendInto
         || markerSessionId !== sid;
       recordBridgeReplyMarker({
@@ -13954,6 +14307,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         targetRootMessageId: deferredTopicRootMessageIdForOutput
           ?? (sendTarget.mode === 'plain' ? undefined : sendTarget.rootMessageId),
         targetSessionId: sid,
+        crossChatFollowThread,
+        followThreadEpoch: (originSession ?? s).followThreadEpoch,
       });
     } catch { /* best-effort: marker miss only causes a redundant fallback message */ }
   };
@@ -13961,8 +14316,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // A detoured send is still positive user-visible output for its exact source
   // turn. Require an exact turn before recording a detour so a manually-run,
   // unattributed publish cannot suppress a real empty reply by timestamp alone.
+  // Cross-chat sends also record their messageId in turn-sends/<sessionId>.jsonl
+  // so replies in that cross-chat thread can route back to the origin session
+  // (detoured_send without turnId is ignored by evaluateBridgeFallbackGate).
   const shouldRecordBridgeMarker = !sendTopLevel && !overrideChatId && !sendInto
-    || !!(originTurnId ?? currentTurnId);
+    || !!(originTurnId ?? currentTurnId)
+    || crossChatFollowThread !== undefined;
   let unifiedReplyUsed = false;
 
   // Quote chain (普通群): the primary message replies to the turn's target so
@@ -14398,13 +14757,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // （Codex review P2）。--top-level 同样无特定收件人。
     const frozenFooterAddressingSource = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
       ? { ...s, lastCallerOpenId: explicitVcMeetingImOrigin.replyTargetSenderOpenId }
-      : frozenTurnDispatch?.replyTargetSenderOpenId
-        ? {
-            ...s,
-            lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId,
-            lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot,
-          }
-        : s;
+      : currentTurnCrossChatOrigin && sendingToOriginSessionChat
+        ? { ...s, lastCallerOpenId: replyTargetSenderOpenId ?? s.ownerOpenId, lastCallerIsBot: replyTargetSenderIsBot }
+        : frozenTurnDispatch?.replyTargetSenderOpenId
+          ? {
+              ...s,
+              lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId,
+              lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot,
+            }
+          : s;
     const footerAddressing = (sendTopLevel || noMention)
       ? { sendTo: undefined as string | undefined, cc: [] as string[] }
       : buildFooterAddressing(frozenFooterAddressingSource, {
@@ -14682,10 +15043,6 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       if (feedbackBaseCard && replyCardJson !== withOncall) feedbackBaseCard = JSON.parse(replyCardJson);
       const replyStore = new TurnReplyCardStore(resolveDataDir());
       const replyKey = currentTurnId ? { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt } : undefined;
-      const replyTargetSenderIsBot = frozenTurnDispatch?.replyTargetSenderIsBot
-        ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderIsBot
-        ?? s.replyTargets?.[currentTurnId ?? '']?.participants?.find(p => p.openId === replyTargetSenderOpenId)?.isBot
-        ?? (currentTurnId && s.quoteTargetId === currentTurnId ? s.quoteTargetSenderIsBot : undefined);
       // Mentioning this turn's human requester is still an ordinary reply.
       // Peer bots, other recipients and unknown identities need a new message
       // so their notification/automation cannot be swallowed by a PATCH.
@@ -14794,6 +15151,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // after waiting. Stop here so the losing process cannot repeat indexing,
     // attachments, urgency, bridge markers, or attention side effects.
     if (turnPrimaryReplayed) {
+      if (crossChatFollowThread === 'at') {
+        const bound = ensureCrossChatFollowThreadAtBinding({
+          dataDir: resolveDataDir(), sessionId: originSessionId ?? sid, sentAtMs, messageId,
+          targetChatId,
+          ...(sendTarget.mode !== 'plain' ? { targetRootMessageId: sendTarget.rootMessageId } : {}),
+          followThreadEpoch: (originSession ?? s).followThreadEpoch,
+        });
+        if (!bound) console.error('botmux send: 已复用投递，但跨群话题绑定补建失败');
+      }
       // Reusing a receipt is not a new send. Preserve the original marker's
       // time, including when another input arrived while we waited on the lock.
       // The first sender may have lost the reply-card mark; it is idempotent.
@@ -14939,6 +15305,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         (!customCard || customFinal) && !pureFileSend && !pureVideoSend
           ? 'standard_reply_card'
           : 'non_patchable',
+        !customCard && !pureFileSend && !pureVideoSend ? text : undefined,
       );
     }
     await removeScheduleSelfAfterFinal();
@@ -14963,16 +15330,36 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // the success JSON. Pure-video sends have no text/card primary, so the media
     // message above is the primary and failures before any media is sent still
     // surface as command failure.
+    const attachmentTrackingErrors: string[] = [];
+    let replyDeliveryId: string | undefined;
     if (!pureFileSend && !pureVideoSend && !vcMeetingListenerReplyReplay && !turnPrimaryReplayed) {
-      ({ sent: attachmentMessageIds, failed: failedAttachments } = await sendFileAttachments(
-        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, files,
-      ));
+      const { ReplyDeliveryStore } = await import('./services/reply-delivery-store.js');
+      const deliveryStore = new ReplyDeliveryStore(resolveDataDir());
+      if (files.length || videoAttachments.length) {
+        try {
+          replyDeliveryId = deliveryStore.begin(appId, messageId, targetChatId, [
+            ...files.map(path => ({ path, type: 'file' as const })),
+            ...videoAttachments.map(video => ({ path: video.videoPath, type: 'media' as const })),
+          ]);
+        } catch (error) { attachmentTrackingErrors.push(error instanceof Error ? error.message : String(error)); }
+      }
+      const onResult = replyDeliveryId ? (index: number, outcome: { messageId: string } | { failed: true }) =>
+        deliveryStore.record(appId, messageId, targetChatId, replyDeliveryId!, index, outcome) : undefined;
+      const fileResult = await sendFileAttachments(
+        { uploadFile, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect, onResult }, appId, files,
+      );
+      attachmentMessageIds = fileResult.sent;
+      failedAttachments = fileResult.failed;
+      attachmentTrackingErrors.push(...(fileResult.trackingErrors ?? []).map(item => item.error));
       const videoResult = await sendVideoAttachments(
-        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect }, appId, videoAttachments,
+        { uploadFile, uploadImage, dispatch: dispatchAfterOriginGate, beforeEffect: fenceIsolatedOriginBeforeEffect,
+          onResult: onResult ? (index, outcome) => onResult(files.length + index, outcome) : undefined }, appId, videoAttachments,
       );
       failedVideoAttachments = videoResult.failed;
       videoMessageIds = videoResult.sent;
+      attachmentTrackingErrors.push(...(videoResult.trackingErrors ?? []).map(item => item.error));
     }
+    for (const error of attachmentTrackingErrors) console.error(`⚠️ 正文/附件关联记录未完整保存（已发送的消息请勿重发）: ${error}`);
     // Attachments are independent Lark messages posted after the main reply
     // card. Record the actual bottom-most carrier so terminal auto mode never
     // PATCHes an earlier card and leaves a file/voice/custom carrier below it
@@ -15023,7 +15410,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
     const sendLocale = localeForBot(appId);
-    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId), undefined, sendLocale));
+    // REPLY_DELIVERY_ENV is the spawn snapshot of how this pane's final reply
+    // reaches Lark. Under transcript the hint points the model back at its
+    // final reply instead of another `botmux send` (no hard limit on sends:
+    // collaboration and attachments legitimately need several per turn).
+    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId,
+      replyDeliveryFromEnv(process.env)), undefined, sendLocale));
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
@@ -15109,6 +15501,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         : {}),
       ...(attention.requested ? { attentionRaised, attentionError } : {}),
       ...(attachmentMessageIds.length > 0 ? { attachmentMessageIds } : {}),
+      ...(replyDeliveryId ? { replyDeliveryId } : {}),
+      ...(attachmentTrackingErrors.length ? { attachmentTrackingErrors } : {}),
       ...(videoMessageIds.length > 0 ? { videoMessageIds } : {}),
       ...(urgent.requested ? { urgent: { mode: urgent.mode, sent: urgentSent, error: urgentError } } : {}),
       ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
@@ -15492,7 +15886,7 @@ async function cmdCard(rest: string[]): Promise<void> {
 }
 
 async function cmdAuth(rest: string[]): Promise<void> {
-  const { AUTH_REQUEST_USAGE, parseAuthRequestArgs, providerAuthExitCode } = await import('./cli/auth-request.js');
+  const { AUTH_REQUEST_USAGE, parseAuthRequestArgs, providerAuthAnswerTag, providerAuthExitCode } = await import('./cli/auth-request.js');
   let parsed;
   try {
     parsed = parseAuthRequestArgs(rest);
@@ -15540,12 +15934,17 @@ async function cmdAuth(rest: string[]): Promise<void> {
       }
       const provider = parsed.command === 'request' ? parsed.provider : undefined;
       const tenant = parsed.command === 'request' ? parsed.tenant : undefined;
-      const authBody = provider ? { provider, ...(tenant ? { tenant } : {}) }
-        : parsed.command === 'request'
-          ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
-          : { requestId: parsed.requestId };
-      // A provider request may start a device login and send a DM before it answers.
-      const requestTimeout = Math.min(provider ? 60_000 : 10_000, Math.max(1, remaining));
+      const unattendedRequest = parsed.command === 'request' && parsed.unattended === true;
+      const authBody = {
+        ...(provider ? { provider, ...(tenant ? { tenant } : {}), ...(unattendedRequest ? { unattended: true } : {}) }
+          : parsed.command === 'request'
+            ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
+            : { requestId: parsed.requestId }),
+        // The speaker this call acts for (see BOTMUX_AS); the daemon accepts only a speaker of the current turn.
+        ...(process.env.BOTMUX_AS ? { as: process.env.BOTMUX_AS } : {}),
+      };
+      // A request may start a device login, or ask the platform to send a card, before it answers.
+      const requestTimeout = Math.min(parsed.command === 'request' ? 60_000 : 10_000, Math.max(1, remaining));
       const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
       const response = toolBinding
         ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {
@@ -15570,8 +15969,11 @@ async function cmdAuth(rest: string[]): Promise<void> {
       const body = await response.json() as { ok?: boolean; status?: string; message?: string; error?: string };
       if (provider) {
         if (parsed.command === 'request' && parsed.json) console.log(JSON.stringify(body));
-        else if (body.message) console.log(body.message);
-        else console.error(`botmux auth: ${body.error ?? `HTTP ${response.status}`}`);
+        else if (body.message) {
+          console.log(body.message);
+          const tag = providerAuthAnswerTag(response.ok && body.ok === true, body.status);
+          if (tag) console.log(tag);
+        } else console.error(`botmux auth: ${body.error ?? `HTTP ${response.status}`}`);
         process.exitCode = providerAuthExitCode(response.ok && body.ok === true, body.status);
         return;
       }
@@ -16441,6 +16843,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     });
     const result: any = await response.json();
     if (!response.ok || result?.ok !== true || typeof result.messageId !== 'string') {
+      if (result?.error === 'task_consent_pending') {
+        throw Object.assign(new Error(`原话题的任务授权待确认。确认后用 --into ${rootId} 继续这条派单。`),
+          { code: 'TASK_CONSENT_PENDING', rootId });
+      }
+      if (result?.error === 'task_consent_denied') {
+        throw Object.assign(new Error('发起人已拒绝或撤销本任务授权。'),
+          { code: 'TASK_CONSENT_DENIED', rootId });
+      }
       throw new Error(`dispatch delivery failed: ${result?.error ?? response.status}`);
     }
     return result.messageId;
@@ -16710,6 +17120,13 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     }));
     if (!accepted) process.exitCode = 1;
   } catch (err: any) {
+    if (err?.code === 'TASK_CONSENT_PENDING' || err?.code === 'TASK_CONSENT_DENIED') {
+      console.error(JSON.stringify({ success: false, taskSent: false, errorCode: err.code,
+        sourceSessionId: sid, targetAppIds: parsedBotApps.map(item => item.appId),
+        chatId: targetChatId, threadRootId: err.rootId, detail: err.message }));
+      process.exitCode = 1;
+      return;
+    }
     let receiptState: DispatchReceiptState = {
       transportState: 'failed',
       acceptanceState: 'failed',
@@ -17616,6 +18033,16 @@ botmux create-group — 用一组机器人新建飞书群
   --json-status    可选；在 chatId 后追加一行结构化完成状态。默认 stdout 无论完整成功或
                    部分失败都保持历史兼容，只输出单行 chatId；显式 kickoff 未发出时以非零退出表示。
 
+建群后 @ 群主提醒（本机全局开关，默认开）:
+  botmux create-group owner-notice [status|on|off]
+
+  新群建好后，创建群的 bot 默认会 @ 群主发「群已创建，后续进展将在本群同步。」。
+  off 之后本机所有建群入口（本命令、/group、Dashboard 建群、会议监听群等）都不再发这条，
+  群主转让、拉人、设管理员照常。写的是 ~/.botmux/config.json 的 "groupOwnerNotice": false
+  （on 会删掉这个键，回到默认）；下一次建群即生效，不用重启 daemon。不带参数 = status。
+  文件沙盒内 status/on/off 均拒绝执行：那里的配置视图不代表宿主，写入也不持久。
+  请在宿主终端执行，或使用 Dashboard「设置 → 群聊创建」。
+
 团队模式（跨机建聚焦新群，走中心化平台）:
   botmux create-group --team <teamId> --agent <appId> [--agent ...] [--name "群名"]
 
@@ -17630,7 +18057,7 @@ botmux create-group — 用一组机器人新建飞书群
 行为:
   - 第一个解析到的 bot 作为 creator（决定建群身份 + 初始群主 + open_id app scope）。
   - 邀请用户 / 转让群主 / @通知 对象都从 creator 的 resolvedAllowedUsers 取首个 open_id（email 自动转换；
-    转不出来或为空则跳过对应步骤，stderr warning）。
+    转不出来或为空则跳过对应步骤，stderr warning）。@通知 受上面的 owner-notice 开关控制。
   - 不依赖 botmux 会话，任何环境都能跑。
   - --working-dir 会先校验路径存在且是目录；绑定失败不会重复建群，会在 stderr 给出逐 bot 结果。
   - --kickoff-bot/--kickoff-prompt：creator 建群后 @ 指定 bot 并发 prompt；该 bot 收到 @ 会自动起会话。
@@ -17644,6 +18071,38 @@ botmux create-group — 用一组机器人新建飞书群
   - 只有缺 --bot / 解析失败 / chat.create 未成功时 stdout 才为空。只要 stdout 已有 chatId，
     即使超时或 exit 非零也必须先检查并复用该群，不得重建。
 `);
+    return;
+  }
+
+  // `create-group owner-notice …` is a settings write, not a group creation:
+  // route it before every creation gate (transport, bots.json, --bot).
+  const { parseOwnerNoticeCommand, runOwnerNoticeCommand } = await import('./cli/create-group-resolver.js');
+  const ownerNoticeCommand = parseOwnerNoticeCommand(rest);
+  if (ownerNoticeCommand.kind !== 'none') {
+    // A sandboxed CLI cannot see the host's live config.json. Worse, its fresh
+    // tmpfs may accept a write and report "saved" while the host stays unchanged.
+    // Refuse every mode (including read-only status) instead of returning an
+    // untrustworthy value; do not expose the credential-bearing host config.
+    if (detectSandboxContext().inSandbox) {
+      console.error(
+        'ℹ️  当前在 botmux 沙盒内，建群后 @ 群主提醒开关的 status/on/off 均不可用：'
+        + '这里读到的配置不代表宿主，写入也不会落到宿主。'
+        + '\n   请在宿主终端执行 `botmux create-group owner-notice [status|on|off]`，'
+        + '或使用 Dashboard「设置 → 群聊创建」。',
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const { setGroupOwnerNoticeEnabled, readRawGroupOwnerNotice } = await import('./global-config.js');
+    const outcome = runOwnerNoticeCommand(ownerNoticeCommand, {
+      setEnabled: setGroupOwnerNoticeEnabled,
+      isEnabled: () => config.groupOwnerNotice,
+      rawValue: readRawGroupOwnerNotice,
+      configPath: globalConfigPath,
+    });
+    for (const line of outcome.stdout) console.log(line);
+    for (const line of outcome.stderr) console.error(line);
+    if (outcome.exitCode !== 0) process.exitCode = outcome.exitCode;
     return;
   }
 
@@ -18574,11 +19033,17 @@ export async function runHook(
     }
   }
   // 权限确认一旦路由到 botmux 会话，任何「没拿到人工裁决」的结局都按拒绝处理：
-  // passthrough 会让终端确认框照旧弹出，而这正是本桥要消除的静默卡死。
+  // passthrough 会让终端确认框照旧弹出，而这正是本桥要消除的静默卡死。提问同理：
+  // 实现了 formatUnanswered 的 CLI（agy）带着原因结束这次提问，不回退终端提问页。
+  const unanswered = (outcome: import('./core/ask-hook/types.js').UnansweredAsk): { stdout: string } => (
+    adapter.formatUnanswered
+      ? { stdout: adapter.formatUnanswered(outcome, parsed) }
+      : { stdout: adapter.passthrough(payload) }
+  );
   const unresolved = (message: string): { stdout: string } => (
     permissionParsed && adapter.formatPermissionDecision
       ? { stdout: adapter.formatPermissionDecision(false, message) }
-      : { stdout: adapter.passthrough(payload) }
+      : unanswered({ kind: 'undelivered' })
   );
 
   // Per-invocation identity: generated ONCE here (outside the retry loop) and
@@ -18589,7 +19054,7 @@ export async function runHook(
 
   // Freeze the issuing turn before reconnect retries. Shared-service/adopt
   // routing cannot borrow this process's ambient turn identity.
-  const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex'].includes(cliId)
+  const hookOrigin = !explicitRoute && routeSessionId === sessionId && ['claude-code', 'codex', 'antigravity'].includes(cliId)
     ? resolveTurnOriginFn(routeSessionId!) : undefined;
 
   const body: Record<string, unknown> = {
@@ -18695,8 +19160,10 @@ export async function runHook(
     return { stdout: adapter.formatAnswer(result.answers, parsed, result.comment, result.customAnswers) };
   }
 
-  // timedOut / invalidated → passthrough 放行
-  return { stdout: adapter.passthrough(payload) };
+  // timedOut / invalidated → passthrough 放行（实现了 formatUnanswered 的 CLI 带原因结束）
+  return unanswered(result.kind === 'timedOut'
+    ? { kind: 'timedOut', timeoutMs }
+    : { kind: 'invalidated', reason: result.reason, ...(result.failureCode ? { failureCode: result.failureCode } : {}) });
 }
 
 /** 权限确认默认等 10 分钟；上限必须小于 hook 安装侧的进程超时（见 hook-installer）。 */
@@ -18830,6 +19297,7 @@ async function cmdHook(cliId: string): Promise<void> {
   }
 
   const env = process.env as Record<string, string | undefined>;
+  if (cliId === 'antigravity') exitWhenHookParentGone();
   const permissionRequest = !adapter.parseQuestions(payload) && !!adapter.parsePermissionRequest?.(payload, env);
   const terminated = new AbortController();
   if (permissionRequest) {
@@ -18858,6 +19326,22 @@ async function cmdHook(cliId: string): Promise<void> {
     try { await writeAndFlush(process.stdout, result.stdout + '\n'); } catch { /* passthrough */ }
   }
   process.exit(0);
+}
+
+/** agy (1.5.12) gives up on a PreToolUse handler — Esc, a stopped turn, its
+ *  timeout, its own exit — by SIGKILLing the process it started, or by simply
+ *  going away. A client that outlives it keeps its ask open: the card stays
+ *  answerable and the daemon reads the next text in the thread as the answer
+ *  to a question nobody waits for. The installed command `exec`s this client
+ *  so the kill lands here; should anything sit in between (or agy die), the
+ *  parent changes and the client leaves — the closed connection lets the
+ *  broker retire the ask. `process.ppid` is read live on Node and Bun. */
+function exitWhenHookParentGone(intervalMs = 1_000): void {
+  const parent = process.ppid;
+  const timer = setInterval(() => {
+    if (process.ppid !== parent) process.exit(0);
+  }, intervalMs);
+  timer.unref();
 }
 
 // ─── botmux session-ready ─────────────────────────────────────────────────────
@@ -19547,8 +20031,8 @@ botmux bots — 机器人协作花名册 / 团队补人
 }
 
 /**
- * `botmux bots list --scope team [--team <id>]` — 跨机发现同团队、已 opt-in（owner
- * 加进 team.bots）的 agent，打平台端点2（machine-auth，Bearer=machineToken）。
+ * `botmux bots list --scope team [--team <id>]` — 跨机发现同团队的 botmux agent
+ * （owner opt-in）与外部机器人（团队成员登记），打平台端点2（machine-auth，Bearer=machineToken）。
  *
  * 与 chat scope 的关键区别 + 硬约束：
  *  - 走 machine-auth，不读飞书群花名册、不需要传输身份 → 沙盒/apiOnly bot 也能查。
@@ -19606,14 +20090,14 @@ async function cmdBotsListTeam(rest: string[]): Promise<void> {
 
   const { teamName, agents } = res.value;
   // 输出对齐 chat scope 的 JSON 形状（scope 标注 + total），字段是平台端点2 的原样透传。
-  // 提醒：发现列表只含**已加入 team.bots** 的 agent（owner 在平台「管理机器人」显式加入）。
+  // 提醒：botmux agent 由 owner opt-in；外部机器人由团队成员登记。
   console.log(JSON.stringify({
     scope: 'team',
     teamId,
     teamName: teamName || teamNameHint || teamId,
     agents,
     total: agents.length,
-    note: '发现列表只含已加入团队（owner 在平台「管理机器人」opt-in）的 agent；specialties/mentionable 为 agent 自报，仅供参考不可信。',
+    note: '发现列表包含 owner 在平台「管理机器人」opt-in 的 botmux agent，以及团队成员登记的外部机器人；specialties/mentionable 为 agent 自报，仅供参考不可信。',
   }, null, jsonOut ? 0 : 2));
 }
 
@@ -20172,6 +20656,10 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
   else if (__entrySubcommand === 'sandbox-network-runner') await import('./sandbox-network-runner.js');
   else if (__entrySubcommand === 'program-status-relay') await import('./program-status-relay.js');
+  else if (__entrySubcommand === 'reply-file-sanitizer') {
+    await import('./reply-file-sanitizer.js');
+    process.exit(process.exitCode ?? 0);
+  }
   else if (__entrySubcommand === 'background-execution-runner') {
     await import('./background-execution-runner.js');
     process.exit(process.exitCode ?? 0);
@@ -21084,6 +21572,8 @@ async function cmdPlugin(args: string[]): Promise<void> {
       if (!pluginRegistryCache.plugins[pluginId]) throw new Error(`plugin_not_installed:${pluginId}`);
       const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
       if (enable) {
+        const { assertPluginPrerequisitesReady } = await import('./core/plugins/prerequisites.js');
+        await assertPluginPrerequisitesReady(pluginId);
         if (botSelector) {
           updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
         } else {
@@ -21270,7 +21760,7 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // managed origin → NOT gated: the operator keeps full access. per-command +
 // daemon-side getBotClient/larkTransportEnabled gates remain authoritative.
 const LARK_FACING_COMMANDS = new Set([
-  'input-capture', 'send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
+  'input-capture', 'send', 'post', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'react', 'thread', 'interaction-context',
   'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
@@ -21349,13 +21839,14 @@ switch (command) {
     }
     const { CURRENT_EXECUTION_SCHEMA, parseCurrentExecutionArgs, resolveCurrentExecution } = await import('./cli/current-execution.js');
     if (!parseCurrentExecutionArgs(process.argv.slice(3))) {
-      console.error('用法: botmux execution current --json');
+      console.error('用法: botmux execution current --json [--cli]');
       process.exitCode = 2;
       break;
     }
     try {
       const { resolveBotmuxAncestorContext } = await import('./cli/current-actor.js');
-      const document = await resolveCurrentExecution(resolveBotmuxAncestorContext());
+      const document = await resolveCurrentExecution({ ...resolveBotmuxAncestorContext(),
+        includeCli: process.argv.slice(3).includes('--cli') });
       process.stdout.write(`${JSON.stringify(document)}\n`);
     } catch {
       process.stdout.write(`${JSON.stringify({ schema: CURRENT_EXECUTION_SCHEMA,
@@ -21433,6 +21924,19 @@ switch (command) {
   case 'codex-instances': {
     const { runCodexInstancesCommand } = await import('./cli/codex-instances.js');
     await runCodexInstancesCommand(process.argv.slice(3));
+    break;
+  }
+  case 'agy-accounts':
+  case 'antigravity-accounts': {
+    const { runAntigravityAccountsCommand } = await import('./cli/antigravity-accounts.js');
+    try {
+      await runAntigravityAccountsCommand(process.argv.slice(3), {
+        isBlockedInSession: isolatedCliProcess() || isSessionScopedCliProcess(),
+      });
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
     break;
   }
   case 'upgrade':
@@ -21863,13 +22367,22 @@ switch (command) {
     process.exitCode = await runObserveCommand(process.argv.slice(3));
     break;
   }
+  case 'post': {
+    const { cmdPost } = await import('./cli/post-command.js');
+    process.exitCode = await cmdPost(process.argv.slice(3));
+    break;
+  }
   case 'send': {
-    let releaseFeedbackEffect: (() => void) | undefined;
+    let feedbackEffectLease: Promise<() => Promise<void>> | undefined;
     try {
-      await cmdSend(process.argv.slice(3), () => {
-        releaseFeedbackEffect ??= acquireFeedbackSendLease(resolveDataDir());
+      await cmdSend(process.argv.slice(3), async (relay) => {
+        feedbackEffectLease ??= acquireFeedbackSendLeaseWithRelay({
+          acquireLocal: () => acquireFeedbackSendLease(resolveDataDir()),
+          relay,
+        });
+        await feedbackEffectLease;
       }, sendPreflight);
-      releaseFeedbackEffect?.();
+      if (feedbackEffectLease) await (await feedbackEffectLease)();
     }
     catch (error) {
       if (!(error instanceof TopicSendError)) throw error;
@@ -21992,3 +22505,4 @@ switch (command) {
     break;
 }
 import { acquireFeedbackSendLease } from './services/feedback-maintenance.js';
+import { acquireFeedbackSendLeaseWithRelay, FEEDBACK_SEND_LEASE_ROUTE, type FeedbackSendLeaseRelay } from './services/feedback-send-lease-relay.js';

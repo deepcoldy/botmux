@@ -42,36 +42,21 @@
  *     drain with flushTrailingFinal:true.
  *
  * Pending-task self-attestation — why the screen gate alone is not enough:
- * While a task runs in the BACKGROUND the TUI itself goes back to the ready
- * composer, so a 1s quiet tick could coincide with a screen that looks idle
- * even though the task has not reported back yet (the wake-up SYSTEM_MESSAGE
- * arrives tens of seconds later — p50 ~20s, p90 ~81s in real logs). The
- * transcript records that wait deterministically:
- *   - a GENERIC record with status:"RUNNING" (every RUNNING GENERIC in
- *     observed logs is one) whose content says "Tool is running as a
- *     background task"
- * sets hasPendingTask. Tool NAMES are deliberately NOT used to SET the flag:
- * `manage_task` / `schedule` are ALSO called synchronously to poll task status
- * (their GENERIC result is DONE, not RUNNING), so a name alone would latch
- * waits that already ended. While the flag is set, flushTrailingFinal is
- * refused no matter how quiet the screen is. The flag clears only on proof the
- * wait actually ended:
- *   - the completion SYSTEM_MESSAGE / an ERROR,
- *   - a FOREGROUND tool call (run_command/read/edit/…), including when a
- *     background task finishes WITHOUT a SYSTEM_MESSAGE and the planner wraps
- *     up itself (session 098f4ab3),
- *   - the next USER_INPUT.
- * A call whose tools are ALL `manage_task`/`schedule` does NOT clear it —
- * those calls ARE the launch/poll mechanism, and the RUNNING record plus them
- * are written out of step_index order in real logs (clearing on every
- * PLANNER tool_call dropped the flag for ~63% of build/review waits).
+ * Background commands and subagents both leave the TUI at a ready composer.
+ * A RUNNING GENERIC latches hasPendingTask for command waits; a GENERIC saying
+ * "Created the following subagent" records its conversationId even though the
+ * launch itself is DONE. Quiet flushes are refused while either wait exists.
+ * Command waits end on a task-result SYSTEM_MESSAGE, an error, a foreground
+ * tool call, or the next USER_INPUT (legacy agy can omit command callbacks).
+ * Subagent waits survive foreground work, errors and unrelated system notices:
+ * only that agent's [Message] sender, an explicit manage_subagents kill/kill_all
+ * call abandoning the wait, or a new USER_INPUT removes them. Each agent is
+ * tracked separately so the first of several replies cannot close the turn.
  *
- * Continuation records cancel a held candidate: a PLANNER_RESPONSE whose
- * tool_calls include any FOREGROUND tool, a GENERIC tool-output line, or a
- * SYSTEM_MESSAGE / ERROR_MESSAGE. A PLANNER_RESPONSE whose tool_calls are all
- * task launch/poll tools (manage_task/schedule) neither confirms nor cancels.
- * CHECKPOINT / TASK_NOTIFICATION neither confirm nor cancel (they can follow a
- * real final while the turn is done).
+ * Continuation records cancel a held candidate: a PLANNER_RESPONSE with a
+ * foreground tool, GENERIC tool output, or SYSTEM_MESSAGE / ERROR_MESSAGE.
+ * Task launch/poll calls preserve it. CHECKPOINT / TASK_NOTIFICATION neither
+ * confirm nor cancel (they can follow a real final while the turn is done).
  *
  * Other accepted gaps:
  *   - An EMPTY content/no-tool_calls PLANNER_RESPONSE precedes a
@@ -303,11 +288,23 @@ export function unwrapAntigravityUserInput(content: string): string {
  *  user turn confirms it (it gets emitted). */
 export interface AntigravityTranscriptState {
   provisionalFinal?: CodexBridgeEvent;
-  /** A background task (manage_task / schedule / RUNNING background GENERIC)
-   *  is outstanding: the transcript itself proves the turn is not done, so the
-   *  quiet-tick flush is refused until the completion SYSTEM_MESSAGE or the
-   *  next user turn clears it. */
+  sourceTurnId?: string;
+  /** Legacy command wait, separate from subagent waits: foreground work can
+   *  clear this even when an agy build omitted the command callback. */
   hasPendingTask?: boolean;
+  /** The RUNNING record's logical step. Only its immediate DONE successor is
+   *  accepted as callback-less command-result evidence; poll results can be
+   *  physically written before their lower-step tool_call. */
+  pendingTaskRunningStep?: number;
+  /** The command RUNNING step's immediate non-launch DONE successor landed.
+   *  invoke_subagent may use this narrower callback-less recovery signal;
+   *  the launch alone does not prove an independent command ended. */
+  hasPendingTaskResult?: boolean;
+  /** Launched subagents whose first notifications have not arrived,
+   *  deduplicated by id. A notification can request guidance rather than
+   *  finish the work; send_message does not re-arm this wait because it does
+   *  not promise a reply. An array keeps carried worker state serializable. */
+  pendingSubagentIds?: string[];
 }
 
 /** Every GENERIC record in observed logs with this phrase has status RUNNING;
@@ -338,9 +335,15 @@ export interface AntigravityDrainOptions {
   /** Worker-only: release the held trailing candidate after the viewport
    *  quiet-tick probe confirmed the TUI is idle and on the ready marker. */
   flushTrailingFinal?: boolean;
+  /** Worker-only: the whole conversation is being retired. A later explicit
+   *  input abandons earlier pending work in managed mode too, rather than
+   *  promoting its waiting narration to a normal final. */
+  retirePendingTurns?: boolean;
+  /** Bind replies to native inputs when a person can also type in the pane. */
+  adoptMode?: boolean;
 }
 
-function recordTimestampMs(rec: any): number {
+export function recordTimestampMs(rec: any): number {
   const ms = Date.parse(rec?.created_at);
   return Number.isFinite(ms) ? ms : Date.now();
 }
@@ -349,8 +352,86 @@ function cloneState(state: AntigravityTranscriptState | undefined): AntigravityT
   const candidate = state?.provisionalFinal;
   return {
     ...(candidate ? { provisionalFinal: { ...candidate } } : {}),
-    ...(state?.hasPendingTask ? { hasPendingTask: true } : {}),
+    ...pendingState(state),
+    ...(state?.sourceTurnId ? { sourceTurnId: state.sourceTurnId } : {}),
   };
+}
+
+/** Shared by the worker's quiet latch and both drainer flush paths. */
+export function hasAntigravityPendingTasks(state: AntigravityTranscriptState): boolean {
+  return !!state.hasPendingTask || !!state.pendingSubagentIds?.length;
+}
+
+function commandState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
+  return state?.hasPendingTask ? {
+    hasPendingTask: true,
+    ...(state.pendingTaskRunningStep !== undefined ? { pendingTaskRunningStep: state.pendingTaskRunningStep } : {}),
+    ...(state.hasPendingTaskResult ? { hasPendingTaskResult: true } : {}),
+  } : {};
+}
+
+function pendingState(state: AntigravityTranscriptState | undefined): AntigravityTranscriptState {
+  return {
+    ...commandState(state),
+    ...(state?.pendingSubagentIds?.length ? { pendingSubagentIds: [...state.pendingSubagentIds] } : {}),
+  };
+}
+
+function subagentState(ids: readonly string[] | undefined): AntigravityTranscriptState {
+  return ids?.length ? { pendingSubagentIds: [...ids] } : {};
+}
+
+/** Match the tool's result header, not arbitrary conversationIds in output. */
+function createdSubagentIds(content: string): string[] {
+  // A launch has only timestamp metadata before this header. read_file and
+  // run_command output can quote the same text later in their result bodies.
+  const match = content.match(/^(?:(?:Created|Completed) At: [^\r\n]+\r?\n)*Created the following subagent:\s*\{\s*"conversationId"\s*:\s*"([A-Za-z0-9._-]+)"/);
+  return match ? [match[1]] : [];
+}
+
+/** Only the notification header supplies provenance; a report body may quote
+ *  other agents' sender= strings. */
+function systemMessageHeader(content: string): string {
+  return systemMessagePayload(content).match(/^\[Message\] ([^\n]*)/)?.[1] ?? '';
+}
+
+/** Strip only agy's system envelope, so legacy unheaded task results can be
+ *  matched at the start of the payload rather than anywhere in a reminder. */
+function systemMessagePayload(content: string): string {
+  return content.match(/(?:^|\n)<SYSTEM_MESSAGE>\r?\n([\s\S]*?)(?:\r?\n<\/SYSTEM_MESSAGE>|$)/)?.[1] ?? content;
+}
+
+/** Compact transcripts JSON-encode each args field separately; full logs and
+ *  function-call encodings can already carry native values. Decode one layer. */
+function decodeArgumentValue(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try { return JSON.parse(value); } catch { return value; }
+}
+
+function toolCallArguments(call: any): any {
+  const args = call?.args ?? call?.function?.arguments;
+  if (typeof args !== 'string') return args;
+  try { return JSON.parse(args); } catch { return undefined; }
+}
+
+/** An explicit kill abandons the requested waits. list/send_message/ordinary
+ *  tools cannot do that. Support agy's args and the function-call encoding. */
+function abandonSubagentWaits(state: AntigravityTranscriptState, toolCalls: any[]): AntigravityTranscriptState {
+  for (const call of toolCalls) {
+    if ((call?.name ?? call?.function?.name) !== 'manage_subagents') continue;
+    const args = toolCallArguments(call);
+    const action = decodeArgumentValue(args?.Action);
+    const conversationIds = decodeArgumentValue(args?.ConversationIds);
+    if (action !== 'kill_all' && !(action === 'kill' && Array.isArray(conversationIds))) continue;
+    const ids = action === 'kill_all'
+      ? undefined
+      : state.pendingSubagentIds?.filter(id => !(conversationIds as unknown[]).includes(id));
+    // Cancel the old "waiting" narration as well: otherwise kill_all could
+    // immediately flush that stale candidate before the kill's result lands.
+    const { provisionalFinal: _final, pendingSubagentIds: _ids, ...rest } = state;
+    state = { ...rest, ...subagentState(ids) };
+  }
+  return state;
 }
 
 /** Tool calls that are part of the background-task mechanism itself —
@@ -362,12 +443,20 @@ function cloneState(state: AntigravityTranscriptState | undefined): AntigravityT
  *  these tools must NOT clear it — the wait it is part of is still in flight.
  *  Empirically the RUNNING record and these calls are written out of
  *  step_index order, so clearing on every PLANNER tool_call dropped the flag
- *  for the majority of real build/review waits (63%). */
-const TASK_POLL_TOOL_NAMES = new Set(['manage_task', 'schedule']);
+ *  for the majority of real build/review waits (63%). manage_subagents also
+ *  preserves both waits: managing agents says nothing about a command.
+ *  invoke_subagent is deliberately NOT in this set. It is substantive new
+ *  work, so the ordinary foreground branch clears the legacy command wait
+ *  and old candidate while retaining every outstanding subagent id. */
+const TASK_POLL_TOOL_NAMES = new Set(['manage_task', 'schedule', 'manage_subagents']);
 
 function isTaskPollToolCall(toolCall: any): boolean {
   const name = toolCall?.name ?? toolCall?.function?.name;
   return typeof name === 'string' && TASK_POLL_TOOL_NAMES.has(name);
+}
+
+function isSubagentLaunchToolCall(toolCall: any): boolean {
+  return (toolCall?.name ?? toolCall?.function?.name) === 'invoke_subagent';
 }
 
 /** Fold one parsed record into the drain: push confirmed events, hold/cancel
@@ -380,23 +469,36 @@ function foldRecord(
   timestampMs: number,
   events: CodexBridgeEvent[],
   state: AntigravityTranscriptState,
+  adoptMode: boolean,
+  retirePendingTurns: boolean,
 ): AntigravityTranscriptState {
   const type = obj?.type;
-  const keepPending = (s: AntigravityTranscriptState): AntigravityTranscriptState =>
-    s.hasPendingTask ? { hasPendingTask: true } : {};
-
+  const turn = state.sourceTurnId ? { sourceTurnId: state.sourceTurnId } : {};
   if (type === 'USER_INPUT') {
     // Only agy's own explicit submits start bridge turns. Any other source is
     // ignored entirely (and neither confirms nor cancels a candidate).
     if (obj.source !== undefined && obj.source !== 'USER_EXPLICIT') return state;
-    // A new explicit user turn proves the previous loop really ended AND no
-    // background task from it is outstanding: release its held final BEFORE
-    // the user event so turns stay interleaved, and reset the turn state.
-    if (state.provisionalFinal) events.push(state.provisionalFinal);
+    // A new explicit user turn normally confirms the previous loop. During
+    // conversation retirement, pending work is abandoned in managed mode too:
+    // its waiting narration must not become the old turn's normal answer.
+    const uuid = `${path}:${lineStart}`;
+    const pending = hasAntigravityPendingTasks(state);
+    const abandonPending = retirePendingTurns && pending;
+    if (state.provisionalFinal && !((adoptMode || retirePendingTurns) && pending)) {
+      events.push(state.provisionalFinal);
+    } else if (state.sourceTurnId || abandonPending) {
+      // Managed states have no native id; the queue's current collecting owner
+      // receives this abort. Adopt states route by their exact sourceTurnId.
+      events.push({ uuid: `${uuid}:abort`, timestampMs, kind: 'turn_aborted', text: '', ...turn });
+    }
     const raw = typeof obj.content === 'string' ? obj.content : '';
     const text = unwrapAntigravityUserInput(raw);
     if (text) {
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
+      const next = adoptMode ? { sourceTurnId: uuid } : {};
+      events.push({ uuid, timestampMs, kind: 'user', text, ...next,
+        ...(adoptMode ? { inputTextAliases: [] } : {}),
+      });
+      return next;
     }
     return {};
   }
@@ -409,17 +511,28 @@ function foldRecord(
       //    Keep BOTH a held candidate and the pending flag intact (the RUNNING
       //    record and these calls are observed out of step order).
       //  - ANY call is an ordinary FOREGROUND tool (run_command/read/edit/…)
-      //    → the model has moved on with a real tool after the wait: hard
-      //    evidence the outstanding wait ended. Drop the candidate and clear
-      //    pending. This is what lets a turn that launched a background task
-      //    and then wrapped up on its own (NO completion SYSTEM_MESSAGE, e.g.
+      //    → drop the candidate and clear the legacy command wait, retaining
+      //    all outstanding subagent ids. This lets a turn with a command task
+      //    that wrapped up on its own (NO completion SYSTEM_MESSAGE, e.g.
       //    session 098f4ab3's 491-char release summary) still emit its real
       //    final instead of latching forever.
+      state = abandonSubagentWaits(state, obj.tool_calls);
       if (obj.tool_calls.every(isTaskPollToolCall)) return state;
-      return {};
+      const hasOrdinaryForeground = obj.tool_calls.some((call: any) =>
+        !isTaskPollToolCall(call) && !isSubagentLaunchToolCall(call));
+      // Ordinary foreground work retains the legacy recovery heuristic. A
+      // subagent launch is narrower: it recovers a missing callback only after
+      // a command-result DONE, never while the command is still merely RUNNING.
+      const launchRecovery = state.hasPendingTaskResult
+        && obj.tool_calls.some(isSubagentLaunchToolCall);
+      return {
+        ...turn,
+        ...(!hasOrdinaryForeground && !launchRecovery ? commandState(state) : {}),
+        ...subagentState(state.pendingSubagentIds),
+      };
     }
     const text = typeof obj.content === 'string' ? obj.content : '';
-    if (!text.trim()) {
+    if (!text.trim() || (adoptMode && !state.sourceTurnId)) {
       // Empty content-only step: the "model output must contain either output
       // text or tool calls" ERROR precursor. Never a final; do not disturb a
       // held candidate or the pending flag.
@@ -429,9 +542,14 @@ function foldRecord(
     // replaces an earlier held one). The pending-task flag rides along — the
     // quiet flush checks it and refuses while a task is outstanding.
     const finalText = hasTruncatedContent(obj) ? `${text}\n\n${ANTIGRAVITY_TRUNCATED_REPLY_NOTICE}` : text;
+    const model = adoptMode && typeof obj.model === 'string' ? obj.model.trim() : '';
     return {
-      provisionalFinal: { uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: finalText },
-      ...(state.hasPendingTask ? { hasPendingTask: true } : {}),
+      ...turn,
+      provisionalFinal: {
+        uuid: `${path}:${lineStart}`, timestampMs, kind: 'assistant_final', text: finalText, ...turn,
+        ...(model && !model.endsWith('-worker-agy') ? { replyModel: model } : {}),
+      },
+      ...pendingState(state),
     };
   }
 
@@ -440,20 +558,61 @@ function foldRecord(
   // outstanding-task state must survive it; the completion SYSTEM_MESSAGE is
   // the actual wake-up that clears it.
   if (isBackgroundTaskRunningRecord(obj)) {
-    return { ...state, hasPendingTask: true };
+    const { hasPendingTaskResult: _staleResult, pendingTaskRunningStep: _staleStep, ...rest } = state;
+    const runningStep = typeof obj.step_index === 'number' && Number.isInteger(obj.step_index)
+      ? obj.step_index
+      : undefined;
+    return { ...rest, hasPendingTask: true, ...(runningStep !== undefined ? { pendingTaskRunningStep: runningStep } : {}) };
   }
   if (type === 'GENERIC') {
     // Foreground tool output after a content-only step cancels the candidate;
-    // a possibly-outstanding background task stays recorded.
-    return keepPending(state);
+    // a possibly-outstanding background task stays recorded. A DONE result can
+    // later support invoke_subagent's callback-less recovery, but a subagent
+    // creation result is not evidence about the independent command.
+    const content = typeof obj.content === 'string' ? obj.content : '';
+    const ids = obj.status === 'DONE' ? createdSubagentIds(content) : [];
+    // Real background RUNNING/result pairs are consecutive logical steps even
+    // when lower-step planner records physically land between them. Poll DONE
+    // or ERROR records have no such relationship, including reversed writes.
+    const commandResult = state.hasPendingTask
+      && obj.status === 'DONE'
+      && ids.length === 0
+      && state.pendingTaskRunningStep !== undefined
+      && obj.step_index === state.pendingTaskRunningStep + 1;
+    return {
+      ...turn,
+      ...pendingState(commandResult ? { ...state, hasPendingTaskResult: true } : state),
+      ...subagentState([...new Set([...(state.pendingSubagentIds ?? []), ...ids])]),
+    };
   }
 
-  // SYSTEM_MESSAGE is the background-task result / stop-hook wake-up: the
-  // wait is over, so clear hasPendingTask, AND cancel any provisional
-  // narration — the planner either continues with tools (re-cancelling) or
-  // emits the real final afterwards. ERROR records cancel the candidate too.
-  if (type === 'SYSTEM_MESSAGE' || type === 'ERROR_MESSAGE' || type === 'ERROR') {
-    return {};
+  if (type === 'SYSTEM_MESSAGE') {
+    const content = typeof obj.content === 'string' ? obj.content : '';
+    const header = systemMessageHeader(content);
+    const sender = header.match(/(?:^|\s)sender=([A-Za-z0-9._/-]+)(?:\s|$)/)?.[1];
+    // Sender provenance is sufficient for command/timer wakeups: schedule
+    // delivers arbitrary user-defined prompts, not a fixed completion phrase.
+    const taskSender = sender !== undefined && /\/task-[A-Za-z0-9._-]+$/.test(sender);
+    const payload = header
+      ? (header.match(/(?:^|\s)content=(.*)/)?.[1] ?? header)
+      : systemMessagePayload(content);
+    // Older builds omit sender and sometimes [Message] itself. Match only a
+    // task result at the payload's start, never a quoted result in a reminder
+    // or a subagent's report body.
+    const legacyTaskResult = !sender
+      && /^[Tt]ask(?: id)?\s+[^\n]*? (?:finished|completed|was cancel(?:l)?ed|failed|timed out)\b/.test(payload);
+    // Pure system notices do not wake the planner with a result and may land
+    // after its real final. Preserve both pending work and the held candidate.
+    if (!header && !legacyTaskResult) return state;
+    const ids = state.pendingSubagentIds?.filter(id => id !== sender);
+    return {
+      ...turn,
+      ...(!taskSender && !legacyTaskResult ? commandState(state) : {}),
+      ...subagentState(ids),
+    };
+  }
+  if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
+    return { ...turn, ...subagentState(state.pendingSubagentIds) };
   }
 
   // CHECKPOINT / TASK_NOTIFICATION / unknown types neither confirm nor cancel;
@@ -487,11 +646,11 @@ export function drainAntigravityTranscript(
   if (step.kind === 'idle') {
     // Nothing new on disk, but the caller may be releasing a held candidate.
     // Refuse while a background task is still outstanding: its completion
-    // SYSTEM_MESSAGE (which clears the flag) has not arrived, so a quiet
+    // result notification has not arrived, so a quiet
     // screen cannot prove the turn is done.
-    if (options.flushTrailingFinal && incomingState.provisionalFinal && !incomingState.hasPendingTask) {
+    if (options.flushTrailingFinal && incomingState.provisionalFinal && !hasAntigravityPendingTasks(incomingState)) {
       const events = [incomingState.provisionalFinal];
-      return { events, newOffset: fromOffset, pendingTail: '', state: { ...(incomingState.hasPendingTask ? { hasPendingTask: true } : {}) } };
+      return { events, newOffset: fromOffset, pendingTail: '', state: pendingState(incomingState) };
     }
     return { events: [], newOffset: fromOffset, pendingTail: '', state: cloneState(incomingState) };
   }
@@ -505,7 +664,7 @@ export function drainAntigravityTranscript(
   for (const { line, lineStart } of iterateJsonlLines(completeText, fromOffset)) {
     let obj: any;
     try { obj = JSON.parse(line); } catch { continue; }
-    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state);
+    state = foldRecord(path, lineStart, obj, recordTimestampMs(obj), events, state, options.adoptMode === true, options.retirePendingTurns === true);
   }
 
   // The final object may sit at EOF without a trailing \n until the next turn.
@@ -513,7 +672,7 @@ export function drainAntigravityTranscript(
   if (pendingTail.length > 0) {
     try {
       const obj = JSON.parse(pendingTail);
-      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state);
+      state = foldRecord(path, newOffset, obj, recordTimestampMs(obj), events, state, options.adoptMode === true, options.retirePendingTurns === true);
       newOffset = size;
       pendingTail = '';
     } catch {
@@ -522,11 +681,12 @@ export function drainAntigravityTranscript(
   }
 
   // Release the candidate only when the flush is requested AND no background
-  // task is outstanding. With hasPendingTask set the candidate rides another
-  // tick until the completion SYSTEM_MESSAGE / next user turn clears it.
-  if (options.flushTrailingFinal && state.provisionalFinal && !state.hasPendingTask) {
+  // command or subagent is outstanding. The candidate rides another tick
+  // until the corresponding result / next user turn clears the wait.
+  if (options.flushTrailingFinal && state.provisionalFinal && !hasAntigravityPendingTasks(state)) {
     events.push(state.provisionalFinal);
     state.provisionalFinal = undefined;
+    delete state.sourceTurnId;
   }
   return { events, newOffset, pendingTail, state };
 }

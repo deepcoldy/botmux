@@ -1,8 +1,9 @@
 import { AUTH_PROVIDERS, type AuthProvider } from '../core/provider-auth-request.js';
 import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
+import { reasonTag } from '../core/refusal-reasons.js';
 
 export const AUTH_REQUEST_USAGE = `用法: botmux auth request [--scope "<scope1 scope2,...>"] [--allow-unknown] [--json]
-      botmux auth request --provider <meego|bytedcli> [--tenant dcar] [--json]
+      botmux auth request --provider <meego|bytedcli|lark-cli> [--tenant dcar] [--json]
       botmux auth wait --request-id <id> [--json]
 
 为当前会话的本轮发起人生成飞书授权链接，返回 daemon 的 JSON 结果。
@@ -14,11 +15,12 @@ Daemon 自动完成授权；本轮结束后，用户也可在有效期内授权�
 wait 每 2 秒查询一次，最多等待 5 分钟，返回 JSON。
 --provider 由 bytedcli 包装脚本调用：botmux 把 Meego / ByteCloud 授权链接直接私下发给本轮发起人，只输出一句不含链接的说明。
 --tenant 仅用于 Meego，取值同 bytedcli meego login --tenant。
-退出码 0 已授权，3 尚未授权（链接已发出或发不出去），4 授权服务暂不可用。`;
+--unattended 由包装脚本在无人值守的运行里调用：只把授权链接私下发给任务执行人（同一链接不重复发），不等待、不返回链接。
+退出码 0 已授权，3 尚未授权（链接已发出或发不出去），4 授权服务暂不可用，5 无人值守的授权入口没能送达任务执行人。`;
 
 export type ParsedAuthArgs =
   | { help: true }
-  | { help: false; command: 'request'; scopes: string[]; allowUnknown: boolean; provider?: AuthProvider; tenant?: MeegoTenant; json?: boolean }
+  | { help: false; command: 'request'; scopes: string[]; allowUnknown: boolean; provider?: AuthProvider | 'lark-cli'; tenant?: MeegoTenant; json?: boolean; unattended?: boolean }
   | { help: false; command: 'wait'; requestId: string };
 
 export function parseAuthRequestArgs(args: string[]): ParsedAuthArgs {
@@ -30,8 +32,9 @@ export function parseAuthRequestArgs(args: string[]): ParsedAuthArgs {
   if (command !== 'request' && command !== 'wait') throw new Error('需要 auth request 或 auth wait 子命令');
   let scopes: string[] | undefined;
   let requestId: string | undefined;
-  let provider: AuthProvider | undefined;
+  let provider: AuthProvider | 'lark-cli' | undefined;
   let tenant: MeegoTenant | undefined;
+  let unattended = false;
   let json = false;
   let allowUnknown = false;
   for (let index = 1; index < args.length; index++) {
@@ -47,8 +50,10 @@ export function parseAuthRequestArgs(args: string[]): ParsedAuthArgs {
       if (scopes.length === 0) throw new Error('--scope 需要权限名称');
     } else if (command === 'request' && argument === '--provider' && provider === undefined) {
       const value = args[++index];
-      if (!AUTH_PROVIDERS.includes(value as AuthProvider)) throw new Error(`--provider 只支持 ${AUTH_PROVIDERS.join(' / ')}`);
-      provider = value as AuthProvider;
+      if (!AUTH_PROVIDERS.includes(value as AuthProvider) && value !== 'lark-cli') throw new Error(`--provider 只支持 ${AUTH_PROVIDERS.join(' / ')} / lark-cli`);
+      provider = value as AuthProvider | 'lark-cli';
+    } else if (command === 'request' && argument === '--unattended' && !unattended) {
+      unattended = true;
     } else if (command === 'request' && argument === '--tenant' && tenant === undefined) {
       const value = args[++index];
       if (!MEEGO_TENANTS.includes(value as MeegoTenant)) throw new Error(`--tenant 只支持 ${MEEGO_TENANTS.join(' / ')}`);
@@ -65,8 +70,9 @@ export function parseAuthRequestArgs(args: string[]): ParsedAuthArgs {
     return { help: false, command, requestId };
   }
   if (provider && (scopes || allowUnknown)) throw new Error('--provider 不能和 --scope / --allow-unknown 一起用');
+  if (unattended && !provider) throw new Error('--unattended 只能和 --provider 一起用');
   if (tenant && provider !== 'meego') throw new Error('--tenant 只能和 --provider meego 一起用');
-  return { help: false, command, scopes: scopes ?? [], allowUnknown, ...(provider ? { provider, json, ...(tenant ? { tenant } : {}) } : {}) };
+  return { help: false, command, scopes: scopes ?? [], allowUnknown, ...(provider ? { provider, json, ...(tenant ? { tenant } : {}), ...(unattended ? { unattended } : {}) } : {}) };
 }
 
 /** Exit status of `auth request --provider`, which the bytedcli wrapper reads. */
@@ -75,7 +81,22 @@ export function providerAuthExitCode(ok: boolean, status: unknown): number {
   switch (status) {
     case 'ready': return 0;
     case 'delivered': case 'pending': case 'undeliverable': return 3;
+    case 'undelivered': case 'platform_undelivered': return 5;
     case 'unavailable': return 4;
     default: return 1;
+  }
+}
+
+/** The `[reason=…]` line printed after a provider answer, so a caller can tell
+ *  "an entry went to the person" and "the provider is down" from refusals that
+ *  are not about authorization. Decided from the status, not the exit code: a
+ *  request botmux refused to start (delegated turn, unbound host, …) also
+ *  exits 3, yet no entry went anywhere, so it carries no tag. */
+export function providerAuthAnswerTag(ok: boolean, status: unknown): string | undefined {
+  if (!ok) return undefined;
+  switch (status) {
+    case 'delivered': case 'pending': case 'undeliverable': return reasonTag('authorization_requested');
+    case 'unavailable': return reasonTag('authorization_unavailable');
+    default: return undefined;
   }
 }

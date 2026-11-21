@@ -22,6 +22,33 @@ import {
 } from '../src/core/raw-command-writer.js';
 
 describe('raw command backend acceptance', () => {
+  it.each(['write', 'sendText', 'pasteText', 'coco'] as const)(
+    'stops later command bytes after ownership changes during %s delivery', async mode => {
+      let current = true;
+      const text: string[] = [], keys: string[] = [];
+      const backend = {
+        write: (data: string) => { text.push(data); },
+        ...(mode !== 'write' ? {
+          sendText: (data: string) => { text.push(data); },
+          sendSpecialKeys: (key: string) => { keys.push(key); },
+        } : {}),
+        ...(mode === 'pasteText' ? {
+          supportsRawCommandPasteLine: true,
+          pasteText: (data: string) => { text.push(data); },
+        } : {}),
+      };
+      const opts = { coco: mode === 'coco', pasteLine: mode === 'pasteText',
+        delay: async () => { current = false; }, isCurrent: () => current };
+      expect(await writeRawCommandLine(backend, '/compact', opts)).toBe(false);
+      expect(text).toEqual([mode === 'coco' ? '/' : '/compact']);
+      expect(keys).toEqual([]);
+    },
+  );
+  it.each([typeRawCommandLine, writeRawCommandLine])('refuses a retired writer before the first byte (%s)', async writer => {
+    const write = vi.fn();
+    expect(await writer({ write }, '/compact', { isCurrent: () => false })).toBe(false);
+    expect(write).not.toHaveBeenCalled();
+  });
   const immediateDelay = vi.fn(async () => {});
 
   it('uses pasteText before Enter when pasteLine is enabled', async () => {

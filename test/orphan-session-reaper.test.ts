@@ -218,6 +218,24 @@ describe('runPeriodicOrphanSessionSweep (daemon periodic wiring)', () => {
     log: () => {},
   };
 
+  it.each(['linux', 'darwin'] as const)('does not probe or warn about an absent tmux server on %s', platform => {
+    let probes = 0;
+    const logs: string[] = [];
+    const r = runPeriodicOrphanSessionSweep({
+      ...baseSeam,
+      platform,
+      listeningPids: () => [],
+      reachablePid: () => { probes += 1; return null; },
+      log: message => logs.push(message),
+    });
+    expect(r.labelsScanned).toBe(1);
+    expect(r.censusComplete).toBe(true);
+    expect(r.orphanServers).toBe(0);
+    expect(r.signalled).toEqual([]);
+    expect(probes).toBe(0);
+    expect(logs).toEqual([]);
+  });
+
   it('report-only default counts orphan servers and never signals / touches procs', () => {
     let procsLoaded = false;
     const r = runPeriodicOrphanSessionSweep({

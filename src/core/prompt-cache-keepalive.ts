@@ -58,6 +58,10 @@ export function promptCacheKeepaliveIneligibility(ds: DaemonSession): string | u
   // Background tasks report back into the conversation on their own; a
   // keep-alive turn would only interleave with them.
   if (ds.backgroundTaskCount) return 'background_tasks';
+  // A failed turn waits for the provider and its continuation refreshes the
+  // cache. A keep-alive turn finishing in that wait would read as someone
+  // taking over in the web terminal, and cancel the continuation.
+  if (ds.session.ordinaryTurnRecovery?.status === 'backoff') return 'recovery_wait';
   return undefined;
 }
 
@@ -145,6 +149,24 @@ export function resetPromptCacheKeepalive(ds: DaemonSession, now = Date.now()): 
     type: 'session.update',
     body: { sessionId: ds.session.sessionId, patch: { busySinceAt: now } },
   });
+}
+
+/**
+ * A botmux turn is starting: it ends the idle stretch the keep-alive was
+ * extending. Except an unattended maintenance write (auto / idle /compact):
+ * the worker may still refuse it before typing anything, and resetting here
+ * would make the keep-alive fire again at once over a stretch nothing
+ * touched. If it does run, its busy edge ends the stretch in
+ * notePromptCacheKeepaliveScreenStatus. With a keep-alive in flight it resets
+ * as before: that busy edge would otherwise be taken for the keep-alive's.
+ */
+export function notePromptCacheKeepaliveTurnStarted(
+  ds: DaemonSession,
+  opts: { unattended?: boolean } = {},
+  now = Date.now(),
+): void {
+  if (opts.unattended && !promptCacheKeepaliveInFlight(ds, now)) return;
+  resetPromptCacheKeepalive(ds, now);
 }
 
 /**

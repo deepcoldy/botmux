@@ -16,9 +16,11 @@ import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
+import { crossChatFollowThreadPath } from './cross-chat-follow-thread-store.js';
 import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
 import { removeCodexModelLaunchReceipt } from './codex-model-selection.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
+import { cleanupSessionTurns, resumeSessionTurns } from './session-turns.js';
 import {
   applySessionRowCommand,
   type HostSessionCommand,
@@ -892,9 +894,11 @@ export function listUnmigratedAppIds(dataDir: string, opts: { strict?: boolean }
   return ids;
 }
 
-/** One ref per SQLite store identity. `strict` propagates an unlistable
- *  `session-stores/` dir (fail-closed callers must not mistake an unreadable
- *  store set for an empty one). */
+/** One ref per SQLite store identity. `strict` lists every peer directory so
+ *  unreadable directories and unresolved links cannot silently narrow the
+ *  inventory. A readable peer with no database is still legitimately absent,
+ *  and so is a non-directory entry (e.g. a Finder `.DS_Store`): it cannot hold
+ *  a store, so it must not fail every strict inventory on the machine. */
 function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreFileRef[] {
   const names = readdirSync(dataDir);
   const refs: StoreFileRef[] = [];
@@ -907,7 +911,22 @@ function listStoreRefs(dataDir: string, opts: { strict?: boolean } = {}): StoreF
     }
     for (const appId of appIds) {
       const dbPath = storeDbPath(appId, dataDir);
-      if (existsSync(dbPath)) refs.push({ appId, path: dbPath });
+      let present: boolean;
+      if (opts.strict) {
+        let entries: string[];
+        try {
+          entries = readdirSync(dirname(dbPath));
+        } catch (err) {
+          // ENOTDIR = the entry (or what its link resolves to) is a plain file.
+          // A dangling link (ENOENT) or an unsearchable dir (EACCES) still throws.
+          if ((err as NodeJS.ErrnoException).code === 'ENOTDIR') continue;
+          throw err;
+        }
+        present = entries.includes(basename(dbPath));
+      } else {
+        present = existsSync(dbPath);
+      }
+      if (present) refs.push({ appId, path: dbPath });
     }
   }
   return refs;
@@ -2486,15 +2505,25 @@ function findInOtherFiles(sessionId: string): Session | undefined {
 
 export function cleanupSessionBridgeSendMarkersNow(sessionId: string): void {
   try { unlinkSync(join(config.session.dataDir, 'turn-sends', `${sessionId}.jsonl`)); } catch { /* absent/best effort */ }
+  try { unlinkSync(crossChatFollowThreadPath(config.session.dataDir, sessionId)); } catch { /* absent/best effort */ }
 }
 
 export function cleanupSessionBridgeSendMarkers(sessionId: string): void {
   const fence = bridgeMarkerCleanupFences.get(sessionId);
   if (fence) {
-    void fence.then(
-      () => cleanupSessionBridgeSendMarkersNow(sessionId),
-      () => cleanupSessionBridgeSendMarkersNow(sessionId),
-    );
+    const expectedEpoch = getOwnedSession(sessionId)?.followThreadEpoch;
+    const cleanupIfLifecycleUnchanged = () => {
+      try {
+        const current = getOwnedSession(sessionId);
+        // A close fence belongs to the lifecycle that created it. If resume or
+        // another close has moved the session forward, its cleanup must not
+        // delete the new lifecycle's host binding.
+        if (current?.status === 'closed' && current.followThreadEpoch === expectedEpoch) {
+          cleanupSessionBridgeSendMarkersNow(sessionId);
+        }
+      } catch { /* an unreadable lifecycle is not proof it is safe to delete */ }
+    };
+    void fence.then(cleanupIfLifecycleUnchanged, cleanupIfLifecycleUnchanged);
     return;
   }
   cleanupSessionBridgeSendMarkersNow(sessionId);
@@ -2868,6 +2897,7 @@ export function closeSession(
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
     }, { now: new Date() });
     if (applied.outcome === 'applied') {
+      next.followThreadEpoch = randomUUID();
       commitContractLifecycle(basis, 'close', () => {
         const latest = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
         const closed = latest ? JSON.parse(latest.row) as Session : undefined;
@@ -2892,6 +2922,11 @@ export function closeSession(
     // user-visible, so workerless/forced closes must apply the same cleanup;
     // otherwise closed sessions retain private reply text indefinitely.
     if (opts.cleanupBridgeMarkers !== false) cleanupSessionBridgeSendMarkers(sessionId);
+    try {
+      cleanupSessionTurns(config.session.dataDir, sessionId);
+    } catch {
+      logger.warn('Failed to clean structured session turns');
+    }
     // #794: per-turn hook sidecar 与 turn-sends 同生命周期，关会话一并清掉，
     // 否则 prompt-ctx/<sid>/ 成为孤儿目录（24h TTL 兜底但 daemon 长命会累积）。
     removePromptContextDir(sessionId);
@@ -2937,6 +2972,7 @@ export function reactivateClosedSession(
   // starts a new lifecycle, so the previous close-time token snapshot must not
   // survive into the active row or the next close.
   const next: Session = { ...session };
+  if (next.followThreadEpoch === undefined) next.followThreadEpoch = randomUUID();
   next.status = 'active';
   next.closedAt = undefined;
   next.userClosedAt = undefined;
@@ -2963,6 +2999,11 @@ export function reactivateClosedSession(
   next.mojoCloseJournal = undefined;
   next.tokenUsage = undefined;
 
+  try {
+    resumeSessionTurns(config.session.dataDir, sessionId);
+  } catch {
+    logger.warn('Failed to reset structured session turns on reactivation');
+  }
   commitContractLifecycle(session, 'resume', () => persistRow(next));
   const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
   Object.assign(session, next, committed ? JSON.parse(committed.row) : {});
@@ -4005,7 +4046,7 @@ const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'modelPin', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
-  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
+  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy', 'sandboxWithholdBotSecret',
   'protectedHttpEgressPolicy',
 ] as const satisfies readonly (keyof Session)[];
 
@@ -5825,6 +5866,37 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
     s => s.chatId === chatId && s.scope === 'chat',
     { chatScopeChatId: chatId },
   );
+}
+
+/**
+ * Reverse-lookup the owning botmux session id from a CLI-native session id,
+ * scanning every bot store read-only. Used by short-lived CLI subprocesses
+ * (e.g. `botmux skill` inside doubao's sbox shell) that never receive
+ * BOTMUX_SESSION_ID but do carry the native conversation id.
+ *
+ * Fail-closed: the native id must match exactly ONE active row of the given
+ * cliId. Zero matches (unknown id) or several (a native id misbound to two
+ * botmux sessions) both return undefined, so the caller never acts on a
+ * sibling session. Read errors propagate — the caller decides whether to fail
+ * closed rather than have an unreadable peer store silently narrow the result.
+ */
+export function findActiveSessionIdByCliSessionId(opts: {
+  cliId: string;
+  cliSessionId: string;
+  dataDir?: string;
+}): string | undefined {
+  const cliSessionId = opts.cliSessionId.trim();
+  if (!cliSessionId) return undefined;
+  const dataDir = opts.dataDir ?? config.session.dataDir;
+  const matches: string[] = [];
+  for (const ref of listStoreRefs(dataDir, { strict: true })) {
+    for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
+      if (session.cliId === opts.cliId && session.cliSessionId === cliSessionId) {
+        matches.push(session.sessionId);
+      }
+    }
+  }
+  return matches.length === 1 ? matches[0] : undefined;
 }
 
 /**

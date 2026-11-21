@@ -1,8 +1,19 @@
-import { renderInboundMessageLocation } from './core/reply-message.js';
+import { configuredCliExecutionMode, delegatedCliExecutionAllowed } from './core/cli-execution-mode.js';
+import { resolveNativeScheduledControlActor } from './core/scheduled-control-actor.js';
+import { admitDelegatedSlashTurn, queuedOpeningHasTail, sessionDelegatedSlashCommands } from './core/remote-runner-slash.js';
+import { sandboxWithholdsBotSecret } from './adapters/cli/sandbox-mode.js';
+import { renderCrossChatReplyHint, renderInboundMessageLocation, type InboundMessageLocation } from './core/reply-message.js';
+import {
+  resolveCrossChatFollowedThread,
+  type CrossChatCandidateSession,
+  type CrossChatFollowedThreadMatch,
+  type CrossChatFollowedThreadOrigin,
+} from './services/cross-chat-thread-binding.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
 import { registerSessionContractPrimary } from './core/session-contract-primary.js';
 import { controllerForSession } from './core/session-controller.js';
+import { captureCodexAsyncAskOrigin } from './core/codex-async-ask-origin.js';
 import { sessionContractStore } from './services/session-contract-store.js';
 import { recordDeploymentContinuation, cancelDeploymentContinuation } from './services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './core/deployment-continuation-authority.js';
@@ -32,6 +43,8 @@ import { authorizeVcMeetingSummaryShare } from './services/vc-meeting-send-polic
 import { globalVcMeetingAgentConfigLive } from './global-config.js';
 import { resolveVcMeetingListenerPolicy, vcMeetingSummaryShareTarget, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { createMessageListenerAutoCloseScheduler, recordMessageListenerTurnTerminal } from './core/message-listener-auto-close.js';
+import { resolveWorkerAdmissionOwner, WorkerAdmissionOwnerAlerts } from './core/worker-admission-owner-alert.js';
+import { WorkerOwnerDiagnostics } from './core/worker-owner-diagnostic.js';
 import { deliverPublishedReport, type ReportDeliveryResponse } from './core/report-publication.js';
 import {
   REPORT_SOURCE_REPLY_ROUTE,
@@ -56,7 +69,8 @@ import { installDaemonRejectionGuard } from './utils/daemon-rejection-guard.js';
 import { getLarkConnectionHealth, type LarkConnectionHealth } from './im/lark/transport/connection-health.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { readPeerCrossRef } from './services/peer-cross-ref-store.js';
-import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
+import { readBotsInfoJson } from './services/bots-info-cache.js';
 import { createBotProfileRefresher } from './services/bot-profile-refresh.js';
 import { lastKnownBotName } from './services/bot-display-name.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
@@ -115,7 +129,9 @@ import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages
 import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
+import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
+import { createBotmuxUpdateNotifier, buildBotmuxUpdateNoticeCard } from './core/botmux-update-notify.js';
 import {
   selectCodexRuntimeUpdateTargets,
   startCliRuntimeUpdateMonitor,
@@ -127,7 +143,7 @@ import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
 import { deliverWelcomeMessageOnce, planStartupWelcomeMessages } from './services/welcome-message.js';
-import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
+import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, findCurrentChatUserMembers, firstDispatchReply, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { GROUP_JOIN_ANCHOR_SCAN_LIMIT, pickGroupJoinAnchorMessageId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
   loadBotConfigAtIndex,
@@ -142,6 +158,7 @@ import {
   createDetachedLarkClient,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
+  getStrictOwnerOpenId,
   getBotBrand,
   getDashboardAdminOpenIds,
   findOncallChat,
@@ -161,7 +178,7 @@ import {
   type VcMeetingConsumerAgentConfig,
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
-import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
+import { resolveHiddenStreamingCardButtons, resolveStreamingCardFoldedLayout } from './im/lark/streaming-card-buttons.js';
 import { buildMarkdownCard, contextPercentUsed } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
@@ -170,8 +187,7 @@ import { CardStreamStore } from './services/card-stream-store.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-completion-events.js';
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
-import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
-import { resolveImportedTopicHandoff } from './services/imported-topic-handoff.js';
+import { peerAnswersTopicWithoutMention, resolveGroupMentionMode, resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
@@ -190,7 +206,7 @@ import {
 } from './services/durable-lark-primary-runtime.js';
 import {
   deliverDurableLarkOutbox,
-  durableLarkOutboxMessage,
+  durableLarkOutboxMessage, durableReplyFileContent,
   type DurableLarkOutboxTarget,
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
@@ -284,13 +300,33 @@ import { BoundedMap } from './utils/bounded-map.js';
 import { checkAllowedChatGroupsConfig } from './services/allowed-chat-groups.js';
 import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterruptionDeliveryAudit, CrossPrincipalInterruptionMessage, PrincipalLaneQueuedTurn, Session, TrustedCaller, VcMeetingImTurnOrigin, TurnParticipant, LarkMention } from './types.js';
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
-import { scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
+import { refreshTmuxVersion, scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
+import { detectPlatform } from './setup/detect-platform.js';
+import {
+  defaultTmuxUpgradeProbe,
+  executeTmuxUpgrade,
+  planTmuxUpgrade,
+  readDebianCodename,
+  spawnUpgradeCommand,
+} from './setup/tmux-upgrade-plan.js';
+import { installManagedTmuxForHost } from './setup/tmux-prebuilt.js';
+import {
+  fanOutTmuxSwitchSuspend,
+  killTmuxServer,
+  probeTmuxFacts,
+  retireEmptyTmuxServer,
+  startTmuxUpgradeMonitor,
+} from './core/tmux-upgrade.js';
+import { preferredManagedTmuxSocket } from './adapters/backend/tmux-socket.js';
+import { isBotAdmin } from './im/lark/grant-owner.js';
+import { readProcessStartIdentity } from './utils/process-identity.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
 import { missingCliExecutableAfterRetry } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { comparableSessionDir } from './core/working-dir-range.js';
 import type { DaemonToWorker, LarkAttachment, LarkMessage, WorkerToDaemon } from './types.js';
+import { mergeStagedSessionTurnInputs, projectLarkTurnInbound, stageSessionTurnInbound } from './services/session-turns.js';
 
 export function useOrdinaryOutputDelivery(): void {
   setDurableBridgeFinalOutputHandler(undefined);
@@ -532,8 +568,8 @@ import {
   collectSessionTurnGarbage,
   sweepTraexInstallChanges,
 } from './core/worker-pool.js';
-import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
-import { isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
+import { notePromptCacheKeepaliveTurnStarted, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
+import { invalidateIdleAutoCompactRetryForTurn, isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice, type IdleAutoCompactRefusalReason } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { runPeriodicOrphanSessionSweep, loadRichProcsLinux, enumerateThreadLockHolders, enumerateOrphanPanes, readProcEnviron } from './core/orphan-session-reaper.js';
 import { listeningServersOnPath, probeTmuxOwner, tmuxSocketPath, procIsBotmuxListener } from './core/tmux-server-guard.js';
@@ -553,6 +589,7 @@ import {
   waitForSessionReadyAck,
 } from './core/session-ready-handshake.js';
 import { loadOrCreateDashboardSecret, loadPersistedToken } from './dashboard/auth.js';
+import { noteReplyCardTurnStarted } from './core/reply-card-turn-start.js';
 import { daemonIpcAuthHeaders, fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import {
   authorizeSessionScopedIpc,
@@ -595,9 +632,18 @@ import {
   evaluateProjectDispatchPolicy,
   readGroupCollaborationMode,
 } from './services/group-collaboration-mode-store.js';
+import {
+  findLiveMentionlessSubtopicOwner,
+  resolveManagedSubtopicMentionlessHandoff,
+  type ConfiguredBotIdentity,
+  type ResolveSubtopicHandoffDeps,
+} from './services/subtopic-mentionless-handoff.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
 import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
+import { commandSpec } from './core/command-schema.js';
+import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
+import { groupTaskSenderIsBot } from './core/group-task-start.js';
 import { deriveSessionPhase } from './core/session-phase.js';
 import { noteObservedCliVersion } from './core/cli-version-history.js';
 import { cascadeTiming, waitForCliIdle, waitForCommandSettled } from './core/cli-idle-wait.js';
@@ -621,6 +667,7 @@ import {
   formatAttachmentsHint,
   buildNewTopicCliInput,
   buildFollowUpCliInput,
+  traexRpcContextForSession,
   buildGroupContextBridgeInput,
   buildReforkCliInput,
   getAvailableBots,
@@ -645,13 +692,16 @@ import { readSecretaryMarker, writeSecretaryMarker } from './services/group-secr
 import { fetchRemoteSecretarySessions, fetchRemoteSecretaryTranscript, listSecretaryPeers, type SecretaryPeer } from './services/group-secretary-federation.js';
 import { listSecretaryWatches } from './services/group-secretary-watch-store.js';
 import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
-import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
+import { clearSessionIdentity, clearSingleIdentityArtifacts, forgetProvenIdentityContent, recallProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
 import type { IdentityStorageModel } from './core/lark-tool-binding.js';
-import { getLarkToolDelegation } from './core/lark-tool-delegation.js';
+import { getLarkToolDelegation, rememberLarkToolDelegation } from './core/lark-tool-delegation.js';
+import { releaseActiveIdentityTurn } from './core/active-identity-turns.js';
 import { noteInboundSenderUnionId, noteSenderUnionId } from './core/platform-credential-source.js';
 import { validateRoleLibraryPath } from './core/role-library.js';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
+import { assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, restoreDispatchTaskOwner } from './im/lark/dispatch-task-consent.js';
+import { dispatchConsentCardAvailable } from './im/lark/client.js';
+import { authorityForDispatch, resolveDispatchSenderUnionId, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, registerPendingDispatchUser, readPendingDispatchUser, bindPendingDispatchUser, dropPendingDispatchUser, handoffMessageMatches, readHandoffMessage } from './core/dispatch-user-delegation.js';
 import { resolveMessageSenderUnionId, resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { trustedCallerFromInbound } from './core/inbound-trusted-caller.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
@@ -664,7 +714,9 @@ import {
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { matchingScheduleBotGrant, botScheduleAuthority, assertScheduleBotGrantActive } from './core/schedule-bot-grant.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
-import { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn, parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
+import { authorizeTalkerScheduleRun, countLiveTalkerTasks, isTalkerScheduledTask, talkerScheduleChatType, talkerSchedulePolicy, talkerScheduleScopeError } from './core/schedule-talker.js';
+import { assertScheduledAuthorityCurrent, authorizeScheduledTurn, isManualScheduleRun, isManualScheduledTurn, parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
+import { validateScheduleChildOneShot } from './core/schedule-child-one-shot.js';
 import {
   prepareScheduledRecoveryRun,
   reconcileScheduledDelivery,
@@ -676,8 +728,11 @@ import {
   type ScheduledSendSettlement,
 } from './core/scheduled-send.js';
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
-import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
-import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
+import { backfillOwnerUnionId, claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
+import { offerAuthorizationAtCreation, clearRestoredLapses, privateNoticeSender, unattendedTask } from './core/capability-authorization.js';
+import { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } from './core/workflow-event-turn.js';
+import { capabilityOn, delegatesOnMention, dispatchOnlyToolsForTurn, TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
+import { capabilityOfTool } from './core/identity-policy.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -712,7 +767,7 @@ import {
   signDispatchLaunchIpcResponse,
   verifyDispatchLaunchIpcRequest,
 } from './core/dispatch-launch-ipc-auth.js';
-import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
+import { beginReplyTargetTurn, buildTurnParticipantsFrom, chatSessionAnsweredRootAtTopLevel, fallbackTurnId, frozenReplyContextForTurn, isHumanInboundTurnId, isSubstituteTurn, pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveInboundReplyTarget, resolveSessionReplyTarget, syncReplyTargetState } from './core/reply-target.js';
 import { sameTrustedPrincipal } from './core/active-turn-authority.js';
 import { isSerialGroupInput, trustedSessionController } from './core/trusted-session-controller.js';
 import {
@@ -944,6 +999,8 @@ import {
   V3_SESSION_RUN_MUTATIONS,
   V3_SESSION_RUN_MUTATION_ROUTE_PREFIX,
 } from './workflows/v3/session-relay.js';
+import { authorizeSignedChatMutation } from './workflows/v3/signed-chat-mutation-auth.js';
+import { v3RunHasChatBinding } from './workflows/v3/cli-daemon-command-authority.js';
 import { defaultBaseDir as v3DefaultBaseDir } from './workflows/v3/grill-state.js';
 import { persistV3StartIntent } from './workflows/v3/start-intent.js';
 import {
@@ -1050,7 +1107,7 @@ function startAdminUnionsPublisher(larkAppId: string): void {
   void publisher.publish();
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, humanCanRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, ensureChatDisbandedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canOperateBotSender, canRunDaemonCommand, humanCanRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, ensureChatDisbandedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { classifyLarkError } from './im/lark/error-classify.js';
@@ -3462,6 +3519,7 @@ async function ensureVcMeetingReceiverSession(
     session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
     session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
     session.sandboxNetworkPolicy = bot.config.sandboxNetworkPolicy ? structuredClone(bot.config.sandboxNetworkPolicy) : undefined;
+    session.sandboxWithholdBotSecret = sandboxWithholdsBotSecret(bot.config) ? true : undefined;
     session.backendType = isolation.backendType;
     sessionStore.updateSession(session);
 
@@ -4198,9 +4256,85 @@ function scheduleDeferredScheduleSettlement(
   });
 }
 
+function doesBotAnswerTopicWithoutMention(targetAppId: string, chatId: string, observerAppId?: string): boolean | 'unknown' {
+  if (observerAppId && targetAppId === observerAppId) {
+    try {
+      getBot(targetAppId);
+      return resolveGroupMentionMode(targetAppId, chatId) !== 'always';
+    } catch {
+      /* fall through to peer config lookup */
+    }
+  }
+  let cfg: BotConfig | undefined;
+  try {
+    cfg = getBot(targetAppId).config;
+  } catch {
+    try {
+      cfg = loadBotConfigsCached().find(b => b.larkAppId === targetAppId);
+    } catch {
+      cfg = undefined;
+    }
+  }
+  return peerAnswersTopicWithoutMention(cfg, chatId);
+}
+
+function subtopicHandoffDeps(): ResolveSubtopicHandoffDeps {
+  return {
+    dataDir: config.session.dataDir,
+    getLiveThreadSessionsAtRoot: (rootId, chatId) => {
+      const out: Session[] = [];
+      for (const ds of activeSessions.values()) {
+        if (ds.session.status === 'active'
+            && ds.chatId === chatId
+            && (ds.scope ?? ds.session.scope) === 'thread'
+            && ds.session.rootMessageId === rootId
+            && !!ds.larkAppId) {
+          out.push(ds.session.larkAppId ? ds.session : { ...ds.session, larkAppId: ds.larkAppId });
+        }
+      }
+      return out;
+    },
+    findActiveSessionsByRoot: rootId => sessionStore.findActiveSessionsByRoot(rootId),
+    findActiveChatScopeSessionsByChat: chatId => sessionStore.findActiveChatScopeSessionsByChat(chatId),
+    readSessionsByRoots: roots => sessionStore.readSessionsByRoots(roots, { dataDir: config.session.dataDir }),
+    doesBotAnswerTopicWithoutMention: (targetAppId, chatId, observerAppId) =>
+      doesBotAnswerTopicWithoutMention(targetAppId, chatId, observerAppId),
+    getConfiguredBots: () => {
+      const out: ConfiguredBotIdentity[] = [];
+      const seen = new Set<string>();
+      for (const b of getAllBots()) {
+        seen.add(b.config.larkAppId);
+        out.push({
+          larkAppId: b.config.larkAppId,
+          cliId: b.config.cliId,
+          botName: b.botName,
+          botOpenId: b.botOpenId,
+        });
+      }
+      try {
+        for (const c of loadBotConfigsCached()) {
+          if (seen.has(c.larkAppId)) continue;
+          seen.add(c.larkAppId);
+          out.push({ larkAppId: c.larkAppId, cliId: c.cliId });
+        }
+      } catch {
+        /* ignore unconfigured bots.json in tests */
+      }
+      return out;
+    },
+  };
+}
+
 function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string; anchor?: string } | null {
   // A real thread-scope session at this root wins over any historical alias.
   if (activeSessions.get(sessionKey(rootId, larkAppId))?.scope === 'thread') return null;
+  // When another bot's live thread-scope session in a managed subtopic (imported,
+  // dispatch, or project workstream) has免@ enabled (`topic` / `ambient` / `never`),
+  // it owns un-@ replies inside its topic even if a coordinator previously answered
+  // an explicit `@coordinator` message inside the same topic.
+  if (findLiveMentionlessSubtopicOwner(subtopicHandoffDeps(), rootId, chatId, larkAppId)) {
+    return null;
+  }
   for (const ds of activeSessions.values()) {
     if (ds.larkAppId !== larkAppId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
     const deferredRoot = reconcileDeferredTopicBinding(ds);
@@ -4224,6 +4358,62 @@ function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): 
   return hit
     ? { chatId: hit.chatId, sessionId: hit.sessionId, anchor: storedSessionAnchorId(hit) }
     : null;
+}
+
+function findCrossChatFollowedThread(
+  candidateRootIds: readonly string[],
+  chatId: string,
+  larkAppId: string,
+): CrossChatFollowedThreadMatch | null {
+  const candidates: CrossChatCandidateSession[] = [];
+  for (const ds of activeSessions.values()) {
+    if (ds.larkAppId !== larkAppId) continue;
+    candidates.push({
+      sessionId: ds.session.sessionId,
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      scope: ds.scope,
+      rootMessageId: ds.session.rootMessageId,
+      runtimeRoutingAnchor: ds.runtimeRoutingAnchor,
+      status: ds.session.status,
+      followThreadEpoch: ds.session.followThreadEpoch,
+      queued: ds.session.queued,
+      messageListenerRun: ds.session.messageListenerRun,
+      deferredScheduleRun: ds.session.deferredScheduleRun,
+    });
+  }
+  return resolveCrossChatFollowedThread({
+    dataDir: config.session.dataDir,
+    larkAppId,
+    chatId,
+    candidateRootIds,
+    sessions: candidates,
+  });
+}
+
+function crossChatFollowUpIsCurrent(ctx: RoutingContext): boolean {
+  const expected = ctx.crossChatThreadFollowUp;
+  if (!expected) return true;
+  const current = findCrossChatFollowedThread(
+    [expected.followedRootMessageId], expected.followedChatId, ctx.larkAppId,
+  );
+  const source = current
+    ? activeSessions.get(sessionKey(current.runtimeRoutingAnchor ?? current.anchor, ctx.larkAppId))
+    : undefined;
+  const valid = !!current
+    && current.sourceSessionId === expected.sourceSessionId
+    && current.followThreadEpoch === expected.followThreadEpoch
+    && current.sourceChatId === expected.sourceChatId
+    && current.scope === expected.scope
+    && current.anchor === expected.anchor
+    && current.runtimeRoutingAnchor === expected.runtimeRoutingAnchor
+    && source?.session.sessionId === expected.sourceSessionId
+    && source.session.status === 'active'
+    && source.session.followThreadEpoch === expected.followThreadEpoch;
+  if (!valid) {
+    logger.info(`[cross-chat-thread:${ctx.larkAppId}] dropping stale follow-up msg=${ctx.messageId.substring(0, 12)} source=${expected.sourceSessionId.substring(0, 12)}`);
+  }
+  return valid;
 }
 
 function setDirectChatDisplayNameFromSender(
@@ -4492,9 +4682,95 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
       persist: () => sessionStore.updateSession(ds.session),
     });
   }
-  if (!triggerUserAuthEnabledFor(ds)) return;
   if (turnId.startsWith('schedule:')) {
-    return prepareScheduledTurnCliIdentity(ds, turnId);
+    const modeAtStart = configuredCliExecutionMode(getBot(ds.larkAppId).config);
+    const authAtStart = triggerUserAuthEnabledFor(ds);
+    const clearControlActor = () => {
+      ds.scheduledControlActors?.delete(turnId);
+      if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
+    };
+    const clearFailedAdmission = () => {
+      clearControlActor();
+      ds.scheduledToolActors?.delete(turnId);
+      if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
+      rememberLarkToolDelegation(config.session.dataDir, ds.session.sessionId, turnId, undefined);
+      releaseActiveIdentityTurn(config.session.dataDir, ds.session.sessionId, turnId);
+      for (const model of ['proven', 'single'] as const) {
+        for (const tool of TRIGGER_USER_AUTH_TOOLS) {
+          clearSessionIdentity(config.session.dataDir, ds.session.sessionId, tool, turnId, model);
+        }
+      }
+      // 材料已撤销；下一次 live replay 必须重新准备，不能沿用这次发布基线。
+      ds.lastPublishedIdentityModel = undefined;
+    };
+    const finishScheduledAdmission = async (preparation: Promise<void>): Promise<void> => {
+      try {
+        await preparation;
+        const assertStable = () => {
+          if (configuredCliExecutionMode(getBot(ds.larkAppId).config) !== modeAtStart
+            || triggerUserAuthEnabledFor(ds) !== authAtStart) {
+            throw new Error('CLI execution policy changed during scheduled turn admission');
+          }
+        };
+        assertStable();
+        const taskId = parseScheduledTurnId(turnId);
+        const authority = taskId ? scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId) : undefined;
+        if (!authority) throw new Error('schedule authority record missing');
+        if (modeAtStart === 'native') {
+          // ABA（native→managed→native）也不能只凭最终模式放行：本轮必须真的
+          // 走完 native 控制人准备，而不是提交一次空 native 分支的结果。
+          if (authority.kind === 'delegated' && !ds.scheduledControlActors?.has(turnId)) {
+            throw new Error('native scheduled control actor missing');
+          }
+          return;
+        }
+        clearControlActor();
+        // managed 身份发布可能发生外部等待。发布后、返回 admission 成功前，
+        // 再按当前配置核验 delegated 控制器、授予范围和 host 策略。
+        if (authority.kind === 'delegated') {
+          await authorizeDelegatedScheduleRun(authority.task, authority, {
+            ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
+            allowCompletedOnce: true,
+            assertAuthorityCurrent: () => assertScheduledAuthorityCurrent(authority,
+              scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId!), { turnId, allowCompleted: true }),
+          });
+        }
+        assertStable();
+      } catch (error) {
+        clearFailedAdmission();
+        throw error;
+      }
+    };
+    if (modeAtStart === 'native' || !authAtStart) {
+      return finishScheduledAdmission(prepareScheduledTurnCliIdentity(ds, turnId, true)
+        .then(() => prepareNativeScheduledControlIdentity(ds, turnId)));
+    }
+    // managed delegated turn 不再保留 native 控制人证明；即时查询另有模式门控。
+    clearControlActor();
+    return finishScheduledAdmission(prepareScheduledTurnCliIdentity(ds, turnId));
+  }
+  if (!triggerUserAuthEnabledFor(ds)) return;
+  if (isOwnerActorTurnId(turnId)) {
+    const prepareKey = JSON.stringify([ds.workerGeneration ?? null, ds.managedTurnOrigin?.dispatchAttempt ?? null]);
+    let preparations = ownerActorIdentityRestores.get(ds);
+    const previous = preparations?.get(turnId);
+    if (previous) {
+      if (previous.key === prepareKey) return previous.work;
+      // Every owner preparation, not only daemon-restart recovery, waits for
+      // an older generation's fence and cleanup before publishing its own.
+      return previous.work.then(() => prepareTurnCliIdentity(ds, turnId), () => prepareTurnCliIdentity(ds, turnId));
+    }
+    const work = refreshTurnCliIdentity(ds, turnId);
+    if (!preparations) ownerActorIdentityRestores.set(ds, preparations = new Map());
+    const entry = { key: prepareKey, work };
+    preparations.set(turnId, entry);
+    const cleanup = () => {
+      if (preparations.get(turnId) !== entry) return;
+      preparations.delete(turnId);
+      if (!preparations.size) ownerActorIdentityRestores.delete(ds);
+    };
+    work.then(cleanup, cleanup);
+    return work;
   }
   return refreshTurnCliIdentity(ds, turnId);
 }
@@ -4504,7 +4780,7 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
  *  authority of a dispatch / `--mention` handoff, schedule creation — gets no
  *  delegation from it. `waitMs`: how long to wait for an unbound handoff to
  *  this bot to be bound (default: resolveDispatchUser's). */
-async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean; waitMs?: number } = {}) {
+async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean; forIdentity?: boolean; waitMs?: number } = {}) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
   // The main bot's own workflow node turn has no inbound message (design
   // §6.5): its turn id is the handoff it posted, its topic the node card.
@@ -4528,6 +4804,7 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { ke
   });
   // A workflow handoff's delegation (design 2026-11-03 §10) holds only while
   // its run attempt does; past that it is no delegation at all.
+  if (record && 'taskConsent' in record && !opts.forIdentity) return undefined;
   if (!record || !('workflow' in record) || opts.keepInactiveWorkflow) return record;
   const refusal = workflowDelegationRefusalFor(ds, turnId, record);
   if (!refusal) return record;
@@ -4556,17 +4833,47 @@ function workflowDelegationRefusalFor(
 
 /** Reads only the bot, chat and chat type of `ds`, so the pre-handoff check
  *  of a workflow delegation runs it for a chat this bot has no session in. */
+async function checkDelegationRecipient(
+  ds: Pick<DaemonSession, 'larkAppId' | 'chatId' | 'chatType'>,
+  user: Pick<import('./core/dispatch-user-delegation.js').DispatchUserAuthority, 'unionId'>,
+  taskConsent?: Extract<import('./core/dispatch-user-delegation.js').DispatchUserPayload, { taskConsent: unknown }>,
+) {
+  const resolved = await resolveTargetAppOpenId(ds.larkAppId, user.unionId);
+  if (resolved.status === 'transient') return { denied: 'target_validation_unavailable' } as const;
+  if (resolved.status !== 'resolved') return { denied: 'target_identity_unresolved' } as const;
+  if (!evaluateTalk(ds.larkAppId, ds.chatId, resolved.openId, undefined, user.unionId, ds.chatType).allowed) {
+    return { denied: 'target_access_denied' } as const;
+  }
+  if (taskConsent && (!capabilityOn(getBot(ds.larkAppId).config.triggerUserAuth, 'bytecloud')
+      || !evaluateTalk(ds.larkAppId, undefined, resolved.openId, undefined, user.unionId).allowed)) {
+    // A chat-wide allowlist assumes the caller can already speak there.
+    // A non-member must be eligible to use this bot independently of the hub.
+    return { denied: 'target_access_denied' } as const;
+  }
+  if (taskConsent) {
+    const binding = await readTaskBinding(config.session.dataDir,
+      loadOrCreateDispatchReportBindingSecret(config.session.dataDir), taskConsent.rootId,
+      cardId => dispatchConsentCardAvailable(taskConsent.sourceAppId, taskConsent.taskConsent.sourceChatId, cardId));
+    if (!binding || binding.attachment || binding.targetSessionId !== taskConsent.sourceSessionId
+        || binding.targetLarkAppId !== taskConsent.sourceAppId || binding.targetChatId !== taskConsent.taskConsent.sourceChatId
+        || binding.taskOwner?.decision !== 'approved' || binding.taskOwner.consentMessageId !== taskConsent.taskConsent.cardId
+        || binding.taskOwner.openId !== taskConsent.authority.openId || binding.taskOwner.receivingAppId !== ds.larkAppId
+        || binding.taskOwner.receivingChatId !== ds.chatId || taskConsent.sourceAppId !== taskConsent.authority.appId
+        || binding.targetChatId === ds.chatId || ds.chatType !== 'group') {
+      return { denied: 'target_access_denied' } as const;
+    }
+  } else if (ds.chatType === 'group') {
+    const members = await findCurrentChatUserMembers(ds.larkAppId, ds.chatId, [resolved.openId]);
+    if (!members.has(resolved.openId)) return { denied: 'target_chat_membership_required' } as const;
+  }
+  return { openId: resolved.openId } as const;
+}
+
 async function targetUserForDelegation(
   ds: Pick<DaemonSession, 'larkAppId' | 'chatId' | 'chatType'>,
   user: Pick<import('./core/dispatch-user-delegation.js').DispatchUserAuthority, 'unionId'>,
 ): Promise<string | undefined> {
-  const resolved = await resolveTargetAppOpenId(ds.larkAppId, user.unionId);
-  if (resolved.status !== 'resolved'
-    || !evaluateTalk(ds.larkAppId, ds.chatId, resolved.openId, user.unionId, undefined, ds.chatType).allowed) return;
-  // A delegated turn did not itself prove that the human belongs to this chat.
-  // Do not use allowedChatGroups' implicit membership assumption for them.
-  if (ds.chatType === 'group' && !(await listChatMemberOpenIds(ds.larkAppId, ds.chatId)).includes(resolved.openId)) return;
-  return resolved.openId;
+  return (await checkDelegationRecipient(ds, user)).openId;
 }
 
 function delegatedScheduleRuntimeDeps(appId: string) {
@@ -4576,10 +4883,31 @@ function delegatedScheduleRuntimeDeps(appId: string) {
   return {
     runEnabled: schedulePolicy?.runEnabled !== false,
     hostRunScopes: schedulePolicy?.runScopes ?? [],
-    triggerUserAuthTools: triggerPolicy?.enabled === true ? triggerPolicy.tools : [],
+    triggerUserAuth: triggerPolicy,
+    larkToolBinding: botConfig.larkToolBinding,
+    currentCliConfig: () => getBot(appId).config,
+    currentRunEnabled: () => readGlobalConfig().scheduleDelegation?.runEnabled !== false,
+    currentAdminOpenIds: () => getDashboardAdminOpenIds(appId),
+    currentRunScopes: () => readGlobalConfig().scheduleDelegation?.runScopes ?? [],
     validateBotGrant: (record: import('./services/schedule-authority-store.js').ScheduleAuthorityRecord) =>
       assertScheduleBotGrantActive(record, readGlobalConfig().scheduleDelegation),
     adminOpenIds: getDashboardAdminOpenIds(appId),
+    resolveTargetOpenId: async (unionId: string) => {
+      const resolved = await resolveTargetAppOpenId(appId, unionId);
+      return resolved.status === 'resolved' ? resolved.openId : undefined;
+    },
+    listChatMemberOpenIds: (chatId: string) => listChatMemberOpenIds(appId, chatId),
+  };
+}
+
+/** Live re-admission inputs for a talker-created task (core/schedule-talker):
+ *  the bot switch and talk evaluation are read fresh on every call, so turning
+ *  the switch off or revoking the person's access stops the next fire. */
+function talkerScheduleRuntimeDeps(appId: string) {
+  return {
+    policy: () => talkerSchedulePolicy(getBot(appId).config),
+    canTalk: (chatId: string, openId: string, unionId: string, chatType: 'group' | 'p2p') =>
+      evaluateTalk(appId, chatId, openId, undefined, unionId, chatType).allowed,
     resolveTargetOpenId: async (unionId: string) => {
       const resolved = await resolveTargetAppOpenId(appId, unionId);
       return resolved.status === 'resolved' ? resolved.openId : undefined;
@@ -4686,12 +5014,45 @@ async function handleIdentityDecisionFlip(
   }
 }
 
-async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
-  if (identityPublicationConflicted(ds)) return;
-  if (await prepareDelegatedScheduledTurnIdentity(ds, turnId)) return;
+/** Owner preparations are serialized per session/turn and generation. */
+const ownerActorIdentityRestores = new WeakMap<DaemonSession, Map<string, { key: string; work: Promise<void> }>>();
+
+/** Proven identity material lives only in daemon memory, so a turn that was
+ *  executing when the daemon restarted has none once its re-attached worker
+ *  republishes the turn's origin. Before this daemon has published anything
+ *  for the session, prepare that turn again through the entry its original
+ *  publication used: the schedule authority for a scheduled run, the
+ *  session's reply target for a human message or a resolved owner actor turn. */
+async function restoreTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  // daemon 重启后原生定时轮也需重建控制人证明，但不发布个人凭据。
+  if (parseScheduledTurnId(turnId) && configuredCliExecutionMode(getBot(ds.larkAppId).config) === 'native') {
+    await prepareScheduledTurnCliIdentity(ds, turnId, true);
+    await prepareNativeScheduledControlIdentity(ds, turnId);
+    return;
+  }
+  if (parseScheduledTurnId(turnId)) {
+    ds.scheduledControlActors?.delete(turnId);
+    if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
+  }
+  if (ds.lastPublishedIdentityModel !== undefined || !triggerUserAuthEnabledFor(ds)
+    || identityStorageModelForDaemonSession(ds) !== 'proven'
+    // Owner turns are synthetic but carry a daemon-resolved human sender. Other
+    // external triggers stay excluded; publication rechecks allowOwnerActor.
+    || !(parseScheduledTurnId(turnId) || isHumanInboundTurnId(turnId) || isOwnerActorTurnId(turnId))
+    || !identityDecisionTurnIsLive(ds, turnId)) return;
+  const replay = prepareTurnCliIdentity(ds, turnId);
+  if (replay) await trackTurnIdentityPublication(config.session.dataDir, ds.session.sessionId, replay);
+}
+
+async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string, reauthorizeTalkerOnly = false): Promise<void> {
+  if (!reauthorizeTalkerOnly && identityPublicationConflicted(ds)) return;
+  if (!reauthorizeTalkerOnly && await prepareDelegatedScheduledTurnIdentity(ds, turnId)) return;
   const taskId = parseScheduledTurnId(turnId);
   if (!taskId) throw new Error('invalid scheduled turn');
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
+  // With trigger-user auth off, ordinary tasks keep their historical no-op;
+  // only talker tasks need the independent post-wait admission fence.
+  if (reauthorizeTalkerOnly && !isTalkerScheduledTask(authority?.task)) return;
   if (!authority) throw new Error('schedule authority record missing');
   const task = authority.task;
   // Read the host authority, never the CLI-writable schedules.json projection
@@ -4709,8 +5070,24 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
   // The claimant from the claim card, else the creator (scheduledTaskRunAs).
   // open_id is app-scoped. Ownerless/legacy tasks and people whose access was
   // removed receive a denial, even if this session once held valid tokens.
-  const identity = resolveScheduledRunIdentity(task, ds.larkAppId,
-    (openId, unionId) => canOperate(ds.larkAppId, ds.chatId, openId, unionId));
+  // A talker-created task is different: its creator never had operate access,
+  // so it is re-admitted on talk access + membership instead, and a lapse
+  // refuses the turn outright rather than offering the task to a claimant.
+  let identity: ScheduledRunIdentity;
+  if (isTalkerScheduledTask(task)) {
+    const admitted = await authorizeTalkerScheduleRun(task, authority,
+      talkerScheduleRuntimeDeps(ds.larkAppId),
+      { chatId: ds.chatId, chatType: ds.chatType === 'p2p' ? 'p2p' : 'group' });
+    if (reauthorizeTalkerOnly) {
+      assertScheduledAuthorityCurrent(authority, scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId),
+        { turnId, allowCompleted: true });
+      return;
+    }
+    identity = { ok: true, openId: admitted.openId, unionId: admitted.unionId, source: 'creator' };
+  } else {
+    identity = resolveScheduledRunIdentity(task, ds.larkAppId,
+      (openId, unionId) => canOperate(ds.larkAppId, ds.chatId, openId, unionId));
+  }
   const senderOpenId = identity.ok ? identity.openId : undefined;
   // A scheduled run has no inbound event to learn the union_id from; the host
   // authority recorded it with the creator or the claim.
@@ -4718,7 +5095,7 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
     noteScheduledIdentityRestored(ds, task, turnId, identity);
   } else noteScheduledIdentityGap(ds, task, turnId, identity);
-  await publishTurnCliIdentity({
+  const outcomes = await publishTurnCliIdentity({
     botConfig: getBot(ds.larkAppId).config,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
@@ -4728,6 +5105,15 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     storageModel: identityModelForPublication(ds),
     privateChat: ds.chatType === 'p2p',
   });
+  if (senderOpenId) clearRestoredLapses({ appId: ds.larkAppId, taskId, openId: senderOpenId, outcomes });
+  if (isTalkerScheduledTask(task)) {
+    // Credential minting/publication can wait on external providers. Re-admit
+    // after the last publication await too; assertScheduledAuthorityCurrent
+    // only detects task edits, not a policy/talk revocation during that wait.
+    await authorizeTalkerScheduleRun(task, authority,
+      talkerScheduleRuntimeDeps(ds.larkAppId),
+      { chatId: ds.chatId, chatType: ds.chatType === 'p2p' ? 'p2p' : 'group' });
+  }
   assertScheduledAuthorityCurrent(authority, scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId),
     { turnId, allowCompleted: true });
 }
@@ -4802,6 +5188,42 @@ const scheduleIdentityClaims = createScheduleIdentityClaims({
   log: { info: message => logger.info(message), warn: message => logger.warn(message) },
 });
 
+async function prepareNativeScheduledControlIdentity(ds: DaemonSession, turnId: string): Promise<void> {
+  ds.scheduledControlActors?.delete(turnId);
+  if (ds.scheduledControlActors?.size === 0) ds.scheduledControlActors = undefined;
+  ds.scheduledToolActors?.delete(turnId);
+  if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
+  const taskId = parseScheduledTurnId(turnId);
+  const authority = taskId ? scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId) : undefined;
+  if (!authority) throw new Error('schedule authority record missing');
+  if (configuredCliExecutionMode(getBot(ds.larkAppId).config) !== 'native') {
+    // triggerUserAuth 全关时 prepareScheduledTurnCliIdentity 只复核 talker；
+    // fire 后若从 native 切到 managed，仍须在入 worker 前按当前配置重跑 delegated 门禁。
+    if (authority?.kind === 'delegated') {
+      await authorizeDelegatedScheduleRun(authority.task, authority, {
+        ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
+        allowCompletedOnce: true,
+        assertAuthorityCurrent: () => assertScheduledAuthorityCurrent(authority,
+          scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId!), { turnId, allowCompleted: true }),
+      });
+    }
+    return;
+  }
+  const actor = await resolveNativeScheduledControlActor({
+    turnId, appId: ds.larkAppId, chatId: ds.chatId, authority,
+    cliConfig: () => getBot(ds.larkAppId).config,
+    deps: delegatedScheduleRuntimeDeps(ds.larkAppId),
+    resolveDirectActor: () => resolveScheduledRunIdentity(authority.task, ds.larkAppId,
+      (openId, unionId) => canOperate(ds.larkAppId, ds.chatId, openId, unionId)),
+    assertCurrent: () => assertScheduledAuthorityCurrent(authority,
+      scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId!), { turnId, allowCompleted: true }),
+  });
+  if (actor) {
+    noteSenderUnionId(ds.larkAppId, actor.openId, actor.unionId);
+    (ds.scheduledControlActors ??= new Map()).set(turnId, actor);
+  }
+}
+
 async function prepareDelegatedScheduledTurnIdentity(
   ds: DaemonSession,
   turnId: string,
@@ -4812,26 +5234,71 @@ async function prepareDelegatedScheduledTurnIdentity(
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
   if (!authority) throw new Error('schedule authority record missing');
   if (authority.kind !== 'delegated') return false;
+  ds.scheduledToolActors?.delete(turnId);
+  if (ds.scheduledToolActors?.size === 0) ds.scheduledToolActors = undefined;
+  // Same rule as the owner path: a one-shot is completed as soon as its turn
+  // is dispatched, so a replay or recovery of that admitted turn must still
+  // resolve (the scheduler admission refuses any new run of a completed task).
   const assertCurrent = () => assertScheduledAuthorityCurrent(authority,
-    scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId });
+    scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId, allowCompleted: true });
   const authorized = await authorizeDelegatedScheduleRun(
     authority.task,
     authority,
     { ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
-      assertAuthorityCurrent: assertCurrent },
+      allowCompletedOnce: true, assertAuthorityCurrent: assertCurrent },
   );
-  await publishTurnCliIdentity({
-    botConfig: getBot(ds.larkAppId).config,
-    sessionDataDir: config.session.dataDir,
-    sessionId: ds.session.sessionId,
-    senderOpenId: undefined,
-    delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
-    locale: localeForBot(ds.larkAppId),
-    turnId,
-    storageModel: identityModelForPublication(ds),
-    privateChat: ds.chatType === 'p2p',
-  });
-  assertCurrent();
+  const scheduledPublicationSnapshot = () => JSON.stringify([
+    configuredCliExecutionMode(getBot(ds.larkAppId).config), triggerUserAuthEnabledFor(ds),
+  ]);
+  const assertScheduledPublicationStable = (snapshot: string): void => {
+    // 比较的是“本次发布实际采用的配置”，不是 admission 的起止字符串：
+    // managed→native→managed 的 ABA 不能把 native 发布结果提交给 managed。
+    if (scheduledPublicationSnapshot() !== snapshot) {
+      throw new Error('CLI execution policy changed during scheduled identity publication');
+    }
+  };
+  if (authorized.usesControllerToolActor) {
+    const identity: Extract<ScheduledRunIdentity, { ok: true }> = {
+      ok: true,
+      openId: authorized.targetOpenId,
+      unionId: authority.controlUnionId!,
+      source: 'creator',
+    };
+    noteSenderUnionId(ds.larkAppId, identity.openId, identity.unionId);
+    noteScheduledIdentityRestored(ds, authorized.task, turnId, identity);
+    const publicationSnapshot = scheduledPublicationSnapshot();
+    await publishTurnCliIdentity({
+      botConfig: getBot(ds.larkAppId).config,
+      sessionDataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      senderOpenId: identity.openId,
+      locale: localeForBot(ds.larkAppId),
+      turnId,
+      storageModel: identityModelForPublication(ds),
+      privateChat: ds.chatType === 'p2p',
+    });
+    assertScheduledPublicationStable(publicationSnapshot);
+    assertCurrent();
+    (ds.scheduledToolActors ??= new Map()).set(turnId, {
+      openId: identity.openId,
+      unionId: identity.unionId,
+    });
+  } else {
+    const publicationSnapshot = scheduledPublicationSnapshot();
+    await publishTurnCliIdentity({
+      botConfig: getBot(ds.larkAppId).config,
+      sessionDataDir: config.session.dataDir,
+      sessionId: ds.session.sessionId,
+      senderOpenId: undefined,
+      delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
+      locale: localeForBot(ds.larkAppId),
+      turnId,
+      storageModel: identityModelForPublication(ds),
+      privateChat: ds.chatType === 'p2p',
+    });
+    assertScheduledPublicationStable(publicationSnapshot);
+    assertCurrent();
+  }
   return true;
 }
 
@@ -4846,7 +5313,7 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   let delegationBlocked = false;
   let delegationRecord: Awaited<ReturnType<typeof dispatchUserForTurn>>;
   try {
-    const delegation = delegationRecord = await dispatchUserForTurn(ds, turnId, { keepInactiveWorkflow: true });
+    const delegation = delegationRecord = await dispatchUserForTurn(ds, turnId, { keepInactiveWorkflow: true, forIdentity: true });
     if (delegation) {
       const workflow = 'workflow' in delegation;
       // Keep a denial tied to the originating task even if contact/membership
@@ -4878,14 +5345,28 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
         delegatedIdentity.denialReason = 'passed_on_unsupported';
         logger.info(`[dispatch-user:audit] workflow delegation passed on into a file-identity session target=${ds.larkAppId} turn=${turnId}`);
       }
-      const targetOpenId = workflowRefusal || passedOnToFileSession
-        ? undefined : await targetUserForDelegation(ds, delegation.authority);
-      if (targetOpenId) delegatedIdentity = {
-        ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
+      const taskConsent = 'taskConsent' in delegation ? delegation : undefined;
+      const unsupportedTask = taskConsent && (ds.scope !== 'thread' || identityStorageModelForDaemonSession(ds) !== 'proven');
+      if (unsupportedTask) delegatedIdentity.denialReason = 'task_turn_isolation_required';
+      const recipient = workflowRefusal || passedOnToFileSession || unsupportedTask
+        ? undefined : await checkDelegationRecipient(ds, delegation.authority, taskConsent);
+      if (recipient?.denied) delegatedIdentity.denialReason = recipient.denied;
+      if (recipient?.openId) delegatedIdentity = {
+        ...delegatedIdentity, targetOpenId: recipient.openId, tools: delegation.authority.tools,
         denialReason: undefined,
         // Re-checked on every use (dashboard-ipc-server): the run attempt can
         // end, or the handoff be withdrawn, while this turn still runs.
         ...(workflow ? { recheck: () => workflowDelegationRefusalFor(ds, turnId, delegation) } : {}),
+        ...(taskConsent ? { taskAuthorized: async () => {
+          if (identityStorageModelForDaemonSession(ds) !== 'proven') return false;
+          const result = await checkDelegationRecipient(ds, taskConsent.authority, taskConsent);
+          // A transient platform failure must not be mistaken for a revocation:
+          // the renewal sweep keeps the entry and retries instead of dropping it.
+          if (result.denied === 'target_validation_unavailable') {
+            throw new Error('task_authorization_validation_unavailable');
+          }
+          return identityStorageModelForDaemonSession(ds) === 'proven' && !!result.openId;
+        } } : {}),
       };
     }
   } catch (error) {
@@ -4904,20 +5385,64 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
       + `result=${delegatedIdentity.denialReason ?? 'delegated'}`,
     );
   }
-  await publishTurnCliIdentity({
+  // A cross-chat reply has a human sender in the followed chat, but that person
+  // did not speak into this session and must not become its CLI principal. Keep
+  // this narrower than registryTurnMayAuthenticateHuman: asynchronous answers
+  // and unattended external turns use synthetic ids while still refreshing the
+  // identity of the person already bound to their per-turn reply target. Read
+  // the origin from that same captured record as the sender; the separately
+  // bounded context map can be pruned or rebound while delegation is awaited.
+  const turnSenderOpenId = delegationBlocked
+    || reply?.crossChatOrigin
+    || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
+    || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
+    ? undefined : reply?.senderOpenId;
+  const ownerActor = isOwnerActorTurnId(turnId);
+  const ownerPersonalAllowedAtStart = ownerActor && allowsPersonalIdentityForTurn(turnId, botConfig.triggerUserAuth);
+  const ownerOrigin = ownerActor && ds.managedTurnOrigin?.turnId === turnId
+    ? { generation: ds.workerGeneration, dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt }
+    : undefined;
+  const validateBeforeWrite = !ownerActor ? undefined : (): boolean => {
+    let currentBotConfig;
+    try { currentBotConfig = getBot(ds.larkAppId).config; } catch { return false; }
+    if (!allowsPersonalIdentityForTurn(turnId, currentBotConfig.triggerUserAuth)
+      || !turnSenderOpenId || getStrictOwnerOpenId(ds.larkAppId) !== turnSenderOpenId) return false;
+    const turnIsLive = ds.worker
+      ? identityDecisionTurnIsLive(ds, turnId)
+      : ds.session.status === 'active' && !ds.terminalIdentityTurnIds?.has(turnId);
+    if (!turnIsLive) return false;
+    if (ownerOrigin && (ds.workerGeneration !== ownerOrigin.generation
+      || ds.managedTurnOrigin?.turnId !== turnId
+      || ds.managedTurnOrigin.dispatchAttempt !== ownerOrigin.dispatchAttempt)) return false;
+    return true;
+  };
+  const storageModel = identityModelForPublication(ds);
+  if (delegatedIdentity?.taskAuthorized && storageModel !== 'proven') {
+    delegatedIdentity = { ...delegatedIdentity, tools: [], denialReason: 'task_turn_isolation_required' };
+  }
+  const outcomes = await publishTurnCliIdentity({
     botConfig,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
-    senderOpenId: delegationBlocked
-      || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
-      || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
-      ? undefined : reply?.senderOpenId,
+    senderOpenId: turnSenderOpenId,
     ...(delegatedIdentity ? { delegatedIdentity } : {}),
     locale: localeForBot(ds.larkAppId),
     turnId,
-    storageModel: identityModelForPublication(ds),
+    storageModel,
     privateChat: ds.chatType === 'p2p',
+    ...(validateBeforeWrite ? { validateBeforeWrite } : {}),
   });
+  if (validateBeforeWrite && !validateBeforeWrite()) {
+    // The write fence already removed any partial publication. Clear its
+    // baseline too so a later live origin may retry instead of reusing absence.
+    if (ownerPersonalAllowedAtStart) ds.lastPublishedIdentityModel = undefined;
+    return;
+  }
+  // An external or workflow turn is unattended too: credentials in force end its lapse.
+  if (turnSenderOpenId && !delegatedIdentity && isUnattendedIdentityTurnId(turnId)) {
+    clearRestoredLapses({ appId: ds.larkAppId, openId: turnSenderOpenId, outcomes,
+      taskId: unattendedTask(ds.larkAppId, ds.session.sessionId, turnId, localeForBot(ds.larkAppId)).taskId });
+  }
 
   // NO chat notice here.
   //
@@ -5392,13 +5917,28 @@ async function revokeQuotaGrant(
   }
 }
 
+const quotaExhaustedNoticeStates = new BoundedMap<string, string>(1024);
+function clearQuotaExhaustedNotice(larkAppId: string, quotaKey: string): void {
+  quotaExhaustedNoticeStates.delete(`${larkAppId}:${quotaKey}`);
+}
+export function __resetQuotaExhaustedNoticesForTest(): void {
+  quotaExhaustedNoticeStates.clear();
+}
+
 async function notifyQuotaExhausted(
   larkAppId: string,
   anchor: string,
   senderOpenId: string,
   limit: number | undefined,
+  quotaKey?: string,
+  exhaustedUsed?: number,
 ): Promise<void> {
   if (typeof limit !== 'number') return;
+  const noticeKey = quotaKey ? `${larkAppId}:${quotaKey}` : undefined;
+  const noticeState = `${limit}:${exhaustedUsed ?? ''}`;
+  // Denials are never deduped: only the user-facing card is. A successful
+  // consume clears this state so a later refill→exhaust cycle notifies again.
+  if (noticeKey && quotaExhaustedNoticeStates.get(noticeKey) === noticeState) return;
   let autoReapply = false;
   try {
     const cfg = getBot(larkAppId).config;
@@ -5411,6 +5951,7 @@ async function notifyQuotaExhausted(
       'interactive',
       larkAppId,
     );
+    if (noticeKey) quotaExhaustedNoticeStates.set(noticeKey, noticeState);
   } catch (err) {
     logger.warn(`[quota:${larkAppId}] quota exhausted notify failed: ${err}`);
   }
@@ -5427,7 +5968,12 @@ export async function enforceMessageQuotaForCliInput(
   chatType?: 'group' | 'p2p',
   botSender?: boolean,
   opts?: {
+    /** 与 bot-locked senderUnionId 同源的飞书 sender app_id；external roster 需要配对。 */
+    senderAppId?: string;
     listenerAuthorized?: boolean;
+    crossChatFollowedThreadAuthorized?: boolean;
+    crossChatFollowedChatId?: string;
+    crossChatFollowedRootMessageId?: string;
     skipCharge?: boolean;
     alreadyAuthorizedAndCharged?: boolean;
     /** 本轮要喂给 CLI 的用户文本，交给 prompt.submit 同步校验闸做内容级判断。
@@ -5438,14 +5984,95 @@ export async function enforceMessageQuotaForCliInput(
      *  所以闸看不到文件内容——但至少能看到「这轮带了什么附件」，让
      *  「禁止上传 .env / 只许图片」这类策略可写。见 hooks.md 的边界说明。 */
     promptAttachments?: Array<{ type: string; name: string }>;
+    /** Resolve content that must only be fetched after the built-in talk check
+     * (for example a quoted `/g` task). Runs before prompt.submit and charging;
+     * static promptContent/promptAttachments remain the zero-async default. */
+    resolvePrompt?: () => Promise<{
+      promptContent?: string;
+      promptAttachments?: Array<{ type: string; name: string }>;
+    }>;
   },
 ): Promise<boolean> {
+  if (opts?.crossChatFollowedThreadAuthorized) {
+    const checkChatId = opts.crossChatFollowedChatId ?? chatId;
+    const ev = botSender
+      ? evaluateBotTalk(larkAppId, checkChatId, senderOpenId, senderUnionId)
+      : evaluateTalk(larkAppId, checkChatId, senderOpenId, senderUnionId, memberUnionId, chatType);
+    if (ev.reason === 'blocked') {
+      logger.info(`[quota:${larkAppId}] dropping cross-chat thread message ${messageId.substring(0, 12)} from blocked sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
+      return false;
+    }
+    const crossChatGate = await evaluatePromptGate('prompt.submit', {
+      larkAppId,
+      chatId: checkChatId,
+      chatType,
+      anchor,
+      messageId,
+      senderOpenId,
+      senderUnionId,
+      memberUnionId,
+      botSender: !!botSender,
+      talkReason: 'crossChatFollowedThread',
+      content: opts.promptContent,
+      attachments: opts.promptAttachments,
+    });
+    if (!crossChatGate.allowed) {
+      logger.info(
+        `[hooks:${larkAppId}] prompt.submit gate denied cross-chat thread message ${messageId.substring(0, 12)}`
+        + `${crossChatGate.reason ? `: ${crossChatGate.reason}` : ''}`,
+      );
+      return false;
+    }
+    if (!ev.quotaKey) return true;
+    if (!senderOpenId) return false;
+    // The followed-chat allowlist exemption does not exempt a grant's finite
+    // quota. Keep the ordinary charge order: gate first, then dedup + consume;
+    // a rejected or uncertain message is never committed as charged.
+    const charge = beginCharge(larkAppId, messageId);
+    if (charge === 'done') return true;
+    if (charge === 'pending') return false;
+    let quota;
+    try {
+      const def = ev.reason === 'oncall' && !ev.explicitGrantOverride
+        ? getBot(larkAppId).config.messageQuota?.defaultLimit
+        : undefined;
+      quota = await consumeQuota(larkAppId, ev.quotaKey, def, ev.expiredGrantCleanup);
+    } catch (err) {
+      logger.warn(`[quota:${larkAppId}] cross-chat consume failed; dropping message ${messageId.substring(0, 12)}: ${err}`);
+      abortCharge(larkAppId, messageId);
+      return false;
+    }
+    if (quota.allow) clearQuotaExhaustedNotice(larkAppId, ev.quotaKey);
+    if (quota.tracked) {
+      if (!quota.allow) {
+        abortCharge(larkAppId, messageId);
+        // Keep the exhausted grant and quotaState as the durable denial. If
+        // they were revoked, the next cross-chat evaluation would degrade to
+        // an unmetered stranger exemption and both replay and later messages
+        // would bypass the hard cap.
+        await notifyQuotaExhausted(
+          larkAppId,
+          opts.crossChatFollowedRootMessageId ?? anchor,
+          senderOpenId,
+          quota.limit,
+          ev.quotaKey,
+          quota.used,
+        );
+        return false;
+      }
+    }
+    commitCharge(larkAppId, messageId);
+    return true;
+  }
   if (opts?.listenerAuthorized) {
     // Listener matches skip the talk/quota model (a third-party alert bot is
     // not a "sender" with a grant), but they DO reach a CLI — and their content
     // is attacker-influenceable third-party text, which is exactly what a
     // pre-submit gate exists to inspect. Ask the gate before returning; there
     // is no charge on this path, so the charge-order invariant is not in play.
+    const resolvedPrompt = opts.resolvePrompt
+      ? await opts.resolvePrompt()
+      : { promptContent: opts.promptContent, promptAttachments: opts.promptAttachments };
     const listenerGate = await evaluatePromptGate('prompt.submit', {
       larkAppId,
       chatId,
@@ -5455,8 +6082,8 @@ export async function enforceMessageQuotaForCliInput(
       senderOpenId,
       botSender: !!botSender,
       talkReason: 'messageListener',
-      content: opts.promptContent,
-      attachments: opts.promptAttachments,
+      content: resolvedPrompt.promptContent,
+      attachments: resolvedPrompt.promptAttachments,
     });
     if (!listenerGate.allowed) {
       logger.info(
@@ -5491,7 +6118,7 @@ export async function enforceMessageQuotaForCliInput(
   // 更糟：owner 以为授权生效了，消息凭空消失（#332 同款断点的最后一截）。
   // 不传（人的路径）→ 原样走 evaluateTalk，语义不变。
   const ev = botSender
-    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId, opts?.senderAppId)
     : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
     logger.info(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
@@ -5500,6 +6127,10 @@ export async function enforceMessageQuotaForCliInput(
   // Control/setup messages still need the authorization decision above, but
   // they never reach a CLI and therefore must not spend or dedupe a quota unit.
   if (opts?.skipCharge) return true;
+
+  const resolvedPrompt = opts?.resolvePrompt
+    ? await opts.resolvePrompt()
+    : { promptContent: opts?.promptContent, promptAttachments: opts?.promptAttachments };
 
   // ─── prompt.submit 同步前置校验闸 ────────────────────────────────────────
   // 位置是被两条既有不变量夹死的，不能随意挪：
@@ -5519,8 +6150,8 @@ export async function enforceMessageQuotaForCliInput(
     memberUnionId,
     botSender: !!botSender,
     talkReason: ev.reason,
-    content: opts?.promptContent,
-    attachments: opts?.promptAttachments,
+    content: resolvedPrompt.promptContent,
+    attachments: resolvedPrompt.promptAttachments,
   });
   if (!gate.allowed) {
     logger.info(
@@ -5572,6 +6203,7 @@ export async function enforceMessageQuotaForCliInput(
     return false;
   }
 
+  if (quota.allow) clearQuotaExhaustedNotice(larkAppId, ev.quotaKey);
   // 无额度记录（无限授权）：放行；标 done 去重后续重投。
   if (!quota.tracked) {
     commitCharge(larkAppId, messageId);
@@ -5583,7 +6215,7 @@ export async function enforceMessageQuotaForCliInput(
   if (!quota.allow) {
     abortCharge(larkAppId, messageId);
     await revokeQuotaGrant(larkAppId, chatId, senderOpenId, ev);
-    await notifyQuotaExhausted(larkAppId, anchor, senderOpenId, quota.limit);
+    await notifyQuotaExhausted(larkAppId, anchor, senderOpenId, quota.limit, ev.quotaKey, quota.used);
     return false;
   }
   // 扣费成功才定论为 done。
@@ -6164,6 +6796,8 @@ interface V3SavedWorkflowImInvocation {
   initiatorOpenId: string | undefined;
   /** union_id may grant teamBot trust only when the event was bot-authored. */
   teamTrustUnionId?: string;
+  /** Feishu-stamped app_id paired with teamTrustUnionId for external roster entries. */
+  teamTrustAppId?: string;
   /** Raw sender union_id may independently grant the configured teamMember leg. */
   memberUnionId?: string;
   /** 发起方是飞书盖章的 bot → talk 复查走 evaluateBotTalk（与 dispatcher 外层同源）。 */
@@ -6392,6 +7026,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     larkAppId,
     initiatorOpenId,
     teamTrustUnionId,
+    teamTrustAppId,
     memberUnionId,
     botSender,
   } = invocation;
@@ -6442,7 +7077,7 @@ async function handleV3SavedWorkflowCommandIfAny(
     return true;
   }
 
-  const operatorCanOperate = canOperate(larkAppId, chatId, initiatorOpenId, teamTrustUnionId);
+  const operatorCanOperate = canOperateBotSender(larkAppId, chatId, initiatorOpenId, teamTrustUnionId, teamTrustAppId);
   const policy = await authorizeV3SavedWorkflowInvocation(command, {
     canPublishGlobal: () => operatorCanOperate,
     consumeMessageQuotaOnce: () => enforceMessageQuotaForCliInput(
@@ -6455,6 +7090,7 @@ async function handleV3SavedWorkflowCommandIfAny(
       memberUnionId,
       chatType,
       botSender,
+      { senderAppId: teamTrustAppId },
     ),
   });
   if (!policy.ok) {
@@ -6654,13 +7290,25 @@ function idleAutoCompactContextTokens(ds: DaemonSession): number | undefined {
   return typeof used === 'number' && Number.isFinite(used) && used > 0 ? used : undefined;
 }
 
+/** Each refusal says what actually stopped the write (see IdleAutoCompactRefusalReason). */
+const IDLE_COMPACT_REFUSED_NOTICE_KEYS = {
+  draft: 'idle_compact.notice.refused_draft',
+  choice: 'idle_compact.notice.refused_choice',
+  unconfirmed: 'idle_compact.notice.refused_unconfirmed',
+  no_screen: 'idle_compact.notice.refused_no_screen',
+  busy: 'idle_compact.notice.refused_busy',
+  unknown: 'idle_compact.notice.refused_unknown',
+} as const satisfies Record<IdleAutoCompactRefusalReason, string>;
+
 function idleAutoCompactNoticeText(ds: DaemonSession, notice: IdleAutoCompactNotice): string {
   const loc = localeForBot(ds.larkAppId);
   const k = (tokens: number) => String(Math.round(tokens / 1000));
   if (notice.kind === 'skipped_small') {
     return tr('idle_compact.notice.skipped_small', { minutes: notice.idleMinutes, tokens: k(notice.tokens), min: k(notice.minTokens) }, loc);
   }
-  if (notice.kind === 'refused') return tr('idle_compact.notice.refused', { minutes: notice.idleMinutes }, loc);
+  if (notice.kind === 'refused') {
+    return tr(IDLE_COMPACT_REFUSED_NOTICE_KEYS[notice.reason], { minutes: notice.idleMinutes, attempts: notice.attempts }, loc);
+  }
   if (notice.kind === 'interrupted') return tr('idle_compact.notice.interrupted', { minutes: notice.idleMinutes }, loc);
   return notice.tokens !== undefined
     ? tr('idle_compact.notice.compacted', { minutes: notice.idleMinutes, tokens: k(notice.tokens) }, loc)
@@ -6708,12 +7356,19 @@ function runIdleAutoCompact(): void {
  * this, passthrough commands silently PATCH the previous card and the user
  * sees no visible response.
  */
-function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
+function beginNewTurn(ds: DaemonSession, title: string, turnId: string, opts: { unattended?: boolean; preserveIdleCompactRetry?: boolean } = {}): void {
   noteTurnStarted(ds, turnId);
-  // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
-  resetPromptCacheKeepalive(ds);
+  // The previous turn's「下一步」row stops being the last card's.
+  noteReplyCardTurnStarted(ds, turnId);
+  // A real turn ends the idle stretch a prompt-cache keep-alive was extending
+  // (an unattended /compact only once it actually runs — see the helper).
+  notePromptCacheKeepaliveTurnStarted(ds, opts);
   // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
-  noteIdleAutoCompactTurnStarted(ds, turnId);
+  // Persist a real turn's retry invalidation before its busy edge: the whole
+  // turn may finish while the daemon is down, and an old retry must not revive.
+  if (noteIdleAutoCompactTurnStarted(ds, turnId, Date.now(), { preserveRetry: opts.preserveIdleCompactRetry })) {
+    sessionStore.updateSession(ds.session);
+  }
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
   // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
   // deliverFinalOutput / botmux send 成功路径清理。
@@ -6750,6 +7405,8 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       false,
       substituteCardControlFor(ds),
       ds.keysPanelOpen === true,
+      undefined,
+      resolveStreamingCardFoldedLayout(getBot(ds.larkAppId).config),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -6932,6 +7589,7 @@ async function submitQueuedMessage(
     senderOpenId: message.senderId,
     participants: [{ openId: message.senderId, isBot: senderIsBot === true }],
     inThread: !!message.threadId,
+    sourceMessageId: message.messageId,
   });
   await noteTurnReceived(ds, message.messageId, text, sender, message.messageId);
   // Identity refresh and reaction delivery both await external work.
@@ -6967,6 +7625,33 @@ const commandDeps: CommandHandlerDeps = {
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
   submitQueuedMessage,
+  // `/g <task>` hands its text to a new CLI session: same talk check,
+  // prompt.submit gate and quota charge as a normal message, before the
+  // group exists (a refusal must leave no external side effect).
+  admitTaskPrompt: ({ larkAppId, message, anchor, content, resolvePrompt }) => {
+    const larkStampedBotSender = message.senderType === 'app' || message.senderType === 'bot';
+    const botSender = groupTaskSenderIsBot(
+      message,
+      getBot(larkAppId).botOpenId,
+      isKnownPeerBot(config.session.dataDir, larkAppId, message.senderId),
+    );
+    return enforceMessageQuotaForCliInput(
+      larkAppId,
+      message.chatId ?? anchor,
+      message.senderId,
+      message.messageId,
+      anchor,
+      botSender ? message.senderUnionId : undefined,
+      botSender ? undefined : message.senderUnionId,
+      message.chatType,
+      botSender,
+      {
+        senderAppId: larkStampedBotSender ? message.senderAppId : undefined,
+        promptContent: content,
+        resolvePrompt,
+      },
+    );
+  },
 };
 
 /** Bind every reply produced by one slash-command invocation to the routing
@@ -6981,6 +7666,8 @@ function commandDepsForInvocation(input: {
   anchor: string;
   messageId: string;
   replyRootId?: string;
+  /** Sender identity already resolved by the route, including cross-ref peer bots. */
+  senderIsBot: boolean;
 }): CommandHandlerDeps {
   const replyTarget = resolveInboundReplyTarget({
     scope: input.scope,
@@ -6992,6 +7679,22 @@ function commandDepsForInvocation(input: {
     ...commandDeps,
     invocationContext: input.context,
     invocationReplyTarget: replyTarget,
+    deliverCliCommand: (ds, command, message) => {
+      // Same refusal as a routed passthrough: a raw command must not overtake
+      // an ordinary message that is still being submitted.
+      if (ds.worker && !ds.worker.killed && hasQueuedActivationAdmissionGate(ds)) {
+        logger.warn(`[${input.anchor.substring(0, 12)}] Refused ${command} before acceptance while queued activation owns raw submission order`);
+        return 'activation_pending';
+      }
+      return deliverPassthroughToExistingSession(ds, command, command, input.anchor, ds.larkAppId, {
+        messageId: input.messageId,
+        replyRootId: input.replyRootId,
+        senderOpenId: message.senderId,
+        senderIsBot: input.senderIsBot,
+        substitute: false,
+        inThread: !!message.threadId,
+      }) ? 'delivered' : 'rejected';
+    },
     sessionReply: (rootId, content, msgType, larkAppId, turnId, opts) =>
       sessionReply(
         rootId,
@@ -7048,10 +7751,44 @@ function canTalkForGroupSessions(
   memberUnionId: string | undefined,
   chatType: 'p2p' | 'group' | undefined,
   botSender: boolean,
+  botTrustAppId?: string,
 ): boolean {
   return botSender
-    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, botTrustUnionId).allowed
+    ? evaluateBotTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, botTrustAppId).allowed
     : evaluateTalk(larkAppId, chatId, senderOpenId, botTrustUnionId, memberUnionId, chatType).allowed;
+}
+
+/** Shared, receiver-independent creator defaults for multiline `/g` routing.
+ * Name-only registry rows stay visible to election; config joins by app ID. */
+function sharedGroupRoutingBots(): GroupRoutingBotDefaults[] {
+  let defaultsByAppId = new Map<string, unknown>();
+  try {
+    defaultsByAppId = new Map(loadBotConfigsCached().map(bot => [bot.larkAppId, bot.groupCreation]));
+  } catch { /* Explicit --start still works with unknown defaults. */ }
+  let raw: unknown;
+  try { raw = readBotsInfoJson(config.session.dataDir); } catch { return []; }
+  return botsInfoObjectEntries(raw).filter(isBotsInfoNameEntry).map(entry => ({
+    botName: entry.botName,
+    groupCreation: typeof entry.larkAppId === 'string' ? defaultsByAppId.get(entry.larkAppId) : undefined,
+  }));
+}
+
+/** Multi-line `/g` is a command only under the FIRST mentioned creator's
+ * shared defaults. Without bot mentions, this daemon is the creator. */
+function multilineCommandsForRouting(
+  larkAppId: string,
+  text: string,
+  mentions?: LarkMessage['mentions'],
+): ReadonlySet<string> | undefined {
+  if (!isGroupCommandText(text)) return undefined;
+  if (!groupCommandStartsTaskForRouting({
+    commandText: text,
+    ownDefaults: getBot(larkAppId).config.groupCreation,
+    mentions,
+    knownBots: sharedGroupRoutingBots(),
+  })) return undefined;
+  const spec = commandSpec('/group');
+  return spec ? new Set([spec.name, ...(spec.aliases ?? [])]) : undefined;
 }
 
 /** Plugin command table for routing. Only `/…` text can route to a plugin, so
@@ -7083,6 +7820,7 @@ async function executePluginSlashCommand(input: {
   senderOpenId: string | undefined;
   senderUnionId: string | undefined;
   teamTrustUnionId: string | undefined;
+  teamTrustAppId: string | undefined;
   botSender: boolean;
   deps: CommandHandlerDeps;
 }): Promise<void> {
@@ -7112,8 +7850,9 @@ async function executePluginSlashCommand(input: {
       input.senderUnionId,
       input.chatType,
       input.botSender,
+      input.teamTrustAppId,
     ),
-    canOperate: () => canOperate(larkAppId, chatId, input.senderOpenId, input.teamTrustUnionId),
+    canOperate: () => canOperateBotSender(larkAppId, chatId, input.senderOpenId, input.teamTrustUnionId, input.teamTrustAppId),
     onAdmitted: () => markIngressAdmitted(input.ctx),
     execute: pluginCommandGateway.execute,
     reply: (content, msgType) => deps.sessionReply(anchor, content, msgType, larkAppId),
@@ -7771,6 +8510,7 @@ function clearPendingRepoStateForNotifierAdopt(ds: DaemonSession): void {
   ds.pendingFollowUps = undefined;
   ds.pendingFollowUpTurnId = undefined;
   ds.pendingCodexAppText = undefined;
+  ds.pendingAcceptedInput = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingChatContext = undefined;
@@ -8273,7 +9013,6 @@ function workflowDaemonMutationRoute<K extends WorkflowDaemonMutation>(
       });
     }
 
-    const parsed = parseWorkflowDaemonMutationBody(mutation, verified.bodyRaw);
     const reply = (status: number, payload: unknown): void => {
       const responseBody = JSON.stringify(payload);
       const responseSignature = signWorkflowDaemonIpcResponse({
@@ -8291,6 +9030,50 @@ function workflowDaemonMutationRoute<K extends WorkflowDaemonMutation>(
       });
       res.end(responseBody);
     };
+
+    let raw: Record<string, unknown> | undefined;
+    try {
+      const candidate = JSON.parse(verified.bodyRaw) as unknown;
+      if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)
+        && JSON.stringify(candidate) === verified.bodyRaw) raw = candidate as Record<string, unknown>;
+    } catch { /* the legacy parser below returns bad_json */ }
+    const claimedSessionId = raw?.sessionId;
+    let sessionProofRequired = typeof claimedSessionId === 'string' && claimedSessionId.length > 0;
+    if (!sessionProofRequired) {
+      try {
+        sessionProofRequired = v3RunHasChatBinding(params.runId, v3DefaultBaseDir());
+      } catch { /* preserve the legacy executor's missing/corrupt-run error */ }
+    }
+    if (sessionProofRequired) {
+      if (!raw) return reply(400, { ok: false, error: 'bad_json' });
+      if (typeof claimedSessionId !== 'string' || !claimedSessionId) {
+        return reply(400, { ok: false, error: 'missing_session_id' });
+      }
+      const ds = findActiveBySessionId(claimedSessionId);
+      const decision = authorizeSignedChatMutation({
+        runId: params.runId,
+        mutation,
+        raw,
+        session: ds ? v3RelaySessionView(ds) : undefined,
+        selfLarkAppId: identity.larkAppId,
+        baseDir: v3DefaultBaseDir(),
+        ...v3RelayScheduleAuth(ds),
+      });
+      if (!decision.ok) {
+        return reply(decision.status, {
+          ok: false,
+          error: decision.error,
+          ...(decision.detail ? { detail: decision.detail } : {}),
+        });
+      }
+      const authorizedBody = 'body' in decision && decision.body !== undefined
+        ? decision.body
+        : 'edit' in decision ? decision.edit : undefined;
+      if (!authorizedBody) return reply(400, { ok: false, error: 'bad_body' });
+      return handler(reply, params, authorizedBody as WorkflowDaemonMutationBodies[K], identity);
+    }
+
+    const parsed = parseWorkflowDaemonMutationBody(mutation, verified.bodyRaw);
     if (!parsed.ok) return reply(400, { ok: false, error: parsed.error });
     // parseWorkflowDaemonMutationBody is keyed by the same `mutation` value;
     // this cast only expresses that correlation to TypeScript.
@@ -9057,6 +9840,14 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     policyDigest = evaluation.policyDigest;
   }
 
+  const ownerTurn = ds.managedTurnOrigin?.turnId;
+  const ownerCaller = ds.activeInteractiveTurn?.turnId === ownerTurn ? ds.activeInteractiveTurn?.caller
+    : ownerTurn ? dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, ownerTurn)) : undefined;
+  const taskOwner = ds.chatType === 'group' && (ds.scope ?? ds.session.scope) === 'thread'
+    && ds.chatId !== targetChatId && targetAppIds.length === 1 && body?.hasLegacyBots !== true
+    && ownerCaller?.requestUserOpenId && directHumanForDispatchOnly({ sourceAppId: ds.larkAppId,
+      turnId: ownerTurn, session: ds.session, activeTurn: ds.activeInteractiveTurn })
+    ? { openId: ownerCaller.requestUserOpenId, receivingAppId: targetAppIds[0]!, receivingChatId: targetChatId } : undefined;
   let dispatchRoot: string;
   try {
     dispatchRoot = await sendMessage(ds.larkAppId, targetChatId, seedText, 'text', undefined, undefined, sourceWriteOptions);
@@ -9089,6 +9880,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     sourceName: title || 'dispatched subtask',
     issuedAt,
     ...(sourceReply ? { reply: sourceReply } : {}),
+    ...(taskOwner ? { taskOwner } : {}),
   });
   const botOpenIds = stringArray(body?.bots);
   try {
@@ -9204,29 +9996,40 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     if (!policy.ok) return jsonRes(res, 403, policy);
     const bot = getBot(ds.larkAppId).config;
     const turnId = sourceTurnId;
+    const mayDelegatePersonalIdentity = allowsPersonalIdentityForTurn(turnId, bot.triggerUserAuth);
     const active = ds.activeInteractiveTurn;
     const delegationPolicy = readGlobalConfig().scheduleDelegation;
     const adminOpenIds = getDashboardAdminOpenIds(ds.larkAppId);
-    const directScheduleSource = !!active && active.turnId === turnId
+    const directScheduleSource = mayDelegatePersonalIdentity && !!active && active.turnId === turnId
       && active.caller.senderType === 'user' && !active.caller.source
       && !!active.caller.requestUserOpenId
       && adminOpenIds.includes(active.caller.requestUserOpenId);
-    const dispatchCaller = !turnId ? undefined
+    const dispatchCaller = !turnId || !mayDelegatePersonalIdentity ? undefined
       : ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
         : active?.turnId === turnId ? active.caller
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
     const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
+    const directHumanTurn = mayDelegatePersonalIdentity && directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
+      session: ds.session, activeTurn: active });
+    const inheritedForwardTools = !directHumanTurn && turnId && targetAppIds.length
+      ? dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
+        sourceChatId: ds.chatId, targetChatId: chatId, targetAppIds,
+        directHuman: false, inherited: true,
+      }) : [];
+    // With tools: [] a bot can still forward an already signed grant through
+    // dispatchOnly. Read that grant before deciding whether to sign at all.
+    const inheritedLookedUp = mayDelegatePersonalIdentity && inheritedForwardTools.length > 0;
+    const earlyInherited = inheritedLookedUp ? await dispatchUserForTurn(ds, turnId!) : undefined;
+    // A forward passes on only tools the upstream grant already carries. A
+    // listed tool it cannot pass on is no immediate delegation: counting it
+    // would suppress the automatic schedule grant below and sign nothing.
     const dispatchOnlyTools = dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
       sourceChatId: ds.chatId,
       targetChatId: chatId,
       targetAppIds,
-      directHuman: ds.session.failedTurnRecovery?.turnId !== turnId
-        && !!active && active.turnId === turnId
-        && active.caller.senderType === 'user' && !active.caller.source
-        && active.caller.requestLarkAppId === ds.larkAppId
-        && !!active.caller.requestUserOpenId,
-      inherited: false,
-    });
+      directHuman: directHumanTurn,
+      inherited: !!earlyInherited,
+    }).filter(tool => directHumanTurn || earlyInherited?.authority.tools.some(granted => granted === tool));
     const dispatchTools = [...new Set([...tools, ...dispatchOnlyTools])];
     // A host bot grant stands in only for turns that no human administrator
     // drives. An administrator's own dispatch (live, or restored from the reply
@@ -9273,8 +10076,9 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     // schedule:create; `--no-delegate schedule:create` keeps the caller's own
     // immediate tool delegation.
     const serviceGrant = scheduleCreateRequested ? botGrant : undefined;
-    let inherited = needsDelegation && turnId && !serviceGrant
-      ? await dispatchUserForTurn(ds, turnId) : undefined;
+    let inherited = needsDelegation && turnId && !serviceGrant && mayDelegatePersonalIdentity
+      ? inheritedLookedUp ? earlyInherited : await dispatchUserForTurn(ds, turnId)
+      : undefined;
     let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
     if (inherited && 'workflow' in inherited) {
       // A workflow node's delegation goes on only within its run (approved
@@ -9293,7 +10097,10 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       sourceAppId: ds.larkAppId,
       caller: dispatchCaller,
       inherited: inherited?.authority,
-      tools: inherited ? tools : dispatchTools,
+      // authorityForDispatch intersects this list with a verified inherited
+      // grant. dispatchOnly can permit forwarding without enabling the tool
+      // in this bot's own CLI policy.
+      tools: dispatchTools,
       ...(scheduleCreateRequested ? {
         scheduleCreate: {
           targetAppIds,
@@ -9302,7 +10109,9 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           allowSelfManage: delegationPolicy?.selfManageEnabled === true,
         },
       } : {}),
-      resolveUnionId: resolveUnionIdFromOpenId,
+      resolveUnionId: (appId, openId) => resolveDispatchSenderUnionId(
+        ds.session, turnId, appId, openId, resolveMessageSenderUnionId, resolveUnionIdFromOpenId,
+      ),
     }) : undefined;
     if (serviceGrant) {
       const sponsor = await resolveTargetAppOpenId(ds.larkAppId, serviceGrant.controllerUnionId);
@@ -9322,18 +10131,120 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     if (authority && ds.managedTurnOrigin?.turnId !== turnId) {
       return jsonRes(res, 409, { ok: false, error: 'dispatch_turn_changed' });
     }
+    // A terminal task denial is independent of the delivery shape. Check it
+    // before schedule defaults, multi-target delivery or legacy recipients can
+    // bypass the consent-card path. Only the exact owner/app/chat tuple matches.
+    let assertTaskNotDenied: (() => Promise<void>) | undefined;
+    if (directHumanTurn && ds.chatType === 'group' && ds.chatId !== chatId && turnId?.startsWith('om_')
+        && targetAppIds.length > 0 && authority
+        && (authority.tools.includes('bytedcli')
+          || scheduleCreateCapabilities(authority).some(capability => capability.allowedRunScopes.includes('bytedcli')))) {
+      const secret = loadOrCreateDispatchReportBindingSecret(config.session.dataDir);
+      const binding = await readTaskBinding(config.session.dataDir, secret, rootId);
+      const sticky = binding?.taskOwner;
+      if (binding?.targetLarkAppId === ds.larkAppId && binding.targetSessionId === ds.session.sessionId
+          && binding.targetChatId === ds.chatId && binding.targetScope === 'thread' && !binding.attachment
+          && sticky?.openId === authority.openId && sticky.receivingChatId === chatId
+          && targetAppIds.includes(sticky.receivingAppId)) {
+        if (sticky.decision === 'denied') {
+          return jsonRes(res, 409, { ok: false, error: 'task_consent_denied', dispatchRoot: rootId });
+        }
+        assertTaskNotDenied = async () => {
+          const current = await readTaskBinding(config.session.dataDir, secret, rootId);
+          const owner = current?.taskOwner;
+          if (!current || current.attachment || current.targetLarkAppId !== binding.targetLarkAppId
+              || current.targetSessionId !== binding.targetSessionId || current.targetChatId !== binding.targetChatId
+              || current.targetScope !== binding.targetScope || owner?.openId !== sticky.openId
+              || owner.receivingAppId !== sticky.receivingAppId || owner.receivingChatId !== sticky.receivingChatId) {
+            throw new Error('dispatch_task_changed');
+          }
+          if (owner.decision === 'denied') throw new Error('task_consent_denied');
+        };
+      }
+    }
+    let taskConsent: { sourceChatId: string; cardId: string } | undefined;
+    if (directHumanTurn && ds.chatType === 'group' && ds.chatId !== chatId && turnId?.startsWith('om_')
+        && targetAppIds.length === 1 && targetAppIds[0] !== ds.larkAppId && !body.hasLegacyBots
+        && authority?.tools.includes('bytedcli') && capabilityOn(bot.triggerUserAuth, 'bytecloud') && !inherited) {
+      // Only tasks whose report channel the source daemon owns may request
+      // cross-chat consent (including --into). An arbitrary thread is no task.
+      const targetApp = targetAppIds[0];
+      const secret = loadOrCreateDispatchReportBindingSecret(config.session.dataDir);
+      let binding = await readTaskBinding(config.session.dataDir, secret, rootId);
+      const targetConfig = binding && loadBotConfigs().find(cfg => cfg.larkAppId === targetApp);
+      if (binding?.targetLarkAppId === ds.larkAppId && binding.targetSessionId === ds.session.sessionId
+          && binding.targetChatId === ds.chatId && binding.targetScope === 'thread' && !binding.attachment
+          && targetConfig && capabilityOn(targetConfig.triggerUserAuth, 'bytecloud')) {
+        // An explicit refusal is sticky for this task owner. Joining the target
+        // chat later must not reopen it through the ordinary member delegation.
+        const sticky = binding.taskOwner;
+        if (sticky?.decision === 'denied' && sticky.openId === authority.openId
+            && sticky.receivingAppId === targetApp && sticky.receivingChatId === chatId) {
+          return jsonRes(res, 409, { ok: false, error: 'task_consent_denied', dispatchRoot: rootId });
+        }
+        if (!scheduleCreateRequested) {
+          const members = await findCurrentChatUserMembers(ds.larkAppId, chatId, [authority.openId]);
+          if (!members.has(authority.openId)) {
+            if (!binding.taskOwner && ds.session.rootMessageId) {
+              binding = await restoreDispatchTaskOwner({ dataDir: config.session.dataDir, secret, binding,
+                owner: { openId: authority.openId, receivingAppId: targetApp, receivingChatId: chatId },
+                sourceRootId: ds.session.rootMessageId, firstReply: () => firstDispatchReply(ds.larkAppId, chatId, rootId, targetApp),
+                original: kickoff => resolveDispatchUser({ dataDir: config.session.dataDir, secret, appId: targetApp,
+                  chatId, rootId, turnId: kickoff, waitMs: 0 }),
+                sourceMessage: id => getMessageDetail(ds.larkAppId, id, { userIdType: 'open_id', userCardContent: false, timeoutMs: 5000 }),
+              }) ?? null;
+            }
+            if (!binding || binding.taskOwner?.openId !== authority.openId || binding.taskOwner.receivingAppId !== targetApp
+                || binding.taskOwner.receivingChatId !== chatId) {
+              return jsonRes(res, 403, { ok: false, error: 'dispatch_task_owner_unproven' });
+            }
+            await sourceWriteOptions.beforeWrite();
+            const cardId = await confirmDispatchTask({
+              dataDir: config.session.dataDir, secret, binding, targetName: targetConfig.displayName,
+              send: (card, key) => replyMessage(ds.larkAppId, turnId, card, 'interactive', true, key, undefined, sourceWriteOptions),
+              checkOrigin: sourceWriteOptions.beforeWrite,
+              isCardAvailable: cardId => dispatchConsentCardAvailable(ds.larkAppId, ds.chatId, cardId),
+            });
+            if (!evaluateTalk(ds.larkAppId, ds.chatId, authority.openId, undefined, authority.unionId, 'group').allowed
+                || !(await findCurrentChatUserMembers(ds.larkAppId, ds.chatId, [authority.openId])).has(authority.openId)) {
+              return jsonRes(res, 403, { ok: false, error: 'dispatch_source_access_denied' });
+            }
+            taskConsent = { sourceChatId: ds.chatId, cardId };
+            authority = { ...authority, tools: ['bytedcli'] };
+          }
+        }
+      }
+    }
     await sourceWriteOptions.beforeWrite();
-    const send = () => replyMessage(ds.larkAppId, rootId, body.content, 'post', true, undefined, undefined, sourceWriteOptions);
-    const messageId = authority && turnId && targetAppIds.length
-      ? await deliverDispatchWithUser({
-          dataDir: config.session.dataDir,
-          secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
-          payload: {
-            sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
-            rootId, chatId, targetAppIds, authority,
-            ...(inheritedWorkflow && !scheduleCreateCapabilities(authority).length ? { workflow: inheritedWorkflow } : {}),
-          }, send,
-        })
+    const delivery = authority && turnId && targetAppIds.length ? {
+      dataDir: config.session.dataDir,
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+      ...(taskConsent ? {
+        isCardAvailable: (cardId: string) => dispatchConsentCardAvailable(ds.larkAppId, ds.chatId, cardId),
+      } : {}),
+      payload: {
+        sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
+        rootId, chatId, targetAppIds, authority,
+        ...(taskConsent ? { taskConsent } : {}),
+        ...(inheritedWorkflow && !scheduleCreateCapabilities(authority).length ? { workflow: inheritedWorkflow } : {}),
+      },
+    } : undefined;
+    const send = () => replyMessage(ds.larkAppId, rootId, body.content, 'post', true, undefined, undefined,
+      taskConsent && delivery ? { ...sourceWriteOptions, beforeWrite: async () => {
+        await sourceWriteOptions.beforeWrite();
+        await assertDispatchTaskApproved(delivery);
+        await sourceWriteOptions.beforeWrite();
+      } } : assertTaskNotDenied && delivery ? { ...sourceWriteOptions, beforeWrite: async () => {
+        await sourceWriteOptions.beforeWrite();
+        await assertTaskNotDenied();
+        await sourceWriteOptions.beforeWrite();
+      } } : sourceWriteOptions);
+    const messageId = delivery
+      ? await (taskConsent
+        ? deliverApprovedDispatchTask({ ...delivery, send })
+        : assertTaskNotDenied
+          ? deliverStickyDispatchWithUser({ ...delivery, send }, assertTaskNotDenied)
+          : deliverDispatchWithUser({ ...delivery, send }))
       : await send();
     if (scheduleCreateDefaulted || serviceGrant) {
       // With a service grant the signer is the sponsor, not whoever drove the
@@ -9353,6 +10264,10 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
   } catch (error) {
     if (isDispatchOriginNotSendableError(error)) {
       return jsonRes(res, 409, { ok: false, error: 'origin_not_sendable' });
+    }
+    if (error instanceof Error && ['task_consent_pending', 'task_consent_denied', 'dispatch_task_changed',
+      'dispatch_consent_unavailable', 'dispatch_consent_race'].includes(error.message)) {
+      return jsonRes(res, 409, { ok: false, error: error.message, dispatchRoot: rootId });
     }
     return jsonRes(res, 502, { ok: false, error: 'dispatch_delivery_failed', detail: error instanceof Error ? error.message : String(error) });
   }
@@ -9411,6 +10326,7 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
   if (targets.length === 0) return skip('no_local_bot');
   const turnId = ds.managedTurnOrigin?.turnId;
   if (!turnId) return skip('no_live_turn');
+  if (!allowsPersonalIdentityForTurn(turnId, bot.triggerUserAuth)) return skip('unattended_turn');
   try {
     const active = ds.activeInteractiveTurn;
     // The person who sent THIS turn directly, or — exactly as `botmux dispatch`
@@ -9434,11 +10350,8 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return skip('delegated_caller_not_allowed');
     }
-    const directHumanTurn = ds.session.failedTurnRecovery?.turnId !== turnId
-      && !!active && active.turnId === turnId
-      && active.caller.senderType === 'user' && !active.caller.source
-      && active.caller.requestLarkAppId === ds.larkAppId
-      && !!active.caller.requestUserOpenId;
+    const directHumanTurn = directHumanForDispatchOnly({ sourceAppId: ds.larkAppId, turnId,
+      session: ds.session, activeTurn: active });
     // Scope the dispatch-only check to `targets` — the local bots that actually
     // receive a signed record. The raw targetAppIds may name a bot that is not
     // configured on this machine; it is filtered out above, so letting it veto
@@ -9457,7 +10370,9 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
       inherited: inherited?.authority,
       tools: [...new Set([...bot.triggerUserAuth!.tools, ...dispatchOnlyTools])],
-      resolveUnionId: resolveUnionIdFromOpenId,
+      resolveUnionId: (appId, openId) => resolveDispatchSenderUnionId(
+        ds.session, turnId, appId, openId, resolveMessageSenderUnionId, resolveUnionIdFromOpenId,
+      ),
     });
     if (!authority) {
       if (inherited) return skip('no_shared_tool');
@@ -9657,7 +10572,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     // the task's creator identity only if that person may operate this bot
     // now; every fire re-checks the same admission.
     const { runAs, ownerOpenId: _ownerOpenId, ownerUnionId: _ownerUnionId, ...hostTask } = task;
-    let runAsOwner: { ownerOpenId: string; ownerUnionId: string; creatorLarkAppId: string } | undefined;
+    let runAsOwner: scheduler.ScheduleOwner = { kind: 'ownerless' };
     if (runAs !== undefined) {
       if (!selfDaemonLarkAppId || typeof runAs !== 'string'
         || !/^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/.test(runAs)) {
@@ -9671,10 +10586,15 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       if (!canOperate(selfDaemonLarkAppId, task.chatId, openId, unionId)) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_run_as_not_allowed' });
       }
-      runAsOwner = { ownerOpenId: openId, ownerUnionId: unionId, creatorLarkAppId: selfDaemonLarkAppId };
+      runAsOwner = { kind: 'human', openId, unionId };
     }
     try {
-      const created = scheduler.addTask({ ...hostTask, ...runAsOwner, ...untilDoneParams });
+      const created = scheduler.addTask({
+        ...hostTask,
+        owner: runAsOwner,
+        ...(runAsOwner.kind === 'human' ? { creatorLarkAppId: selfDaemonLarkAppId } : {}),
+        ...untilDoneParams,
+      });
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     } catch (error) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_host_commit_failed',
@@ -9743,6 +10663,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let persistentRunScopes: Array<'bytedcli'> = [];
   let selfManage = false;
   let botGrantHolds: (() => boolean) | undefined;
+  let scheduledChildParent: import('./services/schedule-authority-store.js').ScheduleAuthorityRecord | undefined;
+  let scheduledChildParsed: ReturnType<typeof scheduler.parseSchedule> | undefined;
+  let scheduledChildMaxTasksPerTurn: number | undefined;
   const caller = scheduleCallerForTurn(ds, turnId);
   const directHuman = caller?.senderType === 'user'
     && !caller.source && caller.requestLarkAppId === ds.larkAppId;
@@ -9753,17 +10676,108 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     return jsonRes(res, 403, { ok: false, error: 'schedule_session_tool_controller_forbidden' });
   }
   const direct = directHuman || providerActor;
+  const scheduledParentTaskId = parseScheduledTurnId(turnId);
   const capability = ds.managedTurnOrigin.capability;
+  // A direct human who is not a bot administrator but may talk here, admitted
+  // under the bot's scheduleCreateByTalkers policy (core/schedule-talker).
+  let talkerOwner = false;
   try {
     if (directHuman) {
       controlOpenId = caller!.requestUserOpenId;
       controlUnionId = caller!.requestUserUnionId
         ?? (controlOpenId ? await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined : undefined);
       grantId = `direct:${sessionId}:${turnId}`;
+      if (controlOpenId && !getDashboardAdminOpenIds(ds.larkAppId).includes(controlOpenId)
+        && talkerSchedulePolicy(getBot(ds.larkAppId).config).enabled) {
+        if (!controlUnionId) {
+          return jsonRes(res, 403, { ok: false, error: 'schedule_talker_identity_unresolved' });
+        }
+        const scopeError = talkerScheduleScopeError(task, { chatId: ds.chatId, rootMessageId: expectedRoot });
+        if (scopeError) {
+          return jsonRes(res, scopeError === 'schedule_talker_root_forbidden' ? 400 : 403,
+            { ok: false, error: scopeError });
+        }
+        // The inbound turn already passed the talk gate for this chat; check it
+        // again here so a grant revoked mid-turn cannot still mint a task. Group
+        // membership is enforced by the shared operator gate below.
+        if (!evaluateTalk(ds.larkAppId, ds.chatId, controlOpenId, undefined, controlUnionId, ds.chatType).allowed) {
+          return jsonRes(res, 403, { ok: false, error: 'schedule_talker_operator_denied' });
+        }
+        // Fast-path only: createDirect enforces this quota transactionally.
+        // An existing id must reach its identical-replay/conflict check first,
+        // otherwise a successful create that filled the quota makes its own
+        // retry look like a new over-quota request.
+        const existing = task.id ? scheduleAuthorityStore.getRecord(ds.larkAppId, task.id) : undefined;
+        if (!existing && countLiveTalkerTasks(scheduleAuthorityStore.listRecords(ds.larkAppId), controlOpenId)
+          >= talkerSchedulePolicy(getBot(ds.larkAppId).config).maxTasksPerUser) {
+          return jsonRes(res, 403, { ok: false, error: 'schedule_talker_task_limit' });
+        }
+        talkerOwner = true;
+      }
     } else if (providerActor) {
       controlOpenId = remoteRunnerControllerOpenId;
       controlUnionId = await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined;
       grantId = `provider-actor:${sessionId}:${turnId}`;
+    } else if (scheduledParentTaskId) {
+      const rawWorkingDir = ds.workingDir ?? ds.session.workingDir;
+      let sessionWorkingDir: string | undefined;
+      try { sessionWorkingDir = rawWorkingDir ? realpathSync(rawWorkingDir) : undefined; }
+      catch { sessionWorkingDir = undefined; }
+      const parent = scheduleAuthorityStore.getRecord(ds.larkAppId, scheduledParentTaskId);
+      if (!parent) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
+      }
+      let parsed: ReturnType<typeof scheduler.parseSchedule>;
+      try { parsed = scheduler.parseSchedule(task.schedule); }
+      catch {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_requires_once' });
+      }
+      const childDecision = validateScheduleChildOneShot({
+        policy: readGlobalConfig().scheduleDelegation,
+        parent,
+        task,
+        parsed,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        rootMessageId: expectedRoot,
+        workingDir: sessionWorkingDir ?? '',
+        nowMs: Date.now(),
+      });
+      if (!childDecision.ok) {
+        return jsonRes(res, 403, { ok: false, error: childDecision.error });
+      }
+      const parentAuth = authorizeScheduledTurn({
+        turnId,
+        sessionLarkAppId: ds.larkAppId,
+        sessionChatId: ds.chatId,
+        loadTask: (appId, taskId) => readScheduledTaskFromAuthority(scheduleAuthorityStore, appId, taskId),
+        isOwnerAllowed: (appId, ownerOpenId) => getDashboardAdminOpenIds(appId).includes(ownerOpenId),
+        isScheduledTurnLive: liveTurnId => ds.scheduledTurnCallers?.has(liveTurnId) === true,
+      });
+      if ('error' in parentAuth
+        || parentAuth.ownerOpenId !== parent.controlOpenId
+        || parent.task.ownerUnionId !== parent.controlUnionId) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
+      }
+      const resolved = await resolveTargetAppOpenId(ds.larkAppId, parent.controlUnionId!);
+      if (resolved.status !== 'resolved' || resolved.openId !== parent.controlOpenId) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_child_one_shot_parent_ineligible' });
+      }
+      const targetCliConfig = getBot(ds.larkAppId).config;
+      if (!delegatedCliExecutionAllowed(targetCliConfig)) {
+        return jsonRes(res, 403, {
+          ok: false,
+          error: 'schedule_child_one_shot_identity_isolation_required',
+        });
+      }
+      scheduledChildParent = parent;
+      scheduledChildParsed = parsed;
+      scheduledChildMaxTasksPerTurn = childDecision.value.maxTasksPerTurn;
+      controlOpenId = parent.controlOpenId;
+      controlUnionId = parent.controlUnionId;
+      grantId = `schedule-child:${ds.larkAppId}:${scheduledParentTaskId}:${turnId}`;
+      sourceMessageId = turnId;
+      sourceSessionId = sessionId;
     } else {
       if (readGlobalConfig().scheduleDelegation?.createEnabled !== true) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
@@ -9806,13 +10820,14 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         };
         if (!botGrantHolds()) return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
       }
-      const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
-      if (!targetTriggerPolicy?.enabled
-        || !TRIGGER_USER_AUTH_TOOLS.every(tool => targetTriggerPolicy.tools.includes(tool))) {
+      const targetCliConfig = getBot(ds.larkAppId).config;
+      const targetTriggerPolicy = targetCliConfig.triggerUserAuth;
+      if (!delegatedCliExecutionAllowed(targetCliConfig)) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_target_identity_isolation_required' });
       }
       if (capability.allowedRunScopes.some(scope => !targetPolicy?.runScopes?.includes(scope)
-        || !targetTriggerPolicy.tools.includes(scope))) {
+        || configuredCliExecutionMode(targetCliConfig) !== 'native'
+          && !capabilityOn(targetTriggerPolicy, capabilityOfTool(scope)))) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_run_scope_unsupported' });
       }
       if (capability.allowSelfManage === true && targetPolicy?.selfManageEnabled !== true) {
@@ -9834,12 +10849,21 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       sourceSessionId = delegation.sourceSessionId;
     }
     if (!controlOpenId || !controlUnionId
-      || !getDashboardAdminOpenIds(ds.larkAppId).includes(controlOpenId)
+      || !(talkerOwner || getDashboardAdminOpenIds(ds.larkAppId).includes(controlOpenId))
       // A capability-only caller in a p2p turn must not aim the task at another
       // chat the bot happens to be in unless the operator is a member there.
       || ((ds.chatType === 'group' || (!trustedHost && task.chatId !== ds.chatId))
         && !(await listChatMemberOpenIds(ds.larkAppId, task.chatId)).includes(controlOpenId))) {
-      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_operator_denied' });
+      return jsonRes(res, 403, { ok: false, error: talkerOwner
+        ? 'schedule_talker_operator_denied' : 'schedule_delegation_operator_denied' });
+    }
+    // Re-read after the identity/membership lookups: a switch or talk grant
+    // revoked meanwhile commits nothing.
+    if (talkerOwner && !talkerSchedulePolicy(getBot(ds.larkAppId).config).enabled) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_talker_create_disabled' });
+    }
+    if (talkerOwner && !evaluateTalk(ds.larkAppId, ds.chatId, controlOpenId, undefined, controlUnionId, ds.chatType).allowed) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_talker_operator_denied' });
     }
     if (ds.managedTurnOrigin?.turnId !== turnId || ds.workerGeneration !== generation
       || ds.managedTurnOrigin.capability !== capability) {
@@ -9847,6 +10871,42 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     }
     if (botGrantHolds && !botGrantHolds()) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_bot_grant_denied' });
+    }
+    if (scheduledChildParent && scheduledChildParsed) {
+      try {
+        assertScheduledAuthorityCurrent(
+          scheduledChildParent,
+          scheduleAuthorityStore.getRecord(ds.larkAppId, scheduledParentTaskId!),
+          { turnId, allowCompleted: true },
+        );
+      } catch {
+        return jsonRes(res, 409, { ok: false, error: 'schedule_child_one_shot_authority_changed' });
+      }
+      const rawWorkingDir = ds.workingDir ?? ds.session.workingDir;
+      let sessionWorkingDir: string | undefined;
+      try { sessionWorkingDir = rawWorkingDir ? realpathSync(rawWorkingDir) : undefined; }
+      catch { sessionWorkingDir = undefined; }
+      const childDecision = validateScheduleChildOneShot({
+        policy: readGlobalConfig().scheduleDelegation,
+        parent: scheduleAuthorityStore.getRecord(ds.larkAppId, scheduledParentTaskId!),
+        task,
+        parsed: scheduledChildParsed,
+        larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        rootMessageId: expectedRoot,
+        workingDir: sessionWorkingDir ?? '',
+        nowMs: Date.now(),
+      });
+      if (!childDecision.ok) {
+        return jsonRes(res, 403, { ok: false, error: childDecision.error });
+      }
+      scheduledChildMaxTasksPerTurn = childDecision.value.maxTasksPerTurn;
+    }
+    if (!direct && !providerActor && !delegatedCliExecutionAllowed(getBot(ds.larkAppId).config)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_target_identity_isolation_required' });
+    }
+    if (persistentRunScopes.some(scope => !readGlobalConfig().scheduleDelegation?.runScopes?.includes(scope))) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_run_scope_unsupported' });
     }
     const baseParams = {
       name: task.name.trim(),
@@ -9876,17 +10936,27 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       let created;
       try {
         created = scheduler.addTask({ ...baseParams, ...untilDoneParams, id: task.id,
-          ownerOpenId: controlOpenId, ownerUnionId: controlUnionId }, {
+          owner: { kind: 'human', openId: controlOpenId, unionId: controlUnionId },
+          ...(talkerOwner ? { ownerAccess: 'talk' as const } : {}) }, {
           // turnId is the live managed origin read above — never the request body.
           directTurn: {
             turnId,
-            maxTasksPerTurn: readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
-              ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+            // A talker may commit one task per turn; the per-person quota above
+            // bounds the total.
+            maxTasksPerTurn: talkerOwner ? 1 : (readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
+              ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN),
+            ...(talkerOwner ? {
+              maxLiveTasksPerOwner: talkerSchedulePolicy(getBot(ds.larkAppId).config).maxTasksPerUser,
+            } : {}),
           },
+          creatingTurn: { sessionId: ds.session.sessionId, turnId },
         });
       } catch (error) {
         if (error instanceof Error && error.message === 'schedule_direct_task_limit') {
           return jsonRes(res, 403, { ok: false, error: 'schedule_direct_task_limit' });
+        }
+        if (error instanceof Error && error.message === 'schedule_talker_task_limit') {
+          return jsonRes(res, 403, { ok: false, error: 'schedule_talker_task_limit' });
         }
         throw error;
       }
@@ -9911,13 +10981,18 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       sourceSessionId,
       targetTurnId: turnId,
       targetGeneration: generation,
-      maxTasksPerTurn: readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
+      maxTasksPerTurn: scheduledChildMaxTasksPerTurn
+        ?? readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
         ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+      controllerBoundToolIdentity: scheduledChildParent !== undefined,
     });
     if (!result.ok) {
+      const error = scheduledChildParent && result.error === 'grant_task_limit'
+        ? 'schedule_child_one_shot_task_limit'
+        : result.error;
       return jsonRes(res, result.error === 'grant_task_limit' ? 403 : 409, {
         ok: false,
-        error: result.error,
+        error,
       });
     }
     return jsonRes(res, result.replay ? 200 : 201, { ok: true, task: result.task, replay: result.replay });
@@ -10037,10 +11112,11 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   const turnId = ds?.managedTurnOrigin?.turnId;
   const caller = ds && turnId ? scheduleCallerForTurn(ds, turnId) : undefined;
   const hostAdmin = trustedHost && !ds && body?.larkAppId === selfDaemonLarkAppId;
-  const currentHumanAdmin = !!ds && caller?.senderType === 'user' && !caller.source
+  const currentHuman = !!ds && caller?.senderType === 'user' && !caller.source
     && caller.requestLarkAppId === ds.larkAppId
-    && !!caller.requestUserOpenId
-    && getDashboardAdminOpenIds(ds.larkAppId).includes(caller.requestUserOpenId);
+    && !!caller.requestUserOpenId;
+  const currentHumanAdmin = currentHuman
+    && getDashboardAdminOpenIds(ds!.larkAppId).includes(caller!.requestUserOpenId!);
   const providerActor = !!ds && trustedHost && remoteRunnerSessionTool
     && caller?.senderType === 'bot'
     && caller.requestLarkAppId === ds.larkAppId
@@ -10067,6 +11143,16 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   const appId = ds?.larkAppId ?? selfDaemonLarkAppId;
   if (!appId) return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_daemon_unbound' });
   const authority = scheduleAuthorityStore.getRecord(appId, id);
+  // A talk-only person manages exactly the tasks they created under the
+  // talker policy, from the chat those tasks post into, while the policy is
+  // on. Administrators keep the ordinary path above.
+  const currentHumanTalkerOwner = currentHuman && !currentHumanAdmin
+    && !!authority && authority.kind === 'direct' && isTalkerScheduledTask(authority.task)
+    && authority.controlOpenId === caller!.requestUserOpenId
+    && !!authority.controlUnionId
+    && (caller!.requestUserUnionId === undefined || caller!.requestUserUnionId === authority.controlUnionId)
+    && authority.task.chatId === ds!.chatId
+    && talkerSchedulePolicy(getBot(ds!.larkAppId).config).enabled;
   let providerActorAdmin = false;
   if (providerActor) {
     const providerTurnId = ds!.managedTurnOrigin?.turnId;
@@ -10116,7 +11202,8 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
   // until-done task reporting that the awaited work is finished.
   const potentialScheduledSelfManager = (!!ds && scheduledTaskId === id
     && (action === 'pause' || action === 'remove' || action === 'done')) || botPolicyTopicManager;
-  if (!hostAdmin && !currentHumanAdmin && !providerActorAdmin && !potentialScheduledSelfManager) {
+  if (!hostAdmin && !currentHumanAdmin && !currentHumanTalkerOwner && !providerActorAdmin
+    && !potentialScheduledSelfManager) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
   }
   if (!authority) return jsonRes(res, 404, { ok: false, error: 'schedule_not_found' });
@@ -11046,6 +12133,13 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   const documentSource = typeof body.originTurnId === 'string'
     ? askSession?.session.docCommentTargets?.[body.originTurnId] : undefined;
   const asyncDocumentTarget = documentSource ? { ...documentSource } : undefined;
+  const asyncInput = boundAsk.asyncUserInput;
+  const asyncAskOriginIsCurrent = asyncInput && askSession
+    && isCodexAppCliId(askSession.session.cliLaunchSnapshot?.cliId
+      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId)
+    ? captureCodexAsyncAskOrigin(askSession, asyncInput.threadId) : undefined;
+  const isAsyncAskCurrent = () => !res.destroyed && findActiveBySessionId(boundAsk.sessionId) === askSession
+    && asyncAskOriginIsCurrent?.() === true;
   let documentDelivery: Awaited<ReturnType<typeof resolveDocumentAskDelivery>>;
   const askGeneration = askSession && captureRoutingGeneration(askSession);
   const askWorker = askSession?.worker;
@@ -11068,9 +12162,6 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       detail: error instanceof Error ? error.message : 'Confirmation card cannot be delivered',
     });
   }
-  const asyncInput = boundAsk.asyncUserInput;
-  const asyncWorker = askSession?.worker;
-  const asyncGeneration = askSession?.session.workerGeneration;
   const asyncOriginTurn = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
   const audience = asyncInput && askSession
     ? documentDelivery ? { kind: 'human' as const, answererOpenId: documentDelivery.openId }
@@ -11079,10 +12170,8 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   const asyncCaller = audience?.kind === 'human' ? audience.answererOpenId : undefined;
   const asyncOriginMessageId = typeof body.originTurnId === 'string' && body.originTurnId.startsWith('om_')
     ? body.originTurnId : askSession?.session.rootMessageId;
-  if (asyncInput && (!askSession || !asyncWorker || asyncWorker.killed
-    || !isCodexAppCliId(askSession.session.cliLaunchSnapshot?.cliId
-      ?? askSession.session.cliId ?? getBot(askSession.larkAppId).config.cliId)
-    || askSession.session.cliSessionId !== asyncInput.threadId)) {
+  if (asyncInput && !isAsyncAskCurrent()) {
+    logger.warn(`[ask:${boundAsk.sessionId.slice(0, 8)}] Async question rejected: native thread origin unavailable`);
     if (askSession && audience?.kind !== 'silent') await notifyAsyncAsk(askSession, boundAsk.rootMessageId, asyncOriginTurn,
       tr('card.ask.async_unavailable', undefined, localeForBot(askSession.larkAppId)));
     return jsonRes(res, 409, { ok: false, error: 'async_question_origin_unavailable' });
@@ -11140,6 +12229,9 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     isPeerBot: openId => isKnownPeerBot(config.session.dataDir, boundAsk.larkAppId, openId),
     isHuman: openId => isHumanOpenId(boundAsk.larkAppId, openId),
   });
+  if (asyncInput && !isAsyncAskCurrent()) {
+    return jsonRes(res, 409, { ok: false, error: 'async_question_origin_unavailable' });
+  }
   if (requestedMention && !mentionedOpenId) {
     logger.warn(`[ask:${boundAsk.sessionId.slice(0, 8)}] --mention ${requestedMention.slice(0, 12)} is not a human of this app; card sent without the mention`);
   }
@@ -11170,10 +12262,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
   if (res.destroyed) return;
 
   if (asyncInput && askSession && result.kind === 'answered') {
-    const isCurrent = () => !res.destroyed && findActiveBySessionId(boundAsk.sessionId) === askSession
-      && askSession.worker === asyncWorker && !!asyncWorker && !asyncWorker.killed
-      && askSession.session.workerGeneration === asyncGeneration
-      && askSession.session.cliSessionId === asyncInput.threadId;
+    const isCurrent = isAsyncAskCurrent;
     const delivered = await deliverCodexAsyncAnswer(asyncInput, boundAsk.questions, result, {
       isCurrent,
       deliver: async (text, by) => {
@@ -22255,12 +23344,40 @@ async function resolveSoloSessionForTurn(
  * fork. All potentially-slow preparation must happen before this call; the
  * pendingFollowUps snapshot and fork then cannot be interleaved by a later
  * same-anchor handler. */
+function stageStructuredLarkTurn(
+  ds: DaemonSession,
+  message: LarkMessage,
+  attachments: LarkAttachment[],
+  senderName?: string,
+  turnId = message.messageId,
+): void {
+  if (ds.session.status === 'closed') return;
+  try {
+    const root = ds.scope === 'thread' || message.threadId
+      ? message.rootId || message.messageId
+      : undefined;
+    stageSessionTurnInbound(config.session.dataDir, ds.session.sessionId, turnId,
+      projectLarkTurnInbound(message, attachments, root, senderName));
+  } catch {
+    logger.warn('Failed to stage structured session input');
+  }
+}
+
 function buildReservedInitialInput(
   ds: DaemonSession,
   availableBots: AvailableBot[],
 ) {
   const selfBot = getBot(ds.larkAppId);
   const botCfg = selfBot.config;
+  const openingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
+  if (openingTurnId && ds.pendingStructuredOpeningTurnId && ds.pendingFollowUpTurnIds?.length) {
+    try {
+      mergeStagedSessionTurnInputs(config.session.dataDir, ds.session.sessionId, openingTurnId,
+        [ds.pendingStructuredOpeningTurnId, ...ds.pendingFollowUpTurnIds]);
+    } catch {
+      logger.warn('Failed to stage merged session input');
+    }
+  }
   const built = buildNewTopicCliInput(
     ds.pendingPrompt ?? '',
     ds.session.sessionId,
@@ -22279,6 +23396,7 @@ function buildReservedInitialInput(
       whiteboardId: ds.session.whiteboardId,
       substituteTrigger: ds.pendingSubstituteTrigger,
       codexAppText: ds.pendingCodexAppText,
+      acceptedInput: ds.pendingAcceptedInput,
       codexAppApplicationContext: ds.pendingCodexAppApplicationContext,
       codexAppMessageContext: ds.pendingCodexAppMessageContext,
       codexAppFollowUps: ds.pendingCodexAppFollowUps,
@@ -22315,6 +23433,7 @@ function buildReservedInitialInput(
 function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingPrompt = undefined;
   ds.pendingCodexAppText = undefined;
+  ds.pendingAcceptedInput = undefined;
   ds.pendingCodexAppApplicationContext = undefined;
   ds.pendingCodexAppMessageContext = undefined;
   ds.pendingAttachments = undefined;
@@ -22327,6 +23446,7 @@ function clearInitialStartBuffers(ds: DaemonSession): void {
   ds.pendingLinkRefMode = undefined;
   ds.pendingFollowUps = undefined;
   ds.pendingFollowUpTurnIds = undefined;
+  ds.pendingStructuredOpeningTurnId = undefined;
   ds.pendingCodexAppFollowUps = undefined;
   ds.pendingCodexAppFollowUpContexts = undefined;
   ds.pendingCodexAppFollowUpGateAccepted = undefined;
@@ -22448,6 +23568,18 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
     const turnId = bufferedTurnIds[bufferedTurnIds.length - 1]
       ?? ds.currentReplyTarget?.turnId
       ?? `queued-activation-followup-${randomUUID()}`;
+    // The coalesced CLI turn keeps only the last turnId for attribution, so
+    // fold every buffered message's staged inbound into that turn's payload
+    // before durable admission. Without this the read model would expose only
+    // the final buffered message (same merge as buildReservedInitialInput).
+    if (bufferedTurnIds.length > 0) {
+      try {
+        mergeStagedSessionTurnInputs(config.session.dataDir, ds.session.sessionId, turnId, bufferedTurnIds);
+      } catch {
+        logger.warn('Failed to stage merged activation input');
+      }
+    }
+    const traexRpcContext = traexRpcContextForSession(ds, cliId);
     const followUp = buildFollowUpCliInput(
       buffered.join('\n\n'),
       ds.session.sessionId,
@@ -22468,6 +23600,7 @@ function releaseQueuedActivationReservationNow(ds: DaemonSession, acknowledgedTo
         codexAppMessageContext: (ds.pendingCodexAppFollowUpContexts ?? [])
           .filter(Boolean)
           .join('\n\n'),
+        ...(traexRpcContext ? { traexRpcContext } : {}),
       },
     );
     const reservation = reserveQueuedActivationTailAdmission(ds);
@@ -24669,6 +25802,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.sandboxReadonlyPaths = source.sandboxReadonlyPaths;
   child.sandboxNetwork = source.sandboxNetwork;
   child.sandboxNetworkPolicy = source.sandboxNetworkPolicy ? structuredClone(source.sandboxNetworkPolicy) : undefined;
+  child.sandboxWithholdBotSecret = source.sandboxWithholdBotSecret;
   child.reasoningEffort = source.reasoningEffort;
   child.modelBackendVariant = source.modelBackendVariant;
   child.model = source.model;
@@ -25840,11 +26974,16 @@ function deliverPassthroughToExistingSession(
       ...sessionBindingKeys.map(key => ({ target: ds.session, key, descriptor: Object.getOwnPropertyDescriptor(ds.session, key) })),
       ...['replyThreadAliases', 'currentReplyTarget'].map(key => ({ target: ds, key, descriptor: Object.getOwnPropertyDescriptor(ds, key) })),
     ];
+    // Unlike the reply descriptors above, this nested object is mutated by the
+    // pre-admission invalidation itself: a descriptor alone cannot roll it back.
+    const savedIdleAutoCompact = structuredClone(ds.session.idleAutoCompact);
     const restoreBinding = () => {
       for (const { target, key, descriptor } of savedBinding) {
         if (descriptor) Object.defineProperty(target, key, descriptor);
         else Reflect.deleteProperty(target, key);
       }
+      if (savedIdleAutoCompact === undefined) delete ds.session.idleAutoCompact;
+      else ds.session.idleAutoCompact = structuredClone(savedIdleAutoCompact);
       sessionStore.updateSession(ds.session);
     };
     // Passthrough commands bypass the normal message-forwarding block, so bind
@@ -25865,6 +27004,8 @@ function deliverPassthroughToExistingSession(
       participants: passthroughWindow.participants,
       participantsIncomplete: passthroughWindow.incomplete,
       inThread: turn.inThread,
+      // A cascade's derived turnId is not a Lark message id; keep the exact inbound id.
+      sourceMessageId: turn.messageId,
     });
     if (turn.senderOpenId && ds.session.lastCallerOpenId !== turn.senderOpenId) {
       ds.session.lastCallerOpenId = turn.senderOpenId;
@@ -25879,19 +27020,26 @@ function deliverPassthroughToExistingSession(
     // clearing the marker would lose the opening for the next real turn.
     // `/model` on an empty-started session therefore stays literal and the
     // FOLLOWING business message still opens as a new topic.
+    const localCliCommand = isLocalCliCommand(cmd);
+    const retryInvalidation = invalidateIdleAutoCompactRetryForTurn(ds, turnId, { preserveRetry: localCliCommand });
     let accepted: boolean;
-    try { accepted = sendWorkerSessionInput(ds, {
-      type: 'raw_input',
-      content: commandContent,
-      ...(trustedSessionController(ds)
-        ? { trustedController: trustedSessionController(ds) }
-        : {}),
-      // Same reason as the worker-pool raw_input send: a passthrough is a real
-      // mojo turn, so it needs the live credential snapshot too.
-      ...(mojoLivePatchForSession(ds) ?? {}),
-      turnId,
-      ...(turn.requireSafeComposer ? { requireSafeComposer: true as const } : {}),
-    }); } catch (err) { restoreBinding(); throw err; }
+    try {
+      // Commit the cancellation before IPC admission: if this save fails the
+      // worker never accepts a turn that could revive the old retry on restart.
+      if (retryInvalidation.changed) sessionStore.updateSession(ds.session);
+      accepted = sendWorkerSessionInput(ds, {
+        type: 'raw_input',
+        content: commandContent,
+        ...(trustedSessionController(ds)
+          ? { trustedController: trustedSessionController(ds) }
+          : {}),
+        // Same reason as the worker-pool raw_input send: a passthrough is a real
+        // mojo turn, so it needs the live credential snapshot too.
+        ...(mojoLivePatchForSession(ds) ?? {}),
+        turnId,
+        ...(turn.requireSafeComposer ? { requireSafeComposer: true as const } : {}),
+      });
+    } catch (err) { restoreBinding(); throw err; }
     if (!accepted) {
       logger.warn(`[${anchor.substring(0, 12)}] Passthrough ${cmd} was not accepted by the worker`);
       restoreBinding();
@@ -25904,10 +27052,13 @@ function deliverPassthroughToExistingSession(
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
     // A locally answered CLI command (/model, /cost, …) sends no request, so it
-    // must not arm a warm idle-auto-compact stretch (core/idle-auto-compact.ts).
+    // must not arm a warm idle-auto-compact stretch or cancel a pending retry.
     const idleCompactArm = ds.idleAutoCompactArm;
-    beginNewTurn(ds, commandContent, turnId);
-    if (isLocalCliCommand(cmd)) ds.idleAutoCompactArm = idleCompactArm;
+    beginNewTurn(ds, commandContent, turnId, {
+      unattended: turn.requireSafeComposer === true,
+      preserveIdleCompactRetry: localCliCommand,
+    });
+    if (localCliCommand) ds.idleAutoCompactArm = idleCompactArm;
     markPassthroughActivity(ds, turnId);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;
@@ -25941,6 +27092,8 @@ async function startInitialPassthroughSession(args: {
   substitute: boolean;
   /** Bot-locked union_id (quota gate's teamBot leg — bot senders only). */
   senderUnionId?: string;
+  /** Feishu-stamped bot app_id paired with senderUnionId for external roster entries. */
+  senderAppId?: string;
   /** Raw sender union_id (quota gate's teamMember leg — may be a human). */
   memberUnionId?: string;
   /** Ownership is the CALLER's call — required fields, no sender fallback.
@@ -25972,12 +27125,13 @@ async function startInitialPassthroughSession(args: {
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
-    parsed, promptResources, commandContent, senderOpenId, substitute, senderUnionId,
+    parsed, promptResources, commandContent, senderOpenId, substitute, senderUnionId, senderAppId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
     routeToCanonicalOwner, lifecycle,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, {
+    senderAppId,
     promptContent: commandContent || parsed.content,
     promptAttachments: promptResources?.map(r => ({ type: r.type, name: r.name })),
   })) {
@@ -26561,6 +27715,7 @@ function computeCodexAppSteerable(facts: {
   messageListener: boolean;
   vcMeetingReceiver: boolean;
   vcMeetingImTurnOrigin: boolean;
+  crossChatFollowUp: boolean;
 }): boolean {
   const plainHuman = facts.humanSender
     && !facts.isForeignBot
@@ -26574,7 +27729,8 @@ function computeCodexAppSteerable(facts: {
     && !facts.controlRewrite
     && !facts.messageListener
     && !facts.vcMeetingReceiver
-    && !facts.vcMeetingImTurnOrigin;
+    && !facts.vcMeetingImTurnOrigin
+    && !facts.crossChatFollowUp;
 }
 
 /**
@@ -26933,6 +28089,9 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // talk 复查走哪个谓词（evaluateBotTalk vs evaluateTalk）——两者必须同源，见
   // enforceMessageQuotaForCliInput 的 botSender 说明。
   const teamTrustUnionId: string | undefined = isBotSenderType ? senderUnionId : undefined;
+  // external roster 不能只凭手填 union 放行：只把飞书盖章的 app_id 与 bot-locked union
+  // 一起交给授权层做配对。cross-ref 推断的 bot 不补造这份证据；真人路径恒 undefined。
+  const teamTrustAppId: string | undefined = isBotSenderType ? data.sender?.sender_id?.app_id : undefined;
   // A bot-sent new topic (e.g. a message-listener match on a third-party alert
   // bot's card) must NOT make that bot the session owner: daemon-generated
   // footers --mention-back the owner, so a bot owner means we @ the alert bot
@@ -26987,6 +28146,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     larkAppId,
     initiatorOpenId: senderOpenId,
     teamTrustUnionId,
+    teamTrustAppId,
     memberUnionId: senderUnionId,
     botSender: isBotSenderType,
   })) {
@@ -27028,8 +28188,8 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 斜杠命令执行段已搬到 executeNewTopicSlash（输入全部显式）；true = 已处理。
   if (await executeNewTopicSlash({
     ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent,
-    senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger,
-    forceTopic, forceTopicMode, botCfg,
+    senderOpenId, senderUnionId, teamTrustUnionId, teamTrustAppId, isBotSenderType, isForeignBotSender, substituteTrigger,
+    forceTopic, forceTopicMode, botCfg, trustedCaller,
   })) return;
 
   // A setup-only `/t` must still pass the same talk-permission recheck as any
@@ -27062,6 +28222,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const sessionGroupAlreadyCharged = !!ctx.sessionGroupQuotaConsumed
     || quotaConsumedBeforeSessionGroupBirth;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, teamTrustUnionId, senderUnionId, chatType, isBotSenderType, {
+    senderAppId: teamTrustAppId,
     listenerAuthorized: !!messageListener,
     skipCharge: isBareForceTopic || sessionGroupAlreadyCharged,
     alreadyAuthorizedAndCharged: sessionGroupAlreadyCharged,
@@ -27340,6 +28501,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     pendingTurnId: replyAnchorId,
     pendingTrustedCaller: trustedCaller,
     pendingCodexAppText: codexAppVisibleText,
+    pendingAcceptedInput: ctx.acceptedInput,
     pendingCodexAppApplicationContext: codexAppApplicationContext || undefined,
     pendingCodexAppMessageContext: codexAppMessageContext,
     pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -27372,6 +28534,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageListener: !!messageListener,
       vcMeetingReceiver: false,
       vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
+      crossChatFollowUp: !!ctx.crossChatThreadFollowUp,
     }) ? { pendingCodexAppSteerable: true as const } : {}),
     ownerOpenId: ownerOpenIdForSession,
     currentTurnTitle: initialTurnTitle,
@@ -27424,6 +28587,10 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // repo 卡片 / auto-worktree 之后的 commit）经 buildReservedInitialInput 与
   // worker-pool init 读到同一个值。send 模式零额外 API。
   await resolveSoloSessionForTurn(ds, chatType, newTopicSender);
+  if (promptContent.trim() || attachments.length) {
+    stageStructuredLarkTurn(ds, parsed, attachments, newTopicSender?.name, replyAnchorId);
+    ds.pendingStructuredOpeningTurnId = replyAnchorId;
+  }
   const sharedWorktree = autoWt && pinnedWorkingDir && forceTopicMode === 'worktree'
     ? await forceTopicWorktreeTarget(pinnedWorkingDir, anchor)
     : undefined;
@@ -27624,16 +28791,19 @@ interface NewTopicSlashContext {
   senderOpenId: string | undefined;
   senderUnionId: string | undefined;
   teamTrustUnionId: string | undefined;
+  teamTrustAppId: string | undefined;
   isBotSenderType: boolean;
   isForeignBotSender: boolean;
   substituteTrigger: RoutingContext['substituteTrigger'];
   forceTopic: Extract<ReturnType<typeof parseTopicHeader>, { ok: true }> | null;
   forceTopicMode: 'default' | 'here' | 'worktree';
   botCfg: ReturnType<typeof getBot>['config'];
+  trustedCaller?: TrustedCaller;
 }
 
 async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolean> {
-  const { ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, forceTopic, forceTopicMode, botCfg } = slash;
+  const { ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent, senderOpenId, senderUnionId, teamTrustUnionId, teamTrustAppId, isBotSenderType, isForeignBotSender, substituteTrigger, forceTopic, forceTopicMode, botCfg } = slash;
+  ctx.acceptedInput = undefined;
   // Intercept daemon commands in new topics (no session needed for some commands)
   // acceptSlashFromBots gate: a bot sender's slash command is only routed as a
   // command when this bot opts in (default on). When off, fall through to
@@ -27652,7 +28822,9 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
     coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
     senderIsBot: senderIsBotForSlashGate,
     acceptSlashFromBots: botAcceptsSlashFromBots(larkAppId),
+    delegatedCommands: sessionDelegatedSlashCommands(botCfg, undefined, config.daemon.backendType),
     pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
+    multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
   });
   if (slashDecision.kind === 'plugin') {
     await executePluginSlashCommand({
@@ -27667,8 +28839,9 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       senderOpenId,
       senderUnionId,
       teamTrustUnionId,
+      teamTrustAppId,
       botSender: senderIsBotForSlashGate,
-      deps: commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId }),
+      deps: commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId, senderIsBot: isForeignBotSender }),
     });
     return true;
   }
@@ -27677,7 +28850,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
   if (slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, slashDecision.cmd);
     if (restrictedText) {
-      await commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId })
+      await commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId, senderIsBot: isForeignBotSender })
         .sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
     }
@@ -27691,11 +28864,22 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       anchor,
       messageId: parsed.messageId,
       replyRootId,
+      senderIsBot: isForeignBotSender,
     });
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
+    }
+    if (slashDecision.kind === 'delegated_turn') {
+      ctx.acceptedInput = await admitDelegatedSlashTurn(slashDecision, {
+        authorized: canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType, teamTrustAppId),
+        primary: coordinationModeIsPrimary(),
+        caller: slash.trustedCaller,
+        larkAppId,
+        reply: text => invocationDeps.sessionReply(anchor, text, 'text', larkAppId),
+      });
+      return !ctx.acceptedInput;
     }
     // Unlike daemon-management commands, `/sessions` is a read-only view of
     // metadata already visible in this group. Authorize it at canTalk level so
@@ -27713,6 +28897,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
             chatId,
             anchor: chatId,
             messageId: parsed.messageId,
+            senderIsBot: isForeignBotSender,
           })
         : invocationDeps;
       if (!canTalkForGroupSessions(
@@ -27723,6 +28908,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
         senderUnionId,
         chatType,
         senderIsBotForSlashGate,
+        teamTrustAppId,
       )) {
         await sessionsDeps.sessionReply(sessionsAnchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
@@ -27737,7 +28923,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       return true;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'vc-auth') {
-      if (!canOperate(larkAppId, chatId, senderOpenId, teamTrustUnionId)) {
+      if (!canOperateBotSender(larkAppId, chatId, senderOpenId, teamTrustUnionId, teamTrustAppId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
@@ -27791,6 +28977,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
           senderOpenId,
           substitute: !!substituteTrigger,
           senderUnionId: teamTrustUnionId,
+          senderAppId: teamTrustAppId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
           botSender: isBotSenderType,
           // Reply attribution uses the cross-ref-resolved is-bot (foreign peer
@@ -27824,7 +29011,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // which left a hole once per-chat grants flow through canTalk.
       // canRunDaemonCommand = canOperate ∪（cmd ∈ canTalkDaemonCommands && canTalk）：
       // bot 可通过名单把选定命令（如 /status）降到 canTalk；未配置时与 canOperate 全等。
-      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType)) {
+      if (!canRunDaemonCommand(larkAppId, chatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType, isBotSenderType, teamTrustAppId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
@@ -28358,6 +29545,10 @@ async function handleBotAdded(
     session.lastMessageAt = new Date(now).toISOString();
     session.scope = scope;
     if (pinnedWorkingDir) session.workingDir = pinnedWorkingDir;
+    // An ordinary join opens with the bootstrap, not a user question. Persist the
+    // awaiting-content marker at birth so naming starts from the first accepted
+    // content even if a later title write fails (forced openings carry a real task).
+    if (!forced) session.nativeSessionTitleAwaitingContent = true;
     sessionStore.updateSession(session);
     messageQueue.ensureQueue(anchor);
 
@@ -29141,6 +30332,7 @@ async function handleThreadReplyAdmitted(
   replay?: { parsed: LarkMessage; resources: MessageResource[] },
   effortSessionIsCurrent?: () => boolean,
 ): Promise<void> {
+  if (!crossChatFollowUpIsCurrent(ctx)) return;
   if (feedbackMaintenanceActive(config.session.dataDir)) throw new Error('feedback_storage_maintenance');
   noteInboundSenderUnionId(ctx.larkAppId, data); // see handleNewTopicAdmitted
   if (!replay && handleDocumentAskTextReply(data, ctx)) return;
@@ -29187,13 +30379,14 @@ async function handleThreadReplyAdmitted(
   // 同样跳过纯占位符种子（见出生侧注释）：自愈闸本就是为「停在占位名」兜底的，
   // 拿一张图片去改名只会把错名焊死，反而堵死后面真消息的自愈机会。
   // Completion Proposal 合成续跑不是真人新消息，同样不触发改名。
-  if (!ctx.completionProposalContinuation && ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
+  if (!ctx.completionProposalContinuation && !ctx.crossChatThreadFollowUp && ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
     const sgEntry = getSessionGroup(ctxChatId);
     if (sgEntry && !sgEntry.titled && shouldSeedSessionGroupTitle(parsed.content)) {
       scheduleSessionGroupTitle({ larkAppId, chatId: ctxChatId, userText: parsed.content });
     }
   }
   const groupAutoTitlePending = !ctx.completionProposalContinuation
+    && !ctx.crossChatThreadFollowUp
     && groupAutoTitleEligible(data, larkAppId, ctxChatId, ctxChatType);
 
   // Foreign bot @mention prefix: when sender is another botmux bot，把内容包成
@@ -29217,7 +30410,9 @@ async function handleThreadReplyAdmitted(
     senderOpenIdForPrefix !== selfBotOpenId &&
     (isBotSenderType ||
       isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenIdForPrefix));
-  const botSteerDirective = isForeignBot
+  // Cross-chat follow-ups are literal conversational text even when a bot sent
+  // them: their transport directives must not steer or replace the origin session.
+  const botSteerDirective = isForeignBot && !ctx.crossChatThreadFollowUp
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
@@ -29227,7 +30422,7 @@ async function handleThreadReplyAdmitted(
   // Unlike @steer (text only) it changes persistent state (closes a session), so
   // besides the @steer sender rule (a bot sender) it needs this bot to accept bot
   // slash commands; the quota/talk gate then runs before anything is consumed.
-  const botSessionDirective = isForeignBot && botAcceptsSlashFromBots(larkAppId)
+  const botSessionDirective = isForeignBot && !ctx.crossChatThreadFollowUp && botAcceptsSlashFromBots(larkAppId)
     ? parseBotSessionDirective(parsed.content)
     : { content: parsed.content };
   if (botSessionDirective.mode) parsed.content = botSessionDirective.content;
@@ -29289,15 +30484,38 @@ async function handleThreadReplyAdmitted(
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';
 
+  const crossChatOrigin: CrossChatFollowedThreadOrigin | undefined = ctx.crossChatThreadFollowUp
+    ? {
+        sourceChatId: ctx.crossChatThreadFollowUp.sourceChatId,
+        followedChatId: ctx.crossChatThreadFollowUp.followedChatId,
+        followedRootMessageId: ctx.crossChatThreadFollowUp.followedRootMessageId,
+      }
+    : undefined;
+  const buildTurnMessageLocation = (targetDs: DaemonSession): InboundMessageLocation => ({
+    messageId: parsed.messageId,
+    ...(crossChatOrigin
+      ? { rootMessageId: crossChatOrigin.followedRootMessageId, crossChatOrigin }
+      : (targetDs.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {})),
+  });
+
   // `let` (not const): the v3 grill gate below may replace this with a
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
-  const initialCodexAppMessageContext = zeroInjection ? ''
-    : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix
+  const baseQuoteAndBotContext = zeroInjection ? ''
+    : buildQuoteHint(
+        parsed,
+        crossChatOrigin ? 'thread' : scope,
+        crossChatOrigin?.followedRootMessageId ?? anchor,
+        localeForBot(larkAppId),
+      )
+      + botSenderPrefix
       + buildReportReplyContext(inputSession?.session.reportReplyReferences);
+  const initialCodexAppMessageContext = zeroInjection ? ''
+    : (crossChatOrigin ? `${renderCrossChatReplyHint(crossChatOrigin)}\n` : '')
+      + baseQuoteAndBotContext;
   const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
   const initialPromptContent = zeroInjection
     ? zeroPromptTaskContent(stripCrossPrincipalAsToken(parsed.content).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
-    : initialCodexAppMessageContext + initialCodexAppApplicationContext
+    : baseQuoteAndBotContext + initialCodexAppApplicationContext
       + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
   let rewrittenCodexAppMessageContext: string | undefined;
@@ -29354,7 +30572,10 @@ async function handleThreadReplyAdmitted(
   let cmdContent = stripLeadingMentions(threadCommandLane, parsed.mentions);
   // The administrative effort prefix was already consumed. Its attached task
   // remains literal model text while quota/resources/principal admission run.
-  if (ctx.effortTaskReentry) cmdContent = '';
+  // Cross-chat thread follow-up replies from another group are also literal
+  // conversational text — never daemon/slash commands or ask answers in the
+  // origin session.
+  if (ctx.effortTaskReentry || ctx.crossChatThreadFollowUp) cmdContent = '';
   // Keep the three values consumed by the remainder of this function in lock
   // step. In particular, workflow/slash parsing reads cmdContent while worker
   // injection reads content/parsed.content; listener input is never trusted as
@@ -29375,14 +30596,20 @@ async function handleThreadReplyAdmitted(
   // 类型的话，把真人 union_id 报成 bot 就能让真人在全团队被当队友 bot 放行
   //（talk + operate）。与旧联邦 team-bots「学习入口限 bot sender」同一不变量。
   const threadTeamTrustUnionId = (isBotSenderType || isForeignBot) ? threadSenderUnionId : undefined;
-  const threadTrustedCaller = await trustedCallerForInboundTurn(
+  // external roster 还要求和 union 配对的飞书 app_id；cross-ref 认识的 peer 不补造该证据。
+  const threadTeamTrustAppId: string | undefined = isBotSenderType ? data?.sender?.sender_id?.app_id : undefined;
+  const rawThreadTrustedCaller = await trustedCallerForInboundTurn(
     larkAppId,
     threadSenderOpenId,
     threadSenderUnionId,
     senderIsBotTriState(parsed.senderType, isForeignBot),
     parsed.messageId,
   );
-  const xpiControlNotice = threadTrustedCaller?.senderType === 'bot'
+  // Cross-chat followed thread replies are admitted via talk-gate exemption on
+  // the bot's own cross-chat thread, so they never replace the origin session's
+  // execution principal (nor trigger XPI principal staging in the origin chat).
+  const threadTrustedCaller = ctx.crossChatThreadFollowUp ? undefined : rawThreadTrustedCaller;
+  const xpiControlNotice = rawThreadTrustedCaller?.senderType === 'bot'
     ? parseCrossPrincipalControlNotice(parsed.content)
     : undefined;
   if (xpiControlNotice) {
@@ -29398,7 +30625,7 @@ async function handleThreadReplyAdmitted(
   }
   const threadChatId = ctxChatId ?? data?.message?.chat_id;
   const clearAgentAttentionForHumanInbound = (): void => {
-    if (isForeignBot || isBotSenderType) return;
+    if (isForeignBot || isBotSenderType || ctx.crossChatThreadFollowUp) return;
     const ds = activeSessions.get(runtimeSessionKey);
     if (ds) {
       if (ds.session.reportReplyInputId !== undefined && markReportReplyInput(ds.session, parsed.messageId)) {
@@ -29418,8 +30645,8 @@ async function handleThreadReplyAdmitted(
   // ^https?://127.0.0.1, so the mention prefix breaks the match — fall back to
   // the mention-stripped cmdContent so pasting the callback back into the
   // topic still works.
-  const callbackText = !ctx.effortTaskReentry && isCallbackUrl(content) ? content
-    : !ctx.effortTaskReentry && isCallbackUrl(cmdContent) ? cmdContent : null;
+  const callbackText = !ctx.effortTaskReentry && !ctx.crossChatThreadFollowUp && isCallbackUrl(content) ? content
+    : !ctx.effortTaskReentry && !ctx.crossChatThreadFollowUp && isCallbackUrl(cmdContent) ? cmdContent : null;
   if (callbackText) {
     const result = await handleCallbackUrl(callbackText);
     if (result) {
@@ -29517,6 +30744,7 @@ async function handleThreadReplyAdmitted(
     larkAppId,
     initiatorOpenId: threadSenderOpenId,
     teamTrustUnionId: threadTeamTrustUnionId,
+    teamTrustAppId: threadTeamTrustAppId,
     memberUnionId: threadSenderUnionId,
     botSender: isBotSenderType || isForeignBot,
   })) {
@@ -29560,7 +30788,8 @@ async function handleThreadReplyAdmitted(
     ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent,
     routingChatId: ctxChatId, chatType: ctxChatType, chatId: threadChatId,
     senderOpenId: threadSenderOpenId, senderUnionId: threadSenderUnionId, teamTrustUnionId: threadTeamTrustUnionId,
-    isBotSenderType, isForeignBotSender: isForeignBot, substituteTrigger, getThreadSender,
+    teamTrustAppId: threadTeamTrustAppId,
+    isBotSenderType, isForeignBotSender: isForeignBot, substituteTrigger, getThreadSender, trustedCaller: threadTrustedCaller,
   })) return;
 
   // 自定义回复拦截：该话题有未结的 ask 时，把这条文字当答案，走 submitCustomReply
@@ -29573,7 +30802,7 @@ async function handleThreadReplyAdmitted(
   // 触发的排除理由），拦截器这里只负责拿着结果去 settle。
   // 没有 hook 连着的 dormant hook ask（hook 随 CLI 退出、或重启后还没重连）不在
   // 候选里——broker 的 list/find 已过滤：此刻没有 CLI 在等答案，这条文字照常进会话。
-  const askCandidate = ctx.effortTaskReentry ? null : askCustomReplyCandidate({
+  const askCandidate = (ctx.effortTaskReentry || ctx.crossChatThreadFollowUp) ? null : askCustomReplyCandidate({
     senderOpenId: threadSenderOpenId,
     chatId: threadChatId,
     cmdContent,
@@ -29618,6 +30847,7 @@ async function handleThreadReplyAdmitted(
             : parsed.senderType === 'user' ? 'user' : undefined,
           botSender: isBotSenderType || isForeignBot,
           senderUnionId: threadTeamTrustUnionId,
+          senderAppId: threadTeamTrustAppId,
           memberUnionId: threadSenderUnionId,
         },
       });
@@ -29709,12 +30939,14 @@ async function handleThreadReplyAdmitted(
     if (disposition === 'committed') {
       const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
       markSessionActivity(dsPre, Date.now(), {
-        human: parsed.senderType === 'user' && !isForeignBot,
+        human: parsed.senderType === 'user' && !isForeignBot && !ctx.crossChatThreadFollowUp,
       });
-      const nativeTopicChanged = fillNativeTopicId(dsPre.session, scope, parsed.threadId);
-      if (!ctx.completionProposalContinuation) dsPre.session.quoteTargetId = parsed.messageId;
-      dsPre.session.quoteTargetSenderOpenId = callerOpenId;
-      dsPre.session.quoteTargetSenderIsBot = isForeignBot;
+      const nativeTopicChanged = !ctx.crossChatThreadFollowUp && fillNativeTopicId(dsPre.session, scope, parsed.threadId);
+      if (!ctx.completionProposalContinuation && !ctx.crossChatThreadFollowUp) {
+        dsPre.session.quoteTargetId = parsed.messageId;
+        dsPre.session.quoteTargetSenderOpenId = callerOpenId;
+        dsPre.session.quoteTargetSenderIsBot = isForeignBot;
+      }
       const substituteReplyMode = substituteTrigger
         ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
         : 'thread';
@@ -29737,8 +30969,9 @@ async function handleThreadReplyAdmitted(
         inThread: !!parsed.threadId,
         foldedRootId: ctx.foldedRootId,
         sourceMessageId: parsed.messageId,
+        ...(crossChatOrigin ? { crossChatOrigin } : {}),
       });
-      if (callerOpenId) dsPre.session.lastCallerOpenId = callerOpenId;
+      if (callerOpenId && !ctx.crossChatThreadFollowUp) dsPre.session.lastCallerOpenId = callerOpenId;
       publishLastInputFromBotPatch(dsPre);
       if (dsPre.session.vcMeetingReceiver) {
         dsPre.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
@@ -29764,7 +30997,7 @@ async function handleThreadReplyAdmitted(
       return;
     }
   }
-  if (dsPre && fillNativeTopicId(dsPre.session, scope, parsed.threadId)) {
+  if (dsPre && !ctx.crossChatThreadFollowUp && fillNativeTopicId(dsPre.session, scope, parsed.threadId)) {
     sessionStore.updateSession(dsPre.session);
     publishNativeTopicLinkPatch(dsPre);
   }
@@ -29787,7 +31020,9 @@ async function handleThreadReplyAdmitted(
   }
 
   // Quota/talk gate runs before any side effect below (continuity resume/close,
-  // initial-start claim).
+  // initial-start claim). Revalidate the source after any earlier async work so
+  // a stale lifecycle cannot be charged or admitted after the anchor was queued.
+  if (!crossChatFollowUpIsCurrent(ctx)) return;
   const quotaSenderOpenId = threadSenderOpenId;
   if (!prepared?.quotaChecked && !await enforceMessageQuotaForCliInput(
     larkAppId,
@@ -29799,10 +31034,22 @@ async function handleThreadReplyAdmitted(
     threadSenderUnionId,
     ctxChatType,
     isBotSenderType || isForeignBot,
-    { promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
+    {
+      senderAppId: threadTeamTrustAppId,
+      promptContent: parsed.content,
+      promptAttachments: resources.map(r => ({ type: r.type, name: r.name })),
+      ...(ctx.crossChatThreadFollowUp
+        ? {
+            crossChatFollowedThreadAuthorized: true,
+            crossChatFollowedChatId: ctx.crossChatThreadFollowUp.followedChatId,
+            crossChatFollowedRootMessageId: ctx.crossChatThreadFollowUp.followedRootMessageId,
+          }
+        : {}),
+    },
   )) {
     return;
   }
+  if (!crossChatFollowUpIsCurrent(ctx)) return;
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // Topic session continuity (core/topic-session-continuity.ts). A topic whose
   // session was closed used to get a brand-new CLI session on the next message,
@@ -29956,19 +31203,22 @@ async function handleThreadReplyAdmitted(
     }
   }
 
+  if (!crossChatFollowUpIsCurrent(ctx)) return;
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // Update last message time + last caller (used by `botmux send` to address
   // reply cards to whoever triggered this turn — matters in oncall groups
   // where the caller is often not the session owner).
   const callerOpenId = inboundSenderOpenId;
   if (ds) {
-    markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot });
+    markSessionActivity(ds, Date.now(), { human: parsed.senderType === 'user' && !isForeignBot && !ctx.crossChatThreadFollowUp });
     // quoteTargetId changes every inbound message (always a new message_id), so
     // — unlike lastCallerOpenId — persist unconditionally. Powers `botmux send`'s
     // default chat-scope quote chain + --mention-back.
-    if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId;
-    ds.session.quoteTargetSenderOpenId = callerOpenId;
-    ds.session.quoteTargetSenderIsBot = isForeignBot;
+    if (!ctx.completionProposalContinuation && !ctx.crossChatThreadFollowUp) {
+      ds.session.quoteTargetId = parsed.messageId;
+      ds.session.quoteTargetSenderOpenId = callerOpenId;
+      ds.session.quoteTargetSenderIsBot = isForeignBot;
+    }
     publishLastInputFromBotPatch(ds);
     if (ds.session.vcMeetingReceiver) {
       ds.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
@@ -29990,8 +31240,18 @@ async function handleThreadReplyAdmitted(
     // on the double-race (matches the new-topic path's collectPostAtMentions args).
     const existingPostAt = prepared?.postParticipantMentions ?? collectPostAtMentions(data?.message, ctx.forwardSeedData?.message);
     const existingWindow = buildTurnParticipants(larkAppId, callerOpenId, senderIsBotTriState(parsed.senderType, isForeignBot), parsed.mentions, undefined, existingPostAt);
-    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), { quoteOnly: substituteReplyMode === 'quote', substitute: !!substituteTrigger, senderOpenId: callerOpenId, participants: existingWindow.participants, participantsIncomplete: existingWindow.incomplete, inThread: !!parsed.threadId, foldedRootId: ctx.foldedRootId, sourceMessageId: parsed.messageId });
-    if (callerOpenId && ds.session.lastCallerOpenId !== callerOpenId) {
+    beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), {
+      quoteOnly: substituteReplyMode === 'quote',
+      substitute: !!substituteTrigger,
+      senderOpenId: callerOpenId,
+      participants: existingWindow.participants,
+      participantsIncomplete: existingWindow.incomplete,
+      inThread: !!parsed.threadId,
+      foldedRootId: ctx.foldedRootId,
+      sourceMessageId: parsed.messageId,
+      ...(crossChatOrigin ? { crossChatOrigin } : {}),
+    });
+    if (callerOpenId && !ctx.crossChatThreadFollowUp && ds.session.lastCallerOpenId !== callerOpenId) {
       ds.session.lastCallerOpenId = callerOpenId;
     }
     sessionStore.updateSession(ds.session);
@@ -30040,6 +31300,7 @@ async function handleThreadReplyAdmitted(
     messageListener: !!ctx.messageListener,
     vcMeetingReceiver: ds?.session.vcMeetingReceiver !== undefined,
     vcMeetingImTurnOrigin: !!ctx.vcMeetingImTurnOrigin,
+    crossChatFollowUp: !!ctx.crossChatThreadFollowUp,
   });
 
   const liveTakeoverReady = !!ds?.worker && !ds.worker.killed
@@ -30061,17 +31322,20 @@ async function handleThreadReplyAdmitted(
       build: async () => {
         const tailBot = getBot(ds.larkAppId);
         const botCfg = tailBot.config;
+        const tailCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
+        const traexRpcContext = traexRpcContextForSession(ds, tailCliId);
         // solo 必须在构造信封之前解析：transcript 下 solo 决定是否去掉
         // <user_message> 壳与 <sender/> 标签。
         const tailSender = await getThreadSender();
+        stageStructuredLarkTurn(ds, parsed, attachments, tailSender?.name);
         await resolveSoloSessionForTurn(ds, ctxChatType, tailSender);
         if (effortSessionIsCurrent && !effortSessionIsCurrent()) throw new Error('Effort task session changed during queued activation preparation');
         const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
+          messageLocation: buildTurnMessageLocation(ds),
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
-          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+          cliId: tailCliId,
           cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? botCfg.cliPathOverride,
           sender: tailSender,
           solo: ds.soloSession,
@@ -30081,12 +31345,14 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          acceptedInput: ctx.acceptedInput,
           codexAppApplicationContext,
           codexAppMessageContext,
           sessionBackendType: ds.session.backendType,
           promptInjection: sessionPromptInjection(ds),
           turnId: parsed.messageId,
           linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+          ...(traexRpcContext ? { traexRpcContext } : {}),
         });
         // R5-B1-1: freeze the admission-time steer authorization onto this earliest
         // (initialStartPending follower) tail entry — the strip-proof admit rebuild
@@ -30114,6 +31380,7 @@ async function handleThreadReplyAdmitted(
     // synthetic opening turn from an empty pendingPrompt (a non-empty new-topic
     // envelope), which would be accepted as a fresh dispatch and overtake the
     // promoted old head — the exact defect this recovery must avoid.
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     if (ds.quarantinedActivationTailPromotion && (!ds.worker || ds.worker.killed)) {
       if (forkWorker(ds, '', true)) {
         logger.info(`[${tag(ds)}] Quarantined activation-tail promotion recovered on inbound; cold-forked promoted head`);
@@ -30158,10 +31425,8 @@ async function handleThreadReplyAdmitted(
     const followUpSender: import('./im/lark/identity-cache.js').ResolvedSender | undefined = callerOpenId
       ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
       : undefined;
-    if (!zeroInjection) enriched = `${renderInboundMessageLocation({
-      messageId: parsed.messageId,
-      ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}),
-    })}\n${enriched}`;
+    stageStructuredLarkTurn(ds, parsed, attachments, followUpSender?.name);
+    if (!zeroInjection) enriched = `${renderInboundMessageLocation(buildTurnMessageLocation(ds))}\n${enriched}`;
     const hadBufferedFollowUps = (ds.pendingFollowUps?.length ?? 0) > 0;
     const sameInitialCaller = !!followUpSender?.openId
       && followUpSender.openId === ds.pendingSender?.openId;
@@ -30189,8 +31454,10 @@ async function handleThreadReplyAdmitted(
         // durable opening instead of an impossible successor to an empty ACK.
         ds.pendingPrompt = promptContent;
         ds.pendingTurnId = parsed.messageId;
+        ds.pendingStructuredOpeningTurnId = parsed.messageId;
         ds.pendingTrustedCaller = threadTrustedCaller;
         ds.pendingCodexAppText = parsed.content;
+        ds.pendingAcceptedInput = ctx.acceptedInput;
         ds.pendingCodexAppApplicationContext = codexAppApplicationContext;
         ds.pendingCodexAppMessageContext = codexAppMessageContext;
         ds.pendingAttachments = attachments.length > 0 ? attachments : undefined;
@@ -30213,14 +31480,16 @@ async function handleThreadReplyAdmitted(
       } else {
         const pendingBot = getBot(ds.larkAppId);
         const botCfg = pendingBot.config;
+        const pendingCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
+        const traexRpcContext = traexRpcContextForSession(ds, pendingCliId);
         // 此分支是 pending 首个 worker 的同步屏障，不能 await 网络（见上方注释），
         // 所以不重算 solo，沿用会话注册时算好的 ds.soloSession。
         const exactFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
+          messageLocation: buildTurnMessageLocation(ds),
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
-          cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+          cliId: pendingCliId,
           cliPathOverride: ds.session.cliPathOverride ?? botCfg.cliPathOverride,
           sender: followUpSender,
           larkAppId,
@@ -30228,6 +31497,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          acceptedInput: ctx.acceptedInput,
           codexAppApplicationContext,
           solo: ds.soloSession,
           selfMention: { name: pendingBot.botName, openId: pendingBot.botOpenId },
@@ -30236,6 +31506,7 @@ async function handleThreadReplyAdmitted(
         promptInjection: sessionPromptInjection(ds),
         turnId: parsed.messageId,
         linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+        ...(traexRpcContext ? { traexRpcContext } : {}),
         });
         ds.session.queuedPrompt ??= ds.pendingPrompt;
         ds.session.queuedCodexAppText ??= ds.pendingCodexAppText;
@@ -30330,6 +31601,10 @@ async function handleThreadReplyAdmitted(
   if (!ds) {
     if (ctx.completionProposalContinuation) {
       logger.warn('[completion-proposal] source session disappeared before continuation admission; refusing auto-create');
+      return;
+    }
+    if (ctx.crossChatThreadFollowUp) {
+      logger.warn('[cross-chat-thread] source session disappeared before follow-up admission; refusing auto-create');
       return;
     }
     // No active session at this anchor — auto-create. This branch is mostly a
@@ -30441,6 +31716,10 @@ async function handleThreadReplyAdmitted(
     // pendingSender for the deferred spawn.
     const autoCreateSender = await getThreadSender();
     setDirectChatDisplayNameFromSender(session, autoCreateChatType, autoCreateSender);
+    // Hoisted for the same reason as promptContent/parsed below: the isolated
+    // newDs-literal eval in test/new-topic-lark-caller.test.ts only binds
+    // locals, never the RoutingContext, so it cannot see a bare `ctx` reference.
+    const autoCreateAcceptedInput = ctx.acceptedInput;
     const newDs: DaemonSession = {
       session,
       worker: null,
@@ -30459,6 +31738,7 @@ async function handleThreadReplyAdmitted(
       pendingPrompt: promptContent,
       pendingTurnId: parsed.messageId,
       pendingCodexAppText: parsed.content,
+      pendingAcceptedInput: autoCreateAcceptedInput,
       pendingCodexAppApplicationContext: codexAppApplicationContext,
       pendingCodexAppMessageContext: codexAppMessageContext,
       pendingAttachments: attachments.length > 0 ? attachments : undefined,
@@ -30517,6 +31797,8 @@ async function handleThreadReplyAdmitted(
     mirrorDurableSessionShadow(newDs.session);
     // transcript 模式的 solo 判定（同 handleNewTopicAdmitted）：fork 前算好。
     await resolveSoloSessionForTurn(newDs, autoCreateChatType, autoCreateSender);
+    stageStructuredLarkTurn(newDs, parsed, attachments, autoCreateSender?.name);
+    newDs.pendingStructuredOpeningTurnId = parsed.messageId;
     if (newDs.pendingRepo) {
       stageClaimedPendingRepoSetup(activeSessions, newDs, {
         mode: autoWt ? 'auto_worktree' : 'picker',
@@ -30726,10 +32008,12 @@ async function handleThreadReplyAdmitted(
     const wantsOpening = !isBridge && isInitialUserTurnPending(ds);
     const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
     const turnSender = await getThreadSender();
+    stageStructuredLarkTurn(ds, parsed, attachments, turnSender?.name);
     // transcript 模式按轮重算 solo（bridge 会话本就是裸文本，跳过）。
     if (!isBridge) await resolveSoloSessionForTurn(ds, ctxChatType, turnSender);
     if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
     const openingTurn = wantsOpening && claimInitialUserTurn(ds);
+    const traexRpcContext = traexRpcContextForSession(ds, effectiveCliId);
     const cliInput = isBridge
       ? { content: buildGroupContextBridgeInput(promptContent, ds.session.sessionId, {
           larkAppId, chatId: ds.chatId, turnId: parsed.messageId, cliId: effectiveCliId,
@@ -30757,6 +32041,7 @@ async function handleThreadReplyAdmitted(
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
             codexAppText: parsed.content,
+            acceptedInput: ctx.acceptedInput,
             codexAppApplicationContext,
             codexAppMessageContext,
             // #794 后续：empty-start 首轮 opening 也走 hook 注入。turnId 与下方
@@ -30772,10 +32057,11 @@ async function handleThreadReplyAdmitted(
             promptInjection: sessionPromptInjection(ds),
             solo: ds.soloSession,
             selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
+            traexRpcContextEnabled: !!traexRpcContext,
           },
         )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
+          messageLocation: buildTurnMessageLocation(ds),
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -30787,6 +32073,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: parsed.content,
+          acceptedInput: ctx.acceptedInput,
           codexAppApplicationContext,
           codexAppMessageContext,
           solo: ds.soloSession,
@@ -30795,6 +32082,7 @@ async function handleThreadReplyAdmitted(
         promptInjection: sessionPromptInjection(ds),
         turnId: parsed.messageId,
         linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+        ...(traexRpcContext ? { traexRpcContext } : {}),
         });
     if (!ctx.completionProposalContinuation) {
       await noteTurnReceived(ds, parsed.messageId, parsed.content, turnSender, parsed.messageId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -30818,6 +32106,7 @@ async function handleThreadReplyAdmitted(
     // covers routing/materialisation and therefore cannot protect the mutable
     // worker turn marker after this handler returns.  Persist the final payload
     // behind the active turn instead of exposing B2 to B1's worker process.
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     if (ds.session.principalLane && threadTrustedCaller
         && (ds.principalLaneRunningTurn
           || ds.activeInteractiveTurn
@@ -30986,6 +32275,11 @@ async function handleThreadReplyAdmitted(
     ds.completedIdleTurnId = undefined;
     ds.failedIdleTurnId = undefined;
     ds.currentTurnId = parsed.messageId;
+    // A suspended/exited worker is the usual way back to a session, so this
+    // turn must also take the「下一步」row off the previous turn's card;
+    // otherwise that row stays clickable and this turn's own row is refused
+    // as belonging to an older turn.
+    noteReplyCardTurnStarted(ds, parsed.messageId);
     ds.currentImageKey = undefined;
     persistStreamCardState(ds);
     // Wrap the user message in the same `<user_message>` / `<session_id>` /
@@ -31013,13 +32307,16 @@ async function handleThreadReplyAdmitted(
           : {}),
         build: async () => {
           const stagedSender = await getThreadSender();
+          stageStructuredLarkTurn(ds, parsed, attachments, stagedSender?.name);
           await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);
+          const currentCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId;
+          const traexRpcContext = traexRpcContextForSession(ds, currentCliId);
           const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
-          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
+            messageLocation: buildTurnMessageLocation(ds),
             attachments,
             mentions: parsed.mentions,
             isAdoptMode: false,
-            cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? dsBotCfgForFork.cliId,
+            cliId: currentCliId,
             cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride ?? ds.session.cliPathOverride ?? dsBotCfgForFork.cliPathOverride,
             sender: stagedSender,
             solo: ds.soloSession,
@@ -31029,12 +32326,14 @@ async function handleThreadReplyAdmitted(
             whiteboardId: ds.session.whiteboardId,
             substituteTrigger,
             codexAppText: parsed.content,
+            acceptedInput: ctx.acceptedInput,
             codexAppApplicationContext,
             codexAppMessageContext,
             sessionBackendType: ds.session.backendType,
             promptInjection: sessionPromptInjection(ds),
             turnId: parsed.messageId,
             linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+            ...(traexRpcContext ? { traexRpcContext } : {}),
           });
           // R4-B1: freeze the admission-time steer authorization onto the queued
           // opening payload so the worker-null re-fork path carries it exactly like
@@ -31061,6 +32360,7 @@ async function handleThreadReplyAdmitted(
     // Codex App may retain an ACK journal/FIFO head after its worker dies. A
     // new inbound turn wakes a pure recovery fork first; it stays in the exact
     // runtime tail until that recovered head produces its submission ACK.
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     if (ds.session.queuedActivationPending) {
       await stageCurrentBehindQueuedActivation();
       try {
@@ -31107,6 +32407,7 @@ async function handleThreadReplyAdmitted(
     const retainedQueuedActivation = ds.session.queued === true
       ? ds.session.queuedActivationInput
       : undefined;
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     if (retainedQueuedActivation) {
       await stageCurrentBehindQueuedActivation();
       try {
@@ -31140,8 +32441,7 @@ async function handleThreadReplyAdmitted(
     // behind its unopened N. Appending this inbound to N would overtake those
     // persisted entries. Keep N exact and append the current turn after the
     // existing tail before starting the activation journal.
-    const queuedHasDurableTail = queuedDashboardTurn
-      && (ds.session.queuedActivationTail?.length ?? 0) > 0;
+    const queuedHasDurableTail = queuedOpeningHasTail(ds.session, ctx.acceptedInput);
     if (queuedHasDurableTail) await stageCurrentBehindQueuedActivation();
     const reforkContent = queuedDashboardTurn && !queuedHasDurableTail
       ? `${ds.session.queuedPrompt}\n\n${promptContent}`
@@ -31163,6 +32463,7 @@ async function handleThreadReplyAdmitted(
     const wantsOpening = !ds.adoptedFrom && !queuedDashboardTurn && isInitialUserTurnPending(ds);
     const openingBots = wantsOpening ? await getAvailableBots(larkAppId, ds.chatId) : undefined;
     const reforkSender = await getThreadSender();
+    stageStructuredLarkTurn(ds, parsed, attachments, reforkSender?.name);
     // transcript 模式按轮重算 solo：refork 走 worker-pool init 冻结 solo，且
     // buildReforkCliInput / buildNewTopicCliInput 都据 ds.soloSession 去壳。
     if (!ds.adoptedFrom) await resolveSoloSessionForTurn(ds, ctxChatType, reforkSender);
@@ -31201,6 +32502,7 @@ async function handleThreadReplyAdmitted(
           whiteboardId: ds.session.whiteboardId,
           substituteTrigger,
           codexAppText: reforkCodexApp.text,
+          acceptedInput: queuedHasDurableTail ? ds.pendingAcceptedInput : ctx.acceptedInput,
           codexAppApplicationContext,
           solo: ds.soloSession,
           selfMention: { name: selfBot.botName, openId: selfBot.botOpenId },
@@ -31225,10 +32527,12 @@ async function handleThreadReplyAdmitted(
         sender: queuedHasDurableTail ? undefined : reforkSender,
         substituteTrigger: queuedHasDurableTail ? undefined : substituteTrigger,
         codexAppText: reforkCodexApp.text,
+        acceptedInput: queuedHasDurableTail ? ds.pendingAcceptedInput : ctx.acceptedInput,
         codexAppApplicationContext: queuedHasDurableTail ? undefined : codexAppApplicationContext,
         codexAppMessageContext: reforkCodexApp.messageContext,
         turnId: parsed.messageId,
         linkRefSourceType: parsed.msgType === 'interactive' ? 'card' : 'user_message',
+        ...(!queuedHasDurableTail ? { messageLocation: buildTurnMessageLocation(ds) } : {}),
       });
       wrappedInput = applyQueuedCodexAppLegacyFallback(builtReforkInput, {
         queued: queuedDashboardTurn,
@@ -31291,6 +32595,7 @@ async function handleThreadReplyAdmitted(
         return;
       }
     }
+    if (!crossChatFollowUpIsCurrent(ctx)) return;
     try {
       // Adopt sessions must re-fork via forkAdoptWorker, NOT forkWorker: the
       // latter would spawn a fresh botmux-managed bmx-* CLI in the adopt cwd,
@@ -31483,6 +32788,7 @@ async function handleThreadReplyAdmitted(
  * 推迟、透传送进已有会话。返回 true 表示已处理，入口应直接 return。
  */
 interface ThreadSlashContext {
+  trustedCaller?: TrustedCaller;
   ctx: RoutingContext;
   data: any;
   larkAppId: string;
@@ -31500,6 +32806,7 @@ interface ThreadSlashContext {
   senderOpenId: string | undefined;
   senderUnionId: string | undefined;
   teamTrustUnionId: string | undefined;
+  teamTrustAppId: string | undefined;
   isBotSenderType: boolean;
   isForeignBotSender: boolean;
   substituteTrigger: RoutingContext['substituteTrigger'];
@@ -31507,7 +32814,8 @@ interface ThreadSlashContext {
 }
 
 async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
-  const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
+  const { ctx, data, larkAppId, scope, anchor, replyRootId, parsed, resources, cmdContent, routingChatId, chatType, chatId, senderOpenId, senderUnionId, teamTrustUnionId, teamTrustAppId, isBotSenderType, isForeignBotSender, substituteTrigger, getThreadSender } = slash;
+  ctx.acceptedInput = undefined;
   if (ctx.effortTaskReentry) return false;
   // Intercept daemon commands
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
@@ -31534,6 +32842,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       context: 'thread',
       phase: deriveSessionPhase(existingDs),
       sessionIsCommandScratch: !!existingDs && isResumeRecoveryPlaceholder(existingDs),
+      sessionHasBackendState: existingDs?.session.remoteBackendState !== undefined,
       passthrough: resolvePassthroughCommands(larkAppId, passthroughCliId),
       coldStartPassthrough: coldStartPassthroughCommands(larkAppId),
       senderIsBot: isBotSenderType || isForeignBotSender,
@@ -31543,7 +32852,9 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       cascadeCapable: !!existingDs && !isRemoteBackendSession(existingDs)
         && !existingDs.adoptedFrom && !existingDs.initConfig?.adoptMode,
       hasAttachments: resources.length > 0,
+      delegatedCommands: sessionDelegatedSlashCommands(getBot(larkAppId).config, existingDs, config.daemon.backendType),
       pluginCommands: pluginCommandsForRouting(larkAppId, cmdContent),
+      multilineCommands: multilineCommandsForRouting(larkAppId, cmdContent, parsed.mentions),
     });
   // 级联在飞：第二条级联 fail closed；普通正文与单条透传排在定序器之后重入（保序）；
   // botmux 自己的命令（/close /status …）照常放行。正文项的重入自带 cascadeBodyReentry 标记。
@@ -31575,6 +32886,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       anchor,
       messageId: parsed.messageId,
       replyRootId,
+      senderIsBot: isForeignBotSender,
     });
     const cascadeChatId = cascadeDs.chatId ?? chatId;
     // 与单条透传同一组闸，逐条命令过一遍：grant 限制、排队激活提交闸、/fast 后端门。
@@ -31631,8 +32943,9 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       senderOpenId,
       senderUnionId,
       teamTrustUnionId,
+      teamTrustAppId,
       botSender: isBotSenderType || isForeignBotSender,
-      deps: commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId }),
+      deps: commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId, senderIsBot: isForeignBotSender }),
     });
     return true;
   }
@@ -31640,7 +32953,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
   if (slashDecision && slashDecision.kind === 'forward' && slashDecision.reason === 'unknown_slash') {
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, existingDs?.chatId ?? chatId, senderOpenId, slashDecision.cmd);
     if (restrictedText) {
-      await commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId })
+      await commandDepsForInvocation({ scope, chatId: routingChatId, anchor, messageId: parsed.messageId, replyRootId, senderIsBot: isForeignBotSender })
         .sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
     }
@@ -31654,6 +32967,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       anchor,
       messageId: parsed.messageId,
       replyRootId,
+      senderIsBot: isForeignBotSender,
     });
     invocationDeps.submitEffortTask = async (ds, message, text) => {
       const committed = !!ctx.durablePrimaryDispatch && hasDurablePrimaryInputCommit(ds, message.messageId);
@@ -31713,6 +33027,16 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return true;
     }
+    if (slashDecision.kind === 'delegated_turn') {
+      ctx.acceptedInput = await admitDelegatedSlashTurn(slashDecision, {
+        authorized: canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType, teamTrustAppId),
+        primary: coordinationModeIsPrimary(),
+        caller: slash.trustedCaller,
+        larkAppId,
+        reply: text => invocationDeps.sessionReply(anchor, text, 'text', larkAppId),
+      });
+      return !ctx.acceptedInput;
+    }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'sessions') {
       const botSender = isBotSenderType || isForeignBotSender;
       if (!canTalkForGroupSessions(
@@ -31723,6 +33047,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         senderUnionId,
         chatType,
         botSender,
+        teamTrustAppId,
       )) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
@@ -31737,7 +33062,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       return true;
     }
     if (slashDecision.kind === 'special' && slashDecision.handler === 'vc-auth') {
-      if (!canOperate(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId)) {
+      if (!canOperateBotSender(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, teamTrustAppId)) {
         await invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
@@ -31788,6 +33113,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
           senderOpenId: senderOpenId,
           substitute: !!substituteTrigger,
           senderUnionId: teamTrustUnionId,
+          senderAppId: teamTrustAppId,
           memberUnionId: senderUnionId, // 原始 union（人腿），不锁 bot
           botSender: isBotSenderType || isForeignBotSender,
           // Reply attribution: platform-stamped OR cross-ref-resolved bot →
@@ -31857,7 +33183,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       // (see spawn-path gate above). Denies chat-granted users management commands.
       // canRunDaemonCommand：canTalkDaemonCommands 名单内的命令降到 canTalk，
       // 与 new-topic 路径的统一闸同款（未配置时与 canOperate 全等）。
-      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType)) {
+      if (!canRunDaemonCommand(larkAppId, effectiveThreadChatId, senderOpenId, teamTrustUnionId, cmd, senderUnionId, chatType, isBotSenderType || isForeignBotSender, isBotSenderType, teamTrustAppId)) {
         invocationDeps.sessionReply(anchor, tr('daemon.cmd_allowed_users_only', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
         return true;
       }
@@ -32457,6 +33783,7 @@ async function handleDocCommentAdmitted(ctx: DocCommentContext, routeRetry = 0):
       ds.completedIdleTurnId = undefined;
       ds.failedIdleTurnId = undefined;
       ds.currentTurnId = turnId;
+      noteReplyCardTurnStarted(ds, turnId);
       ds.currentImageKey = undefined;
       persistStreamCardState(ds);
       // Skip whiteboard ensure for adopted (bridge) sessions on re-fork — mirrors
@@ -33122,7 +34449,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const bot = getBot(record.larkAppId);
       const budget = bot?.config?.budget;
       if (!budget) return;
-      const alert = trackBudgetSpend(record.larkAppId, record.costCny, { budget });
+      const alert = trackBudgetSpend(record.larkAppId, record.costCny, { budget, occurredAt: new Date(record.ts), recordId: record.recordId });
       if (alert) {
         const ownerOpenId = getConfiguredOwnerOpenId(record.larkAppId);
         if (ownerOpenId) {
@@ -33817,8 +35144,31 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     onError: err => logger.warn(`[message-listener] Auto-close failed: ${err instanceof Error ? err.message : String(err)}`),
   });
   // Initialise worker pool with daemon callbacks
+  const ownerAlertDependencies = {
+    dataDir: config.session.dataDir,
+    ownerForApp: (appId: string) => resolveWorkerAdmissionOwner(appId, { getBot, getOwnerOpenId }),
+    botForApp: (appId: string) => ({ name: getBot(appId).botName ?? appId, locale: localeForBot(appId) }),
+    send: (appId: string, owner: string, content: string) => sendUserMessage(appId, owner, content, 'text', undefined, { timeoutMs: 10_000 }),
+    onError: (message: string) => logger.warn(`[owner-diagnostic] ${message}`),
+  };
+  const memoryAdmissionOwnerAlerts = new WorkerAdmissionOwnerAlerts(ownerAlertDependencies);
+  const workerOwnerDiagnostics = new WorkerOwnerDiagnostics(ownerAlertDependencies);
   initWorkerPool({
+    onOwnerDiagnostic: (ds, diagnostic) =>
+      workerOwnerDiagnostics.report(ds.larkAppId, ds.session.sessionId, diagnostic),
     larkAppId: cfg.larkAppId,
+    // Backend-outage summary: one DM per outage, to the bot's current owner
+    // (same resolution as the host-memory alert; apiOnly bots have no DM).
+    notifyOwner: async (appId, content) => {
+      const owner = resolveWorkerAdmissionOwner(appId, { getBot, getOwnerOpenId });
+      if (!owner) {
+        logger.warn(`[backend-outage] no owner to send the outage summary to for ${appId}`);
+        return;
+      }
+      await sendUserMessage(appId, owner, content, 'text', undefined, { timeoutMs: 10_000 });
+    },
+    onMemoryAdmissionBlocked: (ds, decision) =>
+      memoryAdmissionOwnerAlerts.report(ds.larkAppId, ds.session.sessionId, decision),
     sessionReply,
     onZeroPromptFinal: reportZeroPromptFinal,
     getSessionWorkingDir,
@@ -34105,6 +35455,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // handler — no unhandledRejection, and failures stay replayable.
       void handleIdentityDecisionFlip(ds, context).catch(error => {
         logger.error(`[trigger-user-auth] identity decision handler failed for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    },
+    onManagedTurnOrigin(ds, turnId) {
+      void restoreTurnCliIdentity(ds, turnId).catch(error => {
+        logger.error(`[trigger-user-auth] turn identity restore failed for ${ds.session.sessionId} turn=${turnId}: ${error instanceof Error ? error.message : String(error)}`);
       });
     },
     onCliExit(ds, context) {
@@ -35024,25 +36379,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
       beforeSessionTurn: (data, ctx) => maybeCatchUpVcMeetingConsumerBeforeTurn(data, ctx),
       isSessionOwner: (anchor, appId) => activeSessions.has(sessionKey(anchor, appId)),
-      resolveImportedTopicMentionlessHandoff: (rootId, chatId, appId) => resolveImportedTopicHandoff({
-        rootId,
-        chatId,
-        larkAppId: appId,
-        // One cross-bot lookup (this bot's own sessions are excluded inside).
-        sessionsAtRoot: sessionStore.findActiveSessionsByRoot(rootId),
-        chatScopeSessions: () => sessionStore.findActiveChatScopeSessionsByChat(chatId),
-        // One bot per daemon: a peer is not registered here, read bots.json.
-        peerConfig: peerAppId => {
-          try { return getBot(peerAppId).config; } catch { /* not this daemon's bot */ }
-          return loadBotConfigsCached().find(b => b.larkAppId === peerAppId);
-        },
-        groupMode: () => readGroupCollaborationMode(config.session.dataDir, chatId),
-      }),
+      resolveSubtopicMentionlessHandoff: (rootId, chatId, appId) =>
+        resolveManagedSubtopicMentionlessHandoff(subtopicHandoffDeps(), rootId, chatId, appId),
       resolveDurableSession: (ctx) => activeSessions.get(sessionKey(
         ctx.runtimeRoutingAnchor ?? ctx.anchor,
         ctx.larkAppId,
       ))?.session,
       resolveReplyThreadAlias: (rootId, chatId, appId) => findChatReplyAlias(rootId, chatId, appId),
+      resolveCrossChatFollowedThread: (rootIds, chatId, appId) => findCrossChatFollowedThread(rootIds, chatId, appId),
       chatSessionAnsweredRootAtTopLevel: (rootId, chatId, appId) => {
         for (const ds of activeSessions.values()) {
           if (ds.larkAppId !== appId || ds.scope !== 'chat' || ds.chatId !== chatId) continue;
@@ -35480,7 +36824,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   sendStartupWelcomeMessages(durableCoordinationRuntime?.mode ?? 'disabled');
   if (durableCoordinationRuntime?.mode === 'primary') {
     const deliverDurablePrimaryMessage = async (
-      request: DurableSessionSendRequest,
+      request: DurableSessionSendRequest, replyFileDigest?: string,
     ): Promise<DurableSessionSendResult> => {
       const runtime = durablePrimaryRuntimeByApp.get(request.daemonSession.larkAppId);
       if (!runtime) throw new Error('durable primary output runtime is unavailable');
@@ -35502,7 +36846,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         sessionKey: canonicalKey,
         larkAppId: request.daemonSession.larkAppId,
         target: request.target,
-        content: request.content,
+        content: replyFileDigest ? await durableReplyFileContent(durableCoordinationRuntime.store,
+          `out_${request.providerUuid}`, replyFileDigest, request.content) : request.content,
         msgType: request.msgType,
         providerUuid: request.providerUuid,
         hookContext: request.hookContext,
@@ -35548,8 +36893,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       hookContext: {
         sessionId: request.daemonSession.session.sessionId,
         turnId: request.turnId,
+        ...(request.replyFileDigest ? { replyFileDigest: request.replyFileDigest } : {}),
       },
-    }));
+    }, request.replyFileDigest));
     setDurableSessionSendHandler(deliverDurablePrimaryMessage);
     const quarantinedDashboardSessionKeys = new Set<string>();
     setDurableSessionListHandler(async () => {
@@ -35715,6 +37061,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 文档订阅恢复 + 评论轮询：都是主动调飞书文档 API 的路径。apiOnly（core-only）
   // bot 从不连飞书，且其合成身份不会有真实文档订阅——整块跳过，否则非 pristine
   // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
+  const ownerGroupFollower = cfg.apiOnly ? undefined : startOwnerGroupFollow(cfg.larkAppId, config.session.dataDir);
   let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
   let oncallHandoffTimer: ReturnType<typeof setInterval> | undefined;
   let oncallHandoffRunning = false;
@@ -35880,6 +37227,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const sessionOwnerReminder = new SessionOwnerReminderController({
     load: () => loadSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId),
     save: records => saveSessionOwnerReminderRecords(config.session.dataDir, cfg.larkAppId, records),
+    getQuietHours: () => getBot(cfg.larkAppId).config.sessionOwnerReminder?.quietHours,
     canSend: ds => larkTransportEnabled({
       chatId: ds.chatId,
       apiOnly: getBot(ds.larkAppId).config.apiOnly,
@@ -35997,6 +37345,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[v3] main-wake cold-attach failed: ${err instanceof Error ? err.message : String(err)}`);
   });
 
+  // The person a task runs as is present now and is not later: every creation route offers them what unattended runs will need.
+  // When the creating route holds the live turn of that same person, what the turn published says what they lack.
+  scheduler.setScheduleCreatedObserver((task, creatingTurn) => {
+    const appId = task.larkAppId ?? task.creatorLarkAppId;
+    const runnerOpenId = task.ownerOpenId;
+    if (!runnerOpenId || !appId) return;
+    const ds = creatingTurn ? findActiveBySessionId(creatingTurn.sessionId) : undefined;
+    const sameTurn = !!ds && ds.larkAppId === appId && ds.managedTurnOrigin?.callerOpenId === runnerOpenId
+      && ds.managedTurnOrigin.turnId === creatingTurn!.turnId
+      && identityStorageModelForDaemonSession(ds) === 'proven';
+    const identityTurnId = ds?.managedTurnOrigin?.identityTurnId ?? creatingTurn?.turnId;
+    void offerAuthorizationAtCreation({
+      botConfig: getBot(appId).config, openId: runnerOpenId,
+      locale: localeForBot(appId), sendDirect: privateNoticeSender(appId, task),
+      ...(sameTurn ? { published: tool => recallProvenIdentityContent(config.session.dataDir, creatingTurn!.sessionId, identityTurnId!, tool) } : {}),
+    });
+  });
+
   // Opt-in owner notifications (`schedule add --notify`); target and wording
   // are decided in schedule-until-done.ts. An unavailable transport must throw
   // (not return): the scheduler persists the once-per-streak marker only after
@@ -36018,6 +37384,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // missing larkAppId falls through to bot-0 as a legacy fallback).
   scheduler.setExecuteCallback(async (task, executionContext) => {
     const effectiveAppId = task.larkAppId ?? cfg.larkAppId;
+    if (scheduleAuthorityStore?.getRecord(effectiveAppId, task.id)?.state === 'active') {
+      try {
+        if (getBot(effectiveAppId).config.triggerUserAuth?.enabled) {
+          task = await backfillOwnerUnionId({
+            task,
+            larkAppId: effectiveAppId,
+            lookupUnionId: async (appId, openId) => {
+              const found = await resolveUnionIdFromOpenIdStrict(appId, openId);
+              return found.status === 'resolved' ? found.unionId : undefined;
+            },
+            record: scheduler.recordTaskOwnerUnionId,
+          });
+        }
+      } catch (error) {
+        logger.warn(`[scheduler] owner union_id backfill skipped for task ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     const authority = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
     if (!authority) {
       throw new Error('schedule authority record missing; refusing unregistered task');
@@ -36039,6 +37422,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             scheduleAuthorityStore?.getRecord(effectiveAppId, task.id), { runId: executionContext.runId }) },
       );
       task = authorized.task;
+    } else if (authority.kind === 'direct' && isTalkerScheduledTask(authority.task)) {
+      // A talk-only creator's task: the bot switch, the person's talk access
+      // and group membership are re-checked before the run may enter a queue.
+      await authorizeTalkerScheduleRun(task, authority, talkerScheduleRuntimeDeps(effectiveAppId),
+        { chatId: task.chatId, chatType: talkerScheduleChatType(task) });
     }
     let targetResults: ScheduleRunTargetResult[] | undefined;
     let precondition: ScheduledTaskPreconditionObservation = {
@@ -36334,6 +37722,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         projectCardRuntimeSync.notify(source.chatId);
       })
       .catch(() => logger.debug('[project] association projection pending; refresh can repair'));
+    if (findActiveBySessionId(event.sessionId)?.session.projectImportPending) {
+      void projectImports.tick().catch(() => logger.debug('[project] import recovery pending'));
+    }
   });
   // 子任务提醒：本 daemon 记下本轮结果或举手时，按群转给本机开着「子任务提醒」的管家
   // （本 bot 直接调用，其他 bot 走本机 IPC）。管家端防抖、重新核对、去重。
@@ -36475,8 +37866,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // it must NOT own host-wide fleet maintenance — auto-update could rewrite the
   // global botmux install and a detached `botmux restart` would tear down the
   // real fleet. Core-only manages only its own single process.
+  const botmuxUpdateNotifier = createBotmuxUpdateNotifier({
+    dataDir: config.session.dataDir,
+    larkAppId: cfg.larkAppId,
+    enabled: () => readGlobalConfig().maintenance?.notifyOnNewVersion === true,
+    ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+    send: async (notice, beforeWrite) => {
+      const card = buildBotmuxUpdateNoticeCard(notice, {
+        dashboardUrl: dashboardUrlForReport().url,
+        locale: localeForBot(cfg.larkAppId),
+      });
+      await sendUserMessage(cfg.larkAppId, notice.ownerOpenId, card, 'interactive', notice.uuid,
+        { timeoutMs: 15_000 }, { beforeWrite });
+    },
+    log: message => logger.info(`[botmux-update] ${message}`),
+  });
   if (idx === 0 && !coreOnly) {
     startMaintenance();
+    botmuxUpdateNotifier.start();
     startCliRuntimeUpdateMonitor({
       dataDir: config.session.dataDir,
       primaryLarkAppId: cfg.larkAppId,
@@ -36485,6 +37892,51 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       targets: configuredCodexUpdateTargets,
       sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
       log: (m) => logger.info(`[cli-update] ${m}`),
+    });
+    // tmux below TMUX_RECOMMENDED_MIN → owner DM with one-click upgrade and an
+    // owner-chosen server switch. Host-wide like the Codex monitor above.
+    startTmuxUpgradeMonitor({
+      dataDir: config.session.dataDir,
+      larkAppId: cfg.larkAppId,
+      ownerOpenId: () => resolvePrimaryOwnerOpenId(cfg.larkAppId),
+      isAdmin: (appId, openId) => isBotAdmin(appId, openId),
+      locale: () => localeForBot(cfg.larkAppId),
+      now: () => Date.now(),
+      tmuxBackendInUse: () => loadBotConfigs().some(b => (b.backendType ?? config.daemon.backendType) === 'tmux'),
+      socketName: () => preferredManagedTmuxSocket(),
+      probeFacts: probeTmuxFacts,
+      plan: (locale) => planTmuxUpgrade(defaultTmuxUpgradeProbe(detectPlatform()), {
+        locale,
+        debianCodename: readDebianCodename(() => readFileSync('/etc/os-release', 'utf8')),
+      }),
+      executeUpgrade: (plan, onLine, onSpawn) => {
+        const platform = detectPlatform();
+        return executeTmuxUpgrade(plan, {
+          platform,
+          run: spawnUpgradeCommand,
+          onLine,
+          onSpawn,
+          aptCandidates: () => defaultTmuxUpgradeProbe(platform).packageCandidates('apt'),
+          // Hosts no package manager can serve: botmux's own verified copy.
+          installPrebuilt: (line) => installManagedTmuxForHost(line),
+        });
+      },
+      onBinaryChanged: () => { refreshTmuxVersion(); },
+      sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive'),
+      updateCard: (messageId, card) => updateMessage(cfg.larkAppId, messageId, card),
+      isUpdateExpired: error => error instanceof MessageUpdateExpiredError
+        || error instanceof MessageWithdrawnError
+        || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
+      fanOutSuspend: fanOutTmuxSwitchSuspend,
+      killServer: killTmuxServer,
+      retireEmptyServer: retireEmptyTmuxServer,
+      sleep: (ms) => new Promise(resolve => setTimeout(resolve, ms)),
+      processStart: readProcessStartIdentity,
+      signalInstaller: (pid, signal) => {
+        try { process.kill(-pid, signal); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+      },
+      log: (m) => logger.info(`[tmux-upgrade] ${m}`),
     });
     // After an intentional restart, DM the owner a summary. Delayed a few
     // seconds so the dashboard process can publish its token first.
@@ -36762,6 +38214,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (result.worker) remoteRetiredWorkers.push(result.worker);
     }
 
+    memoryAdmissionOwnerAlerts.dispose();
+    workerOwnerDiagnostics.dispose();
     scheduler.stopScheduler();
 
     // Settle live CoT thinking bubbles as「因重启中断」BEFORE tearing anything
@@ -36795,6 +38249,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     await (await import('./services/constrained-invocation/daemon.js')).closeConstrainedInvocations();
     await waitAllWithin([stopInputCaptureRuntimes()], shutdownDeadlineMs);
     stopMaintenance();
+    botmuxUpdateNotifier.stop();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);
     for (const timer of vcMeetingReceiverRecoveryTimers.values()) clearTimeout(timer);
@@ -36809,6 +38264,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     stopCliRuntimeUpdateMonitor();
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
+    ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
     oncallHandoffStopped = true;
     clearInterval(oncallHandoffTimer);
@@ -37099,6 +38555,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(longTaskReminderTimer);
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
+    ownerGroupFollower?.stop();
     clearInterval(docCommentPollTimer);
     oncallHandoffStopped = true;
     clearInterval(oncallHandoffTimer);

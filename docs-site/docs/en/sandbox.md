@@ -166,7 +166,7 @@ A bot with a launch prefix (`wrapperCli`) can also be sandboxed (pty / tmux back
 
 - **Codex isolated login (`codexAuthSync: "isolated"`)**: points `CODEX_HOME` at `<BOTMUX_HOME>/bots/<appId>/codex` and never reads or touches the global `~/.codex`. Works with the sandbox off or in allowlist isolation; it **cannot be combined with `scratch` or `wrapperCli`** (the session refuses to start). When a session is bound to a non-legacy Codex instance, the instance's own auth mode applies.
 - **Codex `config.toml`**: when Codex uses the bot's own directory (allowlist isolation, or `codexAuthSync: "isolated"`; not under scratch or with `wrapperCli`), the `config.toml` in it is copied once from the host's `~/.codex/config.toml` when the first new session starts; later host edits are not synced. The Dashboard (next to "Codex login credentials") shows the path and offers **Re-sync from host** (the current file is backed up as `config.toml.bak-<time>` first), effective for the next new session.
-- **Claude per-bot accounts (`credentialsSourceDir`)**: a sandboxed bot takes its OAuth credentials from this directory on every cold start, so sandboxed bots never share an account by accident. No effect on bots without a sandbox; cannot be combined with `codexAuthSync: "isolated"`.
+- **Claude per-bot accounts (`credentialsSourceDir`)**: a `claude-code` bot takes its OAuth credentials from this directory on every cold start, with allowlist isolation (`oncall`) or the sandbox off. An unsandboxed bot therefore switches to its own CLI data directory, without adding file access restrictions. Cannot be combined with `codexAuthSync: "isolated"` or `scratch`.
 - **lark-cli**: the sandbox hides the shared `~/.lark-cli`. To use lark-cli inside the sandbox, the machine must first split lark-cli config per bot; see [lark-cli per-bot config](https://github.com/deepcoldy/botmux/blob/master/docs/lark-cli-per-bot.md) (Chinese).
 
 #### Several accounts on one machine: a separate account for a Claude bot {#credentials-source-dir}
@@ -186,7 +186,7 @@ By default every sandboxed bot on a machine takes its credentials from the share
 
 Limits:
 
-- **Only `claude-code` is supported for now**, and the bot must have the file sandbox on. On a bot with no sandbox at all it has no effect (the global login is still used and a warning is logged); with the sandbox on but the data directory not redirectable (for example with `wrapperCli`), the session refuses to start.
+- **Only `claude-code` is supported for now**, with allowlist isolation (`oncall`) or the sandbox off; `scratch` refuses to start. With the sandbox off, the CLI data directory moves to `<BOTMUX_HOME>/bots/<appId>/claude`, without adding file access restrictions. Existing transcripts and memory do not move; global `settings.json` contributes only `env`, while `CLAUDE.md`, skills and plugins are not carried over. If the data directory cannot be redirected (for example with `wrapperCli`), the session also refuses to start.
 - If the source directory is missing, unreadable or holds invalid credentials, the session **refuses to start** instead of quietly falling back to the shared login.
 - Cannot be combined with `codexAuthSync: "isolated"`. For separate Codex accounts use `codexAuthSync: "isolated"`, see the item above.
 - botmux only copies on cold start and **does not refresh** the tokens in the source directory; keeping them valid is up to you (or an external script).
@@ -296,15 +296,36 @@ Other limits:
 
 ## What works inside the sandbox, and what does not
 
-### `botmux send` still works, credentials stay outside
+### `botmux send` still works
 
-When the CLI inside the sandbox calls `botmux send` to post text, cards, images or files, it never gets Lark credentials. The request is written to a session-private relay directory and the daemon outside the sandbox sends it. **The Lark App Secret never enters the sandbox.**
+On Linux, when the CLI inside the sandbox calls `botmux send` to post text, cards, images or files, the request is written to a session-private relay directory and the daemon outside the sandbox sends it. On macOS the allowlist sandbox by default calls Lark itself, after the daemon confirms this turn's origin.
+
+Note: by default the allowlist sandbox **can read** this bot's own Lark App Secret (`<BOT_HOME>/send-cred.json`); `botmux history`, `botmux quoted` and similar commands use it to call Lark directly. Anyone who can steer the agent can therefore have it trade the secret for an app-identity token and skip every daemon-side check. Turn on `sandboxWithholdBotSecret` below if that is not acceptable.
 
 Sending somewhere other than the current topic (`--top-level` for the group's top level, `--chat-id` for another group, `--into` for another message's thread) also works, but the daemon re-checks the destination:
 
 - The session's own chat is always allowed;
 - Any other chat must be a regular group (not a DM, not an external chat) that the bot is in, and the person who sent this turn's message (or the session owner when there is none) must be a member there and allowed to talk to the bot;
 - If any of this cannot be confirmed, the send is refused.
+
+### Keep the bot secret out of the sandbox (`sandboxWithholdBotSecret`) {#withhold-bot-secret}
+
+```json
+"sandbox": "oncall",
+"sandboxWithholdBotSecret": true
+```
+
+When on:
+
+- The sandbox cannot read `send-cred.json`, so the agent never sees this bot's App Secret and cannot mint an app-identity token;
+- `botmux send`, `botmux dispatch`, `botmux history` and `botmux quoted` are written to the session relay directory and executed by the daemon outside the sandbox. This also gives macOS the same relay Linux has;
+- For `history` the daemon always reads the current session; for `quoted` the message must be in this session's chat or it is refused. Images and files from a quoted message are downloaded by the daemon and handed back inside the session relay directory;
+- Relayed `history` supports only `--limit` (at most 100), `--scope` and `--with-card-json`; `quoted` reads one message per call and supports `--raw`. Other options are refused;
+- Other host processes' arguments and environment are hidden from the sandbox (on macOS, process-info on other processes and `kern.procargs` sysctls are denied);
+- This bot's attachment directory `attachments/<appId>` becomes read-only inside the sandbox (incoming attachments stay readable; all writes are done by the daemon);
+- The session's `lark-cli` bot identity (the default and `--as bot`) is unavailable; `--as user` keeps working. Other commands that need to call Lark directly from the sandbox (for example `botmux bots list`) fail.
+
+Applies to the allowlist sandbox (`oncall`) only; scratch is unaffected. Like the other sandbox options it is fixed when a session is created, so a change applies to new sessions.
 
 ### Fleet commands belong on the host
 
@@ -345,7 +366,8 @@ The Linux sandbox relies on kernel namespaces, which Docker-style containers and
 Notes:
 
 - **Which bwrap**: the distro binary at `/usr/bin/bwrap` or `/bin/bwrap` is preferred; only when neither exists is a bwrap from `PATH` used, with a one-time warning in the log. Codex installs its own build at `~/.local/bin/bwrap`; when that comes first, sandboxed sessions exit right after launch. Install the distro `bubblewrap` package to fix it.
-- **Symlinked system directories**: when a directory such as `/opt` is itself a symlink, the sandbox recreates the same symlink inside and mounts the real path read-only.
+- **A setuid system bwrap** (such as Debian 10's `/usr/bin/bwrap` 0.3.1) creates the sandbox's user namespace as root. When botmux runs as an ordinary user, the kernel then refuses it the sandboxed CLI process's `/proc/<pid>/fd`, even under the same uid. TRAE (`traex`) identifies its session from the kernel lock table `/proc/locks` instead, so replies are still collected; other CLIs that locate their transcript through the files their process has open may not get their replies collected on such a host — the notice in the thread then says "permission denied", and the worker log names the process and the cause. There is no need to remove the setuid bit or loosen kernel settings for this, and you should not.
+- **Symlinked system directories**: when `/opt`, `/usr` or `/etc` is itself a symlink, the sandbox recreates the same symlink inside. If the real path is a directory of the same name (`/opt -> /data00/opt`), it is mounted read-only as before; if it points anywhere else (such as the root of a data disk, `/opt -> /data00`), only the link is recreated and the target is not granted — just the working directory, the CLI runtime and whatever `sandboxPaths` grants explicitly are visible under it, so the baseline `/opt` grant never exposes a whole disk. Add the toolchain subdirectories a session needs from `/opt` to `sandboxPaths.readOnly`.
 - **No downgrade by dropping PID isolation**: other bots' processes on the same host hold plaintext credentials in their environment, which a sandbox without PID isolation could read through `/proc`. So a normal deployment refuses to start when procfs cannot be mounted (only the core-only deployment `BOTMUX_CORE_ONLY=1` allows it).
 
 botmux **never** falls back to running the CLI unsandboxed; it refuses to start the session instead. Common messages:
@@ -400,5 +422,5 @@ No single layer covers everything; combine them as needed:
 | File sandbox: allowlist isolation | Reads and writes outside the allowlist; credentials, other repositories, other bots' data; the Claude family's and Codex's data directories are split per bot | Writes to allowlisted paths (including the working directory) reach the host directly, and with `workingDir` at its default `~` the whole home directory is allowlisted; other CLIs keep their global host data directory; network is not restricted by default; sessions of the same bot share its model account and CLI data directory | `sandbox: "oncall"` + `sandboxPaths` |
 | File sandbox: scratch | Writes (kept in a throwaway copy); botmux's own credentials | Reads: most host files are readable, including other people's tokens; on macOS, cache / preference and system temp dirs still write to the real disk; network is not restricted by default | `sandbox: "scratch"` + `scratchStorage` |
 | Per-person tool credentials | lark-cli and other managed tools run with the **current message sender's** own authorization and are refused when that person has not authorized, never borrowing the owner's or anyone else's login | Model account, file access and other unmanaged tools still use the machine / bot identity | `triggerUserAuth`; personal Lark authorization via `/login`, other managed tools reply with an authorization link when needed |
-| Model account | Different bots use different model accounts (Claude: `credentialsSourceDir`, sandbox required; Codex: `codexAuthSync: "isolated"`) | Split per bot, not per person: everyone using the same bot shares one model account | The corresponding `bots.json` fields |
+| Model account | Different bots use different model accounts (Claude: `credentialsSourceDir`, with `oncall` or the sandbox off; Codex: `codexAuthSync: "isolated"`) | Split per bot, not per person: everyone using the same bot shares one model account | The corresponding `bots.json` fields |
 | OS user | System-level file permissions, processes and home directories are fully separate | botmux does not provide this layer: every bot and session under one daemon runs as the same system user | Deploy a separate botmux per system user (each with its own `~/.botmux`) |

@@ -74,9 +74,8 @@ export interface CredentialGrantClientOptions {
 }
 
 /**
- * ByteCloud JWTs are partition-scoped: the default (cn) one is refused by the
- * overseas partitions. A bytedcli grant asks for one per partition by naming
- * them in the request ({@link CLOUD_JWT_REGIONS_FIELD}), and the platform
+ * A bytedcli grant names the requested ByteCloud partitions in
+ * {@link CLOUD_JWT_REGIONS_FIELD}, and the platform
  * returns each one it minted under these variable names.
  *
  * Asked for, not just accepted: a daemon from before these names rejects the
@@ -87,6 +86,7 @@ export const BYTEDCLI_REGIONAL_GRANT_VARIABLES = {
   i18n: 'BYTEDCLI_USER_CLOUD_JWT_I18N',
   i18nbd: 'BYTEDCLI_USER_CLOUD_JWT_I18NBD',
   tx: 'BYTEDCLI_USER_CLOUD_JWT_TX',
+  cn: 'BYTEDCLI_USER_CLOUD_JWT_CN',
 } as const;
 export type BytedcliGrantRegion = keyof typeof BYTEDCLI_REGIONAL_GRANT_VARIABLES;
 const BYTEDCLI_GRANT_REGIONS = Object.keys(BYTEDCLI_REGIONAL_GRANT_VARIABLES) as BytedcliGrantRegion[];
@@ -213,7 +213,7 @@ function classify(status: number, json: unknown, platformUrl: string): Credentia
  *  abort the request then. The socket's own timeout is an IDLE timeout: a peer
  *  that trickles bytes never trips it, and without the abort the retry would
  *  leave the first request still running against the platform. */
-function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+export function withHardTimeout<T>(run: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
@@ -273,6 +273,9 @@ async function requestCredentialGrantInner(
     sessionId: req.sessionId,
     ...(req.turnId ? { turnId: req.turnId } : {}),
     machineId: binding.machineId,
+    // A platform that predates machine consent ignores the field and keeps
+    // answering `not_teammate` for a sender outside the owner's teams.
+    machineConsent: true,
     // A platform that predates regional tokens ignores the field (it reads
     // only the fields it knows) and answers with the default token alone.
     ...(req.tool === 'bytedcli' ? { [CLOUD_JWT_REGIONS_FIELD]: BYTEDCLI_GRANT_REGIONS } : {}),
@@ -342,8 +345,8 @@ export function describeCredentialGrantFailure(f: CredentialGrantFailure): strin
     case 'unbound': return 'machine is not bound to a platform';
     case 'network': return `network: ${f.error}`;
     case 'not_authorized': return `not authorized on platform (${f.error})`;
-    case 'consent_missing': return 'authorized on platform but no consent for this team';
-    case 'not_teammate': return 'sender and machine owner share no team';
+    case 'consent_missing': return 'platform has no usable authorization for this person on this machine';
+    case 'not_teammate': return 'platform only issues to the machine owner or a teammate of theirs';
     case 'forbidden': return `forbidden (${f.status} ${f.error})`;
     case 'not_deployed': return `platform has no credential-grant endpoint (${f.status})`;
     case 'rate_limited': return `rate limited (${f.status})`;

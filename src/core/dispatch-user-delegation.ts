@@ -3,9 +3,9 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { z } from 'zod';
-import type { TrustedCaller, TurnParticipant } from '../types.js';
+import type { Session, TrustedCaller, TurnParticipant } from '../types.js';
 import { updateDispatchRegistry } from './dispatch-registry.js';
-import { registryEntryProvesHumanSender } from './reply-target.js';
+import { pickTurnReplyTarget, registryEntryProvesHumanSender, registryTurnMayAuthenticateHuman } from './reply-target.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 export const DISPATCH_USER_DELIVERY_ROUTE = '/api/dispatch-user/deliver';
@@ -100,7 +100,16 @@ const payloadWorkflowSchema = z.object({
   workflow: workflowRefSchema,
   authority: authorityV1Schema,
 }).strict();
-const payloadSchema = z.discriminatedUnion('domain', [payloadV1Schema, payloadV2Schema, payloadWorkflowSchema]);
+// An explicit source-user decision for one direct cross-chat message. There
+// is no generic tool set, schedule capability, second target or onward grant.
+const taskConsentSchema = z.object({ sourceChatId: identity('oc_'), cardId: identity('om_') }).strict();
+const taskPayloadSchema = z.object({
+  ...payloadBase, domain: z.literal('botmux.dispatch-user.task.v1'),
+  sourceTurnId: identity('om_'), rootId: identity('om_'), targetAppIds: z.tuple([identity('cli_')]),
+  taskConsent: taskConsentSchema,
+  authority: authorityV1Schema.extend({ tools: z.tuple([z.literal('bytedcli')]) }),
+}).strict();
+const payloadSchema = z.discriminatedUnion('domain', [payloadV1Schema, payloadV2Schema, payloadWorkflowSchema, taskPayloadSchema]);
 
 /** A credential-store reference, never credentials. openId belongs ONLY to appId. */
 export type ScheduleCreateCapability = z.infer<typeof scheduleCreateCapabilitySchema>;
@@ -144,6 +153,46 @@ export function dispatchCallerFromReply(appId: string, reply?: {
 }): TrustedCaller | undefined {
   if (!registryEntryProvesHumanSender(reply)) return;
   return { requestLarkAppId: appId, requestUserOpenId: reply.senderOpenId, senderType: 'user' };
+}
+
+/** A dispatch-only grant may use the exact inbound sender preserved in the
+ * reply registry when the in-memory interactive turn has already ended. A
+ * matching active bot/synthetic turn still vetoes that fallback. */
+export function directHumanForDispatchOnly(input: {
+  sourceAppId: string;
+  turnId?: string;
+  session: Session;
+  activeTurn?: { turnId: string; caller: TrustedCaller };
+}): boolean {
+  const { sourceAppId, turnId, session, activeTurn } = input;
+  if (!turnId) return false;
+  if (session.failedTurnRecovery?.turnId === turnId) return false;
+  const caller = activeTurn?.turnId === turnId ? activeTurn.caller
+    : registryTurnMayAuthenticateHuman(session, turnId)
+      ? dispatchCallerFromReply(sourceAppId, pickTurnReplyTarget(session, turnId))
+      : undefined;
+  return caller?.senderType === 'user' && !caller.source
+    && caller.requestLarkAppId === sourceAppId && !!caller.requestUserOpenId;
+}
+
+/** Resolve a human already authenticated by authorityForDispatch. A thread root,
+ * destination message, or copied recovery turn cannot identify this sender. */
+export async function resolveDispatchSenderUnionId(
+  session: Session,
+  turnId: string,
+  appId: string,
+  openId: string,
+  fromMessage: (appId: string, messageId: string) => Promise<string | null>,
+  fromContact: (appId: string, openId: string) => Promise<string | null>,
+): Promise<string | null> {
+  const entry = session.replyTargets?.[turnId];
+  if (turnId.startsWith('om_') && registryTurnMayAuthenticateHuman(session, turnId)
+    && session.turnReplyContexts?.[turnId]?.sourceMessageId === turnId
+    && registryEntryProvesHumanSender(entry) && entry.senderOpenId === openId) {
+    const unionId = await fromMessage(appId, turnId);
+    if (unionId) return unionId;
+  }
+  return fromContact(appId, openId);
 }
 
 /** Only a daemon-authenticated, current human turn may originate a delegation. */
@@ -210,6 +259,7 @@ function readStore(dataDir: string): Record<string, unknown> {
 type DispatchUserPayloadInput = Omit<DispatchUserPayload, 'domain' | 'deliveryId' | 'issuedAt' | 'messageId'> & {
   /** Present only on a workflow handoff (its own domain, §10.2). */
   workflow?: WorkflowDispatchUserRef;
+  taskConsent?: z.infer<typeof taskConsentSchema>;
 };
 
 /** Two workflow records for the same handoff: same source, chat, topic,
@@ -239,7 +289,8 @@ export async function registerPendingDispatchUser(input: {
     chatId: input.payload.chatId,
     targetAppIds: input.payload.targetAppIds, authority: input.payload.authority,
     ...(workflow ? { workflow } : {}),
-    domain: workflow ? DISPATCH_USER_WORKFLOW_DOMAIN : v2 ? 'botmux.dispatch-user.v2' : 'botmux.dispatch-user.v1',
+    ...(input.payload.taskConsent ? { taskConsent: input.payload.taskConsent } : {}),
+    domain: input.payload.taskConsent ? 'botmux.dispatch-user.task.v1' : workflow ? DISPATCH_USER_WORKFLOW_DOMAIN : v2 ? 'botmux.dispatch-user.v2' : 'botmux.dispatch-user.v1',
     deliveryId: randomUUID(), issuedAt: Date.now(),
   } as DispatchUserPayload);
   await updateDispatchRegistry(dispatchUserStorePath(input.dataDir), store => {
@@ -297,8 +348,17 @@ export async function deliverDispatchWithUser(input: {
   secret: string;
   payload: DispatchUserPayloadInput;
   send: () => Promise<string>;
+  bindGuard?: (bind: () => Promise<DispatchUserPayload>) => Promise<DispatchUserPayload>;
 }): Promise<string> {
   const pending = await registerPendingDispatchUser(input);
+  return deliverPendingDispatchUser(input, pending);
+}
+
+/** Complete an already registered delivery using the same send/cleanup path. */
+export async function deliverPendingDispatchUser(input: {
+  dataDir: string; secret: string; send: () => Promise<string>;
+  bindGuard?: (bind: () => Promise<DispatchUserPayload>) => Promise<DispatchUserPayload>;
+}, pending: SignedDispatchUser): Promise<string> {
   const deliveryId = pending.payload.deliveryId;
   let messageId: string;
   try {
@@ -308,7 +368,8 @@ export async function deliverDispatchWithUser(input: {
     throw error;
   }
   try {
-    await bindPendingDispatchUser({ dataDir: input.dataDir, secret: input.secret, deliveryId, messageId });
+    const bind = () => bindPendingDispatchUser({ dataDir: input.dataDir, secret: input.secret, deliveryId, messageId });
+    await (input.bindGuard ? input.bindGuard(bind) : bind());
   } catch (error) {
     await dropPendingDispatchUser(input.dataDir, deliveryId);
     throw error;

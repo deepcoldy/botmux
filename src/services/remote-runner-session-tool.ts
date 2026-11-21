@@ -1,10 +1,15 @@
 import { spawn } from 'node:child_process';
 import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
   lstatSync,
+  openSync,
   readFileSync,
   realpathSync,
 } from 'node:fs';
-import { basename, join, sep } from 'node:path';
+import { attachmentsRoot } from '../core/attachment-path.js';
+import { basename, sep } from 'node:path';
 import {
   botmuxCliInvocation,
   buildRelayHostEnv,
@@ -21,6 +26,20 @@ const MAX_STDERR_BYTES = 64 * 1024;
 const MAX_ATTACHMENTS = 8;
 const DEFAULT_TIMEOUT_MS = 60_000;
 
+export class QuotedAttachmentCountError extends Error {
+  constructor(readonly actualCount: number, readonly limitCount: number) {
+    super(`quoted returned more than ${limitCount} attachments: ${actualCount}`);
+    this.name = 'QuotedAttachmentCountError';
+  }
+}
+
+export class QuotedAttachmentLimitError extends Error {
+  constructor(readonly actualBytes: number, readonly limitBytes: number) {
+    super(`quoted attachments exceed the transfer limit: ${actualBytes} bytes > ${limitBytes} bytes`);
+    this.name = 'QuotedAttachmentLimitError';
+  }
+}
+
 export interface RemoteRunnerSessionToolHostContext {
   sessionId: string;
   turnId: string;
@@ -30,6 +49,9 @@ export interface RemoteRunnerSessionToolHostContext {
   env?: NodeJS.ProcessEnv;
   cliPath?: string;
   timeoutMs?: number;
+  /** Total quoted-attachment budget. Defaults to the remote-runner wire limit;
+   *  the local sandbox relay (outbox) passes a larger one. */
+  maxAttachmentBytes?: number;
 }
 
 function boundedDiagnostic(value: string, fallback: string): string {
@@ -114,6 +136,7 @@ export function remoteRunnerSessionToolArgs(
 export function quotedAttachments(
   stdout: string,
   env: NodeJS.ProcessEnv,
+  maxAttachmentBytes = MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES,
 ): { stdout: string; attachments?: RemoteRunnerSessionToolAttachment[] } {
   let parsed: unknown;
   try {
@@ -123,14 +146,29 @@ export function quotedAttachments(
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { stdout };
   const root = parsed as Record<string, unknown>;
-  if (!Array.isArray(root.attachments) || root.attachments.length === 0) return { stdout };
-  if (root.attachments.length > MAX_ATTACHMENTS) {
-    throw new Error(`quoted returned more than ${MAX_ATTACHMENTS} attachments`);
+  // Single quoted keeps a top-level `attachments` array; batch quoted nests one
+  // envelope per requested id under `messages`. Both shapes must cross the same
+  // root-escape and budget validation, otherwise multi-id reads would hand the
+  // remote side unreadable host paths without transferring any bytes.
+  const holders: Array<Record<string, unknown>> = [];
+  if (Array.isArray(root.attachments)) holders.push(root);
+  if (Array.isArray(root.messages)) {
+    for (const message of root.messages) {
+      if (message && typeof message === 'object' && !Array.isArray(message)
+          && Array.isArray((message as Record<string, unknown>).attachments)) {
+        holders.push(message as Record<string, unknown>);
+      }
+    }
+  }
+  const totalCount = holders.reduce((count, holder) => count + (holder.attachments as unknown[]).length, 0);
+  if (totalCount === 0) return { stdout };
+  if (totalCount > MAX_ATTACHMENTS) {
+    throw new QuotedAttachmentCountError(totalCount, MAX_ATTACHMENTS);
   }
 
   const dataDir = env.SESSION_DATA_DIR?.trim();
   if (!dataDir) throw new Error('SESSION_DATA_DIR is unavailable for quoted attachments');
-  const attachmentRootInput = join(dataDir, 'attachments');
+  const attachmentRootInput = attachmentsRoot(env, dataDir);
   const attachmentRootInfo = lstatSync(attachmentRootInput);
   if (attachmentRootInfo.isSymbolicLink() || !attachmentRootInfo.isDirectory()) {
     throw new Error('BotMux attachment root is unsafe');
@@ -139,9 +177,9 @@ export function quotedAttachments(
   const attachmentPrefix = attachmentRoot.endsWith(sep) ? attachmentRoot : `${attachmentRoot}${sep}`;
   const transferred: RemoteRunnerSessionToolAttachment[] = [];
   let totalBytes = 0;
+  let placeholderIndex = 0;
 
-  for (let index = 0; index < root.attachments.length; index++) {
-    const raw = root.attachments[index];
+  const transfer = (raw: unknown): void => {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw new Error('quoted returned an invalid attachment');
     }
@@ -159,10 +197,10 @@ export function quotedAttachments(
       throw new Error('quoted attachment escaped the BotMux attachment root');
     }
     totalBytes += info.size;
-    if (totalBytes > MAX_REMOTE_RUNNER_SESSION_TOOL_ATTACHMENT_BYTES) {
-      throw new Error('quoted attachments exceed the Remote Runner transfer limit');
+    if (totalBytes > maxAttachmentBytes) {
+      throw new QuotedAttachmentLimitError(totalBytes, maxAttachmentBytes);
     }
-    const placeholder = `botmux-session-tool://attachment/${index}`;
+    const placeholder = `botmux-session-tool://attachment/${placeholderIndex++}`;
     item.path = placeholder;
     transferred.push({
       placeholder,
@@ -171,8 +209,12 @@ export function quotedAttachments(
       ...(typeof item.mimeType === 'string' && item.mimeType.length <= 256
         ? { mimeType: item.mimeType }
         : {}),
-      dataBase64: readFileSync(resolved).toString('base64'),
+      dataBase64: readVerifiedFile(resolved, info).toString('base64'),
     });
+  };
+
+  for (const holder of holders) {
+    for (const item of holder.attachments as unknown[]) transfer(item);
   }
 
   return {
@@ -286,7 +328,7 @@ export async function runRemoteRunnerSessionTool(
       }
       try {
         const packaged = request.tool === 'quoted'
-          ? quotedAttachments(stdout, env)
+          ? quotedAttachments(stdout, env, context.maxAttachmentBytes)
           : { stdout };
         finish({
           outcome: 'completed',
@@ -309,4 +351,17 @@ export async function runRemoteRunnerSessionTool(
       }
     });
   });
+}
+
+/** Read the file that was validated, not whatever the path names now: open
+ *  without following a symlink and require the same inode. */
+export function readVerifiedFile(path: string, expected: { dev: number; ino: number }): Buffer {
+  const fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0) | (fsConstants.O_NONBLOCK ?? 0));
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.dev !== expected.dev || st.ino !== expected.ino) {
+      throw new Error('quoted attachment changed while it was being read');
+    }
+    return readFileSync(fd);
+  } finally { closeSync(fd); }
 }

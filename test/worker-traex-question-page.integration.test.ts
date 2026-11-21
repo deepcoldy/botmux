@@ -1,11 +1,12 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
 import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
@@ -64,6 +65,12 @@ for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as co
     () => runTypeAheadRaceScenario(backendType),
     90_000,
   );
+  // tmux: finding the pipe-pane relay reads /proc.
+  it.skipIf(backendType === 'tmux' && (!tmuxAvailable || process.platform !== 'linux'))(
+    `TraeX ${backendType}: a message arriving while the page is drawn but the worker has not read it yet is held off it`,
+    () => runStalledStreamScenario(backendType),
+    90_000,
+  );
 }
 
 interface Ask { body: { questions: Array<{ prompt: string; multiSelect: boolean; options: Array<{ key: string; label: string; description?: string }> }>; originKind?: string; originTurnId?: string }; closed: boolean; respond: (result: AskResult) => void }
@@ -75,6 +82,12 @@ interface Harness {
   typed: () => string;
   send: (message: DaemonToWorker) => void;
   waitFor: (predicate: () => boolean, description: string, timeoutMs?: number) => Promise<void>;
+  /** The fake CLI's pid. */
+  cliPid: () => number;
+  /** The worker's pid. */
+  workerPid: () => number;
+  /** A tmux command on this test's private server (tmux backend). */
+  tmux: (args: string[]) => string;
 }
 
 async function startFakeDaemon(): Promise<{ server: Server; port: number; asks: Ask[] }> {
@@ -124,6 +137,8 @@ async function withTraexWorker(
     /** The first turn asks only when a message is typed ahead into it: the
      *  page comes up between that paste and its Enter. */
     askOnTypeAhead?: boolean;
+    /** The first turn asks only on SIGUSR1. */
+    askOnSignal?: boolean;
   },
   run: (h: Harness) => Promise<void>,
 ): Promise<void> {
@@ -199,12 +214,13 @@ function start(text) {
   // TRAE keeps repainting its footer (with "Context N% left") under the
   // activity row while a turn runs.
   for (const d of [0, 150, 300, 450]) setTimeout(() => { if (mode === 'working') draw(working(text)); }, d);
-  if (text === 'first-traex-input' && ${JSON.stringify(!!opts.askOnTypeAhead)}) { event('working:' + text); return; }
+  if (text === 'first-traex-input' && ${JSON.stringify(!!opts.askOnTypeAhead || !!opts.askOnSignal)}) { event('working:' + text); return; }
   setTimeout(() => {
     if (text !== 'first-traex-input') return finish('reply to ' + text);
     ask();
   }, ${JSON.stringify(opts.questionAfterMs ?? 700)});
 }
+process.on('SIGUSR1', () => { if (mode === 'working' && turn === 1) ask(); });
 function ask() {
   mode = 'question';
   process.stdout.write(report('blocked', 'question'));
@@ -294,14 +310,15 @@ setInterval(() => {}, 1000);
       messages, logs, asks: daemon.asks, send, waitFor,
       events: () => read(eventsFile).split('\n').filter(Boolean),
       typed: () => read(inputFile),
+      cliPid: () => Number(read(pidFile)),
+      workerPid: () => child!.pid!,
+      tmux: args => execFileSync('tmux', [...tmuxSocketArgs(preferredManagedTmuxSocket(env)), ...args], { env, encoding: 'utf8' }),
     });
   } finally {
     for (const ask of daemon.asks) if (!ask.closed) ask.respond({ kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
-    if (child && child.exitCode === null && child.signalCode === null) {
-      const exited = new Promise<void>(r => child!.once('exit', () => r()));
-      child.kill('SIGKILL');
-      await Promise.race([exited, new Promise(r => setTimeout(r, 2_000))]);
-    }
+    // The whole tree: a tmux client the worker started just before the kill
+    // would otherwise outlive the private TMUX_TMPDIR removed below (#2214).
+    if (child) await killProcessTree(child);
     if (existsSync(pidFile)) {
       try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* exited */ }
     }
@@ -320,15 +337,6 @@ const heldNotice = t('worker.traex_question.input_held', { cliName: lookupCliDis
 async function runCardScenario(backendType: 'pty' | 'tmux'): Promise<void> {
   await withTraexWorker(backendType, { cliVersion: '0.214.1\ninstallation: internal', reports: true }, async h => {
     await h.waitFor(() => h.events().includes('question-shown'), 'the fake drew its question page');
-    // A Lark message arrives while the page is up. It never reaches the page:
-    // no paste into the notes field, no Enter submitting the recommended option.
-    h.send({ type: 'message', content: 'second-traex-input', turnId: 'om_second' });
-    await new Promise(r => setTimeout(r, 3_000));
-    expect(h.events().filter(e => e.startsWith('pasted-on-question') || e.startsWith('answer') || e.startsWith('key-on-question')), h.logs.join('')).toEqual([]);
-    expect(h.typed()).not.toContain('second-traex-input');
-    // The sender is told it is held until the question is answered.
-    expect(h.messages.filter(m => m.type === 'user_notify' && m.message === heldNotice)).toHaveLength(1);
-
     // The page became one question card, through the native-question ask endpoint.
     await h.waitFor(() => h.asks.length > 0, 'question card raised');
     expect(h.asks).toHaveLength(1);
@@ -346,6 +354,14 @@ async function runCardScenario(backendType: 'pty' | 'tmux'): Promise<void> {
       }],
     });
 
+    // A Lark message arrives while the page is up. It never reaches the page:
+    // no paste into the notes field, no Enter submitting the recommended option.
+    // The sender is told it is held until the question is answered.
+    h.send({ type: 'message', content: 'second-traex-input', turnId: 'om_second' });
+    await h.waitFor(() => h.messages.some(m => m.type === 'user_notify' && m.message === heldNotice), 'the sender is told the message is held');
+    expect(h.events().filter(e => e.startsWith('pasted-on-question') || e.startsWith('answer') || e.startsWith('key-on-question')), h.logs.join('')).toEqual([]);
+    expect(h.typed()).not.toContain('second-traex-input');
+
     // The card's choice goes in as its digit, after a fresh look at the page.
     h.asks[0]!.respond({ kind: 'answered', answers: [['2']], by: 'ou_user', comment: null, timedOut: false });
     await h.waitFor(() => h.events().includes('answer:2'), 'card choice entered as the digit');
@@ -354,8 +370,9 @@ async function runCardScenario(backendType: 'pty' | 'tmux'): Promise<void> {
     await h.waitFor(() => h.events().includes('turn-done:2'), 'the held message delivered after the answer');
     const events = h.events();
     expect(events.indexOf('submitted:second-traex-input')).toBeGreaterThan(events.indexOf('answer:2'));
-    expect(events.filter(e => e.startsWith('answer') || e.startsWith('pasted-on-question'))).toEqual(['answer:2']);
+    expect(events.filter(e => e.startsWith('answer') || e.startsWith('pasted-on-question') || e.startsWith('key-on-question'))).toEqual(['answer:2']);
     expect(h.typed().match(/second-traex-input/g)).toHaveLength(1);
+    expect(h.messages.filter(m => m.type === 'user_notify' && m.message === heldNotice)).toHaveLength(1);
     // A turn without a question raises no card.
     await new Promise(r => setTimeout(r, 1_500));
     expect(h.asks).toHaveLength(1);
@@ -421,14 +438,16 @@ async function runDrainLoopScenario(backendType: 'pty' | 'tmux'): Promise<void> 
   await withTraexWorker(backendType, { cliVersion: '0.214.1\ninstallation: internal', reports: true, rolloutOpenLagMs: 2_500, questionAfterMs: 300 }, async h => {
     await h.waitFor(() => h.events().includes('question-shown'), 'the fake drew its question page');
     h.send({ type: 'message', content: 'second-traex-input', turnId: 'om_second' });
-    await new Promise(r => setTimeout(r, 4_000));
+    // The drain reaches the message once the first write has its receipt,
+    // and holds it there.
+    await h.waitFor(() => h.messages.some(m => m.type === 'user_notify' && m.message === heldNotice), 'the sender is told the message is held');
     expect(h.events().filter(e => e.startsWith('pasted-on-question') || e.startsWith('answer') || e.startsWith('key-on-question')), h.logs.join('')).toEqual([]);
     await h.waitFor(() => h.asks.length > 0, 'question card raised');
     h.asks[0]!.respond({ kind: 'answered', answers: [['2']], by: 'ou_user', comment: null, timedOut: false });
     await h.waitFor(() => h.events().includes('turn-done:2'), 'the held message delivered after the answer');
     const events = h.events();
     expect(events.indexOf('submitted:second-traex-input')).toBeGreaterThan(events.indexOf('answer:2'));
-    expect(events.filter(e => e.startsWith('answer') || e.startsWith('pasted-on-question'))).toEqual(['answer:2']);
+    expect(events.filter(e => e.startsWith('answer') || e.startsWith('pasted-on-question') || e.startsWith('key-on-question'))).toEqual(['answer:2']);
   });
 }
 
@@ -477,6 +496,83 @@ async function runTypeAheadRaceScenario(backendType: 'pty' | 'tmux'): Promise<vo
     expect(submitted.slice(0, 2)).toEqual(['submitted:first-traex-input', 'submitted:second-traex-input']);
     expect(submitted.slice(2).some(e => e.startsWith('submitted:third-traex-input'))).toBe(true);
     expect(events.indexOf('submitted:second-traex-input')).toBeGreaterThan(events.indexOf('answer:3'));
+    expect(h.typed().match(/second-traex-input/g)).toHaveLength(1);
+  });
+}
+
+/** The process tmux runs for `pipe-pane`: it copies the pane's output into the
+ *  worker's FIFO. */
+function pipePaneRelayPid(h: Harness, pane: string): number {
+  const server = Number(h.tmux(['display-message', '-p', '-t', pane, '#{pid}']).trim());
+  const panePid = Number(h.tmux(['display-message', '-p', '-t', pane, '#{pane_pid}']).trim());
+  let children: number[];
+  try {
+    children = readFileSync(`/proc/${server}/task/${server}/children`, 'utf8').trim().split(/\s+/).filter(Boolean).map(Number);
+  } catch {
+    children = execFileSync('pgrep', ['-P', String(server)], { encoding: 'utf8' }).trim().split(/\s+/).filter(Boolean).map(Number);
+  }
+  const relays = children.filter(pid => {
+    if (pid === panePid) return false;
+    try { return statSync(`/proc/${pid}/fd/1`).isFIFO(); } catch { return false; }
+  });
+  expect(relays, `children of the tmux server ${server}: ${children.join(' ')}`).toHaveLength(1);
+  return relays[0]!;
+}
+
+/** The page is drawn, the worker has not read it yet, and a message arrives.
+ *  tmux: on a loaded host the pipe-pane relay that copies the pane's output to
+ *  the worker falls behind the pane — the page (and its OSC 7501 report) is on
+ *  the pane while the worker still has the turn's working screen; stopping
+ *  the relay holds the worker exactly there. PTY: the worker reads the stream
+ *  itself, but its renderer parses it asynchronously; the worker is stopped
+ *  while the page is drawn, so the page and the message reach it together
+ *  (a CLI without OSC 7501, which would be read at once). A message arriving
+ *  then was pasted into the page's notes field. */
+async function runStalledStreamScenario(backendType: 'pty' | 'tmux'): Promise<void> {
+  const opts = backendType === 'tmux'
+    ? { cliVersion: '0.214.1\ninstallation: internal', reports: true }
+    : { cliVersion: '0.213.1', reports: false };
+  await withTraexWorker(backendType, { ...opts, askOnSignal: true }, async h => {
+    await h.waitFor(() => h.events().includes('working:first-traex-input'), 'the first turn is running');
+    // Let the worker's screen tick catch up with the turn's last repaint (on
+    // tmux it captures the pane only after output it has read), so that
+    // nothing but the write's own look can show it the page.
+    await new Promise(r => setTimeout(r, 3_000));
+    let stalled: number;
+    let pane = '';
+    if (backendType === 'tmux') {
+      pane = h.tmux(['list-panes', '-a', '-F', '#{pane_id}']).trim().split('\n')[0]!;
+      stalled = pipePaneRelayPid(h, pane);
+    } else {
+      stalled = h.workerPid();
+    }
+    process.kill(stalled, 'SIGSTOP');
+    try {
+      process.kill(h.cliPid(), 'SIGUSR1');
+      await h.waitFor(() => h.events().includes('question-shown'), 'the fake drew its question page');
+      if (backendType === 'tmux') {
+        await h.waitFor(() => h.tmux(['capture-pane', '-p', '-t', pane]).includes('Question 1/1'), 'the page is on the pane');
+      }
+      h.send({ type: 'message', content: 'second-traex-input', turnId: 'om_second' });
+      if (backendType === 'pty') process.kill(stalled, 'SIGCONT');
+      await h.waitFor(
+        () => h.messages.some(m => m.type === 'user_notify' && m.message === heldNotice)
+          || h.events().some(e => e.startsWith('pasted-on-question')),
+        'the message is either held or pasted',
+      );
+      expect(h.events().filter(e => e.startsWith('pasted-on-question') || e.startsWith('answer') || e.startsWith('key-on-question')), h.logs.join('')).toEqual([]);
+      expect(h.typed()).not.toContain('second-traex-input');
+    } finally {
+      try { process.kill(stalled, 'SIGCONT'); } catch { /* exited */ }
+    }
+    // The worker catches up: the page becomes the card, and the held message
+    // follows its answer as its own turn.
+    await h.waitFor(() => h.asks.length > 0, 'question card raised');
+    h.asks[0]!.respond({ kind: 'answered', answers: [['2']], by: 'ou_user', comment: null, timedOut: false });
+    await h.waitFor(() => h.events().includes('turn-done:2'), 'the held message delivered after the answer');
+    const events = h.events();
+    expect(events.indexOf('submitted:second-traex-input')).toBeGreaterThan(events.indexOf('answer:2'));
+    expect(events.filter(e => e.startsWith('answer') || e.startsWith('pasted-on-question') || e.startsWith('key-on-question'))).toEqual(['answer:2']);
     expect(h.typed().match(/second-traex-input/g)).toHaveLength(1);
   });
 }

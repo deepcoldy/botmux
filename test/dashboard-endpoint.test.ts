@@ -766,6 +766,131 @@ describe('discovery is bounded (real sockets)', () => {
     return (s.address() as import('node:net').AddressInfo).port;
   }
 
+  /**
+   * True only when a loopback TCP connect is REFUSED. A port that accepts
+   * (including a concurrent test's HTTP server on a busy CI runner) or one that
+   * stalls past the timeout both report false, so callers relocate instead of
+   * assuming an ephemeral port is free. This is the race that made the
+   * "TOTAL budget" probe occasionally receive another test's HTML response.
+   */
+  async function loopbackPortIsDead(port: number, timeoutMs = 200): Promise<boolean> {
+    const { createConnection } = await import('node:net');
+    return new Promise<boolean>(resolve => {
+      let settled = false;
+      const done = (dead: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        socket.destroy();
+        resolve(dead);
+      };
+      const socket = createConnection({ host: '127.0.0.1', port });
+      const timer = setTimeout(() => done(false), timeoutMs);
+      socket.once('connect', () => done(false));
+      socket.once('error', err =>
+        done((err as NodeJS.ErrnoException).code === 'ECONNREFUSED'));
+    });
+  }
+
+  /**
+   * Bind `count` ADJACENT accept-and-stall servers with NO gaps, so every port
+   * in a discovery scan span is held by this fixture and a concurrent test can
+   * never answer a probe there. Retries on fresh ephemeral bases when any port
+   * is taken; returns base=-1 (caller FAILs LOUD) if a controlled block cannot
+   * be established. Every server is registered for afterEach teardown.
+   */
+  async function claimContiguousStallBlock(count: number): Promise<{ base: number; servers: import('node:net').Server[] }> {
+    const { createServer: netServer } = await import('node:net');
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const probe = netServer();
+      await new Promise<void>(r => probe.listen(0, '127.0.0.1', () => r()));
+      const base = (probe.address() as import('node:net').AddressInfo).port;
+      await new Promise<void>(r => probe.close(() => r()));
+
+      const servers: import('node:net').Server[] = [];
+      try {
+        for (let i = 0; i < count; i++) {
+          const s = netServer(sock => { liveSockets.push(sock); });  // accept, never reply
+          await new Promise<void>((res, rej) => {
+            s.once('error', rej);
+            s.listen(base + i, '127.0.0.1', () => res());
+          });
+          servers.push(s);
+        }
+        stalls.push(...servers);
+        return { base, servers };
+      } catch {
+        // A port in the block was taken — release what we bound and retry elsewhere.
+        await Promise.all(servers.map(s =>
+          new Promise<void>(r => s.close(() => r())).catch(() => {})));
+      }
+    }
+    return { base: -1, servers: [] };
+  }
+
+  /**
+   * Pick an ephemeral port that is PROVABLY connection-refused and lies outside
+   * [blockBase, blockBase+blockSpan]. Used as the recorded port so the first
+   * hop cannot hit a concurrent test's HTTP responder; retries until a dead
+   * port is confirmed, returning -1 (caller FAILs LOUD) otherwise.
+   */
+  async function pickDeadRecordedPort(blockBase: number, blockSpan: number): Promise<number> {
+    const { createServer: netServer } = await import('node:net');
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const probe = netServer();
+      await new Promise<void>(r => probe.listen(0, '127.0.0.1', () => r()));
+      const port = (probe.address() as import('node:net').AddressInfo).port;
+      await new Promise<void>(r => probe.close(() => r()));
+      if (port >= blockBase && port <= blockBase + blockSpan) continue;  // inside scan span
+      if (await loopbackPortIsDead(port)) return port;
+    }
+    return -1;
+  }
+
+  it('port-race fixtures separate a dead port from a foreign HTTP responder and hold every scan port', async () => {
+    const { createServer: httpServer } = await import('node:http');
+    const { createServer: netServer, createConnection } = await import('node:net');
+    // A foreign HTTP responder (the shape that collided on loaded CI) is NOT dead.
+    const foreign = httpServer((_req: unknown, res: any) => {
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<!doctype html>');
+    });
+    httpServers.push(foreign);
+    await new Promise<void>(r => foreign.listen(0, '127.0.0.1', () => r()));
+    const foreignPort = (foreign.address() as import('node:net').AddressInfo).port;
+    expect(await loopbackPortIsDead(foreignPort)).toBe(false);
+
+    // An accept-but-never-reply stalled port is also NOT dead.
+    const stalled = await stalledPort();
+    expect(await loopbackPortIsDead(stalled)).toBe(false);
+
+    // A released ephemeral port IS dead (connection refused).
+    const probe = netServer();
+    await new Promise<void>(r => probe.listen(0, '127.0.0.1', () => r()));
+    const released = (probe.address() as import('node:net').AddressInfo).port;
+    await new Promise<void>(r => probe.close(() => r()));
+    expect(await loopbackPortIsDead(released)).toBe(true);
+
+    // The contiguous block holds EVERY port: each accepts a connection, no gaps.
+    const span = 6;
+    const { base, servers } = await claimContiguousStallBlock(span);
+    expect(base).toBeGreaterThan(0);
+    expect(servers).toHaveLength(span);
+    for (let i = 0; i < span; i++) {
+      await new Promise<void>((resolve, reject) => {
+        const sock = createConnection({ host: '127.0.0.1', port: base + i });
+        sock.once('connect', () => { sock.destroy(); resolve(); });
+        sock.once('error', reject);
+      });
+    }
+
+    // The recorded-port picker stays outside the span and returns a verified-dead port.
+    const dead = await pickDeadRecordedPort(base, span - 1);
+    expect(dead).toBeGreaterThan(0);
+    expect(dead < base || dead > base + span - 1).toBe(true);
+    expect(await loopbackPortIsDead(dead)).toBe(true);
+  }, 30_000);
+
   it('skips a stalled candidate within budget and still finds the real dashboard', async () => {
     // Ordering must be deterministic AND race-free. Earlier attempts (retrying
     // random OS ports; binding realPort-1) both flaked — one leaked listeners and
@@ -806,7 +931,12 @@ describe('discovery is bounded (real sockets)', () => {
     // CI port race would silently count this as green with zero behaviour checked.
     expect(realPort, 'fixture could not claim an adjacent port pair after 12 tries').toBeGreaterThan(0);
 
-    setPort(realPort + 1_000);                 // recorded port: nobody listening
+    // Recorded port must be PROVABLY dead, not an assumed-free `realPort+1000`: a
+    // concurrent test's server answering there (e.g. 403 HTML → http-error) ends
+    // the call on the first hop, before discovery ever runs.
+    const deadRecorded = await pickDeadRecordedPort(stalled, 1);
+    expect(deadRecorded, 'fixture could not confirm a dead recorded port').toBeGreaterThan(0);
+    setPort(deadRecorded);                     // recorded port: verified nobody listening
     const t0 = Date.now();
     const r = await callDashboard({
       configDir: dir, defaultPort: stalled, probeSpan: 1, path: '/__cli/current',
@@ -858,7 +988,10 @@ describe('discovery is bounded (real sockets)', () => {
     expect(realPort, 'fixture could not claim an adjacent port pair').toBeGreaterThan(0);
     expect(stalledPortNum).toBeLessThan(realPort);   // stall must be probed first
 
-    setPort(realPort + 1_000);                       // recorded port: nobody there
+    // Same first-hop race as above: the recorded port must be verified dead.
+    const deadRecorded = await pickDeadRecordedPort(stalledPortNum, 1);
+    expect(deadRecorded, 'fixture could not confirm a dead recorded port').toBeGreaterThan(0);
+    setPort(deadRecorded);                           // recorded port: verified nobody there
     const t0 = Date.now();
     const r = await callDashboard({
       configDir: dir, defaultPort: stalledPortNum, probeSpan: 1, path: '/__cli/current',
@@ -876,9 +1009,13 @@ describe('discovery is bounded (real sockets)', () => {
     // "bounded command" must include this hop, not just the scan.
     const stalled = await stalledPort();
     setPort(stalled);                                // recorded port IS the stall
+    // The single scanned port must be verified dead too, not an assumed-free
+    // `stalled+500` a concurrent fake dashboard could answer `ok` on.
+    const deadScan = await pickDeadRecordedPort(stalled, 0);
+    expect(deadScan, 'fixture could not confirm a dead scan port').toBeGreaterThan(0);
     const t0 = Date.now();
     const r = await callDashboard({
-      configDir: dir, defaultPort: stalled + 500, probeSpan: 0, path: '/__cli/current',
+      configDir: dir, defaultPort: deadScan, probeSpan: 0, path: '/__cli/current',
       rescanWhenUnreachable: true, probeTimeoutMs: 300, discoveryBudgetMs: 1_000,
     });
     const elapsed = Date.now() - t0;
@@ -965,7 +1102,12 @@ describe('discovery is bounded (real sockets)', () => {
     // the clamp the probe is cut at `remaining`; without it, that probe runs the
     // full probeTimeoutMs and the total overruns by nearly a whole timeout.
     const stalled = await stalledPort();
-    setPort(stalled + 700);                    // recorded port: nobody listening
+    // Recorded port must be PROVABLY dead, not an assumed-free `stalled+700` that
+    // a concurrent test could be serving HTTP on (same port-race class as the
+    // TOTAL-budget probe). It only has to lie outside the [stalled, stalled+1] span.
+    const deadRecorded = await pickDeadRecordedPort(stalled, 1);
+    expect(deadRecorded, 'fixture could not confirm a dead recorded port').toBeGreaterThan(0);
+    setPort(deadRecorded);                     // recorded port: verified nobody listening
     const t0 = Date.now();
     const r = await callDashboard({
       configDir: dir, defaultPort: stalled, probeSpan: 1, path: '/__cli/current',
@@ -985,30 +1127,25 @@ describe('discovery is bounded (real sockets)', () => {
     // dead and fail instantly, so the deadline never binds — an earlier version of
     // this test made exactly that mistake and the mutation survived). Fill MANY
     // adjacent ports with stalled listeners so the serial cost is real.
-    const { createServer: netServer } = await import('node:net');
-    const probe = netServer();
-    await new Promise<void>(r => probe.listen(0, '127.0.0.1', () => r()));
-    const lo = (probe.address() as import('node:net').AddressInfo).port;
-    await new Promise<void>(r => probe.close(() => r()));
+    //
+    // Race-free fixture: the scan spans [base, base+probeSpan] (probeSpan+1 ports),
+    // so hold EVERY one of them as a stalled socket with no gaps — a gap could be
+    // occupied by a concurrent test's HTTP server, whose HTML response previously
+    // made this probe flake on loaded CI runners. The recorded port likewise must
+    // be a PROVABLY dead (connection-refused) port, not an assumed-free `lo+900`.
+    const probeSpan = 10;
+    const { base, servers } = await claimContiguousStallBlock(probeSpan + 1);
+    // FAIL LOUD: a partial/empty block would either leave a gap for a foreign
+    // responder or remove the serial cost this test exists to measure.
+    expect(base, 'fixture could not claim a contiguous stalled block').toBeGreaterThan(0);
+    expect(servers).toHaveLength(probeSpan + 1);
 
-    let bound = 0;
-    for (let i = 0; i < 10; i++) {
-      const st = netServer((sock) => { liveSockets.push(sock); });
-      try {
-        await new Promise<void>((res, rej) => {
-          st.once('error', rej); st.listen(lo + i, '127.0.0.1', () => res());
-        });
-        stalls.push(st); bound++;
-      } catch { /* that port was taken; keep going */ }
-    }
-    // FAIL LOUD (see above): silently passing would make the deadline mutation
-    // toothless in CI, which is the one place it most needs teeth.
-    expect(bound, `fixture bound only ${bound} stalled ports; need >= 6 for the serial cost to show`).toBeGreaterThanOrEqual(6);
-
-    setPort(lo + 900);                          // recorded port: nobody listening
+    const deadRecorded = await pickDeadRecordedPort(base, probeSpan);
+    expect(deadRecorded, 'fixture could not confirm a dead recorded port').toBeGreaterThan(0);
+    setPort(deadRecorded);                     // recorded port: verified nobody listening
     const t0 = Date.now();
     const r = await callDashboard({
-      configDir: dir, defaultPort: lo, probeSpan: 10, path: '/__cli/current',
+      configDir: dir, defaultPort: base, probeSpan, path: '/__cli/current',
       rescanWhenUnreachable: true, probeTimeoutMs: 300, discoveryBudgetMs: 900,
     });
     const elapsed = Date.now() - t0;
@@ -1021,21 +1158,49 @@ describe('discovery is bounded (real sockets)', () => {
     // break, `budget < probeTimeoutMs` for the clamp — so a single-bound regression
     // is caught there, not here.
     expect(elapsed).toBeLessThan(1_400);
-    expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe(String(lo + 900));
+    expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe(String(deadRecorded));
   }, 40_000);
 
   it('returns the original unreachable within budget with one stall and the rest down', async () => {
-    const a = await stalledPort();
-    setPort(a + 5);                  // recorded port: nobody listening
+    // Same race class as the TOTAL-budget fixture: every port treated as "down"
+    // must be one THIS fixture held an instant ago, not an assumed-free neighbour
+    // a concurrent test could be serving HTTP on (that responder would make the
+    // probe return wrong-service/success instead of unreachable). Claim the whole
+    // span, keep one stall, release the rest — our own close makes them
+    // connection-refused, apart from the same sub-millisecond re-grab window that
+    // pickDeadRecordedPort already accepts for the recorded hop.
+    const probeSpan = 3;
+    const { base, servers } = await claimContiguousStallBlock(probeSpan + 1);
+    expect(base, 'fixture could not claim a contiguous stalled block').toBeGreaterThan(0);
+    expect(servers).toHaveLength(probeSpan + 1);
+    const released = servers.slice(1);
+    const releasedPorts = released.map(
+      s => (s.address() as import('node:net').AddressInfo).port,
+    );
+    for (const s of released) {
+      const idx = stalls.indexOf(s);
+      if (idx >= 0) stalls.splice(idx, 1);
+    }
+    await Promise.all(released.map(s => new Promise<void>(r => s.close(() => r()))));
+    // Pin the release: the "down" candidates must really be connection-refused.
+    expect(await Promise.all(releasedPorts.map(p => loopbackPortIsDead(p)))).toEqual([
+      true,
+      true,
+      true,
+    ]);
+
+    const deadRecorded = await pickDeadRecordedPort(base, probeSpan);
+    expect(deadRecorded, 'fixture could not confirm a dead recorded port').toBeGreaterThan(0);
+    setPort(deadRecorded);                  // recorded port: verified nobody listening
     const t0 = Date.now();
     const r = await callDashboard({
-      configDir: dir, defaultPort: a, probeSpan: 3, path: '/__cli/current',
+      configDir: dir, defaultPort: base, probeSpan, path: '/__cli/current',
       rescanWhenUnreachable: true, probeTimeoutMs: 300, discoveryBudgetMs: 2_000,
     });
     const elapsed = Date.now() - t0;
     expect(r).toEqual({ ok: false, reason: 'unreachable' });
     expect(elapsed).toBeLessThan(4_000);
     // fail-closed: a fruitless scan must not rewrite the port file.
-    expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe(String(a + 5));
+    expect(readFileSync(join(dir, '.dashboard-port'), 'utf8').trim()).toBe(String(deadRecorded));
   }, 30_000);
 });

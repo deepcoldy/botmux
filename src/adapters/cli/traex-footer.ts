@@ -95,6 +95,37 @@ const EMPTY_COMPOSER_HINTS = new Set([
   'Will this algorithm scale well?',
 ]);
 
+/** Match only the live composer, never a pasted-content example in history.
+ * A collapsed chip is usable only together with the worker's unchanged
+ * external-input generation: its character count alone is not ownership.
+ * The provisional shortcut-only startup composer can show a pasted draft while
+ * still dropping Enter, so it must not consume the worker's one-shot rescue.
+ * A parked draft changes the hint row (see `draftFooter`), so the footer is
+ * judged with the draft-surface hints, never as an empty composer. */
+export function traexComposerHoldsInput(
+  screen: string,
+  input: string,
+  opts: { requireThreadReady?: boolean } = {},
+): boolean {
+  const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
+  if (composer < 0 || !input.trim()) return false;
+  for (let end = composer + 1; end < rows.length; end++) {
+    const empty = [...rows.slice(0, composer), '❯', ...rows.slice(end)].join('\n');
+    if (!traexRestoredComposerReady(empty, {
+      requireThreadReady: opts.requireThreadReady !== false,
+      draftFooter: true,
+    })) continue;
+    const body = [rows[composer]!.slice(1), ...rows.slice(composer + 1, end)]
+      .join('\n').trim();
+    const chip = /^\[Pasted Content (\d+) chars?\]$/i.exec(body);
+    if (chip) return Number(chip[1]) === Array.from(input).length;
+    return body.replace(/\s/g, '') === input.replace(/\s/g, '');
+  }
+  return false;
+}
+
 /**
  * Fresh 0.211 startup and resume can paint an initialized composer without
  * the old model/directory banner. Only the bottom input surface and its
@@ -104,7 +135,15 @@ const EMPTY_COMPOSER_HINTS = new Set([
  */
 export function traexRestoredComposerReady(
   screen: string,
-  opts: { resumedSession?: boolean } = {},
+  opts: {
+    resumedSession?: boolean;
+    requireThreadReady?: boolean;
+    nativeIdleReported?: boolean;
+    /** The footer belongs to a composer holding a draft (the caller blanked
+     * the draft rows). TraeX swaps the native hint row for draft-only hints
+     * then; only traexComposerHoldsInput judges such a surface. */
+    draftFooter?: boolean;
+  } = {},
 ): boolean {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
@@ -113,8 +152,14 @@ export function traexRestoredComposerReady(
   const footer = rows.slice(composer + 1).filter(row => row.trim());
   // TraeX 0.209–0.211: optional bottom rule, initialized model/context row,
   // then the access/shortcut row. Extra rows can be a draft, picker or dialog.
-  if (/^[ \t]*─+[ \t]*$/.test(footer[0] ?? '')) footer.shift();
+  const hasBottomRule = /^[ \t]*─+[ \t]*$/.test(footer[0] ?? '');
+  if (hasBottomRule) footer.shift();
   if (footer.length < 1 || footer.length > 2) return false;
+  // An owned native idle/done proves initialization even when a newer CLI
+  // changes its status cells. Still require a known EMPTY prompt and a rule
+  // immediately below it: otherwise an unknown row may be wrapped draft text.
+  // Screen-only callers never get this exception.
+  const reportedIdleFooter = opts.nativeIdleReported === true && hasBottomRule;
   // Recorded 0.212.1 cold start: marketplace Git access failure replaces
   // BOTH native footer rows with a nonblocking notification for ~30s. The
   // initialized startup banner and an empty composer still prove readiness.
@@ -122,6 +167,18 @@ export function traexRestoredComposerReady(
   // its host-provided launch context replaces the banner requirement only
   // for this known nonblocking notification, never arbitrary dialog text.
   const startupRows = rows.slice(0, composer);
+  // With [tui] status_line=[] and approval_policy=never the initialized
+  // footer is intentionally identical to the provisional bare-hint row.
+  // Native idle cannot distinguish them (a stalled catalog also reports it),
+  // but the native content ABOVE the composer can: 0.214.1 PTY recordings with
+  // a hung catalog proxy show the welcome/tip only after initialization, and
+  // cold-resume recordings likewise paint restored transcript rows only after
+  // the resume has completed. This is independent of the hidden status cells.
+  const initializedStartupContent = startupRows.some(row =>
+    /^[ \t]*Good (?:morning|afternoon|evening),[ \t]*\S/.test(row)
+    || /^[ \t]*Tip:[ \t]+\S/.test(row)
+    || /^[ \t]*▍[ \t]+\S/.test(row)
+    || /^[ \t]*Worked for \d/.test(row));
   const repositoryNotice = footer.length === 1
     && /^[ \t]*无法访问 Git 仓库 `[^`\r\n]+`，请确认该仓库权限或地址。[ \t]*$/.test(footer[0]!)
     && (opts.resumedSession === true || (
@@ -147,10 +204,32 @@ export function traexRestoredComposerReady(
   // dropped and the warning indicator becomes the whole footer row.
   const warningIndicator = '⚠[ \\t]+\\d+(?:[ \\t]+warnings?[ \\t]+·[ \\t]+f2[ \\t]+to[ \\t]+view|[ \\t]+·[ \\t]+f2)?';
   const warningSuffix = `(?:[ \\t]+${warningIndicator})?`;
-  const hintOnlyRow = new RegExp(`^[ \\t]*(?:\\? for shortcuts|← for agents)(?:[ \\t]+·[ \\t]+(?:\\? for shortcuts|← for agents))*${warningSuffix}[ \\t]*$`);
+  // A large paste collapses into a `[Pasted Content N chars]` chip and the
+  // hint row becomes the chip's own key hint (0.214.1 and 0.216.0, recorded:
+  // bold `paste again` + dim ` expand`). Below the provisional composer it is
+  // the whole footer; below an initialized one it follows the model/context
+  // row and stays until the footer is redrawn. It never renders under an empty
+  // composer, so only a draft-holding footer may carry it.
+  const hintToken = opts.draftFooter
+    ? '(?:\\? for shortcuts|← for agents|paste again expand)'
+    : '(?:\\? for shortcuts|← for agents)';
+  const hintOnlyRow = new RegExp(`^[ \\t]*${hintToken}(?:[ \\t]+·[ \\t]+${hintToken})*${warningSuffix}[ \\t]*$`);
   const warningOnlyRow = new RegExp(`^[ \\t]*${warningIndicator}[ \\t]*$`);
   const warningOnlyFooter = warningOnlyRow.test(footer[footer.length - 1]!);
   const shortcutOnlyFooter = footer.length === 1 && (hintOnlyRow.test(footer[0]!) || warningOnlyFooter);
+  // A fresh 0.214.1 TUI paints this provisional surface BEFORE its app-server
+  // thread/start response. It accepts paste then, but drops Enter; the draft
+  // survives once initialization finishes. The general restoration predicate
+  // keeps its legacy hint/notice support. The native first-input fence
+  // requires either a resolved model footer or the independently initialized
+  // startup/transcript content above (which also covers a hidden status line).
+  // A native idle cannot vouch for the shortcut-only surface itself: 0.214.1
+  // and 0.216.0 (fresh and resumed) report idle on it while the model catalog
+  // fetch stalls, and still drop Enter. It still vouches for the repository
+  // notice, which hides both footer rows of an otherwise unknown state.
+  if (opts.requireThreadReady
+    && ((shortcutOnlyFooter && !initializedStartupContent)
+      || (repositoryNotice && !opts.nativeIdleReported))) return false;
   // A working directory wider than the pane truncates the model/context row
   // with a U+2026 ellipsis before the Context cell can render. Such a row
   // still contains the native ` · ` cell separator and ends on the
@@ -159,7 +238,7 @@ export function traexRestoredComposerReady(
   // so this arm deliberately trusts the footer-region geometry; revisit it if
   // a future build moves notification content below the composer.
   const truncatedStatusRow = /^[ \t]*(?![^\r\n]*│)\S[^\r\n]* · [^\r\n]*…[ \t]*$/;
-  if (!repositoryNotice && !shortcutOnlyFooter
+  if (!reportedIdleFooter && !repositoryNotice && !shortcutOnlyFooter
     && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)
     && !truncatedStatusRow.test(footer[0]!)) return false;
   // Only the model cell is initialization evidence; a cwd named "loading"
@@ -169,7 +248,7 @@ export function traexRestoredComposerReady(
   // qdh-topic profile) omit the standard permission label, so the second
   // footer row is a bare hint row; on a narrow pane the hint tokens are
   // dropped entirely and only the width-degraded warning indicator remains.
-  if (footer.length === 2 && !hintOnlyRow.test(footer[1]!) && !warningOnlyRow.test(footer[1]!)
+  if (!reportedIdleFooter && footer.length === 2 && !hintOnlyRow.test(footer[1]!) && !warningOnlyRow.test(footer[1]!)
     && !/^[ \t]*(?:[☢▧] )?(?:Full Access|Read Only|Auto Mode|Workspace Edit|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
   // A login banner can be taller than the nearby live-status region. Inspect
   // all rows above the composer for native login prompts, but do not treat

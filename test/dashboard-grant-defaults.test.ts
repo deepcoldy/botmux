@@ -331,6 +331,47 @@ describe('dashboard grant defaults', () => {
     expect(root.findByProps({ 'data-action': 'toggle-p2p-open' }).props.checked).toBe(true);
   });
 
+  it('saves the talker-schedules toggle through the grant-prefs endpoint and rolls back on failure', async () => {
+    const requests: Array<{ url: string; body: any }> = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      requests.push({ url, body: JSON.parse(init?.body ?? '{}') });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          autoGrantRequestCards: true,
+          restrictGrantCommands: false,
+          p2pOpen: false,
+          scheduleCreateByTalkers: true,
+          grantDefaultDurationMs: null,
+          messageQuotaDefaultLimit: null,
+        }),
+      } as any;
+    });
+
+    const { root, patchBot } = renderGrantSection();
+    const toggle = root.findByProps({ 'data-action': 'toggle-schedule-create-by-talkers' });
+    expect(toggle.props.checked).toBe(false);
+    await flushAction(() => toggle.props.onChange({ currentTarget: { checked: true } }));
+
+    expect(requests).toEqual([{ url: '/api/bots/app_grant/grant-prefs', body: { scheduleCreateByTalkers: true } }]);
+    expect(patchBot).toHaveBeenCalledWith('app_grant', expect.objectContaining({ scheduleCreateByTalkers: true }));
+    expect(root.findByProps({ 'data-action': 'toggle-schedule-create-by-talkers' }).props.checked).toBe(true);
+
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      json: async () => ({ ok: false, error: 'write_failed' }),
+    } as any));
+    const failing = renderGrantSection({ scheduleCreateByTalkers: true });
+    const on = failing.root.findByProps({ 'data-action': 'toggle-schedule-create-by-talkers' });
+    expect(on.props.checked).toBe(true);
+    await flushAction(() => on.props.onChange({ currentTarget: { checked: false } }));
+    // A failed write must not leave the UI claiming talkers can no longer schedule.
+    expect(failing.root.findByProps({ 'data-action': 'toggle-schedule-create-by-talkers' }).props.checked).toBe(true);
+  });
+
   it('saves the owner-DM forwarding toggle through the grant-prefs endpoint', async () => {
     const requests: Array<{ url: string; body: any }> = [];
     (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {

@@ -125,11 +125,11 @@ export function startLarkConnection(
     else if (state !== 'connected' && pendingFor >= reconnectLimit) reason = `${state} for ${pendingFor}ms`;
     else if (silentFor >= inboundLimit) reason = `no inbound for ${silentFor}ms`;
     else return;
-    if (rebuilds >= maxRebuilds) {
-      logger.error(`[ws] ${larkAppId} ${reason} after ${rebuilds} rebuilds; exiting for supervisor recovery (${diagnostics})`);
-      process.exit(1);
-    }
-    logger.warn(`[ws] ${larkAppId} ${reason}; rebuilding WSClient ${++rebuilds}/${maxRebuilds} (${diagnostics})`);
+    // A network outage must not tear down unrelated CLI work. After the burst,
+    // keep the client's bounded retries alive and space out full replacements.
+    const throttled = rebuilds >= maxRebuilds;
+    if (throttled && now - generationStarted < Math.max(reconnectLimit, inboundLimit)) return;
+    logger.warn(`[ws] ${larkAppId} ${reason}; rebuilding WSClient ${++rebuilds}${throttled ? ' (throttled)' : `/${maxRebuilds}`} (${diagnostics})`);
     generation++;
     active.close({ force: true });
     if (health.state === 'connected') {

@@ -5,7 +5,7 @@ import { listChatMessagesUntil, listThreadMessagesWithContext, listMessagesByThr
 import { parseApiMessage, createImgNumberer, extractResources, cardContentHasUpgradeFallback, resolveMergedCardContent, structuredMentionRefs, rawPlaceholderText, postMentionRefs } from '../im/lark/message-parser.js';
 import { GROUP_CONTEXT_CARD_CONTENT_VERSION } from '../im/lark/group-context-card.js';
 import { projectObservedGroupContextCard } from './group-context-card-source.js';
-import { getAttachmentsDir } from '../core/attachment-path.js';
+import { attachmentsRoot, getAttachmentsDir } from '../core/attachment-path.js';
 import { normalizeImageAttachment } from '../core/attachment-image-format.js';
 import { getGroupContextSettings } from './group-context-settings-store.js';
 import { getGroupContextHead, getGroupContextMessage, listGroupContextMessages, upsertGroupContextMessage, pruneGroupContext, type GroupContextMessageRecord } from './group-context-store.js';
@@ -318,7 +318,7 @@ async function resolveAttachments(request: GroupContextTurnRequest, records: Gro
             // Any file at `path` is reused as complete by later turns.
             const partial = `${path}.${randomUUID()}.part`;
             try {
-              await downloadMessageResource(request.appId, record.messageId, resource.key, resource.type as 'image' | 'file' | 'video', partial, undefined, { allowUserTokenFallback: false });
+              await downloadMessageResource(request.appId, record.messageId, resource.key, resource.type as 'image' | 'file' | 'video', partial, undefined, { allowUserTokenFallback: false, withinRoot: attachmentsRoot() });
               renameSync(partial, path);
             } finally { rmSync(partial, { force: true }); }
           }

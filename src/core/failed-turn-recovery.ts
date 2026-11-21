@@ -4,6 +4,7 @@ import type { DaemonSession } from './types.js';
 import { activeSessionKey } from './types.js';
 import * as store from '../services/session-store.js';
 import { buildFailedTurnRecord } from '../services/failed-turn-retry.js';
+import { turnAnswersInChat } from './failed-turn-rewind.js';
 import { isAutoCompactSafeComposerRefusal } from './auto-compact.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
@@ -47,8 +48,16 @@ export function noteFailedTurnRecoveryInput(appId: string, anchor: string, messa
   if (transaction && messageId !== transaction.originalTurnId) transaction.cancelled = true;
 }
 
+/** Cross-chat origin is checked in both indexes: replyTargets is bounded much
+ * sooner than turnReplyContexts, and either may be the only surviving proof. */
+function failedTurnCrossChatOrigin(session: Session, turnId: string): FailedTurnRecord['crossChatOrigin'] {
+  return session.replyTargets?.[turnId]?.crossChatOrigin
+    ?? session.turnReplyContexts?.[turnId]?.crossChatOrigin;
+}
+
 /** Snapshot only daemon-authenticated current-turn facts, never the owner. */
 export function failedTurnCaller(ds: DaemonSession, turnId: string): TrustedCaller | undefined {
+  if (failedTurnCrossChatOrigin(ds.session, turnId)) return;
   const caller = ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
     : ds.activeInteractiveTurn?.turnId === turnId ? ds.activeInteractiveTurn.caller
       : ds.scheduledTurnCallers?.get(turnId);
@@ -70,6 +79,13 @@ export function failedTurnCaller(ds: DaemonSession, turnId: string): TrustedCall
  * once at the native limited edge, while the authenticated turn still exists. */
 export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | undefined): void {
   if (!turnId || ds.lastCliInputTurnId !== turnId || !ds.usageLimit?.limited || ds.session.lastFailedTurn?.turnId === turnId) return;
+  // This snapshot exists for limits that never reach turn_terminal. Once the
+  // turn has an observed terminal, recordFailedTurnTerminal owns its outcome; a
+  // later `limited` frame is the sticky ds.usageLimit carried past the turn, not
+  // a new failure. A recovery turn keeps its caller in failedTurnRecovery after
+  // the terminal, so without this an answered recovery is recorded as
+  // rate_limited and offered for replay.
+  if (ds.terminalIdentityTurnIds?.has(turnId)) return;
   const caller = failedTurnCaller(ds, turnId);
   if (!caller) return;
   const record = buildFailedTurnRecord({ turnId, status: 'failed', errorCode: `${ds.usageLimit.kind}_limited` }, {
@@ -99,7 +115,7 @@ export function clearLimitedFailedTurn(ds: DaemonSession, turnId?: string): void
  * active turn; a late terminal must not erase an already-claimed receipt. */
 export function recordFailedTurnTerminal(
   ds: DaemonSession,
-  terminal: { turnId: string; status: string; errorCode?: string },
+  terminal: { turnId: string; status: string; errorCode?: string; retryable?: boolean; directFailure?: true },
   context: { workerGeneration: number; caller: TrustedCaller | undefined; silent: boolean },
 ): void {
   if (terminal.status === 'completed' && ds.session.workerGeneration === context.workerGeneration) {
@@ -112,12 +128,19 @@ export function recordFailedTurnTerminal(
   if (isAutoCompactSafeComposerRefusal(terminal)) return;
   if (ds.lastCliInputTurnId !== terminal.turnId
       || ds.session.lastFailedTurn?.turnId === terminal.turnId && ds.session.lastFailedTurn.recovery) return;
+  const originalTurnId = ds.session.failedTurnRecovery?.turnId === terminal.turnId
+    ? ds.session.failedTurnRecovery.originalTurnId : terminal.turnId;
+  const crossChatOrigin = failedTurnCrossChatOrigin(ds.session, terminal.turnId)
+    ?? (originalTurnId ? failedTurnCrossChatOrigin(ds.session, originalTurnId) : undefined);
   const record = buildFailedTurnRecord({ ...terminal, status: terminal.status }, {
     userPrompt: ds.lastUserPrompt, cliInput: ds.lastCliInput, codexAppInput: ds.lastCodexAppInput,
     trustedCaller: context.caller, silent: context.silent,
-    originalTurnId: ds.session.failedTurnRecovery?.turnId === terminal.turnId
-      ? ds.session.failedTurnRecovery.originalTurnId : terminal.turnId,
+    originalTurnId,
   });
+  // Where its answer was to go is known only now (HTTP and suppression state
+  // is dropped once the terminal settles): freeze it for the rewind decision.
+  if (record?.directFailure && !context.silent && turnAnswersInChat(ds, terminal.turnId)) record.answersInChat = true;
+  if (record && crossChatOrigin) record.crossChatOrigin = crossChatOrigin;
   if (record) { ds.session.lastFailedTurn = record; store.updateSession(ds.session); }
 }
 
@@ -151,6 +174,11 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
   if (!row || !old || old.turnId !== request.turnId || old.failedAt !== request.failedAt) {
     return { ok: false, error: 'failure_changed' };
   }
+  if (old.crossChatOrigin
+      || failedTurnCrossChatOrigin(row, old.turnId)
+      || failedTurnCrossChatOrigin(row, old.originalTurnId ?? old.turnId)) {
+    return { ok: false, error: 'original_actor_unavailable' };
+  }
   if (old.recovery) {
     return old.recovery.requestId === request.requestId && old.recovery.mode === request.mode
       ? receipt(old) : { ok: false, error: 'failure_already_claimed' };
@@ -171,6 +199,11 @@ export async function recoverFailedTurn(sessionId: string, request: FailedTurnRe
       // replay a provisional quota observation after native recovery succeeds.
       if (record.limitedSnapshot && (!ds.usageLimit?.limited || ds.lastScreenStatus !== 'limited')) {
         return { ok: false, error: 'failure_changed' };
+      }
+      if (record.crossChatOrigin
+          || failedTurnCrossChatOrigin(ds.session, record.turnId)
+          || failedTurnCrossChatOrigin(ds.session, record.originalTurnId ?? record.turnId)) {
+        return { ok: false, error: 'original_actor_unavailable' };
       }
       const caller = record.trustedCaller;
       if (!caller || caller.senderType !== 'user' || caller.requestLarkAppId !== ds.larkAppId

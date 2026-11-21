@@ -62,8 +62,10 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       mimocode: 'global',
       grok: 'global', 'kiro-cli': 'global',
       reasonix: 'global', mojo: 'global',
+      // agy 1.5.x discovers global skills from ~/.gemini/config/skills (verified on 1.5.12).
+      antigravity: 'global',
       // no skill mechanism at all
-      aiden: 'none', 'codex-app': 'none', antigravity: 'none', hermes: 'none', ebsd: 'none',
+      aiden: 'none', 'codex-app': 'none', hermes: 'none', ebsd: 'none',
       // Added by upstream #858: a bundled Node JSON-RPC runner with no skills dir.
       dsh: 'none',
       // PTY-driven TUI variant of dsh; no skills dir of its own.

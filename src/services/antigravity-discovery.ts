@@ -1,10 +1,11 @@
-import { existsSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { listProcessOpenFiles } from '../utils/process-open-files.js';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-const UUID_MATCH_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const CONVERSATION_DB_RE = /^([0-9a-f-]{36})\.db(?:-wal|-shm)?(?: \(deleted\))?$/i;
 
 export interface AntigravityDiscoveryOptions {
   pid?: number;
@@ -62,15 +63,34 @@ function getProcessChildPids(pid: number, procRoot = '/proc'): number[] {
   return children;
 }
 
+/** Logical and canonical trailing-slash prefixes for a directory. A directory
+ *  that does not exist yet (the conversation or its presence lock is created
+ *  lazily on the first submit) simply keeps its logical prefix. */
+function directoryPrefixVariants(directory: string): string[] {
+  const logical = `${directory}/`;
+  try {
+    const canonical = `${realpathSync(directory)}/`;
+    return canonical === logical ? [logical] : [logical, canonical];
+  } catch {
+    return [logical];
+  }
+}
+
+function matchingPrefix(link: string, prefixes: readonly string[]): string | undefined {
+  return prefixes.find(prefix => link.startsWith(prefix));
+}
+
 /**
- * Scan /proc/<pid>/fd (and its child processes) for open SQLite handles
- * matching ~/.gemini/antigravity-cli/conversations/<uuid>.db.
+ * Agy holds a presence lock on the active conversation in the TUI process.
+ * Prefer that descriptor because old brain directories and databases can
+ * remain open after a conversation switch. Older builds without presence
+ * descriptors fall back to a unique brain or database identity across the
+ * process tree (procfs on Linux, lsof on macOS).
  *
- * Fails closed (`null`) when zero or multiple distinct conversation UUIDs are
- * open across the process tree (for example during startup `ListConversations`
- * summary indexing or after `/fork` retains the parent DB alongside the child).
- * Multiple SQLite sidecar descriptors (`.db`, `.db-wal`, `.db-shm`) for the
- * same conversation collapse to one UUID.
+ * `/proc/<pid>/fd` and lsof report the kernel-resolved path, so an fd opened
+ * under a symlinked `$HOME` (or a symlinked parent) carries the canonical
+ * prefix while callers resolve the logical one from `homedir()`; every prefix
+ * is matched in both variants.
  */
 export function findAntigravityConversationIdByPid(
   pid: number,
@@ -78,25 +98,43 @@ export function findAntigravityConversationIdByPid(
   procRoot = '/proc',
 ): string | null {
   if (!Number.isFinite(pid) || pid <= 0) return null;
-  const pidsToScan: number[] = [pid, ...getProcessChildPids(pid, procRoot)];
-  const marker = conversationsDir ?? join('.gemini', 'antigravity-cli', 'conversations');
-  const found = new Map<string, string>();
+  const useProcfs = process.platform === 'linux' || procRoot !== '/proc';
+  const links = useProcfs
+    ? getProcessFds(pid, procRoot)
+    : listProcessOpenFiles(pid) ?? [];
+  const databases = conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations');
+  const presencePrefixes = directoryPrefixVariants(join(dirname(databases), 'presence'));
+  const active = new Set<string>();
+  for (const link of links) {
+    const presencePrefix = matchingPrefix(link, presencePrefixes);
+    if (!presencePrefix || !link.endsWith('.lock')) continue;
+    const id = link.slice(presencePrefix.length, -'.lock'.length);
+    if (UUID_RE.test(id)) active.add(id.toLowerCase());
+  }
+  if (active.size > 0) return active.size === 1 ? [...active][0] : null;
 
-  for (const p of pidsToScan) {
-    const links = getProcessFds(p, procRoot);
-    for (const link of links) {
-      if (!link.includes(marker)) continue;
-      const m = link.match(UUID_MATCH_RE);
-      if (m && UUID_RE.test(m[0])) {
-        const key = m[0].toLowerCase();
-        if (!found.has(key)) {
-          found.set(key, m[0]);
-          if (found.size > 1) return null;
-        }
+  if (useProcfs) {
+    for (const child of getProcessChildPids(pid, procRoot)) links.push(...getProcessFds(child, procRoot));
+  }
+  const databasePrefixes = directoryPrefixVariants(databases);
+  const brainPrefixes = directoryPrefixVariants(join(dirname(databases), 'brain'));
+  let found: string | null = null;
+  for (const link of links) {
+    let id: string | undefined;
+    const brainPrefix = matchingPrefix(link, brainPrefixes);
+    if (brainPrefix) {
+      id = link.slice(brainPrefix.length).split('/')[0];
+    } else {
+      const databasePrefix = matchingPrefix(link, databasePrefixes);
+      if (databasePrefix) {
+        id = CONVERSATION_DB_RE.exec(link.slice(databasePrefix.length))?.[1];
       }
     }
+    if (!id || !UUID_RE.test(id)) continue;
+    if (found && found.toLowerCase() !== id.toLowerCase()) return null;
+    found ??= id;
   }
-  return found.size === 1 ? (found.values().next().value ?? null) : null;
+  return found;
 }
 
 function uriToPath(uri: string): string {

@@ -20,7 +20,7 @@
 | 发消息**完全没反应**（连表情都没有） | 事件订阅、发版或长连接没通 | [A. 完全收不到消息](#a-完全收不到消息) |
 | 只有**我（owner）**能触发，别人 @ 它弹授权卡或不回 | 别人没有对话权 | [B. 别人用不了](#b-别人用不了) |
 | 群里**必须 @ 才回**，想免 @ | 群的 @ 策略 | [B. 别人用不了](#b-别人用不了) |
-| 卡片显示「工作中」，终端里有输出，但**结果没发到飞书** | 模型没调用 `botmux send` | [C. 终端有输出但没发飞书](#c-终端有输出但没发飞书) |
+| 卡片显示「工作中」，终端里有输出，但**结果没发到飞书** | send 模式下模型没调用 `botmux send`，或转写回复没采集到会话记录 | [C. 终端有输出但没发飞书](#c-终端有输出但没发飞书) |
 | 会话**起不来**，首条消息报 `zsh: parse error` | 登录 shell 的启动文件切了 shell | [会话起不来](#会话起不来) |
 
 ### A. 完全收不到消息
@@ -57,13 +57,15 @@ botmux 的权限分两层：
 
 ### C. 终端有输出但没发飞书
 
-终端里打印出来的内容不等于发到了飞书。对需要显式发送的 CLI（Claude Code、Codex CLI、Antigravity、CoCo 等），模型必须执行 `botmux send`，群里才看得到：
+终端里打印出来的内容不等于发到了飞书。先看这个 bot 的回复方式：
 
-- 每条都要带 `--mention-back`、`--mention`、`--no-mention` 三者之一，否则会报错、不发送。
-- 只用 `echo` / `print`，或者忘了调 `botmux send`，就什么都不会发出。
-- 多行内容用 heredoc 传，别写成 `"第一行\n第二行"`。
+- **转写回复**（`replyDelivery: "transcript"`，Claude Code、Codex、TraeX、CoCo、Pi、Grok、Cursor 等的默认）：botmux 从 CLI 的会话记录里取本轮最后的回答发出去。没发出来，通常是会话记录没采集到——群里会有「botmux 没读到这一轮」之类的提示，打开 Web 终端看结果；也可以用 `/botconfig set replyDelivery send` 改回让模型自己发。
+- **send 模式**（显式写了 `replyDelivery: "send"`，或 CLI 不支持转写，如 Antigravity、OpenCode、Relay）：模型必须执行 `botmux send`，群里才看得到。
+  - 每条都要带 `--mention-back`、`--mention`、`--no-mention` 三者之一，否则会报错、不发送。
+  - 只用 `echo` / `print`，或者忘了调 `botmux send`，就什么都不会发出。
+  - 多行内容用 heredoc 传，别写成 `"第一行\n第二行"`。
 
-两种情况不需要模型自己发：
+另外两种情况也不需要模型自己发：
 
 - **`codex-app`**（Codex App 协议）：最终回复由 botmux 自动转发。常规回复别再调 `botmux send`，否则会发两遍；只在中途推进度、发附件、跨 bot @ 时才用。
 - **零注入模式**（`promptInjection: "none"`）：botmux 从 CLI 的对话记录里自动取最终回答发回飞书，见 [bots.json 配置](/bots-json)。

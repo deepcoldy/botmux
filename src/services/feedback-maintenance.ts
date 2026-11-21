@@ -1,3 +1,4 @@
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -47,18 +48,93 @@ export function assertFeedbackAdmission(dataDir: string): void {
 export function feedbackMaintenanceActive(dataDir: string): boolean {
   try { assertFeedbackAdmission(dataDir); return false; } catch { return true; }
 }
+const sendLeaseDirectory = (dataDir: string) => join(dataDir, 'feedback-send-leases');
+/** Admission and the lease write share the control lock, so a lease either
+ *  lands before maintenance starts (and blocks freezing) or is refused. */
+function writeSendLease(
+  dataDir: string,
+  processId: number,
+  identity: string,
+  ownership?: { sessionId: string; releaseTokenHash: string },
+): string {
+  const directory = sendLeaseDirectory(dataDir);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const name = `${processId}-${crypto.randomUUID()}.json`;
+  withFileLockSync(controlPath(dataDir), () => {
+    assertFeedbackAdmission(dataDir);
+    atomicWriteFileSync(join(directory, name), JSON.stringify({
+      processId, processStartId: identity, ...(ownership ?? {}),
+    }), { mode: 0o600, durable: true, followTargetSymlink: false });
+  });
+  return name;
+}
 export function acquireFeedbackSendLease(dataDir: string): () => void {
   mkdirSync(dataDir, { recursive: true });
   const identity = readDurableProcessIdentity(process.pid);
   if (!identity) throw new Error('feedback_process_identity_unavailable');
-  const directory = join(dataDir, 'feedback-send-leases');
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const path = join(directory, `${process.pid}-${crypto.randomUUID()}.json`);
-  withFileLockSync(controlPath(dataDir), () => {
-    assertFeedbackAdmission(dataDir);
-    atomicWriteFileSync(path, JSON.stringify({ processId: process.pid, processStartId: identity }), { mode: 0o600, durable: true, followTargetSymlink: false });
-  });
+  const path = join(sendLeaseDirectory(dataDir), writeSendLease(dataDir, process.pid, identity));
   return () => { try { unlinkSync(path); } catch {} };
+}
+
+/**
+ * Daemon-side lease for a session CLI that cannot take one itself: a macOS
+ * read-isolated `botmux send` can neither exec the setuid `ps` (its own birth
+ * identity) nor write the data dir (denied by the session's Seatbelt policy).
+ * The daemon runs outside the sandbox, so it reads the CLI's exact identity and
+ * writes the same lease the CLI would have written — inspection, liveness and
+ * acknowledgement stay unchanged. The CLI is blocked on this request, so the
+ * pid it reports cannot be recycled before the identity is read.
+ *
+ * Trust boundary: the caller passed `sessionCliIpcAuth` for `sessionId`. The
+ * worst it can do is keep a lease on another of its user's live processes,
+ * which delays a maintenance freeze until that process exits — something a
+ * non-isolated CLI can do by writing the lease directory directly. It can only
+ * release leases recorded for its own session and pid. Acquisition returns a
+ * separate high-entropy release credential; only its SHA-256 hash is persisted,
+ * so a later turn rotation, session close or daemon restart cannot strand a
+ * delivered send without its release path.
+ */
+export function acquireFeedbackSendLeaseFor(
+  dataDir: string,
+  input: { processId: number; sessionId: string },
+): { lease: string; releaseToken: string } {
+  if (!Number.isSafeInteger(input.processId) || input.processId < 2 || input.processId === process.pid || !input.sessionId) {
+    throw new Error('feedback_send_lease_invalid');
+  }
+  mkdirSync(dataDir, { recursive: true });
+  const identity = readDurableProcessIdentity(input.processId);
+  if (!identity) throw new Error('feedback_process_identity_unavailable');
+  const releaseToken = randomBytes(32).toString('base64url');
+  const releaseTokenHash = createHash('sha256').update(releaseToken).digest('hex');
+  const lease = writeSendLease(dataDir, input.processId, identity, { sessionId: input.sessionId, releaseTokenHash });
+  return { lease, releaseToken };
+}
+export function releaseFeedbackSendLeaseFor(
+  dataDir: string,
+  input: { lease: string; processId: number; sessionId: string; releaseToken: string },
+): void {
+  if (!Number.isSafeInteger(input.processId)
+    || !/^[A-Za-z0-9_-]{43}$/.test(input.releaseToken)
+    || !new RegExp(`^${input.processId}-[0-9a-f-]+\\.json$`).test(input.lease)) {
+    throw new Error('feedback_send_lease_invalid');
+  }
+  const path = join(sendLeaseDirectory(dataDir), input.lease);
+  let lease: { processId?: unknown; sessionId?: unknown; releaseTokenHash?: unknown };
+  try { lease = JSON.parse(readFileSync(path, 'utf8')); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw new Error('feedback_send_lease_invalid');
+  }
+  const storedHash = typeof lease.releaseTokenHash === 'string' && /^[a-f0-9]{64}$/.test(lease.releaseTokenHash)
+    ? Buffer.from(lease.releaseTokenHash, 'hex')
+    : undefined;
+  const actualHash = createHash('sha256').update(input.releaseToken).digest();
+  if (lease.processId !== input.processId || lease.sessionId !== input.sessionId
+    || !storedHash || !timingSafeEqual(storedHash, actualHash)) {
+    throw new Error('feedback_send_lease_not_owned');
+  }
+  try { unlinkSync(path); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
 }
 export function writeFeedbackParticipant(dataDir: string, input: Omit<Participant, 'processId' | 'processStartId' | 'updatedAt'>): void {
   const identity = readDurableProcessIdentity(process.pid);
@@ -98,7 +174,7 @@ export function startFeedbackMaintenanceParticipant(
           // Lazy import keeps `pg` out of the daemon/send module-load graph.
           const { closeFeedbackStorage, getFeedbackStorage } = await import('./feedback-storage.js');
           await closeFeedbackStorage(dataDir);
-          if (config.active.backend === 'postgresql') await getFeedbackStorage(dataDir);
+          if (config.generation !== maintenance.generation && config.active.backend !== 'sqlite') await getFeedbackStorage(dataDir);
           ready = true;
         }
       } else if (stoppedOutbox) {
@@ -192,7 +268,7 @@ export async function freezeFeedbackSource(dataDir: string, migrationId: string)
     }
     const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
     if (version < 1 || version > 8) throw new Error('feedback_source_schema_unsupported');
-    const known = new Set<string>([...FEEDBACK_TABLES, 'feedback_source_guard', 'feedback_source_restorations', 'feedback_event_stream']);
+    const known = new Set<string>([...FEEDBACK_TABLES, 'feedback_source_guard', 'feedback_source_restorations', 'feedback_event_stream', 'feedback_event_stream_counter']);
     const tables = database.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[];
     if (tables.some(table => !known.has(table.name))) throw new Error('feedback_source_schema_unsupported');
     if (database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='feedback_source_restorations'").get()
@@ -263,4 +339,12 @@ export async function releaseFeedbackMaintenance(dataDir: string, migrationId: s
     throw new Error('feedback_maintenance_generation_pending');
   }
   withFileLockSync(controlPath(dataDir), () => writeControl(dataDir, { ...report, generation, state: 'complete' }));
+}
+
+export function cancelFeedbackMaintenance(dataDir: string, migrationId: string, generation: number): void {
+  withFileLockSync(controlPath(dataDir), () => {
+    const control = readControl(dataDir);
+    if (!control || control.migrationId !== migrationId || control.generation !== generation) throw new Error('feedback_migration_identity_conflict');
+    writeControl(dataDir, { ...control, state: 'complete' });
+  });
 }

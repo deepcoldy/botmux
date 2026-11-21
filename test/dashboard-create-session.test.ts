@@ -77,6 +77,7 @@ const findQuarantinedRoutingConflictMock = vi.fn((_key: string, _appId: string):
 const runAutoWorktreeCommitMock = vi.fn(async () => {});
 let activeRegistryMock: Map<string, DaemonSession> | null = null;
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   forkWorker: (...a: any[]) => forkWorkerMock(...a),
   recordTurnExplicitMention: (...a: any[]) => recordTurnExplicitMentionMock(...a),
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
@@ -156,7 +157,7 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { getBot } from '../src/bot-registry.js';
 import { getAllBots } from '../src/bot-registry.js';
 import type { ScheduledTask } from '../src/types.js';
-import { setActiveSessionSafe } from '../src/core/worker-pool.js';
+import { setActiveSessionSafe, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
 import {
   applyQueuedCodexAppLegacyFallback,
   mergeQueuedCodexAppTurn,
@@ -217,6 +218,28 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     );
     // banner posted once (postBanner)
     expect(sendMessageMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an explicitly ownerless bot opening ownerless while preserving its creator', async () => {
+    const active = new Map<string, DaemonSession>();
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP,
+      chatId: CHAT,
+      content: 'delegated task',
+      column: 'backlog',
+      role: 'solo',
+      ownerOpenId: null,
+      ownerUnionId: 'on_sender_bot',
+      creatorOpenId: 'ou_sender_bot',
+    });
+
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.session.ownerOpenId).toBeUndefined();
+    expect(ds.session.ownerUnionId).toBeUndefined();
+    expect(ds.ownerOpenId).toBeUndefined();
+    expect(ds.session.creatorOpenId).toBe('ou_sender_bot');
+    expect(store.get(ds.session.sessionId)?.ownerOpenId).toBeUndefined();
+    expect(store.get(ds.session.sessionId)?.ownerUnionId).toBeUndefined();
   });
 
   it('banner posts the FULL content (no 300-char truncation that dropped the tail in the group)', async () => {
@@ -368,6 +391,7 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
         turnId: 'turn-before-crash',
         dispatchAttempt: undefined,
       },
+      expect.objectContaining({ memoryNoticeAudience: 'owner-only' }),
     );
   });
 
@@ -405,7 +429,9 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(restored.session.queued).toBe(false);
     expect(restored.hasHistory).toBe(false);
     expect(restored.session.codexAppDispatchLedger).toHaveLength(1);
-    expect(forkWorkerMock).toHaveBeenCalledWith(restored, '', true);
+    expect(forkWorkerMock).toHaveBeenCalledWith(
+      restored, '', true, expect.objectContaining({ memoryNoticeAudience: 'owner-only' }),
+    );
   });
 
   it('starts a restored pre-clean-input backlog task safely from the Dashboard button', async () => {
@@ -1156,6 +1182,25 @@ describe('spawnDashboardSession — guards', () => {
 });
 
 describe('activateQueuedSession', () => {
+  it('rechecks an opening reservation installed while waiting for the key lock', async () => {
+    const active = new Map<string, DaemonSession>();
+    activeRegistryMock = active;
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: 'original queued task', column: 'backlog', role: 'solo',
+    });
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    forkWorkerMock.mockClear();
+    vi.mocked(withActiveSessionKeyLock).mockImplementationOnce(async (_map, _key, action) => {
+      // Simulate the normal ingress winning before this activation got the lock.
+      ds.initialStartPending = true;
+      return action();
+    });
+
+    await expect(activateQueuedSession(ds)).resolves.toEqual({ ok: true });
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(ds.session.queuedPrompt).toContain('original queued task');
+  });
+
   it('consumes the wrapped queuedPrompt as the first turn, clears queued, moves to in_progress', async () => {
     const active = new Map<string, DaemonSession>();
     await spawnDashboardSession(active, undefined, {

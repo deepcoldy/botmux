@@ -116,6 +116,10 @@ export const BLOCK_META: Record<string, { label: string; hint?: string }> = {
     label: '<summary_memory> /summary 记忆文件规则',
     hint: '首轮与每轮共用',
   },
+  group_task: {
+    label: '/g 任务群开工',
+    hint: '/g 带任务建群后，新群会话的首轮输入',
+  },
   whiteboard_block: {
     label: '<whiteboard> 白板结构化指令',
     hint: '绑定白板的会话，首轮与每轮注入',
@@ -157,6 +161,16 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     label: '开场说明（transcript 自动转发模式）',
     gateLabel: '仅 replyDelivery=transcript（daemon 自动转发最终回复）时替代上面的标准版',
   },
+  {
+    key: 'ai.routing.usage_send_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
+    label: 'botmux send 的使用场景（transcript 模式）',
+    gateLabel: '仅 replyDelivery=transcript 时替代「发送用法」与「@ 决策规则」',
+  },
+  {
+    key: 'ai.routing.no_progress_send_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
+    label: '不用 send 发进度 / 重复最终答复（transcript 模式）',
+    gateLabel: '仅 replyDelivery=transcript 时注入',
+  },
   { key: 'ai.routing.usage_send', block: 'routing_system', stage: 'new', label: '发送用法', kind: 'editable' },
   { key: 'ai.routing.usage_mention_gate', block: 'routing_system', stage: 'new', label: '@ 决策规则', kind: 'editable' },
   { key: 'ai.routing.usage_attachments', block: 'routing_system', stage: 'new', label: '附件用法', kind: 'editable' },
@@ -189,6 +203,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '仅 replyDelivery=transcript 时替代标准版',
   },
   { key: 'ai.shell.commands_are_shell', block: 'routing_shell', stage: 'new', label: 'Shell：命令是 shell 程序、不是 MCP 工具', kind: 'editable' },
+  {
+    key: 'ai.shell.send_scope_transcript', block: 'routing_shell', stage: 'new', kind: 'editable',
+    label: 'Shell：botmux send 的使用场景（transcript 模式）',
+    gateLabel: '仅 replyDelivery=transcript 时替代「如何发送」与「@ 决策」',
+  },
   { key: 'ai.shell.how_to_send', block: 'routing_shell', stage: 'new', label: 'Shell：如何发送', kind: 'editable' },
   { key: 'ai.shell.multiline_heredoc', block: 'routing_shell', stage: 'new', label: 'Shell：多行正文规则（heredoc）', kind: 'editable' },
   { key: 'ai.shell.heredoc_example', block: 'routing_shell', stage: 'new', label: 'Shell：多行正确示例', kind: 'editable' },
@@ -257,6 +276,10 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     label: '凭证：stderr 已附授权链接时', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },
   {
+    key: 'ai.credentials.turn_speakers', block: 'credentials', stage: 'followup', kind: 'placeholder', placeholders: ['speakers'],
+    label: '凭证：本轮多人发言时按人选择身份（BOTMUX_AS）', gateLabel: '仅 trigger-user 鉴权会话且本轮有多位发言人',
+  },
+  {
     key: 'ai.credentials.on_missing_scope', block: 'credentials', stage: 'new', kind: 'editable',
     label: '凭证：missing_scope 补授权流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
   },
@@ -306,6 +329,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     key: 'ai.summary_memory.reuse_guard', block: 'summary_memory', stage: 'new', stages: ['followup'], kind: 'placeholder',
     placeholders: ['path'], label: '记忆：条件不齐只能当参考',
     gateLabel: '仅开启 summaryMemory 时',
+  },
+  {
+    key: 'ai.group_task.intro', block: 'group_task', stage: 'new', kind: 'editable',
+    label: '开工引导语（后接用户原话与来源定位）',
+    gateLabel: '仅 /g 带任务建群后，新群会话的首轮',
   },
   {
     key: 'ai.summary_memory.write_guard', block: 'summary_memory', stage: 'new', stages: ['followup'], kind: 'placeholder',
@@ -421,6 +449,21 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     key: 'ai.send.after_success_unified', block: 'send_feedback', stage: 'send', kind: 'editable',
     label: '统一回复卡片：进度已更新回显',
     gateLabel: '仅本轮发送走统一回复卡片、且发送类型为 progress 时',
+  },
+  {
+    key: 'ai.send.after_success_progress_transcript', block: 'send_feedback', stage: 'send', kind: 'editable',
+    label: '进度发送成功回显（transcript 模式）',
+    gateLabel: '仅 replyDelivery=transcript 的会话替代上面的标准版',
+  },
+  {
+    key: 'ai.send.after_success_unified_transcript', block: 'send_feedback', stage: 'send', kind: 'editable',
+    label: '统一回复卡片：进度已更新回显（transcript 模式）',
+    gateLabel: '仅 replyDelivery=transcript 的会话、本轮走统一回复卡片且发送类型为 progress 时',
+  },
+  {
+    key: 'ai.send.after_success_auxiliary_transcript', block: 'send_feedback', stage: 'send', kind: 'editable',
+    label: '补充消息发送成功回显（transcript 模式）',
+    gateLabel: '仅 replyDelivery=transcript 的会话替代上面的标准版',
   },
 ];
 

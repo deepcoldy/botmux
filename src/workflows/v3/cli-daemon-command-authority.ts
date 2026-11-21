@@ -156,6 +156,14 @@ function readTargetBinding(
   return { source: 'legacy-unbound' };
 }
 
+/** Whether this run has a chat binding and therefore needs per-turn session
+ *  proof on the signed-envelope daemon route. Legacy unbound runs stay on the
+ *  standalone transport path. */
+export function v3RunHasChatBinding(runId: string, baseDir = defaultBaseDir()): boolean {
+  if (!isValidRunId(runId)) throw new V3DaemonCommandAuthorityError(`v3 runId 非法：${runId}`);
+  return !!readTargetBinding(join(baseDir, runId), runId).binding;
+}
+
 /** The exact identity tuple a chat mutation must prove against the binding. */
 export interface V3RunMutationCurrentTuple {
   callerOpenId: string;

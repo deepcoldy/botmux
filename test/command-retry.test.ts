@@ -137,6 +137,7 @@ const { sendWorkerInput, forkWorker, rememberLastCliInput } = vi.hoisted(() => (
 }));
 
 vi.mock('../src/core/worker-pool.js', () => ({
+  dshRuntimeForSession: vi.fn((): 'official' | 'tui' | undefined => undefined),
   sendWorkerInput,
   forkWorker,
   killWorker: vi.fn(),
@@ -294,6 +295,7 @@ import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session, FailedTurnRecord } from '../src/types.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { noteCliRecap, noteRecapCard, noteRecapTurnStarted, recapIdle, type RecapIo } from '../src/core/turn-recap-state.js';
 
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
@@ -408,6 +410,8 @@ describe('/retry command', () => {
     expect(sendWorkerInput).toHaveBeenCalledTimes(1);
     const [sentDs, payload, turnId] = sendWorkerInput.mock.calls[0];
     expect(sentDs).toBe(ds);
+    // A cut of a turn that failed without output re-sends the recorded turn.
+    expect((sendWorkerInput.mock.calls[0] as unknown[])[3]).toMatchObject({ failedTurnResendOf: makeFailedTurn().turnId });
     expect(payload).toMatchObject({ content: '<user-prompt>fix the flaky test</user-prompt>' });
     expect(forkWorker).not.toHaveBeenCalled();
     // Cooldown/retry state stamped onto the persisted record.
@@ -420,6 +424,34 @@ describe('/retry command', () => {
     expect(turnId).toEqual(expect.any(String));
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
     expect(deps.sessionReply).toHaveBeenCalledWith(ROOT_ID, expect.stringContaining('已重新提交'), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('takes the「本轮回顾」over from the previous turn', async () => {
+    const ds = makeDaemonSession({
+      worker: aliveWorker() as any,
+      session: makeSession({ lastFailedTurn: makeFailedTurn() }),
+    });
+    const readBack: string[] = [];
+    const published: string[] = [];
+    const io: RecapIo = {
+      enabled: () => true, locale: () => 'zh',
+      readCard: async (_ds, messageId) => { readBack.push(messageId); return undefined; },
+      cardId: async () => 'card', insert: async () => {}, replace: async () => {},
+      now: () => Date.now(), warn: () => {},
+    };
+    noteRecapTurnStarted(ds, 'om_turn_done');
+    noteRecapCard(ds, 'om_turn_done', { kind: 'legacy', messageId: 'om_card_done' }, io);
+    await recapIdle(ds);
+    await handleCommand('/retry', ROOT_ID, makeLarkMessage('/retry'), makeDeps(ds), LARK_APP_ID);
+    const retryTurnId = sendWorkerInput.mock.calls[0][2] as string;
+    noteRecapCard(ds, retryTurnId, { kind: 'unified', publish: async markdown => { published.push(markdown); } }, io);
+    // A late recap of the turn the retry replaced goes nowhere.
+    noteCliRecap(ds, 'om_turn_done', '上一轮的回顾', io);
+    noteCliRecap(ds, retryTurnId, '重试这一轮的回顾', io);
+    await recapIdle(ds);
+    expect(readBack).toEqual([]);
+    expect(published.at(-1)).toContain('重试这一轮的回顾');
+    expect(published.join('\n')).not.toContain('上一轮的回顾');
   });
 
   it('routes a new retry turn to the failed topic even after another topic becomes current', async () => {

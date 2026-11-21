@@ -34,6 +34,12 @@ import {
   settleUntilDoneSkip,
 } from './schedule-until-done.js';
 
+/** Whose identity a new task's scheduled turns run as. Every creation path
+ *  states it: a human creator, or no user identity at all. */
+export type ScheduleOwner =
+  | { kind: 'human'; openId: string; unionId?: string }
+  | { kind: 'ownerless' };
+
 /** Reasoning levels a task may pin. Mirrors CODEX_REASONING_EFFORTS; spelled out
  *  here because this module is the storage layer and must not depend on the CLI
  *  adapter services. */
@@ -123,6 +129,10 @@ export function canonicalScheduleInput(t: {
    *  scheduled-turn-provenance). Part of canonical input: the same workflow
    *  attempt run as a different creator is a different schedule. */
   ownerOpenId?: string;
+  /** Talk-only creator marker (see ScheduledTask.ownerAccess). Part of
+   *  canonical input so an administrator-shaped and a talker-shaped task with
+   *  the same id never read as the same request. */
+  ownerAccess?: 'talk';
   untilDone?: Pick<ScheduleUntilDone, 'deadline' | 'retryMinutes'>;
   notify?: readonly ScheduleNotifyEvent[];
 }): unknown {
@@ -175,6 +185,7 @@ export function canonicalScheduleInput(t: {
     // slot is dropped by computeInputHash and their canonical JSON is
     // byte-for-byte unchanged.
     ownerOpenId: t.ownerOpenId?.trim() || undefined,
+    ownerAccess: t.ownerAccess === 'talk' ? 'talk' : undefined,
     // Until-done configuration is caller intent; its runtime state (status,
     // attempts, closing-run bookkeeping) is not. Both are absent on every
     // pre-existing task, so their canonical JSON stays byte-for-byte the same.
@@ -396,6 +407,9 @@ function migrate(raw: any): ScheduledTask | null {
     // "no creator".
     ownerOpenId: raw.ownerOpenId,
     ownerUnionId: raw.ownerUnionId,
+    // Same trap: a talker marker that is not rebuilt here would turn a
+    // talk-only creator's task back into an administrator-shaped one on reload.
+    ownerAccess: raw.ownerAccess === 'talk' ? 'talk' : undefined,
     // Same trap as the creator pair above: a claim that is not rebuilt here is
     // dropped on the next reload and the task falls back to having no identity.
     runAsClaim: parseScheduleRunAsClaim(raw.runAsClaim),
@@ -685,7 +699,7 @@ function assertValidTaskId(id: string): void {
  * Use `wf_<hash...>` prefixed ids when called from workflow runtime to
  * avoid collisions with the 8-char randomUUID legacy namespace.
  */
-export function createTask(params: {
+export function createTask(input: {
   id?: string;
   preconditionRef?: string;
   calendar?: string;
@@ -706,8 +720,6 @@ export function createTask(params: {
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
-  ownerOpenId?: string;
-  ownerUnionId?: string;
   nextRunAt?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -718,7 +730,16 @@ export function createTask(params: {
   /** Initial until-done state, already validated by scheduler.addTask. */
   untilDone?: ScheduleUntilDone;
   notify?: ScheduleNotifyEvent[];
+  owner: ScheduleOwner;
+  /** See ScheduledTask.ownerAccess. Only meaningful with a human owner. */
+  ownerAccess?: 'talk';
 }, authoritativeCreate?: (task: ScheduledTask) => ScheduledTask): ScheduledTask {
+  const { owner, ...fields } = input;
+  const params = {
+    ...fields,
+    ownerOpenId: owner.kind === 'human' ? owner.openId : undefined,
+    ownerUnionId: owner.kind === 'human' ? owner.unionId : undefined,
+  };
   const targets = normalizeScheduleChatTargets({ chatId: params.chatId, chatIds: params.chatIds });
   if (params.id) assertValidTaskId(params.id);
   if (authoritativeCreate) {
@@ -793,6 +814,7 @@ export function createTask(params: {
       creatorLarkAppId: params.creatorLarkAppId,
       ownerOpenId: params.ownerOpenId,
       ownerUnionId: params.ownerUnionId,
+      ownerAccess: params.ownerAccess,
       enabled: true,
       createdAt: new Date().toISOString(),
       nextRunAt: params.nextRunAt,

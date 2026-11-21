@@ -213,6 +213,19 @@ describe('record sink', () => {
     expect(sink).not.toHaveBeenCalled();
   });
 
+  it('does not fire for reset markers or attach a guessed price', () => {
+    const sink = vi.fn();
+    setUsageLedgerRecordSink(sink);
+    recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(100, 10), pricing: { usdCny: 7.2 } });
+    sink.mockClear();
+
+    expect(recordSessionUsage({ ...baseArgs(), ledgerDir: dir, usage: cumulative(20, 5), pricing: { usdCny: 7.2 } })).toBeNull();
+    expect(sink).not.toHaveBeenCalled();
+    const reset = ledgerLines(dir).find(row => row.kind === 'reset');
+    expect(reset).toMatchObject({ inputTokens: 0, outputTokens: 0, totalInputTokens: 20, epoch: 1 });
+    expect(reset).not.toHaveProperty('costCny');
+  });
+
   it('survives a throwing sink: the record still lands', () => {
     const sink = vi.fn(() => { throw new Error('boom'); });
     setUsageLedgerRecordSink(sink);

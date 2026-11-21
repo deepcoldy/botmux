@@ -52,8 +52,10 @@ const TOGGLE_FIELDS: ReadonlySet<string> = new Set([
   'publicReadOnly',
   'openTerminalInFeishu',
   'enableLocalCliOpen',
+  'modelQueueNotify',
   'autoUpdate',
   'autoRestart',
+  'notifyOnNewVersion',
 ]);
 
 /** Builder opts intentionally exclude sender union identity. */
@@ -372,8 +374,11 @@ export function buildPatchFromAction(
         return { ok: false, error: 'invalid_value' };
       }
       const next = raw === 'true';
-      if (field === 'publicReadOnly' || field === 'openTerminalInFeishu' || field === 'enableLocalCliOpen') {
+      if (field === 'publicReadOnly' || field === 'openTerminalInFeishu' || field === 'enableLocalCliOpen' || field === 'modelQueueNotify') {
         return { ok: true, value: { [field]: next } };
+      }
+      if (field === 'notifyOnNewVersion') {
+        return { ok: true, value: { maintenance: { notifyOnNewVersion: next } } };
       }
       return { ok: true, value: { maintenance: { [field]: { enabled: next } } } };
     }

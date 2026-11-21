@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { bridgeSpecFor } from '../src/adapters/cli/registry.js';
 import {
   antigravityRecoveryBindPath,
   decideAntigravityFullUpgrade,
@@ -190,12 +191,16 @@ describe('Antigravity startup session discovery & zero-prompt bridge rebind', ()
       nativeSessionForkPending: () => false,
       resolveFileBridgePath: (_cliId: string, opts: { sessionId?: string }) =>
         resolveAntigravityTranscriptPath(opts.sessionId, { brainDir }) ?? undefined,
-      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean }) => {
+      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean; retireAntigravityPendingTurns?: boolean }) => {
         const res = drainAntigravityTranscript(
           path,
           offset,
           (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
-          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal },
+          {
+            flushTrailingFinal: opts?.flushAntigravityTrailingFinal,
+            retirePendingTurns: opts?.retireAntigravityPendingTurns,
+            adoptMode: scope.lastInitConfig?.adoptMode === true,
+          },
         );
         return { ...res, state: res.state };
       },
@@ -304,12 +309,16 @@ describe('Antigravity startup session discovery & zero-prompt bridge rebind', ()
       nativeSessionForkPending: () => false,
       resolveFileBridgePath: (_cliId: string, opts: { sessionId?: string }) =>
         resolveAntigravityTranscriptPath(opts.sessionId, { brainDir }) ?? undefined,
-      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean }) => {
+      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean; retireAntigravityPendingTurns?: boolean }) => {
         const res = drainAntigravityTranscript(
           path,
           offset,
           (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
-          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal },
+          {
+            flushTrailingFinal: opts?.flushAntigravityTrailingFinal,
+            retirePendingTurns: opts?.retireAntigravityPendingTurns,
+            adoptMode: scope.lastInitConfig?.adoptMode === true,
+          },
         );
         return { ...res, state: res.state };
       },
@@ -522,12 +531,16 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
         }
         return undefined;
       },
-      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean }) => {
+      structuredBridgeIngestPath: (path: string, offset: number, opts?: { flushAntigravityTrailingFinal?: boolean; retireAntigravityPendingTurns?: boolean }) => {
         const res = drainAntigravityTranscript(
           path,
           offset,
           (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
-          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal },
+          {
+            flushTrailingFinal: opts?.flushAntigravityTrailingFinal,
+            retirePendingTurns: opts?.retireAntigravityPendingTurns,
+            adoptMode: scope.lastInitConfig?.adoptMode === true,
+          },
         );
         return { ...res, state: res.state };
       },
@@ -567,7 +580,7 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     scope.codexBridgeAttach = loadWorkerFunction('codexBridgeAttach', scope);
     scope.codexBridgeIngest = loadWorkerFunction('codexBridgeIngest', scope);
     scope.codexBridgeStartTimer = loadWorkerFunction('codexBridgeStartTimer', scope);
-    const notify = loadWorkerFunction<(sid: string) => void>('codexBridgeNotifyCliSessionId', scope);
+    const notify = loadWorkerFunction<(sid: string, options?: { preserveLiveTurn?: boolean }) => void>('codexBridgeNotifyCliSessionId', scope);
     const tick = () => {
       if (!tickCallback) throw new Error('bridge ticker was not armed');
       tickCallback();
@@ -579,6 +592,346 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     };
     return { scope, queue, emittedFinals, pidLookups, makeTranscript, notify, tick, flushQuietFinal };
   }
+
+  it.each([
+    { via: 'notify', adoptMode: true },
+    { via: 'notify', adoptMode: true, bufferedInput: true },
+    { via: 'notify', adoptMode: true, skipOldIngest: true },
+    { via: 'notify', adoptMode: true, failAfterIngest: true },
+    { via: 'notify', adoptMode: false },
+    { via: 'notify', adoptMode: false, bufferedInput: true },
+    { via: 'notify', adoptMode: false, skipOldIngest: true },
+    { via: 'notify', adoptMode: false, failAfterIngest: true },
+    { via: 'ticker', adoptMode: false },
+    { via: 'ticker', adoptMode: false, bufferedInput: true },
+    { via: 'ticker', adoptMode: false, skipOldIngest: true },
+  ])('settles a retired subagent wait before the new conversation reply ($via, adopt=$adoptMode, buffered=$bufferedInput, unread=$skipOldIngest, failure=$failAfterIngest)', ({ via, adoptMode, bufferedInput, skipOldIngest, failAfterIngest }) => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.lastInitConfig.adoptMode = adoptMode;
+    const oldPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    h.queue.mark('old-turn', 'Old request', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(oldPath, 1, 'Old request');
+    appendFileSync(oldPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(oldPath, 3, 'Waiting for subagent');
+    if (skipOldIngest) {
+      // /new can precede fs.watch/the next poll, so retirement must discover
+      // and settle this owner in one drain before detaching the old file.
+      expect(h.queue.peek()[0]).toMatchObject({ turnId: 'old-turn', started: false });
+    } else {
+      h.scope.codexBridgeIngest();
+      expect(h.queue.peek()[0]).toMatchObject({ turnId: 'old-turn', started: true });
+      expect(h.queue.peek()[0]?.finalText).toBeUndefined();
+      expect(h.scope.structuredBridgeDriverState.pendingSubagentIds).toEqual(['pending-agent']);
+    }
+    if (bufferedInput) {
+      h.queue.mark('intermediate-turn', 'Intermediate request', Date.now(), undefined, undefined, undefined, adoptMode);
+      writeAntigravityUserStep(oldPath, 4, 'Intermediate request');
+      appendFileSync(oldPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-second-agent" }' }) + '\n');
+      writeAntigravityFinalStep(oldPath, 6, 'Waiting for second subagent');
+    }
+    if (failAfterIngest) {
+      // Fail after events/state are committed but before retirement selects
+      // the old owner. The next ingest must not fail again during the probe.
+      let failOnce = true;
+      h.scope.observeStructuredBackgroundTasks = () => {
+        if (failOnce) {
+          failOnce = false;
+          throw new Error('injected post-ingest failure');
+        }
+      };
+    }
+    const nextPath = h.makeTranscript(REAL_ID);
+    h.queue.mark('new-turn', 'New request', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(nextPath, 1, 'New request');
+    writeAntigravityFinalStep(nextPath, 2, 'New answer');
+    if (via === 'ticker') {
+      h.scope.codexBridgePendingSessionId = REAL_ID;
+      h.scope.codexBridgeStartTimer();
+      h.tick();
+    } else {
+      h.notify(REAL_ID);
+    }
+    if (failAfterIngest) {
+      expect(h.scope.log.mock.calls.some(([message]: [string]) =>
+        /pre-rotation bridge drain failed: injected post-ingest failure/.test(message))).toBe(true);
+    }
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([
+      { turnId: 'old-turn', text: '' },
+      ...(bufferedInput ? [{ turnId: 'intermediate-turn', text: '' }] : []),
+      { turnId: 'new-turn', text: 'New answer' },
+    ]);
+    expect(h.queue.peek()).toEqual([]);
+    expect(h.scope.codexBridgeRolloutPath).toBe(nextPath);
+    // The retired transcript can still receive results; it is no longer read.
+    appendFileSync(oldPath, JSON.stringify({ type: 'SYSTEM_MESSAGE', content: '[Message] sender=pending-agent content=late result' }) + '\n');
+    writeAntigravityFinalStep(oldPath, 5, 'Old late final');
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toHaveLength(bufferedInput ? 3 : 2);
+  });
+
+  it.each([
+    { via: 'notify', adoptMode: false },
+    { via: 'notify', adoptMode: true },
+    { via: 'ticker', adoptMode: false },
+    { via: 'ticker', adoptMode: true },
+  ])('migrates an already-attributed live owner on authoritative rebind ($via, adopt=$adoptMode)', ({ via, adoptMode }) => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.lastInitConfig.adoptMode = adoptMode;
+    if (adoptMode) h.queue.setLocalTurns(true, Date.now() - 1000);
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    h.queue.mark('live-turn', 'Same live request', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(siblingPath, 1, 'Same live request');
+    appendFileSync(siblingPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(siblingPath, 3, 'Sibling waiting narration');
+    h.scope.codexBridgeIngest();
+    expect(h.queue.peek()[0]).toMatchObject({ turnId: 'live-turn', started: true });
+    expect(h.queue.peek()[0]?.finalText).toBeUndefined();
+
+    // No newer Lark mark exists: the authoritative file contains the SAME
+    // turn's answer, not a replacement request.
+    if (via === 'notify') {
+      const realPath = h.makeTranscript(REAL_ID);
+      writeAntigravityUserStep(realPath, 1, 'Same live request');
+      writeAntigravityFinalStep(realPath, 2, 'REAL_LIVE_ANSWER');
+      h.notify(REAL_ID, { preserveLiveTurn: true });
+      expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+    } else {
+      h.notify(REAL_ID, { preserveLiveTurn: true });
+      expect(h.scope.codexBridgePendingSessionId).toBe(REAL_ID);
+      expect(h.scope.antigravityPendingRebind).toBe(true);
+      // REAL is not readable yet. A sibling callback and quiet tick must not
+      // settle the live owner with the wrong answer while rebind is pending.
+      appendFileSync(siblingPath, JSON.stringify({ type: 'SYSTEM_MESSAGE', content: '[Message] sender=pending-agent content=sibling result' }) + '\n');
+      writeAntigravityFinalStep(siblingPath, 4, 'WRONG_SIBLING_FINAL');
+      h.flushQuietFinal();
+      expect(h.emittedFinals).toEqual([]);
+      expect(h.scope.codexBridgeRolloutPath).toBe(siblingPath);
+      expect(h.queue.peek()[0]?.finalText).toBeUndefined();
+      const realPath = h.makeTranscript(REAL_ID);
+      writeAntigravityUserStep(realPath, 1, 'Same live request');
+      writeAntigravityFinalStep(realPath, 2, 'REAL_LIVE_ANSWER');
+      h.tick();
+      expect(h.scope.codexBridgeRolloutPath).toBe(realPath);
+      expect(h.scope.antigravityPendingRebind).toBe(false);
+    }
+    expect(h.emittedFinals).toEqual([]);
+    if (adoptMode) {
+      expect(h.queue.peek()[0]?.sourceTurnId).toMatch(/^.*transcript_full\.jsonl:0$/);
+      expect(h.queue.peek()[0]?.sourceTurnId).toContain(REAL_ID);
+    }
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([{ turnId: 'live-turn', text: 'REAL_LIVE_ANSWER' }]);
+    expect(h.queue.peek()).toEqual([]);
+  });
+
+  it.each([false, true])('deduplicates started users without absorbing same-text successors (adopt=%s)', adoptMode => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.lastInitConfig.adoptMode = adoptMode;
+    if (adoptMode) h.queue.setLocalTurns(true, Date.now() - 1000);
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    h.queue.mark('turn-a', 'Repeat', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(siblingPath, 1, 'Repeat');
+    appendFileSync(siblingPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(siblingPath, 3, 'Sibling waiting narration');
+    h.scope.codexBridgeIngest();
+    h.queue.mark('turn-b', 'Repeat', Date.now(), undefined, undefined, undefined, adoptMode);
+
+    const realPath = h.makeTranscript(REAL_ID);
+    writeAntigravityUserStep(realPath, 1, 'Repeat');
+    writeAntigravityFinalStep(realPath, 2, 'REAL_A');
+    h.notify(REAL_ID, { preserveLiveTurn: true });
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([{ turnId: 'turn-a', text: 'REAL_A' }]);
+    expect(h.queue.peek()).toHaveLength(1);
+    expect(h.queue.peek()[0]).toMatchObject({ turnId: 'turn-b', started: false });
+    expect(h.queue.peek()[0]?.finalText).toBeUndefined();
+
+    // Only A's already-owned user was absorbed. B's later record must still
+    // start and settle its own same-text turn normally.
+    writeAntigravityUserStep(realPath, 3, 'Repeat');
+    writeAntigravityFinalStep(realPath, 4, 'REAL_B');
+    h.scope.codexBridgeIngest();
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([
+      { turnId: 'turn-a', text: 'REAL_A' },
+      { turnId: 'turn-b', text: 'REAL_B' },
+    ]);
+    expect(h.queue.peek()).toEqual([]);
+  });
+
+  it.each([false, true])('reconciles REAL history instead of replaying it (adopt=%s)', adoptMode => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.lastInitConfig.adoptMode = adoptMode;
+    if (adoptMode) h.queue.setLocalTurns(true, Date.now() - 1000);
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+
+    h.queue.mark('turn-a', 'Request A', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(siblingPath, 1, 'Request A');
+    writeAntigravityFinalStep(siblingPath, 2, 'ANSWER_A');
+    h.scope.codexBridgeIngest();
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([{ turnId: 'turn-a', text: 'ANSWER_A' }]);
+
+    h.queue.mark('turn-b', 'Request B', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(siblingPath, 3, 'Request B');
+    appendFileSync(siblingPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(siblingPath, 5, 'Waiting for B');
+    h.scope.codexBridgeIngest();
+    expect(h.queue.peek()[0]).toMatchObject({ turnId: 'turn-b', started: true });
+
+    const realPath = h.makeTranscript(REAL_ID);
+    writeAntigravityUserStep(realPath, 1, 'Request A');
+    writeAntigravityFinalStep(realPath, 2, 'ANSWER_A');
+    writeAntigravityUserStep(realPath, 3, 'Request B');
+    writeAntigravityFinalStep(realPath, 4, 'REAL_B');
+    h.notify(REAL_ID, { preserveLiveTurn: true });
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([
+      { turnId: 'turn-a', text: 'ANSWER_A' },
+      { turnId: 'turn-b', text: 'REAL_B' },
+    ]);
+    expect(h.queue.peek()).toEqual([]);
+  });
+
+  it.each([
+    { shape: 'different-text', adoptMode: false },
+    { shape: 'different-text', adoptMode: true },
+    { shape: 'old-same-text', adoptMode: false },
+    { shape: 'old-same-text', adoptMode: true },
+    { shape: 'ambiguous-same-text', adoptMode: false },
+    { shape: 'ambiguous-same-text', adoptMode: true },
+  ])('reconciles an unstarted live mark against REAL history ($shape, adopt=$adoptMode)', ({ shape, adoptMode }) => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.lastInitConfig.adoptMode = adoptMode;
+    if (adoptMode) h.queue.setLocalTurns(true, Date.now() - 1000);
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    const sameText = shape !== 'different-text';
+    const textA = sameText ? 'Same text' : 'Request A';
+    const textB = sameText ? 'Same text' : 'Request B';
+
+    h.queue.mark('turn-a', textA, Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(siblingPath, 1, textA);
+    writeAntigravityFinalStep(siblingPath, 2, 'ANSWER_A');
+    h.scope.codexBridgeIngest();
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([{ turnId: 'turn-a', text: 'ANSWER_A' }]);
+    h.queue.mark('turn-b', textB, Date.now(), undefined, undefined, undefined, adoptMode);
+
+    const realPath = h.makeTranscript(REAL_ID);
+    if (shape === 'old-same-text') {
+      appendFileSync(realPath, JSON.stringify({ type: 'USER_INPUT', source: 'USER_EXPLICIT', step_index: 1,
+        created_at: new Date(Date.now() - 60_000).toISOString(), content: textA }) + '\n');
+    } else {
+      writeAntigravityUserStep(realPath, 1, textA);
+    }
+    writeAntigravityFinalStep(realPath, 2, 'ANSWER_A');
+    writeAntigravityUserStep(realPath, 3, textB);
+    writeAntigravityFinalStep(realPath, 4, 'REAL_B');
+    h.notify(REAL_ID, { preserveLiveTurn: true });
+    h.flushQuietFinal();
+
+    if (shape === 'ambiguous-same-text') {
+      // Two recent same-text users are ambiguous. Do not bind the first one or
+      // replay it as a local turn; keep the old binding and retry later.
+      expect(h.scope.antigravityPendingRebind).toBe(true);
+      expect(h.scope.codexBridgeRolloutPath).toBe(siblingPath);
+      expect(h.emittedFinals).toEqual([{ turnId: 'turn-a', text: 'ANSWER_A' }]);
+      expect(h.queue.peek()[0]).toMatchObject({ turnId: 'turn-b', started: false });
+    } else {
+      expect(h.emittedFinals).toEqual([
+        { turnId: 'turn-a', text: 'ANSWER_A' },
+        { turnId: 'turn-b', text: 'REAL_B' },
+      ]);
+      expect(h.queue.peek()).toEqual([]);
+    }
+  });
+
+  it.each([false, true])('refuses ambiguous same-text matches for a started owner (adopt=%s)', adoptMode => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.lastInitConfig.adoptMode = adoptMode;
+    if (adoptMode) h.queue.setLocalTurns(true, Date.now() - 1000);
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    h.queue.mark('live-turn', 'Same text', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(siblingPath, 1, 'Same text');
+    appendFileSync(siblingPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(siblingPath, 3, 'Waiting');
+    h.scope.codexBridgeIngest();
+    const previousSource = h.queue.peek()[0]?.sourceTurnId;
+
+    const realPath = h.makeTranscript(REAL_ID);
+    writeAntigravityUserStep(realPath, 1, 'Same text');
+    writeAntigravityFinalStep(realPath, 2, 'ANSWER_A');
+    writeAntigravityUserStep(realPath, 3, 'Same text');
+    writeAntigravityFinalStep(realPath, 4, 'REAL_B');
+    h.notify(REAL_ID, { preserveLiveTurn: true });
+    h.flushQuietFinal();
+    expect(h.scope.antigravityPendingRebind).toBe(true);
+    expect(h.scope.codexBridgeRolloutPath).toBe(siblingPath);
+    expect(h.queue.peek()[0]?.sourceTurnId).toBe(previousSource);
+    expect(h.emittedFinals).toEqual([]);
+    expect(h.queue.peek()[0]?.finalText).toBeUndefined();
+  });
+
+  it.each([false, true])('binds adopt/managed owners to the actual REAL user offset (adopt=%s)', adoptMode => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.lastInitConfig.adoptMode = adoptMode;
+    if (adoptMode) h.queue.setLocalTurns(true, Date.now() - 1000);
+    const siblingPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    h.queue.mark('live-turn', 'Same live request', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(siblingPath, 1, 'Same live request');
+    appendFileSync(siblingPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(siblingPath, 3, 'Sibling waiting narration');
+    h.scope.codexBridgeIngest();
+
+    const realPath = h.makeTranscript(REAL_ID);
+    appendFileSync(realPath, JSON.stringify({ type: 'CHECKPOINT', content: 'prefix shifts the real user offset' }) + '\n');
+    writeAntigravityUserStep(realPath, 2, 'Same live request');
+    writeAntigravityFinalStep(realPath, 3, 'REAL_LIVE_ANSWER');
+    h.notify(REAL_ID, { preserveLiveTurn: true });
+    if (adoptMode) expect(h.queue.peek()[0]?.sourceTurnId).not.toBe(`${realPath}:0`);
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([{ turnId: 'live-turn', text: 'REAL_LIVE_ANSWER' }]);
+    expect(h.queue.peek()).toEqual([]);
+  });
+
+  it('threads retirement through the real ingest path and adapter for managed buffered input', () => {
+    const path = join(root, 'managed-retirement.jsonl');
+    writeFileSync(path, '');
+    writeAntigravityUserStep(path, 1, 'Old request');
+    appendFileSync(path, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(path, 3, 'Waiting for subagent');
+    const first = drainAntigravityTranscript(path, 0);
+    expect(first.state.pendingSubagentIds).toEqual(['pending-agent']);
+    writeAntigravityUserStep(path, 4, 'Intermediate request');
+
+    const scope: Record<string, any> = {
+      lastInitConfig: { cliId: 'antigravity', adoptMode: false },
+      structuredBridgeDriverState: first.state,
+      bridgeSpecFor,
+      structuredBridgeIs: (id: string) => id === 'antigravity',
+      nativeGoalSourcePath: undefined,
+      nativeGoalGeneration: -1,
+      cliSpawnGeneration: 1,
+      nativeGoalCardEnabled: () => false,
+    };
+    const ingest = loadWorkerFunction<(
+      path: string,
+      offset: number,
+      opts?: { retireAntigravityPendingTurns?: boolean },
+    ) => ReturnType<typeof drainAntigravityTranscript>>('structuredBridgeIngestPath', scope);
+    const retired = ingest(path, first.newOffset, { retireAntigravityPendingTurns: true });
+    expect(retired.events.map(event => event.kind)).toEqual(['turn_aborted', 'user']);
+    expect(retired.events[0]).toMatchObject({ text: '' });
+    expect(retired.events[1]).toMatchObject({ text: 'Intermediate request' });
+  });
 
   it('ticker stays unbound through the startup window instead of pid-probing a sibling DB, then binds the streamed conversation', async () => {
     const { adapter, logPath } = await startupAdapter();
@@ -652,7 +1005,7 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     runNextTimer();
     expect(persistCliSessionId.mock.calls).toEqual([[REAL_ID]]);
     expect(ensureAntigravityCotReader.mock.calls).toEqual([[REAL_ID]]);
-    expect(codexBridgeNotifyCliSessionId.mock.calls).toEqual([[REAL_ID]]);
+    expect(codexBridgeNotifyCliSessionId.mock.calls).toEqual([[REAL_ID, { preserveLiveTurn: true }]]);
     expect(timers).toEqual([]);
     expect(pidProbe).not.toHaveBeenCalled();
   });

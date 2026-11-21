@@ -237,8 +237,9 @@ function hostRequiresCredentialIsolation(plugins?: string[]): boolean {
  * tools and hooks left on, only the env / wrapper / profile this module
  * reproduces — so it is allowed only for a plain local launch it provably
  * matches. Anything else keeps the placeholder name: a sandboxed bot or an
- * enrolled host (mandatory credential isolation), the Forge launch mode, and a
- * private or pooled CODEX_HOME. Remote CLIs have no one-shot template at all.
+ * enrolled host (mandatory credential isolation), the Forge launch mode, a
+ * private or pooled CODEX_HOME, and a per-bot `credentialsSourceDir` (the bot
+ * runs as that account; the one-shot would use the shared login). Remote CLIs have no one-shot template at all.
  * Fails closed on an unresolvable sandbox mode.
  */
 export function oneShotTitleAllowed(cfg: {
@@ -248,10 +249,15 @@ export function oneShotTitleAllowed(cfg: {
   cliLaunchMode?: string;
   codexAuthSync?: string;
   codexInstancePool?: unknown;
+  credentialsSourceDir?: unknown;
   plugins?: string[];
 }): boolean {
   if (!supportsOneShotTitle(cfg.cliId)) return false;
   if (cfg.cliLaunchMode || cfg.codexAuthSync === 'isolated' || cfg.codexInstancePool) return false;
+  // Any configured value, valid or not: never title under the shared login a
+  // bot was configured away from.
+  const source = cfg.credentialsSourceDir;
+  if (source != null && !(typeof source === 'string' && !source.trim())) return false;
   try {
     if (resolveSandboxMode({
       configSandbox: cfg.sandbox,

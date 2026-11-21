@@ -16,6 +16,7 @@ export type LegacyWorkflowRetirementReason =
   | 'identity_conflict';
 
 export interface TriggerRequest {
+  actor?: 'owner';
   source: {
     type: TriggerSourceType;
     connectorId?: string;
@@ -130,6 +131,8 @@ export interface TriggerRequest {
 export type TriggerErrorCode =
   | 'bad_json'
   | 'bad_request'
+  | 'actor_not_allowed'
+  | 'owner_unresolved'
   | 'bot_not_found'
   | 'bot_not_in_chat'
   | 'daemon_offline'
@@ -162,6 +165,7 @@ export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'interrupte
 
 export interface TriggerResponse {
   ok: boolean;
+  actor?: 'owner';
   triggerId?: string;
   action?: TriggerAction;
   /** Four-state async lifecycle. Present on trigger-result (async polling)
@@ -246,6 +250,10 @@ export function isRecord(v: unknown): v is Record<string, unknown> {
   return !!v && typeof v === 'object' && !Array.isArray(v);
 }
 
+export function hasTriggerActor(raw: unknown): boolean {
+  return isRecord(raw) && Object.hasOwn(raw, 'actor');
+}
+
 export function validateTriggerRequest(raw: unknown): { ok: true; request: TriggerRequest } | { ok: false; status: number; body: TriggerResponse } {
   if (!isRecord(raw)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'request body must be an object' } };
@@ -255,6 +263,16 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   const envelope = raw.envelope;
   if (!isRecord(source) || !isRecord(target) || !isRecord(envelope)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'source, target, and envelope are required objects' } };
+  }
+  if (hasTriggerActor(raw)) {
+    if (raw.actor !== 'owner' || Object.hasOwn(envelope, 'payload') || Object.hasOwn(envelope, 'rawText')) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'actor must be owner and cannot carry envelope.payload or envelope.rawText' } };
+    }
+    if (target.kind !== 'turn' || typeof target.botId !== 'string' || !target.botId.trim()
+      || typeof target.sessionId !== 'string' || !target.sessionId.trim()
+      || typeof raw.instruction !== 'string' || !raw.instruction.trim()) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'owner actor requires a turn target with botId, sessionId, and a non-empty instruction' } };
+    }
   }
   // An unknown source.type must fail at the edge: triggerSessionTurn records
   // it verbatim and `execution current` then fails its own origin enum check

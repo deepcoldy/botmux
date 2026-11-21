@@ -23,7 +23,7 @@ The reply looks roughly like:
 Just start chatting in the new group — the whole group is one CLI session.
 ```
 
-> Creating the group **does not start a session**. The session starts when you send your first message in the new group.
+> Creating the group **does not start a session**. The session starts when you send your first message in the new group. To create the group and start on a task right away, add `--start`; see "Create and start a task" below.
 
 botmux has two kinds of "session group". This page covers both:
 
@@ -38,6 +38,7 @@ botmux has two kinds of "session group". This page covers both:
 ### Group name and avatar
 
 - **With a name**: your name is used and never changed afterwards.
+- **Starting a task** (`--start`): the first 20 characters of the task name the group, then a short title generated from the task replaces it (see "Create and start a task").
 - **Without a name** (just `/g`): the group starts with the placeholder "New session MM/DD HH:mm". After your first substantive message in it, the bot summarizes a title of up to 20 characters and renames the group.
 - **Avatar**: by default, the botmux logo on a gradient background (one of ten palettes, fixed per group). Add `--avatar name` for a text avatar showing the group name, or `--avatar off` to keep Lark's default.
 
@@ -81,6 +82,8 @@ Names are case-insensitive. Unknown or duplicate names fail before the group is 
 | `--tag <name>` | Put the new group into a message group in your Lark sidebar (up to 60 characters) |
 | `--no-tag` | Ignore the default tag |
 | `--avatar logo\|name\|off` | Avatar: gradient logo (default) / group-name text / Lark default |
+| `--start` | Treat the text as a task this time: create the group and start on it there; see "Create and start a task" below |
+| `--no-start` | Only create the group this time (overrides a bot's `"autoStart": true`) |
 | `--role-profile <id>` | Apply a [role profile](/en/roles) to the bots in the group after creation |
 | `--` | End of options: everything after it is part of the group name, handy when the name itself contains text like `--tag` |
 
@@ -97,6 +100,31 @@ Notes:
 - Unknown `--xxx` words are not errors; they stay in the group name as-is.
 - `--tag` is a **message group in your personal sidebar**, not a tenant-wide chat tag. The first time, authorize it: send `/login tags` in a chat with that bot and confirm the link. Without authorization the group is still created and the reply tells you what is missing.
 - Failures to invite bots, set the tag or set the avatar are reported separately in the reply; the created group is kept.
+
+### Create and start a task
+
+With `--start`, the text after `/g` is the **task** (multi-line is fine):
+
+```bash
+/g --start Investigate the wrong cart price, start from the last release
+@Claude @Codex /g --start Add tracking to the checkout page
+```
+
+You can also quote a message and send just `/g --start`; the quoted message is the task.
+
+To make a bot's `/g` start tasks by default, set `"autoStart": true` for it (next section) and you no longer need `--start`; add `--no-start` when you only want a group. With multiple bots, the first @-mentioned bot is the creator. Multi-line command recognition uses only that creator's shared configuration, so another bot's `autoStart` cannot split the routing decision.
+
+Options (`--start`, `--tag`, …) are read from the first line only; later lines are kept verbatim as the task. If the first line of the task itself contains words like `--tag`, put `--` before the task, e.g. `/g --start -- npm publish --tag canary`.
+
+After the group is created:
+
+- The group is first named after the first 20 characters of the task, then renamed to a short title the bot's own CLI generates from the task (kept as is when the CLI has no one-shot mode or the bot is sandboxed);
+- The quoted message, and the command message if it has attachments, are forwarded into the new group;
+- The creating bot opens a **fresh session** in the new group and starts right away. Its first turn is your words plus where they came from (source chat, message, thread, quote) — no context from the old session; the bot reads the originals itself;
+- Local bots in the group may @ each other without approval (talk-only grants) so they can split the work;
+- You get a reply where you sent the command: the group link plus notes on anything that failed (start, forward, grants). A failure after the group exists never removes the group.
+
+The lead-in of that first turn can be edited on the Dashboard **Customization** page under "Session start → /g task group".
 
 ### Apply a role profile
 
@@ -117,7 +145,8 @@ If your team always uses the same set of bots and the same tag, give the bot def
   "groupCreation": {
     "agents": ["cli_review_app", "cli_build_app"],
     "tag": "Projects",
-    "avatar": "name"
+    "avatar": "name",
+    "autoStart": true
   }
 }
 ```
@@ -127,7 +156,28 @@ You can also send `/botconfig set groupCreation <JSON>` in Lark, and `/botconfig
 - Options in the command override the defaults.
 - With a default list, @-mentioning just one of those bots with `/g` still brings in the whole team (deduplicated).
 - `--no-agents`, `--no-tag` and `--avatar off` only drop defaults; they never remove bots you explicitly @-mentioned.
+- `autoStart` defaults to `false`: the text after `/g` is only the group name; with `true` it is a task the bot starts on (`--no-start` turns that off for one command).
 - Without `groupCreation` and without options, only the current bot and the bots you @-mentioned join.
+
+### Add missing bots to an existing group
+
+Each bot can store its own invitation list in its `bots.json` entry:
+
+```json
+{
+  "inviteConfig": {
+    "agents": ["cli_review_app", "cli_build_app"]
+  }
+}
+```
+
+Use `@bot /botconfig set inviteConfig {"agents":["Review","Build"]}` to save changes immediately, or `@bot /botconfig unset inviteConfig` to clear them. This setting is independent of `/g`'s `groupCreation`; group-creation defaults are neither inherited nor migrated.
+
+A bot admin sends `@bot /invite all` in a group to add missing members from that bot's `inviteConfig.agents`. Names and app IDs resolve as they do for `/g`, and must refer to configured Lark bots in this deployment. Each app ID is invited once; the current bot and existing members are skipped. An unknown or ambiguous entry, or an unavailable membership check, prevents invitations for the entire list. An empty list prompts configuration first. After a partial invitation failure, repeat the command to add the remaining bots.
+
+Bare `@bot /invite` still displays usage help. `@bot /invite @target` and `/invite --app cli_xxx` continue to process only explicit targets without reading defaults. `all` cannot be combined with explicit targets. Invitations do not change the group's name, tag or avatar.
+
+Revoking admin access or changing or clearing the default list during execution stops invitations that have not yet been sent. Completed invitations are kept; check access and the list before running `/invite all` again.
 
 ## Create a group in the Dashboard
 
@@ -245,3 +295,16 @@ Groups that were not opened from a DM (ordinary and topic groups) also accept `/
 - The bot owns the group and is the only bot in it. Lark cannot confirm in advance whether a disband would succeed otherwise, so the bot replies that it has no permission and closes no session.
 
 The confirmation card lists every session this machine's bots hold in the group (every topic's session in a topic group) and states that the whole group is disbanded for everyone in it. After you confirm, those sessions are closed first, and the group is disbanded only once all of them are closed; the result arrives as a private card. It stops in the same cases as above.
+
+## Follow the owner into new groups
+
+`ownerGroupFollow` is off by default for every bot. When enabled, the bot uses its owner’s own user authorization to check for new group memberships every 60 seconds. The first complete scan records existing groups; later scans invite the bot to newly joined groups.
+
+```text
+@bot /botconfig set ownerGroupFollow {"enabled":true,"excludeChatIds":["oc_example"]}
+@bot /botconfig unset ownerGroupFollow
+```
+
+The switch is in Dashboard → Bot defaults → Common → Working directory. The owner must authorize chat listing, member invitations and continued access, for example `/login --scope im:chat:read im:chat.members:write_only offline_access`. The app must also enable those user scopes. Existing platform authorization follows this bot’s credential policy.
+
+Excluded groups receive no invitation. Once removed, the bot is not automatically re-added. Turning the feature off and back on establishes a fresh baseline. Invitation permissions and external-group restrictions still apply; failures are reported to the owner in a direct message. Periodic scanning cannot capture joins followed by leaves between scans.

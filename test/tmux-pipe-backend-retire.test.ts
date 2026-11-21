@@ -1,19 +1,20 @@
 /**
- * A managed TmuxPipeBackend.spawn() creates the detached session first and only
- * then sets up the FIFO / wake fd / pipe-pane. When a later step fails, the
+ * A managed TmuxPipeBackend.spawn() prepares the reader, creates a detached
+ * session and subscribes in one queue. When a later identity check fails, the
  * worker retires the session THIS spawn created before it rolls the sandbox
  * tree back — exactly that session (by tmux session id), never a same-named
  * one another generation created in the meantime.
  *
- * Real tmux on a private socket (PATH shim); the wake-fd failure is the
- * backend's own test seam.
+ * Real tmux on a private socket (PATH shim); only the final identity check is
+ * replaced to exercise a failure after successful creation.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setStartupTmuxRetrySleepForTests, TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { isTransientStartupFailure } from '../src/core/worker-startup-retry.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
@@ -97,10 +98,14 @@ describe.skipIf(!realTmux)('TmuxPipeBackend.retireSessionCreatedBySpawn', () => 
     process.env.SHELL = '/bin/sh';
     delete process.env.TMUX;
     delete process.env.TMUX_PANE;
-    process.env.BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL = '1';
+    delete process.env.BOTMUX_TEST_FORCE_WAKE_OPEN_FAIL;
+    vi.spyOn(TmuxBackend, 'assertInstanceIdentity').mockImplementation(() => {
+      throw new Error('injected post-create identity failure');
+    });
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     for (const [key, value] of Object.entries(saved)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -112,8 +117,9 @@ describe.skipIf(!realTmux)('TmuxPipeBackend.retireSessionCreatedBySpawn', () => 
   const failedSpawn = (): TmuxPipeBackend => {
     const backend = new TmuxPipeBackend(name, { createSession: true, ownsSession: true });
     expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 300'], {
-      cwd: dir, cols: 80, rows: 24, env: { PATH: process.env.PATH!, HOME: dir },
-    })).toThrow(/EMFILE: injected by test/);
+      cwd: dir, cols: 80, rows: 24,
+      env: { PATH: process.env.PATH!, HOME: dir, BOTMUX_CODEX_INSTANCE_BINDING: 'retire-binding' },
+    })).toThrow(/injected post-create identity failure/);
     return backend;
   };
 

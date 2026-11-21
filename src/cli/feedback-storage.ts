@@ -1,6 +1,6 @@
 import { feedbackStorageStatus, feedbackStorageView, configureFeedbackStorageFile, initializeFeedbackStorage, testFeedbackStorageConnection } from '../services/feedback-storage-management.js';
 import { readFeedbackStorageConfig } from '../services/feedback-storage-config.js';
-import { startFeedbackMigration, resumeFeedbackMigration, cancelFeedbackMigration } from '../services/feedback-migration.js';
+import { prepareStorageMigration, resumeStorageMigration, cancelStorageMigration } from '../services/feedback-migration-router.js';
 import { inspectFeedbackRecovery, acknowledgeFeedbackRecovery } from '../services/feedback-recovery.js';
 import { randomUUID } from 'node:crypto';
 import { userInfo } from 'node:os';
@@ -13,12 +13,20 @@ export async function runFeedbackStorageCommand(args: string[], io: {
     return index < 0 ? undefined : args[index + 1];
   };
   try {
-    if (args.some(value => value === '--password' || value.startsWith('--password=') || value === '--token' || value.startsWith('--token='))) throw new Error('feedback_storage_use_secret_reference');
+    if (args.some(value => value === '--password' || value.startsWith('--password=') || value === '--token' || value.startsWith('--token=') || value === '--supabase-key' || value.startsWith('--supabase-key='))) throw new Error('feedback_storage_use_secret_reference');
     let result: unknown;
     switch (args[0] ?? 'status') {
+      case 'supabase-schema': {
+        const config = await readFeedbackStorageConfig(dataDir);
+        const target = config.candidate ?? config.active;
+        if (target.backend !== 'supabase') throw new Error('feedback_migration_target_required');
+        const { feedbackSupabaseSchemaSql } = await import('../services/feedback-supabase-schema.js');
+        io.output.write(feedbackSupabaseSchemaSql(target.supabase.schema, config.instanceId) + '\n');
+        return 0;
+      }
       case 'cancel': {
         if (!args[1]) throw new Error('feedback_migration_id_required');
-        const job = await cancelFeedbackMigration(dataDir, args[1], {
+        const job = await cancelStorageMigration(dataDir, args[1], {
           confirmed: args.includes('--yes') as true, actor: `local:${userInfo().username}`,
           reason: option('--reason') ?? '', evidence: option('--evidence') ?? '',
         });
@@ -56,16 +64,17 @@ export async function runFeedbackStorageCommand(args: string[], io: {
       }
       case 'migrate': {
         if (!args.includes('--yes')) throw new Error('feedback_maintenance_confirmation_required');
-        if (option('--to') !== 'postgresql') throw new Error('feedback_migration_target_required');
         const config = await readFeedbackStorageConfig(dataDir);
-        const job = await startFeedbackMigration(dataDir, { requestId: option('--request-id') ?? randomUUID(), expectedGeneration: config.generation, maintenanceConfirmed: true });
+        if (!['postgresql', 'supabase'].includes(option('--to') ?? '') || config.candidate?.backend !== option('--to')) throw new Error('feedback_migration_target_required');
+        const prepared = await prepareStorageMigration(dataDir, { requestId: option('--request-id') ?? randomUUID(), expectedGeneration: config.generation, maintenanceConfirmed: true });
+        const job = await resumeStorageMigration(dataDir, prepared.migrationId);
         result = { migrationId: job.migrationId, phase: job.phase, blockers: job.blockers };
         io.output.write(JSON.stringify(result) + '\n');
         return job.phase === 'complete' ? 0 : 1;
       }
       case 'resume': {
         if (!args[1]) throw new Error('feedback_migration_id_required');
-        const job = await resumeFeedbackMigration(dataDir, args[1]);
+        const job = await resumeStorageMigration(dataDir, args[1]);
         result = { migrationId: job.migrationId, phase: job.phase, blockers: job.blockers };
         io.output.write(JSON.stringify(result) + '\n');
         return job.phase === 'complete' ? 0 : 1;

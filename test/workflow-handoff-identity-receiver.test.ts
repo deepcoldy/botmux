@@ -39,6 +39,8 @@ vi.mock('../src/services/lark-cli-auth.js', async (importOriginal) => ({
 
 const ts = (await import('typescript')).default;
 const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+const { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
+const { clearRestoredLapses, unattendedTask } = await import('../src/core/capability-authorization.js');
 const { recallProvenIdentityContent, renderIdentityWrapper, publishActiveTurn } = await import('../src/core/cli-identity.js');
 const { execFileSync } = await import('node:child_process');
 const fs = await import('node:fs');
@@ -46,7 +48,7 @@ const nodePath = await import('node:path');
 const nodeOs = await import('node:os');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
-const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
+const { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } = await import('../src/core/reply-target.js');
 const { readDispatchRegistryLoose, revokeWorkflowHandoff, lookupWorkflowHandoff } = await import('../src/core/workflow-handoff-binding.js');
 const { workflowDelegationRefusal, checkWorkflowHandoffIdentityTarget, inheritWorkflowDelegation } = await import('../src/core/workflow-handoff-identity.js');
 const { authorityForDispatch, deliverDispatchWithUser } = await import('../src/core/dispatch-user-delegation.js');
@@ -69,7 +71,7 @@ afterEach(() => cleanupBotRuns());
 
 const DAEMON_FUNCTIONS = [
   'triggerUserAuthEnabledFor', 'prepareTurnCliIdentity', 'dispatchUserForTurn', 'workflowDelegationRefusalFor',
-  'targetUserForDelegation', 'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
+  'targetUserForDelegation', 'checkDelegationRecipient', 'refreshTurnCliIdentity', 'identityPublicationConflicted', 'identityModelForPublication',
   'workflowHandoffIdentityCheck', 'withdrawWorkflowHandoffIdentity',
 ];
 
@@ -125,15 +127,17 @@ async function receiver(opts: { self?: boolean; alsoApproved?: string[]; main?: 
   const members = new Set([INITIATOR_OU_IN[appId]!]);
   const scope: Record<string, any> = {
     config: { session: { dataDir: world.dataDir } },
-    pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
+    pickTurnReplyTarget, registryTurnMayAuthenticateHuman, resolveDispatchUser, dispatchCallerFromReply,
     getBot: () => ({ config: botConfig(appId, ['bytedcli', 'lark-cli']) }),
     loadOrCreateDispatchReportBindingSecret: () => SECRET,
     // The target app's own contact directory: union_id → ITS open_id.
     resolveTargetAppOpenId: vi.fn(async (app: string, unionId: string) => unionId === INITIATOR_UNION
       ? { status: 'resolved', openId: INITIATOR_OU_IN[app] } : { status: 'definitive' }),
     evaluateTalk: () => ({ allowed: true }),
-    listChatMemberOpenIds: vi.fn(async () => [...members]),
+    findCurrentChatUserMembers: vi.fn(async () => new Set(members)),
     publishTurnCliIdentity, localeForBot: () => 'en',
+    isUnattendedIdentityTurnId, allowsPersonalIdentityForTurn, isOwnerActorTurnId, clearRestoredLapses, unattendedTask,
+    getStrictOwnerOpenId: () => undefined,
     logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
     identityStorageModelForDaemonSession: () => 'proven',
     identityDecisionConflict: () => undefined,
@@ -289,7 +293,7 @@ describe('the pre-handoff check runs the dispatch delegation check of this bot',
     const h = await receiver();
     h.members.clear();
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toEqual({ status: 'denied', reason: 'target_access_denied' });
-    h.scope.listChatMemberOpenIds.mockRejectedValueOnce(new Error('member list exceeds 2000 members'));
+    h.scope.findCurrentChatUserMembers.mockRejectedValueOnce(new Error('member list exceeds 2000 members'));
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toMatchObject({ status: 'unavailable' });
     h.scope.getBot = () => ({ config: botConfig('cli_a', null) });
     expect(await h.fns.workflowHandoffIdentityCheck(request)).toEqual({ status: 'not_required' });

@@ -445,6 +445,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_REPLY_FOOTER',
   // Per-bot local-address policy snapshot for a sandboxed `botmux send`.
   'BOTMUX_HIDE_LOCAL_ADDRESSES',
+  // Spawn-time replyDelivery ('send' | 'transcript') this pane's prompt was
+  // built with. `botmux send` only uses it to word its post-send hint; a
+  // missing value falls back to the send-mode wording.
+  'BOTMUX_REPLY_DELIVERY',
   // Normalized sparse reply-style snapshot. Shared/native skill loaders and
   // `botmux send` consume this same session value; it must never enter a
   // co-tenant tmux server's ambient environment.
@@ -494,6 +498,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // command that `botmux statusline` chains to after persisting the snapshot.
   // Not a credential — it is what the user already put in their settings.json.
   'BOTMUX_STATUSLINE_CHAIN',
+  // Per-CLI-spawn opaque generation token stamped on statusline snapshots so
+  // late writes from a dying CLI process cannot pollute or dedupe-block the
+  // replacement generation.
+  'BOTMUX_STATUSLINE_GEN',
   // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
   // the pane; the runner consumes+unlinks the file before app-server starts.
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
@@ -535,6 +543,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'EBSD_BOTMUX_SUBJECT',
   'EBSD_BOTMUX_REPOSITORY_ROOT',
   'EBSD_NO_UPDATE_CHECK',
+  // Doubao's npm launcher otherwise blocks every interactive start on
+  // `Update now? [Y/N]` while a newer version exists. Set by the doubao
+  // adapter's spawnEnv; without this entry only the pty backend honours it.
+  'DOUBAO_CLI_NO_UPDATE_CHECK',
   // Kimi Code: emit OSC 7501 turn state inside a tmux pane (it skips the
   // support probe there). Set by the kimi adapter's spawnEnv.
   'PI_PROGRAM_STATUS',
@@ -605,6 +617,8 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_REPLY_FOOTER',
   // Per-bot local-address policy, from the worker's init snapshot per session.
   'BOTMUX_HIDE_LOCAL_ADDRESSES',
+  // Per-session replyDelivery, from the worker's init snapshot per spawn.
+  'BOTMUX_REPLY_DELIVERY',
   // Spawn-time normalized reply style; unset/scrub at every session boundary to
   // avoid cross-bot guide/card drift through a shared persistent backend.
   'BOTMUX_REPLY_STYLE',
@@ -620,6 +634,9 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Shadowed user statusLine command, resolved per session from the spawn cwd
   // + user settings (worker.ts); an inherited copy points at another project.
   'BOTMUX_STATUSLINE_CHAIN',
+  // Per-CLI-spawn statusline generation token; an inherited copy belongs to
+  // another CLI process generation and must be scrubbed at session boundaries.
+  'BOTMUX_STATUSLINE_GEN',
   // Per-app value pinned by the ecosystemConfig env block; an inherited copy
   // is untrusted (the daemon resolves its bot via BOTMUX_BOT_INDEX).
   'BOTMUX_LARK_APP_ID',

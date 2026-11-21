@@ -285,9 +285,9 @@ Rules:
 
 ## Automatic-recovery failure card
 
-When an ordinary Claude message hits a transient model failure (API unreachable, DNS outage, dropped stream, ...), Botmux continues it automatically, at most twice. If it still fails in the end, a failure card is posted in the original chat (or topic). It is the only notice for that message:
+When an ordinary Claude message hits a transient model failure (API unreachable, DNS outage, dropped stream, ...), a bot with [auto-continue after provider failures](/global-settings#provider-recovery) turned on continues it automatically (off by default; when off, this failure card appears right away, marked "not continued"). If it still fails by the limit, a failure card is posted in the original chat (or topic). It is the only notice for that message:
 
-- It @-mentions the original sender, states the cause in one sentence (no raw error text), and adds an excerpt of the message, the time and how many continuations ran.
+- It @-mentions the original sender, states the cause in one sentence (no raw error text), and adds an excerpt of the message, the time, how many continuations ran, until when, when the provider expected to recover, and why it stopped there.
 - **🔁 Retry** sends the message again as the original sender; the answer still goes to the original chat or topic. Only the original sender (while they can still talk to the bot) or a bot admin can press it. Each card can be retried successfully once, then shows who retried. The retried message asks the AI to check the current state first and avoid repeating work already done.
 - A continuation that never produces a result (terminal idle for about a minute) also counts as failed, instead of staying "in progress" forever.
 - If the Lark API is also down when the card is due, it keeps retrying (up to 24 hours) and lands exactly once; a daemon restart won't send it twice.

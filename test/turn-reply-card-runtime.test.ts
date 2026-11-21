@@ -24,6 +24,7 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-boundary-extension.js';
 import { KimiActivityObserver } from '../src/services/kimi-cot.js';
 import { makeKimiSession, toolTurn } from './helpers/kimi-wire-fixture.js';
+import { applyNativeReasoningObservation } from '../src/core/native-reasoning-observation.js';
 
 vi.mock('../src/config.js', () => ({ config: {
   session: { dataDir: '' }, web: { externalHost: 'localhost' }, dashboard: { externalHost: 'localhost', port: 7891 },
@@ -35,7 +36,11 @@ vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}), uploadFile: vi.fn(), replyMessage: vi.fn(), sendMessage: vi.fn(),
   MessageWithdrawnError: class extends Error {},
 }));
-vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'zh', t: (key: string) => key }));
+// Keys stay literal except the effort-source labels, whose effort argument is the
+// observed value under test.
+vi.mock('../src/i18n/index.js', () => ({ localeForBot: () => 'zh',
+  t: (key: string, params?: Record<string, string | number>) => key === 'card.usage.effort_selected' ? `${params?.effort}（已选）`
+    : key === 'card.usage.effort_last_execution' ? `${params?.effort}（最近执行）` : key }));
 vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
 vi.mock('../src/services/session-store.js', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/services/session-store.js')>();
@@ -576,7 +581,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     });
   });
 
-  it.each((['traex', 'pi'] as const).flatMap(cliId => [
+  it.each((['traex', 'pi', 'doubao'] as const).flatMap(cliId => [
     'legacy', 'api-only', 'adopt', 'headless', 'remote', 'document', 'vc', 'scheduled', 'non-lark',
   ].map(entry => ({ cliId, entry }))))('keeps $cliId $entry on the established path', ({ cliId, entry }) => {
     const ds = session();
@@ -596,7 +601,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(existsSync(new TurnReplyCardStore(dir).directory)).toBe(false);
   });
 
-  it.each((['grok', 'traex', 'pi'] as const).flatMap(cliId =>
+  it.each((['grok', 'traex', 'pi', 'doubao'] as const).flatMap(cliId =>
     (['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'] as const).map(phase => ({ cliId, phase })),
   ))('settles $cliId as $phase and isolates later turns', async ({ cliId, phase }) => {
     const ds = session();
@@ -627,7 +632,8 @@ describe('reply-card runtime eligibility and recovery', () => {
 
   it.each([['grok', 'opencode', 'unified'], ['opencode', 'grok', 'legacy'],
     ['traex', 'opencode', 'unified'], ['opencode', 'traex', 'legacy'],
-    ['pi', 'opencode', 'unified'], ['opencode', 'pi', 'legacy']] as const)(
+    ['pi', 'opencode', 'unified'], ['opencode', 'pi', 'legacy'],
+    ['doubao', 'opencode', 'unified'], ['opencode', 'doubao', 'legacy']] as const)(
     'uses frozen %s rather than stale %s for reply-card admission', (frozen, stale, expected) => {
       const ds = session();
       ds.session.cliId = stale;
@@ -639,7 +645,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     },
   );
 
-  it.each(['grok', 'traex', 'pi'] as const)('preserves a superseded %s card across disconnect and startup recovery', async cliId => {
+  it.each(['grok', 'traex', 'pi', 'doubao'] as const)('preserves a superseded %s card across disconnect and startup recovery', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     const send = vi.fn(async () => 'om_reply');
@@ -696,12 +702,21 @@ describe('reply-card runtime eligibility and recovery', () => {
     const ds = session();
     ds.session.cliId = 'codex';
     ds.session.model = 'gpt-5.6-sol';
-    ds.activeReasoningEffort = 'high';
+    ds.session.cliSessionId = 'native-runtime';
+    ds.workerGeneration = 1;
+    ds.worker = {} as NonNullable<DaemonSession['worker']>;
+    expect(applyNativeReasoningObservation(ds, {
+      cliId: 'codex', nativeSessionId: 'native-runtime', reasoningEffort: 'high',
+      source: 'native-settings', observedAtMs: Date.now(),
+    }, { worker: ds.worker, workerGeneration: 1, cliId: 'codex' })).toBe(true);
     const send = vi.fn(async (_content: string) => 'om_reply');
     await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
     const card = JSON.parse(send.mock.calls[0]![0]);
     const line = card.body.elements.find((e: any) => e.element_id === 'botmux_turn_usage');
-    expect(line?.content).toBe('**gpt-5.6-sol** high');
+    expect(line?.content).toContain('gpt-5.6-sol');
+    expect(line?.content).toMatch(/\bhigh\b/);
+    // The native selection must be labelled, even when token usage is off.
+    expect(line?.content).toContain('已选');
   });
 
   it.each([false, true])('private replies bypass dynamic cards with an existing reservation=%s', async reserved => {
@@ -887,7 +902,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(patched).toContain('README.md');
   });
 
-  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
+  it.each(['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi', 'doubao'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     ds.session.sandbox = true;
@@ -941,7 +956,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(replyCardModeFor(legacyIsolated)).toBe('legacy');
   });
 
-  it.each(['claude-code', 'traex', 'pi', 'kimi'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
+  it.each(['claude-code', 'traex', 'pi', 'kimi', 'doubao'] as const)('freezes the old %s turn while mode changes apply to the next turn', cliId => {
     const ds = session();
     ds.session.cliId = cliId;
     expect(replyCardModeFor(ds)).toBe('unified');

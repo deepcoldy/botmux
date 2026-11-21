@@ -355,6 +355,24 @@ export class WorkerSessionEventScope {
     const binding = [...this.bindings.values()].find(value => value.operationId === operationId);
     return binding ? this.snapshot(binding) : undefined;
   }
+  /** Screen observations describe the live process, not the historical
+   * execution a timer inherited. Only an in-process rebind may advance it;
+   * callbacks from a replaced process retain their stale runtime fence. */
+  screenObservationOrigin(turnId?: string, dispatchAttempt?: number): CapturedSessionOrigin | undefined {
+    // The worker starts its screen sampler while handling `init`, before any
+    // runtime is bound, so the sampler's timer carries no binding. A frame that
+    // names a turn this worker typed into the CLI observes the process that turn
+    // was submitted to. Without that, every such frame left with no runtime
+    // scope and the host refused it (runtime_scope_missing): an adopted CLI
+    // never reported 「工作中」 for a turn. A turnless frame from an unbound
+    // sampler stays unattributed — a restored worker that has not yet seen its
+    // pane go idle only has a projected status for it.
+    const observed = this.storage.getStore()?.binding
+      ?? (turnId ? this.submissions.get(this.turnKey(turnId, dispatchAttempt)) : undefined);
+    if (!observed) return undefined;
+    const binding = this.current?.physicalId === observed.physicalId ? this.current : observed;
+    return { bindingId: binding.bindingId, ...(binding.runtime ? { runtime: structuredClone(binding.runtime) } : {}) };
+  }
   capture(): CapturedSessionOrigin | undefined {
     const context = this.storage.getStore(); return context?.binding ? { ...this.snapshot(context.binding, context.execution), ...(context.operationId ? { operationId: context.operationId } : {}) } : undefined;
   }

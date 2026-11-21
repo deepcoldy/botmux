@@ -1,3 +1,7 @@
+import { capabilityOn } from '../src/services/trigger-user-auth.js';
+import { answerDispatchTaskConsent, assertDispatchTaskApproved, confirmDispatchTask, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, readTaskBinding, TASK_CONSENT_ACTION } from '../src/im/lark/dispatch-task-consent.js';
+import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
+import { messageSenderUnionIdFromDetail } from '../src/im/lark/client.js';
 import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /** Executes the production IPC handler with platform/network seams replaced. */
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
@@ -6,8 +10,19 @@ import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
-import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
+let taskReadHook: (() => void) | undefined;
+vi.mock('node:fs/promises', async () => {
+  const { promises: original } = await import('node:fs');
+  const readFile = original.readFile.bind(original);
+  return { ...original, readFile: ((...args: Parameters<typeof original.readFile>) => {
+    const hook = taskReadHook;
+    taskReadHook = undefined;
+    hook?.();
+    return readFile(...args);
+  }) as typeof original.readFile };
+});
+import { authorityForDispatch, resolveDispatchSenderUnionId, directHumanForDispatchOnly, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
+import { beginReplyTargetTurn, fallbackTurnId, frozenReplyContextForTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
@@ -17,6 +32,7 @@ import { drainTraexRollout } from '../src/services/traex-transcript.js';
 import { isStructuredBridgeLifecycleBlockingCli } from '../src/services/structured-bridge-clis.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { dispatchOnlyToolsForTurn } from '../src/services/trigger-user-auth.js';
+import { allowsPersonalIdentityForTurn } from '../src/core/workflow-event-turn.js';
 import { validateCodexAppManagedSendOrigin } from '../src/utils/codex-app-dispatch-ledger.js';
 import {
   isDispatchOriginNotSendableError,
@@ -54,7 +70,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
   const send = vi.fn(async () => 'om_kickoff');
   const resolveUnionIdFromOpenId = vi.fn(async () => 'on_alice');
   const scope: any = {
-    readJsonBody: async () => body, DISPATCH_USER_DELIVERY_MAX_BYTES, JsonBodyTooLargeError,
+    capabilityOn, readJsonBody: async () => body, DISPATCH_USER_DELIVERY_MAX_BYTES, JsonBodyTooLargeError,
     findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
     authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => isHost, selfDaemonLarkAppId: 'cli_source',
     validateCodexAppManagedSendOrigin, isCodexAppCliId,
@@ -63,15 +79,18 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     lookupMessageChatId: vi.fn(async () => 'oc_target'), readGroupCollaborationMode: () => undefined,
     evaluateProjectDispatchPolicy: vi.fn(() => ({ ok: true })),
     getBot: () => ({ config: { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } } }),
+    allowsPersonalIdentityForTurn,
     dispatchUserForTurn: vi.fn(async () => undefined),
     targetUserForDelegation: vi.fn(async () => 'ou_alice_target'),
     fallbackTurnId, frozenReplyContextForTurn,
-    authorityForDispatch, scheduleCreateCapabilities, dispatchCallerFromReply, dispatchOnlyToolsForTurn,
+    authorityForDispatch, resolveDispatchSenderUnionId, scheduleCreateCapabilities, directHumanForDispatchOnly, dispatchCallerFromReply, dispatchOnlyToolsForTurn,
     pickTurnReplyTarget: () => undefined,
     matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getDashboardAdminOpenIds: () => ['ou_alice'],
-    resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
+    resolveMessageSenderUnionId: vi.fn(async () => null),
+    resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser, deliverApprovedDispatchTask, deliverStickyDispatchWithUser, assertDispatchTaskApproved,
+    dispatchConsentCardAvailable: async () => true,
     config: { session: { dataDir } }, loadOrCreateDispatchReportBindingSecret: () => secret,
     logger: { info: vi.fn() },
   };
@@ -79,6 +98,73 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
   return { ds, scope, send, body, run: (req: unknown = {}) => run(req, {}) };
 }
 const read = () => resolveDispatchUser({ dataDir, secret, appId: 'cli_target', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_kickoff', waitMs: 0 });
+
+// Execute the production entry that creates the reply registry, then let the
+// real dispatch IPC handler consume it after the live caller has gone away.
+function daemonEntry(name: string, scope: Record<string, unknown>): any {
+  const declaration = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+  if (!declaration) throw new Error('Missing production entry: ' + name);
+  const entryCode = ts.transpileModule(declaration.getText(source), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  }).outputText;
+  return new Function('scope', `with (scope) { ${entryCode}; return ${name}; }`)(scope);
+}
+
+function restoreEntryCallerForDispatch(h: ReturnType<typeof harness>, turnId: string): void {
+  h.ds.managedTurnOrigin.turnId = turnId;
+  h.body.originTurnId = turnId;
+  h.ds.activeInteractiveTurn = undefined;
+  h.scope.pickTurnReplyTarget = pickTurnReplyTarget;
+  h.scope.resolveMessageSenderUnionId.mockResolvedValue('on_from_message');
+  h.scope.resolveUnionIdFromOpenId.mockResolvedValue(null);
+}
+
+async function expectEntrySenderSigned(h: ReturnType<typeof harness>, messageId: string): Promise<void> {
+  expect((await h.run()).status).toBe(200);
+  expect(h.scope.resolveMessageSenderUnionId).toHaveBeenCalledExactlyOnceWith('cli_source', messageId);
+  expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+  expect((await read())?.authority).toMatchObject({ openId: 'ou_alice', unionId: 'on_from_message' });
+}
+
+async function submitQueuedFollowUp(h: ReturnType<typeof harness>, messageId: string): Promise<void> {
+  h.ds.worker = { killed: false };
+  h.ds.session.workerGeneration = 1;
+  h.ds.session.cliSessionId = 'native';
+  const submit = daemonEntry('submitQueuedMessage', {
+    activeSessions: new Map([['session-key', h.ds]]), activeSessionKey: () => 'session-key',
+    senderIsBotTriState: () => false, isKnownPeerBot: () => false,
+    config: h.scope.config, resolveSender: async () => ({ name: 'Alice' }),
+    getBot: () => ({ config: { botName: 'source', botOpenId: 'ou_bot' } }),
+    buildFollowUpCliInput: () => 'queued-input', sessionPromptInjection: () => undefined,
+    beginReplyTargetTurn, noteTurnReceived: async () => {},
+    trustedCallerForInboundTurn: async () => ({
+      senderType: 'user', requestLarkAppId: 'cli_source', requestUserOpenId: 'ou_alice',
+    }),
+    sendWorkerInput: () => true, beginNewTurn: () => {}, rememberLastCliInput: () => {},
+    markSessionActivity: () => {}, sessionStore: { updateSession: () => {} },
+  });
+  expect(await submit(h.ds, {
+    messageId, senderId: 'ou_alice', senderType: 'user', mentions: [], threadId: 'omt_thread',
+  }, 'queued follow-up', { mode: 'thread', rootMessageId: 'om_root' })).toBe(true);
+}
+
+function deliverPassthrough(h: ReturnType<typeof harness>, messageId: string, turnId?: string): void {
+  h.ds.worker = { killed: false };
+  const deliver = daemonEntry('deliverPassthroughToExistingSession', {
+    isSessionTransferring: () => false, sessionStore: { updateSession: () => {} },
+    getBot: () => ({ config: {} }),
+    buildTurnParticipants: () => ({ participants: [{ openId: 'ou_alice', isBot: false }], incomplete: false }),
+    beginReplyTargetTurn, isLocalCliCommand: () => false,
+    invalidateIdleAutoCompactRetryForTurn: () => ({ changed: false }),
+    sendWorkerSessionInput: () => true, trustedSessionController: () => undefined,
+    mojoLivePatchForSession: () => undefined, beginNewTurn: () => {}, markPassthroughActivity: () => {},
+    logger: { info: vi.fn(), warn: vi.fn() },
+  });
+  expect(deliver(h.ds, '/compact', '/compact', 'om_root', 'cli_source', {
+    messageId, replyRootId: 'om_root', senderOpenId: 'ou_alice', senderIsBot: false,
+    substitute: false, inThread: true, ...(turnId ? { turnId } : {}),
+  })).toBe(true);
+}
 
 // Run the actual worker screen-ready gate against a real transcript queue.
 // Stop at its release boundary: the remainder only schedules UI/input work.
@@ -104,7 +190,20 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // This fixture exercises lifecycle/delegation, not a live process tree.
     // Root refresh and publication are covered by worker-codex-execution-root.
     currentCodexObservedPid: vi.fn(),
+    // markPromptReady calls this module-level let unconditionally (optional
+    // chaining only guards nullish VALUES, not an identifier missing from a
+    // bare `with(scope)` object); the sandbox leaf path has its own suite.
+    refreshSandboxedCliLeafAttestation: undefined,
     stopBusyPatternIdleProbe: vi.fn(), readyGate: { shouldHold: () => false },
+    // markPromptReady's busy-deferral bookkeeping (worker.ts module-level
+    // symbols in the real process): this fixture asserts lifecycle/release
+    // boundaries, so the throttle stays quiet and the bookkeeping is stubbed.
+    busyReadyLogThrottle: { shouldLog: () => false },
+    warnPromptReadySkipped: vi.fn(),
+    busyReadyDeferral: { clear: vi.fn() },
+    cancelTurnTerminalReadyRecovery: vi.fn(),
+    forceReadyAfterTurnTerminal: false,
+    currentBotmuxTurnId: undefined,
     awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
     freshnessInputQueue: { onPromptReady: () => 'continue' }, spawnArgvTurnStartGateHolds: () => false,
     spawnArgvInitialPromptBusy: false, ptyOutputGeneration: { snapshot: () => 1 },
@@ -127,6 +226,9 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     // ...and no startup dialog can be up (covered by
     // worker-claude-startup-dialog.integration.test.ts).
     probeStartupBlocker: () => null,
+    // These cases run after the first prompt was admitted; the TraeX-only
+    // native startup fence (covered by traex-startup-input) is inert here.
+    traexNativeStartupInputIsPending: () => false,
   };
   const run = new Function('scope', `with (scope) { ${readyCode}; return markPromptReady; }`)(scope);
   try { run(); } catch (err) { if (err !== released) throw err; }
@@ -134,12 +236,278 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
 }
 
 describe('dispatch user IPC end-to-end identity binding', () => {
+  it('does not sign a personal delegation for an owner actor with no opt-in', async () => {
+    const h = harness({ originTurnId: 'trg_owner_fixture' });
+    h.ds.managedTurnOrigin.turnId = 'trg_owner_fixture';
+    h.ds.activeInteractiveTurn.turnId = 'trg_owner_fixture';
+    expect((await h.run()).status).toBe(200);
+    expect(h.send).toHaveBeenCalledOnce();
+    expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
   const dispatchOnly = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_target'] };
   const restrictSource = (h: ReturnType<typeof harness>) => {
     h.scope.getBot = () => ({ config: { triggerUserAuth: {
       enabled: true, tools: ['lark-cli'], dispatchOnly,
     } } });
   };
+  it('records source consent and reuses it for the same signed workstream across requests', async () => {
+    const h = harness({ content: JSON.stringify({ zh_cn: { title: '', content: [[{ tag: 'text', text: 'Review the change' }]] } }) });
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    let dispatches = 0;
+    const send = vi.fn(async (_app, _turn, _content, type) => type === 'interactive' ? 'om_consent' : 'om_delivery' + ++dispatches);
+    Object.assign(h.scope, { readTaskBinding, confirmDispatchTask,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      findCurrentChatUserMembers: async (app: string, chat: string) => {
+        expect(app).toBe('cli_source');
+        return new Set(chat === 'oc_source' ? ['ou_alice'] : []);
+      },
+      replyMessage: send, evaluateTalk: () => ({ allowed: true }),
+    });
+    const result = h.run();
+    await vi.waitFor(async () => expect((await readTaskBinding(dataDir, secret, 'om_root'))?.taskOwner?.consentMessageId).toBe('om_consent'));
+    const click = { action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } },
+      operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } };
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_other', click)).toBe(false);
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', { ...click, operator: { open_id: 'ou_other' } })).toBe(false);
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', { ...click, context: { ...click.context, open_message_id: 'om_copy' } })).toBe(false);
+    expect(send.mock.calls.filter(call => call[3] === 'post')).toHaveLength(0);
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    const oldRouting = readFileSync(join(dataDir, 'orchestrate-dispatch.json'));
+    expect((await result).status).toBe(200);
+    const exact = await resolveDispatchUser({ dataDir, secret, appId: 'cli_target', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_delivery1', waitMs: 0 });
+    expect(exact).toMatchObject({ domain: 'botmux.dispatch-user.task.v1', authority: { tools: ['bytedcli'] } });
+    expect(await resolveDispatchUser({ dataDir, secret, appId: 'cli_other', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_delivery1', waitMs: 0 })).toBeUndefined();
+    h.ds.managedTurnOrigin.turnId = h.ds.activeInteractiveTurn.turnId = h.body.originTurnId = 'om_followup';
+    expect((await h.run()).status).toBe(200);
+    expect(send.mock.calls.filter(call => call[3] === 'interactive')).toHaveLength(1);
+    click.action.value.choice = 'deny';
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    click.action.value.choice = 'approve';
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(false);
+    expect((await h.run()).value.error).toBe('task_consent_denied');
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), oldRouting);
+    expect((await h.run()).value.error).toBe('task_consent_denied');
+    expect(dispatches).toBe(2);
+  });
+
+  it.each(['revocation', 'turn replacement'] as const)('refuses %s between approval and provider write', async race => {
+    const h = harness();
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    const click = { action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } },
+      operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } };
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    Object.assign(h.scope, { readTaskBinding, confirmDispatchTask,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async (_app: string, chat: string) => {
+        if (chat !== 'oc_source') return new Set();
+        if (race === 'revocation') {
+          expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source',
+            { ...click, action: { value: { ...click.action.value, choice: 'deny' } } })).toBe(true);
+        }
+        return new Set(['ou_alice']);
+      },
+      replyMessage: async (...args: any[]) => {
+        taskReadHook = () => { h.ds.managedTurnOrigin.turnId = 'om_next'; };
+        try {
+          await args[7]?.beforeWrite();
+          return h.send(...args);
+        } finally { taskReadHook = undefined; }
+      },
+    });
+    const result = await h.run();
+    expect(result.value.error).toBe(race === 'revocation' ? 'task_consent_denied' : 'dispatch_delivery_failed');
+    if (race === 'turn replacement') expect(result.value.detail).toBe('dispatch origin changed before provider effect');
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
+  it('keeps a task denial sticky after the owner joins the target chat', async () => {
+    const h = harness();
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', {
+      action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+      operator: { open_id: 'ou_alice' },
+      context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+    })).toBe(true);
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      // The human has since become a member of the execution chat. Membership
+      // must not reopen a consent they explicitly refused for this task.
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+    });
+    const result = await h.run();
+    expect(result.status).toBe(409);
+    expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
+  it.each(['explicit', 'automatic'] as const)('keeps a task denial sticky with %s schedule delegation', async scheduleMode => {
+    const h = harness(scheduleMode === 'explicit' ? { delegateScheduleCreate: true } : {});
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', {
+      action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+      operator: { open_id: 'ou_alice' },
+      context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+    })).toBe(true);
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+      // Both paths would otherwise issue immediate bytedcli AND a schedule
+      // capability whose run scope can use the same personal credential.
+      readGlobalConfig: () => ({ scheduleDelegation: {
+        createEnabled: true, runScopes: ['bytedcli'],
+        ...(scheduleMode === 'automatic' ? { defaultOnDispatchFromBotAppIds: ['cli_source'] } : {}),
+      } }),
+    });
+    const result = await h.run();
+    expect(result.status).toBe(409);
+    expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+
+  it.each(['multi-target', 'legacy-recipient', 'ownerless-route-replay'] as const)(
+    'keeps a task denial sticky with automatic schedule and %s', async scenario => {
+      const h = harness(scenario === 'multi-target' ? { targetAppIds: ['cli_target', 'cli_other'] }
+        : scenario === 'legacy-recipient' ? { hasLegacyBots: true } : {});
+      h.ds.chatType = 'group';
+      const route = { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+        targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread' as const,
+        sourceName: 'test', issuedAt: new Date().toISOString() };
+      const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+        consentMessageId: 'om_consent' };
+      writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: {
+        reportBinding: createDispatchReportBinding(secret, { ...route, taskOwner: owner }),
+      } }));
+      expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', {
+        action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'deny' } },
+        operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' },
+      })).toBe(true);
+      if (scenario === 'ownerless-route-replay') {
+        // A genuine signed pre-owner route can be replayed, but it must not hide
+        // the host-only denied tombstone left by the newer owner route.
+        writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: {
+          reportBinding: createDispatchReportBinding(secret, route),
+        } }));
+      }
+      Object.assign(h.scope, { readTaskBinding,
+        loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+        evaluateTalk: () => ({ allowed: true }),
+        findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+        readGlobalConfig: () => ({ scheduleDelegation: {
+          createEnabled: true, runScopes: ['bytedcli'], defaultOnDispatchFromBotAppIds: ['cli_source'],
+        } }),
+      });
+      const result = await h.run();
+      expect(result.status).toBe(409);
+      expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+      expect(h.send).not.toHaveBeenCalled();
+      expect(await read()).toBeUndefined();
+    });
+
+  it.each(['provider-write', 'bind'] as const)('rechecks a sticky task decision before schedule %s', async edge => {
+    const h = harness();
+    h.ds.chatType = 'group';
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target',
+      consentMessageId: 'om_consent' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    const click = { action: { value: { action: TASK_CONSENT_ACTION, root: 'om_root', choice: 'approve' } },
+      operator: { open_id: 'ou_alice' }, context: { open_message_id: 'om_consent', open_chat_id: 'oc_source' } };
+    expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+    let sent = false;
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+      readGlobalConfig: () => ({ scheduleDelegation: {
+        createEnabled: true, runScopes: ['bytedcli'], defaultOnDispatchFromBotAppIds: ['cli_source'],
+      } }),
+      replyMessage: async (...args: any[]) => {
+        if (edge === 'provider-write') {
+          click.action.value.choice = 'deny';
+          expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+        }
+        await args[7]?.beforeWrite?.();
+        if (edge === 'bind') {
+          click.action.value.choice = 'deny';
+          expect(await answerDispatchTaskConsent(dataDir, secret, 'cli_source', click)).toBe(true);
+        }
+        sent = true;
+        return 'om_kickoff';
+      },
+    });
+    const result = await h.run();
+    expect(result.status).toBe(409);
+    expect(result.value).toMatchObject({ error: 'task_consent_denied', dispatchRoot: 'om_root' });
+    expect(sent).toBe(edge === 'bind');
+    expect(await read()).toBeUndefined();
+  });
+
+  it.each(['ordinary', 'explicit', 'automatic'] as const)('binds a first member delivery without a decision directory: %s', async mode => {
+    const h = harness(mode === 'explicit' ? { delegateScheduleCreate: true } : {});
+    h.ds.chatType = 'group';
+    // Initial taskOwner is present, but no consent card or host decision has
+    // ever existed: the decision directory itself starts absent.
+    const owner = { openId: 'ou_alice', receivingAppId: 'cli_target', receivingChatId: 'oc_target' };
+    const binding = createDispatchReportBinding(secret, { dispatchRoot: 'om_root', targetSessionId: 'source-session',
+      targetLarkAppId: 'cli_source', targetChatId: 'oc_source', targetScope: 'thread',
+      taskOwner: owner, sourceName: 'test', issuedAt: new Date().toISOString() });
+    writeFileSync(join(dataDir, 'orchestrate-dispatch.json'), JSON.stringify({ om_root: { reportBinding: binding } }));
+    Object.assign(h.scope, { readTaskBinding,
+      loadBotConfigs: () => [{ larkAppId: 'cli_target', triggerUserAuth: { enabled: true, tools: ['bytedcli'] } }],
+      evaluateTalk: () => ({ allowed: true }),
+      findCurrentChatUserMembers: async () => new Set(['ou_alice']),
+      readGlobalConfig: () => ({ scheduleDelegation: {
+        createEnabled: true, runScopes: ['bytedcli'],
+        ...(mode === 'automatic' ? { defaultOnDispatchFromBotAppIds: ['cli_source'] } : {}),
+      } }),
+    });
+    const result = await h.run();
+    expect(result.status).toBe(200);
+    const delegated = await read();
+    expect(delegated).toMatchObject({
+      domain: mode === 'ordinary' ? 'botmux.dispatch-user.v1' : 'botmux.dispatch-user.v2',
+      authority: { tools: ['bytedcli'] },
+    });
+    if (mode !== 'ordinary') {
+      expect(scheduleCreateCapabilities(delegated!.authority)).toEqual([
+        expect.objectContaining({ allowedRunScopes: ['bytedcli'] }),
+      ]);
+    }
+  });
+
   it('signs the direct sender for one allowed dispatch without changing the source CLI policy', async () => {
     const h = harness();
     h.ds.chatId = 'oc_target';
@@ -149,6 +517,113 @@ describe('dispatch user IPC end-to-end identity binding', () => {
       appId: 'cli_source', openId: 'ou_alice', unionId: 'on_alice', tools: ['lark-cli', 'bytedcli'],
     });
   });
+  it('signs dispatch-only tools for the exact recorded human turn after the active turn was cleared', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_target';
+    restrictSource(h);
+    h.ds.activeInteractiveTurn = undefined;
+    h.ds.session.replyTargets = { om_human: { senderOpenId: 'ou_alice',
+      participants: [{ openId: 'ou_alice', isBot: false }] } };
+    h.scope.pickTurnReplyTarget = pickTurnReplyTarget;
+    expect((await h.run()).status).toBe(200);
+    expect((await read())?.authority).toMatchObject({ openId: 'ou_alice',
+      tools: ['lark-cli', 'bytedcli'] });
+  });
+  it('forwards an already signed bytedcli grant through a bot with no own tools', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_target';
+    h.scope.getBot = () => ({ config: { triggerUserAuth: {
+      enabled: true, tools: [], dispatchOnly,
+    } } });
+    h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_source' };
+    h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+      appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['bytedcli'],
+    } }));
+    expect((await h.run()).status).toBe(200);
+    expect((await read())?.authority).toMatchObject({
+      appId: 'cli_upstream', openId: 'ou_alice', tools: ['bytedcli'],
+    });
+  });
+  it.each(['no signed grant', 'different signed tool', 'outside target allowlist'])(
+    'does not invent bytedcli for an automatic turn with %s', async scenario => {
+      const h = harness();
+      h.ds.chatId = 'oc_target';
+      h.scope.getBot = () => ({ config: { triggerUserAuth: {
+        enabled: true, tools: [], dispatchOnly,
+      } } });
+      h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_source' };
+      if (scenario === 'different signed tool') h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+        appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['lark-cli'],
+      } }));
+      if (scenario === 'outside target allowlist') {
+        h.body.targetAppIds = ['cli_other'];
+        h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+          appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: ['bytedcli'],
+        } }));
+      }
+      expect((await h.run()).status).toBe(200);
+      const signed = await resolveDispatchUser({ dataDir, secret,
+        appId: h.body.targetAppIds[0], chatId: 'oc_target', rootId: 'om_root',
+        turnId: 'om_kickoff', waitMs: 0 });
+      expect(signed).toBeUndefined();
+    });
+  describe('a dispatch-only forward versus an automatic host bot grant', () => {
+    const forwardingBotTurn = (h: ReturnType<typeof harness>, upstreamTools: string[]) => {
+      h.ds.chatId = 'oc_target';
+      h.scope.getBot = () => ({ config: { triggerUserAuth: { enabled: true, tools: [], dispatchOnly } } });
+      h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_source' };
+      h.scope.dispatchUserForTurn = vi.fn(async () => ({ authority: {
+        appId: 'cli_upstream', openId: 'ou_alice', unionId: 'on_alice', tools: upstreamTools,
+      } }));
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true,
+        botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
+          chatIds: ['oc_target'], controllerUnionId: 'on_sponsor' }] } });
+      h.scope.resolveTargetAppOpenId = vi.fn(async () => ({ status: 'resolved', openId: 'ou_alice' }));
+    };
+    it('forwards a signed dispatch-only tool instead of attaching the host grant', async () => {
+      const h = harness();
+      forwardingBotTurn(h, ['bytedcli']);
+      expect((await h.run()).status).toBe(200);
+      const payload = await read();
+      expect(payload?.authority).toMatchObject({ unionId: 'on_alice', tools: ['bytedcli'] });
+      expect(scheduleCreateCapabilities(payload!.authority)).toEqual([]);
+    });
+    it('still attaches the host grant when the signed grant has no tool dispatchOnly can forward', async () => {
+      const h = harness();
+      forwardingBotTurn(h, ['lark-cli']);
+      expect((await h.run()).status).toBe(200);
+      const payload = await read();
+      expect(payload?.authority).toMatchObject({ unionId: 'on_sponsor', tools: [] });
+      expect(scheduleCreateCapabilities(payload!.authority)).toEqual([
+        expect.objectContaining({ botGrantId: 'team' }),
+      ]);
+    });
+  });
+  it.each(['bot sender', 'synthetic turn', 'failed recovery', 'active bot'])
+    ('does not restore dispatch-only tools from an ineligible recorded %s', async scenario => {
+      const h = harness();
+      h.ds.chatId = 'oc_target';
+      restrictSource(h);
+      h.ds.activeInteractiveTurn = scenario === 'active bot'
+        ? { turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' } }
+        : undefined;
+      if (scenario === 'synthetic turn') {
+        h.ds.managedTurnOrigin.turnId = 'trg_synthetic';
+        h.body.originTurnId = 'trg_synthetic';
+      }
+      if (scenario === 'failed recovery') h.ds.session.failedTurnRecovery = {
+        turnId: 'om_human', caller: { senderType: 'bot', requestLarkAppId: 'cli_source' },
+      };
+      h.ds.session.replyTargets = { [h.ds.managedTurnOrigin.turnId]: {
+        senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: scenario === 'bot sender' }],
+      } };
+      h.scope.pickTurnReplyTarget = pickTurnReplyTarget;
+      expect((await h.run()).status).toBe(200);
+      const authority = (await read())?.authority;
+      if (scenario === 'bot sender' || scenario === 'failed recovery' || scenario === 'active bot')
+        expect(authority).toBeUndefined();
+      else expect(authority?.tools).toEqual(['lark-cli']);
+    });
   it('keeps the human tool grant when an automatic schedule grant also matches', async () => {
     const h = harness();
     h.ds.chatId = 'oc_target';
@@ -582,6 +1057,93 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect((await h.run()).status).toBe(409);
     expect(h.send).not.toHaveBeenCalled();
   });
+  it.each(['active', 'restored'])('signs the exact inbound message sender with Contact unavailable (%s)', async mode => {
+    const h = harness();
+    beginReplyTargetTurn(h.ds, undefined, 'om_human', undefined, {
+      sourceMessageId: 'om_human', senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: false }],
+    });
+    delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
+    if (mode === 'restored') {
+      h.ds.activeInteractiveTurn = undefined;
+      h.ds.session = JSON.parse(JSON.stringify(h.ds.session));
+    }
+    h.scope.pickTurnReplyTarget = pickTurnReplyTarget;
+    h.scope.resolveMessageSenderUnionId.mockResolvedValue('on_from_message');
+    h.scope.resolveUnionIdFromOpenId.mockResolvedValue(null);
+    expect((await h.run()).status).toBe(200);
+    expect(h.scope.resolveMessageSenderUnionId).toHaveBeenCalledExactlyOnceWith('cli_source', 'om_human');
+    expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+    expect((await read())?.authority).toMatchObject({ openId: 'ou_alice', unionId: 'on_from_message' });
+  });
+  it('signs a restored /queue sender through its original message when Contact is unavailable', async () => {
+    const h = harness();
+    await submitQueuedFollowUp(h, 'om_queued');
+    restoreEntryCallerForDispatch(h, 'om_queued');
+    await expectEntrySenderSigned(h, 'om_queued');
+  });
+  it('signs a restored first-passthrough sender through its original message when Contact is unavailable', async () => {
+    const h = harness();
+    deliverPassthrough(h, 'om_passthrough');
+    restoreEntryCallerForDispatch(h, 'om_passthrough');
+    await expectEntrySenderSigned(h, 'om_passthrough');
+  });
+  it('keeps a cascade turn pinned to the real message without authenticating the derived turn id', async () => {
+    const h = harness();
+    deliverPassthrough(h, 'om_passthrough', 'om_passthrough#c1');
+    expect(h.ds.session.turnReplyContexts['om_passthrough#c1'].sourceMessageId).toBe('om_passthrough');
+    const fromMessage = vi.fn(async () => 'on_derived_turn_must_not_be_used');
+    const fromContact = vi.fn(async () => null);
+    await expect(resolveDispatchSenderUnionId(
+      h.ds.session, 'om_passthrough#c1', 'cli_source', 'ou_alice', fromMessage, fromContact,
+    )).resolves.toBeNull();
+    expect(fromMessage).not.toHaveBeenCalled();
+    expect(fromContact).toHaveBeenCalledExactlyOnceWith('cli_source', 'ou_alice');
+  });
+  it('does not borrow a non-human compact-card sender for the click operator', async () => {
+    const h = harness();
+    deliverPassthrough(h, 'om_bot_card');
+    const fromMessage = vi.fn(async () => messageSenderUnionIdFromDetail({
+      items: [{ sender: { sender_type: 'app', id_type: 'union_id', id: 'on_card_sender' } }],
+    }));
+    const fromContact = vi.fn(async () => 'on_click_operator');
+    await expect(resolveDispatchSenderUnionId(
+      h.ds.session, 'om_bot_card', 'cli_source', 'ou_alice', fromMessage, fromContact,
+    )).resolves.toBe('on_click_operator');
+    expect(fromMessage).toHaveBeenCalledExactlyOnceWith('cli_source', 'om_bot_card');
+    expect(fromContact).toHaveBeenCalledExactlyOnceWith('cli_source', 'ou_alice');
+  });
+  it('does not deliver after the source turn changes during the message lookup', async () => {
+    const h = harness();
+    delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
+    beginReplyTargetTurn(h.ds, undefined, 'om_human', undefined, {
+      sourceMessageId: 'om_human', senderOpenId: 'ou_alice', participants: [{ openId: 'ou_alice', isBot: false }],
+    });
+    h.scope.resolveMessageSenderUnionId.mockImplementation(async () => {
+      h.ds.managedTurnOrigin.turnId = 'om_next';
+      return 'on_from_message';
+    });
+    expect((await h.run()).status).toBe(409);
+    expect(h.send).not.toHaveBeenCalled();
+  });
+  it.each(['different message', 'different sender', 'unknown sender', 'copied recovery'])(
+    'never uses a message sender with inconsistent origin evidence (%s)', async scenario => {
+      const h = harness();
+      delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
+      const sender = scenario === 'different sender' ? 'ou_other' : 'ou_alice';
+      beginReplyTargetTurn(h.ds, undefined, 'om_human', undefined, {
+        sourceMessageId: scenario === 'different message' ? 'om_other' : 'om_human',
+        senderOpenId: sender, participants: [{ openId: sender, isBot: scenario === 'unknown sender' ? undefined : false }],
+      });
+      if (scenario === 'copied recovery') {
+        h.ds.session.ordinaryTurnRecovery = { currentTurnId: 'om_human', logicalTurnId: 'om_original' };
+      }
+      h.scope.resolveMessageSenderUnionId.mockResolvedValue('on_other');
+      h.scope.resolveUnionIdFromOpenId.mockResolvedValue(null);
+      expect((await h.run()).status).toBe(502);
+      expect(h.scope.resolveMessageSenderUnionId).not.toHaveBeenCalled();
+      expect(h.send).not.toHaveBeenCalled();
+    },
+  );
   it('unknown cross-app identity fails before sending a task', async () => {
     const h = harness(); delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
     h.scope.resolveUnionIdFromOpenId = async () => null;

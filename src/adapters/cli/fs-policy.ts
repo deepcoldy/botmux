@@ -42,11 +42,29 @@ export interface FsPolicy {
   rules: FsRule[];
   /** Keep network egress (bwrap-only knob; Seatbelt does not confine net here). */
   net: boolean;
+  /** Seatbelt only: refuse process-info on OTHER processes and the
+   *  kern.procargs* sysctls. The host worker's environment carries the Lark app
+   *  secret; measured on macOS: a same-uid sandboxed process reads it back via
+   *  sysctl(KERN_PROCARGS2) unless BOTH denies are present (either alone still
+   *  leaks; denying self pid-info crashes runtimes). Linux hides host processes
+   *  with the PID namespace instead. */
+  hideHostProcessInfo?: boolean;
+  /** Seatbelt only: directories the pane may write INTO but must not rename or
+   *  remove. A writable directory can otherwise be rename(2)d wholesale (its
+   *  children are never opened, so a per-file deny does not fire) and read
+   *  back from a writable location, or replaced by a symlink the host then
+   *  writes through. Measured: `(deny file-write-unlink (literal <dir>))` blocks
+   *  mv/rmdir of the directory while mkdir/touch/rename inside it keep working.
+   *  Linux needs none of this: these directories are bind mounts there. */
+  pinnedDirs?: string[];
   /** Extra Seatbelt write-allow regexes (e.g. ~/.claude.json.tmp.* atomic-save
    *  siblings when the CLI data dir is NOT redirected into BOT_HOME). */
   writeRegexes: string[];
   /** Final host-security denies that cannot be represented as path prefixes. */
   denyRegexes?: string[];
+  /** Seatbelt only: withheld credential stores re-denied after every
+   *  finalReadOnlyPaths/ancestor grant, so no allow can re-open the secret. */
+  finalDenyPaths?: string[];
   /** Narrow read-only exceptions emitted after denyRegexes (macOS gateway socket). */
   finalReadOnlyPaths?: string[];
   /** No-transport turns: caller-supplied allow paths (extraWrite / readonlyRoots /
@@ -117,8 +135,15 @@ export interface FsPolicyContext {
    *  the caller itself grants that part of the checkout (a workingDir or user
    *  path at/inside the install root — a bot working ON the checkout). */
   botmuxInstallRootMaskPaths?: readonly string[];
-  /** Daemon-mediated relay outbox (Linux) — readWrite. */
+  /** Daemon-mediated relay outbox — readWrite. Linux always; macOS when the
+   *  bot withholds its app secret (see `withholdSendCredential`). */
   outbox?: string;
+  /** Bot config `sandboxWithholdBotSecret`: deny this bot's own
+   *  `<BOT_HOME>/send-cred.json` (plaintext app secret) even though BOT_HOME is
+   *  otherwise readWrite. The sandboxed CLI then reaches Lark only through the
+   *  host relay. Without it the secret is readable in-sandbox, and anyone who
+   *  can steer the agent can mint this bot's tenant token directly. */
+  withholdSendCredential?: boolean;
   /** Extra writable roots (resolved TMPDIR, admin extras). */
   extraWritePaths?: readonly string[];
   /** Per-bot user config (bots.json sandboxPaths) — highest precedence. */
@@ -905,6 +930,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const roleLibGrant = larkTransport && ctx.roleLibrarySubtree ? roleLibAccess(ctx.roleLibrarySubtree) : null;
   if (roleLibGrant) push([ctx.roleLibrarySubtree!], roleLibGrant, 'internal');
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
+  if (ctx.withholdSendCredential) push([`${ctx.botHome}/send-cred.json`], 'deny', 'mandatory');
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
   push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
   // Session-owned read-only roots: directories the daemon generated for THIS
@@ -938,7 +964,13 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // downloaded attachment under attachments/<self>/<messageId>/… (not just reads
   // pre-uploaded files). The worker mkdirs it pre-spawn so it survives the
   // existence-filter and gets bound rw. Siblings' buckets stay uncovered.
-  push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], 'readWrite', 'internal');
+  // With sandboxWithholdBotSecret the only writer of this bucket is the host
+  // (incoming messages; relayed `quoted` lands in the host-private
+  // relay-attachments instead), so the pane gets it read-only. A writable
+  // bucket lets the pane swap a message directory for a symlink between the
+  // host's validation and its open/rename — a cross-process race no path-based
+  // check can close — and a read-only bucket removes that class outright.
+  push([`${ctx.sessionDataDir}/attachments/${ctx.currentAppId}`], ctx.withholdSendCredential ? 'readOnly' : 'readWrite', 'internal');
   // Own per-turn hook context（UserPromptSubmit sidecar，#794）——read-only。
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
@@ -1047,6 +1079,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // so the old shared data/schedules.json grant (and the cross-bot task-prompt
   // exposure it had to accept) is gone. The RMW sibling lock lives in the same
   // rw dir, so sandboxed `botmux schedule` mutations work on both platforms.)
+  const withheldLarkStores = new Set<string>();
   // macOS lark-cli key store carve-out. The baseline DENIES the whole
   // `~/Library/Application Support/lark-cli` dir (it holds EVERY bot's appsecret
   // ciphertext + the master key — the pre-refactor cross-bot leak). But this bot
@@ -1056,9 +1089,23 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // path than the deny so longest-prefix-wins. Siblings' `appsecret_*.enc` and
   // user tokens stay denied → the master key alone can't decrypt what it can't
   // read (verified: sibling ciphertext still DENIED).
-  if (ctx.platform === 'darwin' && larkTransport) {
+  // withholdSendCredential: the own appsecret + master key ARE the app secret
+  // (decryptable), so the carve-out stays closed and the store stays denied.
+  if (ctx.platform === 'darwin' && (larkTransport || ctx.withholdSendCredential)) {
     const larkStore = `${ctx.homeDir}/Library/Application Support/lark-cli`;
-    push([`${larkStore}/master.key.file`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+    if (ctx.withholdSendCredential) {
+      withheldLarkStores.add(larkStore);
+      // Both levels are mandatory: the baseline store deny alone loses to a
+      // same-path internal workingDir/user grant, while a deeper exact-key
+      // grant would re-open the parent store deny.
+      push([
+        larkStore,
+        `${larkStore}/master.key.file`,
+        `${larkStore}/appsecret_${ctx.currentAppId}.enc`,
+      ], 'deny', 'mandatory');
+    } else {
+      push([`${larkStore}/master.key.file`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+    }
   }
   // LINUX lark-cli key store — SAME cross-bot leak, SAME carve-out (was missing).
   // lark-cli on Linux writes keys to `<LARKSUITE_CLI_DATA_DIR>/lark-cli` (when that env
@@ -1081,7 +1128,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // no custom LARKSUITE_CLI_DATA_DIR → resolved == default → one store). `deny` tagged
   // `mandatory` (not `baseline` like darwin's): see the rank-collision note in the loop.
   // No-transport denies both stores wholesale via authorityRoots and gets NO carve-out.
-  if (ctx.platform === 'linux' && larkTransport) {
+  if (ctx.platform === 'linux' && (larkTransport || ctx.withholdSendCredential)) {
     const stores = new Set<string>();
     const resolved = larkCliLinuxStorePath(ctx.homeDir, ctx.larkCliLinuxStore);
     if (resolved) stores.add(resolved);
@@ -1093,8 +1140,19 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       // the internal BOT_HOME readWrite grant lands on the SAME path and would otherwise
       // outrank this deny by source rank (internal 2 > baseline 0), re-opening the whole
       // keystore rw. mandatory (4) keeps the ceiling; the deeper own-key carve-outs still win by depth.
-      push([larkStore], 'deny', 'mandatory');
-      push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+      if (!ctx.withholdSendCredential) {
+        push([larkStore], 'deny', 'mandatory');
+        push([`${larkStore}/master.key`, `${larkStore}/appsecret_${ctx.currentAppId}.enc`], 'readOnly', 'internal');
+      } else {
+        withheldLarkStores.add(larkStore);
+        // The mandatory parent is not enough: a user grant that names one of
+        // these exact files is deeper and would otherwise re-open the secret.
+        push([
+          larkStore,
+          `${larkStore}/master.key`,
+          `${larkStore}/appsecret_${ctx.currentAppId}.enc`,
+        ], 'deny', 'mandatory');
+      }
     }
   }
 
@@ -1142,7 +1200,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     ...(ctx.mandatoryReadOnlyPaths ?? []),
   ].filter((path) => {
     const normalized = normalizeFsPath(path);
-    return !normalized || !insideHostOnlyRoot(normalized);
+    if (!normalized || insideHostOnlyRoot(normalized)) return false;
+    // This final pass runs after ordinary rules. A service-credential exception
+    // under a withheld lark-cli store would otherwise re-open the exact key the
+    // mandatory ceiling just denied.
+    return ![...withheldLarkStores].some(root => coversPath(root, normalized));
   });
 
   // No-Lark-transport HOST-AUTHORITY denies + minimal carve-out (codex escalation
@@ -1183,7 +1245,11 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     // reaching sibling daemons, and the secret is the escalation vector.
   }
 
-  const rules = mergeFsRules(candidates);
+  // Deepest-prefix grants inside a withheld keystore must not survive at all:
+  // otherwise a sibling/token/future-file grant would beat the mandatory parent.
+  const rules = mergeFsRules(candidates).filter(rule =>
+    rule.access === 'deny'
+    || ![...withheldLarkStores].some(root => coversPath(root, rule.path)));
 
   // Post-merge self-check for the loaded bots-config (codex P1). Being inside a
   // frozen authority root is necessary but NOT sufficient: this is a white-in-black
@@ -1219,8 +1285,13 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   return {
     rules,
     net: ctx.net !== false,
+    ...(ctx.withholdSendCredential ? { hideHostProcessInfo: true } : {}),
+    ...(ctx.withholdSendCredential
+      ? { pinnedDirs: [ctx.botHome, ...(ctx.outbox ? [ctx.outbox] : [])].map(p => normalizeFsPath(p)).filter((p): p is string => !!p) }
+      : {}),
     writeRegexes: [...(ctx.writeRegexes ?? [])],
     denyRegexes: [...(ctx.mandatoryDenyRegexes ?? [])],
+    ...(ctx.withholdSendCredential ? { finalDenyPaths: [...withheldLarkStores] } : {}),
     finalReadOnlyPaths,
     suppressedAuthorityPaths: suppressedAuthorityPaths.length
       ? [...new Set(suppressedAuthorityPaths)].sort()
@@ -1305,6 +1376,9 @@ export function compileToSeatbelt(policy: FsPolicy): string {
     // if a deployment ever needs the kernel surface closed too.
     '(allow iokit-open)',
     ...(policy.net ? ['(allow network*)', '(allow system-socket)'] : []),
+    ...(policy.hideHostProcessInfo
+      ? ['(deny process-info* (target others))', '(deny sysctl-read (sysctl-name-prefix "kern.procargs"))']
+      : []),
   ];
   for (const r of policy.rules) {
     const p = escSb(r.path);
@@ -1335,6 +1409,13 @@ export function compileToSeatbelt(policy: FsPolicy): string {
     lines.push(`(allow file-read* (subpath "${escSb(path)}"))`);
     lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
   }
+  // Last-match backstop: an ancestor grant (HOME or /) would otherwise
+  // re-open every secret in a withheld store, even exact mandatory denies.
+  for (const path of policy.finalDenyPaths ?? []) {
+    lines.push(`(deny file-read* (subpath "${escSb(path)}"))`);
+    lines.push(`(deny file-write* (subpath "${escSb(path)}"))`);
+  }
+  for (const p of policy.pinnedDirs ?? []) lines.push(`(deny file-write-unlink (literal "${escSb(p)}"))`);
   return lines.join('\n') + '\n';
 }
 
@@ -1363,14 +1444,39 @@ export interface SymlinkProbe {
  * narrowed by a baseline candidate). A dangling baseline link is dropped —
  * nothing to expose. Only a link whose PARENT is already canonical is
  * rebuilt; deeper aliasing is left untouched (as before). Pure given `io`.
+ *
+ * A SYSTEM directory (a top-level baseline entry: `/opt`, `/usr`, `/etc`)
+ * carries its grant over to the real path only when that path is a relocated
+ * copy of the same directory — same last path component (`/opt ->
+ * /data00/opt`). Then the target holds exactly what `/opt` holds on any other
+ * host and binding it grants nothing extra. Anything else — `/opt -> /data00`
+ * (a whole data disk, the stock devbox layout), a differently named dir, `/` —
+ * is NOT a system tree: the baseline knows nothing about what else lives
+ * there (projects, logs, other users' checkouts), so granting it would turn
+ * "the toolchain dir is readable" into "that whole disk is readable". Such a
+ * link is recreated WITHOUT its grant (`withheld`): parts of the target that
+ * another rule grants (workingDir, CLI/runtime dirs, user sandboxPaths — all
+ * canonical, and rules lexically under the link are still moved) stay
+ * reachable under both names, the rest is denied by default. Home-level
+ * entries (`~/.cache`, …) keep the plain relocation: they are per-user
+ * tool/cache dirs, commonly moved to a data disk as a dedicated dir under
+ * another name, and withholding a readWrite cache would break the CLI.
  */
 export function relocateSymlinkedBaselineRules(
   rules: readonly FsRule[],
   io: SymlinkProbe,
-): { rules: FsRule[]; symlinks: { path: string; target: string }[] } {
+): {
+  rules: FsRule[];
+  symlinks: { path: string; target: string }[];
+  /** System-dir links recreated WITHOUT carrying their grant to the target.
+   *  Present only when there is at least one (for the caller's log line). */
+  withheld?: { path: string; target: string }[];
+} {
   const symlinks: { path: string; target: string }[] = [];
+  const withheld: { path: string; target: string }[] = [];
   const moves: { from: string; to: string }[] = [];
   const dropped = new Set<string>();
+  const lastSegment = (p: string) => p.slice(p.lastIndexOf('/') + 1);
   for (const r of rules) {
     if (r.source !== 'baseline' || r.access === 'deny' || r.path === '/') continue;
     if (!io.isSymlink(r.path)) continue;
@@ -1378,10 +1484,17 @@ export function relocateSymlinkedBaselineRules(
     if (io.realpath(parent) !== parent) continue;
     const target = io.realpath(r.path);
     if (!target) { dropped.add(r.path); continue; }
-    if (target === r.path || coversPath(r.path, target) || coversPath(target, r.path)) continue;
+    const systemDir = parent === '/';
+    if (target === r.path || coversPath(r.path, target)) continue;
+    // Only `/` covers a top-level path: a system link to `/` is withheld below.
+    if (coversPath(target, r.path) && !systemDir) continue;
     if (symlinks.some(l => l.path === r.path)) continue;
     symlinks.push({ path: r.path, target });
     moves.push({ from: r.path, to: target });
+    if (systemDir && lastSegment(target) !== lastSegment(r.path)) {
+      withheld.push({ path: r.path, target });
+      dropped.add(r.path);
+    }
   }
   if (!moves.length && !dropped.size) return { rules: [...rules], symlinks };
   const byPath = new Map<string, FsRule>();
@@ -1389,14 +1502,15 @@ export function relocateSymlinkedBaselineRules(
     if (dropped.has(r.path)) continue;
     const move = moves.find(m => coversPath(m.from, r.path));
     if (!move) { byPath.set(r.path, r); continue; }
-    const path = move.to + r.path.slice(move.from.length);
+    const rest = r.path.slice(move.from.length);
+    const path = move.to === '/' ? rest || '/' : move.to + rest;
     // A rule already naming the real path wins whichever order it comes in: an
     // earlier one is kept here, a later one overwrites below via set().
     if (!byPath.has(path)) byPath.set(path, { ...r, path });
   }
   const out = [...byPath.values()].sort((a, b) =>
     pathDepth(a.path) - pathDepth(b.path) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-  return { rules: out, symlinks };
+  return { rules: out, symlinks, ...(withheld.length ? { withheld } : {}) };
 }
 
 export interface CompileBwrapOpts {

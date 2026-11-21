@@ -166,7 +166,7 @@ Claude Code、Codex、Antigravity、OpenCode、Pi、oh-my-pi、Grok、Kimi。
 
 - **Codex 独立登录态（`codexAuthSync: "isolated"`）**：`CODEX_HOME` 指向 `<BOTMUX_HOME>/bots/<appId>/codex`，不读也不改全局 `~/.codex`。关闭沙盒和白名单隔离下都能用；**不能和 `scratch` 或 `wrapperCli` 一起配**（会拒绝启动）。会话绑定了非旧式 Codex 实例时，以实例自己的认证方式为准。
 - **Codex 的 `config.toml`**：Codex 用 Bot 专属目录时（白名单隔离，或 `codexAuthSync: "isolated"`；scratch 和配了 `wrapperCli` 时不算），里面的 `config.toml` 在第一个新会话启动时从宿主 `~/.codex/config.toml` 复制一次，之后宿主改动不会自动同步。Dashboard「Codex 登录凭证」里会显示路径，可以点「从宿主重新同步」（旧文件先备份为 `config.toml.bak-<时间>`），下个新会话生效。
-- **Claude 按 Bot 分账号（`credentialsSourceDir`）**：沙盒 Bot 每次冷启动都从这个目录取 OAuth 凭证，多个沙盒 Bot 互不串号。对没开沙盒的 Bot 无效；不能和 `codexAuthSync: "isolated"` 同时配。
+- **Claude 按 Bot 分账号（`credentialsSourceDir`）**：`claude-code` Bot 每次冷启动都从这个目录取 OAuth 凭证，白名单隔离（oncall）或关闭沙盒时可用；非沙盒 Bot 会因此使用 Bot 专属数据目录（不增加文件读写限制）。不能和 `codexAuthSync: "isolated"` 或 `scratch` 同时配。
 - **lark-cli**：沙盒遮住了共享的 `~/.lark-cli`。想在沙盒里用 lark-cli，机器要先按 Bot 拆分配置，见 [lark-cli 按 bot 隔离配置](https://github.com/deepcoldy/botmux/blob/master/docs/lark-cli-per-bot.md)。
 
 #### 一机多账号：给 Claude Bot 配独立账号 {#credentials-source-dir}
@@ -186,7 +186,7 @@ Claude Code、Codex、Antigravity、OpenCode、Pi、oh-my-pi、Grok、Kimi。
 
 限制：
 
-- **目前只支持 `claude-code`**，而且 Bot 必须开着文件沙盒。完全没开沙盒的 Bot 配了也不生效（仍用全局登录，日志里会告警）；开了沙盒但数据目录重定向不了（比如配了 `wrapperCli`）会拒绝启动。
+- **目前只支持 `claude-code`**，白名单隔离（oncall）或关闭沙盒时可用，scratch 会拒绝启动。未开沙盒时，CLI 数据目录重定向到 `<BOTMUX_HOME>/bots/<appId>/claude`，只换目录，不增加文件读写限制；旧会话转写/记忆不迁移，全局 `settings.json` 只继承 `env`，`CLAUDE.md`、skills、plugins 不带过去。数据目录无法重定向（比如配了 `wrapperCli`）也会拒绝启动。
 - 来源目录不存在、不可读或凭证无效时**拒绝启动**，不会悄悄退回共享登录。
 - 不能和 `codexAuthSync: "isolated"` 同时配。Codex 分账号用 `codexAuthSync: "isolated"`，见上一条。
 - botmux 只在冷启动时复制，**不负责刷新**来源目录里的 token。来源目录要由你自己（或外部脚本）保持有效。
@@ -296,15 +296,36 @@ CLI 在一个没有外部网络的命名空间里运行。适合纯本地、离�
 
 ## 沙盒里能做什么、不能做什么
 
-### `botmux send` 照常可用，凭证不进沙盒
+### `botmux send` 照常可用
 
-沙盒里的 CLI 调 `botmux send` 发文字、卡片、图片或附件时，不会拿到飞书凭证。请求先写进会话私有的中转目录，由沙盒外的 daemon 代为发送，**飞书 App Secret 全程不进沙盒**。
+Linux 上，沙盒里的 CLI 调 `botmux send` 发文字、卡片、图片或附件时，请求先写进会话私有的中转目录，由沙盒外的 daemon 代为发送。macOS 的白名单隔离默认由沙盒里的 CLI 自己调飞书，发送前先向 daemon 核实本轮的来源。
+
+注意：白名单隔离默认**能读到**这个 Bot 自己的飞书 App Secret（`<BOT_HOME>/send-cred.json`），`botmux history`、`botmux quoted` 等命令就是靠它直连飞书的。能指使 agent 的人因此可以让它直接用这个密钥换应用身份的 token，绕开 daemon 的所有检查。不希望这样时，打开下面的 `sandboxWithholdBotSecret`。
 
 发到本话题以外的地方（`--top-level` 发群顶层、`--chat-id` 跨群、`--into` 发到某条消息的话题）也可以，但目标由 daemon 重新核实：
 
 - 本会话所在的群总是允许；
 - 其它群必须是这个 Bot 在里面的普通群（不是单聊、不是外部群），并且本轮发消息的人（没有真人时是会话 owner）也在那个群里、有和 Bot 对话的权限；
 - 查不到这些信息时一律拒绝。
+
+### 不把 Bot 密钥放进沙盒（`sandboxWithholdBotSecret`） {#withhold-bot-secret}
+
+```json
+"sandbox": "oncall",
+"sandboxWithholdBotSecret": true
+```
+
+开启后：
+
+- 沙盒里读不到 `send-cred.json`，agent 拿不到这个 Bot 的 App Secret，也就换不到应用身份的 token；
+- `botmux send`、`botmux dispatch`、`botmux history`、`botmux quoted` 都写进会话中转目录，由 daemon 在沙盒外执行。macOS 也因此用上和 Linux 一样的中转；
+- daemon 执行 `history` 时固定读本会话；执行 `quoted` 时，被引用的消息必须在本会话所在的群里，否则拒绝。引用消息里的图片和文件由 daemon 下载后传回，放在会话中转目录里；
+- 经中转的 `history` 只支持 `--limit`（最多 100）、`--scope`、`--with-card-json`；`quoted` 一次只读一条，支持 `--raw`。其它选项会直接报错；
+- 沙盒里看不到宿主其它进程的参数和环境（macOS 下拒绝对其它进程的 process-info 与 `kern.procargs` 查询）；
+- 本 Bot 的附件目录 `attachments/<appId>` 在沙盒里变成只读（入站附件照常可读；写入都由 daemon 完成）；
+- 会话里 `lark-cli` 的 Bot 身份（默认身份和 `--as bot`）不可用，`--as user` 照常；其它需要在沙盒里直连飞书的命令（例如 `botmux bots list`）会失败。
+
+只对白名单隔离（`oncall`）生效，scratch 沙盒不受影响。和其它沙盒选项一样，在会话创建时定下来，改了之后对新会话生效。
 
 ### 宿主管理命令要回宿主执行
 
@@ -345,7 +366,8 @@ Linux 沙盒依赖内核命名空间（namespace），Docker 等容器和加固�
 补充说明：
 
 - **用哪个 bwrap**：优先用系统包的 `/usr/bin/bwrap`、`/bin/bwrap`，都没有才用 `PATH` 上的并在日志里警告一次。Codex 会在 `~/.local/bin/bwrap` 放一份自带版本，它排在前面时沙盒会话会一启动就退出；用系统包管理器装 `bubblewrap` 即可。
-- **软链的系统目录**：`/opt` 这类目录本身是软链时，沙盒会在里面重建同样的软链，并把真实路径只读挂进去。
+- **setuid 的系统 bwrap**（如 Debian 10 自带的 `/usr/bin/bwrap` 0.3.1）：它以 root 身份创建沙盒的 user namespace，botmux 以普通用户运行时，内核不允许它读取沙盒里 CLI 进程的 `/proc/<pid>/fd`，同一个 uid 也不行。TRAE（`traex`）会改从内核锁表 `/proc/locks` 认出自己的会话，回复照常采集；其它靠进程打开的文件定位会话记录的 CLI 在这类主机上可能采集不到回复，话题里的提示会写明是「权限被拒」，worker 日志里有具体进程和原因。不需要、也不要为此去掉 setuid 位或放宽内核设置。
+- **软链的系统目录**：`/opt`、`/usr`、`/etc` 本身是软链时，沙盒会在里面重建同样的软链。真实路径是同名目录（如 `/opt -> /data00/opt`）时，照旧把它只读挂进去；指向别处（如整块数据盘的根 `/opt -> /data00`）时只重建软链、不放行目标——目标下只有工作目录、CLI 运行时和 `sandboxPaths` 显式授权的部分可见，不会因为基线放行 `/opt` 就把整块盘暴露出去。会话要用 `/opt` 下的工具链时，把对应子目录加进 `sandboxPaths.readOnly`。
 - **不会去掉 PID 隔离降级运行**：同机其它 Bot 的进程环境里有明文凭据，没有 PID 隔离时沙盒能通过 `/proc` 读到。所以普通部署挂不上 procfs 就拒绝启动（仅核心专用部署 `BOTMUX_CORE_ONLY=1` 允许）。
 
 botmux **不会**在沙盒起不来时裸跑 CLI，而是拒绝启动会话。常见报错：
@@ -400,5 +422,5 @@ botmux **不会**在沙盒起不来时裸跑 CLI，而是拒绝启动会话。�
 | 文件沙盒：白名单隔离 | 白名单以外的读写；凭证、其它仓库、其它 Bot 的数据；Claude 家族与 Codex 的数据目录按 Bot 分开 | 白名单内（含工作目录）的写入直接落宿主，`workingDir` 为缺省 `~` 时整个家目录都在白名单里；其它 CLI 仍用宿主全局数据目录；网络默认不限；同一 Bot 的会话共用模型账号和 CLI 数据目录 | `sandbox: "oncall"` + `sandboxPaths` |
 | 文件沙盒：scratch | 写入（落在一次性副本里）；botmux 自身凭证 | 读：宿主大部分文件可读，包括他人的 token；macOS 上缓存 / 偏好和系统临时目录仍写真实磁盘；网络默认不限 | `sandbox: "scratch"` + `scratchStorage` |
 | 按人工具凭据 | lark-cli 等受管工具按**本轮发消息的人**自己的授权执行，未授权就拒绝，不借用 owner 或别人的登录 | 模型账号、文件访问和其它未受管工具仍是机器 / Bot 身份 | `triggerUserAuth`；飞书侧个人授权用 `/login`，其它受管工具未授权时会收到授权链接 |
-| 模型账号 | 不同 Bot 用不同模型账号（Claude：`credentialsSourceDir`，需开沙盒；Codex：`codexAuthSync: "isolated"`） | 按 Bot 分、不按人分：同一个 Bot 的使用者共用一个模型账号 | `bots.json` 对应字段 |
+| 模型账号 | 不同 Bot 用不同模型账号（Claude：`credentialsSourceDir`，oncall 或关闭沙盒时可用；Codex：`codexAuthSync: "isolated"`） | 按 Bot 分、不按人分：同一个 Bot 的使用者共用一个模型账号 | `bots.json` 对应字段 |
 | 系统用户 | 系统级文件权限、进程、家目录完全分开 | botmux 不提供这一层：一个 daemon 下所有 Bot 和会话都是同一个系统用户 | 每个系统用户各自部署一套 botmux（各自的 `~/.botmux`） |

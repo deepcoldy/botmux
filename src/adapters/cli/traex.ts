@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { traeCliStatePath, traeConfigPath, traeHomeFor, traeInstallationIdPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
 import {
-  findTraexSessionIdByBotmuxSessionId,
+  resolveTraexResumeSessionId,
   traexHistoryMatchDelta,
   traexHistorySize,
   findTraexRolloutSetByPid,
@@ -373,8 +373,20 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   const resolvedBin = (): string => (cachedBin ??= resolveCommand(rawBin));
   let launchNotice: CliLaunchNotice | undefined;
+  const pressSubmit = (pty: PtyHandle): boolean => {
+    try {
+      if (pty.sendSpecialKeys) return pty.sendSpecialKeys('Enter') !== false;
+      return pty.write('\r') !== false;
+    } catch {
+      return false;
+    }
+  };
   return {
     id: 'traex',
+    pressComposerSubmit: pressSubmit,
+    // buildArgs has no --continue fallback. The worker resolves the same
+    // exact native mapping first and reports/fences a missing-ID fresh launch.
+    resumeRequiresCliSessionId: true,
     // Native /goal starts work and can cold-start an empty topic.
     defaultPassthroughCommands: ['/goal'],
     // codex_core-based TUI: hook-review flow + legacy-data migration picker.
@@ -415,19 +427,6 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       const modelNudgeArgs = hideRateLimitModelNudge
         ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
         : [];
-      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
-      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
-      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
-      // shape, so this is identical to the codex adapter's branch.
-      if (remoteWsUrl && remoteThreadId) {
-        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
-        // so an interactive update dialog would freeze the resume. TraeX shares
-        // codex's config schema; disable at the process level, never user-global.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false', ...modelNudgeArgs, remoteThreadId];
-      }
-      // Releases before the baseline reject the hook-trust flag at argv parsing
-      // and exit; leave it out for them (they have no hook-trust gate to pass
-      // either) and tell the user to upgrade. Unknown version → pass it as before.
       let hookTrustFlag = !disableCliBypass && !!bypassHookTrust;
       if (hookTrustFlag) {
         const support = probeTraexHookTrustSupport(resolvedBin());
@@ -441,6 +440,23 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
           };
         }
       }
+      // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
+      // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
+      // instead of a drop-prone paste. TRAE CLI shares codex's --remote/resume
+      // shape, so this is identical to the codex adapter's branch.
+      if (remoteWsUrl && remoteThreadId) {
+        // -c check_for_update_on_startup=false: RPC pane has no terminal input path,
+        // so an interactive update dialog would freeze the resume. TraeX shares
+        // codex's config schema; disable at the process level, never user-global.
+        return [
+          ...(hookTrustFlag ? [TRAEX_HOOK_TRUST_FLAG] : []),
+          '--remote', remoteWsUrl, 'resume', '--no-alt-screen', '-c', 'check_for_update_on_startup=false',
+          ...modelNudgeArgs, remoteThreadId,
+        ];
+      }
+      // Releases before the baseline reject the hook-trust flag at argv parsing
+      // and exit; leave it out for them (they have no hook-trust gate to pass
+      // either) and tell the user to upgrade. Unknown version → pass it as before.
       const baseArgs = [
         ...(!disableCliBypass ? [
           '--dangerously-bypass-approvals-and-sandbox',
@@ -473,7 +489,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       if (workingDir) baseArgs.push('-C', workingDir);
       if (!resume) return baseArgs;
 
-      const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
+      const traeSessionId = resolveTraexResumeSessionId(sessionId, resumeSessionId);
       if (!traeSessionId) return baseArgs;
       // Session fork: TraeX exposes the same native subcommand shape as Codex
       // (`traecli fork <id>`). It mints a new thread while leaving the source
@@ -483,7 +499,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
-      const sid = cliSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
+      const sid = resolveTraexResumeSessionId(sessionId, cliSessionId);
       if (!sid) return null;
       return `traex resume ${sid}`;
     },
@@ -515,9 +531,17 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // before writing any user text. Never select a model with submit retries.
       const pickerFailure = await dismissTraexModelPicker(pty);
       if (pickerFailure) return { submitted: false, failureReason: pickerFailure };
+      context?.submitGuard?.beforeWrite?.();
       // Same bracketed-paste strategy as the Codex adapter: multi-line user
       // messages must not be split into separate turns by embedded \n.
+      // A boolean false from sendSpecialKeys (e.g. tmux send-keys timing out
+      // under load) is not proof the Enter was lost: the key may still have
+      // reached the pane, and writeInput's history polling plus its recheck
+      // closure own that uncertainty. Only a thrown transport error fails the
+      // write here; the strict boolean contract stays on pressComposerSubmit,
+      // whose one-shot rescue must not guess.
       const trySendEnter = (): boolean => {
+        if (context?.submitGuard && !context.submitGuard.current()) return false;
         try {
           if (pty.sendSpecialKeys) pty.sendSpecialKeys('Enter');
           else pty.write('\r');
@@ -541,10 +565,6 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // absent file just means baseByte=0 and the first appended line matches.
       const historyPath = traeHistoryPath();
       const baseByte = traexHistorySize(historyPath);
-
-      const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
-        ? pty.cliPid
-        : undefined;
 
       // Two separable facts, matched with two different scans:
       //  - SUBMIT confirmation: any full-content match in the global submit log,
@@ -610,10 +630,19 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // result to return now, or null to keep waiting. `final` relaxes the
       // owned-wait: at budget end / on the worker recheck, confirm on any-text.
       const resolve = (final: boolean) => {
+        // The worker can rewire this same handle from a launcher/missing PID to
+        // the real TraeX leaf after writeInput returns its deferred recheck.
+        // Resolve ownership from the CURRENT pid on every poll, not a stale
+        // write-time snapshot that can never see the leaf's rollout fds.
+        const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
+          ? pty.cliPid
+          : undefined;
         const owned = cliPid ? findTraexRolloutSetByPid(cliPid) : undefined;
         if (owned !== undefined) {
           const m = ownedMatch(owned);
-          if (m.found && m.cliSessionId) return { submitted: true as const, cliSessionId: m.cliSessionId };
+          if (m.found && m.cliSessionId) return {
+            submitted: true as const, cliSessionId: m.cliSessionId, ownershipProven: true as const,
+          };
           // Enumeration works but no owned line yet. Note submit evidence but
           // keep waiting for the owned id — unless the budget is spent.
           if (anyMatch().found) sawAnyText = true;

@@ -29,6 +29,28 @@ When the selected incomplete runtime itself still has unfinished work, the
 complete identity of that same live process completes it instead: the older
 runtime stays out of reach, and the re-attached worker is not refused a binding
 (which would leave it, and that work, with no runtime).
+Re-attachment moves executions, not runtimes. An incomplete binding that is
+later completed in place (an Antigravity CLI whose conversation ID is read only
+after the re-attached worker's first binding) keeps its own runtime, so the
+older runtime is never revived; instead every unfinished execution still on it
+moves to the live runtime with an `execution_reattached` fact, keeping its phase
+and replaying nothing. That needs the same evidence a reuse needs: the older
+runtime belongs to an earlier worker generation and its loss was recorded
+(`unresolved`), every binding either runtime ever had names the same backend,
+process birth and native conversation, every epoch between them is reserved and
+only re-observes that process bare (or is the live worker's own launcher
+continued into it) with no execution of its own, the live runtime runs no
+execution yet, no control operation is open, and the execution holds no observer
+grant. A control operation that settles re-checks this for the live runtime.
+The moved-from runtime stays linked to the execution, so output frozen under it
+before the move still proves its origin.
+An execution no runtime has bound (an opening prompt passed in the spawn argv,
+reported before any runtime existed) is judged under the active runtime when its
+event's runtime was continued in process into it by the same worker; a runtime
+that was replaced rather than continued still cannot report it.
+A final output the contract refuses from the live worker is kept on the host
+(`<data dir>/undelivered-replies/`, owner-only, bounded per session) and the
+chat is told why and where, except while a restart, suspend or close retires it.
 
 The host persists a runtime reservation before granting `mayStart`. A worker
 awaits that receipt before starting its CLI. Once the backend exists, it reports
@@ -111,6 +133,21 @@ ready-to-busy edge. Turn lookups use an index instead of scanning all attempts.
 Readiness has separate worker-online and prompt-ready facets. `workerReady`,
 `cliReady` and `cliReadyGeneration` are compatible read projections. Screen idle,
 IPC receipt and prompt readiness do not settle a business execution.
+
+Ordinary IM delivery tracking admits the exact execution before sending IPC,
+including follow-ups and recovery/board turns. The frozen admission travels with
+every transport retry. Cold-start receipt publication waits until the worker's
+contract identity and execution registry are initialized; the preload only
+publishes legacy receipts and keeps contract-enabled init messages buffered.
+An admitted commit clears the delivery tracker while the execution can remain
+queued. After a worker retires, its late commit may clear only that child's
+matching tracked admission, with session, producer, generation and full attempt
+identity verified. It cannot update the replacement runtime or settle its input.
+If the commit ACK was lost, a successful native terminal accepted by the
+contract gateway also clears that child's exact delivery, including a proven
+historical runtime or retired worker. Settlement still matches the original
+worker object and frozen execution, preserving the replacement input. Failure, cancellation and
+reconciliation boundaries do not supply this fallback admission proof.
 
 Operations progress through `planned`, `applying`, `confirmed`,
 `failed_before_effect`, `rejected` or `uncertain`. They retain their operation ID,

@@ -45,6 +45,7 @@ vi.mock('../src/services/session-store.js', () => ({
   createSession: (...args: any[]) => mockCreateSession(...args),
   updateSession: (...args: any[]) => mockUpdateSession(...args),
   closeSession: (...args: any[]) => mockCloseSession(...args),
+  getSession: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/services/message-queue.js', () => ({
@@ -73,6 +74,10 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
         ? { codexAppInput: payload.codexAppInput }
         : {}),
       ...(turnId ? { turnId } : {}),
+      ...(payload.trustedCaller ? { trustedCaller: payload.trustedCaller } : {}),
+      ...(turnId && ds.session.replyTargets?.[turnId]?.senderOpenId
+        ? { turnCallerOpenId: ds.session.replyTargets[turnId].senderOpenId } : {}),
+      ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
       ...(opts.dispatchAttempt !== undefined
         ? { dispatchAttempt: opts.dispatchAttempt }
         : {}),
@@ -122,15 +127,21 @@ const mockBuildNewTopicCliInput = vi.fn((prompt: string, ...args: any[]) => ({
   content: `new:${prompt}`,
   codexAppInput: args[1] === 'codex-app' && args[10]?.codexAppText ? { text: args[10].codexAppText } : undefined,
 }));
-vi.mock('../src/core/session-manager.js', () => ({
+vi.mock('../src/core/session-manager.js', async importOriginal => ({
   buildFollowUpContent: vi.fn((prompt: string) => `follow:${prompt}`),
-  buildFollowUpCliInput: (...args: any[]) => mockBuildFollowUpCliInput(...args),
+  buildFollowUpCliInput: ownerAwareFollowUpBuilder(await importOriginal<typeof import('../src/core/session-manager.js')>()),
   buildNewTopicPrompt: vi.fn((prompt: string) => `new:${prompt}`),
   buildNewTopicCliInput: (...args: any[]) => mockBuildNewTopicCliInput(...args),
   ensureSessionWhiteboard: vi.fn(),
   getAvailableBots: (...args: any[]) => mockGetAvailableBots(...args),
   rememberLastCliInput: (...args: any[]) => mockRememberLastCliInput(...args),
 }));
+
+function ownerAwareFollowUpBuilder(actual: typeof import('../src/core/session-manager.js')) {
+  return (...args: Parameters<typeof actual.buildFollowUpCliInput>) => args[2]?.trustedCaller?.requestUserOpenId
+    ? actual.buildFollowUpCliInput(...args)
+    : mockBuildFollowUpCliInput(...args);
+}
 
 const mockBotAutoWorktreeEnabled = vi.fn(() => false);
 vi.mock('../src/services/default-worktree.js', () => ({
@@ -149,6 +160,16 @@ import { admitQueuedActivationTail, withActiveSessionKeyLock, __testOnly_session
 import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
 import { authorizeReportSessionRelayRequest } from '../src/core/report-session-relay.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
+import { resolveSender } from '../src/im/lark/identity-cache.js';
+import { config } from '../src/config.js';
+import { readSessionTurns, recordSessionTurnInput } from '../src/services/session-turns.js';
+import { mergeQueuedCliInput, type PendingCliInput } from '../src/utils/pending-input-queue.js';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+
+vi.mock('../src/im/lark/identity-cache.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/im/lark/identity-cache.js')>(),
+  resolveSender: vi.fn(),
+}));
 
 const APP = 'app1';
 const CHAT = 'oc_root_chat';
@@ -220,6 +241,127 @@ describe('triggerSessionTurn rootMessageId target', () => {
     }));
   });
 
+  function ownerRequest(): TriggerRequest {
+    return {
+      actor: 'owner',
+      source: { type: 'webhook', connectorId: 'fixture-connector' },
+      target: { kind: 'turn', botId: APP, sessionId: 'sess_existing' },
+      instruction: 'Continue testing',
+      envelope: { format: 'text', sourceName: 'Example client', trusted: false },
+    };
+  }
+
+  it.each([undefined, 'ou_removed'])('refuses to fall back to the first allowed user for configured owner %s', async ownerOpenId => {
+    registerBot(parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex', allowedUsers: ['ou_other'], ownerOpenId,
+    }]))[0]!);
+    const ds = existingDs();
+    const result = await triggerSessionTurn(ownerRequest(), {
+      larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+    });
+    expect(result).toMatchObject({ ok: false, errorCode: 'owner_unresolved' });
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+
+  it('rejects the owner if allowlist access is revoked during contact resolution', async () => {
+    const owner = 'ou_fixture_owner';
+    const bot = registerBot(parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: APP, larkAppSecret: 'fixture', cliId: 'codex',
+      allowedUsers: [owner], ownerOpenId: owner,
+    }]))[0]!);
+    vi.mocked(resolveSender).mockImplementationOnce(async () => {
+      await Promise.resolve();
+      bot.resolvedAllowedUsers = ['ou_other'];
+      return { openId: owner, type: 'user' };
+    });
+    const send = vi.fn();
+    const ds = existingDs({ worker: { send } as any });
+    const response = await triggerSessionTurn(ownerRequest(), {
+      larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]),
+    });
+    expect(response).toMatchObject({ ok: false, errorCode: 'owner_unresolved' });
+    expect(send).not.toHaveBeenCalled();
+    expect(ds.session.replyTargets).toBeUndefined();
+  });
+
+  it.each([
+    ['claude-code', 'thread', true],
+    ['codex', 'chat', false],
+    ['codex-app', 'thread', true],
+  ] as const)('uses the %s continuation for a %s session (senderTag=%s)', async (cliId, scope, senderTag) => {
+    const bot = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: APP, larkAppSecret: 'fixture', workingDir: '/tmp', cliId, senderTag,
+      allowedUsers: ['ou_other', 'ou_fixture_owner'], ownerOpenId: 'ou_fixture_owner',
+    }]))[0]!;
+    registerBot(bot);
+    mockGetBot.mockReturnValue(undefined);
+    vi.mocked(resolveSender).mockRejectedValueOnce(new Error('contact unavailable'));
+    const send = vi.fn();
+    const ds = existingDs({ worker: { send } as any, scope });
+    const request = ownerRequest();
+    request.target.chatId = 'oc_unrelated';
+    request.target.rootMessageId = 'om_unrelated';
+    request.options = { steer: true };
+    const result = await triggerSessionTurn(request, {
+      larkAppId: APP, activeSessions: new Map([[sessionKey(scope === 'thread' ? ROOT : CHAT, APP), ds]]),
+    });
+    expect(result).toMatchObject({ ok: true, actor: 'owner', steer: true, target: { chatId: CHAT } });
+    const turn = send.mock.calls[0]![0] as PendingCliInput;
+    expect(turn.turnCallerOpenId).toBe('ou_fixture_owner');
+    expect(resolveSender).toHaveBeenCalledWith(APP, 'ou_fixture_owner', 'user');
+    const location = scope === 'thread'
+      ? `<message_location placement="thread" root_message_id="${ROOT}" />`
+      : '<message_location placement="chat" />';
+    expect(turn.content).toContain(location);
+    expect(turn.content.includes('<sender type="user" open_id="ou_fixture_owner" />')).toBe(senderTag);
+    expect(turn.content).not.toMatch(/<botmux_(task|external_event)>|om_unrelated/);
+    expect(resolveSessionReplyTarget(ds, result.triggerId)).toEqual(scope === 'thread'
+      ? { mode: 'thread', rootMessageId: ROOT } : { mode: 'plain', chatId: CHAT });
+    if (cliId === 'codex-app') {
+      expect(turn.codexAppSteerable).toBe(true);
+      expect(turn.codexAppInput?.text).toBe(request.instruction);
+      expect(JSON.stringify(turn.codexAppInput)).toContain('message_location');
+    }
+    if (cliId === 'claude-code') {
+      const ownerLarkInput: PendingCliInput = {
+        content: 'From chat', turnId: 'om_fixture_owner', trustedCaller: turn.trustedCaller,
+        turnCallerOpenId: turn.turnCallerOpenId,
+      };
+      const queue = [ownerLarkInput];
+      expect(mergeQueuedCliInput(queue, turn)).toBe(true);
+      expect(queue[0]?.structuredSourceTurnIds).toEqual(['om_fixture_owner', result.triggerId]);
+      expect(queue[0]?.turnCallerOpenId).toBe('ou_fixture_owner');
+      const reverseQueue = [{ ...turn }];
+      expect(mergeQueuedCliInput(reverseQueue, {
+        ...ownerLarkInput, turnId: 'om_fixture_later', structuredSourceTurnIds: undefined,
+      })).toBe(true);
+      expect(reverseQueue[0]?.turnId).toBe(turn.turnId);
+      expect(reverseQueue[0]?.structuredSourceTurnIds).toEqual([turn.turnId, 'om_fixture_later']);
+      recordSessionTurnInput({
+        dataDir: config.session.dataDir, sessionId: ds.session.sessionId, turnId: turn.turnId!,
+        sourceTurnIds: queue[0]?.structuredSourceTurnIds, input: queue[0]!.content, cliId,
+      });
+      expect(readSessionTurns(config.session.dataDir, ds.session.sessionId, 0, 100).turns
+        .find(entry => entry.turnId === turn.turnId)?.inbound).toEqual([{
+        messageId: turn.turnId, text: request.instruction, via: 'owner_actor',
+        sender: { type: 'user', openId: 'ou_fixture_owner' },
+        placement: { kind: 'thread', rootMessageId: ROOT },
+      }]);
+    }
+    const authority = new ActiveTurnAuthority();
+    const chat = { turnId: 'om_fixture_human', caller: {
+      senderType: 'user' as const, requestUserOpenId: 'ou_fixture_human', requestLarkAppId: APP,
+    } };
+    expect(authority.reserve(chat)).toBe(true);
+    authority.markStarted(chat);
+    expect(authority.adoptEnvelopePreservingPrincipal({ turnId: turn.turnId, caller: turn.trustedCaller })).toBe(true);
+    expect(authority.speakers()).toEqual([
+      { openId: 'ou_fixture_human', turnId: chat.turnId }, { openId: 'ou_fixture_owner', turnId: turn.turnId },
+    ]);
+    expect(authority.identity().caller).toEqual(chat.caller);
+    expect(mockSendMessage).not.toHaveBeenCalled();
+  });
+
   it('zero injection forwards caller instruction and event data without the generated external envelope', async () => {
     mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', promptInjection: 'none', workingDir: '/tmp' } });
     const req = request();
@@ -227,6 +369,38 @@ describe('triggerSessionTurn rootMessageId target', () => {
     req.envelope.rawText = '原始日志 <user_message>';
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
     expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('检查这个错误\n\n原始日志 <user_message>');
+  });
+
+  // 11-16: a connector's bare "继续" (no rawText, no payload) reached the CLI as
+  // "继续\n\n{}" — the missing payload was rendered as an empty object.
+  it.each([
+    ['absent', undefined],
+    ['an empty object', {}],
+    ['null', null],
+  ])('zero injection sends the instruction alone when the payload is %s', async (_label, payload) => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', promptInjection: 'none', workingDir: '/tmp' } });
+    const req = request();
+    req.instruction = '继续';
+    if (payload === undefined) delete req.envelope.payload;
+    else req.envelope.payload = payload;
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+    expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('继续');
+  });
+
+  it('zero injection with neither instruction nor data still sends a non-empty input', async () => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', promptInjection: 'none', workingDir: '/tmp' } });
+    const req = request();
+    delete req.envelope.payload;
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+    expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('{}');
+  });
+
+  it('zero injection keeps a non-empty payload after the instruction', async () => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', promptInjection: 'none', workingDir: '/tmp' } });
+    const req = request();
+    req.instruction = '继续';
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+    expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('继续\n\n{"alert":"x"}');
   });
 
   it('creates a thread-scope session anchored at rootMessageId without opening a new topic', async () => {
@@ -364,6 +538,22 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: true, action: 'queued' });
     expect(mockCreateSession).toHaveBeenCalledOnce();
     expect(activeSessions.get(sessionKey(ROOT, APP))?.session.reasoningEffort).toBe('xhigh');
+  });
+
+  it('lets a Codex trigger inherit the bot\'s saved catalogue-only pair and still rejects a refuted override', async () => {
+    // gpt-6.3-sol stands for a model the static table has no row for: config
+    // load keeps its catalogue-verified max, so the trigger must not reject it.
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'codex', workingDir: '/tmp', model: 'gpt-6.3-sol', reasoningEffort: 'max' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const inherited = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map() });
+    expect(inherited).toMatchObject({ ok: true });
+
+    const overridden = request();
+    (overridden.options as any) = { model: 'gpt-5.5' };
+    await expect(triggerSessionTurn(overridden, { larkAppId: APP, activeSessions: new Map() }))
+      .resolves.toMatchObject({ ok: false, errorCode: 'bad_request' });
   });
 
   it.each([

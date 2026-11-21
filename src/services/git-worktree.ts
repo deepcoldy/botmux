@@ -18,6 +18,7 @@ import { logger } from '../utils/logger.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { expandHomePath } from '../utils/working-dir.js';
 import { readGlobalConfig } from '../global-config.js';
+import { resolveWorktreeCreateTimeoutMs } from '../config.js';
 
 const execFileP = promisify(execFile);
 
@@ -236,7 +237,7 @@ async function addWorktreeOrReuseAfterRace(
   reuseExisting: boolean,
 ): Promise<WorktreeCreation | null> {
   try {
-    await git(args, repo, 60_000);
+    await git(args, repo, resolveWorktreeCreateTimeoutMs());
     return null;
   } catch (error) {
     if (reuseExisting) {
@@ -807,7 +808,8 @@ export async function removeCleanWorktree(repo: string, worktreePath: string): P
 /**
  * `git check-ref-format --branch` — the ONLY branch-name validity check in the
  * repo. `createRepoWorktree` itself never validates: an illegal name only fails
- * later inside `git worktree add -b` (60s window, after the topic exists). The
+ * later inside `git worktree add -b` (the configured creation budget window,
+ * default 60s, after the topic exists). The
  * topic header's `/repo wt <目标> [分支]` runs this BEFORE opening the topic so a
  * typo fails closed with zero side effects. Needs no repository (any cwd works);
  * a leading `-` is rejected up front because git would parse it as an option.

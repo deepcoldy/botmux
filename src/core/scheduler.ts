@@ -2,7 +2,7 @@ import { Cron } from 'croner';
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import * as scheduleStore from '../services/schedule-store.js';
-import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
+import type { ScheduleOwner, ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
 import { checkTaskCalendar, manualCalendarCheck, normalizeCalendarBinding, normalizeCalendarDayType } from '../services/work-calendar.js';
 import { appendScheduleRunLog, removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
@@ -1280,6 +1280,16 @@ export function assertScheduleChatTargetLimit(chatIds: readonly string[], previo
   }
 }
 
+/** The live turn whose agent created a task, when the creating route holds it. */
+export interface ScheduleCreatingTurn { sessionId: string; turnId: string }
+
+let createdObserver: ((task: ScheduledTask, creatingTurn?: ScheduleCreatingTurn) => void) | undefined;
+
+/** Registers the one observer told about every newly created task; the person it runs as is `task.ownerOpenId`. */
+export function setScheduleCreatedObserver(observer: typeof createdObserver): void { createdObserver = observer; }
+
+export type { ScheduleOwner };
+
 export function addTask(params: {
   id?: string;
   preconditionRef?: string;
@@ -1300,14 +1310,12 @@ export function addTask(params: {
   creatorChatId?: string;
   creatorRootMessageId?: string;
   creatorLarkAppId?: string;
-  /** Creator's Lark open_id, stamped so daemon-initiated scheduled turns can
-   *  authenticate workflow commands as the creator (see
-   *  scheduled-turn-provenance). Absent for CLI-created tasks without a
-   *  resolvable creator — those keep the historical behavior. */
-  ownerOpenId?: string;
-  /** Creator's Lark union_id (tenant-stable). Stamped only for human creators;
-   *  a task without it runs its scheduled turns with no user identity. */
-  ownerUnionId?: string;
+  /** Whose identity the task's scheduled turns run as. A human owner lets
+   *  daemon-initiated turns authenticate workflow commands as that person (see
+   *  scheduled-turn-provenance); an ownerless task runs with no user identity. */
+  owner: ScheduleOwner;
+  /** See ScheduledTask.ownerAccess: the creator held talk-only access. */
+  ownerAccess?: 'talk';
   parsed?: ParsedSchedule;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -1326,7 +1334,9 @@ export function addTask(params: {
   /** Server-authoritative live turn that created this direct task (never from a
    *  request body). Recorded in the authority row's target_turn_id column only —
    *  not in the task JSON — and counted against maxTasksPerTurn. */
-  directTurn?: { turnId: string; maxTasksPerTurn: number };
+  directTurn?: { turnId: string; maxTasksPerTurn: number; maxLiveTasksPerOwner?: number };
+  /** The live turn whose agent creates this task; the creation observer reads what that turn published. */
+  creatingTurn?: ScheduleCreatingTurn;
 }): ScheduledTask {
   assertScheduleAuthorityAvailable();
   if (audit?.directTurn && !(params.larkAppId && authorityStore?.isInitialized(params.larkAppId))) {
@@ -1379,7 +1389,7 @@ export function addTask(params: {
     executionPosition,
     rootMessageId: executionPosition === 'task' ? undefined : params.rootMessageId,
     silent: params.silent,
-    ownerOpenId: params.ownerOpenId,
+    ownerOpenId: params.owner.kind === 'human' ? params.owner.openId : undefined,
   });
   // Task position owns a topic (created lazily by its first fire), so the row
   // is thread-scoped like an explicit topic — but the root only exists after
@@ -1409,8 +1419,8 @@ export function addTask(params: {
     creatorChatId: params.creatorChatId,
     creatorRootMessageId: params.creatorRootMessageId,
     creatorLarkAppId: params.creatorLarkAppId,
-    ownerOpenId: params.ownerOpenId,
-    ownerUnionId: params.ownerUnionId,
+    owner: params.owner,
+    ownerAccess: params.owner.kind === 'human' && params.ownerAccess === 'talk' ? 'talk' : undefined,
     nextRunAt,
     repeat: params.repeat,
     // Delivery shape is now expressed by scope/rootMessageId. Persist only the
@@ -1423,6 +1433,11 @@ export function addTask(params: {
     ...untilDoneConfig,
   }, authoritativeCreateFor(params.larkAppId, audit?.directTurn));
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
+  try {
+    createdObserver?.(task, audit?.creatingTurn);
+  } catch (error) {
+    logger.warn(`[scheduler] creation observer failed for task ${task.id}: ${error instanceof Error ? error.message : String(error)}`);
+  }
   return task;
 }
 
@@ -1432,7 +1447,7 @@ export function addTask(params: {
  * path. */
 export function authoritativeCreateFor(
   appId: string | undefined,
-  directTurn?: { turnId: string; maxTasksPerTurn: number },
+  directTurn?: { turnId: string; maxTasksPerTurn: number; maxLiveTasksPerOwner?: number },
 ): ((task: ScheduledTask) => ScheduledTask) | undefined {
   assertScheduleAuthorityAvailable();
   return appId && authorityStore?.isInitialized(appId)
@@ -1444,7 +1459,7 @@ export function authoritativeCreateFor(
  * the same routing invariants as addTask, but commits authority before exposing
  * the JSON projection. */
 export function commitDelegatedTask(input: {
-  params: Parameters<typeof addTask>[0] & { id: string; larkAppId: string };
+  params: Omit<Parameters<typeof addTask>[0], 'owner'> & { id: string; larkAppId: string };
   grantId: string;
   requestHash: string;
   control: DelegatedScheduleControl;
@@ -1453,6 +1468,9 @@ export function commitDelegatedTask(input: {
   targetTurnId: string;
   targetGeneration: number;
   maxTasksPerTurn: number;
+  /** Narrow same-topic child exception: admit the already verified controller
+   * as an exact-turn tool actor while keeping the task itself ownerless. */
+  controllerBoundToolIdentity?: boolean;
 }): CommitDelegatedScheduleResult {
   assertScheduleAuthorityAvailable();
   if (!authorityStore?.isInitialized(input.params.larkAppId)) {
@@ -1469,6 +1487,15 @@ export function commitDelegatedTask(input: {
   if (position !== 'top-level' && position !== 'topic') throw new Error('delegated_schedule_position_denied');
   if (position === 'topic' && !params.rootMessageId?.trim()) throw new Error('topic_root_required');
   if (params.followActive || params.deliver === 'new-topic') throw new Error('delegated_schedule_position_denied');
+  const controllerBoundToolIdentity = input.controllerBoundToolIdentity === true;
+  const scheduleChildGrant = input.grantId.startsWith('schedule-child:');
+  if (controllerBoundToolIdentity !== scheduleChildGrant
+    || (controllerBoundToolIdentity && (
+    !input.control.openId || !input.control.unionId
+    || input.control.credentialOpenId !== input.control.openId
+    || (input.control.runScopes ?? []).length !== 0
+    || input.control.selfManage !== false
+  ))) throw new Error('delegated_schedule_controller_binding_invalid');
   const createdAt = new Date().toISOString();
   const task: ScheduledTask = {
     id: params.id,
@@ -1485,17 +1512,15 @@ export function commitDelegatedTask(input: {
       executionPosition: position,
       rootMessageId: position === 'topic' ? params.rootMessageId : undefined,
       silent: params.silent,
-      ownerOpenId: params.ownerOpenId,
     }),
     chatType: params.chatType,
     larkAppId: params.larkAppId,
     creatorChatId: params.creatorChatId,
     creatorRootMessageId: params.creatorRootMessageId,
     creatorLarkAppId: params.creatorLarkAppId,
-    // The control principal lives only in the host authority store. Empty
-    // runScopes means the scheduled model turn is intentionally anonymous; it
-    // must not become a generic human TrustedCaller merely because a human
-    // authorized creation.
+    // Every delegated task stays ownerless. A bounded same-topic child may use
+    // its controller only as an exact-turn tool actor after a live host check;
+    // persisting it here would also grant workflow/schedule mutation authority.
     ownerOpenId: undefined,
     ownerUnionId: undefined,
     enabled: true,
@@ -1675,6 +1700,28 @@ export function claimTaskRunAs(
   // No dashboard event: schedule rows carry no identity fields, and the event
   // stream also reaches anonymous public-read viewers.
   return { ok: true, task, ...(previous ? { previous } : {}) };
+}
+
+/**
+ * Record the union_id of the creator a task already names by open_id. Compare-
+ * and-set inside the authority write transaction: it lands only while the task
+ * still carries that open_id and no union_id, so it never changes who the task
+ * runs as. Returns the stored task, or undefined when nothing was recorded.
+ */
+export function recordTaskOwnerUnionId(
+  id: string,
+  appId: string,
+  ownerOpenId: string,
+  ownerUnionId: string,
+): ScheduledTask | undefined {
+  assertScheduleAuthorityAvailable();
+  let recorded = false;
+  const task = mutateRuntimeTask(id, current => {
+    if (current.ownerOpenId !== ownerOpenId || current.ownerUnionId) return undefined;
+    recorded = true;
+    return { ...current, ownerUnionId };
+  }, appId);
+  return recorded ? task : undefined;
 }
 
 /**
@@ -1943,7 +1990,7 @@ export function updateTask(
   /** With `creator`: who the task ran as just before this edit, read inside
    *  the same authority write, so a caller that must undo the edit can put
    *  exactly that back. */
-  previousRunAs?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'>;
+  previousRunAs?: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim' | 'ownerAccess'>;
 } {
   const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
@@ -2165,12 +2212,13 @@ export function updateTask(
   // Identity fields stay out of `patch`: it doubles as the dashboard event,
   // which anonymous public-read viewers also receive.
   const creatorPatch: Partial<ScheduledTask> = updates.creator
-    ? { ownerOpenId: updates.creator.openId, ownerUnionId: updates.creator.unionId, runAsClaim: undefined }
+    ? { ownerOpenId: updates.creator.openId, ownerUnionId: updates.creator.unionId, runAsClaim: undefined, ownerAccess: undefined }
     : {};
-  let previousRunAs: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim'> | undefined;
+  let previousRunAs: Pick<ScheduledTask, 'ownerOpenId' | 'ownerUnionId' | 'runAsClaim' | 'ownerAccess'> | undefined;
   if (!mutateRuntimeTask(id, current => {
     if (updates.creator) {
-      previousRunAs = { ownerOpenId: current.ownerOpenId, ownerUnionId: current.ownerUnionId, runAsClaim: current.runAsClaim };
+      previousRunAs = { ownerOpenId: current.ownerOpenId, ownerUnionId: current.ownerUnionId,
+        runAsClaim: current.runAsClaim, ownerAccess: current.ownerAccess };
     }
     return { ...current, ...patch, ...creatorPatch };
   })) {

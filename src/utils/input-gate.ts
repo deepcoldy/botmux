@@ -249,17 +249,62 @@ export function firstPromptSeedStillWaiting(state: {
 
 /** A full-width light horizontal rule, as Claude draws above and below its input box. */
 const INPUT_BOX_RULE = /^\s*─{8,}\s*$/;
+/** The input box's TOP rule with text written into it: Claude Code 2.1.3xx
+ *  puts the session name there after `/rename` (`──────── <name> ─`), its
+ *  effort / fast-mode tags at the right end and `History n/m` near the left
+ *  end while browsing history — always one space on each side of the text and
+ *  rule on both ends. The bottom rule never carries text. */
+const INPUT_BOX_TITLED_RULE = /^\s*(─+) \S(?:.*\S)? (─+)\s*$/;
+
+/** A plain input box rule (`bottom` only) or, for the top rule, one that may
+ *  carry text. */
+export function isInputBoxRule(line: string, edge: 'top' | 'bottom'): boolean {
+  if (INPUT_BOX_RULE.test(line)) return true;
+  if (edge === 'bottom') return false;
+  const titled = INPUT_BOX_TITLED_RULE.exec(line);
+  return !!titled && titled[1].length + titled[2].length >= 8;
+}
+
+function isInputBoxTopRule(line: string): boolean {
+  return isInputBoxRule(line, 'top');
+}
+
+/** Where Claude's input box starts a row: the prompt marker, or `!` in bash mode. */
+const INPUT_BOX_FIRST_ROW = /^[❯!](?:[\u00a0 ]|$)/;
+
+/**
+ * The LAST input box on screen, as line indices of its two rules: the last
+ * plain rule, the nearest rule above it as the top rule, and the box's first
+ * non-blank row starting in column 0 with the prompt marker (or `!`, bash
+ * mode). Unlike screenShowsFramedPrompt this also finds a box holding several
+ * rows — a multi-line or wrapped draft, which never frames a single prompt
+ * row. Selectors and dialogs do not start their rows that way.
+ */
+export function lastInputBox(screen: string): { top: number; bottom: number } | undefined {
+  const lines = screen.split('\n');
+  let bottom = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (INPUT_BOX_RULE.test(lines[i])) { bottom = i; break; }
+  }
+  if (bottom < 1) return undefined;
+  let top = bottom - 1;
+  while (top >= 0 && !isInputBoxTopRule(lines[top])) top--;
+  if (top < 0) return undefined;
+  const first = lines.slice(top + 1, bottom).find(line => line.trim() !== '');
+  return first !== undefined && INPUT_BOX_FIRST_ROW.test(first) ? { top, bottom } : undefined;
+}
 
 /**
  * The LAST line matching `readyPattern` sits inside a framed input box: the
- * nearest non-blank line above and below it are both horizontal rules.
+ * nearest non-blank line above is the box's top rule (plain or carrying the
+ * session name / tags) and the one below is a plain horizontal rule.
  *
  * A bare `readyPattern.test(screen)` also matches a selector's `❯ 1. Yes`
  * (startup / trust / hook dialogs) and any ❯ left in the replayed transcript.
  * Neither is framed by rules on both sides, so they are rejected here. Pass the
- * rendered viewport with box drawing kept
- * (`renderer.rawSnapshot({ preserveFormatting: true })`) — the default snapshot
- * turns every `─` into a space — and never the appended PTY log.
+ * current viewport with box drawing kept (the backend's own capture, or
+ * `renderer.rawSnapshot({ preserveFormatting: true })` — the default snapshot
+ * turns every `─` into a space) and never the appended PTY log.
  */
 export function screenShowsFramedPrompt(screen: string, readyPattern: RegExp): boolean {
   if (!screen) return false;
@@ -278,7 +323,7 @@ export function screenShowsFramedPrompt(screen: string, readyPattern: RegExp): b
   const above = nearestNonBlank(promptLine, -1);
   const below = nearestNonBlank(promptLine, 1);
   return above !== undefined && below !== undefined
-    && INPUT_BOX_RULE.test(above) && INPUT_BOX_RULE.test(below);
+    && isInputBoxTopRule(above) && INPUT_BOX_RULE.test(below);
 }
 
 export function shouldReleaseFirstPromptTimeout(state: {
