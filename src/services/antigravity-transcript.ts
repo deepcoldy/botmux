@@ -388,15 +388,18 @@ function decodeArgumentValue(value: unknown): unknown {
   try { return JSON.parse(value); } catch { return value; }
 }
 
+function toolCallArguments(call: any): any {
+  const args = call?.args ?? call?.function?.arguments;
+  if (typeof args !== 'string') return args;
+  try { return JSON.parse(args); } catch { return undefined; }
+}
+
 /** An explicit kill abandons the requested waits. list/send_message/ordinary
  *  tools cannot do that. Support agy's args and the function-call encoding. */
 function abandonSubagentWaits(state: AntigravityTranscriptState, toolCalls: any[]): AntigravityTranscriptState {
   for (const call of toolCalls) {
     if ((call?.name ?? call?.function?.name) !== 'manage_subagents') continue;
-    let args = call?.args ?? call?.function?.arguments;
-    if (typeof args === 'string') {
-      try { args = JSON.parse(args); } catch { continue; }
-    }
+    const args = toolCallArguments(call);
     const action = decodeArgumentValue(args?.Action);
     const conversationIds = decodeArgumentValue(args?.ConversationIds);
     if (action !== 'kill_all' && !(action === 'kill' && Array.isArray(conversationIds))) continue;
@@ -421,11 +424,20 @@ function abandonSubagentWaits(state: AntigravityTranscriptState, toolCalls: any[
  *  Empirically the RUNNING record and these calls are written out of
  *  step_index order, so clearing on every PLANNER tool_call dropped the flag
  *  for the majority of real build/review waits (63%). */
-const TASK_POLL_TOOL_NAMES = new Set(['manage_task', 'schedule', 'invoke_subagent', 'manage_subagents']);
+const TASK_POLL_TOOL_NAMES = new Set(['manage_task', 'schedule']);
 
 function isTaskPollToolCall(toolCall: any): boolean {
   const name = toolCall?.name ?? toolCall?.function?.name;
-  return typeof name === 'string' && TASK_POLL_TOOL_NAMES.has(name);
+  if (typeof name !== 'string') return false;
+  if (TASK_POLL_TOOL_NAMES.has(name)) return true;
+  // Cancellation abandons selected subagents, not an independent command.
+  // Launches and ordinary subagent management (e.g. list) remain foreground
+  // transitions for the legacy missing-command-callback recovery heuristic.
+  // Their foreground path still carries every outstanding subagent id.
+  const action = name === 'manage_subagents'
+    ? decodeArgumentValue(toolCallArguments(toolCall)?.Action)
+    : undefined;
+  return action === 'kill' || action === 'kill_all';
 }
 
 /** Fold one parsed record into the drain: push confirmed events, hold/cancel

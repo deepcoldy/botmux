@@ -317,4 +317,22 @@ describe('Antigravity subagent final delivery', () => {
     expect(state.pendingSubagentIds).toEqual(['agent-1']);
   });
 
+  it.each(['invoke_subagent', 'manage_subagents'])('recovers a missing command callback before %s work without dropping subagent waits', name => {
+    const call = name === 'manage_subagents' ? { name, args: { Action: '"list"' } } : { name, args: {} };
+    const first = drain([
+      { type: 'USER_INPUT', content: query },
+      { type: 'GENERIC', status: 'RUNNING', content: 'Tool is running as a background task' },
+      { type: 'GENERIC', status: 'DONE', content: 'Command exited with code 0.\nCommand output:\nDone' },
+      ...(name === 'manage_subagents' ? [created('agent-1')] : []),
+      tools(call),
+      ...(name === 'invoke_subagent' ? [created('agent-1')] : []),
+      planner('Waiting for the reviewer'),
+    ]);
+    expect(first.map(e => e.kind)).toEqual(['user']);
+    expect(state.pendingSubagentIds).toEqual(['agent-1']);
+    expect(drain()).toEqual([]);
+    expect(drain([reply('agent-1'), planner('Combined final report')]).map(e => e.text)).toEqual(['Combined final report']);
+    expect(hasAntigravityPendingTasks(state)).toBe(false);
+  });
+
 });

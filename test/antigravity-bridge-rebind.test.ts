@@ -195,7 +195,7 @@ describe('Antigravity startup session discovery & zero-prompt bridge rebind', ()
           path,
           offset,
           (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
-          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal },
+          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal, adoptMode: scope.lastInitConfig?.adoptMode === true },
         );
         return { ...res, state: res.state };
       },
@@ -309,7 +309,7 @@ describe('Antigravity startup session discovery & zero-prompt bridge rebind', ()
           path,
           offset,
           (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
-          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal },
+          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal, adoptMode: scope.lastInitConfig?.adoptMode === true },
         );
         return { ...res, state: res.state };
       },
@@ -527,7 +527,7 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
           path,
           offset,
           (scope.structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {},
-          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal },
+          { flushTrailingFinal: opts?.flushAntigravityTrailingFinal, adoptMode: scope.lastInitConfig?.adoptMode === true },
         );
         return { ...res, state: res.state };
       },
@@ -579,6 +579,65 @@ describe('Antigravity bridge ticker and spawn observer honor the adapter session
     };
     return { scope, queue, emittedFinals, pidLookups, makeTranscript, notify, tick, flushQuietFinal };
   }
+
+  it.each([
+    { via: 'notify', adoptMode: true },
+    { via: 'notify', adoptMode: true, bufferedInput: true },
+    { via: 'notify', adoptMode: true, skipOldIngest: true },
+    { via: 'notify', adoptMode: false },
+    { via: 'notify', adoptMode: false, skipOldIngest: true },
+    { via: 'ticker', adoptMode: false },
+    { via: 'ticker', adoptMode: false, skipOldIngest: true },
+  ])('settles a retired subagent wait before the new conversation reply ($via, adopt=$adoptMode, buffered=$bufferedInput, unread=$skipOldIngest)', ({ via, adoptMode, bufferedInput, skipOldIngest }) => {
+    const h = bridgeHarness({ id: 'antigravity', postTerminalPromptFence: false });
+    h.scope.lastInitConfig.adoptMode = adoptMode;
+    const oldPath = h.makeTranscript(SIBLING_ID);
+    h.notify(SIBLING_ID);
+    h.queue.mark('old-turn', 'Old request', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(oldPath, 1, 'Old request');
+    appendFileSync(oldPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-agent" }' }) + '\n');
+    writeAntigravityFinalStep(oldPath, 3, 'Waiting for subagent');
+    if (skipOldIngest) {
+      // /new can precede fs.watch/the next poll, so retirement must discover
+      // and settle this owner in one drain before detaching the old file.
+      expect(h.queue.peek()[0]).toMatchObject({ turnId: 'old-turn', started: false });
+    } else {
+      h.scope.codexBridgeIngest();
+      expect(h.queue.peek()[0]).toMatchObject({ turnId: 'old-turn', started: true });
+      expect(h.queue.peek()[0]?.finalText).toBeUndefined();
+      expect(h.scope.structuredBridgeDriverState.pendingSubagentIds).toEqual(['pending-agent']);
+    }
+    if (bufferedInput) {
+      h.queue.mark('intermediate-turn', 'Intermediate request', Date.now(), undefined, undefined, undefined, adoptMode);
+      writeAntigravityUserStep(oldPath, 4, 'Intermediate request');
+      appendFileSync(oldPath, JSON.stringify({ type: 'GENERIC', status: 'DONE', content: 'Created the following subagent:\n{ "conversationId": "pending-second-agent" }' }) + '\n');
+      writeAntigravityFinalStep(oldPath, 6, 'Waiting for second subagent');
+    }
+    const nextPath = h.makeTranscript(REAL_ID);
+    h.queue.mark('new-turn', 'New request', Date.now(), undefined, undefined, undefined, adoptMode);
+    writeAntigravityUserStep(nextPath, 1, 'New request');
+    writeAntigravityFinalStep(nextPath, 2, 'New answer');
+    if (via === 'ticker') {
+      h.scope.codexBridgePendingSessionId = REAL_ID;
+      h.scope.codexBridgeStartTimer();
+      h.tick();
+    } else {
+      h.notify(REAL_ID);
+    }
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toEqual([
+      { turnId: 'old-turn', text: '' },
+      ...(bufferedInput ? [{ turnId: 'intermediate-turn', text: '' }] : []),
+      { turnId: 'new-turn', text: 'New answer' },
+    ]);
+    expect(h.queue.peek()).toEqual([]);
+    expect(h.scope.codexBridgeRolloutPath).toBe(nextPath);
+    // The retired transcript can still receive results; it is no longer read.
+    appendFileSync(oldPath, JSON.stringify({ type: 'SYSTEM_MESSAGE', content: '[Message] sender=pending-agent content=late result' }) + '\n');
+    writeAntigravityFinalStep(oldPath, 5, 'Old late final');
+    h.flushQuietFinal();
+    expect(h.emittedFinals).toHaveLength(bufferedInput ? 3 : 2);
+  });
 
   it('ticker stays unbound through the startup window instead of pid-probing a sibling DB, then binds the streamed conversation', async () => {
     const { adapter, logPath } = await startupAdapter();

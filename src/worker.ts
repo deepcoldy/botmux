@@ -13615,6 +13615,28 @@ function ompBridgeState(): OmpTranscriptState {
   return (structuredBridgeDriverState as OmpTranscriptState | undefined) ?? {};
 }
 
+/** Finish the old queue owner before abandoning its transcript. A quiet
+ *  flush may refuse waiting narration; detach alone cannot settle that owner,
+ *  especially when adopt's next input has a different sourceTurnId. */
+function retireAntigravityBridgeTurn(): void {
+  codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+  // The drain itself may discover a queued input or advance to another input
+  // in the retired log. Select its remaining owner after that attribution.
+  const retired = codexBridgeQueue.peek().find(turn => turn.started && turn.finalText === undefined);
+  if (retired) {
+    codexBridgeQueue.ingest([{
+      uuid: `${codexBridgeRolloutPath}:retired:${retired.turnId}:${retired.dispatchAttempt ?? 0}`,
+      timestampMs: Date.now(),
+      kind: 'turn_aborted',
+      text: '',
+      sourceSessionId: retired.sourceSessionId,
+      sourceTurnId: retired.sourceTurnId,
+      terminalErrorCode: 'antigravity_conversation_retired',
+    }]);
+  }
+  emitReadyCodexTurns();
+}
+
 /** Antigravity's held provisional terminal (valid only while that driver is active). */
 function antigravityBridgeState(): AntigravityTranscriptState {
   return (structuredBridgeDriverState as AntigravityTranscriptState | undefined) ?? {};
@@ -13879,14 +13901,13 @@ function codexBridgeStartTimer(): void {
             // conversation switched): flush the retired conversation's held
             // final only when an earlier turn belongs to it, then bind the new
             // one fresh so its live turn is ingested from byte 0. Pending
-            // task/subagent waits still block the flush: /new abandons unfinished
-            // work rather than promoting waiting narration to a final.
+            // task/subagent waits block the flush; /new explicitly aborts the
+            // retired owner rather than promoting waiting narration to a final.
             codexBridgePendingSessionId = undefined;
             codexAdoptPendingPid = undefined;
             if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
               try {
-                codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-                emitReadyCodexTurns();
+                retireAntigravityBridgeTurn();
               } catch (err: any) {
                 log(`Antigravity late-rotation bridge drain failed: ${err.message}`);
               }
@@ -15212,12 +15233,11 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         // drain the retired transcript only when an earlier turn actually
         // belongs to it, then rebind fresh-empty so the current conversation's
         // existing bytes are ingested from byte 0. Pending task/subagent waits
-        // still block the flush: /new abandons unfinished work rather than
-        // promoting waiting narration to a final.
+        // still block the flush; /new explicitly aborts the retired owner rather
+        // than promoting waiting narration to a final.
         if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
           try {
-            codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-            emitReadyCodexTurns();
+            retireAntigravityBridgeTurn();
           } catch (err: any) {
             log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
           }
