@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import type { DaemonToWorker } from '../src/types.js';
 import { t } from '../src/i18n/index.js';
@@ -215,7 +215,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
     await f.wait(() => rows(f.submissions).length === 1, 'original working submit');
     f.child.send({ type: 'message', content: 'correction changes capacity', turnId: 'om_capacity' } satisfies DaemonToWorker);
     f.child.send({ type: 'message', content: 'held successor', turnId: 'om_held' } satisfies DaemonToWorker);
-    await f.wait(() => rows(f.submissions).length === 2, 'correction submitted');
+    await f.wait(() => rows(f.submissions).length >= 2, 'correction submitted');
     await new Promise(resolveWait => setTimeout(resolveWait, 1_000));
     expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
       'original working ask', 'correction changes capacity',
@@ -224,6 +224,29 @@ describe('TraeX auto-model real Worker and PTY', () => {
     writeFileSync(f.release, 'finish');
     await f.wait(() => rows(f.submissions).length === 3, 'held input after composer');
     expect(rows(f.submissions).filter(row => row.text.startsWith('held successor'))).toHaveLength(1);
+  }, 45_000);
+
+  // Deterministic guard for the poll-skip race (#2642): under CI load the 50ms
+  // wait() poll can miss the intermediate count when two PTY submissions land in
+  // the same window (1 -> 3). The intermediate wait must accept "at least N" so a
+  // skipped sample can never hang, while the final exact-order assertion stays.
+  it('tolerates a poll window that skips the intermediate submission count', async () => {
+    const f = await fixture(true, false, false, undefined, false, undefined, false, 'queue-after-second');
+    f.child.send({ type: 'message', content: 'original working ask', turnId: 'om_working' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original working submit');
+    // Simulate the worker appending correction + held successor inside one poll
+    // interval: the observed row count jumps straight from 1 to 3.
+    appendFileSync(f.submissions, [
+      JSON.stringify({ model: 'core', text: 'correction changes capacity' }),
+      JSON.stringify({ model: 'core', text: 'held successor' }),
+    ].join('\n') + '\n');
+    expect(rows(f.submissions).length).toBe(3);
+    // The exact intermediate predicate would now hang forever; the tolerant one
+    // resolves immediately. A short timeout keeps the mutation check fast.
+    await f.wait(() => rows(f.submissions).length >= 2, 'correction submitted (tolerant)', 2_000);
+    expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
+      'original working ask', 'correction changes capacity', 'held successor',
+    ]);
   }, 45_000);
 
   // A late history receipt quarantines one write while the original turn is
@@ -240,7 +263,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
     f.child.send({ type: 'message', content: 'correction changes capacity', turnId: 'om_capacity' } satisfies DaemonToWorker);
     f.child.send({ type: 'message', content: 'held successor', turnId: 'om_held' } satisfies DaemonToWorker);
     await f.wait(() => f.logs.join('').includes(`after unconfirmed submit turn=${quarantinedTurn} `), 'late receipt quarantined');
-    await f.wait(() => rows(f.submissions).length === 2, 'correction submitted');
+    await f.wait(() => rows(f.submissions).length >= 2, 'correction submitted');
     writeFileSync(f.release, 'finish');
     await f.wait(() => rows(f.submissions).length === 3, 'held input after deferred recheck');
     expect(rows(f.submissions).map(row => row.text.split(/[\r\n]/)[0])).toEqual([
