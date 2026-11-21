@@ -643,6 +643,18 @@ describe('doubao composer and held-input screens', () => {
     expect(doubaoComposerState(frame(['❯ earlier prompt', 'answer']))).toBe('unknown');
   });
 
+  it('reads continuation rows before calling a multiline composer empty', () => {
+    expect(doubaoComposerState(frame([
+      rule, '❯ ', '  first surviving line', '  second surviving line', rule,
+    ]))).toBe('draft');
+    expect(doubaoComposerState(frame([
+      rule, '❯ ', '  ', '   ', rule,
+    ]))).toBe('empty');
+    expect(doubaoScreenShowsNoPendingInput(frame([
+      rule, '❯ ', '  first surviving line', rule,
+    ]))).toBe(false);
+  });
+
   it('holds input while a turn runs or Doubao shows its own send queue', () => {
     const idle = [rule, '❯  Ask Doubao to do anything', rule, '  Default model · Default · /work'];
     expect(doubaoScreenHoldsSubmittedInput(frame(idle))).toBe(false);

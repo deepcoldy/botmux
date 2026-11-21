@@ -98,6 +98,15 @@ describe('Doubao submit receipt', () => {
     // CRLF / re-wrapped whitespace still matches.
     expect(doubaoAssignmentHasInputSince(assignment, baseline, prompt.replaceAll('\n', '\r\n  '))).toBe(true);
   });
+
+  it('fails closed when the log shrinks and only an old identical request remains', () => {
+    const { assignment } = makeSession(join(tmpdir(), `doubao-receipt-shrink-${process.pid}`));
+    writeFileSync(assignment, `${heading('2026-11-21T03:00:00Z')}repeat\n\n${heading('2026-11-21T03:01:00Z')}${'padding'.repeat(2_000)}\n\n`);
+    const baseline = doubaoLogSize(assignment)!;
+    writeFileSync(assignment, `${heading('2026-11-21T03:00:00Z')}repeat\n\n`);
+    expect(doubaoLogSize(assignment)!).toBeLessThan(baseline);
+    expect(doubaoAssignmentHasInputSince(assignment, baseline, 'repeat')).toBe(false);
+  });
 });
 
 describe('Doubao request rows as turn boundaries', () => {
@@ -130,7 +139,7 @@ describe('Doubao request rows as turn boundaries', () => {
     const tool = (id: string) => row({ role: 'assistant', content: '', tool_calls: [{ id, function: { name: 'Read', arguments: '{}' } }] });
     const mark = (turnId: string, text: string) => q.mark(turnId, text, now);
     const advance = (ms: number) => { now += ms; };
-    return { q, drain, section, row, request, tool, mark, advance, emitted, state: () => state as Record<string, unknown> };
+    return { q, drain, section, row, request, tool, mark, advance, emitted, state: () => state as Record<string, unknown>, assignment, trajectory };
   }
 
   /** Turn 1 of the session establishes that requests open with a user row. */
@@ -345,6 +354,19 @@ describe('Doubao request rows as turn boundaries', () => {
     expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER'], ['om_2', 'NEW_REPEAT_ANSWER']]);
   });
 
+  it('parks a wrapped exact-input row until its exact assignment section arrives', () => {
+    const r = rig();
+    firstTurn(r);
+    r.mark('om_2', '/run');
+    r.row({ role: 'user', content: 'context\n/run' });
+    r.row({ role: 'assistant', content: 'WRAPPED_EXACT_ANSWER' });
+    r.drain();
+    expect(r.state().parkedUserRow).toMatchObject({ turnId: 'om_2' });
+    r.section('/run');
+    r.drain();
+    expect(r.emitted.at(-1)).toEqual(['om_2', 'WRAPPED_EXACT_ANSWER']);
+  });
+
   it('does not pair a new section with the only old same-text retry row', () => {
     const r = rig();
     firstTurn(r, 'repeat');
@@ -450,6 +472,31 @@ describe('Doubao request rows as turn boundaries', () => {
     r.drain();
     expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER']]);
     expect(r.q.peek()[0]).toMatchObject({ turnId: 'om_2', started: false });
+  });
+
+  it('pairs a new request after both native logs shrink and reuse its row offset', () => {
+    const r = rig();
+    const line = (value: unknown) => `${JSON.stringify(value)}\n`;
+    const oldFinal = { role: 'assistant', content: 'OLD_LOCAL_ANSWER' };
+    const prefix = { role: 'assistant', content: '' };
+    prefix.content = 'P'.repeat(Buffer.byteLength(line(oldFinal)) - Buffer.byteLength(line(prefix)));
+    const first = 'first request '.padEnd(2_000, 'x');
+    r.mark('om_1', first);
+    r.row(prefix);
+    r.request(first);
+    r.row({ role: 'assistant', content: 'FIRST_ANSWER' });
+    r.drain();
+    expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER']]);
+    const reusedOffset = Buffer.byteLength(line(prefix));
+
+    r.mark('om_2', 'second request');
+    writeFileSync(r.assignment, `# rewritten generation\n## [${new Date().toISOString()}] 需求\nsecond request\n\n`);
+    writeFileSync(r.trajectory, line(oldFinal)
+      + line({ role: 'user', content: 'second request' })
+      + line({ role: 'assistant', content: 'SECOND_ANSWER' }));
+    expect(Buffer.byteLength(line(oldFinal))).toBe(reusedOffset);
+    r.drain();
+    expect(r.emitted.at(-1)).toEqual(['om_2', 'SECOND_ANSWER']);
   });
 
   it('ignores a user row that is not a request while a turn runs', () => {

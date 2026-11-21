@@ -4519,8 +4519,17 @@ function expireHeldInputBeforeReceivedTurn(turnId: string, dispatchAttempt?: num
   if (!cliAdapter?.screenHoldsSubmittedInput) return;
   // A driver-parked row is positive native-start evidence, not an input the
   // CLI lost. Keep that exact head while its assignment section is late; a
-  // later receipt only expires older heads with no such evidence.
-  const driverParked = driverPendingInputTurn();
+  // later receipt only expires older heads with no such evidence. Legacy
+  // parked state has no owner: never guess it from queue order (the row can
+  // belong to B while A is first); let the driver's bounded wait resolve it.
+  const spec = bridgeSpecFor(lastInitConfig?.cliId);
+  const waiting = spec?.awaitsPendingInput?.(structuredBridgeDriverState) === true;
+  const owner = spec?.pendingInputOwner?.(structuredBridgeDriverState);
+  if (waiting && !owner) return;
+  const driverParked = owner
+    ? codexBridgeQueue.peek().find(turn => turn.turnId === owner.turnId
+      && turn.dispatchAttempt === owner.dispatchAttempt && !turn.started && turn.finalText === undefined)
+    : undefined;
   const expired = codexBridgeQueue.expireUnstartedBefore(turnId, dispatchAttempt,
     turn => turn === driverParked);
   if (expired.length === 0) return;

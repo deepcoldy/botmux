@@ -184,8 +184,10 @@ export function doubaoAssignmentHasInputSince(path: string, fromOffset: number, 
   if (!wanted) return false;
   try {
     const size = statSync(path).size;
-    // A rewritten (shorter) log has no stable frontier; read all of it.
-    const start = size < fromOffset ? 0 : fromOffset;
+    // A rewritten (shorter) log has no stable frontier. Historical sections
+    // cannot prove this submit: fail closed instead of replaying old content.
+    if (size < fromOffset) return false;
+    const start = fromOffset;
     if (size <= start) return false;
     const window = readJsonlWindow(path, start, size);
     return parseAssignmentSections(path, window.completeText + window.pendingTail, start)

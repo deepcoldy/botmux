@@ -289,6 +289,27 @@ describe('worker: expired structured heads', () => {
     expect(q.hasPendingTurn('om_B')).toBe(true);
   });
 
+  it('does not guess a parked owner from queue order for legacy driver state', () => {
+    const q = new CodexBridgeQueue(() => 1_000);
+    for (const turnId of ['om_A', 'om_B', 'om_C']) {
+      q.mark(turnId, `${turnId} request`, 1_000);
+      q.confirmPendingTurn(turnId, 1_000);
+    }
+    const h = harness([], undefined, {
+      codexBridgeQueue: q,
+      cliAdapter: { screenHoldsSubmittedInput: () => true },
+      bridgeSpecFor: () => ({ awaitsPendingInput: () => true }),
+      structuredBridgeDriverState: { parkedUserRow: { offset: 10, sinceMs: 1_000 } },
+      pruneExpiredStructuredHeadsAndEmit: vi.fn(),
+    });
+    const expire = loadWorkerFunction('expireHeldInputBeforeReceivedTurn', h.scope);
+    expire('om_C');
+    expect(q.peek().map(turn => [turn.turnId, turn.submitConfirmedAtMs])).toEqual([
+      ['om_A', 1_000], ['om_B', 1_000], ['om_C', 1_000],
+    ]);
+    expect(h.scope.pruneExpiredStructuredHeadsAndEmit).not.toHaveBeenCalled();
+  });
+
   it('expires a dead predecessor rather than protecting it for a successor\'s parked row', () => {
     const q = new CodexBridgeQueue(() => 1_000);
     q.mark('om_deleted_A', 'A request', 1_000);
