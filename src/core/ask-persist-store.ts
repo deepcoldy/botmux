@@ -65,6 +65,8 @@ export interface PersistedAsk {
   larkAppId: string;
   chatId: string;
   rootMessageId: string | null;
+  /** Original question topic, retained so text replies remain isolated after restart. */
+  cardRootMessageId?: string;
   sessionId: string;
   chatType?: 'group' | 'p2p';
   /** Optional app-scoped responder lock for host-owned approval asks. */

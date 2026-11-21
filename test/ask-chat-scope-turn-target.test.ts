@@ -306,6 +306,22 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     expect(await cardThenTextAnswer(ds, askBody(TURN))).toEqual({ via: 'reply', target: ROOT });
   });
 
+  it('内嵌 ask 也保留冻结话题供文字隔离，其他话题不会结算', async () => {
+    const ds = chatScopeSession({
+      turnReplyContexts: { [TURN]: { target: { mode: 'thread', rootMessageId: ROOT } } },
+    });
+    setCardDispatcher({ async send(ask) { sent.push({ via: 'reply', target: ROOT }); return { messageId: 'om_inline' }; } });
+    const { done, responses } = post(ds, askBody(TURN), { replyCardAskTarget: () => ({ turnId: TURN }) });
+    await vi.waitFor(() => expect(sent).toHaveLength(1));
+    const route = { larkAppId: APP, chatId: CHAT, anchor: CHAT };
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_other' })).toEqual([]);
+    const [pending] = listPendingAsksByAnchor({ ...route, messageRootId: ROOT });
+    expect(pending?.cardRootMessageId).toBe(ROOT);
+    expect(submitCustomReply({ askId: pending!.askId, by: 'ou_user', text: '继续' })).toBe('accepted');
+    await done;
+    expect(responses.at(-1)).toMatchObject({ status: 200 });
+  });
+
   it('hook 发起的 ask 同样跟随话题落点', async () => {
     const ds = chatScopeSession({
       turnReplyContexts: { [TURN]: { target: { mode: 'thread', rootMessageId: ROOT } } },

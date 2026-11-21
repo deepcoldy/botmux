@@ -110,6 +110,29 @@ function onlyPersisted(): PersistedAsk {
 }
 
 describe('ask persistence (injected store)', () => {
+  it('群会话的提问话题在恢复与重连后保留，文字候选仍按原始话题隔离', async () => {
+    const input = makeInput({ rootMessageId: null, cardRootMessageId: 'om_ask_topic' });
+    const first = mockDispatcher();
+    setCardDispatcher(first);
+    registerAsk(input);
+    await new Promise(r => setTimeout(r, 5));
+    expect(onlyPersisted()).toMatchObject({ cardRootMessageId: 'om_ask_topic' });
+    const original = first.sendCalls[0]!;
+    _resetForTest();
+    bindStore();
+    setCardDispatcher(mockDispatcher());
+    setCanTalkChecker(() => true);
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    const waiting = registerAsk(input);
+    const route = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat' };
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: 'om_other_topic' })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...route, messageRootId: null })).toEqual([]);
+    const found = findPendingAskByAnchor({ ...route, messageRootId: 'om_ask_topic' });
+    expect(found?.askId).toBe(original.askId);
+    expect(submitCustomReply({ askId: found!.askId, by: 'ou_owner', text: '同话题答案' })).toBe('accepted');
+    expect(await waiting).toMatchObject({ kind: 'answered', comment: '同话题答案' });
+  });
+
   it('preserves document recipient, responder lock and exact-card text routing across restart', async () => {
     const target = { kind: 'document-author' as const, openId: 'ou_owner', turnId: 'turn-A',
       fileToken: 'fixture', commentId: 'comment' };

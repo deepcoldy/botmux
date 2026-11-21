@@ -626,6 +626,7 @@ function persistFromInternal(ask: InternalPending, strict = false): void {
     larkAppId: ask.larkAppId,
     chatId: ask.chatId,
     rootMessageId: ask.rootMessageId,
+    cardRootMessageId: ask.cardRootMessageId,
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
@@ -904,8 +905,8 @@ export function submitCustomReply(args: {
  * 是不是在回答某个 ask」。匹配条件：
  *   - larkAppId 相同（不跨 bot 命中）
  *   - chatId 相同
- *   - thread-scope：ask.rootMessageId === anchor（话题根 message_id）
- *   - chat-scope：ask.rootMessageId === null（anchor 实为 chatId，已由 chatId 命中）
+ *   - 提供原始消息位置时：仅匹配提问的冻结话题；群外层仅匹配群外层
+ *   - 旧调用只提供 anchor：话题匹配 rootMessageId，群外层匹配 chatId
  *
  * 命中多个时返回最先注册的（实践中同一 anchor 同时最多一个 pending ask，因为发起
  * ask 的 CLI 此刻正阻塞等待结果）。返回 snapshot，改它不影响 broker 状态。
@@ -913,11 +914,15 @@ export function submitCustomReply(args: {
  * 跳过没有 hook 连着的 dormant hook ask（见 submitCustomReply）：这条文字应按普通
  * 消息进会话，而不是被当成一张没人在等的问题卡的答案。
  */
-export function findPendingAskByAnchor(args: {
+interface AskMessageAnchor {
   larkAppId: string;
   chatId: string;
   anchor: string;
-}): PendingAsk | undefined {
+  /** Original IM location, before chat/shared routing folds a topic into the chat. */
+  messageRootId?: string | null;
+}
+
+export function findPendingAskByAnchor(args: AskMessageAnchor): PendingAsk | undefined {
   for (const ask of pending.values()) {
     if (!anchorMatches(ask, args)) continue;
     if (isUnclaimedHookAsk(ask)) {
@@ -932,15 +937,19 @@ export function findPendingAskByAnchor(args: {
 }
 
 /** Snapshot all live candidates, without changing the legacy first-match API. */
-export function listPendingAsksByAnchor(args: { larkAppId: string; chatId: string; anchor: string }): PendingAsk[] {
+export function listPendingAsksByAnchor(args: AskMessageAnchor): PendingAsk[] {
   return [...pending.values()]
     .filter(ask => anchorMatches(ask, args) && !isUnclaimedHookAsk(ask))
     .map(snapshot);
 }
 
-function anchorMatches(ask: InternalPending, args: { larkAppId: string; chatId: string; anchor: string }): boolean {
-  return !ask.settled && ask.larkAppId === args.larkAppId && ask.chatId === args.chatId
-    && (ask.rootMessageId === null || ask.rootMessageId === args.anchor);
+function anchorMatches(ask: InternalPending, args: AskMessageAnchor): boolean {
+  if (ask.settled || ask.larkAppId !== args.larkAppId || ask.chatId !== args.chatId) return false;
+  if (args.messageRootId !== undefined) {
+    const askRoot = ask.cardRootMessageId ?? (ask.rootMessageId === ask.chatId ? null : ask.rootMessageId);
+    return askRoot === args.messageRootId;
+  }
+  return ask.rootMessageId === null ? args.anchor === args.chatId : ask.rootMessageId === args.anchor;
 }
 
 /** A hook ask whose hook connection is gone: no CLI is blocked on it right now.
@@ -1088,6 +1097,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       larkAppId: p.larkAppId,
       chatId: p.chatId,
       rootMessageId: p.rootMessageId,
+      cardRootMessageId: p.cardRootMessageId,
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,

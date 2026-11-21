@@ -14,6 +14,7 @@ import {
   _pendingCount,
   _resetForTest,
   findPendingAskByAnchor,
+  listPendingAsksByAnchor,
   invalidateAll,
   registerAsk,
   registerHostAsk,
@@ -843,6 +844,28 @@ describe('自定义回复 findPendingAskByAnchor + submitCustomReply', () => {
     await Promise.resolve();
     const found = findPendingAskByAnchor({ larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'oc_chat' });
     expect(found?.askId).toBe(d.sendCalls[0]!.askId);
+  });
+
+  it('群级 ask 不作为同群话题文字的候选，话题与群级候选各自隔离', async () => {
+    const d = mockDispatcher();
+    setCardDispatcher(d);
+    registerAsk(makeInput({ rootMessageId: null, sessionId: 'chat-session' }));
+    await Promise.resolve();
+    await Promise.resolve();
+    const groupId = d.sendCalls[0]!.askId;
+    const topic = { larkAppId: 'cli_app', chatId: 'oc_chat', anchor: 'om_root' };
+    expect(findPendingAskByAnchor(topic)).toBeUndefined();
+    expect(listPendingAsksByAnchor(topic)).toEqual([]);
+
+    registerAsk(makeInput());
+    await Promise.resolve();
+    await Promise.resolve();
+    const topicId = d.sendCalls[1]!.askId;
+    expect(findPendingAskByAnchor(topic)?.askId).toBe(topicId);
+    expect(listPendingAsksByAnchor(topic).map(ask => ask.askId)).toEqual([topicId]);
+    expect(listPendingAsksByAnchor({ ...topic, anchor: 'oc_chat' }).map(ask => ask.askId)).toEqual([groupId]);
+    expect(listPendingAsksByAnchor({ ...topic, anchor: 'om_other' })).toEqual([]);
+    expect(listPendingAsksByAnchor({ ...topic, chatId: 'oc_other' })).toEqual([]);
   });
 
   it('findPendingAskByAnchor: anchor 不匹配 → undefined', async () => {
