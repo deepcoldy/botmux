@@ -231,7 +231,7 @@ import { doubaoWorkspaceForSession } from '../services/doubao-transcript.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
-import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage, resumeCotMessage } from '../im/lark/cot-message.js';
+import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage, resumeCotMessage, cotEnabled } from '../im/lark/cot-message.js';
 import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
@@ -27653,6 +27653,50 @@ function setupWorkerHandlers(
         });
         break;
       }
+      case 'absorbed_reply': {
+        // Adopt: the answer to a message Claude Code folded into the running
+        // turn — live while that turn keeps working, or when it ends. Replied
+        // under the folded message, which the reply quotes, so the card omits
+        // the question. Presentation only: the folded turn ends with its host.
+        if (!ds.adoptedFrom) {
+          logger.warn(`[${t}] Ignored absorbed_reply from non-adopt worker`);
+          break;
+        }
+        if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (!msg.answer.trim()) break;
+        // Said only in a thinking summary, the answer is thinking content: a
+        // bot or chat with the thinking display off does not get it.
+        if (msg.source === 'thinking' && !cotEnabled(ds)) {
+          logger.info(`[${t}] Folded-turn reply from a thinking summary not posted: thinking display is off`);
+          break;
+        }
+        const loc = localeForBot(ds.larkAppId);
+        const answer = msg.answer.length > BTW_ANSWER_MAX_CHARS
+          ? `${truncateUtf16WellFormed(msg.answer, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
+          : msg.answer;
+        const cardJson = buildContextualReplyCard({
+          title: tr(msg.source === 'thinking' ? 'card.absorbed_reply_thinking' : 'card.absorbed_reply', undefined, loc),
+          assistantText: repairReplyMarkdown(answer),
+          assistantLabel: sessionCliDisplayName(ds, botCfg),
+          recipientOpenId: daemonCardFooterRecipientOpenId(ds, effectiveCliId),
+          brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+          locale: loc,
+          workingDir: ds.workingDir,
+          localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
+        });
+        // The worker sends a folded turn's reply once. Retry it like a bridge
+        // final; the provider key keeps an attempt whose response was lost
+        // from posting a second copy.
+        const uuid = absorbedReplyUuid(ds.session.sessionId, msg.turnId, msg.replyUuid);
+        void deliverWithRetry(
+          () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid }),
+          ownsWorkerSession,
+          (attempt, err) => logger.warn(`[${t}] Folded-turn reply attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`),
+        ).then(delivered => {
+          if (!delivered) logger.error(`[${t}] Gave up delivering folded-turn reply for turn ${msg.turnId.substring(0, 8)}`);
+        });
+        break;
+      }
       case 'adopt_preamble': {
         // Adopt-bridge: surface the last completed user/assistant exchange
         // from the adopted CLI session so the Lark thread has context to
@@ -28241,6 +28285,35 @@ function setupWorkerHandlers(
 // ─── Bridge final-output delivery (with retry) ──────────────────────────────
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
+
+/** Provider idempotency key for a folded turn's reply: stable for one answer
+ *  (the transcript record it ends at), so a retry after a lost response
+ *  returns the message already posted instead of posting another. */
+export function absorbedReplyUuid(sessionId: string, turnId: string, replyUuid: string): string {
+  return `ar_${createHash('sha256').update(`${sessionId}:${turnId}:${replyUuid}`, 'utf8').digest('hex').slice(0, 46)}`;
+}
+
+/** Run `attempt` on the bridge-final backoff until it resolves. Retries stop
+ *  once `stillOwned` says the session moved on. Resolves true when an attempt
+ *  succeeded. */
+export async function deliverWithRetry(
+  attempt: () => Promise<unknown>,
+  stillOwned: () => boolean,
+  onFailure: (attemptNo: number, err: unknown) => void,
+): Promise<boolean> {
+  for (let i = 0; i < FINAL_OUTPUT_RETRY_BACKOFF_MS.length; i++) {
+    const delay = FINAL_OUTPUT_RETRY_BACKOFF_MS[i] ?? 0;
+    if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+    if (i > 0 && !stillOwned()) return false;
+    try {
+      await attempt();
+      return true;
+    } catch (err) {
+      onFailure(i + 1, err);
+    }
+  }
+  return false;
+}
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
 export interface DurableBridgeFinalOutputRequest {

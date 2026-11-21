@@ -165,8 +165,8 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BackgroundTaskPinSnapshot, BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -10333,6 +10333,45 @@ function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn
   observeCotEntries(extractCotEntries(ev), turn);
 }
 
+/** Per folded turn: the live trigger's state (takeAbsorbedReplyCandidates). */
+const absorbedReplyCollectors = new WeakMap<BridgePendingTurn, AbsorbedReplyCollector>();
+
+/** Post a folded turn's reply and mark it answered. */
+function sendAbsorbedReply(turn: BridgePendingTurn, reply: AbsorbedInputReply, when: 'live' | 'at turn end'): void {
+  turn.absorbedReplySent = true;
+  send({
+    type: 'absorbed_reply',
+    turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+    answer: reply.text,
+    replyUuid: reply.lastUuid,
+    source: reply.source,
+  });
+  log(`Folded turn ${turn.turnId.substring(0, 8)} answered ${when} (${reply.source}, ${reply.text.length} chars)`);
+}
+
+/** Adopt: answer a Lark message Claude Code folded into the running turn as
+ *  soon as the model moves on from it, instead of when the host turn ends.
+ *  The host may be a local (terminal-typed) turn, so this runs before the CoT
+ *  observer's local-turn exit. The reply is read from the transcript, not
+ *  from what this observer saw: see takeAbsorbedReplyCandidates. */
+function observeAbsorbedReplies(ev: TranscriptEvent, host: BridgePendingTurn): void {
+  if (lastInitConfig?.adoptMode !== true || !host.absorbedTurns?.length) return;
+  for (const turn of takeAbsorbedReplyCandidates(host, ev, absorbedReplyCollectors)) {
+    const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
+    if (!path || !turn.absorbedAtUuid) continue;
+    const reply = absorbedInputReplyText(drainTranscript(path, 0).events, turn.absorbedAtUuid);
+    if (reply) sendAbsorbedReply(turn, reply, 'live');
+    else log(`Folded turn ${turn.turnId.substring(0, 8)} has no reply of its own yet; left to the host turn's end`);
+  }
+}
+
+/** Observer for records attributed to the running turn on the live read. */
+function observeBridgeAttribution(ev: TranscriptEvent, turn: BridgePendingTurn): void {
+  try { observeAbsorbedReplies(ev, turn); } catch (err) { log(`Folded-turn reply observer failed: ${String(err)}`); }
+  observeThinkingAttribution(ev, turn);
+}
+
 /** Trailing-edge throttle: at most one thinking_update per interval, always
  *  eventually flushing the latest accumulated text. */
 function scheduleThinkingEmit(): void {
@@ -12690,7 +12729,7 @@ function bridgeIngest(): void {
     // exists", which this makes true in every mode.
     cliTranscriptEverExisted = true;
   }
-  bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
+  bridgeQueue.ingest(result.events, bridgeJsonlPath, observeBridgeAttribution);
   // Arm (or keep) the no-idle-edge watchdog for a fresh head now waiting on
   // its closing records. No-op while an idle settle owns the wait.
   updateProvisionalExitWatch();
@@ -13236,12 +13275,32 @@ function emitReadyTurns(opts: {
       explicitReplyMarkers,
     );
 
+    // A folded turn answered live while its host ran (observeAbsorbedReplies):
+    // its reply is out, so it settles without posting it a second time.
+    if (adoptMode && turn.absorbedReplySent) {
+      observedOutputTurns.add(turn);
+      continue;
+    }
+
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
     if (!path) continue;
     let drained = cache.get(path);
     if (!drained) {
       drained = drainTranscript(path, 0);
       cache.set(path, drained);
+    }
+    // Adopt: a message Claude Code folded into the running turn has no reply
+    // of its own — everything after it is attributed to the host turn — so
+    // answer it the way the live path does (observeAbsorbedReplies): with the
+    // model's first output after the fold, which may exist only as a thinking
+    // summary. It settles with its host either way.
+    if (adoptMode && turn.absorbedIntoTurnId && turn.absorbedAtUuid) {
+      const reply = absorbedInputReplyText(drained.events, turn.absorbedAtUuid);
+      if (reply) {
+        sendAbsorbedReply(turn, reply, 'at turn end');
+        observedOutputTurns.add(turn);
+      }
+      continue;
     }
     const set = new Set(turn.assistantUuids);
     const matched = drained.events.filter(e => e.uuid && set.has(e.uuid));

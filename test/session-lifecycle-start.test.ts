@@ -12365,6 +12365,98 @@ describe('/btw side answer relay', () => {
   });
 });
 
+describe('folded-turn reply relay', () => {
+  const forkWithReply = (overrides?: Partial<DaemonSession>, sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply')) => {
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    expect(forkWorker(makeDs(overrides), 'hello', false)).toBe(true);
+    return { sessionReply, worker: forkMock.mock.results.at(-1)!.value };
+  };
+  const adopted = { adoptedFrom: { tmuxTarget: 'adopt-folded:0.0', originalCliPid: 23456, cliId: 'claude-code', cwd: REPO } };
+  const reply = (turnId: string, answer: string, source: 'text' | 'thinking' = 'text', replyUuid = `${turnId}-a1`) =>
+    ({ type: 'absorbed_reply', turnId, answer, replyUuid, source });
+  const settle = () => new Promise(resolveTick => setTimeout(resolveTick, 20));
+
+  it('replies under the folded message, capping a long answer', async () => {
+    const { sessionReply, worker } = forkWithReply(adopted);
+    worker.emit('message', reply('om_followup', '用的是 gpt-6-astra。'));
+    const long = `${'a'.repeat(6_000)}TAIL_BEYOND_CAP`;
+    worker.emit('message', reply('om_followup_long', long));
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls.map(call => [call[2], call[4]])).toEqual([
+      ['interactive', 'om_followup'],
+      ['interactive', 'om_followup_long'],
+    ]);
+    const [short, capped] = sessionReply.mock.calls.map(call => String(call[1]));
+    expect(short).toContain('用的是 gpt-6-astra。');
+    expect(capped).toContain('a'.repeat(1_000));
+    expect(capped).not.toContain('TAIL_BEYOND_CAP');
+  });
+
+  it('retries a failed delivery under one provider key', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply')
+      .mockRejectedValueOnce(new Error('lark 5xx (transient)'));
+    const { worker } = forkWithReply(adopted, sessionReply);
+    worker.emit('message', reply('om_followup', 'answer'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    const keys = sessionReply.mock.calls.map(call => (call[5] as { uuid?: string } | undefined)?.uuid);
+    expect(keys[0]).toBeTruthy();
+    expect(keys[1]).toBe(keys[0]);
+    // A different answer for the same turn is a different provider message.
+    worker.emit('message', reply('om_followup', 'answer', 'text', 'om_followup-a2'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect((sessionReply.mock.calls[2][5] as { uuid?: string }).uuid).not.toBe(keys[0]);
+  });
+
+  it('posts an answer from a thinking summary only while thinking is shown', async () => {
+    const { sessionReply, worker } = forkWithReply(adopted);
+    worker.emit('message', reply('om_text', 'from text', 'text'));
+    worker.emit('message', reply('om_thinking', 'from thinking', 'thinking'));
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    const [textCard, thinkingCard] = sessionReply.mock.calls.map(call => String(call[1]));
+    // The card says which kind of output answered.
+    expect(thinkingCard.replace('from thinking', '')).not.toBe(textCard.replace('from text', ''));
+
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cotEnabled: false }));
+    worker.emit('message', reply('om_thinking_off', 'hidden thinking', 'thinking'));
+    worker.emit('message', reply('om_text_off', 'still shown', 'text'));
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(3));
+    await settle();
+    expect(sessionReply.mock.calls.map(call => call[4])).toEqual(['om_text', 'om_thinking', 'om_text_off']);
+
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ noCotChats: [makeDs().chatId] }));
+    worker.emit('message', reply('om_thinking_chat_off', 'hidden thinking', 'thinking'));
+    await settle();
+    expect(sessionReply).toHaveBeenCalledTimes(3);
+  });
+
+  it('drops an empty answer and one for a session without a Lark transport', async () => {
+    const live = forkWithReply(adopted);
+    live.worker.emit('message', reply('om_blank', '  \n '));
+    await settle();
+    expect(live.sessionReply).not.toHaveBeenCalled();
+    const noTransport = forkWithReply({ ...adopted, chatId: 'http_async_folded' });
+    noTransport.worker.emit('message', reply('om_followup', 'a'));
+    await settle();
+    expect(noTransport.sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('ignores it from a session that is not adopted', async () => {
+    const { sessionReply, worker } = forkWithReply();
+    worker.emit('message', reply('om_followup', 'a'));
+    await settle();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+});
+
 describe('worker pid record', () => {
   // A real idle child stands in for the forked worker so its birth identity is
   // readable; updateSessionPid is mocked and only the cleanup signals it.

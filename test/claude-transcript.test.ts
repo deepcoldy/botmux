@@ -36,6 +36,8 @@ import {
   apiErrorMessageText,
   transcriptShowsTurnDurationMarker,
   transcriptHoldsConversation,
+  absorbedInputReplyText,
+  AbsorbedReplyCollector,
   type TranscriptEvent,
 } from '../src/services/claude-transcript.js';
 
@@ -2256,5 +2258,112 @@ describe('transcriptHoldsConversation', () => {
   it('does not take a nested "type":"user" for a conversation record', () => {
     appendLine({ type: 'file-history-snapshot', snapshot: { note: { type: 'user' } } });
     expect(transcriptHoldsConversation(path)).toBe(false);
+  });
+});
+
+describe('absorbedInputReplyText', () => {
+  const block = (uuid: string, content: unknown, extra: Record<string, unknown> = {}): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [content] }, ...extra,
+  } as TranscriptEvent);
+  const text = (uuid: string, t: string) => block(uuid, { type: 'text', text: t });
+  const thinking = (uuid: string, t: string) => block(uuid, { type: 'thinking', thinking: t, signature: 'sig' });
+  const tool = (uuid: string) => block(uuid, { type: 'tool_use', id: `tu-${uuid}`, name: 'Bash', input: {} });
+  const toolResult = (uuid: string): TranscriptEvent => ({
+    type: 'user', uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'x', content: 'ok' } as any] },
+  });
+  const folded = (uuid: string): TranscriptEvent => ({
+    type: 'attachment', uuid, attachment: { type: 'queued_command', prompt: '现在用的是什么模型？', commandMode: 'prompt' },
+  } as TranscriptEvent);
+  const duration: TranscriptEvent = { type: 'system', subtype: 'turn_duration', uuid: 'dur' };
+
+  it('answers with a thinking summary when the model wrote no text after the fold', () => {
+    // Shape of the reported session: redacted thinking + a lookup, then the
+    // answer only as a thinking summary, then the turn keeps working.
+    const events = [
+      text('a0', 'Verifying which code each kernel runs.'),
+      tool('t0'), toolResult('r0'),
+      folded('q1'),
+      thinking('a1', ''), tool('t1'), toolResult('r1'),
+      thinking('a2', ''),
+      thinking('a3', '这 3 个 case 用的是 gpt-6-astra，评分用 gpt-6.1-sol。\n\n'),
+      tool('t2'), toolResult('r2'),
+      thinking('a4', 'Both builds differ, so the identical result is real.'),
+      text('a5', 'Final summary of the whole turn.'),
+      duration,
+    ];
+    expect(absorbedInputReplyText(events, 'q1')).toEqual({
+      text: '这 3 个 case 用的是 gpt-6-astra，评分用 gpt-6.1-sol。',
+      lastUuid: 'a3',
+      source: 'thinking',
+    });
+  });
+
+  it('prefers text over the thinking that precedes it in the same run', () => {
+    const events = [
+      folded('q1'),
+      thinking('a1', 'The user asks which model; the rollout says gpt-6-astra.'),
+      text('a2', 'Cases run on gpt-6-astra.'),
+      text('a3', 'Grading uses gpt-6.1-sol.'),
+      tool('t1'),
+      text('a4', 'Back to the audit.'),
+    ];
+    expect(absorbedInputReplyText(events, 'q1')).toEqual({
+      text: 'Cases run on gpt-6-astra.\n\nGrading uses gpt-6.1-sol.',
+      lastUuid: 'a3',
+      source: 'text',
+    });
+  });
+
+  it('ignores output before the fold, sidechain chatter and API-error records', () => {
+    const events = [
+      text('a0', 'said before the message arrived'),
+      folded('q1'),
+      text('s1', 'sub-agent chatter'),
+      { ...text('e1', 'API Error: 500'), isApiErrorMessage: true } as TranscriptEvent,
+      text('a1', 'the answer'),
+    ];
+    (events[2] as any).isSidechain = true;
+    expect(absorbedInputReplyText(events, 'q1')).toEqual({ text: 'the answer', lastUuid: 'a1', source: 'text' });
+  });
+
+  it('does not reach past the end of the host turn', () => {
+    const userPrompt: TranscriptEvent = { type: 'user', uuid: 'u2', message: { role: 'user', content: 'next question' } };
+    expect(absorbedInputReplyText([folded('q1'), tool('t1'), duration, text('a1', 'next turn')], 'q1')).toBeUndefined();
+    expect(absorbedInputReplyText([folded('q1'), tool('t1'), userPrompt, text('a1', 'next turn')], 'q1')).toBeUndefined();
+  });
+
+  it('returns undefined when the fold record is not in the transcript', () => {
+    expect(absorbedInputReplyText([text('a1', 'anything')], 'missing')).toBeUndefined();
+  });
+
+  it('stops at the next folded input: what follows answers that one', () => {
+    // Claude Code renders a folded input to the model as a system reminder.
+    const reminder = (uuid: string, prompt: string): TranscriptEvent => ({
+      type: 'attachment', uuid, renderedRole: 'system',
+      attachment: { type: 'queued_command', prompt, commandMode: 'prompt' },
+    } as TranscriptEvent);
+    const events = [
+      reminder('qB', 'which model?'), thinking('aB', ''), tool('t1'), toolResult('r1'),
+      reminder('qC', 'is CI green?'), text('aC', 'CI is green.'), tool('t2'),
+    ];
+    expect(absorbedInputReplyText(events, 'qB')).toBeUndefined();
+    expect(absorbedInputReplyText(events, 'qC')).toEqual({ text: 'CI is green.', lastUuid: 'aC', source: 'text' });
+  });
+});
+
+describe('AbsorbedReplyCollector (live feed)', () => {
+  const ev = (uuid: string, block: unknown): TranscriptEvent => ({
+    type: 'assistant', uuid, message: { role: 'assistant', content: [block] },
+  } as TranscriptEvent);
+
+  it('completes at the first tool call after output and ignores what follows', () => {
+    const c = new AbsorbedReplyCollector();
+    expect(c.feed(ev('a1', { type: 'tool_use', id: 't1', name: 'Bash', input: {} }))).toBe(false);
+    expect(c.reply()).toBeUndefined();
+    expect(c.feed(ev('a2', { type: 'thinking', thinking: 'it is gpt-6-astra' }))).toBe(false);
+    expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', source: 'thinking' });
+    expect(c.feed(ev('a3', { type: 'tool_use', id: 't2', name: 'Bash', input: {} }))).toBe(true);
+    expect(c.feed(ev('a4', { type: 'text', text: 'later narration' }))).toBe(true);
+    expect(c.reply()).toEqual({ text: 'it is gpt-6-astra', lastUuid: 'a2', source: 'thinking' });
   });
 });

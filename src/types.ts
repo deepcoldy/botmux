@@ -2991,6 +2991,15 @@ export type WorkerToDaemonBase =
     source: 'clipboard' | 'screen';
     turnId?: string;
   }
+  /** Adopt: the reply to a Lark message Claude Code folded into the running
+   *  turn (a mid-turn system reminder). Sent as soon as the model moved on
+   *  from it, or when the host turn ends if it never did. `turnId` is the
+   *  folded message's turn; presentation only — its terminal still follows
+   *  the host turn's. `replyUuid` is the transcript record the answer ends
+   *  at (stable across re-sends, so it keys the provider's idempotency);
+   *  `source: 'thinking'` marks an answer the model gave only in a thinking
+   *  summary. */
+  | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking' }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
    * was either removed from the worker queue or its owned CLI was fenced. */

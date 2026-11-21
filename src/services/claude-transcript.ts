@@ -1442,6 +1442,94 @@ export interface TrailingAnswerOptions {
   endsWithSentinel?: (text: string) => boolean;
 }
 
+/**
+ * The reply to a message Claude Code folded into the running turn (the
+ * `attachment(queued_command)` record shown to the model as a mid-turn system
+ * reminder). That input has no turn of its own, so whatever the model says in
+ * response lands inside the host turn — and it may say it only in a thinking
+ * summary, which the CLI displays inline (`⏺ … · summary`) but the host
+ * turn's reply leaves out.
+ *
+ * Fed the records that follow the fold in transcript order — live as the
+ * worker reads them, or all at once by {@link absorbedInputReplyText} — it
+ * keeps the first output: the run of non-empty `text` / `thinking` blocks
+ * that starts with the first one and ends at the next tool call. Text wins
+ * when the run has any; otherwise the thinking summary is the answer.
+ * Sidechain and API-error records never contribute. Another folded input
+ * ends the run too: what the model writes after it answers that one.
+ */
+export class AbsorbedReplyCollector {
+  private readonly run: Array<{ kind: 'text' | 'thinking'; text: string; uuid: string }> = [];
+  private complete = false;
+
+  /** Feed the next record. Returns true once the reply is complete — output
+   *  was written and the model then called a tool, or the turn ended
+   *  (`turn_duration`, the next real user prompt), or another input was folded
+   *  in — and keeps returning true; records fed after that are ignored. */
+  feed(ev: TranscriptEvent): boolean {
+    if (this.complete) return true;
+    if (!ev || typeof ev !== 'object' || (ev as any).isSidechain === true) return false;
+    if (isClaudeTurnDurationEvent(ev) || isMeaningfulUserEvent(ev) || isMidTurnAbsorbedQueuedCommand(ev)) {
+      return (this.complete = true);
+    }
+    const role = ev.message?.role ?? ev.type;
+    if (role !== 'assistant' || !ev.uuid) return false;
+    if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) return false;
+    const content = ev.message?.content;
+    if (!Array.isArray(content)) return false;
+    for (const block of content as any[]) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.type === 'tool_use') {
+        if (this.run.length > 0) this.complete = true;
+        return this.complete;
+      }
+      const text = block.type === 'text' ? block.text : block.type === 'thinking' ? block.thinking : undefined;
+      if (typeof text === 'string' && text.trim().length > 0) {
+        this.run.push({ kind: block.type, text: text.trim(), uuid: ev.uuid });
+      }
+    }
+    return false;
+  }
+
+  /** The reply collected so far, undefined while nothing was said;
+   *  `lastUuid` is the uuid of the last block used, `source` the kind of
+   *  block it came from. */
+  reply(): AbsorbedInputReply | undefined {
+    const texts = this.run.filter(part => part.kind === 'text');
+    const picked = texts.length > 0 ? texts : this.run;
+    if (picked.length === 0) return undefined;
+    return {
+      text: picked.map(part => part.text).join('\n\n'),
+      lastUuid: picked[picked.length - 1].uuid,
+      source: texts.length > 0 ? 'text' : 'thinking',
+    };
+  }
+}
+
+/** The reply to a folded input. `source: 'thinking'` means the model said it
+ *  only in a thinking summary — possibly a plan rather than an answer, and
+ *  content a bot with its thinking display off does not show. */
+export interface AbsorbedInputReply {
+  text: string;
+  lastUuid: string;
+  source: 'text' | 'thinking';
+}
+
+/** {@link AbsorbedReplyCollector} over a whole transcript: the reply to the
+ *  input folded in at the record `absorbedAtUuid`, read up to the end of the
+ *  turn that absorbed it. Undefined when that record is not in `events` or
+ *  nothing was said after it. */
+export function absorbedInputReplyText(
+  events: readonly TranscriptEvent[],
+  absorbedAtUuid: string,
+): AbsorbedInputReply | undefined {
+  const start = events.findIndex(ev => ev?.uuid === absorbedAtUuid);
+  if (start < 0) return undefined;
+  const collector = new AbsorbedReplyCollector();
+  for (let i = start + 1; i < events.length && !collector.feed(events[i]); i++) { /* feed until complete */ }
+  return collector.reply();
+}
+
 /** Walk back from `end` over this turn's contiguous assistant-text run.
  *  `boundary` is the index of the tool_use / user event that ended the walk
  *  (-1 when it reached the start of the transcript). */

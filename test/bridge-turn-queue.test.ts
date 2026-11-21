@@ -14,9 +14,9 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, isHeldPendingMark, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, CLI_QUEUE_HOLD_MAX_MS, isHeldInCliQueue, isHeldPendingMark, makeFingerprint, isTruncatedMatch, normaliseForFingerprint, takeAbsorbedReplyCandidates, type BridgePendingTurn } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
-import type { TranscriptEvent } from '../src/services/claude-transcript.js';
+import type { AbsorbedReplyCollector, TranscriptEvent } from '../src/services/claude-transcript.js';
 
 function user(uuid: string, content: string = `<input ${uuid}>`, timestamp?: string): TranscriptEvent {
   return { type: 'user', uuid, timestamp, message: { role: 'user', content } };
@@ -1289,7 +1289,7 @@ describe('BridgeTurnQueue', () => {
       // Not split: the running turn keeps collecting the reply.
       expect(q.peek().map(t => t.turnId)).toEqual(['tA', 'tB']);
       expect(q.peek()[0].assistantUuids).toEqual(['a-final']);
-      expect(q.peek()[1]).toMatchObject({ started: true, absorbedIntoTurnId: 'tA', assistantUuids: [] });
+      expect(q.peek()[1]).toMatchObject({ started: true, absorbedIntoTurnId: 'tA', absorbedAtUuid: 'q-absorbed', assistantUuids: [] });
       expect(started).toEqual(['tA:true', 'tB:true']);
 
       // A pruning pass cannot expire it any more: it is started.
@@ -1301,6 +1301,80 @@ describe('BridgeTurnQueue', () => {
       expect(ready[1].terminalOutcome).toEqual({ status: 'completed' });
       expect(ready[1].markTimeMs).toBe(5000);
       expect(q.size()).toBe(0);
+    });
+
+    it('flags a folded message for its live reply once, when the model moves on from it', () => {
+      const promptB = '<user_message>现在用的是什么模型？</user_message>';
+      const collectors = new WeakMap<BridgePendingTurn, AbsorbedReplyCollector>();
+      const due: string[] = [];
+      const observe = (ev: TranscriptEvent, host: BridgePendingTurn) => {
+        for (const turn of takeAbsorbedReplyCandidates(host, ev, collectors)) due.push(turn.turnId);
+      };
+      const thinking = (uuid: string, text: string): TranscriptEvent => ({
+        type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'thinking', thinking: text } as any] },
+      });
+      const q = new BridgeTurnQueue();
+      q.mark('tA', makeFingerprint('跑用例'), 100, normaliseForFingerprint('跑用例'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([user('uA', '跑用例'), assistant('a0', 'starting'), assistantToolUse('a-t0'), toolResult('r0')], undefined, observe);
+      q.ingest([
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        thinking('a1', ''), assistantToolUse('a-t1'), toolResult('r1'),
+        thinking('a2', '用的是 gpt-6-astra。'),
+      ], undefined, observe);
+      // The answer is written, but the model may still add to it.
+      expect(due).toEqual([]);
+
+      q.ingest([assistantToolUse('a-t2'), toolResult('r2'), assistant('a3', 'more work'), assistantToolUse('a-t3')], undefined, observe);
+      expect(due).toEqual(['tB']);
+      // Flagged once, whatever the worker then finds in the transcript.
+      q.ingest([assistant('a-final', 'done'), { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent], undefined, observe);
+      expect(due).toEqual(['tB']);
+    });
+
+    it('does not flag a folded message whose reply is still open when the host turn ends', () => {
+      const promptB = '<user_message>顺便问一句</user_message>';
+      const collectors = new WeakMap<BridgePendingTurn, AbsorbedReplyCollector>();
+      const due: string[] = [];
+      const observe = (ev: TranscriptEvent, host: BridgePendingTurn) => {
+        for (const turn of takeAbsorbedReplyCandidates(host, ev, collectors)) due.push(turn.turnId);
+      };
+      const q = new BridgeTurnQueue();
+      q.mark('tA', makeFingerprint('跑用例'), 100, normaliseForFingerprint('跑用例'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', '跑用例'), assistantToolUse('a-t0'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        assistant('a-final', 'answer and summary in one closing message'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ], undefined, observe);
+      expect(due).toEqual([]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => t.turnId)).toEqual(['tA', 'tB']);
+    });
+
+    it('a folded turn already answered settles as completed even when its host then fails', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'quick question while busy';
+      const promptC = 'another one while busy';
+      q.mark('tA', makeFingerprint('first request'), 100, normaliseForFingerprint('first request'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.mark('tC', makeFingerprint(promptC), 300, normaliseForFingerprint(promptC), 1);
+      q.ingest([
+        user('uA', 'first request'), assistantToolUse('a-t0'),
+        absorbedQueued('q-b', promptB, new Date(5000).toISOString()),
+        absorbedQueued('q-c', promptC, new Date(6000).toISOString()),
+      ]);
+      q.peek().find(t => t.turnId === 'tB')!.absorbedReplySent = true;
+      q.ingest([
+        { ...assistant('err', 'API Error: 500 {"error":{"type":"api_error"}}'), isApiErrorMessage: true } as TranscriptEvent,
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      const outcome = (id: string) => ready.find(t => t.turnId === id)!.terminalOutcome?.status;
+      expect(outcome('tA')).not.toBe('completed');
+      expect(outcome('tB')).toBe('completed');
+      expect(outcome('tC')).toBe(outcome('tA'));
     });
 
     it('an API error that ends the host turn keeps its text, and the absorbed turn ends with the same error', () => {

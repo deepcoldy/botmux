@@ -47,6 +47,7 @@ import {
   isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
   apiErrorMessageText,
+  AbsorbedReplyCollector,
   type ClaudeTerminalOutcome,
   type TranscriptEvent,
 } from './claude-transcript.js';
@@ -222,6 +223,17 @@ export interface BridgePendingTurn {
    *  running (a mid-turn system reminder) instead of starting its own. It has
    *  no reply of its own and ends when that turn ends — see `absorbedTurns`. */
   absorbedIntoTurnId?: string;
+  /** uuid of the `attachment(queued_command)` record that folded this turn's
+   *  input into the host turn: where its reply starts in the transcript (see
+   *  absorbedInputReplyText). Set together with `absorbedIntoTurnId`. */
+  absorbedAtUuid?: string;
+  /** The worker already sent this folded turn's reply live, while its host
+   *  turn was still running: the end of the host turn must not post it again,
+   *  and a failure the host meets afterwards is not this turn's. */
+  absorbedReplySent?: boolean;
+  /** The live check for this folded turn's reply has run (see
+   *  takeAbsorbedReplyCandidates); whatever it found, it does not run again. */
+  absorbedLiveChecked?: boolean;
   /** Lark turns folded into this one. They leave the queue right behind it and
    *  share its terminal, so each still gets the end signal its card waits for. */
   absorbedTurns?: BridgePendingTurn[];
@@ -275,6 +287,36 @@ export const BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS = 60_000;
  *  running. Either way the rotation fallback scan only needs the rare cadence. */
 export function isHeldPendingMark(turn: BridgePendingTurn): boolean {
   return !turn.started && (isHeldInCliQueue(turn) || turn.heldWhileBusyAtMs !== undefined);
+}
+
+/** Inputs folded into `host` whose reply `ev` may have completed. Feeds `ev` —
+ *  the next record attributed to the running host turn — to the collector of
+ *  each folded turn not yet checked, and returns the turns whose collector now
+ *  reports a complete, non-empty reply, marking them `absorbedLiveChecked` so
+ *  each is returned once. This is only the moment to look: the worker reads
+ *  the reply itself from the transcript (absorbedInputReplyText), because a
+ *  collector misses whatever the transcript reader ingested without this
+ *  observer, and it never sees the records that bound a reply (a later fold,
+ *  the turn's duration marker). A turn not answered live is answered when its
+ *  host turn ends. `collectors` holds the per-turn state between calls. */
+export function takeAbsorbedReplyCandidates(
+  host: BridgePendingTurn,
+  ev: TranscriptEvent,
+  collectors: WeakMap<BridgePendingTurn, AbsorbedReplyCollector>,
+): BridgePendingTurn[] {
+  const due: BridgePendingTurn[] = [];
+  for (const absorbed of host.absorbedTurns ?? []) {
+    if (absorbed.absorbedLiveChecked || absorbed.absorbedReplySent || !absorbed.absorbedAtUuid) continue;
+    let collector = collectors.get(absorbed);
+    if (!collector) {
+      collector = new AbsorbedReplyCollector();
+      collectors.set(absorbed, collector);
+    }
+    if (!collector.feed(ev) || !collector.reply()) continue;
+    absorbed.absorbedLiveChecked = true;
+    due.push(absorbed);
+  }
+  return due;
 }
 
 /** Claude's own transcript proves this input is waiting in its queue. There is
@@ -1191,6 +1233,7 @@ export class BridgeTurnQueue {
     const host = this.collecting;
     if (host && !host.terminalObserved) {
       next.absorbedIntoTurnId = host.turnId;
+      if (typeof ev.uuid === 'string' && ev.uuid) next.absorbedAtUuid = ev.uuid;
       (host.absorbedTurns ??= []).push(next);
     } else {
       // Nothing is collecting (e.g. the worker restarted mid-turn and lost the
@@ -1411,6 +1454,14 @@ export class BridgeTurnQueue {
         this.queue.splice(idx, 1);
         if (this.collecting === absorbed) this.collecting = null;
         absorbed.terminalObserved = head.terminalObserved;
+        if (absorbed.absorbedReplySent) {
+          // Already answered while the host ran: whatever the host meets
+          // afterwards (an API error, a usage limit) is the host's, not this
+          // turn's, so it settles as completed.
+          absorbed.terminalOutcome ??= { status: 'completed' };
+          out.push(absorbed);
+          continue;
+        }
         if (head.terminalOutcome && absorbed.terminalOutcome === undefined) {
           absorbed.terminalOutcome = head.terminalOutcome;
           if (head.terminalErrorDetail) absorbed.terminalErrorDetail = head.terminalErrorDetail;
