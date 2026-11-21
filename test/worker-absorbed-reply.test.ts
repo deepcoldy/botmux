@@ -231,6 +231,22 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
     expect(h.replies()).toEqual([['om_C', 'CI 全绿。', 'text']]);
   });
 
+  it('suppresses ambiguous answers after consecutive folds without assistant activity, live and at turn end', () => {
+    const live = harness({ folds: [PROMPT_B, PROMPT_C] });
+    live.live([user('uA', PROMPT_A), tool('t0'), result('r0'),
+      fold('qB', PROMPT_B), fold('qC', PROMPT_C), text('aC', '用的是 gpt-x。'), tool('t1'), result('r1')]);
+    expect(live.replies()).toEqual([]);
+    live.live([text('a-final', 'done', 'end_turn'), duration('dur')]);
+    live.emit();
+    expect(live.replies()).toEqual([]);
+
+    const atEnd = harness({ folds: [PROMPT_B, PROMPT_C] });
+    atEnd.live([user('uA', PROMPT_A), tool('t0'), result('r0'),
+      fold('qB', PROMPT_B), fold('qC', PROMPT_C), text('a-final', '用的是 gpt-x。', 'end_turn'), duration('dur')]);
+    atEnd.emit();
+    expect(atEnd.replies()).toEqual([]);
+  });
+
   it('does not fail a folded turn it answered when the host turn then fails', () => {
     const h = harness();
     h.live([user('uA', PROMPT_A), tool('t0'), result('r0'), fold('qB', PROMPT_B), text('aB', 'answer'), tool('t1'), result('r1')]);

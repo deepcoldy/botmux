@@ -227,6 +227,12 @@ export interface BridgePendingTurn {
    *  input into the host turn: where its reply starts in the transcript (see
    *  absorbedInputReplyText). Set together with `absorbedIntoTurnId`. */
   absorbedAtUuid?: string;
+  /** Host assistant-activity sequence when this input was folded. Two folds
+   *  with the same sequence have no output boundary between them. */
+  absorbedActivitySeqAtFold?: number;
+  /** Multiple inputs share one uninterrupted output segment, so the next
+   *  output cannot be attributed to this later input without guessing. */
+  absorbedReplyAmbiguous?: boolean;
   /** The worker already sent this folded turn's reply live, while its host
    *  turn was still running: the end of the host turn must not post it again,
    *  and a failure the host meets afterwards is not this turn's. */
@@ -1234,6 +1240,10 @@ export class BridgeTurnQueue {
     if (host && !host.terminalObserved) {
       next.absorbedIntoTurnId = host.turnId;
       if (typeof ev.uuid === 'string' && ev.uuid) next.absorbedAtUuid = ev.uuid;
+      const activitySeq = host.attributedActivitySeq ?? 0;
+      const previous = host.absorbedTurns?.at(-1);
+      if (previous?.absorbedActivitySeqAtFold === activitySeq) next.absorbedReplyAmbiguous = true;
+      next.absorbedActivitySeqAtFold = activitySeq;
       (host.absorbedTurns ??= []).push(next);
     } else {
       // Nothing is collecting (e.g. the worker restarted mid-turn and lost the

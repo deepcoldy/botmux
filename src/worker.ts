@@ -10378,6 +10378,7 @@ function noteFoldReadOffsets(events: readonly TranscriptEvent[], path: string, b
 
 /** The reply to a folded turn as the transcript has it now. */
 function readFoldReply(turn: BridgePendingTurn): AbsorbedInputReply | undefined {
+  if (turn.absorbedReplyAmbiguous) return undefined;
   const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
   const foldUuid = turn.absorbedAtUuid;
   if (!path || !foldUuid) return undefined;
@@ -13360,7 +13361,9 @@ function emitReadyTurns(opts: {
     // model's first output after the fold, which may exist only as a thinking
     // summary. It settles with its host either way.
     if (adoptMode && followUpReplyEnabled() && turn.absorbedIntoTurnId && turn.absorbedAtUuid) {
-      const reply = absorbedInputReplyText(drained.events, turn.absorbedAtUuid);
+      const reply = turn.absorbedReplyAmbiguous
+        ? undefined
+        : absorbedInputReplyText(drained.events, turn.absorbedAtUuid);
       if (reply) {
         sendAbsorbedReply(turn, reply, 'at turn end');
         observedOutputTurns.add(turn);
