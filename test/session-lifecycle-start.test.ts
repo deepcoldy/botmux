@@ -12444,6 +12444,19 @@ describe('folded-turn reply relay', () => {
     expect(ds.turnTerminalCarriers?.get('om_steered')).toBeUndefined();
   });
 
+  it('does not record a late final after the session loses ownership', async () => {
+    let complete!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => { complete = resolve; }));
+    const { ds, worker } = forkWithReply(adopted, sessionReply);
+    worker.emit('message', { ...reply('om_folded_late', 'answer'), turnReply: true });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    ds.session.status = 'closed';
+    complete('om_late_reply');
+    await settle();
+    expect(ds.turnTerminalCarriers?.get('om_folded_late')).toBeUndefined();
+    expect(ds.finalOutputDeliveriesInFlight?.size ?? 0).toBe(0);
+  });
+
   it('posts an answer from a thinking summary only while thinking is shown', async () => {
     const { sessionReply, worker } = forkWithReply(adopted);
     worker.emit('message', reply('om_text', 'from text', 'text'));

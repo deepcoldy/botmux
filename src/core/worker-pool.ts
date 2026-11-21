@@ -27710,6 +27710,10 @@ function setupWorkerHandlers(
             logger.error(`[${t}] Gave up delivering follow-up reply for turn ${msg.turnId.substring(0, 8)}`);
             return;
           }
+          // The POST can outlive this worker/session. Its external effect is
+          // already real, but a late response must not mutate the replacement's
+          // terminal state.
+          if (!ownsLifecycleMutation()) return;
           // The turn's final (see turnReply): it is what this turn delivered.
           if (msg.turnReply && typeof result.value === 'string' && result.value) {
             recordTurnTerminalCarrier(ds, msg.turnId, { messageId: result.value, kind: 'non_patchable', responseKind: 'final' });
