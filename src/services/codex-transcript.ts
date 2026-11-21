@@ -281,6 +281,9 @@ export interface CodexBridgeEvent {
    *  separately from {@link uuid} so content-addressed stable ids do not erase
    *  the physical ordering evidence needed for deferred tool records. */
   rolloutOffset?: number;
+  /** Rollout file that owns {@link rolloutOffset}. Byte offsets from different
+   *  generations have different origins and must never be ordered directly. */
+  rolloutPath?: string;
   /** Physical tool-progress position for drivers without native timestamps.
    * Compared only with the same file's submit cursor; never final evidence. */
   progressCursor?: { jsonlPath: string; offset: number };

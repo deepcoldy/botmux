@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { codexGenerationSessionIdFromRolloutPath, codexSessionIdFromRolloutPath, drainCodexRollout, findCodexRolloutBySessionId, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from '../src/services/codex-rollout-replay.js';
-import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexSteerReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 
 const SID = 'aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa';
 const GENERATION = 'bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb';
@@ -194,6 +194,40 @@ describe('Codex bridge replay across file generations', () => {
     q.ingest(events);
     expect(q.drainEmittable()).toEqual([]);
     expect(q.peek()).toEqual([]);
+  });
+
+  it('does not compare bare byte offsets across rollout generations for a live steer reply', () => {
+    const assistant = line({ timestamp: T2, type: 'response_item', payload: {
+      type: 'message', role: 'assistant', phase: 'commentary', content: [{ type: 'output_text', text: 'answer' }],
+    } });
+    const history = start('native-steer', T0) + user('main task', T0) + user('question', T1) + assistant;
+    const old = rollout('29', '', SID, metaWithByteLength(SID, 16_384) + history);
+    const next = rollout('30', `_${GENERATION}`, SID, meta() + history + line({
+      timestamp: '2026-09-30T01:00:03Z', type: 'response_item', payload: {
+        type: 'custom_tool_call', name: 'exec', call_id: 'new-tool',
+        input: 'await tools.exec_command({ cmd: "npm test" })',
+      },
+    }));
+    const oldEvents = codexEventsWithStableIds(old, drainCodexRollout(old, 0).events);
+    const nextEvents = codexEventsWithStableIds(next, drainCodexRollout(next, 0).events);
+    const oldAnswerOffset = oldEvents.find(event => event.assistantMessage === 'answer')?.rolloutOffset;
+    const newToolOffset = nextEvents.find(event => event.toolCallBoundary)?.rolloutOffset;
+    expect(Number(oldAnswerOffset)).toBeGreaterThan(Number(newToolOffset));
+
+    const q = new CodexBridgeQueue();
+    q.mark('om_host', 'main task', Date.parse(T0));
+    q.mark('om_followup', 'question', Date.parse(T0));
+    const collectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
+    const replies: string[] = [];
+    q.setSteerReplyObserver((ev, turn) => {
+      let collector = collectors.get(turn);
+      if (!collector) collectors.set(turn, collector = new CodexSteerReplyCollector());
+      const reply = collector.feed(ev);
+      if (reply) replies.push(reply.text);
+    });
+    q.ingest(oldEvents);
+    q.ingest(nextEvents);
+    expect(replies).toEqual(['answer']);
   });
 
   it('suppresses baseline history but does not absorb a terminal beyond the consumed cursor', () => {

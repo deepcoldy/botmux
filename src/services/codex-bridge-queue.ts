@@ -198,6 +198,13 @@ function rolloutLineOffset(uuid: string): number | undefined {
   return Number.isSafeInteger(offset) ? offset : undefined;
 }
 
+/** Rollout file of a raw `<path>:<offset>` event id. Stable content ids carry
+ * the same information explicitly in `rolloutPath`. */
+function rolloutLinePath(uuid: string): string | undefined {
+  const separator = uuid.lastIndexOf(':');
+  return separator > 0 ? uuid.slice(0, separator) : undefined;
+}
+
 /**
  * The answer to an input Codex pulled into the running execution (a
  * same-turn steer). Fed the 'cot' records attributed to that input's turn in
@@ -209,7 +216,7 @@ function rolloutLineOffset(uuid: string): number | undefined {
  * end) is not the model moving on.
  */
 export class CodexSteerReplyCollector {
-  private readonly run: Array<{ text: string; uuid: string; offset?: number }> = [];
+  private readonly run: Array<{ text: string; uuid: string; offset?: number; path?: string }> = [];
   private done = false;
 
   /** Feed the next record; returns the reply exactly once, when complete. */
@@ -217,14 +224,17 @@ export class CodexSteerReplyCollector {
     if (this.done) return undefined;
     const message = ev.assistantMessage?.trim();
     if (message) {
-      this.run.push({ text: message, uuid: ev.uuid, offset: ev.rolloutOffset ?? rolloutLineOffset(ev.uuid) });
+      this.run.push({ text: message, uuid: ev.uuid,
+        offset: ev.rolloutOffset ?? rolloutLineOffset(ev.uuid),
+        path: ev.rolloutPath ?? rolloutLinePath(ev.uuid) });
       return undefined;
     }
     const toolCall = ev.toolCallBoundary === true || ev.cotEntries?.some(entry => entry.kind === 'tool_call');
     if (this.run.length === 0 || !toolCall) return undefined;
     const at = ev.rolloutOffset ?? rolloutLineOffset(ev.uuid);
-    const answeredAt = this.run[this.run.length - 1].offset;
-    if (at !== undefined && answeredAt !== undefined && at < answeredAt) return undefined;
+    const path = ev.rolloutPath ?? rolloutLinePath(ev.uuid);
+    const answered = this.run[this.run.length - 1];
+    if (path === answered.path && at !== undefined && answered.offset !== undefined && at < answered.offset) return undefined;
     this.done = true;
     return { text: this.run.map(part => part.text).join('\n\n'), lastUuid: this.run[this.run.length - 1].uuid };
   }

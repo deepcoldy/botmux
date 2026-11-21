@@ -17,7 +17,9 @@ export function codexEventsWithStableIds(path: string, events: CodexBridgeEvent[
     const offset = event.uuid.startsWith(prefix) ? Number(event.uuid.slice(prefix.length)) : undefined;
     return {
       ...event,
-      ...(offset !== undefined && Number.isSafeInteger(offset) && offset >= 0 ? { rolloutOffset: offset } : {}),
+      ...(offset !== undefined && Number.isSafeInteger(offset) && offset >= 0
+        ? { rolloutOffset: offset, rolloutPath: path }
+        : {}),
       uuid: `codex:${sid}:${event.rawId}`,
     };
   });
