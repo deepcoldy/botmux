@@ -60,9 +60,8 @@ export async function resolveScannerAllowedUser(
   try {
     const { Client } = await import('@larksuiteoapi/node-sdk');
     const client = new Client({ appId, appSecret, domain: sdkDomain(brand), disableTokenCache: false });
-    const res = await (client as any).contact.v3.user.get({
-      path: { user_id: openId },
-      params: { user_id_type: 'open_id' },
+    const res = await larkGet(client, `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`, {
+      user_id_type: 'open_id',
     });
     if (res.code === 0 && res.data?.user) return res.data.user.union_id ?? openId;
   } catch { /* do not trust an open_id that this app could not validate */ }

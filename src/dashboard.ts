@@ -6364,14 +6364,12 @@ const server = createServer(async (req, res) => {
         return jsonRes(res, 400, { ok: false, error: 'invalid_app_name', message: '应用名称不能超过 64 个字符' });
       }
       const registrationModeRaw = typeof parsed.registrationMode === 'string' ? parsed.registrationMode.trim() : '';
-      if (registrationModeRaw && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat' && registrationModeRaw !== 'local') {
-        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 web、compat 或 local' });
+      if (registrationModeRaw && registrationModeRaw !== 'sdk' && registrationModeRaw !== 'web' && registrationModeRaw !== 'compat' && registrationModeRaw !== 'local') {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_registration_mode', message: 'registrationMode 必须是 sdk、web、compat 或 local' });
       }
-      const registrationMode = registrationModeRaw === 'compat'
-        ? 'compat' as const
-        : registrationModeRaw === 'local'
-          ? 'local' as const
-          : 'web' as const;
+      // 缺省走网页会话流程（内置表单同样走网页流程）；sdk 只在调用方显式传入时使用。
+      const registrationMode = registrationModeRaw === 'sdk' || registrationModeRaw === 'compat' || registrationModeRaw === 'local'
+        ? registrationModeRaw : 'web';
       if (registrationMode === 'local' && typeof parsed.cloneSourceAppId === 'string' && parsed.cloneSourceAppId.trim()) {
         return jsonRes(res, 400, { ok: false, error: 'local_clone_unsupported', message: '本地模式不克隆飞书机器人。' });
       }

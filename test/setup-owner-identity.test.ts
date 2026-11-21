@@ -100,7 +100,10 @@ describe('scripted setup owner identity', () => {
     expect(resolveStable).not.toHaveBeenCalled();
   });
 
-  it('resolves a source-app open_id to union_id for managed normalization', async () => {
+  it('resolves the scanner to a union_id behind a gateway that rejects GET-with-body', async () => {
+    generatedUserGetMock.mockRejectedValue(Object.assign(new Error('Request failed with status code 411'), {
+      response: { status: 411, data: 'Length Required' },
+    }));
     userGetMock.mockResolvedValueOnce({
       code: 0,
       data: { user: { open_id: 'ou_source', union_id: 'on_owner' } },
@@ -108,6 +111,7 @@ describe('scripted setup owner identity', () => {
 
     await expect(resolveScannerAllowedUser('cli_source', 'secret', 'ou_source', 'feishu'))
       .resolves.toBe('on_owner');
+    expect(generatedUserGetMock).not.toHaveBeenCalled();
   });
 
   it('uses the Lark SDK domain for source-owner normalization', async () => {

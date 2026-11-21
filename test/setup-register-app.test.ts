@@ -77,10 +77,19 @@ describe('tryRegisterApp', () => {
   });
 
   it('maps SDK code=expired_token to expired (QR expired)', async () => {
-    mockedRegisterApp.mockRejectedValue(Object.assign(new Error('Polling timed out'), { code: 'expired_token' }));
+    mockedRegisterApp.mockRejectedValue({ code: 'expired_token', description: 'Device code expired' });
     const r = await tryRegisterApp({ onQRCodeReady: () => {}, onStatusChange: () => {} });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toBe('expired');
+  });
+
+  it('treats the local polling deadline after issuing a link as an unknown result', async () => {
+    mockedRegisterApp.mockImplementation(async options => {
+      options.onQRCodeReady({ url: 'https://open.feishu.cn/page/launcher', expireIn: 600 });
+      throw { code: 'expired_token', description: 'Polling timed out' };
+    });
+    await expect(tryRegisterApp({ onQRCodeReady: () => {} }))
+      .resolves.toMatchObject({ ok: false, error: 'unconfirmed' });
   });
 
   it('maps SDK code=access_denied to denied (user rejected in browser)', async () => {
@@ -97,17 +106,24 @@ describe('tryRegisterApp', () => {
     if (!r.ok) expect(r.error).toBe('network');
   });
 
-  it('falls through to unknown for unmapped errors and masks long tokens in message', async () => {
-    // 模拟 SDK 抛了一个携带长 token 的错误信息. 实测 SDK 不会泄露 secret,
-    // 但 register-app 的 safeMsg 保险层会把 30+ 长串替换成 ***.
+  it('uses a fixed message for unknown SDK errors', async () => {
     mockedRegisterApp.mockRejectedValue(new Error('weird abcdefghijklmnopqrstuvwxyz1234567890_xyz error'));
     const r = await tryRegisterApp({ onQRCodeReady: () => {}, onStatusChange: () => {} });
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.error).toBe('unknown');
       expect(r.message).not.toContain('abcdefghijklmnopqrstuvwxyz1234567890');
-      expect(r.message).toContain('***');
+      expect(r.message).not.toContain('weird');
     }
+  });
+
+  it('distinguishes a lost response after the link was issued from a failed begin', async () => {
+    mockedRegisterApp.mockImplementationOnce(async options => {
+      options.onQRCodeReady({ url: 'https://open.feishu.cn/page/launcher', expireIn: 600 });
+      throw new Error('ECONNRESET');
+    });
+    const result = await tryRegisterApp({ onQRCodeReady: () => {} });
+    expect(result).toMatchObject({ ok: false, error: 'unconfirmed' });
   });
 
   it('treats missing client_id/secret in successful response as unknown error', async () => {
