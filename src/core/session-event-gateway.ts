@@ -7,7 +7,7 @@ export type SessionEventAdmission =
   | { kind: 'worker'; context: SessionEventContext }
   | { kind: 'defer'; bindingId: string }
   | { kind: 'reject'; reason: string };
-const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_offer', 'turn_interrupt_result', 'codex_app_dispatch_persisted', 'restart_result', 'claude_exit']);
+const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_offer', 'absorbed_reply', 'turn_interrupt_result', 'codex_app_dispatch_persisted', 'restart_result', 'claude_exit']);
 // persistent_backend_target is stamped before the CLI spawns, so it can only be worker-scoped.
 // session_identity_decision is the worker's report of the spawn it is about to
 // make (sandbox / loopback shape). It is sent before the CLI exists, while an

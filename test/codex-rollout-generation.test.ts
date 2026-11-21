@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { codexGenerationSessionIdFromRolloutPath, codexSessionIdFromRolloutPath, drainCodexRollout, findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
+import { codexGenerationSessionIdFromRolloutPath, codexSessionIdFromRolloutPath, drainCodexRollout, findCodexRolloutBySessionId, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from '../src/services/codex-rollout-replay.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
@@ -265,10 +265,13 @@ describe('Codex bridge replay across file generations', () => {
     const splitAt = statSync(file).size;
     appendFileSync(file, final('native-turn-x', 'done', T2));
 
-    const forwardCots = drainCodexRollout(file, 0).events.filter(e => e.kind === 'cot');
+    // Timeline records only: the forward read also marks the call line itself
+    // (a bare toolCallBoundary), a different record a late attach never sees.
+    const timelineCots = (events: CodexBridgeEvent[]) => events.filter(e => e.kind === 'cot' && e.toolCallBoundary !== true);
+    const forwardCots = timelineCots(drainCodexRollout(file, 0).events);
     expect(forwardCots.length).toBeGreaterThan(0);
     const lateDrain = drainCodexRollout(file, splitAt);
-    const backwardCots = lateDrain.events.filter(e => e.kind === 'cot');
+    const backwardCots = timelineCots(lateDrain.events);
     expect(backwardCots.length).toBeGreaterThan(0);
     expect(backwardCots.map(e => e.rawId).sort()).toEqual(forwardCots.map(e => e.rawId).sort());
     expect(forwardCots.every(e => typeof e.rawId === 'string' && e.rawId.length === 64)).toBe(true);

@@ -165,8 +165,8 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
-import { BackgroundTaskPinSnapshot, BridgeTurnQueue, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
   claudeInterruptedWork,
@@ -421,7 +421,7 @@ import {
   SESSION_ID_FILENAME_RE,
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
-import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexSteerReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
 import {
   BridgeBlindTurnWatch,
@@ -10333,6 +10333,82 @@ function observeThinkingAttribution(ev: TranscriptEvent, turn: BridgePendingTurn
   observeCotEntries(extractCotEntries(ev), turn);
 }
 
+/** Per folded turn: the live trigger's state (takeAbsorbedReplyCandidates). */
+const absorbedReplyCollectors = new WeakMap<BridgePendingTurn, AbsorbedReplyCollector>();
+
+/** Opt-in per bot (followUpReply), fixed for this worker process. Off, a
+ *  folded input is handled exactly as before: no reply of its own. */
+function followUpReplyEnabled(): boolean {
+  return lastInitConfig?.followUpReply === true;
+}
+
+/** Post a folded turn's reply and mark it answered. */
+function sendAbsorbedReply(turn: BridgePendingTurn, reply: AbsorbedInputReply, when: 'live' | 'at turn end'): void {
+  turn.absorbedReplySent = true;
+  send({
+    type: 'absorbed_reply',
+    turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+    answer: reply.text,
+    replyUuid: reply.lastUuid,
+    source: reply.source,
+    // The folded turn has no other reply. Under transcript delivery, which
+    // posts no completion receipt, it stands as the turn's final.
+    ...(replyDeliveryMode() === 'transcript' ? { turnReply: true as const } : {}),
+  });
+  log(`Folded turn ${turn.turnId.substring(0, 8)} answered ${when} (${reply.source}, ${reply.text.length} chars)`);
+}
+
+/** Where the polling read found each recent fold record: the offset its batch
+ *  started at, a line boundary at or before the record. Lets the live path
+ *  read the reply from there instead of parsing the whole transcript (which
+ *  runs to hundreds of MB in long sessions). Bounded; a miss reads it all. */
+const foldReadOffsets = new Map<string, { path: string; offset: number }>();
+const FOLD_READ_OFFSETS_MAX = 32;
+
+/** Called by the polling read with the batch it is about to ingest. */
+function noteFoldReadOffsets(events: readonly TranscriptEvent[], path: string, batchOffset: number): void {
+  if (!followUpReplyEnabled()) return;
+  for (const ev of events) {
+    if (!ev.uuid || !isMidTurnAbsorbedQueuedCommand(ev)) continue;
+    foldReadOffsets.set(ev.uuid, { path, offset: batchOffset });
+    if (foldReadOffsets.size > FOLD_READ_OFFSETS_MAX) foldReadOffsets.delete(foldReadOffsets.keys().next().value!);
+  }
+}
+
+/** The reply to a folded turn as the transcript has it now. */
+function readFoldReply(turn: BridgePendingTurn): AbsorbedInputReply | undefined {
+  const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
+  const foldUuid = turn.absorbedAtUuid;
+  if (!path || !foldUuid) return undefined;
+  const from = foldReadOffsets.get(foldUuid);
+  if (from && from.path === path) {
+    const tail = drainTranscript(path, from.offset).events;
+    if (tail.some(ev => ev.uuid === foldUuid)) return absorbedInputReplyText(tail, foldUuid);
+  }
+  return absorbedInputReplyText(drainTranscript(path, 0).events, foldUuid);
+}
+
+/** Adopt: answer a Lark message Claude Code folded into the running turn as
+ *  soon as the model moves on from it, instead of when the host turn ends.
+ *  The host may be a local (terminal-typed) turn, so this runs before the CoT
+ *  observer's local-turn exit. The reply is read from the transcript, not
+ *  from what this observer saw: see takeAbsorbedReplyCandidates. */
+function observeAbsorbedReplies(ev: TranscriptEvent, host: BridgePendingTurn): void {
+  if (lastInitConfig?.adoptMode !== true || !followUpReplyEnabled() || !host.absorbedTurns?.length) return;
+  for (const turn of takeAbsorbedReplyCandidates(host, ev, absorbedReplyCollectors)) {
+    const reply = readFoldReply(turn);
+    if (reply) sendAbsorbedReply(turn, reply, 'live');
+    else log(`Folded turn ${turn.turnId.substring(0, 8)} has no reply of its own yet; left to the host turn's end`);
+  }
+}
+
+/** Observer for records attributed to the running turn on the live read. */
+function observeBridgeAttribution(ev: TranscriptEvent, turn: BridgePendingTurn): void {
+  try { observeAbsorbedReplies(ev, turn); } catch (err) { log(`Folded-turn reply observer failed: ${String(err)}`); }
+  observeThinkingAttribution(ev, turn);
+}
+
 /** Trailing-edge throttle: at most one thinking_update per interval, always
  *  eventually flushing the latest accumulated text. */
 function scheduleThinkingEmit(): void {
@@ -10425,6 +10501,32 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
 codexBridgeQueue.setTurnStartObserver((turn) => {
   if (!turn.isLocal) inflightInputs.onTurnStarted(turn.turnId);
 });
+// Codex same-turn steer: answer the steered Lark message as soon as the model
+// answers it and goes back to work, quoting it. The final answer still comes
+// with the turn's own reply.
+const codexSteerReplyCollectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
+function observeCodexSteerReply(ev: CodexBridgeEvent, turn: CodexPendingTurn): void {
+  if (!followUpReplyEnabled() || !structuredBridgeIs('codex') || turn.isLocal) return;
+  // Under `botmux send` the model may already have sent this answer itself.
+  if (lastInitConfig?.adoptMode !== true && replyDeliveryMode() !== 'transcript') return;
+  let collector = codexSteerReplyCollectors.get(turn);
+  if (!collector) {
+    collector = new CodexSteerReplyCollector();
+    codexSteerReplyCollectors.set(turn, collector);
+  }
+  const reply = collector.feed(ev);
+  if (!reply) return;
+  send({
+    type: 'absorbed_reply',
+    turnId: turn.turnId,
+    ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+    answer: reply.text,
+    replyUuid: reply.lastUuid,
+    source: 'text',
+  });
+  log(`Steered turn ${turn.turnId.substring(0, 8)} answered live (${reply.text.length} chars)`);
+}
+codexBridgeQueue.setSteerReplyObserver(observeCodexSteerReply);
 codexBridgeQueue.setCotSupersededObserver((turn) => {
   if (!sessionId || turn.isLocal) return;
   const ownsThinking = thinkingTurn?.turnId === turn.turnId
@@ -12674,8 +12776,10 @@ function bridgeIngest(): void {
     seedModelFallbackFromTranscript();
     return;
   }
+  const batchOffset = bridgeOffset;
   const result = drainTranscript(bridgeJsonlPath, bridgeOffset);
   bridgeOffset = result.newOffset;
+  noteFoldReadOffsets(result.events, bridgeJsonlPath, batchOffset);
   if (result.events.length > 0) {
     lastStructuredBridgeActivityAtMs = Date.now();
     // First drained event = the CLI session now holds user-visible history.
@@ -12690,7 +12794,7 @@ function bridgeIngest(): void {
     // exists", which this makes true in every mode.
     cliTranscriptEverExisted = true;
   }
-  bridgeQueue.ingest(result.events, bridgeJsonlPath, observeThinkingAttribution);
+  bridgeQueue.ingest(result.events, bridgeJsonlPath, observeBridgeAttribution);
   // Arm (or keep) the no-idle-edge watchdog for a fresh head now waiting on
   // its closing records. No-op while an idle settle owns the wait.
   updateProvisionalExitWatch();
@@ -13236,12 +13340,32 @@ function emitReadyTurns(opts: {
       explicitReplyMarkers,
     );
 
+    // A folded turn answered live while its host ran (observeAbsorbedReplies):
+    // its reply is out, so it settles without posting it a second time.
+    if (adoptMode && turn.absorbedReplySent) {
+      observedOutputTurns.add(turn);
+      continue;
+    }
+
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
     if (!path) continue;
     let drained = cache.get(path);
     if (!drained) {
       drained = drainTranscript(path, 0);
       cache.set(path, drained);
+    }
+    // Adopt: a message Claude Code folded into the running turn has no reply
+    // of its own — everything after it is attributed to the host turn — so
+    // answer it the way the live path does (observeAbsorbedReplies): with the
+    // model's first output after the fold, which may exist only as a thinking
+    // summary. It settles with its host either way.
+    if (adoptMode && followUpReplyEnabled() && turn.absorbedIntoTurnId && turn.absorbedAtUuid) {
+      const reply = absorbedInputReplyText(drained.events, turn.absorbedAtUuid);
+      if (reply) {
+        sendAbsorbedReply(turn, reply, 'at turn end');
+        observedOutputTurns.add(turn);
+      }
+      continue;
     }
     const set = new Set(turn.assistantUuids);
     const matched = drained.events.filter(e => e.uuid && set.has(e.uuid));
