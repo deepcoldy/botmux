@@ -1332,10 +1332,20 @@ export interface StructuredBridgeDrainContext {
    *  never observe and would then over-count forever. */
   openTurns?: number;
   /** Whether a native user record with this text would start a turn the
-   *  attribution queue is waiting for (non-adopt; the queue's own fingerprint
-   *  / exact-hash rule). Lets a two-file driver tell botmux's request row,
-   *  whose prompt record has not been read yet, from any other user row. */
+   *  attribution queue is waiting for (non-adopt; complete normalised input
+   *  containment, not merely the shared envelope-prefix fingerprint). Lets a
+   *  two-file driver tell botmux's request row, whose prompt record has not
+   *  been read yet, from an old retry or any other user row. */
   ownsNativeInput?: (text: string) => boolean;
+  /** Legacy ownership fallback for journal-restored marks whose full input was
+   *  deliberately not persisted. The driver additionally applies the original
+   *  same-text retry digest guard before using this weaker proof. */
+  ownsNativeInputByFingerprint?: (text: string) => boolean;
+  /** Exact queue owner of a native request row. The driver persists only this
+   *  identity with its parked offset, so later receipt/prune operations do not
+   *  assume that the first unstarted queue head owns the row. */
+  nativeInputOwner?: (text: string, requireCompleteInput: boolean) =>
+    { turnId: string; dispatchAttempt?: number } | undefined;
 }
 
 /**
@@ -1353,6 +1363,9 @@ export interface StructuredBridgeSpec {
    *  (Doubao: a request row ahead of its assignment section). The worker keeps
    *  that head's pre-start lease alive meanwhile. */
   awaitsPendingInput?(state: unknown): boolean;
+  /** Queue identity of the native row on which awaitsPendingInput is parked.
+   *  Undefined for legacy driver state that predates explicit ownership. */
+  pendingInputOwner?(state: unknown): { turnId: string; dispatchAttempt?: number } | undefined;
   /**
    * When the worker commits `result.state` back into its single state slot:
    *  - `'drain'`: on every drain, including the one-off attach-time drains

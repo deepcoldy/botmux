@@ -80,6 +80,11 @@ export interface CodexPendingTurn {
   restoredFromJournal?: boolean;
   started: boolean;
   contentFingerprint?: string;
+  /** Full normalised mark, retained in memory only for Doubao's native request
+   * row ownership. A shared 30-char session prefix cannot distinguish an old
+   * retry from the next input; restart journals deliberately keep only the
+   * existing fingerprint/hash fields, so restored turns fail closed here. */
+  nativeInputText?: string;
   /** Digest of the full written input for driver-proved input aliases.
    * The historical prefix fingerprint alone cannot prove a rewritten skill
    * input whose arguments differ after its first 30 characters. Persist the
@@ -433,6 +438,7 @@ export class CodexBridgeQueue {
       ...(linkRefMode ? { linkRefMode } : {}),
       started: false,
       contentFingerprint: makeFingerprint(message),
+      nativeInputText: normaliseForFingerprint(message),
       ...(requireExactInput || /^[ \t]*(?:[/$]|\[\$)/.test(message) ? { inputTextHash: exactInputHash(message) } : {}),
       markTimeMs,
       recoveryJsonlPathAtMark: recoveryCursorAtMark?.jsonlPath,
@@ -663,14 +669,18 @@ export class CodexBridgeQueue {
    *  would only park the successor's native start behind a dead head.
    *  Quarantined, verifying, RPC-active and CLI-queued heads are left alone.
    *  The caller prunes (and notifies) through its usual expiry path. */
-  expireUnstartedBefore(turnId: string, dispatchAttempt?: number): CodexPendingTurn[] {
+  expireUnstartedBefore(
+    turnId: string,
+    dispatchAttempt?: number,
+    preserve?: (turn: CodexPendingTurn) => boolean,
+  ): CodexPendingTurn[] {
     const index = this.queue.findIndex(candidate => candidate.turnId === turnId
       && candidate.dispatchAttempt === dispatchAttempt);
     if (index <= 0) return [];
     const expired: CodexPendingTurn[] = [];
     for (const turn of this.queue.slice(0, index)) {
       if (turn.started || turn.finalText !== undefined || turn.rpcActive
-        || turn.inputDeliveryQuarantined || turn.cliQueuedAtMs !== undefined
+        || preserve?.(turn) || turn.inputDeliveryQuarantined || turn.cliQueuedAtMs !== undefined
         || turn.submitVerificationStartedAtMs !== undefined) continue;
       if (turn.submitConfirmedAtMs !== undefined) turn.submitConfirmedAtMs = Number.NEGATIVE_INFINITY;
       else if (turn.unconfirmedAttributionStartedAtMs !== undefined) {
@@ -771,11 +781,22 @@ export class CodexBridgeQueue {
    *  side channel cannot attribute local-turn entries to an active Lark card.
    *  Open marks that have not reached their transcript `user` event yet still
    *  qualify: the mark is installed before the literal write. */
-  ownsTurnForNativeInput(text: string, timestampMs: number): boolean {
-    return this.queue.some(turn => {
+  nativeInputOwner(
+    text: string,
+    timestampMs: number,
+    requireCompleteInput = false,
+  ): { turnId: string; dispatchAttempt?: number } | undefined {
+    const normalisedText = normaliseForFingerprint(text);
+    const candidates = this.queue.filter(turn => {
       if (turn.isLocal || turn.finalText !== undefined) return false;
       if (turn.markTimeMs !== undefined
         && timestampMs < turn.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS) return false;
+      // Doubao's request-row parking needs the complete mark, not the shared
+      // envelope prefix used by the ordinary CoT attribution side channel.
+      // The native row may add provider context around the original input.
+      if (requireCompleteInput) {
+        return !!turn.nativeInputText && normalisedText.includes(turn.nativeInputText);
+      }
       // Mirror the adopt-mode antigravity user event shape: an exact-input mark
       // pairs with an empty alias list so the match is hash-only, never the
       // looser fingerprint containment.
@@ -784,6 +805,18 @@ export class CodexBridgeQueue {
         : { uuid: '', timestampMs, kind: 'user', text };
       return this.matchesUserInput(turn, event);
     });
+    // If zero-injection texts contain one another, the most specific complete
+    // input owns the row. Fingerprint fallback deliberately retains FIFO order.
+    if (requireCompleteInput) {
+      candidates.sort((left, right) => (right.nativeInputText?.length ?? 0) - (left.nativeInputText?.length ?? 0));
+    }
+    const owner = candidates[0];
+    return owner ? { turnId: owner.turnId, ...(owner.dispatchAttempt !== undefined
+      ? { dispatchAttempt: owner.dispatchAttempt } : {}) } : undefined;
+  }
+
+  ownsTurnForNativeInput(text: string, timestampMs: number, requireCompleteInput = false): boolean {
+    return this.nativeInputOwner(text, timestampMs, requireCompleteInput) !== undefined;
   }
 
   /** True while the transcript proves a turn is running, or while a verified

@@ -485,8 +485,15 @@ export const doubaoBridgeSpec: StructuredBridgeSpec = {
     state: ctx.state,
     openTurns: ctx.openTurns,
     ownsNativeInput: ctx.ownsNativeInput,
+    ownsNativeInputByFingerprint: ctx.ownsNativeInputByFingerprint,
+    nativeInputOwner: ctx.nativeInputOwner,
   }),
   awaitsPendingInput: state => !!(state as DoubaoBridgeDrainState | undefined)?.parkedUserRow,
+  pendingInputOwner: state => {
+    const parked = (state as DoubaoBridgeDrainState | undefined)?.parkedUserRow;
+    return parked?.turnId ? { turnId: parked.turnId,
+      ...(parked.dispatchAttempt !== undefined ? { dispatchAttempt: parked.dispatchAttempt } : {}) } : undefined;
+  },
   locate: {
     bySessionId: sessionId => doubaoTrajectoryPathForSession(sessionId),
   },

@@ -4,6 +4,7 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createQueuedActivationReceiptObserver } from '../src/services/queued-activation-receipts.js';
 import { inputDeliveryObservedSessionIdAtSpawn } from '../src/services/input-delivery-evidence.js';
 import type { SubmitRecheckResult } from '../src/adapters/cli/types.js';
+import { doubaoScreenShowsNoPendingInput } from '../src/adapters/cli/doubao-screen.js';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => { cleanups.splice(0).forEach(cleanup => cleanup()); vi.useRealTimers(); });
@@ -57,6 +58,34 @@ async function warnAndDrop(h: ReturnType<typeof harness>) {
 }
 
 describe('quarantine receipt outlives bounded warning and bridge attribution', () => {
+  it('releases a no-recheck Doubao exception after two empty screens and redrives the successor', async () => {
+    const h = harness();
+    const empty = `────────────────────────────────────────\n❯  Ask Doubao to do anything\n────────────────────────────────────────`;
+    Object.assign(h.scope, {
+      lastInitConfig: { cliId: 'doubao' },
+      effectiveBackendType: 'tmux',
+      captureBackendScreen: () => empty,
+      backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+    });
+    h.scope.cliAdapter.screenShowsNoPendingInput = doubaoScreenShowsNoPendingInput;
+    h.scope.cliAdapter.writeInput = vi.fn()
+      .mockRejectedValueOnce(new Error('assignment vanished during capture'))
+      .mockResolvedValue({ submitted: true });
+
+    await h.flush();
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+    expect(h.scope.inputDeliveryQuarantine.cancelReceipt).toBeTypeOf('function');
+    h.scope.pendingMessages.push({ turnId: 'successor', dispatchAttempt: 2, content: 'next input' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(1);
+    expect(h.scope.inputDeliveryQuarantine).not.toBeNull();
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.scope.inputDeliveryQuarantine).toBeNull();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledTimes(2);
+    expect(h.scope.cliAdapter.writeInput.mock.calls[1][1]).toBe('next input');
+  });
+
   it('keeps the parked draft and exact bridge quarantine alongside its late receipt observer', async () => {
     const h = harness();
     h.queue.mark('parked', 'original draft', 0);

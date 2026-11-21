@@ -4479,15 +4479,26 @@ function holdStructuredStartLeasesWhileCliHoldsInput(): void {
   }
 }
 
+function driverPendingInputTurn(): CodexPendingTurn | undefined {
+  const spec = bridgeSpecFor(lastInitConfig?.cliId);
+  if (!spec?.awaitsPendingInput?.(structuredBridgeDriverState)) return undefined;
+  const owner = spec.pendingInputOwner?.(structuredBridgeDriverState);
+  if (owner) {
+    return codexBridgeQueue.peek().find(turn => turn.turnId === owner.turnId
+      && turn.dispatchAttempt === owner.dispatchAttempt && !turn.started && turn.finalText === undefined);
+  }
+  // State written before owner identity was introduced retains the old
+  // next-head behavior for this generation only.
+  return codexBridgeQueue.peek().find(turn => !turn.started && turn.finalText === undefined);
+}
+
 /** The transcript driver is waiting at a native record of the next pending
  *  input whose prompt record is not readable yet (bridgeSpec.awaitsPendingInput;
  *  the driver bounds that wait itself). The CLI may already be idle, so no
  *  screen evidence covers this head: keep its own lease alive meanwhile. */
 function holdStructuredStartLeaseWhileDriverAwaitsInput(): void {
   if (lastInitConfig?.adoptMode) return;
-  const spec = bridgeSpecFor(lastInitConfig?.cliId);
-  if (!spec?.awaitsPendingInput?.(structuredBridgeDriverState)) return;
-  const next = codexBridgeQueue.peek().find(turn => !turn.started && turn.finalText === undefined);
+  const next = driverPendingInputTurn();
   if (!next) return;
   codexBridgeQueue.refreshUnstartedHeadAttributionLease(Date.now(), CLI_HELD_INPUT_MAX_MS, turn => turn === next);
 }
@@ -4498,7 +4509,12 @@ function holdStructuredStartLeaseWhileDriverAwaitsInput(): void {
  *  instead of letting them sit ahead of this turn's native start. */
 function expireHeldInputBeforeReceivedTurn(turnId: string, dispatchAttempt?: number): void {
   if (!cliAdapter?.screenHoldsSubmittedInput) return;
-  const expired = codexBridgeQueue.expireUnstartedBefore(turnId, dispatchAttempt);
+  // A driver-parked row is positive native-start evidence, not an input the
+  // CLI lost. Keep that exact head while its assignment section is late; a
+  // later receipt only expires older heads with no such evidence.
+  const driverParked = driverPendingInputTurn();
+  const expired = codexBridgeQueue.expireUnstartedBefore(turnId, dispatchAttempt,
+    turn => turn === driverParked);
   if (expired.length === 0) return;
   for (const turn of expired) cliHeldInputReleased.add(turn);
   log(`Later input ${turnId.slice(0, 12)} was received; expiring ${expired.length} earlier unstarted head(s) the CLI no longer holds`);
@@ -13873,7 +13889,13 @@ function structuredBridgeIngestPath(
         ? codexBridgeQueue.peek().filter(turn => turn.started && turn.finalText === undefined).length
         : undefined,
       ownsNativeInput: structuredBridgeIs('doubao') && lastInitConfig?.adoptMode !== true
+        ? text => codexBridgeQueue.ownsTurnForNativeInput(text, Date.now(), true)
+        : undefined,
+      ownsNativeInputByFingerprint: structuredBridgeIs('doubao') && lastInitConfig?.adoptMode !== true
         ? text => codexBridgeQueue.ownsTurnForNativeInput(text, Date.now())
+        : undefined,
+      nativeInputOwner: structuredBridgeIs('doubao') && lastInitConfig?.adoptMode !== true
+        ? (text, requireCompleteInput) => codexBridgeQueue.nativeInputOwner(text, Date.now(), requireCompleteInput)
         : undefined,
       // The two flags are never set for the "other" driver: every caller sits
       // under its own structuredBridgeIs('oh-my-pi' | 'antigravity') guard.
@@ -21612,11 +21634,13 @@ function armInputDeliveryQuarantine(
   if (item.turnId && item.dispatchAttempt === undefined) {
     codexBridgeQueue.setInputDeliveryQuarantined(item.turnId, true);
   }
-  if (recheck) {
+  if (recheck || cliAdapter?.screenShowsNoPendingInput) {
     // Notification/attribution leases are bounded, but an ambiguous submit can
     // be accepted much later (e.g. a parked draft submitted in the terminal).
     // Keep its read-only receipt closure, not a live bridge mark or replayable
-    // queue entry.
+    // queue entry. A throwing write has no receipt closure: the same observer
+    // still supplies the bounded two-empty-screen release instead of wedging
+    // every successor until restart.
     // The ordinary recheck may accept a sibling's same-text history line;
     // recovery after attribution is gone requires positive pane ownership.
     const nativeSessionId = inputDeliveryObservedCliSessionId;
@@ -21632,10 +21656,10 @@ function armInputDeliveryQuarantine(
       recheck: async () => {
         // While attribution is live, its existing confirmation/terminal path
         // owns recovery. In particular, do not race its awaited recheck.
-        if (quarantine.turnId
+        if (recheck && quarantine.turnId
           && (codexBridgeQueue.hasPendingTurn(quarantine.turnId, quarantine.dispatchAttempt)
             || codexBridgeQueue.hasTerminalTurn(quarantine.turnId, quarantine.dispatchAttempt))) return false;
-        const result = await recheck();
+        const result = recheck ? await recheck() : false;
         const expectedSessionId = nativeSessionId ?? inputDeliveryObservedCliSessionId;
         if (typeof result === 'object' && result && result.ownershipProven === true
           && !!result.cliSessionId

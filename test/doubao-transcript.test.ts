@@ -114,7 +114,10 @@ describe('Doubao request rows as turn boundaries', () => {
     const drain = () => {
       const openTurns = q.peek().filter(turn => turn.started && turn.finalText === undefined).length;
       const r = drainDoubaoTranscript(trajectory, offset, {
-        state, openTurns, nowMs: now, ownsNativeInput: text => q.ownsTurnForNativeInput(text, now),
+        state, openTurns, nowMs: now,
+        ownsNativeInput: text => q.ownsTurnForNativeInput(text, now, true),
+        ownsNativeInputByFingerprint: text => q.ownsTurnForNativeInput(text, now),
+        nativeInputOwner: (text, complete) => q.nativeInputOwner(text, now, complete),
       });
       state = r.state; offset = r.newOffset;
       q.ingest(r.events);
@@ -131,9 +134,9 @@ describe('Doubao request rows as turn boundaries', () => {
   }
 
   /** Turn 1 of the session establishes that requests open with a user row. */
-  function firstTurn(r: ReturnType<typeof rig>) {
-    r.mark('om_1', 'first task: inspect the build');
-    r.request('first task: inspect the build');
+  function firstTurn(r: ReturnType<typeof rig>, text = 'first task: inspect the build') {
+    r.mark('om_1', text);
+    r.request(text);
     r.tool('c1');
     r.drain();
     r.row({ role: 'assistant', content: 'FIRST_ANSWER' });
@@ -295,6 +298,158 @@ describe('Doubao request rows as turn boundaries', () => {
     r.row({ role: 'assistant', content: 'ANSWER_3' });
     r.drain();
     expect(r.emitted.slice(1)).toEqual([['om_2', 'ANSWER_2'], ['om_3', 'ANSWER_3']]);
+  });
+
+  it('pairs zero-injection requests whose texts contain one another by their exact rows', () => {
+    const r = rig();
+    firstTurn(r);
+    r.mark('om_short', '继续');
+    r.mark('om_long', '继续执行测试');
+    r.request('继续');
+    r.row({ role: 'assistant', content: 'SHORT_ANSWER' });
+    r.request('继续执行测试');
+    r.row({ role: 'assistant', content: 'LONG_ANSWER' });
+    r.drain();
+    expect(r.emitted.slice(1)).toEqual([['om_short', 'SHORT_ANSWER'], ['om_long', 'LONG_ANSWER']]);
+  });
+
+  it('holds a section that arrives in an empty trajectory window for its later request row', () => {
+    const r = rig();
+    firstTurn(r);
+    r.mark('om_2', 'second task');
+    r.section('second task');
+    r.drain();
+    expect(r.q.peek()[0]).toMatchObject({ turnId: 'om_2', started: false });
+    expect(r.state().sectionRowWait).toBeDefined();
+
+    r.row({ role: 'assistant', content: 'OLDER_WORK_ANSWER' });
+    r.row({ role: 'user', content: 'second task' });
+    r.row({ role: 'assistant', content: 'SECOND_ANSWER' });
+    r.advance(400);
+    r.drain();
+    expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER'], ['om_2', 'SECOND_ANSWER']]);
+  });
+
+  it('accepts a legitimate same-text second request whose row arrives first', () => {
+    const r = rig();
+    firstTurn(r, 'repeat');
+    r.mark('om_2', 'repeat');
+    r.row({ role: 'user', content: 'repeat' });
+    r.row({ role: 'assistant', content: 'NEW_REPEAT_ANSWER' });
+    r.drain();
+    expect(r.state().parkedUserRow).toBeDefined();
+    expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER']]);
+
+    r.section('repeat');
+    r.drain();
+    expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER'], ['om_2', 'NEW_REPEAT_ANSWER']]);
+  });
+
+  it('does not pair a new section with the only old same-text retry row', () => {
+    const r = rig();
+    firstTurn(r, 'repeat');
+    r.mark('om_2', 'repeat');
+    r.row({ role: 'user', content: 'repeat' });
+    r.row({ role: 'assistant', content: 'OLD_RETRY_ANSWER' });
+    r.section('repeat');
+    r.drain();
+    expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER']]);
+    expect(r.state().sectionRowWait).toBeDefined();
+
+    r.row({ role: 'user', content: 'repeat' });
+    r.row({ role: 'assistant', content: 'NEW_REPEAT_ANSWER' });
+    r.advance(400);
+    r.drain();
+    expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER'], ['om_2', 'NEW_REPEAT_ANSWER']]);
+  });
+
+  it('keeps a parked request ahead of a later receipt until its own section arrives', () => {
+    const r = rig();
+    r.mark('om_A', 'A request');
+    r.q.beginSubmitVerification('om_A');
+    r.q.finishSubmitVerification('om_A');
+    r.row({ role: 'user', content: 'A request' });
+    r.row({ role: 'assistant', content: 'A_ANSWER' });
+    r.drain();
+    expect(r.state().parkedUserRow).toMatchObject({ turnId: 'om_A' });
+
+    r.mark('om_B', 'B request');
+    r.q.confirmPendingTurn('om_B');
+    const parked = r.q.peek().find(turn => turn.turnId === 'om_A')!;
+    expect(r.q.expireUnstartedBefore('om_B', undefined, turn => turn === parked)).toEqual([]);
+    r.section('B request');
+    r.row({ role: 'user', content: 'B request' });
+    r.row({ role: 'assistant', content: 'B_ANSWER' });
+    r.drain();
+    expect(r.emitted).toEqual([]);
+    expect(r.state().parkedUserRow).toBeDefined();
+
+    // B's receipt made its assignment section visible first. Native row order,
+    // not that cross-file append order, must still emit A before B.
+    r.section('A request');
+    r.drain();
+    expect(r.emitted).toEqual([['om_A', 'A_ANSWER'], ['om_B', 'B_ANSWER']]);
+  });
+
+  it('pairs two legitimate resubmissions even when the previous turn had the same text', () => {
+    const r = rig();
+    firstTurn(r, 'run the tests');
+    r.mark('om_2', 'run the tests');
+    r.mark('om_3', 'run the tests');
+    r.request('run the tests');
+    r.row({ role: 'assistant', content: 'ANSWER_2' });
+    r.request('run the tests');
+    r.row({ role: 'assistant', content: 'ANSWER_3' });
+    r.drain();
+    expect(r.emitted.slice(1)).toEqual([['om_2', 'ANSWER_2'], ['om_3', 'ANSWER_3']]);
+  });
+
+  it('keeps row-first ownership for a journal-restored mark without retaining its full input', () => {
+    const r = rig();
+    firstTurn(r);
+    r.q.restorePendingTurns([{ turnId: 'om_restored', fingerprint: 'restored task', markTimeMs: 1_000_000 }]);
+    expect(r.q.peek().find(turn => turn.turnId === 'om_restored')?.nativeInputText).toBeUndefined();
+    r.row({ role: 'user', content: 'restored task' });
+    r.row({ role: 'assistant', content: 'RESTORED_ANSWER' });
+    r.drain();
+    expect(r.state().parkedUserRow).toBeDefined();
+
+    r.section('restored task');
+    r.drain();
+    expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER'], ['om_restored', 'RESTORED_ANSWER']]);
+  });
+
+  it('keeps same-text requests split across drains attached to their own rows and answers', () => {
+    const r = rig();
+    firstTurn(r, 'repeat');
+    r.mark('om_A', 'repeat');
+    r.request('repeat');
+    r.row({ role: 'assistant', content: 'A_ANSWER' });
+    r.drain();
+    expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER']]);
+
+    r.advance(400);
+    r.mark('om_B', 'repeat');
+    r.request('repeat');
+    r.row({ role: 'assistant', content: 'B_ANSWER' });
+    r.drain();
+    expect(r.emitted).toEqual([
+      ['om_1', 'FIRST_ANSWER'], ['om_A', 'A_ANSWER'], ['om_B', 'B_ANSWER'],
+    ]);
+  });
+
+  it('fails closed instead of delivering an ambiguous old retry after the wait expires', () => {
+    const r = rig();
+    firstTurn(r, 'repeat');
+    r.mark('om_2', 'repeat');
+    r.row({ role: 'user', content: 'repeat' });
+    r.row({ role: 'assistant', content: 'OLD_RETRY_ANSWER' });
+    r.section('repeat');
+    r.drain();
+    r.advance(3_500);
+    r.drain();
+    expect(r.emitted).toEqual([['om_1', 'FIRST_ANSWER']]);
+    expect(r.q.peek()[0]).toMatchObject({ turnId: 'om_2', started: false });
   });
 
   it('ignores a user row that is not a request while a turn runs', () => {

@@ -5,7 +5,7 @@
  * the thread, and which are already covered by something else.
  */
 import { describe, expect, it, vi } from 'vitest';
-import type { CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from '../src/services/structured-uncollected-notice.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
@@ -101,6 +101,7 @@ function harness(
   scope.uncollectedStructuredTurnNotice = loadWorkerFunction('uncollectedStructuredTurnNotice', scope);
   scope.holdStructuredStartLeasesWhileCliStarting = loadWorkerFunction('holdStructuredStartLeasesWhileCliStarting', scope);
   scope.holdStructuredStartLeasesWhileCliHoldsInput = loadWorkerFunction('holdStructuredStartLeasesWhileCliHoldsInput', scope);
+  scope.driverPendingInputTurn = loadWorkerFunction('driverPendingInputTurn', scope);
   scope.holdStructuredStartLeaseWhileDriverAwaitsInput = loadWorkerFunction('holdStructuredStartLeaseWhileDriverAwaitsInput', scope);
   scope.notifyUncollectedStructuredTurns = loadWorkerFunction('notifyUncollectedStructuredTurns', scope);
   const prune = loadWorkerFunction<(source: string) => boolean>('pruneExpiredStructuredHeadsAndEmit', scope);
@@ -267,6 +268,46 @@ describe('worker: expired structured heads', () => {
       idle.prune('structured bridge tick');
       expect(idle.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).not.toHaveBeenCalled();
     }
+  });
+
+  it('does not expire the driver-parked head when a later submit receipt arrives', () => {
+    const q = new CodexBridgeQueue(() => 1_000);
+    q.mark('om_A', 'A request', 1_000);
+    q.mark('om_B', 'B request', 1_000);
+    q.confirmPendingTurn('om_B', 1_000);
+    const h = harness([], undefined, {
+      codexBridgeQueue: q,
+      cliAdapter: { screenHoldsSubmittedInput: () => true },
+      bridgeSpecFor: () => ({ awaitsPendingInput: (state: unknown) => state === 'parked-A' }),
+      structuredBridgeDriverState: 'parked-A',
+      pruneExpiredStructuredHeadsAndEmit: vi.fn(),
+    });
+    const expire = loadWorkerFunction('expireHeldInputBeforeReceivedTurn', h.scope);
+    expire('om_B');
+    expect(q.hasPendingTurn('om_A')).toBe(true);
+    expect(q.peek()[0]?.unconfirmedAttributionStartedAtMs).toBe(1_000);
+    expect(q.hasPendingTurn('om_B')).toBe(true);
+  });
+
+  it('expires a dead predecessor rather than protecting it for a successor\'s parked row', () => {
+    const q = new CodexBridgeQueue(() => 1_000);
+    q.mark('om_deleted_A', 'A request', 1_000);
+    q.mark('om_B', 'B request', 1_000);
+    q.confirmPendingTurn('om_B', 1_000);
+    const h = harness([], undefined, {
+      codexBridgeQueue: q,
+      cliAdapter: { screenHoldsSubmittedInput: () => true },
+      bridgeSpecFor: () => ({
+        awaitsPendingInput: (state: unknown) => state === 'parked-B',
+        pendingInputOwner: (state: unknown) => state === 'parked-B' ? { turnId: 'om_B' } : undefined,
+      }),
+      structuredBridgeDriverState: 'parked-B',
+      pruneExpiredStructuredHeadsAndEmit: vi.fn(),
+    });
+    const expire = loadWorkerFunction('expireHeldInputBeforeReceivedTurn', h.scope);
+    expire('om_B');
+    expect(q.peek()[0]).toMatchObject({ turnId: 'om_deleted_A', unconfirmedAttributionStartedAtMs: Number.NEGATIVE_INFINITY });
+    expect(q.peek()[1]).toMatchObject({ turnId: 'om_B', submitConfirmedAtMs: 1_000 });
   });
 
   describe('when procfs refused the CLI process its open files', () => {

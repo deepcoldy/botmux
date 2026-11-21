@@ -50,8 +50,9 @@ export interface DoubaoBridgeDrainState {
   skipTrajectoryTail?: true;
   /** A request row of an input the attribution queue is waiting for, whose
    *  assignment section was not parsed yet: the trajectory frontier waits at
-   *  it (bounded in time) instead of passing its answer as ownerless. */
-  parkedUserRow?: { offset: number; sinceMs: number };
+   *  it (bounded in time) instead of passing its answer as ownerless. Owner
+   *  identity is optional only for state captured before it was recorded. */
+  parkedUserRow?: { offset: number; sinceMs: number; turnId?: string; dispatchAttempt?: number };
   /** This session's trajectory opens requests with a row carrying the request
    *  text (seen at least once). Only then is a section that arrives without
    *  its row held back briefly for that row. */
@@ -72,6 +73,11 @@ export interface DoubaoBridgeDrainContext {
   openTurns?: number;
   /** See StructuredBridgeDrainContext.ownsNativeInput. */
   ownsNativeInput?: (text: string) => boolean;
+  /** See StructuredBridgeDrainContext.ownsNativeInputByFingerprint. */
+  ownsNativeInputByFingerprint?: (text: string) => boolean;
+  /** See StructuredBridgeDrainContext.nativeInputOwner. */
+  nativeInputOwner?: (text: string, requireCompleteInput: boolean) =>
+    { turnId: string; dispatchAttempt?: number } | undefined;
   /** Clock for the bounded wait at a parked request row. */
   nowMs?: number;
 }
@@ -511,87 +517,154 @@ export function drainDoubaoTranscript(
   const events: CodexBridgeEvent[] = [];
   const nowMs = ctx.nowMs ?? Date.now();
   const sectionText = (section: ParsedAssignmentSection) => normaliseRequestText(section.event!.text);
-  // Where, in this window, each pending section's own request row is. Rows
-  // and sections of the same text pair up in order; only rows in EXCESS of
-  // that text's pending sections are stale repeats, and those are the earliest
-  // ones. A section whose row is missing ends the in-window pairing.
-  const sectionRowAt: number[] = [];
-  {
-    const texts = userSections.map(sectionText);
-    const rowsByText = new Map<string, number[]>();
-    for (let j = 0; j < trajectoryEvents.length; j++) {
-      const row = trajectoryEvents[j]!.userRow;
-      if (row === undefined) continue;
-      const text = texts.find(candidate => userRowOpens(row, candidate));
-      if (text === undefined) continue;
-      rowsByText.set(text, [...(rowsByText.get(text) ?? []), j]);
-    }
-    const nextOfText = new Map<string, number>();
-    for (const [text, rows] of rowsByText) {
-      const sections = texts.filter(candidate => candidate === text).length;
-      nextOfText.set(text, Math.max(0, rows.length - sections));
-    }
-    for (let i = 0; i < userSections.length; i++) {
-      const rows = rowsByText.get(texts[i]!);
-      const k = nextOfText.get(texts[i]!) ?? 0;
-      const at = rows?.[k];
-      if (at === undefined) break;
-      nextOfText.set(texts[i]!, k + 1);
-      sectionRowAt.push(at);
-    }
-  }
   const startedRequests = [...(prevState.startedRequests ?? [])];
   const noteStarted = (section: ParsedAssignmentSection) => {
     startedRequests.push(requestDigest(sectionText(section)));
     if (startedRequests.length > STARTED_REQUESTS_KEPT) startedRequests.shift();
   };
+
+  // Assign every row to at most one section text. Exact matches win; otherwise
+  // the longest containing request wins, so `继续执行测试` cannot be stolen by
+  // the earlier `继续`. Rows and sections of the same text pair in occurrence
+  // order. An already-started text gets one ambiguous-row hold: its first 1:1
+  // row may be an old retry, while a row that was explicitly parked as the
+  // queue's next input is positive evidence of a new occurrence.
+  let orderedSections = [...userSections];
+  let mappedRows: Array<number | undefined> = Array(orderedSections.length).fill(undefined);
+  const ambiguousOldRowAt = new Map<number, number>();
+  {
+    const texts = orderedSections.map(sectionText);
+    const rowsByText = new Map<string, number[]>();
+    for (let j = 0; j < trajectoryEvents.length; j++) {
+      const row = trajectoryEvents[j]!.userRow;
+      if (row === undefined) continue;
+      let text: string | undefined;
+      for (const candidate of texts) {
+        if (!userRowOpens(row, candidate)) continue;
+        if (row === candidate) { text = candidate; break; }
+        if (text === undefined || candidate.length > text.length) text = candidate;
+      }
+      if (text === undefined) continue;
+      rowsByText.set(text, [...(rowsByText.get(text) ?? []), j]);
+    }
+    const nextOfText = new Map<string, number>();
+    for (const [text, rows] of rowsByText) {
+      const sectionCount = texts.filter(candidate => candidate === text).length;
+      const firstSection = orderedSections.find(section => sectionText(section) === text)!;
+      const hasParkedRow = rows.some(index => trajectoryEvents[index]!.start === prevState.parkedUserRow?.offset);
+      const ambiguousOldRow = prevState.userRowsMatch === true
+        && startedRequests.includes(requestDigest(text))
+        && rows.length === 1 && sectionCount === 1 && !hasParkedRow;
+      if (ambiguousOldRow) ambiguousOldRowAt.set(firstSection.start, rows[0]!);
+      nextOfText.set(text, Math.max(ambiguousOldRow ? 1 : 0, rows.length - sectionCount));
+    }
+    for (let i = 0; i < orderedSections.length; i++) {
+      const rows = rowsByText.get(texts[i]!);
+      const k = nextOfText.get(texts[i]!) ?? 0;
+      const at = rows?.[k];
+      if (at === undefined) break;
+      mappedRows[i] = at;
+      nextOfText.set(texts[i]!, k + 1);
+    }
+  }
+
+  // A parked row is the queue's next native request even if a later receipt
+  // made its assignment section visible first. Once every section has a row,
+  // restore native occurrence order before emitting to the FIFO attribution
+  // queue. Partial mappings stay in file order and use the bounded wait below.
+  const parkedSection = mappedRows.findIndex(index => index !== undefined
+    && trajectoryEvents[index]!.start === prevState.parkedUserRow?.offset);
+  if (parkedSection > 0 && mappedRows.every(index => index !== undefined)) {
+    const order = [parkedSection, ...orderedSections.map((_, index) => index).filter(index => index !== parkedSection)];
+    orderedSections = order.map(index => orderedSections[index]!);
+    mappedRows = order.map(index => mappedRows[index]!);
+  }
+  const sectionRowAt: number[] = [];
+  for (const at of mappedRows) {
+    if (at === undefined || (sectionRowAt.length > 0 && at <= sectionRowAt.at(-1)!)) break;
+    sectionRowAt.push(at);
+  }
+
   const userRowsMatch = prevState.userRowsMatch === true || sectionRowAt.length > 0;
   let parkedUserRow: DoubaoBridgeDrainState['parkedUserRow'];
   let sectionRowWait: DoubaoBridgeDrainState['sectionRowWait'];
   let holdSectionsFrom: number | undefined;
+  const holdForRequestRow = (sectionIndex: number, trajectoryStart?: number): boolean => {
+    if (!userRowsMatch || sectionRowAt[sectionIndex] !== undefined) return false;
+    const section = orderedSections[sectionIndex]!;
+    const waitKey = section.start;
+    const previous = prevState.sectionRowWait?.assignmentOffset === waitKey
+      ? prevState.sectionRowWait : undefined;
+    const sinceMs = previous?.sinceMs ?? nowMs;
+    if (nowMs - sinceMs > SECTION_ROW_WAIT_MS) return false;
+    sectionRowWait = { assignmentOffset: waitKey, sinceMs };
+    holdSectionsFrom = sectionIndex;
+    if (trajectoryStart !== undefined) trajectoryOffset = trajectoryStart;
+    return true;
+  };
+
   let remainingOpen = openTurns;
   let nextUser = 0;
   let hasOwner = remainingOpen > 0;
   for (let index = 0; index < trajectoryEvents.length; index++) {
     const { event, userRow, start } = trajectoryEvents[index]!;
     if (userRow !== undefined) {
-      if (nextUser < userSections.length && sectionRowAt[nextUser] === index) {
+      if (nextUser < orderedSections.length && sectionRowAt[nextUser] === index) {
         // A new request starts here; whatever ran before it is over.
-        noteStarted(userSections[nextUser]!);
-        events.push(userSections[nextUser++]!.event!);
+        noteStarted(orderedSections[nextUser]!);
+        events.push(orderedSections[nextUser++]!.event!);
         hasOwner = true;
         remainingOpen = 1;
         continue;
       }
-      if (!hasOwner && nextUser >= userSections.length
-        && !startedRequests.includes(requestDigest(userRow)) && ctx.ownsNativeInput?.(userRow)) {
-        const sinceMs = prevState.parkedUserRow?.offset === start ? prevState.parkedUserRow.sinceMs : nowMs;
+      const ambiguousOldRow = nextUser < orderedSections.length
+        && sectionRowAt[nextUser] === undefined
+        && ambiguousOldRowAt.get(orderedSections[nextUser]!.start) === index;
+      if (!hasOwner && ambiguousOldRow) {
+        if (holdForRequestRow(nextUser, start)) break;
+        // The ambiguous native occurrence never acquired positive evidence
+        // within the bounded wait. Consume its section and events WITHOUT
+        // starting the queue turn: its old final must not become the new reply.
+        // The unstarted mark follows the ordinary pre-start timeout/notice.
+        nextUser++;
+        continue;
+      }
+      const alreadyParked = prevState.parkedUserRow?.offset === start;
+      const completeOwner = ctx.nativeInputOwner?.(userRow, true);
+      const fingerprintOwner = ctx.nativeInputOwner?.(userRow, false);
+      const completeOwned = completeOwner !== undefined || ctx.ownsNativeInput?.(userRow) === true;
+      const fingerprintOwned = (fingerprintOwner !== undefined || ctx.ownsNativeInputByFingerprint?.(userRow) === true)
+        && !startedRequests.includes(requestDigest(userRow));
+      if (!hasOwner && (alreadyParked || nextUser >= orderedSections.length)
+        && (completeOwned || fingerprintOwned)) {
+        const sinceMs = alreadyParked ? prevState.parkedUserRow!.sinceMs : nowMs;
         if (nowMs - sinceMs <= PARKED_USER_ROW_MAX_MS) {
-          // botmux's own next request, its section not in assignment.md yet:
-          // wait here rather than pass its answer as an ownerless row.
-          parkedUserRow = { offset: start, sinceMs };
+          // The native row is already known to be the queue's next request.
+          // Later sections for successors do not let us skip its answer.
+          const owner = completeOwner ?? (fingerprintOwned ? fingerprintOwner : undefined)
+            ?? (alreadyParked && prevState.parkedUserRow?.turnId ? {
+              turnId: prevState.parkedUserRow.turnId,
+              ...(prevState.parkedUserRow.dispatchAttempt !== undefined
+                ? { dispatchAttempt: prevState.parkedUserRow.dispatchAttempt } : {}),
+            } : undefined);
+          parkedUserRow = { offset: start, sinceMs, ...(owner ?? {}) };
           trajectoryOffset = start;
+          // Later receipts may already have written successor sections. Keep
+          // those bytes too; consuming them now would let a successor start
+          // ahead of the parked head and then mistake its own row for a new
+          // row-first request on the next drain.
+          if (nextUser < orderedSections.length) holdSectionsFrom = nextUser;
           break;
         }
         logger.warn(`[doubao-transcript] request row at ${path}:${start} found no assignment section in ${PARKED_USER_ROW_MAX_MS / 1000}s; reading on`);
       }
       continue;
     }
-    if (!hasOwner && nextUser < userSections.length
+    if (!hasOwner && nextUser < orderedSections.length
       && !(sectionRowAt[nextUser] !== undefined && sectionRowAt[nextUser]! > index)) {
-      const waitKey = userSections[nextUser]!.start;
-      const sinceMs = prevState.sectionRowWait?.assignmentOffset === waitKey ? prevState.sectionRowWait.sinceMs : nowMs;
-      if (userRowsMatch && sectionRowAt[nextUser] === undefined && nowMs - sinceMs <= SECTION_ROW_WAIT_MS) {
-        // This session writes a request row, and this request's is not here
-        // yet: the ownerless row ahead may be earlier work's. Hold both the
-        // section and this frontier briefly for the row.
-        sectionRowWait = { assignmentOffset: waitKey, sinceMs };
-        holdSectionsFrom = nextUser;
-        trajectoryOffset = start;
-        break;
-      }
-      noteStarted(userSections[nextUser]!);
-      events.push(userSections[nextUser++]!.event!);
+      if (holdForRequestRow(nextUser, start)) break;
+      noteStarted(orderedSections[nextUser]!);
+      events.push(orderedSections[nextUser++]!.event!);
       hasOwner = true;
     }
     if (!hasOwner) {
@@ -610,17 +683,21 @@ export function drainDoubaoTranscript(
     }
   }
   // A pending prompt may precede its first trajectory row by several polls.
+  // Empty windows wait too: the next poll may begin with earlier work's final.
+  if (holdSectionsFrom === undefined && nextUser < orderedSections.length) {
+    holdForRequestRow(nextUser);
+  }
   if (holdSectionsFrom === undefined) {
-    for (; nextUser < userSections.length; nextUser++) {
-      noteStarted(userSections[nextUser]!);
-      events.push(userSections[nextUser]!.event!);
+    for (; nextUser < orderedSections.length; nextUser++) {
+      noteStarted(orderedSections[nextUser]!);
+      events.push(orderedSections[nextUser]!.event!);
     }
   }
 
   // Park assignment bytes at a torn trailing heading, if any; every complete
   // section above has been emitted and its bytes may be committed. A section
   // held back for its request row is re-read from its own start.
-  if (holdSectionsFrom !== undefined) assignmentOffset = userSections[holdSectionsFrom]!.start;
+  if (holdSectionsFrom !== undefined) assignmentOffset = orderedSections[holdSectionsFrom]!.start;
   else if (trailingIncomplete) assignmentOffset = trailingIncomplete.start;
   else assignmentOffset = assignmentWindowEnd;
 
