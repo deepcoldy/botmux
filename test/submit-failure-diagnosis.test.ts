@@ -248,6 +248,7 @@ const DIAG_KEYS = [
   'submitDiag.logged_out',
   'submitDiag.interactive_menu',
   'submitDiag.draft_parked',
+  'submitDiag.draft_parked_held',
   'submitDiag.session_locked',
 ] as const;
 
@@ -342,6 +343,25 @@ describe('collapsed pasted-text chip in Claude composer', () => {
   it('is gated to the claude-code family like the expanded-composer rule', () => {
     expect(diagnoseSubmitFailure({ screenText: parkedChipScreen, cliId: 'codex' }).reason).toBe('unknown');
     expect(diagnoseSubmitFailure({ screenText: parkedChipScreen }).reason).toBe('unknown');
+  });
+});
+
+describe('Doubao composer draft', () => {
+  const rule = '─'.repeat(40);
+  const NOW = 1_000_000;
+  it('reports a draft Doubao kept in its composer as parked, even while the pane is active', () => {
+    const screen = ['◆ FIRST_ANSWER', rule, '❯ second task: summarize the failures', rule, '  Default model · Default · /work'].join('\n');
+    expect(diagnoseSubmitFailure({ screenText: screen, cliId: 'doubao', nowMs: NOW, lastActivityAtMs: NOW }))
+      .toEqual({ reason: 'draft_parked', evidence: 'screen', matched: 'draft_parked:doubao_composer' });
+    // The same rows from another CLI are not read as a Doubao composer.
+    expect(diagnoseSubmitFailure({ screenText: screen, cliId: 'kimi' }).reason).toBe('unknown');
+  });
+
+  it('does not call an empty composer or a queued input a parked draft', () => {
+    const empty = [rule, '❯  Ask Doubao to do anything', rule].join('\n');
+    expect(diagnoseSubmitFailure({ screenText: empty, cliId: 'doubao' }).reason).toBe('unknown');
+    const queued = [rule, '❯  Ask Doubao to do anything', rule, '1 queued · second task · Ctrl+Q manage'].join('\n');
+    expect(diagnoseSubmitFailure({ screenText: queued, cliId: 'doubao' }).reason).toBe('unknown');
   });
 });
 

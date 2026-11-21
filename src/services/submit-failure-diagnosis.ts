@@ -9,6 +9,7 @@
  * extra silences, never a conclusion about what happened to the message.
  */
 import { stripAnsiScreenText } from '../utils/idle-detector.js';
+import { doubaoComposerState } from '../adapters/cli/doubao-screen.js';
 import { classifyStuckPage } from '../utils/stuck-detector.js';
 
 export type SubmitFailureDiagnosisReason =
@@ -162,6 +163,10 @@ export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): Submi
   if (input.cliId === 'claude-code') {
     const composerDraft = claudeComposerDraftMatch(screen);
     if (composerDraft) return { reason: 'draft_parked', evidence: 'screen', matched: composerDraft };
+  }
+  // Doubao keeps a draft whose Enter it refused in its `❯` composer box.
+  if (input.cliId === 'doubao' && doubaoComposerState(screen) === 'draft') {
+    return { reason: 'draft_parked', evidence: 'screen', matched: 'draft_parked:doubao_composer' };
   }
 
   const nowMs = input.nowMs ?? Date.now();

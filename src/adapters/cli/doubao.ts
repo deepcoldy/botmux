@@ -7,8 +7,25 @@ import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
-import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
-import { doubaoTrajectoryPathForSession, drainDoubaoTranscript } from '../../services/doubao-transcript.js';
+import type { CliAdapter, PtyHandle, StructuredBridgeSpec, SubmitRecheckResult } from './types.js';
+import {
+  doubaoAssignmentHasInputSince,
+  doubaoAssignmentPathForSession,
+  doubaoLogSize,
+  doubaoTrajectoryPathForSession,
+  drainDoubaoTranscript,
+  type DoubaoBridgeDrainState,
+} from '../../services/doubao-transcript.js';
+import { busyProbeRegion } from '../../utils/busy-probe.js';
+import {
+  DOUBAO_BUSY_FOOTER,
+  DOUBAO_QUEUE_LINE,
+  doubaoComposerState,
+  doubaoScreenHoldsSubmittedInput,
+  doubaoScreenShowsNoPendingInput,
+} from './doubao-screen.js';
+
+export { DOUBAO_BUSY_FOOTER };
 
 import { delay } from '../../utils/timing.js';
 import { DOUBAO_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -21,15 +38,6 @@ const DOUBAO_SESSION_ID = /^\d{10,24}$/;
 /** `--effort` values accepted by doubao 2.36 (`none|minimal|low|medium|high|xhigh|max`).
  *  botmux's `ultra` has no equivalent and is dropped rather than failing the launch. */
 const DOUBAO_EFFORTS = new Set(DOUBAO_REASONING_EFFORTS);
-
-/**
- * Busy footer drawn directly above the composer while a turn runs:
- * `✦ Responding… (3s • esc to interrupt)` / `◈ Running tool… (8s • esc to interrupt)`.
- * The leading glyph animates and the counter ticks every second, so only the
- * static `esc to interrupt)` tail is anchored. It disappears when the turn ends
- * (replaced by `Worked for Ns` in the transcript). Verified on doubao 2.31.0.
- */
-export const DOUBAO_BUSY_FOOTER = /esc to interrupt\)/;
 
 /**
  * Composer evidence. The `❯  Ask Doubao to do anything` placeholder and the
@@ -261,29 +269,77 @@ export function findDoubaoSessionForSubmit(
  */
 export const DOUBAO_SUBMIT_CAPTURE_BUDGET_MS = 20_000;
 export const DOUBAO_SUBMIT_CAPTURE_INTERVAL_MS = 250;
+/** Receipt wait for an input to an already bound session. Doubao appends the
+ *  request to assignment.md within seconds once it sends it; input parked in
+ *  its own send queue ends the wait early (see DOUBAO_QUEUE_LINE), so this
+ *  only bounds how long a silent miss holds the flush. */
+export const DOUBAO_SUBMIT_RECEIPT_BUDGET_MS = 10_000;
+/** The composer is read no earlier than this after Enter: Doubao clears it
+ *  synchronously on accept, but the pane needs a repaint to show that. */
+const DOUBAO_COMPOSER_SETTLE_MS = 1_000;
 
-/** Poll `find` until it yields a session id or the budget runs out. Split out
- *  of writeInput so the cold-start timing is testable without a real TUI. */
-export async function pollDoubaoSessionForSubmit(
-  find: () => string | undefined,
+const DOUBAO_PASTE_NOT_DELIVERED = 'The terminal did not confirm the paste and the Doubao input box is still empty; Enter was not sent. Retry the message.';
+
+async function captureDoubaoScreen(
+  pty: Pick<PtyHandle, 'captureViewportAsync' | 'captureCurrentScreen'>,
+): Promise<string | undefined> {
+  try {
+    if (pty.captureViewportAsync) return await pty.captureViewportAsync();
+    return pty.captureCurrentScreen?.();
+  } catch { return undefined; }
+}
+
+/**
+ * After Enter: wait for the submit receipt, and classify a miss by what the
+ * composer shows. Pressing Enter is not proof of submission — Doubao drops it
+ * while the composer cannot submit (initializing / switching / too long) and
+ * the draft simply stays in the box; and an Enter it does accept during a
+ * running turn is only queued.
+ *  - receipt found                 → submitted (the native record exists);
+ *  - Doubao's queue line is drawn  → taken into Doubao's own send queue; it is
+ *    sent when the running work ends, so stop waiting (unverified);
+ *  - draft still in the composer   → not submitted; nothing re-pastes it, and
+ *    the recheck lets a later manual submit confirm the same input;
+ *  - otherwise                     → unverified (the bridge's start lease decides).
+ */
+export async function awaitDoubaoSubmitReceipt(
+  pty: Pick<PtyHandle, 'captureViewportAsync' | 'captureCurrentScreen'>,
+  receipt: () => SubmitRecheckResult,
   opts: {
     budgetMs?: number;
     intervalMs?: number;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
   } = {},
-): Promise<string | undefined> {
-  const budgetMs = opts.budgetMs ?? DOUBAO_SUBMIT_CAPTURE_BUDGET_MS;
-  const intervalMs = opts.intervalMs ?? DOUBAO_SUBMIT_CAPTURE_INTERVAL_MS;
+): Promise<void | { submitted: boolean; cliSessionId?: string; ownershipProven?: boolean; recheck?: () => SubmitRecheckResult }> {
   const now = opts.now ?? Date.now;
   const sleep = opts.sleep ?? delay;
-  const deadline = now() + budgetMs;
+  const intervalMs = opts.intervalMs ?? DOUBAO_SUBMIT_CAPTURE_INTERVAL_MS;
+  const enterAt = now();
+  const deadline = enterAt + (opts.budgetMs ?? DOUBAO_SUBMIT_RECEIPT_BUDGET_MS);
+  const confirmed = () => {
+    const result = receipt();
+    return result && typeof result === 'object' && result.submitted ? result : undefined;
+  };
+  let lastLook = Number.NEGATIVE_INFINITY;
   for (;;) {
-    const sid = find();
-    if (sid) return sid;
-    if (now() >= deadline) return undefined;
+    const hit = confirmed();
+    if (hit) return hit;
+    if (now() >= deadline) break;
+    if (now() - enterAt >= DOUBAO_COMPOSER_SETTLE_MS && now() - lastLook >= DOUBAO_COMPOSER_SETTLE_MS) {
+      lastLook = now();
+      const screen = await captureDoubaoScreen(pty);
+      if (screen && doubaoComposerState(screen) === 'empty'
+        && DOUBAO_QUEUE_LINE.test(busyProbeRegion(screen))) {
+        return confirmed() ?? undefined;
+      }
+    }
     await sleep(intervalMs);
   }
+  const late = confirmed();
+  if (late) return late;
+  const screen = await captureDoubaoScreen(pty);
+  if (screen && doubaoComposerState(screen) === 'draft') return { submitted: false, recheck: receipt };
 }
 
 /** True when the session directory exists locally; undefined when no session
@@ -428,20 +484,38 @@ export const doubaoBridgeSpec: StructuredBridgeSpec = {
   drain: (path, offset, ctx) => drainDoubaoTranscript(path, offset, {
     state: ctx.state,
     openTurns: ctx.openTurns,
+    ownsNativeInput: ctx.ownsNativeInput,
+    ownsNativeInputByFingerprint: ctx.ownsNativeInputByFingerprint,
+    nativeInputOwner: ctx.nativeInputOwner,
   }),
+  awaitsPendingInput: state => !!(state as DoubaoBridgeDrainState | undefined)?.parkedUserRow,
+  pendingInputOwner: state => {
+    const parked = (state as DoubaoBridgeDrainState | undefined)?.parkedUserRow;
+    return parked?.turnId ? { turnId: parked.turnId,
+      ...(parked.dispatchAttempt !== undefined ? { dispatchAttempt: parked.dispatchAttempt } : {}) } : undefined;
+  },
   locate: {
     bySessionId: sessionId => doubaoTrajectoryPathForSession(sessionId),
   },
 };
 
-export function createDoubaoAdapter(pathOverride?: string, deps: { now?: () => number } = {}): CliAdapter {
+export function createDoubaoAdapter(pathOverride?: string, deps: {
+  now?: () => number;
+  /** Clock for the post-Enter receipt wait (tests run it virtually). */
+  submitClock?: { now: () => number; sleep: (ms: number) => Promise<void> };
+} = {}): CliAdapter {
   const rawBin = pathOverride ?? 'doubao';
   const now = deps.now ?? (() => Date.now());
   let cachedBin: string | undefined;
   // A fresh spawn learns its native id from the first submit that lands.
   // Each launch owns an immutable identity; per-input state lives on this
   // object so an old poll can never clear a replacement launch's capture.
-  let captureState: { id: string; sinceMs?: number; windowBytes: number } | undefined;
+  // `sessionId` is the conversation this launch is bound to (precise resume,
+  // or the captured id): later inputs take their submit receipt from it.
+  let launch: {
+    capture?: { id: string; sinceMs?: number; windowBytes: number };
+    sessionId?: string;
+  } = {};
   return {
     id: 'doubao',
     bridgeSpec: doubaoBridgeSpec,
@@ -457,13 +531,15 @@ export function createDoubaoAdapter(pathOverride?: string, deps: { now?: () => n
 
     buildArgs({ resume, resumeSessionId, model, reasoningEffort, disableCliBypass }) {
       const preciseResume = resume && !!resumeSessionId && DOUBAO_SESSION_ID.test(resumeSessionId);
-      // Replace the whole capture object for every launch, including a
+      // Replace the whole launch object for every launch, including a
       // predicted reattach that a backend later turns into a fresh spawn.
       // Inputs from one launch share the id so delayed turns remain recoverable.
-      captureState = preciseResume ? undefined : {
-        id: randomBytes(16).toString('hex'),
-        sinceMs: undefined,
-        windowBytes: 0,
+      launch = preciseResume ? { sessionId: resumeSessionId } : {
+        capture: {
+          id: randomBytes(16).toString('hex'),
+          sinceMs: undefined,
+          windowBytes: 0,
+        },
       };
       const args: string[] = [];
       // `always_allow` = act without per-tool approval (the TUI's dialog is not
@@ -492,7 +568,8 @@ export function createDoubaoAdapter(pathOverride?: string, deps: { now?: () => n
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      const launchCapture = captureState;
+      const current = launch;
+      const launchCapture = current.capture;
       const submittedContent = launchCapture
         ? doubaoContentWithCaptureId(content, launchCapture.id)
         : content;
@@ -503,39 +580,73 @@ export function createDoubaoAdapter(pathOverride?: string, deps: { now?: () => n
         launchCapture.sinceMs ??= startedAt - 2000;
         launchCapture.windowBytes = Math.max(launchCapture.windowBytes, Buffer.byteLength(submittedContent, 'utf-8') * 2 + 4096);
       }
+      // Receipt source, fixed before any byte is written. A fresh launch finds
+      // its session through the per-launch capture id; a bound one checks only
+      // what its own assignment.md gains after this baseline.
+      let receipt: () => SubmitRecheckResult = () => false;
+      if (launchCapture) {
+        receipt = () => {
+          const sid = findDoubaoSessionForSubmit(
+            submittedContent,
+            launchCapture.sinceMs ?? startedAt - 2000,
+            undefined,
+            launchCapture.windowBytes,
+          );
+          if (!sid) return false;
+          // A stale write may still return its own SID for the worker's
+          // generation fence, but it must not disarm the replacement launch.
+          if (current.capture === launchCapture) current.capture = undefined;
+          current.sessionId = sid;
+          return { submitted: true, cliSessionId: sid, ownershipProven: true };
+        };
+      } else if (current.sessionId) {
+        const sessionId = current.sessionId;
+        const assignment = doubaoAssignmentPathForSession(sessionId);
+        const baseline = assignment ? doubaoLogSize(assignment) : undefined;
+        if (assignment && baseline !== undefined) {
+          receipt = () => doubaoAssignmentHasInputSince(assignment, baseline, submittedContent)
+            ? { submitted: true, cliSessionId: sessionId, ownershipProven: true }
+            : false;
+        }
+      }
       // Bracketed paste: the composer inserts the whole multi-line envelope as
       // content (large pastes collapse to `[Pasted text #n +N lines]` and are
       // expanded verbatim on submit); only the following Enter submits.
       // Per-line send-keys would turn each embedded newline into Enter.
       if (pty.pasteText && pty.sendSpecialKeys) {
-        pty.pasteText(submittedContent);
+        if (pty.pasteText(submittedContent) === false) {
+          // Never follow an unconfirmed paste with Enter. An empty composer
+          // proves nothing landed; anything else may be a partial draft.
+          const screen = await captureDoubaoScreen(pty);
+          return screen && doubaoComposerState(screen) === 'empty'
+            ? { submitted: false, failureReason: DOUBAO_PASTE_NOT_DELIVERED }
+            : { submitted: false, recheck: receipt };
+        }
         await delay(300);
-        if (pty.sendSpecialKeys('Enter') === false) return { submitted: false };
+        if (pty.sendSpecialKeys('Enter') === false) return { submitted: false, recheck: receipt };
       } else {
-        if (pty.write(wrapBracketedPaste(submittedContent)) === false) return { submitted: false };
+        if (pty.write(wrapBracketedPaste(submittedContent)) === false) return { submitted: false, recheck: receipt };
         await delay(1000);
-        if (pty.write('\r') === false) return { submitted: false };
+        if (pty.write('\r') === false) return { submitted: false, recheck: receipt };
       }
-      if (!launchCapture) return;
-      // assignment.md is appended once doubao accepts the turn (later on a cold
-      // service start, see DOUBAO_SUBMIT_CAPTURE_BUDGET_MS). A miss stays armed
-      // for the next input instead of costing the session its resume id, and is
-      // reported as "unverified" (void) — never as a failed submit.
-      const sid = await pollDoubaoSessionForSubmit(
-        () => findDoubaoSessionForSubmit(
-          submittedContent,
-          launchCapture.sinceMs ?? startedAt - 2000,
-          undefined,
-          launchCapture.windowBytes,
-        ),
-      );
-      if (sid) {
-        // A stale write may still return its own SID for the worker's
-        // generation fence, but it must not disarm the replacement launch.
-        if (captureState === launchCapture) captureState = undefined;
-        return { submitted: true, cliSessionId: sid };
-      }
+      // assignment.md is appended once doubao sends the turn (later on a cold
+      // service start, see DOUBAO_SUBMIT_CAPTURE_BUDGET_MS). A capture miss
+      // stays armed for the next input instead of costing the session its
+      // resume id; a miss is "unverified" unless the draft is visibly stuck.
+      return awaitDoubaoSubmitReceipt(pty, receipt, {
+        budgetMs: launchCapture ? DOUBAO_SUBMIT_CAPTURE_BUDGET_MS : DOUBAO_SUBMIT_RECEIPT_BUDGET_MS,
+        ...deps.submitClock,
+      });
     },
+
+    // A miss whose draft is still in the composer may yet be submitted by
+    // hand in the Web terminal: keep that turn attributable and hold later
+    // input instead of pasting it onto the draft (never re-pasted).
+    quarantineUnconfirmedSubmits: true,
+    screenHoldsSubmittedInput: doubaoScreenHoldsSubmittedInput,
+    // …and once the draft is gone from the composer (cleared or replaced by
+    // hand), stop holding later input behind it.
+    screenShowsNoPendingInput: doubaoScreenShowsNoPendingInput,
 
     completionPattern: undefined,
     readyPattern: DOUBAO_READY_PATTERN,
