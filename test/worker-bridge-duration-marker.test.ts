@@ -777,7 +777,7 @@ describe('marker verdict lifecycle wiring guard', () => {
     // queue ingest and the arming call.
     const workerSrc = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
     expect(workerSrc).toMatch(
-      /bridgeQueue\.ingest\(result\.events, bridgeJsonlPath, observeThinkingAttribution\);\s*\n(?:\s*\/\/[^\n]*\n)*\s*updateProvisionalExitWatch\(\);/,
+      /bridgeQueue\.ingest\(result\.events, bridgeJsonlPath, observeBridgeAttribution\);\s*\n(?:\s*\/\/[^\n]*\n)*\s*updateProvisionalExitWatch\(\);/,
     );
     // Fallback scope is the Claude non-adopt transcript bridge only: adopt
     // sessions and headless local turns are timed out by other paths.

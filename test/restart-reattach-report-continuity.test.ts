@@ -4,6 +4,7 @@ import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } fr
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionController } from '../src/core/session-controller.js';
+import { deliverWithRetry } from '../src/core/worker-pool.js';
 import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-turn-authority.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
@@ -614,6 +615,21 @@ describe('same-worker multi-hop in-process runtime continuation (epoch 1 -> 2 ->
         worker,
       ),
     ).toEqual({ kind: 'reject', reason: 'execution_scope_unproven' });
+    // A reply the replaced runtime already produced for that turn is a fact
+    // about it, like its final: still admitted, as history.
+    expect(
+      controller.ingest(
+        {
+          type: 'absorbed_reply',
+          turnId,
+          answer: 'answered before the respawn',
+          replyUuid: 'a1',
+          source: 'text',
+          sessionContract: ctx(7, { runtime: r3, execution }, 'b3-real'),
+        },
+        worker,
+      ),
+    ).toMatchObject({ kind: 'historical' });
   });
 
   it('resolves WorkerSessionEventScope.origin cleanly across same-process binding continuations while failing closed across distinct processes', () => {
@@ -1214,6 +1230,110 @@ describe('launcher-chain recovery guards', () => {
     const leafBound = s.controller.bindRuntime('w2-leaf', worker2, leaf, undefined, 'w2-unrelated');
     expect(leafBound.ref).toEqual(leafReserved);
     expect(leafBound.ref).not.toEqual(s.runtime1);
+  });
+});
+
+describe('historical follow-up reply delivery', () => {
+  it('runs a historical absorbed reply through its delivery handler before acknowledging it', async () => {
+    const effects: string[] = [];
+    const ds: any = { larkAppId: 'a', session: { sessionId: 's', status: 'active', cliId: 'codex' } };
+    const worker: any = { connected: true };
+    ds.worker = worker;
+    const contractWorker: any = { workerId: 'w', generation: 1 };
+    const context: any = {
+      version: 2, session: { appId: 'a', sessionId: 's' }, producer: contractWorker,
+      bindingId: 'b', eventId: 'w:1', sequence: 1, scope: {},
+    };
+    const admission = { kind: 'historical' as const, context };
+    const controller: any = {
+      ingest: () => admission,
+      flushPrimary: async () => {},
+      gateway: { admit: () => admission },
+      store: { acknowledgeDeferred: () => { effects.push('ack'); } },
+      run: async (_admission: unknown, work: () => Promise<void>) => work(),
+    };
+    const env: any = {
+      ds, worker, contractWorker, sessionController: controller,
+      logger: { warn() {}, info() {}, debug() {}, error() {} }, t: 'probe', cb: {},
+      handleLegacyWorkerMessage: async () => { effects.push('deliver'); },
+    };
+    const handle = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', env);
+    await handle({
+      type: 'absorbed_reply', turnId: 'om_fold', answer: 'answer', replyUuid: 'a1', source: 'text', turnReply: true,
+      sessionContract: context,
+    });
+    expect(effects).toEqual(['deliver', 'ack']);
+  });
+  function realHistoricalReplyHarness(overrides: Record<string, unknown> = {}) {
+    const effects: string[] = [];
+    const ds: any = { larkAppId: 'a', chatId: 'oc_c', adoptedFrom: {}, session: { sessionId: 's', status: 'active', cliId: 'claude-code' } };
+    const worker: any = { connected: true };
+    ds.worker = worker;
+    const contractWorker: any = { workerId: 'w', generation: 1 };
+    const context: any = {
+      version: 2, session: { appId: 'a', sessionId: 's' }, producer: contractWorker,
+      bindingId: 'b', eventId: 'w:1', sequence: 1, scope: {},
+    };
+    const admission = { kind: 'historical' as const, context };
+    const controller: any = {
+      ingest: () => admission,
+      flushPrimary: async () => {},
+      gateway: { admit: () => admission },
+      store: { acknowledgeDeferred: () => { effects.push('ack'); } },
+      run: async (_admission: unknown, work: () => Promise<void>) => work(),
+    };
+    const env: any = {
+      ds, worker, contractWorker, sessionController: controller, botCfg: {},
+      logger: { warn() {}, info() {}, debug() {}, error() {} }, t: 'probe', cb: {},
+      sessionCliId: () => 'claude-code', managedAuxUiSuppressed: () => false,
+      getBot: () => ({ config: { followUpReply: true } }), localeForBot: () => 'zh',
+      BTW_ANSWER_MAX_CHARS: 6_000, truncateUtf16WellFormed: (s: string) => s,
+      tr: (key: string) => key, buildContextualReplyCard: () => 'card', repairReplyMarkdown: (s: string) => s,
+      sessionCliDisplayName: () => 'Claude', daemonCardFooterRecipientOpenId: () => undefined,
+      renderBrandTemplate: () => '', resolveBrandLabel: () => '', daemonCardLocalHomeLinkMode: () => undefined,
+      absorbedReplyUuid: () => 'provider-key', deliverWithRetry,
+      beginFinalOutputDelivery: () => () => { effects.push('drain-finished'); },
+      scopedReply: async () => 'om_reply', ownsLifecycleMutation: () => true,
+      recordTurnTerminalCarrier: () => { effects.push('carrier'); },
+      noteFinalOutputReceipt: () => { effects.push('receipt'); },
+      ...overrides,
+    };
+    env.handleLegacyWorkerMessage = loadWorkerPoolClosure('handleLegacyWorkerMessage', env);
+    const handle = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', env);
+    const message = {
+      type: 'absorbed_reply', turnId: 'om_fold', answer: 'answer', replyUuid: 'a1', source: 'text', turnReply: true,
+      sessionContract: context,
+    };
+    return { effects, handle, message };
+  }
+
+  it('does not acknowledge a historical reply before its POST has completed', async () => {
+    let resolvePost!: (messageId: string) => void;
+    let postStarted!: () => void;
+    const started = new Promise<void>(resolve => { postStarted = resolve; });
+    const { effects, handle, message } = realHistoricalReplyHarness({
+      scopedReply: () => new Promise<string>(resolve => {
+        effects.push('post-start');
+        resolvePost = resolve;
+        postStarted();
+      }),
+    });
+    const pending = handle(message);
+    await started;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(effects).toEqual(['post-start']);
+    effects.push('post-resolve');
+    resolvePost('om_reply');
+    await pending;
+    expect(effects).toEqual(['post-start', 'post-resolve', 'carrier', 'receipt', 'drain-finished', 'ack']);
+  });
+
+  it('does not acknowledge a historical reply whose delivery did not complete', async () => {
+    const { effects, handle, message } = realHistoricalReplyHarness({
+      deliverWithRetry: async () => ({ delivered: false }),
+    });
+    await expect(handle(message)).rejects.toThrow('Follow-up reply delivery did not complete');
+    expect(effects).not.toContain('ack');
   });
 });
 

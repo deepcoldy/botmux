@@ -163,6 +163,10 @@ export interface CodexPendingTurn {
   /** Inputs folded into this native execution by a confirmed same-turn steer.
    * Their send attribution must retire with the single native terminal. */
   supersededTurns?: Array<Pick<CodexPendingTurn, 'turnId' | 'dispatchAttempt'>>;
+  /** This input reached the CLI as a confirmed same-turn steer: Codex pulled
+   * it into the execution already running, so the model answers it in the
+   * middle of that work (see setSteerReplyObserver). */
+  steeredMidTurn?: boolean;
   /** True when the turn was delivered via Codex RPC (turn/start) and the
    *  app-server has acknowledged it. RPC turns have no local transcript to
    *  ingest, so they can never reach the started state; this flag keeps the
@@ -197,6 +201,54 @@ export function selectStaleRestoredJournalTurns(
       || turn.submitVerificationStartedAtMs !== undefined));
 }
 
+/** Byte offset of the rollout line a Codex event came from (`<path>:<offset>`). */
+function rolloutLineOffset(uuid: string): number | undefined {
+  const offset = Number(uuid.slice(uuid.lastIndexOf(':') + 1));
+  return Number.isSafeInteger(offset) ? offset : undefined;
+}
+
+/** Rollout file of a raw `<path>:<offset>` event id. Stable content ids carry
+ * the same information explicitly in `rolloutPath`. */
+function rolloutLinePath(uuid: string): string | undefined {
+  const separator = uuid.lastIndexOf(':');
+  return separator > 0 ? uuid.slice(0, separator) : undefined;
+}
+
+/**
+ * The answer to an input Codex pulled into the running execution (a
+ * same-turn steer). Fed the 'cot' records attributed to that input's turn in
+ * order, it keeps the first assistant message(s) and reports them once the
+ * model moves on to a tool call: the model answered and went back to work.
+ * A message the turn simply ends with is its final answer, which the turn's
+ * own reply already carries, so that never completes here. A tool record
+ * written before the answer (a deferred shell call surfacing at the turn's
+ * end) is not the model moving on.
+ */
+export class CodexSteerReplyCollector {
+  private readonly run: Array<{ text: string; uuid: string; offset?: number; path?: string }> = [];
+  private done = false;
+
+  /** Feed the next record; returns the reply exactly once, when complete. */
+  feed(ev: CodexBridgeEvent): { text: string; lastUuid: string } | undefined {
+    if (this.done) return undefined;
+    const message = ev.assistantMessage?.trim();
+    if (message) {
+      this.run.push({ text: message, uuid: ev.uuid,
+        offset: ev.rolloutOffset ?? rolloutLineOffset(ev.uuid),
+        path: ev.rolloutPath ?? rolloutLinePath(ev.uuid) });
+      return undefined;
+    }
+    const toolCall = ev.toolCallBoundary === true || ev.cotEntries?.some(entry => entry.kind === 'tool_call');
+    if (this.run.length === 0 || !toolCall) return undefined;
+    const at = ev.rolloutOffset ?? rolloutLineOffset(ev.uuid);
+    const path = ev.rolloutPath ?? rolloutLinePath(ev.uuid);
+    const answered = this.run[this.run.length - 1];
+    if (path === answered.path && at !== undefined && answered.offset !== undefined && at < answered.offset) return undefined;
+    this.done = true;
+    return { text: this.run.map(part => part.text).join('\n\n'), lastUuid: this.run[this.run.length - 1].uuid };
+  }
+}
+
 export class CodexBridgeQueue {
   private seen = new Set<string>();
   private seenNativeUserMessages = new Map<string, true>();
@@ -214,6 +266,10 @@ export class CodexBridgeQueue {
    * any CoT on the successor. Let the UI close that exact abandoned timeline;
    * this notification is not evidence that the work completed. */
   private cotSupersededObserver?: (turn: CodexPendingTurn) => void;
+  /** Read-only observer for each 'cot' record attributed to a turn that
+   * started as a same-turn steer — what the model writes and calls while it
+   * answers that input mid-execution. Never affects attribution. */
+  private steerReplyObserver?: (ev: CodexBridgeEvent, turn: CodexPendingTurn) => void;
   /** A Lark turn's own user record reached the transcript: the CLI has its
    *  input. Never affects attribution; exceptions are swallowed. */
   private turnStartObserver?: (turn: CodexPendingTurn) => void;
@@ -481,6 +537,9 @@ export class CodexBridgeQueue {
           sourceTurnId: entry.mergedExecution.sourceTurnId,
           sourceSessionId: entry.mergedExecution.sourceSessionId,
           supersededTurns: entry.mergedExecution.supersededTurnIds.map(turnId => ({ turnId })),
+          // A persisted superseded host is the same same-turn steer evidence
+          // that armed the observer before the worker restarted.
+          ...(entry.mergedExecution.supersededTurnIds.length > 0 ? { steeredMidTurn: true } : {}),
         } : {}),
         unconfirmedAttributionStartedAtMs: entry.markTimeMs });
     }
@@ -873,6 +932,10 @@ export class CodexBridgeQueue {
     this.cotSupersededObserver = fn;
   }
 
+  setSteerReplyObserver(fn: (ev: CodexBridgeEvent, turn: CodexPendingTurn) => void): void {
+    this.steerReplyObserver = fn;
+  }
+
   setTurnStartObserver(fn: (turn: CodexPendingTurn) => void): void {
     this.turnStartObserver = fn;
   }
@@ -928,6 +991,7 @@ export class CodexBridgeQueue {
     if (turn.supersededTurns?.length && (turn.sourceTurnId !== ev.sourceTurnId
       || turn.sourceSessionId !== ev.sourceSessionId)) {
       turn.supersededTurns = undefined;
+      turn.steeredMidTurn = undefined;
     }
   }
 
@@ -1048,13 +1112,17 @@ export class CodexBridgeQueue {
       // collecting; history replay / unmatched events are dropped (never
       // buffered — a late replay into the wrong turn is worse than a gap).
       const target = this.targetForNativeEvent(ev);
-      if (target && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
-        // Native tool rows can flush after a stop but before the next submit.
-        // A parse-time timestamp must not turn those old bytes into new work.
-        if (ev.progressCursor && ev.progressCursor.jsonlPath === target.recoveryJsonlPathAtMark
-          && target.recoveryOffsetAtMark !== undefined
-          && ev.progressCursor.offset < target.recoveryOffsetAtMark) return;
-        if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
+      if (!target) return;
+      // Native tool rows can flush after a stop but before the next submit.
+      // A parse-time timestamp must not turn those old bytes into new work.
+      if (ev.progressCursor && ev.progressCursor.jsonlPath === target.recoveryJsonlPathAtMark
+        && target.recoveryOffsetAtMark !== undefined
+        && ev.progressCursor.offset < target.recoveryOffsetAtMark) return;
+      if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
+      if (target.steeredMidTurn && this.steerReplyObserver) {
+        try { this.steerReplyObserver(ev, target); } catch { /* observer channel — never break attribution */ }
+      }
+      if (this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
         try { this.cotObserver(ev.cotEntries, target); } catch { /* cosmetic channel — never break attribution */ }
       }
@@ -1165,6 +1233,7 @@ export class CodexBridgeQueue {
           && this.sourceSessionsCompatible(superseded.sourceSessionId, ev.sourceSessionId)) {
           next!.supersededTurns = [...(superseded.supersededTurns ?? []),
             { turnId: superseded.turnId, dispatchAttempt: superseded.dispatchAttempt }];
+          next!.steeredMidTurn = true;
         }
         const idx = this.queue.indexOf(superseded);
         if (idx >= 0) this.queue.splice(idx, 1);

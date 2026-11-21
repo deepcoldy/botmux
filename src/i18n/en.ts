@@ -2595,6 +2595,8 @@ export const messages: Record<string, string> = {
   // Adopt preamble card title
   'card.adopt_last_round': '📜 Last exchange before /adopt',
   'card.btw_answer': '💬 /btw side answer',
+  'card.absorbed_reply': '💬 Reply to your follow-up (the main task continues)',
+  'card.absorbed_reply_thinking': '💭 Thinking summary on your follow-up (the main task continues)',
   'card.btw_answer_truncated': '_(Answer truncated; see the web terminal for the full text.)_',
   'card.btw_answer_from_screen': '_(Read from the terminal screen; a long answer may be incomplete.)_',
   'card.local_turn_resumed': '🖥️ Local terminal turn resumed (model was mid-output during the daemon restart)',

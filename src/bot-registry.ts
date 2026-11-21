@@ -2409,6 +2409,15 @@ export interface BotConfig {
    */
   goalStatusCard?: boolean;
   /**
+   * Opt-in (default off): answer a Lark message the CLI folded into the turn
+   * already running — Claude Code's mid-turn system reminder in adopt
+   * sessions, a Codex same-turn steer — as soon as the model answers it,
+   * quoting that message, instead of leaving the answer inside the running
+   * turn. The worker side is read when a worker process starts; the daemon
+   * side is read live, so turning it off stops posting at once.
+   */
+  followUpReply?: boolean;
+  /**
    * When true, `/card` sends a **private** static snapshot card via the ephemeral
    * API, visible only to the bot's `allowedUsers` (owner / co-owners), instead of
    * the group-visible live streaming card. Talk-only grants (globalGrants /
@@ -4705,6 +4714,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true || undefined,
       goalStatusCard: entry.goalStatusCard === true || undefined,
+      followUpReply: entry.followUpReply === true || undefined,
       privateCard: entry.privateCard === true || undefined,
       replyCardActions: entry.replyCardActions === true || undefined,
       replyCardNextStep: entry.replyCardNextStep === true || undefined,
