@@ -153,6 +153,14 @@ describe('Riff host boundary', () => {
     expect(riffHostFileArguments(['send', '--into=om_other', 'body'])).toEqual([]);
   });
 
+  it.each([
+    ['separate', ['send', '--chat-id', 'oc_followed', '--into', '/etc/passwd', 'hello']],
+    ['inline', ['send', '--into=../../etc/passwd', 'body']],
+    ['bad-prefix', ['send', '--into', 'not_an_om_id', 'body']],
+  ])('rejects a non-om --into topic root (%s)', (_label, argv) => {
+    expect(() => riffHostFileArguments(argv)).toThrow('riff_host_invalid_into');
+  });
+
   it('delivers through the real host send path, indexes feedback and accepts a click without resending', async () => {
     const directory = root(), dataDir = join(directory, 'data'), app = 'cli_test', turnId = 'om_turn_host';
     mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
