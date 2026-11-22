@@ -26,7 +26,7 @@ import type { FailedTurnRecord, FailedTurnRewindDirective } from '../types.js';
 import { isHttpVirtualSession, type DaemonSession } from './types.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { isTriggerFinalSuppressed } from './trigger-final-suppression.js';
-import { normaliseForFingerprint } from '../services/claude-transcript.js';
+import { normaliseForFingerprint, normaliseTranscriptFingerprintCandidates } from '../services/claude-transcript.js';
 import type { PurgeResumeTarget } from '../services/transcript-image-purge.js';
 import { isInClaudeProjectsRoot, type ClaudeProjectsRoot } from '../services/claude-projects-root.js';
 import { inspectLastClaudeTurn, withOpenTranscript, type LastTurnInspection, type RewindResult, type TranscriptTreeScope } from './context-rewind.js';
@@ -99,7 +99,7 @@ const WRITE_EDGE_BLOCK_RE = /(?:<botmux_skills_refresh>[\s\S]*?<\/botmux_skills_
 export function matchRecordedInput(recorded: string, input: string): { suffix: string } | undefined {
   const want = normaliseForFingerprint(input);
   if (want.length === 0) return undefined;
-  if (normaliseForFingerprint(recorded) === want) return { suffix: '' };
+  if (normaliseTranscriptFingerprintCandidates(recorded).includes(want)) return { suffix: '' };
   let head = recorded;
   let last: string | undefined;
   for (let i = 0; i < 4; i += 1) {
@@ -108,7 +108,7 @@ export function matchRecordedInput(recorded: string, input: string): { suffix: s
     // A catalog replaces every earlier one: only the latest is worth keeping.
     last ??= block[0].trim();
     head = head.slice(0, block.index);
-    if (normaliseForFingerprint(head) === want) return { suffix: last };
+    if (normaliseTranscriptFingerprintCandidates(head).includes(want)) return { suffix: last };
   }
   return undefined;
 }

@@ -424,6 +424,31 @@ describe('restore semantics against the real queue + gate', () => {
     expect(ready[0].assistantUuids).toEqual(['cur-a']);
   });
 
+  it('recovers a legacy journal mark with a literal line-ending backslash', () => {
+    const legacyMessage = 'echo foo\\\nbar with enough content to identify the turn';
+    // Freeze the pre-upgrade on-disk format explicitly. Re-normalising this
+    // value cannot migrate it: its newline has already become a space.
+    const legacyNormalized = legacyMessage.replace(/\s+/g, ' ').trim();
+    const evidence: boolean[] = [];
+    const q = new BridgeTurnQueue(undefined, undefined, (_turn, e) => evidence.push(e.fullContentMatch));
+    q.mark('turn-legacy-journal', legacyNormalized.slice(0, 30), markTimeMs, legacyNormalized, undefined, {
+      restoredFromJournal: true,
+    });
+    const { history, live } = splitTranscriptEventsByCutoff([
+      ...oldTurnEvents,
+      user('legacy-u', legacyMessage, markTimeMs + 1_000),
+      assistant('legacy-a', 'recovered reply', markTimeMs + 2_000),
+    ], cutoffMs);
+    q.absorb(history);
+    q.ingest(live, '/tmp/session.jsonl');
+
+    const ready = q.drainEmittable();
+    expect(ready.map(turn => turn.turnId)).toEqual(['turn-legacy-journal']);
+    expect(ready[0].assistantUuids).toEqual(['legacy-a']);
+    expect(ready[0].restoredFromJournal).toBe(true);
+    expect(evidence).toEqual([true]);
+  });
+
   it('suppresses the recovered turn when a persisted send marker already covers it (已 send)', () => {
     const q = restoredQueueWithEvents([...oldTurnEvents, ...interruptedTurnEvents]);
     const [turn] = q.drainEmittable();

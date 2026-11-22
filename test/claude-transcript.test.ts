@@ -13,6 +13,7 @@ import { join, basename } from 'node:path';
 import { hasTrailingBridgeSentinelLine, shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTranscript,
+  normaliseForFingerprint,
   pickAssistantTextEvents,
   extractAssistantText,
   joinAssistantText,
@@ -1773,6 +1774,32 @@ describe('findJsonlContainingFingerprint: acceptCandidate', () => {
     );
     const got = findJsonlContainingFingerprint(dir, 'test');
     expect(got).toBe(path);
+  });
+});
+
+describe('soft-newline residue in transcript fingerprint searches', () => {
+  const sent = 'echo foo\\\nbar with enough content to identify the turn';
+  const recorded = 'echo foo\\\\\nbar with enough content to identify the turn';
+  const fingerprint = normaliseForFingerprint(sent).slice(0, 30);
+
+  it('matches residue-bearing user records in direct, fan-out, and exact-content searches', () => {
+    appendLine({ type: 'user', message: { role: 'user', content: recorded } });
+    expect(jsonlContainsFingerprint(path, fingerprint)).toBe(true);
+    expect(findJsonlContainingFingerprint(dir, fingerprint)).toBe(path);
+    expect(findJsonlsContainingExactContent(dir, normaliseForFingerprint(sent))).toEqual([path]);
+  });
+
+  it('matches residue-bearing queue operations when the caller opts in', () => {
+    appendLine({ type: 'queue-operation', operation: 'enqueue', content: recorded });
+    expect(jsonlContainsFingerprint(path, fingerprint, { includeQueueOperations: true })).toBe(true);
+    expect(findJsonlsContainingExactContent(dir, normaliseForFingerprint(sent), { includeQueueOperations: true })).toEqual([path]);
+  });
+
+  it('does not match a different record missing the genuine backslash', () => {
+    appendLine({ type: 'user', message: { role: 'user', content: 'echo foo\nbar with enough content to identify the turn' } });
+    expect(jsonlContainsFingerprint(path, fingerprint)).toBe(false);
+    expect(findJsonlContainingFingerprint(dir, fingerprint)).toBeNull();
+    expect(findJsonlsContainingExactContent(dir, normaliseForFingerprint(sent))).toEqual([]);
   });
 });
 
