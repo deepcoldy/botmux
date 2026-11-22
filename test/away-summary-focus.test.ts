@@ -12,12 +12,13 @@ import {
   AWAY_SUMMARY_SUGGESTION_WAIT_MS,
   AwaySummaryFocus,
   awaySummaryFocusRefusal,
+  type AwaySummaryFocusDeps,
   FOCUS_IN,
   FOCUS_OUT,
 } from '../src/services/away-summary-focus.js';
 import type { PromptCacheKeepaliveRefusal } from '../src/core/unattended-input-refusal.js';
 
-function terminal() {
+function terminal(over: Partial<AwaySummaryFocusDeps> = {}) {
   const written: string[] = [];
   const logs: string[] = [];
   const state = {
@@ -41,6 +42,7 @@ function terminal() {
       return true;
     },
     log: message => { logs.push(message); },
+    ...over,
   });
   return { focus, written, logs, state };
 }
@@ -138,6 +140,16 @@ describe('reporting the terminal unfocused', () => {
     vi.advanceTimersByTime(AWAY_SUMMARY_SUGGESTION_WAIT_MS);
     expect(t.written).toEqual([]);
   });
+
+  it('accepts a folded turn whose recap identity differs from the screen-owning host', () => {
+    const t = terminal({
+      currentTurnId: () => 'om_host',
+      recapTurnId: () => 'om_folded',
+    });
+    t.focus.noteSuggestion('om_folded');
+    t.focus.request('om_folded');
+    expect(t.written).toEqual([FOCUS_OUT]);
+  });
 });
 
 describe('reporting focus back', () => {
@@ -149,7 +161,7 @@ describe('reporting focus back', () => {
     return t;
   }
 
-  it.each(['message', 'raw_input', 'tui_keys', 'tui_text_input', 'inject_command', 'prompt_cache_keepalive', 'term_action', 'interrupt_turn', 'rename_session'])(
+  it.each(['message', 'raw_input', 'tui_keys', 'tui_text_input', 'inject_command', 'prompt_submitted', 'term_action', 'interrupt_turn', 'rename_session'])(
     'before %s input is handled', type => {
       const t = blurred();
       t.focus.beforeDaemonMessage(type);
@@ -167,18 +179,67 @@ describe('reporting focus back', () => {
     expect(t.written).toEqual([FOCUS_OUT]);
   });
 
+  it('defers prompt-cache keepalive instead of consuming the active recap', () => {
+    const alreadyBlurred = blurred();
+    alreadyBlurred.focus.beforeDaemonMessage('prompt_cache_keepalive');
+    expect(alreadyBlurred.written).toEqual([FOCUS_OUT]);
+    expect(alreadyBlurred.focus.isBlurred).toBe(true);
+
+    const stillWaiting = terminal();
+    stillWaiting.focus.request('om_turn1');
+    stillWaiting.focus.beforeDaemonMessage('prompt_cache_keepalive');
+    vi.advanceTimersByTime(AWAY_SUMMARY_SUGGESTION_WAIT_MS);
+    expect(stillWaiting.written).toEqual([FOCUS_OUT]);
+  });
+
   it('once the summary is written, or when the CLI starts a turn of its own', () => {
     const summary = blurred();
-    summary.focus.observeTranscript([{ type: 'file-history-snapshot' }, { type: 'system', subtype: 'turn_duration' }]);
+    summary.focus.noteRecap(undefined);
     expect(summary.written).toEqual([FOCUS_OUT]);
-    summary.focus.observeTranscript([{ type: 'system', subtype: 'away_summary', content: 'You were …' }]);
+    summary.focus.noteRecap({ turnId: 'om_turn1' });
     expect(summary.written).toEqual([FOCUS_OUT, FOCUS_IN]);
 
     const ownTurn = blurred();
-    ownTurn.focus.observeTranscript([{ type: 'user', isMeta: true, message: { content: '<local-command-caveat>' } }, { type: 'assistant', isSidechain: true }]);
-    expect(ownTurn.written).toEqual([FOCUS_OUT]);
-    ownTurn.focus.observeTranscript([{ type: 'attachment', attachment: { type: 'queued_command' } }]);
+    ownTurn.focus.noteCliTurnStarted();
     expect(ownTurn.written).toEqual([FOCUS_OUT, FOCUS_IN]);
+  });
+
+  it('cancels a waiting request only for a recap accepted for that same turn', () => {
+    const accepted = terminal();
+    accepted.focus.request('om_turn1');
+    accepted.focus.noteRecap({ turnId: 'om_turn1' });
+    vi.advanceTimersByTime(AWAY_SUMMARY_SUGGESTION_WAIT_MS * 2);
+    expect(accepted.written).toEqual([]);
+    expect(accepted.focus.isBlurred).toBe(false);
+
+    // An older turn's late away_summary is rejected by CliRecapObserver and
+    // must not consume this turn's request.
+    const stale = terminal();
+    stale.focus.request('om_turn1');
+    stale.focus.noteRecap(undefined);
+    vi.advanceTimersByTime(AWAY_SUMMARY_SUGGESTION_WAIT_MS);
+    expect(stale.written).toEqual([FOCUS_OUT]);
+
+    const otherTurn = terminal();
+    otherTurn.focus.request('om_turn1');
+    otherTurn.focus.noteRecap({ turnId: 'om_previous' });
+    vi.advanceTimersByTime(AWAY_SUMMARY_SUGGESTION_WAIT_MS);
+    expect(otherTurn.written).toEqual([FOCUS_OUT]);
+  });
+
+  it('cancels waiting only on the bridge-confirmed start of a new CLI turn', () => {
+    // Late assistant/tool-result records from the requested turn do not emit
+    // this signal, so they cannot consume a valid request.
+    const lateSameTurn = terminal();
+    lateSameTurn.focus.request('om_turn1');
+    vi.advanceTimersByTime(AWAY_SUMMARY_SUGGESTION_WAIT_MS);
+    expect(lateSameTurn.written).toEqual([FOCUS_OUT]);
+
+    const freshTurn = terminal();
+    freshTurn.focus.request('om_turn1');
+    freshTurn.focus.noteCliTurnStarted();
+    vi.advanceTimersByTime(AWAY_SUMMARY_SUGGESTION_WAIT_MS * 2);
+    expect(freshTurn.written).toEqual([]);
   });
 
   it('when someone opens the web terminal', () => {

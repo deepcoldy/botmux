@@ -52,7 +52,7 @@ export const AWAY_SUMMARY_BLUR_MAX_MS = 5 * 60_000;
  * focus is reported back before they are handled. */
 const INPUT_MESSAGE_TYPES: ReadonlySet<string> = new Set([
   'message', 'raw_input', 'tui_keys', 'tui_text_input', 'inject_command',
-  'prompt_cache_keepalive', 'rename_session', 'term_action', 'interrupt_turn',
+  'prompt_submitted', 'rename_session', 'term_action', 'interrupt_turn',
   'coco_drive_picker', 'codex_cli_effort',
 ]);
 
@@ -93,6 +93,9 @@ export interface AwaySummaryFocusDeps {
   refusal(): PromptCacheKeepaliveRefusal | undefined;
   /** The turn whose input the CLI was last given. */
   currentTurnId(): string | undefined;
+  /** The same turn after folded type-ahead attribution: a completed B folded
+   *  into screen-owning A owns the recap even though currentTurnId remains A. */
+  recapTurnId?(): string | undefined;
   /** Someone has the web terminal open: they are not away. */
   watched(): boolean;
   /** Writes the bytes to the CLI's terminal; false when they could not be. */
@@ -117,6 +120,12 @@ export class AwaySummaryFocus {
     return !!this.blurred;
   }
 
+  /** A recap is being waited on or the terminal is blurred for it. Keepalive
+   *  must wait for this stretch rather than consume the one-shot request. */
+  get isActive(): boolean {
+    return !!this.waiting || !!this.blurred;
+  }
+
   /** The daemon asks for an away summary of `turn` (its last card settled and
    * the bot has the switch on). */
   request(turnId: string): void {
@@ -138,23 +147,25 @@ export class AwaySummaryFocus {
     if (INPUT_MESSAGE_TYPES.has(type)) this.restore(type);
   }
 
-  /** Newly drained transcript records: the summary written, or the CLI
-   * running a turn of its own, ends the blurred stretch. */
-  observeTranscript(events: readonly unknown[]): void {
-    if (!this.blurred) return;
-    for (const event of events) {
-      const record = event as { type?: unknown; subtype?: unknown; isSidechain?: unknown; isMeta?: unknown } | null;
-      if (!record || record.isSidechain === true) continue;
-      if (record.type === 'system' && record.subtype === 'away_summary') {
-        this.restore('summary written');
-        return;
-      }
-      if (record.type === 'assistant' || (record.type === 'user' && record.isMeta !== true)
-        || record.type === 'attachment') {
-        this.restore('the CLI started a turn');
-        return;
-      }
+  /** The recap observer accepted a summary for a specific turn. Only that
+   *  attribution may finish a request: an older turn's late away_summary is
+   *  not evidence about this one. */
+  noteRecap(recap: { turnId: string } | undefined): void {
+    if (!recap) return;
+    if (this.waiting?.turnId === recap.turnId) {
+      this.deps.log(`[away-summary] ${label(recap.turnId)}: skipped, the summary is already written`);
+      this.cancelWait();
     }
+    if (this.blurred?.turnId === recap.turnId) this.restore('summary written');
+  }
+
+  /** The bridge proved that the CLI went busy from idle: a new local/scheduled
+   *  turn, not a late record from the turn whose recap is being awaited. */
+  noteCliTurnStarted(): void {
+    if (this.waiting) {
+      this.deps.log(`[away-summary] ${label(this.waiting.turnId)}: skipped, the CLI started a newer turn`);
+    }
+    this.restore('the CLI started a turn');
   }
 
   /** Reports focus back (when botmux had reported it away) and drops any
@@ -197,7 +208,7 @@ export class AwaySummaryFocus {
     const waiting = this.waiting;
     if (!waiting) return;
     const { turnId } = waiting;
-    const current = this.deps.currentTurnId();
+    const current = this.deps.recapTurnId ? this.deps.recapTurnId() : this.deps.currentTurnId();
     if (current !== undefined && current !== turnId) {
       this.deps.log(`[away-summary] ${label(turnId)}: skipped, a newer turn has the CLI`);
       this.cancelWait();

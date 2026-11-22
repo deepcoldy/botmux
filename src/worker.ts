@@ -10133,6 +10133,20 @@ const emittedRateLimitUuids = new Set<string>();
 /** Claude Code's away summaries (「本轮回顾」), forwarded once each for the
  *  turn they recap. */
 const cliRecapObserver = new CliRecapObserver();
+/** The turn that owns both the away-summary focus request and its transcript
+ *  attribution. A completed type-ahead B folded into screen-owning A recaps B. */
+function currentRecapTurn(): { turnId?: string; dispatchAttempt?: number } {
+  return promptSuggestionReportTurn(
+    { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
+    foldedTypeAheadTurn,
+    turnTerminalEmitted,
+  );
+}
+function observeCurrentCliRecap(events: readonly unknown[]) {
+  const recap = cliRecapObserver.observe(events, currentRecapTurn(), Date.now());
+  awaySummaryFocus.noteRecap(recap);
+  return recap;
+}
 /** With the bot's switch on, tells Claude Code its terminal lost focus once a
  *  turn is over so that it writes its away summary, and reports focus back as
  *  soon as anything else happens (services/away-summary-focus.ts). */
@@ -10145,6 +10159,7 @@ const awaySummaryFocus = new AwaySummaryFocus({
   },
   refusal: () => unattendedRawInputRefusal({ requireSafeComposer: true })?.refusal,
   currentTurnId: () => currentBotmuxTurnId,
+  recapTurnId: () => currentRecapTurn().turnId,
   watched: () => wsClients.size > 0,
   write: bytes => {
     if (!backend) return false;
@@ -12336,6 +12351,7 @@ function bridgeReadPosition(): BridgeReadPosition {
  *  no fingerprint fallback to find their transcript either. */
 function noteClaudeBridgeTurnStarted(): void {
   if (!bridgeJsonlPath) return;
+  awaySummaryFocus.noteCliTurnStarted();
   bridgeBlindTurnWatch.noteTurnStarted(bridgeReadPosition(), Date.now());
 }
 
@@ -12972,10 +12988,8 @@ function bridgeIngest(): void {
   // the TUI. The queue already skips it as an assistant reply.
   maybeEmitStructuredRateLimit(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
-  const cliRecap = cliRecapObserver.observe(result.events,
-    { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt }, Date.now());
+  const cliRecap = observeCurrentCliRecap(result.events);
   if (cliRecap) send({ type: 'cli_recap', ...cliRecap });
-  awaySummaryFocus.observeTranscript(result.events);
   claudeTranscriptTurnEnd.observe(result.events);
   if (claudeTranscriptTurnEnd.endedForMs() !== undefined) scheduleStaleProgramStatusCheck();
   // Transcript terminal markers are authoritative and may settle a durable
@@ -41522,6 +41536,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
 
+    case 'away_summary_focus_cancel': {
+      // The bot switch was turned off after this worker received a request.
+      // restore() is a no-op (and writes nothing) when no focus-out was made.
+      awaySummaryFocus.restore('replyCardRecap off');
+      break;
+    }
+
     case 'kimi_cache_expiry_auto_compact': {
       kimiCacheExpiryAutoCompact = msg.enabled === true;
       log(`Kimi cache-expiry auto-compact ${kimiCacheExpiryAutoCompact ? 'on' : 'off'}`);
@@ -41529,6 +41550,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'prompt_cache_keepalive': {
+      // Do not consume the one-shot away summary. The daemon clears this
+      // refused attempt and a later 60s sweep retries after the recap settles.
+      if (awaySummaryFocus.isActive) {
+        send({ type: 'prompt_cache_keepalive_result', injected: false, reason: 'away_summary_pending' });
+        log('Prompt-cache keep-alive deferred while an away summary is pending');
+        break;
+      }
       // Claude Code prompt-cache keep-alive (core/prompt-cache-keepalive.ts).
       // Only into a CLI that is quietly idle AND visibly sitting in its real
       // composer: a permission dialog / AskUserQuestion picker also reads as

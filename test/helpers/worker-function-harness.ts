@@ -75,7 +75,7 @@ const TRAEX_QUESTION_FUNCTIONS = [
  *  a function); a caller that observes it passes its own in `scope`. */
 const INERT_TRAEX_QUESTION_BRIDGE = { kick() {}, reset() {}, hasOpenCard: () => false, dispose() {} };
 /** The worker's away-summary focus controller, doing nothing unless a test supplies its own. */
-const INERT_AWAY_SUMMARY_FOCUS = { request() {}, noteSuggestion() {}, beforeDaemonMessage() {}, observeTranscript() {}, restore() {}, reset() {}, isBlurred: false };
+const INERT_AWAY_SUMMARY_FOCUS = { request() {}, noteSuggestion() {}, beforeDaemonMessage() {}, noteRecap() {}, noteCliTurnStarted() {}, restore() {}, reset() {}, isBlurred: false, isActive: false };
 
 let parsed: ts.SourceFile | undefined;
 

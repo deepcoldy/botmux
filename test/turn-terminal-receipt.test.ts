@@ -109,6 +109,7 @@ import {
   __testOnly_setSuspendBackingVerifier,
   recordTurnExplicitMention,
   ensureOrdinaryTurnRecoveryAttached,
+  setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { beginOrdinaryTurnRecovery, disposeOrdinaryTurnRecovery } from '../src/services/ordinary-turn-recovery.js';
 import { beginFinalOutputDelivery, waitForFinalOutputDeliveryDrain } from '../src/core/final-output-delivery-drain.js';
@@ -118,6 +119,7 @@ import { getMessageDetail, updateMessage, resolveCardKitId, patchCardStreamEleme
 import { nextStepIdle, noteNextStepTurnStarted } from '../src/core/next-step-suggestion.js';
 import { nextStepIo } from '../src/core/next-step-io.js';
 import { recapIdle } from '../src/core/turn-recap-state.js';
+import { notifyAwaySummaryFocusRevoked } from '../src/services/away-summary-focus-revocation.js';
 import { claudeAwaySummaryText } from '../src/services/turn-recap.js';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -440,6 +442,22 @@ describe('independent turn terminal receipt', () => {
     expect(requests).toEqual(asked ? [{ type: 'away_summary_focus', turnId: 'om_turn_away' }] : []);
     // Nothing goes on the card until the CLI writes the recap.
     expect(insertCardElements).not.toHaveBeenCalled();
+  });
+
+  it('broadcasts a committed recap revocation through the active-session registry', () => {
+    const target = makeDs();
+    (target.worker as any).connected = true;
+    const otherBot = makeDs();
+    otherBot.larkAppId = 'app_other';
+    (otherBot.worker as any).connected = true;
+    setActiveSessionsRegistry(new Map([['target', target], ['other', otherBot]]));
+    try {
+      notifyAwaySummaryFocusRevoked('app_test');
+      expect((target.worker as any).send).toHaveBeenCalledWith({ type: 'away_summary_focus_cancel' });
+      expect((otherBot.worker as any).send).not.toHaveBeenCalled();
+    } finally {
+      setActiveSessionsRegistry(undefined);
+    }
   });
 
   /** A Claude Code session as the daemon runs it: ordinary-turn recovery is
