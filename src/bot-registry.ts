@@ -2443,8 +2443,14 @@ export interface BotConfig {
   /**
    * Per-bot opt-in for the collapsed「本轮回顾」panel above the last reply
    * card's footer, holding the CLI's own recap of the turn (Claude Code's
-   * transcript away summary). A turn the CLI does not recap gets no panel.
-   * Default (undefined) keeps reply cards unchanged.
+   * transcript away summary). In Claude Code sessions botmux also gets that
+   * recap written: once a turn's last card settled and the CLI sits idle at an
+   * empty input box, it reports the terminal unfocused (Claude Code writes its
+   * away summary only then, about 3 minutes after the turn) and reports focus
+   * back on the next input, a web terminal opening, or the summary landing —
+   * one extra background model call per recapped turn. A turn the CLI does
+   * not recap, and every other CLI, gets no panel. Default (undefined) keeps
+   * reply cards unchanged.
    */
   replyCardRecap?: boolean;
   /**

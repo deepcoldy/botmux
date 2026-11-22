@@ -415,6 +415,33 @@ describe('independent turn terminal receipt', () => {
     expect(replaced[6]).toBe('om_answer_card');
   });
 
+  it.each([
+    ['switch on, Claude Code', true, 'claude-code', true],
+    ['switch off, Claude Code', false, 'claude-code', false],
+    ['switch on, another CLI', true, 'codex', false],
+  ] as const)('asks the worker to let the CLI recap the turn once its card settles (%s)', async (_label, recap, cliId, asked) => {
+    Object.assign(botConfig, { replyCardRecap: recap });
+    const ds = makeDs();
+    ds.initConfig = { cliId } as any;
+    (ds.worker as any).connected = true;
+    bindLarkTurn(ds, 'om_turn_away');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed', turnId: 'om_turn_away', messageId: 'om_answer_card',
+      responseKind: 'final', terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    await deliver(ds, terminalMsg('om_turn_away'));
+    // A replayed terminal for the same turn.
+    await deliver(ds, terminalMsg('om_turn_away'));
+    await settle(ds);
+    await recapIdle(ds);
+    const requests = vi.mocked((ds.worker as any).send).mock.calls.map((call: any[]) => call[0])
+      .filter((msg: any) => msg?.type === 'away_summary_focus');
+    expect(requests).toEqual(asked ? [{ type: 'away_summary_focus', turnId: 'om_turn_away' }] : []);
+    // Nothing goes on the card until the CLI writes the recap.
+    expect(insertCardElements).not.toHaveBeenCalled();
+  });
+
   /** A Claude Code session as the daemon runs it: ordinary-turn recovery is
    * attached and tracks every admitted turn (recordAdmittedOrdinaryUserTurn). */
   function claudeSessionTrackingTurn(turnId: string, override: Record<string, unknown> = {}): DaemonSession {

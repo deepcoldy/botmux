@@ -16,6 +16,7 @@
  * worker globals it reads; renaming either fails loudly (missing function /
  * undefined read), never silently green.
  */
+import { awaySummaryFocusRefusal } from '../../src/services/away-summary-focus.js';
 import { paneReplyDeliveryFromProcessTree } from '../../src/services/pane-reply-delivery.js';
 import { REPLY_DELIVERY_ENV } from '../../src/services/send-completion-hint.js';
 import { randomUUID } from 'node:crypto';
@@ -73,6 +74,8 @@ const TRAEX_QUESTION_FUNCTIONS = [
 /** Inert stand-in for the worker's TraexQuestionBridge instance (a const, not
  *  a function); a caller that observes it passes its own in `scope`. */
 const INERT_TRAEX_QUESTION_BRIDGE = { kick() {}, reset() {}, hasOpenCard: () => false, dispose() {} };
+/** The worker's away-summary focus controller, doing nothing unless a test supplies its own. */
+const INERT_AWAY_SUMMARY_FOCUS = { request() {}, noteSuggestion() {}, beforeDaemonMessage() {}, observeTranscript() {}, restore() {}, reset() {}, isBlurred: false };
 
 let parsed: ts.SourceFile | undefined;
 
@@ -231,6 +234,8 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'resolveAntigravitySpawnStoreOptions') return resolveAntigravitySpawnStoreOptions;
     if (key === 'drainAntigravityTranscript') return drainAntigravityTranscript;
     if (key === 'traexQuestionBridge') return INERT_TRAEX_QUESTION_BRIDGE;
+    if (key === 'awaySummaryFocus') return INERT_AWAY_SUMMARY_FOCUS;
+    if (key === 'awaySummaryFocusRefusal') return awaySummaryFocusRefusal;
     if (typeof key === 'string' && ['retireAntigravityBridgeTurn', 'rebindAntigravityBridgeTurn', 'warnPromptReadySkipped', 'cancelTurnTerminalReadyRecovery', 'recoverDeferredPromptReadyAtTurnTerminal', 'markPromptReadyFromBusyProbe', 'traexNativeStartupInputIsPending', 'readinessTrackedInput', 'invalidatePromptReadinessEvidence', 'revokePromptReadiness', 'codexAppRuntimeTypeAheadReady', 'sessionEventMetadata', 'bindSessionObservation', 'bindSessionPhysicalObservation', 'bindSessionExecutionEvent', 'restoreCodexAppContractNativeSession', 'spawnCliBody', 'setCaptureIdentity', 'cotEntryWithoutSentinel', 'clearCodexAppInterruptTarget', 'publishAppliedReasoningSelection', 'publishNativeReasoningFooter', 'publishNativeReasoningObservation', 'notifyTraexCatalogEmpty', 'admitTraexCatalogModelBeforeInput', 'requeueUnsubmittedQueuedActivation', 'prepareAntigravityAccountsCredentialMask', 'reconcileAntigravitySpawnAccount', 'confirmAntigravitySpawnAccount', ...TRAEX_QUESTION_FUNCTIONS, ...FAILED_TURN_REWIND_FUNCTIONS].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);
