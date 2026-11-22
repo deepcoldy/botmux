@@ -94,7 +94,7 @@ pane 脚本还要做三件事：
 - 禁止在热路径上用 `terminal.send`/`keys`。
 - 能证明输入没被接受时（未连接、终端已结束、socket 写失败）返回 false，供 `critical-control-key.ts` 重试。终端的结束由 core 主动推送（CLOSE 帧或 `finished` 事件），收到之后的一切写入与粘贴都返回 false、不发出，对应 tmux 写前拒绝死 pane（#3580/#3610）。
 - `submitBracketedPaste` 的回车单独写入，与 TmuxPipeBackend 相同：Codex（crossterm）在边沿触发下每次只读 1024 字节，帧恰好填满一次读取时，同一次 pty 写入里的回车留在 tty 里直到下一次按键。hc 把每个输入帧到达 holder 时各写一次 pty，但两个背靠背的帧仍可能落进同一次读取（实测 Codex 0.167.0 下 9 个边界长度仍有 4 个滞留），所以回车等 core 应答同一连接上帧之后的一次往返（`terminal.get`）再发：core 先转发输入帧、再处理后续请求。这相当于 tmux 两次客户端调用之间的那一次往返；期间写入的输入排在回车之后。
-  - 等待中本端 detach（`kill()`，终端继续运行，如 worker 随父进程退出）：回车与排在它后面的输入（如 `/stop` 已返回 true 的 C-c）在关闭 stream 之前按顺序立即写出。没有那次往返，回车可能与粘贴落进同一次读取，但仍会提交；丢掉则粘贴留在输入框里。
+  - 等待中本端 detach（`kill()`，终端继续运行，如 worker 随父进程退出）：回车与排在它后面的输入（如 `/stop` 已返回 true 的 C-c）在关闭 stream 之前按顺序立即写出。没有那次往返，回车可能与粘贴落进同一次读取，但仍会提交；丢掉则粘贴留在输入框里。已知限制：写出的字节若超过 socket 发送缓冲（约 200 KiB 的粘贴），detach 后 worker 紧接着 `process.exit`，未发出的部分连同粘贴一起丢失；只在这样的大粘贴恰好碰上 worker 退出的几毫秒内发生，修它需要让 worker 公共关停路径在退出前等 socket 写空。
   - 等待中连接断开：回车与排在它后面的输入随连接丢弃（已返回 true），之后的 detach 也不补发，由 worker 的回执与原生 history 判定是否送达。不经新连接补发：粘贴帧可能已经到达，单独补一个回车可能提交别人此后输入的草稿。
 
 **尺寸**
@@ -293,7 +293,7 @@ stream.onData((chunk, { paint, firstPaint, paintDone }) => {
 - 之后出现的 paint（积压丢弃或 `hc read` 滚动读取后的 history=0 重绘）也用 `writePaint`：它替换屏幕，但不把旧屏推进 scrollback。
 - `ScreenMirror` 的 `write`/`writePaint` 同步解析。它提供：
   - 与 TmuxPipeBackend 同形的读取方法：`captureCurrentScreen`、`captureViewport`、`viewportText`（对应 `captureViewportAsync`）、`viewportCells`（对应 `captureViewportCells`）、`captureInputState`、`capturePaneInputModes`、`size()`；
-  - `-e` 形态的行尾与 tmux 2.8–3.6a 一致。tmux（`grid_string_cells`）逐 cell 输出（擦除的 cell 输出为空格），属性变化处写 SGR，最后裁掉文本末尾的空格，所以只保留到一行最后一次属性变化为止的空白：后面还有默认 cell 的反显光标、带底色的状态条、带颜色擦除的 cell 保留并在其后复位；延伸到最后一列的带样式空白（整行底色条、最后一列的反显光标）整段去掉；
+  - `-e` 形态的行尾与 tmux 2.8–3.6a 一致。tmux（`grid_string_cells`）逐 cell 输出（擦除的 cell 输出为空格），属性变化处写 SGR，最后裁掉文本末尾的空格，所以只保留到一行最后一次属性变化为止的空白：后面还有默认 cell 的反显光标、带底色的状态条、带颜色擦除的 cell 保留并在其后复位；延伸到最后一列的带样式空白（整行底色条、最后一列的反显光标）整段去掉；已知不一致：tmux 的行分配按 1/4、1/2、整宽三档增长，落在已分配末格的带样式空白也会被 tmux 裁掉，镜像保留（取决于该行历史，不模拟）；宽字符折行留下的最后一格、ICH 插入的格，xterm 与 tmux 填的属性不同。随机差分（tmux 3.5a，160 列）每 2000 行不一致 0–2 行，旧序列化器为 51–71 行；没有找到会因此判断出错的消费方；
   - 模式 getter：`applicationCursorKeys`、`applicationKeypad`、`bracketedPaste`、`altScreen`；
   - `HC_MIRROR_SCROLLBACK_LINES = 3000` 行 scrollback：160 列下每会话约 10 MB（50 000 行约 140 MB）。hc 自己只留 `history_mb = 5`（约 3 600 行），attach 的首帧仍能填满它；web 端从实时输出继续增长自己的 scrollback。
 - 尺寸：

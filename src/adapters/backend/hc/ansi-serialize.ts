@@ -52,9 +52,12 @@ const DEFAULT_PEN: Pen = { fg: 0, bg: 0, flags: 0 };
  * text. So blanks, styled or not, survive up to the row's last attribute
  * change, which the sequence after them protects: a reverse-video cursor
  * followed by default cells is kept, one in the last column is not, and a
- * background bar that reaches the margin goes entirely. The allocation always
- * reaches past the last cell written or erased with a colour, or to the
- * margin, so reading the whole row finds the same changes.
+ * background bar that reaches the margin goes entirely. tmux grows a row's
+ * allocation only in steps (a quarter, half, all of the width), so a styled
+ * blank in the last allocated cell is trimmed there too; that depends on the
+ * row's history and is not modelled. Nor are cells xterm and tmux fill with
+ * different attributes (the margin cell a wide character wraps past, cells
+ * ICH inserts): there xterm sees a change tmux does not.
  *
  * Unlike tmux the pen is reset before every line ending, so replaying the
  * text never paints a coloured background into the row a scroll opens.
