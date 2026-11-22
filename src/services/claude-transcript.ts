@@ -1915,13 +1915,32 @@ export function stringifyUserContent(content: unknown): string {
 }
 
 /**
- * Collapse whitespace + trim. Same normalisation applied on both sides
- * of the fingerprint compare (the Lark message that produces the
- * fingerprint, and the transcript user content we search through),
- * so newlines / tabs / double-spaces don't break the match.
+ * Collapse whitespace + trim. This is the stable identity normalisation used
+ * when a Lark mark or a persisted fingerprint/hash is created. Keep literal
+ * backslashes significant: removing them here would make distinct inputs
+ * collide and would make pre-upgrade journal entries impossible to migrate
+ * (their line breaks have already been collapsed to spaces).
  */
 export function normaliseForFingerprint(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Normalisation candidates for TEXT READ BACK FROM A CLAUDE TRANSCRIPT.
+ * The first candidate is always the legacy identity above. The second drops
+ * at most one backslash immediately before each LF/CRLF, tolerating the
+ * soft-newline marker that Ink sometimes leaves behind in paste-burst mode.
+ *
+ * The second candidate is comparison-only: never use it to create a mark, a
+ * persisted hash, or full-content consumption evidence. In particular, a
+ * genuine line-ending backslash remains significant in the first candidate,
+ * while N genuine backslashes plus one residual marker still normalise back
+ * to N in the second.
+ */
+export function normaliseTranscriptFingerprintCandidates(s: string): string[] {
+  const legacy = normaliseForFingerprint(s);
+  const withoutSoftNewlineResidue = normaliseForFingerprint(s.replace(/\\(?=\r?\n)/g, ''));
+  return withoutSoftNewlineResidue === legacy ? [legacy] : [legacy, withoutSoftNewlineResidue];
 }
 
 /**
@@ -2111,8 +2130,8 @@ export function jsonlContainsFingerprint(
     } else {
       continue;
     }
-    const normalisedText = normaliseForFingerprint(lineText);
-    if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) return true;
+    if (normaliseTranscriptFingerprintCandidates(lineText)
+      .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
   }
   return false;
 }
@@ -2208,8 +2227,8 @@ function jsonlTailMatchFingerprint(
         } else {
           continue;
         }
-        const normalisedText = normaliseForFingerprint(text);
-        if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
+        if (normaliseTranscriptFingerprintCandidates(text)
+          .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
           hit = true;
           break;
         }
@@ -2372,8 +2391,7 @@ export function findJsonlsContainingExactContent(
           } else {
             continue;
           }
-          const normalised = normaliseForFingerprint(raw);
-          if (normalised === normalisedContent) {
+          if (normaliseTranscriptFingerprintCandidates(raw).includes(normalisedContent)) {
             hit = true;
             break;
           }
