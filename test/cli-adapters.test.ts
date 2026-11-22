@@ -4986,6 +4986,16 @@ describe('traex/coco sandbox authPaths', () => {
     ]);
   });
 
+  it('antigravity terminal and ACP adapters share ~/.gemini/config/mcp_config.json', () => {
+    const terminal = createAntigravityAdapter('/bin/agy');
+    const acp = createCliAdapterSync('antigravity', '/bin/agy', { antigravityTransport: 'acp' });
+    expect(terminal.mcpGateway).toEqual({
+      configPath: '~/.gemini/config/mcp_config.json',
+      format: 'antigravity-json',
+    });
+    expect(acp.mcpGateway).toEqual(terminal.mcpGateway);
+  });
+
   it('coco keeps ~/.trae/cli + ~/.cache/coco real (RW) and exposes the same migration markers READ-ONLY', () => {
     // Coco runs the same traecli binary as traex → same migration prompt; markers
     // exposed read-only, authPaths NOT widened past cli/ (+ the coco cache the

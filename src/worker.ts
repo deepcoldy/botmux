@@ -311,7 +311,7 @@ import {
   upsertScheduledTaskAnchor,
 } from './services/bridge-scheduled-anchors.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
-import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import { defaultGatewayEntry, ensureEffectiveHomeGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
   pinSessionMcpGatewaySocketRoot,
@@ -32717,6 +32717,10 @@ async function spawnCliBody(
     let antigravitySpawnStoreOptions: AntigravityAccountStoreOptions | undefined;
     if (cfg.cliId === 'antigravity' && !willReattachPersistent && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
       const effectiveChildEnv = { ...spawnEnvPlan.childEnv, ...spawnEnvPlan.injectEnv };
+      if (hasMcpRuntimeEntries) {
+        const report = ensureEffectiveHomeGatewayEntry(cliAdapter, effectiveChildEnv.HOME);
+        if (report?.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+      }
       antigravitySpawnStoreOptions = resolveAntigravitySpawnStoreOptions({
         effectiveHome: effectiveChildEnv.HOME,
         botmuxConfigDir: configuredBotmuxHome,

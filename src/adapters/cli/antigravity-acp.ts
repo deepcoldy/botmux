@@ -16,6 +16,10 @@ export function createAntigravityAcpAdapter(pathOverride?: string): CliAdapter {
   const executable = (): string => (nativeBin ??= resolveCommandReal(pathOverride ?? 'agy'));
   return {
     id: 'antigravity',
+    mcpGateway: {
+      configPath: '~/.gemini/config/mcp_config.json',
+      format: 'antigravity-json',
+    },
     resolvedBin: process.execPath,
     authPaths: ['~/.gemini'],
     sandboxExtraExecPaths: () => [executable()],

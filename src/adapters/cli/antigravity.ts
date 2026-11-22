@@ -497,6 +497,10 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   };
   return {
     id: 'antigravity',
+    mcpGateway: {
+      configPath: '~/.gemini/config/mcp_config.json',
+      format: 'antigravity-json',
+    },
     bridgeSpec: antigravityBridgeSpec,
     // Whole ~/.gemini (oauth + antigravity-cli brain transcripts + history):
     // a directory-level readWrite bind under the sandbox so the host daemon

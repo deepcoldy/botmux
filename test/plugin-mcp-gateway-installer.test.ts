@@ -1,11 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
-import { ensureGatewayEntry, inspectGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
+import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
+import { createAntigravityAcpAdapter } from '../src/adapters/cli/antigravity-acp.js';
+import {
+  ensureEffectiveHomeGatewayEntry,
+  ensureGatewayEntry,
+  inspectGatewayEntry,
+} from '../src/core/plugins/mcp/gateway-installer.js';
 import {
   MCP_GATEWAY_FORWARDED_ENV_KEYS,
   MCP_GATEWAY_OWNER_ENV,
@@ -331,6 +337,153 @@ describe('plugin MCP Gateway installer', () => {
       expect(ensureGatewayEntry(adapter).state).toBe('unchanged');
       expect(inspectGatewayEntry(adapter).state).toBe('configured');
     }
+  });
+
+  it('installs one shared Antigravity gateway entry for terminal and ACP without unexpanded env literals', () => {
+    const path = join(home, '.gemini', 'config', 'mcp_config.json');
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      mcpServers: { keep: { command: '/bin/keep', args: ['--ok'], disabled: false } },
+      customTopLevel: true,
+    }));
+    const terminal = createAntigravityAdapter('/bin/agy');
+    const acp = createAntigravityAcpAdapter('/bin/agy');
+
+    expect(ensureGatewayEntry(terminal, {
+      command: join(home, '.botmux', 'bin', 'botmux'),
+      args: ['mcp', 'serve'],
+      maxToolTimeoutMs: 900_001,
+    }).state).toBe('installed');
+    expect(ensureGatewayEntry(acp, {
+      command: join(home, '.botmux', 'bin', 'botmux'),
+      args: ['mcp', 'serve'],
+      maxToolTimeoutMs: 900_001,
+    }).state).toBe('unchanged');
+    expect(inspectGatewayEntry(terminal).state).toBe('configured');
+    expect(inspectGatewayEntry(acp).state).toBe('configured');
+
+    const installed = JSON.parse(readFileSync(path, 'utf8'));
+    expect(installed.customTopLevel).toBe(true);
+    expect(installed.mcpServers.keep).toEqual({ command: '/bin/keep', args: ['--ok'], disabled: false });
+    expect(installed.mcpServers.botmux).toEqual({
+      args: ['mcp', 'serve'],
+      command: join(home, '.botmux', 'bin', 'botmux'),
+      disabled: false,
+      env: {
+        [MCP_GATEWAY_OWNER_ENV]: '1',
+      },
+      timeoutSeconds: 901,
+    });
+    for (const key of MCP_GATEWAY_FORWARDED_ENV_KEYS) {
+      expect(installed.mcpServers.botmux.env).not.toHaveProperty(key);
+    }
+  });
+
+  it('initializes a 0-byte Antigravity mcp_config.json created by CLI migration', () => {
+    const terminal = createAntigravityAdapter('/bin/agy');
+    const path = join(home, '.gemini', 'config', 'mcp_config.json');
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, '');
+
+    expect(inspectGatewayEntry(terminal).state).toBe('absent');
+    expect(ensureGatewayEntry(terminal).state).toBe('installed');
+    expect(inspectGatewayEntry(terminal).state).toBe('configured');
+  });
+
+  it('accepts CLI-reordered Antigravity keys without rewriting and repairs disabled or unowned entries', () => {
+    const terminal = createAntigravityAdapter('/bin/agy');
+    const path = join(home, '.gemini', 'config', 'mcp_config.json');
+    expect(ensureGatewayEntry(terminal).state).toBe('installed');
+
+    // `agy mcp add other ...` re-serializes maps with Go's key ordering.
+    const cliRewritten = `${JSON.stringify({
+      mcpServers: {
+        botmux: {
+          timeoutSeconds: 600,
+          env: { [MCP_GATEWAY_OWNER_ENV]: '1' },
+          disabled: false,
+          command: process.env.BOTMUX_BIN_PATH,
+          args: ['mcp', 'serve'],
+        },
+        other: { args: ['hi'], command: '/bin/echo', disabled: false },
+      },
+    }, null, 2)}\n`;
+    writeFileSync(path, cliRewritten);
+    expect(inspectGatewayEntry(terminal).state).toBe('configured');
+    expect(ensureGatewayEntry(terminal).state).toBe('unchanged');
+    expect(readFileSync(path, 'utf8')).toBe(cliRewritten);
+
+    // `agy mcp disable botmux` leaves `disabled: true`: must not report configured,
+    // and ensureGatewayEntry must re-enable it while keeping `other`.
+    writeFileSync(path, JSON.stringify({
+      mcpServers: {
+        botmux: {
+          args: ['mcp', 'serve'],
+          command: process.env.BOTMUX_BIN_PATH,
+          disabled: true,
+          env: { [MCP_GATEWAY_OWNER_ENV]: '1' },
+          timeoutSeconds: 600,
+        },
+        other: { args: ['hi'], command: '/bin/echo', disabled: false },
+      },
+    }));
+    expect(inspectGatewayEntry(terminal).state).toBe('absent');
+    expect(ensureGatewayEntry(terminal).state).toBe('installed');
+    expect(inspectGatewayEntry(terminal).state).toBe('configured');
+    expect(JSON.parse(readFileSync(path, 'utf8')).mcpServers.other.command).toBe('/bin/echo');
+
+    // A user-written `botmux` server lacking the Botmux ownership env marker
+    // must report `absent` until `ensureGatewayEntry` claims it.
+    writeFileSync(path, JSON.stringify({
+      mcpServers: {
+        botmux: { args: ['serve'], command: '/usr/local/bin/custom', disabled: false },
+      },
+    }));
+    expect(inspectGatewayEntry(terminal).state).toBe('absent');
+    expect(ensureGatewayEntry(terminal).state).toBe('installed');
+    expect(inspectGatewayEntry(terminal).state).toBe('configured');
+  });
+
+  it('refuses to overwrite malformed Antigravity JSON or non-object mcpServers', () => {
+    const terminal = createAntigravityAdapter('/bin/agy');
+    const path = join(home, '.gemini', 'config', 'mcp_config.json');
+    mkdirSync(dirname(path), { recursive: true });
+
+    for (const malformed of ['{broken', JSON.stringify({ mcpServers: [] })]) {
+      writeFileSync(path, malformed);
+      const inspectReport = inspectGatewayEntry(terminal);
+      expect(inspectReport.state).toBe('adapter-required');
+      expect(inspectReport.warning).toBeTruthy();
+      const ensureReport = ensureGatewayEntry(terminal);
+      expect(ensureReport.state).toBe('adapter-required');
+      expect(ensureReport.warning).toBeTruthy();
+      expect(readFileSync(path, 'utf8')).toBe(malformed);
+    }
+  });
+
+  it('installs into a relocated per-bot HOME only when effectiveHome is a distinct absolute directory', () => {
+    const terminal = createAntigravityAdapter('/bin/agy');
+    expect(ensureEffectiveHomeGatewayEntry(terminal, undefined)).toBeUndefined();
+    expect(ensureEffectiveHomeGatewayEntry(terminal, home)).toBeUndefined();
+    expect(ensureEffectiveHomeGatewayEntry(terminal, realpathSync(home))).toBeUndefined();
+    expect(ensureEffectiveHomeGatewayEntry(terminal, '~/not-expanded')).toBeUndefined();
+    expect(ensureEffectiveHomeGatewayEntry(terminal, 'relative/home')).toBeUndefined();
+
+    const symlinkHome = `${home}-symlink`;
+    symlinkSync(home, symlinkHome);
+    try {
+      expect(ensureEffectiveHomeGatewayEntry(terminal, symlinkHome)).toBeUndefined();
+    } finally {
+      rmSync(symlinkHome, { force: true });
+    }
+
+    const perBotHome = join(home, 'bots', 'bot-a-home');
+    const relocatedReport = ensureEffectiveHomeGatewayEntry(terminal, `  ${perBotHome}  `);
+    expect(relocatedReport?.state).toBe('installed');
+    const relocatedConfig = join(perBotHome, '.gemini', 'config', 'mcp_config.json');
+    expect(relocatedReport?.configPath).toBe(relocatedConfig);
+    expect(JSON.parse(readFileSync(relocatedConfig, 'utf8')).mcpServers.botmux.command).toBe(process.env.BOTMUX_BIN_PATH);
+    expect(ensureEffectiveHomeGatewayEntry(terminal, perBotHome)?.state).toBe('unchanged');
   });
 
 });

@@ -1,10 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { parse as parseToml } from 'smol-toml';
 import type { CliAdapter, McpGatewayInstallSpec } from '../../../adapters/cli/types.js';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
+import { withFileLockSync } from '../../../utils/file-lock.js';
 import { expandHomePath } from '../../../utils/working-dir.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { readMaterializedPlugin } from '../materializer.js';
@@ -269,9 +270,11 @@ function ensureCodexEntry(path: string, entry: GatewayEntry): boolean {
   return true;
 }
 
-function parseJsonConfig(path: string): Record<string, unknown> {
+function parseJsonConfig(path: string, allowEmpty = false): Record<string, unknown> {
   if (!existsSync(path)) return {};
-  const parsed = JSON.parse(readFileSync(path, 'utf-8'));
+  const raw = readFileSync(path, 'utf-8').replace(/^\uFEFF/, '');
+  if (allowEmpty && raw.trim() === '') return {};
+  const parsed = JSON.parse(raw);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid_cli_mcp_json_config');
   return parsed as Record<string, unknown>;
 }
@@ -291,6 +294,21 @@ function gatewayJsonValue(entry: GatewayEntry): Record<string, unknown> {
   };
 }
 
+function antigravityGatewayJsonValue(entry: GatewayEntry): Record<string, unknown> {
+  return {
+    args: entry.args,
+    command: entry.command,
+    disabled: false,
+    env: {
+      // agy inherits the owning CLI process env into stdio MCP servers and does
+      // not expand `${VAR:-}` literals in mcp_config.json, so forwarded session
+      // and socket keys must not be shadowed by placeholder strings here.
+      [MCP_GATEWAY_OWNER_ENV]: '1',
+    },
+    timeoutSeconds: Math.ceil(effectiveMcpGatewayMaxToolTimeoutMs(entry.maxToolTimeoutMs) / 1_000),
+  };
+}
+
 function ensureClaudeEntry(path: string, entry: GatewayEntry): boolean {
   const data = parseJsonConfig(path);
   const servers = data.mcpServers && typeof data.mcpServers === 'object' && !Array.isArray(data.mcpServers)
@@ -304,11 +322,32 @@ function ensureClaudeEntry(path: string, entry: GatewayEntry): boolean {
   return true;
 }
 
+function ensureAntigravityEntry(path: string, entry: GatewayEntry): boolean {
+  // agy's initial migration creates a 0-byte `~/.gemini/config/mcp_config.json`
+  // that `agy mcp list/add` itself treats as empty `{}`; accept whitespace-only
+  // files while still rejecting malformed non-empty JSON or non-object servers.
+  const data = parseJsonConfig(path, true);
+  if (data.mcpServers !== undefined && (!data.mcpServers || typeof data.mcpServers !== 'object' || Array.isArray(data.mcpServers))) {
+    throw new Error('invalid_cli_mcp_json_config');
+  }
+  const servers = (data.mcpServers as Record<string, unknown> | undefined) ?? {};
+  const desired = antigravityGatewayJsonValue(entry);
+  if (isDeepStrictEqual(servers.botmux, desired)) return false;
+  data.mcpServers = { ...servers, botmux: desired };
+  mkdirSync(dirname(path), { recursive: true });
+  atomicWriteFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
+  return true;
+}
+
 function isOwnedJsonEntry(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const env = (value as Record<string, unknown>).env;
   return !!env && typeof env === 'object' && !Array.isArray(env)
     && (env as Record<string, unknown>)[MCP_GATEWAY_OWNER_ENV] === '1';
+}
+
+function isOwnedAntigravityEntry(value: unknown): boolean {
+  return isOwnedJsonEntry(value) && (value as Record<string, unknown>).disabled !== true;
 }
 
 function configPath(spec: McpGatewayInstallSpec): string {
@@ -323,9 +362,22 @@ export function ensureGatewayEntry(
   if (!spec) return { cliId: adapter.id, state: 'adapter-required' };
   const path = configPath(spec);
   try {
-    const changed = spec.format === 'codex-toml'
-      ? ensureCodexEntry(path, entry)
-      : ensureClaudeEntry(path, entry);
+    let changed: boolean;
+    switch (spec.format) {
+      case 'codex-toml':
+        changed = ensureCodexEntry(path, entry);
+        break;
+      case 'claude-json':
+        changed = ensureClaudeEntry(path, entry);
+        break;
+      case 'antigravity-json':
+        changed = ensureAntigravityEntry(path, entry);
+        break;
+      default: {
+        const _exhaustive: never = spec.format;
+        throw new Error(`unsupported_mcp_gateway_format:${String(_exhaustive)}`);
+      }
+    }
     return { cliId: adapter.id, state: changed ? 'installed' : 'unchanged', configPath: path };
   } catch (err) {
     return {
@@ -345,20 +397,83 @@ export function inspectGatewayEntry(
   const path = configPath(spec);
   try {
     if (!existsSync(path)) return { cliId: adapter.id, state: 'absent', configPath: path };
-    const configured = spec.format === 'codex-toml'
-      ? hasCodexBotmuxTable(readFileSync(path, 'utf-8'))
-      : (() => {
-          const data = parseJsonConfig(path);
-          const servers = data.mcpServers;
-          return !!servers && typeof servers === 'object' && !Array.isArray(servers)
-            && isOwnedJsonEntry((servers as Record<string, unknown>).botmux);
-        })();
+    let configured: boolean;
+    switch (spec.format) {
+      case 'codex-toml':
+        configured = hasCodexBotmuxTable(readFileSync(path, 'utf-8'));
+        break;
+      case 'claude-json': {
+        const data = parseJsonConfig(path);
+        const servers = data.mcpServers;
+        configured = !!servers && typeof servers === 'object' && !Array.isArray(servers)
+          && isOwnedJsonEntry((servers as Record<string, unknown>).botmux);
+        break;
+      }
+      case 'antigravity-json': {
+        const data = parseJsonConfig(path, true);
+        if (data.mcpServers !== undefined && (!data.mcpServers || typeof data.mcpServers !== 'object' || Array.isArray(data.mcpServers))) {
+          throw new Error('invalid_cli_mcp_json_config');
+        }
+        const servers = data.mcpServers as Record<string, unknown> | undefined;
+        configured = !!servers && isOwnedAntigravityEntry(servers.botmux);
+        break;
+      }
+      default: {
+        const _exhaustive: never = spec.format;
+        throw new Error(`unsupported_mcp_gateway_format:${String(_exhaustive)}`);
+      }
+    }
     return { cliId: adapter.id, state: configured ? 'configured' : 'absent', configPath: path };
   } catch (err) {
     return {
       cliId: adapter.id,
       state: 'adapter-required',
       configPath: path,
+      warning: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function canonicalOrResolved(path: string): string {
+  const resolved = resolve(path);
+  try { return realpathSync(resolved); } catch { return resolved; }
+}
+
+/**
+ * When a bot overrides `HOME` via per-bot env, CLIs whose global MCP config
+ * lives under `$HOME` (`antigravity-json`) read `<effectiveHome>/...` instead
+ * of the daemon's own `homedir()`. Ensure that relocated config before spawn;
+ * return `undefined` when no relocation applies.
+ */
+export function ensureEffectiveHomeGatewayEntry(
+  adapter: Pick<CliAdapter, 'id' | 'mcpGateway'>,
+  effectiveHome: string | undefined,
+  entry: GatewayEntry = defaultGatewayEntry(),
+): GatewayEntryReport | undefined {
+  const spec = adapter.mcpGateway;
+  const trimmedHome = effectiveHome?.trim();
+  if (
+    !spec
+    || spec.format !== 'antigravity-json'
+    || !trimmedHome
+    || !isAbsolute(trimmedHome)
+    || !spec.configPath.startsWith('~')
+  ) {
+    return undefined;
+  }
+  if (canonicalOrResolved(trimmedHome) === canonicalOrResolved(homedir())) return undefined;
+  const relocatedPath = join(trimmedHome, spec.configPath.slice(1));
+  try {
+    mkdirSync(dirname(relocatedPath), { recursive: true });
+    return withFileLockSync(relocatedPath, () => ensureGatewayEntry(
+      { id: adapter.id, mcpGateway: { ...spec, configPath: relocatedPath } },
+      entry,
+    ));
+  } catch (err) {
+    return {
+      cliId: adapter.id,
+      state: 'adapter-required',
+      configPath: relocatedPath,
       warning: err instanceof Error ? err.message : String(err),
     };
   }
