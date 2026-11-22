@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { PromptSuggestionPublisher, promptSuggestionReportTurn } from '../src/utils/prompt-suggestion-publisher.js';
+import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 const dialog = 'Bash command\nDo you want to proceed?\n1. Yes\n2. No\nEsc to cancel';
@@ -26,7 +27,7 @@ function start(cliId = 'claude-code') {
     projectedRuntimeScreenStatus: () => 'idle', observeTraexAutoModelCapacity() {},
     classifyUsageLimitWithNativeEvidence: (_: string, status: string) => ({ status }),
     settleBackgroundTasksFromSiblings() {}, refreshBackgroundWait() {},
-    startupInputHeld: () => false, backgroundWaitPayload: () => ({}),
+    startupInputHeld: () => false, backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
     send: (message: any) => messages.push(message),
   };
   loadWorkerFunction<() => void>('startScreenUpdates', scope)();

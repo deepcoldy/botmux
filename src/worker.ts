@@ -165,7 +165,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
@@ -9841,6 +9841,34 @@ function backgroundWaitPayload(): { backgroundTasks?: number } {
   return backgroundWaitTasks > 0 ? { backgroundTasks: backgroundWaitTasks } : {};
 }
 
+/** The main conversation's latest served model request, from the transcript
+ *  this worker follows: any request, and any but idle upkeep (botmux's own
+ *  keep-alive, a plugin's prompt).
+ *  Rides on screen_update (the sampler publishes a change) so the daemon's
+ *  idle auto-compact times the prompt cache from the last request that
+ *  actually read it, and its idle clock from the last real activity (a
+ *  background-task wake or a scheduled fire included). */
+const modelRequestClock = new ClaudeModelRequestClock();
+
+/** A worker that starts on an existing transcript (a daemon restart, a
+ *  resume) cursors to its end, so the clock would know nothing until the
+ *  next request and the daemon would fall back to timing the cache and the
+ *  idle stretch from the stretch start. Read the tail once instead. */
+function seedModelRequestClockFromTranscript(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || !bridgeJsonlPath || !existsSyncSafe(bridgeJsonlPath)) return;
+  try { modelRequestClock.seedFromTail(bridgeJsonlPath); }
+  catch (err: any) { log(`Model request clock seed skipped: ${err?.message ?? err}`); }
+}
+
+function modelRequestPayload(): { lastModelRequestAt?: number; lastActivityRequestAt?: number } {
+  const at = modelRequestClock.lastServedAt();
+  const activity = modelRequestClock.lastActivityServedAt();
+  return {
+    ...(at !== undefined ? { lastModelRequestAt: at } : {}),
+    ...(activity !== undefined ? { lastActivityRequestAt: activity } : {}),
+  };
+}
+
 function refreshBackgroundWait(): void {
   const next = backgroundTaskTracker.backgroundWait();
   if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
@@ -11832,6 +11860,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // previous session left behind) before folding this file's own events in.
   seedModelFallbackFromTranscript();
   observeModelFallbackEvents(matched, drained.events);
+  for (const ev of drained.events) modelRequestClock.observe(ev);
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
   log(`Bridge fingerprint switch split: ${history.length} historical events absorbed, ${live.length} live events ingested (cutoff=${cutoffMs})`);
@@ -12120,6 +12149,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // possibly before this switch noticed it. Launches replayed from an older
   // CLI process are ignored by the tracker itself.
   observeClaudeBackgroundTasks(result.events);
+  for (const ev of result.events) modelRequestClock.observe(ev);
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
   log(`Bridge rotation split: ${history.length} historical events absorbed, ${live.length} live events ingested`);
@@ -12919,6 +12949,7 @@ function bridgeIngest(): void {
     // also binds the tracker to this file's Claude session. Idempotent with the
     // adopt branch's own observe: the same record is deduped by uuid.
     seedModelFallbackFromTranscript();
+    seedModelRequestClockFromTranscript();
     return;
   }
   const batchOffset = bridgeOffset;
@@ -12946,6 +12977,9 @@ function bridgeIngest(): void {
   // Fold background task launches / stops and the main turn's start / end, so
   // the idle edge (markPromptReady) and the card know what is still running.
   observeClaudeBackgroundTasks(result.events);
+  // Only the followed transcript: a retired path's tail is an older
+  // conversation, whose requests do not warm this one's cache.
+  for (const ev of result.events) modelRequestClock.observe(ev);
   // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
   // at the turn's terminal boundary. This is the authoritative "limited"
   // signal — read it here (event-driven, once per record) instead of scraping
@@ -13165,6 +13199,7 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
     log(`Bridge transcript not yet present at ${bridgeJsonlPath}; will baseline on first appearance`);
   }
   seedModelFallbackFromTranscript();
+  seedModelRequestClockFromTranscript();
   // fs.watch is best-effort wakeup — actual data source is the byte offset.
   // The fallback poller covers fs.watch's gaps (NFS, rename-rotation, etc.)
   // and also drives lazy baseline when the file shows up after attach.
@@ -22409,6 +22444,7 @@ function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolea
     content,
     ...statusPayload,
     ...backgroundWaitPayload(),
+    ...modelRequestPayload(),
     turnId: opts?.clearTurnId ? undefined : currentBotmuxTurnId,
     dispatchAttempt: opts?.clearTurnId ? undefined : currentBotmuxDispatchAttempt,
     // Explicit direct-submit provenance: only the clearTurnId caller that
@@ -23219,6 +23255,7 @@ function markPromptReady(): void {
       content,
       ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
       ...backgroundWaitPayload(),
+      ...modelRequestPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
@@ -26232,6 +26269,8 @@ function startScreenUpdates(): void {
   let lastSentExpiredQuotaKey: string | undefined;
   let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
+  let lastSentModelRequestAt: number | undefined;
+  let lastSentActivityRequestAt: number | undefined;
   let lastTextSnapshotHash = '';
   let lastContent = '';
   const permissionNotice = new ClaudePermissionNoticeTracker();
@@ -26511,16 +26550,21 @@ function startScreenUpdates(): void {
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
         || usageAware.usageLimitRecovery !== lastSentRecovery
-        || backgroundWaitTasks !== lastSentBackgroundWait) {
+        || backgroundWaitTasks !== lastSentBackgroundWait
+        || modelRequestClock.lastServedAt() !== lastSentModelRequestAt
+        || modelRequestClock.lastActivityServedAt() !== lastSentActivityRequestAt) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
         lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
+        lastSentModelRequestAt = modelRequestClock.lastServedAt();
+        lastSentActivityRequestAt = modelRequestClock.lastActivityServedAt();
         send({
           type: 'screen_update',
           content: snapshot.content,
           ...usageAware,
           ...backgroundWaitPayload(),
+          ...modelRequestPayload(),
           turnId: screenTurn.turnId,
           dispatchAttempt: screenTurn.dispatchAttempt,
         });

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
+import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { reconcileUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { snapshotWithLatestRuntimeStatus } from '../src/utils/runtime-screen-status.js';
@@ -58,7 +59,7 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
       observeTraexAutoModelCapacity: () => {}, publishNativeReasoningFooter: () => {},
       promptSuggestionReportTurn: () => undefined, settleBackgroundTasksFromSiblings: () => {},
       refreshBackgroundWait: () => {}, backgroundWaitTasks: 0, startupInputHeld: () => false,
-      backgroundWaitPayload: () => ({}), currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined,
+      backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(), currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined,
       send: (message: Record<string, unknown>) => messages.push(message), log: () => {},
     });
 

@@ -636,6 +636,16 @@ export interface DaemonSession {
   /** A botmux turn started and its idle edge has not been seen yet
    *  (core/idle-auto-compact.ts). In-memory; mirrored to the row while on. */
   idleAutoCompactArm?: import('./idle-auto-compact.js').IdleAutoCompactArm;
+  /** Start (epoch ms) of the main conversation's latest served model request,
+   *  as the worker read it from the Claude transcript (`lastModelRequestAt` on
+   *  screen_update). The idle auto-compact's cache window counts from here when
+   *  it is later than the stretch start. Never moves back. In-memory only. */
+  lastModelRequestAt?: number;
+  /** The same, leaving out idle upkeep — botmux's keep-alive, a plugin's
+   *  prompt (`lastActivityRequestAt` on screen_update): the idle auto-compact's idle
+   *  time counts from here when it is later than the stretch start. Never
+   *  moves back. In-memory only. */
+  lastActivityRequestAt?: number;
   /** Non-keep-alive busy observed before this idle compact settles. This
    *  in-memory witness survives session-store's durable-row rollback on a
    *  failed save; the persisted inFlight flag is the restart-safe counterpart. */

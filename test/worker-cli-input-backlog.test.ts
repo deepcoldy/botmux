@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BridgeTurnQueue } from '../src/services/bridge-turn-queue.js';
+import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { settleStaleWriteContinuation } from '../src/services/submit-confirmation.js';
 import { saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from '../src/services/unsent-input-journal.js';
 import { claudeTranscriptLatestTurnState } from '../src/utils/stale-program-status.js';
@@ -59,7 +60,7 @@ function wokenClaudeWorker(opts: { promptReady?: boolean; transcriptPath?: strin
     settleStaleWriteContinuation,
     redriveRejectedStructuredReady: vi.fn(() => { redriven.push(scope.structuredRejectedReadyEvidenceGeneration); }),
     renderer: { snapshot: () => ({ content: 'claude composer', changed: false }), markNewTurn: vi.fn() },
-    backgroundWaitPayload: () => ({}),
+    backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
   });
   scope.deferTurnInputCommitUntilSubmission = loadWorkerFunction('deferTurnInputCommitUntilSubmission', scope);
   scope.markPromptReady = loadWorkerFunction('markPromptReady', scope);

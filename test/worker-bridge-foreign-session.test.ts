@@ -6,7 +6,7 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { BLIND_TURN_MIN_BUSY_MS, BridgeBlindTurnWatch } from '../src/services/claude-bridge-blind-turn.js';
 import { decideFingerprintSwitch, foreignNativeSessionIds, SESSION_ID_FILENAME_RE, sessionIdFromJsonlPath } from '../src/services/bridge-rotation-policy.js';
-import { findJsonlContainingFingerprint, findJsonlsContainingExactContent } from '../src/services/claude-transcript.js';
+import { findJsonlContainingFingerprint, findJsonlsContainingExactContent, ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 
 // The worker's fingerprint fallback, with real transcripts on disk and a
 // session-store stand-in: which file it switches to when one broadcast lands
@@ -133,7 +133,7 @@ describe('worker trust set: what the CLI proved vs what was only guessed or swit
       splitTranscriptEventsByCutoff: () => ({ history: [], live: [] }),
       beginNewBridgeTranscriptGeneration: () => {},
       bridgeQueue: { absorb: () => {}, ingest: () => {} },
-      seedModelFallbackFromTranscript: () => {}, observeModelFallbackEvents: () => {},
+      seedModelFallbackFromTranscript: () => {}, seedModelRequestClockFromTranscript: () => {}, modelRequestClock: new ClaudeModelRequestClock(), observeModelFallbackEvents: () => {},
       bridgeMarkStalePidStateForAcceptedSid: () => {},
       fsWatch: () => ({ close: () => {} }),
       performBridgeIngestAndScheduleQuietEmit: () => {},
@@ -255,7 +255,7 @@ describe('proven trust-set: the whole pid/fd producer chain', () => {
       newestPath: (paths: string[]) => paths[0],
       bridgeMarkStalePidStateForAcceptedSid: () => {},
       beginNewBridgeTranscriptGeneration: () => {},
-      seedModelFallbackFromTranscript: () => {},
+      seedModelFallbackFromTranscript: () => {}, seedModelRequestClockFromTranscript: () => {}, modelRequestClock: new ClaudeModelRequestClock(),
       fsWatch: () => ({ close: () => {} }),
       performBridgeIngestAndScheduleQuietEmit: () => {},
       setInterval: () => 0,
@@ -281,7 +281,7 @@ describe('proven trust-set: the whole pid/fd producer chain', () => {
       dirname: (p: string) => p.slice(0, p.lastIndexOf('/')),
       existsSyncSafe: () => false,
       beginNewBridgeTranscriptGeneration: () => {},
-      seedModelFallbackFromTranscript: () => {},
+      seedModelFallbackFromTranscript: () => {}, seedModelRequestClockFromTranscript: () => {}, modelRequestClock: new ClaudeModelRequestClock(),
       fsWatch: () => ({ close: () => {} }),
       performBridgeIngestAndScheduleQuietEmit: () => {},
       setInterval: () => 0,

@@ -73,32 +73,50 @@ export interface AutoCompactEligibilitySnapshot {
   supportsCompact: boolean;
 }
 
+/** One reason the fire-time gate says no, as it is logged. */
+export type AutoCompactBlocker =
+  | 'session_inactive' | 'no_worker' | 'worker_not_ready' | 'cli_not_ready' | 'not_idle'
+  | 'stream_card_pending' | 'transferring' | 'protected_mutation' | 'pending_turns'
+  | 'pending_prompt' | 'pending_raw_input' | 'pending_follow_up_input' | 'queued_activation'
+  | 'cascade_in_flight' | 'usage_limited' | 'agent_attention' | 'final_delivery_in_flight'
+  | 'background_tasks' | 'adopted' | 'headless' | 'vc_meeting_receiver' | 'remote_runner'
+  | 'compact_unsupported';
+
+const AUTO_COMPACT_GATE: ReadonlyArray<readonly [AutoCompactBlocker, (s: AutoCompactEligibilitySnapshot) => boolean]> = [
+  ['session_inactive', s => !s.sessionActive],
+  ['no_worker', s => !s.workerAlive],
+  ['worker_not_ready', s => !s.workerReady],
+  ['cli_not_ready', s => !s.cliReady],
+  ['not_idle', s => !s.idle],
+  ['stream_card_pending', s => !s.streamCardSettled],
+  ['transferring', s => s.transferring],
+  ['protected_mutation', s => s.protectedMutation],
+  ['pending_turns', s => s.pendingTurns],
+  ['pending_prompt', s => s.pendingPrompt],
+  ['pending_raw_input', s => s.pendingRawInput],
+  ['pending_follow_up_input', s => s.pendingFollowUpInput],
+  ['queued_activation', s => s.queuedActivationCount !== 0],
+  ['cascade_in_flight', s => s.cascadeInFlight],
+  ['usage_limited', s => s.usageLimited],
+  ['agent_attention', s => s.agentAttention],
+  ['final_delivery_in_flight', s => s.finalDeliveriesInFlight !== 0],
+  ['background_tasks', s => s.backgroundTaskCount !== 0],
+  ['adopted', s => s.adopted],
+  ['headless', s => s.headless],
+  ['vc_meeting_receiver', s => s.vcMeetingReceiver],
+  ['remote_runner', s => s.remoteRunner],
+  ['compact_unsupported', s => !s.supportsCompact],
+];
+
+/** Every exclusion the snapshot hits, in a fixed order; empty = eligible. */
+export function autoCompactBlockers(input: AutoCompactEligibilitySnapshot): AutoCompactBlocker[] {
+  return AUTO_COMPACT_GATE.filter(([, blocks]) => blocks(input)).map(([name]) => name);
+}
+
 /** Pure fire-time gate for daemon-initiated maintenance. Every field is
  * explicit so each exclusion remains independently testable. */
 export function isAutoCompactEligible(input: AutoCompactEligibilitySnapshot): boolean {
-  return input.sessionActive
-    && input.workerAlive
-    && input.workerReady
-    && input.cliReady
-    && input.idle
-    && input.streamCardSettled
-    && !input.transferring
-    && !input.protectedMutation
-    && !input.pendingTurns
-    && !input.pendingPrompt
-    && !input.pendingRawInput
-    && !input.pendingFollowUpInput
-    && input.queuedActivationCount === 0
-    && !input.cascadeInFlight
-    && !input.usageLimited
-    && !input.agentAttention
-    && input.finalDeliveriesInFlight === 0
-    && input.backgroundTaskCount === 0
-    && !input.adopted
-    && !input.headless
-    && !input.vcMeetingReceiver
-    && !input.remoteRunner
-    && input.supportsCompact;
+  return autoCompactBlockers(input).length === 0;
 }
 
 export interface AutoCompactRefusalProjection {

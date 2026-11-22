@@ -57,7 +57,7 @@ describe('idle auto-compact persistence', () => {
     noteIdleAutoCompactScreenStatus(restored, undefined, T0 + 20 * MIN);
     const compact = vi.fn(() => true);
     const sweep = (at: number) => runIdleAutoCompactSweep([restored], {
-      now: () => at, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      now: () => at, supported: () => true, blockers: () => [], contextTokens: () => undefined,
       persist: ds => updateSession(ds.session), compact, notify: () => {}, log: () => {},
     });
     expect(sweep(T0 + 29 * MIN)).toBe(0);
@@ -77,7 +77,7 @@ describe('idle auto-compact persistence', () => {
     let accept = false;
     const compact = vi.fn(() => accept);
     const sweep = (at: number) => runIdleAutoCompactSweep([ds], {
-      now: () => at, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      now: () => at, supported: () => true, blockers: () => [], contextTokens: () => undefined,
       persist: d => updateSession(d.session), compact, notify: () => {}, log: () => {},
     });
     expect(sweep(T0 + 55 * MIN)).toBe(0);
@@ -95,7 +95,7 @@ describe('idle auto-compact persistence', () => {
     updateSession(session);
     const compact = vi.fn(() => true);
     runIdleAutoCompactSweep([ds], {
-      now: () => T0 + 55 * MIN, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      now: () => T0 + 55 * MIN, supported: () => true, blockers: () => [], contextTokens: () => undefined,
       persist: d => updateSession(d.session), compact, notify: () => {}, log: () => {},
     });
     const turnId = compact.mock.calls[0][1] as string;
@@ -125,7 +125,7 @@ describe('idle auto-compact persistence', () => {
     updateSession(session);
     const compact = vi.fn(() => true);
     const sweep = (at: number) => runIdleAutoCompactSweep([ds], {
-      now: () => at, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      now: () => at, supported: () => true, blockers: () => [], contextTokens: () => undefined,
       persist: d => updateSession(d.session), compact, notify: () => {}, log: () => {},
     });
     sweep(T0 + 55 * MIN);
@@ -159,7 +159,7 @@ describe('idle auto-compact persistence', () => {
     const compact = vi.fn(() => true);
     const notices: unknown[] = [];
     const sweep = (at: number) => runIdleAutoCompactSweep([ds], {
-      now: () => at, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      now: () => at, supported: () => true, blockers: () => [], contextTokens: () => undefined,
       persist: d => updateSession(d.session), compact, notify: (_d, notice) => { notices.push(notice); }, log: () => {},
     });
     sweep(T0 + 55 * MIN);
@@ -200,7 +200,7 @@ describe('idle auto-compact persistence', () => {
     const compact = vi.fn(() => true);
     const notices: unknown[] = [];
     const sweep = (target: DaemonSession, at: number) => runIdleAutoCompactSweep([target], {
-      now: () => at, supported: () => true, eligible: () => true, contextTokens: () => undefined,
+      now: () => at, supported: () => true, blockers: () => [], contextTokens: () => undefined,
       persist: d => updateSession(d.session), compact, notify: (_d, notice) => { notices.push(notice); }, log: () => {},
     });
     sweep(ds, T0 + 55 * MIN);

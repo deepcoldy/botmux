@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { terminalInputSubmits } from '../src/adapters/cli/tui-input.js';
-import { splitTranscriptEventsByCutoff, type TranscriptEvent } from '../src/services/claude-transcript.js';
+import { splitTranscriptEventsByCutoff, type TranscriptEvent, ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { BridgeTurnQueue } from '../src/services/bridge-turn-queue.js';
 import {
   BLIND_TURN_MIN_BUSY_MS,
@@ -459,7 +459,7 @@ describe.each(['performRotationSwitch', 'bridgeApplyFingerprintSwitch'])('worker
       splitTranscriptEventsByCutoff,
       beginNewBridgeTranscriptGeneration: () => {},
       bridgeQueue: queue,
-      seedModelFallbackFromTranscript: () => {}, observeModelFallbackEvents: () => {},
+      seedModelFallbackFromTranscript: () => {}, seedModelRequestClockFromTranscript: () => {}, modelRequestClock: new ClaudeModelRequestClock(), observeModelFallbackEvents: () => {},
       observeClaudeBackgroundTasks: () => {}, bridgeMarkStalePidStateForAcceptedSid: () => {},
       bridgeRememberSessionIdForPath: () => {},
       sessionIdFromJsonlPath: (path: string) => path.slice(path.lastIndexOf('/') + 1, -'.jsonl'.length),

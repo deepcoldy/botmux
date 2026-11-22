@@ -97,10 +97,11 @@ afterEach(() => {
   vi.unstubAllEnvs(); __testOnly_resetLarkGate();
 });
 
-async function screenUpdate(status: 'working' | 'idle' | 'limited', backgroundTasks?: number): Promise<void> {
+async function screenUpdate(status: 'working' | 'idle' | 'limited', backgroundTasks?: number, extra: Record<string, unknown> = {}): Promise<void> {
   await worker.listeners('message')[0]({
     type: 'screen_update', content: 'screen', status, turnId: 'om_turn',
     ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
+    ...extra,
   });
   await vi.waitFor(() => expect(ds.cardPatchInFlight ?? false).toBe(false));
 }
@@ -689,5 +690,21 @@ describe('background-wait label on the live card', () => {
     await screenUpdate('limited', 3);
     expect(ds.backgroundTaskCount).toBeUndefined();
     expect(patchedHeaders().every(header => !header.includes('后台子任务'))).toBe(true);
+  });
+});
+
+// The same frame also carries the transcript's latest served model request,
+// which the idle auto-compact times the prompt cache from.
+describe('last served model request on screen_update', () => {
+  it('keeps the latest proof of a cache read and of use; an older or missing report never moves them back', async () => {
+    const read = Date.now() - 10 * 60_000;
+    const used = read - 5 * 60_000;
+    await screenUpdate('working', 1, { lastModelRequestAt: read, lastActivityRequestAt: used });
+    expect([ds.lastModelRequestAt, ds.lastActivityRequestAt]).toEqual([read, used]);
+    await screenUpdate('idle', 1, { lastModelRequestAt: read - 60_000, lastActivityRequestAt: used - 60_000 });
+    await screenUpdate('idle', 1);
+    expect([ds.lastModelRequestAt, ds.lastActivityRequestAt]).toEqual([read, used]);
+    await screenUpdate('idle', undefined, { lastModelRequestAt: read + 60_000, lastActivityRequestAt: read + 60_000 });
+    expect([ds.lastModelRequestAt, ds.lastActivityRequestAt]).toEqual([read + 60_000, read + 60_000]);
   });
 });

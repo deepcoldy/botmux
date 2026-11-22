@@ -86,7 +86,7 @@ import {
 } from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, promptCacheKeepaliveInFlight, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
-import { IDLE_AUTO_COMPACT_MAX_ATTEMPTS, clearIdleAutoCompactStretch, idleAutoCompactMinutes, invalidateIdleAutoCompactRetryForTurn, noteIdleAutoCompactDirectInput, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
+import { IDLE_AUTO_COMPACT_MAX_ATTEMPTS, clearIdleAutoCompactStretch, idleAutoCompactMinutes, invalidateIdleAutoCompactRetryForTurn, noteIdleAutoCompactDirectInput, noteIdleAutoCompactTranscriptClock, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
 import { parseUnattendedInputRefusal } from './unattended-input-refusal.js';
 import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
@@ -24191,6 +24191,8 @@ function setupWorkerHandlers(
           && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
           ? Math.floor(msg.backgroundTasks)
           : undefined;
+        // A transcript fact, so a stale frame carries it as truly as a live one.
+        noteIdleAutoCompactTranscriptClock(ds, msg);
         stampIdleSinceAt(ds, prevStatus);
         // Stale post-terminal busy frames must not move the card revision: a
         // bump here would invalidate the in-flight post-terminal idle
