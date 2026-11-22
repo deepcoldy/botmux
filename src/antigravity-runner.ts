@@ -54,6 +54,7 @@ async function drain(): Promise<void> {
           onRuntime: runtime => output.marker('runtime', { threadId: nativeSessionId, ...runtime }),
           onText: display,
           onTool: title => display(`[tool] ${title}`),
+          onWarning: warning => display(`[mcp-gateway] WARN ${warning}`),
           onReasoningEffort: reasoningEffort => {
             if (nativeSessionId) output.marker('reasoning_observed', { nativeSessionId, reasoningEffort });
           },

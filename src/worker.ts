@@ -311,7 +311,12 @@ import {
   upsertScheduledTaskAnchor,
 } from './services/bridge-scheduled-anchors.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
-import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import {
+  defaultGatewayEntry,
+  ensureEffectiveHomeGatewayEntry,
+  ensureGatewayEntry,
+  shouldEnsureAntigravityGatewayOnSpawn,
+} from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
   pinSessionMcpGatewaySocketRoot,
@@ -327,6 +332,7 @@ import {
   writeMcpGatewayLaunchRecord,
 } from './core/plugins/mcp/launch-record.js';
 import {
+  MCP_GATEWAY_INSTALL_ENTRY_ENV,
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from './core/plugins/mcp/environment.js';
@@ -30383,9 +30389,11 @@ async function spawnCliBody(
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
     childEnv[MCP_GATEWAY_REQUIRED_ENV] = '1';
+    childEnv[MCP_GATEWAY_INSTALL_ENTRY_ENV] = JSON.stringify(defaultGatewayEntry());
   } else {
     delete childEnv[MCP_GATEWAY_SOCKET_ENV];
     delete childEnv[MCP_GATEWAY_REQUIRED_ENV];
+    delete childEnv[MCP_GATEWAY_INSTALL_ENTRY_ENV];
   }
   // Never inherit an ambient/stale bootstrap path from the daemon's own launch
   // environment. The raw capability is never placed in any environment.
@@ -32715,21 +32723,31 @@ async function spawnCliBody(
     const spawnCliBin = cliAdapter.resolvedBin;
     let spawnedAntigravityAccountReport: { accountId: string } | undefined;
     let antigravitySpawnStoreOptions: AntigravityAccountStoreOptions | undefined;
-    if (cfg.cliId === 'antigravity' && !willReattachPersistent && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
+    if (cfg.cliId === 'antigravity' && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
       const effectiveChildEnv = { ...spawnEnvPlan.childEnv, ...spawnEnvPlan.injectEnv };
-      antigravitySpawnStoreOptions = resolveAntigravitySpawnStoreOptions({
-        effectiveHome: effectiveChildEnv.HOME,
-        botmuxConfigDir: configuredBotmuxHome,
-        env: effectiveChildEnv,
-      });
-      const prepared = reconcileAntigravitySpawnAccount(antigravitySpawnStoreOptions);
-      if (prepared) {
-        const { reconciled } = prepared;
-        spawnedAntigravityAccountReport = { accountId: prepared.accountId };
-        if (reconciled.advancedFrom) {
-          log(`Antigravity account pre-spawn advance: ${reconciled.advancedFrom} -> ${reconciled.activeId}`);
-        } else if (reconciled.restored) {
-          log(`Antigravity live token restored to active account ${reconciled.activeId}`);
+      if (shouldEnsureAntigravityGatewayOnSpawn({
+        transport: agyTransport,
+        willReattachPersistent,
+        runtimeEntryCount: mcpRuntimeManifest?.entries.length,
+      })) {
+        const report = ensureEffectiveHomeGatewayEntry(cliAdapter, effectiveChildEnv.HOME);
+        if (report?.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+      }
+      if (!willReattachPersistent) {
+        antigravitySpawnStoreOptions = resolveAntigravitySpawnStoreOptions({
+          effectiveHome: effectiveChildEnv.HOME,
+          botmuxConfigDir: configuredBotmuxHome,
+          env: effectiveChildEnv,
+        });
+        const prepared = reconcileAntigravitySpawnAccount(antigravitySpawnStoreOptions);
+        if (prepared) {
+          const { reconciled } = prepared;
+          spawnedAntigravityAccountReport = { accountId: prepared.accountId };
+          if (reconciled.advancedFrom) {
+            log(`Antigravity account pre-spawn advance: ${reconciled.advancedFrom} -> ${reconciled.activeId}`);
+          } else if (reconciled.restored) {
+            log(`Antigravity live token restored to active account ${reconciled.activeId}`);
+          }
         }
       }
     }

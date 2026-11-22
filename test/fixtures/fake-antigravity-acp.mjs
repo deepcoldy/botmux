@@ -1,6 +1,16 @@
 /** Deterministic ACP peer for transport, cancellation and native-session isolation tests. */
 import { createInterface } from 'node:readline';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
+
+function observeMcpConfig() {
+  if (!process.env.AGY_TEST_MCP_CONFIG) return {};
+  try {
+    const config = JSON.parse(readFileSync(process.env.AGY_TEST_MCP_CONFIG, 'utf8'));
+    return { mcp: { exists: true, disabled: config.mcpServers?.botmux?.disabled } };
+  } catch (error) {
+    return { mcp: { exists: false, code: error.code ?? error.name } };
+  }
+}
 
 const mode = process.env.AGY_TEST_MODE;
 const sessionId = 'native-agy-test-session';
@@ -20,7 +30,8 @@ function send(message) {
 createInterface({ input: process.stdin }).on('line', line => {
   const request = JSON.parse(line);
   appendFileSync(process.env.AGY_TEST_LOG, JSON.stringify({ ...request, pid: process.pid,
-    owner: process.env.BOTMUX_OWNER_OPEN_ID, legacyOwner: process.env.__OWNER_OPEN_ID, args: process.argv.slice(2) }) + '\n');
+    owner: process.env.BOTMUX_OWNER_OPEN_ID, legacyOwner: process.env.__OWNER_OPEN_ID, args: process.argv.slice(2),
+    ...observeMcpConfig() }) + '\n');
   if (request.method === 'initialize') send({ id: request.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: mode !== 'no-restore' } } });
   else if (request.method === 'session/new') send({ id: request.id, result: { sessionId, ...configs } });
   else if (request.method === 'session/load') {
