@@ -243,7 +243,7 @@ botmux 在 tmux 里用 `<$SHELL> -i -c '…启动 CLI'` 拉起会话。`-i` 会�
   PATH、nvm 等要写进所选 shell 自己的启动文件（如 `.zshrc`；fish 写 `~/.config/fish/config.fish`）。
 - **改启动文件**：给跳转加个条件，只在手动开终端时才切：`[ -z "$BASH_EXECUTION_STRING" ] && [ -t 1 ] && exec zsh`（PATH、nvm 等放在这行前面）。
 
-改完执行 `botmux restart`，再发一条消息。这个问题只影响要靠 shell 拉起的后端（`tmux` / `zellij` / `zmx`）；`pty` 后端直接启动 CLI，不受影响。
+改完执行 `botmux restart`，再发一条消息。这个问题只影响要靠 shell 拉起的后端（`tmux` / `zellij` / `zmx` / `hc`）；`pty` 后端直接启动 CLI，不受影响。
 
 ### 手机上驾驶舱或终端打不开？
 

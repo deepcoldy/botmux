@@ -904,6 +904,45 @@ export function tmuxStartupFailureSummary(err: any): string {
   return '未知错误';
 }
 
+/**
+ * The launch goes through a private file (pane-launch.ts): the shell, wrapper
+ * and argv are exactly what used to follow `--` inline. Strict panes keep their
+ * direct `env -i` exec; /bin/sh -c reads no profile, so it only loads the argv
+ * before exec'ing it. `paneArgv` is the command the pane runs.
+ */
+export function writeManagedPaneLaunch(
+  bin: string,
+  args: string[],
+  opts: SpawnOpts,
+): { launchFile: PaneLaunchFile; paneArgv: string[] } {
+  const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
+  const shellKind = shellKindForPath(shellSpec.shell);
+  const launchFile = writePaneLaunchFile(opts.paneLaunchDir, opts.strictEnv
+    ? { kind: shellKind, script: 'exec "$@"', argv: strictPaneCommand(bin, args, opts) }
+    : {
+      kind: shellKind,
+      script: shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind),
+      argv: [
+        opts.cwd,
+        ...buildBotmuxEnvAssignments(
+          opts.env,
+          opts.injectEnv,
+          opts.unsetEnv,
+          opts.gitConfigPairs,
+          opts.protectedUnsetEnv,
+        ),
+        bin, ...args,
+      ],
+    });
+  const loader = paneLaunchLoader(shellKind);
+  return {
+    launchFile,
+    paneArgv: opts.strictEnv
+      ? [shellSpec.shell, '-c', loader, '_', launchFile.path]
+      : shellCommandArgv(shellSpec, loader, [launchFile.path]),
+  };
+}
+
 /** The public error for a failed `new-session`. */
 export function tmuxNewSessionError(err: any, commandBytes: number): Error {
   const summary = tmuxStartupFailureSummary(err);
@@ -913,6 +952,9 @@ export function tmuxNewSessionError(err: any, commandBytes: number): Error {
   }
   return new Error(`tmux 创建会话失败：${summary}`);
 }
+
+/** How long a pane's server may stay unreachable before the pane counts as lost. */
+export const SERVER_OUTAGE_ESCALATE_MS = 60_000;
 
 export class TmuxPipeBackend implements SessionBackend {
   readonly supportsRawCommandPasteLine = true;
@@ -1018,7 +1060,7 @@ export class TmuxPipeBackend implements SessionBackend {
    *  timeouts leave it untouched (a wedged-but-alive server neither proves nor
    *  disproves the outage). */
   private serverUnreachableSince: number | null = null;
-  private static readonly SERVER_OUTAGE_ESCALATE_MS = 60_000;
+  private static readonly SERVER_OUTAGE_ESCALATE_MS = SERVER_OUTAGE_ESCALATE_MS;
   private cols = 200;
   private rows = 50;
   private exited = false;
@@ -2480,31 +2522,8 @@ export class TmuxPipeBackend implements SessionBackend {
     const newSessionAcceptsE = tmuxVersionAtLeast(tmuxVersion, 3, 2);
     const remainOnExit = remainOnExitMode(tmuxVersion);
     this.legacyRetention = remainOnExit === 'on';
-    // The launch itself goes through a private file (pane-launch.ts): the
-    // shell, wrapper and argv are exactly what used to follow `--` inline.
-    // Strict panes keep their direct `env -i` exec; /bin/sh -c reads no
-    // profile, so it only loads the argv before exec'ing it.
-    const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
-    const shellKind = shellKindForPath(shellSpec.shell);
-    const launchFile = writePaneLaunchFile(opts.paneLaunchDir, opts.strictEnv
-      ? { kind: shellKind, script: 'exec "$@"', argv: strictPaneCommand(bin, args, opts) }
-      : {
-        kind: shellKind,
-        script: shellWrapperScript(resolveBotmuxWrapperBinDir(opts.env ?? process.env), shellKind),
-        argv: [
-          opts.cwd,
-          ...buildBotmuxEnvAssignments(
-            opts.env,
-            opts.injectEnv,
-            opts.unsetEnv,
-            opts.gitConfigPairs,
-            opts.protectedUnsetEnv,
-          ),
-          bin, ...args,
-        ],
-      });
+    const { launchFile, paneArgv } = writeManagedPaneLaunch(bin, args, opts);
     this.launchFile = launchFile;
-    const loader = paneLaunchLoader(shellKind);
     const argv = [
       'new-session',
       '-d',
@@ -2519,9 +2538,7 @@ export class TmuxPipeBackend implements SessionBackend {
       // adopted via the duplicate path below.
       ...(instanceIdentity && newSessionAcceptsE ? ['-e', `BOTMUX_CODEX_INSTANCE_BINDING=${instanceIdentity}`] : []),
       '--',
-      ...(opts.strictEnv
-        ? [shellSpec.shell, '-c', loader, '_', launchFile.path]
-        : shellCommandArgv(shellSpec, loader, [launchFile.path])),
+      ...paneArgv,
       // `remain-on-exit` must be in effect BEFORE the CLI can exit, or a
       // fast death (exit 127 from a missing binary is sub-100ms) takes the
       // whole session with it and the exit status is gone forever. applySession

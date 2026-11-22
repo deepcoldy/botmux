@@ -128,7 +128,7 @@ Keys in the interactive list:
 | Key | Action |
 |------|------|
 | `↑` / `↓` (or `k` / `j`) | Select a session |
-| `Enter` | Attach to the managed tmux / ZMX terminal; a suspended session is resumed first |
+| `Enter` | Attach to the managed tmux / ZMX / hc terminal; a suspended session is resumed first |
 | `d` (or `x`) | Delete the selected session (press `y` to confirm) |
 | `q` / `Esc` | Quit |
 

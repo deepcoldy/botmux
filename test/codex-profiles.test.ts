@@ -76,6 +76,14 @@ describe('Codex profiles: bounded, target-local and non-executing scan', () => {
   });
   it('rejects RPC explicitly without changing eligibility or selecting another backend', async () => {
     expect(await scanCodexProfiles({ cliId: 'codex', backendType: 'tmux', codexRpcInput: true })).toMatchObject({ status: 'unsupported', error: 'unsupported_rpc' });
+    expect(await scanCodexProfiles({ cliId: 'codex', backendType: 'hc', codexRpcInput: true })).toMatchObject({ status: 'unsupported', error: 'unsupported_rpc' });
+  });
+  it('scans and validates the profile of an hc terminal launch like a tmux one', async () => {
+    const { home, cfg } = fixture();
+    writeFileSync(join(home, 'work.config.toml'), 'model="x"');
+    expect(await scanCodexProfiles({ ...cfg, backendType: 'hc' })).toMatchObject({ status: 'ok', candidates: [{ name: 'work', available: true }] });
+    expect(await validateCodexProfile({ ...cfg, backendType: 'hc' }, 'work')).toBe(home);
+    expect(await scanCodexProfiles({ ...cfg, backendType: 'zmx' })).toMatchObject({ status: 'unsupported', error: 'unsupported_launch' });
   });
   it.each([{ wrapperCli: 'do-not-execute --hooks' }, { sandbox: true }, { readIsolation: true }, { codexAuthSync: 'isolated' }, { cliId: 'claude-code' }, { cliPathOverride: '/arbitrary/wrapper' }, { startupCommands: ['export CODEX_HOME=/other'] }])('refuses unsupported launch without probing %j', async overrides => {
     const catalog = await scanCodexProfiles({ cliId: 'codex', ...overrides } as ProfileLaunch);

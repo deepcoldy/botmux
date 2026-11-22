@@ -188,6 +188,7 @@ import {
 import { computeSessionPickerScrollWindow } from './cli/session-picker-viewport.js';
 import {
   canWakeDormantBackendForAttach,
+  type ManagedAttachBackend,
   type SessionListWakeRequestContext,
   wakeDormantBackendForAttach,
 } from './cli/session-list-wake.js';
@@ -198,6 +199,7 @@ import {
   attachFrozenManagedZmxSession,
   freezeManagedZmxAttachTarget,
 } from './cli/zmx-managed-attach.js';
+import { prepareManagedHcAttach, runManagedHcAttach } from './cli/hc-managed-attach.js';
 import {
   FLEET_DAEMON_EXIT_WAIT_MS,
 } from './core/shutdown-budgets.js';
@@ -1729,8 +1731,9 @@ async function promptEditBotConfig(
 
   printInputHelp('会话后端 backendType', [
     '可选。pty 更轻量；tmux 支持 adopt 和 Web Terminal 附着；herdr 支持托管持久会话；zmx >= 0.7.0 提供纯文本持久会话 + 本机 attach（无 Web TUI）；zellij 为实验后端（需 zellij >= 0.44）。',
+    'hc 基于 herdr-core 运行持久会话，需显式选用，本机要有 herdr-core >= 0.1.19（仅 Linux，botmux 不自动安装）。',
     '选择 traex + herdr 时，可在 Dashboard Settings 中开启 TraeX herdr plugin opt-in 并填写可信插件 spec；默认不会自动安装第三方插件。',
-    '留空保留当前值；输入 - 回到全局默认（未设置 BACKEND_TYPE 时为 tmux）；接受 pty / tmux / herdr / zellij / zmx。',
+    '留空保留当前值；输入 - 回到全局默认（未设置 BACKEND_TYPE 时为 tmux）；接受 pty / tmux / herdr / zellij / zmx / hc。',
   ]);
   input.backendType = await ask(rl, `会话后端 backendType [${formatOptionalValue(bot.backendType)}]: `);
 
@@ -3711,9 +3714,17 @@ async function printAddBotLiveHint(appId: string): Promise<void> {
  *  would gate at first message. A present-but-broken tmux (functional probe
  *  flaked) is NOT fatal: the daemon still starts and degrades per-session, so a
  *  transient probe failure can't block reattaching live sessions (PR#249). An
- *  unexpected exception in the probe itself is non-fatal for the same reason. */
+ *  unexpected exception in the probe itself is non-fatal for the same reason.
+ *  hc follows the same rule, but only when it is the sole backend wanted
+ *  (shouldHardFailStartupForMissingHc); otherwise a missing hc only warns. */
 async function ensureSystemDependencies(): Promise<void> {
-  const { ensureDependencies, shouldHardFailStartupForMissingTmux } = await import('./setup/index.js');
+  const {
+    checkHcDependency,
+    ensureDependencies,
+    reportHcDependency,
+    shouldHardFailStartupForMissingHc,
+    shouldHardFailStartupForMissingTmux,
+  } = await import('./setup/index.js');
   let report: Awaited<ReturnType<typeof ensureDependencies>>;
   try {
     report = await ensureDependencies();
@@ -3726,7 +3737,8 @@ async function ensureSystemDependencies(): Promise<void> {
 
   // loadBotsJson() returns [] when bots.json is absent (→ no bot wants tmux) and
   // hard-exits on a malformed file (existing fast-fail) — it never throws here.
-  const anyBotWantsTmux = loadBotsJson().some(b => (b?.backendType ?? config.daemon.backendType) === 'tmux');
+  const botBackends: Array<string | undefined> = loadBotsJson().map(b => b?.backendType ?? config.daemon.backendType);
+  const anyBotWantsTmux = botBackends.some(backend => backend === 'tmux');
   const ptyOptIn = (process.env.BACKEND_TYPE ?? '').toLowerCase() === 'pty';
 
   if (shouldHardFailStartupForMissingTmux({
@@ -3742,6 +3754,33 @@ async function ensureSystemDependencies(): Promise<void> {
     console.error('   （注意：PTY 会话不跨 daemon 重启存活，仅作应急。）');
     console.error('');
     process.exit(1);
+  }
+
+  if (botBackends.includes('hc')) {
+    // ensureDependencies reads bots.json raw; probe here if it saw no hc bot.
+    let hc = report.hc;
+    if (!hc) {
+      hc = checkHcDependency();
+      reportHcDependency(hc);
+    }
+    if (shouldHardFailStartupForMissingHc({
+      hcAvailable: hc.availability.ok,
+      hcBinaryPresent: hc.binaryPresent,
+      botBackends,
+      activeSessionBackends: () => {
+        try {
+          return [...loadSessions().values()].filter(s => s.status === 'active').map(s => s.backendType);
+        } catch {
+          return null;
+        }
+      },
+    })) {
+      console.error('');
+      console.error('❌ herdr-core 未安装，且所有 bot 与活跃会话都使用 hc 后端，已中止 daemon 启动。');
+      console.error('   请按上方指引放好 herdr-core 后重试，或把 bot 的 backendType 改回 "tmux"。');
+      console.error('');
+      process.exit(1);
+    }
   }
 }
 
@@ -4726,8 +4765,8 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
 
   // Provider-specific backing teardown (no daemon to run killWorker()). Adopted
   // panes belong to the user and are never touched. This runs BEFORE the durable
-  // close so a ZMX ownership-tag mismatch fails closed: refusing to hide the sole
-  // control row while its CLI is still alive under a different owner.
+  // close so a ZMX or hc ownership-label mismatch fails closed: refusing to hide
+  // the sole control row while its CLI is still alive under a different owner.
   let cleanedBacking: string | undefined;
   if (!isAdoptedSession(current)) {
     if (isSuspendableBackendType(current.backendType)) {
@@ -4740,15 +4779,14 @@ async function abandonSessionOffline(session: SessionData): Promise<OfflineAband
         killPersistentBackendTarget(target, current.sessionId);
         cleanedBacking = `${target.backendType}:${target.sessionName}`;
       } catch (err) {
-        // ZMX destruction is identity-verified against the complete botmux
-        // session UUID and waits for confirmed disappearance. Swallowing an
-        // inconclusive/mismatched kill would hide the sole control row while
-        // its CLI remains alive. Older mux backends keep their historical
-        // best-effort offline-close compatibility.
-        if (target.backendType === 'zmx') {
+        // ZMX and hc destruction is identity-verified against the complete
+        // botmux session UUID. Swallowing an inconclusive/mismatched kill would
+        // hide the sole control row while its CLI remains alive. Older mux
+        // backends keep their historical best-effort offline-close compatibility.
+        if (target.backendType === 'zmx' || target.backendType === 'hc') {
           return {
             ok: false,
-            error: `ZMX 离线删除未完成：${err instanceof Error ? err.message : String(err)}`,
+            error: `${target.backendType === 'zmx' ? 'ZMX' : 'hc'} 离线删除未完成：${err instanceof Error ? err.message : String(err)}`,
           };
         }
       }
@@ -5289,7 +5327,7 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
   target?: PersistentBackendTarget;
   probe: 'exists' | 'missing' | 'unknown';
   label: string;
-  attachBackend?: 'tmux' | 'zmx';
+  attachBackend?: ManagedAttachBackend;
 } {
   if (isSuspendableBackendType(s.backendType)) {
     const target = sessionPersistentTarget(s)!;
@@ -5300,7 +5338,7 @@ function sessionBackingInfo(s: SessionData, snapshot?: BackingProbeSnapshot): {
       target,
       probe,
       label: `${s.backendType}: ${persistentTargetDisplay(target)}${suffix}`,
-      attachBackend: s.backendType === 'tmux' || s.backendType === 'zmx'
+      attachBackend: s.backendType === 'tmux' || s.backendType === 'zmx' || s.backendType === 'hc'
         ? s.backendType
         : undefined,
     };
@@ -5434,7 +5472,7 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
     alive: boolean;
     backendTarget?: PersistentBackendTarget;
     backingProbe: 'exists' | 'missing' | 'unknown';
-    attachBackend?: 'tmux' | 'zmx';
+    attachBackend?: ManagedAttachBackend;
     isAdopt: boolean;
     targetLabel: string;
     canAttach: boolean;
@@ -5868,6 +5906,32 @@ function interactiveSessionPicker(active: SessionData[], probeSnapshot: BackingP
             attachDeps,
           );
           if (!attached.ok) console.error(attached.message);
+        } else if (selected.attachBackend === 'hc') {
+          const target = selected.backendTarget;
+          if (!target || target.backendType !== 'hc') {
+            flash = { style: 'error', text: 'hc attach target is missing or inconsistent' };
+            render();
+            return;
+          }
+          // Prove the labels while the picker is still active; the attach then
+          // goes to the proven address, not the name.
+          wakeInFlight = true;
+          let plan: Awaited<ReturnType<typeof prepareManagedHcAttach>>;
+          try {
+            plan = await prepareManagedHcAttach(target, selected.session.sessionId);
+          } finally {
+            wakeInFlight = false;
+          }
+          if (pickerClosed) return;
+          if (!plan.ok) {
+            flash = { style: 'error', text: plan.message };
+            render();
+            return;
+          }
+          cleanup();
+          console.error(`hc: ${target.sessionName}（Ctrl+\\ 断开）`);
+          const attached = runManagedHcAttach(plan);
+          if (!attached.ok) console.error(attached.message);
         } else {
           const target = selected.backendTarget;
           if (!target || target.backendType !== 'tmux') {
@@ -5919,6 +5983,28 @@ function cmdManagedZmxAttach(args: string[]): void {
     return;
   }
   const attached = attachFrozenManagedZmxSession(name, sessionId, frozen.pid, attachDeps);
+  if (!attached.ok) {
+    console.error(attached.message);
+    process.exitCode = 1;
+  }
+}
+
+/** The hc twin of `__zmx-attach-managed`: label-verified attach to a frozen core. */
+async function cmdManagedHcAttach(args: string[]): Promise<void> {
+  const [name, sessionId, hcSession, socket, ...extra] = args;
+  if (!name?.trim() || !sessionId?.trim() || !hcSession?.trim() || !socket?.trim() || extra.length > 0) {
+    console.error('internal usage: __hc-attach-managed <terminal-name> <complete-session-id> <hc-session> <socket>');
+    process.exitCode = 2;
+    return;
+  }
+  const plan = await prepareManagedHcAttach({ backendType: 'hc', sessionName: name, hcSession, socket }, sessionId);
+  if (!plan.ok) {
+    console.error(plan.message);
+    process.exitCode = 1;
+    return;
+  }
+  console.error(`hc: ${name}（Ctrl+\\ 断开）`);
+  const attached = runManagedHcAttach(plan);
   if (!attached.ok) {
     console.error(attached.message);
     process.exitCode = 1;
@@ -6234,7 +6320,6 @@ async function cmdSuspend(): Promise<void> {
   // 预告成 排队/挂起，实际执行拿到 `session_transferring`。transfer 是短暂窗口，
   // 为一个 dry-run 预告给 SessionRow 加字段不成比例；如果以后行里有了该状态，
   // 在 adopt 之前补一条分支即可。
-  const SUSPENDABLE_BACKENDS = new Set(['tmux', 'herdr', 'zellij', 'zmx']);
   type Prediction = 'defer' | 'suspend' | 'no_worker' | 'refuse' | 'skip_no_daemon' | 'unknown';
   const predictSuspend = (lk: Lookup): Prediction => {
     if (lk.kind === 'no_daemon') return 'skip_no_daemon';
@@ -6244,7 +6329,7 @@ async function cmdSuspend(): Promise<void> {
     if (!row) return 'unknown';
     if (row.adopt) return 'refuse';                          // adopt_suspend_unsupported
     if (row.status === 'dormant' || row.status === 'closed') return 'no_worker';
-    if (!SUSPENDABLE_BACKENDS.has(row.backendType)) return 'refuse';  // backend_not_suspendable
+    if (!isSuspendableBackendType(row.backendType)) return 'refuse';  // backend_not_suspendable
     if (row.status === 'working' || row.status === 'analyzing') return 'defer';
     return 'suspend';
   };
@@ -22031,6 +22116,7 @@ switch (command) {
   case 'list':
   case 'ls':      await cmdList(); break;
   case '__zmx-attach-managed': cmdManagedZmxAttach(process.argv.slice(3)); break;
+  case '__hc-attach-managed': await cmdManagedHcAttach(process.argv.slice(3)); break;
   // Hidden self-check for the compiled single-file binary: exercise the two
   // setup-time code paths that load lark-scopes.json off a module-relative path —
   // readDefaultScopeManifest() (real Open Platform setup) and

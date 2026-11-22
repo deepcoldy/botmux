@@ -56,6 +56,7 @@ botmux 只是「飞书 ↔ CLI」的桥，**不负责帮你登录 CLI**。所以
 | `herdr` | 需要 herdr，botmux 可以帮你装 |
 | `zellij` | 需要你自己装好 zellij |
 | `zmx` | 需要你自己装好 zmx（≥ 0.7.0），见 [ZMX 会话后端](/zmx) |
+| `hc` | 仅 Linux，需要你自己准备 herdr-core（≥ 0.1.19），botmux 不会自动安装，见 [hc 会话后端](/hc) |
 
 ## 推荐部署在哪
 

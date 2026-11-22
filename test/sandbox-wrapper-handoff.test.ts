@@ -75,10 +75,12 @@ describe('sandboxed wrapper launch', () => {
     expect(launch.args.slice(1)).toEqual(['x', 'codex', 'exec', 'hi']);
   });
 
-  it('P2: never builds the launch for a warm reattach, and only on local pty/tmux', () => {
+  it('P2: never builds the launch for a warm reattach, and only on local pty/tmux/hc', () => {
     const base = { wrapperConfigured: true, sandboxRequested: true, backendType: 'tmux', reattach: false };
     expect(buildsSandboxWrapperLaunch(base)).toBe(true);
     expect(buildsSandboxWrapperLaunch({ ...base, backendType: 'pty' })).toBe(true);
+    expect(buildsSandboxWrapperLaunch({ ...base, backendType: 'hc' })).toBe(true);
+    expect(buildsSandboxWrapperLaunch({ ...base, backendType: 'hc', reattach: true })).toBe(false);
     expect(buildsSandboxWrapperLaunch({ ...base, reattach: true })).toBe(false);
     expect(buildsSandboxWrapperLaunch({ ...base, backendType: 'herdr' })).toBe(false);
     expect(buildsSandboxWrapperLaunch({ ...base, sandboxRequested: false })).toBe(false);

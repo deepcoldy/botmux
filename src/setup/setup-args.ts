@@ -151,7 +151,8 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
                              displayName、executable、update，传 - 清空
   --wrapper-cli <prefix>     通用启动前缀（如 "aiden x claude"），覆盖 --cli 推导值
   --model <m>                CLI 模型名
-  --backend <b>              会话后端 pty | tmux | herdr | zellij | zmx
+  --backend <b>              会话后端 pty | tmux | herdr | zellij | zmx | hc
+                             hc 需显式选用，且本机要有 herdr-core >= 0.1.19（仅 Linux）
                              traex + herdr 插件安装需在 Dashboard Settings 中显式开启并填写可信 source/ref
   --working-dir <dirs>       仓库选择卡片的扫描根目录（逗号分隔多个）
   --default-working-dir <d>  固定默认目录：新话题直接在此目录启动、不弹仓库

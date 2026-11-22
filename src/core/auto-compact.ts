@@ -23,9 +23,9 @@ export function supportsNativeAutoCompact(cliId: string): boolean {
 /** Runtime capability for unattended native compaction.
  *
  * Codex needs a live terminal cursor + viewport snapshot for its positive
- * empty-composer proof. Only the tmux backend exposes that authoritative
- * input state today, and RPC-input sessions use the pane as a viewer rather
- * than an input surface. Claude keeps its existing renderer-based evidence. */
+ * empty-composer proof. Only the tmux and hc backends expose that
+ * authoritative input state today, and RPC-input sessions use the pane as a
+ * viewer rather than an input surface. Claude keeps its existing renderer-based evidence. */
 export function supportsNativeAutoCompactRuntime(
   cliId: string,
   backendType: string | undefined,
@@ -33,7 +33,7 @@ export function supportsNativeAutoCompactRuntime(
 ): boolean {
   if (!supportsNativeAutoCompact(cliId)) return false;
   if (cliId !== 'codex') return true;
-  return backendType === 'tmux' && !codexRpcInput;
+  return (backendType === 'tmux' || backendType === 'hc') && !codexRpcInput;
 }
 
 export interface AutoCompactObservation {

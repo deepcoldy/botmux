@@ -21,8 +21,8 @@ export default defineConfig({
     exclude: ['test/e2e-browser/**', '**/*.e2e.ts', 'node_modules/**'],
     testTimeout: 30_000,
     // Same fences as the unit project in vitest.config.ts: a config that drops
-    // them lets the normal unit files reach the host's tmux servers.
-    globalSetup: ['./test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts'],
-    setupFiles: ['./test/tmux-fence-setup.ts', './test/unit-setup.ts', './test/helpers/non-linux-probe-setup.ts'],
+    // them lets the normal unit files reach the host's tmux servers and hc cores.
+    globalSetup: ['./test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts', './test/hc-fence-global-setup.ts'],
+    setupFiles: ['./test/tmux-fence-setup.ts', './test/hc-fence-setup.ts', './test/unit-setup.ts', './test/helpers/non-linux-probe-setup.ts'],
   },
 });

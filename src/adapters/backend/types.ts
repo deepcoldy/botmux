@@ -9,7 +9,7 @@ import type {
   RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
 
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner' | 'orca';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'hc' | 'riff' | 'mojo' | 'remote-runner' | 'orca';
 
 export type HerdrBackendPlacement = 'workspace' | 'tab' | 'split';
 
@@ -177,6 +177,9 @@ export type PersistentBackendTarget =
   | { backendType: 'zellij'; sessionName: string }
   // New ZMX targets freeze the native socket directory; older rows may omit it.
   | { backendType: 'zmx'; sessionName: string; socketDir?: string }
+  // The hc core (HC_SESSION + socket) the terminal was created on; the terminal
+  // name is `bmx-<sid8>`, its owner the `botmux_sid` label (hc/cli-ops.ts).
+  | { backendType: 'hc'; sessionName: string; hcSession: string; socket: string }
   | {
     backendType: 'herdr';
     sessionName: string;

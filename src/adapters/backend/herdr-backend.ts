@@ -15,7 +15,7 @@ import { maskCredentialShapes } from '../../core/stuck-page-catalog.js';
 
 const { Terminal } = xtermHeadless;
 
-export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
+export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'hc'>;
 
 export interface HerdrExternalTarget {
   sessionName: string;

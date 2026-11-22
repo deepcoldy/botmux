@@ -225,3 +225,60 @@ describe('read-isolation persistent-pane teardown', () => {
     expect(afterKill).toBeGreaterThan(owned);
   });
 });
+
+describe('hc wiring inside the worker spawn and web closures', () => {
+  // 源码结构护栏(K2)：hc 的门禁判定 resolveHcBackendGate 在 hc-backend-selection.test.ts 有行为测试，但它在 spawnCli
+  // 闭包里的接线没有行为 seam：解析出的 target 必须在 selectBackend 之前冻结进 cfg.persistentBackendTarget，
+  // 否则后续探测/kill/重连会打到另一个 core；selectBackend 必须用 hc 自己的冻结探针做重连偏置；每处拆除后
+  // 刷新 tmux 冻结探针的地方也必须刷新 hc 的，否则重选后端会重新连上刚杀掉的终端。
+  it('freezes the resolved hc target before selection and refreshes its probe wherever tmux does', () => {
+    const gate = workerSource.indexOf('resolveHcBackendGate({');
+    const freeze = workerSource.indexOf('cfg.persistentBackendTarget = resolved.target;', gate);
+    const select = workerSource.indexOf('let selectedBackend = selectBackend();');
+    expect(gate).toBeGreaterThan(-1);
+    expect(freeze).toBeGreaterThan(gate);
+    expect(select).toBeGreaterThan(freeze);
+    expect(workerSource).toMatch(/effectiveBackend === 'hc'\s*\?\s*persistentReattachBias\(resolvedHcSessionProbe\)/);
+
+    const tmuxRefresh = /\} else if \(effectiveBackendType === 'tmux'\) \{\s*resolvedTmuxSessionProbe = [^;]+;\s*\}( else if \(effectiveBackendType === 'hc'\) \{\s*resolvedHcSessionProbe = [^;]+;)?/g;
+    const refreshes = [...workerSource.matchAll(tmuxRefresh)];
+    expect(refreshes.length).toBeGreaterThan(0);
+    for (const refresh of refreshes) expect(refresh[1], refresh[0]).toBeDefined();
+  });
+
+  // 源码结构护栏(K2)：hc 崩溃诊断终端的驻留/销毁在 hc-worker-wiring.test.ts 有行为测试、attach 命令在
+  // hc-worker-real.test.ts 对真 hc 验证；但 web 终端的逐客户端 attach 分支在 HTTP/WS 闭包里没有行为 seam。
+  // 漏掉它，驻留的诊断 shell 没有任何入口；只读客户端不走 --observe 就能往诊断 shell 里打字。
+  it('serves a parked hc diagnostic terminal per client, observe-only for view clients', () => {
+    const branch = workerSource.indexOf('const hcDiagnostic = crashDiagnosticHcTarget;');
+    expect(branch).toBeGreaterThan(-1);
+    const block = workerSource.slice(branch, workerSource.indexOf('clientPtys.set(ws, cp);', branch));
+    expect(block).toMatch(/if \(\(\(isTmuxMode && !isPipeMode\) \|\| hcDiagnostic\) && sessionId\)/);
+    expect(block).toContain('hcDiagnosticAttachCommand(hcDiagnostic, { observe: !hasWrite })');
+  });
+
+  // 源码结构护栏(K2)：RPC 生命周期判断“幸存终端是不是 RPC 的 --remote viewer”时，hc 必须经标签校验的
+  // hcTerminalPanePid 取 pane pid（真 hc 行为见 hc-worker-real.test.ts）；接线在 init 处理的闭包里，没有行为 seam。
+  // 否则 hc 会话会拿 tmux 的 pane 探针去问一个不存在的 tmux 会话，把旧 viewer 当成原生粘贴终端留下。
+  it("identifies an hc pane's process through the label-checked pid read", () => {
+    const probes = workerSource.indexOf('const rpcPaneProbes = (): PaneProbes => {');
+    expect(probes).toBeGreaterThan(-1);
+    const body = workerSource.slice(probes, workerSource.indexOf('};', probes));
+    expect(body).toMatch(/target\?\.backendType === 'hc'\s*\?\s*\{ panePidOf: \(\) => hcTerminalPanePid\(target, msg\.sessionId\) \}/);
+    expect(workerSource).toContain('paneRunsRemoteTui(name, rpcPaneProbes(), msg.cliRuntime?.executable)');
+  });
+
+  // 源码结构护栏(K2)：hc 重连后的整屏快照和“别的 viewer 拿走了尺寸”事件要分别推给已连接的 web 客户端
+  // （relayHcWebSnapshot / broadcastOwnedPaneReadOnlyFollowerGrid 有行为测试）；接线在后端事件的闭包里，必须带
+  // 后端代际围栏，否则旧后端的迟到事件会把替换后的视图覆盖成上一代的屏幕。
+  it('relays hc resync paints and size changes to web clients behind the backend generation fence', () => {
+    const resync = workerSource.indexOf('backend.onScreenResync?.((snapshot) => {');
+    expect(resync).toBeGreaterThan(-1);
+    const resyncBody = workerSource.slice(resync, workerSource.indexOf('\n  });\n', resync));
+    expect(resyncBody).toMatch(/if \(observedBackend !== backend\) return;[\s\S]*effectiveBackendType === 'hc'[\s\S]*relayHcWebSnapshot\(snapshot\)/);
+    const size = workerSource.indexOf('hcBackend?.onPaneSizeChange(() => {');
+    expect(size).toBeGreaterThan(resync);
+    expect(workerSource.slice(size, workerSource.indexOf('});', size)))
+      .toMatch(/if \(observedBackend !== backend\) return;\s*broadcastOwnedPaneReadOnlyFollowerGrid\(\);/);
+  });
+});

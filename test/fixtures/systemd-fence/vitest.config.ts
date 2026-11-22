@@ -7,7 +7,7 @@ export default defineConfig({
   test: {
     root: fileURLToPath(new URL('../../..', import.meta.url)),
     include: ['test/fixtures/systemd-fence/*.fixture.ts'],
-    globalSetup: ['./test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts'],
-    setupFiles: ['./test/tmux-fence-setup.ts', './test/unit-setup.ts'],
+    globalSetup: ['./test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts', './test/hc-fence-global-setup.ts'],
+    setupFiles: ['./test/tmux-fence-setup.ts', './test/hc-fence-setup.ts', './test/unit-setup.ts'],
   },
 });

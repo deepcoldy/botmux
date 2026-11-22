@@ -80,7 +80,7 @@ export function createWorkspaceResolver(source: () => string = workspaceSourceId
   }
   return async (cwd: string, backendType?: string, force = false): Promise<WorkspaceMetadata> => {
     // Unknown/remote execution environments must not be interpreted on this host.
-    if (!['pty', 'tmux', 'herdr', 'zellij', 'zmx'].includes(backendType ?? '') || !isAbsolute(cwd)) {
+    if (!['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc'].includes(backendType ?? '') || !isAbsolute(cwd)) {
       return { sourceId: source(), kind: 'unknown', state: 'unsupported' };
     }
     // Preserve symlink/.. semantics until realpath runs on the owning host.

@@ -5649,6 +5649,7 @@ const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string; hintKey: st
   { value: 'herdr', labelKey: 'botDefaults.backendHerdr', hintKey: 'botDefaults.backendHerdrHint' },
   { value: 'zellij', labelKey: 'botDefaults.backendZellij', hintKey: 'botDefaults.backendZellijHint' },
   { value: 'zmx', labelKey: 'botDefaults.backendZmx', hintKey: 'botDefaults.backendZmxHint' },
+  { value: 'hc', labelKey: 'botDefaults.backendHc', hintKey: 'botDefaults.backendHcHint' },
   { value: 'pty', labelKey: 'botDefaults.backendPty', hintKey: 'botDefaults.backendPtyHint' },
 ];
 

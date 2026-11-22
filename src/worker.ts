@@ -127,7 +127,7 @@ import { plausibleConfiguredBotmuxHome } from './core/skills/snapshot.js';
 import { skillStoreDir } from './core/skills/registry-paths.js';
 import { pluginsHome } from './core/plugins/paths.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
-import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
+import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, resolvePersistentBackendTarget, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, typeRawCommandLine, writeRawCommandLine } from './core/raw-command-writer.js';
 import {
   decodeTerminalWriteFrameSource,
@@ -593,7 +593,7 @@ import {
   settleLaunchComm,
   readProcessStartTime,
 } from './core/session-discovery.js';
-import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
+import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, codexRpcPaneBackend, hcTerminalPanePid, paneRunsRemoteTui, type PaneProbes, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay, scaleMs } from './utils/timing.js';
 import { waitForProcessQuiescence } from './services/process-quiescence.js';
 import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
@@ -653,6 +653,11 @@ import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-back
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
 import { OrcaBackend, renderOrcaTranscriptHistory } from './adapters/backend/orca-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
+import { HcBackend } from './adapters/backend/hc-backend.js';
+import { hcDiagnosticTarget, hcTerminalName, killHcTerminal, probeHcTerminal, type HcTarget } from './adapters/backend/hc/cli-ops.js';
+import { hcCoreAddress, hcCorePaths, hcRuntimeDirError } from './adapters/backend/hc/core.js';
+import { hcDiagnosticAttachCommand, parkHcDiagnosticTerminal } from './adapters/backend/hc/diagnostic-terminal.js';
+import { probeHcAvailability } from './setup/ensure-hc.js';
 import {
   isCriticalInterruptKey,
   sendCriticalControlKey,
@@ -677,6 +682,7 @@ import {
   decideBackendGate,
   persistentReattachBias,
   reconcileBiasedReattachProbe,
+  resolveHcBackendGate,
   resolveManagedTmuxPlacement,
   resolveTmuxBackendGate,
   retireSupersededRecordedHerdrTarget,
@@ -1306,8 +1312,14 @@ function stopCodexRpcEngine(): void {
  *  spawnCli's willReattachPersistent probe (worker.ts) but callable from the init
  *  handler BEFORE spawnCli runs (effectiveBackendType is stale there). A wrong
  *  guess is safe: an assumed-tmux session that is really pty just has no live
- *  session → treated as fresh. Returns null for non-persistent backends. */
+ *  session → treated as fresh. Returns null for non-persistent backends. hc
+ *  reads an unanswered probe as live, so the RPC lifecycle keeps paste rather
+ *  than engaging a fresh engine the gate would then reattach a stale pane to. */
 function persistentPaneInfo(backendType: string, sessionId: string, target?: PersistentBackendTarget): { name: string; live: boolean } | null {
+  if (backendType === 'hc') {
+    const hcTarget = resolvePersistentBackendTarget('hc', sessionId, target);
+    return { name: hcTarget.sessionName, live: probePersistentBackendTarget(hcTarget) !== 'missing' };
+  }
   let name: string | undefined;
   if (backendType === 'tmux') name = TmuxBackend.sessionName(sessionId);
   else if (backendType === 'herdr') name = HerdrBackend.sessionName(sessionId);
@@ -1366,6 +1378,15 @@ function assertManagedTmuxInstanceIdentity(cfg: Extract<DaemonToWorker, { type: 
   }
 }
 
+/** hc cannot yet prove a reused terminal's instance binding before attaching,
+ *  so a bound hc session must not reach the instance config, an engine or a pane. */
+function refuseUnverifiableInstanceBinding(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  if (!cfg.cliInstanceBinding || cfg.cliInstanceBinding.source === 'legacy') return;
+  if ((cfg.backendType ?? config.daemon.backendType) === 'hc') {
+    throw new Error('Codex 实例池目前只支持 tmux 后端：hc 还不能在接管终端前核对它的实例绑定，已拒绝启动。请把该 bot 的 backendType 改回 tmux');
+  }
+}
+
 /** Tri-state pane liveness, for callers that must not read "no answer" as an
  *  answer. The `hasSession()` helpers collapse an unanswered probe into
  *  `false`, which is safe where a wrong guess just means "treat as fresh" but
@@ -1377,10 +1398,7 @@ function persistentPaneProbe(
   name: string,
   target?: PersistentBackendTarget,
 ): 'live' | 'gone' | 'unknown' {
-  const probe: SessionProbe = target ? probePersistentBackendTarget(target) : backendType === 'tmux' ? TmuxBackend.probeSession(name)
-    : backendType === 'zellij' ? ZellijBackend.probeSession(name)
-      : backendType === 'herdr' ? HerdrBackend.probeSession(name)
-        : ZmxBackend.probeSession(name);
+  const probe: SessionProbe = target ? probePersistentBackendTarget(target) : probePersistentSession(backendType, name);
   if (probe === 'exists') return 'live';
   if (probe === 'missing') return 'gone';
   return 'unknown';
@@ -1747,8 +1765,9 @@ async function codexLaunchReasoningEffort(
 
 async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
   followBotTraeHome(cfg);
-  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
-    assertManagedTmuxInstanceIdentity(cfg);
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    refuseUnverifiableInstanceBinding(cfg);
+    if (cfg.backendType === 'tmux') assertManagedTmuxInstanceIdentity(cfg);
   }
   if (!codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() })) return 'not-engaged';
   if (cfg.codexProfile) throw new Error('Codex profile is not supported by the RPC app-server');
@@ -2968,6 +2987,7 @@ async function prepareCliPluginGenerationAndGateway(
     // RPC calls this before spawnCli. Fence the surviving pane before changing
     // its gateway/catalog, and install the config before either CLI process
     // (app-server or TUI) has a chance to read it.
+    refuseUnverifiableInstanceBinding(cfg);
     if ((cfg.backendType ?? config.daemon.backendType) === 'tmux') {
       assertManagedTmuxInstanceIdentity(cfg);
     }
@@ -3552,6 +3572,8 @@ let isTmuxMode = false;
 let crashDiagnosticTmuxParked = false;
 /** tmux server the diagnostic shell was parked on (undefined = default server). */
 let crashDiagnosticTmuxSocket: string | undefined;
+/** The hc diagnostic terminal (bmx-diag-<sid8>) while one is live. */
+let crashDiagnosticHcTarget: HcTarget | undefined;
 /** True once the daemon told us to stop & park a crash diagnostic (crash loop):
  *  the next user message retries the CLI. Distinct from the flag above because
  *  retry must still fire even if the tmux park itself failed (no hang). */
@@ -8668,7 +8690,7 @@ function stopCodexAppControlChannel(
 function killCodexAppGenerationPane(sessionId: string, fallbackName: string): void {
   const target = lastInitConfig?.persistentBackendTarget;
   if (target?.backendType === effectiveBackendType) killPersistentBackendTarget(target, sessionId);
-  else killPersistentSession(effectiveBackendType as PersistentBackendType, fallbackName);
+  else killPersistentSession(effectiveBackendType as PersistentBackendType, fallbackName, sessionId);
 }
 
 function failCodexAppControlGeneration(reason: string): void {
@@ -8690,7 +8712,9 @@ function failCodexAppControlGeneration(reason: string): void {
         ? ZellijBackend.sessionName(cfg.sessionId)
         : effectiveBackendType === 'herdr'
           ? HerdrBackend.sessionName(cfg.sessionId)
-          : undefined;
+          : effectiveBackendType === 'hc'
+            ? hcTerminalName(cfg.sessionId)
+            : undefined;
     if (name) {
       try { killCodexAppGenerationPane(cfg.sessionId, name); }
       catch (err: any) { log(`Failed to kill rejected Codex App generation: ${err?.message ?? err}`); }
@@ -10036,7 +10060,7 @@ const deploymentCancellationReceipts = new Map<string, (ok: boolean) => void>();
  * forwarding operator bytes through any terminal transport. */
 async function cancelDeploymentForTerminalInput(): Promise<boolean> {
   if (nativeSessionForkPending()) return false;
-  if (lastInitConfig?.cliId !== 'codex' || effectiveBackendType !== 'tmux'
+  if (lastInitConfig?.cliId !== 'codex' || (effectiveBackendType !== 'tmux' && effectiveBackendType !== 'hc')
     || lastInitConfig.adoptMode || lastInitConfig.codexRpcInput) return true;
   discardDeploymentContinuation();
   const requestId = randomBytes(16).toString('hex');
@@ -17262,6 +17286,26 @@ function relayRemoteRunnerWebSnapshot(snapshot: string): void {
   }
 }
 
+/** Replace every web view with an hc reattach paint.
+ *
+ * The snapshot is the backend mirror's history plus screen, the same capture a
+ * newly connected client is seeded with; bytes after it arrive through
+ * onPtyData relative to that paint, so a view still holding the pre-reattach
+ * screen would render them against the wrong base. The history frame resets the
+ * client xterm, input modes included, so write clients get them re-asserted.
+ */
+function relayHcWebSnapshot(snapshot: string): void {
+  scrollback = snapshot.length > MAX_SCROLLBACK
+    ? `\x1bc${snapshot.slice(snapshot.indexOf('\n', snapshot.length - MAX_SCROLLBACK) + 1)}`
+    : snapshot;
+  const payload = `\x1b]1989;history;0\x07${snapshot}`;
+  const modes = backend?.capturePaneInputModes?.() ?? '';
+  for (const ws of wsClients) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    ws.send(authedClients.has(ws) ? payload + modes : payload);
+  }
+}
+
 function applyHerdrWebBindingResult(
   ws: WebSocket,
   result: ReturnType<HerdrWebTerminalBinding['resize']>,
@@ -17282,16 +17326,17 @@ function applyHerdrWebBindingResult(
   }
 }
 
-/** Keep already-connected read-only viewers aligned with an owned tmux grid.
+/** Keep already-connected read-only viewers aligned with an owned tmux/hc grid.
  *
  * A read-only socket never drives the shared pane, but a writable socket may
- * resize it later. Without a fresh pin those existing followers keep rendering
- * at their connection-time dimensions until they reload the page. TmuxPipeBackend
+ * resize it later (and on hc, another viewer may take the size). Without a
+ * fresh pin those existing followers keep rendering at their connection-time
+ * dimensions until they reload the page. TmuxPipeBackend and HcBackend
  * resize/getPaneSize are synchronous, so publish the authoritative post-resize
  * grid rather than trusting the browser request.
  */
-function broadcastOwnedTmuxReadOnlyFollowerGrid(): void {
-  if (effectiveBackendType !== 'tmux' || !isPipeMode || lastInitConfig?.adoptMode) return;
+function broadcastOwnedPaneReadOnlyFollowerGrid(): void {
+  if ((effectiveBackendType !== 'tmux' && effectiveBackendType !== 'hc') || !isPipeMode || lastInitConfig?.adoptMode) return;
   const size = backend?.getPaneSize?.();
   if (!size) return;
   const payload = `\x1b]1989;follower;${size.cols};${size.rows}\x07`;
@@ -17621,12 +17666,13 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
       let screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
       if (!screen || !adapter?.startupReadyFromHistory?.(screen)
         || traexNativeStartupInputIsPending(screen)) {
-        // A tmux CLI can draw its footer before pipe-pane attaches. Later
-        // cursor-only redraws leave the renderer nonempty but incomplete, so
-        // waiting for more stream bytes can strand a ready pane until 90s.
-        // Read the actual current cells without blocking the worker; preserve
-        // the exact generation/output/web-input fence across that await.
-        if (!(observedBackend instanceof TmuxPipeBackend)) return;
+        // A tmux or hc CLI can draw its footer before pipe-pane (or the hc
+        // attach) is in place. Later cursor-only redraws leave the renderer
+        // nonempty but incomplete, so waiting for more stream bytes can strand
+        // a ready pane until 90s. Read the actual current cells without
+        // blocking the worker; preserve the exact generation/output/web-input
+        // fence across that await.
+        if (!(observedBackend instanceof TmuxPipeBackend || observedBackend instanceof HcBackend)) return;
         screen = await observedBackend.captureViewportAsync();
         if (!stillWaiting() || webTerminalInputGeneration !== webInputGeneration
           || renderer !== observedRenderer || backendScreenRevision !== revision
@@ -17634,7 +17680,7 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
           || Date.now() - lastPtyOutputAtMs < 2_000) return;
         if (!screen || !adapter?.startupReadyFromHistory?.(screen)
           || traexNativeStartupInputIsPending(screen)) return;
-        log(`${cliName()} initialized composer recovered from native tmux viewport`);
+        log(`${cliName()} initialized composer recovered from native ${effectiveBackendType} viewport`);
       }
       if (detector?.observeStartupHistory(screen)) {
         log(`${cliName()} ${lastInitConfig?.resume ? 'restored' : 'initialized'} composer observed on screen; rechecking first-prompt readiness`);
@@ -17821,6 +17867,17 @@ function destroyCrashDiagnosticTerminal(reason: string): void {
   // was actually parked (park may have failed); the next retry/close/suspend
   // funnels through here.
   crashDiagnosticStopped = false;
+  if (crashDiagnosticHcTarget && sessionId) {
+    const outcome = killHcTerminal(crashDiagnosticHcTarget, sessionId);
+    log(outcome.result === 'mismatch' || outcome.result === 'unknown'
+      ? `Crash diagnostic hc terminal ${crashDiagnosticHcTarget.sessionName} not removed (${reason}): `
+        + (outcome.result === 'mismatch' ? `held by ${outcome.owner ?? 'a non-botmux owner'}` : outcome.reason)
+      : `Crash diagnostic hc terminal destroyed (${reason})`);
+    crashDiagnosticHcTarget = undefined;
+    const path = crashDiagnosticPath();
+    if (path) { try { unlinkSync(path); } catch { /* already gone — benign */ } }
+    return;
+  }
   if (!crashDiagnosticTmuxParked || !sessionId) return;
   try {
     TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(sessionId), crashDiagnosticTmuxSocket);
@@ -17835,8 +17892,19 @@ function destroyCrashDiagnosticTerminal(reason: string): void {
   crashDiagnosticTmuxParked = false;
 }
 
+/** The diagnostic shell needs a terminal server that outlives the CLI and that
+ *  the daemon's reclaim finds: tmux, or hc on the session's recorded core. */
+function canParkCrashDiagnostic(): boolean {
+  if (lastInitConfig?.adoptMode || !sessionId) return false;
+  return effectiveBackendType === 'tmux'
+    || (effectiveBackendType === 'hc' && lastInitConfig?.persistentBackendTarget?.backendType === 'hc');
+}
+
 function parkCrashDiagnosticTerminal(code: number | null, signal: string | null): boolean {
-  if (lastInitConfig?.adoptMode || effectiveBackendType !== 'tmux' || !sessionId) return false;
+  if (!canParkCrashDiagnostic() || !sessionId) return false;
+  const hcTarget = effectiveBackendType === 'hc' && lastInitConfig?.persistentBackendTarget?.backendType === 'hc'
+    ? lastInitConfig.persistentBackendTarget
+    : undefined;
   const path = crashDiagnosticPath();
   if (!path) return false;
   try {
@@ -17862,6 +17930,28 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   // terminal is pointed at the diagnostic name explicitly (see the WS attach).
   // Same server as the managed session it stands in for, so the web terminal
   // and the daemon's reclaim find it next to bmx-<sid>.
+  if (hcTarget) {
+    const diagnostic = hcDiagnosticTarget(hcTarget, sessionId);
+    try {
+      parkHcDiagnosticTerminal(diagnostic, sessionId, {
+        cwd: lastInitConfig?.workingDir ?? process.cwd(),
+        cols: renderCols || PTY_COLS,
+        rows: renderRows || PTY_ROWS,
+        contentPath: path,
+      });
+    } catch (err: any) {
+      log(`Crash diagnostic hc terminal park failed: ${err?.message ?? err}`);
+      try { unlinkSync(path); } catch { /* benign */ }
+      return false;
+    }
+    crashDiagnosticHcTarget = diagnostic;
+    // Same constraint as the tmux park below: a stale screen tick must not
+    // un-freeze the crash card. Web clients attach per client (see the WS attach).
+    stopScreenUpdates();
+    stopStuckDetector();
+    log(`Crash diagnostic hc terminal parked at ${diagnostic.sessionName} on ${diagnostic.socket}`);
+    return true;
+  }
   const diagnosticSocket = lastInitConfig?.persistentBackendTarget?.backendType === 'tmux'
     ? lastInitConfig.persistentBackendTarget.socketName
     : preferredManagedTmuxSocket();
@@ -23416,7 +23506,7 @@ function persistCliSessionId(cliSessionId: string): void {
     ...(lastInitConfig && ['codex', 'codex-app'].includes(lastInitConfig.cliId) && codexCleanupLaunchTarget
       && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
       && !lastInitConfig.wrapperCli && lastInitConfig.sandbox !== 'scratch'
-      && ['pty', 'tmux'].includes(lastInitConfig.backendType)
+      && ['pty', 'tmux', 'hc'].includes(lastInitConfig.backendType)
       ? { codexCleanupTarget: {
         threadId: cliSessionId,
         ...codexCleanupLaunchTarget,
@@ -27686,8 +27776,9 @@ async function spawnCliBody(
   // The Gateway socket must stay under the inherited, short tmpdir.
   pinSessionMcpGatewaySocketRoot(tmpdir());
   applySessionTempEnv(process.env, sessionScratchDir);
-  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
-    assertManagedTmuxInstanceIdentity(cfg);
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    refuseUnverifiableInstanceBinding(cfg);
+    if (cfg.backendType === 'tmux') assertManagedTmuxInstanceIdentity(cfg);
   }
   // Deferred submit-failure chains are generation-keyed; a fresh generation
   // invalidates every live chain before any old timer can touch new state.
@@ -28058,11 +28149,12 @@ async function spawnCliBody(
   // sessions; ZMX validates its version plus full-list control plane; Herdr
   // uses a non-destructive version check.
   let effectiveBackend = cfg.backendType;
-  const backendCliError = backendCliCompatibilityError(effectiveBackend, cfg.cliId as CliId);
+  const backendCliError = backendCliCompatibilityError(effectiveBackend, cfg.cliId as CliId, cliAdapter);
   if (backendCliError) {
+    const zmx = effectiveBackend === 'zmx';
     throw new Error(
-      `⚠️ ${cfg.cliId} 当前不能使用 ZMX 后端：其完成事件依赖不可见 OSC 控制消息，` +
-      `而 ZMX 的纯文本 history 不保留该通道。请将 backendType 改为 tmux / pty。\n` +
+      `⚠️ ${cfg.cliId} 当前不能使用 ${zmx ? 'ZMX' : effectiveBackend} 后端：其完成事件依赖不可见 OSC 控制消息，` +
+      `${zmx ? '而 ZMX 的纯文本 history 不保留该通道' : '而该后端在输出积压溢出或 core 重启时会丢掉这段输出'}。请将 backendType 改为 tmux / pty。\n` +
       `原因：${backendCliError}`,
     );
   }
@@ -28086,6 +28178,10 @@ async function spawnCliBody(
   // pre-isolation session leaves the shared default server at its next spawn.
   let resolvedTmuxSocketName: string | undefined;
   const preferredTmuxSocket = preferredManagedTmuxSocket();
+  // Frozen hc existence decision on the terminal resolveHcBackendGate froze
+  // into cfg.persistentBackendTarget; same reattach bias and teardown refresh
+  // as tmux.
+  let resolvedHcSessionProbe: SessionProbe | undefined;
   {
     let available = true;
     let reason = '';
@@ -28237,6 +28333,38 @@ async function spawnCliBody(
           // incompatible/unknown ownership result.
           hasExistingSession = false;
         }
+      }
+    } else if (effectiveBackend === 'hc') {
+      const recorded = cfg.persistentBackendTarget;
+      const resolved = resolveHcBackendGate({
+        sessionId: cfg.sessionId,
+        recorded,
+        availability: () => probeHcAvailability({ env: process.env }),
+        defaultCore: () => hcCoreAddress(hcCorePaths(process.env)),
+        coreUnreachable: core => {
+          try {
+            return hcRuntimeDirError(hcCorePaths(process.env, { core }));
+          } catch (err) {
+            return err instanceof Error ? err.message : String(err);
+          }
+        },
+        probe: target => probeHcTerminal(target),
+      });
+      resolvedHcSessionProbe = resolved.probe;
+      available = resolved.available;
+      reason = resolved.reason;
+      hasExistingSession = resolved.hasExistingSession;
+      existingSessionUnknown = resolved.existingSessionUnknown;
+      if (resolved.target) {
+        if (recorded?.backendType === 'hc' && recorded.socket && recorded.socket !== resolved.target.socket) {
+          log(`hc terminal ${resolved.target.sessionName} is gone from ${recorded.socket}; it is created on ${resolved.target.socket}`);
+        }
+        // Freeze before selection: every later probe, kill and reattach of this
+        // incarnation addresses this core.
+        cfg.persistentBackendTarget = resolved.target;
+      }
+      if (existingSessionUnknown) {
+        log(`hc get ${resolved.target?.sessionName} got no answer from ${resolved.target?.socket}; biasing toward reattach instead of creating`);
       }
     } else if (effectiveBackend === 'herdr') {
       // herdr's isAvailable() is a cheap, non-destructive `herdr --version`
@@ -28836,7 +28964,9 @@ async function spawnCliBody(
         ? resolvedZellijSessionProbe !== undefined && resolvedZellijSessionProbe !== 'missing'
         : effectiveBackend === 'tmux'
           ? persistentReattachBias(resolvedTmuxSessionProbe)
-          : undefined,
+          : effectiveBackend === 'hc'
+            ? persistentReattachBias(resolvedHcSessionProbe)
+            : undefined,
     tmuxSocketName: persistentReattachBias(resolvedTmuxSessionProbe) ? resolvedTmuxSocketName : preferredTmuxSocket,
     // Only strict workers pin an absolute root. Persist it with the existing
     // target so daemon workerless probe/kill uses explicit -S on the SAME server.
@@ -28852,15 +28982,21 @@ async function spawnCliBody(
   // turns a doomed reattach into a proper cold spawn WITH the fresh-path setup;
   // a still-'unknown' answer keeps the reattach bias, so the backend never
   // creates over a possibly-live pane (no duplicate-session swallowing).
-  if (effectiveBackend === 'tmux' || effectiveBackend === 'zellij') {
-    const before = effectiveBackend === 'tmux' ? resolvedTmuxSessionProbe : resolvedZellijSessionProbe;
+  if (effectiveBackend === 'tmux' || effectiveBackend === 'zellij' || effectiveBackend === 'hc') {
+    const frozenHcTarget = cfg.persistentBackendTarget?.backendType === 'hc' ? cfg.persistentBackendTarget : undefined;
+    const before = effectiveBackend === 'tmux' ? resolvedTmuxSessionProbe
+      : effectiveBackend === 'zellij' ? resolvedZellijSessionProbe
+        : resolvedHcSessionProbe;
     const after = reconcileBiasedReattachProbe(before, () => (effectiveBackend === 'tmux'
       ? TmuxBackend.probeSessionWithRetry(TmuxBackend.sessionName(cfg.sessionId), { socketName: resolvedTmuxSocketName })
-      : ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId))));
+      : effectiveBackend === 'zellij'
+        ? ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId))
+        : frozenHcTarget ? probeHcTerminal(frozenHcTarget) : 'unknown'));
     if (after !== before) {
       log(`${effectiveBackend} existence re-probe before spawn: ${before} → ${after}`);
       if (effectiveBackend === 'tmux') resolvedTmuxSessionProbe = after;
-      else resolvedZellijSessionProbe = after;
+      else if (effectiveBackend === 'zellij') resolvedZellijSessionProbe = after;
+      else resolvedHcSessionProbe = after;
     }
   }
   let selectedBackend = selectBackend();
@@ -29160,7 +29296,7 @@ async function spawnCliBody(
   // scoped to it so an ordinary transport-enabled chat is never subjected to the
   // tombstone requirement (no false kills).
   const noTransportSession = !sessionLarkTransportEnabled({ chatId: cfg.chatId, apiOnly: cfg.apiOnly });
-  const isolationCapableBackend = effectiveBackendType === 'tmux';
+  const isolationCapableBackend = effectiveBackendType === 'tmux' || effectiveBackendType === 'hc';
   // Existence via no-follow probes so a planted/tampered leaf still counts as
   // present (→ triggers cleanup / conservative kill) and can never be used to
   // force a silent reattach.
@@ -29173,7 +29309,7 @@ async function spawnCliBody(
   // Enter for:
   //   · any policy-ON spawn (capability check runs on every persistent backend,
   //     incl. credential-only zellij/herdr/zmx), OR
-  //   · a policy-OFF no-transport tmux session (the file-sandbox migration scope), OR
+  //   · a policy-OFF no-transport tmux/hc session (the file-sandbox migration scope), OR
   //   · ANY session (incl. transport-enabled, any backend) that has stale
   //     provenance on disk — so a dead pane's leftover marker/tombstone is cleared
   //     before cold-spawn on EVERY backend. Otherwise a transport chat that turned
@@ -29361,6 +29497,8 @@ async function spawnCliBody(
           resolvedZellijSessionProbe = 'missing';
         } else if (effectiveBackendType === 'tmux') {
           resolvedTmuxSessionProbe = 'missing';
+        } else if (effectiveBackendType === 'hc') {
+          resolvedHcSessionProbe = 'missing';
         }
       },
       clearProvenanceVerified: () => {
@@ -29459,13 +29597,13 @@ async function spawnCliBody(
         `could not verify existing ${effectiveBackendType} pane`,
       );
     }
-    // zellij's pre-spawn bias reattaches on an indeterminate probe (a live pane
-    // is likelier than a gone one under load). That bias is WRONG for an
+    // zellij's and hc's pre-spawn bias reattaches on an indeterminate probe (a
+    // live pane is likelier than a gone one under load). That bias is WRONG for an
     // MCP-gateway pane: reattaching binds the CLI's MCP client to a relay socket
     // that cannot survive this worker, and the gate below only cold-resumes on a
-    // proven 'exists'. So an unverifiable zellij pane here must fail closed like
+    // proven 'exists'. So an unverifiable zellij/hc pane here must fail closed like
     // zmx rather than silently reattach to a possibly-dead gateway host.
-    if (effectiveBackendType === 'zellij' && paneProbe === 'unknown') {
+    if ((effectiveBackendType === 'zellij' || effectiveBackendType === 'hc') && paneProbe === 'unknown') {
       throw new Error(
         `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
         `could not verify existing ${effectiveBackendType} pane`,
@@ -29531,7 +29669,7 @@ async function spawnCliBody(
       // would let the new backend reattach to the pane we just tried to remove.
       // Deliberately not probePaneAfterKill: this gate delegates to
       // shouldRejectPersistentPostKillProbe (for tmux only 'exists' is
-      // rejected; zmx additionally fail-closes on 'unknown'), so for tmux a
+      // rejected; zmx and hc additionally fail-close on 'unknown'), so for tmux a
       // mid-exit 'unknown' already reads as gone here — nothing to re-ask.
       const postKillProbe = effectiveBackendType === 'zmx'
         ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
@@ -29554,6 +29692,8 @@ async function spawnCliBody(
         resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
       } else if (effectiveBackendType === 'tmux') {
         resolvedTmuxSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
+      } else if (effectiveBackendType === 'hc') {
+        resolvedHcSessionProbe = postKillProbe;
       }
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
@@ -29602,6 +29742,8 @@ async function spawnCliBody(
       resolvedZellijSessionProbe = 'missing';
     } else if (effectiveBackendType === 'tmux') {
       resolvedTmuxSessionProbe = 'missing';
+    } else if (effectiveBackendType === 'hc') {
+      resolvedHcSessionProbe = 'missing';
     }
     selectedBackend = selectBackend();
     isTmuxMode = selectedBackend.isTmuxMode;
@@ -30930,7 +31072,7 @@ async function spawnCliBody(
   if (!codexRpcEngine) {
     codexCleanupLaunchTarget = undefined;
     if (!cfg.adoptMode && !cfg.existingAppServerEndpoint && !cfg.wrapperCli && cfg.sandbox !== 'scratch'
-        && ['pty', 'tmux'].includes(effectiveBackendType)) {
+        && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)) {
       try {
         codexCleanupLaunchTarget = freezeCodexCleanupLaunch(cfg.cliId, cliAdapter.resolvedBin, args,
           childEnv.CODEX_HOME ?? join(homedir(), '.codex'));
@@ -30966,11 +31108,11 @@ async function spawnCliBody(
   // sandbox, as the program the sandbox executes (same namespace, same
   // allowlist as the CLI). Build the launch now, before any sandbox wrapping
   // rewrites spawnBin/spawnArgs; the sandbox builders below take it as their
-  // command. Only the local pty/tmux backends run a sandbox around a local
+  // command. Only the local pty/tmux/hc backends run a sandbox around a local
   // command; other backends keep ignoring the wrapper under a sandbox.
   const wrapperCliConfigured = !!cfg.wrapperCli && !!cfg.wrapperCli.trim();
   const wrapperInsideSandbox = wrapperCliConfigured && sandboxRequested
-    && (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux');
+    && (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux' || effectiveBackendType === 'hc');
   let sandboxWrapperLaunch: SandboxWrapperLaunch | undefined;
   sandboxWrapperAwaitingFirstPrompt = undefined;
   if (buildsSandboxWrapperLaunch({
@@ -31034,8 +31176,8 @@ async function spawnCliBody(
     const dataDir = process.env.SESSION_DATA_DIR;
     // FAIL-SAFE (not fail-open): a requested sandbox that can't be established
     // must be a HARD ERROR, never a silent unconfined run.
-    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux') {
-      const msg = `Sandbox ENABLED but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux) — aborting spawn to avoid an unsandboxed run`;
+    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux' && effectiveBackendType !== 'hc') {
+      const msg = `Sandbox ENABLED but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux/hc) — aborting spawn to avoid an unsandboxed run`;
       log(msg);
       throw new Error(msg);
     }
@@ -31828,7 +31970,7 @@ async function spawnCliBody(
             ...(service.attestProcessPeer ? { attestProcessPeer: true } : {}),
           })),
         larkCliDataDir: childLarkDataRoot,
-        useBwrapArgsFile: effectiveBackendType === 'tmux',
+        useBwrapArgsFile: effectiveBackendType === 'tmux' || effectiveBackendType === 'hc',
         minimaxDataDir: cliAdapter.id === 'minimax' ? cliAdapter.authPaths?.[0] : undefined,
         childTarOptions: perBotInjectEnv.TAR_OPTIONS ?? childEnv.TAR_OPTIONS,
       });
@@ -31896,8 +32038,8 @@ async function spawnCliBody(
     if (!scratchDataDir) {
       throw new Error('Sandbox ENABLED (scratch) but SESSION_DATA_DIR is unset — aborting spawn to avoid an unsandboxed run');
     }
-    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux') {
-      const msg = `Sandbox ENABLED (scratch) but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux) — aborting spawn`;
+    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux' && effectiveBackendType !== 'hc') {
+      const msg = `Sandbox ENABLED (scratch) but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux/hc) — aborting spawn`;
       log(msg);
       throw new Error(msg);
     }
@@ -32058,7 +32200,7 @@ async function spawnCliBody(
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
         readOnlyCarvePaths: scratchReadOnlyCarves,
-        useBwrapArgsFile: effectiveBackendType === 'tmux',
+        useBwrapArgsFile: effectiveBackendType === 'tmux' || effectiveBackendType === 'hc',
       });
       if (!prepared.ok) {
         log(`scratch sandbox (${storage})${reusingRepairedScratch ? ' reuse' : ''} could not be established: ${prepared.failure.reason}${prepared.failure.detail ? ` (${prepared.failure.detail})` : ''}`);
@@ -32114,8 +32256,8 @@ async function spawnCliBody(
   // spawn confirms a genuine fresh generation.
   //
   // Policy ON → ISOLATION marker; policy OFF on a no-transport isolation-capable
-  // (tmux) session → POLICY-OFF TOMBSTONE. The tombstone is tmux-only
-  // (isolationCapableBackend === tmux), so the policy-off circular-proof concern is
+  // (tmux/hc) session → POLICY-OFF TOMBSTONE. The tombstone is tmux/hc-only
+  // (isolationCapableBackend), so the policy-off circular-proof concern is
   // fully closed synchronously. See PersistentPaneCommit below for the ZELLIJ
   // exception (option B: isolation-capable zellij stays pending → always cold-spawn).
   type PersistentPaneCommit = {
@@ -32170,7 +32312,7 @@ async function spawnCliBody(
     }
   } else if (appliedIsolationCapabilities.length === 0 && persistentSessionName
       && !willReattachPersistent && noTransportSession && isolationCapableBackend) {
-    // Policy-OFF generation proof (tmux-only: isolationCapableBackend === tmux).
+    // Policy-OFF generation proof (tmux/hc only: isolationCapableBackend).
     // NOT best-effort: if we cannot durably record the PENDING proof we must fail
     // closed rather than spawn a pane we can never prove. The committed tombstone
     // is written post-spawn only on a confirmed fresh generation.
@@ -32748,7 +32890,8 @@ async function spawnCliBody(
       // the OSC 7501 probe via pipe-pane, so Claude Code would disable program
       // status. An in-pane relay answers the probe ahead of the DA1 query
       // (src/program-status-relay.ts). The pane pid becomes the relay; the
-      // real CLI pid is resolved below (startWrapperRealPidResolve).
+      // real CLI pid is resolved below (startWrapperRealPidResolve). hc needs
+      // none: it answers the 7501 probe and DA1 for the program itself.
       // Outermost, i.e. OUTSIDE the session scope: the relay's launch shim is a
       // shell script with `$VAR` references, and systemd-run (258+) expands
       // environment references in its payload by default. `systemd-run
@@ -32767,7 +32910,7 @@ async function spawnCliBody(
     }
     let nativeModelLaunch: CodexModelLaunchObservation | undefined;
     if (cfg.cliId === 'codex' && !cfg.adoptMode && !cfg.existingAppServerEndpoint
-      && !willReattachPersistent && ['pty', 'tmux'].includes(effectiveBackendType)) {
+      && !willReattachPersistent && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)) {
       nativeModelLaunch = { model: cfg.model ?? null, startedAtMs: Date.now(), nativeSessionId: cfg.cliSessionId };
       if (cfg.cliSessionId) {
         try {
@@ -33092,8 +33235,9 @@ async function spawnCliBody(
       // protocol that would restore zellij warm-reattach is a separate follow-up.
       log(`[read-isolation] zellij persistent pane ${cfg.sessionId}: leaving PENDING proof (isolation-capable zellij does not warm-reattach; cold-spawn on next launch)`);
     } else {
-      // tmux(-pipe) / herdr / zmx: attributable-fresh at the synchronous spawn
-      // return — TmuxPipe throws on new-session collision, herdr/zmx throw on a
+      // tmux(-pipe) / hc / herdr / zmx: attributable-fresh at the synchronous spawn
+      // return — TmuxPipe throws on new-session collision, hc on name_taken,
+      // herdr/zmx throw on a
       // name collision / verify their own bootstrap+launchPid handshake. So a
       // returned spawn + !isReattach here IS a fresh generation created by THIS
       // launch. COMMIT with compare-before-replace + generation fence.
@@ -34215,10 +34359,18 @@ async function spawnCliBody(
     if (observedBackend !== backend) return;
     if (effectiveBackendType === 'remote-runner') {
       relayRemoteRunnerWebSnapshot(snapshot);
+    } else if (effectiveBackendType === 'hc') {
+      log('hc terminal reattached — rebasing screen state from its paint');
+      relayHcWebSnapshot(snapshot);
     } else {
       log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
     }
     scheduleBackendScreenResync(snapshot, `${effectiveBackendType} observer recovery`);
+  }, true));
+  const hcBackend = backend instanceof HcBackend ? backend : null;
+  hcBackend?.onPaneSizeChange(bindSessionRuntimeCallback(() => {
+    if (observedBackend !== backend) return;
+    broadcastOwnedPaneReadOnlyFollowerGrid();
   }, true));
   backend.onAccessUrl?.(bindSessionRuntimeCallback((url) => {
     send({
@@ -34591,7 +34743,7 @@ async function spawnCliBody(
     // model"): under pty the pane observes an activity frame before the
     // crash, so deleting this line still passes pty but fails tmux.
     if (!intentionalRestart) traexAutoModelController?.noteProcessExited(false);
-    const canParkDiagnostic = !lastInitConfig?.adoptMode && effectiveBackendType === 'tmux' && !!sessionId;
+    const canParkDiagnostic = canParkCrashDiagnostic();
     // Inputs written but not yet consumed (no idle since the write) die with
     // the CLI — codex crashing mid-submit never records them, and the fresh
     // respawn comes up empty. Stash them so the next spawnCli re-queues and
@@ -35461,9 +35613,10 @@ async function restartCliProcess(
       } catch { /* sendFatalWorkerErrorAndExit is already best-effort */ }
     }
   };
-  if (effectiveBackendType === 'tmux' && !opts.immediate) {
+  // hc: one core per uid serves every session, so losing it restarts them all at once.
+  if ((effectiveBackendType === 'tmux' || effectiveBackendType === 'hc') && !opts.immediate) {
     const delayMs = tmuxRestartJitterMs(lastInitConfig?.sessionId ?? '', consecutiveInWorkerRestarts);
-    log(`Staggering tmux teardown/restart by ${delayMs}ms to avoid shared-server probe storms`);
+    log(`Staggering ${effectiveBackendType} teardown/restart by ${delayMs}ms to avoid shared-server probe storms`);
     if (tmuxRestartTimer) clearTimeout(tmuxRestartTimer);
     tmuxRestartTimer = setTimeout(() => { void restart(); }, delayMs);
   } else {
@@ -35701,10 +35854,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // alternate buffer at runtime (vim/less, or the CLI's own alt-screen) still
       // forwards via _fwdScroll and must inherit its backend's cap. So gate the
       // cap on a POSITIVE allowlist of cheap, locally-drivable terminal backends
-      // (pty/tmux/zellij); every other backend — Herdr, Riff, and any future one
+      // (pty/tmux/hc/zellij — an hc write is one input frame on an open
+      // connection); every other backend — Herdr, Riff, and any future one
       // — stays safely capped by default.
       const localTerminalBackend = effectiveBackendType === 'pty'
         || effectiveBackendType === 'tmux'
+        || effectiveBackendType === 'hc'
         || effectiveBackendType === 'zellij';
       // 避免手机 Webview 或浏览器缓存包含动态首态（如动态 initialMobileInputMode）的 HTML
       res.writeHead(200, {
@@ -35846,8 +36001,11 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         if (ws.readyState === WebSocket.OPEN) ws.send(formatQuickCommandsReply(request.nonce, result.status, result.commands));
       });
 
-      if (isTmuxMode && !isPipeMode && sessionId) {
+      const hcDiagnostic = crashDiagnosticHcTarget;
+      if (((isTmuxMode && !isPipeMode) || hcDiagnostic) && sessionId) {
         // ── Tmux-attach mode: per-client attach ──
+        // A parked hc crash diagnostic terminal is served the same way, through
+        // per-client `hc attach` (observe-only for view clients).
         // Each WS client gets its own `tmux attach-session` PTY.
         // Scrollback is handled natively by tmux (history-limit).
         // In adopt mode, attach to the user's original pane; otherwise use bmx-* session.
@@ -35885,27 +36043,44 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         const startAttach = (cols: number, rows: number) => {
           if (cp) return;
-          // Why: a prior web resize may leave the shared tmux window in manual mode.
-          // `largest` restores the shared default without letting a smaller/newer
-          // viewer resize every other attached client.
-          spawnSync('tmux', [...attachSocketArgs, 'set-option', '-t', tmuxTarget, 'window-size', 'largest'], {
-            stdio: 'ignore',
-            env: tmuxEnv() as { [key: string]: string },
-            timeout: 3000,
-          });
-          // Defense in depth: view-capability clients attach through tmux's
-          // own read-only mode as well as the WebSocket input gate below.
-          cp = pty.spawn('tmux', [
-            ...attachSocketArgs,
-            'attach-session',
-            ...(!hasWrite ? ['-r'] : []),
-            '-t', tmuxTarget,
-          ], {
-            name: 'xterm-256color',
-            cols,
-            rows,
-            env: tmuxEnv() as { [key: string]: string },
-          });
+          if (hcDiagnostic) {
+            let attach: ReturnType<typeof hcDiagnosticAttachCommand>;
+            try {
+              attach = hcDiagnosticAttachCommand(hcDiagnostic, { observe: !hasWrite });
+            } catch (err: any) {
+              log(`Crash diagnostic hc attach unavailable: ${err?.message ?? err}`);
+              if (ws.readyState === WebSocket.OPEN) ws.close(1011, 'hc unavailable');
+              return;
+            }
+            cp = pty.spawn(attach.bin, attach.args, {
+              name: 'xterm-256color',
+              cols,
+              rows,
+              env: attach.env as { [key: string]: string },
+            });
+          } else {
+            // Why: a prior web resize may leave the shared tmux window in manual mode.
+            // `largest` restores the shared default without letting a smaller/newer
+            // viewer resize every other attached client.
+            spawnSync('tmux', [...attachSocketArgs, 'set-option', '-t', tmuxTarget, 'window-size', 'largest'], {
+              stdio: 'ignore',
+              env: tmuxEnv() as { [key: string]: string },
+              timeout: 3000,
+            });
+            // Defense in depth: view-capability clients attach through tmux's
+            // own read-only mode as well as the WebSocket input gate below.
+            cp = pty.spawn('tmux', [
+              ...attachSocketArgs,
+              'attach-session',
+              ...(!hasWrite ? ['-r'] : []),
+              '-t', tmuxTarget,
+            ], {
+              name: 'xterm-256color',
+              cols,
+              rows,
+              env: tmuxEnv() as { [key: string]: string },
+            });
+          }
           clientPtys.set(ws, cp);
 
           cp.onData((d: string) => {
@@ -36036,12 +36211,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         const initialHerdrSize = herdrWebBinding.sync().initialSize;
         // A view capability is observational: it must not resize a shared
         // terminal. Remote Runner already follows the provider grid; owned
-        // tmux pipe sessions need the same rule because their live pane also
+        // tmux pipe and hc sessions need the same rule because their live pane also
         // drives the Lark screenshot. Letting a narrow read-only browser resize
         // that pane leaves later screenshots permanently wrapped at its width.
         const readOnlyFollowsBackendGrid = !hasWrite
           && (effectiveBackendType === 'remote-runner'
-            || (effectiveBackendType === 'tmux' && isPipeMode && !lastInitConfig?.adoptMode));
+            || ((effectiveBackendType === 'tmux' || effectiveBackendType === 'hc') && isPipeMode && !lastInitConfig?.adoptMode));
         if (initialHerdrSize) {
           ws.send(`\x1b]1989;follower;${initialHerdrSize.cols};${initialHerdrSize.rows}\x07`);
         }
@@ -36111,7 +36286,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!result.backend && !readOnlyFollowsBackendGrid) {
                 backend?.resize(msg.cols, msg.rows);
                 if (backend) webResizedBackendGrid = { backend, cols: msg.cols, rows: msg.rows };
-                broadcastOwnedTmuxReadOnlyFollowerGrid();
+                broadcastOwnedPaneReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               await inputController.accept(msg.data, { forceUser: msg.forceUser });
@@ -40299,7 +40474,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // then launched/respawned as `codex --remote resume` (codex.ts buildArgs)
         // against the CURRENT app-server (a fresh port each incarnation).
         const rpcBackendType = msg.backendType ?? config.daemon.backendType;
-        if (msg.codexProfile && msg.codexRpcInput && rpcBackendType === 'tmux') {
+        if (msg.codexProfile && msg.codexRpcInput && codexRpcPaneBackend(rpcBackendType)) {
           throw new Error('Codex profile is not supported by the RPC app-server; no fallback was launched');
         }
         // tmux: located lazily (probes every server the pane may be on) and
@@ -40310,16 +40485,20 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ? msg.persistentBackendTarget
             : rpcBackendType === 'tmux'
               ? (rpcTmuxTarget ??= locateManagedTmuxTarget(msg.sessionId, msg.persistentBackendTarget))
-              : undefined
+              : rpcBackendType === 'hc'
+                ? resolvePersistentBackendTarget('hc', msg.sessionId, msg.persistentBackendTarget)
+                : undefined
         );
-        const rpcTmuxSocket = (): string | undefined => {
+        const rpcPaneProbes = (): PaneProbes => {
           const target = rpcPersistentTarget();
-          return target?.backendType === 'tmux' ? target.socketName : undefined;
+          return target?.backendType === 'hc'
+            ? { panePidOf: () => hcTerminalPanePid(target, msg.sessionId) }
+            : { socketName: target?.backendType === 'tmux' ? target.socketName : undefined };
         };
         let rpcPluginGenerationPrepared = false;
         const rpcDecision = await orchestrateCodexRpcInit(msg, {
           paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid, rpcPersistentTarget()),
-          paneIsRemote: (name) => paneRunsRemoteTui(name, { socketName: rpcTmuxSocket() }, msg.cliRuntime?.executable),
+          paneIsRemote: (name) => paneRunsRemoteTui(name, rpcPaneProbes(), msg.cliRuntime?.executable),
           prepare: async () => {
             const adapter = createCliAdapterSync(msg.cliId as CliId, msg.cliPathOverride);
             await prepareCliPluginGenerationAndGateway(msg, adapter);
@@ -40983,7 +41162,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const model = publishedActiveRuntime.model;
       const lifetime = cliLifetimeNonce;
       if (lastInitConfig?.cliId !== 'codex' || !target || !path || !model
-        || !['pty', 'tmux'].includes(lastInitConfig.backendType) || lastInitConfig.wrapperCli
+        || !['pty', 'tmux', 'hc'].includes(lastInitConfig.backendType) || lastInitConfig.wrapperCli
         || codexRpcEngine || lastInitConfig.adoptMode || sandboxBoolValue(lastInitConfig.sandbox)
         || sandboxEnabled() || lastInitConfig.readIsolation
         || sessionRenameInFlight() || isFlushing || injectionFlushing || commandLineWritesPending
@@ -41252,7 +41431,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           current = lastInitConfig && backend && isPromptReady && !cliRestartInProgress && !tmuxRestartTimer
             && !isFlushing && !injectionFlushing && !commandLineWritesPending && !pendingMessages.length && !pendingRawInputs.length
             && !sandboxBoolValue(lastInitConfig.sandbox) && !sandboxEnabled() && !lastInitConfig.readIsolation
-            && ['pty', 'tmux'].includes(lastInitConfig.backendType)
+            && ['pty', 'tmux', 'hc'].includes(lastInitConfig.backendType)
             ? validateTraexTopicEffortRestart(lastInitConfig, msg.topicEffort, captureBackendScreen(backend)) : undefined;
         } catch { current = undefined; }
         if (!current || !msg.attemptId) {

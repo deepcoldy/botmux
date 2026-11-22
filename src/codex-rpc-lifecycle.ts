@@ -9,12 +9,17 @@ import {
   readComm,
 } from './core/session-discovery.js';
 import type { DaemonToWorker } from './types.js';
+import { isHcTerminalOwnedBy, type HcTarget } from './adapters/backend/hc/cli-ops.js';
+import { hcCallSync, prepareHcSyncCore } from './adapters/backend/hc/sync-rpc.js';
+import type { HcTerminalRecord } from './adapters/backend/hc/types.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 export { RPC_CAPABLE_CLIS } from './services/codex-rpc-input-policy.js';
 import { RPC_CAPABLE_CLIS } from './services/codex-rpc-input-policy.js';
 
 type InitCfg = Extract<DaemonToWorker, { type: 'init' }>;
+
+const HC_PANE_PID_TIMEOUT_MS = 5_000;
 
 /** Retry cadence for native turn/completed → rollout visibility hydration.
  *  Total window is 11.55s: bounded, but intentionally aligned with the 12s
@@ -103,11 +108,11 @@ export class RpcEngagementFence {
  *     app-server`, which an ambiguous wrapper/alternate launcher won't satisfy
  *     the same way the TUI's buildArgs does. A structured compatible runtime is
  *     the only path override allowed through this gate (P1-2).
- *   - backendType !== 'tmux': the pane-ownership detection + controlled respawn
- *     are only wired for tmux. On herdr/zellij a surviving dead `--remote` pane
- *     would be misjudged as native and reattached, and pty has no persistent
- *     pane at all — so restrict RPC to tmux until each backend's replace path is
- *     built + verified. */
+ *   - backendType other than tmux/hc: the pane-ownership detection + controlled
+ *     respawn are only wired for tmux and hc. On herdr/zellij a surviving dead
+ *     `--remote` pane would be misjudged as native and reattached, and pty has
+ *     no persistent pane at all — so restrict RPC to tmux/hc until each
+ *     backend's replace path is built + verified. */
 export interface CodexRpcRuntimeGates {
   /** Process-wide BOTMUX_SANDBOX=1 force. It is not represented in InitCfg but
    *  must gate RPC too: the app-server owns model execution and otherwise runs
@@ -118,6 +123,11 @@ export interface CodexRpcRuntimeGates {
 function executableName(value: string): string {
   const normalized = value.replace(/\\/g, '/').replace(/\/+$/, '');
   return normalized.slice(normalized.lastIndexOf('/') + 1).toLowerCase();
+}
+
+/** Backends whose surviving pane the RPC lifecycle can identify and replace. */
+export function codexRpcPaneBackend(backendType: string | undefined): boolean {
+  return backendType === 'tmux' || backendType === 'hc';
 }
 
 export function codexRpcEligible(cfg: InitCfg, runtime: CodexRpcRuntimeGates = {}): boolean {
@@ -136,7 +146,7 @@ export function codexRpcEligible(cfg: InitCfg, runtime: CodexRpcRuntimeGates = {
       : !cfg.cliPathOverride;
   return (
     cfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(cfg.cliId) &&
-    cfg.backendType === 'tmux' &&
+    codexRpcPaneBackend(cfg.backendType) &&
     cfg.adoptMode !== true && cfg.readIsolation !== true && cfg.sandbox !== true && cfg.sandbox !== 'oncall' && cfg.sandbox !== 'scratch' && runtime.sandboxForced !== true &&
     cfg.disableCliBypass !== true &&
     !cfg.startupCommands?.length &&
@@ -280,7 +290,7 @@ export async function orchestrateCodexRpcInit(
     // Its previous app-server was owned by the old worker; replace only a
     // positively identified remote pane, keeping native terminal panes intact.
     if (cfg.codexRpcInput === false && RPC_CAPABLE_CLIS.has(cfg.cliId)
-      && cfg.backendType === 'tmux' && cfg.resume && cfg.cliSessionId
+      && codexRpcPaneBackend(cfg.backendType) && cfg.resume && cfg.cliSessionId
       && !cfg.adoptMode && !cfg.existingAppServerEndpoint) {
       const pane = fx.paneInfo(cfg.sessionId);
       if (pane?.live && fx.paneIsRemote(pane.name)) {
@@ -386,6 +396,21 @@ function tmuxPanePid(sessionName: string, socketName?: string): number | undefin
       { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 3000, env: tmuxEnv() }).trim();
     const n = Number(out);
     return Number.isInteger(n) && n > 0 ? n : undefined;
+  } catch { return undefined; }
+}
+
+/** PaneProbes.panePidOf for hc: the pid of `target`'s live terminal, only when its labels make it `sessionId`'s. */
+export function hcTerminalPanePid(target: HcTarget, sessionId: string, env: NodeJS.ProcessEnv = process.env): number | undefined {
+  try {
+    const got = hcCallSync<HcTerminalRecord>(
+      prepareHcSyncCore(target, env), 'terminal.get', { terminal: target.sessionName }, HC_PANE_PID_TIMEOUT_MS,
+    );
+    if (!got.ok) return undefined;
+    const record = got.value;
+    if (record?.state !== 'live' || record.name !== target.sessionName || !isHcTerminalOwnedBy(record.labels, sessionId)) {
+      return undefined;
+    }
+    return Number.isInteger(record.pid) && record.pid! > 0 ? record.pid! : undefined;
   } catch { return undefined; }
 }
 

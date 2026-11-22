@@ -154,7 +154,7 @@ describe('maintenance idle suspension', () => {
   });
 
   it('covers every resumable backend without depending on a TraeX-specific CLI', () => {
-    const entries = (['tmux', 'herdr', 'zellij', 'zmx', 'pty'] as const).map((backend) => {
+    const entries = (['tmux', 'herdr', 'zellij', 'zmx', 'hc', 'pty'] as const).map((backend) => {
       const session = ds(`old-${backend}`, backend, now - 8 * day);
       session.session.cliId = 'claude-code';
       session.initConfig.cliId = 'claude-code';
@@ -167,7 +167,7 @@ describe('maintenance idle suspension', () => {
     });
 
     expect(candidates.map(candidate => candidate.backendType)).toEqual([
-      'tmux', 'herdr', 'zellij', 'zmx',
+      'tmux', 'herdr', 'zellij', 'zmx', 'hc',
     ]);
     expect(candidates.every(candidate => candidate.processTypes.at(-1) === 'claude-code')).toBe(true);
   });

@@ -56,6 +56,7 @@ Don't want tmux? Pick another backend explicitly: globally with the `BACKEND_TYP
 | `herdr` | Needs herdr; botmux can install it for you |
 | `zellij` | You install zellij yourself |
 | `zmx` | You install zmx (≥ 0.7.0) yourself, see [ZMX Session Backend](/en/zmx) |
+| `hc` | Linux only; you provide herdr-core (≥ 0.1.19) yourself, botmux does not install it, see [hc Session Backend](/en/hc) |
 
 ## Where to deploy
 
