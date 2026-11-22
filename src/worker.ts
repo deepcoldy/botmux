@@ -7792,38 +7792,42 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
   if (sessionId) {
     const scope = typeof workerSessionEventScope !== 'undefined' ? workerSessionEventScope : undefined;
     const binding = scope?.contextBinding() ?? scope?.currentBinding();
-    const execution = capability.turnId
-      ? scope?.executionForTurn(capability.turnId, capability.dispatchAttempt)
-      : undefined;
-    publishedOriginContractScope = binding?.runtime && execution
-      ? { bindingId: binding.bindingId, executionId: execution.executionId }
-      : undefined;
-    const explicitOrigin = binding?.runtime
-      ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
-      : undefined;
-    pendingManagedTurnOriginScope = explicitOrigin;
-    try {
-    send({
-      type: 'managed_turn_origin',
-      sessionId,
-      capability: capability.token,
-      policyCapability,
-      ...(activeIdentity.turnId ? {
-        trustedCaller: activeIdentity.caller ?? null,
-        identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
-        ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
-      } : {}),
-      ...(readIsolationOriginChannelId
-        ? { originChannelId: readIsolationOriginChannelId }
-        : {}),
-      ...(capability.turnId ? { turnId: capability.turnId } : {}),
-      ...(capability.dispatchAttempt !== undefined
-        ? { dispatchAttempt: capability.dispatchAttempt }
-        : {}),
-      ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
-    });
-    } finally {
-      pendingManagedTurnOriginScope = undefined;
+    if (!scope || binding) {
+      const execution = capability.turnId
+        ? scope?.executionForTurn(capability.turnId, capability.dispatchAttempt)
+        : undefined;
+      publishedOriginContractScope = binding?.runtime && execution
+        ? { bindingId: binding.bindingId, executionId: execution.executionId }
+        : undefined;
+      const explicitOrigin = binding?.runtime
+        ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
+        : undefined;
+      pendingManagedTurnOriginScope = explicitOrigin;
+      try {
+        send({
+          type: 'managed_turn_origin',
+          sessionId,
+          capability: capability.token,
+          policyCapability,
+          ...(activeIdentity.turnId ? {
+            trustedCaller: activeIdentity.caller ?? null,
+            identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
+            ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
+          } : {}),
+          ...(readIsolationOriginChannelId
+            ? { originChannelId: readIsolationOriginChannelId }
+            : {}),
+          ...(capability.turnId ? { turnId: capability.turnId } : {}),
+          ...(capability.dispatchAttempt !== undefined
+            ? { dispatchAttempt: capability.dispatchAttempt }
+            : {}),
+          ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
+        });
+      } finally {
+        pendingManagedTurnOriginScope = undefined;
+      }
+    } else {
+      publishedOriginContractScope = undefined;
     }
   }
   return true;
@@ -23148,11 +23152,23 @@ function markPromptReady(): void {
     hasQueuedTurn: queuedTypeAheadTurns.length > 0,
   });
   const beforeMarkerSync = readyTransition(false);
+  // Drain Antigravity's transcript before evaluating readyContinuesTurn so a
+  // just-written background task or subagent launch is reflected before this
+  // ready edge can revoke turn authority.
+  if (typeof structuredBridgeIs === 'function' && structuredBridgeIs('antigravity')
+    && typeof codexBridgeDrainAndMaybeEmit === 'function') {
+    codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+  }
+  const antigravityPendingTasks = typeof structuredBridgeIs === 'function'
+    && structuredBridgeIs('antigravity')
+    && typeof hasAntigravityPendingTasks === 'function'
+    && typeof antigravityBridgeState === 'function'
+    && hasAntigravityPendingTasks(antigravityBridgeState());
   // A ready reported as working below (the argv-baked first prompt still runs,
-  // or the turn only waits on its background agents) is not the turn's end:
-  // that work still reports under this turn's authority.
+  // or the turn only waits on its background agents/tasks) is not the turn's
+  // end: that work still reports under this turn's authority.
   const readyContinuesTurn = (spawnArgvInitialPromptBusy
-      || (backgroundTaskTracker.pendingTurnAgents() > 0 && !spawnArgvNeedsWorkingSeed))
+      || ((backgroundTaskTracker.pendingTurnAgents() > 0 || antigravityPendingTasks) && !spawnArgvNeedsWorkingSeed))
     && !!renderer
     && queuedTypeAheadTurns.length === 0
     && pendingMessages.length === 0
@@ -23266,7 +23282,7 @@ function markPromptReady(): void {
   // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
   // correct 'working' publish for these paths, so this idle must not escape first.
   refreshBackgroundWait();
-  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
@@ -23314,9 +23330,9 @@ function markPromptReady(): void {
       // is fine: gate allows working→limited.
       publishScreenStatus('idle');
       log('Argv-baked first prompt completed — seeded working→idle for card-off reactions');
-    } else if (backgroundTaskTracker.pendingTurnAgents() > 0) {
+    } else if (backgroundTaskTracker.pendingTurnAgents() > 0 || antigravityPendingTasks) {
       // The main turn is only quiet because it dispatched background
-      // sub-agents and is awaiting their `<task-notification>`. Report
+      // sub-agents/tasks and is awaiting their completion notification. Report
       // working (not idle) so the session card is not frozen to 「已完成」
       // mid-flight and then re-posted as 「进行中」when the notification
       // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
@@ -23325,7 +23341,9 @@ function markPromptReady(): void {
       revokePromptReadiness();
       idleDetector?.reset();
       publishScreenStatus('working');
-      log(`Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`);
+      log(backgroundTaskTracker.pendingTurnAgents() > 0
+        ? `Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`
+        : 'Idle prompt while Antigravity background task(s)/subagent(s) pending — reporting working until completion notification arrives');
     } else {
       publishScreenStatus('idle');
     }

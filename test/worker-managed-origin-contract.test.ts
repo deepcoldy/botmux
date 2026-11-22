@@ -165,6 +165,40 @@ describe('managed origin publication through the session contract', () => {
     expect(h.ds.managedTurnOrigin?.turnId).toBeUndefined();
     expect(h.hostEnv.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('Ignored stale live capability'));
   });
+  it('defers cold-start managed_turn_origin IPC until a runtime binding exists, avoiding runtime_scope_missing drops', async () => {
+    const h = fixture({ preAdmit: true, cliId: 'antigravity' });
+    // Fresh cold-start scope with no runtime binding started yet (init before spawnCli).
+    const freshScope = new WorkerSessionEventScope(h.controller.ref, h.hostEnv.contractWorker);
+    freshScope.noteAdmission({ ref: h.execution, phase: 'queued' });
+    h.env.workerSessionEventScope = freshScope;
+    h.env.currentBotmuxDispatchAttempt = undefined;
+    h.env.retiredTurnIds = new Set();
+
+    h.env.publishSandboxRelayCapability();
+    await h.drain();
+    expect(h.env.sandboxRelayCapability?.turnId).toBe(h.execution.turnId);
+    expect(h.env.writeCliPidMarker).toHaveBeenCalled();
+    expect(h.wire.filter(m => m.type === 'managed_turn_origin')).toHaveLength(0);
+    expect(h.hostEnv.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('runtime_scope_missing'));
+
+    // Once spawnCli opens and binds the runtime, runtime_contract_assigned publishes the live origin.
+    const opening = freshScope.beginRuntime();
+    freshScope.run(opening, () => {
+      h.env.send({ type: 'runtime_binding_started', bindingId: opening.bindingId });
+      opening.identity = { backend: 'tmux', physicalId: '300:3000', proof: 'process_start', nativeSessionId: 'agy-cold-start' };
+      h.env.send({ type: 'runtime_binding', bindingId: opening.bindingId, identity: opening.identity });
+    }, h.execution);
+    await h.drain();
+    const assigned = h.commands.filter(m => m.type === 'runtime_contract_assigned' && m.bindingId === opening.bindingId);
+    expect(assigned).toHaveLength(1);
+    await loadWorkerMessageHandler('runtime_contract_assigned', h.env)(assigned[0]);
+    await h.drain();
+    const origins = h.wire.filter(m => m.type === 'managed_turn_origin');
+    expect(origins).toHaveLength(1);
+    expect(origins[0].sessionContract.scope).toMatchObject({ runtime: assigned[0].runtime, execution: h.execution });
+    expect(h.ds.managedTurnOrigin).toMatchObject({ turnId: h.execution.turnId, callerOpenId: 'ou_human', capability: h.env.sandboxRelayCapability.token });
+    expect(h.hostEnv.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('Dropped managed_turn_origin'));
+  });
 });
 
 
