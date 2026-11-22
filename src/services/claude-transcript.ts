@@ -1192,18 +1192,21 @@ const MODEL_REQUEST_CLOCK_SEED_BYTES = 4 * 1024 * 1024;
  *  - API-error and `<synthetic>` records, sidechains, and the content blobs
  *    (`api-request-blob`, whose `message.role` can be `assistant`) prove
  *    nothing. A sub-agent's or a fork's request does not read this prefix.
- * Two readings: every served request keeps the cache warm, whoever sent it;
- * every one except those of idle upkeep turns also means the session was in
- * use — a person, a Lark message, a background task waking the model, a
- * scheduled fire all produce something someone may answer. Idle upkeep is
- * botmux's own prompt-cache keep-alive (recognised by its tag) and a prompt a
- * plugin injected (`origin.kind:"plugin"`, e.g. a cache-keeping plugin's
- * "stepping away" summary): keeping a session warm must not look like using it.
+ * Two readings with different time anchors: every served request keeps the
+ * cache warm FROM ITS START, whoever sent it; every response except those of
+ * idle upkeep turns also means the session was in use AT ITS COMPLETION.
+ * Keeping those anchors separate prevents a long generation from counting as
+ * idle time. Idle upkeep is botmux's own prompt-cache keep-alive (recognised
+ * by its tag) and a prompt a plugin injected (`origin.kind:"plugin"`, e.g. a
+ * cache-keeping plugin's "stepping away" summary): keeping a session warm
+ * must not look like using it.
  */
 export class ClaudeModelRequestClock {
+  /** Native Claude conversation every remembered timestamp belongs to. */
+  private claudeSessionId = '';
   private requestStartMs: number | undefined;
   private servedMs: number | undefined;
-  private activityServedMs: number | undefined;
+  private activityAtMs: number | undefined;
   private turnOpen = false;
   /** The open turn is idle upkeep. Unknown (a worker attached mid-turn, a
    *  turn whose start no record marks) counts as activity: errs toward not
@@ -1213,6 +1216,25 @@ export class ClaudeModelRequestClock {
    *  request (a response split over several records) stay upkeep after its
    *  turn has ended. */
   private upkeepRequestStartMs: number | undefined;
+
+  get boundClaudeSessionId(): string {
+    return this.claudeSessionId;
+  }
+
+  /** Rebind to another native conversation. Request and response timestamps
+   *  from the old transcript say nothing about this one's cache or activity;
+   *  carrying them over can make a cold `/resume` target look freshly read. */
+  bind(claudeSessionId: string): boolean {
+    if (claudeSessionId === this.claudeSessionId) return false;
+    this.claudeSessionId = claudeSessionId;
+    this.requestStartMs = undefined;
+    this.servedMs = undefined;
+    this.activityAtMs = undefined;
+    this.turnOpen = false;
+    this.upkeepTurn = false;
+    this.upkeepRequestStartMs = undefined;
+    return true;
+  }
 
   observe(ev: TranscriptEvent): void {
     if (!ev || typeof ev !== 'object' || ev.isSidechain === true) return;
@@ -1233,13 +1255,15 @@ export class ClaudeModelRequestClock {
       if (at !== undefined) this.requestStartMs = at;
       return;
     }
-    const served = this.servedStart(ev);
+    const served = this.servedRequest(ev);
     if (served !== undefined) {
-      if (this.servedMs === undefined || served > this.servedMs) this.servedMs = served;
-      if (this.upkeepTurn || served === this.upkeepRequestStartMs) {
-        this.upkeepRequestStartMs = served;
-      } else if (this.activityServedMs === undefined || served > this.activityServedMs) {
-        this.activityServedMs = served;
+      // Cache TTL starts at the request; activity starts at the response. A
+      // long generation keeps the screen busy and must not also count as idle.
+      if (this.servedMs === undefined || served.startedAt > this.servedMs) this.servedMs = served.startedAt;
+      if (this.upkeepTurn || served.startedAt === this.upkeepRequestStartMs) {
+        this.upkeepRequestStartMs = served.startedAt;
+      } else if (this.activityAtMs === undefined || served.completedAt > this.activityAtMs) {
+        this.activityAtMs = served.completedAt;
       }
     }
     if (isClaudeTurnTerminalEvent(ev)) {
@@ -1250,16 +1274,19 @@ export class ClaudeModelRequestClock {
     }
   }
 
-  /** The start credited to a main-thread assistant record that proves a
+  /** Start and completion of a main-thread assistant record that proves a
    *  served request; undefined for any other record. */
-  private servedStart(ev: TranscriptEvent): number | undefined {
+  private servedRequest(ev: TranscriptEvent): { startedAt: number; completedAt: number } | undefined {
     if (ev.type !== 'assistant' || ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) return undefined;
     const usage = ev.message?.usage;
     const tokens = (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0) + (usage?.cache_creation_input_tokens ?? 0);
     if (!(tokens > 0)) return undefined;
-    const at = eventTimeMs(ev);
-    if (at === undefined) return undefined;
-    return this.requestStartMs !== undefined && this.requestStartMs <= at ? this.requestStartMs : at;
+    const completedAt = eventTimeMs(ev);
+    if (completedAt === undefined) return undefined;
+    const startedAt = this.requestStartMs !== undefined && this.requestStartMs <= completedAt
+      ? this.requestStartMs
+      : completedAt;
+    return { startedAt, completedAt };
   }
 
   /**
@@ -1278,10 +1305,11 @@ export class ClaudeModelRequestClock {
     return this.servedMs;
   }
 
-  /** The same, leaving out idle upkeep: when the session was last in use, as
-   *  opposed to merely kept warm. */
-  lastActivityServedAt(): number | undefined {
-    return this.activityServedMs;
+  /** Completion of the latest served response that was not idle upkeep. This
+   *  is deliberately later than its request start: response-generation time
+   *  is busy time, not idle time. */
+  lastActivityAt(): number | undefined {
+    return this.activityAtMs;
   }
 }
 

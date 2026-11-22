@@ -2868,17 +2868,22 @@ export type WorkerToDaemonBase =
        *  otherwise. Never changes the reported status; the card shows it and the
        *  idle-worker sweeper will not suspend a session while it is set. */
       backgroundTasks?: number;
+      /** Native Claude session the two request clocks below belong to. A
+       *  transcript rotation changes this identity and makes the daemon drop
+       *  the previous conversation's timestamps before merging the new ones. */
+      modelRequestSessionId?: string;
       /** Start (epoch ms) of the main conversation's latest served model
        *  request this worker has read from the Claude transcript, whoever sent
        *  it (a botmux turn, a background-task wake, a keep-alive, a plugin).
        *  The prompt cache stays warm an hour from it; the idle auto-compact
        *  uses it as its cache window. Omitted until one is seen. */
       lastModelRequestAt?: number;
-      /** The same, leaving out idle upkeep (botmux's own prompt-cache
-       *  keep-alive, a plugin's prompt): the session was last in use then (a
-       *  person, a Lark message, a background task waking the model, a
-       *  scheduled fire). The idle auto-compact counts its idle time from it.
-       *  Omitted until one is seen. */
+      /** Completion (epoch ms) of the latest served response, leaving out idle
+       *  upkeep (botmux's own prompt-cache keep-alive, a plugin's prompt): the
+       *  session was last in use then (a person, a Lark message, a background
+       *  task waking the model, a scheduled fire). Response-generation time is
+       *  busy, so unlike the cache clock this is NOT the request start. The
+       *  wire name is kept for compatibility. Omitted until one is seen. */
       lastActivityRequestAt?: number }
   /** The CLI's own next-input suggestion on an idle screen (Claude Code's
    *  greyed-out prompt suggestion), sent when it appears or changes. turnId is

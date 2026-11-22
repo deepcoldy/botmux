@@ -66,8 +66,10 @@ function clockOf(events: TranscriptEvent[]): ClaudeModelRequestClock {
 }
 
 describe('ClaudeModelRequestClock', () => {
-  it('credits a served request with its start, not with the end of its long generation', () => {
-    expect(clockOf([request('09:05:55'), served('09:06:59')]).lastServedAt()).toBe(ms('09:05:55'));
+  it('credits cache warmth to the request start but activity to its response completion', () => {
+    const clock = clockOf([byPerson('09:05:50'), request('09:05:55'), served('09:06:59')]);
+    expect(clock.lastServedAt()).toBe(ms('09:05:55'));
+    expect(clock.lastActivityAt()).toBe(ms('09:06:59'));
   });
 
   it('a request that failed proves nothing; the retry the model answered counts from its own start', () => {
@@ -113,7 +115,7 @@ describe('ClaudeModelRequestClock', () => {
 
   it('every served request is activity except idle upkeep: botmux\'s keep-alive and a plugin\'s prompt', () => {
     const clock = clockOf([byPerson('09:00:00'), request('09:00:01'), served('09:01:00'), turnEnd('09:01:01')]);
-    expect(clock.lastActivityServedAt()).toBe(ms('09:00:01'));
+    expect(clock.lastActivityAt()).toBe(ms('09:01:00'));
     // A watcher waking the model, a scheduled fire: each produces something
     // someone may answer.
     for (const [start, hhmmss] of [[byWatcher, '09:20:00'], [bySchedule, '10:00:00']] as const) {
@@ -121,7 +123,7 @@ describe('ClaudeModelRequestClock', () => {
       clock.observe(request(hhmmss.replace(/:00$/, ':02')));
       clock.observe(served(hhmmss.replace(/:00$/, ':30')));
       clock.observe(turnEnd(hhmmss.replace(/:00$/, ':31')));
-      expect(clock.lastActivityServedAt()).toBe(ms(hhmmss.replace(/:00$/, ':02')));
+      expect(clock.lastActivityAt()).toBe(ms(hhmmss.replace(/:00$/, ':30')));
     }
     // A cache-keeping plugin's "stepping away" summary, and botmux's keep-alive
     // (typed like a person's prompt; its tag says whose): both only keep warm.
@@ -134,7 +136,7 @@ describe('ClaudeModelRequestClock', () => {
     clock.observe(served('11:30:05'));
     clock.observe(turnEnd('11:30:06'));
     expect(clock.lastServedAt()).toBe(ms('11:30:02'));
-    expect(clock.lastActivityServedAt()).toBe(ms('10:00:02'));
+    expect(clock.lastActivityAt()).toBe(ms('10:00:30'));
   });
 
   it('upkeep ends with its turn: a later request no record marks as a turn start is activity', () => {
@@ -145,16 +147,16 @@ describe('ClaudeModelRequestClock', () => {
     clock.observe(served('12:00:04'));
     clock.observe(turnEnd('12:00:05'));
     clock.observe(served('12:00:06'));
-    expect(clock.lastActivityServedAt()).toBeUndefined();
+    expect(clock.lastActivityAt()).toBeUndefined();
     clock.observe(prompt('12:30:00', '<command-name>/review</command-name>\n<command-message>review</command-message>'));
     clock.observe(request('12:30:01'));
     clock.observe(served('12:31:00'));
-    expect(clock.lastActivityServedAt()).toBe(ms('12:30:01'));
+    expect(clock.lastActivityAt()).toBe(ms('12:31:00'));
   });
 
   it("input folded into an upkeep turn makes it real work; a worker attached mid-turn counts it too", () => {
     const clock = clockOf([byPerson('11:00:00', KEEPALIVE), request('11:00:01'), midTurn('11:00:20')]);
-    expect(clock.lastActivityServedAt()).toBeUndefined();
+    expect(clock.lastActivityAt()).toBeUndefined();
     // How Claude Code 2.1.322 records a message absorbed into a running turn.
     clock.observe({
       type: 'attachment', timestamp: at('11:00:30'), renderedRole: 'system',
@@ -163,16 +165,31 @@ describe('ClaudeModelRequestClock', () => {
     } as unknown as TranscriptEvent);
     clock.observe(request('11:00:31'));
     clock.observe(served('11:01:00'));
-    expect(clock.lastActivityServedAt()).toBe(ms('11:00:31'));
+    expect(clock.lastActivityAt()).toBe(ms('11:01:00'));
     const attached = clockOf([request('08:00:00'), served('08:00:10')]);
-    expect(attached.lastActivityServedAt()).toBe(ms('08:00:00'));
+    expect(attached.lastActivityAt()).toBe(ms('08:00:10'));
     // A keep-alive queued while a person's turn still runs does not take that
     // turn's remaining requests away from activity.
     const busy = clockOf([byPerson('13:00:00'), request('13:00:01'), midTurn('13:00:20')]);
     busy.observe(byPerson('13:00:25', KEEPALIVE));
     busy.observe(request('13:00:30'));
     busy.observe(served('13:00:50'));
-    expect(busy.lastActivityServedAt()).toBe(ms('13:00:30'));
+    expect(busy.lastActivityAt()).toBe(ms('13:00:50'));
+  });
+
+  it('rebinding to another native session drops the old timestamps and accepts its older history', () => {
+    const clock = new ClaudeModelRequestClock();
+    expect(clock.bind('session-a')).toBe(true);
+    for (const ev of [byPerson('10:00:00'), request('10:00:01'), served('10:00:30'), turnEnd('10:00:31')]) clock.observe(ev);
+    expect(clock.lastServedAt()).toBe(ms('10:00:01'));
+    expect(clock.bind('session-b')).toBe(true);
+    expect(clock.boundClaudeSessionId).toBe('session-b');
+    expect(clock.lastServedAt()).toBeUndefined();
+    expect(clock.lastActivityAt()).toBeUndefined();
+    for (const ev of [byPerson('06:00:00'), request('06:00:01'), served('06:00:30'), turnEnd('06:00:31')]) clock.observe(ev);
+    expect(clock.lastServedAt()).toBe(ms('06:00:01'));
+    expect(clock.lastActivityAt()).toBe(ms('06:00:30'));
+    expect(clock.bind('session-b')).toBe(false);
   });
 
   it('seeds from the tail of a transcript it starts following at the end, skipping a cut first line', () => {
@@ -192,7 +209,7 @@ describe('ClaudeModelRequestClock', () => {
       const clock = new ClaudeModelRequestClock();
       clock.seedFromTail(path, tailBytes);
       expect(clock.lastServedAt()).toBe(ms('07:00:01'));
-      expect(clock.lastActivityServedAt()).toBe(ms('07:00:01'));
+      expect(clock.lastActivityAt()).toBe(ms('07:00:30'));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

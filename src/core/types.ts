@@ -636,15 +636,19 @@ export interface DaemonSession {
   /** A botmux turn started and its idle edge has not been seen yet
    *  (core/idle-auto-compact.ts). In-memory; mirrored to the row while on. */
   idleAutoCompactArm?: import('./idle-auto-compact.js').IdleAutoCompactArm;
+  /** Native Claude session that owns the two transcript clocks below. A
+   *  changed identity resets both before their monotonic merge. In-memory only. */
+  modelRequestSessionId?: string;
   /** Start (epoch ms) of the main conversation's latest served model request,
    *  as the worker read it from the Claude transcript (`lastModelRequestAt` on
-   *  screen_update). The idle auto-compact's cache window counts from here when
-   *  it is later than the stretch start. Never moves back. In-memory only. */
+   *  screen_update). The idle auto-compact's cache window counts from this real
+   *  request start. Never moves back within one native session. In-memory only. */
   lastModelRequestAt?: number;
-  /** The same, leaving out idle upkeep — botmux's keep-alive, a plugin's
-   *  prompt (`lastActivityRequestAt` on screen_update): the idle auto-compact's idle
-   *  time counts from here when it is later than the stretch start. Never
-   *  moves back. In-memory only. */
+  /** Completion (epoch ms) of the latest served response, leaving out idle
+   *  upkeep — botmux's keep-alive, a plugin's prompt (`lastActivityRequestAt`
+   *  on screen_update; wire name kept for compatibility). The idle auto-compact
+   *  counts idle time from this response completion, not its request start.
+   *  Never moves back within one native session. In-memory only. */
   lastActivityRequestAt?: number;
   /** Non-keep-alive busy observed before this idle compact settles. This
    *  in-memory witness survives session-store's durable-row rollback on a
@@ -654,6 +658,11 @@ export interface DaemonSession {
    *  so a durable-row rollback cannot split warm/notice state from the row or
    *  allow a later duplicate compact. In-memory only; reconciled before sweep. */
   idleAutoCompactCompletedTurnId?: string;
+  /** Direct Web-terminal submit armed a user turn while this compact was
+   *  unsettled. In-memory witness paired with inFlight.directInputArmed: unlike
+   *  the nested flag it survives session-store's durable-row rollback. Kept
+   *  after settlement for the same rollback reconciliation as completedTurnId. */
+  idleAutoCompactDirectInputTurnId?: string;
   /** A locally answered CLI turn whose own busy repaint must not cancel an
    *  idle-compact retry. In-memory only; cleared by its terminal or idle edge. */
   idleAutoCompactLocalTurn?: { turnId: string; since: number };

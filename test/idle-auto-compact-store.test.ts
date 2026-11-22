@@ -22,6 +22,7 @@ vi.mock('../src/utils/logger.js', () => ({
 import { createSession, getSession, init, updateSession, __testOnly_setBeforeRowPersist } from '../src/services/session-store.js';
 import {
   applyIdleAutoCompactSetting,
+  noteIdleAutoCompactDirectInput,
   noteIdleAutoCompactRefused,
   noteIdleAutoCompactScreenStatus,
   noteIdleAutoCompactTurnEnded,
@@ -231,6 +232,86 @@ describe('idle auto-compact persistence', () => {
     expect(notices).toEqual([]);
     expect(restored.session.idleAutoCompact?.inFlight).toBeUndefined();
     expect(restored.session.idleAutoCompact?.handledIdleSince).toBe(T0 + 55 * MIN + 40_000);
+  });
+
+  it('a direct-input save rollback still preserves the user\'s new stretch', () => {
+    const session = createSession('oc_chat', 'om_direct_rollback', 'direct rollback', 'group', 'thread');
+    session.idleAutoCompact = { enabled: true, idleSince: T0 };
+    const ds = { session, lastScreenStatus: 'idle', idleSinceAt: T0, idleAutoCompactWarmSince: T0 } as unknown as DaemonSession;
+    updateSession(session);
+    const compact = vi.fn(() => true);
+    const sweep = (at: number) => runIdleAutoCompactSweep([ds], {
+      now: () => at, supported: () => true, blockers: () => [], contextTokens: () => undefined,
+      persist: d => updateSession(d.session), compact, notify: () => {}, log: () => {},
+    });
+    expect(sweep(T0 + 55 * MIN)).toBe(1);
+    const turnId = compact.mock.calls[0][1] as string;
+    ds.lastScreenStatus = 'working';
+    stampIdleSinceAt(ds, 'idle', T0 + 55 * MIN + 5_000);
+    expect(noteIdleAutoCompactDirectInput(ds, T0 + 55 * MIN + 10_000)).toBe(true);
+    __testOnly_setBeforeRowPersist(() => { throw new Error('injected direct-input EIO'); });
+    expect(() => updateSession(session)).toThrow('injected direct-input EIO');
+    __testOnly_setBeforeRowPersist(undefined);
+    // The nested arm is rolled back with the row; the live arm still opens the
+    // user's new stretch, so settlement must not require another nested flag.
+    expect(ds.session.idleAutoCompact?.armed).toBeUndefined();
+    expect(ds.session.idleAutoCompact?.inFlight?.directInputArmed).toBeUndefined();
+    expect(ds.idleAutoCompactDirectInputTurnId).toBe(turnId);
+    expect(ds.idleAutoCompactArm).toBeDefined();
+    expect(noteIdleAutoCompactTurnEnded(ds, turnId, 'completed')).toBe(true);
+    updateSession(session);
+    ds.lastScreenStatus = 'idle';
+    stampIdleSinceAt(ds, 'working', T0 + 56 * MIN);
+    expect(ds.session.idleAutoCompact?.idleSince).toBe(T0 + 56 * MIN);
+    expect(ds.session.idleAutoCompact?.handledIdleSince).toBe(T0);
+    expect(sweep(T0 + 111 * MIN)).toBe(1);
+    expect(compact).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['terminal-first', 'sweep-first'] as const)('restart after the direct user\'s idle preserves the new stretch (%s)', (order) => {
+    const session = createSession('oc_chat', `om_direct_restart_${order}`, 'direct restart', 'group', 'thread');
+    session.idleAutoCompact = { enabled: true, idleSince: T0 };
+    const ds = { session, lastScreenStatus: 'idle', idleSinceAt: T0, idleAutoCompactWarmSince: T0 } as unknown as DaemonSession;
+    updateSession(session);
+    const compact = vi.fn(() => true);
+    const notices: unknown[] = [];
+    const sweep = (target: DaemonSession, at: number) => runIdleAutoCompactSweep([target], {
+      now: () => at, supported: () => true, blockers: () => [], contextTokens: () => undefined,
+      persist: d => updateSession(d.session), compact, notify: (_d, notice) => { notices.push(notice); }, log: () => {},
+    });
+    expect(sweep(ds, T0 + 55 * MIN)).toBe(1);
+    const turnId = compact.mock.calls[0][1] as string;
+    ds.lastScreenStatus = 'working';
+    stampIdleSinceAt(ds, 'idle', T0 + 55 * MIN + 5_000);
+    noteIdleAutoCompactDirectInput(ds, T0 + 55 * MIN + 10_000);
+    updateSession(session);
+    // The user's idle edge precedes the compact terminal. Its new idleSince
+    // must reach SQLite before the in-flight early return.
+    ds.lastScreenStatus = 'idle';
+    stampIdleSinceAt(ds, 'working', T0 + 56 * MIN);
+    expect(session.idleAutoCompact?.idleSince).toBe(T0 + 56 * MIN);
+    expect(session.idleAutoCompact?.handledIdleSince).toBe(T0);
+
+    init(APP);
+    const reloaded = getSession(session.sessionId)!;
+    expect(reloaded.idleAutoCompact?.idleSince).toBe(T0 + 56 * MIN);
+    const restored = { session: reloaded } as unknown as DaemonSession;
+    restored.lastScreenStatus = 'idle';
+    stampIdleSinceAt(restored, undefined, T0 + 56 * MIN + 30_000);
+    if (order === 'terminal-first') {
+      expect(noteIdleAutoCompactTurnEnded(restored, turnId, 'completed')).toBe(true);
+      updateSession(reloaded);
+    } else {
+      // No local completed/dispatch witness: the inherited sweep retires the
+      // claim silently, but must use the same new-stretch preservation rule.
+      expect(sweep(restored, T0 + 57 * MIN)).toBe(0);
+    }
+    expect(restored.session.idleAutoCompact?.inFlight).toBeUndefined();
+    expect(restored.session.idleAutoCompact?.idleSince).toBe(T0 + 56 * MIN);
+    expect(restored.session.idleAutoCompact?.handledIdleSince).toBe(T0);
+    expect(sweep(restored, T0 + 112 * MIN)).toBe(1);
+    expect(compact).toHaveBeenCalledTimes(2);
+    expect(notices).toEqual([]);
   });
 
   it('a session that never opted in has no setting after reload', () => {

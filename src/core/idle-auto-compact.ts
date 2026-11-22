@@ -16,16 +16,19 @@
  *    turn since it was (re)started is cold and never compacted;
  *  - from the Claude transcript the worker also reports
  *    ({@link noteIdleAutoCompactTranscriptClock}) the main conversation's latest
- *    served request, and the latest one that was not idle upkeep (botmux's
- *    own keep-alive, a plugin's prompt such as a cache-keeping plugin's
- *    summary). Idle time counts from the later of the stretch start and that
- *    activity:
+ *    served request START, and the latest non-upkeep response COMPLETION (idle
+ *    upkeep is botmux's own keep-alive, a plugin's prompt such as a cache-keeping
+ *    plugin's summary). The anchors differ on purpose: response generation is
+ *    busy, not idle. Idle time counts from the later of the stretch start and
+ *    that response completion:
  *    a person typing in the terminal, a botmux turn that opened no stretch, a
  *    background task or a schedule waking the model all produce something
  *    someone may answer, so none is compacted under right after;
- *  - the cache is warm for an hour from the start of the last request that
+ *  - the cache is warm for an hour from the START of the last request that
  *    read it, whoever sent it (keep-alives included); without a report the
- *    stretch start is the last read. A stretch that goes cold is not dropped:
+ *    stretch start is the last read. A known older request is used as-is rather
+ *    than replaced by the later idle edge: uncertainty fails cold instead of
+ *    inventing a warmer cache. A stretch that goes cold is not dropped:
  *    a later request warms the cache again, and the stretch is compacted once
  *    idle again after it;
  *  - background tasks do not hold the compact back (see
@@ -79,6 +82,9 @@ export interface IdleAutoCompactSetting {
     turnId: string; since: number; idleMinutes: number; tokens?: number;
     stretch?: number; attempt?: number; previousHandled?: number;
     busyBeforeSettled?: true;
+    /** A direct Web-terminal submit armed its own turn while this compact was
+     *  unsettled. Paired with a rollback-proof in-memory witness on DaemonSession. */
+    directInputArmed?: true;
     /** Idle was observed after the busy edge, but no terminal has settled the
      *  compact yet: never announce success before a completed terminal. */
     idleBeforeSettled?: number;
@@ -202,7 +208,8 @@ type IdleAutoCompactSessionState = Pick<DaemonSession,
   | 'idleAutoCompactPendingNotice' | 'idleAutoCompactDispatchedTurnId' | 'promptCacheKeepalive'
   | 'idleAutoCompactWarmSince' | 'idleAutoCompactArm'
   | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactLocalTurn'
-  | 'idleAutoCompactCompletedTurnId' | 'lastModelRequestAt' | 'lastActivityRequestAt'>;
+  | 'idleAutoCompactCompletedTurnId' | 'idleAutoCompactDirectInputTurnId'
+  | 'modelRequestSessionId' | 'lastModelRequestAt' | 'lastActivityRequestAt'>;
 
 export function idleAutoCompactMinutes(setting: IdleAutoCompactSetting | undefined): number {
   const minutes = setting?.minutes;
@@ -302,17 +309,29 @@ function currentStretch(ds: Pick<DaemonSession, 'session' | 'idleAutoCompactWarm
  *  - `lastModelRequestAt`: start of the latest served request. The prompt
  *    cache lives an hour from it, whoever sent it (a background task waking
  *    the model, a scheduled fire, a keep-alive, a plugin's turn);
- *  - `lastActivityRequestAt`: the same leaving out idle upkeep (botmux's own
- *    keep-alive, a plugin's prompt). The session was in use until then.
- * Each keeps the latest value: an older report never moves it back, and one
- * ahead of `now` is clamped to `now`. In-memory only: after a daemon restart
- * the stretch start stands in for both again.
+ *  - `lastActivityRequestAt`: completion of the latest served response that was
+ *    not idle upkeep (wire name retained for compatibility). The session was in
+ *    use until then; its generation time was not idle.
+ * `modelRequestSessionId` binds both readings to one native Claude session. A
+ * new identity drops the old conversation's readings BEFORE merging, so an
+ * older `/resume` target is allowed to move the timestamps back. Within one
+ * identity each keeps the latest value: an older report never moves it back,
+ * and one ahead of `now` is clamped to `now`. In-memory only: after a daemon
+ * restart the stretch start stands in for both again.
  */
 export function noteIdleAutoCompactTranscriptClock(
-  ds: Pick<DaemonSession, 'lastModelRequestAt' | 'lastActivityRequestAt'>,
-  report: { lastModelRequestAt?: unknown; lastActivityRequestAt?: unknown },
+  ds: Pick<DaemonSession, 'modelRequestSessionId' | 'lastModelRequestAt' | 'lastActivityRequestAt'>,
+  report: { modelRequestSessionId?: unknown; lastModelRequestAt?: unknown; lastActivityRequestAt?: unknown },
   now = Date.now(),
 ): void {
+  const claudeSessionId = typeof report.modelRequestSessionId === 'string' && report.modelRequestSessionId.trim()
+    ? report.modelRequestSessionId.trim()
+    : undefined;
+  if (claudeSessionId !== undefined && claudeSessionId !== ds.modelRequestSessionId) {
+    ds.modelRequestSessionId = claudeSessionId;
+    ds.lastModelRequestAt = undefined;
+    ds.lastActivityRequestAt = undefined;
+  }
   const later = (current: number | undefined, at: unknown): number | undefined => {
     if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) return current;
     const seen = Math.min(at, now);
@@ -329,18 +348,13 @@ function idleFrom(ds: IdleAutoCompactSessionState, stretch: number, now: number)
   return seen !== undefined && seen > stretch && seen <= now ? seen : stretch;
 }
 
-/** How long before its idle edge the turn that opened a stretch may have sent
- *  its last request (a long final answer: measured p99 about 2 minutes, the
- *  longest about 4). A reported request that recent is that turn's, and the
- *  cache is timed from its start; an older report belongs to some earlier turn
- *  (or a transcript the worker no longer follows) and is not trusted, so a
- *  stale report can never keep a stretch cold. */
-export const IDLE_AUTO_COMPACT_LAST_REQUEST_LEAD_MS = 5 * 60_000;
-
-/** The latest moment the cache is known to have been read. */
+/** The latest moment the cache is known to have been read. A real older report
+ *  stays older: replacing it with the later stretch would invent cache warmth
+ *  and can dispatch exactly the cold full-context rewrite this feature avoids.
+ *  Transcript identity, not a fixed time lead, filters another session's data. */
 function lastCacheReadAt(ds: IdleAutoCompactSessionState, stretch: number, now: number): number {
   const seen = ds.lastModelRequestAt;
-  return seen !== undefined && seen >= stretch - IDLE_AUTO_COMPACT_LAST_REQUEST_LEAD_MS && seen <= now ? seen : stretch;
+  return seen !== undefined && seen <= now ? seen : stretch;
 }
 
 function liveInFlight(setting: IdleAutoCompactSetting, now: number): IdleAutoCompactSetting['inFlight'] {
@@ -362,7 +376,16 @@ function hasCompleted(ds: IdleAutoCompactSessionState, flight: IdleAutoCompactFl
   return flight.completed === true || ds.idleAutoCompactCompletedTurnId === flight.turnId;
 }
 
-/** A completed compact and its finishing idle edge have BOTH been observed. */
+function hasDirectInputArmed(ds: IdleAutoCompactSessionState, flight: IdleAutoCompactFlight): boolean {
+  // The nested flag survives restart; the independent turnId witness survives
+  // updateSession restoring its durable row after a failed direct-input save.
+  return flight.directInputArmed === true
+    || ds.idleAutoCompactDirectInputTurnId === flight.turnId;
+}
+
+/** A completed compact and its finishing idle edge have BOTH been observed.
+ *  When a direct input armed a newer stretch, the same edge belongs to that
+ *  user turn: retire the compact without consuming the user's new stretch. */
 function settleCompletedIdleCompact(
   ds: IdleAutoCompactSessionState,
   setting: IdleAutoCompactSetting,
@@ -374,9 +397,21 @@ function settleCompletedIdleCompact(
   if (ds.idleAutoCompactBusyBeforeSettledTurnId === finished.turnId) {
     ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
   }
-  ds.idleAutoCompactWarmSince = idle;
-  setting.idleSince = idle;
-  setting.handledIdleSince = idle;
+  const current = currentStretch(ds);
+  const preserveUserStretch = hasDirectInputArmed(ds, finished)
+    && finished.stretch !== undefined
+    && current !== undefined && current !== finished.stretch;
+  if (preserveUserStretch) {
+    // The finishing idle edge belongs to the direct user's armed turn, not to
+    // our compact. Retire only the compact claim and mirror the NEW stretch;
+    // its handled marker stays on the older stretch so it can compact later.
+    const warm = current;
+    if (warm !== undefined) setting.idleSince = warm;
+  } else {
+    ds.idleAutoCompactWarmSince = idle;
+    setting.idleSince = idle;
+    setting.handledIdleSince = idle;
+  }
   // Only a compact THIS process dispatched may be announced as done. A marker
   // inherited from a restarted daemon folds as handled without a success claim.
   if (ds.idleAutoCompactDispatchedTurnId === finished.turnId) {
@@ -486,6 +521,15 @@ export function noteIdleAutoCompactScreenStatus(
   syncArm();
   // A local command's own repaint is over; later busy edges are activity again.
   ds.idleAutoCompactLocalTurn = undefined;
+  // Mirror an armed user's NEW stretch before any in-flight early return. If
+  // the daemon restarts before the compact terminal, the durable row must still
+  // distinguish this stretch from the compact's older flight.stretch.
+  const warm = ds.idleAutoCompactWarmSince;
+  if (warm !== setting!.idleSince) {
+    if (warm === undefined) delete setting!.idleSince;
+    else setting!.idleSince = warm;
+    changed = true;
+  }
   const finished = liveInFlight(setting!, now);
   if (finished && hasBusyBeforeSettled(ds, finished) && !hasCompleted(ds, finished)) {
     // A busy → idle edge alone cannot distinguish our compact from the user's
@@ -498,12 +542,6 @@ export function noteIdleAutoCompactScreenStatus(
   if (finished) return settleCompletedIdleCompact(ds, setting!, finished, finished.idleBeforeSettled ?? idle);
   // A stale marker (or one a different turn already ended) is just dropped.
   if (setting!.inFlight) { delete setting!.inFlight; changed = true; }
-  const warm = ds.idleAutoCompactWarmSince;
-  if (warm !== setting!.idleSince) {
-    if (warm === undefined) delete setting!.idleSince;
-    else setting!.idleSince = warm;
-    changed = true;
-  }
   return changed;
 }
 
@@ -570,7 +608,8 @@ export function invalidateIdleAutoCompactRetryForTurn(
  *  must save the retry invalidation now. */
 export function noteIdleAutoCompactTurnStarted(
   ds: Pick<DaemonSession, 'session' | 'idleAutoCompactArm' | 'lastScreenStatus'
-    | 'idleAutoCompactLocalTurn' | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactCompletedTurnId'>,
+    | 'idleAutoCompactLocalTurn' | 'idleAutoCompactBusyBeforeSettledTurnId'
+    | 'idleAutoCompactCompletedTurnId' | 'idleAutoCompactDirectInputTurnId'>,
   turnId: string,
   now = Date.now(),
   opts: { preserveRetry?: boolean } = {},
@@ -578,6 +617,7 @@ export function noteIdleAutoCompactTurnStarted(
   const setting = ds.session.idleAutoCompact;
   const endedInFlight = setting?.inFlight !== undefined && setting.inFlight.turnId !== turnId;
   if (endedInFlight) delete setting!.inFlight;
+  ds.idleAutoCompactDirectInputTurnId = undefined;
   if (turnId.startsWith(IDLE_AUTO_COMPACT_TURN_PREFIX)) return endedInFlight;
   const invalidation = invalidateIdleAutoCompactRetryForTurn(ds, turnId, opts);
   ds.idleAutoCompactLocalTurn = opts.preserveRetry && setting?.retry
@@ -601,21 +641,33 @@ export function noteIdleAutoCompactTurnStarted(
  *  Returns true when the caller must persist the change. */
 export function noteIdleAutoCompactDirectInput(
   ds: Pick<DaemonSession, 'session' | 'idleAutoCompactLocalTurn' | 'idleAutoCompactBusyBeforeSettledTurnId'
-    | 'idleAutoCompactArm' | 'lastScreenStatus'>,
+    | 'idleAutoCompactDirectInputTurnId' | 'idleAutoCompactArm' | 'lastScreenStatus'>,
   now = Date.now(),
 ): boolean {
   ds.idleAutoCompactLocalTurn = undefined;
+  ds.idleAutoCompactDirectInputTurnId = undefined;
   const setting = ds.session.idleAutoCompact;
   let changed = false;
+  // Arm in EVERY case, including while our compact is unsettled. Persist the
+  // arm now: the CLI may already be busy, so there need not be another busy
+  // edge to save it before a daemon restart.
+  const arm = { at: now, busy: BUSY_SCREEN_STATUSES.has(ds.lastScreenStatus ?? '') };
+  ds.idleAutoCompactArm = arm;
+  if (setting?.enabled && (setting.armed?.at !== arm.at || setting.armed.busy !== arm.busy)) {
+    setting.armed = { ...arm };
+    changed = true;
+  }
   if (setting?.inFlight) {
     ds.idleAutoCompactBusyBeforeSettledTurnId = setting.inFlight.turnId;
+    ds.idleAutoCompactDirectInputTurnId = setting.inFlight.turnId;
     if (!setting.inFlight.busyBeforeSettled) {
       setting.inFlight.busyBeforeSettled = true;
       changed = true;
     }
-  } else {
-    // Saved by its busy edge, like a botmux turn's arm.
-    ds.idleAutoCompactArm = { at: now, busy: BUSY_SCREEN_STATUSES.has(ds.lastScreenStatus ?? '') };
+    if (!setting.inFlight.directInputArmed) {
+      setting.inFlight.directInputArmed = true;
+      changed = true;
+    }
   }
   if (setting?.retry) {
     setting.handledIdleSince = setting.retry.stretch;
@@ -642,7 +694,7 @@ export interface IdleAutoCompactRefusalOutcome {
  *  saves the session row. */
 export function noteIdleAutoCompactRefused(
   ds: Pick<DaemonSession, 'session' | 'idleAutoCompactPendingNotice' | 'idleAutoCompactDispatchedTurnId'
-    | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactCompletedTurnId'>,
+    | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactCompletedTurnId' | 'idleAutoCompactDirectInputTurnId'>,
   turnId: string,
   refusal?: PromptCacheKeepaliveRefusal,
 ): IdleAutoCompactRefusalOutcome | undefined {
@@ -660,6 +712,7 @@ export function noteIdleAutoCompactRefused(
     ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
   }
   if (ds.idleAutoCompactCompletedTurnId === turnId) ds.idleAutoCompactCompletedTurnId = undefined;
+  if (ds.idleAutoCompactDirectInputTurnId === turnId) ds.idleAutoCompactDirectInputTurnId = undefined;
   if (busyBeforeSettled || !locallyDispatched) {
     // Busy before refusal proves activity. An inherited claim without THIS
     // process's dispatch witness is also never retryable: a failed marker save
@@ -730,6 +783,7 @@ export function noteIdleAutoCompactTurnEnded(
     ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
   }
   if (ds.idleAutoCompactCompletedTurnId === turnId) ds.idleAutoCompactCompletedTurnId = undefined;
+  if (ds.idleAutoCompactDirectInputTurnId === turnId) ds.idleAutoCompactDirectInputTurnId = undefined;
   const pending = ds.idleAutoCompactPendingNotice;
   if (pending?.kind === 'compacted' && pending.turnId === turnId) {
     // The idle edge announced success first; retract it before the sweep posts.
@@ -904,15 +958,17 @@ function postedNotice(p: IdleAutoCompactPendingNotice): IdleAutoCompactNotice {
 export function clearIdleAutoCompactStretch(
   ds: Pick<DaemonSession, 'session' | 'idleAutoCompactWarmSince' | 'idleAutoCompactArm'
     | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactLocalTurn' | 'idleAutoCompactCompletedTurnId'
-    | 'lastModelRequestAt' | 'lastActivityRequestAt'>,
+    | 'idleAutoCompactDirectInputTurnId' | 'modelRequestSessionId' | 'lastModelRequestAt' | 'lastActivityRequestAt'>,
 ): boolean {
   ds.idleAutoCompactWarmSince = undefined;
   ds.idleAutoCompactArm = undefined;
+  ds.modelRequestSessionId = undefined;
   ds.lastModelRequestAt = undefined;
   ds.lastActivityRequestAt = undefined;
   ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
   ds.idleAutoCompactLocalTurn = undefined;
   ds.idleAutoCompactCompletedTurnId = undefined;
+  ds.idleAutoCompactDirectInputTurnId = undefined;
   const setting = ds.session.idleAutoCompact;
   if (!setting || (setting.idleSince === undefined && !setting.inFlight && setting.armed === undefined && !setting.retry)) return false;
   delete setting.idleSince;
@@ -974,15 +1030,11 @@ export function runIdleAutoCompactSweep(
           if (unsettled.idleBeforeSettled !== undefined
             && ds.idleAutoCompactDispatchedTurnId !== unsettled.turnId) {
             // This claim came from another process. Its idle edge is durable,
-            // but its in-memory completed witness is unrecoverable (for example
-            // a failed completed save followed by restart). Fold it silently as
-            // handled rather than waiting forever or claiming success.
-            const inheritedIdle = unsettled.idleBeforeSettled;
-            delete current()!.inFlight;
-            delete current()!.retry;
-            ds.idleAutoCompactWarmSince = inheritedIdle;
-            current()!.idleSince = inheritedIdle;
-            current()!.handledIdleSince = inheritedIdle;
+            // but its in-memory completed witness is unrecoverable. Retire it
+            // through the same stretch-aware settlement as a witnessed compact:
+            // no success is claimed, and a direct user's newer stretch is not
+            // consumed. Without one, the old stretch folds silently as handled.
+            settleCompletedIdleCompact(ds, current()!, unsettled, unsettled.idleBeforeSettled);
             try { deps.persist(ds); } catch { /* the next sweep reconciles again */ }
           }
           continue;

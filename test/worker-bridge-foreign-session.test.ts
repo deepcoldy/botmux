@@ -124,24 +124,71 @@ describe('worker trust set: what the CLI proved vs what was only guessed or swit
     expect([...(scope.bridgeCliProvenSessionIds as Set<string>)]).toEqual([OWN]);
   });
 
-  it('a fingerprint switch trusts the new file without counting it as proven', () => {
+  it('a fingerprint switch trusts the new file and rebinds its model-request clock', () => {
     const scope = trustScope();
+    const modelRequestClock = new ClaudeModelRequestClock();
+    modelRequestClock.bind(OWN);
+    modelRequestClock.observe({
+      type: 'assistant', timestamp: '2026-11-21T10:00:30.000Z',
+      message: { role: 'assistant', content: [], usage: { input_tokens: 1 } },
+    });
+    expect(modelRequestClock.lastServedAt()).toBeDefined();
     Object.assign(scope, {
+      lastInitConfig: { cliId: 'claude-code' },
       bridgeJsonlPath: undefined, bridgeBaselineDone: false, bridgeWatcher: null, log: () => {},
       dirname: (p: string) => p.slice(0, p.lastIndexOf('/')),
-      drainTranscript: () => ({ newOffset: 0, events: [] }),
+      drainTranscript: () => {
+        expect(modelRequestClock.boundClaudeSessionId).toBe(SIBLING);
+        return { newOffset: 0, events: [] };
+      },
       splitTranscriptEventsByCutoff: () => ({ history: [], live: [] }),
       beginNewBridgeTranscriptGeneration: () => {},
       bridgeQueue: { absorb: () => {}, ingest: () => {} },
-      seedModelFallbackFromTranscript: () => {}, seedModelRequestClockFromTranscript: () => {}, modelRequestClock: new ClaudeModelRequestClock(), observeModelFallbackEvents: () => {},
+      seedModelFallbackFromTranscript: () => {}, seedModelRequestClockFromTranscript: () => {}, modelRequestClock, observeModelFallbackEvents: () => {},
       bridgeMarkStalePidStateForAcceptedSid: () => {},
       fsWatch: () => ({ close: () => {} }),
       performBridgeIngestAndScheduleQuietEmit: () => {},
       ingestClaudeSwitchLiveAndSettleUnreadTurn: () => {},
     });
+    scope.bindModelRequestClockToTranscript = loadWorkerFunction('bindModelRequestClockToTranscript', scope);
     loadWorkerFunction<(m: string, r: string, c: number) => void>('bridgeApplyFingerprintSwitch', scope)(`/p/${SIBLING}.jsonl`, 'test', 0);
     expect([...(scope.bridgeKnownSessionIds as Set<string>)]).toEqual([SIBLING]);
     expect([...(scope.bridgeCliProvenSessionIds as Set<string>)]).toEqual([]);
+    expect(modelRequestClock.boundClaudeSessionId).toBe(SIBLING);
+    expect(modelRequestClock.lastServedAt()).toBeUndefined();
+    expect(loadWorkerFunction<() => Record<string, unknown>>('modelRequestPayload', scope)())
+      .toEqual({ modelRequestSessionId: SIBLING });
+  });
+  it('a rotation also rebinds the model-request clock before folding the new file', () => {
+    const scope = trustScope();
+    const modelRequestClock = new ClaudeModelRequestClock();
+    modelRequestClock.bind(OWN);
+    modelRequestClock.observe({
+      type: 'assistant', timestamp: '2026-11-21T10:00:30.000Z',
+      message: { role: 'assistant', content: [], usage: { input_tokens: 1 } },
+    });
+    Object.assign(scope, {
+      lastInitConfig: { cliId: 'claude-code' },
+      bridgeJsonlPath: undefined, bridgeBaselineDone: false, bridgeWatcher: null, log: () => {},
+      bridgeOffset: 0, bridgePathConfirmedAtMs: 0,
+      dirname: (p: string) => p.slice(0, p.lastIndexOf('/')),
+      drainTranscript: () => {
+        expect(modelRequestClock.boundClaudeSessionId).toBe(SIBLING);
+        return { newOffset: 0, events: [] };
+      },
+      splitTranscriptEventsByCutoff: () => ({ history: [], live: [] }),
+      beginNewBridgeTranscriptGeneration: () => {},
+      bridgeQueue: { absorb: () => {} },
+      ingestClaudeSwitchLiveAndSettleUnreadTurn: () => {},
+      seedModelFallbackFromTranscript: () => {}, observeModelFallbackEvents: () => {},
+      observeClaudeBackgroundTasks: () => {}, modelRequestClock,
+      fsWatch: () => ({ close: () => {} }), performBridgeIngestAndScheduleQuietEmit: () => {},
+    });
+    scope.bindModelRequestClockToTranscript = loadWorkerFunction('bindModelRequestClockToTranscript', scope);
+    loadWorkerFunction<(p: string, c: number, r: string) => void>('performRotationSwitch', scope)(`/p/${SIBLING}.jsonl`, 0, 'test');
+    expect(modelRequestClock.boundClaudeSessionId).toBe(SIBLING);
+    expect(modelRequestClock.lastServedAt()).toBeUndefined();
+    expect(modelRequestClock.lastActivityAt()).toBeUndefined();
   });
 });
 

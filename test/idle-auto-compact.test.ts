@@ -496,15 +496,69 @@ describe('idle auto-compact sweep', () => {
     expect(h.sweepAt([ds], T0 + 56 * MIN)).toBe(0);
   });
 
-  it('a direct Web submit marks an unsettled compact before its refusal', () => {
+  it('a direct Web submit during an unsettled compact arms the user turn through refusal', () => {
     const ds = makeDs('33333346', { enabled: true });
     edge(ds, 'idle', T0);
     const h = harness();
     h.sweepAt([ds], T0 + 55 * MIN);
     const turnId = h.compact.mock.calls[0][1];
-    expect(noteIdleAutoCompactDirectInput(ds)).toBe(true);
+    expect(noteIdleAutoCompactDirectInput(ds, T0 + 55 * MIN)).toBe(true);
+    expect(ds.idleAutoCompactArm).toEqual({ at: T0 + 55 * MIN, busy: false });
+    expect(ds.session.idleAutoCompact?.armed).toEqual({ at: T0 + 55 * MIN, busy: false });
     expect(ds.session.idleAutoCompact?.inFlight?.busyBeforeSettled).toBe(true);
+    expect(ds.session.idleAutoCompact?.inFlight?.directInputArmed).toBe(true);
+    expect(ds.idleAutoCompactDirectInputTurnId).toBe(turnId);
     expect(noteIdleAutoCompactRefused(ds, turnId, 'prompt_not_ready')?.retry).toBe(false);
+    // The refused compact wrote nothing; this busy → idle is the direct user's
+    // turn and must open a fresh, UNHANDLED stretch.
+    edge(ds, 'working', T0 + 55 * MIN + 10_000);
+    sawRequest(ds, T0 + 55 * MIN + 20_000, T0 + 55 * MIN + 30_000);
+    edge(ds, 'idle', T0 + 56 * MIN);
+    expect(ds.idleAutoCompactWarmSince).toBe(T0 + 56 * MIN);
+    expect(ds.session.idleAutoCompact?.idleSince).toBe(T0 + 56 * MIN);
+    expect(ds.session.idleAutoCompact?.handledIdleSince).toBe(T0);
+    expect(h.sweepAt([ds], T0 + 110 * MIN)).toBe(0);
+    expect(h.sweepAt([ds], T0 + 111 * MIN)).toBe(1);
+  });
+
+  it('a completed compact does not consume the direct user turn\'s new stretch', () => {
+    const ds = makeDs('33333347', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    const turnId = h.compact.mock.calls[0][1];
+    ds.idleAutoCompactDispatchedTurnId = turnId;
+    edge(ds, 'working', T0 + 55 * MIN + 5_000); // compact's busy edge
+    noteIdleAutoCompactDirectInput(ds, T0 + 55 * MIN + 10_000);
+    sawRequest(ds, T0 + 55 * MIN + 20_000, T0 + 55 * MIN + 30_000);
+    expect(noteIdleAutoCompactTurnEnded(ds, turnId, 'completed')).toBe(true);
+    edge(ds, 'idle', T0 + 56 * MIN);
+    expect(ds.session.idleAutoCompact?.inFlight).toBeUndefined();
+    expect(ds.idleAutoCompactWarmSince).toBe(T0 + 56 * MIN);
+    expect(ds.session.idleAutoCompact?.idleSince).toBe(T0 + 56 * MIN);
+    expect(ds.session.idleAutoCompact?.handledIdleSince).toBe(T0);
+    expect(h.sweepAt([ds], T0 + 110 * MIN)).toBe(0);
+    expect(h.sweepAt([ds], T0 + 111 * MIN)).toBe(1);
+  });
+
+  it('restart preserves the direct arm while reconciling a completed compact', () => {
+    const ds = makeDs('33333348', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    const turnId = h.compact.mock.calls[0][1];
+    edge(ds, 'working', T0 + 55 * MIN + 5_000);
+    noteIdleAutoCompactDirectInput(ds, T0 + 55 * MIN + 10_000);
+    h.persist(ds); // the terminal_input caller saves the arm immediately
+    const restored = restartFrom(ds);
+    edge(restored, 'working', T0 + 55 * MIN + 20_000);
+    expect(noteIdleAutoCompactTurnEnded(restored, turnId, 'completed')).toBe(true);
+    edge(restored, 'idle', T0 + 56 * MIN);
+    expect(restored.session.idleAutoCompact?.inFlight).toBeUndefined();
+    // A restored arm conservatively dates from submit; either way it is a NEW
+    // stretch and the old compact must not mark it handled.
+    expect(restored.session.idleAutoCompact?.idleSince).toBe(T0 + 55 * MIN + 10_000);
+    expect(restored.session.idleAutoCompact?.handledIdleSince).toBe(T0);
   });
 
   it('a real busy edge after the already-idle local command still cancels retry', () => {
@@ -1095,9 +1149,13 @@ describe('idle auto-compact across a worker suspend', () => {
 
 
 /** The worker's transcript report (screen_update): a served request started
- *  at `at`; `keepalive` when it was botmux's own keep-alive (not activity). */
-function sawRequest(ds: DaemonSession, at: number, now: number, opts: { keepalive?: boolean } = {}): void {
-  noteIdleAutoCompactTranscriptClock(ds, { lastModelRequestAt: at, ...(opts.keepalive ? {} : { lastActivityRequestAt: at }) }, now);
+ *  at `at`; `responseAt` is when its response completed (default: the report's
+ *  `now`). `keepalive` marks upkeep: it updates only the cache clock. */
+function sawRequest(ds: DaemonSession, at: number, now: number, opts: { keepalive?: boolean; responseAt?: number } = {}): void {
+  noteIdleAutoCompactTranscriptClock(ds, {
+    lastModelRequestAt: at,
+    ...(opts.keepalive ? {} : { lastActivityRequestAt: opts.responseAt ?? now }),
+  }, now);
 }
 
 /** The daemon's fire-time gate snapshot with nothing in the way. */
@@ -1157,6 +1215,22 @@ describe('idle auto-compact cache window follows the last request that read the 
     expect(h.sweepAt([ds], T0 + 86 * MIN)).toBe(1);
   });
 
+  it('a long background response is busy time; idle starts at its completion while cache stays at request start', () => {
+    const ds = makeDs('cw000008', { enabled: true });
+    edge(ds, 'idle', T0);
+    edge(ds, 'working', T0 + 30 * MIN);
+    // Request at +30m, response completes at +80m. The cache expires at +90m,
+    // but only five minutes of real idle have elapsed at +85m.
+    sawRequest(ds, T0 + 30 * MIN, T0 + 80 * MIN, { responseAt: T0 + 80 * MIN });
+    edge(ds, 'idle', T0 + 80 * MIN);
+    // Upkeep at +84m re-warms the cache without moving real activity.
+    sawRequest(ds, T0 + 84 * MIN, T0 + 84 * MIN + 30_000, { keepalive: true });
+    const h = harness();
+    expect(h.sweepAt([ds], T0 + 85 * MIN)).toBe(0);
+    for (let m = 86; m <= 134; m += 1) expect(h.sweepAt([ds], T0 + m * MIN)).toBe(0);
+    expect(h.sweepAt([ds], T0 + 135 * MIN)).toBe(1);
+  });
+
   it("botmux's keep-alive keeps the cache warm without counting as activity", () => {
     // A keep-alive at +54m reads the cache; a waiting card then holds the
     // compact back until +70m, past the hour since the stretch began.
@@ -1171,7 +1245,7 @@ describe('idle auto-compact cache window follows the last request that read the 
     expect(h.compact.mock.calls).toHaveLength(1);
   });
 
-  it("the stretch's own last request, sent just before its idle edge, times the cache; an older report does not", () => {
+  it("the stretch's own last request times the cache from its real start; an older report fails cold", () => {
     // A 59-minute setting: the turn's final answer took two minutes, so at
     // +59m the cache was last read 61 minutes ago.
     const ds = makeDs('cw000006', { enabled: true, minutes: 59 });
@@ -1179,12 +1253,43 @@ describe('idle auto-compact cache window follows the last request that read the 
     sawRequest(ds, T0 - 2 * MIN, T0);
     const h = harness();
     expect(h.sweepAt([ds], T0 + 59 * MIN)).toBe(0);
-    // A report from long before the stretch (another turn, another
-    // transcript) is not trusted: it never keeps a stretch cold.
+    // A report from long before the stretch is real evidence of an old cache
+    // read, not a reason to substitute the younger idle edge: fail cold.
     const stale = makeDs('cw000007', { enabled: true, minutes: 59 });
     edge(stale, 'idle', T0);
     sawRequest(stale, T0 - 30 * MIN, T0);
-    expect(h.sweepAt([stale], T0 + 59 * MIN)).toBe(1);
+    expect(h.sweepAt([stale], T0 + 59 * MIN)).toBe(0);
+  });
+
+  it('a six-minute final answer does not make the idle edge invent a warm cache', () => {
+    const ds = makeDs('cw000009', { enabled: true });
+    // Request start T0-6m, response/idle edge T0. At +55m the real cache read
+    // is 61m old. The removed five-minute lead used to substitute T0 and send.
+    edge(ds, 'idle', T0);
+    sawRequest(ds, T0 - 6 * MIN, T0, { responseAt: T0 });
+    const h = harness();
+    for (let m = 55; m <= 59; m += 1) expect(h.sweepAt([ds], T0 + m * MIN)).toBe(0);
+    // A later upkeep request really warms it; the already-idle stretch can then
+    // compact without pretending the old request was younger.
+    sawRequest(ds, T0 + 60 * MIN, T0 + 60 * MIN + 30_000, { keepalive: true });
+    expect(h.sweepAt([ds], T0 + 61 * MIN)).toBe(1);
+  });
+
+  it('a different native session replaces both clocks even when its history is older', () => {
+    const ds = makeDs('cw000010', { enabled: true });
+    edge(ds, 'idle', T0);
+    const now = T0 + 60 * MIN;
+    noteIdleAutoCompactTranscriptClock(ds, {
+      modelRequestSessionId: 'session-a', lastModelRequestAt: T0 + 59 * MIN, lastActivityRequestAt: T0,
+    }, now);
+    noteIdleAutoCompactTranscriptClock(ds, {
+      modelRequestSessionId: 'session-b', lastModelRequestAt: T0 - 120 * MIN, lastActivityRequestAt: T0 - 121 * MIN,
+    }, now);
+    expect(ds.modelRequestSessionId).toBe('session-b');
+    expect(ds.lastModelRequestAt).toBe(T0 - 120 * MIN);
+    expect(ds.lastActivityRequestAt).toBe(T0 - 121 * MIN);
+    // Session A's recent upkeep must not warm cold session B.
+    expect(harness().sweepAt([ds], now)).toBe(0);
   });
 
   it('a stretch that went cold is compacted once a later request warms the cache again, and only once', () => {
@@ -1205,13 +1310,13 @@ describe('idle auto-compact cache window follows the last request that read the 
     edge(ds, 'working', T0 + 120 * MIN);
     sawRequest(ds, T0 + 120 * MIN, T0 + 121 * MIN);
     edge(ds, 'idle', T0 + 121 * MIN);
-    for (let m = 121; m <= 174; m += 1) expect(h.sweepAt([ds], T0 + m * MIN)).toBe(0);
-    expect(h.sweepAt([ds], T0 + 175 * MIN)).toBe(1);
+    for (let m = 121; m <= 175; m += 1) expect(h.sweepAt([ds], T0 + m * MIN)).toBe(0);
+    expect(h.sweepAt([ds], T0 + 176 * MIN)).toBe(1);
     const turnId = h.compact.mock.calls[0][1];
-    edge(ds, 'working', T0 + 175 * MIN + 1_000);
+    edge(ds, 'working', T0 + 176 * MIN + 1_000);
     noteIdleAutoCompactTurnEnded(ds, turnId, 'completed');
-    edge(ds, 'idle', T0 + 177 * MIN);
-    h.sweepAt([ds], T0 + 178 * MIN);
+    edge(ds, 'idle', T0 + 178 * MIN);
+    h.sweepAt([ds], T0 + 179 * MIN);
     expect(h.notify).toHaveBeenCalledWith(ds, { kind: 'compacted', idleMinutes: 55, tokens: 150_000 });
     // Later wakes keep the compacted stretch: it is not compacted again.
     edge(ds, 'working', T0 + 240 * MIN);

@@ -470,6 +470,7 @@ describe.each(['performRotationSwitch', 'bridgeApplyFingerprintSwitch'])('worker
       PENDING_MARK_SKEW_MS: 5_000, replyRecordsStampedWithin,
       unreadClaudeTurnLook: { run, timer: setTimeout(look, UNREAD_TURN_RELOCATE_RETRY_MS) },
     };
+    scope.bindModelRequestClockToTranscript = loadWorkerFunction('bindModelRequestClockToTranscript', scope);
     for (const name of [
       'unreadClaudeTurnUndisturbed', 'settleUnreadClaudeTurnLookOnSwitch',
       'ingestClaudeSwitchLiveAndSettleUnreadTurn',

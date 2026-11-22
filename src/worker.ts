@@ -9841,29 +9841,43 @@ function backgroundWaitPayload(): { backgroundTasks?: number } {
   return backgroundWaitTasks > 0 ? { backgroundTasks: backgroundWaitTasks } : {};
 }
 
-/** The main conversation's latest served model request, from the transcript
- *  this worker follows: any request, and any but idle upkeep (botmux's own
- *  keep-alive, a plugin's prompt).
- *  Rides on screen_update (the sampler publishes a change) so the daemon's
- *  idle auto-compact times the prompt cache from the last request that
- *  actually read it, and its idle clock from the last real activity (a
- *  background-task wake or a scheduled fire included). */
+/** The main conversation's latest served model request and latest non-upkeep
+ *  response completion, from the transcript this worker follows. The first
+ *  times cache warmth from the request start; the second times real activity
+ *  from the response end (botmux's keep-alive and plugin upkeep excluded).
+ *  Rides on screen_update with its native-session identity (the sampler
+ *  publishes a change) so the daemon can rebind on rotation, time the prompt
+ *  cache from the last actual read, and count idle only after activity ended. */
 const modelRequestClock = new ClaudeModelRequestClock();
+
+/** Bind the clock to the native conversation before reading any of its events.
+ *  The screen_update identity lets the daemon perform the matching rebind. */
+function bindModelRequestClockToTranscript(path: string | undefined): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || !path) return;
+  const claudeSessionId = sessionIdFromJsonlPath(path);
+  if (claudeSessionId) modelRequestClock.bind(claudeSessionId);
+}
 
 /** A worker that starts on an existing transcript (a daemon restart, a
  *  resume) cursors to its end, so the clock would know nothing until the
  *  next request and the daemon would fall back to timing the cache and the
  *  idle stretch from the stretch start. Read the tail once instead. */
 function seedModelRequestClockFromTranscript(): void {
-  if (lastInitConfig?.cliId !== 'claude-code' || !bridgeJsonlPath || !existsSyncSafe(bridgeJsonlPath)) return;
+  if (lastInitConfig?.cliId !== 'claude-code' || !bridgeJsonlPath) return;
+  // Bind even when the new file does not exist yet: a fresh native session
+  // must not inherit the retired transcript's cache/activity timestamps.
+  bindModelRequestClockToTranscript(bridgeJsonlPath);
+  if (!existsSyncSafe(bridgeJsonlPath)) return;
   try { modelRequestClock.seedFromTail(bridgeJsonlPath); }
   catch (err: any) { log(`Model request clock seed skipped: ${err?.message ?? err}`); }
 }
 
-function modelRequestPayload(): { lastModelRequestAt?: number; lastActivityRequestAt?: number } {
+function modelRequestPayload(): { modelRequestSessionId?: string; lastModelRequestAt?: number; lastActivityRequestAt?: number } {
+  const claudeSessionId = modelRequestClock.boundClaudeSessionId;
   const at = modelRequestClock.lastServedAt();
-  const activity = modelRequestClock.lastActivityServedAt();
+  const activity = modelRequestClock.lastActivityAt();
   return {
+    ...(claudeSessionId ? { modelRequestSessionId: claudeSessionId } : {}),
     ...(at !== undefined ? { lastModelRequestAt: at } : {}),
     ...(activity !== undefined ? { lastActivityRequestAt: activity } : {}),
   };
@@ -11841,6 +11855,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // trying to deliver.
   bridgeJsonlPath = matched;
   bridgeJsonlDir = dirname(matched);
+  bindModelRequestClockToTranscript(matched);
   // Split-live: drain `matched` from offset 0, partition by cutoffMs.
   // History (pre-mark) is absorbed into the seen set so the iTerm-side
   // turns the user accumulated before this Lark message DON'T re-emit
@@ -12130,6 +12145,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   }
   bridgeJsonlPath = newPath;
   bridgeJsonlDir = dirname(newPath);
+  bindModelRequestClockToTranscript(newPath);
 
   // Drain the new path from 0 ourselves (do NOT call bridgeAbsorbBaseline
   // — that would emit the preamble we want to suppress on rotation).
@@ -12942,14 +12958,15 @@ function bridgeIngest(): void {
   if (!bridgeBaselineDone) {
     // Lazy baseline: file didn't exist at attach, baseline the moment it does.
     if (!existsSyncSafe(bridgeJsonlPath)) return;
+    // Bind/seed before baseline can trigger any immediate status publication.
+    seedModelRequestClockFromTranscript();
     bridgeAbsorbBaseline();
-    // Seed for the same reason startBridgeWatcher seeds after ITS baseline:
-    // the non-adopt branch cursors straight to EOF, so a switch already written
-    // to the file is never drained and only the tail scan can recover it. It
-    // also binds the tracker to this file's Claude session. Idempotent with the
+    // Seed the fallback tracker for the same reason as the request clock: the
+    // non-adopt branch cursors straight to EOF, so a switch already written to
+    // the file is never drained and only the tail scan can recover it. It also
+    // binds the tracker to this file's Claude session. Idempotent with the
     // adopt branch's own observe: the same record is deduped by uuid.
     seedModelFallbackFromTranscript();
-    seedModelRequestClockFromTranscript();
     return;
   }
   const batchOffset = bridgeOffset;
@@ -13182,6 +13199,8 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   // baseline-existing branch re-proves `seen` from its file; fresh-empty
   // starts undecided, so its first split final gets the provisional wait.
   beginNewBridgeTranscriptGeneration();
+  // Bind/seed before baseline can publish status from a previous native session.
+  seedModelRequestClockFromTranscript();
   if (mode === 'fresh-empty') {
     // Non-adopt fallback: brand-new session, jsonl gets created on the first
     // user submit. We must NOT lazy-absorb the file when it appears — that
@@ -13199,7 +13218,6 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
     log(`Bridge transcript not yet present at ${bridgeJsonlPath}; will baseline on first appearance`);
   }
   seedModelFallbackFromTranscript();
-  seedModelRequestClockFromTranscript();
   // fs.watch is best-effort wakeup — actual data source is the byte offset.
   // The fallback poller covers fs.watch's gaps (NFS, rename-rotation, etc.)
   // and also drives lazy baseline when the file shows up after attach.
@@ -26271,6 +26289,7 @@ function startScreenUpdates(): void {
   let lastSentBackgroundWait = 0;
   let lastSentModelRequestAt: number | undefined;
   let lastSentActivityRequestAt: number | undefined;
+  let lastSentModelRequestSessionId: string | undefined;
   let lastTextSnapshotHash = '';
   let lastContent = '';
   const permissionNotice = new ClaudePermissionNoticeTracker();
@@ -26552,13 +26571,15 @@ function startScreenUpdates(): void {
         || usageAware.usageLimitRecovery !== lastSentRecovery
         || backgroundWaitTasks !== lastSentBackgroundWait
         || modelRequestClock.lastServedAt() !== lastSentModelRequestAt
-        || modelRequestClock.lastActivityServedAt() !== lastSentActivityRequestAt) {
+        || modelRequestClock.lastActivityAt() !== lastSentActivityRequestAt
+        || modelRequestClock.boundClaudeSessionId !== lastSentModelRequestSessionId) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
         lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
         lastSentModelRequestAt = modelRequestClock.lastServedAt();
-        lastSentActivityRequestAt = modelRequestClock.lastActivityServedAt();
+        lastSentActivityRequestAt = modelRequestClock.lastActivityAt();
+        lastSentModelRequestSessionId = modelRequestClock.boundClaudeSessionId;
         send({
           type: 'screen_update',
           content: snapshot.content,
