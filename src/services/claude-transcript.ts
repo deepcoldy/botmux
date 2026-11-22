@@ -1919,9 +1919,17 @@ export function stringifyUserContent(content: unknown): string {
  * of the fingerprint compare (the Lark message that produces the
  * fingerprint, and the transcript user content we search through),
  * so newlines / tabs / double-spaces don't break the match.
+ *
+ * A backslash directly before a line break is dropped first. Claude Code
+ * input is typed as `\` + Enter per newline (soft-newline idiom); when Ink
+ * treats that burst as a paste, the `\` survives into the recorded user
+ * line (`<summary_memory>\` + newline), so the transcript no longer contains
+ * the head fingerprint and the Lark turn falls back to a suppressed local
+ * turn. Applied to both sides, so a genuine line-ending backslash still
+ * matches itself.
  */
 export function normaliseForFingerprint(s: string): string {
-  return s.replace(/\s+/g, ' ').trim();
+  return s.replace(/\\(?=\r?\n)/g, '').replace(/\s+/g, ' ').trim();
 }
 
 /**

@@ -1596,6 +1596,31 @@ describe('BridgeTurnQueue', () => {
     });
   });
 
+  describe('soft-newline backslash left in the recorded user line', () => {
+    // Claude Code input is typed as `\` + Enter per newline. When Ink takes
+    // the burst for a paste the backslash is recorded literally, e.g. the
+    // first line becomes `<summary_memory>\`. Before the fix the head
+    // fingerprint no longer matched, the Lark mark stayed unstarted and the
+    // reply went out as a suppressed local turn.
+    it('binds the Lark mark when the transcript kept a `\\` before a newline', () => {
+      const q = new BridgeTurnQueue();
+      const sent = '<summary_memory>\n配置的记忆文件路径是 summary.md。\n</summary_memory>\n<user_message>\n可以提交 PR 吗\n</user_message>';
+      q.mark('lark-1', makeFingerprint(sent), 100, makeFingerprintFull(sent));
+      const recorded = '<summary_memory>\\\n配置的记忆文件路径是 summary.md。\n</summary_memory>\n<user_message>\n可以提交 PR 吗\n</user_message>';
+      q.ingest([user('u1', recorded), assistant('a1', 'reply')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('lark-1');
+      expect(ready[0].isLocal).toBeFalsy();
+      expect(ready[0].assistantUuids).toEqual(['a1']);
+    });
+
+    it('still treats a backslash that is not before a newline as content', () => {
+      expect(normaliseForFingerprint('a\\b\nc')).toBe('a\\b c');
+      expect(normaliseForFingerprint('a\\\nb')).toBe(normaliseForFingerprint('a\nb'));
+    });
+  });
+
   describe('truncation-proof bind in the queue (durable mark, mismatched head)', () => {
     it('binds the durable mark when the recorded line is a provable truncation of the marked content', () => {
       const q = new BridgeTurnQueue();
