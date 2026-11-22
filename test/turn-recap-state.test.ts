@@ -38,6 +38,8 @@ function harness(over: Partial<RecapIo> = {}) {
   const writes: Write[] = [];
   const attempts = { insert: 0 };
   const warnings: string[] = [];
+  /** Turns the worker was asked to let the CLI recap. */
+  const awaySummaryRequests: string[] = [];
   const send = (messageId: string) => {
     cards.set(messageId, createReplyCard([
       ...buildCardBodyElements('最终答复'),
@@ -48,6 +50,8 @@ function harness(over: Partial<RecapIo> = {}) {
   const panelOf = (messageId: string) => cards.get(messageId)?.body.elements.find((element: any) => element.element_id === TURN_RECAP_ELEMENT_ID);
   const io: RecapIo = {
     enabled: () => true,
+    awaySummaryWanted: () => false,
+    requestAwaySummary: (_ds, turnId) => { awaySummaryRequests.push(turnId); },
     locale: () => 'zh',
     readCard: async (_ds, messageId) => JSON.stringify(cards.get(messageId)),
     cardId: async (_ds, messageId) => `card_${messageId}`,
@@ -75,7 +79,7 @@ function harness(over: Partial<RecapIo> = {}) {
     ...over,
   };
   return {
-    io, cards, writes, attempts, warnings, send, panelOf,
+    io, cards, writes, attempts, warnings, send, panelOf, awaySummaryRequests,
     ids: (messageId: string): string[] => cards.get(messageId).body.elements.map((element: any) => element.element_id ?? element.tag),
   };
 }
@@ -363,6 +367,47 @@ describe('unified reply card', () => {
     expect(published).toHaveLength(1);
     expect(published[0]).toContain(SUMMARY);
     expect(run.writes).toEqual([]);
+  });
+});
+
+describe('asking the CLI to recap the turn', () => {
+  it('asks once per turn when the card settles, with both switches on', async () => {
+    const ds = session();
+    const run = harness({ awaySummaryWanted: () => true });
+    noteRecapTurnStarted(ds, 'om_turn1');
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, run.io);
+    // A replayed terminal settles the same card again.
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: 'om_card1' }, run.io);
+    await settle(ds);
+    expect(run.awaySummaryRequests).toEqual(['om_turn1']);
+    noteRecapTurnStarted(ds, 'om_turn2');
+    noteRecapCard(ds, 'om_turn2', { kind: 'legacy', messageId: run.send('om_card2') }, run.io);
+    await settle(ds);
+    expect(run.awaySummaryRequests).toEqual(['om_turn1', 'om_turn2']);
+    // The request writes nothing to a card by itself.
+    expect(run.writes).toEqual([]);
+  });
+
+  it('does not ask with either switch off, for an older turn, or when the recap is already here', async () => {
+    const ds = session();
+    let wanted = false;
+    let enabled = true;
+    const run = harness({ awaySummaryWanted: () => wanted, enabled: () => enabled });
+    noteRecapTurnStarted(ds, 'om_turn1');
+    noteRecapCard(ds, 'om_turn1', { kind: 'legacy', messageId: run.send('om_card1') }, run.io);
+    // The switches are read at use time.
+    wanted = true;
+    enabled = false;
+    noteRecapTurnStarted(ds, 'om_turn2');
+    noteRecapCard(ds, 'om_turn2', { kind: 'legacy', messageId: run.send('om_card2') }, run.io);
+    enabled = true;
+    noteRecapTurnStarted(ds, 'om_turn3');
+    noteCliRecap(ds, 'om_turn3', SUMMARY, run.io);
+    noteRecapCard(ds, 'om_turn3', { kind: 'legacy', messageId: run.send('om_card3') }, run.io);
+    noteRecapTurnStarted(ds, 'om_turn4');
+    noteRecapCard(ds, 'om_turn3', { kind: 'legacy', messageId: 'om_card3' }, run.io);
+    await settle(ds);
+    expect(run.awaySummaryRequests).toEqual([]);
   });
 });
 

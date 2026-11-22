@@ -176,7 +176,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'privateCard', configKey: 'privateCard', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/card 发 owner-only 私有快照 on|off' },
   { key: 'replyCardActions', configKey: 'replyCardActions', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡右下角操作菜单（打开终端/切换模型/关闭会话）on|off，默认关闭' },
   { key: 'replyCardNextStep', configKey: 'replyCardNextStep', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「下一步」按钮 on|off，默认关闭：把 CLI 给出的下一轮推荐输入（目前是 Claude Code 输入框里的置灰提示）放在本轮最后一张回复卡签名上方，点击即以点击人身份发给本会话；不支持的 CLI 不显示' },
-  { key: 'replyCardRecap', configKey: 'replyCardRecap', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「本轮回顾」on|off，默认关闭：CLI 自己写出本轮回顾时（Claude Code 会话空闲约 3 分钟且终端不在前台时写进 transcript 的离开总结），放到本轮最后一张回复卡签名上方的折叠面板里；没有回顾的回合不出面板，不额外调用模型' },
+  { key: 'replyCardRecap', configKey: 'replyCardRecap', kind: 'boolean', effect: 'immediate', clearable: false, hint: '回复卡「本轮回顾」on|off，默认关闭：Claude Code 会话每轮结束、空闲且输入框为空时，botmux 让它认为终端失焦，它约 3 分钟后自己写一段回顾，放到本轮最后一张回复卡签名上方的折叠面板里；下一条消息、打开 Web 终端或回顾写完时恢复聚焦。每轮多一次后台总结（主模型以缓存读取的方式读一遍当前上下文，输出几十 token）；Claude 跳过的回合、其它 CLI 都不出面板' },
   { key: 'summaryMemory', configKey: 'summaryMemory', kind: 'boolean', effect: 'immediate', clearable: false, hint: '/summary 写入当前项目 summary.md 的问题解决记录 on|off' },
   { key: 'summaryMemoryPath', configKey: 'summaryMemoryPath', kind: 'string', effect: 'immediate', clearable: true, hint: '/summary 记忆文件路径，支持相对当前项目根目录或绝对路径；unset 回 summary.md' },
   { key: 'autoStartOnGroupJoin', configKey: 'autoStartOnGroupJoin', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被拉进新群即主动开工 on|off' },

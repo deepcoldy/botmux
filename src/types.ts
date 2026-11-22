@@ -2249,6 +2249,13 @@ export interface CodexAppEffortResult {
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
   | { type: 'goal_update_ack'; signature: string }
+  /** The turn's last reply card settled and the bot has replyCardRecap on:
+   *  once the CLI sits idle, report its terminal unfocused so that Claude Code
+   *  writes its away summary (services/away-summary-focus.ts). */
+  | { type: 'away_summary_focus'; turnId: string }
+  /** replyCardRecap was switched off after a request: cancel its wait and,
+   *  if botmux had reported focus out, report it back. */
+  | { type: 'away_summary_focus_cancel' }
   | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef;
       /** Set with `mayStart: false` when no lifecycle operation takes the start over. */
       startRefusal?: import('./services/runtime-reservation.js').RuntimeStartRefusal }

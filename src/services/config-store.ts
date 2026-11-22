@@ -4,7 +4,8 @@ import { withManagedDirectoriesAsync } from './managed-directory-retention.js';
  * oncall-store 与 grant-store 共用，保证对同一 bots.json 的并发写不丢更新。
  */
 import { promises as fsp } from 'node:fs';
-import { getLoadedConfigPath } from '../bot-registry.js';
+import { getBot, getLoadedConfigPath } from '../bot-registry.js';
+import { notifyAwaySummaryFocusRevoked } from './away-summary-focus-revocation.js';
 import { assertQuotaFallbackGraphAcyclic } from './quota-fallback.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { assertCodexInstanceConfigWrite } from './codex-instance-config-guard.js';
@@ -60,6 +61,18 @@ export function findEntryIndex(raw: any[], larkAppId: string): number {
   return raw.findIndex((e: any) => e?.larkAppId === larkAppId);
 }
 
+function notifyReplyCardRecapRevocation(previousRaw: any[], nextRaw: any[], larkAppId: string): void {
+  const wasEnabled = previousRaw.find(entry => entry?.larkAppId === larkAppId)?.replyCardRecap === true;
+  const isEnabled = nextRaw.find(entry => entry?.larkAppId === larkAppId)?.replyCardRecap === true;
+  if (wasEnabled && !isEnabled) {
+    // Publish the live value BEFORE notifying workers. The await that follows
+    // the commit lets queued card settlements run before the caller's own
+    // post-rmw sync; they must see off here rather than issue a fresh request.
+    try { getBot(larkAppId).config.replyCardRecap = undefined; } catch { /* CLI process / unregistered bot */ }
+    notifyAwaySummaryFocusRevoked(larkAppId);
+  }
+}
+
 export function requireConfigPath(): string {
   const p = getLoadedConfigPath();
   if (!p) throw new Error('Bot config path unknown — cannot persist config changes');
@@ -109,6 +122,7 @@ export async function rmwBotEntry<T>(
         const parseError = changedEntryParseError();
         if (parseError) return { ok: false as const, reason: parseError };
         await writeRawConfigAtomic(path, raw);
+        notifyReplyCardRecapRevocation(previousRaw, raw, larkAppId);
         return { ok: true as const };
       };
       if (out && typeof out === 'object' && 'write' in (out as any)) {

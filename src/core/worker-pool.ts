@@ -57,6 +57,10 @@ import { nextStepPlacement } from '../im/lark/next-step-card.js';
 import { nextStepIo } from './next-step-io.js';
 import { noteCliRecap, noteRecapCard } from './turn-recap-state.js';
 import { turnRecapIo } from './turn-recap-io.js';
+import {
+  cancelAwaySummaryFocusForBot,
+  registerAwaySummaryFocusRevocationHandler,
+} from '../services/away-summary-focus-revocation.js';
 import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage, uploadFile } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { modelPinView, retainPinEffort, samePinModel, validateModelPin, type ModelPin } from './model-pin.js';
@@ -1629,6 +1633,7 @@ function requireCallbacks(): WorkerPoolCallbacks {
 // daemon registers its Map here at boot. Helpers below return a snapshot or
 // linear-scan by sessionId.
 let activeSessionsRegistry: Map<string, DaemonSession> | undefined;
+let awaySummaryFocusRevocationRegistered = false;
 
 type RemoteWorkerCloseResult = {
   ok: boolean;
@@ -1651,6 +1656,12 @@ const pendingRemoteWorkerCloses = new Map<string, {
 
 export function setActiveSessionsRegistry(m: Map<string, DaemonSession> | undefined): void {
   activeSessionsRegistry = m;
+  if (!awaySummaryFocusRevocationRegistered) {
+    awaySummaryFocusRevocationRegistered = true;
+    registerAwaySummaryFocusRevocationHandler(larkAppId => {
+      if (activeSessionsRegistry) cancelAwaySummaryFocusForBot(activeSessionsRegistry.values(), larkAppId);
+    });
+  }
   if (!m && finalOutputHandoffTimer) { clearInterval(finalOutputHandoffTimer); finalOutputHandoffTimer = undefined; }
   if (m && !finalOutputHandoffTimer) {
     finalOutputHandoffTimer = setInterval(() => { void pumpFinalOutputHandoffs(); }, 5_000);

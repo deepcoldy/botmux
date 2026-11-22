@@ -7,7 +7,9 @@
  *     core/reply-card-turn-start.ts) → the previous card keeps its panel as
  *     written (a recap is history), it just stops being updated;
  *   - the turn's last card has settled → remembered as the card the panel
- *     goes on; nothing is written to it yet;
+ *     goes on; nothing is written to it yet. In a Claude Code session the
+ *     worker is asked (once per turn) to let the CLI write its away summary
+ *     (services/away-summary-focus.ts);
  *   - the CLI writes its own recap (Claude Code's away summary, minutes into
  *     an idle session) → the panel goes on that card, or is updated in place
  *     when a later summary of the same turn arrives.
@@ -41,6 +43,11 @@ type InsertPlacement = Extract<RecapPlacement, { kind: 'insert' }>['placement'];
 export interface RecapIo {
   /** Bot switch for the panel, read at use time. */
   enabled(ds: DaemonSession): boolean;
+  /** Whether this session's CLI can be asked to write its away summary
+   * (Claude Code sessions); asked only with the panel switch on. */
+  awaySummaryWanted(ds: DaemonSession): boolean;
+  /** Asks the session's worker to let the CLI write its away summary of `turnId`. */
+  requestAwaySummary(ds: DaemonSession, turnId: string): void;
   locale(ds: DaemonSession): 'zh' | 'en';
   readCard(ds: DaemonSession, messageId: string): Promise<string | undefined>;
   cardId(ds: DaemonSession, messageId: string): Promise<string>;
@@ -66,6 +73,8 @@ interface State {
   turnId?: string;
   card?: RecapCard;
   cli?: { turnId: string; text: string };
+  /** The turn the worker was last asked to let the CLI recap. */
+  awaySummaryRequested?: string;
   shown?: Shown;
   chain: Promise<void>;
 }
@@ -116,6 +125,12 @@ export function noteRecapCard(ds: DaemonSession, turnId: string, card: RecapCard
   }
   state.turnId = turnId;
   state.card = card;
+  if (state.awaySummaryRequested !== turnId && state.cli?.turnId !== turnId
+    && io.enabled(ds) && io.awaySummaryWanted(ds)) {
+    state.awaySummaryRequested = turnId;
+    io.requestAwaySummary(ds, turnId);
+    io.info?.(`[recap] ${ds.session.sessionId.slice(0, 8)}: asked the worker to let the CLI recap ${turnId.slice(0, 16)}`);
+  }
   reconcile(ds, io);
 }
 

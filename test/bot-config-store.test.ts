@@ -54,7 +54,8 @@ async function freshModules() {
   const store = await import('../src/services/bot-config-store.js');
   const pinStreamingCardChange = await import('../src/services/pin-streaming-card-change.js');
   const sessionGroups = await import('../src/services/session-groups-store.js');
-  return { registry, store, pinStreamingCardChange, sessionGroups };
+  const awaySummaryFocusRevocation = await import('../src/services/away-summary-focus-revocation.js');
+  return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
 }
 
 describe('bot-config store', () => {
@@ -85,10 +86,43 @@ describe('bot-config store', () => {
   }
   async function loaded(entry: Record<string, unknown> = {}) {
     writeConfig(entry);
-    const { registry, store, pinStreamingCardChange, sessionGroups } = await freshModules();
+    const { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation } = await freshModules();
     registry.loadBotConfigs().forEach((c: any) => registry.registerBot(c));
-    return { registry, store, pinStreamingCardChange, sessionGroups };
+    return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
   }
+
+  it('publishes recap revocation to live config before a queued card settlement', async () => {
+    const { registry, store, awaySummaryFocusRevocation } = await loaded({ replyCardRecap: true });
+    const { noteRecapCard, noteRecapTurnStarted } = await import('../src/core/turn-recap-state.js');
+    const events: string[] = [];
+    const ds = { session: { sessionId: 'sess-config-race' }, larkAppId: 'app_default' } as any;
+    noteRecapTurnStarted(ds, 'turn1');
+    const io = {
+      enabled: () => registry.getBot('app_default').config.replyCardRecap === true,
+      awaySummaryWanted: () => true,
+      requestAwaySummary: () => { events.push('request'); },
+      locale: () => 'zh' as const,
+      readCard: async () => undefined,
+      cardId: async () => 'card',
+      insert: async () => {},
+      replace: async () => {},
+      now: () => Date.now(),
+      warn: () => {},
+    };
+    const dispose = awaySummaryFocusRevocation.registerAwaySummaryFocusRevocationHandler(() => {
+      events.push('cancel');
+      queueMicrotask(() => noteRecapCard(ds, 'turn1', { kind: 'legacy', messageId: 'card1' }, io));
+    });
+    try {
+      await store.applyConfigField('app_default', store.findConfigField('replyCardRecap')!, false);
+      await Promise.resolve();
+      expect(events).toEqual(['cancel']);
+      expect(registry.getBot('app_default').config.replyCardRecap).not.toBe(true);
+      expect(readConfig().replyCardRecap).not.toBe(true);
+    } finally {
+      dispose();
+    }
+  });
 
   it('checks a picker model snapshot inside the file lock before writing effort', async () => {
     const { registry, store } = await loaded({ model: 'opus' });
