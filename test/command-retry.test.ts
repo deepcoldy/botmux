@@ -434,7 +434,7 @@ describe('/retry command', () => {
     const readBack: string[] = [];
     const published: string[] = [];
     const io: RecapIo = {
-      enabled: () => true, locale: () => 'zh',
+      enabled: () => true, awaySummaryWanted: () => false, requestAwaySummary: () => {}, locale: () => 'zh',
       readCard: async (_ds, messageId) => { readBack.push(messageId); return undefined; },
       cardId: async () => 'card', insert: async () => {}, replace: async () => {},
       now: () => Date.now(), warn: () => {},
