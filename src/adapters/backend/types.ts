@@ -356,10 +356,12 @@ export interface SessionBackend {
    *  restart for that exit must not spend the fresh-session fallback budget. */
   exitedBecauseServerReplaced?(): boolean;
   /** After onExit: how the shared multiplexer server holding the pane was lost
-   *  (tmux: `replaced` / `gone` / `unreachable`), or undefined for an ordinary
-   *  CLI exit. The daemon folds every session that lost the same server into
-   *  ONE backend outage instead of N CLI crashes. */
-  exitedBecauseServerLost?(): { kind: 'replaced' | 'gone' | 'unreachable'; socketName?: string } | undefined;
+   *  (`replaced` / `gone` / `unreachable`), or undefined for an ordinary CLI
+   *  exit. The daemon folds every session that lost the same server into ONE
+   *  backend outage instead of N CLI crashes. `backend` names the server
+   *  family (absent = tmux, whose `socketName` is the `-L` name; hc's is the
+   *  core's socket path). */
+  exitedBecauseServerLost?(): { backend?: 'tmux' | 'hc'; kind: 'replaced' | 'gone' | 'unreachable'; socketName?: string } | undefined;
   kill(): void;
   /** Permanently destroy the backing session (e.g. kill tmux session).
    *  Called only on explicit /close. Default: same as kill(). */

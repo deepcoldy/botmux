@@ -5,10 +5,12 @@ export const SESSION_EVENT_PROTOCOL_VERSION = 2 as const;
  * independent of executor admission; it cannot disable the state authority. */
 export function sessionContractsEnabled(): boolean { return true; }
 /** The host computes historical execution observer grants only for a persistent
- * Codex tmux CLI. The worker may wait for such a grant only under the same
- * predicate; every other CLI/backend keeps the ordinary admission path. */
+ * Codex CLI whose pane outlives its worker: tmux, and hc (a core-held terminal
+ * the next worker reattaches to, proven by the same process_start identity).
+ * The worker may wait for such a grant only under the same predicate; every
+ * other CLI/backend keeps the ordinary admission path. */
 export function executionObserverSupported(cliId: unknown, backend: unknown): boolean {
-  return cliId === 'codex' && backend === 'tmux';
+  return cliId === 'codex' && (backend === 'tmux' || backend === 'hc');
 }
 export function contractTerminalStatus(status: unknown, errorCode: unknown): 'succeeded' | 'failed' | 'cancelled' | 'reconciling' {
   if (typeof errorCode === 'string' && (errorCode === 'rpc_turn_aborted'
@@ -40,9 +42,10 @@ export interface RuntimeExecutionContinuationFailure {
 }
 /** Local PTY-family backends whose process_start identity a continuation can
  * prove. Remote backends run off-box; zmx launches the CLI itself rather than
- * botmux, so neither can supply the required physical process proof. The host
- * gate and the Worker rotation gate must use this same set. */
-export const TRAEX_CONTINUATION_BACKENDS = ['pty', 'tmux', 'zellij', 'herdr'] as const;
+ * botmux, so neither can supply the required physical process proof. hc runs
+ * botmux's own pane launcher as a local process on this host, like tmux. The
+ * host gate and the Worker rotation gate must use this same set. */
+export const TRAEX_CONTINUATION_BACKENDS = ['pty', 'tmux', 'zellij', 'herdr', 'hc'] as const;
 export interface RuntimeIdentity {
   backend: string;
   physicalId: string;

@@ -257,7 +257,7 @@ import {
   type HcKillOutcome,
   type HcTarget,
 } from '../adapters/backend/hc/cli-ops.js';
-import { hcCoreAddress, hcCorePaths, type HcCoreAddress } from '../adapters/backend/hc/core.js';
+import { hcCoreAddress, hcCorePaths, queryHcCoreStatus, type HcCoreAddress } from '../adapters/backend/hc/core.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
 import { wrapperIdentityTokens } from '../setup/cli-selection.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
@@ -859,7 +859,7 @@ export function sessionSupportsIdleAutoCompact(ds: DaemonSession): boolean {
 }
 
 /** Whether this session can take 缓存过期自动压缩 (core/kimi-cache-expiry.ts):
- *  Kimi Code on a local PTY / tmux backend, in a session botmux owns. */
+ *  Kimi Code on a local PTY / tmux / hc backend, in a session botmux owns. */
 export function sessionSupportsKimiCacheExpiryAutoCompact(ds: DaemonSession): boolean {
   try {
     return supportsKimiCacheExpiryAutoCompact({
@@ -9762,7 +9762,10 @@ function backendOutageDeps(): BackendOutageDeps<DaemonSession> {
         if (status !== 'in_progress') onSettled(status);
       },
     }) !== undefined,
-    serverUp: socketName => probeTmuxServerUp(socketName),
+    // Connect-only probes on both families: neither starts a server.
+    serverUp: (socketName, backend) => backend === 'hc'
+      ? hcCoreAnswers(socketName)
+      : probeTmuxServerUp(socketName),
     eligible: ds => recoveryEligibility({
       active: ds.session.status === 'active',
       current: !activeSessionsRegistry || activeSessionsRegistry.get(activeSessionKey(ds)) === ds,
@@ -9822,6 +9825,13 @@ function backendOutageDeps(): BackendOutageDeps<DaemonSession> {
     },
     log: line => logger.warn(`[backend-outage] ${line}`),
   };
+}
+
+/** Whether an hc core answers `server.status` on `socket` (an hc outage is
+ *  keyed by the core's socket path). */
+async function hcCoreAnswers(socket: string | undefined): Promise<boolean> {
+  if (!socket) return false;
+  return (await queryHcCoreStatus(socket)).state === 'running';
 }
 
 /** Socket a managed session's pane lives on, as the worker recorded it. */
@@ -25418,13 +25428,20 @@ function setupWorkerHandlers(
           break;
         }
 
-        // The CLI did not fail: the shared tmux server holding its pane was
-        // lost, and every session on that server is reporting the same thing.
-        // One backend outage, handled once (backend-outage-coordinator.ts):
-        // no crash-loop count, no per-session crash notice, a single server
-        // recovery, one status card per topic and one owner summary.
+        // The CLI did not fail: the shared tmux server (or hc core) holding
+        // its pane was lost, and every session on that server is reporting
+        // the same thing. One backend outage, handled once
+        // (backend-outage-coordinator.ts): no crash-loop count, no
+        // per-session crash notice, a single server recovery, one status card
+        // per topic and one owner summary.
+        // tmux's `gone` is inferred from an empty socket, which a clean exit
+        // of a server's last session leaves too, so it needs corroboration.
+        // hc's `gone` is the core's own end reason (server_stop /
+        // host_shutdown), and a core outlives its last terminal.
+        const lostBackend = msg.backendLost?.backend ?? 'tmux';
         const serverLost = msg.backendLost
-          && (msg.backendLost.kind !== 'gone' || goneServerCorroborated(ds, msg.backendLost.socketName));
+          && (msg.backendLost.kind !== 'gone' || lostBackend === 'hc'
+            || goneServerCorroborated(ds, msg.backendLost.socketName));
         if (msg.backendLost && !serverLost) {
           logger.info(
             `[${t}] tmux server ${msg.backendLost.socketName ?? 'default'} is gone but held no other session of ours; `
@@ -25433,11 +25450,12 @@ function setupWorkerHandlers(
         }
         if (msg.backendLost && serverLost) {
           logger.warn(
-            `[${t}] ${sessionCliDisplayName(ds, botCfg)} lost its tmux server `
+            `[${t}] ${sessionCliDisplayName(ds, botCfg)} lost its ${lostBackend === 'hc' ? 'hc core' : 'tmux server'} `
             + `(${msg.backendLost.kind}); handing it to the backend outage recovery`,
           );
           backendOutage.onServerLost(ds, ds.session.sessionId, {
             larkAppId: ds.larkAppId,
+            ...(lostBackend === 'hc' ? { backend: 'hc' as const } : {}),
             ...(msg.backendLost.socketName !== undefined ? { socketName: msg.backendLost.socketName } : {}),
             kind: msg.backendLost.kind,
             cliName: sessionCliDisplayName(ds, botCfg),

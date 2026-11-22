@@ -74,8 +74,14 @@ describe('serializeRows format', () => {
     expect(serializeRows(term.buffer.active, 0, 2, '\n')).toBe('x\n\n');
   });
 
-  it('drops trailing blanks whatever their colours but keeps inner ones', async () => {
-    expect(await rowsOf('ab   \x1b[44m   \x1b[0m')).toBe('ab\r\n\r\n\r\n');
+  // tmux 2.8 to 3.6a alike: `capture-pane -e` resets after a trailing run of
+  // spaces written with attributes (a reverse-video cursor, a coloured bar)
+  // instead of trimming it; default spaces and erased cells are trimmed.
+  it('drops trailing default spaces and erased cells, keeps trailing spaces written with attributes, and inner ones', async () => {
+    expect(await rowsOf('ab   \x1b[44m   \x1b[0m')).toBe('ab   \x1b[44m   \x1b[0m\r\n\r\n\r\n');
+    expect(await rowsOf('> \x1b[7m \x1b[0m')).toBe('> \x1b[7m \x1b[0m\r\n\r\n\r\n');
+    expect(await rowsOf('ab   ')).toBe('ab\r\n\r\n\r\n');
+    expect(await rowsOf('ab\x1b[44m\x1b[K\x1b[0m')).toBe('ab\r\n\r\n\r\n');
     expect(await rowsOf('a   b')).toBe('a   b\r\n\r\n\r\n');
     expect(await rowsOf('a\x1b[5Cb')).toBe('a     b\r\n\r\n\r\n');
   });

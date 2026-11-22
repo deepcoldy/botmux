@@ -10,6 +10,12 @@
  * total, and dozens of chats each received "⚠️ Codex 在 1 分钟内崩溃 4 次，已停
  * 止自动重启" (plus start-failure / interruption notices) within two minutes.
  *
+ * hc sessions share one core the same way. A core crash or restart keeps
+ * their programs running (HcBackend reconnects), but losing the holder, a
+ * core stop, a core that lost its state or a core unreachable for the outage
+ * window ends every terminal on it at once: the same outage, keyed by the
+ * core's socket and never merged with a tmux server's.
+ *
  * The worker now tells a server loss apart from a CLI exit
  * (`claude_exit.backendLost`). This coordinator turns all such exits of one
  * server into ONE episode:
@@ -60,12 +66,18 @@ export type OutageFailureReason =
 
 export type ServerLossKind = 'replaced' | 'gone' | 'unreachable';
 
+/** The shared server families whose loss is one outage: one tmux server
+ *  (`-L`), or one hc core holding every session's terminal. */
+export type OutageBackend = 'tmux' | 'hc';
+
 /** Everything the card renderer needs for one topic. */
 export interface OutageCardView {
   state: OutageMemberState;
   cliName: string;
   /** Human label of the lost server, e.g. `botmux`. */
   serverLabel: string;
+  /** Which kind of server it was; absent = tmux. */
+  backend?: OutageBackend;
   /** A turn was running in this topic when the server was lost. */
   turnInFlight: boolean;
   /** Failed server recoveries so far (shown while waiting for a retry). */
@@ -88,6 +100,8 @@ export interface OutageSummaryMember {
 export interface OutageSummary {
   larkAppId: string;
   serverLabel: string;
+  /** Which kind of server it was; absent = tmux. */
+  backend?: OutageBackend;
   startedAt: number;
   endedAt: number;
   /** Failed server recoveries during the episode (0 = back on the first try). */
@@ -98,7 +112,11 @@ export interface OutageSummary {
 /** Facts about one session at the moment it lost its server. */
 export interface ServerLossReport {
   larkAppId: string;
-  /** Socket name of the lost server (`undefined` = tmux default socket). */
+  /** Which shared server was lost; absent = tmux. Sessions on different
+   *  backends never share an episode, whatever their socket strings. */
+  backend?: OutageBackend;
+  /** The lost server's socket: tmux's `-L` name (`undefined` = tmux default
+   *  socket), or the hc core's socket path. */
   socketName?: string;
   kind: ServerLossKind;
   cliName: string;
@@ -142,8 +160,8 @@ export interface BackendOutageDeps<S> {
   /** Start one recovery restart of `ref`. `onSettled` fires once with the
    *  outcome. Returns false when no restart could be started at all. */
   restart(ref: S, onSettled: (status: RecoveryRestartStatus) => void): boolean;
-  /** Whether a server answers on the socket right now. Must not start one. */
-  serverUp(socketName: string | undefined): Promise<boolean>;
+  /** Whether a server of `backend` answers on the socket right now. Must not start one. */
+  serverUp(socketName: string | undefined, backend: OutageBackend): Promise<boolean>;
   eligible(ref: S): RecoveryEligibility;
   /** A cancelled recovery restart is owned by an external replacement
    *  generation (cold refork / transfer / another correlated restart). While
@@ -358,6 +376,7 @@ type EpisodePhase =
 interface Episode<S> {
   key: string;
   larkAppId: string;
+  backend: OutageBackend;
   socketName: string | undefined;
   startedAt: number;
   phase: EpisodePhase;
@@ -394,12 +413,14 @@ export class BackendOutageCoordinator<S> {
   onServerLost(ref: S, sessionId: string, report: ServerLossReport): void {
     this.dormant.delete(sessionId);
     const now = this.deps.now();
-    const key = episodeKey(report.larkAppId, report.socketName);
+    const backend = report.backend ?? 'tmux';
+    const key = episodeKey(report.larkAppId, backend, report.socketName);
     let episode = this.episodes.get(key);
     if (!episode) {
       episode = {
         key,
         larkAppId: report.larkAppId,
+        backend,
         socketName: report.socketName,
         startedAt: now,
         phase: 'waiting',
@@ -408,7 +429,7 @@ export class BackendOutageCoordinator<S> {
         generation: 0,
       };
       this.episodes.set(key, episode);
-      this.deps.log(`backend outage opened: tmux ${serverLabel(report.socketName)} (${report.kind}) for ${report.larkAppId}`);
+      this.deps.log(`backend outage opened: ${backend} ${serverLabel(report.socketName, backend)} (${report.kind}) for ${report.larkAppId}`);
       this.schedule(episode, this.timings.gatherMs + stableJitter(report.larkAppId, this.timings.gatherJitterMs));
     }
     this.cancelSummary(episode);
@@ -438,7 +459,7 @@ export class BackendOutageCoordinator<S> {
       episode.members.set(sessionId, member);
       this.membership.set(sessionId, key);
     }
-    this.deps.log(`session ${sessionId.slice(0, 8)} lost tmux ${serverLabel(report.socketName)} (${report.kind}); ${episode.members.size} session(s) in this outage`);
+    this.deps.log(`session ${sessionId.slice(0, 8)} lost ${backend} ${serverLabel(report.socketName, backend)} (${report.kind}); ${episode.members.size} session(s) in this outage`);
 
     if (history.length > this.timings.maxLossesPerWindow) {
       // Bounded like the crash loop: a session that keeps losing its server is
@@ -530,7 +551,8 @@ export class BackendOutageCoordinator<S> {
     card.update(dormant.ref, () => ({
       state: 'recovered',
       cliName: dormant.report.cliName,
-      serverLabel: serverLabel(dormant.report.socketName),
+      serverLabel: serverLabel(dormant.report.socketName, dormant.report.backend),
+      ...nonTmuxBackend(dormant.report.backend),
       turnInFlight: dormant.report.turnInFlight,
       serverRetries: dormant.serverRetries,
       notices: [...dormant.notices],
@@ -684,7 +706,7 @@ export class BackendOutageCoordinator<S> {
         const up = await this.serverUp(episode);
         if (this.episodes.get(episode.key) !== episode || episode.phase !== 'canary' || episode.generation !== generation) return;
         if (up) {
-          this.deps.log(`tmux ${serverLabel(episode.socketName)} answers again; restarting the remaining sessions`);
+          this.deps.log(`${episode.backend} ${serverLabel(episode.socketName, episode.backend)} answers again; restarting the remaining sessions`);
           episode.phase = 'up';
           episode.generation += 1; // a newer decision than any pending settlement
           this.stopPolling(episode);
@@ -847,7 +869,7 @@ export class BackendOutageCoordinator<S> {
     member.timedOutAt = undefined;
     this.renderCard(member);
     if (episode.phase === 'canary') {
-      this.deps.log(`tmux ${serverLabel(episode.socketName)} is back (session ${member.sessionId.slice(0, 8)} recovered)`);
+      this.deps.log(`${episode.backend} ${serverLabel(episode.socketName, episode.backend)} is back (session ${member.sessionId.slice(0, 8)} recovered)`);
       episode.phase = 'up';
       episode.generation += 1;
       this.stopPolling(episode);
@@ -889,13 +911,13 @@ export class BackendOutageCoordinator<S> {
     episode.serverRetries += 1;
     const delay = this.timings.serverBackoffMs[episode.serverRetries - 1];
     if (delay === undefined) {
-      this.deps.log(`tmux ${serverLabel(episode.socketName)} did not come back after ${episode.serverRetries} tries; giving up`);
+      this.deps.log(`${episode.backend} ${serverLabel(episode.socketName, episode.backend)} did not come back after ${episode.serverRetries} tries; giving up`);
       episode.phase = 'failed';
       episode.generation += 1;
       this.stopPolling(episode);
       return; // progress() fails the waiting members
     }
-    this.deps.log(`tmux ${serverLabel(episode.socketName)} still down; retry ${episode.serverRetries} in ${Math.round(delay / 1000)}s`);
+    this.deps.log(`${episode.backend} ${serverLabel(episode.socketName, episode.backend)} still down; retry ${episode.serverRetries} in ${Math.round(delay / 1000)}s`);
     for (const member of episode.members.values()) {
       if (member.state === 'interrupted') this.renderCard(member);
     }
@@ -989,7 +1011,8 @@ export class BackendOutageCoordinator<S> {
     }
     const summary: OutageSummary = {
       larkAppId: episode.larkAppId,
-      serverLabel: serverLabel(episode.socketName),
+      serverLabel: serverLabel(episode.socketName, episode.backend),
+      ...nonTmuxBackend(episode.backend),
       startedAt: episode.startedAt,
       endedAt: this.deps.now(),
       serverRetries: episode.serverRetries,
@@ -1002,7 +1025,7 @@ export class BackendOutageCoordinator<S> {
       })),
     };
     this.deps.log(
-      `backend outage closed: tmux ${summary.serverLabel}, ${members.length} session(s), `
+      `backend outage closed: ${episode.backend} ${summary.serverLabel}, ${members.length} session(s), `
       + `${members.filter(m => m.state === 'recovered').length} recovered, `
       + `${members.filter(m => m.state === 'failed').length} failed, `
       + `${members.filter(m => m.state === 'dormant').length} dormant, ${episode.serverRetries} server retr${episode.serverRetries === 1 ? 'y' : 'ies'}`,
@@ -1026,7 +1049,7 @@ export class BackendOutageCoordinator<S> {
 
   private async serverUp(episode: Episode<S>): Promise<boolean> {
     try {
-      return await this.deps.serverUp(episode.socketName);
+      return await this.deps.serverUp(episode.socketName, episode.backend);
     } catch {
       return false;
     }
@@ -1045,7 +1068,8 @@ export class BackendOutageCoordinator<S> {
     card.update(member.ref, () => ({
       state: member.state,
       cliName: member.report.cliName,
-      serverLabel: serverLabel(member.report.socketName),
+      serverLabel: serverLabel(member.report.socketName, member.report.backend),
+      ...nonTmuxBackend(member.report.backend),
       turnInFlight: member.report.turnInFlight,
       serverRetries: (key ? this.episodes.get(key)?.serverRetries : undefined) ?? 0,
       ...(member.failure ? { failure: member.failure } : {}),
@@ -1061,8 +1085,14 @@ function inFlight<S>(episode: Episode<S>): number {
   return n;
 }
 
-function episodeKey(larkAppId: string, socketName: string | undefined): string {
-  return `${larkAppId}\u0000tmux:${socketName ?? ''}`;
+/** The `backend` field of a view or summary: left out for tmux, so tmux
+ *  views keep their historical shape. */
+function nonTmuxBackend(backend: OutageBackend | undefined): { backend?: OutageBackend } {
+  return backend && backend !== 'tmux' ? { backend } : {};
+}
+
+function episodeKey(larkAppId: string, backend: OutageBackend, socketName: string | undefined): string {
+  return `${larkAppId}\u0000${backend}:${socketName ?? ''}`;
 }
 
 /** Stable value in [0, spread) for one key (FNV-1a). */
@@ -1076,11 +1106,14 @@ function stableJitter(key: string, spread: number): number {
   return (hash >>> 0) % spread;
 }
 
-/** `botmux` for `-L botmux`, `default` for the user's default server. */
-export function serverLabel(socketName: string | undefined): string {
+/** `botmux` for `-L botmux`, `default` for the user's default server, and
+ *  `botmux` for the hc core on `…/herdr-core/botmux.sock`. */
+export function serverLabel(socketName: string | undefined, backend: OutageBackend = 'tmux'): string {
   if (!socketName) return 'default';
   const parts = socketName.split('/');
-  return parts[parts.length - 1] || socketName;
+  const name = parts[parts.length - 1] || socketName;
+  // An hc core is named by its socket file: `…/herdr-core/botmux.sock` → `botmux`.
+  return backend === 'hc' ? name.replace(/\.sock$/, '') || name : name;
 }
 
 function firstLines(text: string, lines: number): string {

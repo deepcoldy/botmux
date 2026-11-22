@@ -78,6 +78,7 @@ pane 脚本还要做三件事：
 - 重连后的首帧走 `onScreenResync`。
 - 之后出现的 paint 表示 core 丢掉了这个 viewer 没读走的输出，以重绘代替：积压超过约 4 MiB（`wire.rs`），或有人用 `hc read` 滚动读取（`stitch.rs`）。它的屏幕部分照常经过 `onData` 修复 worker 的屏幕，状态部分见下。
 - 隐藏的 OSC 字节必须原样经过 `onData`，`capabilities.ts` 依赖它们。丢掉的输出补不回来，所以只靠隐藏 OSC 报告完成的 runner CLI 在 hc 上 fail closed（第 7 节第 8 条）。
+- 新建终端的程序在首个 attach 之前就结束了（启动即报错退出），它的输出从未进过流：先经同一连接 `terminal.read {lines: 50}` 读出最近的屏幕与历史，写进 worker 日志并作为输出经 `onData` 交出，再按记录触发 exit。这对应 TmuxPipeBackend 的创建即订阅（#3448）与死 pane 带历史读屏（#3539），让 CLI 自己的报错进入 worker 日志尾、`claude_exit.logTail` 与崩溃卡片。只对新建终端这样做：reattach 的终端可能长期存在，与 tmux 相同。
 
 **状态（OSC 7501）**
 - 每个 paint 末尾带着程序当前的 7501 记录，包括首帧：无人 attach 时程序报告的状态只存在于这里。
@@ -91,7 +92,8 @@ pane 脚本还要做三件事：
 - tmux 键名在本地翻译成字节，DECCKM 状态取自镜像。bracketed paste 只在镜像里 DEC 2004 打开时才包 `ESC[200~ … ESC[201~`，与 tmux `paste-buffer -p` 一致。
 - 首帧之前的输入按顺序排队，且先不编码：首帧之前镜像不知道程序的 DECCKM 与 bracketed paste 状态（reattach 时镜像还是空白的），首帧落地后再按镜像编码发出。
 - 禁止在热路径上用 `terminal.send`/`keys`。
-- 能证明输入没被接受时（未连接、终端已结束、socket 写失败）返回 false，供 `critical-control-key.ts` 重试。
+- 能证明输入没被接受时（未连接、终端已结束、socket 写失败）返回 false，供 `critical-control-key.ts` 重试。终端的结束由 core 主动推送（CLOSE 帧或 `finished` 事件），收到之后的一切写入与粘贴都返回 false、不发出，对应 tmux 写前拒绝死 pane（#3580/#3610）。
+- `submitBracketedPaste` 的回车单独写入，与 TmuxPipeBackend 相同：Codex（crossterm）在边沿触发下每次只读 1024 字节，帧恰好填满一次读取时，同一次 pty 写入里的回车留在 tty 里直到下一次按键。hc 把每个输入帧到达 holder 时各写一次 pty，但两个背靠背的帧仍可能落进同一次读取（实测 Codex 0.167.0 下 9 个边界长度仍有 4 个滞留），所以回车等 core 应答同一连接上帧之后的一次往返（`terminal.get`）再发：core 先转发输入帧、再处理后续请求。这相当于 tmux 两次客户端调用之间的那一次往返；期间写入的输入排在回车之后。等待中连接断开，回车与排在它后面的输入随连接丢弃（已返回 true），由 worker 的回执与原生 history 判定是否送达。
 
 **尺寸**
 - `resize` 发 RESIZE 帧，同时调整镜像，并记下这个请求（attach 时的尺寸也算一个）。
@@ -102,11 +104,13 @@ pane 脚本还要做三件事：
 - `captureCurrentScreen` 返回历史加屏幕的 ANSI，`captureViewport` 返回可见区 ANSI，输出形态与 tmux `capture-pane -e` 一致。
 - `getPaneSize`、`capturePaneInputModes` 和 `captureInputState` 的格式与 TmuxPipeBackend 相同。
 - `captureViewportAsync` 直接返回 `Promise.resolve`。
+- `captureViewportCells`（#3626）：`ScreenMirror.viewportCells` 用 tmux 那条路径同一个 `parseCapturedScreenRows` 解析镜像的 `capture-pane -e -p` 形态，dim/inverse 保留；镜像跟随 core 的每个尺寸（包括 web 或本地 viewer 改的），闲置压缩与保活判断输入框用的就是 pane 的真实屏幕。首帧前或终端已结束为 null，且不像其它读屏那样欠 worker 一次 resync。
 - ANSI 序列化器自己写：cell 转 SGR，覆盖 16/256/RGB 色和宽字符，参考 `src/utils/screenshot-renderer.ts` 的 cell API 用法，不新增依赖。
 
 **退出**
 - 来源有两个：core 发来的 CLOSE 帧，载荷 JSON 为 `{reason, exit_code, signal}`；或 `finished` 事件。两者归一后触发一次 sticky 的 `onExit(code, signal)`，晚到的订阅者也会收到回放。
 - 以下情况 `exitedBecauseServerReplaced()` 为 true，不消耗第二层 fresh 预算：reason 属于 `holder_lost`/`stopped_by_restart`/`server_stop`/`host_shutdown`；hc 状态丢失（终端 not_found）；不可达超时升级。
+- 同样这些情况下 `exitedBecauseServerLost()` 给出 `{backend: 'hc', kind, socketName: <core socket>}`，worker 经 `claude_exit.backendLost` 上报，daemon 的 `BackendOutageCoordinator`（#3610）把同一 core 上的全部会话折成一次故障：不计崩溃次数、一个 canary、core 应答后再分批重启、每话题一张卡片、一份 owner 汇总。kind：`holder_lost`、`stopped_by_restart`、状态丢失为 `replaced`（core 在应答）；`server_stop`、`host_shutdown` 为 `gone`；不可达超时为 `unreachable`。故障按 `backend + socket` 归并，hc core 与 tmux server 即使 socket 字符串相同也不合并；`serverUp` 走 `queryHcCoreStatus`，只连接、从不拉起 core（canary 的 spawn 才会按 control env 拉起）。tmux 的 `gone` 是从空 socket 推断的（server 最后一个会话正常退出也会留下空 socket），需要另一会话旁证；hc 的 `gone` 是 core 自己给的结束原因，core 也不会因最后一个终端结束而退出，所以不需要旁证。
 
 **断线**
 - core 崩溃或 restart 时程序仍然活着。按退避重连；socket 连不上就用 control env 执行 `server start`，新 core 会 adopt holder。
@@ -116,7 +120,7 @@ pane 脚本还要做三件事：
 **生命周期**
 - `kill()` 只断开连接，终端保留，与 tmux 的 detach 语义相同。
 - `destroySession()` 先核对 label，再 `terminal.kill` 和 `terminal.rm`。scope 的 stop 照旧由 worker 负责。
-- `getChildPid` 返回终端记录里的 `pid`，即 pane 根进程，也就是 scope 监督者 sh；终端结束后返回 null。
+- `getChildPid` 与 `getStablePanePid`（#3600）都返回终端记录里的 `pid`，即 pane 根进程，也就是 scope 监督者 sh；终端结束后返回 null。worker 把 `cliPid` 改写到 wrapper 的后代时它不跟着变，重连核对的也是同一个终端。它是本机进程，worker 的 `process_start` 运行时身份由它推导（真实 hc 测试覆盖）。
 - `isPaneAlive` 为“尚未收到退出且已解析出终端 address”。
 - hc 没有 copy mode。web 端滚动走 `localTerminalBackend`，浏览器自己保留 scrollback；半页滚动映射成 PgUp/PgDn 或 no-op。
 
@@ -173,6 +177,20 @@ pane 脚本还要做三件事：
 | MCP gateway 复用 pane | 拒绝 | probe 为 unknown 时拒绝启动（同 zellij、zmx）；tmux 只在 gate 时也是 unknown 才拒绝 |
 | Codex 实例池（`normalizeCodexInstancePool`、`refuseUnverifiableInstanceBinding`） | 拒绝 | 见下 |
 | core-only 模式（`bot-registry`、`cli`） | 拒绝 | 见下 |
+| `captureViewportCells`（#3626 闲置压缩、保活按真实屏幕判断输入框） | 实现 | 见第 5 节“同步读屏”；真实 tmux 对等测试逐 cell 对比 |
+| `getStablePanePid`（#3600 wrapper PID 重试围栏） | 实现 | 见第 5 节“生命周期” |
+| `exitedBecauseServerLost`、`claude_exit.backendLost`、`BackendOutageCoordinator`、worker-pool 的 `serverUp` 与 `gone` 旁证（#3610） | 实现 | 见第 5 节“退出”；卡片与 owner 汇总写 hc core 而非 tmux server |
+| `executionObserverSupported`（#3330 历史轮次观察授权） | 实现 | Codex 在 hc 终端里跨 worker 重启存活，与 tmux 相同；宿主（`runtime.identity.backend`）与 worker（`effectiveBackendType`）用同一谓词，两侧对 hc 都是 `'hc'` |
+| `TRAEX_CONTINUATION_BACKENDS`（#3315 自动换模续接当前轮） | 实现 | hc 跑 botmux 自己的 pane 启动器，CLI 是本机进程，`process_start` 身份可证；宿主与 worker 共用同一集合 |
+| `supportsKimiCacheExpiryAutoCompact`（#3403） | 实现 | 菜单指针核对读 `captureViewport`，即镜像，属权威屏幕 |
+| dashboard `codexArchiveInapplicableReason` | 实现 | 与 daemon 侧 `ownedLocalCodex` 一致，测试对每个后端从两侧取值比较 |
+| 冷启秒退保留 CLI 报错（#3539）、创建即订阅启动输出（#3448） | 实现 | 首帧本身带屏幕与 7501 状态；首个 attach 前就结束的新终端见第 5 节“输出” |
+| 写前拒绝死 pane、死 pane 拒绝一切粘贴（#3580/#3610） | 通用 | 结束由 core 推送，之后输入一律 false；hc 没有共享 paste buffer，也没有 tmux ≤3.3a 往死 pane 粘贴使整个 server 崩溃的问题，`pane-died` 关输入钩子 N/A |
+| 粘贴帧填满 1024 字节时回车单独写入（Codex） | 实现 | 见第 5 节“输入”；真实 Codex 0.167.0 + hc 0.1.19 的 e2e 覆盖 |
+| tmux 存活探测降载（#3580 单条异步探测、空闲降频） | N/A | hc 不轮询，结束、尺寸由事件流推送 |
+| tmux socketRoot（#3529）、tmux 升级提示、预编译包、切换候选（`tmux-switch-candidates` 只挑 tmux target） | N/A | tmux 专属；hc 的 socket 冻结在 target，control env 取自 worker 自身 env |
+| herdr 冷恢复先关旧 pane（#3621）、`retryPaneAgentStart`（#3243）、瞬断保留 pane 身份（#3624）、`herdrPidRetryMaxElapsedMs` | N/A | herdr 专属；hc 的 pid 在创建时同步拿到，重连不变 |
+| `getRuntimeIdentity` | N/A | 只有远端后端（riff、mojo）提供；hc 由 worker 按本机 `process_start` 推导 |
 
 **fail closed 的 tmux 专属能力（切默认前要补齐的对等缺口）**
 
@@ -270,7 +288,8 @@ stream.onData((chunk, { paint, firstPaint, paintDone }) => {
 - 首帧只能写进新建的镜像，或 `reset()` 过的镜像。重连后的首帧也是这样，然后走 `onScreenResync`。
 - 之后出现的 paint（积压丢弃或 `hc read` 滚动读取后的 history=0 重绘）也用 `writePaint`：它替换屏幕，但不把旧屏推进 scrollback。
 - `ScreenMirror` 的 `write`/`writePaint` 同步解析。它提供：
-  - 与 TmuxPipeBackend 同形的读取方法：`captureCurrentScreen`、`captureViewport`、`viewportText`（对应 `captureViewportAsync`）、`captureInputState`、`capturePaneInputModes`、`size()`；
+  - 与 TmuxPipeBackend 同形的读取方法：`captureCurrentScreen`、`captureViewport`、`viewportText`（对应 `captureViewportAsync`）、`viewportCells`（对应 `captureViewportCells`）、`captureInputState`、`capturePaneInputModes`、`size()`；
+  - `-e` 形态的行尾与 tmux 2.8–3.6a 一致：去掉被擦除的 cell 与不带属性的空格，保留带属性写入的尾部空格（反显光标、带底色的状态条）并在其后复位；
   - 模式 getter：`applicationCursorKeys`、`applicationKeypad`、`bracketedPaste`、`altScreen`；
   - `HC_MIRROR_SCROLLBACK_LINES = 3000` 行 scrollback：160 列下每会话约 10 MB（50 000 行约 140 MB）。hc 自己只留 `history_mb = 5`（约 3 600 行），attach 的首帧仍能填满它；web 端从实时输出继续增长自己的 scrollback。
 - 尺寸：
@@ -279,7 +298,7 @@ stream.onData((chunk, { paint, firstPaint, paintDone }) => {
   - 两种情况下非 observer 都收不到重绘，程序的重画作为普通输出到达。
 - 按键：
   - `encodeTmuxKeys(names, mirror)`：镜像在结构上满足 `KeyEncodingModes`。
-  - `pasteBufferBytes(text, mirror.bracketedPaste)`、`bracketedPasteFrame`、`submitBracketedPasteBytes`。
+  - `pasteBufferBytes(text, mirror.bracketedPaste)`、`bracketedPasteFrame`；`submitBracketedPaste` 的回车单独发送（第 5 节）。
   - 生成的字节一律经 `writeAutomatic` 发送。
 
 **实测协议事实**

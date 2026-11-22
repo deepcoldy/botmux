@@ -4,7 +4,6 @@ import {
   encodeTmuxKey,
   encodeTmuxKeys,
   pasteBufferBytes,
-  submitBracketedPasteBytes,
 } from '../src/adapters/backend/hc/keys.js';
 import { ScreenMirror } from '../src/adapters/backend/hc/screen-mirror.js';
 
@@ -142,10 +141,5 @@ describe('paste framing', () => {
   it('bracketedPasteFrame always brackets and keeps the text verbatim', () => {
     expect(bracketedPasteFrame('a\nb')).toBe('\x1b[200~a\nb\x1b[201~');
     expect(bracketedPasteFrame('')).toBe('\x1b[200~\x1b[201~');
-  });
-
-  it('submitBracketedPasteBytes brackets the raw text then presses Enter, even when empty', () => {
-    expect(submitBracketedPasteBytes('line 1\nline 2')).toBe('\x1b[200~line 1\nline 2\x1b[201~\r');
-    expect(submitBracketedPasteBytes('')).toBe('\x1b[200~\x1b[201~\r');
   });
 });

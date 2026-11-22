@@ -8,6 +8,8 @@ import xtermHeadless from '@xterm/headless';
 import type { Terminal as HeadlessTerminal, ITerminalAddon } from '@xterm/headless';
 import * as unicode11 from '@xterm/addon-unicode11';
 import { composeSeedBody, paneInputModeSeed, type PaneInputModes } from '../tmux-pipe-backend.js';
+import { parseCapturedScreenRows } from '../../../utils/captured-screen-rows.js';
+import type { ScreenRow } from '../../../utils/terminal-cells.js';
 import { plainRows, serializeRows } from './ansi-serialize.js';
 
 const { Terminal } = xtermHeadless;
@@ -149,6 +151,15 @@ export class ScreenMirror {
       body = serializeRows(active, 0, active.baseY + rows);
     }
     return this.altPrefix() + composeSeedBody(body, { x: active.cursorX, y: active.cursorY });
+  }
+
+  /**
+   * TmuxPipeBackend.captureViewportCells: the visible rows as cells (dim and
+   * inverse kept), read from this viewport's `capture-pane -e -p` form by the
+   * same parser tmux's capture goes through, so both answer alike.
+   */
+  viewportCells(): ScreenRow[] {
+    return parseCapturedScreenRows(this.captureViewport());
   }
 
   /** TmuxPipeBackend.captureViewportAsync: plain `capture-pane -p`, every row ending in LF. */

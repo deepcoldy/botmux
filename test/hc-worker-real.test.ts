@@ -9,7 +9,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as pty from 'node-pty';
@@ -20,6 +20,9 @@ import { HcBackend } from '../src/adapters/backend/hc-backend.js';
 import { RunnerControlDecoder } from '../src/adapters/cli/runner-control-channel.js';
 import { hcTerminalPanePid } from '../src/codex-rpc-lifecycle.js';
 import { linuxIsolationLaunchViaArgsFile } from '../src/core/linux-isolation.js';
+import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { resetHcAvailabilityCache } from '../src/setup/ensure-hc.js';
 import { isBunRuntime } from './helpers/ts-runner.js';
 
@@ -191,6 +194,27 @@ describe.skipIf(!realHc)('worker hc paths against the real binary', () => {
     expect(hcTerminalPanePid(target, sid, env)).toBe(backend.getChildPid());
     expect(hcTerminalPanePid(target, randomUUID(), env)).toBeUndefined();
     expect(hcTerminalPanePid(newTarget().target, sid, env)).toBeUndefined();
+  }, 60_000);
+
+  it("proves the CLI's runtime as a process_start identity, from the pane's stable pid", async () => {
+    const { sid, target } = newTarget();
+    const { backend, output } = openBackend(sid, target, '/bin/sh', ['-c', 'echo READY; exec sleep 300']);
+    await until(() => expect(output()).toContain('READY'));
+    const pid = backend.getStablePanePid()!;
+    // The pane launcher execs down to the CLI: the pane's pid is a live local process running it.
+    expect(readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')).toEqual(['sleep', '300', '']);
+    const start = readProcessStartIdentity(pid);
+    expect(start).toBeTruthy();
+    const scope = new WorkerSessionEventScope({ appId: 'cli_hc_identity', sessionId: sid }, { workerId: 'w', generation: 1 });
+    const binding = scope.beginRuntime();
+    const identityOf = loadWorkerFunction<(binding: unknown) => unknown>('runtimeIdentityForContract', {
+      backend, workerSessionEventScope: scope, effectiveBackendType: 'hc', codexRpcEngine: undefined,
+      lastInitConfig: { cliId: 'kimi' }, cliAdapter: undefined, readProcessStartIdentity,
+    });
+    expect(identityOf(binding)).toEqual({ backend: 'hc', physicalId: `${pid}:${start}`, proof: 'process_start' });
+    // A worker rewiring cliPid to a wrapper's descendant leaves the pane identity alone.
+    backend.cliPid = process.pid;
+    expect(backend.getStablePanePid()).toBe(pid);
   }, 60_000);
 
   it.skipIf(!canRunBwrap)('starts a bwrap sandbox through the args-file launcher, with the pane as its stdin', async () => {

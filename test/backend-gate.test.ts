@@ -272,13 +272,14 @@ describe('hc wiring inside the worker spawn and web closures', () => {
   // （relayHcWebSnapshot / broadcastOwnedPaneReadOnlyFollowerGrid 有行为测试）；接线在后端事件的闭包里，必须带
   // 后端代际围栏，否则旧后端的迟到事件会把替换后的视图覆盖成上一代的屏幕。
   it('relays hc resync paints and size changes to web clients behind the backend generation fence', () => {
-    const resync = workerSource.indexOf('backend.onScreenResync?.((snapshot) => {');
+    // Both callbacks are bound to the session runtime (bindSessionRuntimeCallback).
+    const resync = workerSource.indexOf('backend.onScreenResync?.(bindSessionRuntimeCallback((snapshot) => {');
     expect(resync).toBeGreaterThan(-1);
-    const resyncBody = workerSource.slice(resync, workerSource.indexOf('\n  });\n', resync));
+    const resyncBody = workerSource.slice(resync, workerSource.indexOf('\n  }, true));\n', resync));
     expect(resyncBody).toMatch(/if \(observedBackend !== backend\) return;[\s\S]*effectiveBackendType === 'hc'[\s\S]*relayHcWebSnapshot\(snapshot\)/);
-    const size = workerSource.indexOf('hcBackend?.onPaneSizeChange(() => {');
+    const size = workerSource.indexOf('hcBackend?.onPaneSizeChange(bindSessionRuntimeCallback(() => {');
     expect(size).toBeGreaterThan(resync);
-    expect(workerSource.slice(size, workerSource.indexOf('});', size)))
+    expect(workerSource.slice(size, workerSource.indexOf('}, true));', size)))
       .toMatch(/if \(observedBackend !== backend\) return;\s*broadcastOwnedPaneReadOnlyFollowerGrid\(\);/);
   });
 });

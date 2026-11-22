@@ -1,8 +1,10 @@
 /**
  * Buffer rows as tmux `capture-pane -p` prints them (no `-J`): one row per
- * line, every row terminated, wide-character padding skipped, trailing blank
- * cells dropped whatever their colours. `serializeRows` is the `-e` flavour
- * with SGR colours; `plainRows` is the bare text.
+ * line, every row terminated, wide-character padding skipped, trailing erased
+ * cells and default spaces dropped. `serializeRows` is the `-e` flavour with
+ * SGR colours, which like tmux (2.8 to 3.6a) keeps a trailing space written
+ * with attributes, such as a reverse-video cursor cell; `plainRows` is the
+ * bare text, trimmed of every trailing space.
  */
 
 import type { IBuffer, IBufferCell, IBufferLine } from '@xterm/headless';
@@ -92,13 +94,13 @@ function trimTrailingSpaces(s: string): string {
   return end === s.length ? s : s.slice(0, end);
 }
 
-/** Cells up to and including the last one that is neither empty nor a space. */
+/** Cells up to and including the last one that is neither erased nor a space without attributes. */
 function contentWidth(line: IBufferLine, cell: IBufferCell): number {
   for (let x = line.length - 1; x >= 0; x--) {
     line.getCell(x, cell);
     if (cell.getWidth() === 0) return x + 1;
     const chars = cell.getChars();
-    if (chars !== '' && chars !== ' ') return x + 1;
+    if (chars !== '' && (chars !== ' ' || !cell.isAttributeDefault())) return x + 1;
   }
   return 0;
 }

@@ -37,6 +37,13 @@ const FIXTURES: Array<[string, string]> = [
   ['all mouse and a hidden cursor', 'x\x1b[?1003h\x1b[?25l'],
   ['a cursor waiting to wrap', `${numbered(0, 3, i => `row ${i}`)}\x1b[${ROWS};1H${'w'.repeat(COLS)}`],
   ['erased rows with a background', `top\r\n\x1b[44m\x1b[2K\x1b[0m\r\nmid\r\n\x1b[41m\x1b[K\x1b[0mtext after\r\nend`],
+  ['a composer: dim suggestion, inverse cursor cells', [
+    '\x1b[2mTry "fix the failing test"\x1b[0m',
+    '\x1b[7m>\x1b[0m draft \x1b[7m \x1b[0m',
+    '\x1b[1;2mbold dim\x1b[22m plain \x1b[2;7mdim inverse\x1b[0m',
+    '\x1b[2m中文提示\x1b[0m 宽\x1b[7m字\x1b[0m',
+    '\x1b[44m status bar   \x1b[0m',
+  ].join('\r\n')],
 ];
 
 const stripSgr = (s: string): string => s.replace(/\x1b\[[0-9;:]*m/g, '');
@@ -104,6 +111,7 @@ describe.skipIf(!tmuxAvailable)('ScreenMirror against TmuxPipeBackend on a priva
     expect(mirror.captureInputState()).toEqual(backend.captureInputState());
     expect(mirror.viewportText()).toBe(await backend.captureViewportAsync());
     expect(mirror.capturePaneInputModes()).toBe(backend.capturePaneInputModes());
+    expect(mirror.viewportCells()).toEqual(backend.captureViewportCells());
 
     const tmuxScreen = backend.captureCurrentScreen();
     const tmuxViewport = backend.captureViewport();

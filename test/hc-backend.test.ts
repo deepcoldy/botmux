@@ -103,6 +103,10 @@ class FakeClient {
   readonly calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   attachParams: Record<string, unknown> | null = null;
   subscribeParams: Record<string, unknown> | null = null;
+  /** What `terminal.read` answers (the terminal's last screen and history). */
+  readText = '';
+  /** Holds every `terminal.get` answer until it settles (a slow core). */
+  gate: Promise<void> | null = null;
   stream: FakeStream | null = null;
   sub: FakeSub | null = null;
   private disconnectCb: ((info: { error: HcError }) => void) | null = null;
@@ -111,9 +115,11 @@ class FakeClient {
   async call(method: string, params: Record<string, unknown>): Promise<unknown> {
     this.calls.push({ method, params });
     if (method === 'terminal.get') {
+      if (this.gate) await this.gate;
       if (!this.terminal) throw new HcError('rpc', 'no such terminal', { kind: 'not_found' });
       return this.terminal;
     }
+    if (method === 'terminal.read') return { text: this.readText, complete: true, how: 'history' };
     return {};
   }
   async subscribe(params: Record<string, unknown>): Promise<FakeSub> {
@@ -223,6 +229,17 @@ describe('spawn', () => {
     expect(backend.isReattach).toBe(false);
     expect(backend.getChildPid()).toBe(4242);
     backend.kill();
+  });
+
+  it("keeps the pane's root pid as its stable identity whatever the worker rewires cliPid to", async () => {
+    const client = queueClient();
+    const backend = backendFor({ sessionId: SID });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    backend.cliPid = 999;
+    expect(backend.getStablePanePid()).toBe(4242);
+    expect(backend.getChildPid()).toBe(4242);
+    (await attached(client)).end({ reason: 'exited', exit_code: 0, signal: null, finished_ms: 1 });
+    expect(backend.getStablePanePid()).toBeNull();
   });
 
   it('gives a strict pane no XDG restore and no shell rcfile', () => {
@@ -430,6 +447,44 @@ describe('screen and output', () => {
     backend.kill();
   });
 
+  it('reads the viewport as cells, dim and inverse kept, at the size another viewer gave the pane', async () => {
+    const client = queueClient();
+    const backend = backendFor({ sessionId: SID });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    const stream = await attached(client);
+    expect(backend.captureViewportCells()).toBeNull();
+    stream.paint('');
+    stream.live('\x1b[2mtry "fix"\x1b[0m\r\n> \x1b[7mX\x1b[0m draft');
+    const rows = backend.captureViewportCells()!;
+    expect(rows).toHaveLength(30);
+    expect(rows[0]).toEqual([...'try "fix"'].map(ch => ({ ch, dim: true, inverse: false })));
+    expect(rows[1]!.map(cell => [cell.ch, cell.inverse])).toEqual([...'> X draft'].map((ch, i) => [ch, i === 2]));
+    // A web terminal took the pane to its own size; the program redraws for it.
+    client.sub!.emit('size', { cols: 214, rows: 62 });
+    stream.live('\x1b[H\x1b[2Jresized');
+    const resized = backend.captureViewportCells()!;
+    expect(resized).toHaveLength(62);
+    expect(resized[0]!.map(cell => cell.ch).join('')).toBe('resized');
+    stream.end({ reason: 'exited', exit_code: 0, signal: null, finished_ms: 1 });
+    expect(backend.captureViewportCells()).toBeNull();
+  });
+
+  it('owes no resync for a cells read before the first paint', async () => {
+    const client = queueClient();
+    const backend = backendFor({ sessionId: SID });
+    const data: string[] = [];
+    const resync = vi.fn();
+    backend.onData(chunk => data.push(chunk));
+    backend.onScreenResync(resync);
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    const stream = await attached(client);
+    expect(backend.captureViewportCells()).toBeNull();
+    stream.paint('drawn before the attach');
+    expect(resync).not.toHaveBeenCalled();
+    expect(data.join('')).toContain('drawn before the attach');
+    backend.kill();
+  });
+
   it('follows a size another viewer takes and reports it', async () => {
     const client = queueClient();
     const backend = backendFor({ sessionId: SID });
@@ -532,15 +587,79 @@ describe('input', () => {
     backend.pasteText('one\ntwo');
     backend.submitBracketedPaste('hi');
     backend.sendLines(['l1', 'l2'], 'M-Enter');
-    expect(stream.written).toEqual([
+    await vi.waitFor(() => expect(stream.written).toEqual([
       '\x1b[A\x03',
       'one\rtwo',
       '\x1bOA',
       '\x1b[200~one\rtwo\x1b[201~',
-      '\x1b[200~hi\x1b[201~\r',
+      '\x1b[200~hi\x1b[201~',
+      '\r',
       'l1\x1b\rl2',
-    ]);
+    ]));
     expect(backend.sendLines([], 'M-Enter')).toBe(false);
+    backend.kill();
+  });
+
+  // Codex reads 1024 bytes per edge-triggered wakeup: an Enter in the same pty
+  // write as a frame that fills a read exactly waits for the next key.
+  it('writes the Enter of a submitted paste on its own, once the core answered a round trip after the frame', async () => {
+    const client = queueClient();
+    const backend = backendFor({ sessionId: SID });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    const stream = await attached(client);
+    stream.paint('');
+    let answer!: () => void;
+    client.gate = new Promise(resolve => { answer = resolve; });
+    const before = client.calls.length;
+    expect(backend.submitBracketedPaste('hi')).toBe(true);
+    expect(backend.write('next')).toBe(true);
+    await Promise.resolve();
+    expect(stream.written).toEqual(['\x1b[200~hi\x1b[201~']);
+    expect(client.calls.slice(before)).toEqual([{ method: 'terminal.get', params: { terminal: 't1' } }]);
+    answer();
+    await vi.waitFor(() => expect(stream.written).toEqual(['\x1b[200~hi\x1b[201~', '\r', 'next']));
+    backend.kill();
+  });
+
+  it('keeps that order for a paste submitted before the first paint', async () => {
+    const client = queueClient();
+    const backend = backendFor({ sessionId: SID });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    expect(backend.submitBracketedPaste('a')).toBe(true);
+    expect(backend.submitBracketedPaste('b')).toBe(true);
+    expect(backend.write('c')).toBe(true);
+    const stream = await attached(client);
+    stream.paint('');
+    await vi.waitFor(() => expect(stream.written).toEqual(['\x1b[200~a\x1b[201~', '\r', '\x1b[200~b\x1b[201~', '\r', 'c']));
+    backend.kill();
+  });
+
+  it('still writes the Enter when the round trip fails, and drops it with the connection', async () => {
+    const client = queueClient();
+    const backend = backendFor({ sessionId: SID });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    const stream = await attached(client);
+    stream.paint('');
+    client.gate = Promise.reject(new HcError('timeout', 'slow core'));
+    client.gate.catch(() => {});
+    backend.submitBracketedPaste('x');
+    await vi.waitFor(() => expect(stream.written).toEqual(['\x1b[200~x\x1b[201~', '\r']));
+
+    let answer!: () => void;
+    client.gate = new Promise(resolve => { answer = resolve; });
+    backend.submitBracketedPaste('y');
+    const next = queueClient();
+    client.drop();
+    // Nothing waits on a dropped connection: later input says it did not arrive.
+    expect(backend.write('z')).toBe(false);
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    const reattached = await attached(next);
+    reattached.paint('');
+    answer();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    stderr.mockRestore();
+    expect(stream.written).toEqual(['\x1b[200~x\x1b[201~', '\r', '\x1b[200~y\x1b[201~']);
+    expect(reattached.written).toEqual([]);
     backend.kill();
   });
 
@@ -559,6 +678,95 @@ describe('input', () => {
     backend.kill();
     expect(backend.write('x')).toBe(false);
     expect(backend.submitBracketedPaste('x')).toBe(false);
+  });
+});
+
+describe('input after the program ended', () => {
+  it.each([
+    ['the attach stream closing', (stream: FakeStream) => stream.end({ reason: 'exited', exit_code: 1, signal: null, finished_ms: 1 })],
+    ['the finished event', (_stream: FakeStream, client: FakeClient) => client.sub!.emit('finished', { reason: 'exited', exit_code: 1, signal: null, finished_ms: 1 })],
+  ] as const)('refuses every write and paste once it heard of the end through %s, sending nothing', async (_how, end) => {
+    const client = queueClient();
+    const backend = backendFor({ sessionId: SID });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    const stream = await attached(client);
+    stream.paint('x');
+    end(stream, client);
+    expect(backend.write('x')).toBe(false);
+    expect(backend.sendText('x')).toBe(false);
+    expect(backend.sendSpecialKeys('Enter')).toBe(false);
+    expect(backend.sendLines(['a', 'b'], 'M-Enter')).toBe(false);
+    expect(backend.pasteText('x')).toBe(false);
+    expect(backend.submitBracketedPaste('x')).toBe(false);
+    expect(stream.written).toEqual([]);
+  });
+});
+
+describe('a program that ends before the first attach', () => {
+  const FINISHED = { state: 'finished' as const, reason: 'exited', exit_code: 3, signal: null, finished_ms: 1 };
+
+  it('hands its last output to the worker, then reports the exit and removes the record', async () => {
+    const client = queueClient(new FakeClient(record(FINISHED)));
+    client.readText = 'fatal: config.toml: unknown key\nusage: cli [opts]\n\n';
+    const backend = backendFor({ sessionId: SID });
+    const events: string[] = [];
+    backend.onData(chunk => events.push(`data:${chunk}`));
+    backend.onExit((code, signal) => events.push(`exit:${code}:${signal}`));
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    await vi.waitFor(() => expect(events.at(-1)).toBe('exit:3:null'));
+    const logged = stderr.mock.calls.map(call => String(call[0])).join('');
+    stderr.mockRestore();
+    expect(events).toEqual(['data:fatal: config.toml: unknown key\r\nusage: cli [opts]\r\n', 'exit:3:null']);
+    expect(logged).toContain('fatal: config.toml: unknown key');
+    expect(client.calls.find(c => c.method === 'terminal.read')!.params).toEqual({ terminal: 't1', lines: 50 });
+    const methods = client.methods();
+    expect(methods.indexOf('terminal.read')).toBeLessThan(methods.indexOf('terminal.rm'));
+    expect(backend.exitedBecauseServerLost()).toBeUndefined();
+  });
+
+  it('still reports the exit when the output cannot be read', async () => {
+    const client = queueClient(new FakeClient(record(FINISHED)));
+    client.call = async (method: string, params: Record<string, unknown>) => {
+      client.calls.push({ method, params });
+      if (method === 'terminal.read') throw new HcError('rpc', 'gone', { kind: 'not_found' });
+      if (method === 'terminal.get') return client.terminal;
+      return {};
+    };
+    const backend = backendFor({ sessionId: SID });
+    const data: string[] = [];
+    const exit = vi.fn();
+    backend.onData(chunk => data.push(chunk));
+    backend.onExit(exit);
+    const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(3, null));
+    stderr.mockRestore();
+    expect(data).toEqual([]);
+  });
+
+  it('reads nothing back for a terminal it reattached to or had already attached', async () => {
+    const first = queueClient();
+    const backend = backendFor({ sessionId: SID });
+    const exit = vi.fn();
+    backend.onExit(exit);
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    (await attached(first)).paint('x');
+    const second = queueClient(new FakeClient(record(FINISHED)));
+    second.readText = 'must not be read';
+    first.drop();
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(3, null));
+    expect(second.methods()).not.toContain('terminal.read');
+
+    // A reattach reads the corpse's end synchronously and never connects.
+    syncAnswers['terminal.get'] = () => ({ ok: true, value: record(FINISHED) });
+    connectMock.mockClear();
+    const reattachExit = vi.fn();
+    const reattach = backendFor({ sessionId: SID, isReattach: true });
+    reattach.onExit(reattachExit);
+    reattach.spawn('/usr/bin/claude', [], spawnOpts());
+    expect(reattachExit).toHaveBeenCalledWith(3, null);
+    expect(connectMock).not.toHaveBeenCalled();
   });
 });
 
@@ -598,10 +806,23 @@ describe('exit', () => {
     expect(exit).toHaveBeenCalledWith(null, '9');
   });
 
-  it.each(['holder_lost', 'stopped_by_restart', 'server_stop', 'host_shutdown'])('counts %s as the server going away', async reason => {
+  it.each([
+    ['holder_lost', 'replaced'],
+    ['stopped_by_restart', 'replaced'],
+    ['server_stop', 'gone'],
+    ['host_shutdown', 'gone'],
+  ] as const)('counts %s as the core losing the terminal (%s), keyed by its socket', async (reason, kind) => {
     const { backend, stream } = await running();
     stream.end({ reason, exit_code: null, signal: 1, finished_ms: 1 });
     expect(backend.exitedBecauseServerReplaced()).toBe(true);
+    expect(backend.exitedBecauseServerLost()).toEqual({ backend: 'hc', kind, socketName: TARGET.socket });
+  });
+
+  it.each(['exited', 'killed', 'signaled'])('reports no server loss for a program that ended %s', async reason => {
+    const { backend, client } = await running();
+    client.sub!.emit('finished', { reason, exit_code: 1, signal: null, finished_ms: 1 });
+    expect(backend.exitedBecauseServerReplaced()).toBe(false);
+    expect(backend.exitedBecauseServerLost()).toBeUndefined();
   });
 
   it('ends when someone else removes the terminal', async () => {
@@ -624,6 +845,7 @@ describe('exit', () => {
     expect(exit).not.toHaveBeenCalled();
     expect(backend.isPaneAlive()).toBe(false);
     expect(backend.exitedBecauseServerReplaced()).toBe(false);
+    expect(backend.exitedBecauseServerLost()).toBeUndefined();
   });
 
   it('destroySession() ends the terminal through the label-checked kill', async () => {
@@ -719,6 +941,7 @@ describe('reconnect', () => {
     first.drop();
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1, null));
     expect(backend.exitedBecauseServerReplaced()).toBe(true);
+    expect(backend.exitedBecauseServerLost()).toEqual({ backend: 'hc', kind: 'replaced', socketName: TARGET.socket });
     expect(second.methods()).toEqual(['terminal.get']);
     expect(second.attachParams).toBeNull();
     expect(second.closed).toBe(true);
@@ -732,6 +955,7 @@ describe('reconnect', () => {
     queueClient(new FakeClient(null));
     first.drop();
     await vi.waitFor(() => expect(backend.exitedBecauseServerReplaced()).toBe(true));
+    expect(backend.exitedBecauseServerLost()).toEqual({ backend: 'hc', kind: 'replaced', socketName: TARGET.socket });
   });
 
   it('gives up after the core stays unreachable for the outage window', async () => {
@@ -752,6 +976,7 @@ describe('reconnect', () => {
     stderr.mockRestore();
     expect(exit).toHaveBeenCalledWith(1, null);
     expect(backend.exitedBecauseServerReplaced()).toBe(true);
+    expect(backend.exitedBecauseServerLost()).toEqual({ backend: 'hc', kind: 'unreachable', socketName: TARGET.socket });
   });
 });
 

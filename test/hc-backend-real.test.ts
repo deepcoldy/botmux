@@ -31,6 +31,7 @@ process.stdin.on('data', b => {
   if (text === 'MODES') out('\\x1b[?1h\\x1b[?2004h');
   if (text === 'PROBE') out('\\x1b]7501;?\\x1b\\\\\\x1b[c');
   if (text === 'STATUS') out('\\x1b]7501;state=working\\x1b\\\\');
+  if (text === 'CELLS') out('\\x1b[2mdim hint\\x1b[0m \\x1b[7mINV\\x1b[0m end\\n');
 });
 `;
 
@@ -214,6 +215,55 @@ describe.skipIf(!realHc)('HcBackend against the real binary', () => {
     expect(state.cursor.y).toBeGreaterThan(0);
     expect(state.cursor.y).toBeLessThan(30);
     expect(backend.getPaneSize()).toEqual({ cols: 100, rows: 30 });
+  }, 60_000);
+
+  it('reads the viewport as cells, dim and inverse kept, at the size another viewer gives the pane', async () => {
+    const { target, session } = await started();
+    const { backend } = session;
+    expect(backend.sendText('CELLS')).toBe(true);
+    const styledRow = () => backend.captureViewportCells()?.find(row => row.map(cell => cell.ch).join('') === 'dim hint INV end');
+    await until(() => expect(styledRow()).toBeDefined());
+    expect(styledRow()!.map(cell => [cell.ch, cell.dim, cell.inverse])).toEqual(
+      [...'dim hint INV end'].map((ch, i) => [ch, i < 8, i >= 9 && i < 12]),
+    );
+    expect(backend.captureViewportCells()).toHaveLength(30);
+
+    const viewer = await HcClient.connect(core.socket);
+    try {
+      const stream = await viewer.attach({ terminal: target.sessionName, cols: 90, rows: 25 });
+      stream.onData(() => {});
+      await until(() => expect(backend.captureViewportCells()).toHaveLength(25));
+      expect(backend.captureViewportCells()!.every(row => row.length <= 90)).toBe(true);
+      stream.close();
+      await until(() => expect(backend.captureViewportCells()).toHaveLength(30));
+    } finally {
+      viewer.close();
+    }
+  }, 60_000);
+
+  it('hands the worker what a CLI printed before it exited, ahead of the first attach', async () => {
+    const { sid, target } = newTarget();
+    const failing = join(root, `failing-${sid}.sh`);
+    writeFileSync(failing, "#!/bin/sh\nprintf 'fatal: unknown flag --frobnicate\\nsee cli --help\\n' >&2\nexit 3\n");
+    chmodSync(failing, 0o755);
+    const backend = new HcBackend(target, { sessionId: sid, env });
+    opened.push({ backend });
+    const session = new Session(backend);
+    backend.spawn(failing, [], {
+      cwd: root, cols: 100, rows: 30,
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: env.HOME! },
+      launchShell: '/bin/bash', paneLaunchDir: join(root, 'launch', sid),
+    });
+    // Hold the event loop until the program has ended: the backend's attach
+    // (asynchronous) cannot have started before it.
+    const deadline = Date.now() + 15_000;
+    while (getTerminal(target.sessionName)?.state !== 'finished') {
+      if (Date.now() > deadline) throw new Error('the CLI did not exit');
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+    await until(() => expect(session.exits).toEqual([[3, null]]));
+    expect(session.output()).toContain('fatal: unknown flag --frobnicate\r\nsee cli --help');
+    await until(() => expect(getTerminal(target.sessionName)).toBeNull());
   }, 60_000);
 
   it('leads the size, follows another viewer that takes it, and leads again once it leaves', async () => {

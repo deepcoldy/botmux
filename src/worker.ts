@@ -34605,7 +34605,8 @@ async function spawnCliBody(
       backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
     });
     // Same evidence, for the daemon: an exit caused by losing the shared tmux
-    // server joins ONE backend outage instead of counting as a CLI crash.
+    // server (or hc core) joins ONE backend outage instead of counting as a
+    // CLI crash.
     const serverLoss = intentionalRestart ? undefined : observedBackend.exitedBecauseServerLost?.();
     if (codexAutoUpgrade) {
       backend = null;
@@ -34805,7 +34806,7 @@ async function spawnCliBody(
     } else {
       const sandboxNamespace = code !== 0 ? sandboxNamespaceDiagnosis(logTail) : undefined;
       send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt,
-        ...(serverLoss ? { backendLost: { backend: 'tmux' as const, ...serverLoss } } : {}),
+        ...(serverLoss ? { backendLost: { ...serverLoss, backend: serverLoss.backend ?? 'tmux' } } : {}),
         ...(lastInitConfig?.cliId === 'traex' ? { traexStartupFailure: freshCliNeverReady() } : {}),
         ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
     }

@@ -266,6 +266,7 @@ describe('restart on hc', () => {
       tmuxRestartJitterMs: vi.fn(() => 1_234),
       remoteThreadId: undefined,
       intentionalRestartBackend: undefined,
+      intentionallyRetiredBackends: new WeakSet(),
       effectiveBackendType: 'hc',
       awaitingFirstPrompt: false,
       isPromptReady: true,

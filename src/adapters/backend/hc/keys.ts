@@ -109,11 +109,6 @@ export function bracketedPasteFrame(text: string): string {
   return `\x1b[200~${text}\x1b[201~`;
 }
 
-/** TmuxPipeBackend.submitBracketedPaste: markers around the raw text, then Enter. */
-export function submitBracketedPasteBytes(text: string): string {
-  return `${bracketedPasteFrame(text)}\r`;
-}
-
 function parseTmuxKey(name: string): ParsedKey | null {
   let rest = name;
   let ctrl = false;

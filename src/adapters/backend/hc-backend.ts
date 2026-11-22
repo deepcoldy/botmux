@@ -19,13 +19,14 @@ import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import { parseProgramStatusPayload, type ProgramStatusEvent } from '../../utils/program-status-parser.js';
+import type { ScreenRow } from '../../utils/terminal-cells.js';
 import type { SessionBackend, SpawnOpts } from './types.js';
 import type { PaneLaunchFile } from './pane-launch.js';
 import { SERVER_OUTAGE_ESCALATE_MS, writeManagedPaneLaunch } from './tmux-pipe-backend.js';
 import { HcClient, isHcError, type HcChannelClose, type HcChunkInfo, type HcStream, type HcSubscription } from './hc/client.js';
 import { hcOwnerLabels, isHcTerminalOwnedBy, killHcTerminal, type HcKillOutcome, type HcTarget } from './hc/cli-ops.js';
 import { ensureHcCore, hcPaneXdgRestore } from './hc/core.js';
-import { encodeTmuxKey, encodeTmuxKeys, pasteBufferBytes, submitBracketedPasteBytes, type KeyEncodingModes } from './hc/keys.js';
+import { bracketedPasteFrame, encodeTmuxKey, encodeTmuxKeys, pasteBufferBytes, type KeyEncodingModes } from './hc/keys.js';
 import { HC_MIRROR_SCROLLBACK_LINES, ScreenMirror } from './hc/screen-mirror.js';
 import {
   HC_STARTUP_RETRY_DELAYS_MS,
@@ -43,8 +44,27 @@ import { asHcTerminalRecord, parseHcEnd } from './hc/types.js';
 /** Codex instance binding of the CLI a terminal runs (tmux keeps it in the session env). */
 export const HC_INSTANCE_LABEL = 'botmux_codex_instance';
 
-/** The program ended because its core went away, not on its own. */
-const SERVER_REPLACED_REASONS = new Set(['holder_lost', 'stopped_by_restart', 'server_stop', 'host_shutdown']);
+/**
+ * How the core lost a program it reports ended for `reason`, if it did:
+ *  - `replaced`: a core answers, but the program is gone with the holder
+ *    that ran it, or with the core that a restart replaced;
+ *  - `gone`: the core stopped (or the host is shutting down), taking every
+ *    terminal with it.
+ * Any other reason is the program's own end. These are the core's own words,
+ * never an inference from a silent socket.
+ */
+function serverLossFor(reason: string | null | undefined): HcServerLossKind | undefined {
+  switch (reason) {
+    case 'holder_lost':
+    case 'stopped_by_restart':
+      return 'replaced';
+    case 'server_stop':
+    case 'host_shutdown':
+      return 'gone';
+    default:
+      return undefined;
+  }
+}
 const GET_TIMEOUT_MS = 5_000;
 const RUN_TIMEOUT_MS = 15_000;
 /** hc's kill escalates HUP, TERM, KILL with 0.5 s, 0.5 s and 2 s waits. */
@@ -64,6 +84,10 @@ const STATUS_REPORT = /\x1b\]7501;[^\x1b\x07]*(?:\x1b\\|\x07)/g;
 const STATUS_PREFIX = '\x1b]7501;';
 /** The worker's 7501 parser passes a longer unfinished report through as text. */
 const MAX_STATUS_REPORT = 4096;
+/** History above the screen read from a program that ended before its first attach (TmuxPipeBackend's PANE_DEATH_SCREEN_HISTORY_LINES). */
+const STARTUP_DEATH_HISTORY_LINES = 50;
+/** Bound on the round trip an Enter written on its own waits for (TmuxPipeBackend's send-keys deadline). */
+const OWN_WRITE_ROUND_TRIP_MS = 5_000;
 /** One terminal.run call's own label: tells its terminal apart after a reply that never came. */
 const RUN_LABEL = 'botmux_run';
 /** Only the latest request can still take effect; older ones are kept to recognise their acknowledgements. */
@@ -78,8 +102,17 @@ export interface HcBackendOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+/** The kinds of SessionBackend.exitedBecauseServerLost, as the daemon's outage coordinator groups them. */
+export type HcServerLossKind = 'replaced' | 'gone' | 'unreachable';
+
+/** One input, encoded when it is written. `ownWrite`: it must reach the program as a write of its own. */
+interface QueuedInput {
+  encode: () => string;
+  ownWrite: boolean;
+}
+
 class TerminalGone extends Error {
-  constructor(readonly end: HcEnd | null, readonly serverReplaced: boolean, reason: string) {
+  constructor(readonly end: HcEnd | null, readonly serverLoss: HcServerLossKind | undefined, reason: string) {
     super(reason);
   }
 }
@@ -244,7 +277,13 @@ export class HcBackend implements SessionBackend {
    * Kept unencoded: until that paint the mirror does not know the program's
    * keyboard and paste modes.
    */
-  private pendingInput: Array<() => string> | null = [];
+  private pendingInput: QueuedInput[] | null = [];
+  /**
+   * Input behind an Enter that waits to be written on its own (see
+   * submitBracketedPaste), in order; null when nothing waits. Dropped with
+   * the stream it was meant for.
+   */
+  private inputBarrier: QueuedInput[] | null = null;
   /** Sizes sent to the core that no `size` event has acknowledged yet, oldest first. */
   private requestedSizes: Array<{ cols: number; rows: number }> = [];
   /** The program's 7501 records as onData delivered them to the worker, by id. */
@@ -261,7 +300,8 @@ export class HcBackend implements SessionBackend {
   private exited = false;
   /** The program ended (or its terminal is gone): no pid any more. */
   private terminalEnded = false;
-  private serverReplacedAtExit = false;
+  /** Set when the terminal ended with its core rather than on its own. */
+  private serverLossAtExit: HcServerLossKind | undefined;
   private pendingExit: { code: number | null; signal: string | null } | null = null;
   private readonly dataCbs: Array<(data: string) => void> = [];
   private readonly exitCbs: Array<(code: number | null, signal: string | null) => void> = [];
@@ -321,9 +361,20 @@ export class HcBackend implements SessionBackend {
     return this.input(() => pasteBufferBytes(text, this.mirror?.bracketedPaste ?? false));
   }
 
-  /** Markers around the raw text, then Enter, in one frame whatever the program's modes. */
+  /**
+   * Markers around the raw text whatever the program's modes, then Enter as
+   * a write of its own, as TmuxPipeBackend does: crossterm (Codex) reads 1024
+   * bytes per edge-triggered wakeup, so an Enter in the same pty write as a
+   * frame that fills a read exactly stays in the tty until the next key. hc
+   * writes every input frame to the pty as it reaches the holder, so two
+   * frames sent back to back can still land in one read; the Enter is sent
+   * only once the core has answered a round trip after the frame (the core
+   * forwards input before it serves a later request on the connection),
+   * tmux's one client round trip. Input written meanwhile queues behind it.
+   */
   submitBracketedPaste(text: string): boolean {
-    return this.input(() => submitBracketedPasteBytes(text));
+    if (!this.input(() => bracketedPasteFrame(text))) return false;
+    return this.input(() => '\r', true);
   }
 
   resize(cols: number, rows: number): void {
@@ -358,7 +409,19 @@ export class HcBackend implements SessionBackend {
   }
 
   exitedBecauseServerReplaced(): boolean {
-    return this.exited && this.serverReplacedAtExit;
+    return this.exitedBecauseServerLost() !== undefined;
+  }
+
+  /**
+   * After onExit: how the core holding the terminal lost it, when that ended
+   * the program (see serverLossFor; a core that lost its state reads as
+   * `replaced`, one unreachable for the outage window as `unreachable`). The
+   * core's socket lets the daemon fold every session that lost the same core
+   * into ONE outage, apart from any tmux server's.
+   */
+  exitedBecauseServerLost(): { backend: 'hc'; kind: HcServerLossKind; socketName: string } | undefined {
+    if (!this.exited || this.serverLossAtExit === undefined) return undefined;
+    return { backend: 'hc', kind: this.serverLossAtExit, socketName: this.target.socket };
   }
 
   /** Detach only: the terminal and its program keep running. */
@@ -403,6 +466,16 @@ export class HcBackend implements SessionBackend {
   }
 
   getChildPid(): number | null {
+    return this.getStablePanePid();
+  }
+
+  /**
+   * The pane's root process from the terminal record (the scope supervisor
+   * sh), for as long as the terminal runs. The worker's `cliPid` refinement
+   * to a wrapper's descendant never moves it, and a reconnect re-verifies the
+   * same terminal, so it stays one pane's identity until that pane ends.
+   */
+  getStablePanePid(): number | null {
     return this.terminalEnded ? null : this.pid;
   }
 
@@ -428,6 +501,19 @@ export class HcBackend implements SessionBackend {
 
   captureInputState(): { viewport: string; cursor: { x: number; y: number } } | null {
     return this.capture(mirror => mirror.captureInputState(), null);
+  }
+
+  /**
+   * TmuxPipeBackend.captureViewportCells, from the mirror (ScreenMirror.
+   * viewportCells). The mirror takes every size the core takes (another
+   * viewer's included), so a web or local terminal that resized the pane
+   * cannot skew it. Null when the terminal is gone or no complete paint has
+   * arrived yet; unlike the other captures this never owes the worker a resync.
+   */
+  captureViewportCells(): ScreenRow[] | null {
+    if (this.exited || !this.seeded) return null;
+    const rows = this.mirror!.viewportCells();
+    return rows.length > 0 ? rows : null;
   }
 
   /** Waits (bounded) for the first paint rather than answering an unknown screen. */
@@ -496,7 +582,7 @@ export class HcBackend implements SessionBackend {
       if (got.kind === 'not_found') {
         this.exited = true;
         this.terminalEnded = true;
-        this.serverReplacedAtExit = true;
+        this.serverLossAtExit = 'replaced';
         this.fireExit(1, null);
         throw new Error(`hc 终端 ${name} 已不存在（${this.target.socket}），无法重新连接`);
       }
@@ -518,7 +604,7 @@ export class HcBackend implements SessionBackend {
     this.exited = true;
     this.terminalEnded = true;
     const end = endOf(record);
-    this.serverReplacedAtExit = SERVER_REPLACED_REASONS.has(end.reason);
+    this.serverLossAtExit = serverLossFor(end.reason);
     const removed = hcCallSync(core, 'terminal.rm', { terminal: record.address }, GET_TIMEOUT_MS);
     if (!removed.ok && removed.kind !== 'not_found') {
       process.stderr.write(`[hc-backend] could not remove finished terminal ${record.address}: ${removed.message}\n`);
@@ -562,8 +648,8 @@ export class HcBackend implements SessionBackend {
         return;
       }
       const listed = sub.snapshot.terminals.find(t => t.address === address);
-      if (!listed) throw new TerminalGone(null, true, `hc 终端 ${address} 在订阅时已不存在`);
-      if (listed.state === 'finished') throw new TerminalGone(endOf(listed), SERVER_REPLACED_REASONS.has(listed.reason ?? ''), 'finished');
+      if (!listed) throw new TerminalGone(null, 'replaced', `hc 终端 ${address} 在订阅时已不存在`);
+      if (listed.state === 'finished') throw new TerminalGone(endOf(listed), serverLossFor(listed.reason), 'finished');
       let stream: HcStream;
       const size = { cols: this.cols, rows: this.rows };
       try {
@@ -586,14 +672,46 @@ export class HcBackend implements SessionBackend {
         return;
       }
       if (err instanceof TerminalGone) {
+        if (err.end && client && !this.everAttached && !this._isReattach) {
+          await this.deliverStartupOutput(client, address);
+          if (stale()) {
+            client.close();
+            return;
+          }
+        }
         this.client = client;
-        this.finish(err.end, err.serverReplaced);
+        this.finish(err.end, err.serverLoss);
         return;
       }
       client?.close();
       process.stderr.write(`[hc-backend] ${this.target.sessionName}: attach to ${address} failed: ${describeError(err)}\n`);
       this.scheduleReconnect();
     }
+  }
+
+  /**
+   * A fresh program that ended before its first attach never reached the
+   * stream, so the worker would hear only its exit code. Read what it last
+   * printed (its own startup error, usually) and hand that on as output: it
+   * reaches the worker's log tail, claude_exit and crash notice the way
+   * TmuxPipeBackend's create-time pipe (#3448) and dead-pane screen read with
+   * history (#3539) keep a CLI's startup error. History is read for a fresh
+   * terminal only, as there: a reattached one may be long-lived. Best effort.
+   */
+  private async deliverStartupOutput(client: HcClient, address: string): Promise<void> {
+    let text: unknown;
+    try {
+      text = (await client.call<{ text?: unknown }>(
+        'terminal.read', { terminal: address, lines: STARTUP_DEATH_HISTORY_LINES }, { timeoutMs: CALL_TIMEOUT_MS },
+      ))?.text;
+    } catch (err) {
+      process.stderr.write(`[hc-backend] ${this.target.sessionName}: could not read the output of a CLI that exited at startup: ${describeError(err)}\n`);
+      return;
+    }
+    const body = typeof text === 'string' ? text.replace(/\s+$/, '') : '';
+    if (!body) return;
+    process.stderr.write(`[hc-backend] ${this.target.sessionName}: CLI last output before it exited at startup (tail):\n${body}\n`);
+    this.emitText(`${body.split('\n').join('\r\n')}\r\n`);
   }
 
   /** Throws TerminalGone unless `address` is still this session's live terminal. */
@@ -603,16 +721,16 @@ export class HcBackend implements SessionBackend {
       record = asHcTerminalRecord(await client.call<HcTerminalRecord>('terminal.get', { terminal: address }, { timeoutMs: CALL_TIMEOUT_MS }));
     } catch (err) {
       if (isHcError(err, 'rpc') && err.kind === 'not_found') {
-        throw new TerminalGone(null, true, `hc 终端 ${address} 已不存在（core 丢失了状态）`);
+        throw new TerminalGone(null, 'replaced', `hc 终端 ${address} 已不存在（core 丢失了状态）`);
       }
       throw err;
     }
     if (!record) throw new Error(`hc terminal.get ${address} 返回了无法识别的记录`);
     if (record.name !== this.target.sessionName || !isHcTerminalOwnedBy(record.labels, this.sessionId)) {
-      throw new TerminalGone(null, true, `hc 终端 ${address} 已换成了别的终端（${record.name ?? '无名'}，${record.labels?.botmux_sid ?? '无会话'}）`);
+      throw new TerminalGone(null, 'replaced', `hc 终端 ${address} 已换成了别的终端（${record.name ?? '无名'}，${record.labels?.botmux_sid ?? '无会话'}）`);
     }
     if (record.state === 'finished') {
-      throw new TerminalGone(endOf(record), SERVER_REPLACED_REASONS.has(record.reason ?? ''), 'finished');
+      throw new TerminalGone(endOf(record), serverLossFor(record.reason), 'finished');
     }
   }
 
@@ -692,7 +810,7 @@ export class HcBackend implements SessionBackend {
     this.paintTail = '';
     const queued = this.pendingInput;
     this.pendingInput = null;
-    for (const encode of queued ?? []) this.stream?.writeAutomatic(encode());
+    this.drainInput(queued ?? []);
     for (const waiter of [...this.seedWaiters]) waiter();
   }
 
@@ -753,7 +871,7 @@ export class HcBackend implements SessionBackend {
   private onStreamClose(stream: HcStream, info: HcChannelClose): void {
     if (stream !== this.stream) return;
     if (info.kind === 'ended') {
-      this.finish(info.end, SERVER_REPLACED_REASONS.has(info.end.reason));
+      this.finish(info.end, serverLossFor(info.end.reason));
     } else if (info.kind === 'detached') {
       this.dropConnection('the core detached this viewer');
     }
@@ -770,11 +888,11 @@ export class HcBackend implements SessionBackend {
       case 'finished':
       case 'lost': {
         const end = parseHcEnd(event.data);
-        if (end) this.finish(end, SERVER_REPLACED_REASONS.has(end.reason));
+        if (end) this.finish(end, serverLossFor(end.reason));
         return;
       }
       case 'removed':
-        this.finish(null, false);
+        this.finish(null, undefined);
         return;
       case 'size': {
         const cols = event.data?.cols;
@@ -788,8 +906,8 @@ export class HcBackend implements SessionBackend {
   private onSnapshot(sub: HcSubscription, snapshot: HcSnapshot): void {
     if (sub !== this.sub) return;
     const record = snapshot.terminals.find(t => t.address === this.address);
-    if (!record) this.finish(null, false);
-    else if (record.state === 'finished') this.finish(endOf(record), SERVER_REPLACED_REASONS.has(record.reason ?? ''));
+    if (!record) this.finish(null, undefined);
+    else if (record.state === 'finished') this.finish(endOf(record), serverLossFor(record.reason));
     else this.onCoreSize(record.cols, record.rows);
   }
 
@@ -844,6 +962,7 @@ export class HcBackend implements SessionBackend {
     this.stream = null;
     this.sub = null;
     this.seeded = false;
+    this.inputBarrier = null;
     if (this.paintTarget && this.paintTarget !== this.mirror) this.paintTarget.dispose();
     this.paintTarget = null;
   }
@@ -855,7 +974,7 @@ export class HcBackend implements SessionBackend {
       process.stderr.write(
         `[hc-backend] ${this.target.sessionName}: hc core ${this.target.socket} unreachable for ${Math.round((Date.now() - this.unreachableSince) / 1000)}s; treating the terminal as lost\n`,
       );
-      this.finish(null, true);
+      this.finish(null, 'unreachable');
       return;
     }
     const delay = RECONNECT_DELAYS_MS[Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)]!;
@@ -874,11 +993,11 @@ export class HcBackend implements SessionBackend {
    * record is removed through the connection that saw it end, like tmux reaps
    * a remain-on-exit corpse; the name never blocks the next generation anyway.
    */
-  private finish(end: HcEnd | null, serverReplaced: boolean): void {
+  private finish(end: HcEnd | null, serverLoss: HcServerLossKind | undefined): void {
     if (this.exited) return;
     this.exited = true;
     this.terminalEnded = true;
-    this.serverReplacedAtExit = serverReplaced;
+    this.serverLossAtExit = serverLoss;
     const client = this.client;
     const address = this.address;
     this.teardown(end !== null);
@@ -903,6 +1022,7 @@ export class HcBackend implements SessionBackend {
     sub?.close();
     if (!keepClient) client?.close();
     this.pendingInput = null;
+    this.inputBarrier = null;
     this.mirror?.dispose();
     this.mirror = null;
     for (const waiter of [...this.seedWaiters]) waiter();
@@ -919,14 +1039,45 @@ export class HcBackend implements SessionBackend {
   // ─── helpers ──────────────────────────────────────────────────────────────────────
 
   /** False only when the input provably cannot arrive: detached, ended, or the connection is down. */
-  private input(encode: () => string): boolean {
+  private input(encode: () => string, ownWrite = false): boolean {
     if (this.exited) return false;
-    if (this.pendingInput) {
-      this.pendingInput.push(encode);
+    const queue = this.pendingInput ?? this.inputBarrier;
+    if (queue) {
+      queue.push({ encode, ownWrite });
       return true;
     }
-    if (this.stream) return this.stream.writeAutomatic(encode());
-    return false;
+    if (!this.stream) return false;
+    return this.writeInput({ encode, ownWrite });
+  }
+
+  /** Writes one input on the current stream; one that needs a write of its own goes after a round trip. */
+  private writeInput(item: QueuedInput): boolean {
+    const stream = this.stream!;
+    const client = this.client;
+    if (!item.ownWrite || !client) return stream.writeAutomatic(item.encode());
+    const barrier: QueuedInput[] = [];
+    this.inputBarrier = barrier;
+    const release = (): void => {
+      // A teardown or reconnect meanwhile dropped this barrier with its stream.
+      if (this.inputBarrier !== barrier) return;
+      this.inputBarrier = null;
+      stream.writeAutomatic(item.encode());
+      this.drainInput(barrier);
+    };
+    client.call('terminal.get', { terminal: this.address }, { timeoutMs: OWN_WRITE_ROUND_TRIP_MS }).then(release, release);
+    return true;
+  }
+
+  /** Writes queued input in order, stopping behind an Enter that waits for its own write. */
+  private drainInput(items: QueuedInput[]): void {
+    for (let i = 0; i < items.length; i++) {
+      if (this.inputBarrier) {
+        this.inputBarrier.push(...items.slice(i));
+        return;
+      }
+      if (this.exited || !this.stream) return;
+      this.writeInput(items[i]!);
+    }
   }
 
   private keyModes(): KeyEncodingModes {
