@@ -93,7 +93,9 @@ pane 脚本还要做三件事：
 - 首帧之前的输入按顺序排队，且先不编码：首帧之前镜像不知道程序的 DECCKM 与 bracketed paste 状态（reattach 时镜像还是空白的），首帧落地后再按镜像编码发出。
 - 禁止在热路径上用 `terminal.send`/`keys`。
 - 能证明输入没被接受时（未连接、终端已结束、socket 写失败）返回 false，供 `critical-control-key.ts` 重试。终端的结束由 core 主动推送（CLOSE 帧或 `finished` 事件），收到之后的一切写入与粘贴都返回 false、不发出，对应 tmux 写前拒绝死 pane（#3580/#3610）。
-- `submitBracketedPaste` 的回车单独写入，与 TmuxPipeBackend 相同：Codex（crossterm）在边沿触发下每次只读 1024 字节，帧恰好填满一次读取时，同一次 pty 写入里的回车留在 tty 里直到下一次按键。hc 把每个输入帧到达 holder 时各写一次 pty，但两个背靠背的帧仍可能落进同一次读取（实测 Codex 0.167.0 下 9 个边界长度仍有 4 个滞留），所以回车等 core 应答同一连接上帧之后的一次往返（`terminal.get`）再发：core 先转发输入帧、再处理后续请求。这相当于 tmux 两次客户端调用之间的那一次往返；期间写入的输入排在回车之后。等待中连接断开，回车与排在它后面的输入随连接丢弃（已返回 true），由 worker 的回执与原生 history 判定是否送达。
+- `submitBracketedPaste` 的回车单独写入，与 TmuxPipeBackend 相同：Codex（crossterm）在边沿触发下每次只读 1024 字节，帧恰好填满一次读取时，同一次 pty 写入里的回车留在 tty 里直到下一次按键。hc 把每个输入帧到达 holder 时各写一次 pty，但两个背靠背的帧仍可能落进同一次读取（实测 Codex 0.167.0 下 9 个边界长度仍有 4 个滞留），所以回车等 core 应答同一连接上帧之后的一次往返（`terminal.get`）再发：core 先转发输入帧、再处理后续请求。这相当于 tmux 两次客户端调用之间的那一次往返；期间写入的输入排在回车之后。
+  - 等待中本端 detach（`kill()`，终端继续运行，如 worker 随父进程退出）：回车与排在它后面的输入（如 `/stop` 已返回 true 的 C-c）在关闭 stream 之前按顺序立即写出。没有那次往返，回车可能与粘贴落进同一次读取，但仍会提交；丢掉则粘贴留在输入框里。
+  - 等待中连接断开：回车与排在它后面的输入随连接丢弃（已返回 true），之后的 detach 也不补发，由 worker 的回执与原生 history 判定是否送达。不经新连接补发：粘贴帧可能已经到达，单独补一个回车可能提交别人此后输入的草稿。
 
 **尺寸**
 - `resize` 发 RESIZE 帧，同时调整镜像，并记下这个请求（attach 时的尺寸也算一个）。
@@ -109,12 +111,14 @@ pane 脚本还要做三件事：
 
 **退出**
 - 来源有两个：core 发来的 CLOSE 帧，载荷 JSON 为 `{reason, exit_code, signal}`；或 `finished` 事件。两者归一后触发一次 sticky 的 `onExit(code, signal)`，晚到的订阅者也会收到回放。
-- 以下情况 `exitedBecauseServerReplaced()` 为 true，不消耗第二层 fresh 预算：reason 属于 `holder_lost`/`stopped_by_restart`/`server_stop`/`host_shutdown`；hc 状态丢失（终端 not_found）；不可达超时升级。
-- 同样这些情况下 `exitedBecauseServerLost()` 给出 `{backend: 'hc', kind, socketName: <core socket>}`，worker 经 `claude_exit.backendLost` 上报，daemon 的 `BackendOutageCoordinator`（#3610）把同一 core 上的全部会话折成一次故障：不计崩溃次数、一个 canary、core 应答后再分批重启、每话题一张卡片、一份 owner 汇总。kind：`holder_lost`、`stopped_by_restart`、状态丢失为 `replaced`（core 在应答）；`server_stop`、`host_shutdown` 为 `gone`；不可达超时为 `unreachable`。故障按 `backend + socket` 归并，hc core 与 tmux server 即使 socket 字符串相同也不合并；`serverUp` 走 `queryHcCoreStatus`，只连接、从不拉起 core（canary 的 spawn 才会按 control env 拉起）。tmux 的 `gone` 是从空 socket 推断的（server 最后一个会话正常退出也会留下空 socket），需要另一会话旁证；hc 的 `gone` 是 core 自己给的结束原因，core 也不会因最后一个终端结束而退出，所以不需要旁证。
+- 以下情况 `exitedBecauseServerReplaced()` 为 true，不消耗第二层 fresh 预算：reason 属于 `holder_lost`/`stopped_by_restart`/`server_stop`/`host_shutdown`；core 换了且没有这个终端（见“断线”）；不可达超时升级。
+- 同样这些情况下 `exitedBecauseServerLost()` 给出 `{backend: 'hc', kind, socketName: <core socket>}`，worker 经 `claude_exit.backendLost` 上报，daemon 的 `BackendOutageCoordinator`（#3610）把同一 core 上的全部会话折成一次故障：不计崩溃次数、一个 canary、core 应答后再分批重启、每话题一张卡片、一份 owner 汇总。kind：`holder_lost`、`stopped_by_restart`、换了的 core 没有这个终端为 `replaced`（core 在应答）；`server_stop`、`host_shutdown` 为 `gone`；不可达超时为 `unreachable`。故障按 `backend + socket` 归并，hc core 与 tmux server 即使 socket 字符串相同也不合并；`serverUp` 走 `queryHcCoreStatus`，只连接、从不拉起 core（canary 的 spawn 才会按 control env 拉起）。tmux 的 `gone` 是从空 socket 推断的（server 最后一个会话正常退出也会留下空 socket），需要另一会话旁证；hc 的 `gone` 是 core 自己给的结束原因，core 也不会因最后一个终端结束而退出，所以不需要旁证。
 
 **断线**
 - core 崩溃或 restart 时程序仍然活着。按退避重连；socket 连不上就用 control env 执行 `server start`，新 core 会 adopt holder。
-- 重连后用 `terminal.get`：终端还活着就重新 attach 并 resync；已结束就按记录触发 exit；不存在就按 serverReplaced 退出。
+- 重连后先 `server.status` 读出 core 的 pid 与 `core.id`（只有 state 被清空才重置），再用 `terminal.get`：终端还活着就重新 attach 并 resync，并记下这个 core；已结束就按记录触发 exit。
+- 不存在，或 address 已换成别的终端时，只有应答的 core 不是上次确认终端存活的那个（pid 不同，或 `core.id` 变了）才按 serverReplaced（`replaced`）退出。同一个 core 进程、同一份 state 不会丢终端，说明终端是被人移除的（如断线期间 `hc kill` + `hc rm`），按普通退出处理，不报 server 丢失。首次 attach 与 spawn 时 `server start` 报告的 pid 比较。
+- worker 新实例 reattach（spawn 时同步 `terminal.get`）遇到 not_found 没有可比较的 core，仍按 `replaced`。
 - 连续 60 秒不可达才升级，对齐 tmux 的 `SERVER_OUTAGE_ESCALATE_MS`。之后若旧终端被 adopt 回来，由孤儿回收负责 kill。
 
 **生命周期**
@@ -289,7 +293,7 @@ stream.onData((chunk, { paint, firstPaint, paintDone }) => {
 - 之后出现的 paint（积压丢弃或 `hc read` 滚动读取后的 history=0 重绘）也用 `writePaint`：它替换屏幕，但不把旧屏推进 scrollback。
 - `ScreenMirror` 的 `write`/`writePaint` 同步解析。它提供：
   - 与 TmuxPipeBackend 同形的读取方法：`captureCurrentScreen`、`captureViewport`、`viewportText`（对应 `captureViewportAsync`）、`viewportCells`（对应 `captureViewportCells`）、`captureInputState`、`capturePaneInputModes`、`size()`；
-  - `-e` 形态的行尾与 tmux 2.8–3.6a 一致：去掉被擦除的 cell 与不带属性的空格，保留带属性写入的尾部空格（反显光标、带底色的状态条）并在其后复位；
+  - `-e` 形态的行尾与 tmux 2.8–3.6a 一致。tmux（`grid_string_cells`）逐 cell 输出（擦除的 cell 输出为空格），属性变化处写 SGR，最后裁掉文本末尾的空格，所以只保留到一行最后一次属性变化为止的空白：后面还有默认 cell 的反显光标、带底色的状态条、带颜色擦除的 cell 保留并在其后复位；延伸到最后一列的带样式空白（整行底色条、最后一列的反显光标）整段去掉；
   - 模式 getter：`applicationCursorKeys`、`applicationKeypad`、`bracketedPaste`、`altScreen`；
   - `HC_MIRROR_SCROLLBACK_LINES = 3000` 行 scrollback：160 列下每会话约 10 MB（50 000 行约 140 MB）。hc 自己只留 `history_mb = 5`（约 3 600 行），attach 的首帧仍能填满它；web 端从实时输出继续增长自己的 scrollback。
 - 尺寸：

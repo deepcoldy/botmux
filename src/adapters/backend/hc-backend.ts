@@ -111,6 +111,18 @@ interface QueuedInput {
   ownWrite: boolean;
 }
 
+/** An Enter waiting for its round trip (see submitBracketedPaste), and the input queued behind it, in order. */
+interface InputBarrier {
+  held: QueuedInput;
+  queued: QueuedInput[];
+}
+
+/** A core process: its pid (server.status) and the id of its state, which only a wipe of that state resets. */
+interface HcCoreInstance {
+  pid: number;
+  id: string | null;
+}
+
 class TerminalGone extends Error {
   constructor(readonly end: HcEnd | null, readonly serverLoss: HcServerLossKind | undefined, reason: string) {
     super(reason);
@@ -279,11 +291,11 @@ export class HcBackend implements SessionBackend {
    */
   private pendingInput: QueuedInput[] | null = [];
   /**
-   * Input behind an Enter that waits to be written on its own (see
-   * submitBracketedPaste), in order; null when nothing waits. Dropped with
-   * the stream it was meant for.
+   * An Enter that waits to be written on its own (see submitBracketedPaste)
+   * and the input behind it; null when nothing waits. A detach writes it at
+   * once (flushInputBarrier); a lost connection drops it.
    */
-  private inputBarrier: QueuedInput[] | null = null;
+  private inputBarrier: InputBarrier | null = null;
   /** Sizes sent to the core that no `size` event has acknowledged yet, oldest first. */
   private requestedSizes: Array<{ cols: number; rows: number }> = [];
   /** The program's 7501 records as onData delivered them to the worker, by id. */
@@ -295,6 +307,12 @@ export class HcBackend implements SessionBackend {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectAttempt = 0;
   private unreachableSince: number | null = null;
+  /**
+   * The core that last showed the terminal live: spawn's, then each
+   * connection's that verified it. While that same process answers, it holds
+   * the same state, so it cannot have lost the terminal with its state.
+   */
+  private vouchingCore: HcCoreInstance | null = null;
 
   /** Detached (kill) or the program ended. */
   private exited = false;
@@ -327,13 +345,14 @@ export class HcBackend implements SessionBackend {
     this.cols = opts.cols;
     this.rows = opts.rows;
     const core = prepareHcSyncCore(this.target, this.env);
-    startHcCoreSync(core);
+    const started = startHcCoreSync(core);
     const record = this._isReattach
       ? this.verifyExistingTerminal(core, opts)
       : this.createTerminal(core, bin, args, opts);
     if (!record) return;
     this.address = record.address;
     this.pid = record.pid ?? null;
+    this.vouchingCore = { pid: started.pid, id: null };
     this.mirror = new ScreenMirror({ cols: this.cols, rows: this.rows });
     this.paintTarget = this.mirror;
     void this.connect();
@@ -370,7 +389,8 @@ export class HcBackend implements SessionBackend {
    * frames sent back to back can still land in one read; the Enter is sent
    * only once the core has answered a round trip after the frame (the core
    * forwards input before it serves a later request on the connection),
-   * tmux's one client round trip. Input written meanwhile queues behind it.
+   * tmux's one client round trip. Input written meanwhile queues behind it,
+   * and a detach meanwhile writes them at once (flushInputBarrier).
    */
   submitBracketedPaste(text: string): boolean {
     if (!this.input(() => bracketedPasteFrame(text))) return false;
@@ -414,10 +434,11 @@ export class HcBackend implements SessionBackend {
 
   /**
    * After onExit: how the core holding the terminal lost it, when that ended
-   * the program (see serverLossFor; a core that lost its state reads as
-   * `replaced`, one unreachable for the outage window as `unreachable`). The
-   * core's socket lets the daemon fold every session that lost the same core
-   * into ONE outage, apart from any tmux server's.
+   * the program (see serverLossFor; a restarted core, or one whose state was
+   * wiped, that no longer has the terminal reads as `replaced`, see
+   * lossUnlessVouched; one unreachable for the outage window as
+   * `unreachable`). The core's socket lets the daemon fold every session
+   * that lost the same core into ONE outage, apart from any tmux server's.
    */
   exitedBecauseServerLost(): { backend: 'hc'; kind: HcServerLossKind; socketName: string } | undefined {
     if (!this.exited || this.serverLossAtExit === undefined) return undefined;
@@ -428,6 +449,7 @@ export class HcBackend implements SessionBackend {
   kill(): void {
     if (this.exited) return;
     this.exited = true;
+    this.flushInputBarrier();
     this.teardown();
   }
 
@@ -641,14 +663,16 @@ export class HcBackend implements SessionBackend {
       if (!client.hasFeature('automatic_input')) {
         throw new Error(`hc core ${client.version} 不支持 automatic_input`);
       }
-      await this.verifyLive(client, address);
+      const core = await this.coreInstance(client);
+      await this.verifyLive(client, address, core);
       const sub = await client.subscribe({ terminal: address }, { timeoutMs: CALL_TIMEOUT_MS, heartbeatTimeoutMs: HEARTBEAT_TIMEOUT_MS });
       if (stale()) {
         client.close();
         return;
       }
       const listed = sub.snapshot.terminals.find(t => t.address === address);
-      if (!listed) throw new TerminalGone(null, 'replaced', `hc 终端 ${address} 在订阅时已不存在`);
+      // This core showed it live a moment ago: it was removed since.
+      if (!listed) throw new TerminalGone(null, undefined, `hc 终端 ${address} 在订阅时已被移除`);
       if (listed.state === 'finished') throw new TerminalGone(endOf(listed), serverLossFor(listed.reason), 'finished');
       let stream: HcStream;
       const size = { cols: this.cols, rows: this.rows };
@@ -658,7 +682,7 @@ export class HcBackend implements SessionBackend {
           { timeoutMs: CALL_TIMEOUT_MS },
         );
       } catch (err) {
-        if (isHcError(err, 'rpc') && err.kind === 'finished') await this.verifyLive(client, address);
+        if (isHcError(err, 'rpc') && err.kind === 'finished') await this.verifyLive(client, address, core);
         throw err;
       }
       if (stale()) {
@@ -714,24 +738,55 @@ export class HcBackend implements SessionBackend {
     this.emitText(`${body.split('\n').join('\r\n')}\r\n`);
   }
 
-  /** Throws TerminalGone unless `address` is still this session's live terminal. */
-  private async verifyLive(client: HcClient, address: string): Promise<void> {
+  /** The core process a connection reached. */
+  private async coreInstance(client: HcClient): Promise<HcCoreInstance> {
+    const status = await client.call<{ pid?: unknown; core?: { id?: unknown } } | null>('server.status', {}, { timeoutMs: CALL_TIMEOUT_MS });
+    if (typeof status?.pid !== 'number') throw new Error('hc server.status 的应答缺少 pid');
+    const id = status.core?.id;
+    return { pid: status.pid, id: typeof id === 'string' ? id : null };
+  }
+
+  /**
+   * Throws TerminalGone unless `address` is still this session's live
+   * terminal on `core`, the core the connection reached; records `core` as
+   * the one that vouches for it when it is.
+   */
+  private async verifyLive(client: HcClient, address: string, core: HcCoreInstance): Promise<void> {
     let record: HcTerminalRecord | null;
     try {
       record = asHcTerminalRecord(await client.call<HcTerminalRecord>('terminal.get', { terminal: address }, { timeoutMs: CALL_TIMEOUT_MS }));
     } catch (err) {
       if (isHcError(err, 'rpc') && err.kind === 'not_found') {
-        throw new TerminalGone(null, 'replaced', `hc 终端 ${address} 已不存在（core 丢失了状态）`);
+        throw new TerminalGone(null, this.lossUnlessVouched(core), `hc 终端 ${address} 已不存在`);
       }
       throw err;
     }
     if (!record) throw new Error(`hc terminal.get ${address} 返回了无法识别的记录`);
     if (record.name !== this.target.sessionName || !isHcTerminalOwnedBy(record.labels, this.sessionId)) {
-      throw new TerminalGone(null, 'replaced', `hc 终端 ${address} 已换成了别的终端（${record.name ?? '无名'}，${record.labels?.botmux_sid ?? '无会话'}）`);
+      throw new TerminalGone(
+        null,
+        this.lossUnlessVouched(core),
+        `hc 终端 ${address} 已换成了别的终端（${record.name ?? '无名'}，${record.labels?.botmux_sid ?? '无会话'}）`,
+      );
     }
     if (record.state === 'finished') {
       throw new TerminalGone(endOf(record), serverLossFor(record.reason), 'finished');
     }
+    this.vouchingCore = core;
+  }
+
+  /**
+   * A terminal gone from `core`, or an address it now gives another, means
+   * the core lost the terminal with its state only when `core` is not the
+   * process that last showed it live (a restart, a crash) or its state was
+   * wiped since: `replaced`. The same process with the same state lost
+   * nothing; somebody removed the terminal (`hc kill` and `hc rm` while this
+   * backend was reconnecting), and the program ended like any other.
+   */
+  private lossUnlessVouched(core: HcCoreInstance): HcServerLossKind | undefined {
+    const last = this.vouchingCore;
+    const sameCore = last !== null && last.pid === core.pid && (last.id === null || last.id === core.id);
+    return sameCore ? undefined : 'replaced';
   }
 
   private adopt(client: HcClient, sub: HcSubscription, stream: HcStream, attachedAt: { cols: number; rows: number }): void {
@@ -1041,7 +1096,7 @@ export class HcBackend implements SessionBackend {
   /** False only when the input provably cannot arrive: detached, ended, or the connection is down. */
   private input(encode: () => string, ownWrite = false): boolean {
     if (this.exited) return false;
-    const queue = this.pendingInput ?? this.inputBarrier;
+    const queue = this.pendingInput ?? this.inputBarrier?.queued;
     if (queue) {
       queue.push({ encode, ownWrite });
       return true;
@@ -1055,14 +1110,14 @@ export class HcBackend implements SessionBackend {
     const stream = this.stream!;
     const client = this.client;
     if (!item.ownWrite || !client) return stream.writeAutomatic(item.encode());
-    const barrier: QueuedInput[] = [];
+    const barrier: InputBarrier = { held: item, queued: [] };
     this.inputBarrier = barrier;
     const release = (): void => {
-      // A teardown or reconnect meanwhile dropped this barrier with its stream.
+      // A detach meanwhile wrote this barrier, or a lost connection dropped it.
       if (this.inputBarrier !== barrier) return;
       this.inputBarrier = null;
       stream.writeAutomatic(item.encode());
-      this.drainInput(barrier);
+      this.drainInput(barrier.queued);
     };
     client.call('terminal.get', { terminal: this.address }, { timeoutMs: OWN_WRITE_ROUND_TRIP_MS }).then(release, release);
     return true;
@@ -1072,11 +1127,32 @@ export class HcBackend implements SessionBackend {
   private drainInput(items: QueuedInput[]): void {
     for (let i = 0; i < items.length; i++) {
       if (this.inputBarrier) {
-        this.inputBarrier.push(...items.slice(i));
+        this.inputBarrier.queued.push(...items.slice(i));
         return;
       }
       if (this.exited || !this.stream) return;
       this.writeInput(items[i]!);
+    }
+  }
+
+  /**
+   * A detach leaves the program running, so input already accepted (input()
+   * said true) must still reach it: the Enter waiting for its round trip and
+   * the input queued behind it go out now, in order, ahead of the detach on
+   * the same stream. Without the round trip the Enter may share a read with
+   * the paste before it, which still submits the paste; dropping it would
+   * leave the paste in the composer and lose what queued behind (a /stop's
+   * C-c). Once the connection is gone the barrier went with it, and nothing
+   * is written anywhere: the paste may have reached the program, and an Enter
+   * sent through another connection could submit a draft typed since.
+   */
+  private flushInputBarrier(): void {
+    const barrier = this.inputBarrier;
+    const stream = this.stream;
+    this.inputBarrier = null;
+    if (!barrier || !stream) return;
+    for (const item of [barrier.held, ...barrier.queued]) {
+      if (!stream.writeAutomatic(item.encode())) return;
     }
   }
 

@@ -1,13 +1,12 @@
 /**
  * Buffer rows as tmux `capture-pane -p` prints them (no `-J`): one row per
- * line, every row terminated, wide-character padding skipped, trailing erased
- * cells and default spaces dropped. `serializeRows` is the `-e` flavour with
- * SGR colours, which like tmux (2.8 to 3.6a) keeps a trailing space written
- * with attributes, such as a reverse-video cursor cell; `plainRows` is the
- * bare text, trimmed of every trailing space.
+ * line, every row terminated, wide-character padding skipped. `plainRows` is
+ * the bare text, trimmed of every trailing space. `serializeRows` is the `-e`
+ * flavour with SGR colours, trimmed as tmux 2.8 to 3.6a trim it (see
+ * serializeRows).
  */
 
-import type { IBuffer, IBufferCell, IBufferLine } from '@xterm/headless';
+import type { IBuffer, IBufferCell } from '@xterm/headless';
 
 const COLOR_MODE_P16 = 0x1000000;
 const COLOR_MODE_P256 = 0x2000000;
@@ -45,33 +44,53 @@ interface Pen {
 const DEFAULT_PEN: Pen = { fg: 0, bg: 0, flags: 0 };
 
 /**
- * Rows [start, end) with SGR colours, each ending in `eol`. Unlike tmux the pen
- * is reset before every line ending, so replaying the text never paints a
- * coloured background into the row a scroll opens.
+ * Rows [start, end) with SGR colours, each ending in `eol`.
+ *
+ * tmux (grid_string_cells) prints every cell of the row it allocated, erased
+ * ones as spaces, with an SGR sequence before each cell whose attributes
+ * differ from the cell before it, then trims the trailing spaces of that
+ * text. So blanks, styled or not, survive up to the row's last attribute
+ * change, which the sequence after them protects: a reverse-video cursor
+ * followed by default cells is kept, one in the last column is not, and a
+ * background bar that reaches the margin goes entirely. The allocation always
+ * reaches past the last cell written or erased with a colour, or to the
+ * margin, so reading the whole row finds the same changes.
+ *
+ * Unlike tmux the pen is reset before every line ending, so replaying the
+ * text never paints a coloured background into the row a scroll opens.
  */
 export function serializeRows(buffer: IBuffer, start: number, end: number, eol = '\r\n'): string {
   const cell = buffer.getNullCell();
   let out = '';
   for (let y = start; y < end; y++) {
     const line = buffer.getLine(y);
+    /** The row up to its last non-blank cell or attribute change, and the pen at its end. */
+    let kept = '';
+    let keptPen = DEFAULT_PEN;
+    /** What follows it: an SGR sequence and blanks, kept only if a later change protects them. */
+    let pending = '';
     let pen = DEFAULT_PEN;
-    if (line) {
-      const width = contentWidth(line, cell);
-      let text = '';
-      for (let x = 0; x < width; x++) {
-        line.getCell(x, cell);
-        if (cell.getWidth() === 0) continue;
-        const next = cell.isAttributeDefault() ? DEFAULT_PEN : penOf(cell);
-        if (next.fg !== pen.fg || next.bg !== pen.bg || next.flags !== pen.flags) {
-          out += text + sgr(pen, next);
-          text = '';
-          pen = next;
-        }
-        text += cell.getChars() || ' ';
+    for (let x = 0; line && x < line.length; x++) {
+      line.getCell(x, cell);
+      if (cell.getWidth() === 0) continue;
+      const next = cell.isAttributeDefault() ? DEFAULT_PEN : penOf(cell);
+      if (!samePen(next, pen)) {
+        kept += pending;
+        keptPen = pen;
+        pending = sgr(pen, next);
+        pen = next;
       }
-      out += text;
+      const chars = cell.getChars();
+      if (chars === '' || chars === ' ') {
+        pending += ' ';
+      } else {
+        kept += pending + chars;
+        keptPen = pen;
+        pending = '';
+      }
     }
-    if (pen.fg !== 0 || pen.bg !== 0 || pen.flags !== 0) out += '\x1b[0m';
+    out += kept;
+    if (!samePen(keptPen, DEFAULT_PEN)) out += '\x1b[0m';
     out += eol;
   }
   return out;
@@ -94,15 +113,8 @@ function trimTrailingSpaces(s: string): string {
   return end === s.length ? s : s.slice(0, end);
 }
 
-/** Cells up to and including the last one that is neither erased nor a space without attributes. */
-function contentWidth(line: IBufferLine, cell: IBufferCell): number {
-  for (let x = line.length - 1; x >= 0; x--) {
-    line.getCell(x, cell);
-    if (cell.getWidth() === 0) return x + 1;
-    const chars = cell.getChars();
-    if (chars !== '' && (chars !== ' ' || !cell.isAttributeDefault())) return x + 1;
-  }
-  return 0;
+function samePen(a: Pen, b: Pen): boolean {
+  return a === b || (a.fg === b.fg && a.bg === b.bg && a.flags === b.flags);
 }
 
 function penOf(cell: IBufferCell): Pen {

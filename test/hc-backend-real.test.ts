@@ -8,7 +8,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HcClient } from '../src/adapters/backend/hc/client.js';
@@ -74,6 +74,27 @@ function hex(text: string): string {
   return Buffer.from(text, 'latin1').toString('hex');
 }
 
+/** Every input the program echoed in `text` (a capture), in order. */
+function echoedIn(text: string): string {
+  return [...text.matchAll(/HEX:([0-9a-f]+)/g)].map(m => m[1]).join('');
+}
+
+/** Blocks (no timer runs meanwhile) until `pid` has exited. */
+function waitGoneSync(pid: number, timeoutMs = 10_000): void {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    let state: string | undefined;
+    try {
+      state = readFileSync(`/proc/${pid}/stat`, 'utf8').replace(/^.*\) /s, '')[0];
+    } catch {
+      return;
+    }
+    if (state === 'Z') return;
+    if (Date.now() > deadline) throw new Error(`pid ${pid} did not exit`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
+
 async function until(check: () => void, timeout = 15_000): Promise<void> {
   await vi.waitFor(check, { timeout, interval: 50 });
 }
@@ -122,6 +143,24 @@ describe.skipIf(!realHc)('HcBackend against the real binary', () => {
       timeout: 20_000,
     });
     return { status: result.status, stdout: result.stdout, stderr: result.stderr };
+  }
+
+  function coreStatus(): { pid: number; core: { id: string } } {
+    const status = hc(['--json', 'server', 'status']);
+    expect(status.status, status.stderr).toBe(0);
+    return JSON.parse(status.stdout);
+  }
+
+  /** The connections backends open from here on, as they open them. */
+  function recordConnections(): { connections: HcClient[]; restore: () => void } {
+    const connect = HcClient.connect.bind(HcClient);
+    const connections: HcClient[] = [];
+    const spy = vi.spyOn(HcClient, 'connect').mockImplementation(async (...args) => {
+      const client = await connect(...args);
+      connections.push(client);
+      return client;
+    });
+    return { connections, restore: () => spy.mockRestore() };
   }
 
   function getTerminal(name: string): Record<string, unknown> | null {
@@ -318,6 +357,18 @@ describe.skipIf(!realHc)('HcBackend against the real binary', () => {
     await typed(again, hex('cd'), () => again.backend.write('cd'));
   }, 60_000);
 
+  it('hands the program the Enter of a submitted paste, and the keys queued behind it, when the worker detaches meanwhile', async () => {
+    const { sid, target, session } = await started();
+    expect(session.backend.submitBracketedPaste('hello')).toBe(true);
+    expect(session.backend.sendSpecialKeys('C-c')).toBe(true);
+    // The worker's parent-exit shutdown detaches while the Enter waits for its round trip.
+    await Promise.resolve();
+    session.backend.kill();
+    expect(session.exits).toEqual([]);
+    const again = open(sid, target, true);
+    await until(() => expect(echoedIn(again.backend.captureCurrentScreen())).toBe(hex('\x1b[200~hello\x1b[201~\r\x03')));
+  }, 60_000);
+
   it("refuses to reattach to a terminal of another session, leaving it running", async () => {
     const { sid, target } = newTarget();
     const run = hc([
@@ -370,6 +421,42 @@ describe.skipIf(!realHc)('HcBackend against the real binary', () => {
     await until(() => expect(session.resyncs).toHaveLength(1), 30_000);
     await typed(session, hex('ab'), () => session.backend.write('ab'));
     expect(session.output().match(/\x1b\]7501;/g)).toHaveLength(1);
+  }, 60_000);
+
+  it('ends as an ordinary exit when someone removes the terminal while the backend reconnects to the same core', async () => {
+    const { connections, restore } = recordConnections();
+    try {
+      const { target, session } = await started();
+      const before = coreStatus();
+      // The backend's connection drops (as its event-stream watchdog drops a
+      // stalled one) while the core runs on; the reconnect is a timer, so it
+      // waits for these synchronous calls.
+      connections[0]!.close();
+      expect(hc(['--json', 'kill', target.sessionName]).status).toBe(0);
+      expect(hc(['--json', 'rm', target.sessionName]).status).toBe(0);
+      await until(() => expect(session.exits).toEqual([[1, null]]));
+      expect(coreStatus()).toMatchObject({ pid: before.pid, core: { id: before.core.id } });
+      expect(session.backend.exitedBecauseServerLost()).toBeUndefined();
+      expect(session.backend.exitedBecauseServerReplaced()).toBe(false);
+    } finally {
+      restore();
+    }
+  }, 60_000);
+
+  it('counts a core that came back without the terminal, its state wiped, as having replaced it', async () => {
+    const { session } = await started();
+    const before = coreStatus();
+    const state = join(hcCorePaths(env, { core }).stateHome, 'herdr-core', core.hcSession);
+    expect(existsSync(join(state, 'core.json'))).toBe(true);
+    // Synchronously, so the backend's reconnect cannot start the next core first.
+    process.kill(before.pid, 'SIGKILL');
+    waitGoneSync(before.pid);
+    rmSync(state, { recursive: true, force: true });
+    await until(() => expect(session.exits).toEqual([[1, null]]), 30_000);
+    const after = coreStatus();
+    expect(after.pid).not.toBe(before.pid);
+    expect(after.core.id).not.toBe(before.core.id);
+    expect(session.backend.exitedBecauseServerLost()).toEqual({ backend: 'hc', kind: 'replaced', socketName: core.socket });
   }, 60_000);
 
   it('adopts the terminal a run without a reply created, starting its program once', () => {

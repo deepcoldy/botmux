@@ -39,6 +39,8 @@ vi.mock('../src/adapters/backend/hc/cli-ops.js', async importOriginal => ({
 const SID = '0123abcd-0000-4000-8000-000000000001';
 const OTHER_SID = '9999ffff-0000-4000-8000-000000000002';
 const TARGET = { backendType: 'hc' as const, sessionName: 'bmx-0123abcd', hcSession: 'botmux', socket: '/tmp/fake-hc/herdr-core/botmux.sock' };
+/** The core spawn's `server start` reached (the startHcCoreSync mock's pid). */
+const CORE = { pid: 1, id: 'core-1' };
 const PAINT_HEAD = '\x18\x1b[!p\x1b[?2026l';
 const LIVE: HcChunkInfo = { paint: false, firstPaint: false, paintDone: false };
 const FIRST_PAINT_DONE: HcChunkInfo = { paint: true, firstPaint: true, paintDone: true };
@@ -109,11 +111,15 @@ class FakeClient {
   gate: Promise<void> | null = null;
   stream: FakeStream | null = null;
   sub: FakeSub | null = null;
+  /** What the subscribe snapshot lists; default: the terminal `terminal.get` answers. */
+  listed: HcTerminalRecord[] | null = null;
   private disconnectCb: ((info: { error: HcError }) => void) | null = null;
-  constructor(public terminal: HcTerminalRecord | null = record()) {}
+  /** `core`: the core process this connection reaches (server.status); spawn's `server start` reports pid 1. */
+  constructor(public terminal: HcTerminalRecord | null = record(), readonly core: { pid: number; id: string } = CORE) {}
   hasFeature(name: string): boolean { return name === 'automatic_input'; }
   async call(method: string, params: Record<string, unknown>): Promise<unknown> {
     this.calls.push({ method, params });
+    if (method === 'server.status') return { version: '0.1.19', pid: this.core.pid, core: { id: this.core.id, name: 'host' } };
     if (method === 'terminal.get') {
       if (this.gate) await this.gate;
       if (!this.terminal) throw new HcError('rpc', 'no such terminal', { kind: 'not_found' });
@@ -124,7 +130,7 @@ class FakeClient {
   }
   async subscribe(params: Record<string, unknown>): Promise<FakeSub> {
     this.subscribeParams = params;
-    this.sub = new FakeSub({ seq: 0, terminals: this.terminal ? [this.terminal] : [] });
+    this.sub = new FakeSub({ seq: 0, terminals: this.listed ?? (this.terminal ? [this.terminal] : []) });
     return this.sub;
   }
   async attach(params: Record<string, unknown>): Promise<FakeStream> {
@@ -634,6 +640,27 @@ describe('input', () => {
     backend.kill();
   });
 
+  it('writes the waiting Enter, and the input queued behind it, before a detach closes the stream', async () => {
+    const client = queueClient();
+    const backend = backendFor({ sessionId: SID });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    const stream = await attached(client);
+    stream.paint('');
+    let answer!: () => void;
+    client.gate = new Promise(resolve => { answer = resolve; });
+    expect(backend.submitBracketedPaste('hi')).toBe(true);
+    expect(backend.sendSpecialKeys('C-c')).toBe(true);
+    await Promise.resolve();
+    expect(stream.written).toEqual(['\x1b[200~hi\x1b[201~']);
+    // The worker's parent-exit shutdown: the terminal keeps running.
+    backend.kill();
+    expect(stream.closed).toBe(true);
+    expect(stream.written).toEqual(['\x1b[200~hi\x1b[201~', '\r', '\x03']);
+    answer();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(stream.written).toEqual(['\x1b[200~hi\x1b[201~', '\r', '\x03']);
+  });
+
   it('still writes the Enter when the round trip fails, and drops it with the connection', async () => {
     const client = queueClient();
     const backend = backendFor({ sessionId: SID });
@@ -660,7 +687,9 @@ describe('input', () => {
     stderr.mockRestore();
     expect(stream.written).toEqual(['\x1b[200~x\x1b[201~', '\r', '\x1b[200~y\x1b[201~']);
     expect(reattached.written).toEqual([]);
+    // Nor does a detach send it through the new connection.
     backend.kill();
+    expect(reattached.written).toEqual([]);
   });
 
   it('says false when the input provably did not arrive', async () => {
@@ -727,11 +756,11 @@ describe('a program that ends before the first attach', () => {
 
   it('still reports the exit when the output cannot be read', async () => {
     const client = queueClient(new FakeClient(record(FINISHED)));
+    const answer = client.call.bind(client);
     client.call = async (method: string, params: Record<string, unknown>) => {
+      if (method !== 'terminal.read') return answer(method, params);
       client.calls.push({ method, params });
-      if (method === 'terminal.read') throw new HcError('rpc', 'gone', { kind: 'not_found' });
-      if (method === 'terminal.get') return client.terminal;
-      return {};
+      throw new HcError('rpc', 'gone', { kind: 'not_found' });
     };
     const backend = backendFor({ sessionId: SID });
     const data: string[] = [];
@@ -876,7 +905,7 @@ describe('reconnect', () => {
     expect(backend.captureCurrentScreen()).toBe('');
     expect(backend.isPaneAlive()).toBe(true);
     const stream = await attached(second);
-    expect(second.methods()).toEqual(['terminal.get']);
+    expect(second.methods()).toEqual(['server.status', 'terminal.get']);
     stream.paint('after restart', '\x1b]7501;state=idle\x1b\\');
     expect(resync).toHaveBeenCalledTimes(1);
     expect(resync.mock.calls[0]![0]).toContain('after restart');
@@ -930,32 +959,59 @@ describe('reconnect', () => {
     backend.kill();
   });
 
-  it('ends as replaced, touching nothing, when the name now holds another session', async () => {
-    const first = queueClient();
+  describe.each([
+    ['no longer has the terminal', null],
+    ['gives its address to another session', record({ labels: { botmux: '1', botmux_sid: OTHER_SID } })],
+  ] as const)('a reconnect to a core that %s', (_what, found) => {
+    it.each([
+      ['a restarted core (another pid)', { pid: 2, id: CORE.id }, 'replaced'],
+      ['a core whose state was wiped (another state id)', { pid: CORE.pid, id: 'core-2' }, 'replaced'],
+      ['the core that showed the terminal live (someone removed it)', CORE, undefined],
+    ] as const)('ends, touching nothing, as lost with its core only for %s', async (_core, core, kind) => {
+      const first = queueClient();
+      const backend = backendFor({ sessionId: SID });
+      const exit = vi.fn();
+      backend.onExit(exit);
+      backend.spawn('/usr/bin/claude', [], spawnOpts());
+      await attached(first);
+      const second = queueClient(new FakeClient(found, core));
+      first.drop();
+      await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1, null));
+      expect(backend.exitedBecauseServerReplaced()).toBe(kind !== undefined);
+      expect(backend.exitedBecauseServerLost()).toEqual(kind && { backend: 'hc', kind, socketName: TARGET.socket });
+      expect(second.methods()).toEqual(['server.status', 'terminal.get']);
+      expect(second.attachParams).toBeNull();
+      expect(second.closed).toBe(true);
+    });
+  });
+
+  it('compares a first attach with the core spawn reached', async () => {
+    const client = queueClient(new FakeClient(null, { pid: 2, id: 'core-2' }));
+    const backend = backendFor({ sessionId: SID });
+    backend.spawn('/usr/bin/claude', [], spawnOpts());
+    await vi.waitFor(() => expect(backend.exitedBecauseServerLost()).toEqual({ backend: 'hc', kind: 'replaced', socketName: TARGET.socket }));
+    expect(client.attachParams).toBeNull();
+
+    queueClient(new FakeClient(null, CORE));
+    const same = backendFor({ sessionId: SID });
+    const exit = vi.fn();
+    same.onExit(exit);
+    same.spawn('/usr/bin/claude', [], spawnOpts());
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1, null));
+    expect(same.exitedBecauseServerLost()).toBeUndefined();
+  });
+
+  it('ends as an ordinary exit when the terminal goes between its check and the subscription', async () => {
+    const client = new FakeClient();
+    client.listed = [];
+    queueClient(client);
     const backend = backendFor({ sessionId: SID });
     const exit = vi.fn();
     backend.onExit(exit);
     backend.spawn('/usr/bin/claude', [], spawnOpts());
-    await attached(first);
-    const second = queueClient(new FakeClient(record({ labels: { botmux: '1', botmux_sid: OTHER_SID } })));
-    first.drop();
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1, null));
-    expect(backend.exitedBecauseServerReplaced()).toBe(true);
-    expect(backend.exitedBecauseServerLost()).toEqual({ backend: 'hc', kind: 'replaced', socketName: TARGET.socket });
-    expect(second.methods()).toEqual(['terminal.get']);
-    expect(second.attachParams).toBeNull();
-    expect(second.closed).toBe(true);
-  });
-
-  it('ends as replaced when the core lost the terminal', async () => {
-    const first = queueClient();
-    const backend = backendFor({ sessionId: SID });
-    backend.spawn('/usr/bin/claude', [], spawnOpts());
-    await attached(first);
-    queueClient(new FakeClient(null));
-    first.drop();
-    await vi.waitFor(() => expect(backend.exitedBecauseServerReplaced()).toBe(true));
-    expect(backend.exitedBecauseServerLost()).toEqual({ backend: 'hc', kind: 'replaced', socketName: TARGET.socket });
+    expect(backend.exitedBecauseServerLost()).toBeUndefined();
+    expect(client.attachParams).toBeNull();
   });
 
   it('gives up after the core stays unreachable for the outage window', async () => {

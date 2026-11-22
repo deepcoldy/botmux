@@ -74,16 +74,24 @@ describe('serializeRows format', () => {
     expect(serializeRows(term.buffer.active, 0, 2, '\n')).toBe('x\n\n');
   });
 
-  // tmux 2.8 to 3.6a alike: `capture-pane -e` resets after a trailing run of
-  // spaces written with attributes (a reverse-video cursor, a coloured bar)
-  // instead of trimming it; default spaces and erased cells are trimmed.
-  it('drops trailing default spaces and erased cells, keeps trailing spaces written with attributes, and inner ones', async () => {
+  // tmux 2.8 to 3.6a alike: `capture-pane -e` trims the spaces after a row's
+  // last attribute change, so blanks before a change are kept (a reverse-video
+  // cursor, a coloured bar, cells erased with a colour) and blanks that reach
+  // the margin without one are not.
+  it('keeps blanks up to the last attribute change of a row and drops the rest', async () => {
     expect(await rowsOf('ab   \x1b[44m   \x1b[0m')).toBe('ab   \x1b[44m   \x1b[0m\r\n\r\n\r\n');
     expect(await rowsOf('> \x1b[7m \x1b[0m')).toBe('> \x1b[7m \x1b[0m\r\n\r\n\r\n');
+    expect(await rowsOf('ab\x1b[41m\x1b[3X\x1b[0m')).toBe('ab\x1b[41m   \x1b[0m\r\n\r\n\r\n');
     expect(await rowsOf('ab   ')).toBe('ab\r\n\r\n\r\n');
     expect(await rowsOf('ab\x1b[44m\x1b[K\x1b[0m')).toBe('ab\r\n\r\n\r\n');
     expect(await rowsOf('a   b')).toBe('a   b\r\n\r\n\r\n');
     expect(await rowsOf('a\x1b[5Cb')).toBe('a     b\r\n\r\n\r\n');
+  });
+
+  it('drops styled blanks that reach the last column', async () => {
+    expect(await rowsOf(`\x1b[44m${' '.repeat(20)}\x1b[0m`)).toBe('\r\n\r\n\r\n');
+    expect(await rowsOf(`\x1b[44m${' '.repeat(19)}\x1b[7m \x1b[0m`)).toBe(`\x1b[44m${' '.repeat(19)}\x1b[0m\r\n\r\n\r\n`);
+    expect(await rowsOf(`${'t'.repeat(19)}\x1b[7m \x1b[0m`)).toBe(`${'t'.repeat(19)}\r\n\r\n\r\n`);
   });
 
   it('writes a wide character once, without its padding cell', async () => {

@@ -44,6 +44,16 @@ const FIXTURES: Array<[string, string]> = [
     '\x1b[2m中文提示\x1b[0m 宽\x1b[7m字\x1b[0m',
     '\x1b[44m status bar   \x1b[0m',
   ].join('\r\n')],
+  // tmux trims the spaces after the last attribute change of a row: styled
+  // blanks that reach the margin have no change after them.
+  ['styled blanks reaching the last column', [
+    `\x1b[48;5;236m${' '.repeat(COLS)}\x1b[0m`,
+    `\x1b[48;5;236m${' '.repeat(COLS - 1)}\x1b[7m \x1b[0m`,
+    `${'t'.repeat(COLS - 1)}\x1b[7m \x1b[0m`,
+    `abc\x1b[${COLS}G\x1b[7m \x1b[0m`,
+    'end',
+  ].join('\r\n')],
+  ['cells erased with a colour inside a row', `abc\x1b[41m\x1b[5X\x1b[0m\r\n\x1b[44m\x1b[2K\x1b[3Cx\x1b[0m\r\nend`],
 ];
 
 const stripSgr = (s: string): string => s.replace(/\x1b\[[0-9;:]*m/g, '');
