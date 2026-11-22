@@ -12,7 +12,9 @@ import { readMaterializedPlugin } from '../materializer.js';
 import { readGlobalConfig } from '../../../global-config.js';
 import {
   MCP_GATEWAY_FORWARDED_ENV_KEYS,
+  MCP_GATEWAY_INSTALL_ENTRY_ENV,
   MCP_GATEWAY_OWNER_ENV,
+  MCP_GATEWAY_REQUIRED_ENV,
 } from './environment.js';
 import { effectiveMcpGatewayMaxToolTimeoutMs } from './runtime-options.js';
 
@@ -270,13 +272,24 @@ function ensureCodexEntry(path: string, entry: GatewayEntry): boolean {
   return true;
 }
 
-function parseJsonConfig(path: string, allowEmpty = false): Record<string, unknown> {
-  if (!existsSync(path)) return {};
-  const raw = readFileSync(path, 'utf-8').replace(/^\uFEFF/, '');
-  if (allowEmpty && raw.trim() === '') return {};
-  const parsed = JSON.parse(raw);
+interface JsonConfigSnapshot {
+  data: Record<string, unknown>;
+  /** Undefined means the file did not exist when this snapshot was read. */
+  raw: string | undefined;
+}
+
+function readJsonConfigSnapshot(path: string, allowEmpty = false): JsonConfigSnapshot {
+  if (!existsSync(path)) return { data: {}, raw: undefined };
+  const raw = readFileSync(path, 'utf-8');
+  const text = raw.replace(/^\uFEFF/, '');
+  if (allowEmpty && text.trim() === '') return { data: {}, raw };
+  const parsed = JSON.parse(text);
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid_cli_mcp_json_config');
-  return parsed as Record<string, unknown>;
+  return { data: parsed as Record<string, unknown>, raw };
+}
+
+function parseJsonConfig(path: string, allowEmpty = false): Record<string, unknown> {
+  return readJsonConfigSnapshot(path, allowEmpty).data;
 }
 
 function gatewayJsonValue(entry: GatewayEntry): Record<string, unknown> {
@@ -322,21 +335,40 @@ function ensureClaudeEntry(path: string, entry: GatewayEntry): boolean {
   return true;
 }
 
+function antigravityServers(data: Record<string, unknown>): Record<string, unknown> {
+  if (data.mcpServers !== undefined && (!data.mcpServers || typeof data.mcpServers !== 'object' || Array.isArray(data.mcpServers))) {
+    throw new Error('invalid_cli_mcp_json_config');
+  }
+  return (data.mcpServers as Record<string, unknown> | undefined) ?? {};
+}
+
 function ensureAntigravityEntry(path: string, entry: GatewayEntry): boolean {
   // agy's initial migration creates a 0-byte `~/.gemini/config/mcp_config.json`
   // that `agy mcp list/add` itself treats as empty `{}`; accept whitespace-only
   // files while still rejecting malformed non-empty JSON or non-object servers.
-  const data = parseJsonConfig(path, true);
-  if (data.mcpServers !== undefined && (!data.mcpServers || typeof data.mcpServers !== 'object' || Array.isArray(data.mcpServers))) {
-    throw new Error('invalid_cli_mcp_json_config');
-  }
-  const servers = (data.mcpServers as Record<string, unknown> | undefined) ?? {};
   const desired = antigravityGatewayJsonValue(entry);
-  if (isDeepStrictEqual(servers.botmux, desired)) return false;
-  data.mcpServers = { ...servers, botmux: desired };
-  mkdirSync(dirname(path), { recursive: true });
-  atomicWriteFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-  return true;
+  // agy rewrites the whole file too and does not participate in Botmux's lock.
+  // Discard a stale merge when the pre-rename read observes an external write;
+  // after bounded conflicts, warn without overwriting the user's latest file.
+  // This is BEST-EFFORT, not no-clobber CAS: an agy rename landing after the
+  // final comparison can still be replaced (concurrent agy writers race the
+  // same way). A strict guarantee requires a shared writer/locking protocol.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const before = readJsonConfigSnapshot(path, true);
+    const servers = antigravityServers(before.data);
+    if (isDeepStrictEqual(servers.botmux, desired)) return false;
+    const next = {
+      ...before.data,
+      mcpServers: { ...servers, botmux: desired },
+    };
+    const beforeWrite = readJsonConfigSnapshot(path, true);
+    antigravityServers(beforeWrite.data);
+    if (beforeWrite.raw !== before.raw) continue;
+    mkdirSync(dirname(path), { recursive: true });
+    atomicWriteFileSync(path, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 });
+    return true;
+  }
+  throw new Error('cli_mcp_json_config_changed');
 }
 
 function isOwnedJsonEntry(value: unknown): boolean {
@@ -411,11 +443,8 @@ export function inspectGatewayEntry(
       }
       case 'antigravity-json': {
         const data = parseJsonConfig(path, true);
-        if (data.mcpServers !== undefined && (!data.mcpServers || typeof data.mcpServers !== 'object' || Array.isArray(data.mcpServers))) {
-          throw new Error('invalid_cli_mcp_json_config');
-        }
-        const servers = data.mcpServers as Record<string, unknown> | undefined;
-        configured = !!servers && isOwnedAntigravityEntry(servers.botmux);
+        const servers = antigravityServers(data);
+        configured = isOwnedAntigravityEntry(servers.botmux);
         break;
       }
       default: {
@@ -439,6 +468,51 @@ function canonicalOrResolved(path: string): string {
   try { return realpathSync(resolved); } catch { return resolved; }
 }
 
+export function shouldEnsureAntigravityGatewayOnSpawn(input: {
+  transport: 'terminal' | 'acp' | undefined;
+  willReattachPersistent: boolean;
+  runtimeEntryCount: number | undefined;
+}): boolean {
+  // A terminal agy survives a warm reattach and keeps its already-read config.
+  // An ACP runner instead spawns a fresh agy for every turn, which reads it again.
+  return (input.runtimeEntryCount ?? 0) > 0
+    && (!input.willReattachPersistent || input.transport === 'acp');
+}
+
+function frozenAcpGatewayEntry(env: NodeJS.ProcessEnv): GatewayEntry {
+  try {
+    const raw = env[MCP_GATEWAY_INSTALL_ENTRY_ENV];
+    if (!raw) return defaultGatewayEntry();
+    const parsed = JSON.parse(raw) as Partial<GatewayEntry>;
+    if (typeof parsed.command !== 'string' || !parsed.command
+      || !Array.isArray(parsed.args) || !parsed.args.every(arg => typeof arg === 'string')) {
+      return defaultGatewayEntry();
+    }
+    return {
+      command: parsed.command,
+      args: [...parsed.args],
+      maxToolTimeoutMs: effectiveMcpGatewayMaxToolTimeoutMs(parsed.maxToolTimeoutMs),
+    };
+  } catch {
+    return defaultGatewayEntry();
+  }
+}
+
+export function ensureAntigravityGatewayForAcpTurn(
+  adapter: Pick<CliAdapter, 'id' | 'mcpGateway'>,
+  effectiveHome: string | undefined,
+  env: NodeJS.ProcessEnv,
+  entry?: GatewayEntry,
+): GatewayEntryReport | undefined {
+  // REQUIRED is worker-injected only while this session has a live MCP host.
+  // Do not refresh the runner's frozen manifest/catalog, and do not touch a
+  // standalone ACP runner's config when this session has no plugin MCP entries.
+  if (env[MCP_GATEWAY_REQUIRED_ENV] !== '1') return undefined;
+  const desiredEntry = entry ?? frozenAcpGatewayEntry(env);
+  return ensureEffectiveHomeGatewayEntry(adapter, effectiveHome, desiredEntry)
+    ?? ensureGatewayEntry(adapter, desiredEntry);
+}
+
 /**
  * When a bot overrides `HOME` via per-bot env, CLIs whose global MCP config
  * lives under `$HOME` (`antigravity-json`) read `<effectiveHome>/...` instead
@@ -451,18 +525,17 @@ export function ensureEffectiveHomeGatewayEntry(
   entry: GatewayEntry = defaultGatewayEntry(),
 ): GatewayEntryReport | undefined {
   const spec = adapter.mcpGateway;
-  const trimmedHome = effectiveHome?.trim();
   if (
     !spec
     || spec.format !== 'antigravity-json'
-    || !trimmedHome
-    || !isAbsolute(trimmedHome)
+    || !effectiveHome?.trim()
+    || !isAbsolute(effectiveHome)
     || !spec.configPath.startsWith('~')
   ) {
     return undefined;
   }
-  if (canonicalOrResolved(trimmedHome) === canonicalOrResolved(homedir())) return undefined;
-  const relocatedPath = join(trimmedHome, spec.configPath.slice(1));
+  if (canonicalOrResolved(effectiveHome) === canonicalOrResolved(homedir())) return undefined;
+  const relocatedPath = join(effectiveHome, spec.configPath.slice(1));
   try {
     mkdirSync(dirname(relocatedPath), { recursive: true });
     return withFileLockSync(relocatedPath, () => ensureGatewayEntry(

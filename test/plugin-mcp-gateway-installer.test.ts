@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { realpathSync } from 'node:fs';
@@ -9,12 +9,16 @@ import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createAntigravityAcpAdapter } from '../src/adapters/cli/antigravity-acp.js';
 import {
   ensureEffectiveHomeGatewayEntry,
+  ensureAntigravityGatewayForAcpTurn,
   ensureGatewayEntry,
   inspectGatewayEntry,
+  shouldEnsureAntigravityGatewayOnSpawn,
 } from '../src/core/plugins/mcp/gateway-installer.js';
 import {
   MCP_GATEWAY_FORWARDED_ENV_KEYS,
+  MCP_GATEWAY_INSTALL_ENTRY_ENV,
   MCP_GATEWAY_OWNER_ENV,
+  MCP_GATEWAY_REQUIRED_ENV,
 } from '../src/core/plugins/mcp/environment.js';
 
 describe('plugin MCP Gateway installer', () => {
@@ -478,12 +482,67 @@ describe('plugin MCP Gateway installer', () => {
     }
 
     const perBotHome = join(home, 'bots', 'bot-a-home');
-    const relocatedReport = ensureEffectiveHomeGatewayEntry(terminal, `  ${perBotHome}  `);
+    const relocatedReport = ensureEffectiveHomeGatewayEntry(terminal, perBotHome);
     expect(relocatedReport?.state).toBe('installed');
     const relocatedConfig = join(perBotHome, '.gemini', 'config', 'mcp_config.json');
     expect(relocatedReport?.configPath).toBe(relocatedConfig);
     expect(JSON.parse(readFileSync(relocatedConfig, 'utf8')).mcpServers.botmux.command).toBe(process.env.BOTMUX_BIN_PATH);
     expect(ensureEffectiveHomeGatewayEntry(terminal, perBotHome)?.state).toBe('unchanged');
+  });
+
+  it('uses the literal absolute HOME including trailing whitespace for relocated config', () => {
+    const terminal = createAntigravityAdapter('/bin/agy');
+    const literalHome = `${join(home, 'bots', 'bot-a-home')}  `;
+    const report = ensureEffectiveHomeGatewayEntry(terminal, literalHome);
+    const literalConfig = join(literalHome, '.gemini', 'config', 'mcp_config.json');
+    const trimmedConfig = join(literalHome.trim(), '.gemini', 'config', 'mcp_config.json');
+
+    expect(report?.state).toBe('installed');
+    expect(report?.configPath).toBe(literalConfig);
+    expect(JSON.parse(readFileSync(literalConfig, 'utf8')).mcpServers.botmux.command).toBe(process.env.BOTMUX_BIN_PATH);
+    expect(existsSync(trimmedConfig)).toBe(false);
+  });
+
+  it.each([
+    { transport: 'terminal', willReattachPersistent: false, runtimeEntryCount: 1, expected: true },
+    { transport: 'acp', willReattachPersistent: false, runtimeEntryCount: 1, expected: true },
+    { transport: 'terminal', willReattachPersistent: true, runtimeEntryCount: 1, expected: false },
+    { transport: 'acp', willReattachPersistent: true, runtimeEntryCount: 1, expected: true },
+    { transport: 'acp', willReattachPersistent: true, runtimeEntryCount: 0, expected: false },
+    { transport: 'acp', willReattachPersistent: false, runtimeEntryCount: undefined, expected: false },
+  ] as const)('ensures Antigravity config for transport=$transport reattach=$willReattachPersistent entries=$runtimeEntryCount', ({ expected, ...input }) => {
+    expect(shouldEnsureAntigravityGatewayOnSpawn(input)).toBe(expected);
+  });
+
+  it('repairs default-HOME config before each plugin-enabled ACP turn only', () => {
+    const terminal = createAntigravityAdapter('/bin/agy');
+    const path = join(home, '.gemini', 'config', 'mcp_config.json');
+    const entry = { command: '/bin/botmux', args: ['mcp', 'serve'], maxToolTimeoutMs: 600_000 };
+    expect(ensureAntigravityGatewayForAcpTurn(terminal, home, {}, entry)).toBeUndefined();
+    expect(existsSync(path)).toBe(false);
+
+    const enabledEnv = { [MCP_GATEWAY_REQUIRED_ENV]: '1' };
+    expect(ensureAntigravityGatewayForAcpTurn(terminal, home, enabledEnv, entry)?.state).toBe('installed');
+    const disabled = JSON.parse(readFileSync(path, 'utf8'));
+    disabled.mcpServers.botmux.disabled = true;
+    writeFileSync(path, JSON.stringify(disabled));
+    expect(ensureAntigravityGatewayForAcpTurn(terminal, home, enabledEnv, entry)?.state).toBe('installed');
+    expect(JSON.parse(readFileSync(path, 'utf8')).mcpServers.botmux.disabled).toBe(false);
+  });
+
+  it('uses the spawn-frozen gateway entry when an ACP runner cannot read global config', () => {
+    const terminal = createAntigravityAdapter('/bin/agy');
+    const path = join(home, '.gemini', 'config', 'mcp_config.json');
+    const env = {
+      [MCP_GATEWAY_REQUIRED_ENV]: '1',
+      [MCP_GATEWAY_INSTALL_ENTRY_ENV]: JSON.stringify({
+        command: '/bin/frozen-botmux', args: ['mcp', 'serve'], maxToolTimeoutMs: 900_001,
+      }),
+    };
+    expect(ensureAntigravityGatewayForAcpTurn(terminal, home, env)?.state).toBe('installed');
+    const installed = JSON.parse(readFileSync(path, 'utf8')).mcpServers.botmux;
+    expect(installed.command).toBe('/bin/frozen-botmux');
+    expect(installed.timeoutSeconds).toBe(901);
   });
 
 });
