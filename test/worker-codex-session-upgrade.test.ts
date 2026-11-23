@@ -46,6 +46,11 @@ function harness() {
   const delivered: unknown[] = [];
   const state: Record<string, any> = {
     config: { autoUpgradeCodexSessions: true },
+    // `settleRestartAttemptOnReady` reads the session-contract scope to decide
+    // whether the readiness riding its receipt needs re-scoping. These cases
+    // exercise legacy IPC, so the identifier must exist and be unset — `with`
+    // throws ReferenceError on a name the scope object does not carry at all.
+    workerSessionEventScope: undefined,
     isCodexAppCliId,
     lastInitConfig: {
       cliId: 'codex', cliSessionId: threadId, sessionId: 'botmux-session',

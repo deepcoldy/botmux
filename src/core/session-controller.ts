@@ -214,15 +214,23 @@ export class SessionController {
     // worker generation RE-ATTACHES that same CLI without respawning it, so its
     // hooks still name the launcher binding of the generation that spawned it —
     // and continuations are recorded per generation, so the branch above (which
-    // walks them as the live worker) finds nothing. Walk them as the generation
-    // that produced the binding instead, and admit only when the live worker
-    // owns the very runtime that chain ends at. Without this a re-attached CLI
-    // lost every SessionStart signal, including `source=compact`, where before
-    // runtime bindings reached the pane it had none to be judged by and the
-    // unbound path adopted it (2026-11-23 review of #3734).
-    if (current && owner && sameWorker(current.worker, owner) && !sameWorker(source.worker, owner)
-      && this.store.runtimeContinues(this.ref, source.ref, current.ref, source.worker)) {
-      return { version: 2, runtime: current.ref };
+    // walks them as the live worker) finds nothing. Without this a re-attached
+    // CLI lost every SessionStart signal, including `source=compact`, where
+    // before runtime bindings reached the pane it had none to be judged by and
+    // the unbound path adopted it (2026-11-23 review of #3734).
+    //
+    // The chain can also be SPLIT across generations: `/clear` keeps the pid and
+    // rotates the native session id, so its hop is recorded by the live worker
+    // while the launcher hop belongs to the generation that spawned the CLI.
+    // Walking either side alone stops at the handoff, so splice them — any
+    // runtime on the producer's chain that the live worker then continued into
+    // the current one proves the same CLI, and the live worker owning that
+    // continuation is its proof of having taken the handoff point over.
+    if (current && owner && sameWorker(current.worker, owner) && !sameWorker(source.worker, owner)) {
+      const produced = [source.ref, ...this.store.continuedRuntimes(this.ref, source.ref, source.worker)];
+      if (produced.some(runtime => this.store.runtimeContinues(this.ref, runtime, current.ref, owner))) {
+        return { version: 2, runtime: current.ref };
+      }
     }
     const executor = execution?.runtime ? this.store.runtime(this.ref, execution.runtime.runtimeId) : undefined;
     if (executor?.identity && samePhysicalRuntimeIdentity(source.identity, executor.identity)) return { version: 2, runtime: executor.ref, execution: execution!.ref };

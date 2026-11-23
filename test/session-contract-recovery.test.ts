@@ -435,6 +435,16 @@ describe('hook signals from a CLI a later worker generation re-attached', () => 
     });
     expect(s.controller.nativeSignal('binding-elsewhere', 'native-other')).toBeUndefined();
   });
+
+  it('splices the chain when /clear after the handover adds a hop of its own', () => {
+    // `/clear` keeps the pid and rotates the native session id, so generation 2
+    // records that hop while the launcher hop belongs to generation 1. Walking
+    // either side alone stops at the handoff point.
+    const { s, next } = reattachedByNextGeneration();
+    const cleared = s.controller.bindRuntime('binding-after-clear', next,
+      { ...identity, physicalId: '901:cli', nativeSessionId: 'native-2' }, undefined, 'binding-reattach');
+    expect(s.controller.nativeSignal('binding-launcher', 'native-2')).toEqual({ version: 2, runtime: cleared.ref });
+  });
 });
 
 describe('contract history stays bounded', () => {
