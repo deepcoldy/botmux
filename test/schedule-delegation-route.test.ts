@@ -8,6 +8,7 @@ import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { dispatchCallerFromReply, scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
+import { resolveRunAs } from '../src/core/run-as.js';
 import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
@@ -127,6 +128,12 @@ function harness(overrides: Record<string, unknown> = {}) {
     createHash,
     scheduler: { parseSchedule, commitDelegatedTask, addTask: vi.fn((task: unknown) => task) },
   };
+  // The real shared admission rule, over the harness's replaceable lookups.
+  scope.resolveRunAs = (appId: string, chatId: string, runAs: unknown) => resolveRunAs(appId, chatId, runAs, {
+    resolveAllowedUsersWithMap: (...args) => scope.resolveAllowedUsersWithMap(...args),
+    resolveUnionIdFromOpenId: (...args) => scope.resolveUnionIdFromOpenId(...args),
+    canOperate: (...args) => scope.canOperate(...args),
+  });
   const run = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
   return { ds, body, scope, commitDelegatedTask, run: () => run({}, {}) };
 }

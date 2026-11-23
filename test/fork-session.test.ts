@@ -982,6 +982,26 @@ describe('forkSession：等目标锁期间源会话变化', () => {
     expect(res).toEqual({ ok: false, error: 'session_not_active' });
     expect(sessionStore.createSession).not.toHaveBeenCalled();
   });
+
+  it.each(['native source changed', 'command withdrawn'] as const)('revalidates the queued fork at commit when the %s', async change => {
+    const src = makeSourceDs();
+    const registry = new Map([[sessionKey('om_source_root', 'cli_app_test'), src]]);
+    setActiveSessionsRegistry(registry);
+
+    const result = await forkSession(src.session.sessionId, 'oc_child', 'oc_child', 'group', 'chat', {
+      forkWorkerImpl: forkWorkerSpy as any,
+      expectedSourceCliSessionId: src.session.cliSessionId,
+      checkSourceMessage: async () => {
+        await Promise.resolve();
+        if (change === 'command withdrawn') return 'source_withdrawn';
+        src.session.cliSessionId = 'cli-replacement';
+      },
+    });
+
+    expect(result).toEqual({ ok: false, error: change === 'command withdrawn' ? 'source_withdrawn' : 'source_changed' });
+    expect(sessionStore.createSession).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe('sessionAgentConfig — cliConfigDir (Claude config profile) is frozen per session', () => {

@@ -75,16 +75,17 @@ it('rejects a top-level owner actor on authenticated HMAC and bearer webhooks', 
   await startWebhookServer({ proxyToDaemon });
   const signed = await seedNewGroupConnector();
   const token = await seedTokenConnector();
-  const body = { actor: 'owner', event: 'fixture' };
-  expect(await postWebhook(signed.id, 'fixture-actor-nonce', body))
-    .toMatchObject({ status: 403, body: { errorCode: 'actor_not_allowed' } });
-  const response = await fetch(`${baseUrl}/webhook/${token.id}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: 'Bearer tok_plain_value' },
-    body: JSON.stringify(body),
-  });
-  expect(response.status).toBe(403);
-  expect(await response.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+  for (const [index, body] of [{ actor: 'owner', event: 'fixture' }, { runAs: 'ou_person', event: 'fixture' }].entries()) {
+    expect(await postWebhook(signed.id, `fixture-actor-nonce-${index}`, body))
+      .toMatchObject({ status: 403, body: { errorCode: 'actor_not_allowed' } });
+    const response = await fetch(`${baseUrl}/webhook/${token.id}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer tok_plain_value' },
+      body: JSON.stringify(body),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ errorCode: 'actor_not_allowed' });
+  }
   expect(proxyToDaemon).not.toHaveBeenCalled();
 });
 

@@ -62,10 +62,22 @@ export function isOwnerActorTurnId(turnId: string | undefined): boolean {
   return turnId?.startsWith('trg_owner_') === true;
 }
 
+/** A trigger turn that runs under a person the host admin named (`runAs`). */
+export function isRunAsTurnId(turnId: string | undefined): boolean {
+  return turnId?.startsWith('trg_runas_') === true;
+}
+
+/** A trigger turn whose identity is one named person, resolved by the daemon:
+ *  the bot owner (`actor: 'owner'`) or a `runAs` person. */
+export function isPersonActorTurnId(turnId: string | undefined): boolean {
+  return isOwnerActorTurnId(turnId) || isRunAsTurnId(turnId);
+}
+
 export function allowsPersonalIdentityForTurn(
   turnId: string | undefined,
   policy: { enabled?: boolean; allowOwnerActor?: boolean } | null | undefined,
 ): boolean {
+  if (isRunAsTurnId(turnId)) return policy?.enabled === true;
   return !isOwnerActorTurnId(turnId) || (policy?.enabled === true && policy.allowOwnerActor === true);
 }
 

@@ -238,7 +238,7 @@ Or in that bot's `bots.json`:
 Notes:
 
 - The group is named automatically once; later title changes are not followed, and a name you set by hand is never overwritten.
-- "Reuse Agent session title" accepts Codex's own session titles and titles published through botmux renames (including Agent renames and renames you make in the Dashboard or inside a session).
+- "Reuse Agent session title" uses native titles from Codex and local Antigravity sessions. It also accepts titles set through BotMux, including renames in the Dashboard or inside a session.
 - For AI summaries, Codex uses an isolated lightweight call: low reasoning, none of your hooks, plugins, MCP servers or project instructions, only the login credentials and model gateway settings. Enter a lightweight model your account can use in "**Summary model (Codex)**" (`naming.model` in bots.json), or leave it blank to use the bot's model. This only affects group naming, not conversations.
 
 ### Change the tag on close

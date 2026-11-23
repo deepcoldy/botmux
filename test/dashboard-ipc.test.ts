@@ -26,6 +26,7 @@ import { rmwBotEntry } from '../src/services/config-store.js';
 import { cliAuthBind, signCliAuth } from '../src/dashboard/auth.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
+import * as runAsModule from '../src/core/run-as.js';
 import { invalidateGlobalConfigCache, setGroupOwnerNoticeEnabled } from '../src/global-config.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
@@ -13627,6 +13628,150 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     expect((await fetch(`${base}/api/asks/pending`)).status).toBe(401);
     // /api/asks/answer is deliberately excluded from the allowlist → 401.
     expect((await fetch(`${base}/api/asks/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"askId":"x","selections":[]}' })).status).toBe(401);
+  });
+
+  const workingDirTriggerBody = JSON.stringify({
+    source: { type: 'webhook' },
+    target: { kind: 'turn', botId: 'local_smoke', sessionId: 'fixture-session' },
+    instruction: 'Run the analysis',
+    envelope: { sourceName: 'Example client', format: 'text', trusted: false },
+    options: { workingDir: '/tmp' },
+  });
+
+  it('refuses options.workingDir on the unauthenticated core-only public trigger route', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    setCoreOnlyReady();
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: workingDirTriggerBody,
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode: 'working_dir_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it('lets a trusted-host trigger carry options.workingDir past the gate into session routing', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/host`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger/host', handle.port) },
+        body: workingDirTriggerBody,
+      });
+      // Past the gate the request reaches session routing; this fixture has no
+      // registered bot, so routing itself fails there.
+      expect(response.status).not.toBe(403);
+      expect(await response.json()).not.toMatchObject({ errorCode: 'working_dir_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  const runAsTriggerBody = JSON.stringify({
+    runAs: 'ou_person',
+    source: { type: 'webhook' },
+    target: { kind: 'turn', botId: 'local_smoke', sessionId: 'fixture-session' },
+    instruction: 'Run the analysis',
+    envelope: { sourceName: 'Example client', format: 'text', trusted: false },
+  });
+
+  it('refuses runAs on the unauthenticated core-only public trigger route', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
+    setCoreOnlyReady();
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: runAsTriggerBody,
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode: 'run_as_not_allowed' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it('lets a trusted-host trigger carry runAs past the gate into session routing', async () => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/host`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger/host', handle.port) },
+        body: runAsTriggerBody,
+      });
+      expect(response.status).toBe(500);
+      expect(await response.json()).toMatchObject({ errorCode: 'trigger_failed', error: 'Bot not registered: local_smoke' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it.each([
+    ['workingDir', workingDirTriggerBody, 'working_dir_not_allowed'],
+    ['runAs', runAsTriggerBody, 'run_as_not_allowed'],
+  ] as const)('rejects %s on the legacy ordinary route even with a trusted-host signature', async (_field, body, errorCode) => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger', handle.port) },
+        body,
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it.each([
+    ['unresolved', 'run_as_unresolved'],
+    ['not_allowed', 'run_as_not_allowed'],
+  ] as const)('answers 403 %s when the trusted-host runAs admission refuses the person', async (reason, errorCode) => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    registerBot({ larkAppId: 'local_smoke', larkAppSecret: 'fixture', cliId: 'codex', workingDir: process.cwd() });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const admission = vi.spyOn(runAsModule, 'resolveRunAs').mockResolvedValue({ ok: false, reason });
+    const inChat = vi.spyOn(groupsStore, 'isInChat').mockResolvedValue(true);
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    const ds: any = { larkAppId: 'local_smoke', chatId: 'oc_runas_chat', chatType: 'group', scope: 'thread',
+      session: { sessionId: 'runas-session', status: 'active', chatId: 'oc_runas_chat' } };
+    workerPool.setActiveSessionsRegistry(new Map([['oc_runas_chat:thread', ds]]));
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/host`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger/host', handle.port) },
+        body: JSON.stringify({ ...JSON.parse(runAsTriggerBody), target: { kind: 'turn', botId: 'local_smoke', sessionId: 'runas-session' } }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode });
+      expect(admission).toHaveBeenCalledWith('local_smoke', 'oc_runas_chat', 'ou_person');
+    } finally {
+      admission.mockRestore();
+      inChat.mockRestore();
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
   });
 
   it('rejects an unsigned owner IPC request before owner resolution without outer auth', async () => {

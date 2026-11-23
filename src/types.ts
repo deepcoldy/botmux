@@ -2298,6 +2298,7 @@ type DaemonToWorkerBase =
    *  a separate `message` IPC could write into the PTY first. */
   | { type: 'terminal_effort_writeback_ack'; nonce: string; preference: string }
   | { type: 'raw_input'; content: string; turnId?: string; trustedController?: TrustedCaller; followUpContent?: string; followUpTurnId?: string; followUpCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; mojoLivePatch?: MojoLivePatch; turnCallerOpenId?: string; requireSafeComposer?: true }
+  | { type: 'antigravity_btw'; question: string; messageId: string; nativeSessionId: string }
   /** Rename the current CLI-native interactive session. The worker queues this
    *  administrative slash command until the TUI is idle and does not treat it
    *  as a model turn. Only adapters declaring buildSessionRenameCommand handle
@@ -3021,6 +3022,10 @@ export type WorkerToDaemonBase =
     source: 'clipboard' | 'screen';
     turnId?: string;
   }
+  | { type: 'antigravity_btw_result'; messageId: string; question: string } & (
+    | { answer: string }
+    | { reason: 'busy' | 'unavailable' | 'unconfirmed' }
+  )
   /** Adopt: the reply to a Lark message Claude Code folded into the running
    *  turn (a mid-turn system reminder). Sent as soon as the model moved on
    *  from it, or when the host turn ends if it never did. `turnId` is the

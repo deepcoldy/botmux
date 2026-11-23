@@ -22,7 +22,7 @@ import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-tu
 import { recallProvenIdentityContent, rememberProvenIdentityContent } from '../src/core/cli-identity.js';
 import { configuredCliExecutionMode } from '../src/core/cli-execution-mode.js';
 import { isHumanInboundTurnId, pickTurnReplyTarget } from '../src/core/reply-target.js';
-import { isOwnerActorTurnId } from '../src/core/workflow-event-turn.js';
+import { isPersonActorTurnId, isRunAsTurnId } from '../src/core/workflow-event-turn.js';
 import { prepareScheduledRecoveryRun } from '../src/core/scheduled-send.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 import { SessionController } from '../src/core/session-controller.js';
@@ -101,7 +101,7 @@ function restartedWorld(turnId: string, opts: { endedBeforeRestart?: boolean } =
     getBot: () => ({ config: { larkToolBinding: true,
       triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'] } } }),
     identityStorageModelForDaemonSession: (session: any) => session.reportedIdentityModel?.model ?? 'single',
-    parseScheduledTurnId, isHumanInboundTurnId, isOwnerActorTurnId, identityDecisionTurnIsLive, trackTurnIdentityPublication, prepareScheduledRecoveryRun,
+    parseScheduledTurnId, isHumanInboundTurnId, isPersonActorTurnId, isRunAsTurnId, identityDecisionTurnIsLive, trackTurnIdentityPublication, prepareScheduledRecoveryRun,
     scheduleAuthorityStore: { getRecord: () => ({ kind: 'direct', state: 'active',
       task: { id: 'daily_report', larkAppId: appId, chatId: 'oc_chat' } }) },
     scheduler: { admitManualRunTurn: () => false },

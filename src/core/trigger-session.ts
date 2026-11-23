@@ -14,6 +14,7 @@ import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
 import { getBot, getStrictOwnerOpenId, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { resolveSender, type ResolvedSender } from '../im/lark/identity-cache.js';
+import type { RunAsResolution } from './run-as.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { renderInboundMessageLocation } from './reply-message.js';
 import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode } from '../im/lark/client.js';
@@ -40,7 +41,7 @@ import { currentDeviceIsolationFreezeLease } from './device-isolation-activation
 import * as messageQueue from '../services/message-queue.js';
 import type { DaemonSession } from './types.js';
 import { activeSessionKey, sessionKey, larkTransportEnabled, isHttpVirtualSession } from './types.js';
-import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
+import type { TriggerErrorCode, TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { logger } from '../utils/logger.js';
 import type { CliTurnPayload } from '../types.js';
@@ -58,6 +59,9 @@ export interface TriggerSessionDeps {
    *  from outside (core/turn-origin isExternallySubmittedTriggerSource).
    *  Internal relays calling triggerSessionTurn directly never set it. */
   externalRequest?: boolean;
+  /** Admission of a request's `runAs` person for a chat. Supplied by the trusted
+   *  host IPC route only; a request carrying `runAs` is refused without it. */
+  resolveRunAs?: (chatId: string, runAs: string) => Promise<RunAsResolution>;
 }
 
 /** Daemon-internal dispatch controls. These deliberately do not live in the
@@ -327,13 +331,19 @@ export function externalEventOpensOwnTopic(chatMode: ChatMode, regularGroupMode:
   return chatMode === 'topic' || regularGroupMode === 'new-topic';
 }
 
-function resolveWorkingDir(larkAppId: string, chatId: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; error: string } {
+function resolveWorkingDir(larkAppId: string, chatId: string, explicit?: string): { ok: true; workingDir: string; fromBotDefault: boolean } | { ok: false; errorCode: TriggerErrorCode; error: string } {
+  if (explicit !== undefined) {
+    const v = validateWorkingDir(explicit, localeForBot(larkAppId));
+    return v.ok
+      ? { ok: true, workingDir: v.resolvedPath, fromBotDefault: false }
+      : { ok: false, errorCode: 'bad_request', error: v.error };
+  }
   const bot = getBot(larkAppId);
   const oncall = oncallStore.getOncallStatus(larkAppId, chatId)?.workingDir;
   const botDefault = effectiveDefaultWorkingDir(bot.config);
   const candidate = oncall || botDefault || bot.config.workingDir || '~';
   const v = validateWorkingDir(candidate, localeForBot(larkAppId));
-  if (!v.ok) return { ok: false, error: v.error };
+  if (!v.ok) return { ok: false, errorCode: 'trigger_failed', error: v.error };
   // 仅当命中本 bot 自己的 defaultWorkingDir（layer 3，非 oncall 绑定）时才允许 auto-worktree。
   // 无 oncall 时 candidate 就是 botDefault（它排在 bot.config.workingDir/'~' 之前），故
   // `!oncall && botDefault` 即可刻画"来自本 bot 默认目录"。
@@ -881,7 +891,7 @@ function stageTriggerReadModel(ds: DaemonSession, req: TriggerRequest, turnId: s
   if (ds.session.status === 'closed') return;
   try {
     stageSessionTurnInbound(config.session.dataDir, ds.session.sessionId, turnId, {
-      via: owner ? 'owner_actor' : 'trigger',
+      via: req.actor === 'owner' ? 'owner_actor' : 'trigger',
       messageId: turnId,
       text: req.instruction ?? '',
       ...(owner ? { sender: { type: 'user', openId: owner.openId, name: owner.name } } : {}),
@@ -901,7 +911,9 @@ async function triggerSessionTurnAdmitted(
 ): Promise<TriggerResponse> {
   const stableTurnId = internal?.stableTurnId?.trim();
   const ownerActor = req.actor === 'owner';
-  const triggerId = stableTurnId || `trg_${ownerActor ? 'owner_' : ''}${randomUUID()}`;
+  const runAs = req.runAs;
+  const personActor = ownerActor || runAs !== undefined;
+  const triggerId = stableTurnId || `trg_${ownerActor ? 'owner_' : runAs !== undefined ? 'runas_' : ''}${randomUUID()}`;
   rememberTriggerTurn(triggerId, req.source.type);
   if (deps.externalRequest === true) rememberExternalTriggerTurn(triggerId);
   // HTTP opt-in for codex-app native in-flight steer (turn/steer). The flag is
@@ -1061,7 +1073,7 @@ async function triggerSessionTurnAdmitted(
   }
 
   const dryRun = !!req.options?.dryRun;
-  const promptForSession = (target?: DaemonSession) => ownerActor ? req.instruction! : zeroPromptInjectionForBot(larkAppId, undefined,
+  const promptForSession = (target?: DaemonSession) => personActor ? req.instruction! : zeroPromptInjectionForBot(larkAppId, undefined,
     target ? sessionPromptInjection(target) : undefined)
     ? buildZeroInjectionTriggerPrompt(req)
     : buildUntrustedEventPrompt(req, triggerId);
@@ -1069,11 +1081,11 @@ async function triggerSessionTurnAdmitted(
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
   const hasExplicitTopicMessage = typeof req.presentation?.topicMessage === 'string'
     && req.presentation.topicMessage.trim().length > 0;
-  const codexAppText = ownerActor ? prompt : buildExternalEventVisibleText(req, larkAppId);
+  const codexAppText = personActor ? prompt : buildExternalEventVisibleText(req, larkAppId);
   const {
     application: codexAppApplicationContext,
     message: codexAppMessageContext,
-  } = ownerActor ? { application: '', message: '' } : buildExternalEventCodexAppContexts(req, triggerId);
+  } = personActor ? { application: '', message: '' } : buildExternalEventCodexAppContexts(req, triggerId);
   const promptPreview = prompt.length > 4000 ? prompt.slice(0, 4000) + '\n...[truncated]' : prompt;
 
   // ── Idempotency (fresh async virtual only — validator guarantees the shape) ──
@@ -1097,6 +1109,7 @@ async function triggerSessionTurnAdmitted(
     ? computeInputHash({
         instruction: req.instruction ?? null,
         ...(req.payloadTrusted ? { payloadTrusted: true } : {}),
+        ...(runAs !== undefined ? { runAs } : {}),
         envelope: req.envelope,
         source: req.source,
         presentation: req.presentation ?? null,
@@ -1197,6 +1210,7 @@ async function triggerSessionTurnAdmitted(
     ? computeInputHash({
         seam: 'turn',
         ...(req.actor ? { actor: req.actor } : {}),
+        ...(req.runAs !== undefined ? { runAs: req.runAs } : {}),
         sessionId: req.target.sessionId ?? null,
         instruction: req.instruction ?? null,
         ...(req.payloadTrusted ? { payloadTrusted: true } : {}),
@@ -1338,7 +1352,7 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
-  let chatId = ownerActor ? ds?.chatId : req.target.chatId ?? ds?.chatId;
+  let chatId = ownerActor || (runAs !== undefined && req.target.sessionId) ? ds?.chatId : req.target.chatId ?? ds?.chatId;
   if (rootMessageId && !req.target.sessionId) {
     const rootTarget = await validateRootMessageTarget(larkAppId, chatId, rootMessageId);
     if (!rootTarget.ok) {
@@ -1373,6 +1387,22 @@ async function triggerSessionTurnAdmitted(
   }
   if (!inChat) {
     return { ok: false, errorCode: 'bot_not_in_chat', error: `bot ${larkAppId} is not in chat ${chatId}` };
+  }
+  let runAsPerson: ResolvedSender | undefined;
+  if (runAs !== undefined) {
+    if (httpVirtual || !deps.resolveRunAs) {
+      return { ok: false, errorCode: 'bad_request', error: 'runAs requires a real chat target and a trusted host caller' };
+    }
+    const admitted = await deps.resolveRunAs(chatId, runAs);
+    if (!admitted.ok) {
+      return admitted.reason === 'invalid'
+        ? { ok: false, errorCode: 'bad_request', error: 'runAs must be an ou_ open_id or an email address' }
+        : admitted.reason === 'unresolved'
+          ? { ok: false, errorCode: 'run_as_unresolved', error: 'runAs person could not be resolved to a user of this bot' }
+          : { ok: false, errorCode: 'run_as_not_allowed', error: 'runAs person is not allowed to operate this bot in the target chat' };
+    }
+    runAsPerson = await resolveSender(larkAppId, admitted.openId, 'user').catch(() => undefined)
+      ?? { openId: admitted.openId, type: 'user' as const };
   }
 
   // Mirror the inbound @ routing: a 普通群 in `new-topic` mode forks a fresh
@@ -1412,12 +1442,15 @@ async function triggerSessionTurnAdmitted(
   }
 
   const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
+    if (runAs !== undefined && (target.session.assistantOwnerOpenId || getBot(larkAppId).config.assistantMode === true)) {
+      return { ok: false, errorCode: 'bad_request', error: 'assistant mode: runAs is not supported; the session belongs to the chat owner' };
+    }
     const prompt = promptForSession(target);
     const owner = ownerOpenId
       ? await resolveSender(larkAppId, ownerOpenId, 'user').catch(() => undefined)
         ?? { openId: ownerOpenId, type: 'user' as const }
-      : undefined;
-    if (owner && getStrictOwnerOpenId(larkAppId) !== owner.openId) return ownerUnresolved();
+      : runAsPerson;
+    if (ownerOpenId && getStrictOwnerOpenId(larkAppId) !== owner?.openId) return ownerUnresolved();
     // Ownership guard (PR #597): the target must still be the live, registered
     // occupant before we dispatch. Validate by object identity at its canonical
     // key AND — because a session can legitimately be reached via a non-canonical
@@ -1439,7 +1472,7 @@ async function triggerSessionTurnAdmitted(
     }
     const workerIsLive = !!target.worker && !target.worker.killed;
     if (owner && hasQueuedActivationAdmissionGate(target)) {
-      return { ok: false, triggerId, errorCode: 'session_not_runnable', error: 'wait for the session activation to complete before sending as owner' };
+      return { ok: false, triggerId, errorCode: 'session_not_runnable', error: 'wait for the session activation to complete before sending as a named person' };
     }
     if (!workerIsLive && (target.pendingRepo || target.initialStartPending
       || target.worktreeCreating || target.session.queued
@@ -1658,6 +1691,7 @@ async function triggerSessionTurnAdmitted(
             armFinalOutputSuppression(target, dispatchAttempt);
             const accepted = sendWorkerInput(target, content, triggerId, {
               ...(owner ? { trustedCaller: content.trustedCaller } : {}),
+              ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
               ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
               ...(steerRequested ? { codexAppSteerable: true as const } : {}),
             });
@@ -1700,6 +1734,7 @@ async function triggerSessionTurnAdmitted(
           armFinalOutputSuppression(target, dispatchAttempt);
           accepted = sendWorkerInput(target, content, triggerId, {
             ...(owner ? { trustedCaller: content.trustedCaller } : {}),
+            ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
             ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
             // At-most-once: a keyed follow-up delivered to a LIVE worker must be
             // tagged so a CLI crash never replays it onto the auto-restarted CLI
@@ -1761,6 +1796,7 @@ async function triggerSessionTurnAdmitted(
       armLoudFinalSuppression(target);
       const accepted = sendWorkerInput(target, content, triggerId, {
         ...(owner ? { trustedCaller: content.trustedCaller } : {}),
+        ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
@@ -1903,15 +1939,21 @@ async function triggerSessionTurnAdmitted(
 
   if (ds) return deliverToExisting(ds);
 
-  const resolvedWd = resolveWorkingDir(larkAppId, chatId);
+  const resolvedWd = resolveWorkingDir(larkAppId, chatId, req.options?.workingDir);
   if (!resolvedWd.ok) {
-    return { ok: false, errorCode: 'trigger_failed', error: resolvedWd.error };
+    return { ok: false, errorCode: resolvedWd.errorCode, error: resolvedWd.error };
   }
   // 个人助理模式：触发器建的会话归该群的主人、cwd 在主人 work/（不建 worktree）；
   // 群未认领（含私聊——触发器不知道是谁在说话）就拒绝。
   const assistantSpawn = resolveAssistantSpawn(larkAppId, chatId, 'group', undefined);
   if (assistantSpawn.kind === 'unclaimed') {
     return { ok: false, errorCode: 'trigger_failed', error: 'assistant mode: this chat has no assistant owner' };
+  }
+  if (assistantSpawn.kind === 'owner' && req.options?.workingDir !== undefined) {
+    return { ok: false, errorCode: 'bad_request', error: 'assistant mode: options.workingDir is not supported; the session runs in the chat owner work dir' };
+  }
+  if (assistantSpawn.kind === 'owner' && runAs !== undefined) {
+    return { ok: false, errorCode: 'bad_request', error: 'assistant mode: runAs is not supported; the session belongs to the chat owner' };
   }
   const wd = assistantSpawn.kind === 'owner'
     ? { ok: true as const, workingDir: assistantSpawn.workDir, fromBotDefault: false }
@@ -1963,6 +2005,7 @@ async function triggerSessionTurnAdmitted(
     && !req.options?.waitForFinalOutput
     && !req.options?.asyncReturnSessionId
     && !stableTurnId
+    && runAs === undefined
     && wd.fromBotDefault
     && botAutoWorktreeEnabled(larkAppId);
 
@@ -2157,9 +2200,9 @@ async function triggerSessionTurnAdmitted(
     });
     throw err;
   }
-  stageTriggerReadModel(newDs, req, triggerId);
-  const promptInput = buildNewTopicCliInput(
-    prompt,
+  const newTurnRoot = scope === 'thread' ? anchor : undefined;
+  stageTriggerReadModel(newDs, req, triggerId, runAsPerson, newTurnRoot);
+  const promptInput = buildNewTopicCliInput(prompt,
     session.sessionId,
     session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
     session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
@@ -2198,6 +2241,17 @@ async function triggerSessionTurnAdmitted(
   // (codex canSteer requires the root itself to be positively authorized), so a
   // later follow-up can natively turn/steer into it. No-op for non-codex CLIs.
   if (steerRequested) promptInput.codexAppSteerable = true;
+  if (runAsPerson) {
+    // The opening turn belongs to the named person: its reply target records them
+    // as the sender (identity publication reads it) and the worker acts for them.
+    promptInput.trustedCaller = { requestLarkAppId: larkAppId, requestUserOpenId: runAsPerson.openId, senderType: 'user' };
+    beginReplyTargetTurn(newDs, newTurnRoot, triggerId, undefined, {
+      senderOpenId: runAsPerson.openId,
+      participants: [{ openId: runAsPerson.openId, name: runAsPerson.name, isBot: false }],
+      synthetic: true,
+    });
+    sessionStore.updateSession(session);
+  }
   rememberInput(newDs, prompt, promptInput);
 
   const releaseInitialReservation = (): void => {
@@ -2486,6 +2540,9 @@ export async function triggerSessionTurn(
   const result = await withBotTurnAdmission(
     deps.larkAppId,
     () => {
+      if (req.runAs !== undefined && req.options?.turnIdempotencyKey && !req.options.asyncReturnSessionId) {
+        return Promise.resolve<TriggerResponse>({ ok: false, errorCode: 'bad_request', error: 'runAs with turnIdempotencyKey requires asyncReturnSessionId' });
+      }
       if (!req.options?.turnIdempotencyKey || req.options.asyncReturnSessionId) {
         return triggerSessionTurnAdmitted(req, deps, internal);
       }

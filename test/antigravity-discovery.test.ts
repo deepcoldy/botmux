@@ -7,6 +7,7 @@ import {
   findAntigravityConversationId,
   findAntigravityConversationIdByPid,
   findAntigravityConversationIdByWorkspace,
+  readAntigravityConversationTitle,
 } from '../src/services/antigravity-discovery.js';
 
 describe('antigravity-discovery', () => {
@@ -114,6 +115,24 @@ describe('antigravity-discovery', () => {
 
     const fromAll = findAntigravityConversationId({ cwd: '/repo/my-project', summariesDbPath: dbPath });
     expect(fromAll).toBe(validUuid2);
+  });
+
+  it('reads the title for the requested native conversation and waits for an empty title', () => {
+    const first = '11111111-2222-3333-4444-555555555555';
+    const current = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const db = openDatabaseSyncOrThrow(dbPath);
+    try {
+      db.exec('CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL)');
+      const insert = db.prepare('INSERT INTO conversation_summaries VALUES (?, ?)');
+      insert.run(first, 'Other conversation');
+      insert.run(current, '');
+      expect(readAntigravityConversationTitle(current, dbPath)).toBeUndefined();
+      db.prepare('UPDATE conversation_summaries SET title = ? WHERE conversation_id = ?').run('  原生\n会话标题  ', current);
+      expect(readAntigravityConversationTitle(current, dbPath)).toBe('原生 会话标题');
+      expect(readAntigravityConversationTitle(first, dbPath)).toBe('Other conversation');
+    } finally {
+      db.close();
+    }
   });
 
   it('returns null when no matching workspace exists', () => {

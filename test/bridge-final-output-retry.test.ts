@@ -2126,6 +2126,38 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[0][5]).not.toHaveProperty('suppressHook');
   });
 
+  it('posts an Antigravity side answer below its command with a valid, stable Lark dedupe key', async () => {
+    const sessionReply = vi.fn(async () => 'om_side_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'chat';
+    ds.session.scope = 'chat';
+    ds.session.cliId = 'antigravity';
+    __testOnly_setupWorkerHandlers(ds, ds.worker!);
+    const messageId = 'om_0123456789abcdef0123456789abcdef';
+    const result = { type: 'antigravity_btw_result', messageId, question: 'Read the inherited value', answer: 'QA-42' } as const;
+    ds.worker!.emit('message', { type: result.type, messageId, question: result.question, reason: 'busy' });
+    ds.worker!.emit('message', result);
+    ds.worker!.emit('message', result);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(3));
+    const [status, ...replies] = sessionReply.mock.calls as unknown as [string, string, string, string, string, { replyTarget: unknown; uuid: string }][];
+    expect(status[2]).toBe('text');
+    expect(status[5].uuid).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+    expect(status[5].uuid).not.toBe(replies[0][5].uuid);
+    for (const call of replies) {
+      expect(call[1]).toContain('QA-42');
+      expect(call[5].replyTarget).toEqual({ mode: 'thread', rootMessageId: messageId });
+      expect(call[5].uuid).toMatch(/^[A-Za-z0-9_-]{1,50}$/);
+    }
+    expect(replies[1][5].uuid).toBe(replies[0][5].uuid);
+  });
+
   it('routes sequential Codex App settlements through each ledger-frozen shared-chat root', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
