@@ -464,7 +464,7 @@ describe('权限卡结局文案', () => {
     expect(cardVisibleText(buildAskCard(ask(), timedOut))).toContain(t('card.ask.permission_timed_out'));
     const plain = { ...ask(), questions: [{ prompt: '选哪个？', multiSelect: false, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] }] };
     const text = cardVisibleText(buildAskCard(plain, timedOut));
-    expect(text).toContain(t('card.ask.timed_out'));
+    expect(text).toContain(t('card.ask.header.timed_out'));
     expect(text).not.toContain(t('card.ask.permission_timed_out'));
   });
 

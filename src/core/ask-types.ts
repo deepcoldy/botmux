@@ -277,7 +277,10 @@ export type AskClickOutcome =
    *  都允许空集（全多选），提交极可能是手滑——先不 settle，要求带 confirmEmpty 再点
    *  一次。仅当所有问题都可空时才可能返回；任一单选未选走 `stale`（空非有效答案）。 */
   | 'needs_empty_confirm'
-  | 'invalid_form';
+  | 'invalid_form'
+  /** A one-shot choice form broke a per-question rule (see `askChoiceProblem`): nothing
+   *  changed, the card keeps the user's ticks and text, the handler says which question. */
+  | 'invalid_choice';
 
 /** 旧单选语义兼容：仅当"单问且恰好选 1 个"时返回该 key，否则 null。
  *  `botmux ask buttons` 子命令与其测试据此保持单选行为不变。 */
