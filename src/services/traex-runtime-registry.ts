@@ -433,11 +433,13 @@ export async function acquireTraexRuntimeStart(
     // restart / reattach) must not reset its proven content to unknown just
     // because the caller only knows the pid. A record for that exact process
     // already names the bytes it runs.
-    const effectiveComboKey = request.comboKey === '' && request.cliPid !== undefined
-      ? (remaining.find((occupant) => occupant.cliPid === request.cliPid
+    const inheritedIdentity = request.comboKey === '' && request.cliPid !== undefined
+      ? remaining.find((occupant) => occupant.cliPid === request.cliPid
         && (occupant.cliStart ?? undefined) === (request.cliStart ?? undefined)
-        && occupant.comboKey.length > 0)?.comboKey ?? '')
-      : request.comboKey;
+        && occupant.comboKey.length > 0)
+      : undefined;
+    const effectiveComboKey = inheritedIdentity?.comboKey ?? request.comboKey;
+    const effectiveInstallSignature = request.installSignature ?? inheritedIdentity?.installSignature;
     // `force` registers occupancy without asserting content compatibility.
     // Used only for runtimes this worker did not start (adopt/reattach/...),
     // which must still make an incompatible start wait.
@@ -452,7 +454,7 @@ export async function acquireTraexRuntimeStart(
     const occupant: TraexRuntimeOccupant = {
       occupantId: request.occupantId,
       comboKey: effectiveComboKey,
-      ...(request.installSignature ? { installSignature: request.installSignature } : {}),
+      ...(effectiveInstallSignature ? { installSignature: effectiveInstallSignature } : {}),
       ...(request.snapshotDir ? { snapshotDir: request.snapshotDir } : {}),
       ...(request.traexPath ? { traexPath: request.traexPath } : {}),
       // A known CLI at registration is already alive; recording it here (not
@@ -502,13 +504,14 @@ export async function acquireTraexRuntimeStart(
  * and the gate fails closed rather than forget a live runtime.
  *
  * `comboKey` is a backfill for records registered without content proof
- * (adopt/reattach/opaque launcher). It is only applied while the record still
- * has no key: a proven identity is never replaced by a later observation.
+ * (adopt/reattach). It is only applied while the record still has no key: a
+ * proven identity is never replaced by a later observation. The matching
+ * source-install signature is retained for the daemon scheduling precheck.
  */
 export async function markTraexRuntimeRunning(
   domain: TraexRuntimeDomain,
   occupantId: string,
-  detail: { cliPid: number; cliStart?: string; snapshotDir?: string; comboKey?: string; now?: number },
+  detail: { cliPid: number; cliStart?: string; snapshotDir?: string; comboKey?: string; installSignature?: string; now?: number },
 ): Promise<boolean> {
   return mutateOccupant(domain, occupantId, (occupant, now) => ({
     ...occupant,
@@ -517,6 +520,8 @@ export async function markTraexRuntimeRunning(
     ...(detail.cliStart ? { cliStart: detail.cliStart } : {}),
     ...(detail.snapshotDir ? { snapshotDir: detail.snapshotDir } : {}),
     ...(detail.comboKey && occupant.comboKey === '' ? { comboKey: detail.comboKey } : {}),
+    ...(detail.comboKey && detail.installSignature && occupant.installSignature === undefined
+      ? { installSignature: detail.installSignature } : {}),
     heartbeatAt: now,
     leaseUntil: now + TRAEX_RUNTIME_LEASE_MS,
   }));

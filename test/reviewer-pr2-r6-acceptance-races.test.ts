@@ -29,7 +29,7 @@ beforeEach(async () => {
   scheduler.setOwnerFilter(APP, true);
   const task = scheduler.addTask({ id: 'r6accept', name: 'acceptance race', schedule: 'every 30m',
     prompt: 'check', workingDir: root, chatId: 'oc_A', chatIds: ['oc_A', 'oc_B'],
-    larkAppId: APP, repeat: { times: 2, completed: 0 } });
+    larkAppId: APP, owner: { kind: 'human', openId: 'ou_r6_test' }, repeat: { times: 2, completed: 0 } });
   taskId = task.id;
   scheduler.setExecuteCallback(async (t, c) => {
     context = c;

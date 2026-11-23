@@ -825,6 +825,7 @@ import {
   reportUndeliveredScheduleRun,
   SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE,
   settleDeferredScheduleRun,
+  settleHeldScheduleRunsOnWorkerExit,
 } from './core/deferred-schedule-settlement.js';
 import {
   renderMessageListenerPrompt,
@@ -35808,22 +35809,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // accepted once its worker is gone. Settle that parked run now instead of
       // waiting for the handoff timeout; the same single-exit helper is used by
       // the ambiguous and timeout paths.
-      const scheduledRuns = [
-        ...(ds.session.scheduledRun ? [ds.session.scheduledRun] : []),
-        ...Object.values(ds.session.scheduledRuns ?? {}),
-      ];
-      for (const run of scheduledRuns) {
-        const parked = scheduler.getRuntimeTask(run.taskId, ds.larkAppId)?.deferredRun;
-        if (!parked || parked.runId !== run.runId) continue;
-        if (Object.values(parked.acceptedTargets ?? {}).includes(run.turnId)) continue;
-        if (!Object.values(parked.heldTargets ?? {}).includes(run.turnId)) continue;
-        scheduler.settleParkedRunOnce(
-          run.taskId,
-          run.runId,
-          'scheduled turn worker exited while the TRAE runtime handoff was still waiting',
-          ds.larkAppId,
-        );
-      }
+      settleHeldScheduleRunsOnWorkerExit(ds.session, ds.larkAppId, {
+        getDeferredRun: (taskId, appId) => scheduler.getRuntimeTask(taskId, appId)?.deferredRun,
+        settle: scheduler.settleParkedRunOnce,
+      });
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.

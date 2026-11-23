@@ -28,7 +28,7 @@ import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } fr
 import { logger } from '../utils/logger.js';
 import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, findActiveBySessionId, identityStorageModelForDaemonSession, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync, resolveCommandReal } from '../adapters/cli/registry.js';
-import { precheckTraexRuntime } from '../services/traex-runtime-gate.js';
+import { precheckTraexRuntime, traexLaunchUsesSharedRuntimeGate } from '../services/traex-runtime-gate.js';
 import { releaseDirForExecutable } from '../services/traex-runtime-snapshot.js';
 import { resolveTraexChildHome } from '../services/traex-paths.js';
 import { botInjectedEnv } from './env-policy.js';
@@ -5609,7 +5609,7 @@ function scheduledTraexRuntimeBlocker(
   bot: {
     config: Pick<
       BotConfig,
-      'cliId' | 'cliPathOverride' | 'env' | 'envUnset' | 'envPolicy'
+      'cliId' | 'cliPathOverride' | 'wrapperCli' | 'cliLaunchMode' | 'env' | 'envUnset' | 'envPolicy'
     >;
   },
   task: ScheduledTask,
@@ -5628,6 +5628,16 @@ function scheduledTraexRuntimeBlocker(
     ?? selected?.session.cliId
     ?? bot.config.cliId;
   if (targetCliId !== 'traex') return undefined;
+  const launchSnapshot = selected?.session.cliLaunchSnapshot;
+  const wrapperCli = launchSnapshot
+    ? launchSnapshot.wrapperCli
+    : selected?.session.wrapperCli ?? bot.config.wrapperCli;
+  const cliLaunchMode = launchSnapshot
+    ? launchSnapshot.cliLaunchMode
+    : selected?.session.cliLaunchMode ?? bot.config.cliLaunchMode;
+  // The worker does not acquire a shared-domain lease for these launch modes;
+  // the scheduler must not invent a blocker the actual dispatch will ignore.
+  if (!traexLaunchUsesSharedRuntimeGate({ wrapperCli, cliLaunchMode })) return undefined;
   try {
     const executablePath = resolveCommandReal(bot.config.cliPathOverride?.trim() || 'traex');
     // Pre-check the SAME cache domain the CLI child will write. Using the

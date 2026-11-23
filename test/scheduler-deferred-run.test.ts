@@ -24,6 +24,7 @@ import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import { queryScheduleRunLogs } from '../src/services/schedule-run-log-store.js';
+import { settleHeldScheduleRunsOnWorkerExit } from '../src/core/deferred-schedule-settlement.js';
 
 const APP = 'cli_deferred_test';
 
@@ -41,9 +42,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  scheduler.stopScheduler();
   vi.useRealTimers();
   vi.restoreAllMocks();
-  scheduler.stopScheduler();
   scheduler.setScheduleAuthorityStore(null);
   store.close();
   rmSync(join(dataDir, '..'), { recursive: true, force: true });
@@ -137,6 +138,7 @@ function addTwoTargetTask() {
     chatId: 'oc_a',
     chatIds: ['oc_a', 'oc_b'],
     larkAppId: APP,
+    owner: { kind: 'human', openId: 'ou_deferred_test' },
     repeat: { times: 3, completed: 0 },
   });
 }
@@ -362,6 +364,80 @@ describe('deferred scheduled run lifecycle', () => {
     expect(settled.repeat?.completed).toBe(1);
     expect(settled.nextRunAt).toBeDefined();
     expect(Date.parse(settled.nextRunAt!)).toBeGreaterThan(Date.now());
+  });
+
+  it('settles a parked run when the scheduler tick reaches the 30-minute timeout', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    const execute = vi.fn(callback);
+    scheduler.setExecuteCallback(execute);
+    scheduler.runNow(task.id);
+    await flush();
+    const parked = scheduler.getRuntimeTask(task.id, APP)!;
+    const since = Date.parse(parked.deferredRun!.since);
+    const runId = parked.deferredRun!.runId;
+    const alert = vi.fn();
+    scheduler.setScheduleFailureAlert(alert);
+    expect(execute).toHaveBeenCalledTimes(1);
+
+    // Start five seconds before the deadline; the real startup tick therefore
+    // lands exactly on it. A missing timeout branch retries and stays parked.
+    vi.useFakeTimers({ now: new Date(since + scheduler.TRAEX_DEFERRED_RUN_TIMEOUT_MS - 5_000) });
+    scheduler.startScheduler();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const settled = scheduler.getRuntimeTask(task.id, APP)!;
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(settled.deferredRun).toBeUndefined();
+    expect(settled.lastRunId).toBe(runId);
+    expect(settled.lastStatus).toBe('error');
+    expect(settled.lastError).toContain('30 minutes');
+    expect(alert).toHaveBeenCalledTimes(1);
+    const errors = queryScheduleRunLogs(task.id, { limit: 10 }, APP).logs
+      .filter(entry => entry.outcome === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].errorCode).toBe('deferred_unsettled');
+    scheduler.stopScheduler();
+  });
+
+  it('settles a worker-held scheduled run onWorkerExit, but not an accepted turn', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const parked = scheduler.getRuntimeTask(task.id, APP)!.deferredRun!;
+    const runId = parked.runId;
+    const turnA = parked.targetTurnIds!.oc_a;
+    const turnB = parked.targetTurnIds!.oc_b;
+    const runs: Record<string, { taskId: string; runId: string; turnId: string }> = {
+      oc_a: { taskId: task.id, runId, turnId: turnA },
+    };
+    const deps = {
+      getDeferredRun: (taskId: string, appId: string) => scheduler.getRuntimeTask(taskId, appId)?.deferredRun,
+      settle: scheduler.settleParkedRunOnce,
+    };
+
+    expect(scheduler.markDeferredTargetAccepted(task.id, runId, 'oc_a', turnA, APP)).toBe(true);
+    expect(settleHeldScheduleRunsOnWorkerExit({ scheduledRuns: runs }, APP, deps)).toBe(0);
+    expect(scheduler.getRuntimeTask(task.id, APP)!.deferredRun?.runId).toBe(runId);
+
+    expect(scheduler.markDeferredTargetDispatching(task.id, runId, 'oc_b', turnB, APP)).toBe(true);
+    expect(scheduler.markDeferredTargetHeld(task.id, runId, 'oc_b', turnB, APP)).toBe(true);
+    runs.oc_b = { taskId: task.id, runId, turnId: turnB };
+    const alert = vi.fn();
+    scheduler.setScheduleFailureAlert(alert);
+    expect(settleHeldScheduleRunsOnWorkerExit({ scheduledRuns: runs }, APP, deps)).toBe(1);
+
+    const settled = scheduler.getRuntimeTask(task.id, APP)!;
+    expect(settled.deferredRun).toBeUndefined();
+    expect(settled.lastStatus).toBe('error');
+    expect(settled.lastError).toContain('worker exited');
+    expect(alert).toHaveBeenCalledTimes(1);
+    const errors = queryScheduleRunLogs(task.id, { limit: 10 }, APP).logs
+      .filter(entry => entry.outcome === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].errorCode).toBe('deferred_unsettled');
   });
 
   it('does not let a stale run outcome clear a newer parked run', async () => {

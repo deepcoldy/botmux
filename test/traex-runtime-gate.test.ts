@@ -36,15 +36,19 @@ import {
   captureTraexReleaseIdentity,
   comboKeyFromHashes,
   materializeTraexSnapshot,
+  readTraexSnapshotProvenance,
   __testOnly_resetTraexSnapshotCache,
 } from '../src/services/traex-runtime-snapshot.js';
 import {
   acquireTraexRuntimeLease,
+  acquireTraexRuntimeOccupancy,
   computeTraexInstallSignature,
   precheckTraexRuntime,
+  traexLaunchUsesSharedRuntimeGate,
 } from '../src/services/traex-runtime-gate.js';
 
 const dirs: string[] = [];
+const rootIgnoresWritePermissionBits = process.geteuid?.() === 0;
 
 function tempDir(prefix: string): string {
   const dir = mkdtempSync(join(tmpdir(), prefix));
@@ -73,6 +77,15 @@ afterEach(() => {
     try { chmodSync(dir, 0o755); } catch { /* best effort */ }
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
   }
+});
+
+describe('shared runtime gate launch eligibility', () => {
+  it('keeps direct launches coordinated and excludes wrapperCli / forge-traex', () => {
+    expect(traexLaunchUsesSharedRuntimeGate({})).toBe(true);
+    expect(traexLaunchUsesSharedRuntimeGate({ cliLaunchMode: 'direct' })).toBe(true);
+    expect(traexLaunchUsesSharedRuntimeGate({ wrapperCli: 'gateway traex' })).toBe(false);
+    expect(traexLaunchUsesSharedRuntimeGate({ cliLaunchMode: 'forge-traex' })).toBe(false);
+  });
 });
 
 describe('resolveTraexRuntimeDomain', () => {
@@ -108,7 +121,7 @@ describe('resolveTraexRuntimeDomain', () => {
     expect(a.domain.registryPath).toBe(b.domain.registryPath);
   });
 
-  it('fails closed when the shared skills directory is not writable', () => {
+  it.skipIf(rootIgnoresWritePermissionBits)('fails closed when the shared skills directory is not writable', () => {
     const home = traeHome();
     mkdirSync(join(home, 'skills'), { recursive: true });
     chmodSync(join(home, 'skills'), 0o555);
@@ -227,7 +240,7 @@ describe('traex runtime registry', () => {
     const domain = domainFor(traeHome());
     const cliStart = readProcessStartIdentity(process.pid);
     await acquireTraexRuntimeStart(domain, {
-      occupantId: 'first', comboKey: 'content-a', force: true, occupancyOnly: true,
+      occupantId: 'first', comboKey: 'content-a', installSignature: 'signature-a', force: true, occupancyOnly: true,
       cliPid: process.pid, ...(cliStart ? { cliStart } : {}),
       workerPid: process.ppid, daemonPid: process.ppid,
     });
@@ -236,8 +249,39 @@ describe('traex runtime registry', () => {
       cliPid: process.pid, ...(cliStart ? { cliStart } : {}),
       workerPid: process.ppid, daemonPid: process.ppid,
     });
-    expect(readTraexRuntimeOccupants(domain)?.find(o => o.occupantId === 'second')?.comboKey)
-      .toBe('content-a');
+    expect(readTraexRuntimeOccupants(domain)?.find(o => o.occupantId === 'second'))
+      .toMatchObject({ comboKey: 'content-a', installSignature: 'signature-a' });
+  });
+
+  it('restores the scheduler install signature from snapshot provenance after reattach', async () => {
+    const home = traeHome();
+    const dir = release('a');
+    const snapshot = await materializeTraexSnapshot({
+      releaseDir: dir,
+      snapshotsRoot: tempDir('botmux-traex-snapshots-'),
+    });
+    const provenance = readTraexSnapshotProvenance(snapshot.traexPath);
+    expect(provenance?.sourceSignature).toBe(computeTraexInstallSignature(dir));
+    const cliStart = readProcessStartIdentity(process.pid);
+    const attached = await acquireTraexRuntimeOccupancy({
+      traeHome: home,
+      releaseDir: dir,
+      existingRuntime: true,
+      cliPid: process.pid,
+      ...(cliStart ? { cliStart } : {}),
+      workerPid: process.ppid,
+      daemonPid: process.ppid,
+    });
+    expect(attached.kind).toBe('granted');
+    if (attached.kind !== 'granted') return;
+
+    // This is the worker's leaf-backfill contract: the content key and the
+    // source signature come from the same verified snapshot manifest.
+    await attached.lease.markRunning(process.pid, cliStart, {
+      comboKey: provenance!.manifest.comboKey,
+      ...(provenance!.sourceSignature ? { installSignature: provenance!.sourceSignature } : {}),
+    });
+    expect(precheckTraexRuntime({ traeHome: home, releaseDir: dir }).state).toBe('compatible');
   });
 
   it('lets a same-content start overlap an opaque runtime after its identity is backfilled', async () => {
@@ -563,7 +607,7 @@ describe('acquireTraexRuntimeLease', () => {
     await first.lease.abandon();
   });
 
-  it('fails closed when the shared cache cannot be coordinated', async () => {
+  it.skipIf(rootIgnoresWritePermissionBits)('fails closed when the shared cache cannot be coordinated', async () => {
     const home = traeHome();
     mkdirSync(join(home, 'skills'), { recursive: true });
     chmodSync(join(home, 'skills'), 0o555);
@@ -578,7 +622,7 @@ describe('acquireTraexRuntimeLease', () => {
     if (result.kind === 'error') expect(result.reason).toBe('uncoordinated');
   });
 
-  it('reports an unknown precheck when the domain is uncoordinated', () => {
+  it.skipIf(rootIgnoresWritePermissionBits)('reports an unknown precheck when the domain is uncoordinated', () => {
     const home = traeHome();
     mkdirSync(join(home, 'skills'), { recursive: true });
     chmodSync(join(home, 'skills'), 0o555);

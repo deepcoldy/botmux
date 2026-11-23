@@ -1,4 +1,5 @@
 import type { DaemonSession } from './types.js';
+import type { ScheduledTask } from '../types.js';
 
 /** Worker → daemon terminal error code: a hidden schedule run's CLI never
  *  recorded the prompt it was started with, so the run never executed (#1607). */
@@ -29,6 +30,39 @@ export function noteDeferredScheduleRunFailure(
   if (context.errorCode === SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE) {
     ds.deferredScheduleUndeliveredTurnId = context.turnId;
   }
+}
+
+/** A scheduled turn still held by the runtime gate cannot become accepted after
+ * its worker has exited. Settle that exact parked run immediately rather than
+ * leaving it until the handoff timeout. Accepted turns and unrelated waiting
+ * sessions do not take this exit. The scheduler settlement is idempotent, so
+ * duplicate session run indexes and repeated exit edges remain single-shot. */
+export function settleHeldScheduleRunsOnWorkerExit(
+  session: Pick<DaemonSession['session'], 'scheduledRun' | 'scheduledRuns'>,
+  larkAppId: string,
+  deps: {
+    getDeferredRun: (taskId: string, appId: string) => ScheduledTask['deferredRun'] | undefined;
+    settle: (taskId: string, runId: string, reason: string, appId?: string) => boolean;
+  },
+): number {
+  const scheduledRuns = [
+    ...(session.scheduledRun ? [session.scheduledRun] : []),
+    ...Object.values(session.scheduledRuns ?? {}),
+  ];
+  let settled = 0;
+  for (const run of scheduledRuns) {
+    const parked = deps.getDeferredRun(run.taskId, larkAppId);
+    if (!parked || parked.runId !== run.runId) continue;
+    if (Object.values(parked.acceptedTargets ?? {}).includes(run.turnId)) continue;
+    if (!Object.values(parked.heldTargets ?? {}).includes(run.turnId)) continue;
+    if (deps.settle(
+      run.taskId,
+      run.runId,
+      'scheduled turn worker exited while the TRAE runtime handoff was still waiting',
+      larkAppId,
+    )) settled += 1;
+  }
+  return settled;
 }
 
 /** Execute the exact-turn lifecycle decision after a hidden schedule run

@@ -1646,7 +1646,13 @@ describe('target daemon consumes signed message authority', () => {
     let execute: (task: any, context: any) => Promise<void>;
     let dispatches = 0;
     h.installSchedulerCallback({
-      cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      cfg: { larkAppId: APP }, scheduler: {
+        setExecuteCallback: (fn: typeof execute) => { execute = fn; },
+        getRuntimeTask: () => undefined,
+        markDeferredTargetDispatching: () => false,
+        markDeferredTargetAccepted: () => false,
+        parkDeferredRun: () => false,
+      },
       executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
         await run(); return 'executed';
       },
@@ -1685,7 +1691,13 @@ describe('target daemon consumes signed message authority', () => {
     let dispatches = 0;
     let revokeOnWait = true;
     h.installSchedulerCallback({
-      cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      cfg: { larkAppId: APP }, scheduler: {
+        setExecuteCallback: (fn: typeof execute) => { execute = fn; },
+        getRuntimeTask: () => undefined,
+        markDeferredTargetDispatching: () => false,
+        markDeferredTargetAccepted: () => false,
+        parkDeferredRun: () => false,
+      },
       executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
         if (revokeOnWait) {
           revokeOnWait = false;

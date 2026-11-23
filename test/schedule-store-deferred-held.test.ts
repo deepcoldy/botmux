@@ -37,6 +37,7 @@ const TASK_PARAMS = {
   workingDir: '/workspace/project',
   chatId: 'oc_a',
   chatIds: ['oc_a', 'oc_b'],
+  owner: { kind: 'human' as const, openId: 'ou_deferred_store' },
 };
 
 async function freshImport() {

@@ -48,6 +48,18 @@ import {
   type TraexRuntimeContent,
 } from './traex-runtime-snapshot.js';
 
+/** Wrapper and Forge launches do not expose a content identity BotMux can
+ * verify before exec. They deliberately retain their pre-handoff behaviour
+ * instead of registering an unknown occupant that would serialise every
+ * session sharing the same TRAE_HOME. Direct launches and existing-runtime
+ * reattachment without those launch modes remain coordinated. */
+export function traexLaunchUsesSharedRuntimeGate(launch: {
+  wrapperCli?: string | null;
+  cliLaunchMode?: string | null;
+}): boolean {
+  return !launch.wrapperCli?.trim() && launch.cliLaunchMode !== 'forge-traex';
+}
+
 export interface TraexRuntimeGateInput {
   /** Defaults to the worker's own TRAE_HOME. */
   traeHome?: string;
@@ -100,13 +112,17 @@ export interface TraexRuntimeLease {
   domain: TraexRuntimeDomain;
   snapshot: TraexRuntimeContent;
   /** This lease only reserves the domain for a runtime this worker did not
-   *  exec (adopt/reattach/wrapper/forge). Its content identity is unknown, so
-   *  it blocks incompatible starts and must never authorize one. */
+   *  exec (adopt/reattach). Its content identity is unknown until backfilled,
+   *  so it blocks incompatible starts and must never authorize one. */
   occupancyOnly?: boolean;
   /** Attach the real CLI birth identity after exec. Never releases the slot.
-   *  `comboKey` backfills content identity for a record registered without
-   *  proof (adopt/reattach/opaque launcher); it never replaces a proven key. */
-  markRunning(cliPid: number, cliStart?: string, comboKey?: string): Promise<void>;
+   *  `identity` backfills content and source-install proof for a record
+   *  registered without them (adopt/reattach); it never replaces a proven key. */
+  markRunning(
+    cliPid: number,
+    cliStart?: string,
+    identity?: { comboKey?: string; installSignature?: string },
+  ): Promise<void>;
   /** The process behind this lease does not run the object we registered.
    *  Downgrade the occupant to unknown so it blocks instead of authorizing a
    *  parallel start with an unproven identity. */
@@ -195,14 +211,20 @@ function leaseFor(
     domain,
     snapshot,
     ...(occupancyOnly ? { occupancyOnly: true } : {}),
-    async markRunning(cliPid: number, cliStart?: string, comboKey?: string): Promise<void> {
+    async markRunning(
+      cliPid: number,
+      cliStart?: string,
+      identity?: { comboKey?: string; installSignature?: string },
+    ): Promise<void> {
       await markTraexRuntimeRunning(domain, occupantId, {
         cliPid,
         ...(cliStart ? { cliStart } : {}),
         ...(snapshot.dir ? { snapshotDir: snapshot.dir } : {}),
-        ...(comboKey ? { comboKey } : {}),
+        ...(identity?.comboKey ? { comboKey: identity.comboKey } : {}),
+        ...(identity?.comboKey && identity.installSignature
+          ? { installSignature: identity.installSignature } : {}),
       });
-      if (comboKey && snapshot.comboKey === '') snapshot.comboKey = comboKey;
+      if (identity?.comboKey && snapshot.comboKey === '') snapshot.comboKey = identity.comboKey;
     },
     async markUnknown(cliPid?: number, cliStart?: string): Promise<void> {
       await markTraexRuntimeUnknown(domain, occupantId, {

@@ -58,7 +58,7 @@ function task() {
   authority.initializeApp(APP, []);
   scheduler.setScheduleAuthorityStore(authority);
   scheduler.setOwnerFilter(APP, true);
-  return scheduler.addTask({ id: 'rvpr2001', name: 'review handoff', schedule: 'every 30m', prompt: 'original prompt', workingDir: root, chatId: 'oc_A', chatIds: ['oc_A', 'oc_B'], larkAppId: APP });
+  return scheduler.addTask({ id: 'rvpr2001', name: 'review handoff', schedule: 'every 30m', prompt: 'original prompt', workingDir: root, chatId: 'oc_A', chatIds: ['oc_A', 'oc_B'], larkAppId: APP, owner: { kind: 'human', openId: 'ou_reviewer' } });
 }
 async function flush() {
   await Promise.resolve(); await Promise.resolve();
@@ -212,17 +212,6 @@ async function liveRuntime(home: string, key: string) {
 }
 
 describe('PR2 round2 protocol wiring', () => {
-  it('does not authorize a fresh opaque launcher beside a live incompatible runtime', async () => {
-    const home = join(root, 'home');
-    await liveRuntime(home, 'A');
-    // The wrapper/forge new-exec path calls occupancy WITHOUT the
-    // existing-runtime bypass; an unprovable new start must wait/refuse.
-    const next = await acquireTraexRuntimeOccupancy({
-      traeHome: home, releaseDir: release('B'), workerPid: process.pid, daemonPid: process.pid,
-    });
-    expect(next.kind).toBe('blocked');
-  });
-
   it('registers an already-alive adopted runtime as unknown without authorizing a parallel start', async () => {
     const home = join(root, 'home');
     const adopted = await acquireTraexRuntimeOccupancy({
@@ -230,9 +219,14 @@ describe('PR2 round2 protocol wiring', () => {
       existingRuntime: true,
     });
     expect(adopted.kind).toBe('granted');
-    // A later unprovable new exec must wait for that unknown occupant.
-    const fresh = await acquireTraexRuntimeOccupancy({
-      traeHome: home, releaseDir: release('B'), workerPid: process.pid, daemonPid: process.pid,
+    // A later managed start with different proven content must wait for that
+    // unknown adopted occupant.
+    const fresh = await acquireTraexRuntimeLease({
+      traeHome: home,
+      releaseDir: release('B'),
+      workerPid: process.pid,
+      daemonPid: process.pid,
+      snapshotsRoot: join(root, 'snapshots'),
     });
     expect(fresh.kind).toBe('blocked');
   });
@@ -330,7 +324,7 @@ describe('independent PR2 r3 admission-to-exec identity', () => {
 describe('independent PR2 r4 late worker defer', () => {
   it('does not settle a finite run before the worker can report its start gate wait', async () => {
     task(); // real authority/store initialization
-    const t = scheduler.addTask({id:'rvpr2002',name:'finite handoff',schedule:'every 30m',prompt:'exact prompt',workingDir:root,chatId:'oc_A',chatIds:['oc_A'],larkAppId:APP,repeat:{times:1,completed:0}});
+    const t = scheduler.addTask({id:'rvpr2002',name:'finite handoff',schedule:'every 30m',prompt:'exact prompt',workingDir:root,chatId:'oc_A',chatIds:['oc_A'],larkAppId:APP,owner:{kind:'human',openId:'ou_reviewer'},repeat:{times:1,completed:0}});
     let runId = '';
     const turnId = `schedule:${t.id}:late`;
     scheduler.setExecuteCallback(async (current, context) => {
@@ -387,7 +381,7 @@ describe('independent PR2 r4 late worker defer', () => {
 describe('independent PR2 r5 admission facts', () => {
   it('never publishes successful completion while the forked worker has not crossed its gate', async () => {
     task();
-    const t = scheduler.addTask({id:'rvpr2002',name:'finite',schedule:'every 30m',prompt:'original prompt',workingDir:root,chatId:'oc_A',chatIds:['oc_A'],larkAppId:APP,repeat:{times:1,completed:0}});
+    const t = scheduler.addTask({id:'rvpr2002',name:'finite',schedule:'every 30m',prompt:'original prompt',workingDir:root,chatId:'oc_A',chatIds:['oc_A'],larkAppId:APP,owner:{kind:'human',openId:'ou_reviewer'},repeat:{times:1,completed:0}});
     let runId = '';
     const turnId = `schedule:${t.id}:late`;
     scheduler.setExecuteCallback(async (current, context) => {

@@ -469,6 +469,7 @@ import {
   acquireTraexRuntimeLease,
   acquireTraexRuntimeOccupancy,
   daemonBirthIdentity,
+  traexLaunchUsesSharedRuntimeGate,
   type TraexRuntimeBlocker,
   type TraexRuntimeLease,
 } from './services/traex-runtime-gate.js';
@@ -29844,19 +29845,28 @@ async function spawnCliBody(
   /**
    * Content identity of the process actually running at `pid`.
    *
-   * A record registered without proof (adopt/reattach/opaque launcher) can
-   * still be identified after the fact: `/proc/<pid>/exe` names the kernel's
-   * own object, a BotMux snapshot records its `comboKey` in the manifest, and
+   * A record registered without proof (adopt/reattach) can still be identified
+   * after the fact: `/proc/<pid>/exe` names the kernel's own object, a BotMux
+   * snapshot records its `comboKey` and source signature in the manifest, and
    * otherwise the running executable (plus its release siblings) is hashed.
    * Any failure stays unknown — the caller then keeps the fail-closed record.
    */
-  const captureRunningContentKey = async (pid: number, cliStart?: string): Promise<string | undefined> => {
+  const captureRunningContentKey = async (
+    pid: number,
+    cliStart?: string,
+  ): Promise<{ comboKey: string; installSignature?: string } | undefined> => {
     const running = readRunningExeIdentity(pid, cliStart);
     if (!running) return undefined;
     const provenance = readTraexSnapshotProvenance(running.path);
-    if (provenance) return provenance.manifest.comboKey;
+    if (provenance) {
+      return {
+        comboKey: provenance.manifest.comboKey,
+        ...(provenance.sourceSignature ? { installSignature: provenance.sourceSignature } : {}),
+      };
+    }
     try {
-      return (await captureTraexExecutableIdentity(running.path)).comboKey || undefined;
+      const comboKey = (await captureTraexExecutableIdentity(running.path)).comboKey;
+      return comboKey ? { comboKey } : undefined;
     } catch (err) {
       log(`[traex-runtime] could not capture content identity for pid ${pid}: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
@@ -29885,15 +29895,14 @@ async function spawnCliBody(
         );
       }
     }
-    // A record with no content identity (adopt/reattach/opaque launcher) is
-    // backfilled once the real TRAE process is known. This is what lets two
-    // same-version runtimes overlap instead of serialising the whole domain,
-    // and what stops a reconnected daemon from pinning the domain to unknown.
+    // A record with no content identity (adopt/reattach) is backfilled once
+    // the real TRAE process is known. This stops a reconnected daemon from
+    // pinning the domain to unknown and restores its scheduling signature.
     const backfill = proven && lease.snapshot.comboKey === '' && isTraexProcess(pid);
     if (backfill && !traexContentKeyInFlight.has(pid)) {
       traexContentKeyInFlight.add(pid);
       void captureRunningContentKey(pid, cliStart ?? undefined)
-        .then(comboKey => lease.markRunning(pid, cliStart ?? undefined, comboKey))
+        .then(identity => lease.markRunning(pid, cliStart ?? undefined, identity))
         .catch((err) => {
           log(`[traex-runtime] failed to record CLI identity ${pid}: ${err instanceof Error ? err.message : String(err)}`);
         })
@@ -29929,15 +29938,15 @@ async function spawnCliBody(
     || willReattachPersistent
     || cfg.existingAppServerEndpoint !== undefined
   );
-  // Wrapper/forge launchers are a NEW exec whose content identity this worker
-  // cannot hash. They must NOT borrow the existing-runtime registration bypass:
-  // an opaque new start has to pass the same compatibility gate (wait for every
-  // incompatible occupant to be proven gone) as a proven-content start.
-  const traexOpaqueNewExec = traexRuntimeRelevant && (
-    !!cfg.wrapperCli
-    || cfg.cliLaunchMode === 'forge-traex'
-  );
-  if (traexRuntimeRelevant) {
+  // Wrapper/forge launches intentionally keep their pre-handoff behaviour.
+  // Their content cannot be proven before exec, so registering an unknown
+  // occupant would serialise all same-domain sessions without providing the
+  // version-safety guarantee this gate gives direct managed launches.
+  const traexGateExcluded = traexRuntimeRelevant && !traexLaunchUsesSharedRuntimeGate(cfg);
+  if (traexGateExcluded) {
+    log('[traex-runtime] wrapperCli/forge-traex launch excluded from the shared-cache gate');
+  }
+  if (traexRuntimeRelevant && !traexGateExcluded) {
     const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
     // Two different facts:
     //   - configuredEntry: the UPDATABLE operator/PATH entry. It must keep its
@@ -30019,38 +30028,25 @@ async function spawnCliBody(
             fixedPath,
             existingRuntime: true,
           })
-        : traexOpaqueNewExec
-          // New opaque exec: same compatibility gate as a proven start. It may
-          // wait; it may not borrow the existing-runtime bypass.
-          ? await acquireTraexRuntimeOccupancy({
-              ...common,
-              fixedPath,
-              existingRuntime: false,
-              coordinate: !scratchRequested,
-              waitMs: Number.POSITIVE_INFINITY,
-              pollMs: 500,
-              abort: gateAbort,
-              onBlocked,
-            })
-          : await acquireTraexRuntimeLease({
-              ...common,
-              // Re-resolved on every wait iteration so A→B→C is observed rather
-              // than frozen to the release that was current when we arrived.
-              entryPath: configuredEntry,
-              fixedPath,
-              ...(fixedPath ? { fixedExecutablePath: resolvedEntry } : {}),
-              // Always exec a frozen copy — including pinned and sandboxed
-              // launches. A pinned config stays untouched; only the runtime
-              // object is frozen so a switch between materialisation and exec
-              // cannot make this process load content it never registered.
-              materialize: true,
-              // Scratch is a session-private COW home: no cross-process domain.
-              coordinate: !scratchRequested,
-              waitMs: Number.POSITIVE_INFINITY,
-              pollMs: 500,
-              abort: gateAbort,
-              onBlocked,
-            });
+        : await acquireTraexRuntimeLease({
+            ...common,
+            // Re-resolved on every wait iteration so A→B→C is observed rather
+            // than frozen to the release that was current when we arrived.
+            entryPath: configuredEntry,
+            fixedPath,
+            ...(fixedPath ? { fixedExecutablePath: resolvedEntry } : {}),
+            // Always exec a frozen copy — including pinned and sandboxed
+            // launches. A pinned config stays untouched; only the runtime
+            // object is frozen so a switch between materialisation and exec
+            // cannot make this process load content it never registered.
+            materialize: true,
+            // Scratch is a session-private COW home: no cross-process domain.
+            coordinate: !scratchRequested,
+            waitMs: Number.POSITIVE_INFINITY,
+            pollMs: 500,
+            abort: gateAbort,
+            onBlocked,
+          });
       if (gate.kind === 'aborted') throw new CliSpawnSupersededError();
       if (gate.kind === 'blocked') {
         throw new Error(`TRAE runtime gate stayed blocked: ${gate.detail}`);
@@ -30090,9 +30086,8 @@ async function spawnCliBody(
         };
         traexLaunchHelperPath = gate.lease.snapshot.helperPath;
       } else {
-        // Adopt/reattach/wrapper/forge: the configured entry is still the
-        // thing the install watcher should follow, but there is no frozen
-        // launch target to prove.
+        // Adopt/reattach: the configured entry is still the thing the install
+        // watcher should follow, but there is no frozen launch target to prove.
         traexConfiguredEntryAtSpawn = {
           generation: cliSpawnGeneration,
           entry: configuredEntry,
@@ -33360,6 +33355,17 @@ async function spawnCliBody(
       publish: send,
       spawn: () => {
         const backend = spawnBackend;
+        if (cfg.cliId === 'traex' && traexGateExcluded) {
+          // Preserve the pre-handoff install observation for wrapper/forge:
+          // they skip only the shared-domain lease, not #3252's install watch.
+          traexConfiguredEntryAtSpawn = {
+            generation: cliSpawnGeneration,
+            entry: spawnCliBin,
+            identity: resolveInstallIdentity(spawnCliBin),
+          };
+          traexLaunchTargetAtSpawn = undefined;
+          traexLaunchHelperPath = undefined;
+        }
         if (credentialOnlyBwrap && !sandboxRequested && !!cfg.wrapperCli?.trim() && !!claudeDataDir) {
           // The running CLI must be compared with the install object that was
           // present for THIS spawn, not with an upgrade that may replace the
