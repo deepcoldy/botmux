@@ -33,6 +33,7 @@ vi.mock('../src/core/device-isolation-activation.js', async importOriginal => ({
 }));
 
 import * as workerPool from '../src/core/worker-pool.js';
+import { logger } from '../src/utils/logger.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { __testOnly_resetBotRegistry, registerBot } from '../src/bot-registry.js';
@@ -161,6 +162,26 @@ describe('restart status card × worker lifecycle', () => {
     await flush();
 
     expect(c.states()).toEqual(['red']);
+  });
+
+  it('logs the effective failed status when a setting success receipt is not proven', async () => {
+    const { ds, worker } = arm({ backendType: 'tmux' });
+    const c = chat(ds);
+    workerPool.requestSessionRestart(ds, { source: 'card', notify: c.notifier('effort') },
+      { topicEffort: { model: 'm', effort: 'low', nativeSessionId: ds.session.cliSessionId! } as any });
+    const sent = worker.send.mock.calls.map((call: any[]) => call[0]).find((m: any) => m?.type === 'restart');
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+
+    // A success without the requested topicEffort is settled as a failure.
+    worker.emit('message', { type: 'restart_result', attemptId: sent.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await flush();
+
+    expect(c.states()).toEqual(['red']);
+    expect(ds.workerReady).toBe(false);
+    const receiptLogs = info.mock.calls.map(call => call.join(' ')).filter(line => line.includes('restart_result'));
+    expect(receiptLogs).toHaveLength(1);
+    expect(receiptLogs[0]).toContain('restart_result failed');
+    expect(receiptLogs[0]).not.toContain('restart_result succeeded');
   });
 
   it('a dashboard revive whose working directory is gone keeps the live pane and reports the failure', async () => {

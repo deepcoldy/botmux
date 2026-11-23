@@ -221,7 +221,7 @@ import {
   shouldHoldCodexRunnerInput,
   type CodexRunnerFreshnessState,
 } from './services/codex-runner-freshness.js';
-import { canStartInjectionFlush, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
+import { canStartInjectionFlush, minimaxCompactQueueSuppressesPromptReady, shouldDeferUserFlush, shouldFlushInjectionsFirst, type PendingInjection } from './core/inject-queue-policy.js';
 import { applyRespawnConfigPatch, respawnConfigPatchFromMessage } from './core/respawn-config-patch.js';
 import { classifyMergedRestart, decideRestartFollowup, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings, settleDurableTurnForRestart, type RestartLaunchSettings } from './core/restart-followup-policy.js';
 import { stripAnsiForLog, tailChars } from './utils/crash-log.js';
@@ -2273,9 +2273,22 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   const explicitOrigin = origin ?? (msg.type === 'managed_turn_origin' && typeof pendingManagedTurnOriginScope !== 'undefined'
     ? pendingManagedTurnOriginScope
     : undefined);
+  // The restart receipt is a statement about THIS ATTEMPT, not a runtime
+  // observation: it says the attempt the daemon minted reached a prompt. The
+  // relay rebinds in process (launcher pid → the real CLI behind it) while the
+  // callbacks armed during spawn keep the launcher's binding, and the host then
+  // judges the receipt against a retired runtime and never hands it to the
+  // restart coordinator — `/restart` reported 等待就绪超时 forty seconds after a
+  // CLI that was already at its prompt (2026-11-23). So name the live binding of
+  // the same physical CLI. Readiness keeps the captured binding on purpose: a
+  // pre-replacement callback must not publish the successor's readiness
+  // (session-contract-gateway.test.ts).
+  const liveProcessOrigin = msg.type === 'restart_result'
+    ? workerSessionEventScope.liveProcessOrigin()
+    : undefined;
   // Runtime identity follows the physical observer's binding. A submitted
   // turn may still name the previous runtime after an in-process rebind.
-  const captured = explicitOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
+  const captured = explicitOrigin ?? liveProcessOrigin ?? (msg.type === 'cli_session_id' ? workerSessionEventScope.capture()
     : workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined)) ?? operationOrigin;
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
@@ -6380,7 +6393,11 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         }),
       });
       if (untouchedCompact) {
-        send({ type: 'prompt_ready' });
+        // Recovery still has to drain a following queued compact. Reopen the
+        // daemon's compact-button fence only when no such command remains.
+        if (!minimaxCompactQueueSuppressesPromptReady(lastInitConfig?.cliId, pendingRawInputs)) {
+          send({ type: 'prompt_ready' });
+        }
         // A queued command owns isFlushing until its caller's finally runs.
         // With no native idle edge after rejection, admitted follower messages
         // need one fresh drain after that mutex is released (never a replay of
@@ -23033,7 +23050,23 @@ function settleRestartAttemptOnReady(
       pendingTopicEffortRestart = undefined;
     }
 
-    if (opts.republishPromptReady) send({ type: 'prompt_ready' });
+    // Readiness this same callback published a moment ago was judged under the
+    // binding it captured and refused — a pre-replacement callback may not
+    // declare the successor ready. Only the receipt below was re-scoped, so the
+    // daemon kept `cliReady` false: the card said 已重启 while the next
+    // passthrough cascade sat out its whole 120s idle budget (cli-idle-wait)
+    // against an idle screen, because nothing published readiness again
+    // (2026-11-23 review of #3734). The receipt proves THIS attempt reached a
+    // prompt in the live CLI of the same process, so publish readiness under
+    // that same proven origin. A callback of a REPLACED process gets no live
+    // origin and still cannot announce the new process ready.
+    const liveProcess = isPromptReady ? workerSessionEventScope?.liveProcessOrigin() : undefined;
+    const observer = workerSessionEventScope?.contextBinding();
+    const supersededInProcess = !!liveProcess && !!observer && observer.bindingId !== liveProcess.bindingId;
+    if ((opts.republishPromptReady || supersededInProcess)
+      && !minimaxCompactQueueSuppressesPromptReady(lastInitConfig?.cliId, pendingRawInputs)) {
+      send({ type: 'prompt_ready' }, liveProcess);
+    }
     send({
       type: 'restart_result',
       attemptId: activeRestartAttemptId,
@@ -23041,6 +23074,12 @@ function settleRestartAttemptOnReady(
       category: 'prompt_ready',
       ...(topicEffort ? { topicEffort } : {}),
     });
+    // The success receipt is the ONLY edge that closes the restart's status card
+    // and lifts the daemon's workerReady fence, and until now nothing on either
+    // side said whether it was sent. A `/restart` card that sat at 重启超时 while
+    // the CLI was plainly back at its prompt could not be told apart from a
+    // receipt that never left the worker (2026-11-23). One line per restart.
+    log(`${trigger}: restart receipt sent (attempt=${activeRestartAttemptId.slice(0, 8)}, status=succeeded)`);
     activeRestartAttemptId = undefined;
     return;
   }
@@ -23420,8 +23459,7 @@ function markPromptReady(): void {
   // A compact click already owns the daemon's readiness fence. The prompt
   // between the preceding business turn and this queued command must drain
   // the command without making the button accept another click.
-  if (!(lastInitConfig?.cliId === 'minimax'
-    && pendingRawInputs.some(input => input.content.trim() === '/compact'))) {
+  if (!minimaxCompactQueueSuppressesPromptReady(lastInitConfig?.cliId, pendingRawInputs)) {
     send({ type: 'prompt_ready' });
   }
   if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
@@ -41046,6 +41084,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const observerDecided = msg.observerDecision === true && (!scope || scope.currentBinding()?.bindingId === msg.bindingId)
         && restoredObserverGrantWait.decide(msg.bindingId);
       if (msg.mayExecute && (msg.observedExecutions?.length || observerDecided)) codexBridgeDrainAndMaybeEmit();
+      if (msg.mayExecute) replayDeferredSessionReady();
       break;
     }
 
@@ -42696,13 +42735,71 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
   }
 }
-process.on('message', (raw: unknown, handle: unknown) => {
+type DeferredSessionReady = {
+  msg: Extract<DaemonToWorker, { type: 'session_ready' }>;
+  handle: unknown;
+  timer: ReturnType<typeof setTimeout>;
+};
+const deferredSessionReady: DeferredSessionReady[] = [];
+
+function takeDeferredSessionReady(entry: DeferredSessionReady): boolean {
+  const index = deferredSessionReady.indexOf(entry);
+  if (index < 0) return false;
+  deferredSessionReady.splice(index, 1);
+  clearTimeout(entry.timer);
+  return true;
+}
+
+/** A new native session's hook may overtake the host's runtime_binding. Hold it
+ * briefly so runtime_contract_assigned can prove the pending runtime instead of
+ * losing this one-shot boundary to stale_runtime_target. */
+function deferSessionReadyUntilRuntimeAssigned(msg: DeferredSessionReady['msg'], handle: unknown): void {
+  const key = msg.requestId ?? msg.source;
+  if (key && deferredSessionReady.some(entry => (entry.msg.requestId ?? entry.msg.source) === key)) return;
+  if (deferredSessionReady.length >= 8) {
+    log('Dropped session_ready deferral: too many pending runtime assignments');
+    return;
+  }
+  const entry: DeferredSessionReady = { msg, handle, timer: setTimeout(() => {
+    if (takeDeferredSessionReady(entry)) log('Dropped deferred session_ready: runtime contract assignment timed out');
+  }, 5_000) };
+  entry.timer.unref?.();
+  deferredSessionReady.push(entry);
+  log(`Deferred session_ready until runtime contract assignment (runtime=${msg.sessionCommand?.runtime?.runtimeId.slice(0, 8) ?? '?'})`);
+}
+
+/** Re-evaluate a deferred hook only against the LIVE binding. The host judged
+ * the old runtime; the assignment now proves its successor in the SAME physical
+ * process. A different process never inherits the signal and it expires. */
+function replayDeferredSessionReady(): void {
+  const scope = workerSessionEventScope;
+  const current = scope?.currentBinding();
+  if (!scope || !current?.runtime) return;
+  for (const entry of [...deferredSessionReady]) {
+    const context = entry.msg.sessionCommand;
+    const previous = context?.runtime ? scope.bindingForRuntime(context.runtime) : undefined;
+    if (!context?.runtime || !previous || previous.physicalId !== current.physicalId) continue;
+    const sessionCommand = { ...context, runtime: current.runtime };
+    if (!admitSessionCommand('session_ready', sessionCommand, current.runtime).allowed) continue;
+    if (takeDeferredSessionReady(entry)) dispatchDaemonMessage({ ...entry.msg, sessionCommand }, entry.handle);
+  }
+}
+
+function clearDeferredSessionReady(): void {
+  for (const entry of deferredSessionReady.splice(0)) clearTimeout(entry.timer);
+}
+
+function dispatchDaemonMessage(raw: unknown, handle: unknown): unknown {
   const msg = raw as DaemonToWorker;
   if (!msg || typeof msg !== 'object') return;
   const binding = workerSessionEventScope?.currentBinding();
   if (workerSessionEventScope && msg.type !== 'init') {
     const admission = admitSessionCommand(msg.type, msg.sessionCommand, binding?.runtime ?? binding?.proposedRuntime, msg.type === 'restart' ? msg.attemptId : undefined);
     if (!admission.allowed) {
+      if (msg.type === 'session_ready' && admission.reason === 'stale_runtime_target' && msg.sessionCommand?.runtime) {
+        deferSessionReadyUntilRuntimeAssigned(msg, handle);
+        return;
+      }
       log(`Rejected ${msg.type}: ${admission.reason}`);
       const target = msg.sessionCommand?.runtime ? workerSessionEventScope.bindingForRuntime(msg.sessionCommand.runtime) : binding;
       const reject = () => {
@@ -42721,7 +42818,8 @@ process.on('message', (raw: unknown, handle: unknown) => {
   if (execution) workerSessionEventScope?.rememberExecution(execution);
   if (binding && workerSessionEventScope && msg.type !== 'init') return workerSessionEventScope.run(binding, () => handleContractDaemonMessage(msg, handle), execution, msg.sessionCommand?.operationId);
   return handleContractDaemonMessage(msg, handle);
-});
+}
+process.on('message', dispatchDaemonMessage);
 
 // The daemon starts every worker with an empty backlog.
 publishedCliInputBacklog = cliInputBacklogKey({ pending: false });
@@ -42737,6 +42835,7 @@ grokRuntimePollTimer.unref?.();
 // ─── Cleanup ─────────────────────────────────────────────────────────────────
 
 function cleanup(): void {
+  clearDeferredSessionReady();
   clearInterval(claudeEffortPollTimer);
   clearInterval(grokRuntimePollTimer);
   workerFinalOutputHandoff?.stop();

@@ -23779,11 +23779,18 @@ function setupWorkerHandlers(
         const validSettingReceipt = !currentSettingsAttempt || msg.status !== 'succeeded'
           || (!!msg.topicEffort && msg.topicEffort.model === savedReadiness.requested.model
             && msg.topicEffort.effort === savedReadiness.requested.effort);
+        const effectiveStatus = validSettingReceipt ? msg.status : 'failed';
         const restartSettled = restartCoordinator.resolve(
           ds.session.sessionId,
           msg.attemptId,
-          validSettingReceipt ? msg.status : 'failed',
+          effectiveStatus,
         );
+        // `settled=false` means the coordinator had no attempt under this id —
+        // its status card keeps whatever it last showed (a 40s 重启超时) even
+        // though the CLI reported success. Say which side lost the correlation:
+        // without this the only symptom is a card that never leaves 重启超时
+        // (2026-11-23).
+        logger.info(`[${t}] restart_result ${effectiveStatus} attempt=${msg.attemptId.slice(0, 8)} settled=${restartSettled}`);
         // requestSessionRestart() fences the live generation by clearing
         // workerReady before asking the worker to respawn its CLI in place. An
         // in-worker respawn does not emit the process-level `ready` message
@@ -28055,11 +28062,19 @@ function setupWorkerHandlers(
     // current without a requesting user, and losing its identity decision
     // leaves every proven identity wrapper refused (exit 77), so both must be
     // visible in production. So must losing a terminal-local turn's start: a
-    // zero-prompt session then has nowhere to send that turn's final.
+    // zero-prompt session then has nowhere to send that turn's final. And so
+    // must a dropped restart receipt: it is the only edge that closes the
+    // restart status card and lifts the workerReady fence, so a scope rejection
+    // here leaves the card stuck at 重启超时 and fork/relay at worker_busy for a
+    // CLI that is plainly back at its prompt — diagnosable at debug level only,
+    // which production never has on (2026-11-23).
     const logRejected = (reason: string) => {
       if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked' || msg.type === 'session_identity_decision'
-        || msg.type === 'terminal_turn_started') && ds.worker === worker) {
-        logger.warn(`[${t}] Dropped ${msg.type} from current worker turn=${msg.turnId ?? '-'} reason=${reason}`);
+        || msg.type === 'terminal_turn_started' || msg.type === 'restart_result') && ds.worker === worker) {
+        const detail = msg.type === 'restart_result'
+          ? `attempt=${msg.attemptId.slice(0, 8)} status=${msg.status}`
+          : `turn=${msg.turnId ?? '-'}`;
+        logger.warn(`[${t}] Dropped ${msg.type} from current worker ${detail} reason=${reason}`);
       } else if (msg.type === 'final_output' && ds.worker === worker) {
         reportUndeliveredFinal(msg, reason);
       } else {
@@ -28072,11 +28087,24 @@ function setupWorkerHandlers(
       if (metadata) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId, msg);
       return;
     }
-    if (admission.kind === 'defer') return;
+    // A deferral parks the event until its binding proves an identity, and says
+    // nothing — which is wrong for the two messages whose loss is user-visible:
+    // a parked `prompt_ready` leaves the session looking busy, and a parked
+    // restart receipt leaves the status card at 重启超时 for a CLI that is at its
+    // prompt. Both are sent once, so a parked one is simply lost. Until this
+    // line a lost receipt was indistinguishable from one the worker never sent
+    // (2026-11-23).
+    const logDeferred = (stage: string) => {
+      if (msg.type === 'prompt_ready' || msg.type === 'restart_result') {
+        logger.warn(`[${t}] Deferred ${msg.type} from current worker at ${stage}`
+          + ` binding=${metadata?.bindingId?.slice(0, 8) ?? '-'} — waiting for that binding to bind an identity`);
+      }
+    };
+    if (admission.kind === 'defer') { logDeferred('ingest'); return; }
     await sessionController.flushPrimary();
     admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
     if (admission.kind === 'reject') { logRejected(admission.reason); return; }
-    if (admission.kind === 'defer') return;
+    if (admission.kind === 'defer') { logDeferred('gateway'); return; }
     // A verified native success is stronger than a lost input commit ACK.
     // Ambiguous/failed/cancelled boundaries do not prove queue admission.
     if ((admission.kind === 'current' || admission.kind === 'historical')

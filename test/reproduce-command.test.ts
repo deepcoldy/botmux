@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { spawnSync } from 'node:child_process';
 import { buildReproduceCommand, selectReproduceLaunch } from '../src/adapters/backend/reproduce-command.js';
 
 // Dashboard「复现命令」跨后端准确性（codex review issue 1）。
@@ -72,6 +73,26 @@ describe('buildReproduceCommand', () => {
     })!;
     expect(cmd).toContain("CODEX_HOME='/home/u/.botmux/codex/cli_app'");
     expect(cmd).toContain("'/opt/codex' 'resume'");
+  });
+
+  it.each(['pty', 'tmux'] as const)('%s reproduce command scrubs an ambient runtime binding from the repro child', backendType => {
+    const cmd = buildReproduceCommand({
+      backendType,
+      bin: '/usr/bin/printenv',
+      args: ['BOTMUX_RUNTIME_BINDING_ID'],
+      env: { ...baseEnv, BOTMUX_RUNTIME_BINDING_ID: 'original-launch-binding' },
+    })!;
+    expect(cmd).toContain('/usr/bin/env -u BOTMUX_RUNTIME_BINDING_ID');
+    expect(cmd).not.toContain("BOTMUX_RUNTIME_BINDING_ID='");
+    expect(cmd).toContain("BOTMUX_SESSION_ID='sess-1'");
+
+    const result = spawnSync('/bin/bash', ['-c', cmd], {
+      env: { ...process.env, BOTMUX_RUNTIME_BINDING_ID: 'ambient-pane-binding' },
+      encoding: 'utf8',
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
   });
 
   it('per-bot injectEnv (provider creds) are included and quoted', () => {
