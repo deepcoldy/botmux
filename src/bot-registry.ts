@@ -1814,6 +1814,15 @@ export interface BotConfig {
    */
   larkToolBinding?: boolean;
   /**
+   * 没有发起人时用主人的飞书身份（默认开启）。
+   * 绑定会话里 `lark-cli --as user` 原本只认本轮发起人；脚本、Webhook、平台、无创建人的定时任务、
+   * 发起人是主人的 bot 签名派发等回合没有可用的发起人，调用一律被拒。开启（未配置或 true）时这类回合改用
+   * bot 主人（getOwnerOpenId）对本应用的授权；有真人发起的回合仍用发起人自己的授权。
+   * 显式关闭（false）回到只认发起人的严格行为。triggerUserAuth 覆盖 lark-cli 时不生效。
+   * 每次调用实时读取，改完立即生效。见 core/lark-user-owner-fallback.ts。
+   */
+  larkUserOwnerFallback?: boolean;
+  /**
    * Local file sandbox selection.
    *   true/"oncall" — per-session deny-by-default three-tier whitelist
    *     (Linux bwrap + macOS Seatbelt, identical semantics; see
@@ -4532,6 +4541,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
       larkToolBinding: typeof entry.larkToolBinding === 'boolean' ? entry.larkToolBinding : undefined,
+      larkUserOwnerFallback: typeof entry.larkUserOwnerFallback === 'boolean' ? entry.larkUserOwnerFallback : undefined,
       // Wire representation stays backwards compatible: oncall = legacy `true`;
       // only scratch is a string; off serializes as false.
       sandbox: sandboxMode === 'oncall' ? true : sandboxMode === 'scratch' ? 'scratch' : false,

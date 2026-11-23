@@ -3,7 +3,7 @@ import { resolveAssistantSpawn } from './assistant-spawn.js';
 import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
 import { messageListenerTaskAnchor } from './message-listener-silence.js';
-import { rememberTriggerTurn } from './turn-origin.js';
+import { rememberExternalTriggerTurn, rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
 import * as sessionStore from '../services/session-store.js';
@@ -54,6 +54,10 @@ import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updat
 export interface TriggerSessionDeps {
   larkAppId: string;
   activeSessions: Map<string, DaemonSession>;
+  /** Set only by the daemon's public trigger entry for a request submitted
+   *  from outside (core/turn-origin isExternallySubmittedTriggerSource).
+   *  Internal relays calling triggerSessionTurn directly never set it. */
+  externalRequest?: boolean;
 }
 
 /** Daemon-internal dispatch controls. These deliberately do not live in the
@@ -899,6 +903,7 @@ async function triggerSessionTurnAdmitted(
   const ownerActor = req.actor === 'owner';
   const triggerId = stableTurnId || `trg_${ownerActor ? 'owner_' : ''}${randomUUID()}`;
   rememberTriggerTurn(triggerId, req.source.type);
+  if (deps.externalRequest === true) rememberExternalTriggerTurn(triggerId);
   // HTTP opt-in for codex-app native in-flight steer (turn/steer). The flag is
   // pure AUTHORIZATION forwarded to the worker — the live runner decides whether
   // it can actually merge into an active turn (canSteer); when it cannot, the

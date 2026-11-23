@@ -28,6 +28,12 @@ import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credent
 import { __resetPlatformAuthorizationRequestForTest } from '../src/core/platform-authorization-request.js';
 import * as credentialRequestClient from '../src/platform/credential-request-client.js';
 import { t } from '../src/i18n/index.js';
+import * as schedulerModule from '../src/core/scheduler.js';
+import * as eventDispatcher from '../src/im/lark/event-dispatcher.js';
+import * as dispatchUserDelegation from '../src/core/dispatch-user-delegation.js';
+import * as dispatchReportBinding from '../src/core/dispatch-report-binding.js';
+import { logger } from '../src/utils/logger.js';
+import { rememberExternalTriggerTurn } from '../src/core/turn-origin.js';
 import {
   createProtectedLoopbackProxyAttestation,
   PROTECTED_LOOPBACK_ATTESTATION_HEADER,
@@ -1132,5 +1138,286 @@ describe('unattended lark-cli turn on a platform-bound host', () => {
       expect(req).toEqual({ unionId: 'on_sender', appId: 'cli_bound', tools: ['lark-cli'], scopes: ['im:chat:read'] });
     }
     expect(dm).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('lark-cli --as user in a turn nobody started uses the bot owner (larkUserOwnerFallback)', () => {
+  const OWNER = 'ou_owner';
+  const TRIGGER = 'trg_abc12345';
+  const SCHEDULE = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+  let botConfig: Record<string, unknown>;
+  const useBot = (patch: Record<string, unknown> = {}) => {
+    botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', ...patch };
+    vi.mocked(bots.getBot).mockImplementation(() => ({ config: botConfig }) as any);
+  };
+  /** A live turn with no person of its own (a script, webhook or platform request). */
+  const callerless = (turnId: string, trustedCaller?: unknown) => {
+    // A script, webhook or platform request admitted through the public trigger entry.
+    if (turnId.startsWith('trg_')) rememberExternalTriggerTurn(turnId);
+    session.managedTurnOrigin.turnId = turnId;
+    session.managedTurnOrigin.identityTurnId = turnId;
+    delete session.managedTurnOrigin.callerOpenId;
+    if (trustedCaller === undefined) delete session.managedTurnOrigin.trustedCaller;
+    else session.managedTurnOrigin.trustedCaller = trustedCaller;
+  };
+  const tokenCallsFor = (person: string) => vi.mocked(tokens.resolveUserToken).mock.calls.filter(call => call[3] === person);
+  const auditLines = () => vi.mocked(logger.info).mock.calls.map(call => String(call[0]))
+    .filter(line => line.startsWith('[lark-tool:owner-fallback:audit]'));
+  const authRequest = (body: object = { scopes: ['docx:document:readonly'] }) => fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+    method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey }, body: JSON.stringify(body),
+  });
+
+  beforeEach(() => {
+    useBot();
+    session.chatType = 'group';
+    vi.spyOn(bots, 'getOwnerOpenId').mockImplementation(app => app === 'cli_bound' ? OWNER : undefined);
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockImplementation(async (_app, openId) => ({ openId, type: 'user' }) as any);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async (_app, _secret, _brand, person) =>
+      person === OWNER ? 'owner-token' : person === 'ou_sender' ? 'sender-token' : null);
+    vi.spyOn(logger, 'info');
+  });
+
+  it('a script, webhook or platform trigger uses the owner\'s grant, says so, and is audited', async () => {
+    callerless(TRIGGER);
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ appId: 'cli_bound', mode: 'user', credential: 'owner-token', actingAs: 'owner' });
+    expect(tokens.resolveUserToken).toHaveBeenCalledExactlyOnceWith('cli_bound', 'bound-secret', 'feishu', OWNER);
+    const [line] = auditLines();
+    for (const part of ['bot=cli_bound', 'session=tool-session', `turn=${TRIGGER}`, 'reason=external_trigger', 'result=granted']) {
+      expect(line).toContain(part);
+    }
+    // --as bot is untouched.
+    expect(await (await request('bot')).json()).toMatchObject({ mode: 'bot', credential: 'bound-bot-token' });
+  });
+
+  it('the real lark-cli wrapper runs the tool with the owner\'s token in a trigger turn and tells the agent so', async () => {
+    callerless(TRIGGER);
+    const real = join(dir, 'real-lark');
+    writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n');
+    chmodSync(real, 0o755);
+    binding.realBinary = real; delete (binding as any).ipcPort;
+    writeFileSync(larkToolBindingPath(dir, 'tool-session'), JSON.stringify(binding), { mode: 0o600 });
+    const run = await new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {
+      const child = spawnTsScript(join(process.cwd(), 'src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(dir, 'tool-session'), '--', 'docs', '+fetch', '--as=user'], {
+        env: { ...process.env, BOTMUX_DAEMON_IPC_PORT: String(ipc!.port) }, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let out = '', err = ''; child.stdout!.on('data', b => out += b); child.stderr!.on('data', b => err += b);
+      child.on('error', reject); child.on('close', code => resolve({ code, out, err }));
+    });
+    expect(run.code, run.err).toBe(0);
+    expect(run.out).toBe('cli_bound|owner-token|docs +fetch --as user');
+    expect(run.err).toContain('bot 主人');
+  });
+
+  it('a relay the daemon minted for someone else\'s content (botmux report, meeting, answer) never uses the owner', async () => {
+    callerless(TRIGGER);
+    expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token' });
+    vi.mocked(tokens.resolveUserToken).mockClear();
+    // Same trigger machinery, but not submitted through the public entry.
+    session.managedTurnOrigin.turnId = 'trg_internal_relay';
+    session.managedTurnOrigin.identityTurnId = 'trg_internal_relay';
+    const relay = await request('user');
+    expect(relay.status).toBe(403);
+    expect(await relay.json()).toEqual({ ok: false, error: 'No current requesting user; --as user requires their authorization' });
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+
+  it('the owner\'s own turns use the owner\'s grant: a message, and a Dashboard owner-actor trigger without allowOwnerActor', async () => {
+    session.managedTurnOrigin.callerOpenId = OWNER;
+    const message = await request('user');
+    expect(await message.json()).toMatchObject({ credential: 'owner-token' });
+    session.managedTurnOrigin.turnId = 'trg_owner_abc';
+    session.managedTurnOrigin.identityTurnId = 'trg_owner_abc';
+    session.managedTurnOrigin.trustedCaller = { requestLarkAppId: 'cli_bound', requestUserOpenId: OWNER, senderType: 'user' };
+    const ownerActor = await request('user');
+    expect(ownerActor.status).toBe(200);
+    expect(await ownerActor.json()).toMatchObject({ credential: 'owner-token', actingAs: 'owner' });
+    expect(auditLines().at(-1)).toContain('reason=owner_actor');
+    // A per-person policy still gates owner-actor credentials behind allowOwnerActor.
+    useBot({ triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities: ['lark-user'] }) });
+    const gated = await request('user');
+    expect(gated.status).toBe(403);
+    expect(await gated.json()).toMatchObject({ error: 'unattended_turn' });
+  });
+
+  it('a schedule without a creator uses the owner; one created by someone else never does', async () => {
+    const authority = vi.spyOn(schedulerModule, 'getScheduleAuthorityRecord').mockReturnValue({ kind: 'direct', state: 'active', task: { id: 'a1b2c3d4' } } as any);
+    callerless(SCHEDULE);
+    expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token', actingAs: 'owner' });
+    expect(auditLines().at(-1)).toContain('reason=schedule_without_creator');
+    vi.mocked(tokens.resolveUserToken).mockClear();
+    for (const record of [
+      { kind: 'direct', state: 'active', task: { id: 'a1b2c3d4', ownerOpenId: 'ou_sender', ownerUnionId: 'on_sender' } },
+      { kind: 'delegated', state: 'active', task: { id: 'a1b2c3d4' } },
+      undefined,
+    ]) {
+      authority.mockReturnValue(record as any);
+      const refused = await request('user');
+      expect(refused.status).toBe(403);
+      expect(await refused.text()).not.toContain('owner-token');
+    }
+    expect(tokenCallsFor(OWNER)).toHaveLength(0);
+    // The creator present as the turn's caller keeps their own grant.
+    session.managedTurnOrigin.callerOpenId = 'ou_sender';
+    session.managedTurnOrigin.trustedCaller = { requestLarkAppId: 'cli_bound', requestUserOpenId: 'ou_sender', requestUserUnionId: 'on_sender', senderType: 'user', source: 'schedule_creator', taskId: 'a1b2c3d4' };
+    expect(await (await request('user')).json()).toMatchObject({ credential: 'sender-token' });
+    expect(tokenCallsFor(OWNER)).toHaveLength(0);
+  });
+
+  it('someone else\'s turn keeps their own grant, and their message merged into a trigger ends the owner fallback', async () => {
+    callerless(TRIGGER);
+    expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token' });
+    vi.mocked(tokens.resolveUserToken).mockClear();
+    // Another person started the turn: their own grant, or a refusal — never the owner's.
+    session.managedTurnOrigin.callerOpenId = 'ou_sender';
+    expect(await (await request('user')).json()).toMatchObject({ credential: 'sender-token' });
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async (_a, _s, _b, person) => person === OWNER ? 'owner-token' : null);
+    const ungranted = await request('user');
+    expect(ungranted.status).toBe(403);
+    expect(tokenCallsFor(OWNER)).toHaveLength(0);
+    // A trigger that someone else has spoken into since.
+    callerless(TRIGGER);
+    session.managedTurnOrigin.speakers = [{ openId: 'ou_sender', turnId: 'om_merged' }];
+    const merged = await request('user');
+    expect(merged.status).toBe(403);
+    expect(await merged.text()).not.toContain('owner-token');
+    expect(tokenCallsFor(OWNER)).toHaveLength(0);
+    // ...including one who speaks while the owner's grant is being fetched.
+    session.managedTurnOrigin.speakers = [{ openId: OWNER, turnId: 'om_owner' }];
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      session.managedTurnOrigin.speakers = [{ openId: OWNER, turnId: 'om_owner' }, { openId: 'ou_sender', turnId: 'om_late' }];
+      return 'late-owner-token';
+    });
+    const late = await request('user');
+    expect(late.status).toBe(409);
+    expect(await late.text()).not.toContain('late-owner-token');
+  });
+
+  it('switched off, the strict refusal comes back unchanged and takes effect without a restart', async () => {
+    callerless(TRIGGER);
+    expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token' });
+    vi.mocked(tokens.resolveUserToken).mockClear();
+    useBot({ larkUserOwnerFallback: false });
+    const off = await request('user');
+    expect(off.status).toBe(403);
+    expect(await off.json()).toEqual({ ok: false, error: 'No current requesting user; --as user requires their authorization' });
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+    const scope = await authRequest();
+    expect(scope.status).toBe(403);
+    expect(await scope.json()).toMatchObject({ error: 'current_actor_unverified' });    // Byte-identical to before even where the fallback would have explained itself.
+    vi.spyOn(schedulerModule, 'getScheduleAuthorityRecord').mockReturnValue({ kind: 'direct', state: 'active',
+      task: { id: 'a1b2c3d4', ownerOpenId: 'ou_sender', ownerUnionId: 'on_sender' } } as any);
+    callerless(SCHEDULE);
+    for (const strict of [{ larkUserOwnerFallback: false },
+      { triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, capabilities: ['lark-user'] }) }]) {
+      useBot(strict);
+      expect(await (await request('user')).json()).toEqual({ ok: false, error: 'No current requesting user; --as user requires their authorization' });
+    }
+  });
+
+  it('per-person authorization covering the Feishu user identity keeps the strict behaviour', async () => {
+    callerless(TRIGGER);
+    for (const triggerUserAuth of [{ enabled: true, capabilities: ['lark-user'] }, { enabled: true, tools: ['lark-cli'] }]) {
+      useBot({ triggerUserAuth: parseTriggerUserAuthConfig(triggerUserAuth) });
+      expect((await request('user')).status).toBe(403);
+    }
+    expect(tokenCallsFor(OWNER)).toHaveLength(0);
+    // Per-person auth for other tools only (legacy tools list) does not.
+    useBot({ triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'] }) });
+    expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token' });
+  });
+
+  it('an owner who has not authorized gets the link privately through auth request, never in the conversation', async () => {
+    callerless(TRIGGER);
+    session.chatType = 'p2p';
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const refused = await request('user');
+    expect(refused.status).toBe(403);
+    const { error } = await refused.json() as { error: string };
+    expect(error).toContain('botmux auth request');
+    expect(error).not.toContain('/login');
+    expect(auditLines().at(-1)).toContain('result=owner_not_authorized');
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const poll = vi.fn(async () => ({ status: 'ready' as const, token: 'owner-fresh-token' }));
+    const requestAuth = vi.spyOn(tokens, 'requestUserAuthorization').mockResolvedValue({
+      authUrl: 'https://accounts.example/device?code=OWNER', scopes: ['docx:document:readonly'], expiresIn: 300, poll,
+    });
+    const asked = await authRequest();
+    expect(asked.status).toBe(200);
+    const body = await asked.json() as { requestId: string; delivery?: string; authUrl?: string };
+    expect(body).toMatchObject({ ok: true, delivery: 'dm' });
+    expect(body.authUrl).toBeUndefined();
+    expect(requestAuth.mock.calls[0]?.[4]).toBe(OWNER);
+    expect(dm).toHaveBeenCalledOnce();
+    expect(dm.mock.calls[0].slice(0, 2)).toEqual(['cli_bound', OWNER]);
+    expect(dm.mock.calls[0][2]).toContain('https://accounts.example/device?code=OWNER');
+    // botmux auth wait in the same turn completes for the owner.
+    const waited = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-status`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ requestId: body.requestId }),
+    });
+    expect(await waited.json()).toEqual({ ok: true, status: 'ready' });
+  });
+
+  describe('a message from a bot', () => {
+    const peerBot = { requestLarkAppId: 'cli_bound', requestUserOpenId: 'ou_peer_bot', requestUserUnionId: 'on_peer_bot', senderType: 'bot' };
+    beforeEach(() => {
+      session.managedTurnOrigin.callerOpenId = 'ou_peer_bot';
+      session.managedTurnOrigin.trustedCaller = peerBot;
+      vi.spyOn(dispatchReportBinding, 'loadOrCreateDispatchReportBindingSecret').mockReturnValue('secret');
+    });
+
+    it('uses the owner only when its signed dispatch names the owner', async () => {
+      const record = vi.spyOn(dispatchUserDelegation, 'resolveDispatchUser').mockResolvedValue({ authority: { unionId: 'on_owner' } } as any);
+      const target = vi.spyOn(larkClient, 'resolveTargetAppOpenId').mockResolvedValue({ status: 'resolved', openId: OWNER } as any);
+      expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token', actingAs: 'owner' });
+      expect(record).toHaveBeenCalledWith(expect.objectContaining({ appId: 'cli_bound', chatId: 'oc_chat', turnId: 'om_turn' }));
+      expect(target).toHaveBeenCalledWith('cli_bound', 'on_owner');
+      expect(auditLines().at(-1)).toContain('reason=owner_dispatch');
+      vi.mocked(tokens.resolveUserToken).mockClear();
+      // Signed for someone else: that person's turn, never the owner's.
+      target.mockResolvedValue({ status: 'resolved', openId: 'ou_x' } as any);
+      expect((await request('user')).status).toBe(403);
+      // The requester cannot be resolved here: unknown, refused.
+      target.mockResolvedValue({ status: 'transient' } as any);
+      expect((await request('user')).status).toBe(403);
+      expect(tokenCallsFor(OWNER)).toHaveLength(0);
+    });
+
+    it('without a record (unsigned, unbound, or still pending) never uses the owner, even from a same-administrator bot', async () => {
+      vi.spyOn(eventDispatcher, 'isTrustedSameOwnerSiblingBot').mockReturnValue(true);
+      vi.spyOn(dispatchUserDelegation, 'resolveDispatchUser').mockResolvedValue(undefined);
+      const response = await request('user');
+      expect(response.status).toBe(403);
+      expect(await response.text()).not.toContain('owner-token');
+      expect(tokenCallsFor(OWNER)).toHaveLength(0);
+    });
+  });
+
+  it('a schedule that gains a person while the owner\'s grant is fetched gets nothing', async () => {
+    const authority = vi.spyOn(schedulerModule, 'getScheduleAuthorityRecord').mockReturnValue({ kind: 'direct', state: 'active', task: { id: 'a1b2c3d4' } } as any);
+    callerless(SCHEDULE);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      authority.mockReturnValue({ kind: 'direct', state: 'active', task: { id: 'a1b2c3d4', runAsClaim: { openId: 'ou_sender' } } } as any);
+      return 'late-owner-token';
+    });
+    const late = await request('user');
+    expect(late.status).toBe(409);
+    expect(await late.text()).not.toContain('late-owner-token');
+  });
+
+  it('sessions that withhold the bot identity, or belong to another person in assistant mode, never use the owner', async () => {
+    callerless(TRIGGER);
+    session.session.sandboxWithholdBotSecret = true;
+    expect((await request('user')).status).toBe(403);
+    delete session.session.sandboxWithholdBotSecret;
+    useBot({ assistantMode: true });
+    session.session.assistantOwnerOpenId = 'ou_sender';
+    expect((await request('user')).status).toBe(403);
+    expect(tokenCallsFor(OWNER)).toHaveLength(0);
+    session.session.assistantOwnerOpenId = OWNER;
+    expect(await (await request('user')).json()).toMatchObject({ credential: 'owner-token' });
   });
 });
