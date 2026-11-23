@@ -35,7 +35,7 @@ export function renderAskFormBody(ask: PendingAsk, locale: Locale, result?: AskR
     const detail = result.kind === 'timedOut' ? (en ? 'Timed out — no approval was given.' : '等待已超时，未获得确认。')
       : result.kind === 'invalidated' ? `${en ? 'Invalidated' : '已失效'}：${safe(result.reason.length > valueCap ? `${result.reason.slice(0, valueCap)}…` : result.reason)}`
         : undefined;
-    const body = buildAskSettledBody(ask, result, { locale, prompt: safe, descriptionCap, valueCap, detail });
+    const body = buildAskSettledBody(ask, result, { locale, prompt: safe, descriptionCap, valueCap, detail, density: extras.density });
     return { descriptionsTruncated: body.descriptionsTruncated, elements: [...body.elements, askFooter(result.kind === 'answered'
       ? submittedByLine(result.by, ask, locale) : grey(`${deadlineText(ask, locale)} · ${who}`))] };
   }

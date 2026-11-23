@@ -37,10 +37,30 @@ export function countCardElements(value: unknown): number {
  * How much structure each option gets, from the approved look down to what still fits a very
  * large Ask under the element limit: `rows` (white row per option), `compact` (bare checker per
  * option), `dropdown` (one select per question, descriptions go to the attachment), `bare`
- * (dropdowns without the grey blocks and kind labels).
+ * (dropdowns without the grey blocks and kind labels), and finally `list`: every question and
+ * option as text in one block, answered by a chat reply (the existing whole-Ask text answer).
  */
-export type AskDensity = 'rows' | 'compact' | 'dropdown' | 'bare';
-export const ASK_DENSITIES: readonly AskDensity[] = ['rows', 'compact', 'dropdown', 'bare'];
+export type AskDensity = 'rows' | 'compact' | 'dropdown' | 'bare' | 'list';
+export const ASK_DENSITIES: readonly AskDensity[] = ['rows', 'compact', 'dropdown', 'bare', 'list'];
+
+/**
+ * Last-resort body for an Ask too large for any control: one Markdown block listing each
+ * question and its options (with descriptions); the footer asks for a chat reply instead.
+ */
+export function buildAskListBody(ask: PendingAsk, options: { locale: Locale; prompt: (text: string) => string; descriptionCap: number }):
+  { elements: El[]; descriptionsTruncated: boolean } {
+  let descriptionsTruncated = false;
+  const blocks = ask.questions.map((q, i) => {
+    const lines = q.options.map(o => {
+      const text = optionContent(q, o, options.locale, options.descriptionCap);
+      descriptionsTruncated ||= text.truncated;
+      return `• ${text.content.replace(/\n/g, '\n   ')}`;
+    });
+    const [first = '', ...rest] = options.prompt(q.prompt).trim().split('\n');
+    return [`**${ask.questions.length > 1 ? `${i + 1}. ` : ''}${first.trim()}**`, ...rest, ...lines].join('\n');
+  });
+  return { descriptionsTruncated, elements: [{ tag: 'markdown', content: blocks.join('\n\n') }] };
+}
 
 /** Which control set an unsettled Ask gets. */
 export type AskPresentation = 'input_form' | 'form' | 'quick' | 'text_reply';
@@ -322,11 +342,14 @@ export function askReplyHint(ask: PendingAsk, locale: Locale): string | undefine
  * Body of a settled Ask: each question keeps its block with the kind, the question and what was
  * answered (`✓ label` with its description, the written text, or the input value), so an approver
  * can still see what was asked and answered. Detail lines (a whole-Ask text reply, why it ended)
- * follow the blocks.
+ * follow the blocks. Densities `bare` and `list` (a very large Ask) drop the blocks and kind labels;
+ * `list` puts every question in one Markdown element.
  */
 export function buildAskSettledBody(ask: PendingAsk, result: AskResult, options: {
   locale: Locale; prompt: (text: string) => string; descriptionCap: number; valueCap?: number; detail?: string;
+  density?: AskDensity;
 }): { elements: El[]; descriptionsTruncated: boolean } {
+  const flat = options.density === 'bare' || options.density === 'list';
   const { locale } = options;
   const total = ask.questions.length;
   let descriptionsTruncated = false;
@@ -335,8 +358,8 @@ export function buildAskSettledBody(ask: PendingAsk, result: AskResult, options:
     if (text.length <= cap) return escapeAnswerText(text);
     return `${escapeAnswerText(capChars(text, cap))}${t('card.ask.value_truncated', undefined, locale)}`;
   };
-  const elements: El[] = ask.questions.map((q, i) => {
-    const children: El[] = [askEyebrow(q, locale), ...questionHeading(options.prompt(q.prompt), i, total)];
+  const blocks: El[][] = ask.questions.map((q, i) => {
+    const children: El[] = [...(flat ? [] : [askEyebrow(q, locale)]), ...questionHeading(options.prompt(q.prompt), i, total)];
     if (result.kind === 'answered') {
       const custom = result.customAnswers?.[i] ?? result.inputs?.[i];
       let lines: string[];
@@ -353,8 +376,11 @@ export function buildAskSettledBody(ask: PendingAsk, result: AskResult, options:
       if (!lines.length && !result.comment) lines = [grey(t('card.ask.answer.none', undefined, locale))];
       if (lines.length) children.push({ tag: 'markdown', content: lines.join('\n') });
     }
-    return questionBlock(children);
+    return children;
   });
+  const elements: El[] = options.density === 'list'
+    ? [{ tag: 'markdown', content: blocks.map(children => children.map(child => child.content).join('\n')).join('\n\n') }]
+    : flat ? blocks.flat() : blocks.map(questionBlock);
   if (result.kind === 'answered' && result.comment) {
     const onlyComment = result.answers.every(keys => !keys.length) && !result.customAnswers?.some(Boolean) && !result.inputs?.some(Boolean);
     elements.push({ tag: 'markdown', content: onlyComment

@@ -16,7 +16,7 @@ import { askChoiceProblem } from '../../core/ask-choice.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
 import {
-  ASK_CARD_ELEMENT_LIMIT, ASK_DENSITIES, askCardConfig, askFooter, askPresentation, askReplyHint, buildAskChoiceBody,
+  ASK_CARD_ELEMENT_LIMIT, ASK_DENSITIES, askCardConfig, askFooter, askPresentation, askReplyHint, buildAskChoiceBody, buildAskListBody,
   buildAskSettledBody, countCardElements, deadlineLine, escapeMd, escapeQuestion, pendingHeader, settledHeader, submittedByLine,
   type AskDensity,
 } from './ask-card-look.js';
@@ -515,22 +515,27 @@ export function renderAskCard(
   const fits = (json: string) => turnReplyCardRequestBytes(json, receiveId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES;
   const longestDescription = Math.max(0, ...ask.questions.flatMap(q => q.options.map(o => o.description?.length ?? 0)));
   const longestPrompt = Math.max(0, ...ask.questions.map(q => q.prompt.length));
-  let last: { json: string; promptTruncated: boolean; descriptionsTruncated: boolean; fits: boolean } | undefined;
+  type Rendered = { json: string; promptTruncated: boolean; descriptionsTruncated: boolean; fits: boolean };
+  const withinElements = (json: string) => countCardElements(JSON.parse(json)) <= ASK_CARD_ELEMENT_LIMIT;
+  let last: Rendered | undefined;
   for (const density of ASK_DENSITIES) {
     const render = (promptCap: number, descriptionCap: number) => renderAskCardWithCap(ask, result, opts, promptCap, descriptionCap, density);
-    const full = render(Infinity, Infinity);
-    // A cut prompt gains its notice line, so the most-cut render bounds the element count too.
-    const elements = Math.max(countCardElements(JSON.parse(full.json)), countCardElements(JSON.parse(render(0, 0).json)));
-    if (elements > ASK_CARD_ELEMENT_LIMIT && density !== ASK_DENSITIES.at(-1)) continue;
-    if (fits(full.json)) return { json: full.json, promptTruncated: false, descriptionsTruncated: full.descriptionsTruncated, fits: true };
-    if (longestDescription > 0) {
-      const withoutDescriptions = render(Infinity, 0).json;
-      if (fits(withoutDescriptions)) return { promptTruncated: false, descriptionsTruncated: true, fits: true,
-        json: largestFitting(1, longestDescription - 1, cap => render(Infinity, cap).json, fits) ?? withoutDescriptions };
-    }
-    const json = largestFitting(0, longestPrompt - 1, cap => render(cap, 0).json, fits);
-    last = { json: json ?? render(0, 0).json, promptTruncated: true, descriptionsTruncated: longestDescription > 0, fits: json !== undefined };
-    if (last.fits) return last;
+    const fitBytes = (): Rendered => {
+      const full = render(Infinity, Infinity);
+      if (fits(full.json)) return { json: full.json, promptTruncated: false, descriptionsTruncated: full.descriptionsTruncated, fits: true };
+      if (longestDescription > 0) {
+        const withoutDescriptions = render(Infinity, 0).json;
+        if (fits(withoutDescriptions)) return { promptTruncated: false, descriptionsTruncated: true, fits: true,
+          json: largestFitting(1, longestDescription - 1, cap => render(Infinity, cap).json, fits) ?? withoutDescriptions };
+      }
+      const json = largestFitting(0, longestPrompt - 1, cap => render(cap, 0).json, fits);
+      return { json: json ?? render(0, 0).json, promptTruncated: true, descriptionsTruncated: longestDescription > 0, fits: json !== undefined };
+    };
+    // Cutting text never removes an element (a cut prompt may add its notice line), so an
+    // uncut render over the element limit rules this density out before any byte fitting.
+    if (density !== ASK_DENSITIES.at(-1) && !withinElements(render(Infinity, Infinity).json)) continue;
+    last = fitBytes();
+    if (density === ASK_DENSITIES.at(-1) || (last.fits && withinElements(last.json))) return last;
   }
   return last!;
 }
@@ -611,7 +616,18 @@ function renderAskCardWithCap(
   }
   let header: Record<string, unknown>;
   let descriptionsTruncated: boolean;
-  if (presentation === 'input_form') {
+  if (!result && density === 'list') {
+    // Too large for any control within the element limit: list it, answer by chat reply.
+    const body = buildAskListBody(ask, { locale, prompt, descriptionCap });
+    header = pendingHeader(ask, locale, 'text_reply');
+    if (mention) elements.push({ tag: 'markdown', content: mention });
+    elements.push(...body.elements, askFooter(deadlineLine(ask, locale), [
+      ask.deliveryTarget || ask.originKind === 'native-user-input-async' ? askReplyHint(ask, locale) ?? ''
+        : t('card.ask.list_reply_hint', undefined, locale),
+      body.descriptionsTruncated ? t('card.ask.descriptions_truncated', undefined, locale) : '',
+    ]));
+    descriptionsTruncated = body.descriptionsTruncated;
+  } else if (presentation === 'input_form') {
     const capped = { ...ask, questions: ask.questions.map(q => ({ ...q, prompt: capPrompt(q.prompt, promptCap, locale) })) };
     const body = renderAskFormBody(capped, locale, result, Math.min(300, promptCap), { mention, descriptionCap, density });
     header = result ? settledHeader(ask, result, locale) : pendingHeader(ask, locale, presentation);
@@ -623,7 +639,7 @@ function renderAskCardWithCap(
       : result.failureCode === 'claimant_gone' ? t('card.ask.invalidated_claimant_gone', undefined, locale)
         : result.failureCode === 'answer_undelivered' ? t('card.ask.invalidated_answer_undelivered', undefined, locale)
           : escapeMd(result.reason));
-    const body = buildAskSettledBody(ask, result, { locale, prompt, descriptionCap, detail });
+    const body = buildAskSettledBody(ask, result, { locale, prompt, descriptionCap, detail, density });
     header = settledHeader(ask, result, locale, permission?.headline);
     elements.push(...body.elements, askFooter(result.kind === 'answered'
       ? submittedByLine(result.by, ask, locale) : deadlineLine(ask, locale)));

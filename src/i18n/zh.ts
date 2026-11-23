@@ -2610,6 +2610,7 @@ export const messages: Record<string, string> = {
   'card.ask.toast.option_and_text': '第 {n} 题请只保留一种答案：勾选的选项，或自己写的答案',
   'card.ask.toast.unanswered': '第 {n} 题还没有回答',
   'card.ask.toast.unreadable': '没能读到这张卡上的选择，请直接在对话里回复你的答案',
+  'card.ask.list_reply_hint': '💬 选项太多，卡片里放不下勾选框：请直接在对话里回复你的答案（多题请逐题写明）。',
 
   // Voice summary instruction (injected into the model session)
   'card.voice.summary_instruction': '🔊【语音总结请求】把你上一条发给用户的回复，精简成不超过 5 句、适合朗读的口语：去掉代码、命令、文件路径、URL、英文缩写和 markdown 标记，只讲结论，第一句直接进正题。然后调用 `botmux send --voice "<精简后的口语>"` 把它作为语音发出来。只发这一条语音，不要再额外发文字说明。',

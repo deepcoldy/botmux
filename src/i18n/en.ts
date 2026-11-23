@@ -2606,6 +2606,7 @@ export const messages: Record<string, string> = {
   'card.ask.toast.option_and_text': 'Question {n}: keep either the ticked options or your own answer, not both',
   'card.ask.toast.unanswered': 'Question {n} has no answer yet',
   'card.ask.toast.unreadable': "Couldn't read the choices on this card. Reply with your answer in the chat instead.",
+  'card.ask.list_reply_hint': '💬 Too many options to fit as checkboxes on this card: reply with your answer in the chat (label each answer for several questions).',
 
   // Voice summary instruction (injected into the model session)
   'card.voice.summary_instruction': '🔊 [Voice summary request] Condense your last reply to the user into spoken prose of at most 5 sentences suitable for reading aloud: drop code, commands, file paths, URLs, English abbreviations and markdown; state only the conclusions, and get to the point in the first sentence. Then call `botmux send --voice "<the condensed spoken text>"` to send it as voice. Send only this one voice message — no extra text.',
