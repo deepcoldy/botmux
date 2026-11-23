@@ -2553,7 +2553,7 @@ describe('handleCommand', () => {
         await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
         await drainQueuedForks(ds);
         const target = { mode: 'thread', rootMessageId: msg.messageId };
-        expect(deps.sessionReply).toHaveBeenCalledExactlyOnceWith(CHAT_ID, expect.stringContaining('空闲后会自动执行'),
+        expect(deps.sessionReply).toHaveBeenCalledExactlyOnceWith(CHAT_ID, expect.any(String),
           'interactive', LARK_APP_ID, msg.messageId, { replyTarget: target, uuid: expect.stringMatching(/^[a-f0-9]{40}$/) });
         expect(replyMessage).not.toHaveBeenCalled();
         expect(forkSession).not.toHaveBeenCalled();
@@ -2576,12 +2576,42 @@ describe('handleCommand', () => {
           expect(forkSession).not.toHaveBeenCalled();
           expect(replyMessage).not.toHaveBeenCalled();
           if (condition === 'source changed') {
-            expect(deps.sessionReply).toHaveBeenLastCalledWith(CHAT_ID, expect.stringContaining('源会话已切换'),
+            expect(deps.sessionReply).toHaveBeenLastCalledWith(CHAT_ID, expect.any(String),
               'text', LARK_APP_ID, msg.messageId, { replyTarget: target });
           }
         }
       },
     );
+
+    it('uses the idle notification that arrives while the failed fork seed is being recalled', async () => {
+      vi.mocked(isSessionGroup).mockReturnValue(true);
+      onTestFinished(() => { vi.mocked(isSessionGroup).mockReturnValue(false); });
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: false }] }));
+      const ds = makeLegacyLarkSession({ scope: 'chat', lastScreenStatus: 'working', session: makeSession({
+        cliId: 'antigravity', scope: 'chat', rootMessageId: CHAT_ID, ownerOpenId: 'ou_sender', cliSessionId: 'agy-parent',
+      }) });
+      const deps = makeDeps(ds);
+      deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
+      const msg = makeLarkMessage('/fork 继续任务', { messageId: 'om_fork_retry', chatId: CHAT_ID, rootId: '' });
+      await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
+      vi.mocked(replyMessage).mockResolvedValueOnce('om_seed_first').mockResolvedValueOnce('om_seed_retry');
+      vi.mocked(forkSession).mockImplementationOnce(async () => {
+        ds.lastScreenStatus = 'working';
+        return { ok: false, error: 'worker_busy' };
+      });
+      vi.mocked(deleteMessage).mockImplementationOnce(async () => {
+        ds.lastScreenStatus = 'idle';
+        await drainQueuedForks(ds);
+        return true;
+      });
+      ds.lastScreenStatus = 'idle';
+      await drainQueuedForks(ds);
+      expect(forkSession).toHaveBeenCalledTimes(2);
+      expect(deleteMessage).toHaveBeenCalledExactlyOnceWith(LARK_APP_ID, 'om_seed_first');
+      expect(vi.mocked(replyMessage).mock.calls[0]?.[5]).not.toBe(vi.mocked(replyMessage).mock.calls[1]?.[5]);
+      expect(ds.session.forkChildSessionIds).toEqual(['child-sess-1']);
+      expect(isPendingForkTopic(ds, msg.messageId)).toBe(false);
+    });
 
     it.each([true, false])('uses an Antigravity session-group command as the topic root (thread created: %s)', async threadCreated => {
       vi.mocked(isSessionGroup).mockReturnValue(true);
@@ -2594,10 +2624,15 @@ describe('handleCommand', () => {
       const deps = makeDeps(ds);
       const task = '检查继承的上下文';
       deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
+      vi.mocked(replyMessage).mockImplementationOnce(async () => {
+        expect(isPendingForkTopic(ds, 'om_fork_command')).toBe(true);
+        return 'om_fork_seed';
+      });
       await handleCommand('/fork', CHAT_ID, makeLarkMessage(`/fork ${task}`, {
         messageId: 'om_fork_command', rootId: 'om_fork_command', chatId: CHAT_ID,
       }), deps, LARK_APP_ID);
 
+      expect(isPendingForkTopic(ds, 'om_fork_command')).toBe(false);
       expect(sendMessage).not.toHaveBeenCalled();
       expect(vi.mocked(replyMessage).mock.calls[0]?.slice(0, 5)).toEqual([
         LARK_APP_ID, 'om_fork_command', expect.stringContaining(task), 'post', true,

@@ -1281,7 +1281,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.wrong_bot': '⚠️ Fork can only clone the current session to **this same bot** (the clone must run the same CLI). No need to @ another bot; just `/fork --create <new group name>` — it defaults to the current bot.',
   'cmd.fork.unsupported_backend': 'ℹ️ Botmux has not integrated fork for the current {cli} session (supported: Claude family, Grok, Antigravity, and Codex / TraeX terminal modes; Codex App, RPC, and pure-remote sessions are not supported yet).',
   'cmd.fork.mid_turn': '⚠️ The session is mid-turn and cannot be forked. Wait until it is idle, then /fork.',
-  'cmd.fork.queued': 'Fork queued. It will run automatically when the source session is idle.',
+  'cmd.fork.queued': 'Fork queued. It will run automatically when the source session is idle. Send it again if BotMux restarts.',
   'cmd.fork.topic_pending': 'The fork is still being prepared. Send your message again when its execution card appears.',
   'cmd.fork.source_changed': 'The source conversation changed while waiting. This fork was cancelled.',
   'cmd.fork.source_check_failed': 'The original fork command could not be verified. No fork was created.',

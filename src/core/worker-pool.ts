@@ -16649,6 +16649,8 @@ type ForkSessionOptions = {
   turnId?: string;
   senderOpenId?: string;
   senderIsBot?: boolean;
+  expectedSourceCliSessionId?: string;
+  checkSourceMessage?: () => Promise<'source_withdrawn' | 'source_check_failed' | undefined>;
   /** Owner to stamp on the CHILD session. Defaults to the source's owner
    *  (the common case: forker === source owner, so this is a no-op).
    *  Set it when an admin forks someone else's session — otherwise the child
@@ -16702,6 +16704,7 @@ export async function forkSession(
   // behind the target-key lock; repeat the live-source guards right before minting.
   const revalidate = (): string | undefined => {
     if (findActiveBySessionId(sessionId) !== ds || ds.session.status !== 'active') return 'session_not_active';
+    if (opts?.expectedSourceCliSessionId && ds.session.cliSessionId !== opts.expectedSourceCliSessionId) return 'source_changed';
     return isForkSourceBusy(ds) ? 'worker_busy' : undefined;
   };
   return forkFromSource(ds, targetChatId, targetRootMessageId, targetChatType, targetScope, opts, revalidate);
@@ -16816,6 +16819,13 @@ async function forkFromSource(
   }
 
   const mintAndSpawnChild = async (): Promise<{ ok: true; childSessionId: string } | { ok: false; error: string }> => {
+    // A queued Feishu command can be withdrawn while a topic is being prepared.
+    // Run the last provider lookup before checking the synchronous ownership and
+    // native identity gates, under the same lock that commits the child.
+    if (opts?.checkSourceMessage) {
+      const unavailable = await opts.checkSourceMessage();
+      if (unavailable) return { ok: false, error: unavailable };
+    }
     // Re-check under the target-key lock: the guard above ran before any await,
     // so two copies aimed at one empty anchor could both have passed it.
     const lockedOccupant = activeSessionsRegistry?.get(targetKey);

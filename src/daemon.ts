@@ -7645,6 +7645,7 @@ const commandDeps: CommandHandlerDeps = {
   sessionReply,
   getActiveCount,
   lastRepoScan,
+  resumeQueuedForks,
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
   submitQueuedMessage,

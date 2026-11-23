@@ -1278,7 +1278,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.wrong_bot': '⚠️ fork 只能把当前会话复制给**当前这个机器人**（分身要跑同一个 CLI）。不用 @ 别的机器人；直接 `/fork --create <新群名>` 即可，会默认用当前机器人。',
   'cmd.fork.unsupported_backend': 'ℹ️ 当前 {cli} 会话尚未接入 Botmux fork（已支持 Claude 系、Grok、Antigravity，以及 Codex / TraeX 终端模式；Codex App、RPC 和纯远端会话暂不支持）。',
   'cmd.fork.mid_turn': '⚠️ 会话正在处理中（mid-turn），无法 fork。请等它空闲（idle）后再发 /fork。',
-  'cmd.fork.queued': '已排队。原会话空闲后会自动执行 /fork。',
+  'cmd.fork.queued': '已排队。原会话空闲后会自动执行 /fork。BotMux 重启后需重新发送。',
   'cmd.fork.topic_pending': '分支会话还在准备中。请等执行卡片出现后再发。',
   'cmd.fork.source_changed': '等待期间源会话已切换。本次 /fork 已取消。',
   'cmd.fork.source_check_failed': '无法确认原 /fork 指令仍可用，本次未创建分支。',
