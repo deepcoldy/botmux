@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CodexBridgeQueue, CodexSteerReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexMidTurnReplyCollector, STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { shouldSuppressStructuredFallback, structuredFallbackKind, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
@@ -155,6 +155,7 @@ describe('Codex environment updates in adopted turns', () => {
   it.each([
     ['typed environment example', environment, metadata(['user.text'])],
     ['mixed user and environment content', environment, metadata(['environments.environment_context', 'user.text'])],
+    ['mixed user and AGENTS.md content', environment, metadata(['agents_md.instructions', 'user.text'])],
     ['unknown content kind', environment, metadata(['future.content'])],
     ['empty content kinds', environment, metadata([])],
     ['malformed content kinds', environment, { content_item_kinds: 'environments.environment_context' }],
@@ -206,7 +207,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-describe('Codex same-turn steer: the steered message gets its own answer', () => {
+describe('Codex mid-turn replies: progress, and the answer to a same-turn steer', () => {
   const native = 'native-turn-steer';
   const at = (sec: number) => `2026-04-29T07:00:${String(sec).padStart(2, '0')}.000Z`;
   const toolCall = (id: string, sec: number) =>
@@ -217,6 +218,22 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
    *  completion or the turn's end. */
   const execCall = (id: string, sec: number) => ({ timestamp: at(sec), type: 'response_item', payload: {
     type: 'custom_tool_call', name: 'exec', call_id: id, input: 'await tools.exec_command({ cmd: "npm test" })' } });
+  const withKinds = (row: ReturnType<typeof userResponseItem>, kinds: readonly string[]) =>
+    ({ ...row, payload: { ...row.payload, internal_chat_message_metadata_passthrough: { turn_id: native, content_item_kinds: kinds } } });
+
+  /** A queue wired like the worker: one collector per turn, local turns skipped. */
+  function observed(q: CodexBridgeQueue) {
+    const collectors = new WeakMap<CodexPendingTurn, CodexMidTurnReplyCollector>();
+    const replies: Array<[string, string, 'steer answer' | 'progress']> = [];
+    q.setMidTurnReplyObserver((event, turn) => {
+      if (turn.isLocal) return;
+      let c = collectors.get(turn);
+      if (!c) collectors.set(turn, c = new CodexMidTurnReplyCollector(turn));
+      const reply = c.feed(event);
+      if (reply) replies.push([turn.turnId, reply.text, reply.answersSteer ? 'steer answer' : 'progress']);
+    });
+    return replies;
+  }
 
   /** Rollout of one execution with a second Lark message steered into it. */
   function run(afterSteer: object[], withStableIds = false) {
@@ -224,14 +241,7 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
     const q = new CodexBridgeQueue(() => now);
     q.mark('om_task', 'Keep working', now);
     q.mark('om_followup', '下载弄完了吗？可以关窗口了吗', now);
-    const collectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
-    const replies: Array<[string, string]> = [];
-    q.setSteerReplyObserver((ev, turn) => {
-      let c = collectors.get(turn);
-      if (!c) collectors.set(turn, c = new CodexSteerReplyCollector());
-      const reply = c.feed(ev);
-      if (reply) replies.push([turn.turnId, reply.text]);
-    });
+    const replies = observed(q);
     const ingest = (events: CodexBridgeEvent[]) =>
       q.ingest(withStableIds ? codexEventsWithStableIds(path, events) : events);
     writeFileSync(path, [
@@ -246,8 +256,9 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
     ingest(drainCodexRollout(path, first.newOffset, first.state).events);
     return { q, replies };
   }
+  const beforeSteer = ['om_task', 'Working on it.', 'progress'];
 
-  it('answers it once the model goes back to work, and the turn still ends with its final', () => {
+  it('answers the steer once the model goes back to work, then posts its progress, and the turn still ends with its final', () => {
     const { q, replies } = run([
       assistantMessageResponseItem('可以关闭下载窗口，下载已经完成。', 'commentary', at(6)),
       toolCall('c2', 7), toolOutput('c2', 8),
@@ -256,7 +267,11 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
       assistantMessageResponseItem('All done.', 'final_answer', at(12)),
       { timestamp: at(13), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'All done.' } },
     ]);
-    expect(replies).toEqual([['om_followup', '可以关闭下载窗口，下载已经完成。']]);
+    expect(replies).toEqual([
+      beforeSteer,
+      ['om_followup', '可以关闭下载窗口，下载已经完成。', 'steer answer'],
+      ['om_followup', 'Next step done.', 'progress'],
+    ]);
     const ready = q.drainEmittable();
     expect(ready.map(t => [t.turnId, t.finalText])).toEqual([['om_followup', 'All done.']]);
   });
@@ -268,7 +283,7 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
       assistantMessageResponseItem('All tests pass. Done.', 'final_answer', at(9)),
       { timestamp: at(10), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'All tests pass. Done.' } },
     ]);
-    expect(replies).toEqual([['om_followup', '下载已完成，可以关窗口。']]);
+    expect(replies).toEqual([beforeSteer, ['om_followup', '下载已完成，可以关窗口。', 'steer answer']]);
   });
 
   it.each([
@@ -284,7 +299,7 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
       assistantMessageResponseItem('All done.', 'final_answer', at(9)),
       { timestamp: at(10), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'All done.' } },
     ], withStableIds);
-    expect(replies).toEqual([]);
+    expect(replies).toEqual([beforeSteer]);
   });
 
   it('leaves an answer that is the final message to the turn\'s own reply', () => {
@@ -293,27 +308,114 @@ describe('Codex same-turn steer: the steered message gets its own answer', () =>
       assistantMessageResponseItem('Yes, it finished; all done.', 'final_answer', at(8)),
       { timestamp: at(9), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'Yes, it finished; all done.' } },
     ]);
-    expect(replies).toEqual([]);
+    expect(replies).toEqual([beforeSteer]);
   });
 
-  it('does not treat the first message of an ordinary turn as a steer answer', () => {
+  it('posts each thing an ordinary turn says mid-work as progress, never as a steer answer', () => {
     const now = Date.parse(at(0));
     const q = new CodexBridgeQueue(() => now);
     q.mark('om_task', 'Keep working', now);
-    const seen: string[] = [];
-    q.setSteerReplyObserver((_ev, turn) => seen.push(turn.turnId));
+    const replies = observed(q);
     writeFileSync(path, [
       { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', turn_id: native } },
       userResponseItem('Keep working', at(1)),
       assistantMessageResponseItem('Working on it.', 'commentary', at(2)),
       toolCall('c1', 3), toolOutput('c1', 4),
+      assistantMessageResponseItem('Installed; verifying.', 'commentary', at(5)),
+      toolCall('c2', 6), toolOutput('c2', 7),
+      assistantMessageResponseItem('Done.', 'final_answer', at(8)),
+      { timestamp: at(9), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'Done.' } },
     ].map(ev).join(''));
     q.ingest(drainCodexRollout(path, 0).events);
-    expect(seen).toEqual([]);
+    expect(replies).toEqual([
+      ['om_task', 'Working on it.', 'progress'],
+      ['om_task', 'Installed; verifying.', 'progress'],
+    ]);
+    expect(q.drainEmittable().map(t => [t.turnId, t.finalText])).toEqual([['om_task', 'Done.']]);
+  });
+
+  // A command's completion record carries a tool_call entry for the thinking
+  // timeline, but it is written when the command finished.
+  it('does not take a command completion written after the final message for the model going back to work', () => {
+    const now = Date.parse(at(0));
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('om_task', 'Keep working', now);
+    const replies = observed(q);
+    const completion = (id: string, sec: number) => ({ timestamp: at(sec), type: 'event_msg', payload: {
+      type: 'item_completed', turn_id: native,
+      item: { type: 'CommandExecution', id, command: ['npm', 'test'], aggregated_output: 'ok' } } });
+    writeFileSync(path, [
+      { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', turn_id: native } },
+      userResponseItem('Keep working', at(1)),
+      assistantMessageResponseItem('Running the tests.', 'commentary', at(2)),
+      execCall('c1', 3),
+      assistantMessageResponseItem('Final answer.', 'final_answer', at(4)),
+      completion('c1', 5),
+      { timestamp: at(6), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'Final answer.' } },
+    ].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(replies).toEqual([['om_task', 'Running the tests.', 'progress']]);
+    expect(q.drainEmittable().map(t => [t.turnId, t.finalText])).toEqual([['om_task', 'Final answer.']]);
+  });
+
+  it('does not take an unmatched terminal exec fallback after the final message for new progress', () => {
+    const now = Date.parse(at(0));
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('om_task', 'Keep working', now);
+    const replies = observed(q);
+    writeFileSync(path, [
+      { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', turn_id: native } },
+      userResponseItem('Keep working', at(1)),
+      execCall('unmatched-after-final', 2),
+      assistantMessageResponseItem('Final answer.', 'final_answer', at(3)),
+      toolOutput('unmatched-after-final', 4),
+      { timestamp: at(5), type: 'event_msg', payload: { type: 'task_complete', turn_id: native, last_agent_message: 'Final answer.' } },
+    ].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(replies).toEqual([]);
+    expect(q.drainEmittable().map(t => [t.turnId, t.finalText])).toEqual([['om_task', 'Final answer.']]);
+  });
+
+  // A fresh conversation (new session, /clear, /new) opens with Codex's
+  // AGENTS.md block as role=user in the same native turn as the first input.
+  it('does not take the first message after AGENTS.md opens a conversation for a steer', () => {
+    const now = Date.parse(at(0));
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, now - 60_000);
+    q.mark('om_task', '更新本机 codex', now);
+    const replies = observed(q);
+    writeFileSync(path, [
+      { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', turn_id: native } },
+      withKinds(userResponseItem('# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n继续之前先跑 test。\n</INSTRUCTIONS>', at(1)),
+        ['agents_md.instructions', 'environments.environment_context']),
+      withKinds(userResponseItem('更新本机 codex', at(4)), ['user.text']),
+      assistantMessageResponseItem('我先确认终端里实际使用的 Codex CLI 版本。', 'commentary', at(5)),
+      toolCall('c1', 6), toolOutput('c1', 7),
+    ].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(replies).toEqual([['om_task', '我先确认终端里实际使用的 Codex CLI 版本。', 'progress']]);
+    expect(q.peek()).toMatchObject([{ turnId: 'om_task', started: true }]);
+    expect(q.peek()[0].steeredMidTurn).toBeUndefined();
+  });
+
+  it('posts nothing for a local turn', () => {
+    const now = Date.parse(at(0));
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, now - 60_000);
+    const replies = observed(q);
+    writeFileSync(path, [
+      { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', turn_id: native } },
+      userResponseItem('typed in the terminal', at(1)),
+      assistantMessageResponseItem('Working on it.', 'commentary', at(2)),
+      toolCall('c1', 3), toolOutput('c1', 4),
+    ].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(q.peek()).toMatchObject([{ isLocal: true }]);
+    expect(replies).toEqual([]);
   });
 });
 
-describe('CodexSteerReplyCollector', () => {
+describe('CodexMidTurnReplyCollector', () => {
   const message = (uuid: string, text: string): CodexBridgeEvent =>
     ({ uuid, timestampMs: 0, kind: 'cot', text: '', cotEntries: [], assistantMessage: text });
   const tool = (uuid: string): CodexBridgeEvent =>
@@ -321,15 +423,41 @@ describe('CodexSteerReplyCollector', () => {
   const thinking = (uuid: string): CodexBridgeEvent =>
     ({ uuid, timestampMs: 0, kind: 'cot', text: '', cotEntries: [{ kind: 'thinking', text: 'hmm' }] });
 
-  it('waits through tool calls before any answer, joins the answer, and reports it once', () => {
-    const c = new CodexSteerReplyCollector();
+  it('waits through tool calls before anything is said, joins a run of messages, and reports each run once', () => {
+    const c = new CodexMidTurnReplyCollector({ steeredMidTurn: true });
     expect(c.feed(tool('t0'))).toBeUndefined();
     expect(c.feed(message('m1', 'First part.'))).toBeUndefined();
     expect(c.feed(thinking('r1'))).toBeUndefined();
     expect(c.feed(message('m2', '  Second part. '))).toBeUndefined();
-    expect(c.feed(tool('t1'))).toEqual({ text: 'First part.\n\nSecond part.', lastUuid: 'm2' });
-    expect(c.feed(message('m3', 'later narration'))).toBeUndefined();
+    expect(c.feed(tool('t1'))).toEqual({ text: 'First part.\n\nSecond part.', lastUuid: 'm2', saidAtMs: 0, answersSteer: true });
     expect(c.feed(tool('t2'))).toBeUndefined();
+    expect(c.feed(message('m3', 'later narration'))).toBeUndefined();
+    expect(c.feed(tool('t3'))).toEqual({ text: 'later narration', lastUuid: 'm3', saidAtMs: 0, answersSteer: false });
+    expect(c.feed(message('m4', 'the final answer'))).toBeUndefined();
+  });
+
+  it('does not complete a run at a command completion record, and reports when the run was said', () => {
+    const c = new CodexMidTurnReplyCollector({});
+    c.feed({ ...message('m1', 'Final answer.'), timestampMs: 42 });
+    expect(c.feed({ ...tool('done'), toolCompletion: true })).toBeUndefined();
+    expect(c.feed(tool('t1'))).toEqual({ text: 'Final answer.', lastUuid: 'm1', saidAtMs: 42, answersSteer: false });
+  });
+
+  it('never calls anything an ordinary turn says a steer answer', () => {
+    const c = new CodexMidTurnReplyCollector({});
+    c.feed(message('m1', 'Working on it.'));
+    expect(c.feed(tool('t1'))).toMatchObject({ answersSteer: false });
+  });
+
+  it('is not completed by a tool record written before the latest message', () => {
+    const at = (uuid: string, offset: number, ev: CodexBridgeEvent): CodexBridgeEvent =>
+      ({ ...ev, uuid, rolloutPath: '/r.jsonl', rolloutOffset: offset });
+    const c = new CodexMidTurnReplyCollector({});
+    c.feed(at('m1', 100, message('m1', 'Step one.')));
+    expect(c.feed(at('t1', 200, tool('t1')))).toMatchObject({ text: 'Step one.' });
+    c.feed(at('m2', 400, message('m2', 'Step two.')));
+    expect(c.feed(at('t-deferred', 300, tool('t-deferred')))).toBeUndefined();
+    expect(c.feed(at('t2', 500, tool('t2')))).toMatchObject({ text: 'Step two.', lastUuid: 'm2' });
   });
 });
 
@@ -1998,4 +2126,370 @@ describe('explicit Codex capacity failures', () => {
 it.each(['401 Unauthorized', '429 Too Many Requests', '400 invalid request'])('a capacity message cannot override %s', async code => {
   const { isCodexCapacityError } = await import('../src/services/codex-transcript.js');
   expect(isCodexCapacityError({ code, message: 'Selected model is at capacity. Please try a different model.' })).toBe(false);
+});
+
+describe('a Lark input that never reached Codex does not take the next input\'s reply', () => {
+  const at = (sec: number) => `2026-04-29T07:01:${String(sec).padStart(2, '0')}.000Z`;
+  const t0 = Date.parse(at(0));
+  const taskStarted = (turn: string, sec: number) =>
+    ({ timestamp: at(sec), type: 'event_msg', payload: { type: 'task_started', turn_id: turn } });
+  const userRecord = (text: string, sec: number, turn: string, kinds: readonly string[] = ['user.text']) => {
+    const item = userResponseItem(text, at(sec));
+    return { ...item, payload: { ...item.payload,
+      internal_chat_message_metadata_passthrough: { turn_id: turn, content_item_kinds: kinds } } };
+  };
+  const taskComplete = (turn: string, text: string, sec: number) =>
+    ({ timestamp: at(sec), type: 'event_msg', payload: { type: 'task_complete', turn_id: turn, last_agent_message: text } });
+  // Codex opens every conversation (fresh, /clear, /new) with this role=user block.
+  const agentsMd = (turn: string, sec: number) => userRecord(
+    '# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n不要继续写到根目录；跑 test 前先 commit。\n</INSTRUCTIONS>',
+    sec, turn, ['agents_md.instructions', 'environments.environment_context']);
+  // Every Lark wiki link shares its first 30 characters, the attribution fingerprint.
+  const wiki = (doc: string, ask: string) => `https://example.feishu.cn/wiki/${doc} ${ask}`;
+
+  function rollout(q: CodexBridgeQueue): (rows: object[]) => void {
+    let offset = 0;
+    let state: ReturnType<typeof drainCodexRollout>['state'] | undefined;
+    writeFileSync(path, '');
+    return rows => {
+      appendFileSync(path, rows.map(ev).join(''));
+      const drained = drainCodexRollout(path, offset, state);
+      offset = drained.newOffset;
+      state = drained.state;
+      q.ingest(drained.events);
+    };
+  }
+  const shape = (q: CodexBridgeQueue) => q.peek().map(turn => ({
+    turnId: turn.turnId, started: turn.started, passed: turn.passedBySuccessor === true }));
+
+  it.each([
+    ['after its native start', true],
+    // The incident shape: after /clear the bridge attached to the new rollout
+    // just past task_started, so no start claim ever touched the typo.
+    ['attached past its native start', false],
+  ] as const)('adopt (%s): a slash typo Codex never submitted is passed; the next input gets its own reply at once', (_name, withStart) => {
+    let now = t0;
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('typo', '/cleat', t0);
+    q.beginSubmitVerification('typo', t0);
+    q.mark('ask', wiki('AAA', '看看里面的压缩包能不能下载'), t0 + 1000);
+    q.beginSubmitVerification('ask', t0 + 1000);
+    const feed = rollout(q);
+
+    feed([...(withStart ? [taskStarted('N1', 2)] : []), agentsMd('N1', 3),
+      userRecord(wiki('AAA', '看看里面的压缩包能不能下载'), 4, 'N1')]);
+    expect(shape(q)).toEqual([
+      { turnId: 'ask', started: true, passed: false },
+      { turnId: 'typo', started: false, passed: true },
+    ]);
+    now = t0 + 6000;
+    // Nothing is retired while the input that passed it is still running.
+    expect(q.pruneExpiredPreStartHeads(now)).toEqual([]);
+
+    feed([taskComplete('N1', 'Downloaded to data/my.', 8)]);
+    now = t0 + 9000;
+    const ready = q.drainEmittable();
+    expect(ready).toMatchObject([{ turnId: 'ask', finalText: 'Downloaded to data/my.' }]);
+    expect(ready[0].isLocal).not.toBe(true);
+    // The typo keeps nothing busy. It is retired (with its usual notice) once
+    // its own submit check can no longer prove it arrived: at once when a
+    // native start already settled that check, else when the check runs out.
+    expect(q.hasBlockingTurn(now)).toBe(false);
+    expect(q.preStartLeaseRemainingMs(now)).toBeUndefined();
+    expect(q.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(withStart ? ['typo'] : []);
+    now = t0 + STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(withStart ? [] : ['typo']);
+    expect(q.size()).toBe(0);
+  });
+
+  it('adopt: of two links with the same opening, only the one whose whole text arrived gets the reply', () => {
+    let now = t0;
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('lost', wiki('AAA', '看看这个'), t0);
+    q.mark('real', wiki('BBB', '下载压缩包'), t0 + 1000);
+    rollout(q)([taskStarted('N1', 2), userRecord(wiki('BBB', '下载压缩包'), 3, 'N1'), taskComplete('N1', 'BBB downloaded.', 6)]);
+    now = t0 + 7000;
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'real', finalText: 'BBB downloaded.' }]);
+    expect(q.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(['lost']);
+  });
+
+  it('identical inputs that both arrive still pair in order', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('first', '继续', t0);
+    q.mark('second', '继续', t0 + 500);
+    rollout(q)([
+      taskStarted('N1', 1), userRecord('继续', 2, 'N1'), taskComplete('N1', 'one', 3),
+      taskStarted('N2', 4), userRecord('继续', 5, 'N2'), taskComplete('N2', 'two', 6),
+    ]);
+    expect(q.drainEmittable().map(turn => [turn.turnId, turn.finalText])).toEqual([['first', 'one'], ['second', 'two']]);
+  });
+
+  it('the AGENTS.md block that opens a conversation does not claim a short message it happens to contain', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('lark', '继续', t0);
+    rollout(q)([taskStarted('N1', 1), agentsMd('N1', 2), userRecord('继续', 3, 'N1'), taskComplete('N1', 'continued', 4)]);
+    const ready = q.drainEmittable();
+    expect(ready).toMatchObject([{ turnId: 'lark', finalText: 'continued' }]);
+    expect(ready[0].isLocal).not.toBe(true);
+  });
+
+  it('a passed mark claims no later native start and holds no later reply', () => {
+    let now = t0;
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('typo', '/cleat', t0);
+    q.beginSubmitVerification('typo', t0);
+    q.mark('ask', '帮我看一下这个报错', t0 + 500);
+    const feed = rollout(q);
+    feed([taskStarted('N1', 1), userRecord('帮我看一下这个报错', 2, 'N1'), taskComplete('N1', 'first answer', 3)]);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'ask' }]);
+
+    // The next message arrives before any expiry pass has retired the typo.
+    now = t0 + 4000;
+    q.mark('next', '再跑一遍测试', now);
+    feed([taskStarted('N2', 5)]);
+    expect(shape(q)).toEqual([
+      { turnId: 'next', started: true, passed: false },
+      { turnId: 'typo', started: false, passed: true },
+    ]);
+    feed([userRecord('再跑一遍测试', 6, 'N2'), taskComplete('N2', 'second answer', 7)]);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'next', finalText: 'second answer' }]);
+  });
+
+  it('while a passed mark awaits expiry, the next input still owns a record that only matches its fingerprint', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('typo', '/cleat', t0);
+    q.mark('ask', '帮我看一下这个报错', t0 + 500);
+    const feed = rollout(q);
+    feed([userRecord('帮我看一下这个报错', 1, 'N1'), taskComplete('N1', 'first answer', 2)]);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'ask' }]);
+
+    // Codex recorded this input with its attachment rewritten: the opening
+    // still matches, the whole text does not.
+    const asked = '请帮我看看这张截图里的报错到底是什么原因造成的，并顺便给出一个可行的修复建议';
+    q.mark('next', `${asked} /tmp/botmux/img-1.png`, t0 + 3000);
+    feed([userRecord(`${asked} [Image #1]`, 4, 'N2'), taskComplete('N2', 'second answer', 5)]);
+    const ready = q.drainEmittable();
+    expect(ready).toMatchObject([{ turnId: 'next', finalText: 'second answer' }]);
+    expect(ready[0].isLocal).not.toBe(true);
+  });
+
+  it('the input queued behind the passed mark keeps the lease refresh it is owed', () => {
+    let now = t0;
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('typo', '/cleat', t0);
+    q.mark('ask', '跑一个很长的任务', t0 + 500);
+    q.mark('third', '完了再总结一下', t0 + 1000);
+    q.confirmPendingTurn('third', t0 + 1000);
+    const feed = rollout(q);
+    feed([taskStarted('N1', 1), userRecord('跑一个很长的任务', 2, 'N1')]);
+    // The long task outlives the queued input's own start lease...
+    now = t0 + 60_000;
+    feed([taskComplete('N1', 'long task done', 59)]);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'ask' }]);
+    // ...but its lease restarts at that terminal, so only the typo is retired.
+    expect(q.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(['typo']);
+    expect(shape(q)).toEqual([{ turnId: 'third', started: false, passed: false }]);
+  });
+
+  it('a passed mark is no longer the input a CLI reports holding or the owner of native input', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('typo', '/cleat', t0);
+    q.mark('ask', '帮我看一下这个报错', t0 + 500);
+    const feed = rollout(q);
+    feed([taskStarted('N1', 1), userRecord('帮我看一下这个报错', 2, 'N1')]);
+    q.mark('third', '完了再总结一下', t0 + 3000);
+    q.ingest([{ uuid: 'queued-3', timestampMs: t0 + 3100, kind: 'input_queued', text: '' }]);
+    expect(q.peek().find(turn => turn.turnId === 'third')?.cliQueuedAtMs).toBeDefined();
+    expect(q.peek().find(turn => turn.turnId === 'typo')?.cliQueuedAtMs).toBeUndefined();
+    expect(q.nativeInputOwner('/cleat', t0 + 3200)).toBeUndefined();
+  });
+
+  it('non-adopt keeps its buffer: an exact successor behind two dead heads never leaves the session busy', () => {
+    let now = t0;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('A', wiki('AAA', '看看这个'), t0);
+    q.mark('X', '/never-submitted', t0 + 1000);
+    q.mark('B', wiki('BBB', '下载压缩包'), t0 + 2000);
+    rollout(q)([taskStarted('N1', 3), userRecord(wiki('BBB', '下载压缩包'), 4, 'N1'), taskComplete('N1', 'answer B', 5)]);
+    for (const at of [10, 60, 3600]) {
+      now = t0 + at * 1000;
+      q.pruneExpiredPreStartHeads(now);
+      q.drainEmittable();
+    }
+    expect(q.hasBlockingTurn(now)).toBe(false);
+    expect(q.peek().filter(turn => turn.started && turn.finalText === undefined)).toEqual([]);
+  });
+
+  it('a record written before the later mark existed (typed in the terminal) passes nothing', () => {
+    const q = new CodexBridgeQueue(() => t0 + 10_000);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('typo', '/cleat', t0);
+    q.mark('lark', '同一句话', t0 + 5000);
+    rollout(q)([userRecord('同一句话', 2, 'N1'), taskComplete('N1', 'terminal answer', 3)]);
+    expect(q.drainEmittable()).toMatchObject([{ isLocal: true, finalText: 'terminal answer' }]);
+    expect(shape(q)).toEqual([
+      { turnId: 'typo', started: false, passed: false },
+      { turnId: 'lark', started: false, passed: false },
+    ]);
+  });
+
+  it('never passes an input whose submit the CLI confirmed', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('confirmed', 'first request', t0);
+    q.confirmPendingTurn('confirmed', t0 + 100);
+    q.mark('later', 'second request', t0 + 200);
+    q.ingest([{ uuid: 'user-2', timestampMs: t0 + 300, kind: 'user', text: 'second request' }]);
+    expect(q.peek().find(turn => turn.turnId === 'confirmed')?.passedBySuccessor).toBeUndefined();
+    expect(q.peek().find(turn => turn.turnId === 'later')?.started).toBe(false);
+  });
+
+  it('a passed mark is retired even when a rolled-back start sits ahead of it', () => {
+    let now = t0;
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('typo', '/cleat', t0 + 1000);
+    q.mark('ask', 'valid B', t0 + 2000);
+    q.mark('next', 'valid C', t0 + 3000);
+    const feed = rollout(q);
+    now = t0 + 9000;
+    feed([taskStarted('B', 4), userRecord('valid B', 5, 'B'), taskComplete('B', 'answer B', 6),
+      taskStarted('cancelled', 7), { timestamp: at(8), type: 'event_msg', payload: { type: 'turn_aborted', turn_id: 'cancelled', reason: 'interrupted' } }]);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'ask', finalText: 'answer B' }]);
+    // The aborted start put 'next' back ahead of the typo, with a fresh lease;
+    // the typo goes now, while 'next' keeps waiting for its own record.
+    expect(q.pruneExpiredPreStartHeads(now).map(turn => turn.turnId)).toEqual(['typo']);
+    expect(shape(q)).toEqual([{ turnId: 'next', started: false, passed: false }]);
+  });
+
+  it('passes nothing for a driver that has not enabled whole-input passing', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.mark('typo', '/cleat', t0);
+    q.mark('ask', '帮我看一下这个报错', t0 + 500);
+    rollout(q)([userRecord('帮我看一下这个报错', 1, 'N1'), taskComplete('N1', 'answer', 2)]);
+    expect(q.drainEmittable()).toMatchObject([{ isLocal: true, finalText: 'answer' }]);
+    expect(shape(q).map(turn => turn.passed)).toEqual([false, false]);
+  });
+
+  it('passes nothing outside adopt mode even when the driver allows it', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setWholeInputPassing(true);
+    q.mark('typo', '/cleat', t0);
+    q.mark('ask', '帮我看一下这个报错', t0 + 500);
+    rollout(q)([userRecord('帮我看一下这个报错', 1, 'N1')]);
+    // Non-adopt keeps its buffer: the record waits for the dead head to expire.
+    expect(shape(q)).toEqual([
+      { turnId: 'typo', started: false, passed: false },
+      { turnId: 'ask', started: false, passed: false },
+    ]);
+  });
+
+  it('a late positive submit receipt takes a pass back', () => {
+    const q = new CodexBridgeQueue(() => t0 + 3000);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('first', 'first request', t0);
+    q.beginSubmitVerification('first', t0);
+    q.mark('second', 'second request', t0 + 1000);
+    q.ingest([{ uuid: 'user-2', timestampMs: t0 + 2000, kind: 'user', text: 'second request' }]);
+    expect(q.peek().find(turn => turn.turnId === 'first')?.passedBySuccessor).toBe(true);
+    q.confirmPendingTurn('first', t0 + 3000);
+    expect(q.peek().find(turn => turn.turnId === 'first')?.passedBySuccessor).toBeUndefined();
+    // Confirmed input is owed a start again: it holds the session and its lease.
+    expect(q.pruneExpiredPreStartHeads(t0 + 3000)).toEqual([]);
+  });
+
+  it('a passed mark whose own record arrives after all gets its own reply', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('first', 'first request', t0);
+    q.mark('second', 'second request', t0 + 1000);
+    rollout(q)([userRecord('second request', 2, 'N1'), taskComplete('N1', 'second answer', 3),
+      userRecord('first request', 4, 'N2'), taskComplete('N2', 'first answer', 5)]);
+    expect(q.drainEmittable().map(turn => [turn.turnId, turn.finalText])).toEqual([
+      ['second', 'second answer'], ['first', 'first answer']]);
+  });
+
+  it('a late identical record revives the older passed mark instead of a newer head', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('first', '继续', t0);
+    q.mark('passing', 'different input', t0 + 100);
+    const feed = rollout(q);
+    feed([userRecord('different input', 1, 'N1'), taskComplete('N1', 'passing answer', 2)]);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'passing', finalText: 'passing answer' }]);
+    expect(shape(q)).toEqual([{ turnId: 'first', started: false, passed: true }]);
+
+    // Deliberately reuse the original mark timestamp: submission order, not a
+    // timestamp tie-break or the reordered queue position, must decide ownership.
+    q.mark('newer-same-text', '继续', t0);
+    feed([
+      userRecord('继续', 3, 'N-first-late'), taskComplete('N-first-late', 'first answer', 4),
+      userRecord('继续', 5, 'N-newer'), taskComplete('N-newer', 'newer answer', 6),
+    ]);
+    expect(q.drainEmittable().map(turn => [turn.turnId, turn.sourceTurnId, turn.finalText])).toEqual([
+      ['first', 'N-first-late', 'first answer'],
+      ['newer-same-text', 'N-newer', 'newer answer'],
+    ]);
+  });
+
+  it('late quarantine evidence revokes a pass and survives the successor terminal', () => {
+    let now = t0;
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('parked', 'first request', t0);
+    q.beginSubmitVerification('parked', t0);
+    q.mark('later', 'second request', t0 + 500);
+    const feed = rollout(q);
+    feed([userRecord('second request', 1, 'N1')]);
+    expect(shape(q).find(turn => turn.turnId === 'parked')?.passed).toBe(true);
+
+    // writeInput can arm quarantine only after the later transcript record has
+    // already passed this mark. That new evidence must restore its old lease.
+    now = t0 + 2_000;
+    q.finishSubmitVerification('parked', now);
+    q.setInputDeliveryQuarantined('parked', true);
+    feed([taskComplete('N1', 'second answer', 3)]);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'later', finalText: 'second answer' }]);
+    now = t0 + STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS + 4_000;
+    expect(q.pruneExpiredPreStartHeads(now)).toEqual([]);
+    expect(q.peek()).toMatchObject([{ turnId: 'parked', passedBySuccessor: undefined, inputDeliveryQuarantined: true }]);
+  });
+
+  it('never passes an input the CLI reported it is still holding', () => {
+    const q = new CodexBridgeQueue(() => t0);
+    q.setLocalTurns(true, t0);
+    q.setWholeInputPassing(true);
+    q.mark('held', 'first request', t0);
+    q.ingest([{ uuid: 'queued-1', timestampMs: t0 + 100, kind: 'input_queued', text: '' }]);
+    q.mark('later', 'second request', t0 + 200);
+    q.ingest([{ uuid: 'user-2', timestampMs: t0 + 300, kind: 'user', text: 'second request' }]);
+    const held = q.peek().find(turn => turn.turnId === 'held');
+    expect(held).toMatchObject({ started: false });
+    expect(held?.passedBySuccessor).toBeUndefined();
+    expect(q.peek().find(turn => turn.turnId === 'later')?.started).toBe(false);
+  });
 });

@@ -55,6 +55,14 @@ export interface BridgeTurnJournalEntry {
   /** Full-input digest for driver-proved spelling aliases. Older journals
    * omit it and cannot use an alias as exact-input evidence. */
   inputTextHash?: string;
+  /** Digest of the whole normalised input, so a restored mark can still prove
+   * a record is exactly its input. Older journals omit it. */
+  wholeInputHash?: string;
+  /** A later whole-input record already passed this unstarted mark. Recovery
+   * restores the mark as passed (so the successor cannot be replayed into it)
+   * and uses this observed transcript floor plus the advanced byte cursor to
+   * distinguish old rows from its own still-late record. */
+  passedBySuccessor?: { replayFloorMs: number };
   contentNormalized?: string;
   /** Transcript file the mark was armed against. Restore is scoped to the
    *  SAME file — a rotation between generations makes attribution unsafe. */
@@ -170,6 +178,12 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
     && typeof entry?.markTimeMs === 'number'
     && typeof entry?.jsonlPath === 'string'
     && typeof entry?.offsetAtMark === 'number'
+    // Invalid passed metadata must drop the entry, never sanitize it into an
+    // ordinary old-cursor mark that could replay and duplicate its successor.
+    && (entry?.passedBySuccessor === undefined
+      || (isJsonObject(entry.passedBySuccessor)
+        && Number.isFinite(entry.passedBySuccessor.replayFloorMs)
+        && entry.passedBySuccessor.replayFloorMs >= 0))
     && (entry?.linkRefMode === undefined
       || entry.linkRefMode === 'observe'
       || entry.linkRefMode === 'enabled'))
@@ -180,10 +194,11 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
         || entry.pendingFinal.output.turnId !== entry.turnId)) {
         throw new Error('Invalid pending final handoff journal');
       }
-      const { mergedExecution, claimedAtMs, inputTextHash, ...rest } = entry;
+      const { mergedExecution, claimedAtMs, inputTextHash, wholeInputHash, ...rest } = entry;
       const plain = {
         ...rest,
         ...(typeof inputTextHash === 'string' && /^[a-f0-9]{64}$/.test(inputTextHash) ? { inputTextHash } : {}),
+        ...(typeof wholeInputHash === 'string' && /^[a-f0-9]{64}$/.test(wholeInputHash) ? { wholeInputHash } : {}),
         ...(typeof claimedAtMs === 'number' && Number.isFinite(claimedAtMs) ? { claimedAtMs } : {}),
       };
       // Invalid optional merge evidence must not discard the pending answer

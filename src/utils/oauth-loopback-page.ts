@@ -13,10 +13,16 @@ function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string));
 }
 
-export function renderOAuthLoopbackPage(outcome: OAuthLoopbackOutcome, callbackUrl: string): { status: number; html: string } {
+export function renderOAuthLoopbackPage(
+  outcome: OAuthLoopbackOutcome,
+  callbackUrl: string,
+  /** 授权已保存、但飞书没给全申请的权限时的补充说明（缺哪些、是否卡在企业审核）。 */
+  warning?: string,
+): { status: number; html: string } {
   const title = outcome === 'ok' ? '授权成功' : outcome === 'foreign' ? '这条授权不是本机 BotMux 发起的' : '授权失败';
   const body = outcome === 'ok'
     ? '<p>BotMux 已完成授权。你可以关闭此页面并返回 Dashboard。</p>'
+      + (warning ? `<p style="color:#b45309;white-space:pre-wrap">${escapeHtml(warning)}</p>` : '')
     : outcome === 'foreign'
       ? '<p>这台电脑上的 BotMux 接住了这次授权回调，但它没有发起过这次授权。通常是因为你在飞书里对部署在别的机器上的机器人发了 /login。授权码没有在这里使用。</p>'
         + '<p>请复制下面这条完整网址（与地址栏相同），在 5 分钟内发回你发起 /login 的那个飞书话题，即可完成授权。超时的话重新发一次 /login。</p>'
@@ -29,6 +35,17 @@ export function renderOAuthLoopbackPage(outcome: OAuthLoopbackOutcome, callbackU
 }
 
 /**
+ * Dashboard `/oauth/callback` 接收页（配了 oauthRedirectBase 时的自动回调落点）的正文 HTML。
+ * 成功时也要带上 warning：授权已保存、但飞书没给全申请的权限（例如卡在应用新版本的企业审核）
+ * 时，只显示一句「已完成授权」会让人以为一切就绪。所有动态文字都转义。
+ */
+export function dashboardOAuthCallbackBody(outcome: { ok: boolean; message: string; warning?: string }): string {
+  if (!outcome.ok) return escapeHtml(outcome.message);
+  return '已完成授权，本页可以关闭。回到 Dashboard 即可看到状态更新。'
+    + (outcome.warning ? `</p><p style="color:#b45309;max-width:420px;white-space:pre-wrap">${escapeHtml(outcome.warning)}` : '');
+}
+
+/**
  * The loopback listener's whole decision: which page to show and whether this
  * process may consume the callback at all. Only a login this process (or a
  * sibling process on this machine) started is handed to `consume`.
@@ -37,21 +54,25 @@ export async function answerOAuthLoopbackCallback(
   callbackUrl: string,
   deps: {
     origin: (url: string) => 'own' | 'expired' | 'unknown';
-    consume: (url: string) => Promise<string | null>;
+    consume: (url: string) => Promise<{ message: string; warning?: string } | null>;
     onError?: (error: unknown) => void;
   },
 ): Promise<{ status: number; html: string }> {
   let outcome: OAuthLoopbackOutcome = 'failed';
+  let warning: string | undefined;
   const origin = deps.origin(callbackUrl);
   if (origin === 'unknown') {
     outcome = 'foreign';
   } else if (origin === 'own') {
     try {
-      const message = await deps.consume(callbackUrl);
-      if (typeof message === 'string' && message.startsWith('✅')) outcome = 'ok';
+      const result = await deps.consume(callbackUrl);
+      if (result?.message.startsWith('✅')) {
+        outcome = 'ok';
+        warning = result.warning;
+      }
     } catch (error) {
       deps.onError?.(error);
     }
   }
-  return renderOAuthLoopbackPage(outcome, callbackUrl);
+  return renderOAuthLoopbackPage(outcome, callbackUrl, warning);
 }

@@ -15,7 +15,7 @@ import { SessionContractStore } from '../../services/session-contract-store.js';
 import { sessionContractsEnabled } from '../../services/session-contract.js';
 import type { DaemonSession } from '../../core/types.js';
 import { resolveSessionEnv, type SessionEnvBotInput } from '../../core/session-env-resolve.js';
-import { getBot, loadBotConfigsCached } from '../../bot-registry.js';
+import { getBot, loadBotConfigsCached, type BotConfig } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -73,7 +73,7 @@ export interface EphemeralPoolDeps {
   resolveLarkAppSecret(larkAppId: string): string | undefined | Promise<string | undefined>;
   /** Resolve the live bot config at spawn time so env values (session-env
    *  layers, core/session-env.ts) are never persisted in snapshots. Defaults
-   *  to the daemon's bot registry. */
+   *  to this daemon's bot registry, then live bots.json. */
   resolveBot?: (larkAppId: string) => SessionEnvBotInput | undefined;
   factory?: WorkerProcessFactory;
   workerPath?: string;
@@ -83,16 +83,19 @@ export interface EphemeralPoolDeps {
   manifestSettleMs?: number;
 }
 
+/** Live config of a node's bot. A daemon registers only its own bot, and
+ *  standalone runs register none, while workflow nodes may use any configured
+ *  bot: fall back to live bots.json. */
+function liveBotConfig(larkAppId: string): BotConfig | undefined {
+  try { return getBot(larkAppId).config; } catch { /* not hosted by this daemon */ }
+  try { return loadBotConfigsCached().find(b => b.larkAppId === larkAppId); } catch { return undefined; }
+}
+
 /** Throws when the live bot runs personal-assistant mode (see runNodeImpl). */
 export function assertNotAssistantModeBot(larkAppId: string): void {
-  // A daemon registers only its own bot, and standalone runs register none:
-  // fall back to the configured bots. A bot absent from both has no secret to
-  // launch with either, so that case is left to the credential resolver.
-  let cfg: { assistantMode?: boolean } | undefined;
-  try { cfg = getBot(larkAppId).config; } catch {
-    try { cfg = loadBotConfigsCached().find(b => b.larkAppId === larkAppId); } catch { cfg = undefined; }
-  }
-  const assistant = cfg?.assistantMode === true;
+  // A bot absent from both sources has no secret to launch with either, so
+  // that case is left to the credential resolver.
+  const assistant = liveBotConfig(larkAppId)?.assistantMode === true;
   if (assistant) throw new Error(`v3 workflow does not support personal-assistant mode; bot ${larkAppId} has assistantMode=true`);
 }
 
@@ -102,7 +105,7 @@ function v3WorkerSessionEnv(
   resolveBot: EphemeralPoolDeps['resolveBot'],
 ): { env?: Record<string, string>; envUnset?: string[] } {
   let bot: SessionEnvBotInput | undefined;
-  try { bot = resolveBot ? resolveBot(larkAppId) : getBot(larkAppId).config; } catch { bot = undefined; }
+  try { bot = (resolveBot ?? liveBotConfig)(larkAppId); } catch { bot = undefined; }
   if (!bot) return {};
   // Workflow workers never install the identity wrappers (usesLarkToolBinding).
   const resolved = resolveSessionEnv({ bot, backendType: v3WorkerBackendType(), facts: { unwrapped: true } });

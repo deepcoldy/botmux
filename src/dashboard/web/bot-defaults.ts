@@ -165,7 +165,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     tab: 'cards',
     titleKey: 'botDefaults.sectionCard',
     fieldKeys: [
-      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.pinStreamingCard',
+      'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.goalStatusCard', 'botDefaults.followUpReply', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
       'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions', 'botDefaults.replyCardNextStep',
       'botDefaults.replyCardRecap',
@@ -499,6 +499,7 @@ export type BotDefaultsRow = {
   codexBrowserAutoApproveOrigins?: boolean;
   writableTerminalLinkInCard?: boolean;
   goalStatusCard?: boolean;
+  followUpReply?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
   replyCardNextStep?: boolean;

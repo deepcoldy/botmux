@@ -79,6 +79,10 @@ export interface OwnerBoardItem {
   rev: number;
   /** 实际主群（指定的主群，否则第一条 chat 关联）。 */
   primaryChatId?: string;
+  /** 上级事项编号（这一项是它的子任务）。 */
+  parentSeq?: number;
+  /** 管家写的「在等谁」。 */
+  waitingOn?: string;
   links: OwnerBoardLink[];
   createdAt: number;
   updatedAt: number;

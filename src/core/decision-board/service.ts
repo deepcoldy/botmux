@@ -69,6 +69,7 @@ import {
   decisionAskKey,
 } from './card.js';
 import { draftAskKey } from './ask-key.js';
+import { parseParentSpec } from './overview.js';
 import {
   BOARD_STATE_LABELS,
   CHAT_REF_PATTERN,
@@ -234,6 +235,10 @@ export interface BoardCliRequest {
   nextCheck?: unknown;
   /** `--dismiss-hint`：收起当前提示。 */
   dismissHint?: unknown;
+  /** `--parent 12 | none`：挂到另一项下面当子任务 / 取消。 */
+  parent?: unknown;
+  /** `--waiting-on "<在等谁>" | none` */
+  waitingOn?: unknown;
 }
 
 /** 建项缺群时的报错：写清楚三种写法（管家照着改命令即可）。 */
@@ -501,6 +506,17 @@ export class DecisionBoardService {
       patch.nextCheckAt = parsed;
     }
     if (req.dismissHint === true) patch.dismissHint = true;
+    if (req.parent !== undefined) {
+      if (typeof req.parent !== 'string') throw new BoardError('invalid_parent', '--parent 必须是字符串');
+      const parsed = parseParentSpec(req.parent);
+      if (parsed !== null && typeof parsed === 'object') throw new BoardError('invalid_parent', parsed.error);
+      patch.parentSeq = parsed;
+    }
+    if (req.waitingOn !== undefined) {
+      if (typeof req.waitingOn !== 'string') throw new BoardError('invalid_waiting_on', '--waiting-on 必须是字符串');
+      const value = req.waitingOn.trim();
+      patch.waitingOn = !value || value.toLowerCase() === 'none' ? null : value;
+    }
     if (req.clearAsk === true) {
       patch.question = null;
       patch.options = [];
@@ -618,7 +634,11 @@ export class DecisionBoardService {
         const items = store.listItems(app, view).map(i => ({
           seq: i.seq, title: i.title, state: i.state, stateLabel: BOARD_STATE_LABELS[this.deps.locale()][i.state],
           ...(i.stage ? { stage: i.stage } : {}), ...(i.key ? { key: i.key } : {}), ...(i.repo ? { repo: i.repo } : {}),
-          pendingDecisions: i.pendingDecisions, updatedAt: i.updatedAt, ...this.itemLinks(i.seq),
+          pendingDecisions: i.pendingDecisions, updatedAt: i.updatedAt, lastActivityAt: i.lastActivityAt, ownActivityAt: i.ownActivityAt,
+          ...(i.nextCheckAt !== undefined ? { nextCheckAt: i.nextCheckAt } : {}),
+          ...(i.waitingOn ? { waitingOn: i.waitingOn } : {}),
+          ...(i.parent ? { parentSeq: i.parent.seq } : {}), ...(i.childStats ? { childStats: i.childStats } : {}),
+          ...this.itemLinks(i.seq),
           ...this.chatState(i, i.links),
           ...(this.withVisibleHint(i).hint ? { hint: i.hint } : {}),
         }));
@@ -629,6 +649,9 @@ export class DecisionBoardService {
         const detail = store.detail(app, seq)!;
         return {
           item: this.itemOut(seq),
+          ...(detail.parent ? { parent: detail.parent } : {}),
+          ...(detail.children.length ? { children: detail.children, childStats: detail.childStats } : {}),
+          lastActivityAt: detail.lastActivityAt,
           links: this.renderLinks(detail.links, detail.item.primaryChat),
           // owner 没提交的草稿（收进历史留底的）不给管家看：草稿点提交才发给管家。
           events: detail.events.filter(e => e.kind !== 'draft').slice(0, 30).map(e => ({ at: e.at, actor: e.actor, kind: e.kind, text: e.text,
@@ -1122,6 +1145,8 @@ export class DecisionBoardService {
       ...(item.recommendReason ? { recommendReason: item.recommendReason } : {}),
       askKey: ownerBoardAskKey(item),
       rev: item.rev,
+      ...(item.parentSeq !== undefined ? { parentSeq: item.parentSeq } : {}),
+      ...(item.waitingOn ? { waitingOn: item.waitingOn } : {}),
       ...(primary ? { primaryChatId: primary.ref } : {}),
       links: rendered.map(l => ({ kind: l.kind, ref: l.ref, text: l.text, ...(l.url ? { url: l.url } : {}), ...(l.primary ? { primary: true as const } : {}) })),
       createdAt: item.createdAt,

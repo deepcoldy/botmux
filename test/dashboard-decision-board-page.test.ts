@@ -50,6 +50,8 @@ beforeEach(() => {
   vi.stubGlobal('window', {
     setTimeout: (fn: () => void, ms?: number) => globalThis.setTimeout(fn, ms),
     clearTimeout: (id?: ReturnType<typeof setTimeout>) => globalThis.clearTimeout(id),
+    setInterval: (fn: () => void, ms?: number) => globalThis.setInterval(fn, ms),
+    clearInterval: (id?: ReturnType<typeof setInterval>) => globalThis.clearInterval(id),
     requestAnimationFrame: (fn: () => void) => globalThis.setTimeout(fn, 0),
     addEventListener: () => {},
     removeEventListener: () => {},
@@ -1182,5 +1184,279 @@ describe('linked chats', () => {
     await openDetail(32);
     expect(renderer!.root.findAll(n => n.props.className === 'dboard-tasks')).toEqual([]);
     expect(renderer!.root.findAll(n => n.props['data-task-hint'])).toEqual([]);
+  });
+});
+
+describe('overview and task trees', () => {
+  const NOW = Date.UTC(2026, 10, 23, 4, 0, 0);
+  const DAY = 86_400_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers({ now: NOW });
+    resetBoardNavMemory();
+    vi.stubGlobal('location', { hash: '#/board?view=overview', pathname: '/', search: '' });
+    vi.stubGlobal('history', { state: null, replaceState: () => {} });
+    vi.stubGlobal('window', {
+      setTimeout: (fn: () => void, ms?: number) => globalThis.setTimeout(fn, ms),
+      clearTimeout: (id?: ReturnType<typeof setTimeout>) => globalThis.clearTimeout(id),
+      setInterval: (fn: () => void, ms?: number) => globalThis.setInterval(fn, ms),
+      clearInterval: (id?: ReturnType<typeof setInterval>) => globalThis.clearInterval(id),
+      requestAnimationFrame: (fn: () => void) => globalThis.setTimeout(fn, 0),
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => true,
+      localStorage: { getItem: () => null, setItem: () => {} },
+      sessionStorage: { getItem: () => null, setItem: storedNav },
+    });
+  });
+  const storedNav = vi.fn();
+
+  // 一棵「发版」树（子任务里有要你拍板的）、一项过了复查时间、一项很久没动、一项暂时搁置、一项已完成。
+  const items = [
+    { seq: 10, title: '发 v3.60', state: 'active', updatedAt: NOW - DAY, childStats: { total: 3, done: 1, closed: 0 } },
+    { seq: 11, title: '修启动崩溃', state: 'done', parentSeq: 10, parent: { seq: 10, title: '发 v3.60', state: 'active' } },
+    { seq: 12, title: '写发布说明', state: 'decide', stateAt: NOW - 2 * DAY, parentSeq: 10, parent: { seq: 10, title: '发 v3.60', state: 'active' } },
+    { seq: 13, title: '补 e2e', state: 'waiting', waitingOn: 'PR 作者', updatedAt: NOW - DAY, parentSeq: 10, parent: { seq: 10, title: '发 v3.60', state: 'active' } },
+    { seq: 20, title: '复查 CI 偶发', state: 'active', nextCheckAt: NOW - 3_600_000, updatedAt: NOW - 2 * DAY },
+    { seq: 30, title: '老任务', state: 'active', updatedAt: NOW - 5 * DAY, lastActivityAt: NOW - 4 * DAY },
+    { seq: 40, title: '等外部团队排期', state: 'waiting', nextCheckAt: NOW + 3 * DAY, updatedAt: NOW - 9 * DAY },
+    { seq: 50, title: '早就做完的', state: 'done' },
+    { seq: 51, title: '看过了但没重设复查', state: 'active', nextCheckAt: NOW - 2 * DAY, updatedAt: NOW - 3 * DAY, lastActivityAt: NOW - DAY, ownActivityAt: NOW - DAY },
+  ];
+
+  function serve(rows = items): void {
+    routes = (url, init) => {
+      const method = init.method ?? 'GET';
+      if (url.endsWith('/api/decision-board/boards')) {
+        return json({ ok: true, boards: [{ larkAppId: 'cli_a', botName: '管家', online: true, steward: { enabled: true, ready: true } }] });
+      }
+      if (url.includes('/items?') && method === 'GET') {
+        return json({ ok: true, view: new URL(url, 'http://x').searchParams.get('view'), steward: { enabled: true, ready: true },
+          counts: { decide: rows.filter(i => i.state === 'decide' || i.state === 'accept').length,
+            active: rows.filter(i => i.state === 'active' || i.state === 'waiting').length, all: rows.length },
+          items: rows.map(i => ({ ...boardItem(i.seq, { stage: undefined, question: undefined, options: [], recommend: undefined }), createdAt: NOW - 20 * DAY,
+            links: [], hasDraft: false, pendingDecisions: 0, unseen: false, ...i })),
+          drafts: [], batches: [] });
+      }
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+  }
+
+  async function open(view: 'overview' | 'all') {
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BoardSummaryView, { route: { view } }));
+    });
+    for (let i = 0; i < 4; i += 1) await flush();
+  }
+
+  const sections = () => renderer!.root.findAll(n => n.type === 'section' && n.props['data-group']);
+  const rowsOf = (section: ReactTestInstance) => section.findAll(n => n.type === 'li' && n.props['data-seq'] !== undefined)
+    .map(li => `${li.props['data-depth'] ?? 0}:#${li.props['data-seq']}:${li.props['data-group']}`);
+  const visibleSeqs = () => sections().flatMap(section => section.findAll(n => n.type === 'li' && n.props['data-seq'] !== undefined)
+    .map(li => Number(li.props['data-seq'])));
+
+  it('the overview tab lists every open item once, grouped with what needs attention first; trees go with their most urgent item', async () => {
+    serve();
+    await open('overview');
+    // 取的是全部事项（服务端视图 all），标签上的数是没结束的项数。
+    expect(calls('GET', '/items?').map(c => new URL(c.url, 'http://x').searchParams.get('view'))).toEqual(['all']);
+    const tab = renderer!.root.find(n => n.type === 'button' && n.props.role === 'tab' && textOf(n).includes(zh('decisionBoard.tabOverview')));
+    expect(tab.props['aria-selected']).toBe(true);
+    expect(textOf(tab)).toContain('7');
+
+    expect(sections().map(s => s.props['data-group'])).toEqual(['needs_you', 'overdue', 'stalled', 'active', 'parked']);
+    expect(rowsOf(sections()[0]!)).toEqual(['0:#10:active', '1:#12:needs_you', '1:#13:waiting']);
+    expect(rowsOf(sections()[1]!)).toEqual(['0:#20:overdue']);
+    expect(rowsOf(sections()[2]!)).toEqual(['0:#30:stalled']);
+    expect(rowsOf(sections()[3]!)).toEqual(['0:#51:active']);
+    expect(rowsOf(sections()[4]!)).toEqual(['0:#40:parked']);
+    expect(text()).not.toContain('早就做完的');
+    expect(text()).not.toContain('修启动崩溃');
+  });
+
+  it('the overview clock regroups due items without a refetch and rebuilds detail navigation in the same order', async () => {
+    const clockItems = [
+      { seq: 1, title: '即将到复查时间', state: 'waiting', nextCheckAt: NOW + 60_000, updatedAt: NOW - DAY },
+      { seq: 2, title: '仍在推进', state: 'active', updatedAt: NOW - DAY },
+    ];
+    serve(clockItems);
+    await open('overview');
+    expect(visibleSeqs()).toEqual([2, 1]);
+    expect(JSON.parse(String(storedNav.mock.calls.at(-1)![1])).seqs).toEqual([2, 1]);
+    const requests = calls('GET', '/items?').length;
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+    expect(visibleSeqs()).toEqual([1, 2]);
+    expect(JSON.parse(String(storedNav.mock.calls.at(-1)![1])).seqs).toEqual([1, 2]);
+    expect(calls('GET', '/items?')).toHaveLength(requests);
+  });
+
+  it('a response arriving across a time boundary still saves navigation in the visible overview order', async () => {
+    const clockItems = [
+      { seq: 1, title: '即将到复查时间', state: 'waiting', nextCheckAt: NOW + 60_000, updatedAt: NOW - DAY },
+      { seq: 2, title: '仍在推进', state: 'active', updatedAt: NOW - DAY },
+    ];
+    serve(clockItems);
+    const originalRoutes = routes;
+    const listResponse = originalRoutes('/api/decision-board/cli_a/items?view=all', {}) as Response;
+    let release!: () => void;
+    const pending = new Promise<Response>(resolve => { release = () => resolve(listResponse); });
+    routes = (url, init) => url.includes('/items?') ? pending : originalRoutes(url, init);
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BoardSummaryView, { route: { view: 'overview' } }));
+    });
+    await flush();
+
+    // 旧实现连续读两次 Date.now()：第一次给导航，第二次给渲染；这里让边界落在两次读数之间。
+    const clock = vi.spyOn(Date, 'now').mockReturnValueOnce(NOW).mockReturnValueOnce(NOW + 120_000);
+    try {
+      await act(async () => { release(); });
+      for (let i = 0; i < 4; i += 1) await flush();
+      const nav = JSON.parse(String(storedNav.mock.calls.at(-1)![1]));
+      expect(nav.seqs).toEqual(visibleSeqs());
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('a late response from board A after switching to offline board B is ignored and cannot rewrite B navigation', async () => {
+    const listResponse = json({ ok: true, view: 'all', steward: { enabled: true, ready: true }, counts: { decide: 0, active: 2, all: 2 }, drafts: [], batches: [],
+      items: [101, 102].map(seq => ({ ...boardItem(seq, { title: `A 的事项 ${seq}`, state: 'active', stage: undefined, question: undefined, options: [] }),
+        createdAt: NOW - DAY, updatedAt: NOW - DAY, links: [], hasDraft: false, pendingDecisions: 0, unseen: false })) });
+    let release!: () => void;
+    const pending = new Promise<Response>(resolve => { release = () => resolve(listResponse); });
+    routes = url => {
+      if (url.endsWith('/api/decision-board/boards')) return json({ ok: true, boards: [
+        { larkAppId: 'cli_a', botName: 'A', online: true, steward: { enabled: true, ready: true } },
+        { larkAppId: 'cli_b', botName: 'B', online: false, steward: { enabled: true, ready: true } },
+      ] });
+      if (url.includes('/items?')) return pending;
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+    const navCalls = storedNav.mock.calls.length;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BoardSummaryView, { route: { appId: 'cli_a', view: 'overview' } }));
+    });
+    for (let i = 0; i < 4; i += 1) await flush();
+    expect(calls('GET', '/items?')).toHaveLength(1);
+
+    const switcher = renderer!.root.find(n => n.props.id === 'dboard-board-switch');
+    await act(async () => { switcher.props.onChange('cli_b'); });
+    await act(async () => { release(); });
+    for (let i = 0; i < 4; i += 1) await flush();
+
+    expect(calls('GET', '/items?')).toHaveLength(1);
+    expect(text()).not.toContain('A 的事项');
+    expect(storedNav.mock.calls).toHaveLength(navCalls);
+  });
+
+  it('each overview row says who it is waiting on, when it last moved, when to look again, and how far its subtasks are', async () => {
+    serve();
+    await open('overview');
+    const row = (seq: number) => renderer!.root.find(n => n.type === 'li' && n.props['data-seq'] === seq);
+    expect(textOf(row(12))).toContain(zh('decisionBoard.waitOwnerDecide'));
+    expect(textOf(row(13))).toContain(zh('decisionBoard.waitExternal', { who: 'PR 作者' }));
+    expect(textOf(row(10))).toContain(zh('decisionBoard.waitStewardWork'));
+    expect(textOf(row(10))).toContain(zh('decisionBoard.childProgress', { done: 1, total: 3 }));
+    expect(textOf(row(30))).toContain(zh('decisionBoard.idleDays', { n: 4 }));
+    expect(row(30).find(n => n.props['data-stale'] !== undefined)).toBeTruthy();
+    expect(row(20).find(n => n.props['data-check'] === 'due')).toBeTruthy();
+    expect(row(40).find(n => n.props['data-check'] === 'later')).toBeTruthy();
+    // 暂时搁置的不算很久没动（约了复查时间）。
+    expect(row(40).findAll(n => n.props['data-stale'] !== undefined)).toEqual([]);
+    // 复查到点后这一项自己有过进展：不再标「复查时间已过」。
+    expect(row(50 + 1).findAll(n => n.props['data-check'] !== undefined)).toEqual([]);
+    // 详情页的上一项 / 下一项按总览显示的顺序走（已完成、不在总览里的不进切换范围）。
+    const nav = JSON.parse(String(storedNav.mock.calls.at(-1)![1]));
+    expect(nav).toMatchObject({ appId: 'cli_a', view: 'overview', seqs: [10, 12, 13, 20, 30, 51, 40] });
+  });
+
+  it('the counts on top go by each item\'s own group, even when its tree is filed under another group', async () => {
+    serve();
+    await open('overview');
+    const chips = renderer!.root.findAll(n => n.type === 'span' && n.props['data-group'] !== undefined && String(n.props.className).includes('dboard-ov-chip'));
+    expect(chips.map(c => [c.props['data-group'], textOf(c).replace(/\D+/g, '')])).toEqual([
+      ['needs_you', '1'], ['overdue', '1'], ['stalled', '1'], ['active', '2'], ['waiting', '1'], ['parked', '1'],
+    ]);
+  });
+
+  it('a search that only hits a child: the overview shows it at the top level and says which item it belongs to', async () => {
+    routes = (url, init) => {
+      if (url.endsWith('/api/decision-board/boards')) {
+        return json({ ok: true, boards: [{ larkAppId: 'cli_a', botName: '管家', online: true, steward: { enabled: true, ready: true } }] });
+      }
+      if (url.includes('/items?') && (init.method ?? 'GET') === 'GET') {
+        return json({ ok: true, view: 'all', steward: { enabled: true, ready: true }, counts: { decide: 1, active: 6, all: 8 }, drafts: [], batches: [],
+          items: [{ ...boardItem(12, { title: '写发布说明', state: 'decide', parentSeq: 10 }), parent: { seq: 10, title: '发 v3.60', state: 'active' },
+            links: [], hasDraft: false, pendingDecisions: 0, unseen: false }] });
+      }
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+    await open('overview');
+    const row = renderer!.root.find(n => n.type === 'li' && n.props['data-seq'] === 12);
+    expect(row.props['data-depth']).toBeUndefined();
+    expect(textOf(row)).toContain(zh('decisionBoard.parentOf', { seq: 10, title: '发 v3.60' }));
+  });
+
+  it('list tabs show children under their parent, and say which item a child belongs to when the parent is not on the page', async () => {
+    serve();
+    await open('all');
+    const lis = renderer!.root.findAll(n => n.type === 'li' && n.props.className === 'dboard-row-item');
+    const order = lis.map(li => `${li.props['data-depth'] ?? 0}:${li.findAll(n => n.type === 'a' && n.props['data-seq'] !== undefined)[0]!.props['data-seq']}`);
+    const at = (seq: number) => order.findIndex(o => o.endsWith(`:${seq}`));
+    expect(order[at(10)]).toBe('0:10');
+    for (const child of [11, 12, 13]) {
+      expect(order[at(child)]).toBe(`1:${child}`);
+      expect(at(child)).toBeGreaterThan(at(10));
+    }
+    expect(textOf(lis[at(10)]!)).toContain(zh('decisionBoard.childProgress', { done: 1, total: 3 }));
+    // 子任务缩进显示时不再重复写「属于 #10」。
+    expect(lis[at(12)]!.findAll(n => n.props['data-parent'] !== undefined)).toEqual([]);
+  });
+
+  it('a child on a filtered list shows its parent; the detail page links up to the parent and lists the subtasks with a wrap-up note', async () => {
+    routes = (url, init) => {
+      const method = init.method ?? 'GET';
+      if (url.endsWith('/items/12') && method === 'GET') {
+        return json({ ok: true, ...detail(12, { parent: { seq: 10, title: '发 v3.60', state: 'active' }, lastActivityAt: NOW - DAY }) });
+      }
+      if (url.endsWith('/items/10') && method === 'GET') {
+        return json({ ok: true, ...detail(10, {
+          item: boardItem(10, { state: 'active', question: undefined, options: [], waitingOn: '评审群双审', nextCheckAt: NOW + DAY }),
+          children: [{ seq: 11, title: '修启动崩溃', state: 'done' }, { seq: 12, title: '写发布说明', state: 'closed' }],
+          childStats: { total: 2, done: 1, closed: 1 }, lastActivityAt: NOW - DAY,
+        }) });
+      }
+      if (url.endsWith('/seen')) return json({ ok: true });
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+    await act(async () => { renderer = TestRenderer.create(React.createElement(ItemDetailView, { appId: 'cli_a', seq: 12 })); });
+    await flush();
+    const up = renderer!.root.find(n => n.type === 'a' && n.props['data-parent'] === 10);
+    expect(up.props.href).toBe('#/board/cli_a/10');
+    expect(textOf(up)).toContain(zh('decisionBoard.parentOf', { seq: 10, title: '发 v3.60' }));
+    act(() => renderer!.unmount());
+
+    await act(async () => { renderer = TestRenderer.create(React.createElement(ItemDetailView, { appId: 'cli_a', seq: 10 })); });
+    await flush();
+    expect(renderer!.root.findAll(n => n.type === 'a' && n.props['data-child'] !== undefined).map(a => a.props.href))
+      .toEqual(['#/board/cli_a/11', '#/board/cli_a/12']);
+    expect(text()).toContain(zh('decisionBoard.childProgress', { done: 2, total: 2 }));
+    expect(text()).toContain(zh('decisionBoard.readyToWrapUp'));
+    expect(text()).toContain(zh('decisionBoard.waitExternal', { who: '评审群双审' }));
+    expect(renderer!.root.find(n => n.props['data-check'] === 'later')).toBeTruthy();
+    act(() => renderer!.unmount());
+
+    // 已结束的项不写在等谁、不写复查。
+    routes = (url, init) => {
+      if (url.endsWith('/items/10') && (init.method ?? 'GET') === 'GET') {
+        return json({ ok: true, ...detail(10, { item: boardItem(10, { state: 'done', question: undefined, options: [], waitingOn: '评审群双审', nextCheckAt: NOW - DAY }) }) });
+      }
+      if (url.endsWith('/seen')) return json({ ok: true });
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+    await act(async () => { renderer = TestRenderer.create(React.createElement(ItemDetailView, { appId: 'cli_a', seq: 10 })); });
+    await flush();
+    expect(renderer!.root.findAll(n => n.props['data-waiting'] !== undefined || n.props['data-check'] !== undefined)).toEqual([]);
   });
 });

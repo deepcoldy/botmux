@@ -12,7 +12,8 @@ import { config } from '../../config.js';
 import { emitHookEvent, type ManagedHookOrigin } from '../../services/hook-runner.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
-import { resolveUserToken } from '../../utils/user-token.js';
+import { resolveUserTokenWithScopes } from '../../utils/user-token.js';
+import { RESOURCE_DOWNLOAD_OAUTH_SCOPES } from '../../utils/lark-scope-catalog.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { getGroupContextSettings } from '../../services/group-context-settings-store.js';
@@ -218,8 +219,8 @@ export function assertLarkTransport(larkAppId: string, op: string): void {
  * "missing User Token, please /login" even though a valid token was used.
  */
 export class UserTokenMissingError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = 'UserTokenMissingError';
   }
 }
@@ -2031,17 +2032,41 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
   // just run /login, be told it succeeded, and still get "no User Token". The
   // openId is only ever a lookup key here; with the policy off it simply picks
   // the same person's token it always meant to.
-  const userToken = await resolveUserToken(
+  const resolved = await resolveUserTokenWithScopes(
     bot.config.larkAppId, bot.config.larkAppSecret, brand, senderOpenId,
   );
-  if (!userToken) {
+  const resourceLogin = `/login --scope ${RESOURCE_DOWNLOAD_OAUTH_SCOPES.join(' ')}`;
+  if (!resolved) {
     throw new UserTokenMissingError(
       `App Token 无法下载此资源，且未找到可用的 User Token。` +
-      `请在话题中发送 /login 完成授权后重试。`
+      `请在话题中发送 ${resourceLogin} 完成授权后重试。`
     );
   }
+  // access token 与 scope 来自同一次 TokenStore 加载/刷新；不能用另一时刻重读
+  // 磁盘得到的 scope 去解释这份 token 的下载失败。
+  const { accessToken: userToken, scopes: granted } = resolved;
 
-  await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand, guard);
+  try {
+    await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand, guard);
+  } catch (err) {
+    // 只认飞书明确返回的「用户身份缺 scope」（99991679）：HTTP 400/403 还可能是资源
+    // 撤回、跨租户或 file-not-in-msg，不能因为 token 没记 im:resource 就推人去授权。
+    // 响应带 missing_scopes 时以它为准；没有该数组时才用同一份凭证的 scope 快照兜底。
+    const status = (err as { status?: unknown })?.status;
+    const missingScopes = (err as { missingScopes?: unknown })?.missingScopes;
+    const resourceMissing = Array.isArray(missingScopes)
+      ? RESOURCE_DOWNLOAD_OAUTH_SCOPES.every(scope => missingScopes.includes(scope))
+      : !!granted && !RESOURCE_DOWNLOAD_OAUTH_SCOPES.every(scope => granted.includes(scope));
+    if ((status === 400 || status === 403)
+      && structuredLarkCode(err) === LARK_CODE_USER_SCOPE_MISSING && resourceMissing) {
+      throw new UserTokenMissingError(
+        `App Token 无法下载此资源，你的 User Token 也还没有授权下载图片/文件（${RESOURCE_DOWNLOAD_OAUTH_SCOPES.join(' ')}）。` +
+        `请在话题中发送 ${resourceLogin} 完成授权后重试。`,
+        { cause: err },
+      );
+    }
+    throw err;
+  }
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
@@ -2092,6 +2117,21 @@ async function downloadWithAppToken(larkAppId: string, messageId: string, fileKe
   await writeResourceToDisk(res, savePath, guard);
 }
 
+function resourceDownloadHttpError(message: string, status: number, body: string): Error {
+  let code: number | undefined;
+  let missingScopes: string[] | undefined;
+  try {
+    const payload = JSON.parse(body) as { code?: unknown; missing_scopes?: unknown };
+    if (typeof payload.code === 'number') code = payload.code;
+    if (Array.isArray(payload.missing_scopes)) {
+      missingScopes = payload.missing_scopes.filter((scope): scope is string => typeof scope === 'string');
+    }
+  } catch {
+    // 非 JSON 错误页没有可分类的业务码；保留原始 HTTP 错误，不猜成缺授权。
+  }
+  return Object.assign(new Error(message), { status, code, missingScopes });
+}
+
 async function downloadWithUserToken(userToken: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, brand: Brand = 'feishu', guard?: DownloadDirGuard): Promise<void> {
   const url = `${larkHosts(brand).openApi}/open-apis/im/v1/messages/${messageId}/resources/${fileKey}?type=${type}`;
   const res = await fetch(url, {
@@ -2106,11 +2146,12 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
           signal: AbortSignal.timeout(30_000),
         });
         if (!partial.ok || !partial.body) {
-          await partial.body?.cancel();
           if (partial.status === 401) {
-            throw new UserTokenMissingError('User Token 已失效（HTTP 401）。请在话题中发送 /login 重新授权后重试。');
+            await partial.body?.cancel();
+            throw new UserTokenMissingError(`User Token 已失效（HTTP 401）。请在话题中发送 /login --scope ${RESOURCE_DOWNLOAD_OAUTH_SCOPES.join(' ')} 重新授权后重试。`);
           }
-          throw Object.assign(new Error(`Resource Range download failed: HTTP ${partial.status}`), { status: partial.status });
+          const errorBody = await partial.text().catch(() => '');
+          throw resourceDownloadHttpError(`Resource Range download failed: HTTP ${partial.status}`, partial.status, errorBody);
         }
         const stream = Readable.fromWeb(partial.body as any) as ResourceStream;
         stream.statusCode = partial.status;
@@ -2119,14 +2160,12 @@ async function downloadWithUserToken(userToken: string, messageId: string, fileK
       }, savePath, guard);
       return;
     }
-    // 401 = the token itself was rejected (expired / wrong scope) → genuinely
-    // needs re-login. Any other status (403/404/4xx/5xx) means the token is
-    // fine but THIS resource can't be fetched (cross-tenant, card image,
-    // withdrawn) — surface as a plain failure so it does NOT trigger /login.
+    // 401 = token 本身失效。其它响应先保留原始资源错误；只有结构化 99991679
+    // 且确实缺 im:resource 时，外层才改写为按需授权提示，撤回/跨租户等不触发登录。
     if (res.status === 401) {
-      throw new UserTokenMissingError(`User Token 已失效（HTTP 401）。请在话题中发送 /login 重新授权后重试。`);
+      throw new UserTokenMissingError(`User Token 已失效（HTTP 401）。请在话题中发送 /login --scope ${RESOURCE_DOWNLOAD_OAUTH_SCOPES.join(' ')} 重新授权后重试。`);
     }
-    throw new Error(`Resource download failed: HTTP ${res.status} ${body}`);
+    throw resourceDownloadHttpError(`Resource download failed: HTTP ${res.status} ${body}`, res.status, body);
   }
   const buf = Buffer.from(await res.arrayBuffer());
   await writeViaRename(savePath, async (fd) => { await fdWriteAll(fd, buf); }, guard);

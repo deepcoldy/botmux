@@ -492,7 +492,7 @@ export function setExactChatGrantHandler(handler: typeof applyExactChatGrantRequ
 // botName/descriptor/bots-info 同步都在 daemon 的闭包里做）。未注册（测试环境）
 // 时 PUT /api/bot-rename 降级为仅改 displayName。
 export type BotRenameOutcome =
-  | { ok: true; name: string }
+  | { ok: true; name: string; displayName?: string | null; localSyncError?: string }
   | { ok: false; reason: string; message: string };
 let botRenamer: ((newName: string) => Promise<BotRenameOutcome>) | null = null;
 export function setBotRenamer(fn: ((newName: string) => Promise<BotRenameOutcome>) | null): void {
@@ -606,7 +606,8 @@ import {
   type SessionRow,
 } from './dashboard-rows.js';
 import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, findOncallChat, listOncallChats, effectiveDefaultWorkingDir, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, isUsableOpenId, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization, type UserAuthorizationPollResult } from '../utils/user-token.js';
+import { describeMissingUserScopes, type AppVersionReviewLookup } from '../utils/lark-app-version.js';
 import { queryTriggerUserAuthStatus } from '../services/trigger-user-auth-status.js';
 import { revokeTriggerUserAuth } from '../services/revoke-trigger-user-auth.js';
 import { tokenStoreProtection, triggerUserAuthApplies, larkUserNative, credentialSourceOf, capabilityOn, capabilitiesOf, IDENTITY_ROUTE_TOOLS, type IdentityRouteTool, type TriggerUserAuthConfig, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
@@ -4751,6 +4752,27 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   });
 });
 
+/**
+ * `auth wait` 的失败详情。目前只有 `authorization_scope_missing` 有：点名缺了哪几项 scope，
+ * 查得到应用新版本卡在企业审核时一并说明——光一个错误码会让 agent 猜原因（实测猜成
+ * 「默认 scope 里混了应用身份专属权限」）。错误码本身不变，调用方的判定逻辑不受影响。
+ */
+export function authorizationFailureDetails(
+  result: Extract<UserAuthorizationPollResult, { status: 'failed' }>,
+  locale: Locale,
+): { missingScopes?: string[]; appVersionReview?: { state: AppVersionReviewLookup['state']; version?: string }; message?: string } {
+  if (!result.missingScopes?.length) return {};
+  const review = result.appVersionReview;
+  return {
+    missingScopes: result.missingScopes,
+    // 只透出状态与版本号；查不到时的内部原因（接口错误码等）只进日志。
+    ...(review ? {
+      appVersionReview: { state: review.state, ...(review.state !== 'unknown' && review.version ? { version: review.version } : {}) },
+    } : {}),
+    message: describeMissingUserScopes(result.missingScopes, review, locale),
+  };
+}
+
 // Pending auth-request registry (session-scoped singleton) lives in
 // session-auth-requests.js so terminal identity GC can read it too.
 
@@ -5165,7 +5187,10 @@ for (const action of ['auth-request', 'auth-status']) {
       const result = await request.poll();
       if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
       if (result.status === 'failed') {
-        return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
+        return jsonRes(res, 400, {
+          ok: false, status: 'failed', error: result.error,
+          ...authorizationFailureDetails(result, localeForBot(ds.larkAppId)),
+        });
       }
       if (isCurrent() && request.isCurrent()) {
         if (!boundTool) {
@@ -11004,6 +11029,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     codexBrowserAutoApproveOrigins: cardPrefs.codexBrowserAutoApproveOrigins,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     goalStatusCard: cardPrefs.goalStatusCard,
+    followUpReply: cardPrefs.followUpReply,
     privateCard: cardPrefs.privateCard,
     replyCardActions: cardPrefs.replyCardActions,
     replyCardNextStep: cardPrefs.replyCardNextStep,
@@ -11175,7 +11201,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; streamingCardFoldedLayout?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
+    disableStreamingCard?: unknown; streamingCardFoldedLayout?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; goalStatusCard?: unknown; followUpReply?: unknown; privateCard?: unknown; replyCardActions?: unknown; replyCardNextStep?: unknown; replyCardRecap?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoStartExcludedChats?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -11197,7 +11223,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     replyCardNativeCot?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; streamingCardFoldedLayout?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; cotEnabled?: boolean;
+    disableStreamingCard?: boolean; streamingCardFoldedLayout?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; goalStatusCard?: boolean; followUpReply?: boolean; privateCard?: boolean; replyCardActions?: boolean; replyCardNextStep?: boolean; replyCardRecap?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoStartExcludedChats?: string[]; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -11269,6 +11295,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   if (typeof body.replyCardShowTools === 'boolean') patch.replyCardShowTools = body.replyCardShowTools;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.goalStatusCard === 'boolean') patch.goalStatusCard = body.goalStatusCard;
+  if (typeof body.followUpReply === 'boolean') patch.followUpReply = body.followUpReply;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
   if (typeof body.replyCardActions === 'boolean') patch.replyCardActions = body.replyCardActions;
   if (typeof body.replyCardNextStep === 'boolean') patch.replyCardNextStep = body.replyCardNextStep;
@@ -11578,7 +11605,9 @@ ipcRoute('PUT', '/api/bot-ask-option-layout', requireBoundBot(async (req, res) =
 // 主路径：daemon 注册的 renamer 走开放平台自动化真改飞书应用名（改基础信息 +
 // 建版发布，群内显示名生效）；失败（Web 登录态过期 / 非协作者 / lark 租户等）
 // 自动降级为仅改 botmux 展示名 displayName，并把原因作为 warning 返回给前端。
-// 响应：{ ok, mode: 'feishu'|'local', botName, warning?, message? }。
+// 已发布但本地同步失败仍是 mode:feishu，带 localSyncError，绝不走本地降级。
+// 响应：{ ok, mode: 'feishu'|'local', botName, larkBotName?, displayName?,
+//          localSyncError?, warning?, message? }。
 ipcRoute('PUT', '/api/bot-rename', requireBoundBot(async (req, res) => {
   const body = await readJsonBodyOrBadJson<{ name?: unknown }>(req, res);
   if (body === BAD_JSON) return;
@@ -11602,7 +11631,14 @@ ipcRoute('PUT', '/api/bot-rename', requireBoundBot(async (req, res) => {
       renamed = { ok: false, reason: 'api_error', message: ipcErrorText(err) };
     }
     if (renamed.ok) {
-      return jsonRes(res, 200, { ok: true, mode: 'feishu', botName: getBotName() });
+      return jsonRes(res, 200, {
+        ok: true,
+        mode: 'feishu',
+        botName: renamed.displayName || renamed.name,
+        larkBotName: renamed.name,
+        displayName: renamed.displayName ?? null,
+        ...(renamed.localSyncError ? { localSyncError: renamed.localSyncError } : {}),
+      });
     }
     // 降级：仅改 botmux 展示名，带上飞书侧失败原因让前端明示。
     const fallback = await applyConfigField(cachedLarkAppId, spec, name);
@@ -12391,7 +12427,10 @@ ipcRoute('POST', '/api/oauth-callback', async (req, res) => {
   }
   const result = await tryHandleCallbackUrl(body.url.trim());
   if (!result) return jsonRes(res, 200, { ok: false, matched: false, message: 'not a callback url' });
-  jsonRes(res, 200, { ok: result.ok, matched: result.matched, message: result.message });
+  jsonRes(res, 200, {
+    ok: result.ok, matched: result.matched, message: result.message,
+    ...(result.warning ? { warning: result.warning } : {}),
+  });
 });
 
 // POST /api/session-group-tag-auth — 生成带 feed-group scope 的授权链接。

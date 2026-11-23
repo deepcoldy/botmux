@@ -171,6 +171,9 @@ interface UpdateStatus {
   localDevUpdatable?: boolean;
   updateSupported: boolean;
   releaseInstallRequired?: boolean;
+  sourceReleaseAvailable?: boolean;
+  sourceReleasePending?: boolean;
+  sourceReleaseBackup?: string;
   // 'binary' = 编译版独立二进制（install.sh 形态），不归任何包管理器所有，
   // 自己下载 release 资产替换自身。
   updateManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | 'binary' | 'unknown';
@@ -670,15 +673,17 @@ function SettingsPage() {
     pollReconnect();
   }
 
-  async function doUpdate(forceLocal = false): Promise<void> {
+  async function doUpdate(forceLocal = false, installRelease = false): Promise<void> {
     const s = upStatus;
     if (!s) return;
-    if (!s.node.ok) {
+    if (!installRelease && !s.node.ok) {
       toast(tr('update.nodeTooOldAlert', { version: s.node.version, required: s.node.required }), { kind: 'warning' });
       return;
     }
     const localDev = s.localDevInstall === true;
-    if (localDev) {
+    if (installRelease) {
+      if (!localDev || !s.sourceReleaseAvailable || !s.latest) return;
+    } else if (localDev) {
       if (!s.localDevUpdatable) { toast(tr('update.localDev'), { kind: 'warning' }); return; }
     } else if (!s.updateSupported || !s.updateCommand) {
       toast(tr('update.unsupportedInstall'), { kind: 'warning' });
@@ -700,14 +705,16 @@ function SettingsPage() {
       } finally { if (mountedRef.current) setUpBusy(false); }
       if (!forceToken || !mountedRef.current) return;
     }
-    const confirmMsg = localDev
+    const confirmMsg = installRelease
+      ? tr('update.confirmSourceRelease', { version: `v${s.latest}` })
+      : localDev
       ? tr('update.confirmUpdateLocalDev')
       : s.latest
         ? tr('update.confirmUpdate', { version: `v${s.latest}`, command: s.updateCommand! })
         : tr('update.confirmUpdateNoVer', { command: s.updateCommand! });
     if (!forceLocal && !await confirm({ title: tr('update.confirmUpdateTitle'), message: confirmMsg, confirmLabel: tr('update.btnRunUpdate'), cancelLabel: tr('update.btnCancel') })) return;
     setUpBusy(true);
-    setUpMsg({ text: localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
+    setUpMsg({ text: installRelease ? tr('update.binaryDownloading', { version: `v${s.latest}` }) : localDev ? tr('update.updatingLocalDev') : tr('update.updating', { command: s.updateCommand! }) });
     const stopUpdatePoll = (): void => {
       updatePollStopRef.current?.();
       updatePollStopRef.current = null;
@@ -720,7 +727,10 @@ function SettingsPage() {
       }
     }, 1000);
     try {
-      const r = await fetch('/api/update/run', forceToken ? {
+      const r = await fetch('/api/update/run', installRelease ? {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ installRelease: true, version: s.latest }),
+      } : forceToken ? {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ forceLocal: true, previewToken: forceToken }),
       } : { method: 'POST' });
@@ -777,11 +787,16 @@ function SettingsPage() {
         return;
       }
       stopUpdatePoll();
+      if (body.sourceReleaseInstalled) {
+        await fetchStatus();
+        if (!mountedRef.current) return;
+      }
       // A restart is needed when the server says so (local-dev build always
       // regenerates dist/, even when HEAD didn't move) or when the version
       // changed (generic npm/pnpm/bun path, which sets no restartRequired).
       const needsRestart = updateResponseNeedsRestart(body);
-      const backupNotice = body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '';
+      const backupNotice = (body.backupRef ? '\n' + tr('update.forceBackup', { ref: String(body.backupRef) }) : '')
+        + (body.backupLauncher ? '\n' + tr('update.sourceReleaseBackup', { path: String(body.backupLauncher) }) : '');
       if (needsRestart) {
         setUpBusy(false);
         // `changed` reflects whether the source actually advanced; a build-only
@@ -850,6 +865,7 @@ function SettingsPage() {
       }}
       onUpdate={() => void doUpdate()}
       onForceUpdate={() => void doUpdate(true)}
+      onInstallRelease={() => void doUpdate(false, true)}
       onRestart={() => { void (async () => { if (await confirm({ title: tr('update.confirmRestartTitle'), message: tr('update.confirmPlainRestart'), confirmLabel: tr('update.btnRestartNow'), cancelLabel: tr('update.btnCancel') })) void doRestart(null); })(); }}
     />
   );
@@ -2399,6 +2415,7 @@ export function UpdateCard(props: {
   onToggleChangelog(): void;
   onUpdate(): void;
   onForceUpdate?(): void;
+  onInstallRelease?(): void;
   onRestart(): void;
 }) {
   const tr = useT();
@@ -2429,6 +2446,8 @@ export function UpdateCard(props: {
           <UpdateBadge status={s} />
         </p>
         {s.runningDaemonRestartHint ? <p className="hint-warn">{s.runningDaemonRestartHint}</p> : null}
+        {s.sourceReleasePending ? <p className="hint-warn" data-source-release-pending>{tr('update.source_release_restart_required')}</p> : null}
+        {s.sourceReleaseBackup && !props.message ? <p className="hint">{tr('update.sourceReleaseBackup', { path: s.sourceReleaseBackup })}</p> : null}
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
         {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
         {s.releaseInstallRequired ? <p className="hint">{tr('update.installReleaseHint')}</p> : null}
@@ -2441,9 +2460,11 @@ export function UpdateCard(props: {
           </button>
           <button type="button" className="page-primary-action" data-up="update" disabled={updateDisabled} onClick={props.onUpdate}>{updateLabel}</button>
           {s.localDevInstall && props.onForceUpdate ? <button type="button" data-up="force-update" disabled={updateDisabled} onClick={props.onForceUpdate}>{tr('update.forceButton')}</button> : null}
+          {s.sourceReleaseAvailable && props.onInstallRelease ? <button type="button" data-up="install-release" disabled={props.busy || !s.latest} onClick={props.onInstallRelease}>{tr('update.sourceReleaseButton')}</button> : null}
           <button type="button" data-up="restart" disabled={props.busy} onClick={props.onRestart}>{tr('update.btnRestart')}</button>
         </div>
         {s.localDevInstall && props.onForceUpdate ? <p className="hint-warn">{tr('update.forceHint')}</p> : null}
+        {s.sourceReleaseAvailable ? <p className="hint">{tr('update.sourceReleaseHint')}</p> : null}
         {s.cliUpdates?.length ? <CliRuntimeUpdates entries={s.cliUpdates} /> : null}
         {props.changelogOpen ? (
           <ChangelogPanel

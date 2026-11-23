@@ -2422,8 +2422,10 @@ export interface BotConfig {
    * already running — Claude Code's mid-turn system reminder in adopt
    * sessions, a Codex same-turn steer — as soon as the model answers it,
    * quoting that message, instead of leaving the answer inside the running
-   * turn. The worker side is read when a worker process starts; the daemon
-   * side is read live, so turning it off stops posting at once.
+   * turn. For Codex it also posts what the model says to a Lark turn mid-work
+   * (each message before it goes back to its tools) as a progress reply.
+   * The worker side is read when a worker process starts; the daemon side is
+   * read live, so turning it off stops posting at once.
    */
   followUpReply?: boolean;
   /**

@@ -12,7 +12,7 @@ import { GOAL_COMMAND_OBJECTIVE, GOAL_ENV, isBotmuxGoalObjective, V3_NATIVE_GOAL
 import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, type WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
-import type { BotConfig } from '../src/bot-registry.js';
+import { getBot, registerBot, __testOnly_resetBotRegistry, type BotConfig } from '../src/bot-registry.js';
 import { invalidateGlobalConfigCache } from '../src/global-config.js';
 
 // The default factory delegates to self-spawn's spawnWorker, which is the only
@@ -279,6 +279,97 @@ describe('v3 ephemeral pool', () => {
       await waitFor(() => worker.kills.includes('SIGTERM')); worker.emitExit(0);
       await expect(running).resolves.toMatchObject({ status: 'ok' });
     } finally { vi.unstubAllEnvs(); }
+  });
+
+  describe('live bot env resolution', () => {
+    beforeEach(() => { __testOnly_resetBotRegistry(); });
+    afterEach(() => { __testOnly_resetBotRegistry(); });
+
+    const configureBots = (bots: BotConfig[]) => {
+      const botsPath = join(dir, 'bots.json');
+      writeFileSync(botsPath, JSON.stringify(bots));
+      vi.stubEnv('BOTS_CONFIG', botsPath);
+    };
+
+    it('resolves an unregistered node bot from bots.json', async () => {
+      const hostBot: BotConfig = { larkAppId: 'cli_host', larkAppSecret: 'test-only', cliId: 'claude-code',
+        apiOnly: true, env: { MODEL_AUTH: 'host-sentinel' } };
+      registerBot(hostBot);
+      configureBots([hostBot, { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+        env: { MODEL_AUTH: 'node-sentinel' }, envUnset: ['WORKFLOW_DROP_ME'] }]);
+      expect(() => getBot('cli_app')).toThrow();
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(request());
+      try {
+        await worker.waitForInit();
+        expect(worker.init.env?.MODEL_AUTH).toBe('node-sentinel');
+        expect(worker.init.envUnset).toContain('WORKFLOW_DROP_ME');
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    });
+
+    it('keeps the hosted bot config ahead of bots.json', async () => {
+      const bot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+        apiOnly: true, env: { MODEL_AUTH: 'registered-sentinel' } };
+      registerBot(bot);
+      configureBots([{ ...bot, env: { MODEL_AUTH: 'file-sentinel' } }]);
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(request());
+      try {
+        await worker.waitForInit();
+        expect(worker.init.env?.MODEL_AUTH).toBe('registered-sentinel');
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    });
+
+    it('refuses an unregistered assistant-mode node bot before spawning', async () => {
+      configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code', assistantMode: true }]);
+      const spawn = vi.fn((): WorkerHandle => { throw new Error('unexpected spawn'); });
+      await expect(createEphemeralPool({ factory: { spawn }, workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(request())).rejects.toThrow();
+      expect(spawn).not.toHaveBeenCalled();
+    });
+
+    it.each(['missing', 'throwing'] as const)('does not override an explicit %s resolver with bots.json', async (behavior) => {
+      configureBots([{ larkAppId: 'cli_app', larkAppSecret: 'test-only', cliId: 'claude-code',
+        env: { MODEL_AUTH: 'file-sentinel' } }]);
+      const worker = new ScriptedWorker();
+      const resolveBot = vi.fn(() => {
+        if (behavior === 'throwing') throw new Error('resolver unavailable');
+        return undefined;
+      });
+      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret', resolveBot }).runNode(request());
+      try {
+        await worker.waitForInit();
+        expect(resolveBot).toHaveBeenCalledWith('cli_app');
+        expect(worker.init.env?.MODEL_AUTH).toBeUndefined();
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    });
+
+    it('does not substitute another configured bot when the node bot is absent', async () => {
+      configureBots([{ larkAppId: 'cli_other', larkAppSecret: 'test-only', cliId: 'claude-code',
+        env: { MODEL_AUTH: 'other-sentinel' } }]);
+      const worker = new ScriptedWorker();
+      const running = createEphemeralPool({ factory: factoryFor(worker), workerPath: '/tmp/worker.js',
+        resolveLarkAppSecret: () => 'secret' }).runNode(request());
+      try {
+        await worker.waitForInit();
+        expect(worker.init.env?.MODEL_AUTH).toBeUndefined();
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    });
   });
 
   it('persists the explicit default instance and replays it into the existing PTY worker after config changes', async () => {

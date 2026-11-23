@@ -36,10 +36,16 @@ type OnboardingPermission = {
   scopeCount?: number;
   skippedScopeCount?: number;
   versionId?: string;
+  /** 提交后回读仍是草稿或状态未知；有值时不能显示已发布/已可使用。 */
+  versionWarning?: string;
   scopeWarning?: string;
   /** 与 ok 独立：权限/发版全绿也可能没写上 redirect 白名单（见服务端同名字段注释）。 */
   redirectConfigured?: boolean;
   redirectWarning?: string;
+  /** 版本已提交但停在「审核中」等企业管理员审批（见服务端同名字段注释）。 */
+  versionPendingReview?: boolean;
+  pendingReviewAppVersion?: string;
+  approvalHumanApprovers?: string[];
   reason?: string;
   message?: string;
 };
@@ -166,7 +172,7 @@ function isSessionFailure(error?: string): boolean {
     || error === 'session_changed';
 }
 
-function statusText(job: OnboardingJob): string {
+export function statusText(job: OnboardingJob): string {
   if (job.status === 'waiting_for_scan') {
     return job.registrationMode === 'compat'
       ? t('botOnboarding.waitingCompat')
@@ -181,9 +187,17 @@ function statusText(job: OnboardingJob): string {
   if (job.status === 'waiting_for_platform_scan') return t('botOnboarding.platformScanHint');
   if (job.status === 'needs_owner') return t('botOnboarding.needsOwnerTitle');
   if (job.status === 'completed') {
-    return job.registrationMode === 'local'
-      ? t('botOnboarding.completedLocal', { name: job.appName ?? t('botOnboarding.botFallback') })
-      : t('botOnboarding.completed', { name: job.appName ?? t('botOnboarding.botFallback') });
+    if (job.registrationMode === 'local') {
+      return t('botOnboarding.completedLocal', { name: job.appName ?? t('botOnboarding.botFallback') });
+    }
+    // 审核中、或复查发现仍是草稿/状态未知时，都不能说「已可使用」。
+    if (waitingForEnterpriseReview(job.permission)) {
+      return t('botOnboarding.completedReviewPending', { name: job.appName ?? t('botOnboarding.botFallback') });
+    }
+    if (job.permission?.ok && job.permission.versionWarning) {
+      return t('botOnboarding.completedVersionWarning', { name: job.appName ?? t('botOnboarding.botFallback') });
+    }
+    return t('botOnboarding.completed', { name: job.appName ?? t('botOnboarding.botFallback') });
   }
   if (job.status === 'failed') {
     if (job.appId) return t('botOnboarding.partialFailureTitle');
@@ -357,7 +371,28 @@ function RedirectWarning(props: { permission: OnboardingPermission }): React.JSX
   );
 }
 
-function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | null {
+/**
+ * 权限/版本卡在企业管理员审核：要么本次提交的版本停在审核中，要么应用已有版本在审核、
+ * 开放平台把配置写锁了（`app_under_review`）。两种都不是 botmux 卡住，也都不是重试能解决的。
+ */
+function waitingForEnterpriseReview(permission: OnboardingPermission | undefined): boolean {
+  if (!permission) return false;
+  return permission.ok ? permission.versionPendingReview === true : permission.reason === 'app_under_review';
+}
+
+function reviewPendingText(permission: OnboardingPermission): string {
+  const approvers = permission.approvalHumanApprovers?.length
+    ? t('botOnboarding.permissionReviewApprovers', {
+        names: permission.approvalHumanApprovers.join(t('botOnboarding.listSeparator')),
+      })
+    : '';
+  const stuckHint = t('botOnboarding.reviewStuckHint');
+  return permission.pendingReviewAppVersion
+    ? t('botOnboarding.permissionReviewPending', { version: permission.pendingReviewAppVersion, approvers, stuckHint })
+    : t('botOnboarding.permissionReviewPendingNoVersion', { approvers, stuckHint });
+}
+
+export function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | null {
   const { job } = props;
   if ((job.status !== 'completed' && job.status !== 'needs_owner') || !job.permission) return null;
   const permission = job.permission;
@@ -366,10 +401,19 @@ function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | n
     if (permission.skippedScopeCount && permission.skippedScopeCount > 0) {
       parts.push(t('botOnboarding.permissionSkipped', { count: permission.skippedScopeCount }));
     }
-    if (permission.versionId) parts.push(t('botOnboarding.permissionVersion', { version: permission.versionId }));
+    // 「已提交发布版本 x」在等审核时会被读成「已经生效」，改由下面那条审核提示说清楚。
+    if (permission.versionId && !permission.versionPendingReview && !permission.versionWarning) {
+      parts.push(t('botOnboarding.permissionVersion', { version: permission.versionId }));
+    }
     return (
       <>
         <p className="hint-ok">{parts.join(' ')}</p>
+        {permission.versionPendingReview ? (
+          <p className="hint-warn" data-onboarding-review-pending="">{reviewPendingText(permission)}</p>
+        ) : null}
+        {permission.versionWarning ? (
+          <p className="hint-warn" data-onboarding-version-warning="">{permission.versionWarning}</p>
+        ) : null}
         {permission.scopeWarning ? <p className="hint-warn">{permission.scopeWarning}</p> : null}
         <RedirectWarning permission={permission} />
       </>
@@ -378,10 +422,18 @@ function PermissionSummary(props: { job: OnboardingJob }): React.JSX.Element | n
   const steps = job.remainingSteps ?? [];
   return (
     <>
-      <p className="hint-warn">
-        {t('botOnboarding.permissionManual')}
-        {permission.message ? `（${permission.message}）` : ''}
-      </p>
+      {waitingForEnterpriseReview(permission) ? (
+        // 审核锁：开放平台此刻什么都改不了，「请手动完成」是做不到的建议；只说明在等审核、
+        // 卡住时该怎么查怎么改，不把 automation 那段长说明原样贴出来。
+        <p className="hint-warn" data-onboarding-review-pending="">
+          {t('botOnboarding.permissionUnderReview', { stuckHint: t('botOnboarding.reviewStuckHint') })}
+        </p>
+      ) : (
+        <p className="hint-warn">
+          {t('botOnboarding.permissionManual')}
+          {permission.message ? `（${permission.message}）` : ''}
+        </p>
+      )}
       <RedirectWarning permission={permission} />
       {steps.length ? (
         <ol className="onboarding-steps">

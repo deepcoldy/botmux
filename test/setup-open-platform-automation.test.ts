@@ -1418,6 +1418,124 @@ describe('审批流程预判（秒过 vs 要人审）', () => {
 
 
 
+describe('提交后停在「企业管理员审核中」', () => {
+  const flow = (nodes: Array<Record<string, unknown>>) => ({ code: 0, data: { applyInstanceInfo: { applyNodes: nodes } } });
+
+  /** `afterCommit` 是提交后每次回读 v-new 的 console versionStatus（用尽后沿用最后一个）。 */
+  async function run(label: string, afterCommit: number[], settle: readonly number[] = [0, 0], failStatus = false, humanApproval = false) {
+    const dir = mkdtempSync(join(tmpdir(), `review-${label}-`));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const sub = openPlatformSubscriptionMock('cli_r');
+    const calls: string[] = [];
+    const statuses: string[] = [];
+    let committed = false;
+    let readsAfterCommit = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home', { status: 200 });
+      if (href.endsWith('/app/cli_r/auth')) return new Response('<script>window.csrfToken="c"</script>', { status: 200 });
+      const path = href.replace(/^https:\/\/[^/]+/, '');
+      if (path.startsWith('/developers/')) calls.push(path);
+      if (path.includes('/scope/all/')) {
+        return Response.json({ code: 0, data: { appScopeList: [{ id: 't1', name: 'im:message' }], userScopeList: [] } });
+      }
+      if (path.includes('/privilege/all/')) return Response.json({ code: 0, data: { privileges: [], scopeBiz: [] } });
+      if (path.includes('/approval_nodes/get/')) {
+        return Response.json(flow(humanApproval
+          ? [{ nodeName: '安全审批', nodeType: '', nodeUser: [{ approver: { name: '审批人A', id: 'u1' } }] }]
+          : [{ nodeName: '仅协作者免审策略', nodeType: '自动通过', nodeUser: [] }]));
+      }
+      if (path.includes('/publish/commit/')) { committed = true; return Response.json({ code: 0, data: { isOk: true } }); }
+      if (path.includes('/app_version/list/')) {
+        const versions: Array<Record<string, unknown>> = [{ appVersion: '1.0.0', versionId: 'live', versionStatus: 2 }];
+        if (committed) {
+          const status = afterCommit[Math.min(readsAfterCommit, afterCommit.length - 1)];
+          readsAfterCommit += 1;
+          versions.unshift({ appVersion: '1.0.1', versionId: 'v-new', versionStatus: status });
+        }
+        return Response.json({ code: 0, data: { versions } });
+      }
+      if (path.includes('/app_version/create/')) return Response.json({ code: 0, data: { versionId: 'v-new' } });
+      return sub.handle(href, init) ?? Response.json({ code: 0 });
+    }) as typeof fetch;
+    const r = await automateOpenPlatformSetup({
+      appId: 'cli_r', sessionFilePath: sessionFile, fetchImpl, disableQrLogin: true,
+      scopeManifest: { scopes: { tenant: ['im:message'], user: [] } },
+      reviewSettleDelaysMs: settle,
+      onStatus: message => {
+        statuses.push(message);
+        if (failStatus && message.includes('审核')) throw new Error('progress sink down');
+      },
+    });
+    rmSync(dir, { recursive: true, force: true });
+    return { r, calls, statuses, readsAfterCommit };
+  }
+
+  it('如实报「等待企业管理员审核」并带出版本号，预判的「自动通过」让位于回读事实', async () => {
+    const { r, calls, statuses, readsAfterCommit } = await run('stuck', [1]);
+    expect(r.ok, `ok=false ${(r as any).message}`).toBe(true);
+    if (!r.ok) return;
+    expect(r).toMatchObject({
+      versionId: 'v-new', versionPendingReview: true, pendingReviewAppVersion: '1.0.1', approvalAutoPassed: false,
+    });
+    expect(r.versionWarning).toBeUndefined();
+    // 留了复查窗口（首读 + 两次复查）才下结论。
+    expect(readsAfterCommit).toBe(3);
+    expect(statuses.some(message => message.includes('1.0.1') && message.includes('审核'))).toBe(true);
+    // 等审核 ≠ 配好了：CLI / 脚本化 JSON 不能报纯 ready。
+    expect(classifySetupOpenPlatformOutcome(r).status).toBe('ready_with_warnings');
+    // 只读：不撤回、不重提。
+    expect(calls.filter(p => p.includes('/publish/commit/'))).toHaveLength(1);
+    expect(calls.some(p => p.includes('/cancel_commit/'))).toBe(false);
+  });
+
+  it('复查发现版本已回到草稿时不报纯 ready 或自动通过', async () => {
+    const { r, readsAfterCommit } = await run('withdrawn', [1, 0]);
+    expect(r.ok, `ok=false ${(r as any).message}`).toBe(true);
+    if (!r.ok) return;
+    expect(readsAfterCommit).toBe(2);
+    expect(r.versionPendingReview).toBeUndefined();
+    expect(r.versionWarning).toBeDefined();
+    expect(r.approvalAutoPassed).toBe(false);
+    expect(classifySetupOpenPlatformOutcome(r).status).toBe('ready_with_warnings');
+  });
+
+  it('复查撤回后不再携带提交前的人工审批预判', async () => {
+    const { r } = await run('withdrawn-human', [1, 0], [0, 0], false, true);
+    expect(r.ok, `ok=false ${(r as any).message}`).toBe(true);
+    if (!r.ok) return;
+    expect(r.versionWarning).toBeDefined();
+    expect(r.approvalHumanApprovers).toBeUndefined();
+  });
+
+  it('进度回调出错不会把「审核中」改判成「回读失败」', async () => {
+    const { r } = await run('status-throws', [1], [0, 0], true);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.versionPendingReview).toBe(true);
+    expect(r.versionWarning).toBeUndefined();
+  });
+
+  it('免审版本在复查窗口内自动上线时不报审核中', async () => {
+    const { r, readsAfterCommit } = await run('settles', [1, 2]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.versionPendingReview).toBeUndefined();
+    expect(r.approvalAutoPassed).toBe(true);
+    expect(readsAfterCommit).toBe(2);
+    expect(classifySetupOpenPlatformOutcome(r).status).toBe('ready');
+  });
+
+  it('提交后直接上线时不额外复查', async () => {
+    const { r, readsAfterCommit } = await run('online', [2]);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.versionPendingReview).toBeUndefined();
+    expect(readsAfterCommit).toBe(1);
+  });
+});
+
 describe('redirect 白名单读→合并→写', () => {
   /** postJson 桩：读接口返回 `read`（或抛错），写接口按 `writeResults` 顺序成功/失败。 */
   function stubPostJson(opts: {

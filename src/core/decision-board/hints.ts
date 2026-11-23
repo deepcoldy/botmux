@@ -111,6 +111,10 @@ export interface HintFacts {
   prState(ref: string): PrMergeState | undefined;
   /** 看板上另一项的状态；undefined = 没有这一项。 */
   itemState(seq: number): BoardState | undefined;
+  /** 这一项的直接子任务（`--parent` 挂在它下面的项）；不给 = 不看子任务。 */
+  children?(seq: number): number[];
+  /** 看板上另一项进入当前状态的时间。 */
+  itemStateAt?(seq: number): number | undefined;
 }
 
 export interface HintCandidate {
@@ -147,9 +151,20 @@ function seqList(seqs: number[]): string {
   return seqs.map(s => `#${s}`).join('、');
 }
 
+/** 提示原因里最多逐个列这么多个编号，其余写「等 N 项」：提示是一句话，全量在看板上。 */
+const REASON_SEQS = 6;
+
+function seqListShort(seqs: number[], locale: Locale): string {
+  if (seqs.length <= REASON_SEQS) return locale === 'en' ? seqs.map(s => `#${s}`).join(', ') : seqList(seqs);
+  const head = seqs.slice(0, REASON_SEQS);
+  return locale === 'en' ? `${head.map(s => `#${s}`).join(', ')} and ${seqs.length - REASON_SEQS} more`
+    : `${seqList(head)} 等 ${seqs.length} 项`;
+}
+
 /**
  * 一项该给哪些提示。已结束（完成 / 关闭）的项不给。
  *   - 关闭：显式 pr 条件 → 这个 PR 合入；显式 item 条件 → 那一项完成；没写 → 挂的 PR 全部合入；manual → 不判断。
+ *     另外有子任务、且子任务都结束了 → 可以收尾（manual 时也不判断）。
  *   - 推进：依赖都结束了；或判断关闭用的 PR 没合入就被关了（多半要换 PR 或重新评估）。
  *   - 该看一眼：过了复查时间，且那之后这一项没有更新。
  */
@@ -189,6 +204,24 @@ export function evaluateHints(
         advance.push({ kind: 'advance', key: `advance:pr-closed:${dropped.join(',')}`,
           reason: text(locale, `PR ${dropped.join('、')} 没有合入就关闭了`, `PR ${dropped.join(', ')} closed without merging`) });
       }
+    }
+  }
+
+  // 子任务都结束了：大任务可以收尾（manual 只由管家判断，不提示）。
+  const kids = cw?.kind === 'manual' ? [] : (facts.children?.(item.seq) ?? []).filter(s => s !== item.seq);
+  if (kids.length) {
+    const states = kids.map(seq => ({ seq, state: facts.itemState(seq) }));
+    if (states.every(s => isEndedState(s.state))) {
+      const sorted = [...kids].sort((a, b) => a - b);
+      const closed = states.filter(s => s.state === 'closed').map(s => s.seq).sort((a, b) => a - b);
+      // key 是「最后一个子任务结束的时刻」：子任务重开再结束（含 owner 在看板上关掉）算新的一轮、再通知一次；
+      // 挂上一个早就结束了的子任务、挪走一个，结束时刻不变就不重复通知，管家收起过的也不再冒出来。
+      const endedAt = Math.max(...kids.map(k => facts.itemStateAt?.(k) ?? 0));
+      close.push({ kind: 'close', key: `close:children:${endedAt > 0 ? endedAt : sorted.join(',')}`,
+        reason: closed.length
+          ? text(locale, `子任务 ${seqListShort(sorted, locale)} 都已结束（${seqListShort(closed, locale)} 是关闭，不是完成），可以收尾`,
+            `subtasks ${seqListShort(sorted, locale)} have all ended (${seqListShort(closed, locale)} closed, not done); ready to wrap up`)
+          : text(locale, `子任务 ${seqListShort(sorted, locale)} 都已完成，可以收尾`, `subtasks ${seqListShort(sorted, locale)} are all done; ready to wrap up`) });
     }
   }
 
