@@ -9,14 +9,16 @@ import {
   downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream,
 } from '../src/im/lark/resource-range-download.js';
 
-const mocks = vi.hoisted(() => ({ request: vi.fn(), userToken: vi.fn(), apiOnly: false, brand: 'feishu' }));
+const mocks = vi.hoisted(() => ({ request: vi.fn(), userToken: vi.fn(), userTokenWithScopes: vi.fn(), storedScopes: vi.fn(), apiOnly: false, brand: 'feishu' }));
 vi.mock('../src/bot-registry.js', () => ({
   getBotClient: () => ({ request: mocks.request }), getAllBots: () => [],
   getBot: () => ({ config: { larkAppId: 'cli_test', larkAppSecret: 'test-only', apiOnly: mocks.apiOnly, brand: mocks.brand } }),
   formatLarkError: String,
   LarkTransportDisabledError: class extends Error {},
 }));
-vi.mock('../src/utils/user-token.js', () => ({ resolveUserToken: mocks.userToken }));
+vi.mock('../src/utils/user-token.js', () => ({
+  resolveUserToken: mocks.userToken, resolveUserTokenWithScopes: mocks.userTokenWithScopes,
+}));
 import { downloadMessageResource, UserTokenMissingError } from '../src/im/lark/client.js';
 
 const dirs: string[] = [];
@@ -35,7 +37,16 @@ function sizeError(stream = false) {
     response: { status: 400, data: stream ? Readable.from(['{"code":234037}']) : { code: 234037 } },
   });
 }
-beforeEach(() => { vi.clearAllMocks(); mocks.apiOnly = false; mocks.brand = 'feishu'; mocks.userToken.mockResolvedValue(null); });
+beforeEach(() => {
+  vi.clearAllMocks(); mocks.apiOnly = false; mocks.brand = 'feishu';
+  mocks.userToken.mockResolvedValue(null); mocks.storedScopes.mockReturnValue(undefined);
+  mocks.userTokenWithScopes.mockImplementation(async (appId, appSecret, brand, openId) => {
+    const accessToken = await mocks.userToken(appId, appSecret, brand, openId);
+    if (!accessToken) return null;
+    const scopes = mocks.storedScopes(appId, brand, openId);
+    return { accessToken, ...(scopes ? { scopes } : {}) };
+  });
+});
 afterEach(async () => {
   vi.restoreAllMocks();
   await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true })));
@@ -231,6 +242,111 @@ describe('downloadMessageResource wiring', () => {
       expect(String(url).startsWith(brand === 'lark' ? 'https://open.larksuite.com/' : 'https://open.feishu.cn/')).toBe(true);
       expect((init?.headers as Record<string, string>).Authorization).toBe('Bearer test-user-token');
     }
+  });
+  // 用户身份的 im:resource 改为按需授权：token 明确没有它时，User Token 下载失败要提示单独授权，
+  // 而不是当作资源本身拿不到（那样不会触发任何授权提示，用户只看到附件丢了）。
+  it.each([
+    ['lacks im:resource', 'im:message:readonly offline_access', true],
+    ['already has im:resource', 'im:message:readonly im:resource offline_access', false],
+    ['records no scopes', undefined, false],
+  ])('a user-token download refusal when the token %s', async (_label, scopes, asksForResourceScope) => {
+    const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    mocks.userToken.mockResolvedValue('test-user-token');
+    mocks.storedScopes.mockReturnValue(scopes?.split(' '));
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"code":99991679}', { status: 403 }));
+    const error = await downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender').catch(err => err);
+    expect(error instanceof UserTokenMissingError).toBe(asksForResourceScope);
+    if (asksForResourceScope) expect(error.message).toContain('/login --scope im:resource');
+    else expect(error.message).toContain('HTTP 403');
+    expect(mocks.storedScopes).toHaveBeenCalledWith('cli_test', 'feishu', 'ou_sender');
+  });
+  it('keeps the original refusal as the cause, and leaves network failures and 401s alone', async () => {
+    const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    mocks.userToken.mockResolvedValue('test-user-token');
+    mocks.storedScopes.mockReturnValue(['im:message:readonly', 'offline_access']);
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"code":99991679}', { status: 403 }));
+    const refused = await downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender').catch(err => err);
+    expect(refused).toBeInstanceOf(UserTokenMissingError);
+    expect(String(refused.cause?.message)).toContain('HTTP 403');
+    // 网络抖动不是缺授权：原样抛出，不把人推进可能要企业管理员审批的授权流程。
+    const network = new TypeError('fetch failed');
+    fetchMock.mockRejectedValue(network);
+    await expect(downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender')).rejects.toBe(network);
+    // token 已失效（401）仍按失效提示，不改写成「缺 im:resource」。
+    fetchMock.mockResolvedValue(new Response('expired', { status: 401 }));
+    const expired = await downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender').catch(err => err);
+    expect(expired).toBeInstanceOf(UserTokenMissingError);
+    expect(expired.message).toContain('401');
+  });
+  // access token 和 scope 必须来自同一次解析：旧 token 下载期间即使用户在别处完成了新授权，
+  // 本次 99991679 仍要按旧 token 的快照给出授权引导，不能拿新凭证的元数据解释旧失败。
+  it('uses the access token and scopes from the same resolved snapshot', async () => {
+    const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    mocks.userTokenWithScopes.mockResolvedValue({
+      accessToken: 'snapshot-token', scopes: ['im:message:readonly', 'offline_access'],
+    });
+    // 若实现退回旧的两次读取路径，这里会拿到另一份 token/scope，下面的行为就会翻转。
+    mocks.userToken.mockResolvedValue('replacement-token');
+    mocks.storedScopes.mockReturnValue(['im:message:readonly', 'im:resource', 'offline_access']);
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{"code":99991679}', { status: 403 }));
+    const error = await downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender').catch(err => err);
+    expect(error).toBeInstanceOf(UserTokenMissingError);
+    expect(error.message).toContain('/login --scope im:resource');
+    expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ Authorization: 'Bearer snapshot-token' });
+  });
+  it.each([
+    ['resource-level refusal', { code: 234003 }],
+    ['another scope is missing', { code: 99991679, missing_scopes: ['im:message:readonly'] }],
+    ['non-JSON refusal', 'forbidden'],
+  ])('does not turn a user-token 403 into a scope prompt for %s', async (_label, body) => {
+    const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    mocks.userToken.mockResolvedValue('test-user-token');
+    mocks.storedScopes.mockReturnValue(['im:message:readonly', 'offline_access']);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(typeof body === 'string' ? body : JSON.stringify(body), { status: 403 }));
+    const error = await downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender').catch(err => err);
+    expect(error).not.toBeInstanceOf(UserTokenMissingError);
+    expect(error).toMatchObject({ status: 403 });
+  });
+  it('uses missing_scopes from the actual response when it is present', async () => {
+    const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    mocks.userToken.mockResolvedValue('test-user-token');
+    // 磁盘元数据即使声称已有权限，也不能压过这份 token 实际收到的缺权响应。
+    mocks.storedScopes.mockReturnValue(['im:message:readonly', 'im:resource', 'offline_access']);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      code: 99991679, missing_scopes: ['im:resource'],
+    }), { status: 403 }));
+    const error = await downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender').catch(err => err);
+    expect(error).toBeInstanceOf(UserTokenMissingError);
+    expect(error.cause).toMatchObject({ code: 99991679, missingScopes: ['im:resource'] });
+  });
+  it.each(['probe', 'data-chunk'])('preserves structured missing-scope errors from the Range %s', async stage => {
+    const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    mocks.userToken.mockResolvedValue('test-user-token');
+    mocks.storedScopes.mockReturnValue(['im:message:readonly', 'offline_access']);
+    const fetchMock = vi.spyOn(globalThis, 'fetch');
+    fetchMock.mockResolvedValueOnce(new Response('{"code":234037}', { status: 400 }));
+    if (stage === 'data-chunk') {
+      fetchMock.mockResolvedValueOnce(new Response(Buffer.from([7]), {
+        status: 206, headers: { 'content-range': 'bytes 0-0/3' },
+      }));
+    }
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      code: 99991679, missing_scopes: ['im:resource'],
+    }), { status: 403 }));
+    const error = await downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender').catch(err => err);
+    expect(error).toBeInstanceOf(UserTokenMissingError);
+    expect(error.message).toContain('/login --scope im:resource');
+    expect(error.cause).toMatchObject({
+      status: 403, code: 99991679, missingScopes: ['im:resource'],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(stage === 'probe' ? 2 : 3);
+  });
+  it('asks for the resource scope when no user token exists at all', async () => {
+    const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    mocks.userToken.mockResolvedValue(null);
+    const error = await downloadMessageResource('cli_test', 'om_test', 'file_test', 'file', output, 'ou_sender').catch(err => err);
+    expect(error).toBeInstanceOf(UserTokenMissingError);
+    expect(error.message).toContain('/login --scope im:resource');
   });
   it('keeps an expired user token as a genuine login error', async () => {
     const output = await outputPath(); mocks.request.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));

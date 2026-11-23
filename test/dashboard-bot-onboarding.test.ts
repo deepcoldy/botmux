@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BotOnboardingManager } from '../src/dashboard/bot-onboarding.js';
+import { logger } from '../src/utils/logger.js';
 import type { RegisterAppOptions, RegisterAppResult } from '../src/setup/register-app.js';
 import type { OpenPlatformAutomationResult } from '../src/setup/open-platform-automation.js';
 import {
@@ -908,6 +909,84 @@ describe('BotOnboardingManager', () => {
     });
 
     rmSync(dir, { recursive: true, force: true });
+  });
+
+  it.each([
+    ['the submitted version stays in review', {
+      ...autoOk(), versionId: 'v-new', versionPendingReview: true, pendingReviewAppVersion: '1.0.1', approvalHumanApprovers: ['审批人甲'],
+    } as OpenPlatformAutomationResult, { ok: true, versionPendingReview: true, pendingReviewAppVersion: '1.0.1', approvalHumanApprovers: ['审批人甲'] }],
+    ['the app config is locked by a version under review', {
+      ok: false, reason: 'app_under_review', message: '应用正在飞书审核中', redirectConfigured: false, inReviewVersionId: 'v-0',
+    } as OpenPlatformAutomationResult, { ok: false, reason: 'app_under_review' }],
+  ])('Web 建 bot 后 %s：结果与日志都写明在等企业管理员审核', async (_label, automation, permission) => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-review-'));
+    const info = vi.spyOn(logger, 'info');
+    try {
+      const manager = new BotOnboardingManager({
+        botsJsonPath: join(dir, 'bots.json'),
+        createApp: async () => ({
+          ok: true, appId: 'cli_review', appSecret: 'web-secret', brand: 'feishu',
+          sessionFile: '/tmp/feishu-session.json', sessionSource: 'botmux_cache',
+          sessionIdentity: { userId: 'u_1', userName: 'Alice', tenantId: 't_1', tenantName: 'Example' },
+        }),
+        validateCredentials: async () => ({ ok: true }),
+        automateOpenPlatform: async () => automation,
+      });
+      const job = manager.start({ sessionMode: 'reuse', expectedIdentity: { userId: 'u_1', tenantId: 't_1' } });
+      await job.done;
+      expect(manager.get(job.id)?.permission).toMatchObject(permission);
+      const logged = info.mock.calls.map(([message]) => String(message))
+        .filter(message => message.includes('[bot-onboarding]') && message.includes('cli_review'));
+      expect(logged.some(message => message.includes('审核'))).toBe(true);
+      if (permission.ok) expect(logged.some(message => message.includes('1.0.1'))).toBe(true);
+    } finally {
+      info.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a version readback warning in the terminal permission snapshot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-version-warning-'));
+    const versionWarning = '版本提交后复查又回到草稿';
+    try {
+      const manager = new BotOnboardingManager({
+        botsJsonPath: join(dir, 'bots.json'),
+        registerApp: async () => ({ ok: true, appId: 'cli_warning', appSecret: 's', brand: 'feishu' }),
+        validateCredentials: async () => ({ ok: true }),
+        automateOpenPlatform: async () => ({ ...autoOk(), versionId: 'v-new', versionWarning }),
+      });
+      const job = manager.start({ registrationMode: 'sdk', cliId: 'claude-code', workingDir: '~' });
+      await job.done;
+      expect(manager.get(job.id)?.permission).toMatchObject({
+        ok: true, versionId: 'v-new', versionWarning,
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not log a review wait when the version went live', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-live-'));
+    const info = vi.spyOn(logger, 'info');
+    try {
+      const manager = new BotOnboardingManager({
+        botsJsonPath: join(dir, 'bots.json'),
+        createApp: async () => ({
+          ok: true, appId: 'cli_live', appSecret: 'web-secret', brand: 'feishu',
+          sessionFile: '/tmp/feishu-session.json', sessionSource: 'botmux_cache',
+          sessionIdentity: { userId: 'u_1', userName: 'Alice', tenantId: 't_1', tenantName: 'Example' },
+        }),
+        validateCredentials: async () => ({ ok: true }),
+        automateOpenPlatform: async () => autoOk(),
+      });
+      const job = manager.start({ sessionMode: 'reuse', expectedIdentity: { userId: 'u_1', tenantId: 't_1' } });
+      await job.done;
+      expect(manager.get(job.id)?.permission).not.toHaveProperty('versionPendingReview');
+      expect(info.mock.calls.some(([message]) => String(message).includes('[bot-onboarding]') && String(message).includes('审核'))).toBe(false);
+    } finally {
+      info.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('always forces a command-scoped owner QR for a compat-created App', async () => {

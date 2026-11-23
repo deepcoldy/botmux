@@ -8,9 +8,9 @@ import { stripTrailingBridgeSentinelLine } from '../src/services/bridge-fallback
 import type { CotEntry } from '../src/types.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
-function worker() {
+function worker(lastInitConfig: Record<string, unknown> = {}) {
   const scope: Record<string, any> = {
-    lastInitConfig: {},
+    lastInitConfig,
     // The reply card's activity buffer, as in worker.ts.
     THINKING_ACCUMULATED_CAP: 60_000,
     thinkingTurnKey: undefined,
@@ -39,5 +39,11 @@ describe('worker CoT intake', () => {
     const w = worker();
     expect(() => w.observeCotEntries([{ kind: 'text', text: undefined } as any, ...tail], { turnId: 'om_bad' })).not.toThrow();
     expect(w.thinkingEntries.map((entry: CotEntry) => entry.kind)).toEqual(['tool_call', 'tool_call', 'text']);
+  });
+
+  it('skips a malformed entry in an adopted session and keeps the sentinel verbatim', () => {
+    const w = worker({ adoptMode: true });
+    expect(() => w.observeCotEntries([{ kind: 'text', text: undefined } as any, ...tail], { turnId: 'om_bad' })).not.toThrow();
+    expect(w.thinkingEntries).toEqual(tail);
   });
 });

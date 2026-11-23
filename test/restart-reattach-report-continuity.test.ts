@@ -1294,6 +1294,8 @@ describe('historical follow-up reply delivery', () => {
       absorbedReplyUuid: () => 'provider-key', deliverWithRetry,
       beginFinalOutputDelivery: () => () => { effects.push('drain-finished'); },
       scopedReply: async () => 'om_reply', ownsLifecycleMutation: () => true,
+      isMeetingDrivenTurn: () => false, fallbackTurnId: (_ds: unknown, turnId: string) => turnId,
+      frozenReplyContextForTurn: () => ({ target: { mode: 'thread', rootMessageId: 'om_fold' } }),
       recordTurnTerminalCarrier: () => { effects.push('carrier'); },
       noteFinalOutputReceipt: () => { effects.push('receipt'); },
       ...overrides,

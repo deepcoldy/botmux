@@ -1,8 +1,11 @@
 import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { botmuxWrapperFiles } from '../src/core/botmux-wrapper.js';
+import { writeBotmuxWrapperFiles, writeBotmuxWrapperFilesWithRetry } from '../src/core/botmux-wrapper-writer.js';
+import { withFileLock } from '../src/utils/file-lock.js';
+import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 /**
  * Regression tests for the compiled-binary wrapper self-destruct.
@@ -112,31 +115,21 @@ describe('botmuxWrapperFiles — standalone (compiled binary) form', () => {
 });
 
 describe('daemon wrapper write — refuses to clobber the running executable', () => {
-  /**
-   * Mirrors the guard in src/daemon.ts writePidFile(). Kept as a local
-   * reimplementation because writePidFile is not exported and pulling in daemon.ts
-   * boots a whole daemon; the source-structure guard at the end of this block ties
-   * this logic to the real one so the two cannot silently drift.
-   */
-  function wouldSkip(wrapperPath: string, execPath: string): boolean {
-    const { realpathSync } = require('node:fs') as typeof import('node:fs');
-    try {
-      return realpathSync(wrapperPath) === realpathSync(execPath);
-    } catch {
-      return false;
-    }
+  function write(dir: string, files: ReturnType<typeof botmuxWrapperFiles>, runningExecutable: string) {
+    return writeBotmuxWrapperFiles({
+      binDir: dir, files, runningExecutable, lockTarget: join(dir, 'global-install-lock'),
+    });
   }
 
   it('skips when the wrapper path IS the running binary (the self-destruct case)', () => {
     const dir = tmp();
     const bin = join(dir, 'botmux');
-    // Stand in for the 94MB ELF install.sh drops at ~/.botmux/bin/botmux.
     writeFileSync(bin, 'ELF-ish payload', { mode: 0o755 });
     const sizeBefore = statSync(bin).size;
     const inoBefore = statSync(bin).ino;
 
-    expect(wouldSkip(bin, bin)).toBe(true);
-    // And the file is untouched — the point of the guard.
+    const result = write(dir, botmuxWrapperFiles('/unused', bin, 'linux', true), bin);
+    expect(result.skipped).toContain(bin);
     expect(statSync(bin).size).toBe(sizeBefore);
     expect(statSync(bin).ino).toBe(inoBefore);
   });
@@ -147,44 +140,179 @@ describe('daemon wrapper write — refuses to clobber the running executable', (
     writeFileSync(realBin, 'payload', { mode: 0o755 });
     const linkedWrapper = join(dir, 'botmux');
     symlinkSync(realBin, linkedWrapper);
-    // Different strings, same inode → must still skip.
-    expect(linkedWrapper).not.toBe(realBin);
-    expect(wouldSkip(linkedWrapper, realBin)).toBe(true);
+
+    const result = write(dir, botmuxWrapperFiles('/unused', realBin, 'linux', true), realBin);
+    expect(result.skipped).toContain(linkedWrapper);
+    expect(readFileSync(realBin, 'utf8')).toBe('payload');
   });
 
   it('does NOT skip a genuine wrapper file (guard must not disable normal writes)', () => {
-    // Reverse direction: if this returned true, the guard would suppress the
-    // wrapper for every ordinary Node install and break `botmux send` in sessions.
     const dir = tmp();
     const wrapper = join(dir, 'botmux');
-    writeFileSync(wrapper, '#!/bin/sh\nexec node "/opt/botmux/dist/cli.js" "$@"\n', { mode: 0o755 });
-    const someNode = process.execPath;
-    expect(wouldSkip(wrapper, someNode)).toBe(false);
+    writeFileSync(wrapper, '#!/bin/sh\nexec node "/opt/old/dist/cli.js" "$@"\n', { mode: 0o755 });
+    const files = botmuxWrapperFiles('/opt/new/dist/cli.js', process.execPath, 'linux', false);
+    const result = write(dir, files, process.execPath);
+
+    expect(result.written).toContain(wrapper);
+    expect(readFileSync(wrapper, 'utf8')).toBe(files[0].content);
   });
 
   it('does NOT skip when the wrapper does not exist yet (first boot)', () => {
     const dir = tmp();
-    expect(wouldSkip(join(dir, 'botmux'), process.execPath)).toBe(false);
+    const wrapper = join(dir, 'botmux');
+    const files = botmuxWrapperFiles('/opt/new/dist/cli.js', process.execPath, 'linux', false);
+    const result = write(dir, files, process.execPath);
+
+    expect(result.written).toContain(wrapper);
+    expect(readFileSync(wrapper, 'utf8')).toBe(files[0].content);
   });
 
-  // 源码结构护栏(K1/K3)：编译态单文件二进制的自毁防线。writePidFile 在 daemon.ts 闭包里、未导出，
-  // 起 daemon 才能走到（smoke 用空 bots.json 结构上到不了），上面的用例跑的都是本地复刻，
-  // 所以只能读真实源码确认：标志真的传进了 wrapper 生成器，且「wrapper 路径就是正在运行的二进制」时
-  // 先 continue 跳过、再轮到写盘。丢了它，install.sh 装的 ~94MB 二进制每次启动都会被覆盖成 47 字节的壳
-  // （8386f34dde，CLAUDE.md「编译态注意」）。
-  it('daemon writePidFile passes the standalone flag and skips the running executable before any write', () => {
-    const src = readFileSync(resolve('src/daemon.ts'), 'utf-8');
-    const start = src.indexOf('function writePidFile(');
-    expect(start).toBeGreaterThanOrEqual(0);
-    const region = src.slice(start, src.indexOf('\nfunction ', start + 1));
-    expect(region).toContain('isStandaloneBinary()');
-    // The wrapper generator receives a 4th (standalone) argument.
-    expect(region).toMatch(/botmuxWrapperFiles\(\s*[^,()]+,\s*process\.execPath,\s*[^,()]+,\s*[^,()\s]+\s*\)/);
-    const guard = region.search(/realpathSync\([^)]*\)\s*===\s*realpathSync\(process\.execPath\)/);
-    const skip = region.indexOf('continue;', guard);
-    const write = region.indexOf('atomicWriteFileSync(wrapper', guard);
-    expect(guard).toBeGreaterThanOrEqual(0);
-    expect(skip).toBeGreaterThan(guard);
-    expect(write).toBeGreaterThan(skip);
-  });
+  it('holds the global install lock through the wrapper read/check/write sequence', async () => {
+    const dir = tmp();
+    const binDir = join(dir, 'bin');
+    const wrapper = join(binDir, 'botmux');
+    const lockTarget = join(dir, 'global-install-lock');
+    const options = {
+      binDir,
+      files: botmuxWrapperFiles('/opt/new/dist/cli.js', process.execPath, 'linux', false),
+      runningExecutable: process.execPath,
+      lockTarget,
+    };
+    let child: ReturnType<typeof spawnTsEvalWithRepoImports> | undefined;
+    let stdout = '', stderr = '';
+    try {
+      await withFileLock(lockTarget, async () => {
+        child = spawnTsEvalWithRepoImports(`
+          import { writeBotmuxWrapperFiles } from './src/core/botmux-wrapper-writer.js';
+          const options = ${JSON.stringify(options)};
+          console.log('WRITER_READY');
+          const result = writeBotmuxWrapperFiles(options);
+          console.log('WRITER_DONE=' + JSON.stringify(result));
+        `, { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] });
+        child.stdout?.on('data', chunk => { stdout += String(chunk); });
+        child.stderr?.on('data', chunk => { stderr += String(chunk); });
+        const deadline = Date.now() + 10_000;
+        while (!stdout.includes('WRITER_READY') && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        expect(stdout, stderr).toContain('WRITER_READY');
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(existsSync(wrapper), stdout).toBe(false);
+      });
+      const status = await new Promise<number | null>((resolve, reject) => {
+        child!.once('error', reject);
+        child!.once('exit', code => resolve(code));
+      });
+      expect(status, `${stdout}\n${stderr}`).toBe(0);
+      expect(readFileSync(wrapper, 'utf8')).toBe(options.files[0].content);
+    } finally {
+      if (child && child.exitCode === null) child.kill();
+    }
+  }, 20_000);
+
+  it('retries lock contention after the installer releases the lock', async () => {
+    const dir = tmp();
+    const binDir = join(dir, 'bin');
+    const wrapper = join(binDir, 'botmux');
+    const lockTarget = join(dir, 'global-install-lock');
+    const files = botmuxWrapperFiles('/opt/new/dist/cli.js', process.execPath, 'linux', false);
+    const errors: unknown[] = [];
+    let cancel: (() => void) | undefined;
+    try {
+      await withFileLock(lockTarget, async () => {
+        cancel = writeBotmuxWrapperFilesWithRetry({
+          binDir, files, runningExecutable: process.execPath, lockTarget,
+          lockOptions: { maxWaitMs: 0 }, retryDelayMs: 20,
+          onResult: () => undefined,
+          onError: error => { errors.push(error); },
+        });
+        expect(existsSync(wrapper)).toBe(false);
+        await new Promise(resolve => setTimeout(resolve, 60));
+        expect(existsSync(wrapper)).toBe(false);
+      });
+      const deadline = Date.now() + 2_000;
+      while (!existsSync(wrapper) && Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      expect(existsSync(wrapper)).toBe(true);
+      expect(errors).toEqual([]);
+      expect(readFileSync(wrapper, 'utf8')).toBe(files[0].content);
+    } finally {
+      cancel?.();
+    }
+  }, 10_000);
+
+  it('does not replay a delayed source write over a release installed while waiting', async () => {
+    const dir = tmp();
+    const binDir = join(dir, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const wrapper = join(binDir, 'botmux');
+    const lockTarget = join(dir, 'global-install-lock');
+    const files = botmuxWrapperFiles('/opt/old/dist/cli.js', process.execPath, 'linux', false);
+    writeFileSync(wrapper, files[0].content);
+    const candidate = join(dir, 'candidate');
+    writeFileSync(candidate, 'official-new-binary');
+    const errors: unknown[] = [];
+    let cancel: (() => void) | undefined;
+    let resolveResult!: (result: { deferred: string[] }) => void;
+    const resultPromise = new Promise<{ deferred: string[] }>(resolve => { resolveResult = resolve; });
+    try {
+      await withFileLock(lockTarget, async () => {
+        cancel = writeBotmuxWrapperFilesWithRetry({
+          binDir, files, runningExecutable: process.execPath, lockTarget,
+          lockOptions: { maxWaitMs: 0 }, retryDelayMs: 20,
+          onResult: result => { resolveResult(result); },
+          onError: error => { errors.push(error); },
+        });
+        // The release installer wins while this daemon is waiting for the lock.
+        renameSync(candidate, wrapper);
+        await new Promise(resolve => setTimeout(resolve, 60));
+      });
+      const result = await resultPromise;
+      expect(result.deferred).toContain(wrapper);
+      expect(errors).toEqual([]);
+      expect(readFileSync(wrapper, 'utf8')).toBe('official-new-binary');
+    } finally {
+      cancel?.();
+    }
+  }, 10_000);
+
+  it('observes atomic replacements of a symlink launcher target across retries', async () => {
+    const dir = tmp();
+    const binDir = join(dir, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const target = join(dir, 'launcher-target');
+    const wrapper = join(binDir, 'botmux');
+    const lockTarget = join(dir, 'global-install-lock');
+    const files = botmuxWrapperFiles('/daemon/dist/cli.js', process.execPath, 'linux', false);
+    writeFileSync(target, files[0].content);
+    symlinkSync(target, wrapper);
+    const competitor = join(dir, 'competitor');
+    writeFileSync(competitor, 'competitor launcher');
+    const errors: unknown[] = [];
+    let cancel: (() => void) | undefined;
+    let resolveResult!: (result: { deferred: string[] }) => void;
+    const resultPromise = new Promise<{ deferred: string[] }>(resolve => { resolveResult = resolve; });
+    try {
+      await withFileLock(lockTarget, async () => {
+        cancel = writeBotmuxWrapperFilesWithRetry({
+          binDir, files, runningExecutable: process.execPath, lockTarget,
+          lockOptions: { maxWaitMs: 0 }, retryDelayMs: 20,
+          onResult: result => { resolveResult(result); },
+          onError: error => { errors.push(error); },
+        });
+        // A cooperating winner replaces the symlink TARGET, leaving the link's
+        // own lstat metadata unchanged.
+        renameSync(competitor, target);
+        await new Promise(resolve => setTimeout(resolve, 60));
+      });
+      const result = await resultPromise;
+      expect(result.deferred).toContain(wrapper);
+      expect(errors).toEqual([]);
+      expect(lstatSync(wrapper).isSymbolicLink()).toBe(true);
+      expect(readFileSync(wrapper, 'utf8')).toBe('competitor launcher');
+    } finally {
+      cancel?.();
+    }
+  }, 10_000);
 });

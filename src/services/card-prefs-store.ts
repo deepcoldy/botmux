@@ -20,6 +20,10 @@ import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } 
  *                                  link in the streaming card body
  *   • goalStatusCard            — Codex / TRAE native-goal status card
  *                                  (opt-in, default off)
+ *   • followUpReply             — mid-turn replies: answer a folded Lark
+ *                                  message at once (Claude Code adopt, Codex
+ *                                  steer) and post Codex mid-turn progress
+ *                                  (opt-in, default off)
  *   • privateCard               — `/card` sends a private ephemeral snapshot
  *                                  (visible to the talk-grant audience) instead
  *                                  of the group-visible live card
@@ -84,6 +88,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   writableTerminalLinkInCard: boolean;
   /** Codex / TRAE native-goal status card. Default false; only true persists. */
   goalStatusCard: boolean;
+  /** Mid-turn replies (see BotConfig.followUpReply). Default false; only true persists. */
+  followUpReply: boolean;
   privateCard: boolean;
   /** Compact overflow menu (terminal/model/close) on ordinary reply cards.
    *  Default false; only an explicit true enables it. */
@@ -180,6 +186,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       replyCardNativeCot: c.replyCardNativeCot === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       goalStatusCard: c.goalStatusCard === true,
+      followUpReply: c.followUpReply === true,
       privateCard: c.privateCard === true,
       replyCardActions: c.replyCardActions === true,
       replyCardNextStep: c.replyCardNextStep === true,
@@ -227,6 +234,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       replyCardNativeCot: false,
       writableTerminalLinkInCard: false,
       goalStatusCard: false,
+      followUpReply: false,
       privateCard: false,
       replyCardActions: false,
       replyCardNextStep: false,
@@ -371,6 +379,7 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'replyCardNativeCot', patch.replyCardNativeCot);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'goalStatusCard', patch.goalStatusCard);
+    apply(entry, 'followUpReply', patch.followUpReply);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'replyCardActions', patch.replyCardActions);
     apply(entry, 'replyCardNextStep', patch.replyCardNextStep);
@@ -423,6 +432,7 @@ async function updateBotCardPrefsInternal(
         replyCardNativeCot: entry.replyCardNativeCot === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         goalStatusCard: entry.goalStatusCard === true,
+        followUpReply: entry.followUpReply === true,
         privateCard: entry.privateCard === true,
         replyCardActions: entry.replyCardActions === true,
         replyCardNextStep: entry.replyCardNextStep === true,
@@ -501,6 +511,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.goalStatusCard !== undefined) {
     bot.config.goalStatusCard = patch.goalStatusCard || undefined;
+  }
+  if (patch.followUpReply !== undefined) {
+    bot.config.followUpReply = patch.followUpReply || undefined;
   }
   if (patch.privateCard !== undefined) {
     bot.config.privateCard = patch.privateCard || undefined;
@@ -613,7 +626,7 @@ async function updateBotCardPrefsInternal(
     `silentTurnReactions=${r.result.silentTurnReactions} ` +
     `codexAppCleanInput=${r.result.codexAppCleanInput} ` +
     `codexBrowser=${r.result.codexBrowser} ` +
-    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} goalStatusCard=${r.result.goalStatusCard} privateCard=${r.result.privateCard} ` +
+    `writableTerminalLinkInCard=${r.result.writableTerminalLinkInCard} goalStatusCard=${r.result.goalStatusCard} followUpReply=${r.result.followUpReply} privateCard=${r.result.privateCard} ` +
     `cotEnabled=${r.result.cotEnabled} ` +
     `thinkingCardToolResult=${r.result.thinkingCardToolResult} ` +
     `senderTag=${r.result.senderTag} ` +

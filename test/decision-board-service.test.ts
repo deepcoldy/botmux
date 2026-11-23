@@ -106,29 +106,28 @@ describe('close in chat', () => {
     expect(() => service.closeInChat(item.seq, item.rev, 'local')).toThrow();
     expect(delivered).toEqual([]);
   });
-  it('管家把带草稿的事项置为 done 后，迟到提交按 item_ended 拒绝且不建批次、不动草稿', async () => {
+  it('管家把带草稿的事项置为 done：草稿收进历史、不再算待提交，迟到提交按草稿不在了拒绝且不建批次', async () => {
     const item = await addDecideItem();
     const draft = service.putDraft(item.seq, 'owner', { choice: 'A', text: '还没提交的草稿', baseRev: item.rev }).draft!;
-    // 既有管家路径：updateItem 改状态不清草稿，所以终态事项可能仍带着草稿（旧页面/迟到批量提交会撞上）。
     service.store().updateItem(APP, item.seq, { state: 'done' }, 'steward-1');
-    expect(service.detail(item.seq, 'owner').draft).toBeDefined();
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(service.list('all', 'owner').drafts).toEqual([]);
     await expect(service.submit({ author: 'owner', nonce: 'late-after-done',
       items: [{ seq: item.seq, draftUpdatedAt: draft.updatedAt }] }))
-      .rejects.toMatchObject({ code: 'item_ended' });
+      .rejects.toMatchObject({ code: 'draft_missing' });
     expect(service.store().listBatches(APP)).toEqual([]);
     expect(delivered).toEqual([]);
-    // 事务回滚：草稿原样留着，没有被失败的提交消费掉。
-    expect(service.detail(item.seq, 'owner').draft?.updatedAt).toBe(draft.updatedAt);
+    const archived = service.detail(item.seq, 'owner').events.filter(e => e.kind === 'draft');
+    expect(archived).toHaveLength(1);
+    expect(archived[0]).toMatchObject({ actor: 'owner', actorRef: 'owner' });
+    expect(archived[0]!.text).toContain('还没提交的草稿');
   });
-  it('已结束事项上留下的草稿：不能再改成别的内容，但能清空，清空后不再算在待提交里', async () => {
+  it('已结束事项不能再存非空草稿；空草稿照常当删除', async () => {
     const item = await addDecideItem();
-    service.putDraft(item.seq, 'owner', { choice: 'A', text: '还没提交的草稿', baseRev: item.rev });
     service.store().updateItem(APP, item.seq, { state: 'closed' }, 'steward-1');
     const rev = service.detail(item.seq, 'owner').item.rev;
-    expect(() => service.putDraft(item.seq, 'owner', { text: '改一下', baseRev: rev })).toThrow(expect.objectContaining({ code: 'item_ended' }));
-    expect(service.list('all', 'owner').drafts.map(d => d.seq)).toEqual([item.seq]);
-    service.putDraft(item.seq, 'owner', { text: '', fileIds: [], baseRev: rev });
-    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(() => service.putDraft(item.seq, 'owner', { text: '改一下', baseRev: rev })).toThrow(expect.objectContaining({ code: 'draft_outdated' }));
+    expect(service.putDraft(item.seq, 'owner', { text: '', fileIds: [], baseRev: rev }).draft).toBeNull();
     expect(service.list('all', 'owner').drafts).toEqual([]);
   });
   it('待验收（accept）事项也允许 owner 关闭，落 closed 并清草稿', async () => {
@@ -140,6 +139,395 @@ describe('close in chat', () => {
     expect(res).toMatchObject({ duplicate: false, item: { state: 'closed', rev: acceptRev + 1 } });
     expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
     expect(service.store().listBatches(APP)).toEqual([]);
+  });
+});
+
+describe('草稿随事项失效', () => {
+  const set = (seq: number, req: Record<string, unknown>) => service.cli({ action: 'set', ref: String(seq), ...req }, { sessionId: 'sess-1' });
+  const draftEvents = (seq: number) => service.detail(seq, 'owner').events.filter(e => e.kind === 'draft');
+  /** 页面打开详情时拿到的那一轮拍板，存草稿时原样带回去。 */
+  const askKeyOf = (seq: number) => service.detail(seq, 'owner').draftAskKey;
+
+  it.each([
+    ['active', '这一项改成了「进行中」'],
+    ['waiting', '这一项改成了「等待中」'],
+    ['done', '这一项已完成'],
+    ['closed', '这一项已关闭'],
+  ] as const)('管家把待拍板项改成 %s：草稿收进历史，原话留底，不再算待提交', async (state, reason) => {
+    const item = await addDecideItem();
+    const draft = service.putDraft(item.seq, 'owner', { choice: 'A', text: '我倾向 A，\n但先确认回滚方案', baseRev: item.rev, askKey: askKeyOf(item.seq) }).draft!;
+    await set(item.seq, { fields: { state } });
+
+    expect(service.list('all', 'owner').drafts).toEqual([]);
+    expect(service.list('all', 'owner').items.find(i => i.seq === item.seq)!.hasDraft).toBe(false);
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    const [ev, ...more] = draftEvents(item.seq);
+    expect(more).toEqual([]);
+    expect(ev!.text.split('\n')).toEqual([
+      `${reason}，这份草稿没有提交（没有发给管家），收在这里留底。`,
+      '选：A 合',
+      '说明：',
+      '我倾向 A，',
+      '但先确认回滚方案',
+    ]);
+    // 迟到的批量提交：草稿已经不在了，整批拒绝，不把写给旧问题的决定发给管家。
+    await expect(service.submit({ author: 'owner', nonce: `late-${state}`, items: [{ seq: item.seq, draftUpdatedAt: draft.updatedAt }] }))
+      .rejects.toMatchObject({ code: 'draft_missing' });
+    expect(delivered).toEqual([]);
+    // 管家读 show 时看不到 owner 没提交的草稿。
+    const shown = await service.cli({ action: 'show', ref: String(item.seq) }, { sessionId: 'sess-1' }) as { events: Array<{ kind: string; text: string }> };
+    expect(shown.events.some(e => e.kind === 'draft' || e.text.includes('回滚方案'))).toBe(false);
+  });
+
+  it('管家换了问题或选项：写给旧一轮的草稿收进历史（选项原文按旧的一版）；只改推荐、只差空白 / 全半角 / 句末标点、待拍板 → 待验收都留着', async () => {
+    const reword = await addDecideItem('换问题');
+    const opts = await addDecideItem('换选项');
+    const rec = await addDecideItem('只改推荐');
+    const acc = await addDecideItem('转待验收');
+    const width = await addDecideItem('只差标点和空白');
+    for (const it of [reword, opts, rec, acc, width]) {
+      service.putDraft(it.seq, 'owner', { choice: 'B', text: `草稿 ${it.seq}`, baseRev: it.rev, askKey: askKeyOf(it.seq) });
+    }
+    // 选项常是通用的（是 / 否）：换了问题就是换了一轮，写给旧问题的选择不能留着被发出去。
+    await set(reword.seq, { fields: { question: '回滚还是不回滚？' } });
+    await set(opts.seq, { options: ['A=合', 'B=改完再合 → 晚一天'] });
+    await set(rec.seq, { fields: { recommend: 'B' } });
+    await set(acc.seq, { fields: { state: 'accept' } });
+    // 巡检按同 key 再 add 时常见的抖动：句末问号全半角、多一个空格。选项文字绕过 CLI 解析直接写，验规整。
+    await set(width.seq, { fields: { question: '合不合? ' } });
+    service.store().updateItem(APP, width.seq, { options: [{ key: 'A', label: '合', effect: ' 风险小　' }, { key: 'B', label: '不合\n' }] }, 'steward-1');
+
+    expect(service.list('all', 'owner').drafts.map(x => x.seq).sort((x, y) => x - y)).toEqual([rec.seq, acc.seq, width.seq]);
+    expect(draftEvents(reword.seq)[0]!.text.split('\n').slice(0, 2)).toEqual(['待拍板的问题或选项改了，这份草稿没有提交（没有发给管家），收在这里留底。', '选：B 不合']);
+    expect(draftEvents(opts.seq)[0]!.text).toContain('选：B 不合');
+    for (const it of [rec, acc, width]) expect(draftEvents(it.seq)).toEqual([]);
+    // 留着的标「管家改过」（写下草稿之后又改过这一项）。
+    const r = service.detail(width.seq, 'owner');
+    expect(r.draft!.baseRev).toBeLessThan(r.item.rev);
+  });
+
+  it('没有选项、只有问题的待拍板：问题换了就是换了一轮', async () => {
+    const res = await service.cli({ action: 'add', title: '只问不选', fields: { question: '这周发版吗？' }, noChat: '用例' }, { sessionId: 'sess-1' }) as { item: { seq: number; rev: number } };
+    const seq = res.item.seq;
+    service.putDraft(seq, 'owner', { text: '发', baseRev: res.item.rev, askKey: askKeyOf(seq) });
+    await set(seq, { fields: { question: '这周发版吗? ' } });
+    await set(seq, { fields: { question: '这周发版吗' } });
+    expect(draftEvents(seq)).toEqual([]);
+    await set(seq, { fields: { question: '要不要回滚上一版？' } });
+    expect(draftEvents(seq)[0]!.text).toContain('发');
+    expect(service.list('all', 'owner').drafts).toEqual([]);
+  });
+
+  it('选项只在待拍板 / 待验收时能选：进行中的事项上留着旧选项，带了选项就去掉只存文字；只有选项时拒绝', async () => {
+    const item = await addDecideItem();
+    await set(item.seq, { fields: { state: 'active' } });
+    const now = service.detail(item.seq, 'owner');
+    expect(now.item.options.length).toBeGreaterThan(0);
+    expect(() => service.putDraft(item.seq, 'owner', { choice: 'B', baseRev: now.item.rev, askKey: now.draftAskKey }))
+      .toThrow(expect.objectContaining({ code: 'choice_not_deciding' }));
+    // 旧页面（不带 askKey）发来选项 + 说明：去掉选项，说明照常存下。
+    const saved = service.putDraft(item.seq, 'owner', { choice: 'B', text: '选 B 吧', baseRev: now.item.rev }).draft!;
+    expect(saved).toMatchObject({ text: '选 B 吧' });
+    expect(saved.choice).toBeUndefined();
+  });
+
+  it('带着选项却报「不针对问题」（askKey 为空串）：按现在这一轮记，换了选项照样收', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { choice: 'A', baseRev: item.rev, askKey: '' });
+    await set(item.seq, { options: ['A=不合', 'B=合'] });
+    expect(service.list('all', 'owner').drafts).toEqual([]);
+    expect(draftEvents(item.seq)[0]!.text).toContain('选：A 合');
+  });
+
+  it('archive：只收进历史、不存成草稿（输入框清空后才传完的图），别的标签页刚存的草稿不动', async () => {
+    const item = await addDecideItem();
+    const seen = askKeyOf(item.seq);
+    const { file } = service.upload({ name: 'late.png', mimeType: 'image/png', dataBase64: PNG_B64 });
+    service.putDraft(item.seq, 'owner', { choice: 'B', text: '另一个标签页刚存的', baseRev: item.rev, askKey: seen });
+    service.putDraft(item.seq, 'owner', { fileIds: [file.id], baseRev: item.rev, askKey: seen, archive: true });
+    expect(service.detail(item.seq, 'owner').draft).toMatchObject({ choice: 'B', text: '另一个标签页刚存的' });
+    const [ev] = draftEvents(item.seq);
+    expect(ev!.fileIds).toEqual([file.id]);
+    expect(service.detail(item.seq, 'owner').files.map(f => f.id)).toContain(file.id);
+  });
+
+  it('去重只给迟到的保存用，且连附图一起比：同一句话换了图要记；第二轮同一个选项键换了意思，第一次收时照样记', async () => {
+    const item = await addDecideItem();
+    const seen = askKeyOf(item.seq)!;
+    const img = (name: string) => service.upload({ name, mimeType: 'image/png', dataBase64: PNG_B64 }).file.id;
+    const [a, b] = [img('a.png'), img('b.png')];
+    service.putDraft(item.seq, 'owner', { choice: 'B', text: '见图', fileIds: [a], baseRev: item.rev, askKey: seen });
+    await set(item.seq, { options: ['A=合', 'B=合并后观察'] });
+    expect(draftEvents(item.seq)).toHaveLength(1);
+    expect(() => service.putDraft(item.seq, 'owner', { choice: 'B', text: '见图', fileIds: [b], baseRev: item.rev, askKey: seen })).toThrow();
+    expect(draftEvents(item.seq).map(e => e.fileIds)).toEqual([[b], [a]]);
+    // 第二轮：B 换成了「合并后观察」，owner 又选 B 写同一句；改成进行中时这份要另记一条（意思和第一轮相反）。
+    const r2 = service.detail(item.seq, 'owner');
+    service.putDraft(item.seq, 'owner', { choice: 'B', text: '见图', fileIds: [b], baseRev: r2.item.rev, askKey: r2.draftAskKey });
+    await set(item.seq, { fields: { state: 'active' } });
+    expect(draftEvents(item.seq)[0]!.text).toContain('选：B 合并后观察');
+    expect(draftEvents(item.seq)).toHaveLength(3);
+  });
+
+  it('进行中事项上的说明不针对哪个问题：改成等待中、加上问题都留着；结束时才收', async () => {
+    const res = await service.cli({ action: 'add', title: '进行中的事', fields: { state: 'active' }, noChat: '用例' }, { sessionId: 'sess-1' }) as { item: { seq: number; rev: number } };
+    const seq = res.item.seq;
+    expect(askKeyOf(seq)).toBe('');
+    service.putDraft(seq, 'owner', { text: '顺便把文档也更新一下', baseRev: res.item.rev, askKey: askKeyOf(seq) });
+    await set(seq, { fields: { state: 'waiting' } });
+    await set(seq, { fields: { state: 'decide', question: '要不要顺便改文档？' }, options: ['A=改', 'B=不改'] });
+    expect(service.list('all', 'owner').drafts.map(x => x.seq)).toEqual([seq]);
+    await set(seq, { fields: { state: 'done' } });
+    expect(service.list('all', 'owner').drafts).toEqual([]);
+    expect(draftEvents(seq)[0]!.text).toContain('顺便把文档也更新一下');
+  });
+
+  it('迟到的保存：页面看的那一轮已经变了 → draft_outdated，不存成草稿、内容收进历史（同样的内容不重复记）；空草稿照常删；旧页面不带 askKey 按现在这一轮存', async () => {
+    const item = await addDecideItem();
+    const seen = askKeyOf(item.seq)!;
+    expect(seen).toMatch(/^[0-9a-f]{12}$/);
+    service.putDraft(item.seq, 'owner', { choice: 'A', text: '第一版', baseRev: item.rev, askKey: seen });
+    await set(item.seq, { fields: { state: 'active' } });
+    expect(draftEvents(item.seq)).toHaveLength(1);
+
+    // owner 的页面还开着、接着打字（或者没等自动保存就离开了页面，补存的就是这一笔）：拒绝，内容收进历史。
+    let caught: unknown;
+    try { service.putDraft(item.seq, 'owner', { choice: 'A', text: '第一版，再补一句', baseRev: item.rev, askKey: seen }); } catch (error) { caught = error; }
+    expect(boardErrorStatus(caught)).toMatchObject({ status: 409, error: 'draft_outdated' });
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(service.list('all', 'owner').drafts).toEqual([]);
+    expect(draftEvents(item.seq).map(e => e.text.split('\n').slice(1).join('|'))).toEqual(['选：A|说明：|第一版，再补一句', '选：A 合|说明：|第一版']);
+    // 同样的内容再发一次（离开页面时的补存）不重复记。
+    expect(() => service.putDraft(item.seq, 'owner', { choice: 'A', text: '第一版，再补一句', baseRev: item.rev, askKey: seen })).toThrow();
+    expect(draftEvents(item.seq)).toHaveLength(2);
+    // 清空不受影响。
+    expect(service.putDraft(item.seq, 'owner', { text: '', baseRev: item.rev, askKey: seen }).draft).toBeNull();
+    // 重新读过这一项（现在的一轮是「进行中、不针对问题」）再存：照常存下。
+    const now = service.detail(item.seq, 'owner');
+    expect(now.draftAskKey).toBe('');
+    expect(service.putDraft(item.seq, 'owner', { text: '那就按进行中推进', baseRev: now.item.rev, askKey: now.draftAskKey }).draft).toBeDefined();
+    // 旧页面（不带 askKey）：按现在这一轮存，行为和以前一样。
+    const other = await addDecideItem('旧页面');
+    expect(service.putDraft(other.seq, 'owner', { choice: 'A', baseRev: other.rev }).draft).toBeDefined();
+    await set(other.seq, { fields: { state: 'waiting' } });
+    expect(draftEvents(other.seq)).toHaveLength(1);
+  });
+
+  it('迟到保存按结构化内容去重：语言切换和空指纹不重复，事项重开后不跨生命周期误去重', async () => {
+    const item = await addDecideItem();
+    const seen = askKeyOf(item.seq)!;
+    service.putDraft(item.seq, 'owner', { choice: 'A', text: '同一句', baseRev: item.rev, askKey: seen });
+    await set(item.seq, { fields: { state: 'active' } });
+    locale = 'en';
+    expect(() => service.putDraft(item.seq, 'owner', { choice: 'A', text: '同一句', baseRev: item.rev, askKey: seen }))
+      .toThrow(expect.objectContaining({ code: 'draft_outdated' }));
+    expect(draftEvents(item.seq)).toHaveLength(1);
+
+    locale = 'zh';
+    const res = await service.cli({ action: 'add', title: '进行中的事', fields: { state: 'active' }, noChat: '用例' }, { sessionId: 'sess-1' }) as { item: { seq: number; rev: number } };
+    const seq = res.item.seq;
+    service.putDraft(seq, 'owner', { text: '同一句话', baseRev: res.item.rev, askKey: '' });
+    await set(seq, { fields: { state: 'done' } });
+    for (let i = 0; i < 2; i++) {
+      expect(() => service.putDraft(seq, 'owner', { text: '同一句话', baseRev: res.item.rev, askKey: '' }))
+        .toThrow(expect.objectContaining({ code: 'draft_outdated' }));
+    }
+    expect(draftEvents(seq)).toHaveLength(1);
+
+    // 即使两轮状态切换落在同一毫秒，最近一次状态事件的自增 id 也能分开两个生命周期。
+    const endedAt = service.store().getItem(APP, seq)!.stateAt;
+    service.store().updateItem(APP, seq, { state: 'active' }, 'steward-1', endedAt);
+    service.store().updateItem(APP, seq, { state: 'done' }, 'steward-1', endedAt);
+    expect(service.store().getItem(APP, seq)!.stateAt).toBe(endedAt);
+    expect(() => service.putDraft(seq, 'owner', { text: '同一句话', baseRev: res.item.rev, askKey: '' }))
+      .toThrow(expect.objectContaining({ code: 'draft_outdated' }));
+    expect(draftEvents(seq)).toHaveLength(2);
+  });
+
+  it('迟到的保存只和同一轮收进去的那条比：第一轮选 B「不合」收进历史后，第二轮写给新选项的同样的 B 迟到时照样另记', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { choice: 'B', baseRev: item.rev, askKey: askKeyOf(item.seq) });
+    await set(item.seq, { options: ['A=合', 'B=合并后观察'] });
+    const round2 = service.detail(item.seq, 'owner');
+    await set(item.seq, { fields: { state: 'active' } });
+    expect(() => service.putDraft(item.seq, 'owner', { choice: 'B', baseRev: round2.item.rev, askKey: round2.draftAskKey })).toThrow();
+    expect(draftEvents(item.seq)).toHaveLength(2);
+  });
+
+  it('指纹带算法版本：库里旧版本算法的指纹按「不知道写给哪一轮」处理，不会因为改了算法把待拍板的草稿一次收走；页面带来的旧版本指纹按现在这一轮算', async () => {
+    const item = await addDecideItem();
+    const current = askKeyOf(item.seq)!;
+    const old = `0${current.slice(1)}`;
+    expect(old).not.toBe(current);
+    service.putDraft(item.seq, 'owner', { choice: 'A', text: '旧算法写的', baseRev: item.rev, askKey: current });
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    db.prepare(`UPDATE board_drafts SET ask_key = ? WHERE app_id = ? AND seq = ?`).run(old, APP, item.seq);
+    db.close();
+    expect(service.list('decide', 'owner').drafts.map(d => d.seq)).toEqual([item.seq]);
+    expect(draftEvents(item.seq)).toEqual([]);
+    expect(service.putDraft(item.seq, 'owner', { choice: 'A', text: '旧页面接着写', baseRev: item.rev, askKey: old }).draft).toMatchObject({ text: '旧页面接着写' });
+  });
+
+  it('问题里的全角字母数字、全角空格按半角算，不算换了一轮', async () => {
+    const res = await service.cli({ action: 'add', title: '全角', fields: { question: '合并 PR #12 吗？' }, options: ['A=合', 'B=不合'], noChat: '用例' }, { sessionId: 'sess-1' }) as { item: { seq: number; rev: number } };
+    service.putDraft(res.item.seq, 'owner', { choice: 'A', baseRev: res.item.rev, askKey: askKeyOf(res.item.seq) });
+    await set(res.item.seq, { fields: { question: '合并　ＰＲ ＃１２ 吗' } });
+    expect(draftEvents(res.item.seq)).toEqual([]);
+    expect(service.list('all', 'owner').drafts.map(d => d.seq)).toEqual([res.item.seq]);
+  });
+
+  it('archive 赶上这一轮没变（同一轮来回改过）：照样只收进历史，原因写「编辑器已经清空」，不冒充「问题改了」', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { text: '迟到的一句', baseRev: item.rev, askKey: askKeyOf(item.seq), archive: true });
+    expect(service.detail(item.seq, 'owner').draft).toBeUndefined();
+    expect(draftEvents(item.seq)[0]!.text.split('\n')[0]).toBe('编辑器已经清空，这份草稿没有提交（没有发给管家），收在这里留底。');
+  });
+
+  it('迟到的保存撞上已结束的事项：同样把内容收进历史再拒（draft_outdated：旧 daemon 不会回这个码，页面据此才清空输入框）', async () => {
+    const item = await addDecideItem();
+    const seen = askKeyOf(item.seq);
+    await set(item.seq, { fields: { state: 'done' } });
+    expect(() => service.putDraft(item.seq, 'owner', { text: '离开页面前最后几个字', baseRev: item.rev, askKey: seen }))
+      .toThrow(expect.objectContaining({ code: 'draft_outdated' }));
+    expect(draftEvents(item.seq).map(e => e.text)).toEqual([expect.stringContaining('离开页面前最后几个字')]);
+  });
+
+  it('收进历史的附图挂到这一项上，详情页的历史里看得到', async () => {
+    const item = await addDecideItem();
+    const { file } = service.upload({ name: 'shot.png', mimeType: 'image/png', dataBase64: PNG_B64 });
+    service.putDraft(item.seq, 'owner', { fileIds: [file.id], baseRev: item.rev, askKey: askKeyOf(item.seq) });
+    await set(item.seq, { fields: { state: 'done' } });
+    const [ev] = draftEvents(item.seq);
+    expect(ev!.fileIds).toEqual([file.id]);
+    expect(ev!.text).toContain('附图：1 张');
+    expect(service.detail(item.seq, 'owner').files.map(f => f.id)).toContain(file.id);
+  });
+
+  it('owner 自己关闭：草稿收进历史，原因写「你关闭了这一项」；英文看板写英文', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { text: '其实已经在群里定了', baseRev: item.rev, askKey: askKeyOf(item.seq) });
+    service.closeInChat(item.seq, item.rev, 'local');
+    expect(draftEvents(item.seq)[0]!.text.split('\n')[0]).toBe('你关闭了这一项，这份草稿没有提交（没有发给管家），收在这里留底。');
+
+    locale = 'en';
+    const en = await addDecideItem('english');
+    service.putDraft(en.seq, 'owner', { choice: 'A', text: 'lean A', baseRev: en.rev, askKey: askKeyOf(en.seq) });
+    await set(en.seq, { fields: { state: 'active' } });
+    expect(draftEvents(en.seq)[0]!.text.split('\n')).toEqual([
+      'This item moved to "In progress". This draft was not submitted (nothing was sent to the steward); it is kept here for reference.',
+      'Choice: A 合', 'Note:', 'lean A',
+    ]);
+  });
+
+  it('改状态的那条命令整体失败：状态没改，草稿也不收', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { choice: 'A', baseRev: item.rev, askKey: askKeyOf(item.seq) });
+    // 主群不在这一项的群里：updateItem 的事务里先改了状态，核对主群时抛错，整个事务回滚。
+    expect(() => service.store().updateItem(APP, item.seq, { state: 'done', primaryChat: 'oc_not_linked' }, 'steward-1'))
+      .toThrow(expect.objectContaining({ code: 'primary_chat_not_linked' }));
+    expect(service.detail(item.seq, 'owner').item.state).toBe('decide');
+    expect(service.detail(item.seq, 'owner').draft?.choice).toBe('A');
+    expect(draftEvents(item.seq)).toEqual([]);
+  });
+
+  it('旧构建留下的草稿（没记写给哪一轮）：已结束事项上的、存下之后离开了待拍板的，打开看板时收进历史；其余留着', async () => {
+    const ended = await addDecideItem('已完成的老事项');
+    const left = await addDecideItem('后来改成进行中');
+    const kept = await addDecideItem('还在待拍板');
+    const note = await addDecideItem('先改状态后写的说明');
+    await set(note.seq, { fields: { state: 'active' } });
+    const store = service.store();
+    // 模拟旧构建：直接写草稿行（不带 ask_key），改状态也不收草稿。
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    const insert = db.prepare(`INSERT INTO board_drafts (app_id, seq, author, choice, text, file_ids_json, base_rev, updated_at)
+      VALUES (?, ?, 'owner', ?, ?, '[]', 1, ?)`);
+    const t0 = Date.now() - 60_000;
+    insert.run(APP, ended.seq, 'A', '发版并部署本机', t0);
+    insert.run(APP, left.seq, null, '先别合', t0);
+    insert.run(APP, kept.seq, 'B', '还在想', t0);
+    insert.run(APP, note.seq, null, '进行中时写的说明', Date.now() + 1);
+    db.prepare(`UPDATE board_items SET state = 'done', state_at = ? WHERE app_id = ? AND seq = ?`).run(t0 + 1000, APP, ended.seq);
+    db.prepare(`UPDATE board_items SET state = 'active', state_at = ? WHERE app_id = ? AND seq = ?`).run(t0 + 1000, APP, left.seq);
+    db.close();
+
+    // 还没收之前直接读：已结束事项上的草稿也不算待提交（不进「提交 N 项」、不打 ✎）。
+    expect(store.listDrafts(APP, 'owner').map(d => d.seq).sort((x, y) => x - y)).toEqual([left.seq, kept.seq, note.seq]);
+    expect(store.listItems(APP, 'all', { author: 'owner' }).find(i => i.seq === ended.seq)!.hasDraft).toBe(false);
+
+    expect(service.list('decide', 'owner').drafts.map(d => d.seq).sort((x, y) => x - y)).toEqual([kept.seq, note.seq]);
+    expect(store.listDrafts(APP, 'owner').map(d => d.seq).sort((x, y) => x - y)).toEqual([kept.seq, note.seq]);
+    expect(draftEvents(ended.seq)[0]!.text.split('\n')).toEqual([
+      '这一项已完成，这份草稿没有提交（没有发给管家），收在这里留底。', '选：A 合', '说明：', '发版并部署本机',
+    ]);
+    expect(draftEvents(left.seq)[0]!.text).toContain('先别合');
+    expect(draftEvents(kept.seq)).toEqual([]);
+    expect(draftEvents(note.seq)).toEqual([]);
+    // 已经收过的不再重复记。
+    service.list('all', 'owner');
+    expect(draftEvents(ended.seq)).toHaveLength(1);
+  });
+
+  it('只打开详情页也会收：旧构建留下的已结束事项上的草稿，详情里不再给出，历史里有', async () => {
+    const item = await addDecideItem();
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    db.prepare(`INSERT INTO board_drafts (app_id, seq, author, choice, text, file_ids_json, base_rev, updated_at)
+      VALUES (?, ?, 'owner', 'A', '旧草稿', '[]', 1, ?)`).run(APP, item.seq, Date.now() - 60_000);
+    db.prepare(`UPDATE board_items SET state = 'done' WHERE app_id = ? AND seq = ?`).run(APP, item.seq);
+    db.close();
+    const d = service.detail(item.seq, 'owner');
+    expect(d.draft).toBeUndefined();
+    expect(d.drafts).toEqual([]);
+    expect(d.events.filter(e => e.kind === 'draft').map(e => e.text)).toEqual([expect.stringContaining('旧草稿')]);
+  });
+
+  it('回滚到旧构建期间改写过的草稿（旧构建只改内容和时间、不碰 ask_key）：升级回来按旧构建存的处理，不拿上一轮的指纹判', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { choice: 'B', text: '第一版', baseRev: item.rev, askKey: askKeyOf(item.seq) });
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    // 旧构建：管家换了选项（不收草稿），owner 看着新选项重写了草稿（UPSERT 只改内容和 updated_at）。
+    db.prepare(`UPDATE board_items SET options_json = ?, rev = rev + 1 WHERE app_id = ? AND seq = ?`)
+      .run(JSON.stringify([{ key: 'A', label: '合' }, { key: 'B', label: '先拆 PR' }]), APP, item.seq);
+    db.prepare(`UPDATE board_drafts SET text = '看了新选项写的', updated_at = updated_at + 5000 WHERE app_id = ? AND seq = ?`).run(APP, item.seq);
+    db.close();
+    expect(service.list('decide', 'owner').drafts.map(d => d.seq)).toEqual([item.seq]);
+    expect(draftEvents(item.seq)).toEqual([]);
+  });
+
+  it('列表和详情里顺手收草稿时写失败（库被别的 daemon 锁着等）：照常读，已结束事项上的草稿也不算进待提交；提交前收不成就不提交', async () => {
+    const item = await addDecideItem();
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    db.prepare(`INSERT INTO board_drafts (app_id, seq, author, choice, text, file_ids_json, base_rev, updated_at)
+      VALUES (?, ?, 'owner', 'A', '旧草稿', '[]', 1, ?)`).run(APP, item.seq, Date.now() - 60_000);
+    db.prepare(`UPDATE board_items SET state = 'done' WHERE app_id = ? AND seq = ?`).run(APP, item.seq);
+    db.exec(`CREATE TRIGGER fail_events BEFORE INSERT ON board_events BEGIN SELECT RAISE(FAIL, 'disk busy'); END;`);
+    db.close();
+    expect(service.list('all', 'owner').drafts).toEqual([]);
+    expect(service.detail(item.seq, 'owner').item.state).toBe('done');
+    await expect(service.submit({ author: 'owner', nonce: 'x', items: [{ seq: item.seq, draftUpdatedAt: 1 }] })).rejects.toThrow(/disk busy/);
+    expect(delivered).toEqual([]);
+  });
+
+  it('本机客户端（owner-board show）也不列 owner 没提交的草稿：这个接口在管家会话里也调得通', async () => {
+    const item = await addDecideItem();
+    service.putDraft(item.seq, 'owner', { text: '私下的想法', baseRev: item.rev, askKey: askKeyOf(item.seq) });
+    await set(item.seq, { fields: { state: 'active' } });
+    expect(draftEvents(item.seq)).toHaveLength(1);
+    const shown = service.ownerDetail(item.seq);
+    expect(shown.item.events.some(e => e.kind === 'draft' || e.text.includes('私下的想法'))).toBe(false);
+  });
+
+  it('旧构建留下、事项已离开待拍板的草稿：没打开过看板就直接提交，也先收进历史再拒，不发给管家', async () => {
+    const item = await addDecideItem();
+    const db = openDatabaseSyncOrThrow(decisionBoardDbPath(dir));
+    const t0 = Date.now() - 60_000;
+    db.prepare(`INSERT INTO board_drafts (app_id, seq, author, choice, text, file_ids_json, base_rev, updated_at)
+      VALUES (?, ?, 'owner', 'A', '旧页面存的', '[]', 1, ?)`).run(APP, item.seq, t0);
+    db.prepare(`UPDATE board_items SET state = 'active', state_at = ? WHERE app_id = ? AND seq = ?`).run(t0 + 1000, APP, item.seq);
+    db.close();
+    await expect(service.submit({ author: 'owner', nonce: 'legacy', items: [{ seq: item.seq, draftUpdatedAt: t0 }] }))
+      .rejects.toMatchObject({ code: 'draft_missing' });
+    expect(delivered).toEqual([]);
+    expect(service.store().events(APP, item.seq).filter(e => e.kind === 'draft')).toHaveLength(1);
   });
 });
 

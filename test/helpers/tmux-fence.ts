@@ -200,7 +200,9 @@ register_server() {
 }
 record_server_intent() {
   # Synchronous before exec: no background writer can lose a scheduling race.
-  printf 'pending\t%s\n' "$socket" >> "$SERVER_LOG" 2>/dev/null || true
+  # $$ stays the real client's pid across exec: while it lives, the server it
+  # starts may still be on its way.
+  printf 'pending\t%s\t%s\n' "$socket" "$$" >> "$SERVER_LOG" 2>/dev/null || true
 }
 case "$socket" in */*) dir=\${socket%/*} ;; *) dir=. ;; esac
 rdir=$(cd "$dir" 2>/dev/null && pwd -P) || rdir=$dir

@@ -109,6 +109,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
 import { writeHeartbeat } from './core/daemon-heartbeat.js';
 import { botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from './core/botmux-wrapper.js';
+import { writeBotmuxWrapperFilesWithRetry } from './core/botmux-wrapper-writer.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import {
   evaluateOverload,
@@ -130,7 +131,7 @@ import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-re
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
 import { countHostOverload } from './im/lark/card-handler.js';
 import { startOwnerGroupFollow } from './services/owner-group-follow-runtime.js';
-import { startMaintenance, stopMaintenance } from './core/maintenance.js';
+import { startMaintenance, stopMaintenance, globalInstallUpdateLockTarget } from './core/maintenance.js';
 import { createBotmuxUpdateNotifier, buildBotmuxUpdateNoticeCard } from './core/botmux-update-notify.js';
 import {
   selectCodexRuntimeUpdateTargets,
@@ -189,6 +190,7 @@ import { enqueueTurnTerminal, drainTurnTerminalQueue } from './services/turn-com
 import { FeedbackWebhookSecretStore, startFeedbackWebhookDispatcher } from './services/feedback-webhook-dispatcher.js';
 import { peerAnswersTopicWithoutMention, resolveGroupMentionMode, resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
+import { createSerializedBotRenamer, persistRenamedBotName } from './services/bot-name-sync.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime, type DurableCoordinationMode } from './services/durable-coordination-runtime.js';
@@ -6403,40 +6405,27 @@ function writePidFile(): void {
   // the binary itself (see botmuxWrapperFiles' standalone branch: there is no
   // cli.js on disk, only a process-private /$bunfs/ path).
   try {
-    mkdirSync(BOTMUX_BIN_DIR, { recursive: true });
     const cliScript = join(__dirname, 'cli.js');  // dist/cli.js
     const standalone = isStandaloneBinary();
-    // POSIX `sh` wrapper always; plus a `botmux.cmd` on Windows so native shells
-    // resolve `botmux` (otherwise `botmux send` from a Windows CLI session fails).
-    for (const file of botmuxWrapperFiles(cliScript, process.execPath, process.platform, standalone)) {
-      const wrapper = join(BOTMUX_BIN_DIR, file.name);
-      const isMainWrapper = file.name === 'botmux' || file.name === 'botmux.cmd';
-      // NEVER overwrite the running executable. install.sh installs the compiled
-      // binary to exactly this path (~/.botmux/bin/botmux), so without this guard
-      // the daemon replaced its own 94MB executable with a 47-byte script on every
-      // boot — verified, inode and all. The `existing !== file.content` check below
-      // is NOT protection: a binary's bytes never equal the wrapper text, so it
-      // rewrote every single start. Compare resolved real paths because either side
-      // may be a symlink, and skip rather than fail: the binary already IS a working
-      // `botmux` on PATH, so there is nothing a wrapper needs to add.
-      let isRunningBinary = false;
-      try {
-        isRunningBinary = isMainWrapper && realpathSync(wrapper) === realpathSync(process.execPath);
-      } catch { /* wrapper absent (first boot) or unreadable → not the binary */ }
-      if (isRunningBinary) {
-        logger.info(`Wrapper skipped: ${wrapper} is this running executable (self-contained binary already on PATH)`);
-        continue;
-      }
-      // Only write if changed (avoid unnecessary disk writes on every restart)
-      let existing = '';
-      try { existing = readFileSync(wrapper, 'utf-8'); } catch { /* doesn't exist yet */ }
-      if (existing !== file.content) {
-        // 原子写：并发会话随时在 exec 这个 wrapper，半截脚本会让它们的
-        // `botmux send` 全体失败。
-        atomicWriteFileSync(wrapper, file.content, { mode: file.mode });
-        logger.info(`Wrapper script written: ${wrapper} → ${standalone ? process.execPath : cliScript}`);
-      }
-    }
+    const files = botmuxWrapperFiles(cliScript, process.execPath, process.platform, standalone);
+    writeBotmuxWrapperFilesWithRetry({
+      binDir: BOTMUX_BIN_DIR,
+      files,
+      runningExecutable: process.execPath,
+      lockTarget: globalInstallUpdateLockTarget(),
+      onResult: ({ written, skipped, deferred }) => {
+        for (const wrapper of skipped) {
+          logger.info(`Wrapper skipped: ${wrapper} is this running executable (self-contained binary already on PATH)`);
+        }
+        for (const wrapper of deferred) {
+          logger.info(`Wrapper write deferred: ${wrapper} changed while waiting for the installation lock`);
+        }
+        for (const wrapper of written) {
+          logger.info(`Wrapper script written: ${wrapper} → ${standalone ? process.execPath : cliScript}`);
+        }
+      },
+      onError: err => logger.warn(`Failed to write botmux wrapper script: ${err instanceof Error ? err.message : String(err)}`),
+    });
   } catch (err: any) {
     logger.warn(`Failed to write botmux wrapper script: ${err.message}`);
   }
@@ -35086,22 +35075,44 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // （群内显示名跟随已发布版本，见 services/open-platform-rename.ts）。成功后同步
   // 内存 botName / bots-info 名册 / descriptor，并清掉冗余的 displayName 别名——
   // 飞书名已经是新名，保持单一事实来源。
-  setBotRenamer(async (newName) => {
+  setBotRenamer(createSerializedBotRenamer(async (newName) => {
+    // Resolve before publishing: after remote success no local exception may
+    // escape as a remote failure and trigger the IPC route's local-only fallback.
+    const bot = getBot(cfg.larkAppId);
     const r = await renameBotOnOpenPlatform(cfg.larkAppId, newName, cfg.brand);
     if (!r.ok) return r;
-    const bot = getBot(cfg.larkAppId);
-    bot.botName = newName;
-    noteLocalBotProfileWrite?.();
-    const spec = findConfigField('displayName');
-    if (spec && bot.config.displayName) {
-      // applyConfigField 的 displayName 钩子会顺带触发 refreshBotNameState。
-      await applyConfigField(cfg.larkAppId, spec, null);
-    } else {
-      refreshBotNameState();
-    }
-    try { writeBotInfoFile(config.session.dataDir); } catch { /* best effort */ }
-    return r;
-  });
+    // These warnings cross IPC into the UI. Never include raw exceptions or
+    // config validation reasons, which may contain credentials/config values.
+    const localErrors: string[] = [];
+    try {
+      bot.botName = r.name;
+      // Must be synchronous with the assignment, before waiting for config I/O.
+      noteLocalBotProfileWrite?.();
+    } catch { localErrors.push('运行时名称未完全同步'); }
+    try { bot.config.name = await persistRenamedBotName(cfg.larkAppId, r.name); }
+    catch { localErrors.push('本地配置名未同步'); }
+    try {
+      if (bot.config.displayName) {
+        const spec = findConfigField('displayName');
+        // applyConfigField also refreshes the effective name on success.
+        const cleared = spec ? await applyConfigField(cfg.larkAppId, spec, null) : undefined;
+        if (!cleared?.ok) localErrors.push('本地展示别名未清除');
+      }
+    } catch { localErrors.push('本地展示别名未清除'); }
+    // Refresh even when clearing the alias failed: displayName still wins over
+    // the newly published name, and the response must report that actual alias.
+    try { refreshBotNameState(); }
+    catch { localErrors.push('本地名称状态未完全刷新'); }
+    try { writeBotInfoFile(config.session.dataDir); }
+    catch { localErrors.push('本地名册未同步'); }
+    return {
+      ...r,
+      displayName: bot.config.displayName ?? null,
+      ...(localErrors.length ? {
+        localSyncError: `飞书已改名成功，但${localErrors.join('；')}。请修复本地配置，不要重复发布改名。`,
+      } : {}),
+    };
+  }));
   // 机器人真·改头像（dashboard 档案头头像入口）：开放平台自动化换飞书应用头像并
   // 发布新版本（群内头像跟随已发布版本，同 rename）。成功后用上传返回的 url
   // 同步内存 botAvatarUrl / descriptor / bots-info 让 dashboard 立即换图——该 url

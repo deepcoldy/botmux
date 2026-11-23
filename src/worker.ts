@@ -68,7 +68,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, rmSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -429,7 +429,7 @@ import {
   SESSION_ID_FILENAME_RE,
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
-import { CodexBridgeQueue, CodexSteerReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexMidTurnReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
 import {
   BridgeBlindTurnWatch,
@@ -712,6 +712,7 @@ import {
   prepareCredentialOnlyRelayOutbox,
   attachCredentialOnlyRelayOutbox,
   probeHostCredentialIsolationMechanism,
+  prepareSandboxRelayOutbox,
   attachSandboxOutbox,
   sandboxTreeSurvivesWorkerExit,
   startOutboxWatcher,
@@ -10766,11 +10767,15 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
   // the reply card shows it verbatim. Stripping it from the bubble alone would
   // make the two messages of one turn contradict each other.
+  // Both paths drop a text entry without text: counting it would throw out of
+  // the transcript drain and lose the rest of the turn's activity.
   const adoptMode = lastInitConfig?.adoptMode === true;
-  const kept = adoptMode ? [...entries] : entries.flatMap(entry => {
-    const withoutSentinel = cotEntryWithoutSentinel(entry);
-    return withoutSentinel ? [withoutSentinel] : [];
-  });
+  const kept = adoptMode
+    ? entries.filter(entry => entry.kind !== 'text' || typeof entry.text === 'string')
+    : entries.flatMap(entry => {
+      const withoutSentinel = cotEntryWithoutSentinel(entry);
+      return withoutSentinel ? [withoutSentinel] : [];
+    });
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
@@ -10974,21 +10979,29 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
 codexBridgeQueue.setTurnStartObserver((turn) => {
   if (!turn.isLocal) inflightInputs.onTurnStarted(turn.turnId);
 });
-// Codex same-turn steer: answer the steered Lark message as soon as the model
-// answers it and goes back to work, quoting it. The final answer still comes
+// Codex mid-turn replies: whenever the model says something to a Lark turn and
+// goes back to work, post it under that message — progress, or for a same-turn
+// steer first the answer to the steered message. The final answer still comes
 // with the turn's own reply.
-const codexSteerReplyCollectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
-function observeCodexSteerReply(ev: CodexBridgeEvent, turn: CodexPendingTurn): void {
+const codexMidTurnReplyCollectors = new WeakMap<CodexPendingTurn, CodexMidTurnReplyCollector>();
+function observeCodexMidTurnReply(ev: CodexBridgeEvent, turn: CodexPendingTurn): void {
   if (!followUpReplyEnabled() || !structuredBridgeIs('codex') || turn.isLocal) return;
-  // Under `botmux send` the model may already have sent this answer itself.
+  // Under `botmux send` the model may already have sent this itself.
   if (lastInitConfig?.adoptMode !== true && replyDeliveryMode() !== 'transcript') return;
-  let collector = codexSteerReplyCollectors.get(turn);
+  let collector = codexMidTurnReplyCollectors.get(turn);
   if (!collector) {
-    collector = new CodexSteerReplyCollector();
-    codexSteerReplyCollectors.set(turn, collector);
+    collector = new CodexMidTurnReplyCollector(turn);
+    codexMidTurnReplyCollectors.set(turn, collector);
   }
   const reply = collector.feed(ev);
   if (!reply) return;
+  // Said before this worker started: a restart replaying the turn, whose
+  // earlier generation may already have posted it.
+  if (reply.saidAtMs < WORKER_STARTED_AT_MS) return;
+  // Likewise a steer taken before this worker started may already have its
+  // answer posted; what this generation sees of that turn is progress.
+  const answersSteer = reply.answersSteer
+    && turn.transcriptStartTimeMs !== undefined && turn.transcriptStartTimeMs >= WORKER_STARTED_AT_MS;
   send({
     type: 'absorbed_reply',
     turnId: turn.turnId,
@@ -10996,10 +11009,13 @@ function observeCodexSteerReply(ev: CodexBridgeEvent, turn: CodexPendingTurn): v
     answer: reply.text,
     replyUuid: reply.lastUuid,
     source: 'text',
+    ...(answersSteer ? {} : { progress: true as const }),
   });
-  log(`Steered turn ${turn.turnId.substring(0, 8)} answered live (${reply.text.length} chars)`);
+  log(answersSteer
+    ? `Steered turn ${turn.turnId.substring(0, 8)} answered live (${reply.text.length} chars)`
+    : `Turn ${turn.turnId.substring(0, 8)} progress posted live (${reply.text.length} chars)`);
 }
-codexBridgeQueue.setSteerReplyObserver(observeCodexSteerReply);
+codexBridgeQueue.setMidTurnReplyObserver(observeCodexMidTurnReply);
 codexBridgeQueue.setCotSupersededObserver((turn) => {
   if (!sessionId || turn.isLocal) return;
   const ownsThinking = thinkingTurn?.turnId === turn.turnId
@@ -22090,6 +22106,9 @@ interface InputDeliveryQuarantine {
   cancelReceipt?: () => void;
   draftRescueAttempted?: true;
   submitWarningSent?: true;
+  /** The deferred warning/terminal chain owns negative settlement once armed.
+   * The independent observer must drive it, not drop attribution ahead of it. */
+  onNegativeEvidence?: () => Promise<void>;
 }
 let inputDeliveryQuarantine: InputDeliveryQuarantine | null = null;
 const inputDeliveryEvidence = new InputDeliveryEvidenceTracker();
@@ -22271,7 +22290,16 @@ function armInputDeliveryQuarantine(
         if (screen && cliAdapter!.screenShowsNoPendingInput!(screen)) {
           if (++noPendingInputPolls >= 2) {
             log(`${cliName()} no longer holds the quarantined input (empty idle composer on two receipt polls) — releasing`);
-            releaseInputDeliveryQuarantine(quarantine, 'unconfirmed input no longer pending in the CLI', { redriveTerminal: true });
+            if (quarantine.onNegativeEvidence) {
+              // The deferred chain owns the exact attempt's terminal/notice.
+              // Let it perform release + drop + settlement in one callback.
+              await quarantine.onNegativeEvidence();
+            } else {
+              releaseInputDeliveryQuarantine(quarantine, 'unconfirmed input no longer pending in the CLI', { redriveTerminal: true });
+              // With no deferred owner (manual arm / already-settled chain), the
+              // observer itself must retire stale attribution before a retry.
+              dropFailedBridgeMark(quarantine.turnId, quarantine.dispatchAttempt);
+            }
           }
         } else {
           noPendingInputPolls = 0;
@@ -24145,6 +24173,8 @@ function scheduleSubmitFailureNotify(
   // Consecutive rechecks on which the CLI showed that it no longer holds this
   // unconfirmed input anywhere (screenShowsNoPendingInput).
   let noPendingInputChecks = 0;
+  let observerProvedInputGone = false;
+  let negativeSettlementToken: symbol | undefined;
   let activeSilenceExtra = 0;
   let busySilenceExtra = 0;
   let composerSubmitRescued = false;
@@ -24251,7 +24281,7 @@ function scheduleSubmitFailureNotify(
         // 弱 pty-output 最多再重查一次，仍无强证据就进入单次 warning，避免无限链。
         if (sessionStartGated) break;
         log(`Deferred recheck missing but later ${action.evidence} shows ${cliName()} is active — suppressing submit warning. preview="${preview}"`);
-        if (deferredRecheckAttempts < SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS) {
+        if (!observerProvedInputGone && deferredRecheckAttempts < SUBMIT_DEFERRED_RECHECK_MAX_ATTEMPTS) {
           armDeferredRecheck();
           return;
         }
@@ -24285,7 +24315,7 @@ function scheduleSubmitFailureNotify(
     // missing) see an empty composer and nothing held by the CLI, the input is
     // gone. Release its quarantine and attribution so later input is not held
     // until a restart; warn once if that has not happened yet.
-    let pendingInputGone = false;
+    let pendingInputGone = observerProvedInputGone;
     if (retainQuarantinedReceipt && cliAdapter?.screenShowsNoPendingInput
       && backendScreenEvidenceIsAuthoritativeForMutation() && submitDiagnosisScreen
       && cliAdapter.screenShowsNoPendingInput(submitDiagnosisScreen)) {
@@ -24535,6 +24565,29 @@ function scheduleSubmitFailureNotify(
       send(notice);
     }
   };
+  if (quarantineAtSchedule && currentInputDeliveryQuarantine() === quarantineAtSchedule) {
+    quarantineAtSchedule.onNegativeEvidence = async (): Promise<void> => {
+      observerProvedInputGone = true;
+      // Cancel the timer before driving the same settlement function directly.
+      // Any already-running deferred callback sees its controller token revoked
+      // and returns without side effects after its awaited recheck.
+      submitFailureChains.cancel(chainKey);
+      const token = Symbol('negative-quarantine-settlement');
+      negativeSettlementToken = token;
+      const chainIsCurrent = (): boolean => negativeSettlementToken === token
+        && deferredAttemptIsCurrent()
+        && currentInputDeliveryQuarantine() === quarantineAtSchedule;
+      if (bridgeTurnId
+        && !codexBridgeQueue.hasPendingTurn(bridgeTurnId, turnIdentity?.dispatchAttempt)
+        && !codexBridgeQueue.hasTerminalTurn(bridgeTurnId, turnIdentity?.dispatchAttempt)) {
+        // Another path already settled the exact mark. Only release its leftover
+        // quarantine; emitting a second durable terminal would be a regression.
+        releaseInputDeliveryQuarantine(quarantineAtSchedule, 'unconfirmed input no longer pending in the CLI', { redriveTerminal: true });
+        return;
+      }
+      await runDeferredRecheck(chainIsCurrent);
+    };
+  }
   const armDeferredRecheck = (): void => {
     deferredRecheckAttempts++;
     const { armed, replaced } = submitFailureChains.schedule(
@@ -27102,6 +27155,10 @@ async function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 
     const adoptStartMs = Date.now();
     codexAdoptStartMs = adoptStartMs;
     codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+    // Codex writes each user record when it takes the input, in submit order
+    // and with its own clock: a later input's record proves earlier marks
+    // that never started will not arrive (see wholeInputSuccessor).
+    codexBridgeQueue.setWholeInputPassing(true);
     let rolloutPath: string | undefined;
     const terminalSession = backend ? await refreshCodexTerminalSession(backend) : undefined;
     const initialSessionId = terminalSession?.kind === 'terminal' ? terminalSession.sessionId
@@ -29668,14 +29725,22 @@ async function spawnCliBody(
     // provisions a fresh tree and bind. The probes below never create anything.
     const paneRelayBoundByInode = process.platform === 'linux'
       && (sandboxRequested || credentialOnlyBwrap);
+    // A full macOS oncall pane also requires a host relay. Unlike bwrap it does
+    // not bind the directory by inode, but a legacy live pane has no
+    // BOTMUX_SEND_RELAY in its frozen environment, so creating a directory on
+    // reattach cannot upgrade it. Missing relay therefore forces one cold spawn.
+    const paneRequiresSeatbeltRelay = process.platform === 'darwin'
+      && sandboxRequested && !scratchRequested;
     // The live pane runs against the tree of the flavour it was spawned with.
     // A policy flip that keeps the same isolation capabilities (oncall ↔
     // scratch) must not reattach it under the other flavour's arm.
     const recordedTreeFlavour = paneRelayBoundByInode
       ? recordedSandboxTreeFlavour(cfg.sessionId, isolationRuntimeDataDir)
       : null;
-    const paneRelayReattachable = !paneRelayBoundByInode
-      || (recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
+    const paneRelayReattachable = (!paneRelayBoundByInode && !paneRequiresSeatbeltRelay)
+      || (paneRequiresSeatbeltRelay
+        ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir }) !== null
+        : recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
         ? attachScratchSession({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
         : sandboxRequested
           ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
@@ -31620,21 +31685,22 @@ async function spawnCliBody(
       resolvedBin: canonical(cliAdapter.resolvedBin),
     }).map(canonical);
 
-    // Relay outbox (in the policy so the compiled plan grants it read-write).
-    // Linux: always (created by prepareDirectSandbox, bound into bwrap).
-    // macOS: only when the bot withholds its app secret from the sandbox — the
-    // Seatbelt pane then has no credential to call Lark with, so send / history /
-    // quoted go through this outbox like they do on Linux.
-    const darwinRelayOutbox = process.platform === 'darwin' && cfg.sandboxWithholdBotSecret === true;
-    const outbox = process.platform === 'linux' || darwinRelayOutbox
-      ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
-      : undefined;
-    // macOS has no prepareDirectSandbox: create the outbox here, before the
-    // policy drops grants for paths that do not exist. A warm reattach must
-    // reuse the pane's existing directory (checked below), never make one.
-    if (darwinRelayOutbox && outbox && !willReattachPersistent) {
-      mkdirSync(outbox, { recursive: true, mode: 0o700 });
+    // Seatbelt also needs host-side send: its confined CLI cannot execute the
+    // system ps used to acquire feedback send leases, even with bot credentials.
+    const seatbeltRelay = process.platform === 'darwin'
+      ? (willReattachPersistent
+          ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir })
+          : prepareSandboxRelayOutbox({ sessionId: cfg.sessionId, dataDir }))
+      : null;
+    if (process.platform === 'darwin' && !seatbeltRelay) {
+      throw new Error(
+        `[file-sandbox] refusing to start session ${cfg.sessionId}: Seatbelt relay outbox is unavailable`,
+      );
     }
+    if (seatbeltRelay) childEnv.BOTMUX_SEND_RELAY = seatbeltRelay.outbox;
+    const outbox = process.platform === 'linux'
+      ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
+      : seatbeltRelay?.outbox;
     // Pre-create the outbox BEFORE buildFsPolicy so it survives the allow-rule
     // existence-filter below (a not-yet-existing readWrite path is dropped, and
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
@@ -32166,8 +32232,7 @@ async function spawnCliBody(
           throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: relay outbox ${outbox} is missing`);
         }
         if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-        const sessionTree = dirname(outbox);
-        sandboxCleanup = () => { rmSync(sessionTree, { recursive: true, force: true }); };
+        sandboxCleanup = seatbeltRelay!.cleanup;
         sandboxRelayOutbox = outbox;
         sandboxStopWatcher = startOutboxWatcher(
           outbox,
@@ -32175,8 +32240,8 @@ async function spawnCliBody(
           cfg.sessionId,
           { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
         );
-        publishSandboxRelayCapability();
-        log(`[file-sandbox] bot secret withheld from the sandbox; send/history/quoted relay via outbox=${outbox}`);
+        publishSandboxRelayCapability({ failClosed: true });
+        log(`[file-sandbox] host send relay via outbox=${outbox}`);
       }
     } else if (willReattachPersistent) {
       // Warm reattach (daemon restart / transfer) to a live bwrap'd pane:

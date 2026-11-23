@@ -29,6 +29,9 @@ import { logger } from './logger.js';
 import { withFileLockSync } from './file-lock.js';
 import { type Brand, larkHosts } from '../im/lark/lark-hosts.js';
 import { readGlobalConfig } from '../global-config.js';
+import { t } from '../i18n/index.js';
+import { type AppVersionReviewLookup, lookupAppVersionReview, reviewHoldsScopes } from './lark-app-version.js';
+import { ON_DEMAND_USER_SCOPES, RESOURCE_DOWNLOAD_OAUTH_SCOPES } from './lark-scope-catalog.js';
 
 // ─── Token paths ──────────────────────────────────────────────────────────────
 
@@ -129,6 +132,12 @@ export interface TokenStore {
   openId?: string;
   /** 授权人姓名，仅用于 /status、/login status 等展示，非身份依据。 */
   userName?: string;
+  /**
+   * 本人**显式申请并拿到**的按需权限（ON_DEMAND_USER_SCOPES，如下载附件的 im:resource）。
+   * 只有记在这里的按需权限才随后续授权延续、并受「不降权」保护；旧 token 里随默认集带来、
+   * 没记在这里的，后续授权不再连带申请（否则会被飞书塞进待审版本卡住审核）。
+   */
+  onDemandScopes?: string[];
 }
 
 interface TokenResponse {
@@ -165,6 +174,13 @@ interface PendingLogin {
    * since (epoch ≥ 1) is refused and must /login again.
    */
   authEpoch?: number;
+  /**
+   * 这条链接申请的全部 scope。回调换到 token 后拿它对照飞书实际授予的 scope，缺了的要在
+   * 结果里点名（旧 pending 文件没有这个字段 → 不做对照，行为同以前）。
+   */
+  scopes?: string[];
+  /** 这条链接显式申请的按需权限；回调拿到后记进 token 的 onDemandScopes。 */
+  onDemandScopes?: string[];
   createdAt: number;
 }
 
@@ -303,16 +319,35 @@ function replaceTokenForApp(
     const replacementScopes = new Set(splitScopes(token.scope));
     const droppedScopes = splitScopes(current?.token.scope)
       .filter(scope => !replacementScopes.has(scope));
-    if (policy === 'authorization' && droppedScopes.length > 0) {
-      return {
-        saved: false,
-        token: current!.token,
-        droppedScopes,
-        superseded: false,
-      };
+    if (policy === 'authorization') {
+      // 旧 token 里随默认集带来的按需权限，后续授权不再连带申请，新 token 不带它不算降权；
+      // 本人显式授权过的（记在 onDemandScopes）照样受保护——包括授权期间才拿到的那份。
+      const marked = current?.token.onDemandScopes ?? [];
+      const blocking = droppedScopes.filter(scope => !ON_DEMAND_USER_SCOPES.includes(scope) || marked.includes(scope));
+      if (blocking.length > 0) {
+        return {
+          saved: false,
+          token: current!.token,
+          droppedScopes: blocking,
+          superseded: false,
+        };
+      }
+      if (droppedScopes.length > 0) {
+        logger.info(`[user-token] ${appId}: 授权未再申请默认集带来的按需权限，新 token 不含 ${droppedScopes.join(' ')}`);
+      }
     }
-    saveTokenForAppUnlocked(token, appId, openId);
-    return { saved: true, token, droppedScopes, superseded: false };
+    // 旧 pending 可能没有 onDemandScopes（升级前发起，或较早的授权流程），但它后完成时
+    // 不能把当前 token 上较新的显式授权标记擦掉。只继承 replacement 实际保留的 scope：
+    // 无标记的旧默认集不会凭空获得标记，刷新降权时也不会把已丢 scope 重新标回。
+    const inheritedOnDemandScopes = (current?.token.onDemandScopes ?? []).filter(scope =>
+      ON_DEMAND_USER_SCOPES.includes(scope)
+      && replacementScopes.has(scope)
+      && !token.onDemandScopes?.includes(scope));
+    const replacementToken = inheritedOnDemandScopes.length > 0
+      ? { ...token, onDemandScopes: [...(token.onDemandScopes ?? []), ...inheritedOnDemandScopes] }
+      : token;
+    saveTokenForAppUnlocked(replacementToken, appId, openId);
+    return { saved: true, token: replacementToken, droppedScopes, superseded: false };
   }, { maxWaitMs: 30_000 });
 }
 
@@ -517,6 +552,7 @@ async function refreshToken(
       // 没有，绝不在这里凭空归属给某个人。
       ...(token.openId ? { openId: token.openId } : {}),
       ...(token.userName ? { userName: token.userName } : {}),
+      ...onDemandMarker(token.onDemandScopes, data.scope || token.scope),
     };
 
     // 写回原来那个文件：per-person token 刷新后仍是 per-person，不能落到
@@ -579,6 +615,30 @@ export async function resolveOwnerUserToken(
 }
 
 /** {@link resolveUserToken} / {@link resolveOwnerUserToken} 共用的过期与刷新处理。 */
+async function resolveTokenStoreFrom(
+  loaded: { token: TokenStore; source: string } | null,
+  appId: string,
+  appSecret: string,
+  brand: Brand,
+  signal?: AbortSignal,
+): Promise<TokenStore | null> {
+  signal?.throwIfAborted();
+  if (!loaded) return null;
+  const { token } = loaded;
+
+  if (isValid(token.expires_at)) return token;
+
+  // access_token expired — try refresh
+  if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
+    const refreshed = await refreshToken(token, appId, appSecret, brand, signal);
+    signal?.throwIfAborted();
+    if (refreshed) return refreshed;
+  }
+
+  logger.debug('[user-token] Token expired and refresh_token also expired');
+  return null;
+}
+
 async function resolveTokenFrom(
   loaded: { token: TokenStore; source: string } | null,
   appId: string,
@@ -586,21 +646,30 @@ async function resolveTokenFrom(
   brand: Brand,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  signal?.throwIfAborted();
-  if (!loaded) return null;
-  const { token } = loaded;
+  return (await resolveTokenStoreFrom(loaded, appId, appSecret, brand, signal))?.access_token ?? null;
+}
 
-  if (isValid(token.expires_at)) return token.access_token;
+export interface UserTokenSnapshot {
+  accessToken: string;
+  /** 与 accessToken 来自同一次 TokenStore 加载/刷新；旧 token 没记 scope 时为 undefined。 */
+  scopes?: string[];
+}
 
-  // access_token expired — try refresh
-  if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
-    const refreshed = await refreshToken(token, appId, appSecret, brand, signal);
-    signal?.throwIfAborted();
-    if (refreshed) return refreshed.access_token;
-  }
-
-  logger.debug('[user-token] Token expired and refresh_token also expired');
-  return null;
+/**
+ * 同时解析 access token 和它的 scope 快照。调用方不能用另一次读盘补 scope：两读之间
+ * 另一进程可能换发 token，导致错误分类用的是另一份凭证的元数据。
+ */
+export async function resolveUserTokenWithScopes(
+  appId: string,
+  appSecret: string,
+  brand: Brand = 'feishu',
+  openId?: string,
+  signal?: AbortSignal,
+): Promise<UserTokenSnapshot | null> {
+  const resolved = await resolveTokenStoreFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand, signal);
+  if (!resolved) return null;
+  const scopes = splitScopes(resolved.scope);
+  return { accessToken: resolved.access_token, ...(scopes.length > 0 ? { scopes } : {}) };
 }
 
 /**
@@ -622,28 +691,36 @@ export async function resolveUserToken(
   // 按 (app, 人) 取盘上的 token。不匹配 / 别人的 → null，调用方提示 /login。
   // 这里刻意没有 env 覆盖：一个全局 FEISHU_USER_ACCESS_TOKEN 会绕过整个按人隔离
   // 边界，而且绕过时没有任何痕迹。
-  return resolveTokenFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand, signal);
+  return (await resolveUserTokenWithScopes(appId, appSecret, brand, openId, signal))?.accessToken ?? null;
 }
 
 // ─── Public API: OAuth login flow ─────────────────────────────────────────────
 
 const DEFAULT_PORT = 9768;
 /**
- * 普通登录只申请消息读取、资源访问和授权续期。
+ * 普通登录只申请消息读取和授权续期。
  * 飞书会校验授权链接里的每个 scope；默认捆绑文档权限会让仅开通消息能力的
  * 应用在授权页直接失败（20027），连基础登录也无法完成。其它能力通过
  * `/login --scope ...` 或专项入口按需追加。对已经授权过的同一用户，再次按需
- * 授权时必须同时带上旧 token 的 scope，否则飞书返回的新 token 会覆盖旧 token，
- * 把本次未显式请求的既有能力静默降权。
+ * 授权时必须同时带上旧 token 的 scope（按需权限只带本人显式授权过的，见 ON_DEMAND_USER_SCOPES），
+ * 否则飞书返回的新 token 会覆盖旧 token，把本次未显式请求的既有能力静默降权。
  */
 const DEFAULT_SCOPES = [
   'im:message:readonly',
-  'im:resource',
   'offline_access',
 ].join(' ');
 
+export { ON_DEMAND_USER_SCOPES, RESOURCE_DOWNLOAD_OAUTH_SCOPES };
+
 function splitScopes(scope: string | undefined): string[] {
   return (scope ?? '').split(/\s+/).filter(Boolean);
+}
+
+/** 本次显式申请（或延续）的按需权限里，飞书真正授予了的那些；没有就不写这个字段。 */
+function onDemandMarker(requested: readonly string[] | undefined, grantedScope: string | undefined): { onDemandScopes?: string[] } {
+  const granted = new Set(splitScopes(grantedScope));
+  const kept = ON_DEMAND_USER_SCOPES.filter(scope => requested?.includes(scope) && granted.has(scope));
+  return kept.length ? { onDemandScopes: kept } : {};
 }
 
 /**
@@ -664,14 +741,23 @@ function authorizationScopes(
   return [...new Set([
     ...DEFAULT_SCOPES.split(' '),
     ...extraScopes,
-    ...splitScopes(existing?.token.scope),
+    // 按需权限只延续本人显式授权过的（onDemandScopes），默认集带来的不再连带申请。
+    ...splitScopes(existing?.token.scope).filter(scope => !ON_DEMAND_USER_SCOPES.includes(scope)
+      || (existing?.token.onDemandScopes ?? []).includes(scope)),
   ])];
 }
 
-type UserAuthorizationPollResult =
+export type UserAuthorizationPollResult =
   | { status: 'pending' }
   | { status: 'ready'; token: string }
-  | { status: 'failed'; error: string };
+  | {
+    status: 'failed';
+    error: string;
+    /** `authorization_scope_missing` 专用：申请了、但飞书发回的 token 里没有的 scope。 */
+    missingScopes?: string[];
+    /** `authorization_scope_missing` 专用：应用最新版本是否卡在企业审核（查不到时 state=unknown）。 */
+    appVersionReview?: AppVersionReviewLookup;
+  };
 
 export async function requestUserAuthorization(
   appId: string,
@@ -752,7 +838,20 @@ export async function requestUserAuthorization(
         return { status: 'failed', error: 'authorization_token_failed' };
       }
       const granted = new Set((data.scope ?? '').split(/\s+/));
-      if (!scopes.every(scope => granted.has(scope))) return { status: 'failed', error: 'authorization_scope_missing' };
+      const missingScopes = scopes.filter(scope => !granted.has(scope));
+      if (missingScopes.length > 0) {
+        // 判定不变：缺任何一项照样拒绝、不落盘。只是把「缺了哪几项」和「是不是因为应用新
+        // 版本还在企业审核」带回去，免得用户和 agent 对着一个错误码猜原因。版本查询是
+        // 只读的 best-effort：查不到（无权限 / 网络 / 超时）只少一句说明，不改结论。
+        const appVersionReview = await lookupAppVersionReview(appId, appSecret, brand, { signal });
+        logger.info(
+          `[user-token] authorization for ${appId} is missing scopes: ${missingScopes.join(' ')}`
+          + ` (app version review: ${appVersionReview.state === 'in_review'
+            ? `in review${appVersionReview.version ? ` ${appVersionReview.version}` : ''}`
+            : appVersionReview.state === 'unknown' ? `unknown — ${appVersionReview.reason}` : 'not in review'})`,
+        );
+        return { status: 'failed', error: 'authorization_scope_missing', missingScopes, appVersionReview };
+      }
       const authorized = await fetchAuthorizedUser(data.access_token, brand, signal);
       if (signal.aborted) return { status: 'failed', error: 'authorization_timeout' };
       if (!authorized.ok) return { status: 'failed', error: 'authorization_identity_unverified' };
@@ -773,6 +872,7 @@ export async function requestUserAuthorization(
         brand,
         openId,
         ...(authorized.userName ? { userName: authorized.userName } : {}),
+        ...onDemandMarker(scopes, data.scope),
       }, appId, brand, openId, undefined, 'authorization', authEpoch);
       if (!replacement.saved) {
         return {
@@ -807,7 +907,7 @@ export async function requestUserAuthorization(
 
 /**
  * 飞书文档订阅入口（/subscribe-lark-doc）专用的额外 OAuth scope。**不进**全局
- * DEFAULT_SCOPES —— 否则所有 bot 的通用 /login（图片下载用）都会请求这些 scope，
+ * DEFAULT_SCOPES —— 否则所有 bot 的通用 /login 都会请求这些 scope，
  * 没在开发者后台启用它们的 app 会一起 20043 失败。改由 /subscribe-lark-doc 在
  * 需要时通过 generateAuthUrl 的 extraScopes 单独带上。
  *
@@ -890,6 +990,10 @@ export function generateAuthUrl(
     appSecret,
     brand,
     ...(isUsableOpenId(openId) ? { openId, authEpoch: readUserTokenEpoch(appId, openId) } : {}),
+    scopes,
+    ...(scopes.some(scope => ON_DEMAND_USER_SCOPES.includes(scope))
+      ? { onDemandScopes: ON_DEMAND_USER_SCOPES.filter(scope => scopes.includes(scope)) }
+      : {}),
     createdAt: Date.now(),
   });
   savePendingLogin(pendingLogins.get(state)!);
@@ -910,6 +1014,8 @@ export interface CallbackHandleResult {
   matched: boolean;
   ok: boolean;
   message: string;
+  /** 授权已保存、但飞书没给全申请的 scope 时的补充说明（见 describeCallbackMissingScopes）。 */
+  warning?: string;
 }
 
 /**
@@ -930,9 +1036,14 @@ export async function tryHandleCallbackUrl(url: string): Promise<CallbackHandleR
   if (!(pendingLogins.get(state) ?? loadPendingLogin(state))) {
     return { matched: false, ok: false, message: 'state not pending for this app' };
   }
-  const message = await handleCallbackUrl(url);
-  if (message === null) return null;
-  return { matched: true, ok: message.startsWith('✅'), message };
+  const detailed = await handleCallbackUrlDetailed(url);
+  if (detailed === null) return null;
+  return {
+    matched: true,
+    ok: detailed.message.startsWith('✅'),
+    message: detailed.message,
+    ...(detailed.warning ? { warning: detailed.warning } : {}),
+  };
 }
 
 /**
@@ -1031,7 +1142,40 @@ export function callbackOrigin(url: string): 'own' | 'expired' | 'unknown' {
   return path && existsSync(path) ? 'expired' : 'unknown';
 }
 
-export async function handleCallbackUrl(url: string): Promise<string | null> {
+/**
+ * /login 授权码回调的「缺权限」补充说明。
+ *
+ * 这条链路历来是「换到 token 就保存」：飞书没给全申请的 scope 时也照样存（保存前只防降权，
+ * 见 replaceTokenForApp），这里不改那条判定，只是不能再让用户只看到一句「授权成功」——
+ * 申请的权限还卡在应用新版本的企业审核里时，用户紧接着重试就会再撞缺权限，却不知道为什么。
+ * 返回空串 = 没缺（或旧 pending 文件没记录申请了哪些 scope，无从对照）。
+ */
+async function describeCallbackMissingScopes(pending: PendingLogin, grantedScope: string | undefined): Promise<string | undefined> {
+  // 只有响应没携带 scope 字段时才无从对照。显式空串是「一项都没授予」，
+  // 必须继续枚举缺失项，不能和字段缺省一样静默跳过。
+  if (grantedScope == null) return undefined;
+  const granted = new Set(splitScopes(grantedScope));
+  const missing = (pending.scopes ?? []).filter(scope => !granted.has(scope));
+  if (missing.length === 0) return undefined;
+  const review = await lookupAppVersionReview(pending.appId, pending.appSecret, pending.brand);
+  logger.warn(
+    `[user-token] OAuth login for ${pending.appId} saved without requested scopes: ${missing.join(' ')}`
+    + ` (app version review: ${review.state}${review.state === 'in_review' && review.version ? ` ${review.version}` : ''})`,
+  );
+  const head = `⚠️ 但飞书没有授予本次申请的以下权限：${missing.join(' ')}。`;
+  if (!reviewHoldsScopes(review, missing)) return `${head}用到这些权限的操作仍会失败。`;
+  const outside = review.userScopes ? missing.filter(scope => !review.userScopes!.includes(scope)) : [];
+  return `${head}应用新版本${review.version ? ` ${review.version}` : ''} 正在企业审核，`
+    + '新申请的权限要等审核通过后才生效，请审核通过后再重新授权（审批进度可在飞书「审批」里查看）。'
+    + (outside.length ? t('auth_scope_missing.not_in_review_version', { scopes: outside.join(' ') }, 'zh') : '');
+}
+
+/**
+ * 回调处理的结构化结果：`message` 是成功/失败说明，`warning` 是「已保存但缺权限」的补充。
+ * 自动回调页面（Dashboard `/oauth/callback`、回环 127.0.0.1:9768）成功时只显示固定文案，
+ * 必须单独拿到 warning 才能把它显示出来。
+ */
+export async function handleCallbackUrlDetailed(url: string): Promise<{ message: string; warning?: string } | null> {
   // Match callback URL pattern
   const match = url.match(/[?&]code=([^&]+)/);
   const stateMatch = url.match(/[?&]state=([^&]+)/);
@@ -1042,7 +1186,7 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
 
   const pending = pendingLogins.get(state) ?? loadPendingLogin(state);
   if (!pending) {
-    return '❌ 授权失败：state 不匹配或已过期，请重新发起授权';
+    return { message: '❌ 授权失败：state 不匹配或已过期，请重新发起授权' };
   }
 
   pendingLogins.delete(state);
@@ -1063,12 +1207,12 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
     });
 
     if (!res.ok) {
-      return `❌ 授权失败：Token 端点返回 HTTP ${res.status}`;
+      return { message: `❌ 授权失败：Token 端点返回 HTTP ${res.status}` };
     }
 
     const data = await res.json() as TokenResponse;
     if (data.error || !data.access_token) {
-      return `❌ 授权失败：${data.error_description || data.error || 'unknown error'}`;
+      return { message: `❌ 授权失败：${data.error_description || data.error || 'unknown error'}` };
     }
 
     const now = new Date();
@@ -1083,8 +1227,10 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
     // 存错了没有任何报错，只是之后 A 的每次操作都在用 B 的权限。
     if (!authorized.ok) {
       logger.warn(`[user-token] 放弃保存：无法确认授权人（${authorized.reason}）`);
-      return `❌ 授权未完成：拿到了 token，但无法确认是谁完成的授权（${authorized.reason}），`
-        + `为避免记到错误的人名下，本次没有保存。请重新 /login。`;
+      return {
+        message: `❌ 授权未完成：拿到了 token，但无法确认是谁完成的授权（${authorized.reason}），`
+          + `为避免记到错误的人名下，本次没有保存。请重新 /login。`,
+      };
     }
 
     const ownerOpenId = authorized.openId;
@@ -1102,6 +1248,7 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       brand: pending.brand,
       openId: ownerOpenId,
       ...(authorized.userName ? { userName: authorized.userName } : {}),
+      ...onDemandMarker(pending.onDemandScopes, data.scope),
     };
 
     // Normally generateAuthUrl already merged the requester's stored scopes.
@@ -1133,25 +1280,39 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
       token, pending.appId, pending.brand, ownerOpenId, undefined, 'authorization', authEpoch,
     );
     if (!replacement.saved && replacement.absent) {
-      return '❌ 授权已撤销，本次没有保存。请重新 /login。';
+      return { message: '❌ 授权已撤销，本次没有保存。请重新 /login。' };
     }
     if (!replacement.saved) {
       logger.warn(`[user-token] 放弃保存：新 token 缺少旧 scope（${replacement.droppedScopes.join(', ')}）`);
-      return `❌ 授权未完成：新 token 缺少已有权限 ${replacement.droppedScopes.join(' ')}，`
-        + '为避免覆盖后降权，本次没有保存。请由本人重新发起授权。';
+      return {
+        message: `❌ 授权未完成：新 token 缺少已有权限 ${replacement.droppedScopes.join(' ')}，`
+          + '为避免覆盖后降权，本次没有保存。请由本人重新发起授权。',
+      };
     }
     logger.info(`[user-token] OAuth login successful, token saved for ${pending.appId} (per-user)`);
 
     const expiresAt = new Date(token.expires_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
     const who = authorized.userName ? `${authorized.userName} ` : '';
-    return mismatched
+    const saved = mismatched
       ? `✅ 授权成功，Token 已保存给实际完成授权的账号${who ? `（${authorized.userName}）` : ''}。\n`
         + `注意：这与发起 /login 的账号不是同一个人 —— 如果不是你本人操作，请让本人重新 /login。\n`
         + `有效期至 ${expiresAt}，过期后自动刷新。`
       : `✅ ${who}授权成功！Token 已保存。\n有效期至 ${expiresAt}，过期后自动刷新。`;
+    const warning = await describeCallbackMissingScopes(pending, data.scope);
+    return { message: saved, ...(warning ? { warning } : {}) };
   } catch (err: any) {
-    return `❌ 授权失败：${err.message}`;
+    return { message: `❌ 授权失败：${err.message}` };
   }
+}
+
+/**
+ * 把回调结果拼成一段文字（粘贴回调网址回话题、Dashboard 粘贴兜底等只显示一段文字的入口）。
+ * 缺权限的补充说明接在成功说明后面，不能丢。
+ */
+export async function handleCallbackUrl(url: string): Promise<string | null> {
+  const detailed = await handleCallbackUrlDetailed(url);
+  if (detailed === null) return null;
+  return detailed.warning ? `${detailed.message}\n${detailed.warning}` : detailed.message;
 }
 
 /**

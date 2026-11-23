@@ -40,6 +40,9 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { botmuxWrapperFiles } from '../src/core/botmux-wrapper.js';
+import { globalInstallUpdateLockTargetIn } from '../src/core/global-install-lock.js';
+import { withFileLock } from '../src/utils/file-lock.js';
+import { spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const SCRIPT = join(REPO_ROOT, 'scripts', 'claim-botmux-bin.mjs');
@@ -53,7 +56,7 @@ function fakeBinary(dir: string, name = 'botmux-fake'): string {
 }
 
 function runClaim(args: string[], home: string) {
-  const r = spawnSync(process.execPath, [SCRIPT, ...args], {
+  const r = spawnSyncTsScript(SCRIPT, args, {
     encoding: 'utf-8',
     env: { PATH: process.env.PATH, HOME: home },
     cwd: REPO_ROOT,
@@ -193,10 +196,58 @@ describe('claim-botmux-bin --binary — global botmux points at the compiled bin
     expect(execLine![2]).toBe(join(REPO_ROOT, 'dist', 'cli.js'));
   });
 
+  it('serializes the wrapper write with the global release-install lock', async () => {
+    const home = scratchHome();
+    const dataDir = join(home, 'custom-data');
+    mkdirSync(dataDir, { recursive: true });
+    const wrapper = join(home, '.botmux', 'bin', 'botmux');
+    writeFileSync(wrapper, 'original launcher');
+    const ready = join(home, 'interpreter-probed');
+    const fakeInterpreter = join(home, 'fake-interpreter');
+    writeFileSync(fakeInterpreter, '#!/bin/sh\nprintf ready > "$BOTMUX_TEST_READY"\nprintf "OK\\n"\n', { mode: 0o755 });
+    chmodSync(fakeInterpreter, 0o755);
+
+    let child: ReturnType<typeof spawnTsScript> | undefined;
+    let stderr = '';
+    try {
+      await withFileLock(globalInstallUpdateLockTargetIn(dataDir), async () => {
+        child = spawnTsScript(SCRIPT, [], {
+          cwd: REPO_ROOT,
+          env: {
+            PATH: process.env.PATH,
+            HOME: home,
+            SESSION_DATA_DIR: dataDir,
+            BOTMUX_INTERPRETER: fakeInterpreter,
+            BOTMUX_TEST_READY: ready,
+          },
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        child.stderr?.on('data', chunk => { stderr += String(chunk); });
+        const deadline = Date.now() + 10_000;
+        while (!existsSync(ready) && Date.now() < deadline) {
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        expect(existsSync(ready), stderr).toBe(true);
+        // The interpreter probe is immediately before the locked write. Give a
+        // non-cooperating mutant ample time to expose the missing lock.
+        await new Promise(resolve => setTimeout(resolve, 100));
+        expect(readFileSync(wrapper, 'utf8')).toBe('original launcher');
+      });
+      const status = await new Promise<number | null>((resolve, reject) => {
+        child!.once('error', reject);
+        child!.once('exit', code => resolve(code));
+      });
+      expect(status, stderr).toBe(0);
+      expect(readFileSync(wrapper, 'utf8')).toContain(realpathSync(fakeInterpreter));
+    } finally {
+      if (child && child.exitCode === null) child.kill();
+    }
+  }, 20_000);
+
   it('BOTMUX_NO_CLAIM still short-circuits in --binary mode', () => {
     const home = scratchHome();
     const binary = fakeBinary(home);
-    const r = spawnSync(process.execPath, [SCRIPT, '--binary', binary], {
+    const r = spawnSyncTsScript(SCRIPT, ['--binary', binary], {
       encoding: 'utf-8',
       env: { PATH: process.env.PATH, HOME: home, BOTMUX_NO_CLAIM: '1' },
       cwd: REPO_ROOT,

@@ -329,6 +329,11 @@ export interface CodexBridgeEvent {
    *  thinking-timeline entry is deferred (a wrapped shell call surfaces when
    *  its command completes, or at the turn's end). Marks the moment only. */
   toolCallBoundary?: true;
+  /** For kind 'cot' (Codex): a command's completion record. Its 'tool_call'
+   *  entry feeds the thinking timeline, but the record is written when the
+   *  command finished — possibly after later model output, or for an earlier
+   *  turn — so it is not where the model called a tool. */
+  toolCompletion?: true;
   /** Optional durable-delivery terminal outcome carried by bridges with an
    *  explicit completion record (for example Grok `turn_completed`). Codex
    *  final-answer records omit it and retain the historical completed
@@ -1345,15 +1350,26 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
-/** Codex persists automatic context refreshes as role=user, including mid-turn
- * date/subagent updates. They must not look like local input to an adopt queue.
+/** Content kinds Codex writes as role=user on its own: environment refreshes
+ *  and the AGENTS.md instructions it injects at the start of a conversation
+ *  (fresh, or after /clear and /new). */
+const CODEX_HARNESS_USER_CONTENT_KINDS: ReadonlySet<string> = new Set([
+  'environments.environment_context',
+  'agents_md.instructions',
+]);
+
+/** Codex persists automatic context as role=user: date/subagent environment
+ * updates (also mid-turn) and the AGENTS.md block that opens a conversation.
+ * They must not look like input: an adopt queue would synthesise a local turn
+ * from them, and the AGENTS.md text contains common words ("继续", "test"), so
+ * its fingerprint check could start a short pending Lark message early.
  * Explicit content kinds win over text so a user can quote an environment block.
  * Older rollouts lack kinds; recognize only a complete standalone wrapper there. */
 function isCodexEnvironmentUpdate(metadata: unknown, text: string): boolean {
   if (metadata && typeof metadata === 'object' && 'content_item_kinds' in metadata) {
     const kinds: unknown = metadata.content_item_kinds;
     return Array.isArray(kinds) && kinds.length > 0
-      && kinds.every((kind: unknown) => kind === 'environments.environment_context');
+      && kinds.every((kind: unknown) => typeof kind === 'string' && CODEX_HARNESS_USER_CONTENT_KINDS.has(kind));
   }
   const trimmed = text.trim();
   const opening = '<environment_context>';
@@ -1770,7 +1786,7 @@ function terminalExecFallbacks(
     ]);
     return [{
       uuid: `${path}:${call.outputOffset}`, rawId: call.outputRawId, timestampMs: call.outputTimestampMs ?? Date.now(),
-      kind: 'cot' as const, text: '', cotEntries,
+      kind: 'cot' as const, text: '', cotEntries, toolCompletion: true as const,
     }];
   });
 }
@@ -1974,7 +1990,7 @@ export function drainCodexRollout(
         .join('\n');
       const output = formatted || aggregated || streams;
       cotEntries.push({ kind: 'tool_result', id, result: truncateForCot(output, COT_TOOL_RESULT_MAX_CHARS) });
-      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries });
+      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries, toolCompletion: true });
       continue;
     }
     // A terminal without native identity cannot safely settle a queued turn.

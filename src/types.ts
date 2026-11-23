@@ -3031,8 +3031,11 @@ export type WorkerToDaemonBase =
    *  summary. `turnReply` marks the reply as the turn's final: a Claude
    *  folded turn has no other output, and under transcript delivery no
    *  completion receipt needs a carrier it can be written into. A Codex
-   *  steered turn still ends with its own final, so it never sets this. */
-  | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking'; turnReply?: true }
+   *  steered turn still ends with its own final, so it never sets this.
+   *  `progress` (Codex): not an answer to a folded message but what the model
+   *  said to this turn mid-work before going back to it; the turn's own
+   *  final still follows. */
+  | { type: 'absorbed_reply'; turnId: string; dispatchAttempt?: number; answer: string; replyUuid: string; source: 'text' | 'thinking'; turnReply?: true; progress?: true }
   | { type: 'receiver_reset_ready'; sessionId: string; turnId: string; dispatchAttempt: number }
   /** Runtime lease recovery ACK. Emitted only after the exact durable attempt
    * was either removed from the worker queue or its owned CLI was fenced. */
