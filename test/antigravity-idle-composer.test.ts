@@ -106,6 +106,23 @@ describe('Antigravity idle-composer viewport classifier', () => {
     expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN + NATIVE_ERROR_SCREEN, state)).toBe(state);
     expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN.replace('⚠ Individual', '  ⚠ Individual'), state)).toBe(state);
   });
+  it('does not promote native-log provenance when its countdown disagrees with the screen', () => {
+    const footerQuotaScreen = '⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.\n'
+      + 'Error ID: af1698f6-aaaa-bbbb-cccc-dddddddddddd-1\n────\n>\n────\n? for shortcuts  accept-edits · Gemini 4 Neon · xhigh';
+    const state = { limited: true as const, kind: 'usage' as const, retryAtMs: 1_000, retryLabel: '2h39m35s', retryReady: false };
+    const native = (countdown: string) => ({
+      text: `Individual quota reached. Please upgrade your subscription to increase your limits. Resets in ${countdown}.`,
+      key: 'E1123 20:52:28.722278',
+    });
+    // The retained footer keeps ERROR_COMPOSER_PATTERN from matching; a log
+    // carrying a different deadline must not vouch for this screen.
+    expect(annotateAntigravityUsageLimit(footerQuotaScreen, state, native('1h02m03s'))).toBe(state);
+    // Positive control: the same countdown still promotes the frame, so the
+    // gate is specifically about countdown agreement rather than the footer.
+    expect(annotateAntigravityUsageLimit(footerQuotaScreen, state, native('2h39m35s'))).toMatchObject({
+      source: 'antigravity-native-log', nativeEpisodeKey: 'log:E1123 20:52:28.722278',
+    });
+  });
   it.each([NATIVE_ERROR_SCREEN, QUOTA_ERROR_SCREEN])('recognizes a native error parked at the footerless composer', screen => {
     expect(isAntigravityIdleComposerScreen(screen)).toBe(true);
     expect(createAntigravityAdapter().readyPattern!.test(screen)).toBe(true);
