@@ -2510,8 +2510,14 @@ ipcRoute('POST', `/api/sessions/:sessionId/${FEEDBACK_SEND_LEASE_ROUTE}`, async 
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body, { allowReceiver: true });
   if (!auth.ok || !ds) return jsonRes(res, 403, { ok: false, error: auth.ok ? 'session_not_active' : auth.error });
   // A CLI in a PID namespace (Linux bwrap --unshare-pid) reports its
-  // namespace-local pid; the lease must name the host process.
+  // namespace-local pid; the lease must name the host process. Linux always
+  // has procfs, so an unprovable mapping is refused rather than leasing
+  // whichever host process happens to share the number. Elsewhere (macOS)
+  // there is no PID namespace and the reported pid is the host pid.
   const hostPid = typeof body.processId === 'number' ? resolveNamespaceLocalPid(body.processId, previewOwnerPids(ds)) : null;
+  if (hostPid === null && typeof body.processId === 'number' && process.platform === 'linux') {
+    return jsonRes(res, 409, { ok: false, error: 'feedback_process_identity_unavailable' });
+  }
   const result = handleFeedbackSendLeaseRelay(config.session.dataDir, ds.session.sessionId,
     hostPid ? { ...body, processId: hostPid } : body);
   return jsonRes(res, result.status, result.body);

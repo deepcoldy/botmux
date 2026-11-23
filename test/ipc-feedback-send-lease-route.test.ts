@@ -39,7 +39,8 @@ afterEach(async () => {
 function liveSession(sessionId: string, capability: string): any {
   return {
     session: { sessionId, status: 'active', chatId: `oc_${sessionId}`, rootMessageId: `om_root_${sessionId}` },
-    worker: { killed: false, connected: true, send: vi.fn() },
+    // The test process is the session root: the `sleep` sender descends from it.
+    worker: { killed: false, connected: true, send: vi.fn(), pid: process.pid },
     larkAppId: 'cli_app',
     chatId: `oc_${sessionId}`,
     managedTurnOrigin: { capability, turnId: `turn-${sessionId}`, dispatchAttempt: 1 },
@@ -131,19 +132,24 @@ describe('POST /api/sessions/:sessionId/feedback-send-lease', () => {
     expect(leases()).toEqual([]);
   });
 
-  it('keeps the reported pid unchanged when host resolution cannot prove a mapping', async () => {
-    const sessions: Record<string, any> = { 'sess-a': liveSession('sess-a', CAP_A) };
-    const workerRootPid = 4242;
-    sessions['sess-a'].worker = { ...sessions['sess-a'].worker, pid: workerRootPid };
-    const pid = await setup(sessions);
-    const resolve = vi.spyOn(pidNamespacePeer, 'resolveNamespaceLocalPid').mockReturnValue(null);
-    const acquired = await post('sess-a', { originCapability: CAP_A, action: 'acquire', processId: pid });
-    // The session roots are still handed to the resolver; its null verdict
-    // means the reported pid passes through unchanged.
-    expect(resolve).toHaveBeenCalledWith(pid, expect.arrayContaining([workerRootPid]));
-    expect(acquired.status).toBe(200);
-    expect(acquired.body.processId).toBe(pid);
-    expect(leases()).toHaveLength(1);
+  it.each([
+    ['linux', { status: 409, body: { ok: false, error: 'feedback_process_identity_unavailable' } }, 0],
+    ['darwin', { status: 200 }, 1],
+  ] as const)('on %s, handles a pid host resolution cannot prove', async (platform, expected, leaseCount) => {
+    const pid = await setup({ 'sess-a': liveSession('sess-a', CAP_A) });
+    vi.spyOn(pidNamespacePeer, 'resolveNamespaceLocalPid').mockReturnValue(null);
+    const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { configurable: true, value: platform });
+    try {
+      // Linux refuses instead of leasing whatever host process shares the
+      // number; macOS has no PID namespace, so the reported pid is the host's.
+      const acquired = await post('sess-a', { originCapability: CAP_A, action: 'acquire', processId: pid });
+      expect(acquired).toMatchObject(expected);
+      if (acquired.status === 200) expect(acquired.body.processId).toBe(pid);
+      expect(leases()).toHaveLength(leaseCount);
+    } finally {
+      Object.defineProperty(process, 'platform', descriptor);
+    }
   });
 
   it('releases after turn rotation, session deactivation and a daemon restart', async () => {
