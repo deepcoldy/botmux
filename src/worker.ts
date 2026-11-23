@@ -10518,11 +10518,15 @@ function observeCotEntries(entries: readonly CotEntry[], turn: { turnId: string;
   // exists, so `bridge-fallback-gate` deliberately does NOT strip it there and
   // the reply card shows it verbatim. Stripping it from the bubble alone would
   // make the two messages of one turn contradict each other.
+  // Both paths drop a text entry without text: counting it would throw out of
+  // the transcript drain and lose the rest of the turn's activity.
   const adoptMode = lastInitConfig?.adoptMode === true;
-  const kept = adoptMode ? [...entries] : entries.flatMap(entry => {
-    const withoutSentinel = cotEntryWithoutSentinel(entry);
-    return withoutSentinel ? [withoutSentinel] : [];
-  });
+  const kept = adoptMode
+    ? entries.filter(entry => entry.kind !== 'text' || typeof entry.text === 'string')
+    : entries.flatMap(entry => {
+      const withoutSentinel = cotEntryWithoutSentinel(entry);
+      return withoutSentinel ? [withoutSentinel] : [];
+    });
   const key = `${turn.turnId}|${turn.dispatchAttempt ?? ''}`;
   if (key !== thinkingTurnKey) {
     // Preserve the previous turn's trailing update before a steer/new turn
