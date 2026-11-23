@@ -643,7 +643,7 @@ import {
   type ResolveSubtopicHandoffDeps,
 } from './services/subtopic-mentionless-handoff.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
-import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
+import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, cancelQueuedForks, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { commandSpec } from './core/command-schema.js';
 import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
@@ -744,6 +744,7 @@ import {
   runWithdrawAutoClose,
 } from './core/daemon-background-close.js';
 import {
+  runDetachedBotTurnAdmission,
   runDetachedBotTurnMutation,
   tryWithBotTurnMutation,
   withBotTurnAdmission,
@@ -7647,6 +7648,21 @@ const commandDeps: CommandHandlerDeps = {
   sessionReply,
   getActiveCount,
   lastRepoScan,
+  resumeQueuedForks,
+  canRunQueuedFork: (ds, message) => {
+    // Match the inbound route's grant-only restriction as well as the command
+    // permission itself; both may be tightened while this request waits.
+    if (grantRestrictedSlashCommandText(ds.larkAppId, ds.chatId, message.senderId, '/fork')) return false;
+    const larkStampedBot = message.senderType === 'app' || message.senderType === 'bot';
+    const senderIsBot = larkStampedBot || isKnownPeerBot(config.session.dataDir, ds.larkAppId, message.senderId);
+    return canRunDaemonCommand(
+      ds.larkAppId, ds.chatId, message.senderId,
+      larkStampedBot ? message.senderUnionId : undefined,
+      '/fork', message.senderUnionId, ds.chatType,
+      senderIsBot, larkStampedBot,
+      larkStampedBot ? message.senderAppId : undefined,
+    );
+  },
   prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
   prewarmDocCommentSession,
   submitQueuedMessage,
@@ -27085,6 +27101,7 @@ function deliverPassthroughToExistingSession(
   larkAppId: string,
   turn: {
     messageId: string;
+    sourceChatId?: string;
     replyRootId?: string;
     senderOpenId?: string;
     senderIsBot: boolean;
@@ -27107,6 +27124,29 @@ function deliverPassthroughToExistingSession(
   },
 ): boolean {
   const turnId = turn.turnId ?? turn.messageId;
+  if (cmd === '/btw' && (ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId
+    ?? getBot(larkAppId).config.cliId) === 'antigravity') {
+    const loc = localeForBot(larkAppId);
+    const question = commandContent.replace(/^\/btw(?:\s+|$)/i, '').replace(/\r\n|[\r\n\t\u2028\u2029]/g, ' ').trim();
+    const notify = (text: string) => {
+      const replyTarget = turn.messageId.startsWith('om_')
+        ? { mode: 'thread' as const, rootMessageId: turn.messageId } : undefined;
+      void sessionReply(anchor, text, 'text', larkAppId, turnId, { replyTarget })
+        .catch(error => logger.warn(`[${tag(ds)}] Antigravity /btw notice failed: ${String(error)}`));
+      return false;
+    };
+    if (!question || question.length > 4_000) return notify(tr('daemon.antigravity_btw_usage', undefined, loc));
+    if (!ds.worker || ds.worker.killed || !ds.session.cliSessionId || isSessionTransferring(ds)
+      || isRemoteBackendSession(ds) || ds.initConfig?.adoptMode || ds.session.principalLane
+      || privateReplyEnabled(ds.session) || !turn.messageId.startsWith('om_') || turn.sourceChatId !== ds.chatId) {
+      return notify(tr('daemon.antigravity_btw_unavailable', undefined, loc));
+    }
+    if (!sendWorkerSessionInput(ds, {
+      type: 'antigravity_btw', question, messageId: turn.messageId, nativeSessionId: ds.session.cliSessionId,
+    })) return notify(tr('daemon.antigravity_btw_unavailable', undefined, loc));
+    turn.onDelivered?.();
+    return true;
+  }
   if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
     // A failed IPC enqueue must not replace the business turn's reply binding.
     // beginReplyTargetTurn replaces its maps rather than mutating the old maps.
@@ -27936,8 +27976,26 @@ function handleDocumentAskTextReply(data: any, ctx: RoutingContext): boolean {
   });
 }
 
+/** A waiting card gives the fork a visible topic before a child owns it. */
+function handlePendingForkTopicInput(data: any, ctx: RoutingContext): boolean {
+  const message = data?.message;
+  const topicRoot = message?.root_id;
+  if (ctx.chatType !== 'group' || typeof topicRoot !== 'string' || !topicRoot.startsWith('om_')
+    || topicRoot === ctx.messageId || typeof message.thread_id !== 'string' || !message.thread_id.startsWith('omt_')
+    || activeSessions.has(sessionKey(topicRoot, ctx.larkAppId))) return false;
+  const source = activeSessions.get(sessionKey(ctx.chatId, ctx.larkAppId));
+  if (!source || !isPendingForkTopic(source, topicRoot)) return false;
+  markIngressAdmitted(ctx);
+  if (data.sender?.sender_type === 'user') {
+    void replyMessage(ctx.larkAppId, topicRoot, tr('cmd.fork.topic_pending', undefined, localeForBot(ctx.larkAppId)), 'text', true)
+      .catch(err => logger.debug(`Pending /fork topic notice failed: ${String(err)}`));
+  }
+  return true;
+}
+
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
   if (feedbackMaintenanceActive(config.session.dataDir)) throw new Error('feedback_storage_maintenance');
+  if (handlePendingForkTopicInput(data, ctx)) return;
   // Before any turn identity is published: the platform credential path keys on
   // union_id, and the event is the only source that works for senders outside
   // the bot app's contact range. Synchronous, so admission timing is unchanged.
@@ -30491,6 +30549,17 @@ async function handlePrincipalLaneLiveMessage(
 // external Lark/worker boundaries, not the lane orchestration itself.
 export const __testOnly_handlePrincipalLaneLiveMessage = handlePrincipalLaneLiveMessage;
 
+function threadDeliveryKey(appId: string, scope: 'chat' | 'thread', anchor: string): string {
+  return `\u0000thread-delivery:${appId}:${scope}:${anchor}`;
+}
+
+function resumeQueuedForks(ds: DaemonSession): void {
+  const key = threadDeliveryKey(ds.larkAppId, ds.scope ?? ds.session.scope ?? 'thread', ds.runtimeRoutingAnchor ?? sessionAnchorId(ds));
+  void drainQueuedForks(ds, run => withActiveSessionKeyLock(activeSessions, key,
+    () => runDetachedBotTurnAdmission(ds.larkAppId, run)))
+    .catch(err => logger.warn(`[${tag(ds)}] queued /fork failed: ${String(err)}`));
+}
+
 async function handleThreadReply(
   data: any,
   ctx: RoutingContext,
@@ -30506,7 +30575,7 @@ async function handleThreadReply(
   // before entering it so two same-anchor deliveries can never invert while
   // quota/resource/sender preparation awaits. Synthetic keys share the same
   // lock registry without occupying or mutating an active-session slot.
-  const deliveryKey = `\u0000thread-delivery:${ctx.larkAppId}:${ctx.scope}:${ctx.runtimeRoutingAnchor ?? ctx.anchor}`;
+  const deliveryKey = threadDeliveryKey(ctx.larkAppId, ctx.scope, ctx.runtimeRoutingAnchor ?? ctx.anchor);
   ctx.ingressAdmission ??= { admitted: false };
   return withActiveSessionKeyLock(
     activeSessions,
@@ -30529,6 +30598,7 @@ async function handleThreadReplyAdmitted(
 ): Promise<void> {
   if (!crossChatFollowUpIsCurrent(ctx)) return;
   if (feedbackMaintenanceActive(config.session.dataDir)) throw new Error('feedback_storage_maintenance');
+  if (handlePendingForkTopicInput(data, ctx)) return;
   noteInboundSenderUnionId(ctx.larkAppId, data); // see handleNewTopicAdmitted
   if (!replay && handleDocumentAskTextReply(data, ctx)) return;
   await prepareGroupBackground(data, ctx);
@@ -33392,6 +33462,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         }
         deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
           messageId: parsed.messageId,
+          sourceChatId: data?.message?.chat_id,
           replyRootId,
           senderOpenId: senderOpenId,
           senderIsBot: isForeignBotSender,
@@ -35462,6 +35533,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      if (context.status === 'idle' || context.status === 'limited') resumeQueuedForks(ds);
       observeAutoCompact(ds, context.status);
       // A main-bot wake waits for its main session to be idle; the end of a
       // wake turn there also ends a checkpoint's review (bot-executed runs only).
@@ -35632,6 +35704,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           && ds.activeInteractiveTurn?.turnId === terminal.turnId) {
         ds.activeInteractiveTurn = undefined;
       }
+      resumeQueuedForks(ds);
       // Principal lanes are parallel across runtime keys but own a durable,
       // full-turn FIFO inside each key. Release/advance only on this exact
       // terminal edge; a stale terminal cannot dequeue a newer head.
@@ -35779,6 +35852,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           + `session=${context.sessionId.slice(0, 8)} generation=${context.workerGeneration}`,
         );
       }
+    },
+    onSessionRetired(ds) {
+      void cancelQueuedForks(ds, 'source_changed').catch(error =>
+        logger.warn(`[${tag(ds)}] queued /fork cancellation failed: ${String(error)}`));
     },
     async onSessionClosed(session, context) {
       autoCompactCoordinator.cancel(session.sessionId);

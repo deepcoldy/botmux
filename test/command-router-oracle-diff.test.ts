@@ -25,7 +25,7 @@ import {
 const ALPHABET = [
   '/cd', '/repo', 'wt', '/rename', '/sessions', '/card', '/cot', '/term', '/vc-auth',
   '/context-sharing', '/effort', '/queue', '/resume', '/dash',
-  '/compact', '/model', '/goal', '/foo', '/schedule', '/role', '/fork', '/watch-comment', 'list',
+  '/compact', '/btw', '/model', '/goal', '/foo', '/schedule', '/role', '/fork', '/watch-comment', 'list',
   '<pane>', '中文', 'latin', '"x y"', '/T',
 ];
 const SEPARATORS = [' ', '\n'];
@@ -49,6 +49,7 @@ const BUILTIN = new Set(ORACLE_PASSTHROUGH_COMMANDS);
 const PASSTHROUGH_CONFIGS: Array<{ name: string; cliId?: string; passthrough: ReadonlySet<string>; coldStart: ReadonlySet<string> }> = [
   { name: 'claude-code 默认', passthrough: new Set([...BUILTIN, '/goal']), coldStart: new Set(['/goal']) },
   { name: '含自定义透传 /foo', passthrough: new Set([...BUILTIN, '/goal', '/foo']), coldStart: new Set(['/goal']) },
+  { name: 'antigravity 默认', cliId: 'antigravity', passthrough: BUILTIN, coldStart: new Set() },
   { name: '无 raw 面（codex-app）', cliId: 'codex-app', passthrough: new Set(), coldStart: new Set() },
 ];
 const SENDERS: Array<{ name: string; senderIsBot: boolean; acceptSlashFromBots: boolean }> = [
@@ -170,6 +171,13 @@ const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boo
     && legacy.kind === 'forward' && legacy.reason === 'discussion'
     && (next.kind === 'cascade' || next.kind === 'cascade_unsupported')
     && next.items.length >= 2 && next.items[0]!.kind === 'passthrough',
+  // #3741: Antigravity /btw is one literal side question, including later
+  // slash-shaped lines and angle brackets; never split it into the main turn.
+  (input, legacy, next) => input.cliId === 'antigravity'
+    && /^\s*\/btw(?:\s|$)/i.test(input.text)
+    && legacy.kind === 'forward' && legacy.reason === 'discussion'
+    && next.kind === 'passthrough' && next.cmd === '/btw'
+    && next.content === input.text.trim(),
   // 2026-10-14 插件斜杠指令（docs/design/2026-10-14-plugin-slash-commands.md）：当前 bot 有效插件
   // 声明的指令，从 unknown_slash 转发改为 plugin 决策；内置/透传/特判命令永不被插件覆盖。
   (input, legacy, next) =>

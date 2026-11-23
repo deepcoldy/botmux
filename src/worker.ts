@@ -495,6 +495,7 @@ import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './service
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot } from './services/antigravity-cot.js';
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { AntigravitySessionLog } from './services/antigravity-session-fork.js';
 import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import {
   inspectAntigravityAccounts,
@@ -503,12 +504,13 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, hasAntigravitySideQuestionComposer, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
   hasAntigravityPendingTasks,
   drainAntigravityTranscript,
+  readAntigravitySideAnswer,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
 import {
@@ -20512,6 +20514,75 @@ function finishBtwCaptureFromScreen(): void {
   }
   log('/btw answer finished but neither the clipboard nor the screen yielded it');
   giveUpBtwCapture();
+}
+
+let antigravitySideQuestionPending = false;
+
+async function handleAntigravitySideQuestion(
+  msg: Extract<DaemonToWorker, { type: 'antigravity_btw' }>,
+): Promise<void> {
+  const target = backend;
+  const lifetime = cliLifetimeNonce;
+  const cfg = lastInitConfig;
+  const result = { type: 'antigravity_btw_result' as const, messageId: msg.messageId, question: msg.question };
+  const current = () => backend === target && cliLifetimeNonce === lifetime
+    && lastInitConfig === cfg && !cliRestartInProgress && !nativeSessionForkPending()
+    && inputDeliveryObservedCliSessionId === msg.nativeSessionId;
+  if (!target || cfg?.cliId !== 'antigravity' || cfg.adoptMode || cliAdapter?.runnerFramedInput
+    || isRemoteBackendType(effectiveBackendType) || cfg.sandbox === 'scratch'
+    || !current() || !msg.question || /[\u0000-\u001f\u007f-\u009f]/u.test(msg.question)) {
+    send({ ...result, reason: 'unavailable' });
+    return;
+  }
+  if (antigravitySideQuestionPending || commandLineWritesPending || isFlushing || injectionFlushing
+    || sessionRenameInFlight() || rawInputRestartGate || startupCommandsInProgress || startupCommandAckHold
+    || (!hasRunStartupCommands && cfg.startupCommands?.length)
+    || (!firstWriteLivenessConfirmed && hasPendingInputForFlush())) {
+    send({ ...result, reason: 'busy' });
+    return;
+  }
+  antigravitySideQuestionPending = true;
+  try {
+    const logReader = new AntigravitySessionLog(sessionId);
+    const loggedNativeId = logReader.read().currentId;
+    // A fresh reader scans only the log's last 256 KiB. Missing history is not
+    // a conflict: current() already proves the observed native identity. Refuse
+    // only an explicit different id; receipt + transcript checks stay intact.
+    if (loggedNativeId && loggedNativeId !== msg.nativeSessionId) {
+      send({ ...result, reason: 'unavailable' });
+      return;
+    }
+    const previous = logReader.read().sideQuestion;
+    await sendRawCommandLineWithRecoveryFence(target, `/btw ${msg.question}`, () => {
+      const screen = btwOverlayScreen();
+      if (!current() || heldStuckPage(screen) || !hasAntigravitySideQuestionComposer(screen) || !firstWriteMayProceed()) {
+        throw new SubmissionWriteError('Antigravity /btw requires an empty native composer', undefined, false);
+      }
+    });
+    // The terminal command launches a different native conversation. A
+    // receipt and matching input are required before any output can cross
+    // into Lark. The main turn retains its capture identity throughout.
+    const deadline = Date.now() + BTW_ANSWER_WINDOW_MS;
+    while (current() && Date.now() < deadline) {
+      const state = logReader.read();
+      if (state.currentId && state.currentId !== msg.nativeSessionId) break;
+      const receipt = state.sideQuestion;
+      if (receipt && receipt !== previous && receipt.conversationId !== msg.nativeSessionId) {
+        if (receipt.outcome !== 'answered') break;
+        const answer = readAntigravitySideAnswer(receipt.conversationId, msg.question);
+        if (answer) {
+          send({ ...result, answer });
+          return;
+        }
+      }
+      await delay(500);
+    }
+    send({ ...result, reason: 'unconfirmed' });
+  } catch (err) {
+    send({ ...result, reason: err instanceof SubmissionWriteError && !err.submissionStarted ? 'busy' : 'unconfirmed' });
+  } finally {
+    antigravitySideQuestionPending = false;
+  }
 }
 
 /**
@@ -41740,6 +41811,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       })}\n`, error => {
         if (error) fail();
       });
+      break;
+    }
+
+    case 'antigravity_btw': {
+      await handleAntigravitySideQuestion(msg);
       break;
     }
 
