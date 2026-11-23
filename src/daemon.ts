@@ -27067,6 +27067,7 @@ function deliverPassthroughToExistingSession(
   larkAppId: string,
   turn: {
     messageId: string;
+    sourceChatId?: string;
     replyRootId?: string;
     senderOpenId?: string;
     senderIsBot: boolean;
@@ -27089,6 +27090,29 @@ function deliverPassthroughToExistingSession(
   },
 ): boolean {
   const turnId = turn.turnId ?? turn.messageId;
+  if (cmd === '/btw' && (ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId
+    ?? getBot(larkAppId).config.cliId) === 'antigravity') {
+    const loc = localeForBot(larkAppId);
+    const question = commandContent.replace(/^\/btw(?:\s+|$)/i, '').replace(/\r\n|[\r\n\t\u2028\u2029]/g, ' ').trim();
+    const notify = (text: string) => {
+      const replyTarget = turn.messageId.startsWith('om_')
+        ? { mode: 'thread' as const, rootMessageId: turn.messageId } : undefined;
+      void sessionReply(anchor, text, 'text', larkAppId, turnId, { replyTarget })
+        .catch(error => logger.warn(`[${tag(ds)}] Antigravity /btw notice failed: ${String(error)}`));
+      return false;
+    };
+    if (!question || question.length > 4_000) return notify(tr('daemon.antigravity_btw_usage', undefined, loc));
+    if (!ds.worker || ds.worker.killed || !ds.session.cliSessionId || isSessionTransferring(ds)
+      || isRemoteBackendSession(ds) || ds.initConfig?.adoptMode || ds.session.principalLane
+      || privateReplyEnabled(ds.session) || !turn.messageId.startsWith('om_') || turn.sourceChatId !== ds.chatId) {
+      return notify(tr('daemon.antigravity_btw_unavailable', undefined, loc));
+    }
+    if (!sendWorkerSessionInput(ds, {
+      type: 'antigravity_btw', question, messageId: turn.messageId, nativeSessionId: ds.session.cliSessionId,
+    })) return notify(tr('daemon.antigravity_btw_unavailable', undefined, loc));
+    turn.onDelivered?.();
+    return true;
+  }
   if ((ds.worker && !ds.worker.killed) || isSessionTransferring(ds)) {
     // A failed IPC enqueue must not replace the business turn's reply binding.
     // beginReplyTargetTurn replaces its maps rather than mutating the old maps.
@@ -33374,6 +33398,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
         }
         deliverPassthroughToExistingSession(ds, cmd, commandContent, anchor, larkAppId, {
           messageId: parsed.messageId,
+          sourceChatId: data?.message?.chat_id,
           replyRootId,
           senderOpenId: senderOpenId,
           senderIsBot: isForeignBotSender,

@@ -11,6 +11,7 @@ import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 const fixtures: ReturnType<typeof setup>[] = [];
 const parentId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 const childId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+const sideId = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function waitFor(check: () => boolean, logs: string[], timeout = 30_000) {
@@ -51,6 +52,7 @@ const args = process.argv.slice(2);
 const logFile = args[args.indexOf('--log-file') + 1];
 let current = args[args.indexOf('--conversation') + 1];
 const parent = ${JSON.stringify(parentId)}, child = ${JSON.stringify(childId)};
+const sideId = ${JSON.stringify(sideId)};
 const state = ${JSON.stringify(state)};
 const append = (p, o) => fs.appendFileSync(p, JSON.stringify(o) + '\\n');
 append(${JSON.stringify(launchLog)}, { id: current });
@@ -89,8 +91,21 @@ process.stdin.on('data', chunk => {
       }, 25);
       continue;
     }
+    if (text.startsWith('/btw ')) {
+      const logs = path.join(state, 'brain', sideId, '.system_generated', 'logs');
+      fs.mkdirSync(logs, { recursive: true });
+      const transcript = path.join(logs, 'transcript_full.jsonl');
+      append(transcript, { type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', content: '<USER_REQUEST>\\n' + text.slice(5) + '\\n</USER_REQUEST>' });
+      append(transcript, { type: 'PLANNER_RESPONSE', status: 'DONE', content: 'ISOLATED_SIDE_ANSWER' });
+      native('btw side question ' + sideId + ' ended after 1s and 0 tool calls: answered');
+      continue;
+    }
     fs.appendFileSync(path.join(state, 'history.jsonl'), JSON.stringify({ display: text, timestamp: Date.now(), workspace: ${JSON.stringify(data)}, conversationId: current }) + '\\n');
-    process.stdout.write('\\x1b[2J\\x1b[HWorking... esc to cancel\\r\\n');
+    if (text === 'WORK_MAIN') {
+      process.stdout.write('\\x1b[2J\\x1b[HWorking...\\r\\n────────\\r\\n>\\r\\n────────\\r\\nesc to cancel\\r\\n');
+    } else {
+      process.stdout.write('\\x1b[2J\\x1b[HWorking... esc to cancel\\r\\n');
+    }
     const logs = path.join(state, 'brain', current, '.system_generated', 'logs');
     fs.mkdirSync(logs, { recursive: true });
     const n = turn++;
@@ -102,7 +117,7 @@ process.stdin.on('data', chunk => {
       fs.appendFileSync(path.join(logs, 'transcript.jsonl'), rows);
       fs.appendFileSync(path.join(logs, 'transcript_full.jsonl'), rows);
       setTimeout(screen, 300);
-    }, 1200);
+    }, text === 'WORK_MAIN' ? 4000 : 1200);
   }
 });
 setInterval(() => { void handles; }, 1000);
@@ -156,6 +171,28 @@ afterEach(async () => {
 });
 
 describe.skipIf(process.platform !== 'linux')('worker Antigravity native fork', () => {
+  it('delivers an Antigravity side answer without reassigning the running main turn', async () => {
+    const f = setup(); fixtures.push(f);
+    const run = f.start({ fork: false });
+    await waitFor(() => run.finals().length === 1 && run.messages.some(msg => msg.type === 'prompt_ready'), run.logs);
+    run.worker.send({ type: 'message', content: 'WORK_MAIN', turnId: 'om_main' } satisfies DaemonToWorker);
+    await waitFor(() => f.inputs().some(row => row.text === 'WORK_MAIN'), run.logs);
+    await sleep(300);
+    run.worker.send({
+      type: 'antigravity_btw', question: 'Read the inherited value', nativeSessionId: parentId, messageId: 'om_side',
+    } satisfies DaemonToWorker);
+    await waitFor(() => run.messages.some(msg => msg.type === 'antigravity_btw_result'), run.logs);
+    expect(run.messages.find(msg => msg.type === 'antigravity_btw_result')).toMatchObject({
+      messageId: 'om_side', answer: 'ISOLATED_SIDE_ANSWER',
+    });
+    expect(run.finals()).toHaveLength(1);
+    await waitFor(() => run.finals().some(msg => msg.turnId === 'om_main'), run.logs);
+    expect(run.ids()).not.toContain(sideId);
+    expect(f.inputs().filter(row => row.text.startsWith('/btw '))).toEqual([
+      { id: parentId, text: '/btw Read the inherited value' },
+    ]);
+  }, 60_000);
+
   it('withholds parent identity, readiness and input until an independent child is confirmed', async () => {
     const f = setup(); fixtures.push(f);
     const g = f.start();

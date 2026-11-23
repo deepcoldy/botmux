@@ -2533,6 +2533,36 @@ describe('handleCommand', () => {
   });
 
   describe('/fork sub-topic', () => {
+    it.each([true, false])('uses an Antigravity session-group command as the topic root (thread created: %s)', async threadCreated => {
+      vi.mocked(isSessionGroup).mockReturnValue(true);
+      onTestFinished(() => { vi.mocked(isSessionGroup).mockReturnValue(false); });
+      vi.mocked(replyMessage).mockResolvedValue('om_fork_seed');
+      vi.mocked(getMessageThreadId).mockResolvedValue(threadCreated ? 'omt_fork_child' : null);
+      const ds = makeDaemonSession({ scope: 'chat', lastScreenStatus: 'idle', session: makeSession({
+        cliId: 'antigravity', scope: 'chat', rootMessageId: CHAT_ID, ownerOpenId: 'ou_sender', cliSessionId: 'agy-parent',
+      }) });
+      const deps = makeDeps(ds);
+      const task = '检查继承的上下文';
+      deps.activeSessions.set(sessionKey(CHAT_ID, LARK_APP_ID), ds);
+      await handleCommand('/fork', CHAT_ID, makeLarkMessage(`/fork ${task}`, {
+        messageId: 'om_fork_command', rootId: 'om_fork_command', chatId: CHAT_ID,
+      }), deps, LARK_APP_ID);
+
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(vi.mocked(replyMessage).mock.calls[0]?.slice(0, 5)).toEqual([
+        LARK_APP_ID, 'om_fork_command', expect.stringContaining(task), 'post', true,
+      ]);
+      if (threadCreated) {
+        expect(forkSession).toHaveBeenCalledWith('sess-001', CHAT_ID, 'om_fork_command', 'group', 'thread',
+          expect.objectContaining({ turnId: 'om_fork_command', larkThreadId: 'omt_fork_child', forkTaskText: task }));
+        expect(ds.session.forkChildSessionIds).toEqual(['child-sess-1']);
+        expect(deps.sessionReply).not.toHaveBeenCalled();
+      } else {
+        expect(forkSession).not.toHaveBeenCalled();
+        expect(deleteMessage).toHaveBeenCalledExactlyOnceWith(LARK_APP_ID, 'om_fork_seed');
+      }
+    });
+
     it.each([
       ['codex', 'topic'],
       ['claude-code', 'topic'],

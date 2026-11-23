@@ -258,6 +258,14 @@ export function isAntigravityReadyComposerScreen(screen: string): boolean {
   return !isAntigravityWorkingScreen(plain) && readyComposerRowAbove(plain) !== undefined;
 }
 
+/** The normal composer still accepts /btw while agy's main turn is running. */
+export function hasAntigravitySideQuestionComposer(screen: string): boolean {
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n')
+    .replace(/^([ \t]*)esc to cancel(?=\s|$)/gim, '$1? for shortcuts');
+  return readyComposerRowAbove(plain) !== undefined
+    && !/^[ \t]*┃.*Enter\/Esc to cancel/im.test(plain);
+}
+
 /** Cancellation can leave the transcript at a tool result forever. Accept only
  * the CLI's explicit interruption notice followed immediately by an EMPTY
  * composer and its ready footer at the end of the current viewport. Old notices

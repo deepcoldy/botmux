@@ -65,7 +65,11 @@ export function parseSlashCommandInvocation(
   const spec = commandSpec(cmd);
   const cliPayload = !!spec?.cliId && commandCliIdMatches(spec.cliId, cliId) && spec.multiline === true
     && /^\/effort\s+(?:low|medium|high|xhigh|max|ultra)(?:\s|$)/i.test(trimmed);
-  const literalBody = spec?.literalBody === true && (!spec.cliId || cliPayload);
+  // Antigravity sends the entire side question to a separate native
+  // conversation. Splitting later lines into a cascade would send that part
+  // of the question into the main conversation instead.
+  const antigravityBtw = cliId === 'antigravity' && cmd === '/btw';
+  const literalBody = antigravityBtw || (spec?.literalBody === true && (!spec.cliId || cliPayload));
   // Treat angle-bracket placeholders as documentation, not an invocation.
   const invocationPrefix = cliPayload ? firstLine.split(/\s+/).slice(0, 2).join(' ') : firstLine;
   if ((!literalBody || cliPayload) && /<[^>\r\n]+>/.test(invocationPrefix)) return null;
@@ -74,7 +78,7 @@ export function parseSlashCommandInvocation(
   if (restNonBlank.length > 0) {
     // A list of slash commands is almost certainly discussion / planning text.
     if (!literalBody && restNonBlank.some(l => l.startsWith('/'))) return null;
-    if (!MULTILINE_COMMANDS.has(cmd) && !multilineCommands?.has(cmd) && !cliPayload) return null;
+    if (!MULTILINE_COMMANDS.has(cmd) && !multilineCommands?.has(cmd) && !cliPayload && !antigravityBtw) return null;
   }
 
   return { cmd, content: trimmed };

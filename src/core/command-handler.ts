@@ -6997,13 +6997,9 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.fork.subtopic_usage', undefined, loc));
             break;
           }
-          // 私聊（p2pMode chat/thread 均可）、话题群与普通群里已有独立会话的
-          // 原生话题都支持原地分身。私聊走 chatType 判定，不调 getChatModeStrict：
-          // DM 没有 chat_mode 概念，且该接口偶发 500。群聊只要求源是 thread-scope
-          // 会话（有真实 om_ 根消息）——群类型不是会话隔离边界；普通群顶层的
-          // chat-scope 连续会话仍拒绝，改用 /fork --create。
+          const fromSessionGroup = isAntigravitySessionGroupFork(ds, message);
           const forkInPlaceIsP2p = ds.chatType === 'p2p';
-          if (!forkInPlaceIsP2p
+          if (!forkInPlaceIsP2p && !fromSessionGroup
             && (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_'))) {
             await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
             break;
@@ -7029,7 +7025,9 @@ export async function handleCommand(
             }
             break;
           }
-          await sessionReply(rootId, t('cmd.fork.subtopic_created', { link: result.link }, loc));
+          if (!fromSessionGroup) {
+            await sessionReply(rootId, t('cmd.fork.subtopic_created', { link: result.link }, loc));
+          }
           logger.info(`[${logTag}] /fork sub-topic completed: child=${result.childSessionId.substring(0, 8)} anchor=${result.anchorId.substring(0, 12)} (source ${ds.session.sessionId.substring(0, 8)} untouched)`);
           break;
         }
@@ -7993,7 +7991,13 @@ type ForkSubtopicResult =
   | { ok: true; childSessionId: string; anchorId: string; link: string }
   | { ok: false; error: string; orphanTopic: boolean };
 
-/** Fork the current thread-scoped session into a new sibling topic of the same
+function isAntigravitySessionGroupFork(ds: DaemonSession, message: LarkMessage): boolean {
+  if (ds.chatType !== 'group' || ds.scope !== 'chat' || message.threadId || !message.messageId.startsWith('om_')) return false;
+  const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  return cliId === 'antigravity' && isSessionGroup(ds.chatId);
+}
+
+/** Fork the current session into a new topic of the same
  *  chat. This works for both topic groups and native topics in regular groups.
  *  The session copy itself stays in worker-pool's generic `forkSession()`;
  *  this layer only creates the Lark destination, supplies the first task turn,
@@ -8024,6 +8028,9 @@ export async function startForkSubtopicSession(
   };
   const sourceOptions = forkSourceWriteOptions(appId, parentDs, message.messageId);
   const forkInPlaceIsP2p = parentDs.chatType === 'p2p';
+  const fromSessionGroup = isAntigravitySessionGroupFork(parentDs, message);
+  const commandIsTopLevel = !message.threadId && (!message.rootId || message.rootId === message.messageId);
+  const usesCommandAnchor = (forkInPlaceIsP2p || fromSessionGroup) && commandIsTopLevel;
   // DM 下命令消息不能安全充当新话题根的两种形态：
   // 1) 已在某个真实话题内（thread_id 仅真实话题回复才带；引用气泡不带）——
   //    飞书话题不可嵌套，对它 reply_in_thread 只会落回父话题，marker 记在
@@ -8031,8 +8038,6 @@ export async function startForkSubtopicSession(
   // 2) DM 顶层但引用了别的消息（root_id 存在且不等于自身）——引用气泡能否
   //    当话题根是未验证行为，不赌：同样新发一条顶层消息作锚点。
   // 两种形态都改走 (a)：sendMessage 顶层 post + 对它 reply_in_thread 开话题。
-  const p2pAnchorIsForeign = forkInPlaceIsP2p
-    && (!!message.threadId || (!!message.rootId && message.rootId !== message.messageId));
   let anchorId: string | undefined;
   // forkSession 成功后置位：之后任何抛错都不能再走 recallAnchor，否则会把
   // 一个已经活着的分身话题连同 marker 一起撤掉，留下回复折回扁平、静默
@@ -8070,7 +8075,7 @@ export async function startForkSubtopicSession(
     if (!anchorId) return true;
     // 先撤话题内回复、再撤锚点；任一失败都算留下了孤儿话题。
     let allRecalled = true;
-    for (const id of [groupTopicReplyId, anchorId]) {
+    for (const id of [groupTopicReplyId, usesCommandAnchor ? undefined : anchorId]) {
       if (!id) continue;
       try {
         if (!await deleteMessage(appId, id)) allRecalled = false;
@@ -8086,10 +8091,10 @@ export async function startForkSubtopicSession(
   };
 
   try {
-    let parentThreadId = parentSession.larkThreadId ?? message.threadId;
+    let parentThreadId = fromSessionGroup ? undefined : (parentSession.larkThreadId ?? message.threadId);
     // 扁平私聊会话的 rootMessageId 存的是 chatId（oc_ 开头），不是消息 id——
     // 拿去查 getMessageDetail 必然落空。直接回落成 chat applink 即可。
-    if (!parentThreadId && parentSession.rootMessageId?.startsWith('om_')) {
+    if (!fromSessionGroup && !parentThreadId && parentSession.rootMessageId?.startsWith('om_')) {
       parentThreadId = (await getMessageThreadId(appId, parentSession.rootMessageId)) ?? undefined;
     }
     if (parentThreadId && parentSession.larkThreadId !== parentThreadId) {
@@ -8130,7 +8135,18 @@ export async function startForkSubtopicSession(
       },
     });
     let childThreadId: string | undefined;
-    if (forkInPlaceIsP2p && !p2pAnchorIsForeign) {
+    if (fromSessionGroup && usesCommandAnchor) {
+      anchorId = message.messageId;
+      groupTopicPending = true;
+      groupTopicReplyId = await replyMessage(appId, anchorId, seedPost, 'post', true,
+        `fork-topic:${appId}:${anchorId}`, undefined, sourceOptions);
+      childThreadId = (await getMessageThreadId(appId, groupTopicReplyId)) ?? undefined;
+      if (!childThreadId?.startsWith('omt_')) {
+        const orphanTopic = !await recallAnchor();
+        return { ok: false, error: 'topic_creation_failed', orphanTopic };
+      }
+      groupTopicPending = false;
+    } else if (forkInPlaceIsP2p && usesCommandAnchor) {
       // (b) 命令在 DM 顶层：锚点就是用户的命令消息，reply_in_thread 开出
       // 新话题（与 /t 同构）。锚点归用户所有，失败时绝不删除。
       anchorId = message.messageId;
@@ -8255,13 +8271,15 @@ export async function startForkSubtopicSession(
         );
       }
     }
-    try {
-      await upsertForkPanelCard(parentDs, loc, { sourceOptions });
-    } catch (err) {
-      logger.warn(
-        `[${parentSession.sessionId.substring(0, 8)}] /fork panel refresh failed: `
-        + `${err instanceof Error ? err.message : String(err)}`,
-      );
+    if (!fromSessionGroup) {
+      try {
+        await upsertForkPanelCard(parentDs, loc, { sourceOptions });
+      } catch (err) {
+        logger.warn(
+          `[${parentSession.sessionId.substring(0, 8)}] /fork panel refresh failed: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
     return {
