@@ -37,11 +37,13 @@ const { recallProvenIdentityContent } = await import('../src/core/cli-identity.j
 const { activeIdentityTurns, releaseActiveIdentityTurn } = await import('../src/core/active-identity-turns.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { isHumanInboundTurnId, pickTurnReplyTarget } = await import('../src/core/reply-target.js');
-const { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
+const { allowsPersonalIdentityForTurn, isPersonActorTurnId, isRunAsTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
 const { parseScheduledTurnId } = await import('../src/core/scheduled-turn-provenance.js');
 
 const OWNER = 'ou_old_owner';
-const TURN = 'trg_owner_adversarial';
+const OWNER_TURN = 'trg_owner_adversarial';
+const RUN_AS_TURN = 'trg_runas_adversarial';
+const TURN = OWNER_TURN;
 const SESSION = 'session-owner-adversarial';
 const directories: string[] = [];
 afterEach(() => {
@@ -80,7 +82,14 @@ function world(opts: {
   currentOwner?: string;
   allowedOwners?: string[];
   dispatchUserForTurn?: () => Promise<undefined>;
+  /** A runAs turn: the person its reply target records and the live admission. */
+  runAs?: { person: string; unionId: string | null; operable: () => boolean };
+  /** An earlier turn already published in this session; `turn` overrides the turn id. */
+  previouslyPublished?: boolean;
+  turn?: string;
 } = {}) {
+  const TURN = opts.turn ?? (opts.runAs ? RUN_AS_TURN : OWNER_TURN);
+  const SENDER = opts.runAs?.person ?? OWNER;
   const dataDir = mkdtempSync(join(tmpdir(), 'owner-actor-restore-test-'));
   directories.push(dataDir);
   let allowedOwners = opts.allowedOwners ?? [opts.currentOwner ?? OWNER];
@@ -107,10 +116,11 @@ function world(opts: {
       sessionId: SESSION,
       status: 'active',
       replyTargets: {
-        [TURN]: { senderOpenId: OWNER, participants: [{ openId: OWNER, isBot: false }] },
+        [TURN]: { senderOpenId: SENDER, participants: [{ openId: SENDER, isBot: false }] },
       },
     },
     reportedIdentityModel: { model: 'proven' },
+    ...(opts.previouslyPublished ? { lastPublishedIdentityModel: 'proven' } : {}),
     terminalIdentityTurnIds: new Set<string>(),
   };
   const deps: Record<string, any> = {
@@ -120,8 +130,10 @@ function world(opts: {
     allowsPersonalIdentityForTurn,
     parseScheduledTurnId,
     isHumanInboundTurnId,
-    isOwnerActorTurnId,
+    isPersonActorTurnId, isRunAsTurnId,
     isUnattendedIdentityTurnId,
+    resolveUnionIdFromOpenId: async () => opts.runAs?.unionId ?? null,
+    canOperate: () => opts.runAs?.operable() ?? false,
     trackTurnIdentityPublication,
     ownerActorIdentityRestores: new WeakMap(),
     prepareScheduledRecoveryRun: () => { throw new Error('unexpected schedule recovery'); },
@@ -267,5 +279,120 @@ describe('owner actor identity restoration — authority and timing fences', () 
     await Promise.all([first, second]);
     expect(resolveLarkCliHomeForTurn).toHaveBeenCalledTimes(1);
     expect(w.material()).toContain(`/home/${OWNER}`);
+  });
+});
+
+describe('runAs turn identity — the named person, re-admitted at publication', () => {
+  const PERSON = 'ou_runas_person';
+  const person = (operable: () => boolean = () => true, unionId: string | null = 'on_runas_person') =>
+    ({ person: PERSON, unionId, operable });
+
+  it('publishes the named person identity without needing the owner-actor opt-in', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ allowOwnerActor: false, runAs: person() });
+    await w.restore();
+    expect(w.material()).toContain(`/home/${PERSON}`);
+    expect(resolveLarkCliHomeForTurn).toHaveBeenCalledTimes(1);
+    expect(resolveLarkCliHomeForTurn).toHaveBeenCalledWith(PERSON);
+  });
+
+  it('withholds the identity when the person may no longer operate the bot', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ runAs: person(() => false) });
+    await w.restore();
+    expect(w.material()).toBeUndefined();
+    expect(w.activeTurns()).toEqual([]);
+    expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+  });
+
+  it('withholds the identity when the person cannot be resolved to a union id', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ runAs: person(() => true, null) });
+    await w.restore();
+    expect(w.material()).toBeUndefined();
+    expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+  });
+
+  it('removes a publication whose person loses access while credentials resolve', async () => {
+    const entered = deferred<void>();
+    const gate = deferred<string>();
+    resolveLarkCliHomeForTurn.mockImplementation(async () => { entered.resolve(); return gate.promise; });
+    let operable = true;
+    const w = world({ runAs: person(() => operable) });
+    const restoring = w.restore();
+    await entered.promise;
+    operable = false;
+    gate.resolve(`/home/${PERSON}`);
+    await restoring;
+    expect(w.material()).toBeUndefined();
+    expect(w.activeTurns()).toEqual([]);
+  });
+
+  it('never substitutes the bot owner or another person when the recorded person is missing', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ runAs: person() });
+    w.ds.session.replyTargets = { [RUN_AS_TURN]: {} };
+    await w.restore();
+    expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+    expect(w.material() ?? '').not.toContain('/home/');
+  });
+
+  it.each([
+    ['worker generation', (ds: any) => { ds.workerGeneration = 3; }],
+    ['dispatch attempt', (ds: any) => { ds.managedTurnOrigin = { turnId: RUN_AS_TURN, dispatchAttempt: 2 }; }],
+  ] as const)('removes a publication whose %s changed while credentials resolve', async (_label, advance) => {
+    const entered = deferred<void>();
+    const gate = deferred<string>();
+    resolveLarkCliHomeForTurn.mockImplementation(async () => { entered.resolve(); return gate.promise; });
+    const w = world({ runAs: person() });
+    w.ds.managedTurnOrigin = { turnId: RUN_AS_TURN, dispatchAttempt: 1 };
+    const restoring = w.restore();
+    await entered.promise;
+    advance(w.ds);
+    gate.resolve(`/home/${PERSON}`);
+    await restoring;
+    expect(w.material()).toBeUndefined();
+    expect(w.activeTurns()).toEqual([]);
+  });
+
+  it('requires the bot to have opted into trigger-user auth, but not allowOwnerActor', () => {
+    expect(allowsPersonalIdentityForTurn(RUN_AS_TURN, { enabled: true })).toBe(true);
+    expect(allowsPersonalIdentityForTurn(RUN_AS_TURN, { enabled: false, allowOwnerActor: true })).toBe(false);
+    expect(allowsPersonalIdentityForTurn(RUN_AS_TURN, undefined)).toBe(false);
+    expect(allowsPersonalIdentityForTurn(OWNER_TURN, { enabled: true })).toBe(false);
+  });
+});
+
+describe('person turns in a session that already published for an earlier turn', () => {
+  const PERSON = 'ou_runas_person';
+  const person = { person: PERSON, unionId: 'on_runas_person', operable: () => true };
+
+  it('publishes a runAs turn on its live origin', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ runAs: person, previouslyPublished: true });
+    await w.restore();
+    expect(w.material()).toContain(`/home/${PERSON}`);
+  });
+
+  it('publishes an owner turn on its live origin', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ previouslyPublished: true });
+    await w.restore();
+    expect(w.material()).toContain(`/home/${OWNER}`);
+  });
+
+  it('shares one publication across repeated origin events of the same turn', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ runAs: person, previouslyPublished: true });
+    await Promise.all([w.restore(), w.restore()]);
+    expect(resolveLarkCliHomeForTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('still leaves an ordinary synthetic trigger turn unpublished', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ turn: 'trg_plain_trigger', previouslyPublished: true });
+    await w.restore();
+    expect(w.material()).toBeUndefined();
+    expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
   });
 });

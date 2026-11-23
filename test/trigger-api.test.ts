@@ -99,6 +99,111 @@ describe('owner actor at the dashboard edge', () => {
   });
 });
 
+function runAsRequest(): Record<string, any> {
+  return {
+    runAs: 'ou_person',
+    source: { type: 'webhook', connectorId: 'example-connector' },
+    target: { kind: 'turn', botId: 'fixture-bot', chatId: 'oc_1' },
+    instruction: 'Check the build',
+    envelope: { format: 'text', sourceName: 'Example client', trusted: false },
+    presentation: { topicMessage: 'Build check', title: 'Build' },
+    options: { workingDir: '/repo', asyncReturnSessionId: true },
+  };
+}
+
+describe('runAs at the dashboard edge', () => {
+  const token = 'fixture-admin-token';
+  const gateInput = { method: 'POST', pathname: '/api/trigger', hasTokenParam: false, publicReadOnly: true, activeToken: token };
+  const platform = { userId: 'fixture-user', authSessionId: 'fixture-auth', expiresAt: 100,
+    previewCapability: 'operate' as const, canManageHost: true };
+
+  async function post(body: unknown, identity: Parameters<typeof resolveDashboardRequestGate>[0]['identity'], tokenFromRequest?: string) {
+    const gate = resolveDashboardRequestGate({ ...gateInput, identity, tokenFromRequest });
+    const req = Readable.from([Buffer.from(JSON.stringify(body))]) as unknown as IncomingMessage;
+    const writeHead = vi.fn();
+    const end = vi.fn();
+    const res = { writeHead, end } as unknown as ServerResponse;
+    const proxyToDaemon = vi.fn(async () => Response.json({ ok: true }));
+    if (gate.decision.kind === 'deny401') {
+      expect(await rejectActorOnDeniedTrigger(req, res)).toBe(true);
+    } else {
+      await handleDashboardTriggerApi(req, res, { proxyToDaemon }, gate.allowOwnerActor);
+    }
+    return { status: writeHead.mock.calls[0]?.[0], body: JSON.parse(end.mock.calls[0]?.[0]), proxyToDaemon };
+  }
+
+  it('forwards to the ordinary trigger route only with the local management credential', async () => {
+    const result = await post(runAsRequest(), null, token);
+    expect(result.status).toBe(200);
+    expect(result.proxyToDaemon).toHaveBeenCalledWith('fixture-bot', '/api/trigger', expect.objectContaining({
+      body: JSON.stringify(runAsRequest()),
+    }));
+  });
+
+  it('rejects public-read, H5, and platform management identities before proxying', async () => {
+    for (const [identity, presented] of [
+      [null, 'fixture-read-token'],
+      [{ ...platform, kind: 'feishu-h5' as const }, token],
+      [{ ...platform, kind: 'platform-dashboard' as const }, token],
+    ] as const) {
+      const result = await post(runAsRequest(), identity, presented);
+      expect(result).toMatchObject({ status: 403, body: { errorCode: 'actor_not_allowed' } });
+      expect(result.proxyToDaemon).not.toHaveBeenCalled();
+    }
+  });
+
+  it('rejects a runAs request that has no valid credential at all', async () => {
+    const result = await post(runAsRequest(), null, undefined);
+    expect(result).toMatchObject({ status: 403, body: { errorCode: 'actor_not_allowed' } });
+    expect(result.proxyToDaemon).not.toHaveBeenCalled();
+  });
+});
+
+describe('runAs request contract', () => {
+  it('accepts an open_id or an email and rejects every other shape', () => {
+    for (const runAs of ['ou_person', 'someone@example.com']) {
+      expect(validateTriggerRequest({ ...runAsRequest(), runAs }).ok).toBe(true);
+    }
+    for (const runAs of ['', 'on_union', 'ou_', 'two words@example.com', '@example.com', 'a@', 42, null, ['ou_person']]) {
+      const v = validateTriggerRequest({ ...runAsRequest(), runAs });
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+    }
+  });
+
+  it('refuses runAs combined with actor, a missing instruction, an event payload, steer, or a workflow target', () => {
+    const base = runAsRequest();
+    for (const body of [
+      { ...base, actor: 'owner', target: { ...base.target, sessionId: 'fixture-session' } },
+      { ...base, instruction: undefined },
+      { ...base, instruction: '   ' },
+      { ...base, envelope: { ...base.envelope, payload: { text: 'x' } } },
+      { ...base, envelope: { ...base.envelope, rawText: 'x' } },
+      { ...base, options: { ...base.options, steer: true } },
+      { ...base, target: { kind: 'workflow', botId: 'fixture-bot', workflowId: 'w' } },
+      { ...base, options: { turnIdempotencyKey: 'k', waitForFinalOutput: true }, target: { ...base.target, sessionId: 's' } },
+      { ...base, options: { turnIdempotencyKey: 'k' }, target: { ...base.target, sessionId: 's' } },
+    ]) {
+      const v = validateTriggerRequest(body);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+    }
+    expect(validateTriggerRequest({
+      ...base, options: { turnIdempotencyKey: 'k', asyncReturnSessionId: true }, target: { ...base.target, sessionId: 's' },
+    }).ok).toBe(true);
+  });
+
+  it('accepts the three call shapes of an external backend', () => {
+    const base = runAsRequest();
+    const topic = base;
+    const followUpInTopic = { ...base, target: { kind: 'turn', botId: 'fixture-bot', chatId: 'oc_1', rootMessageId: 'om_root' }, presentation: undefined, options: { asyncReturnSessionId: true } };
+    const followUpInSession = { ...base, target: { kind: 'turn', botId: 'fixture-bot', sessionId: 's1' }, presentation: undefined, options: undefined };
+    for (const body of [topic, followUpInTopic, followUpInSession]) {
+      expect(validateTriggerRequest(body).ok).toBe(true);
+    }
+  });
+});
+
 describe('trigger request contract', () => {
   it('accepts the P1 turn schema', () => {
     const v = validateTriggerRequest(request());

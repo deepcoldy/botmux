@@ -81,6 +81,15 @@ Direct 定时任务沿用持久化的可信创建者。模型翻转后的重发�
 - 请求体自带的 `ownerOpenId` / `ownerUnionId` 在宿主分支一律解构剥离，身份只来自上述校验结果；`creatorLarkAppId` 恒为执行 bot 自己。
 - 到点由 `resolveScheduledRunIdentity` 用同一个 `canOperate` 复核：通过则按该人发布凭证、不发卡；失权则照常进入 `creator_revoked` 认领流程（direct 任务可被认领）。
 
+### 触发 API 的 `runAs`
+
+`POST /api/trigger` 的顶层 `runAs`（`ou_` 或邮箱）让这一轮以指定的人执行，信任边界与 `--run-as` 相同：只有 Dashboard 管理员 token 和宿主签名的 IPC 调用可以带，免鉴权的 core-only 路由返回 403 `run_as_not_allowed`。
+
+- 请求时由 `resolveRunAs`（`src/core/run-as.ts`，定时任务宿主分支共用）完成邮箱解析、`union_id` 解析和 `canOperate`，失败分别是 403 `run_as_unresolved` / `run_as_not_allowed`。
+- 轮次 id 以 `trg_runas_` 开头；首轮（新话题或无会话的 `rootMessageId`）和已有会话追加都会把此人记为该轮 reply target 的发送者与 `trustedCaller`。
+- 发布凭证时（`refreshTurnCliIdentity` 的写前校验）对记录的发送者再做一次 `canOperate`，并核对轮次仍然存活、worker 代数和 dispatch attempt 未变；瞬时失败后的重试写入沿用同一道校验。任一失败就不发布，不会退回群主、发送者或创建者。同一轮内已写入凭证的续期不再核对，与 `--run-as` 定时任务一致。
+- 机器人需 `triggerUserAuth.enabled`，不需要 `allowOwnerActor`，`runAs` 指向机器人群主时也不需要（与 `--run-as` 语义一致）。此人只对该轮有效，后续人工消息按各自发送者发布。
+
 ### Dashboard 新建 / 编辑定时任务时的创建人
 
 Dashboard 有两种进入方式，记的创建人不同：

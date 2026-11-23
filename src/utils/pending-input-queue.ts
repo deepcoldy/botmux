@@ -5,7 +5,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
-import { isOwnerActorTurnId } from '../core/workflow-event-turn.js';
+import { isPersonActorTurnId } from '../core/workflow-event-turn.js';
 import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export interface PendingCliInput {
@@ -156,7 +156,7 @@ export function mergeQueuedCliInput(
   const sourceIds = (item: PendingCliInput) => item.structuredSourceTurnIds ?? (item.turnId ? [item.turnId] : []);
   tail.structuredSourceTurnIds = [...sourceIds(tail), ...sourceIds(next)];
   tail.content = `${tail.content}\n\n${next.content}`;
-  if (!isOwnerActorTurnId(tail.turnId) || isOwnerActorTurnId(next.turnId)) {
+  if (!isPersonActorTurnId(tail.turnId) || isPersonActorTurnId(next.turnId)) {
     tail.turnId = next.turnId ?? tail.turnId;
   }
   return true;

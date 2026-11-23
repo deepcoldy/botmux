@@ -112,6 +112,16 @@ Requests go to the Dashboard (default port `7891`) and use the Dashboard login t
 }
 ```
 
+**`runAs` (optional, top-level)**: run this turn as a named person, so the bot's tools (bytedcli / lark-cli, Meego, Bits) act as that person. The value is an `ou_` open_id or an email; the semantics match `botmux schedule add --run-as`.
+
+- Only the local Dashboard administrator token may send it; any other credential gets 403 `actor_not_allowed`. Webhook connectors don't support it.
+- At request time the email is resolved to an open_id under this bot, and the person must currently be allowed to operate the bot in the target chat: unresolvable → 403 `run_as_unresolved`, not allowed → 403 `run_as_not_allowed`. The person is checked again before every credential write (including the write of a retry after a transient failure); on failure the turn's tools are refused and never fall back to the bot owner, the sender, or the creator. Renewal of an already-written credential within the same turn is not re-checked, same as `schedule add --run-as`.
+- The bot needs `triggerUserAuth.enabled`; `allowOwnerActor` is not required, and naming the bot owner in `runAs` does not need it either (same semantics as `schedule add --run-as`).
+- It applies only to the triggered turn. Later human messages in the same session keep their own sender's identity.
+- Requires `target.kind: "turn"` and a non-empty `instruction`; cannot carry `envelope.payload` / `envelope.rawText`, cannot be combined with `actor` or `options.steer`, and `turnIdempotencyKey` requires `asyncReturnSessionId`. The `instruction` is delivered as the task as-is, without the external-event wrapper.
+- Three target shapes work: a new topic in a real chat (`chatId` + `presentation.topicMessage` / `title` + `options.workingDir`), a follow-up in an existing topic (`chatId` + `rootMessageId`, with or without a session), and a follow-up in an existing session (`sessionId`). Both fire-and-forget and async modes are supported.
+- New sessions never get an auto-worktree; assistant-mode chats and virtual sessions (no `chatId`) are not supported.
+
 ### 4.1 `source`
 
 | Field | Required | Notes |
@@ -605,6 +615,9 @@ If there was no result before closing, polling afterwards returns `state: "faile
 | 400 | `bot_not_found` | `botId` doesn't match this daemon |
 | 403 | `bot_not_in_chat` | Bot isn't in the target group |
 | 403 | `working_dir_not_allowed` | An unauthenticated call carried `options.workingDir` (see §5.7) |
+| 403 | `actor_not_allowed` | A non-administrator token carried `actor` or `runAs` |
+| 403 | `run_as_unresolved` | The `runAs` person could not be resolved (see §4) |
+| 403 | `run_as_not_allowed` | The `runAs` person may not operate the bot in the target chat, or an unauthenticated call carried `runAs` |
 | 404 | `session_not_found` | `target.sessionId` doesn't exist |
 | 409 | `idempotency_conflict` | Same key, different content |
 | 410 | `legacy_workflow_retired` | `target.kind: "workflow"` (retired) |

@@ -29,6 +29,7 @@ import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, 
 import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
 import { canOperate } from '../im/lark/event-dispatcher.js';
+import { resolveRunAs } from './run-as.js';
 import {
   DASHBOARD_SCHEDULE_CREATOR_HEADER,
   dashboardCreatorFromRequest,
@@ -8895,6 +8896,9 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, owner
   if (valid.request.options?.workingDir !== undefined && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, errorCode: 'working_dir_not_allowed' });
   }
+  if (valid.request.runAs !== undefined && !isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'run_as_not_allowed' });
+  }
   if (valid.request.target.botId && valid.request.target.botId !== cachedLarkAppId) {
     return jsonRes(res, 400, {
       ok: false,
@@ -8922,7 +8926,10 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, owner
         error: 'active session registry unavailable',
       });
     }
-    const result = await triggerSessionTurn(valid.request, { larkAppId: cachedLarkAppId, activeSessions });
+    const result = await triggerSessionTurn(valid.request, {
+      larkAppId: cachedLarkAppId, activeSessions,
+      resolveRunAs: (chatId: string, runAs: string) => resolveRunAs(cachedLarkAppId, chatId, runAs),
+    });
     const status = result.ok
       ? 200
       // An idempotent retry that resolves to a durable `failed` async state is a
@@ -8935,6 +8942,7 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, owner
       : ownerActorEndpoint && result.errorCode === 'session_not_runnable'
         ? 409
       : result.errorCode === 'bot_not_in_chat' || result.errorCode === 'owner_unresolved'
+        || result.errorCode === 'run_as_not_allowed' || result.errorCode === 'run_as_unresolved'
         ? 403
         : result.errorCode === 'session_not_found'
           ? 404

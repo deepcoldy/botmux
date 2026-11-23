@@ -627,3 +627,34 @@ describe('the Meego switch on the retry path', () => {
     expect(await recovered(['bytecloud', 'meego'])).toContain('BOTMUX_MEEGO_HOME=');
   });
 });
+
+describe('person turns: the publication fence also guards the retry write', () => {
+  const PERSON_TURN = 'trg_runas_retry';
+  const publishWithFence = (validateBeforeWrite: () => boolean) => publishTurnCliIdentity({
+    botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE, turnId: PERSON_TURN,
+    storageModel: 'proven', validateBeforeWrite,
+  });
+  const body = () => recallProvenIdentityContent(dir, SESSION, PERSON_TURN, 'bytedcli') ?? '';
+  const retryPerson = () => retryTransientTurnIdentity({
+    sessionDataDir: dir, sessionId: SESSION, turnId: PERSON_TURN, tool: 'bytedcli', botConfig: config,
+  });
+
+  it('does not write the recovered credential once the fence turns false', async () => {
+    responses = [NETWORK_DOWN, GRANTED];
+    let admitted = true;
+    await publishWithFence(() => admitted);
+    expect(body()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    admitted = false;
+    await retryPerson();
+    expect(grantCalls).toBe(2);
+    expect(body()).not.toContain('cloud-jwt');
+    expect(body()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+  });
+
+  it('still writes the recovered credential while the fence holds', async () => {
+    responses = [NETWORK_DOWN, GRANTED];
+    await publishWithFence(() => true);
+    await retryPerson();
+    expect(body()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+  });
+});

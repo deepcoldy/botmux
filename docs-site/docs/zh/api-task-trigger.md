@@ -112,6 +112,16 @@ curl "http://<daemon-host>:7891/api/sessions/2eed60c4-.../trigger-result" \
 }
 ```
 
+**`runAs`（可选，顶层字段）**：让这一轮以指定的人的身份执行，机器人调用的 bytedcli / lark-cli、Meego、Bits 等工具都以这个人的身份操作。取值是 `ou_` 开头的 open_id 或邮箱，效果等同 `botmux schedule add --run-as`。
+
+- 只有 Dashboard 管理员 token（本机管理凭证）可以带；其它凭证带了返回 403 `actor_not_allowed`。Webhook 接入点不支持。
+- 请求时先把邮箱换成这个机器人下的 open_id，并要求此人当前可以在目标群操作这个机器人：解析不出来 → 403 `run_as_unresolved`，无权操作 → 403 `run_as_not_allowed`。每次写入工具凭证前（含瞬时失败后的重试写入）会再核对一次，失败时这一轮的工具直接被拒，不会换成群主、发送者或创建者的身份。同一轮内已写入凭证的续期不会再核对，与 `schedule add --run-as` 一致。
+- 机器人需要开启 `triggerUserAuth.enabled`，不需要 `allowOwnerActor`；`runAs` 指向机器人群主时同样不需要，语义与 `schedule add --run-as` 相同。
+- 只作用于这一次触发的轮次，同一会话里之后的人工消息仍用各自发送者的身份。
+- 要求 `target.kind` 为 `turn`、`instruction` 非空；不能带 `envelope.payload` / `envelope.rawText`，不能和 `actor`、`options.steer` 同用，带 `turnIdempotencyKey` 时必须同时 `asyncReturnSessionId`。`instruction` 原样作为任务发给机器人，不套外部事件包装。
+- 支持三种目标：真群里开新话题（`chatId` + `presentation.topicMessage` / `title` + `options.workingDir`）、追加到已有话题（`chatId` + `rootMessageId`，会话有无都可以）、追加到已有会话（`sessionId`）。即发即忘和异步模式都可用。
+- 新会话不会自动建 worktree，个人助理模式的群不支持，虚拟会话（不传 `chatId`）不支持。
+
 ### 4.1 `source`
 
 | 字段 | 必填 | 说明 |
@@ -605,6 +615,9 @@ curl -X POST "http://<host>:7891/api/sessions/:sessionId/close" \
 | 400 | `bot_not_found` | `botId` 和这个 daemon 对不上 |
 | 403 | `bot_not_in_chat` | 机器人不在目标群 |
 | 403 | `working_dir_not_allowed` | 免鉴权调用带了 `options.workingDir`（见 §5.7） |
+| 403 | `actor_not_allowed` | 非管理员 token 带了 `actor` 或 `runAs` |
+| 403 | `run_as_unresolved` | `runAs` 的人解析不出来（见 §4） |
+| 403 | `run_as_not_allowed` | `runAs` 的人无权在目标群操作该机器人，或免鉴权调用带了 `runAs` |
 | 404 | `session_not_found` | `target.sessionId` 不存在 |
 | 409 | `idempotency_conflict` | 同键不同内容 |
 | 410 | `legacy_workflow_retired` | `target.kind: "workflow"`（已退役） |

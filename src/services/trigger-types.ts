@@ -15,8 +15,19 @@ export type LegacyWorkflowRetirementReason =
   | 'changed_after_migration'
   | 'identity_conflict';
 
+/** Shape of a `runAs` person: an app-scoped open_id or an email. One pattern
+ *  for the trigger API and `botmux schedule add --run-as`. */
+export const RUN_AS_PATTERN = /^(ou_[A-Za-z0-9_-]{1,160}|[^\s@]{1,128}@[^\s@]{1,128})$/;
+
 export interface TriggerRequest {
   actor?: 'owner';
+  /** Run this one turn under a named person (open_id or email): the bot's tools
+   *  (bytedcli / lark-cli / Meego / Bits) act as that person. Same trust
+   *  boundary as `botmux schedule add --run-as`: only the local Dashboard
+   *  administrator token and trusted host IPC may set it, and the person must
+   *  be allowed to operate this bot in the target chat. Mutually exclusive
+   *  with `actor`. The person applies to this turn only. */
+  runAs?: string;
   source: {
     type: TriggerSourceType;
     connectorId?: string;
@@ -140,6 +151,8 @@ export type TriggerErrorCode =
   | 'bad_request'
   | 'actor_not_allowed'
   | 'working_dir_not_allowed'
+  | 'run_as_not_allowed'
+  | 'run_as_unresolved'
   | 'owner_unresolved'
   | 'bot_not_found'
   | 'bot_not_in_chat'
@@ -262,6 +275,12 @@ export function hasTriggerActor(raw: unknown): boolean {
   return isRecord(raw) && Object.hasOwn(raw, 'actor');
 }
 
+/** A request that claims a caller identity (`actor` or `runAs`); only the local
+ *  Dashboard administrator token may send one. */
+export function hasTriggerIdentityClaim(raw: unknown): boolean {
+  return hasTriggerActor(raw) || (isRecord(raw) && Object.hasOwn(raw, 'runAs'));
+}
+
 export function validateTriggerRequest(raw: unknown): { ok: true; request: TriggerRequest } | { ok: false; status: number; body: TriggerResponse } {
   if (!isRecord(raw)) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'request body must be an object' } };
@@ -280,6 +299,24 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
       || typeof target.sessionId !== 'string' || !target.sessionId.trim()
       || typeof raw.instruction !== 'string' || !raw.instruction.trim()) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'owner actor requires a turn target with botId, sessionId, and a non-empty instruction' } };
+    }
+  }
+  if (Object.hasOwn(raw, 'runAs')) {
+    if (typeof raw.runAs !== 'string' || !RUN_AS_PATTERN.test(raw.runAs)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'runAs must be an ou_ open_id or an email address' } };
+    }
+    if (hasTriggerActor(raw)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'runAs and actor are mutually exclusive' } };
+    }
+    if (target.kind !== 'turn' || typeof raw.instruction !== 'string' || !raw.instruction.trim()
+      || Object.hasOwn(envelope, 'payload') || Object.hasOwn(envelope, 'rawText')) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'runAs requires a turn target with a non-empty instruction and cannot carry envelope.payload or envelope.rawText' } };
+    }
+    if (isRecord(raw.options) && raw.options.steer === true) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'runAs is not supported with options.steer: a steered turn would merge into another principal\'s turn' } };
+    }
+    if (isRecord(raw.options) && raw.options.turnIdempotencyKey !== undefined && raw.options.asyncReturnSessionId !== true) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'runAs with options.turnIdempotencyKey requires options.asyncReturnSessionId' } };
     }
   }
   // An unknown source.type must fail at the edge: triggerSessionTurn records

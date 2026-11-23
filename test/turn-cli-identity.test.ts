@@ -65,7 +65,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
 const { clearRestoredLapses, unattendedTask, deliverUnattendedLapse, __resetUnattendedNoticesForTest } = await import('../src/core/capability-authorization.js');
-const { allowsPersonalIdentityForTurn, isOwnerActorTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
+const { allowsPersonalIdentityForTurn, isPersonActorTurnId, isRunAsTurnId, isUnattendedIdentityTurnId } = await import('../src/core/workflow-event-turn.js');
 const { writeSessionIdentity, recallProvenIdentityContent, rememberProvenIdentityContent, renderIdentityWrapper, sessionIdentityPath } = await import('../src/core/cli-identity.js');
 const { renewExpiringBytedcliIdentities, trackedBytedcliRenewalCount, forgetBytedcliIdentityRenewals } = await import('../src/core/bytedcli-identity-renewal.js');
 const { renewBytedcliJwts } = await import('../src/services/bytedcli-auth.js');
@@ -641,7 +641,7 @@ describe('target daemon consumes signed message authority', () => {
         return new Set(options.member === false ? [] : ['ou_alice_target']);
       },
       publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en',
-      clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, allowsPersonalIdentityForTurn, isOwnerActorTurnId,
+      clearRestoredLapses, unattendedTask, isUnattendedIdentityTurnId, allowsPersonalIdentityForTurn, isPersonActorTurnId, isRunAsTurnId,
       // This harness never configures an ownerOpenId; non-owner turns do not
       // evaluate the owner-only fence, and an owner fixture would be unresolved.
       getStrictOwnerOpenId: () => undefined,

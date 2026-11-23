@@ -1,7 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
-import { hasTriggerActor, validateTriggerRequest } from '../services/trigger-types.js';
+import { hasTriggerIdentityClaim, validateTriggerRequest } from '../services/trigger-types.js';
 import {
   appendTriggerLog,
   type TriggerLogRequest,
@@ -192,8 +192,8 @@ export async function handleDashboardTriggerApi(
     return jsonRes(res, 400, { ok: false, errorCode: 'bad_json', error });
   }
 
-  if (!allowOwnerActor && hasTriggerActor(raw)) {
-    return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed', error: 'actor requires the local Dashboard administrator token' });
+  if (!allowOwnerActor && hasTriggerIdentityClaim(raw)) {
+    return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed', error: 'actor and runAs require the local Dashboard administrator token' });
   }
   const valid = validateTriggerRequest(raw);
   if (!valid.ok) return jsonRes(res, valid.status, valid.body);
@@ -205,7 +205,7 @@ export async function handleDashboardTriggerApi(
 
 export async function rejectActorOnDeniedTrigger(req: IncomingMessage, res: ServerResponse): Promise<boolean> {
   const raw = await readJsonBodyWithLimit(req).catch(() => undefined);
-  if (!hasTriggerActor(raw)) return false;
-  jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed', error: 'actor requires the local Dashboard administrator token' });
+  if (!hasTriggerIdentityClaim(raw)) return false;
+  jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed', error: 'actor and runAs require the local Dashboard administrator token' });
   return true;
 }

@@ -14,6 +14,7 @@ import * as oncallStore from '../services/oncall-store.js';
 import { randomUUID } from 'node:crypto';
 import { getBot, getStrictOwnerOpenId, effectiveDefaultWorkingDir } from '../bot-registry.js';
 import { resolveSender, type ResolvedSender } from '../im/lark/identity-cache.js';
+import type { RunAsResolution } from './run-as.js';
 import { beginReplyTargetTurn } from './reply-target.js';
 import { renderInboundMessageLocation } from './reply-message.js';
 import { getChatMode, getMessageChatId, sendMessage, replyMessage, type ChatMode } from '../im/lark/client.js';
@@ -54,6 +55,9 @@ import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updat
 export interface TriggerSessionDeps {
   larkAppId: string;
   activeSessions: Map<string, DaemonSession>;
+  /** Admission of a request's `runAs` person for a chat. Supplied by the trusted
+   *  host IPC route only; a request carrying `runAs` is refused without it. */
+  resolveRunAs?: (chatId: string, runAs: string) => Promise<RunAsResolution>;
 }
 
 /** Daemon-internal dispatch controls. These deliberately do not live in the
@@ -883,7 +887,7 @@ function stageTriggerReadModel(ds: DaemonSession, req: TriggerRequest, turnId: s
   if (ds.session.status === 'closed') return;
   try {
     stageSessionTurnInbound(config.session.dataDir, ds.session.sessionId, turnId, {
-      via: owner ? 'owner_actor' : 'trigger',
+      via: req.actor === 'owner' ? 'owner_actor' : 'trigger',
       messageId: turnId,
       text: req.instruction ?? '',
       ...(owner ? { sender: { type: 'user', openId: owner.openId, name: owner.name } } : {}),
@@ -903,7 +907,9 @@ async function triggerSessionTurnAdmitted(
 ): Promise<TriggerResponse> {
   const stableTurnId = internal?.stableTurnId?.trim();
   const ownerActor = req.actor === 'owner';
-  const triggerId = stableTurnId || `trg_${ownerActor ? 'owner_' : ''}${randomUUID()}`;
+  const runAs = req.runAs;
+  const personActor = ownerActor || runAs !== undefined;
+  const triggerId = stableTurnId || `trg_${ownerActor ? 'owner_' : runAs !== undefined ? 'runas_' : ''}${randomUUID()}`;
   rememberTriggerTurn(triggerId, req.source.type);
   // HTTP opt-in for codex-app native in-flight steer (turn/steer). The flag is
   // pure AUTHORIZATION forwarded to the worker — the live runner decides whether
@@ -1062,7 +1068,7 @@ async function triggerSessionTurnAdmitted(
   }
 
   const dryRun = !!req.options?.dryRun;
-  const promptForSession = (target?: DaemonSession) => ownerActor ? req.instruction! : zeroPromptInjectionForBot(larkAppId, undefined,
+  const promptForSession = (target?: DaemonSession) => personActor ? req.instruction! : zeroPromptInjectionForBot(larkAppId, undefined,
     target ? sessionPromptInjection(target) : undefined)
     ? buildZeroInjectionTriggerPrompt(req)
     : buildUntrustedEventPrompt(req, triggerId);
@@ -1070,11 +1076,11 @@ async function triggerSessionTurnAdmitted(
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
   const hasExplicitTopicMessage = typeof req.presentation?.topicMessage === 'string'
     && req.presentation.topicMessage.trim().length > 0;
-  const codexAppText = ownerActor ? prompt : buildExternalEventVisibleText(req, larkAppId);
+  const codexAppText = personActor ? prompt : buildExternalEventVisibleText(req, larkAppId);
   const {
     application: codexAppApplicationContext,
     message: codexAppMessageContext,
-  } = ownerActor ? { application: '', message: '' } : buildExternalEventCodexAppContexts(req, triggerId);
+  } = personActor ? { application: '', message: '' } : buildExternalEventCodexAppContexts(req, triggerId);
   const promptPreview = prompt.length > 4000 ? prompt.slice(0, 4000) + '\n...[truncated]' : prompt;
 
   // ── Idempotency (fresh async virtual only — validator guarantees the shape) ──
@@ -1098,6 +1104,7 @@ async function triggerSessionTurnAdmitted(
     ? computeInputHash({
         instruction: req.instruction ?? null,
         ...(req.payloadTrusted ? { payloadTrusted: true } : {}),
+        ...(runAs !== undefined ? { runAs } : {}),
         envelope: req.envelope,
         source: req.source,
         presentation: req.presentation ?? null,
@@ -1198,6 +1205,7 @@ async function triggerSessionTurnAdmitted(
     ? computeInputHash({
         seam: 'turn',
         ...(req.actor ? { actor: req.actor } : {}),
+        ...(req.runAs !== undefined ? { runAs: req.runAs } : {}),
         sessionId: req.target.sessionId ?? null,
         instruction: req.instruction ?? null,
         ...(req.payloadTrusted ? { payloadTrusted: true } : {}),
@@ -1339,7 +1347,7 @@ async function triggerSessionTurnAdmitted(
     };
   }
 
-  let chatId = ownerActor ? ds?.chatId : req.target.chatId ?? ds?.chatId;
+  let chatId = ownerActor || (runAs !== undefined && req.target.sessionId) ? ds?.chatId : req.target.chatId ?? ds?.chatId;
   if (rootMessageId && !req.target.sessionId) {
     const rootTarget = await validateRootMessageTarget(larkAppId, chatId, rootMessageId);
     if (!rootTarget.ok) {
@@ -1374,6 +1382,22 @@ async function triggerSessionTurnAdmitted(
   }
   if (!inChat) {
     return { ok: false, errorCode: 'bot_not_in_chat', error: `bot ${larkAppId} is not in chat ${chatId}` };
+  }
+  let runAsPerson: ResolvedSender | undefined;
+  if (runAs !== undefined) {
+    if (httpVirtual || !deps.resolveRunAs) {
+      return { ok: false, errorCode: 'bad_request', error: 'runAs requires a real chat target and a trusted host caller' };
+    }
+    const admitted = await deps.resolveRunAs(chatId, runAs);
+    if (!admitted.ok) {
+      return admitted.reason === 'invalid'
+        ? { ok: false, errorCode: 'bad_request', error: 'runAs must be an ou_ open_id or an email address' }
+        : admitted.reason === 'unresolved'
+          ? { ok: false, errorCode: 'run_as_unresolved', error: 'runAs person could not be resolved to a user of this bot' }
+          : { ok: false, errorCode: 'run_as_not_allowed', error: 'runAs person is not allowed to operate this bot in the target chat' };
+    }
+    runAsPerson = await resolveSender(larkAppId, admitted.openId, 'user').catch(() => undefined)
+      ?? { openId: admitted.openId, type: 'user' as const };
   }
 
   // Mirror the inbound @ routing: a 普通群 in `new-topic` mode forks a fresh
@@ -1417,8 +1441,8 @@ async function triggerSessionTurnAdmitted(
     const owner = ownerOpenId
       ? await resolveSender(larkAppId, ownerOpenId, 'user').catch(() => undefined)
         ?? { openId: ownerOpenId, type: 'user' as const }
-      : undefined;
-    if (owner && getStrictOwnerOpenId(larkAppId) !== owner.openId) return ownerUnresolved();
+      : runAsPerson;
+    if (ownerOpenId && getStrictOwnerOpenId(larkAppId) !== owner?.openId) return ownerUnresolved();
     // Ownership guard (PR #597): the target must still be the live, registered
     // occupant before we dispatch. Validate by object identity at its canonical
     // key AND — because a session can legitimately be reached via a non-canonical
@@ -1440,7 +1464,7 @@ async function triggerSessionTurnAdmitted(
     }
     const workerIsLive = !!target.worker && !target.worker.killed;
     if (owner && hasQueuedActivationAdmissionGate(target)) {
-      return { ok: false, triggerId, errorCode: 'session_not_runnable', error: 'wait for the session activation to complete before sending as owner' };
+      return { ok: false, triggerId, errorCode: 'session_not_runnable', error: 'wait for the session activation to complete before sending as a named person' };
     }
     if (!workerIsLive && (target.pendingRepo || target.initialStartPending
       || target.worktreeCreating || target.session.queued
@@ -1917,6 +1941,9 @@ async function triggerSessionTurnAdmitted(
   if (assistantSpawn.kind === 'owner' && req.options?.workingDir !== undefined) {
     return { ok: false, errorCode: 'bad_request', error: 'assistant mode: options.workingDir is not supported; the session runs in the chat owner work dir' };
   }
+  if (assistantSpawn.kind === 'owner' && runAs !== undefined) {
+    return { ok: false, errorCode: 'bad_request', error: 'assistant mode: runAs is not supported; the session belongs to the chat owner' };
+  }
   const wd = assistantSpawn.kind === 'owner'
     ? { ok: true as const, workingDir: assistantSpawn.workDir, fromBotDefault: false }
     : resolvedWd;
@@ -1967,6 +1994,7 @@ async function triggerSessionTurnAdmitted(
     && !req.options?.waitForFinalOutput
     && !req.options?.asyncReturnSessionId
     && !stableTurnId
+    && runAs === undefined
     && wd.fromBotDefault
     && botAutoWorktreeEnabled(larkAppId);
 
@@ -2161,9 +2189,9 @@ async function triggerSessionTurnAdmitted(
     });
     throw err;
   }
-  stageTriggerReadModel(newDs, req, triggerId);
-  const promptInput = buildNewTopicCliInput(
-    prompt,
+  const newTurnRoot = scope === 'thread' ? anchor : undefined;
+  stageTriggerReadModel(newDs, req, triggerId, runAsPerson, newTurnRoot);
+  const promptInput = buildNewTopicCliInput(    prompt,
     session.sessionId,
     session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
     session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,
@@ -2202,6 +2230,17 @@ async function triggerSessionTurnAdmitted(
   // (codex canSteer requires the root itself to be positively authorized), so a
   // later follow-up can natively turn/steer into it. No-op for non-codex CLIs.
   if (steerRequested) promptInput.codexAppSteerable = true;
+  if (runAsPerson) {
+    // The opening turn belongs to the named person: its reply target records them
+    // as the sender (identity publication reads it) and the worker acts for them.
+    promptInput.trustedCaller = { requestLarkAppId: larkAppId, requestUserOpenId: runAsPerson.openId, senderType: 'user' };
+    beginReplyTargetTurn(newDs, newTurnRoot, triggerId, undefined, {
+      senderOpenId: runAsPerson.openId,
+      participants: [{ openId: runAsPerson.openId, name: runAsPerson.name, isBot: false }],
+      synthetic: true,
+    });
+    sessionStore.updateSession(session);
+  }
   rememberInput(newDs, prompt, promptInput);
 
   const releaseInitialReservation = (): void => {
@@ -2490,6 +2529,9 @@ export async function triggerSessionTurn(
   const result = await withBotTurnAdmission(
     deps.larkAppId,
     () => {
+      if (req.runAs !== undefined && req.options?.turnIdempotencyKey && !req.options.asyncReturnSessionId) {
+        return Promise.resolve<TriggerResponse>({ ok: false, errorCode: 'bad_request', error: 'runAs with turnIdempotencyKey requires asyncReturnSessionId' });
+      }
       if (!req.options?.turnIdempotencyKey || req.options.asyncReturnSessionId) {
         return triggerSessionTurnAdmitted(req, deps, internal);
       }

@@ -489,6 +489,170 @@ describe('triggerSessionTurn rootMessageId target', () => {
     }
   });
 
+  describe('runAs', () => {
+    const PERSON = 'ou_runas_person';
+    const admit = vi.fn(async (_chatId: string, _runAs: string): Promise<any> => ({ ok: true, openId: PERSON, unionId: 'on_runas_person' }));
+
+    function runAsRequest(target: Partial<TriggerRequest['target']> = {}, options: TriggerRequest['options'] = {}): TriggerRequest {
+      return {
+        runAs: 'person@example.com',
+        source: { type: 'webhook', connectorId: 'platform' },
+        target: { kind: 'turn', botId: APP, chatId: CHAT, ...target },
+        instruction: 'Check the build',
+        envelope: { format: 'text', sourceName: 'platform', trusted: false },
+        presentation: { topicMessage: 'Build check', title: 'Build' },
+        options,
+      };
+    }
+    const deps = (activeSessions: Map<string, DaemonSession>) => ({ larkAppId: APP, activeSessions, resolveRunAs: admit });
+
+    beforeEach(() => {
+      admit.mockClear();
+      admit.mockResolvedValue({ ok: true, openId: PERSON, unionId: 'on_runas_person' });
+      vi.mocked(resolveSender).mockResolvedValue({ openId: PERSON, type: 'user', name: 'Runner' } as any);
+    });
+
+    it('opens a new topic whose first turn belongs to the named person, in the requested directory', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'trigger-runas-'));
+      try {
+        const activeSessions = new Map<string, DaemonSession>();
+        const res = await triggerSessionTurn(runAsRequest({}, { workingDir: dir }), deps(activeSessions));
+        expect(res).toMatchObject({ ok: true, action: 'queued' });
+        expect(admit).toHaveBeenCalledWith(CHAT, 'person@example.com');
+        const ds = activeSessions.get(sessionKey('om_new_topic', APP))!;
+        const turnId = res.triggerId!;
+        expect(turnId).toMatch(/^trg_runas_/);
+        expect(ds.session.workingDir).toBe(dir);
+        expect(ds.session.replyTargets?.[turnId]?.senderOpenId).toBe(PERSON);
+        expect(Object.keys(ds.session.replyTargets ?? {})).toEqual([turnId]);
+        expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('Check the build');
+        const [, input, forkTurn] = mockForkWorker.mock.calls.at(-1)!;
+        expect(forkTurn).toBe(turnId);
+        expect(input.trustedCaller).toEqual({ requestLarkAppId: APP, requestUserOpenId: PERSON, senderType: 'user' });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('starts the person turn of a rootMessageId that has no session yet', async () => {
+      const activeSessions = new Map<string, DaemonSession>();
+      const res = await triggerSessionTurn(runAsRequest({ rootMessageId: ROOT }), deps(activeSessions));
+      expect(res).toMatchObject({ ok: true });
+      const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+      expect(res.triggerId).toMatch(/^trg_runas_/);
+      expect(ds.session.replyTargets?.[res.triggerId!]?.senderOpenId).toBe(PERSON);
+      expect(mockSendMessage).not.toHaveBeenCalled();
+    });
+
+    it('supports the asyncReturnSessionId mode on a new topic', async () => {
+      const activeSessions = new Map<string, DaemonSession>();
+      const res = await triggerSessionTurn(runAsRequest({}, { asyncReturnSessionId: true }), deps(activeSessions));
+      expect(res).toMatchObject({ ok: true, async: { status: 'pending', sessionId: 'sess_new' } });
+      const [, input, forkTurn] = mockForkWorker.mock.calls.at(-1)!;
+      expect(forkTurn).toBe(res.triggerId);
+      expect(res.triggerId).toMatch(/^trg_runas_/);
+      expect(input.trustedCaller.requestUserOpenId).toBe(PERSON);
+    });
+
+    it('runs a follow-up in an existing session as the person for that turn only', async () => {
+      const send = vi.fn();
+      const ds = existingDs({ worker: { send } as any });
+      ds.session.replyTargets = { om_human_before: { senderOpenId: 'ou_someone_else' } } as any;
+      const res = await triggerSessionTurn(
+        runAsRequest({ chatId: undefined, sessionId: 'sess_existing' }, { asyncReturnSessionId: true }),
+        deps(new Map([[sessionKey(ROOT, APP), ds]])),
+      );
+      expect(res).toMatchObject({ ok: true });
+      const turn = send.mock.calls[0]![0] as PendingCliInput;
+      expect(turn.turnId).toMatch(/^trg_runas_/);
+      expect(turn.turnCallerOpenId).toBe(PERSON);
+      expect(turn.trustedCaller?.requestUserOpenId).toBe(PERSON);
+      expect(Object.keys(ds.session.replyTargets!).sort()).toEqual(['om_human_before', turn.turnId].sort());
+      expect(ds.session.replyTargets!.om_human_before!.senderOpenId).toBe('ou_someone_else');
+      const queue = [{ ...turn }];
+      expect(mergeQueuedCliInput(queue, {
+        content: 'From chat', turnId: 'om_same_person', trustedCaller: turn.trustedCaller, turnCallerOpenId: PERSON,
+      })).toBe(true);
+      expect(queue[0]?.turnId).toBe(turn.turnId);
+    });
+
+    it('admits the person against the chat of the addressed session, not a caller-supplied chat', async () => {
+      const ds = existingDs({ worker: { send: vi.fn() } as any });
+      await triggerSessionTurn(
+        runAsRequest({ chatId: 'oc_other_chat', sessionId: 'sess_existing' }),
+        deps(new Map([[sessionKey(ROOT, APP), ds]])),
+      );
+      expect(admit).toHaveBeenCalledWith(CHAT, 'person@example.com');
+    });
+
+    it.each([
+      ['unresolved', 'run_as_unresolved'],
+      ['not_allowed', 'run_as_not_allowed'],
+      ['invalid', 'bad_request'],
+    ] as const)('refuses a %s person before any chat side effect', async (reason, errorCode) => {
+      admit.mockResolvedValue({ ok: false, reason });
+      const activeSessions = new Map<string, DaemonSession>();
+      const res = await triggerSessionTurn(runAsRequest(), deps(activeSessions));
+      expect(res).toMatchObject({ ok: false, errorCode });
+      expect(activeSessions.size).toBe(0);
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      expect(mockCreateSession).not.toHaveBeenCalled();
+      expect(mockForkWorker).not.toHaveBeenCalled();
+    });
+
+    it('refuses runAs when the caller supplied no admission (untrusted route)', async () => {
+      const res = await triggerSessionTurn(runAsRequest(), { larkAppId: APP, activeSessions: new Map() });
+      expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+      expect(mockSendMessage).not.toHaveBeenCalled();
+      expect(mockForkWorker).not.toHaveBeenCalled();
+    });
+
+    it('refuses runAs on a virtual (no real chat) session', async () => {
+      const activeSessions = new Map<string, DaemonSession>();
+      const res = await triggerSessionTurn(
+        runAsRequest({ chatId: undefined }, { asyncReturnSessionId: true }), deps(activeSessions),
+      );
+      expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+      expect(admit).not.toHaveBeenCalled();
+      expect(activeSessions.size).toBe(0);
+      expect(mockForkWorker).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a synchronous turnIdempotencyKey', { turnIdempotencyKey: 'k1' }],
+      ['a waiting turnIdempotencyKey', { turnIdempotencyKey: 'k1', waitForFinalOutput: true }],
+    ] as const)('refuses runAs with %s without asyncReturnSessionId', async (_label, options) => {
+      const ds = existingDs({ worker: { send: vi.fn() } as any });
+      const res = await triggerSessionTurn(
+        runAsRequest({ chatId: undefined, sessionId: 'sess_existing' }, options),
+        deps(new Map([[sessionKey(ROOT, APP), ds]])),
+      );
+      expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+      expect(ds.session.replyTargets).toBeUndefined();
+    });
+
+    it('does not turn a runAs session into an auto-worktree', async () => {
+      mockBotAutoWorktreeEnabled.mockReturnValue(true);
+      const activeSessions = new Map<string, DaemonSession>();
+      await triggerSessionTurn(runAsRequest({ rootMessageId: ROOT }), deps(activeSessions));
+      expect(mockRunAutoWorktreeCommit).not.toHaveBeenCalled();
+      expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it('assistant mode refuses runAs without creating a session', async () => {
+      try {
+        assistant.spawn = { kind: 'owner', openId: 'ou_owner_a', workDir: '/home/u/ou_owner_a/work' };
+        const activeSessions = new Map<string, DaemonSession>();
+        const res = await triggerSessionTurn(runAsRequest({ rootMessageId: ROOT }), deps(activeSessions));
+        expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+        expect(activeSessions.size).toBe(0);
+        expect(mockForkWorker).not.toHaveBeenCalled();
+      } finally {
+        assistant.spawn = { kind: 'off' };
+      }
+    });
+  });
+
   it('registers the minted turn as a trigger turn of its connector kind (execution current origin)', async () => {
     const res = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map() });
     const triggerId = (res as { triggerId?: string }).triggerId!;
