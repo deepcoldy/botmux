@@ -1,4 +1,6 @@
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
+import { composerTextKey } from '../../utils/composer-text-key.js';
+import type { SessionRenameSurface } from './types.js';
 
 /**
  * TraeX 0.209.x busy evidence from a FULL authoritative viewport.
@@ -95,22 +97,21 @@ const EMPTY_COMPOSER_HINTS = new Set([
   'Will this algorithm scale well?',
 ]);
 
-/** Match only the live composer, never a pasted-content example in history.
- * A collapsed chip is usable only together with the worker's unchanged
- * external-input generation: its character count alone is not ownership.
- * The provisional shortcut-only startup composer can show a pasted draft while
- * still dropping Enter, so it must not consume the worker's one-shot rescue.
- * A parked draft changes the hint row (see `draftFooter`), so the footer is
- * judged with the draft-surface hints, never as an empty composer. */
-export function traexComposerHoldsInput(
+interface TraexComposerDraft {
+  body: string;
+  collapsedChars?: number;
+}
+
+/** Parse a native draft and its draft-specific footer. A collapsed paste chip
+ * carries only a length, never ownership of the content behind it. */
+function traexComposerDraft(
   screen: string,
-  input: string,
   opts: { requireThreadReady?: boolean } = {},
-): boolean {
+): TraexComposerDraft | undefined {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
   while (composer >= 0 && !PROMPT_ROW.test(rows[composer]!)) composer--;
-  if (composer < 0 || !input.trim()) return false;
+  if (composer < 0) return undefined;
   for (let end = composer + 1; end < rows.length; end++) {
     const empty = [...rows.slice(0, composer), '❯', ...rows.slice(end)].join('\n');
     if (!traexRestoredComposerReady(empty, {
@@ -120,10 +121,59 @@ export function traexComposerHoldsInput(
     const body = [rows[composer]!.slice(1), ...rows.slice(composer + 1, end)]
       .join('\n').trim();
     const chip = /^\[Pasted Content (\d+) chars?\]$/i.exec(body);
-    if (chip) return Number(chip[1]) === Array.from(input).length;
-    return body.replace(/\s/g, '') === input.replace(/\s/g, '');
+    return { body, ...(chip ? { collapsedChars: Number(chip[1]) } : {}) };
   }
-  return false;
+  return undefined;
+}
+
+/** Match only the live composer, never a pasted-content example in history.
+ * Existing parked-submit callers may use a collapsed chip only together with
+ * the worker's unchanged external-input generation: its count alone is not
+ * ownership. Native rename recovery deliberately never uses that shortcut.
+ * The provisional shortcut-only startup composer can show a pasted draft while
+ * still dropping Enter, so it must not consume the worker's one-shot rescue. */
+export function traexComposerHoldsInput(
+  screen: string,
+  input: string,
+  opts: {
+    requireThreadReady?: boolean;
+    /** Compare only the exact terminal-lossy glyph sequence documented by
+     * {@link composerTextKey}; visible emoji remain significant. */
+    glyphTolerant?: boolean;
+  } = {},
+): boolean {
+  if (!input.trim()) return false;
+  const draft = traexComposerDraft(screen, opts);
+  if (!draft) return false;
+  if (draft.collapsedChars !== undefined) return draft.collapsedChars === Array.from(input).length;
+  if (opts.glyphTolerant) return composerTextKey(draft.body) === composerTextKey(input);
+  return draft.body.replace(/\s/g, '') === input.replace(/\s/g, '');
+}
+
+/** TRAE's native rename text dialog is not a composer even though it has a ❯
+ * row. Recognise its live control footer and bounded title, never prose above. */
+function traexRenameDialogVisible(screen: string): boolean {
+  const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
+  if (!/^\s*enter submit\s*\|\s*esc back\s*$/.test(rows.at(-1) ?? '')) return false;
+  return rows.slice(-8).some(row => /^\s*Rename thread\s*$/.test(row));
+}
+
+/**
+ * Where a native `/rename <title>` stands after its Enter (0.216.0, recorded).
+ * `settled` only describes an empty composer; the worker still requires this
+ * thread's durable rename receipt. `occupied` means a known busy turn, dialog
+ * or user draft owns input and must outrank that receipt. `unknown` preserves
+ * the receipt-based fallback for future native footer layouts.
+ */
+export function traexSessionRenameSurface(screen: string, command: string): SessionRenameSurface {
+  if (traexViewportFooterBusy(screen) || traexModelPickerPage(screen) || traexRenameDialogVisible(screen)) {
+    return 'occupied';
+  }
+  if (traexRestoredComposerReady(screen)) return 'settled';
+  const draft = traexComposerDraft(screen);
+  if (!draft) return 'unknown';
+  if (draft.collapsedChars !== undefined) return 'occupied';
+  return composerTextKey(draft.body) === composerTextKey(command) ? 'unsubmitted' : 'occupied';
 }
 
 /**
