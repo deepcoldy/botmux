@@ -10,10 +10,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { waitForWorkerMessage } from './helpers/worker-ipc-waiter.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
+const WORKER_BOOT_TIMEOUT_MS = 60_000;
+const TEST_TIMEOUT_MS = 90_000;
 
 afterEach(async () => {
   for (const child of children) {
@@ -103,22 +106,27 @@ describe('worker: Pi install changed under the running process', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-upgrade-'));
     tempDirs.add(root);
     const bin = makeFakePiInstall(root, '1.3.0', '1.1.0');
-    const { messages, logs } = startWorker(root, bin, 'sid-worker-pi-upgrade');
+    const { child, messages, logs } = startWorker(root, bin, 'sid-worker-pi-upgrade');
 
-    await waitUntil(() => messages.some(m => m.type === 'cli_install_changed'), logs, 'cli_install_changed');
+    // Node+tsx module loading, worker init and the PTY spawn are startup, not
+    // part of the install-warning latency being tested. The warning may arrive
+    // before or after ready; the waiter replays either ordering from `messages`.
+    await waitForWorkerMessage(child, messages, 'ready', logs, WORKER_BOOT_TIMEOUT_MS);
+    await waitForWorkerMessage(child, messages, 'cli_install_changed', logs, 15_000);
     await new Promise(done => setTimeout(done, 500));
 
     const reports = messages.filter((m): m is Extract<WorkerToDaemon, { type: 'cli_install_changed' }> => m.type === 'cli_install_changed');
     expect(reports).toEqual([{ type: 'cli_install_changed', runningVersion: '1.1.0', installedVersion: '1.3.0' }]);
-  }, 30_000);
+  }, TEST_TIMEOUT_MS);
 
   it('stays quiet when the warning names the version that is installed (not this process)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-pi-upgrade-quoted-'));
     tempDirs.add(root);
     const bin = makeFakePiInstall(root, '1.3.0', '1.3.0');
-    const { messages, logs } = startWorker(root, bin, 'sid-worker-pi-upgrade-quoted');
+    const { child, messages, logs } = startWorker(root, bin, 'sid-worker-pi-upgrade-quoted');
 
+    await waitForWorkerMessage(child, messages, 'ready', logs, WORKER_BOOT_TIMEOUT_MS);
     await waitUntil(() => logs.join('').includes('not this process; ignoring'), logs, 'the ignore log');
     expect(messages.some(m => m.type === 'cli_install_changed')).toBe(false);
-  }, 30_000);
+  }, TEST_TIMEOUT_MS);
 });

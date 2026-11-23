@@ -4,10 +4,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { waitForWorkerMessage } from './helpers/worker-ipc-waiter.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
 const fixtures: Array<{ root: string; child: ChildProcess; observation: string }> = [];
+const WORKER_BOOT_TIMEOUT_MS = 60_000;
+const TEST_TIMEOUT_MS = 90_000;
 const pause = (ms: number) => new Promise(r => setTimeout(r, ms));
 async function until(predicate: () => boolean, logs: string[], timeout = 12000): Promise<void> {
   const deadline = Date.now() + timeout;
@@ -79,7 +82,9 @@ setInterval(() => {}, 1000);
 describe('frozen Codex instance through real worker IPC (workflow PTY path)', () => {
   it('launches the fake CLI with the frozen HOME and removes inherited authentication overrides', async () => {
     const f = launch();
-    await until(() => f.messages.some(m => m.type === 'ready'), f.logs);
+    // Give Node+tsx and worker init their own startup budget. Once ready, the
+    // observation assertions below retain the original functional timeout.
+    await waitForWorkerMessage(f.child, f.messages, 'ready', f.logs, WORKER_BOOT_TIMEOUT_MS);
     // The file exists from the first append's open(), before its line lands.
     await until(() => readJsonLines(f.observation).length > 0, f.logs);
     const invocations = readJsonLines(f.observation);
@@ -92,12 +97,12 @@ describe('frozen Codex instance through real worker IPC (workflow PTY path)', ()
       if (!invocation.argv.includes('--version')) expect(invocation.gatewayConfigured).toBe(true);
     }
     expect(existsSync(join(f.root, 'wrong-global-home'))).toBe(false);
-  }, 20000);
+  }, TEST_TIMEOUT_MS);
   it('launches Codex with the default-on hook-trust bypass and model-nudge suppression', async () => {
     // Both toggles are live global getters handed to buildArgs by the worker;
     // dropping either from the spawn wedges headless TUIs on an interactive gate.
     const f = launch();
-    await until(() => f.messages.some(m => m.type === 'ready'), f.logs);
+    await waitForWorkerMessage(f.child, f.messages, 'ready', f.logs, WORKER_BOOT_TIMEOUT_MS);
     // The --version probe can land first: wait for the launch itself.
     const launchesOf = () => readJsonLines<{ argv: string[] }>(f.observation)
       .map(row => row.argv)
@@ -109,19 +114,19 @@ describe('frozen Codex instance through real worker IPC (workflow PTY path)', ()
       expect(argv).toContain('--dangerously-bypass-hook-trust');
       expect(argv[argv.indexOf('notice.hide_rate_limit_model_nudge=true') - 1]).toBe('-c');
     }
-  }, 20000);
+  }, TEST_TIMEOUT_MS);
   it('fails before spawning any CLI when the frozen home is missing, without global fallback', async () => {
     const f = launch(true);
-    await until(() => f.child.exitCode !== null || f.child.signalCode !== null || f.messages.some(m => m.type === 'error'), f.logs);
+    await until(() => f.child.exitCode !== null || f.child.signalCode !== null || f.messages.some(m => m.type === 'error'), f.logs, WORKER_BOOT_TIMEOUT_MS);
     expect(f.messages.some(m => m.type === 'ready')).toBe(false);
     expect(existsSync(f.observation)).toBe(false);
     expect(existsSync(join(f.root, 'wrong-global-home'))).toBe(false);
-  }, 20000);
+  }, TEST_TIMEOUT_MS);
   it('rejects explicit read isolation instead of silently disabling it for a bound instance', async () => {
     const f = launch(false, true);
-    await until(() => f.child.exitCode !== null || f.child.signalCode !== null || f.messages.some(m => m.type === 'error'), f.logs);
+    await until(() => f.child.exitCode !== null || f.child.signalCode !== null || f.messages.some(m => m.type === 'error'), f.logs, WORKER_BOOT_TIMEOUT_MS);
     expect(f.messages.some(m => m.type === 'ready')).toBe(false);
     expect(f.logs.join('')).toContain('Codex instance routing does not support sandbox/readIsolation');
     expect(existsSync(f.observation)).toBe(false);
-  }, 20000);
+  }, TEST_TIMEOUT_MS);
 });
