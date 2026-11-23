@@ -4,7 +4,7 @@
  * `observeAbsorbedReplies`) and `emitReadyTurns`, via the worker function
  * harness, over the real BridgeTurnQueue and transcript reader, fed a
  * transcript file the test appends to as Claude would. Plus the Codex
- * same-turn steer observer (`observeCodexSteerReply`).
+ * mid-turn reply observer (`observeCodexMidTurnReply`).
  */
 import { afterAll, describe, expect, it } from 'vitest';
 import { appendFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -14,7 +14,7 @@ import * as queueModule from '../src/services/bridge-turn-queue.js';
 import * as gateModule from '../src/services/bridge-fallback-gate.js';
 import * as transcriptModule from '../src/services/claude-transcript.js';
 import * as localFailureModule from '../src/services/local-turn-failure.js';
-import { CodexSteerReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
+import { CodexMidTurnReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import * as restoredLabelModule from '../src/services/restored-turn-label.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
@@ -283,46 +283,78 @@ describe('worker: replies to folded Lark messages (adopt)', () => {
   });
 });
 
-describe('worker: replies to Codex same-turn steers', () => {
+describe('worker: Codex mid-turn replies', () => {
   const steered = (overrides: Partial<CodexPendingTurn> = {}): CodexPendingTurn =>
-    ({ turnId: 'om_followup', started: true, steeredMidTurn: true, ...overrides }) as CodexPendingTurn;
+    ({ turnId: 'om_followup', started: true, steeredMidTurn: true, transcriptStartTimeMs: 0, ...overrides }) as CodexPendingTurn;
+  const ordinary = (overrides: Partial<CodexPendingTurn> = {}): CodexPendingTurn =>
+    ({ turnId: 'om_task', started: true, ...overrides }) as CodexPendingTurn;
   const message = (uuid: string, value: string): CodexBridgeEvent =>
     ({ uuid, timestampMs: 0, kind: 'cot', text: '', cotEntries: [], assistantMessage: value });
   const toolCall = (uuid: string): CodexBridgeEvent =>
     ({ uuid, timestampMs: 0, kind: 'cot', text: '', cotEntries: [{ kind: 'tool_call', id: uuid, name: 'js', args: '' }] });
 
-  function observer(initConfig: Record<string, unknown>, replyDelivery: 'send' | 'transcript' = 'transcript') {
+  function observer(initConfig: Record<string, unknown>, replyDelivery: 'send' | 'transcript' = 'transcript', workerStartedAtMs = 0) {
     const sent: Array<Record<string, unknown>> = [];
     const scope: Record<string, unknown> = {
       lastInitConfig: { cliId: 'codex', followUpReply: true, ...initConfig },
       replyDeliveryMode: () => replyDelivery,
       send: (msg: Record<string, unknown>) => { sent.push(msg); },
       log: () => {},
-      CodexSteerReplyCollector,
-      codexSteerReplyCollectors: new WeakMap(),
+      CodexMidTurnReplyCollector,
+      codexMidTurnReplyCollectors: new WeakMap(),
+      WORKER_STARTED_AT_MS: workerStartedAtMs,
     };
     scope.followUpReplyEnabled = loadWorkerFunction('followUpReplyEnabled', scope);
     scope.structuredBridgeIs = loadWorkerFunction('structuredBridgeIs', scope);
-    const observe = loadWorkerFunction<(ev: CodexBridgeEvent, turn: CodexPendingTurn) => void>('observeCodexSteerReply', scope);
-    const answer = (turn = steered()) => {
-      observe(message('m1', '可以关闭下载窗口。'), turn);
-      observe(toolCall('t1'), turn);
+    const observe = loadWorkerFunction<(ev: CodexBridgeEvent, turn: CodexPendingTurn) => void>('observeCodexMidTurnReply', scope);
+    const say = (turn: CodexPendingTurn, uuid: string, text: string, saidAtMs = 0) => {
+      observe({ ...message(uuid, text), timestampMs: saidAtMs }, turn);
+      observe(toolCall(`${uuid}-tool`), turn);
       return sent;
     };
-    return { answer };
+    return { answer: (turn = steered()) => say(turn, 'm1', '可以关闭下载窗口。'), say };
   }
 
-  it('answers the steered message once the model goes back to work', () => {
-    expect(observer({}).answer()).toEqual([{
-      type: 'absorbed_reply', turnId: 'om_followup', answer: '可以关闭下载窗口。', replyUuid: 'm1', source: 'text',
-    }]);
+  it('answers the steered message once the model goes back to work, then posts what it says next as progress', () => {
+    const o = observer({});
+    const turn = steered();
+    o.say(turn, 'm1', '可以关闭下载窗口。');
+    expect(o.say(turn, 'm2', '继续跑剩下的用例。')).toEqual([
+      { type: 'absorbed_reply', turnId: 'om_followup', answer: '可以关闭下载窗口。', replyUuid: 'm1', source: 'text' },
+      { type: 'absorbed_reply', turnId: 'om_followup', answer: '继续跑剩下的用例。', replyUuid: 'm2', source: 'text', progress: true },
+    ]);
     expect(observer({ adoptMode: true }, 'send').answer()).toHaveLength(1);
+  });
+
+  it('posts an ordinary turn\'s mid-work messages as progress', () => {
+    const o = observer({ adoptMode: true });
+    const turn = ordinary({ dispatchAttempt: 2 });
+    o.say(turn, 'm1', '我先确认终端里实际使用的 Codex CLI 版本。');
+    expect(o.say(turn, 'm2', '正在安装 0.171.0。')).toEqual([
+      { type: 'absorbed_reply', turnId: 'om_task', dispatchAttempt: 2, answer: '我先确认终端里实际使用的 Codex CLI 版本。', replyUuid: 'm1', source: 'text', progress: true },
+      { type: 'absorbed_reply', turnId: 'om_task', dispatchAttempt: 2, answer: '正在安装 0.171.0。', replyUuid: 'm2', source: 'text', progress: true },
+    ]);
+  });
+
+  it('does not re-post what was said before this worker started, and calls a steer taken before it progress', () => {
+    const o = observer({ adoptMode: true }, 'transcript', 1_000);
+    const turn = ordinary();
+    expect(o.say(turn, 'm1', 'replayed from the previous worker', 999)).toEqual([]);
+    expect(o.say(turn, 'm2', 'said now', 1_000)).toMatchObject([{ answer: 'said now', progress: true }]);
+    const earlier = observer({ adoptMode: true }, 'transcript', 1_000);
+    expect(earlier.say(steered({ transcriptStartTimeMs: 500 }), 'm1', 'after the restart', 1_500))
+      .toMatchObject([{ answer: 'after the restart', progress: true }]);
+    const live = observer({ adoptMode: true }, 'transcript', 1_000);
+    expect(live.say(steered({ transcriptStartTimeMs: 1_200 }), 'm1', 'the answer', 1_500)[0]).not.toHaveProperty('progress');
   });
 
   it('stays quiet when off, for other CLIs, local turns, and botmux-send delivery outside adopt', () => {
     expect(observer({ followUpReply: undefined }).answer()).toEqual([]);
+    expect(observer({ followUpReply: undefined }).answer(ordinary())).toEqual([]);
     expect(observer({ cliId: 'traex' }).answer()).toEqual([]);
     expect(observer({}).answer(steered({ isLocal: true }))).toEqual([]);
+    expect(observer({}).answer(ordinary({ isLocal: true }))).toEqual([]);
     expect(observer({}, 'send').answer()).toEqual([]);
+    expect(observer({}, 'send').answer(ordinary())).toEqual([]);
   });
 });
