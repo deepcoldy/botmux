@@ -3079,60 +3079,60 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
     });
   });
 
-  it('claude-code: GET 生效值缺省 transcript（按 CLI 能力），PUT send / transcript 都落盘，PUT 空串 unset 回缺省', async () => {
+  it('claude-code: GET 生效值缺省 send（按需显式开启），PUT transcript / send 都落盘，PUT 空串 unset 回缺省', async () => {
     await withBot('claude-code', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: true });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
 
-      // send：退回旧行为，显式落盘，之后不再跟随缺省。
-      const off = await put(base, 'send');
-      expect(off.status).toBe(200);
-      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
-      expect(persisted(configPath).replyDelivery).toBe('send');
-      expect(getBot(appId).config.replyDelivery).toBe('send');
-      const afterOff = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(afterOff).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
-
-      // transcript：显式钉住也落盘（与缺省同值，但不靠缺省兜）。
+      // transcript：opt-in，显式落盘。
       const on = await put(base, 'transcript');
       expect(on.status).toBe(200);
-      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript' });
+      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' });
       expect(persisted(configPath).replyDelivery).toBe('transcript');
       expect(getBot(appId).config.replyDelivery).toBe('transcript');
+      const afterOn = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(afterOn).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'send', replyDeliverySupported: true });
 
-      // '' / 未知值删 key，回缺省 transcript。
+      // send：显式退回也落盘（与缺省同值，但意图是钉住，不靠缺省兜）。
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+      expect(getBot(appId).config.replyDelivery).toBe('send');
+
+      // '' / 未知值删 key，回缺省 send。
       const cleared = await put(base, '');
       expect(cleared.status).toBe(200);
-      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' });
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
       expect(getBot(appId).config.replyDelivery).toBeUndefined();
     });
   });
 
-  it('cursor: GET 缺省 transcript/supported（#932 起普通 spawn 也有转写采集），PUT send 落盘可退回', async () => {
+  it('cursor: GET 缺省 send/supported，PUT transcript 落盘（#932 起普通 spawn 也有转写采集）', async () => {
     await withBot('cursor', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: true });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
-
-      const off = await put(base, 'send');
-      expect(off.status).toBe(200);
-      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
-      expect(persisted(configPath).replyDelivery).toBe('send');
-      expect(getBot(appId).config.replyDelivery).toBe('send');
 
       const on = await put(base, 'transcript');
       expect(on.status).toBe(200);
-      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript' });
+      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' });
       expect(persisted(configPath).replyDelivery).toBe('transcript');
+      expect(getBot(appId).config.replyDelivery).toBe('transcript');
+
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
     });
   });
 
-  it('hermes + oncall: state.db 无宿主挂载，GET 生效值回落 send、开关 unsupported', async () => {
+  it('hermes + oncall: state.db 无宿主挂载，GET 生效值与缺省均为 send、开关 unsupported', async () => {
     await withBot('hermes', async (base, configPath) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
-      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: false });
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: false });
       expect('replyDelivery' in persisted(configPath)).toBe(false);
     }, { sandbox: 'oncall' });
   });

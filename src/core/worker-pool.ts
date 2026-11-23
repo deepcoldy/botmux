@@ -29353,7 +29353,7 @@ function deliverFinalOutput(
   const partialResultMessages = (): TurnDeliveryReceipt['messages'] => {
     return finalPublication?.receipt.messages ?? [];
   };
-  // 内容安全审计拒收（230028 等）→ 打码发送副本后重发一次。零注入 / 转写回复
+  // 内容安全审计拒收（230028 等）→ 打码发送副本后重发一次。零注入 / 自动转发最终回复
   // 模式下模型看不到发送失败，只能由这里兜住；transcript 与终端原文不受影响。
   const withAuditRedaction = (content: string, msgType: string | undefined, send: (body: string) => Promise<string>) =>
     sendWithContentAuditRedaction({

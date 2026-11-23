@@ -17,7 +17,10 @@ const WAIT_MS = 60_000;
 // with — survives, while the new init carries today's replyDelivery. The worker
 // must follow the pane's launch value (frozen in its environment), not the
 // init, until the CLI is respawned; the pane itself is not restarted.
-it.skipIf(!runnable)('a re-attached pane keeps the reply delivery it was launched with', async () => {
+it.skipIf(!runnable).each([
+  ['send', 'transcript'],
+  ['transcript', 'send'],
+] as const)('a re-attached pane launched with %s keeps it even when the restarted daemon resolves %s', async (launched, reloaded) => {
   const root = mkdtempSync(join(tmpdir(), 'worker-reattach-delivery-'));
   const dataDir = join(root, 'data'); mkdirSync(dataDir);
   writeFileSync(join(root, 'package.json'), '{"type":"commonjs"}');
@@ -49,11 +52,11 @@ setInterval(()=>{},1000);
   const session = `bmx-${sessionId.slice(0, 8)}`;
   let second: ReturnType<typeof start> | undefined;
   try {
-    const first = start('send', false);
+    const first = start(launched, false);
     const firstDeadline = Date.now() + WAIT_MS;
     while (lines().length < 1 && first.child.exitCode === null && Date.now() < firstDeadline) await new Promise(r => setTimeout(r, 50));
     expect(lines().length, first.logs.join('')).toBe(1);
-    expect(lines()[0].snapshot).toBe('send');
+    expect(lines()[0].snapshot).toBe(launched);
     await new Promise(r => setTimeout(r, 1500));
     // Daemon restart: the IPC channel drops, the persistent pane only detaches.
     first.child.disconnect!();
@@ -62,9 +65,9 @@ setInterval(()=>{},1000);
     expect(execFileSync('tmux', [...workerTmuxArgs(env), 'list-sessions', '-F', '#{session_name}'], { env, encoding: 'utf8' }))
       .toContain(session);
 
-    // The restarted daemon now resolves transcript (e.g. the new default).
-    second = start('transcript', true);
-    const pinned = /\[reply-delivery\] re-attached pane was launched with replyDelivery=send/;
+    // The restarted daemon now resolves the opposite mode (e.g. default flipped).
+    second = start(reloaded, true);
+    const pinned = new RegExp(`\\[reply-delivery\\] re-attached pane was launched with replyDelivery=${launched}`);
     const secondDeadline = Date.now() + 20_000;
     while (!pinned.test(second.logs.join('')) && second.child.exitCode === null && Date.now() < secondDeadline) {
       await new Promise(r => setTimeout(r, 100));

@@ -1473,26 +1473,22 @@ export const messages: Record<string, string> = {
   'ai.routing.workflow_hint': 'Workflow: multi-step goal or saved workflow? Once the user agrees or sends `/workflow`, run `botmux skill show botmux-workflow` first.',
   'ai.routing.feedback_response_kind': 'Mark the turn\'s final answer with `botmux send --response-kind final "full answer"` and send it only once (attaches footer brand signature; if final-answer feedback is enabled for this bot, also attaches feedback buttons). Do not add this flag to interim/progress sends (defaults to progress, hides the footer signature). Marking final locks this turn\'s final answer: subsequent progress sends are rejected; if supplements are needed, use `--response-kind auxiliary`.',
   'ai.routing.hidden_context_defense': 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.',
-  // replyDelivery=transcript (core/reply-delivery.ts): the daemon forwards the
-  // final reply from the transcript — intro is replaced by this line, and
-  // botmux send is kept for what the final reply cannot carry
-  // (usage_send_transcript lists the cases, no_progress_send_transcript rules
-  // out progress broadcasts and duplicate finals; see shared-hints.ts).
-  'ai.routing.intro_transcript': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output; your final assistant message is automatically forwarded back to Lark by botmux — write the final answer there directly.',
-  'ai.routing.usage_send_transcript': '- Use `botmux send` only for what the final reply cannot carry: @-ing another bot to collaborate, or handing results back to the bot that assigned you the task (`--mention <their open_id>` / `--mention-back` — a bot receives nothing unless it is @-ed); sending attachments, images, videos or custom cards; posting to another chat or topic; and turns whose instructions explicitly require `botmux send` (e.g. silent scheduled runs, whose final reply is never posted). Every send must carry one of `--mention <open_id>` / `--mention-back` / `--no-mention`.',
-  'ai.routing.no_progress_send_transcript': '- Do not use `botmux send` for progress broadcasts, acknowledgements ("got it", "looking") or interim summaries, and do not send the final answer again. When the final answer itself must go through send (it is an attachment or card, or the recipient must be @-ed to receive it), add `--response-kind final` so botmux does not forward the final reply a second time. When attaching files, send the attachments first and write the final answer last: botmux forwards only the reply after your last tool call.',
+  // replyDelivery=transcript (auto-forward final reply, core/reply-delivery.ts):
+  // the daemon forwards the final reply automatically, so `<botmux_routing>`
+  // adds no extra `botmux send` instructions — intro is replaced by this line
+  // and only usage_helpers / ask_wait / usage_silence stay (bot collaboration
+  // stays in `<identity>`; attachments/cards/cross-chat stay on-demand in the
+  // built-in `botmux-send` skill; see shared-hints.ts).
+  'ai.routing.intro_transcript': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output; your final assistant message is automatically forwarded back to Lark by botmux — just answer directly.',
   'ai.send.after_success_hint': 'The final answer was sent successfully. If the task is complete or its concrete blocker has been delivered, end with BOTMUX_NOTHING_TO_SEND without resending. Use botmux send --response-kind auxiliary for later supplements.',
   'ai.send.after_success_steer_advanced': 'This send is complete. The session has automatically advanced to the next queued turn; send the full answer for the new message with `botmux send --response-kind final` (or output BOTMUX_NOTHING_TO_SEND if no response is needed).',
   'ai.send.after_success_progress': 'Progress was sent (not marked final). If this message already contains the complete answer to the request, end with just BOTMUX_NOTHING_TO_SEND; do not send a summary or repeat it. If it was only an acknowledgement or interim progress, or the task is unfinished, continue the original task and deliver the result or a concrete blocker with botmux send --response-kind final.',
   'ai.send.after_success_auxiliary': 'The supplement was sent. Check whether the original final answer was delivered successfully; a supplement alone does not prove completion. Do not resend content already delivered.',
   'ai.send.after_success_unified': 'Progress was posted to this turn’s card. When done, send the full answer with `botmux send --response-kind final`.',
-  // Post-send echoes for replyDelivery=transcript sessions (REPLY_DELIVERY_ENV,
-  // see send-completion-hint.ts): the final reply is forwarded by botmux, so
-  // they point the model back at its final reply instead of another send.
-  'ai.send.after_success_progress_transcript': 'Message sent. This session\'s final reply is forwarded to Lark by botmux automatically: when the task is done, write the complete answer in your final reply instead of running botmux send again; progress updates and interim summaries need no send either. If the message you just sent already is the complete answer, end with just BOTMUX_NOTHING_TO_SEND to avoid a duplicate. Silent scheduled runs are the exception: their final reply is never posted, so send every conclusion with botmux send.',
-  'ai.send.after_success_unified_transcript': 'Progress was posted to this turn’s card. This session\'s final reply is forwarded by botmux automatically — when done, write the complete answer in your final reply; no further progress sends are needed.',
-  'ai.send.after_success_auxiliary_transcript': 'The supplement was sent. This session\'s final reply is forwarded by botmux automatically; a supplement does not complete the task, and do not repeat already-sent content in your final reply.',
-  'ai.send.after_success_steer_advanced_transcript': 'This send is complete. The session has automatically advanced to the next queued turn; answer the new message directly in your final reply (botmux forwards it), or output BOTMUX_NOTHING_TO_SEND if no response is needed.',
+  // replyDelivery=transcript (auto-forward final reply): only emit a factual
+  // state-change notice when a queued turn was promoted; normal sends print
+  // only the bare delivery receipt with no extra persuasion.
+  'ai.send.after_success_steer_advanced_transcript': 'This send is complete. The session has automatically advanced to the next queued turn; continue with the new message (or output BOTMUX_NOTHING_TO_SEND if no response is needed).',
   'ai.routing.xpi_as_hint': 'XPI is enabled: every plain-text message directed to another bot must declare its handling up front. Start a separate task with `botmux send --as independent`; leave it for the current task with `--as suggestion`.',
   'ai.shell.xpi_as_hint': 'XPI is enabled: every plain-text message to another bot must include a handling choice. Start separately: `botmux send --as independent`. Leave it for the current task: `botmux send --as suggestion`.',
   'xpi.choice.independent': 'Start a new task',
@@ -1536,7 +1532,7 @@ export const messages: Record<string, string> = {
   'ai.identity.rule_own_part': '- Do only your part; do not pick up work assigned to other bots',
   'ai.identity.rule_silent_when_other': '- If the whole message is for another bot, stay silent',
   'ai.identity.rule_no_proactive_pull': '- Do not pull other bots in unless the user explicitly asks',
-  'ai.identity.mention_must': '- To collaborate with another bot you MUST `botmux send --mention <their open_id>` — without it they receive nothing',
+  'ai.identity.mention_must': '- To reply to or @-mention another bot to collaborate, you MUST `botmux send --mention <their open_id>` (or `--mention-back` to reply to the bot that triggered this turn) — without it they receive nothing',
 
   // ─── AI hints (BOTMUX_SHELL_HINTS for non-injecting CLIs; multiline_heredoc /
   // heredoc_example are also reused by the system-prompt path — keep both locales aligned) ──
@@ -1548,12 +1544,11 @@ export const messages: Record<string, string> = {
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',
   'ai.shell.when_to_send': 'For requests requiring a reply, use Bash to deliver the result or a concrete blocker with botmux send --response-kind final and verify success before ending. Completed queries or progress sends are not final delivery. Do not resend delivered answers. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.shell.no_visible_output_ok': 'Ending with no terminal body is normal only after successful final delivery via botmux send --response-kind final (exit code 0); a successful progress send does not complete the task. Do not resend delivered answers on a no-output nudge. Reconcile unknown send outcomes before treating them as success or failure.',
-  // replyDelivery=transcript shell-hints variant: reworded intro / when_to_send,
-  // and send_scope keeps botmux send for what the final reply cannot carry
-  // (the send-mode how_to_send / mention_gate / feedback paragraphs are not
-  // injected, see shared-hints.ts).
+  // replyDelivery=transcript (auto-forward final reply) shell-hints variant:
+  // only the reworded intro / when_to_send plus helpers; no extra `botmux send`
+  // prompts in `<botmux_routing>` (bot collaboration lives in `<identity>`, and
+  // attachments / cards / cross-chat stay on-demand in the `botmux-send` skill).
   'ai.shell.intro_transcript': 'You are running inside a Lark (Feishu) conversation. The user reads on Lark and cannot see your terminal output; your final assistant message is automatically forwarded back to Lark by botmux.',
-  'ai.shell.send_scope_transcript': 'Use botmux send only for what the final reply cannot carry: @-ing another bot to collaborate, or handing results back to the bot that assigned you the task (`--mention <their open_id>` / `--mention-back` — a bot receives nothing unless it is @-ed); sending attachments (`--images` / `--files` / `--videos`) or custom cards; posting to another chat or topic; and turns whose instructions explicitly require botmux send (e.g. silent scheduled runs, whose final reply is never posted). Every send must carry one of `--mention <open_id>` / `--mention-back` / `--no-mention`. Do not use it for progress broadcasts, acknowledgements ("got it", "looking") or interim summaries, and do not send the final answer again; when the final answer itself must go through send, add `--response-kind final` so botmux does not forward the final reply a second time. When attaching files, send the attachments first and write the final answer last: botmux forwards only the reply after your last tool call.',
   'ai.shell.when_to_send_transcript': 'Answer messages addressed to you directly in your final assistant message — never stay silent. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a specific person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the triggerer of THIS turn) / `--no-mention` (none). First decide WHETHER to @ by VALUE: substantive conclusion the other party should read/confirm/decide → @ someone; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Then pick HOW by recipient: it is the person/bot that triggered this turn → --mention-back; it is someone else (in a multi-person chat the right recipient is often not the triggerer) → --mention to name them. Do not default to --no-mention, and do not @ people for nothing. For automatic turns such as scheduled tasks with no current sender, use --mention only for an explicit recipient, otherwise use --no-mention. Do not use --mention-back or infer a recipient from the session owner or a historical sender.',
 
@@ -1561,7 +1556,7 @@ export const messages: Record<string, string> = {
   'ai.attach.hint': 'Read these with the Read tool. The index matches the [image N] / [file N] / [video N] placeholders in the body.',
   'ai.attach.videoHint': 'The video is saved locally. Prefer Read or the current CLI media-reading tool to provide the full sequence to a video-capable model. If the tool or model cannot accept video, extract frames or transcribe as the task requires and state the method used.',
   'ai.attach.videoHintKimi': 'The video is saved locally. Prefer ReadMediaFile to provide the full sequence to a video-capable model. If the tool or model cannot accept video, extract frames or transcribe as the task requires and state the method used.',
-  'ai.identity.short_routing': 'Reminder: communicating or collaborating with another bot REQUIRES `botmux send --mention <their open_id>` — without it, the other bot is not triggered.',
+  'ai.identity.short_routing': 'Reminder: to reply to or @-mention another bot to collaborate, you MUST `botmux send --mention <their open_id>` (or `--mention-back` to reply to the bot that triggered this turn) — without it, the other bot is not triggered.',
   'ai.available_bots.hint': 'To communicate or collaborate with a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
   'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
   'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',

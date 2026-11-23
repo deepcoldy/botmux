@@ -68,6 +68,22 @@ describe('built-in botmux-send skill', () => {
     expect(skill!.content).toContain('不要在普通回复里画不能点击的按钮');
     expect(skill!.content).not.toContain('纯文本走普通消息');
   });
+
+  it('keeps attachments/cards/cross-chat/collaboration in botmux-send without banning progress sends or calling auto-forward the default', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-send');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('--images');
+    expect(skill!.content).toContain('--files');
+    expect(skill!.content).toContain('--card-json');
+    expect(skill!.content).toContain('--mention');
+    expect(skill!.content).toContain('自动转发最终回复');
+    expect(skill!.content).not.toContain('转写回复');
+    expect(skill!.content).not.toContain('进度播报');
+    expect(skill!.content).not.toContain('不要用 botmux send 发进度');
+    expect(skill!.content).not.toContain('「收到」「在看」');
+    expect(ASK_SKILL).not.toContain('转写回复（默认）');
+    expect(WHITEBOARD_SKILL).not.toContain('转写回复（默认）');
+  });
 });
 
 describe('built-in botmux-session-rename skill', () => {
