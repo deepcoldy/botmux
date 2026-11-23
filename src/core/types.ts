@@ -589,6 +589,14 @@ export interface DaemonSession {
    *  streamCardLabel) and a suspend guard (idle-worker-sweeper: the tasks die
    *  with the CLI). In-memory only. */
   backgroundTaskCount?: number;
+  /** Last screen_update's away-summary state (waiting or blurred). Automatic
+   *  compact must not restore focus and cancel Claude's one-shot recap.
+   *  In-memory; absent from older workers means unknown/false. */
+  awaySummaryPending?: boolean;
+  /** Threshold auto-compact was refused only because the one-shot recap was
+   *  active. Cleared by observeAutoCompact once pending is false, allowing the
+   *  normal debounce to re-arm instead of leaving a spent cooldown. In-memory. */
+  autoCompactAwaySummaryDeferred?: boolean;
   /** Wall-clock of the most recent `turn_terminal` observed for this session,
    *  and the turn it named. The terminal edge is the daemon's authority that a
    *  turn is over, so these drive the post-terminal display settle (see
@@ -636,6 +644,20 @@ export interface DaemonSession {
   /** A botmux turn started and its idle edge has not been seen yet
    *  (core/idle-auto-compact.ts). In-memory; mirrored to the row while on. */
   idleAutoCompactArm?: import('./idle-auto-compact.js').IdleAutoCompactArm;
+  /** Native Claude session that owns the two transcript clocks below. A
+   *  changed identity resets both before their monotonic merge. In-memory only. */
+  modelRequestSessionId?: string;
+  /** Start (epoch ms) of the main conversation's latest served model request,
+   *  as the worker read it from the Claude transcript (`lastModelRequestAt` on
+   *  screen_update). The idle auto-compact's cache window counts from this real
+   *  request start. Never moves back within one native session. In-memory only. */
+  lastModelRequestAt?: number;
+  /** Completion (epoch ms) of the latest served response, leaving out idle
+   *  upkeep — botmux's keep-alive, a plugin's prompt (`lastActivityRequestAt`
+   *  on screen_update; wire name kept for compatibility). The idle auto-compact
+   *  counts idle time from this response completion, not its request start.
+   *  Never moves back within one native session. In-memory only. */
+  lastActivityRequestAt?: number;
   /** Non-keep-alive busy observed before this idle compact settles. This
    *  in-memory witness survives session-store's durable-row rollback on a
    *  failed save; the persisted inFlight flag is the restart-safe counterpart. */
@@ -644,6 +666,11 @@ export interface DaemonSession {
    *  so a durable-row rollback cannot split warm/notice state from the row or
    *  allow a later duplicate compact. In-memory only; reconciled before sweep. */
   idleAutoCompactCompletedTurnId?: string;
+  /** Direct Web-terminal submit armed a user turn while this compact was
+   *  unsettled. In-memory witness paired with inFlight.directInputArmed: unlike
+   *  the nested flag it survives session-store's durable-row rollback. Kept
+   *  after settlement for the same rollback reconciliation as completedTurnId. */
+  idleAutoCompactDirectInputTurnId?: string;
   /** A locally answered CLI turn whose own busy repaint must not cancel an
    *  idle-compact retry. In-memory only; cleared by its terminal or idle edge. */
   idleAutoCompactLocalTurn?: { turnId: string; since: number };

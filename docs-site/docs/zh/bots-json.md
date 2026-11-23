@@ -307,8 +307,8 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 
 | 字段 | 说明 |
 |------|------|
-| `backendType` | 会话后端：`tmux`（默认）、`zellij`（≥ 0.44）、`herdr`、`zmx`、`pty`。tmux 这类持久后端在本机不可用时，会弹卡提示安装，不会悄悄降级成 pty。`pty` 只在显式指定时使用，daemon 重启后会话不保留。见 [tmux 后端](/tmux)、[ZMX 后端](/zmx) |
-| `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`。填 `zsh` / `bash` / `fish` / `sh` 或绝对路径。用在登录 shell 的 rc 文件里有 `exec zsh` 之类跳转、导致会话起不来（终端里出现 `parse error`）的情况。指定后，PATH、nvm 等要写在所选 shell 的 rc 文件里（fish 是 `~/.config/fish/config.fish`）。对 tmux / zellij / zmx 的新会话生效 |
+| `backendType` | 会话后端：`tmux`（默认）、`zellij`（≥ 0.44）、`herdr`、`zmx`、`hc`（仅 Linux，需显式选用并自备 herdr-core ≥ 0.1.19）、`pty`。tmux 这类持久后端在本机不可用时，会弹卡提示安装，不会悄悄降级成 pty。`pty` 只在显式指定时使用，daemon 重启后会话不保留。见 [tmux 后端](/tmux)、[ZMX 后端](/zmx)、[hc 后端](/hc) |
+| `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`。填 `zsh` / `bash` / `fish` / `sh` 或绝对路径。用在登录 shell 的 rc 文件里有 `exec zsh` 之类跳转、导致会话起不来（终端里出现 `parse error`）的情况。指定后，PATH、nvm 等要写在所选 shell 的 rc 文件里（fish 是 `~/.config/fish/config.fish`）。对 tmux / zellij / zmx / hc 的新会话生效 |
 | `lang` | 界面语言 `zh` / `en`；不填时看 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `p2pMode` | 私聊模式：`chat`（默认，一个连续会话）、`thread`（每条私聊消息开一个独立会话）、`group`（每条私聊消息自动建一个专属会话群）。见[群聊模式](/group) |
 | `regularGroupReplyMode` | 普通群 @bot 后的默认回复形态：`chat-topic`（默认，群里顶层 @ 共用一个连续会话，群里开的原生话题各自是独立会话）、`chat`（整群共用一个会话，原生话题也并进这个会话）、`new-topic`（每次 @ 开一个话题）、`shared`（回复进话题但共用一个会话）。单个群可用 `/reply-mode` 覆盖。见[斜杠命令](/slash-commands) |
@@ -675,7 +675,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 
 - **只传任务原文和附件**：不加 botmux 的系统提示、每轮提醒、身份信息、角色、白板、记忆和技能目录。CLI 自己的系统提示和项目里的 `AGENTS.md` 照常由 CLI 处理。
 - **自动回传答复**：从 CLI 的会话记录里取最终答复发回飞书，默认 @ 本轮发任务的人；答复里点名群里其它 bot（如 `@Reviewer`）会自动换成真正的飞书 @。
-- **支持的 CLI**：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao、Antigravity。后端限本机的 tmux / pty / zellij / herdr / zmx（Antigravity 不支持 zmx）；Cursor、Antigravity 不支持 `scratch` 沙盒；Hermes 不支持 `oncall` 沙盒（`~/.hermes/state.db` 未挂载到宿主）。暂不支持远端后端和 v3 工作流。
+- **支持的 CLI**：Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok、Cursor、Doubao、Antigravity。后端限本机的 tmux / pty / zellij / herdr / zmx / hc（Antigravity 不支持 zmx）；Cursor、Antigravity 不支持 `scratch` 沙盒；Hermes 不支持 `oncall` 沙盒（`~/.hermes/state.db` 未挂载到宿主）。暂不支持远端后端和 v3 工作流。
 
 技术细节见 [`docs/zero-prompt-injection.md`](https://github.com/deepcoldy/botmux/blob/master/docs/zero-prompt-injection.md)。
 
@@ -922,7 +922,7 @@ bot 被拉进飞书视频会议后，可以按「会议角色」去做事，比�
 - 每一层里，一个变量要么「设置」要么「去掉」。「恢复继承」就是删掉本层的条目，值回落到下一层。
 - `PATH`、`HOME` 可以覆盖，不能去掉。
 - 每一层的「设置」和「去掉」加起来不超过 4 KB（tmux 单条命令有长度上限）。超出时保存会被拒绝；已经超出的老配置，往小了改总是允许的。
-- 对 tmux / zellij / zmx 会话，「去掉」在会话启动的最后一步执行，所以 tmux server 全局环境和 shell 启动文件带进来的同名变量也会被去掉。
+- 对 tmux / zellij / zmx / hc 会话，「去掉」在会话启动的最后一步执行，所以 tmux server 全局环境和 shell 启动文件带进来的同名变量也会被去掉。
 - 开着 lark-cli 应用绑定时，`ZDOTDIR` / `BASH_ENV` 由 botmux 接管；开着按触发人鉴权时，`GIT_ASKPASS` / `GIT_CONFIG_*` 也由它接管，这些变量在这个 bot 上不能设置或去掉。
 - 老配置不用迁移：`env` 就是 Bot 层的「设置」；没写 `envUnset` / `sessionEnv` 时一切和以前一样。
 - riff / mojo 后端的会话不在本机运行，只会带上本 bot 的 `env`，全局层和「去掉」对它们不生效。
@@ -963,7 +963,7 @@ bot 被拉进飞书视频会议后，可以按「会议角色」去做事，比�
 
 **什么时候生效**：下次会话冷启动时生效；命令行离线修改只改文件，daemon 下次启动时读取。daemon 重启恢复会话时，如果旧会话的策略和现在不一致，会先关掉旧会话再重新启动，确认不了就拒绝启动。CLI 已经读到的环境没法热撤回。
 
-**覆盖范围**：严格模式覆盖 botmux 自己启动的 PTY、tmux、zellij、zmx 会话，以及本机 Codex / TraeX App Server 和标题生成等子进程。tmux / zellij 不再加载 `launchShell` 的启动文件，而是用干净环境直接启动 CLI，所以 PATH、nvm、mise 等要靠基线或你显式配置提供。没有 `TERM` 时默认用 `xterm-256color`。
+**覆盖范围**：严格模式覆盖 botmux 自己启动的 PTY、tmux、zellij、zmx、hc 会话，以及本机 Codex / TraeX App Server 和标题生成等子进程。tmux / zellij / hc 不再加载 `launchShell` 的启动文件，而是用干净环境直接启动 CLI，所以 PATH、nvm、mise 等要靠基线或你显式配置提供。没有 `TERM` 时默认用 `xterm-256color`。
 
 **不支持的情况**：Herdr、Riff、Mojo、Forge 启动模式、adopt 外部进程和外部 App Server 还做不到同样的隔离，开严格模式会拒绝这些路径。CLI 自己读取的配置和凭证文件、文件权限、云端账号也不在这个策略的隔离范围内。
 

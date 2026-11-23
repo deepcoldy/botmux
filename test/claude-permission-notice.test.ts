@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ClaudePermissionNoticeTracker } from '../src/services/claude-action-prompt.js';
+import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { PromptSuggestionPublisher, promptSuggestionReportTurn } from '../src/utils/prompt-suggestion-publisher.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
@@ -27,7 +28,7 @@ function start(cliId = 'claude-code') {
     projectedRuntimeScreenStatus: () => 'idle', observeTraexAutoModelCapacity() {},
     classifyUsageLimitWithNativeEvidence: (_: string, status: string) => ({ status }),
     settleBackgroundTasksFromSiblings() {}, refreshBackgroundWait() {},
-    startupInputHeld: () => false, backgroundWaitPayload: () => ({}),
+    startupInputHeld: () => false, backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
     send: (message: any) => messages.push(message),
   };
   loadWorkerFunction<() => void>('startScreenUpdates', scope)();

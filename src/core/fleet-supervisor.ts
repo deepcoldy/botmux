@@ -2,7 +2,7 @@
  * Fleet supervisor — LIVE layer (owns spawn/kill/fs/timers). Replaces pm2's God
  * daemon for the multi-bot fleet. One `FleetSupervisor` process (the `__supervisor`
  * entry) spawns each bot's daemon as a `__daemon` child, monitors exits, and
- * applies the pure policy decisions (restart-with-backoff / stop / park). All
+ * applies the pure policy decisions (restart-with-backoff / stop). All
  * state goes through fleet-state-store (atomic + locked). Boot persistence stays
  * with systemd/launchd, which re-run `botmux start`.
  *
@@ -670,7 +670,7 @@ export class FleetSupervisor {
         // operator-initiated start (isRestart=false: `botmux start` reconcile or
         // start-bot) gives the bot a CLEAN restart budget; otherwise a proc that
         // crashlooped in a previous supervisor generation would carry its stale
-        // count and be parked one crash later instead of getting a full budget.
+        // count and enter the cooldown instead of getting a full fast budget.
         if (!isRestart) existing.restarts = 0;
         // Record which config this generation was actually started from, so the
         // caller can later tell "running, but from a stale definition" apart from
@@ -734,14 +734,9 @@ export class FleetSupervisor {
     // proof that a stop was requested through the sanctioned channel.
     const unsolicited = exit.code === FLEET_GRACEFUL_EXIT_CODE && exit.signal === null;
     // Graceful ('stop') was already consumed by the stopping / explicitStop
-    // guards above this point, so this path only ever decides restart vs park.
-    const decision = decideCrashExit({ restarts: current?.restarts ?? 0 }, this.policy);
-
-    if (decision.action === 'park') {
-      this.log(`${spec.name} exceeded max_restarts (${decision.atRestarts}); parking errored`);
-      this.markStopped(spec.name, exit, 'errored');
-      return;
-    }
+    // guards above this point. Unexpected exits always retain a retry timer.
+    const uptimeMs = current?.startedAt ? Date.now() - Date.parse(current.startedAt) : 0;
+    const decision = decideCrashExit({ restarts: current?.restarts ?? 0 }, this.policy, uptimeMs);
     // restart: record the bump, then respawn after the backoff.
     mutateFleetState(this.opts.statePath, (cur) => {
       const p = cur.procs.find((x) => x.name === spec.name);
@@ -752,7 +747,7 @@ export class FleetSupervisor {
       unsolicited
         ? `${spec.name} exited graceful sentinel (${FLEET_GRACEFUL_EXIT_CODE}) WITHOUT a supervisor-initiated stop `
           + `(likely an external signal, e.g. pkill/kill -TERM); restarting instead of retiring`
-        : `${spec.name} crashed (code=${exit.code} signal=${exit.signal}); restart ${decision.nextRestarts}/${this.policy.maxRestarts} in ${this.policy.restartDelayMs}ms`,
+        : `${spec.name} crashed (code=${exit.code} signal=${exit.signal}); restart ${decision.nextRestarts}/${this.policy.maxRestarts} in ${decision.delayMs}ms`,
     );
     // The restart timer MUST keep the event loop alive: when the crashed child
     // was the supervisor's only live handle, an unref'd timer would let the loop
@@ -761,7 +756,7 @@ export class FleetSupervisor {
     // after scheduling the first restart). A ref'd timer holds the process until
     // the respawn fires. (stopOne's kill timer stays unref'd — it's a shutdown
     // safety net that must NOT keep the loop alive.)
-    const timer = setTimeout(() => { this.restartTimers.delete(spec.name); this.spawnBot(spec, true); }, this.policy.restartDelayMs);
+    const timer = setTimeout(() => { this.restartTimers.delete(spec.name); this.spawnBot(spec, true); }, decision.delayMs);
     this.restartTimers.set(spec.name, timer);
   }
 
@@ -793,7 +788,8 @@ export class FleetSupervisor {
       for (const p of cur.procs) {
         // Unverifiable or failed orphan retirement must survive shutdown for the
         // next supervisor/operator; do not turn a live PID into a stopped row.
-        if (!pending.some(([name]) => name === p.name)
+        // pid=0 is a pending retry, not an orphan; kill(0, 0) probes our group.
+        if (p.pid > 1 && !pending.some(([name]) => name === p.name)
           && (this.opts.processIdentityRuntime ?? fleetProcessIdentityRuntime).pidExists(p.pid)) continue;
         if (p.status === 'online' || p.status === 'launching') { p.status = 'stopped'; p.pid = 0; }
       }

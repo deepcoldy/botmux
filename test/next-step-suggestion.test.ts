@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { nextCardSequence } from '../src/core/card-element-writes.js';
 import {
+  editableSuggestionIsCurrent,
   nextStepIdle,
   noteNextStepCard,
   noteNextStepSuggestion,
@@ -414,5 +415,50 @@ describe('PromptSuggestionPublisher', () => {
     publisher.observe('确认发版', t1);
     // The next turn's input is written; no frame has been captured since.
     expect(publisher.take('idle', { turnId: 't2' })).toBeUndefined();
+  });
+});
+
+it('requests generation for the current settled card once and never shows a late edit on its successor', async () => {
+  const ds = session();
+  const requestSuggestion = vi.fn(() => true);
+  const { io } = fakeIo({ requestSuggestion });
+  const publish = vi.fn(async () => {});
+  const card = { kind: 'unified', publish } as const;
+  noteNextStepTurnStarted(ds, 'turn-1', io);
+  expect(requestSuggestion).not.toHaveBeenCalled();
+  noteNextStepCard(ds, 'turn-1', card, io, 3);
+  noteNextStepCard(ds, 'turn-1', card, io, 3);
+  expect(requestSuggestion).toHaveBeenCalledExactlyOnceWith(ds, 'turn-1', 3);
+  noteNextStepTurnStarted(ds, 'turn-2', io);
+  noteNextStepSuggestion(ds, 'turn-1', '迟到的建议', io, true);
+  await nextStepIdle(ds);
+  expect(publish).not.toHaveBeenCalled();
+});
+
+describe('editableSuggestionIsCurrent staleness gate', () => {
+  const facts = {
+    currentTurnId: 'turn-1',
+    lastTurnTerminalTurnId: 'turn-1',
+    lastTurnTerminalStatus: 'completed',
+    lastTurnTerminalDispatchAttempt: 2,
+  };
+
+  it('accepts the matching turn at the matching dispatch attempt', () => {
+    expect(editableSuggestionIsCurrent(facts, { turnId: 'turn-1', dispatchAttempt: 2 })).toBe(true);
+  });
+
+  it('treats two absent dispatch attempts as equal (pre-attempt terminals)', () => {
+    const noAttempt = { currentTurnId: 'turn-1', lastTurnTerminalTurnId: 'turn-1', lastTurnTerminalStatus: 'completed' };
+    expect(editableSuggestionIsCurrent(noAttempt, { turnId: 'turn-1' })).toBe(true);
+  });
+
+  it.each([
+    ['a newer current turn', { ...facts, currentTurnId: 'turn-2' }, { turnId: 'turn-1', dispatchAttempt: 2 }],
+    ['a non-completed terminal', { ...facts, lastTurnTerminalStatus: 'failed' }, { turnId: 'turn-1', dispatchAttempt: 2 }],
+    ['a terminal belonging to another turn', { ...facts, lastTurnTerminalTurnId: 'turn-2' }, { turnId: 'turn-1', dispatchAttempt: 2 }],
+    ['a stale dispatch attempt', facts, { turnId: 'turn-1', dispatchAttempt: 1 }],
+    ['an attempt arriving after an attempt-less terminal', facts, { turnId: 'turn-1' }],
+  ])('rejects %s', (_label, variantFacts, msg) => {
+    expect(editableSuggestionIsCurrent(variantFacts, msg)).toBe(false);
   });
 });

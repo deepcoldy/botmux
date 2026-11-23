@@ -345,7 +345,7 @@ Linux 上，沙盒里的 CLI 调 `botmux send` 发文字、卡片、图片或附
 
 | 后端 | 开沙盒后 |
 |---|---|
-| pty、tmux | 正常支持 |
+| pty、tmux、hc | 正常支持 |
 | zellij、herdr、zmx 等其它本地持久后端 | 建不出同样的文件边界，**拒绝启动**，请换成 pty 或 tmux |
 | Riff、remote-runner 等远端后端 | CLI 在远端执行，本地沙盒**不生效**（会话照常启动，隔离由远端负责）；但同时配了 `sandboxNetworkPolicy` 会拒绝启动 |
 | mojo | 确认整个在远端执行时同远端后端；在本机执行时同本地后端，开沙盒拒绝启动 |

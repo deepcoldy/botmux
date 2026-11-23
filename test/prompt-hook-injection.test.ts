@@ -430,6 +430,12 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     } finally { vi.unstubAllEnvs(); }
   });
 
+  it('hc 会话的 CLI 跑在本机：走 hook 模式，reminder 进 sidecar', () => {
+    const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: 'hc' as const }));
+    expect(result.content).toBe('帮我修个 bug');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<botmux_reminder>');
+  });
+
   it('未知后端类型（白名单外）：强制 inline（hardening）', () => {
     getBotMock.mockReturnValue({
       config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
@@ -672,6 +678,12 @@ describe('promptHookRunsInCli — the UserPromptSubmit hook runs on every submit
     });
     expect(promptHookRunsInCli(target())).toBe(true);
     expect(preflightMock).toHaveBeenLastCalledWith('/tmp/bots/app_test/claude/settings.json');
+  });
+
+  it('runs on every backend that hosts the CLI on this host, hc included', () => {
+    for (const sessionBackendType of ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc'] as const) {
+      expect(promptHookRunsInCli(target({ sessionBackendType }))).toBe(true);
+    }
   });
 
   it('never for a CLI that does not install it, a backend not on this host or not known, or a bot not known', () => {

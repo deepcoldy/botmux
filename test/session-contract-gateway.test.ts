@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionController, controllerForSession } from '../src/core/session-controller.js';
+import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { admitSessionCommand } from '../src/services/session-command-gateway.js';
@@ -104,7 +105,7 @@ describe('contract gateway and real worker boundaries', () => {
       observeTraexAutoModelCapacity() {},
       classifyUsageLimitWithNativeEvidence: (_content: string, status: string) => ({ status }),
       settleBackgroundTasksFromSiblings() {}, refreshBackgroundWait() {},
-      startupInputHeld: () => false, backgroundWaitPayload: () => ({}),
+      startupInputHeld: () => false, backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
       send: (message: any) => messages.push(metadata(message)),
     };
     const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
@@ -162,7 +163,7 @@ describe('contract gateway and real worker boundaries', () => {
       observeTraexAutoModelCapacity() {},
       classifyUsageLimitWithNativeEvidence: (_text: string, value: string) => ({ status: value }),
       settleBackgroundTasksFromSiblings() {}, refreshBackgroundWait() {},
-      startupInputHeld: () => false, backgroundWaitPayload: () => ({}), backgroundWaitTasks: 0,
+      startupInputHeld: () => false, backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(), backgroundWaitTasks: 0,
       send: (message: any) => messages.push(metadata(message)),
     };
     env.snapshotWithLatestRuntimeStatus = loadWorkerFunction('snapshotWithLatestRuntimeStatus', env);

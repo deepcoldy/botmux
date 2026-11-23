@@ -184,6 +184,14 @@ describe('confirmed native Codex model preferences', () => {
     expect(resolve(session, 'opus')).toBe('opus');
   });
 
+  it('follows a native /model in an hc terminal like in tmux', () => {
+    const session = { ...subject(), backendType: 'hc' };
+    expect(recordCodexModelLaunch(session, 'A')).toBe(true);
+    writeFileSync(path, settings('A') + settings('B', start + 200));
+    refreshCodexModelSelection(session, path, 'A');
+    expect(resolve(session)).toBe('B');
+  });
+
   it.each([
     { cliId: 'traex' }, { cliId: 'claude-code' }, { cliId: 'codex-app' },
     { adoptedFrom: {} }, { existingAppServerEndpoint: 'external' },

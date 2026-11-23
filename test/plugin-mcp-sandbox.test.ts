@@ -18,8 +18,10 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { prepareDirectSandbox, probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
 import { buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
+import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import { expandHomePath } from '../src/utils/working-dir.js';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import { ensureGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
 import {
@@ -84,6 +86,7 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
     ['codex', 'default'], ['codex', 'custom'],
     ['traex', 'default'], ['traex', 'custom'],
     ['coco', 'default'], ['coco', 'custom'],
+    ['antigravity', 'default'], ['antigravity', 'custom'],
   ] as const)(
     'relays a session MCP through the trusted host without exposing descriptors in bwrap (%s, %s data dir)',
     async (cliId, dataDirMode) => {
@@ -126,11 +129,13 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
       const gatewayBin = join(home, '.botmux', 'bin', 'botmux');
       const traeAdapter = cliId === 'traex' ? createTraexAdapter('/bin/traex')
         : cliId === 'coco' ? createCocoAdapter('/bin/coco') : undefined;
-      const cliConfig = traeAdapter?.mcpGateway?.configPath ?? join(root, 'codex-config.toml');
+      const agyAdapter = cliId === 'antigravity' ? createAntigravityAdapter('/bin/agy') : undefined;
+      const cliConfig = traeAdapter?.mcpGateway?.configPath
+        ?? (agyAdapter ? expandHomePath(agyAdapter.mcpGateway!.configPath) : join(root, 'codex-config.toml'));
       mkdirSync(join(home, '.botmux', 'bin'), { recursive: true });
       writeFileSync(gatewayBin, '#!/bin/sh\nexit 99\n');
       chmodSync(gatewayBin, 0o755);
-      const installReport = ensureGatewayEntry(traeAdapter ?? {
+      const installReport = ensureGatewayEntry(traeAdapter ?? agyAdapter ?? {
         id: 'codex',
         mcpGateway: { format: 'codex-toml', configPath: cliConfig },
       }, {
@@ -138,7 +143,7 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
         args: ['mcp', 'serve'],
       });
       expect(installReport.state).toBe('installed');
-      const forwardedKeys = codexForwardedEnvKeys(cliConfig);
+      const forwardedKeys = agyAdapter ? undefined : codexForwardedEnvKeys(cliConfig);
 
       let gatewayHost: SessionMcpGatewayHost | null = null;
       let sandbox: ReturnType<typeof prepareDirectSandbox> = null;
@@ -166,6 +171,7 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
           currentAppId: 'cli_test',
           botHome,
           redirectedCliData: cliId === 'codex',
+          authPaths: (agyAdapter?.authPaths ?? []).map(expandHomePath),
           readonlyRoots: [
             // Match worker's dependency carve-out for symlinked worktrees.
             realpathSync(resolve('node_modules')),
@@ -230,10 +236,15 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
           [MCP_GATEWAY_SOCKET_ENV]: gatewayHost.socketPath,
           [MCP_GATEWAY_REQUIRED_ENV]: '1',
         };
-        const nativeLauncherEnv = Object.fromEntries(
-          forwardedKeys.flatMap(key => parentGatewayEnv[key] === undefined ? [] : [[key, parentGatewayEnv[key]]]),
-        );
-        expect(nativeLauncherEnv).toEqual(parentGatewayEnv);
+        const nativeLauncherEnv = agyAdapter
+          ? {
+              ...parentGatewayEnv,
+              ...(JSON.parse(readFileSync(cliConfig, 'utf8')).mcpServers.botmux.env as Record<string, string>),
+            }
+          : Object.fromEntries(
+              forwardedKeys!.flatMap(key => parentGatewayEnv[key] === undefined ? [] : [[key, parentGatewayEnv[key]]]),
+            );
+        expect(nativeLauncherEnv).toMatchObject(parentGatewayEnv);
 
         transport = new StdioClientTransport({
           command: sandbox.bin,

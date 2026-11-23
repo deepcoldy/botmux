@@ -100,6 +100,7 @@ import {
 import type { DaemonSession, GroupJoinContext } from './types.js';
 import { stagePendingRepoSetup, persistPendingRepoCardMessageId, restorePendingRepoRuntime } from './pending-repo-journal.js';
 import { announceSessionRow, clearAgentAttention, markSessionActivity, stampHumanActivity, announcePendingRepoSession } from './session-activity.js';
+import { noteTurnStarted } from './turn-outcome.js';
 import { applyFollowActive, followActiveOpenedFreshTopic, recordFollowActiveFreshTopic } from './schedule-follow-active.js';
 import { resolveScheduleModelOverride } from './schedule-model-override.js';
 import { scanMultipleProjects } from '../services/project-scanner.js';
@@ -511,8 +512,8 @@ async function closeActiveSessionIfCliMismatch(ds: DaemonSession): Promise<CliMi
     try {
       killPersistentBackendTarget(target, ds.session.sessionId);
     } catch (err) {
-      // ZMX destruction is deliberately identity-verified and can fail on an
-      // inconclusive probe or a generation change. Never close the persisted
+      // ZMX and hc destruction is deliberately identity-verified and can fail on
+      // an inconclusive probe or a generation change. Never close the persisted
       // row in that state: doing so would orphan a possibly-live CLI with no
       // retryable ownership record. The caller skips this row and continues
       // restoring/sweeping unrelated sessions.
@@ -2190,7 +2191,7 @@ const HOOK_ENVELOPE_MAX_CHARS = 8000;
 
 /** Backends known to run the CLI on this host, where botmux's UserPromptSubmit
  *  hook can run (an allowlist). */
-const PROMPT_HOOK_LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx']);
+const PROMPT_HOOK_LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc']);
 
 /**
  * 判定该 follow-up 是否走 hook 注入模式（#794 P1 方向 B）。四重条件全部满足：
@@ -5238,6 +5239,9 @@ export async function executeScheduledTask(
             + `(running on ${existing.session.model ?? 'the CLI default'})`,
           );
         }
+        // Keep the dispatch timestamp with the durable outcome so a restored
+        // next-step button can distinguish later input from this scheduled run.
+        noteTurnStarted(existing, scheduledTurnId);
         // Identity preparation may reject after a concurrent pause/revocation.
         // Run it before changing the retained conversation's routing or prompt.
         await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
@@ -5400,6 +5404,7 @@ export async function executeScheduledTask(
       // resume of this session (see resolveSessionLaunchModel).
       ...(modelOverride.model ? { spawnModelOverride: modelOverride.model } : {}),
     };
+    noteTurnStarted(ds, scheduledTurnId);
     if (sharedTopicRootId) {
       beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);
       sessionStore.updateSession(ds.session);

@@ -15,6 +15,7 @@ export const UNATTENDED_INPUT_REFUSALS = [
   'action_prompt_open',
   'prompt_not_framed',
   'composer_not_empty',
+  'away_summary_pending',
 ] as const;
 
 export type PromptCacheKeepaliveRefusal = typeof UNATTENDED_INPUT_REFUSALS[number];

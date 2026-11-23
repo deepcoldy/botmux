@@ -2435,16 +2435,22 @@ export interface BotConfig {
    */
   replyCardActions?: boolean;
   /**
-   * Per-bot opt-in for the「下一步」row: the CLI's own next-input suggestion
-   * (Claude Code's greyed-out prompt suggestion) as a button above the last
-   * reply card's footer. Default (undefined) keeps reply cards unchanged.
+   * Per-bot opt-in for the「下一步」row above the last reply card's footer.
+   * Claude Code uses its native prompt suggestion. Codex generates a draft
+   * after replying that the user can edit and confirm. Off by default.
    */
   replyCardNextStep?: boolean;
   /**
    * Per-bot opt-in for the collapsed「本轮回顾」panel above the last reply
    * card's footer, holding the CLI's own recap of the turn (Claude Code's
-   * transcript away summary). A turn the CLI does not recap gets no panel.
-   * Default (undefined) keeps reply cards unchanged.
+   * transcript away summary). In Claude Code sessions botmux also gets that
+   * recap written: once a turn's last card settled and the CLI sits idle at an
+   * empty input box, it reports the terminal unfocused (Claude Code writes its
+   * away summary only then, about 3 minutes after the turn) and reports focus
+   * back on the next input, a web terminal opening, or the summary landing —
+   * one extra background model call per recapped turn. A turn the CLI does
+   * not recap, and every other CLI, gets no panel. Default (undefined) keeps
+   * reply cards unchanged.
    */
   replyCardRecap?: boolean;
   /**

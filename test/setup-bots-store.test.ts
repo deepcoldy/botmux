@@ -7,7 +7,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { writeBotsJsonAtomic, readBotsJsonOrEmpty, mutateBotsJsonAtomic } from '../src/setup/bots-store.js';
+import {
+  BotsJsonStaleSnapshotError,
+  writeBotsJsonAtomic,
+  readBotsJsonOrEmpty,
+  mutateBotsJsonAtomic,
+} from '../src/setup/bots-store.js';
+import { persistRenamedBotName } from '../src/services/bot-name-sync.js';
 
 let tmpDir: string;
 let botsPath: string;
@@ -23,7 +29,7 @@ afterEach(() => {
 
 describe('writeBotsJsonAtomic', () => {
   it('writes valid JSON with trailing newline', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_1', larkAppSecret: 's1' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_1', larkAppSecret: 's1' }], null);
     expect(existsSync(botsPath)).toBe(true);
     const content = readFileSync(botsPath, 'utf-8');
     expect(content.endsWith('\n')).toBe(true);
@@ -33,26 +39,26 @@ describe('writeBotsJsonAtomic', () => {
   });
 
   it('persists the brand field so subsequent start/verify reads it back', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_lark', larkAppSecret: 's', brand: 'lark' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_lark', larkAppSecret: 's', brand: 'lark' }], null);
     const parsed = readBotsJsonOrEmpty(botsPath);
     expect(parsed[0].brand).toBe('lark');
   });
 
   it('cleans up the tmp file after rename (only bots.json remains)', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_2', larkAppSecret: 's2' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_2', larkAppSecret: 's2' }], null);
     expect(existsSync(botsPath + '.tmp')).toBe(false);
     expect(existsSync(botsPath)).toBe(true);
   });
 
   it('replaces existing file atomically — old content gone, new content visible', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_old', larkAppSecret: 'old' }]);
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_new', larkAppSecret: 'new' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_old', larkAppSecret: 'old' }], null);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_new', larkAppSecret: 'new' }], null);
     const parsed = JSON.parse(readFileSync(botsPath, 'utf-8'));
     expect(parsed[0].larkAppId).toBe('cli_new');
   });
 
   it('sets file mode 0o600 (only owner can read — secret protection)', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_x', larkAppSecret: 'secret' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_x', larkAppSecret: 'secret' }], null);
     const mode = statSync(botsPath).mode & 0o777;
     // 在 root 用户 / fakeroot 下 umask 可能影响; 但 0o600 是 writeFileSync 显式指定的
     // 实际结果应该精确等于 0o600.
@@ -63,17 +69,17 @@ describe('writeBotsJsonAtomic', () => {
     // 通过 spy fs.writeFileSync 监控 tmp 路径 — 简单版: 检查 bots.json.tmp 在
     // bots.json 同目录. 实现细节: 只要写完 + rename 完不出错, 同目录假设成立.
     // 这里跑一次 + 校验 bots.json 出现在 tmpDir, 间接保证 tmp 路径也在 tmpDir.
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_t', larkAppSecret: 's' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_t', larkAppSecret: 's' }], null);
     expect(existsSync(join(tmpDir, 'bots.json'))).toBe(true);
   });
 
   it('rejects a cloned next generation that would create a fallback cycle', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_safe', larkAppSecret: 's' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_safe', larkAppSecret: 's' }], null);
     const before = readFileSync(botsPath, 'utf8');
     expect(() => writeBotsJsonAtomic(botsPath, [
       { larkAppId: 'cli_a', quotaFallbackBot: { enabled: true, targetAppId: 'cli_b' } },
       { larkAppId: 'cli_b', quotaFallbackBot: { enabled: true, targetAppId: 'cli_a' } },
-    ])).toThrow('cli_a -> cli_b -> cli_a');
+    ], null)).toThrow('cli_a -> cli_b -> cli_a');
     expect(readFileSync(botsPath, 'utf8')).toBe(before);
   });
 
@@ -84,10 +90,10 @@ describe('writeBotsJsonAtomic', () => {
       cliId: 'codex-app',
       codexBrowser: { enabled: true, family: 'chrome' },
     };
-    writeBotsJsonAtomic(botsPath, [original]);
+    writeBotsJsonAtomic(botsPath, [original], null);
     const before = readFileSync(botsPath, 'utf8');
 
-    expect(() => writeBotsJsonAtomic(botsPath, [{ ...original, cliId: 'claude-code' }]))
+    expect(() => writeBotsJsonAtomic(botsPath, [{ ...original, cliId: 'claude-code' }], null))
       .toThrow('codex_browser_requires_codex_app');
     expect(readFileSync(botsPath, 'utf8')).toBe(before);
   });
@@ -102,12 +108,12 @@ describe('writeBotsJsonAtomic', () => {
     const editable = { larkAppId: 'cli_editable', larkAppSecret: 's', cliId: 'codex-app', lang: 'en' };
     writeFileSync(botsPath, JSON.stringify([legacyInvalid, editable], null, 2));
 
-    expect(() => writeBotsJsonAtomic(botsPath, [legacyInvalid, { ...editable, lang: 'zh' }]))
+    expect(() => writeBotsJsonAtomic(botsPath, [legacyInvalid, { ...editable, lang: 'zh' }], null))
       .not.toThrow();
     expect(readBotsJsonOrEmpty(botsPath)[1].lang).toBe('zh');
   });
   it('mutates the latest on-disk generation and returns the committed result', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_a', larkAppSecret: 'a' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_a', larkAppSecret: 'a' }], null);
     const result = mutateBotsJsonAtomic(botsPath, previous => {
       expect(previous.map(bot => bot.larkAppId)).toEqual(['cli_a']);
       return {
@@ -117,6 +123,35 @@ describe('writeBotsJsonAtomic', () => {
     });
     expect(result).toEqual({ index: 1 });
     expect(readBotsJsonOrEmpty(botsPath).map(bot => bot.larkAppId)).toEqual(['cli_a', 'cli_b']);
+  });
+
+  it('rejects a stale derived snapshot that crosses a committed rename, then permits a fresh retry', async () => {
+    writeBotsJsonAtomic(botsPath, [{
+      larkAppId: 'cli_a', larkAppSecret: 'a', cliId: 'doubao', name: 'old-a', model: 'original',
+    }], null);
+    const stale = readBotsJsonOrEmpty(botsPath);
+    const humanEdit = [...stale];
+    humanEdit[0] = { ...humanEdit[0], model: 'human-edit' };
+
+    expect(await persistRenamedBotName('cli_a', 'Remote New Name', botsPath)).toBe('Remote-New-Name');
+    expect(() => writeBotsJsonAtomic(botsPath, humanEdit, stale)).toThrow(BotsJsonStaleSnapshotError);
+
+    // The rejected writer neither restores the old name nor loses the rename's fields.
+    const latest = readBotsJsonOrEmpty(botsPath);
+    expect(latest[0]).toMatchObject({ name: 'Remote-New-Name', model: 'original' });
+    latest[0].model = 'human-edit';
+    writeBotsJsonAtomic(botsPath, latest, latest);
+    expect(readBotsJsonOrEmpty(botsPath)[0]).toMatchObject({
+      name: 'Remote-New-Name', model: 'human-edit',
+    });
+  });
+
+  it('does not let a snapshot of a missing file overwrite a subsequent creation', () => {
+    const staleEmpty = readBotsJsonOrEmpty(botsPath);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_new', larkAppSecret: 'new' }], null);
+    expect(() => writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_stale' }], staleEmpty))
+      .toThrow(BotsJsonStaleSnapshotError);
+    expect(readBotsJsonOrEmpty(botsPath).map(bot => bot.larkAppId)).toEqual(['cli_new']);
   });
 });
 
@@ -131,7 +166,7 @@ describe('readBotsJsonOrEmpty', () => {
   });
 
   it('returns parsed array when file is valid', () => {
-    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'a', larkAppSecret: 's' }, { larkAppId: 'b', larkAppSecret: 's' }]);
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'a', larkAppSecret: 's' }, { larkAppId: 'b', larkAppSecret: 's' }], null);
     expect(readBotsJsonOrEmpty(botsPath).map((b: any) => b.larkAppId)).toEqual(['a', 'b']);
   });
 });

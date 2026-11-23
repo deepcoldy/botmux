@@ -21,6 +21,7 @@ import type { ModelFallbackState } from '../types.js';
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 // provider-retry-hint 同样零依赖（只用语言内建）。
 import { parseProviderRetryAtMs } from './provider-retry-hint.js';
+import { PROMPT_CACHE_KEEPALIVE_TAG } from './prompt-cache-policy.js';
 
 /** Read the session identity published by one live Claude Code process. */
 export function readClaudeSessionMeta(
@@ -70,7 +71,15 @@ export interface TranscriptEvent {
      *  placeholder (`isApiErrorMessage:false`, text "No response requested.",
      *  usage all zero, no `requestId`) — see {@link isSyntheticNoModelReplyEvent}. */
     model?: string;
+    /** API usage of the request this assistant record answers. */
+    usage?: { input_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
   };
+  /** `type:"api-request"` records (Claude Code ≥2.1.304): which loop sent the
+   *  request; the main conversation's are `repl_main_thread`. */
+  querySource?: string;
+  /** Who put a user record's prompt in (Claude Code ≥2.1.3xx): `human` for one
+   *  typed into the CLI, `plugin` for one a plugin injected, … */
+  origin?: { kind?: string };
   /** API-error records. When the model call fails, Claude Code writes a
    *  `type:"assistant"` line with `isApiErrorMessage:true` and a machine
    *  `error` code (e.g. "rate_limit", "server_error", "authentication_failed",
@@ -1162,6 +1171,155 @@ export class BackgroundTaskTracker {
   }
 }
 
+/** `querySource` of the main conversation's `api-request` records. */
+const MAIN_THREAD_QUERY_SOURCE = 'repl_main_thread';
+/** Transcript tail {@link ClaudeModelRequestClock.seedFromTail} reads: a
+ *  busy session writes about this much in a few hours. */
+const MODEL_REQUEST_CLOCK_SEED_BYTES = 4 * 1024 * 1024;
+
+/**
+ * When the main conversation's latest model request was served, read from its
+ * transcript. The prompt cache lives from the START of the request that read
+ * it (generation time counts against it), and only a request the model
+ * answered read it; one rejected as overloaded or rate-limited did not. So:
+ *  - an `api-request` record (`querySource:"repl_main_thread"`, Claude Code
+ *    ≥2.1.304) gives a request's start. It is written as the request goes out,
+ *    also for requests that then fail, so on its own it proves nothing;
+ *  - the main-thread `assistant` record carrying real usage proves the request
+ *    was served, and is credited with the start before it. Builds without
+ *    `api-request` records credit the response's own time, the approximation
+ *    the idle edge after a botmux turn already makes;
+ *  - API-error and `<synthetic>` records, sidechains, and the content blobs
+ *    (`api-request-blob`, whose `message.role` can be `assistant`) prove
+ *    nothing. A sub-agent's or a fork's request does not read this prefix.
+ * Two readings with different time anchors: every served request keeps the
+ * cache warm FROM ITS START, whoever sent it; every response except those of
+ * idle upkeep turns also means the session was in use AT ITS COMPLETION.
+ * Keeping those anchors separate prevents a long generation from counting as
+ * idle time. Idle upkeep is botmux's own prompt-cache keep-alive (recognised
+ * by its tag) and a prompt a plugin injected (`origin.kind:"plugin"`, e.g. a
+ * cache-keeping plugin's "stepping away" summary): keeping a session warm
+ * must not look like using it.
+ */
+export class ClaudeModelRequestClock {
+  /** Native Claude conversation every remembered timestamp belongs to. */
+  private claudeSessionId = '';
+  private requestStartMs: number | undefined;
+  private servedMs: number | undefined;
+  private activityAtMs: number | undefined;
+  private turnOpen = false;
+  /** The open turn is idle upkeep. Unknown (a worker attached mid-turn, a
+   *  turn whose start no record marks) counts as activity: errs toward not
+   *  compacting. */
+  private upkeepTurn = false;
+  /** Start of the last request credited to upkeep: later records of that same
+   *  request (a response split over several records) stay upkeep after its
+   *  turn has ended. */
+  private upkeepRequestStartMs: number | undefined;
+
+  get boundClaudeSessionId(): string {
+    return this.claudeSessionId;
+  }
+
+  /** Rebind to another native conversation. Request and response timestamps
+   *  from the old transcript say nothing about this one's cache or activity;
+   *  carrying them over can make a cold `/resume` target look freshly read. */
+  bind(claudeSessionId: string): boolean {
+    if (claudeSessionId === this.claudeSessionId) return false;
+    this.claudeSessionId = claudeSessionId;
+    this.requestStartMs = undefined;
+    this.servedMs = undefined;
+    this.activityAtMs = undefined;
+    this.turnOpen = false;
+    this.upkeepTurn = false;
+    this.upkeepRequestStartMs = undefined;
+    return true;
+  }
+
+  observe(ev: TranscriptEvent): void {
+    if (!ev || typeof ev !== 'object' || ev.isSidechain === true) return;
+    if (ev.type !== 'queue-operation' && isClaudeMainTurnStart(ev)) {
+      const upkeep = isIdleUpkeepTurnStart(ev);
+      // Upkeep folded into a running turn does not take that turn over.
+      this.upkeepTurn = upkeep && (!this.turnOpen || this.upkeepTurn);
+      this.turnOpen = true;
+      return;
+    }
+    if (isMidTurnAbsorbedQueuedCommand(ev)) {
+      // Someone's input folded into the running turn: it is real work now.
+      this.upkeepTurn = false;
+      return;
+    }
+    if (ev.type === 'api-request') {
+      const at = ev.querySource === MAIN_THREAD_QUERY_SOURCE ? eventTimeMs(ev) : undefined;
+      if (at !== undefined) this.requestStartMs = at;
+      return;
+    }
+    const served = this.servedRequest(ev);
+    if (served !== undefined) {
+      // Cache TTL starts at the request; activity starts at the response. A
+      // long generation keeps the screen busy and must not also count as idle.
+      if (this.servedMs === undefined || served.startedAt > this.servedMs) this.servedMs = served.startedAt;
+      if (this.upkeepTurn || served.startedAt === this.upkeepRequestStartMs) {
+        this.upkeepRequestStartMs = served.startedAt;
+      } else if (this.activityAtMs === undefined || served.completedAt > this.activityAtMs) {
+        this.activityAtMs = served.completedAt;
+      }
+    }
+    if (isClaudeTurnTerminalEvent(ev)) {
+      // Whatever the next turn is, nothing here says it is upkeep: a slash
+      // command typed in the terminal writes no record that starts a turn.
+      this.turnOpen = false;
+      this.upkeepTurn = false;
+    }
+  }
+
+  /** Start and completion of a main-thread assistant record that proves a
+   *  served request; undefined for any other record. */
+  private servedRequest(ev: TranscriptEvent): { startedAt: number; completedAt: number } | undefined {
+    if (ev.type !== 'assistant' || ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) return undefined;
+    const usage = ev.message?.usage;
+    const tokens = (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0) + (usage?.cache_creation_input_tokens ?? 0);
+    if (!(tokens > 0)) return undefined;
+    const completedAt = eventTimeMs(ev);
+    if (completedAt === undefined) return undefined;
+    const startedAt = this.requestStartMs !== undefined && this.requestStartMs <= completedAt
+      ? this.requestStartMs
+      : completedAt;
+    return { startedAt, completedAt };
+  }
+
+  /**
+   * Read the last `maxBytes` of a transcript the caller is about to follow
+   * from its end (a worker starting after a daemon restart, a resume), so
+   * the clock does not start out knowing nothing. Its requests are as real
+   * as live ones; a partial first line is skipped.
+   */
+  seedFromTail(path: string, maxBytes = MODEL_REQUEST_CLOCK_SEED_BYTES): void {
+    const size = statSync(path).size;
+    for (const ev of drainTranscript(path, Math.max(0, size - maxBytes)).events) this.observe(ev);
+  }
+
+  /** Start (epoch ms) of the latest served request seen; undefined until one. */
+  lastServedAt(): number | undefined {
+    return this.servedMs;
+  }
+
+  /** Completion of the latest served response that was not idle upkeep. This
+   *  is deliberately later than its request start: response-generation time
+   *  is busy time, not idle time. */
+  lastActivityAt(): number | undefined {
+    return this.activityAtMs;
+  }
+}
+
+/** A turn start that only keeps an idle session warm: botmux's own keep-alive
+ *  (typed, so stamped as a person's prompt, but tagged) or a plugin's prompt. */
+function isIdleUpkeepTurnStart(ev: TranscriptEvent): boolean {
+  return ev.origin?.kind === 'plugin'
+    || extractTurnStartText(ev).trimStart().startsWith(PROMPT_CACHE_KEEPALIVE_TAG);
+}
+
 /** Extract the user-typed prompt text for a "turn start" event — works for
  *  both legacy `role:user` events (text in `message.content`) and the
  *  type-ahead `attachment(queued_command)` form (text in `attachment.prompt`).
@@ -1915,13 +2073,32 @@ export function stringifyUserContent(content: unknown): string {
 }
 
 /**
- * Collapse whitespace + trim. Same normalisation applied on both sides
- * of the fingerprint compare (the Lark message that produces the
- * fingerprint, and the transcript user content we search through),
- * so newlines / tabs / double-spaces don't break the match.
+ * Collapse whitespace + trim. This is the stable identity normalisation used
+ * when a Lark mark or a persisted fingerprint/hash is created. Keep literal
+ * backslashes significant: removing them here would make distinct inputs
+ * collide and would make pre-upgrade journal entries impossible to migrate
+ * (their line breaks have already been collapsed to spaces).
  */
 export function normaliseForFingerprint(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Normalisation candidates for TEXT READ BACK FROM A CLAUDE TRANSCRIPT.
+ * The first candidate is always the legacy identity above. The second drops
+ * at most one backslash immediately before each LF/CRLF, tolerating the
+ * soft-newline marker that Ink sometimes leaves behind in paste-burst mode.
+ *
+ * The second candidate is comparison-only: never use it to create a mark, a
+ * persisted hash, or full-content consumption evidence. In particular, a
+ * genuine line-ending backslash remains significant in the first candidate,
+ * while N genuine backslashes plus one residual marker still normalise back
+ * to N in the second.
+ */
+export function normaliseTranscriptFingerprintCandidates(s: string): string[] {
+  const legacy = normaliseForFingerprint(s);
+  const withoutSoftNewlineResidue = normaliseForFingerprint(s.replace(/\\(?=\r?\n)/g, ''));
+  return withoutSoftNewlineResidue === legacy ? [legacy] : [legacy, withoutSoftNewlineResidue];
 }
 
 /**
@@ -2111,8 +2288,8 @@ export function jsonlContainsFingerprint(
     } else {
       continue;
     }
-    const normalisedText = normaliseForFingerprint(lineText);
-    if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) return true;
+    if (normaliseTranscriptFingerprintCandidates(lineText)
+      .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) return true;
   }
   return false;
 }
@@ -2208,8 +2385,8 @@ function jsonlTailMatchFingerprint(
         } else {
           continue;
         }
-        const normalisedText = normaliseForFingerprint(text);
-        if (normalisedText.length > 0 && normalisedText.includes(fingerprint)) {
+        if (normaliseTranscriptFingerprintCandidates(text)
+          .some(candidate => candidate.length > 0 && candidate.includes(fingerprint))) {
           hit = true;
           break;
         }
@@ -2372,8 +2549,7 @@ export function findJsonlsContainingExactContent(
           } else {
             continue;
           }
-          const normalised = normaliseForFingerprint(raw);
-          if (normalised === normalisedContent) {
+          if (normaliseTranscriptFingerprintCandidates(raw).includes(normalisedContent)) {
             hit = true;
             break;
           }

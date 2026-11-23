@@ -57,7 +57,7 @@ interface ScopeView {
   tmuxServers?: TmuxServerView[];
 }
 
-const SHELL_WRAPPED_BACKENDS = new Set(['tmux', 'zellij', 'zmx']);
+const SHELL_WRAPPED_BACKENDS = new Set(['tmux', 'zellij', 'zmx', 'hc']);
 
 function scopeUrl(scope: SessionEnvScope): string {
   return scope.kind === 'global' ? '/api/session-env' : `/api/bots/${encodeURIComponent(scope.larkAppId)}/session-env`;

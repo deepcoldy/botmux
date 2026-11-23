@@ -405,6 +405,90 @@ describe('local-cli-opener', () => {
     }
   });
 
+  describe('hc', () => {
+    const hcSession = (target: Record<string, unknown>) => ds({
+      session: {
+        ...ds().session,
+        sessionId: 'abcdef123456',
+        backendType: 'hc',
+        persistentBackendTarget: target as any,
+        cliSessionId: undefined,
+      },
+    });
+    const recorded = { backendType: 'hc', sessionName: 'bmx-abcdef12', hcSession: 'botmux', socket: "/tmp/owner's hc/herdr-core/botmux.sock" };
+
+    function withFakeHc<T>(run: (bin: string) => T): T {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-opener-hc-'));
+      const bin = join(dir, 'herdr-core');
+      writeFileSync(bin, "#!/bin/sh\necho 'hc 0.1.19'\n", { mode: 0o755 });
+      vi.stubEnv('BOTMUX_HC_BIN', bin);
+      try {
+        return run(bin);
+      } finally {
+        vi.unstubAllEnvs();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+
+    it('attach mode delegates hc to the label-verifying helper on the recorded core, pinning the discovered binary', () => {
+      withFakeHc((bin) => {
+        const adapterFactory = vi.fn(() => ({ buildResumeCommand: () => 'codex resume should-not-run' }));
+        const result = buildLocalCliOpenCommand(hcSession(recorded), { mode: 'attach', adapterFactory });
+        expect(result.ok).toBe(true);
+        if (!result.ok) return;
+        const [prelude, helper] = result.command.split('; exec ');
+        expect(prelude).toBe(`export BOTMUX_HC_BIN=${shellQuote(bin)}`);
+        expect(helper.startsWith(`${shellQuote(process.execPath)} `)).toBe(true);
+        expect(helper.endsWith(
+          "'__hc-attach-managed' 'bmx-abcdef12' 'abcdef123456' 'botmux' '/tmp/owner'\\''s hc/herdr-core/botmux.sock'",
+        )).toBe(true);
+        expect(result.command).not.toMatch(/\battach '?bmx-/);
+        expect(adapterFactory).not.toHaveBeenCalled();
+      });
+    });
+
+    it('still hands hc to the helper when this process finds no usable hc, without pinning a binary', () => {
+      vi.stubEnv('BOTMUX_HC_BIN', '/nonexistent/botmux-opener-hc');
+      try {
+        const result = buildLocalCliOpenCommand(hcSession(recorded), { mode: 'attach' });
+        expect(result.ok).toBe(true);
+        if (!result.ok) return;
+        expect(result.command.startsWith('exec ')).toBe(true);
+        expect(result.command).not.toContain('BOTMUX_HC_BIN');
+        expect(result.command).toContain("'__hc-attach-managed' 'bmx-abcdef12' 'abcdef123456' 'botmux'");
+      } finally { vi.unstubAllEnvs(); }
+    });
+
+    it('refuses an hc row whose core socket cannot be resolved', () => {
+      vi.stubEnv('XDG_RUNTIME_DIR', `/tmp/${'x'.repeat(120)}`);
+      try {
+        const result = buildLocalCliOpenCommand(
+          hcSession({ backendType: 'hc', sessionName: 'bmx-abcdef12', hcSession: 'botmux', socket: '' }),
+          { mode: 'attach' },
+        );
+        expect(result).toMatchObject({ ok: false, error: 'missing_attach_target' });
+      } finally { vi.unstubAllEnvs(); }
+    });
+
+    it('compiled binary attaches hc with the subcommand first, never a script path', () => {
+      const realArgv1 = process.argv[1];
+      process.argv[1] = '/$bunfs/root/cli.js';
+      try {
+        withFakeHc(() => {
+          const result = buildLocalCliOpenCommand(hcSession(recorded), { mode: 'attach' });
+          expect(result.ok).toBe(true);
+          if (!result.ok) return;
+          expect(result.command.split('; exec ')[1]).toBe(
+            `${shellQuote(process.execPath)} '__hc-attach-managed' 'bmx-abcdef12' 'abcdef123456' 'botmux' '/tmp/owner'\\''s hc/herdr-core/botmux.sock'`,
+          );
+          expect(result.command).not.toContain('$bunfs');
+        });
+      } finally {
+        process.argv[1] = realArgv1;
+      }
+    });
+  });
+
   it('attach mode opens adopted Herdr by exact scoped terminal id when available', () => {
     const result = buildLocalCliOpenCommand(ds({
       adoptedFrom: { source: 'herdr', herdrSessionName: 'dev', herdrTerminalId: 'terminal_1', cwd: '/repo' },

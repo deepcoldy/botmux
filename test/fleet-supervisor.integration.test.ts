@@ -612,39 +612,110 @@ setInterval(() => {}, 1000);
     expect(after.restarts).toBe(0);
   });
 
-  it('parks a proc errored after exceeding max_restarts', async () => {
+  it('recovers after an outage outlasts the fast-restart budget', async () => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');
-    const CRASH = `process.exit(1);`;
+    const available = join(root, 'dependency-available');
+    const launches = join(root, 'launches');
+    const DEPENDENCY = `
+require('fs').appendFileSync(${JSON.stringify(launches)}, 'x');
+if (!require('fs').existsSync(${JSON.stringify(available)})) process.exit(1);
+${STAY}`;
     const sup = new FleetSupervisor({
-      statePath, distDir: fakeDist(root, CRASH), daemonEnv: {}, cwd: root,
-      policy: { maxRestarts: 3, restartDelayMs: 20 }, log: () => {},
+      statePath, distDir: fakeDist(root, DEPENDENCY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 3, restartDelayMs: 20, restartCooldownMs: 300, resetAfterMs: 60_000 }, log: () => {},
     });
-    sup.start([bots[0]]);
-    const parked = await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'errored', 8000);
-    expect(parked).toBe(true);
-    // exactly maxRestarts crash-restarts happened before parking
-    expect(readFleetState(statePath)!.procs[0].restarts).toBe(3);
+    try {
+      sup.start([bots[0]]);
+      expect(await waitFor(() => {
+        const p = readFleetState(statePath)?.procs[0];
+        return existsSync(launches) && readFileSync(launches, 'utf-8').length >= 6
+          && p?.status === 'launching';
+      })).toBe(true);
+      const count = readFileSync(launches, 'utf-8').length;
+      expect(readFleetState(statePath)!.procs[0].restarts).toBe(3);
+      await delay(100); // no rapid respawn once the budget is exhausted
+      expect(readFileSync(launches, 'utf-8').length).toBe(count);
 
-    await sup.stopAll();
+      writeFileSync(available, 'available');
+      expect(await waitFor(() => readFileSync(launches, 'utf-8').length > count
+        && readFleetState(statePath)?.procs[0]?.status === 'online')).toBe(true);
+      const pid = readFleetState(statePath)!.procs[0].pid;
+      await delay(400); // recovered child stays online across another cooldown
+      expect(readFleetState(statePath)!.procs[0]).toMatchObject({ pid, status: 'online' });
+      expect(pidAlive(pid)).toBe(true);
+    } finally {
+      await sup.stopAll();
+    }
   });
 
-  it('a fresh operator start resets a parked/crashed proc restart budget (crash respawn preserves it)', async () => {
+  it.each(['stopOneBot', 'stopAll'] as const)('%s cancels an exhausted-budget cooldown', async (stop) => {
     const root = tmp();
     const statePath = join(root, 'fleet.json');
-    // First: a crash-looper that parks at restarts=3.
+    const launches = join(root, 'launches');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, `require('fs').appendFileSync(${JSON.stringify(launches)}, 'x'); process.exit(1);`),
+      daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 0, restartDelayMs: 20, restartCooldownMs: 300 }, log: () => {},
+    });
+    try {
+      sup.start([bots[0]]);
+      expect(await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'launching')).toBe(true);
+      if (stop === 'stopOneBot') await sup.stopOneBot(bots[0].name);
+      else await sup.stopAll();
+      const count = readFileSync(launches, 'utf-8').length;
+      await delay(450);
+      expect(readFileSync(launches, 'utf-8').length).toBe(count);
+      expect(readFleetState(statePath)!.procs[0]).toMatchObject({ status: 'stopped', pid: 0 });
+    } finally {
+      await sup.stopAll();
+    }
+  });
+
+  it('a stable run resets the fast-restart budget on the next crash', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 1, restartDelayMs: 20, restartCooldownMs: 1500, resetAfterMs: 200 }, log: () => {},
+    });
+    try {
+      sup.start([bots[0]]);
+      const first = readFleetState(statePath)!.procs[0].pid;
+      process.kill(first, 'SIGKILL');
+      expect(await waitFor(() => {
+        const p = readFleetState(statePath)?.procs[0];
+        return p?.status === 'online' && p.pid !== first && p.restarts === 1;
+      })).toBe(true);
+      const second = readFleetState(statePath)!.procs[0].pid;
+      await delay(250);
+      process.kill(second, 'SIGKILL');
+      expect(await waitFor(() => {
+        const p = readFleetState(statePath)?.procs[0];
+        return p?.status === 'online' && p.pid !== second && p.restarts === 1;
+      }, 1000)).toBe(true); // stable uptime restores the fast delay, not 1500ms
+    } finally {
+      await sup.stopAll();
+    }
+  });
+
+  it('a fresh operator start resets a crashed proc restart budget (crash respawn preserves it)', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    // First: a crash-looper that reaches the cooldown at restarts=3.
     const crashSup = new FleetSupervisor({
       statePath, distDir: fakeDist(root, `process.exit(1);`), daemonEnv: {}, cwd: root,
       policy: { maxRestarts: 3, restartDelayMs: 20 }, log: () => {},
     });
     crashSup.start([bots[0]]);
-    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'errored', 8000);
+    await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'launching'
+      && readFleetState(statePath)?.procs[0]?.restarts === 3, 8000);
     expect(readFleetState(statePath)!.procs[0].restarts).toBe(3);
     await crashSup.stopAll();
 
     // Now a FRESH operator start (new supervisor, healthy daemon) must give the
-    // proc a clean restart budget — not inherit the stale 3 that would park it one
-    // crash sooner. Swap the fake daemon to STAY (stays online).
+    // proc a clean restart budget, rather than inheriting a cooldown.
+    // Swap the fake daemon to STAY (stays online).
     writeFileSync(join(root, 'dist', 'index-daemon.js'), STAY);
     const freshSup = new FleetSupervisor({
       statePath, distDir: join(root, 'dist'), daemonEnv: {}, cwd: root,

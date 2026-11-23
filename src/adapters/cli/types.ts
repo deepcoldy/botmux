@@ -156,7 +156,7 @@ export interface SkillDeliveryCapability {
 export interface McpGatewayInstallSpec {
   /** Stable CLI-global config file that receives the single `botmux` entry. */
   readonly configPath: string;
-  readonly format: 'codex-toml' | 'claude-json';
+  readonly format: 'codex-toml' | 'claude-json' | 'antigravity-json';
 }
 
 /** UTF-8 budget for a first prompt baked into launch argv.

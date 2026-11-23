@@ -2065,7 +2065,7 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
 
   // The「下一步」row is navigation chrome like the footer: its button is a
   // stamped botmux callback (dropped below) and its label is not reply text.
-  if (el.element_id === NEXT_STEP_ELEMENT_ID && tag === 'column_set') return;
+  if (el.element_id === NEXT_STEP_ELEMENT_ID && (tag === 'column_set' || tag === 'form')) return;
   // The「本轮回顾」panel restates the turn for a person who stepped away; a
   // bot reading the card gets the reply itself, not a summary of it.
   if (el.element_id === TURN_RECAP_ELEMENT_ID && tag === 'collapsible_panel') return;

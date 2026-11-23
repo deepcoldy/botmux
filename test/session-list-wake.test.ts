@@ -40,6 +40,14 @@ describe('botmux list dormant backend wake', () => {
     })).toBe(false);
   });
 
+  it('wakes a missing hc terminal but keeps an inconclusive hc probe fail-closed', () => {
+    const hcTarget = { backendType: 'hc' as const, sessionName: 'bmx-deadbeef', hcSession: 'botmux', socket: '/tmp/hc/herdr-core/botmux.sock' };
+    const base = { isAdopt: false, realManagedSession: true, attachBackend: 'hc' as const, target: hcTarget };
+    expect(canWakeDormantBackendForAttach({ ...base, probe: 'missing' })).toBe(true);
+    expect(canWakeDormantBackendForAttach({ ...base, probe: 'unknown' })).toBe(false);
+    expect(canWakeDormantBackendForAttach({ ...base, probe: 'exists' })).toBe(false);
+  });
+
   it('wakes once and waits through missing/unknown probes until attachable', async () => {
     let now = 1_000;
     const wake = vi.fn(async ({ signal, deadlineMs }: { signal: AbortSignal; deadlineMs: number }) => {

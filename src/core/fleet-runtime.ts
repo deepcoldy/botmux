@@ -238,7 +238,8 @@ export const DASHBOARD_PROCESS_NAME = 'botmux-dashboard';
  * The dashboard's fleet spec. The dashboard is supervised exactly like a bot
  * daemon (crash-restart; the 90 graceful sentinel is honoured ONLY when this
  * supervisor itself requested the stop via stopAll/stop-bot — an unsolicited
- * 90 or an outside signal crash-restarts instead; max_restarts parks), but
+ * 90 or an outside signal crash-restarts instead; once the fast-restart
+ * budget is exhausted, retries continue at the cooldown interval), but
  * runs the `dashboard` entry (index-dashboard.ts) instead of a bot daemon,
  * carries no bot index/appId, and logs to dashboard-{out,err}.log. This is what
  * replaces the old unconditional `apps.push({ name: 'botmux-dashboard', … })` in

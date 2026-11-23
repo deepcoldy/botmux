@@ -45,7 +45,7 @@ botmux 做的事情一句话就能说清：**把飞书里的消息，变成 AI �
 | 后端 | 怎么开启 | daemon 重启后 |
 |------|----------|---------------|
 | **tmux**（默认） | 什么都不用配 | CLI 一直活着，下次消息自动重新接上，上下文不丢 |
-| zmx / zellij / herdr | `backendType` 或 `BACKEND_TYPE` 显式指定 | 同样常驻，需要装对应工具 |
+| zmx / zellij / herdr / hc | `backendType` 或 `BACKEND_TYPE` 显式指定 | 同样常驻，需要装对应工具 |
 | pty | `BACKEND_TYPE=pty` 或 `backendType: "pty"` 显式指定 | CLI 跟着退出，重启后重新拉起 |
 
 tmux 不可用时，botmux **不会悄悄降级到 pty**，而是拦下新会话并弹卡提示安装。细节见 [tmux 会话常驻](/tmux) 和 [ZMX 后端](/zmx)。
@@ -73,7 +73,7 @@ daemon 启动时会自动恢复之前活跃的会话，所以飞书里的话题�
 | `src/worker.ts` | worker 进程：管理 CLI、渲染卡片、提供 Web 终端 |
 | `src/bot-registry.ts`、`src/config.ts` | 读取 `bots.json` 与全局配置 |
 | `src/adapters/cli/` | CLI 适配器，每种 CLI 一个文件（启动参数、输入方式、Skill 目录等） |
-| `src/adapters/backend/` | 会话后端：tmux、pty、zmx、zellij、herdr 等 |
+| `src/adapters/backend/` | 会话后端：tmux、pty、zmx、hc、zellij、herdr 等 |
 | `src/core/` | 会话管理、命令表与路由（`command-schema.ts` / `command-router.ts`）、worker 池、定时任务等 |
 | `src/im/lark/` | 飞书相关：事件分发、卡片构建与回调、API 调用、消息解析 |
 | `src/skills/` | 注入给 CLI 的内置 Skill |

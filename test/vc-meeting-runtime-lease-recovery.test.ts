@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { DaemonSession } from '../src/core/types.js';
+import type { PersistentBackendType } from '../src/core/persistent-backend.js';
+import type { PersistentBackendTarget } from '../src/adapters/backend/types.js';
 import type { VcMeetingDeliveryRequest } from '../src/services/vc-meeting-delivery-protocol.js';
 import type { VcMeetingAmbiguousReceiptRef } from '../src/services/vc-meeting-delivery-store.js';
 
@@ -8,9 +13,14 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
   return { Client: FakeClient, LoggerLevel: { error: 0, warn: 1, info: 2 } };
 });
 
-import { __testOnly_createVcMeetingRuntimeLeaseRecovery as createRecovery } from '../src/daemon.js';
+import {
+  __testOnly_createVcMeetingRuntimeLeaseRecovery as createRecovery,
+  __testOnly_vcMeetingPersistentScope as persistentScope,
+} from '../src/daemon.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { resetHcAvailabilityCache } from '../src/setup/ensure-hc.js';
 
-type FakeSession = DaemonSession & { testPersistentScope?: 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'none' | 'unknown' };
+type FakeSession = DaemonSession & { testPersistentScope?: PersistentBackendType | 'none' | 'unknown' };
 
 function ref(overrides: Partial<VcMeetingAmbiguousReceiptRef> = {}): VcMeetingAmbiguousReceiptRef {
   return {
@@ -83,9 +93,10 @@ function fakeSession(options: {
 
 function harness(input: {
   sessions?: FakeSession[];
-  probe?: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx', sessionName: string) => 'exists' | 'missing' | 'unknown';
+  probe?: (backend: PersistentBackendType, sessionName: string) => 'exists' | 'missing' | 'unknown';
   missingPersistentScope?: FakeSession['testPersistentScope'];
-  backendAvailable?: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => boolean;
+  backendAvailable?: (backend: PersistentBackendType) => boolean;
+  persistedTarget?: PersistentBackendTarget;
   retireDispatch?: (sessionId: string, turnId: string, dispatchAttempt: number) => boolean;
   /** Override the teardown; the default kills. A no-op models killWorker's
    *  refusal of an unprepared live remote worker (P0-2). */
@@ -99,6 +110,7 @@ function harness(input: {
   const killed: string[] = [];
   const backingKills: string[] = [];
   const backingKillCalls: Array<{ backend: string; sessionName: string; sessionId: string }> = [];
+  const backingTargets: PersistentBackendTarget[] = [];
   const probes: string[] = [];
   const warnings: string[] = [];
   const errors: string[] = [];
@@ -120,12 +132,14 @@ function harness(input: {
     resolveRetiringWorkers: input.resolveRetiringWorkers,
     resolvePersistentScope: (ds: FakeSession) => ds.testPersistentScope ?? 'unknown',
     resolveMissingPersistentScope: () => input.missingPersistentScope ?? 'unknown',
-    backendAvailable: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx') => input.backendAvailable?.(backend) ?? true,
-    killPersistent: (backend: string, sessionName: string, sessionId: string) => {
+    resolvePersistentTarget: () => input.persistedTarget,
+    backendAvailable: (backend: PersistentBackendType) => input.backendAvailable?.(backend) ?? true,
+    killPersistent: (backend: string, sessionName: string, sessionId: string, target: PersistentBackendTarget) => {
       backingKills.push(`${backend}:${sessionName}`);
       backingKillCalls.push({ backend, sessionName, sessionId });
+      backingTargets.push(target);
     },
-    probePersistent: (backend: 'tmux' | 'herdr' | 'zellij' | 'zmx', sessionName: string) => {
+    probePersistent: (backend: PersistentBackendType, sessionName: string) => {
       probes.push(`${backend}:${sessionName}`);
       return input.probe?.(backend, sessionName) ?? 'missing';
     },
@@ -136,7 +150,7 @@ function harness(input: {
     warn: (message: string) => warnings.push(message),
     error: (message: string) => errors.push(message),
   } as any);
-  return { recovery, sessions, sent, killed, backingKills, backingKillCalls, probes, retired, warnings, errors };
+  return { recovery, sessions, sent, killed, backingKills, backingKillCalls, backingTargets, probes, retired, warnings, errors };
 }
 
 describe('VC meeting runtime lease recovery', () => {
@@ -313,6 +327,26 @@ describe('VC meeting runtime lease recovery', () => {
     expect(h.recovery.snapshot()).toEqual([]);
   });
 
+  it('tears down an hc receiver on the core its terminal was frozen onto, with the full session id', () => {
+    const frozen: PersistentBackendTarget = {
+      backendType: 'hc',
+      sessionName: 'bmx-session_',
+      hcSession: 'botmux',
+      socket: '/tmp/vc-hc-frozen/herdr-core/botmux.sock',
+    };
+    const h = harness({
+      sessions: [fakeSession({ worker: false, persistentScope: 'hc' })],
+      persistedTarget: frozen,
+      probe: backend => backend === 'hc' ? 'unknown' : 'missing',
+    });
+    h.recovery.arm(ref(), 'agent_test');
+
+    expect(h.backingKillCalls).toEqual([{ backend: 'hc', sessionName: 'bmx-session_', sessionId: 'session_a' }]);
+    expect(h.backingTargets).toEqual([frozen]);
+    expect(h.probes).toEqual(['hc:bmx-session_']);
+    expect(h.recovery.isBlocked(delivery())).toBe(true);
+  });
+
   it('keeps worker-exit replay gated while its persistent pane exists, without blocking another member', async () => {
     let probeState: 'exists' | 'missing' = 'exists';
     const h = harness({
@@ -338,8 +372,8 @@ describe('VC meeting runtime lease recovery', () => {
     });
     h.recovery.arm(ref(), 'agent_test');
 
-    expect(h.backingKills.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij', 'zmx']);
-    expect(h.probes.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij', 'zmx']);
+    expect(h.backingKills.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij', 'zmx', 'hc']);
+    expect(h.probes.map(value => value.split(':')[0])).toEqual(['tmux', 'herdr', 'zellij', 'zmx', 'hc']);
     expect(h.recovery.snapshot()).toMatchObject([{
       receiverSessionId: 'session_a',
       deliveryKey: 'delivery_a',
@@ -435,5 +469,40 @@ describe('VC meeting runtime lease recovery', () => {
       sessionId: 'session_a', turnId: 'delivery_a', dispatchAttempt: 2, workerGeneration: 7,
       disposition: 'queued_removed',
     })).toBe(true);
+  });
+});
+
+describe('VC meeting persistent scope of a receiver without a live ds', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    resetHcAvailabilityCache();
+  });
+
+  it('keeps an hc-stamped receiver on hc instead of fanning out across every backend', () => {
+    vi.spyOn(sessionStore, 'getSession').mockImplementation(sessionId => ({
+      sessionId,
+      backendType: sessionId === 'hc_row' ? 'hc' : sessionId === 'pty_row' ? 'pty' : undefined,
+    }) as any);
+    expect(persistentScope.resolveMissing('hc_row')).toBe('hc');
+    expect(persistentScope.resolveMissing('pty_row')).toBe('none');
+    expect(persistentScope.resolveMissing('legacy_row')).toBe('unknown');
+  });
+
+  it('counts hc as reachable only when a usable herdr-core is discoverable', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-vc-hc-'));
+    try {
+      const bin = join(root, 'herdr-core');
+      writeFileSync(bin, '#!/bin/sh\necho "hc 0.1.19"\n', { mode: 0o755 });
+      vi.stubEnv('BOTMUX_HC_BIN', bin);
+      resetHcAvailabilityCache();
+      expect(persistentScope.backendAvailable('hc')).toBe(true);
+
+      vi.stubEnv('BOTMUX_HC_BIN', join(root, 'absent'));
+      resetHcAvailabilityCache();
+      expect(persistentScope.backendAvailable('hc')).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

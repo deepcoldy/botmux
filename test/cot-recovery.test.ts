@@ -223,6 +223,17 @@ describe.each(['antigravity', 'codex'])('surviving %s thinking stream', cliId =>
     finalizeCotMessage(next, 'om_turn', 'completed'); await flush(); await settled(() => markers().length === 0); expect(markers()).toEqual([]);
   });
 
+  it('resumes an hc session only on the core its terminal was frozen onto', async () => {
+    const hcTarget = { backendType: 'hc', sessionName: 'bmx-session1', hcSession: 'botmux', socket: '/tmp/hc-a/botmux.sock' };
+    const hcDs = (target: object) => makeDs({ session: { backendType: 'hc', persistentBackendTarget: target } });
+    const old = hcDs(hcTarget); expect(canResumeCotMessage(old)).toBe(true);
+    update(old, 'before'); await flush(); await settleCotMessageForShutdown(old);
+    expect(resumeCotMessage(hcDs({ ...hcTarget, socket: '/tmp/hc-b/botmux.sock' }))).toBe(false);
+    expect(resumeCotMessage(hcDs({ ...hcTarget, hcSession: 'other' }))).toBe(false);
+    expect(resumeCotMessage(hcDs(hcTarget))).toBe(true);
+    expect(entities.get('cot1')!.status).toBe('open'); expect(sequence).toBe(1);
+  });
+
   it.each(['thinking', 'terminal', 'cot-off'] as const)('retires an unbound older marker on a proven successor %s', async event => {
     const old = makeDs(); update(old, 'old progress', 'om_old', 1); await flush();
     await settleCotMessageForShutdown(old);

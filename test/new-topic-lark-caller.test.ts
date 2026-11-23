@@ -44,8 +44,15 @@ const initStart = pool.indexOf('  const initTrustedCaller = promptPayload.truste
 const initSource = pool.slice(initStart, pool.indexOf(';', initStart) + 1);
 const initCaller = new Function('promptPayload', 'resumeOrTurnId', initSource + '; return initTrustedCaller;');
 const authority = compile(extract(worker, 'turnAuthorityIdentity'), 'turnAuthorityIdentity', {});
-const pubStart = worker.lastIndexOf('    send({', worker.indexOf("type: 'managed_turn_origin'"));
-const publication = worker.slice(pubStart, worker.indexOf('\n    });', pubStart) + 8);
+// Indentation-agnostic anchors: the live send() call gains nesting levels as
+// worker.ts refactors, and a fixed-column slice would overrun into the
+// following finally block and fail to parse. Match the call by its wire type
+// and the first line-closing `});` at any indentation.
+const managedOriginSendIndex = worker.indexOf("type: 'managed_turn_origin'");
+const pubStart = worker.lastIndexOf('send({', managedOriginSendIndex);
+const pubEndMatch = worker.slice(pubStart).match(/\n\s*\}\);/);
+assert(pubEndMatch, 'managed_turn_origin send call boundary exists');
+const publication = worker.slice(pubStart, pubStart + pubEndMatch.index! + pubEndMatch[0].length);
 const publish = new Function('deps', 'with(deps){' + publication + ';}');
 const originCallerStart = pool.indexOf('        const callerOpenId = msg.trustedCaller !== undefined');
 const originCallerSource = pool.slice(originCallerStart, pool.indexOf(';', originCallerStart) + 1);

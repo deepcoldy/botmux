@@ -60,6 +60,16 @@ it('receipt-confirmed Codex /effort persists pin and restart/cold restore use th
   store.init(app); const row = store.getOwnedSession(ds.session.sessionId)!;
   expect(__testOnly_sessionAgentConfig({ ...ds, worker: null, session: row }, bot).reasoningEffort).toBe('low');
 });
+it('admits a Codex TUI in an hc terminal to the worker effort menu, but not one in zmx', async () => {
+  const { ds, worker } = fixture(); ds.initConfig.backendType = 'hc';
+  const result = updateCodexCliEffort(ds, 'low', 1000);
+  expect(worker.send.mock.calls.at(-1)?.[0]).toMatchObject({ type: 'codex_cli_effort' });
+  receipt(worker);
+  expect(await result).toMatchObject({ status: 'future_only' });
+  worker.send.mockClear(); ds.initConfig.backendType = 'zmx';
+  expect(await updateCodexCliEffort(ds, 'medium', 1000)).toEqual({ status: 'unavailable', reason: 'cli_menu_unavailable' });
+  expect(worker.send).not.toHaveBeenCalled();
+});
 it.each(['codex', 'codex-app'])('a failed %s receipt write rolls back session, pin and launch snapshot together', async cliId => {
   const { ds, worker } = fixture(cliId); const before = structuredClone(ds.session.modelPin);
   store.__testOnly_setBeforeRowPersist(() => { throw new Error('disk failure'); });

@@ -649,7 +649,7 @@ describe('managed Herdr agent identity', () => {
 
 describe('backendSandboxCompatibilityError', () => {
   it('rejects Linux Codex App file/read sandbox requests before a wrapper-owned launch', () => {
-    for (const backendType of ['pty', 'tmux'] as const) {
+    for (const backendType of ['pty', 'tmux', 'hc'] as const) {
       for (const request of [
         { fileSandboxRequested: true, effectiveReadIsolationRequested: false },
         { fileSandboxRequested: false, effectiveReadIsolationRequested: true },
@@ -700,6 +700,11 @@ describe('backendSandboxCompatibilityError', () => {
     })).toBeUndefined();
     expect(backendSandboxCompatibilityError({
       backendType: 'pty',
+      fileSandboxRequested: true,
+      effectiveReadIsolationRequested: true,
+    })).toBeUndefined();
+    expect(backendSandboxCompatibilityError({
+      backendType: 'hc',
       fileSandboxRequested: true,
       effectiveReadIsolationRequested: true,
     })).toBeUndefined();

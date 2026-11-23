@@ -53,6 +53,10 @@ export function classifyTurnOutcome(
 }
 
 const finalTexts = new WeakMap<DaemonSession, Map<string, string>>();
+// Full delivered context for Codex next-step generation. Keep the same 16-turn
+// bound as the summary cache and cap each body; do not add another disk copy.
+const finalFullTexts = new WeakMap<DaemonSession, Map<string, string>>();
+const FINAL_REPLY_CONTEXT_MAX_CHARS = 2_000;
 const finalKinds = new WeakMap<DaemonSession, Map<string, 'answer' | 'diagnostic'>>();
 const terminalStatuses = new WeakMap<DaemonSession, Map<string, TurnOutcomeTerminal['status']>>();
 const turnStarts = new WeakMap<DaemonSession, Map<string, number>>();
@@ -94,12 +98,25 @@ function stripRestoredNotice(raw: unknown): unknown {
   return notice ? text.slice(notice.length) : raw;
 }
 
-/** daemon 兜底投递最终回复时记下正文第一行，供卡片展示。 */
+function boundedFinalText(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const text = raw.trim();
+  if (!text) return undefined;
+  return text.length > FINAL_REPLY_CONTEXT_MAX_CHARS
+    ? `${text.slice(0, FINAL_REPLY_CONTEXT_MAX_CHARS - 1)}…`
+    : text;
+}
+
+/** daemon 投递最终回复时记下首行摘要和有界正文，供卡片与下一步建议使用。 */
 export function noteFinalReplyText(ds: DaemonSession, turnId: string, raw: unknown): void {
   if (!turnId) return;
   noteAnswered(ds, turnId);
-  const line = replySummaryLine(stripRestoredNotice(raw));
-  if (line) remember(finalTexts, ds, turnId, line);
+  const text = stripRestoredNotice(raw);
+  const line = replySummaryLine(text);
+  if (!line) return;
+  remember(finalTexts, ds, turnId, line);
+  const fullText = boundedFinalText(text);
+  if (fullText) remember(finalFullTexts, ds, turnId, fullText);
 }
 
 /** 投递出去的是「没匹配到最终文本」诊断，不是模型的答复：不算本轮的最终回复。 */
@@ -142,7 +159,7 @@ function resultStillCurrent(ds: DaemonSession, turn: SessionLastTurn | undefined
 }
 
 /** `botmux send --response-kind final` 的正文预览在 turn-sends 里，按 turnId 从尾部反查。 */
-export function readFinalSendPreview(dataDir: string, sessionId: string, turnId: string): string | undefined {
+function readFinalSendText(dataDir: string, sessionId: string, turnId: string): string | undefined {
   const path = join(dataDir, 'turn-sends', `${sessionId}.jsonl`);
   if (!existsSync(path)) return undefined;
   let fd: number | undefined;
@@ -160,7 +177,7 @@ export function readFinalSendPreview(dataDir: string, sessionId: string, turnId:
       try {
         const row = JSON.parse(lines[i]!);
         if (row?.turnId === turnId && row.responseKind === 'final' && typeof row.previewText === 'string') {
-          return replySummaryLine(row.previewText);
+          return row.previewText;
         }
       } catch { /* 并发写入的半行 */ }
     }
@@ -174,7 +191,16 @@ export function readFinalSendPreview(dataDir: string, sessionId: string, turnId:
   }
 }
 
-function finalSummary(ds: DaemonSession, turnId: string, dataDir: string): string | undefined {
+export function readFinalSendPreview(dataDir: string, sessionId: string, turnId: string): string | undefined {
+  return replySummaryLine(readFinalSendText(dataDir, sessionId, turnId));
+}
+
+/** Bounded multiline reply used only as generation context, not as the dashboard summary. */
+export function turnFinalText(ds: DaemonSession, turnId: string, dataDir: string): string | undefined {
+  return finalFullTexts.get(ds)?.get(turnId) ?? boundedFinalText(readFinalSendText(dataDir, ds.session.sessionId, turnId));
+}
+
+export function turnFinalSummary(ds: DaemonSession, turnId: string, dataDir: string): string | undefined {
   return finalTexts.get(ds)?.get(turnId) ?? readFinalSendPreview(dataDir, ds.session.sessionId, turnId);
 }
 
@@ -249,7 +275,7 @@ export async function recordTurnOutcome(
   }
   heldBackNoOutput.delete(ds);
   const summary = outcome === 'delivered'
-    ? finalSummary(ds, terminal.turnId, opts.dataDir ?? config.session.dataDir)
+    ? turnFinalSummary(ds, terminal.turnId, opts.dataDir ?? config.session.dataDir)
     : undefined;
   const lastTurn: SessionLastTurn = {
     turnId: terminal.turnId,
@@ -281,7 +307,7 @@ export function noteLateFinalReply(
   const heldBackTurn = heldBack?.turnId === turnId && !(ds.lastMessageAt > heldBack.at);
   if (!sameTurnNoOutput && !heldBackTurn) return undefined;
   heldBackNoOutput.delete(ds);
-  const summary = finalSummary(ds, turnId, opts.dataDir ?? config.session.dataDir);
+  const summary = turnFinalSummary(ds, turnId, opts.dataDir ?? config.session.dataDir);
   const startedAt = turnStarts.get(ds)?.get(turnId);
   const lastTurn: SessionLastTurn = {
     turnId,

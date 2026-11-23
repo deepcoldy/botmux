@@ -5,9 +5,9 @@
  */
 import { describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fencedRunEnv } from '../scripts/fenced-run.js';
 import { userSystemdBusEnv } from '../src/core/session-scope.js';
 
@@ -29,13 +29,17 @@ describe.skipIf(!bun)('fenced-run', () => {
 
   it('gives the probe a temp HOME (even under Bun) and no user bus by default', () => {
     const home = process.env.HOME ?? '';
-    const probe = 'const os=require("os");console.log(JSON.stringify({home:os.homedir(),bus:process.env.XDG_RUNTIME_DIR??null,dbus:process.env.DBUS_SESSION_BUS_ADDRESS??null,fenced:process.env.BOTMUX_FENCED_RUN??null}))';
+    const probe = 'const os=require("os"),fs=require("fs");const run=process.env.XDG_RUNTIME_DIR;'
+      + 'console.log(JSON.stringify({home:os.homedir(),run:run??null,busSocket:!!run&&fs.existsSync(run+"/bus"),'
+      + 'dbus:process.env.DBUS_SESSION_BUS_ADDRESS??null,fenced:process.env.BOTMUX_FENCED_RUN??null}))';
     const r = run(['--', bun!, '-e', probe], { ...process.env, XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' });
     expect(r.status).toBe(0);
     const seen = JSON.parse(r.stdout.trim().split('\n').pop()!);
     expect(seen.home).not.toBe(home);
     expect(seen.home).toMatch(/bmx-fenced-home-/);
-    expect(seen.bus).toBeNull();
+    // The runtime dir is the hc fence's private one, which holds no bus.
+    expect(seen.run ?? '').not.toMatch(/^\/run\/user\//);
+    expect(seen.busSocket).toBe(false);
     expect(seen.dbus).toBeNull();
     // Marker a probe can check to know it is running behind the fences.
     expect(seen.fenced).toBe('1');
@@ -55,7 +59,9 @@ describe.skipIf(!bun)('fenced-run', () => {
     const invoker = { ...process.env, XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' };
     const fenced = run(['--', bun!, '-e', probe], invoker);
     expect(fenced.status, fenced.stderr).toBe(0);
-    expect(JSON.parse(fenced.stdout.trim().split('\n').pop()!)).toBeNull();
+    const declared = JSON.parse(fenced.stdout.trim().split('\n').pop()!) as Record<string, string> | null;
+    expect(declared?.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+    expect(declared?.XDG_RUNTIME_DIR ?? '').not.toMatch(/^\/run\/user\//);
 
     const kept = run(['--keep-user-bus', '--', bun!, '-e', probe], invoker);
     expect(kept.status, kept.stderr).toBe(0);
@@ -100,6 +106,40 @@ describe.skipIf(!bun)('fenced-run', () => {
     expect(r.status).toBe(3);
     expect(r.stderr).toMatch(/refus/i);
   });
+
+  it.skipIf(process.platform === 'win32')('gives the probe a private hc runtime dir and none of the invoker\'s HC_* variables', () => {
+    const probe = 'const fs=require("fs"),path=require("path");const e=process.env;'
+      + 'console.log(JSON.stringify({hc:Object.keys(e).filter(k=>/^_?HC_/.test(k)),session:e.HC_SESSION??null,'
+      + 'run:e.XDG_RUNTIME_DIR??null,runIsDir:!!e.XDG_RUNTIME_DIR&&fs.statSync(e.XDG_RUNTIME_DIR).isDirectory(),'
+      + 'bin:e.BOTMUX_HC_BIN??null,path0:(e.PATH??"").split(path.delimiter)[0]}))';
+    const invoker: NodeJS.ProcessEnv = {
+      ...process.env,
+      XDG_RUNTIME_DIR: '/run/user/0',
+      HC_SOCKET: '/run/user/0/herdr-core/default.sock',
+      HC_SESSION: 'default',
+      HC_TERMINAL_ID: 't1',
+      _HC_RESPONSIBLE_PID: '1',
+    };
+    const r = run(['--', bun!, '-e', probe], invoker);
+    expect(r.status, r.stderr).toBe(0);
+    const seen = JSON.parse(r.stdout.trim().split('\n').pop()!);
+    expect(seen.hc).toEqual(['HC_SESSION']);
+    expect(seen.session).not.toBe('default');
+    expect(seen.run).not.toMatch(/^\/run\/user\//);
+    expect(seen.runIsDir).toBe(true);
+    // hc caps socket paths, holder sockets included, at 107 bytes.
+    expect(`${seen.run}/herdr-core/${seen.session}.holder.ffffffff.sock`.length).toBeLessThanOrEqual(107);
+    expect(seen.bin).toBeTruthy();
+    expect(dirname(seen.bin)).toBe(seen.path0);
+  });
+
+  it.skipIf(process.platform === 'win32')('fails the run when the probe sends hc to the host runtime dir', () => {
+    const invoker: NodeJS.ProcessEnv = { ...process.env };
+    delete invoker.BOTMUX_HC_TEST_BIN;
+    const r = run(['--', 'env', '-u', 'XDG_RUNTIME_DIR', 'hc', 'ls'], invoker);
+    expect(r.status).toBe(3);
+    expect(r.stderr).toMatch(/refus/i);
+  });
 });
 
 describe.skipIf(process.platform !== 'linux')('fencedRunEnv user bus', () => {
@@ -109,8 +149,13 @@ describe.skipIf(process.platform !== 'linux')('fencedRunEnv user bus', () => {
 
   function childEnv(base: NodeJS.ProcessEnv, keepUserBus: boolean): NodeJS.ProcessEnv {
     const root = mkdtempSync(join(tmpdir(), 'bmx-frb-'));
+    const fence = (name: string) => {
+      const dir = join(root, name);
+      mkdirSync(dir);
+      return { root: dir, binDir: null, denyLog: join(dir, 'denied.log') };
+    };
     try {
-      return fencedRunEnv(base, join(root, 'home'), { root, binDir: null, denyLog: join(root, 'denied.log') },
+      return fencedRunEnv(base, join(root, 'home'), { tmux: fence('tmux'), hc: fence('hc') },
         { keepUserBus, isBusSocket: isSocket });
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -122,8 +167,10 @@ describe.skipIf(process.platform !== 'linux')('fencedRunEnv user bus', () => {
 
   it('leaves botmux no user bus to derive by default', () => {
     const env = childEnv({ XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' }, false);
-    expect(busVars(env)).toEqual({ XDG_RUNTIME_DIR: undefined, DBUS_SESSION_BUS_ADDRESS: undefined });
-    expect(userSystemdBusEnv({ env, isSocket })).toBeUndefined();
+    // The hc fence's private runtime dir, which holds no bus.
+    expect(env.XDG_RUNTIME_DIR).not.toMatch(/^\/run\/user\//);
+    expect(env.DBUS_SESSION_BUS_ADDRESS).toBeUndefined();
+    expect(userSystemdBusEnv({ env, isSocket })).toEqual({ XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR });
   });
 
   it('passes the invoker bus through unchanged with --keep-user-bus', () => {
@@ -137,7 +184,7 @@ describe.skipIf(process.platform !== 'linux')('fencedRunEnv user bus', () => {
     expect(userSystemdBusEnv({ env: { ...fenced, XDG_RUNTIME_DIR: '/tmp/probe-runtime' }, isSocket }))
       .toEqual({ XDG_RUNTIME_DIR: '/tmp/probe-runtime' });
     expect(userSystemdBusEnv({ env: { ...fenced, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' }, isSocket }))
-      .toEqual({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
+      .toEqual({ XDG_RUNTIME_DIR: fenced.XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
   });
 
   it('hands --keep-user-bus the bus botmux would derive when the invoker exported none', () => {
@@ -149,9 +196,10 @@ describe.skipIf(process.platform !== 'linux')('fencedRunEnv user bus', () => {
   it('cannot win the bus back by nesting --keep-user-bus inside a fence that dropped it', () => {
     const outer = childEnv({ XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' }, false);
     const env = childEnv(outer, true);
-    expect(busVars(env)).toEqual({ XDG_RUNTIME_DIR: undefined, DBUS_SESSION_BUS_ADDRESS: undefined });
-    expect(userSystemdBusEnv({ env, isSocket })).toBeUndefined();
+    expect(busVars(env)).toEqual({ XDG_RUNTIME_DIR: outer.XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS: undefined });
+    expect(userSystemdBusEnv({ env, isSocket })).toEqual({ XDG_RUNTIME_DIR: outer.XDG_RUNTIME_DIR });
     const viaPrivateBus = childEnv({ ...outer, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' }, true);
-    expect(userSystemdBusEnv({ env: viaPrivateBus, isSocket })).toEqual({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
+    expect(userSystemdBusEnv({ env: viaPrivateBus, isSocket }))
+      .toEqual({ XDG_RUNTIME_DIR: outer.XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
   });
 });

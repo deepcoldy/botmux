@@ -90,6 +90,11 @@ describe('native-consumed deployment continuation with real SQLite', () => {
     row.backendType = backendType as Session['backendType']; expect(arm()).toBe(false);
   });
 
+  it('takes ownership of a local Codex TUI turn on hc', () => {
+    row.backendType = 'hc'; expect(arm()).toBe(true);
+    expect(deploymentContinuationCandidate(row)).toMatchObject({ turnId: receipt.turnId, state: 'running' });
+  });
+
   it('expires old work and never resumes another native conversation or a surviving process', () => {
     arm(); const claimed = claimDeploymentContinuation(row, deploymentContinuationCandidate(row)!, persist)!;
     for (const patch of [{ resumed: false }, { reattached: true }, { nativeSessionId: 'another' }, { appId: 'another' }]) {

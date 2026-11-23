@@ -343,6 +343,10 @@ export function assertUniqueBotProcessNames(
     if (reserved.has(name)) {
       throw new Error(`进程名 "${name}" 是保留名, 请改用其他 "name" 值.`);
     }
+    const pluginPrefix = `${prefix}-plugin-`;
+    if (name.startsWith(pluginPrefix)) {
+      throw new Error(`进程名 "${name}" 使用了插件 service 保留前缀 "${pluginPrefix}", 请改 "name" 避免使用该前缀.`);
+    }
     const firstIndex = seen.get(name);
     if (firstIndex !== undefined) {
       throw new Error(
@@ -402,7 +406,7 @@ function applyOptionalBoolean(
 
 export function parseBotSelection(
   input: string,
-  bots: Array<{ larkAppId?: string; name?: unknown }>,
+  bots: Array<{ larkAppId?: string; name?: unknown; displayName?: unknown }>,
 ): number | undefined {
   const raw = input.trim();
   if (!raw) return undefined;
@@ -424,7 +428,10 @@ export function parseBotSelection(
   if (byConfiguredName >= 0) return byConfiguredName;
 
   const byProcessName = bots.findIndex((b, i) => botProcessName(b, i) === raw);
-  return byProcessName >= 0 ? byProcessName : undefined;
+  if (byProcessName >= 0) return byProcessName;
+  const displayed = bots.map((bot, index) => ({ bot, index }))
+    .filter(({ bot }) => typeof bot.displayName === 'string' && bot.displayName.trim() === raw);
+  return displayed.length === 1 ? displayed[0]!.index : undefined;
 }
 
 /**
@@ -680,8 +687,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (backendType === '-') {
       delete out.backendType;
     } else if (backendType) {
-      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff' && backendType !== 'mojo' && backendType !== 'remote-runner') {
-        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "riff", "mojo", or "remote-runner": ${backendType}`);
+      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'hc' && backendType !== 'riff' && backendType !== 'mojo' && backendType !== 'remote-runner') {
+        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "hc", "riff", "mojo", or "remote-runner": ${backendType}`);
       }
       out.backendType = backendType;
     }

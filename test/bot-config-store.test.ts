@@ -54,7 +54,8 @@ async function freshModules() {
   const store = await import('../src/services/bot-config-store.js');
   const pinStreamingCardChange = await import('../src/services/pin-streaming-card-change.js');
   const sessionGroups = await import('../src/services/session-groups-store.js');
-  return { registry, store, pinStreamingCardChange, sessionGroups };
+  const awaySummaryFocusRevocation = await import('../src/services/away-summary-focus-revocation.js');
+  return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
 }
 
 describe('bot-config store', () => {
@@ -85,10 +86,43 @@ describe('bot-config store', () => {
   }
   async function loaded(entry: Record<string, unknown> = {}) {
     writeConfig(entry);
-    const { registry, store, pinStreamingCardChange, sessionGroups } = await freshModules();
+    const { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation } = await freshModules();
     registry.loadBotConfigs().forEach((c: any) => registry.registerBot(c));
-    return { registry, store, pinStreamingCardChange, sessionGroups };
+    return { registry, store, pinStreamingCardChange, sessionGroups, awaySummaryFocusRevocation };
   }
+
+  it('publishes recap revocation to live config before a queued card settlement', async () => {
+    const { registry, store, awaySummaryFocusRevocation } = await loaded({ replyCardRecap: true });
+    const { noteRecapCard, noteRecapTurnStarted } = await import('../src/core/turn-recap-state.js');
+    const events: string[] = [];
+    const ds = { session: { sessionId: 'sess-config-race' }, larkAppId: 'app_default' } as any;
+    noteRecapTurnStarted(ds, 'turn1');
+    const io = {
+      enabled: () => registry.getBot('app_default').config.replyCardRecap === true,
+      awaySummaryWanted: () => true,
+      requestAwaySummary: () => { events.push('request'); },
+      locale: () => 'zh' as const,
+      readCard: async () => undefined,
+      cardId: async () => 'card',
+      insert: async () => {},
+      replace: async () => {},
+      now: () => Date.now(),
+      warn: () => {},
+    };
+    const dispose = awaySummaryFocusRevocation.registerAwaySummaryFocusRevocationHandler(() => {
+      events.push('cancel');
+      queueMicrotask(() => noteRecapCard(ds, 'turn1', { kind: 'legacy', messageId: 'card1' }, io));
+    });
+    try {
+      await store.applyConfigField('app_default', store.findConfigField('replyCardRecap')!, false);
+      await Promise.resolve();
+      expect(events).toEqual(['cancel']);
+      expect(registry.getBot('app_default').config.replyCardRecap).not.toBe(true);
+      expect(readConfig().replyCardRecap).not.toBe(true);
+    } finally {
+      dispose();
+    }
+  });
 
   it('checks a picker model snapshot inside the file lock before writing effort', async () => {
     const { registry, store } = await loaded({ model: 'opus' });
@@ -437,6 +471,17 @@ describe('bot-config store', () => {
     } finally {
       delete process.env.BACKEND_TYPE;
     }
+  });
+
+  it('/config set backendType accepts hc and persists it, and still rejects names that are not backends', async () => {
+    const { registry, store } = await loaded({ cliId: 'claude-code' });
+    const backend = store.findConfigField('backendType')!;
+    expect(store.coerceConfigValue(backend, 'herdr-core')).toEqual({ ok: false, reason: 'invalid_enum' });
+    const coerced = store.coerceConfigValue(backend, 'HC');
+    expect(coerced).toEqual({ ok: true, value: 'hc' });
+    expect((await store.applyConfigField('app_default', backend, coerced.ok ? coerced.value : undefined)).ok).toBe(true);
+    expect(readConfig().backendType).toBe('hc');
+    expect(registry.getBot('app_default').config.backendType).toBe('hc');
   });
 
   it('pairs a remote daemon default back to pty for a local CLI, as spawning does', async () => {
@@ -2462,6 +2507,17 @@ describe('bot-config store', () => {
     // pty/tmux are capable → the ordinary matrix verdict.
     const { store: pty } = await loaded({ oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
     expect(pty.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('verified');
+  });
+
+  it('judges hc sandbox advice by the same worker gate that would launch it', async () => {
+    const { backendSandboxCompatibilityError } = await import('../src/adapters/backend/session-backend-selector.js');
+    const refused = backendSandboxCompatibilityError({
+      backendType: 'hc', cliId: 'claude-code', fileSandboxRequested: true, effectiveReadIsolationRequested: false,
+    });
+    const { store } = await loaded({ backendType: 'hc', oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    const advice = store.getConfigCardData('app_default')?.sandboxAdvice;
+    expect(advice?.reasons).toEqual(['oncall']);
+    expect(advice?.cliSupport).toBe(refused ? 'blocked' : 'verified');
   });
 
   it('a local mojo session (cloud off or unprovable env) is shown as blocked, cloud mojo is silent', async () => {

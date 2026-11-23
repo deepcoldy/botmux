@@ -377,7 +377,7 @@ These fields only appear in session data from `/api/sessions` and `/events`; the
 
 | Field | Meaning |
 |------|---------|
-| `backendType` | The backend used at the latest launch (`pty` / `tmux` / `herdr` / `zellij` / `zmx`), for filtering and display; it may change after a cold resume if the config changed |
+| `backendType` | The backend used at the latest launch (`pty` / `tmux` / `herdr` / `zellij` / `zmx` / `hc`), for filtering and display; it may change after a cold resume if the config changed |
 | `backendSessionName` | Present only for managed persistent-backend sessions; currently `bmx-<first 8 chars of sessionId>`. PTY sessions, adopted sessions, and some old rows lack it. It is locator information only and **does not mean the process or socket is still alive** |
 | `titleUpdatedAt` | When the title was last updated (ISO-8601) |
 | `titleSource` | Where the title came from: `initial` / `user` / `agent` / `cli` / `dashboard` / `system`. For display and debugging only, **not usable as identity or audit evidence** |

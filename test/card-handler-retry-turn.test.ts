@@ -646,7 +646,7 @@ describe('a retry takes over the last reply card', () => {
    * the legacy cards a panel write was attempted on. */
   function recapIoFor(readBack: string[], published: string[]) {
     const io: RecapIo = {
-      enabled: () => true, locale: () => 'zh',
+      enabled: () => true, awaySummaryWanted: () => false, requestAwaySummary: () => {}, locale: () => 'zh',
       readCard: async (_ds, messageId) => { readBack.push(messageId); return undefined; },
       cardId: async () => 'card', insert: async () => {}, replace: async () => {},
       now: () => Date.now(), warn: () => {},
@@ -770,7 +770,7 @@ describe('/quote cold admission', () => {
     const readBack: string[] = [];
     const published: string[] = [];
     const io: RecapIo = {
-      enabled: () => true, locale: () => 'zh',
+      enabled: () => true, awaySummaryWanted: () => false, requestAwaySummary: () => {}, locale: () => 'zh',
       readCard: async (_ds, messageId) => { readBack.push(messageId); return undefined; },
       cardId: async () => 'card', insert: async () => {}, replace: async () => {},
       now: () => Date.now(), warn: () => {},

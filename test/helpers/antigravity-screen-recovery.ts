@@ -1,6 +1,7 @@
 import { vi } from 'vitest';
 import { loadWorkerFunction } from './worker-function-harness.js';
 import { PromptSuggestionPublisher } from '../../src/utils/prompt-suggestion-publisher.js';
+import { ClaudeModelRequestClock } from '../../src/services/claude-transcript.js';
 import { createUsageLimitTracker } from '../../src/utils/usage-limit-tracker.js';
 import { reconcileUsageLimitState } from '../../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../../src/utils/idle-detector.js';
@@ -28,7 +29,7 @@ export function antigravityScreenProducer(send: (frame: WorkerToDaemon) => void)
     projectedRuntimeScreenStatus: () => 'idle',
     traexQuestionBridgeActive: () => false, observeTraexAutoModelCapacity() {}, publishNativeReasoningFooter() {},
     settleBackgroundTasksFromSiblings() {}, refreshBackgroundWait() {}, startupInputHeld: () => false,
-    backgroundWaitTasks: 0, backgroundWaitPayload: () => ({}), PromptSuggestionPublisher,
+    backgroundWaitTasks: 0, backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(), PromptSuggestionPublisher,
     currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined, foldedTypeAheadTurn: undefined,
     turnTerminalEmitted: false, promptSuggestionReportTurn: () => undefined,
     SCREEN_UPDATE_INTERVAL_MS: 100, backendScreenEvidenceIsAuthoritativeForMutation: () => true,

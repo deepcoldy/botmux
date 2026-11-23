@@ -510,7 +510,9 @@ export function buildSeatbeltProfile(
 // 19 adds whole-directory read/write masks for project attachment, source-grant
 // and import-outbox authority below dataDir. A credential-only pane launched
 // before those mounts must not warm-reattach and retain access to the new WAL.
-export const ISOLATION_PANE_MARKER_VERSION = 19;
+// 20 adds the host send relay to macOS Seatbelt oncall panes. A persistent pane
+// launched without that environment cannot acquire it during warm reattach.
+export const ISOLATION_PANE_MARKER_VERSION = 20;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 
@@ -836,8 +838,9 @@ export function isolatedPaneReattachSafe(
  *     capability/policy check runs on EVERY persistent backend — credential-only
  *     panes exist on zellij/herdr/zmx too, so this must NOT be tmux-scoped.
  *   · policy OFF migration arm: scoped to `noTransport && isolationCapableBackend`
- *     (only no-transport tmux was ever file-force-isolated by the removed rule).
- *     An ordinary transport chat / non-tmux backend is never subjected to the
+ *     (only no-transport tmux was ever file-force-isolated by the removed rule;
+ *     hc carries the same file sandbox, so it is held to the same proof).
+ *     An ordinary transport chat / other backend is never subjected to the
  *     tombstone requirement — no false kills — though a DEAD pane's stale
  *     provenance is still cleared so it cannot mislead a later decision.
  *
@@ -863,7 +866,7 @@ export type PersistentPaneMigrationInput = {
    *  tmux/zellij/herdr/zmx alike. So the policy-ON capability check below is NOT
    *  scoped to tmux. */
   appliedIsolationCapabilities: readonly IsolationCapability[];
-  /** Backend can carry a FILE sandbox (tmux). Scopes ONLY the policy-off
+  /** Backend can carry a FILE sandbox (tmux, hc). Scopes ONLY the policy-off
    *  no-transport migration arm (the removed force-isolation rule only ever
    *  file-sandboxed tmux); policy-ON capability checks run on every backend. */
   isolationCapableBackend: boolean;
@@ -936,6 +939,8 @@ export type PersistentPaneMigrationDecision =
  * caller's cold-machine check (TmuxBackend.serverAbsentOnColdMachine) confirms the
  * socket is gone AND no tmux process is visible. `exists` / `missing` and every
  * non-tmux backend pass through untouched; the check is not even invoked then.
+ * hc needs no such tie-break: a core with neither a socket nor a holder answers
+ * 'missing' without hc being run, and hc starts any other core it cannot reach.
  */
 export function resolveReadIsolationPaneProbe(
   paneProbe: SessionProbe,

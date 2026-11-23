@@ -372,6 +372,8 @@ describe('缓存过期自动压缩 session setting', () => {
     const base = { cliId: 'kimi', backendType: 'tmux', adopted: false, headless: false, vcMeetingReceiver: false };
     expect(supportsKimiCacheExpiryAutoCompact(base)).toBe(true);
     expect(supportsKimiCacheExpiryAutoCompact({ ...base, backendType: 'pty' })).toBe(true);
+    // hc answers the worker's captures from its screen mirror, as tmux does from capture-pane.
+    expect(supportsKimiCacheExpiryAutoCompact({ ...base, backendType: 'hc' })).toBe(true);
     expect(supportsKimiCacheExpiryAutoCompact({ ...base, backendType: undefined })).toBe(true);
     for (const backendType of ['zmx', 'herdr', 'zellij', 'riff', 'mojo', 'remote-runner', 'orca']) {
       expect(supportsKimiCacheExpiryAutoCompact({ ...base, backendType }), backendType).toBe(false);

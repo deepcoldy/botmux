@@ -21,12 +21,13 @@ export function ownedLocalCodex(session: Session): boolean {
     && !session.adoptedFrom && !session.existingAppServerEndpoint
     && session.creationSource !== 'external' && !session.wrapperCli
     && session.sandbox !== 'scratch'
-    && (session.backendType === undefined || session.backendType === 'pty' || session.backendType === 'tmux');
+    && (session.backendType === undefined || session.backendType === 'pty' || session.backendType === 'tmux'
+      || session.backendType === 'hc');
 }
 
 export function codexCleanupEligible(session: Session): boolean {
   const target = session.codexCleanupTarget;
-  // The worker publishes targets only from verified local PTY/tmux launches.
+  // The worker publishes targets only from verified local PTY/tmux/hc launches.
   // Historical rows may omit backendType even after that worker proof arrives.
   return ownedLocalCodex(session) && !!target && target.threadId === session.cliSessionId
     && isAbsolute(target.codexHome) && isAbsolute(target.codexBin);

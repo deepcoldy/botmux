@@ -1,17 +1,22 @@
 import { describe, expect, it, vi } from 'vitest';
 import { decideQueuedReadyTransition } from '../src/core/queued-ready-transition.js';
+import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import { hasAntigravityPendingTasks, type AntigravityTranscriptState } from '../src/services/antigravity-transcript.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 
 /**
  * A prompt-ready edge that the worker itself turns back into `working` is not
  * the turn's terminal boundary (#1723): the turn is quiet only while its
- * background agents run, or the argv-baked first prompt is still executing.
+ * background agents/tasks run, or the argv-baked first prompt is still executing.
  * Releasing the turn's authority there revokes the live origin the still
  * running work reports through, so its `botmux report` is refused as stale.
  */
 function harness(opts: {
+  cliId?: string;
   backgroundAgents?: number;
+  antigravityState?: AntigravityTranscriptState;
+  onAntigravityDrain?: (state: AntigravityTranscriptState) => void;
   argvPromptBusy?: boolean;
   pendingMessages?: unknown[];
   queuedTypeAheadTurns?: unknown[];
@@ -20,10 +25,15 @@ function harness(opts: {
   const authority = new ActiveTurnAuthority();
   authority.reserve({ turnId: 'turn-a', caller });
   authority.markStarted({ turnId: 'turn-a', caller });
+  const cliId = opts.cliId ?? 'claude-code';
+  const agyState: AntigravityTranscriptState = { ...(opts.antigravityState ?? {}) };
+  const codexBridgeDrainAndMaybeEmit = vi.fn(() => {
+    opts.onAntigravityDrain?.(agyState);
+  });
   const scope: Record<string, any> = {
     isPromptReady: false, isFlushing: false, durableTurnInFlight: false,
     preserveActiveTurnAuthorityForReady: false,
-    lastInitConfig: { cliId: 'claude-code' }, effectiveBackendType: 'tmux',
+    lastInitConfig: { cliId }, effectiveBackendType: 'tmux',
     activeTurnAuthority: authority,
     releaseActiveTurnAuthority: vi.fn(() => authority.clear()),
     pendingMessages: opts.pendingMessages ?? [], pendingRawInputs: [], pendingAdoptMessages: [], pendingSessionRename: null,
@@ -33,6 +43,11 @@ function harness(opts: {
     decideQueuedReadyTransition,
     inflightInputs: { onTurnComplete: vi.fn() },
     backgroundTaskTracker: { pendingTurnAgents: () => opts.backgroundAgents ?? 0 },
+    structuredBridgeIs: (id: string) => cliId === id,
+    antigravityBridgeState: () => agyState,
+    hasAntigravityPendingTasks,
+    codexBridgeDrainAndMaybeEmit,
+    revokePromptReadiness: () => { scope.isPromptReady = false; },
     spawnArgvInitialPromptBusy: opts.argvPromptBusy === true,
     spawnArgvNeedsWorkingSeed: false,
     renderer: { snapshot: () => ({ content: '' }) },
@@ -50,7 +65,7 @@ function harness(opts: {
     publishScreenStatus: vi.fn(),
     classifyUsageLimitWithNativeEvidence: () => ({}),
     projectedRuntimeScreenStatus: () => 'idle',
-    backgroundWaitPayload: () => ({}),
+    backgroundWaitPayload: () => ({}), modelRequestPayload: () => ({}), modelRequestClock: new ClaudeModelRequestClock(),
     flushPending: vi.fn(),
     log: vi.fn(),
   };
@@ -92,6 +107,57 @@ describe('a prompt-ready edge that is not the turn boundary keeps the turn autho
 
   it('still releases it at a real end-of-turn ready', () => {
     const h = harness();
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.isPromptReady).toBe(true);
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');
+    expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
+    expect(h.activeTurnAuthority.snapshot()).toBeUndefined();
+  });
+
+  it('keeps it while an Antigravity background command is still pending (including when newly drained on ready)', () => {
+    const h = harness({
+      cliId: 'antigravity',
+      onAntigravityDrain: (state) => { state.hasPendingTask = true; },
+    });
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.codexBridgeDrainAndMaybeEmit).toHaveBeenCalledWith({ signalIdle: false });
+    expect(h.isPromptReady).toBe(false);
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('working');
+    expect(h.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'screen_update' }));
+    expect(h.releaseActiveTurnAuthority).not.toHaveBeenCalled();
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('turn-a');
+  });
+
+  it('keeps it while an Antigravity subagent is still pending', () => {
+    const h = harness({
+      cliId: 'antigravity',
+      antigravityState: { pendingSubagentIds: ['conv-sub-1'] },
+    });
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.isPromptReady).toBe(false);
+    expect(h.publishScreenStatus).toHaveBeenCalledWith('working');
+    expect(h.releaseActiveTurnAuthority).not.toHaveBeenCalled();
+    expect(h.activeTurnAuthority.snapshot()?.turnId).toBe('turn-a');
+  });
+
+  it.each([
+    ['a queued message', { pendingMessages: [{ content: 'next' }] }],
+    ['a queued type-ahead turn', { queuedTypeAheadTurns: [{ turnId: 'turn-b' }] }],
+  ])('still releases Antigravity authority when the ready hands the CLI to %s', (_label, queued) => {
+    const h = harness({
+      cliId: 'antigravity',
+      antigravityState: { hasPendingTask: true },
+      ...queued,
+    });
+    loadWorkerFunction('markPromptReady', h)();
+    expect(h.releaseActiveTurnAuthority).toHaveBeenCalledWith('prompt_ready');
+  });
+
+  it('releases Antigravity authority once pending tasks and subagents have cleared', () => {
+    const h = harness({
+      cliId: 'antigravity',
+      antigravityState: { hasPendingTask: false, pendingSubagentIds: [] },
+    });
     loadWorkerFunction('markPromptReady', h)();
     expect(h.isPromptReady).toBe(true);
     expect(h.publishScreenStatus).toHaveBeenCalledWith('idle');

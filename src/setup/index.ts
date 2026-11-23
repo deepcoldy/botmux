@@ -10,6 +10,9 @@
  * - fonts are nice-to-have: failures only print a warning.
  * - herdr is on-demand: only runs when at least one bot in bots.json has
  *   `backendType: 'herdr'`. Avoids dragging an extra binary onto every host.
+ * - hc (herdr-core) is probed, never installed, only when a bot resolves to
+ *   `backendType: 'hc'`; see shouldHardFailStartupForMissingHc for when that
+ *   blocks startup.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -21,13 +24,21 @@ import { getDefaultLocale } from '../i18n/index.js';
 import { ensureFonts, type FontResult } from './ensure-fonts.js';
 import { ensureHerdr, type HerdrResult } from './ensure-herdr.js';
 import { ensureHerdrIntegrations, type HerdrIntegrationResult } from './ensure-herdr-integrations.js';
+import { HC_MIN_VERSION, hcBinaryCandidates, hcBotmuxRoot, probeHcAvailability, type HcAvailability } from './ensure-hc.js';
 import type { CliId } from '../adapters/cli/types.js';
+
+export interface HcDependencyResult {
+  availability: HcAvailability;
+  /** Some discovery candidate exists on disk, even if its probe rejected it. */
+  binaryPresent: boolean;
+}
 
 export interface DependenciesReport {
   tmux: TmuxResult;
   fonts: FontResult;
   herdr?: HerdrResult;
   herdrIntegrations?: HerdrIntegrationResult;
+  hc?: HcDependencyResult;
 }
 
 export { botmuxFontDir } from './ensure-fonts.js';
@@ -63,16 +74,53 @@ export function shouldHardFailStartupForMissingTmux(opts: {
   return opts.anyBotWantsTmux;
 }
 
+/**
+ * Decide whether `botmux start`/`restart` must refuse to spawn the daemon
+ * because hc is missing. Same rule as tmux: only a binary that is GENUINELY
+ * ABSENT (no discovery candidate on disk) can be fatal; a present binary that
+ * failed its probe (timeout, too old, non-Linux) degrades per session, where
+ * the selector refuses hc with the reason.
+ *
+ * It is fatal only when hc is the sole backend wanted: every bot resolves to
+ * hc AND every active session row is stamped hc. A daemon still serving tmux
+ * (or other) sessions must come up even when hc is gone, so the session read
+ * runs last and an unreadable store counts as "other backends may be live".
+ */
+export function shouldHardFailStartupForMissingHc(opts: {
+  hcAvailable: boolean;
+  hcBinaryPresent: boolean;
+  /** Each bot's resolved backend (`backendType ?? daemon default`). */
+  botBackends: readonly (string | undefined)[];
+  /** Backends stamped on active session rows (undefined = unstamped); null when unreadable. */
+  activeSessionBackends: () => Iterable<string | undefined> | null;
+}): boolean {
+  if (opts.hcAvailable || opts.hcBinaryPresent) return false;
+  if (opts.botBackends.length === 0 || !opts.botBackends.every(backend => backend === 'hc')) return false;
+  const sessions = opts.activeSessionBackends();
+  if (sessions === null) return false;
+  for (const backend of sessions) {
+    if (backend !== 'hc') return false;
+  }
+  return true;
+}
+
+/** Probe the hc binary botmux would drive. Synchronous and cached by ensure-hc. */
+export function checkHcDependency(env: NodeJS.ProcessEnv = process.env): HcDependencyResult {
+  return {
+    availability: probeHcAvailability({ env }),
+    binaryPresent: hcBinaryCandidates(env).some(candidate => existsSync(candidate)),
+  };
+}
+
 const BOTS_JSON_FILE = join(homedir(), '.botmux', 'bots.json');
 
 /**
- * Read bots.json directly (no parser, no validation) to find which CLIs
- * have herdr backend selected. We deliberately bypass parseBotConfigsJson
- * to avoid pulling the full bot-config-editor module (and its CLI deps)
- * into the bootstrap path. Best-effort: any read/parse failure → empty list,
- * herdr install will simply skip.
+ * Read bots.json directly (no parser, no validation). We deliberately bypass
+ * parseBotConfigsJson to avoid pulling the full bot-config-editor module (and
+ * its CLI deps) into the bootstrap path. Best-effort: any read/parse failure
+ * → empty list, and the on-demand installs/probes simply skip.
  */
-function herdrCliIds(): CliId[] {
+function readBotsJsonRaw(): any[] {
   if (!existsSync(BOTS_JSON_FILE)) return [];
   let parsed: any;
   try {
@@ -80,15 +128,24 @@ function herdrCliIds(): CliId[] {
   } catch {
     return [];
   }
-  if (!Array.isArray(parsed)) return [];
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+/** Which CLIs have the herdr backend selected. */
+function herdrCliIds(): CliId[] {
   const out = new Set<CliId>();
-  for (const bot of parsed) {
+  for (const bot of readBotsJsonRaw()) {
     if (!bot || typeof bot !== 'object') continue;
     if (bot.backendType !== 'herdr') continue;
     const cli = (bot.cliId ?? 'claude-code') as CliId;
     out.add(cli);
   }
   return [...out];
+}
+
+/** A bot resolves to hc by its own `backendType`, else BACKEND_TYPE (the built-in default is never hc). */
+function anyBotWantsHc(defaultBackend: string | undefined = process.env.BACKEND_TYPE): boolean {
+  return readBotsJsonRaw().some(bot => !!bot && typeof bot === 'object' && (bot.backendType ?? defaultBackend) === 'hc');
 }
 
 export async function ensureDependencies(): Promise<DependenciesReport> {
@@ -157,7 +214,26 @@ export async function ensureDependencies(): Promise<DependenciesReport> {
     }
   }
 
-  return { tmux, fonts, herdr, herdrIntegrations };
+  let hc: HcDependencyResult | undefined;
+  if (anyBotWantsHc()) {
+    hc = checkHcDependency();
+    reportHcDependency(hc);
+  }
+
+  return { tmux, fonts, herdr, herdrIntegrations, hc };
+}
+
+export function reportHcDependency(hc: HcDependencyResult): void {
+  if (hc.availability.ok) {
+    console.log(`✓ ${hc.availability.version} (${hc.availability.bin})`);
+    return;
+  }
+  console.warn('');
+  console.warn('⚠️  herdr-core 不可用，backendType 为 "hc" 的 bot 新会话将无法启动');
+  console.warn(`    原因：${hc.availability.reason}`);
+  console.warn(`    botmux 不会自动安装 herdr-core：请把 >= ${HC_MIN_VERSION.join('.')} 的二进制放到 ${join(hcBotmuxRoot(), 'bin', 'herdr-core')}、PATH 上，或用 BOTMUX_HC_BIN 指定绝对路径`);
+  console.warn('    临时方案：把对应 bot 的 backendType 改回 "tmux"');
+  console.warn('');
 }
 
 function reportHerdrIntegrations(r: HerdrIntegrationResult): void {

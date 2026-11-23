@@ -4,6 +4,8 @@ import { spawnOwnedModelProcess } from './constrained-invocation/native-process.
 import { applySessionOwnerEnv } from '../utils/child-env.js';
 import { isNativeReasoningEffort } from './native-reasoning-observation.js';
 import type { CodexReasoningEffort } from './codex-reasoning-effort.js';
+import { createAntigravityAcpAdapter } from '../adapters/cli/antigravity-acp.js';
+import { ensureAntigravityGatewayForAcpTurn } from '../core/plugins/mcp/gateway-installer.js';
 
 type JsonObject = Record<string, unknown>;
 
@@ -21,6 +23,7 @@ export interface AntigravityAcpOptions {
   onRuntime?: (runtime: { model?: string; reasoningEffort?: string }) => void;
   onText?: (text: string) => void;
   onTool?: (title: string) => void;
+  onWarning?: (warning: string) => void;
   /** Server-reported currentValue or a successful, validated settings ACK. */
   onReasoningEffort?: (effort: CodexReasoningEffort | null) => void;
 }
@@ -45,6 +48,12 @@ export async function runAntigravityAcp(opts: AntigravityAcpOptions, signal: Abo
   };
   const env = { ...opts.env };
   applySessionOwnerEnv(env, opts.env.BOTMUX_OWNER_OPEN_ID);
+  const gatewayReport = ensureAntigravityGatewayForAcpTurn(
+    createAntigravityAcpAdapter(opts.executable),
+    env.HOME,
+    env,
+  );
+  if (gatewayReport?.warning) opts.onWarning?.(gatewayReport.warning);
   const child = spawnOwnedModelProcess(opts.executable, [
     'acp', '--stdio', '--dangerously-skip-permissions',
     ...(opts.logFile ? ['--log-file', opts.logFile] : []),

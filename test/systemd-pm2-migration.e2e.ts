@@ -13,10 +13,16 @@ import { fileURLToPath } from 'node:url';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 const fixtureRoot = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'systemd-migration');
+// The fixture units write their pid files under %t, the user manager's runtime
+// dir. The test fences give this process a private XDG_RUNTIME_DIR, which
+// reaches no manager.
+const runtimeDir = `/run/user/${process.getuid?.()}`;
+const userManagerEnv = { ...process.env, XDG_RUNTIME_DIR: runtimeDir };
 const systemdAvailable = process.platform === 'linux'
   && spawnSync('systemctl', ['--user', 'show-environment'], {
     stdio: 'ignore',
     timeout: 5_000,
+    env: userManagerEnv,
   }).status === 0;
 
 describe.runIf(systemdAvailable)('systemd PM2 generation migration', () => {
@@ -25,7 +31,6 @@ describe.runIf(systemdAvailable)('systemd PM2 generation migration', () => {
   const pidPrefix = `botmux-migration-${suffix}`;
   const failingUnit = `botmux-migration-failing-${suffix}.service`;
   const failingPidPrefix = `botmux-migration-failing-${suffix}`;
-  const runtimeDir = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.()}`;
   const godPidFile = join(runtimeDir, `${pidPrefix}-god.pid`);
   const persistentPidFile = join(runtimeDir, `${pidPrefix}-persistent.pid`);
   const failingGodPidFile = join(runtimeDir, `${failingPidPrefix}-god.pid`);
@@ -40,6 +45,7 @@ describe.runIf(systemdAvailable)('systemd PM2 generation migration', () => {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
+      env: userManagerEnv,
     });
     if (result.status !== 0) {
       throw new Error(`systemctl ${args.join(' ')} failed: ${result.stderr || result.status}`);
@@ -84,8 +90,8 @@ describe.runIf(systemdAvailable)('systemd PM2 generation migration', () => {
   });
 
   afterAll(() => {
-    spawnSync('systemctl', ['--user', 'stop', unit], { stdio: 'ignore', timeout: 10_000 });
-    spawnSync('systemctl', ['--user', 'stop', failingUnit], { stdio: 'ignore', timeout: 10_000 });
+    spawnSync('systemctl', ['--user', 'stop', unit], { stdio: 'ignore', timeout: 10_000, env: userManagerEnv });
+    spawnSync('systemctl', ['--user', 'stop', failingUnit], { stdio: 'ignore', timeout: 10_000, env: userManagerEnv });
     if (existsSync(persistentPidFile)) {
       const pid = readPid(persistentPidFile);
       try {
@@ -101,11 +107,11 @@ describe.runIf(systemdAvailable)('systemd PM2 generation migration', () => {
         process.kill(pid, 'SIGTERM');
       } catch { /* already gone or identity mismatch: do not signal */ }
     }
-    spawnSync('systemctl', ['--user', 'disable', '--runtime', unit], { stdio: 'ignore', timeout: 10_000 });
-    spawnSync('systemctl', ['--user', 'disable', '--runtime', failingUnit], { stdio: 'ignore', timeout: 10_000 });
-    spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'ignore', timeout: 10_000 });
-    spawnSync('systemctl', ['--user', 'reset-failed', unit], { stdio: 'ignore', timeout: 10_000 });
-    spawnSync('systemctl', ['--user', 'reset-failed', failingUnit], { stdio: 'ignore', timeout: 10_000 });
+    spawnSync('systemctl', ['--user', 'disable', '--runtime', unit], { stdio: 'ignore', timeout: 10_000, env: userManagerEnv });
+    spawnSync('systemctl', ['--user', 'disable', '--runtime', failingUnit], { stdio: 'ignore', timeout: 10_000, env: userManagerEnv });
+    spawnSync('systemctl', ['--user', 'daemon-reload'], { stdio: 'ignore', timeout: 10_000, env: userManagerEnv });
+    spawnSync('systemctl', ['--user', 'reset-failed', unit], { stdio: 'ignore', timeout: 10_000, env: userManagerEnv });
+    spawnSync('systemctl', ['--user', 'reset-failed', failingUnit], { stdio: 'ignore', timeout: 10_000, env: userManagerEnv });
     rmSync(godPidFile, { force: true });
     rmSync(persistentPidFile, { force: true });
     rmSync(failingGodPidFile, { force: true });
@@ -159,6 +165,7 @@ describe.runIf(systemdAvailable)('systemd PM2 generation migration', () => {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
+      env: userManagerEnv,
     });
     expect(restarted.status).toBe(0);
     expect(readPid(failingGodPidFile)).toBe(god);

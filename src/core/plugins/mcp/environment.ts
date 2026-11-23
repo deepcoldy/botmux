@@ -3,6 +3,8 @@ export const MCP_GATEWAY_SESSION_ENV = 'BOTMUX_SESSION_ID';
 export const MCP_GATEWAY_DATA_DIR_ENV = 'SESSION_DATA_DIR';
 export const MCP_GATEWAY_SOCKET_ENV = 'BOTMUX_MCP_GATEWAY_SOCKET';
 export const MCP_GATEWAY_REQUIRED_ENV = 'BOTMUX_MCP_GATEWAY_REQUIRED';
+/** Frozen non-secret install entry for runners that spawn fresh MCP clients per turn. */
+export const MCP_GATEWAY_INSTALL_ENTRY_ENV = 'BOTMUX_MCP_GATEWAY_INSTALL_ENTRY';
 
 export const MCP_GATEWAY_HANDSHAKE_PREFIX = 'BOTMUX-MCP/1 ';
 export const MCP_GATEWAY_HANDSHAKE_OK = 'BOTMUX-MCP/1 OK';

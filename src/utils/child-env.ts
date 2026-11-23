@@ -263,6 +263,14 @@ export const REDACTED_CHILD_ENV_KEYS = [
   // the source. Non-tmux CLIs are unaffected (they don't read TMUX).
   'TMUX',
   'TMUX_PANE',
+  // herdr-core client vars, for the same reason: hc sets the terminal pair in
+  // every program it runs, and a daemon started inside an hc terminal (or the
+  // botmux core's own env) carries the session/socket pair. A CLI inheriting
+  // them drives that core instead of starting its own hc. HC_SCOPE stays.
+  'HC_SESSION',
+  'HC_SOCKET',
+  'HC_TERMINAL_ID',
+  'HC_TERMINAL_SOCKET',
   // PM2 graceful-exit sentinel (BOTMUX_PM2_GRACEFUL_EXIT_CODE, defined as
   // PM2_GRACEFUL_EXIT_CODE_ENV in pm2-graceful-exit.ts). pm2 bakes it into the
   // daemon/dashboard env so ONLY those two managed cores exit with the sentinel
@@ -396,6 +404,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // capability plus a fail-closed marker.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',
+  'BOTMUX_MCP_GATEWAY_INSTALL_ENTRY',
   // Public per-session plugin action selectors. This lets isolated and remote
   // CLIs validate interactive cards without reading host-only plugin files.
   'BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES',
@@ -597,9 +606,10 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // credential-only "relay serves `send` only" scope marker that rides with it.
   'BOTMUX_SEND_RELAY',
   'BOTMUX_SEND_RELAY_SCOPE',
-  // Session-scoped MCP gateway capability + fail-closed marker.
+  // Session-scoped MCP gateway capability + fail-closed marker + frozen entry.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',
+  'BOTMUX_MCP_GATEWAY_INSTALL_ENTRY',
   'BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES',
   // Owning daemon's per-boot IPC port; the daemon self-sets the real value at
   // boot (daemon.ts), so an inherited copy is always a stale foreign port.

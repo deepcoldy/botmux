@@ -372,11 +372,11 @@ export interface KimiCacheExpirySupportSnapshot {
 }
 
 /** Kimi Code on a local backend whose screen the worker can verify the menu's
- *  pointer on (PTY, tmux; unset = the default local backend), in a session
- *  botmux owns. */
+ *  pointer on (PTY, tmux, hc — whose captures come from its screen mirror;
+ *  unset = the default local backend), in a session botmux owns. */
 export function supportsKimiCacheExpiryAutoCompact(s: KimiCacheExpirySupportSnapshot): boolean {
   return s.cliId === 'kimi'
-    && (s.backendType === undefined || s.backendType === 'pty' || s.backendType === 'tmux')
+    && (s.backendType === undefined || s.backendType === 'pty' || s.backendType === 'tmux' || s.backendType === 'hc')
     && !s.adopted && !s.headless && !s.vcMeetingReceiver;
 }
 

@@ -23,6 +23,12 @@ import { join } from 'node:path';
 
 const tokens = new Map<string, string>();
 vi.mock('../src/utils/user-token.js', () => ({
+  // im/lark/client.ts imports this (attachment download); bun rejects a mock
+  // missing an imported export at link time.
+  resolveUserTokenWithScopes: vi.fn(async (appId: string, _secret: string, _brand: string, openId?: string) => {
+    const accessToken = tokens.get(`${appId}|${openId ?? ''}`) ?? null;
+    return accessToken ? { accessToken } : null;
+  }),
   resolveUserToken: vi.fn(async (appId: string, _secret: string, _brand: string, openId?: string) =>
     tokens.get(`${appId}|${openId ?? ''}`) ?? null),
   lookupAuthorizedUserName: vi.fn(() => undefined),

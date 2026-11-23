@@ -6,6 +6,7 @@ import { withManagedDirectories } from '../services/managed-directory-retention.
  * - 文件权限 0o600 (只有用户自己能读), secret 不外泄给同机器人其它用户
  */
 import { writeFileSync, renameSync, existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { assertCodexInstanceConfigWrite } from '../services/codex-instance-config-guard.js';
 import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
@@ -16,6 +17,42 @@ import { assertNextBotsGenerationContent } from '../services/config-store.js';
 export interface BotsJsonMutation<T> {
   bots: any[];
   result: T;
+}
+
+export interface BotsJsonMutationContext {
+  /** Exact file contents at the locked read; null means the file did not exist. */
+  revision: string | null;
+}
+
+interface BotsJsonSnapshot {
+  path: string;
+  revision: string | null;
+}
+
+// Snapshot identity deliberately lives out-of-band: bots.json rows remain plain
+// JSON data and bookkeeping cannot leak into a committed generation.
+const snapshots = new WeakMap<readonly any[], BotsJsonSnapshot>();
+
+/** A whole-file writer's source generation no longer matches the locked file. */
+export class BotsJsonStaleSnapshotError extends Error {
+  readonly code = 'BOTS_JSON_STALE_SNAPSHOT' as const;
+  constructor(readonly botsJsonPath: string) {
+    super(
+      `bots.json changed since it was read; refusing to overwrite newer changes: ${botsJsonPath}. `
+      + 'Re-read the configuration and retry the edit.',
+    );
+    this.name = 'BotsJsonStaleSnapshotError';
+  }
+}
+
+/** Attach the exact source generation returned by a bots.json reader. */
+export function trackBotsJsonSnapshot<T extends any[]>(
+  bots: T,
+  botsJsonPath: string,
+  revision: string | null,
+): T {
+  snapshots.set(bots, { path: resolve(botsJsonPath), revision });
+  return bots;
 }
 
 /**
@@ -29,12 +66,15 @@ export interface BotsJsonMutation<T> {
  */
 export function mutateBotsJsonAtomic<T>(
   botsJsonPath: string,
-  mutation: (previous: any[]) => BotsJsonMutation<T>,
+  mutation: (previous: any[], context: BotsJsonMutationContext) => BotsJsonMutation<T>,
 ): T {
   assertDurableConfigMutationAllowed('bots');
   return withFileLockSync(botsJsonPath, () => {
-    const previous = existsSync(botsJsonPath) ? JSON.parse(readFileSync(botsJsonPath, 'utf8')) as any[] : [];
-    const { bots, result } = mutation(previous);
+    // Compare exact contents rather than mtime: atomic rename, coarse filesystem
+    // timestamps and same-ms writes must not make two generations look equal.
+    const revision = existsSync(botsJsonPath) ? readFileSync(botsJsonPath, 'utf8') : null;
+    const previous = revision === null ? [] : JSON.parse(revision) as any[];
+    const { bots, result } = mutation(previous, { revision });
     assertCodexInstanceConfigWrite(previous, bots);
     assertChangedBotConfigInvariants(previous, bots);
     assertQuotaFallbackGraphAcyclic(bots);
@@ -51,14 +91,44 @@ export function mutateBotsJsonAtomic<T>(
   });
 }
 
-export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
-  mutateBotsJsonAtomic(botsJsonPath, () => ({ bots, result: undefined }));
+/**
+ * Write a caller-assembled generation without overwriting a newer generation.
+ *
+ * `snapshotSource` is the array returned by the original read. A derived next
+ * array (spread/slice/map) must pass that source explicitly; null documents an
+ * intentionally untracked write, used for new files and tests with no reader.
+ * The check runs AFTER acquiring the lock, so non-FIFO lock acquisition cannot
+ * make an older operation overwrite a rename that committed in the meantime.
+ */
+export function writeBotsJsonAtomic(
+  botsJsonPath: string,
+  bots: any[],
+  snapshotSource: readonly any[] | null,
+): void {
+  mutateBotsJsonAtomic(botsJsonPath, (_previous, { revision }) => {
+    if (snapshotSource === undefined) {
+      throw new Error('writeBotsJsonAtomic requires an explicit snapshot source (or null for an untracked write)');
+    }
+    const snapshot = snapshotSource ? snapshots.get(snapshotSource) : undefined;
+    if (snapshotSource && !snapshot) {
+      throw new Error('writeBotsJsonAtomic snapshot source was not captured by a bots.json reader');
+    }
+    // Reading one path and intentionally writing another remains supported.
+    if (snapshot && snapshot.path === resolve(botsJsonPath) && snapshot.revision !== revision) {
+      throw new BotsJsonStaleSnapshotError(botsJsonPath);
+    }
+    return { bots, result: undefined };
+  });
 }
 
 export function readBotsJsonOrEmpty(botsJsonPath: string): any[] {
-  if (!existsSync(botsJsonPath)) return [];
+  if (!existsSync(botsJsonPath)) return trackBotsJsonSnapshot([], botsJsonPath, null);
   try {
-    return JSON.parse(readFileSync(botsJsonPath, 'utf-8'));
+    const revision = readFileSync(botsJsonPath, 'utf8');
+    const bots = JSON.parse(revision);
+    // Preserve the legacy read helper's permissive scalar/object behavior; only
+    // arrays can serve as whole-file snapshot sources for the writer.
+    return Array.isArray(bots) ? trackBotsJsonSnapshot(bots, botsJsonPath, revision) : bots;
   } catch {
     return [];
   }

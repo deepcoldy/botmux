@@ -14,6 +14,7 @@ import {
   RuntimeReservationRefusedError,
 } from './services/runtime-reservation.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
+import { shouldDeferAutoCompactForAwaySummary, type AutoCompactMaintenanceMessage } from './core/auto-compact.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
 import { probeCodexProfileCapability, validateCodexProfile, type CodexProfileCapability } from './services/codex-profiles.js';
@@ -43,6 +44,7 @@ import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath }
 import {ClaudePermissionNoticeTracker} from './services/claude-action-prompt.js';
 import { PromptSuggestionPublisher, promptSuggestionReportTurn, type FoldedTypeAheadTurn } from './utils/prompt-suggestion-publisher.js';
 import { CliRecapObserver } from './services/turn-recap.js';
+import { AwaySummaryFocus, awaySummaryFocusRefusal } from './services/away-summary-focus.js';
 import { WrittenInputLedger } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
@@ -66,7 +68,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, rmSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -125,7 +127,7 @@ import { plausibleConfiguredBotmuxHome } from './core/skills/snapshot.js';
 import { skillStoreDir } from './core/skills/registry-paths.js';
 import { pluginsHome } from './core/plugins/paths.js';
 import { buildCloseResultMessage, normalizeDestroyResult, mayRestoreWriteAdmission, interpretAbortOutcome, classifyRestartTeardown, type RestartTeardownOutcome } from './adapters/backend/destroy-result.js';
-import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
+import { isRemoteBackendType, killPersistentBackendTarget, killPersistentSession, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentSession, resolvePersistentBackendTarget, shouldRejectPersistentPostKillProbe, type PersistentBackendType } from './core/persistent-backend.js';
 import { finalizeRawCommandDelivery, typeRawCommandLine, writeRawCommandLine } from './core/raw-command-writer.js';
 import {
   decodeTerminalWriteFrameSource,
@@ -165,7 +167,7 @@ import { applySessionTempEnv, ensureSessionTempDir } from './core/session-temp.j
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, absorbedInputReplyText, AbsorbedReplyCollector, type AbsorbedInputReply, isMidTurnAbsorbedQueuedCommand, isClaudeMemoryToolUse, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, transcriptFilesSignature, ClaudeModelFallbackTracker, BackgroundTaskTracker, ClaudeModelRequestClock, backgroundTaskStopsInSiblingTranscripts, transcriptShowsTurnDurationMarker, transcriptHoldsConversation, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BackgroundTaskPinSnapshot, BridgeTurnQueue, takeAbsorbedReplyCandidates, BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS, BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS, isHeldPendingMark, makeFingerprint, normaliseForFingerprint, PROVISIONAL_EXIT_WATCH_MS, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { localTurnFailureNotice } from './services/local-turn-failure.js';
 import {
@@ -311,7 +313,12 @@ import {
   upsertScheduledTaskAnchor,
 } from './services/bridge-scheduled-anchors.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from './services/codex-adopt-recovery.js';
-import { defaultGatewayEntry, ensureGatewayEntry } from './core/plugins/mcp/gateway-installer.js';
+import {
+  defaultGatewayEntry,
+  ensureEffectiveHomeGatewayEntry,
+  ensureGatewayEntry,
+  shouldEnsureAntigravityGatewayOnSpawn,
+} from './core/plugins/mcp/gateway-installer.js';
 import {
   sessionMcpGatewayPathRegex,
   pinSessionMcpGatewaySocketRoot,
@@ -327,6 +334,7 @@ import {
   writeMcpGatewayLaunchRecord,
 } from './core/plugins/mcp/launch-record.js';
 import {
+  MCP_GATEWAY_INSTALL_ENTRY_ENV,
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
 } from './core/plugins/mcp/environment.js';
@@ -437,6 +445,7 @@ import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
   generateCodexAppThreadTitle,
+  generateCodexAppNextStep,
   readCodexAppThreadMetadata,
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
@@ -585,7 +594,7 @@ import {
   settleLaunchComm,
   readProcessStartTime,
 } from './core/session-discovery.js';
-import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
+import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, codexRpcPaneBackend, hcTerminalPanePid, paneRunsRemoteTui, type PaneProbes, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay, scaleMs } from './utils/timing.js';
 import { waitForProcessQuiescence } from './services/process-quiescence.js';
 import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
@@ -645,6 +654,11 @@ import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-back
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
 import { OrcaBackend, renderOrcaTranscriptHistory } from './adapters/backend/orca-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
+import { HcBackend } from './adapters/backend/hc-backend.js';
+import { hcDiagnosticTarget, hcTerminalName, killHcTerminal, probeHcTerminal, type HcTarget } from './adapters/backend/hc/cli-ops.js';
+import { hcCoreAddress, hcCorePaths, hcRuntimeDirError } from './adapters/backend/hc/core.js';
+import { hcDiagnosticAttachCommand, parkHcDiagnosticTerminal } from './adapters/backend/hc/diagnostic-terminal.js';
+import { probeHcAvailability } from './setup/ensure-hc.js';
 import {
   isCriticalInterruptKey,
   sendCriticalControlKey,
@@ -669,6 +683,7 @@ import {
   decideBackendGate,
   persistentReattachBias,
   reconcileBiasedReattachProbe,
+  resolveHcBackendGate,
   resolveManagedTmuxPlacement,
   resolveTmuxBackendGate,
   retireSupersededRecordedHerdrTarget,
@@ -696,6 +711,7 @@ import {
   prepareCredentialOnlyRelayOutbox,
   attachCredentialOnlyRelayOutbox,
   probeHostCredentialIsolationMechanism,
+  prepareSandboxRelayOutbox,
   attachSandboxOutbox,
   sandboxTreeSurvivesWorkerExit,
   startOutboxWatcher,
@@ -1298,8 +1314,14 @@ function stopCodexRpcEngine(): void {
  *  spawnCli's willReattachPersistent probe (worker.ts) but callable from the init
  *  handler BEFORE spawnCli runs (effectiveBackendType is stale there). A wrong
  *  guess is safe: an assumed-tmux session that is really pty just has no live
- *  session → treated as fresh. Returns null for non-persistent backends. */
+ *  session → treated as fresh. Returns null for non-persistent backends. hc
+ *  reads an unanswered probe as live, so the RPC lifecycle keeps paste rather
+ *  than engaging a fresh engine the gate would then reattach a stale pane to. */
 function persistentPaneInfo(backendType: string, sessionId: string, target?: PersistentBackendTarget): { name: string; live: boolean } | null {
+  if (backendType === 'hc') {
+    const hcTarget = resolvePersistentBackendTarget('hc', sessionId, target);
+    return { name: hcTarget.sessionName, live: probePersistentBackendTarget(hcTarget) !== 'missing' };
+  }
   let name: string | undefined;
   if (backendType === 'tmux') name = TmuxBackend.sessionName(sessionId);
   else if (backendType === 'herdr') name = HerdrBackend.sessionName(sessionId);
@@ -1358,6 +1380,15 @@ function assertManagedTmuxInstanceIdentity(cfg: Extract<DaemonToWorker, { type: 
   }
 }
 
+/** hc cannot yet prove a reused terminal's instance binding before attaching,
+ *  so a bound hc session must not reach the instance config, an engine or a pane. */
+function refuseUnverifiableInstanceBinding(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  if (!cfg.cliInstanceBinding || cfg.cliInstanceBinding.source === 'legacy') return;
+  if ((cfg.backendType ?? config.daemon.backendType) === 'hc') {
+    throw new Error('Codex 实例池目前只支持 tmux 后端：hc 还不能在接管终端前核对它的实例绑定，已拒绝启动。请把该 bot 的 backendType 改回 tmux');
+  }
+}
+
 /** Tri-state pane liveness, for callers that must not read "no answer" as an
  *  answer. The `hasSession()` helpers collapse an unanswered probe into
  *  `false`, which is safe where a wrong guess just means "treat as fresh" but
@@ -1369,10 +1400,7 @@ function persistentPaneProbe(
   name: string,
   target?: PersistentBackendTarget,
 ): 'live' | 'gone' | 'unknown' {
-  const probe: SessionProbe = target ? probePersistentBackendTarget(target) : backendType === 'tmux' ? TmuxBackend.probeSession(name)
-    : backendType === 'zellij' ? ZellijBackend.probeSession(name)
-      : backendType === 'herdr' ? HerdrBackend.probeSession(name)
-        : ZmxBackend.probeSession(name);
+  const probe: SessionProbe = target ? probePersistentBackendTarget(target) : probePersistentSession(backendType, name);
   if (probe === 'exists') return 'live';
   if (probe === 'missing') return 'gone';
   return 'unknown';
@@ -1739,8 +1767,9 @@ async function codexLaunchReasoningEffort(
 
 async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): Promise<EngageOutcome> {
   followBotTraeHome(cfg);
-  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
-    assertManagedTmuxInstanceIdentity(cfg);
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    refuseUnverifiableInstanceBinding(cfg);
+    if (cfg.backendType === 'tmux') assertManagedTmuxInstanceIdentity(cfg);
   }
   if (!codexRpcEligible(cfg, { sandboxForced: sandboxEnabled() })) return 'not-engaged';
   if (cfg.codexProfile) throw new Error('Codex profile is not supported by the RPC app-server');
@@ -2960,6 +2989,7 @@ async function prepareCliPluginGenerationAndGateway(
     // RPC calls this before spawnCli. Fence the surviving pane before changing
     // its gateway/catalog, and install the config before either CLI process
     // (app-server or TUI) has a chance to read it.
+    refuseUnverifiableInstanceBinding(cfg);
     if ((cfg.backendType ?? config.daemon.backendType) === 'tmux') {
       assertManagedTmuxInstanceIdentity(cfg);
     }
@@ -3544,6 +3574,8 @@ let isTmuxMode = false;
 let crashDiagnosticTmuxParked = false;
 /** tmux server the diagnostic shell was parked on (undefined = default server). */
 let crashDiagnosticTmuxSocket: string | undefined;
+/** The hc diagnostic terminal (bmx-diag-<sid8>) while one is live. */
+let crashDiagnosticHcTarget: HcTarget | undefined;
 /** True once the daemon told us to stop & park a crash diagnostic (crash loop):
  *  the next user message retries the CLI. Distinct from the flag above because
  *  retry must still fire even if the tmux park itself failed (no hang). */
@@ -7786,38 +7818,42 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
   if (sessionId) {
     const scope = typeof workerSessionEventScope !== 'undefined' ? workerSessionEventScope : undefined;
     const binding = scope?.contextBinding() ?? scope?.currentBinding();
-    const execution = capability.turnId
-      ? scope?.executionForTurn(capability.turnId, capability.dispatchAttempt)
-      : undefined;
-    publishedOriginContractScope = binding?.runtime && execution
-      ? { bindingId: binding.bindingId, executionId: execution.executionId }
-      : undefined;
-    const explicitOrigin = binding?.runtime
-      ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
-      : undefined;
-    pendingManagedTurnOriginScope = explicitOrigin;
-    try {
-    send({
-      type: 'managed_turn_origin',
-      sessionId,
-      capability: capability.token,
-      policyCapability,
-      ...(activeIdentity.turnId ? {
-        trustedCaller: activeIdentity.caller ?? null,
-        identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
-        ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
-      } : {}),
-      ...(readIsolationOriginChannelId
-        ? { originChannelId: readIsolationOriginChannelId }
-        : {}),
-      ...(capability.turnId ? { turnId: capability.turnId } : {}),
-      ...(capability.dispatchAttempt !== undefined
-        ? { dispatchAttempt: capability.dispatchAttempt }
-        : {}),
-      ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
-    });
-    } finally {
-      pendingManagedTurnOriginScope = undefined;
+    if (!scope || binding) {
+      const execution = capability.turnId
+        ? scope?.executionForTurn(capability.turnId, capability.dispatchAttempt)
+        : undefined;
+      publishedOriginContractScope = binding?.runtime && execution
+        ? { bindingId: binding.bindingId, executionId: execution.executionId }
+        : undefined;
+      const explicitOrigin = binding?.runtime
+        ? { bindingId: binding.bindingId, runtime: binding.runtime, ...(execution ? { execution } : {}) }
+        : undefined;
+      pendingManagedTurnOriginScope = explicitOrigin;
+      try {
+        send({
+          type: 'managed_turn_origin',
+          sessionId,
+          capability: capability.token,
+          policyCapability,
+          ...(activeIdentity.turnId ? {
+            trustedCaller: activeIdentity.caller ?? null,
+            identityTurnId: activeIdentity.identityTurnId ?? activeIdentity.turnId,
+            ...(activeIdentity.speakers?.length ? { speakers: [...activeIdentity.speakers] } : {}),
+          } : {}),
+          ...(readIsolationOriginChannelId
+            ? { originChannelId: readIsolationOriginChannelId }
+            : {}),
+          ...(capability.turnId ? { turnId: capability.turnId } : {}),
+          ...(capability.dispatchAttempt !== undefined
+            ? { dispatchAttempt: capability.dispatchAttempt }
+            : {}),
+          ...(authorityLinkRefMode ? { linkRefMode: authorityLinkRefMode } : {}),
+        });
+      } finally {
+        pendingManagedTurnOriginScope = undefined;
+      }
+    } else {
+      publishedOriginContractScope = undefined;
     }
   }
   return true;
@@ -8656,7 +8692,7 @@ function stopCodexAppControlChannel(
 function killCodexAppGenerationPane(sessionId: string, fallbackName: string): void {
   const target = lastInitConfig?.persistentBackendTarget;
   if (target?.backendType === effectiveBackendType) killPersistentBackendTarget(target, sessionId);
-  else killPersistentSession(effectiveBackendType as PersistentBackendType, fallbackName);
+  else killPersistentSession(effectiveBackendType as PersistentBackendType, fallbackName, sessionId);
 }
 
 function failCodexAppControlGeneration(reason: string): void {
@@ -8678,7 +8714,9 @@ function failCodexAppControlGeneration(reason: string): void {
         ? ZellijBackend.sessionName(cfg.sessionId)
         : effectiveBackendType === 'herdr'
           ? HerdrBackend.sessionName(cfg.sessionId)
-          : undefined;
+          : effectiveBackendType === 'hc'
+            ? hcTerminalName(cfg.sessionId)
+            : undefined;
     if (name) {
       try { killCodexAppGenerationPane(cfg.sessionId, name); }
       catch (err: any) { log(`Failed to kill rejected Codex App generation: ${err?.message ?? err}`); }
@@ -9835,6 +9873,51 @@ function backgroundWaitPayload(): { backgroundTasks?: number } {
   return backgroundWaitTasks > 0 ? { backgroundTasks: backgroundWaitTasks } : {};
 }
 
+/** The main conversation's latest served model request and latest non-upkeep
+ *  response completion, from the transcript this worker follows. The first
+ *  times cache warmth from the request start; the second times real activity
+ *  from the response end (botmux's keep-alive and plugin upkeep excluded).
+ *  Rides on screen_update with its native-session identity (the sampler
+ *  publishes a change) so the daemon can rebind on rotation, time the prompt
+ *  cache from the last actual read, and count idle only after activity ended. */
+const modelRequestClock = new ClaudeModelRequestClock();
+
+/** Bind the clock to the native conversation before reading any of its events.
+ *  The screen_update identity lets the daemon perform the matching rebind. */
+function bindModelRequestClockToTranscript(path: string | undefined): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || !path) return;
+  const claudeSessionId = sessionIdFromJsonlPath(path);
+  if (claudeSessionId) modelRequestClock.bind(claudeSessionId);
+}
+
+/** A worker that starts on an existing transcript (a daemon restart, a
+ *  resume) cursors to its end, so the clock would know nothing until the
+ *  next request and the daemon would fall back to timing the cache and the
+ *  idle stretch from the stretch start. Read the tail once instead. */
+function seedModelRequestClockFromTranscript(): void {
+  if (lastInitConfig?.cliId !== 'claude-code' || !bridgeJsonlPath) return;
+  // Bind even when the new file does not exist yet: a fresh native session
+  // must not inherit the retired transcript's cache/activity timestamps.
+  bindModelRequestClockToTranscript(bridgeJsonlPath);
+  if (!existsSyncSafe(bridgeJsonlPath)) return;
+  try { modelRequestClock.seedFromTail(bridgeJsonlPath); }
+  catch (err: any) { log(`Model request clock seed skipped: ${err?.message ?? err}`); }
+}
+
+function modelRequestPayload(): { awaySummaryPending: boolean; modelRequestSessionId?: string; lastModelRequestAt?: number; lastActivityRequestAt?: number } {
+  const claudeSessionId = modelRequestClock.boundClaudeSessionId;
+  const at = modelRequestClock.lastServedAt();
+  const activity = modelRequestClock.lastActivityAt();
+  return {
+    // Share the screen_update transport with the request clocks: automatic
+    // compact must see a one-shot recap before restoring focus.
+    awaySummaryPending: awaySummaryFocus.isActive,
+    ...(claudeSessionId ? { modelRequestSessionId: claudeSessionId } : {}),
+    ...(at !== undefined ? { lastModelRequestAt: at } : {}),
+    ...(activity !== undefined ? { lastActivityRequestAt: activity } : {}),
+  };
+}
+
 function refreshBackgroundWait(): void {
   const next = backgroundTaskTracker.backgroundWait();
   if (next > 0 && backgroundWaitTasks === 0) backgroundStopScanSinceMs = Date.now();
@@ -9979,7 +10062,7 @@ const deploymentCancellationReceipts = new Map<string, (ok: boolean) => void>();
  * forwarding operator bytes through any terminal transport. */
 async function cancelDeploymentForTerminalInput(): Promise<boolean> {
   if (nativeSessionForkPending()) return false;
-  if (lastInitConfig?.cliId !== 'codex' || effectiveBackendType !== 'tmux'
+  if (lastInitConfig?.cliId !== 'codex' || (effectiveBackendType !== 'tmux' && effectiveBackendType !== 'hc')
     || lastInitConfig.adoptMode || lastInitConfig.codexRpcInput) return true;
   discardDeploymentContinuation();
   const requestId = randomBytes(16).toString('hex');
@@ -10126,6 +10209,40 @@ const emittedRateLimitUuids = new Set<string>();
 /** Claude Code's away summaries (「本轮回顾」), forwarded once each for the
  *  turn they recap. */
 const cliRecapObserver = new CliRecapObserver();
+/** The turn that owns both the away-summary focus request and its transcript
+ *  attribution. A completed type-ahead B folded into screen-owning A recaps B. */
+function currentRecapTurn(): { turnId?: string; dispatchAttempt?: number } {
+  return promptSuggestionReportTurn(
+    { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
+    foldedTypeAheadTurn,
+    turnTerminalEmitted,
+  );
+}
+function observeCurrentCliRecap(events: readonly unknown[]) {
+  const recap = cliRecapObserver.observe(events, currentRecapTurn(), Date.now());
+  awaySummaryFocus.noteRecap(recap);
+  return recap;
+}
+/** With the bot's switch on, tells Claude Code its terminal lost focus once a
+ *  turn is over so that it writes its away summary, and reports focus back as
+ *  soon as anything else happens (services/away-summary-focus.ts). */
+const awaySummaryFocus = new AwaySummaryFocus({
+  now: () => Date.now(),
+  setTimer: (run, ms) => {
+    const timer = setTimeout(run, ms);
+    timer.unref?.();
+    return () => clearTimeout(timer);
+  },
+  refusal: () => unattendedRawInputRefusal({ requireSafeComposer: true })?.refusal,
+  currentTurnId: () => currentBotmuxTurnId,
+  recapTurnId: () => currentRecapTurn().turnId,
+  watched: () => wsClients.size > 0,
+  write: bytes => {
+    if (!backend) return false;
+    try { return backend.write(bytes) !== false; } catch { return false; }
+  },
+  log: message => log(message),
+});
 /** Codex collaboration sub-agents spawned during live ingest. Their quota
  *  failures land in their own rollouts and reach the parent only as tool
  *  results, so they are tailed separately and fed into the same structured
@@ -11807,6 +11924,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // trying to deliver.
   bridgeJsonlPath = matched;
   bridgeJsonlDir = dirname(matched);
+  bindModelRequestClockToTranscript(matched);
   // Split-live: drain `matched` from offset 0, partition by cutoffMs.
   // History (pre-mark) is absorbed into the seen set so the iTerm-side
   // turns the user accumulated before this Lark message DON'T re-emit
@@ -11826,6 +11944,7 @@ function bridgeApplyFingerprintSwitch(matched: string, reason: string, cutoffMs:
   // previous session left behind) before folding this file's own events in.
   seedModelFallbackFromTranscript();
   observeModelFallbackEvents(matched, drained.events);
+  for (const ev of drained.events) modelRequestClock.observe(ev);
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
   log(`Bridge fingerprint switch split: ${history.length} historical events absorbed, ${live.length} live events ingested (cutoff=${cutoffMs})`);
@@ -12095,6 +12214,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   }
   bridgeJsonlPath = newPath;
   bridgeJsonlDir = dirname(newPath);
+  bindModelRequestClockToTranscript(newPath);
 
   // Drain the new path from 0 ourselves (do NOT call bridgeAbsorbBaseline
   // — that would emit the preamble we want to suppress on rotation).
@@ -12114,6 +12234,7 @@ function performRotationSwitch(newPath: string, cutoffMs: number, reason: string
   // possibly before this switch noticed it. Launches replayed from an older
   // CLI process are ignored by the tracker itself.
   observeClaudeBackgroundTasks(result.events);
+  for (const ev of result.events) modelRequestClock.observe(ev);
   bridgeBaselineDone = true;
   bridgePathConfirmedAtMs = Date.now();
   log(`Bridge rotation split: ${history.length} historical events absorbed, ${live.length} live events ingested`);
@@ -12310,6 +12431,7 @@ function bridgeReadPosition(): BridgeReadPosition {
  *  no fingerprint fallback to find their transcript either. */
 function noteClaudeBridgeTurnStarted(): void {
   if (!bridgeJsonlPath) return;
+  awaySummaryFocus.noteCliTurnStarted();
   bridgeBlindTurnWatch.noteTurnStarted(bridgeReadPosition(), Date.now());
 }
 
@@ -12906,11 +13028,13 @@ function bridgeIngest(): void {
   if (!bridgeBaselineDone) {
     // Lazy baseline: file didn't exist at attach, baseline the moment it does.
     if (!existsSyncSafe(bridgeJsonlPath)) return;
+    // Bind/seed before baseline can trigger any immediate status publication.
+    seedModelRequestClockFromTranscript();
     bridgeAbsorbBaseline();
-    // Seed for the same reason startBridgeWatcher seeds after ITS baseline:
-    // the non-adopt branch cursors straight to EOF, so a switch already written
-    // to the file is never drained and only the tail scan can recover it. It
-    // also binds the tracker to this file's Claude session. Idempotent with the
+    // Seed the fallback tracker for the same reason as the request clock: the
+    // non-adopt branch cursors straight to EOF, so a switch already written to
+    // the file is never drained and only the tail scan can recover it. It also
+    // binds the tracker to this file's Claude session. Idempotent with the
     // adopt branch's own observe: the same record is deduped by uuid.
     seedModelFallbackFromTranscript();
     return;
@@ -12940,14 +13064,16 @@ function bridgeIngest(): void {
   // Fold background task launches / stops and the main turn's start / end, so
   // the idle edge (markPromptReady) and the card know what is still running.
   observeClaudeBackgroundTasks(result.events);
+  // Only the followed transcript: a retired path's tail is an older
+  // conversation, whose requests do not warm this one's cache.
+  for (const ev of result.events) modelRequestClock.observe(ev);
   // Structured rate-limit: Claude Code writes an `error:"rate_limit"` record
   // at the turn's terminal boundary. This is the authoritative "limited"
   // signal — read it here (event-driven, once per record) instead of scraping
   // the TUI. The queue already skips it as an assistant reply.
   maybeEmitStructuredRateLimit(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
-  const cliRecap = cliRecapObserver.observe(result.events,
-    { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt }, Date.now());
+  const cliRecap = observeCurrentCliRecap(result.events);
   if (cliRecap) send({ type: 'cli_recap', ...cliRecap });
   claudeTranscriptTurnEnd.observe(result.events);
   if (claudeTranscriptTurnEnd.endedForMs() !== undefined) scheduleStaleProgramStatusCheck();
@@ -13142,6 +13268,8 @@ function startBridgeWatcher(jsonlPath: string, opts?: { cliPid?: number; cliCwd?
   // baseline-existing branch re-proves `seen` from its file; fresh-empty
   // starts undecided, so its first split final gets the provisional wait.
   beginNewBridgeTranscriptGeneration();
+  // Bind/seed before baseline can publish status from a previous native session.
+  seedModelRequestClockFromTranscript();
   if (mode === 'fresh-empty') {
     // Non-adopt fallback: brand-new session, jsonl gets created on the first
     // user submit. We must NOT lazy-absorb the file when it appears — that
@@ -17160,6 +17288,26 @@ function relayRemoteRunnerWebSnapshot(snapshot: string): void {
   }
 }
 
+/** Replace every web view with an hc reattach paint.
+ *
+ * The snapshot is the backend mirror's history plus screen, the same capture a
+ * newly connected client is seeded with; bytes after it arrive through
+ * onPtyData relative to that paint, so a view still holding the pre-reattach
+ * screen would render them against the wrong base. The history frame resets the
+ * client xterm, input modes included, so write clients get them re-asserted.
+ */
+function relayHcWebSnapshot(snapshot: string): void {
+  scrollback = snapshot.length > MAX_SCROLLBACK
+    ? `\x1bc${snapshot.slice(snapshot.indexOf('\n', snapshot.length - MAX_SCROLLBACK) + 1)}`
+    : snapshot;
+  const payload = `\x1b]1989;history;0\x07${snapshot}`;
+  const modes = backend?.capturePaneInputModes?.() ?? '';
+  for (const ws of wsClients) {
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    ws.send(authedClients.has(ws) ? payload + modes : payload);
+  }
+}
+
 function applyHerdrWebBindingResult(
   ws: WebSocket,
   result: ReturnType<HerdrWebTerminalBinding['resize']>,
@@ -17180,16 +17328,17 @@ function applyHerdrWebBindingResult(
   }
 }
 
-/** Keep already-connected read-only viewers aligned with an owned tmux grid.
+/** Keep already-connected read-only viewers aligned with an owned tmux/hc grid.
  *
  * A read-only socket never drives the shared pane, but a writable socket may
- * resize it later. Without a fresh pin those existing followers keep rendering
- * at their connection-time dimensions until they reload the page. TmuxPipeBackend
+ * resize it later (and on hc, another viewer may take the size). Without a
+ * fresh pin those existing followers keep rendering at their connection-time
+ * dimensions until they reload the page. TmuxPipeBackend and HcBackend
  * resize/getPaneSize are synchronous, so publish the authoritative post-resize
  * grid rather than trusting the browser request.
  */
-function broadcastOwnedTmuxReadOnlyFollowerGrid(): void {
-  if (effectiveBackendType !== 'tmux' || !isPipeMode || lastInitConfig?.adoptMode) return;
+function broadcastOwnedPaneReadOnlyFollowerGrid(): void {
+  if ((effectiveBackendType !== 'tmux' && effectiveBackendType !== 'hc') || !isPipeMode || lastInitConfig?.adoptMode) return;
   const size = backend?.getPaneSize?.();
   if (!size) return;
   const payload = `\x1b]1989;follower;${size.cols};${size.rows}\x07`;
@@ -17519,12 +17668,13 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
       let screen = observedRenderer.rawSnapshot({ preserveFormatting: true });
       if (!screen || !adapter?.startupReadyFromHistory?.(screen)
         || traexNativeStartupInputIsPending(screen)) {
-        // A tmux CLI can draw its footer before pipe-pane attaches. Later
-        // cursor-only redraws leave the renderer nonempty but incomplete, so
-        // waiting for more stream bytes can strand a ready pane until 90s.
-        // Read the actual current cells without blocking the worker; preserve
-        // the exact generation/output/web-input fence across that await.
-        if (!(observedBackend instanceof TmuxPipeBackend)) return;
+        // A tmux or hc CLI can draw its footer before pipe-pane (or the hc
+        // attach) is in place. Later cursor-only redraws leave the renderer
+        // nonempty but incomplete, so waiting for more stream bytes can strand
+        // a ready pane until 90s. Read the actual current cells without
+        // blocking the worker; preserve the exact generation/output/web-input
+        // fence across that await.
+        if (!(observedBackend instanceof TmuxPipeBackend || observedBackend instanceof HcBackend)) return;
         screen = await observedBackend.captureViewportAsync();
         if (!stillWaiting() || webTerminalInputGeneration !== webInputGeneration
           || renderer !== observedRenderer || backendScreenRevision !== revision
@@ -17532,7 +17682,7 @@ function scheduleTraexFirstPromptReadiness(observedBackend: SessionBackend): voi
           || Date.now() - lastPtyOutputAtMs < 2_000) return;
         if (!screen || !adapter?.startupReadyFromHistory?.(screen)
           || traexNativeStartupInputIsPending(screen)) return;
-        log(`${cliName()} initialized composer recovered from native tmux viewport`);
+        log(`${cliName()} initialized composer recovered from native ${effectiveBackendType} viewport`);
       }
       if (detector?.observeStartupHistory(screen)) {
         log(`${cliName()} ${lastInitConfig?.resume ? 'restored' : 'initialized'} composer observed on screen; rechecking first-prompt readiness`);
@@ -17719,6 +17869,17 @@ function destroyCrashDiagnosticTerminal(reason: string): void {
   // was actually parked (park may have failed); the next retry/close/suspend
   // funnels through here.
   crashDiagnosticStopped = false;
+  if (crashDiagnosticHcTarget && sessionId) {
+    const outcome = killHcTerminal(crashDiagnosticHcTarget, sessionId);
+    log(outcome.result === 'mismatch' || outcome.result === 'unknown'
+      ? `Crash diagnostic hc terminal ${crashDiagnosticHcTarget.sessionName} not removed (${reason}): `
+        + (outcome.result === 'mismatch' ? `held by ${outcome.owner ?? 'a non-botmux owner'}` : outcome.reason)
+      : `Crash diagnostic hc terminal destroyed (${reason})`);
+    crashDiagnosticHcTarget = undefined;
+    const path = crashDiagnosticPath();
+    if (path) { try { unlinkSync(path); } catch { /* already gone — benign */ } }
+    return;
+  }
   if (!crashDiagnosticTmuxParked || !sessionId) return;
   try {
     TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(sessionId), crashDiagnosticTmuxSocket);
@@ -17733,8 +17894,19 @@ function destroyCrashDiagnosticTerminal(reason: string): void {
   crashDiagnosticTmuxParked = false;
 }
 
+/** The diagnostic shell needs a terminal server that outlives the CLI and that
+ *  the daemon's reclaim finds: tmux, or hc on the session's recorded core. */
+function canParkCrashDiagnostic(): boolean {
+  if (lastInitConfig?.adoptMode || !sessionId) return false;
+  return effectiveBackendType === 'tmux'
+    || (effectiveBackendType === 'hc' && lastInitConfig?.persistentBackendTarget?.backendType === 'hc');
+}
+
 function parkCrashDiagnosticTerminal(code: number | null, signal: string | null): boolean {
-  if (lastInitConfig?.adoptMode || effectiveBackendType !== 'tmux' || !sessionId) return false;
+  if (!canParkCrashDiagnostic() || !sessionId) return false;
+  const hcTarget = effectiveBackendType === 'hc' && lastInitConfig?.persistentBackendTarget?.backendType === 'hc'
+    ? lastInitConfig.persistentBackendTarget
+    : undefined;
   const path = crashDiagnosticPath();
   if (!path) return false;
   try {
@@ -17760,6 +17932,28 @@ function parkCrashDiagnosticTerminal(code: number | null, signal: string | null)
   // terminal is pointed at the diagnostic name explicitly (see the WS attach).
   // Same server as the managed session it stands in for, so the web terminal
   // and the daemon's reclaim find it next to bmx-<sid>.
+  if (hcTarget) {
+    const diagnostic = hcDiagnosticTarget(hcTarget, sessionId);
+    try {
+      parkHcDiagnosticTerminal(diagnostic, sessionId, {
+        cwd: lastInitConfig?.workingDir ?? process.cwd(),
+        cols: renderCols || PTY_COLS,
+        rows: renderRows || PTY_ROWS,
+        contentPath: path,
+      });
+    } catch (err: any) {
+      log(`Crash diagnostic hc terminal park failed: ${err?.message ?? err}`);
+      try { unlinkSync(path); } catch { /* benign */ }
+      return false;
+    }
+    crashDiagnosticHcTarget = diagnostic;
+    // Same constraint as the tmux park below: a stale screen tick must not
+    // un-freeze the crash card. Web clients attach per client (see the WS attach).
+    stopScreenUpdates();
+    stopStuckDetector();
+    log(`Crash diagnostic hc terminal parked at ${diagnostic.sessionName} on ${diagnostic.socket}`);
+    return true;
+  }
   const diagnosticSocket = lastInitConfig?.persistentBackendTarget?.backendType === 'tmux'
     ? lastInitConfig.persistentBackendTarget.socketName
     : preferredManagedTmuxSocket();
@@ -22403,6 +22597,7 @@ function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolea
     content,
     ...statusPayload,
     ...backgroundWaitPayload(),
+    ...modelRequestPayload(),
     turnId: opts?.clearTurnId ? undefined : currentBotmuxTurnId,
     dispatchAttempt: opts?.clearTurnId ? undefined : currentBotmuxDispatchAttempt,
     // Explicit direct-submit provenance: only the clearTurnId caller that
@@ -23088,11 +23283,23 @@ function markPromptReady(): void {
     hasQueuedTurn: queuedTypeAheadTurns.length > 0,
   });
   const beforeMarkerSync = readyTransition(false);
+  // Drain Antigravity's transcript before evaluating readyContinuesTurn so a
+  // just-written background task or subagent launch is reflected before this
+  // ready edge can revoke turn authority.
+  if (typeof structuredBridgeIs === 'function' && structuredBridgeIs('antigravity')
+    && typeof codexBridgeDrainAndMaybeEmit === 'function') {
+    codexBridgeDrainAndMaybeEmit({ signalIdle: false });
+  }
+  const antigravityPendingTasks = typeof structuredBridgeIs === 'function'
+    && structuredBridgeIs('antigravity')
+    && typeof hasAntigravityPendingTasks === 'function'
+    && typeof antigravityBridgeState === 'function'
+    && hasAntigravityPendingTasks(antigravityBridgeState());
   // A ready reported as working below (the argv-baked first prompt still runs,
-  // or the turn only waits on its background agents) is not the turn's end:
-  // that work still reports under this turn's authority.
+  // or the turn only waits on its background agents/tasks) is not the turn's
+  // end: that work still reports under this turn's authority.
   const readyContinuesTurn = (spawnArgvInitialPromptBusy
-      || (backgroundTaskTracker.pendingTurnAgents() > 0 && !spawnArgvNeedsWorkingSeed))
+      || ((backgroundTaskTracker.pendingTurnAgents() > 0 || antigravityPendingTasks) && !spawnArgvNeedsWorkingSeed))
     && !!renderer
     && queuedTypeAheadTurns.length === 0
     && pendingMessages.length === 0
@@ -23206,13 +23413,14 @@ function markPromptReady(): void {
   // 「工作中→等待输入→工作中」 flicker on the open card). The busy arm below owns the
   // correct 'working' publish for these paths, so this idle must not escape first.
   refreshBackgroundWait();
-  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
+  if (renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pendingTurnAgents() === 0 && !antigravityPendingTasks && pendingMessages.length === 0 && pendingAdoptMessages.length === 0 && pendingRawInputs.length === 0 && pendingSessionRename === null && !isFlushing) {
     const { content } = renderer.snapshot();
     send({
       type: 'screen_update',
       content,
       ...classifyUsageLimitWithNativeEvidence(content, projectedRuntimeScreenStatus()),
       ...backgroundWaitPayload(),
+      ...modelRequestPayload(),
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
@@ -23253,9 +23461,9 @@ function markPromptReady(): void {
       // is fine: gate allows working→limited.
       publishScreenStatus('idle');
       log('Argv-baked first prompt completed — seeded working→idle for card-off reactions');
-    } else if (backgroundTaskTracker.pendingTurnAgents() > 0) {
+    } else if (backgroundTaskTracker.pendingTurnAgents() > 0 || antigravityPendingTasks) {
       // The main turn is only quiet because it dispatched background
-      // sub-agents and is awaiting their `<task-notification>`. Report
+      // sub-agents/tasks and is awaiting their completion notification. Report
       // working (not idle) so the session card is not frozen to 「已完成」
       // mid-flight and then re-posted as 「进行中」when the notification
       // re-wakes the turn. Stay non-ready + re-arm the detector (mirrors the
@@ -23264,7 +23472,9 @@ function markPromptReady(): void {
       revokePromptReadiness();
       idleDetector?.reset();
       publishScreenStatus('working');
-      log(`Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`);
+      log(backgroundTaskTracker.pendingTurnAgents() > 0
+        ? `Idle prompt while ${backgroundTaskTracker.pendingTurnAgents()} background agent(s) pending — reporting working until their completion notification arrives`
+        : 'Idle prompt while Antigravity background task(s)/subagent(s) pending — reporting working until completion notification arrives');
     } else {
       publishScreenStatus('idle');
     }
@@ -23298,7 +23508,7 @@ function persistCliSessionId(cliSessionId: string): void {
     ...(lastInitConfig && ['codex', 'codex-app'].includes(lastInitConfig.cliId) && codexCleanupLaunchTarget
       && !lastInitConfig.adoptMode && !lastInitConfig.existingAppServerEndpoint
       && !lastInitConfig.wrapperCli && lastInitConfig.sandbox !== 'scratch'
-      && ['pty', 'tmux'].includes(lastInitConfig.backendType)
+      && ['pty', 'tmux', 'hc'].includes(lastInitConfig.backendType)
       ? { codexCleanupTarget: {
         threadId: cliSessionId,
         ...codexCleanupLaunchTarget,
@@ -23348,7 +23558,10 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
     effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
   })) return;
 
+  // Fence on this spawn, not on getChildPid(): on Herdr/ZMX it aliases the
+  // cliPid that launch-layer resolution rewires to Cursor itself mid-poll.
   const backendAtSpawn = backend;
+  const generationAtSpawn = cliSpawnGeneration;
   let attempts = 0;
   const maxAttempts = 60; // Cursor may open store.db only after its startup render settles.
   const tick = () => {
@@ -23357,11 +23570,14 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
       effectiveResume: lastSpawnEffectiveResume,
       effectiveCliSessionId: lastSpawnEffectiveCliSessionId,
     })) return;
-    if (backend !== backendAtSpawn) return;
-    const currentPid = backend.getChildPid?.();
-    if (currentPid && currentPid !== pid) return;
+    if (backend !== backendAtSpawn || cliSpawnGeneration !== generationAtSpawn) return;
 
-    const realPid = findLaunchedCliPid(pid, 'cursor') ?? pid;
+    // `pid` can be a launch layer (session-scope sh, status relay) that stays
+    // Cursor's parent, and Cursor's comm (`MainThread`/`node`) is no Cursor
+    // name, so a comm search from it finds nothing and probing it finds no
+    // store.db. Probe the pid the transcript bridge uses: launch-layer
+    // resolution rewires backend.cliPid to the payload.
+    const realPid = currentCursorObservedPid() ?? pid;
     const chatId = findCursorChatIdByPid(realPid);
     if (chatId) {
       if (!shouldPersistObservedCursorChatId({
@@ -26226,6 +26442,10 @@ function startScreenUpdates(): void {
   let lastSentExpiredQuotaKey: string | undefined;
   let lastSentRecovery: UsageAwareScreen['usageLimitRecovery'];
   let lastSentBackgroundWait = 0;
+  let lastSentModelRequestAt: number | undefined;
+  let lastSentActivityRequestAt: number | undefined;
+  let lastSentModelRequestSessionId: string | undefined;
+  let lastSentAwaySummaryPending = false;
   let lastTextSnapshotHash = '';
   let lastContent = '';
   const permissionNotice = new ClaudePermissionNoticeTracker();
@@ -26492,6 +26712,7 @@ function startScreenUpdates(): void {
       if (suggestion) {
         log(`Prompt suggestion on screen for turn ${suggestion.turnId.substring(0, 16)} (${suggestion.text.length} chars)`);
         send({ type: 'prompt_suggestion', ...suggestion });
+        awaySummaryFocus.noteSuggestion(suggestion.turnId);
       }
       // A Monitor's deadline can pass with no transcript record to re-read on,
       // and a stop can land in a transcript the bridge does not follow.
@@ -26505,16 +26726,25 @@ function startScreenUpdates(): void {
       const expiredQuotaKey = usageAware.expiredAntigravityQuota?.relativeResetKey;
       if (snapshot.changed || usageAware.status !== lastSentStatus || expiredQuotaKey !== lastSentExpiredQuotaKey
         || usageAware.usageLimitRecovery !== lastSentRecovery
-        || backgroundWaitTasks !== lastSentBackgroundWait) {
+        || backgroundWaitTasks !== lastSentBackgroundWait
+        || modelRequestClock.lastServedAt() !== lastSentModelRequestAt
+        || modelRequestClock.lastActivityAt() !== lastSentActivityRequestAt
+        || modelRequestClock.boundClaudeSessionId !== lastSentModelRequestSessionId
+        || awaySummaryFocus.isActive !== lastSentAwaySummaryPending) {
         lastSentStatus = usageAware.status;
         lastSentExpiredQuotaKey = expiredQuotaKey;
         lastSentRecovery = usageAware.usageLimitRecovery;
         lastSentBackgroundWait = backgroundWaitTasks;
+        lastSentModelRequestAt = modelRequestClock.lastServedAt();
+        lastSentActivityRequestAt = modelRequestClock.lastActivityAt();
+        lastSentModelRequestSessionId = modelRequestClock.boundClaudeSessionId;
+        lastSentAwaySummaryPending = awaySummaryFocus.isActive;
         send({
           type: 'screen_update',
           content: snapshot.content,
           ...usageAware,
           ...backgroundWaitPayload(),
+          ...modelRequestPayload(),
           turnId: screenTurn.turnId,
           dispatchAttempt: screenTurn.dispatchAttempt,
         });
@@ -27554,8 +27784,9 @@ async function spawnCliBody(
   // The Gateway socket must stay under the inherited, short tmpdir.
   pinSessionMcpGatewaySocketRoot(tmpdir());
   applySessionTempEnv(process.env, sessionScratchDir);
-  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
-    assertManagedTmuxInstanceIdentity(cfg);
+  if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy') {
+    refuseUnverifiableInstanceBinding(cfg);
+    if (cfg.backendType === 'tmux') assertManagedTmuxInstanceIdentity(cfg);
   }
   // Deferred submit-failure chains are generation-keyed; a fresh generation
   // invalidates every live chain before any old timer can touch new state.
@@ -27926,11 +28157,12 @@ async function spawnCliBody(
   // sessions; ZMX validates its version plus full-list control plane; Herdr
   // uses a non-destructive version check.
   let effectiveBackend = cfg.backendType;
-  const backendCliError = backendCliCompatibilityError(effectiveBackend, cfg.cliId as CliId);
+  const backendCliError = backendCliCompatibilityError(effectiveBackend, cfg.cliId as CliId, cliAdapter);
   if (backendCliError) {
+    const zmx = effectiveBackend === 'zmx';
     throw new Error(
-      `⚠️ ${cfg.cliId} 当前不能使用 ZMX 后端：其完成事件依赖不可见 OSC 控制消息，` +
-      `而 ZMX 的纯文本 history 不保留该通道。请将 backendType 改为 tmux / pty。\n` +
+      `⚠️ ${cfg.cliId} 当前不能使用 ${zmx ? 'ZMX' : effectiveBackend} 后端：其完成事件依赖不可见 OSC 控制消息，` +
+      `${zmx ? '而 ZMX 的纯文本 history 不保留该通道' : '而该后端在输出积压溢出或 core 重启时会丢掉这段输出'}。请将 backendType 改为 tmux / pty。\n` +
       `原因：${backendCliError}`,
     );
   }
@@ -27954,6 +28186,10 @@ async function spawnCliBody(
   // pre-isolation session leaves the shared default server at its next spawn.
   let resolvedTmuxSocketName: string | undefined;
   const preferredTmuxSocket = preferredManagedTmuxSocket();
+  // Frozen hc existence decision on the terminal resolveHcBackendGate froze
+  // into cfg.persistentBackendTarget; same reattach bias and teardown refresh
+  // as tmux.
+  let resolvedHcSessionProbe: SessionProbe | undefined;
   {
     let available = true;
     let reason = '';
@@ -28105,6 +28341,38 @@ async function spawnCliBody(
           // incompatible/unknown ownership result.
           hasExistingSession = false;
         }
+      }
+    } else if (effectiveBackend === 'hc') {
+      const recorded = cfg.persistentBackendTarget;
+      const resolved = resolveHcBackendGate({
+        sessionId: cfg.sessionId,
+        recorded,
+        availability: () => probeHcAvailability({ env: process.env }),
+        defaultCore: () => hcCoreAddress(hcCorePaths(process.env)),
+        coreUnreachable: core => {
+          try {
+            return hcRuntimeDirError(hcCorePaths(process.env, { core }));
+          } catch (err) {
+            return err instanceof Error ? err.message : String(err);
+          }
+        },
+        probe: target => probeHcTerminal(target),
+      });
+      resolvedHcSessionProbe = resolved.probe;
+      available = resolved.available;
+      reason = resolved.reason;
+      hasExistingSession = resolved.hasExistingSession;
+      existingSessionUnknown = resolved.existingSessionUnknown;
+      if (resolved.target) {
+        if (recorded?.backendType === 'hc' && recorded.socket && recorded.socket !== resolved.target.socket) {
+          log(`hc terminal ${resolved.target.sessionName} is gone from ${recorded.socket}; it is created on ${resolved.target.socket}`);
+        }
+        // Freeze before selection: every later probe, kill and reattach of this
+        // incarnation addresses this core.
+        cfg.persistentBackendTarget = resolved.target;
+      }
+      if (existingSessionUnknown) {
+        log(`hc get ${resolved.target?.sessionName} got no answer from ${resolved.target?.socket}; biasing toward reattach instead of creating`);
       }
     } else if (effectiveBackend === 'herdr') {
       // herdr's isAvailable() is a cheap, non-destructive `herdr --version`
@@ -28704,7 +28972,9 @@ async function spawnCliBody(
         ? resolvedZellijSessionProbe !== undefined && resolvedZellijSessionProbe !== 'missing'
         : effectiveBackend === 'tmux'
           ? persistentReattachBias(resolvedTmuxSessionProbe)
-          : undefined,
+          : effectiveBackend === 'hc'
+            ? persistentReattachBias(resolvedHcSessionProbe)
+            : undefined,
     tmuxSocketName: persistentReattachBias(resolvedTmuxSessionProbe) ? resolvedTmuxSocketName : preferredTmuxSocket,
     // Only strict workers pin an absolute root. Persist it with the existing
     // target so daemon workerless probe/kill uses explicit -S on the SAME server.
@@ -28720,15 +28990,21 @@ async function spawnCliBody(
   // turns a doomed reattach into a proper cold spawn WITH the fresh-path setup;
   // a still-'unknown' answer keeps the reattach bias, so the backend never
   // creates over a possibly-live pane (no duplicate-session swallowing).
-  if (effectiveBackend === 'tmux' || effectiveBackend === 'zellij') {
-    const before = effectiveBackend === 'tmux' ? resolvedTmuxSessionProbe : resolvedZellijSessionProbe;
+  if (effectiveBackend === 'tmux' || effectiveBackend === 'zellij' || effectiveBackend === 'hc') {
+    const frozenHcTarget = cfg.persistentBackendTarget?.backendType === 'hc' ? cfg.persistentBackendTarget : undefined;
+    const before = effectiveBackend === 'tmux' ? resolvedTmuxSessionProbe
+      : effectiveBackend === 'zellij' ? resolvedZellijSessionProbe
+        : resolvedHcSessionProbe;
     const after = reconcileBiasedReattachProbe(before, () => (effectiveBackend === 'tmux'
       ? TmuxBackend.probeSessionWithRetry(TmuxBackend.sessionName(cfg.sessionId), { socketName: resolvedTmuxSocketName })
-      : ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId))));
+      : effectiveBackend === 'zellij'
+        ? ZellijBackend.probeSession(ZellijBackend.sessionName(cfg.sessionId))
+        : frozenHcTarget ? probeHcTerminal(frozenHcTarget) : 'unknown'));
     if (after !== before) {
       log(`${effectiveBackend} existence re-probe before spawn: ${before} → ${after}`);
       if (effectiveBackend === 'tmux') resolvedTmuxSessionProbe = after;
-      else resolvedZellijSessionProbe = after;
+      else if (effectiveBackend === 'zellij') resolvedZellijSessionProbe = after;
+      else resolvedHcSessionProbe = after;
     }
   }
   let selectedBackend = selectBackend();
@@ -29028,7 +29304,7 @@ async function spawnCliBody(
   // scoped to it so an ordinary transport-enabled chat is never subjected to the
   // tombstone requirement (no false kills).
   const noTransportSession = !sessionLarkTransportEnabled({ chatId: cfg.chatId, apiOnly: cfg.apiOnly });
-  const isolationCapableBackend = effectiveBackendType === 'tmux';
+  const isolationCapableBackend = effectiveBackendType === 'tmux' || effectiveBackendType === 'hc';
   // Existence via no-follow probes so a planted/tampered leaf still counts as
   // present (→ triggers cleanup / conservative kill) and can never be used to
   // force a silent reattach.
@@ -29041,7 +29317,7 @@ async function spawnCliBody(
   // Enter for:
   //   · any policy-ON spawn (capability check runs on every persistent backend,
   //     incl. credential-only zellij/herdr/zmx), OR
-  //   · a policy-OFF no-transport tmux session (the file-sandbox migration scope), OR
+  //   · a policy-OFF no-transport tmux/hc session (the file-sandbox migration scope), OR
   //   · ANY session (incl. transport-enabled, any backend) that has stale
   //     provenance on disk — so a dead pane's leftover marker/tombstone is cleared
   //     before cold-spawn on EVERY backend. Otherwise a transport chat that turned
@@ -29113,14 +29389,22 @@ async function spawnCliBody(
     // provisions a fresh tree and bind. The probes below never create anything.
     const paneRelayBoundByInode = process.platform === 'linux'
       && (sandboxRequested || credentialOnlyBwrap);
+    // A full macOS oncall pane also requires a host relay. Unlike bwrap it does
+    // not bind the directory by inode, but a legacy live pane has no
+    // BOTMUX_SEND_RELAY in its frozen environment, so creating a directory on
+    // reattach cannot upgrade it. Missing relay therefore forces one cold spawn.
+    const paneRequiresSeatbeltRelay = process.platform === 'darwin'
+      && sandboxRequested && !scratchRequested;
     // The live pane runs against the tree of the flavour it was spawned with.
     // A policy flip that keeps the same isolation capabilities (oncall ↔
     // scratch) must not reattach it under the other flavour's arm.
     const recordedTreeFlavour = paneRelayBoundByInode
       ? recordedSandboxTreeFlavour(cfg.sessionId, isolationRuntimeDataDir)
       : null;
-    const paneRelayReattachable = !paneRelayBoundByInode
-      || (recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
+    const paneRelayReattachable = (!paneRelayBoundByInode && !paneRequiresSeatbeltRelay)
+      || (paneRequiresSeatbeltRelay
+        ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir }) !== null
+        : recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
         ? attachScratchSession({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
         : sandboxRequested
           ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
@@ -29229,6 +29513,8 @@ async function spawnCliBody(
           resolvedZellijSessionProbe = 'missing';
         } else if (effectiveBackendType === 'tmux') {
           resolvedTmuxSessionProbe = 'missing';
+        } else if (effectiveBackendType === 'hc') {
+          resolvedHcSessionProbe = 'missing';
         }
       },
       clearProvenanceVerified: () => {
@@ -29327,13 +29613,13 @@ async function spawnCliBody(
         `could not verify existing ${effectiveBackendType} pane`,
       );
     }
-    // zellij's pre-spawn bias reattaches on an indeterminate probe (a live pane
-    // is likelier than a gone one under load). That bias is WRONG for an
+    // zellij's and hc's pre-spawn bias reattaches on an indeterminate probe (a
+    // live pane is likelier than a gone one under load). That bias is WRONG for an
     // MCP-gateway pane: reattaching binds the CLI's MCP client to a relay socket
     // that cannot survive this worker, and the gate below only cold-resumes on a
-    // proven 'exists'. So an unverifiable zellij pane here must fail closed like
+    // proven 'exists'. So an unverifiable zellij/hc pane here must fail closed like
     // zmx rather than silently reattach to a possibly-dead gateway host.
-    if (effectiveBackendType === 'zellij' && paneProbe === 'unknown') {
+    if ((effectiveBackendType === 'zellij' || effectiveBackendType === 'hc') && paneProbe === 'unknown') {
       throw new Error(
         `[mcp-gateway] refusing to start session ${cfg.sessionId}: ` +
         `could not verify existing ${effectiveBackendType} pane`,
@@ -29399,7 +29685,7 @@ async function spawnCliBody(
       // would let the new backend reattach to the pane we just tried to remove.
       // Deliberately not probePaneAfterKill: this gate delegates to
       // shouldRejectPersistentPostKillProbe (for tmux only 'exists' is
-      // rejected; zmx additionally fail-closes on 'unknown'), so for tmux a
+      // rejected; zmx and hc additionally fail-close on 'unknown'), so for tmux a
       // mid-exit 'unknown' already reads as gone here — nothing to re-ask.
       const postKillProbe = effectiveBackendType === 'zmx'
         ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
@@ -29422,6 +29708,8 @@ async function spawnCliBody(
         resolvedZellijSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
       } else if (effectiveBackendType === 'tmux') {
         resolvedTmuxSessionProbe = postKillProbe === 'exists' ? 'exists' : 'missing';
+      } else if (effectiveBackendType === 'hc') {
+        resolvedHcSessionProbe = postKillProbe;
       }
       selectedBackend = selectBackend();
       isTmuxMode = selectedBackend.isTmuxMode;
@@ -29470,6 +29758,8 @@ async function spawnCliBody(
       resolvedZellijSessionProbe = 'missing';
     } else if (effectiveBackendType === 'tmux') {
       resolvedTmuxSessionProbe = 'missing';
+    } else if (effectiveBackendType === 'hc') {
+      resolvedHcSessionProbe = 'missing';
     }
     selectedBackend = selectBackend();
     isTmuxMode = selectedBackend.isTmuxMode;
@@ -30383,9 +30673,11 @@ async function spawnCliBody(
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;
     childEnv[MCP_GATEWAY_REQUIRED_ENV] = '1';
+    childEnv[MCP_GATEWAY_INSTALL_ENTRY_ENV] = JSON.stringify(defaultGatewayEntry());
   } else {
     delete childEnv[MCP_GATEWAY_SOCKET_ENV];
     delete childEnv[MCP_GATEWAY_REQUIRED_ENV];
+    delete childEnv[MCP_GATEWAY_INSTALL_ENTRY_ENV];
   }
   // Never inherit an ambient/stale bootstrap path from the daemon's own launch
   // environment. The raw capability is never placed in any environment.
@@ -30796,7 +31088,7 @@ async function spawnCliBody(
   if (!codexRpcEngine) {
     codexCleanupLaunchTarget = undefined;
     if (!cfg.adoptMode && !cfg.existingAppServerEndpoint && !cfg.wrapperCli && cfg.sandbox !== 'scratch'
-        && ['pty', 'tmux'].includes(effectiveBackendType)) {
+        && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)) {
       try {
         codexCleanupLaunchTarget = freezeCodexCleanupLaunch(cfg.cliId, cliAdapter.resolvedBin, args,
           childEnv.CODEX_HOME ?? join(homedir(), '.codex'));
@@ -30832,11 +31124,11 @@ async function spawnCliBody(
   // sandbox, as the program the sandbox executes (same namespace, same
   // allowlist as the CLI). Build the launch now, before any sandbox wrapping
   // rewrites spawnBin/spawnArgs; the sandbox builders below take it as their
-  // command. Only the local pty/tmux backends run a sandbox around a local
+  // command. Only the local pty/tmux/hc backends run a sandbox around a local
   // command; other backends keep ignoring the wrapper under a sandbox.
   const wrapperCliConfigured = !!cfg.wrapperCli && !!cfg.wrapperCli.trim();
   const wrapperInsideSandbox = wrapperCliConfigured && sandboxRequested
-    && (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux');
+    && (effectiveBackendType === 'pty' || effectiveBackendType === 'tmux' || effectiveBackendType === 'hc');
   let sandboxWrapperLaunch: SandboxWrapperLaunch | undefined;
   sandboxWrapperAwaitingFirstPrompt = undefined;
   if (buildsSandboxWrapperLaunch({
@@ -30900,8 +31192,8 @@ async function spawnCliBody(
     const dataDir = process.env.SESSION_DATA_DIR;
     // FAIL-SAFE (not fail-open): a requested sandbox that can't be established
     // must be a HARD ERROR, never a silent unconfined run.
-    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux') {
-      const msg = `Sandbox ENABLED but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux) — aborting spawn to avoid an unsandboxed run`;
+    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux' && effectiveBackendType !== 'hc') {
+      const msg = `Sandbox ENABLED but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux/hc) — aborting spawn to avoid an unsandboxed run`;
       log(msg);
       throw new Error(msg);
     }
@@ -31056,21 +31348,22 @@ async function spawnCliBody(
       resolvedBin: canonical(cliAdapter.resolvedBin),
     }).map(canonical);
 
-    // Relay outbox (in the policy so the compiled plan grants it read-write).
-    // Linux: always (created by prepareDirectSandbox, bound into bwrap).
-    // macOS: only when the bot withholds its app secret from the sandbox — the
-    // Seatbelt pane then has no credential to call Lark with, so send / history /
-    // quoted go through this outbox like they do on Linux.
-    const darwinRelayOutbox = process.platform === 'darwin' && cfg.sandboxWithholdBotSecret === true;
-    const outbox = process.platform === 'linux' || darwinRelayOutbox
-      ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
-      : undefined;
-    // macOS has no prepareDirectSandbox: create the outbox here, before the
-    // policy drops grants for paths that do not exist. A warm reattach must
-    // reuse the pane's existing directory (checked below), never make one.
-    if (darwinRelayOutbox && outbox && !willReattachPersistent) {
-      mkdirSync(outbox, { recursive: true, mode: 0o700 });
+    // Seatbelt also needs host-side send: its confined CLI cannot execute the
+    // system ps used to acquire feedback send leases, even with bot credentials.
+    const seatbeltRelay = process.platform === 'darwin'
+      ? (willReattachPersistent
+          ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir })
+          : prepareSandboxRelayOutbox({ sessionId: cfg.sessionId, dataDir }))
+      : null;
+    if (process.platform === 'darwin' && !seatbeltRelay) {
+      throw new Error(
+        `[file-sandbox] refusing to start session ${cfg.sessionId}: Seatbelt relay outbox is unavailable`,
+      );
     }
+    if (seatbeltRelay) childEnv.BOTMUX_SEND_RELAY = seatbeltRelay.outbox;
+    const outbox = process.platform === 'linux'
+      ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
+      : seatbeltRelay?.outbox;
     // Pre-create the outbox BEFORE buildFsPolicy so it survives the allow-rule
     // existence-filter below (a not-yet-existing readWrite path is dropped, and
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
@@ -31602,8 +31895,7 @@ async function spawnCliBody(
           throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: relay outbox ${outbox} is missing`);
         }
         if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-        const sessionTree = dirname(outbox);
-        sandboxCleanup = () => { rmSync(sessionTree, { recursive: true, force: true }); };
+        sandboxCleanup = seatbeltRelay!.cleanup;
         sandboxRelayOutbox = outbox;
         sandboxStopWatcher = startOutboxWatcher(
           outbox,
@@ -31611,8 +31903,8 @@ async function spawnCliBody(
           cfg.sessionId,
           { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
         );
-        publishSandboxRelayCapability();
-        log(`[file-sandbox] bot secret withheld from the sandbox; send/history/quoted relay via outbox=${outbox}`);
+        publishSandboxRelayCapability({ failClosed: true });
+        log(`[file-sandbox] host send relay via outbox=${outbox}`);
       }
     } else if (willReattachPersistent) {
       // Warm reattach (daemon restart / transfer) to a live bwrap'd pane:
@@ -31694,7 +31986,7 @@ async function spawnCliBody(
             ...(service.attestProcessPeer ? { attestProcessPeer: true } : {}),
           })),
         larkCliDataDir: childLarkDataRoot,
-        useBwrapArgsFile: effectiveBackendType === 'tmux',
+        useBwrapArgsFile: effectiveBackendType === 'tmux' || effectiveBackendType === 'hc',
         minimaxDataDir: cliAdapter.id === 'minimax' ? cliAdapter.authPaths?.[0] : undefined,
         childTarOptions: perBotInjectEnv.TAR_OPTIONS ?? childEnv.TAR_OPTIONS,
       });
@@ -31762,8 +32054,8 @@ async function spawnCliBody(
     if (!scratchDataDir) {
       throw new Error('Sandbox ENABLED (scratch) but SESSION_DATA_DIR is unset — aborting spawn to avoid an unsandboxed run');
     }
-    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux') {
-      const msg = `Sandbox ENABLED (scratch) but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux) — aborting spawn`;
+    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux' && effectiveBackendType !== 'hc') {
+      const msg = `Sandbox ENABLED (scratch) but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux/hc) — aborting spawn`;
       log(msg);
       throw new Error(msg);
     }
@@ -31924,7 +32216,7 @@ async function spawnCliBody(
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
         readOnlyCarvePaths: scratchReadOnlyCarves,
-        useBwrapArgsFile: effectiveBackendType === 'tmux',
+        useBwrapArgsFile: effectiveBackendType === 'tmux' || effectiveBackendType === 'hc',
       });
       if (!prepared.ok) {
         log(`scratch sandbox (${storage})${reusingRepairedScratch ? ' reuse' : ''} could not be established: ${prepared.failure.reason}${prepared.failure.detail ? ` (${prepared.failure.detail})` : ''}`);
@@ -31980,8 +32272,8 @@ async function spawnCliBody(
   // spawn confirms a genuine fresh generation.
   //
   // Policy ON → ISOLATION marker; policy OFF on a no-transport isolation-capable
-  // (tmux) session → POLICY-OFF TOMBSTONE. The tombstone is tmux-only
-  // (isolationCapableBackend === tmux), so the policy-off circular-proof concern is
+  // (tmux/hc) session → POLICY-OFF TOMBSTONE. The tombstone is tmux/hc-only
+  // (isolationCapableBackend), so the policy-off circular-proof concern is
   // fully closed synchronously. See PersistentPaneCommit below for the ZELLIJ
   // exception (option B: isolation-capable zellij stays pending → always cold-spawn).
   type PersistentPaneCommit = {
@@ -32036,7 +32328,7 @@ async function spawnCliBody(
     }
   } else if (appliedIsolationCapabilities.length === 0 && persistentSessionName
       && !willReattachPersistent && noTransportSession && isolationCapableBackend) {
-    // Policy-OFF generation proof (tmux-only: isolationCapableBackend === tmux).
+    // Policy-OFF generation proof (tmux/hc only: isolationCapableBackend).
     // NOT best-effort: if we cannot durably record the PENDING proof we must fail
     // closed rather than spawn a pane we can never prove. The committed tombstone
     // is written post-spawn only on a confirmed fresh generation.
@@ -32614,7 +32906,8 @@ async function spawnCliBody(
       // the OSC 7501 probe via pipe-pane, so Claude Code would disable program
       // status. An in-pane relay answers the probe ahead of the DA1 query
       // (src/program-status-relay.ts). The pane pid becomes the relay; the
-      // real CLI pid is resolved below (startWrapperRealPidResolve).
+      // real CLI pid is resolved below (startWrapperRealPidResolve). hc needs
+      // none: it answers the 7501 probe and DA1 for the program itself.
       // Outermost, i.e. OUTSIDE the session scope: the relay's launch shim is a
       // shell script with `$VAR` references, and systemd-run (258+) expands
       // environment references in its payload by default. `systemd-run
@@ -32633,7 +32926,7 @@ async function spawnCliBody(
     }
     let nativeModelLaunch: CodexModelLaunchObservation | undefined;
     if (cfg.cliId === 'codex' && !cfg.adoptMode && !cfg.existingAppServerEndpoint
-      && !willReattachPersistent && ['pty', 'tmux'].includes(effectiveBackendType)) {
+      && !willReattachPersistent && ['pty', 'tmux', 'hc'].includes(effectiveBackendType)) {
       nativeModelLaunch = { model: cfg.model ?? null, startedAtMs: Date.now(), nativeSessionId: cfg.cliSessionId };
       if (cfg.cliSessionId) {
         try {
@@ -32715,21 +33008,31 @@ async function spawnCliBody(
     const spawnCliBin = cliAdapter.resolvedBin;
     let spawnedAntigravityAccountReport: { accountId: string } | undefined;
     let antigravitySpawnStoreOptions: AntigravityAccountStoreOptions | undefined;
-    if (cfg.cliId === 'antigravity' && !willReattachPersistent && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
+    if (cfg.cliId === 'antigravity' && !cfg.adoptMode && !isRemoteBackendType(effectiveBackendType)) {
       const effectiveChildEnv = { ...spawnEnvPlan.childEnv, ...spawnEnvPlan.injectEnv };
-      antigravitySpawnStoreOptions = resolveAntigravitySpawnStoreOptions({
-        effectiveHome: effectiveChildEnv.HOME,
-        botmuxConfigDir: configuredBotmuxHome,
-        env: effectiveChildEnv,
-      });
-      const prepared = reconcileAntigravitySpawnAccount(antigravitySpawnStoreOptions);
-      if (prepared) {
-        const { reconciled } = prepared;
-        spawnedAntigravityAccountReport = { accountId: prepared.accountId };
-        if (reconciled.advancedFrom) {
-          log(`Antigravity account pre-spawn advance: ${reconciled.advancedFrom} -> ${reconciled.activeId}`);
-        } else if (reconciled.restored) {
-          log(`Antigravity live token restored to active account ${reconciled.activeId}`);
+      if (shouldEnsureAntigravityGatewayOnSpawn({
+        transport: agyTransport,
+        willReattachPersistent,
+        runtimeEntryCount: mcpRuntimeManifest?.entries.length,
+      })) {
+        const report = ensureEffectiveHomeGatewayEntry(cliAdapter, effectiveChildEnv.HOME);
+        if (report?.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+      }
+      if (!willReattachPersistent) {
+        antigravitySpawnStoreOptions = resolveAntigravitySpawnStoreOptions({
+          effectiveHome: effectiveChildEnv.HOME,
+          botmuxConfigDir: configuredBotmuxHome,
+          env: effectiveChildEnv,
+        });
+        const prepared = reconcileAntigravitySpawnAccount(antigravitySpawnStoreOptions);
+        if (prepared) {
+          const { reconciled } = prepared;
+          spawnedAntigravityAccountReport = { accountId: prepared.accountId };
+          if (reconciled.advancedFrom) {
+            log(`Antigravity account pre-spawn advance: ${reconciled.advancedFrom} -> ${reconciled.activeId}`);
+          } else if (reconciled.restored) {
+            log(`Antigravity live token restored to active account ${reconciled.activeId}`);
+          }
         }
       }
     }
@@ -32948,8 +33251,9 @@ async function spawnCliBody(
       // protocol that would restore zellij warm-reattach is a separate follow-up.
       log(`[read-isolation] zellij persistent pane ${cfg.sessionId}: leaving PENDING proof (isolation-capable zellij does not warm-reattach; cold-spawn on next launch)`);
     } else {
-      // tmux(-pipe) / herdr / zmx: attributable-fresh at the synchronous spawn
-      // return — TmuxPipe throws on new-session collision, herdr/zmx throw on a
+      // tmux(-pipe) / hc / herdr / zmx: attributable-fresh at the synchronous spawn
+      // return — TmuxPipe throws on new-session collision, hc on name_taken,
+      // herdr/zmx throw on a
       // name collision / verify their own bootstrap+launchPid handshake. So a
       // returned spawn + !isReattach here IS a fresh generation created by THIS
       // launch. COMMIT with compare-before-replace + generation fence.
@@ -34071,10 +34375,18 @@ async function spawnCliBody(
     if (observedBackend !== backend) return;
     if (effectiveBackendType === 'remote-runner') {
       relayRemoteRunnerWebSnapshot(snapshot);
+    } else if (effectiveBackendType === 'hc') {
+      log('hc terminal reattached — rebasing screen state from its paint');
+      relayHcWebSnapshot(snapshot);
     } else {
       log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
     }
     scheduleBackendScreenResync(snapshot, `${effectiveBackendType} observer recovery`);
+  }, true));
+  const hcBackend = backend instanceof HcBackend ? backend : null;
+  hcBackend?.onPaneSizeChange(bindSessionRuntimeCallback(() => {
+    if (observedBackend !== backend) return;
+    broadcastOwnedPaneReadOnlyFollowerGrid();
   }, true));
   backend.onAccessUrl?.(bindSessionRuntimeCallback((url) => {
     send({
@@ -34309,7 +34621,8 @@ async function spawnCliBody(
       backendReportsServerReplaced: observedBackend.exitedBecauseServerReplaced?.() === true,
     });
     // Same evidence, for the daemon: an exit caused by losing the shared tmux
-    // server joins ONE backend outage instead of counting as a CLI crash.
+    // server (or hc core) joins ONE backend outage instead of counting as a
+    // CLI crash.
     const serverLoss = intentionalRestart ? undefined : observedBackend.exitedBecauseServerLost?.();
     if (codexAutoUpgrade) {
       backend = null;
@@ -34447,7 +34760,7 @@ async function spawnCliBody(
     // model"): under pty the pane observes an activity frame before the
     // crash, so deleting this line still passes pty but fails tmux.
     if (!intentionalRestart) traexAutoModelController?.noteProcessExited(false);
-    const canParkDiagnostic = !lastInitConfig?.adoptMode && effectiveBackendType === 'tmux' && !!sessionId;
+    const canParkDiagnostic = canParkCrashDiagnostic();
     // Inputs written but not yet consumed (no idle since the write) die with
     // the CLI — codex crashing mid-submit never records them, and the fresh
     // respawn comes up empty. Stash them so the next spawnCli re-queues and
@@ -34509,7 +34822,7 @@ async function spawnCliBody(
     } else {
       const sandboxNamespace = code !== 0 ? sandboxNamespaceDiagnosis(logTail) : undefined;
       send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt,
-        ...(serverLoss ? { backendLost: { backend: 'tmux' as const, ...serverLoss } } : {}),
+        ...(serverLoss ? { backendLost: { ...serverLoss, backend: serverLoss.backend ?? 'tmux' } } : {}),
         ...(lastInitConfig?.cliId === 'traex' ? { traexStartupFailure: freshCliNeverReady() } : {}),
         ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
     }
@@ -34849,6 +35162,7 @@ function killCli(opts: {
   // depend on that implementation detail.
   cliSpawnGeneration++;
   claudeEffortObserver.reset();
+  awaySummaryFocus.reset();
   if (dshProcessAttestation?.retryTimer) clearTimeout(dshProcessAttestation.retryTimer);
   dshProcessAttestation = undefined;
   terminalEffortTracker.reset();
@@ -35316,9 +35630,10 @@ async function restartCliProcess(
       } catch { /* sendFatalWorkerErrorAndExit is already best-effort */ }
     }
   };
-  if (effectiveBackendType === 'tmux' && !opts.immediate) {
+  // hc: one core per uid serves every session, so losing it restarts them all at once.
+  if ((effectiveBackendType === 'tmux' || effectiveBackendType === 'hc') && !opts.immediate) {
     const delayMs = tmuxRestartJitterMs(lastInitConfig?.sessionId ?? '', consecutiveInWorkerRestarts);
-    log(`Staggering tmux teardown/restart by ${delayMs}ms to avoid shared-server probe storms`);
+    log(`Staggering ${effectiveBackendType} teardown/restart by ${delayMs}ms to avoid shared-server probe storms`);
     if (tmuxRestartTimer) clearTimeout(tmuxRestartTimer);
     tmuxRestartTimer = setTimeout(() => { void restart(); }, delayMs);
   } else {
@@ -35556,10 +35871,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // alternate buffer at runtime (vim/less, or the CLI's own alt-screen) still
       // forwards via _fwdScroll and must inherit its backend's cap. So gate the
       // cap on a POSITIVE allowlist of cheap, locally-drivable terminal backends
-      // (pty/tmux/zellij); every other backend — Herdr, Riff, and any future one
+      // (pty/tmux/hc/zellij — an hc write is one input frame on an open
+      // connection); every other backend — Herdr, Riff, and any future one
       // — stays safely capped by default.
       const localTerminalBackend = effectiveBackendType === 'pty'
         || effectiveBackendType === 'tmux'
+        || effectiveBackendType === 'hc'
         || effectiveBackendType === 'zellij';
       // 避免手机 Webview 或浏览器缓存包含动态首态（如动态 initialMobileInputMode）的 HTML
       res.writeHead(200, {
@@ -35637,6 +35954,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       }
       wsClients.add(ws);
       heartbeat.watch(ws);
+      // A person is looking at the terminal now.
+      awaySummaryFocus.restore('web terminal opened');
       const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
@@ -35699,8 +36018,11 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         if (ws.readyState === WebSocket.OPEN) ws.send(formatQuickCommandsReply(request.nonce, result.status, result.commands));
       });
 
-      if (isTmuxMode && !isPipeMode && sessionId) {
+      const hcDiagnostic = crashDiagnosticHcTarget;
+      if (((isTmuxMode && !isPipeMode) || hcDiagnostic) && sessionId) {
         // ── Tmux-attach mode: per-client attach ──
+        // A parked hc crash diagnostic terminal is served the same way, through
+        // per-client `hc attach` (observe-only for view clients).
         // Each WS client gets its own `tmux attach-session` PTY.
         // Scrollback is handled natively by tmux (history-limit).
         // In adopt mode, attach to the user's original pane; otherwise use bmx-* session.
@@ -35738,27 +36060,44 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         const startAttach = (cols: number, rows: number) => {
           if (cp) return;
-          // Why: a prior web resize may leave the shared tmux window in manual mode.
-          // `largest` restores the shared default without letting a smaller/newer
-          // viewer resize every other attached client.
-          spawnSync('tmux', [...attachSocketArgs, 'set-option', '-t', tmuxTarget, 'window-size', 'largest'], {
-            stdio: 'ignore',
-            env: tmuxEnv() as { [key: string]: string },
-            timeout: 3000,
-          });
-          // Defense in depth: view-capability clients attach through tmux's
-          // own read-only mode as well as the WebSocket input gate below.
-          cp = pty.spawn('tmux', [
-            ...attachSocketArgs,
-            'attach-session',
-            ...(!hasWrite ? ['-r'] : []),
-            '-t', tmuxTarget,
-          ], {
-            name: 'xterm-256color',
-            cols,
-            rows,
-            env: tmuxEnv() as { [key: string]: string },
-          });
+          if (hcDiagnostic) {
+            let attach: ReturnType<typeof hcDiagnosticAttachCommand>;
+            try {
+              attach = hcDiagnosticAttachCommand(hcDiagnostic, { observe: !hasWrite });
+            } catch (err: any) {
+              log(`Crash diagnostic hc attach unavailable: ${err?.message ?? err}`);
+              if (ws.readyState === WebSocket.OPEN) ws.close(1011, 'hc unavailable');
+              return;
+            }
+            cp = pty.spawn(attach.bin, attach.args, {
+              name: 'xterm-256color',
+              cols,
+              rows,
+              env: attach.env as { [key: string]: string },
+            });
+          } else {
+            // Why: a prior web resize may leave the shared tmux window in manual mode.
+            // `largest` restores the shared default without letting a smaller/newer
+            // viewer resize every other attached client.
+            spawnSync('tmux', [...attachSocketArgs, 'set-option', '-t', tmuxTarget, 'window-size', 'largest'], {
+              stdio: 'ignore',
+              env: tmuxEnv() as { [key: string]: string },
+              timeout: 3000,
+            });
+            // Defense in depth: view-capability clients attach through tmux's
+            // own read-only mode as well as the WebSocket input gate below.
+            cp = pty.spawn('tmux', [
+              ...attachSocketArgs,
+              'attach-session',
+              ...(!hasWrite ? ['-r'] : []),
+              '-t', tmuxTarget,
+            ], {
+              name: 'xterm-256color',
+              cols,
+              rows,
+              env: tmuxEnv() as { [key: string]: string },
+            });
+          }
           clientPtys.set(ws, cp);
 
           cp.onData((d: string) => {
@@ -35889,12 +36228,12 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         const initialHerdrSize = herdrWebBinding.sync().initialSize;
         // A view capability is observational: it must not resize a shared
         // terminal. Remote Runner already follows the provider grid; owned
-        // tmux pipe sessions need the same rule because their live pane also
+        // tmux pipe and hc sessions need the same rule because their live pane also
         // drives the Lark screenshot. Letting a narrow read-only browser resize
         // that pane leaves later screenshots permanently wrapped at its width.
         const readOnlyFollowsBackendGrid = !hasWrite
           && (effectiveBackendType === 'remote-runner'
-            || (effectiveBackendType === 'tmux' && isPipeMode && !lastInitConfig?.adoptMode));
+            || ((effectiveBackendType === 'tmux' || effectiveBackendType === 'hc') && isPipeMode && !lastInitConfig?.adoptMode));
         if (initialHerdrSize) {
           ws.send(`\x1b]1989;follower;${initialHerdrSize.cols};${initialHerdrSize.rows}\x07`);
         }
@@ -35964,7 +36303,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!result.backend && !readOnlyFollowsBackendGrid) {
                 backend?.resize(msg.cols, msg.rows);
                 if (backend) webResizedBackendGrid = { backend, cols: msg.cols, rows: msg.rows };
-                broadcastOwnedTmuxReadOnlyFollowerGrid();
+                broadcastOwnedPaneReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               await inputController.accept(msg.data, { forceUser: msg.forceUser });
@@ -39800,13 +40139,27 @@ function describeUnattendedScreen(screen: UnattendedComposerScreen | undefined):
   return describeUnattendedComposerScreen(screen, cliAdapter?.readyPattern, { cols: renderCols, rows: renderRows });
 }
 
+/** Automatic compact must not restore focus and cancel a one-shot recap. This
+ *  predicate is shared by the IPC pre-restore hook and the final input gate. */
+function deferAutoCompactForAwaySummary(msg: AutoCompactMaintenanceMessage): boolean {
+  return shouldDeferAutoCompactForAwaySummary(msg, awaySummaryFocus.isActive);
+}
+
+/** Apply the normal focus restoration for human/CLI input, except for automatic
+ *  compact while recap is active. That refusal must leave the terminal blurred
+ *  so Claude can still write its one-shot summary. */
+function restoreFocusForDaemonMessage(msg: AutoCompactMaintenanceMessage): void {
+  if (!deferAutoCompactForAwaySummary(msg)) awaySummaryFocus.beforeDaemonMessage(msg.type ?? '');
+}
+
 /** Fail-closed probe for unattended raw input. Human passthrough intentionally
  * bypasses this additional gate; maintenance commands must prove that the live,
  * empty composer is on screen before the caller can write and press Enter. */
 function unattendedRawInputRefusal(
-  msg: { requireSafeComposer?: true },
+  msg: AutoCompactMaintenanceMessage,
 ): { refusal: PromptCacheKeepaliveRefusal; screen: UnattendedComposerScreen | undefined } | undefined {
   if (!msg.requireSafeComposer) return undefined;
+  if (deferAutoCompactForAwaySummary(msg)) return { refusal: 'away_summary_pending', screen: undefined };
   const isCodex = lastInitConfig?.cliId === 'codex';
   const screen = isCodex ? undefined : unattendedComposerScreen();
   let codexInputState: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined;
@@ -39860,10 +40213,43 @@ function seedInitTurnTerminals(msg: Extract<DaemonToWorker, { type: 'init' }>): 
   }
 }
 
+let nextStepGeneration: AbortController | undefined;
+
 async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Promise<void> {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
+    case 'request_next_step': {
+      const cfg = lastInitConfig;
+      if (!cfg || !isCodexFamilyCliId(cfg.cliId)) break;
+      const abortController = new AbortController();
+      nextStepGeneration?.abort();
+      nextStepGeneration = abortController;
+      nativeSessionTitleSyncAbortControllers.add(abortController);
+      try {
+        const adapter = createCliAdapterSync('codex', cfg.cliPathOverride);
+        const text = await generateCodexAppNextStep({
+          answer: msg.answer,
+          userPrompt: msg.userPrompt,
+          codexBin: adapter.resolvedBin,
+          env: codexNativeTitleEnv(cfg),
+          model: cfg.model,
+          timeoutMs: 15_000,
+          signal: abortController.signal,
+          detached: true,
+          registerForceClose: registerNativeTitleForceClose,
+        });
+        if (text && !abortController.signal.aborted && lastInitConfig === cfg) {
+          send({ type: 'prompt_suggestion', turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt, text, editable: true });
+        }
+      } catch {
+        // Optional UI: a launcher or subprocess failure cannot fail the reply.
+      } finally {
+        nativeSessionTitleSyncAbortControllers.delete(abortController);
+        if (nextStepGeneration === abortController) nextStepGeneration = undefined;
+      }
+      break;
+    }
     case 'traex_model_pool_prune_result': {
       const pending = pendingTraexModelPoolPrunes.get(msg.requestId);
       if (!pending) break;
@@ -40138,7 +40524,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         // then launched/respawned as `codex --remote resume` (codex.ts buildArgs)
         // against the CURRENT app-server (a fresh port each incarnation).
         const rpcBackendType = msg.backendType ?? config.daemon.backendType;
-        if (msg.codexProfile && msg.codexRpcInput && rpcBackendType === 'tmux') {
+        if (msg.codexProfile && msg.codexRpcInput && codexRpcPaneBackend(rpcBackendType)) {
           throw new Error('Codex profile is not supported by the RPC app-server; no fallback was launched');
         }
         // tmux: located lazily (probes every server the pane may be on) and
@@ -40149,16 +40535,20 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
             ? msg.persistentBackendTarget
             : rpcBackendType === 'tmux'
               ? (rpcTmuxTarget ??= locateManagedTmuxTarget(msg.sessionId, msg.persistentBackendTarget))
-              : undefined
+              : rpcBackendType === 'hc'
+                ? resolvePersistentBackendTarget('hc', msg.sessionId, msg.persistentBackendTarget)
+                : undefined
         );
-        const rpcTmuxSocket = (): string | undefined => {
+        const rpcPaneProbes = (): PaneProbes => {
           const target = rpcPersistentTarget();
-          return target?.backendType === 'tmux' ? target.socketName : undefined;
+          return target?.backendType === 'hc'
+            ? { panePidOf: () => hcTerminalPanePid(target, msg.sessionId) }
+            : { socketName: target?.backendType === 'tmux' ? target.socketName : undefined };
         };
         let rpcPluginGenerationPrepared = false;
         const rpcDecision = await orchestrateCodexRpcInit(msg, {
           paneInfo: (sid) => persistentPaneInfo(rpcBackendType, sid, rpcPersistentTarget()),
-          paneIsRemote: (name) => paneRunsRemoteTui(name, { socketName: rpcTmuxSocket() }, msg.cliRuntime?.executable),
+          paneIsRemote: (name) => paneRunsRemoteTui(name, rpcPaneProbes(), msg.cliRuntime?.executable),
           prepare: async () => {
             const adapter = createCliAdapterSync(msg.cliId as CliId, msg.cliPathOverride);
             await prepareCliPluginGenerationAndGateway(msg, adapter);
@@ -40822,7 +41212,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       const model = publishedActiveRuntime.model;
       const lifetime = cliLifetimeNonce;
       if (lastInitConfig?.cliId !== 'codex' || !target || !path || !model
-        || !['pty', 'tmux'].includes(lastInitConfig.backendType) || lastInitConfig.wrapperCli
+        || !['pty', 'tmux', 'hc'].includes(lastInitConfig.backendType) || lastInitConfig.wrapperCli
         || codexRpcEngine || lastInitConfig.adoptMode || sandboxBoolValue(lastInitConfig.sandbox)
         || sandboxEnabled() || lastInitConfig.readIsolation
         || sessionRenameInFlight() || isFlushing || injectionFlushing || commandLineWritesPending
@@ -41091,7 +41481,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           current = lastInitConfig && backend && isPromptReady && !cliRestartInProgress && !tmuxRestartTimer
             && !isFlushing && !injectionFlushing && !commandLineWritesPending && !pendingMessages.length && !pendingRawInputs.length
             && !sandboxBoolValue(lastInitConfig.sandbox) && !sandboxEnabled() && !lastInitConfig.readIsolation
-            && ['pty', 'tmux'].includes(lastInitConfig.backendType)
+            && ['pty', 'tmux', 'hc'].includes(lastInitConfig.backendType)
             ? validateTraexTopicEffortRestart(lastInitConfig, msg.topicEffort, captureBackendScreen(backend)) : undefined;
         } catch { current = undefined; }
         if (!current || !msg.attemptId) {
@@ -41462,6 +41852,30 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
 
+    case 'away_summary_focus': {
+      // The turn's last reply card settled with the bot's 本轮回顾 switch on:
+      // let Claude Code write its away summary for it.
+      const refusal = awaySummaryFocusRefusal({
+        cliId: lastInitConfig?.cliId,
+        cliVersion: lastInitConfig?.cliVersion,
+        adoptMode: lastInitConfig?.adoptMode === true,
+        backendType: lastInitConfig?.backendType,
+      });
+      if (refusal) {
+        log(`[away-summary] ${msg.turnId.slice(0, 16)}: not done for this session (${refusal})`);
+        break;
+      }
+      awaySummaryFocus.request(msg.turnId);
+      break;
+    }
+
+    case 'away_summary_focus_cancel': {
+      // The bot switch was turned off after this worker received a request.
+      // restore() is a no-op (and writes nothing) when no focus-out was made.
+      awaySummaryFocus.restore('replyCardRecap off');
+      break;
+    }
+
     case 'kimi_cache_expiry_auto_compact': {
       kimiCacheExpiryAutoCompact = msg.enabled === true;
       log(`Kimi cache-expiry auto-compact ${kimiCacheExpiryAutoCompact ? 'on' : 'off'}`);
@@ -41469,6 +41883,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     }
 
     case 'prompt_cache_keepalive': {
+      // Do not consume the one-shot away summary. The daemon clears this
+      // refused attempt and a later 60s sweep retries after the recap settles.
+      if (awaySummaryFocus.isActive) {
+        send({ type: 'prompt_cache_keepalive_result', injected: false, reason: 'away_summary_pending' });
+        log('Prompt-cache keep-alive deferred while an away summary is pending');
+        break;
+      }
       // Claude Code prompt-cache keep-alive (core/prompt-cache-keepalive.ts).
       // Only into a CLI that is quietly idle AND visibly sitting in its real
       // composer: a permission dialog / AskUserQuestion picker also reads as
@@ -42220,6 +42641,9 @@ process.on('message', (raw: unknown, handle: unknown) => {
       return;
     }
   }
+  // Input for the CLI first gets the terminal's focus back (if botmux had
+  // reported it away for an away summary), except for a deferred auto-compact.
+  if (msg.type !== 'request_next_step') restoreFocusForDaemonMessage(msg);
   const execution = msg.sessionCommand?.execution;
   if (execution) workerSessionEventScope?.rememberExecution(execution);
   if (binding && workerSessionEventScope && msg.type !== 'init') return workerSessionEventScope.run(binding, () => handleContractDaemonMessage(msg, handle), execution, msg.sessionCommand?.operationId);

@@ -106,6 +106,7 @@ if (args.join(' ') === 'session list --json') {
 function runCli(
   fixture: Pick<ReturnType<typeof makeFixture>, 'dataDir' | 'binDir' | 'logPath'>,
   args: string[],
+  extraEnv: NodeJS.ProcessEnv = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const env: NodeJS.ProcessEnv = {
@@ -113,6 +114,7 @@ function runCli(
       PATH: `${fixture.binDir}:${process.env.PATH ?? ''}`,
       SESSION_DATA_DIR: fixture.dataDir,
       HERDR_TEST_LOG: fixture.logPath,
+      ...extraEnv,
     };
     for (const key of [
       'BOTMUX_SESSION_ID',
@@ -275,5 +277,114 @@ if (args.join(' ') === 'list --short') {
     const stored = storedSession(dataDir, sessionId);
     expect(stored.status).toBe('active');
     expect(stored.closedAt).toBeUndefined();
+  });
+
+  describe('hc', () => {
+    const sessionId = 'abcdef12-1111-2222-3333-444444444444';
+    const sessionName = 'bmx-abcdef12';
+
+    /**
+     * A fake herdr-core on a recorded core whose `bmx-abcdef12` is labelled for
+     * `owner`. The log path is baked in: hc's control env drops BOTMUX* keys.
+     */
+    function makeHcFixture(owner: string) {
+      const root = mkdtempSync('/tmp/bmhcc-');
+      tempDirs.push(root);
+      const dataDir = join(root, 'data');
+      const binDir = join(root, 'bin');
+      const logPath = join(root, 'hc.log');
+      const runtimeDir = join(root, 'run');
+      for (const dir of [dataDir, binDir, runtimeDir]) mkdirSync(dir, { recursive: true });
+      const target = { backendType: 'hc', sessionName, hcSession: 'botmux', socket: join(runtimeDir, 'herdr-core', 'botmux.sock') };
+      // Where the recorded core would listen: hc is never run for a core without a socket or a holder.
+      mkdirSync(join(runtimeDir, 'herdr-core'));
+      writeFileSync(target.socket, '');
+      seedPersistedSessionRows(dataDir, 'cli-target', {
+        [sessionId]: {
+          sessionId,
+          chatId: 'oc_hc_target',
+          rootMessageId: 'om_hc_target',
+          title: 'owned-hc-target',
+          status: 'active',
+          createdAt: '2026-07-30T00:00:00.000Z',
+          larkAppId: 'cli-target',
+          cliId: 'codex',
+          backendType: 'hc',
+          persistentBackendTarget: target,
+        },
+      });
+      const record = (state: string) => JSON.stringify({
+        address: 't3', name: sessionName, labels: { botmux: '1', botmux_sid: owner }, argv: ['codex'], cwd: '/tmp',
+        keep: false, state, pid: state === 'live' ? 4242 : null, exit_code: null, signal: null, reason: null,
+        created_ms: 0, finished_ms: null, screen: 'exact', cols: 160, rows: 50, title: '', parent: null,
+      });
+      const hcBin = join(binDir, 'herdr-core');
+      writeFileSync(hcBin, `#!/bin/sh
+printf '%s\\n' "$*" >> '${logPath}'
+case "$*" in
+  --version) echo 'hc 0.1.19' ;;
+  '--json ls --all') printf '%s' '{"terminals":[${record('live')}]}' ;;
+  '--json get ${sessionName}') printf '%s' '${record('live')}' ;;
+  '--json kill t3') printf '%s' '${record('finished')}' ;;
+  '--json rm t3') printf '%s' '{}' ;;
+  *) echo "unexpected hc command: $*" >&2; exit 8 ;;
+esac
+`, { mode: 0o755 });
+      return { dataDir, binDir, logPath, hcBin, target };
+    }
+
+    const hcCalls = (logPath: string) => readFileSync(logPath, 'utf8').trim().split('\n').filter(line => line !== '--version');
+
+    it('offline delete refuses an hc terminal labelled for another session and keeps the row active', async () => {
+      const fixture = makeHcFixture('abcdef12-0000-4000-8000-000000000000');
+      const result = await runCli(fixture, ['delete', sessionId], { BOTMUX_HC_BIN: fixture.hcBin });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('hc 离线删除未完成');
+      expect(result.stdout).toContain('已关闭 0 个会话');
+      expect(hcCalls(fixture.logPath)).toEqual([`--json get ${sessionName}`]);
+      expect(storedSession(fixture.dataDir, sessionId).status).toBe('active');
+    });
+
+    it('offline delete ends the owned hc terminal by address on its recorded core', async () => {
+      const fixture = makeHcFixture(sessionId);
+      const result = await runCli(fixture, ['delete', sessionId], { BOTMUX_HC_BIN: fixture.hcBin });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(hcCalls(fixture.logPath)).toEqual([`--json get ${sessionName}`, '--json kill t3', '--json rm t3']);
+      expect(storedSession(fixture.dataDir, sessionId).status).toBe('closed');
+    });
+
+    it('offline delete keeps the row when hc cannot be run at all', async () => {
+      const fixture = makeHcFixture(sessionId);
+      const result = await runCli(fixture, ['delete', sessionId], { BOTMUX_HC_BIN: join(fixture.binDir, 'missing') });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('hc 离线删除未完成');
+      expect(storedSession(fixture.dataDir, sessionId).status).toBe('active');
+    });
+
+    it('list probes hc rows on their recorded core and shows them as hc', async () => {
+      const fixture = makeHcFixture(sessionId);
+      const result = await runCli(fixture, ['list', '--plain'], { BOTMUX_HC_BIN: fixture.hcBin });
+
+      expect(result.status, result.stderr).toBe(0);
+      const line = result.stdout.split('\n').find(l => l.includes('owned-hc-target'))!;
+      expect(line).toContain(`hc: ${sessionName}`);
+      expect(line).not.toContain('(miss');
+      expect(hcCalls(fixture.logPath)).toEqual(['--json ls --all']);
+      expect(storedSession(fixture.dataDir, sessionId).status).toBe('active');
+    });
+
+    it('list never runs hc, which would start a core from the CLI env, for a core that runs nothing', async () => {
+      const fixture = makeHcFixture(sessionId);
+      rmSync(fixture.target.socket);
+      const result = await runCli(fixture, ['list', '--plain'], { BOTMUX_HC_BIN: fixture.hcBin });
+
+      expect(result.status, result.stderr).toBe(0);
+      const line = result.stdout.split('\n').find(l => l.includes('owned-hc-target'))!;
+      expect(line).toContain('(miss');
+      expect(hcCalls(fixture.logPath)).toEqual([]);
+    });
   });
 });

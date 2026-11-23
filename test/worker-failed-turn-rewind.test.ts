@@ -19,6 +19,7 @@ import { pruneRewindBackupsBeside, rewindBackupDirForSession, rewindBackupSuffix
 import {
   assertTranscriptInProjectsRoot,
   inspectLastTurnInProjectsRoot,
+  matchRecordedInput,
   planFailedTurnRewindRequest,
   withFailedTurnTranscript,
   rewindableErrorCode,
@@ -162,6 +163,21 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}, d = 
     reachWriteEdge, stop, putBackBeforeWrites, offQueue, goAway, successorInputs,
   };
 }
+
+describe('matchRecordedInput soft-newline residue', () => {
+  const input = 'echo foo\\\nbar with enough content to identify the turn';
+
+  it('accepts one residual backslash beside a genuine line-ending backslash', () => {
+    const recorded = 'echo foo\\\\\nbar with enough content to identify the turn';
+    expect(matchRecordedInput(recorded, input)).toEqual({ suffix: '' });
+    expect(matchRecordedInput(input, input)).toEqual({ suffix: '' });
+  });
+
+  it('does not accept a different recording missing the genuine backslash', () => {
+    const different = 'echo foo\nbar with enough content to identify the turn';
+    expect(matchRecordedInput(different, input)).toBeUndefined();
+  });
+});
 
 describe('startFailedTurnRewind', () => {
   it('cuts the failed turn after the CLI exit is proven and hands the CLI the failed input with the new one', async () => {

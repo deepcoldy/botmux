@@ -6,6 +6,7 @@
 import { resolve as resolvePath } from 'node:path';
 import {
   admitCardClickSender,
+  CARD_CLICK_TURN_MAX_EDITED_PROMPT_CHARS,
   readCardClickTurnClaims,
   type CardClickNonceConsume,
   type CardClickTurnClaims,
@@ -46,13 +47,15 @@ export interface CardClickTurnRuntimeDeps {
   setWorkingDir(session: CardClickBoundSession, dir: string): void;
   /** `principal_lane` wins over `cross_principal` when both apply. */
   sessionBlockedShape?(session: CardClickBoundSession | undefined): 'ok' | 'principal_lane' | 'cross_principal';
+  nextStepCurrent?(session: CardClickBoundSession, turnId: string): boolean;
   startTurn(
     session: CardClickBoundSession,
-    args: { senderOpenId: string; memberUnionId?: string; prompt: string },
+    args: { senderOpenId: string; memberUnionId?: string; prompt: string; responseToTurnId?: string },
   ): Promise<{ ok: true; turnId: string } | { ok: false; reason: string }>;
 }
 
 export type CardClickTurnFailure =
+  | 'invalid_prompt'
   | 'bad_signature'
   | 'expired'
   | 'replayed'
@@ -87,6 +90,7 @@ export async function acceptCardClickTurn(
     operatorUnionId?: string;
     payload?: string;
     sig?: string;
+    editedPrompt?: unknown;
   },
   deps: CardClickTurnRuntimeDeps,
 ): Promise<{ ok: true; chatId: string; anchorId?: string; prompt: string; run: () => Promise<{ ok: true; turnId: string } | { ok: false; reason: string }> }
@@ -135,6 +139,19 @@ export async function acceptCardClickTurn(
   const blockedShape = deps.sessionBlockedShape?.(session) ?? 'ok';
   if (blockedShape !== 'ok') return { ok: false, reason: blockedShape };
 
+  const responseToTurnId = claims.responseToTurnId;
+  let prompt = claims.prompt;
+  if (responseToTurnId !== undefined) {
+    if (!session || deps.nextStepCurrent?.(session, responseToTurnId) !== true) return { ok: false, reason: 'expired' };
+    const edited = typeof input.editedPrompt === 'string' ? input.editedPrompt.trim() : '';
+    if (!edited || edited.length > CARD_CLICK_TURN_MAX_EDITED_PROMPT_CHARS || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(edited)) {
+      return { ok: false, reason: 'invalid_prompt' };
+    }
+    prompt = edited;
+  } else if (input.editedPrompt !== undefined) {
+    return { ok: false, reason: 'bad_signature' };
+  }
+
   let consumed: 'ok' | 'replayed' | 'expired';
   try {
     consumed = deps.nonces.consume(claims.nonce, claims.exp, now);
@@ -163,7 +180,6 @@ export async function acceptCardClickTurn(
   }
 
   const bound = session;
-  const prompt = claims.prompt;
   return {
     ok: true,
     chatId,
@@ -178,12 +194,13 @@ export async function acceptCardClickTurn(
         senderOpenId: admitted.senderOpenId,
         ...(unionId ? { memberUnionId: unionId } : {}),
         prompt,
+        ...(responseToTurnId !== undefined ? { responseToTurnId } : {}),
       });
       if (!started.ok) {
         // startTurn reports failure only after rolling back: nothing reached
         // the session, so the same button may be clicked again.
         try { deps.nonces.release?.(claims.nonce); } catch { /* the button stays used */ }
-        return { ok: false, reason: 'delivery_failed' };
+        return { ok: false, reason: started.reason === 'expired' ? 'expired' : 'delivery_failed' };
       }
       return started;
     },

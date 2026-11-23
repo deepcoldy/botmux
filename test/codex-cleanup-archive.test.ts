@@ -38,6 +38,12 @@ describe('Codex idle cleanup archive journal', () => {
     expect(await archiveCodexForCleanup(session({ codexCleanupTarget: undefined, backendType: undefined }), true, persist, rpc)).toBe('codex_archive_target_unverified');
     expect(rpc).not.toHaveBeenCalled(); expect(persist).not.toHaveBeenCalled();
   });
+  it('archives an owned Codex thread that ran in an hc terminal', async () => {
+    const row = session({ backendType: 'hc' }); const rpc = vi.fn().mockResolvedValue(undefined);
+    expect(await archiveCodexForCleanup(row, true, vi.fn(), rpc)).toBeUndefined();
+    expect(rpc).toHaveBeenCalledOnce();
+    expect(row.codexCleanupArchive?.state).toBe('archived');
+  });
   it('uses worker-proven targets for historical rows without persisted backendType', async () => {
     const row = session({ backendType: undefined }); const rpc = vi.fn().mockResolvedValue(undefined);
     expect(await archiveCodexForCleanup(row, true, vi.fn(), rpc)).toBeUndefined();

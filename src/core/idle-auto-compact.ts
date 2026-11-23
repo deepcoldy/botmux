@@ -9,12 +9,32 @@
  * summary instead of the full context.
  *
  * Shape (mirrors core/prompt-cache-keepalive.ts):
- *  - the idle clock starts at the idle edge that follows a botmux turn (the
- *    only proof a request warmed the cache); other busy → idle edges — a CLI
- *    booting or restarting, a slash command, input typed into the terminal —
- *    keep the stretch that was already running, and a CLI with no such turn
- *    since it was (re)started is cold and never compacted;
- *  - the daemon's 60s idle sweep calls {@link runIdleAutoCompactSweep};
+ *  - the idle clock starts at the idle edge that follows a botmux turn or a
+ *    person's own Web-terminal submit; other busy → idle edges — a CLI booting
+ *    or restarting, a slash command, a background task or schedule waking the
+ *    model — keep the stretch that was already running, and a CLI with no such
+ *    turn since it was (re)started is cold and never compacted;
+ *  - from the Claude transcript the worker also reports
+ *    ({@link noteIdleAutoCompactTranscriptClock}) the main conversation's latest
+ *    served request START, and the latest non-upkeep response COMPLETION (idle
+ *    upkeep is botmux's own keep-alive, a plugin's prompt such as a cache-keeping
+ *    plugin's summary). The anchors differ on purpose: response generation is
+ *    busy, not idle. Idle time counts from the later of the stretch start and
+ *    that response completion:
+ *    a person typing in the terminal, a botmux turn that opened no stretch, a
+ *    background task or a schedule waking the model all produce something
+ *    someone may answer, so none is compacted under right after;
+ *  - the cache is warm for an hour from the START of the last request that
+ *    read it, whoever sent it (keep-alives included); without a report the
+ *    stretch start is the last read. A known older request is used as-is rather
+ *    than replaced by the later idle edge: uncertainty fails cold instead of
+ *    inventing a warmer cache. A stretch that goes cold is not dropped:
+ *    a later request warms the cache again, and the stretch is compacted once
+ *    idle again after it;
+ *  - background tasks do not hold the compact back (see
+ *    {@link idleAutoCompactBlockers}); every other fire-time exclusion does;
+ *  - the daemon's 60s idle sweep calls {@link runIdleAutoCompactSweep}, and
+ *    logs why a stretch is still waiting once per reason per stretch;
  *  - the compact itself goes through the same passthrough path as the card
  *    「🗜️ 压缩」button, with the unattended-maintenance safe-composer gate.
  *
@@ -33,7 +53,7 @@
  * a turn that was running when the daemon went down still opens its stretch.
  */
 import type { DaemonSession } from './types.js';
-import { supportsNativeAutoCompactRuntime } from './auto-compact.js';
+import { supportsNativeAutoCompactRuntime, type AutoCompactBlocker } from './auto-compact.js';
 import { KEEPALIVE_IN_FLIGHT_STALE_MS } from '../services/prompt-cache-policy.js';
 import type { PromptCacheKeepaliveRefusal } from './unattended-input-refusal.js';
 
@@ -62,6 +82,9 @@ export interface IdleAutoCompactSetting {
     turnId: string; since: number; idleMinutes: number; tokens?: number;
     stretch?: number; attempt?: number; previousHandled?: number;
     busyBeforeSettled?: true;
+    /** A direct Web-terminal submit armed its own turn while this compact was
+     *  unsettled. Paired with a rollback-proof in-memory witness on DaemonSession. */
+    directInputArmed?: true;
     /** Idle was observed after the busy edge, but no terminal has settled the
      *  compact yet: never announce success before a completed terminal. */
     idleBeforeSettled?: number;
@@ -106,9 +129,10 @@ export function isLocalCliCommand(cmd: string): boolean {
 export const IDLE_AUTO_COMPACT_MIN_MINUTES = 1;
 /** Must stay below the cache window so at least one sweep tick lands in it. */
 export const IDLE_AUTO_COMPACT_MAX_MINUTES = 59;
-/** Anthropic's 1h prompt-cache lifetime. Past it the cache is gone: a compact
- *  would re-read the whole context uncached, which is exactly the cost the
- *  feature exists to avoid, so the stretch is dropped instead. */
+/** Anthropic's 1h prompt-cache lifetime, counted from the start of the last
+ *  request that read the cache. Past it the cache is gone: a compact would
+ *  re-write the whole context, which is exactly the cost the feature exists to
+ *  avoid, so the stretch waits for a request to warm it again instead. */
 export const IDLE_AUTO_COMPACT_CACHE_WINDOW_MS = 60 * 60_000;
 /** Contexts smaller than this are cheap to rewrite; compacting them only
  *  loses detail. Applied only when the context size is known. */
@@ -120,10 +144,31 @@ export const IDLE_AUTO_COMPACT_IN_FLIGHT_STALE_MS = 60 * 60_000;
  *  settled like the threshold auto-compact's (see auto-compact.ts). */
 export const IDLE_AUTO_COMPACT_TURN_PREFIX = 'auto-compact:idle:';
 /** Attempts per idle stretch when the worker keeps refusing for a reason that
- *  may pass. Sweeps run a minute apart and the window is the minutes between
- *  the configured idle time and the cache's hour, so this many tries fit the
- *  default 55-minute setting; a later setting just gets fewer. */
+ *  may pass. Sweeps run a minute apart and the window is at least the minutes
+ *  between the configured idle time and the cache's hour, so this many tries
+ *  fit the default 55-minute setting; a later setting just gets fewer. */
 export const IDLE_AUTO_COMPACT_MAX_ATTEMPTS = 3;
+
+/**
+ * Fire-time exclusions the idle compact does not wait for.
+ *
+ * `background_tasks`: a CI / release watcher shell, a Monitor or an earlier
+ * prompt's background agent lives in the CLI process, not in the conversation.
+ * `/compact` rewrites only the conversation; the tasks keep running and their
+ * `<task-notification>` is delivered into the compacted conversation as before
+ * (Claude Code's own context-limit compaction does exactly this routinely).
+ * Waiting for them only helps when they end within the few minutes before the
+ * cache expires, so a watcher that runs for hours kept the session from ever
+ * being compacted. A background agent of the current prompt keeps the screen
+ * `working`, so the idle compact never sees it as idle. The threshold
+ * auto-compact keeps the full gate.
+ */
+const IDLE_AUTO_COMPACT_TOLERATED_BLOCKERS: ReadonlySet<AutoCompactBlocker> = new Set<AutoCompactBlocker>(['background_tasks']);
+
+/** The fire-time exclusions that do hold the idle compact back. */
+export function idleAutoCompactBlockers(all: readonly AutoCompactBlocker[]): AutoCompactBlocker[] {
+  return all.filter(blocker => !IDLE_AUTO_COMPACT_TOLERATED_BLOCKERS.has(blocker));
+}
 
 /**
  * Why the worker refused, as the topic is told it:
@@ -149,6 +194,7 @@ export function idleAutoCompactRefusalReason(refusal: PromptCacheKeepaliveRefusa
     case 'restarting':
     case 'prompt_not_ready':
     case 'input_pending':
+    case 'away_summary_pending':
     case 'bare_shell': return 'busy';
     default: return 'unknown';
   }
@@ -163,7 +209,8 @@ type IdleAutoCompactSessionState = Pick<DaemonSession,
   | 'idleAutoCompactPendingNotice' | 'idleAutoCompactDispatchedTurnId' | 'promptCacheKeepalive'
   | 'idleAutoCompactWarmSince' | 'idleAutoCompactArm'
   | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactLocalTurn'
-  | 'idleAutoCompactCompletedTurnId'>;
+  | 'idleAutoCompactCompletedTurnId' | 'idleAutoCompactDirectInputTurnId'
+  | 'modelRequestSessionId' | 'lastModelRequestAt' | 'lastActivityRequestAt'>;
 
 export function idleAutoCompactMinutes(setting: IdleAutoCompactSetting | undefined): number {
   const minutes = setting?.minutes;
@@ -249,7 +296,66 @@ export function supportsIdleAutoCompact(s: IdleAutoCompactSupportSnapshot): bool
  *  busy or when no stretch is known to follow a model request (cold). */
 function stretchStart(ds: IdleAutoCompactSessionState): number | undefined {
   if (ds.idleSinceAt === undefined) return undefined;
+  return currentStretch(ds);
+}
+
+/** The stretch being timed, also while the screen is busy. */
+function currentStretch(ds: Pick<DaemonSession, 'session' | 'idleAutoCompactWarmSince'>): number | undefined {
   return ds.idleAutoCompactWarmSince ?? ds.session.idleAutoCompact?.idleSince;
+}
+
+/**
+ * What the worker read from the Claude transcript (screen_update; see
+ * ClaudeModelRequestClock in services/claude-transcript.ts):
+ *  - `lastModelRequestAt`: start of the latest served request. The prompt
+ *    cache lives an hour from it, whoever sent it (a background task waking
+ *    the model, a scheduled fire, a keep-alive, a plugin's turn);
+ *  - `lastActivityRequestAt`: completion of the latest served response that was
+ *    not idle upkeep (wire name retained for compatibility). The session was in
+ *    use until then; its generation time was not idle.
+ * `modelRequestSessionId` binds both readings to one native Claude session. A
+ * new identity drops the old conversation's readings BEFORE merging, so an
+ * older `/resume` target is allowed to move the timestamps back. Within one
+ * identity each keeps the latest value: an older report never moves it back,
+ * and one ahead of `now` is clamped to `now`. In-memory only: after a daemon
+ * restart the stretch start stands in for both again.
+ */
+export function noteIdleAutoCompactTranscriptClock(
+  ds: Pick<DaemonSession, 'modelRequestSessionId' | 'lastModelRequestAt' | 'lastActivityRequestAt'>,
+  report: { modelRequestSessionId?: unknown; lastModelRequestAt?: unknown; lastActivityRequestAt?: unknown },
+  now = Date.now(),
+): void {
+  const claudeSessionId = typeof report.modelRequestSessionId === 'string' && report.modelRequestSessionId.trim()
+    ? report.modelRequestSessionId.trim()
+    : undefined;
+  if (claudeSessionId !== undefined && claudeSessionId !== ds.modelRequestSessionId) {
+    ds.modelRequestSessionId = claudeSessionId;
+    ds.lastModelRequestAt = undefined;
+    ds.lastActivityRequestAt = undefined;
+  }
+  const later = (current: number | undefined, at: unknown): number | undefined => {
+    if (typeof at !== 'number' || !Number.isFinite(at) || at <= 0) return current;
+    const seen = Math.min(at, now);
+    return current === undefined || seen > current ? seen : current;
+  };
+  ds.lastModelRequestAt = later(ds.lastModelRequestAt, report.lastModelRequestAt);
+  ds.lastActivityRequestAt = later(ds.lastActivityRequestAt, report.lastActivityRequestAt);
+}
+
+/** When the session was last in use: activity reported after the stretch
+ *  began, else the stretch start. */
+function idleFrom(ds: IdleAutoCompactSessionState, stretch: number, now: number): number {
+  const seen = ds.lastActivityRequestAt;
+  return seen !== undefined && seen > stretch && seen <= now ? seen : stretch;
+}
+
+/** The latest moment the cache is known to have been read. A real older report
+ *  stays older: replacing it with the later stretch would invent cache warmth
+ *  and can dispatch exactly the cold full-context rewrite this feature avoids.
+ *  Transcript identity, not a fixed time lead, filters another session's data. */
+function lastCacheReadAt(ds: IdleAutoCompactSessionState, stretch: number, now: number): number {
+  const seen = ds.lastModelRequestAt;
+  return seen !== undefined && seen <= now ? seen : stretch;
 }
 
 function liveInFlight(setting: IdleAutoCompactSetting, now: number): IdleAutoCompactSetting['inFlight'] {
@@ -271,7 +377,16 @@ function hasCompleted(ds: IdleAutoCompactSessionState, flight: IdleAutoCompactFl
   return flight.completed === true || ds.idleAutoCompactCompletedTurnId === flight.turnId;
 }
 
-/** A completed compact and its finishing idle edge have BOTH been observed. */
+function hasDirectInputArmed(ds: IdleAutoCompactSessionState, flight: IdleAutoCompactFlight): boolean {
+  // The nested flag survives restart; the independent turnId witness survives
+  // updateSession restoring its durable row after a failed direct-input save.
+  return flight.directInputArmed === true
+    || ds.idleAutoCompactDirectInputTurnId === flight.turnId;
+}
+
+/** A completed compact and its finishing idle edge have BOTH been observed.
+ *  When a direct input armed a newer stretch, the same edge belongs to that
+ *  user turn: retire the compact without consuming the user's new stretch. */
 function settleCompletedIdleCompact(
   ds: IdleAutoCompactSessionState,
   setting: IdleAutoCompactSetting,
@@ -283,9 +398,21 @@ function settleCompletedIdleCompact(
   if (ds.idleAutoCompactBusyBeforeSettledTurnId === finished.turnId) {
     ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
   }
-  ds.idleAutoCompactWarmSince = idle;
-  setting.idleSince = idle;
-  setting.handledIdleSince = idle;
+  const current = currentStretch(ds);
+  const preserveUserStretch = hasDirectInputArmed(ds, finished)
+    && finished.stretch !== undefined
+    && current !== undefined && current !== finished.stretch;
+  if (preserveUserStretch) {
+    // The finishing idle edge belongs to the direct user's armed turn, not to
+    // our compact. Retire only the compact claim and mirror the NEW stretch;
+    // its handled marker stays on the older stretch so it can compact later.
+    const warm = current;
+    if (warm !== undefined) setting.idleSince = warm;
+  } else {
+    ds.idleAutoCompactWarmSince = idle;
+    setting.idleSince = idle;
+    setting.handledIdleSince = idle;
+  }
   // Only a compact THIS process dispatched may be announced as done. A marker
   // inherited from a restarted daemon folds as handled without a success claim.
   if (ds.idleAutoCompactDispatchedTurnId === finished.turnId) {
@@ -361,7 +488,10 @@ export function noteIdleAutoCompactScreenStatus(
       // The CLI went busy while a refused compact waited for another try, and
       // neither our compact nor a keep-alive did it: someone is using the
       // session (a turn typed into the terminal, a background task waking
-      // it). That stretch is over, not to be compacted under them.
+      // it). That stretch is over, not to be compacted under them: a screen
+      // edge cannot tell who, and trying again after every busy flicker of a
+      // CLI that keeps refusing would never end. The next sweep logs it.
+      idleAutoCompactAbandonedRetry.set(ds, setting.retry);
       setting.handledIdleSince = setting.retry.stretch;
       delete setting.retry;
       changed = true;
@@ -392,6 +522,15 @@ export function noteIdleAutoCompactScreenStatus(
   syncArm();
   // A local command's own repaint is over; later busy edges are activity again.
   ds.idleAutoCompactLocalTurn = undefined;
+  // Mirror an armed user's NEW stretch before any in-flight early return. If
+  // the daemon restarts before the compact terminal, the durable row must still
+  // distinguish this stretch from the compact's older flight.stretch.
+  const warm = ds.idleAutoCompactWarmSince;
+  if (warm !== setting!.idleSince) {
+    if (warm === undefined) delete setting!.idleSince;
+    else setting!.idleSince = warm;
+    changed = true;
+  }
   const finished = liveInFlight(setting!, now);
   if (finished && hasBusyBeforeSettled(ds, finished) && !hasCompleted(ds, finished)) {
     // A busy → idle edge alone cannot distinguish our compact from the user's
@@ -404,14 +543,11 @@ export function noteIdleAutoCompactScreenStatus(
   if (finished) return settleCompletedIdleCompact(ds, setting!, finished, finished.idleBeforeSettled ?? idle);
   // A stale marker (or one a different turn already ended) is just dropped.
   if (setting!.inFlight) { delete setting!.inFlight; changed = true; }
-  const warm = ds.idleAutoCompactWarmSince;
-  if (warm !== setting!.idleSince) {
-    if (warm === undefined) delete setting!.idleSince;
-    else setting!.idleSince = warm;
-    changed = true;
-  }
   return changed;
 }
+
+/** A retry the screen hook abandoned, for the next sweep to log. In-memory. */
+const idleAutoCompactAbandonedRetry = new WeakMap<object, NonNullable<IdleAutoCompactSetting['retry']>>();
 
 export interface IdleAutoCompactRetryInvalidation {
   /** The persistent setting changed and must be saved before worker admission. */
@@ -473,7 +609,8 @@ export function invalidateIdleAutoCompactRetryForTurn(
  *  must save the retry invalidation now. */
 export function noteIdleAutoCompactTurnStarted(
   ds: Pick<DaemonSession, 'session' | 'idleAutoCompactArm' | 'lastScreenStatus'
-    | 'idleAutoCompactLocalTurn' | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactCompletedTurnId'>,
+    | 'idleAutoCompactLocalTurn' | 'idleAutoCompactBusyBeforeSettledTurnId'
+    | 'idleAutoCompactCompletedTurnId' | 'idleAutoCompactDirectInputTurnId'>,
   turnId: string,
   now = Date.now(),
   opts: { preserveRetry?: boolean } = {},
@@ -481,6 +618,7 @@ export function noteIdleAutoCompactTurnStarted(
   const setting = ds.session.idleAutoCompact;
   const endedInFlight = setting?.inFlight !== undefined && setting.inFlight.turnId !== turnId;
   if (endedInFlight) delete setting!.inFlight;
+  ds.idleAutoCompactDirectInputTurnId = undefined;
   if (turnId.startsWith(IDLE_AUTO_COMPACT_TURN_PREFIX)) return endedInFlight;
   const invalidation = invalidateIdleAutoCompactRetryForTurn(ds, turnId, opts);
   ds.idleAutoCompactLocalTurn = opts.preserveRetry && setting?.retry
@@ -496,17 +634,39 @@ export function noteIdleAutoCompactTurnStarted(
 
 /** A direct Web-terminal submit is positive user-attribution, not a repaint to
  *  guess about: end any local-command exemption and cancel unsettled maintenance
- *  state immediately. Returns true when the caller must persist the change. */
+ *  state immediately. The person is using the session, so the submit also
+ *  arms like a botmux turn: the idle edge after its busy period opens the next
+ *  stretch, and the stretch it interrupted is never compacted under them (the
+ *  request their turn sends would otherwise keep that stretch's cache warm). A
+ *  submit that never goes busy (a local command) leaves the stretch as it was.
+ *  Returns true when the caller must persist the change. */
 export function noteIdleAutoCompactDirectInput(
-  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactLocalTurn' | 'idleAutoCompactBusyBeforeSettledTurnId'>,
+  ds: Pick<DaemonSession, 'session' | 'idleAutoCompactLocalTurn' | 'idleAutoCompactBusyBeforeSettledTurnId'
+    | 'idleAutoCompactDirectInputTurnId' | 'idleAutoCompactArm' | 'lastScreenStatus'>,
+  now = Date.now(),
 ): boolean {
   ds.idleAutoCompactLocalTurn = undefined;
+  ds.idleAutoCompactDirectInputTurnId = undefined;
   const setting = ds.session.idleAutoCompact;
   let changed = false;
+  // Arm in EVERY case, including while our compact is unsettled. Persist the
+  // arm now: the CLI may already be busy, so there need not be another busy
+  // edge to save it before a daemon restart.
+  const arm = { at: now, busy: BUSY_SCREEN_STATUSES.has(ds.lastScreenStatus ?? '') };
+  ds.idleAutoCompactArm = arm;
+  if (setting?.enabled && (setting.armed?.at !== arm.at || setting.armed.busy !== arm.busy)) {
+    setting.armed = { ...arm };
+    changed = true;
+  }
   if (setting?.inFlight) {
     ds.idleAutoCompactBusyBeforeSettledTurnId = setting.inFlight.turnId;
+    ds.idleAutoCompactDirectInputTurnId = setting.inFlight.turnId;
     if (!setting.inFlight.busyBeforeSettled) {
       setting.inFlight.busyBeforeSettled = true;
+      changed = true;
+    }
+    if (!setting.inFlight.directInputArmed) {
+      setting.inFlight.directInputArmed = true;
       changed = true;
     }
   }
@@ -535,7 +695,7 @@ export interface IdleAutoCompactRefusalOutcome {
  *  saves the session row. */
 export function noteIdleAutoCompactRefused(
   ds: Pick<DaemonSession, 'session' | 'idleAutoCompactPendingNotice' | 'idleAutoCompactDispatchedTurnId'
-    | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactCompletedTurnId'>,
+    | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactCompletedTurnId' | 'idleAutoCompactDirectInputTurnId'>,
   turnId: string,
   refusal?: PromptCacheKeepaliveRefusal,
 ): IdleAutoCompactRefusalOutcome | undefined {
@@ -553,6 +713,7 @@ export function noteIdleAutoCompactRefused(
     ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
   }
   if (ds.idleAutoCompactCompletedTurnId === turnId) ds.idleAutoCompactCompletedTurnId = undefined;
+  if (ds.idleAutoCompactDirectInputTurnId === turnId) ds.idleAutoCompactDirectInputTurnId = undefined;
   if (busyBeforeSettled || !locallyDispatched) {
     // Busy before refusal proves activity. An inherited claim without THIS
     // process's dispatch witness is also never retryable: a failed marker save
@@ -623,6 +784,7 @@ export function noteIdleAutoCompactTurnEnded(
     ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
   }
   if (ds.idleAutoCompactCompletedTurnId === turnId) ds.idleAutoCompactCompletedTurnId = undefined;
+  if (ds.idleAutoCompactDirectInputTurnId === turnId) ds.idleAutoCompactDirectInputTurnId = undefined;
   const pending = ds.idleAutoCompactPendingNotice;
   if (pending?.kind === 'compacted' && pending.turnId === turnId) {
     // The idle edge announced success first; retract it before the sweep posts.
@@ -649,15 +811,25 @@ function keepaliveInFlight(ds: IdleAutoCompactSessionState, now: number): boolea
 }
 
 type IdleAutoCompactDecision =
-  | { action: 'wait'; reason: 'not_idle' | 'handled' | 'too_early' | 'keepalive' | 'ineligible' }
-  | { action: 'expired'; stretch: number; idleMs: number }
+  /** `stretch` is the one the busy screen interrupts; `due` when it is past
+   *  its idle time and not handled yet (only then is the wait worth logging). */
+  | { action: 'wait'; reason: 'not_idle'; stretch?: number; idleMs?: number; due: boolean }
+  | { action: 'wait'; reason: 'handled'; stretch: number }
+  | { action: 'wait'; reason: 'too_early' | 'keepalive'; stretch: number; idleMs: number }
+  | { action: 'wait'; reason: 'ineligible'; stretch: number; idleMs: number; blockers: AutoCompactBlocker[] }
+  /** Due, but the last known cache read is past the window. */
+  | { action: 'cold'; stretch: number; idleMs: number; sinceReadMs: number }
   | { action: 'skip_small'; stretch: number; idleMs: number; tokens: number }
-  | { action: 'compact'; stretch: number; idleMs: number; tokens?: number };
+  /** `tolerated`: exclusions present that the idle compact does not wait for. */
+  | { action: 'compact'; stretch: number; idleMs: number; sinceReadMs: number; tokens?: number; tolerated: AutoCompactBlocker[] };
+
+type IdleAutoCompactWaitDecision = Extract<IdleAutoCompactDecision, { action: 'wait' }>;
 
 interface IdleAutoCompactProbe {
   now: number;
-  /** Final fire-time gate (live worker, CLI ready, nothing queued, …). */
-  eligible: () => boolean;
+  /** Final fire-time gate (live worker, CLI ready, nothing queued, …): every
+   *  exclusion that applies right now; empty = eligible. */
+  blockers: () => readonly AutoCompactBlocker[];
   /** Current context size in tokens; undefined = unknown (threshold skipped). */
   contextTokens: () => number | undefined;
   minContextTokens?: number;
@@ -672,19 +844,86 @@ function decideIdleAutoCompact(
   setting: IdleAutoCompactSetting,
   probe: IdleAutoCompactProbe,
 ): IdleAutoCompactDecision {
+  const idleMinutesMs = idleAutoCompactMinutes(setting) * 60_000;
   const stretch = stretchStart(ds);
-  if (stretch === undefined) return { action: 'wait', reason: 'not_idle' };
-  if (setting.handledIdleSince === stretch) return { action: 'wait', reason: 'handled' };
-  const idleMs = probe.now - stretch;
-  if (idleMs < idleAutoCompactMinutes(setting) * 60_000) return { action: 'wait', reason: 'too_early' };
-  if (idleMs >= IDLE_AUTO_COMPACT_CACHE_WINDOW_MS) return { action: 'expired', stretch, idleMs };
+  if (stretch === undefined) {
+    const interrupted = currentStretch(ds);
+    if (interrupted === undefined) return { action: 'wait', reason: 'not_idle', due: false };
+    const idleMs = probe.now - idleFrom(ds, interrupted, probe.now);
+    const due = setting.handledIdleSince !== interrupted && idleMs >= idleMinutesMs;
+    return { action: 'wait', reason: 'not_idle', stretch: interrupted, idleMs, due };
+  }
+  if (setting.handledIdleSince === stretch) return { action: 'wait', reason: 'handled', stretch };
+  // Idle since the last activity; the cache warm since the last read of any kind.
+  const idleMs = probe.now - idleFrom(ds, stretch, probe.now);
+  if (idleMs < idleMinutesMs) return { action: 'wait', reason: 'too_early', stretch, idleMs };
+  const sinceReadMs = probe.now - lastCacheReadAt(ds, stretch, probe.now);
+  if (sinceReadMs >= IDLE_AUTO_COMPACT_CACHE_WINDOW_MS) return { action: 'cold', stretch, idleMs, sinceReadMs };
   const tokens = probe.contextTokens();
   const minTokens = probe.minContextTokens ?? IDLE_AUTO_COMPACT_MIN_CONTEXT_TOKENS;
   if (tokens !== undefined && tokens < minTokens) return { action: 'skip_small', stretch, idleMs, tokens };
   // Never type /compact on top of a keep-alive prompt in the same tick.
-  if (keepaliveInFlight(ds, probe.now)) return { action: 'wait', reason: 'keepalive' };
-  if (!probe.eligible()) return { action: 'wait', reason: 'ineligible' };
-  return { action: 'compact', stretch, idleMs, ...(tokens !== undefined ? { tokens } : {}) };
+  if (keepaliveInFlight(ds, probe.now)) return { action: 'wait', reason: 'keepalive', stretch, idleMs };
+  const all = probe.blockers();
+  const blockers = idleAutoCompactBlockers(all);
+  if (blockers.length > 0) return { action: 'wait', reason: 'ineligible', stretch, idleMs, blockers };
+  const tolerated = all.filter(blocker => !blockers.includes(blocker));
+  return { action: 'compact', stretch, idleMs, sinceReadMs, tolerated, ...(tokens !== undefined ? { tokens } : {}) };
+}
+
+/** Per session, the stretch the wait log belongs to and the reasons already
+ *  logged for it: each distinct reason is logged once per stretch, so a
+ *  session that waits for an hour writes one line, not sixty. In-memory. */
+const idleAutoCompactWaitLog = new WeakMap<object, { stretch: number | undefined; logged: Set<string> }>();
+
+/** Log `line` unless this stretch already logged `key`. A busy screen reports
+ *  no stretch of its own and stays with the one it interrupted. */
+function logOncePerStretch(ds: object, stretch: number | undefined, key: string, line: () => string, log: (message: string) => void): void {
+  let state = idleAutoCompactWaitLog.get(ds);
+  if (!state || (stretch !== undefined && state.stretch !== stretch)) {
+    state = { stretch, logged: new Set() };
+    idleAutoCompactWaitLog.set(ds, state);
+  }
+  if (state.logged.has(key)) return;
+  state.logged.add(key);
+  log(line());
+}
+
+function minutesOf(ms: number): number {
+  return Math.floor(ms / 60_000);
+}
+
+function logIdleAutoCompactWait(
+  ds: IdleAutoCompactSessionState,
+  id: string,
+  setting: IdleAutoCompactSetting,
+  decision: IdleAutoCompactWaitDecision,
+  now: number,
+  log: (message: string) => void,
+): void {
+  switch (decision.reason) {
+    case 'handled':
+      // Its outcome (compacted, skipped, refused) was already logged.
+      return;
+    case 'not_idle':
+      if (!decision.due) return;
+      logOncePerStretch(ds, decision.stretch, 'not_idle', () =>
+        `[idle-compact] ${id} waiting: due after ${minutesOf(decision.idleMs!)}m idle, but the CLI is ${ds.lastScreenStatus ?? 'not idle'}`, log);
+      return;
+    case 'too_early':
+      logOncePerStretch(ds, decision.stretch, 'too_early', () =>
+        `[idle-compact] ${id} waiting: idle ${minutesOf(decision.idleMs)}m of ${idleAutoCompactMinutes(setting)}m `
+        + `(since ${new Date(now - decision.idleMs).toISOString()})`, log);
+      return;
+    case 'keepalive':
+      logOncePerStretch(ds, decision.stretch, 'keepalive', () =>
+        `[idle-compact] ${id} waiting: a prompt-cache keep-alive is in flight (idle ${minutesOf(decision.idleMs)}m)`, log);
+      return;
+    case 'ineligible':
+      logOncePerStretch(ds, decision.stretch, `ineligible:${decision.blockers.join(',')}`, () =>
+        `[idle-compact] ${id} waiting: not eligible (${decision.blockers.join(', ')}) after ${minutesOf(decision.idleMs)}m idle`, log);
+      return;
+  }
 }
 
 export type IdleAutoCompactNotice =
@@ -719,13 +958,18 @@ function postedNotice(p: IdleAutoCompactPendingNotice): IdleAutoCompactNotice {
  *  persisted setting changed (the caller saves the row). */
 export function clearIdleAutoCompactStretch(
   ds: Pick<DaemonSession, 'session' | 'idleAutoCompactWarmSince' | 'idleAutoCompactArm'
-    | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactLocalTurn' | 'idleAutoCompactCompletedTurnId'>,
+    | 'idleAutoCompactBusyBeforeSettledTurnId' | 'idleAutoCompactLocalTurn' | 'idleAutoCompactCompletedTurnId'
+    | 'idleAutoCompactDirectInputTurnId' | 'modelRequestSessionId' | 'lastModelRequestAt' | 'lastActivityRequestAt'>,
 ): boolean {
   ds.idleAutoCompactWarmSince = undefined;
   ds.idleAutoCompactArm = undefined;
+  ds.modelRequestSessionId = undefined;
+  ds.lastModelRequestAt = undefined;
+  ds.lastActivityRequestAt = undefined;
   ds.idleAutoCompactBusyBeforeSettledTurnId = undefined;
   ds.idleAutoCompactLocalTurn = undefined;
   ds.idleAutoCompactCompletedTurnId = undefined;
+  ds.idleAutoCompactDirectInputTurnId = undefined;
   const setting = ds.session.idleAutoCompact;
   if (!setting || (setting.idleSince === undefined && !setting.inFlight && setting.armed === undefined && !setting.retry)) return false;
   delete setting.idleSince;
@@ -747,7 +991,10 @@ function describeOutcome(notice: IdleAutoCompactNotice): string {
 export interface IdleAutoCompactSweepDeps {
   now?: () => number;
   supported(ds: DaemonSession): boolean;
-  eligible(ds: DaemonSession): boolean;
+  /** Every fire-time exclusion that applies right now (the daemon's shared
+   *  auto-compact gate); empty = eligible. The sweep drops the ones the idle
+   *  compact tolerates ({@link idleAutoCompactBlockers}). */
+  blockers(ds: DaemonSession): readonly AutoCompactBlocker[];
   contextTokens(ds: DaemonSession): number | undefined;
   /** Save `ds.session` (the setting rides the session row). */
   persist(ds: DaemonSession): void;
@@ -784,15 +1031,11 @@ export function runIdleAutoCompactSweep(
           if (unsettled.idleBeforeSettled !== undefined
             && ds.idleAutoCompactDispatchedTurnId !== unsettled.turnId) {
             // This claim came from another process. Its idle edge is durable,
-            // but its in-memory completed witness is unrecoverable (for example
-            // a failed completed save followed by restart). Fold it silently as
-            // handled rather than waiting forever or claiming success.
-            const inheritedIdle = unsettled.idleBeforeSettled;
-            delete current()!.inFlight;
-            delete current()!.retry;
-            ds.idleAutoCompactWarmSince = inheritedIdle;
-            current()!.idleSince = inheritedIdle;
-            current()!.handledIdleSince = inheritedIdle;
+            // but its in-memory completed witness is unrecoverable. Retire it
+            // through the same stretch-aware settlement as a witnessed compact:
+            // no success is claimed, and a direct user's newer stretch is not
+            // consumed. Without one, the old stretch folds silently as handled.
+            settleCompletedIdleCompact(ds, current()!, unsettled, unsettled.idleBeforeSettled);
             try { deps.persist(ds); } catch { /* the next sweep reconciles again */ }
           }
           continue;
@@ -812,6 +1055,12 @@ export function runIdleAutoCompactSweep(
         deps.notify(ds, notice);
         deps.log(`[idle-compact] ${id} outcome: ${describeOutcome(notice)}`);
       }
+      const abandoned = idleAutoCompactAbandonedRetry.get(ds);
+      if (abandoned) {
+        idleAutoCompactAbandonedRetry.delete(ds);
+        deps.log(`[idle-compact] ${id} gave up retrying (refused ${abandoned.attempts}x, last: ${abandoned.reason}): `
+          + 'the CLI went busy before the next try; this stretch is left alone');
+      }
       if (!deps.supported(ds)) continue;
       // Turned on mid-stretch: mirror the live warm stretch onto the row so a
       // daemon restart continues it instead of seeing an unexplained stretch.
@@ -822,27 +1071,35 @@ export function runIdleAutoCompactSweep(
       }
       const decision = decideIdleAutoCompact(ds, current()!, {
         now,
-        eligible: () => deps.eligible(ds),
+        blockers: () => deps.blockers(ds),
         contextTokens: () => deps.contextTokens(ds),
         minContextTokens: minTokens,
       });
-      if (decision.action === 'wait') continue;
+      if (decision.action === 'wait') {
+        logIdleAutoCompactWait(ds, id, current()!, decision, now, deps.log);
+        continue;
+      }
       const idleMinutes = Math.floor(decision.idleMs / 60_000);
-      if (decision.action === 'expired') {
-        const expired = current()!;
-        expired.handledIdleSince = decision.stretch;
-        const retry = expired.retry;
-        delete expired.retry;
-        deps.persist(ds);
-        if (retry?.stretch === decision.stretch) {
+      if (decision.action === 'cold') {
+        const cold = current()!;
+        if (cold.retry?.stretch === decision.stretch) {
           // The window closed while a refused compact was waiting to be tried
-          // again: the topic hears why it never ran.
+          // again: the topic hears why it never ran, and the stretch is over.
+          const retry = cold.retry;
+          cold.handledIdleSince = decision.stretch;
+          delete cold.retry;
+          deps.persist(ds);
           const notice: IdleAutoCompactNotice = { kind: 'refused', idleMinutes, reason: retry.reason, attempts: retry.attempts };
           deps.notify(ds, notice);
           deps.log(`[idle-compact] ${id} idle ${idleMinutes}m is past the cache window before a retry; outcome: ${describeOutcome(notice)}`);
           continue;
         }
-        deps.log(`[idle-compact] ${id} idle ${idleMinutes}m is past the cache window; skipped`);
+        // Not handled: a background task waking the model, a scheduled fire or
+        // a keep-alive warms the cache again, and the next sweep compacts then
+        // at the price of a warm read instead of a full rewrite.
+        logOncePerStretch(ds, decision.stretch, 'cold', () =>
+          `[idle-compact] ${id} idle ${idleMinutes}m; the last cache read was ${minutesOf(decision.sinceReadMs)}m ago, `
+          + 'past the cache window: waiting for a request to warm the cache again', deps.log);
         continue;
       }
       if (decision.action === 'skip_small') {
@@ -894,6 +1151,9 @@ export function runIdleAutoCompactSweep(
       if (!accepted) {
         releaseClaim();
         try { deps.persist(ds); } catch { /* the in-memory release already lets a later tick retry */ }
+        logOncePerStretch(ds, decision.stretch, 'not_accepted', () =>
+          `[idle-compact] ${id} /compact was not handed to the worker (no live worker or delivery refused); `
+          + 'trying again at the next sweep', deps.log);
         continue;
       }
       // This process itself handed the compact to the worker: only it may
@@ -905,6 +1165,8 @@ export function runIdleAutoCompactSweep(
       sent += 1;
       deps.log(`[idle-compact] ${id} /compact dispatched to worker after ${idleMinutes}m idle`
         + (decision.tokens !== undefined ? ` (context ${decision.tokens} tokens` : ' (context size unknown')
+        + `, last cache read ${minutesOf(decision.sinceReadMs)}m ago`
+        + (decision.tolerated.length > 0 ? `, not waiting for: ${decision.tolerated.join(', ')}` : '')
         + `, attempt ${attempt}/${IDLE_AUTO_COMPACT_MAX_ATTEMPTS})`);
     } catch (error) {
       deps.log(`[idle-compact] ${id} sweep failed safely: ${error instanceof Error ? error.message : String(error)}`);

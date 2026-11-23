@@ -37,7 +37,7 @@ export const AGENT_PROMPT_INJECTION_MODES = ['default', 'none'] as const;
 export type AgentPromptInjectionMode = (typeof AGENT_PROMPT_INJECTION_MODES)[number];
 
 /** 与 services/backend-type-store.ts 的 EDITABLE_BACKEND_TYPES 保持一致（有测试守护）。 */
-export const AGENT_BACKEND_TYPES = ['pty', 'tmux', 'herdr', 'zellij', 'zmx'] as const;
+export const AGENT_BACKEND_TYPES = ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'hc'] as const;
 export type AgentBackendType = (typeof AGENT_BACKEND_TYPES)[number];
 
 export const AGENT_NAME_MAX = 64;

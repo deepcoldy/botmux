@@ -8,13 +8,14 @@
  * it by a CardKit element insert (the answer body is never rewritten); unified
  * reply cards render it from their record.
  */
-import { CARD_CLICK_TURN_ACTION } from '../../services/card-click-turn.js';
+import { CARD_CLICK_TURN_ACTION, CARD_CLICK_TURN_MAX_EDITED_PROMPT_CHARS } from '../../services/card-click-turn.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 
 export const NEXT_STEP_ELEMENT_ID = 'botmux_next_step';
 /** Marks a card-click turn started from this row (unsigned: it only selects
  * the wording of the in-thread acknowledgement, never what is sent). */
 export const NEXT_STEP_CLICK_NOTICE = 'next_step';
+export const NEXT_STEP_PROMPT_FIELD = 'botmux_next_step_prompt';
 /** Button label budget. The full text is what the signed token sends. */
 export const NEXT_STEP_LABEL_MAX_CHARS = 80;
 
@@ -22,6 +23,7 @@ export interface NextStepButton {
   text: string;
   payload: string;
   sig: string;
+  editable?: true;
 }
 
 function label(text: string): { label: string; shortened: boolean } {
@@ -34,6 +36,31 @@ function label(text: string): { label: string; shortened: boolean } {
 export function buildNextStepElement(next: NextStepButton, locale?: 'zh' | 'en'): Record<string, unknown> {
   const en = locale === 'en';
   const shown = label(next.text);
+  if (next.editable) {
+    return {
+      tag: 'form', element_id: NEXT_STEP_ELEMENT_ID, name: 'botmux_next_step',
+      elements: [{
+        tag: 'collapsible_panel', expanded: false,
+        header: {
+          title: { tag: 'plain_text', content: `${en ? 'Next step' : '下一步'} · ${shown.label}` },
+          icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey', size: '16px 16px' },
+          icon_position: 'right', icon_expanded_angle: -180,
+        },
+        elements: [{
+          tag: 'input', name: NEXT_STEP_PROMPT_FIELD, input_type: 'multiline_text',
+          width: 'fill', required: true, max_length: CARD_CLICK_TURN_MAX_EDITED_PROMPT_CHARS,
+          default_value: next.text,
+          placeholder: { tag: 'plain_text', content: en ? 'Edit the suggestion' : '编辑建议' },
+        }, {
+          tag: 'button', name: 'botmux_next_step_submit', type: 'primary', form_action_type: 'submit',
+          text: { tag: 'plain_text', content: en ? 'Confirm and send' : '确认发送' },
+          behaviors: [{ type: 'callback', value: {
+            action: CARD_CLICK_TURN_ACTION, payload: next.payload, sig: next.sig, notice: NEXT_STEP_CLICK_NOTICE,
+          } }],
+        }],
+      }],
+    };
+  }
   // A shortened label hides part of what a click sends: the tip shows it all.
   const tip = shown.shortened
     ? `${en ? 'Sends: ' : '将发送：'}${next.text}`

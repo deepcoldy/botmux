@@ -95,6 +95,19 @@ describe('parseBotSelection', () => {
     expect(parseBotSelection('app_b', bots)).toBe(1);
   });
 
+  it('selects the current display name without changing the process identity', () => {
+    expect(parseBotSelection('Current name', [
+      { larkAppId: 'app_a', name: 'old-process-name', displayName: 'Current name' },
+    ])).toBe(0);
+  });
+
+  it('does not guess between identical display names', () => {
+    expect(parseBotSelection('Shared', [
+      { larkAppId: 'app_a', name: 'a', displayName: 'Shared' },
+      { larkAppId: 'app_b', name: 'b', displayName: 'Shared' },
+    ])).toBeUndefined();
+  });
+
   it('rejects unknown selections', () => {
     expect(parseBotSelection('botmux-9', bots)).toBeUndefined();
     expect(parseBotSelection('missing', bots)).toBeUndefined();
@@ -492,6 +505,12 @@ describe('applyBotConfigEdits', () => {
     expect(edited.backendType).toBe('zmx');
   });
 
+  it('accepts hc as a backendType and still rejects unknown ones', () => {
+    const base = { larkAppId: 'app', larkAppSecret: 'secret', cliId: 'claude-code' };
+    expect(applyBotConfigEdits(base, { backendType: 'hc' }).backendType).toBe('hc');
+    expect(() => applyBotConfigEdits(base, { backendType: 'herdr-core' })).toThrow(/hc/);
+  });
+
   it('accepts remote-runner as a backendType', () => {
     const edited = applyBotConfigEdits({
       larkAppId: 'cli_remote_runner',
@@ -702,6 +721,12 @@ describe('assertUniqueBotProcessNames', () => {
     expect(() => assertUniqueBotProcessNames([
       { larkAppId: 'app_a', name: 'dashboard' },
     ])).toThrow(/botmux-dashboard.*保留名/);
+  });
+
+  it.each(['plugin-demo', 'botmux-plugin-demo'])('rejects the reserved plugin service prefix in %j', name => {
+    expect(() => assertUniqueBotProcessNames([
+      { larkAppId: 'app_a', name },
+    ])).toThrow(/botmux-plugin-demo.*插件 service 保留前缀/);
   });
 
   it('allows unique process names', () => {

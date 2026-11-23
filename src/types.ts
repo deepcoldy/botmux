@@ -2249,6 +2249,13 @@ export interface CodexAppEffortResult {
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
   | { type: 'goal_update_ack'; signature: string }
+  /** The turn's last reply card settled and the bot has replyCardRecap on:
+   *  once the CLI sits idle, report its terminal unfocused so that Claude Code
+   *  writes its away summary (services/away-summary-focus.ts). */
+  | { type: 'away_summary_focus'; turnId: string }
+  /** replyCardRecap was switched off after a request: cancel its wait and,
+   *  if botmux had reported focus out, report it back. */
+  | { type: 'away_summary_focus_cancel' }
   | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef;
       /** Set with `mayStart: false` when no lifecycle operation takes the start over. */
       startRefusal?: import('./services/runtime-reservation.js').RuntimeStartRefusal }
@@ -2281,6 +2288,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
+  | { type: 'request_next_step'; turnId: string; dispatchAttempt?: number; userPrompt?: string; answer: string }
   | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig | null; replyDelivery?: 'send' | 'transcript'; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true; failedTurnRewind?: FailedTurnRewindDirective }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
@@ -2809,7 +2817,8 @@ export type WorkerToDaemonBase =
      *  pane was lost (crash / kill / replaced / unreachable). The daemon
      *  handles every such exit of one server as ONE backend outage
      *  (backend-outage-coordinator.ts), outside the per-session crash loop. */
-    backendLost?: { backend: 'tmux'; kind: 'replaced' | 'gone' | 'unreachable'; socketName?: string };
+    /** tmux: `socketName` is the `-L` name (absent = default server); hc: the core's socket path. */
+    backendLost?: { backend: 'tmux' | 'hc'; kind: 'replaced' | 'gone' | 'unreachable'; socketName?: string };
     turnId?: string;
     dispatchAttempt?: number;
   }
@@ -2867,11 +2876,32 @@ export type WorkerToDaemonBase =
        *  still running (card: 「主回合已结束 · 后台子任务运行中（N）」). Omitted
        *  otherwise. Never changes the reported status; the card shows it and the
        *  idle-worker sweeper will not suspend a session while it is set. */
-      backgroundTasks?: number }
+      backgroundTasks?: number;
+      /** Claude's one-shot away summary is waiting or blurred. Automatic
+       *  compact must defer maintenance input rather than restore focus and
+       *  cancel it. Always emitted by current workers; absent = older worker. */
+      awaySummaryPending?: boolean;
+      /** Native Claude session the two request clocks below belong to. A
+       *  transcript rotation changes this identity and makes the daemon drop
+       *  the previous conversation's timestamps before merging the new ones. */
+      modelRequestSessionId?: string;
+      /** Start (epoch ms) of the main conversation's latest served model
+       *  request this worker has read from the Claude transcript, whoever sent
+       *  it (a botmux turn, a background-task wake, a keep-alive, a plugin).
+       *  The prompt cache stays warm an hour from it; the idle auto-compact
+       *  uses it as its cache window. Omitted until one is seen. */
+      lastModelRequestAt?: number;
+      /** Completion (epoch ms) of the latest served response, leaving out idle
+       *  upkeep (botmux's own prompt-cache keep-alive, a plugin's prompt): the
+       *  session was last in use then (a person, a Lark message, a background
+       *  task waking the model, a scheduled fire). Response-generation time is
+       *  busy, so unlike the cache clock this is NOT the request start. The
+       *  wire name is kept for compatibility. Omitted until one is seen. */
+      lastActivityRequestAt?: number }
   /** The CLI's own next-input suggestion on an idle screen (Claude Code's
    *  greyed-out prompt suggestion), sent when it appears or changes. turnId is
    *  the turn that just ended; the daemon shows it on that turn's last card. */
-  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number }
+  | { type: 'prompt_suggestion'; text: string; turnId?: string; dispatchAttempt?: number; editable?: true }
   /** The CLI's own recap of the session (Claude Code's transcript away
    *  summary), written while idle after a turn; turnId is that turn. */
   | { type: 'cli_recap'; text: string; turnId?: string; dispatchAttempt?: number }
