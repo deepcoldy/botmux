@@ -63,11 +63,11 @@ const CASES: readonly Case[] = [
   ['/api/bot-topic-unavailable-policy', '[]', 400, { ok: false, error: 'invalid_topic_unavailable_policy' }],
   // Zero injection forces transcript delivery; the response carries the effective value.
   ['/api/bot-prompt-injection', '{"promptInjection":"none"}', 200, { ok: true, promptInjection: 'none', replyDelivery: 'transcript' }, { promptInjection: 'none' }],
-  // Leaving zero injection falls back to the CLI default (claude-code: transcript).
-  ['/api/bot-prompt-injection', '{"promptInjection":"default"}', 200, { ok: true, promptInjection: 'default', replyDelivery: 'transcript' }, { promptInjection: 'default' }],
+  // Leaving zero injection falls back to the CLI default (claude-code: send).
+  ['/api/bot-prompt-injection', '{"promptInjection":"default"}', 200, { ok: true, promptInjection: 'default', replyDelivery: 'send' }, { promptInjection: 'default' }],
   ['/api/bot-prompt-injection', '{"promptInjection":"x"}', 400, { ok: false, error: 'invalid_prompt_injection' }],
-  ['/api/bot-reply-delivery', '{"replyDelivery":"transcript"}', 200, { ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' }, { replyDelivery: 'transcript' }],
-  ['/api/bot-reply-delivery', '{"replyDelivery":"send"}', 200, { ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' }, { replyDelivery: 'send' }],
+  ['/api/bot-reply-delivery', '{"replyDelivery":"transcript"}', 200, { ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' }, { replyDelivery: 'transcript' }],
+  ['/api/bot-reply-delivery', '{"replyDelivery":"send"}', 200, { ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' }, { replyDelivery: 'send' }],
   ['/api/bot-skill-injection', '{"skillInjection":"global"}', 200, { ok: true, skillInjection: 'global' }, { skillInjection: 'global' }],
   ['/api/bot-skill-injection', '{"skillInjection":"zz"}', 200, { ok: true, skillInjection: null }, { skillInjection: undefined }],
   ['/api/bot-startup-commands', '{"startupCommands":"/effort high, /foo"}', 200, { ok: true, startupCommands: '/effort high\n/foo' }, { startupCommands: ['/effort high', '/foo'] }],

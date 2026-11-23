@@ -1236,7 +1236,7 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('envelope-injection')}><EnvelopeInjectionSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
-            {/* 转写回复模式对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
+            {/* 自动转发最终回复开关对所有 CLI 都显示：不支持的 CLI 禁用开关并说明原因，
                 避免用户在别的 tab 找不到这个开关却在 /botconfig 里能设。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('prompt-injection')}>
               <PromptInjectionSection bot={bot} patchBot={patchBot} lock={props.linkedAgent} />

@@ -3,7 +3,7 @@ import { isLarkContentAuditError } from './content-audit.js';
 /**
  * 飞书内容安全审计（230028 等）拒收后的「自动打码 + 重发一次」。
  *
- * 零注入 / 转写回复模式下，最终回复由 daemon 从 transcript 自动收取后外发，
+ * 零注入 / 自动转发最终回复模式下，最终回复由 daemon 从会话记录自动收取后外发，
  * 模型看不到发送失败，没法像 `botmux send` 那样按错误提示自己改。现网被拦的
  * 回复几乎全是 git 作者 / 提交者 / Co-Authored-By 里的邮箱（飞书返回
  * `contain sensitive data: EMAIL_ADDRESS`），所以这里按飞书给出的敏感类型把
