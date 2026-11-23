@@ -219,8 +219,8 @@ function closeButton(input: DecisionCardInput): Record<string, unknown> {
     confirm: {
       title: { tag: 'plain_text', content: en ? 'Close this item?' : '关闭此项？' },
       text: { tag: 'plain_text', content: en
-        ? 'Closing removes this item from pending decisions and clears its draft, without sending any option or note to the session. Use it when it was decided elsewhere, needs no decision, or will not be done. Earlier submissions are not recalled.'
-        : '关闭后此项不再待拍板并清空草稿，不会向会话发送任何选项或说明。适用于已在别处定了、不再需要决策或不做了；此前的提交不会撤回。' },
+        ? 'Closing removes this item from pending decisions and moves the unsubmitted web draft into its history, without sending any option or note to the session. Use it when it was decided elsewhere, needs no decision, or will not be done. Earlier submissions are not recalled.'
+        : '关闭后此项不再待拍板，网页上没提交的草稿收进这一项的历史留底，不会向会话发送任何选项或说明。适用于已在别处定了、不再需要决策或不做了；此前的提交不会撤回。' },
     },
     behaviors: [{ type: 'callback', value: {
       action: DECISION_CARD_ACTION_CLOSE, app: input.appId, seq: String(item.seq), ask, rev: String(item.rev),

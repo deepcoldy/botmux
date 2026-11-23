@@ -62,7 +62,11 @@ export interface BoardLink {
 export type BoardChatCheck = 'verified' | 'unverified';
 
 export type BoardActor = 'steward' | 'owner' | 'system';
-export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link' | 'hint';
+/**
+ * draft：owner 没提交的草稿，在这一项离开待拍板、结束或换了问题 / 选项时收进历史留底（不是决定，没有发给管家，
+ * 管家的 `board show` 也不列出来）。
+ */
+export type BoardEventKind = 'create' | 'note' | 'state' | 'edit' | 'decision' | 'reply' | 'attach' | 'link' | 'hint' | 'draft';
 
 /**
  * 这一项什么时候可以关：
@@ -150,6 +154,10 @@ export interface BoardFile {
   createdAt: number;
 }
 
+/**
+ * owner 的草稿（一项一份）。只在它写给的那一轮拍板还在时算待提交：这一项离开待拍板、结束，或问题 / 选项
+ * 换了，就收进历史（kind = draft），不再出现在「提交 N 项」里。
+ */
 export interface BoardDraft {
   seq: number;
   author: string;
