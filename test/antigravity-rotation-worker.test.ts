@@ -3,6 +3,14 @@ import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { annotateAntigravityUsageLimit } from '../src/adapters/cli/antigravity.js';
+import { detectCliUsageLimit, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
+
+const INCIDENT_QUOTA_SCREEN = '⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.\n'
+  + 'Error ID: af1698f6-aaaa-bbbb-cccc-dddddddddddd-1\n────\n>\n────\n? for shortcuts  accept-edits · Gemini 4 Neon · xhigh';
+const NO_ERROR_ID_QUOTA_SCREEN = INCIDENT_QUOTA_SCREEN.replace(/Error ID: [^\n]+\n/, '');
+const FIXED_TIME_QUOTA_SCREEN = '⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets at 11:59 PM.\n'
+  + 'Error ID: fixed-time-episode\n────\n>\n────\n';
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -10,7 +18,7 @@ afterEach(() => {
 });
 
 let scenarioSeq = 0;
-async function setupRotationScenario(input: { directFailure: boolean; accountCount?: number }) {
+async function setupRotationScenario(input: { directFailure: boolean; accountCount?: number; limitedDirectFailure?: boolean }) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-agy-worker-rotation-'));
   const previousHome = process.env.HOME;
   const previousDataDir = process.env.SESSION_DATA_DIR;
@@ -54,6 +62,7 @@ async function setupRotationScenario(input: { directFailure: boolean; accountCou
     status: 'failed',
     retryCount: 0,
     ...(input.directFailure ? { directFailure: true as const } : { limitedSnapshot: true }),
+    ...(input.limitedDirectFailure ? { directFailure: true as const } : {}),
   };
   sessionStore.updateSession(session);
   const worker = Object.assign(new EventEmitter(), {
@@ -123,17 +132,27 @@ async function emitQuotaAndStart(
   turnId: string | null = 'turn-1',
   retryOffsetMs = 60_000,
   requireRestart = true,
+  nativeScreen?: string,
+  nativeEpisodeKey = 'native-episode-1',
 ) {
   const previousRestartCount = h.sent.filter(msg => msg.type === 'restart').length;
   const frameTurnId = turnId ?? undefined;
   h.worker.emit('message', { type: 'screen_update', content: 'working\nesc to cancel', status: 'working', ...(frameTurnId ? { turnId: frameTurnId } : {}) });
   await h.flush();
+  let usageLimit: CliUsageLimitState = {
+    limited: true, kind: 'usage', retryAtMs: h.nowMs + retryOffsetMs,
+    retryLabel: '1m', retryReady: false, source: 'antigravity-error-composer',
+  };
+  let content = 'quota exceeded';
+  if (nativeScreen) {
+    const detected = detectCliUsageLimit(nativeScreen, new Date(h.nowMs));
+    if (!detected.limited) throw new Error('incident quota text was not detected');
+    usageLimit = annotateAntigravityUsageLimit(nativeScreen, detected, { text: nativeScreen, key: nativeEpisodeKey });
+    content = nativeScreen;
+  }
   h.worker.emit('message', {
-    type: 'screen_update', content: 'quota exceeded', status: 'limited', ...(frameTurnId ? { turnId: frameTurnId } : {}),
-    usageLimit: {
-      limited: true, kind: 'usage', retryAtMs: h.nowMs + retryOffsetMs,
-      retryLabel: '1m', retryReady: false, source: 'antigravity-error-composer',
-    },
+    type: 'screen_update', content, status: 'limited', ...(frameTurnId ? { turnId: frameTurnId } : {}),
+    usageLimit,
   });
   await h.flush();
   const restart = h.sent.slice(previousRestartCount).find(msg => msg.type === 'restart');
@@ -145,9 +164,119 @@ async function emitQuotaAndStart(
 }
 
 describe('Antigravity worker-pool replay safety', () => {
-  it('does not replay an agy turn without a durable no-progress proof', async () => {
+  it('rotates, restarts and replays the failed turn for the observed quota screen with a shortcuts footer', async () => {
+    const h = await setupRotationScenario({ directFailure: false, limitedDirectFailure: true });
+    const restart = await emitQuotaAndStart(h, 'turn-1', 60_000, true, INCIDENT_QUOTA_SCREEN);
+    expect(h.ds.lastScreenStatus).toBe('limited');
+    expect(h.ds.session.antigravityAccountId).toBe('acc1');
+
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+
+    expect(h.sent.map(msg => msg.type)).toEqual(['restart', 'message']);
+    expect(h.sent.find(msg => msg.type === 'message')).toMatchObject({ content: 'do work' });
+    expect(h.ds.session.antigravityAccountId).toBe('acc2');
+    expect(h.ds.usageLimit).toBeUndefined();
+  });
+
+  it('rotates without replaying a turn that already completed tool work', async () => {
     const h = await setupRotationScenario({ directFailure: false });
-    const restart = await emitQuotaAndStart(h);
+    const afterTool = '● Bash(create-the-file)\n  ⎿  file created\n' + INCIDENT_QUOTA_SCREEN;
+    const restart = await emitQuotaAndStart(h, 'turn-1', 60_000, true, afterTool);
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: restart!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+
+    expect(h.sent.map(msg => msg.type)).toEqual(['restart']);
+    expect(h.ds.session.antigravityAccountId).toBe('acc2');
+  });
+
+  it('does not rotate again for the same Error ID after a successful replay', async () => {
+    const h = await setupRotationScenario({ directFailure: false, limitedDirectFailure: true });
+    const first = await emitQuotaAndStart(h, 'turn-1', 60_000, true, INCIDENT_QUOTA_SCREEN);
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: first!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: first!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    const replay = h.sent.find(msg => msg.type === 'message');
+    expect(replay).toBeDefined();
+    const consumed = h.ds.session.consumedAntigravityQuotaKeys;
+    expect(consumed).toHaveLength(1);
+    const sessionStore = await import('../src/services/session-store.js');
+    expect(sessionStore.getSessionFresh(h.ds.session.sessionId)?.consumedAntigravityQuotaKeys).toEqual(consumed);
+    h.ds.antigravityRotation = undefined;
+
+    const second = await emitQuotaAndStart(h, (replay as any).turnId, 60_000, false, INCIDENT_QUOTA_SCREEN);
+    expect(second).toBeUndefined();
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(1);
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(1);
+    expect(h.ds.usageLimit).toBeUndefined();
+  });
+
+  it('rotates for a fresh native episode with the same countdown and no screen Error ID', async () => {
+    const h = await setupRotationScenario({ directFailure: false, limitedDirectFailure: true, accountCount: 3 });
+    const first = await emitQuotaAndStart(h, 'turn-1', 60_000, true, NO_ERROR_ID_QUOTA_SCREEN, 'native-episode-a');
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: first!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: first!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    const replay = h.sent.find(msg => msg.type === 'message');
+    expect(replay).toBeDefined();
+    const replayTurnId = (replay as any).turnId as string;
+    h.ds.session.lastFailedTurn = {
+      turnId: replayTurnId, cliInput: 'do work', userPrompt: 'do work',
+      failedAt: new Date().toISOString(), status: 'failed', retryCount: 1,
+      limitedSnapshot: true, directFailure: true,
+    };
+    h.ds.session.lastCliInputTurnId = replayTurnId;
+    h.ds.lastCliInputTurnId = replayTurnId;
+    const sessionStore = await import('../src/services/session-store.js');
+    sessionStore.updateSession(h.ds.session);
+
+    const second = await emitQuotaAndStart(h, replayTurnId, 60_000, true, NO_ERROR_ID_QUOTA_SCREEN, 'native-episode-b');
+    expect(second).toBeDefined();
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc3', attemptId: second!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: second!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(2);
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(2);
+    expect(h.ds.session.consumedAntigravityQuotaKeys).toEqual([
+      'log:native-episode-a', 'log:native-episode-b',
+    ]);
+  });
+
+  it('deduplicates an identical fixed-time native Error ID', async () => {
+    const h = await setupRotationScenario({ directFailure: false, limitedDirectFailure: true });
+    const first = await emitQuotaAndStart(h, 'turn-1', 60_000, true, FIXED_TIME_QUOTA_SCREEN);
+    h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: first!.attemptId });
+    h.worker.emit('message', { type: 'restart_result', attemptId: first!.attemptId, status: 'succeeded', category: 'prompt_ready' });
+    await h.flush();
+    const replay = h.sent.find(msg => msg.type === 'message');
+    expect(replay).toBeDefined();
+    expect(h.ds.session.consumedAntigravityQuotaKeys).toEqual(['composer:fixed-time-episode']);
+
+    const second = await emitQuotaAndStart(h, (replay as any).turnId, 60_000, false, FIXED_TIME_QUOTA_SCREEN);
+    expect(second).toBeUndefined();
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(1);
+    expect(h.sent.filter(msg => msg.type === 'message')).toHaveLength(1);
+    expect(h.ds.usageLimit).toBeUndefined();
+  });
+
+  it('reports pool exhaustion and the observed reset duration instead of leaving a working card', async () => {
+    const h = await setupRotationScenario({ directFailure: true, accountCount: 1 });
+    const retryOffsetMs = ((2 * 60 + 39) * 60 + 35) * 1000;
+    const restart = await emitQuotaAndStart(h, 'turn-1', retryOffsetMs, false, INCIDENT_QUOTA_SCREEN);
+
+    expect(restart).toBeUndefined();
+    expect(h.sent.filter(msg => msg.type === 'restart')).toHaveLength(0);
+    expect(h.ds.lastScreenStatus).toBe('limited');
+    expect(h.replies.flat().join('\n')).toContain('所有 Antigravity 账号均已达到限额');
+    expect(h.replies.flat().join('\n')).toContain('2 小时 39 分钟');
+  });
+
+  it('does not replay a native quota snapshot when the frame has no proven turn', async () => {
+    const h = await setupRotationScenario({ directFailure: false });
+    const restart = await emitQuotaAndStart(h, null);
     h.worker.emit('message', { type: 'antigravity_account', accountId: 'acc2', attemptId: restart.attemptId });
     h.worker.emit('message', { type: 'restart_result', attemptId: restart.attemptId, status: 'succeeded', category: 'prompt_ready' });
     await h.flush();

@@ -2,6 +2,7 @@ import {
   detectCliUsageLimit,
   detectScreenUsageLimit,
   usageLimitStateKey,
+  cliUsageLimitEpisodeKey,
   type CliUsageLimitState,
 } from './cli-usage-limit.js';
 
@@ -55,7 +56,8 @@ export interface UsageLimitTracker<S extends string = string> {
  */
 function bannerTextIdentity(state: CliUsageLimitState): string {
   const key = `${state.kind}:${state.retryLabel}`;
-  return state.relativeResetKey ? `${key}:${state.relativeResetKey}` : key;
+  const episode = cliUsageLimitEpisodeKey(state);
+  return episode ? `${key}:${episode}` : key;
 }
 
 /** Whether a bridge turn's terminal is positive evidence the CLI produced an

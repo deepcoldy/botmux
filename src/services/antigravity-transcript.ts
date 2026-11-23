@@ -74,7 +74,7 @@
  *
  * Pure I/O. Attribution belongs in CodexBridgeQueue.
  */
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, statSync, closeSync, openSync, readSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import type { CodexBridgeEvent } from './codex-transcript.js';
@@ -281,6 +281,54 @@ export function unwrapAntigravityUserInput(content: string): string {
   const closeAt = content.lastIndexOf(USER_REQUEST_CLOSE);
   if (closeAt < innerStart) return content;
   return content.slice(innerStart, closeAt);
+}
+
+/** Durable no-progress proof for unattended replay of an agy quota failure.
+ * The exact submitted USER_INPUT must be the last native turn, followed only by
+ * non-output bookkeeping. Any assistant, tool, error, system or later-user
+ * record fails closed. The quota refusal itself is not recorded by agy. */
+export function antigravityTurnFailedWithoutOutput(
+  path: string | undefined,
+  writtenInput: string | undefined,
+): boolean {
+  if (!path || !writtenInput) return false;
+  let fd: number;
+  let offset: number;
+  let size: number;
+  try {
+    const stat = statSync(path);
+    size = stat.size;
+    offset = Math.max(0, size - 256 * 1024);
+    fd = openSync(path, 'r');
+  } catch {
+    return false;
+  }
+  try {
+    const buf = Buffer.alloc(Math.max(0, size - offset));
+    const count = readSync(fd, buf, 0, buf.length, offset);
+    const lines = buf.subarray(0, count).toString('utf8').split('\n');
+    if (offset > 0) lines.shift();
+    const pendingTail = lines.pop() ?? '';
+    let matched = false;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      let rec: any;
+      try { rec = JSON.parse(line); } catch { if (matched) return false; else continue; }
+      if (rec?.type === 'USER_INPUT') {
+        if (matched) return false;
+        if (rec.source === 'USER_EXPLICIT' && typeof rec.content === 'string'
+          && unwrapAntigravityUserInput(rec.content) === writtenInput) matched = true;
+        continue;
+      }
+      if (!matched || rec?.type === 'CHECKPOINT' || rec?.type === 'TASK_NOTIFICATION') continue;
+      return false;
+    }
+    return matched && !pendingTail.trim();
+  } catch {
+    return false;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** A content-only PLANNER_RESPONSE held as the turn's candidate final until a

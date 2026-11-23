@@ -1176,6 +1176,8 @@ export interface Session {
   usageLimit?: CliUsageLimitState;
   /** 最近的原生限额拒绝及首次截止时间，用于恢复时识别旧终端残留的提示 */
   antigravityQuotaHistory?: readonly CliUsageLimitState[];
+  /** 已成功换号的 Error ID 剧集，防止旧视口在 daemon 重启后再次轮换。 */
+  consumedAntigravityQuotaKeys?: readonly string[];
   /** Model fallback in effect. Persisted alongside usageLimit because the
    *  worker's baseline cursors to EOF after a restart — the switch record is
    *  already history by then and would never be drained again. */

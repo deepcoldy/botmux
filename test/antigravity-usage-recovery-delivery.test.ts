@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
 import { ClaudeModelRequestClock } from '../src/services/claude-transcript.js';
-import { reconcileUsageLimitState } from '../src/utils/cli-usage-limit.js';
+import { reconcileUsageLimitState, detectCliUsageLimit, cliUsageLimitEpisodeKey, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { snapshotWithLatestRuntimeStatus } from '../src/utils/runtime-screen-status.js';
 import {
@@ -14,6 +14,9 @@ import {
 } from '../src/adapters/cli/antigravity.js';
 
 const nativeError = '⚠ Individual quota reached. Resets in 124h24m15s.\nError ID: old\n────\n>\n────\n';
+// Old agy omitted the footer on the error page and added it back on recovery.
+// The native log remains on disk; that alone must not turn recovery into a new
+// quota episode.
 const recovered = nativeError + '? for shortcuts';
 
 afterEach(() => {
@@ -36,6 +39,8 @@ describe('Antigravity recovery delivery through the real screen sampler', () => 
       cliAdapter: { id: 'antigravity' }, backend: {}, captureBackendScreen,
       backendScreenEvidenceIsAuthoritativeForMutation: () => true,
       stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, annotateAntigravityUsageLimit,
+      readAntigravityNativeQuota: () => ({ key: 'native-old', text: nativeError }),
+      withAntigravityDirectFailureProof: (limit: CliUsageLimitState) => limit, detectCliUsageLimit, cliUsageLimitEpisodeKey,
       usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
       unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
     });

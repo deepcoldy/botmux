@@ -9,6 +9,13 @@ const FORK = new RegExp(`\\bForked conversation (${UUID}) -> (${UUID})\\s*$`, 'i
 
 /** Each managed agy gets its own native log. A global cli.log mixes sibling
  * processes, and agy keeps BOTH parent and child DBs open after /fork. */
+export function antigravitySessionLogPath(
+  sessionId: string,
+  root = join(homedir(), '.gemini', 'antigravity-cli'),
+): string {
+  return join(root, 'botmux', `${encodeURIComponent(sessionId)}.log`);
+}
+
 export class AntigravitySessionLog {
   readonly path: string;
   private offset = 0;
@@ -17,7 +24,7 @@ export class AntigravitySessionLog {
   private state: { currentId?: string; fork?: { parentId: string; childId: string } } = {};
 
   constructor(sessionId: string, root = join(homedir(), '.gemini', 'antigravity-cli')) {
-    this.path = join(root, 'botmux', `${encodeURIComponent(sessionId)}.log`);
+    this.path = antigravitySessionLogPath(sessionId, root);
     mkdirSync(dirname(this.path), { recursive: true });
   }
 

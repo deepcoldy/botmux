@@ -1,17 +1,19 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { createUsageLimitTracker } from '../src/utils/usage-limit-tracker.js';
-import { reconcileUsageLimitState, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
+import { reconcileUsageLimitState, detectCliUsageLimit, cliUsageLimitEpisodeKey, type CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from '../src/adapters/cli/antigravity.js';
 
-function classifier(raw: () => string, cliId = 'antigravity', authoritative = true) {
+function classifier(raw: () => string, cliId = 'antigravity', authoritative = true, outputActive = false, nativeText?: string) {
   const capture = vi.fn(raw);
-  const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => false });
+  const usageLimitTracker = createUsageLimitTracker({ isRateKindSuppressed: () => false, isOutputActive: () => outputActive });
   const classify = loadWorkerFunction<(content: string, status: string) => any>('classifyUsageLimitWithNativeEvidence', {
     cliAdapter: { id: cliId }, backend: {}, captureBackendScreen: capture,
     backendScreenEvidenceIsAuthoritativeForMutation: () => authoritative,
     stripAnsiScreenText, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, annotateAntigravityUsageLimit,
+    readAntigravityNativeQuota: () => nativeText ? { key: 'native-test', text: nativeText } : undefined,
+    withAntigravityDirectFailureProof: (limit: CliUsageLimitState) => limit, detectCliUsageLimit, cliUsageLimitEpisodeKey,
     usageLimitTracker, reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
     unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
   });
@@ -19,6 +21,8 @@ function classifier(raw: () => string, cliId = 'antigravity', authoritative = tr
 }
 const composer = '\r\n────\r\n>\r\n────\r\n';
 const quota = '⚠ Individual quota reached. Resets in 124h24m15s.';
+const currentQuotaScreen = '⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.\n'
+  + 'Error ID: af1698f6-aaaa-bbbb-cccc-dddddddddddd-1\n────\n>\n────\n? for shortcuts  accept-edits · Gemini 4 Neon · xhigh';
 const id = 'ansi-error-one';
 const color = (s: string) => `\x1b[1;33m${s}\x1b[0m`;
 afterEach(() => vi.useRealTimers());
@@ -38,6 +42,30 @@ describe('raw ANSI tmux quota classification', () => {
     expect(result.usageLimit).toMatchObject({ limited: true, kind: 'usage', source: 'antigravity-error-composer' });
     expect(result.usageLimit.relativeResetKey).toContain(id);
     expect(result.usageLimit.retryAtMs).toBe(Date.now() + ((124 * 60 + 24) * 60 + 15) * 1000);
+  });
+
+  it('recognizes the current quota wording above an empty composer with the normal shortcuts footer', () => {
+    vi.useFakeTimers(); vi.setSystemTime(new Date('2026-11-23T13:38:00Z'));
+    const { classify } = classifier(() => currentQuotaScreen, 'antigravity', true, false, currentQuotaScreen);
+    const result = classify('display-only snapshot', 'idle');
+    expect(result.status).toBe('limited');
+    expect(result.usageLimit).toMatchObject({
+      kind: 'usage', retryLabel: '2h39m35s', source: 'antigravity-native-log', nativeEpisodeKey: 'log:native-test',
+    });
+    expect(result.usageLimit.retryAtMs).toBe(Date.now() + ((2 * 60 + 39) * 60 + 35) * 1000);
+  });
+
+  it('does not treat the same footer as recovery while fresh output still suppresses the working-frame verdict', () => {
+    const { classify } = classifier(() => currentQuotaScreen, 'antigravity', true, true, currentQuotaScreen);
+    expect(classify('display-only snapshot', 'working')).toEqual({ status: 'working' });
+  });
+
+  it('does not promote tool-quoted quota output above an ordinary ready composer', () => {
+    const quoted = '● Bash(cat incident.log)\n  ⎿  done\n' + currentQuotaScreen;
+    const { classify } = classifier(() => quoted);
+    expect(classify('', 'idle')).toEqual({
+      status: 'idle', usageLimitRecovery: 'antigravity-ready-composer',
+    });
   });
 
   it('keeps distinct colored Error IDs from sharing the first refusal deadline', () => {

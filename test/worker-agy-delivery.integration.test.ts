@@ -70,7 +70,7 @@ async function waitFor(check: () => boolean, logs: string[], timeout = 10_000): 
   throw new Error(`Worker condition timed out\n${logs.join('')}`);
 }
 
-function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'expired-quota' | 'running', cliId: 'antigravity' | 'traex' = 'antigravity') {
+function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error' | 'quota' | 'quota-with-footer' | 'expired-quota' | 'running', cliId: 'antigravity' | 'traex' = 'antigravity') {
   // Closing a worker also stops its OS session scope. A fixed session ID would
   // let parallel runtime/test invocations terminate each other's fake CLI.
   const sessionId = `agy-delivery-${randomUUID()}`;
@@ -88,7 +88,13 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
   const history = cliId === 'antigravity'
     ? join(cliHome, 'history.jsonl') : join(root, '.trae', 'cli', 'history.jsonl');
   mkdirSync(join(history, '..'), { recursive: true });
-  const isQuota = mode === 'quota' || mode === 'expired-quota';
+  const isQuota = mode === 'quota' || mode === 'quota-with-footer' || mode === 'expired-quota';
+  if (mode === 'quota-with-footer') {
+    mkdirSync(join(cliHome, 'botmux'), { recursive: true });
+    writeFileSync(join(cliHome, 'botmux', `${sessionId}.log`),
+      'I1123 13:39:07.000000 100 input_loop.go:104] HandleUserInput called with text: "passive task"\n'
+      + 'E1123 13:39:10.000000 200 errorreport.go:282] agent executor error: generating and executing: transport error (ResourceExhausted, HTTP 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.\n');
+  }
   const passive = isQuota || ['interrupted', 'native-error', 'running'].includes(mode);
   if (passive) {
     writeFileSync(join(transcriptDir, 'transcript.jsonl'), JSON.stringify({
@@ -98,6 +104,8 @@ function startWorker(mode: 'delayed' | 'interrupted' | 'manual' | 'native-error'
   const ready = cliId === 'antigravity' ? '? for shortcuts' : '›';
   const screen = mode === 'interrupted'
     ? '  ⎿  Interrupted · What should Antigravity CLI do instead?\n────────\n>\n────────\n? for shortcuts\n'
+    : mode === 'quota-with-footer'
+      ? '⚠ Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 2h39m35s.\nError ID: af1698f6-aaaa-bbbb-cccc-dddddddddddd-1\n────────\n>\n────────\n? for shortcuts  accept-edits · Gemini 4 Neon · xhigh\n'
     : mode === 'native-error' || isQuota
       ? `⚠ ${isQuota ? 'Individual quota reached. Resets in 124h24m15s.' : 'Request failed. Please retry.'}\nError ID: native-error-fixture\n────────\n>\n────────\n`
     : mode === 'running'
@@ -185,6 +193,7 @@ setInterval(() => {}, 1_000);
     type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId, cliPathOverride: fakeCli, backendType: 'pty',
     cliSessionId: nativeId,
+    ...(mode === 'quota-with-footer' ? { cliVersion: '1.5.15' } : {}),
     antigravityQuotaHistory,
     prompt: passive ? '' : 'ACTIVATION_UNIQUE_MARKER',
     ...(!passive ? { queuedActivationToken: 'activation-token', turnId: 'om_initial' } : {}),
@@ -212,6 +221,14 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
     await waitFor(() => worker.messages.some(m => m.type === 'ready'), worker.logs, 30_000);
     await waitFor(() => worker.messages.some(m => m.type === 'screen_update' && m.status === 'limited'
       && m.usageLimit?.kind === 'usage' && m.usageLimit.source === 'antigravity-error-composer'), worker.logs, 20_000);
+    expect(worker.input()).toBe('');
+  }, 60_000);
+
+  it('publishes the current quota refusal even when its native error page retains the shortcuts footer', async () => {
+    const worker = startWorker('quota-with-footer');
+    await waitFor(() => worker.messages.some(m => m.type === 'ready'), worker.logs, 30_000);
+    await waitFor(() => worker.messages.some(m => m.type === 'screen_update' && m.status === 'limited'
+      && m.usageLimit?.retryLabel === '2h39m35s' && m.usageLimit.source === 'antigravity-native-log'), worker.logs, 20_000);
     expect(worker.input()).toBe('');
   }, 60_000);
 

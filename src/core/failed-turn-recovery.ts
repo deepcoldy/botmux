@@ -96,6 +96,7 @@ export function recordLimitedFailedTurn(ds: DaemonSession, turnId: string | unde
   });
   if (record) {
     record.limitedSnapshot = true;
+    if (ds.usageLimit.directFailure) record.directFailure = true;
     ds.session.lastFailedTurn = record;
     store.updateSession(ds.session);
   }

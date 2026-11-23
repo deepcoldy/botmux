@@ -503,12 +503,15 @@ import {
   type AntigravityAccountStoreOptions,
   type ReconcileAntigravityTokenResult,
 } from './services/antigravity-accounts.js';
-import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota } from './adapters/cli/antigravity.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, isAntigravityReadyComposerScreen, rememberAntigravityQuota, supportsAntigravityReadyFooterQuota } from './adapters/cli/antigravity.js';
+import { antigravitySessionLogPath } from './services/antigravity-session-fork.js';
+import { AntigravityNativeQuotaLog, currentAntigravityNativeQuota } from './services/antigravity-native-quota.js';
 import {
   isSameAntigravityConversation,
   mapAntigravityCompactOffsetToFull,
   hasAntigravityPendingTasks,
   drainAntigravityTranscript,
+  antigravityTurnFailedWithoutOutput,
   type AntigravityTranscriptState,
 } from './services/antigravity-transcript.js';
 import {
@@ -816,7 +819,7 @@ import {
   type HerdrWebScrollDirection,
 } from './utils/herdr-web-history.js';
 import { parseWorkerRequestUrl } from './utils/worker-http.js';
-import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, reconcileUsageLimitState, type CliUsageLimitState } from './utils/cli-usage-limit.js';
+import { structuredRateLimitState, structuredCodexLimitState, isStructuredRateLimitAuthoritative, reconcileUsageLimitState, detectCliUsageLimit, cliUsageLimitEpisodeKey, type CliUsageLimitState } from './utils/cli-usage-limit.js';
 import { CodexSubagentLimitTracker } from './services/codex-subagent-limit-tracker.js';
 import { bridgeTurnOutcome, createUsageLimitTracker } from './utils/usage-limit-tracker.js';
 import { uploadImageBuffer } from './utils/lark-upload.js';
@@ -9660,6 +9663,28 @@ const usageLimitTracker = createUsageLimitTracker<RuntimeScreenStatus>({
 
 let antigravityQuotaHistory: readonly CliUsageLimitState[] | undefined;
 let unconfirmedAntigravityQuotas = new Map<string, CliUsageLimitState>();
+let antigravityNativeQuotaLog: AntigravityNativeQuotaLog | undefined;
+
+function readAntigravityNativeQuota() {
+  if (cliAdapter?.id !== 'antigravity' || cliAdapter.runnerFramedInput
+    || !supportsAntigravityReadyFooterQuota(lastInitConfig?.cliVersion) || !sessionId) return undefined;
+  antigravityNativeQuotaLog ??= new AntigravityNativeQuotaLog(antigravitySessionLogPath(sessionId));
+  const lastWritten = lastWrittenCliInput;
+  const currentInput = lastWritten && lastWritten.turnId === currentBotmuxTurnId
+    ? lastWritten.content : undefined;
+  return currentAntigravityNativeQuota(antigravityNativeQuotaLog.read(), currentInput);
+}
+
+function withAntigravityDirectFailureProof(limit: CliUsageLimitState): CliUsageLimitState {
+  if (limit.directFailure || (limit.source !== 'antigravity-error-composer'
+    && limit.source !== 'antigravity-native-log')) return limit;
+  const lastWritten = lastWrittenCliInput;
+  const written = lastWritten && lastWritten.turnId === currentBotmuxTurnId
+    ? lastWritten.content : undefined;
+  return antigravityTurnFailedWithoutOutput(codexBridgeRolloutPath, written)
+    ? { ...limit, directFailure: true }
+    : limit;
+}
 
 function currentUsageLimitSnapshot(): string {
   if (!backendScreenEvidenceIsAuthoritativeForMutation()) return '';
@@ -9703,33 +9728,63 @@ function classifyUsageLimitWithNativeEvidence(
     // IDs. Strip controls without filtering away native composer rows.
     evidence = stripAnsiScreenText(evidence);
     if (isAntigravityWorkingScreen(evidence)) return { status: 'working' };
-    // 正常输入框是当前恢复证据；保留上方历史报错，但不再用它判定本轮限额。
-    // 卡片内容会裁剪输入框，因此显式携带完整权威视口确认的恢复信号。
-    if (nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
-      return { status, usageLimitRecovery: 'antigravity-ready-composer' };
+    const nativeQuota = readAntigravityNativeQuota();
+    const previousFor = (state: CliUsageLimitState, nativeKey?: string): CliUsageLimitState | undefined => {
+      const key = state.relativeResetKey;
+      const episode = nativeKey ? `log:${nativeKey}` : cliUsageLimitEpisodeKey(state) ?? key;
+      if (!episode) return undefined;
+      const history = antigravityQuotaHistory;
+      return history?.find(entry => cliUsageLimitEpisodeKey(entry) === episode)
+        // A log episode may be the old footerless composer after its footer
+        // returned. Only that composer source may share the relative key;
+        // another native-log episode with the same countdown is NOT a match.
+        ?? (nativeKey && key
+          ? history?.find(entry => entry.relativeResetKey === key && entry.source === 'antigravity-error-composer')
+          : undefined)
+        // Before an Error ID arrived, only an unconfirmed partial frame can
+        // provide the first deadline. Confirmed other episodes never lend it.
+        ?? (key ? history?.find(entry => entry.nativeEpisodeKey === undefined && entry.relativeResetKey === key) : undefined)
+        ?? (key ? unconfirmedAntigravityQuotas.get(key) : undefined);
+    };
+    // Evaluate native-log evidence independently of the active-work screen gate:
+    // even a fresh-output working frame must not call this error page recovered.
+    let nativeLogQuotaObserved = false;
+    if (nativeQuota) {
+      const candidate = detectCliUsageLimit(evidence);
+      if (candidate.limited) {
+        const composerCandidate = annotateAntigravityUsageLimit(evidence, candidate);
+        const annotated = annotateAntigravityUsageLimit(evidence, composerCandidate, {
+          text: nativeQuota.text, key: nativeQuota.key, previous: previousFor(composerCandidate, nativeQuota.key),
+        });
+        nativeLogQuotaObserved = annotated.source === 'antigravity-native-log';
+      }
     }
     let expiredAntigravityQuota: CliUsageLimitState | undefined;
     const result = usageLimitTracker.classify(evidence, status, state => {
-      const observed = annotateAntigravityUsageLimit(evidence, state);
-      const key = observed.relativeResetKey;
+      const key = state.relativeResetKey;
+      const composerObserved = annotateAntigravityUsageLimit(evidence, state);
+      const previous = previousFor(composerObserved, nativeQuota?.key);
+      const annotated = annotateAntigravityUsageLimit(evidence, composerObserved, {
+        text: nativeQuota?.text, key: nativeQuota?.key, previous,
+      });
+      const observed = withAntigravityDirectFailureProof(annotated);
       if (!key) return observed;
 
-      const previous = antigravityQuotaHistory?.find(entry => entry.relativeResetKey === key)
-        ?? unconfirmedAntigravityQuotas.get(key);
       const now = Date.now();
       const limit = reconcileUsageLimitState(previous, observed, now);
-      // Composer 可能到期后才补齐。保留确认后的记录，但从本轮限额判定中排除。
-      if (observed.source === 'antigravity-error-composer' && previous && now >= limit.retryAtMs) {
+      // 原生确认可能在到期后才补齐。保留历史，但从本轮限额判定中排除。
+      if ((observed.source === 'antigravity-error-composer' || observed.source === 'antigravity-native-log')
+        && previous && now >= limit.retryAtMs) {
         expiredAntigravityQuota = limit;
         return undefined;
       }
       return limit;
     });
-    // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生 composer 后再把它计入历史。
+    // 只用已上报且带 Error ID 的部分帧固定首次截止时间。看到原生证据后再把它计入历史。
     const limit = expiredAntigravityQuota ?? result.usageLimit;
     const key = limit?.relativeResetKey;
     if (limit && key) {
-      if (limit.source === 'antigravity-error-composer') {
+      if (limit.source === 'antigravity-error-composer' || limit.source === 'antigravity-native-log') {
         antigravityQuotaHistory = rememberAntigravityQuota(antigravityQuotaHistory, limit);
         unconfirmedAntigravityQuotas.delete(key);
       } else if (limit.kind === 'usage' && !key.endsWith(':')) {
@@ -9738,6 +9793,12 @@ function classifyUsageLimitWithNativeEvidence(
           unconfirmedAntigravityQuotas.delete(unconfirmedAntigravityQuotas.keys().next().value!);
         }
       }
+    }
+    // shortcuts 页脚只证明旧版 footerless 错误已经恢复；带原生日志证据的
+    // 当前错误可以合法地保留同一页脚，不能用页脚本身区分这两种形态。
+    if (!expiredAntigravityQuota && !nativeLogQuotaObserved
+      && nativeViewportCaptured && isAntigravityReadyComposerScreen(evidence)) {
+      return { status, usageLimitRecovery: 'antigravity-ready-composer' };
     }
     return expiredAntigravityQuota ? { ...result, expiredAntigravityQuota } : result;
   }

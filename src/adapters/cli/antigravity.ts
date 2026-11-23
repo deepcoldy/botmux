@@ -9,7 +9,7 @@ import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
-import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
+import { detectCliUsageLimit, cliUsageLimitEpisodeKey, type CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, StructuredBridgeSpec } from './types.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
@@ -182,7 +182,9 @@ function isEmptyComposerRow(row: string): boolean {
 
 // Native agy errors end at an empty composer without the normal shortcuts
 // footer. Error ID anchors this to the CLI's error layout, rather than any
-// bare `>` in tool output, a draft or a permission menu.
+// bare `>` in tool output, a draft or a permission menu. Newer agy builds may
+// retain the footer on a real error; that layout alone is deliberately NOT
+// enough for unattended rotation (ordinary tool output can reproduce it).
 const ERROR_COMPOSER_PATTERN = new RegExp(`(?:^|\\n)[ \\t]*Error ID:[ \\t]*[a-zA-Z0-9][a-zA-Z0-9-]*[ \\t]*\\r?\\n[─━ \\t\\r\\n]*${EMPTY_COMPOSER_ROW.source}[ \\t]*(?:\\r?\\n[─━ \\t]*)*$`);
 
 /** An agy task footer is positive work evidence; unrelated PTY/syslog output
@@ -191,19 +193,44 @@ export function isAntigravityWorkingScreen(screen: string): boolean {
   return /(?:^|\n)[ \t]*esc to cancel(?:\s|$)/i.test(stripAnsiScreenText(screen));
 }
 
-/** Preserve provenance only for the CLI's own quota/error/composer layout,
- * not generic quota-shaped text in model/tool output. */
-export function annotateAntigravityUsageLimit(screen: string, state: CliUsageLimitState): CliUsageLimitState {
+/** Preserve provenance for the CLI's own quota evidence, not generic
+ * quota-shaped text in model/tool output. The optional native-log text is a
+ * deterministic fallback for newer agy builds that retain the shortcuts footer
+ * on their error page. A previously confirmed footerless composer wins: when
+ * only the footer later appears, that is the old CLI's recovery, not a new log
+ * episode. */
+export function annotateAntigravityUsageLimit(
+  screen: string,
+  state: CliUsageLimitState,
+  native?: { text?: string; key?: string; previous?: CliUsageLimitState },
+): CliUsageLimitState {
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  if (/esc to cancel/i.test(plain)) return state;
   const match = ERROR_COMPOSER_PATTERN.exec(plain);
-  if (!match || /esc to cancel/i.test(plain)) return state;
-  const rows = plain.slice(0, match.index).trimEnd().split('\n');
-  for (let i = rows.length - 1; i >= Math.max(0, rows.length - 8); i--) {
-    const row = rows[i]!;
-    if (/^⚠(?:️)?[ \t]*Individual quota reached\./.test(row)) {
-      return { ...state, source: 'antigravity-error-composer' };
+  if (match) {
+    const rows = plain.slice(0, match.index).trimEnd().split('\n');
+    for (let i = rows.length - 1; i >= Math.max(0, rows.length - 8); i--) {
+      const row = rows[i]!;
+      if (/^⚠(?:️)?[ \t]*Individual quota reached\./.test(row)) {
+        const errorId = /Error ID:[ \t]*([a-zA-Z0-9][a-zA-Z0-9-]*)/.exec(match[0])?.[1];
+        return {
+          ...state,
+          source: 'antigravity-error-composer',
+          ...(errorId ? { nativeEpisodeKey: `composer:${errorId}` } : {}),
+        };
+      }
+      if (/^[ \t]*(?:⚠|Error ID:|>|●)/.test(row)) return state;
     }
-    if (/^[ \t]*(?:⚠|Error ID:|>|●)/.test(row)) return state;
+  }
+  if (native?.previous?.source === 'antigravity-error-composer' || !native?.text) return state;
+  const fromLog = detectCliUsageLimit(native.text);
+  if (fromLog.limited && fromLog.kind === 'usage' && state.kind === 'usage'
+    && fromLog.retryLabel === state.retryLabel) {
+    return {
+      ...state,
+      source: 'antigravity-native-log',
+      ...(native.key ? { nativeEpisodeKey: `log:${native.key}` } : {}),
+    };
   }
   return state;
 }
@@ -215,8 +242,9 @@ export function rememberAntigravityQuota(
   history: readonly CliUsageLimitState[] | undefined,
   state: CliUsageLimitState,
 ): readonly CliUsageLimitState[] | undefined {
-  const key = state.relativeResetKey;
-  if (state.source !== 'antigravity-error-composer' || !key || history?.some(entry => entry.relativeResetKey === key)) {
+  const episode = cliUsageLimitEpisodeKey(state);
+  if (state.source !== 'antigravity-error-composer' && state.source !== 'antigravity-native-log'
+    || !episode || history?.some(entry => cliUsageLimitEpisodeKey(entry) === episode)) {
     return history;
   }
   return [...(history?.slice(1 - ANTIGRAVITY_QUOTA_HISTORY_LIMIT) ?? []), state];
@@ -416,6 +444,13 @@ function antigravityVersionAtLeast(
 /** Only release versions with the verified paste contract opt into the fast path. */
 function supportsAntigravityBracketedPaste(version: string | undefined): boolean {
   return antigravityVersionAtLeast(version, 1, 5, 4);
+}
+
+/** Verified on agy 1.5.15: its native quota error can retain the ready footer.
+ * Older/unknown versions keep the old footer-only recovery semantics instead
+ * of guessing that a historical error is current after a worker restart. */
+export function supportsAntigravityReadyFooterQuota(version: string | undefined): boolean {
+  return antigravityVersionAtLeast(version, 1, 5, 15);
 }
 
 /** Verified release baseline supporting ephemeral `--settings` JSON with

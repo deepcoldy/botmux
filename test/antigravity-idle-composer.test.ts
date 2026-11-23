@@ -99,7 +99,9 @@ describe('Antigravity idle-composer viewport classifier', () => {
 
   it('retains native quota provenance only for the latest actual quota error composer', () => {
     const state = { limited: true as const, kind: 'usage' as const, retryAtMs: 1_000, retryLabel: '1m', retryReady: false };
-    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN, state).source).toBe('antigravity-error-composer');
+    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN, state)).toMatchObject({
+      source: 'antigravity-error-composer', nativeEpisodeKey: 'composer:native-error-fixture',
+    });
     expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN + 'esc to cancel', state)).toBe(state);
     expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN + NATIVE_ERROR_SCREEN, state)).toBe(state);
     expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN.replace('⚠ Individual', '  ⚠ Individual'), state)).toBe(state);

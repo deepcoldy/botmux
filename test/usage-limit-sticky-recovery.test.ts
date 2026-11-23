@@ -35,7 +35,7 @@ import { registerBot } from '../src/bot-registry.js';
 import { clearUsageLimitState, closeSession, initWorkerPool, restoreUsageLimitRuntimeState, setActiveSessionsRegistry, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
-import { detectCliUsageLimit, reconcileUsageLimitState, usageLimitStateKey } from '../src/utils/cli-usage-limit.js';
+import { detectCliUsageLimit, reconcileUsageLimitState, usageLimitStateKey, cliUsageLimitEpisodeKey } from '../src/utils/cli-usage-limit.js';
 import {
   ANTIGRAVITY_QUOTA_HISTORY_LIMIT, annotateAntigravityUsageLimit, isAntigravityWorkingScreen, rememberAntigravityQuota,
 } from '../src/adapters/cli/antigravity.js';
@@ -270,7 +270,9 @@ describe('usage-limit sticky state self-heal', () => {
     const classify = loadWorkerFunction<(content: string, status: 'idle') => UsageFrame>(
       'classifyUsageLimitWithNativeEvidence', {
         cliAdapter: { id: 'antigravity' }, backendScreenEvidenceIsAuthoritativeForMutation: () => true,
-        stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit, usageLimitTracker,
+        stripAnsiScreenText, isAntigravityWorkingScreen, annotateAntigravityUsageLimit, usageLimitTracker, detectCliUsageLimit, cliUsageLimitEpisodeKey,
+        readAntigravityNativeQuota: () => undefined,
+        withAntigravityDirectFailureProof: (limit: any) => limit,
         reconcileUsageLimitState, rememberAntigravityQuota, antigravityQuotaHistory: undefined,
         unconfirmedAntigravityQuotas: new Map(), ANTIGRAVITY_QUOTA_HISTORY_LIMIT,
       },

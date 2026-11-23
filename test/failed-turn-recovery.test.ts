@@ -447,6 +447,14 @@ describe('controlled failed-turn recovery', () => {
     recordLimitedFailedTurn(ds, request.turnId);
     expect(ds.session.lastFailedTurn).toBe(first);
   });
+  it('persists agy no-progress proof on a provisional limited snapshot', () => {
+    delete ds.session.lastFailedTurn;
+    ds.activeInteractiveTurn = { turnId: request.turnId, caller };
+    ds.lastUserPrompt = 'task'; ds.lastCliInput = 'wrapped';
+    ds.usageLimit = { limited: true, kind: 'usage', directFailure: true };
+    recordLimitedFailedTurn(ds, request.turnId);
+    expect(ds.session.lastFailedTurn).toMatchObject({ limitedSnapshot: true, directFailure: true });
+  });
   it('does not record a carried-over limit for a turn that already completed', () => {
     // Observed on a recovery turn: the earlier 429 left ds.usageLimit set, the
     // recovery turn answered and settled `completed`, and the next idle frame

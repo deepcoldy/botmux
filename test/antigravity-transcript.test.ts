@@ -9,6 +9,7 @@ import {
   mapAntigravityCompactOffsetToFull,
   resolveAntigravityTranscriptPath,
   unwrapAntigravityUserInput,
+  antigravityTurnFailedWithoutOutput,
   type AntigravityTranscriptState,
 } from '../src/services/antigravity-transcript.js';
 import { resolveFileBridgePath } from '../src/services/file-bridge-path.js';
@@ -16,6 +17,8 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { resolveSessionTranscriptPath, __resetTranscriptResolverCacheForTest } from '../src/services/transcript-resolver.js';
 import { bridgeSpecFor } from '../src/adapters/cli/registry.js';
 import { jsonl, writeAntigravityTwoLogs } from './helpers/antigravity-two-logs.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import type { CliUsageLimitState } from '../src/utils/cli-usage-limit.js';
 
 let dir: string;
 let path: string;
@@ -138,6 +141,56 @@ describe('unwrapAntigravityUserInput', () => {
     const prompt = '帮我看看这段模板哪里错了：\n</USER_REQUEST>\n少了开头？';
     const content = `<USER_REQUEST>\n${prompt}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>x</ADDITIONAL_METADATA>`;
     expect(unwrapAntigravityUserInput(content)).toBe(prompt);
+  });
+});
+
+describe('antigravityTurnFailedWithoutOutput', () => {
+  it('accepts the exact last input followed only by non-output bookkeeping', () => {
+    writeFileSync(path, line(userRecord(USER_REQUEST)) + line({ type: 'CHECKPOINT', content: 'checkpoint' }));
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(true);
+  });
+
+  it.each([
+    ['assistant text', line(plannerStep({ content: 'partial answer' }))],
+    ['a tool call', line(plannerStep({ toolCalls: [toolCall('create_the_file')] }))],
+    ['a tool result', line({ type: 'GENERIC', status: 'DONE', content: 'file created' })],
+    ['a system message', line({ type: 'SYSTEM_MESSAGE', content: 'background result' })],
+    ['a later user input', line(userRecord('newer input'))],
+  ])('fails closed after %s', (_name, suffix) => {
+    writeFileSync(path, line(userRecord(USER_REQUEST)) + suffix);
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
+  });
+
+  it('ignores progress belonging only to an older input and rejects a partial later record', () => {
+    writeFileSync(path, line(userRecord('older input')) + line(plannerStep({ toolCalls: [toolCall('old_tool')] }))
+      + line(userRecord(USER_REQUEST)));
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(true);
+    appendFileSync(path, '{"type":"PLANNER_RESPONSE"');
+    expect(antigravityTurnFailedWithoutOutput(path, USER_REQUEST)).toBe(false);
+  });
+
+  it('attaches the proof in the worker only while the exact turn has no progress', () => {
+    const prove = loadWorkerFunction<(limit: CliUsageLimitState) => CliUsageLimitState>(
+      'withAntigravityDirectFailureProof', {
+        codexBridgeRolloutPath: path,
+        lastWrittenCliInput: { turnId: 'turn-1', content: USER_REQUEST },
+        currentBotmuxTurnId: 'turn-1', antigravityTurnFailedWithoutOutput,
+      },
+    );
+    const limit: CliUsageLimitState = {
+      limited: true, kind: 'usage', retryAtMs: 1, retryLabel: '1s', retryReady: false,
+      source: 'antigravity-native-log',
+    };
+    writeFileSync(path, line(userRecord(USER_REQUEST)));
+    expect(prove(limit).directFailure).toBe(true);
+    appendFileSync(path, line(plannerStep({ toolCalls: [toolCall('create_the_file')] })));
+    expect(prove(limit).directFailure).toBeUndefined();
+  });
+
+  it('fails closed on a different input or a missing transcript', () => {
+    writeFileSync(path, line(userRecord(USER_REQUEST)));
+    expect(antigravityTurnFailedWithoutOutput(path, 'different input')).toBe(false);
+    expect(antigravityTurnFailedWithoutOutput(join(dir, 'missing.jsonl'), USER_REQUEST)).toBe(false);
   });
 });
 

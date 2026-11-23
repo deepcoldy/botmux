@@ -29,6 +29,14 @@ describe('relative quota reset durations', () => {
     expect(detectCliUsageLimit(banner(duration)).limited).toBe(false);
   });
 
+  it('does not share a deadline or state key across distinct native episodes with the same countdown', () => {
+    const now = Date.UTC(2026, 9, 1);
+    const first = { ...detected(banner('1m'), now), nativeEpisodeKey: 'log:first' };
+    const second = { ...detected(banner('1m'), now + 20_000), nativeEpisodeKey: 'log:second' };
+    expect(reconcileUsageLimitState(first, second, now + 20_000).retryAtMs).toBe(second.retryAtMs);
+    expect(usageLimitStateKey(first)).not.toBe(usageLimitStateKey(second));
+  });
+
   it('does not classify a countdown without a quota refusal', () => {
     expect(detectCliUsageLimit('The batch resets in 5m.').limited).toBe(false);
   });

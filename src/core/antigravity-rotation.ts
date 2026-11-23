@@ -95,7 +95,8 @@ export function isAntigravityQuotaAutoRotateEligible(input: AntigravityAutoRotat
   if (input.effectiveCliId !== 'antigravity') return false;
   if (!input.usageLimit?.limited) return false;
   if (input.usageLimit.kind !== 'usage') return false;
-  if (input.usageLimit.source !== 'antigravity-error-composer') return false;
+  if (input.usageLimit.source !== 'antigravity-error-composer'
+    && input.usageLimit.source !== 'antigravity-native-log') return false;
   if (input.suppressRecoveryCard) return false;
   if (input.isAdoptSession) return false;
   if (input.isRemoteBackend) return false;

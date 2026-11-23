@@ -111,6 +111,7 @@ describe('antigravity quota auto-rotation state machine', () => {
       usageLimit: nativeAgyLimit(),
     };
     expect(isAntigravityQuotaAutoRotateEligible(valid)).toBe(true);
+    expect(isAntigravityQuotaAutoRotateEligible({ ...valid, usageLimit: nativeAgyLimit({ source: 'antigravity-native-log' }) })).toBe(true);
     expect(isAntigravityQuotaAutoRotateEligible({ ...valid, effectiveCliId: 'claude-code' })).toBe(false);
     expect(isAntigravityQuotaAutoRotateEligible({ ...valid, usageLimit: nativeAgyLimit({ kind: 'rate' }) })).toBe(false);
     expect(isAntigravityQuotaAutoRotateEligible({ ...valid, usageLimit: nativeAgyLimit({ source: undefined }) })).toBe(false);

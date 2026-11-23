@@ -9,8 +9,12 @@ export interface CliUsageLimitState {
   /** Stable identity of one relative-countdown refusal, persisted so a
    * reattached worker cannot move its already-observed reset deadline. */
   relativeResetKey?: string;
-  /** A confirmed native quota composer must survive unrelated PTY output. */
-  source?: 'antigravity-error-composer';
+  /** Confirmed native quota evidence must survive unrelated PTY output. */
+  source?: 'antigravity-error-composer' | 'antigravity-native-log';
+  /** Stable native failure identity, independent of the reset-time format. */
+  nativeEpisodeKey?: string;
+  /** The exact failed input has durable proof of no assistant/tool progress. */
+  directFailure?: true;
 }
 
 export interface CliUsageLimitNotDetected {
@@ -304,9 +308,14 @@ export function detectCliUsageLimit(
   return { limited: false };
 }
 
+export function cliUsageLimitEpisodeKey(state: CliUsageLimitState): string | undefined {
+  return state.nativeEpisodeKey ?? state.relativeResetKey;
+}
+
 export function usageLimitStateKey(state: CliUsageLimitState): string {
   const key = `${state.kind}:${state.retryAtMs}:${state.retryLabel}`;
-  return state.relativeResetKey ? `${key}:${state.relativeResetKey}` : key;
+  const episode = cliUsageLimitEpisodeKey(state);
+  return episode ? `${key}:${episode}` : key;
 }
 
 /** Repeated screenshots contain the same relative duration, not a new reset.
@@ -317,13 +326,21 @@ export function reconcileUsageLimitState(
   incoming: CliUsageLimitState,
   nowMs = Date.now(),
 ): CliUsageLimitState {
-  if (!incoming.relativeResetKey || previous?.relativeResetKey !== incoming.relativeResetKey
+  const sameEpisode = previous && (
+    cliUsageLimitEpisodeKey(previous) === cliUsageLimitEpisodeKey(incoming)
+    // An unconfirmed frame gains its native Error ID only later. A confirmed
+    // episode with a different native key never borrows this deadline.
+    || (previous.nativeEpisodeKey === undefined
+      && previous.relativeResetKey === incoming.relativeResetKey)
+  );
+  if (!incoming.relativeResetKey || !sameEpisode
     || previous.kind !== incoming.kind || !Number.isFinite(previous.retryAtMs)) return incoming;
   return {
     ...incoming,
     retryAtMs: previous.retryAtMs,
     retryReady: previous.retryReady || nowMs >= previous.retryAtMs,
     ...(previous.source ? { source: previous.source } : {}),
+    ...(previous.nativeEpisodeKey ? { nativeEpisodeKey: previous.nativeEpisodeKey } : {}),
   };
 }
 

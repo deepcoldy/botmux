@@ -1102,8 +1102,8 @@ import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
 import { sameTrustedPrincipal } from './active-turn-authority.js';
-import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
-import { isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
+import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, cliUsageLimitEpisodeKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { ANTIGRAVITY_QUOTA_HISTORY_LIMIT, isAntigravityWorkingScreen, rememberAntigravityQuota } from '../adapters/cli/antigravity.js';
 import {
   inspectAntigravityAccounts,
   maskAntigravityEmail,
@@ -5134,7 +5134,8 @@ function updateUsageLimitState(
 }
 
 function isExpiredNativeAntigravityQuota(limit?: CliUsageLimitState): boolean {
-  return limit?.source === 'antigravity-error-composer' && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
+  return (limit?.source === 'antigravity-error-composer' || limit?.source === 'antigravity-native-log')
+    && !!limit.relativeResetKey && limit.retryAtMs <= Date.now();
 }
 
 const usageLimitPersistRetries = new WeakMap<DaemonSession, {
@@ -5267,10 +5268,15 @@ function resolveUsageAwareScreenStatus(
   if (expired) rememberSessionAntigravityQuota(ds, expired);
 
   if (previous && !usageLimit) {
-    const expiredSameEpisode = expired && expired.relativeResetKey === previous.relativeResetKey && expired.kind === previous.kind;
+    const expiredSameEpisode = expired && (
+      cliUsageLimitEpisodeKey(expired) === cliUsageLimitEpisodeKey(previous)
+      || (previous.nativeEpisodeKey === undefined
+        && previous.relativeResetKey === expired.relativeResetKey)
+    ) && expired.kind === previous.kind;
     const working = isActiveWorkRuntimeStatus(status);
     // 原生拒绝在窗口内只接受原生工作提示，避免无关 PTY 输出清掉限额。
-    const workRecovered = working && (previous.source !== 'antigravity-error-composer'
+    const workRecovered = working && ((previous.source !== 'antigravity-error-composer'
+      && previous.source !== 'antigravity-native-log')
       || (content && isAntigravityWorkingScreen(content)));
     const composerRecovered = frame.usageLimitRecovery === 'antigravity-ready-composer'
       && sessionCliId(ds, getBot(ds.larkAppId).config) === 'antigravity';
@@ -21471,7 +21477,7 @@ function setupWorkerHandlers(
     const limit = ds.usageLimit;
     if (ds.lastScreenStatus !== 'limited' || !limit || ds.suppressRecoveryCard) return;
     const replacedExpiredQuota = isExpiredNativeAntigravityQuota(previousLimit)
-      && previousLimit?.relativeResetKey !== limit.relativeResetKey;
+      && previousLimit && cliUsageLimitEpisodeKey(previousLimit) !== cliUsageLimitEpisodeKey(limit);
     if (previousStatus === 'limited' && !replacedExpiredQuota) return;
 
     // 已通过截图来源校验的旧帧仍可能指向旧话题。两个入口都先核对当前执行。
@@ -21487,13 +21493,29 @@ function setupWorkerHandlers(
     }
     const limitKey = usageLimitStateKey(limit);
     // Antigravity hosted-account auto-rotation: on genuine native quota
-    // exhaustion (`antigravity-error-composer`), rotate the host vault to
+    // exhaustion (a footerless native composer or the session's own
+    // ResourceExhausted --log-file record), rotate the host vault to
     // the next healthy account, restart the worker in place (resuming
     // `--conversation`), and automatically replay the interrupted turn.
     // When rotation starts, suppress duplicate `@owner` limit spam and
     // `quotaFallbackBot` handoff; when disabled or exhausted, fall through
     // so existing notifications and backup-bot handoff run as before.
     const effectiveCliId = sessionCliId(ds, botCfg);
+    if (effectiveCliId === 'antigravity'
+      && (limit.source === 'antigravity-error-composer' || limit.source === 'antigravity-native-log')
+      && limit.nativeEpisodeKey
+      && ds.session.consumedAntigravityQuotaKeys?.includes(limit.nativeEpisodeKey)) {
+      // A resumed viewport can still contain the refusal consumed by the last
+      // successful rotation. It is not a fresh provider episode; clear the
+      // stale card without restarting or charging another account.
+      try {
+        clearUsageLimitState(ds);
+        if (ds.lastScreenStatus === 'limited') ds.lastScreenStatus = 'idle';
+      } catch (err: any) {
+        logger.warn(`[${t}] Failed to clear consumed Antigravity quota episode: ${err?.message ?? err}`);
+      }
+      return;
+    }
     // Only replay when the limited frame carries a proven `provenTurn`
     // matching the exact recorded turn. Without `provenTurn` (e.g. a
     // direct Web Terminal prompt), rotate + restart cleanly and ask the
@@ -21502,16 +21524,14 @@ function setupWorkerHandlers(
     const matchesFailedTurn = Boolean(
       provenTurn && capturedFailedTurn && capturedFailedTurn.turnId === provenTurn,
     );
-    // A matching turn ID proves ownership, NOT that replay is side-effect safe.
-    // Only a durable direct-failure observation (no assistant text/tool calls)
-    // may be re-sent unattended. agy does not currently expose that proof, so
-    // its native quota path rotates + resumes but asks for manual continuation
-    // instead of repeating a turn that may already have performed mutations.
+    // Replay only a failure with durable no-progress proof. agy attaches that
+    // proof to its limitedSnapshot only when the exact native USER_INPUT has no
+    // subsequent assistant/tool records; a turn that already performed work is
+    // rotated + resumed but never repeated from its original side effects.
     const replayPayload = matchesFailedTurn
       && capturedFailedTurn?.directFailure === true
       && capturedFailedTurn.status === 'failed'
       && !capturedFailedTurn.recovery
-      && !capturedFailedTurn.limitedSnapshot
       && capturedFailedTurn.retryable !== false
       && capturedFailedTurn.cliInput.trim()
       ? {
@@ -21563,10 +21583,19 @@ function setupWorkerHandlers(
       ),
       updateSessionAccount: accountId => {
         ds.antigravityAccountId = accountId;
+        let dirty = false;
         if (ds.session.antigravityAccountId !== accountId) {
           ds.session.antigravityAccountId = accountId;
-          sessionStore.updateSession(ds.session);
+          dirty = true;
         }
+        const consumedKey = limit.nativeEpisodeKey;
+        if (consumedKey && !ds.session.consumedAntigravityQuotaKeys?.includes(consumedKey)) {
+          ds.session.consumedAntigravityQuotaKeys = [
+            ...(ds.session.consumedAntigravityQuotaKeys ?? []), consumedKey,
+          ].slice(-ANTIGRAVITY_QUOTA_HISTORY_LIMIT);
+          dirty = true;
+        }
+        if (dirty) sessionStore.updateSession(ds.session);
       },
       clearUsageLimit: () => {
         try {
