@@ -288,6 +288,11 @@ export interface CredentialOnlyRelayOutbox {
   cleanup: () => void;
 }
 
+export interface SandboxRelayOutbox {
+  outbox: string;
+  cleanup: () => void;
+}
+
 function credentialOnlyRelayPaths(opts: { sessionId: string; dataDir: string }): {
   sessionsRoot: string;
   sessionRoot: string;
@@ -359,6 +364,49 @@ export function reattachableRelayOutbox(sessionRoot: string): string | null {
     return null;
   }
   return outbox;
+}
+
+/** Provision the host-owned relay used by the macOS Seatbelt file sandbox.
+ *
+ * Linux's full sandbox creates this same tree as part of prepareDirectSandbox,
+ * while Seatbelt has no mount namespace setup phase. Keep provisioning here so
+ * the worker can add the exact outbox to the shared FsPolicy before compiling
+ * the profile, then inject BOTMUX_SEND_RELAY into the confined child.
+ *
+ * This helper is intentionally platform-neutral for deterministic tests; the
+ * worker is the platform gate. */
+export function prepareSandboxRelayOutbox(opts: {
+  sessionId: string;
+  dataDir: string;
+}): SandboxRelayOutbox | null {
+  const sessionsRoot = join(canonical(opts.dataDir), 'sandboxes');
+  const sessionRoot = join(sessionsRoot, opts.sessionId);
+  const outbox = join(sessionRoot, 'outbox');
+  try {
+    mkdirSync(sessionsRoot, { recursive: true, mode: 0o700 });
+    const uid = process.getuid?.();
+    const existingSession = (() => { try { return lstatSync(sessionRoot); } catch { return null; } })();
+    if (existingSession && (!existingSession.isDirectory()
+      || existingSession.isSymbolicLink()
+      || (uid !== undefined && existingSession.uid !== uid))) return null;
+    if (!existingSession) mkdirSync(sessionRoot, { mode: 0o700 });
+    const existingOutbox = (() => { try { return lstatSync(outbox); } catch { return null; } })();
+    if (existingOutbox && (!existingOutbox.isDirectory()
+      || existingOutbox.isSymbolicLink()
+      || (uid !== undefined && existingOutbox.uid !== uid))) return null;
+    if (!existingOutbox) mkdirSync(outbox, { mode: 0o700 });
+    chmodSync(outbox, 0o700);
+  } catch {
+    return null;
+  }
+  if (reattachableRelayOutbox(sessionRoot) !== outbox) return null;
+  return {
+    outbox,
+    cleanup: () => {
+      reclaimMaskMounts(sessionRoot);
+      removeSandboxTree(sessionRoot);
+    },
+  };
 }
 
 /** Warm-reattach counterpart of {@link prepareCredentialOnlyRelayOutbox}.
@@ -1624,16 +1672,16 @@ export function prepareDirectSandbox(opts: {
 
 /**
  * Re-attach the daemon/worker side to an ALREADY-spawned sandbox session (a
- * live bwrap'd CLI surviving in a tmux pane across a daemon restart or a topic
+ * live sandboxed CLI surviving in a tmux pane across a daemon restart or a topic
  * transfer). Only the outbox path is needed back so the watcher keeps servicing
  * the live CLI's `botmux send`, plus a cleanup that removes the tree at
- * close/exit. Returns null when the pane's outbox is no longer on disk (never
- * sandboxed, or the tree was lost): it is never recreated — see
- * {@link reattachableRelayOutbox}. Linux-only, mirrors prepareDirectSandbox's
- * layout.
+ * close/exit. Returns null when the pane's outbox is no longer on disk (legacy
+ * Seatbelt pane, never sandboxed, or the tree was lost): it is never recreated
+ * because a live legacy pane has no BOTMUX_SEND_RELAY in its environment, while
+ * a live bwrap pane holds the old directory by inode. Mirrors the shared
+ * `<data>/sandboxes/<sid>/outbox` layout on Linux and macOS.
  */
 export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }): { outbox: string; cleanup: () => void } | null {
-  if (process.platform !== 'linux') return null;
   const sessionRoot = join(canonical(opts.dataDir), 'sandboxes', opts.sessionId);
   const outbox = reattachableRelayOutbox(sessionRoot);
   if (!outbox) return null;
@@ -2086,6 +2134,12 @@ export function buildRelayHostEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
+  // The watcher re-exec runs on the trusted host, outside Seatbelt/bwrap. Do
+  // not let the confined child's classification markers make cmdSend enter the
+  // read-isolated direct-send path after the relay itself was stripped; that
+  // path then correctly demands a pane channel we intentionally remove below.
+  delete env.BOTMUX_READ_ISOLATED;
+  delete env.BOTMUX_READ_ISOLATION;
   delete env.BOTMUX_LINK_REFS_MODE;
   delete env.BOTMUX_LINK_REF_TURN_MODE;
   // This channel locates the pane's read-isolation proof, not the host

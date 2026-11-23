@@ -68,7 +68,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, rmSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname, isAbsolute, resolve } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -711,6 +711,7 @@ import {
   prepareCredentialOnlyRelayOutbox,
   attachCredentialOnlyRelayOutbox,
   probeHostCredentialIsolationMechanism,
+  prepareSandboxRelayOutbox,
   attachSandboxOutbox,
   sandboxTreeSurvivesWorkerExit,
   startOutboxWatcher,
@@ -29388,14 +29389,22 @@ async function spawnCliBody(
     // provisions a fresh tree and bind. The probes below never create anything.
     const paneRelayBoundByInode = process.platform === 'linux'
       && (sandboxRequested || credentialOnlyBwrap);
+    // A full macOS oncall pane also requires a host relay. Unlike bwrap it does
+    // not bind the directory by inode, but a legacy live pane has no
+    // BOTMUX_SEND_RELAY in its frozen environment, so creating a directory on
+    // reattach cannot upgrade it. Missing relay therefore forces one cold spawn.
+    const paneRequiresSeatbeltRelay = process.platform === 'darwin'
+      && sandboxRequested && !scratchRequested;
     // The live pane runs against the tree of the flavour it was spawned with.
     // A policy flip that keeps the same isolation capabilities (oncall ↔
     // scratch) must not reattach it under the other flavour's arm.
     const recordedTreeFlavour = paneRelayBoundByInode
       ? recordedSandboxTreeFlavour(cfg.sessionId, isolationRuntimeDataDir)
       : null;
-    const paneRelayReattachable = !paneRelayBoundByInode
-      || (recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
+    const paneRelayReattachable = (!paneRelayBoundByInode && !paneRequiresSeatbeltRelay)
+      || (paneRequiresSeatbeltRelay
+        ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir }) !== null
+        : recordedTreeFlavour === requestedTreeFlavour && (scratchRequested
         ? attachScratchSession({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
         : sandboxRequested
           ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir: isolationRuntimeDataDir })
@@ -31339,21 +31348,22 @@ async function spawnCliBody(
       resolvedBin: canonical(cliAdapter.resolvedBin),
     }).map(canonical);
 
-    // Relay outbox (in the policy so the compiled plan grants it read-write).
-    // Linux: always (created by prepareDirectSandbox, bound into bwrap).
-    // macOS: only when the bot withholds its app secret from the sandbox — the
-    // Seatbelt pane then has no credential to call Lark with, so send / history /
-    // quoted go through this outbox like they do on Linux.
-    const darwinRelayOutbox = process.platform === 'darwin' && cfg.sandboxWithholdBotSecret === true;
-    const outbox = process.platform === 'linux' || darwinRelayOutbox
-      ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
-      : undefined;
-    // macOS has no prepareDirectSandbox: create the outbox here, before the
-    // policy drops grants for paths that do not exist. A warm reattach must
-    // reuse the pane's existing directory (checked below), never make one.
-    if (darwinRelayOutbox && outbox && !willReattachPersistent) {
-      mkdirSync(outbox, { recursive: true, mode: 0o700 });
+    // Seatbelt also needs host-side send: its confined CLI cannot execute the
+    // system ps used to acquire feedback send leases, even with bot credentials.
+    const seatbeltRelay = process.platform === 'darwin'
+      ? (willReattachPersistent
+          ? attachSandboxOutbox({ sessionId: cfg.sessionId, dataDir })
+          : prepareSandboxRelayOutbox({ sessionId: cfg.sessionId, dataDir }))
+      : null;
+    if (process.platform === 'darwin' && !seatbeltRelay) {
+      throw new Error(
+        `[file-sandbox] refusing to start session ${cfg.sessionId}: Seatbelt relay outbox is unavailable`,
+      );
     }
+    if (seatbeltRelay) childEnv.BOTMUX_SEND_RELAY = seatbeltRelay.outbox;
+    const outbox = process.platform === 'linux'
+      ? join(canonical(dataDir), 'sandboxes', cfg.sessionId, 'outbox')
+      : seatbeltRelay?.outbox;
     // Pre-create the outbox BEFORE buildFsPolicy so it survives the allow-rule
     // existence-filter below (a not-yet-existing readWrite path is dropped, and
     // bwrap can't bind a missing source → the sandboxed `botmux send` relay
@@ -31885,8 +31895,7 @@ async function spawnCliBody(
           throw new Error(`[file-sandbox] refusing to start session ${cfg.sessionId}: relay outbox ${outbox} is missing`);
         }
         if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-        const sessionTree = dirname(outbox);
-        sandboxCleanup = () => { rmSync(sessionTree, { recursive: true, force: true }); };
+        sandboxCleanup = seatbeltRelay!.cleanup;
         sandboxRelayOutbox = outbox;
         sandboxStopWatcher = startOutboxWatcher(
           outbox,
@@ -31894,8 +31903,8 @@ async function spawnCliBody(
           cfg.sessionId,
           { authorize: authorizeManagedSend, allowRouting: true, ...(cfg.sandboxWithholdBotSecret === true ? { sessionToolChatId: cfg.chatId } : {}) },
         );
-        publishSandboxRelayCapability();
-        log(`[file-sandbox] bot secret withheld from the sandbox; send/history/quoted relay via outbox=${outbox}`);
+        publishSandboxRelayCapability({ failClosed: true });
+        log(`[file-sandbox] host send relay via outbox=${outbox}`);
       }
     } else if (willReattachPersistent) {
       // Warm reattach (daemon restart / transfer) to a live bwrap'd pane:
