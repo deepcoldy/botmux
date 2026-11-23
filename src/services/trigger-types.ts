@@ -157,6 +157,7 @@ export type TriggerErrorCode =
   | 'bot_not_found'
   | 'bot_not_in_chat'
   | 'daemon_offline'
+  | 'daemon_upgrade_required'
   | 'dry_run'
   | 'idempotency_conflict'
   | 'invalid_signature'

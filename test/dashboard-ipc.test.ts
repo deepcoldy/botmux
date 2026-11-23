@@ -13599,9 +13599,9 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     const previousSessions = workerPool.getActiveSessionsRegistry();
     workerPool.setActiveSessionsRegistry(new Map());
     try {
-      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/host`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger', handle.port) },
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger/host', handle.port) },
         body: workingDirTriggerBody,
       });
       // Past the gate the request reaches session routing; this fixture has no
@@ -13646,13 +13646,35 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     const previousSessions = workerPool.getActiveSessionsRegistry();
     workerPool.setActiveSessionsRegistry(new Map());
     try {
-      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/host`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger', handle.port) },
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger/host', handle.port) },
         body: runAsTriggerBody,
       });
       expect(response.status).toBe(500);
       expect(await response.json()).toMatchObject({ errorCode: 'trigger_failed', error: 'Bot not registered: local_smoke' });
+    } finally {
+      workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
+    }
+  });
+
+  it.each([
+    ['workingDir', workingDirTriggerBody, 'working_dir_not_allowed'],
+    ['runAs', runAsTriggerBody, 'run_as_not_allowed'],
+  ] as const)('rejects %s on the legacy ordinary route even with a trusted-host signature', async (_field, body, errorCode) => {
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    setLarkAppId('local_smoke');
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const previousSessions = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map());
+    try {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger', handle.port) },
+        body,
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ errorCode });
     } finally {
       workerPool.setActiveSessionsRegistry(previousSessions ?? new Map());
     }
@@ -13673,9 +13695,9 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
       session: { sessionId: 'runas-session', status: 'active', chatId: 'oc_runas_chat' } };
     workerPool.setActiveSessionsRegistry(new Map([['oc_runas_chat:thread', ds]]));
     try {
-      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger`, {
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/trigger/host`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger', handle.port) },
+        headers: { 'content-type': 'application/json', ...trustedHostHeaders('POST', '/api/trigger/host', handle.port) },
         body: JSON.stringify({ ...JSON.parse(runAsTriggerBody), target: { kind: 'turn', botId: 'local_smoke', sessionId: 'runas-session' } }),
       });
       expect(response.status).toBe(403);

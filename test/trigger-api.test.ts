@@ -132,10 +132,10 @@ describe('runAs at the dashboard edge', () => {
     return { status: writeHead.mock.calls[0]?.[0], body: JSON.parse(end.mock.calls[0]?.[0]), proxyToDaemon };
   }
 
-  it('forwards to the ordinary trigger route only with the local management credential', async () => {
+  it('forwards to the host-field trigger route only with the local management credential', async () => {
     const result = await post(runAsRequest(), null, token);
     expect(result.status).toBe(200);
-    expect(result.proxyToDaemon).toHaveBeenCalledWith('fixture-bot', '/api/trigger', expect.objectContaining({
+    expect(result.proxyToDaemon).toHaveBeenCalledWith('fixture-bot', '/api/trigger/host', expect.objectContaining({
       body: JSON.stringify(runAsRequest()),
     }));
   });
@@ -721,6 +721,31 @@ describe('dispatchTriggerRequest', () => {
     expect(res.status).toBe(400);
     expect(res.body.errorCode).toBe('target_required');
     expect(proxyToDaemon).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['runAs', runAsRequest() as TriggerRequest],
+    ['workingDir', { ...request(), options: { workingDir: '/repo' } } as TriggerRequest],
+    ['owner actor with workingDir', { ...ownerRequest(), options: { workingDir: '/repo' } } as TriggerRequest],
+  ])('routes %s through the host-field endpoint', async (_field, body) => {
+    const proxyToDaemon = vi.fn(async () => Response.json({ ok: true }));
+    const res = await dispatchTriggerRequest(body, { proxyToDaemon });
+    expect(res.status).toBe(200);
+    expect(proxyToDaemon).toHaveBeenCalledWith(body.target.botId, '/api/trigger/host', expect.objectContaining({ method: 'POST' }));
+  });
+
+  it('maps an old daemon’s missing host-field route to daemon_upgrade_required', async () => {
+    const proxyToDaemon = vi.fn(async () => Response.json({ error: 'not_found', path: '/api/trigger/host' }, { status: 404 }));
+    const res = await dispatchTriggerRequest(runAsRequest() as TriggerRequest, { proxyToDaemon });
+    expect(res.status).toBe(503);
+    expect(res.body).toMatchObject({ ok: false, errorCode: 'daemon_upgrade_required' });
+  });
+
+  it('does not mistake a current daemon’s session_not_found for an old daemon', async () => {
+    const proxyToDaemon = vi.fn(async () => Response.json({ ok: false, errorCode: 'session_not_found' }, { status: 404 }));
+    const res = await dispatchTriggerRequest(runAsRequest() as TriggerRequest, { proxyToDaemon });
+    expect(res.status).toBe(404);
+    expect(res.body.errorCode).toBe('session_not_found');
   });
 
   it('turns an unreachable daemon into a reviewable 502 response', async () => {

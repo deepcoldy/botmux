@@ -5055,7 +5055,10 @@ async function restoreTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   // A person-actor turn is never prepared before dispatch (its write fence needs the
   // live turn), so an earlier publication in the session does not cover it.
   if ((ds.lastPublishedIdentityModel !== undefined && !isPersonActorTurnId(turnId)) || !triggerUserAuthEnabledFor(ds)
-    || identityStorageModelForDaemonSession(ds) !== 'proven'
+    // runAs has no pre-dispatch publication on either model, so its live origin
+    // must also prepare file-backed identity. Every other turn keeps the old
+    // proven-only restore rule; owner-actor behavior is unchanged here.
+    || (!isRunAsTurnId(turnId) && identityStorageModelForDaemonSession(ds) !== 'proven')
     // Owner and runAs turns are synthetic but carry a daemon-resolved human sender. Other
     // external triggers stay excluded; publication rechecks the turn's policy.
     || !(parseScheduledTurnId(turnId) || isHumanInboundTurnId(turnId) || isPersonActorTurnId(turnId))

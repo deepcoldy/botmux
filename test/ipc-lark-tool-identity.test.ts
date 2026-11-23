@@ -72,6 +72,19 @@ async function request(mode: string, accessKey = binding.accessKey) {
     body: JSON.stringify({ mode }),
   });
 }
+function useRunAsTurn(allowedUsers: string[]) {
+  const botConfig = {
+    larkAppId: 'cli_bound', larkAppSecret: 'bound-secret', ownerOpenId: 'ou_owner',
+    // Deliberately omit larkToolBinding: undefined enables the bound route by default.
+    triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'] }),
+  };
+  vi.mocked(bots.getBot).mockImplementation(() => ({
+    config: botConfig, resolvedAllowedUsers: allowedUsers, resolvedBlockedUsers: [],
+  }) as any);
+  session.managedTurnOrigin.turnId = 'trg_runas_bound_test';
+  vi.spyOn(larkClient, 'resolveUnionIdFromOpenId').mockResolvedValue('on_sender');
+  return botConfig;
+}
 describe('session application identity route', () => {
   it.skipIf(process.platform !== 'linux')('accepts a signed original peer through the trusted loopback proxy and binds it to the live turn', async () => {
     const cliRoot: ChildProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
@@ -549,6 +562,61 @@ describe('session application identity route', () => {
     expect(tokens.resolveUserToken).not.toHaveBeenCalled();
     expect((await request('bot')).status).toBe(200);
   });
+  it('serves an allowed runAs person through the default-enabled bound route', async () => {
+    useRunAsTurn(['ou_sender']);
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ mode: 'user', credential: 'bound-user-token' });
+    expect(larkClient.resolveUnionIdFromOpenId).toHaveBeenCalledExactlyOnceWith('cli_bound', 'ou_sender');
+  });
+  it.each(['om_original', 'trg_runas_original'])('refuses an adopted runAs envelope carrying inherited identity %s', async identityTurnId => {
+    useRunAsTurn(['ou_sender']);
+    session.managedTurnOrigin.identityTurnId = identityTurnId;
+    vi.mocked(tokens.resolveUserToken).mockClear();
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(await response.text()).not.toContain('bound-user-token');
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('refuses a runAs person whose operate access was revoked before the credential lookup', async () => {
+    useRunAsTurn([]);
+    vi.mocked(tokens.resolveUserToken).mockClear();
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(await response.text()).not.toContain('bound-user-token');
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('refuses a runAs person whose operate access is revoked during the credential lookup', async () => {
+    const allowed = ['ou_sender'];
+    useRunAsTurn(allowed);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      allowed.splice(0);
+      return 'late-runas-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(await response.text()).not.toContain('late-runas-token');
+  });
+  it('refuses a runAs credential when lark-cli capability is disabled during the lookup', async () => {
+    const botConfig = useRunAsTurn(['ou_sender']);
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      botConfig.triggerUserAuth = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'] });
+      return 'late-lark-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(await response.text()).not.toContain('late-lark-token');
+  });
+  it('does not add the runAs contact/allowlist fence to owner actors', async () => {
+    const botConfig = useRunAsTurn([]);
+    botConfig.triggerUserAuth.allowOwnerActor = true;
+    session.managedTurnOrigin.turnId = 'trg_owner_bound_test';
+    vi.mocked(larkClient.resolveUnionIdFromOpenId).mockClear();
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(larkClient.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+  });
+
   it('does not return a credential when the user resolver crosses a turn boundary', async () => {
     vi.mocked(tokens.resolveUserToken).mockImplementation(async () => { session.managedTurnOrigin.turnId = 'om_later'; return 'wrong-turn-token'; });
     const response = await request('user');

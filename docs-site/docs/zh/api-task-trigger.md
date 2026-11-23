@@ -114,6 +114,7 @@ curl "http://<daemon-host>:7891/api/sessions/2eed60c4-.../trigger-result" \
 
 **`runAs`（可选，顶层字段）**：让这一轮以指定的人的身份执行，机器人调用的 bytedcli / lark-cli、Meego、Bits 等工具都以这个人的身份操作。取值是 `ou_` 开头的 open_id 或邮箱，效果等同 `botmux schedule add --run-as`。
 
+- 携带 `runAs` 时必须请求 **`POST /api/trigger/host`**，不要用普通 `/api/trigger`；后者即使带宿主签名也返回 403 `run_as_not_allowed`。旧 daemon 没有 host 路由，Dashboard 会将这种混版结果返回为 503 `daemon_upgrade_required`，不会按普通触发执行。
 - 只有 Dashboard 管理员 token（本机管理凭证）可以带；其它凭证带了返回 403 `actor_not_allowed`。Webhook 接入点不支持。
 - 请求时先把邮箱换成这个机器人下的 open_id，并要求此人当前可以在目标群操作这个机器人：解析不出来 → 403 `run_as_unresolved`，无权操作 → 403 `run_as_not_allowed`。每次写入工具凭证前（含瞬时失败后的重试写入）会再核对一次，失败时这一轮的工具直接被拒，不会换成群主、发送者或创建者的身份。同一轮内已写入凭证的续期不会再核对，与 `schedule add --run-as` 一致。
 - 机器人需要开启 `triggerUserAuth.enabled`，不需要 `allowOwnerActor`；`runAs` 指向机器人群主时同样不需要，语义与 `schedule add --run-as` 相同。
@@ -271,7 +272,7 @@ curl "http://<daemon-host>:7891/api/sessions/2eed60c4-.../trigger-result" \
 
 - **不建 worktree**：即使机器人开了「自动创建 worktree」，虚拟会话和同步/异步会话也**一律在基础目录直接跑**，避免每次程序调用都留下一个 worktree。只有「真群 + 即发即忘 + 落在机器人自己的默认目录」才会自动建 worktree。
 - **工作目录的选法更简单**：依次取 oncall 绑定目录 → 机器人默认目录（含 `defaultOncall.workingDir`）→ 机器人 `workingDir` → `~`。不会从兄弟会话继承目录（`botToBotSameDir` 在这里不生效），也不会自动绑定 oncall。需要固定目录时，请直接在机器人或 oncall 上配置好。
-- **按请求指定目录**：传 `options.workingDir` 时，新会话直接在这个目录跑，不走上面的顺序，也不建 worktree。和 `model` 一样只对新建的会话生效，落到已有会话时沿用该会话原来的目录。目录不存在或不是目录 → 400 `bad_request`；个人助理模式的群不支持，同样 400。只接受宿主级调用（Dashboard 转发或带宿主签名的直连）；core-only 模式下免鉴权的 `/api/trigger` 带这个字段会返回 **403 `working_dir_not_allowed`**。
+- **按请求指定目录**：传 `options.workingDir` 时，新会话直接在这个目录跑，不走上面的顺序，也不建 worktree。和 `model` 一样只对新建的会话生效，落到已有会话时沿用该会话原来的目录。目录不存在或不是目录 → 400 `bad_request`；个人助理模式的群不支持，同样 400。携带该字段必须请求 **`/api/trigger/host`**（Dashboard 会自动选择），普通 `/api/trigger` 即使带宿主签名也返回 **403 `working_dir_not_allowed`**；旧 daemon 没有 host 路由时返回 503 `daemon_upgrade_required`，不会忽略目录后继续执行。
 
 ---
 
@@ -614,13 +615,14 @@ curl -X POST "http://<host>:7891/api/sessions/:sessionId/close" \
 | 400 | `bad_json` / `bad_request` / `target_required` | 请求格式或组合不对 |
 | 400 | `bot_not_found` | `botId` 和这个 daemon 对不上 |
 | 403 | `bot_not_in_chat` | 机器人不在目标群 |
-| 403 | `working_dir_not_allowed` | 免鉴权调用带了 `options.workingDir`（见 §5.7） |
+| 403 | `working_dir_not_allowed` | 普通 `/api/trigger` 携带了 `options.workingDir`（含 core-only 与旧 Dashboard 转发）；改用 `/api/trigger/host` |
 | 403 | `actor_not_allowed` | 非管理员 token 带了 `actor` 或 `runAs` |
 | 403 | `run_as_unresolved` | `runAs` 的人解析不出来（见 §4） |
-| 403 | `run_as_not_allowed` | `runAs` 的人无权在目标群操作该机器人，或免鉴权调用带了 `runAs` |
+| 403 | `run_as_not_allowed` | `runAs` 的人无权在目标群操作该机器人，或普通 `/api/trigger` 携带了 `runAs` |
 | 404 | `session_not_found` | `target.sessionId` 不存在 |
 | 409 | `idempotency_conflict` | 同键不同内容 |
 | 410 | `legacy_workflow_retired` | `target.kind: "workflow"`（已退役） |
+| 503 | `daemon_upgrade_required` | 目标 daemon 没有 `/api/trigger/host`，升级后再携带 `runAs` / `workingDir` 重试 |
 | 503 | `bot_not_found` / `trigger_failed` | daemon 还没准备好 |
 | 504 | `wait_timeout` | 同步等待超时 |
 | 500 | `trigger_failed` / `session_not_runnable` / `chat_not_allowed` 等 | 其它失败 |

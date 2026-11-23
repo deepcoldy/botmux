@@ -1437,6 +1437,9 @@ async function triggerSessionTurnAdmitted(
   }
 
   const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
+    if (runAs !== undefined && (target.session.assistantOwnerOpenId || getBot(larkAppId).config.assistantMode === true)) {
+      return { ok: false, errorCode: 'bad_request', error: 'assistant mode: runAs is not supported; the session belongs to the chat owner' };
+    }
     const prompt = promptForSession(target);
     const owner = ownerOpenId
       ? await resolveSender(larkAppId, ownerOpenId, 'user').catch(() => undefined)
@@ -1683,6 +1686,7 @@ async function triggerSessionTurnAdmitted(
             armFinalOutputSuppression(target, dispatchAttempt);
             const accepted = sendWorkerInput(target, content, triggerId, {
               ...(owner ? { trustedCaller: content.trustedCaller } : {}),
+              ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
               ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
               ...(steerRequested ? { codexAppSteerable: true as const } : {}),
             });
@@ -1725,6 +1729,7 @@ async function triggerSessionTurnAdmitted(
           armFinalOutputSuppression(target, dispatchAttempt);
           accepted = sendWorkerInput(target, content, triggerId, {
             ...(owner ? { trustedCaller: content.trustedCaller } : {}),
+            ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
             ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
             // At-most-once: a keyed follow-up delivered to a LIVE worker must be
             // tagged so a CLI crash never replays it onto the auto-restarted CLI
@@ -1786,6 +1791,7 @@ async function triggerSessionTurnAdmitted(
       armLoudFinalSuppression(target);
       const accepted = sendWorkerInput(target, content, triggerId, {
         ...(owner ? { trustedCaller: content.trustedCaller } : {}),
+        ...(runAs !== undefined ? { queueAfterActiveTurn: true as const } : {}),
         ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
         ...(internal?.atMostOnce ? { atMostOnce: true } : {}),
         ...(steerRequested ? { codexAppSteerable: true as const } : {}),
@@ -2191,7 +2197,7 @@ async function triggerSessionTurnAdmitted(
   }
   const newTurnRoot = scope === 'thread' ? anchor : undefined;
   stageTriggerReadModel(newDs, req, triggerId, runAsPerson, newTurnRoot);
-  const promptInput = buildNewTopicCliInput(    prompt,
+  const promptInput = buildNewTopicCliInput(prompt,
     session.sessionId,
     session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
     session.cliLaunchSnapshot?.cliPathOverride ?? session.cliPathOverride ?? bot.config.cliPathOverride,

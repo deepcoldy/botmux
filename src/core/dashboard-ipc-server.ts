@@ -618,7 +618,7 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope, isValidLarkScopeSyntax } from '../utils/lark-scope-catalog.js';
 import { recallProvenIdentityContent, refreshSessionIdentity, sessionIdentityMaterialPresent } from './cli-identity.js';
-import { allowsPersonalIdentityForTurn, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
+import { allowsPersonalIdentityForTurn, isRunAsTurnId, isUnattendedIdentityTurnId } from './workflow-event-turn.js';
 import {
   resolveRegisteredBackgroundContext,
   backgroundContextStillValid,
@@ -4558,6 +4558,34 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
   const originSender = choice.speaker?.openId ?? baseSender;
   const sender = delegated?.targetOpenId ?? originSender;
   if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  // runAs was admitted at trigger time, possibly long before this call. Bound
+  // lark-cli bypasses publishTurnCliIdentity, so enforce that turn's live
+  // permission fence here as well. Owner actors deliberately keep their old
+  // static-owner semantics and never take this extra contact/allowlist path.
+  const requestedRunAsTurn = isRunAsTurnId(turnId);
+  const runAsTurn = requestedRunAsTurn || isRunAsTurnId(identityTurnId);
+  // A runAs envelope adopted over another active turn preserves that turn's
+  // caller. It is not the person named by this runAs request; never authenticate
+  // such an inherited principal as a successful runAs execution.
+  if (requestedRunAsTurn && identityTurnId !== undefined && identityTurnId !== turnId) {
+    return jsonRes(res, 403, { ok: false, error: 'runAs turn did not preserve its requested principal; retry as an independent turn' });
+  }
+  let runAsUnionId: string | undefined;
+  const runAsCurrentlyAllowed = (): boolean => {
+    if (!runAsUnionId) return false;
+    try {
+      const currentBot = getBot(bot.larkAppId).config;
+      return allowsPersonalIdentityForTurn(identityTurnId ?? turnId, currentBot.triggerUserAuth)
+        && triggerUserAuthApplies(currentBot.triggerUserAuth, 'lark-cli')
+        && canOperate(bot.larkAppId, targetChatId, sender, runAsUnionId);
+    } catch { return false; }
+  };
+  if (runAsTurn) {
+    runAsUnionId = await resolveUnionIdFromOpenId(bot.larkAppId, sender).catch(() => null) ?? undefined;
+    if (!runAsCurrentlyAllowed()) {
+      return jsonRes(res, 403, { ok: false, error: 'runAs person is not allowed to operate this bot in the target chat' });
+    }
+  }
   const cached = delegated ? undefined : getIdentity(bot.larkAppId, sender);
   const user = delegated ? { type: 'user' as const, openId: sender }
     : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
@@ -4593,6 +4621,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     || !stableAfterAwait
     || (!detachedForUser && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId ?? turnId)) !== JSON.stringify(delegated))) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
+  }
+  // The credential lookup may have crossed an operator edit. Re-read the live
+  // policy and allowlist immediately before any credential can enter the response.
+  if (runAsTurn && !runAsCurrentlyAllowed()) {
+    return jsonRes(res, 403, { ok: false, error: 'runAs person is not allowed to operate this bot in the target chat' });
   }
   // Nobody attends an unattended run: the agent gets a refusal with no personal link
   // or instruction to request scopes (when the platform could not send its card, it names
@@ -8876,8 +8909,10 @@ ipcRoute('DELETE', '/api/schedules/:id', requireBoundBot((_req, res, p) => {
   }
 }, NOT_BOUND_BODY.okFalse));
 
-async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, ownerActorEndpoint: boolean): Promise<void> {
-  if (ownerActorEndpoint && !isTrustedHostIpcRequest(req)) {
+async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, endpoint: 'ordinary' | 'owner' | 'host'): Promise<void> {
+  const ownerActorEndpoint = endpoint === 'owner';
+  const hostFieldsEndpoint = endpoint === 'host';
+  if ((ownerActorEndpoint || hostFieldsEndpoint) && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
   }
   const activeSessions = getActiveSessionsRegistry();
@@ -8890,13 +8925,16 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, owner
   }
   const valid = validateTriggerRequest(body);
   if (!valid.ok) return jsonRes(res, valid.status, valid.body);
-  if (ownerActorEndpoint !== (valid.request.actor === 'owner')) {
+  if (!hostFieldsEndpoint && ownerActorEndpoint !== (valid.request.actor === 'owner')) {
     return jsonRes(res, 403, { ok: false, errorCode: 'actor_not_allowed' });
   }
-  if (valid.request.options?.workingDir !== undefined && !isTrustedHostIpcRequest(req)) {
+  // Host-only fields live on a distinct route so mixed-version fleets fail
+  // closed in BOTH directions: an old daemon returns 404 for /api/trigger/host,
+  // while an old Dashboard forwarding to this ordinary route gets 403 here.
+  if (valid.request.options?.workingDir !== undefined && !hostFieldsEndpoint) {
     return jsonRes(res, 403, { ok: false, errorCode: 'working_dir_not_allowed' });
   }
-  if (valid.request.runAs !== undefined && !isTrustedHostIpcRequest(req)) {
+  if (valid.request.runAs !== undefined && !hostFieldsEndpoint) {
     return jsonRes(res, 403, { ok: false, errorCode: 'run_as_not_allowed' });
   }
   if (valid.request.target.botId && valid.request.target.botId !== cachedLarkAppId) {
@@ -8939,7 +8977,7 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, owner
         ? 200
       : result.errorCode === 'idempotency_conflict'
         ? 409
-      : ownerActorEndpoint && result.errorCode === 'session_not_runnable'
+      : (ownerActorEndpoint || (hostFieldsEndpoint && valid.request.actor === 'owner')) && result.errorCode === 'session_not_runnable'
         ? 409
       : result.errorCode === 'bot_not_in_chat' || result.errorCode === 'owner_unresolved'
         || result.errorCode === 'run_as_not_allowed' || result.errorCode === 'run_as_unresolved'
@@ -8958,8 +8996,9 @@ async function handleTriggerIpc(req: IncomingMessage, res: ServerResponse, owner
 }
 
 const unboundTriggerResponse = { ok: false, errorCode: 'bot_not_found', error: 'larkAppId_not_set' };
-ipcRoute('POST', '/api/trigger', requireBoundBot((req, res) => handleTriggerIpc(req, res, false), unboundTriggerResponse));
-ipcRoute('POST', '/api/trigger/owner', requireBoundBot((req, res) => handleTriggerIpc(req, res, true), unboundTriggerResponse));
+ipcRoute('POST', '/api/trigger', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'ordinary'), unboundTriggerResponse));
+ipcRoute('POST', '/api/trigger/owner', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'owner'), unboundTriggerResponse));
+ipcRoute('POST', '/api/trigger/host', requireBoundBot((req, res) => handleTriggerIpc(req, res, 'host'), unboundTriggerResponse));
 
 // ─── Exact chat grants (talk-only) ─────────────────────────────────────────
 

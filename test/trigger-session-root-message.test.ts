@@ -83,6 +83,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
       ...(turnId && ds.session.replyTargets?.[turnId]?.senderOpenId
         ? { turnCallerOpenId: ds.session.replyTargets[turnId].senderOpenId } : {}),
       ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(opts.queueAfterActiveTurn ? { queueAfterActiveTurn: true } : {}),
       ...(opts.dispatchAttempt !== undefined
         ? { dispatchAttempt: opts.dispatchAttempt }
         : {}),
@@ -567,13 +568,28 @@ describe('triggerSessionTurn rootMessageId target', () => {
       expect(turn.turnId).toMatch(/^trg_runas_/);
       expect(turn.turnCallerOpenId).toBe(PERSON);
       expect(turn.trustedCaller?.requestUserOpenId).toBe(PERSON);
+      expect(turn.queueAfterActiveTurn).toBe(true);
       expect(Object.keys(ds.session.replyTargets!).sort()).toEqual(['om_human_before', turn.turnId].sort());
       expect(ds.session.replyTargets!.om_human_before!.senderOpenId).toBe('ou_someone_else');
       const queue = [{ ...turn }];
       expect(mergeQueuedCliInput(queue, {
         content: 'From chat', turnId: 'om_same_person', trustedCaller: turn.trustedCaller, turnCallerOpenId: PERSON,
-      })).toBe(true);
+      })).toBe(false);
       expect(queue[0]?.turnId).toBe(turn.turnId);
+      expect(queue[0]?.content).not.toContain('From chat');
+    });
+
+    it('marks an ordinary live-worker runAs follow-up as an independent serial turn', async () => {
+      const send = vi.fn();
+      const ds = existingDs({ worker: { send } as any });
+      const res = await triggerSessionTurn(
+        runAsRequest({ chatId: undefined, sessionId: 'sess_existing' }),
+        deps(new Map([[sessionKey(ROOT, APP), ds]])),
+      );
+      expect(res).toMatchObject({ ok: true });
+      const turn = send.mock.calls[0]![0] as PendingCliInput;
+      expect(turn.queueAfterActiveTurn).toBe(true);
+      expect(turn.trustedCaller?.requestUserOpenId).toBe(PERSON);
     });
 
     it('admits the person against the chat of the addressed session, not a caller-supplied chat', async () => {
@@ -637,6 +653,38 @@ describe('triggerSessionTurn rootMessageId target', () => {
       await triggerSessionTurn(runAsRequest({ rootMessageId: ROOT }), deps(activeSessions));
       expect(mockRunAutoWorktreeCommit).not.toHaveBeenCalled();
       expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['sessionId', { chatId: undefined, sessionId: 'sess_existing' }],
+      ['rootMessageId', { rootMessageId: ROOT }],
+    ] as const)('assistant mode refuses runAs on an existing session addressed by %s', async (_label, target) => {
+      const send = vi.fn();
+      const ds = existingDs({ worker: { send } as any });
+      ds.session.assistantOwnerOpenId = 'ou_owner_a';
+      ds.session.replyTargets = { om_before: { senderOpenId: 'ou_owner_a' } } as any;
+      const res = await triggerSessionTurn(
+        runAsRequest(target),
+        deps(new Map([[sessionKey(ROOT, APP), ds]])),
+      );
+      expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+      expect(send).not.toHaveBeenCalled();
+      expect(ds.session.replyTargets).toEqual({ om_before: { senderOpenId: 'ou_owner_a' } });
+    });
+
+    it('assistant mode rejects runAs on a legacy existing session without an owner marker', async () => {
+      mockGetBot.mockReturnValue({
+        config: { larkAppId: APP, cliId: 'codex', workingDir: '/tmp', assistantMode: true },
+        botName: 'Bot', botOpenId: 'ou_bot',
+      });
+      const send = vi.fn();
+      const ds = existingDs({ worker: { send } as any });
+      const res = await triggerSessionTurn(
+        runAsRequest({ chatId: undefined, sessionId: 'sess_existing' }),
+        deps(new Map([[sessionKey(ROOT, APP), ds]])),
+      );
+      expect(res).toMatchObject({ ok: false, errorCode: 'bad_request' });
+      expect(send).not.toHaveBeenCalled();
     });
 
     it('assistant mode refuses runAs without creating a session', async () => {

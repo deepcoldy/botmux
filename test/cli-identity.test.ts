@@ -1192,6 +1192,29 @@ describe('renderIdentityWrapper', () => {
     expect(runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION })).toBe('a|tok|');
   });
 
+  it('refuses a legacy unstamped identity when the live turn is runAs', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    publishActiveTurn(dir, SESSION, 'trg_runas_live', undefined, 'ou-runas');
+    // Simulate a stale legacy write landing after activation. It must not be
+    // accepted merely because one side of the turn binding is missing.
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'old-token', openId: 'ou-old',
+    }, 'single');
+    expect(runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }).status)
+      .toBe(IDENTITY_DENIED_EXIT_CODE);
+  });
+
+  it('refuses a runAs-stamped identity when the live turn marker is missing', () => {
+    const wrapperPath = join(dir, 'lark-cli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', stubTool()));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'runas-token', turnId: 'trg_runas_live', openId: 'ou-runas',
+    }, 'single');
+    expect(runDenied(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }).status)
+      .toBe(IDENTITY_DENIED_EXIT_CODE);
+  });
+
   // Proven material may exist for a prepared turn, but the wrapper executes
   // nothing until the channel proves the current execution: a runner that
   // cannot prove denies 77 regardless of what is in memory or on disk.
@@ -1427,6 +1450,35 @@ describe('active-turn file is one atomic (turn, caller) pair', () => {
   it('writes an empty caller line when the principal is unknown', () => {
     publishActiveTurn(dir, SESSION, 'turn-A');
     expect(readFileSync(sessionActiveTurnPath(dir, SESSION), 'utf8').split('\n').slice(0, 2)).toEqual(['turn-A', '']);
+  });
+  it('runAs activation removes the old single snapshot but same-turn rewrites preserve its replacement', () => {
+    publishActiveTurn(dir, SESSION, 'om_old', undefined, 'ou-old');
+    const path = writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'old-token', turnId: 'om_old', openId: 'ou-old',
+    }, 'single');
+
+    publishActiveTurn(dir, SESSION, 'trg_runas_new', undefined, 'ou-runas');
+    expect(existsSync(path)).toBe(false);
+
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'lark-cli', appId: 'a', userAccessToken: 'runas-token', turnId: 'trg_runas_new', openId: 'ou-runas',
+    }, 'single');
+    publishActiveTurn(dir, SESSION, 'trg_runas_new', undefined, 'ou-runas');
+    expect(existsSync(path)).toBe(true);
+    expect(readFileSync(path, 'utf8')).toContain('runas-token');
+  });
+
+  it('runAs snapshot invalidation failure escapes before the old live marker changes', () => {
+    publishActiveTurn(dir, SESSION, 'om_old', undefined, 'ou-old');
+    const before = readFileSync(sessionActiveTurnPath(dir, SESSION), 'utf8');
+    mkdirSync(sessionIdentityPath(dir, SESSION, 'lark-cli'));
+    expect(() => publishActiveTurn(dir, SESSION, 'trg_runas_new', undefined, 'ou-runas')).toThrow();
+    expect(readFileSync(sessionActiveTurnPath(dir, SESSION), 'utf8')).toBe(before);
+  });
+  it('runAs marker-write failure escapes while an ordinary turn keeps best-effort behavior', () => {
+    mkdirSync(sessionActiveTurnPath(dir, SESSION), { recursive: true });
+    expect(() => publishActiveTurn(dir, SESSION, 'trg_runas_new', undefined, 'ou-runas')).toThrow();
+    expect(() => publishActiveTurn(dir, SESSION, 'om_old', undefined, 'ou-old')).not.toThrow();
   });
 });
 

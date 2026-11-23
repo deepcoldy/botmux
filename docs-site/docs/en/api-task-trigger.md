@@ -114,6 +114,7 @@ Requests go to the Dashboard (default port `7891`) and use the Dashboard login t
 
 **`runAs` (optional, top-level)**: run this turn as a named person, so the bot's tools (bytedcli / lark-cli, Meego, Bits) act as that person. The value is an `ou_` open_id or an email; the semantics match `botmux schedule add --run-as`.
 
+- Requests carrying `runAs` must use **`POST /api/trigger/host`**, not ordinary `/api/trigger`; the latter returns 403 `run_as_not_allowed` even with a host signature. Older daemons have no host route, and Dashboard turns that mixed-version result into 503 `daemon_upgrade_required` instead of executing an ordinary trigger.
 - Only the local Dashboard administrator token may send it; any other credential gets 403 `actor_not_allowed`. Webhook connectors don't support it.
 - At request time the email is resolved to an open_id under this bot, and the person must currently be allowed to operate the bot in the target chat: unresolvable → 403 `run_as_unresolved`, not allowed → 403 `run_as_not_allowed`. The person is checked again before every credential write (including the write of a retry after a transient failure); on failure the turn's tools are refused and never fall back to the bot owner, the sender, or the creator. Renewal of an already-written credential within the same turn is not re-checked, same as `schedule add --run-as`.
 - The bot needs `triggerUserAuth.enabled`; `allowOwnerActor` is not required, and naming the bot owner in `runAs` does not need it either (same semantics as `schedule add --run-as`).
@@ -271,7 +272,7 @@ The group is inherited from the session; no need to pass it.
 
 - **No worktree**: even if the bot has "auto-create worktree" on, virtual and sync/async sessions **always run in the base directory**, so programmatic calls don't leave a worktree behind each time. Only "real group + fire-and-forget + the bot's own default directory" gets an auto worktree.
 - **Simpler working-directory choice**: oncall-bound directory → bot default directory (including `defaultOncall.workingDir`) → bot `workingDir` → `~`. Directories aren't inherited from sibling sessions (`botToBotSameDir` doesn't apply here), and oncall isn't auto-bound. If you need a fixed directory, configure it on the bot or oncall.
-- **Per-request directory**: with `options.workingDir`, the new session runs in that directory instead of the order above, and no worktree is created. Like `model`, it only applies to newly created sessions; a request that lands in an existing session keeps that session's directory. A missing path or a non-directory → 400 `bad_request`; assistant-mode chats don't support it (also 400). Only host-level callers may set it (Dashboard-proxied or host-signed direct calls); on the unauthenticated core-only `/api/trigger` route the field returns **403 `working_dir_not_allowed`**.
+- **Per-request directory**: with `options.workingDir`, the new session runs in that directory instead of the order above, and no worktree is created. Like `model`, it only applies to newly created sessions; a request that lands in an existing session keeps that session's directory. A missing path or a non-directory → 400 `bad_request`; assistant-mode chats don't support it (also 400). Requests carrying this field must use **`/api/trigger/host`** (Dashboard selects it automatically); ordinary `/api/trigger` returns **403 `working_dir_not_allowed`** even with a host signature. If the target daemon has no host route, the request fails with 503 `daemon_upgrade_required` instead of running in the wrong directory.
 
 ---
 
@@ -614,13 +615,14 @@ If there was no result before closing, polling afterwards returns `state: "faile
 | 400 | `bad_json` / `bad_request` / `target_required` | Malformed request or invalid combination |
 | 400 | `bot_not_found` | `botId` doesn't match this daemon |
 | 403 | `bot_not_in_chat` | Bot isn't in the target group |
-| 403 | `working_dir_not_allowed` | An unauthenticated call carried `options.workingDir` (see §5.7) |
+| 403 | `working_dir_not_allowed` | Ordinary `/api/trigger` carried `options.workingDir` (including core-only and an old Dashboard proxy); use `/api/trigger/host` |
 | 403 | `actor_not_allowed` | A non-administrator token carried `actor` or `runAs` |
 | 403 | `run_as_unresolved` | The `runAs` person could not be resolved (see §4) |
-| 403 | `run_as_not_allowed` | The `runAs` person may not operate the bot in the target chat, or an unauthenticated call carried `runAs` |
+| 403 | `run_as_not_allowed` | The `runAs` person may not operate the bot in the target chat, or ordinary `/api/trigger` carried `runAs` |
 | 404 | `session_not_found` | `target.sessionId` doesn't exist |
 | 409 | `idempotency_conflict` | Same key, different content |
 | 410 | `legacy_workflow_retired` | `target.kind: "workflow"` (retired) |
+| 503 | `daemon_upgrade_required` | The target daemon has no `/api/trigger/host`; upgrade it before retrying with `runAs` / `workingDir` |
 | 503 | `bot_not_found` / `trigger_failed` | Daemon isn't ready yet |
 | 504 | `wait_timeout` | Sync wait timed out |
 | 500 | `trigger_failed` / `session_not_runnable` / `chat_not_allowed` etc. | Other failures |

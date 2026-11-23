@@ -33,7 +33,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 }));
 
 const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
-const { recallProvenIdentityContent } = await import('../src/core/cli-identity.js');
+const { recallProvenIdentityContent, sessionIdentityPath } = await import('../src/core/cli-identity.js');
 const { activeIdentityTurns, releaseActiveIdentityTurn } = await import('../src/core/active-identity-turns.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { isHumanInboundTurnId, pickTurnReplyTarget } = await import('../src/core/reply-target.js');
@@ -86,6 +86,7 @@ function world(opts: {
   runAs?: { person: string; unionId: string | null; operable: () => boolean };
   /** An earlier turn already published in this session; `turn` overrides the turn id. */
   previouslyPublished?: boolean;
+  storageModel?: 'proven' | 'single';
   turn?: string;
 } = {}) {
   const TURN = opts.turn ?? (opts.runAs ? RUN_AS_TURN : OWNER_TURN);
@@ -142,7 +143,7 @@ function world(opts: {
     sessionStore: { updateSession: () => {} },
     prepareScheduledTurnCliIdentity: async () => { throw new Error('unexpected scheduled identity'); },
     identityPublicationConflicted: () => false,
-    identityStorageModelForDaemonSession: () => 'proven',
+    identityStorageModelForDaemonSession: () => opts.storageModel ?? 'proven',
     pickTurnReplyTarget,
     dispatchUserForTurn: opts.dispatchUserForTurn ?? (async () => undefined),
     targetUserForDelegation: async () => undefined,
@@ -162,6 +163,10 @@ function world(opts: {
     restore: () => restoreTurnCliIdentity(ds, TURN),
     prepare: () => prepareTurnCliIdentity(ds, TURN),
     material: () => recallProvenIdentityContent(dataDir, SESSION, TURN, 'lark-cli'),
+    singleMaterial: () => {
+      try { return readFileSync(sessionIdentityPath(dataDir, SESSION, 'lark-cli'), 'utf8'); }
+      catch { return undefined; }
+    },
     activeTurns: () => activeIdentityTurns(dataDir, SESSION),
     releaseTerminal: () => {
       ds.terminalIdentityTurnIds.add(TURN);
@@ -296,6 +301,30 @@ describe('runAs turn identity — the named person, re-admitted at publication',
     expect(resolveLarkCliHomeForTurn).toHaveBeenCalledWith(PERSON);
   });
 
+  it('publishes the named person identity for a single-model live origin', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ runAs: person(), storageModel: 'single' });
+    await w.restore();
+    expect(w.singleMaterial()).toContain(`/home/${PERSON}`);
+    expect(w.ds.lastPublishedIdentityModel).toBe('single');
+    expect(resolveLarkCliHomeForTurn).toHaveBeenCalledExactlyOnceWith(PERSON);
+  });
+
+  it('removes a single-model publication whose person loses access while credentials resolve', async () => {
+    const entered = deferred<void>();
+    const gate = deferred<string>();
+    resolveLarkCliHomeForTurn.mockImplementation(async () => { entered.resolve(); return gate.promise; });
+    let operable = true;
+    const w = world({ runAs: person(() => operable), storageModel: 'single' });
+    const restoring = w.restore();
+    await entered.promise;
+    operable = false;
+    gate.resolve(`/home/${PERSON}`);
+    await restoring;
+    expect(w.singleMaterial()).toBeUndefined();
+    expect(w.activeTurns()).toEqual([]);
+  });
+
   it('withholds the identity when the person may no longer operate the bot', async () => {
     resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
     const w = world({ runAs: person(() => false) });
@@ -386,6 +415,14 @@ describe('person turns in a session that already published for an earlier turn',
     const w = world({ runAs: person, previouslyPublished: true });
     await Promise.all([w.restore(), w.restore()]);
     expect(resolveLarkCliHomeForTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the ordinary synthetic turn restore proven-only', async () => {
+    resolveLarkCliHomeForTurn.mockImplementation(async openId => `/home/${openId}`);
+    const w = world({ turn: 'trg_plain_trigger', storageModel: 'single' });
+    await w.restore();
+    expect(resolveLarkCliHomeForTurn).not.toHaveBeenCalled();
+    expect(w.singleMaterial()).toBeUndefined();
   });
 
   it('still leaves an ordinary synthetic trigger turn unpublished', async () => {
