@@ -22,6 +22,7 @@ import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import { restartInterruptionNote, restartInterruptionNotice, restartNoteMayPrefix, prefixRestartNote } from '../src/services/restart-interruption.js';
 import { codexRpcEligible } from '../src/codex-rpc-lifecycle.js';
 import { sandboxEnabled } from '../src/adapters/backend/sandbox.js';
+import { decideSessionRenameSettlement } from '../src/core/session-rename-settlement.js';
 
 function wireAutoModelSettings(scope: Record<string, any>): Record<string, any> {
   Object.assign(scope, {
@@ -287,6 +288,11 @@ describe('auto-model Worker admission and original-input retirement', () => {
       });
       const reset = loadAutoModelReset(h.scope);
       h.scope.flushPending = vi.fn(() => reset());
+      // The timeout releases only on a settled composer; this test is about
+      // what that release's flush does, so the composer reads as settled.
+      Object.assign(h.scope, { sessionRenameSurfaceNow: () => 'settled', decideSessionRenameSettlement });
+      h.scope.forceClearSessionRenameInFlight = loadWorkerFunction('forceClearSessionRenameInFlight', h.scope);
+      h.scope.settleSessionRename = loadWorkerFunction('settleSessionRename', h.scope);
       expect(h.scope.activeTurnAuthority.snapshot()).toMatchObject({ turnId: 'turn', started: true });
       loadWorkerFunction<() => void>('armSessionRenameIdleTimeout', h.scope)();
       // advanceTimersToNextTimerAsync is available on both vitest and the

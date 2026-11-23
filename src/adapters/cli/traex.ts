@@ -6,7 +6,8 @@ import { detectModelsViaExec, parseDebugModelsJson, detectModelCapabilitiesViaEx
 import type { CliAdapter, CliLaunchNotice, PtyHandle, StructuredBridgeSpec, WriteInputContext } from './types.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { traeCliStatePath, traeConfigPath, traeHomeFor, traeInstallationIdPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import { traeCliStatePath, traeConfigPath, traeHome, traeHomeFor, traeInstallationIdPath, traeSessionsRoot, traeHistoryPath } from '../../services/traex-paths.js';
+import { watchNativeSessionIndex } from '../../services/native-session-index.js';
 import {
   resolveTraexResumeSessionId,
   traexHistoryMatchDelta,
@@ -23,7 +24,7 @@ import {
 } from '../../services/traex-transcript.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
-import { traexModelPickerPage, traexRestoredComposerReady, traexViewportFooterBusy } from './traex-footer.js';
+import { traexModelPickerPage, traexRestoredComposerReady, traexSessionRenameSurface, traexViewportFooterBusy } from './traex-footer.js';
 import { probeTraexHookTrustSupport, TRAEX_HOOK_TRUST_FLAG, TRAEX_HOOK_TRUST_MIN_VERSION, TRAEX_PROGRAM_STATUS_MIN_VERSION } from './traex-version.js';
 
 /**
@@ -791,6 +792,10 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // message is appended to the still-open rename command. Preserve the title
     // text with a full-width at sign so the command remains a single submit.
     buildSessionRenameCommand: (title) => `/rename ${title.replaceAll('@', '＠')}`,
+    sessionRenameSurface: ({ viewport }, command) => traexSessionRenameSurface(viewport, command),
+    watchSessionRename: (command) => watchNativeSessionIndex(
+      join(traeHome(), 'cli', 'session_index.jsonl'), command.replace(/^\/rename /, ''),
+    ),
     altScreen: false,
     skillsDir: '~/.trae/skills',
     // Curated subset — the full catalogue has 27 models. `traex debug models`

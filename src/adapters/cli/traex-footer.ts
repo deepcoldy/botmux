@@ -1,4 +1,5 @@
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
+import { composerTextKey } from '../../utils/composer-text-key.js';
 
 /**
  * TraeX 0.209.x busy evidence from a FULL authoritative viewport.
@@ -105,7 +106,13 @@ const EMPTY_COMPOSER_HINTS = new Set([
 export function traexComposerHoldsInput(
   screen: string,
   input: string,
-  opts: { requireThreadReady?: boolean } = {},
+  opts: {
+    requireThreadReady?: boolean;
+    /** Compare with {@link composerTextKey}: for a command botmux typed,
+     * cells tmux cannot draw (an emoji with a variation selector) are not a
+     * mismatch. */
+    glyphTolerant?: boolean;
+  } = {},
 ): boolean {
   const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
   let composer = rows.length - 1;
@@ -121,9 +128,29 @@ export function traexComposerHoldsInput(
       .join('\n').trim();
     const chip = /^\[Pasted Content (\d+) chars?\]$/i.exec(body);
     if (chip) return Number(chip[1]) === Array.from(input).length;
+    if (opts.glyphTolerant) return composerTextKey(body) === composerTextKey(input);
     return body.replace(/\s/g, '') === input.replace(/\s/g, '');
   }
   return false;
+}
+
+/**
+ * Where a native `/rename <title>` stands after its Enter (0.216.0, recorded):
+ * normally the composer is back to an empty native input within half a
+ * second, with `Thread renamed to …` above it. When the TUI reads the command
+ * text and its Enter in one go (its event loop stalled, e.g. under host load)
+ * the Enter is taken as a pasted newline: the command stays in the composer,
+ * the next message is appended to it, and its Enter renames the thread to
+ * `<title>\n<message>` — the message never becomes a user turn. A single
+ * Enter on that draft completes the rename (TRAE trims the trailing newline).
+ * Anything else (a busy turn, a dialog, a user draft, an unknown surface) is
+ * `pending`: it proves neither outcome. `settled` only says the composer is
+ * empty — a TUI that has not read the command yet shows the same screen; the
+ * worker supplies the evidence that it did.
+ */
+export function traexSessionRenameSurface(screen: string, command: string): 'settled' | 'unsubmitted' | 'pending' {
+  if (traexRestoredComposerReady(screen)) return 'settled';
+  return traexComposerHoldsInput(screen, command, { glyphTolerant: true }) ? 'unsubmitted' : 'pending';
 }
 
 /**

@@ -76,6 +76,9 @@ export type SubmitRecheckResult = boolean | {
   unprovenCliSessionId?: string;
 };
 
+/** See {@link CliAdapter.sessionRenameSurface}. */
+export type SessionRenameSurface = 'settled' | 'unsubmitted' | 'pending';
+
 /** What the adapter can prove about a failed runner-protocol write.
  *
  * Runner adapters write a framed line and then a newline.  `submitted:false`
@@ -1270,6 +1273,25 @@ export interface CliAdapter {
    *  by the daemon. Undefined means this adapter has no proven native rename
    *  command and must never receive a best-guess slash command. */
   buildSessionRenameCommand?(title: string): string;
+
+  /** Where the native rename typed by `buildSessionRenameCommand` stands, read
+   *  from the backend's current viewport (and cursor when the backend reports
+   *  it) after its Enter: `settled` — the composer is an empty native input
+   *  again; `unsubmitted` — the composer still holds exactly `command` (the
+   *  Enter became a newline or never arrived), so one more Enter submits it;
+   *  `pending` — anything else (a redraw, a dialog, a draft, a busy turn).
+   *  When declared, the worker writes no queued input after a rename until it
+   *  reads `settled`. Undefined keeps the historical bounded fail-open. */
+  sessionRenameSurface?(
+    evidence: { viewport: string; cursor?: { x: number; y: number } },
+    command: string,
+  ): SessionRenameSurface;
+
+  /** Armed right before `command` is typed; the probe turns true once the CLI
+   *  durably recorded that exact rename (Codex/TRAE `session_index.jsonl`).
+   *  The rename then left the composer, which settles a `pending` surface
+   *  without depending on footer copy. Never overrides `unsubmitted`. */
+  watchSessionRename?(command: string): () => boolean;
 
   /** CLI-native command that makes the CLI name the current interactive
    *  session itself (Claude Code: a bare `/rename` derives a name from the

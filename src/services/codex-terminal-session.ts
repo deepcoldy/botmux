@@ -2,6 +2,7 @@ import type { PtyHandle } from '../adapters/cli/types.js';
 import { findCodexRolloutSetByPid } from './codex-transcript.js';
 import { stripAnsiScreenText } from '../utils/idle-detector.js';
 import { detectCodexComposerState } from './codex-composer-state.js';
+import { composerTextKey } from '../utils/composer-text-key.js';
 
 type Resolution =
   | { kind: 'legacy' }
@@ -91,6 +92,37 @@ export function codexNativeFooterRows(footer: string[]): string | undefined {
     && !/^\s*(?:\u2190 for agents|\? for shortcuts|esc to interrupt|tab to queue)\b/.test(footer[1] ?? '')
     && !/^\s*\u26a0(?:\ufe0f)?\s*\d+\b/.test(footer[1] ?? '')) return undefined;
   return footer.map(row => row.trim()).join('\n');
+}
+
+/**
+ * Where a native Codex `/rename <title>` stands after its Enter. Codex shares
+ * TRAE's failure shape (0.167.0, recorded): when the TUI reads the command
+ * text and its Enter in one go, the Enter becomes a newline, the command stays
+ * in the composer, and the next message is appended into the thread name
+ * instead of becoming a turn. One Enter on that draft completes the rename.
+ *
+ * Without a reported cursor the live prompt row stands in for it: the empty
+ * verdict still requires the native placeholder row and footer band.
+ */
+export function codexSessionRenameSurface(
+  evidence: { viewport: string; cursor?: { x: number; y: number } },
+  command: string,
+): 'settled' | 'unsubmitted' | 'pending' {
+  const viewport = stripAnsiScreenText(evidence.viewport);
+  const rows = viewport.split(/\r?\n/);
+  let composer = rows.length - 1;
+  while (composer >= 0 && !/^\s*[›»](?:\s|$)/.test(rows[composer]!)) composer--;
+  if (composer < 0) return 'pending';
+  const cursor = evidence.cursor
+    ?? { x: (/^\s*/.exec(rows[composer]!)?.[0].length ?? 0) + 2, y: composer };
+  if (codexNativeComposerState({ viewport, cursor }) === 'empty') return 'settled';
+  const wanted = composerTextKey(command);
+  for (let end = composer + 1; end < rows.length; end++) {
+    if (codexNativeFooterRows(rows.slice(end).filter(row => row.trim())) === undefined) continue;
+    const body = [rows[composer]!.replace(/^\s*[›»]/, ''), ...rows.slice(composer + 1, end)].join('');
+    return composerTextKey(body) === wanted ? 'unsubmitted' : 'pending';
+  }
+  return 'pending';
 }
 
 // A complete Codex thread UUID (the `thread-id` / legacy `session-id` item).

@@ -636,7 +636,8 @@ import {
 } from './core/failed-turn-rewind.js';
 import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSession } from './core/rewind-backup-retention.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
-import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
+import type { CliAdapter, CliLaunchNotice, PtyHandle, SessionRenameSurface, SubmitGuard, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
+import { decideSessionRenameSettlement } from './core/session-rename-settlement.js';
 import { detectCliStartupBlocker, screenMayShowCredential, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
 import { lookupCliDisplayName } from './adapters/cli/display-names.js';
 import { strictInputHandle } from './adapters/cli/strict-input-handle.js';
@@ -6197,7 +6198,25 @@ function stopNativeSessionTitleSync(): void {
 type SessionRenamePhase = 'idle' | 'reserved' | 'writing' | 'sent';
 let sessionRenamePhase: SessionRenamePhase = 'idle';
 const SESSION_RENAME_IDLE_TIMEOUT_MS = 5_000;
+/** Re-read cadence while a rename the adapter can judge is not yet settled;
+ *  each read is a terminal capture, so a long hold backs off. A redraw from
+ *  the user finishing the rename still re-judges at once via prompt-ready. */
+const SESSION_RENAME_RECHECK_MS = 2_000;
+const SESSION_RENAME_SLOW_RECHECK_MS = 10_000;
+const SESSION_RENAME_FAST_RECHECK_WINDOW_MS = 30_000;
 let sessionRenameIdleTimer: ReturnType<typeof setTimeout> | null = null;
+/** The rename in flight: the exact command typed, the adapter's durable-record
+ *  probe armed just before it, and its one-shot recovery/notice latches. */
+let sessionRenameCommand: string | undefined;
+let sessionRenameRecorded: (() => boolean) | undefined;
+let sessionRenameResubmitted = false;
+let sessionRenameHoldLogged = false;
+let sessionRenameHoldNoticeSent = false;
+let sessionRenameSentAtMs = 0;
+/** Terminal output generation just before the command was typed: output past
+ *  it shows the TUI consumed the command (a stalled TUI still shows the old,
+ *  empty composer). Undefined when no such evidence is owed. */
+let sessionRenameOutputMark: number | undefined;
 
 function sessionRenameInFlight(): boolean {
   // Both native menu operations own the composer until their picker is closed.
@@ -6210,40 +6229,145 @@ function forceClearSessionRenameInFlight(): void {
     sessionRenameIdleTimer = null;
   }
   sessionRenamePhase = 'idle';
+  sessionRenameCommand = undefined;
+  sessionRenameRecorded = undefined;
+  sessionRenameResubmitted = false;
+  sessionRenameHoldLogged = false;
+  sessionRenameHoldNoticeSent = false;
+  sessionRenameSentAtMs = 0;
+  sessionRenameOutputMark = undefined;
+}
+
+/** The adapter's verdict on the rename in flight, read from the backend's own
+ *  viewport (and cursor where reported). Undefined — the historical fail-open —
+ *  when the adapter cannot judge or this backend's screen may not drive input.
+ *  Missing evidence on a judging adapter is `pending`, never `settled`. */
+function sessionRenameSurfaceNow(): SessionRenameSurface | undefined {
+  const adapter = cliAdapter;
+  const command = sessionRenameCommand;
+  const target = backend;
+  if (!adapter?.sessionRenameSurface || !command || !target
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return undefined;
+  let evidence: { viewport: string; cursor?: { x: number; y: number } } | undefined;
+  try {
+    evidence = target.captureInputState?.() ?? { viewport: captureBackendScreen(target) };
+  } catch { evidence = undefined; }
+  if (!evidence?.viewport.trim()) return 'pending';
+  try { return adapter.sessionRenameSurface(evidence, command); } catch { return 'pending'; }
+}
+
+/** One Enter for a rename whose command provably stayed in the composer. Only
+ *  when nothing else may be mid-write into the same terminal. Should the CLI
+ *  merely have been slow to read the original Enter, this one reaches an empty
+ *  composer, where TRAE 0.216.0 and Codex 0.167.0 do nothing. */
+function resubmitSessionRename(): boolean {
+  const target = backend;
+  if (!target || cliRestartInProgress || rawInputRestartGate || webTerminalInputWireDirty()
+    || commandLineWritesPending > 0 || isFlushing || injectionFlushing) return false;
+  try {
+    const sent: unknown = 'sendSpecialKeys' in target
+      ? (target as { sendSpecialKeys(...keys: string[]): unknown }).sendSpecialKeys('Enter')
+      : target.write('\r');
+    if (sent === false) return false;
+  } catch { return false; }
+  // Like the rename's own Enter: only the prompt this key produces may settle.
+  beginCliWriteCycle();
+  return true;
+}
+
+/** Judge the rename in flight and act on it: release queued input, press the
+ *  one recovery Enter, or keep holding and re-read. `prompt` is a screen-idle
+ *  edge (markPromptReady already restores readiness and flushes); `timer` is
+ *  the bounded wait for a CLI that redraws too little to produce one. */
+function settleSessionRename(source: 'prompt' | 'timer'): void {
+  if (sessionRenamePhase !== 'sent') return;
+  const surface = sessionRenameSurfaceNow();
+  const recorded = surface !== undefined && surface !== 'unsubmitted' && sessionRenameRecorded?.() === true;
+  const consumed = sessionRenameOutputMark === undefined || !ptyOutputGeneration.isCurrent(sessionRenameOutputMark);
+  const step = decideSessionRenameSettlement({
+    surface,
+    recorded,
+    consumed,
+    resubmitted: sessionRenameResubmitted,
+    fromPrompt: source === 'prompt',
+  });
+  if (step === 'release') {
+    const held = sessionRenameHoldLogged;
+    forceClearSessionRenameInFlight();
+    const evidence = surface === undefined ? 'unjudged' : recorded ? 'recorded by the CLI' : 'composer empty';
+    if (source === 'prompt') {
+      if (held) log(`Native session rename confirmed (${evidence}); releasing queued input`);
+      return;
+    }
+    // The timer means prompt redraw detection failed. Restore the gate
+    // explicitly; otherwise a deferred raw_input is the only queued work and
+    // flushPending would keep waiting for the very signal this timer replaces.
+    isPromptReady = true;
+    reattachOpenTurnGate = false;
+    log(surface === undefined
+      ? `Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`
+      : `Native session rename confirmed (${evidence}); releasing queued input`);
+    void flushPending();
+    return;
+  }
+  if (step === 'resubmit') {
+    if (resubmitSessionRename()) {
+      sessionRenameResubmitted = true;
+      log(`Native session rename command is still in the ${cliName()} composer; pressed Enter once to submit it`);
+    }
+    armSessionRenameIdleTimeout(SESSION_RENAME_RECHECK_MS);
+    return;
+  }
+  if (source === 'prompt') return;  // the armed timer re-reads and owns notice/recovery
+  if (!sessionRenameHoldLogged) {
+    sessionRenameHoldLogged = true;
+    const state = surface === 'settled' && !consumed ? 'not yet read by the CLI' : surface;
+    log(`Native session rename not confirmed (${state}${sessionRenameResubmitted ? ' after one resubmit' : ''}); holding queued input until the ${cliName()} composer is empty`);
+  }
+  const head = pendingMessages[0] ?? pendingAdoptMessages[0];
+  const rawHead = pendingRawInputs[0];
+  if (!sessionRenameHoldNoticeSent && (head || rawHead)) {
+    sessionRenameHoldNoticeSent = true;
+    send({
+      type: 'user_notify',
+      turnId: head?.turnId ?? rawHead?.turnId ?? currentBotmuxTurnId,
+      dispatchAttempt: head?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+      message: t('worker.session_rename_input_held', { cliName: cliName() }),
+    });
+  }
+  armSessionRenameIdleTimeout(Date.now() - sessionRenameSentAtMs < SESSION_RENAME_FAST_RECHECK_WINDOW_MS
+    ? SESSION_RENAME_RECHECK_MS : SESSION_RENAME_SLOW_RECHECK_MS);
 }
 
 /** A prompt can release rename only after the command Enter was actually sent.
  * A fast final from an older adopt write may arrive while rename is merely
  * reserved behind the queue; keep that reservation and let the queued helper
- * consume the newly-ready prompt. */
+ * consume the newly-ready prompt. A quiet screen still holding the command
+ * is a prompt too, so an adapter that judges its composer must agree. */
 function settleSessionRenameOnPrompt(): void {
-  if (sessionRenamePhase === 'sent') forceClearSessionRenameInFlight();
+  settleSessionRename('prompt');
 }
 
 function settleFailedSessionRenameWrite(): void {
-  if (sessionRenamePhase === 'writing') sessionRenamePhase = 'sent';
+  if (sessionRenamePhase !== 'writing') return;
+  sessionRenamePhase = 'sent';
+  sessionRenameSentAtMs = Date.now();
+  // The write may have stopped before any byte reached the TUI: an empty
+  // composer then owes no output, and a partial command still reads pending.
+  sessionRenameOutputMark = undefined;
 }
 
-/** Fail open if a CLI executes /rename without emitting enough redraw output
- * for IdleDetector to rediscover the prompt. The verified Codex/Claude paths
- * normally settle immediately; this cap prevents one administrative command
- * from wedging all later Lark messages forever. */
-function armSessionRenameIdleTimeout(): void {
+/** Bound the wait for a CLI that executes /rename without emitting enough
+ * redraw output for IdleDetector to rediscover the prompt. Without an adapter
+ * verdict this fails open, so one administrative command cannot wedge all
+ * later Lark messages; with one, queued input waits for a settled composer. */
+function armSessionRenameIdleTimeout(delayMs = SESSION_RENAME_IDLE_TIMEOUT_MS): void {
   if (sessionRenamePhase !== 'sent') return;
   if (sessionRenameIdleTimer) clearTimeout(sessionRenameIdleTimer);
   sessionRenameIdleTimer = setTimeout(() => {
     sessionRenameIdleTimer = null;
-    if (sessionRenamePhase !== 'sent') return;
-    sessionRenamePhase = 'idle';
-    // The timeout specifically means prompt redraw detection failed. Fail open
-    // by restoring the gate explicitly; otherwise a deferred raw_input is the
-    // only queued work and flushPending would keep waiting for the very signal
-    // this timer exists to replace.
-    isPromptReady = true;
-    reattachOpenTurnGate = false;
-    log(`Native session rename idle timeout after ${SESSION_RENAME_IDLE_TIMEOUT_MS}ms; releasing queued input`);
-    void flushPending();
-  }, SESSION_RENAME_IDLE_TIMEOUT_MS);
+    settleSessionRename('timer');
+  }, delayMs);
   sessionRenameIdleTimer.unref?.();
 }
 
@@ -24973,11 +25097,23 @@ async function flushPending(): Promise<void> {
           // the preceding turn in that window must not release the rename gate.
           beginCliWriteCycle();
           sessionRenamePhase = 'writing';
-          await sendRawCommandLineWithRecoveryFence(renameBackend, buildRename(title));
+          const renameCommand = buildRename(title);
+          sessionRenameCommand = renameCommand;
+          sessionRenameResubmitted = false;
+          sessionRenameHoldLogged = false;
+          sessionRenameHoldNoticeSent = false;
+          try {
+            sessionRenameRecorded = cliAdapter?.watchSessionRename?.(renameCommand);
+          } catch { sessionRenameRecorded = undefined; }
+          // Before the first byte: a fast CLI can draw the finished rename
+          // while this write is still settling its journal.
+          sessionRenameOutputMark = ptyOutputGeneration.snapshot();
+          await sendRawCommandLineWithRecoveryFence(renameBackend, renameCommand);
           if (cliSpawnGeneration !== renameGeneration || backend !== renameBackend || cliRestartInProgress) {
             throw new Error('rename backend generation changed before Enter settlement');
           }
           sessionRenamePhase = 'sent';
+          sessionRenameSentAtMs = Date.now();
           // A previous turn's terminal may have raised ready while the rename
           // was still writing. Re-arm after Enter so only rename's own prompt
           // can settle `sent` (with the bounded timeout as fail-open fallback).

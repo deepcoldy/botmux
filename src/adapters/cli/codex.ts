@@ -10,6 +10,7 @@ import { capabilitySlugs, type DebugModelCapabilities } from './model-catalog-js
 import { loadCodexServiceTierCatalog } from '../../services/codex-service-tier-catalog.js';
 import type { CliAdapter, PtyHandle, StructuredBridgeSpec, WriteInputContext } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
+import { watchNativeSessionIndex } from '../../services/native-session-index.js';
 import {
   drainCodexRollout,
   findCodexRolloutByPid,
@@ -18,7 +19,7 @@ import {
   findCodexSessionIdByBotmuxSessionId,
   type CodexDrainState,
 } from '../../services/codex-transcript.js';
-import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeComposerState, codexNativeFooterRows, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
+import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeComposerState, codexNativeFooterRows, codexSessionRenameSurface, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { codexTranscriptCloseable, prepareCodexTranscriptInput, settleCodexInputBox } from '../../services/codex-transcript-input.js';
@@ -622,6 +623,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // session; harmless unknown-command on other CLIs).
     defaultPassthroughCommands: ['/goal'],
     buildSessionRenameCommand: (title) => `/rename ${title}`,
+    sessionRenameSurface: codexSessionRenameSurface,
+    watchSessionRename: (command) => watchNativeSessionIndex(
+      join(codexHome(), 'session_index.jsonl'), command.replace(/^\/rename /, ''),
+    ),
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:
     // it parks it ("Messages to be submitted after next tool call") via an
