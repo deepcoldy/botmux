@@ -108,10 +108,15 @@ describe('POST /api/sessions/:sessionId/feedback-send-lease', () => {
   });
 
   it('maps a namespace-local sender pid onto its host pid before leasing and echoes it for release', async () => {
-    const pid = await setup({ 'sess-a': liveSession('sess-a', CAP_A) });
+    const sessions: Record<string, any> = { 'sess-a': liveSession('sess-a', CAP_A) };
+    // A recognisable session root: the route must pass previewOwnerPids(ds),
+    // not an empty array, into the namespace resolver.
+    const workerRootPid = 4242;
+    sessions['sess-a'].worker = { ...sessions['sess-a'].worker, pid: workerRootPid };
+    const pid = await setup(sessions);
     const resolve = vi.spyOn(pidNamespacePeer, 'resolveNamespaceLocalPid').mockReturnValue(pid);
     const acquired = await post('sess-a', { originCapability: CAP_A, action: 'acquire', processId: 18 });
-    expect(resolve).toHaveBeenCalledWith(18, expect.any(Array));
+    expect(resolve).toHaveBeenCalledWith(18, expect.arrayContaining([workerRootPid]));
     expect(acquired.status).toBe(200);
     // The lease and the response name the host pid, not the namespace-local 18.
     expect(acquired.body.processId).toBe(pid);
@@ -127,9 +132,15 @@ describe('POST /api/sessions/:sessionId/feedback-send-lease', () => {
   });
 
   it('keeps the reported pid unchanged when host resolution cannot prove a mapping', async () => {
-    const pid = await setup({ 'sess-a': liveSession('sess-a', CAP_A) });
-    vi.spyOn(pidNamespacePeer, 'resolveNamespaceLocalPid').mockReturnValue(null);
+    const sessions: Record<string, any> = { 'sess-a': liveSession('sess-a', CAP_A) };
+    const workerRootPid = 4242;
+    sessions['sess-a'].worker = { ...sessions['sess-a'].worker, pid: workerRootPid };
+    const pid = await setup(sessions);
+    const resolve = vi.spyOn(pidNamespacePeer, 'resolveNamespaceLocalPid').mockReturnValue(null);
     const acquired = await post('sess-a', { originCapability: CAP_A, action: 'acquire', processId: pid });
+    // The session roots are still handed to the resolver; its null verdict
+    // means the reported pid passes through unchanged.
+    expect(resolve).toHaveBeenCalledWith(pid, expect.arrayContaining([workerRootPid]));
     expect(acquired.status).toBe(200);
     expect(acquired.body.processId).toBe(pid);
     expect(leases()).toHaveLength(1);
