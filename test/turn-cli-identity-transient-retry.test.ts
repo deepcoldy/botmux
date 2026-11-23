@@ -12,6 +12,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 vi.mock('../src/utils/user-token.js', () => ({
+  // im/lark/client.ts imports this (attachment download); bun rejects a mock
+  // missing an imported export at link time.
+  storedUserTokenScopes: vi.fn(() => undefined),
   resolveUserToken: vi.fn(async () => null),
   lookupAuthorizedUserName: vi.fn(() => undefined),
   isUsableOpenId: (openId: unknown) => typeof openId === 'string' && /^[A-Za-z0-9_-]{1,120}$/.test(openId),

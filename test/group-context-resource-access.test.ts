@@ -9,7 +9,7 @@ vi.mock('../src/bot-registry.js', () => ({
   formatLarkError: String,
 }));
 vi.mock('../src/utils/user-token.js', () => ({
-  resolveUserToken: mocks.userToken, storedUserTokenScopes: mocks.storedScopes, RESOURCE_DOWNLOAD_OAUTH_SCOPES: ['im:resource'],
+  resolveUserToken: mocks.userToken, storedUserTokenScopes: mocks.storedScopes,
 }));
 import { downloadMessageResource } from '../src/im/lark/client.js';
 const dirs: string[] = [];
