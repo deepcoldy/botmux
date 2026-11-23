@@ -1246,7 +1246,10 @@ function BotDefaultsCard(props: {
             {/* <sender> 注入对所有 CLI 都生效（每种 CLI 的 prompt 都会带这个块），
                 所以不按 cliId 收窄——不像上面的 hook 注入只验证过 claude-code。 */}
             <section className="bd-tile" id={botDefaultsSectionDomId('sender-tag')}><SenderTagSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
-            <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}><QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('quota-fallback')}>
+              <QuotaFallbackChainSection bot={bot} cliState={cliState} startCli={cli} patchBot={patchBot} />
+              <QuotaFallbackSection bot={bot} bots={props.bots} patchBot={patchBot} />
+            </section>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('runtime-env')}><RuntimeEnvironmentSection bot={bot} patchBot={patchBot} refreshBot={props.refreshBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('owner-reminder')}><SessionOwnerReminderSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
@@ -1903,6 +1906,192 @@ function QuotaFallbackSection(props: { bot: BotDefaultsRow; bots: BotDefaultsRow
       <div className="actions">
         <button type="button" className="primary" data-action="save-quota-fallback" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackSave')}</button>
         <StatusSpan status={status} attr={{ 'data-quota-fallback-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+type QuotaFallbackChainStepDraft = { cliId: string; model: string };
+
+function quotaFallbackChainDraft(config: BotDefaultsRow['quotaFallbackChain']): QuotaFallbackChainStepDraft[] {
+  const steps = config?.steps.map(step => ({ cliId: step.cliId, model: step.model ?? '' })) ?? [];
+  return steps.length ? steps : [{ cliId: '', model: '' }];
+}
+
+export function QuotaFallbackChainSection(props: { bot: BotDefaultsRow; cliState: CliOptionsState; startCli: string; patchBot: PatchBot }) {
+  const tr = useT();
+  const initial = props.bot.quotaFallbackChain ?? null;
+  const [enabled, setEnabled] = useState(initial?.enabled === true);
+  const [kinds, setKinds] = useState<QuotaFallbackKind[]>(initial?.kinds ?? ['usage', 'rate']);
+  const [steps, setSteps] = useState<QuotaFallbackChainStepDraft[]>(() => quotaFallbackChainDraft(initial));
+  const [detected, setDetected] = useState<Record<string, readonly string[]>>({});
+  const requestedModels = useRef(new Set<string>());
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const next = props.bot.quotaFallbackChain ?? null;
+    setEnabled(next?.enabled === true);
+    setKinds(next?.kinds ?? ['usage', 'rate']);
+    setSteps(quotaFallbackChainDraft(next));
+  }, [props.bot.quotaFallbackChain]);
+
+  // A step launches the stock CLI, so its catalogue is probed without this bot's runtime.
+  useEffect(() => {
+    for (const { cliId } of steps) {
+      if (!cliId || requestedModels.current.has(cliId)) continue;
+      requestedModels.current.add(cliId);
+      void fetchDetectedModels(cliId).then(result => {
+        setDetected(current => ({ ...current, [cliId]: result?.models ?? [] }));
+      });
+    }
+  }, [steps]);
+
+  const cliOptions = useMemo<DropdownFieldOption<string>[]>(() => [
+    { value: '', label: tr('botDefaults.quotaFallbackChainStepCliPlaceholder') },
+    ...props.cliState.options
+      .filter(option => !option.gateway && !option.cliLaunchMode)
+      .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
+      .map(option => ({ value: option.id, label: `${option.label}（${option.id}）` })),
+  ], [props.cliState.options, tr]);
+
+  const startCliLabel = selectedCliOption(props.cliState.options, props.startCli)?.label ?? props.startCli;
+  const startAgent = props.bot.model ? `${startCliLabel} · ${props.bot.model}` : startCliLabel;
+
+  function modelOptions(cliId: string): string[] {
+    const option = selectedCliOption(props.cliState.options, cliId);
+    return mergeModelCandidates(option?.modelChoices ?? [], detected[cliId]);
+  }
+
+  function updateStep(index: number, patch: Partial<QuotaFallbackChainStepDraft>): void {
+    setSteps(current => current.map((step, i) => i === index ? { ...step, ...patch } : step));
+  }
+
+  function toggleKind(kind: QuotaFallbackKind, checked: boolean): void {
+    setKinds(current => checked
+      ? (current.includes(kind) ? current : [...current, kind])
+      : current.filter(item => item !== kind));
+  }
+
+  async function save(): Promise<void> {
+    if (enabled && (steps.length === 0 || steps.some(step => !step.cliId))) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackChainStepsRequired')}` });
+      return;
+    }
+    if (enabled && kinds.length === 0) {
+      setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackKindsRequired')}` });
+      return;
+    }
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/quota-fallback-chain`,
+        {
+          enabled,
+          kinds,
+          steps: steps.map(step => ({ cliId: step.cliId, ...(step.model.trim() ? { model: step.model.trim() } : {}) })),
+        },
+      );
+      if (res.ok && res.body.ok) {
+        props.patchBot(props.bot.larkAppId, { quotaFallbackChain: res.body.quotaFallbackChain ?? null });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else if (res.body?.error === 'invalid_quota_fallback_chain') {
+        setStatus({ text: `✗ ${tr('botDefaults.quotaFallbackChainInvalid', { reason: String(res.body?.reason ?? '') })}` });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (error: any) {
+      setStatus({ text: `✗ ${caughtErrorText(error)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section bd-quota-fallback-chain" data-quota-fallback-chain>
+      <h3 className="bd-section-title"><FieldTitle help={tr('botDefaults.quotaFallbackChainHelp')}>{tr('botDefaults.quotaFallbackChainTitle')}</FieldTitle></h3>
+      <ToggleRow
+        checked={enabled}
+        disabled={busy}
+        dataAction="toggle-quota-fallback-chain"
+        title={tr('botDefaults.quotaFallbackChainEnabled')}
+        help={tr('botDefaults.quotaFallbackChainEnabledHelp')}
+        onChange={setEnabled}
+      />
+      <div className="bd-row">
+        <FieldTitle help={tr('botDefaults.quotaFallbackChainStepsHelp')}>{tr('botDefaults.quotaFallbackChainSteps')}</FieldTitle>
+        <small className="bd-section-note">{tr('botDefaults.quotaFallbackChainStart', { agent: startAgent })}</small>
+        <div className="bd-quota-chain-list" data-input="quotaFallbackChainSteps">
+          <div className="bd-quota-chain-row bd-quota-chain-head" aria-hidden="true">
+            <span />
+            <span>{tr('botDefaults.quotaFallbackChainStepCli')}</span>
+            <span>{tr('botDefaults.quotaFallbackChainStepModel')}</span>
+            <span />
+          </div>
+          {steps.map((step, index) => (
+            <div className="bd-quota-chain-row" key={index} data-quota-fallback-chain-step={index}>
+              <span className="bd-quota-chain-index">{index + 1}</span>
+              <DropdownField<string>
+                dataInput={`quotaFallbackChainCli${index}`}
+                ariaLabel={`${index + 1}. ${tr('botDefaults.quotaFallbackChainStepCli')}`}
+                value={step.cliId}
+                disabled={busy || !enabled}
+                options={cliOptions}
+                searchable
+                onChange={cliId => updateStep(index, { cliId, model: '' })}
+              />
+              <ModelPickerField
+                key={step.cliId}
+                value={step.model}
+                onChange={model => updateStep(index, { model })}
+                options={modelOptions(step.cliId)}
+                disabled={busy || !enabled || !step.cliId}
+                dataInput={`quotaFallbackChainModel${index}`}
+                ariaLabel={`${index + 1}. ${tr('botDefaults.quotaFallbackChainStepModel')}`}
+                defaultLabel={tr('botDefaults.modelPickerDefault')}
+                customLabel={tr('botDefaults.modelPickerCustom')}
+                includeDefault
+                menuClassName="bd-field-menu"
+              />
+              <button
+                type="button"
+                data-action="remove-quota-fallback-chain-step"
+                disabled={busy || !enabled || steps.length === 1}
+                onClick={() => setSteps(current => current.filter((_, i) => i !== index))}
+              >
+                {tr('botDefaults.quotaFallbackChainRemove')}
+              </button>
+            </div>
+          ))}
+        </div>
+        <div className="actions">
+          <button
+            type="button"
+            data-action="add-quota-fallback-chain-step"
+            disabled={busy || !enabled}
+            onClick={() => setSteps(current => [...current, { cliId: '', model: '' }])}
+          >
+            {tr('botDefaults.quotaFallbackChainAdd')}
+          </button>
+        </div>
+      </div>
+      <div className="bd-subsection">
+        <h4 className="bd-subsection-title">{tr('botDefaults.quotaFallbackKinds')}</h4>
+        <div className="bd-owner-reminder-states">
+          {(['usage', 'rate'] as const).map(kind => (
+            <label key={kind}>
+              <input type="checkbox" checked={kinds.includes(kind)} disabled={busy || !enabled} onChange={event => toggleKind(kind, event.currentTarget.checked)} />
+              <span>{tr(kind === 'usage' ? 'botDefaults.quotaFallbackKindUsage' : 'botDefaults.quotaFallbackKindRate')}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      <small className="bd-section-note">{tr('botDefaults.quotaFallbackChainNote')}</small>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-quota-fallback-chain" disabled={busy} onClick={() => void save()}>{tr('botDefaults.quotaFallbackChainSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-quota-fallback-chain-status': '' }} />
       </div>
     </section>
   );

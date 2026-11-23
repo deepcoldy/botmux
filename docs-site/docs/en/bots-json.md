@@ -78,6 +78,7 @@ Two bots, one on Claude Code and one on Codex:
 | Start working without being @-mentioned | `autoStartOnNewTopic`, `autoStartOnGroupJoin` |
 | DM the owner a welcome message when the bot first comes online | `welcomeMessage` (see [Welcome message](#welcome-message)) |
 | Watch an alert group and handle every alert | Group message listener (see [Group message listener](#message-listener)) |
+| Continue on another CLI / model when quota runs out | `quotaFallbackChain` |
 | Hand off to another bot when quota runs out | `quotaFallbackBot` |
 | Stop botmux from adding anything to the prompt | `promptInjection: "none"` |
 | Control how much memory sessions use | `maxLiveWorkers`, `idleSuspendMinutes` |
@@ -119,6 +120,7 @@ The optional `brand` says which platform the app belongs to: `feishu` (default, 
 | `customPassthroughCommands` | Extra slash commands passed through to the CLI, e.g. `["/export"]`. Entries that would clash with botmux's own commands are dropped. `/list-slash-command` shows the full list. See [Slash commands](/en/slash-commands) |
 | `bareRenamePassthrough` | Off by default. When `true`, a `/rename` without a title goes to the CLI as is, and the CLI names the session from the conversation (Claude Code only for now, adopted sessions included). See [Slash commands](/en/slash-commands#rename-cli) |
 | `startupCommands` | Commands sent to the CLI after it starts and before the first message, e.g. `["/effort ultracode"]`. Re-sent on every fresh start and resume |
+| `quotaFallbackChain` | When CLI quota runs out, the same bot moves the session to the next CLI / model and continues. Off by default. See [Quota CLI / model switch](#quota-fallback-chain) below |
 | `quotaFallbackBot` | Hand the session to another bot when CLI quota runs out. Off by default. See [Quota handoff](#quota-fallback) below |
 | `codexCapacityRecovery` | Codex / Codex App only: automatically continue after an explicit model-capacity error. Off by default; at most two recovery inputs per task. Ordinary rate limits and exhausted quota don't count |
 | `suppressDeliveredFinalFailureNotice` | Experimental, off by default. Once a turn's final answer has been delivered, a later model-service error no longer posts a "model connection failed" notice |
@@ -155,6 +157,39 @@ This only affects new subagents created by TraeX's native `spawn_agent`, not the
 - Leaving both out: delete the whole field. `inherit` is not a valid mode.
 
 Switching to another CLI removes this field automatically.
+
+### Quota CLI / model switch {#quota-fallback-chain}
+
+With `quotaFallbackChain`, when a session hits a quota limit the same bot moves it, in place, to the next CLI and model and continues the interrupted request. The chain starts from the bot's own `cliId` and `model` and walks `steps` in order.
+
+```json
+{
+  "cliId": "claude-code",
+  "model": "claude-opus-5-5",
+  "quotaFallbackChain": {
+    "enabled": true,
+    "kinds": ["usage", "rate"],
+    "steps": [
+      { "cliId": "traex", "model": "GPT-6.1-Sol" },
+      { "cliId": "traex", "model": "DeepSeek-V4.1-Flash" }
+    ]
+  }
+}
+```
+
+| Field | Description |
+|------|------|
+| `enabled` | Only `true` turns it on |
+| `kinds` | `usage` (usage cap) and/or `rate` (rate limit); both if omitted. Claude Code quota exhaustion is only recognized as `rate`, so with `usage` alone Claude never switches |
+| `steps` | Ordered switch steps, each with a `cliId`; omit `model` to use that CLI's default model. A step that stays on the same CLI must name a model |
+
+Good to know:
+
+- A rate limit without a reset time (e.g. a bare 429) is first retried on the same CLI 5 times, with the delay doubling from 30 seconds; a limit with a reset time or a quota error code switches at once.
+- A model change on the same CLI resumes the native conversation. A CLI change starts a new native conversation whose first message is a handoff: read the previous CLI's session file, then the topic with `botmux history`, check the working directory, and continue the interrupted request from where it stopped.
+- The continued request runs as its original sender and replies in the original topic; a notice is posted once the switch is done. When the switch cannot start (for example a newer message is already waiting, or the original sender is unknown), the usual owner notice and backup-bot handoff happen instead.
+- A different CLI starts with its own local sign-in and without this bot's `env`. The chain cannot return to a CLI it has left.
+- A session only moves forward and never switches back; it stays on its step across daemon restarts. New sessions start from the bot's own configuration.
 
 ### Quota handoff {#quota-fallback}
 

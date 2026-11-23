@@ -239,6 +239,15 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     ],
   },
   {
+    id: 'quota-fallback-chain',
+    tab: 'advanced',
+    titleKey: 'botDefaults.quotaFallbackChainTitle',
+    tile: 'quota-fallback',
+    fieldKeys: [
+      'botDefaults.quotaFallbackChainEnabled', 'botDefaults.quotaFallbackChainSteps',
+    ],
+  },
+  {
     id: 'runtime-env',
     tab: 'advanced',
     titleKey: 'botDefaults.sectionRuntimeEnv',
@@ -530,6 +539,11 @@ export type BotDefaultsRow = {
     targetAppId: string;
     kinds: Array<'usage' | 'rate'>;
     message: string;
+  } | null;
+  quotaFallbackChain?: {
+    enabled: true;
+    kinds: Array<'usage' | 'rate'>;
+    steps: Array<{ cliId: string; model?: string }>;
   } | null;
   online?: boolean;
   startupBlocked?: {

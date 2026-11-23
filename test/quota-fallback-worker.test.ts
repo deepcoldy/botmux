@@ -45,6 +45,7 @@ import {
   __testOnly_setupWorkerHandlers,
   clearUsageLimitState,
   initWorkerPool,
+  sendWorkerSessionInput,
 } from '../src/core/worker-pool.js';
 import * as sessionStore from '../src/services/session-store.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -457,5 +458,142 @@ describe('daemon quota fallback handoff', () => {
 
     expect(sessionReply).not.toHaveBeenCalled();
     expect(mocks.resolveCurrent).not.toHaveBeenCalled();
+  });
+});
+
+describe('same-bot quota fallback chain wiring', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __testOnly_resetQuotaFallbackEvents();
+    process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-quota-chain-'));
+    sessionStore.init(SOURCE);
+    registerBot({
+      larkAppId: SOURCE,
+      larkAppSecret: 'source-secret',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      disableStreamingCard: true,
+      quotaFallbackBot: { enabled: true, targetAppId: TARGET, kinds: ['usage', 'rate'], message: 'Fixed daemon handoff.' },
+    });
+    registerBot({ larkAppId: TARGET, larkAppSecret: 'target-secret', cliId: 'codex', allowedUsers: ['ou_owner'] });
+    mocks.resolveCurrent.mockResolvedValue({ ok: true, mappings: [{ larkAppId: TARGET, subjectOpenId: TARGET_OPEN_ID }] });
+  });
+
+  function setupChain(sessionReply: ReturnType<typeof vi.fn>, startQuotaFallbackChainSwitch: ReturnType<typeof vi.fn>): void {
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      startQuotaFallbackChainSwitch,
+    } as any);
+  }
+
+  it('hands a limited edge to the chain before the owner notice and backup-bot handoff', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const chain = vi.fn(() => true);
+    setupChain(sessionReply, chain);
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', { type: 'screen_update', content: '429', status: 'limited', usageLimit: limit('rate'), turnId: TURN });
+    await flush();
+
+    expect(chain).toHaveBeenCalledTimes(1);
+    expect(chain.mock.calls[0]![1]).toMatchObject({ kind: 'rate', transient: false, sourceTurnId: TURN, worker });
+    expect(sessionReply.mock.calls.filter(call => String(call[1]).includes('<at id=ou_owner>'))).toHaveLength(0);
+    expect(fallbackReplies(sessionReply)).toHaveLength(0);
+  });
+
+  it('marks a rate limit without a provider reset time as transient', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const chain = vi.fn(() => true);
+    setupChain(sessionReply, chain);
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'screen_update', content: '429', status: 'limited', turnId: TURN,
+      usageLimit: { ...limit('rate'), retryLabel: '5-10 min' },
+    });
+    await flush();
+
+    expect(chain.mock.calls[0]![1]).toMatchObject({ kind: 'rate', transient: true });
+  });
+
+  it('keeps the existing notice and handoff when the chain declines', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const chain = vi.fn(() => false);
+    setupChain(sessionReply, chain);
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', { type: 'screen_update', content: 'quota', status: 'limited', usageLimit: limit('usage'), turnId: TURN });
+    await flush();
+
+    expect(chain).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls.filter(call => String(call[1]).includes('<at id=ou_owner>'))).toHaveLength(1);
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+  });
+
+  it('runs the handed-back notice only while the same limit is still active', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const chain = vi.fn((..._args: any[]) => true);
+    setupChain(sessionReply, chain);
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'screen_update', content: 'quota', status: 'limited', usageLimit: limit('usage'), turnId: TURN });
+    await flush();
+    const ownerNotices = () => sessionReply.mock.calls.filter(call => String(call[1]).includes('<at id=ou_owner>'));
+
+    const { fallThrough } = chain.mock.calls[0]![1];
+    clearUsageLimitState(ds);
+    ds.lastScreenStatus = 'working';
+    fallThrough();
+    await flush();
+    expect(ownerNotices()).toHaveLength(0);
+    expect(fallbackReplies(sessionReply)).toHaveLength(0);
+
+    worker.emit('message', { type: 'screen_update', content: 'quota', status: 'limited', usageLimit: limit('usage'), turnId: TURN });
+    await flush();
+    chain.mock.calls.at(-1)![1].fallThrough();
+    await flush();
+    expect(ownerNotices()).toHaveLength(1);
+    expect(fallbackReplies(sessionReply)).toHaveLength(1);
+  });
+
+  it('cancels a waiting same-CLI retry when the user stops the turn', () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    setupChain(sessionReply, vi.fn(() => true));
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    const fired = vi.fn();
+    ds.quotaFallbackChainRetries = { logicalTurnId: TURN, attempts: 1, timer: setTimeout(fired, 60_000) };
+
+    sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' } as any);
+
+    expect(ds.quotaFallbackChainRetries).toBeUndefined();
+  });
+
+  it('treats a TraeX quota failure terminal as a usage limit', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const chain = vi.fn(() => true);
+    setupChain(sessionReply, chain);
+    const worker = fakeWorker();
+    const ds = makeDs({ worker, workerPort: 9999 });
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', {
+      type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: TURN,
+      status: 'failed', errorCode: 'traex_usage_limit_exceeded',
+    });
+    await flush();
+
+    expect(chain).toHaveBeenCalledTimes(1);
+    expect(chain.mock.calls[0]![1]).toMatchObject({ kind: 'usage', sourceTurnId: TURN, worker });
   });
 });

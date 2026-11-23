@@ -160,6 +160,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('backend-type'),
   // card-prefs：任意子集的 per-bot 行为布尔 / prompt 字符串。
   putBotConfig('card-prefs'),
+  // quota-fallback-chain：`{ enabled, kinds, steps: [{ cliId, model? }] }`，同 Bot 额度耗尽切换 CLI / 模型。
+  putBotConfig('quota-fallback-chain', { kind: 'json', maxBytes: 16 * 1024 }),
   // substitute-mode：`{ enabled, targets, disclosure }`。
   putBotConfig('substitute-mode'),
   // substitute-targets/resolve：只预览解析单个 target、不落盘，供 dashboard 自动补全。

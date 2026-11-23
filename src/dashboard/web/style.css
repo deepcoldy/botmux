@@ -22868,6 +22868,31 @@ dialog select[multiple]:hover:not(:disabled) {
   }
 }
 
+.bot-defaults-page .bd-quota-chain-list {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-quota-chain-row {
+  display: grid;
+  grid-template-columns: 1.5em minmax(0, 1fr) minmax(0, 1.4fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.bot-defaults-page .bd-quota-chain-head,
+.bot-defaults-page .bd-quota-chain-index {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.bot-defaults-page .bd-quota-chain-index {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .bot-defaults-page .bd-substitute-target-list {
   display: grid;
   gap: 8px;

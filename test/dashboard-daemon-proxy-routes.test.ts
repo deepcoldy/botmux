@@ -55,6 +55,7 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/read-isolation', '/api/bot-read-isolation', 'raw'],
   ['PUT', '/api/bots/cli_a/backend-type', '/api/bot-backend-type', 'raw'],
   ['PUT', '/api/bots/cli_a/card-prefs', '/api/bot-card-prefs', 'raw'],
+  ['PUT', '/api/bots/cli_a/quota-fallback-chain', '/api/bot-quota-fallback-chain', 'json'],
   ['PUT', '/api/bots/cli_a/substitute-mode', '/api/bot-substitute-mode', 'raw'],
   ['POST', '/api/bots/cli_a/substitute-targets/resolve', '/api/bot-substitute-targets/resolve', 'raw'],
   ['PUT', '/api/bots/cli_a/summary-range', '/api/bot-summary-range', 'raw'],

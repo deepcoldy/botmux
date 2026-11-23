@@ -939,6 +939,11 @@ export interface DaemonSession {
    * target lookup from posting after this episode cleared and a same-key later
    * episode started. Cross-session duplicate events use a daemon-wide TTL. */
   quotaFallbackAttemptToken?: string;
+  /** A same-bot quota fallback chain switch is in flight. In-memory only. */
+  quotaFallbackChainSwitching?: boolean;
+  /** Same-CLI retries spent on one logical turn's transient rate limits before
+   * the chain switches. In-memory only. */
+  quotaFallbackChainRetries?: { logicalTurnId: string; attempts: number; timer?: NodeJS.Timeout };
   /** Host-managed Antigravity account alias active when this session's CLI spawned. */
   antigravityAccountId?: string;
   /** In-flight and per-turn state for Antigravity quota-limit auto-rotation. */

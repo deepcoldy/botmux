@@ -1325,6 +1325,9 @@ export interface Session {
   modelPin?: import('./core/model-pin.js').ModelPin;
   /** Retained Auto-model selection for the exact native conversation. */
   traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
+  /** Step of the bot's quota fallback chain this session moved to. Its model
+   * outranks every other launch-model source while its CLI is the session's. */
+  quotaFallback?: import('./services/quota-fallback-chain.js').QuotaFallbackSessionState;
   /** Group defaults at topic creation; absent on legacy sessions. */
   groupDefaultModels?: import('./core/group-default-models.js').GroupDefaultModels;
   /** Optional reasoning effort frozen at creation (per-turn API override).
