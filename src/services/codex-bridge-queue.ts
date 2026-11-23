@@ -20,8 +20,10 @@
  *   - mark()           — push a pending turn anchored to Lark fingerprint.
  *   - ingest(events)   —
  *       * 'user' event: first classify it — does it START the head pending
- *         turn (fingerprint match, not tooOld) or SYNTHESISE a local turn
- *         (adopt-only)? Only a 'user' event that does one of those triggers
+ *         turn (fingerprint match, not tooOld), START a later pending turn
+ *         whose whole input it is (adopt-only, passing heads that never
+ *         reached the CLI), or SYNTHESISE a local turn (adopt-only)? Only a
+ *         'user' event that does one of those triggers
  *         HOL-block-drop: if a turn is still collecting with no finalText,
  *         discard it. Codex 0.134.0 type-ahead is an active-turn STEER: a
  *         queued message typed while a tool-running turn is in flight gets
@@ -45,6 +47,11 @@ import { createHash } from 'node:crypto';
 
 function exactInputHash(text: string): string {
   return createHash('sha256').update(text.replace(/\r\n?/g, '\n'), 'utf8').digest('hex');
+}
+
+/** Digest of a mark's whole normalised input; see CodexPendingTurn.wholeInputHash. */
+export function wholeInputHash(text: string): string {
+  return createHash('sha256').update(normaliseForFingerprint(text), 'utf8').digest('hex');
 }
 
 const UNMATCHED_REPLAY_WINDOW_MS = 5_000;
@@ -80,11 +87,17 @@ export interface CodexPendingTurn {
   restoredFromJournal?: boolean;
   started: boolean;
   contentFingerprint?: string;
-  /** Full normalised mark, retained in memory only for Doubao's native request
-   * row ownership. A shared 30-char session prefix cannot distinguish an old
-   * retry from the next input; restart journals deliberately keep only the
-   * existing fingerprint/hash fields, so restored turns fail closed here. */
+  /** Full normalised mark, retained in memory only. Doubao's native request
+   * row ownership uses it, and so does whole-input attribution: a shared
+   * 30-char prefix cannot tell an old retry from the next input, nor two
+   * messages that open with the same link. Restart journals deliberately keep
+   * only the existing fingerprint/hash fields, so restored turns fail closed
+   * here and fall back to the head-only fingerprint match. */
   nativeInputText?: string;
+  /** Digest of the full normalised mark. Unlike nativeInputText it survives a
+   * restart journal (no prompt text is persisted), so a restored mark can
+   * still prove a later record is its whole input. */
+  wholeInputHash?: string;
   /** Digest of the full written input for driver-proved input aliases.
    * The historical prefix fingerprint alone cannot prove a rewritten skill
    * input whose arguments differ after its first 30 characters. Persist the
@@ -112,6 +125,14 @@ export interface CodexPendingTurn {
    *  back. While the mark remains unstarted, unmatched terminals are dropped
    *  rather than buffered back onto it. */
   taskStartedRollbackAtMs?: number;
+  /** A later mark's whole input reached the transcript while this one never
+   *  started. The CLI takes input in submit order, so this input is presumed
+   *  not coming (an unknown slash command, input swallowed by a modal). It
+   *  claims no start by fingerprint, holds no lease and keeps nothing busy;
+   *  expiry retires it, with its usual notice, once no started turn is
+   *  running and its own submit verification has run out. A positive submit
+   *  receipt, or its own whole-input record, takes the presumption back. */
+  passedBySuccessor?: true;
   /** Wall-clock millis when an authoritative adapter/history check confirmed
    *  the submit. Unverified writes deliberately leave this unset. */
   submitConfirmedAtMs?: number;
@@ -165,7 +186,7 @@ export interface CodexPendingTurn {
   supersededTurns?: Array<Pick<CodexPendingTurn, 'turnId' | 'dispatchAttempt'>>;
   /** This input reached the CLI as a confirmed same-turn steer: Codex pulled
    * it into the execution already running, so the model answers it in the
-   * middle of that work (see setSteerReplyObserver). */
+   * middle of that work (see CodexMidTurnReplyCollector). */
   steeredMidTurn?: boolean;
   /** True when the turn was delivered via Codex RPC (turn/start) and the
    *  app-server has acknowledged it. RPC turns have no local transcript to
@@ -215,37 +236,52 @@ function rolloutLinePath(uuid: string): string | undefined {
 }
 
 /**
- * The answer to an input Codex pulled into the running execution (a
- * same-turn steer). Fed the 'cot' records attributed to that input's turn in
- * order, it keeps the first assistant message(s) and reports them once the
- * model moves on to a tool call: the model answered and went back to work.
- * A message the turn simply ends with is its final answer, which the turn's
- * own reply already carries, so that never completes here. A tool record
- * written before the answer (a deferred shell call surfacing at the turn's
- * end) is not the model moving on.
+ * What the model says to a Lark turn in the middle of its work. Fed the 'cot'
+ * records attributed to one turn in order, it collects each run of assistant
+ * messages and reports it once the model moves on to a tool call: it said
+ * something and went back to work. A message the turn simply ends with is its
+ * final answer, which the turn's own reply already carries, so that never
+ * completes here. Only a record of the model calling a tool counts: not one
+ * written before the message (a deferred shell call surfacing at the turn's
+ * end), and not a command's completion record, which can land after the final
+ * message or belong to an earlier execution.
+ *
+ * The first report of a turn that started as a same-turn steer
+ * (`steeredMidTurn`: Codex pulled the input into the execution already
+ * running) is the answer to that input; every other report is progress.
  */
-export class CodexSteerReplyCollector {
-  private readonly run: Array<{ text: string; uuid: string; offset?: number; path?: string }> = [];
-  private done = false;
+export class CodexMidTurnReplyCollector {
+  private run: Array<{ text: string; uuid: string; timestampMs: number; offset?: number; path?: string }> = [];
+  private reported = false;
 
-  /** Feed the next record; returns the reply exactly once, when complete. */
-  feed(ev: CodexBridgeEvent): { text: string; lastUuid: string } | undefined {
-    if (this.done) return undefined;
+  constructor(private readonly turn: Pick<CodexPendingTurn, 'steeredMidTurn'>) {}
+
+  /** Feed the next record; returns each completed run exactly once.
+   *  `saidAtMs` is the transcript time of the run's last message. */
+  feed(ev: CodexBridgeEvent): { text: string; lastUuid: string; saidAtMs: number; answersSteer: boolean } | undefined {
     const message = ev.assistantMessage?.trim();
     if (message) {
-      this.run.push({ text: message, uuid: ev.uuid,
+      this.run.push({ text: message, uuid: ev.uuid, timestampMs: ev.timestampMs,
         offset: ev.rolloutOffset ?? rolloutLineOffset(ev.uuid),
         path: ev.rolloutPath ?? rolloutLinePath(ev.uuid) });
       return undefined;
     }
-    const toolCall = ev.toolCallBoundary === true || ev.cotEntries?.some(entry => entry.kind === 'tool_call');
+    const toolCall = ev.toolCompletion !== true
+      && (ev.toolCallBoundary === true || ev.cotEntries?.some(entry => entry.kind === 'tool_call'));
     if (this.run.length === 0 || !toolCall) return undefined;
     const at = ev.rolloutOffset ?? rolloutLineOffset(ev.uuid);
     const path = ev.rolloutPath ?? rolloutLinePath(ev.uuid);
-    const answered = this.run[this.run.length - 1];
-    if (path === answered.path && at !== undefined && answered.offset !== undefined && at < answered.offset) return undefined;
-    this.done = true;
-    return { text: this.run.map(part => part.text).join('\n\n'), lastUuid: this.run[this.run.length - 1].uuid };
+    const said = this.run[this.run.length - 1];
+    if (path === said.path && at !== undefined && said.offset !== undefined && at < said.offset) return undefined;
+    const reply = {
+      text: this.run.map(part => part.text).join('\n\n'),
+      lastUuid: said.uuid,
+      saidAtMs: said.timestampMs,
+      answersSteer: !this.reported && this.turn.steeredMidTurn === true,
+    };
+    this.run = [];
+    this.reported = true;
+    return reply;
   }
 }
 
@@ -266,14 +302,17 @@ export class CodexBridgeQueue {
    * any CoT on the successor. Let the UI close that exact abandoned timeline;
    * this notification is not evidence that the work completed. */
   private cotSupersededObserver?: (turn: CodexPendingTurn) => void;
-  /** Read-only observer for each 'cot' record attributed to a turn that
-   * started as a same-turn steer — what the model writes and calls while it
-   * answers that input mid-execution. Never affects attribution. */
-  private steerReplyObserver?: (ev: CodexBridgeEvent, turn: CodexPendingTurn) => void;
+  /** Read-only observer for each 'cot' record attributed to a started turn —
+   * what the model writes and calls in the middle of its work (see
+   * CodexMidTurnReplyCollector). Never affects attribution. */
+  private midTurnReplyObserver?: (ev: CodexBridgeEvent, turn: CodexPendingTurn) => void;
   /** A Lark turn's own user record reached the transcript: the CLI has its
    *  input. Never affects attribution; exceptions are swallowed. */
   private turnStartObserver?: (turn: CodexPendingTurn) => void;
   private localTurnsEnabled = false;
+  /** See wholeInputSuccessor. Off unless the worker enables it for a driver
+   *  whose transcript timestamps and submit order it trusts. */
+  private wholeInputPassing = false;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
   /** Lower bound (ms) for synthesising local turns — protects against a
@@ -295,6 +334,86 @@ export class CodexBridgeQueue {
     }
     return !turn.contentFingerprint
       || normaliseForFingerprint(event.text).includes(turn.contentFingerprint);
+  }
+
+  /** Whole-input equality: the transcript user record is exactly what was
+   *  written for this mark. Stronger than the fingerprint (a 30-char prefix
+   *  found anywhere in the record), which two messages opening with the same
+   *  link both pass. Driver-proved aliases are already exact. A restored mark
+   *  has only its digest (older journals: nothing, and it never matches). */
+  private exactlyMatchesUserInput(turn: CodexPendingTurn, event: CodexBridgeEvent): boolean {
+    if (event.inputTextAliases !== undefined) return this.matchesUserInput(turn, event);
+    if (turn.nativeInputText) return normaliseForFingerprint(event.text) === turn.nativeInputText;
+    return !!turn.wholeInputHash && wholeInputHash(event.text) === turn.wholeInputHash;
+  }
+
+  /** A mark the CLI may still deliver: never passed over. */
+  private mayStillArrive(turn: CodexPendingTurn): boolean {
+    return turn.rpcActive === true
+      || turn.cliQueuedAtMs !== undefined
+      || turn.inputDeliveryQuarantined === true
+      || turn.submitConfirmedAtMs !== undefined
+      || turn.finalText !== undefined;
+  }
+
+  /** Adopt mode only: the later unstarted mark whose whole input this user
+   *  record is, and the unstarted marks it passes.
+   *
+   *  The CLI takes input in submit order, so when a later input's own record
+   *  arrives, earlier inputs that never started never reached it (an unknown
+   *  slash command, input swallowed by a modal). In adopt mode an unmatched
+   *  record becomes a local turn: without passing, the later input's reply
+   *  posts as a terminal turn and its own mark expires with a "not collected"
+   *  notice; and when the head shares the record's 30-char opening (every Lark
+   *  wiki link does), the head claims a reply to an input it never sent.
+   *
+   *  Only whole-input equality passes, never the fingerprint. Nothing passes
+   *  a mark the CLI may still deliver (RPC-active, CLI-queued, quarantined,
+   *  submit-confirmed), and a record older than the later mark cannot be that
+   *  mark's input. Identical texts keep FIFO order. Non-adopt sessions keep
+   *  their buffer instead: the record replays once the dead heads expire. */
+  private wholeInputSuccessor(
+    ev: CodexBridgeEvent,
+    alsoPassing: readonly CodexPendingTurn[] = [],
+  ): { mark: CodexPendingTurn; ahead: CodexPendingTurn[] } | undefined {
+    if (!this.localTurnsEnabled || !this.wholeInputPassing) return undefined;
+    const unstarted = this.queue.filter(turn => !turn.started && !turn.passedBySuccessor);
+    const index = unstarted.findIndex(turn => turn.finalText === undefined
+      && this.exactlyMatchesUserInput(turn, ev));
+    // The head itself is a successor only to a start claim being passed.
+    if (index < 0 || (index === 0 && alsoPassing.length === 0)) return undefined;
+    const mark = unstarted[index];
+    const ahead = unstarted.slice(0, index);
+    if (mark.markTimeMs !== undefined && ev.timestampMs < mark.markTimeMs) return undefined;
+    if ([...alsoPassing, ...ahead].some(turn => this.mayStillArrive(turn))) return undefined;
+    return { mark, ahead };
+  }
+
+  /** Which unstarted mark a transcript user record starts: the head by its
+   *  fingerprint, unless (adopt with passing) a later mark is its whole input,
+   *  or a passed mark's own whole input arrives after all. */
+  private userRecordOwner(ev: CodexBridgeEvent): { next?: CodexPendingTurn; passed: CodexPendingTurn[] } {
+    const head = this.queue.find(turn => !turn.started && !turn.passedBySuccessor);
+    if (head && this.exactlyMatchesUserInput(head, ev)) return { next: head, passed: [] };
+    const successor = this.wholeInputSuccessor(ev);
+    if (successor) return { next: successor.mark, passed: successor.ahead };
+    const revived = this.localTurnsEnabled && this.wholeInputPassing
+      ? this.queue.find(turn => turn.passedBySuccessor && !turn.started && turn.finalText === undefined
+        && !(turn.markTimeMs !== undefined && ev.timestampMs < turn.markTimeMs)
+        && this.exactlyMatchesUserInput(turn, ev))
+      : undefined;
+    return { next: revived ?? head, passed: [] };
+  }
+
+  /** A turn that starts behind passed marks moves ahead of them:
+   *  drainEmittable stops at the first unstarted turn, so leaving it behind a
+   *  passed mark would hold its reply until that mark expires. */
+  private moveAheadOfUnstarted(turn: CodexPendingTurn): void {
+    const firstUnstarted = this.queue.findIndex(candidate => !candidate.started);
+    const at = this.queue.indexOf(turn);
+    if (firstUnstarted < 0 || at < firstUnstarted) return;
+    this.queue.splice(at, 1);
+    this.queue.splice(firstUnstarted, 0, turn);
   }
 
   private isClosedNativeTurn(sourceSessionId: string | undefined, sourceTurnId: string): boolean {
@@ -433,6 +552,14 @@ export class CodexBridgeQueue {
   /** Toggle adopt-mode local-turn synthesis. `lowerBoundMs` (typically
    *  Date.now() at adopt-time) protects against a fresh-empty attach
    *  feeding historical user_messages back as "live" local turns. */
+  /** Allow adopt-mode whole-input passing (see wholeInputSuccessor). Only for
+   *  drivers that write each user record when the CLI takes the input, with
+   *  its own clock: a reader that stamps records at read time cannot tell an
+   *  old identical record from the new input. */
+  setWholeInputPassing(enabled: boolean): void {
+    this.wholeInputPassing = enabled;
+  }
+
   setLocalTurns(enabled: boolean, lowerBoundMs: number = this.now()): void {
     this.localTurnsEnabled = enabled;
     this.localLowerBoundMs = lowerBoundMs;
@@ -495,6 +622,7 @@ export class CodexBridgeQueue {
       started: false,
       contentFingerprint: makeFingerprint(message),
       nativeInputText: normaliseForFingerprint(message),
+      wholeInputHash: wholeInputHash(message),
       ...(requireExactInput || /^[ \t]*(?:[/$]|\[\$)/.test(message) ? { inputTextHash: exactInputHash(message) } : {}),
       markTimeMs,
       recoveryJsonlPathAtMark: recoveryCursorAtMark?.jsonlPath,
@@ -511,6 +639,7 @@ export class CodexBridgeQueue {
     turnId: string;
     fingerprint: string;
     inputTextHash?: string;
+    wholeInputHash?: string;
     markTimeMs: number;
     linkRefMode?: 'observe' | 'enabled';
     jsonlPath?: string;
@@ -531,6 +660,7 @@ export class CodexBridgeQueue {
         ...(entry.linkRefMode ? { linkRefMode: entry.linkRefMode } : {}),
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
         ...(entry.inputTextHash ? { inputTextHash: entry.inputTextHash } : {}),
+        ...(entry.wholeInputHash ? { wholeInputHash: entry.wholeInputHash } : {}),
         recoveryJsonlPathAtMark: entry.jsonlPath,
         recoveryOffsetAtMark: entry.offsetAtMark,
         ...(entry.mergedExecution ? {
@@ -608,6 +738,22 @@ export class CodexBridgeQueue {
       // from local observation time, so expiring anything before that boundary
       // would drop valid queued work.
       if (this.queue.some(turn => turn.started && turn.finalText === undefined)) break;
+
+      // A passed mark's input is presumed not coming (a later input already
+      // started), so its attribution lease no longer applies. Retire it
+      // wherever it sits: a later mark whose start was rolled back can be
+      // ahead of it and must not hold its notice behind that mark's lease.
+      // Only an in-flight submit check may still prove it arrived.
+      const passed = this.queue.find(turn => turn.passedBySuccessor
+        && !turn.started && turn.finalText === undefined
+        && !(turn.submitVerificationStartedAtMs !== undefined
+          && nowMs - turn.submitVerificationStartedAtMs <= STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS));
+      if (passed) {
+        const removed = this.dropPendingTurn(passed.turnId, passed.dispatchAttempt);
+        if (!removed) break;
+        dropped.push(removed);
+        continue;
+      }
 
       const head = this.queue.find(turn => !turn.started && turn.finalText === undefined);
       if (!head) break;
@@ -714,6 +860,8 @@ export class CodexBridgeQueue {
       && candidate.dispatchAttempt === dispatchAttempt
       && candidate.finalText === undefined);
     if (!turn) return false;
+    // The CLI did take this input after all: its record is coming.
+    turn.passedBySuccessor = undefined;
     turn.submitVerificationStartedAtMs = undefined;
     turn.unconfirmedAttributionStartedAtMs = undefined;
     turn.submitConfirmedAtMs = confirmedAtMs;
@@ -847,7 +995,7 @@ export class CodexBridgeQueue {
   ): { turnId: string; dispatchAttempt?: number } | undefined {
     const normalisedText = normaliseForFingerprint(text);
     const candidates = this.queue.filter(turn => {
-      if (turn.isLocal || turn.finalText !== undefined) return false;
+      if (turn.isLocal || turn.finalText !== undefined || turn.passedBySuccessor) return false;
       if (turn.markTimeMs !== undefined
         && timestampMs < turn.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS) return false;
       // Doubao's request-row parking needs the complete mark, not the shared
@@ -888,6 +1036,8 @@ export class CodexBridgeQueue {
       if (turn.started) return true;
       if (turn.rpcActive) return true;
       if (turn.cliQueuedAtMs !== undefined) return true;
+      // Its input is not coming: nothing the CLI does can still be this turn.
+      if (turn.passedBySuccessor) return false;
       const confirmed = turn.submitConfirmedAtMs !== undefined
         && nowMs - turn.submitConfirmedAtMs <= STRUCTURED_SUBMIT_START_GRACE_MS;
       const verifying = turn.submitVerificationStartedAtMs !== undefined
@@ -913,6 +1063,7 @@ export class CodexBridgeQueue {
         return leases.filter(remaining => remaining >= 0);
       }
       if (candidate.started) return [];
+      if (candidate.passedBySuccessor) return [];
       if (candidate.submitConfirmedAtMs !== undefined) {
         leases.push(STRUCTURED_SUBMIT_START_GRACE_MS - (nowMs - candidate.submitConfirmedAtMs));
       }
@@ -932,8 +1083,8 @@ export class CodexBridgeQueue {
     this.cotSupersededObserver = fn;
   }
 
-  setSteerReplyObserver(fn: (ev: CodexBridgeEvent, turn: CodexPendingTurn) => void): void {
-    this.steerReplyObserver = fn;
+  setMidTurnReplyObserver(fn: (ev: CodexBridgeEvent, turn: CodexPendingTurn) => void): void {
+    this.midTurnReplyObserver = fn;
   }
 
   setTurnStartObserver(fn: (turn: CodexPendingTurn) => void): void {
@@ -972,7 +1123,7 @@ export class CodexBridgeQueue {
    *  this process's clock for both successful and aborted predecessors. */
   private refreshNextPreStartLease(): void {
     const nextPending = this.queue.find(turn => !turn.started
-      && turn.finalText === undefined);
+      && turn.finalText === undefined && !turn.passedBySuccessor);
     if (!nextPending) return;
     // RPC turns keep their own rpcActive flag for lifecycle gating; do not
     // overwrite it with a bounded confirmation/attribution lease.
@@ -1064,13 +1215,15 @@ export class CodexBridgeQueue {
           return;
         }
       }
-      const next = this.queue.find(turn => !turn.started && turn.finalText === undefined);
+      const next = this.queue.find(turn => !turn.started && turn.finalText === undefined
+        && !turn.passedBySuccessor);
       if (!next) return;
       const tooOld = next.markTimeMs !== undefined
         && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
       if (tooOld) return;
       this.revalidateRestoredMerge(next, ev);
       next.started = true;
+      this.moveAheadOfUnstarted(next);
       next.submitVerificationStartedAtMs = undefined;
       next.unconfirmedAttributionStartedAtMs = undefined;
       next.provisionalTaskStartedAtMs = this.now();
@@ -1087,7 +1240,7 @@ export class CodexBridgeQueue {
       // One accepted input per marker, in submit order. Never starts the
       // head: the work still running belongs to an earlier turn.
       const next = this.queue.find(turn => !turn.started && turn.finalText === undefined
-        && turn.cliQueuedAtMs === undefined && !turn.rpcActive);
+        && turn.cliQueuedAtMs === undefined && !turn.rpcActive && !turn.passedBySuccessor);
       if (!next) return;
       if (next.markTimeMs !== undefined
         && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS) return;
@@ -1119,8 +1272,8 @@ export class CodexBridgeQueue {
         && target.recoveryOffsetAtMark !== undefined
         && ev.progressCursor.offset < target.recoveryOffsetAtMark) return;
       if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
-      if (target.steeredMidTurn && this.steerReplyObserver) {
-        try { this.steerReplyObserver(ev, target); } catch { /* observer channel — never break attribution */ }
+      if (this.midTurnReplyObserver) {
+        try { this.midTurnReplyObserver(ev, target); } catch { /* observer channel — never break attribution */ }
       }
       if (this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
@@ -1144,7 +1297,14 @@ export class CodexBridgeQueue {
       if (provisional) {
         const collectingTooOld = provisional.markTimeMs !== undefined
           && ev.timestampMs < provisional.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
-        const collectingFingerprintOk = this.matchesUserInput(provisional, ev);
+        // Adopt: another unstarted mark is this record's whole input, so the
+        // native start belongs to that input and the claim sits on one that
+        // never arrived. A prefix-only match (both open with the same link)
+        // must not corroborate the claim then; the rollback below lets the
+        // claimed head be passed.
+        const wholeInputElsewhere = this.wholeInputSuccessor(ev, [provisional]) !== undefined;
+        const collectingFingerprintOk = this.matchesUserInput(provisional, ev)
+          && (this.exactlyMatchesUserInput(provisional, ev) || !wholeInputElsewhere);
         if (!collectingTooOld && collectingFingerprintOk) {
           provisional.transcriptStartTimeMs = ev.timestampMs;
           provisional.sourceMessageId = ev.sourceMessageId;
@@ -1185,9 +1345,10 @@ export class CodexBridgeQueue {
         && turn.sourceTurnId === ev.sourceTurnId)) return;
       // First decide whether this user event is a REAL turn-start: either it
       // matches the head pending Lark turn's fingerprint (and isn't tooOld),
-      // or — in adopt mode — it synthesises a local turn. Both the HOL-drop
-      // and the actual start key off this decision.
-      const next = this.queue.find(t => !t.started);
+      // or a later mark's whole input (passing a head that never arrived, see
+      // userRecordOwner), or — in adopt mode — it synthesises a local turn.
+      // Both the HOL-drop and the actual start key off this decision.
+      const { next, passed } = this.userRecordOwner(ev);
       const tooOld = !!next && next.markTimeMs !== undefined && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
       let fingerprintOk = true;
       if (next) fingerprintOk = this.matchesUserInput(next, ev);
@@ -1245,6 +1406,9 @@ export class CodexBridgeQueue {
 
       if (willStartNext) {
         next!.started = true;
+        next!.passedBySuccessor = undefined;
+        for (const turn of passed) turn.passedBySuccessor = true;
+        this.moveAheadOfUnstarted(next!);
         next!.submitVerificationStartedAtMs = undefined;
         next!.unconfirmedAttributionStartedAtMs = undefined;
         next!.cliQueuedAtMs = undefined;

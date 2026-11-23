@@ -429,7 +429,7 @@ import {
   SESSION_ID_FILENAME_RE,
   type PidFollowResult,
 } from './services/bridge-rotation-policy.js';
-import { CodexBridgeQueue, CodexSteerReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexMidTurnReplyCollector, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
 import {
   BridgeBlindTurnWatch,
@@ -10724,21 +10724,29 @@ codexBridgeQueue.setCotObserver((entries, turn) => {
 codexBridgeQueue.setTurnStartObserver((turn) => {
   if (!turn.isLocal) inflightInputs.onTurnStarted(turn.turnId);
 });
-// Codex same-turn steer: answer the steered Lark message as soon as the model
-// answers it and goes back to work, quoting it. The final answer still comes
+// Codex mid-turn replies: whenever the model says something to a Lark turn and
+// goes back to work, post it under that message — progress, or for a same-turn
+// steer first the answer to the steered message. The final answer still comes
 // with the turn's own reply.
-const codexSteerReplyCollectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
-function observeCodexSteerReply(ev: CodexBridgeEvent, turn: CodexPendingTurn): void {
+const codexMidTurnReplyCollectors = new WeakMap<CodexPendingTurn, CodexMidTurnReplyCollector>();
+function observeCodexMidTurnReply(ev: CodexBridgeEvent, turn: CodexPendingTurn): void {
   if (!followUpReplyEnabled() || !structuredBridgeIs('codex') || turn.isLocal) return;
-  // Under `botmux send` the model may already have sent this answer itself.
+  // Under `botmux send` the model may already have sent this itself.
   if (lastInitConfig?.adoptMode !== true && replyDeliveryMode() !== 'transcript') return;
-  let collector = codexSteerReplyCollectors.get(turn);
+  let collector = codexMidTurnReplyCollectors.get(turn);
   if (!collector) {
-    collector = new CodexSteerReplyCollector();
-    codexSteerReplyCollectors.set(turn, collector);
+    collector = new CodexMidTurnReplyCollector(turn);
+    codexMidTurnReplyCollectors.set(turn, collector);
   }
   const reply = collector.feed(ev);
   if (!reply) return;
+  // Said before this worker started: a restart replaying the turn, whose
+  // earlier generation may already have posted it.
+  if (reply.saidAtMs < WORKER_STARTED_AT_MS) return;
+  // Likewise a steer taken before this worker started may already have its
+  // answer posted; what this generation sees of that turn is progress.
+  const answersSteer = reply.answersSteer
+    && turn.transcriptStartTimeMs !== undefined && turn.transcriptStartTimeMs >= WORKER_STARTED_AT_MS;
   send({
     type: 'absorbed_reply',
     turnId: turn.turnId,
@@ -10746,10 +10754,13 @@ function observeCodexSteerReply(ev: CodexBridgeEvent, turn: CodexPendingTurn): v
     answer: reply.text,
     replyUuid: reply.lastUuid,
     source: 'text',
+    ...(answersSteer ? {} : { progress: true as const }),
   });
-  log(`Steered turn ${turn.turnId.substring(0, 8)} answered live (${reply.text.length} chars)`);
+  log(answersSteer
+    ? `Steered turn ${turn.turnId.substring(0, 8)} answered live (${reply.text.length} chars)`
+    : `Turn ${turn.turnId.substring(0, 8)} progress posted live (${reply.text.length} chars)`);
 }
-codexBridgeQueue.setSteerReplyObserver(observeCodexSteerReply);
+codexBridgeQueue.setMidTurnReplyObserver(observeCodexMidTurnReply);
 codexBridgeQueue.setCotSupersededObserver((turn) => {
   if (!sessionId || turn.isLocal) return;
   const ownsThinking = thinkingTurn?.turnId === turn.turnId
@@ -26815,6 +26826,10 @@ async function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 
     const adoptStartMs = Date.now();
     codexAdoptStartMs = adoptStartMs;
     codexBridgeQueue.setLocalTurns(true, adoptStartMs);
+    // Codex writes each user record when it takes the input, in submit order
+    // and with its own clock: a later input's record proves earlier marks
+    // that never started will not arrive (see wholeInputSuccessor).
+    codexBridgeQueue.setWholeInputPassing(true);
     let rolloutPath: string | undefined;
     const terminalSession = backend ? await refreshCodexTerminalSession(backend) : undefined;
     const initialSessionId = terminalSession?.kind === 'terminal' ? terminalSession.sessionId

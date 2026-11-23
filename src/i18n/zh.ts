@@ -2604,6 +2604,7 @@ export const messages: Record<string, string> = {
   'card.btw_answer': '💬 /btw 旁路回答',
   'card.absorbed_reply': '💬 对追问的回复（主任务仍在继续）',
   'card.absorbed_reply_thinking': '💭 对追问的思考摘要（主任务仍在继续）',
+  'card.mid_turn_progress': '⏳ 中途进展（任务仍在继续）',
   'card.btw_answer_truncated': '_（回答过长，已截断，完整内容见 Web 终端）_',
   'card.btw_answer_from_screen': '_（从终端屏幕读取，较长的回答可能不完整）_',
   'card.local_turn_resumed': '🖥️ 终端本地对话续传（daemon 重启时模型正在输出）',

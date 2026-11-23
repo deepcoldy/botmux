@@ -16,7 +16,9 @@ export function checkpointCodexAdoptTurns(
     ? offsetAtMark
     : 0;
   const entries = queue.peek().flatMap(turn => {
-    if (turn.isLocal || turn.dispatchAttempt !== undefined
+    // A passed mark's input is presumed lost; restoring it would replay the
+    // transcript from its old cursor and re-deliver what passed it.
+    if (turn.isLocal || turn.dispatchAttempt !== undefined || turn.passedBySuccessor
       || turn.markTimeMs === undefined || !turn.contentFingerprint) return [];
     // Capture the cursor on the FIRST checkpoint for this pending turn. Later
     // checkpoints can run after its user/progress records were ingested, so
@@ -42,6 +44,7 @@ export function checkpointCodexAdoptTurns(
       ...(nativeUserProof ? { nativeUserProof } : {}),
       fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath,
       ...(turn.inputTextHash ? { inputTextHash: turn.inputTextHash } : {}),
+      ...(turn.wholeInputHash ? { wholeInputHash: turn.wholeInputHash } : {}),
       ...(turn.linkRefMode ? { linkRefMode: turn.linkRefMode } : {}),
       ...(turn.sourceTurnId && supersededTurnIds?.length ? { mergedExecution: {
         sourceTurnId: turn.sourceTurnId,

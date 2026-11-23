@@ -27754,9 +27754,11 @@ function setupWorkerHandlers(
       case 'absorbed_reply': {
         // The answer to a Lark message the CLI folded into its running turn
         // (Claude Code adopt: a mid-turn system reminder; Codex: a same-turn
-        // steer), posted as soon as the model answered it. Replied under that
-        // message, which the reply quotes, so the card omits the question.
-        // Presentation only: the turn's lifecycle is unchanged.
+        // steer), posted as soon as the model answered it — or, with
+        // `progress` (Codex), what the model said to that turn mid-work.
+        // Replied under that message, which the reply quotes, so the card
+        // omits the question. Presentation only: the turn's lifecycle is
+        // unchanged.
         if (!ds.adoptedFrom && effectiveCliId !== 'codex') {
           logger.warn(`[${t}] Ignored absorbed_reply from a session that cannot fold input`);
           break;
@@ -27781,7 +27783,8 @@ function setupWorkerHandlers(
           ? `${truncateUtf16WellFormed(msg.answer, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
           : msg.answer;
         const cardJson = buildContextualReplyCard({
-          title: tr(msg.source === 'thinking' ? 'card.absorbed_reply_thinking' : 'card.absorbed_reply', undefined, loc),
+          title: tr(msg.progress ? 'card.mid_turn_progress'
+            : msg.source === 'thinking' ? 'card.absorbed_reply_thinking' : 'card.absorbed_reply', undefined, loc),
           assistantText: repairReplyMarkdown(answer),
           assistantLabel: sessionCliDisplayName(ds, botCfg),
           recipientOpenId: daemonCardFooterRecipientOpenId(ds, effectiveCliId),
@@ -27790,15 +27793,37 @@ function setupWorkerHandlers(
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
         });
+        // Where the turn's own final goes: the inbound message captured for
+        // this turn, not the session's current reply target, which a later
+        // turn may have moved (a topic thread's root, or a newer quote).
+        const replyTarget = isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)
+          ? undefined
+          : frozenReplyContextForTurn(ds, fallbackTurnId(ds, msg.turnId)).target;
+        const uuid = absorbedReplyUuid(ds.session.sessionId, msg.turnId, msg.replyUuid);
+        if (msg.progress) {
+          // Progress is best effort: the turn's final does not wait for it,
+          // nor does a graceful shutdown, and a retry stops once the bot turns
+          // the option off or the turn's UI is suppressed.
+          const stillWanted = () => {
+            if (!ownsLifecycleMutation() || managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) return false;
+            try { return getBot(ds.larkAppId).config.followUpReply === true; } catch { return false; }
+          };
+          const result = await deliverWithRetry(
+            () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid, ...(replyTarget ? { replyTarget } : {}) }),
+            stillWanted,
+            (attempt, err) => logger.warn(`[${t}] Progress reply attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`),
+          );
+          if (!result.delivered) logger.warn(`[${t}] Progress reply for turn ${msg.turnId.substring(0, 8)} not delivered`);
+          break;
+        }
         // The worker sends this reply once. Retry it like a bridge final — a
         // daemon-owned delivery a graceful shutdown waits for — and let the
         // provider key keep an attempt whose response was lost from posting a
         // second copy.
-        const uuid = absorbedReplyUuid(ds.session.sessionId, msg.turnId, msg.replyUuid);
         const finishDelivery = beginFinalOutputDelivery(ds, msg.turnId);
         try {
           const result = await deliverWithRetry(
-            () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid }),
+            () => scopedReply(cardJson, 'interactive', msg.turnId, { uuid, ...(replyTarget ? { replyTarget } : {}) }),
             ownsLifecycleMutation,
             (attempt, err) => logger.warn(`[${t}] Follow-up reply attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`),
           );

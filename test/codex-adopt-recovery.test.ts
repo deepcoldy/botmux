@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { CodexBridgeQueue, CodexSteerReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
+import { CodexBridgeQueue, CodexMidTurnReplyCollector, type CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { splitCodexEventsByCutoff, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 import { checkpointCodexAdoptTurns, restoreCodexAdoptTurns } from '../src/services/codex-adopt-recovery.js';
 import { readBridgeTurnJournal } from '../src/services/bridge-turn-journal.js';
@@ -154,20 +154,20 @@ describe('adopted Codex turn recovery', () => {
     }]);
 
     const { queue } = restore([], 20_000);
-    const collectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
+    const collectors = new WeakMap<CodexPendingTurn, CodexMidTurnReplyCollector>();
     const replies: string[] = [];
-    queue.setSteerReplyObserver((ev, turn) => {
+    queue.setMidTurnReplyObserver((ev, turn) => {
       let collector = collectors.get(turn);
-      if (!collector) collectors.set(turn, collector = new CodexSteerReplyCollector());
+      if (!collector) collectors.set(turn, collector = new CodexMidTurnReplyCollector(turn));
       const reply = collector.feed(ev);
-      if (reply) replies.push(reply.text);
+      if (reply) replies.push(`${reply.answersSteer ? 'steer answer' : 'progress'}: ${reply.text}`);
     });
     queue.ingest([
       user('question', 11_000),
       { ...native, uuid: `${rollout}:200`, timestampMs: 20_000, kind: 'cot', text: '', cotEntries: [], assistantMessage: 'answer' },
       { ...native, uuid: `${rollout}:300`, timestampMs: 21_000, kind: 'cot', text: '', cotEntries: [], toolCallBoundary: true },
     ]);
-    expect(replies).toEqual(['answer']);
+    expect(replies).toEqual(['steer answer: answer']);
   });
 
   it.each([
@@ -185,13 +185,13 @@ describe('adopted Codex turn recovery', () => {
     checkpointCodexAdoptTurns(path, rollout, beforeRestart);
 
     const { queue } = restore([], 20_000);
-    const collectors = new WeakMap<CodexPendingTurn, CodexSteerReplyCollector>();
+    const collectors = new WeakMap<CodexPendingTurn, CodexMidTurnReplyCollector>();
     const replies: string[] = [];
-    queue.setSteerReplyObserver((ev, turn) => {
+    queue.setMidTurnReplyObserver((ev, turn) => {
       let collector = collectors.get(turn);
-      if (!collector) collectors.set(turn, collector = new CodexSteerReplyCollector());
+      if (!collector) collectors.set(turn, collector = new CodexMidTurnReplyCollector(turn));
       const reply = collector.feed(ev);
-      if (reply) replies.push(reply.text);
+      if (reply) replies.push(`${reply.answersSteer ? 'steer answer' : 'progress'}: ${reply.text}`);
     });
     const rebound = withNativeProof ? { sourceTurnId: 'native-new', sourceSessionId: 's' } as const : {};
     queue.ingest([
@@ -199,7 +199,8 @@ describe('adopted Codex turn recovery', () => {
       { ...rebound, uuid: `${rollout}:200`, timestampMs: 21_000, kind: 'cot', text: '', cotEntries: [], assistantMessage: 'ordinary interim narration' },
       { ...rebound, uuid: `${rollout}:300`, timestampMs: 22_000, kind: 'cot', text: '', cotEntries: [], toolCallBoundary: true },
     ]);
-    expect(replies).toEqual([]);
+    // Disarmed: what it says is the turn's progress, not a steer answer.
+    expect(replies).toEqual(['progress: ordinary interim narration']);
   });
 
   it('keeps this generation as the owner of an already marked message', () => {
@@ -293,5 +294,45 @@ describe('adopted Codex turn recovery', () => {
     const { history, live } = splitCodexEventsByCutoff(wallClockEvents, cutoff);
     expect(history).toHaveLength(0);
     expect(live).toHaveLength(2);
+  });
+});
+
+describe('adopted Codex recovery around a passed mark', () => {
+  const typo = '/cleat';
+  const ask = 'https://example.feishu.cn/wiki/AAA 看看压缩包能不能下载';
+  const adoptQueue = (now: number) => {
+    const queue = new CodexBridgeQueue(() => now);
+    queue.setLocalTurns(true, 9_000);
+    queue.setWholeInputPassing(true);
+    return queue;
+  };
+
+  it('never journals a passed mark, so a restart cannot replay what passed it', () => {
+    const queue = adoptQueue(12_000);
+    queue.mark('om_typo', typo, 10_000);
+    queue.mark('om_ask', ask, 10_500);
+    queue.ingest([event('user', 11_000, ask)]);
+    expect(queue.peek().find(turn => turn.turnId === 'om_typo')?.passedBySuccessor).toBe(true);
+    checkpointCodexAdoptTurns(path, rollout, queue);
+    expect(readBridgeTurnJournal(path).map(entry => entry.turnId)).toEqual(['om_ask']);
+  });
+
+  it('a restart before the pass still gives the reply to the input whose whole text arrived', () => {
+    const before = adoptQueue(10_600);
+    before.mark('om_typo', typo, 10_000);
+    before.mark('om_ask', ask, 10_500);
+    checkpointCodexAdoptTurns(path, rollout, before);
+    // The journal carries a digest, never the prompt itself.
+    expect(JSON.stringify(readBridgeTurnJournal(path))).not.toContain('压缩包');
+
+    const queue = adoptQueue(20_000);
+    const result = restoreCodexAdoptTurns(path, rollout, queue,
+      [event('user', 11_000, ask), event('assistant_final', 12_000, 'downloaded')], 15_000, 20_000);
+    expect(result.restored).toBe(2);
+    queue.absorb(result.history);
+    queue.ingest(result.live);
+    const ready = queue.drainEmittable();
+    expect(ready.map(turn => ({ turnId: turn.turnId, local: turn.isLocal === true, finalText: turn.finalText })))
+      .toEqual([{ turnId: 'om_ask', local: false, finalText: 'downloaded' }]);
   });
 });

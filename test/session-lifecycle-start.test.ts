@@ -12479,6 +12479,48 @@ describe('folded-turn reply relay', () => {
     expect(sessionReply).toHaveBeenCalledTimes(3);
   });
 
+  it('titles a Codex progress reply as progress, not as an answer to a follow-up, and posts it under that message', async () => {
+    const { sessionReply, worker } = forkWithReply();
+    worker.emit('message', reply('om_steer', 'same body'));
+    worker.emit('message', { ...reply('om_task', 'same body'), progress: true });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls.map(call => [call[2], call[4]])).toEqual([['interactive', 'om_steer'], ['interactive', 'om_task']]);
+    const [followUpCard, progressCard] = sessionReply.mock.calls.map(call => String(call[1]));
+    expect(progressCard).toContain('same body');
+    expect(progressCard).not.toBe(followUpCard);
+    vi.mocked(getBot).mockImplementation(() => defaultBot());
+    worker.emit('message', { ...reply('om_task', 'later', 'text', 'om_task-a2'), progress: true });
+    await settle();
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+  });
+
+  it('posts a reply under the turn\'s own inbound message, not the session\'s current target', async () => {
+    const { sessionReply, ds, worker } = forkWithReply();
+    const ownTarget = { mode: 'thread' as const, rootMessageId: 'om_task' };
+    ds.session.turnReplyContexts = { om_task: { target: ownTarget }, om_steer: { target: { mode: 'thread', rootMessageId: 'om_steer' } } };
+    worker.emit('message', { ...reply('om_task', 'progress'), progress: true });
+    worker.emit('message', reply('om_steer', 'answer'));
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls.map(call => (call[5] as { replyTarget?: unknown }).replyTarget)).toEqual([
+      ownTarget, { mode: 'thread', rootMessageId: 'om_steer' },
+    ]);
+  });
+
+  it('delivers progress without holding the turn\'s final or a shutdown, and stops retrying once the option is off', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async (..._args: unknown[]) => 'om_reply')
+      .mockRejectedValueOnce(new Error('lark 5xx (transient)'));
+    const { ds, worker } = forkWithReply({}, sessionReply);
+    worker.emit('message', { ...reply('om_task', 'progress'), progress: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.finalOutputDeliveriesInFlight?.size ?? 0).toBe(0);
+    expect(ds.finalOutputDeliveriesByTurn?.get('om_task')?.size ?? 0).toBe(0);
+    vi.mocked(getBot).mockImplementation(() => defaultBot());
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
   it('drops an empty answer and one for a session without a Lark transport', async () => {
     const live = forkWithReply(adopted);
     live.worker.emit('message', reply('om_blank', '  \n '));
