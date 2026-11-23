@@ -313,6 +313,37 @@ describe('草稿随事项失效', () => {
     expect(draftEvents(other.seq)).toHaveLength(1);
   });
 
+  it('迟到保存按结构化内容去重：语言切换和空指纹不重复，事项重开后不跨生命周期误去重', async () => {
+    const item = await addDecideItem();
+    const seen = askKeyOf(item.seq)!;
+    service.putDraft(item.seq, 'owner', { choice: 'A', text: '同一句', baseRev: item.rev, askKey: seen });
+    await set(item.seq, { fields: { state: 'active' } });
+    locale = 'en';
+    expect(() => service.putDraft(item.seq, 'owner', { choice: 'A', text: '同一句', baseRev: item.rev, askKey: seen }))
+      .toThrow(expect.objectContaining({ code: 'draft_outdated' }));
+    expect(draftEvents(item.seq)).toHaveLength(1);
+
+    locale = 'zh';
+    const res = await service.cli({ action: 'add', title: '进行中的事', fields: { state: 'active' }, noChat: '用例' }, { sessionId: 'sess-1' }) as { item: { seq: number; rev: number } };
+    const seq = res.item.seq;
+    service.putDraft(seq, 'owner', { text: '同一句话', baseRev: res.item.rev, askKey: '' });
+    await set(seq, { fields: { state: 'done' } });
+    for (let i = 0; i < 2; i++) {
+      expect(() => service.putDraft(seq, 'owner', { text: '同一句话', baseRev: res.item.rev, askKey: '' }))
+        .toThrow(expect.objectContaining({ code: 'draft_outdated' }));
+    }
+    expect(draftEvents(seq)).toHaveLength(1);
+
+    // 即使两轮状态切换落在同一毫秒，最近一次状态事件的自增 id 也能分开两个生命周期。
+    const endedAt = service.store().getItem(APP, seq)!.stateAt;
+    service.store().updateItem(APP, seq, { state: 'active' }, 'steward-1', endedAt);
+    service.store().updateItem(APP, seq, { state: 'done' }, 'steward-1', endedAt);
+    expect(service.store().getItem(APP, seq)!.stateAt).toBe(endedAt);
+    expect(() => service.putDraft(seq, 'owner', { text: '同一句话', baseRev: res.item.rev, askKey: '' }))
+      .toThrow(expect.objectContaining({ code: 'draft_outdated' }));
+    expect(draftEvents(seq)).toHaveLength(2);
+  });
+
   it('迟到的保存只和同一轮收进去的那条比：第一轮选 B「不合」收进历史后，第二轮写给新选项的同样的 B 迟到时照样另记', async () => {
     const item = await addDecideItem();
     service.putDraft(item.seq, 'owner', { choice: 'B', baseRev: item.rev, askKey: askKeyOf(item.seq) });

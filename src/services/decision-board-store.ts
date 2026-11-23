@@ -358,6 +358,8 @@ function migrateDraftColumns(db: DatabaseSyncLike): void {
   // 收进历史的草稿写给的那一轮（只有 kind = draft 的事件有）：迟到的保存只和同一轮收进去的那条比，判重。
   const events = new Set((db.prepare('PRAGMA table_info(board_events)').all() as Array<{ name?: unknown }>).map(c => c.name));
   if (events.size > 0 && !events.has('ask_key')) db.exec('ALTER TABLE board_events ADD COLUMN ask_key TEXT;');
+  // 结构化内容 + 生命周期的去重指纹；不拿带 locale 标签的渲染文本判等。
+  if (events.size > 0 && !events.has('dedupe_key')) db.exec('ALTER TABLE board_events ADD COLUMN dedupe_key TEXT;');
 }
 
 function healChatFields(db: DatabaseSyncLike): void {
@@ -433,6 +435,18 @@ export function draftArchiveText(draft: BoardDraft, reason: DraftArchiveReason, 
   if (draft.text.trim()) lines.push(`${zh ? '说明：' : 'Note:'}\n${draft.text}`);
   if (draft.fileIds.length) lines.push(zh ? `附图：${draft.fileIds.length} 张` : `Images: ${draft.fileIds.length}`);
   return lines.join('\n');
+}
+
+/**
+ * 迟到保存的结构化去重指纹：选项键、原始文字和附图集合直接参与计算，不经带 locale 标签的历史文案。
+ * lifecycle 用最近一次状态事件的自增 id（老数据没有状态事件时才退回 stateAt），同毫秒重开也能隔开；
+ * 空串 askKey 也是有效的一轮，不能按 falsy 跳过去重。
+ */
+function draftDedupeKey(draft: BoardDraft, lifecycle: number | string, askKey: string): string {
+  return createHash('sha256').update(JSON.stringify({
+    v: 1, askKey, lifecycle, choice: draft.choice ?? '', text: draft.text,
+    fileIds: [...new Set(draft.fileIds)].sort(),
+  })).digest('hex');
 }
 
 export class DecisionBoardStore {
@@ -530,7 +544,9 @@ export class DecisionBoardStore {
           file_ids_json TEXT,
           batch_id INTEGER,
           -- 只有 kind = draft：这份草稿写给的那一轮（ask-key.ts 的 draftAskKey）；NULL = 不知道。
-          ask_key TEXT
+          ask_key TEXT,
+          -- 只有 kind = draft：结构化内容 + 事项生命周期的去重指纹，不随界面语言变化。
+          dedupe_key TEXT
         );
         CREATE INDEX IF NOT EXISTS board_events_item ON board_events(app_id, seq, id);
         CREATE TABLE IF NOT EXISTS board_files (
@@ -657,10 +673,10 @@ export class DecisionBoardStore {
   }
 
   private insertEvent(appId: string, seq: number, at: number, actor: BoardActor, actorRef: string | undefined,
-    kind: BoardEventKind, text: string, fileIds: string[] = [], batchId?: number, askKey?: string | null): number {
-    const r = this.stmt(`INSERT INTO board_events (app_id, seq, at, actor, actor_ref, kind, text, file_ids_json, batch_id, ask_key)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(appId, seq, at, actor, actorRef ?? null, kind, text,
-      fileIds.length ? JSON.stringify(fileIds) : null, batchId ?? null, askKey ?? null);
+    kind: BoardEventKind, text: string, fileIds: string[] = [], batchId?: number, askKey?: string | null, dedupeKey?: string | null): number {
+    const r = this.stmt(`INSERT INTO board_events (app_id, seq, at, actor, actor_ref, kind, text, file_ids_json, batch_id, ask_key, dedupe_key)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(appId, seq, at, actor, actorRef ?? null, kind, text,
+      fileIds.length ? JSON.stringify(fileIds) : null, batchId ?? null, askKey ?? null, dedupeKey ?? null);
     if (actor === 'steward') {
       this.stmt('UPDATE board_items SET steward_event_at = ? WHERE app_id = ? AND seq = ?').run(at, appId, seq);
     }
@@ -1509,26 +1525,28 @@ export class DecisionBoardStore {
   /**
    * 在调用方的事务里把一份草稿内容记成一条 owner 的 draft 历史（原话、选项、附图），附图挂到这一项上。
    *
-   * dedupe 只给迟到的保存用：离开页面时的补存常常就是刚收进去的那一份，内容（选项键、原话、附图集合）和这一项最近
-   * 一条 draft 历史完全相同时不再记。管家改状态 / 选项时第一次收一份草稿不去重——同一个选项键在两轮里可能是两个意思。
+   * dedupe 只给迟到的保存用：离开页面时的补存常常就是刚收进去的那一份。按结构化内容 + 生命周期判重，
+   * 不受历史文案 locale 影响；空串 askKey 也参与。最近一次状态事件的自增 id 能把同毫秒重开也隔开。
+   * 管家改状态 / 选项时第一次收一份草稿不去重——同一个选项键在两轮里可能是两个意思。
    */
   private archiveDraftContent(appId: string, draft: BoardDraft, reason: DraftArchiveReason, item: BoardItem,
     labels: readonly BoardOption[] | undefined, locale: Locale, now: number, opts: { dedupe?: boolean; askKey?: string | null } = {}): void {
     const text = draftArchiveText(draft, reason, item, labels, locale);
-    // 只和同一轮收进去的那条比：不同轮里同一个选项键、同一句话可能是两个意思。
-    if (opts.dedupe && opts.askKey) {
-      // 比内容不比原因：去掉第一行（原因），「选：」那一行只比选项键（迟到的保存附不上选项原文）；附图比集合。
-      const content = (t: string) => t.split('\n').slice(1).map((line, i) => i === 0 ? line.replace(/^(选：|Choice: )(\S+).*$/, '$1$2') : line).join('\n');
-      const files = (ids: readonly string[]) => [...new Set(ids)].sort().join(',');
-      const last = this.stmt(`SELECT text, file_ids_json, ask_key FROM board_events WHERE app_id = ? AND seq = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1`)
-        .get(appId, draft.seq) as { text: string; file_ids_json: string | null; ask_key: string | null } | undefined;
-      if (last && last.ask_key === opts.askKey && content(last.text) === content(text)
-        && files(parseIds(last.file_ids_json)) === files(draft.fileIds)) return;
+    // updateItem / closeInChat 都先写状态事件再收草稿，所以首次归档和之后的迟到保存看到的是同一个 id。
+    // 只有老数据可能没有状态事件，才退回毫秒时间戳；新一轮真实状态切换总会分配新的自增 id。
+    const stateEvent = this.stmt(`SELECT id FROM board_events WHERE app_id = ? AND seq = ? AND kind = 'state' ORDER BY id DESC LIMIT 1`)
+      .get(appId, draft.seq) as { id: number } | undefined;
+    const lifecycle = stateEvent?.id ?? `at:${item.stateAt}`;
+    const dedupeKey = typeof opts.askKey === 'string' ? draftDedupeKey(draft, lifecycle, opts.askKey) : null;
+    if (opts.dedupe && dedupeKey) {
+      const last = this.stmt(`SELECT dedupe_key FROM board_events WHERE app_id = ? AND seq = ? AND kind = 'draft' ORDER BY id DESC LIMIT 1`)
+        .get(appId, draft.seq) as { dedupe_key: string | null } | undefined;
+      if (last?.dedupe_key === dedupeKey) return;
     }
     for (const fid of draft.fileIds) {
       this.stmt('UPDATE board_files SET seq = ? WHERE app_id = ? AND id = ? AND seq IS NULL').run(draft.seq, appId, fid);
     }
-    this.insertEvent(appId, draft.seq, now, 'owner', draft.author, 'draft', text, draft.fileIds, undefined, opts.askKey ?? null);
+    this.insertEvent(appId, draft.seq, now, 'owner', draft.author, 'draft', text, draft.fileIds, undefined, opts.askKey ?? null, dedupeKey);
   }
 
   /**

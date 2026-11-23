@@ -16,6 +16,7 @@ import { BOARD_NAV_STORAGE_KEY, DECISION_BOARD_CHANGED_EVENT, type BoardDetailRe
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { SearchableGroupPicker } from '../src/dashboard/web/searchable-group-picker.js';
 import { ConfirmModalRoot } from '../src/dashboard/web/confirm-modal.js';
+import { pendingLeavePrompt } from '../src/dashboard/web/leave-guard.js';
 import type { BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
 
 const zh = createDashboardTranslator('zh');
@@ -466,6 +467,8 @@ describe('item detail · the steward changes the item while the owner is typing'
       if (url.endsWith('/items/31/draft') && method === 'PUT') {
         const body = JSON.parse(String(init.body));
         if (gate) await gate;
+        // 真实 store 的 archive 分支只收进历史，成功回 200，不走 late 的 409。
+        if (body.archive) return json({ ok: true, draft: null });
         if (changed && body.askKey === OLD_KEY) {
           archivedTexts.push(`这一项改成了「进行中」，这份草稿没有提交（没有发给管家），收在这里留底。\n说明：\n${body.text}`);
           return json({ ok: false, error: 'draft_outdated', message: outdatedMessage }, 409);
@@ -531,6 +534,58 @@ describe('item detail · the steward changes the item while the owner is typing'
     renderer = undefined;
     await act(async () => { await vi.advanceTimersByTimeAsync(10); });
     expect(calls('PUT', '/items/31/draft')).toHaveLength(2);
+  });
+
+  it('keeps the unconfirmed in-flight text when supplemental archival fails, and retries it under the old round', async () => {
+    await openDetail();
+    changed = true;
+    const base = routes;
+    let failures = 1;
+    routes = async (url, init) => {
+      if (url.endsWith('/items/31/draft') && init.method === 'PUT') {
+        const body = JSON.parse(String(init.body));
+        if (body.text === '第一句，第二句' && failures > 0) {
+          failures -= 1;
+          return json({ ok: false, error: 'daemon_offline', message: '502 Bad Gateway' }, 502);
+        }
+      }
+      return base(url, init);
+    };
+    let release!: () => void;
+    gate = new Promise(r => { release = r; });
+    type('第一句');
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
+    type('第一句，第二句');
+    gate = undefined;
+    release();
+    await flush();
+    await flush();
+    await settle();
+
+    // 第一笔已归档，第二笔 502 没归档：只保留仍未确认的内容，不用服务端空草稿覆盖，也不按新一轮自动保存。
+    expect(archivedTexts).toHaveLength(1);
+    expect(archivedTexts[0]).toContain('第一句');
+    expect(archivedTexts[0]).not.toContain('第二句');
+    expect(calls('GET', '/items/31')).toHaveLength(1);
+    expect(renderer!.root.findByType('textarea').props.value).toBe('第一句，第二句');
+    expect(renderer!.root.findByType('textarea').props.readOnly).toBe(true);
+    expect(buttonByText(zh('decisionBoard.clearDraft')).props.disabled).toBe(true);
+    expect(text()).toContain('502 Bad Gateway');
+    expect(calls('PUT', '/items/31/draft')).toHaveLength(2);
+    expect(pendingLeavePrompt()).not.toBeNull();
+
+    await act(async () => { buttonByText(zh('decisionBoard.saveRetry')).props.onClick(); });
+    await settle();
+    const puts = calls('PUT', '/items/31/draft');
+    expect(puts).toHaveLength(3);
+    expect(puts[2]!.body.askKey).toBe(OLD_KEY);
+    expect(puts[2]!.body.text).toBe('第一句，第二句');
+    expect(archivedTexts).toHaveLength(2);
+    expect(archivedTexts[1]).toContain('第一句，第二句');
+    expect(calls('GET', '/items/31')).toHaveLength(2);
+    expect(renderer!.root.findByType('textarea').props.value).toBe('');
+    expect(renderer!.root.findByType('textarea').props.readOnly).toBe(false);
+    expect(pendingLeavePrompt()).toBeNull();
   });
 
   it('a late save that hits an item the steward has just finished is handled the same way: archived, box cleared, page reloaded', async () => {
@@ -664,6 +719,76 @@ describe('item detail · the steward changes the item while the owner is typing'
     expect(renderer!.root.findAll(n => n.type === 'img' && String(n.props.src).includes('/files/img1'))).toEqual([]);
     expect(calls('PUT', '/items/31/draft').filter(c => c.body.fileIds.length).map(c => c.body))
       .toEqual([{ text: '', fileIds: ['img1'], baseRev: 5, askKey: OLD_KEY, archive: true }]);
+  });
+
+  it('keeps a late image and its leave guard when archival fails, then retries the same file with keepalive', async () => {
+    vi.stubGlobal('FileReader', class {
+      result: string | null = null;
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      readAsDataURL() { this.result = 'data:image/png;base64,iVBORw0KGgo='; this.onload?.(); }
+    });
+    const base = routes;
+    let failures = 1;
+    routes = async (url, init) => {
+      if (url.endsWith('/items/31/draft') && init.method === 'PUT') {
+        const body = JSON.parse(String(init.body));
+        if (body.archive && failures > 0) {
+          failures -= 1;
+          return json({ ok: false, error: 'daemon_offline', message: '502 Bad Gateway' }, 502);
+        }
+      }
+      return base(url, init);
+    };
+    const beforeUnloadListeners: Array<(event: BeforeUnloadEvent) => void> = [];
+    const currentWindow = window;
+    vi.stubGlobal('window', {
+      ...currentWindow,
+      addEventListener: (type: string, listener: (event: BeforeUnloadEvent) => void) => {
+        if (type === 'beforeunload') beforeUnloadListeners.push(listener);
+      },
+      removeEventListener: () => {},
+    });
+    await openDetail();
+    let release!: () => void;
+    gate = new Promise(r => { release = r; });
+    const input = renderer!.root.find(n => n.type === 'input' && n.props.type === 'file');
+    await act(async () => { input.props.onChange({ currentTarget: { files: [{ type: 'image/png', size: 10, name: 'a.png' }], value: '' } }); });
+    await flush();
+    changed = true;
+    gate = undefined;
+    type('补一句');
+    await settle();
+    release();
+    await flush();
+    await settle();
+
+    const previews = () => renderer!.root.findAll(n => n.type === 'img' && String(n.props.src).startsWith('data:'));
+    const archives = () => fetcher.mock.calls.filter(([url, init]) => String(url).endsWith('/items/31/draft')
+      && (init as RequestInit).method === 'PUT' && JSON.parse(String((init as RequestInit).body)).archive === true);
+    expect(archives()).toHaveLength(1);
+    expect((archives()[0]![1] as RequestInit).keepalive).toBe(true);
+    expect(previews()).toHaveLength(1);
+    expect(renderer!.root.find(n => n.props['data-upload-error'] !== undefined)).toBeTruthy();
+    expect(text()).toContain('502 Bad Gateway');
+    expect(pendingLeavePrompt()).not.toBeNull();
+    const blockedUnload = { preventDefault: vi.fn(), returnValue: '' } as unknown as BeforeUnloadEvent;
+    for (const listener of beforeUnloadListeners) listener(blockedUnload);
+    expect(blockedUnload.preventDefault).toHaveBeenCalled();
+
+    await act(async () => { renderer!.root.find(n => n.props['data-action'] === 'retry-archive').props.onClick(); });
+    await settle();
+    expect(archives()).toHaveLength(2);
+    expect(JSON.parse(String((archives()[1]![1] as RequestInit).body))).toEqual({
+      text: '', fileIds: ['img1'], baseRev: 5, askKey: OLD_KEY, archive: true,
+    });
+    expect((archives()[1]![1] as RequestInit).keepalive).toBe(true);
+    expect(previews()).toHaveLength(0);
+    expect(renderer!.root.findAll(n => n.props['data-action'] === 'retry-archive')).toEqual([]);
+    expect(pendingLeavePrompt()).toBeNull();
+    const cleanUnload = { preventDefault: vi.fn(), returnValue: '' } as unknown as BeforeUnloadEvent;
+    for (const listener of beforeUnloadListeners) listener(cleanUnload);
+    expect(cleanUnload.preventDefault).not.toHaveBeenCalled();
   });
 });
 

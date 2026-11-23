@@ -900,8 +900,8 @@ interface DraftEditor {
   state: DraftSaveState;
   error: string;
   /**
-   * 刚写的内容因为这一项被管家改过（或已结束）没有存成草稿、已由服务端收进历史，编辑器随之清空：页面据此提示一句，
-   * owner 再动编辑器时消失。
+   * 刚写的内容因为这一项被管家改过（或已结束）没有存成草稿，已确认的部分收进历史。请求期间新增的内容还在补收时，
+   * 页面据 dirty 状态改提示，避免把尚未确认的部分也说成已归档；owner 再动编辑器时提示消失。
    */
   archived: boolean;
   /**
@@ -925,9 +925,8 @@ interface DraftEditor {
  * draftAskKey），随每次保存带上。
  *
  * 管家在 owner 写草稿时改了状态或选项（或把这一项结束了），服务端拒绝这次保存（draft_outdated / item_ended），
- * 同时把这次发过去的内容收进这一项的历史。编辑器这时清空——刚写的东西已经在历史里，不会把写给旧问题的内容留在输入框、
- * 稍后又按新的一轮存掉——并提示一句，`onOutdated` 让页面重新读这一项。请求在路上时 owner 又打的几个字，再按旧的一轮
- * 补发一次（同样被拒、收进历史），不丢。
+ * 同时把这次发过去的内容收进这一项的历史。已确认的内容从编辑器清掉，不把写给旧问题的内容稍后又按新的一轮存掉；
+ * `onOutdated` 重新读这一项。请求在路上时 owner 又打的几个字按旧的一轮补收，确认前保留，失败显示错误并可重试，不丢。
  */
 function useDraftEditor(appId: string, seq: number, itemRev: number, optionKeys: readonly string[],
   askKey: string | undefined, onOutdated: () => Promise<unknown>): DraftEditor {
@@ -943,6 +942,9 @@ function useDraftEditor(appId: string, seq: number, itemRev: number, optionKeys:
   const savedRef = useRef<BoardDraft | null>(null);
   const timerRef = useRef<number | undefined>(undefined);
   const inflightRef = useRef<Promise<void> | null>(null);
+  /** 第一笔已归档后，仍在补收请求期间新增内容的那一笔；失败保留内容，可用 flush 重试。 */
+  const archivalRef = useRef<Promise<void> | null>(null);
+  const archivedRetryRef = useRef<(() => Promise<void>) | null>(null);
   const mountedRef = useRef(true);
   const generationRef = useRef(0);
   /** 被拒、清空之后到重新读完这一项之前：不自动保存（那时页面上还是旧的一轮，存了还会被拒）。 */
@@ -971,31 +973,70 @@ function useDraftEditor(appId: string, seq: number, itemRev: number, optionKeys:
     timerRef.current = window.setTimeout(() => { void flushRef.current().catch(() => {}); }, AUTOSAVE_MS);
   }, []);
 
-  /** 服务端收走了这份内容：清空编辑器（不再自动保存），提示一句，重新读这一项。 */
-  const discardArchived = (sent: DraftInput, opts: { askKey?: string }) => {
-    window.clearTimeout(timerRef.current);
-    generationRef.current += 1;
-    // 请求在路上时又打的字：按同一轮补发一次，服务端同样收进历史（内容相同的不会重复记）。
-    if (!sameDraftContent(latestRef.current, sent)) {
-      void saveBoardDraft(appId, seq, payloadFor(latestRef.current), revRef.current, opts).catch(() => {});
-    }
-    latestRef.current = EMPTY_DRAFT;
-    ackRef.current = EMPTY_DRAFT;
-    savedRef.current = null;
-    if (!mountedRef.current) return;
-    setDraft(EMPTY_DRAFT);
-    setSaved(null);
-    setState('idle');
-    setError('');
-    setArchived(true);
-    reloadingRef.current = true;
-    setReloading(true);
+  const reloadArchived = () => {
     void onOutdatedRef.current().catch(() => {}).finally(() => {
       reloadingRef.current = false;
       if (mountedRef.current) setReloading(false);
       // 重新读这一项期间 owner 接着写了：按现在的一轮补存。
       if (mountedRef.current && !sameDraftContent(latestRef.current, ackRef.current)) schedule();
     });
+  };
+
+  /** 第一笔已确认归档；请求期间新增的内容必须等服务端确认后才能清，失败则留下并按同一轮重试。 */
+  const archiveResidual = (residual: DraftInput, opts: { askKey?: string }): Promise<void> => {
+    if (archivalRef.current) return archivalRef.current;
+    const request = (async () => {
+      if (mountedRef.current) { setState('saving'); setError(''); }
+      try {
+        try {
+          await saveBoardDraft(appId, seq, payloadFor(residual), revRef.current, opts);
+        } catch (err) {
+          // 迟到保存的 409 是「已收进历史」的确认，不是失败；其它响应都不能当作已归档。
+          if (!(err instanceof BoardRequestError && err.code === 'draft_outdated')) throw err;
+        }
+      } catch (err) {
+        if (mountedRef.current) { setState('error'); setError(errorText(err)); }
+        throw err;
+      }
+      archivedRetryRef.current = null;
+      latestRef.current = EMPTY_DRAFT;
+      ackRef.current = EMPTY_DRAFT;
+      savedRef.current = null;
+      if (!mountedRef.current) return;
+      setDraft(EMPTY_DRAFT);
+      setSaved(null);
+      setState('idle');
+      reloadArchived();
+    })().finally(() => {
+      if (archivalRef.current === request) archivalRef.current = null;
+    });
+    archivalRef.current = request;
+    return request;
+  };
+
+  /** 已归档的 sent 可以清；在途新增部分继续保留到补收确认，失败时显示错误并允许 flush 重试。 */
+  const discardArchived = (sent: DraftInput, opts: { askKey?: string }) => {
+    window.clearTimeout(timerRef.current);
+    generationRef.current += 1;
+    const residual = sameDraftContent(latestRef.current, sent) ? null : latestRef.current;
+    latestRef.current = residual ?? EMPTY_DRAFT;
+    ackRef.current = EMPTY_DRAFT;
+    savedRef.current = null;
+    if (mountedRef.current) {
+      setDraft(residual ?? EMPTY_DRAFT);
+      setSaved(null);
+      setState(residual ? 'saving' : 'idle');
+      setError('');
+      setArchived(true);
+      reloadingRef.current = true;
+      setReloading(true);
+    }
+    if (residual) {
+      archivedRetryRef.current = () => archiveResidual(residual, opts);
+      void archiveResidual(residual, opts).catch(() => {});
+      return;
+    }
+    if (mountedRef.current) reloadArchived();
   };
 
   const flush = useCallback(async (): Promise<BoardDraft | null> => {
@@ -1010,7 +1051,12 @@ function useDraftEditor(appId: string, seq: number, itemRev: number, optionKeys:
       if (mountedRef.current) setState(settledState());
       return savedRef.current;
     }
-    if (reloadingRef.current) return savedRef.current;
+    if (reloadingRef.current) {
+      // 迟到补收失败：重试仍用拒绝那一轮的 askKey，不按页面上的新一轮存。
+      const retry = archivedRetryRef.current;
+      if (retry) await retry();
+      return savedRef.current;
+    }
     if (mountedRef.current) setState('saving');
     const opts = saveOpts();
     const request: Promise<void> = saveBoardDraft(appId, seq, payloadFor(snapshot), revRef.current, opts).then(next => {
@@ -1080,7 +1126,7 @@ function useDraftEditor(appId: string, seq: number, itemRev: number, optionKeys:
       window.clearTimeout(timerRef.current);
       // 离开详情页（站内跳转）时把最后的改动存掉：等进行中的那笔落地后再补一笔。这一项刚被改过时服务端会拒、
       // 并把内容收进历史，所以也不会丢。
-      const pending = inflightRef.current ?? Promise.resolve();
+      const pending = archivalRef.current ?? inflightRef.current ?? Promise.resolve();
       void pending.catch(() => {}).then(() => {
         if (!sameDraftContent(latestRef.current, ackRef.current)) {
           void saveBoardDraft(appId, seq, payloadFor(latestRef.current), revRef.current, saveOpts({ keepalive: true })).catch(() => {});
@@ -1290,13 +1336,23 @@ function ItemNav(props: { neighbors: BoardNeighbors | null; busy: boolean; onGo(
   );
 }
 
+interface PendingImageUpload {
+  key: string;
+  preview: string;
+  /** 上传完成、但迟到归档尚未确认时保留这些字段供失败重试。 */
+  fileId?: string;
+  askKey?: string;
+  baseRev?: number;
+  error?: string;
+}
+
 export function ItemDetailView(props: { appId: string; seq: number }) {
   const tr = useT();
   const { appId, seq } = props;
   const [detail, setDetail] = useState<BoardDetailResponse | null>(null);
   const [loadError, setLoadError] = useState<{ text: string; notFound: boolean } | null>(null);
   const [submitSeqs, setSubmitSeqs] = useState<number[] | null>(null);
-  const [uploads, setUploads] = useState<Array<{ key: string; preview: string }>>([]);
+  const [uploads, setUploads] = useState<PendingImageUpload[]>([]);
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const mountedRef = useRef(true);
@@ -1310,6 +1366,9 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
   uploadingRef.current = uploads.length;
   const editorStateRef = useRef(editor.state);
   editorStateRef.current = editor.state;
+  // 迟到补收还没确认时也守离开：编辑器只读期间 dirty 表示这笔内容尚未归档/存下。
+  const editorNeedsGuardRef = useRef(false);
+  editorNeedsGuardRef.current = editor.reloading && editor.dirty();
   const [navList, setNavList] = useState<BoardNavList | null>(() => recallNavList());
   const [navigating, setNavigating] = useState(false);
   const neighbors = boardNeighbors(navList, appId, seq);
@@ -1374,10 +1433,37 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
     location.hash = boardItemHash(appId, target);
   }
 
-  // 草稿没存进去或图片还在传：离开前问一句（其余情况离开时会自动补存）。
-  useEffect(() => setLeaveGuard(() => (editorStateRef.current === 'error' || uploadingRef.current > 0)
+  // 草稿没存进去、迟到补收未确认或图片还在传/归档：离开前问一句（其余情况离开时会自动补存）。
+  useEffect(() => setLeaveGuard(() => (editorStateRef.current === 'error' || editorNeedsGuardRef.current || uploadingRef.current > 0)
     ? { title: tr('decisionBoard.leaveTitle'), message: tr('decisionBoard.leaveBody'), confirmLabel: tr('decisionBoard.leaveConfirm') }
     : null), [tr]);
+  useEffect(() => {
+    // hash 离开由 setLeaveGuard 守；刷新 / 关标签页也要覆盖上传中或迟到归档失败的图片。
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (uploadingRef.current === 0) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, []);
+
+  /** 迟到的图只收进历史；请求带 keepalive，成功才撤掉预览，失败保留文件 id / 旧 askKey 供原图重试。 */
+  async function archiveLateImage(key: string, fileId: string, askKey: string, baseRev: number): Promise<void> {
+    if (mountedRef.current) {
+      setUploads(current => current.map(u => u.key === key ? { ...u, fileId, askKey, baseRev, error: undefined } : u));
+    }
+    try {
+      await saveBoardDraft(appId, seq, { text: '', fileIds: [fileId] }, baseRev, { askKey, archive: true, keepalive: true });
+    } catch (err) {
+      if (mountedRef.current) {
+        const message = errorText(err);
+        setUploads(current => current.map(u => u.key === key ? { ...u, fileId, askKey, baseRev, error: message } : u));
+      }
+      return;
+    }
+    if (mountedRef.current) setUploads(current => current.filter(u => u.key !== key));
+  }
 
   async function addImages(files: File[]): Promise<void> {
     if (!files.length || editor.reloading) return;
@@ -1409,6 +1495,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         return;
       }
       if (mountedRef.current) setUploads(current => [...current, { key, preview: dataUrl }]);
+      let retainForArchive = false;
       try {
         const uploaded = await uploadBoardImage(appId, {
           name: file.name || `image-${index + 1}.${file.type.split('/')[1] ?? 'png'}`,
@@ -1417,7 +1504,8 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         });
         if (editor.generation() !== generation) {
           if (askKeyAtStart !== undefined) {
-            void saveBoardDraft(appId, seq, { text: '', fileIds: [uploaded.id] }, revAtStart, { askKey: askKeyAtStart, archive: true }).catch(() => {});
+            retainForArchive = true;
+            await archiveLateImage(key, uploaded.id, askKeyAtStart, revAtStart);
           }
           return;
         }
@@ -1425,7 +1513,8 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
       } catch (err) {
         toast(tr('decisionBoard.imageUploadFailed', { error: errorText(err) }), { kind: 'error' });
       } finally {
-        if (mountedRef.current) setUploads(current => current.filter(u => u.key !== key));
+        // 迟到归档由 archiveLateImage 自己收尾：失败不能再走这里把预览和重试信息删掉。
+        if (!retainForArchive && mountedRef.current) setUploads(current => current.filter(u => u.key !== key));
       }
     }));
   }
@@ -1568,7 +1657,9 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
       ) : null}
 
       {editor.archived ? (
-        <p className="dboard-warn" role="status" data-draft-archived="">⚠ {tr('decisionBoard.draftArchivedNotice')}</p>
+        <p className="dboard-warn" role="status" data-draft-archived="">
+          ⚠ {tr(editor.dirty() ? 'decisionBoard.draftArchivePendingNotice' : 'decisionBoard.draftArchivedNotice')}
+        </p>
       ) : null}
 
       {!ended ? <section className="dboard-block dboard-decision">
@@ -1622,9 +1713,11 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
               </span>
             ))}
             {uploads.map(upload => (
-              <span key={upload.key} className="dboard-thumb is-uploading" title={tr('decisionBoard.uploading')}>
+              <span key={upload.key} className="dboard-thumb is-uploading" title={upload.error ?? tr('decisionBoard.uploading')}>
                 <img src={upload.preview} alt="" />
-                <span className="dboard-thumb-progress">{tr('decisionBoard.uploading')}</span>
+                <span className="dboard-thumb-progress">
+                  {upload.error ? tr('decisionBoard.imageArchiveFailed') : tr('decisionBoard.uploading')}
+                </span>
               </span>
             ))}
             <button type="button" className="dboard-add-image" disabled={editor.reloading} onClick={() => fileInputRef.current?.click()}>
@@ -1632,6 +1725,15 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
             </button>
             <span className="dboard-drop-hint">{tr('decisionBoard.dropHint')}</span>
           </div>
+          {uploads.filter(upload => upload.error).map(upload => (
+            <p className="dboard-warn" role="status" data-upload-error={upload.key} key={`${upload.key}-error`}>
+              {tr('decisionBoard.imageArchiveFailed')}：{upload.error}{' '}
+              <button type="button" className="dboard-text-btn" data-action="retry-archive" data-upload-key={upload.key}
+                onClick={() => void archiveLateImage(upload.key, upload.fileId!, upload.askKey!, upload.baseRev!)}>
+                {tr('decisionBoard.saveRetry')}
+              </button>
+            </p>
+          ))}
           <input
             ref={fileInputRef}
             type="file"
@@ -1650,7 +1752,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         <div className="dboard-decision-foot">
           <SaveStatus editor={editor} />
           <div className="dboard-decision-actions">
-            <button type="button" disabled={!ownDraft} onClick={() => void clearDraft()}>{tr('decisionBoard.clearDraft')}</button>
+            <button type="button" disabled={!ownDraft || editor.reloading} onClick={() => void clearDraft()}>{tr('decisionBoard.clearDraft')}</button>
             <button
               type="button"
               className="primary"
