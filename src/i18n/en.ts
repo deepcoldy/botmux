@@ -1282,6 +1282,7 @@ export const messages: Record<string, string> = {
   'cmd.fork.unsupported_backend': 'ℹ️ Botmux has not integrated fork for the current {cli} session (supported: Claude family, Grok, Antigravity, and Codex / TraeX terminal modes; Codex App, RPC, and pure-remote sessions are not supported yet).',
   'cmd.fork.mid_turn': '⚠️ The session is mid-turn and cannot be forked. Wait until it is idle, then /fork.',
   'cmd.fork.queued': 'Fork queued. It will run automatically when the source session is idle.',
+  'cmd.fork.topic_pending': 'The fork is still being prepared. Send your message again when its execution card appears.',
   'cmd.fork.source_changed': 'The source conversation changed while waiting. This fork was cancelled.',
   'cmd.fork.source_check_failed': 'The original fork command could not be verified. No fork was created.',
   'cmd.fork.not_started_yet': '⚠️ The session has not really started (no repo / CLI not up / no context) and cannot be forked.',

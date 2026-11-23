@@ -756,7 +756,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, drainQueuedForks, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession, discoverResumableSessionsForBot } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession, discoverResumableSessionsForBot } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
@@ -2552,22 +2552,33 @@ describe('handleCommand', () => {
         await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
         await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
         await drainQueuedForks(ds);
-        expect(deps.sessionReply).toHaveBeenCalledExactlyOnceWith(CHAT_ID, expect.stringContaining('空闲后会自动执行'), undefined, LARK_APP_ID, msg.messageId);
+        const target = { mode: 'thread', rootMessageId: msg.messageId };
+        expect(deps.sessionReply).toHaveBeenCalledExactlyOnceWith(CHAT_ID, expect.stringContaining('空闲后会自动执行'),
+          'interactive', LARK_APP_ID, msg.messageId, { replyTarget: target, uuid: expect.stringMatching(/^[a-f0-9]{40}$/) });
         expect(replyMessage).not.toHaveBeenCalled();
         expect(forkSession).not.toHaveBeenCalled();
+        expect(isPendingForkTopic(ds, msg.messageId)).toBe(true);
 
         if (condition === 'source changed') ds.session.cliSessionId = 'agy-new';
         if (condition === 'source replaced') deps.activeSessions.set(key, makeDaemonSession());
         ds.lastScreenStatus = 'idle';
         await Promise.all([drainQueuedForks(ds), drainQueuedForks(ds)]);
         await drainQueuedForks(ds);
+        expect(isPendingForkTopic(ds, msg.messageId)).toBe(false);
         if (condition === 'available') {
           expect(replyMessage).toHaveBeenCalledTimes(1);
+          expect(vi.mocked(replyMessage).mock.calls[0]?.slice(0, 5)).toEqual([
+            LARK_APP_ID, msg.messageId, expect.any(String), 'post', true,
+          ]);
           expect(forkSession).toHaveBeenCalledExactlyOnceWith('sess-001', CHAT_ID, msg.messageId, 'group', 'thread',
             expect.objectContaining({ turnId: msg.messageId, forkTaskText: '继承上下文' }));
         } else {
           expect(forkSession).not.toHaveBeenCalled();
           expect(replyMessage).not.toHaveBeenCalled();
+          if (condition === 'source changed') {
+            expect(deps.sessionReply).toHaveBeenLastCalledWith(CHAT_ID, expect.stringContaining('源会话已切换'),
+              'text', LARK_APP_ID, msg.messageId, { replyTarget: target });
+          }
         }
       },
     );

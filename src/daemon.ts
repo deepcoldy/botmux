@@ -641,7 +641,7 @@ import {
   type ResolveSubtopicHandoffDeps,
 } from './services/subtopic-mentionless-handoff.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
-import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, drainQueuedForks, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
+import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, drainQueuedForks, isPendingForkTopic, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { commandSpec } from './core/command-schema.js';
 import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
@@ -27943,8 +27943,26 @@ function handleDocumentAskTextReply(data: any, ctx: RoutingContext): boolean {
   });
 }
 
+/** A waiting card gives the fork a visible topic before a child owns it. */
+function handlePendingForkTopicInput(data: any, ctx: RoutingContext): boolean {
+  const message = data?.message;
+  const topicRoot = message?.root_id;
+  if (ctx.chatType !== 'group' || typeof topicRoot !== 'string' || !topicRoot.startsWith('om_')
+    || topicRoot === ctx.messageId || typeof message.thread_id !== 'string' || !message.thread_id.startsWith('omt_')
+    || activeSessions.has(sessionKey(topicRoot, ctx.larkAppId))) return false;
+  const source = activeSessions.get(sessionKey(ctx.chatId, ctx.larkAppId));
+  if (!source || !isPendingForkTopic(source, topicRoot)) return false;
+  markIngressAdmitted(ctx);
+  if (data.sender?.sender_type === 'user') {
+    void replyMessage(ctx.larkAppId, topicRoot, tr('cmd.fork.topic_pending', undefined, localeForBot(ctx.larkAppId)), 'text', true)
+      .catch(err => logger.debug(`Pending /fork topic notice failed: ${String(err)}`));
+  }
+  return true;
+}
+
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
   if (feedbackMaintenanceActive(config.session.dataDir)) throw new Error('feedback_storage_maintenance');
+  if (handlePendingForkTopicInput(data, ctx)) return;
   // Before any turn identity is published: the platform credential path keys on
   // union_id, and the event is the only source that works for senders outside
   // the bot app's contact range. Synchronous, so admission timing is unchanged.
@@ -30547,6 +30565,7 @@ async function handleThreadReplyAdmitted(
 ): Promise<void> {
   if (!crossChatFollowUpIsCurrent(ctx)) return;
   if (feedbackMaintenanceActive(config.session.dataDir)) throw new Error('feedback_storage_maintenance');
+  if (handlePendingForkTopicInput(data, ctx)) return;
   noteInboundSenderUnionId(ctx.larkAppId, data); // see handleNewTopicAdmitted
   if (!replay && handleDocumentAskTextReply(data, ctx)) return;
   await prepareGroupBackground(data, ctx);
