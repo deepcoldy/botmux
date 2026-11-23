@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -60,17 +60,19 @@ describe('worker-budget CLI', () => {
     expect(result.stderr).toContain('--memory-admission-enabled must be true or false');
   });
 
-  it('rejects unknown, duplicate, missing-value, and trailing unset arguments', () => {
-    for (const args of [
-      ['worker-budget', 'set', '--memory-admission-enabled', 'false', '--unknown', '1'],
-      ['worker-budget', 'set', '--min-available-mib', '1', '--min-available-mib', '2'],
-      ['worker-budget', 'set', '--memory-admission-enabled'],
-      ['worker-budget', 'set', '--min-available-mib', '1e300'],
-      ['worker-budget', 'set', '--session-memory-max-mib', '0.0000001'],
-      ['worker-budget', 'status', '--unknown'],
-      ['worker-budget', 'unset', '--unknown'],
-    ]) {
-      expect(runCli(args).status).toBe(1);
-    }
+  // Split each invalid-argument CLI cold start into its own test case so 7 sequential
+  // `tsx src/cli.ts` launches (~2.8-3.3s each on CI) never stack inside one 30s timeout.
+  it.each([
+    ['unknown set flag', ['worker-budget', 'set', '--memory-admission-enabled', 'false', '--unknown', '1']],
+    ['duplicate set flag', ['worker-budget', 'set', '--min-available-mib', '1', '--min-available-mib', '2']],
+    ['missing flag value', ['worker-budget', 'set', '--memory-admission-enabled']],
+    ['overflow MiB value', ['worker-budget', 'set', '--min-available-mib', '1e300']],
+    ['sub-byte MiB value', ['worker-budget', 'set', '--session-memory-max-mib', '0.0000001']],
+    ['trailing status arg', ['worker-budget', 'status', '--unknown']],
+    ['trailing unset arg', ['worker-budget', 'unset', '--unknown']],
+  ])('rejects invalid arguments (%s)', (_label, args) => {
+    const result = runCli(args);
+    expect(result.status).toBe(1);
+    expect(existsSync(join(home, '.botmux', 'config.json'))).toBe(false);
   });
 });
