@@ -475,6 +475,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
   transferSession: vi.fn(async () => ({ ok: true })),
   forkSession: vi.fn(async () => ({ ok: true, childSessionId: 'child-sess-1' })),
   isForkCapableSession: vi.fn(() => true),
+  isForkSourceBusy: (ds: DaemonSession) => !!ds.worker && !ds.worker.killed
+    && ds.lastScreenStatus !== 'idle' && ds.lastScreenStatus !== 'limited',
   // /relay --create empty-leader path closes the scratch via this; default
   // resolves as idempotent close so unrelated tests don't need to think
   // about it.
@@ -754,7 +756,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession, discoverResumableSessionsForBot } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, drainQueuedForks, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession, discoverResumableSessionsForBot } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
@@ -2533,6 +2535,43 @@ describe('handleCommand', () => {
   });
 
   describe('/fork sub-topic', () => {
+    it.each(['available', 'withdrawn', 'source changed', 'source replaced'] as const)(
+      'queues a dedicated-group /fork until idle with original command %s', async condition => {
+        vi.mocked(isSessionGroup).mockReturnValue(true);
+        onTestFinished(() => { vi.mocked(isSessionGroup).mockReturnValue(false); });
+        vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({
+          items: [{ message_id: id, deleted: condition === 'withdrawn' }],
+        }));
+        const ds = makeLegacyLarkSession({ scope: 'chat', lastScreenStatus: 'working', session: makeSession({
+          cliId: 'antigravity', scope: 'chat', rootMessageId: CHAT_ID, ownerOpenId: 'ou_sender', cliSessionId: 'agy-parent',
+        }) });
+        const deps = makeDeps(ds);
+        const key = sessionKey(CHAT_ID, LARK_APP_ID);
+        deps.activeSessions.set(key, ds);
+        const msg = makeLarkMessage('/fork 继承上下文', { messageId: 'om_waiting_fork', chatId: CHAT_ID, rootId: '' });
+        await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
+        await handleCommand('/fork', CHAT_ID, msg, deps, LARK_APP_ID);
+        await drainQueuedForks(ds);
+        expect(deps.sessionReply).toHaveBeenCalledExactlyOnceWith(CHAT_ID, expect.stringContaining('空闲后会自动执行'), undefined, LARK_APP_ID, msg.messageId);
+        expect(replyMessage).not.toHaveBeenCalled();
+        expect(forkSession).not.toHaveBeenCalled();
+
+        if (condition === 'source changed') ds.session.cliSessionId = 'agy-new';
+        if (condition === 'source replaced') deps.activeSessions.set(key, makeDaemonSession());
+        ds.lastScreenStatus = 'idle';
+        await Promise.all([drainQueuedForks(ds), drainQueuedForks(ds)]);
+        await drainQueuedForks(ds);
+        if (condition === 'available') {
+          expect(replyMessage).toHaveBeenCalledTimes(1);
+          expect(forkSession).toHaveBeenCalledExactlyOnceWith('sess-001', CHAT_ID, msg.messageId, 'group', 'thread',
+            expect.objectContaining({ turnId: msg.messageId, forkTaskText: '继承上下文' }));
+        } else {
+          expect(forkSession).not.toHaveBeenCalled();
+          expect(replyMessage).not.toHaveBeenCalled();
+        }
+      },
+    );
+
     it.each([true, false])('uses an Antigravity session-group command as the topic root (thread created: %s)', async threadCreated => {
       vi.mocked(isSessionGroup).mockReturnValue(true);
       onTestFinished(() => { vi.mocked(isSessionGroup).mockReturnValue(false); });

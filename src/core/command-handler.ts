@@ -1974,12 +1974,82 @@ function canOperateForCommandMessage(larkAppId: string, chatId: string | undefin
     : canOperate(larkAppId, chatId, message.senderId, message.senderUnionId);
 }
 
+type QueuedFork = {
+  rootId: string;
+  message: LarkMessage;
+  deps: CommandHandlerDeps;
+  nativeSessionId: string | undefined;
+  attempt: number;
+};
+
+const queuedForks = new WeakMap<DaemonSession, { requests: Map<string, QueuedFork>; draining: boolean }>();
+
+function enqueueFork(ds: DaemonSession, request: QueuedFork): boolean {
+  let queue = queuedForks.get(ds);
+  if (!queue) {
+    queue = { requests: new Map(), draining: false };
+    queuedForks.set(ds, queue);
+  }
+  const id = request.message.messageId;
+  if (queue.requests.has(id)) return false;
+  queue.requests.set(id, request);
+  return true;
+}
+
+/** Called at the source's idle or exact turn-terminal edge. */
+export async function drainQueuedForks(
+  ds: DaemonSession,
+  withAdmission: (run: () => Promise<void>) => Promise<void> = run => run(),
+): Promise<void> {
+  const queue = queuedForks.get(ds);
+  if (!queue || queue.draining) return;
+  queue.draining = true;
+  try {
+    const { isForkSourceBusy } = await import('./worker-pool.js');
+    await withAdmission(async () => {
+      for (const [id, request] of queue.requests) {
+        const { rootId, message, deps, nativeSessionId, attempt } = request;
+        const appId = ds.larkAppId;
+        const sourceIsCurrent = () => ds.session.status === 'active' && deps.activeSessions.get(sessionKey(rootId, appId)) === ds;
+        if (!sourceIsCurrent()) { queue.requests.delete(id); continue; }
+        if (isForkSourceBusy(ds)) return;
+        const reply = (key: 'cmd.fork.source_changed' | 'cmd.fork.source_check_failed') =>
+          deps.sessionReply(rootId, t(key, undefined, localeForBot(appId)), 'text', appId, id);
+        try {
+          await assertSendTopicsAvailable(appId, [id],
+            (app, msgId) => getMessageDetail(app, msgId, { userCardContent: false, timeoutMs: 10_000 }), 'stop');
+        } catch (err) {
+          queue.requests.delete(id);
+          if (err instanceof TopicSendError && err.code === 'TOPIC_SEND_BLOCKED') continue;
+          await reply('cmd.fork.source_check_failed');
+          continue;
+        }
+        if (!sourceIsCurrent()) { queue.requests.delete(id); continue; }
+        if (isForkSourceBusy(ds)) return;
+        queue.requests.delete(id);
+        if (nativeSessionId && nativeSessionId !== ds.session.cliSessionId) {
+          await reply('cmd.fork.source_changed');
+          continue;
+        }
+        await handleCommand('/fork', rootId, message, deps, appId, attempt);
+        // The source can become busy while the topic is being prepared. Only
+        // another readiness edge may retry a request put back by that race.
+        if (queue.requests.has(id)) return;
+      }
+    });
+  } finally {
+    queue.draining = false;
+    if (queue.requests.size === 0) queuedForks.delete(ds);
+  }
+}
+
 export async function handleCommand(
   cmd: string,
   rootId: string,
   message: LarkMessage,
   deps: CommandHandlerDeps,
   larkAppId?: string,
+  queuedForkAttempt?: number,
 ): Promise<void> {
   const { activeSessions, getActiveCount, lastRepoScan } = deps;
   // Command replies carry the triggering messageId as the turnId so a shared
@@ -6980,33 +7050,42 @@ export async function handleCommand(
         // persisted CLI markers) is not forkable — most commonly this fires when
         // /fork was invoked at the group top-level while the session lives in a
         // 话题 (thread-scope). Refuse BEFORE creating any group.
-        const { isRelayableRealSession: forkIsRealSession } = await import('./worker-pool.js');
+        const { isRelayableRealSession: forkIsRealSession, isForkSourceBusy } = await import('./worker-pool.js');
         if (!forkIsRealSession(ds)) {
           await sessionReply(rootId, t('cmd.fork.no_source_here', undefined, loc));
           break;
         }
-        // Idle check up front — mid-turn source can't be forked cleanly.
-        const forkSt = ds.lastScreenStatus;
-        if (ds.worker && !ds.worker.killed && forkSt !== 'idle' && forkSt !== 'limited') {
-          await sessionReply(rootId, t('cmd.fork.mid_turn', undefined, loc));
-          break;
-        }
-
-        if (!/^--create\b/i.test(argsLine)) {
+        const createsGroup = /^--create\b/i.test(argsLine);
+        const fromSessionGroup = isAntigravitySessionGroupFork(ds, message);
+        if (!createsGroup) {
           if (!argsLine) {
             await sessionReply(rootId, t('cmd.fork.subtopic_usage', undefined, loc));
             break;
           }
-          const fromSessionGroup = isAntigravitySessionGroupFork(ds, message);
           const forkInPlaceIsP2p = ds.chatType === 'p2p';
           if (!forkInPlaceIsP2p && !fromSessionGroup
             && (ds.scope !== 'thread' || !ds.session.rootMessageId?.startsWith('om_'))) {
             await sessionReply(rootId, t('cmd.fork.subtopic_thread_only', undefined, loc));
             break;
           }
+        }
 
-          const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId, forkChildOwnerOpenId);
+        const queueForIdle = async (attempt: number) => {
+          const added = enqueueFork(ds, { rootId, message, deps, nativeSessionId: ds.session.cliSessionId, attempt });
+          if (added && queuedForkAttempt === undefined) await sessionReply(rootId, t('cmd.fork.queued', undefined, loc));
+        };
+        if (isForkSourceBusy(ds)) {
+          await queueForIdle(queuedForkAttempt ?? 0);
+          break;
+        }
+
+        if (!createsGroup) {
+          const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId, forkChildOwnerOpenId, queuedForkAttempt);
           if (!result.ok) {
+            if (result.error === 'worker_busy' && !result.orphanTopic) {
+              await queueForIdle((queuedForkAttempt ?? 0) + 1);
+              break;
+            }
             const errKey = result.error === 'worker_busy' ? 'cmd.fork.mid_turn'
               : result.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'
               : result.error === 'fork_unsupported_backend' ? 'cmd.fork.unsupported_backend'
@@ -8010,6 +8089,7 @@ export async function startForkSubtopicSession(
   /** Owner for the child session; omit to inherit the parent's. Set by the
    *  `/fork` handler when an admin forks someone else's session. */
   childOwnerOpenId?: string,
+  attempt = 0,
 ): Promise<ForkSubtopicResult> {
   const appId = parentDs.larkAppId ?? larkAppId;
   if (!appId) return { ok: false, error: 'missing_lark_app_id', orphanTopic: false };
@@ -8138,7 +8218,9 @@ export async function startForkSubtopicSession(
     if (fromSessionGroup && usesCommandAnchor) {
       anchorId = message.messageId;
       groupTopicPending = true;
-      const uuid = createHash('sha256').update(`fork-topic:${appId}:${anchorId}`).digest('hex').slice(0, 40);
+      // A retry after a fully rolled-back topic must get a fresh provider key.
+      const key = `fork-topic:${appId}:${anchorId}`;
+      const uuid = createHash('sha256').update(attempt === 0 ? key : `${key}:${attempt}`).digest('hex').slice(0, 40);
       groupTopicReplyId = await replyMessage(appId, anchorId, seedPost, 'post', true,
         uuid, undefined, sourceOptions);
       childThreadId = (await getMessageThreadId(appId, groupTopicReplyId)) ?? undefined;

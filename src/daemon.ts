@@ -641,7 +641,7 @@ import {
   type ResolveSubtopicHandoffDeps,
 } from './services/subtopic-mentionless-handoff.js';
 import { loadFrozenCards, saveFrozenCards } from './services/frozen-card-store.js';
-import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
+import { resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, drainQueuedForks, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand } from './core/command-handler.js';
 import { classifySlash, isCommandDecision, type CascadeItem, type SlashRouteDecision } from './core/command-router.js';
 import { commandSpec } from './core/command-schema.js';
 import { groupCommandStartsTaskForRouting, isGroupCommandText, type GroupRoutingBotDefaults } from './services/group-creation-options.js';
@@ -741,6 +741,7 @@ import {
   runWithdrawAutoClose,
 } from './core/daemon-background-close.js';
 import {
+  runDetachedBotTurnAdmission,
   runDetachedBotTurnMutation,
   tryWithBotTurnMutation,
   withBotTurnAdmission,
@@ -30497,6 +30498,17 @@ async function handlePrincipalLaneLiveMessage(
 // external Lark/worker boundaries, not the lane orchestration itself.
 export const __testOnly_handlePrincipalLaneLiveMessage = handlePrincipalLaneLiveMessage;
 
+function threadDeliveryKey(appId: string, scope: 'chat' | 'thread', anchor: string): string {
+  return `\u0000thread-delivery:${appId}:${scope}:${anchor}`;
+}
+
+function resumeQueuedForks(ds: DaemonSession): void {
+  const key = threadDeliveryKey(ds.larkAppId, ds.scope ?? ds.session.scope ?? 'thread', ds.runtimeRoutingAnchor ?? sessionAnchorId(ds));
+  void drainQueuedForks(ds, run => withActiveSessionKeyLock(activeSessions, key,
+    () => runDetachedBotTurnAdmission(ds.larkAppId, run)))
+    .catch(err => logger.warn(`[${tag(ds)}] queued /fork failed: ${String(err)}`));
+}
+
 async function handleThreadReply(
   data: any,
   ctx: RoutingContext,
@@ -30512,7 +30524,7 @@ async function handleThreadReply(
   // before entering it so two same-anchor deliveries can never invert while
   // quota/resource/sender preparation awaits. Synthetic keys share the same
   // lock registry without occupying or mutating an active-session slot.
-  const deliveryKey = `\u0000thread-delivery:${ctx.larkAppId}:${ctx.scope}:${ctx.runtimeRoutingAnchor ?? ctx.anchor}`;
+  const deliveryKey = threadDeliveryKey(ctx.larkAppId, ctx.scope, ctx.runtimeRoutingAnchor ?? ctx.anchor);
   ctx.ingressAdmission ??= { admitted: false };
   return withActiveSessionKeyLock(
     activeSessions,
@@ -35447,6 +35459,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      if (context.status === 'idle' || context.status === 'limited') resumeQueuedForks(ds);
       observeAutoCompact(ds, context.status);
       // A main-bot wake waits for its main session to be idle; the end of a
       // wake turn there also ends a checkpoint's review (bot-executed runs only).
@@ -35617,6 +35630,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           && ds.activeInteractiveTurn?.turnId === terminal.turnId) {
         ds.activeInteractiveTurn = undefined;
       }
+      resumeQueuedForks(ds);
       // Principal lanes are parallel across runtime keys but own a durable,
       // full-turn FIFO inside each key. Release/advance only on this exact
       // terminal edge; a stale terminal cannot dequeue a newer head.

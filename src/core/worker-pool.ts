@@ -16659,6 +16659,15 @@ type ForkSessionOptions = {
   childOwnerOpenId?: string;
 };
 
+/** A fork must see a settled native source, even if its last render still shows idle. */
+export function isForkSourceBusy(ds: DaemonSession): boolean {
+  if (isSessionLifecycleInFlight(ds) || isSessionTransferring(ds)) return true;
+  if (!ds.worker || ds.worker.killed) return false;
+  return (ds.lastScreenStatus !== 'idle' && ds.lastScreenStatus !== 'limited')
+    || hasPendingOrdinaryImInput(ds)
+    || (cliReportsTurnTerminals(ds) && hasUnsettledAcceptedInput(ds));
+}
+
 /**
  * Fork a session: create a SECOND, independent botmux session that inherits the
  * source's full context at the current node, landing at a different anchor
@@ -16688,19 +16697,12 @@ export async function forkSession(
   const ds = findActiveBySessionId(sessionId);
   if (!ds) return { ok: false, error: 'session_not_active' };
   // A live source must sit at a clean node: not mid-lifecycle, not mid-turn.
-  if (isSessionLifecycleInFlight(ds)) return { ok: false, error: 'worker_busy' };
-  const st = ds.lastScreenStatus;
-  if (ds.worker && !ds.worker.killed && st !== 'idle' && st !== 'limited') {
-    return { ok: false, error: 'worker_busy' };
-  }
+  if (isForkSourceBusy(ds)) return { ok: false, error: 'worker_busy' };
   // The source may start a turn, close, or be replaced while this fork waits
   // behind the target-key lock; repeat the live-source guards right before minting.
   const revalidate = (): string | undefined => {
     if (findActiveBySessionId(sessionId) !== ds || ds.session.status !== 'active') return 'session_not_active';
-    if (isSessionLifecycleInFlight(ds)) return 'worker_busy';
-    const latestStatus = ds.lastScreenStatus;
-    if (ds.worker && !ds.worker.killed && latestStatus !== 'idle' && latestStatus !== 'limited') return 'worker_busy';
-    return undefined;
+    return isForkSourceBusy(ds) ? 'worker_busy' : undefined;
   };
   return forkFromSource(ds, targetChatId, targetRootMessageId, targetChatType, targetScope, opts, revalidate);
 }
