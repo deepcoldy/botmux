@@ -300,6 +300,16 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_OWNER_OPEN_ID='))).toBe(false);
   });
 
+  it('forwards only the owning session relay into a persistent pane', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX_SESSION_ID: 'session-a',
+      BOTMUX_SEND_RELAY: '/data/sandboxes/session-a/outbox',
+    });
+    expect(out).toContain('BOTMUX_SEND_RELAY=/data/sandboxes/session-a/outbox');
+    expect(buildBotmuxEnvAssignments({ BOTMUX_SESSION_ID: 'session-b' })
+      .some(value => value.startsWith('BOTMUX_SEND_RELAY='))).toBe(false);
+  });
+
   it('forwards the host-resolved dispatch task-tree card switch into panes', () => {
     // The file-sandboxed CLI cannot read ~/.botmux/config.json; the daemon
     // projects the resolved value and it reaches the pane only because it is on

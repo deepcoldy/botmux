@@ -486,6 +486,12 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Unguessable pane/profile authority channel. It selects an exact read carve
   // but is not sufficient without the daemon-rotated capability inside it.
   'BOTMUX_ORIGIN_CHANNEL_ID',
+  // Per-session host relay capability. Linux bwrap also sets this inside its
+  // namespace, but macOS Seatbelt shares the host process namespace and needs
+  // persistent-pane transport to inject the path into the owning CLI. Listing
+  // it here also scrubs stale values from shared tmux server globals; the pane
+  // wrapper re-adds only the current session's value.
+  'BOTMUX_SEND_RELAY',
   // Workflow node session marker: `botmux skill show` inside a tmux / zellij
   // pane must see it like a PTY child does; being listed also means a stale
   // value in a shared server's global env is unset for ordinary panes.
@@ -578,9 +584,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
  * HERMES_BOTMUX_* roots are ambient install-location config nothing in
  * botmux ever sets, same contract as GROK_HOME; BOTS_CONFIG /
  * SESSION_DATA_DIR / BOTMUX_LARK_LIST_BOTS_API_* are documented ambient or
- * ecosystem-block config). The reverse also holds: session/sandbox routing
- * keys the pane transport never carries (BOTMUX_SEND_RELAY) still need
- * scrubbing here. Every entry below is
+ * ecosystem-block config). The reverse also holds: a key can belong here even
+ * when another launch layer injects it too (Linux bwrap deliberately duplicates
+ * BOTMUX_SEND_RELAY). Every entry below is
  * session-scoped BY CONSTRUCTION: the daemon/worker computes and injects it
  * per session AFTER every boundary scrub, and no ambient/env-file channel for
  * it exists.
